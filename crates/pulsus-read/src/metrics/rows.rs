@@ -6,9 +6,10 @@ use pulsus_clickhouse::Row;
 use pulsus_model::Fingerprint;
 use serde::{Deserialize, Serialize};
 
-/// One `metric_series` row from the §5.2 sweep (`SELECT fingerprint,
-/// metric_name, labels FROM metric_series WHERE ... ORDER BY unix_milli
-/// DESC LIMIT 1 BY metric_name, fingerprint`, docs/architecture.md §5.2).
+/// One series from statement 2 or 4 (issue #623): its ID, its name and its
+/// own lookup row's labels — the sweep ([`super::sql::sweep_query`],
+/// docs/architecture.md §5.2), the discovery reads and the fallback's label
+/// hydration.
 /// `labels` is the canonical JSON string the writer produced
 /// (`LabelSet::to_canonical_json`) — parsed into a `LabelSet` by
 /// [`super::refresh`], not here (this module only owns the wire shape).
@@ -25,7 +26,7 @@ pub struct SeriesRow {
 /// [`SeriesRow`] (which also carries `fingerprint`/`labels`, columns the
 /// probe never selects — reusing the 3-field row here would be a
 /// column-count mismatch against the 1-column result set), mirroring the
-/// `HydratedLabelsRow` precedent in [`super::exec`].
+/// `FingerprintOnlyRow` precedent in [`super::exec`].
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct MetricNameRow {
     pub metric_name: String,

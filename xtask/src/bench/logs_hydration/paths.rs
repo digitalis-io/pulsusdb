@@ -857,8 +857,7 @@ impl VariantAccumulator {
 }
 
 /// Everything [`run_breadth`] needs, grouped into one parameter (clippy's
-/// argument-count lint, same rationale as `queries.rs::RunConfig`/
-/// `metrics_labels::paths::PathsConfig`). `exe`/`http_url`/`user`/
+/// argument-count lint, same rationale as `queries.rs::RunConfig`). `exe`/`http_url`/`user`/
 /// `password` are only used to spawn RSS-probe children (`database` doubles
 /// as both the connection's default database and the `--database` argument
 /// those children are spawned with — the two are always the same value).

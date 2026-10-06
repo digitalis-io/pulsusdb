@@ -24,7 +24,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
 use pulsus_config::WriterConfig;
-use pulsus_model::{DEFAULT_ACTIVITY_BUCKET_MS, Fingerprint, LabelSet};
+use pulsus_model::{ACTIVITY_BUCKET_MS, Fingerprint, LabelSet};
 use pulsus_schema::RenderCtx;
 use pulsus_schema_testkit::run_init;
 use pulsus_write::{
@@ -105,7 +105,7 @@ async fn live_writer(db: String) -> (ChClient, String, Arc<ChClient>, MetricWrit
     let writer = MetricWriter::new_with_tables(
         client.clone(),
         &WriterConfig::default(),
-        DEFAULT_ACTIVITY_BUCKET_MS,
+        ACTIVITY_BUCKET_MS,
         MetricWriterTables::metrics_default(),
     );
     (bootstrap, db, client, writer)
@@ -191,79 +191,6 @@ async fn a_push_lands_one_block_carrying_every_kind() {
     drop_database(&bootstrap, &db).await;
 }
 
-/// The writer never sets `event_id`, so the server fills it from the
-/// column's own `DEFAULT generateUUIDv7()`: two rows of one push carry two
-/// different, non-nil, version-7 values.
-///
-/// A row type carrying the column would store whatever the writer put
-/// there — the nil UUID on every row, for an explicit zero.
-#[tokio::test]
-async fn the_insert_omits_event_id_so_the_server_fills_it() {
-    skip_unless_live!();
-    let (bootstrap, db, client, writer) =
-        live_writer(pulsus_testkit::test_db("pulsus_write_it_landing_event_id")).await;
-
-    let metric_name: Arc<str> = Arc::from("http_requests_total");
-    let batch = ParsedMetrics {
-        samples: vec![
-            MetricPoint {
-                metric_name: metric_name.clone(),
-                fingerprint: Fingerprint::from_raw(42),
-                unix_milli: 1_000,
-                value: 1.0,
-            },
-            MetricPoint {
-                metric_name: metric_name.clone(),
-                fingerprint: Fingerprint::from_raw(42),
-                unix_milli: 1_001,
-                value: 2.0,
-            },
-        ],
-        ..Default::default()
-    };
-    let wait = writer
-        .admit_flush(batch, PushHeaders::default())
-        .expect("queue has room");
-    tokio::time::timeout(Duration::from_secs(10), wait)
-        .await
-        .expect("flush settles")
-        .expect("commits");
-    writer.shutdown(Duration::from_secs(5)).await;
-
-    let rows = count(
-        &client,
-        &format!("SELECT count() AS n FROM {db}.metric_landing WHERE kind = 0"),
-    )
-    .await;
-    assert_eq!(rows, 2);
-    let distinct = count(
-        &client,
-        &format!("SELECT uniqExact(event_id) AS n FROM {db}.metric_landing WHERE kind = 0"),
-    )
-    .await;
-    assert_eq!(distinct, 2, "each landed event has its own identity");
-    let nil = count(
-        &client,
-        &format!(
-            "SELECT count() AS n FROM {db}.metric_landing \
-             WHERE event_id = toUUID('00000000-0000-0000-0000-000000000000')"
-        ),
-    )
-    .await;
-    assert_eq!(nil, 0, "no row carries the nil UUID");
-    let version_7 = count(
-        &client,
-        &format!(
-            "SELECT count() AS n FROM {db}.metric_landing \
-             WHERE substring(toString(event_id), 15, 1) = '7'"
-        ),
-    )
-    .await;
-    assert_eq!(version_7, 2, "the server's own time-ordered UUID version");
-
-    drop_database(&bootstrap, &db).await;
-}
-
 /// The writer's registration gate against a live server: two samples in the
 /// same activity bucket for one series land exactly one kind-2 row, through
 /// the whole path including the RowBinary encoding of the canonical label
@@ -338,7 +265,7 @@ async fn registration_rows_for_one_fingerprint_carry_byte_identical_labels() {
 
     let (labels, _) = LabelSet::from_normalized([("job".to_string(), "checkout".to_string())]);
     let metric_name: Arc<str> = Arc::from("http_requests_total");
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let batch = ParsedMetrics {
         samples: vec![
             MetricPoint {

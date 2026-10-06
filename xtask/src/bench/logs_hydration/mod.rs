@@ -10,8 +10,7 @@
 //! result fingerprints — pure SQL over the existing
 //! `pulsus_read::logql::sql` builders, **no product read-path change**.
 //!
-//! Ships as a **sibling scenario** to `logs-read` (mirroring #34's
-//! `metrics-labels`) — not a new row in `logs-read`'s fixed four-shape
+//! Ships as a **sibling scenario** to `logs-read` — not a new row in `logs-read`'s fixed four-shape
 //! matrix — so #16's committed Tier-1 evidence and its
 //! `query_log_gates.rs` ratio gates stay byte-stable while this A/B
 //! investigation gets its own corpus-breadth sweep, correctness gate, and
@@ -49,8 +48,7 @@ use super::{BenchArgs, Profile, parse_http_url};
 use report::{CloseoutRef, LogsHydrationReport, Variant, evaluate_verdict};
 
 /// `--profile ci`'s fixed, hard-coded breadth set — small enough for a
-/// per-PR `schema-it` smoke step (mirrors `metrics_labels::CI_CARDINALITIES`'
-/// posture).
+/// per-PR `schema-it` smoke step.
 pub const CI_BREADTHS: [u32; 2] = [1_000, 10_000];
 /// `--profile full`'s default breadth set when `--breadths` is not given —
 /// the sweep the materiality verdict is evaluated over (`LOW_BREADTH`,
@@ -307,11 +305,6 @@ mod tests {
             reps: 1,
             out: None,
             report_out: None,
-            metric_cardinalities: None,
-            activity_buckets: "1h,1d".to_string(),
-            corpus_window_hours: 24,
-            cache_max_series: 10_000_000,
-            matcher_reps: 10,
             breadths: breadths.map(str::to_string),
             rss_probe: false,
             rss_variant: None,

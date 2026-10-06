@@ -63,7 +63,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, ChRow, Idempotency, QuerySettings, Row};
-use pulsus_model::{DEFAULT_ACTIVITY_BUCKET_MS, Fingerprint, FpLiteral, STALE_NAN_BITS};
+use pulsus_model::{ACTIVITY_BUCKET_MS, Fingerprint, FpLiteral, STALE_NAN_BITS};
 use pulsus_promql::DEFAULT_LOOKBACK_MS;
 use pulsus_promql::parser::parse;
 use pulsus_read::metrics::grouped::{Grid, GroupedOp};
@@ -130,7 +130,6 @@ struct SeedSeriesRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedSampleRow {
-    metric_name: String,
     fingerprint: u128,
     unix_milli: i64,
     value: f64,
@@ -138,7 +137,6 @@ struct SeedSampleRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedHistRow {
-    metric_name: String,
     fingerprint: u128,
     unix_milli: i64,
     schema: i8,
@@ -201,7 +199,7 @@ fn cache_config(db: &str) -> LabelCacheConfig {
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
         db: db.to_string(),
         series_table: "metric_series".to_string(),
-        bucket_ms: DEFAULT_ACTIVITY_BUCKET_MS,
+        labels_table: "metric_labels".to_string(),
         window_ms: 24 * 3_600_000,
         cache_max_series: 50_000,
         ttl: Duration::from_secs(60),
@@ -216,6 +214,7 @@ fn engine_config(db: &str, grouped_push: bool) -> MetricsConfig {
         samples_table: "metric_samples".to_string(),
         hist_samples_table: "metric_hist_samples".to_string(),
         series_table: "metric_series".to_string(),
+        labels_table: "metric_labels".to_string(),
         metadata_table: "metric_metadata".to_string(),
         experimental_functions: false,
         max_metric_fanout: 1_000,
@@ -279,17 +278,13 @@ async fn seed(client: &ChClient, fx: &[Series], bucket: i64) {
         .iter()
         .flat_map(|s| {
             s.samples.iter().map(move |(t, bits)| SeedSampleRow {
-                metric_name: s.metric.clone(),
                 fingerprint: u128::from(s.fp),
                 unix_milli: *t,
                 value: f64::from_bits(*bits),
             })
         })
         .collect();
-    client
-        .insert_block("metric_series", &series)
-        .await
-        .expect("seed metric_series");
+    seed_series_rows(client, &series).await;
     for block in samples.chunks(50_000) {
         client
             .insert_block("metric_samples", block)
@@ -301,9 +296,7 @@ async fn seed(client: &ChClient, fx: &[Series], bucket: i64) {
         .iter()
         .flat_map(|s| {
             let cols = cols.clone();
-            let metric = s.metric.clone();
             s.hist_samples.iter().map(move |t| SeedHistRow {
-                metric_name: metric.clone(),
                 fingerprint: u128::from(s.fp),
                 unix_milli: *t,
                 schema: cols.schema,
@@ -398,7 +391,7 @@ async fn harness(db: &str, fx: &[Series]) -> Harness {
     let client = ChClient::new(test_config(&db)).await.expect("connect");
     let now = now_ms();
     let t = (now / 60_000) * 60_000;
-    let bucket = (now / DEFAULT_ACTIVITY_BUCKET_MS) * DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = (now / ACTIVITY_BUCKET_MS) * ACTIVITY_BUCKET_MS;
     seed(&client, fx, bucket).await;
 
     // ONE cache, shared by both engines: a disagreement below cannot come
@@ -965,7 +958,6 @@ async fn a_gap_longer_than_the_lookback_drops_the_group_on_both_routes() {
 /// statement reduces onto.
 struct RowCase {
     name: &'static str,
-    metric: &'static str,
     series: Vec<Series>,
     grid: Grid,
     /// The fetch window the engine would use for this grid.
@@ -994,7 +986,6 @@ fn row_cases(t: i64) -> Vec<RowCase> {
             .collect();
         cases.push(RowCase {
             name: "aligned, 400 series / 4 groups / 15 s step",
-            metric,
             series,
             grid: Grid {
                 start_ms: start,
@@ -1035,7 +1026,6 @@ fn row_cases(t: i64) -> Vec<RowCase> {
             .collect();
         cases.push(RowCase {
             name: "cyclic, four members per group, 3.75 s step",
-            metric,
             series,
             grid: Grid {
                 start_ms: start,
@@ -1082,7 +1072,6 @@ fn row_cases(t: i64) -> Vec<RowCase> {
             .collect();
         cases.push(RowCase {
             name: "expiry, 100 one-sample series in one group",
-            metric,
             series,
             grid: Grid {
                 start_ms: start,
@@ -1111,7 +1100,6 @@ fn row_cases(t: i64) -> Vec<RowCase> {
             .collect();
         cases.push(RowCase {
             name: "three one-sample series in one group",
-            metric,
             series,
             grid: Grid {
                 start_ms: start,
@@ -1148,7 +1136,6 @@ fn row_cases(t: i64) -> Vec<RowCase> {
             .collect();
         cases.push(RowCase {
             name: "one group per series, constant values (declined)",
-            metric,
             series,
             grid: Grid {
                 start_ms: start,
@@ -1228,8 +1215,13 @@ async fn pushed_rows_never_exceed_twice_the_raw_rows() {
         let raw = h
             .count(&format!(
                 "SELECT toUInt64(count()) AS n FROM metric_samples \
-                 WHERE metric_name = '{}' AND unix_milli > {} AND unix_milli <= {}",
-                case.metric, case.lower_excl_ms, case.upper_incl_ms
+                 WHERE fingerprint IN ({}) AND unix_milli > {} AND unix_milli <= {}",
+                fps.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                case.lower_excl_ms,
+                case.upper_incl_ms
             ))
             .await;
         // Every operation, not one: `count` changes at an arrival AND at
@@ -1244,7 +1236,6 @@ async fn pushed_rows_never_exceed_twice_the_raw_rows() {
             let sql = grouped_sql::grouped_fetch(
                 "metric_samples",
                 "metric_hist_samples",
-                case.metric,
                 &fps,
                 &gids,
                 case.grid,
@@ -1288,7 +1279,6 @@ async fn pushed_rows_never_exceed_twice_the_raw_rows() {
         let pushed_sql = grouped_sql::grouped_fetch(
             "metric_samples",
             "metric_hist_samples",
-            case.metric,
             &fps,
             &gids,
             case.grid,
@@ -1298,7 +1288,6 @@ async fn pushed_rows_never_exceed_twice_the_raw_rows() {
         );
         let raw_sql = sample_sql::sample_fetch(
             "metric_samples",
-            case.metric,
             &fps,
             case.lower_excl_ms,
             case.upper_incl_ms,
@@ -1746,7 +1735,6 @@ async fn the_budget_answers_before_a_later_statements_failure() {
     let sql = grouped_sql::grouped_fetch(
         "metric_samples",
         "metric_hist_samples",
-        "charge_prec",
         &first_chunk,
         &vec![0u32; 400],
         Grid {
@@ -1806,7 +1794,6 @@ async fn the_budget_answers_before_a_later_statements_failure() {
     let heavy_sql = grouped_sql::grouped_fetch(
         "metric_samples",
         "metric_hist_samples",
-        "charge_prec",
         &heavy_chunk,
         &vec![0u32; 400],
         Grid {
@@ -2001,7 +1988,6 @@ async fn the_grouped_fps_array_types_as_uint128_and_maps_each_boundary_value() {
     let statement = grouped_sql::grouped_fetch(
         "metric_samples",
         "metric_hist_samples",
-        "pulsus_probe",
         &[
             Fingerprint::from_raw(A).sql_literal(),
             Fingerprint::from_raw(B).sql_literal(),
@@ -2018,4 +2004,54 @@ async fn the_grouped_fps_array_types_as_uint128_and_maps_each_boundary_value() {
     );
 
     drop_database(&bootstrap, &db).await;
+}
+
+/// Issue #623: a series is two rows now — its activity in `metric_series`
+/// and its own label row in `metric_labels`.
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SeedActivityRow {
+    day: u16,
+    fingerprint: u128,
+    metric_name: String,
+    hours: u32,
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SeedLabelRow {
+    metric_name: String,
+    fingerprint: u128,
+    labels: String,
+    first_seen: i64,
+    last_seen: i64,
+}
+
+/// Seeds `rows` the way the two views fill the tables from one kind-2 row.
+async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
+    let activity: Vec<SeedActivityRow> = rows
+        .iter()
+        .map(|r| SeedActivityRow {
+            day: r.unix_milli.div_euclid(86_400_000) as u16,
+            fingerprint: r.fingerprint,
+            metric_name: r.metric_name.clone(),
+            hours: 1u32 << (r.unix_milli.rem_euclid(86_400_000) / 3_600_000),
+        })
+        .collect();
+    let labels: Vec<SeedLabelRow> = rows
+        .iter()
+        .map(|r| SeedLabelRow {
+            metric_name: r.metric_name.clone(),
+            fingerprint: r.fingerprint,
+            labels: r.labels.clone(),
+            first_seen: r.unix_milli,
+            last_seen: r.unix_milli,
+        })
+        .collect();
+    client
+        .insert_block("metric_series", &activity)
+        .await
+        .expect("seed metric_series");
+    client
+        .insert_block("metric_labels", &labels)
+        .await
+        .expect("seed metric_labels");
 }

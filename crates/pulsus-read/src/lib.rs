@@ -24,7 +24,8 @@ pub use metrics::{
     CacheMetricsSnapshot, DEFAULT_STALENESS_MULTIPLIER, DataWindow, DiscoveryFilter,
     FallbackReason, FetchProbe, LabelCache, LabelCacheConfig, LabelMatcher, LabelledResolution,
     MatchOp, MetricMeta, MetricQueryParams, MetricsConfig, MetricsEngine, Resolution,
-    SeriesResolver, TSDB_TOP_METRIC_NAMES, TsdbCacheSnapshot, TsdbStatus, spawn_refresh_loop,
+    SeriesResolver, StatementProbe, TSDB_TOP_METRIC_NAMES, TsdbCacheSnapshot, TsdbStatus,
+    spawn_refresh_loop,
 };
 pub use querytext::{MAX_QUERY_TEXT_BYTES, ensure_query_text_fits};
 pub use traces::{

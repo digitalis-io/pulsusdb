@@ -175,9 +175,11 @@ identical codecs and cardinality.
 
 ### 3. Streaming fetch
 
-The §2.3 hot-path projection `SELECT fingerprint, unix_milli, value FROM
-metric_samples PREWHERE metric_name = ...` (2,000 matching rows out of the
-1,000,000-row table), 5 reps, run in an isolated process (no prior-scenario
+The §2.3 hot-path projection as it stood then, `SELECT fingerprint,
+unix_milli, value FROM metric_samples PREWHERE metric_name = ...` (2,000
+matching rows out of the 1,000,000-row table; issue #623 later keyed the sample
+tables by the series ID alone, so the read today carries an ID list instead of
+the name), 5 reps, run in an isolated process (no prior-scenario
 memory in the same process) so peak RSS reflects only the fetch:
 
 | Crate | p50 | rows/s (p50) | peak RSS |

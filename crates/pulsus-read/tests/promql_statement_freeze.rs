@@ -109,6 +109,7 @@ fn freeze_config() -> MetricsConfig {
         samples_table: SAMPLES.to_string(),
         hist_samples_table: HIST.to_string(),
         series_table: "metric_series".to_string(),
+        labels_table: "metric_labels".to_string(),
         metadata_table: "metric_metadata".to_string(),
         experimental_functions: true,
         max_metric_fanout: 1_000,
@@ -124,10 +125,12 @@ fn freeze_config() -> MetricsConfig {
 const GOLDEN: &str = include_str!("golden/promql_statements.txt");
 const PINNED: &str = include_str!("golden/promql_statements.sha256");
 
-/// The three constants published on issue #548 before the code existed.
+/// The three constants published on issue #548 before the code existed;
+/// the line and byte counts re-taken by issue #623, whose sample statements
+/// carry no metric name.
 const ENTRIES: usize = 30;
-const LINES: usize = 736;
-const BYTES: usize = 39_043;
+const LINES: usize = 676;
+const BYTES: usize = 36_167;
 /// The statements the writer's markers declare. Sixty before issue #549;
 /// four entries now send ONE statement where they sent two.
 const STATEMENTS: usize = 56;
@@ -144,13 +147,6 @@ fn fps() -> [FpLiteral; 3] {
 }
 const SAMPLES: &str = "metric_samples";
 const HIST: &str = "metric_hist_samples";
-
-fn names() -> Vec<String> {
-    vec![
-        "http_requests_total".to_string(),
-        "http_errors_total".to_string(),
-    ]
-}
 
 /// (query, instant?)
 #[rustfmt::skip]
@@ -240,14 +236,13 @@ fn render() -> String {
             match (&pushed, &sel.metric_name) {
                 // ONE statement, over both tables, with the group ids
                 // stated above.
-                (Some(shape), Some(n)) if shape.selector == sel.id => {
+                (Some(shape), Some(_)) if shape.selector == sel.id => {
                     out.push_str(&format!("-- grouped op={:?} gids={GIDS:?}\n", shape.op));
                     emit(
                         &mut out,
                         &grouped_sql::grouped_fetch(
                             SAMPLES,
                             HIST,
-                            n,
                             &fps(),
                             &GIDS,
                             shape.grid,
@@ -257,24 +252,21 @@ fn render() -> String {
                         ),
                     );
                 }
-                (_, Some(n)) => {
+                (_, Some(_)) => {
+                    emit(&mut out, &sample_sql::sample_fetch(SAMPLES, &fps(), lo, hi));
                     emit(
                         &mut out,
-                        &sample_sql::sample_fetch(SAMPLES, n, &fps(), lo, hi),
-                    );
-                    emit(
-                        &mut out,
-                        &sample_sql::hist_sample_fetch(HIST, n, &fps(), lo, hi),
+                        &sample_sql::hist_sample_fetch(HIST, &fps(), lo, hi),
                     );
                 }
                 (_, None) => {
                     emit(
                         &mut out,
-                        &sample_sql::sample_fetch_multi(SAMPLES, &names(), &fps(), lo, hi),
+                        &sample_sql::sample_fetch_multi(SAMPLES, &fps(), lo, hi),
                     );
                     emit(
                         &mut out,
-                        &sample_sql::hist_sample_fetch_multi(HIST, &names(), &fps(), lo, hi),
+                        &sample_sql::hist_sample_fetch_multi(HIST, &fps(), lo, hi),
                     );
                 }
             }
@@ -410,7 +402,6 @@ fn the_grouped_statement_in_schemas_md_is_the_one_the_builder_renders() {
     let rendered = grouped_sql::grouped_fetch(
         SAMPLES,
         HIST,
-        "http_requests_total",
         &fps(),
         &GIDS,
         Grid {

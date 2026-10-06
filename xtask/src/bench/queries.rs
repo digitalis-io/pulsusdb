@@ -1052,8 +1052,8 @@ impl Tables {
 /// (issue #35 architect plan) — a fixed constant rather than a
 /// threaded-through parameter, since every [`reader_settings`] call site in
 /// this file is already scoped to the single `logs-read` scenario (`bench
-/// metrics-labels`/`bench logs-hydration` tag their own settings via their
-/// own modules' calls into [`super::query_log::tagged_settings`]). Purely
+/// logs-hydration` tags its own settings via its own module's calls into
+/// [`super::query_log::tagged_settings`]). Purely
 /// additive: `log_comment` is an HTTP request setting, never inlined SQL,
 /// and does not touch `read_rows`/`read_bytes`/`SelectedMarks`, so
 /// `query_log_gates.rs` and the committed `logs-read-ci.json`/

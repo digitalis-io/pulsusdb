@@ -322,7 +322,7 @@ pub(crate) fn label_cache_config_from(config: &Config) -> LabelCacheConfig {
     LabelCacheConfig {
         db: config.clickhouse.database.clone(),
         series_table: format!("metric_series{dist}"),
-        bucket_ms: config.reader.series_activity_bucket.0.as_millis() as i64,
+        labels_table: format!("metric_labels{dist}"),
         window_ms: config.reader.cache_window.0.as_millis() as i64,
         cache_max_series: config.reader.cache_max_series,
         ttl: config.reader.cache_ttl.0,
@@ -359,6 +359,7 @@ pub(crate) fn metrics_config_from(config: &Config) -> MetricsConfig {
         db: config.clickhouse.database.clone(),
         samples_table: format!("metric_samples{dist}"),
         series_table: format!("metric_series{dist}"),
+        labels_table: format!("metric_labels{dist}"),
         metadata_table: "metric_metadata".to_string(),
         // M7-A5a: the dual-read's complementary histogram table, `_dist`-
         // aware exactly like `samples_table` (co-sharded Metrics family).
@@ -810,6 +811,7 @@ mod tests {
         let config = Config::default();
         let cfg = label_cache_config_from(&config);
         assert_eq!(cfg.series_table, "metric_series");
+        assert_eq!(cfg.labels_table, "metric_labels");
     }
 
     #[test]
@@ -820,6 +822,7 @@ mod tests {
         };
         let cfg = label_cache_config_from(&config);
         assert_eq!(cfg.series_table, "metric_series_dist");
+        assert_eq!(cfg.labels_table, "metric_labels_dist");
     }
 
     #[test]
@@ -828,6 +831,7 @@ mod tests {
         let cfg = metrics_config_from(&config);
         assert_eq!(cfg.samples_table, "metric_samples");
         assert_eq!(cfg.series_table, "metric_series");
+        assert_eq!(cfg.labels_table, "metric_labels");
         assert_eq!(cfg.metadata_table, "metric_metadata");
         assert!(!cfg.distributed);
     }
@@ -841,6 +845,7 @@ mod tests {
         let cfg = metrics_config_from(&config);
         assert_eq!(cfg.samples_table, "metric_samples_dist");
         assert_eq!(cfg.series_table, "metric_series_dist");
+        assert_eq!(cfg.labels_table, "metric_labels_dist");
         assert_eq!(
             cfg.metadata_table, "metric_metadata",
             "metric_metadata is a global catalog table and must never carry a _dist suffix"
@@ -981,10 +986,6 @@ mod tests {
         let config = Config::default();
         let cfg = label_cache_config_from(&config);
         assert_eq!(cfg.db, config.clickhouse.database);
-        assert_eq!(
-            cfg.bucket_ms,
-            config.reader.series_activity_bucket.0.as_millis() as i64
-        );
         assert_eq!(
             cfg.window_ms,
             config.reader.cache_window.0.as_millis() as i64

@@ -27,7 +27,7 @@ use std::net::TcpStream;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
-use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, QuerySettings, Row};
+use pulsus_clickhouse::{ChClient, ChConnConfig, ChError, ChProto, QuerySettings, Row};
 
 /// `true` when the gated half of this suite should run. Skips cleanly on a
 /// developer machine with no container; **panics** rather than skipping when
@@ -156,9 +156,58 @@ struct SeedSeriesRow {
     labels: String,
 }
 
+/// Issue #623: a series is an activity row in `metric_series` and its label
+/// set, once, in `metric_labels` — what the two views write from one kind-2
+/// landing row.
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SeedActivityRow {
+    day: u16,
+    fingerprint: u128,
+    metric_name: String,
+    hours: u32,
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SeedLabelRow {
+    metric_name: String,
+    fingerprint: u128,
+    labels: String,
+    first_seen: i64,
+    last_seen: i64,
+}
+
+trait InsertSeries {
+    async fn insert_series(&self, rows: &[SeedSeriesRow]) -> Result<(), ChError>;
+}
+
+impl InsertSeries for ChClient {
+    async fn insert_series(&self, rows: &[SeedSeriesRow]) -> Result<(), ChError> {
+        let activity: Vec<SeedActivityRow> = rows
+            .iter()
+            .map(|r| SeedActivityRow {
+                day: r.unix_milli.div_euclid(86_400_000) as u16,
+                fingerprint: r.fingerprint,
+                metric_name: r.metric_name.clone(),
+                hours: 1u32 << (r.unix_milli.rem_euclid(86_400_000) / 3_600_000),
+            })
+            .collect();
+        let labels: Vec<SeedLabelRow> = rows
+            .iter()
+            .map(|r| SeedLabelRow {
+                metric_name: r.metric_name.clone(),
+                fingerprint: r.fingerprint,
+                labels: r.labels.clone(),
+                first_seen: r.unix_milli,
+                last_seen: r.unix_milli,
+            })
+            .collect();
+        self.insert_block("metric_series", &activity).await?;
+        self.insert_block("metric_labels", &labels).await
+    }
+}
+
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedSampleRow {
-    metric_name: String,
     fingerprint: u128,
     unix_milli: i64,
     value: f64,
@@ -230,23 +279,20 @@ async fn prom_api_serves_discovery_and_query_against_real_clickhouse() {
     let now = now_ms();
     let recent_bucket = (now / bucket_ms) * bucket_ms;
     client
-        .insert_block(
-            "metric_series",
-            &[
-                SeedSeriesRow {
-                    metric_name: "up".to_string(),
-                    fingerprint: 1,
-                    unix_milli: recent_bucket,
-                    labels: r#"{"job":"api"}"#.to_string(),
-                },
-                SeedSeriesRow {
-                    metric_name: "up".to_string(),
-                    fingerprint: 2,
-                    unix_milli: recent_bucket,
-                    labels: r#"{"job":"web"}"#.to_string(),
-                },
-            ],
-        )
+        .insert_series(&[
+            SeedSeriesRow {
+                metric_name: "up".to_string(),
+                fingerprint: 1,
+                unix_milli: recent_bucket,
+                labels: r#"{"job":"api"}"#.to_string(),
+            },
+            SeedSeriesRow {
+                metric_name: "up".to_string(),
+                fingerprint: 2,
+                unix_milli: recent_bucket,
+                labels: r#"{"job":"web"}"#.to_string(),
+            },
+        ])
         .await
         .expect("seed metric_series");
     client
@@ -254,13 +300,11 @@ async fn prom_api_serves_discovery_and_query_against_real_clickhouse() {
             "metric_samples",
             &[
                 SeedSampleRow {
-                    metric_name: "up".to_string(),
                     fingerprint: 1,
                     unix_milli: now,
                     value: 1.0,
                 },
                 SeedSampleRow {
-                    metric_name: "up".to_string(),
                     fingerprint: 2,
                     unix_milli: now,
                     value: 0.0,
@@ -429,23 +473,20 @@ async fn prom_api_name_regex_discovery_over_the_fanout_cap_is_422_execution() {
     // Two distinct metric names, both matching `up.*` -> a resolved
     // candidate-name set of 2 against a cap of 1.
     client
-        .insert_block(
-            "metric_series",
-            &[
-                SeedSeriesRow {
-                    metric_name: "up".to_string(),
-                    fingerprint: 1,
-                    unix_milli: recent_bucket,
-                    labels: r#"{"job":"api"}"#.to_string(),
-                },
-                SeedSeriesRow {
-                    metric_name: "up_alias".to_string(),
-                    fingerprint: 2,
-                    unix_milli: recent_bucket,
-                    labels: r#"{"job":"web"}"#.to_string(),
-                },
-            ],
-        )
+        .insert_series(&[
+            SeedSeriesRow {
+                metric_name: "up".to_string(),
+                fingerprint: 1,
+                unix_milli: recent_bucket,
+                labels: r#"{"job":"api"}"#.to_string(),
+            },
+            SeedSeriesRow {
+                metric_name: "up_alias".to_string(),
+                fingerprint: 2,
+                unix_milli: recent_bucket,
+                labels: r#"{"job":"web"}"#.to_string(),
+            },
+        ])
         .await
         .expect("seed metric_series");
 
@@ -554,23 +595,20 @@ async fn prom_api_name_regex_discovery_over_the_cache_scan_budget_is_422_executi
     let now = now_ms();
     let recent_bucket = (now / bucket_ms) * bucket_ms;
     client
-        .insert_block(
-            "metric_series",
-            &[
-                SeedSeriesRow {
-                    metric_name: "up".to_string(),
-                    fingerprint: 1,
-                    unix_milli: recent_bucket,
-                    labels: r#"{"job":"api"}"#.to_string(),
-                },
-                SeedSeriesRow {
-                    metric_name: "up_alias".to_string(),
-                    fingerprint: 2,
-                    unix_milli: recent_bucket,
-                    labels: r#"{"job":"web"}"#.to_string(),
-                },
-            ],
-        )
+        .insert_series(&[
+            SeedSeriesRow {
+                metric_name: "up".to_string(),
+                fingerprint: 1,
+                unix_milli: recent_bucket,
+                labels: r#"{"job":"api"}"#.to_string(),
+            },
+            SeedSeriesRow {
+                metric_name: "up_alias".to_string(),
+                fingerprint: 2,
+                unix_milli: recent_bucket,
+                labels: r#"{"job":"web"}"#.to_string(),
+            },
+        ])
         .await
         .expect("seed metric_series");
 
@@ -738,8 +776,8 @@ async fn promql_memory_breach_is_422_and_actually_dispatched() {
     client
         .execute(
             &format!(
-                "INSERT INTO {db}.metric_series (metric_name, fingerprint, unix_milli, labels) \
-                 SELECT '{PROBE_METRIC}', number + 1, {recent_bucket}, \
+                "INSERT INTO {db}.metric_landing (kind, metric_name, fingerprint, unix_milli, labels) \
+                 SELECT 2, '{PROBE_METRIC}', number + 1, {recent_bucket}, \
                         concat('{{\"job\":\"j', toString(number), '\"}}') \
                  FROM numbers({PROBE_SERIES})"
             ),
@@ -922,8 +960,7 @@ async fn prom_api_query_surface_bundle_issue_471() {
         ("dashed", 4, r#"{"a-b":"dash"}"#),
     ];
     client
-        .insert_block(
-            "metric_series",
+        .insert_series(
             &series
                 .iter()
                 .map(|(name, fp, labels)| SeedSeriesRow {
@@ -941,8 +978,7 @@ async fn prom_api_query_surface_bundle_issue_471() {
             "metric_samples",
             &series
                 .iter()
-                .map(|(name, fp, _)| SeedSampleRow {
-                    metric_name: (*name).to_string(),
+                .map(|(_, fp, _)| SeedSampleRow {
                     fingerprint: u128::from(*fp),
                     unix_milli: now,
                     value: 1.0,
@@ -1461,8 +1497,7 @@ async fn prom_api_name_values_bodies_and_narrow_dispatch_issue_472() {
         ),
     ];
     client
-        .insert_block(
-            "metric_series",
+        .insert_series(
             &corpus
                 .iter()
                 .map(|(name, fp, labels)| SeedSeriesRow {
@@ -1615,13 +1650,13 @@ async fn prom_api_name_values_bodies_and_narrow_dispatch_issue_472() {
     flush_logs(&admin).await;
 
     // The #472 statement, told apart from the #96 degraded probe: both
-    // begin `SELECT DISTINCT metric_name FROM metric_series WHERE
-    // unix_milli >=`, and the probe additionally carries the name-matcher
-    // regex's compile-probe splice and a `LIMIT <fanout cap + 1>`. The
+    // begin `SELECT DISTINCT metric_name FROM metric_series WHERE day
+    // BETWEEN` (issue #623), and the probe additionally carries the
+    // name-matcher regex's compile probe and a `LIMIT <fanout cap + 1>`. The
     // discovery `limit` is a response-size cap applied last (docs/api.md
     // §3.3), so the #472 statement never carries a `LIMIT` at all.
     const NARROW_PREFIX: &str =
-        "query LIKE 'SELECT DISTINCT metric_name\\nFROM metric_series\\nWHERE unix_milli >=%'";
+        "query LIKE 'SELECT DISTINCT metric_name\\nFROM metric_series\\nWHERE day BETWEEN %'";
     let narrow_472 = format!("{NARROW_PREFIX} AND query NOT LIKE '%\\nLIMIT %'");
     let narrow_472 = narrow_472.as_str();
     // The #96 degraded probe, named unambiguously: the same projection
@@ -1657,21 +1692,22 @@ async fn prom_api_name_values_bodies_and_narrow_dispatch_issue_472() {
     // out of scope here). `match[]=http_requests_total` is that marker: it
     // is the only request in this test that renders `metric_name =
     // 'http_requests_total'`, and the regex route renders `metric_name IN
-    // (…)` rather than `= '…'`. The quotes are backslash-escaped because
+    // (…)` rather than `= '…'`. Since issue #623 the name is a lookup
+    // predicate in both statements. The quotes are backslash-escaped because
     // the pattern becomes a ClickHouse string literal.
-    const CONCRETE: &str = "metric_series\\nWHERE metric_name = \\'http_requests_total\\'%";
+    const CONCRETE: &str = "%WHERE metric_name = \\'http_requests_total\\'%";
+    // The wide statement's head since issue #623: statement 2, the lookup
+    // rows of the series the activity read finds.
+    const WIDE_HEAD: &str =
+        "SELECT fingerprint, any(name) AS metric_name, any(label_text) AS labels\\nFROM (";
     let concrete_narrow = statements_matching(
         &admin,
         db,
-        &format!("query LIKE 'SELECT DISTINCT metric_name\\nFROM {CONCRETE}'"),
+        &format!("query LIKE 'SELECT DISTINCT metric_name\\nFROM metric_series{CONCRETE}'"),
     )
     .await;
-    let concrete_wide = statements_matching(
-        &admin,
-        db,
-        &format!("query LIKE 'SELECT fingerprint, metric_name, labels\\nFROM {CONCRETE}'"),
-    )
-    .await;
+    let concrete_wide =
+        statements_matching(&admin, db, &format!("query LIKE '{WIDE_HEAD}{CONCRETE}'")).await;
     assert!(
         concrete_narrow > 0,
         "the concrete-name `__name__` request must render the narrow projection.\nstatements:\n{}",
@@ -1709,8 +1745,12 @@ async fn prom_api_name_values_bodies_and_narrow_dispatch_issue_472() {
     // resolution and omit newly active names — a wrong answer passing the
     // check.
     let narrow_before = narrow;
-    const IN_FETCH: &str = "query LIKE 'SELECT fingerprint, metric_name, labels\\nFROM \
-                            metric_series\\nWHERE metric_name IN (%'";
+    // Issue #623: the names-only fetch is statement 2 scoped to the probed
+    // names on the lookup.
+    const IN_FETCH: &str = "query LIKE 'SELECT fingerprint, any(name) AS metric_name, \
+                            any(label_text) AS labels\\nFROM (\\n  SELECT fingerprint, \
+                            metric_name AS name, labels AS label_text\\n  FROM metric_labels\\n  \
+                            WHERE metric_name IN (%'";
     let in_fetch_before = statements_matching(&admin, db, IN_FETCH).await;
     let probes_before = statements_matching(&admin, db, probe_96).await;
 
@@ -1797,23 +1837,20 @@ async fn seed_c0_series(client: &ChClient, values: [f64; 2]) -> i64 {
         set.to_canonical_json()
     };
     client
-        .insert_block(
-            "metric_series",
-            &[
-                SeedSeriesRow {
-                    metric_name: "t539".to_string(),
-                    fingerprint: 1,
-                    unix_milli: recent_bucket,
-                    labels: label_json(&around('\u{8}')),
-                },
-                SeedSeriesRow {
-                    metric_name: "t539".to_string(),
-                    fingerprint: 2,
-                    unix_milli: recent_bucket,
-                    labels: label_json("abb"),
-                },
-            ],
-        )
+        .insert_series(&[
+            SeedSeriesRow {
+                metric_name: "t539".to_string(),
+                fingerprint: 1,
+                unix_milli: recent_bucket,
+                labels: label_json(&around('\u{8}')),
+            },
+            SeedSeriesRow {
+                metric_name: "t539".to_string(),
+                fingerprint: 2,
+                unix_milli: recent_bucket,
+                labels: label_json("abb"),
+            },
+        ])
         .await
         .expect("seed metric_series");
     client
@@ -1821,13 +1858,11 @@ async fn seed_c0_series(client: &ChClient, values: [f64; 2]) -> i64 {
             "metric_samples",
             &[
                 SeedSampleRow {
-                    metric_name: "t539".to_string(),
                     fingerprint: 1,
                     unix_milli: now,
                     value: values[0],
                 },
                 SeedSampleRow {
-                    metric_name: "t539".to_string(),
                     fingerprint: 2,
                     unix_milli: now,
                     value: values[1],

@@ -118,7 +118,6 @@ async fn drop_database(client: &ChClient, db: &str) {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 struct MetricSampleRow {
-    metric_name: String,
     /// `UInt128` since issue #498, read as the bare integer: this suite
     /// pins the COLUMN, and `pulsus-model`'s newtype is not a dependency
     /// of this crate.
@@ -246,7 +245,6 @@ async fn run_init_creates_every_m0_table_and_mv_and_is_idempotent() {
     let timestamp_ns = i64::try_from(now.as_nanos()).expect("fits i64");
 
     let metric_rows = vec![MetricSampleRow {
-        metric_name: "http_requests_total".to_string(),
         fingerprint: 0xFFFF_FFFF_FFFF_FFF1,
         unix_milli,
         value: 42.5,
@@ -271,7 +269,7 @@ async fn run_init_creates_every_m0_table_and_mv_and_is_idempotent() {
 
     let mut ms = client
         .query_stream::<MetricSampleRow>(
-            &format!("SELECT metric_name, fingerprint, unix_milli, value FROM {db}.metric_samples"),
+            &format!("SELECT fingerprint, unix_milli, value FROM {db}.metric_samples"),
             &QuerySettings::new(),
         )
         .await
@@ -293,12 +291,13 @@ async fn run_init_creates_every_m0_table_and_mv_and_is_idempotent() {
     assert_eq!(got_log, log_rows[0]);
 
     // EXPLAIN indexes=1 sanity check (docs/schemas.md §2.3 fetch shape):
-    // the metric_name-led primary key must be in play, not a full scan.
+    // F8 (issue #623): the series-ID-led primary key must be in play, not a
+    // full scan.
     let mut explain = client
         .query_stream::<ExplainRow>(
             &format!(
                 "EXPLAIN indexes = 1 SELECT fingerprint, unix_milli, value FROM {db}.metric_samples \
-                 WHERE metric_name = 'http_requests_total' AND fingerprint IN (toUInt128('18374588331335825905'))"
+                 WHERE fingerprint IN (toUInt128('18374588331335825905'))"
             ),
             &QuerySettings::new(),
         )
@@ -310,8 +309,8 @@ async fn run_init_creates_every_m0_table_and_mv_and_is_idempotent() {
         plan.push('\n');
     }
     assert!(
-        plan.contains("metric_name"),
-        "EXPLAIN output must show metric_name driving the primary key read, got:\n{plan}"
+        plan.contains("Keys:\n") && plan.contains("fingerprint"),
+        "EXPLAIN output must show the series ID driving the primary key read, got:\n{plan}"
     );
 }
 
@@ -546,19 +545,22 @@ async fn the_configured_retention_reaches_every_retained_tables_ttl() {
         .await
         .expect("a rebuild at the new PULSUS_RETENTION_DAYS must succeed");
 
-    for table in [
-        "metric_samples",
-        "log_samples",
-        "metric_hist_samples",
-        "log_patterns",
+    // Issue #623: the activity table keeps a day until its last sample has
+    // expired, `(day + 1 + retention) * 86400`.
+    for (table, want, stale) in [
+        ("metric_samples", "(30 * 86400)", "(7 * 86400)"),
+        ("log_samples", "(30 * 86400)", "(7 * 86400)"),
+        ("metric_hist_samples", "(30 * 86400)", "(7 * 86400)"),
+        ("log_patterns", "(30 * 86400)", "(7 * 86400)"),
+        ("metric_series", "+ 1) + 30) * 86400", "+ 1) + 7) * 86400"),
     ] {
         let after = create_table_query(&client, db, table).await;
         assert!(
-            after.contains("(30 * 86400)"),
+            after.contains(want),
             "{table}'s TTL must be updated to the new retention_days: {after}"
         );
         assert!(
-            !after.contains("(7 * 86400)"),
+            !after.contains(stale),
             "{table}: stale retention_days=7 TTL: {after}"
         );
         assert!(
@@ -755,8 +757,8 @@ async fn day_50_000_rows_survive_saturating_ttl_and_drop_under_the_wrapping_ttl(
     client
         .execute(
             &format!(
-                "INSERT INTO {db}.metric_samples (metric_name, fingerprint, unix_milli, value) \
-                 VALUES ('m_boundary', 1, {DAY_50_000_MS}, 1.0)"
+                "INSERT INTO {db}.metric_samples (fingerprint, unix_milli, value) \
+                 VALUES (1, {DAY_50_000_MS}, 1.0)"
             ),
             &QuerySettings::new(),
             Idempotency::NonIdempotent,
@@ -782,8 +784,8 @@ async fn day_50_000_rows_survive_saturating_ttl_and_drop_under_the_wrapping_ttl(
         .execute(
             &format!(
                 "INSERT INTO {db}.metric_hist_samples \
-                     (metric_name, fingerprint, unix_milli, schema, count, sum) \
-                 VALUES ('h_boundary', 1, {DAY_50_000_MS}, 0, 4, 2.0)"
+                     (fingerprint, unix_milli, schema, count, sum) \
+                 VALUES (1, {DAY_50_000_MS}, 0, 4, 2.0)"
             ),
             &QuerySettings::new(),
             Idempotency::NonIdempotent,
@@ -892,6 +894,7 @@ async fn a_fresh_database_creates_every_fingerprint_column_as_uint128() {
         "log_streams",
         "log_streams_idx",
         "metric_hist_samples",
+        "metric_labels",
         "metric_landing",
         "metric_samples",
         "metric_series",
@@ -993,7 +996,7 @@ async fn a_fresh_database_creates_every_fingerprint_column_as_uint128() {
 }
 
 // ---------------------------------------------------------------------
-// The metrics landing table and its four views (issue #603)
+// The metrics landing table and its views (issues #603, #623)
 // ---------------------------------------------------------------------
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -1004,7 +1007,7 @@ struct LandingColumnRow {
     default_expression: String,
 }
 
-/// `metric_landing`'s 26 columns, in declaration order, with the type and
+/// `metric_landing`'s 25 columns, in declaration order, with the type and
 /// codec each carries **as the server reports them**. Written out so the
 /// shipped table cannot drift from the row type the writer sends.
 ///
@@ -1012,8 +1015,7 @@ struct LandingColumnRow {
 /// `Gorilla` is reported as `Gorilla(8)`, and a column with no codec clause
 /// reports the empty string. The same normalisation the four shipped TTL
 /// assertions read around a parenthesised product.
-const LANDING_COLUMNS: [(&str, &str, &str); 26] = [
-    ("event_id", "UUID", ""),
+const LANDING_COLUMNS: [(&str, &str, &str); 25] = [
     ("received_ms", "Int64", "CODEC(DoubleDelta, ZSTD(1))"),
     ("kind", "UInt8", "CODEC(ZSTD(1))"),
     ("metric_name", "LowCardinality(String)", ""),
@@ -1046,10 +1048,9 @@ const LANDING_COLUMNS: [(&str, &str, &str); 26] = [
 ];
 
 /// A fresh `run_init` creates `metric_landing` with exactly the declared
-/// columns, in order, with the declared types and codecs, `event_id`
-/// defaulted by the server's own time-ordered UUID function, and the engine,
-/// partition, sorting key and fixed settings the design pins. The four
-/// `metric_*_mv` views exist beside it.
+/// columns, in order, with the declared types and codecs, and the engine,
+/// partition, sorting key and fixed settings the design pins. It carries no
+/// `event_id` (issue #623). The five `metric_*_mv` views exist beside it.
 #[tokio::test]
 async fn metric_landing_and_its_views_exist_after_init() {
     skip_unless_live!();
@@ -1078,9 +1079,9 @@ async fn metric_landing_and_its_views_exist_after_init() {
         assert_eq!(got.r#type, ty, "{name}'s type");
         assert_eq!(got.compression_codec, codec, "{name}'s codec");
     }
-    assert_eq!(
-        seen[0].default_expression, "generateUUIDv7()",
-        "the landed event's identity is the server's, not the writer's"
+    assert!(
+        seen.iter().all(|c| c.default_expression.is_empty()),
+        "no landing column is filled by the server"
     );
 
     let create = create_table_query(&client, db, "metric_landing").await;
@@ -1100,6 +1101,7 @@ async fn metric_landing_and_its_views_exist_after_init() {
         "metric_hist_samples_mv",
         "metric_series_mv",
         "metric_metadata_mv",
+        "metric_labels_mv",
     ] {
         assert!(
             names.contains(&view.to_string()),
@@ -1135,7 +1137,6 @@ async fn an_existing_landing_table_is_adopted_by_a_rerun() {
 
     let create = format!(
         "CREATE TABLE IF NOT EXISTS {db}.metric_landing (
-             event_id                 UUID DEFAULT generateUUIDv7(),
              received_ms              Int64  CODEC(DoubleDelta, ZSTD(1)),
              kind                     UInt8  CODEC(ZSTD(1)),
              metric_name              LowCardinality(String),
@@ -1239,6 +1240,7 @@ async fn dedup_settings_reach_the_landing_table_and_all_four_targets() {
         "metric_series",
         "metric_metadata",
         "metric_hist_samples",
+        "metric_labels",
     ] {
         let create = create_table_query(&client, db, table).await;
         assert!(
@@ -1247,6 +1249,292 @@ async fn dedup_settings_reach_the_landing_table_and_all_four_targets() {
         );
     }
 
+    drop_database(&client, db).await;
+}
+
+/// One landing row, every column, in the table's order. The client sends
+/// a full row; a kind-2 row leaves the other kinds' columns at zero.
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
+struct LandingSeriesRow {
+    received_ms: i64,
+    kind: u8,
+    metric_name: String,
+    fingerprint: u128,
+    unix_milli: i64,
+    value: f64,
+    labels: String,
+    value_type: u8,
+    metric_type: String,
+    help: String,
+    unit: String,
+    updated_ns: i64,
+    hist_schema: i8,
+    hist_zero_threshold: f64,
+    hist_zero_count: u64,
+    hist_count: u64,
+    hist_sum: f64,
+    hist_pos_span_offsets: Vec<i32>,
+    hist_pos_span_lengths: Vec<u32>,
+    hist_pos_bucket_deltas: Vec<i64>,
+    hist_neg_span_offsets: Vec<i32>,
+    hist_neg_span_lengths: Vec<u32>,
+    hist_neg_bucket_deltas: Vec<i64>,
+    hist_custom_values: Vec<f64>,
+    hist_counter_reset_hint: u8,
+}
+
+/// **S3 (issue #623): a label row is stored once per series, activity once
+/// per hour.** Three metric names over one label set, registered in two
+/// hours, land six kind-2 rows. `metric_series` keeps the six activity rows
+/// and no label text; `metric_labels` keeps one label row per series —
+/// three, each under its own name — once the engine has merged.
+#[tokio::test]
+async fn kind_2_rows_store_one_label_set_and_one_activity_row_per_series() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_metric_labels");
+    drop_database(&client, db).await;
+    run_init(&client, &test_ctx(db)).await.expect("run_init");
+    let mut data_cfg = test_config();
+    data_cfg.database = db.to_string();
+    let data_client = ChClient::new(data_cfg).await.expect("connect (data)");
+
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_millis(),
+    )
+    .expect("fits i64");
+    let hour = (now / 3_600_000) * 3_600_000;
+    let labels = r#"{"instance":"a:9100","job":"node"}"#;
+    let mut rows = Vec::new();
+    for name in ["up", "node_load1", "node_cpu_seconds_total"] {
+        for bucket in [hour - 3_600_000, hour] {
+            rows.push(LandingSeriesRow {
+                received_ms: now,
+                kind: 2,
+                metric_name: name.to_string(),
+                fingerprint: 77,
+                unix_milli: bucket,
+                labels: labels.to_string(),
+                ..Default::default()
+            });
+        }
+    }
+    // Two blocks, so the label table holds two parts until it merges.
+    data_client
+        .insert_block("metric_landing", &rows[..3])
+        .await
+        .expect("insert the first block");
+    data_client
+        .insert_block("metric_landing", &rows[3..])
+        .await
+        .expect("insert the second block");
+
+    let series_columns = count(
+        &client,
+        &format!(
+            "SELECT count() AS n FROM system.columns \
+             WHERE database = '{db}' AND table = 'metric_series' AND name = 'labels'"
+        ),
+    )
+    .await;
+    assert_eq!(series_columns, 0, "metric_series stores no label text");
+
+    client
+        .execute(
+            &format!("OPTIMIZE TABLE {db}.metric_labels FINAL"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("merge metric_labels");
+    assert_eq!(
+        count(
+            &client,
+            &format!("SELECT count() AS n FROM {db}.metric_labels")
+        )
+        .await,
+        3,
+        "one label row per series"
+    );
+    assert_eq!(
+        count(
+            &client,
+            &format!(
+                "SELECT uniqExact(metric_name) AS n FROM {db}.metric_labels \
+                 WHERE fingerprint = 77 AND labels = '{labels}'"
+            ),
+        )
+        .await,
+        3,
+        "each series' label row is the one its kind-2 rows carried"
+    );
+
+    drop_database(&client, db).await;
+}
+
+/// One kind-2 landing row of series `fp` at `unix_milli`.
+fn kind_2_row(fp: u128, unix_milli: i64, labels: &str) -> LandingSeriesRow {
+    LandingSeriesRow {
+        received_ms: unix_milli,
+        kind: 2,
+        metric_name: "m".to_string(),
+        fingerprint: fp,
+        unix_milli,
+        labels: labels.to_string(),
+        ..Default::default()
+    }
+}
+
+/// Today's UTC midnight, in milliseconds.
+fn today_ms() -> i64 {
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_millis(),
+    )
+    .expect("fits i64");
+    (now / 86_400_000) * 86_400_000
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug)]
+struct SeenRow {
+    first_seen: i64,
+    last_seen: i64,
+}
+
+async fn seen(client: &ChClient, sql: &str) -> Vec<SeenRow> {
+    let mut stream = client
+        .query_stream::<SeenRow>(sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    let mut out = Vec::new();
+    while let Some(row) = stream.next().await {
+        out.push(row.expect("decode"));
+    }
+    out
+}
+
+/// **A3 (issue #623): one activity row per series per day, its hours OR'd.**
+/// Two kind-2 rows of one series at hours 2 and 3 of one UTC day, each its
+/// own insert, merge to one row whose mask is `4 | 8 = 12`.
+#[tokio::test]
+async fn activity_folds_a_series_hours_into_one_row_per_day() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_activity_mask");
+    drop_database(&client, db).await;
+    run_init(&client, &test_ctx(db)).await.expect("run_init");
+    let mut data_cfg = test_config();
+    data_cfg.database = db.to_string();
+    let data_client = ChClient::new(data_cfg).await.expect("connect (data)");
+    let day = today_ms();
+    for hour in [2i64, 3] {
+        data_client
+            .insert_block(
+                "metric_landing",
+                &[kind_2_row(5, day + hour * 3_600_000, r#"{"job":"a"}"#)],
+            )
+            .await
+            .expect("insert a kind-2 row");
+    }
+    client
+        .execute(
+            &format!("OPTIMIZE TABLE {db}.metric_series FINAL"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("merge metric_series");
+    assert_eq!(
+        count(
+            &client,
+            &format!("SELECT count() AS n FROM {db}.metric_series")
+        )
+        .await,
+        1,
+        "one row for the series' day"
+    );
+    assert_eq!(
+        count(
+            &client,
+            &format!("SELECT toUInt64(hours) AS n FROM {db}.metric_series")
+        )
+        .await,
+        12,
+        "hours 2 and 3"
+    );
+    drop_database(&client, db).await;
+}
+
+/// **K4 (issue #623): the lookup keeps the hours a series was first and last
+/// registered.** Kind-2 rows of one series at hours 5, 2 and 9, each its own
+/// insert: before a merge, `min(first_seen)` and `max(last_seen)` by
+/// fingerprint are hours 2 and 9; after `OPTIMIZE FINAL` one row carries 2,
+/// 9 and the label text.
+#[tokio::test]
+async fn the_lookup_keeps_first_and_last_seen() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_first_last_seen");
+    drop_database(&client, db).await;
+    run_init(&client, &test_ctx(db)).await.expect("run_init");
+    let mut data_cfg = test_config();
+    data_cfg.database = db.to_string();
+    let data_client = ChClient::new(data_cfg).await.expect("connect (data)");
+    let day = today_ms();
+    let labels = r#"{"job":"k4"}"#;
+    for hour in [5i64, 2, 9] {
+        data_client
+            .insert_block(
+                "metric_landing",
+                &[kind_2_row(6, day + hour * 3_600_000, labels)],
+            )
+            .await
+            .expect("insert a kind-2 row");
+    }
+    let by_fp = format!(
+        "SELECT min(first_seen) AS first_seen, max(last_seen) AS last_seen \
+         FROM {db}.metric_labels GROUP BY fingerprint"
+    );
+    let before = seen(&client, &by_fp).await;
+    assert_eq!(before.len(), 1, "{before:?}");
+    assert_eq!(
+        (before[0].first_seen, before[0].last_seen),
+        (day + 2 * 3_600_000, day + 9 * 3_600_000),
+        "before a merge"
+    );
+    client
+        .execute(
+            &format!("OPTIMIZE TABLE {db}.metric_labels FINAL"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("merge metric_labels");
+    let rows = seen(
+        &client,
+        &format!("SELECT first_seen, last_seen FROM {db}.metric_labels"),
+    )
+    .await;
+    assert_eq!(rows.len(), 1, "one row after the merge: {rows:?}");
+    assert_eq!(
+        (rows[0].first_seen, rows[0].last_seen),
+        (day + 2 * 3_600_000, day + 9 * 3_600_000),
+        "after the merge"
+    );
+    assert_eq!(
+        count(
+            &client,
+            &format!("SELECT count() AS n FROM {db}.metric_labels WHERE labels = '{labels}'")
+        )
+        .await,
+        1,
+        "the label text survives the merge"
+    );
     drop_database(&client, db).await;
 }
 

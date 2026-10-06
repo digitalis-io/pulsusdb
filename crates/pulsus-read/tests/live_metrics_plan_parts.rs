@@ -59,7 +59,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
-use pulsus_model::DEFAULT_ACTIVITY_BUCKET_MS;
+use pulsus_model::ACTIVITY_BUCKET_MS;
 use pulsus_promql::parser::parse;
 use pulsus_read::{
     LabelCache, LabelCacheConfig, MetricQueryParams, MetricsConfig, MetricsEngine, PlanExplain,
@@ -159,7 +159,6 @@ struct SeedSeriesRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedSampleRow {
-    metric_name: String,
     fingerprint: u128,
     unix_milli: i64,
     value: f64,
@@ -167,7 +166,6 @@ struct SeedSampleRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedHistRow {
-    metric_name: String,
     fingerprint: u128,
     unix_milli: i64,
     schema: i8,
@@ -210,7 +208,7 @@ fn cache_config(db: &str) -> LabelCacheConfig {
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
         db: db.to_string(),
         series_table: "metric_series".to_string(),
-        bucket_ms: DEFAULT_ACTIVITY_BUCKET_MS,
+        labels_table: "metric_labels".to_string(),
         window_ms: 24 * 3_600_000,
         cache_max_series: 50_000,
         ttl: Duration::from_secs(60),
@@ -225,6 +223,7 @@ fn engine_config(db: &str) -> MetricsConfig {
         samples_table: "metric_samples".to_string(),
         hist_samples_table: "metric_hist_samples".to_string(),
         series_table: "metric_series".to_string(),
+        labels_table: "metric_labels".to_string(),
         metadata_table: "metric_metadata".to_string(),
         experimental_functions: false,
         max_metric_fanout: 1_000,
@@ -251,7 +250,6 @@ async fn seed(client: &ChClient, t: i64, bucket: i64) {
             labels: serde_json::to_string(&labels).expect("labels json"),
         });
         samples.push(SeedSampleRow {
-            metric_name: METRIC.to_string(),
             fingerprint: u128::from(*fp),
             unix_milli: t,
             value: i as f64,
@@ -267,16 +265,12 @@ async fn seed(client: &ChClient, t: i64, bucket: i64) {
             labels: serde_json::to_string(&labels).expect("labels json"),
         });
         samples.push(SeedSampleRow {
-            metric_name: ERRORS.to_string(),
             fingerprint: u128::from(*fp),
             unix_milli: t,
             value: i as f64,
         });
     }
-    client
-        .insert_block("metric_series", &series)
-        .await
-        .expect("seed metric_series");
+    seed_series_rows(client, &series).await;
     client
         .insert_block("metric_samples", &samples)
         .await
@@ -285,7 +279,6 @@ async fn seed(client: &ChClient, t: i64, bucket: i64) {
     // carries, so the dual read has rows on both sides and no `IN` list
     // gains a member.
     let hist = vec![SeedHistRow {
-        metric_name: METRIC.to_string(),
         fingerprint: u128::from(FPS[1]),
         unix_milli: t,
         schema: 0,
@@ -427,12 +420,11 @@ impl Harness {
 
     /// The float read this test writes out for `metric`, over the window
     /// `(start - back, end]`, with `fps` as a rendered list.
-    fn float_read(&self, metric: &str, fps: &str, back: i64) -> String {
+    fn float_read(&self, fps: &str, back: i64) -> String {
         let p = self.range();
         format!(
-            "SELECT fingerprint, unix_milli, value\nFROM metric_samples\nPREWHERE metric_name = \
-             '{metric}'\nWHERE unix_milli > {} AND unix_milli <= {}\n  AND fingerprint IN \
-             ({fps})\nORDER BY fingerprint, unix_milli",
+            "SELECT fingerprint, unix_milli, value\nFROM metric_samples\nWHERE unix_milli > {} \
+             AND unix_milli <= {}\n  AND fingerprint IN ({fps})\nORDER BY fingerprint, unix_milli",
             p.start_ms - back,
             p.end_ms
         )
@@ -445,7 +437,7 @@ impl Harness {
     /// Written out here rather than rendered by `grouped_sql`, for the
     /// reason at the top of this file: an expectation produced by the
     /// code under test agrees with whatever that code chose.
-    fn grouped_read(&self, metric: &str, fps: &str, gids: &str, back: i64) -> String {
+    fn grouped_read(&self, fps: &str, gids: &str, back: i64) -> String {
         let p = self.range();
         let lower = p.start_ms - back;
         let upper = p.end_ms;
@@ -496,7 +488,6 @@ impl Harness {
              CAST(0, 'UInt8') AS is_hist,\n\
              \x20                  reinterpretAsUInt64(value) = 9218868437227405314 AS stale\n\
              \x20           FROM metric_samples\n\
-             \x20           PREWHERE metric_name = '{metric}'\n\
              \x20           WHERE unix_milli > {lower} AND unix_milli <= {upper} \
              AND fingerprint IN fps\n\
              \x20           UNION ALL\n\
@@ -504,7 +495,6 @@ impl Harness {
              CAST(1, 'UInt8') AS is_hist,\n\
              \x20                  reinterpretAsUInt64(sum) = 9218868437227405314 AS stale\n\
              \x20           FROM metric_hist_samples\n\
-             \x20           PREWHERE metric_name = '{metric}'\n\
              \x20           WHERE unix_milli > {lower} AND unix_milli <= {upper} \
              AND fingerprint IN fps\n\
              \x20         )\n\
@@ -524,11 +514,11 @@ impl Harness {
     }
 
     /// The complementary histogram read, written out the same way.
-    fn hist_read(&self, metric: &str, fps: &str, back: i64) -> String {
+    fn hist_read(&self, fps: &str, back: i64) -> String {
         let p = self.range();
         format!(
             "SELECT fingerprint, unix_milli, {HIST_COLUMNS}\nFROM \
-             metric_hist_samples\nPREWHERE metric_name = '{metric}'\nWHERE unix_milli > {} AND \
+             metric_hist_samples\nWHERE unix_milli > {} AND \
              unix_milli <= {}\n  AND fingerprint IN ({fps})\nORDER BY fingerprint, unix_milli",
             p.start_ms - back,
             p.end_ms
@@ -545,7 +535,7 @@ async fn harness(db: &str) -> Harness {
     let client = ChClient::new(test_config(&db)).await.expect("connect");
     let now = now_ms();
     let t = (now / 60_000) * 60_000;
-    let bucket = (now / DEFAULT_ACTIVITY_BUCKET_MS) * DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = (now / ACTIVITY_BUCKET_MS) * ACTIVITY_BUCKET_MS;
     seed(&client, t, bucket).await;
 
     let cache = Arc::new(LabelCache::new(
@@ -629,12 +619,7 @@ async fn every_statement_the_database_received_is_the_one_the_test_wrote_out() {
     // one statement. The gid array is the group each fingerprint was
     // assigned in THIS process; the selector narrows to `status="500"`,
     // so the four matched series are one group and every gid is 0.
-    let want = sorted(vec![h.grouped_read(
-        METRIC,
-        FPS_SQL,
-        "0, 0, 0, 0",
-        LOOKBACK_MS,
-    )]);
+    let want = sorted(vec![h.grouped_read(FPS_SQL, "0, 0, 0, 0", LOOKBACK_MS)]);
     assert_eq!(got, want, "the aggregation's one grouped statement");
 
     // 2 — the same query WITHOUT the header sends exactly the same two
@@ -666,10 +651,10 @@ async fn every_statement_the_database_received_is_the_one_the_test_wrote_out() {
     );
     let back = LOOKBACK_MS + RANGE_MS;
     let want_two = sorted(vec![
-        h.float_read(METRIC, FPS_SQL, back),
-        h.hist_read(METRIC, FPS_SQL, back),
-        h.float_read(ERRORS, ERROR_FPS_SQL, back),
-        h.hist_read(ERRORS, ERROR_FPS_SQL, back),
+        h.float_read(FPS_SQL, back),
+        h.hist_read(FPS_SQL, back),
+        h.float_read(ERROR_FPS_SQL, back),
+        h.hist_read(ERROR_FPS_SQL, back),
     ]);
     assert_eq!(got.len(), 4, "two selectors, two statements each");
     assert_eq!(got, want_two, "the two chains' four statements");
@@ -836,4 +821,54 @@ async fn the_plans_sql_parts_are_the_statements_the_database_received() {
             }
         }
     }
+}
+
+/// Issue #623: a series is two rows now — its activity in `metric_series`
+/// and its own label row in `metric_labels`.
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SeedActivityRow {
+    day: u16,
+    fingerprint: u128,
+    metric_name: String,
+    hours: u32,
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SeedLabelRow {
+    metric_name: String,
+    fingerprint: u128,
+    labels: String,
+    first_seen: i64,
+    last_seen: i64,
+}
+
+/// Seeds `rows` the way the two views fill the tables from one kind-2 row.
+async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
+    let activity: Vec<SeedActivityRow> = rows
+        .iter()
+        .map(|r| SeedActivityRow {
+            day: r.unix_milli.div_euclid(86_400_000) as u16,
+            fingerprint: r.fingerprint,
+            metric_name: r.metric_name.clone(),
+            hours: 1u32 << (r.unix_milli.rem_euclid(86_400_000) / 3_600_000),
+        })
+        .collect();
+    let labels: Vec<SeedLabelRow> = rows
+        .iter()
+        .map(|r| SeedLabelRow {
+            metric_name: r.metric_name.clone(),
+            fingerprint: r.fingerprint,
+            labels: r.labels.clone(),
+            first_seen: r.unix_milli,
+            last_seen: r.unix_milli,
+        })
+        .collect();
+    client
+        .insert_block("metric_series", &activity)
+        .await
+        .expect("seed metric_series");
+    client
+        .insert_block("metric_labels", &labels)
+        .await
+        .expect("seed metric_labels");
 }

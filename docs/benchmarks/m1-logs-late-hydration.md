@@ -58,8 +58,8 @@ model (issue #16).
 ## Harness
 
 `cargo xtask bench logs-hydration` (`xtask/src/bench/logs_hydration/`), a
-sibling scenario to `logs-read`/`metrics-labels` (keeps #16's committed
-Tier-1 gates and #34's committed evidence byte-stable). No product
+sibling scenario to `logs-read` (keeps #16's committed Tier-1 gates
+byte-stable). No product
 read-path change: every stage reuses `pulsus_read::logql::{plan, sql}`
 unmodified; `service_set_from_idx`/`service_set_from_streams` (the two
 service-derivation builders `sql` doesn't have) are the only bench-local

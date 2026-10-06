@@ -154,17 +154,12 @@ impl std::fmt::Display for FpLiteral {
     }
 }
 
-/// The default `metric_series` activity-bucket width in milliseconds
-/// (docs/schemas.md §2.1, `PULSUS_SERIES_ACTIVITY_BUCKET`,
-/// `pulsus_config::ReaderConfig::series_activity_bucket`'s documented
-/// default, `1h`). Duplicated here as an `i64` constant — not derived from
-/// `pulsus-config` (this crate does not depend on it) — so both the writer
-/// (issue #26, bucket-floors `metric_series.unix_milli` at registration) and
-/// the reader (issue #30, renders the same floor into its historical-bound
-/// SQL) can pin their default against one source without a cross-crate
-/// dependency cycle; `pulsus-config`'s own default is cross-checked against
-/// this constant in `pulsus-write`'s test suite.
-pub const DEFAULT_ACTIVITY_BUCKET_MS: i64 = 3_600_000;
+/// The metrics activity bucket in milliseconds: one hour, fixed (issue
+/// #623; docs/schemas.md §2.1). The writer registers a series once per
+/// bucket (issue #26), and the activity table's hour mask holds one bit per
+/// hour, so the reader's window is exact to the bucket. Not configurable:
+/// a wider bucket would set bits the mask reads as hours with samples.
+pub const ACTIVITY_BUCKET_MS: i64 = 3_600_000;
 
 /// Floors `unix_milli` to the nearest (lower-or-equal) multiple of
 /// `bucket_ms` — the `metric_series` activity-bucket floor (docs/schemas.md
@@ -686,7 +681,7 @@ mod tests {
 
     #[test]
     fn default_activity_bucket_ms_is_one_hour() {
-        assert_eq!(DEFAULT_ACTIVITY_BUCKET_MS, 3_600_000);
+        assert_eq!(ACTIVITY_BUCKET_MS, 3_600_000);
     }
 
     #[test]

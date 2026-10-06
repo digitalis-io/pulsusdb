@@ -23,13 +23,12 @@
 //!   18446744073709551618   2^64 + 2   its neighbour
 //! ```
 //!
-//! **The inventory.** Twenty-three production `Row` structs carry a
+//! **The inventory.** Twenty-two production `Row` structs carry a
 //! `fingerprint` field — ten in `logql/rows.rs`, four in
-//! `metrics/sample_rows.rs`, one in `metrics/rows.rs`, two in
-//! `metrics/exec.rs` and six in `pulsus-write`'s `writer/rows.rs`. Two of
-//! the twenty-three were private, which is why a `pub struct` search
-//! returns twenty-one; they are `pub` now with that reason recorded on
-//! them. A twenty-fourth, `MetricRangeUnwrappedRow`, carries no
+//! `metrics/sample_rows.rs`, one in `metrics/rows.rs`, one in
+//! `metrics/exec.rs` and six in `pulsus-write`'s `writer/rows.rs`. One of
+//! them was private, which is why a `pub struct` search once returned one
+//! fewer; it is `pub` now with that reason recorded on it. One more, `MetricRangeUnwrappedRow`, carries no
 //! `fingerprint` field but reads the `class` column, which is the
 //! fingerprint itself when the group-key plan groups per fingerprint — so
 //! it is exercised here too.
@@ -51,9 +50,10 @@ use pulsus_read::metrics::exec as metrics_exec;
 use pulsus_read::metrics::{rows as metrics_rows, sample_rows};
 use pulsus_schema::RenderCtx;
 use pulsus_schema_testkit::run_init;
+use pulsus_write::SeriesRef;
 use pulsus_write::writer::{
-    LogPatternRow, LogSampleRow, LogStreamRow, MetricHistSampleRow, MetricSampleRow,
-    MetricSeriesRow,
+    LogPatternRow, LogSampleRow, LogStreamRow, MetricHistSampleRow, MetricLandingRow,
+    MetricSampleRow, MetricSeriesRow,
 };
 
 /// `2^64-1`, `2^64`, `2^64+1`, `2^64+2`.
@@ -213,60 +213,82 @@ async fn seed(client: &ChClient, db: &str) {
         .await
         .expect("insert log_patterns through LogPatternRow");
 
-    let series: Vec<MetricSeriesRow> = fingerprints()
+    // Issue #623: a series is written as a kind-2 landing row, which the two
+    // views turn into an activity row and a label row. `metric_series` has
+    // no label column for `MetricSeriesRow` to be inserted into, so it is
+    // read back below through the join that reassembles it.
+    let series: Vec<MetricLandingRow> = fingerprints()
         .into_iter()
-        .map(|fingerprint| MetricSeriesRow {
-            metric_name: "pulsus_probe".to_string(),
-            fingerprint,
-            unix_milli: ts_ms,
-            labels: r#"{"service_name":"checkout"}"#.to_string(),
-            value_type: 0,
+        .map(|fingerprint| {
+            MetricLandingRow::series(
+                ts_ms,
+                &SeriesRef {
+                    metric_name: "pulsus_probe".into(),
+                    fingerprint,
+                    labels: pulsus_model::LabelSet::from_normalized([(
+                        "service_name".to_string(),
+                        "checkout".to_string(),
+                    )])
+                    .0,
+                },
+                ts_ms,
+                0,
+            )
         })
         .collect();
     client
-        .insert_block("metric_series", &series)
+        .insert_block("metric_landing", &series)
         .await
-        .expect("insert metric_series through MetricSeriesRow");
+        .expect("insert a kind-2 row per fingerprint through MetricLandingRow");
 
-    let metric_samples: Vec<MetricSampleRow> = fingerprints()
+    // Issue #623: the sample tables have no `metric_name`; samples are
+    // written as kind-0 and kind-1 landing rows, which the views turn into
+    // sample rows. `MetricSampleRow` and `MetricHistSampleRow` are read back
+    // from the landing table below.
+    let samples: Vec<MetricLandingRow> = fingerprints()
         .into_iter()
-        .map(|fingerprint| MetricSampleRow {
-            metric_name: "pulsus_probe".to_string(),
-            fingerprint,
-            unix_milli: ts_ms,
-            value: 1.0,
+        .flat_map(|fingerprint| {
+            [
+                MetricLandingRow::float_sample(
+                    ts_ms,
+                    &pulsus_write::MetricPoint {
+                        metric_name: "pulsus_probe".into(),
+                        fingerprint,
+                        unix_milli: ts_ms,
+                        value: 1.0,
+                    },
+                ),
+                MetricLandingRow::hist_sample(
+                    ts_ms,
+                    &pulsus_write::HistogramPoint {
+                        metric_name: "pulsus_probe_hist".into(),
+                        fingerprint,
+                        unix_milli: ts_ms,
+                        histogram: pulsus_model::NativeHistogram {
+                            counter_reset_hint: pulsus_model::CounterResetHint::Unknown,
+                            schema: 0,
+                            zero_threshold: 0.0,
+                            zero_count: 0,
+                            count: 1,
+                            sum: 1.0,
+                            positive_spans: vec![pulsus_model::Span {
+                                offset: 0,
+                                length: 1,
+                            }],
+                            negative_spans: vec![],
+                            positive_buckets: vec![1],
+                            negative_buckets: vec![],
+                            custom_values: vec![],
+                        },
+                    },
+                ),
+            ]
         })
         .collect();
     client
-        .insert_block("metric_samples", &metric_samples)
+        .insert_block("metric_landing", &samples)
         .await
-        .expect("insert metric_samples through MetricSampleRow");
-
-    let hist: Vec<MetricHistSampleRow> = fingerprints()
-        .into_iter()
-        .map(|fingerprint| MetricHistSampleRow {
-            metric_name: "pulsus_probe_hist".to_string(),
-            fingerprint,
-            unix_milli: ts_ms,
-            schema: 0,
-            zero_threshold: 0.0,
-            zero_count: 0,
-            count: 1,
-            sum: 1.0,
-            pos_span_offsets: vec![0],
-            pos_span_lengths: vec![1],
-            pos_bucket_deltas: vec![1],
-            neg_span_offsets: Vec::new(),
-            neg_span_lengths: Vec::new(),
-            neg_bucket_deltas: Vec::new(),
-            custom_values: Vec::new(),
-            counter_reset_hint: 0,
-        })
-        .collect();
-    client
-        .insert_block("metric_hist_samples", &hist)
-        .await
-        .expect("insert metric_hist_samples through MetricHistSampleRow");
+        .expect("insert a kind-0 and a kind-1 row per fingerprint through MetricLandingRow");
 }
 
 /// **The control: the client refuses a narrow field, with the message the
@@ -501,7 +523,7 @@ async fn every_fingerprint_row_struct_round_trips_the_uint128_column() {
         rows.into_iter().map(|r| r.class).collect(),
     );
 
-    // The twenty-fourth: no `fingerprint` field, but its `class` column is
+    // The twenty-second: no `fingerprint` field, but its `class` column is
     // the fingerprint on the per-fingerprint plan.
     let rows: Vec<logql_rows::MetricRangeUnwrappedRow> = read_all(
         &client,
@@ -539,7 +561,7 @@ async fn every_fingerprint_row_struct_round_trips_the_uint128_column() {
         &client,
         "MultiSampleRow",
         &format!(
-            "SELECT metric_name, fingerprint, unix_milli, value FROM metric_samples \
+            "SELECT fingerprint, unix_milli, value FROM metric_samples \
              WHERE fingerprint IN ({fps}) ORDER BY fingerprint"
         ),
     )
@@ -571,7 +593,7 @@ async fn every_fingerprint_row_struct_round_trips_the_uint128_column() {
         &client,
         "MultiHistSampleRow",
         &format!(
-            "SELECT metric_name, fingerprint, unix_milli, {HIST_COLUMNS} \
+            "SELECT fingerprint, unix_milli, {HIST_COLUMNS} \
              FROM metric_hist_samples WHERE fingerprint IN ({fps}) ORDER BY fingerprint"
         ),
     )
@@ -586,7 +608,7 @@ async fn every_fingerprint_row_struct_round_trips_the_uint128_column() {
         &client,
         "SeriesRow",
         &format!(
-            "SELECT fingerprint, metric_name, labels FROM metric_series \
+            "SELECT fingerprint, metric_name, labels FROM metric_labels \
              WHERE fingerprint IN ({fps}) ORDER BY fingerprint"
         ),
     )
@@ -596,22 +618,7 @@ async fn every_fingerprint_row_struct_round_trips_the_uint128_column() {
         rows.into_iter().map(|r| r.fingerprint).collect(),
     );
 
-    // --- crates/pulsus-read/src/metrics/exec.rs (2, the two that were
-    // --- private) ----------------------------------------------------
-    let rows: Vec<metrics_exec::HydratedLabelsRow> = read_all(
-        &client,
-        "HydratedLabelsRow",
-        &format!(
-            "SELECT fingerprint, labels FROM metric_series WHERE fingerprint IN ({fps}) \
-             ORDER BY fingerprint"
-        ),
-    )
-    .await;
-    assert_the_four_boundary_values(
-        "HydratedLabelsRow",
-        rows.into_iter().map(|r| r.fingerprint).collect(),
-    );
-
+    // --- crates/pulsus-read/src/metrics/exec.rs (1, once private) -------
     let rows: Vec<metrics_exec::FingerprintOnlyRow> = read_all(
         &client,
         "FingerprintOnlyRow",
@@ -675,8 +682,8 @@ async fn every_fingerprint_row_struct_round_trips_the_uint128_column() {
         &client,
         "MetricSeriesRow",
         &format!(
-            "SELECT metric_name, fingerprint, unix_milli, labels, value_type FROM metric_series \
-             WHERE fingerprint IN ({fps}) ORDER BY fingerprint"
+            "SELECT metric_name, fingerprint, unix_milli, labels, value_type FROM metric_landing \
+             WHERE kind = 2 AND fingerprint IN ({fps}) ORDER BY fingerprint"
         ),
     )
     .await;
@@ -689,8 +696,8 @@ async fn every_fingerprint_row_struct_round_trips_the_uint128_column() {
         &client,
         "MetricSampleRow",
         &format!(
-            "SELECT metric_name, fingerprint, unix_milli, value FROM metric_samples \
-             WHERE fingerprint IN ({fps}) ORDER BY fingerprint"
+            "SELECT metric_name, fingerprint, unix_milli, value FROM metric_landing \
+             WHERE kind = 0 AND fingerprint IN ({fps}) ORDER BY fingerprint"
         ),
     )
     .await;
@@ -703,11 +710,16 @@ async fn every_fingerprint_row_struct_round_trips_the_uint128_column() {
         &client,
         "MetricHistSampleRow",
         &format!(
-            "SELECT metric_name, fingerprint, unix_milli, schema, zero_threshold, zero_count, \
-             count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, \
-             neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, \
-             counter_reset_hint FROM metric_hist_samples WHERE fingerprint IN ({fps}) \
-             ORDER BY fingerprint"
+            "SELECT metric_name, fingerprint, unix_milli, hist_schema AS schema, \
+             hist_zero_threshold AS zero_threshold, hist_zero_count AS zero_count, \
+             hist_count AS count, hist_sum AS sum, hist_pos_span_offsets AS pos_span_offsets, \
+             hist_pos_span_lengths AS pos_span_lengths, \
+             hist_pos_bucket_deltas AS pos_bucket_deltas, \
+             hist_neg_span_offsets AS neg_span_offsets, \
+             hist_neg_span_lengths AS neg_span_lengths, \
+             hist_neg_bucket_deltas AS neg_bucket_deltas, hist_custom_values AS custom_values, \
+             hist_counter_reset_hint AS counter_reset_hint FROM metric_landing \
+             WHERE kind = 1 AND fingerprint IN ({fps}) ORDER BY fingerprint"
         ),
     )
     .await;

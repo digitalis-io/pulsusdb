@@ -768,7 +768,7 @@ fn t_c6_the_fixed_refusals_keep_their_messages() {
 }
 
 /// `T-C6b`: the two carved-out fields' refusal matrix, as a CROSS PRODUCT
-/// rather than a list of queries — `docs/api.md:1039` says of them that
+/// rather than a list of queries — `docs/api.md:1042` says of them that
 /// "any ordered comparison at those fields stay `400`", and a list is how
 /// an earlier draft used `>` twice and `<` not at all.
 #[test]

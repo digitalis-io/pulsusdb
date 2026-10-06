@@ -404,7 +404,6 @@
           "properties": {
             "cache_ttl": { "$ref": "#/definitions/humanDuration" },
             "cache_max_series": { "type": "integer", "minimum": 1 },
-            "series_activity_bucket": { "$ref": "#/definitions/humanDuration" },
             "cache_window": { "$ref": "#/definitions/humanDuration" },
             "promql_max_samples": { "type": "integer", "minimum": 1 },
             "promql_lookback": { "$ref": "#/definitions/humanDuration" },

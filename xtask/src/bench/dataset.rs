@@ -496,7 +496,7 @@ pub async fn load(client: &ChClient, spec: &DatasetSpec) -> anyhow::Result<Datas
 // `DatasetSummary` widening (deviation from the architect plan's v1/v2
 // `broad_tiers` field sketch, recorded in the issue #35 implementation
 // notes): each breadth gets its own freshly-dropped-and-reinitialized
-// database (mirroring `metrics_labels::run`'s per-`bucket_ms` reset), so
+// database, so
 // [`HYDRATION_SERVICE`] never needs a breadth suffix and the R6 "identical
 // fingerprints across all breadths" property (v4 architect plan) falls out
 // structurally: the same `(service, env, region, stream_ordinal)`
@@ -505,7 +505,7 @@ pub async fn load(client: &ChClient, spec: &DatasetSpec) -> anyhow::Result<Datas
 // rather than requiring a second selector branch to reunite a
 // breadth-varying service name with a breadth-invariant result set. This
 // keeps [`DatasetSpec`]/[`DatasetSummary`] (and therefore every committed
-// `logs-read-*.json`/`metrics-labels-*.json` byte-shape) completely
+// `logs-read-*.json` byte-shape) completely
 // untouched.
 
 /// The fixed, result-bearing stream count every breadth carries — equal to

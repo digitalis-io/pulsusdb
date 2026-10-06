@@ -97,9 +97,9 @@ const STALE_NAN_DECIMAL: u64 = 9_218_868_437_227_405_314;
 /// owner of it), and this function does not re-check it; it also does not
 /// re-check the feature flag.
 ///
-/// **Nine parameters, four of them interchangeable by type.** Transposing
+/// **Eight parameters, four of them interchangeable by type.** Transposing
 /// `lower_excl_ms` and `upper_incl_ms`, or the two table names, compiles.
-/// The signature is the one issue #549's plan specifies and is kept, so
+/// The signature is the one issue #549's plan specifies less its metric name (issue #623), so
 /// what guards against a transposition is a test rather than the type
 /// system — and **which test depends on where the transposition is**,
 /// measured by making each one:
@@ -120,7 +120,6 @@ const STALE_NAN_DECIMAL: u64 = 9_218_868_437_227_405_314;
 pub fn grouped_fetch(
     samples_table: &str,
     hist_samples_table: &str,
-    metric_name: &str,
     fps: &[FpLiteral],
     gids: &[u32],
     grid: Grid,
@@ -128,7 +127,6 @@ pub fn grouped_fetch(
     upper_incl_ms: i64,
     op: GroupedOp,
 ) -> String {
-    let name = sample_sql::name_predicate(metric_name);
     let window = sample_sql::window_predicate(lower_excl_ms, upper_incl_ms);
     let fp_list = sample_sql::render_fingerprint_list(fps);
     let gid_list = gids
@@ -228,14 +226,12 @@ pub fn grouped_fetch(
          CAST(0, 'UInt8') AS is_hist,\n\
          \x20                  reinterpretAsUInt64(value) = {STALE_NAN_DECIMAL} AS stale\n\
          \x20           FROM {samples_table}\n\
-         \x20           PREWHERE {name}\n\
          \x20           WHERE {window} AND fingerprint IN fps\n\
          \x20           UNION ALL\n\
          \x20           SELECT fingerprint, unix_milli AS ts, CAST(0, 'Float64') AS v, \
          CAST(1, 'UInt8') AS is_hist,\n\
          \x20                  reinterpretAsUInt64(sum) = {STALE_NAN_DECIMAL} AS stale\n\
          \x20           FROM {hist_samples_table}\n\
-         \x20           PREWHERE {name}\n\
          \x20           WHERE {window} AND fingerprint IN fps\n\
          \x20         )\n\
          \x20       )\n\
@@ -270,7 +266,6 @@ mod tests {
         grouped_fetch(
             "metric_samples",
             "metric_hist_samples",
-            "http_requests_total",
             &[
                 Fingerprint::from_raw(101).sql_literal(),
                 Fingerprint::from_raw(205).sql_literal(),
@@ -346,7 +341,6 @@ mod tests {
              CAST(0, 'UInt8') AS is_hist,\n\
              \x20                  reinterpretAsUInt64(value) = 9218868437227405314 AS stale\n\
              \x20           FROM metric_samples\n\
-             \x20           PREWHERE metric_name = 'http_requests_total'\n\
              \x20           WHERE unix_milli > 1782906900000 AND unix_milli <= 1782910800000 \
              AND fingerprint IN fps\n\
              \x20           UNION ALL\n\
@@ -354,7 +348,6 @@ mod tests {
              CAST(1, 'UInt8') AS is_hist,\n\
              \x20                  reinterpretAsUInt64(sum) = 9218868437227405314 AS stale\n\
              \x20           FROM metric_hist_samples\n\
-             \x20           PREWHERE metric_name = 'http_requests_total'\n\
              \x20           WHERE unix_milli > 1782906900000 AND unix_milli <= 1782910800000 \
              AND fingerprint IN fps\n\
              \x20         )\n\
@@ -407,7 +400,6 @@ mod tests {
         let a = grouped_fetch(
             "metric_samples",
             "metric_hist_samples",
-            "m",
             &[
                 Fingerprint::from_raw(1).sql_literal(),
                 Fingerprint::from_raw(2).sql_literal(),
@@ -421,7 +413,6 @@ mod tests {
         let b = grouped_fetch(
             "metric_samples",
             "metric_hist_samples",
-            "m",
             &[
                 Fingerprint::from_raw(1).sql_literal(),
                 Fingerprint::from_raw(2).sql_literal(),
@@ -439,13 +430,12 @@ mod tests {
         );
     }
 
-    /// The window predicate and the metric-name literal come from
-    /// [`super::sample_sql`]'s own producers, so the grouped statement
-    /// and the per-sample statement cannot disagree about what they read.
+    /// The window predicate comes from [`super::sample_sql`]'s own
+    /// producer, so the grouped statement and the per-sample statement
+    /// cannot disagree about what they read.
     #[test]
     fn the_read_predicates_are_the_sample_fetchs_own_fragments() {
         let s = sql(GroupedOp::Max);
-        assert!(s.contains(&sample_sql::name_predicate("http_requests_total")));
         assert!(s.contains(&sample_sql::window_predicate(
             1_782_906_900_000,
             1_782_910_800_000
@@ -454,24 +444,21 @@ mod tests {
         assert!(!s.contains("unix_milli >= 1782906900000"));
     }
 
-    /// An injected metric name stays inside one string literal, exactly
-    /// as it does on the per-sample fetch.
+    /// The sample tables carry no metric name: the series ID holds it, so
+    /// the statement reads by ID alone and names no metric anywhere.
     #[test]
-    fn metric_name_injection_stays_inside_one_literal() {
-        let payload = "up'; DROP TABLE metric_samples; --";
-        let s = grouped_fetch(
-            "metric_samples",
-            "metric_hist_samples",
-            payload,
-            &[Fingerprint::from_raw(1).sql_literal()],
-            &[0],
-            grid(),
-            0,
-            100,
+    fn the_statement_names_no_metric() {
+        for op in [
+            GroupedOp::Min,
             GroupedOp::Max,
-        );
-        assert!(s.contains(&sample_sql::name_predicate(payload)));
-        assert!(!s.contains("DROP TABLE metric_samples; --\n"));
+            GroupedOp::Count,
+            GroupedOp::Group,
+        ] {
+            let s = sql(op);
+            assert!(!s.contains("metric_name"), "{op:?}");
+            assert!(!s.contains("PREWHERE"), "{op:?}");
+            assert!(s.contains("AND fingerprint IN fps"), "{op:?}");
+        }
     }
 
     /// ADR 0008 D2, as amended by issue #549: the statement binds no

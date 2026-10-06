@@ -154,7 +154,7 @@ fn writer_with(
 /// One push is one insert into one table (issue #603), so the metric cases
 /// have one inserter and count rows by `kind`.
 fn metric_writer_with(cfg: WriterConfig, landing: Arc<MockInserter>) -> MetricWriter {
-    MetricWriter::with_landing_inserter(landing, &cfg, pulsus_model::DEFAULT_ACTIVITY_BUCKET_MS)
+    MetricWriter::with_landing_inserter(landing, &cfg, pulsus_model::ACTIVITY_BUCKET_MS)
 }
 
 /// Lets a queued landing block reach a worker and settle. An async push
@@ -949,24 +949,22 @@ async fn concurrent_identical_descriptor_bearing_pushes_store_one_copy() {
         1,
         "exactly one push's samples reached the table"
     );
-    assert_eq!(
-        landing.rows_of_kind(3),
-        4,
-        "every one of the four lands its descriptor: suppression drops the sample, \
-         series and histogram rows — the ones a repeat would duplicate — and still \
-         lands the descriptors, which a repeat would CORRECT. There is no cache gate \
-         left to skip one (issue #603): a repeated descriptor is stored and collapses \
-         on `metric_name` under `ReplacingMergeTree(updated_ns)`, and the statement that \
-         reads the table takes one whole tuple, so four identical rows answer what one \
-         does."
+    // Suppression drops the sample, series and histogram rows — the ones a
+    // repeat would duplicate — and leaves the descriptors to the descriptor
+    // rule (issue #623): a push sends one unless this writer has already
+    // committed the same one this hour. Which of the four admissions saw the
+    // first commit depends on timing, so between one and four land.
+    let descriptors = landing.rows_of_kind(3);
+    assert!(
+        (1..=4).contains(&descriptors),
+        "at least the first push's descriptor lands, and no push lands two: {descriptors}"
     );
 }
 
 /// A genuine retry is still suppressed: suppression drops exactly the rows a
-/// repeat would duplicate — the sample, series and histogram rows — and the
-/// retry's descriptor is stored, because a repeated descriptor collapses on
-/// `metric_name` under `ReplacingMergeTree(updated_ns)` while a dropped one
-/// can leave a wrong type standing (issue #603).
+/// repeat would duplicate — the sample, series and histogram rows. The
+/// retry's descriptor is the one the first push already committed this hour,
+/// so it is not sent again (issue #623).
 #[tokio::test]
 async fn a_retried_push_carrying_the_same_descriptor_is_still_suppressed() {
     let landing = MockInserter::new(Behavior::Ok);
@@ -999,9 +997,8 @@ async fn a_retried_push_carrying_the_same_descriptor_is_still_suppressed() {
 
     assert_eq!(
         landing.rows_of_kind(3),
-        2,
-        "both descriptors are stored: the retry's is a repeat, and a repeat of a \
-         descriptor cannot change an answer"
+        1,
+        "the retry's descriptor is the one already sent this hour"
     );
     assert_eq!(
         landing.rows_of_kind(0),
@@ -1016,7 +1013,9 @@ async fn a_retried_push_carrying_the_same_descriptor_is_still_suppressed() {
 /// answered with the original push's outcome.
 ///
 /// Suppression is ordered before the descriptor rule, so the block a
-/// suppressed push sends carries kind-3 rows and nothing else.
+/// suppressed push sends carries kind-3 rows and nothing else. It sends one
+/// only when the descriptor is due again (issue #623): the case forgets what
+/// the writer recorded, as the hour turning does.
 #[tokio::test]
 async fn a_suppressed_push_still_lands_its_descriptor_alone() {
     let landing = MockInserter::new(Behavior::Ok);
@@ -1043,6 +1042,7 @@ async fn a_suppressed_push_still_lands_its_descriptor_alone() {
         .expect("queue has room");
     wait.await.expect("the first push settles");
     assert_eq!(landing.call_count(), 1);
+    writer.forget_sent_descriptors_for_test();
 
     let wait = writer
         .admit_flush(body(), PushHeaders::default())

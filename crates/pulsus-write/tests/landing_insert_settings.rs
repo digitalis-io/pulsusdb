@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use pulsus_clickhouse::{ChClient, ChError, QuerySettings};
 use pulsus_config::WriterConfig;
-use pulsus_model::{DEFAULT_ACTIVITY_BUCKET_MS, Fingerprint, LabelSet};
+use pulsus_model::{ACTIVITY_BUCKET_MS, Fingerprint, LabelSet};
 use pulsus_write::writer::{
     BlockInserter, ChBlockInserter, MetricWriter, MetricWriterTables, WriterRuntime,
 };
@@ -440,7 +440,7 @@ async fn a_retryable_pre_send_failure_is_resent_and_settles_not_committed() {
     let writer = MetricWriter::with_landing_inserter_and_runtime(
         Arc::new(ChBlockInserter::new(client)),
         runtime,
-        DEFAULT_ACTIVITY_BUCKET_MS,
+        ACTIVITY_BUCKET_MS,
         MetricWriterTables::metrics_default(),
     );
 

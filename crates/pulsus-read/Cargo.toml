@@ -9,7 +9,7 @@ rust-version.workspace = true
 pulsus-logql = { path = "../pulsus-logql" }
 pulsus-clickhouse = { path = "../pulsus-clickhouse" }
 pulsus-config = { path = "../pulsus-config" }
-# `floor_to_activity_bucket`/`DEFAULT_ACTIVITY_BUCKET_MS` (the writer/reader
+# `floor_to_activity_bucket`/`ACTIVITY_BUCKET_MS` (the writer/reader
 # shared bucket-floor identity, issue #26 precedent) plus `LabelSet`/
 # `Fingerprint`/`LabelMatcher`/`MatchOp` for the issue #30 label cache.
 pulsus-model = { path = "../pulsus-model" }

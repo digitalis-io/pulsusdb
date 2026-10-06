@@ -17,7 +17,7 @@
 //!   labels through this decoder.
 //! * The metric label pushdown renders
 //!   `JSONExtractString(labels, '<key>') = '<value>'`
-//!   (`crates/pulsus-read/src/metrics/series_where.rs:333`), and the
+//!   (`crates/pulsus-read/src/metrics/series_where.rs:384`), and the
 //!   in-process matcher answers the same selector from the label cache,
 //!   which is filled through this decoder. Which of the two paths answers a
 //!   given query is a runtime decision (`crates/pulsus-read/src/metrics/labels.rs:9-14`),

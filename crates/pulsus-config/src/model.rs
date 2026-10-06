@@ -437,7 +437,6 @@ impl Default for WriterConfig {
 pub struct ReaderConfig {
     pub cache_ttl: HumanDuration,
     pub cache_max_series: u64,
-    pub series_activity_bucket: HumanDuration,
     pub cache_window: HumanDuration,
     pub promql_max_samples: u64,
     pub promql_lookback: HumanDuration,
@@ -671,7 +670,6 @@ impl Default for ReaderConfig {
         ReaderConfig {
             cache_ttl: HumanDuration(Duration::from_secs(60)),
             cache_max_series: 50_000,
-            series_activity_bucket: HumanDuration(Duration::from_secs(3_600)),
             cache_window: HumanDuration(Duration::from_secs(24 * 3_600)),
             promql_max_samples: 50_000_000,
             promql_lookback: HumanDuration(Duration::from_secs(300)),

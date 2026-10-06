@@ -403,11 +403,22 @@ impl Lower<Pql> for NodeLower {
 /// in our process — the core's own description of `Cut::DisjointSources`.
 /// `Pred::disjoint_or_branches` then partitions them into two parts.
 ///
-/// The three fragments come from [`super::sample_sql`]'s own producers,
-/// so the leaf text and the statement text cannot disagree.
-pub fn selector_pred(name: &str, window: &str, fps: &str) -> Pred {
-    let text = format!("{name} AND {window} AND {fps}");
+/// The fragments come from [`super::sample_sql`]'s own producers, so the
+/// leaf text and the statement text cannot disagree. `names` is the
+/// fan-out's metric names, stated beside the sample predicates; a read of
+/// one metric states its IDs and window alone, as its statement does
+/// (issue #623).
+pub fn selector_pred(names: Option<&str>, window: &str, fps: &str) -> Pred {
+    let text = read_text(names, window, fps);
     Pred::leaf(text.clone(), METRIC_SAMPLES).or(Pred::leaf(text, METRIC_HIST_SAMPLES))
+}
+
+/// One read's leaf text: the optional names, the window, the IDs.
+fn read_text(names: Option<&str>, window: &str, fps: &str) -> String {
+    match names {
+        Some(names) => format!("{names} AND {window} AND {fps}"),
+        None => format!("{window} AND {fps}"),
+    }
 }
 
 /// One pushed selector's read, as one predicate: the grouped statement
@@ -416,8 +427,8 @@ pub fn selector_pred(name: &str, window: &str, fps: &str) -> Pred {
 /// carried additively by [`Pql::also_reads`] rather than by a second
 /// branch (a disjunction here would split it into two parts, which is a
 /// plan describing two statements where the engine sends one).
-pub fn grouped_selector_pred(name: &str, window: &str, fps: &str) -> Pred {
-    Pred::leaf(format!("{name} AND {window} AND {fps}"), METRIC_SAMPLES)
+pub fn grouped_selector_pred(window: &str, fps: &str) -> Pred {
+    Pred::leaf(read_text(None, window, fps), METRIC_SAMPLES)
 }
 
 /// The seed relation a PromQL chain folds from.
@@ -1325,7 +1336,7 @@ mod tests {
 
     fn pred(tag: &str) -> Pred {
         selector_pred(
-            &format!("metric_name = '{tag}'"),
+            Some(&format!("metric_name = '{tag}'")),
             "unix_milli > 1 AND unix_milli <= 2",
             "fingerprint IN (toUInt128('7'))",
         )
@@ -1442,7 +1453,6 @@ mod tests {
                 selector: i,
                 pred: if pushed {
                     grouped_selector_pred(
-                        "metric_name = 'http_requests_total'",
                         "unix_milli > 1 AND unix_milli <= 2",
                         "fingerprint IN (toUInt128('7'))",
                     )
@@ -1468,6 +1478,7 @@ mod tests {
             samples_table: "metric_samples".to_string(),
             hist_samples_table: "metric_hist_samples".to_string(),
             series_table: "metric_series".to_string(),
+            labels_table: "metric_labels".to_string(),
             metadata_table: "metric_metadata".to_string(),
             experimental_functions: true,
             max_metric_fanout: 1_000,

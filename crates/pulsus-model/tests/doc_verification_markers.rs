@@ -255,12 +255,6 @@ const MARKERS: &[Marker] = &[
         evidence: Evidence::None,
     },
     Marker {
-        file: "docs/benchmarks/m2-metrics-label-resolution.md",
-        key: "Verified live in this session (podman, ClickHouse 24.8): all 48 cells",
-        subject: Subject::Internal,
-        evidence: Evidence::None,
-    },
-    Marker {
         file: "docs/benchmarks/traces-differential-ledger.md",
         key: "one we should have and do not — and re-verified live against",
         subject: Subject::Reference,

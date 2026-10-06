@@ -957,12 +957,13 @@ mod tests {
         assert_type(&r, "pulsus_ingest_metadata_upserts_total", "counter");
 
         // Per-table values (one table × 7 series), and none for any of the
-        // four tables the views maintain: the writer does not insert into
+        // five tables the views maintain: the writer does not insert into
         // them, so it has nothing to report about them.
         assert_table_series(&r, "metric_landing", 100);
         for absent in [
             "metric_samples",
             "metric_series",
+            "metric_labels",
             "metric_metadata",
             "metric_hist_samples",
         ] {

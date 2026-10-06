@@ -351,11 +351,6 @@ const ROWS: &[Row] = &[
         check: |c| c.reader.cache_max_series == 12345,
     },
     Row {
-        var: "PULSUS_SERIES_ACTIVITY_BUCKET",
-        value: "2h",
-        check: |c| c.reader.series_activity_bucket.0 == Duration::from_secs(2 * 3_600),
-    },
-    Row {
         var: "PULSUS_CACHE_WINDOW",
         value: "48h",
         check: |c| c.reader.cache_window.0 == Duration::from_secs(48 * 3_600),
@@ -538,8 +533,8 @@ fn matrix_rows_exactly_match_all_env_vars() {
     );
     assert_eq!(
         declared.len(),
-        96,
-        "docs/configuration.md §§1-8 document exactly 96 variables"
+        95,
+        "docs/configuration.md §§1-8 document exactly 95 variables"
     );
 
     let mut canonical: Vec<&str> = pulsus_config::ALL_ENV_VARS.to_vec();

@@ -48,7 +48,6 @@ writer:
 reader:
   cache_ttl: 30s
   cache_max_series: 10000
-  series_activity_bucket: 1d
   cache_window: 12h
   promql_max_samples: 1000000
   promql_lookback: 10m
@@ -128,10 +127,6 @@ fn full_fixture_round_trips_into_typed_values() {
 
     assert_eq!(cfg.reader.cache_ttl.0, Duration::from_secs(30));
     assert_eq!(cfg.reader.cache_max_series, 10_000);
-    assert_eq!(
-        cfg.reader.series_activity_bucket.0,
-        Duration::from_secs(86_400)
-    );
     assert_eq!(cfg.reader.cache_window.0, Duration::from_secs(12 * 3_600));
     assert_eq!(cfg.reader.promql_max_samples, 1_000_000);
     assert_eq!(cfg.reader.promql_lookback.0, Duration::from_secs(600));

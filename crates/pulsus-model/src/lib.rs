@@ -16,8 +16,8 @@ pub use canonical::{
     log_label_name,
 };
 pub use fingerprint::{
-    build_metric_buffer, build_stream_buffer, compose128, metric_fingerprint, raw_cityhash64,
-    stream_fingerprint,
+    SERIES_NAME_PREFIX_BITS, build_metric_buffer, build_series_buffer, build_stream_buffer,
+    compose128, metric_fingerprint, raw_cityhash64, series_fingerprint, stream_fingerprint,
 };
 pub use float_histogram::{
     Bucket as FloatBucket, CombineOp, CombineOutcome, CounterResetHint, FloatHistogram,
@@ -31,8 +31,7 @@ pub use labels::{LabelError, LabelSet, resolve_structured_metadata, retain_non_e
 pub use matcher::{LabelMatcher, MatchOp};
 pub use sample::{LogSample, MetricSample, STALE_NAN_BITS, Series};
 pub use time::{
-    DEFAULT_ACTIVITY_BUCKET_MS, Date, Fingerprint, FpLiteral, UnixMilli, UnixNano,
-    floor_to_activity_bucket,
+    ACTIVITY_BUCKET_MS, Date, Fingerprint, FpLiteral, UnixMilli, UnixNano, floor_to_activity_bucket,
 };
 
 #[cfg(test)]

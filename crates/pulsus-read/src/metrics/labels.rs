@@ -59,8 +59,9 @@ pub struct LabelCacheConfig {
     /// `metric_series` (or its `_dist`-suffixed wrapper — cluster-aware
     /// resolution lives in the server's config wiring, not here).
     pub series_table: String,
-    /// `PULSUS_SERIES_ACTIVITY_BUCKET`, milliseconds.
-    pub bucket_ms: i64,
+    /// `metric_labels` (or its `_dist`-suffixed wrapper), one row per
+    /// series, which the sweep reads for the series it finds (issue #623).
+    pub labels_table: String,
     /// `PULSUS_CACHE_WINDOW`, milliseconds — bounds cache *residency*
     /// (reading 1, task-manager resolution #1 on issue #30).
     pub window_ms: i64,
@@ -93,9 +94,9 @@ pub struct LabelCacheConfig {
 #[derive(Debug, Default)]
 pub struct CacheSnapshot {
     pub(crate) by_fingerprint: HashMap<Fingerprint, LabelSet>,
-    /// Values are sorted, deduped fingerprint lists — a consequence of the
-    /// sweep's `LIMIT 1 BY metric_name, fingerprint` dedup, re-sorted after
-    /// the sweep completes (see [`super::refresh`]).
+    /// Values are sorted, deduped fingerprint lists — the sweep returns one
+    /// row per `(metric_name, fingerprint)`, re-sorted after the sweep
+    /// completes (see [`super::refresh`]).
     pub(crate) by_metric: HashMap<String, Vec<Fingerprint>>,
     /// The sweep's own `now_ms` (wall-clock milliseconds since the Unix
     /// epoch, [`super::refresh::now_unix_ms`]) — meaningless (`0`) only for
@@ -670,9 +671,9 @@ fn sql_fallback_sql(
 ) -> String {
     super::sql::historical_series_subquery(
         &config.series_table,
+        &config.labels_table,
         metric_name,
         window,
-        config.bucket_ms,
         matchers,
     )
 }
@@ -1226,7 +1227,7 @@ impl MultiMetricScanProbe {
             config: LabelCacheConfig {
                 db: "pulsus".to_string(),
                 series_table: "metric_series".to_string(),
-                bucket_ms: 3_600_000,
+                labels_table: "metric_labels".to_string(),
                 window_ms: 24 * 3_600_000,
                 cache_max_series: 50_000,
                 ttl: Duration::from_secs(60),
@@ -1313,7 +1314,7 @@ mod tests {
         LabelCacheConfig {
             db: "pulsus".to_string(),
             series_table: "metric_series".to_string(),
-            bucket_ms: 3_600_000,
+            labels_table: "metric_labels".to_string(),
             window_ms: 24 * 3_600_000,
             cache_max_series: 50_000,
             ttl: Duration::from_secs(60),
@@ -1947,7 +1948,9 @@ mod tests {
                     reason,
                     FallbackReason::OverCardinality { matched: 2, cap: 1 }
                 );
-                assert!(!sql.contains(" IN ("));
+                // The matchers select from the label table in a sub-query
+                // (issue #623); no fingerprint list is materialized.
+                assert!(!sql.contains("IN (toUInt128"), "{sql}");
             }
             other => panic!("expected SqlFallback, got {other:?}"),
         }

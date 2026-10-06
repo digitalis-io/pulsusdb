@@ -439,11 +439,10 @@ fn spawn_reconnect_loop(
                         // client, same lifecycle gate — shares one
                         // ClickHouse connection pool with `LogWriter`
                         // rather than opening a second one.
-                        let bucket_ms = config.reader.series_activity_bucket.0.as_millis() as i64;
                         let metric_writer = Arc::new(MetricWriter::new_with_tables(
                             client.clone(),
                             &config.writer,
-                            bucket_ms,
+                            pulsus_model::ACTIVITY_BUCKET_MS,
                             metric_writer_tables_from(&config),
                         ));
                         let _ = writer_slots.metric.set(metric_writer);

@@ -1,11 +1,13 @@
 //! Row generators for the benchmark scenarios. Every shape mirrors the
 //! authoritative DDL in docs/schemas.md so the benchmark measures the real
-//! write/read path, not a narrowed synthetic tuple (issue #3 Codex finding 1).
+//! write/read path, not a narrowed synthetic tuple (issue #3).
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-/// `metric_samples` row (docs/schemas.md §2.1).
+/// `metric_samples` row (docs/schemas.md §2.1), plus the metric name its
+/// series ID's prefix is taken from. The name is not a column (issue #623):
+/// the table holds `fingerprint`, `unix_milli` and `value`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MetricRow {
     pub metric_name: String,
@@ -15,11 +17,11 @@ pub struct MetricRow {
 }
 
 impl MetricRow {
-    /// Uncompressed payload size in bytes (string bytes + fixed-width
-    /// columns): `fingerprint` is 16 bytes since issue #498, then
-    /// `unix_milli` and `value` at 8 each.
+    /// Uncompressed payload size in bytes of the inserted columns:
+    /// `fingerprint` is 16 bytes since issue #498, then `unix_milli` and
+    /// `value` at 8 each.
     pub fn payload_bytes(&self) -> usize {
-        self.metric_name.len() + 16 + 8 + 8
+        16 + 8 + 8
     }
 }
 
@@ -76,9 +78,25 @@ fn splitmix64(mut x: u64) -> u64 {
     z ^ (z >> 31)
 }
 
+/// The bits of a series ID below its name prefix.
+const SERIES_BODY_MASK: u128 = (1u128 << (128 - pulsus_model::SERIES_NAME_PREFIX_BITS)) - 1;
+
+/// The first and last series ID under `metric_name`'s prefix: the key range
+/// one metric's samples occupy (issue #623).
+pub fn name_id_range(metric_name: &str) -> (u128, u128) {
+    let prefix = u128::from(
+        pulsus_model::raw_cityhash64(metric_name.as_bytes())
+            >> (64 - pulsus_model::SERIES_NAME_PREFIX_BITS),
+    );
+    let lo = prefix << (128 - pulsus_model::SERIES_NAME_PREFIX_BITS);
+    (lo, lo | SERIES_BODY_MASK)
+}
+
 /// Generates `n` metric-shaped rows starting at global index `start`, deterministic
-/// given the seed. Row `start == 0` is forced to carry [`HIGH_BIT_FINGERPRINT`] so
-/// every rep's first block exercises the unsigned-fingerprint round-trip gate.
+/// given the seed. Every ID is its name's prefix above a body; row `start == 0`
+/// takes [`HIGH_BIT_FINGERPRINT`]'s body, whose low word carries its top bit,
+/// so every rep's first block exercises the unsigned-fingerprint round-trip
+/// gate.
 pub fn gen_metric_rows(n: u64, start: u64, seed: u64) -> Vec<MetricRow> {
     let mut rng = StdRng::seed_from_u64(seed ^ start);
     let base_ts: i64 = 1_700_000_000_000;
@@ -91,18 +109,22 @@ pub fn gen_metric_rows(n: u64, start: u64, seed: u64) -> Vec<MetricRow> {
         // the mix: the production fingerprint is a `cityHash64` half above
         // an `xxHash64` half, so a benchmark that left one word zero would
         // measure a narrower value than the schema carries.
-        let fingerprint = if idx == 0 {
+        let metric_name = format!("bench_metric_{metric_idx:04}");
+        // Issue #623: the series ID carries its metric name's prefix, so a
+        // metric's series sort together under `(fingerprint, unix_milli)`.
+        let body = if idx == 0 {
             HIGH_BIT_FINGERPRINT
         } else {
             let seed = metric_idx.wrapping_mul(1_000_003).wrapping_add(series_idx);
             ((splitmix64(seed) as u128) << 64) | (splitmix64(seed ^ 0x5851_F42D_4C95_7F2D) as u128)
         };
+        let fingerprint = name_id_range(&metric_name).0 | (body & SERIES_BODY_MASK);
         let jitter: i64 = rng.gen_range(-2..=2);
         let unix_milli = base_ts + (idx as i64) * 10 + jitter;
         // Gorilla-friendly: slowly varying value, not white noise.
         let value = 50.0 + ((idx % 3600) as f64) * 0.05 + rng.gen_range(-0.01..0.01);
         out.push(MetricRow {
-            metric_name: format!("bench_metric_{metric_idx:04}"),
+            metric_name,
             fingerprint,
             unix_milli,
             value,
@@ -152,12 +174,35 @@ mod tests {
     #[test]
     fn metric_rows_first_row_has_high_bit_fingerprint() {
         let rows = gen_metric_rows(10, 0, 42);
-        assert_eq!(rows[0].fingerprint, HIGH_BIT_FINGERPRINT);
+        // Issue #623: the ID's top bits are its name's prefix, and
+        // `bench_metric_0000`'s prefix carries the top bit itself.
+        assert_eq!(
+            rows[0].fingerprint,
+            name_id_range("bench_metric_0000").0 | (HIGH_BIT_FINGERPRINT & SERIES_BODY_MASK)
+        );
+        assert!(rows[0].fingerprint > (1u128 << 127));
+        assert!((rows[0].fingerprint as u64) > (1u64 << 63));
         // Both words carry their top bit, so a signed read of either one
         // comes back negative and the round-trip gate covers the whole
         // 128-bit width rather than its low half.
         const { assert!(HIGH_BIT_FINGERPRINT > (1u128 << 127)) };
         const { assert!((HIGH_BIT_FINGERPRINT as u64) > (1u64 << 63)) };
+    }
+
+    /// **Every generated metric row's ID lies in its name's range** (issue
+    /// #623): the fetch reads one metric as `fingerprint BETWEEN lo AND
+    /// hi`, so a row outside its name's range is inserted and never read.
+    #[test]
+    fn every_generated_metric_row_falls_in_its_names_range() {
+        for row in gen_metric_rows(5_000, 0, 42) {
+            let (lo, hi) = name_id_range(&row.metric_name);
+            assert!(
+                (lo..=hi).contains(&row.fingerprint),
+                "{} {:#x} outside {lo:#x}..={hi:#x}",
+                row.metric_name,
+                row.fingerprint
+            );
+        }
     }
 
     #[test]

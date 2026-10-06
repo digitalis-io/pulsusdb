@@ -61,7 +61,6 @@ writer:
 reader:
   cache_ttl: 60s
   cache_max_series: 50000
-  series_activity_bucket: 1h
   cache_window: 24h
   promql_max_samples: 50000000
   promql_lookback: 5m
