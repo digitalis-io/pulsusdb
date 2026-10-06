@@ -9,8 +9,8 @@
 //! window.
 //!
 //! **It is an operator tool, run by hand.** Absent the subcommand the binary
-//! behaves exactly as before. It is deliberately without tests: there is no
-//! environment here that would exercise it faithfully.
+//! behaves exactly as before. `tests/rebuild_live.rs` runs it as the binary
+//! against a live ClickHouse (issue #623).
 //!
 //! The projection is read out of the view's own rendered statement
 //! (`pulsus_schema::mv_projection`), so the replay applies the same
@@ -24,13 +24,15 @@ use pulsus_config::Config;
 
 use crate::chconfig::{conn_config_from, schema_params_from};
 
-/// The five targets, each with the materialized view that maintains it, the
-/// expression its partitions are keyed on, and whether it tolerates a replay
-/// without dropping those partitions first.
+/// The five targets, each with the materialized view that maintains it and,
+/// where a replay must drop partitions first, the expression they are keyed
+/// on.
 ///
-/// `metric_metadata` and `metric_labels` do: each is a replacing table keyed
-/// on what a replayed row repeats (`metric_name`; `(metric_name, fingerprint)`), so a
-/// replayed row is the same row or loses to a newer one. The other three are
+/// Three tolerate a replay without dropping. `metric_metadata` is a
+/// replacing table keyed on `metric_name`, so a replayed row is the same row
+/// or loses to a newer one; `metric_labels` and `metric_series` aggregate,
+/// so a replayed row folds into the one stored — `min` and `max` of the same
+/// instants, an OR of the same hours (issue #623). The two sample tables are
 /// append-only, so a replay that does not drop first stores every row twice
 /// and inflates every counting query.
 const TARGETS: &[(&str, &str, Option<&str>)] = &[
@@ -44,16 +46,16 @@ const TARGETS: &[(&str, &str, Option<&str>)] = &[
         "metric_hist_samples_mv",
         Some("toDate(fromUnixTimestamp64Milli(unix_milli))"),
     ),
-    (
-        "metric_series",
-        "metric_series_mv",
-        Some("toDate(fromUnixTimestamp64Milli(unix_milli))"),
-    ),
+    // Partitioned by day, but no need to drop (issue #623): a replayed row
+    // ORs its hours into the day's mask, which already holds them, so a
+    // replay adds nothing twice. Dropping would lose what the landing table
+    // no longer holds, and a day could not be restored from its retention.
+    ("metric_series", "metric_series_mv", None),
     // No partition key, and no need to drop: the engine collapses on
     // `metric_name`.
     ("metric_metadata", "metric_metadata_mv", None),
-    // No partition key, and no need to drop: the engine collapses on
-    // `fingerprint`, and a fingerprint names one label set.
+    // No partition key, and no need to drop: the engine folds on
+    // `(metric_name, fingerprint)`, a series' one lookup row.
     ("metric_labels", "metric_labels_mv", None),
 ];
 
@@ -74,8 +76,8 @@ pub(crate) struct RebuildMetrics {
 
     /// Drop the target partitions the replayed rows fall in first. This
     /// deletes **every** row in those partitions, including data the landing
-    /// table no longer holds. Without it the three append-only targets are
-    /// refused, because a replay would store their rows twice.
+    /// table no longer holds. Without it the two sample tables are refused,
+    /// because a replay would store their rows twice.
     #[arg(long)]
     drop_target_partitions: bool,
 }
@@ -165,14 +167,20 @@ async fn rebuild(config: &Config, args: RebuildMetrics) -> Result<String, String
     ))
 }
 
-/// The partition ids the replayed rows fall in, read by applying the target's
+/// The partition IDs the replayed rows fall in, read by applying the target's
 /// own partition expression to the rows the replay would insert.
+///
+/// `partitionID`, not `toString` (issue #623): `DROP PARTITION ID` takes the
+/// ID, and a `Date` partition's ID is `20261006` where its text is
+/// `2026-10-06`. Dropping by the text names no stored partition, drops
+/// nothing and succeeds, so the replay stored every row a second time.
 async fn distinct_partitions(
     client: &ChClient,
     select: &str,
     partition_expr: &str,
 ) -> Result<Vec<String>, String> {
-    let sql = format!("SELECT DISTINCT toString({partition_expr}) AS s FROM ({select}) ORDER BY s");
+    let sql =
+        format!("SELECT DISTINCT partitionID({partition_expr}) AS s FROM ({select}) ORDER BY s");
     client
         .query_strings(&sql, &QuerySettings::new())
         .await

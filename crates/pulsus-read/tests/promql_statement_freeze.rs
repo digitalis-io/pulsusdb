@@ -125,10 +125,12 @@ fn freeze_config() -> MetricsConfig {
 const GOLDEN: &str = include_str!("golden/promql_statements.txt");
 const PINNED: &str = include_str!("golden/promql_statements.sha256");
 
-/// The three constants published on issue #548 before the code existed.
+/// The three constants published on issue #548 before the code existed;
+/// the line and byte counts re-taken by issue #623, whose sample statements
+/// carry no metric name.
 const ENTRIES: usize = 30;
-const LINES: usize = 736;
-const BYTES: usize = 39_043;
+const LINES: usize = 676;
+const BYTES: usize = 36_167;
 /// The statements the writer's markers declare. Sixty before issue #549;
 /// four entries now send ONE statement where they sent two.
 const STATEMENTS: usize = 56;

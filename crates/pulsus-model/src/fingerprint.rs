@@ -82,7 +82,13 @@ pub fn build_metric_buffer(labels: &LabelSet) -> Vec<u8> {
 /// and the golden vectors catch it once; a third primitive for a third
 /// identity gives up exactly that.
 pub fn compose128(buf: &[u8]) -> Fingerprint {
-    Fingerprint::from_raw(((raw_cityhash64(buf) as u128) << 64) | (xxh64(buf, 0) as u128))
+    Fingerprint::from_raw(hash128(buf))
+}
+
+/// [`compose128`]'s value as a bare integer, for the series ID to take its
+/// low bits from.
+fn hash128(buf: &[u8]) -> u128 {
+    ((raw_cityhash64(buf) as u128) << 64) | (xxh64(buf, 0) as u128)
 }
 
 /// Metric fingerprint: [`compose128`] over [`build_metric_buffer`], whose
@@ -144,17 +150,39 @@ pub fn raw_cityhash64(buf: &[u8]) -> u64 {
     ch_cityhash102::cityhash64(buf)
 }
 
-/// The name prefix's width in a series ID (issue #623).
+/// The width of the metric-name prefix at the top of a series ID (issue
+/// #623): the top bits of `cityHash64(metric_name)`. A metric's series
+/// share it, so under `ORDER BY (fingerprint, unix_milli)` one metric's
+/// samples sit together, as they did when `metric_name` led the key.
 pub const SERIES_NAME_PREFIX_BITS: u32 = 24;
 
-/// STUB (issue #623, tests first).
-pub fn build_series_buffer(_metric_name: &str, _labels: &LabelSet) -> Vec<u8> {
-    Vec::new()
+/// The bits of a series ID below the name prefix: the identity.
+const SERIES_BODY_BITS: u32 = 128 - SERIES_NAME_PREFIX_BITS;
+
+/// The series ID's buffer: `metric_name ++ 0xFF ++` [`build_metric_buffer`].
+/// `0xFF` never occurs in UTF-8, so the buffer encodes the name and the
+/// labels without ambiguity.
+///
+/// `pub` for the same reason as [`build_metric_buffer`].
+pub fn build_series_buffer(metric_name: &str, labels: &LabelSet) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(metric_name.len() + 1);
+    buf.extend_from_slice(metric_name.as_bytes());
+    buf.push(SEP);
+    buf.extend_from_slice(&build_metric_buffer(labels));
+    buf
 }
 
-/// STUB (issue #623, tests first).
-pub fn series_fingerprint(_metric_name: &str, _labels: &LabelSet) -> Fingerprint {
-    Fingerprint::from_raw(0)
+/// The metric series ID (issue #623): the top [`SERIES_NAME_PREFIX_BITS`]
+/// of `cityHash64(metric_name)`, then the low bits of [`compose128`] over
+/// [`build_series_buffer`]. One label set under two names is two series.
+/// Reproducible in ClickHouse: the prefix is
+/// `bitShiftRight(cityHash64(metric_name), 64 - SERIES_NAME_PREFIX_BITS)`.
+pub fn series_fingerprint(metric_name: &str, labels: &LabelSet) -> Fingerprint {
+    let prefix =
+        u128::from(raw_cityhash64(metric_name.as_bytes()) >> (64 - SERIES_NAME_PREFIX_BITS));
+    let body =
+        hash128(&build_series_buffer(metric_name, labels)) & ((1u128 << SERIES_BODY_BITS) - 1);
+    Fingerprint::from_raw((prefix << SERIES_BODY_BITS) | body)
 }
 
 #[cfg(test)]

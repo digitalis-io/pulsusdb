@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pulsus_clickhouse::{ChError, ChRow, QuerySettings};
-use pulsus_config::{ByteSize, Config, WriterConfig};
+use pulsus_config::{ByteSize, WriterConfig};
 use pulsus_model::{ACTIVITY_BUCKET_MS, Fingerprint, LabelSet, NativeHistogram, Span};
 use pulsus_write::writer::{
     BlockInserter, LANDING_ROW_SLOT_BYTES, MetricLandingRow, MetricWriter, MetricWriterTables,
@@ -441,19 +441,13 @@ fn epoch_millis() -> i64 {
 
 // -- the cross-crate bucket-floor identity ----------------------------
 
-/// The default `metric_series` activity bucket
-/// (`pulsus_config::ReaderConfig::series_activity_bucket`) must resolve to
-/// exactly `pulsus_model::ACTIVITY_BUCKET_MS`, and the writer's
-/// admission-time flooring must be the same function the reader renders into
-/// its historical-bound SQL — proven by construction (`MetricWriter` only
-/// ever calls `floor_to_activity_bucket`), not by convention.
+/// The activity bucket is fixed at one hour (issue #623): the activity
+/// table's hour mask has one bit per hour, so the writer registers a series
+/// once per hour and the reader's window is exact to the hour. The writer
+/// is handed this constant (`serve.rs`); nothing configures it.
 #[test]
-fn default_series_activity_bucket_matches_the_shared_floor_constant() {
-    let cfg = Config::default();
-    assert_eq!(
-        cfg.reader.series_activity_bucket.0.as_millis() as i64,
-        ACTIVITY_BUCKET_MS
-    );
+fn the_activity_bucket_is_one_hour() {
+    assert_eq!(ACTIVITY_BUCKET_MS, 3_600_000);
 }
 
 // -- one push, one block ----------------------------------------------

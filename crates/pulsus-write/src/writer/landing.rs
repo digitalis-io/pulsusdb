@@ -54,7 +54,7 @@ pub(crate) const MSG_SHUTDOWN_QUEUED: &str = "the writer shut down before the bl
 /// | what it holds | bytes |
 /// |---|---|
 /// | the block itself, and the queue slot it is moved into | `2 * size_of::<LandingBlock<R>>()` |
-/// | `settings`: ten owned key/value pairs | their vector, sixteen slots — its first allocation is four, the fifth pair doubles it and the ninth doubles it again — plus 408 for their text **by capacity**: 18 + 6, 50 + 10, 26 + 36, 21 + 8, 27 + 10, 33 + 10, 26 + 8, 27 + 10, 32 + 10, 30 + 10, at a 36-byte token and the largest accepted row ceiling. A value rendered from an integer literal is allocated ten bytes whatever its digits; one rendered from the `u64` ceiling is allocated its digits, which is why the largest ceiling is the term (406 at the default, 400 at the floor) |
+/// | `settings`: fourteen owned key/value pairs | their vector, [`LANDING_SETTINGS_SLOTS`] slots — its first allocation is four, the fifth pair doubles it and the ninth doubles it again — plus [`LANDING_SETTINGS_TEXT_BYTES`] for their text **by capacity**: 18 + 6, 50 + 10, 26 + 36, 21 + 8, 27 + 10, 33 + 10, 26 + 8, 27 + 10, 32 + 10, 30 + 10, 32 + 10, 51 + 10, 49 + 10, 50 + 10, at a 36-byte token and the largest accepted row ceiling. A value rendered from an integer literal is allocated ten bytes whatever its digits; one rendered from the `u64` ceiling is allocated its digits, which is why the largest ceiling is the term (628 at the default, 622 at the floor) |
 /// | `claim`: the `Vec<PushDigest>` its one key allocates, four slots at its first push | `4 * size_of::<PushDigest>()` |
 /// | `waiter`: one `oneshot` channel in sync mode — a state word, two waker slots and one `Result<(), WriteError>` | 256. Those four come to 8 + 2 × 16 + 32 = 72; the rest is allowance, because the channel's own bookkeeping is private to it |
 ///
@@ -67,21 +67,14 @@ pub(crate) const MSG_SHUTDOWN_QUEUED: &str = "the writer shut down before the bl
 ///
 /// **The figure does not depend on `R`.** `LandingBlock<R>`'s only
 /// `R`-dependent field is a `Vec<R>`, whose header is three words whatever `R`
-/// is, and the settings are the same ten names at the same token width and the
-/// same largest accepted row ceiling for both signals — the two ceilings'
+/// is, and the settings are the same fourteen names at the same token width
+/// and the same largest accepted row ceiling for both signals — the two ceilings'
 /// accepted ranges are identical, which is what lets one derivation serve
 /// both.
-/// STUB (issue #623, tests first).
-#[allow(dead_code)]
-pub const LANDING_SETTINGS_SLOTS: u64 = 16;
-/// STUB (issue #623, tests first).
-#[allow(dead_code)]
-pub const LANDING_SETTINGS_TEXT_BYTES: u64 = 630;
-
 pub const fn landing_block_overhead_bytes<R>() -> u64 {
     2 * std::mem::size_of::<LandingBlock<R>>() as u64
-        + 16 * std::mem::size_of::<(String, String)>() as u64
-        + 408
+        + LANDING_SETTINGS_SLOTS * std::mem::size_of::<(String, String)>() as u64
+        + LANDING_SETTINGS_TEXT_BYTES
         + 4 * std::mem::size_of::<push_dedup::PushDigest>() as u64
         + 256
 }
@@ -91,6 +84,15 @@ pub const fn landing_block_overhead_bytes<R>() -> u64 {
 /// `reserve_queued_bytes` takes it, whichever ending settles releases it and
 /// `record_flush` reports it, so no two halves of the accounting can drift
 /// apart.
+/// The vector slots [`QuerySettings::landing_insert`]'s pairs occupy: its
+/// first allocation is four, the fifth pair doubles it and the ninth doubles
+/// it again, and fourteen pairs fit in sixteen.
+pub const LANDING_SETTINGS_SLOTS: u64 = 16;
+
+/// The text of [`QuerySettings::landing_insert`]'s pairs by capacity, at a
+/// 36-byte token and the largest accepted row ceiling: the table above.
+pub const LANDING_SETTINGS_TEXT_BYTES: u64 = 630;
+
 pub const fn landing_charge<R>(row_bytes: u64) -> u64 {
     row_bytes + landing_block_overhead_bytes::<R>()
 }

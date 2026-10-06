@@ -420,12 +420,11 @@ impl Harness {
 
     /// The float read this test writes out for `metric`, over the window
     /// `(start - back, end]`, with `fps` as a rendered list.
-    fn float_read(&self, metric: &str, fps: &str, back: i64) -> String {
+    fn float_read(&self, fps: &str, back: i64) -> String {
         let p = self.range();
         format!(
-            "SELECT fingerprint, unix_milli, value\nFROM metric_samples\nPREWHERE metric_name = \
-             '{metric}'\nWHERE unix_milli > {} AND unix_milli <= {}\n  AND fingerprint IN \
-             ({fps})\nORDER BY fingerprint, unix_milli",
+            "SELECT fingerprint, unix_milli, value\nFROM metric_samples\nWHERE unix_milli > {} \
+             AND unix_milli <= {}\n  AND fingerprint IN ({fps})\nORDER BY fingerprint, unix_milli",
             p.start_ms - back,
             p.end_ms
         )
@@ -438,7 +437,7 @@ impl Harness {
     /// Written out here rather than rendered by `grouped_sql`, for the
     /// reason at the top of this file: an expectation produced by the
     /// code under test agrees with whatever that code chose.
-    fn grouped_read(&self, metric: &str, fps: &str, gids: &str, back: i64) -> String {
+    fn grouped_read(&self, fps: &str, gids: &str, back: i64) -> String {
         let p = self.range();
         let lower = p.start_ms - back;
         let upper = p.end_ms;
@@ -489,7 +488,6 @@ impl Harness {
              CAST(0, 'UInt8') AS is_hist,\n\
              \x20                  reinterpretAsUInt64(value) = 9218868437227405314 AS stale\n\
              \x20           FROM metric_samples\n\
-             \x20           PREWHERE metric_name = '{metric}'\n\
              \x20           WHERE unix_milli > {lower} AND unix_milli <= {upper} \
              AND fingerprint IN fps\n\
              \x20           UNION ALL\n\
@@ -497,7 +495,6 @@ impl Harness {
              CAST(1, 'UInt8') AS is_hist,\n\
              \x20                  reinterpretAsUInt64(sum) = 9218868437227405314 AS stale\n\
              \x20           FROM metric_hist_samples\n\
-             \x20           PREWHERE metric_name = '{metric}'\n\
              \x20           WHERE unix_milli > {lower} AND unix_milli <= {upper} \
              AND fingerprint IN fps\n\
              \x20         )\n\
@@ -517,11 +514,11 @@ impl Harness {
     }
 
     /// The complementary histogram read, written out the same way.
-    fn hist_read(&self, metric: &str, fps: &str, back: i64) -> String {
+    fn hist_read(&self, fps: &str, back: i64) -> String {
         let p = self.range();
         format!(
             "SELECT fingerprint, unix_milli, {HIST_COLUMNS}\nFROM \
-             metric_hist_samples\nPREWHERE metric_name = '{metric}'\nWHERE unix_milli > {} AND \
+             metric_hist_samples\nWHERE unix_milli > {} AND \
              unix_milli <= {}\n  AND fingerprint IN ({fps})\nORDER BY fingerprint, unix_milli",
             p.start_ms - back,
             p.end_ms
@@ -622,12 +619,7 @@ async fn every_statement_the_database_received_is_the_one_the_test_wrote_out() {
     // one statement. The gid array is the group each fingerprint was
     // assigned in THIS process; the selector narrows to `status="500"`,
     // so the four matched series are one group and every gid is 0.
-    let want = sorted(vec![h.grouped_read(
-        METRIC,
-        FPS_SQL,
-        "0, 0, 0, 0",
-        LOOKBACK_MS,
-    )]);
+    let want = sorted(vec![h.grouped_read(FPS_SQL, "0, 0, 0, 0", LOOKBACK_MS)]);
     assert_eq!(got, want, "the aggregation's one grouped statement");
 
     // 2 — the same query WITHOUT the header sends exactly the same two
@@ -659,10 +651,10 @@ async fn every_statement_the_database_received_is_the_one_the_test_wrote_out() {
     );
     let back = LOOKBACK_MS + RANGE_MS;
     let want_two = sorted(vec![
-        h.float_read(METRIC, FPS_SQL, back),
-        h.hist_read(METRIC, FPS_SQL, back),
-        h.float_read(ERRORS, ERROR_FPS_SQL, back),
-        h.hist_read(ERRORS, ERROR_FPS_SQL, back),
+        h.float_read(FPS_SQL, back),
+        h.hist_read(FPS_SQL, back),
+        h.float_read(ERROR_FPS_SQL, back),
+        h.hist_read(ERROR_FPS_SQL, back),
     ]);
     assert_eq!(got.len(), 4, "two selectors, two statements each");
     assert_eq!(got, want_two, "the two chains' four statements");

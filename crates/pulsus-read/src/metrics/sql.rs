@@ -1,5 +1,6 @@
-//! Pure fallback SQL builders — the snapshot-testing surface for issue
-//! #30's `metric_series` historical/JOIN fallback (docs/schemas.md §2.1).
+//! Pure series-read SQL builders — the snapshot-testing surface for the
+//! lookup and activity reads (issue #623; docs/schemas.md §2.1): every
+//! matcher on `metric_labels`, the window on `metric_series`.
 //! Every function here is `data -> String`: no `ChClient`, no I/O. Callers
 //! ([`super::labels`]) pre-escape every user-controlled fragment before it
 //! reaches these builders, via the single injection boundary this crate
@@ -19,7 +20,7 @@
 //! The `(?-s)` prefix is issue #324: ClickHouse's `match()` sets RE2's
 //! `dot_nl` option, so `.` matches a newline there and does not in RE2
 //! itself — the escaper's own doc carries the measurement. Issue #315 adds
-//! a constant, analysis-time [`re2_compile_probe`] alongside every regex
+//! a constant, analysis-time compile probe alongside every regex
 //! predicate, so a pattern RE2 rejects is rejected even when the query
 //! window holds no rows for `match()` to run on.
 //!
@@ -43,40 +44,9 @@ use pulsus_model::FpLiteral;
 use crate::logql::escape::ch_string;
 
 use super::matcher::{DataWindow, DiscoveryFilter, LabelMatcher};
-use super::series_where::{MatcherTarget, SeriesWhere};
+use super::series_where::{Lookup, SeriesWhere};
 
-/// The `FROM`/`WHERE` head every metric-scoped builder shares, with the
-/// window bound, its issue #315 compile probe and the matcher conjuncts
-/// supplied as one inseparable fragment by [`SeriesWhere`] — so "a user
-/// regex rendered without its probe" is not expressible here from the
-/// sanctioned components (see `super::series_where`'s module doc, which
-/// also states the one unsealed crossing rustc does not police).
-fn base_where(
-    series_table: &str,
-    labels_table: &str,
-    metric_name: &str,
-    window: DataWindow,
-    bucket_ms: i64,
-    matchers: &[LabelMatcher],
-) -> String {
-    let scope = name_scope(metric_name);
-    format!(
-        "FROM {series_table}\nWHERE {scope}\n  AND {}",
-        SeriesWhere::new(
-            window,
-            bucket_ms,
-            matchers,
-            MatcherTarget::Labels {
-                table: labels_table,
-                scope: Some(&scope),
-            }
-        )
-        .where_tail()
-    )
-}
-
-/// `metric_name = '<name>'`: one metric's scope, the head's name predicate
-/// and the label side's (issue #623).
+/// `metric_name = '<name>'`: one metric's scope on the lookup (issue #623).
 fn name_scope(metric_name: &str) -> String {
     format!("metric_name = {}", ch_string(metric_name))
 }
@@ -91,109 +61,49 @@ fn names_scope(metric_names: &[String]) -> String {
     format!("metric_name IN ({name_list})")
 }
 
-/// The key a label join meets on (issue #623): the fingerprint, where one
-/// metric scopes both sides, or the `(metric_name, fingerprint)` pair,
-/// where several do.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LabelJoin {
-    Fingerprint,
-    Series,
+/// `fingerprint IN (<ids>)`: a set of series IDs already resolved.
+fn ids_scope(fps: &[FpLiteral]) -> String {
+    let fp_list = fps
+        .iter()
+        .map(FpLiteral::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("fingerprint IN ({fp_list})")
 }
 
-/// The join builders' series side: `FROM {series}\nWHERE {scope}\n  AND
-/// {bound}`, the matchers left to the label side.
-fn scoped_from_where(series_table: &str, scope: &str, bound: &str) -> String {
-    format!("FROM {series_table}\nWHERE {scope}\n  AND {bound}")
-}
-
-/// `fingerprint, metric_name, labels` — one row per `(metric_name,
-/// fingerprint)` the series rows `from_where` select, joined to that
-/// series' own label row (issue #623).
-///
-/// `metric_series` holds activity only and `metric_labels` one row per
-/// series, keyed `(metric_name, fingerprint)`. The series side is read
-/// once; the label side reads the scoped metrics' rows, `label_where`
-/// carrying the scope and the label matchers. `key` is
-/// [`LabelJoin::Fingerprint`] where one metric scopes both sides and
-/// [`LabelJoin::Series`] where several do. `ANY` keeps one label row per
-/// key while the replacing table holds unmerged copies. The join is
-/// `INNER`: a series with no label row of its own is absent, never returned
-/// with empty labels, which would merge distinct series into one.
-fn with_label_sets(
-    labels_table: &str,
-    from_where: &str,
-    label_where: &str,
-    key: LabelJoin,
-) -> String {
-    match key {
-        LabelJoin::Fingerprint => format!(
-            "SELECT fingerprint, s.metric_name AS metric_name, l.labels AS labels\n\
-             FROM (\n\
-             SELECT DISTINCT metric_name, fingerprint\n\
-             {from_where}\n\
-             ) AS s\n\
-             ANY INNER JOIN (\n\
-             SELECT fingerprint, labels\n\
-             FROM {labels_table}\n\
-             WHERE {label_where}\n\
-             ) AS l USING (fingerprint)\n\
-             ORDER BY metric_name, fingerprint"
-        ),
-        LabelJoin::Series => format!(
-            "SELECT fingerprint, metric_name, l.labels AS labels\n\
-             FROM (\n\
-             SELECT DISTINCT metric_name, fingerprint\n\
-             {from_where}\n\
-             ) AS s\n\
-             ANY INNER JOIN (\n\
-             SELECT metric_name, fingerprint, labels\n\
-             FROM {labels_table}\n\
-             WHERE {label_where}\n\
-             ) AS l USING (metric_name, fingerprint)\n\
-             ORDER BY metric_name, fingerprint"
-        ),
-    }
-}
-
-/// `fingerprint, metric_name, labels` read label rows first (issue #623):
-/// the label row of every `(metric_name, fingerprint)` the series rows
-/// `from_where` select. For the reads no metric scopes — unnamed discovery
-/// and the sweep — where a join's build side would hold every series'
-/// label row. `LIMIT 1 BY` keeps one row per series while the replacing
-/// table holds unmerged copies; a series with no label row of its own is
-/// absent.
-fn label_first(labels_table: &str, from_where: &str) -> String {
-    format!(
-        "SELECT fingerprint, metric_name, labels\n\
-         FROM {labels_table}\n\
-         WHERE (metric_name, fingerprint) IN (\n\
-         SELECT metric_name, fingerprint\n\
-         {from_where}\n\
-         )\n\
-         ORDER BY metric_name, fingerprint\n\
-         LIMIT 1 BY metric_name, fingerprint"
+/// One series read (issue #623): the window on the activity table and every
+/// matcher on the lookup, rendered by [`SeriesWhere`] — so "a user regex
+/// rendered without its probe" is not expressible here from the sanctioned
+/// components (see `super::series_where`'s module doc, which also states
+/// the one unsealed crossing rustc does not police).
+fn series_read(
+    window: DataWindow,
+    scope: &[String],
+    name_matchers: &[LabelMatcher],
+    matchers: &[LabelMatcher],
+) -> SeriesWhere {
+    SeriesWhere::activity(
+        window,
+        Lookup {
+            scope,
+            name_matchers,
+            matchers,
+        },
     )
 }
 
-/// The sweep's statement (`super::refresh`): every series active since
-/// `lower_bound_ms`, with its own labels. No upper bound — the sweep runs as
-/// of now.
+/// The sweep's statement (`super::refresh`): statement 2 with no matcher,
+/// every series active in the cache window with its own name and labels.
 pub fn sweep_query(series_table: &str, labels_table: &str, window: DataWindow) -> String {
-    // STUB (issue #623, tests first): the old body, from the window's start.
-    let lower_bound_ms = window.start_ms;
-    label_first(
-        labels_table,
-        &format!("FROM {series_table}\nWHERE unix_milli >= {lower_bound_ms}"),
-    )
+    series_read(window, &[], &[], &[]).with_labels(series_table, labels_table)
 }
 
-/// The injection-safe `metric_series` sub-query issue #31 inlines verbatim
-/// as `fingerprint IN ( <this> )` against `metric_samples`, for **every**
-/// fallback (task-manager resolution #4 on issue #30: a uniform inline
-/// sub-query, one round trip, no materialized-list special case). No
-/// `ORDER BY`/`LIMIT 1 BY`: the caller only needs a *set* of fingerprints,
-/// and `IN (...)` already ignores duplicates — docs/schemas.md §2.3's
-/// fallback shape.
+/// Statement 1 (issue #623): the IDs of `metric_name`'s series that
+/// `matchers` select on the lookup and the activity table finds in
+/// `window`. Inlined verbatim by issue #31's fallback as `fingerprint IN (
+/// <this> )` against the sample tables, and bounded by the `info()`
+/// cardinality probe. No `ORDER BY`: the caller needs a *set*, and `IN
+/// (...)` ignores the repeats unmerged activity rows give.
 pub fn historical_series_subquery(
     series_table: &str,
     labels_table: &str,
@@ -201,18 +111,10 @@ pub fn historical_series_subquery(
     window: DataWindow,
     matchers: &[LabelMatcher],
 ) -> String {
-    // STUB (issue #623, tests first): the old bucket-floored body.
-    let bucket_ms = pulsus_model::ACTIVITY_BUCKET_MS;
     format!(
         "SELECT fingerprint\n{}",
-        base_where(
-            series_table,
-            labels_table,
-            metric_name,
-            window,
-            bucket_ms,
-            matchers
-        )
+        series_read(window, &[name_scope(metric_name)], &[], matchers)
+            .ids_from_where(series_table, labels_table)
     )
 }
 
@@ -227,17 +129,14 @@ pub fn historical_series_subquery(
 /// bounded before materialization, never a post-fetch backstop.
 ///
 /// **`DISTINCT` (#82 code-review round: the [high] over-count fix):**
-/// `metric_series` is written once per series PER activity bucket
-/// (docs/schemas.md §2.1), so one series active across a wide window
-/// yields multiple rows sharing a fingerprint. The inner
+/// the activity table holds one row per series per day, and more than one
+/// until its parts merge, so one series active across a wide window yields
+/// several rows sharing a fingerprint. The inner
 /// [`historical_series_subquery`] deliberately does NOT dedup (safe for
 /// the sample fetch's `IN (...)` SET semantics — do not change it), so
-/// the probe deduplicates HERE: it must count DISTINCT series, or a
-/// legitimately-sized `info()` over a wide window would falsely 422 on
-/// activity-bucket row count. The `LIMIT cap+1` applies over the
-/// deduplicated set; `ORDER BY fingerprint` makes the probe's own row
-/// set deterministic (only the COUNT matters — membership doesn't, the
-/// real fetch below cap still uses the unbounded subquery verbatim).
+/// the probe deduplicates HERE: it must count DISTINCT series. The `LIMIT
+/// cap+1` applies over the deduplicated set; `ORDER BY fingerprint` makes
+/// the probe's own row set deterministic (only the COUNT matters).
 pub fn info_series_cardinality_probe(series_subquery_sql: &str, cap: u64) -> String {
     format!(
         "SELECT DISTINCT fingerprint\nFROM (\n{series_subquery_sql}\n)\nORDER BY fingerprint\nLIMIT {}",
@@ -245,11 +144,12 @@ pub fn info_series_cardinality_probe(series_subquery_sql: &str, cap: u64) -> Str
     )
 }
 
-/// The standalone, deduplicated `fingerprint, labels` form — docs/schemas.md
-/// §2.1's lookup SQL, one row per series. Used by the
-/// live differential test (a materialized comparison set against the
-/// in-process resolution) and by any caller wanting the historical labels
-/// themselves rather than an `IN (...)` sub-query.
+/// Statement 2 for one metric (issue #623): `fingerprint, metric_name,
+/// labels`, one row per series of `metric_name` that `matchers` select and
+/// the activity table finds in `window`. Used by the live differential
+/// tests (a materialized comparison set against the in-process resolution)
+/// and by any caller wanting the historical labels themselves rather than
+/// an `IN (...)` sub-query.
 pub fn historical_resolution_query(
     series_table: &str,
     labels_table: &str,
@@ -257,254 +157,107 @@ pub fn historical_resolution_query(
     window: DataWindow,
     matchers: &[LabelMatcher],
 ) -> String {
-    // STUB (issue #623, tests first): the old bucket-floored body.
-    let bucket_ms = pulsus_model::ACTIVITY_BUCKET_MS;
-    let scope = name_scope(metric_name);
-    let tail = SeriesWhere::new(
-        window,
-        bucket_ms,
-        matchers,
-        MatcherTarget::Labels {
-            table: labels_table,
-            scope: Some(&scope),
-        },
-    );
-    let (bound, label_where) = tail.join_parts().expect("a scoped tail has a label side");
-    format!(
-        "SELECT fingerprint, labels\nFROM (\n{}\n)",
-        with_label_sets(
-            labels_table,
-            &scoped_from_where(series_table, &scope, bound),
-            label_where,
-            LabelJoin::Fingerprint,
-        )
-    )
+    series_read(window, &[name_scope(metric_name)], &[], matchers)
+        .with_labels(series_table, labels_table)
 }
 
-/// Issue #31's label-hydration query: `fingerprint -> labels` for an
-/// already-**resolved, concrete** fingerprint list (mirrors `logql::exec`'s
-/// stage-2 hydration precedent). Used only on the `SqlFallback` sample-
-/// fetch path ([`super::sample_sql::sample_fetch_subquery`]) — the sample
-/// fetch's own nested `fingerprint IN ( <subquery> )` already narrows to
-/// exactly the fingerprints that returned samples in-window, so this
-/// hydrates *only those*, not the fallback's full (possibly much larger)
-/// matcher-matched set. No `window`/`matchers`/bucket-floor predicates
-/// here — the fingerprint list is already the answer; this is a pure
-/// `fingerprint -> labels` lookup on the metric's own label rows (issue
-/// #623), a key range of `(metric_name, fingerprint)`. `any` collapses the
-/// copies the table holds until it merges.
+/// Statement 4 (issue #623): `fingerprint, metric_name, labels` for an
+/// already-**resolved** ID list (mirrors `logql::exec`'s stage-2 hydration
+/// precedent). Used only to hydrate the `SqlFallback` sample fetch
+/// ([`super::sample_sql::sample_fetch_subquery`]), whose IDs are those that
+/// returned samples in the request window — so this read needs no window
+/// of its own. `metric_names` scopes the lookup to a key range; `any`
+/// collapses the copies the table holds until it merges.
 pub fn series_labels_by_fingerprint(
     labels_table: &str,
     metric_names: &[String],
     fps: &[FpLiteral],
 ) -> String {
-    // STUB (issue #623, tests first): the old body, under the first name.
-    let metric_name = metric_names.first().map(String::as_str).unwrap_or_default();
-    let fp_list = fps
-        .iter()
-        .map(FpLiteral::to_string)
-        .collect::<Vec<_>>()
-        .join(", ");
     format!(
-        "SELECT fingerprint, any(labels) AS labels\nFROM {labels_table}\nWHERE {}\n  AND fingerprint IN ({fp_list})\nGROUP BY fingerprint",
-        name_scope(metric_name)
+        "SELECT fingerprint, any(name) AS metric_name, any(label_text) AS labels\n\
+         FROM (\n\
+         \x20 SELECT fingerprint, metric_name AS name, labels AS label_text\n\
+         \x20 FROM {labels_table}\n\
+         \x20 WHERE {}\n\
+         \x20   AND {}\n\
+         )\n\
+         GROUP BY fingerprint\n\
+         ORDER BY metric_name, fingerprint",
+        names_scope(metric_names),
+        ids_scope(fps)
     )
 }
 
-/// Issue #32's discovery query: `fingerprint, metric_name, labels` for
-/// **all** series matching `filter`, bucket-floored to `window` — used by
-/// `MetricsEngine::{label_names,label_values,series}`, which apply their
-/// **own** window filtering here rather than trusting the label cache's
-/// wider (whole-`PULSUS_CACHE_WINDOW`) resident-superset fast path (#30
-/// handoff AC: the cache's bucket-granularity superset must not leak into a
-/// discovery response for a narrower request window). `filter.metric_name
-/// == None` renders no `metric_name` predicate at all — "every metric",
-/// Prometheus's own `/labels`/`/label/{name}/values` semantics when
-/// `match[]` is omitted (docs/api.md §3.3). Selects `metric_name` (unlike
-/// [`historical_resolution_query`]) because a metric-name-less filter's
-/// caller does not otherwise know which metric each returned row belongs
-/// to — needed to populate `__name__` per row.
+/// Issue #32's discovery query, statement 2 (issue #623): `fingerprint,
+/// metric_name, labels` for **all** series matching `filter` in `window` —
+/// used by `MetricsEngine::{label_names,label_values,series}`, which apply
+/// their **own** window here rather than trusting the label cache's wider
+/// (whole-`PULSUS_CACHE_WINDOW`) resident superset (#30 handoff AC: the
+/// cache's superset must not leak into a discovery response for a narrower
+/// request window). `filter.metric_name == None` renders no name scope —
+/// "every metric", Prometheus's own `/labels`/`/label/{name}/values`
+/// semantics when `match[]` is omitted (docs/api.md §3.3). Each row
+/// carries its own `metric_name`, which a name-less filter's caller needs
+/// for `__name__`.
 pub fn discovery_query(
     series_table: &str,
     labels_table: &str,
     filter: &DiscoveryFilter,
     window: DataWindow,
 ) -> String {
-    // STUB (issue #623, tests first): the old bucket-floored body.
-    let bucket_ms = pulsus_model::ACTIVITY_BUCKET_MS;
-    match &filter.metric_name {
-        // Named: the metric's series joined to its own label rows.
-        Some(name) => {
-            let scope = name_scope(name);
-            let tail = SeriesWhere::new(
-                window,
-                bucket_ms,
-                &filter.matchers,
-                MatcherTarget::Labels {
-                    table: labels_table,
-                    scope: Some(&scope),
-                },
-            );
-            let (bound, label_where) = tail.join_parts().expect("a scoped tail has a label side");
-            with_label_sets(
-                labels_table,
-                &scoped_from_where(series_table, &scope, bound),
-                label_where,
-                LabelJoin::Fingerprint,
-            )
-        }
-        // Unnamed: the label rows of the series the window and the
-        // matchers select.
-        None => label_first(
-            labels_table,
-            &discovery_from_where(series_table, labels_table, filter, window, bucket_ms),
-        ),
-    }
+    discovery_read(filter, window).with_labels(series_table, labels_table)
 }
 
-/// The `FROM <table>` + `WHERE …` head [`discovery_query`] and
-/// [`discovery_distinct_names_query`] share. Extracted rather than
-/// re-derived: the equivalence of the two statements is exactly "same
-/// WHERE, different projection", so a WHERE that is *written once* is what
-/// keeps that true. Private to this module — which is a scope, not a
-/// guarantee: it stops nobody in this file from re-deriving a head by hand,
-/// and `the_two_discovery_builders_share_one_where_byte_for_byte` below is
-/// what would catch that.
-fn discovery_from_where(
-    series_table: &str,
-    labels_table: &str,
-    filter: &DiscoveryFilter,
-    window: DataWindow,
-    bucket_ms: i64,
-) -> String {
-    match &filter.metric_name {
-        Some(name) => base_where(
-            series_table,
-            labels_table,
-            name,
-            window,
-            bucket_ms,
-            &filter.matchers,
-        ),
-        None => {
-            let tail = SeriesWhere::new(
-                window,
-                bucket_ms,
-                &filter.matchers,
-                MatcherTarget::Labels {
-                    table: labels_table,
-                    scope: None,
-                },
-            );
-            format!("FROM {series_table}\nWHERE {}", tail.where_tail())
-        }
-    }
+/// The one series read [`discovery_query`] and
+/// [`discovery_distinct_names_query`] share: the same window and the same
+/// lookup predicates, so the two cannot disagree about which series
+/// `filter` selects. `the_two_discovery_builders_share_one_where_byte_for_byte`
+/// below is what would catch a hand-derived second form.
+fn discovery_read(filter: &DiscoveryFilter, window: DataWindow) -> SeriesWhere {
+    let scope: Vec<String> = filter.metric_name.iter().map(|n| name_scope(n)).collect();
+    series_read(window, &scope, &filter.name_matchers, &filter.matchers)
 }
 
-/// Issue #472's narrow discovery projection: the distinct metric names of
-/// exactly the series [`discovery_query`] would have returned, for the SAME
-/// `filter`/`window`/`bucket_ms`.
+/// Issue #472's narrow discovery projection, statement 3 (issue #623): the
+/// distinct metric names of exactly the series [`discovery_query`] would
+/// have returned, for the SAME `filter` and `window`.
 ///
-/// **Why the answer is unchanged.** [`discovery_query`] yields one row per
-/// `(metric_name, fingerprint)` of its `WHERE` that has its own label row,
-/// and the distinct `metric_name` projection of that set *is* the distinct
-/// `metric_name` set of the same `WHERE`. Named, the two share
-/// [`discovery_from_where`]'s head and label `WHERE`, so "the same `WHERE`"
-/// is a property of the code, not of a comment. Unnamed with label matchers
-/// (issue #623) this statement is [`names_join`]: the same window bound and
-/// the same label predicates, joined by the pair rather than nested, and
-/// `matchers_answer_from_own_label_rows` (live) holds the two to the same
-/// names.
+/// **Why the answer is unchanged.** Both read the activity rows in the
+/// window whose IDs the lookup predicates select (one [`discovery_read`]);
+/// the activity row carries the series' name, so the distinct names of
+/// that set are the names of [`discovery_query`]'s rows.
 ///
-/// **`ORDER BY metric_name` is load-bearing, not cosmetic.** `metric_series
-/// ORDER BY (metric_name, fingerprint, unix_milli)` (docs/schemas.md:73,
-/// rendered at `crates/pulsus-schema/src/catalog.rs:179`) makes
-/// `metric_name` the leading key, and with the `ORDER BY` present
-/// ClickHouse plans BOTH the preliminary and the final DISTINCT as
-/// `DistinctSortedStreamTransform` (no hash set). Measured on 26.3.17.110:
-/// dropping the `ORDER BY` turns the final one into `DistinctTransform`,
-/// and moving the projection to a non-leading key column turns the
-/// preliminary one into `DistinctTransform` — both gated in
-/// `crates/pulsus-read/tests/explain_indexes.rs`.
-///
-/// **The label table is dropped from the statement, which is not the same
-/// as never being read.** With no `match[]` — the discovery client's actual
-/// first call — there are no matcher conjuncts, so `metric_labels` is not
-/// referenced at all. With label matchers the statement reads
-/// `metric_labels` to evaluate them (issue #623), so the label rows **are**
-/// read; the win
+/// **The lookup is dropped from the statement, which is not the same as
+/// never being read.** With no `match[]` — the discovery client's actual
+/// first call — there is no lookup predicate, so `metric_labels` is not
+/// referenced at all and the statement reads the activity table alone
+/// (#472). With matchers it reads the lookup to evaluate them; the win
 /// there is transport and parse count (rows collapse from one-per-series to
-/// one-per-metric-name, and `parse_canonical_label_set` is not called at all),
-/// not bytes read.
+/// one-per-metric-name, and `parse_canonical_label_set` is not called at
+/// all), not bytes read.
 ///
 /// **NO `LIMIT`.** The discovery `limit` stays a response-size cap applied
-/// last, in the handler (docs/api.md §3.3): measured on this table shape,
-/// `LIMIT 6`/`41`/`40001`/none all read the identical 10 000 rows and
-/// 91 508 bytes, so pushing it down buys nothing and would put a
-/// union-of-per-filter-prefixes argument on the multi-`match[]` path for no
-/// measured gain. Scale-dependent early termination routes to issue #25.
+/// last, in the handler (docs/api.md §3.3).
 pub fn discovery_distinct_names_query(
     series_table: &str,
     labels_table: &str,
     filter: &DiscoveryFilter,
     window: DataWindow,
 ) -> String {
-    // STUB (issue #623, tests first): the old bucket-floored body.
-    let bucket_ms = pulsus_model::ACTIVITY_BUCKET_MS;
-    if filter.metric_name.is_none() && !filter.matchers.is_empty() {
-        let tail = SeriesWhere::new(
-            window,
-            bucket_ms,
-            &filter.matchers,
-            MatcherTarget::Labels {
-                table: labels_table,
-                scope: None,
-            },
-        );
-        let (bound, preds) = tail.join_parts().expect("matchers make a label side");
-        return names_join(series_table, labels_table, bound, preds);
-    }
     format!(
         "SELECT DISTINCT metric_name\n{}\nORDER BY metric_name",
-        discovery_from_where(series_table, labels_table, filter, window, bucket_ms)
+        discovery_read(filter, window).ids_from_where(series_table, labels_table)
     )
 }
 
-/// The unnamed names query with label matchers (issue #623): the series
-/// rows in the window joined to the label rows the matchers select, by the
-/// pair, keeping the names. `partial_merge` at the host's threads: a hash
-/// join's build side would hold every matching series' pair, and over many
-/// series a sort-merge join holds less (measured, plan §6; the owner
-/// accepted the slower small-data latency for the exact answer).
-fn names_join(series_table: &str, labels_table: &str, bound: &str, preds: &str) -> String {
-    format!(
-        "SELECT DISTINCT metric_name\n\
-         FROM (SELECT metric_name, fingerprint FROM {series_table} WHERE {bound}) AS s\n\
-         ANY INNER JOIN (SELECT metric_name, fingerprint FROM {labels_table} WHERE {preds}) AS l\n\
-         USING (metric_name, fingerprint)\n\
-         ORDER BY metric_name\n\
-         SETTINGS join_algorithm = 'partial_merge'"
-    )
-}
-
-/// Issue #89's discovery analog of [`super::sample_sql::sample_fetch_multi`]:
-/// ONE flat query for a regex/negated-`__name__` `match[]` selector's whole
-/// resolved candidate set — `metric_name IN (<resolved names>)` (the leading
-/// primary-key component of `metric_series ORDER BY (metric_name,
-/// fingerprint, unix_milli)`) plus `fingerprint IN (<resolved fps>)` (the
-/// second component), both EXPLAIN-gated in `explain_indexes.rs`. The
-/// request window is re-applied here with the same bucket-floored bounds as
-/// [`discovery_query`], so the label cache's wider resident superset (the
-/// resolution source for the IN sets) never leaks into a narrower discovery
-/// response — the `discovery_series` invariant.
-///
-/// Sound without per-pair filtering, by `sample_fetch_multi`'s argument: a
-/// `metric_name` is in the IN set only if it passed the selector's
-/// `name_matchers`, and `metric_fingerprint` excludes `__name__`
-/// (docs/schemas.md §2.1) so every `(metric_name, fingerprint)` cross-pair
-/// naming a real series is a genuine match. One row per series, joined by
-/// the pair to its own label row (issue #623): a cross-pair with none is
-/// absent, never given another name's row.
+/// Issue #89's discovery analog of [`super::sample_sql::sample_fetch_multi`],
+/// statement 2 (issue #623): ONE query for a regex/negated-`__name__`
+/// `match[]` selector's whole resolved candidate set, scoped on the lookup
+/// to `metric_name IN (<resolved names>) AND fingerprint IN (<resolved
+/// IDs>)`. The IDs come from the label cache, which holds every series
+/// active in its whole window, so the request window is applied here by
+/// the activity read — the cache's wider resident superset never leaks into
+/// a narrower discovery response (the `discovery_series` invariant).
 pub fn discovery_fetch_multi(
     series_table: &str,
     labels_table: &str,
@@ -512,43 +265,19 @@ pub fn discovery_fetch_multi(
     fps: &[FpLiteral],
     window: DataWindow,
 ) -> String {
-    // STUB (issue #623, tests first): the old bucket-floored body.
-    let bucket_ms = pulsus_model::ACTIVITY_BUCKET_MS;
-    let names = names_scope(metric_names);
-    let fp_list = fps
-        .iter()
-        .map(FpLiteral::to_string)
-        .collect::<Vec<_>>()
-        .join(", ");
-    // No matchers: the resolved `(name, fingerprint)` set IS the answer, so
-    // the tail is a bare window bound and carries no probe.
-    let tail = SeriesWhere::new(
-        window,
-        bucket_ms,
-        &[],
-        MatcherTarget::Labels {
-            table: labels_table,
-            scope: None,
-        },
-    );
-    let scope = format!("{names}\n  AND fingerprint IN ({fp_list})");
-    with_label_sets(
-        labels_table,
-        &scoped_from_where(series_table, &scope, tail.where_tail()),
-        &scope,
-        LabelJoin::Series,
-    )
+    let scope = [names_scope(metric_names), ids_scope(fps)];
+    series_read(window, &scope, &[], &[]).with_labels(series_table, labels_table)
 }
 
-/// Issue #96's degraded-cache discovery **probe**: the bounded
-/// `SELECT DISTINCT metric_name` over `metric_series` that resolves the
-/// candidate metric-name set when the resident label cache cannot (cold /
-/// stale / out-of-window / regex-cache-full — [`MultiMetricResolution::
-/// Unresolvable`](super::labels::MultiMetricResolution::Unresolvable)).
-/// Only the selector's **name matchers** are pushed (as `metric_name`
-/// predicates); the ordinary label matchers apply later, in the
-/// [`discovery_fetch_by_names`] fetch — a deliberately cheap names-only
-/// probe with a fail-safe superset cap (the #96 adjudication).
+/// Issue #96's degraded-cache discovery **probe**, statement 3 with the
+/// selector's **name matchers** on the lookup (issue #623): the bounded
+/// `SELECT DISTINCT metric_name` that resolves the candidate metric-name
+/// set when the resident label cache cannot (cold / stale /
+/// out-of-window / regex-cache-full — [`MultiMetricResolution::
+/// Unresolvable`](super::labels::MultiMetricResolution::Unresolvable)). The
+/// ordinary label matchers apply later, in the [`discovery_fetch_by_names`]
+/// fetch — a deliberately cheap names-only probe with a fail-safe superset
+/// cap (the #96 adjudication).
 ///
 /// `LIMIT {fanout_cap + 1}` bounds the **returned** row count: the caller
 /// aborts to `QueryTooBroad(MetricFanout)` when it sees more than
@@ -556,12 +285,7 @@ pub fn discovery_fetch_multi(
 /// with [`u64::saturating_add`] as inert defense-in-depth for builder
 /// totality; config load caps `fanout_cap` at
 /// `pulsus_config::PROMQL_MAX_METRIC_FANOUT_CEILING` (issue #96
-/// retroactive re-review — a value above the ceiling would otherwise make
-/// the returned-row bound unreachable), so at runtime `cap + 1` never
-/// actually saturates. **NOT** EXPLAIN-index-gated: a regex/negated
-/// `metric_name` predicate cannot range-prune the leading primary-key
-/// column, so its bound (returned-rows) is the gate; its scan rows are
-/// recorded, not asserted (scale routes to issue #25).
+/// retroactive re-review), so at runtime `cap + 1` never saturates.
 pub fn distinct_metric_names_probe(
     series_table: &str,
     labels_table: &str,
@@ -569,36 +293,21 @@ pub fn distinct_metric_names_probe(
     window: DataWindow,
     fanout_cap: u64,
 ) -> String {
-    // STUB (issue #623, tests first): the old bucket-floored body.
-    let _ = labels_table;
-    let bucket_ms = pulsus_model::ACTIVITY_BUCKET_MS;
-    let limit = fanout_cap.saturating_add(1);
-    let tail = SeriesWhere::new(
-        window,
-        bucket_ms,
-        name_matchers,
-        MatcherTarget::MetricNameColumn,
-    );
-    let mut sql = format!(
-        "SELECT DISTINCT metric_name\nFROM {series_table}\nWHERE {}",
-        tail.where_tail()
-    );
-    sql.push_str(&format!("\nORDER BY metric_name\nLIMIT {limit}"));
-    sql
+    format!(
+        "SELECT DISTINCT metric_name\n{}\nORDER BY metric_name\nLIMIT {}",
+        series_read(window, &[], name_matchers, &[]).ids_from_where(series_table, labels_table),
+        fanout_cap.saturating_add(1)
+    )
 }
 
-/// Issue #96's degraded-cache discovery **fetch**: the names-only analog of
-/// [`discovery_fetch_multi`] — one flat `metric_name IN (<probed names>)`
-/// query (the leading primary-key component of `metric_series ORDER BY
-/// (metric_name, fingerprint, unix_milli)`, EXPLAIN-gated in
-/// `explain_indexes.rs`) with the ordinary **label matchers** applied in
-/// SQL and the request window re-applied (bucket-floored), so the below-cap
-/// result set is byte-identical to the warm [`discovery_fetch_multi`] path.
-/// `metric_names` is the probe's sorted, deduped, non-empty output (caller
-/// guarantees non-empty — an empty probe result skips the fetch entirely).
-/// No `fingerprint IN (…)` component: the probe resolves names only, so the
-/// label matchers here — not a resolved fingerprint set — narrow within
-/// each primary-key-pruned metric.
+/// Issue #96's degraded-cache discovery **fetch**, statement 2 (issue
+/// #623): the names-only analog of [`discovery_fetch_multi`], scoped on the
+/// lookup to `metric_name IN (<probed names>)` with the ordinary **label
+/// matchers** applied there and the request window applied by the activity
+/// read, so the below-cap result set is the warm
+/// [`discovery_fetch_multi`] path's. `metric_names` is the probe's sorted,
+/// deduped, non-empty output (caller guarantees non-empty — an empty probe
+/// result skips the fetch entirely).
 pub fn discovery_fetch_by_names(
     series_table: &str,
     labels_table: &str,
@@ -606,46 +315,8 @@ pub fn discovery_fetch_by_names(
     matchers: &[LabelMatcher],
     window: DataWindow,
 ) -> String {
-    // STUB (issue #623, tests first): the old bucket-floored body.
-    let bucket_ms = pulsus_model::ACTIVITY_BUCKET_MS;
-    let scope = names_scope(metric_names);
-    let tail = SeriesWhere::new(
-        window,
-        bucket_ms,
-        matchers,
-        MatcherTarget::Labels {
-            table: labels_table,
-            scope: Some(&scope),
-        },
-    );
-    let (bound, label_where) = tail.join_parts().expect("a scoped tail has a label side");
-    with_label_sets(
-        labels_table,
-        &scoped_from_where(series_table, &scope, bound),
-        label_where,
-        LabelJoin::Series,
-    )
-}
-
-/// The label rows of `(metric_name, fingerprint)` pairs (issue #623): the
-/// multi-metric fetch's returned pairs the label cache did not resolve —
-/// a series registered under another name after the last sweep — each
-/// looked up by its own pair, never by the fingerprint, which another name
-/// may share. `LIMIT 1 BY` keeps one row per pair while the table holds
-/// unmerged copies; a pair with no label row is absent.
-pub fn series_labels_by_pairs(labels_table: &str, pairs: &[(String, FpLiteral)]) -> String {
-    let pair_list = pairs
-        .iter()
-        .map(|(name, fp)| format!("({}, {fp})", ch_string(name)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "SELECT metric_name, fingerprint, labels\n\
-         FROM {labels_table}\n\
-         WHERE (metric_name, fingerprint) IN ({pair_list})\n\
-         ORDER BY metric_name, fingerprint\n\
-         LIMIT 1 BY metric_name, fingerprint"
-    )
+    series_read(window, &[names_scope(metric_names)], &[], matchers)
+        .with_labels(series_table, labels_table)
 }
 
 /// `GET /api/v1/metadata` (issue #32): `metric_metadata` is a
@@ -1162,7 +833,7 @@ mod tests {
         assert!(sql.contains("metric_name = 'up'"));
         assert!(sql.contains("JSONExtractString(labels, 'job') = 'api'"));
         assert!(sql.starts_with(
-            "SELECT fingerprint, s.metric_name AS metric_name, l.labels AS labels\nFROM ("
+            "SELECT fingerprint, any(name) AS metric_name, any(label_text) AS labels\nFROM ("
         ));
         assert!(sql.ends_with("ORDER BY metric_name, fingerprint"));
     }
@@ -1172,7 +843,7 @@ mod tests {
         let filter = DiscoveryFilter::default();
         let sql = discovery_query("metric_series", "metric_labels", &filter, window());
         assert!(!sql.contains("metric_name ="));
-        assert!(sql.contains("unix_milli >= 0 AND unix_milli <= 3600000"));
+        assert!(sql.contains("WHERE day BETWEEN '1970-01-01' AND '1970-01-01'\n"));
     }
 
     #[test]
@@ -1243,14 +914,12 @@ mod tests {
         ]
     }
 
-    /// Issue #472 AC3 / U8 (issue #623) — the two builders read the same
-    /// series and the same label rows. For a named filter the wide
-    /// statement holds the narrow statement's head up to its label
-    /// sub-query, and the narrow sub-query's `WHERE` as its label side. For
-    /// an unnamed one both carry the same window bound.
+    /// Issue #472 AC3 (issue #623) — the two builders read the same series:
+    /// the wide statement nests the narrow one's activity read, line for
+    /// line, as the set its lookup rows are drawn from.
     ///
-    /// **What it does not prove:** that the head is *shared* rather than
-    /// duplicated-and-currently-equal. That is what [`discovery_from_where`]
+    /// **What it does not prove:** that the read is *shared* rather than
+    /// duplicated-and-currently-equal. That is what [`discovery_read`]
     /// gives by construction, and construction is all it gives.
     #[test]
     fn the_two_discovery_builders_share_one_where_byte_for_byte() {
@@ -1258,36 +927,22 @@ mod tests {
             let wide = discovery_query("metric_series", "metric_labels", &filter, window());
             let narrow =
                 discovery_distinct_names_query("metric_series", "metric_labels", &filter, window());
-            if filter.metric_name.is_some() {
-                let body = narrow
-                    .strip_prefix("SELECT DISTINCT metric_name\n")
-                    .and_then(|rest| rest.strip_suffix("\nORDER BY metric_name"))
-                    .expect("the narrow statement is its projection around the head");
-                let head = body
-                    .split("\n  AND fingerprint IN (")
-                    .next()
-                    .expect("a head");
-                assert!(wide.contains(head), "{what}: {wide}");
-                if let Some((_, label_side)) = body.split_once("\n    WHERE ") {
-                    let label_where = label_side
-                        .strip_suffix("\n  )")
-                        .expect("the sub-query closes the statement");
-                    assert!(
-                        wide.contains(&format!("WHERE {label_where}\n) AS l")),
-                        "{what}: {wide}"
-                    );
-                }
-            } else {
-                let bound = "unix_milli >= 0";
-                assert!(wide.contains(bound) && narrow.contains(bound), "{what}");
-            }
+            let body = narrow
+                .strip_prefix("SELECT DISTINCT metric_name\n")
+                .and_then(|rest| rest.strip_suffix("\nORDER BY metric_name"))
+                .expect("the narrow statement is its projection around the series read");
+            let nested: Vec<String> = body.lines().map(|l| format!("      {l}")).collect();
+            assert!(
+                wide.contains(&nested.join("\n")),
+                "{what}: the wide statement nests the narrow one's read\n{wide}\n{narrow}"
+            );
         }
     }
 
     // --- discovery_fetch_multi (issue #89) ---
 
     #[test]
-    fn discovery_fetch_multi_floors_both_window_bounds_to_the_bucket() {
+    fn discovery_fetch_multi_masks_the_windows_hours() {
         let sql = discovery_fetch_multi(
             "metric_series",
             "metric_labels",
@@ -1298,7 +953,10 @@ mod tests {
                 end_ms: 7_300_000,
             },
         );
-        assert!(sql.contains("unix_milli >= 3600000 AND unix_milli <= 7200000"));
+        assert!(sql.contains(
+            "AND bitAnd(hours, multiIf(day = '1970-01-01' AND day = '1970-01-01', 6, \
+             day = '1970-01-01', 16777214, day = '1970-01-01', 7, 16777215)) != 0\n"
+        ));
     }
 
     /// The window is re-applied in SQL (not inherited from the label
@@ -1313,8 +971,8 @@ mod tests {
             &[Fingerprint::from_raw(1).sql_literal()],
             window(),
         );
-        assert!(sql.contains("AND unix_milli >= "));
-        assert!(sql.contains(" AND unix_milli <= "));
+        assert!(sql.contains("WHERE day BETWEEN "));
+        assert!(sql.contains("AND bitAnd(hours, "));
     }
 
     #[test]
@@ -1474,7 +1132,7 @@ mod tests {
         );
         assert!(!sql.contains("fingerprint IN (toUInt128"));
         assert!(sql.contains("metric_name IN ('up')"));
-        assert!(sql.contains("AND unix_milli >= "));
+        assert!(sql.contains("AND bitAnd(hours, "));
         assert!(sql.ends_with("ORDER BY metric_name, fingerprint"));
     }
 

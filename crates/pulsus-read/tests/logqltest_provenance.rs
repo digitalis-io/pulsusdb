@@ -2065,13 +2065,12 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
     ("pulsus-read/src/logql/predicate.rs", 15),
     ("pulsus-read/src/logql/sql.rs", 2),
     ("pulsus-read/src/metrics/dispatch.rs", 5),
-    // Issue #623: eight more in `series_where.rs`'s test expectations and
-    // four in `sql.rs`'s — the label-table sub-query's and the label
-    // join's renderings of a regex matcher and its probe, and the join's
-    // two halves. No production renderer is added: the matchers still
-    // render in the sealed leaf.
+    // Issue #623: the counts follow the test expectations of the lookup and
+    // activity reads — a regex matcher on the lookup and its probe line on
+    // the activity read, in both files. No production renderer is added:
+    // the matchers still render in the sealed leaf.
     ("pulsus-read/src/metrics/series_where.rs", 18),
-    ("pulsus-read/src/metrics/sql.rs", 18),
+    ("pulsus-read/src/metrics/sql.rs", 20),
     ("pulsus-read/src/traces/filter.rs", 12),
     ("pulsus-read/src/traces/search_plan.rs", 2),
     // Issues #588 and #589. The span-scope predicate compiler: four render
@@ -2094,7 +2093,7 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
 
 /// The separately-asserted total, so "a file appeared" reads differently
 /// from "a file grew".
-const MATCH_RENDER_TOTAL: usize = 88;
+const MATCH_RENDER_TOTAL: usize = 90;
 
 /// Every string-literal CONTENT in a Rust source: ordinary `"…"`, raw
 /// `r"…"`/`r#"…"#`, byte `b"…"` and byte-raw. Comments are dropped.

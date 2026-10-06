@@ -1650,13 +1650,13 @@ async fn prom_api_name_values_bodies_and_narrow_dispatch_issue_472() {
     flush_logs(&admin).await;
 
     // The #472 statement, told apart from the #96 degraded probe: both
-    // begin `SELECT DISTINCT metric_name FROM metric_series WHERE
-    // unix_milli >=`, and the probe additionally carries the name-matcher
-    // regex's compile-probe splice and a `LIMIT <fanout cap + 1>`. The
+    // begin `SELECT DISTINCT metric_name FROM metric_series WHERE day
+    // BETWEEN` (issue #623), and the probe additionally carries the
+    // name-matcher regex's compile probe and a `LIMIT <fanout cap + 1>`. The
     // discovery `limit` is a response-size cap applied last (docs/api.md
     // §3.3), so the #472 statement never carries a `LIMIT` at all.
     const NARROW_PREFIX: &str =
-        "query LIKE 'SELECT DISTINCT metric_name\\nFROM metric_series\\nWHERE unix_milli >=%'";
+        "query LIKE 'SELECT DISTINCT metric_name\\nFROM metric_series\\nWHERE day BETWEEN %'";
     let narrow_472 = format!("{NARROW_PREFIX} AND query NOT LIKE '%\\nLIMIT %'");
     let narrow_472 = narrow_472.as_str();
     // The #96 degraded probe, named unambiguously: the same projection
@@ -1692,17 +1692,18 @@ async fn prom_api_name_values_bodies_and_narrow_dispatch_issue_472() {
     // out of scope here). `match[]=http_requests_total` is that marker: it
     // is the only request in this test that renders `metric_name =
     // 'http_requests_total'`, and the regex route renders `metric_name IN
-    // (…)` rather than `= '…'`. The quotes are backslash-escaped because
+    // (…)` rather than `= '…'`. Since issue #623 the name is a lookup
+    // predicate in both statements. The quotes are backslash-escaped because
     // the pattern becomes a ClickHouse string literal.
-    const CONCRETE: &str = "metric_series\\nWHERE metric_name = \\'http_requests_total\\'%";
-    // The wide statement's head since issue #623: the series side of the
-    // label join, which is where the selection is written.
-    const WIDE_HEAD: &str = "SELECT fingerprint, s.metric_name AS metric_name, l.labels AS \
-                             labels\\nFROM (\\nSELECT DISTINCT metric_name, fingerprint\\nFROM ";
+    const CONCRETE: &str = "%WHERE metric_name = \\'http_requests_total\\'%";
+    // The wide statement's head since issue #623: statement 2, the lookup
+    // rows of the series the activity read finds.
+    const WIDE_HEAD: &str =
+        "SELECT fingerprint, any(name) AS metric_name, any(label_text) AS labels\\nFROM (";
     let concrete_narrow = statements_matching(
         &admin,
         db,
-        &format!("query LIKE 'SELECT DISTINCT metric_name\\nFROM {CONCRETE}'"),
+        &format!("query LIKE 'SELECT DISTINCT metric_name\\nFROM metric_series{CONCRETE}'"),
     )
     .await;
     let concrete_wide =
@@ -1744,11 +1745,12 @@ async fn prom_api_name_values_bodies_and_narrow_dispatch_issue_472() {
     // resolution and omit newly active names — a wrong answer passing the
     // check.
     let narrow_before = narrow;
-    // Issue #623: the names-only fetch joins series to label rows by the
-    // pair.
-    const IN_FETCH: &str = "query LIKE 'SELECT fingerprint, metric_name, \
-                            l.labels AS labels\\nFROM (\\nSELECT DISTINCT metric_name, \
-                            fingerprint\\nFROM metric_series\\nWHERE metric_name IN (%'";
+    // Issue #623: the names-only fetch is statement 2 scoped to the probed
+    // names on the lookup.
+    const IN_FETCH: &str = "query LIKE 'SELECT fingerprint, any(name) AS metric_name, \
+                            any(label_text) AS labels\\nFROM (\\n  SELECT fingerprint, \
+                            metric_name AS name, labels AS label_text\\n  FROM metric_labels\\n  \
+                            WHERE metric_name IN (%'";
     let in_fetch_before = statements_matching(&admin, db, IN_FETCH).await;
     let probes_before = statements_matching(&admin, db, probe_96).await;
 

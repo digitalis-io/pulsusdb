@@ -154,9 +154,9 @@ struct Shared {
     /// the clock alone would repeat for two pushes inside one millisecond,
     /// and the second would be dropped as a resend of the first.
     token_rng: Mutex<XorShift64>,
-    /// The `metric_series` activity-bucket width in milliseconds
-    /// (`pulsus_config::ReaderConfig::series_activity_bucket`, resolved by
-    /// the caller — not read from `WriterConfig`).
+    /// The activity-bucket width in milliseconds,
+    /// `pulsus_model::ACTIVITY_BUCKET_MS` (issue #623), handed in by the
+    /// caller — not read from `WriterConfig`.
     bucket_ms: i64,
     /// The shutdown boundary: the admission gate, the announced deadline and
     /// every task this writer spawned (`writer::drain`).

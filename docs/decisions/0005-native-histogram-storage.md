@@ -59,6 +59,11 @@ Metrics family rather than treating it as an independent signal.
 
 ### (c) `value_type` discriminator on `metric_series`
 
+> **Removed by issue #623.** `metric_series` became one row per series per UTC
+> day with an hour mask, and `value_type` left it: no reader read it. The kind-2
+> landing row still carries it. The text below is the record of what was
+> decided then.
+
 `metric_series` gains a `value_type UInt8 DEFAULT 0` column (`0 = float`,
 `1 = histogram`), added by additive `ALTER` — the §3.1 `structured_metadata`
 precedent, never a mutation of the frozen initial `CREATE`, so fresh and

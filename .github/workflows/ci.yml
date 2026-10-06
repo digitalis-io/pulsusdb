@@ -672,9 +672,9 @@ jobs:
         run: cargo test -p pulsus-schema --test live_schema
 
       # Issue #113 (M7-A2): native-histogram storage schema — migrations 23–26
-      # apply + idempotent (no MigrationDrift), metric_hist_samples +
-      # metric_series.value_type exist, an EXPLAIN indexes=1 metric_name-led PK
-      # prune on metric_hist_samples matching the metric_samples gate, and a
+      # apply + idempotent (no MigrationDrift), metric_hist_samples exists, an
+      # EXPLAIN indexes=1 series-ID-led PK prune on metric_hist_samples
+      # matching the metric_samples gate (issue #623), and a
       # native-histogram row round-trips losslessly for both an exponential and
       # an NHCB sample. Reuses this job's 26.3 container.
       - name: Live native-histogram schema tests (migrations + EXPLAIN + round-trip)
@@ -742,6 +742,14 @@ jobs:
           PULSUS_TEST_CLICKHOUSE: "1"
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-server --test push_dedup_live -- --test-threads=1
+
+      # Issue #623: `pulsusdb rebuild-metrics`, run as the binary, replays a
+      # landing window into each target and leaves every row once.
+      - name: Live metrics rebuild
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-server --test rebuild_live
 
       # Issue #11: docs/schemas.md §9's "EXPLAIN indexes = 1 output for the
       # canonical queries is snapshot-tested" gate for the LogQL read path —
@@ -1616,7 +1624,7 @@ jobs:
       # assumption), an OTLP parse(Native) -> writer -> SELECT absolute-count
       # round-trip incl. an internal zero bucket, and the value_type
       # discriminator mask (a cross-request float+histogram at one series
-      # registers both metric_series rows, groupBitOr == 3). Reuses this
+      # lands both kind-2 landing rows, groupBitOr == 3). Reuses this
       # job's ClickHouse 26.3 container.
       - name: Native histogram writer round-trip (NaN gate + value_type)
         env:
@@ -1629,7 +1637,7 @@ jobs:
       # histogram through ingest_remote_write (sync) -> MetricWriter ->
       # ClickHouse: counter_reset_hint lands 3 and 0 respectively, the
       # stored row decodes to a Gauge FloatHistogram, and the
-      # histograms-only series register value_type = 1 metric_series rows.
+      # histograms-only series land kind-2 rows carrying value_type = 1.
       # Reuses this job's ClickHouse 26.3 container.
       - name: Remote-write gauge-hint native histogram (counter_reset_hint e2e)
         env:

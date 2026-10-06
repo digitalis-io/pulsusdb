@@ -49,9 +49,11 @@ at the column type's default.
 | 2 | a series registration | `metric_series` (activity) and `metric_labels` (the series' label set) | `metric_series_mv`, `metric_labels_mv` |
 | 3 | a metadata descriptor | `metric_metadata` | `metric_metadata_mv` |
 
-Issue #623 split the kind-2 target in two: `metric_series` keeps the activity rows and
-`metric_labels` the label set, one row per series keyed `(metric_name, fingerprint)`
-(`docs/schemas.md` §2.1).
+Issue #623 split the kind-2 target in two: `metric_series` keeps the activity, one row
+per series per UTC day with a mask of its hours, and `metric_labels` the lookup row, one
+per series keyed `(metric_name, fingerprint)` with its first and last hour seen
+(`docs/schemas.md` §2.1). The sample targets take no `metric_name`: the fingerprint is
+the series ID, which the name is part of.
 
 ### 1.1 The landing table
 
@@ -121,12 +123,11 @@ the view is correct whether the server matches by position or by name.
 
 ```sql
 CREATE MATERIALIZED VIEW {{db}}.metric_samples_mv{{on_cluster}} TO {{db}}.metric_samples AS
-SELECT metric_name AS metric_name, fingerprint AS fingerprint,
-       unix_milli AS unix_milli, value AS value
+SELECT fingerprint AS fingerprint, unix_milli AS unix_milli, value AS value
 FROM {{db}}.metric_landing WHERE kind = 0;
 
 CREATE MATERIALIZED VIEW {{db}}.metric_hist_samples_mv{{on_cluster}} TO {{db}}.metric_hist_samples AS
-SELECT metric_name AS metric_name, fingerprint AS fingerprint,
+SELECT fingerprint AS fingerprint,
        unix_milli AS unix_milli, hist_schema AS schema,
        hist_zero_threshold AS zero_threshold, hist_zero_count AS zero_count,
        hist_count AS count, hist_sum AS sum,
@@ -141,12 +142,14 @@ SELECT metric_name AS metric_name, fingerprint AS fingerprint,
 FROM {{db}}.metric_landing WHERE kind = 1;
 
 CREATE MATERIALIZED VIEW {{db}}.metric_series_mv{{on_cluster}} TO {{db}}.metric_series AS
-SELECT metric_name AS metric_name, fingerprint AS fingerprint,
-       unix_milli AS unix_milli, value_type AS value_type
+SELECT toDate(fromUnixTimestamp64Milli(unix_milli), 'UTC') AS day,
+       fingerprint AS fingerprint, metric_name AS metric_name,
+       toUInt32(bitShiftLeft(toUInt32(1), toHour(fromUnixTimestamp64Milli(unix_milli), 'UTC'))) AS hours
 FROM {{db}}.metric_landing WHERE kind = 2;
 
 CREATE MATERIALIZED VIEW {{db}}.metric_labels_mv{{on_cluster}} TO {{db}}.metric_labels AS
-SELECT metric_name AS metric_name, fingerprint AS fingerprint, labels AS labels
+SELECT metric_name AS metric_name, fingerprint AS fingerprint, labels AS labels,
+       unix_milli AS first_seen, unix_milli AS last_seen
 FROM {{db}}.metric_landing WHERE kind = 2;
 
 CREATE MATERIALIZED VIEW {{db}}.metric_metadata_mv{{on_cluster}} TO {{db}}.metric_metadata AS
@@ -230,7 +233,7 @@ it is sent one (§2.2).
 ### 2.1 The settings every landing insert pins
 
 `QuerySettings::landing_insert(token, max_rows)` in
-`crates/pulsus-clickhouse/src/settings.rs`. Ten settings, and that constructor's own
+`crates/pulsus-clickhouse/src/settings.rs`. Fourteen settings, and that constructor's own
 doc comment is the owning passage for the catalogue wording behind each value, for the
 two searches the class was derived from, and for each candidate setting that needs no
 pin. `max_rows` is `PULSUS_METRICS_LANDING_MAX_ROWS`.
@@ -247,6 +250,10 @@ pin. `max_rows` is `PULSUS_METRICS_LANDING_MAX_ROWS`.
 | `insert_deduplication_token` | the block's minted token | §3 |
 | `deduplicate_insert` | `enable` | it overrides `insert_deduplicate` and `async_insert_deduplicate`, so one pin closes all three |
 | `deduplicate_blocks_in_dependent_materialized_views` | `1` | each view's insert then carries a block id derived from the source block, so the targets' own windows see the repeat |
+| `materialized_views_ignore_errors` | `0` | at `1` a view's error is ignored and the push succeeds with that target's rows missing (issue #623) |
+| `ignore_materialized_views_with_dropped_target_table` | `0` | at `1` a view whose target is gone is skipped and the push succeeds without it |
+| `min_insert_block_size_rows_for_materialized_views` | `0` | it overrides `min_insert_block_size_rows` for a view's own insert, which the pin above does not reach |
+| `min_insert_block_size_bytes_for_materialized_views` | `0` | the same, for bytes |
 
 Every byte limit and the wait are pinned to the value that takes no part; the
 connection handling to the value that leaves deduplication possible; both row counts to
@@ -266,9 +273,10 @@ token.
 
 `pulsus_schema::REQUIRED_SERVER_NAMES` lists every setting and function name this build
 sends that was not already somewhere in `crates/` before this work, each with the
-`system` catalogue that answers whether it exists: the ten settings of §2.1 less the two
-that predate this work, `merge_with_ttl_timeout` from the `MergeTree` settings catalogue,
-and the functions `generateUUIDv7`, `toStartOfHour` and `tupleElement`. Twelve names.
+`system` catalogue that answers whether it exists: the fourteen settings of §2.1 less the
+two that predate this work, `merge_with_ttl_timeout` from the `MergeTree` settings
+catalogue, and the functions `generateUUIDv7`, `toStartOfHour` and `tupleElement`.
+Sixteen names.
 
 - **One statement per catalogue, not one joined statement.** A deployment's database
   user may hold `SELECT` on some of these `system` tables and not others, and a joined
@@ -589,7 +597,7 @@ any of them is covered.
 | **D12** | a deployment that had set a byte limit, or enabled connection handling, deliberately | it does not get either on this insert (§2.1) |
 | **D13** | the other shipped log, trace and per-target row shapes | they keep the collect-then-write encoder, which builds one value tree per row. Nothing is claimed about their peak, and it was not measured |
 | **D14** | a new scalar type declared bounded wrongly | the piece refusal turns it into an error and the widest-value case into a failing test, rather than silent growth — but the compiler cannot catch it |
-| **D15** | `pulsusdb rebuild-metrics` | deliberately without tests: there is no environment in this tree that would exercise it faithfully. It refuses a replay into the three append-only targets unless the caller also asks for their partitions to be dropped first, because a replay without that stores every row twice |
+| **D15** | `pulsusdb rebuild-metrics` | `crates/pulsus-server/tests/rebuild_live.rs` runs the binary: each sample table rebuilt with its partitions dropped holds every row once, and activity and the lookup rebuilt twice without dropping hold what the views wrote (issue #623). It refuses a replay into the two sample tables unless the caller also asks for their partitions to be dropped first, because a replay without that stores every row twice |
 | **D16** | a suppressed push carrying descriptors | its descriptor-only insert carries no claim and no waiter, and it runs the same loop as every other block (§4): a failure before the block was sent stored nothing, one after it leaves whether the descriptors landed unknown, and a non-commit ending spools it like any other block. What the suppression leaves unchanged, once that block's own byte reservation is granted, is the caller's answer — the original push's outcome; a queue with no room for that reservation refuses the repeat `429` and nothing of its descriptors is built, queued or sent (§3). Since issue #623 a descriptor is sent only when it differs from the one this writer last committed, or its hour has turned, so a repeat carrying the descriptor its original already committed sends no block at all; only a commit records a descriptor, so after any other ending the next push carrying it emits it again |
 | **D17** | a steady push rate above the rate §3 derives from `PULSUS_METRICS_DEDUP_WINDOW` | a token can be evicted before its resend arrives and the block is stored twice. Sizing the window is a deployment matter and nothing checks it |
 | **D18** | the landing table's TTL | it floors `received_ms` to the second, so expiry can fall up to 999 ms before the exact instant and never after it; and a part's drop waits for a TTL merge, so this design states no instant at which landed rows stop occupying storage |
@@ -709,5 +717,4 @@ against a server.
 | the configured dials are accepted at both ends of their ranges and rejected outside | `the_metrics_landing_dials_reject_both_sides_and_accept_both_ends` (`crates/pulsus-config/src/validate.rs`) |
 
 **What no entry above covers**, stated here rather than left to be found: D2's clustered
-window, D7's cancelled worker, and `pulsusdb rebuild-metrics` (D15). None of the three
-has a test in this tree.
+window and D7's cancelled worker. Neither has a test in this tree.

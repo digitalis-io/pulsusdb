@@ -5,7 +5,8 @@
 //! and an UNKNOWN-hint sibling lands `0`. Also proves the stored row
 //! decodes back through `HistogramColumns → NativeHistogram → to_float()`
 //! with `CounterResetHint::Gauge`, and that the histograms-only series
-//! registered a `metric_series` `value_type = 1` row.
+//! landed a kind-2 row carrying `value_type = 1` (issue #623: `metric_series`
+//! no longer stores it).
 //!
 //! Gated behind `PULSUS_TEST_CLICKHOUSE=1`, harness mirrors
 //! `tests/live_metric_hist_writer.rs`:
@@ -172,7 +173,7 @@ async fn select_hist_rows(client: &ChClient, db: &str, name: &str) -> Vec<Metric
 /// Issue #140 headline AC: a gauge-hint wire native histogram lands
 /// `counter_reset_hint = 3` end-to-end; the unknown-hint sibling lands `0`;
 /// the stored row decodes to a `Gauge` `FloatHistogram`; and the series
-/// registered a `value_type = 1` `metric_series` row.
+/// landed a kind-2 row carrying `value_type = 1`.
 #[tokio::test]
 async fn gauge_hint_native_histogram_lands_counter_reset_hint_3_end_to_end() {
     skip_unless_live!();
@@ -275,7 +276,7 @@ async fn gauge_hint_native_histogram_lands_counter_reset_hint_3_end_to_end() {
     let n = stream.next().await.expect("one row").expect("decode").n;
     assert_eq!(
         n, 2,
-        "both remote-write histogram series must register value_type = 1 metric_series rows"
+        "both remote-write histogram series must land a kind-2 row with value_type = 1"
     );
 
     drop_database(&bootstrap, db).await;

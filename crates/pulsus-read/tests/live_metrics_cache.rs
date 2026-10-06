@@ -606,12 +606,16 @@ async fn stale_cache_degrades_to_sql_identical_to_ground_truth_and_a_fresh_refre
     // fallback rather than validating the fallback's bounds independently.
     let lower_bound_ms = floor_to_activity_bucket(far_future_window.start_ms, bucket);
     let upper_bound_ms = floor_to_activity_bucket(far_future_window.end_ms, bucket);
+    // Issue #623: each activity row's hours are expanded to their own start
+    // instants here, rather than tested through the reader's day mask.
     let truth_sql = format!(
         "SELECT DISTINCT fingerprint FROM metric_series \
-         INNER JOIN metric_labels USING (metric_name, fingerprint) \
-         WHERE metric_name = 'http_requests_total' \
-           AND unix_milli >= {lower_bound_ms} AND unix_milli <= {upper_bound_ms} \
-           AND match(JSONExtractString(labels, 'status'), '^(?:5..)$')"
+         WHERE fingerprint IN (SELECT fingerprint FROM metric_labels \
+                               WHERE metric_name = 'http_requests_total' \
+                                 AND match(JSONExtractString(labels, 'status'), '^(?:5..)$')) \
+           AND arrayExists(h -> bitTest(hours, h) \
+                 AND toInt64(toUInt16(day)) * 86400000 + h * 3600000 BETWEEN {lower_bound_ms} AND {upper_bound_ms}, \
+               range(24))"
     );
     let truth = execute_fingerprint_sql(&client, &truth_sql).await;
     // Proves the bounds actually bite: fingerprint 999 matches the label

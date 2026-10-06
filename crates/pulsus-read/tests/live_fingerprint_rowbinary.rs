@@ -23,13 +23,12 @@
 //!   18446744073709551618   2^64 + 2   its neighbour
 //! ```
 //!
-//! **The inventory.** Twenty-four production `Row` structs carry a
+//! **The inventory.** Twenty-two production `Row` structs carry a
 //! `fingerprint` field — ten in `logql/rows.rs`, four in
-//! `metrics/sample_rows.rs`, two in `metrics/rows.rs` (the second, the pair
-//! lookup's, since issue #623), two in `metrics/exec.rs` and six in
-//! `pulsus-write`'s `writer/rows.rs`. Two of them were private, which is
-//! why a `pub struct` search once returned two fewer; they are `pub` now
-//! with that reason recorded on them. One more, `MetricRangeUnwrappedRow`, carries no
+//! `metrics/sample_rows.rs`, one in `metrics/rows.rs`, one in
+//! `metrics/exec.rs` and six in `pulsus-write`'s `writer/rows.rs`. One of
+//! them was private, which is why a `pub struct` search once returned one
+//! fewer; it is `pub` now with that reason recorded on it. One more, `MetricRangeUnwrappedRow`, carries no
 //! `fingerprint` field but reads the `class` column, which is the
 //! fingerprint itself when the group-key plan groups per fingerprint — so
 //! it is exercised here too.
@@ -524,7 +523,7 @@ async fn every_fingerprint_row_struct_round_trips_the_uint128_column() {
         rows.into_iter().map(|r| r.class).collect(),
     );
 
-    // The twenty-fourth: no `fingerprint` field, but its `class` column is
+    // The twenty-second: no `fingerprint` field, but its `class` column is
     // the fingerprint on the per-fingerprint plan.
     let rows: Vec<logql_rows::MetricRangeUnwrappedRow> = read_all(
         &client,
@@ -604,7 +603,7 @@ async fn every_fingerprint_row_struct_round_trips_the_uint128_column() {
         rows.into_iter().map(|r| r.fingerprint).collect(),
     );
 
-    // --- crates/pulsus-read/src/metrics/rows.rs (2) -------------------
+    // --- crates/pulsus-read/src/metrics/rows.rs (1) -------------------
     let rows: Vec<metrics_rows::SeriesRow> = read_all(
         &client,
         "SeriesRow",
@@ -619,36 +618,7 @@ async fn every_fingerprint_row_struct_round_trips_the_uint128_column() {
         rows.into_iter().map(|r| r.fingerprint).collect(),
     );
 
-    let rows: Vec<metrics_rows::PairLabelsRow> = read_all(
-        &client,
-        "PairLabelsRow",
-        &format!(
-            "SELECT metric_name, fingerprint, labels FROM metric_labels \
-             WHERE fingerprint IN ({fps}) ORDER BY fingerprint"
-        ),
-    )
-    .await;
-    assert_the_four_boundary_values(
-        "PairLabelsRow",
-        rows.into_iter().map(|r| r.fingerprint).collect(),
-    );
-
-    // --- crates/pulsus-read/src/metrics/exec.rs (2, the two that were
-    // --- private) ----------------------------------------------------
-    let rows: Vec<metrics_exec::HydratedLabelsRow> = read_all(
-        &client,
-        "HydratedLabelsRow",
-        &format!(
-            "SELECT fingerprint, labels FROM metric_labels WHERE fingerprint IN ({fps}) \
-             ORDER BY fingerprint"
-        ),
-    )
-    .await;
-    assert_the_four_boundary_values(
-        "HydratedLabelsRow",
-        rows.into_iter().map(|r| r.fingerprint).collect(),
-    );
-
+    // --- crates/pulsus-read/src/metrics/exec.rs (1, once private) -------
     let rows: Vec<metrics_exec::FingerprintOnlyRow> = read_all(
         &client,
         "FingerprintOnlyRow",

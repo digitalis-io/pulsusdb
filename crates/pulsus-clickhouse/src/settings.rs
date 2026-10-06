@@ -168,7 +168,7 @@ impl QuerySettings {
     /// | `deduplicate_insert_select` | its entry scopes it to `INSERT SELECT`; this is `INSERT … FORMAT RowBinary…` |
     /// | `input_format_parallel_parsing` | its entry: "Supported only for TabSeparated (TSV), TSKV, CSV and JSONEachRow formats" — not the `RowBinary` family this client writes |
     /// | `max_parsing_threads`, `min_chunk_bytes_for_parallel_parsing` | both belong to parallel parsing, which `input_format_parallel_parsing`'s entry supports for the four formats above and not for this one: the first is its thread count, the second what one thread takes |
-    /// | `min_insert_block_size_rows_for_materialized_views`, `min_insert_block_size_bytes_for_materialized_views`, `materialized_views_squash_parallel_inserts` | squashing combines blocks into bigger ones and never divides one, and a single-block insert gives each view one block to push. The part-per-thread case the third one's entry names needs `max_insert_threads`, whose own entry scopes it to `INSERT SELECT` |
+    /// | `materialized_views_squash_parallel_inserts` | squashing combines blocks into bigger ones and never divides one, and a single-block insert gives each view one block to push. The part-per-thread case its entry names needs `max_insert_threads`, whose own entry scopes it to `INSERT SELECT` |
     /// | `max_partitions_per_insert_block` | it refuses a block, it does not split one; every row of a push carries one `received_ms`, so the block lies in one partition |
     ///
     /// **How the set was derived.** Two searches over the 1,550 rows of
@@ -309,6 +309,21 @@ impl QuerySettings {
     /// of one `INSERT … FORMAT RowBinary…` request rather than blocks, and
     /// the condition that client states for an atomic insert is the row one
     /// alone (`vendor/clickhouse/README.md:157`).
+    ///
+    /// **A landing insert fails when a view does not write (issue #623).**
+    /// Each signal's views turn one landing row into rows of several tables
+    /// — a metric series into its lookup row and its activity row — and a
+    /// push that stored one without the other would answer wrongly with
+    /// nothing to say so. Four view settings are pinned to the server's own
+    /// defaults, so a profile cannot make a failed view a stored push; the
+    /// writer's resend under the same token then writes what is missing:
+    ///
+    /// | setting | pinned to | why |
+    /// |---|---|---|
+    /// | `materialized_views_ignore_errors` | `0` | **what an error does.** The server's own words: "Allows to ignore errors for MATERIALIZED VIEW, and deliver original block to the table regardless of MVs". At `1` a view's exception is ignored, the insert **succeeds**, and the target is short behind a `200` — the silent-loss shape the whole design exists to prevent |
+    /// | `ignore_materialized_views_with_dropped_target_table` | `0` | the same class. `InsertDependenciesBuilder::observePath`, on a view whose target table cannot be locked: `if (!ignore_materialized_views_with_dropped_target_table) throw Exception(UNKNOWN_TABLE, …)` then `LOG_INFO(…); return false;` — so at `1` the view is **skipped and the insert returns success**, with that target's rows silently absent |
+    /// | `min_insert_block_size_rows_for_materialized_views` | `0` | **the block-forming class above, reaching the part of the path its pins do not.** `createSelectInsertContext` *overrides* `min_insert_block_size_rows` with this value for a **view's** insert alone, so the pin on the non-view variant does not govern there; a profile could reshape one view's output into several blocks, each its own commit into the target |
+    /// | `min_insert_block_size_bytes_for_materialized_views` | `0` | the same, for bytes |
     pub fn landing_insert(token: &str, max_rows: u64) -> Self {
         Self::deduplicate_through_views()
             .set("insert_deduplication_token", token)
@@ -319,12 +334,16 @@ impl QuerySettings {
             .set("min_insert_block_size_bytes", 0)
             .set("input_format_connection_handling", 0)
             .set("input_format_max_block_wait_ms", 0)
+            .set("materialized_views_ignore_errors", 0)
+            .set("ignore_materialized_views_with_dropped_target_table", 0)
+            .set("min_insert_block_size_rows_for_materialized_views", 0)
+            .set("min_insert_block_size_bytes_for_materialized_views", 0)
     }
 
     /// The settings every insert of one traces landing block carries, and
     /// every statement `pulsusdb rebuild-traces` issues (issues #584 to
-    /// #586): [`Self::landing_insert`] whole, plus **nineteen further pins
-    /// of seven classes the metrics set did not need**.
+    /// #586): [`Self::landing_insert`] whole, plus **fifteen further pins
+    /// of six classes the metrics set did not need**.
     ///
     /// The rule behind the set, stated once so it does not grow without
     /// bound: **pin what a profile could use to make an answer wrong or a
@@ -344,22 +363,19 @@ impl QuerySettings {
     /// | `format_binary_max_object_size` | `100000` | the same class: it bounds the paths one JSON value may carry in RowBinary. A profile that lowered it would refuse spans the decode gate admitted, after the block was sent. The decode gate and this pin carry the **same constant**, so neither can admit what the other refuses |
     /// | `max_partitions_per_insert_block` | `100` | **a limit that refuses a block rather than dividing it.** `spans`, `traces` and `resources` are partitioned by UTC day, so a view's insert touches one part per day the push's spans fall in. A profile that lowered this to 1 would fail every push that straddles midnight |
     /// | `throw_on_max_partitions_per_insert_block` | `1` | the same limit's other half. At `0` the server does not store part of the block: the throw in `MergeTreeDataWriter::buildScatterSelector` sits inside the row loop behind `&& throw_on_limit`, so with it false the loop completes the selector over every row and the whole block is accepted, one part per partition, with a warning. **What `0` costs is the ceiling, not the block** — the admission date gate would then be refusing pushes the server would have taken. Pinned so the gate and the engine cannot disagree about the same limit |
-    /// | `materialized_views_ignore_errors` | `0` | **a third class: what an error does.** The server's own words: "Allows to ignore errors for MATERIALIZED VIEW, and deliver original block to the table regardless of MVs". At `1` a view's exception is ignored, the insert **succeeds**, and the target is short behind a `200` — the silent-loss shape the whole design exists to prevent. Every failure statement on this path rests on this value |
-    /// | `ignore_materialized_views_with_dropped_target_table` | `0` | the same class. `InsertDependenciesBuilder::observePath`, on a view whose target table cannot be locked: `if (!ignore_materialized_views_with_dropped_target_table) throw Exception(UNKNOWN_TABLE, …)` then `LOG_INFO(…); return false;` — so at `1` the view is **skipped and the insert returns success**, with that target's rows silently absent |
-    /// | `min_insert_block_size_rows_for_materialized_views` | `0` | **the class [`Self::landing_insert`] already owns — a setting that could divide the request into more than one block — reaching the part of the path its pins do not.** `createSelectInsertContext` *overrides* `min_insert_block_size_rows` with this value for a **view's** insert alone, so the pin on the non-view variant does not govern there; a profile could reshape one view's output into several blocks, each its own commit into the target |
-    /// | `min_insert_block_size_bytes_for_materialized_views` | `0` | the same, for bytes |
-    /// | `distributed_foreground_insert` | `1` | **a fourth class: what an acknowledgement means.** The server's default is `0`, "data is inserted in background mode", and the two per-trace views insert into a routing table. At `1` the insert "succeeds only after all the data is saved on all shards (at least one replica for each shard if `internal_replication` is true)". **It is pinned here and not on the table**: a `Distributed` table accepts the clause on a `CREATE` and the server keeps nothing — the setting is absent from `SHOW CREATE TABLE` and from `system.tables.create_table_query`, and `ALTER TABLE … MODIFY SETTING` answers `Code: 48`. The chain that makes the query pin reach the view's insert is `InsertDependenciesBuilder::createSelectInsertContext` copying the parent context and changing four named settings, and `StorageDistributed::write` computing `insert_sync` from the context it is given |
-    /// | `insert_shard_id` | `0` | **a fifth class: where a row is placed.** `DistributedSink::writeSync`: `if (settings[Setting::insert_shard_id]) { start = insert_shard_id - 1; end = insert_shard_id; }` — the whole block goes to that one shard and the sharding expression is not consulted. A hash-pruned read then looks on the shard `cityHash64(trace_id)` selects while the rows are elsewhere: wrong answers on a cluster from a setting nobody pinned |
-    /// | `json_type_escape_dots_in_keys` | `0` | **a sixth class: what path a value is stored under.** Its description says it escapes dots "during parsing", and this path sends paths in the binary form rather than parsing text — but nothing read here establishes that the binary form is unaffected, and if it were affected every stored path would differ from what the encoder renders. Pinned because the question is open, not because the effect is known |
+    /// | `distributed_foreground_insert` | `1` | **a third class: what an acknowledgement means.** The server's default is `0`, "data is inserted in background mode", and the two per-trace views insert into a routing table. At `1` the insert "succeeds only after all the data is saved on all shards (at least one replica for each shard if `internal_replication` is true)". **It is pinned here and not on the table**: a `Distributed` table accepts the clause on a `CREATE` and the server keeps nothing — the setting is absent from `SHOW CREATE TABLE` and from `system.tables.create_table_query`, and `ALTER TABLE … MODIFY SETTING` answers `Code: 48`. The chain that makes the query pin reach the view's insert is `InsertDependenciesBuilder::createSelectInsertContext` copying the parent context and changing four named settings, and `StorageDistributed::write` computing `insert_sync` from the context it is given |
+    /// | `insert_shard_id` | `0` | **a fourth class: where a row is placed.** `DistributedSink::writeSync`: `if (settings[Setting::insert_shard_id]) { start = insert_shard_id - 1; end = insert_shard_id; }` — the whole block goes to that one shard and the sharding expression is not consulted. A hash-pruned read then looks on the shard `cityHash64(trace_id)` selects while the rows are elsewhere: wrong answers on a cluster from a setting nobody pinned |
+    /// | `json_type_escape_dots_in_keys` | `0` | **a fifth class: what path a value is stored under.** Its description says it escapes dots "during parsing", and this path sends paths in the binary form rather than parsing text — but nothing read here establishes that the binary form is unaffected, and if it were affected every stored path would differ from what the encoder renders. Pinned because the question is open, not because the effect is known |
     /// | `type_json_skip_duplicated_paths` | `0` | the block-forming class again. At `1` a repeated path in one value "will be ignored and only the first one will be inserted instead of an exception" — the same result the writer's own per-scope deduplication produces, which is why it must stay the **only** mechanism: at `1` a writer that emitted a duplicate would be silently absorbed instead of erroring |
-    /// | the seven overflow modes — `read_overflow_mode`, `read_overflow_mode_leaf`, `timeout_overflow_mode`, `group_by_overflow_mode`, `distinct_overflow_mode`, `sort_overflow_mode`, `result_overflow_mode` | `throw`, each one's own declared default | **a seventh class: whether exceeding a limit is an error or a success that need not be complete.** At `break` — and at `any` for the group-by one — the engine keeps what it had and the statement **succeeds**: `SizeLimits::softCheck` returns `false` and `executeJob` then cancels the source; `ExecutionSpeedLimits::handleOverflowMode` returns `false` for the deadline; and `Aggregator::checkLimits` returns `false` or sets `no_more_keys` instead of raising. A repair run's success would then stop meaning a complete replay, and nothing in the outcome would tell a complete replay from a strict prefix. **The cost, stated because it is not zero**: a deployment that has set both a cap and `break` gets a loud failure here where it had a quiet success. A total landing exactly on the cap is not that deployment — `softCheck` breaks at `>=` while `check` raises only at `>` — so only an overshoot turns loud |
+    /// | the seven overflow modes — `read_overflow_mode`, `read_overflow_mode_leaf`, `timeout_overflow_mode`, `group_by_overflow_mode`, `distinct_overflow_mode`, `sort_overflow_mode`, `result_overflow_mode` | `throw`, each one's own declared default | **a sixth class: whether exceeding a limit is an error or a success that need not be complete.** At `break` — and at `any` for the group-by one — the engine keeps what it had and the statement **succeeds**: `SizeLimits::softCheck` returns `false` and `executeJob` then cancels the source; `ExecutionSpeedLimits::handleOverflowMode` returns `false` for the deadline; and `Aggregator::checkLimits` returns `false` or sets `no_more_keys` instead of raising. A repair run's success would then stop meaning a complete replay, and nothing in the outcome would tell a complete replay from a strict prefix. **The cost, stated because it is not zero**: a deployment that has set both a cap and `break` gets a loud failure here where it had a quiet success. A total landing exactly on the cap is not that deployment — `softCheck` breaks at `>=` while `check` raises only at `>` — so only an overshoot turns loud |
     ///
     /// **Four members are inert for an `INSERT … SELECT` and are named here
     /// so nobody prunes them and reintroduces the drift** the repair's
     /// statements would then carry: `input_format_binary_read_json_as_string`
     /// and `format_binary_max_object_size` govern a RowBinary input such a
-    /// statement has none of, and the two view settings govern views, which a
-    /// repair statement's target has none attached. Two are load-bearing
+    /// statement has none of, and the two view-error settings this set takes
+    /// from [`Self::landing_insert`] govern views, which a repair
+    /// statement's target has none attached. Two are load-bearing
     /// there — `distributed_foreground_insert` and `insert_shard_id`, because
     /// the repair writes the routing table for `spans` and `traces` — and two
     /// are moot by the repair's own shape rather than by a pin, since it
@@ -383,10 +399,6 @@ impl QuerySettings {
                 MAX_PARTITIONS_PER_INSERT_BLOCK,
             )
             .set("throw_on_max_partitions_per_insert_block", 1)
-            .set("materialized_views_ignore_errors", 0)
-            .set("ignore_materialized_views_with_dropped_target_table", 0)
-            .set("min_insert_block_size_rows_for_materialized_views", 0)
-            .set("min_insert_block_size_bytes_for_materialized_views", 0)
             .set("distributed_foreground_insert", 1)
             .set("insert_shard_id", 0)
             .set("json_type_escape_dots_in_keys", 0)
@@ -475,28 +487,29 @@ impl QuerySettings {
     /// case that prices a block walks it with this. A figure over the strings'
     /// lengths would understate what the allocator holds, which is what the
     /// charge has to cover.
-    /// STUB (issue #623, tests first).
-    pub fn text_capacity(&self) -> u64 {
-        0
-    }
-
-    /// STUB (issue #623, tests first).
-    pub fn len(&self) -> usize {
-        usize::MAX
-    }
-
-    /// STUB (issue #623, tests first).
-    pub fn is_empty(&self) -> bool {
-        false
-    }
-
     pub fn allocated_bytes(&self) -> u64 {
         self.0.capacity() as u64 * std::mem::size_of::<(String, String)>() as u64
-            + self
-                .0
-                .iter()
-                .map(|(k, v)| (k.capacity() + v.capacity()) as u64)
-                .sum::<u64>()
+            + self.text_capacity()
+    }
+
+    /// The bytes every key and value string holds, **by capacity** — the
+    /// text half of [`Self::allocated_bytes`], which the metrics landing
+    /// charge prices as its own term (issue #623).
+    pub fn text_capacity(&self) -> u64 {
+        self.0
+            .iter()
+            .map(|(k, v)| (k.capacity() + v.capacity()) as u64)
+            .sum()
+    }
+
+    /// How many settings the set carries.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether the set carries no setting.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 
     /// Applies every `(key, value)` pair to a `clickhouse::query::Query`

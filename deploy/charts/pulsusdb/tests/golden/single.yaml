@@ -61,7 +61,6 @@ data:
       logql_scan_budget_bytes: 50GiB
       promql_lookback: 5m
       promql_max_samples: 50000000
-      series_activity_bucket: 1h
       traceql_max_candidates: 100000
       traceql_tag_lookback: 24h
     retention_days: 7

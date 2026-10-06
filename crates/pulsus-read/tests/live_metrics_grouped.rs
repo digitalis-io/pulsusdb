@@ -958,7 +958,6 @@ async fn a_gap_longer_than_the_lookback_drops_the_group_on_both_routes() {
 /// statement reduces onto.
 struct RowCase {
     name: &'static str,
-    metric: &'static str,
     series: Vec<Series>,
     grid: Grid,
     /// The fetch window the engine would use for this grid.
@@ -987,7 +986,6 @@ fn row_cases(t: i64) -> Vec<RowCase> {
             .collect();
         cases.push(RowCase {
             name: "aligned, 400 series / 4 groups / 15 s step",
-            metric,
             series,
             grid: Grid {
                 start_ms: start,
@@ -1028,7 +1026,6 @@ fn row_cases(t: i64) -> Vec<RowCase> {
             .collect();
         cases.push(RowCase {
             name: "cyclic, four members per group, 3.75 s step",
-            metric,
             series,
             grid: Grid {
                 start_ms: start,
@@ -1075,7 +1072,6 @@ fn row_cases(t: i64) -> Vec<RowCase> {
             .collect();
         cases.push(RowCase {
             name: "expiry, 100 one-sample series in one group",
-            metric,
             series,
             grid: Grid {
                 start_ms: start,
@@ -1104,7 +1100,6 @@ fn row_cases(t: i64) -> Vec<RowCase> {
             .collect();
         cases.push(RowCase {
             name: "three one-sample series in one group",
-            metric,
             series,
             grid: Grid {
                 start_ms: start,
@@ -1141,7 +1136,6 @@ fn row_cases(t: i64) -> Vec<RowCase> {
             .collect();
         cases.push(RowCase {
             name: "one group per series, constant values (declined)",
-            metric,
             series,
             grid: Grid {
                 start_ms: start,
@@ -1221,8 +1215,13 @@ async fn pushed_rows_never_exceed_twice_the_raw_rows() {
         let raw = h
             .count(&format!(
                 "SELECT toUInt64(count()) AS n FROM metric_samples \
-                 WHERE metric_name = '{}' AND unix_milli > {} AND unix_milli <= {}",
-                case.metric, case.lower_excl_ms, case.upper_incl_ms
+                 WHERE fingerprint IN ({}) AND unix_milli > {} AND unix_milli <= {}",
+                fps.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                case.lower_excl_ms,
+                case.upper_incl_ms
             ))
             .await;
         // Every operation, not one: `count` changes at an arrival AND at

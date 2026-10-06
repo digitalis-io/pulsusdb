@@ -95,7 +95,7 @@ use std::time::Instant;
 
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, QuerySettings, Row};
-use pulsus_model::{Fingerprint, LabelSet, floor_to_activity_bucket, metric_fingerprint};
+use pulsus_model::{Fingerprint, LabelSet, floor_to_activity_bucket};
 
 use crate::bench::Profile;
 
@@ -390,7 +390,7 @@ pub async fn load(
 
         for i in 0..cardinality {
             let labels = series_labels(i);
-            let fingerprint = metric_fingerprint(&labels);
+            let fingerprint = pulsus_model::series_fingerprint(&metric_name, &labels);
             if i == 0 {
                 narrow_fp = fingerprint;
             }
@@ -517,15 +517,15 @@ mod tests {
 
     #[test]
     fn metric_fingerprint_is_stable_across_calls_for_the_same_series() {
-        let a = metric_fingerprint(&series_labels(42));
-        let b = metric_fingerprint(&series_labels(42));
+        let a = pulsus_model::metric_fingerprint(&series_labels(42));
+        let b = pulsus_model::metric_fingerprint(&series_labels(42));
         assert_eq!(a, b);
     }
 
     #[test]
     fn metric_fingerprint_differs_across_series() {
-        let a = metric_fingerprint(&series_labels(0));
-        let b = metric_fingerprint(&series_labels(1));
+        let a = pulsus_model::metric_fingerprint(&series_labels(0));
+        let b = pulsus_model::metric_fingerprint(&series_labels(1));
         assert_ne!(a, b);
     }
 

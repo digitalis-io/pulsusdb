@@ -545,20 +545,22 @@ async fn the_configured_retention_reaches_every_retained_tables_ttl() {
         .await
         .expect("a rebuild at the new PULSUS_RETENTION_DAYS must succeed");
 
-    for table in [
-        "metric_samples",
-        "log_samples",
-        "metric_hist_samples",
-        "log_patterns",
-        "metric_series",
+    // Issue #623: the activity table keeps a day until its last sample has
+    // expired, `(day + 1 + retention) * 86400`.
+    for (table, want, stale) in [
+        ("metric_samples", "(30 * 86400)", "(7 * 86400)"),
+        ("log_samples", "(30 * 86400)", "(7 * 86400)"),
+        ("metric_hist_samples", "(30 * 86400)", "(7 * 86400)"),
+        ("log_patterns", "(30 * 86400)", "(7 * 86400)"),
+        ("metric_series", "+ 1) + 30) * 86400", "+ 1) + 7) * 86400"),
     ] {
         let after = create_table_query(&client, db, table).await;
         assert!(
-            after.contains("(30 * 86400)"),
+            after.contains(want),
             "{table}'s TTL must be updated to the new retention_days: {after}"
         );
         assert!(
-            !after.contains("(7 * 86400)"),
+            !after.contains(stale),
             "{table}: stale retention_days=7 TTL: {after}"
         );
         assert!(
@@ -755,8 +757,8 @@ async fn day_50_000_rows_survive_saturating_ttl_and_drop_under_the_wrapping_ttl(
     client
         .execute(
             &format!(
-                "INSERT INTO {db}.metric_samples (metric_name, fingerprint, unix_milli, value) \
-                 VALUES ('m_boundary', 1, {DAY_50_000_MS}, 1.0)"
+                "INSERT INTO {db}.metric_samples (fingerprint, unix_milli, value) \
+                 VALUES (1, {DAY_50_000_MS}, 1.0)"
             ),
             &QuerySettings::new(),
             Idempotency::NonIdempotent,
@@ -782,8 +784,8 @@ async fn day_50_000_rows_survive_saturating_ttl_and_drop_under_the_wrapping_ttl(
         .execute(
             &format!(
                 "INSERT INTO {db}.metric_hist_samples \
-                     (metric_name, fingerprint, unix_milli, schema, count, sum) \
-                 VALUES ('h_boundary', 1, {DAY_50_000_MS}, 0, 4, 2.0)"
+                     (fingerprint, unix_milli, schema, count, sum) \
+                 VALUES (1, {DAY_50_000_MS}, 0, 4, 2.0)"
             ),
             &QuerySettings::new(),
             Idempotency::NonIdempotent,

@@ -97,9 +97,9 @@ const STALE_NAN_DECIMAL: u64 = 9_218_868_437_227_405_314;
 /// owner of it), and this function does not re-check it; it also does not
 /// re-check the feature flag.
 ///
-/// **Nine parameters, four of them interchangeable by type.** Transposing
+/// **Eight parameters, four of them interchangeable by type.** Transposing
 /// `lower_excl_ms` and `upper_incl_ms`, or the two table names, compiles.
-/// The signature is the one issue #549's plan specifies and is kept, so
+/// The signature is the one issue #549's plan specifies less its metric name (issue #623), so
 /// what guards against a transposition is a test rather than the type
 /// system — and **which test depends on where the transposition is**,
 /// measured by making each one:
@@ -127,7 +127,6 @@ pub fn grouped_fetch(
     upper_incl_ms: i64,
     op: GroupedOp,
 ) -> String {
-    let name = sample_sql::name_predicate("");
     let window = sample_sql::window_predicate(lower_excl_ms, upper_incl_ms);
     let fp_list = sample_sql::render_fingerprint_list(fps);
     let gid_list = gids
@@ -227,14 +226,12 @@ pub fn grouped_fetch(
          CAST(0, 'UInt8') AS is_hist,\n\
          \x20                  reinterpretAsUInt64(value) = {STALE_NAN_DECIMAL} AS stale\n\
          \x20           FROM {samples_table}\n\
-         \x20           PREWHERE {name}\n\
          \x20           WHERE {window} AND fingerprint IN fps\n\
          \x20           UNION ALL\n\
          \x20           SELECT fingerprint, unix_milli AS ts, CAST(0, 'Float64') AS v, \
          CAST(1, 'UInt8') AS is_hist,\n\
          \x20                  reinterpretAsUInt64(sum) = {STALE_NAN_DECIMAL} AS stale\n\
          \x20           FROM {hist_samples_table}\n\
-         \x20           PREWHERE {name}\n\
          \x20           WHERE {window} AND fingerprint IN fps\n\
          \x20         )\n\
          \x20       )\n\

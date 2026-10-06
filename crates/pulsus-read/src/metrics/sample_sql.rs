@@ -9,8 +9,11 @@
 //! `tests/query_log_gates.rs`… no, in the SQL-plan snapshot tests
 //! (`tests/metrics_sql_snapshots.rs`).
 //!
-//! **`metric_name` is the only string literal here** ([`ch_string`]);
-//! fingerprints enter as [`FpLiteral`]s and render as
+//! **No metric name reaches a sample statement** (issue #623): the sample
+//! tables are keyed by the series ID alone, `(fingerprint, unix_milli)`,
+//! so every read is an exact ID list (or the fallback's ID sub-query) and
+//! a time range. The one string literal here is [`names_predicate`]'s, for
+//! the explained read. Fingerprints enter as [`FpLiteral`]s and render as
 //! `toUInt128('<decimal>')` (no escaping surface — they come from
 //! [`super::labels::Resolution::Fingerprints`] or a resolved
 //! `SqlFallback`, never from unescaped user text). No function in this
@@ -39,17 +42,14 @@ use crate::logql::escape::ch_string;
 // how a plan comes to describe a statement the engine does not send.
 //
 // **No fragment carries statement layout.** Each renders one clause's
-// text and nothing else: the newlines, the `PREWHERE`/`WHERE` keywords
+// text and nothing else: the newlines, the `WHERE` keyword
 // and the two-space continuation are the builders' business, which is
 // what keeps the rendered statements byte-identical to the ones this
 // module rendered before the fragments existed (issue #548 criterion 1).
 
-/// `metric_name = 'x'` — the concrete-name `PREWHERE` term.
-pub fn name_predicate(metric_name: &str) -> String {
-    format!("metric_name = {}", ch_string(metric_name))
-}
-
-/// `metric_name IN ('a', 'b')` — the fan-out `PREWHERE` term.
+/// `metric_name IN ('a', 'b')` — the fan-out's metric names, which its
+/// explained read states beside the sample predicates (issue #548); no
+/// sample statement carries it (issue #623).
 pub fn names_predicate(metric_names: &[String]) -> String {
     let name_list = metric_names
         .iter()
@@ -87,13 +87,10 @@ pub fn sample_fetch(
     lower_excl_ms: i64,
     upper_incl_ms: i64,
 ) -> String {
-    // STUB (issue #623, tests first): the old body.
-    let metric_name = "";
-    let name = name_predicate(metric_name);
     let window = window_predicate(lower_excl_ms, upper_incl_ms);
     let fps = fingerprints_predicate(fps);
     format!(
-        "SELECT fingerprint, unix_milli, value\nFROM {table}\nPREWHERE {name}\nWHERE {window}\n  AND {fps}\nORDER BY fingerprint, unix_milli"
+        "SELECT fingerprint, unix_milli, value\nFROM {table}\nWHERE {window}\n  AND {fps}\nORDER BY fingerprint, unix_milli"
     )
 }
 
@@ -107,41 +104,29 @@ pub fn sample_fetch_subquery(
     lower_excl_ms: i64,
     upper_incl_ms: i64,
 ) -> String {
-    // STUB (issue #623, tests first): the old body.
-    let metric_name = "";
-    let name = name_predicate(metric_name);
     let window = window_predicate(lower_excl_ms, upper_incl_ms);
     let sub = subquery_predicate(subquery);
     format!(
-        "SELECT fingerprint, unix_milli, value\nFROM {table}\nPREWHERE {name}\nWHERE {window}\n  AND {sub}\nORDER BY fingerprint, unix_milli"
+        "SELECT fingerprint, unix_milli, value\nFROM {table}\nWHERE {window}\n  AND {sub}\nORDER BY fingerprint, unix_milli"
     )
 }
 
-/// The issue #85 (M6-08c) multi-metric fan-out fetch: ONE flat query for
-/// a name-less/regex-`__name__` selector's whole resolved set —
-/// `PREWHERE metric_name IN (<matched names>)` (leading-primary-key
-/// granule pruning, the EXPLAIN-gated compound prune's first component)
-/// plus `fingerprint IN (<matched fps>)` (the second PK component),
-/// never a global unfiltered sample scan. Sound without per-pair
-/// filtering (plan v3 Δ2, reviewer-verified): label matchers exclude
-/// `__name__` and apply uniformly across metrics, so any
-/// `(metric_name, fingerprint)` cross-pair naming a real series has
-/// matcher-passing labels by construction — the IN×IN cannot over-match.
-/// `metric_name` joins the projection so rows group into per-
-/// `(metric_name, fingerprint)` series ([`super::sample_rows::MultiSampleRow`]).
+/// The issue #85 (M6-08c) multi-metric fan-out fetch: ONE query for a
+/// name-less/regex-`__name__` selector's whole resolved ID set,
+/// `fingerprint IN (<matched IDs>)` — the leading primary-key component,
+/// never a global unfiltered sample scan. An ID names one series (issue
+/// #623), so rows group by ID ([`super::sample_rows::MultiSampleRow`]) and
+/// take their names from the resolution.
 pub fn sample_fetch_multi(
     table: &str,
     fps: &[FpLiteral],
     lower_excl_ms: i64,
     upper_incl_ms: i64,
 ) -> String {
-    // STUB (issue #623, tests first): the old body.
-    let metric_names: &[String] = &[];
-    let names = names_predicate(metric_names);
     let window = window_predicate(lower_excl_ms, upper_incl_ms);
     let fps = fingerprints_predicate(fps);
     format!(
-        "SELECT metric_name, fingerprint, unix_milli, value\nFROM {table}\nPREWHERE {names}\nWHERE {window}\n  AND {fps}\nORDER BY metric_name, fingerprint, unix_milli"
+        "SELECT fingerprint, unix_milli, value\nFROM {table}\nWHERE {window}\n  AND {fps}\nORDER BY fingerprint, unix_milli"
     )
 }
 
@@ -150,17 +135,17 @@ pub fn sample_fetch_multi(
 /// issue #125) and [`super::sample_rows::HistSampleRow`]. Appended
 /// after the identity columns in every histogram fetch's SELECT list; the
 /// **only** difference from the float builders is this column list and the
-/// table name (M7-A5a AC1/AC5 — the PREWHERE/window/IN/ORDER-BY shape is
+/// table name (M7-A5a AC1/AC5 — the window/IN/ORDER-BY shape is
 /// byte-for-byte the float shape). The extra fixed-width `UInt8` column
-/// changes no PREWHERE/ORDER-BY shape and adds no per-row bucket work.
+/// changes no WHERE/ORDER-BY shape and adds no per-row bucket work.
 const HIST_VALUE_COLUMNS: &str = "schema, zero_threshold, zero_count, count, sum, \
      pos_span_offsets, pos_span_lengths, pos_bucket_deltas, \
      neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, \
      counter_reset_hint";
 
 /// The histogram half of [`sample_fetch`]: the complementary
-/// `metric_hist_samples` read for the same `(metric_name, fingerprint set,
-/// window)`. Byte-for-byte [`sample_fetch`]'s PREWHERE/window/`IN`/ORDER-BY
+/// `metric_hist_samples` read for the same ID set and window. Byte-for-byte
+/// [`sample_fetch`]'s window/`IN`/ORDER-BY
 /// shape — only the SELECT column list and table name differ (M7-A5a).
 pub fn hist_sample_fetch(
     table: &str,
@@ -168,13 +153,10 @@ pub fn hist_sample_fetch(
     lower_excl_ms: i64,
     upper_incl_ms: i64,
 ) -> String {
-    // STUB (issue #623, tests first): the old body.
-    let metric_name = "";
-    let name = name_predicate(metric_name);
     let window = window_predicate(lower_excl_ms, upper_incl_ms);
     let fps = fingerprints_predicate(fps);
     format!(
-        "SELECT fingerprint, unix_milli, {HIST_VALUE_COLUMNS}\nFROM {table}\nPREWHERE {name}\nWHERE {window}\n  AND {fps}\nORDER BY fingerprint, unix_milli"
+        "SELECT fingerprint, unix_milli, {HIST_VALUE_COLUMNS}\nFROM {table}\nWHERE {window}\n  AND {fps}\nORDER BY fingerprint, unix_milli"
     )
 }
 
@@ -188,34 +170,27 @@ pub fn hist_sample_fetch_subquery(
     lower_excl_ms: i64,
     upper_incl_ms: i64,
 ) -> String {
-    // STUB (issue #623, tests first): the old body.
-    let metric_name = "";
-    let name = name_predicate(metric_name);
     let window = window_predicate(lower_excl_ms, upper_incl_ms);
     let sub = subquery_predicate(subquery);
     format!(
-        "SELECT fingerprint, unix_milli, {HIST_VALUE_COLUMNS}\nFROM {table}\nPREWHERE {name}\nWHERE {window}\n  AND {sub}\nORDER BY fingerprint, unix_milli"
+        "SELECT fingerprint, unix_milli, {HIST_VALUE_COLUMNS}\nFROM {table}\nWHERE {window}\n  AND {sub}\nORDER BY fingerprint, unix_milli"
     )
 }
 
 /// The histogram half of [`sample_fetch_multi`] — the name-less/regex-
-/// `__name__` fan-out's complementary read. Byte-for-byte its flat
-/// `PREWHERE metric_name IN (…) … fingerprint IN (…)` shape, only the
-/// SELECT column list (leading `metric_name`, then the 13 value columns)
-/// and table name differ (M7-A5a).
+/// `__name__` fan-out's complementary read. Byte-for-byte its
+/// `fingerprint IN (…)` shape, only the SELECT column list (the 13 value
+/// columns) and table name differ (M7-A5a).
 pub fn hist_sample_fetch_multi(
     table: &str,
     fps: &[FpLiteral],
     lower_excl_ms: i64,
     upper_incl_ms: i64,
 ) -> String {
-    // STUB (issue #623, tests first): the old body.
-    let metric_names: &[String] = &[];
-    let names = names_predicate(metric_names);
     let window = window_predicate(lower_excl_ms, upper_incl_ms);
     let fps = fingerprints_predicate(fps);
     format!(
-        "SELECT metric_name, fingerprint, unix_milli, {HIST_VALUE_COLUMNS}\nFROM {table}\nPREWHERE {names}\nWHERE {window}\n  AND {fps}\nORDER BY metric_name, fingerprint, unix_milli"
+        "SELECT fingerprint, unix_milli, {HIST_VALUE_COLUMNS}\nFROM {table}\nWHERE {window}\n  AND {fps}\nORDER BY fingerprint, unix_milli"
     )
 }
 

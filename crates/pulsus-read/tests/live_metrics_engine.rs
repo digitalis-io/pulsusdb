@@ -1870,7 +1870,10 @@ async fn explain_carries_the_real_generated_sample_fetch_sql() {
         fetch_stage.sql
     );
     assert!(fetch_stage.sql.contains("FROM metric_samples"));
-    assert!(fetch_stage.sql.contains("PREWHERE metric_name = 'up'"));
+    // Issue #623: the sample tables carry no metric name; the read is the
+    // resolved IDs and the window.
+    assert!(!fetch_stage.sql.contains("metric_name"));
+    assert!(fetch_stage.sql.contains("AND fingerprint IN (toUInt128("));
     let resolution_stage = stage(&explain, "series_resolution");
     assert!(resolution_stage.sql.contains("matching series"));
 
@@ -1954,12 +1957,13 @@ async fn every_fetch_path_sends_both_reads_at_once() {
             .await
             .unwrap_or_else(|e| panic!("{path}: {e}"));
         // The path taken: only the fallback's fetch nests the activity
-        // read; only the fan-out's names more than one metric.
+        // read; only the fan-out resolves across metric names.
         let fetch = &stage(&explain, "sample_fetch").sql;
+        let resolution = &stage(&explain, "series_resolution").sql;
         assert_eq!(
             (
                 fetch.contains("FROM metric_series"),
-                fetch.contains("metric_name IN ("),
+                resolution.contains("name-less selector fan-out"),
             ),
             match path {
                 "chunks" => (false, false),
@@ -3112,10 +3116,8 @@ async fn nameless_selector_fans_out_with_per_series_names_and_one_flat_in_set_fe
     let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now / bucket) * bucket;
 
-    // Fingerprint 1 exists under BOTH http_a_total and http_b_total (the
-    // same label set fingerprints identically across metric names —
-    // metric_fingerprint excludes __name__); other_metric must be pruned
-    // by the name regex.
+    // One label set under http_a_total and http_b_total: two series, two
+    // IDs (issue #623); other_metric must be pruned by the name regex.
     seed_series(
         &client,
         &[
@@ -3127,7 +3129,7 @@ async fn nameless_selector_fans_out_with_per_series_names_and_one_flat_in_set_fe
             },
             SeedSeriesRow {
                 metric_name: "http_b_total".to_string(),
-                fingerprint: 1,
+                fingerprint: 3,
                 unix_milli: recent_bucket,
                 labels: r#"{"job":"api"}"#.to_string(),
             },
@@ -3149,7 +3151,7 @@ async fn nameless_selector_fans_out_with_per_series_names_and_one_flat_in_set_fe
                 value: 11.0,
             },
             SeedSampleRow {
-                fingerprint: 1,
+                fingerprint: 3,
                 unix_milli: recent_bucket,
                 value: 22.0,
             },
@@ -3191,10 +3193,9 @@ async fn nameless_selector_fans_out_with_per_series_names_and_one_flat_in_set_fe
     assert_eq!(fetches.len(), 1, "one flat fetch: {:#?}", explain.stages);
     let sql = &fetches[0].sql;
     assert!(
-        sql.contains("PREWHERE metric_name IN ('http_a_total', 'http_b_total')"),
-        "flat IN-set prune must name exactly the regex-matched metrics: {sql}"
+        sql.contains("fingerprint IN (toUInt128('1'), toUInt128('3'))"),
+        "the fetch reads exactly the regex-matched metrics' IDs: {sql}"
     );
-    assert!(sql.contains("fingerprint IN (toUInt128('1'))"), "{sql}");
     assert!(!sql.contains("other_metric"), "{sql}");
 
     match result {
@@ -3250,140 +3251,6 @@ async fn nameless_selector_fans_out_with_per_series_names_and_one_flat_in_set_fe
         msg.contains("query too broad") && msg.contains("fan-out cap"),
         "named metric-fan-out rejection, got {msg:?}"
     );
-
-    drop_database(&bootstrap, db).await;
-}
-
-/// Issue #85 code review round 1, finding 1 (live gap): a genuine
-/// `(metric_name, fingerprint)` cross-pair the cache did NOT resolve —
-/// the name is known via one fingerprint, the fingerprint via another
-/// name, and the pair registered inside the post-sweep recency gap. The
-/// flat IN×IN fetch returns its rows; they must surface with the pair's
-/// own label row, looked up by the pair (issue #623), NEVER an empty label
-/// set.
-#[tokio::test]
-async fn nameless_selector_hydrates_a_post_sweep_cross_pair_never_empty_labels() {
-    skip_unless_live!();
-
-    let bootstrap = ChClient::new(test_config("default"))
-        .await
-        .expect("connect (bootstrap)");
-    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_engine_cross_pair");
-    init_db(&bootstrap, db).await;
-    let client = ChClient::new(test_config(db))
-        .await
-        .expect("connect (target db)");
-    let cache_client = ChClient::new(test_config(db))
-        .await
-        .expect("connect (cache client)");
-    let engine_client = ChClient::new(test_config(db))
-        .await
-        .expect("connect (engine client)");
-
-    let now = now_ms();
-    let bucket = ACTIVITY_BUCKET_MS;
-    let recent_bucket = (now / bucket) * bucket;
-
-    // Pre-sweep registrations: cross_a_total resolves fp1, cross_b_total
-    // resolves fp2 — so the fan-out's IN lists contain BOTH names and
-    // BOTH fingerprints, but the (cross_b_total, fp1) pair is unresolved.
-    seed_series(
-        &client,
-        &[
-            SeedSeriesRow {
-                metric_name: "cross_a_total".to_string(),
-                fingerprint: 1,
-                unix_milli: recent_bucket,
-                labels: r#"{"job":"api"}"#.to_string(),
-            },
-            SeedSeriesRow {
-                metric_name: "cross_b_total".to_string(),
-                fingerprint: 2,
-                unix_milli: recent_bucket,
-                labels: r#"{"job":"web"}"#.to_string(),
-            },
-        ],
-    )
-    .await;
-
-    let cache = Arc::new(LabelCache::new(
-        cache_client,
-        cache_config(db, 24 * 3_600_000),
-    ));
-    cache.refresh().await.expect("refresh");
-    assert!(cache.is_warm());
-
-    // POST-sweep: the cross-pair registers and its samples land. Its
-    // activity and label rows are written as production writes them (one
-    // kind-2 row each), but the resident snapshot predates them — the
-    // sanctioned recency gap. Issue #623: the fan-out looks the pair up by
-    // the pair and finds its own label row.
-    seed_series(
-        &client,
-        &[SeedSeriesRow {
-            metric_name: "cross_b_total".to_string(),
-            fingerprint: 1,
-            unix_milli: recent_bucket,
-            labels: r#"{"job":"api"}"#.to_string(),
-        }],
-    )
-    .await;
-    seed_samples(
-        &client,
-        &[
-            SeedSampleRow {
-                fingerprint: 1,
-                unix_milli: recent_bucket,
-                value: 1.0,
-            },
-            SeedSampleRow {
-                fingerprint: 2,
-                unix_milli: recent_bucket,
-                value: 2.0,
-            },
-            SeedSampleRow {
-                fingerprint: 1,
-                unix_milli: recent_bucket,
-                value: 3.0,
-            },
-        ],
-    )
-    .await;
-
-    let engine = MetricsEngine::new(engine_client, cache, engine_config(db));
-    let expr = parse(r#"{__name__=~"cross_.*"}"#).expect("parse");
-    let params = MetricQueryParams {
-        start_ms: recent_bucket,
-        end_ms: recent_bucket,
-        step_ms: 0,
-    };
-    let (result, _annotations) = engine.query(&expr, &params).await.expect("query");
-
-    match result {
-        QueryResult::Vector(v) => {
-            assert_eq!(v.len(), 3, "both resolved pairs + the cross-pair: {v:?}");
-            assert!(
-                v.iter()
-                    .all(|s| s.labels.iter().any(|(k, _)| k != "__name__")),
-                "no series may surface with empty (name-only) labels: {v:?}"
-            );
-            let cross = v
-                .iter()
-                .find(|s| {
-                    s.labels
-                        .contains(&("__name__".to_string(), "cross_b_total".to_string()))
-                        && s.value == 3.0
-                })
-                .unwrap_or_else(|| panic!("cross-pair series missing: {v:?}"));
-            assert!(
-                cross
-                    .labels
-                    .contains(&("job".to_string(), "api".to_string())),
-                "cross-pair must carry fp1's hydrated name-invariant labels: {cross:?}"
-            );
-        }
-        other => panic!("expected Vector, got {other:?}"),
-    }
 
     drop_database(&bootstrap, db).await;
 }
