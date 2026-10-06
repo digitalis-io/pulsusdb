@@ -2236,7 +2236,8 @@ fn scalar_presence(field: &Field, var: &str) -> Option<String> {
 /// operator but `!=`; `!=` every element, after the presences — the
 /// chain's and the scalar's, in the written order — so an empty event or
 /// link set satisfies it and an absent scalar or a chain held nowhere
-/// does not. With no term, `false`.
+/// does not. With no term, `false`, except that `!=` holds over an empty
+/// set (decision 9 of the part-3d design).
 fn element_compare(
     set: &SetOperand,
     op: ComparisonOp,
@@ -2249,7 +2250,10 @@ fn element_compare(
     } else {
         field_terms(scalar, op, &set.arms)
     };
-    if body == "false" {
+    // Decision 9: with no term, nothing matches under `= < <= > >=`, and
+    // `!=` keeps its every-element rule over `false`, so it holds exactly
+    // when the set is empty.
+    if body == "false" && op != ComparisonOp::Neq {
         return body;
     }
     let (var, array) = (&set.var, &set.array);
@@ -2279,7 +2283,8 @@ fn element_compare(
 /// satisfies it. The count is exact: each element has one stored type and
 /// each pair of types at most one term, so a pair of elements is counted
 /// at most once, and a pair with no term — two arrays, a string against a
-/// number — is not counted. With no term at all, `false`.
+/// number — is not counted. With no term at all, `false`, except that
+/// `!=` holds when either set is empty (decision 9).
 ///
 /// Comparing each pair through part 3a's per-element terms costs about 94
 /// ns a pair against 4.6 ns for the lists (26.3.29.7, the part-3d design's
@@ -2369,8 +2374,13 @@ fn class_list_compare(l: &SetOperand, op: ComparisonOp, r: &SetOperand) -> Strin
             )
         });
     }
+    // Decision 9: with no term, nothing matches under `= < <= > >=`, and
+    // `!=` counts no pair, so it holds when either set is empty.
     if terms.is_empty() {
-        return "false".to_string();
+        if !neq {
+            return "false".to_string();
+        }
+        terms.push("0".to_string());
     }
     if !neq {
         return format!("({})", terms.join(" OR "));
