@@ -4347,6 +4347,22 @@ fn t_c41_the_set_expression_texts() {
          x, false), attrs.`g`.:`Array(Nullable(Bool))`)), arrayFilter(d -> dynamicType(d) != \
          'None', events.attrs.`f`)))) = 1"
     );
+    // A duration divided by a plain number divides as a float: the
+    // element's duration flag, not the divisor's, decides it.
+    let tss = Ax {
+        text: format!("tuple(toInt256(e1), {AX_NF})"),
+        dur: true,
+    };
+    assert_eq!(
+        rendered(r#"{ event:timeSinceStart / 7 > 1392857.1 }"#),
+        format!(
+            "arrayExists(e1 -> arrayExists(a1 -> (coalesce(tupleElement(a1, 1) > \
+             toFloat64('1392857.1'), false) OR coalesce(tupleElement(a1, 2) > \
+             toFloat64('1392857.1'), false)), [{}]), arrayMap(t -> toInt128(t) - start_ns, \
+             events.time_ns))",
+            ax_bin("/", &tss, &ax_int("7", false)).text
+        )
+    );
     let plus = ax_bin("+", &ax_no_number(), &ax_int("1", false));
     assert_eq!(
         rendered(r#"{ event:name + 1 != 2 }"#),
@@ -4419,6 +4435,10 @@ fn t_c42_the_limits_and_the_refusals_that_remain() {
         r#"{ event.a + link.a + event.b > 1 }"#,
         r#"{ event.a + event.b = link.a }"#,
         r#"{ event.a - event.a = event.a }"#,
+        // The cap is applied before a side folding to no value makes the
+        // comparison `false`, in either order.
+        r#"{ event.a + event.a + event.a + 1 / 0 != 2 }"#,
+        r#"{ 2 != event.a + event.a + event.a + 1 / 0 }"#,
     ] {
         assert_eq!(
             compile_span_predicate_in(&filter_body(query), &ctx()).map(|p| p.sql().to_string()),

@@ -5377,6 +5377,14 @@ const CASES_Q: &[CaseIn] = &[
         query: r#"{ 1 / 0 != event.a + 1 }"#,
         want: Want::Ids(&[]),
     },
+    // A duration divided by a plain number divides as a float: `q09`'s
+    // 9.75 ms event over 7 is 1392857.14 ns, which an integer division
+    // would cut to 1392857.
+    CaseIn {
+        name: "AE25",
+        query: r#"{ event:timeSinceStart / 7 > 1392857.1 }"#,
+        want: Want::Ids(&["q09"]),
+    },
 ];
 
 /// Section 8's phase 2, after the resource rows of `q18` and `q21` are
