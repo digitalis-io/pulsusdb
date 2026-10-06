@@ -295,8 +295,8 @@ docs/query-to-sql.md	post_agg.rs:1110	crates/pulsus-read/src/logql/post_agg.rs	1
 docs/query-to-sql.md	post_agg.rs:807	crates/pulsus-read/src/logql/post_agg.rs	807		prose	select_k_range	select_k_range
 docs/query-to-sql.md	post_agg.rs:858	crates/pulsus-read/src/logql/post_agg.rs	858		prose	select_k_instant	select_k_instant
 docs/query-to-sql.md	post_agg.rs:983	crates/pulsus-read/src/logql/post_agg.rs	983		prose	approx_topk_instant	approx_topk_instant
-docs/query-to-sql.md	predicate.rs:1933-1940	crates/pulsus-read/src/logql/predicate.rs	1933	1940	prose	a_contains_line_filter_renders_an_escaped_like_pattern	LIKE
-docs/query-to-sql.md	predicate.rs:1939	crates/pulsus-read/src/logql/predicate.rs	1939		prose	body	'%%'
+docs/query-to-sql.md	logql/predicate.rs:1933-1940	crates/pulsus-read/src/logql/predicate.rs	1933	1940	prose	a_contains_line_filter_renders_an_escaped_like_pattern	LIKE
+docs/query-to-sql.md	logql/predicate.rs:1939	crates/pulsus-read/src/logql/predicate.rs	1939		prose	body	'%%'
 docs/query-to-sql.md	predicate.rs:467-483	crates/pulsus-read/src/logql/predicate.rs	467	483	prose	BAD_ARGUMENTS	BAD_ARGUMENTS
 docs/query-to-sql.md	predicate.rs:493	crates/pulsus-read/src/logql/predicate.rs	493		prose	CheckedFragment	line_filter
 docs/query-to-sql.md	logql/predicate.rs:947	crates/pulsus-read/src/logql/predicate.rs	947		line	contains_predicate	fn contains_predicate(phrase: &str) -> String {

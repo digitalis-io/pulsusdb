@@ -5538,7 +5538,7 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | quantity | at this revision |
 |---|---|
 | citation occurrences in the five artefacts | 693 |
-| of those, citing a bare basename | 507 |
+| of those, citing a bare basename | 505 |
 | of those, written as a continuation of a citation earlier in the paragraph | 75 |
 | of those continuations, on a later line than the citation they continue | 32 |
 | `(document, token)` pairs the rule resolves | 362 |
@@ -5565,7 +5565,7 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | `prose` | a token the citing prose prints, so the claim and its evidence are reviewable side by side |
 | `line` | a snapshot of the cited line, taken because the citing prose prints no such token: it detects the line moving or changing and cannot show the citation means the right thing |
 
-Of the 693 citation occurrences the five artefacts make, 507 name a bare basename and 75 are written as a continuation of a citation earlier on the same line. The rule resolves 362 `(document, token)` pairs covering 492 occurrences, and cannot resolve 110 covering 201. Of the resolved rows, 174 are anchored on a token the citing prose prints and 188 on a snapshot of the cited line.
+Of the 693 citation occurrences the five artefacts make, 505 name a bare basename and 75 are written as a continuation of a citation earlier on the same line. The rule resolves 362 `(document, token)` pairs covering 492 occurrences, and cannot resolve 110 covering 201. Of the resolved rows, 174 are anchored on a token the citing prose prints and 188 on a snapshot of the cited line.
 
 The language fallback and the anchor rule disagree on 4 citations, all of them read one at a time. 4 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
 
