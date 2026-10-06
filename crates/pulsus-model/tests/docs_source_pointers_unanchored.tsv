@@ -488,6 +488,8 @@ docs/benchmarks/metrics-differential-ledger.md	write_handler.go:502-504	not_in_t
 docs/benchmarks/metrics-differential-ledger.md	write_otlp_handler.go:132-138	not_in_this_repository
 docs/benchmarks/metrics-differential-ledger.md	write_otlp_handler.go:177-189	not_in_this_repository
 docs/benchmarks/traces-differential-ledger.md	.github/workflows/ci.yml:483	no_name_the_target_file_holds
+docs/benchmarks/traces-differential-ledger.md	ast_execute.go:553-555	not_in_this_repository
+docs/benchmarks/traces-differential-ledger.md	ast_execute.go:630-650	not_in_this_repository
 docs/benchmarks/traces-differential-ledger.md	ast_stringer.go:245-255	not_in_this_repository
 docs/benchmarks/traces-differential-ledger.md	crates/pulsus-logql/tests/case_folding.rs:874	no_name_the_target_file_holds
 docs/benchmarks/traces-differential-ledger.md	crates/pulsus-schema/src/catalog.rs:986-995	not_in_this_repository
@@ -511,9 +513,11 @@ docs/benchmarks/traces-differential-ledger.md	pkg/tempopb/tempo.proto:159	pinned
 docs/benchmarks/traces-differential-ledger.md	pkg/tempopb/tempo.proto:160	pinned_to_another_version
 docs/benchmarks/traces-differential-ledger.md	pkg/tempopb/tempo.proto:383-386	pinned_to_another_version
 docs/benchmarks/traces-differential-ledger.md	pkg/traceql/ast.go:198-215	not_in_this_repository
+docs/benchmarks/traces-differential-ledger.md	pkg/traceql/ast.go:840-842	not_in_this_repository
 docs/benchmarks/traces-differential-ledger.md	pkg/traceql/ast_execute.go:14-55	not_in_this_repository
 docs/benchmarks/traces-differential-ledger.md	pkg/traceql/ast_execute.go:486	not_in_this_repository
 docs/benchmarks/traces-differential-ledger.md	pkg/traceql/ast_execute.go:535-627	pinned_to_another_version
+docs/benchmarks/traces-differential-ledger.md	pkg/traceql/ast_execute.go:630-656	not_in_this_repository
 docs/benchmarks/traces-differential-ledger.md	pkg/traceql/ast_execute.go:652	not_in_this_repository
 docs/benchmarks/traces-differential-ledger.md	pkg/traceql/ast_execute.go:741	not_in_this_repository
 docs/benchmarks/traces-differential-ledger.md	pkg/traceql/ast_execute.go:940-942	not_in_this_repository

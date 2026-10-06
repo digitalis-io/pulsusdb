@@ -273,7 +273,8 @@ use pulsus_read::traces::spans::predicate::{
 };
 use pulsus_read::traces::window_sql::WindowSql;
 use pulsus_traceql::{
-    AttrScope, ComparisonOp, Field, FieldExpr, Intrinsic, SpansetExpr, SpansetFilter, Value,
+    AttrScope, ComparisonOp, Field, FieldExpr, FieldOp, Intrinsic, SpansetExpr, SpansetFilter,
+    Value,
 };
 
 /// The `T-B1` window: `[start, end)` one nanosecond wide, so all three
@@ -680,19 +681,35 @@ fn t_c5_every_out_of_scope_field_refuses_and_names_itself() {
     }
     assert_eq!(visited_scopes, AttrScope::ALL.len());
 
-    // The expression-level constructs section 7 defers to part 3, each
-    // naming itself.
-    for (query, token) in [
-        (r#"{ span.a + 1 = 2 }"#, "arithmetic"),
-        (r#"{ span.a = span.b }"#, "field-against-field"),
-        (r#"{ 1 = 1 }"#, "two literals"),
-        (r#"{ (span.a = 1) = true }"#, "boolean-valued"),
-        (r#"{ !span.a = span.b }"#, "boolean-valued"),
+    // The expression-level constructs deferred to parts 3b and 3c, each
+    // naming itself and its own part.
+    for (query, token, suffix) in [
+        (
+            r#"{ span.a + 1 = 2 }"#,
+            "arithmetic",
+            "(issue #589 part 3c)",
+        ),
+        (
+            r#"{ resource.a = span.b }"#,
+            "field-against-field",
+            "(issue #589 part 3b)",
+        ),
+        (r#"{ 1 = 1 }"#, "two literals", "(issue #589 part 3c)"),
+        (
+            r#"{ (span.a = 1) = true }"#,
+            "boolean-valued",
+            "(issue #589 part 3c)",
+        ),
+        (
+            r#"{ !span.a = span.b }"#,
+            "boolean-valued",
+            "(issue #589 part 3c)",
+        ),
     ] {
         match refusal(query) {
             PlanError::UnsupportedField(msg) => assert!(
-                msg.contains(token) && msg.ends_with("(issue #589 part 3)"),
-                "{query}: the refusal must name {token:?} and `(issue #589 part 3)`, got {msg:?}"
+                msg.contains(token) && msg.ends_with(suffix),
+                "{query}: the refusal must name {token:?} and end `{suffix}`, got {msg:?}"
             ),
             other => panic!("{query} must be UnsupportedField, got {other:?}"),
         }
@@ -1937,4 +1954,404 @@ fn t_c24_the_chain_needs_the_window_and_the_element_scopes_do_not() {
     // No resource subquery, so no window is carried: another window composes.
     let other = WindowSql::start_closed_end_open(T_B1_START, T_B1_END + 1);
     assert!(span_membership_sql("spans", other, &p).contains("arrayExists"));
+}
+
+// =====================================================================
+// Issue #589 part 3a — field against field on the span row, text only
+// =====================================================================
+
+/// `L op R` with both sides fields, built directly so a pair the
+/// validator would refuse first still reaches the compiler.
+fn field_compare_expr(lhs: &Field, op: ComparisonOp, rhs: &Field) -> FieldExpr {
+    FieldExpr::Binary {
+        op: FieldOp::Cmp(op),
+        lhs: Box::new(FieldExpr::Field(lhs.clone())),
+        rhs: Box::new(FieldExpr::Field(rhs.clone())),
+    }
+}
+
+/// The six operators a field-against-field comparison serves.
+const FF_OPS: [ComparisonOp; 6] = [
+    ComparisonOp::Eq,
+    ComparisonOp::Neq,
+    ComparisonOp::Lt,
+    ComparisonOp::Lte,
+    ComparisonOp::Gt,
+    ComparisonOp::Gte,
+];
+
+fn ff_symbol(op: ComparisonOp) -> &'static str {
+    match op {
+        ComparisonOp::Eq => "=",
+        ComparisonOp::Neq => "!=",
+        ComparisonOp::Gt => ">",
+        ComparisonOp::Gte => ">=",
+        ComparisonOp::Lt => "<",
+        ComparisonOp::Lte => "<=",
+        ComparisonOp::Re | ComparisonOp::Nre => panic!("no field-against-field regex"),
+    }
+}
+
+/// This test's own copy of the integer-against-float rule: the integer
+/// side is compared exactly, as written.
+fn ff_mixed_int(e: &str) -> String {
+    e.to_string()
+}
+
+/// One operand of the part-3a design's section 3.1: the field, its arms
+/// by class, whether it can be `NULL`, and whether it needs the context.
+struct FfOperand {
+    field: Field,
+    arms: Vec<(&'static str, String)>,
+    nullable: bool,
+    needs_ctx: bool,
+}
+
+impl FfOperand {
+    fn arm(&self, class: &str) -> Option<&str> {
+        self.arms
+            .iter()
+            .find(|(c, _)| *c == class)
+            .map(|(_, e)| e.as_str())
+    }
+}
+
+/// An attribute operand's eight typed reads at `root`.
+fn ff_attr(scope: AttrScope, root: &str, key: &str) -> FfOperand {
+    let p = format!("{root}.`{key}`");
+    FfOperand {
+        field: scoped(scope, key),
+        arms: vec![
+            ("s", format!("{p}.:String")),
+            ("i", format!("{p}.:Int64")),
+            ("f", format!("{p}.:Float64")),
+            ("b", format!("{p}.:Bool")),
+            ("sa", format!("{p}.:`Array(Nullable(String))`")),
+            ("ia", format!("{p}.:`Array(Nullable(Int64))`")),
+            ("fa", format!("{p}.:`Array(Nullable(Float64))`")),
+            ("ba", format!("{p}.:`Array(Nullable(Bool))`")),
+        ],
+        nullable: true,
+        needs_ctx: false,
+    }
+}
+
+fn ff_intrinsic(intrinsic: Intrinsic, class: &'static str, expr: &str) -> FfOperand {
+    FfOperand {
+        field: Field::Intrinsic(intrinsic),
+        arms: vec![(class, expr.to_string())],
+        nullable: false,
+        needs_ctx: false,
+    }
+}
+
+/// Section 3.1's thirteen operands.
+fn ff_operands() -> Vec<FfOperand> {
+    vec![
+        ff_attr(AttrScope::Span, "attrs", "a"),
+        ff_attr(AttrScope::Instrumentation, "scope_attrs", "a"),
+        ff_intrinsic(Intrinsic::Name, "s", "name"),
+        ff_intrinsic(Intrinsic::StatusMessage, "s", "status_message"),
+        ff_intrinsic(Intrinsic::SpanId, "s", "lower(hex(span_id))"),
+        ff_intrinsic(Intrinsic::ParentId, "s", "lower(hex(parent_span_id))"),
+        ff_intrinsic(Intrinsic::TraceId, "s", "lower(hex(trace_id))"),
+        ff_intrinsic(Intrinsic::InstrumentationName, "s", "scope_name"),
+        ff_intrinsic(Intrinsic::InstrumentationVersion, "s", "scope_version"),
+        ff_intrinsic(Intrinsic::Duration, "i", "duration_ns"),
+        ff_intrinsic(Intrinsic::Status, "st", "status_code"),
+        ff_intrinsic(Intrinsic::Kind, "kd", "kind"),
+        FfOperand {
+            field: scoped(AttrScope::Resource, "service.name"),
+            arms: vec![(
+                "s",
+                "if(service_type = 'string', service, NULL)".to_string(),
+            )],
+            nullable: true,
+            needs_ctx: true,
+        },
+    ]
+}
+
+/// Section 3.2's scalar pairs in order, each with whether an ordered
+/// operator has a term.
+const FF_SCALAR_PAIRS: [(&str, &str, bool); 8] = [
+    ("s", "s", true),
+    ("i", "i", true),
+    ("i", "f", true),
+    ("f", "i", true),
+    ("f", "f", true),
+    ("b", "b", false),
+    ("st", "st", false),
+    ("kd", "kd", false),
+];
+
+/// Section 3.2's `(scalar class, element class)` array pairs in order.
+const FF_ARRAY_PAIRS: [(&str, &str, bool); 6] = [
+    ("s", "s", true),
+    ("i", "i", true),
+    ("i", "f", true),
+    ("f", "i", true),
+    ("f", "f", true),
+    ("b", "b", false),
+];
+
+/// The two sides of one pair with the integer side of a mixed pair
+/// passed through [`ff_mixed_int`].
+fn ff_mixed(lc: &str, rc: &str, l: &str, r: &str) -> (String, String) {
+    match (lc, rc) {
+        ("i", "f") => (ff_mixed_int(l), r.to_string()),
+        ("f", "i") => (l.to_string(), ff_mixed_int(r)),
+        _ => (l.to_string(), r.to_string()),
+    }
+}
+
+fn ff_array_term(op: ComparisonOp, l: &str, r: &str, array: &str) -> String {
+    if op == ComparisonOp::Neq {
+        format!("(notEmpty({array}) AND arrayAll(x -> coalesce({l} != {r}, false), {array}))")
+    } else {
+        format!(
+            "arrayExists(x -> coalesce({l} {} {r}, false), {array})",
+            ff_symbol(op)
+        )
+    }
+}
+
+/// The text section 3.2 gives `L op R`, built from this file's own copy of
+/// the rules.
+fn ff_expected(l: &FfOperand, op: ComparisonOp, r: &FfOperand) -> String {
+    let sym = ff_symbol(op);
+    let ordered = op_is_ordered(op);
+    let coalesced = l.nullable || r.nullable;
+    let mut terms = Vec::new();
+    for (lc, rc, ordered_ok) in FF_SCALAR_PAIRS {
+        if ordered && !ordered_ok {
+            continue;
+        }
+        let (Some(a), Some(b)) = (l.arm(lc), r.arm(rc)) else {
+            continue;
+        };
+        let (a, b) = ff_mixed(lc, rc, a, b);
+        let c = format!("{a} {sym} {b}");
+        terms.push(if coalesced {
+            format!("coalesce({c}, false)")
+        } else {
+            c
+        });
+    }
+    // The array on the right: the left's scalar against each element.
+    for (c, e, ordered_ok) in FF_ARRAY_PAIRS {
+        if ordered && !ordered_ok {
+            continue;
+        }
+        let (Some(scalar), Some(array)) = (l.arm(c), r.arm(&format!("{e}a"))) else {
+            continue;
+        };
+        let (a, b) = ff_mixed(c, e, scalar, "x");
+        terms.push(ff_array_term(op, &a, &b, array));
+    }
+    // The array on the left: each element against the right's scalar.
+    for (c, e, ordered_ok) in FF_ARRAY_PAIRS {
+        if ordered && !ordered_ok {
+            continue;
+        }
+        let (Some(array), Some(scalar)) = (l.arm(&format!("{e}a")), r.arm(c)) else {
+            continue;
+        };
+        let (a, b) = ff_mixed(e, c, "x", scalar);
+        terms.push(ff_array_term(op, &a, &b, array));
+    }
+    if terms.is_empty() {
+        "false".to_string()
+    } else {
+        format!("({})", terms.join(" OR "))
+    }
+}
+
+/// `T-C25`: every pair of section 3.1's operands under each of the six
+/// operators — 1,014 cells — compiles to the text this file builds from
+/// its own copy of sections 3.1 and 3.2, with no demand. With no context a
+/// cell naming `resource.service.name` is refused and every other cell is
+/// the same text.
+#[test]
+fn t_c25_field_against_field_is_the_generated_cross_product() {
+    let operands = ff_operands();
+    assert_eq!(operands.len(), 13);
+    let mut cells = 0usize;
+    for l in &operands {
+        for r in &operands {
+            for op in FF_OPS {
+                cells += 1;
+                let expr = field_compare_expr(&l.field, op, &r.field);
+                let want = ff_expected(l, op, r);
+                let label = format!("{} {op} {}", l.field, r.field);
+                let got = compile_span_predicate_in(&expr, &ctx())
+                    .unwrap_or_else(|e| panic!("{label} must compile in a context: {e}"));
+                assert_eq!(got.sql(), want, "{label}");
+                assert!(got.demand_messages().is_empty(), "{label}: no demand");
+                let bare = compile_span_predicate(&expr).map(|p| p.sql().to_string());
+                if l.needs_ctx || r.needs_ctx {
+                    assert_eq!(
+                        bare,
+                        Err(PlanError::UnsupportedField(
+                            RESOURCE_NEEDS_WINDOW.to_string()
+                        )),
+                        "{label} with no context"
+                    );
+                } else {
+                    assert_eq!(bare, Ok(want), "{label} with no context");
+                }
+            }
+        }
+    }
+    assert_eq!(cells, 1_014);
+}
+
+/// `T-C26`: the part-3a design's section 3.5 texts, byte for byte.
+#[test]
+fn t_c26_the_measured_field_against_field_texts() {
+    assert_eq!(
+        rendered(r#"{ name != span.k }"#),
+        "(coalesce(name != attrs.`k`.:String, false) OR \
+         (notEmpty(attrs.`k`.:`Array(Nullable(String))`) AND \
+         arrayAll(x -> coalesce(name != x, false), attrs.`k`.:`Array(Nullable(String))`)))"
+    );
+    assert_eq!(rendered(r#"{ status = span.k }"#), "false");
+    assert_eq!(
+        rendered(r#"{ status = status }"#),
+        "(status_code = status_code)"
+    );
+    assert_eq!(
+        rendered_in(r#"{ resource.service.name < instrumentation:version }"#),
+        "(coalesce(if(service_type = 'string', service, NULL) < scope_version, false))"
+    );
+    assert_eq!(
+        rendered(r#"{ duration > span.k }"#),
+        "(coalesce(duration_ns > attrs.`k`.:Int64, false) OR \
+         coalesce(duration_ns > attrs.`k`.:Float64, false) OR \
+         arrayExists(x -> coalesce(duration_ns > x, false), attrs.`k`.:`Array(Nullable(Int64))`) OR \
+         arrayExists(x -> coalesce(duration_ns > x, false), attrs.`k`.:`Array(Nullable(Float64))`))"
+    );
+    assert_eq!(
+        rendered(r#"{ span.k = span.j }"#),
+        "(coalesce(attrs.`k`.:String = attrs.`j`.:String, false) OR \
+         coalesce(attrs.`k`.:Int64 = attrs.`j`.:Int64, false) OR \
+         coalesce(attrs.`k`.:Int64 = attrs.`j`.:Float64, false) OR \
+         coalesce(attrs.`k`.:Float64 = attrs.`j`.:Int64, false) OR \
+         coalesce(attrs.`k`.:Float64 = attrs.`j`.:Float64, false) OR \
+         coalesce(attrs.`k`.:Bool = attrs.`j`.:Bool, false) OR \
+         arrayExists(x -> coalesce(attrs.`k`.:String = x, false), attrs.`j`.:`Array(Nullable(String))`) OR \
+         arrayExists(x -> coalesce(attrs.`k`.:Int64 = x, false), attrs.`j`.:`Array(Nullable(Int64))`) OR \
+         arrayExists(x -> coalesce(attrs.`k`.:Int64 = x, false), attrs.`j`.:`Array(Nullable(Float64))`) OR \
+         arrayExists(x -> coalesce(attrs.`k`.:Float64 = x, false), attrs.`j`.:`Array(Nullable(Int64))`) OR \
+         arrayExists(x -> coalesce(attrs.`k`.:Float64 = x, false), attrs.`j`.:`Array(Nullable(Float64))`) OR \
+         arrayExists(x -> coalesce(attrs.`k`.:Bool = x, false), attrs.`j`.:`Array(Nullable(Bool))`) OR \
+         arrayExists(x -> coalesce(x = attrs.`j`.:String, false), attrs.`k`.:`Array(Nullable(String))`) OR \
+         arrayExists(x -> coalesce(x = attrs.`j`.:Int64, false), attrs.`k`.:`Array(Nullable(Int64))`) OR \
+         arrayExists(x -> coalesce(x = attrs.`j`.:Int64, false), attrs.`k`.:`Array(Nullable(Float64))`) OR \
+         arrayExists(x -> coalesce(x = attrs.`j`.:Float64, false), attrs.`k`.:`Array(Nullable(Int64))`) OR \
+         arrayExists(x -> coalesce(x = attrs.`j`.:Float64, false), attrs.`k`.:`Array(Nullable(Float64))`) OR \
+         arrayExists(x -> coalesce(x = attrs.`j`.:Bool, false), attrs.`k`.:`Array(Nullable(Bool))`))"
+    );
+}
+
+/// `T-C27`: the part-3a design's section 3.6 refusals, whole strings, in
+/// their order — the regex operator first, then the left operand, then the
+/// right.
+#[test]
+fn t_c27_the_field_against_field_refusals() {
+    let span_a = scoped(AttrScope::Span, "a");
+    let refused_bare = |expr: &FieldExpr| match compile_span_predicate(expr) {
+        Err(e) => e,
+        Ok(p) => panic!("{expr} must be refused, it compiled to `{}`", p.sql()),
+    };
+    let refused_in = |expr: &FieldExpr| match compile_span_predicate_in(expr, &ctx()) {
+        Err(e) => e,
+        Ok(p) => panic!("{expr} must be refused, it compiled to `{}`", p.sql()),
+    };
+    let check = |expr: FieldExpr, want: PlanError| {
+        assert_eq!(refused_bare(&expr), want, "{expr} with no context");
+        assert_eq!(refused_in(&expr), want, "{expr} in a context");
+    };
+
+    for (scope, key) in [
+        (AttrScope::Resource, "k"),
+        (AttrScope::Event, "k"),
+        (AttrScope::Link, "k"),
+        (AttrScope::Unscoped, "k"),
+    ] {
+        let want = PlanError::UnsupportedField(format!(
+            "a field-against-field comparison with a \"{scope}\" operand is not supported by \
+             the span-scope predicate compiler yet (issue #589 part 3b)"
+        ));
+        let f = scoped(scope, key);
+        check(
+            field_compare_expr(&f, ComparisonOp::Eq, &span_a),
+            want.clone(),
+        );
+        check(field_compare_expr(&span_a, ComparisonOp::Eq, &f), want);
+    }
+
+    for intrinsic in [
+        Intrinsic::EventName,
+        Intrinsic::EventTimeSinceStart,
+        Intrinsic::LinkSpanId,
+        Intrinsic::LinkTraceId,
+    ] {
+        let want = PlanError::UnsupportedField(format!(
+            "a field-against-field comparison with {intrinsic} is not supported by the \
+             span-scope predicate compiler yet (issue #589 part 3b)"
+        ));
+        let f = Field::Intrinsic(intrinsic);
+        check(
+            field_compare_expr(&f, ComparisonOp::Eq, &span_a),
+            want.clone(),
+        );
+        check(field_compare_expr(&span_a, ComparisonOp::Eq, &f), want);
+    }
+
+    let mut nested_and_trace = 0usize;
+    for intrinsic in Intrinsic::ALL.iter().copied() {
+        if intrinsic_target(intrinsic) != Some("#594") {
+            continue;
+        }
+        nested_and_trace += 1;
+        let want = PlanError::UnsupportedField(format!(
+            "{intrinsic} is not supported by the span-scope predicate compiler yet (issue #594)"
+        ));
+        let f = Field::Intrinsic(intrinsic);
+        check(
+            field_compare_expr(&f, ComparisonOp::Eq, &span_a),
+            want.clone(),
+        );
+        check(field_compare_expr(&span_a, ComparisonOp::Eq, &f), want);
+    }
+    assert_eq!(nested_and_trace, 7);
+
+    let event_k = scoped(AttrScope::Event, "k");
+    let nested_left = Field::Intrinsic(Intrinsic::NestedSetLeft);
+    check(
+        field_compare_expr(&event_k, ComparisonOp::Eq, &nested_left),
+        PlanError::UnsupportedField(
+            "a field-against-field comparison with a \"event.\" operand is not supported by \
+             the span-scope predicate compiler yet (issue #589 part 3b)"
+                .to_string(),
+        ),
+    );
+    check(
+        field_compare_expr(&nested_left, ComparisonOp::Eq, &event_k),
+        PlanError::UnsupportedField(
+            "nestedSetLeft is not supported by the span-scope predicate compiler yet (issue #594)"
+                .to_string(),
+        ),
+    );
+
+    let span_b = scoped(AttrScope::Span, "b");
+    for op in [ComparisonOp::Re, ComparisonOp::Nre] {
+        let regex = PlanError::TypeMismatch(
+            "a field-against-field comparison does not support regex operators".to_string(),
+        );
+        check(field_compare_expr(&span_a, op, &span_b), regex.clone());
+        // The operator is checked before either operand.
+        check(field_compare_expr(&event_k, op, &nested_left), regex);
+    }
 }

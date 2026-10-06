@@ -3829,3 +3829,24 @@ when we are asking it to slow down, so we keep `429`; recorded as
   column and the identity — the write part's case — and
   `t_w7_a_span_with_every_field_round_trips_as_an_otlp_value` in
   `crates/pulsus-server/tests/traces_api_v2_live.rs` for the fetched value.
+
+### `traceql-field-compare-type-gate` (issue #589) — **four field-against-field answers that differ from the reference by decision**
+
+Applies to the span-scope predicate compiler (`crates/pulsus-read/src/traces/spans/predicate.rs`, `field_terms`), which no route calls until #590.
+
+- **An integer against a float is compared exactly.** The reference converts both to float64 for every
+  operator (`pkg/traceql/ast_execute.go:630-656`, `pkg/traceql/ast.go:840-842` at the pinned tag), so
+  `9007199254740993` and `9007199254740992.0` are equal there and not here. This is a deliberate
+  divergence on correctness: where the reference rounds and the exact answer can be computed, it is.
+- **An ordered comparison of two integers, or of a duration with an integer, is exact above 2^53.** The
+  reference's ordered comparison is float64 (`ast_execute.go:630-650`), so two values that differ only past
+  2^53 compare equal there. For a duration that is past 2^53 ns, about 104 days.
+- **A scalar `!=` an empty array matches nothing.** The reference's `!=` against an array requires every
+  element to differ, which an empty array satisfies. Here the array must also be non-empty, because a typed
+  array subcolumn reads `[]` on every row whose value is not that array: without the check, `!=` against an
+  array arm would match every span that does not hold one.
+- **Two arrays compared match nothing.** The reference fails the whole query, "array operators must consist
+  of a scalar and an array operand" (`ast_execute.go:553-555`). One span holding two arrays would otherwise
+  empty every result of the query.
+
+Read from the reference's source, not measured against it.

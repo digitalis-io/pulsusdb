@@ -10,8 +10,13 @@
 //! fourteen intrinsics a span row answers — `name`, `kind`, `status`,
 //! `statusMessage`, `duration`, `span:id`, `span:parentID`, `trace:id`,
 //! `instrumentation:name`, `instrumentation:version`, `event:name`,
-//! `event:timeSinceStart`, `link:spanID`, `link:traceID`; and `&&`, `||`
-//! and `!`. Every other field and construct is
+//! `event:timeSinceStart`, `link:spanID`, `link:traceID`; a comparison of
+//! two of these: span and instrumentation attributes, the ten span-row
+//! intrinsics `name`, `statusMessage`, `span:id`, `span:parentID`,
+//! `trace:id`, `instrumentation:name`, `instrumentation:version`,
+//! `duration`, `status` and `kind`, and `resource.service.name`'s string
+//! ([`field_terms`]); and `&&`, `||` and `!`. Every other field and
+//! construct is
 //! [`PlanError::UnsupportedField`] naming itself and the issue that
 //! serves it. The arms are exhaustive with no wildcard, so a
 //! new `Intrinsic` or `AttrScope` variant fails to compile here rather
@@ -201,7 +206,8 @@ pub fn span_membership_sql(spans_table: &str, w: WindowSql, p: &SpanPredicate) -
 // ---------------------------------------------------------------------
 
 /// The issue each deferred construct is served by.
-const PART_3: &str = "#589 part 3";
+const PART_3B: &str = "#589 part 3b";
+const PART_3C: &str = "#589 part 3c";
 const NESTED_AND_TRACE: &str = "#594";
 
 /// The refusal every deferred construct takes: it names the construct and
@@ -217,7 +223,7 @@ fn unsupported_intrinsic(intrinsic: Intrinsic, target: &str) -> PlanError {
 }
 
 fn unsupported_arithmetic() -> PlanError {
-    unsupported("arithmetic in a span-scope predicate", PART_3)
+    unsupported("arithmetic in a span-scope predicate", PART_3C)
 }
 
 /// A `resource.` or `.` field compiled with no [`PredicateCtx`]: both
@@ -387,15 +393,15 @@ impl<'a> Compiler<'a> {
                     (FieldExpr::Literal(value), FieldExpr::Field(field)) => {
                         self.leaf(field, flip_comparison(*op), value)
                     }
-                    (FieldExpr::Field(_), FieldExpr::Field(_)) => {
-                        Err(unsupported("a field-against-field comparison", PART_3))
+                    (FieldExpr::Field(lhs_field), FieldExpr::Field(rhs_field)) => {
+                        self.field_compare(lhs_field, *op, rhs_field)
                     }
                     (FieldExpr::Literal(_), FieldExpr::Literal(_)) => {
-                        Err(unsupported("a comparison between two literals", PART_3))
+                        Err(unsupported("a comparison between two literals", PART_3C))
                     }
                     _ => Err(unsupported(
                         "a comparison with a boolean-valued side other than `(!field) op literal`",
-                        PART_3,
+                        PART_3C,
                     )),
                 }
             }
@@ -713,6 +719,97 @@ impl<'a> Compiler<'a> {
         let x = format!("(({SERVICE_IS_STRING} AND {g}) OR {r})");
         Ok(if negated { format!("NOT {x}") } else { x })
     }
+
+    /// `L op R`, both sides fields. The regex operators are refused
+    /// first, then each operand in turn, left before right; what remains
+    /// is [`field_terms`] over the two operands' arms.
+    fn field_compare(
+        &mut self,
+        lhs: &Field,
+        op: ComparisonOp,
+        rhs: &Field,
+    ) -> Result<String, PlanError> {
+        if matches!(op, ComparisonOp::Re | ComparisonOp::Nre) {
+            return Err(PlanError::TypeMismatch(
+                "a field-against-field comparison does not support regex operators".to_string(),
+            ));
+        }
+        let l = self.operand_arms(lhs)?;
+        let r = self.operand_arms(rhs)?;
+        Ok(field_terms(&l, op, &r))
+    }
+
+    /// One operand's arms: a typed read per class it can hold. **No
+    /// wildcard arm**, so a new `Intrinsic` or `AttrScope` variant fails to
+    /// compile here until it is classified.
+    fn operand_arms(&self, field: &Field) -> Result<Arms, PlanError> {
+        let unsupported_operand = |what: String| {
+            unsupported(
+                &format!("a field-against-field comparison with {what}"),
+                PART_3B,
+            )
+        };
+        let intrinsic = match field {
+            Field::Attribute { scope, key } => {
+                return match scope {
+                    AttrScope::Span => Ok(Arms::attribute(ATTRS, key)),
+                    AttrScope::Instrumentation => Ok(Arms::attribute(SCOPE_ATTRS, key)),
+                    AttrScope::Resource if key == SERVICE_NAME => {
+                        self.ctx.ok_or_else(|| needs_window(AttrScope::Resource))?;
+                        Ok(Arms {
+                            s: Some(format!("if({SERVICE_IS_STRING}, service, NULL)")),
+                            nullable: true,
+                            ..Arms::default()
+                        })
+                    }
+                    AttrScope::Resource
+                    | AttrScope::Event
+                    | AttrScope::Link
+                    | AttrScope::Unscoped => {
+                        Err(unsupported_operand(format!("a \"{scope}\" operand")))
+                    }
+                };
+            }
+            Field::Intrinsic(intrinsic) => *intrinsic,
+        };
+        let string = |expr: String| Arms {
+            s: Some(expr),
+            ..Arms::default()
+        };
+        let hex = |column: IdColumn| string(format!("lower(hex({}))", column.name));
+        match intrinsic {
+            Intrinsic::Name => Ok(string("name".to_string())),
+            Intrinsic::StatusMessage => Ok(string("status_message".to_string())),
+            Intrinsic::SpanId => Ok(hex(IdColumn::SPAN_ID)),
+            Intrinsic::ParentId => Ok(hex(IdColumn::PARENT_SPAN_ID)),
+            Intrinsic::TraceId => Ok(hex(IdColumn::TRACE_ID)),
+            Intrinsic::InstrumentationName => Ok(string("scope_name".to_string())),
+            Intrinsic::InstrumentationVersion => Ok(string("scope_version".to_string())),
+            Intrinsic::Duration => Ok(Arms {
+                i: Some("duration_ns".to_string()),
+                ..Arms::default()
+            }),
+            Intrinsic::Status => Ok(Arms {
+                st: Some("status_code".to_string()),
+                ..Arms::default()
+            }),
+            Intrinsic::Kind => Ok(Arms {
+                kd: Some("kind".to_string()),
+                ..Arms::default()
+            }),
+            Intrinsic::EventName
+            | Intrinsic::EventTimeSinceStart
+            | Intrinsic::LinkSpanId
+            | Intrinsic::LinkTraceId => Err(unsupported_operand(intrinsic.to_string())),
+            Intrinsic::NestedSetParent
+            | Intrinsic::NestedSetLeft
+            | Intrinsic::NestedSetRight
+            | Intrinsic::ChildCount
+            | Intrinsic::TraceDuration
+            | Intrinsic::RootName
+            | Intrinsic::RootServiceName => Err(unsupported_intrinsic(intrinsic, NESTED_AND_TRACE)),
+        }
+    }
 }
 
 /// The scopes of the unscoped chain, in the order a span's one value is
@@ -832,6 +929,9 @@ enum Read {
     Float,
     Bool,
     StrArray,
+    IntArray,
+    FloatArray,
+    BoolArray,
 }
 
 impl Read {
@@ -842,6 +942,9 @@ impl Read {
             Read::Float => ".:Float64",
             Read::Bool => ".:Bool",
             Read::StrArray => ".:`Array(Nullable(String))`",
+            Read::IntArray => ".:`Array(Nullable(Int64))`",
+            Read::FloatArray => ".:`Array(Nullable(Float64))`",
+            Read::BoolArray => ".:`Array(Nullable(Bool))`",
         }
     }
 
@@ -852,7 +955,228 @@ impl Read {
             Read::Float => "f",
             Read::Bool => "b",
             Read::StrArray => "sa",
+            Read::IntArray => "ia",
+            Read::FloatArray => "fa",
+            Read::BoolArray => "ba",
         }
+    }
+}
+
+// ---------------------------------------------------------------------
+// field against field
+// ---------------------------------------------------------------------
+
+/// The classes a field-against-field operand can hold. `Status` and
+/// `Kind` are their own classes, so against an attribute or any other
+/// field they share no term.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Class {
+    Str,
+    Int,
+    Float,
+    Bool,
+    Status,
+    Kind,
+}
+
+impl Class {
+    /// Whether an ordered operator has a term for this class: a boolean, a
+    /// status and a kind are compared by `=` and `!=` only.
+    fn is_ordered(self) -> bool {
+        match self {
+            Class::Str | Class::Int | Class::Float => true,
+            Class::Bool | Class::Status | Class::Kind => false,
+        }
+    }
+}
+
+/// One field-against-field operand: one SQL expression per class it can
+/// hold, scalar and array, and whether any of them can be `NULL`.
+#[derive(Debug, Default)]
+struct Arms {
+    s: Option<String>,
+    i: Option<String>,
+    f: Option<String>,
+    b: Option<String>,
+    st: Option<String>,
+    kd: Option<String>,
+    sa: Option<String>,
+    ia: Option<String>,
+    fa: Option<String>,
+    ba: Option<String>,
+    nullable: bool,
+}
+
+impl Arms {
+    /// An attribute at `root`: the literal path's typed reads, scalar and
+    /// array, every one `Nullable`.
+    fn attribute(root: &str, key: &str) -> Arms {
+        let path = attr_path(root, key);
+        let read = |r: Read| Some(format!("{path}{}", r.suffix()));
+        Arms {
+            s: read(Read::Str),
+            i: read(Read::Int),
+            f: read(Read::Float),
+            b: read(Read::Bool),
+            st: None,
+            kd: None,
+            sa: read(Read::StrArray),
+            ia: read(Read::IntArray),
+            fa: read(Read::FloatArray),
+            ba: read(Read::BoolArray),
+            nullable: true,
+        }
+    }
+
+    fn scalar(&self, class: Class) -> Option<&str> {
+        match class {
+            Class::Str => self.s.as_deref(),
+            Class::Int => self.i.as_deref(),
+            Class::Float => self.f.as_deref(),
+            Class::Bool => self.b.as_deref(),
+            Class::Status => self.st.as_deref(),
+            Class::Kind => self.kd.as_deref(),
+        }
+    }
+
+    fn array(&self, element: Class) -> Option<&str> {
+        match element {
+            Class::Str => self.sa.as_deref(),
+            Class::Int => self.ia.as_deref(),
+            Class::Float => self.fa.as_deref(),
+            Class::Bool => self.ba.as_deref(),
+            Class::Status | Class::Kind => None,
+        }
+    }
+}
+
+/// The scalar pairs, in the order their terms are emitted.
+const SCALAR_PAIRS: [(Class, Class); 8] = [
+    (Class::Str, Class::Str),
+    (Class::Int, Class::Int),
+    (Class::Int, Class::Float),
+    (Class::Float, Class::Int),
+    (Class::Float, Class::Float),
+    (Class::Bool, Class::Bool),
+    (Class::Status, Class::Status),
+    (Class::Kind, Class::Kind),
+];
+
+/// The `(scalar class, element class)` pairs of a scalar against an
+/// array, in the order their terms are emitted.
+const ARRAY_PAIRS: [(Class, Class); 6] = [
+    (Class::Str, Class::Str),
+    (Class::Int, Class::Int),
+    (Class::Int, Class::Float),
+    (Class::Float, Class::Int),
+    (Class::Float, Class::Float),
+    (Class::Bool, Class::Bool),
+];
+
+/// The integer against a float, and the only place that choice lives: the
+/// integer side of every `Int`/`Float` pair, scalar and array, is rendered
+/// here.
+///
+/// **Exact, by decision.** ClickHouse compares `Int64` with `Float64`
+/// exactly, so `9007199254740993 > 9007199254740992.0` is true here. The
+/// reference converts both sides to `float64` first, where the two are
+/// equal; the other choice would be `toFloat64(e)`. Rounding is not a rule
+/// a user can rely on, so this differs from the reference deliberately
+/// (`docs/benchmarks/traces-differential-ledger.md`,
+/// `traceql-field-compare-type-gate`). An integer pair never passes
+/// through here.
+fn mixed_int(expr: &str) -> String {
+    expr.to_string()
+}
+
+/// One side of a pair: the integer side of a mixed pair through
+/// [`mixed_int`], anything else as it is.
+fn pair_side(class: Class, other: Class, expr: &str) -> String {
+    if class == Class::Int && other == Class::Float {
+        mixed_int(expr)
+    } else {
+        expr.to_string()
+    }
+}
+
+/// A scalar against each element `x` of `array`, `l` and `r` in the
+/// written order. Any element matches, except `!=`, where every element
+/// must differ and the array must not be empty: a typed array subcolumn is
+/// `[]` on every row whose value is not that array, and `arrayAll` over
+/// `[]` is true.
+fn array_term(op: ComparisonOp, sym: &str, l: &str, r: &str, array: &str) -> String {
+    if op == ComparisonOp::Neq {
+        format!("(notEmpty({array}) AND arrayAll(x -> coalesce({l} != {r}, false), {array}))")
+    } else {
+        format!("arrayExists(x -> coalesce({l} {sym} {r}, false), {array})")
+    }
+}
+
+/// `L op R` over two operands' arms: one term per pair of classes both
+/// sides carry, ORed, and `false` when there is none.
+///
+/// **Each type pair is its own term.** The engine's direct form, one
+/// comparison of the two `Dynamic` values, fails the statement with
+/// `NO_COMMON_TYPE` on a span holding a string against an integer. A pair
+/// of different types has no term and so matches nothing, under every
+/// operator — `!=` included, which is why `!=` is per term and never
+/// `NOT (… = …)`. Two arrays have no term either: the reference fails the
+/// query there, and one span holding two arrays would empty every result.
+///
+/// A scalar term is coalesced unless both operands are non-nullable,
+/// which is the module's rule that no intrinsic read is coalesced.
+fn field_terms(l: &Arms, op: ComparisonOp, r: &Arms) -> String {
+    let sym = sql_op(op).expect("the caller has already excluded the regex operators");
+    let ordered = !matches!(op, ComparisonOp::Eq | ComparisonOp::Neq);
+    let coalesced = l.nullable || r.nullable;
+    let mut terms = Vec::new();
+    for (lc, rc) in SCALAR_PAIRS {
+        if ordered && !lc.is_ordered() {
+            continue;
+        }
+        let (Some(a), Some(b)) = (l.scalar(lc), r.scalar(rc)) else {
+            continue;
+        };
+        let c = format!("{} {sym} {}", pair_side(lc, rc, a), pair_side(rc, lc, b));
+        terms.push(if coalesced {
+            format!("coalesce({c}, false)")
+        } else {
+            c
+        });
+    }
+    // The array on the right, then the array on the left.
+    for (c, e) in ARRAY_PAIRS {
+        if ordered && !c.is_ordered() {
+            continue;
+        }
+        if let (Some(scalar), Some(array)) = (l.scalar(c), r.array(e)) {
+            terms.push(array_term(
+                op,
+                sym,
+                &pair_side(c, e, scalar),
+                &pair_side(e, c, "x"),
+                array,
+            ));
+        }
+    }
+    for (c, e) in ARRAY_PAIRS {
+        if ordered && !c.is_ordered() {
+            continue;
+        }
+        if let (Some(array), Some(scalar)) = (l.array(e), r.scalar(c)) {
+            terms.push(array_term(
+                op,
+                sym,
+                &pair_side(e, c, "x"),
+                &pair_side(c, e, scalar),
+                array,
+            ));
+        }
+    }
+    if terms.is_empty() {
+        "false".to_string()
+    } else {
+        format!("({})", terms.join(" OR "))
     }
 }
 

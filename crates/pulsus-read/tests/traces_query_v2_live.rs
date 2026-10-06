@@ -9,7 +9,7 @@
 //! assertions, and the two halves meet at `T-C4`, which freezes the exact
 //! statement this suite issues.
 //!
-//! **Six fixtures, each test function in its own database.**
+//! **Seven fixtures, each test function in its own database.**
 //!
 //! * The worked fixture of `docs/TraceQL/functional-requirements.md` §6.1 —
 //!   three traces, nine spans, every attribute type, one event, one link,
@@ -29,6 +29,10 @@
 //! * Fixture V — eight spans whose events, links and scopes tell
 //!   any-match from first-element and all-match, and the unscoped chain's
 //!   order from any other.
+//! * Fixture W — twenty-three spans, two fields each, for comparing one
+//!   field with another: every stored type against every other, integers
+//!   past `f64`'s exactness limit, arrays on either side, and the
+//!   intrinsics against attributes.
 //!
 //! Each is seeded by building the OTLP request bodies and handing them to
 //! `pulsus_write::parse_trace_landing`, then inserting the rows it
@@ -375,6 +379,14 @@ fn str_array_value(values: &[&str]) -> AnyValue {
     AnyValue {
         value: Some(any_value::Value::ArrayValue(ArrayValue {
             values: values.iter().map(|v| str_value(v)).collect(),
+        })),
+    }
+}
+
+fn int_array_value(values: &[i64]) -> AnyValue {
+    AnyValue {
+        value: Some(any_value::Value::ArrayValue(ArrayValue {
+            values: values.iter().map(|v| int_value(*v)).collect(),
         })),
     }
 }
@@ -3330,6 +3342,342 @@ async fn the_predicate_compiler_answers_any_element_and_the_chain_order() {
         "{} of {} fixture-V cases answer something else:\n\n{}",
         wrong.len(),
         CASES_V.len() + CASES_V_UC_MISS.len() + CASES_V_SV_MISS.len(),
+        wrong.join("\n\n")
+    );
+}
+
+// ---------------------------------------------------------------------
+// #589 part 3a — fixture W, field against field
+// ---------------------------------------------------------------------
+
+/// `w01` to `w23`: span ids `000000000000e001` to `…e023`, the span's
+/// number written as decimal digits in the id's last byte.
+fn idw(short: &str) -> String {
+    format!("000000000000e0{}", short.trim_start_matches('w'))
+}
+
+/// One fixture-W span: its number, span attributes, scope attributes,
+/// resource `service.name`, name, kind and status code.
+type WSpan<'a> = (
+    u8,
+    Vec<KeyValue>,
+    Vec<KeyValue>,
+    AnyValue,
+    &'a str,
+    i32,
+    i32,
+);
+
+/// Fixture W, the part-3a design's section 5.1: twenty-three requests,
+/// one span each.
+fn fixture_w_bodies(base_ns: i64) -> Vec<ExportTraceServiceRequest> {
+    const MS: i64 = 1_000_000;
+    let st = |k: &str, v: &str| kv(k, str_value(v));
+    let it = |k: &str, v: i64| kv(k, int_value(v));
+    let db = |k: &str, v: f64| kv(k, double_value(v));
+    let bl = |k: &str, v: bool| kv(k, bool_value(v));
+    let ar = |k: &str, v: &[&str]| kv(k, str_array_value(v));
+    let mut spans: Vec<WSpan<'_>> = Vec::new();
+    let wsvc = || str_value("wsvc");
+    let plain = |n: u8, attrs: Vec<KeyValue>| (n, attrs, Vec::new(), wsvc(), "op", 1, 0);
+    spans.push(plain(1, vec![st("a", "5"), it("b", 5)]));
+    spans.push(plain(2, vec![it("a", 5), it("b", 5)]));
+    spans.push(plain(
+        3,
+        vec![
+            it("a", 9_007_199_254_740_993),
+            it("b", 9_007_199_254_740_992),
+        ],
+    ));
+    spans.push(plain(
+        4,
+        vec![
+            it("a", 9_007_199_254_740_992),
+            it("b", 9_007_199_254_740_993),
+        ],
+    ));
+    spans.push(plain(5, vec![st("a", "apple"), st("b", "banana")]));
+    spans.push(plain(6, vec![it("a", 3), db("b", 0.25)]));
+    spans.push(plain(
+        7,
+        vec![
+            it("a", 9_007_199_254_740_993),
+            db("b", 9_007_199_254_740_992.0),
+        ],
+    ));
+    spans.push(plain(8, vec![bl("a", true), bl("b", true)]));
+    spans.push(plain(9, vec![st("a", "x")]));
+    spans.push(plain(10, vec![ar("a", &["gold", "eu"]), st("b", "eu")]));
+    spans.push(plain(11, vec![ar("a", &["x", "y"]), st("b", "z")]));
+    spans.push(plain(
+        12,
+        vec![kv("a", int_array_value(&[1, 2])), it("b", 2)],
+    ));
+    spans.push(plain(13, vec![st("a", "5"), st("b", "5")]));
+    spans.push(plain(14, vec![bl("a", false), bl("b", true)]));
+    spans.push(plain(15, vec![ar("a", &[]), st("b", "q")]));
+    spans.push((
+        16,
+        vec![
+            st("nm", "op-x"),
+            it("st", 2),
+            it("kd", 2),
+            it("dn", 1_000_000),
+            st("sid", "000000000000e016"),
+        ],
+        Vec::new(),
+        wsvc(),
+        "op-x",
+        2,
+        2,
+    ));
+    spans.push((
+        17,
+        vec![
+            st("nm", "op-y"),
+            db("dfl", 1_000_000.5),
+            st("sid", "000000000000E017"),
+        ],
+        Vec::new(),
+        wsvc(),
+        "op-x",
+        1,
+        0,
+    ));
+    spans.push((18, vec![it("c", 5)], vec![st("c", "5")], wsvc(), "op", 1, 0));
+    spans.push((
+        19,
+        vec![it("c", 7), st("iname", "io.pulsus.w")],
+        vec![it("c", 7)],
+        wsvc(),
+        "op",
+        1,
+        0,
+    ));
+    spans.push((20, vec![db("c", 7.5)], vec![it("c", 7)], wsvc(), "op", 1, 0));
+    spans.push(plain(21, vec![st("svc", "wsvc")]));
+    spans.push((
+        22,
+        vec![st("svc", "7")],
+        Vec::new(),
+        int_value(7),
+        "op",
+        1,
+        0,
+    ));
+    spans.push((23, vec![it("svc", 8)], Vec::new(), int_value(8), "op", 1, 0));
+
+    spans
+        .into_iter()
+        .map(|(n, attrs, scope_attrs, service, name, kind, status)| {
+            let last = u8::from_str_radix(&format!("{n:02}"), 16).expect("two decimal digits");
+            one_span_request(
+                vec![kv("service.name", service)],
+                scope_named("io.pulsus.w", "1.0", scope_attrs),
+                span_with_message(
+                    vec![0xee; 16],
+                    vec![0, 0, 0, 0, 0, 0, 0xe0, last],
+                    Vec::new(),
+                    name,
+                    kind,
+                    base_ns + i64::from(n) * MS,
+                    MS,
+                    attrs,
+                    (status != 0).then_some((status, "boom")),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            )
+        })
+        .collect()
+}
+
+const ALL_W: &[&str] = &[
+    "w01", "w02", "w03", "w04", "w05", "w06", "w07", "w08", "w09", "w10", "w11", "w12", "w13",
+    "w14", "w15", "w16", "w17", "w18", "w19", "w20", "w21", "w22", "w23",
+];
+
+/// The part-3a design's section 6.1.
+const CASES_W: &[CaseIn] = &[
+    CaseIn {
+        name: "FF-EQ",
+        query: r#"{ span.a = span.b }"#,
+        want: Want::Ids(&["w02", "w08", "w10", "w12", "w13"]),
+    },
+    CaseIn {
+        name: "FF-NE",
+        query: r#"{ span.a != span.b }"#,
+        want: Want::Ids(&["w03", "w04", "w05", "w06", "w07", "w11", "w14"]),
+    },
+    CaseIn {
+        name: "FF-LT",
+        query: r#"{ span.a < span.b }"#,
+        want: Want::Ids(&["w04", "w05", "w11", "w12"]),
+    },
+    CaseIn {
+        name: "FF-LE",
+        query: r#"{ span.a <= span.b }"#,
+        want: Want::Ids(&["w02", "w04", "w05", "w10", "w11", "w12", "w13"]),
+    },
+    CaseIn {
+        name: "FF-GT",
+        query: r#"{ span.a > span.b }"#,
+        want: Want::Ids(&["w03", "w06", "w07", "w10"]),
+    },
+    CaseIn {
+        name: "FF-GE",
+        query: r#"{ span.a >= span.b }"#,
+        want: Want::Ids(&["w02", "w03", "w06", "w07", "w10", "w12", "w13"]),
+    },
+    CaseIn {
+        name: "FF-MIR >",
+        query: r#"{ span.b > span.a }"#,
+        want: Want::Ids(&["w04", "w05", "w11", "w12"]),
+    },
+    CaseIn {
+        name: "FF-MIR <=",
+        query: r#"{ span.b <= span.a }"#,
+        want: Want::Ids(&["w02", "w03", "w06", "w07", "w10", "w12", "w13"]),
+    },
+    CaseIn {
+        name: "IC1",
+        query: r#"{ instrumentation.c = span.c }"#,
+        want: Want::Ids(&["w19"]),
+    },
+    CaseIn {
+        name: "IC2",
+        query: r#"{ instrumentation.c < span.c }"#,
+        want: Want::Ids(&["w20"]),
+    },
+    CaseIn {
+        name: "IC3",
+        query: r#"{ instrumentation.c != span.c }"#,
+        want: Want::Ids(&["w20"]),
+    },
+    CaseIn {
+        name: "NM =",
+        query: r#"{ name = span.nm }"#,
+        want: Want::Ids(&["w16"]),
+    },
+    CaseIn {
+        name: "NM <",
+        query: r#"{ name < span.nm }"#,
+        want: Want::Ids(&["w17"]),
+    },
+    CaseIn {
+        name: "DU =",
+        query: r#"{ duration = span.dn }"#,
+        want: Want::Ids(&["w16"]),
+    },
+    CaseIn {
+        name: "DU <",
+        query: r#"{ duration < span.dfl }"#,
+        want: Want::Ids(&["w17"]),
+    },
+    CaseIn {
+        name: "SK status",
+        query: r#"{ status = span.st }"#,
+        want: Want::Ids(&[]),
+    },
+    CaseIn {
+        name: "SK kind",
+        query: r#"{ kind = span.kd }"#,
+        want: Want::Ids(&[]),
+    },
+    CaseIn {
+        name: "SS status =",
+        query: r#"{ status = status }"#,
+        want: Want::Ids(ALL_W),
+    },
+    CaseIn {
+        name: "SS status !=",
+        query: r#"{ status != status }"#,
+        want: Want::Ids(&[]),
+    },
+    CaseIn {
+        name: "SS kind =",
+        query: r#"{ kind = kind }"#,
+        want: Want::Ids(ALL_W),
+    },
+    CaseIn {
+        name: "ID",
+        query: r#"{ span:id = span.sid }"#,
+        want: Want::Ids(&["w16"]),
+    },
+    CaseIn {
+        name: "SVC",
+        query: r#"{ resource.service.name = span.svc }"#,
+        want: Want::Ids(&["w21"]),
+    },
+    CaseIn {
+        name: "IN",
+        query: r#"{ instrumentation:name = span.iname }"#,
+        want: Want::Ids(&["w19"]),
+    },
+];
+
+/// Section 6.1 of the part-3a design: fixture W.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_predicate_compiler_compares_two_span_row_fields() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db("pulsus_read_it_t589p3a_fixturew");
+    let client = fresh_db(&db).await;
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    for (i, req) in fixture_w_bodies(base_ns).into_iter().enumerate() {
+        land(&client, &req, &format!("t589p3a-w-{i}-{}", now_ns())).await;
+    }
+    let w = WindowSql::start_closed_end_open(base_ns, base_ns + WINDOW_NS);
+
+    let seeded = count(&client, &format!("SELECT count() AS n FROM {SPANS_TABLE}")).await;
+    assert_eq!(
+        seeded, 23,
+        "fixture W seeds twenty-three spans; nothing below can be read as a predicate result \
+         until this holds"
+    );
+
+    let wrong = run_cases_in(&client, w, CASES_W, idw).await;
+    drop_db(&db).await;
+    assert!(
+        wrong.is_empty(),
+        "{} of {} fixture-W cases answer something else:\n\n{}",
+        wrong.len(),
+        CASES_W.len(),
+        wrong.join("\n\n")
+    );
+}
+
+/// Section 6.2 of the part-3a design: the field half of `T-A7`.
+const CASES_61_FIELDS: &[CaseIn] = &[CaseIn {
+    name: "T-A7 (field half)",
+    query: r#"{ span.app.items.count > span.app.discount.ratio }"#,
+    want: Want::Ids(&["0003"]),
+}];
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_predicate_compiler_compares_fields_on_the_worked_fixture() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db("pulsus_read_it_t589p3a_fixture61");
+    let client = fresh_db(&db).await;
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    for (i, req) in fixture_61_bodies(base_ns).into_iter().enumerate() {
+        land(&client, &req, &format!("t589p3a-61-{i}-{}", now_ns())).await;
+    }
+    let w = WindowSql::start_closed_end_open(base_ns, base_ns + WINDOW_NS);
+
+    let seeded = count(&client, &format!("SELECT count() AS n FROM {SPANS_TABLE}")).await;
+    assert_eq!(
+        seeded, 9,
+        "the §6.1 fixture seeds nine spans; nothing below can be read as a predicate result \
+         until this holds"
+    );
+
+    let wrong = run_cases_in(&client, w, CASES_61_FIELDS, id61).await;
+    drop_db(&db).await;
+    assert!(
+        wrong.is_empty(),
+        "{} of {} §6.1 field cases answer something else:\n\n{}",
+        wrong.len(),
+        CASES_61_FIELDS.len(),
         wrong.join("\n\n")
     );
 }
