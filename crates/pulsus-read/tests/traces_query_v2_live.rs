@@ -4073,9 +4073,12 @@ const ALL_Y: &[&str] = &[
     "y14", "y15", "y16", "y17", "y18", "y19",
 ];
 
-/// Every span whose `a` is a number: `y01`–`y08`, `y10`, `y11`, `y17`–`y19`.
+/// Every span whose `a` is a number or holds a numeric element: `y01`–`y08`,
+/// `y10`–`y12`, `y17`–`y19`. A field opposite an arithmetic side matches by
+/// any element, so `y12`'s `a=[1,2]` is among them.
 const Y_NUMERIC_A: &[&str] = &[
-    "y01", "y02", "y03", "y04", "y05", "y06", "y07", "y08", "y10", "y11", "y17", "y18", "y19",
+    "y01", "y02", "y03", "y04", "y05", "y06", "y07", "y08", "y10", "y11", "y12", "y17", "y18",
+    "y19",
 ];
 
 /// `{ (span.a > 1) = false }`'s answer, which `BV7` shares.
@@ -4211,7 +4214,7 @@ const CASES_Y: &[CaseIn] = &[
     },
     CaseIn {
         name: "BG1",
-        query: r#"{ span.big < 9223372036854775809 }"#,
+        query: r#"{ span.big = 9223372036854775808 }"#,
         want: Want::Ids(&["y16"]),
     },
     CaseIn {
