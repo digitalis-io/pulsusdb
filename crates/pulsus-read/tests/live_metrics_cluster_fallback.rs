@@ -237,10 +237,15 @@ async fn local_count(
         .map(u64::to_string)
         .collect::<Vec<_>>()
         .join(", ");
-    let sql = format!(
-        "SELECT count() AS n FROM {db}.{table} WHERE metric_name = '{metric_name}' AND \
-         fingerprint IN ({fp_list})"
-    );
+    // Issue #623: the sample tables carry no metric name; the IDs alone
+    // select the seeded rows there.
+    let name = if table == "metric_series" {
+        format!("metric_name = '{metric_name}' AND ")
+    } else {
+        String::new()
+    };
+    let sql =
+        format!("SELECT count() AS n FROM {db}.{table} WHERE {name}fingerprint IN ({fp_list})");
     let mut stream = shard
         .query_stream::<CountRow>(&sql, &QuerySettings::new())
         .await
