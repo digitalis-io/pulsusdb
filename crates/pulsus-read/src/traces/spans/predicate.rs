@@ -366,6 +366,45 @@ struct Occurrence {
 /// two-set rate of 75 ns a tuple.
 const MAX_SET_OPERANDS: usize = 2;
 
+/// Decision 13's refusal.
+fn too_many_set_operands() -> PlanError {
+    PlanError::UnsupportedField(format!(
+        "a comparison with more than {MAX_SET_OPERANDS} event, link or unscoped operands is not \
+         supported"
+    ))
+}
+
+/// The set operands a side holds, each occurrence counted: a set field,
+/// lone, under `!` or inside arithmetic. A boolean-valued node is a
+/// comparison of its own and counts its own.
+fn set_operands_in(expr: &FieldExpr) -> usize {
+    match expr {
+        FieldExpr::Field(field) => usize::from(is_set_field(field)),
+        FieldExpr::Unary {
+            op: UnaryOp::Not,
+            expr: inner,
+        } => match inner.as_ref() {
+            FieldExpr::Field(field) => usize::from(is_set_field(field)),
+            _ => 0,
+        },
+        FieldExpr::Unary {
+            op: UnaryOp::Neg,
+            expr: inner,
+        } => set_operands_in(inner),
+        FieldExpr::Binary {
+            op: FieldOp::Arith(_),
+            lhs,
+            rhs,
+        } => set_operands_in(lhs) + set_operands_in(rhs),
+        FieldExpr::Literal(_)
+        | FieldExpr::Exists { .. }
+        | FieldExpr::Binary {
+            op: FieldOp::Cmp(_) | FieldOp::Bool(_),
+            ..
+        } => 0,
+    }
+}
+
 /// A lambda variable and the value it is bound to.
 type Bind = (String, String);
 
@@ -895,6 +934,11 @@ impl<'a> Compiler<'a> {
         }
         self.refuse_deferred(lhs, false)?;
         self.refuse_deferred(rhs, false)?;
+        // Decision 13's cap holds before a side folding to no value makes
+        // the comparison `false`, so no shape of a comparison escapes it.
+        if set_operands_in(lhs) + set_operands_in(rhs) > MAX_SET_OPERANDS {
+            return Err(too_many_set_operands());
+        }
         if fold(lhs)? == Folded::Undefined || fold(rhs)? == Folded::Undefined {
             return Ok("false".to_string());
         }
@@ -998,10 +1042,7 @@ impl<'a> Compiler<'a> {
         negated: bool,
     ) -> Result<SetOperand, PlanError> {
         if self.occurrences.len() >= MAX_SET_OPERANDS {
-            return Err(PlanError::UnsupportedField(format!(
-                "a comparison with more than {MAX_SET_OPERANDS} event, link or unscoped operands \
-                 is not supported"
-            )));
+            return Err(too_many_set_operands());
         }
         let k = self.occurrences.len() + 1;
         let cr = format!("cr{k}");
