@@ -5585,8 +5585,8 @@ fn fixture_k_bodies(base_ns: i64) -> Vec<ExportTraceServiceRequest> {
         .collect()
 }
 
-async fn seed_fixture_k(name: &str) -> (String, ChClient, WindowSql) {
-    let db = pulsus_testkit::test_db(name);
+/// Seeds fixture K in `db`, a name `pulsus_testkit::test_db` composed.
+async fn seed_fixture_k(db: String) -> (String, ChClient, WindowSql) {
     let client = fresh_db(&db).await;
     let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
     for (i, req) in fixture_k_bodies(base_ns).into_iter().enumerate() {
@@ -5602,7 +5602,8 @@ async fn seed_fixture_k(name: &str) -> (String, ChClient, WindowSql) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fr_t_c3_matched_counts_before_the_cap() {
     skip_unless_live!();
-    let (db, client, w) = seed_fixture_k("pulsus_read_it_t590_fixturek_c3").await;
+    let (db, client, w) =
+        seed_fixture_k(pulsus_testkit::test_db("pulsus_read_it_t590_fixturek_c3")).await;
     let rows = search_summary(&search_rows(&client, w, "{}", 20, 3, read_settings()).await);
     drop_db(&db).await;
     let c1 = rows
@@ -5622,7 +5623,8 @@ async fn fr_t_c3_matched_counts_before_the_cap() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fr_t_c4_a_tie_orders_by_trace_id() {
     skip_unless_live!();
-    let (db, client, w) = seed_fixture_k("pulsus_read_it_t590_fixturek_c4").await;
+    let (db, client, w) =
+        seed_fixture_k(pulsus_testkit::test_db("pulsus_read_it_t590_fixturek_c4")).await;
     let rows = search_summary(&search_rows(&client, w, "{}", 20, 3, read_settings()).await);
     drop_db(&db).await;
     let order: Vec<String> = rows.into_iter().map(|(t, _, _)| t).collect();
@@ -5649,9 +5651,9 @@ async fn run_bounded(client: &ChClient, sql: String) {
 
 /// Seeds corpus S: 70,000 traces of 28 spans over three hours, then the
 /// per-trace table by `traces_mv`'s own `SELECT` over the spans, then the
-/// span table merged. Returns the database, its client and the window.
-async fn seed_corpus_s(name: &str) -> (String, ChClient, WindowSql) {
-    let db = pulsus_testkit::test_db(name);
+/// span table merged, in `db`, a name `pulsus_testkit::test_db` composed.
+/// Returns the database, its client and the window.
+async fn seed_corpus_s(db: String) -> (String, ChClient, WindowSql) {
     let client = fresh_db(&db).await;
     let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000 - CORPUS_S_NS;
     run_bounded(
@@ -5703,10 +5705,14 @@ async fn window_spans(client: &ChClient, w: WindowSql) -> u64 {
 }
 
 /// Runs the search for `{}` with `limit = 20`, `spss = 3`, tagged so its
-/// `system.query_log` row can be found, and returns its rows and its
+/// `system.query_log` row can be found by `comment`, a name
+/// `pulsus_testkit::test_ident` composed; returns its rows and its
 /// `read_rows`.
-async fn logged_search(client: &ChClient, w: WindowSql, tag: &str) -> (Vec<SearchTraceRow>, u64) {
-    let comment = pulsus_testkit::test_ident(tag);
+async fn logged_search(
+    client: &ChClient,
+    w: WindowSql,
+    comment: String,
+) -> (Vec<SearchTraceRow>, u64) {
     let settings = read_settings()
         .set("max_threads", 4)
         .set("max_memory_usage", 4_000_000_000_u64)
@@ -5738,9 +5744,11 @@ async fn logged_search(client: &ChClient, w: WindowSql, tag: &str) -> (Vec<Searc
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_top_k_runs_once() {
     skip_unless_live!();
-    let (db, client, w) = seed_corpus_s("pulsus_read_it_t590_corpus_s_topk").await;
+    let (db, client, w) =
+        seed_corpus_s(pulsus_testkit::test_db("pulsus_read_it_t590_corpus_s_topk")).await;
     let window = window_spans(&client, w).await;
-    let (rows, read_rows) = logged_search(&client, w, "t590_topk").await;
+    let (rows, read_rows) =
+        logged_search(&client, w, pulsus_testkit::test_ident("t590_topk")).await;
     drop_db(&db).await;
     assert_eq!(rows.len(), 20, "twenty traces");
     assert!(
@@ -5755,9 +5763,13 @@ async fn the_top_k_runs_once() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_detail_read_does_not_re_scan_the_window() {
     skip_unless_live!();
-    let (db, client, w) = seed_corpus_s("pulsus_read_it_t590_corpus_s_detail").await;
+    let (db, client, w) = seed_corpus_s(pulsus_testkit::test_db(
+        "pulsus_read_it_t590_corpus_s_detail",
+    ))
+    .await;
     let window = window_spans(&client, w).await;
-    let (rows, read_rows) = logged_search(&client, w, "t590_detail").await;
+    let (rows, read_rows) =
+        logged_search(&client, w, pulsus_testkit::test_ident("t590_detail")).await;
     let clauses = format!(
         "{} AND {} AND {}",
         w.span_time_clause(),
