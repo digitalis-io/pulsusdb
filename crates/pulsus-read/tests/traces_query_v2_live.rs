@@ -9,7 +9,7 @@
 //! assertions, and the two halves meet at `T-C4`, which freezes the exact
 //! statement this suite issues.
 //!
-//! **Ten fixtures, each test function in its own database.**
+//! **Eleven fixtures, each test function in its own database.**
 //!
 //! * The worked fixture of `docs/TraceQL/functional-requirements.md` §6.1 —
 //!   three traces, nine spans, every attribute type, one event, one link,
@@ -45,6 +45,10 @@
 //!   event, link or unscoped operand with another field: any element and
 //!   every element, empty sets, two sets pair by pair, the four event and
 //!   link intrinsics, the chain's scope order, and resource rows deleted.
+//! * Fixture Q — twenty-two spans, one resource each, for event, link and
+//!   unscoped operands inside arithmetic and opposite any side: every tuple
+//!   of their elements, empty sets, `!` over an event attribute, a duration
+//!   divided as a float, and resource rows deleted.
 //!
 //! Each is seeded by building the OTLP request bodies and handing them to
 //! `pulsus_write::parse_trace_landing`, then inserting the rows it
@@ -5042,6 +5046,392 @@ async fn the_predicate_compiler_compares_event_link_and_chain_operands() {
         "{} of {} fixture-Z cases answer something else:\n\n{}",
         wrong.len(),
         CASES_Z.len() + CASES_Z_MISS.len(),
+        wrong.join("\n\n")
+    );
+}
+
+// ---------------------------------------------------------------------
+// #589 part 3e — fixture Q, set operands in expressions
+// ---------------------------------------------------------------------
+
+/// `q01` to `q22`: span ids `000000000000e401` to `…e422`, the span's
+/// number written as decimal digits in the id's last byte.
+fn idq(short: &str) -> String {
+    format!("000000000000e4{}", short.trim_start_matches('q'))
+}
+
+/// Fixture Q, the part-3e design's section 7.1: twenty-two requests, one
+/// span and one resource each. Every resource carries `rq = "qNN"` and
+/// `service.name = "qsvc"`.
+fn fixture_q_bodies(base_ns: i64) -> Vec<ExportTraceServiceRequest> {
+    const MS: i64 = 1_000_000;
+    const US: i64 = 1_000;
+    let it = |k: &str, v: i64| kv(k, int_value(v));
+    let st = |k: &str, v: &str| kv(k, str_value(v));
+    let db = |k: &str, v: f64| kv(k, double_value(v));
+    let bl = |k: &str, v: bool| kv(k, bool_value(v));
+    let ev = |offset_us: i64, attrs: Vec<KeyValue>| -> ZEvent { (offset_us, "e", attrs) };
+    let lk = |last: u8, attrs: Vec<KeyValue>| -> ZLink { (vec![0xf1; 16], last, attrs) };
+    let spans: Vec<ZSpan> = vec![
+        (
+            1,
+            vec![it("b", 6)],
+            vec![ev(1, vec![it("a", 9)]), ev(2, vec![it("a", 5)])],
+            Vec::new(),
+            Vec::new(),
+        ),
+        (
+            2,
+            vec![it("b", 6)],
+            vec![ev(1, vec![it("a", 1)]), ev(2, vec![it("a", 2)])],
+            Vec::new(),
+            Vec::new(),
+        ),
+        (3, vec![it("b", 6)], Vec::new(), Vec::new(), Vec::new()),
+        (
+            4,
+            Vec::new(),
+            vec![ev(1, vec![it("a", 5)])],
+            Vec::new(),
+            Vec::new(),
+        ),
+        (
+            5,
+            vec![it("b", 6)],
+            vec![ev(1, vec![st("a", "5")])],
+            Vec::new(),
+            Vec::new(),
+        ),
+        (
+            6,
+            Vec::new(),
+            vec![ev(1, vec![it("a", 3)]), ev(2, vec![it("a", 40)])],
+            vec![lk(0xc6, vec![it("a", 7)])],
+            Vec::new(),
+        ),
+        (
+            7,
+            Vec::new(),
+            vec![ev(1, vec![it("a", 5)]), ev(2, vec![it("a", 3)])],
+            vec![lk(0xc7, vec![it("a", 6)])],
+            Vec::new(),
+        ),
+        (
+            8,
+            Vec::new(),
+            vec![ev(1, vec![it("a", 4)]), ev(2, vec![it("a", -4)])],
+            Vec::new(),
+            Vec::new(),
+        ),
+        (
+            9,
+            Vec::new(),
+            vec![ev(3_000, Vec::new()), ev(9_750, Vec::new())],
+            Vec::new(),
+            Vec::new(),
+        ),
+        (
+            10,
+            Vec::new(),
+            vec![(1, "x", Vec::new())],
+            Vec::new(),
+            Vec::new(),
+        ),
+        (
+            11,
+            vec![it("c", 5)],
+            vec![ev(1, vec![it("a", 4)])],
+            Vec::new(),
+            Vec::new(),
+        ),
+        (
+            12,
+            vec![it("a", 4), it("c", 5)],
+            vec![ev(1, vec![it("a", 9)])],
+            Vec::new(),
+            Vec::new(),
+        ),
+        (13, vec![it("c", 5)], Vec::new(), Vec::new(), Vec::new()),
+        (
+            14,
+            vec![it("b", 4)],
+            vec![ev(1, vec![it("a", 1)]), ev(2, vec![it("a", 5)])],
+            Vec::new(),
+            Vec::new(),
+        ),
+        (
+            15,
+            vec![bl("g", true)],
+            vec![ev(1, vec![bl("f", true)]), ev(2, vec![bl("f", false)])],
+            Vec::new(),
+            Vec::new(),
+        ),
+        (
+            16,
+            vec![bl("g", true)],
+            vec![ev(1, vec![bl("f", true)])],
+            Vec::new(),
+            Vec::new(),
+        ),
+        (
+            17,
+            Vec::new(),
+            vec![ev(1, vec![db("a", std::f64::consts::SQRT_2)])],
+            Vec::new(),
+            Vec::new(),
+        ),
+        (
+            18,
+            Vec::new(),
+            vec![ev(1, vec![it("a", 3)])],
+            Vec::new(),
+            vec![it("r", 8)],
+        ),
+        (
+            19,
+            vec![it("b", 4)],
+            vec![ev(1, vec![it("a", 5)])],
+            vec![lk(0xc9, vec![it("a", 11)])],
+            vec![it("r", 2)],
+        ),
+        (
+            20,
+            vec![it("c", 7)],
+            vec![ev(1, vec![it("a", 4)])],
+            Vec::new(),
+            Vec::new(),
+        ),
+        (21, Vec::new(), Vec::new(), Vec::new(), vec![it("r", 8)]),
+        (22, vec![bl("g", true)], Vec::new(), Vec::new(), Vec::new()),
+    ];
+    spans
+        .into_iter()
+        .map(|(n, attrs, events, links, resource_attrs)| {
+            let last = u8::from_str_radix(&format!("{n:02}"), 16).expect("two decimal digits");
+            let start_ns = base_ns + i64::from(n) * MS;
+            let mut resource = vec![st("rq", &format!("q{n:02}")), st("service.name", "qsvc")];
+            resource.extend(resource_attrs);
+            let events = events
+                .into_iter()
+                .map(|(offset_us, name, attributes)| {
+                    event_of(start_ns + offset_us * US, name, attributes)
+                })
+                .collect();
+            let links = links
+                .into_iter()
+                .map(|(trace_id, last_byte, attributes)| {
+                    link_of(trace_id, vec![0, 0, 0, 0, 0, 0, 0, last_byte], attributes)
+                })
+                .collect();
+            one_span_request(
+                resource,
+                scope_named("io.pulsus.q", "1.0", Vec::new()),
+                span_of(
+                    vec![0xe4; 16],
+                    vec![0, 0, 0, 0, 0, 0, 0xe4, last],
+                    Vec::new(),
+                    "op",
+                    1,
+                    start_ns,
+                    MS,
+                    attrs,
+                    0,
+                    events,
+                    links,
+                ),
+            )
+        })
+        .collect()
+}
+
+const ALL_Q: &[&str] = &[
+    "q01", "q02", "q03", "q04", "q05", "q06", "q07", "q08", "q09", "q10", "q11", "q12", "q13",
+    "q14", "q15", "q16", "q17", "q18", "q19", "q20", "q21", "q22",
+];
+
+/// The part-3e design's section 8, before the resource rows are deleted.
+const CASES_Q: &[CaseIn] = &[
+    CaseIn {
+        name: "AE1",
+        query: r#"{ event.a + 1 = span.b }"#,
+        want: Want::Ids(&["q01"]),
+    },
+    CaseIn {
+        name: "AE2",
+        query: r#"{ event.a + 1 != span.b }"#,
+        want: Want::Ids(&["q02", "q03", "q14", "q19"]),
+    },
+    CaseIn {
+        name: "AE3",
+        query: r#"{ event.a * 2 > link.a }"#,
+        want: Want::Ids(&["q06", "q07"]),
+    },
+    CaseIn {
+        name: "AE4",
+        query: r#"{ event.a * 2 = link.a }"#,
+        want: Want::Ids(&["q07"]),
+    },
+    CaseIn {
+        name: "AE5",
+        query: r#"{ event.a * 2 != link.a }"#,
+        want: Want::Ids(&[
+            "q01", "q02", "q03", "q04", "q05", "q06", "q08", "q09", "q10", "q11", "q12", "q13",
+            "q14", "q15", "q16", "q17", "q18", "q19", "q20", "q21", "q22",
+        ]),
+    },
+    CaseIn {
+        name: "AE6",
+        query: r#"{ -event.a > 0 }"#,
+        want: Want::Ids(&["q08"]),
+    },
+    CaseIn {
+        name: "AE7",
+        query: r#"{ event:timeSinceStart / 1ms > 9.5 }"#,
+        want: Want::Ids(&["q09"]),
+    },
+    CaseIn {
+        name: "AE8",
+        query: r#"{ event:name + 1 != 2 }"#,
+        want: Want::Ids(&["q03", "q13", "q21", "q22"]),
+    },
+    CaseIn {
+        name: "AE9",
+        query: r#"{ .a + 1 = span.c }"#,
+        want: Want::Ids(&["q11", "q12"]),
+    },
+    CaseIn {
+        name: "AE10",
+        query: r#"{ .a + 1 != span.c }"#,
+        want: Want::Ids(&["q20"]),
+    },
+    CaseIn {
+        name: "AE11",
+        query: r#"{ event.a = span.b + 1 }"#,
+        want: Want::Ids(&["q14", "q19"]),
+    },
+    CaseIn {
+        name: "AE12",
+        query: r#"{ event.a != span.b + 1 }"#,
+        want: Want::Ids(&["q01", "q02", "q03"]),
+    },
+    CaseIn {
+        name: "AE13",
+        query: r#"{ !event.f = span.g }"#,
+        want: Want::Ids(&["q15"]),
+    },
+    CaseIn {
+        name: "AE14",
+        query: r#"{ !event.f != span.g }"#,
+        want: Want::Ids(&["q16"]),
+    },
+    CaseIn {
+        name: "AE15",
+        query: r#"{ event.a = 2.0 ^ 0.5 }"#,
+        want: Want::Ids(&["q17"]),
+    },
+    CaseIn {
+        name: "AE16",
+        query: r#"{ event.a + resource.r > 10 }"#,
+        want: Want::Ids(&["q18"]),
+    },
+    CaseIn {
+        name: "AE17",
+        query: r#"{ event.a + link.a > span.b * 3 }"#,
+        want: Want::Ids(&["q19"]),
+    },
+    CaseIn {
+        name: "AE18",
+        query: r#"{ event.a + resource.r != 11 }"#,
+        want: Want::Ids(&["q19", "q21"]),
+    },
+    CaseIn {
+        name: "AE19",
+        query: r#"{ event.f = (span.b = 6) }"#,
+        want: Want::Ids(&["q15"]),
+    },
+    CaseIn {
+        name: "AE20",
+        query: r#"{ event.f != (span.b = 6) }"#,
+        want: Want::Ids(&[
+            "q01", "q02", "q03", "q04", "q05", "q06", "q07", "q08", "q09", "q10", "q11", "q12",
+            "q13", "q14", "q16", "q17", "q18", "q19", "q20", "q21", "q22",
+        ]),
+    },
+    CaseIn {
+        name: "AE21",
+        query: r#"{ event.a - event.a = 1 }"#,
+        want: Want::Ids(&["q02"]),
+    },
+    CaseIn {
+        name: "AE22",
+        query: r#"{ event.a + 1 = event.a }"#,
+        want: Want::Ids(&["q02"]),
+    },
+    CaseIn {
+        name: "AE23",
+        query: r#"{ event.a + 1 / 0 != 2 }"#,
+        want: Want::Ids(&[]),
+    },
+    CaseIn {
+        name: "AE24",
+        query: r#"{ 1 / 0 != event.a + 1 }"#,
+        want: Want::Ids(&[]),
+    },
+];
+
+/// Section 8's phase 2, after the resource rows of `q18` and `q21` are
+/// deleted.
+const CASES_Q_MISS: &[CaseIn] = &[
+    CaseIn {
+        name: "AE16-MISS",
+        query: r#"{ event.a + resource.r > 10 }"#,
+        want: Want::Ids(&[]),
+    },
+    CaseIn {
+        name: "AE18-MISS",
+        query: r#"{ event.a + resource.r != 11 }"#,
+        want: Want::Ids(&["q19"]),
+    },
+];
+
+/// Section 8 of the part-3e design: fixture Q. The phase-2 cases run last:
+/// they follow the deletion of two resource rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_predicate_compiler_computes_with_set_operands() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db("pulsus_read_it_t589p3e_fixtureq");
+    let client = fresh_db(&db).await;
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    for (i, req) in fixture_q_bodies(base_ns).into_iter().enumerate() {
+        land(&client, &req, &format!("t589p3e-q-{i}-{}", now_ns())).await;
+    }
+    let w = WindowSql::start_closed_end_open(base_ns, base_ns + WINDOW_NS);
+
+    let seeded = count(&client, &format!("SELECT count() AS n FROM {SPANS_TABLE}")).await;
+    assert_eq!(
+        seeded, 22,
+        "fixture Q seeds twenty-two spans; nothing below can be read as a predicate result \
+         until this holds"
+    );
+    let ids = ids_of(
+        &client,
+        &format!("SELECT lower(hex(span_id)) AS id FROM {SPANS_TABLE} ORDER BY id"),
+    )
+    .await;
+    let want: Vec<String> = ALL_Q.iter().copied().map(idq).collect();
+    assert_eq!(ids, want, "the 22 span ids are fixture Q's");
+
+    let mut wrong = run_cases_in(&client, w, CASES_Q, idq).await;
+    for span in ["q18", "q21"] {
+        delete_resource_row_of(&client, &idq(span)).await;
+    }
+    wrong.extend(run_cases_in(&client, w, CASES_Q_MISS, idq).await);
+    drop_db(&db).await;
+    assert!(
+        wrong.is_empty(),
+        "{} of {} fixture-Q cases answer something else:\n\n{}",
+        wrong.len(),
+        CASES_Q.len() + CASES_Q_MISS.len(),
         wrong.join("\n\n")
     );
 }
