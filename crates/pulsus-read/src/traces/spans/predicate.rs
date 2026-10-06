@@ -5,15 +5,22 @@
 //! ([`span_membership_sql`]). Nothing here reads or writes: every entry
 //! point is pure.
 //!
-//! **What it serves.** The `span.`, `instrumentation.` and `resource.`
-//! attribute scopes; the ten span intrinsics `spans` has a column for —
-//! `name`, `kind`, `status`, `statusMessage`, `duration`, `span:id`,
-//! `span:parentID`, `trace:id`, `instrumentation:name`,
-//! `instrumentation:version`; and `&&`, `||` and `!`. Every other field
-//! and construct is [`PlanError::UnsupportedField`] naming itself and the
-//! issue that serves it. The arms are exhaustive with no wildcard, so a
-//! new `Intrinsic` or `AttrScope` variant fails to compile here rather
-//! than falling into the wrong one.
+//! **What it serves.** Every attribute scope — `span.`, `resource.`,
+//! `instrumentation.`, `event.`, `link.` and the unscoped `.`; the
+//! fourteen intrinsics a span row answers — `name`, `kind`, `status`,
+//! `statusMessage`, `duration`, `span:id`, `span:parentID`, `trace:id`,
+//! `instrumentation:name`, `instrumentation:version`, `event:name`,
+//! `event:timeSinceStart`, `link:spanID`, `link:traceID`; a comparison of
+//! two of these: span and instrumentation attributes, the ten span-row
+//! intrinsics `name`, `statusMessage`, `span:id`, `span:parentID`,
+//! `trace:id`, `instrumentation:name`, `instrumentation:version`,
+//! `duration`, `status` and `kind`, resource attributes, and
+//! `resource.service.name` — its string from the span row, every other arm
+//! from the resource row ([`field_terms`]); and `&&`, `||` and `!`. Every
+//! other field and construct is [`PlanError::UnsupportedField`] naming
+//! itself and the issue that serves it. The arms are exhaustive with no
+//! wildcard, so a new `Intrinsic` or `AttrScope` variant fails to compile
+//! here rather than falling into the wrong one.
 //!
 //! **Four rules worth reading before the code.**
 //!
@@ -41,6 +48,13 @@
 //!   it.** `NOT (R(p))` and `R(NOT p)` disagree for a span whose resource
 //!   row is not visible; outside keeps `{ resource.k != v }` the exact
 //!   complement of `{ resource.k = v }`.
+//! * **An event or link negation is `NOT` outside `arrayExists`, never
+//!   inside the lambda.** `{ event.k != v }` matches a span only when no
+//!   element is `v` — a span lacking the key or carrying no elements
+//!   included — which is the 2026-09-18 decision
+//!   (`docs/benchmarks/traces-differential-ledger.md`,
+//!   `traceql-event-link-operand-any-match`). Inside, it would match a span
+//!   with any element that differs.
 
 use std::fmt::Write as _;
 
@@ -192,8 +206,8 @@ pub fn span_membership_sql(spans_table: &str, w: WindowSql, p: &SpanPredicate) -
 // ---------------------------------------------------------------------
 
 /// The issue each deferred construct is served by.
-const PART_2: &str = "#589 part 2";
-const PART_3: &str = "#589 part 3";
+const PART_3C: &str = "#589 part 3c";
+const PART_3D: &str = "#589 part 3d";
 const NESTED_AND_TRACE: &str = "#594";
 
 /// The refusal every deferred construct takes: it names the construct and
@@ -204,26 +218,21 @@ fn unsupported(construct: &str, target: &str) -> PlanError {
     ))
 }
 
-/// The `.`, `event.` and `link.` scopes, which #589 part 2 serves.
-fn unsupported_scope(scope: AttrScope) -> PlanError {
-    unsupported(&format!("the \"{scope}\" attribute scope"), PART_2)
-}
-
 fn unsupported_intrinsic(intrinsic: Intrinsic, target: &str) -> PlanError {
     unsupported(&format!("{intrinsic}"), target)
 }
 
 fn unsupported_arithmetic() -> PlanError {
-    unsupported("arithmetic in a span-scope predicate", PART_3)
+    unsupported("arithmetic in a span-scope predicate", PART_3C)
 }
 
-/// A `resource.` field compiled with no [`PredicateCtx`].
-fn resource_needs_window() -> PlanError {
-    PlanError::UnsupportedField(
-        "the \"resource.\" attribute scope needs the request window: compile it with \
+/// A `resource.` or `.` field compiled with no [`PredicateCtx`]: both
+/// read the resource table through a subquery bounded by the window.
+fn needs_window(scope: AttrScope) -> PlanError {
+    PlanError::UnsupportedField(format!(
+        "the \"{scope}\" attribute scope needs the request window: compile it with \
          compile_span_predicate_in (issue #589)"
-            .to_string(),
-    )
+    ))
 }
 
 /// Whether `expr` is an arithmetic node — a binary arithmetic operator or
@@ -273,6 +282,12 @@ fn bool_want(op: ComparisonOp, literal: &Value) -> Option<bool> {
 /// The roots of the two span-row `JSON` columns an attribute is read from.
 const ATTRS: &str = "attrs";
 const SCOPE_ATTRS: &str = "scope_attrs";
+
+/// The `JSON` element of the `events` and `links` arrays. On `spans` each
+/// is an array of `JSON`, so ``events.attrs.`k`.:String`` is the typed
+/// array of that one path, which reads that path only.
+const EVENT_ATTRS: &str = "events.attrs";
+const LINK_ATTRS: &str = "links.attrs";
 
 /// The one resource key that is read from the span row: the writer stores
 /// it in `spans.service`, with its arm in `spans.service_type`.
@@ -334,10 +349,28 @@ impl<'a> Compiler<'a> {
     /// `R(p)`: the spans whose resource row, within the window's days,
     /// satisfies `p`. Inline, so the whole predicate is one statement.
     fn resource_subquery(&mut self, p: &str) -> Result<String, PlanError> {
-        let ctx = self.ctx.ok_or_else(resource_needs_window)?;
+        let ctx = self.ctx.ok_or_else(|| needs_window(AttrScope::Resource))?;
         self.uses_resources = true;
         Ok(format!(
             "resource_id IN (SELECT resource_id FROM {} WHERE {} AND ({p}))",
+            ctx.resources_table,
+            ctx.window.resources_day_clause()
+        ))
+    }
+
+    /// `Q(k)`: one uncorrelated scalar subquery over the resource rows in
+    /// the window's days that hold `key` — their ids, their values and the
+    /// set of types those values are stored as. Every occurrence of one
+    /// key's text is the same, so the engine evaluates it once per
+    /// statement.
+    fn resource_read(&mut self, key: &str) -> Result<String, PlanError> {
+        let ctx = self.ctx.ok_or_else(|| needs_window(AttrScope::Resource))?;
+        self.uses_resources = true;
+        let path = attr_path(ATTRS, key);
+        Ok(format!(
+            "(SELECT (groupArray(resource_id), groupArray({path}), \
+             groupUniqArray(dynamicType({path}))) FROM {} WHERE {} AND \
+             dynamicType({path}) != 'None')",
             ctx.resources_table,
             ctx.window.resources_day_clause()
         ))
@@ -378,15 +411,15 @@ impl<'a> Compiler<'a> {
                     (FieldExpr::Literal(value), FieldExpr::Field(field)) => {
                         self.leaf(field, flip_comparison(*op), value)
                     }
-                    (FieldExpr::Field(_), FieldExpr::Field(_)) => {
-                        Err(unsupported("a field-against-field comparison", PART_3))
+                    (FieldExpr::Field(lhs_field), FieldExpr::Field(rhs_field)) => {
+                        self.field_compare(lhs_field, *op, rhs_field)
                     }
                     (FieldExpr::Literal(_), FieldExpr::Literal(_)) => {
-                        Err(unsupported("a comparison between two literals", PART_3))
+                        Err(unsupported("a comparison between two literals", PART_3C))
                     }
                     _ => Err(unsupported(
                         "a comparison with a boolean-valued side other than `(!field) op literal`",
-                        PART_3,
+                        PART_3C,
                     )),
                 }
             }
@@ -453,11 +486,30 @@ impl<'a> Compiler<'a> {
             }
             Field::Attribute { scope, key } => (*scope, key),
         };
-        let (matches, condition) = match scope {
+        let (matches, condition) = self.not_parts(scope, key, want)?;
+        self.demand(
+            condition,
+            format!("expression (!{scope}{key}) expected a boolean"),
+        );
+        Ok(matches)
+    }
+
+    /// `!<scope>key`'s two halves at one scope — what matches `want`, and
+    /// the demand condition — with no demand registered, so the `.` chain
+    /// can assemble its own from them.
+    fn not_parts(
+        &mut self,
+        scope: AttrScope,
+        key: &str,
+        want: Option<bool>,
+    ) -> Result<(String, String), PlanError> {
+        Ok(match scope {
             AttrScope::Span => not_attr(ATTRS, key, want),
             AttrScope::Instrumentation => not_attr(SCOPE_ATTRS, key, want),
+            AttrScope::Event => not_element(EVENT_ATTRS, key, want),
+            AttrScope::Link => not_element(LINK_ATTRS, key, want),
             AttrScope::Resource if key == SERVICE_NAME => {
-                self.ctx.ok_or_else(resource_needs_window)?;
+                self.ctx.ok_or_else(|| needs_window(AttrScope::Resource))?;
                 (
                     want.map_or_else(
                         || "false".to_string(),
@@ -474,15 +526,29 @@ impl<'a> Compiler<'a> {
                 };
                 (matches, self.resource_subquery(&condition)?)
             }
-            AttrScope::Unscoped | AttrScope::Event | AttrScope::Link => {
-                return Err(unsupported_scope(scope));
-            }
+            AttrScope::Unscoped => self.not_chain(key, want)?,
+        })
+    }
+
+    /// `!.key`: section 5.1's chain over each scope's `T` and over each
+    /// scope's demand condition, both defaulting to `false`.
+    fn not_chain(&mut self, key: &str, want: Option<bool>) -> Result<(String, String), PlanError> {
+        self.ctx.ok_or_else(|| needs_window(AttrScope::Unscoped))?;
+        let mut t_args = Vec::with_capacity(2 * CHAIN.len());
+        let mut c_args = Vec::with_capacity(2 * CHAIN.len());
+        for scope in CHAIN {
+            let present = self.chain_presence(scope, key)?;
+            let (t, c) = self.not_parts(scope, key, want)?;
+            t_args.push(present.clone());
+            t_args.push(t);
+            c_args.push(present);
+            c_args.push(c);
+        }
+        let matches = match want {
+            Some(_) => format!("multiIf({}, false)", t_args.join(", ")),
+            None => "false".to_string(),
         };
-        self.demand(
-            condition,
-            format!("expression (!{scope}{key}) expected a boolean"),
-        );
-        Ok(matches)
+        Ok((matches, format!("multiIf({}, false)", c_args.join(", "))))
     }
 
     /// `{ .k != nil }` (presence) and `{ .k = nil }` (absence).
@@ -500,6 +566,15 @@ impl<'a> Compiler<'a> {
                 ));
             }
         };
+        self.scoped_exists(scope, key, negated)
+    }
+
+    fn scoped_exists(
+        &mut self,
+        scope: AttrScope,
+        key: &str,
+        negated: bool,
+    ) -> Result<String, PlanError> {
         let op = if negated { "=" } else { "!=" };
         match scope {
             AttrScope::Span => Ok(format!(
@@ -510,10 +585,14 @@ impl<'a> Compiler<'a> {
                 "dynamicType({}) {op} 'None'",
                 attr_path(SCOPE_ATTRS, key)
             )),
+            // Any element holds the key. Absence is `NOT` outside, so a span
+            // carrying no elements lacks it.
+            AttrScope::Event => Ok(element_exists(EVENT_ATTRS, key, negated)),
+            AttrScope::Link => Ok(element_exists(LINK_ATTRS, key, negated)),
             // Presence reads the arm, never the text: `service` is `''` for
             // an empty string and for no key alike.
             AttrScope::Resource if key == SERVICE_NAME => {
-                self.ctx.ok_or_else(resource_needs_window)?;
+                self.ctx.ok_or_else(|| needs_window(AttrScope::Resource))?;
                 Ok(if negated {
                     format!("NOT ({SERVICE_PRESENT})")
                 } else {
@@ -533,8 +612,15 @@ impl<'a> Compiler<'a> {
                     present
                 })
             }
-            AttrScope::Unscoped | AttrScope::Event | AttrScope::Link => {
-                Err(unsupported_scope(scope))
+            // Present at any scope of the chain.
+            AttrScope::Unscoped => {
+                self.ctx.ok_or_else(|| needs_window(AttrScope::Unscoped))?;
+                let mut any = Vec::with_capacity(CHAIN.len());
+                for scope in CHAIN {
+                    any.push(format!("({})", self.chain_presence(scope, key)?));
+                }
+                let any = any.join(" OR ");
+                Ok(if negated { format!("NOT ({any})") } else { any })
             }
         }
     }
@@ -546,15 +632,25 @@ impl<'a> Compiler<'a> {
         value: &Value,
     ) -> Result<String, PlanError> {
         match field {
-            Field::Attribute { scope, key } => match scope {
-                AttrScope::Span => attr_leaf(ATTRS, key, op, value),
-                AttrScope::Instrumentation => attr_leaf(SCOPE_ATTRS, key, op, value),
-                AttrScope::Resource => self.resource_leaf(key, op, value),
-                AttrScope::Unscoped | AttrScope::Event | AttrScope::Link => {
-                    Err(unsupported_scope(*scope))
-                }
-            },
+            Field::Attribute { scope, key } => self.scoped_leaf(*scope, key, op, value),
             Field::Intrinsic(intrinsic) => intrinsic_leaf(*intrinsic, op, value),
+        }
+    }
+
+    fn scoped_leaf(
+        &mut self,
+        scope: AttrScope,
+        key: &str,
+        op: ComparisonOp,
+        value: &Value,
+    ) -> Result<String, PlanError> {
+        match scope {
+            AttrScope::Span => attr_leaf(ATTRS, key, op, value),
+            AttrScope::Instrumentation => attr_leaf(SCOPE_ATTRS, key, op, value),
+            AttrScope::Resource => self.resource_leaf(key, op, value),
+            AttrScope::Event => element_leaf(EVENT_ATTRS, key, op, value),
+            AttrScope::Link => element_leaf(LINK_ATTRS, key, op, value),
+            AttrScope::Unscoped => self.unscoped_leaf(key, op, value),
         }
     }
 
@@ -566,7 +662,7 @@ impl<'a> Compiler<'a> {
         op: ComparisonOp,
         value: &Value,
     ) -> Result<String, PlanError> {
-        self.ctx.ok_or_else(resource_needs_window)?;
+        self.ctx.ok_or_else(|| needs_window(AttrScope::Resource))?;
         if key == SERVICE_NAME {
             return service_name_leaf(op, value);
         }
@@ -574,7 +670,197 @@ impl<'a> Compiler<'a> {
         let r = self.resource_subquery(&positive)?;
         Ok(if negated { format!("NOT ({r})") } else { r })
     }
+
+    /// `.k <op> v`: the value is the first scope's in the chain that holds
+    /// the key — `multiIf(P_span, X_span, …, P_instrumentation,
+    /// X_instrumentation, D)` — and a span lacking it everywhere matches
+    /// only a negated operator. A refusal is `span.k`'s.
+    fn unscoped_leaf(
+        &mut self,
+        key: &str,
+        op: ComparisonOp,
+        value: &Value,
+    ) -> Result<String, PlanError> {
+        self.ctx.ok_or_else(|| needs_window(AttrScope::Unscoped))?;
+        let (negated, _) = attr_leaf_parts(ATTRS, key, op, value)?;
+        let mut args = Vec::with_capacity(2 * CHAIN.len());
+        for scope in CHAIN {
+            args.push(self.chain_presence(scope, key)?);
+            args.push(if scope == AttrScope::Resource && key == SERVICE_NAME {
+                self.service_name_in_chain(op, value)?
+            } else {
+                self.scoped_leaf(scope, key, op, value)?
+            });
+        }
+        let default = if negated { "true" } else { "false" };
+        Ok(format!("multiIf({}, {default})", args.join(", ")))
+    }
+
+    /// `P_sc`: whether `scope` holds `key`, as the chain tests it.
+    ///
+    /// At `service.name` the resource scope is present when the span row
+    /// holds a string (the writer moves a non-empty string there, and stores
+    /// every other arm in `resources.attrs`) or the resource row holds any
+    /// value.
+    fn chain_presence(&mut self, scope: AttrScope, key: &str) -> Result<String, PlanError> {
+        if scope == AttrScope::Resource && key == SERVICE_NAME {
+            let r = self.resource_subquery(&format!(
+                "dynamicType({}) != 'None'",
+                attr_path(ATTRS, SERVICE_NAME)
+            ))?;
+            return Ok(format!("({SERVICE_IS_STRING} OR {r})"));
+        }
+        self.scoped_exists(scope, key, false)
+    }
+
+    /// `X_resource` at `service.name` in the chain: a string is compared on
+    /// the span row, gated on its arm, OR in the resource row; every other
+    /// operand in the resource row alone. A negation goes outside both.
+    fn service_name_in_chain(
+        &mut self,
+        op: ComparisonOp,
+        value: &Value,
+    ) -> Result<String, PlanError> {
+        let (negated, p) = attr_leaf_parts(ATTRS, SERVICE_NAME, op, value)?;
+        let r = self.resource_subquery(&p)?;
+        let Value::String(s) = value else {
+            return Ok(if negated { format!("NOT ({r})") } else { r });
+        };
+        let g = match positive_op(op).1 {
+            ComparisonOp::Re => format!("match(service, {})", anchored_regex_sql(s)?),
+            other => format!(
+                "service {} {}",
+                sql_op(other).expect("the six non-regex operators"),
+                escape::ch_string(s)
+            ),
+        };
+        let x = format!("(({SERVICE_IS_STRING} AND {g}) OR {r})");
+        Ok(if negated { format!("NOT {x}") } else { x })
+    }
+
+    /// `L op R`, both sides fields. The regex operators are refused
+    /// first, then each operand in turn, left before right; what remains
+    /// is [`field_terms`] over the two operands' arms.
+    ///
+    /// An operand read from the resource row is bound once: the body is a
+    /// lambda over `r1` (left) or `r2` (right), applied to a one-element
+    /// array holding the looked-up value, so every arm reads the variable
+    /// rather than repeating the lookup.
+    fn field_compare(
+        &mut self,
+        lhs: &Field,
+        op: ComparisonOp,
+        rhs: &Field,
+    ) -> Result<String, PlanError> {
+        if matches!(op, ComparisonOp::Re | ComparisonOp::Nre) {
+            return Err(PlanError::TypeMismatch(
+                "a field-against-field comparison does not support regex operators".to_string(),
+            ));
+        }
+        let l = self.operand_arms(lhs, "r1")?;
+        let r = self.operand_arms(rhs, "r2")?;
+        let body = field_terms(&l, op, &r);
+        if body == "false" {
+            return Ok(body);
+        }
+        Ok(match (&l.bind, &r.bind) {
+            (None, None) => body,
+            (Some((v, value)), None) | (None, Some((v, value))) => {
+                format!("arrayExists({v} -> {body}, [{value}])")
+            }
+            (Some((lv, lvalue)), Some((rv, rvalue))) => {
+                format!("arrayExists(({lv}, {rv}) -> {body}, [{lvalue}], [{rvalue}])")
+            }
+        })
+    }
+
+    /// One operand's arms: a typed read per class it can hold. `var` is
+    /// the lambda variable a resource-row operand is bound to. **No
+    /// wildcard arm**, so a new `Intrinsic` or `AttrScope` variant fails to
+    /// compile here until it is classified.
+    fn operand_arms(&mut self, field: &Field, var: &'static str) -> Result<Arms, PlanError> {
+        let unsupported_operand = |what: String| {
+            unsupported(
+                &format!("a field-against-field comparison with {what}"),
+                PART_3D,
+            )
+        };
+        let intrinsic = match field {
+            Field::Attribute { scope, key } => {
+                return match scope {
+                    AttrScope::Span => Ok(Arms::attribute(ATTRS, key)),
+                    AttrScope::Instrumentation => Ok(Arms::attribute(SCOPE_ATTRS, key)),
+                    // The writer keeps a non-empty string on the span row
+                    // only, so the string arm is read there; every other
+                    // arm from the resource row.
+                    AttrScope::Resource if key == SERVICE_NAME => {
+                        let q = self.resource_read(key)?;
+                        Ok(Arms {
+                            s: Some(format!("if({SERVICE_IS_STRING}, service, NULL)")),
+                            s_on_span_row: true,
+                            ..Arms::resource(var, &q)
+                        })
+                    }
+                    AttrScope::Resource => {
+                        let q = self.resource_read(key)?;
+                        Ok(Arms::resource(var, &q))
+                    }
+                    AttrScope::Event | AttrScope::Link | AttrScope::Unscoped => {
+                        Err(unsupported_operand(format!("a \"{scope}\" operand")))
+                    }
+                };
+            }
+            Field::Intrinsic(intrinsic) => *intrinsic,
+        };
+        let string = |expr: String| Arms {
+            s: Some(expr),
+            ..Arms::default()
+        };
+        let hex = |column: IdColumn| string(format!("lower(hex({}))", column.name));
+        match intrinsic {
+            Intrinsic::Name => Ok(string("name".to_string())),
+            Intrinsic::StatusMessage => Ok(string("status_message".to_string())),
+            Intrinsic::SpanId => Ok(hex(IdColumn::SPAN_ID)),
+            Intrinsic::ParentId => Ok(hex(IdColumn::PARENT_SPAN_ID)),
+            Intrinsic::TraceId => Ok(hex(IdColumn::TRACE_ID)),
+            Intrinsic::InstrumentationName => Ok(string("scope_name".to_string())),
+            Intrinsic::InstrumentationVersion => Ok(string("scope_version".to_string())),
+            Intrinsic::Duration => Ok(Arms {
+                i: Some("duration_ns".to_string()),
+                ..Arms::default()
+            }),
+            Intrinsic::Status => Ok(Arms {
+                st: Some("status_code".to_string()),
+                ..Arms::default()
+            }),
+            Intrinsic::Kind => Ok(Arms {
+                kd: Some("kind".to_string()),
+                ..Arms::default()
+            }),
+            Intrinsic::EventName
+            | Intrinsic::EventTimeSinceStart
+            | Intrinsic::LinkSpanId
+            | Intrinsic::LinkTraceId => Err(unsupported_operand(intrinsic.to_string())),
+            Intrinsic::NestedSetParent
+            | Intrinsic::NestedSetLeft
+            | Intrinsic::NestedSetRight
+            | Intrinsic::ChildCount
+            | Intrinsic::TraceDuration
+            | Intrinsic::RootName
+            | Intrinsic::RootServiceName => Err(unsupported_intrinsic(intrinsic, NESTED_AND_TRACE)),
+        }
+    }
 }
+
+/// The scopes of the unscoped chain, in the order a span's one value is
+/// taken from (`docs/api.md`, the unscoped attribute).
+const CHAIN: [AttrScope; 5] = [
+    AttrScope::Span,
+    AttrScope::Resource,
+    AttrScope::Event,
+    AttrScope::Link,
+    AttrScope::Instrumentation,
+];
 
 /// `!<root>.<key>`'s two halves: what matches `want` (`false` with none),
 /// and the demand condition, a present non-boolean.
@@ -590,6 +876,20 @@ fn not_attr(root: &str, key: &str, want: Option<bool>) -> (String, String) {
             |w| format!("coalesce({path}.:Bool = {w}, false)"),
         ),
         format!("dynamicType({path}) != 'None' AND dynamicType({path}) != 'Bool'"),
+    )
+}
+
+/// `!event.key` / `!link.key`'s two halves, each any-match over the
+/// elements: some element IS `want`, and some element holds a
+/// non-boolean.
+fn not_element(root: &str, key: &str, want: Option<bool>) -> (String, String) {
+    let path = attr_path(root, key);
+    (
+        want.map_or_else(
+            || "false".to_string(),
+            |w| format!("arrayExists(b -> coalesce(b = {w}, false), {path}.:Bool)"),
+        ),
+        format!("arrayExists(d -> dynamicType(d) != 'None' AND dynamicType(d) != 'Bool', {path})"),
     )
 }
 
@@ -628,7 +928,8 @@ fn service_name_leaf(op: ComparisonOp, value: &Value) -> Result<String, PlanErro
 // the attribute path
 // ---------------------------------------------------------------------
 
-/// `<root>.` — `attrs.` or `scope_attrs.` — then the stored JSON path,
+/// `<root>.` — `attrs.`, `scope_attrs.`, `events.attrs.` or
+/// `links.attrs.` — then the stored JSON path,
 /// backtick-quoted. Two escapes, in this order, and neither is optional.
 ///
 /// 1. [`escape_json_path`] — `%` to `%25`, then `.` to `%2E`. It is the
@@ -642,6 +943,399 @@ fn service_name_leaf(op: ComparisonOp, value: &Value) -> Result<String, PlanErro
 ///    measurement.
 fn attr_path(root: &str, key: &str) -> String {
     format!("{root}.{}", escape::ch_ident(&escape_json_path(key)))
+}
+
+/// Any element holds the key. Absence is `NOT` outside, so a span carrying
+/// no elements lacks it.
+fn element_exists(root: &str, key: &str, negated: bool) -> String {
+    let present = format!(
+        "arrayExists(d -> dynamicType(d) != 'None', {})",
+        attr_path(root, key)
+    );
+    if negated {
+        format!("NOT {present}")
+    } else {
+        present
+    }
+}
+
+/// One typed read of an attribute value: on a span row, the typed
+/// subcolumn; in an element condition, the lambda variable bound to that
+/// subcolumn's array.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Read {
+    Str,
+    Int,
+    Float,
+    Bool,
+    StrArray,
+    IntArray,
+    FloatArray,
+    BoolArray,
+}
+
+impl Read {
+    fn suffix(self) -> &'static str {
+        match self {
+            Read::Str => ".:String",
+            Read::Int => ".:Int64",
+            Read::Float => ".:Float64",
+            Read::Bool => ".:Bool",
+            Read::StrArray => ".:`Array(Nullable(String))`",
+            Read::IntArray => ".:`Array(Nullable(Int64))`",
+            Read::FloatArray => ".:`Array(Nullable(Float64))`",
+            Read::BoolArray => ".:`Array(Nullable(Bool))`",
+        }
+    }
+
+    /// The type name a `Dynamic` value of this read is stored as, which is
+    /// what `dynamicType` answers and `dynamicElement` takes.
+    fn type_name(self) -> &'static str {
+        match self {
+            Read::Str => "String",
+            Read::Int => "Int64",
+            Read::Float => "Float64",
+            Read::Bool => "Bool",
+            Read::StrArray => "Array(Nullable(String))",
+            Read::IntArray => "Array(Nullable(Int64))",
+            Read::FloatArray => "Array(Nullable(Float64))",
+            Read::BoolArray => "Array(Nullable(Bool))",
+        }
+    }
+
+    fn var(self) -> &'static str {
+        match self {
+            Read::Str => "s",
+            Read::Int => "i",
+            Read::Float => "f",
+            Read::Bool => "b",
+            Read::StrArray => "sa",
+            Read::IntArray => "ia",
+            Read::FloatArray => "fa",
+            Read::BoolArray => "ba",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// field against field
+// ---------------------------------------------------------------------
+
+/// The classes a field-against-field operand can hold. `Status` and
+/// `Kind` are their own classes, so against an attribute or any other
+/// field they share no term.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Class {
+    Str,
+    Int,
+    Float,
+    Bool,
+    Status,
+    Kind,
+}
+
+impl Class {
+    /// The typed read of a scalar of this class, if an attribute can hold
+    /// one.
+    fn scalar_read(self) -> Option<Read> {
+        match self {
+            Class::Str => Some(Read::Str),
+            Class::Int => Some(Read::Int),
+            Class::Float => Some(Read::Float),
+            Class::Bool => Some(Read::Bool),
+            Class::Status | Class::Kind => None,
+        }
+    }
+
+    /// The typed read of an array whose elements are this class, if an
+    /// attribute can hold one.
+    fn array_read(self) -> Option<Read> {
+        match self {
+            Class::Str => Some(Read::StrArray),
+            Class::Int => Some(Read::IntArray),
+            Class::Float => Some(Read::FloatArray),
+            Class::Bool => Some(Read::BoolArray),
+            Class::Status | Class::Kind => None,
+        }
+    }
+
+    /// Whether an ordered operator has a term for this class: a boolean, a
+    /// status and a kind are compared by `=` and `!=` only.
+    fn is_ordered(self) -> bool {
+        match self {
+            Class::Str | Class::Int | Class::Float => true,
+            Class::Bool | Class::Status | Class::Kind => false,
+        }
+    }
+}
+
+/// One field-against-field operand: one SQL expression per class it can
+/// hold, scalar and array, and whether any of them can be `NULL`.
+///
+/// A resource-row operand also carries `types`, the text of the set of
+/// types its key is stored as in the window (`tupleElement(Q(k), 3)`),
+/// which gates each arm, and `bind`, the lambda variable and the looked-up
+/// value it is bound to. `s_on_span_row` marks `resource.service.name`,
+/// whose string arm is read from the span row and so is not gated.
+#[derive(Debug, Default)]
+struct Arms {
+    s: Option<String>,
+    i: Option<String>,
+    f: Option<String>,
+    b: Option<String>,
+    st: Option<String>,
+    kd: Option<String>,
+    sa: Option<String>,
+    ia: Option<String>,
+    fa: Option<String>,
+    ba: Option<String>,
+    nullable: bool,
+    types: Option<String>,
+    s_on_span_row: bool,
+    bind: Option<(&'static str, String)>,
+}
+
+impl Arms {
+    /// An attribute at `root`: the literal path's typed reads, scalar and
+    /// array, every one `Nullable`.
+    fn attribute(root: &str, key: &str) -> Arms {
+        let path = attr_path(root, key);
+        let read = |r: Read| Some(format!("{path}{}", r.suffix()));
+        Arms {
+            s: read(Read::Str),
+            i: read(Read::Int),
+            f: read(Read::Float),
+            b: read(Read::Bool),
+            st: None,
+            kd: None,
+            sa: read(Read::StrArray),
+            ia: read(Read::IntArray),
+            fa: read(Read::FloatArray),
+            ba: read(Read::BoolArray),
+            nullable: true,
+            types: None,
+            s_on_span_row: false,
+            bind: None,
+        }
+    }
+
+    /// A resource attribute whose lookup is `q` (`Q(k)`): every class read
+    /// from the value bound to `var`, which is the value at the span's own
+    /// `resource_id` — `NULL` when the span's resource row is not among
+    /// `q`'s, so every arm is `NULL` then.
+    fn resource(var: &'static str, q: &str) -> Arms {
+        let read = |r: Read| Some(format!("dynamicElement({var}, '{}')", r.type_name()));
+        Arms {
+            s: read(Read::Str),
+            i: read(Read::Int),
+            f: read(Read::Float),
+            b: read(Read::Bool),
+            st: None,
+            kd: None,
+            sa: read(Read::StrArray),
+            ia: read(Read::IntArray),
+            fa: read(Read::FloatArray),
+            ba: read(Read::BoolArray),
+            nullable: true,
+            types: Some(format!("tupleElement({q}, 3)")),
+            s_on_span_row: false,
+            bind: Some((
+                var,
+                format!(
+                    "arrayElement(tupleElement({q}, 2), transform(resource_id, \
+                     tupleElement({q}, 1), arrayEnumerate(tupleElement({q}, 1)), 0))"
+                ),
+            )),
+        }
+    }
+
+    /// The gate of the scalar arm of `class`: whether any resource row
+    /// holds a value of that type. `None` when the arm needs none.
+    fn scalar_gate(&self, class: Class) -> Option<String> {
+        if class == Class::Str && self.s_on_span_row {
+            return None;
+        }
+        self.gate(class.scalar_read()?)
+    }
+
+    /// The gate of the array arm whose elements are `class`.
+    fn array_gate(&self, class: Class) -> Option<String> {
+        self.gate(class.array_read()?)
+    }
+
+    fn gate(&self, read: Read) -> Option<String> {
+        let types = self.types.as_deref()?;
+        Some(format!("has({types}, '{}')", read.type_name()))
+    }
+
+    fn scalar(&self, class: Class) -> Option<&str> {
+        match class {
+            Class::Str => self.s.as_deref(),
+            Class::Int => self.i.as_deref(),
+            Class::Float => self.f.as_deref(),
+            Class::Bool => self.b.as_deref(),
+            Class::Status => self.st.as_deref(),
+            Class::Kind => self.kd.as_deref(),
+        }
+    }
+
+    fn array(&self, element: Class) -> Option<&str> {
+        match element {
+            Class::Str => self.sa.as_deref(),
+            Class::Int => self.ia.as_deref(),
+            Class::Float => self.fa.as_deref(),
+            Class::Bool => self.ba.as_deref(),
+            Class::Status | Class::Kind => None,
+        }
+    }
+}
+
+/// The scalar pairs, in the order their terms are emitted.
+const SCALAR_PAIRS: [(Class, Class); 8] = [
+    (Class::Str, Class::Str),
+    (Class::Int, Class::Int),
+    (Class::Int, Class::Float),
+    (Class::Float, Class::Int),
+    (Class::Float, Class::Float),
+    (Class::Bool, Class::Bool),
+    (Class::Status, Class::Status),
+    (Class::Kind, Class::Kind),
+];
+
+/// The `(scalar class, element class)` pairs of a scalar against an
+/// array, in the order their terms are emitted.
+const ARRAY_PAIRS: [(Class, Class); 6] = [
+    (Class::Str, Class::Str),
+    (Class::Int, Class::Int),
+    (Class::Int, Class::Float),
+    (Class::Float, Class::Int),
+    (Class::Float, Class::Float),
+    (Class::Bool, Class::Bool),
+];
+
+/// The integer against a float, and the only place that choice lives: the
+/// integer side of every `Int`/`Float` pair, scalar and array, is rendered
+/// here.
+///
+/// **Exact, by decision.** ClickHouse compares `Int64` with `Float64`
+/// exactly, so `9007199254740993 > 9007199254740992.0` is true here. The
+/// reference converts both sides to `float64` first, where the two are
+/// equal; the other choice would be `toFloat64(e)`. Rounding is not a rule
+/// a user can rely on, so this differs from the reference deliberately
+/// (`docs/benchmarks/traces-differential-ledger.md`,
+/// `traceql-field-compare-type-gate`). An integer pair never passes
+/// through here.
+fn mixed_int(expr: &str) -> String {
+    expr.to_string()
+}
+
+/// One side of a pair: the integer side of a mixed pair through
+/// [`mixed_int`], anything else as it is.
+fn pair_side(class: Class, other: Class, expr: &str) -> String {
+    if class == Class::Int && other == Class::Float {
+        mixed_int(expr)
+    } else {
+        expr.to_string()
+    }
+}
+
+/// A scalar against each element `x` of `array`, `l` and `r` in the
+/// written order. Any element matches, except `!=`, where every element
+/// must differ and the array must not be empty: a typed array subcolumn is
+/// `[]` on every row whose value is not that array, and `arrayAll` over
+/// `[]` is true.
+fn array_term(op: ComparisonOp, sym: &str, l: &str, r: &str, array: &str) -> String {
+    if op == ComparisonOp::Neq {
+        format!("(notEmpty({array}) AND arrayAll(x -> coalesce({l} != {r}, false), {array}))")
+    } else {
+        format!("arrayExists(x -> coalesce({l} {sym} {r}, false), {array})")
+    }
+}
+
+/// `term` under the gates present, left first.
+fn gated(term: String, left: Option<String>, right: Option<String>) -> String {
+    match (left, right) {
+        (None, None) => term,
+        (Some(g), None) | (None, Some(g)) => format!("if({g}, {term}, false)"),
+        (Some(gl), Some(gr)) => format!("if({gl} AND {gr}, {term}, false)"),
+    }
+}
+
+/// `L op R` over two operands' arms: one term per pair of classes both
+/// sides carry, ORed, and `false` when there is none.
+///
+/// **Each type pair is its own term.** The engine's direct form, one
+/// comparison of the two `Dynamic` values, fails the statement with
+/// `NO_COMMON_TYPE` on a span holding a string against an integer. A pair
+/// of different types has no term and so matches nothing, under every
+/// operator — `!=` included, which is why `!=` is per term and never
+/// `NOT (… = …)`. Two arrays have no term either: the reference fails the
+/// query there, and one span holding two arrays would empty every result.
+///
+/// A scalar term is coalesced unless both operands are non-nullable,
+/// which is the module's rule that no intrinsic read is coalesced.
+///
+/// A term with an arm read from the resource row is gated on that key's
+/// type set, `if(<gate_L> AND <gate_R>, <term>, false)`. The gate never
+/// changes an answer — it is false only when no resource row holds that
+/// type, where the term is false anyway — but it is a constant, so the
+/// engine folds every term no resource row can satisfy.
+fn field_terms(l: &Arms, op: ComparisonOp, r: &Arms) -> String {
+    let sym = sql_op(op).expect("the caller has already excluded the regex operators");
+    let ordered = !matches!(op, ComparisonOp::Eq | ComparisonOp::Neq);
+    let coalesced = l.nullable || r.nullable;
+    let mut terms = Vec::new();
+    for (lc, rc) in SCALAR_PAIRS {
+        if ordered && !lc.is_ordered() {
+            continue;
+        }
+        let (Some(a), Some(b)) = (l.scalar(lc), r.scalar(rc)) else {
+            continue;
+        };
+        let c = format!("{} {sym} {}", pair_side(lc, rc, a), pair_side(rc, lc, b));
+        let term = if coalesced {
+            format!("coalesce({c}, false)")
+        } else {
+            c
+        };
+        terms.push(gated(term, l.scalar_gate(lc), r.scalar_gate(rc)));
+    }
+    // The array on the right, then the array on the left.
+    for (c, e) in ARRAY_PAIRS {
+        if ordered && !c.is_ordered() {
+            continue;
+        }
+        if let (Some(scalar), Some(array)) = (l.scalar(c), r.array(e)) {
+            let term = array_term(
+                op,
+                sym,
+                &pair_side(c, e, scalar),
+                &pair_side(e, c, "x"),
+                array,
+            );
+            terms.push(gated(term, l.scalar_gate(c), r.array_gate(e)));
+        }
+    }
+    for (c, e) in ARRAY_PAIRS {
+        if ordered && !c.is_ordered() {
+            continue;
+        }
+        if let (Some(array), Some(scalar)) = (l.array(e), r.scalar(c)) {
+            let term = array_term(
+                op,
+                sym,
+                &pair_side(e, c, "x"),
+                &pair_side(c, e, scalar),
+                array,
+            );
+            terms.push(gated(term, l.array_gate(e), r.scalar_gate(c)));
+        }
+    }
+    if terms.is_empty() {
+        "false".to_string()
+    } else {
+        format!("({})", terms.join(" OR "))
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -658,12 +1352,9 @@ fn attr_path(root: &str, key: &str) -> String {
 /// `=~`, `!~` and the four ordered operators read `:String` only: the
 /// design names `= "v"` and nothing else, and an ordered comparison
 /// against array elements has no stated meaning.
-fn string_eq(path: &str, literal: &str) -> String {
+fn string_eq(string: &str, string_array: &str, literal: &str) -> String {
     let lit = escape::ch_string(literal);
-    format!(
-        "(coalesce({path}.:String = {lit}, false) OR \
-         has({path}.:`Array(Nullable(String))`, {lit}))"
-    )
+    format!("(coalesce({string} = {lit}, false) OR has({string_array}, {lit}))")
 }
 
 /// The numeric pair, `Int64` before `Float64` in both directions.
@@ -672,12 +1363,9 @@ fn string_eq(path: &str, literal: &str) -> String {
 /// on all 48 of its coalesced numeric lines; the measurement script
 /// disagrees with itself about it, so the catalogue is the authority and
 /// the order is fixed once here.
-fn numeric_pair(path: &str, op: ComparisonOp, number: &str) -> String {
+fn numeric_pair(int: &str, float: &str, op: ComparisonOp, number: &str) -> String {
     let sym = sql_op(op).expect("the caller has already excluded the regex operators");
-    format!(
-        "(coalesce({path}.:Int64 {sym} {number}, false) OR \
-         coalesce({path}.:Float64 {sym} {number}, false))"
-    )
+    format!("(coalesce({int} {sym} {number}, false) OR coalesce({float} {sym} {number}, false))")
 }
 
 /// `N` — the numeric literal's SQL text. **Integer first**: `parse_num` /
@@ -724,16 +1412,71 @@ fn attr_leaf_parts(
     value: &Value,
 ) -> Result<(bool, String), PlanError> {
     let path = attr_path(root, key);
+    leaf_parts(&mut |r| format!("{path}{}", r.suffix()), key, op, value)
+}
+
+/// `event.k` / `link.k`: any element passes the positive rendering, with
+/// each typed read a lambda variable over that read's array. A negation
+/// is `NOT` outside `arrayExists`.
+fn element_leaf(
+    root: &str,
+    key: &str,
+    op: ComparisonOp,
+    value: &Value,
+) -> Result<String, PlanError> {
+    let mut used: Vec<Read> = Vec::new();
+    let (negated, body) = {
+        let mut reader = |r: Read| {
+            if !used.contains(&r) {
+                used.push(r);
+            }
+            r.var().to_string()
+        };
+        leaf_parts(&mut reader, key, op, value)?
+    };
+    let path = attr_path(root, key);
+    let vars: Vec<&str> = used.iter().map(|r| r.var()).collect();
+    let args = if vars.len() > 1 {
+        format!("({})", vars.join(", "))
+    } else {
+        vars.concat()
+    };
+    let arrays: Vec<String> = used
+        .iter()
+        .map(|r| format!("{path}{}", r.suffix()))
+        .collect();
+    let positive = format!("arrayExists({args} -> {body}, {})", arrays.join(", "));
+    Ok(if negated {
+        format!("NOT {positive}")
+    } else {
+        positive
+    })
+}
+
+/// The one attribute-comparison rule, over a reader that renders each
+/// typed read: a span-row path for [`attr_leaf_parts`], a lambda variable
+/// for [`element_leaf`]. `key` names the attribute in the refusal.
+fn leaf_parts(
+    read: &mut dyn FnMut(Read) -> String,
+    key: &str,
+    op: ComparisonOp,
+    value: &Value,
+) -> Result<(bool, String), PlanError> {
     let rendered = match (op, value) {
-        (ComparisonOp::Eq, Value::String(s)) => (false, string_eq(&path, s)),
-        (ComparisonOp::Neq, Value::String(s)) => (true, string_eq(&path, s)),
+        (ComparisonOp::Eq, Value::String(s)) => {
+            (false, string_eq(&read(Read::Str), &read(Read::StrArray), s))
+        }
+        (ComparisonOp::Neq, Value::String(s)) => {
+            (true, string_eq(&read(Read::Str), &read(Read::StrArray), s))
+        }
         (
             ComparisonOp::Gt | ComparisonOp::Gte | ComparisonOp::Lt | ComparisonOp::Lte,
             Value::String(s),
         ) => (
             false,
             format!(
-                "coalesce({path}.:String {} {}, false)",
+                "coalesce({} {} {}, false)",
+                read(Read::Str),
                 sql_op(op).expect("an ordered operator"),
                 escape::ch_string(s)
             ),
@@ -741,37 +1484,63 @@ fn attr_leaf_parts(
         (ComparisonOp::Re, Value::String(s)) => (
             false,
             format!(
-                "coalesce(match({path}.:String, {}), false)",
+                "coalesce(match({}, {}), false)",
+                read(Read::Str),
                 anchored_regex_sql(s)?
             ),
         ),
         (ComparisonOp::Nre, Value::String(s)) => (
             true,
             format!(
-                "coalesce(match({path}.:String, {}), false)",
+                "coalesce(match({}, {}), false)",
+                read(Read::Str),
                 anchored_regex_sql(s)?
             ),
         ),
         (ComparisonOp::Neq, Value::Number(raw)) => (
             true,
-            numeric_pair(&path, ComparisonOp::Eq, &render_number(raw)?),
+            numeric_pair(
+                &read(Read::Int),
+                &read(Read::Float),
+                ComparisonOp::Eq,
+                &render_number(raw)?,
+            ),
         ),
-        (op, Value::Number(raw)) if sql_op(op).is_some() => {
-            (false, numeric_pair(&path, op, &render_number(raw)?))
-        }
+        (op, Value::Number(raw)) if sql_op(op).is_some() => (
+            false,
+            numeric_pair(
+                &read(Read::Int),
+                &read(Read::Float),
+                op,
+                &render_number(raw)?,
+            ),
+        ),
         (ComparisonOp::Neq, Value::Duration(d)) => (
             true,
-            numeric_pair(&path, ComparisonOp::Eq, &duration_nanos(*d)?),
+            numeric_pair(
+                &read(Read::Int),
+                &read(Read::Float),
+                ComparisonOp::Eq,
+                &duration_nanos(*d)?,
+            ),
         ),
-        (op, Value::Duration(d)) if sql_op(op).is_some() => {
-            (false, numeric_pair(&path, op, &duration_nanos(*d)?))
-        }
-        (ComparisonOp::Eq, Value::Bool(b)) => {
-            (false, format!("coalesce({path}.:Bool = {b}, false)"))
-        }
-        (ComparisonOp::Neq, Value::Bool(b)) => {
-            (true, format!("(coalesce({path}.:Bool = {b}, false))"))
-        }
+        (op, Value::Duration(d)) if sql_op(op).is_some() => (
+            false,
+            numeric_pair(
+                &read(Read::Int),
+                &read(Read::Float),
+                op,
+                &duration_nanos(*d)?,
+            ),
+        ),
+        (ComparisonOp::Eq, Value::Bool(b)) => (
+            false,
+            format!("coalesce({} = {b}, false)", read(Read::Bool)),
+        ),
+        (ComparisonOp::Neq, Value::Bool(b)) => (
+            true,
+            format!("(coalesce({} = {b}, false))", read(Read::Bool)),
+        ),
         // The message `filter.rs` produces for the same pair, so
         // `{ span.k = error }` is the same `400` on both compilers.
         _ => {
@@ -809,10 +1578,10 @@ fn intrinsic_leaf(
         Intrinsic::InstrumentationVersion => {
             untyped_string_leaf(&intrinsic.to_string(), "scope_version", op, value)
         }
-        Intrinsic::EventName
-        | Intrinsic::EventTimeSinceStart
-        | Intrinsic::LinkSpanId
-        | Intrinsic::LinkTraceId => Err(unsupported_intrinsic(intrinsic, PART_2)),
+        Intrinsic::EventName => event_name_leaf(op, value),
+        Intrinsic::EventTimeSinceStart => time_since_start_leaf(op, value),
+        Intrinsic::LinkSpanId => link_id_leaf(intrinsic, "links.span_id", op, value),
+        Intrinsic::LinkTraceId => link_id_leaf(intrinsic, "links.trace_id", op, value),
         Intrinsic::NestedSetParent
         | Intrinsic::NestedSetLeft
         | Intrinsic::NestedSetRight
@@ -1053,4 +1822,98 @@ fn id_leaf(
             escape::ch_string(&literal)
         ),
     })
+}
+
+// ---------------------------------------------------------------------
+// the four event and link intrinsics
+// ---------------------------------------------------------------------
+
+/// `!=` to `=` and `!~` to `=~`, with whether it was negated; the other
+/// operators unchanged.
+fn positive_op(op: ComparisonOp) -> (bool, ComparisonOp) {
+    match op {
+        ComparisonOp::Neq => (true, ComparisonOp::Eq),
+        ComparisonOp::Nre => (true, ComparisonOp::Re),
+        ComparisonOp::Eq
+        | ComparisonOp::Gt
+        | ComparisonOp::Gte
+        | ComparisonOp::Lt
+        | ComparisonOp::Lte
+        | ComparisonOp::Re => (false, op),
+    }
+}
+
+/// Any element of `array`, bound to `var`, passes `body`; `NOT` outside
+/// when negated.
+fn any_element(var: &str, array: &str, negated: bool, body: &str) -> String {
+    let positive = format!("arrayExists({var} -> {body}, {array})");
+    if negated {
+        format!("NOT {positive}")
+    } else {
+        positive
+    }
+}
+
+/// `event:name`: `name`'s rule over each event's name.
+fn event_name_leaf(op: ComparisonOp, value: &Value) -> Result<String, PlanError> {
+    let (negated, pos) = positive_op(op);
+    let body = string_column_leaf(Intrinsic::EventName, "n", pos, value)?;
+    Ok(any_element("n", "events.name", negated, &body))
+}
+
+/// `event:timeSinceStart`: each event's time less the span's start, in
+/// nanoseconds. `time_ns` is `UInt64` and `start_ns` `Int64`, so the
+/// difference is taken as `Int128`: exact for every stored pair, and
+/// negative for an event before its span. A bare number is nanoseconds.
+/// The operand is checked before the operator, as `duration`'s is.
+fn time_since_start_leaf(op: ComparisonOp, value: &Value) -> Result<String, PlanError> {
+    let nanos = match value {
+        Value::Duration(d) => duration_nanos(*d)?,
+        Value::Number(raw) => render_number(raw)?,
+        _ => {
+            return Err(PlanError::TypeMismatch(
+                "event:timeSinceStart requires a duration or a number".to_string(),
+            ));
+        }
+    };
+    let (negated, pos) = positive_op(op);
+    let Some(sym) = sql_op(pos) else {
+        return Err(PlanError::TypeMismatch(
+            "event:timeSinceStart does not support regex operators".to_string(),
+        ));
+    };
+    Ok(any_element(
+        "t",
+        "events.time_ns",
+        negated,
+        &format!("toInt128(t) - start_ns {sym} {nanos}"),
+    ))
+}
+
+/// `link:spanID` / `link:traceID`: each link's id as lowercase hex. The
+/// literal is lowercased for `=`/`!=` only, as [`id_leaf`]'s is. A link id
+/// is a `String` of any length with no index, so there is no raw-byte
+/// fast path and no width to guard.
+fn link_id_leaf(
+    intrinsic: Intrinsic,
+    array: &str,
+    op: ComparisonOp,
+    value: &Value,
+) -> Result<String, PlanError> {
+    let Value::String(raw) = value else {
+        return Err(PlanError::TypeMismatch(format!(
+            "{intrinsic} requires a string value"
+        )));
+    };
+    let (negated, pos) = positive_op(op);
+    let body = match pos {
+        ComparisonOp::Re => format!("match(lower(hex(h)), {})", anchored_regex_sql(raw)?),
+        ComparisonOp::Eq => format!("lower(hex(h)) = {}", escape::ch_string(&raw.to_lowercase())),
+        other => format!(
+            "lower(hex(h)) {} {}",
+            sql_op(other).expect("the four ordered operators"),
+            escape::ch_string(raw)
+        ),
+    };
+    Ok(any_element("h", array, negated, &body))
 }

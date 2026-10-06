@@ -273,7 +273,8 @@ use pulsus_read::traces::spans::predicate::{
 };
 use pulsus_read::traces::window_sql::WindowSql;
 use pulsus_traceql::{
-    AttrScope, ComparisonOp, Field, FieldExpr, Intrinsic, SpansetExpr, SpansetFilter, Value,
+    AttrScope, ComparisonOp, Field, FieldExpr, FieldOp, Intrinsic, SpansetExpr, SpansetFilter,
+    Value,
 };
 
 /// The `T-B1` window: `[start, end)` one nanosecond wide, so all three
@@ -546,9 +547,9 @@ fn t_c4_the_membership_statement_is_frozen_whole() {
 // T-C5 — every out-of-scope construct refuses, naming itself
 // ---------------------------------------------------------------------
 
-/// The intrinsics part 1 serves. Every other `Intrinsic` variant is
-/// #589's or later and must REFUSE rather than compile something wrong.
-const IN_SCOPE_INTRINSICS: [Intrinsic; 10] = [
+/// The intrinsics this compiler serves. Every other `Intrinsic` variant is
+/// #594's and must REFUSE rather than compile something wrong.
+const IN_SCOPE_INTRINSICS: [Intrinsic; 14] = [
     Intrinsic::Name,
     Intrinsic::Duration,
     Intrinsic::Status,
@@ -559,11 +560,15 @@ const IN_SCOPE_INTRINSICS: [Intrinsic; 10] = [
     Intrinsic::TraceId,
     Intrinsic::InstrumentationName,
     Intrinsic::InstrumentationVersion,
+    Intrinsic::EventName,
+    Intrinsic::EventTimeSinceStart,
+    Intrinsic::LinkSpanId,
+    Intrinsic::LinkTraceId,
 ];
 
 /// The issue each out-of-scope intrinsic is refused with, and `None` for
-/// the ten this compiler serves. **No wildcard arm**: a new `Intrinsic`
-/// variant fails to compile here until it is classified.
+/// the fourteen this compiler serves. **No wildcard arm**: a new
+/// `Intrinsic` variant fails to compile here until it is classified.
 fn intrinsic_target(intrinsic: Intrinsic) -> Option<&'static str> {
     match intrinsic {
         Intrinsic::Name
@@ -575,11 +580,11 @@ fn intrinsic_target(intrinsic: Intrinsic) -> Option<&'static str> {
         | Intrinsic::ParentId
         | Intrinsic::TraceId
         | Intrinsic::InstrumentationName
-        | Intrinsic::InstrumentationVersion => None,
-        Intrinsic::EventName
+        | Intrinsic::InstrumentationVersion
+        | Intrinsic::EventName
         | Intrinsic::EventTimeSinceStart
         | Intrinsic::LinkSpanId
-        | Intrinsic::LinkTraceId => Some("#589 part 2"),
+        | Intrinsic::LinkTraceId => None,
         Intrinsic::NestedSetParent
         | Intrinsic::NestedSetLeft
         | Intrinsic::NestedSetRight
@@ -592,6 +597,10 @@ fn intrinsic_target(intrinsic: Intrinsic) -> Option<&'static str> {
 
 /// Section 2's refusal: a `resource.` field compiled with no context.
 const RESOURCE_NEEDS_WINDOW: &str = "the \"resource.\" attribute scope needs the request window: \
+                                     compile it with compile_span_predicate_in (issue #589)";
+
+/// Part 2 section 5.1's refusal: a `.` field compiled with no context.
+const UNSCOPED_NEEDS_WINDOW: &str = "the \".\" attribute scope needs the request window: \
                                      compile it with compile_span_predicate_in (issue #589)";
 
 /// `T-C5`: driven from `Intrinsic::ALL` and `AttrScope::ALL`, which the
@@ -635,7 +644,7 @@ fn t_c5_every_out_of_scope_field_refuses_and_names_itself() {
         assert_eq!(intrinsic_target(intrinsic), None, "{intrinsic}");
     }
 
-    let mut refused_scopes = 0usize;
+    let mut visited_scopes = 0usize;
     for scope in AttrScope::ALL.iter().copied() {
         let got = compile_span_leaf(
             &Field::Attribute {
@@ -645,8 +654,9 @@ fn t_c5_every_out_of_scope_field_refuses_and_names_itself() {
             ComparisonOp::Eq,
             &Value::String("x".to_string()),
         );
+        visited_scopes += 1;
         match scope {
-            AttrScope::Span | AttrScope::Instrumentation => {
+            AttrScope::Span | AttrScope::Instrumentation | AttrScope::Event | AttrScope::Link => {
                 assert!(got.is_ok(), "{scope} compiles with no context: {got:?}");
             }
             AttrScope::Resource => {
@@ -658,35 +668,48 @@ fn t_c5_every_out_of_scope_field_refuses_and_names_itself() {
                     "resource. with no context"
                 );
             }
-            AttrScope::Unscoped | AttrScope::Event | AttrScope::Link => {
-                refused_scopes += 1;
-                match got {
-                    Err(PlanError::UnsupportedField(msg)) => assert!(
-                        msg.contains(&format!("\"{scope}\""))
-                            && msg.ends_with("(issue #589 part 2)"),
-                        "{scope}: the refusal must name the scope and `(issue #589 part 2)`, \
-                         got {msg:?}"
-                    ),
-                    other => panic!("the {scope} scope must be UnsupportedField, got {other:?}"),
-                }
+            AttrScope::Unscoped => {
+                assert_eq!(
+                    got.map(|p| p.sql().to_string()),
+                    Err(PlanError::UnsupportedField(
+                        UNSCOPED_NEEDS_WINDOW.to_string()
+                    )),
+                    ". with no context"
+                );
             }
         }
     }
-    assert_eq!(refused_scopes + 3, AttrScope::ALL.len());
+    assert_eq!(visited_scopes, AttrScope::ALL.len());
 
-    // The expression-level constructs section 7 defers to part 3, each
-    // naming itself.
-    for (query, token) in [
-        (r#"{ span.a + 1 = 2 }"#, "arithmetic"),
-        (r#"{ span.a = span.b }"#, "field-against-field"),
-        (r#"{ 1 = 1 }"#, "two literals"),
-        (r#"{ (span.a = 1) = true }"#, "boolean-valued"),
-        (r#"{ !span.a = span.b }"#, "boolean-valued"),
+    // The expression-level constructs deferred to parts 3c and 3d, each
+    // naming itself and its own part.
+    for (query, token, suffix) in [
+        (
+            r#"{ span.a + 1 = 2 }"#,
+            "arithmetic",
+            "(issue #589 part 3c)",
+        ),
+        (
+            r#"{ event.a = span.b }"#,
+            "field-against-field",
+            "(issue #589 part 3d)",
+        ),
+        (r#"{ 1 = 1 }"#, "two literals", "(issue #589 part 3c)"),
+        (
+            r#"{ (span.a = 1) = true }"#,
+            "boolean-valued",
+            "(issue #589 part 3c)",
+        ),
+        (
+            r#"{ !span.a = span.b }"#,
+            "boolean-valued",
+            "(issue #589 part 3c)",
+        ),
     ] {
         match refusal(query) {
             PlanError::UnsupportedField(msg) => assert!(
-                msg.contains(token) && msg.ends_with("(issue #589 part 3)"),
-                "{query}: the refusal must name {token:?} and `(issue #589 part 3)`, got {msg:?}"
+                msg.contains(token) && msg.ends_with(suffix),
+                "{query}: the refusal must name {token:?} and end `{suffix}`, got {msg:?}"
             ),
             other => panic!("{query} must be UnsupportedField, got {other:?}"),
         }
@@ -1344,4 +1367,1202 @@ fn t_c18_not_over_a_bare_field_demands_a_boolean() {
     for query in [r#"{ !resource.k }"#, r#"{ !resource.service.name }"#] {
         assert!(!rendered_in(query).contains("NOT IN ('None'"), "{query}");
     }
+}
+
+// =====================================================================
+// Issue #589 part 2 — event and link conditions, the four event and link
+// intrinsics, and the unscoped `.k` chain, text only
+// =====================================================================
+
+/// The five typed reads a span-row attribute text carries, each with the
+/// lambda variable an element condition binds it to (section 3.1).
+const READS: [(&str, &str); 5] = [
+    (".:String", "s"),
+    (".:Int64", "i"),
+    (".:Float64", "f"),
+    (".:Bool", "b"),
+    (".:`Array(Nullable(String))`", "sa"),
+];
+
+/// This test's own rewrite of the span leaf `span_text` (key `k`) into the
+/// element condition over `e` (`events` or `links`): strip a leading
+/// `NOT `, replace each ``attrs.`k`<suffix>`` with its variable, list the
+/// variables in first-use order, wrap in `arrayExists`, and put the `NOT`
+/// back OUTSIDE it.
+fn element_of(e: &str, span_text: &str) -> String {
+    let (negated, positive) = match span_text.strip_prefix("NOT ") {
+        Some(p) => (true, p),
+        None => (false, span_text),
+    };
+    let needle = "attrs.`k`";
+    let mut body = String::new();
+    let mut vars: Vec<(&str, &str)> = Vec::new();
+    let mut rest = positive;
+    while let Some(at) = rest.find(needle) {
+        body.push_str(&rest[..at]);
+        let after = &rest[at + needle.len()..];
+        let (suffix, var) = READS
+            .iter()
+            .copied()
+            .find(|(suffix, _)| after.starts_with(suffix))
+            .unwrap_or_else(|| panic!("an untyped read in {span_text}"));
+        body.push_str(var);
+        if !vars.iter().any(|(_, v)| *v == var) {
+            vars.push((suffix, var));
+        }
+        rest = &after[suffix.len()..];
+    }
+    body.push_str(rest);
+    assert!(!vars.is_empty(), "no attribute read in {span_text}");
+    let names: Vec<&str> = vars.iter().map(|(_, v)| *v).collect();
+    let args = if names.len() > 1 {
+        format!("({})", names.join(", "))
+    } else {
+        names[0].to_string()
+    };
+    let arrays: Vec<String> = vars
+        .iter()
+        .map(|(suffix, _)| format!("{e}.attrs.`k`{suffix}"))
+        .collect();
+    let inner = format!("arrayExists({args} -> {body}, {})", arrays.join(", "));
+    if negated {
+        format!("NOT {inner}")
+    } else {
+        inner
+    }
+}
+
+// ---------------------------------------------------------------------
+// T-C20 — the element cross product
+// ---------------------------------------------------------------------
+
+/// `T-C20`: where `span.k` renders `L`, `event.k` and `link.k` render the
+/// test's own rewrite of `L` ([`element_of`]); where `span.k` is refused,
+/// they are refused with the same error. The negation is OUTSIDE
+/// `arrayExists`, never inside the lambda.
+#[test]
+fn t_c20_an_event_or_link_leaf_is_any_match_over_the_typed_array() {
+    let mut seen = 0usize;
+    for (scope, e) in [(AttrScope::Event, "events"), (AttrScope::Link, "links")] {
+        for c in cross_cells() {
+            let (span, element) = cell(scope, c.as_ref().map(|(op, v)| (*op, v)), false);
+            seen += 1;
+            assert_eq!(element, span.map(|l| element_of(e, &l)), "{scope} {c:?}");
+        }
+    }
+    assert_eq!(seen, 2 * (ALL_OPS.len() * 4 + 1));
+
+    // Section 3.2's four texts.
+    assert_eq!(
+        rendered(r#"{ event.k = "v" }"#),
+        "arrayExists((s, sa) -> (coalesce(s = 'v', false) OR has(sa, 'v')), \
+         events.attrs.`k`.:String, events.attrs.`k`.:`Array(Nullable(String))`)"
+    );
+    assert_eq!(
+        rendered(r#"{ event.k != 3 }"#),
+        "NOT arrayExists((i, f) -> (coalesce(i = 3, false) OR coalesce(f = 3, false)), \
+         events.attrs.`k`.:Int64, events.attrs.`k`.:Float64)"
+    );
+    assert_eq!(
+        rendered(r#"{ link.k =~ "v" }"#),
+        "arrayExists(s -> coalesce(match(s, '^(?:v)$'), false), links.attrs.`k`.:String)"
+    );
+    assert_eq!(
+        rendered(r#"{ event.k }"#),
+        "arrayExists(b -> coalesce(b = true, false), events.attrs.`k`.:Bool)"
+    );
+    // Section 3.3's two.
+    assert_eq!(
+        rendered(r#"{ event.k != nil }"#),
+        "arrayExists(d -> dynamicType(d) != 'None', events.attrs.`k`)"
+    );
+    assert_eq!(
+        rendered(r#"{ event.k = nil }"#),
+        "NOT arrayExists(d -> dynamicType(d) != 'None', events.attrs.`k`)"
+    );
+}
+
+// ---------------------------------------------------------------------
+// T-C21 — the unscoped chain, generated
+// ---------------------------------------------------------------------
+
+/// The chain's scopes, in its order (section 5.1).
+const CHAIN: [AttrScope; 5] = [
+    AttrScope::Span,
+    AttrScope::Resource,
+    AttrScope::Event,
+    AttrScope::Link,
+    AttrScope::Instrumentation,
+];
+
+/// What `field` compiles to in [`ctx`]: the cell's leaf, or `{ field }`.
+fn chain_cell_text(
+    field: Field,
+    cell: &Option<(ComparisonOp, Value)>,
+) -> Result<String, PlanError> {
+    match cell {
+        Some((op, v)) => compile_span_leaf_in(&field, *op, v, &ctx()),
+        None => compile_span_predicate_in(&FieldExpr::Field(field), &ctx()),
+    }
+    .map(|p| p.sql().to_string())
+}
+
+/// `{ <scope>key != nil }` in [`ctx`].
+fn presence_text(scope: AttrScope, key: &str) -> String {
+    compile_span_predicate_in(
+        &FieldExpr::Exists {
+            field: scoped(scope, key),
+            negated: false,
+        },
+        &ctx(),
+    )
+    .unwrap_or_else(|e| panic!("{scope}{key} != nil must compile: {e}"))
+    .sql()
+    .to_string()
+}
+
+/// Section 5.2's `P_resource` at `service.name`.
+fn service_present_resource() -> String {
+    format!(
+        "(service_type = 'string' OR {})",
+        r_of("dynamicType(attrs.`service%2Ename`) != 'None'")
+    )
+}
+
+/// The symbol of `pos(op)` (section 4): `!=` to `=`, the others unchanged.
+fn pos_symbol(op: ComparisonOp) -> &'static str {
+    match op {
+        ComparisonOp::Eq | ComparisonOp::Neq => "=",
+        ComparisonOp::Gt => ">",
+        ComparisonOp::Gte => ">=",
+        ComparisonOp::Lt => "<",
+        ComparisonOp::Lte => "<=",
+        ComparisonOp::Re | ComparisonOp::Nre => "=~",
+    }
+}
+
+/// Section 5.2's `X_resource` at `service.name`, built from `p` (the span
+/// leaf's positive text), `R` and `G`.
+fn service_x_resource(span_text: &str, cell: &Option<(ComparisonOp, Value)>) -> String {
+    let (negated, p) = match span_text.strip_prefix("NOT ") {
+        Some(p) => (true, p),
+        None => (false, span_text),
+    };
+    let r = r_of(p);
+    match cell {
+        Some((op, Value::String(s))) => {
+            let g = match op {
+                ComparisonOp::Re | ComparisonOp::Nre => {
+                    format!("match(service, '^(?:{s})$')")
+                }
+                other => format!("service {} '{s}'", pos_symbol(*other)),
+            };
+            let x = format!("((service_type = 'string' AND {g}) OR {r})");
+            if negated { format!("NOT {x}") } else { x }
+        }
+        _ => {
+            if negated {
+                format!("NOT ({r})")
+            } else {
+                r
+            }
+        }
+    }
+}
+
+/// `T-C21`: `.key <op> v` is section 5.1's `multiIf` over the five scopes'
+/// own compiled texts, in the chain's order, with `D` from `X_span`'s
+/// polarity; at `service.name` the resource branch is section 5.2's.
+#[test]
+fn t_c21_the_unscoped_chain_is_built_from_each_scopes_own_text() {
+    let mut seen = 0usize;
+    for key in ["k", "service.name"] {
+        for c in cross_cells() {
+            seen += 1;
+            let got = chain_cell_text(scoped(AttrScope::Unscoped, key), &c);
+            let x_span = chain_cell_text(scoped(AttrScope::Span, key), &c);
+            let want = x_span.map(|x_span| {
+                let mut args: Vec<String> = Vec::new();
+                for scope in CHAIN {
+                    let (p, x) = if scope == AttrScope::Resource && key == "service.name" {
+                        (service_present_resource(), service_x_resource(&x_span, &c))
+                    } else {
+                        let x = chain_cell_text(scoped(scope, key), &c).unwrap_or_else(|e| {
+                            panic!("{scope}{key} refuses where span.{key} compiles: {e}")
+                        });
+                        (presence_text(scope, key), x)
+                    };
+                    args.push(p);
+                    args.push(x);
+                }
+                let d = if x_span.starts_with("NOT ") {
+                    "true"
+                } else {
+                    "false"
+                };
+                format!("multiIf({}, {d})", args.join(", "))
+            });
+            assert_eq!(got, want, ".{key} {c:?}");
+        }
+    }
+    assert_eq!(seen, 2 * (ALL_OPS.len() * 4 + 1));
+
+    let d = t_b1_window().resources_day_clause();
+    // Section 5.3's text.
+    assert_eq!(
+        rendered_in(r#"{ .k != "v" }"#),
+        format!(
+            "multiIf(dynamicType(attrs.`k`) != 'None', NOT (coalesce(attrs.`k`.:String = 'v', false) \
+             OR has(attrs.`k`.:`Array(Nullable(String))`, 'v')), \
+             resource_id IN (SELECT resource_id FROM resources WHERE {d} AND \
+             (dynamicType(attrs.`k`) != 'None')), \
+             NOT (resource_id IN (SELECT resource_id FROM resources WHERE {d} AND \
+             ((coalesce(attrs.`k`.:String = 'v', false) OR \
+             has(attrs.`k`.:`Array(Nullable(String))`, 'v'))))), \
+             arrayExists(d -> dynamicType(d) != 'None', events.attrs.`k`), \
+             NOT arrayExists((s, sa) -> (coalesce(s = 'v', false) OR has(sa, 'v')), \
+             events.attrs.`k`.:String, events.attrs.`k`.:`Array(Nullable(String))`), \
+             arrayExists(d -> dynamicType(d) != 'None', links.attrs.`k`), \
+             NOT arrayExists((s, sa) -> (coalesce(s = 'v', false) OR has(sa, 'v')), \
+             links.attrs.`k`.:String, links.attrs.`k`.:`Array(Nullable(String))`), \
+             dynamicType(scope_attrs.`k`) != 'None', \
+             NOT (coalesce(scope_attrs.`k`.:String = 'v', false) OR \
+             has(scope_attrs.`k`.:`Array(Nullable(String))`, 'v')), \
+             true)"
+        )
+    );
+
+    // Section 5.2's resource branches and `P_resource`, byte for byte, each
+    // the second and first argument pair of its chain.
+    let svc_x = format!(
+        "((service_type = 'string' AND service = 'x') OR resource_id IN (SELECT resource_id FROM \
+         resources WHERE {d} AND ((coalesce(attrs.`service%2Ename`.:String = 'x', false) OR \
+         has(attrs.`service%2Ename`.:`Array(Nullable(String))`, 'x')))))"
+    );
+    let svc_n = format!(
+        "resource_id IN (SELECT resource_id FROM resources WHERE {d} AND \
+         ((coalesce(attrs.`service%2Ename`.:Int64 = 12345, false) OR \
+         coalesce(attrs.`service%2Ename`.:Float64 = 12345, false))))"
+    );
+    let svc_p = format!(
+        "(service_type = 'string' OR resource_id IN (SELECT resource_id FROM resources WHERE {d} \
+         AND (dynamicType(attrs.`service%2Ename`) != 'None')))"
+    );
+    for (query, x_resource) in [
+        (r#"{ .service.name = "x" }"#, &svc_x),
+        (r#"{ .service.name = 12345 }"#, &svc_n),
+    ] {
+        let got = rendered_in(query);
+        let span_pair = format!(
+            "multiIf({}, {}, ",
+            presence_text(AttrScope::Span, "service.name"),
+            chain_cell_text(
+                scoped(AttrScope::Span, "service.name"),
+                &match filter_body(query) {
+                    FieldExpr::Binary { rhs, .. } => match *rhs {
+                        FieldExpr::Literal(v) => Some((ComparisonOp::Eq, v)),
+                        other => panic!("{other}"),
+                    },
+                    other => panic!("{other}"),
+                }
+            )
+            .expect("span.service.name compiles")
+        );
+        let prefix = format!("{span_pair}{svc_p}, {x_resource}, ");
+        assert!(
+            got.starts_with(&prefix),
+            "{query}:\n{got}\nmust start\n{prefix}"
+        );
+    }
+
+    // Presence and absence: every scope's presence, ORed in the chain's
+    // order, never ANDed.
+    let presence = format!(
+        "(dynamicType(attrs.`k`) != 'None') OR ({}) OR \
+         (arrayExists(d -> dynamicType(d) != 'None', events.attrs.`k`)) OR \
+         (arrayExists(d -> dynamicType(d) != 'None', links.attrs.`k`)) OR \
+         (dynamicType(scope_attrs.`k`) != 'None')",
+        r_of("dynamicType(attrs.`k`) != 'None'")
+    );
+    assert_eq!(rendered_in(r#"{ .k != nil }"#), presence);
+    assert_eq!(rendered_in(r#"{ .k = nil }"#), format!("NOT ({presence})"));
+}
+
+// ---------------------------------------------------------------------
+// T-C22 — the four intrinsics
+// ---------------------------------------------------------------------
+
+/// `T-C22`: section 4's texts and refusals, byte for byte.
+#[test]
+fn t_c22_the_event_and_link_intrinsics_are_any_match_over_their_arrays() {
+    assert_eq!(
+        rendered(r#"{ event:name !~ "e.*" }"#),
+        "NOT arrayExists(n -> match(n, '^(?:e.*)$'), events.name)"
+    );
+    assert_eq!(
+        rendered(r#"{ event:timeSinceStart < 3ms }"#),
+        "arrayExists(t -> toInt128(t) - start_ns < 3000000, events.time_ns)"
+    );
+    assert_eq!(
+        rendered(r#"{ event:timeSinceStart != 2ms }"#),
+        "NOT arrayExists(t -> toInt128(t) - start_ns = 2000000, events.time_ns)"
+    );
+    assert_eq!(
+        rendered(r#"{ link:traceID != "AB" }"#),
+        "NOT arrayExists(h -> lower(hex(h)) = 'ab', links.trace_id)"
+    );
+    assert_eq!(
+        rendered(r#"{ link:spanID =~ "0A.*" }"#),
+        "arrayExists(h -> match(lower(hex(h)), '^(?:0A.*)$'), links.span_id)"
+    );
+    // A bare number is nanoseconds.
+    assert_eq!(
+        rendered(r#"{ event:timeSinceStart > 5 }"#),
+        "arrayExists(t -> toInt128(t) - start_ns > 5, events.time_ns)"
+    );
+    // An ordered string comparison renders.
+    assert_eq!(
+        rendered(r#"{ event:name > "a" }"#),
+        "arrayExists(n -> n > 'a', events.name)"
+    );
+
+    for (query, message) in [
+        (
+            r#"{ event:name = 5 }"#,
+            "event:name requires a string value",
+        ),
+        (
+            r#"{ event:timeSinceStart = "x" }"#,
+            "event:timeSinceStart requires a duration or a number",
+        ),
+        (
+            r#"{ event:timeSinceStart =~ "x" }"#,
+            "event:timeSinceStart requires a duration or a number",
+        ),
+        (
+            r#"{ link:spanID = 5 }"#,
+            "link:spanID requires a string value",
+        ),
+        (
+            r#"{ link:traceID = 5 }"#,
+            "link:traceID requires a string value",
+        ),
+    ] {
+        assert_eq!(
+            refusal(query),
+            PlanError::TypeMismatch(message.to_string()),
+            "{query}"
+        );
+    }
+    assert_eq!(
+        compile_span_leaf(
+            &Field::Intrinsic(Intrinsic::EventTimeSinceStart),
+            ComparisonOp::Re,
+            &duration_value(r#"{ duration > 1ms }"#),
+        )
+        .map(|p| p.sql().to_string()),
+        Err(PlanError::TypeMismatch(
+            "event:timeSinceStart does not support regex operators".to_string()
+        ))
+    );
+    // `!` over each keeps part 1's plan-time refusal.
+    for intrinsic in [
+        "event:name",
+        "event:timeSinceStart",
+        "link:spanID",
+        "link:traceID",
+    ] {
+        assert_eq!(
+            refusal(&format!("{{ !{intrinsic} }}")),
+            PlanError::TypeMismatch(format!("expression (!{intrinsic}) expected a boolean"))
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
+// T-C23 — `!` over the new scopes
+// ---------------------------------------------------------------------
+
+/// `T-C23`: section 6. `T` and the demand condition `c` are any-match for
+/// `event.`/`link.`, and a `multiIf` over the scopes for `.`.
+#[test]
+fn t_c23_not_over_an_event_link_or_unscoped_field_demands_a_boolean() {
+    let elem = |e: &str| {
+        (
+            format!("arrayExists(b -> coalesce(b = false, false), {e}.attrs.`k`.:Bool)"),
+            format!(
+                "arrayExists(d -> dynamicType(d) != 'None' AND dynamicType(d) != 'Bool', \
+                 {e}.attrs.`k`)"
+            ),
+        )
+    };
+    let (t_ev, c_ev) = elem("events");
+    let (t_lk, c_lk) = elem("links");
+    assert_eq!(
+        rendered(r#"{ !event.k }"#),
+        format!(
+            "(throwIf({c_ev}, 'expression (!event.k) expected a boolean') + toUInt8({t_ev})) = 1"
+        )
+    );
+    assert_eq!(
+        rendered(r#"{ !link.k = true }"#),
+        format!(
+            "(throwIf({c_lk}, 'expression (!link.k) expected a boolean') + toUInt8({t_lk})) = 1"
+        )
+    );
+
+    let c_span = "dynamicType(attrs.`k`) != 'None' AND dynamicType(attrs.`k`) != 'Bool'";
+    let t_span = "coalesce(attrs.`k`.:Bool = false, false)";
+    let c_in = "dynamicType(scope_attrs.`k`) != 'None' AND dynamicType(scope_attrs.`k`) != 'Bool'";
+    let t_in = "coalesce(scope_attrs.`k`.:Bool = false, false)";
+    let p = |scope: AttrScope| presence_text(scope, "k");
+    let t = format!(
+        "multiIf({}, {t_span}, {}, {}, {}, {t_ev}, {}, {t_lk}, {}, {t_in}, false)",
+        p(AttrScope::Span),
+        p(AttrScope::Resource),
+        r_of(t_span),
+        p(AttrScope::Event),
+        p(AttrScope::Link),
+        p(AttrScope::Instrumentation),
+    );
+    let c = format!(
+        "multiIf({}, {c_span}, {}, {}, {}, {c_ev}, {}, {c_lk}, {}, {c_in}, false)",
+        p(AttrScope::Span),
+        p(AttrScope::Resource),
+        r_of(c_span),
+        p(AttrScope::Event),
+        p(AttrScope::Link),
+        p(AttrScope::Instrumentation),
+    );
+    assert_eq!(
+        rendered_in(r#"{ !.k }"#),
+        format!("(throwIf({c}, 'expression (!.k) expected a boolean') + toUInt8({t})) = 1")
+    );
+
+    // At `service.name`: section 5.2's `P_resource`, part 1's `T` and `c`.
+    let ps = |scope: AttrScope| presence_text(scope, "service.name");
+    let span_path = "attrs.`service%2Ename`";
+    let in_path = "scope_attrs.`service%2Ename`";
+    let elem_s = |e: &str| {
+        (
+            format!(
+                "arrayExists(b -> coalesce(b = false, false), {e}.attrs.`service%2Ename`.:Bool)"
+            ),
+            format!(
+                "arrayExists(d -> dynamicType(d) != 'None' AND dynamicType(d) != 'Bool', \
+                 {e}.attrs.`service%2Ename`)"
+            ),
+        )
+    };
+    let (ts_ev, cs_ev) = elem_s("events");
+    let (ts_lk, cs_lk) = elem_s("links");
+    let ts = format!(
+        "multiIf({}, coalesce({span_path}.:Bool = false, false), {}, \
+         (service_type = 'bool' AND service = 'false'), {}, {ts_ev}, {}, {ts_lk}, {}, \
+         coalesce({in_path}.:Bool = false, false), false)",
+        ps(AttrScope::Span),
+        service_present_resource(),
+        ps(AttrScope::Event),
+        ps(AttrScope::Link),
+        ps(AttrScope::Instrumentation),
+    );
+    let cs = format!(
+        "multiIf({}, dynamicType({span_path}) != 'None' AND dynamicType({span_path}) != 'Bool', \
+         {}, service_type != '' AND service_type != 'bool', {}, {cs_ev}, {}, {cs_lk}, {}, \
+         dynamicType({in_path}) != 'None' AND dynamicType({in_path}) != 'Bool', false)",
+        ps(AttrScope::Span),
+        service_present_resource(),
+        ps(AttrScope::Event),
+        ps(AttrScope::Link),
+        ps(AttrScope::Instrumentation),
+    );
+    assert_eq!(
+        rendered_in(r#"{ !.service.name }"#),
+        format!(
+            "(throwIf({cs}, 'expression (!.service.name) expected a boolean') + toUInt8({ts})) = 1"
+        )
+    );
+
+    // Lifted out of a short-circuiting operator, once.
+    let lifted = rendered(r#"{ true || !event.k }"#);
+    assert_eq!(
+        lifted,
+        format!(
+            "(throwIf({c_ev}, 'expression (!event.k) expected a boolean') + \
+             toUInt8((true) OR ({t_ev}))) = 1"
+        )
+    );
+    assert_eq!(lifted.matches("throwIf(").count(), 1, "{lifted}");
+    assert_eq!(
+        compile_span_predicate(&filter_body(r#"{ true || !event.k }"#))
+            .expect("compiles")
+            .demand_messages(),
+        ["expression (!event.k) expected a boolean".to_string()]
+    );
+}
+
+// ---------------------------------------------------------------------
+// T-C24 — the chain's truthiness, presence and context
+// ---------------------------------------------------------------------
+
+/// `T-C24`: `{ .k }` is the chain of `{ sc.k }` with `D = false`;
+/// `{ .k = nil }` and `{ .k != nil }` are the ORed presences; the chain
+/// needs the window, and `event.` does not.
+#[test]
+fn t_c24_the_chain_needs_the_window_and_the_element_scopes_do_not() {
+    let d = t_b1_window().resources_day_clause();
+    let r_present = format!(
+        "resource_id IN (SELECT resource_id FROM resources WHERE {d} AND \
+         (dynamicType(attrs.`k`) != 'None'))"
+    );
+    let r_true = format!(
+        "resource_id IN (SELECT resource_id FROM resources WHERE {d} AND \
+         (coalesce(attrs.`k`.:Bool = true, false)))"
+    );
+    assert_eq!(
+        rendered_in(r#"{ .k }"#),
+        format!(
+            "multiIf(dynamicType(attrs.`k`) != 'None', coalesce(attrs.`k`.:Bool = true, false), \
+             {r_present}, {r_true}, \
+             arrayExists(d -> dynamicType(d) != 'None', events.attrs.`k`), \
+             arrayExists(b -> coalesce(b = true, false), events.attrs.`k`.:Bool), \
+             arrayExists(d -> dynamicType(d) != 'None', links.attrs.`k`), \
+             arrayExists(b -> coalesce(b = true, false), links.attrs.`k`.:Bool), \
+             dynamicType(scope_attrs.`k`) != 'None', coalesce(scope_attrs.`k`.:Bool = true, false), \
+             false)"
+        )
+    );
+    let presence = format!(
+        "(dynamicType(attrs.`k`) != 'None') OR ({r_present}) OR \
+         (arrayExists(d -> dynamicType(d) != 'None', events.attrs.`k`)) OR \
+         (arrayExists(d -> dynamicType(d) != 'None', links.attrs.`k`)) OR \
+         (dynamicType(scope_attrs.`k`) != 'None')"
+    );
+    assert_eq!(rendered_in(r#"{ .k != nil }"#), presence);
+    assert_eq!(rendered_in(r#"{ .k = nil }"#), format!("NOT ({presence})"));
+
+    assert_eq!(
+        refusal(r#"{ .k = 1 }"#),
+        PlanError::UnsupportedField(UNSCOPED_NEEDS_WINDOW.to_string())
+    );
+    assert_eq!(
+        rendered(r#"{ event.k = 1 }"#),
+        "arrayExists((i, f) -> (coalesce(i = 1, false) OR coalesce(f = 1, false)), \
+         events.attrs.`k`.:Int64, events.attrs.`k`.:Float64)"
+    );
+    let p = compile_span_predicate(&filter_body(r#"{ event.k = 1 }"#)).expect("compiles");
+    // No resource subquery, so no window is carried: another window composes.
+    let other = WindowSql::start_closed_end_open(T_B1_START, T_B1_END + 1);
+    assert!(span_membership_sql("spans", other, &p).contains("arrayExists"));
+}
+
+// =====================================================================
+// Issue #589 part 3a — field against field on the span row, text only
+// =====================================================================
+
+/// `L op R` with both sides fields, built directly so a pair the
+/// validator would refuse first still reaches the compiler.
+fn field_compare_expr(lhs: &Field, op: ComparisonOp, rhs: &Field) -> FieldExpr {
+    FieldExpr::Binary {
+        op: FieldOp::Cmp(op),
+        lhs: Box::new(FieldExpr::Field(lhs.clone())),
+        rhs: Box::new(FieldExpr::Field(rhs.clone())),
+    }
+}
+
+/// The six operators a field-against-field comparison serves.
+const FF_OPS: [ComparisonOp; 6] = [
+    ComparisonOp::Eq,
+    ComparisonOp::Neq,
+    ComparisonOp::Lt,
+    ComparisonOp::Lte,
+    ComparisonOp::Gt,
+    ComparisonOp::Gte,
+];
+
+fn ff_symbol(op: ComparisonOp) -> &'static str {
+    match op {
+        ComparisonOp::Eq => "=",
+        ComparisonOp::Neq => "!=",
+        ComparisonOp::Gt => ">",
+        ComparisonOp::Gte => ">=",
+        ComparisonOp::Lt => "<",
+        ComparisonOp::Lte => "<=",
+        ComparisonOp::Re | ComparisonOp::Nre => panic!("no field-against-field regex"),
+    }
+}
+
+/// This test's own copy of the integer-against-float rule: the integer
+/// side is compared exactly, as written.
+fn ff_mixed_int(e: &str) -> String {
+    e.to_string()
+}
+
+/// One operand of the part-3a design's section 3.1, with the part-3b
+/// design's section 5.2 resource operands: the field, its arms by class,
+/// whether it can be `NULL`, and whether it needs the context.
+///
+/// A resource-row arm reads the lambda variable, written `{v}` here and
+/// replaced by `r1` on the left and `r2` on the right. `types` is the text
+/// of the operand's type set, `tupleElement(Q(k), 3)`; `s_on_span_row`
+/// leaves the scalar string arm ungated; `bind` says the operand is bound
+/// to `V(k)` (section 5.3).
+struct FfOperand {
+    field: Field,
+    arms: Vec<(&'static str, String)>,
+    nullable: bool,
+    needs_ctx: bool,
+    types: Option<String>,
+    s_on_span_row: bool,
+    bind: bool,
+}
+
+impl FfOperand {
+    fn arm(&self, class: &str, var: &str) -> Option<String> {
+        self.arms
+            .iter()
+            .find(|(c, _)| *c == class)
+            .map(|(_, e)| e.replace("{v}", var))
+    }
+
+    /// The gate of the scalar arm of `class`, or of the array arm whose
+    /// elements are `class` — section 5.4, from this file's own type names.
+    fn gate(&self, class: &str, array: bool) -> Option<String> {
+        let types = self.types.as_deref()?;
+        let name = ff_type_name(class)?;
+        if array {
+            return Some(format!("has({types}, 'Array(Nullable({name}))')"));
+        }
+        if class == "s" && self.s_on_span_row {
+            return None;
+        }
+        Some(format!("has({types}, '{name}')"))
+    }
+
+    /// `V(k)` for a bound operand.
+    fn bound_value(&self) -> String {
+        match &self.field {
+            Field::Attribute {
+                scope: AttrScope::Resource,
+                key,
+            } => v_of(&ff_resource_path(key)),
+            other => panic!("{other} is not bound"),
+        }
+    }
+}
+
+/// Section 5.2's type names, scalar by class.
+fn ff_type_name(class: &str) -> Option<&'static str> {
+    match class {
+        "s" => Some("String"),
+        "i" => Some("Int64"),
+        "f" => Some("Float64"),
+        "b" => Some("Bool"),
+        _ => None,
+    }
+}
+
+/// `P(k)` for the keys these cases use: the writer's escape of `.` is
+/// `%2E`, and none of them carries a `%` or a backtick.
+fn ff_resource_path(key: &str) -> String {
+    format!("attrs.`{}`", key.replace('.', "%2E"))
+}
+
+/// `Q(k)` — section 5.1, from [`ctx`]'s window and table.
+fn q_of(path: &str) -> String {
+    format!(
+        "(SELECT (groupArray(resource_id), groupArray({path}), \
+         groupUniqArray(dynamicType({path}))) FROM resources WHERE {} AND \
+         dynamicType({path}) != 'None')",
+        t_b1_window().resources_day_clause()
+    )
+}
+
+/// `V(k)` — section 5.1.
+fn v_of(path: &str) -> String {
+    let q = q_of(path);
+    format!(
+        "arrayElement(tupleElement({q}, 2), transform(resource_id, tupleElement({q}, 1), \
+         arrayEnumerate(tupleElement({q}, 1)), 0))"
+    )
+}
+
+/// `G(k, 'T')` — section 5.1.
+fn g_of(path: &str, type_name: &str) -> String {
+    format!("has(tupleElement({}, 3), '{type_name}')", q_of(path))
+}
+
+/// Section 5.2's `resource.k` row: every class read from the bound value,
+/// each gated on the key's type set.
+fn ff_resource(key: &str) -> FfOperand {
+    let typed = |t: &str| format!("dynamicElement({{v}}, '{t}')");
+    FfOperand {
+        field: scoped(AttrScope::Resource, key),
+        arms: vec![
+            ("s", typed("String")),
+            ("i", typed("Int64")),
+            ("f", typed("Float64")),
+            ("b", typed("Bool")),
+            ("sa", typed("Array(Nullable(String))")),
+            ("ia", typed("Array(Nullable(Int64))")),
+            ("fa", typed("Array(Nullable(Float64))")),
+            ("ba", typed("Array(Nullable(Bool))")),
+        ],
+        nullable: true,
+        needs_ctx: true,
+        types: Some(format!("tupleElement({}, 3)", q_of(&ff_resource_path(key)))),
+        s_on_span_row: false,
+        bind: true,
+    }
+}
+
+/// An attribute operand's eight typed reads at `root`.
+fn ff_attr(scope: AttrScope, root: &str, key: &str) -> FfOperand {
+    let p = format!("{root}.`{key}`");
+    FfOperand {
+        field: scoped(scope, key),
+        arms: vec![
+            ("s", format!("{p}.:String")),
+            ("i", format!("{p}.:Int64")),
+            ("f", format!("{p}.:Float64")),
+            ("b", format!("{p}.:Bool")),
+            ("sa", format!("{p}.:`Array(Nullable(String))`")),
+            ("ia", format!("{p}.:`Array(Nullable(Int64))`")),
+            ("fa", format!("{p}.:`Array(Nullable(Float64))`")),
+            ("ba", format!("{p}.:`Array(Nullable(Bool))`")),
+        ],
+        nullable: true,
+        needs_ctx: false,
+        types: None,
+        s_on_span_row: false,
+        bind: false,
+    }
+}
+
+fn ff_intrinsic(intrinsic: Intrinsic, class: &'static str, expr: &str) -> FfOperand {
+    FfOperand {
+        field: Field::Intrinsic(intrinsic),
+        arms: vec![(class, expr.to_string())],
+        nullable: false,
+        needs_ctx: false,
+        types: None,
+        s_on_span_row: false,
+        bind: false,
+    }
+}
+
+/// Section 3.1's operands, with the part-3b design's two resource operands.
+fn ff_operands() -> Vec<FfOperand> {
+    vec![
+        ff_attr(AttrScope::Span, "attrs", "a"),
+        ff_attr(AttrScope::Instrumentation, "scope_attrs", "a"),
+        ff_intrinsic(Intrinsic::Name, "s", "name"),
+        ff_intrinsic(Intrinsic::StatusMessage, "s", "status_message"),
+        ff_intrinsic(Intrinsic::SpanId, "s", "lower(hex(span_id))"),
+        ff_intrinsic(Intrinsic::ParentId, "s", "lower(hex(parent_span_id))"),
+        ff_intrinsic(Intrinsic::TraceId, "s", "lower(hex(trace_id))"),
+        ff_intrinsic(Intrinsic::InstrumentationName, "s", "scope_name"),
+        ff_intrinsic(Intrinsic::InstrumentationVersion, "s", "scope_version"),
+        ff_intrinsic(Intrinsic::Duration, "i", "duration_ns"),
+        ff_intrinsic(Intrinsic::Status, "st", "status_code"),
+        ff_intrinsic(Intrinsic::Kind, "kd", "kind"),
+        ff_resource("a"),
+        {
+            let mut service = ff_resource("service.name");
+            service.arms[0].1 = "if(service_type = 'string', service, NULL)".to_string();
+            service.s_on_span_row = true;
+            service
+        },
+    ]
+}
+
+/// Section 3.2's scalar pairs in order, each with whether an ordered
+/// operator has a term.
+const FF_SCALAR_PAIRS: [(&str, &str, bool); 8] = [
+    ("s", "s", true),
+    ("i", "i", true),
+    ("i", "f", true),
+    ("f", "i", true),
+    ("f", "f", true),
+    ("b", "b", false),
+    ("st", "st", false),
+    ("kd", "kd", false),
+];
+
+/// Section 3.2's `(scalar class, element class)` array pairs in order.
+const FF_ARRAY_PAIRS: [(&str, &str, bool); 6] = [
+    ("s", "s", true),
+    ("i", "i", true),
+    ("i", "f", true),
+    ("f", "i", true),
+    ("f", "f", true),
+    ("b", "b", false),
+];
+
+/// The two sides of one pair with the integer side of a mixed pair
+/// passed through [`ff_mixed_int`].
+fn ff_mixed(lc: &str, rc: &str, l: &str, r: &str) -> (String, String) {
+    match (lc, rc) {
+        ("i", "f") => (ff_mixed_int(l), r.to_string()),
+        ("f", "i") => (l.to_string(), ff_mixed_int(r)),
+        _ => (l.to_string(), r.to_string()),
+    }
+}
+
+fn ff_array_term(op: ComparisonOp, l: &str, r: &str, array: &str) -> String {
+    if op == ComparisonOp::Neq {
+        format!("(notEmpty({array}) AND arrayAll(x -> coalesce({l} != {r}, false), {array}))")
+    } else {
+        format!(
+            "arrayExists(x -> coalesce({l} {} {r}, false), {array})",
+            ff_symbol(op)
+        )
+    }
+}
+
+/// Section 5.4's wrapper: a term with a gate on either side, or both,
+/// left first, is `if(<gates>, <term>, false)`.
+fn ff_gated(term: String, gl: Option<String>, gr: Option<String>) -> String {
+    let gates: Vec<String> = gl.into_iter().chain(gr).collect();
+    if gates.is_empty() {
+        term
+    } else {
+        format!("if({}, {term}, false)", gates.join(" AND "))
+    }
+}
+
+/// The text section 3.2 gives `L op R`, built from this file's own copy of
+/// the rules, with the part-3b design's gates (5.4) and binding (5.3): the
+/// left operand reads `r1`, the right `r2`.
+fn ff_expected(l: &FfOperand, op: ComparisonOp, r: &FfOperand) -> String {
+    let sym = ff_symbol(op);
+    let ordered = op_is_ordered(op);
+    let coalesced = l.nullable || r.nullable;
+    let (lv, rv) = ("r1", "r2");
+    let mut terms = Vec::new();
+    for (lc, rc, ordered_ok) in FF_SCALAR_PAIRS {
+        if ordered && !ordered_ok {
+            continue;
+        }
+        let (Some(a), Some(b)) = (l.arm(lc, lv), r.arm(rc, rv)) else {
+            continue;
+        };
+        let (a, b) = ff_mixed(lc, rc, &a, &b);
+        let c = format!("{a} {sym} {b}");
+        let term = if coalesced {
+            format!("coalesce({c}, false)")
+        } else {
+            c
+        };
+        terms.push(ff_gated(term, l.gate(lc, false), r.gate(rc, false)));
+    }
+    // The array on the right: the left's scalar against each element.
+    for (c, e, ordered_ok) in FF_ARRAY_PAIRS {
+        if ordered && !ordered_ok {
+            continue;
+        }
+        let (Some(scalar), Some(array)) = (l.arm(c, lv), r.arm(&format!("{e}a"), rv)) else {
+            continue;
+        };
+        let (a, b) = ff_mixed(c, e, &scalar, "x");
+        terms.push(ff_gated(
+            ff_array_term(op, &a, &b, &array),
+            l.gate(c, false),
+            r.gate(e, true),
+        ));
+    }
+    // The array on the left: each element against the right's scalar.
+    for (c, e, ordered_ok) in FF_ARRAY_PAIRS {
+        if ordered && !ordered_ok {
+            continue;
+        }
+        let (Some(array), Some(scalar)) = (l.arm(&format!("{e}a"), lv), r.arm(c, rv)) else {
+            continue;
+        };
+        let (a, b) = ff_mixed(e, c, "x", &scalar);
+        terms.push(ff_gated(
+            ff_array_term(op, &a, &b, &array),
+            l.gate(e, true),
+            r.gate(c, false),
+        ));
+    }
+    if terms.is_empty() {
+        return "false".to_string();
+    }
+    let body = format!("({})", terms.join(" OR "));
+    match (l.bind, r.bind) {
+        (false, false) => body,
+        (true, false) => format!("arrayExists({lv} -> {body}, [{}])", l.bound_value()),
+        (false, true) => format!("arrayExists({rv} -> {body}, [{}])", r.bound_value()),
+        (true, true) => format!(
+            "arrayExists(({lv}, {rv}) -> {body}, [{}], [{}])",
+            l.bound_value(),
+            r.bound_value()
+        ),
+    }
+}
+
+/// `T-C25`: every pair of section 3.1's operands, with the part-3b design's
+/// two resource operands, under each of the six operators — 1,176 cells —
+/// compiles to the text this file builds from its own copy of the rules,
+/// with no demand. With no context a cell naming either resource operand
+/// is refused and every other cell is the same text.
+#[test]
+fn t_c25_field_against_field_is_the_generated_cross_product() {
+    let operands = ff_operands();
+    assert_eq!(operands.len(), 14);
+    let mut cells = 0usize;
+    for l in &operands {
+        for r in &operands {
+            for op in FF_OPS {
+                cells += 1;
+                let expr = field_compare_expr(&l.field, op, &r.field);
+                let want = ff_expected(l, op, r);
+                let label = format!("{} {op} {}", l.field, r.field);
+                let got = compile_span_predicate_in(&expr, &ctx())
+                    .unwrap_or_else(|e| panic!("{label} must compile in a context: {e}"));
+                assert_eq!(got.sql(), want, "{label}");
+                assert!(got.demand_messages().is_empty(), "{label}: no demand");
+                let bare = compile_span_predicate(&expr).map(|p| p.sql().to_string());
+                if l.needs_ctx || r.needs_ctx {
+                    assert_eq!(
+                        bare,
+                        Err(PlanError::UnsupportedField(
+                            RESOURCE_NEEDS_WINDOW.to_string()
+                        )),
+                        "{label} with no context"
+                    );
+                } else {
+                    assert_eq!(bare, Ok(want), "{label} with no context");
+                }
+            }
+        }
+    }
+    assert_eq!(cells, 1_176);
+}
+
+/// `T-C26`: the part-3a design's section 3.5 texts, byte for byte.
+#[test]
+fn t_c26_the_measured_field_against_field_texts() {
+    assert_eq!(
+        rendered(r#"{ name != span.k }"#),
+        "(coalesce(name != attrs.`k`.:String, false) OR \
+         (notEmpty(attrs.`k`.:`Array(Nullable(String))`) AND \
+         arrayAll(x -> coalesce(name != x, false), attrs.`k`.:`Array(Nullable(String))`)))"
+    );
+    assert_eq!(rendered(r#"{ status = span.k }"#), "false");
+    assert_eq!(
+        rendered(r#"{ status = status }"#),
+        "(status_code = status_code)"
+    );
+    // The part-3b design's section 5.7, with `Q`, `V` and `G` spelled out
+    // from `ctx()`.
+    let k = "attrs.`k`";
+    let sn = "attrs.`service%2Ename`";
+    assert_eq!(
+        rendered_in(r#"{ resource.service.name < instrumentation:version }"#),
+        format!(
+            "arrayExists(r1 -> (coalesce(if(service_type = 'string', service, NULL) < \
+             scope_version, false) OR if({}, arrayExists(x -> coalesce(x < scope_version, \
+             false), dynamicElement(r1, 'Array(Nullable(String))')), false)), [{}])",
+            g_of(sn, "Array(Nullable(String))"),
+            v_of(sn)
+        )
+    );
+    assert_eq!(
+        rendered_in(r#"{ resource.k < name }"#),
+        format!(
+            "arrayExists(r1 -> (if({}, coalesce(dynamicElement(r1, 'String') < name, false), \
+             false) OR if({}, arrayExists(x -> coalesce(x < name, false), dynamicElement(r1, \
+             'Array(Nullable(String))')), false)), [{}])",
+            g_of(k, "String"),
+            g_of(k, "Array(Nullable(String))"),
+            v_of(k)
+        )
+    );
+    assert_eq!(
+        rendered_in(r#"{ duration = resource.service.name }"#),
+        format!(
+            "arrayExists(r2 -> (if({}, coalesce(duration_ns = dynamicElement(r2, 'Int64'), \
+             false), false) OR if({}, coalesce(duration_ns = dynamicElement(r2, 'Float64'), \
+             false), false) OR if({}, arrayExists(x -> coalesce(duration_ns = x, false), \
+             dynamicElement(r2, 'Array(Nullable(Int64))')), false) OR if({}, arrayExists(x -> \
+             coalesce(duration_ns = x, false), dynamicElement(r2, \
+             'Array(Nullable(Float64))')), false)), [{}])",
+            g_of(sn, "Int64"),
+            g_of(sn, "Float64"),
+            g_of(sn, "Array(Nullable(Int64))"),
+            g_of(sn, "Array(Nullable(Float64))"),
+            v_of(sn)
+        )
+    );
+    assert_eq!(
+        rendered_in(r#"{ resource.service.name = name }"#),
+        format!(
+            "arrayExists(r1 -> (coalesce(if(service_type = 'string', service, NULL) = name, \
+             false) OR if({}, arrayExists(x -> coalesce(x = name, false), dynamicElement(r1, \
+             'Array(Nullable(String))')), false)), [{}])",
+            g_of(sn, "Array(Nullable(String))"),
+            v_of(sn)
+        )
+    );
+    assert_eq!(rendered_in(r#"{ resource.k = status }"#), "false");
+    assert_eq!(
+        rendered(r#"{ duration > span.k }"#),
+        "(coalesce(duration_ns > attrs.`k`.:Int64, false) OR \
+         coalesce(duration_ns > attrs.`k`.:Float64, false) OR \
+         arrayExists(x -> coalesce(duration_ns > x, false), attrs.`k`.:`Array(Nullable(Int64))`) OR \
+         arrayExists(x -> coalesce(duration_ns > x, false), attrs.`k`.:`Array(Nullable(Float64))`))"
+    );
+    assert_eq!(
+        rendered(r#"{ span.k = span.j }"#),
+        "(coalesce(attrs.`k`.:String = attrs.`j`.:String, false) OR \
+         coalesce(attrs.`k`.:Int64 = attrs.`j`.:Int64, false) OR \
+         coalesce(attrs.`k`.:Int64 = attrs.`j`.:Float64, false) OR \
+         coalesce(attrs.`k`.:Float64 = attrs.`j`.:Int64, false) OR \
+         coalesce(attrs.`k`.:Float64 = attrs.`j`.:Float64, false) OR \
+         coalesce(attrs.`k`.:Bool = attrs.`j`.:Bool, false) OR \
+         arrayExists(x -> coalesce(attrs.`k`.:String = x, false), attrs.`j`.:`Array(Nullable(String))`) OR \
+         arrayExists(x -> coalesce(attrs.`k`.:Int64 = x, false), attrs.`j`.:`Array(Nullable(Int64))`) OR \
+         arrayExists(x -> coalesce(attrs.`k`.:Int64 = x, false), attrs.`j`.:`Array(Nullable(Float64))`) OR \
+         arrayExists(x -> coalesce(attrs.`k`.:Float64 = x, false), attrs.`j`.:`Array(Nullable(Int64))`) OR \
+         arrayExists(x -> coalesce(attrs.`k`.:Float64 = x, false), attrs.`j`.:`Array(Nullable(Float64))`) OR \
+         arrayExists(x -> coalesce(attrs.`k`.:Bool = x, false), attrs.`j`.:`Array(Nullable(Bool))`) OR \
+         arrayExists(x -> coalesce(x = attrs.`j`.:String, false), attrs.`k`.:`Array(Nullable(String))`) OR \
+         arrayExists(x -> coalesce(x = attrs.`j`.:Int64, false), attrs.`k`.:`Array(Nullable(Int64))`) OR \
+         arrayExists(x -> coalesce(x = attrs.`j`.:Int64, false), attrs.`k`.:`Array(Nullable(Float64))`) OR \
+         arrayExists(x -> coalesce(x = attrs.`j`.:Float64, false), attrs.`k`.:`Array(Nullable(Int64))`) OR \
+         arrayExists(x -> coalesce(x = attrs.`j`.:Float64, false), attrs.`k`.:`Array(Nullable(Float64))`) OR \
+         arrayExists(x -> coalesce(x = attrs.`j`.:Bool, false), attrs.`k`.:`Array(Nullable(Bool))`))"
+    );
+}
+
+/// `T-C27`: the part-3a design's section 3.6 refusals, whole strings, in
+/// their order — the regex operator first, then the left operand, then the
+/// right.
+#[test]
+fn t_c27_the_field_against_field_refusals() {
+    let span_a = scoped(AttrScope::Span, "a");
+    let refused_bare = |expr: &FieldExpr| match compile_span_predicate(expr) {
+        Err(e) => e,
+        Ok(p) => panic!("{expr} must be refused, it compiled to `{}`", p.sql()),
+    };
+    let refused_in = |expr: &FieldExpr| match compile_span_predicate_in(expr, &ctx()) {
+        Err(e) => e,
+        Ok(p) => panic!("{expr} must be refused, it compiled to `{}`", p.sql()),
+    };
+    let check = |expr: FieldExpr, want: PlanError| {
+        assert_eq!(refused_bare(&expr), want, "{expr} with no context");
+        assert_eq!(refused_in(&expr), want, "{expr} in a context");
+    };
+
+    for (scope, key) in [
+        (AttrScope::Event, "k"),
+        (AttrScope::Link, "k"),
+        (AttrScope::Unscoped, "k"),
+    ] {
+        let want = PlanError::UnsupportedField(format!(
+            "a field-against-field comparison with a \"{scope}\" operand is not supported by \
+             the span-scope predicate compiler yet (issue #589 part 3d)"
+        ));
+        let f = scoped(scope, key);
+        check(
+            field_compare_expr(&f, ComparisonOp::Eq, &span_a),
+            want.clone(),
+        );
+        check(field_compare_expr(&span_a, ComparisonOp::Eq, &f), want);
+    }
+
+    for intrinsic in [
+        Intrinsic::EventName,
+        Intrinsic::EventTimeSinceStart,
+        Intrinsic::LinkSpanId,
+        Intrinsic::LinkTraceId,
+    ] {
+        let want = PlanError::UnsupportedField(format!(
+            "a field-against-field comparison with {intrinsic} is not supported by the \
+             span-scope predicate compiler yet (issue #589 part 3d)"
+        ));
+        let f = Field::Intrinsic(intrinsic);
+        check(
+            field_compare_expr(&f, ComparisonOp::Eq, &span_a),
+            want.clone(),
+        );
+        check(field_compare_expr(&span_a, ComparisonOp::Eq, &f), want);
+    }
+
+    let mut nested_and_trace = 0usize;
+    for intrinsic in Intrinsic::ALL.iter().copied() {
+        if intrinsic_target(intrinsic) != Some("#594") {
+            continue;
+        }
+        nested_and_trace += 1;
+        let want = PlanError::UnsupportedField(format!(
+            "{intrinsic} is not supported by the span-scope predicate compiler yet (issue #594)"
+        ));
+        let f = Field::Intrinsic(intrinsic);
+        check(
+            field_compare_expr(&f, ComparisonOp::Eq, &span_a),
+            want.clone(),
+        );
+        check(field_compare_expr(&span_a, ComparisonOp::Eq, &f), want);
+    }
+    assert_eq!(nested_and_trace, 7);
+
+    let event_k = scoped(AttrScope::Event, "k");
+    let nested_left = Field::Intrinsic(Intrinsic::NestedSetLeft);
+    check(
+        field_compare_expr(&event_k, ComparisonOp::Eq, &nested_left),
+        PlanError::UnsupportedField(
+            "a field-against-field comparison with a \"event.\" operand is not supported by \
+             the span-scope predicate compiler yet (issue #589 part 3d)"
+                .to_string(),
+        ),
+    );
+    check(
+        field_compare_expr(&nested_left, ComparisonOp::Eq, &event_k),
+        PlanError::UnsupportedField(
+            "nestedSetLeft is not supported by the span-scope predicate compiler yet (issue #594)"
+                .to_string(),
+        ),
+    );
+
+    let span_b = scoped(AttrScope::Span, "b");
+    for op in [ComparisonOp::Re, ComparisonOp::Nre] {
+        let regex = PlanError::TypeMismatch(
+            "a field-against-field comparison does not support regex operators".to_string(),
+        );
+        check(field_compare_expr(&span_a, op, &span_b), regex.clone());
+        // The operator is checked before either operand.
+        check(field_compare_expr(&event_k, op, &nested_left), regex);
+    }
+}
+
+// =====================================================================
+// Issue #589 part 3b — field against field with a resource operand
+// =====================================================================
+
+/// `T-C28`: a comparison reading a resource operand carries its window,
+/// so composing it with another window panics, as `T-C15`'s literal leaf
+/// does. `resource.service.name` is one: its non-string arms read the
+/// resource row.
+#[test]
+#[should_panic(expected = "different window")]
+fn t_c28_a_service_name_operand_refuses_another_window() {
+    let p = compile_span_predicate_in(
+        &filter_body(r#"{ span.b = resource.service.name }"#),
+        &ctx(),
+    )
+    .expect("compiles");
+    let other = WindowSql::start_closed_end_open(T_B1_START, T_B1_END + 1);
+    let _ = span_membership_sql("spans", other, &p);
+}
+
+#[test]
+#[should_panic(expected = "different window")]
+fn t_c28_a_resource_operand_refuses_another_window() {
+    let p = compile_span_predicate_in(&filter_body(r#"{ resource.a = span.b }"#), &ctx())
+        .expect("compiles");
+    let other = WindowSql::start_closed_end_open(T_B1_START, T_B1_END + 1);
+    let _ = span_membership_sql("spans", other, &p);
 }

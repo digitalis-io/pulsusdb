@@ -2074,13 +2074,15 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
     ("pulsus-read/src/metrics/sql.rs", 18),
     ("pulsus-read/src/traces/filter.rs", 12),
     ("pulsus-read/src/traces/search_plan.rs", 2),
-    // Issue #588. The span-scope predicate compiler: four render sites,
-    // each spelled once for `=~` and once for `!~` — an attribute's
+    // Issues #588 and #589. The span-scope predicate compiler: four render
+    // sites, each spelled once for `=~` and once for `!~` — an attribute's
     // `:String` read, the `name`/`statusMessage` columns, the two
-    // instrumentation columns, and the three id columns' hex text. Every
-    // one takes its pattern from `anchored_regex_sql`, the leaf `filter.rs`
-    // uses. No production caller yet.
-    ("pulsus-read/src/traces/spans/predicate.rs", 8),
+    // instrumentation columns, and the three id columns' hex text — and
+    // two spelled once, the `link:` ids' hex text and `.service.name`'s
+    // `service` column in the unscoped chain. Every one takes its pattern
+    // from `anchored_regex_sql`, the leaf `filter.rs` uses. No production
+    // caller yet.
+    ("pulsus-read/src/traces/spans/predicate.rs", 10),
     // Issue #478. The one hit here is a TEST EXPECTATION, not a renderer:
     // `tag_narrow.rs` renders no `match(` itself — it delegates to
     // `filter::physical_sql`, which is already inventoried above at 12 —
@@ -2092,7 +2094,7 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
 
 /// The separately-asserted total, so "a file appeared" reads differently
 /// from "a file grew".
-const MATCH_RENDER_TOTAL: usize = 86;
+const MATCH_RENDER_TOTAL: usize = 88;
 
 /// Every string-literal CONTENT in a Rust source: ordinary `"…"`, raw
 /// `r"…"`/`r#"…"#`, byte `b"…"` and byte-raw. Comments are dropped.

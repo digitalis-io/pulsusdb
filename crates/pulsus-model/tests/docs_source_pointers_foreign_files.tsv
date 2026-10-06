@@ -2,6 +2,7 @@ file
 492-fold-breakA.rs
 492-fold-breakB.rs
 ast.go
+ast_execute.go
 ast_stringer.go
 block_traceql.go
 clickhouse/src/client.rs

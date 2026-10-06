@@ -262,7 +262,7 @@ CREATE TABLE IF NOT EXISTS {{db}}.resources{{on_cluster}}
 --@cluster ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/all/{{db}}.resources', '{replica}')
 PARTITION BY day
 ORDER BY (service, resource_id)
-TTL toDateTime(least((toUInt32(day) * 86400) + ({{retention_days}} * 86400), 4294967295))
+TTL toDateTime(least(((toUInt32(day) + 1) * 86400) + ({{retention_days}} * 86400), 4294967295))
 --@single  SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1, non_replicated_deduplication_window = {{trace_dedup_window}}{{storage_policy}};
 --@cluster SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1, replicated_deduplication_window = {{trace_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
 
@@ -590,7 +590,7 @@ CREATE TABLE IF NOT EXISTS {{db}}.traces{{on_cluster}}
 --@cluster ENGINE = ReplicatedAggregatingMergeTree('/clickhouse/tables/{shard}/{{db}}.traces', '{replica}')
 PARTITION BY day
 ORDER BY trace_id
-TTL toDateTime(least((toUInt32(day) * 86400) + ({{retention_days}} * 86400), 4294967295))
+TTL toDateTime(least(intDiv(last_start_ns, 1000000000) + ({{retention_days}} * 86400), 4294967295))
 --@single  SETTINGS index_granularity = 1024, ttl_only_drop_parts = 1, non_replicated_deduplication_window = {{trace_dedup_window}}{{storage_policy}};
 --@cluster SETTINGS index_granularity = 1024, ttl_only_drop_parts = 1, replicated_deduplication_window = {{trace_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
 
