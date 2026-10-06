@@ -32,7 +32,7 @@ use futures::StreamExt;
 
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
 use pulsus_config::WriterConfig;
-use pulsus_model::DEFAULT_ACTIVITY_BUCKET_MS;
+use pulsus_model::ACTIVITY_BUCKET_MS;
 use pulsus_schema::{RenderCtx, SchemaParams};
 use pulsus_schema_testkit::run_init;
 use pulsus_write::ingest::http::metrics;
@@ -179,7 +179,7 @@ async fn otlp_json_metrics_store_the_nearest_representable_f64_bits() {
     let writer = Arc::new(MetricWriter::new_with_tables(
         Arc::new(ChClient::new(db_config(db)).await.expect("connect writer")),
         &WriterConfig::default(),
-        DEFAULT_ACTIVITY_BUCKET_MS,
+        ACTIVITY_BUCKET_MS,
         MetricWriterTables::metrics_default(),
     ));
     let router: Router = Router::new()

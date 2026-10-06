@@ -2126,50 +2126,71 @@ async fn run_name_projection<R: pulsus_clickhouse::ChRow>(
     evidence
 }
 
-/// Creates `{db}.{table}` with `metric_series`'s own DDL and fills it with
-/// [`SERIES_472`] rows over [`NAMES_472`] names in ONE activity bucket,
-/// server-side (`INSERT … SELECT FROM numbers`), so no row crosses the
-/// wire. `pad_bytes` is the only thing that differs between the two
-/// tables: `(metric_name, fingerprint, unix_milli)` is a pure function of
-/// `number` and `bucket_ms`, so the two tables are identical in every
-/// column the `WHERE` and the projection touch — asserted by the identity
-/// hash in the test below, which is what makes the blob-invariance
-/// comparison a comparison of blob size and nothing else.
-async fn seed_metric_series_472(client: &ChClient, db: &str, table: &str, bucket: i64, pad: u64) {
-    client
-        .execute(
-            &format!(
-                "CREATE TABLE {db}.{table} (\
-                   metric_name  LowCardinality(String), \
-                   fingerprint  UInt128  CODEC(Delta(8), ZSTD(1)), \
-                   unix_milli   Int64   CODEC(Delta(8), ZSTD(1)), \
-                   labels       String  CODEC(ZSTD(5))\
-                 ) ENGINE = MergeTree \
-                 PARTITION BY toYYYYMM(fromUnixTimestamp64Milli(unix_milli)) \
-                 ORDER BY (metric_name, fingerprint, unix_milli)"
-            ),
-            &QuerySettings::new(),
-            Idempotency::Idempotent,
-        )
-        .await
-        .expect("create the #472 corpus table");
-    client
-        .execute(
-            &format!(
-                "INSERT INTO {db}.{table} \
-                 SELECT concat('metric_', leftPad(toString(number % {NAMES_472}), 2, '0')), \
-                        number + 1, \
-                        {bucket}, \
-                        concat('{{\"job\":\"api\",\"namespace\":\"ns-', toString(number % 13), \
-                               '\",\"pod\":\"pod-', toString(number), \
-                               '\",\"pad\":\"', repeat('x', {pad}), '\"}}') \
-                 FROM numbers({SERIES_472})"
-            ),
-            &QuerySettings::new(),
-            Idempotency::Idempotent,
-        )
-        .await
-        .expect("seed the #472 corpus");
+/// Creates `{db}.{table}` with `metric_series`' own DDL and `{db}.{labels}`
+/// with `metric_labels`' (issue #623), and fills them with [`SERIES_472`]
+/// series over [`NAMES_472`] names in ONE activity bucket, server-side
+/// (`INSERT … SELECT FROM numbers`), so no row crosses the wire. `pad_bytes`
+/// is the only thing that differs between the two corpora, and it is in the
+/// label table alone: `(day, fingerprint, metric_name, hours)` is a pure
+/// function of `number` and the bucket, so the two series tables are
+/// identical in every column — asserted by the identity hash in the test
+/// below, which is what makes the blob-invariance comparison a comparison
+/// of blob size and nothing else.
+async fn seed_metric_series_472(
+    client: &ChClient,
+    db: &str,
+    table: &str,
+    labels: &str,
+    bucket: i64,
+    pad: u64,
+) {
+    for ddl in [
+        format!(
+            "CREATE TABLE {db}.{table} (\
+               day          Date, \
+               fingerprint  UInt128  CODEC(ZSTD(1)), \
+               metric_name  LowCardinality(String), \
+               hours        SimpleAggregateFunction(groupBitOr, UInt32)\
+             ) ENGINE = AggregatingMergeTree \
+             PARTITION BY day \
+             ORDER BY fingerprint"
+        ),
+        format!(
+            "CREATE TABLE {db}.{labels} (\
+               metric_name  LowCardinality(String), \
+               fingerprint  UInt128  CODEC(Delta(8), ZSTD(1)), \
+               labels       String  CODEC(ZSTD(5)), \
+               first_seen   SimpleAggregateFunction(min, Int64) CODEC(ZSTD(1)), \
+               last_seen    SimpleAggregateFunction(max, Int64) CODEC(ZSTD(1))\
+             ) ENGINE = AggregatingMergeTree \
+             ORDER BY (metric_name, fingerprint)"
+        ),
+        format!(
+            "INSERT INTO {db}.{table} (day, fingerprint, metric_name, hours) \
+             SELECT toDate(fromUnixTimestamp64Milli(toInt64({bucket})), 'UTC'), \
+                    number + 1, \
+                    concat('metric_', leftPad(toString(number % {NAMES_472}), 2, '0')), \
+                    toUInt32(bitShiftLeft(toUInt32(1), \
+                      toHour(fromUnixTimestamp64Milli(toInt64({bucket})), 'UTC'))) \
+             FROM numbers({SERIES_472})"
+        ),
+        format!(
+            "INSERT INTO {db}.{labels} \
+             SELECT concat('metric_', leftPad(toString(number % {NAMES_472}), 2, '0')), \
+                    number + 1, \
+                    concat('{{\"job\":\"api\",\"namespace\":\"ns-', toString(number % 13), \
+                           '\",\"pod\":\"pod-', toString(number), \
+                           '\",\"pad\":\"', repeat('x', {pad}), '\"}}'), \
+                    {bucket}, \
+                    {bucket} \
+             FROM numbers({SERIES_472})"
+        ),
+    ] {
+        client
+            .execute(&ddl, &QuerySettings::new(), Idempotency::Idempotent)
+            .await
+            .unwrap_or_else(|e| panic!("seed the #472 corpus: {e}\n{ddl}"));
+    }
 }
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -2180,11 +2201,11 @@ struct CorpusShapeRow {
     identity: u64,
 }
 
-async fn corpus_shape(client: &ChClient, db: &str, table: &str) -> CorpusShapeRow {
+async fn corpus_shape(client: &ChClient, db: &str, table: &str, labels: &str) -> CorpusShapeRow {
     let sql = format!(
         "SELECT count() AS rows, uniqExact(metric_name) AS names, \
-         avg(length(labels)) AS mean_label_bytes, \
-         sum(cityHash64(metric_name, fingerprint, unix_milli)) AS identity \
+         ifNull((SELECT avg(length(labels)) FROM {db}.{labels}), 0) AS mean_label_bytes, \
+         sum(cityHash64(metric_name, fingerprint, day, hours)) AS identity \
          FROM {db}.{table}"
     );
     let mut stream = client
@@ -2230,10 +2251,11 @@ async fn corpus_shape(client: &ChClient, db: &str, table: &str) -> CorpusShapeRo
 /// issue #25; nothing here asserts a duration.
 ///
 /// **What this gate does NOT claim.** Blob-invariance holds for the
-/// **unfiltered** call only. A `match[]` carrying a label matcher renders
-/// `JSONExtractString(labels, …)` into the same `WHERE`, so `labels` is
-/// read to evaluate the filter and the narrow form's bytes grow with the
-/// blob too; that case's win is transport and parse count, not bytes read.
+/// **unfiltered** call only. A `match[]` carrying a label matcher reads
+/// `metric_labels` to evaluate the filter (issue #623), so the narrow
+/// form's bytes grow with the blob too; that case's win is transport and
+/// parse count, not bytes read. Since #623 the wide statement reads each
+/// series' own label row, and the blob it pays for is the label table's.
 #[tokio::test]
 async fn name_values_narrow_projection_reads_far_fewer_bytes_and_is_blob_invariant() {
     skip_unless_live!();
@@ -2259,11 +2281,11 @@ async fn name_values_narrow_projection_reads_far_fewer_bytes_and_is_blob_invaria
 
     let bucket_ms: i64 = 3_600_000;
     let bucket = (now_ns() / 1_000_000 / bucket_ms) * bucket_ms;
-    seed_metric_series_472(&client, db, "series_small", bucket, 100).await;
-    seed_metric_series_472(&client, db, "series_big", bucket, 1_890).await;
+    seed_metric_series_472(&client, db, "series_small", "labels_small", bucket, 100).await;
+    seed_metric_series_472(&client, db, "series_big", "labels_big", bucket, 1_890).await;
 
-    let small = corpus_shape(&client, db, "series_small").await;
-    let big = corpus_shape(&client, db, "series_big").await;
+    let small = corpus_shape(&client, db, "series_small", "labels_small").await;
+    let big = corpus_shape(&client, db, "series_big", "labels_big").await;
     eprintln!(
         "#472 corpus: small {} rows / {} names / {:.1} B labels; big {} rows / {} names / {:.1} B \
          labels; blob inflation {:.2}x",
@@ -2279,7 +2301,7 @@ async fn name_values_narrow_projection_reads_far_fewer_bytes_and_is_blob_invaria
     assert_eq!((big.rows, big.names), (SERIES_472, NAMES_472));
     assert_eq!(
         small.identity, big.identity,
-        "the two tables must be identical in (metric_name, fingerprint, unix_milli) — otherwise \
+        "the two tables must be identical in (metric_name, fingerprint, day, hours) — otherwise \
          the blob-invariance comparison is comparing two different corpora, not two blob sizes"
     );
     assert!(
@@ -2304,10 +2326,11 @@ async fn name_values_narrow_projection_reads_far_fewer_bytes_and_is_blob_invaria
     let mut evidence = Vec::new();
     for (tag, table) in [("small", "series_small"), ("big", "series_big")] {
         let qualified = format!("{db}.{table}");
+        let labels = format!("{db}.labels_{tag}");
         let wide_sql =
-            pulsus_read::metrics::sql::discovery_query(&qualified, &filter, window, bucket_ms);
+            pulsus_read::metrics::sql::discovery_query(&qualified, &labels, &filter, window);
         let narrow_sql = pulsus_read::metrics::sql::discovery_distinct_names_query(
-            &qualified, &filter, window, bucket_ms,
+            &qualified, &labels, &filter, window,
         );
         let wide = run_name_projection::<pulsus_read::metrics::rows::SeriesRow>(
             &client,
@@ -8802,4 +8825,279 @@ SQL:
                 )
             });
     }
+}
+
+// ---------------------------------------------------------------------
+// Issue #623 — a named read reads its metric; a metric's samples are one
+// key range.
+// ---------------------------------------------------------------------
+
+async fn exec_623(client: &ChClient, sql: &str) {
+    client
+        .execute(sql, &QuerySettings::new(), Idempotency::NonIdempotent)
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+}
+
+/// A fresh database `db` (composed by the caller through
+/// `pulsus_testkit::test_db`), schema applied.
+async fn fresh_db_623(db: String) -> (ChClient, String, ChClient) {
+    let admin = ChClient::new(test_config()).await.expect("connect admin");
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop test database");
+    run_init(&admin, &test_ctx(&db)).await.expect("run_init");
+    let client = data_client_with_deadline(&db, Duration::from_secs(600)).await;
+    (admin, db, client)
+}
+
+async fn drop_db_623(admin: &ChClient, db: &str) {
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop test database");
+}
+
+/// A builder's text as the client sends it: the driver reads `?` as a bind
+/// placeholder, and the regex probe carries `(?-s)`.
+fn unbound(sql: &str) -> String {
+    sql.replace('?', "??")
+}
+
+fn eq_matcher(key: &str, value: &str) -> pulsus_read::metrics::LabelMatcher {
+    pulsus_read::metrics::LabelMatcher {
+        key: key.to_string(),
+        op: pulsus_read::metrics::MatchOp::Eq,
+        value: value.to_string(),
+    }
+}
+
+/// The series ID of series `s` of `name`, through the writers' own
+/// function.
+fn series_id_623(name: &str, s: u32) -> Fingerprint {
+    let (labels, _) = pulsus_model::LabelSet::from_normalized([
+        ("instance".to_string(), format!("i-{s}")),
+        ("job".to_string(), "api".to_string()),
+    ]);
+    pulsus_model::series_fingerprint(name, &labels)
+}
+
+/// Lands one kind-2 row per series in `ids` (a table of `s`, `fingerprint`,
+/// `name`) at `hour`, so the views write the lookup and activity rows a push
+/// writes.
+async fn land_series_623(client: &ChClient, ids: &str, hour: i64, now_ms: i64) {
+    exec_623(
+        client,
+        &format!(
+            "INSERT INTO metric_landing \
+             (received_ms, kind, metric_name, fingerprint, unix_milli, labels, value_type) \
+             SELECT {now_ms}, 2, name, fingerprint, {hour}, \
+                    concat('{{\"instance\":\"i-', toString(s), '\",\"job\":\"api\"}}'), 0 \
+             FROM {ids}"
+        ),
+    )
+    .await;
+}
+
+/// Writes the IDs of `count` series under each of `names` into a new table
+/// `table` (`s`, `fingerprint`, `name`), computed by
+/// [`series_id_623`].
+async fn id_table_623(client: &ChClient, table: &str, names: &[String], count: u32) {
+    exec_623(
+        client,
+        &format!(
+            "CREATE TABLE {table} (s UInt32, fingerprint UInt128, name String) \
+             ENGINE = MergeTree ORDER BY s"
+        ),
+    )
+    .await;
+    for name in names {
+        let values: Vec<String> = (0..count)
+            .map(|s| format!("({s}, {}, '{name}')", series_id_623(name, s).sql_literal()))
+            .collect();
+        for chunk in values.chunks(10_000) {
+            exec_623(
+                client,
+                &format!(
+                    "INSERT INTO {table} (s, fingerprint, name) VALUES {}",
+                    chunk.join(", ")
+                ),
+            )
+            .await;
+        }
+    }
+}
+
+/// **Q1 (issue #623): a named read reads its metric.** 400,000 `bg_`
+/// series under 1,000 names, all `job="api"`, and `m_q` with 100 series in
+/// the same hour. Statements 1, 2 and 3 for `m_q{job="api"}` each read
+/// fewer than 100,000 rows: the lookup by the name's key range and the
+/// activity by the IDs it yields, which sort together under the name's
+/// prefix. A read that scanned either table reads at least 400,000.
+#[tokio::test]
+async fn a_named_read_reads_its_metric() {
+    skip_unless_live!();
+    let (admin, db, client) =
+        fresh_db_623(pulsus_testkit::test_db("pulsus_read_it_qlg_623_named")).await;
+    let now_ms = now_ns() / 1_000_000;
+    let hour = (now_ms / 3_600_000) * 3_600_000;
+    let bg: Vec<String> = (0..1_000).map(|n| format!("bg_{n}")).collect();
+    id_table_623(&client, "ids_bg", &bg, 400).await;
+    id_table_623(&client, "ids_q", &["m_q".to_string()], 100).await;
+    land_series_623(&client, "ids_bg", hour, now_ms).await;
+    land_series_623(&client, "ids_q", hour, now_ms).await;
+
+    let window = pulsus_read::metrics::DataWindow {
+        start_ms: hour,
+        end_ms: hour,
+    };
+    let matchers = [eq_matcher("job", "api")];
+    let filter = pulsus_read::metrics::DiscoveryFilter {
+        metric_name: Some("m_q".to_string()),
+        name_matchers: Vec::new(),
+        matchers: matchers.to_vec(),
+    };
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    for (what, sql, want) in [
+        (
+            "statement 1",
+            pulsus_read::metrics::sql::historical_series_subquery(
+                "metric_series",
+                "metric_labels",
+                "m_q",
+                window,
+                &matchers,
+            ),
+            100,
+        ),
+        (
+            "statement 2",
+            pulsus_read::metrics::sql::discovery_query(
+                "metric_series",
+                "metric_labels",
+                &filter,
+                window,
+            ),
+            100,
+        ),
+        (
+            "statement 3",
+            pulsus_read::metrics::sql::discovery_distinct_names_query(
+                "metric_series",
+                "metric_labels",
+                &filter,
+                window,
+            ),
+            1,
+        ),
+    ] {
+        let wrapped = unbound(&format!("SELECT count() AS n FROM (\n{sql}\n)"));
+        let (_, evidence) = run_and_capture::<CountRow623>(
+            &client,
+            &admin,
+            &wrapped,
+            &format!("q623-named-{}-{nonce}", what.replace(' ', "-")),
+        )
+        .await;
+        let returned = count_623(&client, &wrapped).await;
+        eprintln!(
+            "Q1 {what}: returned {returned}, read_rows {}",
+            evidence.read_rows
+        );
+        assert_eq!(returned, want, "{what}: m_q's own answer\n{sql}");
+        assert!(
+            evidence.read_rows < 100_000,
+            "{what} read {} rows: it must read m_q's rows, not every series'\n{sql}",
+            evidence.read_rows
+        );
+    }
+
+    drop_db_623(&admin, &db).await;
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct CountRow623 {
+    n: u64,
+}
+
+async fn count_623(client: &ChClient, sql: &str) -> u64 {
+    let mut stream = client
+        .query_stream::<CountRow623>(sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    stream
+        .next()
+        .await
+        .expect("one row")
+        .unwrap_or_else(|e| panic!("{e}\n{sql}"))
+        .n
+}
+
+/// **F6 (issue #623): a metric's samples are one key range.** 200,000
+/// series under 200 names, 72 samples each over one UTC day, IDs from the
+/// writers' own [`pulsus_model::series_fingerprint`], merged to one part.
+/// The cache path's fetch of one name's 1,000 IDs returns its 72,000 samples
+/// and reads fewer than 200,000 rows: the name's IDs share a prefix, so its
+/// samples sit together under `(fingerprint, unix_milli)`. IDs spread by a
+/// uniform hash put the 1,000 series in about 1,000 different granules,
+/// at least 6 million rows.
+#[tokio::test]
+async fn a_metrics_samples_are_one_key_range() {
+    skip_unless_live!();
+    let (admin, db, client) =
+        fresh_db_623(pulsus_testkit::test_db("pulsus_read_it_qlg_623_one_range")).await;
+    let now_ms = now_ns() / 1_000_000;
+    let day_ms: i64 = 86_400_000;
+    let day = (now_ms / day_ms - 1) * day_ms;
+    let names: Vec<String> = (0..200).map(|n| format!("m_{n}")).collect();
+    id_table_623(&client, "ids", &names, 1_000).await;
+    exec_623(
+        &client,
+        &format!(
+            "INSERT INTO metric_samples (fingerprint, unix_milli, value) \
+             SELECT fingerprint, {day} + k * 1200000, toFloat64(k) \
+             FROM ids ARRAY JOIN range(72) AS k"
+        ),
+    )
+    .await;
+    exec_623(&client, "OPTIMIZE TABLE metric_samples FINAL").await;
+
+    let fps: Vec<pulsus_model::FpLiteral> = (0..1_000)
+        .map(|s| series_id_623("m_7", s).sql_literal())
+        .collect();
+    let sql = pulsus_read::metrics::sample_sql::sample_fetch(
+        "metric_samples",
+        &fps,
+        day - 1,
+        day + day_ms,
+    );
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    let (returned, evidence) = run_and_capture::<pulsus_read::metrics::sample_rows::SampleRow>(
+        &client,
+        &admin,
+        &unbound(&sql),
+        &format!("f6-623-{nonce}"),
+    )
+    .await;
+    eprintln!(
+        "F6: returned {returned}, read_rows {}, marks {}",
+        evidence.read_rows, evidence.selected_marks
+    );
+    assert_eq!(returned, 72_000, "m_7's 1,000 series, 72 samples each");
+    assert!(
+        evidence.read_rows < 200_000,
+        "one name's samples read {} rows: they are not one key range",
+        evidence.read_rows
+    );
+
+    drop_db_623(&admin, &db).await;
 }

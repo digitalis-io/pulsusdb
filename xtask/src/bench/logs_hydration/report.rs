@@ -1,6 +1,5 @@
 //! Evidence schema, markdown rendering, and the materiality verdict
-//! predicate for `cargo xtask bench logs-hydration` (issue #35). Mirrors
-//! `metrics_labels::report`'s split (issue #34 precedent): `Serialize +
+//! predicate for `cargo xtask bench logs-hydration` (issue #35): `Serialize +
 //! Deserialize` evidence structs, `render_markdown`, and a
 //! `consistency_tests` submodule that loads the **committed** full-tier
 //! JSON and recomputes its verdict from the pinned formulas below —
@@ -519,8 +518,7 @@ fn fmt_dist(d: &Dist) -> String {
 /// Renders the per-path/per-breadth/per-stage evidence table plus the
 /// verdict summary. Every row is rendered — curation for
 /// docs/benchmarks/m1-logs-late-hydration.md happens in the committed
-/// report, not here (same division of labour as `report.rs::render_markdown`
-/// / `metrics_labels::report::render_markdown`).
+/// report, not here (same division of labour as `report.rs::render_markdown`).
 pub fn render_markdown(report: &LogsHydrationReport) -> String {
     let mut out = String::new();
     out.push_str(&format!(

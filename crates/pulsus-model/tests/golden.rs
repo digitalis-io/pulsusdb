@@ -12,8 +12,9 @@
 //! `from_verbatim`, which every other case in this file uses for traces.
 
 use pulsus_model::{
-    Fingerprint, LabelSet, build_metric_buffer, build_stream_buffer, canonicalize_label_key,
-    metric_fingerprint, raw_cityhash64, stream_fingerprint,
+    Fingerprint, LabelSet, build_metric_buffer, build_series_buffer, build_stream_buffer,
+    canonicalize_label_key, metric_fingerprint, raw_cityhash64, series_fingerprint,
+    stream_fingerprint,
 };
 use serde_json::Value;
 
@@ -234,6 +235,41 @@ fn metric_fingerprint_vectors_match() {
             metric_fingerprint(&labels),
             Fingerprint::from_raw(committed.fp128),
             "{name}: fingerprint"
+        );
+    }
+}
+
+/// **F2 (issue #623): the series ID of each metric vector under a name.**
+/// `series_fingerprint128` is series-id.md §1's value for the case's labels
+/// under `series_name`; the case's other fields, the label-only fingerprint
+/// and its buffer, are unchanged, and the series buffer is the name, the
+/// separator, then that buffer.
+#[test]
+fn series_fingerprint_vectors_match() {
+    let fx = fixtures();
+    let cases = fx["metric_fingerprints"].as_array().expect("array");
+    assert!(!cases.is_empty());
+    for case in cases {
+        let name = case["name"].as_str().expect("name");
+        let series_name = case["series_name"].as_str().expect("series_name");
+        let labels = labels_from_json(&case["labels"]);
+        let expected: u128 = case["series_fingerprint128"]
+            .as_str()
+            .expect("series_fingerprint128")
+            .parse()
+            .expect("series_fingerprint128 parses as u128");
+        let mut buf = series_name.as_bytes().to_vec();
+        buf.push(0xFF);
+        buf.extend(decode_hex(case["buffer_hex"].as_str().expect("buffer_hex")));
+        assert_eq!(
+            build_series_buffer(series_name, &labels),
+            buf,
+            "{name}: series buffer"
+        );
+        assert_eq!(
+            series_fingerprint(series_name, &labels),
+            Fingerprint::from_raw(expected),
+            "{name}: series fingerprint"
         );
     }
 }

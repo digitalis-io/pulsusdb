@@ -416,10 +416,9 @@ const COUNTER_RESET_MODULUS: u64 = 5;
 /// last real sample via lookback the whole time.
 const LOOKBACK_MS: i64 = 300_000;
 
-/// PulsusDB's activity-bucket size (`PULSUS_SERIES_ACTIVITY_BUCKET`
-/// default, `pulsus_config::model::ReaderConfig::default`, docs/
-/// schemas.md §2.1) — none of `deploy/e2e/compose.{single,cluster}.yaml`
-/// override it, so this is exactly what the live stack uses. Used only to
+/// PulsusDB's activity bucket, `pulsus_model::ACTIVITY_BUCKET_MS` (one
+/// hour, fixed since issue #623; docs/schemas.md §2.1) — what the live
+/// stack uses. Used only to
 /// compute the harness's own bucket-floor discovery expectation (issue
 /// #33 architect adjudication, finding 2) — never to change ingestion or
 /// query behavior.

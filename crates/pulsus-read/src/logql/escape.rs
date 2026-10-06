@@ -223,7 +223,7 @@ pub(crate) fn ch_regex_unanchored_checked(pat: &str) -> Result<String, PipelineE
 /// comment used to carry existed only because TraceQL held the second;
 /// #282 retired that one). Its SQL path is by design where a pattern the
 /// Rust `regex` crate cannot compile is *sent* (`metrics/labels.rs:496-506`,
-/// `:521-526`; `metrics/sql.rs:264-266`). Rust-validating here would reject
+/// `:521-526`; `metrics/sql.rs:367-369`). Rust-validating here would reject
 /// exactly the queries that fallback exists to serve.
 ///
 /// **Issue #324 — `.` versus newline.** ClickHouse's `match()` compiles its

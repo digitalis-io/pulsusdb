@@ -1,6 +1,6 @@
 //! Bulk columnar insert scenario (docs/schemas.md §2.1 metric shape, §3.1 log
 //! shape). Row shapes and codecs are byte-identical to the authoritative DDL
-//! (architect amendment, issue #3 Codex finding 1) — not a narrowed tuple.
+//! (issue #3) — not a narrowed tuple.
 
 use std::time::Instant;
 
@@ -25,13 +25,12 @@ pub struct InsertReport {
 pub fn metric_table_ddl(table: &str) -> String {
     format!(
         "CREATE TABLE IF NOT EXISTS {table} (
-            metric_name  LowCardinality(String),
             fingerprint  UInt128   CODEC(Delta(8), ZSTD(1)),
             unix_milli   Int64    CODEC(DoubleDelta, ZSTD(1)),
             value        Float64  CODEC(Gorilla, ZSTD(1))
         ) ENGINE = MergeTree
         PARTITION BY toDate(fromUnixTimestamp64Milli(unix_milli))
-        ORDER BY (metric_name, fingerprint, unix_milli)"
+        ORDER BY (fingerprint, unix_milli)"
     )
 }
 

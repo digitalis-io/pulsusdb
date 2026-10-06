@@ -18,8 +18,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pulsus_clickhouse::{ChError, ChRow, QuerySettings};
-use pulsus_config::{ByteSize, Config, WriterConfig};
-use pulsus_model::{DEFAULT_ACTIVITY_BUCKET_MS, Fingerprint, LabelSet, NativeHistogram, Span};
+use pulsus_config::{ByteSize, WriterConfig};
+use pulsus_model::{ACTIVITY_BUCKET_MS, Fingerprint, LabelSet, NativeHistogram, Span};
 use pulsus_write::writer::{
     BlockInserter, LANDING_ROW_SLOT_BYTES, MetricLandingRow, MetricWriter, MetricWriterTables,
     WriterRuntime, landing_block_overhead_bytes,
@@ -30,7 +30,7 @@ use pulsus_write::{
 };
 use tokio::time::Instant;
 
-const BUCKET_MS: i64 = DEFAULT_ACTIVITY_BUCKET_MS;
+const BUCKET_MS: i64 = ACTIVITY_BUCKET_MS;
 const LANDING: &str = "metric_landing";
 
 // -- the mock inserter ------------------------------------------------
@@ -441,19 +441,13 @@ fn epoch_millis() -> i64 {
 
 // -- the cross-crate bucket-floor identity ----------------------------
 
-/// The default `metric_series` activity bucket
-/// (`pulsus_config::ReaderConfig::series_activity_bucket`) must resolve to
-/// exactly `pulsus_model::DEFAULT_ACTIVITY_BUCKET_MS`, and the writer's
-/// admission-time flooring must be the same function the reader renders into
-/// its historical-bound SQL — proven by construction (`MetricWriter` only
-/// ever calls `floor_to_activity_bucket`), not by convention.
+/// The activity bucket is fixed at one hour (issue #623): the activity
+/// table's hour mask has one bit per hour, so the writer registers a series
+/// once per hour and the reader's window is exact to the hour. The writer
+/// is handed this constant (`serve.rs`); nothing configures it.
 #[test]
-fn default_series_activity_bucket_matches_the_shared_floor_constant() {
-    let cfg = Config::default();
-    assert_eq!(
-        cfg.reader.series_activity_bucket.0.as_millis() as i64,
-        DEFAULT_ACTIVITY_BUCKET_MS
-    );
+fn the_activity_bucket_is_one_hour() {
+    assert_eq!(ACTIVITY_BUCKET_MS, 3_600_000);
 }
 
 // -- one push, one block ----------------------------------------------
@@ -1257,12 +1251,15 @@ fn wide_template() -> ParsedMetrics {
     }
 }
 
-/// [`wide_template`] with its descriptors' versions moved on, so no two pushes
-/// are the same body.
+/// [`wide_template`] with its descriptors' versions and units moved on, so no
+/// two pushes are the same body and every push's descriptors differ from the
+/// ones last sent — an unchanged descriptor is not sent again (issue #623),
+/// and a push with nothing to send makes no block.
 fn restamped(template: &ParsedMetrics, push: u128) -> ParsedMetrics {
     let mut batch = template.clone();
     for descriptor in &mut batch.metadata {
         descriptor.updated_ns = push as i64;
+        descriptor.unit = push.to_string();
     }
     batch
 }
@@ -1913,70 +1910,123 @@ fn the_push_too_large_message_names_the_size_and_both_limits() {
 
 // -- descriptors ------------------------------------------------------
 
-/// Every push emits its descriptors: there is no cache gate left, so three
-/// pushes carrying the same descriptor land three kind-3 rows, the third
-/// carrying the largest `updated_ns`. A push carrying samples and no metadata
-/// emits none.
-#[tokio::test]
-async fn every_push_emits_its_descriptors() {
-    let cfg = WriterConfig::default();
-    let root = spool_root("descriptors");
-    let inserter = MockInserter::always(Act::Ok);
-    let writer = writer_with(&cfg, &root, inserter.clone());
+/// One synchronous push, settled and committed.
+async fn push_and_commit(writer: &MetricWriter, batch: ParsedMetrics) {
+    let wait = writer
+        .admit_flush(batch, PushHeaders::default())
+        .expect("queue has room");
+    tokio::time::timeout(Duration::from_secs(5), wait)
+        .await
+        .expect("settles")
+        .expect("commits");
+}
 
-    for call in 0usize..3 {
-        let wait = writer
-            .admit_flush(
+/// The hour a descriptor's resend is keyed on, from the wall clock.
+fn descriptor_hour() -> i64 {
+    epoch_millis() / 3_600_000
+}
+
+/// **Issue #623: a descriptor is sent when it changes, not on every push.**
+/// Three pushes carrying the same descriptor in one hour land one kind-3 row.
+/// A changed type lands one; going back to the first lands it again, since
+/// what the writer last sent was the changed one. A push with no metadata
+/// lands none.
+///
+/// The writer keys the hourly resend on the wall clock, so a run that
+/// crosses an hour boundary is repeated rather than read.
+#[tokio::test]
+async fn a_descriptor_is_sent_only_when_it_changes() {
+    for _attempt in 0..2 {
+        let hour = descriptor_hour();
+        let cfg = WriterConfig::default();
+        let root = spool_root("descriptors");
+        let inserter = MockInserter::always(Act::Ok);
+        let writer = writer_with(&cfg, &root, inserter.clone());
+
+        for call in 0usize..3 {
+            push_and_commit(
+                &writer,
                 mixed_push(1_000 + call as i64, (call as i64) + 1, true),
-                PushHeaders::default(),
             )
+            .await;
+        }
+        let mut changed = mixed_push(1_003, 4, true);
+        changed.metadata[0].metric_type = "counter".to_string();
+        push_and_commit(&writer, changed).await;
+        push_and_commit(&writer, mixed_push(1_004, 5, true)).await;
+        push_and_commit(&writer, batch_for("other", 9, 1_000, true)).await;
+        writer.shutdown(Duration::from_secs(2)).await;
+        std::fs::remove_dir_all(&root).ok();
+        if descriptor_hour() != hour {
+            continue;
+        }
+
+        let sent: Vec<(usize, String, i64)> = (0..6)
+            .flat_map(|call| {
+                rows_of_kind(&inserter.rows_of(call), 3)
+                    .into_iter()
+                    .map(|d| {
+                        (
+                            call,
+                            d["metric_type"].as_str().expect("a type").to_string(),
+                            d["updated_ns"].as_i64().expect("a version"),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            sent,
+            vec![
+                (0, "gauge".to_string(), 1),
+                (3, "counter".to_string(), 4),
+                (4, "gauge".to_string(), 5),
+            ],
+            "only a changed descriptor is sent again within the hour"
+        );
+        assert_eq!(writer.metrics().metadata_upserts_total, 3);
+        return;
+    }
+    panic!("two attempts in a row crossed an hour boundary");
+}
+
+/// **A descriptor whose block did not commit is sent again.** The cache is
+/// promoted at the commit, as the series cache is: a refused insert records
+/// nothing, so the next push carrying the same descriptor lands it.
+#[tokio::test]
+async fn a_descriptor_whose_block_failed_is_sent_again() {
+    for _attempt in 0..2 {
+        let hour = descriptor_hour();
+        let cfg = WriterConfig::default();
+        let root = spool_root("descriptors-failed");
+        let inserter = MockInserter::new(vec![Step::now(Act::Poison), Step::now(Act::Ok)]);
+        let writer = writer_with(&cfg, &root, inserter.clone());
+
+        let wait = writer
+            .admit_flush(mixed_push(1_000, 1, true), PushHeaders::default())
             .expect("queue has room");
-        tokio::time::timeout(Duration::from_secs(5), wait)
+        let failed = tokio::time::timeout(Duration::from_secs(5), wait)
             .await
-            .expect("settles")
-            .expect("commits");
-        let rows = inserter.rows_of(call);
-        let descriptors = rows_of_kind(&rows, 3);
+            .expect("settles");
+        assert!(failed.is_err(), "the first insert is refused");
+        push_and_commit(&writer, mixed_push(1_001, 2, true)).await;
+        writer.shutdown(Duration::from_secs(2)).await;
+        std::fs::remove_dir_all(&root).ok();
+        if descriptor_hour() != hour {
+            continue;
+        }
+
+        let second = inserter.rows_of(1);
+        let descriptors = rows_of_kind(&second, 3);
         assert_eq!(
             descriptors.len(),
             1,
-            "push {call} lands its own descriptor: any suppression drops it"
+            "the refused block's descriptor was recorded as sent"
         );
-        assert_eq!(
-            descriptors[0]["updated_ns"].as_i64(),
-            Some((call as i64) + 1)
-        );
-        assert_eq!(descriptors[0]["metric_type"].as_str(), Some("gauge"));
+        assert_eq!(descriptors[0]["updated_ns"].as_i64(), Some(2));
+        return;
     }
-
-    // A changed descriptor for the same name lands too.
-    let mut changed = mixed_push(1_003, 4, true);
-    changed.metadata[0].metric_type = "counter".to_string();
-    let wait = writer
-        .admit_flush(changed, PushHeaders::default())
-        .expect("queue has room");
-    tokio::time::timeout(Duration::from_secs(5), wait)
-        .await
-        .expect("settles")
-        .expect("commits");
-    let rows = inserter.rows_of(3);
-    let descriptors = rows_of_kind(&rows, 3);
-    assert_eq!(descriptors.len(), 1);
-    assert_eq!(descriptors[0]["metric_type"].as_str(), Some("counter"));
-
-    // Samples with no metadata emit no kind-3 row.
-    let wait = writer
-        .admit_flush(batch_for("other", 9, 1_000, true), PushHeaders::default())
-        .expect("queue has room");
-    tokio::time::timeout(Duration::from_secs(5), wait)
-        .await
-        .expect("settles")
-        .expect("commits");
-    assert!(rows_of_kind(&inserter.rows_of(4), 3).is_empty());
-
-    assert_eq!(writer.metrics().metadata_upserts_total, 4);
-    writer.shutdown(Duration::from_secs(2)).await;
-    std::fs::remove_dir_all(&root).ok();
+    panic!("two attempts in a row crossed an hour boundary");
 }
 
 // -- the block's columns ----------------------------------------------

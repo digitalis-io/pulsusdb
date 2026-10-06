@@ -578,7 +578,8 @@ mod tests {
     /// The metrics landing insert carries the full setting set, in order:
     /// the two block-deduplication pins, the block's own minted token, and
     /// the seven settings that decide how many blocks the server forms out
-    /// of the request and whether it deduplicates them — between
+    /// of the request and whether it deduplicates them, and the four that
+    /// decide what a view does with it — between
     /// `async_insert` and the deadline, with nothing else moving. A path that
     /// sent only some of them would leave a resend storing the block twice,
     /// or one push becoming two blocks.
@@ -597,6 +598,10 @@ mod tests {
              max_insert_block_size_bytes = 0, input_format_max_block_size_bytes = 0, \
              min_insert_block_size_rows = 1048576, min_insert_block_size_bytes = 0, \
              input_format_connection_handling = 0, input_format_max_block_wait_ms = 0, \
+             materialized_views_ignore_errors = 0, \
+             ignore_materialized_views_with_dropped_target_table = 0, \
+             min_insert_block_size_rows_for_materialized_views = 0, \
+             min_insert_block_size_bytes_for_materialized_views = 0, \
              max_execution_time = 120.000"
         );
     }

@@ -44,7 +44,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
-use pulsus_model::DEFAULT_ACTIVITY_BUCKET_MS;
+use pulsus_model::ACTIVITY_BUCKET_MS;
 use pulsus_promql::parser::parse;
 use pulsus_read::{
     LabelCache, LabelCacheConfig, MetricQueryParams, MetricsConfig, MetricsEngine, QueryResult,
@@ -157,7 +157,6 @@ struct SeedSeriesRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedSampleRow {
-    metric_name: String,
     fingerprint: u128,
     unix_milli: i64,
     value: f64,
@@ -178,7 +177,7 @@ fn cache_config(db: &str) -> LabelCacheConfig {
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
         db: db.to_string(),
         series_table: "metric_series_dist".to_string(),
-        bucket_ms: DEFAULT_ACTIVITY_BUCKET_MS,
+        labels_table: "metric_labels_dist".to_string(),
         window_ms: 24 * 3_600_000,
         cache_max_series: 50_000,
         ttl: Duration::from_secs(60),
@@ -193,6 +192,7 @@ fn engine_config(db: &str, grouped_push: bool) -> MetricsConfig {
         samples_table: "metric_samples_dist".to_string(),
         hist_samples_table: "metric_hist_samples_dist".to_string(),
         series_table: "metric_series_dist".to_string(),
+        labels_table: "metric_labels_dist".to_string(),
         metadata_table: "metric_metadata".to_string(),
         experimental_functions: false,
         max_metric_fanout: 1_000,
@@ -206,7 +206,7 @@ fn engine_config(db: &str, grouped_push: bool) -> MetricsConfig {
 
 const METRIC: &str = "grouped_cluster";
 /// 40 series in 4 groups, 60 grid points at a one-minute step. The shard
-/// key is `cityHash64(metric_name, fingerprint)`, so the fingerprints
+/// key is `cityHash64(fingerprint)`, so the fingerprints
 /// split across the two shards on their own; the test asserts the split
 /// happened rather than assuming it.
 const SERIES: u64 = 40;
@@ -253,7 +253,7 @@ async fn the_grouped_read_over_the_dist_tables_answers_what_the_shipped_route_do
     let now = now_ms();
     let t = (now / 60_000) * 60_000;
     let start = t - POINTS * 60_000;
-    let bucket = (now / DEFAULT_ACTIVITY_BUCKET_MS) * DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = (now / ACTIVITY_BUCKET_MS) * ACTIVITY_BUCKET_MS;
 
     let mut series = Vec::new();
     let mut samples = Vec::new();
@@ -273,17 +273,37 @@ async fn the_grouped_read_over_the_dist_tables_answers_what_the_shipped_route_do
         });
         for k in 0..=POINTS {
             samples.push(SeedSampleRow {
-                metric_name: METRIC.to_string(),
                 fingerprint: u128::from(fp),
                 unix_milli: start + k * 60_000,
                 value: fp as f64 + k as f64 * 0.5,
             });
         }
     }
+    // Issue #623: the series land as kind-2 rows on the receiving node,
+    // shard 1, whose views write its activity and lookup rows, as a push
+    // does.
+    let values = series
+        .iter()
+        .map(|r| {
+            format!(
+                "({now}, 2, '{}', {}, {}, '{}', 0)",
+                r.metric_name, r.fingerprint, r.unix_milli, r.labels
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     client
-        .insert_block("metric_series_dist", &series)
+        .execute(
+            &format!(
+                "INSERT INTO metric_landing \
+                 (received_ms, kind, metric_name, fingerprint, unix_milli, labels, value_type) \
+                 VALUES {values}"
+            ),
+            &QuerySettings::new(),
+            Idempotency::NonIdempotent,
+        )
         .await
-        .expect("seed metric_series_dist");
+        .expect("seed shard 1's metric_landing");
     client
         .insert_block("metric_samples_dist", &samples)
         .await
@@ -316,7 +336,8 @@ async fn the_grouped_read_over_the_dist_tables_answers_what_the_shipped_route_do
     const FORWARDING_DEADLINE: Duration = Duration::from_secs(60);
     let want = SERIES * (POINTS as u64 + 1);
     let dist_sql = format!(
-        "SELECT toUInt64(count()) AS n FROM metric_samples_dist WHERE metric_name = '{METRIC}'"
+        "SELECT toUInt64(count()) AS n FROM metric_samples_dist \
+         WHERE fingerprint BETWEEN 1 AND {SERIES}"
     );
     let deadline = Instant::now() + FORWARDING_DEADLINE;
     let mut total = 0u64;
@@ -349,7 +370,8 @@ async fn the_grouped_read_over_the_dist_tables_answers_what_the_shipped_route_do
     let local = count(
         &client,
         &format!(
-            "SELECT toUInt64(count()) AS n FROM metric_samples WHERE metric_name = '{METRIC}'"
+            "SELECT toUInt64(count()) AS n FROM metric_samples \
+             WHERE fingerprint BETWEEN 1 AND {SERIES}"
         ),
     )
     .await;

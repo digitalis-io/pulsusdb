@@ -856,12 +856,8 @@ impl SpoolEncode for MetricMetadataRow {
 ///
 /// `kind` says which event the row is; a row sets that kind's columns and
 /// leaves the rest at the type's default. The fields are the landing
-/// table's 26 columns **less `event_id`**, in the table's own declaration
-/// order: the insert's column list is exactly this type's `COLUMN_NAMES`,
-/// so leaving the column out is what makes the server fill it from
-/// `DEFAULT generateUUIDv7()`. A row type carrying the column would store
-/// whatever the writer put there — the nil UUID on every row, for an
-/// explicit zero.
+/// table's 25 columns, in the table's own declaration order: the insert's
+/// column list is exactly this type's `COLUMN_NAMES`.
 ///
 /// No `PartialEq` derive, for [`MetricSampleRow`]'s reason: `value`,
 /// `hist_sum`, `hist_zero_threshold` and `hist_custom_values` may be NaN
@@ -2311,11 +2307,10 @@ mod tests {
 
     // -- the landing row (issue #603) ---------------------------------
 
-    /// The 26 columns `metric_landing` declares, in its own declaration
+    /// The 25 columns `metric_landing` declares, in its own declaration
     /// order. Written out here so the row type cannot drift from the schema
-    /// silently — including the one column the writer must NOT send.
-    const LANDING_COLUMNS: [&str; 26] = [
-        "event_id",
+    /// silently.
+    const LANDING_COLUMNS: [&str; 25] = [
         "received_ms",
         "kind",
         "metric_name",
@@ -2406,24 +2401,16 @@ mod tests {
         }
     }
 
-    /// The insert's column list is exactly the row type's `COLUMN_NAMES`, so
-    /// omitting `event_id` from the type is what makes the server fill the
-    /// column from its own `DEFAULT generateUUIDv7()`. A row type carrying
-    /// the column would store whatever the writer put there — the nil UUID on
-    /// every row, for an explicit zero — while passing every other case here.
+    /// The insert's column list is exactly the table's: every column of
+    /// `metric_landing`, in its own order. The table has no column the
+    /// server fills (issue #623 removed `event_id`).
     #[test]
-    fn the_insert_omits_event_id_so_the_server_fills_it() {
+    fn the_insert_names_every_landing_column_in_order() {
         let names = <MetricLandingRow as pulsus_clickhouse::Row>::COLUMN_NAMES;
-        assert_eq!(names.len(), 25, "the 26 columns less event_id");
-        let expected: Vec<&str> = LANDING_COLUMNS
-            .iter()
-            .copied()
-            .filter(|c| *c != "event_id")
-            .collect();
-        assert_eq!(names, expected.as_slice(), "in the table's own order");
-        assert!(
-            !names.contains(&"event_id"),
-            "the writer never sets the landed event's identity"
+        assert_eq!(
+            names,
+            LANDING_COLUMNS.as_slice(),
+            "in the table's own order"
         );
     }
 

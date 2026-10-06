@@ -126,7 +126,6 @@ struct Stage2Row {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct MultiSampleRow {
-    metric_name: String,
     fingerprint: u128,
     unix_milli: i64,
     value: f64,
@@ -211,13 +210,8 @@ async fn metrics_multi_oversized_sql_fails_under_ch_defaults_and_succeeds_under_
     ))
     .await;
     let fps = oversized_fingerprint_set();
-    let sql = pulsus_read::metrics::sample_sql::sample_fetch_multi(
-        "metric_samples",
-        &["up".to_string()],
-        &fps,
-        0,
-        i64::MAX,
-    );
+    let sql =
+        pulsus_read::metrics::sample_sql::sample_fetch_multi("metric_samples", &fps, 0, i64::MAX);
     assert!(
         sql.len() > 262_144,
         "fixture SQL is {} bytes, expected > 262,144 to exercise the ClickHouse default",

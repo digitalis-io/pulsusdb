@@ -82,7 +82,13 @@ pub fn build_metric_buffer(labels: &LabelSet) -> Vec<u8> {
 /// and the golden vectors catch it once; a third primitive for a third
 /// identity gives up exactly that.
 pub fn compose128(buf: &[u8]) -> Fingerprint {
-    Fingerprint::from_raw(((raw_cityhash64(buf) as u128) << 64) | (xxh64(buf, 0) as u128))
+    Fingerprint::from_raw(hash128(buf))
+}
+
+/// [`compose128`]'s value as a bare integer, for the series ID to take its
+/// low bits from.
+fn hash128(buf: &[u8]) -> u128 {
+    ((raw_cityhash64(buf) as u128) << 64) | (xxh64(buf, 0) as u128)
 }
 
 /// Metric fingerprint: [`compose128`] over [`build_metric_buffer`], whose
@@ -144,9 +150,85 @@ pub fn raw_cityhash64(buf: &[u8]) -> u64 {
     ch_cityhash102::cityhash64(buf)
 }
 
+/// The width of the metric-name prefix at the top of a series ID (issue
+/// #623): the top bits of `cityHash64(metric_name)`. A metric's series
+/// share it, so under `ORDER BY (fingerprint, unix_milli)` one metric's
+/// samples sit together, as they did when `metric_name` led the key.
+pub const SERIES_NAME_PREFIX_BITS: u32 = 24;
+
+/// The bits of a series ID below the name prefix: the identity.
+const SERIES_BODY_BITS: u32 = 128 - SERIES_NAME_PREFIX_BITS;
+
+/// The series ID's buffer: `metric_name ++ 0xFF ++` [`build_metric_buffer`].
+/// `0xFF` never occurs in UTF-8, so the buffer encodes the name and the
+/// labels without ambiguity.
+///
+/// `pub` for the same reason as [`build_metric_buffer`].
+pub fn build_series_buffer(metric_name: &str, labels: &LabelSet) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(metric_name.len() + 1);
+    buf.extend_from_slice(metric_name.as_bytes());
+    buf.push(SEP);
+    buf.extend_from_slice(&build_metric_buffer(labels));
+    buf
+}
+
+/// The metric series ID (issue #623): the top [`SERIES_NAME_PREFIX_BITS`]
+/// of `cityHash64(metric_name)`, then the low bits of [`compose128`] over
+/// [`build_series_buffer`]. One label set under two names is two series.
+/// Reproducible in ClickHouse: the prefix is
+/// `bitShiftRight(cityHash64(metric_name), 64 - SERIES_NAME_PREFIX_BITS)`.
+pub fn series_fingerprint(metric_name: &str, labels: &LabelSet) -> Fingerprint {
+    let prefix =
+        u128::from(raw_cityhash64(metric_name.as_bytes()) >> (64 - SERIES_NAME_PREFIX_BITS));
+    let body =
+        hash128(&build_series_buffer(metric_name, labels)) & ((1u128 << SERIES_BODY_BITS) - 1);
+    Fingerprint::from_raw((prefix << SERIES_BODY_BITS) | body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **F1 (issue #623): the series ID is the metric name and its labels.**
+    /// One label set under two names is two series; two series of one name
+    /// share the name prefix, so a metric's series sort together; label
+    /// order does not matter; and the buffer is the name, the separator,
+    /// then the label buffer.
+    #[test]
+    fn the_series_id_is_the_name_and_the_labels() {
+        let job_a = labels(&[("job", "a")]);
+        assert_ne!(
+            series_fingerprint("up", &job_a),
+            series_fingerprint("down", &job_a),
+            "one label set under two names"
+        );
+        let prefix = |fp: Fingerprint| fp.sql_literal().to_string();
+        let raw = |name: &str, l: &LabelSet| -> u128 {
+            prefix(series_fingerprint(name, l))
+                .trim_start_matches("toUInt128('")
+                .trim_end_matches("')")
+                .parse()
+                .expect("a decimal ID")
+        };
+        let job_b = labels(&[("job", "b")]);
+        assert_ne!(raw("up", &job_a), raw("up", &job_b));
+        assert_eq!(
+            raw("up", &job_a) >> (128 - SERIES_NAME_PREFIX_BITS),
+            raw("up", &job_b) >> (128 - SERIES_NAME_PREFIX_BITS),
+            "two series of one name share the name prefix"
+        );
+        assert_eq!(
+            raw("up", &job_a) >> (128 - SERIES_NAME_PREFIX_BITS),
+            u128::from(raw_cityhash64(b"up") >> (64 - SERIES_NAME_PREFIX_BITS)),
+            "the prefix is the top bits of the name's cityHash64"
+        );
+        let ab = labels(&[("a", "1"), ("b", "2")]);
+        let ba = labels(&[("b", "2"), ("a", "1")]);
+        assert_eq!(series_fingerprint("up", &ab), series_fingerprint("up", &ba));
+        let mut want = b"up\xff".to_vec();
+        want.extend(build_metric_buffer(&ab));
+        assert_eq!(build_series_buffer("up", &ab), want);
+    }
 
     fn labels(pairs: &[(&str, &str)]) -> LabelSet {
         LabelSet::from_verbatim(

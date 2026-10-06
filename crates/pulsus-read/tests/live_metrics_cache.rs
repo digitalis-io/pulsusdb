@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
-use pulsus_model::{DEFAULT_ACTIVITY_BUCKET_MS, Fingerprint, floor_to_activity_bucket};
+use pulsus_model::{ACTIVITY_BUCKET_MS, Fingerprint, floor_to_activity_bucket};
 use pulsus_read::metrics::sql::{historical_resolution_query, historical_series_subquery};
 use pulsus_read::{
     DataWindow, LabelCache, LabelCacheConfig, LabelMatcher, MatchOp, Resolution, SeriesResolver,
@@ -99,10 +99,7 @@ struct SeedSeriesRow {
 }
 
 async fn seed(client: &ChClient, rows: &[SeedSeriesRow]) {
-    client
-        .insert_block("metric_series", rows)
-        .await
-        .expect("seed metric_series");
+    seed_series_rows(client, rows).await;
 }
 
 /// Doubles literal `?` before executing raw SQL text against the real
@@ -140,7 +137,7 @@ fn cache_config(db: &str, series_table: &str, window_ms: i64, ttl: Duration) -> 
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
         db: db.to_string(),
         series_table: series_table.to_string(),
-        bucket_ms: DEFAULT_ACTIVITY_BUCKET_MS,
+        labels_table: series_table.replace("metric_series", "metric_labels"),
         window_ms,
         cache_max_series: 50_000,
         ttl,
@@ -149,9 +146,11 @@ fn cache_config(db: &str, series_table: &str, window_ms: i64, ttl: Duration) -> 
 }
 
 /// The whole point of the time-awareness invariant (docs/architecture.md
-/// §5.2): a series alive last week but silent today must be absent from
-/// the (24h-windowed) cache, and a historical query for last week must
-/// still resolve it via `metric_series` — never a false empty.
+/// §5.2): a series alive days ago but silent today must be absent from
+/// the (24h-windowed) cache, and a historical query for those days must
+/// still resolve it via `metric_series` — never a false empty. Three days
+/// rather than a week since issue #623: the activity rows expire with the
+/// samples, at the fixture's seven-day retention.
 #[tokio::test]
 async fn silent_last_week_series_is_absent_from_the_cache_but_resolves_via_metric_series() {
     skip_unless_live!();
@@ -177,9 +176,9 @@ async fn silent_last_week_series_is_absent_from_the_cache_but_resolves_via_metri
             .as_millis(),
     )
     .expect("now fits in i64");
-    let one_week_ms = 7 * 24 * 3_600_000;
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
-    let last_week_bucket = ((now_ms - one_week_ms) / bucket) * bucket;
+    let three_days_ms = 3 * 24 * 3_600_000;
+    let bucket = ACTIVITY_BUCKET_MS;
+    let last_week_bucket = ((now_ms - three_days_ms) / bucket) * bucket;
 
     seed(
         &client,
@@ -241,9 +240,19 @@ async fn bucket_floor_boundary_includes_the_mid_bucket_row_and_excludes_the_late
         .await
         .expect("connect (target db)");
 
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS; // 1h
-    let ten_am_bucket = 10 * 3_600_000i64; // an arbitrary "10:00" epoch-relative instant
-    let eleven_am_bucket = 11 * 3_600_000i64;
+    // Yesterday's 10:00 and 11:00 UTC. Inside the fixture's retention: the
+    // activity rows expire with the samples since issue #623, so an epoch-
+    // relative 10:00 would be dropped before the read.
+    let now_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_millis(),
+    )
+    .expect("now fits in i64");
+    let yesterday = (now_ms / 86_400_000 - 1) * 86_400_000;
+    let ten_am_bucket = yesterday + 10 * 3_600_000i64;
+    let eleven_am_bucket = yesterday + 11 * 3_600_000i64;
 
     seed(
         &client,
@@ -269,7 +278,7 @@ async fn bucket_floor_boundary_includes_the_mid_bucket_row_and_excludes_the_late
         start_ms: ten_am_bucket + 30 * 60_000,
         end_ms: ten_am_bucket + 40 * 60_000,
     };
-    let sql = historical_series_subquery("metric_series", "up", window, bucket, &[]);
+    let sql = historical_series_subquery("metric_series", "metric_labels", "up", window, &[]);
     let fingerprints = execute_fingerprint_sql(&client, &sql).await;
     assert_eq!(
         fingerprints,
@@ -306,7 +315,7 @@ async fn warm_cache_and_sql_fallback_return_identical_results() {
             .as_millis(),
     )
     .expect("now fits in i64");
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now_ms / bucket) * bucket;
 
     seed(
@@ -361,15 +370,17 @@ async fn warm_cache_and_sql_fallback_return_identical_results() {
 
     let sql = historical_resolution_query(
         "metric_series",
+        "metric_labels",
         "http_requests_total",
         window,
-        bucket,
         &[matcher],
     );
     let via_sql: Vec<Fingerprint> = {
         #[derive(Row, serde::Serialize, serde::Deserialize)]
         struct LabelsRow {
             fingerprint: Fingerprint,
+            #[allow(dead_code)]
+            metric_name: String,
             #[allow(dead_code)]
             labels: String,
         }
@@ -419,7 +430,7 @@ async fn a_cold_cache_falls_back_to_sql_with_the_same_result_a_warm_cache_would_
             .as_millis(),
     )
     .expect("now fits in i64");
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now_ms / bucket) * bucket;
 
     seed(
@@ -497,7 +508,7 @@ async fn stale_cache_degrades_to_sql_identical_to_ground_truth_and_a_fresh_refre
             .as_millis(),
     )
     .expect("now fits in i64");
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now_ms / bucket) * bucket;
 
     seed(
@@ -595,11 +606,16 @@ async fn stale_cache_degrades_to_sql_identical_to_ground_truth_and_a_fresh_refre
     // fallback rather than validating the fallback's bounds independently.
     let lower_bound_ms = floor_to_activity_bucket(far_future_window.start_ms, bucket);
     let upper_bound_ms = floor_to_activity_bucket(far_future_window.end_ms, bucket);
+    // Issue #623: each activity row's hours are expanded to their own start
+    // instants here, rather than tested through the reader's day mask.
     let truth_sql = format!(
         "SELECT DISTINCT fingerprint FROM metric_series \
-         WHERE metric_name = 'http_requests_total' \
-           AND unix_milli >= {lower_bound_ms} AND unix_milli <= {upper_bound_ms} \
-           AND match(JSONExtractString(labels, 'status'), '^(?:5..)$')"
+         WHERE fingerprint IN (SELECT fingerprint FROM metric_labels \
+                               WHERE metric_name = 'http_requests_total' \
+                                 AND match(JSONExtractString(labels, 'status'), '^(?:5..)$')) \
+           AND arrayExists(h -> bitTest(hours, h) \
+                 AND toInt64(toUInt16(day)) * 86400000 + h * 3600000 BETWEEN {lower_bound_ms} AND {upper_bound_ms}, \
+               range(24))"
     );
     let truth = execute_fingerprint_sql(&client, &truth_sql).await;
     // Proves the bounds actually bite: fingerprint 999 matches the label
@@ -685,7 +701,7 @@ async fn a_quote_and_backslash_bearing_label_key_round_trips_identically_on_both
             .as_millis(),
     )
     .expect("now fits in i64");
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now_ms / bucket) * bucket;
 
     // The label key itself contains a single quote and a backslash; encoded
@@ -727,7 +743,8 @@ async fn a_quote_and_backslash_bearing_label_key_round_trips_identically_on_both
     };
     assert_eq!(in_process, [7].map(Fingerprint::from_raw));
 
-    let sql = historical_series_subquery("metric_series", "up", window, bucket, &[matcher]);
+    let sql =
+        historical_series_subquery("metric_series", "metric_labels", "up", window, &[matcher]);
     let via_sql = execute_fingerprint_sql(&client, &sql).await;
     assert_eq!(in_process, via_sql);
 
@@ -793,7 +810,7 @@ async fn a_memory_bounded_sweep_failure_retains_the_last_good_snapshot() {
             .as_millis(),
     )
     .expect("now fits in i64");
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent = (now_ms / bucket) * bucket;
 
     // A handful of series: small enough that the tight ceiling never bites,
@@ -862,8 +879,8 @@ async fn a_memory_bounded_sweep_failure_retains_the_last_good_snapshot() {
     client
         .execute(
             &format!(
-                "INSERT INTO {db}.metric_series (metric_name, fingerprint, unix_milli, labels) \
-                 SELECT 'up', number + 1000, {recent}, \
+                "INSERT INTO {db}.metric_landing (kind, metric_name, fingerprint, unix_milli, labels) \
+                 SELECT 2, 'up', number + 1000, {recent}, \
                         concat('{{\"job\":\"w', toString(number), '\"}}') \
                  FROM numbers(200000)"
             ),
@@ -896,4 +913,54 @@ async fn a_memory_bounded_sweep_failure_retains_the_last_good_snapshot() {
     assert!(cache.is_warm(), "a failed sweep must not un-warm the cache");
 
     drop_database(&bootstrap, db).await;
+}
+
+/// Issue #623: a series is two rows now — its activity in `metric_series`
+/// and its own label row in `metric_labels`.
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SeedActivityRow {
+    day: u16,
+    fingerprint: u128,
+    metric_name: String,
+    hours: u32,
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SeedLabelRow {
+    metric_name: String,
+    fingerprint: u128,
+    labels: String,
+    first_seen: i64,
+    last_seen: i64,
+}
+
+/// Seeds `rows` the way the two views fill the tables from one kind-2 row.
+async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
+    let activity: Vec<SeedActivityRow> = rows
+        .iter()
+        .map(|r| SeedActivityRow {
+            day: r.unix_milli.div_euclid(86_400_000) as u16,
+            fingerprint: r.fingerprint,
+            metric_name: r.metric_name.clone(),
+            hours: 1u32 << (r.unix_milli.rem_euclid(86_400_000) / 3_600_000),
+        })
+        .collect();
+    let labels: Vec<SeedLabelRow> = rows
+        .iter()
+        .map(|r| SeedLabelRow {
+            metric_name: r.metric_name.clone(),
+            fingerprint: r.fingerprint,
+            labels: r.labels.clone(),
+            first_seen: r.unix_milli,
+            last_seen: r.unix_milli,
+        })
+        .collect();
+    client
+        .insert_block("metric_series", &activity)
+        .await
+        .expect("seed metric_series");
+    client
+        .insert_block("metric_labels", &labels)
+        .await
+        .expect("seed metric_labels");
 }

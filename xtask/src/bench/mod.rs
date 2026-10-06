@@ -9,10 +9,6 @@
 //!   plus the §9-mandated label/series discovery shape, captures per-query
 //!   `system.query_log` evidence and `EXPLAIN indexes = 1`, and emits JSON
 //!   (+ optionally a markdown table body) evidence.
-//! - `metrics-labels` (issue #34) — the M2 label-resolution benchmark:
-//!   benchmarks the docs/schemas.md §2.1 strategy ladder's three paths
-//!   (cache matcher, SQL fallback, prototype `metric_series_idx`) on a
-//!   deterministic `metric_series` corpus. See [`metrics_labels`].
 //! - `traces-read` (issue #57 AC4) — the M4 traces read-path
 //!   shard-locality evidence harness on the 2-shard
 //!   `ci/clickhouse-cluster` fixture: per-stage per-shard
@@ -54,7 +50,6 @@ pub mod dataset;
 pub mod logs_hydration;
 pub mod match_flag_head;
 pub mod metadata_filter;
-pub mod metrics_labels;
 pub mod queries;
 mod query_log;
 pub mod report;
@@ -70,7 +65,7 @@ use pulsus_schema_testkit::run_init;
 
 #[derive(Parser, Debug, Clone)]
 pub struct BenchArgs {
-    /// `"logs-read"` (issue #16) or `"metrics-labels"` (issue #34).
+    /// `"logs-read"` (issue #16), or another scenario [`run`] names.
     #[arg(default_value = "logs-read")]
     pub scenario: String,
     #[arg(long, value_enum, default_value_t = Profile::Ci)]
@@ -113,45 +108,13 @@ pub struct BenchArgs {
     #[arg(long)]
     pub report_out: Option<String>,
 
-    // --- `metrics-labels` scenario only (issue #34); all defaulted so
-    // `logs-read` is unaffected. ---
-    /// Per-metric series cardinalities, comma-separated (`metrics-labels`
-    /// only). **`--profile ci` hard-codes a fixed small set and rejects any
-    /// override** (never silently runs the 5M-series shape in CI); only
-    /// `--profile full` accepts this override, defaulting to
-    /// `10000,500000,5000000` when unset. See
-    /// [`metrics_labels::CI_CARDINALITIES`]/[`metrics_labels::FULL_CARDINALITIES`].
-    #[arg(long)]
-    pub metric_cardinalities: Option<String>,
-    /// Activity-bucket sizes to benchmark, comma-separated (`1h`/`1d`
-    /// tokens only, `metrics-labels` only).
-    #[arg(long, default_value = "1h,1d")]
-    pub activity_buckets: String,
-    /// The `metric_series` corpus window in hours (`metrics-labels` only) —
-    /// default matches `PULSUS_CACHE_WINDOW`'s own default (24h).
-    #[arg(long, default_value_t = 24)]
-    pub corpus_window_hours: u64,
-    /// `PULSUS_CACHE_MAX_SERIES` override for the benchmarked
-    /// [`pulsus_read::metrics::LabelCache`] (`metrics-labels` only) —
-    /// raised well above the product default so the in-process matcher
-    /// actually evaluates every benchmarked selector instead of degrading
-    /// to the SQL fallback before doing any work (architect plan edge case
-    /// 1).
-    #[arg(long, default_value_t = 10_000_000)]
-    pub cache_max_series: u64,
-    /// Timed repetitions of the pure in-process `SeriesResolver::resolve`
-    /// call, per selector/cardinality (`metrics-labels` only, path 1).
-    #[arg(long, default_value_t = 1_000)]
-    pub matcher_reps: usize,
-
     // --- `logs-hydration` scenario only (issue #35); all defaulted so
-    // `logs-read`/`metrics-labels` are unaffected. ---
+    // `logs-read` is unaffected. ---
     /// Selector breadths (streams-per-service), comma-separated
     /// (`logs-hydration` only). **`--profile ci` hard-codes
     /// [`logs_hydration::CI_BREADTHS`] and rejects any override**; only
     /// `--profile full` accepts this override, defaulting to
-    /// [`logs_hydration::FULL_BREADTHS`] when unset — same posture as
-    /// `--metric-cardinalities`.
+    /// [`logs_hydration::FULL_BREADTHS`] when unset.
     #[arg(long)]
     pub breadths: Option<String>,
     /// Hidden internal mode (architect plan v3/v5): runs exactly one
@@ -178,20 +141,19 @@ pub enum Profile {
 }
 
 /// Dispatches on `args.scenario` — `"logs-read"` (issue #16),
-/// `"metrics-labels"` (issue #34), `"logs-hydration"` (issue #35),
+/// `"logs-hydration"` (issue #35),
 /// `"traces-read"` (issue #57) or `"traces-lowering"` (issue #492
 /// part 8); any other value is a hard error.
 pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
     match args.scenario.as_str() {
         "logs-read" => run_logs_read(args).await,
-        "metrics-labels" => metrics_labels::run(args).await,
         "logs-hydration" => logs_hydration::run(args).await,
         "traces-read" => traces_read::run(args).await,
         "traces-lowering" => traces_lowering::run(args).await,
         "match-flag-head" => match_flag_head::run(args).await,
         "logql-metadata-filter" => metadata_filter::run(args).await,
         other => anyhow::bail!(
-            "unknown bench scenario {other:?} (expected \"logs-read\", \"metrics-labels\", \
+            "unknown bench scenario {other:?} (expected \"logs-read\", \
              \"logs-hydration\", \"traces-read\", \"traces-lowering\", or \
              \"match-flag-head\")"
         ),

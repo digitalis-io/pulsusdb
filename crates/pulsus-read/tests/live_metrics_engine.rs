@@ -28,13 +28,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
-use pulsus_model::DEFAULT_ACTIVITY_BUCKET_MS;
+use pulsus_model::ACTIVITY_BUCKET_MS;
 use pulsus_promql::DEFAULT_LOOKBACK_MS;
 use pulsus_promql::parser::parse;
 use pulsus_read::{
     DataWindow, DiscoveryFilter, ExplainStage, FetchProbe, LabelCache, LabelCacheConfig,
     LabelMatcher, MatchOp, MetricQueryParams, MetricsConfig, MetricsEngine, PlanExplain,
-    QueryResult, ReadError,
+    QueryResult, ReadError, StatementProbe,
 };
 use pulsus_schema::RenderCtx;
 use pulsus_schema_testkit::run_init;
@@ -109,7 +109,6 @@ struct SeedSeriesRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedSampleRow {
-    metric_name: String,
     fingerprint: u128,
     unix_milli: i64,
     value: f64,
@@ -119,7 +118,6 @@ struct SeedSampleRow {
 /// catalog CREATE, RowBinary is positional).
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedHistRow {
-    metric_name: String,
     fingerprint: u128,
     unix_milli: i64,
     schema: i8,
@@ -144,10 +142,7 @@ async fn seed_hist_samples(client: &ChClient, rows: &[SeedHistRow]) {
 }
 
 async fn seed_series(client: &ChClient, rows: &[SeedSeriesRow]) {
-    client
-        .insert_block("metric_series", rows)
-        .await
-        .expect("seed metric_series");
+    seed_series_rows(client, rows).await;
 }
 
 async fn seed_samples(client: &ChClient, rows: &[SeedSampleRow]) {
@@ -174,7 +169,7 @@ fn cache_config(db: &str, window_ms: i64) -> LabelCacheConfig {
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
         db: db.to_string(),
         series_table: "metric_series".to_string(),
-        bucket_ms: DEFAULT_ACTIVITY_BUCKET_MS,
+        labels_table: "metric_labels".to_string(),
         window_ms,
         cache_max_series: 50_000,
         ttl: Duration::from_secs(60),
@@ -191,6 +186,7 @@ fn engine_config(db: &str) -> MetricsConfig {
         samples_table: "metric_samples".to_string(),
         hist_samples_table: "metric_hist_samples".to_string(),
         series_table: "metric_series".to_string(),
+        labels_table: "metric_labels".to_string(),
         metadata_table: "metric_metadata".to_string(),
         experimental_functions: false,
         max_metric_fanout: 1_000,
@@ -246,7 +242,7 @@ async fn count_by_job_up_is_lookback_correct_and_excludes_a_silent_series() {
         .expect("connect (engine client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now / bucket) * bucket;
 
     seed_series(
@@ -278,7 +274,6 @@ async fn count_by_job_up_is_lookback_correct_and_excludes_a_silent_series() {
         &[
             // fp1 (job=api): live, sampled at the query instant itself.
             SeedSampleRow {
-                metric_name: "up".to_string(),
                 fingerprint: 1,
                 unix_milli: recent_bucket,
                 value: 1.0,
@@ -288,14 +283,12 @@ async fn count_by_job_up_is_lookback_correct_and_excludes_a_silent_series() {
             // lookback of this instant" case the removed cache-only path
             // got wrong. Must be excluded from the count.
             SeedSampleRow {
-                metric_name: "up".to_string(),
                 fingerprint: 2,
                 unix_milli: recent_bucket - (DEFAULT_LOOKBACK_MS + 60_000),
                 value: 1.0,
             },
             // fp3 (job=web): live.
             SeedSampleRow {
-                metric_name: "up".to_string(),
                 fingerprint: 3,
                 unix_milli: recent_bucket,
                 value: 1.0,
@@ -373,7 +366,7 @@ async fn bare_selector_query_keeps_metric_name_end_to_end() {
         .expect("connect (engine client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now / bucket) * bucket;
 
     seed_series(
@@ -389,7 +382,6 @@ async fn bare_selector_query_keeps_metric_name_end_to_end() {
     seed_samples(
         &client,
         &[SeedSampleRow {
-            metric_name: "up".to_string(),
             fingerprint: 1,
             unix_milli: recent_bucket,
             value: 1.0,
@@ -466,7 +458,7 @@ async fn count_by_job_up_historical_variant_routes_through_metric_series() {
         .expect("connect (engine client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     // 2 days ago: comfortably outside the 24h cache window below, but
     // safely inside the schema's 7-day raw retention TTL (unlike a
     // timestamp right at the 7-day boundary, which risks a background TTL
@@ -487,7 +479,6 @@ async fn count_by_job_up_historical_variant_routes_through_metric_series() {
     seed_samples(
         &client,
         &[SeedSampleRow {
-            metric_name: "up".to_string(),
             fingerprint: 4242,
             unix_milli: last_week_bucket,
             value: 1.0,
@@ -559,7 +550,7 @@ async fn group_with_offset_routes_through_metric_series() {
         .expect("connect (engine client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let two_days_ms = 2 * 24 * 3_600_000;
     let recent_bucket = (now / bucket) * bucket;
     let two_days_ago_bucket = ((now - two_days_ms) / bucket) * bucket;
@@ -581,7 +572,6 @@ async fn group_with_offset_routes_through_metric_series() {
     seed_samples(
         &client,
         &[SeedSampleRow {
-            metric_name: "up".to_string(),
             fingerprint: 777,
             unix_milli: two_days_ago_bucket,
             value: 1.0,
@@ -650,7 +640,7 @@ async fn count_by_service_up_over_query_range_returns_a_matrix_not_a_vector() {
         .expect("connect (engine client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now / bucket) * bucket;
     let step_ms = 60_000;
     // 3 steps, both series present at every one of them — this test proves
@@ -686,37 +676,31 @@ async fn count_by_service_up_over_query_range_returns_a_matrix_not_a_vector() {
         &client,
         &[
             SeedSampleRow {
-                metric_name: "up".to_string(),
                 fingerprint: 10,
                 unix_milli: t0,
                 value: 1.0,
             },
             SeedSampleRow {
-                metric_name: "up".to_string(),
                 fingerprint: 10,
                 unix_milli: t1,
                 value: 1.0,
             },
             SeedSampleRow {
-                metric_name: "up".to_string(),
                 fingerprint: 10,
                 unix_milli: t2,
                 value: 1.0,
             },
             SeedSampleRow {
-                metric_name: "up".to_string(),
                 fingerprint: 11,
                 unix_milli: t0,
                 value: 1.0,
             },
             SeedSampleRow {
-                metric_name: "up".to_string(),
                 fingerprint: 11,
                 unix_milli: t1,
                 value: 1.0,
             },
             SeedSampleRow {
-                metric_name: "up".to_string(),
                 fingerprint: 11,
                 unix_milli: t2,
                 value: 1.0,
@@ -797,7 +781,7 @@ async fn count_by_service_routes_sample_fetch_for_both_instant_and_range() {
         .expect("connect (engine client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now / bucket) * bucket;
     let step_ms = 60_000;
     let t0 = recent_bucket;
@@ -817,13 +801,11 @@ async fn count_by_service_routes_sample_fetch_for_both_instant_and_range() {
         &client,
         &[
             SeedSampleRow {
-                metric_name: "up".to_string(),
                 fingerprint: 20,
                 unix_milli: t0,
                 value: 1.0,
             },
             SeedSampleRow {
-                metric_name: "up".to_string(),
                 fingerprint: 20,
                 unix_milli: t1,
                 value: 1.0,
@@ -904,7 +886,7 @@ async fn count_by_service_routes_sample_fetch_for_both_instant_and_range() {
 /// every selector fetch at entry until released, so a `sum(foo) +
 /// sum(bar)` query's two selector fetches can only both be observed
 /// in-flight (`FetchProbe::in_flight() == 2`) if `query_inner`'s
-/// `join_all` (`metrics/exec.rs:524-529`) truly dispatched them
+/// `join_all` (`metrics/exec.rs:597-602`) truly dispatched them
 /// concurrently — under a regression to a sequential per-selector loop,
 /// the second selector's fetch is never even constructed until the first
 /// completes, so `in_flight` can never reach 2 and the rendezvous below
@@ -941,7 +923,7 @@ async fn binary_expression_fetches_both_sides_concurrently() {
         .expect("connect (probe client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now / bucket) * bucket;
 
     // Enough rows per metric that a single selector's fetch takes
@@ -964,7 +946,6 @@ async fn binary_expression_fetches_both_sides_concurrently() {
             });
             for t in 0..SAMPLES_PER_SERIES {
                 sample_rows.push(SeedSampleRow {
-                    metric_name: metric.to_string(),
                     fingerprint: u128::from(fp),
                     unix_milli: recent_bucket - t * 1_000,
                     value: t as f64,
@@ -1115,7 +1096,7 @@ async fn rate_end_to_end_against_real_samples() {
         .expect("connect (engine client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now / bucket) * bucket;
 
     seed_series(
@@ -1137,13 +1118,11 @@ async fn rate_end_to_end_against_real_samples() {
         &client,
         &[
             SeedSampleRow {
-                metric_name: "http_requests_total".to_string(),
                 fingerprint: 55,
                 unix_milli: recent_bucket - 59_999,
                 value: 0.0,
             },
             SeedSampleRow {
-                metric_name: "http_requests_total".to_string(),
                 fingerprint: 55,
                 unix_milli: recent_bucket,
                 value: 60.0,
@@ -1296,7 +1275,6 @@ async fn info_cardinality_cap_rejects_over_cap_before_materialization() {
     let info_samples: Vec<SeedSampleRow> = info_series
         .iter()
         .map(|s| SeedSampleRow {
-            metric_name: s.metric_name.clone(),
             fingerprint: s.fingerprint,
             unix_milli: now,
             value: 1.0,
@@ -1314,7 +1292,6 @@ async fn info_cardinality_cap_rejects_over_cap_before_materialization() {
     seed_samples(
         &cache_client,
         &[SeedSampleRow {
-            metric_name: base.metric_name.clone(),
             fingerprint: base.fingerprint,
             unix_milli: now,
             value: 1.0,
@@ -1386,7 +1363,7 @@ async fn info_cardinality_cap_rejects_over_cap_on_the_degraded_sql_fallback_path
         .expect("connect (engine client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     // 2 days ago: outside the 24h cache window below (forcing
     // `SqlFallback`), safely inside the 7-day raw retention TTL — the
     // `count_by_job_up_historical_variant_routes_through_metric_series`
@@ -1406,7 +1383,6 @@ async fn info_cardinality_cap_rejects_over_cap_on_the_degraded_sql_fallback_path
     let info_samples: Vec<SeedSampleRow> = info_series
         .iter()
         .map(|s| SeedSampleRow {
-            metric_name: s.metric_name.clone(),
             fingerprint: s.fingerprint,
             unix_milli: last_week_bucket,
             value: 1.0,
@@ -1424,7 +1400,6 @@ async fn info_cardinality_cap_rejects_over_cap_on_the_degraded_sql_fallback_path
     seed_samples(
         &client,
         &[SeedSampleRow {
-            metric_name: base.metric_name.clone(),
             fingerprint: base.fingerprint,
             unix_milli: last_week_bucket,
             value: 1.0,
@@ -1501,7 +1476,7 @@ async fn sample_budget_rejects_over_cap_fetch_and_admits_exactly_at_cap() {
         .expect("connect (cache client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     // 2 days ago: outside the 24h cache window below (forcing
     // `SqlFallback`, whose label hydration must NOT charge), inside the
     // 7-day raw retention — the info-cardinality fallback test's routing
@@ -1520,7 +1495,6 @@ async fn sample_budget_rejects_over_cap_fetch_and_admits_exactly_at_cap() {
     // window ending at b0 + 4s.
     let samples: Vec<SeedSampleRow> = (0..5i64)
         .map(|i| SeedSampleRow {
-            metric_name: series.metric_name.clone(),
             fingerprint: series.fingerprint,
             unix_milli: b0 + i * 1_000,
             value: i as f64,
@@ -1634,7 +1608,7 @@ async fn info_cardinality_probe_counts_distinct_series_not_activity_bucket_rows(
         .expect("connect (engine client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     // 2 days ago (outside the 24h cache window → `SqlFallback`, inside
     // the 7-day retention), bucket-aligned; the range query below spans
     // buckets [b0, b0+2*bucket] so all three activity buckets fall inside
@@ -1657,7 +1631,6 @@ async fn info_cardinality_probe_counts_distinct_series_not_activity_bucket_rows(
                 labels: format!(r#"{{"instance":"i{i}","job":"j","data":"d{i}"}}"#),
             });
             samples.push(SeedSampleRow {
-                metric_name: "target_info".to_string(),
                 fingerprint: u128::from(fp),
                 unix_milli: t,
                 value: 1.0,
@@ -1679,7 +1652,6 @@ async fn info_cardinality_probe_counts_distinct_series_not_activity_bucket_rows(
     .await;
     for &t in &buckets {
         samples.push(SeedSampleRow {
-            metric_name: "metric".to_string(),
             fingerprint: base_fp,
             unix_milli: t,
             value: 1.0,
@@ -1845,7 +1817,7 @@ async fn explain_carries_the_real_generated_sample_fetch_sql() {
         .expect("connect (engine client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now / bucket) * bucket;
 
     seed_series(
@@ -1861,7 +1833,6 @@ async fn explain_carries_the_real_generated_sample_fetch_sql() {
     seed_samples(
         &client,
         &[SeedSampleRow {
-            metric_name: "up".to_string(),
             fingerprint: 1,
             unix_milli: recent_bucket,
             value: 1.0,
@@ -1899,9 +1870,115 @@ async fn explain_carries_the_real_generated_sample_fetch_sql() {
         fetch_stage.sql
     );
     assert!(fetch_stage.sql.contains("FROM metric_samples"));
-    assert!(fetch_stage.sql.contains("PREWHERE metric_name = 'up'"));
+    // Issue #623: the sample tables carry no metric name; the read is the
+    // resolved IDs and the window.
+    assert!(!fetch_stage.sql.contains("metric_name"));
+    assert!(fetch_stage.sql.contains("AND fingerprint IN (toUInt128("));
     let resolution_stage = stage(&explain, "series_resolution");
     assert!(resolution_stage.sql.contains("matching series"));
+
+    drop_database(&bootstrap, db).await;
+}
+
+/// **T5 (issue #623): every fetch path sends a selector's float read and
+/// histogram read at once.** A [`StatementProbe`] parks the first sample
+/// statement until a second enters (for at most [`StatementProbe::WAIT`]);
+/// a path that awaited one read before sending the other parks its first
+/// for the whole wait and records one statement in flight. A fresh probe
+/// and one chunk per path: the cache's chunks, the fallback (a window
+/// outside the cache) and the multi-metric fan-out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_fetch_path_sends_both_reads_at_once() {
+    skip_unless_live!();
+
+    let bootstrap = ChClient::new(test_config("default"))
+        .await
+        .expect("connect (bootstrap)");
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_engine_both_reads");
+    init_db(&bootstrap, db).await;
+    let client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (target db)");
+
+    let now = now_ms();
+    let bucket = ACTIVITY_BUCKET_MS;
+    let recent = (now / bucket) * bucket;
+    let historical = ((now - 2 * 24 * 3_600_000) / bucket) * bucket;
+    let mut series = Vec::new();
+    let mut samples = Vec::new();
+    for (name, fp) in [("up", 1u128), ("down", 2)] {
+        for at in [recent, historical] {
+            series.push(SeedSeriesRow {
+                metric_name: name.to_string(),
+                fingerprint: fp,
+                unix_milli: at,
+                labels: r#"{"job":"api"}"#.to_string(),
+            });
+            samples.push(SeedSampleRow {
+                fingerprint: fp,
+                unix_milli: at,
+                value: 1.0,
+            });
+        }
+    }
+    seed_series(&client, &series).await;
+    seed_samples(&client, &samples).await;
+
+    // A 24h cache window: `historical` is outside it.
+    let cache = Arc::new(LabelCache::new(
+        ChClient::new(test_config(db))
+            .await
+            .expect("connect (cache)"),
+        cache_config(db, 24 * 3_600_000),
+    ));
+    cache.refresh().await.expect("refresh");
+
+    for (path, query, at) in [
+        ("chunks", "up", recent),
+        ("fallback", "up", historical),
+        ("multi", r#"{__name__=~"up|down"}"#, recent),
+    ] {
+        let probe = StatementProbe::new();
+        let engine = MetricsEngine::new(
+            ChClient::new(test_config(db))
+                .await
+                .expect("connect (engine)"),
+            Arc::clone(&cache),
+            engine_config(db),
+        )
+        .with_statement_probe(Arc::clone(&probe));
+        let params = MetricQueryParams {
+            start_ms: at,
+            end_ms: at,
+            step_ms: 0,
+        };
+        let (_, _, explain) = engine
+            .query_explained(&parse(query).expect("parse"), &params)
+            .await
+            .unwrap_or_else(|e| panic!("{path}: {e}"));
+        // The path taken: only the fallback's fetch nests the activity
+        // read; only the fan-out resolves across metric names.
+        let fetch = &stage(&explain, "sample_fetch").sql;
+        let resolution = &stage(&explain, "series_resolution").sql;
+        assert_eq!(
+            (
+                fetch.contains("FROM metric_series"),
+                resolution.contains("name-less selector fan-out"),
+            ),
+            match path {
+                "chunks" => (false, false),
+                "fallback" => (true, false),
+                _ => (false, true),
+            },
+            "{path}: {fetch}"
+        );
+        assert!(
+            probe.max_in_flight() >= 2,
+            "{path}: the float and histogram reads must be in flight together; \
+             the probe saw at most {} statement(s) in flight",
+            probe.max_in_flight()
+        );
+    }
 
     drop_database(&bootstrap, db).await;
 }
@@ -1929,7 +2006,7 @@ async fn explain_carries_the_fallback_subquery_sample_fetch_sql() {
         .expect("connect (engine client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let two_days_ms = 2 * 24 * 3_600_000;
     let historical_bucket = ((now - two_days_ms) / bucket) * bucket;
 
@@ -1946,7 +2023,6 @@ async fn explain_carries_the_fallback_subquery_sample_fetch_sql() {
     seed_samples(
         &client,
         &[SeedSampleRow {
-            metric_name: "up".to_string(),
             fingerprint: 1,
             unix_milli: historical_bucket,
             value: 1.0,
@@ -2035,7 +2111,7 @@ async fn discovery_endpoints_honor_the_query_window_and_include_name() {
         .expect("connect (engine client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now / bucket) * bucket;
     // A cache-resident series bucketed 3 buckets before `recent_bucket` —
     // inside the 24h cache residency window below, but outside the
@@ -2205,7 +2281,7 @@ async fn an_re2_rejected_matcher_regex_is_a_client_rejection_not_a_server_error(
         .expect("connect (engine client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     // 2 days back: outside the 24h cache window (forcing `SqlFallback` on
     // the query path), inside the 7-day raw retention TTL.
     let old_bucket = ((now - 2 * 24 * 3_600_000) / bucket) * bucket;
@@ -2222,7 +2298,6 @@ async fn an_re2_rejected_matcher_regex_is_a_client_rejection_not_a_server_error(
     seed_samples(
         &client,
         &[SeedSampleRow {
-            metric_name: "up".to_string(),
             fingerprint: 1,
             unix_milli: old_bucket,
             value: 1.0,
@@ -2407,7 +2482,7 @@ async fn a_warm_cache_does_not_answer_an_re2_rejected_matcher_in_process() {
         .expect("connect (engine client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now / bucket) * bucket;
     seed_series(
         &client,
@@ -2422,7 +2497,6 @@ async fn a_warm_cache_does_not_answer_an_re2_rejected_matcher_in_process() {
     seed_samples(
         &client,
         &[SeedSampleRow {
-            metric_name: "up".to_string(),
             fingerprint: 1,
             unix_milli: recent_bucket,
             value: 1.0,
@@ -2558,7 +2632,7 @@ async fn label_names_with_no_filters_covers_every_metric_in_window() {
         .expect("connect (engine client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now / bucket) * bucket;
 
     seed_series(
@@ -2633,7 +2707,7 @@ async fn series_applies_regex_matchers() {
         .expect("connect (engine client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now / bucket) * bucket;
 
     seed_series(
@@ -2708,7 +2782,7 @@ async fn series_with_a_matcher_only_filter_matches_across_metric_names() {
         .expect("connect (engine client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now / bucket) * bucket;
 
     seed_series(
@@ -2966,7 +3040,7 @@ async fn tsdb_status_reports_series_counts_with_zero_sample_table_access() {
         .expect("connect (engine client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now / bucket) * bucket;
 
     seed_series(
@@ -3039,13 +3113,11 @@ async fn nameless_selector_fans_out_with_per_series_names_and_one_flat_in_set_fe
         .expect("connect (engine client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now / bucket) * bucket;
 
-    // Fingerprint 1 exists under BOTH http_a_total and http_b_total (the
-    // same label set fingerprints identically across metric names —
-    // metric_fingerprint excludes __name__); other_metric must be pruned
-    // by the name regex.
+    // One label set under http_a_total and http_b_total: two series, two
+    // IDs (issue #623); other_metric must be pruned by the name regex.
     seed_series(
         &client,
         &[
@@ -3057,7 +3129,7 @@ async fn nameless_selector_fans_out_with_per_series_names_and_one_flat_in_set_fe
             },
             SeedSeriesRow {
                 metric_name: "http_b_total".to_string(),
-                fingerprint: 1,
+                fingerprint: 3,
                 unix_milli: recent_bucket,
                 labels: r#"{"job":"api"}"#.to_string(),
             },
@@ -3074,19 +3146,16 @@ async fn nameless_selector_fans_out_with_per_series_names_and_one_flat_in_set_fe
         &client,
         &[
             SeedSampleRow {
-                metric_name: "http_a_total".to_string(),
                 fingerprint: 1,
                 unix_milli: recent_bucket,
                 value: 11.0,
             },
             SeedSampleRow {
-                metric_name: "http_b_total".to_string(),
-                fingerprint: 1,
+                fingerprint: 3,
                 unix_milli: recent_bucket,
                 value: 22.0,
             },
             SeedSampleRow {
-                metric_name: "other_metric".to_string(),
                 fingerprint: 2,
                 unix_milli: recent_bucket,
                 value: 99.0,
@@ -3124,10 +3193,9 @@ async fn nameless_selector_fans_out_with_per_series_names_and_one_flat_in_set_fe
     assert_eq!(fetches.len(), 1, "one flat fetch: {:#?}", explain.stages);
     let sql = &fetches[0].sql;
     assert!(
-        sql.contains("PREWHERE metric_name IN ('http_a_total', 'http_b_total')"),
-        "flat IN-set prune must name exactly the regex-matched metrics: {sql}"
+        sql.contains("fingerprint IN (toUInt128('1'), toUInt128('3'))"),
+        "the fetch reads exactly the regex-matched metrics' IDs: {sql}"
     );
-    assert!(sql.contains("fingerprint IN (toUInt128('1'))"), "{sql}");
     assert!(!sql.contains("other_metric"), "{sql}");
 
     match result {
@@ -3187,132 +3255,6 @@ async fn nameless_selector_fans_out_with_per_series_names_and_one_flat_in_set_fe
     drop_database(&bootstrap, db).await;
 }
 
-/// Issue #85 code review round 1, finding 1 (live gap): a genuine
-/// `(metric_name, fingerprint)` cross-pair the cache did NOT resolve —
-/// the name is known via one fingerprint, the fingerprint via another
-/// name, and the pair itself exists only in `metric_samples` (a series
-/// registered inside the post-sweep recency gap). The flat IN×IN fetch
-/// returns its rows; they must surface with the fingerprint's hydrated
-/// (name-invariant) labels, NEVER an empty label set.
-#[tokio::test]
-async fn nameless_selector_hydrates_a_post_sweep_cross_pair_never_empty_labels() {
-    skip_unless_live!();
-
-    let bootstrap = ChClient::new(test_config("default"))
-        .await
-        .expect("connect (bootstrap)");
-    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_engine_cross_pair");
-    init_db(&bootstrap, db).await;
-    let client = ChClient::new(test_config(db))
-        .await
-        .expect("connect (target db)");
-    let cache_client = ChClient::new(test_config(db))
-        .await
-        .expect("connect (cache client)");
-    let engine_client = ChClient::new(test_config(db))
-        .await
-        .expect("connect (engine client)");
-
-    let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
-    let recent_bucket = (now / bucket) * bucket;
-
-    // Pre-sweep registrations: cross_a_total resolves fp1, cross_b_total
-    // resolves fp2 — so the fan-out's IN lists contain BOTH names and
-    // BOTH fingerprints, but the (cross_b_total, fp1) pair is unresolved.
-    seed_series(
-        &client,
-        &[
-            SeedSeriesRow {
-                metric_name: "cross_a_total".to_string(),
-                fingerprint: 1,
-                unix_milli: recent_bucket,
-                labels: r#"{"job":"api"}"#.to_string(),
-            },
-            SeedSeriesRow {
-                metric_name: "cross_b_total".to_string(),
-                fingerprint: 2,
-                unix_milli: recent_bucket,
-                labels: r#"{"job":"web"}"#.to_string(),
-            },
-        ],
-    )
-    .await;
-
-    let cache = Arc::new(LabelCache::new(
-        cache_client,
-        cache_config(db, 24 * 3_600_000),
-    ));
-    cache.refresh().await.expect("refresh");
-    assert!(cache.is_warm());
-
-    // POST-sweep: the cross-pair's samples land (its metric_series row
-    // would land too in production, but the resident snapshot predates
-    // it — the sanctioned recency gap). fp1's labels are name-invariant
-    // ({job:"api"}), known to the cache only via cross_a_total.
-    seed_samples(
-        &client,
-        &[
-            SeedSampleRow {
-                metric_name: "cross_a_total".to_string(),
-                fingerprint: 1,
-                unix_milli: recent_bucket,
-                value: 1.0,
-            },
-            SeedSampleRow {
-                metric_name: "cross_b_total".to_string(),
-                fingerprint: 2,
-                unix_milli: recent_bucket,
-                value: 2.0,
-            },
-            SeedSampleRow {
-                metric_name: "cross_b_total".to_string(),
-                fingerprint: 1,
-                unix_milli: recent_bucket,
-                value: 3.0,
-            },
-        ],
-    )
-    .await;
-
-    let engine = MetricsEngine::new(engine_client, cache, engine_config(db));
-    let expr = parse(r#"{__name__=~"cross_.*"}"#).expect("parse");
-    let params = MetricQueryParams {
-        start_ms: recent_bucket,
-        end_ms: recent_bucket,
-        step_ms: 0,
-    };
-    let (result, _annotations) = engine.query(&expr, &params).await.expect("query");
-
-    match result {
-        QueryResult::Vector(v) => {
-            assert_eq!(v.len(), 3, "both resolved pairs + the cross-pair: {v:?}");
-            assert!(
-                v.iter()
-                    .all(|s| s.labels.iter().any(|(k, _)| k != "__name__")),
-                "no series may surface with empty (name-only) labels: {v:?}"
-            );
-            let cross = v
-                .iter()
-                .find(|s| {
-                    s.labels
-                        .contains(&("__name__".to_string(), "cross_b_total".to_string()))
-                        && s.value == 3.0
-                })
-                .unwrap_or_else(|| panic!("cross-pair series missing: {v:?}"));
-            assert!(
-                cross
-                    .labels
-                    .contains(&("job".to_string(), "api".to_string())),
-                "cross-pair must carry fp1's hydrated name-invariant labels: {cross:?}"
-            );
-        }
-        other => panic!("expected Vector, got {other:?}"),
-    }
-
-    drop_database(&bootstrap, db).await;
-}
-
 /// M7-A5a end-to-end against real ClickHouse: the metrics read path
 /// UNCONDITIONALLY dual-reads `metric_samples` + `metric_hist_samples`,
 /// merges by `unix_milli`, and decodes histogram value columns into the
@@ -3345,7 +3287,7 @@ async fn dual_read_merges_and_decodes_histogram_samples_end_to_end() {
         .expect("connect (engine)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now / bucket) * bucket;
 
     // Two series: a float `up{job="api"}` (fp 1) and a native-histogram
@@ -3373,7 +3315,6 @@ async fn dual_read_merges_and_decodes_histogram_samples_end_to_end() {
     seed_samples(
         &client,
         &[SeedSampleRow {
-            metric_name: "up".to_string(),
             fingerprint: 1,
             unix_milli: recent_bucket,
             value: 42.0,
@@ -3383,7 +3324,6 @@ async fn dual_read_merges_and_decodes_histogram_samples_end_to_end() {
     seed_hist_samples(
         &client,
         &[SeedHistRow {
-            metric_name: "req_seconds".to_string(),
             fingerprint: 2,
             unix_milli: recent_bucket,
             schema: 0,
@@ -3539,7 +3479,7 @@ async fn a_nameless_selector_with_an_uncompilable_matcher_is_bad_data_not_execut
         .expect("connect (engine client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now / bucket) * bucket;
     seed_series(
         &client,
@@ -3554,7 +3494,6 @@ async fn a_nameless_selector_with_an_uncompilable_matcher_is_bad_data_not_execut
     seed_samples(
         &client,
         &[SeedSampleRow {
-            metric_name: "up".to_string(),
             fingerprint: 1,
             unix_milli: recent_bucket,
             value: 1.0,
@@ -3793,7 +3732,7 @@ async fn selector_regex_matches_prometheus_on_cold_and_warm_resolution() {
         .expect("connect (target db)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now / bucket) * bucket;
 
     let series: Vec<SeedSeriesRow> = P278_FIXTURE
@@ -3814,7 +3753,6 @@ async fn selector_regex_matches_prometheus_on_cold_and_warm_resolution() {
         .iter()
         .enumerate()
         .map(|(i, (_, v))| SeedSampleRow {
-            metric_name: "p278".to_string(),
             fingerprint: u128::from(i as u64 + 1),
             unix_milli: recent_bucket,
             value: *v,
@@ -3993,7 +3931,7 @@ async fn label_values_name_equals_the_wide_discovery_paths_name_set() {
         .await
         .expect("connect (engine client)");
 
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now_ms() / bucket) * bucket;
     let corpus: &[(&str, u64, &str)] = &[
         ("a", 1001, r#"{"job":"api"}"#),
@@ -4219,4 +4157,54 @@ async fn label_values_name_equals_the_wide_discovery_paths_name_set() {
     );
 
     drop_database(&bootstrap, db).await;
+}
+
+/// Issue #623: a series is two rows now — its activity in `metric_series`
+/// and its own label row in `metric_labels`.
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SeedActivityRow {
+    day: u16,
+    fingerprint: u128,
+    metric_name: String,
+    hours: u32,
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SeedLabelRow {
+    metric_name: String,
+    fingerprint: u128,
+    labels: String,
+    first_seen: i64,
+    last_seen: i64,
+}
+
+/// Seeds `rows` the way the two views fill the tables from one kind-2 row.
+async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
+    let activity: Vec<SeedActivityRow> = rows
+        .iter()
+        .map(|r| SeedActivityRow {
+            day: r.unix_milli.div_euclid(86_400_000) as u16,
+            fingerprint: r.fingerprint,
+            metric_name: r.metric_name.clone(),
+            hours: 1u32 << (r.unix_milli.rem_euclid(86_400_000) / 3_600_000),
+        })
+        .collect();
+    let labels: Vec<SeedLabelRow> = rows
+        .iter()
+        .map(|r| SeedLabelRow {
+            metric_name: r.metric_name.clone(),
+            fingerprint: r.fingerprint,
+            labels: r.labels.clone(),
+            first_seen: r.unix_milli,
+            last_seen: r.unix_milli,
+        })
+        .collect();
+    client
+        .insert_block("metric_series", &activity)
+        .await
+        .expect("seed metric_series");
+    client
+        .insert_block("metric_labels", &labels)
+        .await
+        .expect("seed metric_labels");
 }

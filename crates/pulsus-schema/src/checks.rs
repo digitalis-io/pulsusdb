@@ -134,6 +134,21 @@ pub const REQUIRED_SERVER_NAMES: &[(&str, NameCatalogue)] = &[
     ("min_insert_block_size_bytes", NameCatalogue::Setting),
     ("input_format_connection_handling", NameCatalogue::Setting),
     ("input_format_max_block_wait_ms", NameCatalogue::Setting),
+    // Issue #623: the four view pins every landing insert carries, so a push
+    // whose target row a view does not write fails rather than succeeds.
+    ("materialized_views_ignore_errors", NameCatalogue::Setting),
+    (
+        "ignore_materialized_views_with_dropped_target_table",
+        NameCatalogue::Setting,
+    ),
+    (
+        "min_insert_block_size_rows_for_materialized_views",
+        NameCatalogue::Setting,
+    ),
+    (
+        "min_insert_block_size_bytes_for_materialized_views",
+        NameCatalogue::Setting,
+    ),
     ("merge_with_ttl_timeout", NameCatalogue::MergeTreeSetting),
     // The three block/seconds deduplication-window names `apply_ttl` sends
     // (issue #603). Which of the first two a statement carries is rendered
@@ -155,12 +170,12 @@ pub const REQUIRED_SERVER_NAMES: &[(&str, NameCatalogue)] = &[
         "replicated_deduplication_window_seconds",
         NameCatalogue::MergeTreeSetting,
     ),
-    // The nineteen further settings one TRACE landing insert pins, of seven
-    // classes the metrics set did not need: how the block's bytes are read,
-    // a limit that refuses a block rather than dividing it, what an error
-    // does, what an acknowledgement means, where a row is placed, what path
-    // a value is stored under, and whether exceeding a limit is an error or
-    // a success that need not be complete.
+    // The fifteen further settings one TRACE landing insert pins, of six
+    // classes the metrics set does not need: how the block's bytes are read,
+    // a limit that refuses a block rather than dividing it, what an
+    // acknowledgement means, where a row is placed, what path a value is
+    // stored under, and whether exceeding a limit is an error or a success
+    // that need not be complete.
     // `QuerySettings::trace_landing_insert` names them together and quotes
     // what each one's own catalogue entry says. A pin added there without a
     // row here is caught by
@@ -174,19 +189,6 @@ pub const REQUIRED_SERVER_NAMES: &[(&str, NameCatalogue)] = &[
     ("max_partitions_per_insert_block", NameCatalogue::Setting),
     (
         "throw_on_max_partitions_per_insert_block",
-        NameCatalogue::Setting,
-    ),
-    ("materialized_views_ignore_errors", NameCatalogue::Setting),
-    (
-        "ignore_materialized_views_with_dropped_target_table",
-        NameCatalogue::Setting,
-    ),
-    (
-        "min_insert_block_size_rows_for_materialized_views",
-        NameCatalogue::Setting,
-    ),
-    (
-        "min_insert_block_size_bytes_for_materialized_views",
         NameCatalogue::Setting,
     ),
     ("distributed_foreground_insert", NameCatalogue::Setting),
@@ -498,11 +500,15 @@ mod tests {
             "min_insert_block_size_bytes",
             "input_format_connection_handling",
             "input_format_max_block_wait_ms",
+            "materialized_views_ignore_errors",
+            "ignore_materialized_views_with_dropped_target_table",
+            "min_insert_block_size_rows_for_materialized_views",
+            "min_insert_block_size_bytes_for_materialized_views",
         ]);
 
-        // The trace landing insert's own nineteen pins are rows too (issues
+        // The trace landing insert's own fifteen pins are rows too (issues
         // #584 to #586), and they are **derived from that constructor** here
-        // rather than written out a second time: this case owns the eight
+        // rather than written out a second time: this case owns the twelve
         // above as a literal set, and
         // `the_settings_read_back_at_startup_are_the_ones_the_trace_insert_sends`
         // owns the rest, both ways.
@@ -571,13 +577,13 @@ mod tests {
                      'max_insert_block_size_bytes', 'input_format_max_block_size_bytes', \
                      'min_insert_block_size_rows', 'min_insert_block_size_bytes', \
                      'input_format_connection_handling', 'input_format_max_block_wait_ms', \
-                     'input_format_binary_read_json_as_string', \
-                     'format_binary_max_object_size', 'max_partitions_per_insert_block', \
-                     'throw_on_max_partitions_per_insert_block', \
                      'materialized_views_ignore_errors', \
                      'ignore_materialized_views_with_dropped_target_table', \
                      'min_insert_block_size_rows_for_materialized_views', \
                      'min_insert_block_size_bytes_for_materialized_views', \
+                     'input_format_binary_read_json_as_string', \
+                     'format_binary_max_object_size', 'max_partitions_per_insert_block', \
+                     'throw_on_max_partitions_per_insert_block', \
                      'distributed_foreground_insert', 'insert_shard_id', \
                      'json_type_escape_dots_in_keys', 'type_json_skip_duplicated_paths', \
                      'read_overflow_mode', 'read_overflow_mode_leaf', \
@@ -623,7 +629,7 @@ mod tests {
     ///
     /// Neither direction names a count or a name, so a pin added without a
     /// row, a row added without a pin, and a row added for one of the
-    /// nineteen while the reverse check only walked some of them all fail.
+    /// fifteen while the reverse check only walked some of them all fail.
     #[test]
     fn the_settings_read_back_at_startup_are_the_ones_the_trace_insert_sends() {
         use std::collections::BTreeSet;

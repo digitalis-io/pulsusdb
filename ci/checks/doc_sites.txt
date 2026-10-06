@@ -13,7 +13,16 @@ rewrite docs/schemas.md:33-33
 # reads as added, while the protected base ranges it compares against are
 # different lines. Declaring them records that, and the presence rule above
 # keeps the declaration honest about the file.
-rewrite docs/schemas.md:174-174 refs=#25,#559,#560,#603,#16,#171,#498,#2,#57,#584,#586,#587,#5,#63,#75,#478,#555
+# Issue #623 adds #26 and #623. #26 is carried: the `metric_metadata`
+# paragraph that already cited it gained the hourly descriptor resend, so the
+# rule reads the line as added. #623 is the change itself, cited where
+# `docs/schemas.md` states the label table, the activity TTL, the sorting-key
+# setting and the two concurrent sample reads.
+# Issue #623 part 1 adds #125, #315, #472, #549 and #7: each was already in a
+# paragraph that part rewrote (the activity and lookup tables, the four
+# statements, the fallback's compile probe), carried across rather than
+# introduced.
+rewrite docs/schemas.md:174-174 refs=#25,#559,#560,#603,#16,#171,#498,#2,#57,#584,#586,#587,#5,#63,#75,#478,#555,#26,#623,#125,#315,#472,#549,#7
 # `refs=#112` is a NEW reference on this file rather than a carried one. §2.4's
 # writer-contract paragraph gained the reason the read path does not route on
 # `metric_series.value_type`, and that reason is the decision A1's plan v5
@@ -54,7 +63,10 @@ leave docs/traceql-schema-migration.md:2289-2289
 # both occur as often upstream as at the head (1 and 2), carried across by
 # issue #587's rewrite of the four-access-patterns paragraph rather than
 # introduced by it.
-rewrite docs/architecture.md:337-340 refs=#603,#134,#139,#9,#498,#167,#16,#25,#586,#584,#587,#478,#555
+# Issue #623 part 1 adds #461 and #623: #461 is carried on the rewritten
+# hot-table sentence, and #623 is the change itself, cited where the
+# metrics layout and its sharding key are stated.
+rewrite docs/architecture.md:337-340 refs=#603,#134,#139,#9,#498,#167,#16,#25,#586,#584,#587,#478,#555,#461,#623
 rewrite docs/architecture.md:342-342
 rewrite docs/architecture.md:196-196
 leave docs/configuration.md:126-126

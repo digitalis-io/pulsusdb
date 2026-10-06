@@ -4,7 +4,7 @@
 //! narrower and deliberately synchronous where it can be: a resident,
 //! atomically-swapped snapshot (`fingerprint -> LabelSet` +
 //! `metric_name -> sorted [fingerprint]`) is rebuilt every `PULSUS_CACHE_TTL`
-//! by the §5.2 `LIMIT 1 BY` sweep over `PULSUS_CACHE_WINDOW`, and
+//! by the §5.2 sweep over `PULSUS_CACHE_WINDOW`, and
 //! [`labels::SeriesResolver::resolve`] is a **pure, synchronous** function
 //! over the current snapshot — the only async/ClickHouse-touching code in
 //! this module is the refresh sweep ([`refresh`]).
@@ -108,7 +108,8 @@ pub mod stats;
 pub(crate) use series_where::PromqlRe2Fallback;
 
 pub use exec::{
-    FetchProbe, MetricMeta, MetricQueryParams, MetricsConfig, MetricsEngine, TsdbStatus,
+    FetchProbe, MetricMeta, MetricQueryParams, MetricsConfig, MetricsEngine, StatementProbe,
+    TsdbStatus,
 };
 pub use labels::{
     CacheSnapshot, DEFAULT_STALENESS_MULTIPLIER, FallbackReason, LabelCache, LabelCacheConfig,

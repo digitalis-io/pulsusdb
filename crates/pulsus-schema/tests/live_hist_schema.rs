@@ -148,7 +148,6 @@ struct ExplainRow {
 /// positional). `Vec<T>` maps to `Array(T)`.
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 struct HistSampleRow {
-    metric_name: String,
     /// `UInt128` since issue #498, read as the bare integer: this suite
     /// pins the COLUMN, and `pulsus-model`'s newtype is not a dependency
     /// of this crate.
@@ -168,7 +167,7 @@ struct HistSampleRow {
     custom_values: Vec<f64>,
 }
 
-const HIST_SELECT_COLS: &str = "metric_name, fingerprint, unix_milli, schema, zero_threshold, \
+const HIST_SELECT_COLS: &str = "fingerprint, unix_milli, schema, zero_threshold, \
      zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, \
      neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values";
 
@@ -191,15 +190,6 @@ async fn native_histogram_migrations_apply_and_are_idempotent() {
     assert!(
         names.contains(&"metric_hist_samples".to_string()),
         "metric_hist_samples must exist after reconcile: {names:?}"
-    );
-
-    // The additive routing column lands on metric_series as UInt8.
-    assert_eq!(
-        column_type(&client, db, "metric_series", "value_type")
-            .await
-            .as_deref(),
-        Some("UInt8"),
-        "value_type must be a UInt8 column on metric_series after reconcile"
     );
 
     // metric_samples (id 5) gains no histogram column; metric_series (id 4)
@@ -272,7 +262,6 @@ async fn counter_reset_hint_column_is_additive_uint8_default_zero() {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock");
     let seed = HistSampleRow {
-        metric_name: "legacy_shape_metric".to_string(),
         fingerprint: 7,
         unix_milli: i64::try_from(now.as_millis()).expect("fits i64"),
         schema: 0,
@@ -296,7 +285,7 @@ async fn counter_reset_hint_column_is_additive_uint8_default_zero() {
         .query_stream::<HintRow>(
             &format!(
                 "SELECT counter_reset_hint FROM {db}.metric_hist_samples \
-                 WHERE metric_name = 'legacy_shape_metric'"
+                 WHERE fingerprint = 7"
             ),
             &QuerySettings::new(),
         )
@@ -318,11 +307,11 @@ async fn counter_reset_hint_column_is_additive_uint8_default_zero() {
 }
 
 /// Issue #113 (AC): `EXPLAIN indexes=1` on a `metric_hist_samples` fetch shows
-/// the `metric_name`-led primary key driving the read — matching the
+/// the series-ID-led primary key (issue #623) driving the read — matching the
 /// `metric_samples` gate precedent in `live_schema.rs`, so the native fetch
 /// prunes identically (no full scan).
 #[tokio::test]
-async fn metric_hist_samples_explain_shows_metric_name_pk_pruning() {
+async fn metric_hist_samples_explain_shows_series_id_pk_pruning() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
     let db = &pulsus_testkit::test_db("pulsus_hist_it_explain");
@@ -344,7 +333,6 @@ async fn metric_hist_samples_explain_shows_metric_name_pk_pruning() {
         .expect("clock");
     let unix_milli = i64::try_from(now.as_millis()).expect("fits i64");
     let seed = HistSampleRow {
-        metric_name: "http_request_duration_seconds".to_string(),
         fingerprint: 18374588331335825905,
         unix_milli,
         schema: 2,
@@ -370,8 +358,7 @@ async fn metric_hist_samples_explain_shows_metric_name_pk_pruning() {
             &format!(
                 "EXPLAIN indexes = 1 SELECT fingerprint, unix_milli, count, sum \
                  FROM {db}.metric_hist_samples \
-                 WHERE metric_name = 'http_request_duration_seconds' \
-                 AND fingerprint IN (toUInt128('18374588331335825905'))"
+                 WHERE fingerprint IN (toUInt128('18374588331335825905'))"
             ),
             &QuerySettings::new(),
         )
@@ -383,8 +370,8 @@ async fn metric_hist_samples_explain_shows_metric_name_pk_pruning() {
         plan.push('\n');
     }
     assert!(
-        plan.contains("metric_name"),
-        "EXPLAIN output must show metric_name driving the primary key read, got:\n{plan}"
+        plan.contains("Keys:\n") && plan.contains("fingerprint"),
+        "EXPLAIN output must show the series ID driving the primary key read, got:\n{plan}"
     );
 }
 
@@ -417,13 +404,9 @@ fn last_selected_granules(plan: &[String]) -> Option<u64> {
 
 /// M7-A5a AC3 (Tier-1, query-performance mandate): the dual-read's
 /// complementary `metric_hist_samples` read touches **zero granules** for a
-/// single-type series — proven for BOTH prune components of the compound
-/// primary key `(metric_name, fingerprint, unix_milli)`:
-///   (i) a **pure-float metric name** — the leading-PK `metric_name`
-///       PREWHERE prunes every histogram granule; and
-///   (ii) a **float-only fingerprint inside a histogram-bearing metric** —
-///        the `fingerprint IN (…)` prunes the histogram granule whose
-///        fingerprint range excludes it.
+/// single-type series: the primary key is `(fingerprint, unix_milli)`
+/// since issue #623, so a **float-only series ID** — `fingerprint IN (…)` —
+/// prunes the histogram granule whose fingerprint range excludes it.
 /// The complementary read is dispatched concurrently with the float read
 /// (latency-hidden), and this gate proves it is also byte-free on the wire
 /// for single-type series (A1 v5), never a full scan.
@@ -451,7 +434,6 @@ async fn complementary_hist_read_selects_zero_granules_for_single_type_series() 
     // read and would make the prune trivially/meaninglessly pass).
     const HIST_FP: u128 = 18374588331335825905;
     let seed = HistSampleRow {
-        metric_name: "mixed_metric".to_string(),
         fingerprint: HIST_FP,
         unix_milli,
         schema: 0,
@@ -475,27 +457,11 @@ async fn complementary_hist_read_selects_zero_granules_for_single_type_series() 
     let lo = unix_milli - 300_000;
     let hi = unix_milli + 1;
 
-    // (i) Pure-float metric name: the complementary hist read for a metric
-    // that has NO histogram data — metric_name PREWHERE prunes all granules.
-    let float_only = format!(
-        "SELECT fingerprint, unix_milli, count, sum FROM {db}.metric_hist_samples \
-         PREWHERE metric_name = 'pure_float_metric' \
-         WHERE unix_milli > {lo} AND unix_milli <= {hi} AND fingerprint IN (toUInt128('{HIST_FP}')) \
-         ORDER BY fingerprint, unix_milli"
-    );
-    let plan_i = explain_lines(&client, &float_only).await;
-    assert!(
-        matches!(last_selected_granules(&plan_i), None | Some(0)),
-        "(i) pure-float metric name must select zero histogram granules, got:\n{}",
-        plan_i.join("\n")
-    );
-
-    // (ii) Float-only fingerprint inside a histogram-bearing metric: the
+    // A float-only series ID: the
     // `fingerprint IN (toUInt128('1'))` prunes the only hist granule (fingerprint range
     // [BIG, BIG] excludes 1).
     let float_fp = format!(
         "SELECT fingerprint, unix_milli, count, sum FROM {db}.metric_hist_samples \
-         PREWHERE metric_name = 'mixed_metric' \
          WHERE unix_milli > {lo} AND unix_milli <= {hi} AND fingerprint IN (toUInt128('1')) \
          ORDER BY fingerprint, unix_milli"
     );
@@ -510,7 +476,6 @@ async fn complementary_hist_read_selects_zero_granules_for_single_type_series() 
     // vacuously passing because the table/part is unreadable).
     let matching = format!(
         "SELECT fingerprint, unix_milli, count, sum FROM {db}.metric_hist_samples \
-         PREWHERE metric_name = 'mixed_metric' \
          WHERE unix_milli > {lo} AND unix_milli <= {hi} AND fingerprint IN (toUInt128('{HIST_FP}')) \
          ORDER BY fingerprint, unix_milli"
     );
@@ -553,7 +518,6 @@ async fn native_histogram_row_round_trips_losslessly_exponential_and_nhcb() {
     // negative spans/deltas; no custom_values. Deltas are the Prometheus
     // wire form (first absolute, then signed deltas) stored verbatim.
     let exponential = HistSampleRow {
-        metric_name: "http_request_duration_seconds".to_string(),
         fingerprint: 0xFFFF_FFFF_FFFF_FFF1,
         unix_milli: base_ms,
         schema: 2,
@@ -574,7 +538,6 @@ async fn native_histogram_row_round_trips_losslessly_exponential_and_nhcb() {
     // custom_values (explicit bucket bounds) are used; zero/negative fields
     // empty (matches upstream custom-buckets contract). Lossless too.
     let nhcb = HistSampleRow {
-        metric_name: "http_request_duration_seconds".to_string(),
         fingerprint: 0xFFFF_FFFF_FFFF_FFF1,
         unix_milli: base_ms + 1,
         schema: -53,

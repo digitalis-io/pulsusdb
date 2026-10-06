@@ -44,7 +44,7 @@ use std::time::Duration;
 use pulsus_clickhouse::{ChError, ChRow, QuerySettings};
 use pulsus_config::WriterConfig;
 use pulsus_model::{
-    CUSTOM_BUCKETS_SCHEMA, CounterResetHint, DEFAULT_ACTIVITY_BUCKET_MS, Fingerprint, LabelSet,
+    ACTIVITY_BUCKET_MS, CUSTOM_BUCKETS_SCHEMA, CounterResetHint, Fingerprint, LabelSet,
     NativeHistogram, Span,
 };
 use pulsus_model::{Date, UnixNano};
@@ -324,7 +324,7 @@ async fn peak_over_push(push: ParsedMetrics, poison: bool) -> Measured {
     let writer = MetricWriter::with_landing_inserter_and_runtime(
         Arc::new(FixedInserter { poison }),
         runtime,
-        DEFAULT_ACTIVITY_BUCKET_MS,
+        ACTIVITY_BUCKET_MS,
         MetricWriterTables::metrics_default(),
     );
     let peak = peak_bytes_of(async {

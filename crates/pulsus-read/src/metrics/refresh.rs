@@ -1,7 +1,7 @@
 //! The only ClickHouse-touching code in this module: the docs/architecture.md
-//! §5.2 sweep (`SELECT fingerprint, metric_name, labels FROM metric_series
-//! WHERE unix_milli >= floor(now - window) ORDER BY unix_milli DESC LIMIT 1
-//! BY metric_name, fingerprint`), building a whole new
+//! §5.2 sweep (every `(metric_name, fingerprint)` in `metric_series` since
+//! `floor(now - window)`, with its own label row in `metric_labels` —
+//! [`super::sql::sweep_query`]), building a whole new
 //! [`super::labels::CacheSnapshot`] and atomically swapping it into the
 //! resident [`super::labels::LabelCache`]. [`spawn_refresh_loop`] runs this
 //! on an interval in the self-healing shape of
@@ -18,18 +18,19 @@ use std::time::Duration;
 use futures::StreamExt;
 use pulsus_clickhouse::{ChError, QuerySettings};
 use pulsus_model::{Fingerprint, LabelSet, floor_to_activity_bucket};
+
+use super::matcher::DataWindow;
 use tokio::task::JoinHandle;
 
 use super::labels::{CacheSnapshot, LabelCache};
 use super::rows::SeriesRow;
 
-/// Renders the §5.2 sweep SQL: `unix_milli >= floor(now - window)`, no
-/// upper bound (the sweep always runs "as of now"). Pure so it is
-/// snapshot-testable without a clock/DB.
-fn sweep_sql(series_table: &str, lower_bound_ms: i64) -> String {
-    format!(
-        "SELECT fingerprint, metric_name, labels\nFROM {series_table}\nWHERE unix_milli >= {lower_bound_ms}\nORDER BY unix_milli DESC\nLIMIT 1 BY metric_name, fingerprint"
-    )
+/// Renders the §5.2 sweep SQL ([`super::sql::sweep_query`]): every series
+/// active since `floor(now - window)`, with its labels, no upper bound (the
+/// sweep always runs "as of now"). Pure so it is snapshot-testable without a
+/// clock/DB.
+fn sweep_sql(series_table: &str, labels_table: &str, window: DataWindow) -> String {
+    super::sql::sweep_query(series_table, labels_table, window)
 }
 
 /// Wall-clock now, milliseconds since the Unix epoch. `SystemTime::now()`
@@ -54,9 +55,18 @@ pub(crate) fn now_unix_ms() -> i64 {
 /// [`LabelCache::refresh`] and [`spawn_refresh_loop`] both rely on.
 pub(crate) async fn run_sweep(cache: &LabelCache) -> Result<(), ChError> {
     let now_ms = now_unix_ms();
-    let lower_bound_ms =
-        floor_to_activity_bucket(now_ms - cache.config.window_ms, cache.config.bucket_ms);
-    let sql = sweep_sql(&cache.config.series_table, lower_bound_ms);
+    let lower_bound_ms = floor_to_activity_bucket(
+        now_ms - cache.config.window_ms,
+        pulsus_model::ACTIVITY_BUCKET_MS,
+    );
+    let sql = sweep_sql(
+        &cache.config.series_table,
+        &cache.config.labels_table,
+        DataWindow {
+            start_ms: lower_bound_ms,
+            end_ms: now_ms,
+        },
+    );
 
     let result = fetch_rows(cache, &sql).await;
     let rows = match result {
@@ -70,15 +80,11 @@ pub(crate) async fn run_sweep(cache: &LabelCache) -> Result<(), ChError> {
     let mut by_fingerprint: HashMap<Fingerprint, LabelSet> = HashMap::with_capacity(rows.len());
     let mut by_metric: HashMap<String, Vec<Fingerprint>> = HashMap::new();
     for row in rows {
-        // A fingerprint is shared across metric names (`metric_fingerprint`
-        // excludes `__name__`), so `by_metric` — not `by_fingerprint` — is
-        // where identical-label-set series for different metrics stay
-        // disjoint (architect plan edge case 7: never "dedup" across
-        // metrics). `by_fingerprint` keying on the bare fingerprint is still
-        // well-defined here: two rows sharing a fingerprint carry the exact
-        // same label set (verbatim identity, not merely `==`-equal), so
-        // whichever the sweep saw last simply overwrites with the same
-        // content.
+        // The fingerprint is the series ID, which includes the metric name
+        // (issue #623), so one label set under two names is two IDs and
+        // neither map can merge series across metrics. Statement 2 returns
+        // each ID once; a repeat would carry the same row, so whichever the
+        // sweep saw last overwrites with the same content.
         by_fingerprint.insert(
             row.fingerprint,
             crate::canonical_labels::parse_canonical_label_set(&row.labels),
@@ -150,10 +156,28 @@ async fn fetch_rows(cache: &LabelCache, sql: &str) -> Result<Vec<SeriesRow>, ChE
 /// throw-not-spill pair `metrics::exec::metrics_read_settings` sets. A
 /// free function so the decision is provable without a ClickHouse
 /// connection (the `read_query_settings`/`probe_fanout_bound` precedent).
+///
+/// **`distributed_product_mode = 'local'`, always** (issue #623). Clustered,
+/// the sweep reads `metric_labels*_dist` for the `(metric_name,
+/// fingerprint)` pairs a nested `metric_series*_dist` read names, which the
+/// default `'deny'` refuses.
+/// `'local'` is exact: one kind-2 row writes a series' activity row and its
+/// label row on the same node, so each shard's labels cover each shard's
+/// series. Single-node there is no `Distributed` table and the setting
+/// changes nothing.
+///
+/// **`join_algorithm = 'hash'`** (issue #623). The sweep reads label rows
+/// first and joins nothing, so the setting decides nothing for it today; it
+/// is the metrics reads' join choice ([`super::exec`]'s series reads), kept
+/// here so a sweep that did join would not fall to the server's default
+/// `parallel_hash`, which reserved about 42 MiB before reading a row —
+/// measured on 26.3.29.7, growing with the thread count.
 pub(crate) fn sweep_settings(read_max_memory_bytes: u64) -> QuerySettings {
     QuerySettings::new()
         .set("max_memory_usage", read_max_memory_bytes)
         .set("max_bytes_before_external_group_by", 0u64)
+        .set("distributed_product_mode", "local")
+        .set("join_algorithm", "hash")
 }
 
 /// Spawns the recurring refresh task: ticks every `ttl`, running one
@@ -183,12 +207,35 @@ pub fn spawn_refresh_loop(cache: Arc<LabelCache>, ttl: Duration) -> JoinHandle<(
 mod tests {
     use super::*;
 
+    /// **Issue #623: the sweep is statement 2 with no matcher**: the lookup
+    /// rows of every series active in the cache window, by the activity
+    /// table's day and hour mask.
     #[test]
-    fn sweep_sql_renders_the_lower_bound_with_no_upper_bound() {
-        let sql = sweep_sql("metric_series", 1_000);
-        assert!(sql.contains("unix_milli >= 1000"));
-        assert!(!sql.contains("unix_milli <="));
-        assert!(sql.ends_with("LIMIT 1 BY metric_name, fingerprint"));
+    fn sweep_sql_reads_the_lookup_for_the_active_series() {
+        assert_eq!(
+            sweep_sql(
+                "metric_series",
+                "metric_labels",
+                DataWindow {
+                    start_ms: 1_788_820_200_000,
+                    end_ms: 1_788_823_800_000,
+                },
+            ),
+            "SELECT fingerprint, any(name) AS metric_name, any(label_text) AS labels\n\
+             FROM (\n\
+             \x20 SELECT fingerprint, metric_name AS name, labels AS label_text\n\
+             \x20 FROM metric_labels\n\
+             \x20 WHERE fingerprint IN (\n\
+             \x20     SELECT fingerprint\n\
+             \x20     FROM metric_series\n\
+             \x20     WHERE day BETWEEN '2026-09-07' AND '2026-09-07'\n\
+             \x20       AND bitAnd(hours, multiIf(day = '2026-09-07' AND day = '2026-09-07', 12582912, \
+             day = '2026-09-07', 12582912, day = '2026-09-07', 16777215, 16777215)) != 0\n\
+             \x20   )\n\
+             )\n\
+             GROUP BY fingerprint\n\
+             ORDER BY metric_name, fingerprint"
+        );
     }
 
     #[test]

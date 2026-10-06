@@ -3,12 +3,14 @@
 //!
 //! The output-checked leg lives beside the builders
 //! (`crates/pulsus-read/tests/fingerprint_rendering.rs`) and reads what
-//! each of the six sites emits. This file asks the other question: is the
-//! set six, or is there a seventh nobody read?
+//! each of the five sites emits. This file asks the other question: is the
+//! set five, or is there a sixth nobody read?
 //!
 //! **Counting fingerprint-typed signatures cannot answer it.** The five
-//! SQL modules hold thirty-two functions carrying a fingerprint list and
-//! only six of them render; a count can never separate a renderer from a
+//! SQL modules held thirty-two functions carrying a fingerprint list when
+//! issue #498 froze the six that render (issue #623 folded the two in
+//! `metrics/sql.rs` into one, `ids_scope`, and removed a seventh); a count
+//! can never separate a renderer from a
 //! function that forwards a slice. The predicate that does separate them
 //! is about the type rather than the count:
 //!
@@ -23,9 +25,9 @@
 //! render, and a non-empty list is a finding rather than a formality.
 //!
 //! The second check is the inventory itself: the functions in those five
-//! modules that turn a literal into text are exactly the six the issue
-//! froze. That is a text scan over the conversion spellings, listed in
-//! [`CONVERSIONS`], so a seventh site written any of those ways fails
+//! modules that turn a literal into text are exactly the five named. That
+//! is a text scan over the conversion spellings, listed in
+//! [`CONVERSIONS`], so a sixth site written any of those ways fails
 //! here even if its output happens to be right.
 //!
 //! This file lives in `pulsus-model` rather than beside the modules it
@@ -60,7 +62,7 @@ const SQL_MODULES: &[&str] = &[
 /// does not render one. **Expected empty.**
 const EXEMPTIONS: &[(&str, &str, &str)] = &[];
 
-/// The six rendering sites, by enclosing function and module.
+/// The five rendering sites, by enclosing function and module.
 const RENDERERS: &[(&str, &str)] = &[
     ("crates/pulsus-read/src/logql/sql.rs", "fp_list"),
     ("crates/pulsus-read/src/logql/sql.rs", "stage3_keyset"),
@@ -72,14 +74,7 @@ const RENDERERS: &[(&str, &str)] = &[
         "crates/pulsus-read/src/metrics/sample_sql.rs",
         "render_fingerprint_list",
     ),
-    (
-        "crates/pulsus-read/src/metrics/sql.rs",
-        "series_labels_by_fingerprint",
-    ),
-    (
-        "crates/pulsus-read/src/metrics/sql.rs",
-        "discovery_fetch_multi",
-    ),
+    ("crates/pulsus-read/src/metrics/sql.rs", "ids_scope"),
 ];
 
 /// Every way the shipped code turns an `FpLiteral` into text. A site
@@ -222,10 +217,10 @@ fn the_exemption_list_is_empty() {
 }
 
 /// **The set of functions that turn a fingerprint into text is exactly the
-/// six.** A seventh site — written any of the ways [`CONVERSIONS`] lists —
+/// five.** A sixth site — written any of the ways [`CONVERSIONS`] lists —
 /// fails here, which is the break issue #498 specifies for this leg.
 #[test]
-fn the_rendering_sites_are_the_six_the_inventory_names() {
+fn the_rendering_sites_are_the_five_the_inventory_names() {
     let mut found: BTreeSet<(String, String)> = BTreeSet::new();
     for module in SQL_MODULES {
         let src = without_line_comments(&read(module));
@@ -296,6 +291,6 @@ fn the_fingerprint_type_exposes_only_its_mint_and_its_constructor() {
             .collect::<BTreeSet<String>>(),
         "`impl Fingerprint`'s public surface moved. A method that hands the inner 128-bit value \
          back re-opens the hole the sealed type closes: every caller that wants text can then \
-         render it itself, and the six checked sites stop being the whole set"
+         render it itself, and the five checked sites stop being the whole set"
     );
 }

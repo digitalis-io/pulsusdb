@@ -27,7 +27,10 @@
 use std::time::Duration;
 
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, QuerySettings, Row};
-use pulsus_model::{Fingerprint, LabelSet, metric_fingerprint, stream_fingerprint};
+use pulsus_model::{
+    Fingerprint, LabelSet, SERIES_NAME_PREFIX_BITS, metric_fingerprint, series_fingerprint,
+    stream_fingerprint,
+};
 use serde_json::Value;
 
 const FIXTURES: &str = include_str!("fixtures/fingerprints.json");
@@ -164,6 +167,42 @@ async fn stream_fingerprint_vectors_match_a_live_server() {
             .expect("u64");
         let got = live_cityhash64(&client, &buf).await;
         assert_eq!(got, expected, "{name}: live ClickHouse mismatch");
+    }
+}
+
+/// **F3 (issue #623): a series ID's name prefix is the server's
+/// `cityHash64` of the name.** Twenty names, the empty one and non-ASCII
+/// ones among them: the top `SERIES_NAME_PREFIX_BITS` of
+/// `series_fingerprint(name, labels)` equal `bitShiftRight(cityHash64(name),
+/// 64 - SERIES_NAME_PREFIX_BITS)` from a live server, whatever the labels.
+#[tokio::test]
+async fn the_series_id_prefix_is_the_servers_name_hash() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let mut names: Vec<String> = vec![
+        String::new(),
+        "up".to_string(),
+        "métrique_é".to_string(),
+        "指標".to_string(),
+        "http_requests_total".to_string(),
+    ];
+    names.extend((0..15).map(|i| format!("metric_{i:02}_{}", "x".repeat(i))));
+    assert_eq!(names.len(), 20);
+    let labels = LabelSet::from_verbatim(vec![("job".to_string(), "api".to_string())]);
+    for name in &names {
+        let server = u128::from(live_cityhash64(&client, name.as_bytes()).await)
+            >> (64 - SERIES_NAME_PREFIX_BITS);
+        let ours = series_fingerprint(name, &labels).sql_literal().to_string();
+        let ours: u128 = ours
+            .trim_start_matches("toUInt128('")
+            .trim_end_matches("')")
+            .parse()
+            .expect("a decimal ID");
+        assert_eq!(
+            ours >> (128 - SERIES_NAME_PREFIX_BITS),
+            server,
+            "{name:?}: the prefix must be the server's cityHash64 of the name"
+        );
     }
 }
 

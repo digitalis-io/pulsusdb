@@ -7,7 +7,8 @@
 //! `le`/`quantile` labels), so there is no per-type flattening, no
 //! temporality, no exponential-bucket math — just `__name__` extraction,
 //! label normalization through the frozen `LabelSet::from_normalized`,
-//! `metric_fingerprint`, and verbatim `(ms, value)` samples.
+//! the series ID `series_fingerprint(name, labels)`, and verbatim
+//! `(ms, value)` samples.
 //!
 //! ## Wire types: hand-rolled prompb structs
 //!
@@ -42,7 +43,7 @@ use std::sync::Arc;
 use prost::Message;
 use pulsus_model::{
     CounterResetHint, Date, Fingerprint, LabelSet, METRIC_NAME_LABEL, NativeHistogram, Span,
-    metric_fingerprint,
+    series_fingerprint,
 };
 
 use crate::error::LogsIngestError;
@@ -1573,7 +1574,7 @@ fn parse_time_series(
 
     let (labels, collisions) = LabelSet::from_normalized(rest);
     out.collisions += collisions as u64;
-    let fingerprint = metric_fingerprint(&labels);
+    let fingerprint = series_fingerprint(&metric_name, &labels);
 
     // A sampleless series (legal on the wire, e.g. a metadata-only push)
     // registers no `SeriesRef` — the writer derives `metric_series` rows
@@ -2979,12 +2980,13 @@ mod tests {
 
         // A histograms-only series (no float samples) still registers its
         // SeriesRef, with `__name__` excluded and the fingerprint
-        // independently recomputable.
+        // independently recomputable: F4 (issue #623), the series ID of the
+        // metric name and the labels.
         assert_eq!(out.series.len(), 1);
         assert_eq!(out.series[0].labels.get("job"), Some("checkout"));
         assert_eq!(out.series[0].labels.get("__name__"), None);
         assert_eq!(
-            pulsus_model::metric_fingerprint(&out.series[0].labels),
+            pulsus_model::series_fingerprint(&point.metric_name, &out.series[0].labels),
             point.fingerprint
         );
     }

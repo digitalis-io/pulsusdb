@@ -30,11 +30,13 @@
 //! `(metric_name, fingerprint, bucket, value_type)`. A registration is a
 //! kind-2 row inside the samples' own block rather than its own insert, so
 //! there is no "samples committed, registration lost" orphan left to heal
-//! and no registration backfill on this path. Every push emits its
-//! descriptors as kind-3 rows: `metric_metadata` is a
-//! `ReplacingMergeTree(updated_ns)` keyed on `metric_name`, so a second row
-//! carrying the same descriptor collapses on merge, and the read takes one
-//! whole tuple.
+//! and no registration backfill on this path. A push emits a metric's
+//! descriptor as a kind-3 row only when it differs from the one this writer
+//! last sent, or the hour has turned since (issue #623,
+//! [`DescriptorCache`]); that cache too is promoted only when the block
+//! commits. `metric_metadata` is a `ReplacingMergeTree(updated_ns)` keyed on
+//! `metric_name`, so a repeated row collapses on merge, and the read takes
+//! one whole tuple.
 //!
 //! **Backpressure/shutdown**: `queued_bytes` is reserved atomically at
 //! admission and released exactly once, by whichever ending settles the
@@ -77,7 +79,7 @@ use crate::writer::landing::{
 };
 use crate::writer::metrics::{MetricWriterMetrics, MetricWriterMetricsSnapshot};
 use crate::writer::push_dedup::{self, Admission, ClaimTicket, PushDedup};
-use crate::writer::registration::{SeriesKey, SeriesLru};
+use crate::writer::registration::{DESCRIPTOR_RESEND_MS, DescriptorCache, SeriesKey, SeriesLru};
 use crate::writer::rows::{
     MetricHistSampleRow, MetricLandingRow, MetricMetadataRow, MetricSampleRow, MetricSeriesRow,
 };
@@ -146,13 +148,15 @@ struct Shared {
     runtime: Arc<WriterRuntime>,
     metrics: Arc<MetricWriterMetrics>,
     series_lru: Arc<Mutex<SeriesLru>>,
+    /// The descriptors this writer last sent (issue #623).
+    descriptors: Arc<Mutex<DescriptorCache>>,
     /// The token generator. One lock per admitted push: a token minted from
     /// the clock alone would repeat for two pushes inside one millisecond,
     /// and the second would be dropped as a resend of the first.
     token_rng: Mutex<XorShift64>,
-    /// The `metric_series` activity-bucket width in milliseconds
-    /// (`pulsus_config::ReaderConfig::series_activity_bucket`, resolved by
-    /// the caller — not read from `WriterConfig`).
+    /// The activity-bucket width in milliseconds,
+    /// `pulsus_model::ACTIVITY_BUCKET_MS` (issue #623), handed in by the
+    /// caller — not read from `WriterConfig`.
     bucket_ms: i64,
     /// The shutdown boundary: the admission gate, the announced deadline and
     /// every task this writer spawned (`writer::drain`).
@@ -244,6 +248,7 @@ impl MetricWriter {
         let spool = Arc::new(SpoolWriter::new(runtime.spool_dir.clone(), metrics.clone()));
         let boundary = DrainBoundary::new();
         let series_lru = Arc::new(Mutex::new(SeriesLru::new(runtime.lru_capacity)));
+        let descriptors = Arc::new(Mutex::new(DescriptorCache::new(runtime.lru_capacity)));
 
         // Issue #494: one index per signal. The landing insert is the one
         // target, so it is the one thing a suppressed caller's answer waits
@@ -256,16 +261,36 @@ impl MetricWriter {
             )
         });
 
-        // The commit hook: the `SeriesLru` promotion, which is the one thing
-        // this signal does at its commit that `writer::landing` cannot. It runs
-        // while the block is still charged — `LandingBlock::release` owns the
-        // rule and says what handing the allowance back earlier would cost.
+        // The commit hook: the `SeriesLru` and `DescriptorCache` promotions,
+        // which are the things this signal does at its commit that
+        // `writer::landing` cannot. It runs while the block is still charged —
+        // `LandingBlock::release` owns the rule and says what handing the
+        // allowance back earlier would cost.
         let lru_for_hook = series_lru.clone();
+        let descriptors_for_hook = descriptors.clone();
         let on_commit: crate::writer::landing::CommitHook<MetricLandingRow> =
             Arc::new(move |rows: &[MetricLandingRow]| {
-                let mut lru = lru_for_hook.lock().expect("series lru mutex poisoned");
-                for key in promotion_keys(rows) {
-                    lru.insert(key);
+                {
+                    let mut lru = lru_for_hook.lock().expect("series lru mutex poisoned");
+                    for key in promotion_keys(rows) {
+                        lru.insert(key);
+                    }
+                }
+                let mut sent = descriptors_for_hook
+                    .lock()
+                    .expect("descriptor cache mutex poisoned");
+                for row in rows
+                    .iter()
+                    .filter(|row| row.kind == MetricLandingRow::KIND_METADATA)
+                {
+                    sent.promote(
+                        &row.metric_name,
+                        &row.metric_type,
+                        &row.help,
+                        &row.unit,
+                        row.received_ms / DESCRIPTOR_RESEND_MS,
+                        row.updated_ns,
+                    );
                 }
             });
 
@@ -312,6 +337,7 @@ impl MetricWriter {
             runtime,
             metrics,
             series_lru,
+            descriptors,
             token_rng: Mutex::new(XorShift64::seeded()),
             bucket_ms,
             boundary,
@@ -382,17 +408,29 @@ impl MetricWriter {
 
         // A push's descriptors are its parser's metadata entries — one per
         // metric name per request already — locally deduped to the last
-        // occurrence per name, and gated, cached and promoted by nothing.
-        // Every push emits them: the table is a
-        // `ReplacingMergeTree(updated_ns)` keyed on `metric_name`, so a
-        // repeated descriptor collapses on merge, while NOT writing one can
-        // be wrong, because the version is a receiver clock the push
-        // identity deliberately excludes.
+        // occurrence per name, then gated by what this writer last sent
+        // (issue #623): a descriptor is emitted only when its type, help or
+        // unit differs from that, or its hour has turned since. The hourly
+        // resend bounds how long another writer's different descriptor can
+        // stand in the table, since the version is a receiver clock.
         let mut last_by_name: HashMap<&Arc<str>, &MetricMetadata> = HashMap::new();
         for meta in &batch.metadata {
             last_by_name.insert(&meta.metric_name, meta);
         }
-        let descriptors: Vec<&MetricMetadata> = last_by_name.into_values().collect();
+        let hour = received_ms / DESCRIPTOR_RESEND_MS;
+        let descriptors: Vec<&MetricMetadata> = {
+            let sent = self
+                .shared
+                .descriptors
+                .lock()
+                .expect("descriptor cache mutex poisoned");
+            last_by_name
+                .into_values()
+                .filter(|m| {
+                    !sent.is_current(&m.metric_name, &m.metric_type, &m.help, &m.unit, hour)
+                })
+                .collect()
+        };
         let metadata_bytes: u64 = descriptors
             .iter()
             .map(|m| MetricLandingRow::est_landing_bytes(MetricMetadataRow::est_source_bytes(m)))
@@ -489,9 +527,9 @@ impl MetricWriter {
         // waiter, the caller is answered with the ORIGINAL push's outcome, and
         // the block runs `run_block` like any other: a failure before the send
         // stored nothing, one from the send onward leaves whether the
-        // descriptors landed unknown. Nothing gates or caches a descriptor at
-        // any of those endings, so the next push carrying the same ones emits
-        // them again.
+        // descriptors landed unknown. Only a commit records a descriptor as
+        // sent, so after any other ending the next push carrying the same ones
+        // emits them again.
         if let Some(suppressed) = suppressed {
             if !descriptors.is_empty() {
                 let descriptor_bytes = landing_charge::<MetricLandingRow>(metadata_bytes);
@@ -771,6 +809,20 @@ impl MetricWriter {
     #[doc(hidden)]
     pub fn reopen_admission_for_test(&self) {
         self.shared.boundary.reopen_for_test();
+    }
+
+    /// Forgets every descriptor this writer has recorded as sent, as the
+    /// hour turning does, so the next push carrying one sends it again.
+    /// Lets a case outside this crate reach the resend without waiting an
+    /// hour. Nothing in the server calls this.
+    #[doc(hidden)]
+    pub fn forget_sent_descriptors_for_test(&self) {
+        let capacity = self.shared.runtime.lru_capacity;
+        *self
+            .shared
+            .descriptors
+            .lock()
+            .expect("descriptor cache mutex poisoned") = DescriptorCache::new(capacity);
     }
 
     /// This writer's push-suppression index (issue #494), or `None` while

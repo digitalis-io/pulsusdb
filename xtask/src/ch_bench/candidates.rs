@@ -50,8 +50,7 @@ impl ChCandidate {
 }
 
 #[derive(clickhouse::Row, serde::Serialize)]
-struct ChMetricRow<'a> {
-    metric_name: &'a str,
+struct ChMetricRow {
     fingerprint: u128,
     unix_milli: i64,
     value: f64,
@@ -101,7 +100,6 @@ impl CrateUnderTest for ChCandidate {
         for r in rows {
             insert
                 .write(&ChMetricRow {
-                    metric_name: &r.metric_name,
                     fingerprint: r.fingerprint,
                     unix_milli: r.unix_milli,
                     value: r.value,
@@ -134,9 +132,12 @@ impl CrateUnderTest for ChCandidate {
         table: &str,
         metric_name: &str,
     ) -> anyhow::Result<(u64, u64)> {
+        // Issue #623: one metric's samples are its IDs' key range.
+        let (lo, hi) = super::rows::name_id_range(metric_name);
         let sql = format!(
             "SELECT fingerprint, unix_milli, value FROM {table} \
-             PREWHERE metric_name = '{metric_name}' ORDER BY fingerprint, unix_milli"
+             WHERE fingerprint BETWEEN toUInt128('{lo}') AND toUInt128('{hi}') \
+             ORDER BY fingerprint, unix_milli"
         );
         let mut cursor = self.client.query(&sql).fetch::<ChMetricProj>()?;
         let mut count = 0u64;
@@ -204,7 +205,6 @@ impl KlCandidate {
 
 #[derive(klickhouse::Row, serde::Serialize, serde::Deserialize)]
 struct KlMetricRow {
-    metric_name: String,
     fingerprint: u128,
     unix_milli: i64,
     value: f64,
@@ -267,7 +267,6 @@ impl CrateUnderTest for KlCandidate {
         let kl_rows: Vec<KlMetricRow> = rows
             .iter()
             .map(|r| KlMetricRow {
-                metric_name: r.metric_name.clone(),
                 fingerprint: r.fingerprint,
                 unix_milli: r.unix_milli,
                 value: r.value,
@@ -299,9 +298,12 @@ impl CrateUnderTest for KlCandidate {
         table: &str,
         metric_name: &str,
     ) -> anyhow::Result<(u64, u64)> {
+        // Issue #623: one metric's samples are its IDs' key range.
+        let (lo, hi) = super::rows::name_id_range(metric_name);
         let sql = format!(
             "SELECT fingerprint, unix_milli, value FROM {table} \
-             PREWHERE metric_name = '{metric_name}' ORDER BY fingerprint, unix_milli"
+             WHERE fingerprint BETWEEN toUInt128('{lo}') AND toUInt128('{hi}') \
+             ORDER BY fingerprint, unix_milli"
         );
         let mut stream = self.client.query::<KlMetricProj, _>(sql).await?;
         let mut count = 0u64;

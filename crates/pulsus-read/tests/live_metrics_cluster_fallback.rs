@@ -22,7 +22,7 @@ use futures::StreamExt;
 use pulsus_clickhouse::{
     ChClient, ChConnConfig, ChError, ChProto, Idempotency, QuerySettings, Row,
 };
-use pulsus_model::DEFAULT_ACTIVITY_BUCKET_MS;
+use pulsus_model::ACTIVITY_BUCKET_MS;
 use pulsus_promql::parser::parse;
 use pulsus_read::metrics::sample_rows::SampleRow;
 use pulsus_read::metrics::sample_sql::sample_fetch_subquery;
@@ -158,7 +158,7 @@ fn now_ms() -> i64 {
 /// test's 24h label-cache window (forces `SqlFallback`) and safely inside
 /// the schema's 7-day raw retention TTL.
 fn historical_bucket() -> i64 {
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let two_days_ms = 2 * 24 * 3_600_000;
     ((now_ms() - two_days_ms) / bucket) * bucket
 }
@@ -173,7 +173,6 @@ struct SeedSeriesRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedSampleRow {
-    metric_name: String,
     fingerprint: u128,
     unix_milli: i64,
     value: f64,
@@ -201,16 +200,16 @@ async fn seed_dist(db: &str, metric_name: &str, fps: &[u64], unix_milli: i64) {
     let sample_rows: Vec<SeedSampleRow> = fps
         .iter()
         .map(|&fp| SeedSampleRow {
-            metric_name: metric_name.to_string(),
             fingerprint: u128::from(fp),
             unix_milli,
             value: 1.0,
         })
         .collect();
     data_client
-        .insert_block("metric_series_dist", &series_rows)
+        .insert_block("metric_series_dist", &activity_rows(&series_rows))
         .await
         .expect("seed metric_series_dist");
+    seed_labels_on_every_shard(db, &series_rows).await;
     data_client
         .insert_block("metric_samples_dist", &sample_rows)
         .await
@@ -238,10 +237,15 @@ async fn local_count(
         .map(u64::to_string)
         .collect::<Vec<_>>()
         .join(", ");
-    let sql = format!(
-        "SELECT count() AS n FROM {db}.{table} WHERE metric_name = '{metric_name}' AND \
-         fingerprint IN ({fp_list})"
-    );
+    // Issue #623: the sample tables carry no metric name; the IDs alone
+    // select the seeded rows there.
+    let name = if table == "metric_series" {
+        format!("metric_name = '{metric_name}' AND ")
+    } else {
+        String::new()
+    };
+    let sql =
+        format!("SELECT count() AS n FROM {db}.{table} WHERE {name}fingerprint IN ({fp_list})");
     let mut stream = shard
         .query_stream::<CountRow>(&sql, &QuerySettings::new())
         .await
@@ -320,7 +324,7 @@ fn cache_config_dist(db: &str) -> LabelCacheConfig {
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
         db: db.to_string(),
         series_table: "metric_series_dist".to_string(),
-        bucket_ms: DEFAULT_ACTIVITY_BUCKET_MS,
+        labels_table: "metric_labels_dist".to_string(),
         window_ms: 24 * 3_600_000,
         cache_max_series: 50_000,
         ttl: Duration::from_secs(60),
@@ -337,6 +341,7 @@ fn engine_config_dist(db: &str) -> MetricsConfig {
         samples_table: "metric_samples_dist".to_string(),
         hist_samples_table: "metric_hist_samples_dist".to_string(),
         series_table: "metric_series_dist".to_string(),
+        labels_table: "metric_labels_dist".to_string(),
         metadata_table: "metric_metadata".to_string(),
         experimental_functions: false,
         max_metric_fanout: 1_000,
@@ -392,15 +397,14 @@ async fn fallback_fetch_sql_is_denied_by_default_on_the_cluster() {
         start_ms: bucket,
         end_ms: bucket,
     };
-    let series_sql =
-        historical_series_subquery("metric_series_dist", metric_name, window, bucket, &[]);
-    let fetch_sql = sample_fetch_subquery(
-        "metric_samples_dist",
+    let series_sql = historical_series_subquery(
+        "metric_series_dist",
+        "metric_labels_dist",
         metric_name,
-        &series_sql,
-        bucket - 1,
-        bucket,
+        window,
+        &[],
     );
+    let fetch_sql = sample_fetch_subquery("metric_samples_dist", &series_sql, bucket - 1, bucket);
 
     let mut cfg = shard1_config("default");
     cfg.database = db.to_string();
@@ -521,4 +525,348 @@ async fn engine_returns_exact_samples_across_shards_via_the_local_product_mode_f
     }
 
     drop_database(&shard1_bootstrap, db).await;
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct C1Row {
+    fingerprint: u128,
+    labels: String,
+}
+
+/// Runs `sql` wrapped to `fingerprint, labels` (`labels` empty where the
+/// statement has none), in the order the rows arrive.
+async fn c1_rows(
+    client: &ChClient,
+    sql: &str,
+    has_labels: bool,
+    settings: &QuerySettings,
+) -> Result<Vec<(u128, String)>, ChError> {
+    let labels = if has_labels { "toString(labels)" } else { "''" };
+    let wrapped = format!(
+        "SELECT toUInt128(fingerprint) AS fingerprint, {labels} AS labels FROM (\n{sql}\n)"
+    )
+    .replace('?', "??");
+    let mut stream = client.query_stream::<C1Row>(&wrapped, settings).await?;
+    let mut out = Vec::new();
+    while let Some(row) = stream.next().await {
+        let row = row?;
+        out.push((row.fingerprint, row.labels));
+    }
+    Ok(out)
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct C1Name {
+    metric_name: String,
+}
+
+/// Runs a names statement, in the order the rows arrive.
+async fn c1_names(
+    client: &ChClient,
+    sql: &str,
+    settings: &QuerySettings,
+) -> Result<Vec<String>, ChError> {
+    let sql = sql.replace('?', "??");
+    let mut stream = client.query_stream::<C1Name>(&sql, settings).await?;
+    let mut out = Vec::new();
+    while let Some(row) = stream.next().await {
+        out.push(row?.metric_name);
+    }
+    Ok(out)
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct C1Count {
+    rows: u64,
+    fps: u64,
+}
+
+/// One shard's own rows of `table` for the C1 fingerprints.
+async fn c1_local(shard: &ChClient, db: &str, table: &str) -> (u64, u64) {
+    let sql = format!(
+        "SELECT count() AS rows, uniqExact(fingerprint) AS fps FROM {db}.{table} \
+         WHERE fingerprint BETWEEN 1 AND 45"
+    );
+    let mut stream = shard
+        .query_stream::<C1Count>(&sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("local {table}: {e}"));
+    let row = stream.next().await.expect("one row").expect("decode");
+    (row.rows, row.fps)
+}
+
+/// **C1 (issue #623): the label reads on a cluster are shard-local and
+/// answer each series once.** Kind-2 rows go into each shard's own
+/// `metric_landing`, so each shard's views write its own activity and label
+/// rows, as production does: fingerprints 1-20 and 41-45 on shard 1, 21-40
+/// on shard 2, and 21-25 on both. `status="500"` on 1-20, absent on 21-45,
+/// `job="api"` everywhere. Over the `_dist` tables with
+/// `distributed_product_mode = 'local'`, statements 1 to 3 for
+/// `status!="500"` answer exactly 21-45, each once, with `{"job":"api"}`,
+/// and the one name once. At default settings the nested activity read is
+/// denied (288).
+#[tokio::test]
+async fn label_reads_are_shard_local_and_answer_each_series_once() {
+    skip_unless_live!();
+
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_cluster_own_labels");
+    let shard1_bootstrap = init_clustered_db(db).await;
+    let metric_name = "c1_metric";
+    let bucket = historical_bucket();
+    let labels_of = |fp: u64| {
+        if fp <= 20 {
+            r#"{"job":"api","status":"500"}"#
+        } else {
+            r#"{"job":"api"}"#
+        }
+    };
+    let shard1_fps: Vec<u64> = (1..=20).chain(41..=45).chain(21..=25).collect();
+    let shard2_fps: Vec<u64> = (21..=40).collect();
+    let shard1 = ChClient::new(shard1_config(db))
+        .await
+        .expect("connect shard1");
+    let shard2 = ChClient::new(shard2_config(db))
+        .await
+        .expect("connect shard2");
+    for (shard, fps) in [(&shard1, &shard1_fps), (&shard2, &shard2_fps)] {
+        let values = fps
+            .iter()
+            .map(|fp| {
+                format!(
+                    "({}, 2, '{metric_name}', {fp}, {bucket}, '{}', 0)",
+                    now_ms(),
+                    labels_of(*fp)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        shard
+            .execute(
+                &format!(
+                    "INSERT INTO metric_landing \
+                     (received_ms, kind, metric_name, fingerprint, unix_milli, labels, value_type) \
+                     VALUES {values}"
+                ),
+                &QuerySettings::new(),
+                Idempotency::NonIdempotent,
+            )
+            .await
+            .expect("seed a shard's own metric_landing");
+    }
+    for (shard, n, what) in [(&shard1, 30u64, "shard 1"), (&shard2, 20, "shard 2")] {
+        for table in ["metric_series", "metric_labels"] {
+            assert_eq!(
+                c1_local(shard, db, table).await,
+                (n, n),
+                "{what}'s own {table} rows"
+            );
+        }
+    }
+
+    let window = DataWindow {
+        start_ms: bucket,
+        end_ms: bucket,
+    };
+    let matchers = vec![pulsus_read::LabelMatcher {
+        key: "status".to_string(),
+        op: pulsus_read::MatchOp::Neq,
+        value: "500".to_string(),
+    }];
+    let named = pulsus_read::DiscoveryFilter {
+        metric_name: Some(metric_name.to_string()),
+        name_matchers: Vec::new(),
+        matchers: matchers.clone(),
+    };
+    let unnamed = pulsus_read::DiscoveryFilter {
+        metric_name: None,
+        ..named.clone()
+    };
+    let (series, labels) = ("metric_series_dist", "metric_labels_dist");
+    use pulsus_read::metrics::sql;
+    let subquery = historical_series_subquery(series, labels, metric_name, window, &matchers);
+    let resolution =
+        sql::historical_resolution_query(series, labels, metric_name, window, &matchers);
+    let discovery_named = sql::discovery_query(series, labels, &named, window);
+    let discovery_unnamed = sql::discovery_query(series, labels, &unnamed, window);
+    let names_unnamed = sql::discovery_distinct_names_query(series, labels, &unnamed, window);
+
+    let want: Vec<(u128, String)> = (21..=45u128)
+        .map(|fp| (fp, r#"{"job":"api"}"#.to_string()))
+        .collect();
+    let sorted = |mut v: Vec<(u128, String)>| {
+        v.sort();
+        v
+    };
+    let local = QuerySettings::new().set("distributed_product_mode", "local");
+    let mut got = c1_rows(&shard1, &subquery, false, &local)
+        .await
+        .unwrap_or_else(|e| panic!("historical_series_subquery: {e}\n{subquery}"));
+    got.sort();
+    got.dedup();
+    assert_eq!(
+        got.into_iter().map(|(fp, _)| fp).collect::<Vec<_>>(),
+        (21..=45u128).collect::<Vec<_>>(),
+        "historical_series_subquery, as a set"
+    );
+    for (what, sql_text, settings) in [
+        ("historical_resolution_query", &resolution, &local),
+        ("discovery_query named", &discovery_named, &local),
+        ("discovery_query unnamed", &discovery_unnamed, &local),
+    ] {
+        let got = c1_rows(&shard1, sql_text, true, settings)
+            .await
+            .unwrap_or_else(|e| panic!("{what}: {e}\n{sql_text}"));
+        assert_eq!(sorted(got), want, "{what}: 21-45, each once\n{sql_text}");
+    }
+    let names: Vec<String> = c1_names(&shard1, &names_unnamed, &local)
+        .await
+        .unwrap_or_else(|e| panic!("discovery_distinct_names_query: {e}\n{names_unnamed}"));
+    assert_eq!(
+        names,
+        vec![metric_name.to_string()],
+        "discovery_distinct_names_query: the one name, once\n{names_unnamed}"
+    );
+    match c1_rows(&shard1, &subquery, false, &QuerySettings::new()).await {
+        Err(ChError::Server { code, .. }) => assert_eq!(code, 288, "{subquery}"),
+        other => panic!(
+            "the nested activity read at default settings must be denied (288), got {other:?}"
+        ),
+    }
+
+    drop_database(&shard1_bootstrap, db).await;
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SeenRow {
+    fingerprint: u128,
+    first_seen: i64,
+    last_seen: i64,
+}
+
+async fn seen_rows(client: &ChClient, sql: &str) -> Vec<(u128, i64, i64)> {
+    let mut stream = client
+        .query_stream::<SeenRow>(sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    let mut out = Vec::new();
+    while let Some(row) = stream.next().await {
+        let row = row.expect("decode");
+        out.push((row.fingerprint, row.first_seen, row.last_seen));
+    }
+    out
+}
+
+/// **C2 (issue #623): first and last seen span shards.** One series' kind-2
+/// rows go into shard 1's `metric_landing` at hours 5 and 9 of a day and
+/// into shard 2's at hours 2 and 7. Through `metric_labels_dist`,
+/// `min(first_seen)` is hour 2 and `max(last_seen)` hour 9 by fingerprint,
+/// before and after `OPTIMIZE FINAL` on each shard.
+#[tokio::test]
+async fn first_and_last_seen_span_shards() {
+    skip_unless_live!();
+
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_cluster_seen");
+    let shard1_bootstrap = init_clustered_db(db).await;
+    let h = ACTIVITY_BUCKET_MS;
+    let day = (historical_bucket() / 86_400_000) * 86_400_000;
+    let shard1 = ChClient::new(shard1_config(db))
+        .await
+        .expect("connect shard1");
+    let shard2 = ChClient::new(shard2_config(db))
+        .await
+        .expect("connect shard2");
+    for (shard, hours) in [(&shard1, [5i64, 9]), (&shard2, [2, 7])] {
+        for hour in hours {
+            shard
+                .execute(
+                    &format!(
+                        "INSERT INTO metric_landing \
+                         (received_ms, kind, metric_name, fingerprint, unix_milli, labels, value_type) \
+                         VALUES ({}, 2, 'c2_metric', 77, {}, '{{\"job\":\"api\"}}', 0)",
+                        now_ms(),
+                        day + hour * h
+                    ),
+                    &QuerySettings::new(),
+                    Idempotency::NonIdempotent,
+                )
+                .await
+                .expect("seed a shard's own metric_landing");
+        }
+    }
+    let sql = "SELECT fingerprint, min(first_seen) AS first_seen, max(last_seen) AS last_seen \
+               FROM metric_labels_dist WHERE fingerprint = 77 GROUP BY fingerprint";
+    let want = vec![(77u128, day + 2 * h, day + 9 * h)];
+    assert_eq!(seen_rows(&shard1, sql).await, want, "before the merge");
+    for shard in [&shard1, &shard2] {
+        shard
+            .execute(
+                "OPTIMIZE TABLE metric_labels FINAL",
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("merge a shard's lookup");
+    }
+    assert_eq!(
+        seen_rows(&shard1, sql).await,
+        want,
+        "after OPTIMIZE FINAL on each shard"
+    );
+
+    drop_database(&shard1_bootstrap, db).await;
+}
+
+/// Issue #623: a series is an activity row in `metric_series` and its label
+/// set, once, in `metric_labels`.
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SeedActivityRow {
+    day: u16,
+    fingerprint: u128,
+    metric_name: String,
+    hours: u32,
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SeedLabelRow {
+    metric_name: String,
+    fingerprint: u128,
+    labels: String,
+    first_seen: i64,
+    last_seen: i64,
+}
+
+fn activity_rows(rows: &[SeedSeriesRow]) -> Vec<SeedActivityRow> {
+    rows.iter()
+        .map(|r| SeedActivityRow {
+            day: r.unix_milli.div_euclid(86_400_000) as u16,
+            fingerprint: r.fingerprint,
+            metric_name: r.metric_name.clone(),
+            hours: 1u32 << (r.unix_milli.rem_euclid(86_400_000) / 3_600_000),
+        })
+        .collect()
+}
+
+/// The label rows go into every shard's local table. In production the
+/// view writes a series' label row on the node that writes its activity
+/// row; the activity rows here are placed by the routing wrapper's sharding
+/// key instead, so every shard is given every label set, which is the
+/// superset a shard-local read can always find its series' labels in.
+async fn seed_labels_on_every_shard(db: &str, rows: &[SeedSeriesRow]) {
+    let labels: Vec<SeedLabelRow> = rows
+        .iter()
+        .map(|r| SeedLabelRow {
+            metric_name: r.metric_name.clone(),
+            fingerprint: r.fingerprint,
+            labels: r.labels.clone(),
+            first_seen: r.unix_milli,
+            last_seen: r.unix_milli,
+        })
+        .collect();
+    for cfg in [shard1_config(db), shard2_config(db)] {
+        let shard = ChClient::new(cfg).await.expect("connect a shard");
+        shard
+            .insert_block("metric_labels", &labels)
+            .await
+            .expect("seed metric_labels on a shard");
+    }
 }

@@ -66,7 +66,7 @@
 //! mint takes no argument, and [`month_literal`] takes no string), this
 //! design needs **no `_for_test` escape hatch** — unlike `series_where.rs`,
 //! whose `anchored_re2_literal_for_test` is its one documented unsealed
-//! crossing (`series_where.rs:113-119`).
+//! crossing (`series_where.rs:116-122`).
 //!
 //! # What rustc enforces — and what it does not
 //!
@@ -146,7 +146,7 @@
 //!    from #315's round 9.
 //! 3. **`unsafe`.** `std::mem::transmute::<String, CheckedFragment>(s)`
 //!    compiles anywhere in the crate. A workspace `forbid(unsafe_code)` is
-//!    unavailable for the reasons recorded at `series_where.rs:100-111`
+//!    unavailable for the reasons recorded at `series_where.rs:103-114`
 //!    (allocation-ceiling suites install `GlobalAlloc`; `pulsus-config` test
 //!    support mutates the environment).
 //! 4. **The unwrap points.** There is one per type: `as_sql(&self) -> &str`.
@@ -189,7 +189,7 @@
 //! TraceQL's production `match(` renderings all route through
 //! `anchored_regex_sql` → `ch_regex_anchored_checked`
 //! (`traces/filter.rs:701-728`, `:1195-1199`); PromQL's sit inside #315's
-//! sealed leaf (`metrics/series_where.rs:320-340`). That is a **measurement
+//! sealed leaf (`metrics/series_where.rs:371-391`). That is a **measurement
 //! taken today, with no mechanism keeping it true** — `ch_string` is `pub`,
 //! so either file could acquire the same unanchored bypass this issue exists
 //! to close for LogQL. Check G's inventory detects the drift for spellings

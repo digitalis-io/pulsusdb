@@ -23,8 +23,8 @@
 //! Fingerprints derive *only* via `pulsus-model`, never re-derived here.
 //! `__name__` is never placed in a [`LabelSet`]: the metric name travels
 //! only as `MetricPoint`/`SeriesRef`'s first-class `metric_name` column
-//! (docs/architecture.md §2.3), and `metric_fingerprint` excludes it
-//! anyway. An OTLP attribute literally named `__name__` is dropped on its
+//! (docs/architecture.md §2.3); the series ID `series_fingerprint` takes
+//! the name as its own argument (issue #623). An OTLP attribute literally named `__name__` is dropped on its
 //! RAW key before sanitization, exactly as `reservedLabelNames` does
 //! (`helper.go:68-70, :96`).
 //!
@@ -67,7 +67,7 @@ use opentelemetry_proto::tonic::metrics::v1::{
 };
 use prost::Message;
 use pulsus_config::{ExpHistogramMode, OtlpTranslationStrategy};
-use pulsus_model::{Date, Fingerprint, LabelSet, STALE_NAN_BITS, metric_fingerprint};
+use pulsus_model::{Date, Fingerprint, LabelSet, STALE_NAN_BITS, series_fingerprint};
 
 use crate::error::LogsIngestError;
 use crate::ingest::metrics::{
@@ -1532,7 +1532,7 @@ fn emit_native_exponential_histogram(
     // form carries no per-bucket label).
     let ctx = DataPointContext::new(out, expanded_bytes, base, &dp.attributes, unix_milli)?;
     let labels = LabelSet::from_verbatim(ctx.base_labels);
-    let fingerprint = metric_fingerprint(&labels);
+    let fingerprint = series_fingerprint(name, &labels);
 
     if seen_series.insert((Arc::clone(name), fingerprint)) {
         out.series.push(SeriesRef {
@@ -1736,7 +1736,7 @@ fn emit_sample(
     // of `from_normalized` must NOT run here — it would re-resolve
     // collisions the reference has already merged with `;`.
     let labels = LabelSet::from_verbatim(pairs);
-    let fingerprint = metric_fingerprint(&labels);
+    let fingerprint = series_fingerprint(&metric_name, &labels);
 
     if seen_series.insert((Arc::clone(&metric_name), fingerprint)) {
         out.series.push(SeriesRef {
@@ -1854,7 +1854,7 @@ fn emit_target_info(
         });
     }
 
-    let fingerprint = metric_fingerprint(&labels);
+    let fingerprint = series_fingerprint(&name, &labels);
     if seen_series.insert((Arc::clone(&name), fingerprint)) {
         out.series.push(SeriesRef {
             metric_name: Arc::clone(&name),
@@ -3157,6 +3157,48 @@ mod tests {
     }
 
     // -- target_info (issue #461) ----------------------------------------
+
+    /// **F5 (issue #623): every emitter IDs a series by its name and its
+    /// labels.** One request: a gauge point, an exponential histogram point
+    /// (native), and a resource that produces `target_info`, all with no
+    /// point attributes of their own. Each emitted series carries
+    /// `series_fingerprint(its name, its labels)`, so the three IDs differ
+    /// even where two label sets are equal.
+    #[test]
+    fn every_emitter_ids_the_series_by_name_and_labels() {
+        let ts = 1_700_000_000_000_000_000u64;
+        let req = request(vec![ResourceMetrics {
+            resource: Some(target_info_resource()),
+            scope_metrics: vec![scope_metrics(vec![
+                gauge_metric("g", number_dp(ts, 1.0, vec![])),
+                exp_histogram_metric(
+                    "h",
+                    ExponentialHistogramDataPoint {
+                        time_unix_nano: ts,
+                        count: 1,
+                        zero_count: 1,
+                        ..Default::default()
+                    },
+                ),
+            ])],
+            schema_url: String::new(),
+        }]);
+        let out = super::parse(&req, 0, hist_settings(ExpHistogramMode::Native))
+            .expect("within the expansion budget");
+        let mut names: Vec<&str> = out.series.iter().map(|s| &*s.metric_name).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["g", "h", "target_info"], "{:?}", out.series);
+        for s in &out.series {
+            assert_eq!(
+                s.fingerprint,
+                pulsus_model::series_fingerprint(&s.metric_name, &s.labels),
+                "{}",
+                s.metric_name
+            );
+        }
+        let ids: std::collections::BTreeSet<_> = out.series.iter().map(|s| s.fingerprint).collect();
+        assert_eq!(ids.len(), 3, "three series, three IDs: {:?}", out.series);
+    }
 
     /// A resource carrying a non-identifying attribute plus a `job`.
     fn target_info_resource() -> Resource {

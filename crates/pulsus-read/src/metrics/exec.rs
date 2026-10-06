@@ -88,6 +88,10 @@ pub struct MetricsConfig {
     /// (issue #32) the discovery endpoints' own `metric_series`-backed
     /// query ([`super::sql::discovery_query`]).
     pub series_table: String,
+    /// `metric_labels` — one row per series, keyed `(metric_name,
+    /// fingerprint)` (issue #623). Every read that needs a series' labels
+    /// takes them from its own row here; `_dist`-aware like `series_table`.
+    pub labels_table: String,
     /// `metric_metadata` — issue #32's `/api/v1/metadata`
     /// ([`super::sql::metadata_query`]). **Never** `_dist`-suffixed
     /// (docs/schemas.md §2.1: it is a global, unsharded catalog table) —
@@ -149,8 +153,8 @@ pub struct MetricsConfig {
     /// distributed`] — `true` iff `Config::cluster` is configured
     /// (`pulsus-server`'s `metrics_config_from`). Gates
     /// `distributed_product_mode='local'` on the `SqlFallback` sample
-    /// fetches only ([`fallback_fetch_settings`]); every other dispatch
-    /// keeps [`metrics_read_settings`] unchanged.
+    /// fetch and the series and label reads ([`series_read_settings`]);
+    /// the `Chunks`/`Multi` sample fetches keep [`metrics_read_settings`].
     pub distributed: bool,
     /// Issue #398: `reader.promql_read_max_memory_bytes` — the
     /// `max_memory_usage` ceiling (throw-not-spill) every metrics read
@@ -173,31 +177,15 @@ pub struct MetricsConfig {
     pub grouped_push: bool,
 }
 
-/// The `SqlFallback` sample-fetch path's label-hydration result row
-/// ([`super::sql::series_labels_by_fingerprint`]'s `SELECT fingerprint,
-/// labels`) — deliberately not [`super::rows::SeriesRow`], which also
-/// carries `metric_name` (that sweep query's own third column; this
-/// hydration query never selects it, so reusing the 3-field row here would
-/// be a column-count mismatch against the 2-column result set).
+/// Issue #82 (retroactive re-review, Finding 1): the info() degraded-path
+/// cardinality probe's result row
+/// ([`super::sql::info_series_cardinality_probe`]'s `SELECT fingerprint`).
 /// **`pub` for one reason (issue #498):** the round-trip suite
 /// `crates/pulsus-read/tests/live_fingerprint_rowbinary.rs` reads a
 /// `UInt128` column through every `Row` struct that carries a fingerprint,
 /// and the client validates a row type per STATEMENT — a struct left at
 /// `u64` fails on the first row of its own statement and on no other. A
-/// struct it cannot name is a struct nothing checks, which is why this one
-/// and [`FingerprintOnlyRow`] are reachable from outside the crate.
-#[derive(
-    Debug, Clone, PartialEq, Eq, pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize,
-)]
-pub struct HydratedLabelsRow {
-    pub fingerprint: Fingerprint,
-    pub labels: String,
-}
-
-/// Issue #82 (retroactive re-review, Finding 1): the info() degraded-path
-/// cardinality probe's result row
-/// ([`super::sql::info_series_cardinality_probe`]'s `SELECT fingerprint`).
-/// `pub` for the same reason as [`HydratedLabelsRow`].
+/// struct it cannot name is a struct nothing checks.
 #[derive(
     Debug, Clone, PartialEq, Eq, pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize,
 )]
@@ -363,6 +351,71 @@ impl Drop for ProbeGuard<'_> {
     }
 }
 
+/// TEST SEAM (issue #623) — never installed by `pulsus-server`. Entered by
+/// every sample statement, on all three fetch paths, at
+/// [`MetricsEngine::fetch_rows_with`] (the one point they all pass, with a
+/// sample budget). The first statement waits there until a second has
+/// entered, for at most [`StatementProbe::WAIT`]; [`Self::max_in_flight`]
+/// then says whether a selector's float and histogram reads were in flight
+/// together. A path that sent one only after the other finished parks its
+/// first for the whole wait and records one.
+#[derive(Debug)]
+pub struct StatementProbe {
+    in_flight: std::sync::atomic::AtomicUsize,
+    max_in_flight: std::sync::atomic::AtomicUsize,
+    entered: tokio::sync::watch::Sender<usize>,
+}
+
+impl StatementProbe {
+    /// How long the first statement waits for a second.
+    pub const WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    pub fn new() -> std::sync::Arc<Self> {
+        let (entered, _rx) = tokio::sync::watch::channel(0);
+        std::sync::Arc::new(Self {
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
+            max_in_flight: std::sync::atomic::AtomicUsize::new(0),
+            entered,
+        })
+    }
+
+    /// Counts this statement in, records the high-water mark, then waits
+    /// until a second statement has entered — at most [`Self::WAIT`], the
+    /// one bounded wait. The guard counts it out when the statement ends.
+    pub(crate) async fn enter(&self) -> StatementGuard<'_> {
+        let n = self
+            .in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        self.max_in_flight
+            .fetch_max(n, std::sync::atomic::Ordering::SeqCst);
+        self.entered.send_modify(|entered| *entered += 1);
+        let mut rx = self.entered.subscribe();
+        // `wait_for` reads the retained count first, so the second
+        // statement passes at once; a timeout only ends the wait.
+        let _ = tokio::time::timeout(Self::WAIT, rx.wait_for(|entered| *entered >= 2)).await;
+        StatementGuard(self)
+    }
+
+    /// The most statements that were in flight at once.
+    pub fn max_in_flight(&self) -> usize {
+        self.max_in_flight.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// RAII guard returned by [`StatementProbe::enter`]; decrements
+/// `in_flight` when the statement ends.
+#[derive(Debug)]
+pub struct StatementGuard<'a>(&'a StatementProbe);
+
+impl Drop for StatementGuard<'_> {
+    fn drop(&mut self) {
+        self.0
+            .in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Issue #138: the per-query fetched-sample budget
 /// ([`MetricsConfig::max_samples`] ← `reader.promql_max_samples`). One
 /// instance per [`MetricsEngine::query_inner`] call, shared by reference
@@ -439,6 +492,8 @@ pub struct MetricsEngine {
     /// one `Option` branch per selector fetch in `execute_fetch_plan` —
     /// zero atomics, zero clock.
     fetch_probe: Option<std::sync::Arc<FetchProbe>>,
+    /// TEST SEAM (issue #623): see [`StatementProbe`]. `None` in production.
+    statement_probe: Option<std::sync::Arc<StatementProbe>>,
     /// TEST SEAM (issue #549) — how many fingerprints one grouped
     /// statement carries. Always [`sample_sql::CHUNK_THRESHOLD`] in
     /// production; `pulsus-server` never calls
@@ -469,6 +524,7 @@ impl MetricsEngine {
                 crate::eval_gate::DEFAULT_EVAL_CONCURRENCY,
             )),
             fetch_probe: None,
+            statement_probe: None,
             grouped_chunk_size: sample_sql::CHUNK_THRESHOLD,
         }
     }
@@ -490,6 +546,14 @@ impl MetricsEngine {
     /// `fetch_probe: None`.
     pub fn with_fetch_probe(mut self, probe: std::sync::Arc<FetchProbe>) -> Self {
         self.fetch_probe = Some(probe);
+        self
+    }
+
+    /// TEST SEAM (issue #623) — installs a [`StatementProbe`]. Never called
+    /// by `pulsus-server`.
+    #[doc(hidden)]
+    pub fn with_statement_probe(mut self, probe: std::sync::Arc<StatementProbe>) -> Self {
+        self.statement_probe = Some(probe);
         self
     }
 
@@ -539,7 +603,7 @@ impl MetricsEngine {
         // it): the cache-only fast path this comment used to describe has
         // been **removed**, not merely narrowed further. The label cache
         // resolves series presence at activity-*bucket* granularity (1h,
-        // `DEFAULT_ACTIVITY_BUCKET_MS`), which cannot distinguish "had a
+        // `ACTIVITY_BUCKET_MS`), which cannot distinguish "had a
         // sample within the 5-minute PromQL staleness lookback" from
         // "active somewhere in an up-to-24h-old 1-hour bucket" — a
         // structural granularity gap no eligibility/age check on the cache
@@ -727,7 +791,6 @@ impl MetricsEngine {
                             reads.push(compile::SelectorRead {
                                 selector: selector_id,
                                 pred: compile::grouped_selector_pred(
-                                    &sample_sql::name_predicate(metric_name),
                                     &sample_sql::window_predicate(lower_excl, upper_incl),
                                     &sample_sql::fingerprints_predicate(first_chunk),
                                 ),
@@ -803,7 +866,7 @@ impl MetricsEngine {
                             reads.push(compile::SelectorRead {
                                 selector: selector_id,
                                 pred: compile::selector_pred(
-                                    &sample_sql::name_predicate(metric_name),
+                                    None,
                                     &sample_sql::window_predicate(lower_excl, upper_incl),
                                     &sample_sql::fingerprints_predicate(first_chunk),
                                 ),
@@ -813,18 +876,12 @@ impl MetricsEngine {
                     }
                     let hist_sqls = build_hist_chunk_sqls(
                         &self.config.hist_samples_table,
-                        metric_name,
                         fps.clone(),
                         lower_excl,
                         upper_incl,
                     );
-                    let sqls = build_chunk_sqls(
-                        &self.config.samples_table,
-                        metric_name,
-                        fps,
-                        lower_excl,
-                        upper_incl,
-                    );
+                    let sqls =
+                        build_chunk_sqls(&self.config.samples_table, fps, lower_excl, upper_incl);
                     if let Some(e) = explain.as_mut() {
                         // Chunk elision (finding 5): only the first chunk's
                         // SQL is surfaced verbatim; a note names how many
@@ -858,7 +915,7 @@ impl MetricsEngine {
                         reads.push(compile::SelectorRead {
                             selector: selector_id,
                             pred: compile::selector_pred(
-                                &sample_sql::name_predicate(metric_name),
+                                None,
                                 &sample_sql::window_predicate(lower_excl, upper_incl),
                                 &sample_sql::subquery_predicate(&sql),
                             ),
@@ -867,14 +924,12 @@ impl MetricsEngine {
                     }
                     let fetch_sql = sample_sql::sample_fetch_subquery(
                         &self.config.samples_table,
-                        metric_name,
                         &sql,
                         lower_excl,
                         upper_incl,
                     );
                     let hist_sql = sample_sql::hist_sample_fetch_subquery(
                         &self.config.hist_samples_table,
-                        metric_name,
                         &sql,
                         lower_excl,
                         upper_incl,
@@ -1116,32 +1171,23 @@ impl MetricsEngine {
             .collect();
         fps.sort_unstable();
         fps.dedup();
-        let mut labels_by: HashMap<(String, Fingerprint), LabelSet> = HashMap::new();
-        // Cross-pair hydration source (code review round 1, finding 1):
-        // `metric_fingerprint` excludes `__name__` (docs/schemas.md §2.1),
-        // so a fingerprint's label set is name-invariant — any resolved
-        // `(name', fp)` entry carries the exact labels of every genuine
-        // `(name, fp)` cross-pair the flat IN×IN fetch may return that
-        // the cache didn't resolve (a series registered under a second
-        // name inside the sanctioned post-sweep recency gap).
-        let mut labels_by_fp: HashMap<Fingerprint, LabelSet> = HashMap::new();
+        // Name and labels per resolved series ID (issue #623). The fetch
+        // reads exactly these IDs, so every row it returns has an entry.
+        let mut labels_by: HashMap<Fingerprint, (String, LabelSet)> = HashMap::new();
         for g in groups {
             for (fp, labels) in g.series {
-                labels_by_fp.entry(fp).or_insert_with(|| labels.clone());
-                labels_by.insert((g.metric_name.clone(), fp), labels);
+                labels_by.insert(fp, (g.metric_name.clone(), labels));
             }
         }
 
         let sql = sample_sql::sample_fetch_multi(
             &self.config.samples_table,
-            &names,
             &sql_literals(&fps),
             lower_excl,
             upper_incl,
         );
         let hist_sql = sample_sql::hist_sample_fetch_multi(
             &self.config.hist_samples_table,
-            &names,
             &sql_literals(&fps),
             lower_excl,
             upper_incl,
@@ -1154,7 +1200,7 @@ impl MetricsEngine {
         // explain header.
         let read = explain.is_some().then(|| {
             compile::selector_pred(
-                &sample_sql::names_predicate(&names),
+                Some(&sample_sql::names_predicate(&names)),
                 &sample_sql::window_predicate(lower_excl, upper_incl),
                 &sample_sql::fingerprints_predicate(&sql_literals(&fps)),
             )
@@ -1164,7 +1210,6 @@ impl MetricsEngine {
                 sql,
                 hist_sql,
                 labels_by,
-                labels_by_fp,
             },
             read,
         ))
@@ -1175,7 +1220,7 @@ impl MetricsEngine {
     /// the `SqlFallback` path issues the single nested-subquery sample
     /// fetch, then hydrates labels for just the fingerprints that returned
     /// samples; the `Multi` path (issue #85) issues its single flat
-    /// IN-set fetch and groups rows per `(metric_name, fingerprint)`.
+    /// IN-set fetch and groups rows per series ID.
     ///
     /// Issue #138: `budget` is the query-wide [`SampleBudget`] — exactly
     /// the SIX sample dispatches below (Chunks/Fallback/Multi × float +
@@ -1235,7 +1280,7 @@ impl MetricsEngine {
                 // not a post-fetch backstop.
                 if let Some(probe_sql) = info_series_probe {
                     let cap = self.config.max_info_series;
-                    let rows: Vec<FingerprintOnlyRow> = self.fetch_rows(probe_sql).await?;
+                    let rows: Vec<FingerprintOnlyRow> = self.fetch_series_rows(probe_sql).await?;
                     if rows.len() as u64 > cap {
                         return Err(ReadError::QueryTooBroad(TooBroadReason::InfoCardinality {
                             matched: rows.len(),
@@ -1249,9 +1294,9 @@ impl MetricsEngine {
                 // double-distributed IN, rejected at analysis time under
                 // ClickHouse's default `distributed_product_mode='deny'`
                 // (Code 288) on a clustered `_dist` table set —
-                // `fallback_fetch_settings` injects the exact `'local'`
+                // `series_read_settings` injects the exact `'local'`
                 // rewrite ONLY here (never a blanket client-wide default).
-                let settings = fallback_fetch_settings(
+                let settings = series_read_settings(
                     self.config.read_max_memory_bytes,
                     self.config.distributed,
                 );
@@ -1275,11 +1320,11 @@ impl MetricsEngine {
                 fps.sort_unstable();
                 fps.dedup();
                 let hydrate_sql = super::sql::series_labels_by_fingerprint(
-                    &self.config.series_table,
-                    metric_name,
+                    &self.config.labels_table,
+                    &[metric_name.to_string()],
                     &sql_literals(&fps),
                 );
-                let series_rows: Vec<HydratedLabelsRow> = self.fetch_rows(hydrate_sql).await?;
+                let series_rows: Vec<super::rows::SeriesRow> = self.fetch_rows(hydrate_sql).await?;
                 let labels_by_fp: HashMap<Fingerprint, LabelSet> = series_rows
                     .into_iter()
                     .map(|r| {
@@ -1295,7 +1340,6 @@ impl MetricsEngine {
                 sql,
                 hist_sql,
                 labels_by,
-                labels_by_fp,
             } => {
                 let (rows, hist_rows): (Vec<MultiSampleRow>, Vec<MultiHistSampleRow>) =
                     fetch_dual_concurrently(
@@ -1303,7 +1347,14 @@ impl MetricsEngine {
                         self.fetch_sample_rows(hist_sql, budget),
                     )
                     .await?;
-                group_merged_multi_rows(rows, hist_rows, &labels_by, &labels_by_fp)
+                let mut series = group_merged_multi_rows(rows, hist_rows, &labels_by)?;
+                // The order the fan-out answered in before issue #623, when
+                // its rows arrived by name: sorted names, then ascending IDs.
+                series.sort_by(|a, b| {
+                    (a.metric_name.as_deref(), a.fingerprint)
+                        .cmp(&(b.metric_name.as_deref(), b.fingerprint))
+                });
+                Ok(series)
             }
         }
     }
@@ -1357,8 +1408,9 @@ impl MetricsEngine {
     }
 
     /// [`Self::fetch_rows_with`] under the standard [`metrics_read_settings`]
-    /// — every dispatch except the `SqlFallback` sample fetches (issue
-    /// #136), which instead carry [`fallback_fetch_settings`]. Never
+    /// — every dispatch except the `SqlFallback` sample fetch (issue #136)
+    /// and the series reads that nest the label table
+    /// ([`Self::fetch_series_rows`]), which carry [`series_read_settings`]. Never
     /// charges the sample budget (issue #138): this is the probe/
     /// hydration/discovery dispatch — sample fetches go through
     /// [`Self::fetch_sample_rows`] (or `fetch_rows_with` with
@@ -1372,11 +1424,23 @@ impl MetricsEngine {
         .await
     }
 
+    /// [`Self::fetch_rows`] for a series read that nests the label table
+    /// (issue #623): the discovery reads and the `info()` cardinality probe
+    /// carry [`series_read_settings`]. Never charges the sample budget.
+    async fn fetch_series_rows<R: ChRow>(&self, sql: String) -> Result<Vec<R>, ReadError> {
+        self.fetch_rows_with(
+            sql,
+            &series_read_settings(self.config.read_max_memory_bytes, self.config.distributed),
+            None,
+        )
+        .await
+    }
+
     /// Issue #138: [`Self::fetch_rows_with`] under the standard
     /// [`metrics_read_settings`], charging `budget` per drained row — the
     /// Chunks and Multi sample dispatches' fetch. The `SqlFallback` sample
     /// dispatches call `fetch_rows_with` directly (they carry
-    /// [`fallback_fetch_settings`]) with `Some(budget)`.
+    /// [`series_read_settings`]) with `Some(budget)`.
     async fn fetch_sample_rows<R: ChRow>(
         &self,
         sql: String,
@@ -1400,6 +1464,12 @@ impl MetricsEngine {
         settings: &QuerySettings,
         budget: Option<&SampleBudget>,
     ) -> Result<Vec<R>, ReadError> {
+        // Issue #623 TEST SEAM: every sample statement passes here with a
+        // budget. `None` in production: one `Option` branch.
+        let _statement = match (&self.statement_probe, budget) {
+            (Some(p), Some(_)) => Some(p.enter().await),
+            _ => None,
+        };
         self.dispatch.fetch_rows_with(sql, settings, budget).await
     }
 
@@ -1417,22 +1487,20 @@ impl MetricsEngine {
     /// /series results"). `filters` empty is Prometheus's own "no
     /// `match[]`" contract (docs/api.md §3.3) — every series in the
     /// window, unfiltered; each element otherwise applies its own
-    /// window-bound, bucket-floored `metric_series` query, concurrently
-    /// (`join_all`, mirroring `query_inner`'s fetch-concurrency contract),
-    /// unioned and deduplicated by `(metric_name, fingerprint)` (a
-    /// fingerprint is shared across metric names — see
-    /// `super::refresh::run_sweep`'s own comment on the same invariant).
+    /// window-bound read (statement 2, the window exact to the hour,
+    /// issue #623), concurrently (`join_all`, mirroring `query_inner`'s
+    /// fetch-concurrency contract), unioned and deduplicated by
+    /// `(metric_name, fingerprint)`.
     ///
     /// Issue #89: a filter carrying regex/negated `__name__` matchers
     /// instead routes through [`Self::discovery_sql_for`]'s cache-resolved
-    /// flat IN×IN fetch — still one `metric_series` query per filter, still
-    /// window-bound in SQL.
+    /// read, scoped to the cache's names and IDs — still one statement per
+    /// filter, still window-bound in SQL.
     async fn discovery_series(
         &self,
         filters: &[DiscoveryFilter],
         window: DataWindow,
     ) -> Result<Vec<(String, LabelSet)>, ReadError> {
-        let bucket_ms = self.resolver.config.bucket_ms;
         let effective = effective_filters(filters);
         // Resolve pre-pass (synchronous, in-process cache reads only) —
         // a filter whose name matchers can be answered statically
@@ -1442,12 +1510,7 @@ impl MetricsEngine {
         let mut fetch_sqls: Vec<String> = Vec::with_capacity(effective.len());
         let mut probe_specs: Vec<ProbeSpec> = Vec::new();
         for filter in &effective {
-            match self.discovery_query_for(
-                filter,
-                window,
-                bucket_ms,
-                DiscoveryProjection::SeriesLabels,
-            )? {
+            match self.discovery_query_for(filter, window, DiscoveryProjection::SeriesLabels)? {
                 Some(DiscoveryQuery::Sql(sql)) => fetch_sqls.push(sql),
                 Some(DiscoveryQuery::Probe {
                     name_matchers,
@@ -1467,17 +1530,17 @@ impl MetricsEngine {
         if !probe_specs.is_empty() {
             let probe_futs = probe_specs
                 .iter()
-                .map(|spec| self.probe_distinct_names(&spec.name_matchers, window, bucket_ms));
+                .map(|spec| self.probe_distinct_names(&spec.name_matchers, window));
             let probe_results: Vec<Result<Vec<String>, ReadError>> = join_all(probe_futs).await;
             for (names, spec) in probe_results.into_iter().zip(&probe_specs) {
                 let names = names?;
                 if !names.is_empty() {
                     fetch_sqls.push(super::sql::discovery_fetch_by_names(
                         &self.config.series_table,
+                        &self.config.labels_table,
                         &names,
                         &spec.matchers,
                         window,
-                        bucket_ms,
                     ));
                 }
             }
@@ -1485,7 +1548,7 @@ impl MetricsEngine {
         // Wave 2: fetch every (direct + probe-derived) query concurrently.
         let fetches = fetch_sqls
             .into_iter()
-            .map(|sql| self.fetch_rows::<super::rows::SeriesRow>(sql));
+            .map(|sql| self.fetch_series_rows::<super::rows::SeriesRow>(sql));
         let results: Vec<Result<Vec<super::rows::SeriesRow>, ReadError>> = join_all(fetches).await;
         let mut seen: std::collections::HashSet<(String, Fingerprint)> =
             std::collections::HashSet::new();
@@ -1537,25 +1600,24 @@ impl MetricsEngine {
         &self,
         filter: &DiscoveryFilter,
         window: DataWindow,
-        bucket_ms: i64,
         projection: DiscoveryProjection,
     ) -> Result<Option<DiscoveryQuery>, ReadError> {
         if !takes_plain_discovery_route(filter) {
-            return self.discovery_multi_query(filter, window, bucket_ms);
+            return self.discovery_multi_query(filter, window);
         }
         let discovery_query = || {
             DiscoveryQuery::Sql(match projection {
                 DiscoveryProjection::SeriesLabels => super::sql::discovery_query(
                     &self.config.series_table,
+                    &self.config.labels_table,
                     filter,
                     window,
-                    bucket_ms,
                 ),
                 DiscoveryProjection::MetricNamesOnly => super::sql::discovery_distinct_names_query(
                     &self.config.series_table,
+                    &self.config.labels_table,
                     filter,
                     window,
-                    bucket_ms,
                 ),
             })
         };
@@ -1598,7 +1660,6 @@ impl MetricsEngine {
         &self,
         filter: &DiscoveryFilter,
         window: DataWindow,
-        bucket_ms: i64,
     ) -> Result<Option<DiscoveryQuery>, ReadError> {
         let resolution = self.resolver.resolve_multi_metric(
             &filter.name_matchers,
@@ -1649,10 +1710,10 @@ impl MetricsEngine {
         Ok(Some(DiscoveryQuery::Sql(
             super::sql::discovery_fetch_multi(
                 &self.config.series_table,
+                &self.config.labels_table,
                 &names,
                 &sql_literals(&fps),
                 window,
-                bucket_ms,
             ),
         )))
     }
@@ -1675,14 +1736,13 @@ impl MetricsEngine {
         &self,
         name_matchers: &[super::matcher::LabelMatcher],
         window: DataWindow,
-        bucket_ms: i64,
     ) -> Result<Vec<String>, ReadError> {
         let cap = self.config.max_metric_fanout;
         let sql = super::sql::distinct_metric_names_probe(
             &self.config.series_table,
+            &self.config.labels_table,
             name_matchers,
             window,
-            bucket_ms,
             cap,
         );
         let rows: Vec<super::rows::MetricNameRow> = self.fetch_rows(sql).await?;
@@ -1741,7 +1801,6 @@ impl MetricsEngine {
         filters: &[DiscoveryFilter],
         window: DataWindow,
     ) -> Result<Vec<String>, ReadError> {
-        let bucket_ms = self.resolver.config.bucket_ms;
         let effective = effective_filters(filters);
         let mut narrow_sqls: Vec<String> = Vec::with_capacity(effective.len());
         let mut wide: Vec<DiscoveryFilter> = Vec::new();
@@ -1750,12 +1809,7 @@ impl MetricsEngine {
                 wide.push(filter.clone());
                 continue;
             }
-            match self.discovery_query_for(
-                filter,
-                window,
-                bucket_ms,
-                DiscoveryProjection::MetricNamesOnly,
-            )? {
+            match self.discovery_query_for(filter, window, DiscoveryProjection::MetricNamesOnly)? {
                 Some(DiscoveryQuery::Sql(sql)) => narrow_sqls.push(sql),
                 // Unreachable while `discovery_query_for` branches on
                 // `takes_plain_discovery_route`: the plain arm returns
@@ -1772,7 +1826,7 @@ impl MetricsEngine {
         let narrow = async {
             let fetches = narrow_sqls
                 .into_iter()
-                .map(|sql| self.fetch_rows::<super::rows::MetricNameRow>(sql));
+                .map(|sql| self.fetch_series_rows::<super::rows::MetricNameRow>(sql));
             join_all(fetches).await
         };
         let wide_series = async {
@@ -1929,25 +1983,30 @@ fn metrics_read_settings(read_max_memory_bytes: u64) -> QuerySettings {
 /// read's blocks (issue #549).
 const CH_DEFAULT_MAX_BLOCK_SIZE: u64 = 65_409;
 
-/// The `SqlFallback` sample-fetch settings (issue #136): [`metrics_read_settings`]
-/// plus, when clustered, `distributed_product_mode='local'`. The fallback
-/// fetch's `FROM metric_samples*_dist … WHERE fingerprint IN (SELECT … FROM
-/// metric_series*_dist …)` shape is a double-distributed IN, rejected at
-/// analysis time under ClickHouse's default `distributed_product_mode=
-/// 'deny'` (Code 288, `DISTRIBUTED_IN_JOIN_SUBQUERY_DENIED`) — deterministic
-/// 500s on a clustered deployment. `local` is exact here (not merely
-/// permissive): `metric_samples` and `metric_series` are both Metrics-family
-/// tables sharded on the identical `cityHash64(metric_name, fingerprint)`
-/// key (docs/schemas.md §7), so a sample row's series row is always
-/// shard-local and shard-local `IN` decides identically to global `IN` —
-/// the same precedent already applied to the traces metrics semi-join
-/// (`crate::traces::exec::metrics_settings`, issue #59). Applied ONLY to
-/// the two fallback dispatches
-/// ([`MetricsEngine::execute_fetch_plan`]'s `Fallback` arm) — a blanket
-/// client-wide default would let a future non-co-sharded subquery silently
-/// return wrong shard-local results instead of failing loud.
-fn fallback_fetch_settings(read_max_memory_bytes: u64, distributed: bool) -> QuerySettings {
-    let base = metrics_read_settings(read_max_memory_bytes);
+/// The settings of every read that nests one metrics table inside another
+/// (issues #136, #623): [`metrics_read_settings`] plus, when clustered,
+/// `distributed_product_mode='local'`. Those are the `SqlFallback` sample
+/// fetch (`metric_samples*_dist` over a `metric_series*_dist` sub-query) and
+/// every series read that filters on or returns labels
+/// (`metric_series*_dist` beside a `metric_labels*_dist` sub-query or join).
+/// A double-distributed shape is rejected at analysis time under
+/// ClickHouse's default `distributed_product_mode='deny'` (Code 288,
+/// `DISTRIBUTED_IN_JOIN_SUBQUERY_DENIED`).
+///
+/// `local` is exact here (not merely permissive): one kind-2 landing row
+/// writes a series' activity row and its label row on the node that received
+/// the push, and that node's samples beside them, so the rows one shard-local
+/// read pairs are the rows that belong together — the same precedent already
+/// applied to the traces metrics semi-join (`crate::traces::exec::
+/// metrics_settings`, issue #59). Not applied to the `Chunks`/`Multi` sample
+/// fetches, which nest nothing — a blanket client-wide default would let a
+/// future non-co-located subquery silently return wrong shard-local results
+/// instead of failing loud.
+fn series_read_settings(read_max_memory_bytes: u64, distributed: bool) -> QuerySettings {
+    // The label joins' build side is the scoped metrics' label rows; the
+    // plain hash join, for `refresh::sweep_settings`' reason. The unnamed
+    // names join sets its own algorithm in its text.
+    let base = metrics_read_settings(read_max_memory_bytes).set("join_algorithm", "hash");
     if distributed {
         base.set("distributed_product_mode", "local")
     } else {
@@ -2089,19 +2148,14 @@ enum SelectorFetchPlan {
         info_series_probe: Option<String>,
     },
     /// Issue #85 (M6-08c): the name-less/regex-`__name__` fan-out — one
-    /// flat `metric_name IN (…) AND fingerprint IN (…)` fetch, labels
-    /// pre-resolved per `(metric_name, fingerprint)` (a fingerprint can
-    /// exist under several metric names, so the map key must carry both).
-    /// `labels_by_fp` is the cross-pair hydration source (code review
-    /// round 1, finding 1): the IN×IN can return a genuine pair the cache
-    /// didn't resolve (post-sweep recency gap); its labels are recovered
-    /// from the fingerprint's name-invariant label set, never fabricated
-    /// empty — see [`group_multi_rows`].
+    /// `fingerprint IN (…)` fetch over every resolved series ID, each ID's
+    /// name and labels pre-resolved (an ID names one series, issue #623),
+    /// plus the paired complementary `metric_hist_samples` fetch (M7-A5a).
+    /// Labels are never fabricated empty — see [`group_multi_rows`].
     Multi {
         sql: String,
         hist_sql: String,
-        labels_by: HashMap<(String, Fingerprint), LabelSet>,
-        labels_by_fp: HashMap<Fingerprint, LabelSet>,
+        labels_by: HashMap<Fingerprint, (String, LabelSet)>,
     },
     /// Provably-empty selection with no fetch at all: a concrete-name
     /// selector whose `name_matchers` exclude its own name (issue #85),
@@ -2253,7 +2307,6 @@ impl Drop for CancelOnDrop {
 /// starts.
 fn build_chunk_sqls(
     samples_table: &str,
-    metric_name: &str,
     mut fps: Vec<Fingerprint>,
     lower_excl_ms: i64,
     upper_incl_ms: i64,
@@ -2261,15 +2314,7 @@ fn build_chunk_sqls(
     fps.sort_unstable();
     sample_sql::chunk_fingerprints(&sql_literals(&fps), sample_sql::CHUNK_THRESHOLD)
         .into_iter()
-        .map(|chunk| {
-            sample_sql::sample_fetch(
-                samples_table,
-                metric_name,
-                chunk,
-                lower_excl_ms,
-                upper_incl_ms,
-            )
-        })
+        .map(|chunk| sample_sql::sample_fetch(samples_table, chunk, lower_excl_ms, upper_incl_ms))
         .collect()
 }
 
@@ -2294,7 +2339,6 @@ fn build_grouped_sqls(
         out.push(super::grouped_sql::grouped_fetch(
             &config.samples_table,
             &config.hist_samples_table,
-            &push.metric_name,
             chunk,
             gids,
             push.grid,
@@ -2315,7 +2359,6 @@ fn build_grouped_sqls(
 /// granule for a pure-float fingerprint — the EXPLAIN gate).
 fn build_hist_chunk_sqls(
     hist_samples_table: &str,
-    metric_name: &str,
     mut fps: Vec<Fingerprint>,
     lower_excl_ms: i64,
     upper_incl_ms: i64,
@@ -2324,13 +2367,7 @@ fn build_hist_chunk_sqls(
     sample_sql::chunk_fingerprints(&sql_literals(&fps), sample_sql::CHUNK_THRESHOLD)
         .into_iter()
         .map(|chunk| {
-            sample_sql::hist_sample_fetch(
-                hist_samples_table,
-                metric_name,
-                chunk,
-                lower_excl_ms,
-                upper_incl_ms,
-            )
+            sample_sql::hist_sample_fetch(hist_samples_table, chunk, lower_excl_ms, upper_incl_ms)
         })
         .collect()
 }
@@ -2753,6 +2790,10 @@ fn merge_series_with<F: FloatPoint, H: HistPoint>(
 /// `metric_name` is the metric-scoped fetch's one concrete name, stamped
 /// onto every series' per-series name channel (issue #85 —
 /// `FetchedSeries::metric_name`).
+///
+/// **A fingerprint with no label row of its own yields no series** (issue
+/// #623): its rows are skipped, never answered with an empty label set,
+/// which would merge distinct series into one.
 fn group_rows(
     rows: Vec<SampleRow>,
     labels_by_fp: &HashMap<Fingerprint, LabelSet>,
@@ -2760,23 +2801,27 @@ fn group_rows(
 ) -> Vec<FetchedSeries> {
     let mut out: Vec<FetchedSeries> = Vec::new();
     let mut run = RunDedup::default();
+    let mut current: Option<Fingerprint> = None;
+    // Whether `current` produced an output series (false = skipped, so its
+    // remaining rows must not attach to an earlier fingerprint's series).
+    let mut current_kept = false;
     for row in rows {
-        match out.last_mut() {
+        if current == Some(row.fingerprint) {
             // Issue #494 §7: two rows identical in
             // `(fingerprint, unix_milli, value bits)` are one sample.
-            Some(last) if last.fingerprint == row.fingerprint => {
+            if current_kept && let Some(last) = out.last_mut() {
                 run.push_float(&mut last.samples, row.unix_milli, row.value);
             }
-            _ => {
-                run.end_run();
-                let labels = labels_by_fp
-                    .get(&row.fingerprint)
-                    .cloned()
-                    .unwrap_or_default();
+            continue;
+        }
+        run.end_run();
+        current = Some(row.fingerprint);
+        current_kept = match labels_by_fp.get(&row.fingerprint) {
+            Some(labels) => {
                 out.push(FetchedSeries {
                     fingerprint: row.fingerprint,
                     metric_name: Some(metric_name.to_string()),
-                    labels: to_promql_labels(&labels),
+                    labels: to_promql_labels(labels),
                     samples: Vec::new(),
                     start_ts: None,
                 });
@@ -2784,48 +2829,36 @@ fn group_rows(
                 // starts is one the next row can be read against.
                 let last = out.last_mut().expect("just pushed");
                 run.push_float(&mut last.samples, row.unix_milli, row.value);
+                true
             }
-        }
+            None => false,
+        };
     }
     out
 }
 
 /// Issue #85 (M6-08c): [`group_rows`]'s multi-metric counterpart — rows
-/// arrive `ORDER BY metric_name, fingerprint, unix_milli`, so consecutive
-/// grouping on the `(metric_name, fingerprint)` pair yields one
-/// [`FetchedSeries`] per matched series, each carrying its own name on
-/// the per-series channel. Order stays deterministic (sorted names, then
-/// ascending fingerprints) without any re-sort here.
+/// arrive `ORDER BY fingerprint, unix_milli`, so consecutive grouping on the
+/// series ID yields one [`FetchedSeries`] per matched series. The ID names
+/// one series (issue #623), so each takes its name and its labels from its
+/// own entry in `labels_by`, the cache's resolution the fetch was scoped
+/// to. Order stays deterministic (ascending IDs) without any re-sort here.
 ///
-/// **Labels are never fabricated (code review round 1, finding 1):** a
-/// pair absent from `labels_by` is a genuine cross-pair the cache didn't
-/// resolve (a series registered under a second metric name after the last
-/// sweep — the sanctioned recency gap). Its labels are hydrated from
-/// `labels_by_fp`: `metric_fingerprint` excludes `__name__`, so the
-/// fingerprint's label set is name-invariant and already known from the
-/// resolved sibling pair — and those labels passed the selector's
-/// matchers (matchers apply uniformly across names, the v3 Δ2 soundness
-/// argument), so the pair is a legitimate member of the matched set. A
-/// fingerprint absent from *both* maps is structurally impossible (the
-/// `IN` list is built from the resolved set) — skipped for totality, so
-/// an empty-labels series can never reach the evaluator.
+/// **Labels are never fabricated:** an ID with no entry is skipped, rows
+/// and all, so an empty-labels series never reaches the evaluator.
 fn group_multi_rows(
     rows: Vec<MultiSampleRow>,
-    labels_by: &HashMap<(String, Fingerprint), LabelSet>,
-    labels_by_fp: &HashMap<Fingerprint, LabelSet>,
+    labels_by: &HashMap<Fingerprint, (String, LabelSet)>,
 ) -> Vec<FetchedSeries> {
     let mut out: Vec<FetchedSeries> = Vec::new();
     let mut run = RunDedup::default();
-    let mut current: Option<(String, Fingerprint)> = None;
-    // Whether `current` produced an output series (false = the pair was
+    let mut current: Option<Fingerprint> = None;
+    // Whether `current` produced an output series (false = the ID was
     // skipped, so its remaining rows must not attach to `out.last_mut()`,
-    // which belongs to an earlier pair).
+    // which belongs to an earlier ID).
     let mut current_kept = false;
     for row in rows {
-        let same = current
-            .as_ref()
-            .is_some_and(|(name, fp)| *name == row.metric_name && *fp == row.fingerprint);
-        if same {
+        if current == Some(row.fingerprint) {
             // Issue #494 §7, as in `group_rows`.
             if current_kept && let Some(last) = out.last_mut() {
                 run.push_float(&mut last.samples, row.unix_milli, row.value);
@@ -2833,17 +2866,13 @@ fn group_multi_rows(
             continue;
         }
         run.end_run();
-        let key = (row.metric_name, row.fingerprint);
-        let labels = labels_by
-            .get(&key)
-            .or_else(|| labels_by_fp.get(&key.1))
-            .cloned();
-        current_kept = match labels {
-            Some(labels) => {
+        current = Some(row.fingerprint);
+        current_kept = match labels_by.get(&row.fingerprint) {
+            Some((name, labels)) => {
                 out.push(FetchedSeries {
                     fingerprint: row.fingerprint,
-                    metric_name: Some(key.0.clone()),
-                    labels: to_promql_labels(&labels),
+                    metric_name: Some(name.clone()),
+                    labels: to_promql_labels(labels),
                     samples: Vec::new(),
                     start_ts: None,
                 });
@@ -2853,7 +2882,6 @@ fn group_multi_rows(
             }
             None => false,
         };
-        current = Some(key);
     }
     out
 }
@@ -2897,8 +2925,12 @@ fn group_merged_rows(
         while hi < hist.len() && hist[hi].fingerprint == next_fp {
             hi += 1;
         }
+        // Issue #623: a fingerprint with no label row of its own yields no
+        // series (as in `group_rows`).
+        let Some(labels) = labels_by_fp.get(&next_fp).cloned() else {
+            continue;
+        };
         let samples = merge_series_with(&float[f_start..fi], &hist[h_start..hi], &mut run)?;
-        let labels = labels_by_fp.get(&next_fp).cloned().unwrap_or_default();
         out.push(FetchedSeries {
             fingerprint: next_fp,
             metric_name: Some(metric_name.to_string()),
@@ -2911,64 +2943,45 @@ fn group_merged_rows(
 }
 
 /// M7-A5a: [`group_multi_rows`]'s dual-read counterpart. Both reads arrive
-/// `ORDER BY metric_name, fingerprint, unix_milli`; a two-cursor walk over
-/// consecutive `(metric_name, fingerprint)` groups 2-way merges each
-/// series (histogram-wins). The label hydration / cross-pair skip rules are
-/// [`group_multi_rows`]'s exactly (an unresolved cross-pair hydrates from
-/// the fingerprint's name-invariant labels; a wholly-unknown pair is
-/// skipped). When `hist` is empty this reduces to the float-only
-/// [`group_multi_rows`] fast path (byte-identical).
+/// `ORDER BY fingerprint, unix_milli`; a two-cursor walk over consecutive
+/// IDs 2-way merges each series (histogram-wins). The label rule is
+/// [`group_multi_rows`]'s exactly (an ID with no entry is skipped). When
+/// `hist` is empty this reduces to the float-only [`group_multi_rows`] fast
+/// path (byte-identical).
 fn group_merged_multi_rows(
     float: Vec<MultiSampleRow>,
     hist: Vec<MultiHistSampleRow>,
-    labels_by: &HashMap<(String, Fingerprint), LabelSet>,
-    labels_by_fp: &HashMap<Fingerprint, LabelSet>,
+    labels_by: &HashMap<Fingerprint, (String, LabelSet)>,
 ) -> Result<Vec<FetchedSeries>, ReadError> {
     if hist.is_empty() {
-        return Ok(group_multi_rows(float, labels_by, labels_by_fp));
+        return Ok(group_multi_rows(float, labels_by));
     }
     let mut run = RunDedup::default();
     let mut out: Vec<FetchedSeries> = Vec::new();
     let (mut fi, mut hi) = (0usize, 0usize);
     while fi < float.len() || hi < hist.len() {
-        let key: (String, Fingerprint) = match (float.get(fi), hist.get(hi)) {
-            (Some(f), Some(h)) => {
-                if (f.metric_name.as_str(), f.fingerprint)
-                    <= (h.metric_name.as_str(), h.fingerprint)
-                {
-                    (f.metric_name.clone(), f.fingerprint)
-                } else {
-                    (h.metric_name.clone(), h.fingerprint)
-                }
-            }
-            (Some(f), None) => (f.metric_name.clone(), f.fingerprint),
-            (None, Some(h)) => (h.metric_name.clone(), h.fingerprint),
+        let next_fp = match (float.get(fi), hist.get(hi)) {
+            (Some(f), Some(h)) => f.fingerprint.min(h.fingerprint),
+            (Some(f), None) => f.fingerprint,
+            (None, Some(h)) => h.fingerprint,
             (None, None) => break,
         };
         let f_start = fi;
-        while fi < float.len() && float[fi].metric_name == key.0 && float[fi].fingerprint == key.1 {
+        while fi < float.len() && float[fi].fingerprint == next_fp {
             fi += 1;
         }
         let h_start = hi;
-        while hi < hist.len() && hist[hi].metric_name == key.0 && hist[hi].fingerprint == key.1 {
+        while hi < hist.len() && hist[hi].fingerprint == next_fp {
             hi += 1;
         }
-        // Labels: the resolved `(name, fp)` pair, else the fingerprint's
-        // name-invariant set; a pair absent from both is a structural
-        // impossibility (the IN list is built from the resolved set) —
-        // skipped for totality (matches `group_multi_rows`).
-        let Some(labels) = labels_by
-            .get(&key)
-            .or_else(|| labels_by_fp.get(&key.1))
-            .cloned()
-        else {
+        let Some((name, labels)) = labels_by.get(&next_fp) else {
             continue;
         };
         let samples = merge_series_with(&float[f_start..fi], &hist[h_start..hi], &mut run)?;
         out.push(FetchedSeries {
-            fingerprint: key.1,
-            metric_name: Some(key.0),
-            labels: to_promql_labels(&labels),
+            fingerprint: next_fp,
+            metric_name: Some(name.clone()),
+            labels: to_promql_labels(labels),
             samples,
             start_ts: None,
         });
@@ -3238,11 +3251,11 @@ mod tests {
         );
         // The `SqlFallback` variant layers on top and must keep both.
         for distributed in [false, true] {
-            let f = fallback_fetch_settings(TEST_READ_MEM, distributed);
+            let f = series_read_settings(TEST_READ_MEM, distributed);
             assert_eq!(
                 f.get("max_memory_usage"),
                 Some(TEST_READ_MEM.to_string().as_str()),
-                "fallback_fetch_settings(distributed={distributed}) must carry the ceiling"
+                "series_read_settings(distributed={distributed}) must carry the ceiling"
             );
             assert_eq!(f.get("max_bytes_before_external_group_by"), Some("0"));
         }
@@ -3262,6 +3275,10 @@ mod tests {
             Some(TEST_READ_MEM.to_string().as_str())
         );
         assert_eq!(s.get("max_bytes_before_external_group_by"), Some("0"));
+        // Issue #623: the label side nests the series read, and the join
+        // is the plain hash join.
+        assert_eq!(s.get("distributed_product_mode"), Some("local"));
+        assert_eq!(s.get("join_algorithm"), Some("hash"));
     }
 
     #[test]
@@ -3274,17 +3291,15 @@ mod tests {
     }
 
     /// Acceptance criterion 3: the metrics path's own default-scale
-    /// envelope (1,000 × 256 B metric names + 50,000 fingerprints, ≈1.36
-    /// MB) fits under the raised cap while exceeding ClickHouse's
+    /// envelope (50,000 fingerprints) fits under the raised cap while exceeding ClickHouse's
     /// 262,144-byte default — proving the newly-sent setting is
     /// load-bearing here too (`fetch_rows` previously sent NO settings at
     /// all).
     #[test]
     fn metrics_default_envelope_fits_the_query_text_cap_and_exceeds_the_ch_default() {
-        let names: Vec<String> = (0..1_000u32).map(|i| format!("{i:0254}")).collect();
         let fps: Vec<FpLiteral> =
             std::iter::repeat_n(Fingerprint::from_raw(u128::MAX).sql_literal(), 50_000).collect();
-        let sql = sample_sql::sample_fetch_multi("metric_samples", &names, &fps, 0, i64::MAX);
+        let sql = sample_sql::sample_fetch_multi("metric_samples", &fps, 0, i64::MAX);
         let bytes = sql.len() as u64;
         assert!(
             bytes > 262_144,
@@ -3303,10 +3318,10 @@ mod tests {
     /// ClickHouse hitting an opaque parse error.
     #[test]
     fn metrics_ceiling_scale_envelope_is_rejected_by_the_guard() {
-        let names: Vec<String> = (0..1_000_000u32)
-            .map(|i| format!("metric_name_{i}"))
-            .collect();
-        let sql = sample_sql::sample_fetch_multi("metric_samples", &names, &[], 0, i64::MAX);
+        let fps: Vec<FpLiteral> =
+            std::iter::repeat_n(Fingerprint::from_raw(u128::MAX).sql_literal(), 1_000_000)
+                .collect();
+        let sql = sample_sql::sample_fetch_multi("metric_samples", &fps, 0, i64::MAX);
         match crate::querytext::ensure_query_text_fits(&sql) {
             Err(TooBroadReason::QueryTextBytes { .. }) => {}
             other => panic!("expected QueryTextBytes rejection, got {other:?}"),
@@ -3316,9 +3331,8 @@ mod tests {
     // --- Issue #136: SqlFallback settings gate the local product mode ---
 
     #[test]
-    fn fallback_fetch_settings_carries_the_read_settings_and_omits_local_product_mode_unclustered()
-    {
-        let unclustered = format!("{:?}", fallback_fetch_settings(TEST_READ_MEM, false));
+    fn series_read_settings_carries_the_read_settings_and_omits_local_product_mode_unclustered() {
+        let unclustered = format!("{:?}", series_read_settings(TEST_READ_MEM, false));
         assert!(
             unclustered.contains("max_query_size"),
             "missing max_query_size in {unclustered}"
@@ -3330,8 +3344,8 @@ mod tests {
     }
 
     #[test]
-    fn fallback_fetch_settings_adds_the_local_product_mode_when_clustered() {
-        let clustered = format!("{:?}", fallback_fetch_settings(TEST_READ_MEM, true));
+    fn series_read_settings_adds_the_local_product_mode_when_clustered() {
+        let clustered = format!("{:?}", series_read_settings(TEST_READ_MEM, true));
         assert!(clustered.contains("max_query_size"));
         assert!(clustered.contains("distributed_product_mode"));
         assert!(clustered.contains("local"));
@@ -3347,7 +3361,6 @@ mod tests {
         // regardless of input order.
         let sqls = build_chunk_sqls(
             "metric_samples",
-            "up",
             vec![
                 Fingerprint::from_raw(3),
                 Fingerprint::from_raw(1),
@@ -3367,7 +3380,7 @@ mod tests {
     #[test]
     fn build_chunk_sqls_splits_at_the_chunk_threshold() {
         let fps: Vec<Fingerprint> = (0..1_200).map(Fingerprint::from_raw).collect();
-        let sqls = build_chunk_sqls("metric_samples", "up", fps, 0, 100);
+        let sqls = build_chunk_sqls("metric_samples", fps, 0, 100);
         assert_eq!(sqls.len(), 3);
     }
 
@@ -3465,7 +3478,9 @@ mod tests {
         .await
         .unwrap();
 
-        let labels_by_fp = HashMap::new();
+        let labels_by_fp: HashMap<Fingerprint, LabelSet> = (1..=4)
+            .map(|fp| (Fingerprint::from_raw(fp), ls(&[("job", "a")])))
+            .collect();
         let chunked_series = group_rows(chunked_rows, &labels_by_fp, "m");
         let reference_series = group_rows(reference_rows, &labels_by_fp, "m");
 
@@ -3968,145 +3983,86 @@ mod tests {
         assert!(group_rows(Vec::new(), &HashMap::new(), "up").is_empty());
     }
 
-    #[test]
-    fn group_rows_defaults_to_empty_labels_for_an_unhydrated_fingerprint() {
-        let rows = vec![SampleRow {
-            fingerprint: Fingerprint::from_raw(1),
-            unix_milli: 0,
-            value: 1.0,
-        }];
-        let series = group_rows(rows, &HashMap::new(), "up");
-        assert!(series[0].labels.is_empty());
-    }
-
     // --- group_multi_rows (issue #85, M6-08c) ---
 
+    /// F11 (issue #623): one multi fetch returns two IDs under two
+    /// names. The rows carry no name; each series takes its name and its
+    /// labels from its own ID's entry, float and histogram alike.
     #[test]
-    fn group_multi_rows_splits_a_shared_fingerprint_across_metric_names() {
-        // The same fingerprint under two metric names (legal:
-        // metric_fingerprint excludes __name__) must yield TWO series,
-        // each with its own per-series name.
+    fn a_multi_fetch_gives_each_id_its_own_name_and_labels() {
+        let (a, b) = (Fingerprint::from_raw(7), Fingerprint::from_raw(9));
         let rows = vec![
-            MultiSampleRow {
-                metric_name: "aaa".to_string(),
-                fingerprint: Fingerprint::from_raw(7),
-                unix_milli: 0,
-                value: 1.0,
-            },
-            MultiSampleRow {
-                metric_name: "aaa".to_string(),
-                fingerprint: Fingerprint::from_raw(7),
-                unix_milli: 1_000,
-                value: 2.0,
-            },
-            MultiSampleRow {
-                metric_name: "bbb".to_string(),
-                fingerprint: Fingerprint::from_raw(7),
-                unix_milli: 0,
-                value: 9.0,
-            },
+            multi_float_row(a, 0, 1.0),
+            multi_float_row(a, 1_000, 2.0),
+            multi_float_row(b, 0, 9.0),
         ];
         let mut labels_by = HashMap::new();
-        labels_by.insert(
-            ("aaa".to_string(), Fingerprint::from_raw(7)),
-            ls(&[("job", "a")]),
-        );
-        labels_by.insert(
-            ("bbb".to_string(), Fingerprint::from_raw(7)),
-            ls(&[("job", "a")]),
-        );
-        let mut labels_by_fp = HashMap::new();
-        labels_by_fp.insert(Fingerprint::from_raw(7), ls(&[("job", "a")]));
-        let series = group_multi_rows(rows, &labels_by, &labels_by_fp);
-        assert_eq!(series.len(), 2);
+        labels_by.insert(a, ("aaa".to_string(), ls(&[("job", "a")])));
+        labels_by.insert(b, ("bbb".to_string(), ls(&[("job", "b")])));
+        let series = group_multi_rows(rows.clone(), &labels_by);
+        assert_eq!(series.len(), 2, "{series:?}");
+        assert_eq!(series[0].fingerprint, a);
         assert_eq!(series[0].metric_name.as_deref(), Some("aaa"));
+        assert_eq!(series[0].labels, to_promql_labels(&ls(&[("job", "a")])));
         assert_eq!(series[0].samples.len(), 2);
+        assert_eq!(series[1].fingerprint, b);
         assert_eq!(series[1].metric_name.as_deref(), Some("bbb"));
+        assert_eq!(series[1].labels, to_promql_labels(&ls(&[("job", "b")])));
         assert_eq!(series[1].samples.len(), 1);
+
+        let hist = vec![multi_hist_row(b, 5)];
+        let merged = group_merged_multi_rows(rows, hist, &labels_by).unwrap();
+        assert_eq!(merged.len(), 2, "{merged:?}");
+        assert_eq!(merged[0].metric_name.as_deref(), Some("aaa"));
+        assert_eq!(merged[1].metric_name.as_deref(), Some("bbb"));
+        assert_eq!(merged[1].labels, to_promql_labels(&ls(&[("job", "b")])));
+        assert_eq!(merged[1].samples.len(), 2);
     }
 
     #[test]
     fn group_multi_rows_of_an_empty_input_is_empty() {
-        assert!(group_multi_rows(Vec::new(), &HashMap::new(), &HashMap::new()).is_empty());
+        assert!(group_multi_rows(Vec::new(), &HashMap::new()).is_empty());
     }
 
-    /// Code review round 1, finding 1: a genuine cross-pair the cache
-    /// didn't resolve (`(bbb, 7)` absent from `labels_by`) hydrates from
-    /// the fingerprint's name-invariant labels — NEVER an empty label
-    /// set.
+    /// U9 (issue #623): a fingerprint the hydration found no label row for
+    /// yields no series, float or histogram — never one with empty labels,
+    /// which would merge distinct series into one.
     #[test]
-    fn group_multi_rows_hydrates_an_unresolved_cross_pair_from_the_fingerprint_labels() {
-        let rows = vec![
-            MultiSampleRow {
-                metric_name: "aaa".to_string(),
-                fingerprint: Fingerprint::from_raw(7),
-                unix_milli: 0,
-                value: 1.0,
-            },
-            MultiSampleRow {
-                metric_name: "bbb".to_string(),
-                fingerprint: Fingerprint::from_raw(7),
-                unix_milli: 0,
-                value: 2.0,
-            },
+    fn a_fingerprint_with_no_label_row_yields_no_series() {
+        let hist = single_histogram();
+        let float = vec![
+            float_row(Fingerprint::from_raw(1), 0, 1.0),
+            float_row(Fingerprint::from_raw(3), 0, 3.0),
         ];
-        let mut labels_by = HashMap::new();
-        labels_by.insert(
-            ("aaa".to_string(), Fingerprint::from_raw(7)),
-            ls(&[("job", "a")]),
-        );
-        let mut labels_by_fp = HashMap::new();
-        labels_by_fp.insert(Fingerprint::from_raw(7), ls(&[("job", "a")]));
-        let series = group_multi_rows(rows, &labels_by, &labels_by_fp);
-        assert_eq!(series.len(), 2);
-        assert_eq!(series[1].metric_name.as_deref(), Some("bbb"));
-        assert_eq!(
-            series[1].labels.get("job"),
-            Some("a"),
-            "cross-pair labels hydrated from the fingerprint, not empty: {series:?}"
-        );
+        let h = vec![hist_row(Fingerprint::from_raw(2), 0, &hist)];
+        let mut labels = HashMap::new();
+        labels.insert(Fingerprint::from_raw(1), ls(&[("job", "a")]));
+        let plain = group_rows(float.clone(), &labels, "m");
+        assert_eq!(plain.len(), 1, "{plain:?}");
+        let merged = group_merged_rows(float, h, &labels, "m").unwrap();
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        assert_eq!(merged[0].fingerprint, Fingerprint::from_raw(1));
     }
 
-    /// Finding 1's totality arm: a fingerprint absent from BOTH maps
-    /// (structurally impossible — the IN list is built from the resolved
-    /// set) is skipped whole, including its follow-on rows, which must
-    /// not attach to the preceding series.
+    /// An ID with no label entry is skipped whole, including its
+    /// follow-on rows, which must not attach to the preceding series.
     #[test]
-    fn group_multi_rows_skips_a_wholly_unknown_pair_and_all_its_rows() {
+    fn group_multi_rows_skips_a_wholly_unknown_id_and_all_its_rows() {
+        let (a, unknown) = (Fingerprint::from_raw(7), Fingerprint::from_raw(9));
         let rows = vec![
-            MultiSampleRow {
-                metric_name: "aaa".to_string(),
-                fingerprint: Fingerprint::from_raw(7),
-                unix_milli: 0,
-                value: 1.0,
-            },
-            MultiSampleRow {
-                metric_name: "bbb".to_string(),
-                fingerprint: Fingerprint::from_raw(9), // unknown to both maps
-                unix_milli: 0,
-                value: 2.0,
-            },
-            MultiSampleRow {
-                metric_name: "bbb".to_string(),
-                fingerprint: Fingerprint::from_raw(9),
-                unix_milli: 1_000,
-                value: 3.0,
-            },
+            multi_float_row(a, 0, 1.0),
+            multi_float_row(unknown, 0, 2.0),
+            multi_float_row(unknown, 1_000, 3.0),
         ];
         let mut labels_by = HashMap::new();
-        labels_by.insert(
-            ("aaa".to_string(), Fingerprint::from_raw(7)),
-            ls(&[("job", "a")]),
-        );
-        let mut labels_by_fp = HashMap::new();
-        labels_by_fp.insert(Fingerprint::from_raw(7), ls(&[("job", "a")]));
-        let series = group_multi_rows(rows, &labels_by, &labels_by_fp);
-        assert_eq!(series.len(), 1, "unknown pair never surfaces: {series:?}");
+        labels_by.insert(a, ("aaa".to_string(), ls(&[("job", "a")])));
+        let series = group_multi_rows(rows, &labels_by);
+        assert_eq!(series.len(), 1, "unknown ID never surfaces: {series:?}");
         assert_eq!(series[0].metric_name.as_deref(), Some("aaa"));
         assert_eq!(
             series[0].samples.len(),
             1,
-            "the skipped pair's rows must not leak into the previous series"
+            "the skipped ID's rows must not leak into the previous series"
         );
     }
 
@@ -4117,7 +4073,7 @@ mod tests {
             unix_milli: 0,
             value: 1.0,
         }];
-        let series = group_rows(rows, &HashMap::new(), "up");
+        let series = group_rows(rows, &labelled(1), "up");
         assert_eq!(series[0].metric_name.as_deref(), Some("up"));
     }
 
@@ -4302,12 +4258,37 @@ mod tests {
         }
     }
 
-    fn multi_float_row(name: &str, fp: Fingerprint, t: i64, v: f64) -> MultiSampleRow {
+    /// Fingerprint `fp`'s own label row, as the hydration would find it.
+    fn labelled(fp: u128) -> HashMap<Fingerprint, LabelSet> {
+        HashMap::from([(Fingerprint::from_raw(fp), ls(&[("job", "a")]))])
+    }
+
+    fn multi_float_row(fp: Fingerprint, t: i64, v: f64) -> MultiSampleRow {
         MultiSampleRow {
-            metric_name: name.to_string(),
             fingerprint: fp,
             unix_milli: t,
             value: v,
+        }
+    }
+
+    fn multi_hist_row(fp: Fingerprint, t: i64) -> MultiHistSampleRow {
+        let r = hist_row(fp, t, &single_histogram());
+        MultiHistSampleRow {
+            fingerprint: fp,
+            unix_milli: t,
+            schema: r.schema,
+            zero_threshold: r.zero_threshold,
+            zero_count: r.zero_count,
+            count: r.count,
+            sum: r.sum,
+            pos_span_offsets: r.pos_span_offsets,
+            pos_span_lengths: r.pos_span_lengths,
+            pos_bucket_deltas: r.pos_bucket_deltas,
+            neg_span_offsets: r.neg_span_offsets,
+            neg_span_lengths: r.neg_span_lengths,
+            neg_bucket_deltas: r.neg_bucket_deltas,
+            custom_values: r.custom_values,
+            counter_reset_hint: r.counter_reset_hint,
         }
     }
 
@@ -4408,7 +4389,7 @@ mod tests {
             float_row(fp, 1, 7.0),
             float_row(fp, 1, 5.0),
         ];
-        let series = group_rows(rows, &HashMap::new(), "m");
+        let series = group_rows(rows, &labelled(1), "m");
         assert_eq!(series.len(), 1);
         let values: Vec<f64> = series[0].samples.iter().map(|s| s.v).collect();
         assert_eq!(values, vec![5.0, 7.0], "arrival order, one per identity");
@@ -4422,7 +4403,7 @@ mod tests {
             float_row(fp, 1, 5.0),
             float_row(fp, 2, 7.0),
         ];
-        let series = group_rows(rows, &HashMap::new(), "m");
+        let series = group_rows(rows, &labelled(1), "m");
         let got: Vec<(i64, f64)> = series[0].samples.iter().map(|s| (s.t_ms, s.v)).collect();
         assert_eq!(got, vec![(1, 5.0), (2, 7.0)]);
     }
@@ -4433,7 +4414,7 @@ mod tests {
     fn group_rows_leaves_two_different_values_at_one_millisecond_alone() {
         let fp = Fingerprint::from_raw(1);
         let rows = vec![float_row(fp, 1, 1.0), float_row(fp, 1, 2.0)];
-        let series = group_rows(rows, &HashMap::new(), "m");
+        let series = group_rows(rows, &labelled(1), "m");
         let values: Vec<f64> = series[0].samples.iter().map(|s| s.v).collect();
         assert_eq!(values, vec![1.0, 2.0]);
     }
@@ -4444,7 +4425,7 @@ mod tests {
     fn group_rows_keeps_negative_zero_beside_zero() {
         let fp = Fingerprint::from_raw(1);
         let rows = vec![float_row(fp, 1, -0.0), float_row(fp, 1, 0.0)];
-        let series = group_rows(rows, &HashMap::new(), "m");
+        let series = group_rows(rows, &labelled(1), "m");
         let bits: Vec<u64> = series[0].samples.iter().map(|s| s.v.to_bits()).collect();
         assert_eq!(bits, vec![0x8000_0000_0000_0000, 0x0000_0000_0000_0000]);
     }
@@ -4453,13 +4434,13 @@ mod tests {
     fn group_multi_rows_keeps_one_sample_per_distinct_value_at_one_millisecond() {
         let fp = Fingerprint::from_raw(1);
         let rows = vec![
-            multi_float_row("m", fp, 1, 5.0),
-            multi_float_row("m", fp, 1, 7.0),
-            multi_float_row("m", fp, 1, 5.0),
+            multi_float_row(fp, 1, 5.0),
+            multi_float_row(fp, 1, 7.0),
+            multi_float_row(fp, 1, 5.0),
         ];
-        let mut by_fp = HashMap::new();
-        by_fp.insert(fp, ls(&[("job", "a")]));
-        let series = group_multi_rows(rows, &HashMap::new(), &by_fp);
+        let mut labels_by = HashMap::new();
+        labels_by.insert(fp, ("m".to_string(), ls(&[("job", "a")])));
+        let series = group_multi_rows(rows, &labels_by);
         let values: Vec<f64> = series[0].samples.iter().map(|s| s.v).collect();
         assert_eq!(values, vec![5.0, 7.0]);
     }

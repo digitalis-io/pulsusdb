@@ -81,10 +81,11 @@ fn basic_series_fixture_produces_exact_rows_matching_independently_recomputed_fi
     // `__name__` never enters the LabelSet (architect plan).
     assert_eq!(cpu_series.labels.get("__name__"), None);
     // Independently recompute the fingerprint via the frozen model
-    // function over the same labels, proving the parser's fingerprint is
-    // not just internally self-consistent.
+    // function over the same name and labels (F4, issue #623: the series
+    // ID), proving the parser's fingerprint is not just internally
+    // self-consistent.
     assert_eq!(
-        pulsus_model::metric_fingerprint(&cpu_series.labels),
+        pulsus_model::series_fingerprint(&cpu.metric_name, &cpu_series.labels),
         cpu.fingerprint
     );
 

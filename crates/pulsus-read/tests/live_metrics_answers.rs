@@ -10,7 +10,7 @@
 //! worth stating exactly, because the wider claim is false.
 //!
 //! The read path builds a float sample at two places — `group_rows` and
-//! `group_multi_rows` (`crates/pulsus-read/src/metrics/exec.rs:2116` and
+//! `group_multi_rows` (`crates/pulsus-read/src/metrics/exec.rs:2268` and
 //! `:2170`). Mutating **both**, one mutation at a time, against the three
 //! live suites for this engine (`live_metrics_engine`,
 //! `live_metrics_cache`, `live_discovery_fallback` — 39 tests) and the two
@@ -135,7 +135,7 @@ use std::time::Duration;
 
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
 use pulsus_model::{
-    CounterResetHint, DEFAULT_ACTIVITY_BUCKET_MS, Fingerprint, FloatHistogram, STALE_NAN_BITS, Span,
+    ACTIVITY_BUCKET_MS, CounterResetHint, Fingerprint, FloatHistogram, STALE_NAN_BITS, Span,
 };
 use pulsus_promql::parser::parse;
 use pulsus_promql::{FetchedSeries, Labels, QueryValue, Sample, SelectorSpec, SeriesData};
@@ -201,7 +201,6 @@ struct SeedSeriesRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedSampleRow {
-    metric_name: String,
     fingerprint: u128,
     unix_milli: i64,
     value: f64,
@@ -222,7 +221,7 @@ fn cache_config(db: &str) -> LabelCacheConfig {
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
         db: db.to_string(),
         series_table: "metric_series".to_string(),
-        bucket_ms: DEFAULT_ACTIVITY_BUCKET_MS,
+        labels_table: "metric_labels".to_string(),
         window_ms: 24 * 3_600_000,
         cache_max_series: 50_000,
         ttl: Duration::from_secs(60),
@@ -237,6 +236,7 @@ fn engine_config(db: &str) -> MetricsConfig {
         samples_table: "metric_samples".to_string(),
         hist_samples_table: "metric_hist_samples".to_string(),
         series_table: "metric_series".to_string(),
+        labels_table: "metric_labels".to_string(),
         metadata_table: "metric_metadata".to_string(),
         experimental_functions: false,
         max_metric_fanout: 1_000,
@@ -268,7 +268,6 @@ struct FixtureSeries {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedHistRow {
-    metric_name: String,
     fingerprint: u128,
     unix_milli: i64,
     schema: i8,
@@ -619,17 +618,13 @@ async fn seed(client: &ChClient, fx: &[FixtureSeries], bucket: i64) {
         .iter()
         .flat_map(|s| {
             s.samples.iter().map(move |(t, bits)| SeedSampleRow {
-                metric_name: s.metric.to_string(),
                 fingerprint: u128::from(s.fp),
                 unix_milli: *t,
                 value: f64::from_bits(*bits),
             })
         })
         .collect();
-    client
-        .insert_block("metric_series", &series)
-        .await
-        .expect("seed metric_series");
+    seed_series_rows(client, &series).await;
     client
         .insert_block("metric_samples", &samples)
         .await
@@ -640,7 +635,6 @@ async fn seed(client: &ChClient, fx: &[FixtureSeries], bucket: i64) {
         .flat_map(|s| {
             let cols = cols.clone();
             s.hist_samples.iter().map(move |t| SeedHistRow {
-                metric_name: s.metric.to_string(),
                 fingerprint: u128::from(s.fp),
                 unix_milli: *t,
                 schema: cols.schema,
@@ -927,7 +921,7 @@ async fn harness(db: &str) -> Harness {
     let client = ChClient::new(test_config(&db)).await.expect("connect");
     let now = now_ms();
     let t = (now / 60_000) * 60_000;
-    let bucket = (now / DEFAULT_ACTIVITY_BUCKET_MS) * DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = (now / ACTIVITY_BUCKET_MS) * ACTIVITY_BUCKET_MS;
     let fx = fixture(t);
     seed(&client, &fx, bucket).await;
 
@@ -1826,4 +1820,54 @@ async fn every_query_answers_the_same_through_the_read_path_and_in_memory() {
         disagreements.join("\n")
     );
     drop_database(&h.bootstrap, &h.db).await;
+}
+
+/// Issue #623: a series is two rows now — its activity in `metric_series`
+/// and its own label row in `metric_labels`.
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SeedActivityRow {
+    day: u16,
+    fingerprint: u128,
+    metric_name: String,
+    hours: u32,
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SeedLabelRow {
+    metric_name: String,
+    fingerprint: u128,
+    labels: String,
+    first_seen: i64,
+    last_seen: i64,
+}
+
+/// Seeds `rows` the way the two views fill the tables from one kind-2 row.
+async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
+    let activity: Vec<SeedActivityRow> = rows
+        .iter()
+        .map(|r| SeedActivityRow {
+            day: r.unix_milli.div_euclid(86_400_000) as u16,
+            fingerprint: r.fingerprint,
+            metric_name: r.metric_name.clone(),
+            hours: 1u32 << (r.unix_milli.rem_euclid(86_400_000) / 3_600_000),
+        })
+        .collect();
+    let labels: Vec<SeedLabelRow> = rows
+        .iter()
+        .map(|r| SeedLabelRow {
+            metric_name: r.metric_name.clone(),
+            fingerprint: r.fingerprint,
+            labels: r.labels.clone(),
+            first_seen: r.unix_milli,
+            last_seen: r.unix_milli,
+        })
+        .collect();
+    client
+        .insert_block("metric_series", &activity)
+        .await
+        .expect("seed metric_series");
+    client
+        .insert_block("metric_labels", &labels)
+        .await
+        .expect("seed metric_labels");
 }

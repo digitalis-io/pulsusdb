@@ -12,7 +12,7 @@
 -- and never add a substitution that matches one.
 --
 -- A REPLICATION PATH NAMES ITS OWN TABLE. The paths are written out rather
--- than derived, so a wrong one is a per-table error. Eighteen tables take
+-- than derived, so a wrong one is a per-table error. Nineteen tables take
 -- `/clickhouse/tables/{shard}/` and five take `/clickhouse/tables/all/`
 -- (docs/architecture.md §3). `tests/schema_file.rs` holds the relation.
 --
@@ -130,7 +130,6 @@ ORDER BY (key, val, fingerprint)
 
 CREATE TABLE IF NOT EXISTS {{db}}.metric_hist_samples{{on_cluster}}
 (
-    metric_name LowCardinality(String),
     fingerprint UInt128 CODEC(Delta(8), ZSTD(1)),
     unix_milli Int64 CODEC(DoubleDelta, ZSTD(1)),
     schema Int8 CODEC(ZSTD(1)),
@@ -150,14 +149,27 @@ CREATE TABLE IF NOT EXISTS {{db}}.metric_hist_samples{{on_cluster}}
 --@single  ENGINE = MergeTree
 --@cluster ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/{{db}}.metric_hist_samples', '{replica}')
 PARTITION BY toDate(fromUnixTimestamp64Milli(unix_milli))
-ORDER BY (metric_name, fingerprint, unix_milli)
+ORDER BY (fingerprint, unix_milli)
 TTL toDateTime(least(intDiv(unix_milli, 1000) + ({{retention_days}} * 86400), 4294967295))
---@single  SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy}};
---@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
+--@single  SETTINGS ttl_only_drop_parts = 1, primary_key_ratio_of_unique_prefix_values_to_skip_suffix_columns = 1, index_granularity = 8192, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy}};
+--@cluster SETTINGS ttl_only_drop_parts = 1, primary_key_ratio_of_unique_prefix_values_to_skip_suffix_columns = 1, index_granularity = 8192, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
+
+CREATE TABLE IF NOT EXISTS {{db}}.metric_labels{{on_cluster}}
+(
+    metric_name LowCardinality(String),
+    fingerprint UInt128 CODEC(Delta(8), ZSTD(1)),
+    labels String CODEC(ZSTD(5)),
+    first_seen SimpleAggregateFunction(min, Int64) CODEC(ZSTD(1)),
+    last_seen SimpleAggregateFunction(max, Int64) CODEC(ZSTD(1))
+)
+--@single  ENGINE = AggregatingMergeTree
+--@cluster ENGINE = ReplicatedAggregatingMergeTree('/clickhouse/tables/{shard}/{{db}}.metric_labels', '{replica}')
+ORDER BY (metric_name, fingerprint)
+--@single  SETTINGS index_granularity = 8192, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy}};
+--@cluster SETTINGS index_granularity = 8192, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
 
 CREATE TABLE IF NOT EXISTS {{db}}.metric_landing{{on_cluster}}
 (
-    event_id UUID DEFAULT generateUUIDv7(),
     received_ms Int64 CODEC(DoubleDelta, ZSTD(1)),
     kind UInt8 CODEC(ZSTD(1)),
     metric_name LowCardinality(String),
@@ -208,7 +220,6 @@ ORDER BY metric_name
 
 CREATE TABLE IF NOT EXISTS {{db}}.metric_samples{{on_cluster}}
 (
-    metric_name LowCardinality(String),
     fingerprint UInt128 CODEC(Delta(8), ZSTD(1)),
     unix_milli Int64 CODEC(DoubleDelta, ZSTD(1)),
     value Float64 CODEC(Gorilla(8), ZSTD(1))
@@ -216,25 +227,25 @@ CREATE TABLE IF NOT EXISTS {{db}}.metric_samples{{on_cluster}}
 --@single  ENGINE = MergeTree
 --@cluster ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/{{db}}.metric_samples', '{replica}')
 PARTITION BY toDate(fromUnixTimestamp64Milli(unix_milli))
-ORDER BY (metric_name, fingerprint, unix_milli)
+ORDER BY (fingerprint, unix_milli)
 TTL toDateTime(least(intDiv(unix_milli, 1000) + ({{retention_days}} * 86400), 4294967295))
---@single  SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy}};
---@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
+--@single  SETTINGS ttl_only_drop_parts = 1, primary_key_ratio_of_unique_prefix_values_to_skip_suffix_columns = 1, index_granularity = 8192, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy}};
+--@cluster SETTINGS ttl_only_drop_parts = 1, primary_key_ratio_of_unique_prefix_values_to_skip_suffix_columns = 1, index_granularity = 8192, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
 
 CREATE TABLE IF NOT EXISTS {{db}}.metric_series{{on_cluster}}
 (
+    day Date,
+    fingerprint UInt128 CODEC(ZSTD(1)),
     metric_name LowCardinality(String),
-    fingerprint UInt128 CODEC(Delta(8), ZSTD(1)),
-    unix_milli Int64 CODEC(Delta(8), ZSTD(1)),
-    labels String CODEC(ZSTD(5)),
-    value_type UInt8 DEFAULT 0
+    hours SimpleAggregateFunction(groupBitOr, UInt32)
 )
---@single  ENGINE = MergeTree
---@cluster ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/{{db}}.metric_series', '{replica}')
-PARTITION BY toYYYYMM(fromUnixTimestamp64Milli(unix_milli))
-ORDER BY (metric_name, fingerprint, unix_milli)
---@single  SETTINGS index_granularity = 8192, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy}};
---@cluster SETTINGS index_granularity = 8192, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
+--@single  ENGINE = AggregatingMergeTree
+--@cluster ENGINE = ReplicatedAggregatingMergeTree('/clickhouse/tables/{shard}/{{db}}.metric_series', '{replica}')
+PARTITION BY day
+ORDER BY fingerprint
+TTL toDateTime(least((toUInt64(toUInt16(day)) + 1 + {{retention_days}}) * 86400, 4294967295))
+--@single  SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy}};
+--@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
 
 CREATE TABLE IF NOT EXISTS {{db}}.resources{{on_cluster}}
 (
@@ -599,13 +610,16 @@ TTL toDateTime(least(intDiv(last_start_ns, 1000000000) + ({{retention_days}} * 8
 --@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'log_streams', cityHash64(fingerprint));
 
 --@cluster CREATE TABLE IF NOT EXISTS {{db}}.metric_hist_samples{{dist_suffix}}{{on_cluster}} AS {{db}}.metric_hist_samples
---@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'metric_hist_samples', cityHash64(metric_name, fingerprint));
+--@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'metric_hist_samples', cityHash64(fingerprint));
+
+--@cluster CREATE TABLE IF NOT EXISTS {{db}}.metric_labels{{dist_suffix}}{{on_cluster}} AS {{db}}.metric_labels
+--@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'metric_labels', cityHash64(fingerprint));
 
 --@cluster CREATE TABLE IF NOT EXISTS {{db}}.metric_samples{{dist_suffix}}{{on_cluster}} AS {{db}}.metric_samples
---@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'metric_samples', cityHash64(metric_name, fingerprint));
+--@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'metric_samples', cityHash64(fingerprint));
 
 --@cluster CREATE TABLE IF NOT EXISTS {{db}}.metric_series{{dist_suffix}}{{on_cluster}} AS {{db}}.metric_series
---@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'metric_series', cityHash64(metric_name, fingerprint));
+--@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'metric_series', cityHash64(fingerprint));
 
 --@cluster CREATE TABLE IF NOT EXISTS {{db}}.spans{{dist_suffix}}{{on_cluster}} AS {{db}}.spans
 --@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'spans', cityHash64(trace_id))
@@ -690,7 +704,6 @@ WHERE kind = 1;
 DROP VIEW IF EXISTS {{db}}.metric_hist_samples_mv{{on_cluster}};
 CREATE MATERIALIZED VIEW {{db}}.metric_hist_samples_mv{{on_cluster}} TO {{db}}.metric_hist_samples
 AS SELECT
-    metric_name AS metric_name,
     fingerprint AS fingerprint,
     unix_milli AS unix_milli,
     hist_schema AS schema,
@@ -709,6 +722,17 @@ AS SELECT
 FROM {{db}}.metric_landing
 WHERE kind = 1;
 
+DROP VIEW IF EXISTS {{db}}.metric_labels_mv{{on_cluster}};
+CREATE MATERIALIZED VIEW {{db}}.metric_labels_mv{{on_cluster}} TO {{db}}.metric_labels
+AS SELECT
+    metric_name AS metric_name,
+    fingerprint AS fingerprint,
+    labels AS labels,
+    unix_milli AS first_seen,
+    unix_milli AS last_seen
+FROM {{db}}.metric_landing
+WHERE kind = 2;
+
 DROP VIEW IF EXISTS {{db}}.metric_metadata_mv{{on_cluster}};
 CREATE MATERIALIZED VIEW {{db}}.metric_metadata_mv{{on_cluster}} TO {{db}}.metric_metadata
 AS SELECT
@@ -723,7 +747,6 @@ WHERE kind = 3;
 DROP VIEW IF EXISTS {{db}}.metric_samples_mv{{on_cluster}};
 CREATE MATERIALIZED VIEW {{db}}.metric_samples_mv{{on_cluster}} TO {{db}}.metric_samples
 AS SELECT
-    metric_name AS metric_name,
     fingerprint AS fingerprint,
     unix_milli AS unix_milli,
     value AS value
@@ -733,11 +756,10 @@ WHERE kind = 0;
 DROP VIEW IF EXISTS {{db}}.metric_series_mv{{on_cluster}};
 CREATE MATERIALIZED VIEW {{db}}.metric_series_mv{{on_cluster}} TO {{db}}.metric_series
 AS SELECT
-    metric_name AS metric_name,
+    toDate(fromUnixTimestamp64Milli(unix_milli), 'UTC') AS day,
     fingerprint AS fingerprint,
-    unix_milli AS unix_milli,
-    labels AS labels,
-    value_type AS value_type
+    metric_name AS metric_name,
+    toUInt32(bitShiftLeft(toUInt32(1), toHour(fromUnixTimestamp64Milli(unix_milli), 'UTC'))) AS hours
 FROM {{db}}.metric_landing
 WHERE kind = 2;
 

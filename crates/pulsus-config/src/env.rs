@@ -77,7 +77,6 @@ pub const ALL_ENV_VARS: &[&str] = &[
     "PULSUS_OTLP_PROMOTE_SCOPE_METADATA",
     "PULSUS_CACHE_TTL",
     "PULSUS_CACHE_MAX_SERIES",
-    "PULSUS_SERIES_ACTIVITY_BUCKET",
     "PULSUS_CACHE_WINDOW",
     "PULSUS_PROMQL_MAX_SAMPLES",
     "PULSUS_PROMQL_LOOKBACK",
@@ -388,9 +387,6 @@ pub fn apply_env(cfg: &mut Config) -> Result<(), ConfigError> {
     if let Some(v) = read("PULSUS_CACHE_MAX_SERIES") {
         cfg.reader.cache_max_series = parse_int("PULSUS_CACHE_MAX_SERIES", &v)?;
     }
-    if let Some(v) = read("PULSUS_SERIES_ACTIVITY_BUCKET") {
-        cfg.reader.series_activity_bucket = parse_dur("PULSUS_SERIES_ACTIVITY_BUCKET", &v)?;
-    }
     if let Some(v) = read("PULSUS_CACHE_WINDOW") {
         cfg.reader.cache_window = parse_dur("PULSUS_CACHE_WINDOW", &v)?;
     }
@@ -516,8 +512,8 @@ mod tests {
         assert_eq!(sorted, deduped, "ALL_ENV_VARS must not contain duplicates");
         assert_eq!(
             ALL_ENV_VARS.len(),
-            96,
-            "docs/configuration.md §§1-8 document exactly 96 variables"
+            95,
+            "docs/configuration.md §§1-8 document exactly 95 variables"
         );
     }
 

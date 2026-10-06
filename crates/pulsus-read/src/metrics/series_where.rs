@@ -1,13 +1,12 @@
-//! **LEAF MODULE — the only place a `metric_series` window bound or a
-//! label-matcher predicate can be rendered from the sanctioned
-//! components** (issue #315, review rounds 1–3; the one boundary
+//! **LEAF MODULE — the only place a metrics series read's window or a
+//! matcher predicate can be rendered from the sanctioned components** (issue #315, review rounds 1–3; the one boundary
 //! crossing rustc does NOT police is stated under "What rustc enforces —
 //! and what it does not").
 //!
 //! # Why the renderer lives in a leaf module
 //!
-//! Issue #315 has to hold an invariant across *every* builder that reaches
-//! `metric_series`: a user regex may not be rendered into SQL without the
+//! Issue #315 has to hold an invariant across *every* builder that reads
+//! the series tables: a user regex may not be rendered into SQL without the
 //! constant compile probe that forces ClickHouse's RE2 to adjudicate it
 //! (see [`SeriesWhere`]'s own doc for what the probe is and why it is
 //! spliced into the bound). The first cut of that fix satisfied the
@@ -23,9 +22,9 @@
 //! reachable from every descendant — `sql.rs` included, which is how
 //! review round 2 found the #240 capability token still constructible
 //! from the builders' own file. Everything the hole could be rebuilt from
-//! is therefore *written* HERE, in a leaf with no children: `floored_bound`,
-//! `anchored_re2_literal`, `matcher_regex_literal`, `re2_compile_probe`
-//! and `predicate` are module-private with no visibility modifier at all;
+//! is therefore *written* HERE, in a leaf with no children:
+//! `anchored_re2_literal`, `matcher_regex_literal` and `predicate` are
+//! module-private with no visibility modifier at all;
 //! [`SeriesWhere`]'s field is private; and [`PromqlRe2Fallback`] — the
 //! token the `pub(crate)` escaper demands — has a private field and a
 //! private `new`, so no other module can present one.
@@ -47,24 +46,29 @@
 //!
 //! # Boundary inventory
 //!
-//! Six declarations carry a visibility modifier, pinned by the in-file
+//! Nine declarations carry a visibility modifier, pinned by the in-file
 //! census test `the_boundary_inventory_is_pinned` because a
 //! hand-maintained inventory here was wrong once (review round 3 found
 //! it listing three of the six). That pin reads `pub`-prefixed lines and
 //! `impl` headers, not the language's notion of visibility — see the
 //! test's own doc for what it cannot see:
 //!
-//! * [`SeriesWhere`] — the type name (`pub(super)`); its `tail` field
-//!   stays private, so the type can be named but not forged, and there is
-//!   no direct `w.tail` access. Its derived `Debug` does print `tail`,
-//!   which confers nothing beyond what `where_tail` already hands to the
-//!   same audience.
-//! * [`SeriesWhere::new`] — consumes the matchers and renders bound,
-//!   probe and matcher conjuncts together.
-//! * [`SeriesWhere::where_tail`] — the only accessor, one string.
-//! * [`MatcherTarget`] — `new`'s column selector (`pub(super)`); its
-//!   variants inherit that visibility and are constructible wherever the
-//!   enum is, which yields nothing renderable: a target names a column.
+//! * [`SeriesWhere`] — the type name (`pub(super)`); its fields stay
+//!   private, so the type can be named but not forged. Its derived `Debug`
+//!   does print them, which confers nothing beyond what the two renderings
+//!   below already hand to the same audience.
+//! * [`SeriesWhere::activity`] — consumes the window and the matchers and
+//!   renders the window, the probe and the predicates together (issue
+//!   #623).
+//! * [`SeriesWhere::ids_from_where`] — statement 1's `FROM … WHERE …`,
+//!   whole.
+//! * [`SeriesWhere::with_labels`] — statement 2, whole. The probe is in
+//!   the activity read of both, so it cannot be dropped from a regex.
+//! * [`Lookup`] — `activity`'s input (`pub(super)`), with three
+//!   `pub(super)` fields: a scope's predicates and the two matcher sets.
+//!   It carries no rendered matcher, so it yields nothing renderable.
+//! * [`MatcherTarget`] — the column a matcher reads (`pub(super)`); its
+//!   variants inherit that visibility and name a column, nothing more.
 //! * [`PromqlRe2Fallback`] — the TYPE only (`pub(crate)`, so the
 //!   escaper's pinned signature can name it); both ways of *making* one
 //!   are private to this file.
@@ -79,19 +83,18 @@
 //!
 //! | attempted spelling | rustc |
 //! |---|---|
-//! | `floored_bound(..)`, `anchored_re2_literal(..)`, `matcher_regex_literal(..)`, `re2_compile_probe(..)`, `predicate(..)` — unqualified | `E0425` cannot find function in this scope |
-//! | `crate::metrics::series_where::floored_bound(..)` / `…::predicate(..)` — fully qualified | `E0603` private function |
-//! | `SeriesWhere { tail: … }` (struct literal) | `E0451` private field |
-//! | `w.tail` (field access) | `E0616` private field |
+//! | `anchored_re2_literal(..)`, `matcher_regex_literal(..)`, `predicate(..)` — unqualified | `E0425` cannot find function in this scope |
+//! | `crate::metrics::series_where::predicate(..)` — fully qualified | `E0603` private function |
+//! | `SeriesWhere { activity: … }` (struct literal) | `E0451` private field |
+//! | `w.activity` (field access) | `E0616` private field |
 //! | `PromqlRe2Fallback::new()` — including under a `use … as` alias | `E0624` private associated function |
 //! | `PromqlRe2Fallback(())` (tuple constructor) | `E0423` cannot initialize a tuple struct which contains private fields |
 //!
 //! So what rustc enforces is exactly this much: **in safe Rust**, outside
 //! this file, no spelling constructs the #240 token, calls the escaper
-//! (its signature demands that token), calls the private
-//! bound/probe/predicate helpers, forges [`SeriesWhere`] or names its
-//! `tail` field — the *sanctioned components* cannot be recombined into
-//! "bound without probe".
+//! (its signature demands that token), calls the private predicate
+//! helpers, forges [`SeriesWhere`] or names its fields — the *sanctioned
+//! components* cannot be recombined into "a regex without its probe".
 //!
 //! Safe Rust is the boundary that matters here, and it is the only one on
 //! offer: privacy is not checked by `unsafe` conversions, so
@@ -120,10 +123,8 @@
 //! declared here can reach those privates and could therefore rebuild the
 //! hole — this file is the seal's trust base, and rustc cannot police
 //! additions *inside* it. A new builder belongs in `sql.rs`, where the
-//! only fragments available to it are a whole `where_tail` and the seam's
-//! bare literal.
-
-use pulsus_model::floor_to_activity_bucket;
+//! only fragments available to it are a whole rendered read and the
+//! seam's bare literal.
 
 use crate::logql::escape::{ch_regex_anchored_promql_re2, ch_string};
 
@@ -159,7 +160,7 @@ impl PromqlRe2Fallback {
     }
 }
 
-/// Which column a matcher set is evaluated against.
+/// Which column a matcher is evaluated against on the lookup table.
 ///
 /// An enum rather than a boolean (workspace rule: no boolean parameters),
 /// and matched exhaustively in [`predicate`], so a third target cannot be
@@ -167,97 +168,171 @@ impl PromqlRe2Fallback {
 /// breaks the build" property the `MatchOp` arms already carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MatcherTarget {
-    /// Ordinary label matchers, read out of the stored JSON blob.
+    /// Ordinary label matchers, read out of the lookup row's canonical JSON
+    /// (`metric_labels`, one row per series, issue #623).
     /// `JSONExtractString` returns `''` for a missing key, which is
     /// Prometheus's absent-label rule and matches `super::labels`'
     /// in-process `""` — load-bearing for the cache-vs-SQL differential.
     Labels,
-    /// `__name__` matchers (issue #96's degraded-cache discovery probe),
-    /// which address the **`metric_name` column** — the leading
-    /// primary-key component of `metric_series`, never a stored label
-    /// (docs/schemas.md §2.1). Only ever fed the non-`Eq` name matchers a
-    /// regex/negated-`__name__` selector carries; the `Eq` arm is the
-    /// concrete-name route and never reaches here, but is kept total
-    /// rather than panicking on an unreachable input.
+    /// `__name__` matchers, which address the lookup's **`metric_name`
+    /// column** — never a stored label (docs/schemas.md §2.1).
     MetricNameColumn,
 }
 
-/// The bucket-floored window bound **and** its matcher conjuncts, rendered
-/// together and inseparable.
+/// What a series read matches on the lookup table (issue #623): the
+/// predicates its scope already states (`metric_name = 'up'`, `metric_name
+/// IN (…)`, `fingerprint IN (…)`), its `__name__` matchers and its label
+/// matchers. Every one of them runs on the lookup; the activity table
+/// answers only the window.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Lookup<'a> {
+    pub(super) scope: &'a [String],
+    pub(super) name_matchers: &'a [LabelMatcher],
+    pub(super) matchers: &'a [LabelMatcher],
+}
+
+/// A series read's window on the activity table and its matchers on the
+/// lookup table, rendered together and inseparable (issue #623).
+///
+/// # The window
+///
+/// The activity table holds one row per series per UTC day, `hours` the
+/// 24-bit mask of the hours the series had samples in. The window bounds
+/// `day` by its first and last UTC day, and [`hour_mask`] gives each day
+/// the window's hours: the first day from the window's first hour, the
+/// last day to its last hour, a day between them whole. Unmerged rows of
+/// one day are each tested, so no `FINAL` is needed: a row tests true when
+/// any of its hours is in the window.
 ///
 /// # The compile probe (issue #315)
 ///
 /// ClickHouse compiles a `match()` pattern only when it evaluates that
-/// `match()` on a row. A selector naming a metric with no stored rows in
-/// the window therefore never reaches RE2 at all, so an RE2-rejected
-/// pattern came back as an empty `200` where upstream Prometheus (the
-/// metrics API's reference of record, issue #283) answers `400` — and
-/// issue #309's screen cannot close it, because it *delegates* the verdict
-/// to a storage engine that never runs. [`SeriesWhere::new`] therefore
-/// renders one extra `match()` per regex matcher over a **constant**
-/// subject, which ClickHouse folds during query analysis, before a single
-/// part is read: a pattern RE2 refuses raises `Code: 427
-/// CANNOT_COMPILE_REGEXP` there, and [`super::dispatch`] classifies it
-/// into the same 400 the row predicate would have produced.
+/// `match()` on a row. A selector naming a metric with no rows in the
+/// window therefore never reaches RE2 at all, so an RE2-rejected pattern
+/// came back as an empty `200` where the metrics API's reference of record
+/// (issue #283) answers `400`. The activity read
+/// therefore carries one `0 * match('', <pattern>) = 0` line per regex
+/// matcher, over a **constant** subject, which ClickHouse folds during
+/// query analysis, before a single part is read: a pattern RE2 refuses
+/// raises `Code: 427 CANNOT_COMPILE_REGEXP` there, and [`super::dispatch`]
+/// classifies it into the same 400 the row predicate would have produced.
+/// The patterns themselves run on the lookup rows, inside the activity
+/// read's `fingerprint IN` set, so no activity row evaluates a regex.
 ///
-/// **Why the probe is spliced into the window bound rather than added as
-/// its own `AND` conjunct.** Both forms fold, but a standalone constant
-/// conjunct stops ClickHouse from *fully* moving the matcher predicate
-/// into PREWHERE: the plan keeps a second `Filter` step that re-evaluates
-/// `and(metric_name = …, match(JSONExtractString(…), …), 1)` on every row
-/// that survived PREWHERE, i.e. it pays the JSON extraction and the regex
-/// twice for every matched row (measured on 24.8.14.39 with
-/// `EXPLAIN actions=1`; `AND 1` alone is enough to cause it). Folded into
-/// the constant lower bound the probe leaves no trace in the plan — the
-/// primary key condition still reads `unix_milli in [#, +Inf)` and the
-/// whole WHERE still moves to PREWHERE — so it adds no per-row action and
-/// no index engagement. That plan-shape claim is the one this repo gates
-/// (`tests/explain_indexes.rs`), because it is scale-invariant; a paired
-/// wall-clock A/B over 2M-80M rows agreed but could only bound the
-/// difference, not resolve it (95% CIs straddling zero; the rejected
-/// conjunct shape was the one that measured a detectable cost). Wall-time
-/// numbers are recorded on issue #315, never asserted here.
-///
-/// A matcher set with no regex renders no probe at all, so `up{job="a"}`
-/// is byte-identical to what this path emitted before #315. Probes are
-/// emitted in matcher order and the analyzer folds the sum left to right,
-/// so the FIRST invalid pattern is the one reported — matching upstream's
-/// own order and issue #316's in-process `first_invalid_regex_detail`.
+/// A matcher set with no regex renders no probe line at all. Probes are
+/// emitted in matcher order — name matchers, then label matchers — so the
+/// FIRST invalid pattern is the one reported, matching upstream's own
+/// order and issue #316's in-process `first_invalid_regex_detail`.
 #[derive(Debug)]
 pub(super) struct SeriesWhere {
-    /// `unix_milli >= <floor><probe> AND unix_milli <= <floor>` followed by
-    /// one `\n  AND <predicate>` per matcher. Private: the two halves are
-    /// never handed out separately, which is what makes "a regex without
-    /// its probe" unrepresentable rather than merely untested.
-    tail: String,
+    /// The activity read's conditions after `WHERE`: the day range, the
+    /// probe lines and the hour mask, one per line, unindented.
+    activity: Vec<String>,
+    /// The lookup read's conditions: the scope, then one predicate per
+    /// matcher. Empty when the read has neither.
+    lookup: Vec<String>,
 }
 
 impl SeriesWhere {
-    /// Renders the window bound (bucket-floored on both edges, carrying the
-    /// compile probe for `matchers`) and the matcher conjuncts, in the one
-    /// order every builder uses.
-    pub(super) fn new(
-        window: DataWindow,
-        bucket_ms: i64,
-        matchers: &[LabelMatcher],
-        target: MatcherTarget,
-    ) -> Self {
-        let lower = floored_bound(window.start_ms, bucket_ms);
-        let upper = floored_bound(window.end_ms, bucket_ms);
-        let probe = re2_compile_probe(matchers);
-        let mut tail = format!("unix_milli >= {lower}{probe} AND unix_milli <= {upper}");
-        for m in matchers {
-            tail.push_str("\n  AND ");
-            tail.push_str(&predicate(m, target));
+    /// Renders `window` as the activity read's day range and hour mask, the
+    /// compile probe for every regex in `lookup`, and `lookup`'s
+    /// predicates.
+    pub(super) fn activity(window: DataWindow, lookup: Lookup<'_>) -> Self {
+        let (first, _) = day_and_hour(window.start_ms);
+        let (last, _) = day_and_hour(window.end_ms);
+        let mut activity = vec![format!(
+            "day BETWEEN '{}' AND '{}'",
+            day_text(first),
+            day_text(last)
+        )];
+        for literal in lookup
+            .name_matchers
+            .iter()
+            .chain(lookup.matchers)
+            .filter_map(matcher_regex_literal)
+        {
+            activity.push(format!("0 * match('', {literal}) = 0"));
         }
-        SeriesWhere { tail }
+        activity.push(format!("bitAnd(hours, {}) != 0", hour_mask(window)));
+        let lookup_preds = lookup
+            .scope
+            .iter()
+            .cloned()
+            .chain(
+                lookup
+                    .name_matchers
+                    .iter()
+                    .map(|m| predicate(m, MatcherTarget::MetricNameColumn)),
+            )
+            .chain(
+                lookup
+                    .matchers
+                    .iter()
+                    .map(|m| predicate(m, MatcherTarget::Labels)),
+            )
+            .collect();
+        SeriesWhere {
+            activity,
+            lookup: lookup_preds,
+        }
     }
 
-    /// The rendered `WHERE` tail — bound, probe and matchers, as one
-    /// string. The only accessor, deliberately: a builder that could ask
-    /// for the matchers alone would be able to rebuild the #315 hole.
-    pub(super) fn where_tail(&self) -> &str {
-        &self.tail
+    /// Statement 1's `FROM … WHERE …`: the activity rows in the window
+    /// whose IDs the lookup predicates select. A builder prepends its own
+    /// projection.
+    pub(super) fn ids_from_where(&self, series_table: &str, labels_table: &str) -> String {
+        self.activity_read(series_table, labels_table, "")
+    }
+
+    /// Statement 2 whole: each series the lookup predicates select whose
+    /// ID the activity read finds in the window, with its own name and
+    /// labels, once.
+    pub(super) fn with_labels(&self, series_table: &str, labels_table: &str) -> String {
+        let mut out = format!(
+            "SELECT fingerprint, any(name) AS metric_name, any(label_text) AS labels\n\
+             FROM (\n\
+             \x20 SELECT fingerprint, metric_name AS name, labels AS label_text\n\
+             \x20 FROM {labels_table}\n"
+        );
+        let mut keyword = "WHERE";
+        for pred in &self.lookup {
+            out.push_str(&format!("  {keyword} {pred}\n"));
+            keyword = "  AND";
+        }
+        out.push_str(&format!(
+            "  {keyword} fingerprint IN (\n\
+             \x20     SELECT fingerprint\n\
+             {}\n\
+             \x20   )\n\
+             )\n\
+             GROUP BY fingerprint\n\
+             ORDER BY metric_name, fingerprint",
+            self.activity_read(series_table, labels_table, "      ")
+        ));
+        out
+    }
+
+    /// The activity read, every line indented by `indent`: the window, then
+    /// the IDs the lookup predicates select when there are any.
+    fn activity_read(&self, series_table: &str, labels_table: &str, indent: &str) -> String {
+        let mut lines = vec![format!("{indent}FROM {series_table}")];
+        let mut keyword = "WHERE";
+        for cond in &self.activity {
+            lines.push(format!("{indent}{keyword} {cond}"));
+            keyword = "  AND";
+        }
+        if !self.lookup.is_empty() {
+            lines.push(format!("{indent}  AND fingerprint IN ("));
+            lines.push(format!("{indent}    SELECT fingerprint"));
+            lines.push(format!("{indent}    FROM {labels_table}"));
+            let mut keyword = "WHERE";
+            for pred in &self.lookup {
+                lines.push(format!("{indent}    {keyword} {pred}"));
+                keyword = "  AND";
+            }
+            lines.push(format!("{indent}  )"));
+        }
+        lines.join("\n")
     }
 }
 
@@ -284,16 +359,6 @@ pub fn anchored_re2_literal_for_test(pattern: &str) -> String {
     anchored_re2_literal(pattern)
 }
 
-/// `intDiv({ms}, {bucket_ms}) * {bucket_ms}` — the literal bound
-/// docs/schemas.md §2.1 renders, computed via the shared
-/// [`floor_to_activity_bucket`] (not re-derived here) so the rendered
-/// number is byte-identical to what the writer's own registration gate
-/// computes (issue #26 precedent; cross-crate pinned by
-/// `tests/metrics_bucket_floor.rs`).
-fn floored_bound(ms: i64, bucket_ms: i64) -> i64 {
-    floor_to_activity_bucket(ms, bucket_ms)
-}
-
 /// The metrics path's **only** regex→SQL rendering (issue #240's PromQL
 /// exemption, narrowed to one site by issue #315 so the row predicate and
 /// the compile probe can never disagree about the pattern text they name).
@@ -309,20 +374,6 @@ fn matcher_regex_literal(m: &LabelMatcher) -> Option<String> {
         MatchOp::Re | MatchOp::Nre => Some(anchored_re2_literal(&m.value)),
         MatchOp::Eq | MatchOp::Neq => None,
     }
-}
-
-/// The constant `match()` sum spliced into the lower bound, or empty when
-/// no matcher carries a regex. See [`SeriesWhere`] for the reasoning.
-fn re2_compile_probe(matchers: &[LabelMatcher]) -> String {
-    let probes: Vec<String> = matchers
-        .iter()
-        .filter_map(matcher_regex_literal)
-        .map(|literal| format!("match('', {literal})"))
-        .collect();
-    if probes.is_empty() {
-        return String::new();
-    }
-    format!(" + 0 * ({})", probes.join(" + "))
 }
 
 /// One matcher, against whichever column `target` names. Label keys are
@@ -341,9 +392,151 @@ fn predicate(m: &LabelMatcher, target: MatcherTarget) -> String {
     }
 }
 
+/// A UTC instant's day, in days since the epoch, and its hour — clamped to
+/// the `Date` column's range, so a window reaching past it reads the days
+/// the table can hold.
+fn day_and_hour(ms: i64) -> (i64, i64) {
+    const DAY_MS: i64 = 86_400_000;
+    const LAST_DAY: i64 = u16::MAX as i64;
+    let day = ms.div_euclid(DAY_MS);
+    if day < 0 {
+        (0, 0)
+    } else if day > LAST_DAY {
+        (LAST_DAY, 23)
+    } else {
+        (day, ms.rem_euclid(DAY_MS) / 3_600_000)
+    }
+}
+
+/// A day since the epoch as the `YYYY-MM-DD` text a `Date` compares with.
+fn day_text(day: i64) -> String {
+    chrono::DateTime::from_timestamp(day * 86_400, 0)
+        .map(|t| t.format("%Y-%m-%d").to_string())
+        .unwrap_or_default()
+}
+
+/// Hours `first` to `last` of a day as mask bits.
+fn bits(first: i64, last: i64) -> i64 {
+    (1 << (last + 1)) - (1 << first)
+}
+
+/// The hours of `window`, as each day's mask: `multiIf(day = d0 AND day =
+/// d1, bits(h0, h1), day = d0, bits(h0, 23), day = d1, bits(0, h1),
+/// 16777215)`. On a window inside one day the first branch decides; across
+/// days it cannot hold and is rendered `0`.
+fn hour_mask(window: DataWindow) -> String {
+    let (d0, h0) = day_and_hour(window.start_ms);
+    let (d1, h1) = day_and_hour(window.end_ms);
+    let (t0, t1) = (day_text(d0), day_text(d1));
+    let same_day = if d0 == d1 { bits(h0, h1) } else { 0 };
+    format!(
+        "multiIf(day = '{t0}' AND day = '{t1}', {same_day}, day = '{t0}', {}, \
+         day = '{t1}', {}, 16777215)",
+        bits(h0, 23),
+        bits(0, h1)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The §4 window of the design: 2026-09-07 22:30 to 23:30 UTC.
+    fn evening() -> DataWindow {
+        DataWindow {
+            start_ms: 1_788_820_200_000,
+            end_ms: 1_788_823_800_000,
+        }
+    }
+
+    /// **K1 (issue #623): every name and label matcher runs on the
+    /// lookup.** Each row of the design's §2 table, rendered; and a selector
+    /// with a name regex and a label matcher puts both in the lookup
+    /// sub-query, the regex's probe on its own line ahead of the hour mask.
+    #[test]
+    fn every_matcher_renders_its_lookup_predicate() {
+        let name = |op, v| predicate(&m(op, "__name__", v), MatcherTarget::MetricNameColumn);
+        assert_eq!(name(MatchOp::Eq, "m"), "metric_name = 'm'");
+        assert_eq!(name(MatchOp::Neq, "m"), "metric_name != 'm'");
+        assert_eq!(
+            name(MatchOp::Re, "re"),
+            "match(metric_name, '(?-s)^(?:re)$')"
+        );
+        assert_eq!(
+            name(MatchOp::Nre, "re"),
+            "NOT match(metric_name, '(?-s)^(?:re)$')"
+        );
+        let label = |op, v| predicate(&m(op, "k", v), LABELS);
+        assert_eq!(
+            label(MatchOp::Eq, "v"),
+            "JSONExtractString(labels, 'k') = 'v'"
+        );
+        assert_eq!(
+            label(MatchOp::Neq, "v"),
+            "JSONExtractString(labels, 'k') != 'v'"
+        );
+        assert_eq!(
+            label(MatchOp::Re, "re"),
+            "match(JSONExtractString(labels, 'k'), '(?-s)^(?:re)$')"
+        );
+        assert_eq!(
+            label(MatchOp::Nre, "re"),
+            "NOT match(JSONExtractString(labels, 'k'), '(?-s)^(?:re)$')"
+        );
+
+        let names = [m(MatchOp::Re, "__name__", "up|down")];
+        let labels = [m(MatchOp::Eq, "job", "api")];
+        let w = SeriesWhere::activity(
+            evening(),
+            Lookup {
+                scope: &[],
+                name_matchers: &names,
+                matchers: &labels,
+            },
+        );
+        assert_eq!(
+            w.ids_from_where("metric_series", "metric_labels"),
+            "FROM metric_series\n\
+             WHERE day BETWEEN '2026-09-07' AND '2026-09-07'\n\
+             \x20 AND 0 * match('', '(?-s)^(?:up|down)$') = 0\n\
+             \x20 AND bitAnd(hours, multiIf(day = '2026-09-07' AND day = '2026-09-07', 12582912, day = '2026-09-07', 12582912, day = '2026-09-07', 16777215, 16777215)) != 0\n\
+             \x20 AND fingerprint IN (\n\
+             \x20   SELECT fingerprint\n\
+             \x20   FROM metric_labels\n\
+             \x20   WHERE match(metric_name, '(?-s)^(?:up|down)$')\n\
+             \x20     AND JSONExtractString(labels, 'job') = 'api'\n\
+             \x20 )"
+        );
+    }
+
+    /// **A1 (issue #623): the hour mask.** The window's UTC days bound the
+    /// `day` column, and the mask gives each day the window's hours: one
+    /// hour; the design's 22:30-23:30; across midnight, 23:00 on the first
+    /// day and 00:00 on the next; and three days, the middle one whole.
+    #[test]
+    fn the_hour_mask_covers_exactly_the_windows_hours() {
+        let window = |start_ms, end_ms| DataWindow { start_ms, end_ms };
+        assert_eq!(
+            hour_mask(window(1_788_819_000_000, 1_788_821_400_000)),
+            "multiIf(day = '2026-09-07' AND day = '2026-09-07', 4194304, \
+             day = '2026-09-07', 12582912, day = '2026-09-07', 8388607, 16777215)"
+        );
+        assert_eq!(
+            hour_mask(evening()),
+            "multiIf(day = '2026-09-07' AND day = '2026-09-07', 12582912, \
+             day = '2026-09-07', 12582912, day = '2026-09-07', 16777215, 16777215)"
+        );
+        let midnight = hour_mask(window(1_788_823_800_000, 1_788_827_400_000));
+        assert!(
+            midnight.contains("day = '2026-09-07', 8388608, day = '2026-09-08', 1, 16777215)"),
+            "{midnight}"
+        );
+        let three = hour_mask(window(1_788_820_200_000, 1_788_915_600_000));
+        assert!(
+            three.contains("day = '2026-09-07', 12582912, day = '2026-09-09', 3, 16777215)"),
+            "the middle day takes every hour: {three}"
+        );
+    }
 
     fn window() -> DataWindow {
         DataWindow {
@@ -360,10 +553,23 @@ mod tests {
         }
     }
 
-    fn tail(matchers: &[LabelMatcher], target: MatcherTarget) -> String {
-        SeriesWhere::new(window(), 3_600_000, matchers, target)
-            .where_tail()
-            .to_string()
+    /// The label column every `Labels` case below renders against.
+    const LABELS: MatcherTarget = MatcherTarget::Labels;
+
+    /// Statement 1's text for `matchers` over [`window`], unscoped: name
+    /// matchers when they are `__name__`'s, label matchers otherwise.
+    fn ids(matchers: &[LabelMatcher]) -> String {
+        let (names, labels): (Vec<LabelMatcher>, Vec<LabelMatcher>) =
+            matchers.iter().cloned().partition(|m| m.key == "__name__");
+        SeriesWhere::activity(
+            window(),
+            Lookup {
+                scope: &[],
+                name_matchers: &names,
+                matchers: &labels,
+            },
+        )
+        .ids_from_where("metric_series", "metric_labels")
     }
 
     /// The module-doc boundary inventory, kept honest mechanically
@@ -457,9 +663,14 @@ mod tests {
             [
                 "pub(crate) struct PromqlRe2Fallback(());",
                 "pub(super) enum MatcherTarget {",
+                "pub(super) struct Lookup<'a> {",
+                "pub(super) scope: &'a [String],",
+                "pub(super) name_matchers: &'a [LabelMatcher],",
+                "pub(super) matchers: &'a [LabelMatcher],",
                 "pub(super) struct SeriesWhere {",
-                "pub(super) fn new(",
-                "pub(super) fn where_tail(&self) -> &str {",
+                "pub(super) fn activity(window: DataWindow, lookup: Lookup<'_>) -> Self {",
+                "pub(super) fn ids_from_where(&self, series_table: &str, labels_table: &str) -> String {",
+                "pub(super) fn with_labels(&self, series_table: &str, labels_table: &str) -> String {",
                 "pub fn anchored_re2_literal_for_test(pattern: &str) -> String {",
             ],
             "series_where.rs declarations drifted from this test's list"
@@ -500,8 +711,10 @@ mod tests {
             doc_names,
             [
                 "SeriesWhere",
-                "SeriesWhere::new",
-                "SeriesWhere::where_tail",
+                "SeriesWhere::activity",
+                "SeriesWhere::ids_from_where",
+                "SeriesWhere::with_labels",
+                "Lookup",
                 "MatcherTarget",
                 "PromqlRe2Fallback",
                 "anchored_re2_literal_for_test",
@@ -520,81 +733,63 @@ mod tests {
         );
     }
 
-    #[test]
-    fn floored_bound_matches_the_shared_model_definition() {
-        assert_eq!(floored_bound(3_600_001, 3_600_000), 3_600_000);
-        assert_eq!(
-            floored_bound(3_600_001, 3_600_000),
-            floor_to_activity_bucket(3_600_001, 3_600_000)
-        );
-    }
-
-    /// What this test establishes, no more: for renderings produced by
-    /// [`SeriesWhere::new`] — each `MatchOp` × each `MatcherTarget` with
-    /// one matcher, at fixed representative values, plus the empty set —
-    /// a `match(` predicate appears iff its compile probe does, and a
-    /// regex-free set renders the pre-#315 bound byte-for-byte. It does
-    /// NOT establish that `new` is the only source of a predicate — and
-    /// neither does rustc in full: the module-doc compile-error table
-    /// seals the sanctioned components, while the `_for_test` seam's
-    /// literal can be hand-spliced into a new `match(...)` (module doc,
-    /// "what rustc does not enforce"). Fixed
-    /// values rather than a generator, deliberately: the probe/predicate
-    /// pairing is decided by `MatchOp` alone — the rendering is a pure
-    /// concatenation whose shape is value-independent — so the op × target
-    /// arms are the whole input space for the pairing, and the injection
-    /// tests in `super::sql` cover hostile values.
+    /// What this test establishes, no more: for statement 1 rendered by
+    /// [`SeriesWhere::activity`] — each `MatchOp` × each target with one
+    /// matcher, at fixed representative values — a `match(` predicate on
+    /// the lookup appears iff its compile probe line does, and a regex-free
+    /// set renders no probe. It does NOT establish that `activity` is the
+    /// only source of a predicate (module doc, "what rustc does not
+    /// enforce"). Fixed values rather than a generator: the pairing is
+    /// decided by `MatchOp` alone, and the injection tests in `super::sql`
+    /// cover hostile values.
     #[test]
     fn a_rendered_regex_and_its_compile_probe_are_inseparable() {
-        let regex_ops = [MatchOp::Re, MatchOp::Nre];
-        let literal_ops = [MatchOp::Eq, MatchOp::Neq];
-        for target in [MatcherTarget::Labels, MatcherTarget::MetricNameColumn] {
-            for op in regex_ops {
-                let rendered = tail(&[m(op, "job", "5..")], target);
-                assert!(rendered.contains("match("), "{op:?}/{target:?}: {rendered}");
+        for key in ["job", "__name__"] {
+            for op in [MatchOp::Re, MatchOp::Nre] {
+                let rendered = ids(&[m(op, key, "5..")]);
+                assert!(rendered.contains("match("), "{op:?}/{key}: {rendered}");
                 assert!(
-                    rendered.contains("+ 0 * (match('', '(?-s)^(?:5..)$'))"),
-                    "{op:?}/{target:?} rendered a regex with no probe: {rendered}"
+                    rendered.contains("\n  AND 0 * match('', '(?-s)^(?:5..)$') = 0\n"),
+                    "{op:?}/{key} rendered a regex with no probe: {rendered}"
                 );
             }
-            for op in literal_ops {
-                let rendered = tail(&[m(op, "job", "api")], target);
-                assert!(
-                    !rendered.contains("match("),
-                    "{op:?}/{target:?}: {rendered}"
-                );
-                assert_eq!(
-                    rendered.lines().next(),
-                    Some("unix_milli >= 0 AND unix_milli <= 3600000"),
-                    "{op:?}/{target:?} must render the pre-#315 bound verbatim"
-                );
+            for op in [MatchOp::Eq, MatchOp::Neq] {
+                let rendered = ids(&[m(op, key, "api")]);
+                assert!(!rendered.contains("match("), "{op:?}/{key}: {rendered}");
             }
         }
-        // The empty set is the `discovery_fetch_multi` shape: bound only.
+        // No matcher: the window alone.
         assert_eq!(
-            tail(&[], MatcherTarget::Labels),
-            "unix_milli >= 0 AND unix_milli <= 3600000"
+            ids(&[]),
+            "FROM metric_series\n\
+             WHERE day BETWEEN '1970-01-01' AND '1970-01-01'\n\
+             \x20 AND bitAnd(hours, multiIf(day = '1970-01-01' AND day = '1970-01-01', 3, \
+             day = '1970-01-01', 16777215, day = '1970-01-01', 3, 16777215)) != 0"
         );
     }
 
-    /// Probes are emitted in matcher order (ClickHouse folds the sum left
-    /// to right, so the first invalid pattern is the one reported) and
-    /// literal-valued matchers contribute none.
+    /// Probes are emitted in matcher order, name matchers first (ClickHouse
+    /// folds them in order, so the first invalid pattern is the one
+    /// reported), and literal-valued matchers contribute none.
     #[test]
     fn probes_follow_matcher_order_and_skip_literal_matchers() {
-        let rendered = tail(
-            &[
-                m(MatchOp::Re, "status", "5.."),
-                m(MatchOp::Eq, "job", "api"),
-                m(MatchOp::Nre, "env", "dev"),
+        let rendered = ids(&[
+            m(MatchOp::Re, "status", "5.."),
+            m(MatchOp::Eq, "job", "api"),
+            m(MatchOp::Nre, "env", "dev"),
+            m(MatchOp::Re, "__name__", "up.*"),
+        ]);
+        let probes: Vec<&str> = rendered
+            .lines()
+            .filter(|l| l.starts_with("  AND 0 * match('', "))
+            .collect();
+        assert_eq!(
+            probes,
+            [
+                "  AND 0 * match('', '(?-s)^(?:up.*)$') = 0",
+                "  AND 0 * match('', '(?-s)^(?:5..)$') = 0",
+                "  AND 0 * match('', '(?-s)^(?:dev)$') = 0",
             ],
-            MatcherTarget::Labels,
-        );
-        assert!(
-            rendered.starts_with(
-                "unix_milli >= 0 + 0 * (match('', '(?-s)^(?:5..)$') + \
-                 match('', '(?-s)^(?:dev)$')) AND unix_milli <= 3600000"
-            ),
             "{rendered}"
         );
     }
@@ -604,14 +799,53 @@ mod tests {
     /// docs/schemas.md §2.1).
     #[test]
     fn the_matcher_target_selects_the_column() {
-        let labels = tail(&[m(MatchOp::Re, "job", "api")], MatcherTarget::Labels);
-        assert!(labels.contains("match(JSONExtractString(labels, 'job'), '(?-s)^(?:api)$')"));
-
-        let names = tail(
-            &[m(MatchOp::Re, "__name__", "up.*")],
+        let labels = predicate(&m(MatchOp::Re, "job", "api"), LABELS);
+        assert_eq!(
+            labels,
+            "match(JSONExtractString(labels, 'job'), '(?-s)^(?:api)$')"
+        );
+        let names = predicate(
+            &m(MatchOp::Re, "__name__", "up.*"),
             MatcherTarget::MetricNameColumn,
         );
-        assert!(names.contains("match(metric_name, '(?-s)^(?:up.*)$')"));
-        assert!(!names.contains("JSONExtractString"));
+        assert_eq!(names, "match(metric_name, '(?-s)^(?:up.*)$')");
+    }
+
+    /// The scope's predicates lead the lookup's, and a read with neither
+    /// scope nor matcher reads the window alone in statement 2.
+    #[test]
+    fn the_scope_leads_the_lookup_predicates() {
+        let scope = ["metric_name = 'up'".to_string()];
+        let labels = [m(MatchOp::Eq, "job", "api")];
+        let w = SeriesWhere::activity(
+            window(),
+            Lookup {
+                scope: &scope,
+                name_matchers: &[],
+                matchers: &labels,
+            },
+        );
+        assert!(
+            w.ids_from_where("s", "l").ends_with(
+                "    WHERE metric_name = 'up'\n      AND JSONExtractString(labels, 'job') = 'api'\n  )"
+            ),
+            "{}",
+            w.ids_from_where("s", "l")
+        );
+        let none = SeriesWhere::activity(
+            window(),
+            Lookup {
+                scope: &[],
+                name_matchers: &[],
+                matchers: &[],
+            },
+        );
+        assert!(
+            none.with_labels("s", "l").contains(
+                "  FROM l\n  WHERE fingerprint IN (\n      SELECT fingerprint\n      FROM s\n"
+            ),
+            "{}",
+            none.with_labels("s", "l")
+        );
     }
 }
