@@ -102,6 +102,12 @@ impl SpanPredicate {
         &self.sql
     }
 
+    /// Whether this predicate may sit in a statement bounded by `w`: it
+    /// carries no resource subquery, or was compiled for `w`.
+    pub(crate) fn composes_with(&self, w: WindowSql) -> bool {
+        self.window.is_none_or(|pw| pw == w)
+    }
+
     /// The messages this predicate's `throwIf` demands raise. The server
     /// reports any `throwIf` as `Code: 395`, so a route turns that code
     /// into a `400` only when the message is one of these.
@@ -192,7 +198,7 @@ pub fn compile_span_leaf_in(
 /// `span_id` — the whole `span:id` family — is wrong under that alias.
 pub fn span_membership_sql(spans_table: &str, w: WindowSql, p: &SpanPredicate) -> String {
     assert!(
-        p.window.is_none_or(|pw| pw == w),
+        p.composes_with(w),
         "span_membership_sql: the predicate was compiled for a different window"
     );
     format!(

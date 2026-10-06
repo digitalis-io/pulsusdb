@@ -517,9 +517,19 @@ mod tests {
     }
 }
 
-// --- the search statement's row (issue #590) — stub ---------------------
+// --- the search statement's row (issue #590) ----------------------------
 
-/// Stub.
+/// One row of [`super::search::search_sql`]: one returned trace, in the
+/// statement's projection order and under its aliases.
+///
+/// The server reports the projected types as `FixedString(16)`, `String`,
+/// `String`, `SimpleAggregateFunction(min, Int64)`, `Int64`, `Int64`,
+/// `UInt64` and `Array(Tuple(FixedString(8), Int64, Int64, String))`
+/// (`toTypeName` on 26.3.29.7). The driver's row decoder reads a
+/// `SimpleAggregateFunction` as its inner type, so `start_ns` is an `i64`.
+/// For a trace the per-trace table has not indexed, the left join gives
+/// `root_service` and `root_name` empty and `start_ns` and `duration_ns`
+/// zero.
 #[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
 pub struct SearchTraceRow {
     pub trace_id: [u8; 16],
@@ -527,16 +537,67 @@ pub struct SearchTraceRow {
     pub root_name: String,
     pub start_ns: i64,
     pub duration_ns: i64,
+    /// The newest matching span's start: the order's key.
     pub last: i64,
+    /// The matching spans of the trace in the window, before the `spss`
+    /// cap.
     pub matched: u64,
+    /// The first `spss` matching spans by `(start_ns, span_id)`.
     pub spans: Vec<SearchSpanTuple>,
 }
 
-/// Stub.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// One element of [`SearchTraceRow::spans`], in the tuple's order. Its
+/// `Deserialize` goes through `deserialize_tuple` for the reason the
+/// module doc gives.
+#[derive(Debug, Clone, PartialEq)]
 pub struct SearchSpanTuple {
     pub span_id: [u8; 8],
     pub start_ns: i64,
     pub duration_ns: i64,
     pub service: String,
+}
+
+/// See [`SPAN_TUPLE_ELEMENTS`].
+pub const SEARCH_SPAN_TUPLE_ELEMENTS: usize = 4;
+
+impl Serialize for SearchSpanTuple {
+    /// See [`FetchedEventTuple::serialize`].
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeTuple;
+        let mut t = s.serialize_tuple(SEARCH_SPAN_TUPLE_ELEMENTS)?;
+        t.serialize_element(&self.span_id)?;
+        t.serialize_element(&self.start_ns)?;
+        t.serialize_element(&self.duration_ns)?;
+        t.serialize_element(self.service.as_str())?;
+        t.end()
+    }
+}
+
+struct SearchSpanVisitor;
+
+impl<'de> Visitor<'de> for SearchSpanVisitor {
+    type Value = SearchSpanTuple;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "a {SEARCH_SPAN_TUPLE_ELEMENTS}-element search span tuple"
+        )
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        const T: &str = "search span";
+        Ok(SearchSpanTuple {
+            span_id: element(&mut seq, T, "span_id")?,
+            start_ns: element(&mut seq, T, "start_ns")?,
+            duration_ns: element(&mut seq, T, "duration_ns")?,
+            service: element(&mut seq, T, "service")?,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for SearchSpanTuple {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_tuple(SEARCH_SPAN_TUPLE_ELEMENTS, SearchSpanVisitor)
+    }
 }

@@ -636,7 +636,7 @@ fn the_sql_golden_corpus_has_exactly_its_committed_membership() {
 /// `demand` and `limits`, each one statement of
 /// `crates/pulsus-read/src/traces/spans/search.rs`'s `search_sql`, under
 /// [`corpus_digest`]'s encoding.
-const PINNED_SPANS_SEARCH_CORPUS: u64 = 0;
+const PINNED_SPANS_SEARCH_CORPUS: u64 = 0x390e_7753_d1ef_b314;
 
 #[test]
 fn the_sql_golden_corpus_matches_its_committed_digest() {

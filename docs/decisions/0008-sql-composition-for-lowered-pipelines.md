@@ -8,8 +8,8 @@ measurement below is the original one, re-quoted and not re-taken. What is new i
 compiler's output is a **plan** of parts rather than one statement, so the Context now says which of
 these rules governs *within* a part and which governs *between* two, and names the four cuts —
 recording that two of them are recognised from D3's and D2's measurements. And one rule is added
-that these three decisions never made: **no emitted SQL may contain a join until this ADR names the
-clause**, stated before field selection is built rather than after.
+that these three decisions never made: **no SQL the compile core plans may contain a join until this
+ADR names the clause**, stated before field selection is built rather than after.
 Related: [#507](https://github.com/digitalis-io/pulsusdb/issues/507) (the LogQL stage inventory and its measurements), [#25](https://github.com/digitalis-io/pulsusdb/issues/25) (the 1 TB reference run)
 
 ## Context
@@ -220,11 +220,19 @@ one per query.
 
 **So the rule, stated before anything is built rather than after:**
 
-> **No emitted SQL may contain a join until this ADR is amended to name the clause.** The amendment
-> owes three things, none of which the three decisions above supply: which slot a join occupies in
-> the accumulating `SELECT`; what D1's wrap rule does when a later stage needs a slot the join has
-> already filled; and whether the join's right side counts against D3's two ceilings, since it is a
-> second source read inside one statement rather than a key set crossing between two.
+> **No SQL the compile core plans may contain a join until this ADR is amended to name the
+> clause.** The amendment owes three things, none of which the three decisions above supply: which
+> slot a join occupies in the accumulating `SELECT`; what D1's wrap rule does when a later stage
+> needs a slot the join has already filled; and whether the join's right side counts against D3's
+> two ceilings, since it is a second source read inside one statement rather than a key set crossing
+> between two.
+
+The rule covers the statements the compile core plans — the lowered pipelines these three decisions
+are about, whose goldens are `traces_search/`. It does not reach a hand-written builder outside that
+core. The search statement of [TraceQL/sql-schema.md](../TraceQL/sql-schema.md) §5.2 (issue #590) is
+one: its `LEFT JOIN traces` takes each returned trace's root, extent and duration, and keeps a trace
+the per-trace table has not indexed. Its goldens, `traces_spans_search/`, are on the join gate's
+named list (`crates/pulsus-read/tests/golden_sql_freeze.rs`), with the other builders' joins.
 
 `Relation` (query-lowering.md §2.2) has **no join slot**, which is what makes this enforceable rather
 than a request: a stage cannot contribute a join without a type change, and a type change is a
