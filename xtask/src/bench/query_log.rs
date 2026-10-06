@@ -1,11 +1,10 @@
 //! Shared `system.query_log` evidence-capture machinery (issue #34 plan,
 //! "Open questions resolved" #1: relocated out of `queries.rs` rather than
-//! duplicated, so `bench logs-read` and `bench metrics-labels` read
+//! duplicated, so `bench logs-read` and `bench logs-hydration` read
 //! evidence through the **same** reader — never a second, divergent
 //! `query_log` schema). Behaviourally identical to the pre-#34 private
 //! copies in `queries.rs`; this is a mechanical relocation
-//! (`pub(crate)` here, re-imported by `queries.rs` and
-//! `metrics_labels::paths`), not a rewrite.
+//! (`pub(crate)` here, re-imported by `queries.rs`), not a rewrite.
 
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, Idempotency, QuerySettings, Row};
