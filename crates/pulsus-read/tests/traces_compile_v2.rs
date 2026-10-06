@@ -681,7 +681,7 @@ fn t_c5_every_out_of_scope_field_refuses_and_names_itself() {
     }
     assert_eq!(visited_scopes, AttrScope::ALL.len());
 
-    // The expression-level constructs deferred to parts 3b and 3c, each
+    // The expression-level constructs deferred to parts 3c and 3d, each
     // naming itself and its own part.
     for (query, token, suffix) in [
         (
@@ -690,9 +690,9 @@ fn t_c5_every_out_of_scope_field_refuses_and_names_itself() {
             "(issue #589 part 3c)",
         ),
         (
-            r#"{ resource.a = span.b }"#,
+            r#"{ event.a = span.b }"#,
             "field-against-field",
-            "(issue #589 part 3b)",
+            "(issue #589 part 3d)",
         ),
         (r#"{ 1 = 1 }"#, "two literals", "(issue #589 part 3c)"),
         (
@@ -1998,21 +1998,121 @@ fn ff_mixed_int(e: &str) -> String {
     e.to_string()
 }
 
-/// One operand of the part-3a design's section 3.1: the field, its arms
-/// by class, whether it can be `NULL`, and whether it needs the context.
+/// One operand of the part-3a design's section 3.1, with the part-3b
+/// design's section 5.2 resource operands: the field, its arms by class,
+/// whether it can be `NULL`, and whether it needs the context.
+///
+/// A resource-row arm reads the lambda variable, written `{v}` here and
+/// replaced by `r1` on the left and `r2` on the right. `types` is the text
+/// of the operand's type set, `tupleElement(Q(k), 3)`; `s_on_span_row`
+/// leaves the scalar string arm ungated; `bind` says the operand is bound
+/// to `V(k)` (section 5.3).
 struct FfOperand {
     field: Field,
     arms: Vec<(&'static str, String)>,
     nullable: bool,
     needs_ctx: bool,
+    types: Option<String>,
+    s_on_span_row: bool,
+    bind: bool,
 }
 
 impl FfOperand {
-    fn arm(&self, class: &str) -> Option<&str> {
+    fn arm(&self, class: &str, var: &str) -> Option<String> {
         self.arms
             .iter()
             .find(|(c, _)| *c == class)
-            .map(|(_, e)| e.as_str())
+            .map(|(_, e)| e.replace("{v}", var))
+    }
+
+    /// The gate of the scalar arm of `class`, or of the array arm whose
+    /// elements are `class` — section 5.4, from this file's own type names.
+    fn gate(&self, class: &str, array: bool) -> Option<String> {
+        let types = self.types.as_deref()?;
+        let name = ff_type_name(class)?;
+        if array {
+            return Some(format!("has({types}, 'Array(Nullable({name}))')"));
+        }
+        if class == "s" && self.s_on_span_row {
+            return None;
+        }
+        Some(format!("has({types}, '{name}')"))
+    }
+
+    /// `V(k)` for a bound operand.
+    fn bound_value(&self) -> String {
+        match &self.field {
+            Field::Attribute {
+                scope: AttrScope::Resource,
+                key,
+            } => v_of(&ff_resource_path(key)),
+            other => panic!("{other} is not bound"),
+        }
+    }
+}
+
+/// Section 5.2's type names, scalar by class.
+fn ff_type_name(class: &str) -> Option<&'static str> {
+    match class {
+        "s" => Some("String"),
+        "i" => Some("Int64"),
+        "f" => Some("Float64"),
+        "b" => Some("Bool"),
+        _ => None,
+    }
+}
+
+/// `P(k)` for the keys these cases use: the writer's escape of `.` is
+/// `%2E`, and none of them carries a `%` or a backtick.
+fn ff_resource_path(key: &str) -> String {
+    format!("attrs.`{}`", key.replace('.', "%2E"))
+}
+
+/// `Q(k)` — section 5.1, from [`ctx`]'s window and table.
+fn q_of(path: &str) -> String {
+    format!(
+        "(SELECT (groupArray(resource_id), groupArray({path}), \
+         groupUniqArray(dynamicType({path}))) FROM resources WHERE {} AND \
+         dynamicType({path}) != 'None')",
+        t_b1_window().resources_day_clause()
+    )
+}
+
+/// `V(k)` — section 5.1.
+fn v_of(path: &str) -> String {
+    let q = q_of(path);
+    format!(
+        "arrayElement(tupleElement({q}, 2), transform(resource_id, tupleElement({q}, 1), \
+         arrayEnumerate(tupleElement({q}, 1)), 0))"
+    )
+}
+
+/// `G(k, 'T')` — section 5.1.
+fn g_of(path: &str, type_name: &str) -> String {
+    format!("has(tupleElement({}, 3), '{type_name}')", q_of(path))
+}
+
+/// Section 5.2's `resource.k` row: every class read from the bound value,
+/// each gated on the key's type set.
+fn ff_resource(key: &str) -> FfOperand {
+    let typed = |t: &str| format!("dynamicElement({{v}}, '{t}')");
+    FfOperand {
+        field: scoped(AttrScope::Resource, key),
+        arms: vec![
+            ("s", typed("String")),
+            ("i", typed("Int64")),
+            ("f", typed("Float64")),
+            ("b", typed("Bool")),
+            ("sa", typed("Array(Nullable(String))")),
+            ("ia", typed("Array(Nullable(Int64))")),
+            ("fa", typed("Array(Nullable(Float64))")),
+            ("ba", typed("Array(Nullable(Bool))")),
+        ],
+        nullable: true,
+        needs_ctx: true,
+        types: Some(format!("tupleElement({}, 3)", q_of(&ff_resource_path(key)))),
+        s_on_span_row: false,
+        bind: true,
     }
 }
 
@@ -2033,6 +2133,9 @@ fn ff_attr(scope: AttrScope, root: &str, key: &str) -> FfOperand {
         ],
         nullable: true,
         needs_ctx: false,
+        types: None,
+        s_on_span_row: false,
+        bind: false,
     }
 }
 
@@ -2042,10 +2145,13 @@ fn ff_intrinsic(intrinsic: Intrinsic, class: &'static str, expr: &str) -> FfOper
         arms: vec![(class, expr.to_string())],
         nullable: false,
         needs_ctx: false,
+        types: None,
+        s_on_span_row: false,
+        bind: false,
     }
 }
 
-/// Section 3.1's thirteen operands.
+/// Section 3.1's operands, with the part-3b design's two resource operands.
 fn ff_operands() -> Vec<FfOperand> {
     vec![
         ff_attr(AttrScope::Span, "attrs", "a"),
@@ -2060,14 +2166,12 @@ fn ff_operands() -> Vec<FfOperand> {
         ff_intrinsic(Intrinsic::Duration, "i", "duration_ns"),
         ff_intrinsic(Intrinsic::Status, "st", "status_code"),
         ff_intrinsic(Intrinsic::Kind, "kd", "kind"),
-        FfOperand {
-            field: scoped(AttrScope::Resource, "service.name"),
-            arms: vec![(
-                "s",
-                "if(service_type = 'string', service, NULL)".to_string(),
-            )],
-            nullable: true,
-            needs_ctx: true,
+        ff_resource("a"),
+        {
+            let mut service = ff_resource("service.name");
+            service.arms[0].1 = "if(service_type = 'string', service, NULL)".to_string();
+            service.s_on_span_row = true;
+            service
         },
     ]
 }
@@ -2116,66 +2220,97 @@ fn ff_array_term(op: ComparisonOp, l: &str, r: &str, array: &str) -> String {
     }
 }
 
+/// Section 5.4's wrapper: a term with a gate on either side, or both,
+/// left first, is `if(<gates>, <term>, false)`.
+fn ff_gated(term: String, gl: Option<String>, gr: Option<String>) -> String {
+    let gates: Vec<String> = gl.into_iter().chain(gr).collect();
+    if gates.is_empty() {
+        term
+    } else {
+        format!("if({}, {term}, false)", gates.join(" AND "))
+    }
+}
+
 /// The text section 3.2 gives `L op R`, built from this file's own copy of
-/// the rules.
+/// the rules, with the part-3b design's gates (5.4) and binding (5.3): the
+/// left operand reads `r1`, the right `r2`.
 fn ff_expected(l: &FfOperand, op: ComparisonOp, r: &FfOperand) -> String {
     let sym = ff_symbol(op);
     let ordered = op_is_ordered(op);
     let coalesced = l.nullable || r.nullable;
+    let (lv, rv) = ("r1", "r2");
     let mut terms = Vec::new();
     for (lc, rc, ordered_ok) in FF_SCALAR_PAIRS {
         if ordered && !ordered_ok {
             continue;
         }
-        let (Some(a), Some(b)) = (l.arm(lc), r.arm(rc)) else {
+        let (Some(a), Some(b)) = (l.arm(lc, lv), r.arm(rc, rv)) else {
             continue;
         };
-        let (a, b) = ff_mixed(lc, rc, a, b);
+        let (a, b) = ff_mixed(lc, rc, &a, &b);
         let c = format!("{a} {sym} {b}");
-        terms.push(if coalesced {
+        let term = if coalesced {
             format!("coalesce({c}, false)")
         } else {
             c
-        });
+        };
+        terms.push(ff_gated(term, l.gate(lc, false), r.gate(rc, false)));
     }
     // The array on the right: the left's scalar against each element.
     for (c, e, ordered_ok) in FF_ARRAY_PAIRS {
         if ordered && !ordered_ok {
             continue;
         }
-        let (Some(scalar), Some(array)) = (l.arm(c), r.arm(&format!("{e}a"))) else {
+        let (Some(scalar), Some(array)) = (l.arm(c, lv), r.arm(&format!("{e}a"), rv)) else {
             continue;
         };
-        let (a, b) = ff_mixed(c, e, scalar, "x");
-        terms.push(ff_array_term(op, &a, &b, array));
+        let (a, b) = ff_mixed(c, e, &scalar, "x");
+        terms.push(ff_gated(
+            ff_array_term(op, &a, &b, &array),
+            l.gate(c, false),
+            r.gate(e, true),
+        ));
     }
     // The array on the left: each element against the right's scalar.
     for (c, e, ordered_ok) in FF_ARRAY_PAIRS {
         if ordered && !ordered_ok {
             continue;
         }
-        let (Some(array), Some(scalar)) = (l.arm(&format!("{e}a")), r.arm(c)) else {
+        let (Some(array), Some(scalar)) = (l.arm(&format!("{e}a"), lv), r.arm(c, rv)) else {
             continue;
         };
-        let (a, b) = ff_mixed(e, c, "x", scalar);
-        terms.push(ff_array_term(op, &a, &b, array));
+        let (a, b) = ff_mixed(e, c, "x", &scalar);
+        terms.push(ff_gated(
+            ff_array_term(op, &a, &b, &array),
+            l.gate(e, true),
+            r.gate(c, false),
+        ));
     }
     if terms.is_empty() {
-        "false".to_string()
-    } else {
-        format!("({})", terms.join(" OR "))
+        return "false".to_string();
+    }
+    let body = format!("({})", terms.join(" OR "));
+    match (l.bind, r.bind) {
+        (false, false) => body,
+        (true, false) => format!("arrayExists({lv} -> {body}, [{}])", l.bound_value()),
+        (false, true) => format!("arrayExists({rv} -> {body}, [{}])", r.bound_value()),
+        (true, true) => format!(
+            "arrayExists(({lv}, {rv}) -> {body}, [{}], [{}])",
+            l.bound_value(),
+            r.bound_value()
+        ),
     }
 }
 
-/// `T-C25`: every pair of section 3.1's operands under each of the six
-/// operators — 1,014 cells — compiles to the text this file builds from
-/// its own copy of sections 3.1 and 3.2, with no demand. With no context a
-/// cell naming `resource.service.name` is refused and every other cell is
-/// the same text.
+/// `T-C25`: every pair of section 3.1's operands, with the part-3b design's
+/// two resource operands, under each of the six operators — 1,176 cells —
+/// compiles to the text this file builds from its own copy of the rules,
+/// with no demand. With no context a cell naming either resource operand
+/// is refused and every other cell is the same text.
 #[test]
 fn t_c25_field_against_field_is_the_generated_cross_product() {
     let operands = ff_operands();
-    assert_eq!(operands.len(), 13);
+    assert_eq!(operands.len(), 14);
     let mut cells = 0usize;
     for l in &operands {
         for r in &operands {
@@ -2203,7 +2338,7 @@ fn t_c25_field_against_field_is_the_generated_cross_product() {
             }
         }
     }
-    assert_eq!(cells, 1_014);
+    assert_eq!(cells, 1_176);
 }
 
 /// `T-C26`: the part-3a design's section 3.5 texts, byte for byte.
@@ -2220,10 +2355,58 @@ fn t_c26_the_measured_field_against_field_texts() {
         rendered(r#"{ status = status }"#),
         "(status_code = status_code)"
     );
+    // The part-3b design's section 5.7, with `Q`, `V` and `G` spelled out
+    // from `ctx()`.
+    let k = "attrs.`k`";
+    let sn = "attrs.`service%2Ename`";
     assert_eq!(
         rendered_in(r#"{ resource.service.name < instrumentation:version }"#),
-        "(coalesce(if(service_type = 'string', service, NULL) < scope_version, false))"
+        format!(
+            "arrayExists(r1 -> (coalesce(if(service_type = 'string', service, NULL) < \
+             scope_version, false) OR if({}, arrayExists(x -> coalesce(x < scope_version, \
+             false), dynamicElement(r1, 'Array(Nullable(String))')), false)), [{}])",
+            g_of(sn, "Array(Nullable(String))"),
+            v_of(sn)
+        )
     );
+    assert_eq!(
+        rendered_in(r#"{ resource.k < name }"#),
+        format!(
+            "arrayExists(r1 -> (if({}, coalesce(dynamicElement(r1, 'String') < name, false), \
+             false) OR if({}, arrayExists(x -> coalesce(x < name, false), dynamicElement(r1, \
+             'Array(Nullable(String))')), false)), [{}])",
+            g_of(k, "String"),
+            g_of(k, "Array(Nullable(String))"),
+            v_of(k)
+        )
+    );
+    assert_eq!(
+        rendered_in(r#"{ duration = resource.service.name }"#),
+        format!(
+            "arrayExists(r2 -> (if({}, coalesce(duration_ns = dynamicElement(r2, 'Int64'), \
+             false), false) OR if({}, coalesce(duration_ns = dynamicElement(r2, 'Float64'), \
+             false), false) OR if({}, arrayExists(x -> coalesce(duration_ns = x, false), \
+             dynamicElement(r2, 'Array(Nullable(Int64))')), false) OR if({}, arrayExists(x -> \
+             coalesce(duration_ns = x, false), dynamicElement(r2, \
+             'Array(Nullable(Float64))')), false)), [{}])",
+            g_of(sn, "Int64"),
+            g_of(sn, "Float64"),
+            g_of(sn, "Array(Nullable(Int64))"),
+            g_of(sn, "Array(Nullable(Float64))"),
+            v_of(sn)
+        )
+    );
+    assert_eq!(
+        rendered_in(r#"{ resource.service.name = name }"#),
+        format!(
+            "arrayExists(r1 -> (coalesce(if(service_type = 'string', service, NULL) = name, \
+             false) OR if({}, arrayExists(x -> coalesce(x = name, false), dynamicElement(r1, \
+             'Array(Nullable(String))')), false)), [{}])",
+            g_of(sn, "Array(Nullable(String))"),
+            v_of(sn)
+        )
+    );
+    assert_eq!(rendered_in(r#"{ resource.k = status }"#), "false");
     assert_eq!(
         rendered(r#"{ duration > span.k }"#),
         "(coalesce(duration_ns > attrs.`k`.:Int64, false) OR \
@@ -2274,14 +2457,13 @@ fn t_c27_the_field_against_field_refusals() {
     };
 
     for (scope, key) in [
-        (AttrScope::Resource, "k"),
         (AttrScope::Event, "k"),
         (AttrScope::Link, "k"),
         (AttrScope::Unscoped, "k"),
     ] {
         let want = PlanError::UnsupportedField(format!(
             "a field-against-field comparison with a \"{scope}\" operand is not supported by \
-             the span-scope predicate compiler yet (issue #589 part 3b)"
+             the span-scope predicate compiler yet (issue #589 part 3d)"
         ));
         let f = scoped(scope, key);
         check(
@@ -2299,7 +2481,7 @@ fn t_c27_the_field_against_field_refusals() {
     ] {
         let want = PlanError::UnsupportedField(format!(
             "a field-against-field comparison with {intrinsic} is not supported by the \
-             span-scope predicate compiler yet (issue #589 part 3b)"
+             span-scope predicate compiler yet (issue #589 part 3d)"
         ));
         let f = Field::Intrinsic(intrinsic);
         check(
@@ -2333,7 +2515,7 @@ fn t_c27_the_field_against_field_refusals() {
         field_compare_expr(&event_k, ComparisonOp::Eq, &nested_left),
         PlanError::UnsupportedField(
             "a field-against-field comparison with a \"event.\" operand is not supported by \
-             the span-scope predicate compiler yet (issue #589 part 3b)"
+             the span-scope predicate compiler yet (issue #589 part 3d)"
                 .to_string(),
         ),
     );
@@ -2354,4 +2536,33 @@ fn t_c27_the_field_against_field_refusals() {
         // The operator is checked before either operand.
         check(field_compare_expr(&event_k, op, &nested_left), regex);
     }
+}
+
+// =====================================================================
+// Issue #589 part 3b — field against field with a resource operand
+// =====================================================================
+
+/// `T-C28`: a comparison reading a resource operand carries its window,
+/// so composing it with another window panics, as `T-C15`'s literal leaf
+/// does. `resource.service.name` is one: its non-string arms read the
+/// resource row.
+#[test]
+#[should_panic(expected = "different window")]
+fn t_c28_a_service_name_operand_refuses_another_window() {
+    let p = compile_span_predicate_in(
+        &filter_body(r#"{ span.b = resource.service.name }"#),
+        &ctx(),
+    )
+    .expect("compiles");
+    let other = WindowSql::start_closed_end_open(T_B1_START, T_B1_END + 1);
+    let _ = span_membership_sql("spans", other, &p);
+}
+
+#[test]
+#[should_panic(expected = "different window")]
+fn t_c28_a_resource_operand_refuses_another_window() {
+    let p = compile_span_predicate_in(&filter_body(r#"{ resource.a = span.b }"#), &ctx())
+        .expect("compiles");
+    let other = WindowSql::start_closed_end_open(T_B1_START, T_B1_END + 1);
+    let _ = span_membership_sql("spans", other, &p);
 }
