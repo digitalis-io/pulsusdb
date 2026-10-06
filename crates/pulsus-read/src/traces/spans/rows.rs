@@ -516,3 +516,27 @@ mod tests {
         assert_eq!(LINK_TUPLE_ELEMENTS, 7);
     }
 }
+
+// --- the search statement's row (issue #590) — stub ---------------------
+
+/// Stub.
+#[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
+pub struct SearchTraceRow {
+    pub trace_id: [u8; 16],
+    pub root_service: String,
+    pub root_name: String,
+    pub start_ns: i64,
+    pub duration_ns: i64,
+    pub last: i64,
+    pub matched: u64,
+    pub spans: Vec<SearchSpanTuple>,
+}
+
+/// Stub.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchSpanTuple {
+    pub span_id: [u8; 8],
+    pub start_ns: i64,
+    pub duration_ns: i64,
+    pub service: String,
+}

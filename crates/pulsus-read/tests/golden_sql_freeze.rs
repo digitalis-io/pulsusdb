@@ -51,12 +51,20 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// `traces_search` (issue #57) and `traces_metrics` (issue #59/#182):
-/// the two byte-frozen SQL corpora, with their committed sizes. The
-/// count is of EVERY file in the directory tree, not of `.sql` files —
-/// today the two coincide, and a file of any other kind appearing is
-/// precisely the thing the count should report.
-const CORPORA: [(&str, usize); 2] = [("traces_search", 75), ("traces_metrics", 28)];
+/// `traces_search` (issue #57), `traces_metrics` (issue #59/#182) and
+/// `traces_spans_search` (issue #590): the three byte-frozen SQL corpora,
+/// with their committed sizes. The count is of EVERY file in the directory
+/// tree, not of `.sql` files — today the two coincide, and a file of any
+/// other kind appearing is precisely the thing the count should report.
+///
+/// The first two are pinned together by [`PINNED_SQL_CORPUS`]; the third
+/// has its own, [`PINNED_SPANS_SEARCH_CORPUS`], so neither digest moves
+/// when only the other's corpus does.
+const CORPORA: [(&str, usize); 3] = [
+    ("traces_search", 75),
+    ("traces_metrics", 28),
+    ("traces_spans_search", 7),
+];
 
 /// A 64-bit rolling digest over every entry, in sorted path order —
 /// FNV-1a's shape with the same mixing constants `accept_surface.rs`
@@ -617,11 +625,47 @@ fn the_sql_golden_corpus_has_exactly_its_committed_membership() {
         );
         total += entries.len();
     }
-    assert_eq!(total, 103, "the frozen SQL corpus is 75 + 28 = 103 entries");
+    assert_eq!(
+        total, 110,
+        "the frozen SQL corpus is 75 + 28 + 7 = 110 entries"
+    );
 }
+
+/// The search statement's seven goldens (issue #590): `match_all`,
+/// `service`, `span_attribute`, `resource_attribute`, `event_intrinsic`,
+/// `demand` and `limits`, each one statement of
+/// `crates/pulsus-read/src/traces/spans/search.rs`'s `search_sql`, under
+/// [`corpus_digest`]'s encoding.
+const PINNED_SPANS_SEARCH_CORPUS: u64 = 0;
 
 #[test]
 fn the_sql_golden_corpus_matches_its_committed_digest() {
+    let h = corpus_digest(&["traces_search", "traces_metrics"]);
+    assert_eq!(
+        h, PINNED_SQL_CORPUS,
+        "the 103 frozen SQL corpus entries — 102 SQL files and one JSON file — changed. This is \
+         not a constant to refresh: it means the \
+         planner's or the SQL builders' output moved. If that was deliberate, regenerate the \
+         goldens, say in the notes which query's SQL changed and why, and update \
+         PINNED_SQL_CORPUS to {h:#x} in the same change — that edit is what makes 'zero SQL \
+         golden edits' checkable from a diff"
+    );
+}
+
+#[test]
+fn the_search_statement_golden_corpus_matches_its_committed_digest() {
+    let h = corpus_digest(&["traces_spans_search"]);
+    assert_eq!(
+        h, PINNED_SPANS_SEARCH_CORPUS,
+        "the 7 search statement goldens changed: `search_sql`'s output moved. If that was \
+         deliberate, regenerate them, say which statement changed and why, and update \
+         PINNED_SPANS_SEARCH_CORPUS to {h:#x} in the same change"
+    );
+}
+
+/// The digest of the named corpora, in the order given, each entry in
+/// sorted path order.
+fn corpus_digest(names: &[&str]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     let mut feed = |b: &[u8]| {
         for byte in b {
@@ -641,7 +685,7 @@ fn the_sql_golden_corpus_matches_its_committed_digest() {
     // with a file of the same name.
     const KIND_FILE: u8 = 0x01;
     const KIND_DIR: u8 = 0x02;
-    for (name, _) in CORPORA {
+    for name in names {
         let dir = golden_dir(name);
         for entry in corpus_entries(&dir) {
             let (kind, rel, content) = match entry {
@@ -660,15 +704,7 @@ fn the_sql_golden_corpus_matches_its_committed_digest() {
             feed(&content);
         }
     }
-    assert_eq!(
-        h, PINNED_SQL_CORPUS,
-        "the 103 frozen SQL corpus entries — 102 SQL files and one JSON file — changed. This is \
-         not a constant to refresh: it means the \
-         planner's or the SQL builders' output moved. If that was deliberate, regenerate the \
-         goldens, say in the notes which query's SQL changed and why, and update \
-         PINNED_SQL_CORPUS to {h:#x} in the same change — that edit is what makes 'zero SQL \
-         golden edits' checkable from a diff"
-    );
+    h
 }
 
 // ADR 0008 D2 — **the check that enforces it lives in
@@ -700,7 +736,7 @@ fn golden_root() -> PathBuf {
 /// The six committed goldens that carry a join today, none of which the
 /// compile core plans. The list is asserted as an EQUALITY, not used as
 /// a skip list: a seventh file anywhere in the tree fails this test.
-const JOINS_OUTSIDE_THE_COMPILED_SEARCH_CORPUS: [&str; 7] = [
+const JOINS_OUTSIDE_THE_COMPILED_SEARCH_CORPUS: [&str; 14] = [
     "traces_graph/clustered_local_join.sql",
     "traces_graph/single_node.sql",
     // Issue #559 added this comparison golden; a comparison cross-tab
@@ -712,10 +748,29 @@ const JOINS_OUTSIDE_THE_COMPILED_SEARCH_CORPUS: [&str; 7] = [
     "traces_metrics/compare_status_window.sql",
     "traces_metrics_base/compare_status.sql",
     "traces_metrics_base/compare_status_window.sql",
+    // Issue #590's decision 5: the search statement's `LEFT JOIN traces`
+    // takes each returned trace's root, extent and duration, and keeps a
+    // trace the per-trace table has not indexed. It is the design's own
+    // statement (`docs/TraceQL/sql-schema.md` §5.2), built by
+    // `spans::search::search_sql`, which the old compile core does not
+    // plan.
+    "traces_spans_search/demand.sql",
+    "traces_spans_search/event_intrinsic.sql",
+    "traces_spans_search/limits.sql",
+    "traces_spans_search/match_all.sql",
+    "traces_spans_search/resource_attribute.sql",
+    "traces_spans_search/service.sql",
+    "traces_spans_search/span_attribute.sql",
 ];
 
 /// ADR 0008: **no statement the compile core plans may contain a join**,
-/// and the seven committed goldens that carry one, pinned by name.
+/// and the fourteen committed goldens that carry one, pinned by name.
+///
+/// **Issue #590 adds seven**: the `traces_spans_search/` goldens, whose
+/// statement's `LEFT JOIN traces` the design names (`docs/TraceQL/sql-
+/// schema.md` §5.2). That builder is not the compile core, which plans
+/// only `traces_search/`, so the rule below does not reach it; ADR 0008's
+/// decision record says the same.
 ///
 /// # The ADR's rule sentence is wider than the decision it records, and this test does not change it
 ///
@@ -842,11 +897,11 @@ fn no_planned_search_statement_contains_a_join() {
     with_a_join.sort();
     assert_eq!(
         with_a_join, JOINS_OUTSIDE_THE_COMPILED_SEARCH_CORPUS,
-        "the joins outside the compiled search corpus are exactly these seven; an eighth means a \
-         builder grew one and nobody said so"
+        "the joins outside the compiled search corpus are exactly these fourteen; a fifteenth \
+         means a builder grew one and nobody said so"
     );
     assert_eq!(
-        scanned, 130,
+        scanned, 137,
         "every committed SQL golden in the tree is scanned, not only the two frozen corpora"
     );
     assert!(

@@ -17,3 +17,4 @@
 pub mod fetch;
 pub mod predicate;
 pub mod rows;
+pub mod search;

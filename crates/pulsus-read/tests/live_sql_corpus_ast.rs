@@ -212,8 +212,13 @@ const CONTROL: &str = "with_binding_control.txt";
 /// phase-1 generator, the hydration read and the root read — which is the
 /// whole of the `+9`.** The ten goldens that change move their generator
 /// section's text only; none gains or loses a section.
-const SQL_FILES: usize = 130;
-const SQL_STATEMENTS: usize = 394;
+///
+/// **Issue #590 moves `SQL_FILES` 130 -> 137 and `SQL_STATEMENTS` 394 ->
+/// 401: SEVEN `traces_spans_search` goldens added, each one statement of
+/// `spans::search::search_sql` with no `== ` line.** Its `WITH (SELECT …)
+/// AS top` is a scalar alias, which carries no `WithElement`.
+const SQL_FILES: usize = 137;
+const SQL_STATEMENTS: usize = 401;
 const PROMQL_ENTRIES: usize = 30;
 const PROMQL_STATEMENTS: usize = 56;
 const CONTROL_STATEMENTS: usize = 1;
