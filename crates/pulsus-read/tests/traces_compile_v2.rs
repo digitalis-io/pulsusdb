@@ -692,17 +692,17 @@ fn t_c5_every_out_of_scope_field_refuses_and_names_itself() {
         assert!(got.is_ok(), "{query} must compile: {got:?}");
     }
 
-    // The expression-level constructs deferred to part 3d, each naming
+    // The expression-level constructs deferred to part 3e, each naming
     // itself and its own part.
     for (query, token, suffix) in [
         (
-            r#"{ event.a = span.b }"#,
-            "field-against-field",
-            "(issue #589 part 3d)",
+            r#"{ event.a = span.b + 1 }"#,
+            "event.",
+            "(issue #589 part 3e)",
         ),
-        (r#"{ event.a + 1 = 2 }"#, "event.", "(issue #589 part 3d)"),
-        (r#"{ !event.a = span.b }"#, "event.", "(issue #589 part 3d)"),
-        (r#"{ .a + 1 = 2 }"#, ".", "(issue #589 part 3d)"),
+        (r#"{ event.a + 1 = 2 }"#, "event.", "(issue #589 part 3e)"),
+        (r#"{ !event.a = span.b }"#, "event.", "(issue #589 part 3e)"),
+        (r#"{ .a + 1 = 2 }"#, ".", "(issue #589 part 3e)"),
     ] {
         match refusal(query) {
             PlanError::UnsupportedField(msg) => assert!(
@@ -1777,6 +1777,93 @@ fn t_c22_the_event_and_link_intrinsics_are_any_match_over_their_arrays() {
     }
 }
 
+/// A scope's presence of `key` as the chain tests it, in [`ctx`] — written
+/// out, not compiled, so a change to the compiled presence moves only the
+/// compiled side of an assertion. `T-C24` freezes the same five texts.
+fn presence_fixed(scope: AttrScope, key: &str) -> String {
+    let k = key.replace('.', "%2E");
+    match scope {
+        AttrScope::Span => format!("dynamicType(attrs.`{k}`) != 'None'"),
+        AttrScope::Resource => r_of(&format!("dynamicType(attrs.`{k}`) != 'None'")),
+        AttrScope::Event => {
+            format!("arrayExists(d -> dynamicType(d) != 'None', events.attrs.`{k}`)")
+        }
+        AttrScope::Link => format!("arrayExists(d -> dynamicType(d) != 'None', links.attrs.`{k}`)"),
+        AttrScope::Instrumentation => format!("dynamicType(scope_attrs.`{k}`) != 'None'"),
+        AttrScope::Unscoped => panic!("the chain has no presence of its own"),
+    }
+}
+
+/// `!<e>.key`'s match, `want` false: part 2's any element, or with `all`
+/// part 3d's decision 7 — the key held and no element `true`.
+fn not_element_match(e: &str, key: &str, all: bool) -> String {
+    let path = format!("{e}.attrs.`{}`", key.replace('.', "%2E"));
+    if all {
+        format!(
+            "(arrayExists(d -> dynamicType(d) != 'None', {path}) AND NOT arrayExists(b -> \
+             coalesce(b = true, false), {path}.:Bool))"
+        )
+    } else {
+        format!("arrayExists(b -> coalesce(b = false, false), {path}.:Bool)")
+    }
+}
+
+/// `!<e>.key`'s demand condition: some element holds a non-boolean.
+fn not_element_demand(e: &str, key: &str) -> String {
+    format!(
+        "arrayExists(d -> dynamicType(d) != 'None' AND dynamicType(d) != 'Bool', {e}.attrs.`{}`)",
+        key.replace('.', "%2E")
+    )
+}
+
+/// `{ !<e>.key }` in full, `want` false, `all` as [`not_element_match`].
+fn not_element_text(e: &str, scope: AttrScope, key: &str, all: bool) -> String {
+    format!(
+        "(throwIf({}, 'expression (!{scope}{key}) expected a boolean') + toUInt8({})) = 1",
+        not_element_demand(e, key),
+        not_element_match(e, key, all)
+    )
+}
+
+/// `{ !.key }` in full in [`ctx`], `want` false: section 6 of part 2's
+/// `multiIf` over each scope's match and over each scope's demand, the
+/// event and link matches every element with `all` (part 3d's decision 7).
+/// `key` carries no `.`, so the resource scope is not `service.name`'s.
+fn not_chain_text(key: &str, all: bool) -> String {
+    assert!(!key.contains('.'), "service.name's chain is T-C23's own");
+    let c_span =
+        format!("dynamicType(attrs.`{key}`) != 'None' AND dynamicType(attrs.`{key}`) != 'Bool'");
+    let t_span = format!("coalesce(attrs.`{key}`.:Bool = false, false)");
+    let c_in = format!(
+        "dynamicType(scope_attrs.`{key}`) != 'None' AND dynamicType(scope_attrs.`{key}`) != 'Bool'"
+    );
+    let t_in = format!("coalesce(scope_attrs.`{key}`.:Bool = false, false)");
+    let p = |scope: AttrScope| presence_fixed(scope, key);
+    let t = format!(
+        "multiIf({}, {t_span}, {}, {}, {}, {}, {}, {}, {}, {t_in}, false)",
+        p(AttrScope::Span),
+        p(AttrScope::Resource),
+        r_of(&t_span),
+        p(AttrScope::Event),
+        not_element_match("events", key, all),
+        p(AttrScope::Link),
+        not_element_match("links", key, all),
+        p(AttrScope::Instrumentation),
+    );
+    let c = format!(
+        "multiIf({}, {c_span}, {}, {}, {}, {}, {}, {}, {}, {c_in}, false)",
+        p(AttrScope::Span),
+        p(AttrScope::Resource),
+        r_of(&c_span),
+        p(AttrScope::Event),
+        not_element_demand("events", key),
+        p(AttrScope::Link),
+        not_element_demand("links", key),
+        p(AttrScope::Instrumentation),
+    );
+    format!("(throwIf({c}, 'expression (!.{key}) expected a boolean') + toUInt8({t})) = 1")
+}
+
 // ---------------------------------------------------------------------
 // T-C23 — `!` over the new scopes
 // ---------------------------------------------------------------------
@@ -1809,33 +1896,7 @@ fn t_c23_not_over_an_event_link_or_unscoped_field_demands_a_boolean() {
         )
     );
 
-    let c_span = "dynamicType(attrs.`k`) != 'None' AND dynamicType(attrs.`k`) != 'Bool'";
-    let t_span = "coalesce(attrs.`k`.:Bool = false, false)";
-    let c_in = "dynamicType(scope_attrs.`k`) != 'None' AND dynamicType(scope_attrs.`k`) != 'Bool'";
-    let t_in = "coalesce(scope_attrs.`k`.:Bool = false, false)";
-    let p = |scope: AttrScope| presence_text(scope, "k");
-    let t = format!(
-        "multiIf({}, {t_span}, {}, {}, {}, {t_ev}, {}, {t_lk}, {}, {t_in}, false)",
-        p(AttrScope::Span),
-        p(AttrScope::Resource),
-        r_of(t_span),
-        p(AttrScope::Event),
-        p(AttrScope::Link),
-        p(AttrScope::Instrumentation),
-    );
-    let c = format!(
-        "multiIf({}, {c_span}, {}, {}, {}, {c_ev}, {}, {c_lk}, {}, {c_in}, false)",
-        p(AttrScope::Span),
-        p(AttrScope::Resource),
-        r_of(c_span),
-        p(AttrScope::Event),
-        p(AttrScope::Link),
-        p(AttrScope::Instrumentation),
-    );
-    assert_eq!(
-        rendered_in(r#"{ !.k }"#),
-        format!("(throwIf({c}, 'expression (!.k) expected a boolean') + toUInt8({t})) = 1")
-    );
+    assert_eq!(rendered_in(r#"{ !.k }"#), not_chain_text("k", false));
 
     // At `service.name`: section 5.2's `P_resource`, part 1's `T` and `c`.
     let ps = |scope: AttrScope| presence_text(scope, "service.name");
@@ -2233,6 +2294,24 @@ fn ff_gated(term: String, gl: Option<String>, gr: Option<String>) -> String {
 /// the rules, with the part-3b design's gates (5.4) and binding (5.3): the
 /// left operand reads `r1`, the right `r2`.
 fn ff_expected(l: &FfOperand, op: ComparisonOp, r: &FfOperand) -> String {
+    let Some(body) = ff_body(l, op, r) else {
+        return "false".to_string();
+    };
+    match (l.bind, r.bind) {
+        (false, false) => body,
+        (true, false) => format!("arrayExists(r1 -> {body}, [{}])", l.bound_value()),
+        (false, true) => format!("arrayExists(r2 -> {body}, [{}])", r.bound_value()),
+        (true, true) => format!(
+            "arrayExists((r1, r2) -> {body}, [{}], [{}])",
+            l.bound_value(),
+            r.bound_value()
+        ),
+    }
+}
+
+/// [`ff_expected`]'s terms, ORed and unbound; `None` when there is no
+/// term. Part 3d's section 5.2 reuses it for an element against a scalar.
+fn ff_body(l: &FfOperand, op: ComparisonOp, r: &FfOperand) -> Option<String> {
     let sym = ff_symbol(op);
     let ordered = op_is_ordered(op);
     let coalesced = l.nullable || r.nullable;
@@ -2285,19 +2364,9 @@ fn ff_expected(l: &FfOperand, op: ComparisonOp, r: &FfOperand) -> String {
         ));
     }
     if terms.is_empty() {
-        return "false".to_string();
+        return None;
     }
-    let body = format!("({})", terms.join(" OR "));
-    match (l.bind, r.bind) {
-        (false, false) => body,
-        (true, false) => format!("arrayExists({lv} -> {body}, [{}])", l.bound_value()),
-        (false, true) => format!("arrayExists({rv} -> {body}, [{}])", r.bound_value()),
-        (true, true) => format!(
-            "arrayExists(({lv}, {rv}) -> {body}, [{}], [{}])",
-            l.bound_value(),
-            r.bound_value()
-        ),
-    }
+    Some(format!("({})", terms.join(" OR ")))
 }
 
 /// `T-C25`: every pair of section 3.1's operands, with the part-3b design's
@@ -2454,41 +2523,6 @@ fn t_c27_the_field_against_field_refusals() {
         assert_eq!(refused_in(&expr), want, "{expr} in a context");
     };
 
-    for (scope, key) in [
-        (AttrScope::Event, "k"),
-        (AttrScope::Link, "k"),
-        (AttrScope::Unscoped, "k"),
-    ] {
-        let want = PlanError::UnsupportedField(format!(
-            "a field-against-field comparison with a \"{scope}\" operand is not supported by \
-             the span-scope predicate compiler yet (issue #589 part 3d)"
-        ));
-        let f = scoped(scope, key);
-        check(
-            field_compare_expr(&f, ComparisonOp::Eq, &span_a),
-            want.clone(),
-        );
-        check(field_compare_expr(&span_a, ComparisonOp::Eq, &f), want);
-    }
-
-    for intrinsic in [
-        Intrinsic::EventName,
-        Intrinsic::EventTimeSinceStart,
-        Intrinsic::LinkSpanId,
-        Intrinsic::LinkTraceId,
-    ] {
-        let want = PlanError::UnsupportedField(format!(
-            "a field-against-field comparison with {intrinsic} is not supported by the \
-             span-scope predicate compiler yet (issue #589 part 3d)"
-        ));
-        let f = Field::Intrinsic(intrinsic);
-        check(
-            field_compare_expr(&f, ComparisonOp::Eq, &span_a),
-            want.clone(),
-        );
-        check(field_compare_expr(&span_a, ComparisonOp::Eq, &f), want);
-    }
-
     let mut nested_and_trace = 0usize;
     for intrinsic in Intrinsic::ALL.iter().copied() {
         if intrinsic_target(intrinsic) != Some("#594") {
@@ -2507,22 +2541,21 @@ fn t_c27_the_field_against_field_refusals() {
     }
     assert_eq!(nested_and_trace, 7);
 
+    // An event set opposite a #594 intrinsic: the intrinsic's own refusal,
+    // whichever side it is on (part 3d's section 5.6).
     let event_k = scoped(AttrScope::Event, "k");
     let nested_left = Field::Intrinsic(Intrinsic::NestedSetLeft);
+    let nested_refusal = PlanError::UnsupportedField(
+        "nestedSetLeft is not supported by the span-scope predicate compiler yet (issue #594)"
+            .to_string(),
+    );
     check(
         field_compare_expr(&event_k, ComparisonOp::Eq, &nested_left),
-        PlanError::UnsupportedField(
-            "a field-against-field comparison with a \"event.\" operand is not supported by \
-             the span-scope predicate compiler yet (issue #589 part 3d)"
-                .to_string(),
-        ),
+        nested_refusal.clone(),
     );
     check(
         field_compare_expr(&nested_left, ComparisonOp::Eq, &event_k),
-        PlanError::UnsupportedField(
-            "nestedSetLeft is not supported by the span-scope predicate compiler yet (issue #594)"
-                .to_string(),
-        ),
+        nested_refusal,
     );
 
     let span_b = scoped(AttrScope::Span, "b");
@@ -2841,14 +2874,18 @@ fn span_chain(nodes: usize) -> String {
     vec!["span.a"; nodes + 1].join(" + ")
 }
 
-/// `T-C32`: a deferred operand is refused before a zero divisor folds to
-/// `false`; folding comes before the refusal for a lone field; the cap
-/// counts across the predicate and not a folded subtree.
+/// `T-C32`: a deferred operand inside arithmetic is refused before a zero
+/// divisor folds to `false`; folding comes before the refusal for a lone
+/// field; the cap counts across the predicate and not a folded subtree.
 #[test]
 fn t_c32_the_order_of_the_rules_and_the_cap() {
-    match refusal(r#"{ 1 / 0 = event.a }"#) {
+    // A lone set opposite a side folding to no value is `false` (part 3d's
+    // decision 8); inside arithmetic the set is refused before the side
+    // is folded.
+    assert_eq!(rendered(r#"{ 1 / 0 = event.a }"#), "false");
+    match refusal(r#"{ 1 / 0 = event.a + 1 }"#) {
         PlanError::UnsupportedField(msg) => assert!(
-            msg.contains("event.") && msg.ends_with("(issue #589 part 3d)"),
+            msg.contains("event.") && msg.ends_with("(issue #589 part 3e)"),
             "the event operand's refusal, got {msg:?}"
         ),
         other => panic!("must be UnsupportedField, got {other:?}"),
@@ -3038,4 +3075,837 @@ fn t_c33_literal_pairs_and_the_integer_boundaries() {
         negative_zero.contains("toFloat64('-0')"),
         "the sign of zero is kept: {negative_zero}"
     );
+}
+
+// =====================================================================
+// Issue #589 part 3d — field against field with event, link and unscoped
+// operands
+// =====================================================================
+
+/// One of part 3d's seven set operands (section 5.1).
+#[derive(Clone, Copy)]
+enum SetKind {
+    /// `event.k` or `link.k`: the `JSON` array's root, and the key.
+    Attr(&'static str, &'static str),
+    EventName,
+    TimeSinceStart,
+    LinkSpanId,
+    LinkTraceId,
+    /// `.k`.
+    Chain(&'static str),
+}
+
+struct SetSpec {
+    field: Field,
+    kind: SetKind,
+}
+
+/// Every class an attribute element can hold: this file's class name and
+/// the stored type it is read as (part 3b's `T_c`).
+const ELEMENT_TYPES: [(&str, &str); 8] = [
+    ("s", "String"),
+    ("i", "Int64"),
+    ("f", "Float64"),
+    ("b", "Bool"),
+    ("sa", "Array(Nullable(String))"),
+    ("ia", "Array(Nullable(Int64))"),
+    ("fa", "Array(Nullable(Float64))"),
+    ("ba", "Array(Nullable(Bool))"),
+];
+
+/// The seven operands `T-C34` pairs with 3c's fourteen.
+fn set_operands() -> Vec<SetSpec> {
+    vec![
+        SetSpec {
+            field: scoped(AttrScope::Event, "a"),
+            kind: SetKind::Attr("events.attrs", "a"),
+        },
+        SetSpec {
+            field: scoped(AttrScope::Link, "a"),
+            kind: SetKind::Attr("links.attrs", "a"),
+        },
+        SetSpec {
+            field: Field::Intrinsic(Intrinsic::EventName),
+            kind: SetKind::EventName,
+        },
+        SetSpec {
+            field: Field::Intrinsic(Intrinsic::EventTimeSinceStart),
+            kind: SetKind::TimeSinceStart,
+        },
+        SetSpec {
+            field: Field::Intrinsic(Intrinsic::LinkSpanId),
+            kind: SetKind::LinkSpanId,
+        },
+        SetSpec {
+            field: Field::Intrinsic(Intrinsic::LinkTraceId),
+            kind: SetKind::LinkTraceId,
+        },
+        SetSpec {
+            field: scoped(AttrScope::Unscoped, "a"),
+            kind: SetKind::Chain("a"),
+        },
+    ]
+}
+
+/// `C(k)`, section 5.4, for the chain at position `n`: every scope's value
+/// tagged with its scope, the elements of the first scope holding `k` kept.
+fn chain_c(key: &str, n: usize) -> String {
+    let k = key.replace('.', "%2E");
+    let (span, ev, lk, sc) = (
+        format!("attrs.`{k}`"),
+        format!("events.attrs.`{k}`"),
+        format!("links.attrs.`{k}`"),
+        format!("scope_attrs.`{k}`"),
+    );
+    let (pr, rv, rt) = if key == "service.name" {
+        (
+            format!("(service_type = 'string' OR dynamicType(r{n}) != 'None')"),
+            format!("[CAST(CAST(service, 'String'), 'Dynamic')], [r{n}]"),
+            "[if(service_type = 'string', 2, 9)], [if(service_type = 'string', 9, 2)]".to_string(),
+        )
+    } else {
+        (
+            format!("dynamicType(r{n}) != 'None'"),
+            format!("[r{n}]"),
+            "[2]".to_string(),
+        )
+    };
+    let tag = format!(
+        "multiIf(dynamicType({span}) != 'None', 1, {pr}, 2, arrayExists(d -> dynamicType(d) != \
+         'None', {ev}), 3, arrayExists(d -> dynamicType(d) != 'None', {lk}), 4, \
+         dynamicType({sc}) != 'None', 5, 0)"
+    );
+    format!(
+        "arrayFilter((d, g) -> g = {tag} AND dynamicType(d) != 'None', arrayConcat([{span}], {rv}, \
+         {ev}, {lk}, [{sc}]), arrayConcat([1], {rt}, arrayMap(d -> 3, {ev}), arrayMap(d -> 4, \
+         {lk}), [5]))"
+    )
+}
+
+/// The per-class lists of section 5.3 over a `Dynamic` array `src`.
+fn dynamic_lists(src: &str) -> Vec<(&'static str, String)> {
+    ELEMENT_TYPES
+        .iter()
+        .map(|(class, t)| {
+            (
+                *class,
+                format!("arrayMap(d -> dynamicElement(d, '{t}'), arrayFilter(d -> dynamicType(d) = '{t}', {src}))"),
+            )
+        })
+        .collect()
+}
+
+impl SetSpec {
+    fn needs_ctx(&self) -> bool {
+        matches!(self.kind, SetKind::Chain(_))
+    }
+
+    /// `S`, section 5.1, at position `n`.
+    fn array(&self, n: usize) -> String {
+        match self.kind {
+            SetKind::Attr(root, key) => {
+                format!("arrayFilter(d -> dynamicType(d) != 'None', {root}.`{key}`)")
+            }
+            SetKind::EventName => "events.name".to_string(),
+            SetKind::TimeSinceStart => {
+                "arrayMap(t -> toInt128(t) - start_ns, events.time_ns)".to_string()
+            }
+            SetKind::LinkSpanId => "arrayMap(h -> lower(hex(h)), links.span_id)".to_string(),
+            SetKind::LinkTraceId => "arrayMap(h -> lower(hex(h)), links.trace_id)".to_string(),
+            SetKind::Chain(_) => format!("c{n}"),
+        }
+    }
+
+    fn nullable(&self) -> bool {
+        matches!(self.kind, SetKind::Attr(..) | SetKind::Chain(_))
+    }
+
+    /// The element `e<n>` as a 3c operand: its arms by class.
+    fn element(&self, n: usize) -> FfOperand {
+        let e = format!("e{n}");
+        let arms = match self.kind {
+            SetKind::Attr(..) | SetKind::Chain(_) => ELEMENT_TYPES
+                .iter()
+                .map(|(class, t)| (*class, format!("dynamicElement({e}, '{t}')")))
+                .collect(),
+            SetKind::EventName | SetKind::LinkSpanId | SetKind::LinkTraceId => vec![("s", e)],
+            SetKind::TimeSinceStart => vec![("i", e)],
+        };
+        FfOperand {
+            field: self.field.clone(),
+            arms,
+            nullable: self.nullable(),
+            needs_ctx: self.needs_ctx(),
+            types: None,
+            s_on_span_row: false,
+            bind: false,
+        }
+    }
+
+    /// `|S|`, section 5.3.
+    fn count(&self, n: usize) -> String {
+        match self.kind {
+            SetKind::Attr(root, key) => {
+                format!("arrayCount(d -> dynamicType(d) != 'None', {root}.`{key}`)")
+            }
+            SetKind::EventName => "length(events.name)".to_string(),
+            SetKind::TimeSinceStart => "length(events.time_ns)".to_string(),
+            SetKind::LinkSpanId => "length(links.span_id)".to_string(),
+            SetKind::LinkTraceId => "length(links.trace_id)".to_string(),
+            SetKind::Chain(_) => format!("length(c{n})"),
+        }
+    }
+
+    /// `S_c` for every class the set has, section 5.3.
+    fn lists(&self, n: usize) -> Vec<(&'static str, String)> {
+        match self.kind {
+            SetKind::Attr(root, key) => dynamic_lists(&format!("{root}.`{key}`")),
+            SetKind::Chain(_) => dynamic_lists(&format!("c{n}")),
+            SetKind::EventName | SetKind::LinkSpanId | SetKind::LinkTraceId => {
+                vec![("s", self.array(n))]
+            }
+            SetKind::TimeSinceStart => vec![("i", self.array(n))],
+        }
+    }
+
+    /// A chain's presence; an event, link or intrinsic set has none.
+    fn presence(&self, n: usize) -> Option<String> {
+        match self.kind {
+            SetKind::Chain(_) => Some(format!("notEmpty(c{n})")),
+            _ => None,
+        }
+    }
+
+    /// The chain's own variable and `C(k)`.
+    fn chain(&self, n: usize) -> Option<(String, String)> {
+        match self.kind {
+            SetKind::Chain(key) => Some((format!("c{n}"), chain_c(key, n))),
+            _ => None,
+        }
+    }
+
+    /// The resource value the chain reads, bound to `r<n>`.
+    fn bind(&self, n: usize) -> Option<(String, String)> {
+        match self.kind {
+            SetKind::Chain(key) => Some((format!("r{n}"), v_of(&ff_resource_path(key)))),
+            _ => None,
+        }
+    }
+}
+
+/// A scalar's presence, section 5.1, at position `n`.
+fn ff_presence(s: &FfOperand, n: usize) -> Option<String> {
+    match &s.field {
+        Field::Attribute {
+            scope: AttrScope::Span,
+            key,
+        } => Some(format!("dynamicType(attrs.`{key}`) != 'None'")),
+        Field::Attribute {
+            scope: AttrScope::Instrumentation,
+            key,
+        } => Some(format!("dynamicType(scope_attrs.`{key}`) != 'None'")),
+        Field::Attribute {
+            scope: AttrScope::Resource,
+            key,
+        } if key == "service.name" => Some(format!(
+            "(service_type = 'string' OR dynamicType(r{n}) != 'None')"
+        )),
+        Field::Attribute {
+            scope: AttrScope::Resource,
+            ..
+        } => Some(format!("dynamicType(r{n}) != 'None'")),
+        Field::Intrinsic(_) => None,
+        other => panic!("{other} is not one of 3c's scalars"),
+    }
+}
+
+/// One side of a part-3d comparison.
+#[derive(Clone, Copy)]
+enum Side<'a> {
+    Scalar(&'a FfOperand),
+    Set(&'a SetSpec),
+}
+
+impl Side<'_> {
+    fn field(&self) -> &Field {
+        match self {
+            Side::Scalar(s) => &s.field,
+            Side::Set(s) => &s.field,
+        }
+    }
+
+    fn is_set(&self) -> bool {
+        matches!(self, Side::Set(_))
+    }
+
+    /// The refusal the side gives with no context, if it needs one.
+    fn needs_window(&self) -> Option<PlanError> {
+        match self {
+            Side::Scalar(s) if s.needs_ctx => Some(PlanError::UnsupportedField(
+                RESOURCE_NEEDS_WINDOW.to_string(),
+            )),
+            Side::Set(s) if s.needs_ctx() => Some(PlanError::UnsupportedField(
+                UNSCOPED_NEEDS_WINDOW.to_string(),
+            )),
+            _ => None,
+        }
+    }
+
+    fn bind(&self, n: usize) -> Option<(String, String)> {
+        match self {
+            Side::Scalar(s) if s.bind => Some((format!("r{n}"), s.bound_value())),
+            Side::Scalar(_) => None,
+            Side::Set(s) => s.bind(n),
+        }
+    }
+}
+
+/// Section 5.2: one set against a scalar, the set at position `n`.
+fn element_expected(set: &SetSpec, n: usize, op: ComparisonOp, scalar: &FfOperand) -> String {
+    let element = set.element(n);
+    let body = if n == 1 {
+        ff_body(&element, op, scalar)
+    } else {
+        ff_body(scalar, op, &element)
+    };
+    // Decision 9: with no term, `= < <= > >=` match nothing and `!=` keeps
+    // its every-element rule over a body of `false`.
+    let body = match body {
+        Some(body) => body,
+        None if op == ComparisonOp::Neq => "false".to_string(),
+        None => return "false".to_string(),
+    };
+    let (e, array) = (format!("e{n}"), set.array(n));
+    if op != ComparisonOp::Neq {
+        return format!("arrayExists({e} -> {body}, {array})");
+    }
+    let scalar_presence = ff_presence(scalar, 3 - n);
+    let presences: Vec<String> = if n == 1 {
+        [set.presence(n), scalar_presence]
+    } else {
+        [scalar_presence, set.presence(n)]
+    }
+    .into_iter()
+    .flatten()
+    .collect();
+    let all = format!("arrayAll({e} -> {body}, {array})");
+    if presences.is_empty() {
+        all
+    } else {
+        format!("({} AND {all})", presences.join(" AND "))
+    }
+}
+
+/// Section 5.3: two sets, by their class lists.
+fn class_lists_expected(l: &SetSpec, op: ComparisonOp, r: &SetSpec) -> String {
+    let (ll, rl) = (l.lists(1), r.lists(2));
+    let get = |lists: &[(&str, String)], class: &str| {
+        lists
+            .iter()
+            .find(|(c, _)| *c == class)
+            .map(|(_, t)| t.clone())
+    };
+    let nullable = l.nullable() || r.nullable();
+    let sym = ff_symbol(op);
+    let cmp = |lc: &str, rc: &str, a: &str, b: &str| {
+        let (a, b) = ff_mixed(lc, rc, a, b);
+        if nullable {
+            format!("coalesce({a} {sym} {b}, false)")
+        } else {
+            format!("({a} {sym} {b})")
+        }
+    };
+    let neq = op == ComparisonOp::Neq;
+    let ordered = op_is_ordered(op);
+    let mut terms = Vec::new();
+    for (lc, rc, ordered_ok) in FF_SCALAR_PAIRS {
+        if ordered && !ordered_ok {
+            continue;
+        }
+        let (Some(lt), Some(rt)) = (get(&ll, lc), get(&rl, rc)) else {
+            continue;
+        };
+        terms.push(if neq {
+            format!(
+                "arraySum(p -> arrayCount(q -> {}, {rt}), {lt})",
+                cmp(lc, rc, "p", "q")
+            )
+        } else {
+            format!(
+                "arrayExists(x -> arrayExists(y -> {}, {rt}), {lt})",
+                cmp(lc, rc, "x", "y")
+            )
+        });
+    }
+    // The array on the right.
+    for (c, e, ordered_ok) in FF_ARRAY_PAIRS {
+        if ordered && !ordered_ok {
+            continue;
+        }
+        let (Some(lt), Some(rt)) = (get(&ll, c), get(&rl, &format!("{e}a"))) else {
+            continue;
+        };
+        terms.push(if neq {
+            format!(
+                "arraySum(p -> arrayCount(q -> (notEmpty(q) AND arrayAll(x -> {}, q)), {rt}), \
+                 {lt})",
+                cmp(c, e, "p", "x")
+            )
+        } else {
+            format!(
+                "arrayExists(x -> arrayExists(w -> arrayExists(y -> {}, w), {rt}), {lt})",
+                cmp(c, e, "x", "y")
+            )
+        });
+    }
+    // The array on the left.
+    for (c, e, ordered_ok) in FF_ARRAY_PAIRS {
+        if ordered && !ordered_ok {
+            continue;
+        }
+        let (Some(lt), Some(rt)) = (get(&ll, &format!("{e}a")), get(&rl, c)) else {
+            continue;
+        };
+        terms.push(if neq {
+            format!(
+                "arraySum(p -> arrayCount(q -> (notEmpty(p) AND arrayAll(x -> {}, p)), {rt}), \
+                 {lt})",
+                cmp(e, c, "x", "q")
+            )
+        } else {
+            format!(
+                "arrayExists(u -> arrayExists(x -> arrayExists(y -> {}, {rt}), u), {lt})",
+                cmp(e, c, "x", "y")
+            )
+        });
+    }
+    // Decision 9: with no term, `!=` counts no pair, so it holds when either
+    // set is empty.
+    if terms.is_empty() {
+        if !neq {
+            return "false".to_string();
+        }
+        terms.push("0".to_string());
+    }
+    if !neq {
+        return format!("({})", terms.join(" OR "));
+    }
+    let pred = format!(
+        "(({}) = {} * {})",
+        terms.join(" + "),
+        l.count(1),
+        r.count(2)
+    );
+    let presences: Vec<String> = [l.presence(1), r.presence(2)]
+        .into_iter()
+        .flatten()
+        .collect();
+    if presences.is_empty() {
+        pred
+    } else {
+        format!("({} AND {pred})", presences.join(" AND "))
+    }
+}
+
+/// The text part 3d gives `L op R`, at least one side a set: section 5.2
+/// or 5.3, then 5.5's binding — the chains, left outermost, inside the
+/// resource values.
+fn set_pair_expected(l: Side<'_>, op: ComparisonOp, r: Side<'_>) -> String {
+    let pred = match (l, r) {
+        (Side::Set(a), Side::Set(b)) => class_lists_expected(a, op, b),
+        (Side::Set(a), Side::Scalar(s)) => element_expected(a, 1, op, s),
+        (Side::Scalar(s), Side::Set(b)) => element_expected(b, 2, op, s),
+        (Side::Scalar(_), Side::Scalar(_)) => panic!("no set: 3c's ff_expected"),
+    };
+    if pred == "false" {
+        return pred;
+    }
+    let mut text = pred;
+    for (side, n) in [(r, 2), (l, 1)] {
+        if let Side::Set(s) = side
+            && let Some((c, chain)) = s.chain(n)
+        {
+            text = format!("arrayExists({c} -> {text}, [{chain}])");
+        }
+    }
+    let binds: Vec<(String, String)> = [l.bind(1), r.bind(2)].into_iter().flatten().collect();
+    match binds.as_slice() {
+        [] => text,
+        [(v, value)] => format!("arrayExists({v} -> {text}, [{value}])"),
+        [(v1, x1), (v2, x2)] => format!("arrayExists(({v1}, {v2}) -> {text}, [{x1}], [{x2}])"),
+        many => panic!("{} binds", many.len()),
+    }
+}
+
+/// `T-C34`: every ordered pair of 3c's fourteen operands and part 3d's
+/// seven sets with at least one set, under each of the six operators —
+/// 1,470 cells — compiles to the text this file builds from its own copy
+/// of section 5, with no demand; a pair sharing no type pair under `!=`
+/// expects decision 9's text. With no context the first operand needing
+/// it, left before right, gives its own refusal; every other cell is the
+/// same text.
+#[test]
+fn t_c34_set_operands_are_the_generated_cross_product() {
+    let scalars = ff_operands();
+    let sets = set_operands();
+    assert_eq!((scalars.len(), sets.len()), (14, 7));
+    let sides: Vec<Side<'_>> = scalars
+        .iter()
+        .map(Side::Scalar)
+        .chain(sets.iter().map(Side::Set))
+        .collect();
+    let mut cells = 0usize;
+    for l in &sides {
+        for r in &sides {
+            if !l.is_set() && !r.is_set() {
+                continue;
+            }
+            for op in FF_OPS {
+                cells += 1;
+                let expr = field_compare_expr(l.field(), op, r.field());
+                let want = set_pair_expected(*l, op, *r);
+                let label = format!("{} {op} {}", l.field(), r.field());
+                let got = compile_span_predicate_in(&expr, &ctx())
+                    .unwrap_or_else(|e| panic!("{label} must compile in a context: {e}"));
+                assert_eq!(got.sql(), want, "{label}");
+                assert!(got.demand_messages().is_empty(), "{label}: no demand");
+                let bare = compile_span_predicate(&expr).map(|p| p.sql().to_string());
+                match l.needs_window().or_else(|| r.needs_window()) {
+                    Some(refusal) => assert_eq!(bare, Err(refusal), "{label} with no context"),
+                    None => assert_eq!(bare, Ok(want), "{label} with no context"),
+                }
+            }
+        }
+    }
+    assert_eq!(cells, 1_470);
+}
+
+/// `T-C35`: section 5.7's texts, byte for byte, `V(a)` and `C(a)` spelled
+/// out from [`ctx`].
+#[test]
+fn t_c35_the_set_comparison_texts() {
+    assert_eq!(
+        rendered(r#"{ event.a = name }"#),
+        "arrayExists(e1 -> (coalesce(dynamicElement(e1, 'String') = name, false) OR \
+         arrayExists(x -> coalesce(x = name, false), dynamicElement(e1, \
+         'Array(Nullable(String))'))), arrayFilter(d -> dynamicType(d) != 'None', \
+         events.attrs.`a`))"
+    );
+    assert_eq!(
+        rendered(r#"{ event.a != name }"#),
+        "arrayAll(e1 -> (coalesce(dynamicElement(e1, 'String') != name, false) OR \
+         (notEmpty(dynamicElement(e1, 'Array(Nullable(String))')) AND arrayAll(x -> \
+         coalesce(x != name, false), dynamicElement(e1, 'Array(Nullable(String))')))), \
+         arrayFilter(d -> dynamicType(d) != 'None', events.attrs.`a`))"
+    );
+    assert_eq!(
+        rendered(r#"{ event:name != span.s }"#),
+        "(dynamicType(attrs.`s`) != 'None' AND arrayAll(e1 -> (coalesce(e1 != \
+         attrs.`s`.:String, false) OR (notEmpty(attrs.`s`.:`Array(Nullable(String))`) AND \
+         arrayAll(x -> coalesce(e1 != x, false), attrs.`s`.:`Array(Nullable(String))`))), \
+         events.name))"
+    );
+    assert_eq!(
+        rendered(r#"{ event:timeSinceStart < duration }"#),
+        "arrayExists(e1 -> (e1 < duration_ns), arrayMap(t -> toInt128(t) - start_ns, \
+         events.time_ns))"
+    );
+    assert_eq!(
+        rendered(r#"{ link:spanID != span:id }"#),
+        "arrayAll(e1 -> (e1 != lower(hex(span_id))), arrayMap(h -> lower(hex(h)), \
+         links.span_id))"
+    );
+    assert_eq!(
+        rendered(r#"{ event:name = link:spanID }"#),
+        "(arrayExists(x -> arrayExists(y -> (x = y), arrayMap(h -> lower(hex(h)), \
+         links.span_id)), events.name))"
+    );
+    assert_eq!(
+        rendered(r#"{ event:name != link:spanID }"#),
+        "((arraySum(p -> arrayCount(q -> (p != q), arrayMap(h -> lower(hex(h)), \
+         links.span_id)), events.name)) = length(events.name) * length(links.span_id))"
+    );
+    let c_a = "arrayFilter((d, g) -> g = multiIf(dynamicType(attrs.`a`) != 'None', 1, \
+               dynamicType(r1) != 'None', 2, arrayExists(d -> dynamicType(d) != 'None', \
+               events.attrs.`a`), 3, arrayExists(d -> dynamicType(d) != 'None', \
+               links.attrs.`a`), 4, dynamicType(scope_attrs.`a`) != 'None', 5, 0) AND \
+               dynamicType(d) != 'None', arrayConcat([attrs.`a`], [r1], events.attrs.`a`, \
+               links.attrs.`a`, [scope_attrs.`a`]), arrayConcat([1], [2], arrayMap(d -> 3, \
+               events.attrs.`a`), arrayMap(d -> 4, links.attrs.`a`), [5]))";
+    assert_eq!(
+        rendered_in(r#"{ .a != name }"#),
+        format!(
+            "arrayExists(r1 -> arrayExists(c1 -> (notEmpty(c1) AND arrayAll(e1 -> \
+             (coalesce(dynamicElement(e1, 'String') != name, false) OR \
+             (notEmpty(dynamicElement(e1, 'Array(Nullable(String))')) AND arrayAll(x -> \
+             coalesce(x != name, false), dynamicElement(e1, 'Array(Nullable(String))')))), \
+             c1)), [{c_a}]), [{}])",
+            v_of("attrs.`a`")
+        )
+    );
+    assert_eq!(rendered(r#"{ event.a = status }"#), "false");
+    // Decision 9: `!=` with no term holds exactly when the set is empty.
+    assert_eq!(
+        rendered(r#"{ event:name != duration }"#),
+        "arrayAll(e1 -> false, events.name)"
+    );
+    assert_eq!(
+        rendered(r#"{ event:name != event:timeSinceStart }"#),
+        "((0) = length(events.name) * length(events.time_ns))"
+    );
+}
+
+/// `T-C36`: the chain needs its window and an event set does not; every
+/// construct section 1 hands on is refused naming part 3e; the regex
+/// operators keep part 3a's refusal.
+#[test]
+fn t_c36_the_set_operand_refusals() {
+    assert_eq!(
+        refusal(r#"{ .a = span.b }"#),
+        PlanError::UnsupportedField(UNSCOPED_NEEDS_WINDOW.to_string())
+    );
+    assert!(
+        compile_span_predicate(&filter_body(r#"{ event.a = span.b }"#)).is_ok(),
+        "an event set needs no context"
+    );
+    for query in [
+        r#"{ !event.a = span.b }"#,
+        r#"{ span.b = !link.a }"#,
+        r#"{ !.a = span.b }"#,
+        r#"{ .a + 1 = span.b }"#,
+        r#"{ event:name = span.b + 1 }"#,
+        r#"{ event.a = 2.0 ^ 0.5 }"#,
+    ] {
+        match compile_span_predicate_in(&filter_body(query), &ctx()) {
+            Err(PlanError::UnsupportedField(msg)) => assert!(
+                msg.ends_with("(issue #589 part 3e)"),
+                "{query}: the refusal must end `(issue #589 part 3e)`, got {msg:?}"
+            ),
+            other => panic!("{query} must be UnsupportedField, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        refusal(r#"{ event.a =~ link.a }"#),
+        PlanError::TypeMismatch(
+            "a field-against-field comparison does not support regex operators".to_string()
+        )
+    );
+}
+
+/// `T-C37`: a chain operand reads the resource row, so its predicate
+/// carries its window and composing it with another panics, as `T-C28`'s
+/// do.
+#[test]
+#[should_panic(expected = "different window")]
+fn t_c37_a_chain_operand_refuses_another_window() {
+    let p =
+        compile_span_predicate_in(&filter_body(r#"{ .a = span.b }"#), &ctx()).expect("compiles");
+    let other = WindowSql::start_closed_end_open(T_B1_START, T_B1_END + 1);
+    let _ = span_membership_sql("spans", other, &p);
+}
+
+/// `T-C38`'s leaf cells: what `compile_span_leaf_in` answered for each of
+/// the seven operands at the branch point, generated once and checked in,
+/// so a change to the leaf moves only the compiled side of a cell. One
+/// line per cell: operand, the leaf's operator and value, then `ok` and
+/// the text or `err` and the error.
+const T_C38_LEAVES: &str = include_str!("fixtures/traces_compile_v2_t_c38_leaf.tsv");
+
+/// One outcome as `T_C38_LEAVES` writes it.
+fn outcome(got: Result<String, PlanError>) -> String {
+    match got {
+        Ok(sql) => format!("ok\t{sql}"),
+        Err(e) => format!("err\t{e:?}"),
+    }
+}
+
+fn t_c38_leaf(operand: &str, leaf: &str) -> String {
+    let mut found = T_C38_LEAVES.lines().filter_map(|line| {
+        let mut cols = line.splitn(3, '\t');
+        let (o, l, rest) = (cols.next()?, cols.next()?, cols.next()?);
+        (o == operand && l == leaf).then(|| rest.to_string())
+    });
+    let one = found
+        .next()
+        .unwrap_or_else(|| panic!("no leaf cell for {operand} {leaf}"));
+    assert!(
+        found.next().is_none(),
+        "two leaf cells for {operand} {leaf}"
+    );
+    one
+}
+
+/// What one `T-C38` row expects of every operand.
+enum Shape {
+    Leaf(&'static str),
+    Not { all: bool },
+    False,
+    Refuse,
+    Exists { negated: bool },
+    Pair,
+    Regex,
+}
+
+/// `T-C38`: section 9.1's table — the seven operands under 32 shapes, 224
+/// cells, each against its exact outcome.
+#[test]
+fn t_c38_every_compile_path_for_every_set_operand() {
+    // (query with `{F}` for the operand, the row's shape)
+    let rows: [(&str, Shape); 32] = [
+        ("{ {F} }", Shape::Leaf("= true")),
+        ("{ !{F} }", Shape::Not { all: false }),
+        ("{ !{F} = true }", Shape::Not { all: false }),
+        ("{ true = !{F} }", Shape::Not { all: false }),
+        ("{ !{F} != false }", Shape::Not { all: true }),
+        ("{ false != !{F} }", Shape::Not { all: true }),
+        ("{ {F} = 2 }", Shape::Leaf("= 2")),
+        (r#"{ {F} = "x" }"#, Shape::Leaf("= \"x\"")),
+        ("{ {F} < 1ms }", Shape::Leaf("< 1ms")),
+        (r#"{ {F} =~ "x" }"#, Shape::Leaf("=~ \"x\"")),
+        ("{ {F} = 1 + 1 }", Shape::Leaf("= 2")),
+        ("{ 1ms + 1ms < {F} }", Shape::Leaf("> 2000000")),
+        ("{ {F} > 1000 * 3 }", Shape::Leaf("> 3000")),
+        ("{ {F} = -1 }", Shape::Leaf("= -1")),
+        ("{ {F} = maxInt + 1 }", Shape::Leaf("= 9223372036854775808")),
+        ("{ {F} = 1 / 0 }", Shape::False),
+        ("{ 1 / 0 = {F} }", Shape::False),
+        ("{ {F} < 1 % 0 }", Shape::False),
+        ("{ 1 % 0 < {F} }", Shape::False),
+        ("{ 1 / 0 = {F} + 1 }", Shape::Refuse),
+        ("{ {F} = 2.0 ^ 0.5 }", Shape::Refuse),
+        ("{ {F} != nil }", Shape::Exists { negated: false }),
+        ("{ {F} = nil }", Shape::Exists { negated: true }),
+        ("{ {F} = span.a }", Shape::Pair),
+        ("{ span.a = {F} }", Shape::Pair),
+        ("{ {F} = {G} }", Shape::Pair),
+        ("{ {F} =~ span.b }", Shape::Regex),
+        ("{ {F} + 1 = 2 }", Shape::Refuse),
+        ("{ {F} = span.b + 1 }", Shape::Refuse),
+        ("{ !{F} = span.b }", Shape::Refuse),
+        ("{ span.b = !{F} }", Shape::Refuse),
+        ("{ {F} = (span.b = 1) }", Shape::Refuse),
+    ];
+    let sets = set_operands();
+    let span_a = ff_attr(AttrScope::Span, "attrs", "a");
+    let mut cells = 0usize;
+    for set in &sets {
+        let f = set.field.to_string();
+        // Section 9.1's `G`: `event:name`, or `link:spanID` opposite it.
+        let g = if matches!(set.kind, SetKind::EventName) {
+            &sets[4]
+        } else {
+            &sets[2]
+        };
+        for (template, shape) in &rows {
+            cells += 1;
+            let query = template
+                .replace("{F}", &f)
+                .replace("{G}", &g.field.to_string());
+            let got = outcome(
+                compile_span_predicate_in(&filter_body(&query), &ctx())
+                    .map(|p| p.sql().to_string()),
+            );
+            let bool_err = || {
+                Err(PlanError::TypeMismatch(format!(
+                    "expression (!{f}) expected a boolean"
+                )))
+            };
+            let want = match shape {
+                Shape::Leaf(leaf) => t_c38_leaf(&f, leaf),
+                Shape::Not { all } => outcome(match (set.kind, &set.field) {
+                    (SetKind::Attr(root, key), Field::Attribute { scope, .. }) => {
+                        let e = root.trim_end_matches(".attrs");
+                        Ok(not_element_text(e, *scope, key, *all))
+                    }
+                    (SetKind::Chain(key), _) => Ok(not_chain_text(key, *all)),
+                    _ => bool_err(),
+                }),
+                Shape::False => outcome(Ok("false".to_string())),
+                Shape::Refuse => outcome(Err(PlanError::UnsupportedField(match &set.field {
+                    Field::Attribute { scope, .. } => format!(
+                        "an expression with a \"{scope}\" operand is not supported by the \
+                         span-scope predicate compiler yet (issue #589 part 3e)"
+                    ),
+                    Field::Intrinsic(i) => format!(
+                        "an expression with {i} is not supported by the span-scope predicate \
+                         compiler yet (issue #589 part 3e)"
+                    ),
+                }))),
+                Shape::Exists { negated } => outcome(match set.kind {
+                    SetKind::Attr(root, key) => {
+                        let present =
+                            format!("arrayExists(d -> dynamicType(d) != 'None', {root}.`{key}`)");
+                        Ok(if *negated {
+                            format!("NOT {present}")
+                        } else {
+                            present
+                        })
+                    }
+                    SetKind::Chain(key) => {
+                        let any = CHAIN
+                            .iter()
+                            .map(|scope| format!("({})", presence_fixed(*scope, key)))
+                            .collect::<Vec<_>>()
+                            .join(" OR ");
+                        Ok(if *negated {
+                            format!("NOT ({any})")
+                        } else {
+                            any
+                        })
+                    }
+                    _ => Err(PlanError::TypeMismatch(
+                        "existence checks are only supported on attributes".to_string(),
+                    )),
+                }),
+                Shape::Pair => {
+                    let me = Side::Set(set);
+                    let text = if template.starts_with("{ span.a") {
+                        set_pair_expected(Side::Scalar(&span_a), ComparisonOp::Eq, me)
+                    } else if template.contains("{G}") {
+                        set_pair_expected(me, ComparisonOp::Eq, Side::Set(g))
+                    } else {
+                        set_pair_expected(me, ComparisonOp::Eq, Side::Scalar(&span_a))
+                    };
+                    outcome(Ok(text))
+                }
+                Shape::Regex => outcome(Err(PlanError::TypeMismatch(
+                    "a field-against-field comparison does not support regex operators".to_string(),
+                ))),
+            };
+            assert_eq!(got, want, "{query}");
+        }
+    }
+    assert_eq!(cells, 224);
+}
+
+/// `T-C39`: decision 7's `!=` over every element, the literal on either
+/// side; part 2's `=` unchanged; decision 8's fold over the four
+/// intrinsics and to no value.
+#[test]
+fn t_c39_not_over_a_set_and_the_folded_side() {
+    assert_eq!(
+        rendered(r#"{ !event.f != false }"#),
+        "(throwIf(arrayExists(d -> dynamicType(d) != 'None' AND dynamicType(d) != 'Bool', \
+         events.attrs.`f`), 'expression (!event.f) expected a boolean') + \
+         toUInt8((arrayExists(d -> dynamicType(d) != 'None', events.attrs.`f`) AND NOT \
+         arrayExists(b -> coalesce(b = true, false), events.attrs.`f`.:Bool)))) = 1"
+    );
+    let any = "(throwIf(arrayExists(d -> dynamicType(d) != 'None' AND dynamicType(d) != 'Bool', \
+               events.attrs.`f`), 'expression (!event.f) expected a boolean') + \
+               toUInt8(arrayExists(b -> coalesce(b = false, false), events.attrs.`f`.:Bool))) = 1";
+    assert_eq!(rendered(r#"{ !event.f = true }"#), any);
+    assert_eq!(rendered(r#"{ true = !event.f }"#), any);
+    let link_all = "(throwIf(arrayExists(d -> dynamicType(d) != 'None' AND dynamicType(d) != \
+                    'Bool', links.attrs.`lf`), 'expression (!link.lf) expected a boolean') + \
+                    toUInt8((arrayExists(d -> dynamicType(d) != 'None', links.attrs.`lf`) AND \
+                    NOT arrayExists(b -> coalesce(b = false, false), links.attrs.`lf`.:Bool)))) \
+                    = 1";
+    assert_eq!(rendered(r#"{ !link.lf != true }"#), link_all);
+    assert_eq!(rendered(r#"{ true != !link.lf }"#), link_all);
+    assert_eq!(
+        rendered(r#"{ event:timeSinceStart > 5ms + 4ms }"#),
+        "arrayExists(t -> toInt128(t) - start_ns > 9000000, events.time_ns)"
+    );
+    assert_eq!(rendered(r#"{ event:name = 1 / 0 }"#), "false");
+    assert_eq!(rendered_in(r#"{ .a < 1 % 0 }"#), "false");
 }
