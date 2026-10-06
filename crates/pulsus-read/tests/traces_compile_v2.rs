@@ -681,30 +681,28 @@ fn t_c5_every_out_of_scope_field_refuses_and_names_itself() {
     }
     assert_eq!(visited_scopes, AttrScope::ALL.len());
 
-    // The expression-level constructs deferred to parts 3c and 3d, each
-    // naming itself and its own part.
+    // The expression-level constructs part 3c serves now compile.
+    for query in [
+        r#"{ span.a + 1 = 2 }"#,
+        r#"{ 1 = 1 }"#,
+        r#"{ (span.a = 1) = true }"#,
+        r#"{ !span.a = span.b }"#,
+    ] {
+        let got = compile_span_predicate(&filter_body(query)).map(|p| p.sql().to_string());
+        assert!(got.is_ok(), "{query} must compile: {got:?}");
+    }
+
+    // The expression-level constructs deferred to part 3d, each naming
+    // itself and its own part.
     for (query, token, suffix) in [
-        (
-            r#"{ span.a + 1 = 2 }"#,
-            "arithmetic",
-            "(issue #589 part 3c)",
-        ),
         (
             r#"{ event.a = span.b }"#,
             "field-against-field",
             "(issue #589 part 3d)",
         ),
-        (r#"{ 1 = 1 }"#, "two literals", "(issue #589 part 3c)"),
-        (
-            r#"{ (span.a = 1) = true }"#,
-            "boolean-valued",
-            "(issue #589 part 3c)",
-        ),
-        (
-            r#"{ !span.a = span.b }"#,
-            "boolean-valued",
-            "(issue #589 part 3c)",
-        ),
+        (r#"{ event.a + 1 = 2 }"#, "event.", "(issue #589 part 3d)"),
+        (r#"{ !event.a = span.b }"#, "event.", "(issue #589 part 3d)"),
+        (r#"{ .a + 1 = 2 }"#, ".", "(issue #589 part 3d)"),
     ] {
         match refusal(query) {
             PlanError::UnsupportedField(msg) => assert!(
@@ -2565,4 +2563,479 @@ fn t_c28_a_resource_operand_refuses_another_window() {
         .expect("compiles");
     let other = WindowSql::start_closed_end_open(T_B1_START, T_B1_END + 1);
     let _ = span_membership_sql("spans", other, &p);
+}
+
+// =====================================================================
+// Issue #589 part 3c — sides that are expressions
+// =====================================================================
+
+/// The design's section 5.3 `NI` and `NF`.
+const AX_NI: &str = "CAST(NULL, 'Nullable(Int256)')";
+const AX_NF: &str = "CAST(NULL, 'Nullable(Float64)')";
+
+/// One arithmetic value as this file builds it from its own copy of
+/// section 5.3's tables: the tuple text, and whether a duration is in it.
+#[derive(Clone)]
+struct Ax {
+    text: String,
+    dur: bool,
+}
+
+/// A span or instrumentation attribute leaf at `root`.
+fn ax_attr(root: &str, key: &str) -> Ax {
+    let p = format!("{root}.`{key}`");
+    Ax {
+        text: format!("tuple(toInt256({p}.:Int64), {p}.:Float64)"),
+        dur: false,
+    }
+}
+
+fn ax_duration() -> Ax {
+    Ax {
+        text: format!("tuple(toInt256(duration_ns), {AX_NF})"),
+        dur: true,
+    }
+}
+
+/// An integer constant: `digits` is `I(v)`.
+fn ax_int(digits: &str, dur: bool) -> Ax {
+    Ax {
+        text: format!("tuple(toInt256({digits}), {AX_NF})"),
+        dur,
+    }
+}
+
+/// A float constant: `rendered` is `render_num(x)`.
+fn ax_float(rendered: &str) -> Ax {
+    Ax {
+        text: format!("tuple({AX_NI}, toFloat64('{rendered}'))"),
+        dur: false,
+    }
+}
+
+/// A resource attribute leaf, its value `V(k)` spelled out from [`ctx`].
+fn ax_resource(key: &str) -> Ax {
+    Ax {
+        text: format!(
+            "arrayElement(arrayMap(pv -> tuple(toInt256(dynamicElement(pv, 'Int64')), \
+             dynamicElement(pv, 'Float64')), [{}]), 1)",
+            v_of(&ff_resource_path(key))
+        ),
+        dur: false,
+    }
+}
+
+/// `NEG(x)`.
+fn ax_neg_int(x: &str) -> String {
+    format!("if({x} != 0 AND negate({x}) = {x}, NULL, negate({x}))")
+}
+
+/// A binary node, `op` one of `+ - * / % ^`.
+fn ax_bin(op: &str, l: &Ax, r: &Ax) -> Ax {
+    let (l1, l2) = ("tupleElement(pl, 1)", "tupleElement(pl, 2)");
+    let (r1, r2) = ("tupleElement(pr, 1)", "tupleElement(pr, 2)");
+    let fl = format!("coalesce({l2}, toFloat64({l1}))");
+    let fr = format!("coalesce({r2}, toFloat64({r1}))");
+    let h = format!("{l2} IS NULL AND {r2} IS NULL");
+    let dur = l.dur || r.dur;
+    let (i, f) = match op {
+        "+" => (
+            format!(
+                "if(({l1} > 0 AND {r1} > 0 AND {l1} + {r1} <= 0) OR ({l1} < 0 AND {r1} < 0 AND \
+                 {l1} + {r1} >= 0), NULL, {l1} + {r1})"
+            ),
+            format!("if({h}, NULL, {fl} + {fr})"),
+        ),
+        "-" => (
+            format!(
+                "if(({l1} >= 0 AND {r1} < 0 AND {l1} - {r1} < 0) OR ({l1} < 0 AND {r1} > 0 AND \
+                 {l1} - {r1} >= 0), NULL, {l1} - {r1})"
+            ),
+            format!("if({h}, NULL, {fl} - {fr})"),
+        ),
+        "*" => (
+            format!(
+                "if(abs(toFloat64({l1} * {r1}) - toFloat64({l1}) * toFloat64({r1})) <= 1e-6 * \
+                 abs(toFloat64({l1}) * toFloat64({r1})), {l1} * {r1}, NULL)"
+            ),
+            format!("if({h}, NULL, {fl} * {fr})"),
+        ),
+        "/" if dur => (AX_NI.to_string(), format!("{fl} / {fr}")),
+        "/" => (
+            format!(
+                "multiIf({r1} = 0, NULL, {r1} = -1, {}, intDiv({l1}, if({r1} = 0 OR {r1} = -1, \
+                 1, {r1})))",
+                ax_neg_int(l1)
+            ),
+            format!("if({h}, NULL, {fl} / {fr})"),
+        ),
+        "%" => (
+            format!(
+                "multiIf({r1} = 0, NULL, {r1} = -1, {l1} * 0, {l1} % if({r1} = 0 OR {r1} = -1, \
+                 1, {r1}))"
+            ),
+            format!("if({h}, NULL, {fl} % {fr})"),
+        ),
+        "^" => {
+            let pf = format!("pow(toFloat64({l1}), toFloat64({r1}))");
+            let fold = format!(
+                "tupleElement(arrayFold((pa, pk) -> (if(bitTest(toUInt8(assumeNotNull({r1})), \
+                 pk), tupleElement(pa, 1) * tupleElement(pa, 2), tupleElement(pa, 1)), \
+                 tupleElement(pa, 2) * tupleElement(pa, 2)), range(8), (toInt256(1), \
+                 assumeNotNull({l1}))), 1)"
+            );
+            (
+                format!(
+                    "if({l1} IS NULL OR {r1} IS NULL OR {r1} < 0, NULL, if({r1} >= 256, \
+                     multiIf({l1} = 0, 0, {l1} = 1, 1, {l1} = -1, if({r1} % 2 = 0, 1, -1), \
+                     NULL), arrayElement(arrayMap(pq -> if(isFinite({pf}) AND \
+                     abs(toFloat64(pq) - {pf}) <= 1e-6 * abs({pf}), pq, NULL), [{fold}]), 1)))"
+                ),
+                format!("if({h} AND coalesce({r1} >= 0, false), NULL, pow({fl}, {fr}))"),
+            )
+        }
+        other => panic!("not an arithmetic operator: {other}"),
+    };
+    Ax {
+        text: format!(
+            "arrayElement(arrayMap((pl, pr) -> tuple({i}, {f}), [{}], [{}]), 1)",
+            l.text, r.text
+        ),
+        dur,
+    }
+}
+
+/// `<node> <sym> <literal>` with the node the left side, bound to `a1`, and
+/// the literal an integer constant: section 5.2's arms through part 3a's
+/// terms.
+fn ax_compare_left(node: &Ax, sym: &str, literal: &str) -> String {
+    format!(
+        "arrayExists(a1 -> (coalesce(tupleElement(a1, 1) {sym} {literal}, false) OR \
+         coalesce(tupleElement(a1, 2) {sym} {literal}, false)), [{}])",
+        node.text
+    )
+}
+
+const AX_OPS: [&str; 6] = ["+", "-", "*", "/", "%", "^"];
+
+/// `T-C29`: every ordered pair of section 9's five operands with at least
+/// one field, under each arithmetic operator, in `{ <L> <op> <R> > 3 }` —
+/// 126 cells — compiles to the text this file builds from its own copy of
+/// section 5.3, with no demand.
+#[test]
+fn t_c29_arithmetic_is_the_generated_cross_product() {
+    let operands: [(&str, Ax, bool); 5] = [
+        ("span.a", ax_attr("attrs", "a"), true),
+        ("instrumentation.a", ax_attr("scope_attrs", "a"), true),
+        ("duration", ax_duration(), true),
+        ("2", ax_int("2", false), false),
+        ("0.5", ax_float("0.5"), false),
+    ];
+    let mut cells = 0usize;
+    for (lq, la, lf) in &operands {
+        for (rq, ra, rf) in &operands {
+            if !lf && !rf {
+                continue;
+            }
+            for op in AX_OPS {
+                cells += 1;
+                let query = format!("{{ {lq} {op} {rq} > 3 }}");
+                let p = compile_span_predicate(&filter_body(&query))
+                    .unwrap_or_else(|e| panic!("{query} must compile: {e}"));
+                assert_eq!(
+                    p.sql(),
+                    ax_compare_left(&ax_bin(op, la, ra), ">", "3"),
+                    "{query}"
+                );
+                assert!(p.demand_messages().is_empty(), "{query}: no demand");
+            }
+        }
+    }
+    assert_eq!(cells, 126);
+}
+
+/// `T-C30`: section 9's fixed texts, byte for byte.
+#[test]
+fn t_c30_the_measured_arithmetic_texts() {
+    assert_eq!(
+        rendered(r#"{ -span.a > 0 }"#),
+        "arrayExists(a1 -> (coalesce(tupleElement(a1, 1) > 0, false) OR \
+         coalesce(tupleElement(a1, 2) > 0, false)), [arrayElement(arrayMap(pl -> \
+         tuple(if(tupleElement(pl, 1) != 0 AND negate(tupleElement(pl, 1)) = tupleElement(pl, 1), \
+         NULL, negate(tupleElement(pl, 1))), negate(tupleElement(pl, 2))), \
+         [tuple(toInt256(attrs.`a`.:Int64), attrs.`a`.:Float64)]), 1)])"
+    );
+    assert_eq!(
+        rendered(r#"{ duration / 1ms > 1 }"#),
+        "arrayExists(a1 -> (coalesce(tupleElement(a1, 1) > 1, false) OR \
+         coalesce(tupleElement(a1, 2) > 1, false)), [arrayElement(arrayMap((pl, pr) -> \
+         tuple(CAST(NULL, 'Nullable(Int256)'), coalesce(tupleElement(pl, 2), \
+         toFloat64(tupleElement(pl, 1))) / coalesce(tupleElement(pr, 2), \
+         toFloat64(tupleElement(pr, 1)))), [tuple(toInt256(duration_ns), CAST(NULL, \
+         'Nullable(Float64)'))], [tuple(toInt256(1000000), CAST(NULL, \
+         'Nullable(Float64)'))]), 1)])"
+    );
+    let (a, b) = (ax_attr("attrs", "a"), ax_attr("attrs", "b"));
+    assert_eq!(
+        rendered(r#"{ span.a / span.b = -3 }"#),
+        ax_compare_left(&ax_bin("/", &a, &b), "=", "-3")
+    );
+    assert_eq!(
+        rendered(r#"{ span.a ^ 2 > 8 }"#),
+        ax_compare_left(&ax_bin("^", &a, &ax_int("2", false)), ">", "8")
+    );
+    assert_eq!(
+        rendered_in(r#"{ span.a * resource.r > 7 }"#),
+        ax_compare_left(&ax_bin("*", &a, &ax_resource("r")), ">", "7")
+    );
+    assert_eq!(
+        rendered(r#"{ !span.f = span.g }"#),
+        "(throwIf(dynamicType(attrs.`f`) != 'None' AND dynamicType(attrs.`f`) != 'Bool', \
+         'expression (!span.f) expected a boolean') + toUInt8((coalesce((NOT attrs.`f`.:Bool) = \
+         attrs.`g`.:Bool, false) OR arrayExists(x -> coalesce((NOT attrs.`f`.:Bool) = x, false), \
+         attrs.`g`.:`Array(Nullable(Bool))`)))) = 1"
+    );
+}
+
+/// `T-C31`: a literal-only side folds to the constant it computes, and a
+/// folded integer division or modulo by zero is `false`.
+#[test]
+fn t_c31_a_literal_only_side_folds() {
+    for (folded, plain) in [
+        (r#"{ span.a = 2 - 1 }"#, r#"{ span.a = 1 }"#),
+        (r#"{ span.a = -7 / 2 }"#, r#"{ span.a = -3 }"#),
+        (r#"{ span.a = -7 % 2 }"#, r#"{ span.a = -1 }"#),
+        (r#"{ span.a = 5.0 / 2 }"#, r#"{ span.a = 2.5 }"#),
+        (r#"{ span.a > 1ms + 1ms }"#, r#"{ span.a > 2000000 }"#),
+    ] {
+        assert_eq!(rendered(folded), rendered(plain), "{folded}");
+    }
+    assert_eq!(
+        rendered_in(r#"{ .a = 2 ^ 3 }"#),
+        rendered_in(r#"{ .a = 8 }"#)
+    );
+    for query in [
+        r#"{ span.a = 1 / 0 }"#,
+        r#"{ span.a = 1 % 0 }"#,
+        r#"{ span.a + 1 / 0 > 0 }"#,
+    ] {
+        assert_eq!(rendered(query), "false", "{query}");
+    }
+    let duration_by_zero = rendered(r#"{ span.a < 1ms / 0 }"#);
+    assert_ne!(duration_by_zero, "false");
+    assert!(
+        duration_by_zero.contains("tupleElement(a2, 2)"),
+        "a duration's zero divisor is the run-time infinity: {duration_by_zero}"
+    );
+}
+
+/// The cap's refusal, section 5.6.
+fn cap_refusal() -> PlanError {
+    PlanError::UnsupportedField(
+        "an arithmetic expression of more than 64 operations is not supported".to_string(),
+    )
+}
+
+/// `{ span.a + span.a + … }` with `nodes` operators.
+fn span_chain(nodes: usize) -> String {
+    vec!["span.a"; nodes + 1].join(" + ")
+}
+
+/// `T-C32`: a deferred operand is refused before a zero divisor folds to
+/// `false`; folding comes before the refusal for a lone field; the cap
+/// counts across the predicate and not a folded subtree.
+#[test]
+fn t_c32_the_order_of_the_rules_and_the_cap() {
+    match refusal(r#"{ 1 / 0 = event.a }"#) {
+        PlanError::UnsupportedField(msg) => assert!(
+            msg.contains("event.") && msg.ends_with("(issue #589 part 3d)"),
+            "the event operand's refusal, got {msg:?}"
+        ),
+        other => panic!("must be UnsupportedField, got {other:?}"),
+    }
+    assert_eq!(
+        rendered(r#"{ event.a = 1 + 1 }"#),
+        rendered(r#"{ event.a = 2 }"#)
+    );
+    let q64 = format!("{{ {} > 0 }}", span_chain(64));
+    assert!(
+        compile_span_predicate(&filter_body(&q64)).is_ok(),
+        "64 operations compile"
+    );
+    let q65 = format!("{{ {} > 0 }}", span_chain(65));
+    assert_eq!(refusal(&q65), cap_refusal(), "65 operations");
+    let split = format!("{{ {} > 0 && {} > 0 }}", span_chain(33), span_chain(32));
+    assert_eq!(refusal(&split), cap_refusal(), "33 and 32 operations");
+    let ones = vec!["1"; 200].join(" + ");
+    assert_eq!(
+        rendered(&format!("{{ span.a = {ones} }}")),
+        rendered(r#"{ span.a = 200 }"#),
+        "a folded chain is not counted"
+    );
+}
+
+/// Part 1's numeric pair over `n`.
+fn numeric_pair_text(op: &str, n: &str) -> String {
+    format!(
+        "(coalesce(attrs.`a`.:Int64 {op} {n}, false) OR coalesce(attrs.`a`.:Float64 {op} {n}, \
+         false))"
+    )
+}
+
+/// `T-C33`: the literal pairs, and the literals at the 64- and 128-bit
+/// edges.
+#[test]
+fn t_c33_literal_pairs_and_the_integer_boundaries() {
+    assert_eq!(
+        rendered(r#"{ "abc" =~ "a.*" }"#),
+        "match('abc', '^(?:a.*)$')"
+    );
+    assert_eq!(
+        rendered(r#"{ "abc" !~ "a.*" }"#),
+        "NOT match('abc', '^(?:a.*)$')"
+    );
+    assert_eq!(
+        rendered(r#"{ "a\nb" =~ "a.b" }"#),
+        "match('a\\nb', '^(?:a.b)$')"
+    );
+    for pattern in ["(", "(?=a)"] {
+        let got = refusal(&format!(r#"{{ "abc" =~ "{pattern}" }}"#));
+        let leaf = refusal(&format!(r#"{{ name =~ "{pattern}" }}"#));
+        assert_eq!(got, leaf, "{pattern}: the leaf's own error");
+        assert!(
+            matches!(&got, PlanError::TypeMismatch(m) if m.starts_with("invalid regex")),
+            "{pattern}: {got:?}"
+        );
+    }
+    for (query, text) in [
+        (r#"{ "b" < "a" }"#, "('b' < 'a')"),
+        (r#"{ 1s = 1000000000 }"#, "(1000000000 = 1000000000)"),
+        (
+            r#"{ 9007199254740993 = 9007199254740992.0 }"#,
+            "(9007199254740993 = toFloat64('9007199254740992'))",
+        ),
+        (r#"{ ok != error }"#, "(1 != 2)"),
+        (
+            r#"{ 18446744073709551615ns = 18446744073709551615ns }"#,
+            "(18446744073709551615 = 18446744073709551615)",
+        ),
+        (
+            r#"{ 18446744073709551615ns + 1ns > 18446744073709551615ns }"#,
+            "(toInt256('18446744073709551616') > 18446744073709551615)",
+        ),
+        (
+            r#"{ 170141183460469231731687303715884105727 = 170141183460469231731687303715884105727 }"#,
+            "(toInt256('170141183460469231731687303715884105727') = \
+             toInt256('170141183460469231731687303715884105727'))",
+        ),
+        (
+            r#"{ -170141183460469231731687303715884105728 < -170141183460469231731687303715884105727 }"#,
+            "(toInt256('-170141183460469231731687303715884105728') < \
+             toInt256('-170141183460469231731687303715884105727'))",
+        ),
+        (
+            r#"{ 340282366920938463463374607431768211455 > 340282366920938463463374607431768211454 }"#,
+            "(toInt256('340282366920938463463374607431768211455') > \
+             toInt256('340282366920938463463374607431768211454'))",
+        ),
+        (
+            r#"{ duration < 18446744073709551615ns }"#,
+            "duration_ns < 18446744073709551615",
+        ),
+        (
+            r#"{ event:timeSinceStart < 18446744073709551615ns }"#,
+            "arrayExists(t -> toInt128(t) - start_ns < 18446744073709551615, events.time_ns)",
+        ),
+        (
+            r#"{ event:timeSinceStart = 18446744073709551615 }"#,
+            "arrayExists(t -> toInt128(t) - start_ns = 18446744073709551615, events.time_ns)",
+        ),
+    ] {
+        assert_eq!(rendered(query), text, "{query}");
+    }
+    for (query, op, n) in [
+        (
+            r#"{ span.a = 340282366920938463463374607431768211455 }"#,
+            "=",
+            "toInt256('340282366920938463463374607431768211455')",
+        ),
+        (
+            r#"{ span.a = -170141183460469231731687303715884105728 }"#,
+            "=",
+            "toInt256('-170141183460469231731687303715884105728')",
+        ),
+        (
+            r#"{ span.a = 170141183460469231731687303715884105727 }"#,
+            "=",
+            "toInt256('170141183460469231731687303715884105727')",
+        ),
+        (
+            r#"{ span.a = -(170141183460469231731687303715884105728) }"#,
+            "=",
+            "toInt256('-170141183460469231731687303715884105728')",
+        ),
+        (
+            r#"{ span.a < 18446744073709551615ns }"#,
+            "<",
+            "18446744073709551615",
+        ),
+        (r#"{ span.a = -1 }"#, "=", "-1"),
+    ] {
+        assert_eq!(rendered(query), numeric_pair_text(op, n), "{query}");
+    }
+    for (query, literal) in [
+        (
+            r#"{ 340282366920938463463374607431768211456 = 1 }"#,
+            "340282366920938463463374607431768211456",
+        ),
+        (
+            r#"{ -170141183460469231731687303715884105729 = 1 }"#,
+            "-170141183460469231731687303715884105729",
+        ),
+        (
+            r#"{ span.a = 340282366920938463463374607431768211456 }"#,
+            "340282366920938463463374607431768211456",
+        ),
+        (
+            r#"{ span.a < -170141183460469231731687303715884105729 }"#,
+            "-170141183460469231731687303715884105729",
+        ),
+        (
+            r#"{ span.a + 340282366920938463463374607431768211456 > 0 }"#,
+            "340282366920938463463374607431768211456",
+        ),
+        (
+            r#"{ span.a + -170141183460469231731687303715884105729 > 0 }"#,
+            "-170141183460469231731687303715884105729",
+        ),
+    ] {
+        assert_eq!(
+            refusal(query),
+            PlanError::TypeMismatch(format!("integer literal out of range: {literal}")),
+            "{query}"
+        );
+    }
+    // The sign positions: a negative operand, a nested negation and a
+    // parenthesised literal fold as the signed value.
+    for (folded, plain) in [
+        (r#"{ span.a = 3 - -1 }"#, r#"{ span.a = 4 }"#),
+        (r#"{ span.a = - -1 }"#, r#"{ span.a = 1 }"#),
+        (r#"{ span.a = -(1) }"#, r#"{ span.a = -1 }"#),
+    ] {
+        assert_eq!(rendered(folded), rendered(plain), "{folded}");
+    }
+    let negative_operand = rendered(r#"{ span.a - -1 > 0 }"#);
+    assert_eq!(
+        negative_operand,
+        ax_compare_left(
+            &ax_bin("-", &ax_attr("attrs", "a"), &ax_int("-1", false)),
+            ">",
+            "0"
+        )
+    );
+    let negative_zero = rendered(r#"{ span.a > 1 / -0.0 }"#);
+    assert!(
+        negative_zero.contains("toFloat64('-0')"),
+        "the sign of zero is kept: {negative_zero}"
+    );
 }
