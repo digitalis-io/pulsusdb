@@ -3873,3 +3873,25 @@ Applies to the span-scope predicate compiler (`crates/pulsus-read/src/traces/spa
   such limit.
 
 Read from the reference's source, not measured against it.
+
+### `traceql-event-link-set-operands` (issue #589) — **event, link and unscoped operands in a field-against-field comparison**
+
+Applies to the span-scope predicate compiler (`crates/pulsus-read/src/traces/spans/predicate.rs`, `set_compare`), which no route calls until #590.
+
+- **An `event.` or `link.` attribute is the set of elements holding the key, compared by any element; `!=` by
+  every element.** This is the rule `traceql-event-link-operand-any-match` records for the four event and link
+  intrinsics, applied to attributes. The reference reads the first element holding the key.
+- **Two sets are compared pair by pair**: any pair, and for `!=` every pair, so `!=` holds when either set is empty.
+  The reference compares the first element of each.
+- **`.k` holding its value in event or link scope is that scope's set.** The reference reads the first element.
+- **`.k` held in no scope matches no comparison, `!=` included**; an `event.` or `link.` set with no element
+  holding the key satisfies `!=`.
+- **Arithmetic over event, link and unscoped operands ranges over their elements**: every combination of one
+  element from each operand, any combination for `=` and the ordered operators, every one for `!=`. The reference
+  computes once, from the first element of each.
+- **`!F` over an event, link or unscoped attribute is each element's negation**, compared the same way, except that
+  `!=` needs the set to hold the key: a span holding it in no element does not match.
+- **A comparison holds at most two event, link or unscoped operands**; more are refused with a `400`. The reference
+  has no such limit.
+
+Read from the reference's source, not measured against it.
