@@ -798,6 +798,7 @@ docs/query-to-sql.md	logql/charge.rs:1296	no_name_the_target_file_holds
 docs/query-to-sql.md	logql/error.rs:809-815	no_name_the_target_file_holds
 docs/query-to-sql.md	logql/params.rs:121	no_name_the_target_file_holds
 docs/query-to-sql.md	logql/pipeline.rs:1266	no_name_the_target_file_holds
+docs/query-to-sql.md	logql/predicate.rs:1939	no_name_the_target_file_holds
 docs/query-to-sql.md	logql/predicate.rs:501	no_name_the_target_file_holds
 docs/query-to-sql.md	logql/predicate.rs:501-520	no_name_the_target_file_holds
 docs/query-to-sql.md	logql/predicate.rs:522	no_name_the_target_file_holds
@@ -844,7 +845,6 @@ docs/query-to-sql.md	plan.rs:1743	ambiguous_basename
 docs/query-to-sql.md	plan.rs:2695	ambiguous_basename
 docs/query-to-sql.md	plan.rs:3750	ambiguous_basename
 docs/query-to-sql.md	plan.rs:3779	ambiguous_basename
-docs/query-to-sql.md	predicate.rs:1939	no_name_the_target_file_holds
 docs/query-to-sql.md	pulsus-config/src/model.rs:510	no_name_the_target_file_holds
 docs/query-to-sql.md	pulsus-config/src/model.rs:685	no_name_the_target_file_holds
 docs/query-to-sql.md	pulsus-logql/src/limits.rs:96	no_name_the_target_file_holds

@@ -16,7 +16,9 @@
 //! `trace:id`, `instrumentation:name`, `instrumentation:version`,
 //! `duration`, `status` and `kind`, resource attributes, and
 //! `resource.service.name` — its string from the span row, every other arm
-//! from the resource row ([`field_terms`]); and `&&`, `||` and `!`. Every
+//! from the resource row ([`field_terms`]); arithmetic over those fields
+//! and literals ([`Compiler::arith_tuple`]), a literal-only side folded
+//! ([`fold`]), and a boolean-valued side; and `&&`, `||` and `!`. Every
 //! other field and construct is [`PlanError::UnsupportedField`] naming
 //! itself and the issue that serves it. The arms are exhaustive with no
 //! wildcard, so a new `Intrinsic` or `AttrScope` variant fails to compile
@@ -42,8 +44,9 @@
 //! * **A decimal integer literal does not go through `f64`.** `f64` loses
 //!   integer exactness from `2^53` up, and all six comparison operators
 //!   then answer differently; `maxInt` through `parse_num`/`render_num` is
-//!   `9223372036854776000`, which ClickHouse types `UInt64`. [`render_number`]
-//!   is where that is decided.
+//!   `9223372036854776000`, which ClickHouse types `UInt64`. An integer
+//!   literal is exact from −2^127 to 2^128 − 1 and refused outside it.
+//!   [`render_number`] and [`fold`] are where that is decided.
 //! * **A resource negation is `NOT` outside the subquery, never inside
 //!   it.** `NOT (R(p))` and `R(NOT p)` disagree for a span whose resource
 //!   row is not visible; outside keeps `{ resource.k != v }` the exact
@@ -60,7 +63,8 @@ use std::fmt::Write as _;
 
 use pulsus_clickhouse::json_column::escape_json_path;
 use pulsus_traceql::{
-    AttrScope, BoolOp, ComparisonOp, Duration, Field, FieldExpr, FieldOp, Intrinsic, UnaryOp, Value,
+    ArithOp, AttrScope, BoolOp, ComparisonOp, Duration, Field, FieldExpr, FieldOp, Intrinsic,
+    UnaryOp, Value,
 };
 
 use crate::logql::escape;
@@ -206,7 +210,6 @@ pub fn span_membership_sql(spans_table: &str, w: WindowSql, p: &SpanPredicate) -
 // ---------------------------------------------------------------------
 
 /// The issue each deferred construct is served by.
-const PART_3C: &str = "#589 part 3c";
 const PART_3D: &str = "#589 part 3d";
 const NESTED_AND_TRACE: &str = "#594";
 
@@ -222,10 +225,6 @@ fn unsupported_intrinsic(intrinsic: Intrinsic, target: &str) -> PlanError {
     unsupported(&format!("{intrinsic}"), target)
 }
 
-fn unsupported_arithmetic() -> PlanError {
-    unsupported("arithmetic in a span-scope predicate", PART_3C)
-}
-
 /// A `resource.` or `.` field compiled with no [`PredicateCtx`]: both
 /// read the resource table through a subquery bounded by the window.
 fn needs_window(scope: AttrScope) -> PlanError {
@@ -234,6 +233,31 @@ fn needs_window(scope: AttrScope) -> PlanError {
          compile_span_predicate_in (issue #589)"
     ))
 }
+
+/// Arithmetic as the whole filter, or under `!`. The validator rejects it
+/// first; this keeps the AST path total.
+fn not_a_predicate() -> PlanError {
+    PlanError::TypeMismatch("an arithmetic expression is not a predicate".to_string())
+}
+
+/// A boolean-valued node as an operand of arithmetic. The validator
+/// rejects it first.
+fn not_an_operand() -> PlanError {
+    PlanError::TypeMismatch("a boolean-valued expression is not an arithmetic operand".to_string())
+}
+
+/// An integer literal outside −2^127…2^128 − 1, named with its sign
+/// (decision 4 of the part-3c design, owner, 2026-10-06).
+fn out_of_range(literal: &str) -> PlanError {
+    PlanError::TypeMismatch(format!("integer literal out of range: {literal}"))
+}
+
+/// The most arithmetic nodes — binary operators and unary minus, after
+/// folding — one predicate may hold. 64 nested `^` over 65 resource
+/// operands render about 146,300 bytes and 30,200 syntax-tree elements,
+/// inside the server's defaults; past about 165 nested nodes the server's
+/// `max_ast_depth` of 1,000 refuses the statement.
+const MAX_ARITH_NODES: usize = 64;
 
 /// Whether `expr` is an arithmetic node — a binary arithmetic operator or
 /// the unary minus, which is the same construct spelled as a prefix.
@@ -305,6 +329,9 @@ struct Compiler<'a> {
     uses_resources: bool,
     /// `(condition, message)` pairs in pre-order, each once.
     demands: Vec<(String, String)>,
+    /// The arithmetic nodes emitted so far, across the whole predicate,
+    /// for [`MAX_ARITH_NODES`].
+    arith_nodes: usize,
 }
 
 impl<'a> Compiler<'a> {
@@ -313,6 +340,7 @@ impl<'a> Compiler<'a> {
             ctx,
             uses_resources: false,
             demands: Vec::new(),
+            arith_nodes: 0,
         }
     }
 
@@ -392,37 +420,7 @@ impl<'a> Compiler<'a> {
                 op: FieldOp::Cmp(op),
                 lhs,
                 rhs,
-            } => {
-                if is_arithmetic(lhs) || is_arithmetic(rhs) {
-                    return Err(unsupported_arithmetic());
-                }
-                if let (Some(field), FieldExpr::Literal(value)) = (not_of_field(lhs), rhs.as_ref())
-                {
-                    return self.not_field(field, bool_want(*op, value));
-                }
-                if let (FieldExpr::Literal(value), Some(field)) = (lhs.as_ref(), not_of_field(rhs))
-                {
-                    return self.not_field(field, bool_want(flip_comparison(*op), value));
-                }
-                match (lhs.as_ref(), rhs.as_ref()) {
-                    (FieldExpr::Field(field), FieldExpr::Literal(value)) => {
-                        self.leaf(field, *op, value)
-                    }
-                    (FieldExpr::Literal(value), FieldExpr::Field(field)) => {
-                        self.leaf(field, flip_comparison(*op), value)
-                    }
-                    (FieldExpr::Field(lhs_field), FieldExpr::Field(rhs_field)) => {
-                        self.field_compare(lhs_field, *op, rhs_field)
-                    }
-                    (FieldExpr::Literal(_), FieldExpr::Literal(_)) => {
-                        Err(unsupported("a comparison between two literals", PART_3C))
-                    }
-                    _ => Err(unsupported(
-                        "a comparison with a boolean-valued side other than `(!field) op literal`",
-                        PART_3C,
-                    )),
-                }
-            }
+            } => self.compare(lhs, *op, rhs),
             FieldExpr::Binary {
                 op: FieldOp::Bool(op),
                 lhs,
@@ -441,13 +439,13 @@ impl<'a> Compiler<'a> {
             }
             | FieldExpr::Unary {
                 op: UnaryOp::Neg, ..
-            } => Err(unsupported_arithmetic()),
+            } => Err(not_a_predicate()),
             FieldExpr::Unary {
                 op: UnaryOp::Not,
                 expr: inner,
             } => match inner.as_ref() {
                 FieldExpr::Field(field) => self.not_field(field, Some(false)),
-                e if is_arithmetic(e) => Err(unsupported_arithmetic()),
+                e if is_arithmetic(e) => Err(not_a_predicate()),
                 // Two-valued: every leaf this compiler emits is non-`NULL`,
                 // so a span lacking the key matches `NOT (E)`.
                 e => Ok(format!("NOT ({})", self.render_expr(e)?)),
@@ -738,53 +736,511 @@ impl<'a> Compiler<'a> {
         Ok(if negated { format!("NOT {x}") } else { x })
     }
 
-    /// `L op R`, both sides fields. The regex operators are refused
-    /// first, then each operand in turn, left before right; what remains
-    /// is [`field_terms`] over the two operands' arms.
+    /// `L op R`, in the order of the part-3c design's section 5.1: the
+    /// first rule that applies decides.
     ///
-    /// An operand read from the resource row is bound once: the body is a
-    /// lambda over `r1` (left) or `r2` (right), applied to a one-element
-    /// array holding the looked-up value, so every arm reads the variable
-    /// rather than repeating the lookup.
-    fn field_compare(
+    /// 0. an integer literal out of range anywhere in either side is
+    ///    refused;
+    /// 1. `(!field) op literal` is [`Compiler::not_field`];
+    /// 2. a lone field against a plain literal is the leaf;
+    /// 3. a lone attribute against a literal-only side that folds to a
+    ///    constant is the leaf over that constant;
+    /// 4. a deferred operand is refused, pre-order, left side first — after
+    ///    the regex operators when both sides are lone fields, which is
+    ///    part 3a's order;
+    /// 5. a literal-only subtree that folds to no value makes it `false`;
+    /// 6. a regex operator takes two string literals and nothing else;
+    /// 7. otherwise each side's arms ([`Compiler::side_arms`]) through
+    ///    [`field_terms`], bound once each.
+    ///
+    /// An operand read from the resource row, and an arithmetic side, is
+    /// bound once: the body is a lambda over its variable, applied to a
+    /// one-element array holding the value, so every arm reads the
+    /// variable rather than repeating the text.
+    fn compare(
         &mut self,
-        lhs: &Field,
+        lhs: &FieldExpr,
         op: ComparisonOp,
-        rhs: &Field,
+        rhs: &FieldExpr,
     ) -> Result<String, PlanError> {
-        if matches!(op, ComparisonOp::Re | ComparisonOp::Nre) {
+        check_literals(lhs)?;
+        check_literals(rhs)?;
+        if let (Some(field), FieldExpr::Literal(value)) = (not_of_field(lhs), rhs) {
+            return self.not_field(field, bool_want(op, value));
+        }
+        if let (FieldExpr::Literal(value), Some(field)) = (lhs, not_of_field(rhs)) {
+            return self.not_field(field, bool_want(flip_comparison(op), value));
+        }
+        match (lhs, rhs) {
+            (FieldExpr::Field(field), FieldExpr::Literal(value)) => {
+                return self.leaf(field, op, value);
+            }
+            (FieldExpr::Literal(value), FieldExpr::Field(field)) => {
+                return self.leaf(field, flip_comparison(op), value);
+            }
+            _ => {}
+        }
+        if let FieldExpr::Field(field @ Field::Attribute { .. }) = lhs
+            && let Some(value) = fold(rhs)?.constant()
+        {
+            return self.leaf(field, op, &value);
+        }
+        if let FieldExpr::Field(field @ Field::Attribute { .. }) = rhs
+            && let Some(value) = fold(lhs)?.constant()
+        {
+            return self.leaf(field, flip_comparison(op), &value);
+        }
+        let regex = matches!(op, ComparisonOp::Re | ComparisonOp::Nre);
+        let two_fields = matches!((lhs, rhs), (FieldExpr::Field(_), FieldExpr::Field(_)));
+        if two_fields && regex {
             return Err(PlanError::TypeMismatch(
                 "a field-against-field comparison does not support regex operators".to_string(),
             ));
         }
-        let l = self.operand_arms(lhs, "r1")?;
-        let r = self.operand_arms(rhs, "r2")?;
+        let construct = if two_fields {
+            "a field-against-field comparison"
+        } else {
+            "an expression"
+        };
+        self.refuse_deferred(lhs, construct, false)?;
+        self.refuse_deferred(rhs, construct, false)?;
+        if fold(lhs)? == Folded::Undefined || fold(rhs)? == Folded::Undefined {
+            return Ok("false".to_string());
+        }
+        if regex {
+            return match (lhs, rhs) {
+                (FieldExpr::Literal(Value::String(l)), FieldExpr::Literal(Value::String(r))) => {
+                    string_column_text(&escape::ch_string(l), op, r)
+                }
+                (FieldExpr::Literal(_), _) | (_, FieldExpr::Literal(_)) => {
+                    Err(PlanError::TypeMismatch(
+                        "a regex operator against a static operand is not supported".to_string(),
+                    ))
+                }
+                _ => Err(PlanError::TypeMismatch(
+                    "a regex operator compares a field with a string literal".to_string(),
+                )),
+            };
+        }
+        let mut fields = 0usize;
+        let Some(l) = self.side_arms(lhs, 1, &mut fields, construct)? else {
+            return Ok("false".to_string());
+        };
+        let Some(r) = self.side_arms(rhs, 2, &mut fields, construct)? else {
+            return Ok("false".to_string());
+        };
         let body = field_terms(&l, op, &r);
         if body == "false" {
             return Ok(body);
         }
-        Ok(match (&l.bind, &r.bind) {
-            (None, None) => body,
-            (Some((v, value)), None) | (None, Some((v, value))) => {
-                format!("arrayExists({v} -> {body}, [{value}])")
-            }
-            (Some((lv, lvalue)), Some((rv, rvalue))) => {
-                format!("arrayExists(({lv}, {rv}) -> {body}, [{lvalue}], [{rvalue}])")
+        let binds: Vec<&(String, String)> = l.binds.iter().chain(&r.binds).collect();
+        Ok(match binds.as_slice() {
+            [] => body,
+            [(v, value)] => format!("arrayExists({v} -> {body}, [{value}])"),
+            many => {
+                let vars: Vec<&str> = many.iter().map(|(v, _)| v.as_str()).collect();
+                let values: Vec<String> =
+                    many.iter().map(|(_, value)| format!("[{value}]")).collect();
+                format!(
+                    "arrayExists(({}) -> {body}, {})",
+                    vars.join(", "),
+                    values.join(", ")
+                )
             }
         })
     }
 
-    /// One operand's arms: a typed read per class it can hold. `var` is
-    /// the lambda variable a resource-row operand is bound to. **No
-    /// wildcard arm**, so a new `Intrinsic` or `AttrScope` variant fails to
-    /// compile here until it is classified.
-    fn operand_arms(&mut self, field: &Field, var: &'static str) -> Result<Arms, PlanError> {
-        let unsupported_operand = |what: String| {
-            unsupported(
-                &format!("a field-against-field comparison with {what}"),
-                PART_3D,
-            )
+    /// Section 5.1's row 4: the first operand of `expr` this part does not
+    /// serve, pre-order, refused. A boolean-valued node is a comparison of
+    /// its own, rendered — and refused — by [`Compiler::render_expr`],
+    /// except inside arithmetic, where it is not an operand.
+    fn refuse_deferred(
+        &self,
+        expr: &FieldExpr,
+        construct: &str,
+        in_arithmetic: bool,
+    ) -> Result<(), PlanError> {
+        match expr {
+            FieldExpr::Field(field) => self.refuse_field(field, construct),
+            FieldExpr::Literal(_) => Ok(()),
+            FieldExpr::Binary {
+                op: FieldOp::Arith(_),
+                lhs,
+                rhs,
+            } => {
+                self.refuse_deferred(lhs, construct, true)?;
+                self.refuse_deferred(rhs, construct, true)
+            }
+            FieldExpr::Unary {
+                op: UnaryOp::Neg,
+                expr: inner,
+            } => self.refuse_deferred(inner, construct, true),
+            _ if in_arithmetic => Err(not_an_operand()),
+            FieldExpr::Unary {
+                op: UnaryOp::Not,
+                expr: inner,
+            } => match inner.as_ref() {
+                FieldExpr::Field(field) => self.refuse_field(field, construct),
+                _ => Ok(()),
+            },
+            FieldExpr::Binary {
+                op: FieldOp::Cmp(_) | FieldOp::Bool(_),
+                ..
+            }
+            | FieldExpr::Exists { .. } => Ok(()),
+        }
+    }
+
+    /// One operand's refusal, if this part does not serve it. **No
+    /// wildcard arm**.
+    fn refuse_field(&self, field: &Field, construct: &str) -> Result<(), PlanError> {
+        match field {
+            Field::Attribute { scope, .. } => match scope {
+                AttrScope::Span | AttrScope::Instrumentation => Ok(()),
+                AttrScope::Resource => self
+                    .ctx
+                    .map(|_| ())
+                    .ok_or_else(|| needs_window(AttrScope::Resource)),
+                AttrScope::Event | AttrScope::Link | AttrScope::Unscoped => Err(unsupported(
+                    &format!("{construct} with a \"{scope}\" operand"),
+                    PART_3D,
+                )),
+            },
+            Field::Intrinsic(intrinsic) => match intrinsic {
+                Intrinsic::Name
+                | Intrinsic::StatusMessage
+                | Intrinsic::SpanId
+                | Intrinsic::ParentId
+                | Intrinsic::TraceId
+                | Intrinsic::InstrumentationName
+                | Intrinsic::InstrumentationVersion
+                | Intrinsic::Duration
+                | Intrinsic::Status
+                | Intrinsic::Kind => Ok(()),
+                Intrinsic::EventName
+                | Intrinsic::EventTimeSinceStart
+                | Intrinsic::LinkSpanId
+                | Intrinsic::LinkTraceId => Err(unsupported(
+                    &format!("{construct} with {intrinsic}"),
+                    PART_3D,
+                )),
+                Intrinsic::NestedSetParent
+                | Intrinsic::NestedSetLeft
+                | Intrinsic::NestedSetRight
+                | Intrinsic::ChildCount
+                | Intrinsic::TraceDuration
+                | Intrinsic::RootName
+                | Intrinsic::RootServiceName => {
+                    Err(unsupported_intrinsic(*intrinsic, NESTED_AND_TRACE))
+                }
+            },
+        }
+    }
+
+    /// One side's arms (the part-3c design's section 5.2), or `None` when
+    /// the side has no value on any span, so the comparison is `false`.
+    ///
+    /// `n` is the side, 1 left and 2 right, which names an arithmetic
+    /// side's variable `a<n>`; `fields` counts the field operands outside
+    /// arithmetic so far, which names a resource operand's `r<n>`.
+    fn side_arms(
+        &mut self,
+        side: &FieldExpr,
+        n: usize,
+        fields: &mut usize,
+        construct: &str,
+    ) -> Result<Option<Arms>, PlanError> {
+        match side {
+            FieldExpr::Field(field) => {
+                *fields += 1;
+                self.operand_arms(field, format!("r{fields}"), construct)
+                    .map(Some)
+            }
+            FieldExpr::Literal(value) => literal_arms(value).map(Some),
+            FieldExpr::Binary {
+                op: FieldOp::Arith(_),
+                ..
+            }
+            | FieldExpr::Unary {
+                op: UnaryOp::Neg, ..
+            } => {
+                if let Some(arms) = fold(side)?.constant_arms() {
+                    return Ok(Some(arms));
+                }
+                let Some(tuple) = self.arith_tuple(side)? else {
+                    return Ok(None);
+                };
+                let var = format!("a{n}");
+                Ok(Some(Arms {
+                    i: Some(format!("tupleElement({var}, 1)")),
+                    f: Some(format!("tupleElement({var}, 2)")),
+                    nullable: true,
+                    binds: vec![(var, tuple.text)],
+                    ..Arms::default()
+                }))
+            }
+            FieldExpr::Unary {
+                op: UnaryOp::Not,
+                expr: inner,
+            } if matches!(inner.as_ref(), FieldExpr::Field(_)) => {
+                let FieldExpr::Field(field) = inner.as_ref() else {
+                    unreachable!("matched as a field above")
+                };
+                *fields += 1;
+                self.not_operand(field, format!("r{fields}"), construct)
+                    .map(Some)
+            }
+            FieldExpr::Unary {
+                op: UnaryOp::Not, ..
+            }
+            | FieldExpr::Binary {
+                op: FieldOp::Cmp(_) | FieldOp::Bool(_),
+                ..
+            }
+            | FieldExpr::Exists { .. } => {
+                // Two-valued, as every predicate this compiler emits: a
+                // span lacking the operand compares as `false`.
+                let b = self.render_expr(side)?;
+                Ok(Some(Arms {
+                    b: Some(format!("({b})")),
+                    ..Arms::default()
+                }))
+            }
+        }
+    }
+
+    /// `!field` as a side: its boolean arm, `NULL` where the value is not
+    /// a boolean, with `not_field`'s demand that a present non-boolean
+    /// fails the statement.
+    fn not_operand(
+        &mut self,
+        field: &Field,
+        var: String,
+        construct: &str,
+    ) -> Result<Arms, PlanError> {
+        let (scope, key) = match field {
+            Field::Intrinsic(intrinsic) => {
+                return Err(PlanError::TypeMismatch(format!(
+                    "expression (!{intrinsic}) expected a boolean"
+                )));
+            }
+            Field::Attribute { scope, key } => (*scope, key),
         };
+        let arms = match scope {
+            AttrScope::Span | AttrScope::Instrumentation => {
+                let root = if scope == AttrScope::Span {
+                    ATTRS
+                } else {
+                    SCOPE_ATTRS
+                };
+                Arms {
+                    b: Some(format!(
+                        "(NOT {}{})",
+                        attr_path(root, key),
+                        Read::Bool.suffix()
+                    )),
+                    nullable: true,
+                    ..Arms::default()
+                }
+            }
+            AttrScope::Resource if key == SERVICE_NAME => {
+                self.ctx.ok_or_else(|| needs_window(AttrScope::Resource))?;
+                Arms {
+                    b: Some("if(service_type = 'bool', service = 'false', NULL)".to_string()),
+                    nullable: true,
+                    ..Arms::default()
+                }
+            }
+            AttrScope::Resource => {
+                let q = self.resource_read(key)?;
+                Arms {
+                    b: Some(format!("(NOT dynamicElement({var}, 'Bool'))")),
+                    nullable: true,
+                    types: Some(format!("tupleElement({q}, 3)")),
+                    binds: vec![(var, resource_value(&q))],
+                    ..Arms::default()
+                }
+            }
+            AttrScope::Event | AttrScope::Link | AttrScope::Unscoped => {
+                return Err(unsupported(
+                    &format!("{construct} with a \"{scope}\" operand"),
+                    PART_3D,
+                ));
+            }
+        };
+        let (_, condition) = self.not_parts(scope, key, None)?;
+        self.demand(
+            condition,
+            format!("expression (!{scope}{key}) expected a boolean"),
+        );
+        Ok(arms)
+    }
+
+    /// One arithmetic value as a `(Nullable(Int256), Nullable(Float64))`
+    /// tuple, at most one element non-`NULL` (the part-3c design's section
+    /// 5.3); `None` when it has no value on any span. A subtree that folds
+    /// to a constant is that constant and is not a node. Each node is
+    /// counted, across the predicate, for [`MAX_ARITH_NODES`].
+    ///
+    /// A binary node binds its two children's tuples to `pl` and `pr` once
+    /// each, so a node's text holds each child's text once and the
+    /// statement grows linearly with the tree.
+    fn arith_tuple(&mut self, expr: &FieldExpr) -> Result<Option<Tuple>, PlanError> {
+        match fold(expr)? {
+            Folded::Int(v) => return Ok(Some(Tuple::int(int_text(v), false))),
+            Folded::Dur(v) => return Ok(Some(Tuple::int(int_text(v), true))),
+            Folded::U128(v) => return Ok(Some(Tuple::int(u128_text(v), false))),
+            Folded::Float(x) => {
+                return Ok(Some(Tuple {
+                    text: format!("tuple({NULL_INT}, {})", float_text(x)),
+                    dur: false,
+                }));
+            }
+            Folded::Undefined => return Ok(None),
+            Folded::No => {}
+        }
+        match expr {
+            FieldExpr::Binary {
+                op: FieldOp::Arith(op),
+                lhs,
+                rhs,
+            } => {
+                self.count_arith_node()?;
+                let Some(l) = self.arith_tuple(lhs)? else {
+                    return Ok(None);
+                };
+                let Some(r) = self.arith_tuple(rhs)? else {
+                    return Ok(None);
+                };
+                Ok(Some(binary_node(*op, &l, &r)))
+            }
+            FieldExpr::Unary {
+                op: UnaryOp::Neg,
+                expr: inner,
+            } => {
+                self.count_arith_node()?;
+                let Some(x) = self.arith_tuple(inner)? else {
+                    return Ok(None);
+                };
+                Ok(Some(Tuple {
+                    text: format!(
+                        "arrayElement(arrayMap(pl -> tuple({}, negate({L2})), [{}]), 1)",
+                        neg_int(L1),
+                        x.text
+                    ),
+                    dur: x.dur,
+                }))
+            }
+            FieldExpr::Field(field) => self.arith_leaf(field),
+            // A string, boolean, status or kind literal has no number.
+            FieldExpr::Literal(_) => Ok(None),
+            FieldExpr::Unary {
+                op: UnaryOp::Not, ..
+            }
+            | FieldExpr::Binary {
+                op: FieldOp::Cmp(_) | FieldOp::Bool(_),
+                ..
+            }
+            | FieldExpr::Exists { .. } => Err(not_an_operand()),
+        }
+    }
+
+    fn count_arith_node(&mut self) -> Result<(), PlanError> {
+        self.arith_nodes += 1;
+        if self.arith_nodes > MAX_ARITH_NODES {
+            return Err(PlanError::UnsupportedField(format!(
+                "an arithmetic expression of more than {MAX_ARITH_NODES} operations is not \
+                 supported"
+            )));
+        }
+        Ok(())
+    }
+
+    /// A field as an arithmetic leaf: its integer read widened to `Int256`
+    /// and its float read. **No wildcard arm**.
+    fn arith_leaf(&mut self, field: &Field) -> Result<Option<Tuple>, PlanError> {
+        let attribute = |root: &str, key: &str| {
+            let path = attr_path(root, key);
+            Some(Tuple {
+                text: format!(
+                    "tuple(toInt256({path}{}), {path}{})",
+                    Read::Int.suffix(),
+                    Read::Float.suffix()
+                ),
+                dur: false,
+            })
+        };
+        let intrinsic = match field {
+            Field::Attribute { scope, key } => {
+                return match scope {
+                    AttrScope::Span => Ok(attribute(ATTRS, key)),
+                    AttrScope::Instrumentation => Ok(attribute(SCOPE_ATTRS, key)),
+                    // `resource.service.name`'s numeric arms are on the
+                    // resource row, as every other resource key's are.
+                    AttrScope::Resource => {
+                        let q = self.resource_read(key)?;
+                        Ok(Some(Tuple {
+                            text: format!(
+                                "arrayElement(arrayMap(pv -> tuple(toInt256(dynamicElement(pv, \
+                                 'Int64')), dynamicElement(pv, 'Float64')), [{}]), 1)",
+                                resource_value(&q)
+                            ),
+                            dur: false,
+                        }))
+                    }
+                    AttrScope::Event | AttrScope::Link | AttrScope::Unscoped => Err(unsupported(
+                        &format!("an expression with a \"{scope}\" operand"),
+                        PART_3D,
+                    )),
+                };
+            }
+            Field::Intrinsic(intrinsic) => *intrinsic,
+        };
+        match intrinsic {
+            Intrinsic::Duration => Ok(Some(Tuple {
+                text: format!("tuple(toInt256(duration_ns), {NULL_FLOAT})"),
+                dur: true,
+            })),
+            // Not a number on any span.
+            Intrinsic::Name
+            | Intrinsic::StatusMessage
+            | Intrinsic::SpanId
+            | Intrinsic::ParentId
+            | Intrinsic::TraceId
+            | Intrinsic::InstrumentationName
+            | Intrinsic::InstrumentationVersion
+            | Intrinsic::Status
+            | Intrinsic::Kind => Ok(None),
+            Intrinsic::EventName
+            | Intrinsic::EventTimeSinceStart
+            | Intrinsic::LinkSpanId
+            | Intrinsic::LinkTraceId => Err(unsupported(
+                &format!("an expression with {intrinsic}"),
+                PART_3D,
+            )),
+            Intrinsic::NestedSetParent
+            | Intrinsic::NestedSetLeft
+            | Intrinsic::NestedSetRight
+            | Intrinsic::ChildCount
+            | Intrinsic::TraceDuration
+            | Intrinsic::RootName
+            | Intrinsic::RootServiceName => Err(unsupported_intrinsic(intrinsic, NESTED_AND_TRACE)),
+        }
+    }
+
+    /// One operand's arms: a typed read per class it can hold. `var` is
+    /// the lambda variable a resource-row operand is bound to, and
+    /// `construct` names the comparison in a refusal. **No wildcard arm**,
+    /// so a new `Intrinsic` or `AttrScope` variant fails to compile here
+    /// until it is classified.
+    fn operand_arms(
+        &mut self,
+        field: &Field,
+        var: String,
+        construct: &str,
+    ) -> Result<Arms, PlanError> {
+        let unsupported_operand =
+            |what: String| unsupported(&format!("{construct} with {what}"), PART_3D);
         let intrinsic = match field {
             Field::Attribute { scope, key } => {
                 return match scope {
@@ -798,12 +1254,12 @@ impl<'a> Compiler<'a> {
                         Ok(Arms {
                             s: Some(format!("if({SERVICE_IS_STRING}, service, NULL)")),
                             s_on_span_row: true,
-                            ..Arms::resource(var, &q)
+                            ..Arms::resource(&var, &q)
                         })
                     }
                     AttrScope::Resource => {
                         let q = self.resource_read(key)?;
-                        Ok(Arms::resource(var, &q))
+                        Ok(Arms::resource(&var, &q))
                     }
                     AttrScope::Event | AttrScope::Link | AttrScope::Unscoped => {
                         Err(unsupported_operand(format!("a \"{scope}\" operand")))
@@ -1074,9 +1530,10 @@ impl Class {
 ///
 /// A resource-row operand also carries `types`, the text of the set of
 /// types its key is stored as in the window (`tupleElement(Q(k), 3)`),
-/// which gates each arm, and `bind`, the lambda variable and the looked-up
-/// value it is bound to. `s_on_span_row` marks `resource.service.name`,
-/// whose string arm is read from the span row and so is not gated.
+/// which gates each arm. `binds` holds the lambda variable and the value it
+/// is bound to, for a resource-row operand and an arithmetic side.
+/// `s_on_span_row` marks `resource.service.name`, whose string arm is read
+/// from the span row and so is not gated.
 #[derive(Debug, Default)]
 struct Arms {
     s: Option<String>,
@@ -1092,7 +1549,7 @@ struct Arms {
     nullable: bool,
     types: Option<String>,
     s_on_span_row: bool,
-    bind: Option<(&'static str, String)>,
+    binds: Vec<(String, String)>,
 }
 
 impl Arms {
@@ -1115,7 +1572,7 @@ impl Arms {
             nullable: true,
             types: None,
             s_on_span_row: false,
-            bind: None,
+            binds: Vec::new(),
         }
     }
 
@@ -1123,7 +1580,7 @@ impl Arms {
     /// from the value bound to `var`, which is the value at the span's own
     /// `resource_id` — `NULL` when the span's resource row is not among
     /// `q`'s, so every arm is `NULL` then.
-    fn resource(var: &'static str, q: &str) -> Arms {
+    fn resource(var: &str, q: &str) -> Arms {
         let read = |r: Read| Some(format!("dynamicElement({var}, '{}')", r.type_name()));
         Arms {
             s: read(Read::Str),
@@ -1139,13 +1596,7 @@ impl Arms {
             nullable: true,
             types: Some(format!("tupleElement({q}, 3)")),
             s_on_span_row: false,
-            bind: Some((
-                var,
-                format!(
-                    "arrayElement(tupleElement({q}, 2), transform(resource_id, \
-                     tupleElement({q}, 1), arrayEnumerate(tupleElement({q}, 1)), 0))"
-                ),
-            )),
+            binds: vec![(var.to_string(), resource_value(q))],
         }
     }
 
@@ -1188,6 +1639,15 @@ impl Arms {
             Class::Status | Class::Kind => None,
         }
     }
+}
+
+/// `V(k)`: the value of the lookup `q` (`Q(k)`) at the span's own
+/// `resource_id`, `NULL` when the span's resource row is not among `q`'s.
+fn resource_value(q: &str) -> String {
+    format!(
+        "arrayElement(tupleElement({q}, 2), transform(resource_id, tupleElement({q}, 1), \
+         arrayEnumerate(tupleElement({q}, 1)), 0))"
+    )
 }
 
 /// The scalar pairs, in the order their terms are emitted.
@@ -1339,6 +1799,409 @@ fn field_terms(l: &Arms, op: ComparisonOp, r: &Arms) -> String {
 }
 
 // ---------------------------------------------------------------------
+// arithmetic, folding and the literal-only side
+// ---------------------------------------------------------------------
+
+/// `NI` and `NF`: the typed `NULL`s of an arithmetic tuple's two elements.
+const NULL_INT: &str = "CAST(NULL, 'Nullable(Int256)')";
+const NULL_FLOAT: &str = "CAST(NULL, 'Nullable(Float64)')";
+
+/// The two children of a binary node, bound to `pl` and `pr`: `l1`/`r1`
+/// the integer elements, `l2`/`r2` the float elements.
+const L1: &str = "tupleElement(pl, 1)";
+const L2: &str = "tupleElement(pl, 2)";
+const R1: &str = "tupleElement(pr, 1)";
+const R2: &str = "tupleElement(pr, 2)";
+
+/// One arithmetic value's tuple text, and whether a duration is in it —
+/// which makes `/` a float division.
+struct Tuple {
+    text: String,
+    dur: bool,
+}
+
+impl Tuple {
+    /// An integer constant, `digits` its `I(v)`.
+    fn int(digits: String, dur: bool) -> Tuple {
+        Tuple {
+            text: format!("tuple(toInt256({digits}), {NULL_FLOAT})"),
+            dur,
+        }
+    }
+}
+
+/// `NEG(x)`: `-x` in `Int256`, with no value for the type's minimum — the
+/// only value that is its own negation.
+fn neg_int(x: &str) -> String {
+    format!("if({x} != 0 AND negate({x}) = {x}, NULL, negate({x}))")
+}
+
+/// `l op r` over two tuples: `arrayElement(arrayMap((pl, pr) ->
+/// tuple(<I>, <F>), [L], [R]), 1)`. The float element is computed only
+/// when either side is a float (`H`), so an all-integer node never also
+/// carries a float result.
+fn binary_node(op: ArithOp, l: &Tuple, r: &Tuple) -> Tuple {
+    let dur = l.dur || r.dur;
+    let fl = format!("coalesce({L2}, toFloat64({L1}))");
+    let fr = format!("coalesce({R2}, toFloat64({R1}))");
+    let only_ints = format!("{L2} IS NULL AND {R2} IS NULL");
+    let float = |sym: &str| format!("if({only_ints}, NULL, {fl} {sym} {fr})");
+    let (int, float) = match op {
+        ArithOp::Add => (widen(op), float("+")),
+        ArithOp::Sub => (widen(op), float("-")),
+        ArithOp::Mul => (widen(op), float("*")),
+        // The reference's duration arithmetic is float: `3ms / 2ms` is 1.5.
+        ArithOp::Div if dur => (NULL_INT.to_string(), format!("{fl} / {fr}")),
+        ArithOp::Div => (int_divisor(op), float("/")),
+        ArithOp::Mod => (int_divisor(op), float("%")),
+        ArithOp::Pow => (
+            int_pow(),
+            format!("if({only_ints} AND coalesce({R1} >= 0, false), NULL, pow({fl}, {fr}))"),
+        ),
+    };
+    Tuple {
+        text: format!(
+            "arrayElement(arrayMap((pl, pr) -> tuple({int}, {float}), [{}], [{}]), 1)",
+            l.text, r.text
+        ),
+        dur,
+    }
+}
+
+/// The integer element of `+`, `-` and `*`: exact in `Int256`, every
+/// integer leaf having been widened to it with `toInt256`, and no value
+/// for a result outside the type (decision 3 of the part-3c design: the
+/// standing rule, be correct wherever we can). `+` and `-` wrap only when
+/// the operands' signs say the result cannot have the sign it has. A
+/// wrapped `*` differs from the `Float64` product by at least 2^256, far
+/// beyond `1e-6` relative, while an exact one agrees within a few units in
+/// the last place.
+fn widen(op: ArithOp) -> String {
+    match op {
+        ArithOp::Add => format!(
+            "if(({L1} > 0 AND {R1} > 0 AND {L1} + {R1} <= 0) OR ({L1} < 0 AND {R1} < 0 AND \
+             {L1} + {R1} >= 0), NULL, {L1} + {R1})"
+        ),
+        ArithOp::Sub => format!(
+            "if(({L1} >= 0 AND {R1} < 0 AND {L1} - {R1} < 0) OR ({L1} < 0 AND {R1} > 0 AND \
+             {L1} - {R1} >= 0), NULL, {L1} - {R1})"
+        ),
+        ArithOp::Mul => format!(
+            "if(abs(toFloat64({L1} * {R1}) - toFloat64({L1}) * toFloat64({R1})) <= 1e-6 * \
+             abs(toFloat64({L1}) * toFloat64({R1})), {L1} * {R1}, NULL)"
+        ),
+        ArithOp::Div | ArithOp::Mod | ArithOp::Pow => {
+            unreachable!("widen serves + - * only")
+        }
+    }
+}
+
+/// The integer element of `/` (truncating, `intDiv`) and `%` (the
+/// dividend's sign). A zero divisor has no value, so the span does not
+/// match (decision 1 of the part-3c design, owner, 2026-10-06; the
+/// reference fails the query). `-1` is answered without dividing: the
+/// type's minimum divided by `-1` raises in the engine. The divisor that
+/// reaches `intDiv` or `%` is never 0 or `-1`, so no row can raise,
+/// whichever rows the engine evaluates.
+fn int_divisor(op: ArithOp) -> String {
+    let safe = format!("if({R1} = 0 OR {R1} = -1, 1, {R1})");
+    match op {
+        ArithOp::Div => format!(
+            "multiIf({R1} = 0, NULL, {R1} = -1, {}, intDiv({L1}, {safe}))",
+            neg_int(L1)
+        ),
+        ArithOp::Mod => format!("multiIf({R1} = 0, NULL, {R1} = -1, {L1} * 0, {L1} % {safe})"),
+        ArithOp::Add | ArithOp::Sub | ArithOp::Mul | ArithOp::Pow => {
+            unreachable!("int_divisor serves / and % only")
+        }
+    }
+}
+
+/// The integer element of `^`: exact, by squaring over the exponent's
+/// eight bits, in the written order (decision 2 of the part-3c design: the
+/// standing rule, be correct wherever we can; the reference computes it
+/// through `float64` with its operands swapped). A negative exponent has
+/// no integer value, and the float element gives `pow`. Past 255 only a
+/// base of 0, 1 or −1 stays inside `Int256`. A result outside the type
+/// differs from `pow` by far more than `1e-6` relative and has no value.
+/// `bitTest` takes the exponent through `toUInt8`: on an `Int256` it is
+/// refused, and in this branch the exponent is 0…255.
+fn int_pow() -> String {
+    let pf = format!("pow(toFloat64({L1}), toFloat64({R1}))");
+    let squaring = format!(
+        "tupleElement(arrayFold((pa, pk) -> (if(bitTest(toUInt8(assumeNotNull({R1})), pk), \
+         tupleElement(pa, 1) * tupleElement(pa, 2), tupleElement(pa, 1)), tupleElement(pa, 2) * \
+         tupleElement(pa, 2)), range(8), (toInt256(1), assumeNotNull({L1}))), 1)"
+    );
+    format!(
+        "if({L1} IS NULL OR {R1} IS NULL OR {R1} < 0, NULL, if({R1} >= 256, multiIf({L1} = 0, \
+         0, {L1} = 1, 1, {L1} = -1, if({R1} % 2 = 0, 1, -1), NULL), arrayElement(arrayMap(pq \
+         -> if(isFinite({pf}) AND abs(toFloat64(pq) - {pf}) <= 1e-6 * abs({pf}), pq, NULL), \
+         [{squaring}]), 1)))"
+    )
+}
+
+/// A literal-only subtree's value (the part-3c design's section 5.4).
+/// `Undefined` is an integer `/` or `%` by zero: no value, exactly where
+/// the tuple path answers none. `No` is a subtree that is not folded — it
+/// holds a field, or folding could differ from the tuple path — and is
+/// computed per span instead.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Folded {
+    Int(i128),
+    Dur(i128),
+    U128(u128),
+    Float(f64),
+    Undefined,
+    No,
+}
+
+impl Folded {
+    /// The literal a constant compares as through part 1's leaf.
+    fn constant(self) -> Option<Value> {
+        match self {
+            Folded::Int(v) | Folded::Dur(v) => Some(Value::Number(v.to_string())),
+            Folded::U128(v) => Some(Value::Number(v.to_string())),
+            Folded::Float(x) => Some(Value::Number(render_num(x))),
+            Folded::Undefined | Folded::No => None,
+        }
+    }
+
+    /// A constant's arms: `I(v)` or `F(x)`, never `NULL`.
+    fn constant_arms(self) -> Option<Arms> {
+        match self {
+            Folded::Int(v) | Folded::Dur(v) => Some(Arms {
+                i: Some(int_text(v)),
+                ..Arms::default()
+            }),
+            Folded::U128(v) => Some(Arms {
+                i: Some(u128_text(v)),
+                ..Arms::default()
+            }),
+            Folded::Float(x) => Some(Arms {
+                f: Some(float_text(x)),
+                ..Arms::default()
+            }),
+            Folded::Undefined | Folded::No => None,
+        }
+    }
+
+    fn as_f64(self) -> f64 {
+        match self {
+            Folded::Int(v) | Folded::Dur(v) => v as f64,
+            Folded::U128(v) => v as f64,
+            Folded::Float(x) => x,
+            Folded::Undefined | Folded::No => unreachable!("only constants convert"),
+        }
+    }
+}
+
+/// Whether `raw` is a `Number` of decimal digits and nothing else.
+fn is_digits(raw: &str) -> bool {
+    !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// A `Number` literal's value. Digits are exact up to 2^128 − 1 and
+/// refused past it (decision 4 of the part-3c design, owner, 2026-10-06);
+/// `-` and digits is `minInt`'s spelling; anything else is a float.
+fn number_literal(raw: &str) -> Result<Folded, PlanError> {
+    if is_digits(raw) {
+        let m: u128 = raw.parse().map_err(|_| out_of_range(raw))?;
+        return Ok(i128::try_from(m).map_or(Folded::U128(m), Folded::Int));
+    }
+    if raw.strip_prefix('-').is_some_and(is_digits) {
+        return raw
+            .parse::<i128>()
+            .map(Folded::Int)
+            .map_err(|_| out_of_range(raw));
+    }
+    Ok(Folded::Float(parse_num(raw)?))
+}
+
+/// `-` directly over a `Number` of digits: the lexer gives a literal's
+/// sign as a unary minus, so this is the signed literal, exact down to
+/// −2^127 and refused below it.
+fn signed_literal(digits: &str) -> Result<Folded, PlanError> {
+    let refused = || out_of_range(&format!("-{digits}"));
+    let m: u128 = digits.parse().map_err(|_| refused())?;
+    0i128
+        .checked_sub_unsigned(m)
+        .map(Folded::Int)
+        .ok_or_else(refused)
+}
+
+/// The digits under a unary minus, when it is a signed literal.
+fn negated_digits(expr: &FieldExpr) -> Option<&str> {
+    match expr {
+        FieldExpr::Unary {
+            op: UnaryOp::Neg,
+            expr: inner,
+        } => match inner.as_ref() {
+            FieldExpr::Literal(Value::Number(raw)) if is_digits(raw) => Some(raw),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Section 5.1's row 0: every integer literal anywhere in `expr`, read
+/// with its sign, is inside −2^127…2^128 − 1.
+fn check_literals(expr: &FieldExpr) -> Result<(), PlanError> {
+    if let Some(digits) = negated_digits(expr) {
+        return signed_literal(digits).map(|_| ());
+    }
+    match expr {
+        FieldExpr::Literal(Value::Number(raw)) => number_literal(raw).map(|_| ()),
+        FieldExpr::Unary { expr: inner, .. } => check_literals(inner),
+        FieldExpr::Binary { lhs, rhs, .. } => {
+            check_literals(lhs)?;
+            check_literals(rhs)
+        }
+        FieldExpr::Field(_) | FieldExpr::Literal(_) | FieldExpr::Exists { .. } => Ok(()),
+    }
+}
+
+/// Folds `expr` (the part-3c design's section 5.4). Integer steps are
+/// `i128` checked operations; one that overflows is `No`, and the tuple
+/// path computes it in `Int256`. A float result that is not finite is
+/// `No` too, as is a float `^`: the libraries' `pow` may differ in the last
+/// place.
+fn fold(expr: &FieldExpr) -> Result<Folded, PlanError> {
+    if let Some(digits) = negated_digits(expr) {
+        return signed_literal(digits);
+    }
+    Ok(match expr {
+        FieldExpr::Literal(Value::Number(raw)) => number_literal(raw)?,
+        FieldExpr::Literal(Value::Duration(d)) => Folded::Dur(i128::from(d.as_nanos())),
+        FieldExpr::Unary {
+            op: UnaryOp::Neg,
+            expr: inner,
+        } => match fold(inner)? {
+            Folded::Int(v) => v.checked_neg().map_or(Folded::No, Folded::Int),
+            Folded::Dur(v) => v.checked_neg().map_or(Folded::No, Folded::Dur),
+            Folded::Float(x) => Folded::Float(-x),
+            Folded::Undefined => Folded::Undefined,
+            Folded::U128(_) | Folded::No => Folded::No,
+        },
+        FieldExpr::Binary {
+            op: FieldOp::Arith(op),
+            lhs,
+            rhs,
+        } => fold_binary(*op, fold(lhs)?, fold(rhs)?),
+        _ => Folded::No,
+    })
+}
+
+fn fold_binary(op: ArithOp, l: Folded, r: Folded) -> Folded {
+    use Folded::{Dur, Float, Int, No, U128, Undefined};
+    match (l, r) {
+        (Undefined, _) | (_, Undefined) => Undefined,
+        (No | U128(_), _) | (_, No | U128(_)) => No,
+        (Float(_), _) | (_, Float(_)) => {
+            let (a, b) = (l.as_f64(), r.as_f64());
+            let v = match op {
+                ArithOp::Add => a + b,
+                ArithOp::Sub => a - b,
+                ArithOp::Mul => a * b,
+                ArithOp::Div => a / b,
+                ArithOp::Mod => a % b,
+                ArithOp::Pow => return No,
+            };
+            if v.is_finite() { Float(v) } else { No }
+        }
+        (Int(a) | Dur(a), Int(b) | Dur(b)) => {
+            let dur = matches!(l, Dur(_)) || matches!(r, Dur(_));
+            let integer = |v: Option<i128>| match v {
+                Some(v) if dur => Dur(v),
+                Some(v) => Int(v),
+                None => No,
+            };
+            match op {
+                ArithOp::Add => integer(a.checked_add(b)),
+                ArithOp::Sub => integer(a.checked_sub(b)),
+                ArithOp::Mul => integer(a.checked_mul(b)),
+                // By zero a duration's quotient is an infinity, which the
+                // tuple path computes.
+                ArithOp::Div if dur => {
+                    if b == 0 {
+                        No
+                    } else {
+                        Float(a as f64 / b as f64)
+                    }
+                }
+                ArithOp::Div | ArithOp::Mod if b == 0 => Undefined,
+                ArithOp::Div => integer(a.checked_div(b)),
+                ArithOp::Mod => integer(a.checked_rem(b)),
+                ArithOp::Pow => u32::try_from(b)
+                    .ok()
+                    .map_or(No, |e| integer(a.checked_pow(e))),
+            }
+        }
+    }
+}
+
+/// `I(v)`: the digits, sign included, where a bare literal is an integer
+/// type; otherwise through `toInt256`, because ClickHouse types a bare
+/// integer literal past 2^64 − 1 as `Float64`, which rounds.
+fn int_text(v: i128) -> String {
+    if (i128::from(i64::MIN)..=i128::from(u64::MAX)).contains(&v) {
+        v.to_string()
+    } else {
+        format!("toInt256('{v}')")
+    }
+}
+
+fn u128_text(v: u128) -> String {
+    if v <= u128::from(u64::MAX) {
+        v.to_string()
+    } else {
+        format!("toInt256('{v}')")
+    }
+}
+
+/// `F(x)`: through a string, so the sign of a zero is kept — `toFloat64(-0)`
+/// is +0.
+fn float_text(x: f64) -> String {
+    format!("toFloat64('{}')", render_num(x))
+}
+
+/// A literal side's arms: a number or duration as a constant, a string,
+/// boolean, status or kind as its own class. Never `NULL`.
+fn literal_arms(value: &Value) -> Result<Arms, PlanError> {
+    let folded = match value {
+        Value::Number(raw) => number_literal(raw)?,
+        Value::Duration(d) => Folded::Dur(i128::from(d.as_nanos())),
+        Value::String(s) => {
+            return Ok(Arms {
+                s: Some(escape::ch_string(s)),
+                ..Arms::default()
+            });
+        }
+        Value::Bool(b) => {
+            return Ok(Arms {
+                b: Some(b.to_string()),
+                ..Arms::default()
+            });
+        }
+        Value::Status(v) => {
+            return Ok(Arms {
+                st: Some(status_code(*v).to_string()),
+                ..Arms::default()
+            });
+        }
+        Value::Kind(v) => {
+            return Ok(Arms {
+                kd: Some(kind_code(*v).to_string()),
+                ..Arms::default()
+            });
+        }
+    };
+    Ok(folded
+        .constant_arms()
+        .expect("a number or duration literal is a constant"))
+}
+
+// ---------------------------------------------------------------------
 // the attribute leaf
 // ---------------------------------------------------------------------
 
@@ -1368,27 +2231,28 @@ fn numeric_pair(int: &str, float: &str, op: ComparisonOp, number: &str) -> Strin
     format!("(coalesce({int} {sym} {number}, false) OR coalesce({float} {sym} {number}, false))")
 }
 
-/// `N` — the numeric literal's SQL text. **Integer first**: `parse_num` /
-/// `render_num` are used only for a literal that is not an `i64`, because
-/// the `f64` round trip does not preserve one.
+/// `N` — the numeric literal's SQL text. **Integer first**: a `Number` of
+/// digits, or `-` and digits, is `I(v)`, exact from −2^127 to 2^128 − 1 and
+/// refused outside it; `parse_num` / `render_num` are used only for a
+/// literal with a fraction, because the `f64` round trip does not preserve
+/// an integer.
 ///
 /// `minInt`/`maxInt` need no arm of their own: the parser turns each into
 /// `Value::Number(i64::MIN.to_string())` / `i64::MAX.to_string()`, so they
 /// arrive as ordinary decimal literals and take this same path.
 fn render_number(raw: &str) -> Result<String, PlanError> {
-    if let Ok(i) = raw.parse::<i64>() {
-        return Ok(i.to_string());
-    }
-    Ok(render_num(parse_num(raw)?))
+    Ok(match number_literal(raw)? {
+        Folded::Int(v) | Folded::Dur(v) => int_text(v),
+        Folded::U128(v) => u128_text(v),
+        Folded::Float(_) | Folded::Undefined | Folded::No => render_num(parse_num(raw)?),
+    })
 }
 
 /// A duration literal's nanoseconds, which is the number it compares as —
 /// not the digits the client wrote, so `> 1ns` and `> 1us` are different
-/// comparisons.
-fn duration_nanos(d: Duration) -> Result<String, PlanError> {
-    i64::try_from(d.as_nanos())
-        .map(|n| n.to_string())
-        .map_err(|_| PlanError::TypeMismatch("duration literal exceeds the i64 range".to_string()))
+/// comparisons. Every `u64` the parser accepts, as a bare literal.
+fn duration_nanos(d: Duration) -> String {
+    d.as_nanos().to_string()
 }
 
 /// One attribute comparison at `root`: `NOT ` + the positive rendering when
@@ -1521,7 +2385,7 @@ fn leaf_parts(
                 &read(Read::Int),
                 &read(Read::Float),
                 ComparisonOp::Eq,
-                &duration_nanos(*d)?,
+                &duration_nanos(*d),
             ),
         ),
         (op, Value::Duration(d)) if sql_op(op).is_some() => (
@@ -1530,7 +2394,7 @@ fn leaf_parts(
                 &read(Read::Int),
                 &read(Read::Float),
                 op,
-                &duration_nanos(*d)?,
+                &duration_nanos(*d),
             ),
         ),
         (ComparisonOp::Eq, Value::Bool(b)) => (
@@ -1612,6 +2476,13 @@ fn string_column_leaf(
             "{intrinsic} requires a string value"
         )));
     };
+    string_column_text(column, op, s)
+}
+
+/// `<column> <op> <s>` over a non-nullable string, under all eight
+/// operators. An invalid pattern is refused here, at compile time: the
+/// engine would fail the statement.
+fn string_column_text(column: &str, op: ComparisonOp, s: &str) -> Result<String, PlanError> {
     Ok(match op {
         ComparisonOp::Re => format!("match({column}, {})", anchored_regex_sql(s)?),
         ComparisonOp::Nre => format!("NOT match({column}, {})", anchored_regex_sql(s)?),
@@ -1723,7 +2594,7 @@ fn duration_leaf(op: ComparisonOp, value: &Value) -> Result<String, PlanError> {
             "duration does not support regex operators".to_string(),
         ));
     };
-    Ok(format!("duration_ns {sym} {}", duration_nanos(*d)?))
+    Ok(format!("duration_ns {sym} {}", duration_nanos(*d)))
 }
 
 // ---------------------------------------------------------------------
@@ -1868,7 +2739,7 @@ fn event_name_leaf(op: ComparisonOp, value: &Value) -> Result<String, PlanError>
 /// The operand is checked before the operator, as `duration`'s is.
 fn time_since_start_leaf(op: ComparisonOp, value: &Value) -> Result<String, PlanError> {
     let nanos = match value {
-        Value::Duration(d) => duration_nanos(*d)?,
+        Value::Duration(d) => duration_nanos(*d),
         Value::Number(raw) => render_number(raw)?,
         _ => {
             return Err(PlanError::TypeMismatch(

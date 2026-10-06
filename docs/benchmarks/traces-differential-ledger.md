@@ -3850,3 +3850,26 @@ Applies to the span-scope predicate compiler (`crates/pulsus-read/src/traces/spa
   empty every result of the query.
 
 Read from the reference's source, not measured against it.
+
+### `traceql-arithmetic-exact` (issue #589) — **arithmetic answers that differ from the reference by decision**
+
+Applies to the span-scope predicate compiler (`crates/pulsus-read/src/traces/spans/predicate.rs`, `arith_tuple`), which no route calls until #590.
+
+- **Integer arithmetic is exact within 256-bit integers, and a result outside them has no value.** The
+  reference's integer `+ - *` wrap at 2^63; here `9223372036854775807 + 1 > 0` is true, and `2 ^ 255` matches
+  nothing.
+- **Integer `^` is exact, in the written order.** The reference computes it through float64 with its operands
+  swapped (`traceql-pow-integer-operand-swap`); here `3 ^ 39` is 4052555153018976267.
+- **An integer divided by zero, or taken modulo zero, does not match** (owner decision, 2026-10-06). The
+  reference fails the query.
+- **An integer literal is exact from −2^127 to 2^128 − 1 and refused outside it.** The reference reads an integer
+  literal as a 64-bit `int`, so one past 2^63 − 1 is a parse error there.
+- **A duration in arithmetic stays an integer of nanoseconds**, except that `/` with a duration operand divides
+  as float64, as the reference's does. The reference computes every duration operation as float64, so results
+  past 2^53 ns differ.
+- **An array operand in arithmetic does not match.** The reference fails the query.
+- **Unary `-` over a value that is not a number does not match.** The reference fails the query.
+- **A predicate holds at most 64 arithmetic operations.** More are refused with a `400`; the reference has no
+  such limit.
+
+Read from the reference's source, not measured against it.
