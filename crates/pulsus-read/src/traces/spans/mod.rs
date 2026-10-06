@@ -12,8 +12,12 @@
 //!   tuples, the route enum and the request window;
 //! * [`predicate`] — the span-scope predicate compiler (issue #588): one
 //!   TraceQL leaf to one ClickHouse boolean over a `spans` row, and the
-//!   one place a window and a predicate compose.
+//!   one place a window and a predicate compose;
+//! * [`search`] — the search statement (issue #590): the newest traces
+//!   with a matching span, their capped spansets and their roots, in one
+//!   statement.
 
 pub mod fetch;
 pub mod predicate;
 pub mod rows;
+pub mod search;

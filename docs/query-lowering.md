@@ -4977,7 +4977,7 @@ the two tables are a cross-check on each other rather than one table quoted twic
 
 Wave 1 emits no SQL, so the first two must stay green **unchanged** — measured green today,
 `Starting 1 test` each, exit 0 (§11.0). When the fold is wired, the
-goldens and `PINNED_SQL_CORPUS` (`crates/pulsus-read/tests/golden_sql_freeze.rs:391`) move in the
+goldens and `PINNED_SQL_CORPUS` (`crates/pulsus-read/tests/golden_sql_freeze.rs:496`) move in the
 same commit.
 
 ### 11.2 The gates that reproduce each hand-written walk — all **wave 1** at base, none of them there then; all six exist today
@@ -5541,16 +5541,16 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | of those, citing a bare basename | 504 |
 | of those, written as a continuation of a citation earlier in the paragraph | 75 |
 | of those continuations, on a later line than the citation they continue | 32 |
-| `(document, token)` pairs the rule resolves | 363 |
-| occurrences those resolved pairs cover | 493 |
-| `(document, token)` pairs it cannot resolve | 110 |
-| occurrences those frozen pairs cover | 200 |
-| resolved rows anchored on a token the citing prose prints | 174 |
+| `(document, token)` pairs the rule resolves | 364 |
+| occurrences those resolved pairs cover | 494 |
+| `(document, token)` pairs it cannot resolve | 109 |
+| occurrences those frozen pairs cover | 199 |
+| resolved rows anchored on a token the citing prose prints | 175 |
 | resolved rows anchored on a snapshot of the cited line | 189 |
 
 | reason it cannot be resolved | pairs | what it means |
 |---|---|---|
-| `ambiguous_basename` | 101 | the basename matches several tracked files and the citing line prints no identifier that separates them |
+| `ambiguous_basename` | 100 | the basename matches several tracked files and the citing line prints no identifier that separates them |
 | `blank_target_line` | 7 | the cited line exists and is **empty**, so there is nothing to anchor on |
 | `not_a_tracked_file` | 2 | the citation names a throwaway probe that was never committed, which §10 records deliberately |
 
@@ -5565,7 +5565,7 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | `prose` | a token the citing prose prints, so the claim and its evidence are reviewable side by side |
 | `line` | a snapshot of the cited line, taken because the citing prose prints no such token: it detects the line moving or changing and cannot show the citation means the right thing |
 
-Of the 693 citation occurrences the five artefacts make, 504 name a bare basename and 75 are written as a continuation of a citation earlier on the same line. The rule resolves 363 `(document, token)` pairs covering 493 occurrences, and cannot resolve 110 covering 200. Of the resolved rows, 174 are anchored on a token the citing prose prints and 189 on a snapshot of the cited line.
+Of the 693 citation occurrences the five artefacts make, 504 name a bare basename and 75 are written as a continuation of a citation earlier on the same line. The rule resolves 364 `(document, token)` pairs covering 494 occurrences, and cannot resolve 109 covering 199. Of the resolved rows, 175 are anchored on a token the citing prose prints and 189 on a snapshot of the cited line.
 
 The language fallback and the anchor rule disagree on 4 citations, all of them read one at a time. 4 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
 

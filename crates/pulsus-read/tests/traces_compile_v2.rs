@@ -271,6 +271,7 @@ use pulsus_read::traces::spans::predicate::{
     PredicateCtx, compile_span_leaf, compile_span_leaf_in, compile_span_predicate,
     compile_span_predicate_in, span_membership_sql,
 };
+use pulsus_read::traces::spans::search::search_sql;
 use pulsus_read::traces::window_sql::WindowSql;
 use pulsus_traceql::{
     AttrScope, ComparisonOp, Field, FieldExpr, FieldOp, Intrinsic, SpansetExpr, SpansetFilter,
@@ -4509,4 +4510,146 @@ fn t_c42_the_limits_and_the_refusals_that_remain() {
         refusal(r#"{ event.a + resource.r > 1 }"#),
         PlanError::UnsupportedField(RESOURCE_NEEDS_WINDOW.to_string())
     );
+}
+
+// =====================================================================
+// Issue #590 — the search statement
+// =====================================================================
+
+/// The predicate a search body compiles to in `ctx`: `{}` has no body and
+/// is `{ true }` (the predicate compiler's own reading).
+fn search_predicate(
+    query: &str,
+    ctx: &PredicateCtx<'_>,
+) -> pulsus_read::traces::spans::predicate::SpanPredicate {
+    let parsed =
+        pulsus_traceql::parse(query).unwrap_or_else(|e| panic!("{query} must parse: {e:?}"));
+    let body = match parsed.spanset {
+        SpansetExpr::Filter(SpansetFilter { body: Some(b) }) => b,
+        SpansetExpr::Filter(SpansetFilter { body: None }) => FieldExpr::Literal(Value::Bool(true)),
+        other => panic!("{query}: expected one filter, got {other}"),
+    };
+    compile_span_predicate_in(&body, ctx).unwrap_or_else(|e| panic!("{query} must compile: {e}"))
+}
+
+/// `T-B4`: the statement bounds both span reads by the sort key's leading
+/// column, rendered from `start` and from `end - 1` and divided
+/// server-side.
+#[test]
+fn t_b4_the_search_statement_carries_the_bucket_bound() {
+    let p = search_predicate("{}", &ctx());
+    let sql = search_sql("spans", "traces", t_b1_window(), &p, 20, 3);
+    let bound = "intDiv(start_ns, 300000000000) BETWEEN intDiv(1790094846486853636, 300000000000) \
+                 AND intDiv(1790094846486853636, 300000000000)";
+    assert_eq!(sql.matches(bound).count(), 2, "{sql}");
+    assert!(!sql.contains("1790094846486853637, 300000000000)"), "{sql}");
+    assert_eq!(1_790_094_846_486_853_636_i64 / 300_000_000_000, 5_966_982);
+}
+
+/// The window the search goldens are rendered for: g1's three hours,
+/// `[1790084801, 1790095601)` s.
+fn g1_window() -> WindowSql {
+    WindowSql::start_closed_end_open(1_790_084_801_000_000_000, 1_790_095_601_000_000_000)
+}
+
+/// The seven search goldens: file stem, query, `limit`, `spss`.
+const SEARCH_GOLDENS: [(&str, &str, u32, u32); 7] = [
+    ("match_all", "{}", 20, 3),
+    (
+        "service",
+        r#"{ resource.service.name = "checkout" }"#,
+        20,
+        3,
+    ),
+    (
+        "span_attribute",
+        r#"{ span.http.response.status_code >= 500 }"#,
+        20,
+        3,
+    ),
+    (
+        "resource_attribute",
+        r#"{ resource.k8s.pod.name =~ "checkout.*" }"#,
+        20,
+        3,
+    ),
+    ("event_intrinsic", r#"{ event:name = "exception" }"#, 20, 3),
+    ("demand", r#"{ !span.app.cache.hit }"#, 20, 3),
+    ("limits", "{}", 5, 10),
+];
+
+fn search_golden_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("golden")
+        .join("traces_spans_search")
+}
+
+/// One golden's text: two comment lines, then the one statement.
+fn search_golden(stem: &str, query: &str, limit: u32, spss: u32) -> String {
+    let w = g1_window();
+    let ctx = PredicateCtx {
+        window: w,
+        resources_table: "resources",
+    };
+    let p = search_predicate(query, &ctx);
+    format!(
+        "-- case: {stem}\n-- q: {query} limit={limit} spss={spss}\n{}\n",
+        search_sql("spans", "traces", w, &p, limit, spss)
+    )
+}
+
+/// The seven goldens of `golden/traces_spans_search/`, byte for byte,
+/// collected and asserted once.
+#[test]
+fn search_statement_goldens_match() {
+    let mut missing: Vec<String> = Vec::new();
+    let mut drifted: Vec<String> = Vec::new();
+    for (stem, query, limit, spss) in SEARCH_GOLDENS {
+        let path = search_golden_dir().join(format!("{stem}.sql"));
+        match std::fs::read_to_string(&path) {
+            Err(e) => missing.push(format!("{stem} ({path:?}: {e})")),
+            Ok(expected) => {
+                if search_golden(stem, query, limit, spss) != expected {
+                    drifted.push(format!("{stem} ({path:?})"));
+                }
+            }
+        }
+    }
+    assert!(
+        missing.is_empty() && drifted.is_empty(),
+        "{} search golden(s) missing:\n{}\n{} drifted:\n{}\nif the change is intentional, run \
+         `cargo test -p pulsus-read --test traces_compile_v2 -- --ignored \
+         regenerate_search_statement_goldens` and review the diff",
+        missing.len(),
+        missing.join("\n"),
+        drifted.len(),
+        drifted.join("\n")
+    );
+}
+
+/// Regenerates the search goldens. `#[ignore]`d: run explicitly after an
+/// intentional change to the statement, review the diff, and say so.
+#[test]
+#[ignore = "regenerates the committed goldens; run explicitly, see doc comment"]
+fn regenerate_search_statement_goldens() {
+    let dir = search_golden_dir();
+    std::fs::create_dir_all(&dir).expect("create golden dir");
+    for (stem, query, limit, spss) in SEARCH_GOLDENS {
+        let path = dir.join(format!("{stem}.sql"));
+        std::fs::write(&path, search_golden(stem, query, limit, spss))
+            .unwrap_or_else(|e| panic!("write {path:?}: {e}"));
+    }
+}
+
+/// A predicate compiled for one window, composed into a search over
+/// another, panics, as `span_membership_sql` does.
+#[test]
+#[should_panic(expected = "different window")]
+fn search_sql_rejects_another_windows_predicate() {
+    // `resource.k` reads the resource table, so the predicate carries its
+    // window; `resource.service.name = "x"` reads the span row and would not.
+    let p = search_predicate(r#"{ resource.k = "x" }"#, &ctx());
+    let other = WindowSql::start_closed_end_open(T_B1_START, T_B1_END + 1);
+    let _ = search_sql("spans", "traces", other, &p, 20, 3);
 }
