@@ -211,7 +211,7 @@ spec:
         app.kubernetes.io/managed-by: Helm
         app.kubernetes.io/component: all
       annotations:
-        checksum/config: c1fc2eb62e0acb2c6801c35c2768b0262ae0cf274dc90037f0b4ec33bba7f152
+        checksum/config: e06056031b9921c5e95a74176d733219b4d82eeb1dcb0d885e185e27d30056de
         checksum/secret: 01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b
     spec:
       serviceAccountName: pulsusdb
@@ -487,7 +487,7 @@ spec:
         app.kubernetes.io/managed-by: Helm
         app.kubernetes.io/component: init
       annotations:
-        checksum/config: c1fc2eb62e0acb2c6801c35c2768b0262ae0cf274dc90037f0b4ec33bba7f152
+        checksum/config: e06056031b9921c5e95a74176d733219b4d82eeb1dcb0d885e185e27d30056de
         checksum/secret: 01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b
     spec:
       restartPolicy: Never
