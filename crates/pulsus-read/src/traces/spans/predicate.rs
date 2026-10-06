@@ -18,11 +18,14 @@
 //! `resource.service.name` — its string from the span row, every other arm
 //! from the resource row ([`field_terms`]); event and link attributes, the
 //! four event and link intrinsics and the unscoped `.k` — as sets, any
-//! element, `!=` every element ([`Compiler::set_compare`]); arithmetic over
-//! those fields and literals ([`Compiler::arith_tuple`]), a literal-only
-//! side folded ([`fold`]), and a boolean-valued side; and `&&`, `||` and
-//! `!`. Every other field and construct is [`PlanError::UnsupportedField`]
-//! naming itself and the issue that serves it. The arms are exhaustive
+//! element, `!=` every element ([`Compiler::set_compare`]); event, link and
+//! unscoped operands inside arithmetic and opposite any side, over every
+//! tuple of their elements (at most two) ([`Compiler::occurrence_build`]);
+//! arithmetic over those fields and literals ([`Compiler::arith_tuple`]), a
+//! literal-only side folded ([`fold`]), and a boolean-valued side; and
+//! `&&`, `||` and `!`. Every other field and construct is
+//! [`PlanError::UnsupportedField`] naming itself and the issue that serves
+//! it. The arms are exhaustive
 //! with no wildcard, so a new `Intrinsic` or `AttrScope` variant fails to
 //! compile here rather than falling into the wrong one.
 //!
@@ -212,7 +215,6 @@ pub fn span_membership_sql(spans_table: &str, w: WindowSql, p: &SpanPredicate) -
 // ---------------------------------------------------------------------
 
 /// The issue each deferred construct is served by.
-const PART_3E: &str = "#589 part 3e";
 const NESTED_AND_TRACE: &str = "#594";
 
 /// The refusal every deferred construct takes: it names the construct and
@@ -334,6 +336,83 @@ struct Compiler<'a> {
     /// The arithmetic nodes emitted so far, across the whole predicate,
     /// for [`MAX_ARITH_NODES`].
     arith_nodes: usize,
+    /// The current comparison's set operands, in pre-order, left side
+    /// first (the part-3e design's section 5.1); saved and reset by each
+    /// [`Compiler::compare`].
+    occurrences: Vec<Occurrence>,
+    /// The current comparison's scalar field leaves' presences, which
+    /// `!=` over a set operand requires (decision 11 of the part-3e design).
+    presences: Vec<String>,
+}
+
+/// One set operand of a comparison, numbered `k` in pre-order: its element
+/// variable `e<k>`, its set; a chain's variable `c<k>`, `C(k)`, and its
+/// resource value's variable `cr<k>` with `V(k)`; and whether it is a `!F`
+/// side, whose set must hold the key under `!=` (decision 14).
+struct Occurrence {
+    var: String,
+    array: String,
+    chain: Option<(String, String, (String, String))>,
+    negated: bool,
+}
+
+/// The most set operands one comparison may hold (decision 13 of the
+/// part-3e design, owner, 2026-10-06). Each one multiplies the work per
+/// span by its elements: three 16-element set operands measured 487 µs a
+/// span and 7.6 GB peak memory — 4,873 ms over 10,000 spans (26.3.29.7, 16
+/// cores, `max_threads = 16`, `max_block_size = 65409`, `final = 1`,
+/// `max_query_size = 8388608`, `max_execution_time = 20`, every other
+/// setting the server default), against about 300 µs predicted from the
+/// two-set rate of 75 ns a tuple.
+const MAX_SET_OPERANDS: usize = 2;
+
+/// Decision 13's refusal.
+fn too_many_set_operands() -> PlanError {
+    PlanError::UnsupportedField(format!(
+        "a comparison with more than {MAX_SET_OPERANDS} event, link or unscoped operands is not \
+         supported"
+    ))
+}
+
+/// The set operands a side holds, each occurrence counted: a set field,
+/// lone, under `!` or inside arithmetic. A boolean-valued node is a
+/// comparison of its own and counts its own.
+fn set_operands_in(expr: &FieldExpr) -> usize {
+    match expr {
+        FieldExpr::Field(field) => usize::from(is_set_field(field)),
+        FieldExpr::Unary {
+            op: UnaryOp::Not,
+            expr: inner,
+        } => match inner.as_ref() {
+            FieldExpr::Field(field) => usize::from(is_set_field(field)),
+            _ => 0,
+        },
+        FieldExpr::Unary {
+            op: UnaryOp::Neg,
+            expr: inner,
+        } => set_operands_in(inner),
+        FieldExpr::Binary {
+            op: FieldOp::Arith(_),
+            lhs,
+            rhs,
+        } => set_operands_in(lhs) + set_operands_in(rhs),
+        FieldExpr::Literal(_)
+        | FieldExpr::Exists { .. }
+        | FieldExpr::Binary {
+            op: FieldOp::Cmp(_) | FieldOp::Bool(_),
+            ..
+        } => 0,
+    }
+}
+
+/// A lambda variable and the value it is bound to.
+type Bind = (String, String);
+
+/// Whether `var` is an arithmetic side's variable, `a1` or `a2`, whose
+/// tuple may read a set operand's element and so is bound inside the
+/// loops.
+fn is_arith_var(var: &str) -> bool {
+    matches!(var, "a1" | "a2")
 }
 
 impl<'a> Compiler<'a> {
@@ -343,6 +422,8 @@ impl<'a> Compiler<'a> {
             uses_resources: false,
             demands: Vec::new(),
             arith_nodes: 0,
+            occurrences: Vec::new(),
+            presences: Vec::new(),
         }
     }
 
@@ -785,6 +866,24 @@ impl<'a> Compiler<'a> {
         op: ComparisonOp,
         rhs: &FieldExpr,
     ) -> Result<String, PlanError> {
+        // Each comparison numbers its own set operands and collects its own
+        // presences: a boolean-valued side is a comparison of its own,
+        // compiled in the middle of this one's.
+        let occurrences = std::mem::take(&mut self.occurrences);
+        let presences = std::mem::take(&mut self.presences);
+        let compared = self.compare_in_frame(lhs, op, rhs);
+        self.occurrences = occurrences;
+        self.presences = presences;
+        compared
+    }
+
+    /// [`Compiler::compare`] within the comparison's own frame.
+    fn compare_in_frame(
+        &mut self,
+        lhs: &FieldExpr,
+        op: ComparisonOp,
+        rhs: &FieldExpr,
+    ) -> Result<String, PlanError> {
         check_literals(lhs)?;
         check_literals(rhs)?;
         if let (Some(field), FieldExpr::Literal(value)) = (not_of_field(lhs), rhs) {
@@ -833,13 +932,13 @@ impl<'a> Compiler<'a> {
         {
             return self.set_compare(l, op, r);
         }
-        let construct = if two_fields {
-            "a field-against-field comparison"
-        } else {
-            "an expression"
-        };
-        self.refuse_deferred(lhs, construct, false)?;
-        self.refuse_deferred(rhs, construct, false)?;
+        self.refuse_deferred(lhs, false)?;
+        self.refuse_deferred(rhs, false)?;
+        // Decision 13's cap holds before a side folding to no value makes
+        // the comparison `false`, so no shape of a comparison escapes it.
+        if set_operands_in(lhs) + set_operands_in(rhs) > MAX_SET_OPERANDS {
+            return Err(too_many_set_operands());
+        }
         if fold(lhs)? == Folded::Undefined || fold(rhs)? == Folded::Undefined {
             return Ok("false".to_string());
         }
@@ -859,50 +958,143 @@ impl<'a> Compiler<'a> {
             };
         }
         let mut fields = 0usize;
-        let Some(l) = self.side_arms(lhs, 1, &mut fields, construct)? else {
+        let Some(l) = self.side_arms(lhs, 1, &mut fields)? else {
             return Ok("false".to_string());
         };
-        let Some(r) = self.side_arms(rhs, 2, &mut fields, construct)? else {
+        let Some(r) = self.side_arms(rhs, 2, &mut fields)? else {
             return Ok("false".to_string());
         };
         let body = field_terms(&l, op, &r);
+        if !self.occurrences.is_empty() {
+            return Ok(self.occurrence_build(op, &l, &r, body));
+        }
         if body == "false" {
             return Ok(body);
         }
         Ok(bind_values(&l.binds, &r.binds, body))
     }
 
+    /// The part-3e design's section 5.4: `body` inside the arithmetic
+    /// sides' bindings, then one loop per set operand, last first — any
+    /// tuple of their elements, or every tuple for `!=` (decision 10) —
+    /// then, for `!=`, the presences of decision 11, then the chains'
+    /// sets, then the lone resource fields' values and the chains'.
+    ///
+    /// With no term nothing matches under `= < <= > >=`; `!=` is built
+    /// over a body of `false`, so it holds when a set is empty (decision 9).
+    fn occurrence_build(&self, op: ComparisonOp, l: &Arms, r: &Arms, body: String) -> String {
+        let neq = op == ComparisonOp::Neq;
+        if body == "false" && !neq {
+            return body;
+        }
+        let (arith, values): (Vec<Bind>, Vec<Bind>) = l
+            .binds
+            .iter()
+            .chain(&r.binds)
+            .cloned()
+            .partition(|(var, _)| is_arith_var(var));
+        let mut text = bind_values(&arith, &[], body);
+        for occ in self.occurrences.iter().rev() {
+            let each = if neq { "arrayAll" } else { "arrayExists" };
+            text = format!("{each}({} -> {text}, {})", occ.var, occ.array);
+        }
+        if neq {
+            // The scalar leaves', then the chains', then the `!F` sets'.
+            let chains = self
+                .occurrences
+                .iter()
+                .filter_map(|o| o.chain.as_ref().map(|(c, _, _)| format!("notEmpty({c})")));
+            let negated = self
+                .occurrences
+                .iter()
+                .filter(|o| o.negated)
+                .map(|o| format!("notEmpty({})", o.array));
+            let mut presences: Vec<String> = Vec::new();
+            for p in self.presences.iter().cloned().chain(chains).chain(negated) {
+                if !presences.contains(&p) {
+                    presences.push(p);
+                }
+            }
+            if !presences.is_empty() {
+                text = format!("({} AND {text})", presences.join(" AND "));
+            }
+        }
+        for occ in self.occurrences.iter().rev() {
+            if let Some((c, chain, _)) = &occ.chain {
+                text = format!("arrayExists({c} -> {text}, [{chain}])");
+            }
+        }
+        let chain_values: Vec<(String, String)> = self
+            .occurrences
+            .iter()
+            .filter_map(|o| o.chain.as_ref().map(|(_, _, value)| value.clone()))
+            .collect();
+        bind_values(&values, &chain_values, text)
+    }
+
+    /// Registers the set operand `field` as the comparison's next
+    /// occurrence, `k` (the part-3e design's section 5.1), and returns its
+    /// set, its element arms reading `e<k>` with no binding of their own.
+    /// A third occurrence is refused (decision 13).
+    fn register_occurrence(
+        &mut self,
+        field: &Field,
+        negated: bool,
+    ) -> Result<SetOperand, PlanError> {
+        if self.occurrences.len() >= MAX_SET_OPERANDS {
+            return Err(too_many_set_operands());
+        }
+        let k = self.occurrences.len() + 1;
+        let cr = format!("cr{k}");
+        let mut set = self
+            .set_operand(field, k, &cr)?
+            .expect("register_occurrence is called with a set operand");
+        let value = set.arms.binds.pop();
+        self.occurrences.push(Occurrence {
+            var: set.var.clone(),
+            array: set.array.clone(),
+            chain: set
+                .chain
+                .clone()
+                .map(|(c, chain)| (c, chain, value.expect("a chain reads its resource value"))),
+            negated,
+        });
+        Ok(set)
+    }
+
+    /// Notes a scalar field leaf's presence for `!=` (decision 11).
+    fn note_presence(&mut self, presence: Option<String>) {
+        if let Some(p) = presence {
+            self.presences.push(p);
+        }
+    }
+
     /// Section 5.1's row 4: the first operand of `expr` this part does not
     /// serve, pre-order, refused. A boolean-valued node is a comparison of
     /// its own, rendered — and refused — by [`Compiler::render_expr`],
     /// except inside arithmetic, where it is not an operand.
-    fn refuse_deferred(
-        &self,
-        expr: &FieldExpr,
-        construct: &str,
-        in_arithmetic: bool,
-    ) -> Result<(), PlanError> {
+    fn refuse_deferred(&self, expr: &FieldExpr, in_arithmetic: bool) -> Result<(), PlanError> {
         match expr {
-            FieldExpr::Field(field) => self.refuse_field(field, construct),
+            FieldExpr::Field(field) => self.refuse_field(field),
             FieldExpr::Literal(_) => Ok(()),
             FieldExpr::Binary {
                 op: FieldOp::Arith(_),
                 lhs,
                 rhs,
             } => {
-                self.refuse_deferred(lhs, construct, true)?;
-                self.refuse_deferred(rhs, construct, true)
+                self.refuse_deferred(lhs, true)?;
+                self.refuse_deferred(rhs, true)
             }
             FieldExpr::Unary {
                 op: UnaryOp::Neg,
                 expr: inner,
-            } => self.refuse_deferred(inner, construct, true),
+            } => self.refuse_deferred(inner, true),
             _ if in_arithmetic => Err(not_an_operand()),
             FieldExpr::Unary {
                 op: UnaryOp::Not,
                 expr: inner,
             } => match inner.as_ref() {
-                FieldExpr::Field(field) => self.refuse_field(field, construct),
+                FieldExpr::Field(field) => self.refuse_field(field),
                 _ => Ok(()),
             },
             FieldExpr::Binary {
@@ -915,18 +1107,18 @@ impl<'a> Compiler<'a> {
 
     /// One operand's refusal, if this part does not serve it. **No
     /// wildcard arm**.
-    fn refuse_field(&self, field: &Field, construct: &str) -> Result<(), PlanError> {
+    fn refuse_field(&self, field: &Field) -> Result<(), PlanError> {
         match field {
             Field::Attribute { scope, .. } => match scope {
-                AttrScope::Span | AttrScope::Instrumentation => Ok(()),
+                AttrScope::Span
+                | AttrScope::Instrumentation
+                | AttrScope::Event
+                | AttrScope::Link
+                | AttrScope::Unscoped => Ok(()),
                 AttrScope::Resource => self
                     .ctx
                     .map(|_| ())
                     .ok_or_else(|| needs_window(AttrScope::Resource)),
-                AttrScope::Event | AttrScope::Link | AttrScope::Unscoped => Err(unsupported(
-                    &format!("{construct} with a \"{scope}\" operand"),
-                    PART_3E,
-                )),
             },
             Field::Intrinsic(intrinsic) => match intrinsic {
                 Intrinsic::Name
@@ -938,14 +1130,11 @@ impl<'a> Compiler<'a> {
                 | Intrinsic::InstrumentationVersion
                 | Intrinsic::Duration
                 | Intrinsic::Status
-                | Intrinsic::Kind => Ok(()),
-                Intrinsic::EventName
+                | Intrinsic::Kind
+                | Intrinsic::EventName
                 | Intrinsic::EventTimeSinceStart
                 | Intrinsic::LinkSpanId
-                | Intrinsic::LinkTraceId => Err(unsupported(
-                    &format!("{construct} with {intrinsic}"),
-                    PART_3E,
-                )),
+                | Intrinsic::LinkTraceId => Ok(()),
                 Intrinsic::NestedSetParent
                 | Intrinsic::NestedSetLeft
                 | Intrinsic::NestedSetRight
@@ -970,13 +1159,16 @@ impl<'a> Compiler<'a> {
         side: &FieldExpr,
         n: usize,
         fields: &mut usize,
-        construct: &str,
     ) -> Result<Option<Arms>, PlanError> {
         match side {
             FieldExpr::Field(field) => {
                 *fields += 1;
-                self.operand_arms(field, format!("r{fields}"), construct)
-                    .map(Some)
+                if is_set_field(field) {
+                    return Ok(Some(self.register_occurrence(field, false)?.arms));
+                }
+                let var = format!("r{fields}");
+                self.note_presence(scalar_presence(field, &var));
+                self.operand_arms(field, var).map(Some)
             }
             FieldExpr::Literal(value) => literal_arms(value).map(Some),
             FieldExpr::Binary {
@@ -1009,8 +1201,7 @@ impl<'a> Compiler<'a> {
                     unreachable!("matched as a field above")
                 };
                 *fields += 1;
-                self.not_operand(field, format!("r{fields}"), construct)
-                    .map(Some)
+                self.not_operand(field, format!("r{fields}")).map(Some)
             }
             FieldExpr::Unary {
                 op: UnaryOp::Not, ..
@@ -1033,13 +1224,9 @@ impl<'a> Compiler<'a> {
 
     /// `!field` as a side: its boolean arm, `NULL` where the value is not
     /// a boolean, with `not_field`'s demand that a present non-boolean
-    /// fails the statement.
-    fn not_operand(
-        &mut self,
-        field: &Field,
-        var: String,
-        construct: &str,
-    ) -> Result<Arms, PlanError> {
+    /// fails the statement. An `event.`, `link.` or `.` field is a set
+    /// operand, each element negated (the part-3e design's section 5.3).
+    fn not_operand(&mut self, field: &Field, var: String) -> Result<Arms, PlanError> {
         let (scope, key) = match field {
             Field::Intrinsic(intrinsic) => {
                 return Err(PlanError::TypeMismatch(format!(
@@ -1055,6 +1242,10 @@ impl<'a> Compiler<'a> {
                 } else {
                     SCOPE_ATTRS
                 };
+                self.note_presence(Some(format!(
+                    "dynamicType({}) != 'None'",
+                    attr_path(root, key)
+                )));
                 Arms {
                     b: Some(format!(
                         "(NOT {}{})",
@@ -1067,6 +1258,13 @@ impl<'a> Compiler<'a> {
             }
             AttrScope::Resource if key == SERVICE_NAME => {
                 self.ctx.ok_or_else(|| needs_window(AttrScope::Resource))?;
+                // Held when the resource row holds the key (decision 11):
+                // a boolean is stored there, not on the span row.
+                let q = self.resource_read(key)?;
+                self.note_presence(Some(format!(
+                    "dynamicType({}) != 'None'",
+                    resource_value(&q)
+                )));
                 Arms {
                     b: Some("if(service_type = 'bool', service = 'false', NULL)".to_string()),
                     nullable: true,
@@ -1075,6 +1273,7 @@ impl<'a> Compiler<'a> {
             }
             AttrScope::Resource => {
                 let q = self.resource_read(key)?;
+                self.note_presence(Some(format!("dynamicType({var}) != 'None'")));
                 Arms {
                     b: Some(format!("(NOT dynamicElement({var}, 'Bool'))")),
                     nullable: true,
@@ -1084,10 +1283,12 @@ impl<'a> Compiler<'a> {
                 }
             }
             AttrScope::Event | AttrScope::Link | AttrScope::Unscoped => {
-                return Err(unsupported(
-                    &format!("{construct} with a \"{scope}\" operand"),
-                    PART_3E,
-                ));
+                let set = self.register_occurrence(field, true)?;
+                Arms {
+                    b: Some(format!("(NOT dynamicElement({}, 'Bool'))", set.var)),
+                    nullable: true,
+                    ..Arms::default()
+                }
             }
         };
         let (_, condition) = self.not_parts(scope, key, None, false)?;
@@ -1179,8 +1380,13 @@ impl<'a> Compiler<'a> {
     }
 
     /// A field as an arithmetic leaf: its integer read widened to `Int256`
-    /// and its float read. **No wildcard arm**.
+    /// and its float read. A set operand is the next occurrence, read per
+    /// element (the part-3e design's section 5.2); a field leaf's presence
+    /// is noted for `!=` (decision 11). **No wildcard arm**.
     fn arith_leaf(&mut self, field: &Field) -> Result<Option<Tuple>, PlanError> {
+        if is_set_field(field) {
+            return self.set_leaf(field).map(Some);
+        }
         let attribute = |root: &str, key: &str| {
             let path = attr_path(root, key);
             Some(Tuple {
@@ -1195,12 +1401,26 @@ impl<'a> Compiler<'a> {
         let intrinsic = match field {
             Field::Attribute { scope, key } => {
                 return match scope {
-                    AttrScope::Span => Ok(attribute(ATTRS, key)),
-                    AttrScope::Instrumentation => Ok(attribute(SCOPE_ATTRS, key)),
+                    AttrScope::Span | AttrScope::Instrumentation => {
+                        let root = if *scope == AttrScope::Span {
+                            ATTRS
+                        } else {
+                            SCOPE_ATTRS
+                        };
+                        self.note_presence(Some(format!(
+                            "dynamicType({}) != 'None'",
+                            attr_path(root, key)
+                        )));
+                        Ok(attribute(root, key))
+                    }
                     // `resource.service.name`'s numeric arms are on the
                     // resource row, as every other resource key's are.
                     AttrScope::Resource => {
                         let q = self.resource_read(key)?;
+                        self.note_presence(Some(format!(
+                            "dynamicType({}) != 'None'",
+                            resource_value(&q)
+                        )));
                         Ok(Some(Tuple {
                             text: format!(
                                 "arrayElement(arrayMap(pv -> tuple(toInt256(dynamicElement(pv, \
@@ -1210,10 +1430,9 @@ impl<'a> Compiler<'a> {
                             dur: false,
                         }))
                     }
-                    AttrScope::Event | AttrScope::Link | AttrScope::Unscoped => Err(unsupported(
-                        &format!("an expression with a \"{scope}\" operand"),
-                        PART_3E,
-                    )),
+                    AttrScope::Event | AttrScope::Link | AttrScope::Unscoped => {
+                        unreachable!("a set operand is taken by set_leaf first")
+                    }
                 };
             }
             Field::Intrinsic(intrinsic) => *intrinsic,
@@ -1236,10 +1455,7 @@ impl<'a> Compiler<'a> {
             Intrinsic::EventName
             | Intrinsic::EventTimeSinceStart
             | Intrinsic::LinkSpanId
-            | Intrinsic::LinkTraceId => Err(unsupported(
-                &format!("an expression with {intrinsic}"),
-                PART_3E,
-            )),
+            | Intrinsic::LinkTraceId => unreachable!("a set operand is taken by set_leaf first"),
             Intrinsic::NestedSetParent
             | Intrinsic::NestedSetLeft
             | Intrinsic::NestedSetRight
@@ -1250,19 +1466,40 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    /// A set operand as an arithmetic leaf (the part-3e design's section
+    /// 5.2), registered as the next occurrence `k`: an attribute or chain
+    /// element's integer and float reads; `event:timeSinceStart`'s
+    /// element, a duration; `event:name` and the link ids no number
+    /// (decision 12).
+    fn set_leaf(&mut self, field: &Field) -> Result<Tuple, PlanError> {
+        let set = self.register_occurrence(field, false)?;
+        let e = &set.var;
+        let read = |r: Read| format!("dynamicElement({e}, '{}')", r.type_name());
+        Ok(match field {
+            Field::Attribute { .. } => Tuple {
+                text: format!(
+                    "tuple(toInt256({}), {})",
+                    read(Read::Int),
+                    read(Read::Float)
+                ),
+                dur: false,
+            },
+            Field::Intrinsic(Intrinsic::EventTimeSinceStart) => Tuple {
+                text: format!("tuple(toInt256({e}), {NULL_FLOAT})"),
+                dur: true,
+            },
+            Field::Intrinsic(_) => Tuple {
+                text: format!("tuple({NULL_INT}, {NULL_FLOAT})"),
+                dur: false,
+            },
+        })
+    }
+
     /// One operand's arms: a typed read per class it can hold. `var` is
-    /// the lambda variable a resource-row operand is bound to, and
-    /// `construct` names the comparison in a refusal. **No wildcard arm**,
-    /// so a new `Intrinsic` or `AttrScope` variant fails to compile here
-    /// until it is classified.
-    fn operand_arms(
-        &mut self,
-        field: &Field,
-        var: String,
-        construct: &str,
-    ) -> Result<Arms, PlanError> {
-        let unsupported_operand =
-            |what: String| unsupported(&format!("{construct} with {what}"), PART_3E);
+    /// the lambda variable a resource-row operand is bound to. **No
+    /// wildcard arm**, so a new `Intrinsic` or `AttrScope` variant fails to
+    /// compile here until it is classified.
+    fn operand_arms(&mut self, field: &Field, var: String) -> Result<Arms, PlanError> {
         let intrinsic = match field {
             Field::Attribute { scope, key } => {
                 return match scope {
@@ -1284,7 +1521,7 @@ impl<'a> Compiler<'a> {
                         Ok(Arms::resource(&var, &q))
                     }
                     AttrScope::Event | AttrScope::Link | AttrScope::Unscoped => {
-                        Err(unsupported_operand(format!("a \"{scope}\" operand")))
+                        unreachable!("every set operand is classified before operand_arms")
                     }
                 };
             }
@@ -1318,7 +1555,9 @@ impl<'a> Compiler<'a> {
             Intrinsic::EventName
             | Intrinsic::EventTimeSinceStart
             | Intrinsic::LinkSpanId
-            | Intrinsic::LinkTraceId => Err(unsupported_operand(intrinsic.to_string())),
+            | Intrinsic::LinkTraceId => {
+                unreachable!("every set operand is classified before operand_arms")
+            }
             Intrinsic::NestedSetParent
             | Intrinsic::NestedSetLeft
             | Intrinsic::NestedSetRight
@@ -1343,16 +1582,15 @@ impl<'a> Compiler<'a> {
         op: ComparisonOp,
         rhs: &Field,
     ) -> Result<String, PlanError> {
-        const CONSTRUCT: &str = "a field-against-field comparison";
-        let l_set = self.set_operand(lhs, 1)?;
+        let l_set = self.set_operand(lhs, 1, "r1")?;
         let l_scalar = match l_set {
             Some(_) => None,
-            None => Some(self.operand_arms(lhs, "r1".to_string(), CONSTRUCT)?),
+            None => Some(self.operand_arms(lhs, "r1".to_string())?),
         };
-        let r_set = self.set_operand(rhs, 2)?;
+        let r_set = self.set_operand(rhs, 2, "r2")?;
         let r_scalar = match r_set {
             Some(_) => None,
-            None => Some(self.operand_arms(rhs, "r2".to_string(), CONSTRUCT)?),
+            None => Some(self.operand_arms(rhs, "r2".to_string())?),
         };
         let pred = match (&l_set, &l_scalar, &r_set, &r_scalar) {
             (Some(l), _, Some(r), _) => class_list_compare(l, op, r),
@@ -1388,8 +1626,14 @@ impl<'a> Compiler<'a> {
     }
 
     /// The set `field` reads at position `n` (the part-3d design's section
-    /// 5.1), or `None` for a scalar field. **No wildcard arm**.
-    fn set_operand(&mut self, field: &Field, n: usize) -> Result<Option<SetOperand>, PlanError> {
+    /// 5.1), or `None` for a scalar field; a chain's resource value is bound
+    /// to `resource_var`. **No wildcard arm**.
+    fn set_operand(
+        &mut self,
+        field: &Field,
+        n: usize,
+        resource_var: &str,
+    ) -> Result<Option<SetOperand>, PlanError> {
         let var = format!("e{n}");
         let intrinsic = match field {
             Field::Attribute { scope, key } => {
@@ -1397,7 +1641,7 @@ impl<'a> Compiler<'a> {
                     AttrScope::Span | AttrScope::Instrumentation | AttrScope::Resource => Ok(None),
                     AttrScope::Event => Ok(Some(SetOperand::attribute(EVENT_ATTRS, key, var))),
                     AttrScope::Link => Ok(Some(SetOperand::attribute(LINK_ATTRS, key, var))),
-                    AttrScope::Unscoped => self.chain_set(key, n).map(Some),
+                    AttrScope::Unscoped => self.chain_set(key, n, resource_var).map(Some),
                 };
             }
             Field::Intrinsic(intrinsic) => *intrinsic,
@@ -1467,10 +1711,18 @@ impl<'a> Compiler<'a> {
     /// nested type`. At `service.name` a string is taken from the span row
     /// and every other arm from the resource row, as part 3b's operand
     /// does; the arm not taken is tagged 9, which `SC(k)` never answers.
-    fn chain_set(&mut self, key: &str, n: usize) -> Result<SetOperand, PlanError> {
+    ///
+    /// The resource value is bound to `resource_var`: `r<n>` for part 3d's
+    /// two lone fields, `cr<k>` for part 3e's occurrence `k`.
+    fn chain_set(
+        &mut self,
+        key: &str,
+        n: usize,
+        resource_var: &str,
+    ) -> Result<SetOperand, PlanError> {
         self.ctx.ok_or_else(|| needs_window(AttrScope::Unscoped))?;
         let q = self.resource_read(key)?;
-        let r = format!("r{n}");
+        let r = resource_var.to_string();
         let (span, events, links, scope) = (
             attr_path(ATTRS, key),
             attr_path(EVENT_ATTRS, key),

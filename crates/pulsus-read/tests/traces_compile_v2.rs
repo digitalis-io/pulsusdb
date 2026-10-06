@@ -692,25 +692,17 @@ fn t_c5_every_out_of_scope_field_refuses_and_names_itself() {
         assert!(got.is_ok(), "{query} must compile: {got:?}");
     }
 
-    // The expression-level constructs deferred to part 3e, each naming
-    // itself and its own part.
-    for (query, token, suffix) in [
-        (
-            r#"{ event.a = span.b + 1 }"#,
-            "event.",
-            "(issue #589 part 3e)",
-        ),
-        (r#"{ event.a + 1 = 2 }"#, "event.", "(issue #589 part 3e)"),
-        (r#"{ !event.a = span.b }"#, "event.", "(issue #589 part 3e)"),
-        (r#"{ .a + 1 = 2 }"#, ".", "(issue #589 part 3e)"),
+    // The expression-level constructs part 3e serves now compile; `.a`
+    // needs the window, so every row is compiled in a context.
+    for query in [
+        r#"{ event.a = span.b + 1 }"#,
+        r#"{ event.a + 1 = 2 }"#,
+        r#"{ !event.a = span.b }"#,
+        r#"{ .a + 1 = 2 }"#,
     ] {
-        match refusal(query) {
-            PlanError::UnsupportedField(msg) => assert!(
-                msg.contains(token) && msg.ends_with(suffix),
-                "{query}: the refusal must name {token:?} and end `{suffix}`, got {msg:?}"
-            ),
-            other => panic!("{query} must be UnsupportedField, got {other:?}"),
-        }
+        let got =
+            compile_span_predicate_in(&filter_body(query), &ctx()).map(|p| p.sql().to_string());
+        assert!(got.is_ok(), "{query} must compile: {got:?}");
     }
     assert_eq!(
         compile_span_predicate(&FieldExpr::Literal(Value::Number("5".to_string())))
@@ -1831,12 +1823,7 @@ fn not_element_text(e: &str, scope: AttrScope, key: &str, all: bool) -> String {
 /// `key` carries no `.`, so the resource scope is not `service.name`'s.
 fn not_chain_text(key: &str, all: bool) -> String {
     assert!(!key.contains('.'), "service.name's chain is T-C23's own");
-    let c_span =
-        format!("dynamicType(attrs.`{key}`) != 'None' AND dynamicType(attrs.`{key}`) != 'Bool'");
     let t_span = format!("coalesce(attrs.`{key}`.:Bool = false, false)");
-    let c_in = format!(
-        "dynamicType(scope_attrs.`{key}`) != 'None' AND dynamicType(scope_attrs.`{key}`) != 'Bool'"
-    );
     let t_in = format!("coalesce(scope_attrs.`{key}`.:Bool = false, false)");
     let p = |scope: AttrScope| presence_fixed(scope, key);
     let t = format!(
@@ -1850,7 +1837,20 @@ fn not_chain_text(key: &str, all: bool) -> String {
         not_element_match("links", key, all),
         p(AttrScope::Instrumentation),
     );
-    let c = format!(
+    let c = not_chain_demand(key);
+    format!("(throwIf({c}, 'expression (!.{key}) expected a boolean') + toUInt8({t})) = 1")
+}
+
+/// `!.key`'s demand condition in [`ctx`]: each scope's, chosen by the
+/// chain. `key` carries no `.`.
+fn not_chain_demand(key: &str) -> String {
+    let c_span =
+        format!("dynamicType(attrs.`{key}`) != 'None' AND dynamicType(attrs.`{key}`) != 'Bool'");
+    let c_in = format!(
+        "dynamicType(scope_attrs.`{key}`) != 'None' AND dynamicType(scope_attrs.`{key}`) != 'Bool'"
+    );
+    let p = |scope: AttrScope| presence_fixed(scope, key);
+    format!(
         "multiIf({}, {c_span}, {}, {}, {}, {}, {}, {}, {}, {c_in}, false)",
         p(AttrScope::Span),
         p(AttrScope::Resource),
@@ -1860,8 +1860,7 @@ fn not_chain_text(key: &str, all: bool) -> String {
         p(AttrScope::Link),
         not_element_demand("links", key),
         p(AttrScope::Instrumentation),
-    );
-    format!("(throwIf({c}, 'expression (!.{key}) expected a boolean') + toUInt8({t})) = 1")
+    )
 }
 
 // ---------------------------------------------------------------------
@@ -2874,21 +2873,24 @@ fn span_chain(nodes: usize) -> String {
     vec!["span.a"; nodes + 1].join(" + ")
 }
 
-/// `T-C32`: a deferred operand inside arithmetic is refused before a zero
-/// divisor folds to `false`; folding comes before the refusal for a lone
+/// `T-C32`: a zero divisor folds the comparison to `false`, a set operand
+/// beside it included; folding comes before anything else for a lone
 /// field; the cap counts across the predicate and not a folded subtree.
 #[test]
 fn t_c32_the_order_of_the_rules_and_the_cap() {
     // A lone set opposite a side folding to no value is `false` (part 3d's
-    // decision 8); inside arithmetic the set is refused before the side
-    // is folded.
-    assert_eq!(rendered(r#"{ 1 / 0 = event.a }"#), "false");
-    match refusal(r#"{ 1 / 0 = event.a + 1 }"#) {
-        PlanError::UnsupportedField(msg) => assert!(
-            msg.contains("event.") && msg.ends_with("(issue #589 part 3e)"),
-            "the event operand's refusal, got {msg:?}"
-        ),
-        other => panic!("must be UnsupportedField, got {other:?}"),
+    // decision 8), and so is a set inside arithmetic beside one, under
+    // every operator: the comparison is `false` before any set loop is
+    // built, so an empty set's `!=` does not override it (part 3e's
+    // decision 15).
+    for query in [
+        r#"{ 1 / 0 = event.a }"#,
+        r#"{ 1 / 0 = event.a + 1 }"#,
+        r#"{ event.a + 1 / 0 = 2 }"#,
+        r#"{ event.a + 1 / 0 != 2 }"#,
+        r#"{ 1 / 0 != event.a + 1 }"#,
+    ] {
+        assert_eq!(rendered(query), "false", "{query}");
     }
     assert_eq!(
         rendered(r#"{ event.a = 1 + 1 }"#),
@@ -3150,6 +3152,12 @@ fn set_operands() -> Vec<SetSpec> {
 /// `C(k)`, section 5.4, for the chain at position `n`: every scope's value
 /// tagged with its scope, the elements of the first scope holding `k` kept.
 fn chain_c(key: &str, n: usize) -> String {
+    chain_c_over(key, &format!("r{n}"))
+}
+
+/// [`chain_c`] reading its resource value from the variable `rv`: part
+/// 3e binds a chain occurrence's value to `cr<k>`.
+fn chain_c_over(key: &str, rv: &str) -> String {
     let k = key.replace('.', "%2E");
     let (span, ev, lk, sc) = (
         format!("attrs.`{k}`"),
@@ -3157,16 +3165,16 @@ fn chain_c(key: &str, n: usize) -> String {
         format!("links.attrs.`{k}`"),
         format!("scope_attrs.`{k}`"),
     );
-    let (pr, rv, rt) = if key == "service.name" {
+    let (pr, values, rt) = if key == "service.name" {
         (
-            format!("(service_type = 'string' OR dynamicType(r{n}) != 'None')"),
-            format!("[CAST(CAST(service, 'String'), 'Dynamic')], [r{n}]"),
+            format!("(service_type = 'string' OR dynamicType({rv}) != 'None')"),
+            format!("[CAST(CAST(service, 'String'), 'Dynamic')], [{rv}]"),
             "[if(service_type = 'string', 2, 9)], [if(service_type = 'string', 9, 2)]".to_string(),
         )
     } else {
         (
-            format!("dynamicType(r{n}) != 'None'"),
-            format!("[r{n}]"),
+            format!("dynamicType({rv}) != 'None'"),
+            format!("[{rv}]"),
             "[2]".to_string(),
         )
     };
@@ -3176,7 +3184,7 @@ fn chain_c(key: &str, n: usize) -> String {
          dynamicType({sc}) != 'None', 5, 0)"
     );
     format!(
-        "arrayFilter((d, g) -> g = {tag} AND dynamicType(d) != 'None', arrayConcat([{span}], {rv}, \
+        "arrayFilter((d, g) -> g = {tag} AND dynamicType(d) != 'None', arrayConcat([{span}], {values}, \
          {ev}, {lk}, [{sc}]), arrayConcat([1], {rt}, arrayMap(d -> 3, {ev}), arrayMap(d -> 4, \
          {lk}), [5]))"
     )
@@ -3655,9 +3663,8 @@ fn t_c35_the_set_comparison_texts() {
     );
 }
 
-/// `T-C36`: the chain needs its window and an event set does not; every
-/// construct section 1 hands on is refused naming part 3e; the regex
-/// operators keep part 3a's refusal.
+/// `T-C36`: the chain needs its window and an event set does not; the
+/// regex operators keep part 3a's refusal.
 #[test]
 fn t_c36_the_set_operand_refusals() {
     assert_eq!(
@@ -3668,22 +3675,6 @@ fn t_c36_the_set_operand_refusals() {
         compile_span_predicate(&filter_body(r#"{ event.a = span.b }"#)).is_ok(),
         "an event set needs no context"
     );
-    for query in [
-        r#"{ !event.a = span.b }"#,
-        r#"{ span.b = !link.a }"#,
-        r#"{ !.a = span.b }"#,
-        r#"{ .a + 1 = span.b }"#,
-        r#"{ event:name = span.b + 1 }"#,
-        r#"{ event.a = 2.0 ^ 0.5 }"#,
-    ] {
-        match compile_span_predicate_in(&filter_body(query), &ctx()) {
-            Err(PlanError::UnsupportedField(msg)) => assert!(
-                msg.ends_with("(issue #589 part 3e)"),
-                "{query}: the refusal must end `(issue #589 part 3e)`, got {msg:?}"
-            ),
-            other => panic!("{query} must be UnsupportedField, got {other:?}"),
-        }
-    }
     assert_eq!(
         refusal(r#"{ event.a =~ link.a }"#),
         PlanError::TypeMismatch(
@@ -3738,10 +3729,15 @@ fn t_c38_leaf(operand: &str, leaf: &str) -> String {
 /// What one `T-C38` row expects of every operand.
 enum Shape {
     Leaf(&'static str),
-    Not { all: bool },
+    Not {
+        all: bool,
+    },
     False,
-    Refuse,
-    Exists { negated: bool },
+    /// Part 3e's build, from [`ex_expected`].
+    Expr(ExShape),
+    Exists {
+        negated: bool,
+    },
     Pair,
     Regex,
 }
@@ -3771,19 +3767,19 @@ fn t_c38_every_compile_path_for_every_set_operand() {
         ("{ 1 / 0 = {F} }", Shape::False),
         ("{ {F} < 1 % 0 }", Shape::False),
         ("{ 1 % 0 < {F} }", Shape::False),
-        ("{ 1 / 0 = {F} + 1 }", Shape::Refuse),
-        ("{ {F} = 2.0 ^ 0.5 }", Shape::Refuse),
+        ("{ 1 / 0 = {F} + 1 }", Shape::False),
+        ("{ {F} = 2.0 ^ 0.5 }", Shape::Expr(ExShape::VsPow)),
         ("{ {F} != nil }", Shape::Exists { negated: false }),
         ("{ {F} = nil }", Shape::Exists { negated: true }),
         ("{ {F} = span.a }", Shape::Pair),
         ("{ span.a = {F} }", Shape::Pair),
         ("{ {F} = {G} }", Shape::Pair),
         ("{ {F} =~ span.b }", Shape::Regex),
-        ("{ {F} + 1 = 2 }", Shape::Refuse),
-        ("{ {F} = span.b + 1 }", Shape::Refuse),
-        ("{ !{F} = span.b }", Shape::Refuse),
-        ("{ span.b = !{F} }", Shape::Refuse),
-        ("{ {F} = (span.b = 1) }", Shape::Refuse),
+        ("{ {F} + 1 = 2 }", Shape::Expr(ExShape::PlusOneVsTwo)),
+        ("{ {F} = span.b + 1 }", Shape::Expr(ExShape::VsSpanBPlusOne)),
+        ("{ !{F} = span.b }", Shape::Expr(ExShape::NotVsSpanB)),
+        ("{ span.b = !{F} }", Shape::Expr(ExShape::SpanBVsNot)),
+        ("{ {F} = (span.b = 1) }", Shape::Expr(ExShape::VsBool)),
     ];
     let sets = set_operands();
     let span_a = ff_attr(AttrScope::Span, "attrs", "a");
@@ -3821,16 +3817,7 @@ fn t_c38_every_compile_path_for_every_set_operand() {
                     _ => bool_err(),
                 }),
                 Shape::False => outcome(Ok("false".to_string())),
-                Shape::Refuse => outcome(Err(PlanError::UnsupportedField(match &set.field {
-                    Field::Attribute { scope, .. } => format!(
-                        "an expression with a \"{scope}\" operand is not supported by the \
-                         span-scope predicate compiler yet (issue #589 part 3e)"
-                    ),
-                    Field::Intrinsic(i) => format!(
-                        "an expression with {i} is not supported by the span-scope predicate \
-                         compiler yet (issue #589 part 3e)"
-                    ),
-                }))),
+                Shape::Expr(shape) => outcome(ex_expected(*shape, set, g, ComparisonOp::Eq)),
                 Shape::Exists { negated } => outcome(match set.kind {
                     SetKind::Attr(root, key) => {
                         let present =
@@ -3908,4 +3895,618 @@ fn t_c39_not_over_a_set_and_the_folded_side() {
     );
     assert_eq!(rendered(r#"{ event:name = 1 / 0 }"#), "false");
     assert_eq!(rendered_in(r#"{ .a < 1 % 0 }"#), "false");
+}
+
+// =====================================================================
+// Issue #589 part 3e — event, link and unscoped operands in expressions
+// =====================================================================
+
+/// One occurrence of a set operand (part 3e's section 5.1): its element
+/// variable `e<k>`, its set, a chain's variable `c<k>`, `C(k)` over `cr<k>`
+/// and `V(k)`, and whether it is a `!F` side.
+struct ExOcc {
+    var: String,
+    array: String,
+    chain: Option<(String, String, String)>,
+    negated: bool,
+}
+
+/// What the operands of one comparison contribute to section 5.4's build,
+/// in pre-order, left side first.
+#[derive(Default)]
+struct ExFrame {
+    occurrences: Vec<ExOcc>,
+    /// Decision 11's presences of the scalar field leaves.
+    scalars: Vec<String>,
+    /// The arithmetic sides' `a<n>` and their tuples.
+    a_binds: Vec<(String, String)>,
+    /// `!F`'s demands, `(condition, message)`.
+    demands: Vec<(String, String)>,
+}
+
+/// The part-3c typed `NULL` tuple of a leaf with no number.
+fn ax_no_number() -> Ax {
+    Ax {
+        text: format!("tuple({AX_NI}, {AX_NF})"),
+        dur: false,
+    }
+}
+
+/// Unary minus over `x`: part 3c's node.
+fn ax_neg(x: &Ax) -> Ax {
+    Ax {
+        text: format!(
+            "arrayElement(arrayMap(pl -> tuple({}, negate(tupleElement(pl, 2))), [{}]), 1)",
+            ax_neg_int("tupleElement(pl, 1)"),
+            x.text
+        ),
+        dur: x.dur,
+    }
+}
+
+impl ExFrame {
+    /// Registers `set` as the next occurrence and returns its number.
+    fn occurrence(&mut self, set: &SetSpec, negated: bool) -> usize {
+        let k = self.occurrences.len() + 1;
+        let chain = match set.kind {
+            SetKind::Chain(key) => Some((
+                format!("c{k}"),
+                chain_c_over(key, &format!("cr{k}")),
+                v_of(&ff_resource_path(key)),
+            )),
+            _ => None,
+        };
+        self.occurrences.push(ExOcc {
+            var: format!("e{k}"),
+            array: set.array(k),
+            chain,
+            negated,
+        });
+        k
+    }
+
+    /// A lone set field side: part 3d's element arms over `e<k>`.
+    fn set_side(&mut self, set: &SetSpec) -> FfOperand {
+        let k = self.occurrence(set, false);
+        set.element(k)
+    }
+
+    /// `!F` as a side (section 5.3), `F` an attribute or chain set.
+    fn not_side(&mut self, set: &SetSpec) -> FfOperand {
+        let k = self.occurrence(set, true);
+        let (condition, label) = match (set.kind, &set.field) {
+            (SetKind::Attr(root, key), Field::Attribute { scope, .. }) => (
+                not_element_demand(root.trim_end_matches(".attrs"), key),
+                format!("{scope}{key}"),
+            ),
+            (SetKind::Chain(key), _) => (not_chain_demand(key), format!(".{key}")),
+            _ => panic!("an intrinsic `!F` is refused"),
+        };
+        self.demands.push((
+            condition,
+            format!("expression (!{label}) expected a boolean"),
+        ));
+        FfOperand {
+            field: set.field.clone(),
+            arms: vec![("b", format!("(NOT dynamicElement(e{k}, 'Bool'))"))],
+            nullable: true,
+            needs_ctx: false,
+            types: None,
+            s_on_span_row: false,
+            bind: false,
+        }
+    }
+
+    /// A set leaf inside arithmetic (section 5.2).
+    fn set_leaf(&mut self, set: &SetSpec) -> Ax {
+        let k = self.occurrence(set, false);
+        match set.kind {
+            SetKind::Attr(..) | SetKind::Chain(_) => Ax {
+                text: format!(
+                    "tuple(toInt256(dynamicElement(e{k}, 'Int64')), dynamicElement(e{k}, \
+                     'Float64'))"
+                ),
+                dur: false,
+            },
+            SetKind::TimeSinceStart => Ax {
+                text: format!("tuple(toInt256(e{k}), {AX_NF})"),
+                dur: true,
+            },
+            SetKind::EventName | SetKind::LinkSpanId | SetKind::LinkTraceId => ax_no_number(),
+        }
+    }
+
+    /// A span attribute, lone or in arithmetic: decision 11's presence.
+    fn span_attr(&mut self, key: &str) {
+        self.scalars
+            .push(format!("dynamicType(attrs.`{key}`) != 'None'"));
+    }
+
+    /// An arithmetic side `n`: its tuple bound to `a<n>`.
+    fn arith_side(&mut self, n: usize, ax: Ax) -> FfOperand {
+        let a = format!("a{n}");
+        self.a_binds.push((a.clone(), ax.text));
+        FfOperand {
+            field: attr("unused"),
+            arms: vec![
+                ("i", format!("tupleElement({a}, 1)")),
+                ("f", format!("tupleElement({a}, 2)")),
+            ],
+            nullable: true,
+            needs_ctx: false,
+            types: None,
+            s_on_span_row: false,
+            bind: false,
+        }
+    }
+
+    /// Section 5.4's build over the two sides' arms.
+    fn build(&self, l: &FfOperand, op: ComparisonOp, r: &FfOperand) -> String {
+        let neq = op == ComparisonOp::Neq;
+        let text = match ff_body(l, op, r) {
+            Some(body) => Some(body),
+            None if neq => Some("false".to_string()),
+            None => None,
+        };
+        let text = match text {
+            None => "false".to_string(),
+            Some(body) => self.loops(body, neq),
+        };
+        if self.demands.is_empty() {
+            return text;
+        }
+        let mut sql = String::from("(");
+        for (condition, message) in &self.demands {
+            sql.push_str(&format!("throwIf({condition}, '{message}') + "));
+        }
+        format!("{sql}toUInt8({text})) = 1")
+    }
+
+    fn loops(&self, body: String, neq: bool) -> String {
+        // 1. the arithmetic sides' bindings.
+        let mut text = ex_bind(&self.a_binds, body);
+        // 2. each occurrence, last first.
+        for occ in self.occurrences.iter().rev() {
+            let f = if neq { "arrayAll" } else { "arrayExists" };
+            text = format!("{f}({} -> {text}, {})", occ.var, occ.array);
+        }
+        // 3. `!=`: the presences — the scalar leaves, then the chains, then
+        //    the `!F` sets — each text once.
+        if neq {
+            let mut presences: Vec<String> = Vec::new();
+            let chains = self
+                .occurrences
+                .iter()
+                .filter_map(|o| o.chain.as_ref().map(|(c, _, _)| format!("notEmpty({c})")));
+            let negated = self
+                .occurrences
+                .iter()
+                .filter(|o| o.negated)
+                .map(|o| format!("notEmpty({})", o.array));
+            for p in self.scalars.iter().cloned().chain(chains).chain(negated) {
+                if !presences.contains(&p) {
+                    presences.push(p);
+                }
+            }
+            if !presences.is_empty() {
+                text = format!("({} AND {text})", presences.join(" AND "));
+            }
+        }
+        // 4. each chain, last first.
+        for occ in self.occurrences.iter().rev() {
+            if let Some((c, chain, _)) = &occ.chain {
+                text = format!("arrayExists({c} -> {text}, [{chain}])");
+            }
+        }
+        // 5. the chains' resource values (no lone resource field here).
+        let cr: Vec<(String, String)> = self
+            .occurrences
+            .iter()
+            .enumerate()
+            .filter_map(|(i, o)| {
+                o.chain
+                    .as_ref()
+                    .map(|(_, _, v)| (format!("cr{}", i + 1), v.clone()))
+            })
+            .collect();
+        ex_bind(&cr, text)
+    }
+}
+
+/// Part 3c's binding of values to variables, one lambda over one-element
+/// arrays.
+fn ex_bind(binds: &[(String, String)], body: String) -> String {
+    match binds {
+        [] => body,
+        [(v, x)] => format!("arrayExists({v} -> {body}, [{x}])"),
+        many => {
+            let vars: Vec<&str> = many.iter().map(|(v, _)| v.as_str()).collect();
+            let values: Vec<String> = many.iter().map(|(_, x)| format!("[{x}]")).collect();
+            format!(
+                "arrayExists(({}) -> {body}, {})",
+                vars.join(", "),
+                values.join(", ")
+            )
+        }
+    }
+}
+
+/// The shapes part 3e serves, each with `F` a set operand and `G` the
+/// second one of `T-C38`.
+#[derive(Clone, Copy, Debug)]
+enum ExShape {
+    /// `{ F + 1 op span.a }`
+    PlusOneVsSpanA,
+    /// `{ span.a op F * 2 }`
+    SpanAVsTimesTwo,
+    /// `{ -F op 0 }`
+    NegVsZero,
+    /// `{ F op (span.b = 1) }`
+    VsBool,
+    /// `{ !F op span.a }`
+    NotVsSpanA,
+    /// `{ F + G op 1 }`
+    PlusG,
+    /// `{ F op 2.0 ^ 0.5 }`
+    VsPow,
+    /// `{ F + 1 op 2 }`
+    PlusOneVsTwo,
+    /// `{ F op span.b + 1 }`
+    VsSpanBPlusOne,
+    /// `{ !F op span.b }`
+    NotVsSpanB,
+    /// `{ span.b op !F }`
+    SpanBVsNot,
+}
+
+impl ExShape {
+    fn query(self, f: &str, g: &str, op: ComparisonOp) -> String {
+        let op = ff_symbol(op);
+        match self {
+            ExShape::PlusOneVsSpanA => format!("{{ {f} + 1 {op} span.a }}"),
+            ExShape::SpanAVsTimesTwo => format!("{{ span.a {op} {f} * 2 }}"),
+            ExShape::NegVsZero => format!("{{ -{f} {op} 0 }}"),
+            ExShape::VsBool => format!("{{ {f} {op} (span.b = 1) }}"),
+            ExShape::NotVsSpanA => format!("{{ !{f} {op} span.a }}"),
+            ExShape::PlusG => format!("{{ {f} + {g} {op} 1 }}"),
+            ExShape::VsPow => format!("{{ {f} {op} 2.0 ^ 0.5 }}"),
+            ExShape::PlusOneVsTwo => format!("{{ {f} + 1 {op} 2 }}"),
+            ExShape::VsSpanBPlusOne => format!("{{ {f} {op} span.b + 1 }}"),
+            ExShape::NotVsSpanB => format!("{{ !{f} {op} span.b }}"),
+            ExShape::SpanBVsNot => format!("{{ span.b {op} !{f} }}"),
+        }
+    }
+}
+
+/// A literal's arms.
+fn ex_literal(digits: &str) -> FfOperand {
+    ff_intrinsic(Intrinsic::Duration, "i", digits)
+}
+
+/// What part 3e compiles `shape` to in [`ctx`], from this file's own copy
+/// of section 5: the build of 5.4 over part 3c's node rules and part 3a's
+/// terms, or 5.3's refusal of an intrinsic `!F`.
+fn ex_expected(
+    shape: ExShape,
+    set: &SetSpec,
+    g: &SetSpec,
+    op: ComparisonOp,
+) -> Result<String, PlanError> {
+    let mut fr = ExFrame::default();
+    let intrinsic_not = || {
+        Err(PlanError::TypeMismatch(format!(
+            "expression (!{}) expected a boolean",
+            set.field
+        )))
+    };
+    let is_attr_or_chain = matches!(set.kind, SetKind::Attr(..) | SetKind::Chain(_));
+    let (l, r) = match shape {
+        ExShape::PlusOneVsSpanA => {
+            let leaf = fr.set_leaf(set);
+            let l = fr.arith_side(1, ax_bin("+", &leaf, &ax_int("1", false)));
+            fr.span_attr("a");
+            (l, ff_attr(AttrScope::Span, "attrs", "a"))
+        }
+        ExShape::SpanAVsTimesTwo => {
+            fr.span_attr("a");
+            let leaf = fr.set_leaf(set);
+            let r = fr.arith_side(2, ax_bin("*", &leaf, &ax_int("2", false)));
+            (ff_attr(AttrScope::Span, "attrs", "a"), r)
+        }
+        ExShape::NegVsZero => {
+            let leaf = fr.set_leaf(set);
+            (fr.arith_side(1, ax_neg(&leaf)), ex_literal("0"))
+        }
+        ExShape::VsBool => {
+            let l = fr.set_side(set);
+            let b = "((coalesce(attrs.`b`.:Int64 = 1, false) OR coalesce(attrs.`b`.:Float64 = 1, \
+                     false)))";
+            (l, ff_intrinsic(Intrinsic::Name, "b", b))
+        }
+        ExShape::NotVsSpanA => {
+            if !is_attr_or_chain {
+                return intrinsic_not();
+            }
+            let l = fr.not_side(set);
+            fr.span_attr("a");
+            (l, ff_attr(AttrScope::Span, "attrs", "a"))
+        }
+        ExShape::PlusG => {
+            let a = fr.set_leaf(set);
+            let b = fr.set_leaf(g);
+            (fr.arith_side(1, ax_bin("+", &a, &b)), ex_literal("1"))
+        }
+        ExShape::VsPow => {
+            let l = fr.set_side(set);
+            let r = fr.arith_side(2, ax_bin("^", &ax_float("2"), &ax_float("0.5")));
+            (l, r)
+        }
+        ExShape::PlusOneVsTwo => {
+            let leaf = fr.set_leaf(set);
+            (
+                fr.arith_side(1, ax_bin("+", &leaf, &ax_int("1", false))),
+                ex_literal("2"),
+            )
+        }
+        ExShape::VsSpanBPlusOne => {
+            let l = fr.set_side(set);
+            fr.span_attr("b");
+            let r = fr.arith_side(2, ax_bin("+", &ax_attr("attrs", "b"), &ax_int("1", false)));
+            (l, r)
+        }
+        ExShape::NotVsSpanB => {
+            if !is_attr_or_chain {
+                return intrinsic_not();
+            }
+            let l = fr.not_side(set);
+            fr.span_attr("b");
+            (l, ff_attr(AttrScope::Span, "attrs", "b"))
+        }
+        ExShape::SpanBVsNot => {
+            if !is_attr_or_chain {
+                return intrinsic_not();
+            }
+            fr.span_attr("b");
+            let r = fr.not_side(set);
+            (ff_attr(AttrScope::Span, "attrs", "b"), r)
+        }
+    };
+    Ok(fr.build(&l, op, &r))
+}
+
+/// `T-C40`'s six shapes.
+const T_C40_SHAPES: [ExShape; 6] = [
+    ExShape::PlusOneVsSpanA,
+    ExShape::SpanAVsTimesTwo,
+    ExShape::NegVsZero,
+    ExShape::VsBool,
+    ExShape::NotVsSpanA,
+    ExShape::PlusG,
+];
+
+/// `T-C38`'s `G` for `set`: `event:name`, or `link:spanID` opposite it.
+fn second_set<'a>(sets: &'a [SetSpec], set: &SetSpec) -> &'a SetSpec {
+    if matches!(set.kind, SetKind::EventName) {
+        &sets[4]
+    } else {
+        &sets[2]
+    }
+}
+
+/// `T-C40`: the seven set operands × six shapes × the six operators — 252
+/// cells — each the exact text this file builds from its own copy of
+/// section 5, or 5.3's exact refusal.
+#[test]
+fn t_c40_set_operands_in_expressions_are_the_generated_cross_product() {
+    let sets = set_operands();
+    let mut cells = 0usize;
+    for set in &sets {
+        let g = second_set(&sets, set);
+        for shape in T_C40_SHAPES {
+            for op in FF_OPS {
+                cells += 1;
+                let query = shape.query(&set.field.to_string(), &g.field.to_string(), op);
+                let got = compile_span_predicate_in(&filter_body(&query), &ctx())
+                    .map(|p| p.sql().to_string());
+                assert_eq!(got, ex_expected(shape, set, g, op), "{query}");
+            }
+        }
+    }
+    assert_eq!(cells, 252);
+}
+
+/// `T-C41`: section 5.5's texts, byte for byte, `V(a)` and `C(a)` spelled
+/// out from [`ctx`].
+#[test]
+fn t_c41_the_set_expression_texts() {
+    assert_eq!(
+        rendered(r#"{ -event.a > 0 }"#),
+        "arrayExists(e1 -> arrayExists(a1 -> (coalesce(tupleElement(a1, 1) > 0, false) OR \
+         coalesce(tupleElement(a1, 2) > 0, false)), [arrayElement(arrayMap(pl -> \
+         tuple(if(tupleElement(pl, 1) != 0 AND negate(tupleElement(pl, 1)) = tupleElement(pl, \
+         1), NULL, negate(tupleElement(pl, 1))), negate(tupleElement(pl, 2))), \
+         [tuple(toInt256(dynamicElement(e1, 'Int64')), dynamicElement(e1, 'Float64'))]), 1)]), \
+         arrayFilter(d -> dynamicType(d) != 'None', events.attrs.`a`))"
+    );
+    assert_eq!(
+        rendered(r#"{ event:timeSinceStart / 1ms > 9.5 }"#),
+        "arrayExists(e1 -> arrayExists(a1 -> (coalesce(tupleElement(a1, 1) > toFloat64('9.5'), \
+         false) OR coalesce(tupleElement(a1, 2) > toFloat64('9.5'), false)), \
+         [arrayElement(arrayMap((pl, pr) -> tuple(CAST(NULL, 'Nullable(Int256)'), \
+         coalesce(tupleElement(pl, 2), toFloat64(tupleElement(pl, 1))) / \
+         coalesce(tupleElement(pr, 2), toFloat64(tupleElement(pr, 1)))), [tuple(toInt256(e1), \
+         CAST(NULL, 'Nullable(Float64)'))], [tuple(toInt256(1000000), CAST(NULL, \
+         'Nullable(Float64)'))]), 1)]), arrayMap(t -> toInt128(t) - start_ns, events.time_ns))"
+    );
+    assert_eq!(
+        rendered(r#"{ !event.f = span.g }"#),
+        "(throwIf(arrayExists(d -> dynamicType(d) != 'None' AND dynamicType(d) != 'Bool', \
+         events.attrs.`f`), 'expression (!event.f) expected a boolean') + \
+         toUInt8(arrayExists(e1 -> (coalesce((NOT dynamicElement(e1, 'Bool')) = \
+         attrs.`g`.:Bool, false) OR arrayExists(x -> coalesce((NOT dynamicElement(e1, 'Bool')) = \
+         x, false), attrs.`g`.:`Array(Nullable(Bool))`)), arrayFilter(d -> dynamicType(d) != \
+         'None', events.attrs.`f`)))) = 1"
+    );
+    // A duration divided by a plain number divides as a float: the
+    // element's duration flag, not the divisor's, decides it.
+    let tss = Ax {
+        text: format!("tuple(toInt256(e1), {AX_NF})"),
+        dur: true,
+    };
+    assert_eq!(
+        rendered(r#"{ event:timeSinceStart / 7 > 1392857.1 }"#),
+        format!(
+            "arrayExists(e1 -> arrayExists(a1 -> (coalesce(tupleElement(a1, 1) > \
+             toFloat64('1392857.1'), false) OR coalesce(tupleElement(a1, 2) > \
+             toFloat64('1392857.1'), false)), [{}]), arrayMap(t -> toInt128(t) - start_ns, \
+             events.time_ns))",
+            ax_bin("/", &tss, &ax_int("7", false)).text
+        )
+    );
+    let plus = ax_bin("+", &ax_no_number(), &ax_int("1", false));
+    assert_eq!(
+        rendered(r#"{ event:name + 1 != 2 }"#),
+        format!(
+            "arrayAll(e1 -> arrayExists(a1 -> (coalesce(tupleElement(a1, 1) != 2, false) OR \
+             coalesce(tupleElement(a1, 2) != 2, false)), [{}]), events.name)",
+            plus.text
+        )
+    );
+    let c_a = "arrayFilter((d, g) -> g = multiIf(dynamicType(attrs.`a`) != 'None', 1, \
+               dynamicType(cr1) != 'None', 2, arrayExists(d -> dynamicType(d) != 'None', \
+               events.attrs.`a`), 3, arrayExists(d -> dynamicType(d) != 'None', \
+               links.attrs.`a`), 4, dynamicType(scope_attrs.`a`) != 'None', 5, 0) AND \
+               dynamicType(d) != 'None', arrayConcat([attrs.`a`], [cr1], events.attrs.`a`, \
+               links.attrs.`a`, [scope_attrs.`a`]), arrayConcat([1], [2], arrayMap(d -> 3, \
+               events.attrs.`a`), arrayMap(d -> 4, links.attrs.`a`), [5]))";
+    let a1 = FfOperand {
+        field: attr("unused"),
+        arms: vec![
+            ("i", "tupleElement(a1, 1)".to_string()),
+            ("f", "tupleElement(a1, 2)".to_string()),
+        ],
+        nullable: true,
+        needs_ctx: false,
+        types: None,
+        s_on_span_row: false,
+        bind: false,
+    };
+    let terms = ff_body(
+        &a1,
+        ComparisonOp::Neq,
+        &ff_attr(AttrScope::Span, "attrs", "c"),
+    )
+    .expect("terms");
+    let node = ax_bin(
+        "+",
+        &Ax {
+            text: "tuple(toInt256(dynamicElement(e1, 'Int64')), dynamicElement(e1, 'Float64'))"
+                .to_string(),
+            dur: false,
+        },
+        &ax_int("1", false),
+    );
+    assert_eq!(
+        rendered_in(r#"{ .a + 1 != span.c }"#),
+        format!(
+            "arrayExists(cr1 -> arrayExists(c1 -> (dynamicType(attrs.`c`) != 'None' AND \
+             notEmpty(c1) AND arrayAll(e1 -> arrayExists(a1 -> {terms}, [{}]), c1)), [{c_a}]), \
+             [{}])",
+            node.text,
+            v_of("attrs.`a`")
+        )
+    );
+}
+
+/// The refusal of a third set operand (decision 13).
+fn too_many_sets() -> PlanError {
+    PlanError::UnsupportedField(
+        "a comparison with more than 2 event, link or unscoped operands is not supported"
+            .to_string(),
+    )
+}
+
+/// `T-C42`: decision 13's cap, counted per occurrence across both sides;
+/// no outcome of `T-C38`'s or `T-C40`'s cells names a part of #589; the
+/// refusals parts 3a–3d keep are unchanged.
+#[test]
+fn t_c42_the_limits_and_the_refusals_that_remain() {
+    for query in [
+        r#"{ event.a + link.a + event.b > 1 }"#,
+        r#"{ event.a + event.b = link.a }"#,
+        r#"{ event.a - event.a = event.a }"#,
+        // The cap is applied before a side folding to no value makes the
+        // comparison `false`, in either order.
+        r#"{ event.a + event.a + event.a + 1 / 0 != 2 }"#,
+        r#"{ 2 != event.a + event.a + event.a + 1 / 0 }"#,
+    ] {
+        assert_eq!(
+            compile_span_predicate_in(&filter_body(query), &ctx()).map(|p| p.sql().to_string()),
+            Err(too_many_sets()),
+            "{query}"
+        );
+    }
+    for query in [
+        r#"{ event.a + link.a > 1 }"#,
+        r#"{ event.a - event.a = 1 }"#,
+    ] {
+        assert!(
+            compile_span_predicate_in(&filter_body(query), &ctx()).is_ok(),
+            "{query} compiles"
+        );
+    }
+
+    // No outcome names a part of #589.
+    let sets = set_operands();
+    let mut queries: Vec<String> = Vec::new();
+    for set in &sets {
+        let f = set.field.to_string();
+        let g = second_set(&sets, set).field.to_string();
+        for shape in T_C40_SHAPES {
+            for op in FF_OPS {
+                queries.push(shape.query(&f, &g, op));
+            }
+        }
+        for template in [
+            "{ 1 / 0 = {F} + 1 }",
+            "{ {F} = 2.0 ^ 0.5 }",
+            "{ {F} + 1 = 2 }",
+            "{ {F} = span.b + 1 }",
+            "{ !{F} = span.b }",
+            "{ span.b = !{F} }",
+            "{ {F} = (span.b = 1) }",
+        ] {
+            queries.push(template.replace("{F}", &f));
+        }
+    }
+    assert_eq!(queries.len(), 7 * (36 + 7));
+    for query in &queries {
+        let got = outcome(
+            compile_span_predicate_in(&filter_body(query), &ctx()).map(|p| p.sql().to_string()),
+        );
+        assert!(!got.contains("#589 part"), "{query}: {got}");
+    }
+
+    // The refusals parts 3a–3d keep.
+    assert_eq!(
+        refusal(r#"{ event.a =~ span.b }"#),
+        PlanError::TypeMismatch(
+            "a field-against-field comparison does not support regex operators".to_string()
+        )
+    );
+    assert_eq!(
+        refusal(r#"{ event.a + nestedSetLeft > 1 }"#),
+        PlanError::UnsupportedField(
+            "nestedSetLeft is not supported by the span-scope predicate compiler yet (issue #594)"
+                .to_string()
+        )
+    );
+    assert_eq!(
+        refusal(r#"{ .a + 1 = 2 }"#),
+        PlanError::UnsupportedField(UNSCOPED_NEEDS_WINDOW.to_string())
+    );
+    assert_eq!(
+        refusal(r#"{ event.a + resource.r > 1 }"#),
+        PlanError::UnsupportedField(RESOURCE_NEEDS_WINDOW.to_string())
+    );
 }
