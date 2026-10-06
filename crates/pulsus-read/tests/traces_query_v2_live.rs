@@ -9,7 +9,7 @@
 //! assertions, and the two halves meet at `T-C4`, which freezes the exact
 //! statement this suite issues.
 //!
-//! **Nine fixtures, each test function in its own database.**
+//! **Ten fixtures, each test function in its own database.**
 //!
 //! * The worked fixture of `docs/TraceQL/functional-requirements.md` §6.1 —
 //!   three traces, nine spans, every attribute type, one event, one link,
@@ -41,6 +41,10 @@
 //!   past 2^53 and 2^63, zero and `-1` divisors, exact powers at the edges of
 //!   256-bit integers, mixed and absent operands, boolean-valued sides, and
 //!   doubles at the 64- and 128-bit edges.
+//! * Fixture Z — thirty-two spans, one resource each, for comparing an
+//!   event, link or unscoped operand with another field: any element and
+//!   every element, empty sets, two sets pair by pair, the four event and
+//!   link intrinsics, the chain's scope order, and resource rows deleted.
 //!
 //! Each is seeded by building the OTLP request bodies and handing them to
 //! `pulsus_write::parse_trace_landing`, then inserting the rows it
@@ -2901,6 +2905,12 @@ const CASES_C: &[CaseIn] = &[
         query: r#"{ 1 = 1 }"#,
         want: Want::Ids(ALL_C),
     },
+    // #589 part 3d, section 8.2: row 114.
+    CaseIn {
+        name: "CAT114",
+        query: r#"{ .a = .b }"#,
+        want: Want::Ids(&["002a"]),
+    },
 ];
 
 /// Section 10.2: the catalogue fixture.
@@ -4361,6 +4371,584 @@ async fn the_predicate_compiler_computes_arithmetic() {
         "{} of {} fixture-Y cases answer something else:\n\n{}",
         wrong.len(),
         CASES_Y.len(),
+        wrong.join("\n\n")
+    );
+}
+
+// ---------------------------------------------------------------------
+// #589 part 3d — fixture Z, event, link and unscoped operands
+// ---------------------------------------------------------------------
+
+/// `z01` to `z32`: span ids `000000000000e301` to `…e332`, the span's
+/// number written as decimal digits in the id's last byte.
+fn idz(short: &str) -> String {
+    format!("000000000000e3{}", short.trim_start_matches('z'))
+}
+
+/// One event of fixture Z: its offset from the span's start in
+/// microseconds, its name and its attributes.
+type ZEvent = (i64, &'static str, Vec<KeyValue>);
+
+/// One link of fixture Z: its trace id, the last byte of its span id, and
+/// its attributes.
+type ZLink = (Vec<u8>, u8, Vec<KeyValue>);
+
+/// One span of fixture Z: its number, its attributes, events and links,
+/// and its resource attributes besides `rz` and `service.name`.
+type ZSpan = (u8, Vec<KeyValue>, Vec<ZEvent>, Vec<ZLink>, Vec<KeyValue>);
+
+/// Fixture Z, the part-3d design's section 7.1: thirty-two requests, one
+/// span and one resource each. Every resource carries `rz = "zNN"`, so no
+/// two spans share a resource, and `service.name = "zsvc"` but `z28`'s,
+/// which is the integer 8.
+fn fixture_z_bodies(base_ns: i64) -> Vec<ExportTraceServiceRequest> {
+    const MS: i64 = 1_000_000;
+    const US: i64 = 1_000;
+    let st = |k: &str, v: &str| kv(k, str_value(v));
+    let it = |k: &str, v: i64| kv(k, int_value(v));
+    let db = |k: &str, v: f64| kv(k, double_value(v));
+    let bl = |k: &str, v: bool| kv(k, bool_value(v));
+    let ev = |offset_us: i64, attrs: Vec<KeyValue>| -> ZEvent { (offset_us, "e", attrs) };
+    let f1 = || vec![0xf1; 16];
+    let spans: Vec<ZSpan> = vec![
+        (
+            1,
+            vec![it("b", 7)],
+            vec![ev(1, vec![it("a", 5)]), ev(2, vec![it("a", 7)])],
+            Vec::new(),
+            Vec::new(),
+        ),
+        (
+            2,
+            vec![it("b", 5)],
+            vec![ev(1, vec![it("a", 5)]), ev(2, vec![st("a", "5")])],
+            Vec::new(),
+            Vec::new(),
+        ),
+        (
+            3,
+            vec![it("b", 3)],
+            vec![ev(1, vec![it("a", 1)]), ev(2, vec![it("a", 2)])],
+            Vec::new(),
+            Vec::new(),
+        ),
+        (
+            4,
+            vec![it("b", 3)],
+            vec![ev(1, vec![it("a", 1)]), ev(2, vec![st("a", "x")])],
+            Vec::new(),
+            Vec::new(),
+        ),
+        (
+            5,
+            vec![it("b", 3)],
+            vec![ev(1, vec![it("c", 1)])],
+            Vec::new(),
+            Vec::new(),
+        ),
+        (6, vec![it("b", 3)], Vec::new(), Vec::new(), Vec::new()),
+        (
+            7,
+            Vec::new(),
+            vec![ev(1, vec![it("a", 5)])],
+            Vec::new(),
+            Vec::new(),
+        ),
+        (
+            8,
+            vec![db("b", 9_007_199_254_740_992.0)],
+            vec![ev(1, vec![it("a", 9_007_199_254_740_993)])],
+            Vec::new(),
+            Vec::new(),
+        ),
+        (
+            9,
+            vec![it("b", 2)],
+            vec![ev(1, vec![kv("a", int_array_value(&[1, 2]))])],
+            Vec::new(),
+            Vec::new(),
+        ),
+        (
+            10,
+            vec![it("b", 6)],
+            Vec::new(),
+            vec![
+                (f1(), 0xaa, vec![it("a", 4)]),
+                (f1(), 0xab, vec![it("a", 6)]),
+            ],
+            Vec::new(),
+        ),
+        (
+            11,
+            Vec::new(),
+            vec![ev(1, vec![it("a", 2)]), ev(2, vec![it("a", 3)])],
+            vec![(f1(), 0xac, vec![it("a", 3)])],
+            Vec::new(),
+        ),
+        (
+            12,
+            Vec::new(),
+            vec![ev(1, vec![it("a", 1)])],
+            vec![
+                (f1(), 0xad, vec![it("a", 2)]),
+                (f1(), 0xae, vec![it("a", 3)]),
+            ],
+            Vec::new(),
+        ),
+        (
+            13,
+            Vec::new(),
+            vec![ev(1, vec![it("a", 1)])],
+            Vec::new(),
+            Vec::new(),
+        ),
+        (
+            14,
+            vec![st("s", "login")],
+            vec![(1, "x", Vec::new()), (2, "login", Vec::new())],
+            Vec::new(),
+            Vec::new(),
+        ),
+        (
+            15,
+            vec![st("s", "login")],
+            vec![(1, "x", Vec::new())],
+            Vec::new(),
+            Vec::new(),
+        ),
+        (
+            16,
+            vec![it("t", 5_000_000)],
+            vec![ev(3_000, Vec::new()), ev(10_000, Vec::new())],
+            Vec::new(),
+            Vec::new(),
+        ),
+        (
+            17,
+            vec![st("sid", "00000000000000af")],
+            Vec::new(),
+            vec![(vec![0xe3; 16], 0xaf, Vec::new())],
+            Vec::new(),
+        ),
+        (
+            18,
+            vec![st("sid", "00000000000000AF")],
+            Vec::new(),
+            vec![(f1(), 0xaf, Vec::new())],
+            Vec::new(),
+        ),
+        (
+            19,
+            Vec::new(),
+            vec![ev(1, vec![it("a", 7)]), ev(2, vec![it("a", 8)])],
+            Vec::new(),
+            vec![it("r", 7)],
+        ),
+        (
+            20,
+            vec![it("a", 1), it("c", 1)],
+            vec![ev(1, vec![it("a", 2)])],
+            Vec::new(),
+            Vec::new(),
+        ),
+        (
+            21,
+            vec![it("c", 4)],
+            vec![ev(1, vec![it("a", 5)])],
+            Vec::new(),
+            vec![it("a", 4)],
+        ),
+        (
+            22,
+            vec![it("c", 9)],
+            vec![ev(1, vec![it("a", 3)]), ev(2, vec![it("a", 9)])],
+            Vec::new(),
+            Vec::new(),
+        ),
+        (23, vec![it("c", 1)], Vec::new(), Vec::new(), Vec::new()),
+        (
+            24,
+            vec![it("a", 6)],
+            Vec::new(),
+            vec![(f1(), 0xb0, vec![it("b", 6)])],
+            Vec::new(),
+        ),
+        (
+            25,
+            vec![it("c", 3)],
+            vec![ev(1, vec![it("a", 1)]), ev(2, vec![it("a", 2)])],
+            Vec::new(),
+            Vec::new(),
+        ),
+        (
+            26,
+            Vec::new(),
+            vec![ev(1, vec![it("a", 1)]), ev(2, vec![it("a", 2)])],
+            Vec::new(),
+            vec![it("r", 9)],
+        ),
+        (
+            27,
+            vec![st("m", "zsvc")],
+            Vec::new(),
+            Vec::new(),
+            vec![it("r", 9)],
+        ),
+        (28, vec![it("n", 8)], Vec::new(), Vec::new(), Vec::new()),
+        (
+            29,
+            Vec::new(),
+            vec![ev(1, vec![bl("f", true)]), ev(2, vec![bl("f", false)])],
+            vec![(f1(), 0xb1, vec![bl("lf", true)])],
+            Vec::new(),
+        ),
+        (
+            30,
+            Vec::new(),
+            vec![ev(1, vec![bl("f", false)])],
+            vec![
+                (f1(), 0xb2, vec![bl("lf", false)]),
+                (f1(), 0xb3, vec![bl("lf", true)]),
+            ],
+            Vec::new(),
+        ),
+        (
+            31,
+            Vec::new(),
+            vec![ev(1, vec![bl("f", true)])],
+            vec![(f1(), 0xb4, vec![bl("lf", false)])],
+            Vec::new(),
+        ),
+        (
+            32,
+            vec![bl("f", true)],
+            vec![ev(1, vec![bl("f", false)])],
+            Vec::new(),
+            Vec::new(),
+        ),
+    ];
+    spans
+        .into_iter()
+        .map(|(n, attrs, events, links, resource_attrs)| {
+            let last = u8::from_str_radix(&format!("{n:02}"), 16).expect("two decimal digits");
+            let start_ns = base_ns + i64::from(n) * MS;
+            let mut resource = vec![
+                st("rz", &format!("z{n:02}")),
+                if n == 28 {
+                    it("service.name", 8)
+                } else {
+                    st("service.name", "zsvc")
+                },
+            ];
+            resource.extend(resource_attrs);
+            let events = events
+                .into_iter()
+                .map(|(offset_us, name, attributes)| {
+                    event_of(start_ns + offset_us * US, name, attributes)
+                })
+                .collect();
+            let links = links
+                .into_iter()
+                .map(|(trace_id, last_byte, attributes)| {
+                    link_of(trace_id, vec![0, 0, 0, 0, 0, 0, 0, last_byte], attributes)
+                })
+                .collect();
+            one_span_request(
+                resource,
+                scope_named("io.pulsus.z", "1.0", Vec::new()),
+                span_of(
+                    vec![0xe3; 16],
+                    vec![0, 0, 0, 0, 0, 0, 0xe3, last],
+                    Vec::new(),
+                    "op",
+                    1,
+                    start_ns,
+                    MS,
+                    attrs,
+                    0,
+                    events,
+                    links,
+                ),
+            )
+        })
+        .collect()
+}
+
+const ALL_Z: &[&str] = &[
+    "z01", "z02", "z03", "z04", "z05", "z06", "z07", "z08", "z09", "z10", "z11", "z12", "z13",
+    "z14", "z15", "z16", "z17", "z18", "z19", "z20", "z21", "z22", "z23", "z24", "z25", "z26",
+    "z27", "z28", "z29", "z30", "z31", "z32",
+];
+
+/// Every span with an event but `z16`, `TF-LT`'s answer.
+const Z_EVENTS_BUT_Z16: &[&str] = &[
+    "z01", "z02", "z03", "z04", "z05", "z07", "z08", "z09", "z11", "z12", "z13", "z14", "z15",
+    "z19", "z20", "z21", "z22", "z25", "z26", "z29", "z30", "z31", "z32",
+];
+
+/// The part-3d design's section 8.1, before the resource rows are deleted.
+const CASES_Z: &[CaseIn] = &[
+    CaseIn {
+        name: "EV-EQ",
+        query: r#"{ event.a = span.b }"#,
+        want: Want::Ids(&["z01", "z02", "z09"]),
+    },
+    CaseIn {
+        name: "EV-NE",
+        query: r#"{ event.a != span.b }"#,
+        want: Want::Ids(&["z03", "z05", "z06", "z08", "z10"]),
+    },
+    CaseIn {
+        name: "EV-LT",
+        query: r#"{ event.a < span.b }"#,
+        want: Want::Ids(&["z01", "z03", "z04", "z09"]),
+    },
+    CaseIn {
+        name: "EV-GE",
+        query: r#"{ event.a >= span.b }"#,
+        want: Want::Ids(&["z01", "z02", "z08", "z09"]),
+    },
+    CaseIn {
+        name: "EV-MIR",
+        query: r#"{ span.b > event.a }"#,
+        want: Want::Ids(&["z01", "z03", "z04", "z09"]),
+    },
+    CaseIn {
+        name: "LK-EQ",
+        query: r#"{ link.a = span.b }"#,
+        want: Want::Ids(&["z10"]),
+    },
+    CaseIn {
+        name: "LK-NE",
+        query: r#"{ link.a != span.b }"#,
+        want: Want::Ids(&["z01", "z02", "z03", "z04", "z05", "z06", "z08", "z09"]),
+    },
+    CaseIn {
+        name: "SS-EQ",
+        query: r#"{ event.a = link.a }"#,
+        want: Want::Ids(&["z11"]),
+    },
+    CaseIn {
+        name: "SS-NE",
+        query: r#"{ event.a != link.a }"#,
+        want: Want::Ids(&[
+            "z01", "z02", "z03", "z04", "z05", "z06", "z07", "z08", "z09", "z10", "z12", "z13",
+            "z14", "z15", "z16", "z17", "z18", "z19", "z20", "z21", "z22", "z23", "z24", "z25",
+            "z26", "z27", "z28", "z29", "z30", "z31", "z32",
+        ]),
+    },
+    CaseIn {
+        name: "SS-LT",
+        query: r#"{ event.a < link.a }"#,
+        want: Want::Ids(&["z11", "z12"]),
+    },
+    CaseIn {
+        name: "EN-EQ",
+        query: r#"{ event:name = span.s }"#,
+        want: Want::Ids(&["z14"]),
+    },
+    CaseIn {
+        name: "EN-NE",
+        query: r#"{ event:name != span.s }"#,
+        want: Want::Ids(&["z15"]),
+    },
+    CaseIn {
+        name: "TS-LT",
+        query: r#"{ event:timeSinceStart < span.t }"#,
+        want: Want::Ids(&["z16"]),
+    },
+    CaseIn {
+        name: "TS-GT",
+        query: r#"{ event:timeSinceStart > span.t }"#,
+        want: Want::Ids(&["z16"]),
+    },
+    CaseIn {
+        name: "TS-NE",
+        query: r#"{ event:timeSinceStart != span.t }"#,
+        want: Want::Ids(&["z16"]),
+    },
+    CaseIn {
+        name: "LS-EQ",
+        query: r#"{ link:spanID = span.sid }"#,
+        want: Want::Ids(&["z17"]),
+    },
+    CaseIn {
+        name: "LT-EQ",
+        query: r#"{ link:traceID = trace:id }"#,
+        want: Want::Ids(&["z17"]),
+    },
+    CaseIn {
+        name: "LT-NE",
+        query: r#"{ link:traceID != trace:id }"#,
+        want: Want::Ids(&[
+            "z01", "z02", "z03", "z04", "z05", "z06", "z07", "z08", "z09", "z10", "z11", "z12",
+            "z13", "z14", "z15", "z16", "z18", "z19", "z20", "z21", "z22", "z23", "z24", "z25",
+            "z26", "z27", "z28", "z29", "z30", "z31", "z32",
+        ]),
+    },
+    CaseIn {
+        name: "ER-EQ",
+        query: r#"{ event.a = resource.r }"#,
+        want: Want::Ids(&["z19"]),
+    },
+    CaseIn {
+        name: "ER-NE",
+        query: r#"{ event.a != resource.r }"#,
+        want: Want::Ids(&["z26", "z27"]),
+    },
+    CaseIn {
+        name: "CH-EQ",
+        query: r#"{ .a = span.c }"#,
+        want: Want::Ids(&["z20", "z21", "z22"]),
+    },
+    CaseIn {
+        name: "CH-NE",
+        query: r#"{ .a != span.c }"#,
+        want: Want::Ids(&["z25"]),
+    },
+    CaseIn {
+        name: "CH-EV",
+        query: r#"{ .a = event.a }"#,
+        want: Want::Ids(&[
+            "z01", "z02", "z03", "z04", "z07", "z08", "z11", "z12", "z13", "z19", "z22", "z25",
+            "z26",
+        ]),
+    },
+    CaseIn {
+        name: "R114",
+        query: r#"{ .a = .b }"#,
+        want: Want::Ids(&["z01", "z02", "z09", "z10", "z24"]),
+    },
+    CaseIn {
+        name: "SN-INT",
+        query: r#"{ .service.name = span.n }"#,
+        want: Want::Ids(&["z28"]),
+    },
+    CaseIn {
+        name: "SN-STR",
+        query: r#"{ .service.name = span.m }"#,
+        want: Want::Ids(&["z27"]),
+    },
+    CaseIn {
+        name: "NB-EQ",
+        query: r#"{ !event.f = true }"#,
+        want: Want::Ids(&["z29", "z30", "z32"]),
+    },
+    CaseIn {
+        name: "NB-NE",
+        query: r#"{ !event.f != false }"#,
+        want: Want::Ids(&["z30", "z32"]),
+    },
+    CaseIn {
+        name: "NB-LEQ",
+        query: r#"{ !link.lf = false }"#,
+        want: Want::Ids(&["z29", "z30"]),
+    },
+    CaseIn {
+        name: "NB-LNE",
+        query: r#"{ true != !link.lf }"#,
+        want: Want::Ids(&["z29"]),
+    },
+    CaseIn {
+        name: "NB-CEQ",
+        query: r#"{ !.f = true }"#,
+        want: Want::Ids(&["z29", "z30"]),
+    },
+    CaseIn {
+        name: "NB-CNE",
+        query: r#"{ !.f != false }"#,
+        want: Want::Ids(&["z30"]),
+    },
+    CaseIn {
+        name: "TF-GT",
+        query: r#"{ event:timeSinceStart > 5ms + 4ms }"#,
+        want: Want::Ids(&["z16"]),
+    },
+    CaseIn {
+        name: "TF-LT",
+        query: r#"{ 1ms + 1ms > event:timeSinceStart }"#,
+        want: Want::Ids(Z_EVENTS_BUT_Z16),
+    },
+    CaseIn {
+        name: "TF-EQ",
+        query: r#"{ event:timeSinceStart = 1000 * 3000 }"#,
+        want: Want::Ids(&["z16"]),
+    },
+];
+
+/// Section 8.1's phase 2, after the resource rows of `z19`, `z21`, `z27`
+/// and `z28` are deleted.
+const CASES_Z_MISS: &[CaseIn] = &[
+    CaseIn {
+        name: "ER-EQ-MISS",
+        query: r#"{ event.a = resource.r }"#,
+        want: Want::Ids(&[]),
+    },
+    CaseIn {
+        name: "ER-NE-MISS",
+        query: r#"{ event.a != resource.r }"#,
+        want: Want::Ids(&["z26"]),
+    },
+    CaseIn {
+        name: "CH-EQ-MISS",
+        query: r#"{ .a = span.c }"#,
+        want: Want::Ids(&["z20", "z22"]),
+    },
+    CaseIn {
+        name: "CH-NE-MISS",
+        query: r#"{ .a != span.c }"#,
+        want: Want::Ids(&["z21", "z25"]),
+    },
+    CaseIn {
+        name: "SN-INT-MISS",
+        query: r#"{ .service.name = span.n }"#,
+        want: Want::Ids(&[]),
+    },
+    CaseIn {
+        name: "SN-STR-MISS",
+        query: r#"{ .service.name = span.m }"#,
+        want: Want::Ids(&["z27"]),
+    },
+];
+
+/// Section 8.1 of the part-3d design: fixture Z. The phase-2 cases run
+/// last: they follow the deletion of four resource rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_predicate_compiler_compares_event_link_and_chain_operands() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db("pulsus_read_it_t589p3d_fixturez");
+    let client = fresh_db(&db).await;
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    for (i, req) in fixture_z_bodies(base_ns).into_iter().enumerate() {
+        land(&client, &req, &format!("t589p3d-z-{i}-{}", now_ns())).await;
+    }
+    let w = WindowSql::start_closed_end_open(base_ns, base_ns + WINDOW_NS);
+
+    let seeded = count(&client, &format!("SELECT count() AS n FROM {SPANS_TABLE}")).await;
+    assert_eq!(
+        seeded, 32,
+        "fixture Z seeds thirty-two spans; nothing below can be read as a predicate result \
+         until this holds"
+    );
+    let ids = ids_of(
+        &client,
+        &format!("SELECT lower(hex(span_id)) AS id FROM {SPANS_TABLE} ORDER BY id"),
+    )
+    .await;
+    let want: Vec<String> = ALL_Z.iter().copied().map(idz).collect();
+    assert_eq!(ids, want, "the 32 span ids are fixture Z's");
+
+    let mut wrong = run_cases_in(&client, w, CASES_Z, idz).await;
+    for span in ["z19", "z21", "z27", "z28"] {
+        delete_resource_row_of(&client, &idz(span)).await;
+    }
+    wrong.extend(run_cases_in(&client, w, CASES_Z_MISS, idz).await);
+    drop_db(&db).await;
+    assert!(
+        wrong.is_empty(),
+        "{} of {} fixture-Z cases answer something else:\n\n{}",
+        wrong.len(),
+        CASES_Z.len() + CASES_Z_MISS.len(),
         wrong.join("\n\n")
     );
 }
