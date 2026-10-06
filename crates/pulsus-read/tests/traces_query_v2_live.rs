@@ -9,7 +9,7 @@
 //! assertions, and the two halves meet at `T-C4`, which freezes the exact
 //! statement this suite issues.
 //!
-//! **Seven fixtures, each test function in its own database.**
+//! **Eight fixtures, each test function in its own database.**
 //!
 //! * The worked fixture of `docs/TraceQL/functional-requirements.md` §6.1 —
 //!   three traces, nine spans, every attribute type, one event, one link,
@@ -33,6 +33,10 @@
 //!   field with another: every stored type against every other, integers
 //!   past `f64`'s exactness limit, arrays on either side, and the
 //!   intrinsics against attributes.
+//! * Fixture X — twenty spans, one resource each, for comparing a resource
+//!   value with a field: every stored type on the resource row against
+//!   the span's, two resource keys against each other, `service.name`'s
+//!   arms, and resource rows deleted.
 //!
 //! Each is seeded by building the OTLP request bodies and handing them to
 //! `pulsus_write::parse_trace_landing`, then inserting the rows it
@@ -3607,7 +3611,7 @@ const CASES_W: &[CaseIn] = &[
     CaseIn {
         name: "SVC",
         query: r#"{ resource.service.name = span.svc }"#,
-        want: Want::Ids(&["w21"]),
+        want: Want::Ids(&["w21", "w23"]),
     },
     CaseIn {
         name: "IN",
@@ -3678,6 +3682,230 @@ async fn the_predicate_compiler_compares_fields_on_the_worked_fixture() {
         "{} of {} §6.1 field cases answer something else:\n\n{}",
         wrong.len(),
         CASES_61_FIELDS.len(),
+        wrong.join("\n\n")
+    );
+}
+
+// ---------------------------------------------------------------------
+// #589 part 3b — fixture X, a resource value against a field
+// ---------------------------------------------------------------------
+
+/// `x01` to `x20`: span ids `000000000000e101` to `…e120`, the span's
+/// number written as decimal digits in the id's last byte.
+fn idx(short: &str) -> String {
+    format!("000000000000e1{}", short.trim_start_matches('x'))
+}
+
+/// Fixture X, the part-3b design's section 7.1: twenty requests, one span
+/// and one resource each. Every resource carries `rx = "xNN"`, so no two
+/// spans share a resource.
+fn fixture_x_bodies(base_ns: i64) -> Vec<ExportTraceServiceRequest> {
+    const MS: i64 = 1_000_000;
+    let st = |k: &str, v: &str| kv(k, str_value(v));
+    let it = |k: &str, v: i64| kv(k, int_value(v));
+    let db = |k: &str, v: f64| kv(k, double_value(v));
+    let bl = |k: &str, v: bool| kv(k, bool_value(v));
+    let ar = |k: &str, v: &[&str]| kv(k, str_array_value(v));
+    // (span number, resource attributes besides `rx`, span attributes)
+    let spans: Vec<(u8, Vec<KeyValue>, Vec<KeyValue>)> = vec![
+        (1, vec![st("a", "5")], vec![it("b", 5)]),
+        (2, vec![it("a", 5)], vec![it("b", 5)]),
+        (
+            3,
+            vec![it("a", 9_007_199_254_740_993)],
+            vec![it("b", 9_007_199_254_740_992)],
+        ),
+        (
+            4,
+            vec![it("a", 9_007_199_254_740_992)],
+            vec![it("b", 9_007_199_254_740_993)],
+        ),
+        (
+            5,
+            vec![it("a", 9_007_199_254_740_993)],
+            vec![db("b", 9_007_199_254_740_992.0)],
+        ),
+        (6, vec![db("a", 0.25)], vec![it("b", 3)]),
+        (7, vec![bl("a", true)], vec![bl("b", true)]),
+        (8, vec![ar("a", &["eu", "us"])], vec![st("b", "eu")]),
+        (9, vec![ar("a", &["x", "y"])], vec![st("b", "z")]),
+        (10, vec![ar("a", &[])], vec![st("b", "q")]),
+        (
+            11,
+            vec![st("a", "apple")],
+            vec![ar("b", &["apple", "pear"])],
+        ),
+        (12, Vec::new(), vec![it("b", 1)]),
+        (13, vec![it("a", 7)], vec![it("b", 8)]),
+        (14, vec![it("a", 2), it("c", 3)], Vec::new()),
+        (15, vec![st("a", "m"), db("c", 1.5)], Vec::new()),
+        (16, vec![it("service.name", 8)], vec![it("b", 8)]),
+        (
+            17,
+            vec![st("service.name", "8")],
+            vec![it("b", 8), st("bs", "8")],
+        ),
+        (18, vec![it("service.name", 9)], vec![it("b", 10)]),
+        (19, vec![st("service.name", "")], vec![st("bs", "")]),
+        (20, vec![it("n", 1), db("e", 1.5)], Vec::new()),
+    ];
+    spans
+        .into_iter()
+        .map(|(n, resource_attrs, attrs)| {
+            let last = u8::from_str_radix(&format!("{n:02}"), 16).expect("two decimal digits");
+            let mut resource = vec![st("rx", &format!("x{n:02}"))];
+            resource.extend(resource_attrs);
+            one_span_request(
+                resource,
+                scope_named("io.pulsus.x", "1.0", Vec::new()),
+                span_of(
+                    vec![0xe1; 16],
+                    vec![0, 0, 0, 0, 0, 0, 0xe1, last],
+                    Vec::new(),
+                    "op",
+                    1,
+                    base_ns + i64::from(n) * MS,
+                    MS,
+                    attrs,
+                    0,
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            )
+        })
+        .collect()
+}
+
+/// The part-3b design's section 8.1, phase 1.
+const CASES_X: &[CaseIn] = &[
+    CaseIn {
+        name: "RF-EQ",
+        query: r#"{ resource.a = span.b }"#,
+        want: Want::Ids(&["x02", "x07", "x08", "x11"]),
+    },
+    CaseIn {
+        name: "RF-NE",
+        query: r#"{ resource.a != span.b }"#,
+        want: Want::Ids(&["x03", "x04", "x05", "x06", "x09", "x13"]),
+    },
+    CaseIn {
+        name: "RF-LT",
+        query: r#"{ resource.a < span.b }"#,
+        want: Want::Ids(&["x04", "x06", "x09", "x11", "x13"]),
+    },
+    CaseIn {
+        name: "RF-LE",
+        query: r#"{ resource.a <= span.b }"#,
+        want: Want::Ids(&["x02", "x04", "x06", "x08", "x09", "x11", "x13"]),
+    },
+    CaseIn {
+        name: "RF-GT",
+        query: r#"{ resource.a > span.b }"#,
+        want: Want::Ids(&["x03", "x05", "x08"]),
+    },
+    CaseIn {
+        name: "RF-GE",
+        query: r#"{ resource.a >= span.b }"#,
+        want: Want::Ids(&["x02", "x03", "x05", "x08", "x11"]),
+    },
+    CaseIn {
+        name: "RF-MIR >",
+        query: r#"{ span.b > resource.a }"#,
+        want: Want::Ids(&["x04", "x06", "x09", "x11", "x13"]),
+    },
+    CaseIn {
+        name: "RF-MIR <=",
+        query: r#"{ span.b <= resource.a }"#,
+        want: Want::Ids(&["x02", "x03", "x05", "x08", "x11"]),
+    },
+    CaseIn {
+        name: "RR1",
+        query: r#"{ resource.a < resource.c }"#,
+        want: Want::Ids(&["x14"]),
+    },
+    CaseIn {
+        name: "RR2",
+        query: r#"{ resource.n < resource.e }"#,
+        want: Want::Ids(&["x20"]),
+    },
+    CaseIn {
+        name: "RR3",
+        query: r#"{ resource.a != resource.c }"#,
+        want: Want::Ids(&["x14"]),
+    },
+    CaseIn {
+        name: "SN1",
+        query: r#"{ resource.service.name = span.b }"#,
+        want: Want::Ids(&["x16"]),
+    },
+    CaseIn {
+        name: "SN2",
+        query: r#"{ resource.service.name = span.bs }"#,
+        want: Want::Ids(&["x17", "x19"]),
+    },
+    CaseIn {
+        name: "SN3",
+        query: r#"{ resource.service.name != span.b }"#,
+        want: Want::Ids(&["x18"]),
+    },
+];
+
+/// Section 8.1, phase 2: after the resource rows of `x13`, `x18` and `x19`
+/// are deleted.
+const CASES_X_MISS: &[CaseIn] = &[
+    CaseIn {
+        name: "RF-NE-MISS",
+        query: r#"{ resource.a != span.b }"#,
+        want: Want::Ids(&["x03", "x04", "x05", "x06", "x09"]),
+    },
+    CaseIn {
+        name: "RF-LT-MISS",
+        query: r#"{ resource.a < span.b }"#,
+        want: Want::Ids(&["x04", "x06", "x09", "x11"]),
+    },
+    CaseIn {
+        name: "SN2-MISS",
+        query: r#"{ resource.service.name = span.bs }"#,
+        want: Want::Ids(&["x17", "x19"]),
+    },
+    CaseIn {
+        name: "SN3-MISS",
+        query: r#"{ resource.service.name != span.b }"#,
+        want: Want::Ids(&[]),
+    },
+];
+
+/// Section 8.1 of the part-3b design: fixture X. Phase 2 runs last: it
+/// deletes three resource rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_predicate_compiler_compares_resource_values() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db("pulsus_read_it_t589p3b_fixturex");
+    let client = fresh_db(&db).await;
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    for (i, req) in fixture_x_bodies(base_ns).into_iter().enumerate() {
+        land(&client, &req, &format!("t589p3b-x-{i}-{}", now_ns())).await;
+    }
+    let w = WindowSql::start_closed_end_open(base_ns, base_ns + WINDOW_NS);
+
+    let seeded = count(&client, &format!("SELECT count() AS n FROM {SPANS_TABLE}")).await;
+    assert_eq!(
+        seeded, 20,
+        "fixture X seeds twenty spans; nothing below can be read as a predicate result until \
+         this holds"
+    );
+
+    let mut wrong = run_cases_in(&client, w, CASES_X, idx).await;
+    for span in ["x13", "x18", "x19"] {
+        delete_resource_row_of(&client, &idx(span)).await;
+    }
+    wrong.extend(run_cases_in(&client, w, CASES_X_MISS, idx).await);
+    drop_db(&db).await;
+    assert!(
+        wrong.is_empty(),
+        "{} of {} fixture-X cases answer something else:\n\n{}",
+        wrong.len(),
+        CASES_X.len() + CASES_X_MISS.len(),
         wrong.join("\n\n")
     );
 }

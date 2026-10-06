@@ -14,13 +14,13 @@
 //! two of these: span and instrumentation attributes, the ten span-row
 //! intrinsics `name`, `statusMessage`, `span:id`, `span:parentID`,
 //! `trace:id`, `instrumentation:name`, `instrumentation:version`,
-//! `duration`, `status` and `kind`, and `resource.service.name`'s string
-//! ([`field_terms`]); and `&&`, `||` and `!`. Every other field and
-//! construct is
-//! [`PlanError::UnsupportedField`] naming itself and the issue that
-//! serves it. The arms are exhaustive with no wildcard, so a
-//! new `Intrinsic` or `AttrScope` variant fails to compile here rather
-//! than falling into the wrong one.
+//! `duration`, `status` and `kind`, resource attributes, and
+//! `resource.service.name` — its string from the span row, every other arm
+//! from the resource row ([`field_terms`]); and `&&`, `||` and `!`. Every
+//! other field and construct is [`PlanError::UnsupportedField`] naming
+//! itself and the issue that serves it. The arms are exhaustive with no
+//! wildcard, so a new `Intrinsic` or `AttrScope` variant fails to compile
+//! here rather than falling into the wrong one.
 //!
 //! **Four rules worth reading before the code.**
 //!
@@ -206,8 +206,8 @@ pub fn span_membership_sql(spans_table: &str, w: WindowSql, p: &SpanPredicate) -
 // ---------------------------------------------------------------------
 
 /// The issue each deferred construct is served by.
-const PART_3B: &str = "#589 part 3b";
 const PART_3C: &str = "#589 part 3c";
+const PART_3D: &str = "#589 part 3d";
 const NESTED_AND_TRACE: &str = "#594";
 
 /// The refusal every deferred construct takes: it names the construct and
@@ -353,6 +353,24 @@ impl<'a> Compiler<'a> {
         self.uses_resources = true;
         Ok(format!(
             "resource_id IN (SELECT resource_id FROM {} WHERE {} AND ({p}))",
+            ctx.resources_table,
+            ctx.window.resources_day_clause()
+        ))
+    }
+
+    /// `Q(k)`: one uncorrelated scalar subquery over the resource rows in
+    /// the window's days that hold `key` — their ids, their values and the
+    /// set of types those values are stored as. Every occurrence of one
+    /// key's text is the same, so the engine evaluates it once per
+    /// statement.
+    fn resource_read(&mut self, key: &str) -> Result<String, PlanError> {
+        let ctx = self.ctx.ok_or_else(|| needs_window(AttrScope::Resource))?;
+        self.uses_resources = true;
+        let path = attr_path(ATTRS, key);
+        Ok(format!(
+            "(SELECT (groupArray(resource_id), groupArray({path}), \
+             groupUniqArray(dynamicType({path}))) FROM {} WHERE {} AND \
+             dynamicType({path}) != 'None')",
             ctx.resources_table,
             ctx.window.resources_day_clause()
         ))
@@ -723,6 +741,11 @@ impl<'a> Compiler<'a> {
     /// `L op R`, both sides fields. The regex operators are refused
     /// first, then each operand in turn, left before right; what remains
     /// is [`field_terms`] over the two operands' arms.
+    ///
+    /// An operand read from the resource row is bound once: the body is a
+    /// lambda over `r1` (left) or `r2` (right), applied to a one-element
+    /// array holding the looked-up value, so every arm reads the variable
+    /// rather than repeating the lookup.
     fn field_compare(
         &mut self,
         lhs: &Field,
@@ -734,19 +757,32 @@ impl<'a> Compiler<'a> {
                 "a field-against-field comparison does not support regex operators".to_string(),
             ));
         }
-        let l = self.operand_arms(lhs)?;
-        let r = self.operand_arms(rhs)?;
-        Ok(field_terms(&l, op, &r))
+        let l = self.operand_arms(lhs, "r1")?;
+        let r = self.operand_arms(rhs, "r2")?;
+        let body = field_terms(&l, op, &r);
+        if body == "false" {
+            return Ok(body);
+        }
+        Ok(match (&l.bind, &r.bind) {
+            (None, None) => body,
+            (Some((v, value)), None) | (None, Some((v, value))) => {
+                format!("arrayExists({v} -> {body}, [{value}])")
+            }
+            (Some((lv, lvalue)), Some((rv, rvalue))) => {
+                format!("arrayExists(({lv}, {rv}) -> {body}, [{lvalue}], [{rvalue}])")
+            }
+        })
     }
 
-    /// One operand's arms: a typed read per class it can hold. **No
+    /// One operand's arms: a typed read per class it can hold. `var` is
+    /// the lambda variable a resource-row operand is bound to. **No
     /// wildcard arm**, so a new `Intrinsic` or `AttrScope` variant fails to
     /// compile here until it is classified.
-    fn operand_arms(&self, field: &Field) -> Result<Arms, PlanError> {
+    fn operand_arms(&mut self, field: &Field, var: &'static str) -> Result<Arms, PlanError> {
         let unsupported_operand = |what: String| {
             unsupported(
                 &format!("a field-against-field comparison with {what}"),
-                PART_3B,
+                PART_3D,
             )
         };
         let intrinsic = match field {
@@ -754,18 +790,22 @@ impl<'a> Compiler<'a> {
                 return match scope {
                     AttrScope::Span => Ok(Arms::attribute(ATTRS, key)),
                     AttrScope::Instrumentation => Ok(Arms::attribute(SCOPE_ATTRS, key)),
+                    // The writer keeps a non-empty string on the span row
+                    // only, so the string arm is read there; every other
+                    // arm from the resource row.
                     AttrScope::Resource if key == SERVICE_NAME => {
-                        self.ctx.ok_or_else(|| needs_window(AttrScope::Resource))?;
+                        let q = self.resource_read(key)?;
                         Ok(Arms {
                             s: Some(format!("if({SERVICE_IS_STRING}, service, NULL)")),
-                            nullable: true,
-                            ..Arms::default()
+                            s_on_span_row: true,
+                            ..Arms::resource(var, &q)
                         })
                     }
-                    AttrScope::Resource
-                    | AttrScope::Event
-                    | AttrScope::Link
-                    | AttrScope::Unscoped => {
+                    AttrScope::Resource => {
+                        let q = self.resource_read(key)?;
+                        Ok(Arms::resource(var, &q))
+                    }
+                    AttrScope::Event | AttrScope::Link | AttrScope::Unscoped => {
                         Err(unsupported_operand(format!("a \"{scope}\" operand")))
                     }
                 };
@@ -948,6 +988,21 @@ impl Read {
         }
     }
 
+    /// The type name a `Dynamic` value of this read is stored as, which is
+    /// what `dynamicType` answers and `dynamicElement` takes.
+    fn type_name(self) -> &'static str {
+        match self {
+            Read::Str => "String",
+            Read::Int => "Int64",
+            Read::Float => "Float64",
+            Read::Bool => "Bool",
+            Read::StrArray => "Array(Nullable(String))",
+            Read::IntArray => "Array(Nullable(Int64))",
+            Read::FloatArray => "Array(Nullable(Float64))",
+            Read::BoolArray => "Array(Nullable(Bool))",
+        }
+    }
+
     fn var(self) -> &'static str {
         match self {
             Read::Str => "s",
@@ -980,6 +1035,30 @@ enum Class {
 }
 
 impl Class {
+    /// The typed read of a scalar of this class, if an attribute can hold
+    /// one.
+    fn scalar_read(self) -> Option<Read> {
+        match self {
+            Class::Str => Some(Read::Str),
+            Class::Int => Some(Read::Int),
+            Class::Float => Some(Read::Float),
+            Class::Bool => Some(Read::Bool),
+            Class::Status | Class::Kind => None,
+        }
+    }
+
+    /// The typed read of an array whose elements are this class, if an
+    /// attribute can hold one.
+    fn array_read(self) -> Option<Read> {
+        match self {
+            Class::Str => Some(Read::StrArray),
+            Class::Int => Some(Read::IntArray),
+            Class::Float => Some(Read::FloatArray),
+            Class::Bool => Some(Read::BoolArray),
+            Class::Status | Class::Kind => None,
+        }
+    }
+
     /// Whether an ordered operator has a term for this class: a boolean, a
     /// status and a kind are compared by `=` and `!=` only.
     fn is_ordered(self) -> bool {
@@ -992,6 +1071,12 @@ impl Class {
 
 /// One field-against-field operand: one SQL expression per class it can
 /// hold, scalar and array, and whether any of them can be `NULL`.
+///
+/// A resource-row operand also carries `types`, the text of the set of
+/// types its key is stored as in the window (`tupleElement(Q(k), 3)`),
+/// which gates each arm, and `bind`, the lambda variable and the looked-up
+/// value it is bound to. `s_on_span_row` marks `resource.service.name`,
+/// whose string arm is read from the span row and so is not gated.
 #[derive(Debug, Default)]
 struct Arms {
     s: Option<String>,
@@ -1005,6 +1090,9 @@ struct Arms {
     fa: Option<String>,
     ba: Option<String>,
     nullable: bool,
+    types: Option<String>,
+    s_on_span_row: bool,
+    bind: Option<(&'static str, String)>,
 }
 
 impl Arms {
@@ -1025,7 +1113,59 @@ impl Arms {
             fa: read(Read::FloatArray),
             ba: read(Read::BoolArray),
             nullable: true,
+            types: None,
+            s_on_span_row: false,
+            bind: None,
         }
+    }
+
+    /// A resource attribute whose lookup is `q` (`Q(k)`): every class read
+    /// from the value bound to `var`, which is the value at the span's own
+    /// `resource_id` — `NULL` when the span's resource row is not among
+    /// `q`'s, so every arm is `NULL` then.
+    fn resource(var: &'static str, q: &str) -> Arms {
+        let read = |r: Read| Some(format!("dynamicElement({var}, '{}')", r.type_name()));
+        Arms {
+            s: read(Read::Str),
+            i: read(Read::Int),
+            f: read(Read::Float),
+            b: read(Read::Bool),
+            st: None,
+            kd: None,
+            sa: read(Read::StrArray),
+            ia: read(Read::IntArray),
+            fa: read(Read::FloatArray),
+            ba: read(Read::BoolArray),
+            nullable: true,
+            types: Some(format!("tupleElement({q}, 3)")),
+            s_on_span_row: false,
+            bind: Some((
+                var,
+                format!(
+                    "arrayElement(tupleElement({q}, 2), transform(resource_id, \
+                     tupleElement({q}, 1), arrayEnumerate(tupleElement({q}, 1)), 0))"
+                ),
+            )),
+        }
+    }
+
+    /// The gate of the scalar arm of `class`: whether any resource row
+    /// holds a value of that type. `None` when the arm needs none.
+    fn scalar_gate(&self, class: Class) -> Option<String> {
+        if class == Class::Str && self.s_on_span_row {
+            return None;
+        }
+        self.gate(class.scalar_read()?)
+    }
+
+    /// The gate of the array arm whose elements are `class`.
+    fn array_gate(&self, class: Class) -> Option<String> {
+        self.gate(class.array_read()?)
+    }
+
+    fn gate(&self, read: Read) -> Option<String> {
+        let types = self.types.as_deref()?;
+        Some(format!("has({types}, '{}')", read.type_name()))
     }
 
     fn scalar(&self, class: Class) -> Option<&str> {
@@ -1112,6 +1252,15 @@ fn array_term(op: ComparisonOp, sym: &str, l: &str, r: &str, array: &str) -> Str
     }
 }
 
+/// `term` under the gates present, left first.
+fn gated(term: String, left: Option<String>, right: Option<String>) -> String {
+    match (left, right) {
+        (None, None) => term,
+        (Some(g), None) | (None, Some(g)) => format!("if({g}, {term}, false)"),
+        (Some(gl), Some(gr)) => format!("if({gl} AND {gr}, {term}, false)"),
+    }
+}
+
 /// `L op R` over two operands' arms: one term per pair of classes both
 /// sides carry, ORed, and `false` when there is none.
 ///
@@ -1125,6 +1274,12 @@ fn array_term(op: ComparisonOp, sym: &str, l: &str, r: &str, array: &str) -> Str
 ///
 /// A scalar term is coalesced unless both operands are non-nullable,
 /// which is the module's rule that no intrinsic read is coalesced.
+///
+/// A term with an arm read from the resource row is gated on that key's
+/// type set, `if(<gate_L> AND <gate_R>, <term>, false)`. The gate never
+/// changes an answer — it is false only when no resource row holds that
+/// type, where the term is false anyway — but it is a constant, so the
+/// engine folds every term no resource row can satisfy.
 fn field_terms(l: &Arms, op: ComparisonOp, r: &Arms) -> String {
     let sym = sql_op(op).expect("the caller has already excluded the regex operators");
     let ordered = !matches!(op, ComparisonOp::Eq | ComparisonOp::Neq);
@@ -1138,11 +1293,12 @@ fn field_terms(l: &Arms, op: ComparisonOp, r: &Arms) -> String {
             continue;
         };
         let c = format!("{} {sym} {}", pair_side(lc, rc, a), pair_side(rc, lc, b));
-        terms.push(if coalesced {
+        let term = if coalesced {
             format!("coalesce({c}, false)")
         } else {
             c
-        });
+        };
+        terms.push(gated(term, l.scalar_gate(lc), r.scalar_gate(rc)));
     }
     // The array on the right, then the array on the left.
     for (c, e) in ARRAY_PAIRS {
@@ -1150,13 +1306,14 @@ fn field_terms(l: &Arms, op: ComparisonOp, r: &Arms) -> String {
             continue;
         }
         if let (Some(scalar), Some(array)) = (l.scalar(c), r.array(e)) {
-            terms.push(array_term(
+            let term = array_term(
                 op,
                 sym,
                 &pair_side(c, e, scalar),
                 &pair_side(e, c, "x"),
                 array,
-            ));
+            );
+            terms.push(gated(term, l.scalar_gate(c), r.array_gate(e)));
         }
     }
     for (c, e) in ARRAY_PAIRS {
@@ -1164,13 +1321,14 @@ fn field_terms(l: &Arms, op: ComparisonOp, r: &Arms) -> String {
             continue;
         }
         if let (Some(array), Some(scalar)) = (l.array(e), r.scalar(c)) {
-            terms.push(array_term(
+            let term = array_term(
                 op,
                 sym,
                 &pair_side(e, c, "x"),
                 &pair_side(c, e, scalar),
                 array,
-            ));
+            );
+            terms.push(gated(term, l.array_gate(e), r.scalar_gate(c)));
         }
     }
     if terms.is_empty() {
