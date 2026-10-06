@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 
 /// One `metric_samples` row from [`super::sample_sql::sample_fetch`] /
 /// [`super::sample_sql::sample_fetch_subquery`] (docs/schemas.md §2.3):
-/// `SELECT fingerprint, unix_milli, value FROM metric_samples PREWHERE
-/// metric_name = ... WHERE ... ORDER BY fingerprint, unix_milli`.
+/// `SELECT fingerprint, unix_milli, value FROM metric_samples WHERE
+/// <window> AND fingerprint IN (...) ORDER BY fingerprint, unix_milli`.
 #[derive(Debug, Clone, Copy, PartialEq, Row, Serialize, Deserialize)]
 pub struct SampleRow {
     pub fingerprint: Fingerprint,
@@ -18,11 +18,9 @@ pub struct SampleRow {
 }
 
 /// One `metric_samples` row from [`super::sample_sql::sample_fetch_multi`]
-/// (issue #85, M6-08c): the multi-metric fan-out fetch additionally
-/// selects `metric_name`, because a fingerprint can exist under more than
-/// one metric name (`metric_fingerprint` excludes `__name__`,
-/// docs/schemas.md §2.1) — rows must group into per-`(metric_name,
-/// fingerprint)` series, not per-fingerprint alone.
+/// (issue #85, M6-08c): the multi-metric fan-out fetch. The series ID
+/// includes the metric name (issue #623), so rows group by ID and each
+/// takes its name from the resolution; the row carries no name.
 #[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
 pub struct MultiSampleRow {
     pub fingerprint: Fingerprint,
@@ -90,9 +88,8 @@ impl HistSampleRow {
 
 /// One `metric_hist_samples` row from
 /// [`super::sample_sql::hist_sample_fetch_multi`] — the multi-metric
-/// fan-out's histogram half, mirroring [`MultiSampleRow`]: a leading
-/// `metric_name` so rows group into per-`(metric_name, fingerprint)`
-/// series (a fingerprint can exist under more than one metric name).
+/// fan-out's histogram half, mirroring [`MultiSampleRow`]: rows group by
+/// series ID (issue #623).
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct MultiHistSampleRow {
     pub fingerprint: Fingerprint,

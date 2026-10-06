@@ -1,6 +1,6 @@
-//! DDL / maintenance scenario — decision-critical (issue #3 amendment,
-//! Codex finding 2). Runs the exact docs/schemas.md §2.2 `CREATE TABLE` /
-//! `CREATE MATERIALIZED VIEW` plus a chunked `INSERT ... SELECT` backfill
+//! DDL / maintenance scenario — decision-critical (issue #3 amendment). Runs
+//! docs/schemas.md §2.2's `CREATE TABLE` / `CREATE MATERIALIZED VIEW` shapes
+//! plus a chunked `INSERT ... SELECT` backfill
 //! through **both** candidates, each over its own transport (`clickhouse`
 //! over HTTP, `klickhouse` over native TCP), to decide whether one crate's
 //! transport suffices for reliable DDL + maintenance (configuration.md §2).
@@ -26,7 +26,9 @@ impl DdlReport {
     }
 }
 
-/// `CREATE TABLE metric_samples_5m`, byte-identical to docs/schemas.md §2.2.
+/// `CREATE TABLE metric_samples_5m`: docs/schemas.md §2.2's columns, codecs,
+/// engine, partitioning and ordering, without its TTL and settings, which
+/// this scenario does not measure.
 pub fn tier_table_ddl(tier_table: &str) -> String {
     format!(
         "CREATE TABLE IF NOT EXISTS {tier_table} (
@@ -47,8 +49,9 @@ pub fn tier_table_ddl(tier_table: &str) -> String {
     )
 }
 
-/// `CREATE MATERIALIZED VIEW metric_samples_5m_mv`, byte-identical to
-/// docs/schemas.md §2.2 (reading `raw_table` instead of `metric_samples`).
+/// `CREATE MATERIALIZED VIEW metric_samples_5m_mv`: docs/schemas.md §2.2's
+/// projection and grouping, reading `raw_table` instead of
+/// `metric_samples`.
 pub fn tier_mv_ddl(mv_name: &str, tier_table: &str, raw_table: &str) -> String {
     format!(
         "CREATE MATERIALIZED VIEW IF NOT EXISTS {mv_name} TO {tier_table} AS

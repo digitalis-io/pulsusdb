@@ -1487,16 +1487,15 @@ impl MetricsEngine {
     /// /series results"). `filters` empty is Prometheus's own "no
     /// `match[]`" contract (docs/api.md §3.3) — every series in the
     /// window, unfiltered; each element otherwise applies its own
-    /// window-bound, bucket-floored `metric_series` query, concurrently
-    /// (`join_all`, mirroring `query_inner`'s fetch-concurrency contract),
-    /// unioned and deduplicated by `(metric_name, fingerprint)` (a
-    /// fingerprint is shared across metric names — see
-    /// `super::refresh::run_sweep`'s own comment on the same invariant).
+    /// window-bound read (statement 2, the window exact to the hour,
+    /// issue #623), concurrently (`join_all`, mirroring `query_inner`'s
+    /// fetch-concurrency contract), unioned and deduplicated by
+    /// `(metric_name, fingerprint)`.
     ///
     /// Issue #89: a filter carrying regex/negated `__name__` matchers
     /// instead routes through [`Self::discovery_sql_for`]'s cache-resolved
-    /// flat IN×IN fetch — still one `metric_series` query per filter, still
-    /// window-bound in SQL.
+    /// read, scoped to the cache's names and IDs — still one statement per
+    /// filter, still window-bound in SQL.
     async fn discovery_series(
         &self,
         filters: &[DiscoveryFilter],
