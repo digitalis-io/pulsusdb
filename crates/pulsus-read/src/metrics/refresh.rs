@@ -18,6 +18,8 @@ use std::time::Duration;
 use futures::StreamExt;
 use pulsus_clickhouse::{ChError, QuerySettings};
 use pulsus_model::{Fingerprint, LabelSet, floor_to_activity_bucket};
+
+use super::matcher::DataWindow;
 use tokio::task::JoinHandle;
 
 use super::labels::{CacheSnapshot, LabelCache};
@@ -27,8 +29,8 @@ use super::rows::SeriesRow;
 /// active since `floor(now - window)`, with its labels, no upper bound (the
 /// sweep always runs "as of now"). Pure so it is snapshot-testable without a
 /// clock/DB.
-fn sweep_sql(series_table: &str, labels_table: &str, lower_bound_ms: i64) -> String {
-    super::sql::sweep_query(series_table, labels_table, lower_bound_ms)
+fn sweep_sql(series_table: &str, labels_table: &str, window: DataWindow) -> String {
+    super::sql::sweep_query(series_table, labels_table, window)
 }
 
 /// Wall-clock now, milliseconds since the Unix epoch. `SystemTime::now()`
@@ -53,12 +55,17 @@ pub(crate) fn now_unix_ms() -> i64 {
 /// [`LabelCache::refresh`] and [`spawn_refresh_loop`] both rely on.
 pub(crate) async fn run_sweep(cache: &LabelCache) -> Result<(), ChError> {
     let now_ms = now_unix_ms();
-    let lower_bound_ms =
-        floor_to_activity_bucket(now_ms - cache.config.window_ms, cache.config.bucket_ms);
+    let lower_bound_ms = floor_to_activity_bucket(
+        now_ms - cache.config.window_ms,
+        pulsus_model::ACTIVITY_BUCKET_MS,
+    );
     let sql = sweep_sql(
         &cache.config.series_table,
         &cache.config.labels_table,
-        lower_bound_ms,
+        DataWindow {
+            start_ms: lower_bound_ms,
+            end_ms: now_ms,
+        },
     );
 
     let result = fetch_rows(cache, &sql).await;
@@ -204,23 +211,34 @@ pub fn spawn_refresh_loop(cache: Arc<LabelCache>, ttl: Duration) -> JoinHandle<(
 mod tests {
     use super::*;
 
-    /// **U6 (issue #623): the sweep reads each active series' own label
-    /// row.** The label rows of every `(metric_name, fingerprint)` active
-    /// since the bound, read by the pair, one per series while the table
-    /// holds unmerged copies. No upper bound: the sweep runs as of now.
+    /// **Issue #623: the sweep is statement 2 with no matcher**: the lookup
+    /// rows of every series active in the cache window, by the activity
+    /// table's day and hour mask.
     #[test]
-    fn sweep_sql_joins_each_active_series_to_its_label_set() {
+    fn sweep_sql_reads_the_lookup_for_the_active_series() {
         assert_eq!(
-            sweep_sql("metric_series", "metric_labels", 1_000),
-            "SELECT fingerprint, metric_name, labels\n\
-             FROM metric_labels\n\
-             WHERE (metric_name, fingerprint) IN (\n\
-             SELECT metric_name, fingerprint\n\
-             FROM metric_series\n\
-             WHERE unix_milli >= 1000\n\
+            sweep_sql(
+                "metric_series",
+                "metric_labels",
+                DataWindow {
+                    start_ms: 1_788_820_200_000,
+                    end_ms: 1_788_823_800_000,
+                },
+            ),
+            "SELECT fingerprint, any(name) AS metric_name, any(label_text) AS labels\n\
+             FROM (\n\
+             \x20 SELECT fingerprint, metric_name AS name, labels AS label_text\n\
+             \x20 FROM metric_labels\n\
+             \x20 WHERE fingerprint IN (\n\
+             \x20     SELECT fingerprint\n\
+             \x20     FROM metric_series\n\
+             \x20     WHERE day BETWEEN '2026-09-07' AND '2026-09-07'\n\
+             \x20       AND bitAnd(hours, multiIf(day = '2026-09-07' AND day = '2026-09-07', 12582912, \
+             day = '2026-09-07', 12582912, day = '2026-09-07', 16777215, 16777215)) != 0\n\
+             \x20   )\n\
              )\n\
-             ORDER BY metric_name, fingerprint\n\
-             LIMIT 1 BY metric_name, fingerprint"
+             GROUP BY fingerprint\n\
+             ORDER BY metric_name, fingerprint"
         );
     }
 

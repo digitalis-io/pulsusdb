@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
-use pulsus_model::DEFAULT_ACTIVITY_BUCKET_MS;
+use pulsus_model::ACTIVITY_BUCKET_MS;
 use pulsus_read::logql::{ReadError, TooBroadReason};
 use pulsus_read::{
     DataWindow, DiscoveryFilter, LabelCache, LabelCacheConfig, LabelMatcher, MatchOp,
@@ -134,7 +134,6 @@ fn cache_config(db: &str) -> LabelCacheConfig {
         db: db.to_string(),
         series_table: "metric_series".to_string(),
         labels_table: "metric_labels".to_string(),
-        bucket_ms: DEFAULT_ACTIVITY_BUCKET_MS,
         window_ms: 24 * 3_600_000,
         cache_max_series: 50_000,
         ttl: Duration::from_secs(60),
@@ -224,7 +223,7 @@ async fn degraded_regex_name_discovery_matches_the_warm_path_byte_for_byte() {
         .await
         .expect("connect (seed)");
 
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now_ms() / bucket) * bucket;
     // Two metric names matching `up.*`; `up` carries a series that must be
     // excluded by the `job="api"` label matcher (proving the matcher is
@@ -317,9 +316,9 @@ async fn degraded_regex_name_discovery_matches_the_warm_path_byte_for_byte() {
     // recording query.
     let probe_sql = pulsus_read::metrics::sql::distinct_metric_names_probe(
         &format!("{db}.metric_series"),
+        &format!("{db}.metric_labels"),
         &filters[0].name_matchers,
         window,
-        bucket,
         1_000,
     )
     .replace('?', "??");
@@ -380,7 +379,7 @@ async fn degraded_regex_name_discovery_over_the_fanout_cap_is_query_too_broad() 
         .await
         .expect("connect (seed)");
 
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now_ms() / bucket) * bucket;
     // Three distinct names all matching `up.*` → a probed name set of 3
     // against a cap of 2.
@@ -435,9 +434,10 @@ async fn degraded_regex_name_discovery_over_the_fanout_cap_is_query_too_broad() 
 /// and its own label row in `metric_labels`.
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedActivityRow {
-    metric_name: String,
+    day: u16,
     fingerprint: u128,
-    unix_milli: i64,
+    metric_name: String,
+    hours: u32,
 }
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -445,6 +445,8 @@ struct SeedLabelRow {
     metric_name: String,
     fingerprint: u128,
     labels: String,
+    first_seen: i64,
+    last_seen: i64,
 }
 
 /// Seeds `rows` the way the two views fill the tables from one kind-2 row.
@@ -452,9 +454,10 @@ async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
     let activity: Vec<SeedActivityRow> = rows
         .iter()
         .map(|r| SeedActivityRow {
-            metric_name: r.metric_name.clone(),
+            day: r.unix_milli.div_euclid(86_400_000) as u16,
             fingerprint: r.fingerprint,
-            unix_milli: r.unix_milli,
+            metric_name: r.metric_name.clone(),
+            hours: 1u32 << (r.unix_milli.rem_euclid(86_400_000) / 3_600_000),
         })
         .collect();
     let labels: Vec<SeedLabelRow> = rows
@@ -463,6 +466,8 @@ async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
             metric_name: r.metric_name.clone(),
             fingerprint: r.fingerprint,
             labels: r.labels.clone(),
+            first_seen: r.unix_milli,
+            last_seen: r.unix_milli,
         })
         .collect();
     client

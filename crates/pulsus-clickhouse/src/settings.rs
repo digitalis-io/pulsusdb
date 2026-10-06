@@ -475,6 +475,21 @@ impl QuerySettings {
     /// case that prices a block walks it with this. A figure over the strings'
     /// lengths would understate what the allocator holds, which is what the
     /// charge has to cover.
+    /// STUB (issue #623, tests first).
+    pub fn text_capacity(&self) -> u64 {
+        0
+    }
+
+    /// STUB (issue #623, tests first).
+    pub fn len(&self) -> usize {
+        usize::MAX
+    }
+
+    /// STUB (issue #623, tests first).
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+
     pub fn allocated_bytes(&self) -> u64 {
         self.0.capacity() as u64 * std::mem::size_of::<(String, String)>() as u64
             + self
@@ -665,11 +680,31 @@ mod tests {
         );
         assert_eq!(
             s.entries().count(),
-            10,
+            14,
             "the pinned set is closed: a setting added to it without a row in \
              landing_insert's table, and without its required-name entry, is \
              a name sent on somebody's memory"
         );
+    }
+
+    /// **W1 (issue #623): a landing insert fails when a view does not
+    /// write.** The four view settings are pinned to the server's own
+    /// defaults, so a profile cannot turn a failed view into a stored push
+    /// with a target row missing: an error in a view, or a view whose target
+    /// is gone, fails the push and the resend under the same token writes
+    /// what is missing; and a view's own insert is not divided into blocks
+    /// the source block was not.
+    #[test]
+    fn the_landing_insert_pins_the_four_view_settings() {
+        let s = QuerySettings::landing_insert("t1", 1_048_576);
+        for key in [
+            "materialized_views_ignore_errors",
+            "ignore_materialized_views_with_dropped_target_table",
+            "min_insert_block_size_rows_for_materialized_views",
+            "min_insert_block_size_bytes_for_materialized_views",
+        ] {
+            assert_eq!(s.get(key), Some("0"), "{key}");
+        }
     }
 
     /// The row ceiling is a deployment's value, and **both** row limits
@@ -688,12 +723,12 @@ mod tests {
     }
 
     /// **The trace landing insert's pin set is exactly the metrics one plus
-    /// the nineteen the trace path needs**, and the two sets are compared as
-    /// **sets**, with the difference taken against those nineteen — so
+    /// the fifteen the trace path needs**, and the two sets are compared as
+    /// **sets**, with the difference taken against those fifteen — so
     /// neither an added pin nor a removed one passes.
     ///
     /// It is the only place in this change that writes a setting name as a
-    /// literal. The seven classes behind the nineteen, and the catalogue
+    /// literal. The classes behind the fifteen, and the catalogue
     /// quotation behind each value, are
     /// [`QuerySettings::trace_landing_insert`]'s own doc comment.
     ///
@@ -711,10 +746,6 @@ mod tests {
             ("format_binary_max_object_size", "100000"),
             ("max_partitions_per_insert_block", "100"),
             ("throw_on_max_partitions_per_insert_block", "1"),
-            ("materialized_views_ignore_errors", "0"),
-            ("ignore_materialized_views_with_dropped_target_table", "0"),
-            ("min_insert_block_size_rows_for_materialized_views", "0"),
-            ("min_insert_block_size_bytes_for_materialized_views", "0"),
             ("distributed_foreground_insert", "1"),
             ("insert_shard_id", "0"),
             ("json_type_escape_dots_in_keys", "0"),
@@ -742,7 +773,7 @@ mod tests {
         assert_eq!(
             added, want,
             "the difference against the metrics landing insert is exactly the \
-             nineteen pins this design names"
+             fifteen pins this design names"
         );
 
         for (key, value) in &base_entries {

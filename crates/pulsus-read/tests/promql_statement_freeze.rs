@@ -146,13 +146,6 @@ fn fps() -> [FpLiteral; 3] {
 const SAMPLES: &str = "metric_samples";
 const HIST: &str = "metric_hist_samples";
 
-fn names() -> Vec<String> {
-    vec![
-        "http_requests_total".to_string(),
-        "http_errors_total".to_string(),
-    ]
-}
-
 /// (query, instant?)
 #[rustfmt::skip]
 const QUERIES: &[(&str, bool)] = &[
@@ -241,14 +234,13 @@ fn render() -> String {
             match (&pushed, &sel.metric_name) {
                 // ONE statement, over both tables, with the group ids
                 // stated above.
-                (Some(shape), Some(n)) if shape.selector == sel.id => {
+                (Some(shape), Some(_)) if shape.selector == sel.id => {
                     out.push_str(&format!("-- grouped op={:?} gids={GIDS:?}\n", shape.op));
                     emit(
                         &mut out,
                         &grouped_sql::grouped_fetch(
                             SAMPLES,
                             HIST,
-                            n,
                             &fps(),
                             &GIDS,
                             shape.grid,
@@ -258,24 +250,21 @@ fn render() -> String {
                         ),
                     );
                 }
-                (_, Some(n)) => {
+                (_, Some(_)) => {
+                    emit(&mut out, &sample_sql::sample_fetch(SAMPLES, &fps(), lo, hi));
                     emit(
                         &mut out,
-                        &sample_sql::sample_fetch(SAMPLES, n, &fps(), lo, hi),
-                    );
-                    emit(
-                        &mut out,
-                        &sample_sql::hist_sample_fetch(HIST, n, &fps(), lo, hi),
+                        &sample_sql::hist_sample_fetch(HIST, &fps(), lo, hi),
                     );
                 }
                 (_, None) => {
                     emit(
                         &mut out,
-                        &sample_sql::sample_fetch_multi(SAMPLES, &names(), &fps(), lo, hi),
+                        &sample_sql::sample_fetch_multi(SAMPLES, &fps(), lo, hi),
                     );
                     emit(
                         &mut out,
-                        &sample_sql::hist_sample_fetch_multi(HIST, &names(), &fps(), lo, hi),
+                        &sample_sql::hist_sample_fetch_multi(HIST, &fps(), lo, hi),
                     );
                 }
             }
@@ -411,7 +400,6 @@ fn the_grouped_statement_in_schemas_md_is_the_one_the_builder_renders() {
     let rendered = grouped_sql::grouped_fetch(
         SAMPLES,
         HIST,
-        "http_requests_total",
         &fps(),
         &GIDS,
         Grid {

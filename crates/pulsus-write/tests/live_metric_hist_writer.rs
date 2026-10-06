@@ -43,8 +43,8 @@ use opentelemetry_proto::tonic::metrics::v1::{
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
 use pulsus_config::{ExpHistogramMode, WriterConfig};
 use pulsus_model::{
-    DEFAULT_ACTIVITY_BUCKET_MS, Fingerprint, LabelSet, NativeHistogram, STALE_NAN_BITS, Span,
-    metric_fingerprint,
+    ACTIVITY_BUCKET_MS, Fingerprint, LabelSet, NativeHistogram, STALE_NAN_BITS, Span,
+    series_fingerprint,
 };
 use pulsus_schema::RenderCtx;
 use pulsus_schema_testkit::run_init;
@@ -130,7 +130,7 @@ fn writer(client: Arc<ChClient>) -> MetricWriter {
     MetricWriter::new_with_tables(
         client,
         &WriterConfig::default(),
-        DEFAULT_ACTIVITY_BUCKET_MS,
+        ACTIVITY_BUCKET_MS,
         MetricWriterTables::metrics_default(),
     )
 }
@@ -407,7 +407,7 @@ async fn cross_request_float_and_histogram_register_both_value_type_rows() {
     let writer = writer(client.clone());
 
     let (labels, _) = LabelSet::from_normalized([("job".to_string(), "checkout".to_string())]);
-    let fp = metric_fingerprint(&labels);
+    let fp = series_fingerprint("svc", &labels);
     let ts = recent_ms();
 
     // Request 1: a float sample for `svc`.

@@ -1979,8 +1979,8 @@ fn expected_metric_instant_raw_usage() -> Vec<String> {
 
 // ---------------------------------------------------------------------
 // PromQL metric reads (issue #83, M6-08a) — the @-fixed and the
-// subquery-widened fetch windows must keep the `(metric_name,
-// fingerprint, unix_milli)` primary index on `metric_samples`: both plan
+// subquery-widened fetch windows must keep the `(fingerprint,
+// unix_milli)` primary index on `metric_samples`: both plan
 // to exactly one bounded `sample_fetch` whose `EXPLAIN indexes = 1`
 // extract matches the plain raw-fetch expectation (no index loss from
 // the fixed/widened bounds).
@@ -1993,12 +1993,12 @@ async fn seed_metric_samples(client: &ChClient, db: &str, now_ms: i64) {
     // analysis (recent so `ttl_only_drop_parts` retention can't race it,
     // the same rule as `now_ns()`'s doc).
     let values: Vec<String> = (0..6)
-        .map(|k| format!("('mq', {MFP}, {}, {k}.0)", now_ms - k * 10_000))
+        .map(|k| format!("({MFP}, {}, {k}.0)", now_ms - k * 10_000))
         .collect();
     client
         .execute(
             &format!(
-                "INSERT INTO {db}.metric_samples (metric_name, fingerprint, unix_milli, value) \
+                "INSERT INTO {db}.metric_samples (fingerprint, unix_milli, value) \
                  VALUES {}",
                 values.join(", ")
             ),
@@ -2022,21 +2022,21 @@ fn promql_sample_fetch_sql(query: &str, params: pulsus_promql::PlanParams, db: &
     );
     let (lower_excl, upper_incl) = plan.selectors[0].fetch_window(&params);
     let table = format!("{db}.metric_samples");
+    assert!(
+        plan.selectors[0].metric_name.is_some(),
+        "these cases use concrete-name selectors"
+    );
     pulsus_read::metrics::sample_sql::sample_fetch(
         &table,
-        plan.selectors[0]
-            .metric_name
-            .as_deref()
-            .expect("these cases use concrete-name selectors"),
         &[Fingerprint::from_raw(u128::from(MFP)).sql_literal()],
         lower_excl,
         upper_incl,
     )
 }
 
-/// The `(metric_name, fingerprint, unix_milli)` primary key on
-/// `metric_samples` — the shared raw-fetch expectation both PromQL cases
-/// below assert against: the full three-column key condition plus MinMax
+/// The `(fingerprint, unix_milli)` primary key on `metric_samples` (issue
+/// #623) — the shared raw-fetch expectation both PromQL cases below assert
+/// against: the full two-column key condition plus MinMax
 /// time pruning (the `toDate(...)` partition analysis reports
 /// `Condition: true` here — time-range partition pruning surfaces through
 /// the MinMax block instead).
@@ -2050,10 +2050,9 @@ fn expected_metric_samples_fetch_usage() -> Vec<String> {
         "Condition: true",
         "PrimaryKey",
         "Keys:",
-        "metric_name",
         "fingerprint",
         "unix_milli",
-        "Condition: and(and((fingerprint in #-element set), and((unix_milli in (-Inf, #]), (unix_milli in [#, +Inf)))), (metric_name in ['mq', 'mq']))",
+        "Condition: and((fingerprint in #-element set), and((unix_milli in (-Inf, #]), (unix_milli in [#, +Inf))))",
     ])
 }
 
@@ -2140,8 +2139,8 @@ async fn promql_multi_metric_fanout_prunes_on_both_metric_name_and_fingerprint_k
     client
         .execute(
             &format!(
-                "INSERT INTO {db}.metric_samples (metric_name, fingerprint, unix_milli, value) \
-                 VALUES ('mq2', {MFP2}, {now_ms}, 1.0)"
+                "INSERT INTO {db}.metric_samples (fingerprint, unix_milli, value) \
+                 VALUES ({MFP2}, {now_ms}, 1.0)"
             ),
             &QuerySettings::new(),
             Idempotency::Idempotent,
@@ -2160,7 +2159,6 @@ async fn promql_multi_metric_fanout_prunes_on_both_metric_name_and_fingerprint_k
     let table = format!("{db}.metric_samples");
     let sql = pulsus_read::metrics::sample_sql::sample_fetch_multi(
         &table,
-        &["mq".to_string(), "mq2".to_string()],
         &[
             Fingerprint::from_raw(u128::from(MFP)).sql_literal(),
             Fingerprint::from_raw(u128::from(MFP2)).sql_literal(),
@@ -2181,12 +2179,11 @@ async fn promql_multi_metric_fanout_prunes_on_both_metric_name_and_fingerprint_k
             "Condition: true",
             "PrimaryKey",
             "Keys:",
-            "metric_name",
             "fingerprint",
             "unix_milli",
-            "Condition: and(and((fingerprint in #-element set), and((unix_milli in (-Inf, #]), (unix_milli in [#, +Inf)))), (metric_name in #-element set))",
+            "Condition: and((fingerprint in #-element set), and((unix_milli in (-Inf, #]), (unix_milli in [#, +Inf))))",
         ]),
-        "both the metric_name IN and fingerprint IN components must engage the primary key"
+        "the fingerprint IN component must engage the primary key"
     );
 
     // Control: a concrete-name selector's plan is unchanged by the multi
@@ -2220,8 +2217,8 @@ async fn info_selector_fetch_prunes_on_metric_name_and_its_resolution_probe_is_l
     client
         .execute(
             &format!(
-                "INSERT INTO {db}.metric_samples (metric_name, fingerprint, unix_milli, value) \
-                 VALUES ('target_info', {INFO_FP}, {now_ms}, 1.0)"
+                "INSERT INTO {db}.metric_samples (fingerprint, unix_milli, value) \
+                 VALUES ({INFO_FP}, {now_ms}, 1.0)"
             ),
             &QuerySettings::new(),
             Idempotency::Idempotent,
@@ -2260,7 +2257,6 @@ async fn info_selector_fetch_prunes_on_metric_name_and_its_resolution_probe_is_l
     let samples_table = format!("{db}.metric_samples");
     let fetch_sql = pulsus_read::metrics::sample_sql::sample_fetch(
         &samples_table,
-        "target_info",
         &[Fingerprint::from_raw(u128::from(INFO_FP)).sql_literal()],
         lower_excl,
         upper_incl,
@@ -2277,12 +2273,11 @@ async fn info_selector_fetch_prunes_on_metric_name_and_its_resolution_probe_is_l
             "Condition: true",
             "PrimaryKey",
             "Keys:",
-            "metric_name",
             "fingerprint",
             "unix_milli",
-            "Condition: and(and((fingerprint in #-element set), and((unix_milli in (-Inf, #]), (unix_milli in [#, +Inf)))), (metric_name in ['target_info', 'target_info']))",
+            "Condition: and((fingerprint in #-element set), and((unix_milli in (-Inf, #]), (unix_milli in [#, +Inf))))",
         ]),
-        "the info() sample fetch must PK-prune on metric_name exactly like any concrete-name fetch"
+        "the info() sample fetch must PK-prune on its IDs exactly like any concrete-name fetch"
     );
 
     // (b) The degraded-path resolution probe: a `LIMIT cap+1` bound in
@@ -2303,7 +2298,6 @@ async fn info_selector_fetch_prunes_on_metric_name_and_its_resolution_probe_is_l
         &labels_table,
         "target_info",
         window,
-        1,
         &[],
     );
     let cap = 100_000u64;
@@ -2399,7 +2393,6 @@ async fn discovery_multi_metric_fanout_prunes_on_both_metric_name_and_fingerprin
             Fingerprint::from_raw(u128::from(SFP2)).sql_literal(),
         ],
         window,
-        1,
     );
 
     let usage = explain(&client, &sql).await;
@@ -2495,10 +2488,9 @@ async fn discovery_distinct_names_engages_the_same_indexes_as_the_wide_discovery
     // `bucket_ms = 1` floors to the exact bounds, so the seeded now-stamped
     // rows stay inside the queried window and the analysis runs against a
     // populated part.
-    let narrow_sql = pulsus_read::metrics::sql::discovery_distinct_names_query(
-        &table, &labels, &filter, window, 1,
-    );
-    let wide_sql = pulsus_read::metrics::sql::discovery_query(&table, &labels, &filter, window, 1);
+    let narrow_sql =
+        pulsus_read::metrics::sql::discovery_distinct_names_query(&table, &labels, &filter, window);
+    let wide_sql = pulsus_read::metrics::sql::discovery_query(&table, &labels, &filter, window);
 
     let narrow = explain(&client, &narrow_sql).await;
     assert_eq!(
@@ -2580,7 +2572,6 @@ async fn discovery_distinct_names_uses_the_sorted_key_distinct_transform() {
         &format!("{db}.metric_labels"),
         &unfiltered_discovery_filter(),
         window,
-        1,
     );
     let narrow = explain_pipeline_raw(&client, &narrow_sql).await;
     assert!(
@@ -2651,7 +2642,6 @@ async fn discovery_fetch_by_names_prunes_on_the_metric_name_primary_key_componen
             value: "api".to_string(),
         }],
         window,
-        1,
     );
 
     let usage = explain(&client, &sql).await;
@@ -2721,7 +2711,6 @@ async fn the_re2_compile_probe_costs_the_metric_series_fallback_no_index_engagem
             &format!("{db}.metric_labels"),
             "sv",
             window,
-            1,
             &[matcher(op)],
         )
     };
@@ -2731,7 +2720,7 @@ async fn the_re2_compile_probe_costs_the_metric_series_fallback_no_index_engagem
     // Premise: the two SQL texts genuinely differ, and only the regex one
     // carries a probe — otherwise this compares a query with itself.
     assert!(
-        with_probe.contains("+ 0 * (match('', "),
+        with_probe.contains("  AND 0 * match('', "),
         "the regex subquery must carry the probe: {with_probe}"
     );
     assert!(

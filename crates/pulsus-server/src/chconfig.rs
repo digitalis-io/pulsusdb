@@ -323,7 +323,6 @@ pub(crate) fn label_cache_config_from(config: &Config) -> LabelCacheConfig {
         db: config.clickhouse.database.clone(),
         series_table: format!("metric_series{dist}"),
         labels_table: format!("metric_labels{dist}"),
-        bucket_ms: config.reader.series_activity_bucket.0.as_millis() as i64,
         window_ms: config.reader.cache_window.0.as_millis() as i64,
         cache_max_series: config.reader.cache_max_series,
         ttl: config.reader.cache_ttl.0,
@@ -987,10 +986,6 @@ mod tests {
         let config = Config::default();
         let cfg = label_cache_config_from(&config);
         assert_eq!(cfg.db, config.clickhouse.database);
-        assert_eq!(
-            cfg.bucket_ms,
-            config.reader.series_activity_bucket.0.as_millis() as i64
-        );
         assert_eq!(
             cfg.window_ms,
             config.reader.cache_window.0.as_millis() as i64

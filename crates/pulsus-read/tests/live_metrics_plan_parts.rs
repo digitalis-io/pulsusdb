@@ -59,7 +59,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
-use pulsus_model::DEFAULT_ACTIVITY_BUCKET_MS;
+use pulsus_model::ACTIVITY_BUCKET_MS;
 use pulsus_promql::parser::parse;
 use pulsus_read::{
     LabelCache, LabelCacheConfig, MetricQueryParams, MetricsConfig, MetricsEngine, PlanExplain,
@@ -159,7 +159,6 @@ struct SeedSeriesRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedSampleRow {
-    metric_name: String,
     fingerprint: u128,
     unix_milli: i64,
     value: f64,
@@ -167,7 +166,6 @@ struct SeedSampleRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedHistRow {
-    metric_name: String,
     fingerprint: u128,
     unix_milli: i64,
     schema: i8,
@@ -211,7 +209,6 @@ fn cache_config(db: &str) -> LabelCacheConfig {
         db: db.to_string(),
         series_table: "metric_series".to_string(),
         labels_table: "metric_labels".to_string(),
-        bucket_ms: DEFAULT_ACTIVITY_BUCKET_MS,
         window_ms: 24 * 3_600_000,
         cache_max_series: 50_000,
         ttl: Duration::from_secs(60),
@@ -253,7 +250,6 @@ async fn seed(client: &ChClient, t: i64, bucket: i64) {
             labels: serde_json::to_string(&labels).expect("labels json"),
         });
         samples.push(SeedSampleRow {
-            metric_name: METRIC.to_string(),
             fingerprint: u128::from(*fp),
             unix_milli: t,
             value: i as f64,
@@ -269,7 +265,6 @@ async fn seed(client: &ChClient, t: i64, bucket: i64) {
             labels: serde_json::to_string(&labels).expect("labels json"),
         });
         samples.push(SeedSampleRow {
-            metric_name: ERRORS.to_string(),
             fingerprint: u128::from(*fp),
             unix_milli: t,
             value: i as f64,
@@ -284,7 +279,6 @@ async fn seed(client: &ChClient, t: i64, bucket: i64) {
     // carries, so the dual read has rows on both sides and no `IN` list
     // gains a member.
     let hist = vec![SeedHistRow {
-        metric_name: METRIC.to_string(),
         fingerprint: u128::from(FPS[1]),
         unix_milli: t,
         schema: 0,
@@ -544,7 +538,7 @@ async fn harness(db: &str) -> Harness {
     let client = ChClient::new(test_config(&db)).await.expect("connect");
     let now = now_ms();
     let t = (now / 60_000) * 60_000;
-    let bucket = (now / DEFAULT_ACTIVITY_BUCKET_MS) * DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = (now / ACTIVITY_BUCKET_MS) * ACTIVITY_BUCKET_MS;
     seed(&client, t, bucket).await;
 
     let cache = Arc::new(LabelCache::new(
@@ -841,9 +835,10 @@ async fn the_plans_sql_parts_are_the_statements_the_database_received() {
 /// and its own label row in `metric_labels`.
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedActivityRow {
-    metric_name: String,
+    day: u16,
     fingerprint: u128,
-    unix_milli: i64,
+    metric_name: String,
+    hours: u32,
 }
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -851,6 +846,8 @@ struct SeedLabelRow {
     metric_name: String,
     fingerprint: u128,
     labels: String,
+    first_seen: i64,
+    last_seen: i64,
 }
 
 /// Seeds `rows` the way the two views fill the tables from one kind-2 row.
@@ -858,9 +855,10 @@ async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
     let activity: Vec<SeedActivityRow> = rows
         .iter()
         .map(|r| SeedActivityRow {
-            metric_name: r.metric_name.clone(),
+            day: r.unix_milli.div_euclid(86_400_000) as u16,
             fingerprint: r.fingerprint,
-            unix_milli: r.unix_milli,
+            metric_name: r.metric_name.clone(),
+            hours: 1u32 << (r.unix_milli.rem_euclid(86_400_000) / 3_600_000),
         })
         .collect();
     let labels: Vec<SeedLabelRow> = rows
@@ -869,6 +867,8 @@ async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
             metric_name: r.metric_name.clone(),
             fingerprint: r.fingerprint,
             labels: r.labels.clone(),
+            first_seen: r.unix_milli,
+            last_seen: r.unix_milli,
         })
         .collect();
     client

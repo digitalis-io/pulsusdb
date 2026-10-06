@@ -793,7 +793,6 @@ pub async fn over_inclusion_probe(
         &labels_table,
         &tier.metric_name,
         window,
-        bucket_ms,
         &matchers,
     );
     let query_id = format!(
@@ -845,7 +844,6 @@ pub async fn run_all(
         db: cfg.db.to_string(),
         series_table: series_table.clone(),
         labels_table: labels_table.clone(),
-        bucket_ms: summary.bucket_ms,
         window_ms: summary.window_ms,
         cache_max_series: cfg.cache_max_series,
         ttl: std::time::Duration::from_secs(3600),
@@ -897,7 +895,6 @@ pub async fn run_all(
                 &labels_table,
                 &tier.metric_name,
                 window,
-                summary.bucket_ms,
                 &matchers,
             );
             let (sql_ev, mut sql_fps) =
@@ -1042,7 +1039,14 @@ mod tests {
         // comment's "Sweep SQL drift" discipline.
         assert_eq!(
             sweep_sql_copy("metric_series", "metric_labels", 1_000, None),
-            pulsus_read::metrics::sql::sweep_query("metric_series", "metric_labels", 1_000)
+            pulsus_read::metrics::sql::sweep_query(
+                "metric_series",
+                "metric_labels",
+                pulsus_read::metrics::DataWindow {
+                    start_ms: 1_000,
+                    end_ms: i64::MAX,
+                }
+            )
         );
     }
 

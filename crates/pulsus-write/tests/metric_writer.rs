@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use pulsus_clickhouse::{ChError, ChRow, QuerySettings};
 use pulsus_config::{ByteSize, Config, WriterConfig};
-use pulsus_model::{DEFAULT_ACTIVITY_BUCKET_MS, Fingerprint, LabelSet, NativeHistogram, Span};
+use pulsus_model::{ACTIVITY_BUCKET_MS, Fingerprint, LabelSet, NativeHistogram, Span};
 use pulsus_write::writer::{
     BlockInserter, LANDING_ROW_SLOT_BYTES, MetricLandingRow, MetricWriter, MetricWriterTables,
     WriterRuntime, landing_block_overhead_bytes,
@@ -30,7 +30,7 @@ use pulsus_write::{
 };
 use tokio::time::Instant;
 
-const BUCKET_MS: i64 = DEFAULT_ACTIVITY_BUCKET_MS;
+const BUCKET_MS: i64 = ACTIVITY_BUCKET_MS;
 const LANDING: &str = "metric_landing";
 
 // -- the mock inserter ------------------------------------------------
@@ -443,7 +443,7 @@ fn epoch_millis() -> i64 {
 
 /// The default `metric_series` activity bucket
 /// (`pulsus_config::ReaderConfig::series_activity_bucket`) must resolve to
-/// exactly `pulsus_model::DEFAULT_ACTIVITY_BUCKET_MS`, and the writer's
+/// exactly `pulsus_model::ACTIVITY_BUCKET_MS`, and the writer's
 /// admission-time flooring must be the same function the reader renders into
 /// its historical-bound SQL — proven by construction (`MetricWriter` only
 /// ever calls `floor_to_activity_bucket`), not by convention.
@@ -452,7 +452,7 @@ fn default_series_activity_bucket_matches_the_shared_floor_constant() {
     let cfg = Config::default();
     assert_eq!(
         cfg.reader.series_activity_bucket.0.as_millis() as i64,
-        DEFAULT_ACTIVITY_BUCKET_MS
+        ACTIVITY_BUCKET_MS
     );
 }
 

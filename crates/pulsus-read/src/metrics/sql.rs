@@ -178,7 +178,9 @@ fn label_first(labels_table: &str, from_where: &str) -> String {
 /// The sweep's statement (`super::refresh`): every series active since
 /// `lower_bound_ms`, with its own labels. No upper bound — the sweep runs as
 /// of now.
-pub fn sweep_query(series_table: &str, labels_table: &str, lower_bound_ms: i64) -> String {
+pub fn sweep_query(series_table: &str, labels_table: &str, window: DataWindow) -> String {
+    // STUB (issue #623, tests first): the old body, from the window's start.
+    let lower_bound_ms = window.start_ms;
     label_first(
         labels_table,
         &format!("FROM {series_table}\nWHERE unix_milli >= {lower_bound_ms}"),
@@ -197,9 +199,10 @@ pub fn historical_series_subquery(
     labels_table: &str,
     metric_name: &str,
     window: DataWindow,
-    bucket_ms: i64,
     matchers: &[LabelMatcher],
 ) -> String {
+    // STUB (issue #623, tests first): the old bucket-floored body.
+    let bucket_ms = pulsus_model::ACTIVITY_BUCKET_MS;
     format!(
         "SELECT fingerprint\n{}",
         base_where(
@@ -252,9 +255,10 @@ pub fn historical_resolution_query(
     labels_table: &str,
     metric_name: &str,
     window: DataWindow,
-    bucket_ms: i64,
     matchers: &[LabelMatcher],
 ) -> String {
+    // STUB (issue #623, tests first): the old bucket-floored body.
+    let bucket_ms = pulsus_model::ACTIVITY_BUCKET_MS;
     let scope = name_scope(metric_name);
     let tail = SeriesWhere::new(
         window,
@@ -291,9 +295,11 @@ pub fn historical_resolution_query(
 /// copies the table holds until it merges.
 pub fn series_labels_by_fingerprint(
     labels_table: &str,
-    metric_name: &str,
+    metric_names: &[String],
     fps: &[FpLiteral],
 ) -> String {
+    // STUB (issue #623, tests first): the old body, under the first name.
+    let metric_name = metric_names.first().map(String::as_str).unwrap_or_default();
     let fp_list = fps
         .iter()
         .map(FpLiteral::to_string)
@@ -323,8 +329,9 @@ pub fn discovery_query(
     labels_table: &str,
     filter: &DiscoveryFilter,
     window: DataWindow,
-    bucket_ms: i64,
 ) -> String {
+    // STUB (issue #623, tests first): the old bucket-floored body.
+    let bucket_ms = pulsus_model::ACTIVITY_BUCKET_MS;
     match &filter.metric_name {
         // Named: the metric's series joined to its own label rows.
         Some(name) => {
@@ -441,8 +448,9 @@ pub fn discovery_distinct_names_query(
     labels_table: &str,
     filter: &DiscoveryFilter,
     window: DataWindow,
-    bucket_ms: i64,
 ) -> String {
+    // STUB (issue #623, tests first): the old bucket-floored body.
+    let bucket_ms = pulsus_model::ACTIVITY_BUCKET_MS;
     if filter.metric_name.is_none() && !filter.matchers.is_empty() {
         let tail = SeriesWhere::new(
             window,
@@ -503,8 +511,9 @@ pub fn discovery_fetch_multi(
     metric_names: &[String],
     fps: &[FpLiteral],
     window: DataWindow,
-    bucket_ms: i64,
 ) -> String {
+    // STUB (issue #623, tests first): the old bucket-floored body.
+    let bucket_ms = pulsus_model::ACTIVITY_BUCKET_MS;
     let names = names_scope(metric_names);
     let fp_list = fps
         .iter()
@@ -555,11 +564,14 @@ pub fn discovery_fetch_multi(
 /// recorded, not asserted (scale routes to issue #25).
 pub fn distinct_metric_names_probe(
     series_table: &str,
+    labels_table: &str,
     name_matchers: &[LabelMatcher],
     window: DataWindow,
-    bucket_ms: i64,
     fanout_cap: u64,
 ) -> String {
+    // STUB (issue #623, tests first): the old bucket-floored body.
+    let _ = labels_table;
+    let bucket_ms = pulsus_model::ACTIVITY_BUCKET_MS;
     let limit = fanout_cap.saturating_add(1);
     let tail = SeriesWhere::new(
         window,
@@ -593,8 +605,9 @@ pub fn discovery_fetch_by_names(
     metric_names: &[String],
     matchers: &[LabelMatcher],
     window: DataWindow,
-    bucket_ms: i64,
 ) -> String {
+    // STUB (issue #623, tests first): the old bucket-floored body.
+    let bucket_ms = pulsus_model::ACTIVITY_BUCKET_MS;
     let scope = names_scope(metric_names);
     let tail = SeriesWhere::new(
         window,
@@ -692,17 +705,16 @@ mod tests {
     }
 
     #[test]
-    fn historical_series_subquery_renders_bucket_floored_bounds() {
+    fn historical_series_subquery_renders_the_day_window() {
         let sql = historical_series_subquery(
             "metric_series",
             "metric_labels",
             "http_requests_total",
             window(),
-            3_600_000,
             &[],
         );
         assert!(sql.contains("metric_name = 'http_requests_total'"));
-        assert!(sql.contains("unix_milli >= 0 AND unix_milli <= 3600000"));
+        assert!(sql.contains("WHERE day BETWEEN '1970-01-01' AND '1970-01-01'\n"));
         assert!(sql.starts_with("SELECT fingerprint\nFROM metric_series"));
     }
 
@@ -713,7 +725,6 @@ mod tests {
             "metric_labels",
             "up",
             window(),
-            3_600_000,
             &[eq("job", "api")],
         );
         assert!(!sql.contains("ORDER BY"));
@@ -732,7 +743,6 @@ mod tests {
             "metric_labels",
             "target_info",
             window(),
-            1,
             &[],
         );
         let sql = info_series_cardinality_probe(&base, 999);
@@ -754,70 +764,20 @@ mod tests {
             "metric_labels",
             "target_info",
             window(),
-            1,
             &[],
         );
         let sql = info_series_cardinality_probe(&base, u64::MAX);
         assert!(sql.ends_with(&format!("LIMIT {}", u64::MAX)), "got: {sql}");
     }
 
-    /// U5 (issue #623): the metric's series joined to its own label rows.
-    #[test]
-    fn historical_resolution_query_is_the_label_join_over_one_metric() {
-        let sql = historical_resolution_query(
-            "metric_series",
-            "metric_labels",
-            "up",
-            window(),
-            3_600_000,
-            &[],
-        );
-        assert_eq!(
-            sql,
-            "SELECT fingerprint, labels\nFROM (\n\
-             SELECT fingerprint, s.metric_name AS metric_name, l.labels AS labels\n\
-             FROM (\n\
-             SELECT DISTINCT metric_name, fingerprint\n\
-             FROM metric_series\n\
-             WHERE metric_name = 'up'\n\
-             \x20 AND unix_milli >= 0 AND unix_milli <= 3600000\n\
-             ) AS s\n\
-             ANY INNER JOIN (\n\
-             SELECT fingerprint, labels\n\
-             FROM metric_labels\n\
-             WHERE metric_name = 'up'\n\
-             ) AS l USING (fingerprint)\n\
-             ORDER BY metric_name, fingerprint\n\
-             )"
-        );
-    }
-
-    /// U5 (issue #623): the hydration reads the metric's own label rows.
-    #[test]
-    fn series_labels_by_fingerprint_renders_an_explicit_fingerprint_list() {
-        let sql = series_labels_by_fingerprint(
-            "metric_labels",
-            "up",
-            &[
-                Fingerprint::from_raw(101).sql_literal(),
-                Fingerprint::from_raw(205).sql_literal(),
-                Fingerprint::from_raw(990).sql_literal(),
-            ],
-        );
-        assert_eq!(
-            sql,
-            "SELECT fingerprint, any(labels) AS labels\nFROM metric_labels\nWHERE metric_name = 'up'\n  AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))\nGROUP BY fingerprint"
-        );
-    }
-
     #[test]
     fn series_labels_by_fingerprint_has_no_window_or_matcher_predicates() {
         let sql = series_labels_by_fingerprint(
             "metric_labels",
-            "up",
+            &["up".to_string()],
             &[Fingerprint::from_raw(1).sql_literal()],
         );
-        assert!(!sql.contains("unix_milli >="));
+        assert!(!sql.contains("day BETWEEN"));
         assert!(!sql.contains("JSONExtractString"));
     }
 
@@ -828,7 +788,6 @@ mod tests {
             "metric_labels",
             "up",
             window(),
-            3_600_000,
             &[eq("job", "api")],
         );
         assert!(sql.contains("JSONExtractString(labels, 'job') = 'api'"));
@@ -841,14 +800,8 @@ mod tests {
             op: MatchOp::Neq,
             value: "api".to_string(),
         };
-        let sql = historical_series_subquery(
-            "metric_series",
-            "metric_labels",
-            "up",
-            window(),
-            3_600_000,
-            &[m],
-        );
+        let sql =
+            historical_series_subquery("metric_series", "metric_labels", "up", window(), &[m]);
         assert!(sql.contains("JSONExtractString(labels, 'job') != 'api'"));
     }
 
@@ -859,14 +812,8 @@ mod tests {
             op: MatchOp::Re,
             value: "5..".to_string(),
         };
-        let sql = historical_series_subquery(
-            "metric_series",
-            "metric_labels",
-            "up",
-            window(),
-            3_600_000,
-            &[m],
-        );
+        let sql =
+            historical_series_subquery("metric_series", "metric_labels", "up", window(), &[m]);
         assert!(sql.contains("match(JSONExtractString(labels, 'status'), '(?-s)^(?:5..)$')"));
     }
 
@@ -877,14 +824,8 @@ mod tests {
             op: MatchOp::Nre,
             value: "5..".to_string(),
         };
-        let sql = historical_series_subquery(
-            "metric_series",
-            "metric_labels",
-            "up",
-            window(),
-            3_600_000,
-            &[m],
-        );
+        let sql =
+            historical_series_subquery("metric_series", "metric_labels", "up", window(), &[m]);
         assert!(sql.contains("NOT match(JSONExtractString(labels, 'status'), '(?-s)^(?:5..)$')"));
     }
 
@@ -908,7 +849,6 @@ mod tests {
             "metric_labels",
             "up",
             window(),
-            3_600_000,
             &[re("status", "5..")],
         );
         assert_eq!(sql.matches("'(?-s)^(?:5..)$'").count(), 2, "got: {sql}");
@@ -953,7 +893,6 @@ mod tests {
             "metric_labels",
             "up",
             window(),
-            3_600_000,
             &[re("status", "(?s:5..)")],
         );
         assert_eq!(
@@ -964,9 +903,8 @@ mod tests {
     }
 
     /// Issue #315: the compile probe is a **constant** `match()` folded at
-    /// analysis time, spliced into the floored lower bound so it adds no
-    /// conjunct (which would cost a duplicated PREWHERE filter — see
-    /// [`re2_compile_probe`]'s doc) and no index-relevant change.
+    /// analysis time; since issue #623 it is its own line of the activity
+    /// read, one per regex.
     #[test]
     fn a_regex_matcher_adds_a_constant_compile_probe_to_the_lower_bound() {
         let sql = historical_series_subquery(
@@ -974,13 +912,10 @@ mod tests {
             "metric_labels",
             "up",
             window(),
-            3_600_000,
             &[re("status", "5..")],
         );
         assert!(
-            sql.contains(
-                "AND unix_milli >= 0 + 0 * (match('', '(?-s)^(?:5..)$')) AND unix_milli <= 3600000"
-            ),
+            sql.contains("\n  AND 0 * match('', '(?-s)^(?:5..)$') = 0\n"),
             "got: {sql}"
         );
     }
@@ -1000,13 +935,12 @@ mod tests {
             "metric_labels",
             "up",
             window(),
-            3_600_000,
             &[re("status", "5.."), eq("job", "api"), nre],
         );
         assert!(
             sql.contains(
-                "unix_milli >= 0 + 0 * (match('', '(?-s)^(?:5..)$') + \
-                 match('', '(?-s)^(?:dev)$')) AND"
+                "\n  AND 0 * match('', '(?-s)^(?:5..)$') = 0\n  AND 0 * match('', \
+                 '(?-s)^(?:dev)$') = 0\n"
             ),
             "got: {sql}"
         );
@@ -1031,13 +965,9 @@ mod tests {
                 "metric_labels",
                 "up",
                 window(),
-                3_600_000,
                 &matchers,
             );
-            assert!(
-                sql.contains("AND unix_milli >= 0 AND unix_milli <= 3600000"),
-                "got: {sql}"
-            );
+            assert!(!sql.contains("0 * "), "got: {sql}");
             assert!(!sql.contains("match("), "got: {sql}");
         }
     }
@@ -1079,7 +1009,6 @@ mod tests {
                 "metric_labels",
                 "up",
                 window(),
-                3_600_000,
                 &[re("status", "5..")],
             ),
             historical_resolution_query(
@@ -1087,55 +1016,35 @@ mod tests {
                 "metric_labels",
                 "up",
                 window(),
-                3_600_000,
                 &[re("status", "5..")],
             ),
-            discovery_query(
-                "metric_series",
-                "metric_labels",
-                &filter,
-                window(),
-                3_600_000,
-            ),
-            discovery_query(
-                "metric_series",
-                "metric_labels",
-                &nameless,
-                window(),
-                3_600_000,
-            ),
+            discovery_query("metric_series", "metric_labels", &filter, window()),
+            discovery_query("metric_series", "metric_labels", &nameless, window()),
             // Issue #472's narrow projection shares `discovery_from_where`
             // with `discovery_query`, so it inherits the same sealed tail —
             // listed here anyway, because the list is what says a builder
             // was considered.
-            discovery_distinct_names_query(
-                "metric_series",
-                "metric_labels",
-                &filter,
-                window(),
-                3_600_000,
-            ),
-            discovery_distinct_names_query(
-                "metric_series",
-                "metric_labels",
-                &nameless,
-                window(),
-                3_600_000,
-            ),
+            discovery_distinct_names_query("metric_series", "metric_labels", &filter, window()),
+            discovery_distinct_names_query("metric_series", "metric_labels", &nameless, window()),
             discovery_fetch_by_names(
                 "metric_series",
                 "metric_labels",
                 &["up".to_string()],
                 &[re("status", "5..")],
                 window(),
-                3_600_000,
             ),
-            distinct_metric_names_probe("metric_series", &[name_matcher], window(), 3_600_000, 10),
+            distinct_metric_names_probe(
+                "metric_series",
+                "metric_labels",
+                &[name_matcher],
+                window(),
+                10,
+            ),
         ];
         for sql in built {
             assert!(sql.contains("match("), "no user regex rendered: {sql}");
             assert!(
-                sql.contains("+ 0 * (match('', "),
+                sql.contains("0 * match('', "),
                 "a user regex reached SQL with no compile probe: {sql}"
             );
         }
@@ -1148,7 +1057,6 @@ mod tests {
             "metric_labels",
             "http_requests_total",
             window(),
-            3_600_000,
             &[eq("job", "api"), eq("env", "prod")],
         );
         assert!(sql.contains("JSONExtractString(labels, 'job') = 'api'"));
@@ -1166,14 +1074,8 @@ mod tests {
     fn label_key_injection_stays_inside_one_literal() {
         let payload = "job'; DROP TABLE metric_series; --\n\t\0";
         let m = eq(payload, "api");
-        let sql = historical_series_subquery(
-            "metric_series",
-            "metric_labels",
-            "up",
-            window(),
-            3_600_000,
-            &[m],
-        );
+        let sql =
+            historical_series_subquery("metric_series", "metric_labels", "up", window(), &[m]);
         assert!(sql.contains(&format!(
             "JSONExtractString(labels, {})",
             ch_string(payload)
@@ -1193,14 +1095,8 @@ mod tests {
             op: MatchOp::Re,
             value: payload.to_string(),
         };
-        let sql = historical_series_subquery(
-            "metric_series",
-            "metric_labels",
-            "up",
-            window(),
-            3_600_000,
-            &[m],
-        );
+        let sql =
+            historical_series_subquery("metric_series", "metric_labels", "up", window(), &[m]);
         let expected = anchored_re2_literal_for_test(payload);
         assert_no_unescaped_quote(&expected);
         assert!(sql.contains(&format!(
@@ -1229,7 +1125,6 @@ mod tests {
             "metric_labels",
             name_payload,
             window(),
-            3_600_000,
             &[m],
         );
         assert!(sql.contains(&format!("metric_name = {}", ch_string(name_payload))));
@@ -1263,13 +1158,7 @@ mod tests {
             name_matchers: vec![],
             matchers: vec![eq("job", "api")],
         };
-        let sql = discovery_query(
-            "metric_series",
-            "metric_labels",
-            &filter,
-            window(),
-            3_600_000,
-        );
+        let sql = discovery_query("metric_series", "metric_labels", &filter, window());
         assert!(sql.contains("metric_name = 'up'"));
         assert!(sql.contains("JSONExtractString(labels, 'job') = 'api'"));
         assert!(sql.starts_with(
@@ -1281,13 +1170,7 @@ mod tests {
     #[test]
     fn discovery_query_without_a_metric_name_has_no_metric_name_predicate() {
         let filter = DiscoveryFilter::default();
-        let sql = discovery_query(
-            "metric_series",
-            "metric_labels",
-            &filter,
-            window(),
-            3_600_000,
-        );
+        let sql = discovery_query("metric_series", "metric_labels", &filter, window());
         assert!(!sql.contains("metric_name ="));
         assert!(sql.contains("unix_milli >= 0 AND unix_milli <= 3600000"));
     }
@@ -1299,13 +1182,7 @@ mod tests {
             name_matchers: vec![],
             matchers: vec![eq("job", "api")],
         };
-        let sql = discovery_query(
-            "metric_series",
-            "metric_labels",
-            &filter,
-            window(),
-            3_600_000,
-        );
+        let sql = discovery_query("metric_series", "metric_labels", &filter, window());
         assert!(sql.contains("JSONExtractString(labels, 'job') = 'api'"));
     }
 
@@ -1317,13 +1194,7 @@ mod tests {
             name_matchers: vec![],
             matchers: vec![],
         };
-        let sql = discovery_query(
-            "metric_series",
-            "metric_labels",
-            &filter,
-            window(),
-            3_600_000,
-        );
+        let sql = discovery_query("metric_series", "metric_labels", &filter, window());
         assert!(sql.contains(&format!("metric_name = {}", ch_string(payload))));
         assert_no_unescaped_quote(&ch_string(payload));
     }
@@ -1372,69 +1243,6 @@ mod tests {
         ]
     }
 
-    /// Issue #472 AC2 — the narrow builder's literal bytes, for the
-    /// unfiltered call the discovery client actually makes, for a
-    /// concrete-name-plus-matcher filter, and (U4, issue #623) for a
-    /// matcher with no name, which joins series to label rows by the pair.
-    #[test]
-    fn the_narrow_discovery_builder_is_byte_exact() {
-        let plain_window = DataWindow {
-            start_ms: 0,
-            end_ms: 3_600_000,
-        };
-        assert_eq!(
-            discovery_distinct_names_query(
-                "metric_series",
-                "metric_labels",
-                &DiscoveryFilter::default(),
-                plain_window,
-                3_600_000
-            ),
-            "SELECT DISTINCT metric_name\nFROM metric_series\nWHERE unix_milli >= 0 AND \
-             unix_milli <= 3600000\nORDER BY metric_name"
-        );
-        let scoped = DiscoveryFilter {
-            metric_name: Some("up".to_string()),
-            name_matchers: vec![],
-            matchers: vec![eq("job", "api")],
-        };
-        assert_eq!(
-            discovery_distinct_names_query(
-                "metric_series",
-                "metric_labels",
-                &scoped,
-                plain_window,
-                3_600_000
-            ),
-            "SELECT DISTINCT metric_name\nFROM metric_series\nWHERE metric_name = 'up'\n  AND \
-             unix_milli >= 0 AND unix_milli <= 3600000\n  AND fingerprint IN (\n    SELECT \
-             fingerprint\n    FROM metric_labels\n    WHERE metric_name = 'up'\n      AND \
-             JSONExtractString(labels, 'job') = 'api'\n  )\nORDER BY metric_name"
-        );
-        let nameless = DiscoveryFilter {
-            metric_name: None,
-            name_matchers: vec![],
-            matchers: vec![eq("job", "api")],
-        };
-        assert_eq!(
-            discovery_distinct_names_query(
-                "metric_series",
-                "metric_labels",
-                &nameless,
-                plain_window,
-                3_600_000
-            ),
-            "SELECT DISTINCT metric_name\n\
-             FROM (SELECT metric_name, fingerprint FROM metric_series WHERE unix_milli >= 0 AND \
-             unix_milli <= 3600000) AS s\n\
-             ANY INNER JOIN (SELECT metric_name, fingerprint FROM metric_labels WHERE \
-             JSONExtractString(labels, 'job') = 'api') AS l\n\
-             USING (metric_name, fingerprint)\n\
-             ORDER BY metric_name\n\
-             SETTINGS join_algorithm = 'partial_merge'"
-        );
-    }
-
     /// Issue #472 AC3 / U8 (issue #623) — the two builders read the same
     /// series and the same label rows. For a named filter the wide
     /// statement holds the narrow statement's head up to its label
@@ -1447,20 +1255,9 @@ mod tests {
     #[test]
     fn the_two_discovery_builders_share_one_where_byte_for_byte() {
         for (what, filter) in discovery_filter_table() {
-            let wide = discovery_query(
-                "metric_series",
-                "metric_labels",
-                &filter,
-                window(),
-                3_600_000,
-            );
-            let narrow = discovery_distinct_names_query(
-                "metric_series",
-                "metric_labels",
-                &filter,
-                window(),
-                3_600_000,
-            );
+            let wide = discovery_query("metric_series", "metric_labels", &filter, window());
+            let narrow =
+                discovery_distinct_names_query("metric_series", "metric_labels", &filter, window());
             if filter.metric_name.is_some() {
                 let body = narrow
                     .strip_prefix("SELECT DISTINCT metric_name\n")
@@ -1489,41 +1286,6 @@ mod tests {
 
     // --- discovery_fetch_multi (issue #89) ---
 
-    /// U5 (issue #623): the fan-out joins series to label rows by the pair,
-    /// the label side reading only the resolved names and fingerprints.
-    #[test]
-    fn discovery_fetch_multi_renders_the_flat_in_by_in_shape() {
-        let sql = discovery_fetch_multi(
-            "metric_series",
-            "metric_labels",
-            &["up".to_string(), "up_alias".to_string()],
-            &[
-                Fingerprint::from_raw(101).sql_literal(),
-                Fingerprint::from_raw(205).sql_literal(),
-            ],
-            window(),
-            3_600_000,
-        );
-        assert_eq!(
-            sql,
-            "SELECT fingerprint, metric_name, l.labels AS labels\n\
-             FROM (\n\
-             SELECT DISTINCT metric_name, fingerprint\n\
-             FROM metric_series\n\
-             WHERE metric_name IN ('up', 'up_alias')\n\
-             \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'))\n\
-             \x20 AND unix_milli >= 0 AND unix_milli <= 3600000\n\
-             ) AS s\n\
-             ANY INNER JOIN (\n\
-             SELECT metric_name, fingerprint, labels\n\
-             FROM metric_labels\n\
-             WHERE metric_name IN ('up', 'up_alias')\n\
-             \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'))\n\
-             ) AS l USING (metric_name, fingerprint)\n\
-             ORDER BY metric_name, fingerprint"
-        );
-    }
-
     #[test]
     fn discovery_fetch_multi_floors_both_window_bounds_to_the_bucket() {
         let sql = discovery_fetch_multi(
@@ -1535,7 +1297,6 @@ mod tests {
                 start_ms: 3_600_001,
                 end_ms: 7_300_000,
             },
-            3_600_000,
         );
         assert!(sql.contains("unix_milli >= 3600000 AND unix_milli <= 7200000"));
     }
@@ -1551,7 +1312,6 @@ mod tests {
             &["up".to_string()],
             &[Fingerprint::from_raw(1).sql_literal()],
             window(),
-            1,
         );
         assert!(sql.contains("AND unix_milli >= "));
         assert!(sql.contains(" AND unix_milli <= "));
@@ -1566,7 +1326,6 @@ mod tests {
             &[payload.to_string()],
             &[Fingerprint::from_raw(1).sql_literal()],
             window(),
-            3_600_000,
         );
         assert!(sql.contains(&format!("metric_name IN ({})", ch_string(payload))));
         assert_no_unescaped_quote(&ch_string(payload));
@@ -1582,22 +1341,30 @@ mod tests {
         }
     }
 
+    /// The fan-out's names probe is statement 3 with the name matchers on
+    /// the lookup (every name matcher runs there), capped at `cap + 1`.
     #[test]
     fn distinct_metric_names_probe_renders_the_capped_name_predicate_shape() {
         let sql = distinct_metric_names_probe(
             "metric_series",
+            "metric_labels",
             &[name_re("up.*")],
             window(),
-            3_600_000,
             2,
         );
         assert_eq!(
             sql,
             "SELECT DISTINCT metric_name\n\
              FROM metric_series\n\
-             WHERE unix_milli >= 0 + 0 * (match('', '(?-s)^(?:up.*)$')) \
-             AND unix_milli <= 3600000\n\
-             \x20 AND match(metric_name, '(?-s)^(?:up.*)$')\n\
+             WHERE day BETWEEN '1970-01-01' AND '1970-01-01'\n\
+             \x20 AND 0 * match('', '(?-s)^(?:up.*)$') = 0\n\
+             \x20 AND bitAnd(hours, multiIf(day = '1970-01-01' AND day = '1970-01-01', 3, \
+             day = '1970-01-01', 16777215, day = '1970-01-01', 3, 16777215)) != 0\n\
+             \x20 AND fingerprint IN (\n\
+             \x20   SELECT fingerprint\n\
+             \x20   FROM metric_labels\n\
+             \x20   WHERE match(metric_name, '(?-s)^(?:up.*)$')\n\
+             \x20 )\n\
              ORDER BY metric_name\n\
              LIMIT 3"
         );
@@ -1615,9 +1382,13 @@ mod tests {
             op: MatchOp::Nre,
             value: "down.*".to_string(),
         };
-        let sql = distinct_metric_names_probe("metric_series", &[neq, nre], window(), 3_600_000, 5);
-        assert!(sql.contains("AND metric_name != 'up'"));
-        assert!(sql.contains("AND NOT match(metric_name, '(?-s)^(?:down.*)$')"));
+        let sql =
+            distinct_metric_names_probe("metric_series", "metric_labels", &[neq, nre], window(), 5);
+        assert!(sql.contains("    WHERE metric_name != 'up'\n"), "{sql}");
+        assert!(
+            sql.contains("      AND NOT match(metric_name, '(?-s)^(?:down.*)$')\n"),
+            "{sql}"
+        );
         assert!(!sql.contains("JSONExtractString"));
     }
 
@@ -1625,7 +1396,13 @@ mod tests {
     /// names matched" without an unbounded set).
     #[test]
     fn distinct_metric_names_probe_limits_to_cap_plus_one() {
-        let sql = distinct_metric_names_probe("metric_series", &[name_re("x")], window(), 1, 999);
+        let sql = distinct_metric_names_probe(
+            "metric_series",
+            "metric_labels",
+            &[name_re("x")],
+            window(),
+            999,
+        );
         assert!(sql.ends_with("LIMIT 1000"), "got: {sql}");
     }
 
@@ -1637,26 +1414,38 @@ mod tests {
     #[test]
     fn distinct_metric_names_probe_does_not_overflow_at_max_fanout() {
         let cap = pulsus_config::PROMQL_MAX_METRIC_FANOUT_CEILING;
-        let sql = distinct_metric_names_probe("metric_series", &[name_re("x")], window(), 1, cap);
+        let sql = distinct_metric_names_probe(
+            "metric_series",
+            "metric_labels",
+            &[name_re("x")],
+            window(),
+            cap,
+        );
         assert!(sql.ends_with("LIMIT 1000001"), "got: {sql}");
     }
 
+    /// The probe reads the window's hours, 01:00:00.001 to 02:01:40: hours
+    /// 1 and 2 of one day.
     #[test]
-    fn distinct_metric_names_probe_floors_both_window_bounds_to_the_bucket() {
+    fn distinct_metric_names_probe_masks_the_windows_hours() {
         let sql = distinct_metric_names_probe(
             "metric_series",
+            "metric_labels",
             &[name_re("x")],
             DataWindow {
                 start_ms: 3_600_001,
                 end_ms: 7_300_000,
             },
-            3_600_000,
             10,
         );
-        // The floored lower bound carries issue #315's constant probe; the
-        // bound itself is still the bucket floor.
-        assert!(sql.contains("unix_milli >= 3600000 + 0 * (match("));
-        assert!(sql.contains(" AND unix_milli <= 7200000"));
+        assert!(
+            sql.contains(
+                "  AND bitAnd(hours, multiIf(day = '1970-01-01' AND day = '1970-01-01', 6, \
+                 day = '1970-01-01', 16777214, day = '1970-01-01', 7, 16777215)) != 0\n"
+            ),
+            "{sql}"
+        );
+        assert!(!sql.contains("unix_milli"), "{sql}");
     }
 
     #[test]
@@ -1664,45 +1453,14 @@ mod tests {
         let payload = r#"up'; DROP TABLE metric_series; --"#;
         let sql = distinct_metric_names_probe(
             "metric_series",
+            "metric_labels",
             &[name_re(payload)],
             window(),
-            3_600_000,
             2,
         );
         let expected = anchored_re2_literal_for_test(payload);
         assert_no_unescaped_quote(&expected);
         assert!(sql.contains(&format!("match(metric_name, {expected})")));
-    }
-
-    /// U5 (issue #623): the probed names scope both sides; the label
-    /// matchers run on the label side over those names' rows alone.
-    #[test]
-    fn discovery_fetch_by_names_renders_the_flat_name_in_with_label_matchers() {
-        let sql = discovery_fetch_by_names(
-            "metric_series",
-            "metric_labels",
-            &["up".to_string(), "up_alias".to_string()],
-            &[eq("job", "api")],
-            window(),
-            3_600_000,
-        );
-        assert_eq!(
-            sql,
-            "SELECT fingerprint, metric_name, l.labels AS labels\n\
-             FROM (\n\
-             SELECT DISTINCT metric_name, fingerprint\n\
-             FROM metric_series\n\
-             WHERE metric_name IN ('up', 'up_alias')\n\
-             \x20 AND unix_milli >= 0 AND unix_milli <= 3600000\n\
-             ) AS s\n\
-             ANY INNER JOIN (\n\
-             SELECT metric_name, fingerprint, labels\n\
-             FROM metric_labels\n\
-             WHERE metric_name IN ('up', 'up_alias')\n\
-             \x20     AND JSONExtractString(labels, 'job') = 'api'\n\
-             ) AS l USING (metric_name, fingerprint)\n\
-             ORDER BY metric_name, fingerprint"
-        );
     }
 
     #[test]
@@ -1713,7 +1471,6 @@ mod tests {
             &["up".to_string()],
             &[],
             window(),
-            3_600_000,
         );
         assert!(!sql.contains("fingerprint IN (toUInt128"));
         assert!(sql.contains("metric_name IN ('up')"));
@@ -1730,7 +1487,6 @@ mod tests {
             &[payload.to_string()],
             &[],
             window(),
-            3_600_000,
         );
         assert!(sql.contains(&format!("metric_name IN ({})", ch_string(payload))));
         assert_no_unescaped_quote(&ch_string(payload));
@@ -1800,74 +1556,6 @@ mod tests {
 
     // -- issue #623: labels come from the label table --------------------
 
-    /// **U3 (issue #623): a named discovery joins the metric's series to
-    /// the metric's own label rows.** Each side is read once; the label
-    /// side runs the matchers over that metric's rows alone; `ANY` keeps
-    /// one label row per fingerprint while the table holds unmerged copies.
-    #[test]
-    fn discovery_query_joins_the_matched_series_to_their_label_sets() {
-        let filter = DiscoveryFilter {
-            metric_name: Some("up".to_string()),
-            name_matchers: Vec::new(),
-            matchers: vec![eq("job", "api"), re("status", "5..")],
-        };
-        assert_eq!(
-            discovery_query(
-                "metric_series",
-                "metric_labels",
-                &filter,
-                window(),
-                3_600_000
-            ),
-            "SELECT fingerprint, s.metric_name AS metric_name, l.labels AS labels\n\
-             FROM (\n\
-             SELECT DISTINCT metric_name, fingerprint\n\
-             FROM metric_series\n\
-             WHERE metric_name = 'up'\n\
-             \x20 AND unix_milli >= 0 + 0 * (match('', '(?-s)^(?:5..)$')) AND unix_milli <= 3600000\n\
-             ) AS s\n\
-             ANY INNER JOIN (\n\
-             SELECT fingerprint, labels\n\
-             FROM metric_labels\n\
-             WHERE metric_name = 'up'\n\
-             \x20     AND JSONExtractString(labels, 'job') = 'api'\n\
-             \x20     AND match(JSONExtractString(labels, 'status'), '(?-s)^(?:5..)$')\n\
-             ) AS l USING (fingerprint)\n\
-             ORDER BY metric_name, fingerprint"
-        );
-        // Unnamed: the label rows of the series the window and the matchers
-        // select, read by the pair.
-        let nameless = DiscoveryFilter {
-            metric_name: None,
-            name_matchers: Vec::new(),
-            matchers: vec![eq("job", "api"), re("status", "5..")],
-        };
-        assert_eq!(
-            discovery_query(
-                "metric_series",
-                "metric_labels",
-                &nameless,
-                window(),
-                3_600_000
-            ),
-            "SELECT fingerprint, metric_name, labels\n\
-             FROM metric_labels\n\
-             WHERE (metric_name, fingerprint) IN (\n\
-             SELECT metric_name, fingerprint\n\
-             FROM metric_series\n\
-             WHERE unix_milli >= 0 + 0 * (match('', '(?-s)^(?:5..)$')) AND unix_milli <= 3600000\n\
-             \x20 AND (metric_name, fingerprint) IN (\n\
-             \x20   SELECT metric_name, fingerprint\n\
-             \x20   FROM metric_labels\n\
-             \x20   WHERE JSONExtractString(labels, 'job') = 'api'\n\
-             \x20     AND match(JSONExtractString(labels, 'status'), '(?-s)^(?:5..)$')\n\
-             \x20 )\n\
-             )\n\
-             ORDER BY metric_name, fingerprint\n\
-             LIMIT 1 BY metric_name, fingerprint"
-        );
-    }
-
     /// U7 (issue #623): every builder that takes a metric name reads only
     /// that metric's label rows — the line after each `FROM metric_labels`
     /// names `metric_name`.
@@ -1885,7 +1573,6 @@ mod tests {
                 "metric_labels",
                 "up",
                 window(),
-                3_600_000,
                 &[eq("job", "api")],
             ),
             historical_resolution_query(
@@ -1893,30 +1580,16 @@ mod tests {
                 "metric_labels",
                 "up",
                 window(),
-                3_600_000,
                 &[eq("job", "api")],
             ),
-            discovery_query(
-                "metric_series",
-                "metric_labels",
-                &filter,
-                window(),
-                3_600_000,
-            ),
-            discovery_distinct_names_query(
-                "metric_series",
-                "metric_labels",
-                &filter,
-                window(),
-                3_600_000,
-            ),
+            discovery_query("metric_series", "metric_labels", &filter, window()),
+            discovery_distinct_names_query("metric_series", "metric_labels", &filter, window()),
             discovery_fetch_multi(
                 "metric_series",
                 "metric_labels",
                 &["up".to_string()],
                 &fps,
                 window(),
-                3_600_000,
             ),
             discovery_fetch_by_names(
                 "metric_series",
@@ -1924,10 +1597,8 @@ mod tests {
                 &["up".to_string()],
                 &[eq("job", "api")],
                 window(),
-                3_600_000,
             ),
-            series_labels_by_fingerprint("metric_labels", "up", &fps),
-            series_labels_by_pairs("metric_labels", &[("up".to_string(), fps[0])]),
+            series_labels_by_fingerprint("metric_labels", &["up".to_string()], &fps),
         ] {
             let mut lines = sql.lines();
             let mut reads = 0;
@@ -1942,23 +1613,212 @@ mod tests {
         }
     }
 
-    /// U5 (issue #623): the pair lookup reads each `(metric_name,
-    /// fingerprint)` the cache did not resolve from its own label row.
+    /// The design's §4 window: 2026-09-07 22:30 to 23:30 UTC.
+    fn evening() -> DataWindow {
+        DataWindow {
+            start_ms: 1_788_820_200_000,
+            end_ms: 1_788_823_800_000,
+        }
+    }
+
+    const MASK: &str = "multiIf(day = '2026-09-07' AND day = '2026-09-07', 12582912, \
+                        day = '2026-09-07', 12582912, day = '2026-09-07', 16777215, 16777215)";
+
+    fn ids() -> [FpLiteral; 2] {
+        [
+            Fingerprint::from_raw(101).sql_literal(),
+            Fingerprint::from_raw(205).sql_literal(),
+        ]
+    }
+
+    /// **K2 (issue #623): the four statements, byte for byte.** The
+    /// design's selector `up{job="api", status=~"5.."}` over its window:
+    /// statement 1 (series IDs), statement 2 (series with labels) through
+    /// both builders that render it for one name, statement 3 (names) with
+    /// matchers and without, statement 4 (labels for IDs the window already
+    /// bounds), and the two `IN`-scoped forms of statement 2. No statement
+    /// joins.
     #[test]
-    fn series_labels_by_pairs_reads_each_pairs_own_label_row() {
-        assert_eq!(
-            series_labels_by_pairs(
-                "metric_labels",
-                &[
-                    ("up".to_string(), Fingerprint::from_raw(7).sql_literal()),
-                    ("down".to_string(), Fingerprint::from_raw(9).sql_literal()),
-                ],
-            ),
-            "SELECT metric_name, fingerprint, labels\n\
-             FROM metric_labels\n\
-             WHERE (metric_name, fingerprint) IN (('up', toUInt128('7')), ('down', toUInt128('9')))\n\
-             ORDER BY metric_name, fingerprint\n\
-             LIMIT 1 BY metric_name, fingerprint"
+    fn the_four_statements_are_byte_exact() {
+        let matchers = [eq("job", "api"), re("status", "5..")];
+        let s1 = format!(
+            "SELECT fingerprint\n\
+             FROM metric_series\n\
+             WHERE day BETWEEN '2026-09-07' AND '2026-09-07'\n\
+             \x20 AND 0 * match('', '(?-s)^(?:5..)$') = 0\n\
+             \x20 AND bitAnd(hours, {MASK}) != 0\n\
+             \x20 AND fingerprint IN (\n\
+             \x20   SELECT fingerprint\n\
+             \x20   FROM metric_labels\n\
+             \x20   WHERE metric_name = 'up'\n\
+             \x20     AND JSONExtractString(labels, 'job') = 'api'\n\
+             \x20     AND match(JSONExtractString(labels, 'status'), '(?-s)^(?:5..)$')\n\
+             \x20 )"
         );
+        assert_eq!(
+            historical_series_subquery(
+                "metric_series",
+                "metric_labels",
+                "up",
+                evening(),
+                &matchers
+            ),
+            s1,
+            "statement 1"
+        );
+        let s2 = format!(
+            "SELECT fingerprint, any(name) AS metric_name, any(label_text) AS labels\n\
+             FROM (\n\
+             \x20 SELECT fingerprint, metric_name AS name, labels AS label_text\n\
+             \x20 FROM metric_labels\n\
+             \x20 WHERE metric_name = 'up'\n\
+             \x20   AND JSONExtractString(labels, 'job') = 'api'\n\
+             \x20   AND match(JSONExtractString(labels, 'status'), '(?-s)^(?:5..)$')\n\
+             \x20   AND fingerprint IN (\n\
+             \x20     SELECT fingerprint\n\
+             \x20     FROM metric_series\n\
+             \x20     WHERE day BETWEEN '2026-09-07' AND '2026-09-07'\n\
+             \x20       AND 0 * match('', '(?-s)^(?:5..)$') = 0\n\
+             \x20       AND bitAnd(hours, {MASK}) != 0\n\
+             \x20       AND fingerprint IN (\n\
+             \x20         SELECT fingerprint\n\
+             \x20         FROM metric_labels\n\
+             \x20         WHERE metric_name = 'up'\n\
+             \x20           AND JSONExtractString(labels, 'job') = 'api'\n\
+             \x20           AND match(JSONExtractString(labels, 'status'), '(?-s)^(?:5..)$')\n\
+             \x20       )\n\
+             \x20   )\n\
+             )\n\
+             GROUP BY fingerprint\n\
+             ORDER BY metric_name, fingerprint"
+        );
+        assert_eq!(
+            historical_resolution_query(
+                "metric_series",
+                "metric_labels",
+                "up",
+                evening(),
+                &matchers
+            ),
+            s2,
+            "statement 2, the resolution query"
+        );
+        let named = DiscoveryFilter {
+            metric_name: Some("up".to_string()),
+            name_matchers: vec![],
+            matchers: matchers.to_vec(),
+        };
+        assert_eq!(
+            discovery_query("metric_series", "metric_labels", &named, evening()),
+            s2,
+            "statement 2, named discovery"
+        );
+        let unnamed = DiscoveryFilter {
+            metric_name: None,
+            name_matchers: vec![],
+            matchers: matchers.to_vec(),
+        };
+        assert_eq!(
+            discovery_distinct_names_query("metric_series", "metric_labels", &unnamed, evening()),
+            format!(
+                "SELECT DISTINCT metric_name\n\
+                 FROM metric_series\n\
+                 WHERE day BETWEEN '2026-09-07' AND '2026-09-07'\n\
+                 \x20 AND 0 * match('', '(?-s)^(?:5..)$') = 0\n\
+                 \x20 AND bitAnd(hours, {MASK}) != 0\n\
+                 \x20 AND fingerprint IN (\n\
+                 \x20   SELECT fingerprint\n\
+                 \x20   FROM metric_labels\n\
+                 \x20   WHERE JSONExtractString(labels, 'job') = 'api'\n\
+                 \x20     AND match(JSONExtractString(labels, 'status'), '(?-s)^(?:5..)$')\n\
+                 \x20 )\n\
+                 ORDER BY metric_name"
+            ),
+            "statement 3 with matchers"
+        );
+        assert_eq!(
+            discovery_distinct_names_query(
+                "metric_series",
+                "metric_labels",
+                &DiscoveryFilter::default(),
+                evening()
+            ),
+            format!(
+                "SELECT DISTINCT metric_name\n\
+                 FROM metric_series\n\
+                 WHERE day BETWEEN '2026-09-07' AND '2026-09-07'\n\
+                 \x20 AND bitAnd(hours, {MASK}) != 0\n\
+                 ORDER BY metric_name"
+            ),
+            "statement 3 with no matcher"
+        );
+        let two_names = ["up".to_string(), "down".to_string()];
+        assert_eq!(
+            series_labels_by_fingerprint("metric_labels", &two_names, &ids()),
+            "SELECT fingerprint, any(name) AS metric_name, any(label_text) AS labels\n\
+             FROM (\n\
+             \x20 SELECT fingerprint, metric_name AS name, labels AS label_text\n\
+             \x20 FROM metric_labels\n\
+             \x20 WHERE metric_name IN ('up', 'down')\n\
+             \x20   AND fingerprint IN (toUInt128('101'), toUInt128('205'))\n\
+             )\n\
+             GROUP BY fingerprint\n\
+             ORDER BY metric_name, fingerprint",
+            "statement 4"
+        );
+        assert_eq!(
+            discovery_fetch_multi(
+                "metric_series",
+                "metric_labels",
+                &two_names,
+                &ids(),
+                evening()
+            ),
+            format!(
+                "SELECT fingerprint, any(name) AS metric_name, any(label_text) AS labels\n\
+                 FROM (\n\
+                 \x20 SELECT fingerprint, metric_name AS name, labels AS label_text\n\
+                 \x20 FROM metric_labels\n\
+                 \x20 WHERE metric_name IN ('up', 'down')\n\
+                 \x20   AND fingerprint IN (toUInt128('101'), toUInt128('205'))\n\
+                 \x20   AND fingerprint IN (\n\
+                 \x20     SELECT fingerprint\n\
+                 \x20     FROM metric_series\n\
+                 \x20     WHERE day BETWEEN '2026-09-07' AND '2026-09-07'\n\
+                 \x20       AND bitAnd(hours, {MASK}) != 0\n\
+                 \x20       AND fingerprint IN (\n\
+                 \x20         SELECT fingerprint\n\
+                 \x20         FROM metric_labels\n\
+                 \x20         WHERE metric_name IN ('up', 'down')\n\
+                 \x20           AND fingerprint IN (toUInt128('101'), toUInt128('205'))\n\
+                 \x20       )\n\
+                 \x20   )\n\
+                 )\n\
+                 GROUP BY fingerprint\n\
+                 ORDER BY metric_name, fingerprint"
+            ),
+            "the fan-out: statement 2, scoped to the cache's names and IDs"
+        );
+        let by_names = discovery_fetch_by_names(
+            "metric_series",
+            "metric_labels",
+            &two_names,
+            &[eq("job", "api")],
+            evening(),
+        );
+        assert!(
+            by_names.contains(
+                "\n  WHERE metric_name IN ('up', 'down')\n    AND JSONExtractString(labels, 'job') = 'api'\n"
+            ),
+            "{by_names}"
+        );
+        for sql in [
+            s1,
+            s2,
+            by_names,
+            sweep_query("metric_series", "metric_labels", evening()),
+        ] {
+            assert!(!sql.contains("JOIN"), "{sql}");
+        }
     }
 }

@@ -44,7 +44,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
-use pulsus_model::DEFAULT_ACTIVITY_BUCKET_MS;
+use pulsus_model::ACTIVITY_BUCKET_MS;
 use pulsus_promql::parser::parse;
 use pulsus_read::{
     LabelCache, LabelCacheConfig, MetricQueryParams, MetricsConfig, MetricsEngine, QueryResult,
@@ -108,16 +108,6 @@ fn shard1_config(database: &str) -> ChConnConfig {
     )
 }
 
-fn shard2_config(database: &str) -> ChConnConfig {
-    shard_config(
-        "PULSUS_TEST_CH_SHARD2_HOST",
-        "172.28.0.12",
-        "PULSUS_TEST_CH_SHARD2_HTTP_PORT",
-        8123,
-        database,
-    )
-}
-
 fn cluster_ctx(db: &str) -> RenderCtx {
     RenderCtx {
         db: db.to_string(),
@@ -167,7 +157,6 @@ struct SeedSeriesRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedSampleRow {
-    metric_name: String,
     fingerprint: u128,
     unix_milli: i64,
     value: f64,
@@ -189,7 +178,6 @@ fn cache_config(db: &str) -> LabelCacheConfig {
         db: db.to_string(),
         series_table: "metric_series_dist".to_string(),
         labels_table: "metric_labels_dist".to_string(),
-        bucket_ms: DEFAULT_ACTIVITY_BUCKET_MS,
         window_ms: 24 * 3_600_000,
         cache_max_series: 50_000,
         ttl: Duration::from_secs(60),
@@ -218,7 +206,7 @@ fn engine_config(db: &str, grouped_push: bool) -> MetricsConfig {
 
 const METRIC: &str = "grouped_cluster";
 /// 40 series in 4 groups, 60 grid points at a one-minute step. The shard
-/// key is `cityHash64(metric_name, fingerprint)`, so the fingerprints
+/// key is `cityHash64(fingerprint)`, so the fingerprints
 /// split across the two shards on their own; the test asserts the split
 /// happened rather than assuming it.
 const SERIES: u64 = 40;
@@ -265,7 +253,7 @@ async fn the_grouped_read_over_the_dist_tables_answers_what_the_shipped_route_do
     let now = now_ms();
     let t = (now / 60_000) * 60_000;
     let start = t - POINTS * 60_000;
-    let bucket = (now / DEFAULT_ACTIVITY_BUCKET_MS) * DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = (now / ACTIVITY_BUCKET_MS) * ACTIVITY_BUCKET_MS;
 
     let mut series = Vec::new();
     let mut samples = Vec::new();
@@ -285,18 +273,37 @@ async fn the_grouped_read_over_the_dist_tables_answers_what_the_shipped_route_do
         });
         for k in 0..=POINTS {
             samples.push(SeedSampleRow {
-                metric_name: METRIC.to_string(),
                 fingerprint: u128::from(fp),
                 unix_milli: start + k * 60_000,
                 value: fp as f64 + k as f64 * 0.5,
             });
         }
     }
+    // Issue #623: the series land as kind-2 rows on the receiving node,
+    // shard 1, whose views write its activity and lookup rows, as a push
+    // does.
+    let values = series
+        .iter()
+        .map(|r| {
+            format!(
+                "({now}, 2, '{}', {}, {}, '{}', 0)",
+                r.metric_name, r.fingerprint, r.unix_milli, r.labels
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     client
-        .insert_block("metric_series_dist", &activity_rows(&series))
+        .execute(
+            &format!(
+                "INSERT INTO metric_landing \
+                 (received_ms, kind, metric_name, fingerprint, unix_milli, labels, value_type) \
+                 VALUES {values}"
+            ),
+            &QuerySettings::new(),
+            Idempotency::NonIdempotent,
+        )
         .await
-        .expect("seed metric_series_dist");
-    seed_labels_on_every_shard(&db, &series).await;
+        .expect("seed shard 1's metric_landing");
     client
         .insert_block("metric_samples_dist", &samples)
         .await
@@ -329,7 +336,8 @@ async fn the_grouped_read_over_the_dist_tables_answers_what_the_shipped_route_do
     const FORWARDING_DEADLINE: Duration = Duration::from_secs(60);
     let want = SERIES * (POINTS as u64 + 1);
     let dist_sql = format!(
-        "SELECT toUInt64(count()) AS n FROM metric_samples_dist WHERE metric_name = '{METRIC}'"
+        "SELECT toUInt64(count()) AS n FROM metric_samples_dist \
+         WHERE fingerprint BETWEEN 1 AND {SERIES}"
     );
     let deadline = Instant::now() + FORWARDING_DEADLINE;
     let mut total = 0u64;
@@ -362,7 +370,8 @@ async fn the_grouped_read_over_the_dist_tables_answers_what_the_shipped_route_do
     let local = count(
         &client,
         &format!(
-            "SELECT toUInt64(count()) AS n FROM metric_samples WHERE metric_name = '{METRIC}'"
+            "SELECT toUInt64(count()) AS n FROM metric_samples \
+             WHERE fingerprint BETWEEN 1 AND {SERIES}"
         ),
     )
     .await;
@@ -425,53 +434,4 @@ async fn count(client: &ChClient, sql: &str) -> u64 {
         .await
         .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
     stream.next().await.expect("a row").expect("decode").n
-}
-
-/// Issue #623: a series is an activity row in `metric_series` and its label
-/// set, once, in `metric_labels`.
-#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
-struct SeedActivityRow {
-    metric_name: String,
-    fingerprint: u128,
-    unix_milli: i64,
-}
-
-#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
-struct SeedLabelRow {
-    metric_name: String,
-    fingerprint: u128,
-    labels: String,
-}
-
-fn activity_rows(rows: &[SeedSeriesRow]) -> Vec<SeedActivityRow> {
-    rows.iter()
-        .map(|r| SeedActivityRow {
-            metric_name: r.metric_name.clone(),
-            fingerprint: r.fingerprint,
-            unix_milli: r.unix_milli,
-        })
-        .collect()
-}
-
-/// The label rows go into every shard's local table. In production the
-/// view writes a series' label row on the node that writes its activity
-/// row; the activity rows here are placed by the routing wrapper's sharding
-/// key instead, so every shard is given every label set, which is the
-/// superset a shard-local read can always find its series' labels in.
-async fn seed_labels_on_every_shard(db: &str, rows: &[SeedSeriesRow]) {
-    let labels: Vec<SeedLabelRow> = rows
-        .iter()
-        .map(|r| SeedLabelRow {
-            metric_name: r.metric_name.clone(),
-            fingerprint: r.fingerprint,
-            labels: r.labels.clone(),
-        })
-        .collect();
-    for cfg in [shard1_config(db), shard2_config(db)] {
-        let shard = ChClient::new(cfg).await.expect("connect a shard");
-        shard
-            .insert_block("metric_labels", &labels)
-            .await
-            .expect("seed metric_labels on a shard");
-    }
 }

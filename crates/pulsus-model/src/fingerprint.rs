@@ -144,9 +144,63 @@ pub fn raw_cityhash64(buf: &[u8]) -> u64 {
     ch_cityhash102::cityhash64(buf)
 }
 
+/// The name prefix's width in a series ID (issue #623).
+pub const SERIES_NAME_PREFIX_BITS: u32 = 24;
+
+/// STUB (issue #623, tests first).
+pub fn build_series_buffer(_metric_name: &str, _labels: &LabelSet) -> Vec<u8> {
+    Vec::new()
+}
+
+/// STUB (issue #623, tests first).
+pub fn series_fingerprint(_metric_name: &str, _labels: &LabelSet) -> Fingerprint {
+    Fingerprint::from_raw(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **F1 (issue #623): the series ID is the metric name and its labels.**
+    /// One label set under two names is two series; two series of one name
+    /// share the name prefix, so a metric's series sort together; label
+    /// order does not matter; and the buffer is the name, the separator,
+    /// then the label buffer.
+    #[test]
+    fn the_series_id_is_the_name_and_the_labels() {
+        let job_a = labels(&[("job", "a")]);
+        assert_ne!(
+            series_fingerprint("up", &job_a),
+            series_fingerprint("down", &job_a),
+            "one label set under two names"
+        );
+        let prefix = |fp: Fingerprint| fp.sql_literal().to_string();
+        let raw = |name: &str, l: &LabelSet| -> u128 {
+            prefix(series_fingerprint(name, l))
+                .trim_start_matches("toUInt128('")
+                .trim_end_matches("')")
+                .parse()
+                .expect("a decimal ID")
+        };
+        let job_b = labels(&[("job", "b")]);
+        assert_ne!(raw("up", &job_a), raw("up", &job_b));
+        assert_eq!(
+            raw("up", &job_a) >> (128 - SERIES_NAME_PREFIX_BITS),
+            raw("up", &job_b) >> (128 - SERIES_NAME_PREFIX_BITS),
+            "two series of one name share the name prefix"
+        );
+        assert_eq!(
+            raw("up", &job_a) >> (128 - SERIES_NAME_PREFIX_BITS),
+            u128::from(raw_cityhash64(b"up") >> (64 - SERIES_NAME_PREFIX_BITS)),
+            "the prefix is the top bits of the name's cityHash64"
+        );
+        let ab = labels(&[("a", "1"), ("b", "2")]);
+        let ba = labels(&[("b", "2"), ("a", "1")]);
+        assert_eq!(series_fingerprint("up", &ab), series_fingerprint("up", &ba));
+        let mut want = b"up\xff".to_vec();
+        want.extend(build_metric_buffer(&ab));
+        assert_eq!(build_series_buffer("up", &ab), want);
+    }
 
     fn labels(pairs: &[(&str, &str)]) -> LabelSet {
         LabelSet::from_verbatim(

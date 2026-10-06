@@ -410,9 +410,144 @@ fn predicate(m: &LabelMatcher, target: MatcherTarget<'_>) -> String {
     }
 }
 
+/// What a series read matches on the lookup table (issue #623): the name
+/// scope the read knows, its `__name__` matchers and its label matchers.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Lookup<'a> {
+    pub(super) scope: Option<&'a str>,
+    pub(super) name_matchers: &'a [LabelMatcher],
+    pub(super) matchers: &'a [LabelMatcher],
+}
+
+#[allow(dead_code)]
+impl SeriesWhere {
+    /// STUB (issue #623, tests first).
+    pub(super) fn activity(_window: DataWindow, _lookup: Lookup<'_>) -> Self {
+        SeriesWhere {
+            tail: String::new(),
+            bound: String::new(),
+            label_where: None,
+        }
+    }
+
+    /// STUB (issue #623, tests first).
+    pub(super) fn ids_from_where(&self, _series_table: &str, _labels_table: &str) -> String {
+        String::new()
+    }
+
+    /// STUB (issue #623, tests first).
+    pub(super) fn with_labels(&self, _series_table: &str, _labels_table: &str) -> String {
+        String::new()
+    }
+}
+
+/// STUB (issue #623, tests first).
+#[allow(dead_code)]
+fn hour_mask(_window: DataWindow) -> String {
+    String::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The §4 window of the design: 2026-09-07 22:30 to 23:30 UTC.
+    fn evening() -> DataWindow {
+        DataWindow {
+            start_ms: 1_788_820_200_000,
+            end_ms: 1_788_823_800_000,
+        }
+    }
+
+    /// **K1 (issue #623): every name and label matcher runs on the
+    /// lookup.** Each row of the design's §2 table, rendered; and a selector
+    /// with a name regex and a label matcher puts both in the lookup
+    /// sub-query, the regex's probe on its own line ahead of the hour mask.
+    #[test]
+    fn every_matcher_renders_its_lookup_predicate() {
+        let name = |op, v| predicate(&m(op, "__name__", v), MatcherTarget::MetricNameColumn);
+        assert_eq!(name(MatchOp::Eq, "m"), "metric_name = 'm'");
+        assert_eq!(name(MatchOp::Neq, "m"), "metric_name != 'm'");
+        assert_eq!(
+            name(MatchOp::Re, "re"),
+            "match(metric_name, '(?-s)^(?:re)$')"
+        );
+        assert_eq!(
+            name(MatchOp::Nre, "re"),
+            "NOT match(metric_name, '(?-s)^(?:re)$')"
+        );
+        let label = |op, v| predicate(&m(op, "k", v), LABELS);
+        assert_eq!(
+            label(MatchOp::Eq, "v"),
+            "JSONExtractString(labels, 'k') = 'v'"
+        );
+        assert_eq!(
+            label(MatchOp::Neq, "v"),
+            "JSONExtractString(labels, 'k') != 'v'"
+        );
+        assert_eq!(
+            label(MatchOp::Re, "re"),
+            "match(JSONExtractString(labels, 'k'), '(?-s)^(?:re)$')"
+        );
+        assert_eq!(
+            label(MatchOp::Nre, "re"),
+            "NOT match(JSONExtractString(labels, 'k'), '(?-s)^(?:re)$')"
+        );
+
+        let names = [m(MatchOp::Re, "__name__", "up|down")];
+        let labels = [m(MatchOp::Eq, "job", "api")];
+        let w = SeriesWhere::activity(
+            evening(),
+            Lookup {
+                scope: None,
+                name_matchers: &names,
+                matchers: &labels,
+            },
+        );
+        assert_eq!(
+            w.ids_from_where("metric_series", "metric_labels"),
+            "FROM metric_series\n\
+             WHERE day BETWEEN '2026-09-07' AND '2026-09-07'\n\
+             \x20 AND 0 * match('', '(?-s)^(?:up|down)$') = 0\n\
+             \x20 AND bitAnd(hours, multiIf(day = '2026-09-07' AND day = '2026-09-07', 12582912, day = '2026-09-07', 12582912, day = '2026-09-07', 16777215, 16777215)) != 0\n\
+             \x20 AND fingerprint IN (\n\
+             \x20   SELECT fingerprint\n\
+             \x20   FROM metric_labels\n\
+             \x20   WHERE match(metric_name, '(?-s)^(?:up|down)$')\n\
+             \x20     AND JSONExtractString(labels, 'job') = 'api'\n\
+             \x20 )"
+        );
+    }
+
+    /// **A1 (issue #623): the hour mask.** The window's UTC days bound the
+    /// `day` column, and the mask gives each day the window's hours: one
+    /// hour; the design's 22:30-23:30; across midnight, 23:00 on the first
+    /// day and 00:00 on the next; and three days, the middle one whole.
+    #[test]
+    fn the_hour_mask_covers_exactly_the_windows_hours() {
+        let window = |start_ms, end_ms| DataWindow { start_ms, end_ms };
+        assert_eq!(
+            hour_mask(window(1_788_819_000_000, 1_788_821_400_000)),
+            "multiIf(day = '2026-09-07' AND day = '2026-09-07', 4194304, \
+             day = '2026-09-07', 12582912, day = '2026-09-07', 8388607, 16777215)"
+        );
+        assert_eq!(
+            hour_mask(evening()),
+            "multiIf(day = '2026-09-07' AND day = '2026-09-07', 12582912, \
+             day = '2026-09-07', 12582912, day = '2026-09-07', 16777215, 16777215)"
+        );
+        let midnight = hour_mask(window(1_788_823_800_000, 1_788_827_400_000));
+        assert!(
+            midnight.contains("day = '2026-09-07', 8388608, day = '2026-09-08', 1, 16777215)"),
+            "{midnight}"
+        );
+        let three = hour_mask(window(1_788_820_200_000, 1_788_915_600_000));
+        assert!(
+            three.contains("day = '2026-09-07', 12582912, day = '2026-09-09', 3, 16777215)"),
+            "the middle day takes every hour: {three}"
+        );
+    }
 
     fn window() -> DataWindow {
         DataWindow {

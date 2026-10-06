@@ -83,11 +83,12 @@ pub fn subquery_predicate(subquery: &str) -> String {
 /// stability is the caller's responsibility, not re-derived here.
 pub fn sample_fetch(
     table: &str,
-    metric_name: &str,
     fps: &[FpLiteral],
     lower_excl_ms: i64,
     upper_incl_ms: i64,
 ) -> String {
+    // STUB (issue #623, tests first): the old body.
+    let metric_name = "";
     let name = name_predicate(metric_name);
     let window = window_predicate(lower_excl_ms, upper_incl_ms);
     let fps = fingerprints_predicate(fps);
@@ -102,11 +103,12 @@ pub fn sample_fetch(
 /// giant `IN` list (edge case 6, AC).
 pub fn sample_fetch_subquery(
     table: &str,
-    metric_name: &str,
     subquery: &str,
     lower_excl_ms: i64,
     upper_incl_ms: i64,
 ) -> String {
+    // STUB (issue #623, tests first): the old body.
+    let metric_name = "";
     let name = name_predicate(metric_name);
     let window = window_predicate(lower_excl_ms, upper_incl_ms);
     let sub = subquery_predicate(subquery);
@@ -129,11 +131,12 @@ pub fn sample_fetch_subquery(
 /// `(metric_name, fingerprint)` series ([`super::sample_rows::MultiSampleRow`]).
 pub fn sample_fetch_multi(
     table: &str,
-    metric_names: &[String],
     fps: &[FpLiteral],
     lower_excl_ms: i64,
     upper_incl_ms: i64,
 ) -> String {
+    // STUB (issue #623, tests first): the old body.
+    let metric_names: &[String] = &[];
     let names = names_predicate(metric_names);
     let window = window_predicate(lower_excl_ms, upper_incl_ms);
     let fps = fingerprints_predicate(fps);
@@ -161,11 +164,12 @@ const HIST_VALUE_COLUMNS: &str = "schema, zero_threshold, zero_count, count, sum
 /// shape — only the SELECT column list and table name differ (M7-A5a).
 pub fn hist_sample_fetch(
     table: &str,
-    metric_name: &str,
     fps: &[FpLiteral],
     lower_excl_ms: i64,
     upper_incl_ms: i64,
 ) -> String {
+    // STUB (issue #623, tests first): the old body.
+    let metric_name = "";
     let name = name_predicate(metric_name);
     let window = window_predicate(lower_excl_ms, upper_incl_ms);
     let fps = fingerprints_predicate(fps);
@@ -180,11 +184,12 @@ pub fn hist_sample_fetch(
 /// SELECT column list and table name differ (M7-A5a).
 pub fn hist_sample_fetch_subquery(
     table: &str,
-    metric_name: &str,
     subquery: &str,
     lower_excl_ms: i64,
     upper_incl_ms: i64,
 ) -> String {
+    // STUB (issue #623, tests first): the old body.
+    let metric_name = "";
     let name = name_predicate(metric_name);
     let window = window_predicate(lower_excl_ms, upper_incl_ms);
     let sub = subquery_predicate(subquery);
@@ -200,11 +205,12 @@ pub fn hist_sample_fetch_subquery(
 /// and table name differ (M7-A5a).
 pub fn hist_sample_fetch_multi(
     table: &str,
-    metric_names: &[String],
     fps: &[FpLiteral],
     lower_excl_ms: i64,
     upper_incl_ms: i64,
 ) -> String {
+    // STUB (issue #623, tests first): the old body.
+    let metric_names: &[String] = &[];
     let names = names_predicate(metric_names);
     let window = window_predicate(lower_excl_ms, upper_incl_ms);
     let fps = fingerprints_predicate(fps);
@@ -296,7 +302,6 @@ mod tests {
     fn sample_fetch_renders_the_schemas_md_2_3_shape() {
         let sql = sample_fetch(
             "metric_samples",
-            "http_requests_total",
             &[
                 Fingerprint::from_raw(101).sql_literal(),
                 Fingerprint::from_raw(205).sql_literal(),
@@ -309,7 +314,6 @@ mod tests {
             sql,
             "SELECT fingerprint, unix_milli, value\n\
              FROM metric_samples\n\
-             PREWHERE metric_name = 'http_requests_total'\n\
              WHERE unix_milli > 1000 AND unix_milli <= 2000\n\
              \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))\n\
              ORDER BY fingerprint, unix_milli"
@@ -320,7 +324,6 @@ mod tests {
     fn sample_fetch_window_is_left_open_right_closed() {
         let sql = sample_fetch(
             "metric_samples",
-            "up",
             &[Fingerprint::from_raw(1).sql_literal()],
             0,
             100,
@@ -333,14 +336,14 @@ mod tests {
 
     #[test]
     fn sample_fetch_of_an_empty_fingerprint_list_renders_empty_parens() {
-        let sql = sample_fetch("metric_samples", "up", &[], 0, 100);
+        let sql = sample_fetch("metric_samples", &[], 0, 100);
         assert!(sql.contains("fingerprint IN ()"));
     }
 
     #[test]
     fn sample_fetch_subquery_inlines_the_subquery_verbatim() {
         let subquery = "SELECT fingerprint FROM metric_series WHERE metric_name = 'up'";
-        let sql = sample_fetch_subquery("metric_samples", "up", subquery, 0, 100);
+        let sql = sample_fetch_subquery("metric_samples", subquery, 0, 100);
         assert!(sql.contains(&format!("fingerprint IN (\n{subquery}\n  )")));
         assert!(!sql.contains("IN (SELECT fingerprint FROM metric_series"));
     }
@@ -348,22 +351,9 @@ mod tests {
     #[test]
     fn sample_fetch_subquery_never_materializes_a_giant_in_list() {
         let subquery = "SELECT fingerprint FROM metric_series WHERE metric_name = 'up'";
-        let sql = sample_fetch_subquery("metric_samples", "up", subquery, 0, 100);
+        let sql = sample_fetch_subquery("metric_samples", subquery, 0, 100);
         // No comma-separated numeric literal list anywhere in this SQL.
         assert!(!sql.contains("IN (1,"));
-    }
-
-    #[test]
-    fn metric_name_injection_stays_inside_one_literal() {
-        let payload = "up'; DROP TABLE metric_samples; --";
-        let sql = sample_fetch(
-            "metric_samples",
-            payload,
-            &[Fingerprint::from_raw(1).sql_literal()],
-            0,
-            100,
-        );
-        assert!(sql.contains(&format!("metric_name = {}", ch_string(payload))));
     }
 
     #[test]
@@ -409,7 +399,6 @@ mod tests {
     fn sample_fetch_multi_renders_the_flat_in_in_shape() {
         let sql = sample_fetch_multi(
             "metric_samples",
-            &["foo_total".to_string(), "bar_total".to_string()],
             &[
                 Fingerprint::from_raw(101).sql_literal(),
                 Fingerprint::from_raw(205).sql_literal(),
@@ -419,12 +408,11 @@ mod tests {
         );
         assert_eq!(
             sql,
-            "SELECT metric_name, fingerprint, unix_milli, value\n\
+            "SELECT fingerprint, unix_milli, value\n\
              FROM metric_samples\n\
-             PREWHERE metric_name IN ('foo_total', 'bar_total')\n\
              WHERE unix_milli > 1000 AND unix_milli <= 2000\n\
              \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'))\n\
-             ORDER BY metric_name, fingerprint, unix_milli"
+             ORDER BY fingerprint, unix_milli"
         );
     }
 
@@ -432,52 +420,12 @@ mod tests {
     fn sample_fetch_multi_window_is_left_open_right_closed() {
         let sql = sample_fetch_multi(
             "metric_samples",
-            &["up".to_string()],
             &[Fingerprint::from_raw(1).sql_literal()],
             0,
             100,
         );
         assert!(sql.contains("unix_milli > 0 AND unix_milli <= 100"));
         assert!(!sql.contains("unix_milli >= 0"));
-    }
-
-    #[test]
-    fn sample_fetch_multi_metric_name_injection_stays_inside_one_literal() {
-        let payload = "up'; DROP TABLE metric_samples; --".to_string();
-        let sql = sample_fetch_multi(
-            "metric_samples",
-            std::slice::from_ref(&payload),
-            &[Fingerprint::from_raw(1).sql_literal()],
-            0,
-            100,
-        );
-        assert!(sql.contains(&format!("metric_name IN ({})", ch_string(&payload))));
-    }
-
-    /// The concrete-name fetch SQL is byte-unchanged by #85 — the flat
-    /// IN-set shape is a *new* builder alongside it, never a rewrite of
-    /// the single-metric fast path (the EXPLAIN-gated PK prune).
-    #[test]
-    fn sample_fetch_single_name_shape_is_untouched_by_the_multi_builder() {
-        let sql = sample_fetch(
-            "metric_samples",
-            "up",
-            &[
-                Fingerprint::from_raw(1).sql_literal(),
-                Fingerprint::from_raw(2).sql_literal(),
-            ],
-            0,
-            100,
-        );
-        assert_eq!(
-            sql,
-            "SELECT fingerprint, unix_milli, value\n\
-             FROM metric_samples\n\
-             PREWHERE metric_name = 'up'\n\
-             WHERE unix_milli > 0 AND unix_milli <= 100\n\
-             \x20 AND fingerprint IN (toUInt128('1'), toUInt128('2'))\n\
-             ORDER BY fingerprint, unix_milli"
-        );
     }
 
     // --- M7-A5a: histogram fetch builders (dual-read complementary half) ---
@@ -494,7 +442,6 @@ mod tests {
     fn hist_sample_fetch_renders_the_12_column_shape() {
         let sql = hist_sample_fetch(
             "metric_hist_samples",
-            "http_request_duration_seconds",
             &[
                 Fingerprint::from_raw(101).sql_literal(),
                 Fingerprint::from_raw(205).sql_literal(),
@@ -508,7 +455,6 @@ mod tests {
             format!(
                 "SELECT fingerprint, unix_milli, {HIST_COLS}\n\
                  FROM metric_hist_samples\n\
-                 PREWHERE metric_name = 'http_request_duration_seconds'\n\
                  WHERE unix_milli > 1000 AND unix_milli <= 2000\n\
                  \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))\n\
                  ORDER BY fingerprint, unix_milli"
@@ -520,7 +466,6 @@ mod tests {
     fn hist_sample_fetch_window_is_left_open_right_closed() {
         let sql = hist_sample_fetch(
             "metric_hist_samples",
-            "up",
             &[Fingerprint::from_raw(1).sql_literal()],
             0,
             100,
@@ -532,7 +477,7 @@ mod tests {
     #[test]
     fn hist_sample_fetch_subquery_inlines_the_subquery_verbatim() {
         let subquery = "SELECT fingerprint FROM metric_series WHERE metric_name = 'up'";
-        let sql = hist_sample_fetch_subquery("metric_hist_samples", "up", subquery, 0, 100);
+        let sql = hist_sample_fetch_subquery("metric_hist_samples", subquery, 0, 100);
         assert!(sql.contains(&format!("fingerprint IN (\n{subquery}\n  )")));
         assert!(sql.starts_with(&format!("SELECT fingerprint, unix_milli, {HIST_COLS}")));
     }
@@ -541,7 +486,6 @@ mod tests {
     fn hist_sample_fetch_multi_renders_the_flat_in_in_shape() {
         let sql = hist_sample_fetch_multi(
             "metric_hist_samples",
-            &["foo_seconds".to_string(), "bar_seconds".to_string()],
             &[
                 Fingerprint::from_raw(101).sql_literal(),
                 Fingerprint::from_raw(205).sql_literal(),
@@ -552,12 +496,11 @@ mod tests {
         assert_eq!(
             sql,
             format!(
-                "SELECT metric_name, fingerprint, unix_milli, {HIST_COLS}\n\
+                "SELECT fingerprint, unix_milli, {HIST_COLS}\n\
                  FROM metric_hist_samples\n\
-                 PREWHERE metric_name IN ('foo_seconds', 'bar_seconds')\n\
                  WHERE unix_milli > 1000 AND unix_milli <= 2000\n\
                  \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'))\n\
-                 ORDER BY metric_name, fingerprint, unix_milli"
+                 ORDER BY fingerprint, unix_milli"
             )
         );
     }
@@ -578,7 +521,6 @@ mod tests {
     fn ac7a_chunks_float_and_hist_predicates_are_identical() {
         let float = sample_fetch(
             "metric_samples",
-            "up",
             &[
                 Fingerprint::from_raw(7).sql_literal(),
                 Fingerprint::from_raw(9).sql_literal(),
@@ -588,7 +530,6 @@ mod tests {
         );
         let hist = hist_sample_fetch(
             "metric_hist_samples",
-            "up",
             &[
                 Fingerprint::from_raw(7).sql_literal(),
                 Fingerprint::from_raw(9).sql_literal(),
@@ -599,7 +540,7 @@ mod tests {
         assert_eq!(predicate_tail(&float), predicate_tail(&hist));
         assert!(predicate_tail(&float).contains("unix_milli > 1000 AND unix_milli <= 2000"));
         assert!(predicate_tail(&float).contains("fingerprint IN (toUInt128('7'), toUInt128('9'))"));
-        assert!(predicate_tail(&float).contains("PREWHERE metric_name = 'up'"));
+        assert!(!predicate_tail(&float).contains("PREWHERE"));
     }
 
     /// AC7a (Fallback): identical inlined `fingerprint IN ( <subquery> )`,
@@ -607,19 +548,16 @@ mod tests {
     #[test]
     fn ac7a_fallback_float_and_hist_predicates_are_identical() {
         let subquery = "SELECT fingerprint FROM metric_series WHERE metric_name = 'up'";
-        let float = sample_fetch_subquery("metric_samples", "up", subquery, 1_000, 2_000);
-        let hist = hist_sample_fetch_subquery("metric_hist_samples", "up", subquery, 1_000, 2_000);
+        let float = sample_fetch_subquery("metric_samples", subquery, 1_000, 2_000);
+        let hist = hist_sample_fetch_subquery("metric_hist_samples", subquery, 1_000, 2_000);
         assert_eq!(predicate_tail(&float), predicate_tail(&hist));
     }
 
-    /// AC7a (Multi): identical `metric_name IN (…)`, window and
-    /// `fingerprint IN (…)`.
+    /// AC7a (Multi): identical window and `fingerprint IN (…)`.
     #[test]
     fn ac7a_multi_float_and_hist_predicates_are_identical() {
-        let names = vec!["a_seconds".to_string(), "b_seconds".to_string()];
         let float = sample_fetch_multi(
             "metric_samples",
-            &names,
             &[
                 Fingerprint::from_raw(7).sql_literal(),
                 Fingerprint::from_raw(9).sql_literal(),
@@ -629,7 +567,6 @@ mod tests {
         );
         let hist = hist_sample_fetch_multi(
             "metric_hist_samples",
-            &names,
             &[
                 Fingerprint::from_raw(7).sql_literal(),
                 Fingerprint::from_raw(9).sql_literal(),
@@ -638,5 +575,26 @@ mod tests {
             2_000,
         );
         assert_eq!(predicate_tail(&float), predicate_tail(&hist));
+    }
+
+    /// **F9 (issue #623): no sample statement names a metric.** The sample
+    /// tables are keyed by the series ID alone, so every sample builder
+    /// reads an exact ID list (or the fallback's ID sub-query) and a time
+    /// range, and never mentions `metric_name`.
+    #[test]
+    fn no_sample_statement_names_a_metric() {
+        let ids = [fp(101), fp(205)];
+        let sub = "SELECT fingerprint FROM metric_series";
+        for sql in [
+            sample_fetch("metric_samples", &ids, 0, 100),
+            sample_fetch_subquery("metric_samples", sub, 0, 100),
+            sample_fetch_multi("metric_samples", &ids, 0, 100),
+            hist_sample_fetch("metric_hist_samples", &ids, 0, 100),
+            hist_sample_fetch_subquery("metric_hist_samples", sub, 0, 100),
+            hist_sample_fetch_multi("metric_hist_samples", &ids, 0, 100),
+        ] {
+            assert!(!sql.contains("metric_name"), "{sql}");
+            assert!(sql.ends_with("ORDER BY fingerprint, unix_milli"), "{sql}");
+        }
     }
 }

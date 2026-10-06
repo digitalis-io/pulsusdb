@@ -71,6 +71,13 @@ pub(crate) const MSG_SHUTDOWN_QUEUED: &str = "the writer shut down before the bl
 /// same largest accepted row ceiling for both signals — the two ceilings'
 /// accepted ranges are identical, which is what lets one derivation serve
 /// both.
+/// STUB (issue #623, tests first).
+#[allow(dead_code)]
+pub const LANDING_SETTINGS_SLOTS: u64 = 16;
+/// STUB (issue #623, tests first).
+#[allow(dead_code)]
+pub const LANDING_SETTINGS_TEXT_BYTES: u64 = 630;
+
 pub const fn landing_block_overhead_bytes<R>() -> u64 {
     2 * std::mem::size_of::<LandingBlock<R>>() as u64
         + 16 * std::mem::size_of::<(String, String)>() as u64
@@ -637,6 +644,27 @@ mod tests {
             landing_block_overhead_bytes::<MetricLandingRow>(),
             landing_block_overhead_bytes::<crate::writer::rows::LogLandingRow>(),
         );
+    }
+
+    /// **W3 (issue #623): the block charge prices every landing setting.**
+    /// The settings of the widest block — a 36-byte token and the largest
+    /// accepted row ceiling — read from the settings themselves: their count
+    /// is within the charge's slots, and the key
+    /// and value strings' capacity is the charge's text term exactly. A
+    /// setting added to the landing insert without the charge following
+    /// fails here.
+    #[test]
+    fn the_block_charge_prices_every_landing_setting() {
+        let token = "0192f5a4-7c3e-7d2a-9b1c-4e5f6a7b8c9d";
+        assert_eq!(token.len(), 36);
+        let s =
+            QuerySettings::landing_insert(token, pulsus_config::METRICS_LANDING_MAX_ROWS_CEILING);
+        assert!(
+            s.len() as u64 <= LANDING_SETTINGS_SLOTS,
+            "{} settings against {LANDING_SETTINGS_SLOTS} slots charged",
+            s.len()
+        );
+        assert_eq!(s.text_capacity(), LANDING_SETTINGS_TEXT_BYTES);
     }
 
     /// **The queue gauge is subtracted in one place, and in one order.**

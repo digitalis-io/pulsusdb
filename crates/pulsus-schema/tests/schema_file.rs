@@ -314,6 +314,18 @@ fn every_wrapper_in_a_family_shards_on_the_same_expression() {
         );
     }
     assert!(text.contains("cityHash64(trace_id)"));
+    // F7 (issue #623): the metrics family shards by the series ID alone.
+    for table in [
+        "metric_samples",
+        "metric_hist_samples",
+        "metric_series",
+        "metric_labels",
+    ] {
+        assert!(
+            text.contains(&format!("'{table}', cityHash64(fingerprint))")),
+            "{table} routes by cityHash64(fingerprint)"
+        );
+    }
 }
 
 /// The storage policy reaches every table's own `SETTINGS` and nothing
@@ -994,48 +1006,86 @@ fn metric_landing_carries_no_event_id() {
     }
 }
 
-/// **`metric_series` is activity only, and it expires with the samples.**
-/// No `labels` column; daily partitions, the samples' TTL and
-/// `ttl_only_drop_parts`, in both variants.
+/// **F7 (issue #623): `metric_series` is one row per series per UTC day**,
+/// its active hours a 24-bit mask OR'd on merge: `day`, `fingerprint`,
+/// `metric_name`, `hours`, partitioned by `day`, keyed by the series ID, kept
+/// until the day's last sample has expired. The view folds each kind-2 row to
+/// its day and its hour's bit.
 #[test]
-fn metric_series_is_activity_only_and_expires_with_the_samples() {
+fn metric_series_is_one_row_per_series_day() {
     assert_eq!(
         pulsus_schema::table_column_names("metric_series").expect("in the file"),
-        vec!["metric_name", "fingerprint", "unix_milli", "value_type"],
+        vec!["day", "fingerprint", "metric_name", "hours"],
+    );
+    let single_create = create_of(&single(), "metric_series");
+    assert!(
+        single_create.contains("hours SimpleAggregateFunction(groupBitOr, UInt32)"),
+        "{single_create}"
+    );
+    assert!(
+        single_create.contains("ENGINE = AggregatingMergeTree\n"),
+        "{single_create}"
     );
     for ctx in [single(), clustered()] {
         let series = create_of(&ctx, "metric_series");
-        let samples = create_of(&ctx, "metric_samples");
-        for prefix in ["PARTITION BY", "TTL"] {
-            assert_eq!(
-                line_of(&series, prefix),
-                line_of(&samples, prefix),
-                "metric_series must copy metric_samples' {prefix}"
-            );
-        }
+        assert_eq!(line_of(&series, "PARTITION BY"), "PARTITION BY day");
+        assert_eq!(line_of(&series, "ORDER BY"), "ORDER BY fingerprint");
+        assert_eq!(
+            line_of(&series, "TTL"),
+            "TTL toDateTime(least((toUInt64(toUInt16(day)) + 1 + 7) * 86400, 4294967295))"
+        );
         assert!(
             line_of(&series, "SETTINGS").contains("ttl_only_drop_parts = 1"),
             "{series}"
         );
     }
+    assert!(
+        create_of(&clustered(), "metric_series").contains(
+            "ENGINE = ReplicatedAggregatingMergeTree('/clickhouse/tables/{shard}/pulsus.metric_series', '{replica}')"
+        )
+    );
+    let view = pulsus_schema::mv_projection("metric_series_mv", &single())
+        .expect("the view is in the file");
+    for want in [
+        "toDate(fromUnixTimestamp64Milli(unix_milli), 'UTC') AS day",
+        "fingerprint AS fingerprint",
+        "metric_name AS metric_name",
+        "toUInt32(bitShiftLeft(toUInt32(1), toHour(fromUnixTimestamp64Milli(unix_milli), 'UTC'))) AS hours",
+        "WHERE kind = 2",
+    ] {
+        assert!(view.contains(want), "{want}: {view}");
+    }
+    assert!(!view.contains("labels"), "{view}");
 }
 
-/// **S1 (issue #623): `metric_labels` holds one label row per series and
-/// keeps it**, keyed and sorted like the series, `(metric_name,
-/// fingerprint)`, so a metric's label read is a key range. A
-/// replacing engine keyed by the fingerprint, no TTL, filled by a view from
-/// the kind-2 rows, with a routing wrapper and a per-shard replica set.
+/// **K1 (issue #623): `metric_labels` is the lookup, one row per series,
+/// kept for good**, keyed `(metric_name, fingerprint)` so a named matcher is
+/// a key range, with the hours it was first and last registered folded by
+/// `min` and `max`. An aggregating engine, no TTL, filled by a view from the
+/// kind-2 rows, with a routing wrapper and a per-shard replica set.
 #[test]
 fn metric_labels_holds_one_label_row_per_series_and_never_expires() {
     assert_eq!(
         pulsus_schema::table_column_names("metric_labels").expect("in the file"),
-        vec!["metric_name", "fingerprint", "labels"],
+        vec![
+            "metric_name",
+            "fingerprint",
+            "labels",
+            "first_seen",
+            "last_seen"
+        ],
     );
     let single_create = create_of(&single(), "metric_labels");
     assert!(
-        single_create.contains("ENGINE = ReplacingMergeTree\n"),
+        single_create.contains("ENGINE = AggregatingMergeTree\n"),
         "{single_create}"
     );
+    for want in [
+        "first_seen SimpleAggregateFunction(min, Int64)",
+        "last_seen SimpleAggregateFunction(max, Int64)",
+    ] {
+        assert!(single_create.contains(want), "{want}: {single_create}");
+    }
     assert_eq!(
         line_of(&single_create, "ORDER BY"),
         "ORDER BY (metric_name, fingerprint)"
@@ -1050,7 +1100,7 @@ fn metric_labels_holds_one_label_row_per_series_and_never_expires() {
     let clustered_create = create_of(&clustered(), "metric_labels");
     assert!(
         clustered_create.contains(
-            "ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/pulsus.metric_labels', '{replica}')"
+            "ENGINE = ReplicatedAggregatingMergeTree('/clickhouse/tables/{shard}/pulsus.metric_labels', '{replica}')"
         ),
         "{clustered_create}"
     );
@@ -1061,20 +1111,42 @@ fn metric_labels_holds_one_label_row_per_series_and_never_expires() {
     let projection = pulsus_schema::mv_projection("metric_labels_mv", &single())
         .expect("the view is in the file");
     assert!(projection.ends_with("WHERE kind = 2"), "{projection}");
-    assert!(
-        projection.contains("metric_name AS metric_name"),
-        "the view projects the series' name: {projection}"
+    for want in [
+        "metric_name AS metric_name",
+        "labels AS labels",
+        "unix_milli AS first_seen",
+        "unix_milli AS last_seen",
+        "FROM pulsus.metric_landing",
+    ] {
+        assert!(projection.contains(want), "{want}: {projection}");
+    }
+}
+
+/// **F7 (issue #623): the sample tables are keyed by the series ID.** No
+/// `metric_name` column, `ORDER BY (fingerprint, unix_milli)`, and their
+/// views project no name.
+#[test]
+fn the_sample_tables_are_keyed_by_the_series_id() {
+    assert_eq!(
+        pulsus_schema::table_column_names("metric_samples").expect("in the file"),
+        vec!["fingerprint", "unix_milli", "value"],
     );
-    assert!(
-        projection.contains("FROM pulsus.metric_landing"),
-        "{projection}"
-    );
-    let series = pulsus_schema::mv_projection("metric_series_mv", &single())
-        .expect("the view is in the file");
-    assert!(
-        !series.contains("labels"),
-        "metric_series_mv no longer copies the labels: {series}"
-    );
+    let hist = pulsus_schema::table_column_names("metric_hist_samples").expect("in the file");
+    assert_eq!(&hist[..2], &["fingerprint", "unix_milli"]);
+    assert!(!hist.contains(&"metric_name"), "{hist:?}");
+    for ctx in [single(), clustered()] {
+        for table in ["metric_samples", "metric_hist_samples"] {
+            let create = create_of(&ctx, table);
+            assert_eq!(
+                line_of(&create, "ORDER BY"),
+                "ORDER BY (fingerprint, unix_milli)",
+                "{table}"
+            );
+            let view = pulsus_schema::mv_projection(&format!("{table}_mv"), &ctx)
+                .expect("the view is in the file");
+            assert!(!view.contains("metric_name"), "{table}: {view}");
+        }
+    }
 }
 
 /// **Both sample tables keep the whole sorting key in memory.** At the

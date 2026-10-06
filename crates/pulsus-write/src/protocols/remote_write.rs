@@ -2979,12 +2979,13 @@ mod tests {
 
         // A histograms-only series (no float samples) still registers its
         // SeriesRef, with `__name__` excluded and the fingerprint
-        // independently recomputable.
+        // independently recomputable: F4 (issue #623), the series ID of the
+        // metric name and the labels.
         assert_eq!(out.series.len(), 1);
         assert_eq!(out.series[0].labels.get("job"), Some("checkout"));
         assert_eq!(out.series[0].labels.get("__name__"), None);
         assert_eq!(
-            pulsus_model::metric_fingerprint(&out.series[0].labels),
+            pulsus_model::series_fingerprint(&point.metric_name, &out.series[0].labels),
             point.fingerprint
         );
     }

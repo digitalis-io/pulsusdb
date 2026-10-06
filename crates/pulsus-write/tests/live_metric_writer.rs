@@ -24,7 +24,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
 use pulsus_config::WriterConfig;
-use pulsus_model::{DEFAULT_ACTIVITY_BUCKET_MS, Fingerprint, LabelSet};
+use pulsus_model::{ACTIVITY_BUCKET_MS, Fingerprint, LabelSet};
 use pulsus_schema::RenderCtx;
 use pulsus_schema_testkit::run_init;
 use pulsus_write::{
@@ -105,7 +105,7 @@ async fn live_writer(db: String) -> (ChClient, String, Arc<ChClient>, MetricWrit
     let writer = MetricWriter::new_with_tables(
         client.clone(),
         &WriterConfig::default(),
-        DEFAULT_ACTIVITY_BUCKET_MS,
+        ACTIVITY_BUCKET_MS,
         MetricWriterTables::metrics_default(),
     );
     (bootstrap, db, client, writer)
@@ -265,7 +265,7 @@ async fn registration_rows_for_one_fingerprint_carry_byte_identical_labels() {
 
     let (labels, _) = LabelSet::from_normalized([("job".to_string(), "checkout".to_string())]);
     let metric_name: Arc<str> = Arc::from("http_requests_total");
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let batch = ParsedMetrics {
         samples: vec![
             MetricPoint {

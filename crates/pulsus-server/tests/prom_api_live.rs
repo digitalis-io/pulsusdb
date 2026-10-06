@@ -161,9 +161,10 @@ struct SeedSeriesRow {
 /// landing row.
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedActivityRow {
-    metric_name: String,
+    day: u16,
     fingerprint: u128,
-    unix_milli: i64,
+    metric_name: String,
+    hours: u32,
 }
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -171,6 +172,8 @@ struct SeedLabelRow {
     metric_name: String,
     fingerprint: u128,
     labels: String,
+    first_seen: i64,
+    last_seen: i64,
 }
 
 trait InsertSeries {
@@ -182,9 +185,10 @@ impl InsertSeries for ChClient {
         let activity: Vec<SeedActivityRow> = rows
             .iter()
             .map(|r| SeedActivityRow {
-                metric_name: r.metric_name.clone(),
+                day: r.unix_milli.div_euclid(86_400_000) as u16,
                 fingerprint: r.fingerprint,
-                unix_milli: r.unix_milli,
+                metric_name: r.metric_name.clone(),
+                hours: 1u32 << (r.unix_milli.rem_euclid(86_400_000) / 3_600_000),
             })
             .collect();
         let labels: Vec<SeedLabelRow> = rows
@@ -193,6 +197,8 @@ impl InsertSeries for ChClient {
                 metric_name: r.metric_name.clone(),
                 fingerprint: r.fingerprint,
                 labels: r.labels.clone(),
+                first_seen: r.unix_milli,
+                last_seen: r.unix_milli,
             })
             .collect();
         self.insert_block("metric_series", &activity).await?;
@@ -202,7 +208,6 @@ impl InsertSeries for ChClient {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedSampleRow {
-    metric_name: String,
     fingerprint: u128,
     unix_milli: i64,
     value: f64,
@@ -295,13 +300,11 @@ async fn prom_api_serves_discovery_and_query_against_real_clickhouse() {
             "metric_samples",
             &[
                 SeedSampleRow {
-                    metric_name: "up".to_string(),
                     fingerprint: 1,
                     unix_milli: now,
                     value: 1.0,
                 },
                 SeedSampleRow {
-                    metric_name: "up".to_string(),
                     fingerprint: 2,
                     unix_milli: now,
                     value: 0.0,
@@ -975,8 +978,7 @@ async fn prom_api_query_surface_bundle_issue_471() {
             "metric_samples",
             &series
                 .iter()
-                .map(|(name, fp, _)| SeedSampleRow {
-                    metric_name: (*name).to_string(),
+                .map(|(_, fp, _)| SeedSampleRow {
                     fingerprint: u128::from(*fp),
                     unix_milli: now,
                     value: 1.0,
@@ -1854,13 +1856,11 @@ async fn seed_c0_series(client: &ChClient, values: [f64; 2]) -> i64 {
             "metric_samples",
             &[
                 SeedSampleRow {
-                    metric_name: "t539".to_string(),
                     fingerprint: 1,
                     unix_milli: now,
                     value: values[0],
                 },
                 SeedSampleRow {
-                    metric_name: "t539".to_string(),
                     fingerprint: 2,
                     unix_milli: now,
                     value: values[1],

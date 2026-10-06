@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
-use pulsus_model::{DEFAULT_ACTIVITY_BUCKET_MS, Fingerprint, floor_to_activity_bucket};
+use pulsus_model::{ACTIVITY_BUCKET_MS, Fingerprint, floor_to_activity_bucket};
 use pulsus_read::metrics::sql::{historical_resolution_query, historical_series_subquery};
 use pulsus_read::{
     DataWindow, LabelCache, LabelCacheConfig, LabelMatcher, MatchOp, Resolution, SeriesResolver,
@@ -138,7 +138,6 @@ fn cache_config(db: &str, series_table: &str, window_ms: i64, ttl: Duration) -> 
         db: db.to_string(),
         series_table: series_table.to_string(),
         labels_table: series_table.replace("metric_series", "metric_labels"),
-        bucket_ms: DEFAULT_ACTIVITY_BUCKET_MS,
         window_ms,
         cache_max_series: 50_000,
         ttl,
@@ -178,7 +177,7 @@ async fn silent_last_week_series_is_absent_from_the_cache_but_resolves_via_metri
     )
     .expect("now fits in i64");
     let three_days_ms = 3 * 24 * 3_600_000;
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let last_week_bucket = ((now_ms - three_days_ms) / bucket) * bucket;
 
     seed(
@@ -241,7 +240,6 @@ async fn bucket_floor_boundary_includes_the_mid_bucket_row_and_excludes_the_late
         .await
         .expect("connect (target db)");
 
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS; // 1h
     // Yesterday's 10:00 and 11:00 UTC. Inside the fixture's retention: the
     // activity rows expire with the samples since issue #623, so an epoch-
     // relative 10:00 would be dropped before the read.
@@ -280,8 +278,7 @@ async fn bucket_floor_boundary_includes_the_mid_bucket_row_and_excludes_the_late
         start_ms: ten_am_bucket + 30 * 60_000,
         end_ms: ten_am_bucket + 40 * 60_000,
     };
-    let sql =
-        historical_series_subquery("metric_series", "metric_labels", "up", window, bucket, &[]);
+    let sql = historical_series_subquery("metric_series", "metric_labels", "up", window, &[]);
     let fingerprints = execute_fingerprint_sql(&client, &sql).await;
     assert_eq!(
         fingerprints,
@@ -318,7 +315,7 @@ async fn warm_cache_and_sql_fallback_return_identical_results() {
             .as_millis(),
     )
     .expect("now fits in i64");
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now_ms / bucket) * bucket;
 
     seed(
@@ -376,13 +373,14 @@ async fn warm_cache_and_sql_fallback_return_identical_results() {
         "metric_labels",
         "http_requests_total",
         window,
-        bucket,
         &[matcher],
     );
     let via_sql: Vec<Fingerprint> = {
         #[derive(Row, serde::Serialize, serde::Deserialize)]
         struct LabelsRow {
             fingerprint: Fingerprint,
+            #[allow(dead_code)]
+            metric_name: String,
             #[allow(dead_code)]
             labels: String,
         }
@@ -432,7 +430,7 @@ async fn a_cold_cache_falls_back_to_sql_with_the_same_result_a_warm_cache_would_
             .as_millis(),
     )
     .expect("now fits in i64");
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now_ms / bucket) * bucket;
 
     seed(
@@ -510,7 +508,7 @@ async fn stale_cache_degrades_to_sql_identical_to_ground_truth_and_a_fresh_refre
             .as_millis(),
     )
     .expect("now fits in i64");
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now_ms / bucket) * bucket;
 
     seed(
@@ -699,7 +697,7 @@ async fn a_quote_and_backslash_bearing_label_key_round_trips_identically_on_both
             .as_millis(),
     )
     .expect("now fits in i64");
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now_ms / bucket) * bucket;
 
     // The label key itself contains a single quote and a backslash; encoded
@@ -741,14 +739,8 @@ async fn a_quote_and_backslash_bearing_label_key_round_trips_identically_on_both
     };
     assert_eq!(in_process, [7].map(Fingerprint::from_raw));
 
-    let sql = historical_series_subquery(
-        "metric_series",
-        "metric_labels",
-        "up",
-        window,
-        bucket,
-        &[matcher],
-    );
+    let sql =
+        historical_series_subquery("metric_series", "metric_labels", "up", window, &[matcher]);
     let via_sql = execute_fingerprint_sql(&client, &sql).await;
     assert_eq!(in_process, via_sql);
 
@@ -814,7 +806,7 @@ async fn a_memory_bounded_sweep_failure_retains_the_last_good_snapshot() {
             .as_millis(),
     )
     .expect("now fits in i64");
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent = (now_ms / bucket) * bucket;
 
     // A handful of series: small enough that the tight ceiling never bites,
@@ -923,9 +915,10 @@ async fn a_memory_bounded_sweep_failure_retains_the_last_good_snapshot() {
 /// and its own label row in `metric_labels`.
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedActivityRow {
-    metric_name: String,
+    day: u16,
     fingerprint: u128,
-    unix_milli: i64,
+    metric_name: String,
+    hours: u32,
 }
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -933,6 +926,8 @@ struct SeedLabelRow {
     metric_name: String,
     fingerprint: u128,
     labels: String,
+    first_seen: i64,
+    last_seen: i64,
 }
 
 /// Seeds `rows` the way the two views fill the tables from one kind-2 row.
@@ -940,9 +935,10 @@ async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
     let activity: Vec<SeedActivityRow> = rows
         .iter()
         .map(|r| SeedActivityRow {
-            metric_name: r.metric_name.clone(),
+            day: r.unix_milli.div_euclid(86_400_000) as u16,
             fingerprint: r.fingerprint,
-            unix_milli: r.unix_milli,
+            metric_name: r.metric_name.clone(),
+            hours: 1u32 << (r.unix_milli.rem_euclid(86_400_000) / 3_600_000),
         })
         .collect();
     let labels: Vec<SeedLabelRow> = rows
@@ -951,6 +947,8 @@ async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
             metric_name: r.metric_name.clone(),
             fingerprint: r.fingerprint,
             labels: r.labels.clone(),
+            first_seen: r.unix_milli,
+            last_seen: r.unix_milli,
         })
         .collect();
     client

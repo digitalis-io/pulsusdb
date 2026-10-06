@@ -154,7 +154,7 @@ fn writer_with(
 /// One push is one insert into one table (issue #603), so the metric cases
 /// have one inserter and count rows by `kind`.
 fn metric_writer_with(cfg: WriterConfig, landing: Arc<MockInserter>) -> MetricWriter {
-    MetricWriter::with_landing_inserter(landing, &cfg, pulsus_model::DEFAULT_ACTIVITY_BUCKET_MS)
+    MetricWriter::with_landing_inserter(landing, &cfg, pulsus_model::ACTIVITY_BUCKET_MS)
 }
 
 /// Lets a queued landing block reach a worker and settle. An async push

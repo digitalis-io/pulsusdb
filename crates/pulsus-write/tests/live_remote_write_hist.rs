@@ -26,7 +26,7 @@ use futures::StreamExt;
 use prost::Message;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings};
 use pulsus_config::WriterConfig;
-use pulsus_model::{CounterResetHint, DEFAULT_ACTIVITY_BUCKET_MS, HistogramColumns};
+use pulsus_model::{ACTIVITY_BUCKET_MS, CounterResetHint, HistogramColumns};
 use pulsus_schema::RenderCtx;
 use pulsus_schema_testkit::run_init;
 use pulsus_write::protocols::remote_write::{
@@ -185,7 +185,7 @@ async fn gauge_hint_native_histogram_lands_counter_reset_hint_3_end_to_end() {
     let writer = MetricWriter::new_with_tables(
         client.clone(),
         &WriterConfig::default(),
-        DEFAULT_ACTIVITY_BUCKET_MS,
+        ACTIVITY_BUCKET_MS,
         MetricWriterTables::metrics_default(),
     );
 

@@ -29,7 +29,9 @@
       "fingerprint_city64": "11160318154034397263",
       "fingerprint_xx64": "17241709254077376921",
       "labels": [],
-      "name": "empty"
+      "name": "empty",
+      "series_fingerprint128": "279312807052667565677626197582573968815",
+      "series_name": "up"
     },
     {
       "buffer_hex": "736572766963655f6e616d65ff636865636b6f7574ff",
@@ -47,7 +49,9 @@
           "checkout"
         ]
       ],
-      "name": "excludes_name"
+      "name": "excludes_name",
+      "series_fingerprint128": "86200611816547018084146446461867939250",
+      "series_name": "http_requests_total"
     },
     {
       "buffer_hex": "656e76ff70726f64ff726567696f6eff65752d776573742d31ff736572766963655f6e616d65ff636865636b6f7574ff",
@@ -69,7 +73,9 @@
           "checkout"
         ]
       ],
-      "name": "multi_label"
+      "name": "multi_label",
+      "series_fingerprint128": "205871547830026044716163683647279404759",
+      "series_name": ""
     }
   ],
   "raw_cityhash64_vectors": [

@@ -241,7 +241,7 @@ async fn run_init_clustered_creates_dist_wrappers_on_every_shard_with_identical_
     // rollups land where its samples do. Written out here rather than read
     // from a renderer, so this side of the assertion is independent of
     // `schema/schema.sql`.
-    const METRICS_KEY: &str = "cityHash64(metric_name, fingerprint)";
+    const METRICS_KEY: &str = "cityHash64(fingerprint)";
     const LOGS_KEY: &str = "cityHash64(fingerprint)";
     const TRACES_KEY: &str = "cityHash64(trace_id)";
     let dist_tables = [
@@ -1377,7 +1377,6 @@ async fn the_same_block_twice_through_the_wrapper_leaves_every_shard_count_uncha
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 struct MetricSampleRow {
-    metric_name: String,
     fingerprint: u128,
     unix_milli: i64,
     value: f64,
@@ -1473,7 +1472,6 @@ async fn a_disabling_profile_keeps_repeated_log_and_metric_blocks_and_drops_the_
         body: "issue 560 repeated log block".to_string(),
     };
     let metric = MetricSampleRow {
-        metric_name: "issue560_repeat".to_string(),
         fingerprint: 0x0560_0560_0560_0561,
         unix_milli: now / 1_000_000,
         value: 1.0,

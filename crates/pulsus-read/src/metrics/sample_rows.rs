@@ -25,7 +25,6 @@ pub struct SampleRow {
 /// fingerprint)` series, not per-fingerprint alone.
 #[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
 pub struct MultiSampleRow {
-    pub metric_name: String,
     pub fingerprint: Fingerprint,
     pub unix_milli: i64,
     pub value: f64,
@@ -96,7 +95,6 @@ impl HistSampleRow {
 /// series (a fingerprint can exist under more than one metric name).
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct MultiHistSampleRow {
-    pub metric_name: String,
     pub fingerprint: Fingerprint,
     pub unix_milli: i64,
     pub schema: i8,

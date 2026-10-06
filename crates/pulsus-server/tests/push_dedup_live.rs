@@ -98,7 +98,7 @@ use pulsus_write::protocols::loki_push::{EntryAdapter, PushRequest, StreamAdapte
 use pulsus_write::protocols::remote_write::{
     Label, MetricMetadataProto, Sample, TimeSeries, WriteRequest,
 };
-use pulsus_write::writer::{MetricHistSampleRow, MetricLandingRow, MetricSampleRow};
+use pulsus_write::writer::MetricLandingRow;
 
 /// One fixed listener port per test: the suites in this crate run as
 /// separate processes, so each test needs its own. Integer literals,
@@ -1199,19 +1199,26 @@ async fn seed_series(client: &ChClient, name: &str, fp: u128, at_ms: i64, job: &
 }
 
 async fn seed_floats(client: &ChClient, name: &str, fp: u128, rows: &[(i64, f64)]) {
-    let samples: Vec<MetricSampleRow> = rows
+    // Issue #623: kind-0 landing rows, which the sample view turns into
+    // sample rows.
+    let samples: Vec<MetricLandingRow> = rows
         .iter()
-        .map(|(at_ms, value)| MetricSampleRow {
-            metric_name: name.to_string(),
-            fingerprint: Fingerprint::from_raw(fp),
-            unix_milli: *at_ms,
-            value: *value,
+        .map(|(at_ms, value)| {
+            MetricLandingRow::float_sample(
+                *at_ms,
+                &pulsus_write::MetricPoint {
+                    metric_name: name.into(),
+                    fingerprint: Fingerprint::from_raw(fp),
+                    unix_milli: *at_ms,
+                    value: *value,
+                },
+            )
         })
         .collect();
     client
-        .insert_block("metric_samples", &samples)
+        .insert_block("metric_landing", &samples)
         .await
-        .expect("seed metric_samples");
+        .expect("seed the samples through metric_landing");
 }
 
 /// **M2, M3 and M4**: the §7 rule, read back through the API.
@@ -1277,28 +1284,34 @@ async fn one_answer_per_series_millisecond() {
         &[(at_ms, 5.0), (at_ms, 7.0)],
     )
     .await;
-    let hist = vec![MetricHistSampleRow {
-        metric_name: "m4_probe".to_string(),
-        fingerprint: Fingerprint::from_raw(0x494_0004),
-        unix_milli: at_ms,
-        schema: 0,
-        zero_threshold: 0.0,
-        zero_count: 0,
-        count: 3,
-        sum: 12.0,
-        pos_span_offsets: vec![0],
-        pos_span_lengths: vec![1],
-        pos_bucket_deltas: vec![3],
-        neg_span_offsets: Vec::new(),
-        neg_span_lengths: Vec::new(),
-        neg_bucket_deltas: Vec::new(),
-        custom_values: Vec::new(),
-        counter_reset_hint: 0,
-    }];
+    let hist = vec![MetricLandingRow::hist_sample(
+        at_ms,
+        &pulsus_write::HistogramPoint {
+            metric_name: "m4_probe".into(),
+            fingerprint: Fingerprint::from_raw(0x494_0004),
+            unix_milli: at_ms,
+            histogram: pulsus_model::NativeHistogram {
+                counter_reset_hint: pulsus_model::CounterResetHint::Unknown,
+                schema: 0,
+                zero_threshold: 0.0,
+                zero_count: 0,
+                count: 3,
+                sum: 12.0,
+                positive_spans: vec![pulsus_model::Span {
+                    offset: 0,
+                    length: 1,
+                }],
+                negative_spans: vec![],
+                positive_buckets: vec![3],
+                negative_buckets: vec![],
+                custom_values: vec![],
+            },
+        },
+    )];
     client
-        .insert_block("metric_hist_samples", &hist)
+        .insert_block("metric_landing", &hist)
         .await
-        .expect("seed metric_hist_samples");
+        .expect("seed the histogram through metric_landing");
 
     // M2 — the sample stored twice is one sample, and `rate` over a single
     // sample has no series at all rather than a `NaN`.

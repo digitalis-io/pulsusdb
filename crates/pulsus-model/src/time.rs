@@ -164,7 +164,7 @@ impl std::fmt::Display for FpLiteral {
 /// SQL) can pin their default against one source without a cross-crate
 /// dependency cycle; `pulsus-config`'s own default is cross-checked against
 /// this constant in `pulsus-write`'s test suite.
-pub const DEFAULT_ACTIVITY_BUCKET_MS: i64 = 3_600_000;
+pub const ACTIVITY_BUCKET_MS: i64 = 3_600_000;
 
 /// Floors `unix_milli` to the nearest (lower-or-equal) multiple of
 /// `bucket_ms` — the `metric_series` activity-bucket floor (docs/schemas.md
@@ -686,7 +686,7 @@ mod tests {
 
     #[test]
     fn default_activity_bucket_ms_is_one_hour() {
-        assert_eq!(DEFAULT_ACTIVITY_BUCKET_MS, 3_600_000);
+        assert_eq!(ACTIVITY_BUCKET_MS, 3_600_000);
     }
 
     #[test]

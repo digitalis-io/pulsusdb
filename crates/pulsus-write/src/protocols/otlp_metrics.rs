@@ -3158,6 +3158,48 @@ mod tests {
 
     // -- target_info (issue #461) ----------------------------------------
 
+    /// **F5 (issue #623): every emitter IDs a series by its name and its
+    /// labels.** One request: a gauge point, an exponential histogram point
+    /// (native), and a resource that produces `target_info`, all with no
+    /// point attributes of their own. Each emitted series carries
+    /// `series_fingerprint(its name, its labels)`, so the three IDs differ
+    /// even where two label sets are equal.
+    #[test]
+    fn every_emitter_ids_the_series_by_name_and_labels() {
+        let ts = 1_700_000_000_000_000_000u64;
+        let req = request(vec![ResourceMetrics {
+            resource: Some(target_info_resource()),
+            scope_metrics: vec![scope_metrics(vec![
+                gauge_metric("g", number_dp(ts, 1.0, vec![])),
+                exp_histogram_metric(
+                    "h",
+                    ExponentialHistogramDataPoint {
+                        time_unix_nano: ts,
+                        count: 1,
+                        zero_count: 1,
+                        ..Default::default()
+                    },
+                ),
+            ])],
+            schema_url: String::new(),
+        }]);
+        let out = super::parse(&req, 0, hist_settings(ExpHistogramMode::Native))
+            .expect("within the expansion budget");
+        let mut names: Vec<&str> = out.series.iter().map(|s| &*s.metric_name).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["g", "h", "target_info"], "{:?}", out.series);
+        for s in &out.series {
+            assert_eq!(
+                s.fingerprint,
+                pulsus_model::series_fingerprint(&s.metric_name, &s.labels),
+                "{}",
+                s.metric_name
+            );
+        }
+        let ids: std::collections::BTreeSet<_> = out.series.iter().map(|s| s.fingerprint).collect();
+        assert_eq!(ids.len(), 3, "three series, three IDs: {:?}", out.series);
+    }
+
     /// A resource carrying a non-identifying attribute plus a `job`.
     fn target_info_resource() -> Resource {
         Resource {

@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
-use pulsus_model::DEFAULT_ACTIVITY_BUCKET_MS;
+use pulsus_model::ACTIVITY_BUCKET_MS;
 use pulsus_promql::DEFAULT_LOOKBACK_MS;
 use pulsus_promql::parser::parse;
 use pulsus_read::{
@@ -109,7 +109,6 @@ struct SeedSeriesRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedSampleRow {
-    metric_name: String,
     fingerprint: u128,
     unix_milli: i64,
     value: f64,
@@ -119,7 +118,6 @@ struct SeedSampleRow {
 /// catalog CREATE, RowBinary is positional).
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedHistRow {
-    metric_name: String,
     fingerprint: u128,
     unix_milli: i64,
     schema: i8,
@@ -172,7 +170,6 @@ fn cache_config(db: &str, window_ms: i64) -> LabelCacheConfig {
         db: db.to_string(),
         series_table: "metric_series".to_string(),
         labels_table: "metric_labels".to_string(),
-        bucket_ms: DEFAULT_ACTIVITY_BUCKET_MS,
         window_ms,
         cache_max_series: 50_000,
         ttl: Duration::from_secs(60),
@@ -245,7 +242,7 @@ async fn count_by_job_up_is_lookback_correct_and_excludes_a_silent_series() {
         .expect("connect (engine client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now / bucket) * bucket;
 
     seed_series(
@@ -277,7 +274,6 @@ async fn count_by_job_up_is_lookback_correct_and_excludes_a_silent_series() {
         &[
             // fp1 (job=api): live, sampled at the query instant itself.
             SeedSampleRow {
-                metric_name: "up".to_string(),
                 fingerprint: 1,
                 unix_milli: recent_bucket,
                 value: 1.0,
@@ -287,14 +283,12 @@ async fn count_by_job_up_is_lookback_correct_and_excludes_a_silent_series() {
             // lookback of this instant" case the removed cache-only path
             // got wrong. Must be excluded from the count.
             SeedSampleRow {
-                metric_name: "up".to_string(),
                 fingerprint: 2,
                 unix_milli: recent_bucket - (DEFAULT_LOOKBACK_MS + 60_000),
                 value: 1.0,
             },
             // fp3 (job=web): live.
             SeedSampleRow {
-                metric_name: "up".to_string(),
                 fingerprint: 3,
                 unix_milli: recent_bucket,
                 value: 1.0,
@@ -372,7 +366,7 @@ async fn bare_selector_query_keeps_metric_name_end_to_end() {
         .expect("connect (engine client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now / bucket) * bucket;
 
     seed_series(
@@ -388,7 +382,6 @@ async fn bare_selector_query_keeps_metric_name_end_to_end() {
     seed_samples(
         &client,
         &[SeedSampleRow {
-            metric_name: "up".to_string(),
             fingerprint: 1,
             unix_milli: recent_bucket,
             value: 1.0,
@@ -465,7 +458,7 @@ async fn count_by_job_up_historical_variant_routes_through_metric_series() {
         .expect("connect (engine client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     // 2 days ago: comfortably outside the 24h cache window below, but
     // safely inside the schema's 7-day raw retention TTL (unlike a
     // timestamp right at the 7-day boundary, which risks a background TTL
@@ -486,7 +479,6 @@ async fn count_by_job_up_historical_variant_routes_through_metric_series() {
     seed_samples(
         &client,
         &[SeedSampleRow {
-            metric_name: "up".to_string(),
             fingerprint: 4242,
             unix_milli: last_week_bucket,
             value: 1.0,
@@ -558,7 +550,7 @@ async fn group_with_offset_routes_through_metric_series() {
         .expect("connect (engine client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let two_days_ms = 2 * 24 * 3_600_000;
     let recent_bucket = (now / bucket) * bucket;
     let two_days_ago_bucket = ((now - two_days_ms) / bucket) * bucket;
@@ -580,7 +572,6 @@ async fn group_with_offset_routes_through_metric_series() {
     seed_samples(
         &client,
         &[SeedSampleRow {
-            metric_name: "up".to_string(),
             fingerprint: 777,
             unix_milli: two_days_ago_bucket,
             value: 1.0,
@@ -649,7 +640,7 @@ async fn count_by_service_up_over_query_range_returns_a_matrix_not_a_vector() {
         .expect("connect (engine client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now / bucket) * bucket;
     let step_ms = 60_000;
     // 3 steps, both series present at every one of them — this test proves
@@ -685,37 +676,31 @@ async fn count_by_service_up_over_query_range_returns_a_matrix_not_a_vector() {
         &client,
         &[
             SeedSampleRow {
-                metric_name: "up".to_string(),
                 fingerprint: 10,
                 unix_milli: t0,
                 value: 1.0,
             },
             SeedSampleRow {
-                metric_name: "up".to_string(),
                 fingerprint: 10,
                 unix_milli: t1,
                 value: 1.0,
             },
             SeedSampleRow {
-                metric_name: "up".to_string(),
                 fingerprint: 10,
                 unix_milli: t2,
                 value: 1.0,
             },
             SeedSampleRow {
-                metric_name: "up".to_string(),
                 fingerprint: 11,
                 unix_milli: t0,
                 value: 1.0,
             },
             SeedSampleRow {
-                metric_name: "up".to_string(),
                 fingerprint: 11,
                 unix_milli: t1,
                 value: 1.0,
             },
             SeedSampleRow {
-                metric_name: "up".to_string(),
                 fingerprint: 11,
                 unix_milli: t2,
                 value: 1.0,
@@ -796,7 +781,7 @@ async fn count_by_service_routes_sample_fetch_for_both_instant_and_range() {
         .expect("connect (engine client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now / bucket) * bucket;
     let step_ms = 60_000;
     let t0 = recent_bucket;
@@ -816,13 +801,11 @@ async fn count_by_service_routes_sample_fetch_for_both_instant_and_range() {
         &client,
         &[
             SeedSampleRow {
-                metric_name: "up".to_string(),
                 fingerprint: 20,
                 unix_milli: t0,
                 value: 1.0,
             },
             SeedSampleRow {
-                metric_name: "up".to_string(),
                 fingerprint: 20,
                 unix_milli: t1,
                 value: 1.0,
@@ -940,7 +923,7 @@ async fn binary_expression_fetches_both_sides_concurrently() {
         .expect("connect (probe client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now / bucket) * bucket;
 
     // Enough rows per metric that a single selector's fetch takes
@@ -963,7 +946,6 @@ async fn binary_expression_fetches_both_sides_concurrently() {
             });
             for t in 0..SAMPLES_PER_SERIES {
                 sample_rows.push(SeedSampleRow {
-                    metric_name: metric.to_string(),
                     fingerprint: u128::from(fp),
                     unix_milli: recent_bucket - t * 1_000,
                     value: t as f64,
@@ -1114,7 +1096,7 @@ async fn rate_end_to_end_against_real_samples() {
         .expect("connect (engine client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now / bucket) * bucket;
 
     seed_series(
@@ -1136,13 +1118,11 @@ async fn rate_end_to_end_against_real_samples() {
         &client,
         &[
             SeedSampleRow {
-                metric_name: "http_requests_total".to_string(),
                 fingerprint: 55,
                 unix_milli: recent_bucket - 59_999,
                 value: 0.0,
             },
             SeedSampleRow {
-                metric_name: "http_requests_total".to_string(),
                 fingerprint: 55,
                 unix_milli: recent_bucket,
                 value: 60.0,
@@ -1295,7 +1275,6 @@ async fn info_cardinality_cap_rejects_over_cap_before_materialization() {
     let info_samples: Vec<SeedSampleRow> = info_series
         .iter()
         .map(|s| SeedSampleRow {
-            metric_name: s.metric_name.clone(),
             fingerprint: s.fingerprint,
             unix_milli: now,
             value: 1.0,
@@ -1313,7 +1292,6 @@ async fn info_cardinality_cap_rejects_over_cap_before_materialization() {
     seed_samples(
         &cache_client,
         &[SeedSampleRow {
-            metric_name: base.metric_name.clone(),
             fingerprint: base.fingerprint,
             unix_milli: now,
             value: 1.0,
@@ -1385,7 +1363,7 @@ async fn info_cardinality_cap_rejects_over_cap_on_the_degraded_sql_fallback_path
         .expect("connect (engine client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     // 2 days ago: outside the 24h cache window below (forcing
     // `SqlFallback`), safely inside the 7-day raw retention TTL — the
     // `count_by_job_up_historical_variant_routes_through_metric_series`
@@ -1405,7 +1383,6 @@ async fn info_cardinality_cap_rejects_over_cap_on_the_degraded_sql_fallback_path
     let info_samples: Vec<SeedSampleRow> = info_series
         .iter()
         .map(|s| SeedSampleRow {
-            metric_name: s.metric_name.clone(),
             fingerprint: s.fingerprint,
             unix_milli: last_week_bucket,
             value: 1.0,
@@ -1423,7 +1400,6 @@ async fn info_cardinality_cap_rejects_over_cap_on_the_degraded_sql_fallback_path
     seed_samples(
         &client,
         &[SeedSampleRow {
-            metric_name: base.metric_name.clone(),
             fingerprint: base.fingerprint,
             unix_milli: last_week_bucket,
             value: 1.0,
@@ -1500,7 +1476,7 @@ async fn sample_budget_rejects_over_cap_fetch_and_admits_exactly_at_cap() {
         .expect("connect (cache client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     // 2 days ago: outside the 24h cache window below (forcing
     // `SqlFallback`, whose label hydration must NOT charge), inside the
     // 7-day raw retention — the info-cardinality fallback test's routing
@@ -1519,7 +1495,6 @@ async fn sample_budget_rejects_over_cap_fetch_and_admits_exactly_at_cap() {
     // window ending at b0 + 4s.
     let samples: Vec<SeedSampleRow> = (0..5i64)
         .map(|i| SeedSampleRow {
-            metric_name: series.metric_name.clone(),
             fingerprint: series.fingerprint,
             unix_milli: b0 + i * 1_000,
             value: i as f64,
@@ -1633,7 +1608,7 @@ async fn info_cardinality_probe_counts_distinct_series_not_activity_bucket_rows(
         .expect("connect (engine client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     // 2 days ago (outside the 24h cache window → `SqlFallback`, inside
     // the 7-day retention), bucket-aligned; the range query below spans
     // buckets [b0, b0+2*bucket] so all three activity buckets fall inside
@@ -1656,7 +1631,6 @@ async fn info_cardinality_probe_counts_distinct_series_not_activity_bucket_rows(
                 labels: format!(r#"{{"instance":"i{i}","job":"j","data":"d{i}"}}"#),
             });
             samples.push(SeedSampleRow {
-                metric_name: "target_info".to_string(),
                 fingerprint: u128::from(fp),
                 unix_milli: t,
                 value: 1.0,
@@ -1678,7 +1652,6 @@ async fn info_cardinality_probe_counts_distinct_series_not_activity_bucket_rows(
     .await;
     for &t in &buckets {
         samples.push(SeedSampleRow {
-            metric_name: "metric".to_string(),
             fingerprint: base_fp,
             unix_milli: t,
             value: 1.0,
@@ -1844,7 +1817,7 @@ async fn explain_carries_the_real_generated_sample_fetch_sql() {
         .expect("connect (engine client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now / bucket) * bucket;
 
     seed_series(
@@ -1860,7 +1833,6 @@ async fn explain_carries_the_real_generated_sample_fetch_sql() {
     seed_samples(
         &client,
         &[SeedSampleRow {
-            metric_name: "up".to_string(),
             fingerprint: 1,
             unix_milli: recent_bucket,
             value: 1.0,
@@ -1926,7 +1898,7 @@ async fn every_fetch_path_sends_both_reads_at_once() {
         .expect("connect (target db)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent = (now / bucket) * bucket;
     let historical = ((now - 2 * 24 * 3_600_000) / bucket) * bucket;
     let mut series = Vec::new();
@@ -1940,7 +1912,6 @@ async fn every_fetch_path_sends_both_reads_at_once() {
                 labels: r#"{"job":"api"}"#.to_string(),
             });
             samples.push(SeedSampleRow {
-                metric_name: name.to_string(),
                 fingerprint: fp,
                 unix_milli: at,
                 value: 1.0,
@@ -2031,7 +2002,7 @@ async fn explain_carries_the_fallback_subquery_sample_fetch_sql() {
         .expect("connect (engine client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let two_days_ms = 2 * 24 * 3_600_000;
     let historical_bucket = ((now - two_days_ms) / bucket) * bucket;
 
@@ -2048,7 +2019,6 @@ async fn explain_carries_the_fallback_subquery_sample_fetch_sql() {
     seed_samples(
         &client,
         &[SeedSampleRow {
-            metric_name: "up".to_string(),
             fingerprint: 1,
             unix_milli: historical_bucket,
             value: 1.0,
@@ -2137,7 +2107,7 @@ async fn discovery_endpoints_honor_the_query_window_and_include_name() {
         .expect("connect (engine client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now / bucket) * bucket;
     // A cache-resident series bucketed 3 buckets before `recent_bucket` —
     // inside the 24h cache residency window below, but outside the
@@ -2307,7 +2277,7 @@ async fn an_re2_rejected_matcher_regex_is_a_client_rejection_not_a_server_error(
         .expect("connect (engine client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     // 2 days back: outside the 24h cache window (forcing `SqlFallback` on
     // the query path), inside the 7-day raw retention TTL.
     let old_bucket = ((now - 2 * 24 * 3_600_000) / bucket) * bucket;
@@ -2324,7 +2294,6 @@ async fn an_re2_rejected_matcher_regex_is_a_client_rejection_not_a_server_error(
     seed_samples(
         &client,
         &[SeedSampleRow {
-            metric_name: "up".to_string(),
             fingerprint: 1,
             unix_milli: old_bucket,
             value: 1.0,
@@ -2509,7 +2478,7 @@ async fn a_warm_cache_does_not_answer_an_re2_rejected_matcher_in_process() {
         .expect("connect (engine client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now / bucket) * bucket;
     seed_series(
         &client,
@@ -2524,7 +2493,6 @@ async fn a_warm_cache_does_not_answer_an_re2_rejected_matcher_in_process() {
     seed_samples(
         &client,
         &[SeedSampleRow {
-            metric_name: "up".to_string(),
             fingerprint: 1,
             unix_milli: recent_bucket,
             value: 1.0,
@@ -2660,7 +2628,7 @@ async fn label_names_with_no_filters_covers_every_metric_in_window() {
         .expect("connect (engine client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now / bucket) * bucket;
 
     seed_series(
@@ -2735,7 +2703,7 @@ async fn series_applies_regex_matchers() {
         .expect("connect (engine client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now / bucket) * bucket;
 
     seed_series(
@@ -2810,7 +2778,7 @@ async fn series_with_a_matcher_only_filter_matches_across_metric_names() {
         .expect("connect (engine client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now / bucket) * bucket;
 
     seed_series(
@@ -3068,7 +3036,7 @@ async fn tsdb_status_reports_series_counts_with_zero_sample_table_access() {
         .expect("connect (engine client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now / bucket) * bucket;
 
     seed_series(
@@ -3141,7 +3109,7 @@ async fn nameless_selector_fans_out_with_per_series_names_and_one_flat_in_set_fe
         .expect("connect (engine client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now / bucket) * bucket;
 
     // Fingerprint 1 exists under BOTH http_a_total and http_b_total (the
@@ -3176,19 +3144,16 @@ async fn nameless_selector_fans_out_with_per_series_names_and_one_flat_in_set_fe
         &client,
         &[
             SeedSampleRow {
-                metric_name: "http_a_total".to_string(),
                 fingerprint: 1,
                 unix_milli: recent_bucket,
                 value: 11.0,
             },
             SeedSampleRow {
-                metric_name: "http_b_total".to_string(),
                 fingerprint: 1,
                 unix_milli: recent_bucket,
                 value: 22.0,
             },
             SeedSampleRow {
-                metric_name: "other_metric".to_string(),
                 fingerprint: 2,
                 unix_milli: recent_bucket,
                 value: 99.0,
@@ -3316,7 +3281,7 @@ async fn nameless_selector_hydrates_a_post_sweep_cross_pair_never_empty_labels()
         .expect("connect (engine client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now / bucket) * bucket;
 
     // Pre-sweep registrations: cross_a_total resolves fp1, cross_b_total
@@ -3367,19 +3332,16 @@ async fn nameless_selector_hydrates_a_post_sweep_cross_pair_never_empty_labels()
         &client,
         &[
             SeedSampleRow {
-                metric_name: "cross_a_total".to_string(),
                 fingerprint: 1,
                 unix_milli: recent_bucket,
                 value: 1.0,
             },
             SeedSampleRow {
-                metric_name: "cross_b_total".to_string(),
                 fingerprint: 2,
                 unix_milli: recent_bucket,
                 value: 2.0,
             },
             SeedSampleRow {
-                metric_name: "cross_b_total".to_string(),
                 fingerprint: 1,
                 unix_milli: recent_bucket,
                 value: 3.0,
@@ -3458,7 +3420,7 @@ async fn dual_read_merges_and_decodes_histogram_samples_end_to_end() {
         .expect("connect (engine)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now / bucket) * bucket;
 
     // Two series: a float `up{job="api"}` (fp 1) and a native-histogram
@@ -3486,7 +3448,6 @@ async fn dual_read_merges_and_decodes_histogram_samples_end_to_end() {
     seed_samples(
         &client,
         &[SeedSampleRow {
-            metric_name: "up".to_string(),
             fingerprint: 1,
             unix_milli: recent_bucket,
             value: 42.0,
@@ -3496,7 +3457,6 @@ async fn dual_read_merges_and_decodes_histogram_samples_end_to_end() {
     seed_hist_samples(
         &client,
         &[SeedHistRow {
-            metric_name: "req_seconds".to_string(),
             fingerprint: 2,
             unix_milli: recent_bucket,
             schema: 0,
@@ -3652,7 +3612,7 @@ async fn a_nameless_selector_with_an_uncompilable_matcher_is_bad_data_not_execut
         .expect("connect (engine client)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now / bucket) * bucket;
     seed_series(
         &client,
@@ -3667,7 +3627,6 @@ async fn a_nameless_selector_with_an_uncompilable_matcher_is_bad_data_not_execut
     seed_samples(
         &client,
         &[SeedSampleRow {
-            metric_name: "up".to_string(),
             fingerprint: 1,
             unix_milli: recent_bucket,
             value: 1.0,
@@ -3906,7 +3865,7 @@ async fn selector_regex_matches_prometheus_on_cold_and_warm_resolution() {
         .expect("connect (target db)");
 
     let now = now_ms();
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now / bucket) * bucket;
 
     let series: Vec<SeedSeriesRow> = P278_FIXTURE
@@ -3927,7 +3886,6 @@ async fn selector_regex_matches_prometheus_on_cold_and_warm_resolution() {
         .iter()
         .enumerate()
         .map(|(i, (_, v))| SeedSampleRow {
-            metric_name: "p278".to_string(),
             fingerprint: u128::from(i as u64 + 1),
             unix_milli: recent_bucket,
             value: *v,
@@ -4106,7 +4064,7 @@ async fn label_values_name_equals_the_wide_discovery_paths_name_set() {
         .await
         .expect("connect (engine client)");
 
-    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let bucket = ACTIVITY_BUCKET_MS;
     let recent_bucket = (now_ms() / bucket) * bucket;
     let corpus: &[(&str, u64, &str)] = &[
         ("a", 1001, r#"{"job":"api"}"#),
@@ -4338,9 +4296,10 @@ async fn label_values_name_equals_the_wide_discovery_paths_name_set() {
 /// and its own label row in `metric_labels`.
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedActivityRow {
-    metric_name: String,
+    day: u16,
     fingerprint: u128,
-    unix_milli: i64,
+    metric_name: String,
+    hours: u32,
 }
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -4348,6 +4307,8 @@ struct SeedLabelRow {
     metric_name: String,
     fingerprint: u128,
     labels: String,
+    first_seen: i64,
+    last_seen: i64,
 }
 
 /// Seeds `rows` the way the two views fill the tables from one kind-2 row.
@@ -4355,9 +4316,10 @@ async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
     let activity: Vec<SeedActivityRow> = rows
         .iter()
         .map(|r| SeedActivityRow {
-            metric_name: r.metric_name.clone(),
+            day: r.unix_milli.div_euclid(86_400_000) as u16,
             fingerprint: r.fingerprint,
-            unix_milli: r.unix_milli,
+            metric_name: r.metric_name.clone(),
+            hours: 1u32 << (r.unix_milli.rem_euclid(86_400_000) / 3_600_000),
         })
         .collect();
     let labels: Vec<SeedLabelRow> = rows
@@ -4366,6 +4328,8 @@ async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
             metric_name: r.metric_name.clone(),
             fingerprint: r.fingerprint,
             labels: r.labels.clone(),
+            first_seen: r.unix_milli,
+            last_seen: r.unix_milli,
         })
         .collect();
     client
