@@ -3886,5 +3886,12 @@ Applies to the span-scope predicate compiler (`crates/pulsus-read/src/traces/spa
 - **`.k` holding its value in event or link scope is that scope's set.** The reference reads the first element.
 - **`.k` held in no scope matches no comparison, `!=` included**; an `event.` or `link.` set with no element
   holding the key satisfies `!=`.
+- **Arithmetic over event, link and unscoped operands ranges over their elements**: every combination of one
+  element from each operand, any combination for `=` and the ordered operators, every one for `!=`. The reference
+  computes once, from the first element of each.
+- **`!F` over an event, link or unscoped attribute is each element's negation**, compared the same way, except that
+  `!=` needs the set to hold the key: a span holding it in no element does not match.
+- **A comparison holds at most two event, link or unscoped operands**; more are refused with a `400`. The reference
+  has no such limit.
 
 Read from the reference's source, not measured against it.
