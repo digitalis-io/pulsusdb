@@ -9,7 +9,7 @@
 //! assertions, and the two halves meet at `T-C4`, which freezes the exact
 //! statement this suite issues.
 //!
-//! **Eight fixtures, each test function in its own database.**
+//! **Nine fixtures, each test function in its own database.**
 //!
 //! * The worked fixture of `docs/TraceQL/functional-requirements.md` §6.1 —
 //!   three traces, nine spans, every attribute type, one event, one link,
@@ -37,6 +37,10 @@
 //!   value with a field: every stored type on the resource row against
 //!   the span's, two resource keys against each other, `service.name`'s
 //!   arms, and resource rows deleted.
+//! * Fixture Y — nineteen spans, one resource each, for arithmetic: integers
+//!   past 2^53 and 2^63, zero and `-1` divisors, exact powers at the edges of
+//!   256-bit integers, mixed and absent operands, boolean-valued sides, and
+//!   doubles at the 64- and 128-bit edges.
 //!
 //! Each is seeded by building the OTLP request bodies and handing them to
 //! `pulsus_write::parse_trace_landing`, then inserting the rows it
@@ -2852,6 +2856,51 @@ const CASES_C: &[CaseIn] = &[
         query: r#"{ link.relation = "child_of" }"#,
         want: Want::Ids(&["0004"]),
     },
+    // #589 part 3c, section 8.2: a literal-only side, folded.
+    CaseIn {
+        name: "CAT1",
+        query: r#"{ .a = 2 - 1 }"#,
+        want: Want::Ids(&[
+            "0001", "0003", "0004", "0005", "0015", "0017", "0019", "001e", "0020", "002d",
+        ]),
+    },
+    CaseIn {
+        name: "CAT2",
+        query: r#"{ .a = 5 % 2 }"#,
+        want: Want::Ids(&[
+            "0001", "0003", "0004", "0005", "0015", "0017", "0019", "001e", "0020", "002d",
+        ]),
+    },
+    CaseIn {
+        name: "CAT3",
+        query: r#"{ .a = 1 + 2 }"#,
+        want: Want::Ids(&["0028"]),
+    },
+    CaseIn {
+        name: "CAT4",
+        query: r#"{ .a = 2 ^ 3 }"#,
+        want: Want::Ids(&["0029"]),
+    },
+    CaseIn {
+        name: "CAT5",
+        query: r#"{ .a = 4 / 2 }"#,
+        want: Want::Ids(&["002a"]),
+    },
+    CaseIn {
+        name: "CAT6",
+        query: r#"{ .a = 2 * 3 }"#,
+        want: Want::Ids(&["002b"]),
+    },
+    CaseIn {
+        name: "CAT7",
+        query: r#"{ .a = -1 }"#,
+        want: Want::Ids(&["002c"]),
+    },
+    CaseIn {
+        name: "CAT0",
+        query: r#"{ 1 = 1 }"#,
+        want: Want::Ids(ALL_C),
+    },
 ];
 
 /// Section 10.2: the catalogue fixture.
@@ -3651,11 +3700,19 @@ async fn the_predicate_compiler_compares_two_span_row_fields() {
 }
 
 /// Section 6.2 of the part-3a design: the field half of `T-A7`.
-const CASES_61_FIELDS: &[CaseIn] = &[CaseIn {
-    name: "T-A7 (field half)",
-    query: r#"{ span.app.items.count > span.app.discount.ratio }"#,
-    want: Want::Ids(&["0003"]),
-}];
+const CASES_61_FIELDS: &[CaseIn] = &[
+    CaseIn {
+        name: "T-A7 (field half)",
+        query: r#"{ span.app.items.count > span.app.discount.ratio }"#,
+        want: Want::Ids(&["0003"]),
+    },
+    // #589 part 3c, section 8.3.
+    CaseIn {
+        name: "T-A7 (arithmetic half)",
+        query: r#"{ span.app.items.count + span.app.discount.ratio > 3 }"#,
+        want: Want::Ids(&["0003"]),
+    },
+];
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_predicate_compiler_compares_fields_on_the_worked_fixture() {
@@ -3906,6 +3963,401 @@ async fn the_predicate_compiler_compares_resource_values() {
         "{} of {} fixture-X cases answer something else:\n\n{}",
         wrong.len(),
         CASES_X.len() + CASES_X_MISS.len(),
+        wrong.join("\n\n")
+    );
+}
+
+// ---------------------------------------------------------------------
+// #589 part 3c — fixture Y, arithmetic
+// ---------------------------------------------------------------------
+
+/// `y01` to `y19`: span ids `000000000000e201` to `…e219`, the span's
+/// number written as decimal digits in the id's last byte.
+fn idy(short: &str) -> String {
+    format!("000000000000e2{}", short.trim_start_matches('y'))
+}
+
+/// Fixture Y, the part-3c design's section 7.1: nineteen requests, one
+/// span and one resource each. Every resource carries `ry = "yNN"`, so no
+/// two spans share a resource.
+fn fixture_y_bodies(base_ns: i64) -> Vec<ExportTraceServiceRequest> {
+    const MS: i64 = 1_000_000;
+    let st = |k: &str, v: &str| kv(k, str_value(v));
+    let it = |k: &str, v: i64| kv(k, int_value(v));
+    let db = |k: &str, v: f64| kv(k, double_value(v));
+    let bl = |k: &str, v: bool| kv(k, bool_value(v));
+    // (span number, span attributes, resource attributes besides `ry`)
+    let spans: Vec<(u8, Vec<KeyValue>, Vec<KeyValue>)> = vec![
+        (
+            1,
+            vec![
+                it("a", 9_007_199_254_740_992),
+                it("b", 9_007_199_254_740_992),
+            ],
+            Vec::new(),
+        ),
+        (
+            2,
+            vec![
+                it("a", 9_007_199_254_740_993),
+                it("b", 9_007_199_254_740_992),
+            ],
+            Vec::new(),
+        ),
+        (3, vec![it("a", i64::MAX), it("b", 1)], Vec::new()),
+        (4, vec![it("a", -7), it("b", 2)], vec![it("r", 2)]),
+        (5, vec![it("a", 5), it("b", 0)], Vec::new()),
+        (6, vec![it("a", i64::MIN), it("b", -1)], Vec::new()),
+        (
+            7,
+            vec![it("a", 3), db("b", 0.25), st("k", "z")],
+            vec![db("r", 2.5)],
+        ),
+        (8, vec![it("a", 1)], Vec::new()),
+        (9, vec![st("a", "5"), it("b", 1)], Vec::new()),
+        (10, vec![it("a", 3), it("b", 39)], Vec::new()),
+        (11, vec![it("a", 2), it("b", -1)], Vec::new()),
+        (
+            12,
+            vec![kv("a", int_array_value(&[1, 2])), it("b", 1)],
+            Vec::new(),
+        ),
+        (13, vec![bl("f", true), bl("g", false)], Vec::new()),
+        (14, vec![st("nb", "x"), bl("g", false)], Vec::new()),
+        (15, vec![bl("f", false), bl("g", false)], Vec::new()),
+        (
+            16,
+            vec![
+                db("big", 2f64.powi(63)),
+                db("huge", 2f64.powi(70)),
+                db("top", 2f64.powi(128)),
+                db("bot", -(2f64.powi(127))),
+                db("dms", 2f64.powi(64)),
+            ],
+            Vec::new(),
+        ),
+        (17, vec![it("a", 2), it("b", 255)], Vec::new()),
+        (18, vec![it("a", -2), it("b", 255)], Vec::new()),
+        (19, vec![it("a", 2), it("b", 254)], Vec::new()),
+    ];
+    spans
+        .into_iter()
+        .map(|(n, attrs, resource_attrs)| {
+            let last = u8::from_str_radix(&format!("{n:02}"), 16).expect("two decimal digits");
+            let mut resource = vec![st("ry", &format!("y{n:02}"))];
+            resource.extend(resource_attrs);
+            let duration_ns = if n == 16 { MS + MS / 2 } else { MS };
+            one_span_request(
+                resource,
+                scope_named("io.pulsus.y", "1.0", Vec::new()),
+                span_of(
+                    vec![0xe2; 16],
+                    vec![0, 0, 0, 0, 0, 0, 0xe2, last],
+                    Vec::new(),
+                    "op",
+                    1,
+                    base_ns + i64::from(n) * MS,
+                    duration_ns,
+                    attrs,
+                    0,
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            )
+        })
+        .collect()
+}
+
+const ALL_Y: &[&str] = &[
+    "y01", "y02", "y03", "y04", "y05", "y06", "y07", "y08", "y09", "y10", "y11", "y12", "y13",
+    "y14", "y15", "y16", "y17", "y18", "y19",
+];
+
+/// Every span whose `a` is a number: `y01`–`y08`, `y10`, `y11`, `y17`–`y19`.
+const Y_NUMERIC_A: &[&str] = &[
+    "y01", "y02", "y03", "y04", "y05", "y06", "y07", "y08", "y10", "y11", "y17", "y18", "y19",
+];
+
+/// `{ (span.a > 1) = false }`'s answer, which `BV7` shares.
+const Y_A_NOT_ABOVE_1: &[&str] = &[
+    "y04", "y06", "y08", "y09", "y12", "y13", "y14", "y15", "y16", "y18",
+];
+
+/// The part-3c design's section 8.1.
+const CASES_Y: &[CaseIn] = &[
+    CaseIn {
+        name: "AR1",
+        query: r#"{ span.a + 1 > span.b }"#,
+        want: Want::Ids(&["y01", "y02", "y03", "y05", "y07", "y11"]),
+    },
+    CaseIn {
+        name: "AR2",
+        query: r#"{ span.a - span.b = 1 }"#,
+        want: Want::Ids(&["y02"]),
+    },
+    CaseIn {
+        name: "AR3",
+        query: r#"{ span.a + span.b > 0 }"#,
+        want: Want::Ids(&[
+            "y01", "y02", "y03", "y05", "y07", "y10", "y11", "y17", "y18", "y19",
+        ]),
+    },
+    CaseIn {
+        name: "AR4",
+        query: r#"{ span.a / span.b = -3 }"#,
+        want: Want::Ids(&["y04"]),
+    },
+    CaseIn {
+        name: "AR5",
+        query: r#"{ span.a % span.b = -1 }"#,
+        want: Want::Ids(&["y04"]),
+    },
+    CaseIn {
+        name: "AR6",
+        query: r#"{ span.a / span.b > 0 }"#,
+        want: Want::Ids(&["y01", "y02", "y03", "y06", "y07"]),
+    },
+    CaseIn {
+        name: "AR7",
+        query: r#"{ span.k = "z" && span.a / span.b > 0 }"#,
+        want: Want::Ids(&["y07"]),
+    },
+    CaseIn {
+        name: "AR8",
+        query: r#"{ span.a * span.b = 0.75 }"#,
+        want: Want::Ids(&["y07"]),
+    },
+    CaseIn {
+        name: "AR9",
+        query: r#"{ span.a ^ span.b = 4052555153018976267 }"#,
+        want: Want::Ids(&["y10"]),
+    },
+    CaseIn {
+        name: "AR10",
+        query: r#"{ span.a ^ span.b = 0.5 }"#,
+        want: Want::Ids(&["y11"]),
+    },
+    CaseIn {
+        name: "AR11",
+        query: r#"{ -span.a > 0 }"#,
+        want: Want::Ids(&["y04", "y06", "y18"]),
+    },
+    CaseIn {
+        name: "AR12",
+        query: r#"{ span.a + span.b != 5 }"#,
+        want: Want::Ids(&[
+            "y01", "y02", "y03", "y04", "y06", "y07", "y10", "y11", "y17", "y18", "y19",
+        ]),
+    },
+    CaseIn {
+        name: "AR13",
+        query: r#"{ duration / 1ms > 1 }"#,
+        want: Want::Ids(&["y16"]),
+    },
+    CaseIn {
+        name: "PW1",
+        query: r#"{ span.a ^ span.b < 0 }"#,
+        want: Want::Ids(&["y06", "y18"]),
+    },
+    CaseIn {
+        name: "PW2",
+        query: r#"{ span.a ^ (span.b + 0) = 4052555153018976267 }"#,
+        want: Want::Ids(&["y10"]),
+    },
+    CaseIn {
+        name: "PW3",
+        query: r#"{ span.a ^ span.b > 0 }"#,
+        want: Want::Ids(&["y03", "y04", "y05", "y07", "y10", "y11", "y19"]),
+    },
+    CaseIn {
+        name: "OV1",
+        query: r#"{ span.a ^ span.b + span.a ^ span.b < 0 }"#,
+        want: Want::Ids(&["y06"]),
+    },
+    CaseIn {
+        name: "OV2",
+        query: r#"{ span.a * span.a * span.a * span.a * span.a < 0 }"#,
+        want: Want::Ids(&["y04", "y18"]),
+    },
+    CaseIn {
+        name: "RS1",
+        query: r#"{ span.a * resource.r > 7 }"#,
+        want: Want::Ids(&["y07"]),
+    },
+    CaseIn {
+        name: "RS2",
+        query: r#"{ span.a * resource.r = -14 }"#,
+        want: Want::Ids(&["y04"]),
+    },
+    CaseIn {
+        name: "LT1",
+        query: r#"{ 9007199254740993 = 9007199254740992.0 }"#,
+        want: Want::Ids(&[]),
+    },
+    CaseIn {
+        name: "LT2",
+        query: r#"{ 1 = 1 }"#,
+        want: Want::Ids(ALL_Y),
+    },
+    CaseIn {
+        name: "LT3",
+        query: r#"{ "abc" =~ "a.*" }"#,
+        want: Want::Ids(ALL_Y),
+    },
+    CaseIn {
+        name: "LT4",
+        query: r#"{ "abc" !~ "a.*" }"#,
+        want: Want::Ids(&[]),
+    },
+    CaseIn {
+        name: "BG1",
+        query: r#"{ span.big < 9223372036854775809 }"#,
+        want: Want::Ids(&["y16"]),
+    },
+    CaseIn {
+        name: "BG2",
+        query: r#"{ span.huge = 1180591620717411303425 }"#,
+        want: Want::Ids(&[]),
+    },
+    CaseIn {
+        name: "BG3",
+        query: r#"{ span.huge = 1180591620717411303424 }"#,
+        want: Want::Ids(&["y16"]),
+    },
+    CaseIn {
+        name: "BG4",
+        query: r#"{ duration < 18446744073709551615ns }"#,
+        want: Want::Ids(ALL_Y),
+    },
+    CaseIn {
+        name: "BG5",
+        query: r#"{ 18446744073709551615ns = 18446744073709551615ns }"#,
+        want: Want::Ids(ALL_Y),
+    },
+    CaseIn {
+        name: "BG6",
+        query: r#"{ span.a > 1 / -0.0 }"#,
+        want: Want::Ids(Y_NUMERIC_A),
+    },
+    CaseIn {
+        name: "BG7",
+        query: r#"{ span.top = 340282366920938463463374607431768211455 }"#,
+        want: Want::Ids(&[]),
+    },
+    CaseIn {
+        name: "BG8",
+        query: r#"{ span.top > 340282366920938463463374607431768211455 }"#,
+        want: Want::Ids(&["y16"]),
+    },
+    CaseIn {
+        name: "BG9",
+        query: r#"{ span.bot = -170141183460469231731687303715884105728 }"#,
+        want: Want::Ids(&["y16"]),
+    },
+    CaseIn {
+        name: "BG10",
+        query: r#"{ span.bot = -170141183460469231731687303715884105727 }"#,
+        want: Want::Ids(&[]),
+    },
+    CaseIn {
+        name: "BG11",
+        query: r#"{ span.dms = 18446744073709551615ns }"#,
+        want: Want::Ids(&[]),
+    },
+    CaseIn {
+        name: "DZ1",
+        query: r#"{ span.a < 1ms / 0 }"#,
+        want: Want::Ids(Y_NUMERIC_A),
+    },
+    CaseIn {
+        name: "DZ2",
+        query: r#"{ span.a + 1 / 0 > 0 }"#,
+        want: Want::Ids(&[]),
+    },
+    CaseIn {
+        name: "FD1",
+        query: r#"{ span.b != 2 - 1 }"#,
+        want: Want::Ids(&[
+            "y01", "y02", "y04", "y05", "y06", "y07", "y08", "y10", "y11", "y13", "y14", "y15",
+            "y16", "y17", "y18", "y19",
+        ]),
+    },
+    CaseIn {
+        name: "FD2",
+        query: r#"{ span.a = -7 }"#,
+        want: Want::Ids(&["y04"]),
+    },
+    CaseIn {
+        name: "BV1",
+        query: r#"{ (span.a > 1) = false }"#,
+        want: Want::Ids(Y_A_NOT_ABOVE_1),
+    },
+    CaseIn {
+        name: "BV2",
+        query: r#"{ (span.a = 1) = (span.b = 1) }"#,
+        want: Want::Ids(&[
+            "y01", "y02", "y04", "y05", "y06", "y07", "y10", "y11", "y13", "y14", "y15", "y16",
+            "y17", "y18", "y19",
+        ]),
+    },
+    CaseIn {
+        name: "BV3",
+        query: r#"{ !span.f = span.g }"#,
+        want: Want::Ids(&["y13"]),
+    },
+    CaseIn {
+        name: "BV4",
+        query: r#"{ !span.nb = span.g }"#,
+        want: Want::Fails("expression (!span.nb) expected a boolean"),
+    },
+    CaseIn {
+        name: "BV5",
+        query: r#"{ (span.a > 1 && span.b > 1) = true }"#,
+        want: Want::Ids(&["y01", "y02", "y10", "y17", "y19"]),
+    },
+    CaseIn {
+        name: "BV6",
+        query: r#"{ (span.a > 1 || span.b > 1) = false }"#,
+        want: Want::Ids(&["y06", "y08", "y09", "y12", "y13", "y14", "y15", "y16"]),
+    },
+    CaseIn {
+        name: "BV7",
+        query: r#"{ !(span.a > 1) = true }"#,
+        want: Want::Ids(Y_A_NOT_ABOVE_1),
+    },
+    CaseIn {
+        name: "BV8",
+        query: r#"{ (span.b != nil) = (span.a = nil) }"#,
+        want: Want::Ids(&["y08"]),
+    },
+];
+
+/// Section 8.1 of the part-3c design: fixture Y.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_predicate_compiler_computes_arithmetic() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db("pulsus_read_it_t589p3c_fixturey");
+    let client = fresh_db(&db).await;
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    for (i, req) in fixture_y_bodies(base_ns).into_iter().enumerate() {
+        land(&client, &req, &format!("t589p3c-y-{i}-{}", now_ns())).await;
+    }
+    let w = WindowSql::start_closed_end_open(base_ns, base_ns + WINDOW_NS);
+
+    let seeded = count(&client, &format!("SELECT count() AS n FROM {SPANS_TABLE}")).await;
+    assert_eq!(
+        seeded, 19,
+        "fixture Y seeds nineteen spans; nothing below can be read as a predicate result until \
+         this holds"
+    );
+
+    let wrong = run_cases_in(&client, w, CASES_Y, idy).await;
+    drop_db(&db).await;
+    assert!(
+        wrong.is_empty(),
+        "{} of {} fixture-Y cases answer something else:\n\n{}",
+        wrong.len(),
+        CASES_Y.len(),
         wrong.join("\n\n")
     );
 }
