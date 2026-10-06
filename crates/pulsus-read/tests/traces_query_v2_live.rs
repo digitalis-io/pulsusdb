@@ -4686,6 +4686,10 @@ const Z_EVENTS_BUT_Z16: &[&str] = &[
     "z19", "z20", "z21", "z22", "z25", "z26", "z29", "z30", "z31", "z32",
 ];
 
+/// The spans with no events: `NT-EE`'s answer, which `NT-ES` and `NT-EST`
+/// share.
+const Z_NO_EVENTS: &[&str] = &["z06", "z10", "z17", "z18", "z23", "z24", "z27", "z28"];
+
 /// The part-3d design's section 8.1, before the resource rows are deleted.
 const CASES_Z: &[CaseIn] = &[
     CaseIn {
@@ -4873,6 +4877,95 @@ const CASES_Z: &[CaseIn] = &[
         name: "TF-EQ",
         query: r#"{ event:timeSinceStart = 1000 * 3000 }"#,
         want: Want::Ids(&["z16"]),
+    },
+    // Decision 9: a set sharing no type pair with the other operand.
+    CaseIn {
+        name: "NT-EE",
+        query: r#"{ event:name != event:timeSinceStart }"#,
+        want: Want::Ids(Z_NO_EVENTS),
+    },
+    CaseIn {
+        name: "NT-EE reversed",
+        query: r#"{ event:timeSinceStart != event:name }"#,
+        want: Want::Ids(Z_NO_EVENTS),
+    },
+    CaseIn {
+        name: "NT-LE",
+        query: r#"{ link:spanID != event:timeSinceStart }"#,
+        want: Want::Ids(&[
+            "z01", "z02", "z03", "z04", "z05", "z06", "z07", "z08", "z09", "z10", "z13", "z14",
+            "z15", "z16", "z17", "z18", "z19", "z20", "z21", "z22", "z23", "z24", "z25", "z26",
+            "z27", "z28", "z32",
+        ]),
+    },
+    CaseIn {
+        name: "NT-LE reversed",
+        query: r#"{ event:timeSinceStart != link:spanID }"#,
+        want: Want::Ids(&[
+            "z01", "z02", "z03", "z04", "z05", "z06", "z07", "z08", "z09", "z10", "z13", "z14",
+            "z15", "z16", "z17", "z18", "z19", "z20", "z21", "z22", "z23", "z24", "z25", "z26",
+            "z27", "z28", "z32",
+        ]),
+    },
+    CaseIn {
+        name: "NT-EQ",
+        query: r#"{ event:name = event:timeSinceStart }"#,
+        want: Want::Ids(&[]),
+    },
+    CaseIn {
+        name: "NT-ES",
+        query: r#"{ event:name != duration }"#,
+        want: Want::Ids(Z_NO_EVENTS),
+    },
+    CaseIn {
+        name: "NT-ES reversed",
+        query: r#"{ duration != event:name }"#,
+        want: Want::Ids(Z_NO_EVENTS),
+    },
+    CaseIn {
+        name: "NT-LS",
+        query: r#"{ link:traceID != duration }"#,
+        want: Want::Ids(&[
+            "z01", "z02", "z03", "z04", "z05", "z06", "z07", "z08", "z09", "z13", "z14", "z15",
+            "z16", "z19", "z20", "z21", "z22", "z23", "z25", "z26", "z27", "z28", "z32",
+        ]),
+    },
+    CaseIn {
+        name: "NT-EST",
+        query: r#"{ event:timeSinceStart != status }"#,
+        want: Want::Ids(Z_NO_EVENTS),
+    },
+    CaseIn {
+        name: "NT-EA",
+        query: r#"{ event.a != status }"#,
+        want: Want::Ids(&[
+            "z05", "z06", "z10", "z14", "z15", "z16", "z17", "z18", "z23", "z24", "z27", "z28",
+            "z29", "z30", "z31", "z32",
+        ]),
+    },
+    CaseIn {
+        name: "NT-LA",
+        query: r#"{ status != link.a }"#,
+        want: Want::Ids(&[
+            "z01", "z02", "z03", "z04", "z05", "z06", "z07", "z08", "z09", "z13", "z14", "z15",
+            "z16", "z17", "z18", "z19", "z20", "z21", "z22", "z23", "z24", "z25", "z26", "z27",
+            "z28", "z29", "z30", "z31", "z32",
+        ]),
+    },
+    CaseIn {
+        name: "NT-CH",
+        query: r#"{ .a != status }"#,
+        want: Want::Ids(&[]),
+    },
+    CaseIn {
+        name: "NT-SEQ =",
+        query: r#"{ event:name = duration }"#,
+        want: Want::Ids(&[]),
+    },
+    CaseIn {
+        name: "NT-SEQ <",
+        query: r#"{ event:name < duration }"#,
+        want: Want::Ids(&[]),
     },
 ];
 

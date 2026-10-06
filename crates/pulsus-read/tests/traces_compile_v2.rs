@@ -3368,8 +3368,12 @@ fn element_expected(set: &SetSpec, n: usize, op: ComparisonOp, scalar: &FfOperan
     } else {
         ff_body(scalar, op, &element)
     };
-    let Some(body) = body else {
-        return "false".to_string();
+    // Decision 9: with no term, `= < <= > >=` match nothing and `!=` keeps
+    // its every-element rule over a body of `false`.
+    let body = match body {
+        Some(body) => body,
+        None if op == ComparisonOp::Neq => "false".to_string(),
+        None => return "false".to_string(),
     };
     let (e, array) = (format!("e{n}"), set.array(n));
     if op != ComparisonOp::Neq {
@@ -3475,8 +3479,13 @@ fn class_lists_expected(l: &SetSpec, op: ComparisonOp, r: &SetSpec) -> String {
             )
         });
     }
+    // Decision 9: with no term, `!=` counts no pair, so it holds when either
+    // set is empty.
     if terms.is_empty() {
-        return "false".to_string();
+        if !neq {
+            return "false".to_string();
+        }
+        terms.push("0".to_string());
     }
     if !neq {
         return format!("({})", terms.join(" OR "));
@@ -3531,7 +3540,8 @@ fn set_pair_expected(l: Side<'_>, op: ComparisonOp, r: Side<'_>) -> String {
 /// `T-C34`: every ordered pair of 3c's fourteen operands and part 3d's
 /// seven sets with at least one set, under each of the six operators —
 /// 1,470 cells — compiles to the text this file builds from its own copy
-/// of section 5, with no demand. With no context the first operand needing
+/// of section 5, with no demand; a pair sharing no type pair under `!=`
+/// expects decision 9's text. With no context the first operand needing
 /// it, left before right, gives its own refusal; every other cell is the
 /// same text.
 #[test]
@@ -3634,6 +3644,15 @@ fn t_c35_the_set_comparison_texts() {
         )
     );
     assert_eq!(rendered(r#"{ event.a = status }"#), "false");
+    // Decision 9: `!=` with no term holds exactly when the set is empty.
+    assert_eq!(
+        rendered(r#"{ event:name != duration }"#),
+        "arrayAll(e1 -> false, events.name)"
+    );
+    assert_eq!(
+        rendered(r#"{ event:name != event:timeSinceStart }"#),
+        "((0) = length(events.name) * length(events.time_ns))"
+    );
 }
 
 /// `T-C36`: the chain needs its window and an event set does not; every
