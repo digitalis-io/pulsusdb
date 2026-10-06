@@ -89,7 +89,7 @@ SETTINGS ttl_only_drop_parts = 1;
 - **The lookup answers every matcher; the activity answers the window** (issue #623). One kind-2 landing row feeds both views: `metric_labels_mv` writes the series' lookup row and `metric_series_mv` its activity row. `metric_labels` holds **one row per series**, keyed `(metric_name, fingerprint)`: a name equality, or a regex with a literal prefix, is a key range; other name regexes run once per distinct name; label matchers read the rows the name leaves, by `JSONExtractString(labels, '<key>')` (absent is `''`). `metric_series` holds one row per series per UTC day, `hours` a 24-bit mask of the hours the series had samples in, OR'd together on merge. No read joins the two: a read takes the IDs the lookup selects and keeps those the activity table finds in the window.
 - **First and last seen.** The lookup view sets both `first_seen` and `last_seen` to the kind-2 row's `unix_milli`, the hour the writer registered the series in; merges keep the `min` and the `max`. A read takes `min(first_seen)` and `max(last_seen)` by fingerprint, exact across unmerged parts and shards. No read uses them yet.
 - **Activity expires with the samples; lookup rows are kept.** `metric_series` keeps a day until its last sample has expired (`day + 1 + retention`), capped as the sample tables are. `metric_labels` has no TTL: the label sets are kept on disk permanently, by the owner's decision.
-- **Exact to the hour, no `FINAL`.** The writer registers a series once per hour it has samples in (`pulsus_model::ACTIVITY_BUCKET_MS`, fixed), skipping known `(metric_name, fingerprint, hour)` triples through an in-process LRU. A read bounds `day` by the window's first and last UTC day and tests each row's `hours` against that day's hours of the window, so an unmerged row is tested on its own and a merge changes no answer. Measured: 300 random windows of up to six days over 1,000 series active in a random tenth of 168 hours answered exactly the hourly form's sets (`activity_is_exact_to_the_hour`). The discovery endpoints built on this table (`/api/v1/series`, `/labels`, `/label/{name}/values`, docs/api.md §3.3) therefore answer the series active in the window's hours: a bounded superset of Prometheus's exact-sample-window set, never a subset and never a false empty.
+- **Exact to the hour, no `FINAL`.** The writer registers a series once per hour it has samples in (`pulsus_model::ACTIVITY_BUCKET_MS`, fixed), skipping known `(metric_name, fingerprint, hour)` triples through an in-process LRU. A read bounds `day` by the window's first and last UTC day and tests each row's `hours` against that day's hours of the window, so an unmerged row is tested on its own and a merge changes no answer. Measured: 300 random windows of up to six days over 1,000 series active in a random tenth of 168 hours answered exactly the hourly form's sets (`activity_is_exact_to_the_hour`). The discovery endpoints built on this table (`/api/v1/series`, `/labels`, `/label/{name}/values`, docs/api.md §3.3) therefore answer the series active in the window's hours: a bounded superset of the reference's exact-sample-window set, never a subset and never a false empty.
 
 #### The four statements
 
@@ -180,7 +180,6 @@ Downsampling happens **entirely inside ClickHouse** with classic insert-triggere
 
 ```sql
 CREATE TABLE metric_samples_5m (
-    metric_name   LowCardinality(String),
     fingerprint   UInt128                                 CODEC(Delta(8), ZSTD(1)),
     ts            DateTime                               CODEC(DoubleDelta, ZSTD(1)),
     val_min       SimpleAggregateFunction(min, Float64)  CODEC(Gorilla, ZSTD(1)),
@@ -194,12 +193,12 @@ CREATE TABLE metric_samples_5m (
     last_value    AggregateFunction(argMax, Float64, Int64)
 ) ENGINE = AggregatingMergeTree
 PARTITION BY toYYYYMM(ts)
-ORDER BY (metric_name, fingerprint, ts)
+ORDER BY (fingerprint, ts)
 TTL ts + INTERVAL 90 DAY DELETE
 SETTINGS ttl_only_drop_parts = 1;
 
 CREATE MATERIALIZED VIEW metric_samples_5m_mv TO metric_samples_5m AS
-SELECT metric_name, fingerprint,
+SELECT fingerprint,
        toStartOfInterval(fromUnixTimestamp64Milli(unix_milli), INTERVAL 300 SECOND) AS ts,
        min(value) AS val_min, max(value) AS val_max, sum(value) AS val_sum,
        sum(value * value) AS val_sum_sq, count() AS val_count,
@@ -207,7 +206,7 @@ SELECT metric_name, fingerprint,
        argMinState(value, unix_milli) AS first_value,
        argMaxState(value, unix_milli) AS last_value
 FROM metric_samples
-GROUP BY metric_name, fingerprint, ts;
+GROUP BY fingerprint, ts;
 -- metric_samples_1h_mv: identical shape, INTERVAL 3600, also reading metric_samples
 ```
 
@@ -253,7 +252,7 @@ WHERE day BETWEEN {first day} AND {last day}
 
 — statement 1 of §2.1; the samples that return are hydrated with statement 4, over their own IDs.
 
-**Two details in that regex predicate.** ClickHouse's `match()` compiles with RE2's `dot_nl` option set, so `.` matches a newline there and does not in RE2 — and therefore not in Prometheus, which compiles matchers with Go's `regexp`. Every pattern this path renders is prefixed with RE2's own `(?-s)` flag group to restore the reference reading; a `(?s)` the user wrote still overrides it. And because ClickHouse compiles a pattern only when it evaluates `match()` on a row, a selector naming a metric with **no rows in the window** would never reach RE2 at all and an invalid pattern would answer an empty `200` instead of Prometheus's `400`. The activity read therefore carries one `0 * match('', <pattern>) = 0` line per regex matcher: ClickHouse folds the constant during query analysis and rejects an uncompilable pattern before reading a part (issue #315). The patterns themselves run on the lookup rows, inside the activity read's `IN` set, so no activity row evaluates one. A matcher set with no regex renders no probe at all.
+**Two details in that regex predicate.** ClickHouse's `match()` compiles with RE2's `dot_nl` option set, so `.` matches a newline there and does not in RE2 — and therefore not in the reference, which compiles matchers with Go's `regexp`. Every pattern this path renders is prefixed with RE2's own `(?-s)` flag group to restore the reference reading; a `(?s)` the user wrote still overrides it. And because ClickHouse compiles a pattern only when it evaluates `match()` on a row, a selector naming a metric with **no rows in the window** would never reach RE2 at all and an invalid pattern would answer an empty `200` instead of the reference's `400`. The activity read therefore carries one `0 * match('', <pattern>) = 0` line per regex matcher: ClickHouse folds the constant during query analysis and rejects an uncompilable pattern before reading a part (issue #315). The patterns themselves run on the lookup rows, inside the activity read's `IN` set, so no activity row evaluates one. A matcher set with no regex renders no probe at all.
 
 **Clustered honesty:** on a clustered deployment this fallback fetch reads `_dist` names throughout — `metric_samples_dist`, and the nested subqueries' `metric_series_dist` and `metric_labels_dist` — and additionally injects `distributed_product_mode = 'local'`, rewriting those nested subqueries to each shard's **local** tables (the same rewrite already applied to the traces metrics semi-join). It is exact because one kind-2 landing row writes a series' activity row and its lookup row on the node that received the push, beside that push's samples. Every series read that filters on labels or returns them carries the same setting, the label-cache sweep included. Without it, ClickHouse's default `distributed_product_mode = 'deny'` rejects the nested `_dist`-inside-`_dist` shape as a double-distributed `IN` (`DISTRIBUTED_IN_JOIN_SUBQUERY_DENIED`).
 

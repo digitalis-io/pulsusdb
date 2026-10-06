@@ -5,7 +5,9 @@
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-/// `metric_samples` row (docs/schemas.md §2.1).
+/// `metric_samples` row (docs/schemas.md §2.1), plus the metric name its
+/// series ID's prefix is taken from. The name is not a column (issue #623):
+/// the table holds `fingerprint`, `unix_milli` and `value`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MetricRow {
     pub metric_name: String,
@@ -15,11 +17,11 @@ pub struct MetricRow {
 }
 
 impl MetricRow {
-    /// Uncompressed payload size in bytes (string bytes + fixed-width
-    /// columns): `fingerprint` is 16 bytes since issue #498, then
-    /// `unix_milli` and `value` at 8 each.
+    /// Uncompressed payload size in bytes of the inserted columns:
+    /// `fingerprint` is 16 bytes since issue #498, then `unix_milli` and
+    /// `value` at 8 each.
     pub fn payload_bytes(&self) -> usize {
-        self.metric_name.len() + 16 + 8 + 8
+        16 + 8 + 8
     }
 }
 
@@ -79,6 +81,20 @@ fn splitmix64(mut x: u64) -> u64 {
 /// Generates `n` metric-shaped rows starting at global index `start`, deterministic
 /// given the seed. Row `start == 0` is forced to carry [`HIGH_BIT_FINGERPRINT`] so
 /// every rep's first block exercises the unsigned-fingerprint round-trip gate.
+/// The bits of a series ID below its name prefix.
+const SERIES_BODY_MASK: u128 = (1u128 << (128 - pulsus_model::SERIES_NAME_PREFIX_BITS)) - 1;
+
+/// The first and last series ID under `metric_name`'s prefix: the key range
+/// one metric's samples occupy (issue #623).
+pub fn name_id_range(metric_name: &str) -> (u128, u128) {
+    let prefix = u128::from(
+        pulsus_model::raw_cityhash64(metric_name.as_bytes())
+            >> (64 - pulsus_model::SERIES_NAME_PREFIX_BITS),
+    );
+    let lo = prefix << (128 - pulsus_model::SERIES_NAME_PREFIX_BITS);
+    (lo, lo | SERIES_BODY_MASK)
+}
+
 pub fn gen_metric_rows(n: u64, start: u64, seed: u64) -> Vec<MetricRow> {
     let mut rng = StdRng::seed_from_u64(seed ^ start);
     let base_ts: i64 = 1_700_000_000_000;
@@ -91,18 +107,23 @@ pub fn gen_metric_rows(n: u64, start: u64, seed: u64) -> Vec<MetricRow> {
         // the mix: the production fingerprint is a `cityHash64` half above
         // an `xxHash64` half, so a benchmark that left one word zero would
         // measure a narrower value than the schema carries.
+        let metric_name = format!("bench_metric_{metric_idx:04}");
+        // Issue #623: the series ID carries its metric name's prefix, so a
+        // metric's series sort together under `(fingerprint, unix_milli)`.
         let fingerprint = if idx == 0 {
             HIGH_BIT_FINGERPRINT
         } else {
             let seed = metric_idx.wrapping_mul(1_000_003).wrapping_add(series_idx);
-            ((splitmix64(seed) as u128) << 64) | (splitmix64(seed ^ 0x5851_F42D_4C95_7F2D) as u128)
+            let body = ((splitmix64(seed) as u128) << 64)
+                | (splitmix64(seed ^ 0x5851_F42D_4C95_7F2D) as u128);
+            name_id_range(&metric_name).0 | (body & SERIES_BODY_MASK)
         };
         let jitter: i64 = rng.gen_range(-2..=2);
         let unix_milli = base_ts + (idx as i64) * 10 + jitter;
         // Gorilla-friendly: slowly varying value, not white noise.
         let value = 50.0 + ((idx % 3600) as f64) * 0.05 + rng.gen_range(-0.01..0.01);
         out.push(MetricRow {
-            metric_name: format!("bench_metric_{metric_idx:04}"),
+            metric_name,
             fingerprint,
             unix_milli,
             value,

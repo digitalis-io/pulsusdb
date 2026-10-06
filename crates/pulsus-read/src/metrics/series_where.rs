@@ -209,8 +209,8 @@ pub(super) struct Lookup<'a> {
 /// ClickHouse compiles a `match()` pattern only when it evaluates that
 /// `match()` on a row. A selector naming a metric with no rows in the
 /// window therefore never reaches RE2 at all, so an RE2-rejected pattern
-/// came back as an empty `200` where upstream Prometheus (the metrics API's
-/// reference of record, issue #283) answers `400`. The activity read
+/// came back as an empty `200` where the metrics API's reference of record
+/// (issue #283) answers `400`. The activity read
 /// therefore carries one `0 * match('', <pattern>) = 0` line per regex
 /// matcher, over a **constant** subject, which ClickHouse folds during
 /// query analysis, before a single part is read: a pattern RE2 refuses

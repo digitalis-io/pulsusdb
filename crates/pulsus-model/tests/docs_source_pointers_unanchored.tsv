@@ -11,9 +11,7 @@ docs/116.md	ingest/http.rs:116-121	no_name_the_target_file_holds
 docs/116.md	model.rs:156	no_name_the_target_file_holds
 docs/116.md	model.rs:79	no_name_the_target_file_holds
 docs/116.md	schemas.md:194	no_name_the_target_file_holds
-docs/116.md	schemas.md:487	no_name_the_target_file_holds
 docs/116.md	schemas.md:519	no_name_the_target_file_holds
-docs/116.md	schemas.md:541	no_name_the_target_file_holds
 docs/116.md	writer/rows.rs:428	no_name_the_target_file_holds
 docs/116.md	writer/rows.rs:963	no_name_the_target_file_holds
 docs/TraceQL/functional-requirements.md	crates/pulsus-read/src/traces/exec.rs:768-772	no_name_the_target_file_holds

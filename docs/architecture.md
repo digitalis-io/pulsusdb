@@ -65,8 +65,8 @@ Logs, metrics, traces, and profiles have different query shapes, so each gets it
 
 ### 2.2 Fingerprints
 
-A *fingerprint* is a 128-bit hash identifying a unique label set (a stream/series), composed of
-the two 64-bit primitives over one canonical buffer:
+A *fingerprint* is a 128-bit hash identifying a stream or a metric series, composed of the two
+64-bit primitives over one canonical buffer:
 
 ```text
   fp128(buf) = (cityHash64(buf) << 64) | xxHash64(buf, seed 0)
@@ -90,10 +90,13 @@ Rust file — so writing a fingerprint straight into SQL is a compile error. Two
 further down the read path do emit fingerprint SQL, `SqlExpr` and `Pred` in
 `crates/pulsus-read/src/compile/fold.rs:83,535`; both write out a string the mint rendered earlier.
 
-- **Metrics:** the buffer is the label set serialized as `key \xff value \xff ...` with keys sorted
-  and `__name__` excluded (the metric name is a first-class column). This keeps fingerprints stable
-  across label reordering and lets the samples table stay string-free. Its trailing 64 bits are the
-  `xxhash64` value this family used whole before #498.
+- **Metrics:** the fingerprint is the **series ID** (issue #623): the top 24 bits of
+  `cityHash64(metric_name)`, then the low 104 bits of `fp128` over `metric_name \xff` followed by
+  the label set serialized as `key \xff value \xff ...`, keys sorted and `__name__` excluded. One
+  label set under two names is two series; a metric's series share the name prefix, so they sort
+  together under the samples' `(fingerprint, unix_milli)` key; the ID is stable across label
+  reordering and the samples table stays string-free. The prefix is `bitShiftRight(cityHash64(name),
+  40)` on the server, pinned by `crates/pulsus-model/tests/live_cityhash.rs`.
 - **Logs and profiles:** the buffer is a single canonical buffer — each sorted label appended as `key ++ 0xFF ++ value ++ 0xFF` — with the leading 64 bits computed by an implementation **bit-identical to ClickHouse's `cityHash64`** (ClickHouse's frozen CityHash 1.0.2 variant, not upstream CityHash 1.1). The writer is the sole fingerprint authority (the label-index MV only fans out the writer's fingerprint), but bit-identity keeps server-side derivation possible (`cityHash64(concat(...))` over the same buffer) and is enforced by a live cross-check test against `SELECT cityHash64(unhex(...))`.
 - **Traces carry no label fingerprint** (this supersedes earlier revisions of this section, which listed traces alongside logs/profiles — ratified with the M4 schema, issue #53/#54): a span's identity is `(trace_id, span_id)`, the attribute index keys on `(key, val, scope, timestamp_ns, trace_id, span_id)`, and distribution shards by `cityHash64(trace_id)` — a server-side expression over a physical column, never a writer-generated label-set fingerprint.
 

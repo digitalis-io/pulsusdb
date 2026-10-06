@@ -30,7 +30,6 @@ impl DdlReport {
 pub fn tier_table_ddl(tier_table: &str) -> String {
     format!(
         "CREATE TABLE IF NOT EXISTS {tier_table} (
-            metric_name   LowCardinality(String),
             fingerprint   UInt128                                 CODEC(Delta(8), ZSTD(1)),
             ts            DateTime                               CODEC(DoubleDelta, ZSTD(1)),
             val_min       SimpleAggregateFunction(min, Float64)  CODEC(Gorilla, ZSTD(1)),
@@ -44,7 +43,7 @@ pub fn tier_table_ddl(tier_table: &str) -> String {
             last_value    AggregateFunction(argMax, Float64, Int64)
         ) ENGINE = AggregatingMergeTree
         PARTITION BY toYYYYMM(ts)
-        ORDER BY (metric_name, fingerprint, ts)"
+        ORDER BY (fingerprint, ts)"
     )
 }
 
@@ -53,7 +52,7 @@ pub fn tier_table_ddl(tier_table: &str) -> String {
 pub fn tier_mv_ddl(mv_name: &str, tier_table: &str, raw_table: &str) -> String {
     format!(
         "CREATE MATERIALIZED VIEW IF NOT EXISTS {mv_name} TO {tier_table} AS
-        SELECT metric_name, fingerprint,
+        SELECT fingerprint,
                toStartOfInterval(fromUnixTimestamp64Milli(unix_milli), INTERVAL 300 SECOND) AS ts,
                min(value) AS val_min, max(value) AS val_max, sum(value) AS val_sum,
                sum(value * value) AS val_sum_sq, count() AS val_count,
@@ -61,7 +60,7 @@ pub fn tier_mv_ddl(mv_name: &str, tier_table: &str, raw_table: &str) -> String {
                argMinState(value, unix_milli) AS first_value,
                argMaxState(value, unix_milli) AS last_value
         FROM {raw_table}
-        GROUP BY metric_name, fingerprint, ts"
+        GROUP BY fingerprint, ts"
     )
 }
 
@@ -72,7 +71,7 @@ pub fn tier_mv_ddl(mv_name: &str, tier_table: &str, raw_table: &str) -> String {
 fn backfill_chunk_sql(tier_table: &str, raw_table: &str, chunk: usize, chunks: usize) -> String {
     format!(
         "INSERT INTO {tier_table}
-        SELECT metric_name, fingerprint,
+        SELECT fingerprint,
                toStartOfInterval(fromUnixTimestamp64Milli(unix_milli), INTERVAL 300 SECOND) AS ts,
                min(value) AS val_min, max(value) AS val_max, sum(value) AS val_sum,
                sum(value * value) AS val_sum_sq, count() AS val_count,
@@ -81,7 +80,7 @@ fn backfill_chunk_sql(tier_table: &str, raw_table: &str, chunk: usize, chunks: u
                argMaxState(value, unix_milli) AS last_value
         FROM {raw_table}
         WHERE cityHash64(fingerprint) % {chunks} = {chunk}
-        GROUP BY metric_name, fingerprint, ts"
+        GROUP BY fingerprint, ts"
     )
 }
 

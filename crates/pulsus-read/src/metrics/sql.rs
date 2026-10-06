@@ -195,7 +195,7 @@ pub fn series_labels_by_fingerprint(
 /// (whole-`PULSUS_CACHE_WINDOW`) resident superset (#30 handoff AC: the
 /// cache's superset must not leak into a discovery response for a narrower
 /// request window). `filter.metric_name == None` renders no name scope —
-/// "every metric", Prometheus's own `/labels`/`/label/{name}/values`
+/// "every metric", the reference's own `/labels`/`/label/{name}/values`
 /// semantics when `match[]` is omitted (docs/api.md §3.3). Each row
 /// carries its own `metric_name`, which a name-less filter's caller needs
 /// for `__name__`.

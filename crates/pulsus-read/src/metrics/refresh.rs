@@ -80,15 +80,11 @@ pub(crate) async fn run_sweep(cache: &LabelCache) -> Result<(), ChError> {
     let mut by_fingerprint: HashMap<Fingerprint, LabelSet> = HashMap::with_capacity(rows.len());
     let mut by_metric: HashMap<String, Vec<Fingerprint>> = HashMap::new();
     for row in rows {
-        // A fingerprint is shared across metric names (`metric_fingerprint`
-        // excludes `__name__`), so `by_metric` — not `by_fingerprint` — is
-        // where identical-label-set series for different metrics stay
-        // disjoint (architect plan edge case 7: never "dedup" across
-        // metrics). `by_fingerprint` keying on the bare fingerprint is still
-        // well-defined here: two rows sharing a fingerprint carry the exact
-        // same label set (verbatim identity, not merely `==`-equal), so
-        // whichever the sweep saw last simply overwrites with the same
-        // content.
+        // The fingerprint is the series ID, which includes the metric name
+        // (issue #623), so one label set under two names is two IDs and
+        // neither map can merge series across metrics. Statement 2 returns
+        // each ID once; a repeat would carry the same row, so whichever the
+        // sweep saw last overwrites with the same content.
         by_fingerprint.insert(
             row.fingerprint,
             crate::canonical_labels::parse_canonical_label_set(&row.labels),
