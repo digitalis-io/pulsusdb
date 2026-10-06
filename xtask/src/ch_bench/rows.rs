@@ -181,6 +181,22 @@ mod tests {
         const { assert!((HIGH_BIT_FINGERPRINT as u64) > (1u64 << 63)) };
     }
 
+    /// **Every generated metric row's ID lies in its name's range** (issue
+    /// #623): the fetch reads one metric as `fingerprint BETWEEN lo AND
+    /// hi`, so a row outside its name's range is inserted and never read.
+    #[test]
+    fn every_generated_metric_row_falls_in_its_names_range() {
+        for row in gen_metric_rows(5_000, 0, 42) {
+            let (lo, hi) = name_id_range(&row.metric_name);
+            assert!(
+                (lo..=hi).contains(&row.fingerprint),
+                "{} {:#x} outside {lo:#x}..={hi:#x}",
+                row.metric_name,
+                row.fingerprint
+            );
+        }
+    }
+
     #[test]
     fn log_rows_first_row_has_high_bit_fingerprint() {
         let rows = gen_log_rows(10, 0, 42);
