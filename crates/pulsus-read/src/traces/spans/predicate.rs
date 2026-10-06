@@ -16,13 +16,15 @@
 //! `trace:id`, `instrumentation:name`, `instrumentation:version`,
 //! `duration`, `status` and `kind`, resource attributes, and
 //! `resource.service.name` — its string from the span row, every other arm
-//! from the resource row ([`field_terms`]); arithmetic over those fields
-//! and literals ([`Compiler::arith_tuple`]), a literal-only side folded
-//! ([`fold`]), and a boolean-valued side; and `&&`, `||` and `!`. Every
-//! other field and construct is [`PlanError::UnsupportedField`] naming
-//! itself and the issue that serves it. The arms are exhaustive with no
-//! wildcard, so a new `Intrinsic` or `AttrScope` variant fails to compile
-//! here rather than falling into the wrong one.
+//! from the resource row ([`field_terms`]); event and link attributes, the
+//! four event and link intrinsics and the unscoped `.k` — as sets, any
+//! element, `!=` every element ([`Compiler::set_compare`]); arithmetic over
+//! those fields and literals ([`Compiler::arith_tuple`]), a literal-only
+//! side folded ([`fold`]), and a boolean-valued side; and `&&`, `||` and
+//! `!`. Every other field and construct is [`PlanError::UnsupportedField`]
+//! naming itself and the issue that serves it. The arms are exhaustive
+//! with no wildcard, so a new `Intrinsic` or `AttrScope` variant fails to
+//! compile here rather than falling into the wrong one.
 //!
 //! **Four rules worth reading before the code.**
 //!
@@ -210,7 +212,7 @@ pub fn span_membership_sql(spans_table: &str, w: WindowSql, p: &SpanPredicate) -
 // ---------------------------------------------------------------------
 
 /// The issue each deferred construct is served by.
-const PART_3D: &str = "#589 part 3d";
+const PART_3E: &str = "#589 part 3e";
 const NESTED_AND_TRACE: &str = "#594";
 
 /// The refusal every deferred construct takes: it names the construct and
@@ -444,7 +446,7 @@ impl<'a> Compiler<'a> {
                 op: UnaryOp::Not,
                 expr: inner,
             } => match inner.as_ref() {
-                FieldExpr::Field(field) => self.not_field(field, Some(false)),
+                FieldExpr::Field(field) => self.not_field(field, Some(false), false),
                 e if is_arithmetic(e) => Err(not_a_predicate()),
                 // Two-valued: every leaf this compiler emits is non-`NULL`,
                 // so a span lacking the key matches `NOT (E)`.
@@ -475,7 +477,17 @@ impl<'a> Compiler<'a> {
     /// `expression (!<field>) expected a boolean`, as the shipped evaluator
     /// does. The failure is a demand, collected here and lifted out of the
     /// expression by [`Compiler::finish`].
-    fn not_field(&mut self, field: &Field, want: Option<bool>) -> Result<String, PlanError> {
+    ///
+    /// `all` is `(!field) != literal`: an event or link field then matches
+    /// only when it holds the key and EVERY element is `want` — no element
+    /// is its opposite (decision 7 of the part-3d design; the 2026-09-18
+    /// rule of `traceql-event-link-operand-any-match`).
+    fn not_field(
+        &mut self,
+        field: &Field,
+        want: Option<bool>,
+        all: bool,
+    ) -> Result<String, PlanError> {
         let (scope, key) = match field {
             Field::Intrinsic(intrinsic) => {
                 return Err(PlanError::TypeMismatch(format!(
@@ -484,7 +496,7 @@ impl<'a> Compiler<'a> {
             }
             Field::Attribute { scope, key } => (*scope, key),
         };
-        let (matches, condition) = self.not_parts(scope, key, want)?;
+        let (matches, condition) = self.not_parts(scope, key, want, all)?;
         self.demand(
             condition,
             format!("expression (!{scope}{key}) expected a boolean"),
@@ -500,12 +512,13 @@ impl<'a> Compiler<'a> {
         scope: AttrScope,
         key: &str,
         want: Option<bool>,
+        all: bool,
     ) -> Result<(String, String), PlanError> {
         Ok(match scope {
             AttrScope::Span => not_attr(ATTRS, key, want),
             AttrScope::Instrumentation => not_attr(SCOPE_ATTRS, key, want),
-            AttrScope::Event => not_element(EVENT_ATTRS, key, want),
-            AttrScope::Link => not_element(LINK_ATTRS, key, want),
+            AttrScope::Event => not_element(EVENT_ATTRS, key, want, all),
+            AttrScope::Link => not_element(LINK_ATTRS, key, want, all),
             AttrScope::Resource if key == SERVICE_NAME => {
                 self.ctx.ok_or_else(|| needs_window(AttrScope::Resource))?;
                 (
@@ -524,19 +537,24 @@ impl<'a> Compiler<'a> {
                 };
                 (matches, self.resource_subquery(&condition)?)
             }
-            AttrScope::Unscoped => self.not_chain(key, want)?,
+            AttrScope::Unscoped => self.not_chain(key, want, all)?,
         })
     }
 
     /// `!.key`: section 5.1's chain over each scope's `T` and over each
     /// scope's demand condition, both defaulting to `false`.
-    fn not_chain(&mut self, key: &str, want: Option<bool>) -> Result<(String, String), PlanError> {
+    fn not_chain(
+        &mut self,
+        key: &str,
+        want: Option<bool>,
+        all: bool,
+    ) -> Result<(String, String), PlanError> {
         self.ctx.ok_or_else(|| needs_window(AttrScope::Unscoped))?;
         let mut t_args = Vec::with_capacity(2 * CHAIN.len());
         let mut c_args = Vec::with_capacity(2 * CHAIN.len());
         for scope in CHAIN {
             let present = self.chain_presence(scope, key)?;
-            let (t, c) = self.not_parts(scope, key, want)?;
+            let (t, c) = self.not_parts(scope, key, want, all)?;
             t_args.push(present.clone());
             t_args.push(t);
             c_args.push(present);
@@ -743,11 +761,15 @@ impl<'a> Compiler<'a> {
     ///    refused;
     /// 1. `(!field) op literal` is [`Compiler::not_field`];
     /// 2. a lone field against a plain literal is the leaf;
-    /// 3. a lone attribute against a literal-only side that folds to a
-    ///    constant is the leaf over that constant;
+    /// 3. a lone attribute or event and link intrinsic against a
+    ///    literal-only side that folds to a constant is the leaf over that
+    ///    constant, and a set operand ([`is_set_field`]) against one that
+    ///    folds to no value is `false` (decision 8 of the part-3d design);
     /// 4. a deferred operand is refused, pre-order, left side first — after
     ///    the regex operators when both sides are lone fields, which is
-    ///    part 3a's order;
+    ///    part 3a's order; between the two, two lone fields of which either
+    ///    is a set are [`Compiler::set_compare`] (the part-3d design's
+    ///    section 5.6);
     /// 5. a literal-only subtree that folds to no value makes it `false`;
     /// 6. a regex operator takes two string literals and nothing else;
     /// 7. otherwise each side's arms ([`Compiler::side_arms`]) through
@@ -766,10 +788,11 @@ impl<'a> Compiler<'a> {
         check_literals(lhs)?;
         check_literals(rhs)?;
         if let (Some(field), FieldExpr::Literal(value)) = (not_of_field(lhs), rhs) {
-            return self.not_field(field, bool_want(op, value));
+            return self.not_field(field, bool_want(op, value), op == ComparisonOp::Neq);
         }
         if let (FieldExpr::Literal(value), Some(field)) = (lhs, not_of_field(rhs)) {
-            return self.not_field(field, bool_want(flip_comparison(op), value));
+            let op = flip_comparison(op);
+            return self.not_field(field, bool_want(op, value), op == ComparisonOp::Neq);
         }
         match (lhs, rhs) {
             (FieldExpr::Field(field), FieldExpr::Literal(value)) => {
@@ -780,15 +803,23 @@ impl<'a> Compiler<'a> {
             }
             _ => {}
         }
-        if let FieldExpr::Field(field @ Field::Attribute { .. }) = lhs
-            && let Some(value) = fold(rhs)?.constant()
-        {
-            return self.leaf(field, op, &value);
-        }
-        if let FieldExpr::Field(field @ Field::Attribute { .. }) = rhs
-            && let Some(value) = fold(lhs)?.constant()
-        {
-            return self.leaf(field, flip_comparison(op), &value);
+        for (field, other, op) in [(lhs, rhs, op), (rhs, lhs, flip_comparison(op))] {
+            let FieldExpr::Field(field) = field else {
+                continue;
+            };
+            if !folds_to_leaf(field) {
+                continue;
+            }
+            match fold(other)? {
+                Folded::Undefined if is_set_field(field) && literal_only(other) => {
+                    return Ok("false".to_string());
+                }
+                folded => {
+                    if let Some(value) = folded.constant() {
+                        return self.leaf(field, op, &value);
+                    }
+                }
+            }
         }
         let regex = matches!(op, ComparisonOp::Re | ComparisonOp::Nre);
         let two_fields = matches!((lhs, rhs), (FieldExpr::Field(_), FieldExpr::Field(_)));
@@ -796,6 +827,11 @@ impl<'a> Compiler<'a> {
             return Err(PlanError::TypeMismatch(
                 "a field-against-field comparison does not support regex operators".to_string(),
             ));
+        }
+        if let (FieldExpr::Field(l), FieldExpr::Field(r)) = (lhs, rhs)
+            && (is_set_field(l) || is_set_field(r))
+        {
+            return self.set_compare(l, op, r);
         }
         let construct = if two_fields {
             "a field-against-field comparison"
@@ -833,21 +869,7 @@ impl<'a> Compiler<'a> {
         if body == "false" {
             return Ok(body);
         }
-        let binds: Vec<&(String, String)> = l.binds.iter().chain(&r.binds).collect();
-        Ok(match binds.as_slice() {
-            [] => body,
-            [(v, value)] => format!("arrayExists({v} -> {body}, [{value}])"),
-            many => {
-                let vars: Vec<&str> = many.iter().map(|(v, _)| v.as_str()).collect();
-                let values: Vec<String> =
-                    many.iter().map(|(_, value)| format!("[{value}]")).collect();
-                format!(
-                    "arrayExists(({}) -> {body}, {})",
-                    vars.join(", "),
-                    values.join(", ")
-                )
-            }
-        })
+        Ok(bind_values(&l.binds, &r.binds, body))
     }
 
     /// Section 5.1's row 4: the first operand of `expr` this part does not
@@ -903,7 +925,7 @@ impl<'a> Compiler<'a> {
                     .ok_or_else(|| needs_window(AttrScope::Resource)),
                 AttrScope::Event | AttrScope::Link | AttrScope::Unscoped => Err(unsupported(
                     &format!("{construct} with a \"{scope}\" operand"),
-                    PART_3D,
+                    PART_3E,
                 )),
             },
             Field::Intrinsic(intrinsic) => match intrinsic {
@@ -922,7 +944,7 @@ impl<'a> Compiler<'a> {
                 | Intrinsic::LinkSpanId
                 | Intrinsic::LinkTraceId => Err(unsupported(
                     &format!("{construct} with {intrinsic}"),
-                    PART_3D,
+                    PART_3E,
                 )),
                 Intrinsic::NestedSetParent
                 | Intrinsic::NestedSetLeft
@@ -1064,11 +1086,11 @@ impl<'a> Compiler<'a> {
             AttrScope::Event | AttrScope::Link | AttrScope::Unscoped => {
                 return Err(unsupported(
                     &format!("{construct} with a \"{scope}\" operand"),
-                    PART_3D,
+                    PART_3E,
                 ));
             }
         };
-        let (_, condition) = self.not_parts(scope, key, None)?;
+        let (_, condition) = self.not_parts(scope, key, None, false)?;
         self.demand(
             condition,
             format!("expression (!{scope}{key}) expected a boolean"),
@@ -1190,7 +1212,7 @@ impl<'a> Compiler<'a> {
                     }
                     AttrScope::Event | AttrScope::Link | AttrScope::Unscoped => Err(unsupported(
                         &format!("an expression with a \"{scope}\" operand"),
-                        PART_3D,
+                        PART_3E,
                     )),
                 };
             }
@@ -1216,7 +1238,7 @@ impl<'a> Compiler<'a> {
             | Intrinsic::LinkSpanId
             | Intrinsic::LinkTraceId => Err(unsupported(
                 &format!("an expression with {intrinsic}"),
-                PART_3D,
+                PART_3E,
             )),
             Intrinsic::NestedSetParent
             | Intrinsic::NestedSetLeft
@@ -1240,7 +1262,7 @@ impl<'a> Compiler<'a> {
         construct: &str,
     ) -> Result<Arms, PlanError> {
         let unsupported_operand =
-            |what: String| unsupported(&format!("{construct} with {what}"), PART_3D);
+            |what: String| unsupported(&format!("{construct} with {what}"), PART_3E);
         let intrinsic = match field {
             Field::Attribute { scope, key } => {
                 return match scope {
@@ -1306,6 +1328,193 @@ impl<'a> Compiler<'a> {
             | Intrinsic::RootServiceName => Err(unsupported_intrinsic(intrinsic, NESTED_AND_TRACE)),
         }
     }
+
+    /// `L op R`, two lone fields of which at least one is a set (the
+    /// part-3d design's section 5): each operand classified left before
+    /// right — [`Compiler::set_operand`], else [`Compiler::operand_arms`] —
+    /// so a refused or context-less operand is refused as part 3c refuses
+    /// it; then one set against a scalar per element
+    /// ([`element_compare`]) or two sets by their class lists
+    /// ([`class_list_compare`]); then the binding of section 5.5: each
+    /// chain inside the resource values, left outermost.
+    fn set_compare(
+        &mut self,
+        lhs: &Field,
+        op: ComparisonOp,
+        rhs: &Field,
+    ) -> Result<String, PlanError> {
+        const CONSTRUCT: &str = "a field-against-field comparison";
+        let l_set = self.set_operand(lhs, 1)?;
+        let l_scalar = match l_set {
+            Some(_) => None,
+            None => Some(self.operand_arms(lhs, "r1".to_string(), CONSTRUCT)?),
+        };
+        let r_set = self.set_operand(rhs, 2)?;
+        let r_scalar = match r_set {
+            Some(_) => None,
+            None => Some(self.operand_arms(rhs, "r2".to_string(), CONSTRUCT)?),
+        };
+        let pred = match (&l_set, &l_scalar, &r_set, &r_scalar) {
+            (Some(l), _, Some(r), _) => class_list_compare(l, op, r),
+            (Some(l), _, None, Some(r)) => {
+                element_compare(l, op, r, scalar_presence(rhs, "r2").as_deref(), true)
+            }
+            (None, Some(l), Some(r), _) => {
+                element_compare(r, op, l, scalar_presence(lhs, "r1").as_deref(), false)
+            }
+            _ => unreachable!("set_compare is called with at least one set operand"),
+        };
+        if pred == "false" {
+            return Ok(pred);
+        }
+        let mut body = pred;
+        for set in [&r_set, &l_set].into_iter().flatten() {
+            if let Some((var, chain)) = &set.chain {
+                body = format!("arrayExists({var} -> {body}, [{chain}])");
+            }
+        }
+        let arms = |set: &Option<SetOperand>, scalar: &Option<Arms>| -> Vec<(String, String)> {
+            match (set, scalar) {
+                (Some(s), _) => s.arms.binds.clone(),
+                (None, Some(a)) => a.binds.clone(),
+                (None, None) => Vec::new(),
+            }
+        };
+        Ok(bind_values(
+            &arms(&l_set, &l_scalar),
+            &arms(&r_set, &r_scalar),
+            body,
+        ))
+    }
+
+    /// The set `field` reads at position `n` (the part-3d design's section
+    /// 5.1), or `None` for a scalar field. **No wildcard arm**.
+    fn set_operand(&mut self, field: &Field, n: usize) -> Result<Option<SetOperand>, PlanError> {
+        let var = format!("e{n}");
+        let intrinsic = match field {
+            Field::Attribute { scope, key } => {
+                return match scope {
+                    AttrScope::Span | AttrScope::Instrumentation | AttrScope::Resource => Ok(None),
+                    AttrScope::Event => Ok(Some(SetOperand::attribute(EVENT_ATTRS, key, var))),
+                    AttrScope::Link => Ok(Some(SetOperand::attribute(LINK_ATTRS, key, var))),
+                    AttrScope::Unscoped => self.chain_set(key, n).map(Some),
+                };
+            }
+            Field::Intrinsic(intrinsic) => *intrinsic,
+        };
+        let intrinsic_set = |array: &str, count: &str, read: Read| {
+            let element = Arms {
+                s: (read == Read::Str).then(|| var.clone()),
+                i: (read == Read::Int).then(|| var.clone()),
+                ..Arms::default()
+            };
+            Some(SetOperand {
+                array: array.to_string(),
+                var: var.clone(),
+                arms: element,
+                count: count.to_string(),
+                lists: vec![(read, array.to_string())],
+                chain: None,
+                presence: None,
+            })
+        };
+        Ok(match intrinsic {
+            Intrinsic::EventName => intrinsic_set("events.name", "length(events.name)", Read::Str),
+            Intrinsic::EventTimeSinceStart => intrinsic_set(
+                "arrayMap(t -> toInt128(t) - start_ns, events.time_ns)",
+                "length(events.time_ns)",
+                Read::Int,
+            ),
+            Intrinsic::LinkSpanId => intrinsic_set(
+                "arrayMap(h -> lower(hex(h)), links.span_id)",
+                "length(links.span_id)",
+                Read::Str,
+            ),
+            Intrinsic::LinkTraceId => intrinsic_set(
+                "arrayMap(h -> lower(hex(h)), links.trace_id)",
+                "length(links.trace_id)",
+                Read::Str,
+            ),
+            Intrinsic::Name
+            | Intrinsic::StatusMessage
+            | Intrinsic::SpanId
+            | Intrinsic::ParentId
+            | Intrinsic::TraceId
+            | Intrinsic::InstrumentationName
+            | Intrinsic::InstrumentationVersion
+            | Intrinsic::Duration
+            | Intrinsic::Status
+            | Intrinsic::Kind
+            | Intrinsic::NestedSetParent
+            | Intrinsic::NestedSetLeft
+            | Intrinsic::NestedSetRight
+            | Intrinsic::ChildCount
+            | Intrinsic::TraceDuration
+            | Intrinsic::RootName
+            | Intrinsic::RootServiceName => None,
+        })
+    }
+
+    /// `.key` at position `n` as a set (the part-3d design's section 5.4):
+    /// `c<n>` bound to `C(k)`, the elements of the first scope holding the
+    /// key, which reads the resource value bound to `r<n>`.
+    ///
+    /// Each scope's values are concatenated into one array with a tag
+    /// naming the scope, and the elements whose tag is `SC(k)`, the first
+    /// scope holding the key, are kept. The engine's direct forms — a
+    /// `multiIf` or `if` choosing among `Array(Dynamic)` values — fail on
+    /// 26.3.29.7 with `Code: 36 … Variant type should have at least one
+    /// nested type`. At `service.name` a string is taken from the span row
+    /// and every other arm from the resource row, as part 3b's operand
+    /// does; the arm not taken is tagged 9, which `SC(k)` never answers.
+    fn chain_set(&mut self, key: &str, n: usize) -> Result<SetOperand, PlanError> {
+        self.ctx.ok_or_else(|| needs_window(AttrScope::Unscoped))?;
+        let q = self.resource_read(key)?;
+        let r = format!("r{n}");
+        let (span, events, links, scope) = (
+            attr_path(ATTRS, key),
+            attr_path(EVENT_ATTRS, key),
+            attr_path(LINK_ATTRS, key),
+            attr_path(SCOPE_ATTRS, key),
+        );
+        let (resource_present, resource_values, resource_tags) = if key == SERVICE_NAME {
+            (
+                format!("({SERVICE_IS_STRING} OR dynamicType({r}) != 'None')"),
+                format!("[CAST(CAST(service, 'String'), 'Dynamic')], [{r}]"),
+                format!("[if({SERVICE_IS_STRING}, 2, 9)], [if({SERVICE_IS_STRING}, 9, 2)]"),
+            )
+        } else {
+            (
+                format!("dynamicType({r}) != 'None'"),
+                format!("[{r}]"),
+                "[2]".to_string(),
+            )
+        };
+        let tag = format!(
+            "multiIf(dynamicType({span}) != 'None', 1, {resource_present}, 2, arrayExists(d -> \
+             dynamicType(d) != 'None', {events}), 3, arrayExists(d -> dynamicType(d) != 'None', \
+             {links}), 4, dynamicType({scope}) != 'None', 5, 0)"
+        );
+        let chain = format!(
+            "arrayFilter((d, g) -> g = {tag} AND dynamicType(d) != 'None', arrayConcat([{span}], \
+             {resource_values}, {events}, {links}, [{scope}]), arrayConcat([1], {resource_tags}, \
+             arrayMap(d -> 3, {events}), arrayMap(d -> 4, {links}), [5]))"
+        );
+        let c = format!("c{n}");
+        let var = format!("e{n}");
+        Ok(SetOperand {
+            array: c.clone(),
+            arms: Arms {
+                binds: vec![(r, resource_value(&q))],
+                ..element_arms(&var)
+            },
+            var,
+            count: format!("length({c})"),
+            lists: dynamic_lists(&c),
+            presence: Some(format!("notEmpty({c})")),
+            chain: Some((c, chain)),
+        })
+    }
 }
 
 /// The scopes of the unscoped chain, in the order a span's one value is
@@ -1337,13 +1546,24 @@ fn not_attr(root: &str, key: &str, want: Option<bool>) -> (String, String) {
 
 /// `!event.key` / `!link.key`'s two halves, each any-match over the
 /// elements: some element IS `want`, and some element holds a
-/// non-boolean.
-fn not_element(root: &str, key: &str, want: Option<bool>) -> (String, String) {
+/// non-boolean. With `all`, the match is every element: the key is held
+/// and no element is `!want` (decision 7 of the part-3d design).
+fn not_element(root: &str, key: &str, want: Option<bool>, all: bool) -> (String, String) {
     let path = attr_path(root, key);
     (
         want.map_or_else(
             || "false".to_string(),
-            |w| format!("arrayExists(b -> coalesce(b = {w}, false), {path}.:Bool)"),
+            |w| {
+                if all {
+                    format!(
+                        "(arrayExists(d -> dynamicType(d) != 'None', {path}) AND NOT \
+                         arrayExists(b -> coalesce(b = {}, false), {path}.:Bool))",
+                        !w
+                    )
+                } else {
+                    format!("arrayExists(b -> coalesce(b = {w}, false), {path}.:Bool)")
+                }
+            },
         ),
         format!("arrayExists(d -> dynamicType(d) != 'None' AND dynamicType(d) != 'Bool', {path})"),
     )
@@ -1795,6 +2015,375 @@ fn field_terms(l: &Arms, op: ComparisonOp, r: &Arms) -> String {
         "false".to_string()
     } else {
         format!("({})", terms.join(" OR "))
+    }
+}
+
+/// The values a comparison binds — an operand read from the resource row,
+/// an arithmetic side, a chain's resource value — left then right, each to
+/// its variable once: the body is a lambda applied to one-element arrays.
+fn bind_values(left: &[(String, String)], right: &[(String, String)], body: String) -> String {
+    let binds: Vec<&(String, String)> = left.iter().chain(right).collect();
+    match binds.as_slice() {
+        [] => body,
+        [(v, value)] => format!("arrayExists({v} -> {body}, [{value}])"),
+        many => {
+            let vars: Vec<&str> = many.iter().map(|(v, _)| v.as_str()).collect();
+            let values: Vec<String> = many.iter().map(|(_, value)| format!("[{value}]")).collect();
+            format!(
+                "arrayExists(({}) -> {body}, {})",
+                vars.join(", "),
+                values.join(", ")
+            )
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// event, link and unscoped operands: sets
+// ---------------------------------------------------------------------
+
+/// Whether `field` is a set operand (the part-3d design's section 5.1): an
+/// `event.`, `link.` or `.` attribute, or one of the four event and link
+/// intrinsics. **No wildcard arm**.
+fn is_set_field(field: &Field) -> bool {
+    match field {
+        Field::Attribute { scope, .. } => match scope {
+            AttrScope::Event | AttrScope::Link | AttrScope::Unscoped => true,
+            AttrScope::Span | AttrScope::Instrumentation | AttrScope::Resource => false,
+        },
+        Field::Intrinsic(intrinsic) => is_set_intrinsic(*intrinsic),
+    }
+}
+
+/// The four event and link intrinsics. **No wildcard arm**.
+fn is_set_intrinsic(intrinsic: Intrinsic) -> bool {
+    match intrinsic {
+        Intrinsic::EventName
+        | Intrinsic::EventTimeSinceStart
+        | Intrinsic::LinkSpanId
+        | Intrinsic::LinkTraceId => true,
+        Intrinsic::Name
+        | Intrinsic::StatusMessage
+        | Intrinsic::SpanId
+        | Intrinsic::ParentId
+        | Intrinsic::TraceId
+        | Intrinsic::InstrumentationName
+        | Intrinsic::InstrumentationVersion
+        | Intrinsic::Duration
+        | Intrinsic::Status
+        | Intrinsic::Kind
+        | Intrinsic::NestedSetParent
+        | Intrinsic::NestedSetLeft
+        | Intrinsic::NestedSetRight
+        | Intrinsic::ChildCount
+        | Intrinsic::TraceDuration
+        | Intrinsic::RootName
+        | Intrinsic::RootServiceName => false,
+    }
+}
+
+/// Whether a lone `field` opposite a literal-only side that folds to a
+/// constant is the leaf over that constant: any attribute, and the four
+/// event and link intrinsics (decision 8 of the part-3d design).
+fn folds_to_leaf(field: &Field) -> bool {
+    match field {
+        Field::Attribute { .. } => true,
+        Field::Intrinsic(intrinsic) => is_set_intrinsic(*intrinsic),
+    }
+}
+
+/// Whether `expr` holds literals and arithmetic only.
+fn literal_only(expr: &FieldExpr) -> bool {
+    match expr {
+        FieldExpr::Literal(_) => true,
+        FieldExpr::Binary {
+            op: FieldOp::Arith(_),
+            lhs,
+            rhs,
+        } => literal_only(lhs) && literal_only(rhs),
+        FieldExpr::Unary {
+            op: UnaryOp::Neg,
+            expr: inner,
+        } => literal_only(inner),
+        FieldExpr::Field(_)
+        | FieldExpr::Exists { .. }
+        | FieldExpr::Unary {
+            op: UnaryOp::Not, ..
+        }
+        | FieldExpr::Binary {
+            op: FieldOp::Cmp(_) | FieldOp::Bool(_),
+            ..
+        } => false,
+    }
+}
+
+/// Every typed read an attribute element can be, in the order the lists
+/// of a set are built.
+const ELEMENT_READS: [Read; 8] = [
+    Read::Str,
+    Read::Int,
+    Read::Float,
+    Read::Bool,
+    Read::StrArray,
+    Read::IntArray,
+    Read::FloatArray,
+    Read::BoolArray,
+];
+
+/// One set operand of the part-3d design's section 5.1.
+///
+/// `array` is `S`, iterated by `var`, `e<n>`; `arms` are the element's
+/// typed reads, with a chain's resource value in `binds`; `count` is
+/// `|S|` and `lists` its elements by type (section 5.3); `chain` is a
+/// chain's variable `c<n>` and `C(k)`; `presence` the chain's own
+/// `notEmpty(c<n>)`. An event, link or intrinsic set has no presence: an
+/// empty one satisfies `!=` (decision 1).
+struct SetOperand {
+    array: String,
+    var: String,
+    arms: Arms,
+    count: String,
+    lists: Vec<(Read, String)>,
+    chain: Option<(String, String)>,
+    presence: Option<String>,
+}
+
+impl SetOperand {
+    /// `event.key` or `link.key`: the elements holding the key.
+    fn attribute(root: &str, key: &str, var: String) -> SetOperand {
+        let path = attr_path(root, key);
+        SetOperand {
+            array: format!("arrayFilter(d -> dynamicType(d) != 'None', {path})"),
+            arms: element_arms(&var),
+            var,
+            count: format!("arrayCount(d -> dynamicType(d) != 'None', {path})"),
+            lists: dynamic_lists(&path),
+            chain: None,
+            presence: None,
+        }
+    }
+
+    fn list(&self, read: Read) -> Option<&str> {
+        self.lists
+            .iter()
+            .find(|(r, _)| *r == read)
+            .map(|(_, text)| text.as_str())
+    }
+}
+
+/// The arms of an element of a `Dynamic` array, bound to `var`: every
+/// class read from it, every one `Nullable`.
+fn element_arms(var: &str) -> Arms {
+    let read = |r: Read| Some(format!("dynamicElement({var}, '{}')", r.type_name()));
+    Arms {
+        s: read(Read::Str),
+        i: read(Read::Int),
+        f: read(Read::Float),
+        b: read(Read::Bool),
+        st: None,
+        kd: None,
+        sa: read(Read::StrArray),
+        ia: read(Read::IntArray),
+        fa: read(Read::FloatArray),
+        ba: read(Read::BoolArray),
+        nullable: true,
+        types: None,
+        s_on_span_row: false,
+        binds: Vec::new(),
+    }
+}
+
+/// A `Dynamic` array's elements of each type, one list per type.
+fn dynamic_lists(array: &str) -> Vec<(Read, String)> {
+    ELEMENT_READS
+        .iter()
+        .map(|read| {
+            let t = read.type_name();
+            (
+                *read,
+                format!(
+                    "arrayMap(d -> dynamicElement(d, '{t}'), arrayFilter(d -> dynamicType(d) = \
+                     '{t}', {array}))"
+                ),
+            )
+        })
+        .collect()
+}
+
+/// A scalar operand's presence, which `!=` against a set requires (the
+/// part-3d design's section 5.1): `var` is the variable a resource value
+/// is bound to. An intrinsic has none. **No wildcard arm**.
+fn scalar_presence(field: &Field, var: &str) -> Option<String> {
+    match field {
+        Field::Attribute { scope, key } => match scope {
+            AttrScope::Span => Some(format!("dynamicType({}) != 'None'", attr_path(ATTRS, key))),
+            AttrScope::Instrumentation => Some(format!(
+                "dynamicType({}) != 'None'",
+                attr_path(SCOPE_ATTRS, key)
+            )),
+            AttrScope::Resource if key == SERVICE_NAME => Some(format!(
+                "({SERVICE_IS_STRING} OR dynamicType({var}) != 'None')"
+            )),
+            AttrScope::Resource => Some(format!("dynamicType({var}) != 'None'")),
+            AttrScope::Event | AttrScope::Link | AttrScope::Unscoped => None,
+        },
+        Field::Intrinsic(_) => None,
+    }
+}
+
+/// One set against a scalar (the part-3d design's section 5.2): part 3a's
+/// terms between the element and the scalar. Any element, for every
+/// operator but `!=`; `!=` every element, after the presences — the
+/// chain's and the scalar's, in the written order — so an empty event or
+/// link set satisfies it and an absent scalar or a chain held nowhere
+/// does not. With no term, `false`.
+fn element_compare(
+    set: &SetOperand,
+    op: ComparisonOp,
+    scalar: &Arms,
+    scalar_presence: Option<&str>,
+    set_on_left: bool,
+) -> String {
+    let body = if set_on_left {
+        field_terms(&set.arms, op, scalar)
+    } else {
+        field_terms(scalar, op, &set.arms)
+    };
+    if body == "false" {
+        return body;
+    }
+    let (var, array) = (&set.var, &set.array);
+    if op != ComparisonOp::Neq {
+        return format!("arrayExists({var} -> {body}, {array})");
+    }
+    let presences: Vec<&str> = if set_on_left {
+        [set.presence.as_deref(), scalar_presence]
+    } else {
+        [scalar_presence, set.presence.as_deref()]
+    }
+    .into_iter()
+    .flatten()
+    .collect();
+    let all = format!("arrayAll({var} -> {body}, {array})");
+    if presences.is_empty() {
+        all
+    } else {
+        format!("({} AND {all})", presences.join(" AND "))
+    }
+}
+
+/// Two sets (the part-3d design's section 5.3): every pair of elements,
+/// one from each, by part 3a's type pairs over each set's lists of one
+/// type. Any pair, for every operator but `!=`; `!=` every pair, by
+/// counting the pairs that satisfy it against `|L| × |R|`, so no pairs
+/// satisfies it. The count is exact: each element has one stored type and
+/// each pair of types at most one term, so a pair of elements is counted
+/// at most once, and a pair with no term — two arrays, a string against a
+/// number — is not counted. With no term at all, `false`.
+///
+/// Comparing each pair through part 3a's per-element terms costs about 94
+/// ns a pair against 4.6 ns for the lists (26.3.29.7, the part-3d design's
+/// section 3.2).
+fn class_list_compare(l: &SetOperand, op: ComparisonOp, r: &SetOperand) -> String {
+    let sym = sql_op(op).expect("the caller has already excluded the regex operators");
+    let ordered = !matches!(op, ComparisonOp::Eq | ComparisonOp::Neq);
+    let neq = op == ComparisonOp::Neq;
+    let coalesced = l.arms.nullable || r.arms.nullable;
+    let cmp = |lc: Class, rc: Class, a: &str, b: &str| {
+        let c = format!("{} {sym} {}", pair_side(lc, rc, a), pair_side(rc, lc, b));
+        if coalesced {
+            format!("coalesce({c}, false)")
+        } else {
+            format!("({c})")
+        }
+    };
+    let mut terms = Vec::new();
+    for (lc, rc) in SCALAR_PAIRS {
+        if ordered && !lc.is_ordered() {
+            continue;
+        }
+        let (Some(lr), Some(rr)) = (lc.scalar_read(), rc.scalar_read()) else {
+            continue;
+        };
+        let (Some(ll), Some(rl)) = (l.list(lr), r.list(rr)) else {
+            continue;
+        };
+        terms.push(if neq {
+            format!(
+                "arraySum(p -> arrayCount(q -> {}, {rl}), {ll})",
+                cmp(lc, rc, "p", "q")
+            )
+        } else {
+            format!(
+                "arrayExists(x -> arrayExists(y -> {}, {rl}), {ll})",
+                cmp(lc, rc, "x", "y")
+            )
+        });
+    }
+    // An array element on the right: the left's scalar element against
+    // each of its elements.
+    for (c, e) in ARRAY_PAIRS {
+        if ordered && !c.is_ordered() {
+            continue;
+        }
+        let (Some(lr), Some(rr)) = (c.scalar_read(), e.array_read()) else {
+            continue;
+        };
+        let (Some(ll), Some(rl)) = (l.list(lr), r.list(rr)) else {
+            continue;
+        };
+        terms.push(if neq {
+            format!(
+                "arraySum(p -> arrayCount(q -> (notEmpty(q) AND arrayAll(x -> {}, q)), {rl}), \
+                 {ll})",
+                cmp(c, e, "p", "x")
+            )
+        } else {
+            format!(
+                "arrayExists(x -> arrayExists(w -> arrayExists(y -> {}, w), {rl}), {ll})",
+                cmp(c, e, "x", "y")
+            )
+        });
+    }
+    // An array element on the left.
+    for (c, e) in ARRAY_PAIRS {
+        if ordered && !c.is_ordered() {
+            continue;
+        }
+        let (Some(lr), Some(rr)) = (e.array_read(), c.scalar_read()) else {
+            continue;
+        };
+        let (Some(ll), Some(rl)) = (l.list(lr), r.list(rr)) else {
+            continue;
+        };
+        terms.push(if neq {
+            format!(
+                "arraySum(p -> arrayCount(q -> (notEmpty(p) AND arrayAll(x -> {}, p)), {rl}), \
+                 {ll})",
+                cmp(e, c, "x", "q")
+            )
+        } else {
+            format!(
+                "arrayExists(u -> arrayExists(x -> arrayExists(y -> {}, {rl}), u), {ll})",
+                cmp(e, c, "x", "y")
+            )
+        });
+    }
+    if terms.is_empty() {
+        return "false".to_string();
+    }
+    if !neq {
+        return format!("({})", terms.join(" OR "));
+    }
+    let all = format!("(({}) = {} * {})", terms.join(" + "), l.count, r.count);
+    let presences: Vec<&str> = [l.presence.as_deref(), r.presence.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect();
+    if presences.is_empty() {
+        all
+    } else {
+        format!("({} AND {all})", presences.join(" AND "))
     }
 }
 
