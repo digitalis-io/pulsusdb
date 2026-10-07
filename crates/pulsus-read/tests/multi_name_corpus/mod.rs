@@ -78,8 +78,14 @@ fn jitter(s: u32, i: i64) -> i64 {
 
 /// The corpus, anchored so the range ends at `t_end`.
 pub fn multi_name_corpus(t_end: i64) -> Vec<SeedSeries> {
+    multi_name_corpus_of(t_end, SCRAPES)
+}
+
+/// The corpus over `scrapes` scrapes ending at `t_end`: the design's
+/// measurement uses 5,820, 24 h 15 min.
+pub fn multi_name_corpus_of(t_end: i64, scrapes: i64) -> Vec<SeedSeries> {
     let stale = f64::from_bits(STALE_NAN_BITS);
-    let first = t_end - (SCRAPES - 1) * SCRAPE_MS;
+    let first = t_end - (scrapes - 1) * SCRAPE_MS;
     let mut out = Vec::new();
     let mut idx = 0u32;
     let mut s = 0u32;
@@ -99,7 +105,7 @@ pub fn multi_name_corpus(t_end: i64) -> Vec<SeedSeries> {
                     0
                 };
                 let mut samples = Vec::new();
-                for i in 0..SCRAPES {
+                for i in 0..scrapes {
                     let ts = first + i * SCRAPE_MS + jitter(s, i);
                     if ts > t_end {
                         continue;
@@ -145,7 +151,7 @@ pub fn multi_name_corpus(t_end: i64) -> Vec<SeedSeries> {
         for k in 0..2 {
             payload += 1;
             let l = labels(k);
-            let samples = (0..SCRAPES)
+            let samples = (0..scrapes)
                 .map(|i| {
                     let ts = first + i * SCRAPE_MS;
                     let in_hour = ts > t_end - 90 * 60_000 && ts <= t_end - 30 * 60_000;
@@ -174,7 +180,7 @@ pub fn multi_name_corpus(t_end: i64) -> Vec<SeedSeries> {
             fp: fp(name, &l),
             metric: name.to_string(),
             labels: l,
-            samples: (0..SCRAPES)
+            samples: (0..scrapes)
                 .map(|i| (first + i * SCRAPE_MS, i as f64 * 2.0))
                 .collect(),
             hist: if name == "hmix_b" {
