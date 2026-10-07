@@ -1112,6 +1112,56 @@ async fn metric_landing_and_its_views_exist_after_init() {
     drop_database(&client, db).await;
 }
 
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct FingerprintCodecRow {
+    table: String,
+    compression_codec: String,
+}
+
+/// **T4 (issue #635): the two sample tables' `fingerprint` is `ZSTD(1)`
+/// alone**, and no other metrics table's codec moved. Read from the
+/// server's catalogue, so it is the codec the tables carry, not the text.
+#[tokio::test]
+async fn the_sample_tables_fingerprint_codec_is_zstd() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_fp_codec");
+    drop_database(&client, db).await;
+    run_init(&client, &test_ctx(db)).await.expect("run_init");
+
+    let sql = format!(
+        "SELECT table, compression_codec FROM system.columns \
+         WHERE database = '{db}' AND name = 'fingerprint' AND startsWith(table, 'metric_') \
+           AND table IN (SELECT name FROM system.tables \
+                         WHERE database = '{db}' AND engine != 'MaterializedView') \
+         ORDER BY table"
+    );
+    let mut stream = client
+        .query_stream::<FingerprintCodecRow>(&sql, &QuerySettings::new())
+        .await
+        .expect("query system.columns");
+    let mut seen: Vec<(String, String)> = Vec::new();
+    while let Some(row) = stream.next().await {
+        let row = row.expect("decode FingerprintCodecRow");
+        seen.push((row.table, row.compression_codec));
+    }
+    drop(stream);
+
+    let want: Vec<(String, String)> = [
+        ("metric_hist_samples", "CODEC(ZSTD(1))"),
+        ("metric_labels", "CODEC(Delta(8), ZSTD(1))"),
+        ("metric_landing", "CODEC(Delta(8), ZSTD(1))"),
+        ("metric_samples", "CODEC(ZSTD(1))"),
+        ("metric_series", "CODEC(ZSTD(1))"),
+    ]
+    .iter()
+    .map(|(t, c)| (t.to_string(), c.to_string()))
+    .collect();
+    assert_eq!(seen, want, "every metrics table's fingerprint codec");
+
+    drop_database(&client, db).await;
+}
+
 /// `IF NOT EXISTS` is what makes a re-run safe when a creation committed and
 /// its response was lost: an existing landing table is adopted, `run_init`
 /// returns `Ok`, and the migration is recorded. Without it the retry fails

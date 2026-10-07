@@ -30,7 +30,7 @@
       "fingerprint_xx64": "17241709254077376921",
       "labels": [],
       "name": "empty",
-      "series_fingerprint128": "279312807052667565677626197582573968815",
+      "series_fingerprint128": "279312804517366365221167394589167558063",
       "series_name": "up"
     },
     {
@@ -50,7 +50,7 @@
         ]
       ],
       "name": "excludes_name",
-      "series_fingerprint128": "86200611816547018084146446461867939250",
+      "series_fingerprint128": "86200614827217193626191275016538052018",
       "series_name": "http_requests_total"
     },
     {
@@ -74,7 +74,7 @@
         ]
       ],
       "name": "multi_label",
-      "series_fingerprint128": "205871547830026044716163683647279404759",
+      "series_fingerprint128": "205871532776675167005939540873928840919",
       "series_name": ""
     }
   ],

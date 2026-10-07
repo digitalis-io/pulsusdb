@@ -154,7 +154,7 @@ pub fn raw_cityhash64(buf: &[u8]) -> u64 {
 /// #623): the top bits of `cityHash64(metric_name)`. A metric's series
 /// share it, so under `ORDER BY (fingerprint, unix_milli)` one metric's
 /// samples sit together, as they did when `metric_name` led the key.
-pub const SERIES_NAME_PREFIX_BITS: u32 = 24;
+pub const SERIES_NAME_PREFIX_BITS: u32 = 32;
 
 /// The bits of a series ID below the name prefix: the identity.
 const SERIES_BODY_BITS: u32 = 128 - SERIES_NAME_PREFIX_BITS;
@@ -228,6 +228,38 @@ mod tests {
         let mut want = b"up\xff".to_vec();
         want.extend(build_metric_buffer(&ab));
         assert_eq!(build_series_buffer("up", &ab), want);
+    }
+
+    /// **T2 (issue #635): the name prefix is 32 bits.** The expectation
+    /// is written with literal widths, not through
+    /// [`SERIES_NAME_PREFIX_BITS`], so a wrong constant cannot satisfy it.
+    /// `m_766` and `m_48314` share the top 24 bits of their name hash and
+    /// not the top 32, so at 32 bits their IDs sit in different ranges.
+    #[test]
+    fn the_prefix_is_32_bits_of_the_name_hash() {
+        let job_a = labels(&[("job", "a")]);
+        let raw = |name: &str| -> u128 {
+            series_fingerprint(name, &job_a)
+                .sql_literal()
+                .to_string()
+                .trim_start_matches("toUInt128('")
+                .trim_end_matches("')")
+                .parse()
+                .expect("a decimal ID")
+        };
+        for name in ["m_766", "m_48314"] {
+            assert_eq!(
+                raw(name) >> 96,
+                u128::from(raw_cityhash64(name.as_bytes()) >> 32),
+                "{name}: the top 32 bits of the ID are the top 32 bits of the name's cityHash64"
+            );
+        }
+        assert_eq!(
+            raw_cityhash64(b"m_766") >> 40,
+            raw_cityhash64(b"m_48314") >> 40,
+            "the pair shares a 24-bit prefix"
+        );
+        assert_ne!(raw("m_766") >> 96, raw("m_48314") >> 96);
     }
 
     fn labels(pairs: &[(&str, &str)]) -> LabelSet {
