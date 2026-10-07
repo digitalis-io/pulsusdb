@@ -79,7 +79,7 @@
 
 use pulsus_model::FpLiteral;
 
-use super::grouped::{Grid, GroupedOp};
+use super::grouped::{Grid, GroupedOp, PushedRangeFn, RangeAggOp};
 use super::sample_sql;
 
 /// The `reinterpretAsUInt64` bit pattern of Prometheus's stale marker
@@ -246,6 +246,39 @@ pub fn grouped_fetch(
          GROUP BY gid, run\n\
          ORDER BY gid, gi_start"
     )
+}
+
+/// Issue #579: one shape-A statement (plan section 3.1) for one time
+/// chunk of one node: one row per group per grid index, `SELECT gid, gi,
+/// agg`, and one sentinel row whose `gid` is
+/// [`super::grouped::HISTOGRAM_SENTINEL_GID`] carrying the count of
+/// histogram samples in the window.
+///
+/// The window is `(grid start - range, grid end]`. The caller has
+/// established that the grid arithmetic cannot overflow
+/// ([`super::grouped::node_verdicts`] owns that guard).
+#[allow(clippy::too_many_arguments)]
+pub fn range_aggregate_fetch(
+    samples_table: &str,
+    hist_samples_table: &str,
+    fps: &[FpLiteral],
+    gids: &[u32],
+    grid: Grid,
+    range_ms: i64,
+    op: RangeAggOp,
+    func: PushedRangeFn,
+) -> String {
+    let _ = (
+        samples_table,
+        hist_samples_table,
+        fps,
+        gids,
+        grid,
+        range_ms,
+        op,
+        func,
+    );
+    String::new()
 }
 
 #[cfg(test)]
@@ -477,5 +510,133 @@ mod tests {
         ] {
             assert!(!sql(op).contains("AS (SELECT"), "{op:?}");
         }
+    }
+
+    // ------------------------------------------------ issue #579, shape A
+
+    const RANGE_GOLDEN: &str = include_str!("../../tests/golden/range_aggregate_statements.txt");
+
+    fn range_sql(op: RangeAggOp, func: PushedRangeFn) -> String {
+        range_aggregate_fetch(
+            "metric_samples",
+            "metric_hist_samples",
+            &[
+                Fingerprint::from_raw(101).sql_literal(),
+                Fingerprint::from_raw(205).sql_literal(),
+                Fingerprint::from_raw(990).sql_literal(),
+            ],
+            &[0, 1, 0],
+            grid(),
+            300_000,
+            op,
+            func,
+        )
+    }
+
+    /// The golden's sections, keyed by their `<op> <func>` marker.
+    fn range_golden() -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut parts = RANGE_GOLDEN.split("-- golden[").skip(1);
+        for part in parts.by_ref() {
+            let (key, body) = part.split_once("]\n").expect("a marker line");
+            out.push((
+                key.to_string(),
+                body.strip_suffix('\n')
+                    .expect("a section ends in a newline")
+                    .to_string(),
+            ));
+        }
+        out
+    }
+
+    /// Every function under `sum`, and every aggregation under `rate`,
+    /// renders the statement the design's generator wrote, byte for byte.
+    #[test]
+    fn each_range_function_and_aggregation_renders_the_designs_statement() {
+        let golden = range_golden();
+        assert_eq!(golden.len(), 7, "seven sections in the golden");
+        for (key, want) in golden {
+            let (op, func) = key.split_once(' ').expect("<op> <func>");
+            let op = match op {
+                "sum" => RangeAggOp::Sum,
+                "avg" => RangeAggOp::Avg,
+                "count" => RangeAggOp::Count,
+                "min" => RangeAggOp::Min,
+                "max" => RangeAggOp::Max,
+                other => panic!("unknown op {other}"),
+            };
+            let func = match func {
+                "rate" => PushedRangeFn::Rate,
+                "irate" => PushedRangeFn::Irate,
+                "increase" => PushedRangeFn::Increase,
+                other => panic!("unknown function {other}"),
+            };
+            assert_eq!(range_sql(op, func), want, "{key}");
+        }
+    }
+
+    /// The window is `(grid start - range, grid end]` on both tables, and
+    /// the stale literal is the model's stale marker.
+    #[test]
+    fn the_range_statement_reads_its_window_and_drops_stale_markers() {
+        let s = range_sql(RangeAggOp::Sum, PushedRangeFn::Rate);
+        let window = sample_sql::window_predicate(1_782_906_900_000, 1_782_910_800_000);
+        assert_eq!(s.matches(&window).count(), 2, "both tables, one window");
+        assert!(s.contains(&format!(
+            "reinterpretAsUInt64(value) != {}",
+            pulsus_model::STALE_NAN_BITS
+        )));
+    }
+
+    /// The grouping reaches the statement only through `gids`, and the
+    /// sentinel row is in every statement.
+    #[test]
+    fn the_range_statement_carries_the_grouping_only_in_gids_and_always_a_sentinel() {
+        for op in [
+            RangeAggOp::Sum,
+            RangeAggOp::Avg,
+            RangeAggOp::Count,
+            RangeAggOp::Min,
+            RangeAggOp::Max,
+        ] {
+            for func in [
+                PushedRangeFn::Rate,
+                PushedRangeFn::Irate,
+                PushedRangeFn::Increase,
+            ] {
+                let s = range_sql(op, func);
+                assert!(
+                    s.contains("SELECT toUInt32(4294967295) AS gid, toUInt32(0) AS gi,"),
+                    "{op:?} {func:?}"
+                );
+                assert!(!s.contains("metric_name"), "{op:?} {func:?}");
+                assert!(!s.contains("AS (SELECT"), "{op:?} {func:?}");
+                let other = range_aggregate_fetch(
+                    "metric_samples",
+                    "metric_hist_samples",
+                    &[
+                        Fingerprint::from_raw(101).sql_literal(),
+                        Fingerprint::from_raw(205).sql_literal(),
+                        Fingerprint::from_raw(990).sql_literal(),
+                    ],
+                    &[0, 0, 0],
+                    grid(),
+                    300_000,
+                    op,
+                    func,
+                );
+                assert_eq!(
+                    s.replace("[0, 1, 0], 'Array(UInt32)'", "[0, 0, 0], 'Array(UInt32)'"),
+                    other,
+                    "{op:?} {func:?}"
+                );
+            }
+        }
+    }
+
+    /// The sentinel id is the one the reader looks for.
+    #[test]
+    fn the_sentinel_id_is_the_readers() {
+        assert_eq!(super::super::grouped::HISTOGRAM_SENTINEL_GID, 4_294_967_295);
     }
 }

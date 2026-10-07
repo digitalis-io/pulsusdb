@@ -42,6 +42,18 @@ pub struct GroupedCountRow {
     pub agg: u32,
 }
 
+/// Issue #579: one row of a shape-A statement
+/// ([`super::grouped_sql::range_aggregate_fetch`]): `SELECT gid, gi, agg`.
+/// The row whose `gid` is [`super::grouped::HISTOGRAM_SENTINEL_GID`]
+/// carries the window's histogram sample count in `agg` and is never part
+/// of the answer.
+#[derive(Debug, Clone, Copy, Row, Serialize, Deserialize)]
+pub struct RangeAggRow {
+    pub gid: u32,
+    pub gi: u32,
+    pub agg: f64,
+}
+
 impl GroupedRunRow {
     pub fn into_run(self) -> super::grouped::Run {
         super::grouped::Run {

@@ -508,6 +508,12 @@ pub struct MetricsEngine {
     /// nobody has checked. Read at ONE site, `build_grouped_sqls`; the
     /// sample fetch's own chunker is untouched by it.
     grouped_chunk_size: usize,
+    /// TEST SEAM (issue #579): the largest `series x steps` one pushed
+    /// shape-A statement computes —
+    /// [`super::grouped::PUSHED_SERIES_STEPS_PER_STATEMENT`] in
+    /// production, lowered by [`MetricsEngine::with_pushed_series_steps_cap`]
+    /// so a suite can split a node by time at a corpus it can afford.
+    pushed_series_steps_cap: usize,
 }
 
 impl MetricsEngine {
@@ -526,6 +532,7 @@ impl MetricsEngine {
             fetch_probe: None,
             statement_probe: None,
             grouped_chunk_size: sample_sql::CHUNK_THRESHOLD,
+            pushed_series_steps_cap: super::grouped::PUSHED_SERIES_STEPS_PER_STATEMENT,
         }
     }
 
@@ -562,6 +569,14 @@ impl MetricsEngine {
     #[doc(hidden)]
     pub fn with_grouped_chunk_size(mut self, chunk: usize) -> Self {
         self.grouped_chunk_size = chunk;
+        self
+    }
+
+    /// TEST SEAM (issue #579) — see [`MetricsEngine::pushed_series_steps_cap`].
+    /// Never called by `pulsus-server`.
+    #[doc(hidden)]
+    pub fn with_pushed_series_steps_cap(mut self, cap: usize) -> Self {
+        self.pushed_series_steps_cap = cap;
         self
     }
 
