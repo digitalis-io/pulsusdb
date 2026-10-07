@@ -195,10 +195,10 @@ pub struct Run {
 pub struct GroupedShape {
     pub op: GroupedOp,
     pub selector: SelectorId,
-    /// The selector's one concrete metric name, needed by [`decide`]
-    /// because `by (__name__)` reads it into the group key's name
-    /// channel.
-    pub metric_name: String,
+    /// The selector's one concrete metric name, or `None` for a selector
+    /// with no concrete name (issue #579 part 2). [`decide`] reads each
+    /// member's own name into the group key's name channel.
+    pub metric_name: Option<String>,
     pub grouping: Option<Grouping>,
     pub grid: Grid,
     /// The aggregated inner expression's start byte offset — the position
@@ -215,8 +215,9 @@ pub struct GroupedShape {
 pub struct GroupedPush {
     pub op: GroupedOp,
     pub selector: SelectorId,
-    pub metric_name: String,
-    /// Ascending, the order `build_chunk_sqls` sorts into.
+    pub metric_name: Option<String>,
+    /// In member order, `(metric_name, fingerprint)`: the order the run
+    /// statement's chunks and its NaN payload rule fold in.
     pub fingerprints: Vec<Fingerprint>,
     /// Parallel to `fingerprints`: `gids[i]` is the group id of
     /// `fingerprints[i]`.
@@ -265,7 +266,7 @@ pub struct RangeShape {
     pub op: RangeAggOp,
     pub func: PushedRangeFn,
     pub selector: SelectorId,
-    pub metric_name: String,
+    pub metric_name: Option<String>,
     pub grouping: Option<Grouping>,
     /// The request's grid. `lookback_ms` is carried but unused: a range
     /// function's window is `range_ms`.
@@ -327,7 +328,7 @@ pub struct RangePush {
     pub op: RangeAggOp,
     pub func: PushedRangeFn,
     pub selector: SelectorId,
-    /// Ascending.
+    /// In member order, `(metric_name, fingerprint)`.
     pub fingerprints: Vec<Fingerprint>,
     /// Parallel to `fingerprints`.
     pub gids: Vec<u32>,
@@ -541,13 +542,16 @@ fn verdict_of(
     }
 }
 
-/// The selector's one concrete metric name when it is PLAIN: no non-`Eq`
-/// `__name__` matcher, no offset, no `@`, no enclosing subquery context,
-/// not the `info()` family, no histogram-stats reduction, and neither
-/// extended-range modifier. The range is the caller's to check.
-fn plain_metric_name(sel: &pulsus_promql::SelectorSpec) -> Option<String> {
-    let name = sel.metric_name.clone()?;
-    if !sel.name_matchers.is_empty()
+/// `None` when the selector is not PLAIN: an offset, an `@`, an enclosing
+/// subquery context, the `info()` family, a histogram-stats reduction,
+/// either extended-range modifier, or a concrete name that also carries
+/// `__name__` matchers. Otherwise its concrete name, or `Some(None)` for a
+/// selector with no concrete name — a `__name__` regex or label matchers
+/// only, which the multi-name fan-out resolves (issue #579 part 2). The
+/// range is the caller's to check.
+fn plain_metric_name(sel: &pulsus_promql::SelectorSpec) -> Option<Option<String>> {
+    let name = sel.metric_name.clone();
+    if (name.is_some() && !sel.name_matchers.is_empty())
         || sel.offset_ms != 0
         || sel.at_ms.is_some()
         || sel.fetch != pulsus_promql::plan::FetchExtent::default()
@@ -592,8 +596,16 @@ pub fn members_of(
 /// Issue #579 part 2: a multi-name selector's members, from the name-keyed
 /// fan-out's groups.
 pub fn members_of_groups(groups: &[super::labels::MetricSeriesGroup]) -> Vec<Member> {
-    let _ = groups;
-    Vec::new()
+    groups
+        .iter()
+        .flat_map(|g| {
+            g.series.iter().map(|(fp, labels)| Member {
+                fingerprint: *fp,
+                metric_name: g.metric_name.clone(),
+                labels: labels.clone(),
+            })
+        })
+        .collect()
 }
 
 /// Issue #579: every `Aggregate` node the database can answer.
@@ -608,8 +620,7 @@ pub fn pushed_nodes(plan: &QueryPlan, params: &PlanParams, cfg: &MetricsConfig) 
 /// group. No threshold: one row per group per step is fewer rows than the
 /// raw samples for every grouping.
 pub fn decide_range(shape: &RangeShape, members: &[Member]) -> Result<RangePush, DeclineReason> {
-    let (fingerprints, gids, groups) =
-        assign_groups(members, &shape.metric_name, shape.grouping.as_ref());
+    let (fingerprints, gids, groups) = assign_groups(members, shape.grouping.as_ref());
     Ok(RangePush {
         op: shape.op,
         func: shape.func,
@@ -893,8 +904,7 @@ pub fn decide(
     members: &[Member],
     grid: Grid,
 ) -> Result<GroupedPush, DeclineReason> {
-    let (fingerprints, gids, groups) =
-        assign_groups(members, &shape.metric_name, shape.grouping.as_ref());
+    let (fingerprints, gids, groups) = assign_groups(members, shape.grouping.as_ref());
 
     // The threshold. An empty resolution passes it (0 >= 0) and yields
     // zero chunks, zero statements and an empty answer — the same answer
@@ -916,32 +926,34 @@ pub fn decide(
     })
 }
 
-/// The group of every resolved fingerprint, by
-/// [`pulsus_promql::group_key_of`]: fingerprints ascending, their gids in
-/// parallel, and each group's key indexed by gid.
+/// The group of every member, by [`pulsus_promql::group_key_of`] over the
+/// member's own labels and name: members in `(metric_name, fingerprint)`
+/// order, their gids in parallel, and each group's key indexed by gid.
 ///
-/// Ascending fingerprint order is the order `build_chunk_sqls` sorts
-/// into — so a chunk boundary falls in the same place on both routes and
-/// the fold's chunk order IS fingerprint order — and the order the
-/// shape-A statement's `sum` folds its members in.
+/// That order is the one the unpushed route evaluates in — the multi-name
+/// fetch sorts its series by it, and a concrete name's series share their
+/// name, so for them it is ascending fingerprint (issue #579 part 2). The
+/// statements fold by a member's position in this list, never by its
+/// fingerprint: the run statement's chunks and NaN payload rule, and the
+/// shape-A statement's compensated `sum` and `avg`.
 #[allow(clippy::type_complexity)]
 fn assign_groups(
     members: &[Member],
-    metric_name: &str,
     grouping: Option<&Grouping>,
 ) -> (Vec<Fingerprint>, Vec<u32>, Vec<(Labels, Option<String>)>) {
-    let mut by_fp: Vec<(Fingerprint, &pulsus_model::LabelSet)> =
-        members.iter().map(|m| (m.fingerprint, &m.labels)).collect();
-    by_fp.sort_unstable_by_key(|(fp, _)| *fp);
+    let mut ordered: Vec<&Member> = members.iter().collect();
+    ordered.sort_unstable_by(|a, b| {
+        (a.metric_name.as_str(), a.fingerprint).cmp(&(b.metric_name.as_str(), b.fingerprint))
+    });
 
     let mut groups: Vec<(Labels, Option<String>)> = Vec::new();
     let mut seen: HashMap<(Labels, Option<String>), u32> = HashMap::new();
-    let mut fingerprints = Vec::with_capacity(by_fp.len());
-    let mut gids = Vec::with_capacity(by_fp.len());
-    for (fp, labelset) in by_fp {
+    let mut fingerprints = Vec::with_capacity(ordered.len());
+    let mut gids = Vec::with_capacity(ordered.len());
+    for m in ordered {
         let key = group_key_of(
-            &super::exec::to_promql_labels(labelset),
-            Some(metric_name),
+            &super::exec::to_promql_labels(&m.labels),
+            Some(&m.metric_name),
             grouping,
         );
         let gid = match seen.get(&key) {
@@ -954,7 +966,7 @@ fn assign_groups(
                 g
             }
         };
-        fingerprints.push(fp);
+        fingerprints.push(m.fingerprint);
         gids.push(gid);
     }
     (fingerprints, gids, groups)
@@ -995,7 +1007,7 @@ const EMPTY_CELL: Cell = Cell {
 /// never displaces a number; a NaN accumulator is displaced by anything,
 /// including a later NaN — so an all-NaN group answers the payload of its
 /// last member in fold order, and fold order is chunk order, which is
-/// fingerprint order.
+/// member order, `(metric_name, fingerprint)`.
 ///
 /// # It is CPU-bound, so it is cancellable and belongs off the reactor
 ///
@@ -1233,7 +1245,7 @@ mod tests {
         ] {
             let s = shape(q, range_params(), true).unwrap_or_else(|| panic!("{q} declined"));
             assert_eq!(s.op, op, "{q}");
-            assert_eq!(s.metric_name, "m", "{q}");
+            assert_eq!(s.metric_name.as_deref(), Some("m"), "{q}");
         }
     }
 
@@ -1271,8 +1283,9 @@ mod tests {
             "max by (status) (m offset 5m)",
             "max by (status) (m @ 1782907200)",
             "max_over_time(max by (status) (m)[5m:1m])",
-            "max by (status) ({__name__=~\"m.*\"})",
-            "max by (status) ({job=\"api\"})",
+            // a concrete name with another `__name__` matcher (issue #579
+            // part 2 pushes a selector with no concrete name)
+            "max by (status) ({__name__=\"m\", __name__!~\"x\"})",
             // not an aggregate at all
             "m",
             "max_over_time(m[5m])",
@@ -1628,7 +1641,7 @@ mod tests {
         GroupedPush {
             op,
             selector: 0,
-            metric_name: "m".to_string(),
+            metric_name: Some("m".to_string()),
             fingerprints: Vec::new(),
             gids: Vec::new(),
             groups: (0..groups)
@@ -1954,7 +1967,7 @@ mod tests {
             (a.op, a.func, a.selector, a.range_ms),
             (RangeAggOp::Sum, PushedRangeFn::Rate, 0, 300_000)
         );
-        assert_eq!(a.metric_name, "node_cpu_seconds_total");
+        assert_eq!(a.metric_name.as_deref(), Some("node_cpu_seconds_total"));
         assert_eq!(a.grid, range_grid());
         let inner = ISSUE_QUERY.find("count by (cpu)").expect("inner count");
         assert_eq!(got[1].self_pos, inner);
@@ -2078,8 +2091,7 @@ mod tests {
                 "sum by (mode) (rate(m[5m] offset 5m))",
                 "sum by (mode) (rate(m[5m] @ 1782907200))",
                 "sum by (mode) (rate(m[5m:1m]))",
-                "sum by (mode) (rate({__name__=~\"m.*\"}[5m]))",
-                "sum by (mode) (rate({job=\"api\"}[5m]))",
+                "sum by (mode) (rate({__name__=\"m\", __name__!~\"x\"}[5m]))",
                 "histogram_count(sum by (mode) (rate(m[5m])))",
                 "max by (status) (m offset 5m)",
             ],
@@ -2389,7 +2401,10 @@ mod tests {
             matches!(got[0].kind, PushKind::Range(_)),
             "{q} is shape A: {got:?}"
         );
-        assert_declines(&["count(up{__name__!~\"x\"})"], NodeDecline::Selector);
+        assert_declines(
+            &["count({__name__=\"up\", __name__!~\"x\"})"],
+            NodeDecline::Selector,
+        );
         assert_declines(
             &["sum by (__name__) (rate({__name__=~\"a.+\"}[5m]))"],
             NodeDecline::NameGrouping,

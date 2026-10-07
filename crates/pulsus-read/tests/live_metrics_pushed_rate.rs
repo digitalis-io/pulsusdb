@@ -371,9 +371,43 @@ fn assert_pushed_any(query: &str, step_ms: i64, r: &Routed) {
     );
 }
 
+/// One canonical answer line as a response body carries it: every NaN is
+/// the text `NaN`, whatever its payload. The bits of any other value are
+/// kept.
+fn nan_as_text(line: &str) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let run = chars[i..]
+            .iter()
+            .take_while(|c| c.is_ascii_hexdigit())
+            .count();
+        let bounded = (i == 0 || !chars[i - 1].is_alphanumeric())
+            && chars.get(i + run).is_none_or(|c| !c.is_alphanumeric());
+        if run == 16 && bounded {
+            let token: String = chars[i..i + 16].iter().collect();
+            match u64::from_str_radix(&token, 16) {
+                Ok(bits) if f64::from_bits(bits).is_nan() => out.push_str("NaN"),
+                _ => out.push_str(&token),
+            }
+            i += 16;
+        } else if run > 0 {
+            out.extend(&chars[i..i + run]);
+            i += run;
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
 /// T1: the design's queries over multi-name selectors, plus `min`/`max`
-/// over the NaN pair, at 60 s, 15 s and instant: identical with the push
-/// on and off, and pushed.
+/// over the NaN pair, at 60 s, 15 s and instant: the response bodies are
+/// identical with the push on and off, and every query is pushed. A body
+/// renders every NaN as `NaN`, so a NaN compares as one here; the payload
+/// rule is T4's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn multi_name_shapes_answer_identically() {
     skip_unless_live!();
@@ -387,8 +421,15 @@ async fn multi_name_shapes_answer_identically() {
     ]);
     for p in [six_hours(&h, 60_000), six_hours(&h, 15_000), h.instant()] {
         for q in &queries {
-            let r = h.agree(q, &p).await;
-            assert_pushed_any(q, p.step_ms, &r);
+            let (a, b) = h.both(q, &p).await;
+            assert_eq!(
+                a.answer.iter().map(|l| nan_as_text(l)).collect::<Vec<_>>(),
+                b.answer.iter().map(|l| nan_as_text(l)).collect::<Vec<_>>(),
+                "{q} at step {}: the response bodies differ",
+                p.step_ms
+            );
+            assert_eq!(a.annotations, b.annotations, "{q}: the annotations differ");
+            assert_pushed_any(q, p.step_ms, &a);
         }
     }
     h.finish().await;
@@ -511,3 +552,4 @@ async fn multi_name_declines_keep_todays_route() {
     assert_eq!(errors[0], errors[1], "{q}: the cold-cache error differs");
     h.finish().await;
 }
+

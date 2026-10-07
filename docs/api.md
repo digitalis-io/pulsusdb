@@ -401,7 +401,7 @@ A part whose `cut` is `{"why": "inexact_limit"}` carries neither `source`/`key`,
 }]
 ```
 
-**One shape is different, and it is the one a dashboard sends most** (issue #549). `min`, `max`, `count` and `group` over a **plain** instant selector — no range, no `offset`, no `@`, no subquery context, one concrete metric name — compile into ONE statement per fingerprint chunk that reads both sample tables and returns the answer already reduced. Such an entry has **one** `sql` part, which names `metric_samples` and additively names the other table it reads inside the same statement; there is no `disjoint_sources` cut, because there is no second statement to cut from, and **no `engine` part at all**, because every link lowers. `max by (status) (http_requests_total{status="500"})` renders:
+**One shape is different, and it is the one a dashboard sends most** (issue #549). `min`, `max`, `count` and `group` over a **plain** instant selector — no range, no `offset`, no `@`, no subquery context, one concrete metric name with no other `__name__` matcher or none at all (issue #579) — compile into ONE statement per fingerprint chunk that reads both sample tables and returns the answer already reduced. Such an entry has **one** `sql` part, which names `metric_samples` and additively names the other table it reads inside the same statement; there is no `disjoint_sources` cut, because there is no second statement to cut from, and **no `engine` part at all**, because every link lowers. `max by (status) (http_requests_total{status="500"})` renders:
 
 ```json
 "plans": [{
