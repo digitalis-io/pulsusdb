@@ -1386,7 +1386,7 @@ when we are asking it to slow down, so we keep `429`; recorded as
   two systems disagree in two separate ways, and only one of them is
   semantic. Measured 2026-08-29 against the pinned reference
   (`grafana/tempo@sha256:aa8df8d069f77b82e978464daf55169bb8d135852ad58700aa96880653c3d8f7`,
-  the digest `.github/workflows/ci.yml:648` pins, run with this repo's
+  the digest `.github/workflows/ci.yml:651` pins, run with this repo's
   `ci/tempo/tempo-compare.yaml` unmodified) and against PulsusDB at
   `820e138`, same OTLP/JSON corpus pushed to both — 10 spans
   `resource.service.name="w2a"` and 4 `"w2b"` — with the filter
@@ -1586,7 +1586,7 @@ when we are asking it to slow down, so we keep `429`; recorded as
   encoding as the two bytes `12 00`. The reference populates it with a
   byte counter. Measured on the CI-pinned oracle
   (`grafana/tempo@sha256:aa8df8d069f77b82e978464daf55169bb8d135852ad5870
-  0aa96880653c3d8f7`, the digest at `.github/workflows/ci.yml:648`),
+  0aa96880653c3d8f7`, the digest at `.github/workflows/ci.yml:651`),
   booted on this repository's own `ci/tempo/tempo-compare.yaml`.
 
 - **Why this is an exclusion and not a frozen value.** The reference's
@@ -1662,7 +1662,7 @@ when we are asking it to slow down, so we keep `429`; recorded as
 - **What:** our JSON emits proto3 default values; the reference omits
   them. Measured on the CI-pinned oracle
   (`grafana/tempo@sha256:aa8df8d069f77b82e978464daf55169bb8d135852ad5870
-  0aa96880653c3d8f7`, the digest at `.github/workflows/ci.yml:648`) and
+  0aa96880653c3d8f7`, the digest at `.github/workflows/ci.yml:651`) and
   on a `pulsusdb` spawn, both fed the identical four-span fixture in
   `crates/pulsus-server/tests/fixtures/trace_nullable_wire/capture.json`.
   For the probe whose sender omitted `status` entirely, the span object

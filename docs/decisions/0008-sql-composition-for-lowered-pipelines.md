@@ -135,7 +135,7 @@ The `system.query_log` half in `crates/pulsus-read/tests/query_log_gates.rs` **d
 `2f78c53` the binary prints `Starting 14 tests across 1 binary` and `14 passed`, exit 0 — but that
 green is worthless locally: it is env-gated on `PULSUS_TEST_CLICKHOUSE=1` and each test self-skips
 without it. CI runs it with the variable set in the `schema-it` job
-(`.github/workflows/ci.yml:1302-1306`). A local run without that variable self-skips green, so the
+(`.github/workflows/ci.yml:1031-1035`). A local run without that variable self-skips green, so the
 `Starting 14 tests` and `14 passed` recorded above are not evidence of anything.
 
 **D3. A set crossing to the evaluator is handed over as materialised values, never as a subquery.**
