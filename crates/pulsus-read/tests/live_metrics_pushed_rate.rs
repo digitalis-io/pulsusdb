@@ -552,4 +552,3 @@ async fn multi_name_declines_keep_todays_route() {
     assert_eq!(errors[0], errors[1], "{q}: the cold-cache error differs");
     h.finish().await;
 }
-
