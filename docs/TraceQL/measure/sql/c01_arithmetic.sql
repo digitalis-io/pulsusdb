@@ -20,7 +20,7 @@ FROM (SELECT trace_id, max(start_ns) AS last, count() AS matched,
         AND (coalesce(attrs.`http%2Erequest%2Ebody%2Esize`.:Int64, 0) + coalesce(attrs.`app%2Eitems%2Ecount`.:Int64, 0) > 4000)
       GROUP BY trace_id) AS m
 LEFT JOIN (SELECT trace_id, min(start_ns) AS start_ns, max(end_ns) AS end_ns,
-                  max(root_service) AS root_service, max(root_name) AS root_name
+                  min(root) AS r, if(r.1 = 0, if(length(r.4) <= 8192, r.4, substringUTF8(r.4, 1, 2048)), '') AS root_service, if(r.1 = 0, if(length(r.5) <= 8192, r.5, substringUTF8(r.5, 1, 2048)), '') AS root_name
            FROM tqd_g1.traces
            WHERE trace_id IN (SELECT arrayJoin(top.1))
            GROUP BY trace_id) AS t USING trace_id

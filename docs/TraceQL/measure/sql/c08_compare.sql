@@ -3,7 +3,7 @@ WITH base AS (SELECT status_code = 2 AS sel, name, kind, status_code, status_mes
                resource_id, service, trace_id
         FROM tqd_g1.spans WHERE start_ns >= 1790084801000000000 AND start_ns < 1790095601000000000 AND intDiv(start_ns, 300000000000) BETWEEN 5966949 AND 5966985 AND service = 'payment'),
      res AS (SELECT resource_id, any(attrs) AS rattrs FROM tqd_g1.resources GROUP BY resource_id),
-     tr AS (SELECT trace_id, max(root_service) AS root_service, max(root_name) AS root_name
+     tr AS (SELECT trace_id, min(root) AS r, if(r.1 = 0, if(length(r.4) <= 8192, r.4, substringUTF8(r.4, 1, 2048)), '') AS root_service, if(r.1 = 0, if(length(r.5) <= 8192, r.5, substringUTF8(r.5, 1, 2048)), '') AS root_name
             FROM tqd_g1.traces GROUP BY trace_id),
      kv AS (
     SELECT sel, 'span' AS scope, kv.1 AS key,

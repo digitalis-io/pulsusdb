@@ -20,7 +20,7 @@ FROM (SELECT trace_id, max(start_ns) AS last, count() AS matched,
         AND (multiIf(dynamicType(attrs.`success`) != 'None', coalesce(attrs.`success`.:Bool = true, false), multiIf(has((SELECT groupArray(resource_id) FROM tqd_cat.resources WHERE dynamicType(attrs.`success`) != 'None'), resource_id), has((SELECT groupArray(resource_id) FROM tqd_cat.resources WHERE coalesce(attrs.`success`.:Bool = true, false)), resource_id), multiIf(arrayExists(x -> dynamicType(x) != 'None', events.attrs.`success`), arrayExists(x -> x = true, events.attrs.`success`.:Int64), multiIf(arrayExists(x -> dynamicType(x) != 'None', links.attrs.`success`), arrayExists(x -> x = true, links.attrs.`success`.:Int64), multiIf(dynamicType(scope_attrs.`success`) != 'None', coalesce(scope_attrs.`success`.:Bool = true, false), false))))))
       GROUP BY trace_id) AS m
 LEFT JOIN (SELECT trace_id, min(start_ns) AS start_ns, max(end_ns) AS end_ns,
-                  max(root_service) AS root_service, max(root_name) AS root_name
+                  min(root) AS r, if(r.1 = 0, if(length(r.4) <= 8192, r.4, substringUTF8(r.4, 1, 2048)), '') AS root_service, if(r.1 = 0, if(length(r.5) <= 8192, r.5, substringUTF8(r.5, 1, 2048)), '') AS root_name
            FROM tqd_cat.traces
            WHERE trace_id IN (SELECT arrayJoin(top.1))
            GROUP BY trace_id) AS t USING trace_id

@@ -42,7 +42,7 @@ CASES = [
  ('F13 child', '{ resource.service.name = "checkout" } > { resource.service.name = "payment" }', None),
  ('F14 name', '{ name = "SELECT ledger" }', "name = 'SELECT ledger'"),
  ('F15 root service', '{ rootServiceName = "accounting" }',
-  f"trace_id IN (SELECT trace_id FROM {DB}.traces GROUP BY trace_id HAVING max(root_service) = 'accounting')"),
+  f"trace_id IN (SELECT trace_id FROM {DB}.traces GROUP BY trace_id HAVING if(min(root).1 = 0, min(root).4, '') = 'accounting')"),
  ('F16 trace duration', '{ traceDuration > 1s }',
   f"trace_id IN (SELECT trace_id FROM {DB}.traces GROUP BY trace_id HAVING max(end_ns) - min(start_ns) > 1000000000)"),
  ('F17 unscoped', '{ .app.user.id = "u-1" }',

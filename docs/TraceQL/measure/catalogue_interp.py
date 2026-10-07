@@ -85,11 +85,17 @@ class Fixture:
         self.traces = {}
         for r in self.rows:
             t = self.traces.setdefault(r['trace_id'], {'start': r['start_ns'], 'end': r['end_ns'],
-                                                       'root_name': '', 'root_service': ''})
+                                                       'root_name': '', 'root_service': '',
+                                                       'root_key': None})
             t['start'] = min(t['start'], r['start_ns']); t['end'] = max(t['end'], r['end_ns'])
-            if not r['parent_span_id']:       # the view's maxIf over the roots
-                t['root_name'] = max(t['root_name'], r['name'])
-                t['root_service'] = max(t['root_service'], r['service'])
+            # The root is ONE span, the earliest root by (start_ns, span_id),
+            # and both values come from it (issue #591 part 1).
+            if not r['parent_span_id']:
+                key = (r['start_ns'], r['span_id'])
+                if t['root_key'] is None or key < t['root_key']:
+                    t['root_key'] = key
+                    t['root_name'] = r['name']
+                    t['root_service'] = r['service']
         self.nested = self._number()
     def _number(self):
         """The nested-set numbering, written as the retained implementation
