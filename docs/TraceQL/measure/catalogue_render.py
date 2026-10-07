@@ -196,7 +196,10 @@ class Render:
             if col == 'duration':
                 having = f"max(end_ns) - min(start_ns) {sqlop} {self.lit_sql(lit)}"
             else:
-                having = f"max({col}) {sqlop} {self.lit_sql(lit)}"
+                # The root is one span (issue #591 part 1): the least
+                # (not a root, start_ns, span_id, service, name).
+                field = 4 if col == 'root_service' else 5
+                having = f"if(min(root).1 = 0, min(root).{field}, '') {sqlop} {self.lit_sql(lit)}"
             return (f"trace_id IN (SELECT trace_id FROM {self.db}.traces GROUP BY trace_id HAVING {having})")
         if n == 'event:name':
             return f"arrayExists(x -> x.2 {sqlop} {self.lit_sql(lit)}, events)"
@@ -650,7 +653,7 @@ class Statement(Render):
                 f"FROM {self.db}.spans WHERE {win} AND ({outer})), "
                 f"res AS (SELECT resource_id, any(attrs) AS rattrs FROM {self.db}.resources "
                 f"GROUP BY resource_id), "
-                f"tr AS (SELECT trace_id, max(root_service) AS root_service, max(root_name) AS root_name "
+                f"tr AS (SELECT trace_id, min(root) AS r, if(r.1 = 0, if(length(r.4) <= 8192, r.4, substringUTF8(r.4, 1, 2048)), '') AS root_service, if(r.1 = 0, if(length(r.5) <= 8192, r.5, substringUTF8(r.5, 1, 2048)), '') AS root_name "
                 f"FROM {self.db}.traces GROUP BY trace_id), "
                 f"kv AS ({' UNION ALL '.join(parts)}) "
                 f"SELECT scope, key, value, type, side, n FROM ("
@@ -890,7 +893,7 @@ class ApiStatement(Statement):
                 f"            (SELECT arrayJoin(arrayFlatten(arrayMap((t, ks) -> "
                 f"arrayMap(k -> (k, t), ks), top.1, top.2))))")
         join = (f"LEFT JOIN (SELECT trace_id, min(start_ns) AS start_ns, max(end_ns) AS end_ns,\n"
-                f"                  max(root_service) AS root_service, max(root_name) AS root_name\n"
+                f"                  min(root) AS r, if(r.1 = 0, if(length(r.4) <= 8192, r.4, substringUTF8(r.4, 1, 2048)), '') AS root_service, if(r.1 = 0, if(length(r.5) <= 8192, r.5, substringUTF8(r.5, 1, 2048)), '') AS root_name\n"
                 f"           FROM {self.db}.traces\n"
                 f"           WHERE trace_id IN (SELECT arrayJoin(top.1))\n"
                 f"           GROUP BY trace_id) AS t USING trace_id")

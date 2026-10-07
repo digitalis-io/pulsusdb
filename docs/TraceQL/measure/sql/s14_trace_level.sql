@@ -5,7 +5,7 @@ WITH
                   groupUniqArray(intDiv(start_ns, 300000000000)) AS keys
            FROM tqd_g1.spans
            WHERE start_ns >= s AND start_ns < e AND intDiv(start_ns, 300000000000) BETWEEN 5966949 AND 5966985
-             AND (trace_id IN (SELECT trace_id FROM tqd_g1.traces WHERE day >= toDate(fromUnixTimestamp64Nano(1790084801000000000)) - 1 AND day <= toDate(fromUnixTimestamp64Nano(1790095601000000000 - 1)) GROUP BY trace_id HAVING max(root_service) = 'loadgen' AND max(end_ns) - min(start_ns) > 2000000000))
+             AND (trace_id IN (SELECT trace_id FROM tqd_g1.traces WHERE day >= toDate(fromUnixTimestamp64Nano(1790084801000000000)) - 1 AND day <= toDate(fromUnixTimestamp64Nano(1790095601000000000 - 1)) GROUP BY trace_id HAVING if(min(root).1 = 0, min(root).4, '') = 'loadgen' AND max(end_ns) - min(start_ns) > 2000000000))
            GROUP BY trace_id
            ORDER BY last DESC, trace_id ASC
            LIMIT 20)) AS top
@@ -17,10 +17,10 @@ FROM (SELECT trace_id, max(start_ns) AS last, count() AS matched,
       WHERE (intDiv(start_ns, 300000000000), trace_id) IN
             (SELECT arrayJoin(arrayFlatten(arrayMap((t, ks) -> arrayMap(k -> (k, t), ks), top.1, top.2))))
         AND start_ns >= s AND start_ns < e AND intDiv(start_ns, 300000000000) BETWEEN 5966949 AND 5966985
-        AND (trace_id IN (SELECT trace_id FROM tqd_g1.traces WHERE day >= toDate(fromUnixTimestamp64Nano(1790084801000000000)) - 1 AND day <= toDate(fromUnixTimestamp64Nano(1790095601000000000 - 1)) GROUP BY trace_id HAVING max(root_service) = 'loadgen' AND max(end_ns) - min(start_ns) > 2000000000))
+        AND (trace_id IN (SELECT trace_id FROM tqd_g1.traces WHERE day >= toDate(fromUnixTimestamp64Nano(1790084801000000000)) - 1 AND day <= toDate(fromUnixTimestamp64Nano(1790095601000000000 - 1)) GROUP BY trace_id HAVING if(min(root).1 = 0, min(root).4, '') = 'loadgen' AND max(end_ns) - min(start_ns) > 2000000000))
       GROUP BY trace_id) AS m
 LEFT JOIN (SELECT trace_id, min(start_ns) AS start_ns, max(end_ns) AS end_ns,
-                  max(root_service) AS root_service, max(root_name) AS root_name
+                  min(root) AS r, if(r.1 = 0, if(length(r.4) <= 8192, r.4, substringUTF8(r.4, 1, 2048)), '') AS root_service, if(r.1 = 0, if(length(r.5) <= 8192, r.5, substringUTF8(r.5, 1, 2048)), '') AS root_name
            FROM tqd_g1.traces
            WHERE trace_id IN (SELECT arrayJoin(top.1))
            GROUP BY trace_id) AS t USING trace_id

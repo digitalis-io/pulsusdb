@@ -277,7 +277,7 @@ design rather than of a query:
 
 ## Shapes that differ only in a literal
 
-20 groups of queries compile to the same membership statement with a
+19 groups of queries compile to the same membership statement with a
 different literal; the largest are listed here, and every member still has its
 own SQL file and its own answer.
 
@@ -287,6 +287,7 @@ own SQL file and its own answer.
 | 6 queries | `intrinsic_kind_eq_server`, `intrinsic_span_kind`, `static_kind_client`, `static_kind_consumer`, `static_kind_internal`, `static_kind_unspecified` |
 | 6 queries | `intrinsic_name_eq`, `intrinsic_span_name`, `string_escape_hex`, `string_escape_octal`, `string_escape_unicode`, `string_escapes_short` |
 | 5 queries | `by_attribute_types`, `by_missing_attribute`, `by_name_order`, `by_span_attribute`, `match_all` |
+| 4 queries | `intrinsic_root_name_legacy`, `intrinsic_root_service_name_legacy`, `intrinsic_trace_root_name`, `intrinsic_trace_root_service` |
 | 4 queries | `intrinsic_span_status`, `intrinsic_status_eq_error`, `intrinsic_status_eq_unset`, `select_multi` |
 | 3 queries | `bare_bool_true`, `intrinsic_nested_set_left_gt`, `intrinsic_nested_set_right_gte` |
 | 3 queries | `duration_frac_half`, `duration_gt`, `intrinsic_span_duration` |
@@ -294,4 +295,3 @@ own SQL file and its own answer.
 | 3 queries | `exemplars_off`, `metrics_count_over_time`, `metrics_rate` |
 | 3 queries | `pipeline_spanset_filter`, `pipeline_spanset_filter_first`, `pipeline_spanset_filter_parens` |
 | 2 queries | `arith_unary_neg`, `static_min_int` |
-| 2 queries | `duration_frac_leading_dot`, `duration_lt` |

@@ -22,7 +22,7 @@ def stmt(lo, hi, seen):
       WHERE start_ns >= lo AND start_ns < hi AND intDiv(start_ns, {B}) BETWEEN {lo // B} AND {(hi - 1) // B} AND ({F}) {excl}
       GROUP BY trace_id ORDER BY last DESC, trace_id ASC LIMIT {K})) AS ids,
     (SELECT groupArray((trace_id, services, ts, te, rs, rn)) FROM (SELECT trace_id, groupUniqArrayArray(services) AS services,
-      min(start_ns) AS ts, max(end_ns) AS te, max(root_service) AS rs, max(root_name) AS rn
+      min(start_ns) AS ts, max(end_ns) AS te, min(root) AS r, if(r.1 = 0, if(length(r.4) <= 8192, r.4, substringUTF8(r.4, 1, 2048)), '') AS rs, if(r.1 = 0, if(length(r.5) <= 8192, r.5, substringUTF8(r.5, 1, 2048)), '') AS rn
       FROM {DB}.traces WHERE trace_id IN (SELECT arrayJoin(ids)) GROUP BY trace_id)) AS tr
 SELECT hex(trace_id) AS tid, max(start_ns) AS last, count() AS matched,
        arraySlice(arraySort(x -> (x.2, x.1), groupArray((span_id, start_ns, duration_ns{extra}))), 1, {SPSS}) AS spans,

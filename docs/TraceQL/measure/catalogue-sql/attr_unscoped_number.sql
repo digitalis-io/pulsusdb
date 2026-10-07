@@ -20,7 +20,7 @@ FROM (SELECT trace_id, max(start_ns) AS last, count() AS matched,
         AND (multiIf(dynamicType(attrs.`http%2Estatus_code`) != 'None', (coalesce(attrs.`http%2Estatus_code`.:Int64 = 200, false) OR coalesce(attrs.`http%2Estatus_code`.:Float64 = 200, false)), multiIf(has((SELECT groupArray(resource_id) FROM tqd_cat.resources WHERE dynamicType(attrs.`http%2Estatus_code`) != 'None'), resource_id), has((SELECT groupArray(resource_id) FROM tqd_cat.resources WHERE (coalesce(attrs.`http%2Estatus_code`.:Int64 = 200, false) OR coalesce(attrs.`http%2Estatus_code`.:Float64 = 200, false))), resource_id), multiIf(arrayExists(x -> dynamicType(x) != 'None', events.attrs.`http%2Estatus_code`), arrayExists(x -> x = 200, events.attrs.`http%2Estatus_code`.:Int64), multiIf(arrayExists(x -> dynamicType(x) != 'None', links.attrs.`http%2Estatus_code`), arrayExists(x -> x = 200, links.attrs.`http%2Estatus_code`.:Int64), multiIf(dynamicType(scope_attrs.`http%2Estatus_code`) != 'None', (coalesce(scope_attrs.`http%2Estatus_code`.:Int64 = 200, false) OR coalesce(scope_attrs.`http%2Estatus_code`.:Float64 = 200, false)), false))))))
       GROUP BY trace_id) AS m
 LEFT JOIN (SELECT trace_id, min(start_ns) AS start_ns, max(end_ns) AS end_ns,
-                  max(root_service) AS root_service, max(root_name) AS root_name
+                  min(root) AS r, if(r.1 = 0, if(length(r.4) <= 8192, r.4, substringUTF8(r.4, 1, 2048)), '') AS root_service, if(r.1 = 0, if(length(r.5) <= 8192, r.5, substringUTF8(r.5, 1, 2048)), '') AS root_name
            FROM tqd_cat.traces
            WHERE trace_id IN (SELECT arrayJoin(top.1))
            GROUP BY trace_id) AS t USING trace_id

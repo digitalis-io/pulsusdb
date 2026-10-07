@@ -223,8 +223,11 @@ const CONTROL: &str = "with_binding_control.txt";
 /// it sent a float and a histogram fetch. Its `WITH` items are scalars and
 /// arrays, and its histogram count is a scalar subquery in the projection,
 /// not a binding.
-const SQL_FILES: usize = 137;
-const SQL_STATEMENTS: usize = 401;
+///
+/// **Issue #591 part 1 moves them 137 -> 143 and 401 -> 407: SIX
+/// `traces_spans_search` goldens added, one statement each.**
+const SQL_FILES: usize = 143;
+const SQL_STATEMENTS: usize = 407;
 const PROMQL_ENTRIES: usize = 30;
 const PROMQL_STATEMENTS: usize = 55;
 const CONTROL_STATEMENTS: usize = 1;

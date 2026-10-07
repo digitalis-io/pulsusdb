@@ -45,7 +45,7 @@ FROM (SELECT trace_id, max(start_ns) AS last, count() AS matched,
         AND ({F})
       GROUP BY trace_id) AS m
 LEFT JOIN (SELECT trace_id, min(start_ns) AS start_ns, max(end_ns) AS end_ns,
-                  max(root_service) AS root_service, max(root_name) AS root_name
+                  min(root) AS r, if(r.1 = 0, if(length(r.4) <= 8192, r.4, substringUTF8(r.4, 1, 2048)), '') AS root_service, if(r.1 = 0, if(length(r.5) <= 8192, r.5, substringUTF8(r.5, 1, 2048)), '') AS root_name
            FROM {DB}.traces
            WHERE trace_id IN (SELECT arrayJoin(top.1))
            GROUP BY trace_id) AS t USING trace_id
@@ -80,7 +80,7 @@ search('s15_unscoped_and_resource', f"({unscoped}) AND {res_in(p('k8s.pod.name')
 # trace-level intrinsics: candidates from the per-trace table
 search('s14_trace_level', f"trace_id IN (SELECT trace_id FROM {DB}.traces WHERE day >= toDate(fromUnixTimestamp64Nano({S})) - 1 "
        f"AND day <= toDate(fromUnixTimestamp64Nano({E} - 1)) GROUP BY trace_id "
-       f"HAVING max(root_service) = 'loadgen' AND max(end_ns) - min(start_ns) > 2000000000)")
+       f"HAVING if(min(root).1 = 0, min(root).4, '') = 'loadgen' AND max(end_ns) - min(start_ns) > 2000000000)")
 print('ok')
 
 # ---- structural: descendant, a recursive climb from each B span to the root ----
@@ -402,7 +402,7 @@ def compare(name, scope_filter, selection):
         FROM {DB}.spans WHERE {W} AND {scope_filter})"""
     body = f"""WITH base AS {base},
      res AS (SELECT resource_id, any(attrs) AS rattrs FROM {DB}.resources GROUP BY resource_id),
-     tr AS (SELECT trace_id, max(root_service) AS root_service, max(root_name) AS root_name
+     tr AS (SELECT trace_id, min(root) AS r, if(r.1 = 0, if(length(r.4) <= 8192, r.4, substringUTF8(r.4, 1, 2048)), '') AS root_service, if(r.1 = 0, if(length(r.5) <= 8192, r.5, substringUTF8(r.5, 1, 2048)), '') AS root_name
             FROM {DB}.traces GROUP BY trace_id),
      kv AS (
 {kv_rows('base', 'span', 'attrs')}

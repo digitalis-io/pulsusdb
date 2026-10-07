@@ -498,13 +498,11 @@ async fn the_per_trace_aggregate_columns_carry_the_functions_this_design_names()
         // the minimum and this is the maximum, and a view that wrote `min`
         // here would narrow that bound silently.
         ("last_start_ns", "SimpleAggregateFunction(max, Int64)"),
+        // Issue #591 part 1, decision 4: the root is ONE span, the least
+        // `(not a root, start_ns, span_id, service, name)`.
         (
-            "root_name",
-            "SimpleAggregateFunction(max, LowCardinality(String))",
-        ),
-        (
-            "root_service",
-            "SimpleAggregateFunction(max, LowCardinality(String))",
+            "root",
+            "SimpleAggregateFunction(min, Tuple(UInt8, Int64, FixedString(8), String, String))",
         ),
         (
             "services",
@@ -546,11 +544,12 @@ async fn every_target_table_column_carries_a_codec() {
             ),
         )
         .await,
-        51,
-        "the five target tables' own column count (28 + 9 + 8 + 2 + 4), so \
+        50,
+        "the five target tables' own column count (28 + 8 + 8 + 2 + 4), so \
          the codec check below has a non-empty domain. Issue #587 added \
          four columns to `spans`, two to `traces` and one to `resources`; \
-         issue #589 added one to `spans`"
+         issue #589 added one to `spans`; issue #591 part 1 made `traces`' \
+         two root columns one"
     );
     let bare = names(
         &client,
@@ -579,7 +578,7 @@ async fn every_target_table_column_carries_a_codec() {
 ///
 /// The column **type** is not pinned here — the per-table `(name, type)`
 /// cases above own that.
-const TARGET_TABLE_CODECS: [(&str, &str, &str); 51] = [
+const TARGET_TABLE_CODECS: [(&str, &str, &str); 50] = [
     ("resources", "day", "CODEC(ZSTD(1))"),
     ("resources", "resource_id", "CODEC(ZSTD(1))"),
     ("resources", "service", "CODEC(ZSTD(1))"),
@@ -626,8 +625,7 @@ const TARGET_TABLE_CODECS: [(&str, &str, &str); 51] = [
     ("traces", "trace_id", "CODEC(ZSTD(1))"),
     ("traces", "start_ns", "CODEC(ZSTD(1))"),
     ("traces", "end_ns", "CODEC(ZSTD(1))"),
-    ("traces", "root_service", "CODEC(ZSTD(1))"),
-    ("traces", "root_name", "CODEC(ZSTD(1))"),
+    ("traces", "root", "CODEC(ZSTD(1))"),
     ("traces", "services", "CODEC(ZSTD(1))"),
     ("traces", "last_start_ns", "CODEC(Delta(8), ZSTD(1))"),
     ("traces", "buckets", "CODEC(ZSTD(1))"),

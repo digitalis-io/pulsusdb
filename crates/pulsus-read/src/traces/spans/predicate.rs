@@ -1875,7 +1875,7 @@ fn service_name_leaf(op: ComparisonOp, value: &Value) -> Result<String, PlanErro
 ///    This is the first place in the product where a client-chosen OTLP
 ///    key becomes a SQL **identifier**; `ch_ident`'s own doc carries the
 ///    measurement.
-fn attr_path(root: &str, key: &str) -> String {
+pub(super) fn attr_path(root: &str, key: &str) -> String {
     format!("{root}.{}", escape::ch_ident(&escape_json_path(key)))
 }
 
