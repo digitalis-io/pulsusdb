@@ -407,10 +407,12 @@ impl SearchStatement {
     }
 }
 
-/// Compiles `query` to the search statement. A pipeline stage is #592's, a
-/// structural operator #593's, and a projection off the span row "#591
-/// part 2"'s; everything the predicate compiler refuses is returned as it
-/// refused. `query.hints` are accepted and ignored, as today.
+/// Compiles `query` to the search statement. A pipeline stage is #592's
+/// and a structural operator #593's; a set field projected from a
+/// comparison that holds it twice beside arithmetic, or under `!` or inside
+/// a boolean-valued operand, is refused (`projection.rs`); everything the
+/// predicate compiler refuses is returned as it refused. `query.hints` are
+/// accepted and ignored, as today.
 pub fn compile_search(
     query: &Query,
     ctx: &PredicateCtx<'_>,
