@@ -450,6 +450,9 @@ impl Fixture {
     }
 }
 
+/// One label matcher as the expectations read it.
+type Matcher = (&'static str, MatchOp, &'static str);
+
 /// Whether `labels` satisfy every matcher, an absent key read as `""`.
 fn satisfies(labels: &[(String, String)], matchers: &[(&str, MatchOp, &str)]) -> bool {
     matchers.iter().all(|(key, op, value)| {
@@ -586,7 +589,7 @@ fn is_raw_sample_fetch(s: &LoggedStatement) -> bool {
 
 const EXAMPLE: &str = r#"{job="api", status=~"5.."}"#;
 
-fn example() -> Vec<(&'static str, MatchOp, &'static str)> {
+fn example() -> Vec<Matcher> {
     vec![("job", MatchOp::Eq, "api"), ("status", MatchOp::Re, "5..")]
 }
 
@@ -599,7 +602,7 @@ async fn p1_p2_name_less_selectors_answer_through_the_label_index() {
         false,
     )
     .await;
-    let cases: [(&str, Vec<(&str, MatchOp, &str)>); 4] = [
+    let cases: [(&str, Vec<Matcher>); 4] = [
         (EXAMPLE, example()),
         (r#"{status=~"5.."}"#, vec![("status", MatchOp::Re, "5..")]),
         (

@@ -268,27 +268,39 @@ pub(super) fn discovery_label_values_query(
 /// `window`, through the label index when `t` names it, in `(metric_name,
 /// fingerprint)` order and capped at `cap + 1` rows, so a caller can tell
 /// a result past `cap` from one at it.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn nameless_resolution_query(
     t: SeriesTables<'_>,
     matchers: &[LabelMatcher],
     window: DataWindow,
     cap: u64,
 ) -> String {
-    let _ = (t, matchers, window, cap);
-    String::new()
+    format!(
+        "{}\nLIMIT {}",
+        discovery_series_query(t, &nameless_filter(matchers), window),
+        cap.saturating_add(1)
+    )
 }
 
 /// Issue #635 part 3, statement 1: the IDs [`nameless_resolution_query`]
 /// selects, as the sub-query the sample statements nest.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn nameless_ids_query(
     t: SeriesTables<'_>,
     matchers: &[LabelMatcher],
     window: DataWindow,
 ) -> String {
-    let _ = (t, matchers, window);
-    String::new()
+    format!(
+        "SELECT fingerprint\n{}",
+        discovery_read(&nameless_filter(matchers), window).ids_from_where(t)
+    )
+}
+
+/// The filter of a selector with no metric name and no `__name__` matcher.
+fn nameless_filter(matchers: &[LabelMatcher]) -> DiscoveryFilter {
+    DiscoveryFilter {
+        metric_name: None,
+        name_matchers: Vec::new(),
+        matchers: matchers.to_vec(),
+    }
 }
 
 /// The one series read [`discovery_query`] and

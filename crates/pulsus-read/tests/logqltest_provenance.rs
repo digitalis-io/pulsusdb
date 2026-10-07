@@ -2068,9 +2068,11 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
     // Issue #623: the counts follow the test expectations of the lookup and
     // activity reads — a regex matcher on the lookup and its probe line on
     // the activity read, in both files. No production renderer is added:
-    // the matchers still render in the sealed leaf.
+    // the matchers still render in the sealed leaf. Issue #635 part 3 adds
+    // four to `sql.rs`, all in the expectations of statement R and
+    // statement 1: the probe line and the label-values regex in each.
     ("pulsus-read/src/metrics/series_where.rs", 26),
-    ("pulsus-read/src/metrics/sql.rs", 20),
+    ("pulsus-read/src/metrics/sql.rs", 24),
     ("pulsus-read/src/traces/filter.rs", 12),
     ("pulsus-read/src/traces/search_plan.rs", 2),
     // Issues #588 and #589. The span-scope predicate compiler: four render
@@ -2093,7 +2095,7 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
 
 /// The separately-asserted total, so "a file appeared" reads differently
 /// from "a file grew".
-const MATCH_RENDER_TOTAL: usize = 98;
+const MATCH_RENDER_TOTAL: usize = 102;
 
 /// Every string-literal CONTENT in a Rust source: ordinary `"…"`, raw
 /// `r"…"`/`r#"…"#`, byte `b"…"` and byte-raw. Comments are dropped.
