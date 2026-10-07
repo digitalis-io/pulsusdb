@@ -41,7 +41,8 @@ use crate::plan::{
     RangeSource, ScalarFn, SelectorId, SelectorSpec, SubqueryPlan,
 };
 use crate::value::{
-    FetchedSeries, InstantSample, Labels, Point, QueryValue, RangeSeries, Sample, SeriesData,
+    FetchedSeries, InstantSample, Labels, Point, PushedNode, QueryValue, RangeSeries, Sample,
+    SeriesData,
 };
 
 /// The evaluator's view over the fetched data (issue #125): a selector
@@ -87,6 +88,12 @@ impl<'a> EvalData<'a> {
             Some(v) => v.as_slice(),
             None => self.base.get(id),
         }
+    }
+
+    /// Issue #579: the database's answer for the `Aggregate` node at
+    /// `self_pos`, if the fetch layer pushed it.
+    fn pushed(&self, self_pos: usize) -> Option<&PushedNode> {
+        self.base.pushed(self_pos)
     }
 }
 
@@ -3673,6 +3680,25 @@ fn eval_step(
             param_pos,
             self_pos,
         } => {
+            // Issue #579: the database already answered this node. Its
+            // vector at this step is the answer, and nothing below it is
+            // evaluated — the fetch layer read no sample for its selector.
+            if let Some(node) = data.pushed(*self_pos) {
+                let Some(v) = node.at(t_ms) else {
+                    return Err(PromqlError::Unsupported {
+                        construct: format!(
+                            "a pushed aggregate read at {t_ms}, which is not a point of its grid"
+                        ),
+                    });
+                };
+                if !node.annotations.is_empty() {
+                    caches
+                        .annotations
+                        .borrow_mut()
+                        .merge(node.annotations.clone());
+                }
+                return Ok(StepValue::Vector(v.to_vec()));
+            }
             let StepValue::Vector(v) =
                 eval_step(input, selectors, data, t_ms, lookback_ms, caches)?
             else {
@@ -9522,6 +9548,142 @@ mod tests {
         assert!(
             evaluate(&sq_plan, &sq_data).is_ok(),
             "the never() token must still complete the subquery plan"
+        );
+    }
+
+    // -- issue #579: an aggregate node the database already answered --
+
+    /// The `self_pos` of the first `Aggregate` node in written order.
+    fn first_aggregate_pos(e: &PlanExpr) -> usize {
+        match e {
+            PlanExpr::Aggregate { self_pos, .. } => *self_pos,
+            PlanExpr::Binary { lhs, .. } => first_aggregate_pos(lhs),
+            other => panic!("no aggregate on the left spine of {other:?}"),
+        }
+    }
+
+    fn pushed_sample(mode: &str, t_ms: i64, v: f64) -> InstantSample {
+        InstantSample {
+            labels: Labels::new([("mode".to_string(), mode.to_string())]),
+            metric_name: Some("m".to_string()),
+            drop_name: true,
+            t_ms,
+            v,
+            h: None,
+        }
+    }
+
+    /// A pushed node answers for its `Aggregate` at every step, and the
+    /// selector under it is not read: the fetched series below would give
+    /// a different `rate`, and the answer is the pushed one, divided.
+    #[test]
+    fn a_pushed_aggregate_answers_from_the_database_at_every_step() {
+        let p = plan(
+            &crate::parser::parse("sum by (mode) (rate(m[5m])) / 2").expect("parse"),
+            params(0, 120_000, 60_000),
+        )
+        .expect("plan");
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![series(
+                1,
+                &[("mode", "user")],
+                (0..20)
+                    .map(|k| Sample::float(-300_000 + k * 15_000, 1e6 * k as f64))
+                    .collect(),
+            )],
+        );
+        data.insert_pushed(
+            first_aggregate_pos(&p.root),
+            PushedNode {
+                start_ms: 0,
+                step_ms: 60_000,
+                steps: vec![
+                    vec![pushed_sample("user", 0, 10.0)],
+                    vec![],
+                    vec![pushed_sample("user", 120_000, 30.0)],
+                ],
+                annotations: Annotations::new(),
+            },
+        );
+        let QueryValue::Matrix(m) = evaluate(&p, &data).expect("evaluate") else {
+            panic!("a range query answers a matrix");
+        };
+        assert_eq!(m.len(), 1, "one group: {m:?}");
+        assert_eq!(
+            m[0].labels,
+            Labels::new([("mode".to_string(), "user".to_string())])
+        );
+        assert_eq!(m[0].metric_name, None, "the division drops the name");
+        let points: Vec<(i64, u64)> = m[0]
+            .points
+            .iter()
+            .map(|p| (p.t_ms, p.v.to_bits()))
+            .collect();
+        assert_eq!(
+            points,
+            vec![(0, 5.0f64.to_bits()), (120_000, 15.0f64.to_bits())],
+            "the pushed values, divided, and a gap where the node had no group"
+        );
+    }
+
+    /// A pushed node is never read at a time off its own grid: that would
+    /// answer from a different step. It is an error, not an empty vector.
+    #[test]
+    fn a_pushed_node_read_off_its_grid_is_an_error() {
+        let p = plan(
+            &crate::parser::parse("sum by (mode) (rate(m[5m]))").expect("parse"),
+            params(0, 0, 0),
+        )
+        .expect("plan");
+        let mut data = SeriesData::new();
+        data.insert_pushed(
+            first_aggregate_pos(&p.root),
+            PushedNode {
+                start_ms: 1_000,
+                step_ms: 1,
+                steps: vec![vec![pushed_sample("user", 1_000, 1.0)]],
+                annotations: Annotations::new(),
+            },
+        );
+        assert!(
+            evaluate(&p, &data).is_err(),
+            "an instant query at 0 against a node whose one point is at 1000"
+        );
+    }
+
+    /// The annotations the database-side node carries reach the answer.
+    #[test]
+    fn a_pushed_nodes_annotations_reach_the_answer() {
+        let p = plan(
+            &crate::parser::parse("max by (mode) (m)").expect("parse"),
+            params(0, 0, 0),
+        )
+        .expect("plan");
+        let mut annotations = Annotations::new();
+        annotations.info_at(
+            0,
+            crate::annotations::messages::histogram_ignored_in_aggregation_info("max"),
+        );
+        let mut data = SeriesData::new();
+        data.insert_pushed(
+            first_aggregate_pos(&p.root),
+            PushedNode {
+                start_ms: 0,
+                step_ms: 1,
+                steps: vec![vec![pushed_sample("user", 0, 1.0)]],
+                annotations,
+            },
+        );
+        let (value, annos) = super::evaluate(&p, &data).expect("evaluate");
+        let QueryValue::Vector(v) = value else {
+            panic!("an instant query answers a vector");
+        };
+        assert_eq!(v.len(), 1);
+        assert_eq!(
+            annos.base_messages().1,
+            vec!["PromQL info: ignored histogram in max aggregation"]
         );
     }
 }

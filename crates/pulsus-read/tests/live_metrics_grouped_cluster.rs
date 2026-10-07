@@ -108,6 +108,16 @@ fn shard1_config(database: &str) -> ChConnConfig {
     )
 }
 
+fn shard2_config(database: &str) -> ChConnConfig {
+    shard_config(
+        "PULSUS_TEST_CH_SHARD2_HOST",
+        "172.28.0.12",
+        "PULSUS_TEST_CH_SHARD2_HTTP_PORT",
+        8123,
+        database,
+    )
+}
+
 fn cluster_ctx(db: &str) -> RenderCtx {
     RenderCtx {
         db: db.to_string(),
@@ -434,4 +444,149 @@ async fn count(client: &ChClient, sql: &str) -> u64 {
         .await
         .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
     stream.next().await.expect("a row").expect("decode").n
+}
+
+/// Issue #579, T7: shape A over the distributed tables, where every
+/// series' samples were written to BOTH shards — alternate samples to each
+/// shard's local table. The window functions must see all of a series'
+/// rows, so the pushed answer equals the unpushed one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_pushed_rate_over_the_dist_tables_sees_every_shards_rows() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db("pulsus_read_it_pushed_rate_cluster");
+    let client = init_clustered_db(&db).await;
+    let shard2 = ChClient::new(shard2_config(&db))
+        .await
+        .expect("connect to shard2");
+
+    const METRIC_579: &str = "pushed_rate_cluster";
+    const SERIES_579: u64 = 8;
+    let now = now_ms();
+    let t = (now / 60_000) * 60_000;
+    let start = t - POINTS * 60_000;
+    let bucket = (now / ACTIVITY_BUCKET_MS) * ACTIVITY_BUCKET_MS;
+
+    let mut series = Vec::new();
+    let (mut on_shard1, mut on_shard2) = (Vec::new(), Vec::new());
+    for fp in 1..=SERIES_579 {
+        let labels: BTreeMap<&str, String> = BTreeMap::from([
+            ("status", ["200", "500"][(fp % 2) as usize].to_string()),
+            ("instance", format!("i{fp}")),
+        ]);
+        series.push(SeedSeriesRow {
+            metric_name: METRIC_579.to_string(),
+            fingerprint: u128::from(fp),
+            unix_milli: bucket,
+            labels: serde_json::to_string(&labels).expect("labels json"),
+        });
+        // A counter with one reset, its samples alternating between the
+        // two shards.
+        for k in 0..=(POINTS * 4) {
+            let row = SeedSampleRow {
+                fingerprint: u128::from(fp),
+                unix_milli: start - 300_000 + k * 15_000 + (fp as i64) * 37,
+                value: if k < 120 {
+                    k as f64 * fp as f64
+                } else {
+                    (k - 120) as f64
+                },
+            };
+            if k % 2 == 0 {
+                on_shard1.push(row);
+            } else {
+                on_shard2.push(row);
+            }
+        }
+    }
+    let values = series
+        .iter()
+        .map(|r| {
+            format!(
+                "({now}, 2, '{}', {}, {}, '{}', 0)",
+                r.metric_name, r.fingerprint, r.unix_milli, r.labels
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    client
+        .execute(
+            &format!(
+                "INSERT INTO metric_landing \
+                 (received_ms, kind, metric_name, fingerprint, unix_milli, labels, value_type) \
+                 VALUES {values}"
+            ),
+            &QuerySettings::new(),
+            Idempotency::NonIdempotent,
+        )
+        .await
+        .expect("seed shard 1's metric_landing");
+    client
+        .insert_block("metric_samples", &on_shard1)
+        .await
+        .expect("seed shard 1's metric_samples");
+    shard2
+        .insert_block("metric_samples", &on_shard2)
+        .await
+        .expect("seed shard 2's metric_samples");
+    let per_shard = "SELECT toUInt64(count()) AS n FROM metric_samples WHERE fingerprint = 1";
+    assert!(
+        count(&client, per_shard).await > 0 && count(&shard2, per_shard).await > 0,
+        "one series' samples must sit on both shards"
+    );
+
+    let cache = Arc::new(LabelCache::new(
+        ChClient::new(shard1_config(&db)).await.expect("connect"),
+        cache_config(&db),
+    ));
+    cache.refresh().await.expect("refresh");
+    assert!(cache.is_warm());
+    let pushed = MetricsEngine::new(
+        ChClient::new(shard1_config(&db)).await.expect("connect"),
+        Arc::clone(&cache),
+        engine_config(&db, true),
+    );
+    let unpushed = MetricsEngine::new(
+        ChClient::new(shard1_config(&db)).await.expect("connect"),
+        Arc::clone(&cache),
+        engine_config(&db, false),
+    );
+    let params = MetricQueryParams {
+        start_ms: start,
+        end_ms: t,
+        step_ms: 60_000,
+    };
+    for query in [
+        format!("sum by (status) (rate({METRIC_579}[5m]))"),
+        format!("avg by (status) (increase({METRIC_579}[5m]))"),
+        format!("max(irate({METRIC_579}[5m]))"),
+    ] {
+        let expr = parse(&query).expect("parse");
+        let (a, _, explain) = pushed
+            .query_explained(&expr, &params)
+            .await
+            .unwrap_or_else(|e| panic!("{query} (pushed, clustered): {e:?}"));
+        assert!(
+            explain
+                .stages
+                .iter()
+                .any(|s| s.name == "pushed_aggregate" && s.sql.starts_with("WITH ")),
+            "{query}: the push was not taken: {:?}",
+            explain.stages
+        );
+        let (b, _) = unpushed
+            .query(&expr, &params)
+            .await
+            .unwrap_or_else(|e| panic!("{query} (unpushed, clustered): {e:?}"));
+        let (a, b) = (answer_of(a), answer_of(b));
+        assert!(!a.is_empty(), "{query}: an answer");
+        assert_eq!(
+            a, b,
+            "{query}: the pushed answer over the _dist tables differs from the unpushed one"
+        );
+    }
+
+    let bootstrap = ChClient::new(shard1_config("default"))
+        .await
+        .expect("connect (bootstrap)");
+    drop_database(&bootstrap, &db).await;
 }

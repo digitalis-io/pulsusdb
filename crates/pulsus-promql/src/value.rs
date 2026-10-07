@@ -249,6 +249,10 @@ pub struct FetchedSeries {
 #[derive(Debug, Clone, Default)]
 pub struct SeriesData {
     by_selector: HashMap<SelectorId, Vec<FetchedSeries>>,
+    /// Issue #579: aggregate nodes the database already answered, keyed by
+    /// the `Aggregate` node's `self_pos`. The evaluator returns a node's
+    /// vector from here and evaluates nothing below it.
+    pushed: HashMap<usize, PushedNode>,
 }
 
 impl SeriesData {
@@ -260,11 +264,52 @@ impl SeriesData {
         self.by_selector.insert(id, series);
     }
 
+    /// Issue #579: the answer of the `Aggregate` node at `self_pos`, read
+    /// from the database rather than evaluated here.
+    pub fn insert_pushed(&mut self, self_pos: usize, node: PushedNode) {
+        self.pushed.insert(self_pos, node);
+    }
+
+    /// The pushed answer of the `Aggregate` node at `self_pos`, if any.
+    pub fn pushed(&self, self_pos: usize) -> Option<&PushedNode> {
+        self.pushed.get(&self_pos)
+    }
+
     /// The selector's fetched series, or an empty slice if the selector
     /// was never populated (treated identically to "matched zero
     /// fingerprints" — never an error).
     pub fn get(&self, id: SelectorId) -> &[FetchedSeries] {
         self.by_selector.get(&id).map(Vec::as_slice).unwrap_or(&[])
+    }
+}
+
+/// Issue #579: one aggregate node's answer at every point of the query's
+/// evaluation grid, as the database computed it.
+///
+/// `steps[i]` is the node's vector at `start_ms + i * step_ms`, in
+/// `aggregate_reduce`'s output order (sorted by labels, then name). An
+/// instant query is a one-point grid with `step_ms = 1`.
+///
+/// `annotations` are the ones the node raises over the whole grid; the
+/// evaluator merges them when it reads the node.
+#[derive(Debug, Clone, Default)]
+pub struct PushedNode {
+    pub start_ms: i64,
+    pub step_ms: i64,
+    pub steps: Vec<Vec<InstantSample>>,
+    pub annotations: crate::annotations::Annotations,
+}
+
+impl PushedNode {
+    /// The node's vector at `t_ms`, or `None` when `t_ms` is not a point
+    /// of this node's grid.
+    pub fn at(&self, t_ms: i64) -> Option<&[InstantSample]> {
+        let offset = t_ms.checked_sub(self.start_ms)?;
+        if offset < 0 || self.step_ms <= 0 || offset % self.step_ms != 0 {
+            return None;
+        }
+        let i = usize::try_from(offset / self.step_ms).ok()?;
+        self.steps.get(i).map(Vec::as_slice)
     }
 }
 

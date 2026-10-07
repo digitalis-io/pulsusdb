@@ -22,7 +22,9 @@ rewrite docs/schemas.md:33-33
 # paragraph that part rewrote (the activity and lookup tables, the four
 # statements, the fallback's compile probe), carried across rather than
 # introduced.
-rewrite docs/schemas.md:174-174 refs=#25,#559,#560,#603,#16,#171,#498,#2,#57,#584,#586,#587,#5,#63,#75,#478,#555,#26,#623,#125,#315,#472,#549,#7
+# Issue #579 adds #579, its own issue, where the schema's PromQL obligation
+# paragraph names the second reduction it compiles into SQL.
+rewrite docs/schemas.md:174-174 refs=#25,#559,#560,#603,#16,#171,#498,#2,#57,#584,#586,#587,#5,#63,#75,#478,#555,#26,#623,#125,#315,#472,#549,#7,#579
 # `refs=#112` is a NEW reference on this file rather than a carried one. §2.4's
 # writer-contract paragraph gained the reason the read path does not route on
 # `metric_series.value_type`, and that reason is the decision A1's plan v5
@@ -42,7 +44,10 @@ rewrite docs/schemas.md:1089-1089 refs=#112
 # class as the `#556` on `docs/architecture.md` the header names, and the
 # column is per file.
 rewrite docs/schemas.md:691-692 refs=#556
-rewrite docs/architecture.md:378-378 refs=#560
+# Issue #579 adds #549 and #579 to this file's lines. #549 is carried: the
+# two paragraphs of section 5.1 that already cited it now also state what
+# #579 pushes, so the rule reads them as added. #579 is the change itself.
+rewrite docs/architecture.md:378-378 refs=#560,#549,#579
 rewrite docs/116.md:64-64
 rewrite docs/116.md:75-75
 rewrite crates/pulsus-clickhouse/src/client.rs:156-164 refs=#560

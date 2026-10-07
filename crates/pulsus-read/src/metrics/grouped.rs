@@ -1,29 +1,42 @@
-//! Issue #549: the grouped instant read — eligibility, group assignment,
-//! the threshold, and the fold of the statements' run rows back into a
-//! PromQL value.
+//! Issues #549 and #579: the aggregate nodes the database answers —
+//! eligibility, group assignment, the threshold, and the reading of the
+//! statements' rows back into each node's answer.
+//!
+//! Two shapes, at any node of the query:
+//!
+//! - **shape B** (#549): `min`/`max`/`count`/`group` over a plain instant
+//!   selector, one run statement per fingerprint chunk;
+//! - **shape A** (#579): `sum`/`avg`/`count`/`min`/`max` over
+//!   `rate`/`irate`/`increase` of a plain range selector, one statement
+//!   per node — split by time over [`PUSHED_SERIES_STEPS_PER_STATEMENT`] —
+//!   returning one row per group per step.
 //!
 //! # Where the decision is taken
 //!
 //! ```text
 //! query_inner
 //!   |-- plan = pulsus_promql::plan(expr, params)
-//!   |-- grouped::shape_of(&plan, &plan_params, &cfg) -> Option<GroupedShape>
-//!   |     PURE, before the fetch loop. One selector; the root is
-//!   |     Aggregate{min|max|count|group, grouping, Selector(id)} over a
-//!   |     PLAIN instant selector; the grid arithmetic does not overflow;
-//!   |     the flag is on. None -> today's route, nothing else changes.
-//!   `-- the phase-1 loop, for that one selector
+//!   |-- grouped::node_verdicts(&plan, &plan_params, &cfg)
+//!   |     PURE, before the fetch loop. Every Aggregate node over a
+//!   |     selector or a range function, with a PushShape or the
+//!   |     NodeDecline that names why not. The flag is on.
+//!   `-- the phase-1 loop, for each selector a pushed node owns
 //!         resolution = resolver.resolve_labelled(...)   <- the ONE resolve
-//!         grouped::decide(shape, &resolution, grid)
-//!           Series(pairs) -> gids from the pairs, then `series >= 2 * groups`
+//!         grouped::decide / grouped::decide_range
+//!           Series(pairs) -> gids from the pairs (shape B: then the
+//!                            `series >= 2 * groups` threshold)
 //!           SqlFallback   -> Err(ResolutionNotFingerprints)
-//!         Ok  -> render the grouped statements, skip the chunk builders
+//!         Ok  -> render the node's statements, skip the chunk builders
 //!         Err -> fall through with the SAME resolution
 //! ```
 //!
-//! [`shape_of`] is the **sole owner** of the overflow guard and of the
-//! feature flag: [`decide`] re-checks neither, and
-//! [`super::grouped_sql::grouped_fetch`] re-checks neither.
+//! The evaluator then takes each pushed node's vector at every step from
+//! `SeriesData::pushed` and evaluates nothing below it; every other node
+//! is evaluated over the pushed nodes' results as before.
+//!
+//! [`node_verdicts`] is the **sole owner** of the overflow guard and of
+//! the feature flag: [`decide`] and [`decide_range`] re-check neither,
+//! and neither statement builder re-checks either.
 //!
 //! # The group key never enters SQL
 //!
@@ -83,7 +96,7 @@ use std::collections::HashMap;
 
 use pulsus_promql::{
     AggOp, Annotations, CancelToken, Grouping, InstantSample, Labels, PlanExpr, PlanParams, Point,
-    PromqlError, QueryPlan, QueryValue, RangeSeries, SelectorId, group_key_of,
+    PromqlError, PushedNode, QueryPlan, QueryValue, RangeSeries, SelectorId, group_key_of,
 };
 
 use super::exec::MetricsConfig;
@@ -131,9 +144,9 @@ impl GroupedOp {
 
 /// Why [`decide`] declined, and **only** what `decide` can produce.
 ///
-/// [`shape_of`] consumes the aggregate shape, the plain-selector checks,
-/// the grid arithmetic and the flag, returning `None` for all four, so
-/// none of them has a variant here. A refusal reason is written only
+/// [`node_verdicts`] consumes the aggregate shape, the plain-selector
+/// checks, the grid arithmetic and the flag, so none of them has a variant
+/// here. A refusal reason is written only
 /// after naming the line that returns it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeclineReason {
@@ -176,7 +189,8 @@ pub struct Run {
     pub flags: Option<u8>,
 }
 
-/// What [`shape_of`] establishes without looking at any resolution.
+/// What [`node_verdicts`] establishes for a shape-B node without looking
+/// at any resolution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupedShape {
     pub op: GroupedOp,
@@ -214,56 +228,326 @@ pub struct GroupedPush {
     pub instant: bool,
 }
 
-/// Is this plan one the grouped statement can answer?
-///
-/// Pure, and taken **before** the fetch loop, so a decline costs one
-/// walk of the plan root and nothing else changes.
-pub fn shape_of(
+/// Issue #579: the largest `series x steps` one shape-A statement may
+/// compute. A node over it is split by time (plan section 3.4): memory in
+/// the database grows with series times steps, about 520 B each,
+/// measured.
+pub const PUSHED_SERIES_STEPS_PER_STATEMENT: usize = 1_048_576;
+
+/// Issue #579: the group id of the row that carries the count of
+/// histogram samples in a shape-A statement's window. No real group can
+/// take it: a gid is below the series count, which the build-time
+/// assertion below keeps under `u32::MAX`.
+pub const HISTOGRAM_SENTINEL_GID: u32 = u32::MAX;
+
+/// Issue #579: the aggregations shape A answers in the database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeAggOp {
+    Sum,
+    Avg,
+    Count,
+    Min,
+    Max,
+}
+
+/// Issue #579: the range functions shape A computes in the database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushedRangeFn {
+    Rate,
+    Irate,
+    Increase,
+}
+
+/// Issue #579: what [`pushed_nodes`] establishes for a shape-A node — an
+/// aggregation over `rate`/`irate`/`increase` of a plain range selector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RangeShape {
+    pub op: RangeAggOp,
+    pub func: PushedRangeFn,
+    pub selector: SelectorId,
+    pub metric_name: String,
+    pub grouping: Option<Grouping>,
+    /// The request's grid. `lookback_ms` is carried but unused: a range
+    /// function's window is `range_ms`.
+    pub grid: Grid,
+    pub range_ms: i64,
+    pub instant: bool,
+}
+
+/// Issue #579: the two kinds of node the database answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PushKind {
+    /// Shape A: plan section 3.1.
+    Range(RangeShape),
+    /// Shape B: issue #549's grouped instant read, at any node.
+    Instant(GroupedShape),
+}
+
+/// Issue #579: one `Aggregate` node the database can answer, keyed by its
+/// `self_pos` — the key the evaluator looks the answer up by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushShape {
+    pub self_pos: usize,
+    pub kind: PushKind,
+}
+
+impl PushShape {
+    /// The one selector under this node.
+    pub fn selector(&self) -> SelectorId {
+        match &self.kind {
+            PushKind::Range(r) => r.selector,
+            PushKind::Instant(g) => g.selector,
+        }
+    }
+}
+
+/// Issue #579: why an `Aggregate` node over a selector or a range
+/// function is not pushed, decided from the plan alone. The numbers are
+/// the design's named fallbacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeDecline {
+    /// F1: an aggregation neither shape answers over this child.
+    Aggregation,
+    /// F2: a range function other than `rate`, `irate` or `increase`.
+    RangeFunction,
+    /// F3: the selector is not plain — `offset`, `@`, a subquery source,
+    /// `anchored`/`smoothed`, the `info()` family, histogram statistics,
+    /// or no single concrete metric name.
+    Selector,
+    /// F4: `by (__name__)` over a range function.
+    NameGrouping,
+    /// F8: the grid arithmetic would overflow in the database.
+    GridOverflow,
+}
+
+/// Issue #579: what [`decide_range`] establishes once the resolution is in
+/// hand.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RangePush {
+    pub op: RangeAggOp,
+    pub func: PushedRangeFn,
+    pub selector: SelectorId,
+    /// Ascending.
+    pub fingerprints: Vec<Fingerprint>,
+    /// Parallel to `fingerprints`.
+    pub gids: Vec<u32>,
+    /// Indexed by group id.
+    pub groups: Vec<(Labels, Option<String>)>,
+    pub grid: Grid,
+    pub range_ms: i64,
+}
+
+/// Issue #579: a shape-A node's rows, read back.
+#[derive(Debug, Clone)]
+pub enum RangeOutcome {
+    /// The node's answer.
+    Node(PushedNode),
+    /// The sentinel row counted this many histogram samples in the
+    /// window (F6): the answer is discarded and the selector is fetched
+    /// as it is without the push.
+    Histograms(u64),
+}
+
+/// Issue #579: every `Aggregate` node over a selector or a range function,
+/// in written order, with its verdict. Nodes inside a subquery are not
+/// visited: a subquery evaluates its inner expression on its own grid.
+pub fn node_verdicts(
     plan: &QueryPlan,
     params: &PlanParams,
     cfg: &MetricsConfig,
-) -> Option<GroupedShape> {
+) -> Vec<(usize, Result<PushShape, NodeDecline>)> {
     // The flag is read HERE and nowhere else in this module or in
     // `grouped_sql`.
     if !cfg.grouped_push {
-        return None;
+        return Vec::new();
     }
-    // One selector. A binary operator, a set operator or `info()` puts a
-    // second one in the plan, and none of those is in scope.
-    if plan.selectors.len() != 1 {
-        return None;
-    }
-    let PlanExpr::Aggregate {
+    let mut out = Vec::new();
+    walk(&plan.root, plan, params, &mut out);
+    out
+}
+
+/// Visits `e` and its children in written order. A node that is pushed
+/// is not descended into: everything below it is the database's.
+fn walk(
+    e: &PlanExpr,
+    plan: &QueryPlan,
+    params: &PlanParams,
+    out: &mut Vec<(usize, Result<PushShape, NodeDecline>)>,
+) {
+    if let PlanExpr::Aggregate {
         op,
         expr,
         param,
         grouping,
         expr_pos,
+        self_pos,
         ..
-    } = &plan.root
-    else {
-        return None;
-    };
-    // `min`/`max`/`count`/`group` take no parameter; a `param` here would
-    // mean the planner built a shape this code has not been written for.
-    if param.is_some() {
-        return None;
+    } = e
+        && let Some(verdict) = verdict_of(
+            *op,
+            expr,
+            param.is_some(),
+            grouping.as_ref(),
+            *expr_pos,
+            plan,
+            params,
+        )
+    {
+        let pushed = verdict.is_ok();
+        out.push((
+            *self_pos,
+            verdict.map(|kind| PushShape {
+                self_pos: *self_pos,
+                kind,
+            }),
+        ));
+        if pushed {
+            return;
+        }
     }
-    let op = GroupedOp::of(*op)?;
-    // The child must be the SELECTOR itself. `max by (status)
-    // (rate(m[5m]))` has a `RangeFn` here and keeps today's route.
-    let PlanExpr::Selector(id) = expr.as_ref() else {
-        return None;
-    };
-    let sel = plan.selectors.iter().find(|s| s.id == *id)?;
+    for child in children(e) {
+        walk(child, plan, params, out);
+    }
+}
 
-    // A PLAIN instant selector: one concrete metric name, no non-`Eq`
-    // `__name__` matcher, no range, no offset, no `@`, no enclosing
-    // subquery context, not the `info()` family, no histogram-stats
-    // reduction, and neither extended-range modifier.
-    let metric_name = sel.metric_name.clone()?;
+/// A node's children in written order. **No `_` arm**, so a new
+/// [`PlanExpr`] variant fails to compile here. A subquery's inner
+/// expression is deliberately not a child: it is evaluated on the
+/// subquery's own grid, never the request's.
+fn children(e: &PlanExpr) -> Vec<&PlanExpr> {
+    match e {
+        PlanExpr::Selector(_)
+        | PlanExpr::Time
+        | PlanExpr::Scalar(_)
+        | PlanExpr::StringLiteral(_)
+        | PlanExpr::RangeVector { .. }
+        | PlanExpr::RangeFn { .. }
+        | PlanExpr::OverTime { .. }
+        | PlanExpr::AbsentOverTime { .. } => Vec::new(),
+        PlanExpr::OverTimeParam { args, .. } | PlanExpr::ScalarFn { args, .. } => {
+            args.iter().map(Box::as_ref).collect()
+        }
+        PlanExpr::Absent { arg, .. }
+        | PlanExpr::Sort { arg, .. }
+        | PlanExpr::SortByLabel { arg, .. }
+        | PlanExpr::LabelReplace { arg, .. }
+        | PlanExpr::LabelJoin { arg, .. }
+        | PlanExpr::HistogramAccessor { arg, .. }
+        | PlanExpr::Timestamp { arg, .. }
+        | PlanExpr::ScalarOf { arg }
+        | PlanExpr::VectorOf { arg } => vec![arg.as_ref()],
+        PlanExpr::HistogramQuantile { quantile, expr, .. } => vec![quantile, expr],
+        PlanExpr::HistogramQuantiles {
+            expr, quantiles, ..
+        } => std::iter::once(expr.as_ref())
+            .chain(quantiles.iter().map(Box::as_ref))
+            .collect(),
+        PlanExpr::HistogramFraction {
+            lower, upper, expr, ..
+        } => vec![lower, upper, expr],
+        PlanExpr::Aggregate { expr, param, .. } => std::iter::once(expr.as_ref())
+            .chain(param.iter().map(Box::as_ref))
+            .collect(),
+        PlanExpr::CountValues { expr, .. } => vec![expr.as_ref()],
+        PlanExpr::Binary { lhs, rhs, .. } | PlanExpr::SetOp { lhs, rhs, .. } => vec![lhs, rhs],
+        PlanExpr::MathFn {
+            arg, scalar_args, ..
+        } => std::iter::once(arg.as_ref())
+            .chain(scalar_args.iter().map(Box::as_ref))
+            .collect(),
+        PlanExpr::DateFn { arg, .. } => arg.iter().map(Box::as_ref).collect(),
+        PlanExpr::Info { base, .. } => vec![base.as_ref()],
+    }
+}
+
+/// The verdict on one `Aggregate` node, or `None` when its child is
+/// neither a selector nor a range function — not a candidate for either
+/// shape, so there is nothing to report.
+fn verdict_of(
+    op: AggOp,
+    expr: &PlanExpr,
+    has_param: bool,
+    grouping: Option<&Grouping>,
+    expr_pos: usize,
+    plan: &QueryPlan,
+    params: &PlanParams,
+) -> Option<Result<PushKind, NodeDecline>> {
+    match expr {
+        // Shape B: issue #549's checks, at any node.
+        PlanExpr::Selector(id) => {
+            let Some(op) = GroupedOp::of(op).filter(|_| !has_param) else {
+                return Some(Err(NodeDecline::Aggregation));
+            };
+            let sel = plan.selectors.iter().find(|s| s.id == *id)?;
+            let Some(metric_name) = plain_metric_name(sel).filter(|_| sel.range_ms.is_none())
+            else {
+                return Some(Err(NodeDecline::Selector));
+            };
+            let Some(grid) = grid_of(params) else {
+                return Some(Err(NodeDecline::GridOverflow));
+            };
+            Some(Ok(PushKind::Instant(GroupedShape {
+                op,
+                selector: *id,
+                metric_name,
+                grouping: grouping.cloned(),
+                grid,
+                expr_pos,
+                instant: params.step_ms == 0,
+            })))
+        }
+        // Shape A.
+        PlanExpr::RangeFn { func, source, .. } => {
+            let Some(op) = RangeAggOp::of(op).filter(|_| !has_param) else {
+                return Some(Err(NodeDecline::Aggregation));
+            };
+            let Some(func) = PushedRangeFn::of(*func) else {
+                return Some(Err(NodeDecline::RangeFunction));
+            };
+            let pulsus_promql::plan::RangeSource::Selector(id) = source else {
+                return Some(Err(NodeDecline::Selector));
+            };
+            let sel = plan.selectors.iter().find(|s| s.id == *id)?;
+            let (Some(metric_name), Some(range_ms)) = (plain_metric_name(sel), sel.range_ms) else {
+                return Some(Err(NodeDecline::Selector));
+            };
+            // The output's name channel is the group key's, which the gid
+            // does not carry.
+            if grouping.is_some_and(|g| !g.without && g.labels.iter().any(|l| l == "__name__")) {
+                return Some(Err(NodeDecline::NameGrouping));
+            }
+            let Some(grid) = range_grid_of(params, range_ms) else {
+                return Some(Err(NodeDecline::GridOverflow));
+            };
+            Some(Ok(PushKind::Range(RangeShape {
+                op,
+                func,
+                selector: *id,
+                metric_name,
+                grouping: grouping.cloned(),
+                grid,
+                range_ms,
+                instant: params.step_ms == 0,
+            })))
+        }
+        PlanExpr::OverTime { .. } | PlanExpr::OverTimeParam { .. } => {
+            Some(Err(if RangeAggOp::of(op).is_some() && !has_param {
+                NodeDecline::RangeFunction
+            } else {
+                NodeDecline::Aggregation
+            }))
+        }
+        _ => None,
+    }
+}
+
+/// The selector's one concrete metric name when it is PLAIN: no non-`Eq`
+/// `__name__` matcher, no offset, no `@`, no enclosing subquery context,
+/// not the `info()` family, no histogram-stats reduction, and neither
+/// extended-range modifier. The range is the caller's to check.
+fn plain_metric_name(sel: &pulsus_promql::SelectorSpec) -> Option<String> {
+    let name = sel.metric_name.clone()?;
     if !sel.name_matchers.is_empty()
-        || sel.range_ms.is_some()
         || sel.offset_ms != 0
         || sel.at_ms.is_some()
         || sel.fetch != pulsus_promql::plan::FetchExtent::default()
@@ -274,17 +558,215 @@ pub fn shape_of(
     {
         return None;
     }
+    Some(name)
+}
 
-    let grid = grid_of(params)?;
-    Some(GroupedShape {
-        op,
-        selector: *id,
-        metric_name,
-        grouping: grouping.clone(),
-        grid,
-        expr_pos: *expr_pos,
-        instant: params.step_ms == 0,
+/// Issue #579: every `Aggregate` node the database can answer.
+pub fn pushed_nodes(plan: &QueryPlan, params: &PlanParams, cfg: &MetricsConfig) -> Vec<PushShape> {
+    node_verdicts(plan, params, cfg)
+        .into_iter()
+        .filter_map(|(_, v)| v.ok())
+        .collect()
+}
+
+/// Issue #579: assign every resolved fingerprint of a shape-A node to its
+/// group. No threshold: one row per group per step is fewer rows than the
+/// raw samples for every grouping.
+pub fn decide_range(
+    shape: &RangeShape,
+    resolution: &LabelledResolution,
+) -> Result<RangePush, DeclineReason> {
+    let LabelledResolution::Series(pairs) = resolution else {
+        return Err(DeclineReason::ResolutionNotFingerprints);
+    };
+    let (fingerprints, gids, groups) =
+        assign_groups(pairs, &shape.metric_name, shape.grouping.as_ref());
+    Ok(RangePush {
+        op: shape.op,
+        func: shape.func,
+        selector: shape.selector,
+        fingerprints,
+        gids,
+        groups,
+        grid: shape.grid,
+        range_ms: shape.range_ms,
     })
+}
+
+/// Issue #579: splits a shape-A node's grid by time so no statement
+/// computes more than `cap` series-steps. Each entry is the first grid
+/// index of the chunk and the chunk's own grid.
+pub fn time_chunks(grid: Grid, series: usize, cap: usize) -> Vec<(u32, Grid)> {
+    let series = series.max(1);
+    if series.saturating_mul(grid.points as usize) <= cap {
+        return vec![(0, grid)];
+    }
+    // At least one step a statement, whatever the series count.
+    let per = u32::try_from((cap / series).max(1)).unwrap_or(u32::MAX);
+    let mut out = Vec::new();
+    let mut g0 = 0u32;
+    while g0 < grid.points {
+        let points = per.min(grid.points - g0);
+        out.push((
+            g0,
+            Grid {
+                start_ms: grid.start_ms + i64::from(g0) * grid.step_ms,
+                points,
+                ..grid
+            },
+        ));
+        g0 += points;
+    }
+    out
+}
+
+/// Issue #579: a shape-A node's rows, one `Vec` per time chunk with that
+/// chunk's first grid index, read into the node's answer.
+pub fn range_node(
+    push: &RangePush,
+    chunks: Vec<(u32, Vec<super::grouped_rows::RangeAggRow>)>,
+    cancel: &CancelToken,
+) -> Result<RangeOutcome, PromqlError> {
+    let points = push.grid.points as usize;
+    let mut cells: Vec<Vec<(u32, f64)>> = vec![Vec::new(); points];
+    let mut histograms = 0.0f64;
+    for (g0, rows) in chunks {
+        if cancel.is_cancelled() {
+            return Err(PromqlError::Cancelled);
+        }
+        for row in rows {
+            // Picked out by its id, never by its position: the final
+            // `ORDER BY` binds only to the last `SELECT` of the union.
+            if row.gid == HISTOGRAM_SENTINEL_GID {
+                histograms += row.agg.unwrap_or(0.0);
+                continue;
+            }
+            let Some(agg) = row.agg else {
+                return Err(PromqlError::Unsupported {
+                    construct: "a NULL aggregate in a pushed node's row".to_string(),
+                });
+            };
+            let gi = g0 as usize + row.gi as usize;
+            // Unreachable: every fingerprint read is in `fps`, so every
+            // gid indexes `groups`, and `gi` is below the chunk's points.
+            if gi >= points || row.gid as usize >= push.groups.len() {
+                continue;
+            }
+            cells[gi].push((row.gid, agg));
+        }
+    }
+    if histograms > 0.0 {
+        return Ok(RangeOutcome::Histograms(histograms as u64));
+    }
+    // `aggregate_reduce`'s output order: by labels, then name.
+    let mut rank: Vec<u32> = (0..push.groups.len() as u32).collect();
+    rank.sort_by(|a, b| {
+        let (la, na) = &push.groups[*a as usize];
+        let (lb, nb) = &push.groups[*b as usize];
+        (la, na).cmp(&(lb, nb))
+    });
+    let mut position = vec![0u32; push.groups.len()];
+    for (i, gid) in rank.iter().enumerate() {
+        position[*gid as usize] = i as u32;
+    }
+    let mut steps = Vec::with_capacity(points);
+    for (gi, mut cell) in cells.into_iter().enumerate() {
+        if gi % 1_024 == 0 && cancel.is_cancelled() {
+            return Err(PromqlError::Cancelled);
+        }
+        cell.sort_by_key(|(gid, _)| position[*gid as usize]);
+        let t_ms = push.grid.start_ms + gi as i64 * push.grid.step_ms;
+        steps.push(
+            cell.into_iter()
+                .map(|(gid, v)| {
+                    let (labels, metric_name) = &push.groups[gid as usize];
+                    InstantSample {
+                        labels: labels.clone(),
+                        metric_name: metric_name.clone(),
+                        // A range function drops the name, and the
+                        // group's verdict is the OR of its members'.
+                        drop_name: true,
+                        t_ms,
+                        v,
+                        h: None,
+                    }
+                })
+                .collect(),
+        );
+    }
+    Ok(RangeOutcome::Node(PushedNode {
+        start_ms: push.grid.start_ms,
+        step_ms: push.grid.step_ms,
+        steps,
+        annotations: Annotations::new(),
+    }))
+}
+
+/// Issue #579: a shape-B node's runs, folded into the node's answer.
+pub fn instant_node(
+    push: &GroupedPush,
+    chunks: Vec<Vec<Run>>,
+    cancel: &CancelToken,
+) -> Result<PushedNode, PromqlError> {
+    let mut annotations = Annotations::new();
+    let value = fold(push, chunks, &mut annotations, cancel)?;
+    let mut steps: Vec<Vec<InstantSample>> = vec![Vec::new(); push.grid.points as usize];
+    let index = |t_ms: i64| ((t_ms - push.grid.start_ms) / push.grid.step_ms) as usize;
+    // `fold`'s output is already in `(labels, name)` order, so each step
+    // receives its samples in that order.
+    match value {
+        QueryValue::Vector(v) => {
+            for s in v {
+                steps[index(s.t_ms)].push(s);
+            }
+        }
+        QueryValue::Matrix(m) => {
+            for series in m {
+                for p in series.points {
+                    steps[index(p.t_ms)].push(InstantSample {
+                        labels: series.labels.clone(),
+                        metric_name: series.metric_name.clone(),
+                        drop_name: series.drop_name,
+                        t_ms: p.t_ms,
+                        v: p.v,
+                        h: None,
+                    });
+                }
+            }
+        }
+        // `fold` answers a vector or a matrix and nothing else.
+        _ => {}
+    }
+    Ok(PushedNode {
+        start_ms: push.grid.start_ms,
+        step_ms: push.grid.step_ms,
+        steps,
+        annotations,
+    })
+}
+
+impl RangeAggOp {
+    fn of(op: AggOp) -> Option<Self> {
+        match op {
+            AggOp::Sum => Some(RangeAggOp::Sum),
+            AggOp::Avg => Some(RangeAggOp::Avg),
+            AggOp::Count => Some(RangeAggOp::Count),
+            AggOp::Min => Some(RangeAggOp::Min),
+            AggOp::Max => Some(RangeAggOp::Max),
+            _ => None,
+        }
+    }
+}
+
+impl PushedRangeFn {
+    fn of(f: pulsus_promql::RangeFn) -> Option<Self> {
+        match f {
+            pulsus_promql::RangeFn::Rate => Some(PushedRangeFn::Rate),
+            pulsus_promql::RangeFn::Irate => Some(PushedRangeFn::Irate),
+            pulsus_promql::RangeFn::Increase => Some(PushedRangeFn::Increase),
+            pulsus_promql::RangeFn::Delta => None,
+        }
+    }
 }
 
 /// The request's grid, or `None` when the arithmetic the DATABASE
@@ -343,6 +825,22 @@ fn grid_of(params: &PlanParams) -> Option<Grid> {
     })
 }
 
+/// Issue #579: the request's grid for a shape-A node, or `None` when the
+/// arithmetic its statement evaluates would overflow: [`grid_of`]'s guard
+/// with the range in place of the lookback — a sample covers grid indices
+/// up to `ts + range` — and the window's lower bound, `start - range`.
+fn range_grid_of(params: &PlanParams, range_ms: i64) -> Option<Grid> {
+    params.start_ms.checked_sub(range_ms)?;
+    let grid = grid_of(&PlanParams {
+        lookback_ms: range_ms,
+        ..*params
+    })?;
+    Some(Grid {
+        lookback_ms: params.lookback_ms,
+        ..grid
+    })
+}
+
 /// A gid must fit the statement's `UInt32` column.
 ///
 /// There is **no runtime guard** on the cast, and there does not need to
@@ -369,36 +867,8 @@ pub fn decide(
     let LabelledResolution::Series(pairs) = resolution else {
         return Err(DeclineReason::ResolutionNotFingerprints);
     };
-    // Ascending fingerprint order, the order `build_chunk_sqls` sorts
-    // into — so a chunk boundary falls in the same place on both routes
-    // and the fold's chunk order IS fingerprint order.
-    let mut by_fp: Vec<(Fingerprint, &pulsus_model::LabelSet)> =
-        pairs.iter().map(|(fp, ls)| (*fp, ls)).collect();
-    by_fp.sort_unstable_by_key(|(fp, _)| *fp);
-
-    let mut groups: Vec<(Labels, Option<String>)> = Vec::new();
-    let mut seen: HashMap<(Labels, Option<String>), u32> = HashMap::new();
-    let mut fingerprints = Vec::with_capacity(by_fp.len());
-    let mut gids = Vec::with_capacity(by_fp.len());
-    for (fp, labelset) in by_fp {
-        let key = group_key_of(
-            &super::exec::to_promql_labels(labelset),
-            Some(&shape.metric_name),
-            shape.grouping.as_ref(),
-        );
-        let gid = match seen.get(&key) {
-            Some(g) => *g,
-            None => {
-                // The cast is safe under the ceiling asserted above.
-                let g = groups.len() as u32;
-                groups.push(key.clone());
-                seen.insert(key, g);
-                g
-            }
-        };
-        fingerprints.push(fp);
-        gids.push(gid);
-    }
+    let (fingerprints, gids, groups) =
+        assign_groups(pairs, &shape.metric_name, shape.grouping.as_ref());
 
     // The threshold. An empty resolution passes it (0 >= 0) and yields
     // zero chunks, zero statements and an empty answer — the same answer
@@ -418,6 +888,50 @@ pub fn decide(
         expr_pos: shape.expr_pos,
         instant: shape.instant,
     })
+}
+
+/// The group of every resolved fingerprint, by
+/// [`pulsus_promql::group_key_of`]: fingerprints ascending, their gids in
+/// parallel, and each group's key indexed by gid.
+///
+/// Ascending fingerprint order is the order `build_chunk_sqls` sorts
+/// into — so a chunk boundary falls in the same place on both routes and
+/// the fold's chunk order IS fingerprint order — and the order the
+/// shape-A statement's `sum` folds its members in.
+#[allow(clippy::type_complexity)]
+fn assign_groups(
+    pairs: &[(Fingerprint, pulsus_model::LabelSet)],
+    metric_name: &str,
+    grouping: Option<&Grouping>,
+) -> (Vec<Fingerprint>, Vec<u32>, Vec<(Labels, Option<String>)>) {
+    let mut by_fp: Vec<(Fingerprint, &pulsus_model::LabelSet)> =
+        pairs.iter().map(|(fp, ls)| (*fp, ls)).collect();
+    by_fp.sort_unstable_by_key(|(fp, _)| *fp);
+
+    let mut groups: Vec<(Labels, Option<String>)> = Vec::new();
+    let mut seen: HashMap<(Labels, Option<String>), u32> = HashMap::new();
+    let mut fingerprints = Vec::with_capacity(by_fp.len());
+    let mut gids = Vec::with_capacity(by_fp.len());
+    for (fp, labelset) in by_fp {
+        let key = group_key_of(
+            &super::exec::to_promql_labels(labelset),
+            Some(metric_name),
+            grouping,
+        );
+        let gid = match seen.get(&key) {
+            Some(g) => *g,
+            None => {
+                // The cast is safe under the ceiling asserted above.
+                let g = groups.len() as u32;
+                groups.push(key.clone());
+                seen.insert(key, g);
+                g
+            }
+        };
+        fingerprints.push(fp);
+        gids.push(gid);
+    }
+    (fingerprints, gids, groups)
 }
 
 /// One output series before it is given a value type: the group's
@@ -669,9 +1183,18 @@ mod tests {
         params(1_782_907_200_000, 1_782_910_800_000, 15_000)
     }
 
+    /// The plan's one shape-B node, or `None` when it has none or more
+    /// than one.
     fn shape(q: &str, p: PlanParams, on: bool) -> Option<GroupedShape> {
         let plan = pulsus_promql::plan(&parse(q).expect("parse"), p).expect("plan");
-        shape_of(&plan, &p, &cfg(on))
+        let mut instant: Vec<GroupedShape> = pushed_nodes(&plan, &p, &cfg(on))
+            .into_iter()
+            .filter_map(|n| match n.kind {
+                PushKind::Instant(g) => Some(g),
+                PushKind::Range(_) => None,
+            })
+            .collect();
+        (instant.len() == 1).then(|| instant.remove(0))
     }
 
     #[test]
@@ -688,7 +1211,7 @@ mod tests {
         }
     }
 
-    /// The flag is read in `shape_of` and nowhere else, so turning it off
+    /// The flag is read in `node_verdicts` and nowhere else, so turning it off
     /// makes every eligible query take today's route.
     #[test]
     fn the_flag_off_declines_every_query() {
@@ -724,8 +1247,6 @@ mod tests {
             "max_over_time(max by (status) (m)[5m:1m])",
             "max by (status) ({__name__=~\"m.*\"})",
             "max by (status) ({job=\"api\"})",
-            // two selectors
-            "max by (status) (m) + max by (status) (n)",
             // not an aggregate at all
             "m",
             "max_over_time(m[5m])",
@@ -1368,5 +1889,446 @@ mod tests {
             folded(&push, vec![vec![run(0, 0, 0, 42.0, flags)]], &mut ours);
             assert_eq!(ours.base_messages(), reference.base_messages(), "{op:?}");
         }
+    }
+
+    // ------------------------------------------------------ issue #579
+
+    const ISSUE_QUERY: &str = "sum by (mode) (rate(node_cpu_seconds_total[5m])) / on() \
+                               group_left count(count by (cpu)(node_cpu_seconds_total)) * 100";
+
+    fn plan_of(q: &str, p: PlanParams) -> QueryPlan {
+        pulsus_promql::plan(&parse(q).expect("parse"), p).expect("plan")
+    }
+
+    fn nodes(q: &str, p: PlanParams) -> Vec<PushShape> {
+        pushed_nodes(&plan_of(q, p), &p, &cfg(true))
+    }
+
+    fn verdicts(q: &str, p: PlanParams) -> Vec<(usize, Result<PushShape, NodeDecline>)> {
+        node_verdicts(&plan_of(q, p), &p, &cfg(true))
+    }
+
+    /// T5: the issue's query pushes two nodes — shape A at `sum`, shape B
+    /// at the inner `count` — and the outer `count`, the division and the
+    /// multiplication stay in the evaluator.
+    #[test]
+    fn the_issue_query_pushes_two_nodes() {
+        let got = nodes(ISSUE_QUERY, range_params());
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got[0].self_pos, 0, "sum is the first node in written order");
+        let PushKind::Range(a) = &got[0].kind else {
+            panic!("sum over rate is shape A: {got:?}");
+        };
+        assert_eq!(
+            (a.op, a.func, a.selector, a.range_ms),
+            (RangeAggOp::Sum, PushedRangeFn::Rate, 0, 300_000)
+        );
+        assert_eq!(a.metric_name, "node_cpu_seconds_total");
+        assert_eq!(a.grid, range_grid());
+        let inner = ISSUE_QUERY.find("count by (cpu)").expect("inner count");
+        assert_eq!(got[1].self_pos, inner);
+        let PushKind::Instant(b) = &got[1].kind else {
+            panic!("the inner count is shape B: {got:?}");
+        };
+        assert_eq!((b.op, b.selector), (GroupedOp::Count, 1));
+    }
+
+    /// Every one of the five aggregations over every one of the three
+    /// functions, under every grouping form but `by (__name__)`, is shape A.
+    #[test]
+    fn every_covered_shape_is_a_range_node() {
+        for (agg, op) in [
+            ("sum", RangeAggOp::Sum),
+            ("avg", RangeAggOp::Avg),
+            ("count", RangeAggOp::Count),
+            ("min", RangeAggOp::Min),
+            ("max", RangeAggOp::Max),
+        ] {
+            for (f, func) in [
+                ("rate", PushedRangeFn::Rate),
+                ("irate", PushedRangeFn::Irate),
+                ("increase", PushedRangeFn::Increase),
+            ] {
+                for grouping in ["by (mode) ", "by (cpu) ", "without (cpu) ", ""] {
+                    let q = format!("{agg} {grouping}({f}(m[5m]))");
+                    let got = nodes(&q, range_params());
+                    assert_eq!(got.len(), 1, "{q}: {got:?}");
+                    let PushKind::Range(r) = &got[0].kind else {
+                        panic!("{q}: {got:?}");
+                    };
+                    assert_eq!((r.op, r.func), (op, func), "{q}");
+                }
+            }
+        }
+    }
+
+    /// Shape B is pushed at any node, whatever else the plan holds.
+    #[test]
+    fn shape_b_is_pushed_at_any_node() {
+        let got = nodes("max by (status) (m) + max by (status) (n)", range_params());
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(got.iter().all(|n| matches!(
+            n.kind,
+            PushKind::Instant(GroupedShape {
+                op: GroupedOp::Max,
+                ..
+            })
+        )));
+        assert_eq!((got[0].selector(), got[1].selector()), (0, 1));
+
+        let got = nodes("count(count by (cpu) (m))", range_params());
+        assert_eq!(got.len(), 1, "only the inner count: {got:?}");
+        assert_eq!(got[0].self_pos, "count(".len());
+    }
+
+    /// A subquery evaluates its inner expression on its own grid, so no
+    /// node inside one is pushed.
+    #[test]
+    fn nothing_inside_a_subquery_is_pushed() {
+        for q in [
+            "max_over_time(sum(rate(m[5m]))[10m:1m])",
+            "max_over_time(max by (status) (m)[10m:1m])",
+        ] {
+            assert!(nodes(q, range_params()).is_empty(), "{q}");
+        }
+    }
+
+    fn assert_declines(cases: &[&str], want: NodeDecline) {
+        for q in cases {
+            let p = range_params();
+            assert!(nodes(q, p).is_empty(), "{q} was pushed");
+            let v = verdicts(q, p);
+            assert!(
+                v.iter().any(|(_, r)| *r == Err(want)),
+                "{q}: the verdicts {v:?} do not name {want:?}"
+            );
+        }
+    }
+
+    /// T5, F1: any other aggregation over a range function, and an
+    /// aggregation neither shape answers over a plain selector.
+    #[test]
+    fn f1_other_aggregations_decline_and_name_it() {
+        assert_declines(
+            &[
+                "stddev by (mode) (rate(m[5m]))",
+                "stdvar by (mode) (rate(m[5m]))",
+                "quantile by (mode) (0.5, rate(m[5m]))",
+                "topk by (mode) (3, rate(m[5m]))",
+                "bottomk by (mode) (3, rate(m[5m]))",
+                "group by (mode) (rate(m[5m]))",
+                "sum by (mode) (m)",
+            ],
+            NodeDecline::Aggregation,
+        );
+        assert!(nodes("count_values(\"v\", rate(m[5m]))", range_params()).is_empty());
+    }
+
+    /// T5, F2: any other range function.
+    #[test]
+    fn f2_other_range_functions_decline_and_name_it() {
+        assert_declines(
+            &[
+                "sum by (mode) (delta(m[5m]))",
+                "sum by (mode) (max_over_time(m[5m]))",
+                "sum by (mode) (deriv(m[5m]))",
+                "sum by (mode) (resets(m[5m]))",
+                "sum by (mode) (quantile_over_time(0.5, m[5m]))",
+            ],
+            NodeDecline::RangeFunction,
+        );
+    }
+
+    /// T5, F3: a selector that is not plain.
+    #[test]
+    fn f3_selectors_that_are_not_plain_decline_and_name_it() {
+        assert_declines(
+            &[
+                "sum by (mode) (rate(m[5m] offset 5m))",
+                "sum by (mode) (rate(m[5m] @ 1782907200))",
+                "sum by (mode) (rate(m[5m:1m]))",
+                "sum by (mode) (rate({__name__=~\"m.*\"}[5m]))",
+                "sum by (mode) (rate({job=\"api\"}[5m]))",
+                "histogram_count(sum by (mode) (rate(m[5m])))",
+                "max by (status) (m offset 5m)",
+            ],
+            NodeDecline::Selector,
+        );
+    }
+
+    /// T5, F4: the name channel of a range function's output is not
+    /// carried by the group id.
+    #[test]
+    fn f4_by_name_over_a_range_function_declines_and_names_it() {
+        assert_declines(
+            &[
+                "sum by (__name__) (rate(m[5m]))",
+                "max by (__name__, mode) (irate(m[5m]))",
+            ],
+            NodeDecline::NameGrouping,
+        );
+    }
+
+    /// T5, F8: the database's grid arithmetic would wrap: a sample covers
+    /// grid indices up to `ts + range`, and `end + range` passes
+    /// `i64::MAX` here for a 200-year range but not for five minutes.
+    #[test]
+    fn f8_a_grid_that_would_overflow_declines_and_names_it() {
+        let end_ms = i64::MAX - 5_000_000_000_000;
+        let p = params(end_ms - 10_000_000_000_000, end_ms, 10_000_000_000);
+        let q = "sum by (mode) (rate(m[200y]))";
+        assert!(nodes(q, p).is_empty(), "{q} was pushed");
+        assert!(
+            verdicts(q, p)
+                .iter()
+                .any(|(_, r)| *r == Err(NodeDecline::GridOverflow)),
+            "{q}: {:?}",
+            verdicts(q, p)
+        );
+        // The same grid with a range the arithmetic holds is pushed.
+        assert_eq!(nodes("sum by (mode) (rate(m[5m]))", p).len(), 1);
+    }
+
+    /// The flag gates both shapes, and with it off there is no verdict to
+    /// report either.
+    #[test]
+    fn the_flag_off_pushes_no_node_of_either_shape() {
+        let p = range_params();
+        let plan = plan_of(ISSUE_QUERY, p);
+        assert!(pushed_nodes(&plan, &p, &cfg(false)).is_empty());
+        assert!(node_verdicts(&plan, &p, &cfg(false)).is_empty());
+    }
+
+    fn range_shape_for(q: &str) -> RangeShape {
+        match nodes(q, range_params()).into_iter().next().map(|n| n.kind) {
+            Some(PushKind::Range(r)) => r,
+            other => panic!("{q} is not shape A: {other:?}"),
+        }
+    }
+
+    /// T5, F5: a cold or degraded cache has no fingerprint list.
+    #[test]
+    fn f5_a_sql_fallback_resolution_declines_a_range_node() {
+        let s = range_shape_for("sum by (mode) (rate(m[5m]))");
+        let r = LabelledResolution::SqlFallback {
+            sql: "SELECT fingerprint FROM metric_series".to_string(),
+            reason: crate::FallbackReason::ColdCache,
+        };
+        assert_eq!(
+            decide_range(&s, &r),
+            Err(DeclineReason::ResolutionNotFingerprints)
+        );
+    }
+
+    /// Shape A assigns groups as the evaluator keys them and applies no
+    /// threshold: one group per series is still pushed.
+    #[test]
+    fn a_range_node_assigns_groups_and_has_no_threshold() {
+        let s = range_shape_for("sum by (mode) (rate(m[5m]))");
+        let r = resolution(&[
+            (3, &[("mode", "user"), ("cpu", "1")]),
+            (1, &[("mode", "idle"), ("cpu", "0")]),
+            (2, &[("mode", "user"), ("cpu", "0")]),
+        ]);
+        let push = decide_range(&s, &r).expect("pushed");
+        assert_eq!(push.fingerprints, [1, 2, 3].map(Fingerprint::from_raw));
+        assert_eq!(push.gids, vec![0, 1, 1]);
+        assert_eq!(
+            push.groups,
+            vec![
+                (
+                    Labels::new([("mode".to_string(), "idle".to_string())]),
+                    None
+                ),
+                (
+                    Labels::new([("mode".to_string(), "user".to_string())]),
+                    None
+                ),
+            ]
+        );
+        assert_eq!(push.range_ms, 300_000);
+
+        let s = range_shape_for("sum by (cpu, mode) (rate(m[5m]))");
+        let push = decide_range(&s, &r).expect("one group per series is pushed");
+        assert_eq!(push.groups.len(), 3);
+    }
+
+    /// Section 3.4: over the cap, the grid is split by time, never by
+    /// series. 128 series at 5,761 steps under a cap of 262,144 is 2,048
+    /// steps a chunk, three chunks.
+    #[test]
+    fn a_node_over_the_cap_is_split_by_time() {
+        let grid = Grid {
+            start_ms: 1_000,
+            step_ms: 15_000,
+            points: 5_761,
+            lookback_ms: DEFAULT_LOOKBACK_MS,
+        };
+        let chunks = time_chunks(grid, 128, 262_144);
+        let got: Vec<(u32, i64, u32)> = chunks
+            .iter()
+            .map(|(g0, g)| (*g0, g.start_ms, g.points))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (0, 1_000, 2_048),
+                (2_048, 1_000 + 2_048 * 15_000, 2_048),
+                (4_096, 1_000 + 4_096 * 15_000, 1_665),
+            ]
+        );
+        assert!(chunks.iter().all(|(_, g)| g.step_ms == 15_000));
+        // Under the cap, one statement.
+        assert_eq!(
+            time_chunks(grid, 128, PUSHED_SERIES_STEPS_PER_STATEMENT),
+            vec![(0, grid)]
+        );
+        // A node wider than the cap still gets one step a statement.
+        assert_eq!(time_chunks(grid, 300_000, 262_144).len(), 5_761);
+    }
+
+    fn range_push(groups: &[&str], points: u32) -> RangePush {
+        RangePush {
+            op: RangeAggOp::Sum,
+            func: PushedRangeFn::Rate,
+            selector: 0,
+            fingerprints: Vec::new(),
+            gids: Vec::new(),
+            groups: groups
+                .iter()
+                .map(|m| (Labels::new([("mode".to_string(), m.to_string())]), None))
+                .collect(),
+            grid: Grid {
+                start_ms: 1_000,
+                step_ms: 10,
+                points,
+                lookback_ms: DEFAULT_LOOKBACK_MS,
+            },
+            range_ms: 300_000,
+        }
+    }
+
+    fn row(gid: u32, gi: u32, agg: f64) -> super::super::grouped_rows::RangeAggRow {
+        super::super::grouped_rows::RangeAggRow {
+            gid,
+            gi,
+            agg: Some(agg),
+        }
+    }
+
+    /// Rows are placed by `(gid, gi)`, never by position; the sentinel is
+    /// picked out by its id wherever it arrives; each step's vector is in
+    /// label order, carries the step's time and `drop_name`; and a chunk's
+    /// `gi` is offset by its first grid index.
+    #[test]
+    fn range_rows_are_placed_by_group_and_index() {
+        // Group 0 is "user" and group 1 is "idle": the output order is the
+        // labels', not the gids'.
+        let push = range_push(&["user", "idle"], 4);
+        let chunks = vec![
+            (
+                0,
+                vec![
+                    row(HISTOGRAM_SENTINEL_GID, 0, 0.0),
+                    row(0, 1, 2.0),
+                    row(1, 0, 3.0),
+                    row(0, 0, 1.0),
+                ],
+            ),
+            (2, vec![row(1, 1, 5.0), row(HISTOGRAM_SENTINEL_GID, 0, 0.0)]),
+        ];
+        let RangeOutcome::Node(node) =
+            range_node(&push, chunks, &CancelToken::never()).expect("read")
+        else {
+            panic!("no histogram sample was counted");
+        };
+        assert_eq!((node.start_ms, node.step_ms), (1_000, 10));
+        let got: Vec<Vec<(String, i64, u64, bool)>> = node
+            .steps
+            .iter()
+            .map(|v| {
+                v.iter()
+                    .map(|s| {
+                        (
+                            s.labels.get("mode").unwrap_or("").to_string(),
+                            s.t_ms,
+                            s.v.to_bits(),
+                            s.drop_name,
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                vec![
+                    ("idle".to_string(), 1_000, 3.0f64.to_bits(), true),
+                    ("user".to_string(), 1_000, 1.0f64.to_bits(), true),
+                ],
+                vec![("user".to_string(), 1_010, 2.0f64.to_bits(), true)],
+                vec![],
+                vec![("idle".to_string(), 1_030, 5.0f64.to_bits(), true)],
+            ]
+        );
+    }
+
+    /// F6: any chunk's sentinel counting a histogram sample discards the
+    /// node's answer.
+    #[test]
+    fn a_sentinel_counting_histograms_discards_the_answer() {
+        let push = range_push(&["user"], 2);
+        let chunks = vec![
+            (0, vec![row(0, 0, 1.0), row(HISTOGRAM_SENTINEL_GID, 0, 0.0)]),
+            (1, vec![row(HISTOGRAM_SENTINEL_GID, 0, 20.0)]),
+        ];
+        match range_node(&push, chunks, &CancelToken::never()).expect("read") {
+            RangeOutcome::Histograms(n) => assert_eq!(n, 20),
+            RangeOutcome::Node(n) => panic!("histograms were counted, got {n:?}"),
+        }
+    }
+
+    /// A shape-B node's runs become one vector per grid index, with the
+    /// fold's annotations carried on the node.
+    #[test]
+    fn instant_runs_become_one_vector_per_index() {
+        let push = push_of(GroupedOp::Max, 2, 3, false);
+        let node = instant_node(
+            &push,
+            vec![vec![run(1, 0, 2, 7.0, Some(1)), run(0, 1, 1, 9.0, Some(3))]],
+            &CancelToken::never(),
+        )
+        .expect("fold");
+        let got: Vec<Vec<(String, i64, u64)>> = node
+            .steps
+            .iter()
+            .map(|v| {
+                v.iter()
+                    .map(|s| {
+                        (
+                            s.labels.get("g").unwrap_or("").to_string(),
+                            s.t_ms,
+                            s.v.to_bits(),
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                vec![("1".to_string(), 1_000, 7.0f64.to_bits())],
+                vec![
+                    ("0".to_string(), 1_010, 9.0f64.to_bits()),
+                    ("1".to_string(), 1_010, 7.0f64.to_bits()),
+                ],
+                vec![("1".to_string(), 1_020, 7.0f64.to_bits())],
+            ]
+        );
+        assert!(node.steps.iter().flatten().all(|s| !s.drop_name));
+        assert_eq!(
+            node.annotations.base_messages().1,
+            vec!["PromQL info: ignored histogram in max aggregation"]
+        );
     }
 }

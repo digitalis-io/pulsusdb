@@ -1,0 +1,530 @@
+-- Issue #579: the shape-A statement for each range function under sum, and for
+-- each aggregation under rate, written by the design review's own generator from
+-- the inputs the tests in src/metrics/grouped_sql.rs pass. One section per
+-- marker line, which names the aggregation and the function.
+-- golden[sum rate]
+WITH 1782907200000 AS grid_start, 15000 AS grid_step, 241 AS grid_n, 300000 AS range_ms,
+     [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps,
+     CAST([0, 1, 0], 'Array(UInt32)') AS gids
+SELECT gid, gi, (arrayFold((acc, x) -> (acc.1 + x, if(isInfinite(acc.1 + x), 0., if(abs(acc.1) >= abs(x), acc.2 + ((acc.1 - (acc.1 + x)) + x), acc.2 + ((x - (acc.1 + x)) + acc.1)))), vs, CAST((0., 0.), 'Tuple(Float64, Float64)')) AS k).1 + k.2 AS agg
+FROM (
+  SELECT gid, gi, arrayMap(p -> p.2, arraySort(groupArray((fingerprint, v)))) AS vs
+  FROM (
+    SELECT transform(fingerprint, fps, gids, CAST(0, 'UInt32')) AS gid, fingerprint, gi,
+        i_l - i_f + 1 AS n,
+        arrayFold((acc, x) -> acc + x.2, arrayFilter(x -> x.1 > i_f, r_l),
+                  if(y_f < 0., (y_l - y_f) + 0., y_l - y_f)) AS result,
+        toFloat64(t_f - (grid_start + gi * grid_step - range_ms)) / 1000. AS d_start_raw,
+        toFloat64((grid_start + gi * grid_step) - t_l) / 1000. AS d_end_raw,
+        toFloat64(t_l - t_f) / 1000. AS sampled,
+        sampled / toFloat64(n - 1) AS avg_dur,
+        avg_dur * 1.1 AS threshold,
+        if(d_start_raw >= threshold, avg_dur / 2., d_start_raw) AS d_start_1,
+        if(result > 0. AND y_f >= 0., sampled * (y_f / result), d_start_1) AS d_zero,
+        if(d_zero < d_start_1, d_zero, d_start_1) AS d_start,
+        if(d_end_raw >= threshold, avg_dur / 2., d_end_raw) AS d_end,
+        ((sampled + d_start + d_end) / sampled) / (toFloat64(range_ms) / 1000.) AS factor,
+        result * factor AS v
+    FROM (
+      SELECT fingerprint, gi, i_f, t_f, y_f, i AS i_l, ts AS t_l, y AS y_l, ts_prev AS t_p, y_prev AS y_p, resets AS r_l
+      FROM (
+        SELECT fingerprint, gi, role, i, ts, y, ts_prev, y_prev, resets,
+          lagInFrame(i) OVER wr AS i_f, lagInFrame(ts) OVER wr AS t_f, lagInFrame(y) OVER wr AS y_f
+        FROM (
+          SELECT fingerprint, i, ts, y, ts_prev, y_prev, resets, role,
+            arrayJoin(range(
+              toUInt32(least(toInt64(grid_n), if(a <= grid_start, 0, intDiv(a - grid_start + grid_step - 1, grid_step)))),
+              toUInt32(least(toInt64(grid_n), if(b <= grid_start, 0, intDiv(b - grid_start + grid_step - 1, grid_step)))))) AS gi
+          FROM (
+            SELECT fingerprint, i, ts, y, ts_prev, y_prev, resets, role,
+              if(role = 0, if(i = 1, ts, greatest(ts, ts_prev + range_ms)), ts) AS a,
+              if(role = 0, ts + range_ms, least(ts_next, ts + range_ms)) AS b
+            FROM (
+              SELECT fingerprint, ts, y, i, ts_prev, y_prev, ts_next,
+                groupArrayIf((i, y_prev), i > 1 AND y < y_prev) OVER w AS resets
+              FROM (
+                SELECT fingerprint, ts, y, yb,
+                  row_number() OVER w AS i,
+                  lagInFrame(ts, 1, toInt64(0)) OVER w AS ts_prev,
+                  lagInFrame(y, 1, 0.) OVER w AS y_prev,
+                  leadInFrame(ts, 1, toInt64(9223372036854775807)) OVER wf AS ts_next
+                FROM (
+                  SELECT fingerprint, unix_milli AS ts, reinterpretAsUInt64(value) AS yb, value AS y,
+                    ts = lagInFrame(unix_milli, 1, toInt64(-1)) OVER w0
+                      AND yb = lagInFrame(reinterpretAsUInt64(value), 1, toUInt64(0)) OVER w0 AS dup
+                  FROM metric_samples
+                  WHERE unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps
+                    AND reinterpretAsUInt64(value) != 9218868437227405314
+                  WINDOW w0 AS (PARTITION BY fingerprint ORDER BY unix_milli, reinterpretAsUInt64(value)
+                                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+                )
+                WHERE NOT dup
+                WINDOW w AS (PARTITION BY fingerprint ORDER BY ts, yb ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+                       wf AS (PARTITION BY fingerprint ORDER BY ts, yb ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING)
+              )
+              WINDOW w AS (PARTITION BY fingerprint ORDER BY ts, yb ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+            ) ARRAY JOIN [0, 1] AS role
+          )
+        )
+        WINDOW wr AS (PARTITION BY fingerprint ORDER BY gi, role ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+      )
+      WHERE role = 1
+    )
+    WHERE i_l > i_f
+  )
+  GROUP BY gid, gi
+)
+UNION ALL
+SELECT toUInt32(4294967295) AS gid, toUInt32(0) AS gi,
+  toFloat64((SELECT count() FROM metric_hist_samples
+             WHERE unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps)) AS agg
+ORDER BY gid, gi
+-- golden[sum increase]
+WITH 1782907200000 AS grid_start, 15000 AS grid_step, 241 AS grid_n, 300000 AS range_ms,
+     [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps,
+     CAST([0, 1, 0], 'Array(UInt32)') AS gids
+SELECT gid, gi, (arrayFold((acc, x) -> (acc.1 + x, if(isInfinite(acc.1 + x), 0., if(abs(acc.1) >= abs(x), acc.2 + ((acc.1 - (acc.1 + x)) + x), acc.2 + ((x - (acc.1 + x)) + acc.1)))), vs, CAST((0., 0.), 'Tuple(Float64, Float64)')) AS k).1 + k.2 AS agg
+FROM (
+  SELECT gid, gi, arrayMap(p -> p.2, arraySort(groupArray((fingerprint, v)))) AS vs
+  FROM (
+    SELECT transform(fingerprint, fps, gids, CAST(0, 'UInt32')) AS gid, fingerprint, gi,
+        i_l - i_f + 1 AS n,
+        arrayFold((acc, x) -> acc + x.2, arrayFilter(x -> x.1 > i_f, r_l),
+                  if(y_f < 0., (y_l - y_f) + 0., y_l - y_f)) AS result,
+        toFloat64(t_f - (grid_start + gi * grid_step - range_ms)) / 1000. AS d_start_raw,
+        toFloat64((grid_start + gi * grid_step) - t_l) / 1000. AS d_end_raw,
+        toFloat64(t_l - t_f) / 1000. AS sampled,
+        sampled / toFloat64(n - 1) AS avg_dur,
+        avg_dur * 1.1 AS threshold,
+        if(d_start_raw >= threshold, avg_dur / 2., d_start_raw) AS d_start_1,
+        if(result > 0. AND y_f >= 0., sampled * (y_f / result), d_start_1) AS d_zero,
+        if(d_zero < d_start_1, d_zero, d_start_1) AS d_start,
+        if(d_end_raw >= threshold, avg_dur / 2., d_end_raw) AS d_end,
+        (sampled + d_start + d_end) / sampled AS factor,
+        result * factor AS v
+    FROM (
+      SELECT fingerprint, gi, i_f, t_f, y_f, i AS i_l, ts AS t_l, y AS y_l, ts_prev AS t_p, y_prev AS y_p, resets AS r_l
+      FROM (
+        SELECT fingerprint, gi, role, i, ts, y, ts_prev, y_prev, resets,
+          lagInFrame(i) OVER wr AS i_f, lagInFrame(ts) OVER wr AS t_f, lagInFrame(y) OVER wr AS y_f
+        FROM (
+          SELECT fingerprint, i, ts, y, ts_prev, y_prev, resets, role,
+            arrayJoin(range(
+              toUInt32(least(toInt64(grid_n), if(a <= grid_start, 0, intDiv(a - grid_start + grid_step - 1, grid_step)))),
+              toUInt32(least(toInt64(grid_n), if(b <= grid_start, 0, intDiv(b - grid_start + grid_step - 1, grid_step)))))) AS gi
+          FROM (
+            SELECT fingerprint, i, ts, y, ts_prev, y_prev, resets, role,
+              if(role = 0, if(i = 1, ts, greatest(ts, ts_prev + range_ms)), ts) AS a,
+              if(role = 0, ts + range_ms, least(ts_next, ts + range_ms)) AS b
+            FROM (
+              SELECT fingerprint, ts, y, i, ts_prev, y_prev, ts_next,
+                groupArrayIf((i, y_prev), i > 1 AND y < y_prev) OVER w AS resets
+              FROM (
+                SELECT fingerprint, ts, y, yb,
+                  row_number() OVER w AS i,
+                  lagInFrame(ts, 1, toInt64(0)) OVER w AS ts_prev,
+                  lagInFrame(y, 1, 0.) OVER w AS y_prev,
+                  leadInFrame(ts, 1, toInt64(9223372036854775807)) OVER wf AS ts_next
+                FROM (
+                  SELECT fingerprint, unix_milli AS ts, reinterpretAsUInt64(value) AS yb, value AS y,
+                    ts = lagInFrame(unix_milli, 1, toInt64(-1)) OVER w0
+                      AND yb = lagInFrame(reinterpretAsUInt64(value), 1, toUInt64(0)) OVER w0 AS dup
+                  FROM metric_samples
+                  WHERE unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps
+                    AND reinterpretAsUInt64(value) != 9218868437227405314
+                  WINDOW w0 AS (PARTITION BY fingerprint ORDER BY unix_milli, reinterpretAsUInt64(value)
+                                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+                )
+                WHERE NOT dup
+                WINDOW w AS (PARTITION BY fingerprint ORDER BY ts, yb ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+                       wf AS (PARTITION BY fingerprint ORDER BY ts, yb ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING)
+              )
+              WINDOW w AS (PARTITION BY fingerprint ORDER BY ts, yb ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+            ) ARRAY JOIN [0, 1] AS role
+          )
+        )
+        WINDOW wr AS (PARTITION BY fingerprint ORDER BY gi, role ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+      )
+      WHERE role = 1
+    )
+    WHERE i_l > i_f
+  )
+  GROUP BY gid, gi
+)
+UNION ALL
+SELECT toUInt32(4294967295) AS gid, toUInt32(0) AS gi,
+  toFloat64((SELECT count() FROM metric_hist_samples
+             WHERE unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps)) AS agg
+ORDER BY gid, gi
+-- golden[sum irate]
+WITH 1782907200000 AS grid_start, 15000 AS grid_step, 241 AS grid_n, 300000 AS range_ms,
+     [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps,
+     CAST([0, 1, 0], 'Array(UInt32)') AS gids
+SELECT gid, gi, (arrayFold((acc, x) -> (acc.1 + x, if(isInfinite(acc.1 + x), 0., if(abs(acc.1) >= abs(x), acc.2 + ((acc.1 - (acc.1 + x)) + x), acc.2 + ((x - (acc.1 + x)) + acc.1)))), vs, CAST((0., 0.), 'Tuple(Float64, Float64)')) AS k).1 + k.2 AS agg
+FROM (
+  SELECT gid, gi, arrayMap(p -> p.2, arraySort(groupArray((fingerprint, v)))) AS vs
+  FROM (
+    SELECT transform(fingerprint, fps, gids, CAST(0, 'UInt32')) AS gid, fingerprint, gi,
+        if(y_l < y_p, y_l, y_l - y_p) / (toFloat64(t_l - t_p) / 1000.) AS v
+    FROM (
+      SELECT fingerprint, gi, i_f, t_f, y_f, i AS i_l, ts AS t_l, y AS y_l, ts_prev AS t_p, y_prev AS y_p, resets AS r_l
+      FROM (
+        SELECT fingerprint, gi, role, i, ts, y, ts_prev, y_prev, resets,
+          lagInFrame(i) OVER wr AS i_f, lagInFrame(ts) OVER wr AS t_f, lagInFrame(y) OVER wr AS y_f
+        FROM (
+          SELECT fingerprint, i, ts, y, ts_prev, y_prev, resets, role,
+            arrayJoin(range(
+              toUInt32(least(toInt64(grid_n), if(a <= grid_start, 0, intDiv(a - grid_start + grid_step - 1, grid_step)))),
+              toUInt32(least(toInt64(grid_n), if(b <= grid_start, 0, intDiv(b - grid_start + grid_step - 1, grid_step)))))) AS gi
+          FROM (
+            SELECT fingerprint, i, ts, y, ts_prev, y_prev, resets, role,
+              if(role = 0, if(i = 1, ts, greatest(ts, ts_prev + range_ms)), ts) AS a,
+              if(role = 0, ts + range_ms, least(ts_next, ts + range_ms)) AS b
+            FROM (
+              SELECT fingerprint, ts, y, i, ts_prev, y_prev, ts_next,
+                groupArrayIf((i, y_prev), i > 1 AND y < y_prev) OVER w AS resets
+              FROM (
+                SELECT fingerprint, ts, y, yb,
+                  row_number() OVER w AS i,
+                  lagInFrame(ts, 1, toInt64(0)) OVER w AS ts_prev,
+                  lagInFrame(y, 1, 0.) OVER w AS y_prev,
+                  leadInFrame(ts, 1, toInt64(9223372036854775807)) OVER wf AS ts_next
+                FROM (
+                  SELECT fingerprint, unix_milli AS ts, reinterpretAsUInt64(value) AS yb, value AS y,
+                    ts = lagInFrame(unix_milli, 1, toInt64(-1)) OVER w0
+                      AND yb = lagInFrame(reinterpretAsUInt64(value), 1, toUInt64(0)) OVER w0 AS dup
+                  FROM metric_samples
+                  WHERE unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps
+                    AND reinterpretAsUInt64(value) != 9218868437227405314
+                  WINDOW w0 AS (PARTITION BY fingerprint ORDER BY unix_milli, reinterpretAsUInt64(value)
+                                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+                )
+                WHERE NOT dup
+                WINDOW w AS (PARTITION BY fingerprint ORDER BY ts, yb ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+                       wf AS (PARTITION BY fingerprint ORDER BY ts, yb ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING)
+              )
+              WINDOW w AS (PARTITION BY fingerprint ORDER BY ts, yb ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+            ) ARRAY JOIN [0, 1] AS role
+          )
+        )
+        WINDOW wr AS (PARTITION BY fingerprint ORDER BY gi, role ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+      )
+      WHERE role = 1
+    )
+    WHERE t_p > grid_start + gi * grid_step - range_ms AND t_l != t_p
+  )
+  GROUP BY gid, gi
+)
+UNION ALL
+SELECT toUInt32(4294967295) AS gid, toUInt32(0) AS gi,
+  toFloat64((SELECT count() FROM metric_hist_samples
+             WHERE unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps)) AS agg
+ORDER BY gid, gi
+-- golden[avg rate]
+WITH 1782907200000 AS grid_start, 15000 AS grid_step, 241 AS grid_n, 300000 AS range_ms,
+     [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps,
+     CAST([0, 1, 0], 'Array(UInt32)') AS gids
+SELECT gid, gi, if((arrayFold((acc, x) -> if(acc.1 = 0., (1., x, 0., toUInt8(0), 0.), if(acc.4 = 1, ((acc.1 + 1.), acc.2, if(isInfinite((((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * acc.5) + (x / (acc.1 + 1.)))), 0., if(abs(((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * acc.5)) >= abs((x / (acc.1 + 1.))), ((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * acc.3) + ((((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * acc.5) - (((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * acc.5) + (x / (acc.1 + 1.)))) + (x / (acc.1 + 1.))), ((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * acc.3) + (((x / (acc.1 + 1.)) - (((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * acc.5) + (x / (acc.1 + 1.)))) + ((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * acc.5)))), toUInt8(1), (((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * acc.5) + (x / (acc.1 + 1.)))), if(NOT isInfinite((acc.2 + x)), ((acc.1 + 1.), (acc.2 + x), if(isInfinite((acc.2 + x)), 0., if(abs(acc.2) >= abs(x), acc.3 + ((acc.2 - (acc.2 + x)) + x), acc.3 + ((x - (acc.2 + x)) + acc.2))), toUInt8(0), 0.), ((acc.1 + 1.), acc.2, if(isInfinite((((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * (acc.2 / ((acc.1 + 1.) - 1.))) + (x / (acc.1 + 1.)))), 0., if(abs(((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * (acc.2 / ((acc.1 + 1.) - 1.)))) >= abs((x / (acc.1 + 1.))), ((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * (acc.3 / ((acc.1 + 1.) - 1.))) + ((((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * (acc.2 / ((acc.1 + 1.) - 1.))) - (((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * (acc.2 / ((acc.1 + 1.) - 1.))) + (x / (acc.1 + 1.)))) + (x / (acc.1 + 1.))), ((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * (acc.3 / ((acc.1 + 1.) - 1.))) + (((x / (acc.1 + 1.)) - (((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * (acc.2 / ((acc.1 + 1.) - 1.))) + (x / (acc.1 + 1.)))) + ((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * (acc.2 / ((acc.1 + 1.) - 1.)))))), toUInt8(1), (((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * (acc.2 / ((acc.1 + 1.) - 1.))) + (x / (acc.1 + 1.))))))), vs, CAST((0., 0., 0., 0, 0.), 'Tuple(Float64, Float64, Float64, UInt8, Float64)')) AS st).4 = 1, st.5 + st.3, st.2 / st.1 + st.3 / st.1) AS agg
+FROM (
+  SELECT gid, gi, arrayMap(p -> p.2, arraySort(groupArray((fingerprint, v)))) AS vs
+  FROM (
+    SELECT transform(fingerprint, fps, gids, CAST(0, 'UInt32')) AS gid, fingerprint, gi,
+        i_l - i_f + 1 AS n,
+        arrayFold((acc, x) -> acc + x.2, arrayFilter(x -> x.1 > i_f, r_l),
+                  if(y_f < 0., (y_l - y_f) + 0., y_l - y_f)) AS result,
+        toFloat64(t_f - (grid_start + gi * grid_step - range_ms)) / 1000. AS d_start_raw,
+        toFloat64((grid_start + gi * grid_step) - t_l) / 1000. AS d_end_raw,
+        toFloat64(t_l - t_f) / 1000. AS sampled,
+        sampled / toFloat64(n - 1) AS avg_dur,
+        avg_dur * 1.1 AS threshold,
+        if(d_start_raw >= threshold, avg_dur / 2., d_start_raw) AS d_start_1,
+        if(result > 0. AND y_f >= 0., sampled * (y_f / result), d_start_1) AS d_zero,
+        if(d_zero < d_start_1, d_zero, d_start_1) AS d_start,
+        if(d_end_raw >= threshold, avg_dur / 2., d_end_raw) AS d_end,
+        ((sampled + d_start + d_end) / sampled) / (toFloat64(range_ms) / 1000.) AS factor,
+        result * factor AS v
+    FROM (
+      SELECT fingerprint, gi, i_f, t_f, y_f, i AS i_l, ts AS t_l, y AS y_l, ts_prev AS t_p, y_prev AS y_p, resets AS r_l
+      FROM (
+        SELECT fingerprint, gi, role, i, ts, y, ts_prev, y_prev, resets,
+          lagInFrame(i) OVER wr AS i_f, lagInFrame(ts) OVER wr AS t_f, lagInFrame(y) OVER wr AS y_f
+        FROM (
+          SELECT fingerprint, i, ts, y, ts_prev, y_prev, resets, role,
+            arrayJoin(range(
+              toUInt32(least(toInt64(grid_n), if(a <= grid_start, 0, intDiv(a - grid_start + grid_step - 1, grid_step)))),
+              toUInt32(least(toInt64(grid_n), if(b <= grid_start, 0, intDiv(b - grid_start + grid_step - 1, grid_step)))))) AS gi
+          FROM (
+            SELECT fingerprint, i, ts, y, ts_prev, y_prev, resets, role,
+              if(role = 0, if(i = 1, ts, greatest(ts, ts_prev + range_ms)), ts) AS a,
+              if(role = 0, ts + range_ms, least(ts_next, ts + range_ms)) AS b
+            FROM (
+              SELECT fingerprint, ts, y, i, ts_prev, y_prev, ts_next,
+                groupArrayIf((i, y_prev), i > 1 AND y < y_prev) OVER w AS resets
+              FROM (
+                SELECT fingerprint, ts, y, yb,
+                  row_number() OVER w AS i,
+                  lagInFrame(ts, 1, toInt64(0)) OVER w AS ts_prev,
+                  lagInFrame(y, 1, 0.) OVER w AS y_prev,
+                  leadInFrame(ts, 1, toInt64(9223372036854775807)) OVER wf AS ts_next
+                FROM (
+                  SELECT fingerprint, unix_milli AS ts, reinterpretAsUInt64(value) AS yb, value AS y,
+                    ts = lagInFrame(unix_milli, 1, toInt64(-1)) OVER w0
+                      AND yb = lagInFrame(reinterpretAsUInt64(value), 1, toUInt64(0)) OVER w0 AS dup
+                  FROM metric_samples
+                  WHERE unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps
+                    AND reinterpretAsUInt64(value) != 9218868437227405314
+                  WINDOW w0 AS (PARTITION BY fingerprint ORDER BY unix_milli, reinterpretAsUInt64(value)
+                                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+                )
+                WHERE NOT dup
+                WINDOW w AS (PARTITION BY fingerprint ORDER BY ts, yb ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+                       wf AS (PARTITION BY fingerprint ORDER BY ts, yb ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING)
+              )
+              WINDOW w AS (PARTITION BY fingerprint ORDER BY ts, yb ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+            ) ARRAY JOIN [0, 1] AS role
+          )
+        )
+        WINDOW wr AS (PARTITION BY fingerprint ORDER BY gi, role ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+      )
+      WHERE role = 1
+    )
+    WHERE i_l > i_f
+  )
+  GROUP BY gid, gi
+)
+UNION ALL
+SELECT toUInt32(4294967295) AS gid, toUInt32(0) AS gi,
+  toFloat64((SELECT count() FROM metric_hist_samples
+             WHERE unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps)) AS agg
+ORDER BY gid, gi
+-- golden[count rate]
+WITH 1782907200000 AS grid_start, 15000 AS grid_step, 241 AS grid_n, 300000 AS range_ms,
+     [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps,
+     CAST([0, 1, 0], 'Array(UInt32)') AS gids
+SELECT gid, gi, toFloat64(length(vs)) AS agg
+FROM (
+  SELECT gid, gi, arrayMap(p -> p.2, arraySort(groupArray((fingerprint, v)))) AS vs
+  FROM (
+    SELECT transform(fingerprint, fps, gids, CAST(0, 'UInt32')) AS gid, fingerprint, gi,
+        i_l - i_f + 1 AS n,
+        arrayFold((acc, x) -> acc + x.2, arrayFilter(x -> x.1 > i_f, r_l),
+                  if(y_f < 0., (y_l - y_f) + 0., y_l - y_f)) AS result,
+        toFloat64(t_f - (grid_start + gi * grid_step - range_ms)) / 1000. AS d_start_raw,
+        toFloat64((grid_start + gi * grid_step) - t_l) / 1000. AS d_end_raw,
+        toFloat64(t_l - t_f) / 1000. AS sampled,
+        sampled / toFloat64(n - 1) AS avg_dur,
+        avg_dur * 1.1 AS threshold,
+        if(d_start_raw >= threshold, avg_dur / 2., d_start_raw) AS d_start_1,
+        if(result > 0. AND y_f >= 0., sampled * (y_f / result), d_start_1) AS d_zero,
+        if(d_zero < d_start_1, d_zero, d_start_1) AS d_start,
+        if(d_end_raw >= threshold, avg_dur / 2., d_end_raw) AS d_end,
+        ((sampled + d_start + d_end) / sampled) / (toFloat64(range_ms) / 1000.) AS factor,
+        result * factor AS v
+    FROM (
+      SELECT fingerprint, gi, i_f, t_f, y_f, i AS i_l, ts AS t_l, y AS y_l, ts_prev AS t_p, y_prev AS y_p, resets AS r_l
+      FROM (
+        SELECT fingerprint, gi, role, i, ts, y, ts_prev, y_prev, resets,
+          lagInFrame(i) OVER wr AS i_f, lagInFrame(ts) OVER wr AS t_f, lagInFrame(y) OVER wr AS y_f
+        FROM (
+          SELECT fingerprint, i, ts, y, ts_prev, y_prev, resets, role,
+            arrayJoin(range(
+              toUInt32(least(toInt64(grid_n), if(a <= grid_start, 0, intDiv(a - grid_start + grid_step - 1, grid_step)))),
+              toUInt32(least(toInt64(grid_n), if(b <= grid_start, 0, intDiv(b - grid_start + grid_step - 1, grid_step)))))) AS gi
+          FROM (
+            SELECT fingerprint, i, ts, y, ts_prev, y_prev, resets, role,
+              if(role = 0, if(i = 1, ts, greatest(ts, ts_prev + range_ms)), ts) AS a,
+              if(role = 0, ts + range_ms, least(ts_next, ts + range_ms)) AS b
+            FROM (
+              SELECT fingerprint, ts, y, i, ts_prev, y_prev, ts_next,
+                groupArrayIf((i, y_prev), i > 1 AND y < y_prev) OVER w AS resets
+              FROM (
+                SELECT fingerprint, ts, y, yb,
+                  row_number() OVER w AS i,
+                  lagInFrame(ts, 1, toInt64(0)) OVER w AS ts_prev,
+                  lagInFrame(y, 1, 0.) OVER w AS y_prev,
+                  leadInFrame(ts, 1, toInt64(9223372036854775807)) OVER wf AS ts_next
+                FROM (
+                  SELECT fingerprint, unix_milli AS ts, reinterpretAsUInt64(value) AS yb, value AS y,
+                    ts = lagInFrame(unix_milli, 1, toInt64(-1)) OVER w0
+                      AND yb = lagInFrame(reinterpretAsUInt64(value), 1, toUInt64(0)) OVER w0 AS dup
+                  FROM metric_samples
+                  WHERE unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps
+                    AND reinterpretAsUInt64(value) != 9218868437227405314
+                  WINDOW w0 AS (PARTITION BY fingerprint ORDER BY unix_milli, reinterpretAsUInt64(value)
+                                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+                )
+                WHERE NOT dup
+                WINDOW w AS (PARTITION BY fingerprint ORDER BY ts, yb ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+                       wf AS (PARTITION BY fingerprint ORDER BY ts, yb ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING)
+              )
+              WINDOW w AS (PARTITION BY fingerprint ORDER BY ts, yb ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+            ) ARRAY JOIN [0, 1] AS role
+          )
+        )
+        WINDOW wr AS (PARTITION BY fingerprint ORDER BY gi, role ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+      )
+      WHERE role = 1
+    )
+    WHERE i_l > i_f
+  )
+  GROUP BY gid, gi
+)
+UNION ALL
+SELECT toUInt32(4294967295) AS gid, toUInt32(0) AS gi,
+  toFloat64((SELECT count() FROM metric_hist_samples
+             WHERE unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps)) AS agg
+ORDER BY gid, gi
+-- golden[min rate]
+WITH 1782907200000 AS grid_start, 15000 AS grid_step, 241 AS grid_n, 300000 AS range_ms,
+     [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps,
+     CAST([0, 1, 0], 'Array(UInt32)') AS gids
+SELECT gid, gi, arrayFold((acc, x) -> if(acc > x OR isNaN(acc), x, acc), vs, nan) AS agg
+FROM (
+  SELECT gid, gi, arrayMap(p -> p.2, arraySort(groupArray((fingerprint, v)))) AS vs
+  FROM (
+    SELECT transform(fingerprint, fps, gids, CAST(0, 'UInt32')) AS gid, fingerprint, gi,
+        i_l - i_f + 1 AS n,
+        arrayFold((acc, x) -> acc + x.2, arrayFilter(x -> x.1 > i_f, r_l),
+                  if(y_f < 0., (y_l - y_f) + 0., y_l - y_f)) AS result,
+        toFloat64(t_f - (grid_start + gi * grid_step - range_ms)) / 1000. AS d_start_raw,
+        toFloat64((grid_start + gi * grid_step) - t_l) / 1000. AS d_end_raw,
+        toFloat64(t_l - t_f) / 1000. AS sampled,
+        sampled / toFloat64(n - 1) AS avg_dur,
+        avg_dur * 1.1 AS threshold,
+        if(d_start_raw >= threshold, avg_dur / 2., d_start_raw) AS d_start_1,
+        if(result > 0. AND y_f >= 0., sampled * (y_f / result), d_start_1) AS d_zero,
+        if(d_zero < d_start_1, d_zero, d_start_1) AS d_start,
+        if(d_end_raw >= threshold, avg_dur / 2., d_end_raw) AS d_end,
+        ((sampled + d_start + d_end) / sampled) / (toFloat64(range_ms) / 1000.) AS factor,
+        result * factor AS v
+    FROM (
+      SELECT fingerprint, gi, i_f, t_f, y_f, i AS i_l, ts AS t_l, y AS y_l, ts_prev AS t_p, y_prev AS y_p, resets AS r_l
+      FROM (
+        SELECT fingerprint, gi, role, i, ts, y, ts_prev, y_prev, resets,
+          lagInFrame(i) OVER wr AS i_f, lagInFrame(ts) OVER wr AS t_f, lagInFrame(y) OVER wr AS y_f
+        FROM (
+          SELECT fingerprint, i, ts, y, ts_prev, y_prev, resets, role,
+            arrayJoin(range(
+              toUInt32(least(toInt64(grid_n), if(a <= grid_start, 0, intDiv(a - grid_start + grid_step - 1, grid_step)))),
+              toUInt32(least(toInt64(grid_n), if(b <= grid_start, 0, intDiv(b - grid_start + grid_step - 1, grid_step)))))) AS gi
+          FROM (
+            SELECT fingerprint, i, ts, y, ts_prev, y_prev, resets, role,
+              if(role = 0, if(i = 1, ts, greatest(ts, ts_prev + range_ms)), ts) AS a,
+              if(role = 0, ts + range_ms, least(ts_next, ts + range_ms)) AS b
+            FROM (
+              SELECT fingerprint, ts, y, i, ts_prev, y_prev, ts_next,
+                groupArrayIf((i, y_prev), i > 1 AND y < y_prev) OVER w AS resets
+              FROM (
+                SELECT fingerprint, ts, y, yb,
+                  row_number() OVER w AS i,
+                  lagInFrame(ts, 1, toInt64(0)) OVER w AS ts_prev,
+                  lagInFrame(y, 1, 0.) OVER w AS y_prev,
+                  leadInFrame(ts, 1, toInt64(9223372036854775807)) OVER wf AS ts_next
+                FROM (
+                  SELECT fingerprint, unix_milli AS ts, reinterpretAsUInt64(value) AS yb, value AS y,
+                    ts = lagInFrame(unix_milli, 1, toInt64(-1)) OVER w0
+                      AND yb = lagInFrame(reinterpretAsUInt64(value), 1, toUInt64(0)) OVER w0 AS dup
+                  FROM metric_samples
+                  WHERE unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps
+                    AND reinterpretAsUInt64(value) != 9218868437227405314
+                  WINDOW w0 AS (PARTITION BY fingerprint ORDER BY unix_milli, reinterpretAsUInt64(value)
+                                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+                )
+                WHERE NOT dup
+                WINDOW w AS (PARTITION BY fingerprint ORDER BY ts, yb ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+                       wf AS (PARTITION BY fingerprint ORDER BY ts, yb ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING)
+              )
+              WINDOW w AS (PARTITION BY fingerprint ORDER BY ts, yb ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+            ) ARRAY JOIN [0, 1] AS role
+          )
+        )
+        WINDOW wr AS (PARTITION BY fingerprint ORDER BY gi, role ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+      )
+      WHERE role = 1
+    )
+    WHERE i_l > i_f
+  )
+  GROUP BY gid, gi
+)
+UNION ALL
+SELECT toUInt32(4294967295) AS gid, toUInt32(0) AS gi,
+  toFloat64((SELECT count() FROM metric_hist_samples
+             WHERE unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps)) AS agg
+ORDER BY gid, gi
+-- golden[max rate]
+WITH 1782907200000 AS grid_start, 15000 AS grid_step, 241 AS grid_n, 300000 AS range_ms,
+     [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps,
+     CAST([0, 1, 0], 'Array(UInt32)') AS gids
+SELECT gid, gi, arrayFold((acc, x) -> if(acc < x OR isNaN(acc), x, acc), vs, nan) AS agg
+FROM (
+  SELECT gid, gi, arrayMap(p -> p.2, arraySort(groupArray((fingerprint, v)))) AS vs
+  FROM (
+    SELECT transform(fingerprint, fps, gids, CAST(0, 'UInt32')) AS gid, fingerprint, gi,
+        i_l - i_f + 1 AS n,
+        arrayFold((acc, x) -> acc + x.2, arrayFilter(x -> x.1 > i_f, r_l),
+                  if(y_f < 0., (y_l - y_f) + 0., y_l - y_f)) AS result,
+        toFloat64(t_f - (grid_start + gi * grid_step - range_ms)) / 1000. AS d_start_raw,
+        toFloat64((grid_start + gi * grid_step) - t_l) / 1000. AS d_end_raw,
+        toFloat64(t_l - t_f) / 1000. AS sampled,
+        sampled / toFloat64(n - 1) AS avg_dur,
+        avg_dur * 1.1 AS threshold,
+        if(d_start_raw >= threshold, avg_dur / 2., d_start_raw) AS d_start_1,
+        if(result > 0. AND y_f >= 0., sampled * (y_f / result), d_start_1) AS d_zero,
+        if(d_zero < d_start_1, d_zero, d_start_1) AS d_start,
+        if(d_end_raw >= threshold, avg_dur / 2., d_end_raw) AS d_end,
+        ((sampled + d_start + d_end) / sampled) / (toFloat64(range_ms) / 1000.) AS factor,
+        result * factor AS v
+    FROM (
+      SELECT fingerprint, gi, i_f, t_f, y_f, i AS i_l, ts AS t_l, y AS y_l, ts_prev AS t_p, y_prev AS y_p, resets AS r_l
+      FROM (
+        SELECT fingerprint, gi, role, i, ts, y, ts_prev, y_prev, resets,
+          lagInFrame(i) OVER wr AS i_f, lagInFrame(ts) OVER wr AS t_f, lagInFrame(y) OVER wr AS y_f
+        FROM (
+          SELECT fingerprint, i, ts, y, ts_prev, y_prev, resets, role,
+            arrayJoin(range(
+              toUInt32(least(toInt64(grid_n), if(a <= grid_start, 0, intDiv(a - grid_start + grid_step - 1, grid_step)))),
+              toUInt32(least(toInt64(grid_n), if(b <= grid_start, 0, intDiv(b - grid_start + grid_step - 1, grid_step)))))) AS gi
+          FROM (
+            SELECT fingerprint, i, ts, y, ts_prev, y_prev, resets, role,
+              if(role = 0, if(i = 1, ts, greatest(ts, ts_prev + range_ms)), ts) AS a,
+              if(role = 0, ts + range_ms, least(ts_next, ts + range_ms)) AS b
+            FROM (
+              SELECT fingerprint, ts, y, i, ts_prev, y_prev, ts_next,
+                groupArrayIf((i, y_prev), i > 1 AND y < y_prev) OVER w AS resets
+              FROM (
+                SELECT fingerprint, ts, y, yb,
+                  row_number() OVER w AS i,
+                  lagInFrame(ts, 1, toInt64(0)) OVER w AS ts_prev,
+                  lagInFrame(y, 1, 0.) OVER w AS y_prev,
+                  leadInFrame(ts, 1, toInt64(9223372036854775807)) OVER wf AS ts_next
+                FROM (
+                  SELECT fingerprint, unix_milli AS ts, reinterpretAsUInt64(value) AS yb, value AS y,
+                    ts = lagInFrame(unix_milli, 1, toInt64(-1)) OVER w0
+                      AND yb = lagInFrame(reinterpretAsUInt64(value), 1, toUInt64(0)) OVER w0 AS dup
+                  FROM metric_samples
+                  WHERE unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps
+                    AND reinterpretAsUInt64(value) != 9218868437227405314
+                  WINDOW w0 AS (PARTITION BY fingerprint ORDER BY unix_milli, reinterpretAsUInt64(value)
+                                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+                )
+                WHERE NOT dup
+                WINDOW w AS (PARTITION BY fingerprint ORDER BY ts, yb ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+                       wf AS (PARTITION BY fingerprint ORDER BY ts, yb ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING)
+              )
+              WINDOW w AS (PARTITION BY fingerprint ORDER BY ts, yb ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+            ) ARRAY JOIN [0, 1] AS role
+          )
+        )
+        WINDOW wr AS (PARTITION BY fingerprint ORDER BY gi, role ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+      )
+      WHERE role = 1
+    )
+    WHERE i_l > i_f
+  )
+  GROUP BY gid, gi
+)
+UNION ALL
+SELECT toUInt32(4294967295) AS gid, toUInt32(0) AS gi,
+  toFloat64((SELECT count() FROM metric_hist_samples
+             WHERE unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps)) AS agg
+ORDER BY gid, gi
