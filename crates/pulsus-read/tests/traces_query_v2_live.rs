@@ -7620,32 +7620,26 @@ async fn search_routed_answers_a_run_time_demand_on_todays_engine() {
     .await;
     let engine = engine_of(&db).await;
     let demand = "expression (!.a) expected a boolean";
-    let t0 = now_ns();
-    let mut wrong = Vec::new();
-    for (query, want_covered, want) in [
+    let cases = [
         (r#"{ !.a = .b }"#, true, Err(demand)),
         (r#"{ !.a = 1 }"#, false, Err(demand)),
         (r#"{ .a }"#, true, Ok(1usize)),
-    ] {
+    ];
+    let mut wrong = Vec::new();
+    // The fork's answers first, and the query log read before today's
+    // engine runs at all: a read of today's tables after the statement's
+    // 395 can then only be the fork's own retry.
+    let t0 = now_ns();
+    let mut routed = Vec::new();
+    for (query, want_covered, _) in &cases {
         let plan = plan_of(&engine, &parse_query(query), window, 20, 3);
-        if covered(&plan) != want_covered {
+        if covered(&plan) != *want_covered {
             wrong.push(format!(
                 "{query}: covered {}, want {want_covered}",
                 covered(&plan)
             ));
         }
-        let routed = engine.search_routed(&plan).await;
-        let today = engine.search(&plan).await;
-        for (side, out) in [("routed", &routed), ("today", &today)] {
-            let ok = match (&want, out) {
-                (Err(m), Err(e)) => e.to_string().contains(m),
-                (Ok(n), Ok(o)) => o.traces.len() == *n,
-                _ => false,
-            };
-            if !ok {
-                wrong.push(format!("{query} {side}: want {want:?}, got {}", shape(out)));
-            }
-        }
+        routed.push(engine.search_routed(&plan).await);
     }
     client
         .execute(
@@ -7678,6 +7672,31 @@ async fn search_routed_answers_a_run_time_demand_on_todays_engine() {
         .expect("read the query log");
     while let Some(row) = stream.next().await {
         logged.push(row.expect("decode a query log row"));
+    }
+    // Then today's engine, whose answer the fork's must equal exactly —
+    // the same error, of the same kind, not merely the same message.
+    for ((query, _, want), routed) in cases.iter().zip(&routed) {
+        let plan = plan_of(&engine, &parse_query(query), window, 20, 3);
+        let today = engine.search(&plan).await;
+        for (side, out) in [("routed", routed), ("today", &today)] {
+            let ok = match (want, out) {
+                (Err(m), Err(e)) => e.to_string().contains(m),
+                (Ok(n), Ok(o)) => o.traces.len() == *n,
+                _ => false,
+            };
+            if !ok {
+                wrong.push(format!("{query} {side}: want {want:?}, got {}", shape(out)));
+            }
+        }
+        let (r, t) = (
+            format!("{:?}", routed.as_ref().err()),
+            format!("{:?}", today.as_ref().err()),
+        );
+        if r != t {
+            wrong.push(format!(
+                "{query}: the fork's error\n  {r}\nis not today's\n  {t}"
+            ));
+        }
     }
     drop_db(&db).await;
     let tried = logged
