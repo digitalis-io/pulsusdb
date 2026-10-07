@@ -54,7 +54,9 @@
 
 use std::collections::HashMap;
 
-use pulsus_traceql::{BoolOp, FieldExpr, Query, SpansetExpr, SpansetFilter, Value};
+use pulsus_traceql::{
+    BoolOp, Field, FieldExpr, FieldOp, PipelineStage, Query, SpansetExpr, SpansetFilter, Value,
+};
 
 use super::predicate::{PredicateCtx, SpanPredicate, compile_span_predicate_in};
 use super::projection::{Projection, ceiling_sql};
@@ -99,6 +101,40 @@ SELECT m.trace_id AS trace_id, t.root_service AS root_service, t.root_name AS ro
 FROM (SELECT trace_id, max(start_ns) AS last, count() AS matched,
              arraySlice(arraySort(x -> (x.2, x.1),
                         groupArray((span_id, start_ns, duration_ns, service, {projection}))), 1, {spss}) AS spans
+      FROM {spans}
+      WHERE (intDiv(start_ns, 300000000000), trace_id) IN
+            (SELECT arrayJoin(arrayFlatten(arrayMap((t, ks) -> arrayMap(k -> (k, t), ks), top.1, top.2))))
+        AND {time}
+        AND {bucket}
+        AND {day}
+        AND ({predicate})
+      GROUP BY trace_id) AS m
+{trace_read}";
+
+/// One filter followed by later `{…}` filters (issue #592 part 1): today's
+/// engine ranks a trace by the newest span the selector matched, before
+/// any stage runs, and then keeps the spans the later filters keep. So
+/// both reads filter by the selector alone; the top-K keeps a trace only
+/// when a span satisfies the later filters, `matched` counts those spans,
+/// and the spans returned are theirs.
+const SEARCH_LATER: &str = r"WITH (SELECT (groupArray(trace_id), groupArray(keys))
+      FROM (SELECT trace_id, max(start_ns) AS last,
+                   groupUniqArray(intDiv(start_ns, 300000000000)) AS keys
+            FROM {spans}
+            WHERE {time}
+              AND {bucket}
+              AND {day}
+              AND ({predicate})
+            GROUP BY trace_id
+            HAVING countIf({later}) > 0
+            ORDER BY last DESC, trace_id ASC
+            LIMIT {limit})) AS top
+SELECT m.trace_id AS trace_id, t.root_service AS root_service, t.root_name AS root_name,
+       t.start_ns AS start_ns, t.end_ns - t.start_ns AS duration_ns,
+       m.last AS last, m.matched AS matched, m.spans AS spans
+FROM (SELECT trace_id, max(start_ns) AS last, countIf({later}) AS matched,
+             arraySlice(arraySort(x -> (x.2, x.1),
+                        groupArrayIf((span_id, start_ns, duration_ns, service, {projection}), {later})), 1, {spss}) AS spans
       FROM {spans}
       WHERE (intDiv(start_ns, 300000000000), trace_id) IN
             (SELECT arrayJoin(arrayFlatten(arrayMap((t, ks) -> arrayMap(k -> (k, t), ks), top.1, top.2))))
@@ -173,6 +209,12 @@ fn fill(template: &str, values: &[(&str, &str)]) -> String {
 pub enum SearchFilter {
     /// One `{ … }`.
     One(SpanPredicate),
+    /// One `{ … }`, the selector, followed by later `{…}` filters whose
+    /// bodies are ANDed in written order (issue #592 part 1).
+    Later {
+        selector: SpanPredicate,
+        later: SpanPredicate,
+    },
     /// Two or more filters joined by `&&`/`||`, in pre-order, with the
     /// texts of section 4.3's `{holds}` and each filter's guard (`None` =
     /// true).
@@ -187,6 +229,7 @@ impl SearchFilter {
     fn predicates(&self) -> Vec<&SpanPredicate> {
         match self {
             SearchFilter::One(p) => vec![p],
+            SearchFilter::Later { selector, later } => vec![selector, later],
             SearchFilter::Tree { filters, .. } => filters.iter().collect(),
         }
     }
@@ -345,6 +388,12 @@ pub fn search_sql(
             values.push(("predicate", p.sql()));
             fill(SEARCH, &values)
         }
+        SearchFilter::Later { selector, later } => {
+            let mut values: Vec<(&str, &str)> = common.to_vec();
+            values.push(("predicate", selector.sql()));
+            values.push(("later", later.sql()));
+            fill(SEARCH_LATER, &values)
+        }
         SearchFilter::Tree {
             filters,
             holds,
@@ -412,8 +461,61 @@ impl SearchStatement {
     }
 }
 
-/// Compiles `query` to the search statement. A pipeline stage is #592's
-/// and a structural operator #593's; a set field projected from a
+/// The later `{…}` filters' bodies, in written order, and the `select()`
+/// fields of `query`'s `|` stages (issue #592 part 1). Only a single `{…}`
+/// selector followed by later `{…}` filters and `select()` is the
+/// statement's: `by()` and `coalesce()` are #592 part 2's, an aggregate
+/// part 3's, and any other shape is refused naming #592.
+fn pipeline_of(query: &Query) -> Result<(Vec<&FieldExpr>, Vec<Field>), PlanError> {
+    let refused = |what: &str, target: &str| {
+        PlanError::UnsupportedField(format!(
+            "{what} is not supported by the search statement yet (issue {target})"
+        ))
+    };
+    let mut later = Vec::new();
+    let mut selected = Vec::new();
+    for stage in &query.pipeline {
+        match stage {
+            PipelineStage::Filter(SpansetExpr::Filter(f)) => later.extend(f.body.as_ref()),
+            PipelineStage::Filter(_) => {
+                return Err(refused("a spanset operation as a pipeline stage", "#592"));
+            }
+            PipelineStage::Select { fields } => selected.extend(fields.iter().cloned()),
+            PipelineStage::By { .. } => return Err(refused("a by() stage", "#592 part 2")),
+            PipelineStage::Coalesce => return Err(refused("a coalesce() stage", "#592 part 2")),
+            PipelineStage::Aggregate { .. } => {
+                return Err(refused("an aggregate stage", "#592 part 3"));
+            }
+            PipelineStage::Metric(_)
+            | PipelineStage::MetricSecondStage(_)
+            | PipelineStage::Compare { .. } => {
+                return Err(refused("a metrics stage", "#592"));
+            }
+        }
+    }
+    if !query.pipeline.is_empty() && !matches!(query.spanset, SpansetExpr::Filter(_)) {
+        return Err(refused(
+            "a pipeline stage after a spanset operation",
+            "#592",
+        ));
+    }
+    Ok((later, selected))
+}
+
+/// The AND of the later filters' bodies, in written order; `None` when
+/// there is none.
+fn later_body(later: &[&FieldExpr]) -> Option<FieldExpr> {
+    let mut bodies = later.iter().map(|b| (*b).clone());
+    let first = bodies.next()?;
+    Some(bodies.fold(first, |acc, b| FieldExpr::Binary {
+        op: FieldOp::Bool(BoolOp::And),
+        lhs: Box::new(acc),
+        rhs: Box::new(b),
+    }))
+}
+
+/// Compiles `query` to the search statement. Its `|` stages are
+/// [`pipeline_of`]'s; a structural operator is #593's; a set field projected from a
 /// comparison that holds it twice beside arithmetic, or under `!` or inside
 /// a boolean-valued operand, is refused (`projection.rs`); everything the
 /// predicate compiler refuses is returned as it refused. `query.hints` are
@@ -426,17 +528,22 @@ pub fn compile_search(
     limit: u32,
     spss: u32,
 ) -> Result<SearchStatement, PlanError> {
-    if !query.pipeline.is_empty() {
-        return Err(PlanError::UnsupportedField(
-            "a pipeline stage is not supported by the search statement yet (issue #592)"
-                .to_string(),
-        ));
+    let (later, selected) = pipeline_of(query)?;
+    let mut filter = compile_search_filter(&query.spanset, ctx)?;
+    if let Some(body) = later_body(&later) {
+        let SearchFilter::One(selector) = filter else {
+            unreachable!("pipeline_of refuses a stage after anything but one filter")
+        };
+        filter = SearchFilter::Later {
+            selector,
+            later: compile_span_predicate_in(&body, ctx)?,
+        };
     }
-    let filter = compile_search_filter(&query.spanset, ctx)?;
     let mut filters = Vec::new();
     filters_of(&query.spanset, &mut filters)?;
-    let bodies: Vec<&FieldExpr> = filters.iter().filter_map(|f| f.body.as_ref()).collect();
-    let projection = Projection::of_filters(&bodies, ctx)?;
+    let mut bodies: Vec<&FieldExpr> = filters.iter().filter_map(|f| f.body.as_ref()).collect();
+    bodies.extend(later.iter().copied());
+    let projection = Projection::of_filters(&bodies, &selected, ctx)?;
     let mut demands: Vec<String> = Vec::new();
     for p in filter.predicates() {
         for m in p.demand_messages() {
@@ -461,19 +568,16 @@ pub fn compile_search(
     })
 }
 
-/// Issue #591 part 3's coverage: the search statement for `plan`, when it
-/// has no `|` stage and `compile_search` accepts its spanset under its own
-/// window, `limit` and `spss`; `None` sends it to today's engine, which
-/// answers it unchanged.
+/// Issue #591 part 3's coverage: the search statement for `plan`, when
+/// `compile_search` accepts its spanset and its `|` stages (issue #592
+/// part 1) under its own window, `limit` and `spss`; `None` sends it to
+/// today's engine, which answers it unchanged.
 pub fn plan_statement(
     plan: &SearchPlan,
     spans_table: &str,
     traces_table: &str,
     resources_table: &str,
 ) -> Option<SearchStatement> {
-    if plan.pipeline_len != 0 {
-        return None;
-    }
     let window = WindowSql::start_closed_end_open(plan.window.start_ns, plan.window.end_ns);
     let ctx = PredicateCtx {
         window,
@@ -481,7 +585,7 @@ pub fn plan_statement(
     };
     let query = Query {
         spanset: plan.spanset.clone(),
-        pipeline: Vec::new(),
+        pipeline: plan.pipeline.clone(),
         hints: Vec::new(),
     };
     compile_search(
