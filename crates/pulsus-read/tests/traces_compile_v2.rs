@@ -4755,6 +4755,12 @@ fn compile_search_refuses_what_parts_two_and_three_serve() {
         // comparison holding arithmetic has no single element to project.
         (r#"{ event.k * event.k > 5 }"#, "two occurrences"),
         (r#"{ .k + 1 > .k }"#, "two occurrences"),
+        // The same under `!=`, which projects nothing but must still be
+        // refused: the predicate matches any pair, today's engine each
+        // element against itself (code review round 1 of part 2).
+        (r#"{ event.k * event.k != 5 }"#, "two occurrences"),
+        (r#"{ .k + 1 != .k }"#, "two occurrences"),
+        (r#"{ link.lk - link.lk != 0 }"#, "two occurrences"),
         (r#"{ .a = 1 } | count() > 1"#, "#592"),
         (r#"{ .a = 1 } > { .b = 2 }"#, "#593"),
         (r#"({ .a = 1 } > { .b = 2 }) && { .c = 3 }"#, "#593"),

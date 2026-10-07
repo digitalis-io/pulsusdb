@@ -7050,6 +7050,19 @@ async fn search_statement_answers_written_out_on_fixture_p() {
             want,
         );
     }
+    // Section 3.6's refusal holds under `!=` too: on fixture P the
+    // predicate's any-pair reading drops span `…01`, which today's engine,
+    // reading each element against itself, returns. The statement refuses,
+    // so the query is today's engine's.
+    for query in [r#"{ event.k * event.k != 5 }"#, r#"{ .k + 1 != .k }"#] {
+        match statement(&client_p, &parse_query(query), window, 100, 100).await {
+            Err(e) if e.contains("two occurrences") => {}
+            other => wrong.push(format!(
+                "{query}\n  want: a refusal naming two occurrences\n  got:  {:?}",
+                other.map(|o| written(&o, false))
+            )),
+        }
+    }
     let five = |key: &str| format!("3333(1): 0004[{key}=Int 5]");
     let two = |key: &str| format!("3333(1): 0004[{key}=Int 2]");
     let s_rows = [
