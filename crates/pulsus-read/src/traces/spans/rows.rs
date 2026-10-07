@@ -524,8 +524,8 @@ mod tests {
 ///
 /// The server reports the projected types as `FixedString(16)`, `String`,
 /// `String`, `SimpleAggregateFunction(min, Int64)`, `Int64`, `Int64`,
-/// `UInt64` and `Array(Tuple(FixedString(8), Int64, Int64, String))`
-/// (`toTypeName` on 26.3.29.7). The driver's row decoder reads a
+/// `UInt64` and `Array(Tuple(FixedString(8), Int64, Int64, String,
+/// Array(Tuple(UInt8, String, String))))` (`toTypeName` on 26.3.29.7). The driver's row decoder reads a
 /// `SimpleAggregateFunction` as its inner type, so `start_ns` is an `i64`.
 /// For a trace the per-trace table has not indexed, the left join gives
 /// `root_service` and `root_name` empty and `start_ns` and `duration_ns`
@@ -555,10 +555,66 @@ pub struct SearchSpanTuple {
     pub start_ns: i64,
     pub duration_ns: i64,
     pub service: String,
+    /// The span's projected values, one per projection group whose
+    /// condition held for it, in group order (issue #591).
+    pub projected: Vec<SearchProjected>,
 }
 
 /// See [`SPAN_TUPLE_ELEMENTS`].
-pub const SEARCH_SPAN_TUPLE_ELEMENTS: usize = 4;
+pub const SEARCH_SPAN_TUPLE_ELEMENTS: usize = 5;
+
+/// One projected value of a matched span (issue #591): its projection
+/// group (1-based), the value as text, and the kind it decodes as — a
+/// stored type name, `String` or `Bool`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchProjected {
+    pub group: u8,
+    pub value: String,
+    pub kind: String,
+}
+
+/// See [`SPAN_TUPLE_ELEMENTS`].
+pub const SEARCH_PROJECTED_TUPLE_ELEMENTS: usize = 3;
+
+impl Serialize for SearchProjected {
+    /// See [`FetchedEventTuple::serialize`].
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeTuple;
+        let mut t = s.serialize_tuple(SEARCH_PROJECTED_TUPLE_ELEMENTS)?;
+        t.serialize_element(&self.group)?;
+        t.serialize_element(self.value.as_str())?;
+        t.serialize_element(self.kind.as_str())?;
+        t.end()
+    }
+}
+
+struct SearchProjectedVisitor;
+
+impl<'de> Visitor<'de> for SearchProjectedVisitor {
+    type Value = SearchProjected;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "a {SEARCH_PROJECTED_TUPLE_ELEMENTS}-element projected value tuple"
+        )
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        const T: &str = "projected value";
+        Ok(SearchProjected {
+            group: element(&mut seq, T, "group")?,
+            value: element(&mut seq, T, "value")?,
+            kind: element(&mut seq, T, "kind")?,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for SearchProjected {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_tuple(SEARCH_PROJECTED_TUPLE_ELEMENTS, SearchProjectedVisitor)
+    }
+}
 
 impl Serialize for SearchSpanTuple {
     /// See [`FetchedEventTuple::serialize`].
@@ -569,6 +625,7 @@ impl Serialize for SearchSpanTuple {
         t.serialize_element(&self.start_ns)?;
         t.serialize_element(&self.duration_ns)?;
         t.serialize_element(self.service.as_str())?;
+        t.serialize_element(&self.projected)?;
         t.end()
     }
 }
@@ -592,6 +649,7 @@ impl<'de> Visitor<'de> for SearchSpanVisitor {
             start_ns: element(&mut seq, T, "start_ns")?,
             duration_ns: element(&mut seq, T, "duration_ns")?,
             service: element(&mut seq, T, "service")?,
+            projected: element(&mut seq, T, "projected")?,
         })
     }
 }

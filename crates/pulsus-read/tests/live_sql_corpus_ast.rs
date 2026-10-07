@@ -217,8 +217,11 @@ const CONTROL: &str = "with_binding_control.txt";
 /// 401: SEVEN `traces_spans_search` goldens added, each one statement of
 /// `spans::search::search_sql` with no `== ` line.** Its `WITH (SELECT …)
 /// AS top` is a scalar alias, which carries no `WithElement`.
-const SQL_FILES: usize = 137;
-const SQL_STATEMENTS: usize = 401;
+///
+/// **Issue #591 part 1 moves them 137 -> 143 and 401 -> 407: SIX
+/// `traces_spans_search` goldens added, one statement each.**
+const SQL_FILES: usize = 143;
+const SQL_STATEMENTS: usize = 407;
 const PROMQL_ENTRIES: usize = 30;
 const PROMQL_STATEMENTS: usize = 56;
 const CONTROL_STATEMENTS: usize = 1;

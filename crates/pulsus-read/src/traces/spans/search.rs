@@ -30,12 +30,19 @@
 //! builder is not one of them, and its goldens are on the join gate's
 //! named list.
 
-use super::predicate::SpanPredicate;
+use pulsus_traceql::{Query, SpansetExpr};
+
+use super::predicate::{PredicateCtx, SpanPredicate};
+use super::projection::Projection;
+use super::rows::SearchTraceRow;
+use crate::traces::PlanError;
+use crate::traces::exec::SearchOutput;
 use crate::traces::window_sql::WindowSql;
 
 /// The statement, byte for byte (the issue #590 design's section 3.2). A
 /// `const` at column zero, filled by `str::replace`, as [`super::fetch`]
 /// does, so no source indentation can leak into it.
+#[allow(dead_code)]
 const SEARCH: &str = r"WITH (SELECT (groupArray(trace_id), groupArray(keys))
       FROM (SELECT trace_id, max(start_ns) AS last,
                    groupUniqArray(intDiv(start_ns, 300000000000)) AS keys
@@ -68,43 +75,79 @@ LEFT JOIN (SELECT trace_id, min(start_ns) AS start_ns, max(end_ns) AS end_ns,
            GROUP BY trace_id) AS t USING trace_id
 ORDER BY last DESC, trace_id ASC";
 
-/// The search statement (`sql-schema.md` §5.2, ungrouped). `limit` and
-/// `spss` are the request's, already validated positive by the caller.
-/// Issue it with `final = 1`, as every read of these tables is; clustered,
-/// pass the distributed table names — spans are sharded by trace, so each
-/// trace's rows are on one shard.
-///
-/// Every output column carries an alias, read by name into
-/// [`super::rows::SearchTraceRow`].
-///
-/// # Panics
-///
-/// If `p` was compiled for another window, as
-/// [`super::predicate::span_membership_sql`] does: a resource subquery
-/// bounded by one window's days inside a statement bounded by another is a
-/// wrong answer.
+// --- issue #591 part 1: stubs, the tests come first --------------------
+
+/// Stub.
+pub enum SearchFilter {
+    One(SpanPredicate),
+    Tree {
+        filters: Vec<SpanPredicate>,
+        holds: String,
+        guards: Vec<Option<String>>,
+    },
+}
+
+/// Stub.
+pub fn compile_search_filter(
+    _spanset: &SpansetExpr,
+    _ctx: &PredicateCtx<'_>,
+) -> Result<SearchFilter, PlanError> {
+    Err(PlanError::UnsupportedField("stub".to_string()))
+}
+
+/// Stub.
 pub fn search_sql(
-    spans_table: &str,
-    traces_table: &str,
-    w: WindowSql,
-    p: &SpanPredicate,
-    limit: u32,
-    spss: u32,
+    _spans_table: &str,
+    _traces_table: &str,
+    _w: WindowSql,
+    _f: &SearchFilter,
+    _proj: &Projection,
+    _limit: u32,
+    _spss: u32,
 ) -> String {
-    assert!(
-        p.composes_with(w),
-        "search_sql: the predicate was compiled for a different window"
-    );
-    // The predicate is substituted LAST: it carries the client's string
-    // literals, and a literal spelled `{limit}` must not be rewritten by a
-    // later substitution.
-    SEARCH
-        .replace("{spans}", spans_table)
-        .replace("{traces}", traces_table)
-        .replace("{time}", &w.span_time_clause())
-        .replace("{bucket}", &w.span_bucket_clause())
-        .replace("{day}", &w.span_day_clause())
-        .replace("{limit}", &limit.to_string())
-        .replace("{spss}", &spss.to_string())
-        .replace("{predicate}", p.sql())
+    String::new()
+}
+
+/// Stub.
+pub struct SearchStatement {
+    sql: String,
+    projection: Projection,
+    demands: Vec<String>,
+}
+
+impl SearchStatement {
+    pub fn sql(&self) -> &str {
+        &self.sql
+    }
+    pub fn projection(&self) -> &Projection {
+        &self.projection
+    }
+    pub fn demands(&self) -> &[String] {
+        &self.demands
+    }
+}
+
+/// Stub.
+pub fn compile_search(
+    _query: &Query,
+    _ctx: &PredicateCtx<'_>,
+    _spans_table: &str,
+    _traces_table: &str,
+    _limit: u32,
+    _spss: u32,
+) -> Result<SearchStatement, PlanError> {
+    Err(PlanError::UnsupportedField("stub".to_string()))
+}
+
+/// Stub.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchDecodeError(pub String);
+
+/// Stub.
+pub fn decode_search(
+    _rows: Vec<SearchTraceRow>,
+    _proj: &Projection,
+    _limit: u32,
+) -> Result<SearchOutput, SearchDecodeError> {
+    Err(SearchDecodeError("stub".to_string()))
 }

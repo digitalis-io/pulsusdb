@@ -2532,13 +2532,15 @@ async fn the_repair_converges_after_a_partition_is_left_part_written() {
 }
 
 /// The `traces` read of `docs/TraceQL/sql-schema.md` §5.2's own shape, as one
-/// string: `min(start_ns)|max(end_ns)|root_service|root_name|services`.
+/// string: `min(start_ns)|max(end_ns)|root_service|root_name|services`, the
+/// root read from `min(root)` as §5.2 reads it.
 async fn traces_row(client: &ChClient, trace: &[u8; 16]) -> String {
     scalar(
         client,
         &format!(
             "SELECT concat(toString(min(start_ns)), '|', toString(max(end_ns)), '|', \
-                    max(root_service), '|', max(root_name), '|', \
+                    if(min(root).1 = 0, min(root).4, ''), '|', \
+                    if(min(root).1 = 0, min(root).5, ''), '|', \
                     toString(arraySort(groupUniqArrayArray(services)))) AS s \
              FROM traces WHERE trace_id = unhex('{}') GROUP BY trace_id",
             hex_of(trace)
@@ -2764,7 +2766,8 @@ async fn all_traces_rows(client: &ChClient) -> Vec<String> {
     texts(
         client,
         "SELECT concat(hex(trace_id), '|', toString(min(start_ns)), '|', \
-                toString(max(end_ns)), '|', max(root_service), '|', max(root_name), '|', \
+                toString(max(end_ns)), '|', if(min(root).1 = 0, min(root).4, ''), '|', \
+                if(min(root).1 = 0, min(root).5, ''), '|', \
                 toString(arraySort(groupUniqArrayArray(services)))) AS s \
          FROM traces GROUP BY trace_id ORDER BY s",
     )
