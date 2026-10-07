@@ -636,6 +636,13 @@ pub struct TagValues {
     pub truncated: bool,
 }
 
+/// Charged before a search response's trace buffer is reserved at `n`
+/// entries: the buffer's slots and one entry's overhead (issue #591 part 3
+/// shares it between today's engine and the search statement's decode).
+pub(crate) fn output_reserve_bytes(n: usize) -> usize {
+    n * std::mem::size_of::<TraceSearchResult>() + RETAINED_ENTRY_OVERHEAD
+}
+
 /// The Layer-2 retention counter: one per request, charged on every
 /// retained allocation, released when a batch is discarded. A charge
 /// that would breach the cap is a `422 query_too_broad` — the byte
@@ -2171,6 +2178,20 @@ impl TraceEngine {
         Ok((output, explain))
     }
 
+    /// Executes a [`SearchPlan`] by the route fork (issue #591 part 3).
+    /// TESTS-FIRST STUB: today's engine answers every request.
+    pub async fn search_routed(&self, plan: &SearchPlan) -> Result<SearchOutput, ReadError> {
+        self.search_inner(plan, None).await
+    }
+
+    /// [`Self::search_routed`], with the per-stage SQL. TESTS-FIRST STUB.
+    pub async fn search_routed_explained(
+        &self,
+        plan: &SearchPlan,
+    ) -> Result<(SearchOutput, PlanExplain), ReadError> {
+        self.search_explained(plan).await
+    }
+
     fn search_settings(&self) -> QuerySettings {
         search_settings(&self.config)
     }
@@ -2595,9 +2616,7 @@ impl TraceEngine {
         // reservation materializes every slot up front), then each
         // root-summary CLONE's string bytes (the map entry stays live
         // alongside the clone) are charged before that clone is made.
-        budget.charge(
-            winners.len() * std::mem::size_of::<TraceSearchResult>() + RETAINED_ENTRY_OVERHEAD,
-        )?;
+        budget.charge(output_reserve_bytes(winners.len()))?;
         let mut traces: Vec<TraceSearchResult> = Vec::with_capacity(winners.len());
         for w in winners {
             // Charge-before-materialize in BOTH branches (the module's

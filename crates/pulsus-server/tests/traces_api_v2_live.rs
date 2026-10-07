@@ -459,10 +459,10 @@ fn search_ids(port: u16, start_ns: i64, end_ns: i64, ctx: &str) -> Vec<String> {
         .collect()
 }
 
-/// The phase-1 generator statement a search ran, read from the same
-/// request sent with `X-Pulsus-Explain: 1`: the one stage whose SQL
-/// carries `AS bound_ts`.
-fn generator_sql(port: u16, start_ns: i64, end_ns: i64, ctx: &str) -> String {
+/// The search statement a `{}` search ran, read from the same request
+/// sent with `X-Pulsus-Explain: 1`: its one `search_statement` stage
+/// (issue #591 part 3).
+fn statement_sql(port: u16, start_ns: i64, end_ns: i64, ctx: &str) -> String {
     let path = format!("/api/traces/v1/search?q=%7B%7D&start={start_ns}&end={end_ns}&limit=20");
     let raw = request(port, "GET", &path, None, &[("X-Pulsus-Explain", "1")])
         .unwrap_or_else(|| panic!("{ctx}: explain request must be reachable"));
@@ -470,19 +470,15 @@ fn generator_sql(port: u16, start_ns: i64, end_ns: i64, ctx: &str) -> String {
         .unwrap_or_else(|e| panic!("{ctx}: explain body is not JSON: {e}"));
     let sqls: Vec<String> = json["explain"]["stages"]
         .as_array()
-        .map(|stages| {
-            stages
-                .iter()
-                .filter_map(|s| s["sql"].as_str())
-                .filter(|sql| sql.contains("AS bound_ts"))
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
+        .into_iter()
+        .flatten()
+        .filter(|s| s["name"] == "search_statement")
+        .filter_map(|s| s["sql"].as_str().map(str::to_string))
+        .collect();
     match sqls.as_slice() {
         [one] => one.clone(),
         other => panic!(
-            "{ctx}: expected one generator stage, found {}: {json}",
+            "{ctx}: expected one search_statement stage, found {}: {json}",
             other.len()
         ),
     }
@@ -581,10 +577,13 @@ async fn a_window_ending_at_midnight_reads_one_days_partitions() {
         "T-B3(a): the trace whose newest span is exactly start is a candidate and an answer"
     );
 
-    let sql = generator_sql(port, b2, midnight, "T-B3(b)");
+    // Issue #591 part 3: `{}` is the search statement's, so the day bound
+    // is read from its one explained stage.
+    let sql = statement_sql(port, b2, midnight, "T-B3(b)");
     let one_day = date_literal(day);
+    let column = "toDate(fromUnixTimestamp64Nano(start_ns), 'UTC')";
     assert!(
-        sql.contains(&format!("date >= {one_day} AND date <= {one_day}")),
+        sql.contains(&format!("{column} >= {one_day} AND {column} <= {one_day}")),
         "T-B3(b): the day bound comes from the last included nanosecond, so a window ending \
          exactly at midnight names one day:\n{sql}"
     );
@@ -3906,5 +3905,672 @@ async fn t_q3_the_truncated_set_route_suppresses_the_discarded_array() {
          a ratio of {:.3} — the published ceiling is 2x, and the two bodies carry ONE \
          copy of the trace between them",
         numerator as f64 / denominator as f64
+    );
+}
+
+// ---------------------------------------------------------------------
+// Issue #591 part 3 — the search route fork over HTTP.
+// ---------------------------------------------------------------------
+
+fn any(value: Value) -> Option<AnyValue> {
+    Some(AnyValue { value: Some(value) })
+}
+
+fn kv_of(key: &str, value: Value) -> KeyValue {
+    KeyValue {
+        key: key.to_string(),
+        value: any(value),
+        key_strindex: 0,
+    }
+}
+
+fn f61_sid(n: u8) -> Vec<u8> {
+    let mut out = vec![0u8; 8];
+    out[7] = n;
+    out
+}
+
+/// One §6.1 span, as `traces_query_v2_live.rs`'s `span_of` builds it:
+/// `status_code` 0 leaves the status absent.
+#[allow(clippy::too_many_arguments)]
+fn f61_span(
+    trace: u8,
+    span: u8,
+    parent: Option<u8>,
+    name: &str,
+    kind: i32,
+    start_ns: i64,
+    duration_ns: i64,
+    attributes: Vec<KeyValue>,
+    status_code: i32,
+    events: Vec<Event>,
+    links: Vec<Link>,
+) -> Span {
+    Span {
+        trace_id: vec![trace; 16],
+        span_id: f61_sid(span),
+        parent_span_id: parent.map(f61_sid).unwrap_or_default(),
+        name: name.to_string(),
+        kind,
+        start_time_unix_nano: start_ns as u64,
+        end_time_unix_nano: (start_ns + duration_ns) as u64,
+        attributes,
+        events,
+        links,
+        status: (status_code != 0).then(|| Status {
+            message: "boom".to_string(),
+            code: status_code,
+        }),
+        ..Default::default()
+    }
+}
+
+/// One §6.1 request: one resource, the fixture's scope, the spans given.
+fn f61_request(service: &str, pod: &str, spans: Vec<Span>) -> ExportTraceServiceRequest {
+    ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: Some(Resource {
+                attributes: vec![
+                    kv_str("service.name", service),
+                    kv_str("deployment.environment.name", "prod"),
+                    kv_str("k8s.pod.name", pod),
+                ],
+                dropped_attributes_count: 0,
+                entity_refs: vec![],
+            }),
+            scope_spans: vec![ScopeSpans {
+                scope: Some(InstrumentationScope {
+                    name: "io.opentelemetry.http".to_string(),
+                    version: "2.9.0".to_string(),
+                    attributes: vec![kv_str("otel.scope.build", "release")],
+                    dropped_attributes_count: 0,
+                }),
+                spans,
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    }
+}
+
+/// The six §6.1 request bodies — five distinct ones and the retried copy
+/// of the first — transcribed from `traces_query_v2_live.rs`'s
+/// `fixture_61_bodies`.
+fn fixture_61_bodies(base_ns: i64) -> Vec<ExportTraceServiceRequest> {
+    let s = |v: &str| Value::StringValue(v.to_string());
+    let body0 = f61_request(
+        "frontend",
+        "frontend-a",
+        vec![
+            f61_span(
+                0x11,
+                1,
+                None,
+                "GET /cart",
+                2,
+                base_ns,
+                500_000_000,
+                vec![
+                    kv_of("http.request.method", s("GET")),
+                    kv_of("http.route", s("/cart")),
+                    kv_of("http.response.status_code", Value::IntValue(500)),
+                    kv_of("app.user.id", s("u-1")),
+                    kv_of("app.cache.hit", Value::BoolValue(false)),
+                ],
+                2,
+                vec![],
+                vec![],
+            ),
+            f61_span(
+                0x11,
+                2,
+                Some(1),
+                "checkout.Create",
+                3,
+                base_ns + 10_000_000,
+                400_000_000,
+                vec![kv_of("rpc.system", s("grpc"))],
+                0,
+                vec![],
+                vec![],
+            ),
+        ],
+    );
+    let body1 = f61_request(
+        "checkout",
+        "checkout-a",
+        vec![
+            f61_span(
+                0x11,
+                3,
+                Some(2),
+                "checkout.Create",
+                2,
+                base_ns + 20_000_000,
+                380_000_000,
+                vec![
+                    kv_of("rpc.system", s("grpc")),
+                    kv_of("app.items.count", Value::IntValue(3)),
+                    kv_of("app.discount.ratio", Value::DoubleValue(0.25)),
+                    kv_of(
+                        "app.tags",
+                        Value::ArrayValue(ArrayValue {
+                            values: vec![
+                                AnyValue {
+                                    value: Some(s("gold")),
+                                },
+                                AnyValue {
+                                    value: Some(s("eu")),
+                                },
+                            ],
+                        }),
+                    ),
+                ],
+                0,
+                vec![],
+                vec![],
+            ),
+            f61_span(
+                0x11,
+                4,
+                Some(3),
+                "payment.Charge",
+                3,
+                base_ns + 30_000_000,
+                300_000_000,
+                vec![kv_of("rpc.system", s("grpc"))],
+                0,
+                vec![],
+                vec![],
+            ),
+        ],
+    );
+    let body2 = f61_request(
+        "payment",
+        "payment-a",
+        vec![
+            f61_span(
+                0x11,
+                5,
+                Some(4),
+                "payment.Charge",
+                2,
+                base_ns + 40_000_000,
+                280_000_000,
+                vec![
+                    kv_of("rpc.system", s("grpc")),
+                    kv_of("payment.amount", Value::DoubleValue(12.5)),
+                    kv_of("payment.currency", s("EUR")),
+                ],
+                2,
+                vec![Event {
+                    time_unix_nano: (base_ns + 200_000_000) as u64,
+                    name: "exception".to_string(),
+                    attributes: vec![
+                        kv_of("exception.type", s("java.lang.IllegalStateException")),
+                        kv_of("exception.message", s("no funds")),
+                    ],
+                    dropped_attributes_count: 0,
+                }],
+                vec![],
+            ),
+            f61_span(
+                0x11,
+                6,
+                Some(5),
+                "SELECT ledger",
+                3,
+                base_ns + 60_000_000,
+                120_000_000,
+                vec![
+                    kv_of("db.system.name", s("postgresql")),
+                    kv_of("db.query.text", s("SELECT 1")),
+                    kv_of("http.response.status_code", s("200")),
+                ],
+                0,
+                vec![],
+                vec![],
+            ),
+        ],
+    );
+    let body3 = f61_request(
+        "frontend",
+        "frontend-b",
+        vec![f61_span(
+            0x22,
+            7,
+            None,
+            "GET /health",
+            2,
+            base_ns + 1_000_000_000,
+            5_000_000,
+            vec![
+                kv_of("http.request.method", s("GET")),
+                kv_of("http.route", s("/health")),
+                kv_of("http.response.status_code", Value::IntValue(200)),
+            ],
+            0,
+            vec![],
+            vec![],
+        )],
+    );
+    let body4 = f61_request(
+        "accounting",
+        "accounting-a",
+        vec![
+            f61_span(
+                0x33,
+                8,
+                None,
+                "orders process",
+                5,
+                base_ns + 1_999_000_000,
+                2_000_000_000,
+                vec![
+                    kv_of("messaging.system", s("kafka")),
+                    kv_of("messaging.destination.name", s("orders")),
+                ],
+                0,
+                vec![],
+                vec![Link {
+                    trace_id: vec![0x11; 16],
+                    span_id: f61_sid(5),
+                    trace_state: String::new(),
+                    attributes: vec![kv_of("link.kind", s("producer"))],
+                    dropped_attributes_count: 0,
+                    flags: 0,
+                }],
+            ),
+            f61_span(
+                0x33,
+                9,
+                Some(8),
+                "SELECT ledger",
+                3,
+                base_ns + 2_100_000_000,
+                50_000_000,
+                vec![
+                    kv_of("db.system.name", s("postgresql")),
+                    kv_of("db.query.text", s("SELECT 2")),
+                ],
+                0,
+                vec![],
+                vec![],
+            ),
+        ],
+    );
+    let retry = body0.clone();
+    vec![body0, retry, body1, body2, body3, body4]
+}
+
+/// The whole-second base of a fixture an hour ago.
+fn an_hour_ago_ns() -> i64 {
+    (now_ns() / 1_000_000_000 - 3_600) * 1_000_000_000
+}
+
+/// `GET /api/traces/v1/search` for `q` over `[start_ns, end_ns)`, with the
+/// extra query-string `extra` (`&limit=…`).
+fn search_q(port: u16, q: &str, start_ns: i64, end_ns: i64, extra: &str, ctx: &str) -> RawResponse {
+    get(
+        port,
+        &format!(
+            "/api/traces/v1/search?q={}&start={start_ns}&end={end_ns}{extra}",
+            enc(q)
+        ),
+        ctx,
+    )
+}
+
+/// Every returned span's id, as a set.
+fn span_id_set(json: &serde_json::Value) -> BTreeSet<String> {
+    json["traces"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|t| t["spanSets"].as_array().into_iter().flatten())
+        .flat_map(|s| s["spans"].as_array().into_iter().flatten())
+        .filter_map(|s| s["spanID"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// F1–F20 of `docs/TraceQL/functional-requirements.md`, the PulsusDB
+/// column: the query and its span ids, by their last four hex digits.
+const F_CASES: [(&str, &str, &[&str]); 20] = [
+    (
+        "F1",
+        "{}",
+        &[
+            "0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009",
+        ],
+    ),
+    (
+        "F2",
+        r#"{ resource.service.name = "payment" }"#,
+        &["0005", "0006"],
+    ),
+    ("F3", "{ status = error }", &["0001", "0005"]),
+    ("F4", "{ span.http.response.status_code >= 500 }", &["0001"]),
+    (
+        "F5",
+        r#"{ span.http.response.status_code = "200" }"#,
+        &["0006"],
+    ),
+    ("F6", "{ span.app.discount.ratio > 0.2 }", &["0003"]),
+    ("F7", r#"{ span.app.tags = "gold" }"#, &["0003"]),
+    ("F8", "{ span.app.cache.hit = false }", &["0001"]),
+    ("F9", "{ duration > 1s }", &["0008"]),
+    (
+        "F10",
+        r#"{ event.exception.type = "java.lang.IllegalStateException" }"#,
+        &["0005"],
+    ),
+    (
+        "F11",
+        r#"{ link:traceID = "11111111111111111111111111111111" }"#,
+        &["0008"],
+    ),
+    (
+        "F12",
+        r#"{ resource.service.name = "frontend" } >> { resource.service.name = "payment" && status = error }"#,
+        &["0005"],
+    ),
+    (
+        "F13",
+        r#"{ resource.service.name = "checkout" } > { resource.service.name = "payment" }"#,
+        &["0005"],
+    ),
+    ("F14", r#"{ name = "SELECT ledger" }"#, &["0006", "0009"]),
+    (
+        "F15",
+        r#"{ rootServiceName = "accounting" }"#,
+        &["0008", "0009"],
+    ),
+    ("F16", "{ traceDuration > 1s }", &["0008", "0009"]),
+    ("F17", r#"{ .app.user.id = "u-1" }"#, &["0001"]),
+    (
+        "F18",
+        r#"{ resource.k8s.pod.name = "payment-a" }"#,
+        &["0005", "0006"],
+    ),
+    (
+        "F19",
+        "{ span.http.response.status_code != 200 }",
+        &[
+            "0001", "0002", "0003", "0004", "0005", "0006", "0008", "0009",
+        ],
+    ),
+    ("F20", "{ kind = consumer }", &["0008"]),
+];
+
+/// Section 6.5: the §6.1 fixture pushed over OTLP answers F1–F20 as
+/// `functional-requirements.md`'s PulsusDB column says, through the route
+/// — the fork's new path for the covered ones, today's engine for F12,
+/// F13, F15 and F16.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_route_answers_f1_to_f20_on_the_worked_fixture() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_591;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_traces_api_v2_it_f61")).await;
+    let _server = spawn_ready(port, &db);
+    let base = an_hour_ago_ns();
+    for (i, body) in fixture_61_bodies(base).into_iter().enumerate() {
+        let res = request(
+            port,
+            "POST",
+            "/v1/traces",
+            Some(("application/x-protobuf", &body.encode_to_vec())),
+            &[],
+        )
+        .unwrap_or_else(|| panic!("push {i} must be reachable"));
+        assert_eq!(
+            res.status,
+            200,
+            "push {i}: {:?}",
+            String::from_utf8_lossy(&res.body)
+        );
+    }
+    let mut wrong = Vec::new();
+    for (case, q, want) in F_CASES {
+        let res = search_q(
+            port,
+            q,
+            base,
+            base + 10_000_000_000,
+            "&limit=100&spss=100",
+            case,
+        );
+        let got = span_id_set(&res.json(case));
+        let want: BTreeSet<String> = want.iter().map(|s| format!("{s:0>16}")).collect();
+        if got != want {
+            wrong.push(format!("{case} {q}\n  want: {want:?}\n  got:  {got:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
+}
+
+/// Corpus S's spans, `traces_query_v2_live.rs`'s statement: 70,000 traces
+/// of 28 spans over the three hours ending at `end_ns`, the sixth span of
+/// each an error.
+fn corpus_s_spans_sql(base_ns: i64) -> String {
+    const S: i64 = 10_800_000_000_000;
+    format!(
+        "INSERT INTO spans (trace_id, span_id, parent_span_id, start_ns, duration_ns, \
+         service, name, kind, end_ns, service_type, status_code) \
+         SELECT sipHash128(t), reinterpretAsFixedString(cityHash64(t, i)), \
+         if(i = 0, toFixedString('', 8), reinterpretAsFixedString(cityHash64(t, 0))), \
+         {base_ns} + intDiv(t * {S}, 70000) + i * 1000000, 1000000, \
+         ['frontend', 'checkout', 'cart', 'payment'][1 + (t + i) % 4], 'op', 1, \
+         toUInt64({base_ns} + intDiv(t * {S}, 70000) + i * 1000000 + 1000000), \
+         'string', if(i = 5, 2, 0) \
+         FROM (SELECT number AS t, arrayJoin(range(28)) AS i FROM numbers(70000))"
+    )
+}
+
+/// Section 6.10's spans: 70,000 one-span traces, each holding
+/// `{ <4000 × k>: "v" }`.
+fn long_key_spans_sql(base_ns: i64) -> String {
+    format!(
+        "INSERT INTO spans (trace_id, span_id, parent_span_id, start_ns, duration_ns, \
+         service, name, kind, end_ns, service_type, attrs) \
+         SELECT sipHash128(t), reinterpretAsFixedString(cityHash64(t, 0)), \
+         toFixedString('', 8), {base_ns} + t * 1000000, 1000000, 'frontend', 'op', 1, \
+         toUInt64({base_ns} + t * 1000000 + 1000000), 'string', \
+         CAST(concat('{{\"', repeat('k', 4000), '\":\"v\"}}') AS JSON) \
+         FROM (SELECT number AS t FROM numbers(70000))"
+    )
+}
+
+/// The per-trace table from the spans, by `traces_mv`'s own `SELECT`.
+const TRACES_FROM_SPANS: &str = "INSERT INTO traces SELECT \
+     toDate(fromUnixTimestamp64Nano(s), 'UTC') AS day, trace_id, \
+     s AS start_ns, e AS end_ns, r AS root, sv AS services, \
+     ls AS last_start_ns, bk AS buckets \
+     FROM (SELECT trace_id, min(start_ns) AS s, \
+     max(toInt64(least(toUInt64(start_ns) + toUInt64(duration_ns), 9223372036854775807))) AS e, \
+     min((toUInt8(parent_span_id != toFixedString('', 8)), start_ns, span_id, \
+     toString(service), toString(name))) AS r, \
+     groupUniqArray(toString(service)) AS sv, max(start_ns) AS ls, \
+     groupUniqArray(4096)(intDiv(start_ns, 300000000000)) AS bk \
+     FROM spans GROUP BY trace_id)";
+
+/// Runs the seeding statements on `db`, their threads and memory bounded:
+/// the server is shared.
+async fn seed_by_sql(db: &str, statements: &[String]) {
+    let client = ch_data(db).await;
+    let bounded = QuerySettings::new()
+        .set("max_threads", 4)
+        .set("max_memory_usage", 4_000_000_000_u64);
+    for sql in statements {
+        client
+            .execute(sql, &bounded, Idempotency::Idempotent)
+            .await
+            .unwrap_or_else(|e| panic!("seed: {e}\nSQL:\n{sql}"));
+    }
+}
+
+/// A JSON string's encoded length.
+fn json_len(s: &str) -> usize {
+    serde_json::to_string(s).expect("a string encodes").len()
+}
+
+/// `T-Q3`'s two steps over one response: the projection is exactly
+/// `expected` on every span, with no `name` and no extra span-set key;
+/// then the body is within R6's per-span bound over that projection.
+/// Returns `(body bytes, bound, spans)`.
+fn t_q3_check(body: &[u8], expected: &serde_json::Value, ctx: &str) -> (usize, usize, usize) {
+    let json: serde_json::Value =
+        serde_json::from_slice(body).unwrap_or_else(|e| panic!("{ctx}: not JSON: {e}"));
+    let traces = json["traces"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{ctx}: no traces in {json}"));
+    assert_eq!(traces.len(), 20, "{ctx}: twenty traces");
+    let mut spans = 0usize;
+    let mut variable = 0usize;
+    for t in traces {
+        variable += json_len(t["rootServiceName"].as_str().unwrap_or(""))
+            + json_len(t["rootTraceName"].as_str().unwrap_or(""));
+        for set in t["spanSets"].as_array().into_iter().flatten() {
+            let keys: BTreeSet<&str> = set
+                .as_object()
+                .unwrap_or_else(|| panic!("{ctx}: a spanSet is an object: {set}"))
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(
+                keys,
+                BTreeSet::from(["matched", "spans"]),
+                "{ctx}: a spanSet's keys: {set}"
+            );
+            for span in set["spans"].as_array().into_iter().flatten() {
+                spans += 1;
+                assert!(
+                    span.get("name").is_none(),
+                    "{ctx}: no span has a name: {span}"
+                );
+                match (span.get("attributes"), expected.as_array()) {
+                    (None, Some(e)) if e.is_empty() => {}
+                    (Some(a), _) if a == expected => {}
+                    (got, _) => {
+                        panic!("{ctx}: the projection is exactly {expected}, got {got:?} on {span}")
+                    }
+                }
+                for a in expected.as_array().into_iter().flatten() {
+                    let key = a["key"].as_str().expect("a key");
+                    let value = a["value"]["stringValue"].as_str().expect("a string value");
+                    variable += json_len(key) + json_len(value);
+                }
+            }
+        }
+    }
+    assert!(spans <= 60, "{ctx}: {spans} spans, more than limit × spss");
+    let bound = 512 * spans.max(1) + variable;
+    assert!(
+        body.len() <= bound,
+        "{ctx}: R6: {} body bytes over a bound of {bound} for {spans} spans",
+        body.len()
+    );
+    (body.len(), bound, spans)
+}
+
+/// `T-Q3`: a search at the default `limit` and `spss` returns exactly the
+/// projection asked for, within R6's bound per returned span
+/// (`docs/TraceQL/functional-requirements.md`).
+#[tokio::test(flavor = "multi_thread")]
+async fn t_q3_a_search_returns_at_most_r6s_bound() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    const S: i64 = 10_800_000_000_000;
+    let port = 31_592;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_traces_api_v2_it_tq3")).await;
+    let long = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_traces_api_v2_it_tq3_long")).await;
+    let base = (now_ns() / 1_000_000_000) * 1_000_000_000 - S;
+    let _server = spawn_ready(port, &db);
+    seed_by_sql(
+        db.name(),
+        &[corpus_s_spans_sql(base), TRACES_FROM_SPANS.to_string()],
+    )
+    .await;
+    let long_port = 31_593;
+    let _long_server = spawn_ready(long_port, &long);
+    seed_by_sql(
+        long.name(),
+        &[long_key_spans_sql(base), TRACES_FROM_SPANS.to_string()],
+    )
+    .await;
+    let key = "k".repeat(4000);
+    let cases = [
+        (port, "{}".to_string(), serde_json::json!([])),
+        (
+            port,
+            "{ status = error }".to_string(),
+            serde_json::json!([{"key": "status", "value": {"stringValue": "error"}}]),
+        ),
+        (
+            long_port,
+            format!(r#"{{ span.{key} = "v" }}"#),
+            serde_json::json!([{"key": key, "value": {"stringValue": "v"}}]),
+        ),
+    ];
+    for (p, q, expected) in cases {
+        let ctx = format!("T-Q3 {}", q.chars().take(40).collect::<String>());
+        let res = search_q(p, &q, base, base + S, "", &ctx);
+        let (body, bound, spans) = t_q3_check(&res.body, &expected, &ctx);
+        eprintln!("{ctx}: {body} / {bound}; {spans} spans");
+    }
+}
+
+/// Section 6.7: a covered search's explain is one `search_statement`
+/// stage, whose SQL is `compile_search`'s text for the request, and no
+/// compiled plan.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_covered_search_explains_its_one_statement() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_594;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db(
+        "pulsus_traces_api_v2_it_explain591",
+    ))
+    .await;
+    let _server = spawn_ready(port, &db);
+    let base = an_hour_ago_ns();
+    let (start, end) = (base, base + 10_000_000_000);
+    let q = r#"{ span.k = "x" }"#;
+    let raw = request(
+        port,
+        "GET",
+        &format!("/api/traces/v1/search?q={}&start={start}&end={end}", enc(q)),
+        None,
+        &[("X-Pulsus-Explain", "1")],
+    )
+    .expect("the explained request must be reachable");
+    assert_eq!(raw.status, 200, "{:?}", String::from_utf8_lossy(&raw.body));
+    let json = raw.json("explain");
+    let parsed = pulsus_traceql::parse(q).expect("parses");
+    let window = pulsus_read::traces::window_sql::WindowSql::start_closed_end_open(start, end);
+    let ctx = pulsus_read::traces::spans::predicate::PredicateCtx {
+        window,
+        resources_table: "resources",
+    };
+    let want =
+        pulsus_read::traces::spans::search::compile_search(&parsed, &ctx, "spans", "traces", 20, 3)
+            .expect("compiles");
+    let stages = json["explain"]["stages"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no stages in {json}"));
+    assert_eq!(stages.len(), 1, "one stage: {json}");
+    assert_eq!(stages[0]["name"], "search_statement", "{json}");
+    assert_eq!(stages[0]["sql"].as_str(), Some(want.sql()), "{json}");
+    assert!(
+        json["explain"]
+            .get("plan")
+            .is_none_or(serde_json::Value::is_null),
+        "no compiled plan: {json}"
     );
 }

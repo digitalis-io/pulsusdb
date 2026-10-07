@@ -300,6 +300,18 @@ fn typed_value(value: &str, kind: &str) -> Result<GroupValue, String> {
 /// An array's JSON as the writer stores it, from the statement's
 /// `[[type, text], …]`: each element rendered by its own type.
 fn array_json(value: &str) -> Result<String, String> {
+    serde_json::to_string(&array_values(value)?).map_err(|e| e.to_string())
+}
+
+/// The length of `ceiling(serde_json::to_string(values))`, learned
+/// without building it (issue #591 part 3). TESTS-FIRST STUB.
+fn rendered_len(_values: &[serde_json::Value]) -> usize {
+    0
+}
+
+/// An array's elements, each by its own type, from the statement's
+/// `[[type, text], …]`.
+fn array_values(value: &str) -> Result<Vec<serde_json::Value>, String> {
     let elements: Vec<(String, String)> =
         serde_json::from_str(value).map_err(|e| format!("projected array {value:?}: {e}"))?;
     let mut rendered: Vec<serde_json::Value> = Vec::with_capacity(elements.len());
@@ -319,7 +331,7 @@ fn array_json(value: &str) -> Result<String, String> {
             _ => serde_json::Value::Null,
         });
     }
-    serde_json::to_string(&rendered).map_err(|e| e.to_string())
+    Ok(rendered)
 }
 
 /// Every `Field` a comparison's operand tree names, in source order.
@@ -841,5 +853,33 @@ fn selected_value(field: &Field, element: &str) -> Projects {
         Field::Attribute { .. } => stored(element),
         Field::Intrinsic(Intrinsic::EventTimeSinceStart) => offset_value(element),
         Field::Intrinsic(_) => string_value(&format!("toString({element})")),
+    }
+}
+
+#[cfg(test)]
+mod rendered_len_tests {
+    use super::*;
+
+    /// Section 6.1: `rendered_len` is the length of the cut render, for a
+    /// short four-type array and for one that crosses the ceiling in
+    /// multi-byte code points.
+    #[test]
+    fn rendered_len_is_the_length_of_the_cut_render() {
+        let long = format!("[{}]", vec![r#"["String","é€"]"#; 3000].join(","));
+        for value in [
+            r#"[["String","g"],["Int64","7"],["Float64","1e5"],["Bool","true"]]"#,
+            long.as_str(),
+        ] {
+            let values = array_values(value).expect("a well-formed array");
+            let full = serde_json::to_string(&values).expect("a Value serializes");
+            let render = ceiling(full.clone());
+            eprintln!("uncut {} cut {}", full.len(), render.len());
+            assert_eq!(
+                rendered_len(&values),
+                render.len(),
+                "{}",
+                &full[..full.len().min(80)]
+            );
+        }
     }
 }

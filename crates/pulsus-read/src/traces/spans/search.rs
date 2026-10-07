@@ -456,6 +456,33 @@ pub fn compile_search(
     })
 }
 
+/// Issue #591 part 3's coverage: the search statement for `plan`, when it
+/// has no `|` stage and `compile_search` accepts its spanset under its own
+/// window, `limit` and `spss`; `None` sends it to today's engine.
+/// TESTS-FIRST STUB.
+pub fn plan_statement(
+    _plan: &crate::traces::search_plan::SearchPlan,
+    _spans_table: &str,
+    _traces_table: &str,
+    _resources_table: &str,
+) -> Option<SearchStatement> {
+    None
+}
+
+/// [`decode_search`], charging every retained entry against `budget`
+/// before it is built, with today's engine's own charges (issue #591 part
+/// 3). TESTS-FIRST STUB.
+pub(crate) fn decode_search_charged(
+    _rows: Vec<SearchTraceRow>,
+    _proj: &Projection,
+    _limit: u32,
+    _budget: &mut crate::traces::exec::ByteBudget,
+) -> Result<SearchOutput, crate::logql::error::ReadError> {
+    Err(crate::logql::error::ReadError::Clickhouse(
+        pulsus_clickhouse::ChError::Decode("decode_search_charged: stub".to_string()),
+    ))
+}
+
 /// A row the decode could not read: a projected value that does not parse
 /// as its kind, or a count out of range. Never a default.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -508,4 +535,147 @@ pub fn decode_search(
         returned,
         limit,
     })
+}
+
+#[cfg(test)]
+mod charge_tests {
+    use super::*;
+    use crate::traces::exec::{ByteBudget, RETAINED_ENTRY_OVERHEAD, output_reserve_bytes};
+    use crate::traces::search_eval::TraceMatch;
+    use crate::traces::spans::rows::{SearchProjected, SearchSpanTuple};
+
+    /// Section 6.1's four groups: a string, an int, `name` and an array.
+    fn statement() -> SearchStatement {
+        let q = pulsus_traceql::parse(
+            r#"{ span.foo = "bar" || span.n = 5 || name = "x" || span.tags = "g" }"#,
+        )
+        .expect("parses");
+        let w = WindowSql::start_closed_end_open(1_000_000_000_000, 2_000_000_000_000);
+        let ctx = PredicateCtx {
+            window: w,
+            resources_table: "resources",
+        };
+        compile_search(&q, &ctx, "spans", "traces", 20, 3).expect("compiles")
+    }
+
+    fn projected(group: u8, value: &str, kind: &str) -> SearchProjected {
+        SearchProjected {
+            group,
+            value: value.to_string(),
+            kind: kind.to_string(),
+        }
+    }
+
+    fn span(id: u8, projected: Vec<SearchProjected>) -> SearchSpanTuple {
+        SearchSpanTuple {
+            span_id: [id; 8],
+            start_ns: 1,
+            duration_ns: 1,
+            service: "svc".to_string(),
+            projected,
+        }
+    }
+
+    /// Two traces: a span with a string and an int, a span with only
+    /// `name`, then, last, a span with an array, so no later charge can
+    /// hide an over-charge on it.
+    fn rows() -> Vec<SearchTraceRow> {
+        vec![
+            SearchTraceRow {
+                trace_id: [1; 16],
+                root_service: "frontend".to_string(),
+                root_name: "GET /".to_string(),
+                start_ns: 1,
+                duration_ns: 2,
+                last: 1,
+                matched: 5,
+                spans: vec![
+                    span(
+                        1,
+                        vec![projected(1, "bar", "String"), projected(2, "5", "Int64")],
+                    ),
+                    span(2, vec![projected(3, "x", "String")]),
+                ],
+            },
+            SearchTraceRow {
+                trace_id: [2; 16],
+                root_service: "cart".to_string(),
+                root_name: "op".to_string(),
+                start_ns: 1,
+                duration_ns: 2,
+                last: 1,
+                matched: 1,
+                spans: vec![span(
+                    3,
+                    vec![projected(
+                        4,
+                        r#"[["String","g"],["Int64","7"]]"#,
+                        "Array(Nullable(String))",
+                    )],
+                )],
+            },
+        ]
+    }
+
+    /// Everything today's engine charges for the same response: the trace
+    /// buffer, then per trace `TraceMatch::retained_bytes` and the root
+    /// strings.
+    fn todays_charge(out: &SearchOutput) -> usize {
+        output_reserve_bytes(out.traces.len())
+            + out
+                .traces
+                .iter()
+                .map(|t| {
+                    std::mem::size_of::<TraceMatch>()
+                        + RETAINED_ENTRY_OVERHEAD
+                        + t.spans.capacity() * std::mem::size_of::<SpanSummary>()
+                        + t.spans
+                            .iter()
+                            .map(SpanSummary::heap_payload_bytes)
+                            .sum::<usize>()
+                        + t.root.service.len()
+                        + t.root.name.len()
+                })
+                .sum::<usize>()
+    }
+
+    /// Section 6.1: the decode charges exactly what today's engine charges
+    /// for the response it builds; a budget of exactly that decodes, and
+    /// one byte less is refused.
+    #[test]
+    fn the_decode_charges_what_todays_engine_charges() {
+        let s = statement();
+        let mut unbounded = ByteBudget::new(usize::MAX);
+        let out = decode_search_charged(rows(), s.projection(), 20, &mut unbounded)
+            .expect("decodes unbounded");
+        let used = unbounded.used();
+        eprintln!(
+            "used {used}; attributes (len, capacity) {:?}",
+            out.traces
+                .iter()
+                .flat_map(|t| t
+                    .spans
+                    .iter()
+                    .map(|s| (s.attributes.len(), s.attributes.capacity())))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            used,
+            todays_charge(&out),
+            "the decode's charge against today's"
+        );
+        assert!(
+            decode_search_charged(rows(), s.projection(), 20, &mut ByteBudget::new(used)).is_ok(),
+            "a budget of exactly the charge decodes"
+        );
+        let refused =
+            decode_search_charged(rows(), s.projection(), 20, &mut ByteBudget::new(used - 1));
+        assert!(
+            matches!(
+                refused,
+                Err(crate::logql::error::ReadError::QueryTooBroad(_))
+            ),
+            "one byte less is refused: {refused:?}"
+        );
+    }
 }

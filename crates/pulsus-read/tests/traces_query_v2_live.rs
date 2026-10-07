@@ -5652,6 +5652,18 @@ async fn fr_t_c4_a_tie_orders_by_trace_id() {
 /// Corpus S's three hours, ending at the test's own whole second.
 const CORPUS_S_NS: i64 = 10_800_000_000_000;
 
+/// The per-trace table, from the spans, by `traces_mv`'s own `SELECT`.
+const TRACES_FROM_SPANS: &str = "INSERT INTO traces SELECT toDate(fromUnixTimestamp64Nano(s), 'UTC') AS day, trace_id, \
+     s AS start_ns, e AS end_ns, r AS root, sv AS services, \
+     ls AS last_start_ns, bk AS buckets \
+     FROM (SELECT trace_id, min(start_ns) AS s, \
+     max(toInt64(least(toUInt64(start_ns) + toUInt64(duration_ns), 9223372036854775807))) AS e, \
+     min((toUInt8(parent_span_id != toFixedString('', 8)), start_ns, span_id, \
+     toString(service), toString(name))) AS r, \
+     groupUniqArray(toString(service)) AS sv, max(start_ns) AS ls, \
+     groupUniqArray(4096)(intDiv(start_ns, 300000000000)) AS bk \
+     FROM spans GROUP BY trace_id)";
+
 /// One corpus-S statement, its threads and memory bounded: the server is
 /// shared.
 async fn run_bounded(client: &ChClient, sql: String) {
@@ -5664,7 +5676,8 @@ async fn run_bounded(client: &ChClient, sql: String) {
         .unwrap_or_else(|e| panic!("corpus S: {e}\nSQL:\n{sql}"));
 }
 
-/// Seeds corpus S: 70,000 traces of 28 spans over three hours, then the
+/// Seeds corpus S: 70,000 traces of 28 spans over three hours — the sixth
+/// span of each an error (issue #591 part 3's `T-Q2`) — then the
 /// per-trace table by `traces_mv`'s own `SELECT` over the spans, then the
 /// span table merged, in `db`, a name `pulsus_testkit::test_db` composed.
 /// Returns the database, its client and the window.
@@ -5675,29 +5688,18 @@ async fn seed_corpus_s(db: String) -> (String, ChClient, WindowSql) {
         &client,
         format!(
             "INSERT INTO {SPANS_TABLE} (trace_id, span_id, parent_span_id, start_ns, duration_ns, \
-         service, name, kind, end_ns, service_type) \
+         service, name, kind, end_ns, service_type, status_code) \
          SELECT sipHash128(t), reinterpretAsFixedString(cityHash64(t, i)), \
          if(i = 0, toFixedString('', 8), reinterpretAsFixedString(cityHash64(t, 0))), \
          {base_ns} + intDiv(t * {CORPUS_S_NS}, 70000) + i * 1000000, 1000000, \
          ['frontend', 'checkout', 'cart', 'payment'][1 + (t + i) % 4], 'op', 1, \
          toUInt64({base_ns} + intDiv(t * {CORPUS_S_NS}, 70000) + i * 1000000 + 1000000), \
-         'string' \
+         'string', if(i = 5, 2, 0) \
          FROM (SELECT number AS t, arrayJoin(range(28)) AS i FROM numbers(70000))"
         ),
     )
     .await;
-    run_bounded(&client, "INSERT INTO traces SELECT toDate(fromUnixTimestamp64Nano(s), 'UTC') AS day, trace_id, \
-         s AS start_ns, e AS end_ns, r AS root, sv AS services, \
-         ls AS last_start_ns, bk AS buckets \
-         FROM (SELECT trace_id, min(start_ns) AS s, \
-         max(toInt64(least(toUInt64(start_ns) + toUInt64(duration_ns), 9223372036854775807))) AS e, \
-         min((toUInt8(parent_span_id != toFixedString('', 8)), start_ns, span_id, \
-         toString(service), toString(name))) AS r, \
-         groupUniqArray(toString(service)) AS sv, max(start_ns) AS ls, \
-         groupUniqArray(4096)(intDiv(start_ns, 300000000000)) AS bk \
-         FROM spans GROUP BY trace_id)"
-        .to_string())
-    .await;
+    run_bounded(&client, TRACES_FROM_SPANS.to_string()).await;
     run_bounded(&client, format!("OPTIMIZE TABLE {SPANS_TABLE} FINAL")).await;
     let seeded = count(&client, &format!("SELECT count() AS n FROM {SPANS_TABLE}")).await;
     assert_eq!(seeded, 1_960_000, "corpus S seeds 1,960,000 spans");
@@ -7228,4 +7230,533 @@ async fn search_statement_reads_one_root_across_pushes_and_merges() {
     assert_eq!(before, want, "the roots before the merge");
     assert_eq!(after, want, "the roots after the merge");
     assert_eq!(ee_rows, 1, "trace ee is one row after the merge");
+}
+
+// =====================================================================
+// Issue #591 part 3 — the route fork
+// =====================================================================
+
+/// The engine over `db`, configured as [`today`] configures it.
+async fn engine_of(db: &str) -> pulsus_read::TraceEngine {
+    pulsus_read::TraceEngine::new(
+        ChClient::new(client_config(db))
+            .await
+            .expect("connect the engine"),
+        engine_config(),
+    )
+}
+
+/// Today's planner's plan for `query` over `w`.
+fn plan_of(
+    engine: &pulsus_read::TraceEngine,
+    query: &pulsus_traceql::Query,
+    w: (i64, i64),
+    limit: u32,
+    spss: u32,
+) -> pulsus_read::SearchPlan {
+    use pulsus_read::traces::search_plan::{SearchParams, plan_search};
+    plan_search(
+        query,
+        &SearchParams {
+            start_ns: w.0,
+            end_ns: w.1,
+            limit,
+            spss,
+        },
+        &engine.search_ctx(),
+    )
+    .unwrap_or_else(|e| panic!("{query}: today's planner refused: {e}"))
+}
+
+/// Whether the fork's coverage function gives `plan` a statement, with
+/// [`engine_config`]'s tables.
+fn covered(plan: &pulsus_read::SearchPlan) -> bool {
+    pulsus_read::traces::spans::search::plan_statement(plan, "spans", "traces", "resources")
+        .is_some()
+}
+
+/// The inventory's `new` rows, by name.
+fn inventory_new_names() -> Vec<String> {
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/traces_route_inventory.tsv");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+    text.lines()
+        .skip(1)
+        .filter_map(|line| {
+            let cols: Vec<&str> = line.split('\t').collect();
+            (cols.get(2) == Some(&"new")).then(|| cols[0].to_string())
+        })
+        .collect()
+}
+
+/// Section 6.2: every query the inventory puts on the search statement is
+/// covered, and the fork answers it as today's engine does, at three
+/// `(limit, spss)` pairs, on fixture C landed in both stores.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_routed_answers_as_today_on_fixture_c() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let window = (base_ns, base_ns + CATALOGUE_WINDOW_NS);
+    let (db, _client) = seed_both(
+        pulsus_testkit::test_db("pulsus_read_it_t591p3_fork_c"),
+        &fixture_catalogue_bodies(base_ns),
+        34,
+        "t591p3-c",
+    )
+    .await;
+    let engine = engine_of(&db).await;
+    let names = inventory_new_names();
+    let mut wrong: Vec<String> = Vec::new();
+    for name in &names {
+        let text = corpus_query(name);
+        let parsed = parse_query(&text);
+        for (limit, spss) in LIMIT_SPSS {
+            let plan = plan_of(&engine, &parsed, window, limit, spss);
+            if !covered(&plan) {
+                wrong.push(format!("{name} (limit {limit}, spss {spss}): not covered"));
+                continue;
+            }
+            let want = engine.search(&plan).await.map(normalise_today);
+            let got = engine.search_routed(&plan).await;
+            let (want, got) = (format!("{want:?}"), format!("{got:?}"));
+            if want != got {
+                wrong.push(format!(
+                    "{name} (limit {limit}, spss {spss})\n  today:  {}\n  routed: {}",
+                    want.chars().take(2000).collect::<String>(),
+                    got.chars().take(2000).collect::<String>()
+                ));
+            }
+        }
+    }
+    drop_db(&db).await;
+    eprintln!("compared {} × 3", names.len());
+    assert_eq!(names.len(), 82, "the inventory's new rows");
+    assert!(
+        wrong.is_empty(),
+        "{} of {} differ:\n\n{}",
+        wrong.len(),
+        names.len() * 3,
+        wrong.join("\n\n")
+    );
+}
+
+/// `T-C1`'s sixteen non-structural filters of
+/// `docs/TraceQL/measure/agreement.py`, by their ground-truth row.
+const T_C1_FILTERS: [(&str, &str); 16] = [
+    ("service", r#"{ resource.service.name = "checkout" }"#),
+    (
+        "service_error",
+        r#"{ resource.service.name = "payment" && status = error }"#,
+    ),
+    (
+        "status_code_ge_500",
+        r#"{ span.http.response.status_code >= 500 }"#,
+    ),
+    ("duration_kind", r#"{ duration > 2s && kind = server }"#),
+    (
+        "db_and_name",
+        r#"{ span.db.system.name = "postgresql" && name = "SELECT shop" }"#,
+    ),
+    ("route_regex", r#"{ span.http.route =~ "/api/auth/.*" }"#),
+    ("user_point", r#"{ span.app.user.id = "u-10013" }"#),
+    (
+        "event_attr",
+        r#"{ event.exception.type = "java.lang.IllegalStateException" }"#,
+    ),
+    ("bool_true", r#"{ span.app.cache.hit = true }"#),
+    ("float_gt", r#"{ span.app.discount.ratio > 0.4 }"#),
+    ("int_ne", r#"{ span.http.response.status_code != 200 }"#),
+    ("array_attr", r#"{ span.app.tags = "gold" }"#),
+    ("kind_producer", r#"{ kind = producer }"#),
+    ("status_unset", r#"{ status = unset }"#),
+    ("name_eq", r#"{ name = "SELECT shop" }"#),
+    (
+        "resource_attr",
+        r#"{ resource.k8s.pod.name = "cart-7d9f8b-00002" }"#,
+    ),
+];
+
+/// `T-C1`: over g1, the sixteen non-structural filters count what
+/// `docs/TraceQL/measure/results/g1-ground-truth.tsv` records. g1 is built
+/// by hand (section 6.3 of #591 part 3's design) into the database
+/// `PULSUS_TEST_G1_DATABASE` names; the test is run by name and panics,
+/// never skips green, without it. The window is g1's own: its first span's
+/// start to one past its last.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs g1, built by hand: see the doc comment"]
+async fn t_c1_the_sixteen_filters_equal_the_ground_truth_on_g1() {
+    let db = std::env::var("PULSUS_TEST_G1_DATABASE")
+        .expect("PULSUS_TEST_G1_DATABASE names the database g1 was built in");
+    let client = ChClient::new(ChConnConfig {
+        database: db.clone(),
+        ..base_config()
+    })
+    .await
+    .expect("connect to g1");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/TraceQL/measure/results/g1-ground-truth.tsv");
+    let truth = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+    let truth: std::collections::HashMap<&str, u64> = truth
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let (case, n) = line.split_once('\t')?;
+            Some((case, n.trim().parse().ok()?))
+        })
+        .collect();
+    let first = count(
+        &client,
+        &format!("SELECT min(start_ns) AS n FROM {SPANS_TABLE}"),
+    )
+    .await;
+    let last = count(
+        &client,
+        &format!("SELECT max(start_ns) AS n FROM {SPANS_TABLE}"),
+    )
+    .await;
+    let w = WindowSql::start_closed_end_open(first as i64, last as i64 + 1);
+    let mut wrong = Vec::new();
+    for (case, query) in T_C1_FILTERS {
+        let want = *truth
+            .get(case)
+            .unwrap_or_else(|| panic!("{case} has a ground-truth row"));
+        let p = compile_span_predicate_in(&body(query), &ctx_of(w))
+            .unwrap_or_else(|e| panic!("{query}: {e}"));
+        let got = count(
+            &client,
+            &format!(
+                "SELECT count() AS n FROM {SPANS_TABLE} WHERE {} AND {} AND {} AND ({})",
+                w.span_time_clause(),
+                w.span_bucket_clause(),
+                w.span_day_clause(),
+                p.sql()
+            ),
+        )
+        .await;
+        eprintln!("{case}: {got} (ground truth {want})");
+        if got != want {
+            wrong.push(format!("{case}: {got}, ground truth {want}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Reads `system.query_log` for `db`'s finished `SELECT`s since `t0_ns`,
+/// read twice a second apart until two reads agree on a non-zero count:
+/// `(statements, rows returned)`.
+async fn settled_statements(client: &ChClient, db: &str, t0_ns: i64) -> (u64, u64) {
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, PartialEq, Clone, Copy)]
+    struct Logged {
+        n: u64,
+        rows: u64,
+    }
+    let read = || async {
+        client
+            .execute(
+                "SYSTEM FLUSH LOGS",
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("flush the logs");
+        let sql = format!(
+            "SELECT count() AS n, sum(result_rows) AS rows FROM system.query_log \
+             WHERE type = 'QueryFinish' AND query_kind = 'Select' AND has(databases, '{db}') \
+             AND event_time_microseconds >= toDateTime64({}, 6)",
+            t0_ns as f64 / 1e9
+        );
+        let mut stream = client
+            .query_stream::<Logged>(&sql, &QuerySettings::new())
+            .await
+            .expect("read the query log");
+        stream
+            .next()
+            .await
+            .expect("one row")
+            .expect("decode the query log row")
+    };
+    let deadline = std::time::Instant::now() + StdDuration::from_secs(30);
+    loop {
+        let a = read().await;
+        tokio::time::sleep(StdDuration::from_secs(1)).await;
+        let b = read().await;
+        if a == b && a.n >= 1 {
+            return (a.n, a.rows);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the query log did not settle within 30 s: {a:?} then {b:?}"
+        );
+    }
+}
+
+/// `T-Q2`: `{ status = error }` through the fork is one statement, which
+/// returns no more rows than `limit`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_q2_a_covered_search_is_one_statement_returning_at_most_limit_rows() {
+    skip_unless_live!();
+    let (db, client, w) = seed_corpus_s(pulsus_testkit::test_db("pulsus_read_it_t591p3_tq2")).await;
+    let engine = engine_of(&db).await;
+    let window = (w.first_included_ns(), w.last_included_ns() + 1);
+    let plan = plan_of(&engine, &parse_query("{ status = error }"), window, 20, 3);
+    let t0 = now_ns();
+    let out = engine.search_routed(&plan).await;
+    let (n, rows) = settled_statements(&client, &db, t0).await;
+    drop_db(&db).await;
+    let out = out.expect("the search answers");
+    assert_eq!(out.traces.len(), 20, "twenty traces");
+    assert_eq!(n, 1, "one statement");
+    assert!(rows <= 20, "{rows} rows returned, more than limit");
+}
+
+/// The search's error, or its trace and span counts.
+fn shape(out: &Result<pulsus_read::traces::SearchOutput, pulsus_read::logql::ReadError>) -> String {
+    match out {
+        Ok(o) => format!(
+            "Ok({} traces, {} spans)",
+            o.traces.len(),
+            o.traces.iter().map(|t| t.spans.len()).sum::<usize>()
+        ),
+        Err(e) => format!("Err({e:?})"),
+    }
+}
+
+/// Section 6.8: on the covered path the search keeps its documented
+/// bounds — the result ceiling refuses an answer past 64 MiB with the
+/// read/result byte `422`, and an answer that fits is whole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_routed_keeps_the_search_bounds() {
+    skip_unless_live!();
+    let (db, _client, w) =
+        seed_corpus_s(pulsus_testkit::test_db("pulsus_read_it_t591p3_bounds")).await;
+    let engine = engine_of(&db).await;
+    let window = (w.first_included_ns(), w.last_included_ns() + 1);
+    let ceiling = "Err(QueryTooBroad(ScanBudgetBytes { budget_bytes: 67108864, estimate: None }))";
+    let cases: [(&str, u32, u32, &str); 5] = [
+        ("{}", 20, 3, "Ok(20 traces, 60 spans)"),
+        ("{}", 1000, 28, "Ok(1000 traces, 28000 spans)"),
+        ("{}", 70000, 28, ceiling),
+        ("{}", u32::MAX, u32::MAX, ceiling),
+        (
+            "{ status = error }",
+            u32::MAX,
+            u32::MAX,
+            "Ok(70000 traces, 70000 spans)",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (query, limit, spss, want) in cases {
+        let plan = plan_of(&engine, &parse_query(query), window, limit, spss);
+        let started = std::time::Instant::now();
+        let got = shape(&engine.search_routed(&plan).await);
+        eprintln!("{query} ({limit}, {spss}): {got}, {:?}", started.elapsed());
+        if !covered(&plan) {
+            wrong.push(format!("{query} ({limit}, {spss}): not covered"));
+        }
+        if got != want {
+            wrong.push(format!(
+                "{query} ({limit}, {spss})\n  want: {want}\n  got:  {got}"
+            ));
+        }
+    }
+    drop_db(&db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
+}
+
+/// Section 6.9: a run-time demand the statement raises sends the request
+/// to today's engine, whose own answer stands — and the query log shows
+/// the statement was tried first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_routed_answers_a_run_time_demand_on_todays_engine() {
+    skip_unless_live!();
+    const MS: i64 = 1_000_000;
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let window = (base_ns, base_ns + CATALOGUE_WINDOW_NS);
+    let spans: Vec<Span> = [str_value("hello"), bool_value(true), bool_value(false)]
+        .into_iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let i = i as u8;
+            span_of(
+                vec![0x44; 16],
+                vec![0, 0, 0, 0, 0, 0, 0, i + 1],
+                if i == 0 {
+                    Vec::new()
+                } else {
+                    vec![0, 0, 0, 0, 0, 0, 0, 1]
+                },
+                "demand",
+                1,
+                base_ns + i64::from(i) * MS,
+                MS,
+                vec![kv("a", a), kv("b", int_value(1))],
+                0,
+                Vec::new(),
+                Vec::new(),
+            )
+        })
+        .collect();
+    let body = ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: Some(Resource {
+                attributes: vec![kv("service.name", str_value("svc-d"))],
+                dropped_attributes_count: 0,
+                entity_refs: Vec::new(),
+            }),
+            scope_spans: vec![ScopeSpans {
+                scope: Some(scope()),
+                spans,
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    };
+    let (db, client) = seed_both(
+        pulsus_testkit::test_db("pulsus_read_it_t591p3_demand"),
+        &[body],
+        3,
+        "t591p3-demand",
+    )
+    .await;
+    let engine = engine_of(&db).await;
+    let demand = "expression (!.a) expected a boolean";
+    let t0 = now_ns();
+    let mut wrong = Vec::new();
+    for (query, want_covered, want) in [
+        (r#"{ !.a = .b }"#, true, Err(demand)),
+        (r#"{ !.a = 1 }"#, false, Err(demand)),
+        (r#"{ .a }"#, true, Ok(1usize)),
+    ] {
+        let plan = plan_of(&engine, &parse_query(query), window, 20, 3);
+        if covered(&plan) != want_covered {
+            wrong.push(format!(
+                "{query}: covered {}, want {want_covered}",
+                covered(&plan)
+            ));
+        }
+        let routed = engine.search_routed(&plan).await;
+        let today = engine.search(&plan).await;
+        for (side, out) in [("routed", &routed), ("today", &today)] {
+            let ok = match (&want, out) {
+                (Err(m), Err(e)) => e.to_string().contains(m),
+                (Ok(n), Ok(o)) => o.traces.len() == *n,
+                _ => false,
+            };
+            if !ok {
+                wrong.push(format!("{query} {side}: want {want:?}, got {}", shape(out)));
+            }
+        }
+    }
+    client
+        .execute(
+            "SYSTEM FLUSH LOGS",
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("flush the logs");
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug)]
+    struct Logged {
+        at: i64,
+        code: i32,
+        statement: u8,
+        today: u8,
+    }
+    let sql = format!(
+        "SELECT toUnixTimestamp64Micro(event_time_microseconds) AS at, exception_code AS code, \
+         toUInt8(startsWith(query, 'WITH (SELECT (groupArray(trace_id)')) AS statement, \
+         toUInt8(has(tables, '{db}.trace_recent') OR has(tables, '{db}.trace_spans')) AS today \
+         FROM system.query_log WHERE has(databases, '{db}') \
+         AND type IN ('ExceptionBeforeStart', 'ExceptionWhileProcessing', 'QueryFinish') \
+         AND event_time_microseconds >= toDateTime64({}, 6) ORDER BY at",
+        t0 as f64 / 1e9
+    );
+    let mut logged = Vec::new();
+    let mut stream = client
+        .query_stream::<Logged>(&sql, &QuerySettings::new())
+        .await
+        .expect("read the query log");
+    while let Some(row) = stream.next().await {
+        logged.push(row.expect("decode a query log row"));
+    }
+    drop_db(&db).await;
+    let tried = logged
+        .iter()
+        .find(|r| r.code == 395 && r.statement == 1)
+        .map(|r| r.at);
+    match tried {
+        None => wrong.push(format!(
+            "no 395 row for the statement in the query log: {logged:?}"
+        )),
+        Some(at) => {
+            if !logged.iter().any(|r| r.today == 1 && r.at > at) {
+                wrong.push(format!(
+                    "no read of today's tables after the statement's 395: {logged:?}"
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Section 6.10: the decode is charged. 70,000 one-span traces, each span
+/// holding one attribute with a 4,000-byte key: the rows are small, and
+/// the response copies the key into every span it returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_routed_charges_the_response_it_builds() {
+    skip_unless_live!();
+    let (db, _client, w) =
+        seed_long_keys(pulsus_testkit::test_db("pulsus_read_it_t591p3_charged")).await;
+    let engine = engine_of(&db).await;
+    let window = (w.first_included_ns(), w.last_included_ns() + 1);
+    let query = format!(r#"{{ span.{} = "v" }}"#, "k".repeat(4000));
+    let mut wrong = Vec::new();
+    for (limit, spss, want) in [
+        (20, 3, "Ok(20 traces, 20 spans)".to_string()),
+        (
+            u32::MAX,
+            u32::MAX,
+            "Err(QueryTooBroad(ScanBudgetBytes { budget_bytes: 268435456, estimate: None }))"
+                .to_string(),
+        ),
+    ] {
+        let plan = plan_of(&engine, &parse_query(&query), window, limit, spss);
+        let started = std::time::Instant::now();
+        let got = shape(&engine.search_routed(&plan).await);
+        eprintln!("({limit}, {spss}): {got}, {:?}", started.elapsed());
+        if !covered(&plan) {
+            wrong.push(format!("({limit}, {spss}): not covered"));
+        }
+        if got != want {
+            wrong.push(format!("({limit}, {spss})\n  want: {want}\n  got:  {got}"));
+        }
+    }
+    drop_db(&db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
+}
+
+/// Section 6.10's database: 70,000 one-span traces over three hours, each
+/// span holding `{ <4000 × k>: "v" }`, then the per-trace table, as corpus
+/// S builds it.
+async fn seed_long_keys(db: String) -> (String, ChClient, WindowSql) {
+    let client = fresh_db(&db).await;
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000 - CORPUS_S_NS;
+    run_bounded(
+        &client,
+        format!(
+            "INSERT INTO {SPANS_TABLE} (trace_id, span_id, parent_span_id, start_ns, duration_ns, \
+             service, name, kind, end_ns, service_type, attrs) \
+             SELECT sipHash128(t), reinterpretAsFixedString(cityHash64(t, 0)), \
+             toFixedString('', 8), {base_ns} + t * 1000000, 1000000, 'frontend', 'op', 1, \
+             toUInt64({base_ns} + t * 1000000 + 1000000), 'string', \
+             CAST(concat('{{\"', repeat('k', 4000), '\":\"v\"}}') AS JSON) \
+             FROM (SELECT number AS t FROM numbers(70000))"
+        ),
+    )
+    .await;
+    run_bounded(&client, TRACES_FROM_SPANS.to_string()).await;
+    let seeded = count(&client, &format!("SELECT count() AS n FROM {SPANS_TABLE}")).await;
+    assert_eq!(seeded, 70_000, "70,000 spans");
+    let w = WindowSql::start_closed_end_open(base_ns, base_ns + CORPUS_S_NS);
+    (db, client, w)
 }
