@@ -62,9 +62,10 @@
 //! marker as a NaN payload — so this is not a hypothetical.
 //!
 //! **The NaN a group answers is the payload its members carried**, not a
-//! manufactured one: the last NaN member in fold order, which is the
-//! highest fingerprint. `argMaxIf(v, fingerprint, NOT is_hist)`
-//! reproduces that, and it is `argMax` under **both** `min` and `max` —
+//! manufactured one: the last NaN member in fold order, which is member
+//! order, `(metric_name, fingerprint)` (issue #579 part 2).
+//! `argMaxIf(v, <the member's position in fps>, NOT is_hist)` reproduces
+//! that, and it is `argMax` under **both** `min` and `max` —
 //! the rule selects the last member, not the extremum, so there is no
 //! `argMinIf` variant.
 //!
@@ -150,7 +151,7 @@ pub fn grouped_fetch(
                 ", flags",
                 format!(
                     "        if(countIf(NOT is_hist AND NOT isNaN(v)) = 0, \
-                     argMaxIf(v, fingerprint, NOT is_hist),\n           \
+                     argMaxIf(v, transform(fingerprint, fps, arrayEnumerate(fps), toUInt32(0)), NOT is_hist),\n           \
                      {extremum}(v, NOT is_hist AND NOT isNaN(v))) AS agg,\n        \
                      toUInt8(if(countIf(NOT is_hist) > 0, 1, 0) + \
                      if(countIf(is_hist) > 0, 2, 0)) AS flags"
@@ -329,7 +330,7 @@ pub fn range_aggregate_fetch(
          \x20    CAST([{gid_list}], 'Array(UInt32)') AS gids\n\
          SELECT gid, gi, {agg} AS agg\n\
          FROM (\n\
-         \x20 SELECT gid, gi, arrayMap(p -> p.2, arraySort(groupArray((fingerprint, v)))) AS vs\n\
+         \x20 SELECT gid, gi, arrayMap(p -> p.2, arraySort(groupArray((transform(fingerprint, fps, arrayEnumerate(fps), toUInt32(0)), v)))) AS vs\n\
          \x20 FROM (\n\
          \x20   SELECT transform(fingerprint, fps, gids, CAST(0, 'UInt32')) AS gid, fingerprint, gi,{value}\n\
          \x20   FROM (\n\
@@ -424,7 +425,8 @@ fn kahan_inc(inc: &str, s: &str, c: &str) -> (String, String) {
 }
 
 /// `{AGG}` of plan section 3.1, folded over `vs` — the members' values in
-/// ascending fingerprint order, the evaluator's own accumulation order.
+/// member order, their position in `fps`, the evaluator's own
+/// accumulation order.
 fn range_agg_expression(op: RangeAggOp) -> String {
     match op {
         // `KahanSum::add`, read out as `sum + c`.
@@ -541,7 +543,7 @@ mod tests {
              \x20   FROM (\n\
              \x20     SELECT gid, gi,\n\
              \x20       if(countIf(NOT is_hist AND NOT isNaN(v)) = 0, \
-             argMaxIf(v, fingerprint, NOT is_hist),\n\
+             argMaxIf(v, transform(fingerprint, fps, arrayEnumerate(fps), toUInt32(0)), NOT is_hist),\n\
              \x20          maxIf(v, NOT is_hist AND NOT isNaN(v))) AS agg,\n\
              \x20       toUInt8(if(countIf(NOT is_hist) > 0, 1, 0) + \
              if(countIf(is_hist) > 0, 2, 0)) AS flags\n\
@@ -600,7 +602,9 @@ mod tests {
         let max = sql(GroupedOp::Max);
         let min = sql(GroupedOp::Min);
         assert_eq!(max.replace("maxIf(v, NOT", "minIf(v, NOT"), min);
-        assert!(min.contains("argMaxIf(v, fingerprint, NOT is_hist)"));
+        assert!(min.contains(
+            "argMaxIf(v, transform(fingerprint, fps, arrayEnumerate(fps), toUInt32(0)), NOT is_hist)"
+        ));
         assert!(!min.contains("argMinIf"));
     }
 

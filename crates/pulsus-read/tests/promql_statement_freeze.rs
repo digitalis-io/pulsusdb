@@ -52,6 +52,11 @@
 //! of a float fetch and a histogram fetch: 56 statements became 55, and
 //! every other entry is byte-identical.
 //!
+//! Issue #579 part 2 moved the text of the four entries that push: the
+//! run statement's NaN rule and the shape-A statement's sort key fold by
+//! a member's position in `fps` instead of its fingerprint. The statement
+//! count and every other entry are unchanged.
+//!
 //! # Every boundary in this golden is writer-emitted
 //!
 //! The writer emits `-- statement[i]` before each statement, and the live
@@ -134,10 +139,10 @@ const PINNED: &str = include_str!("golden/promql_statements.sha256");
 
 /// The three constants published on issue #548 before the code existed;
 /// the line and byte counts re-taken by issue #623, whose sample statements
-/// carry no metric name, and again by issue #579.
+/// carry no metric name, and again by issue #579 and its part 2.
 const ENTRIES: usize = 30;
 const LINES: usize = 742;
-const BYTES: usize = 40_103;
+const BYTES: usize = 40_253;
 /// The statements the writer's markers declare. Sixty before issue #549;
 /// four entries now send ONE statement where they sent two, and issue #579
 /// made it five.

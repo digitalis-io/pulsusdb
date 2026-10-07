@@ -696,15 +696,62 @@ impl MetricsEngine {
 
             // Issue #85 (M6-08c): a selector without a single concrete
             // metric name resolves through the name-keyed cache into a
-            // capped per-metric fan-out and ONE flat IN-set fetch.
+            // capped per-metric fan-out and ONE flat IN-set fetch — or,
+            // issue #579 part 2, into a pushed node's statements over the
+            // same groups. One resolution on every path.
             let Some(metric_name) = &sel.metric_name else {
-                let (fetch_plan, read) = self.plan_multi_metric_fetch(
-                    sel,
-                    window,
-                    lower_excl,
-                    upper_incl,
-                    explain.as_deref_mut(),
-                )?;
+                let groups = self.resolve_multi(sel, window, explain.as_deref_mut())?;
+                if groups.is_empty() {
+                    fetch_plans.push(SelectorFetchPlan::Empty);
+                    continue;
+                }
+                match owners.get(&selector_id).map(|n| (n.self_pos, &n.kind)) {
+                    Some((self_pos, super::grouped::PushKind::Instant(shape))) => {
+                        let members = super::grouped::members_of_groups(&groups);
+                        match super::grouped::decide(shape, &members, shape.grid) {
+                            Ok(push) => {
+                                self.stage_instant_push(
+                                    selector_id,
+                                    self_pos,
+                                    push,
+                                    (lower_excl, upper_incl),
+                                    explain.as_deref_mut(),
+                                    &mut reads,
+                                    &mut pending,
+                                );
+                                fetch_plans.push(SelectorFetchPlan::Empty);
+                                continue;
+                            }
+                            Err(reason) => instant_push_declined(explain.as_deref_mut(), reason),
+                        }
+                    }
+                    Some((self_pos, super::grouped::PushKind::Range(shape))) => {
+                        let members = super::grouped::members_of_groups(&groups);
+                        match super::grouped::decide_range(shape, &members) {
+                            Ok(push) => {
+                                // F6: today's multi-name fetch, sent only if
+                                // the statement counts a histogram sample.
+                                let (fallback, _) =
+                                    self.multi_fetch_plan(groups, lower_excl, upper_incl, None);
+                                self.stage_range_push(
+                                    selector_id,
+                                    self_pos,
+                                    push,
+                                    fallback,
+                                    explain.as_deref_mut(),
+                                    &mut reads,
+                                    &mut pending,
+                                );
+                                fetch_plans.push(SelectorFetchPlan::Empty);
+                                continue;
+                            }
+                            Err(reason) => range_push_declined(explain.as_deref_mut(), reason),
+                        }
+                    }
+                    None => {}
+                }
+                let (fetch_plan, read) =
+                    self.multi_fetch_plan(groups, lower_excl, upper_incl, explain.as_deref_mut());
                 if let Some(pred) = read {
                     reads.push(compile::SelectorRead {
                         selector: selector_id,
@@ -798,130 +845,34 @@ impl MetricsEngine {
             }
 
             // Issues #549 and #579: the pushed node, decided on the SAME
-            // resolution the declining path then consumes — `decide`
+            // resolution the declining path then consumes — `members_of`
             // borrows it, so there is no clone and no second resolve.
             match owners.get(&selector_id).map(|n| (n.self_pos, &n.kind)) {
                 Some((self_pos, super::grouped::PushKind::Instant(shape))) => {
-                    match super::grouped::decide(shape, &resolution, shape.grid) {
+                    match super::grouped::members_of(&resolution, metric_name)
+                        .and_then(|members| super::grouped::decide(shape, &members, shape.grid))
+                    {
                         Ok(push) => {
-                            let sqls = build_grouped_sqls(
-                                &self.config,
-                                &push,
-                                lower_excl,
-                                upper_incl,
-                                self.grouped_chunk_size,
-                            );
-                            if explain.is_some()
-                                && let Some(first_chunk) = sample_sql::chunk_fingerprints(
-                                    &sql_literals(&push.fingerprints),
-                                    self.grouped_chunk_size,
-                                )
-                                .first()
-                            {
-                                // The same rule the sample fetch follows: a
-                                // read is recorded only where a statement is
-                                // sent, and it carries the FIRST chunk's
-                                // fingerprint list.
-                                reads.push(compile::SelectorRead {
-                                    selector: selector_id,
-                                    pred: compile::grouped_selector_pred(
-                                        &sample_sql::window_predicate(lower_excl, upper_incl),
-                                        &sample_sql::fingerprints_predicate(first_chunk),
-                                    ),
-                                    shape: compile::PqlShape::GroupedRuns,
-                                });
-                            }
-                            if let Some(e) = explain.as_mut()
-                                && let Some(first) = sqls.first()
-                            {
-                                let note = (sqls.len() > 1).then(|| {
-                                    format!(
-                                        "(+{} more chunks like this one, {} fingerprints total)",
-                                        sqls.len() - 1,
-                                        push.fingerprints.len()
-                                    )
-                                });
-                                e.push("grouped_fetch", first.clone(), note);
-                            }
-                            pending.push(PendingPush::Instant {
+                            self.stage_instant_push(
+                                selector_id,
                                 self_pos,
                                 push,
-                                sqls,
-                            });
-                            // The pushed node does not go through
-                            // `execute_fetch_plan`; the vector stays aligned
-                            // with `plan.selectors`.
+                                (lower_excl, upper_incl),
+                                explain.as_deref_mut(),
+                                &mut reads,
+                                &mut pending,
+                            );
                             fetch_plans.push(SelectorFetchPlan::Empty);
                             continue;
                         }
-                        Err(reason) => {
-                            if let Some(e) = explain.as_mut() {
-                                e.push(
-                                    "grouped_push",
-                                    format!("declined: {reason:?}"),
-                                    Some(
-                                        "issue #549: this selector takes the sample fetch below"
-                                            .to_string(),
-                                    ),
-                                );
-                            }
-                        }
+                        Err(reason) => instant_push_declined(explain.as_deref_mut(), reason),
                     }
                 }
                 Some((self_pos, super::grouped::PushKind::Range(shape))) => {
-                    match super::grouped::decide_range(shape, &resolution) {
+                    match super::grouped::members_of(&resolution, metric_name)
+                        .and_then(|members| super::grouped::decide_range(shape, &members))
+                    {
                         Ok(push) => {
-                            let fps = sql_literals(&push.fingerprints);
-                            let sqls: Vec<(u32, String)> = if fps.is_empty() {
-                                Vec::new()
-                            } else {
-                                super::grouped::time_chunks(
-                                    push.grid,
-                                    fps.len(),
-                                    self.pushed_series_steps_cap,
-                                )
-                                .into_iter()
-                                .map(|(g0, grid)| {
-                                    (
-                                        g0,
-                                        super::grouped_sql::range_aggregate_fetch(
-                                            &self.config.samples_table,
-                                            &self.config.hist_samples_table,
-                                            &fps,
-                                            &push.gids,
-                                            grid,
-                                            push.range_ms,
-                                            push.op,
-                                            push.func,
-                                        ),
-                                    )
-                                })
-                                .collect()
-                            };
-                            if explain.is_some() && !fps.is_empty() {
-                                let (lo, hi) =
-                                    super::grouped_sql::range_window(push.grid, push.range_ms);
-                                reads.push(compile::SelectorRead {
-                                    selector: selector_id,
-                                    pred: compile::selector_pred(
-                                        None,
-                                        &sample_sql::window_predicate(lo, hi),
-                                        &sample_sql::fingerprints_predicate(&fps),
-                                    ),
-                                    shape: compile::PqlShape::Samples,
-                                });
-                            }
-                            if let Some(e) = explain.as_mut()
-                                && let Some((_, first)) = sqls.first()
-                            {
-                                let note = (sqls.len() > 1).then(|| {
-                                    format!(
-                                        "(+{} more statements like this one, split by time)",
-                                        sqls.len() - 1
-                                    )
-                                });
-                                e.push("pushed_aggregate", first.clone(), note);
-                            }
                             // F6: today's fetch, built now and sent only if
                             // the statement counts a histogram sample.
                             let fallback = self.concrete_fetch_plan(
@@ -933,28 +884,19 @@ impl MetricsEngine {
                                 None,
                                 None,
                             );
-                            pending.push(PendingPush::Range {
+                            self.stage_range_push(
+                                selector_id,
                                 self_pos,
-                                selector: selector_id,
                                 push,
-                                sqls,
                                 fallback,
-                            });
+                                explain.as_deref_mut(),
+                                &mut reads,
+                                &mut pending,
+                            );
                             fetch_plans.push(SelectorFetchPlan::Empty);
                             continue;
                         }
-                        Err(reason) => {
-                            if let Some(e) = explain.as_mut() {
-                                e.push(
-                                    "pushed_aggregate",
-                                    format!("declined: {reason:?}"),
-                                    Some(
-                                        "issue #579: this selector takes the sample fetch below"
-                                            .to_string(),
-                                    ),
-                                );
-                            }
-                        }
+                        Err(reason) => range_push_declined(explain.as_deref_mut(), reason),
                     }
                 }
                 None => {}
@@ -1036,16 +978,24 @@ impl MetricsEngine {
                                     .to_string(),
                             ),
                         );
-                        if let SelectorFetchPlan::Chunks {
-                            sqls, hist_sqls, ..
-                        } = &fallback
-                        {
-                            if let Some(first) = sqls.first() {
-                                e.push("sample_fetch", first.clone(), None);
+                        match &fallback {
+                            SelectorFetchPlan::Chunks {
+                                sqls, hist_sqls, ..
+                            } => {
+                                if let Some(first) = sqls.first() {
+                                    e.push("sample_fetch", first.clone(), None);
+                                }
+                                if let Some(first) = hist_sqls.first() {
+                                    e.push("hist_sample_fetch", first.clone(), None);
+                                }
                             }
-                            if let Some(first) = hist_sqls.first() {
-                                e.push("hist_sample_fetch", first.clone(), None);
+                            // Issue #579 part 2: a multi-name node's
+                            // fallback is the fan-out's one fetch.
+                            SelectorFetchPlan::Multi { sql, hist_sql, .. } => {
+                                e.push("sample_fetch", sql.clone(), None);
+                                e.push("hist_sample_fetch", hist_sql.clone(), None);
                             }
+                            _ => {}
                         }
                     }
                     fallbacks.push((selector, fallback));
@@ -1255,21 +1205,145 @@ impl MetricsEngine {
         }
     }
 
-    /// Issue #85 (M6-08c): builds a name-less/regex-`__name__` selector's
-    /// fetch plan — resolve `(metric_name → fingerprints)` groups from
-    /// the name-keyed cache (capped by `max_metric_fanout`), then render
-    /// ONE flat `PREWHERE metric_name IN (…) … fingerprint IN (…)` fetch
-    /// (each PK component prunes; see `sample_sql::sample_fetch_multi`'s
-    /// soundness note and the `explain_indexes.rs` gate). A degraded
-    /// cache is a named error, never an unbounded scan.
-    fn plan_multi_metric_fetch(
+    /// Issues #549 and #579: a shape-B node whose decision confirmed it —
+    /// its run statements, its read and its explain entry, and the pending
+    /// push.
+    #[allow(clippy::too_many_arguments)]
+    fn stage_instant_push(
+        &self,
+        selector_id: SelectorId,
+        self_pos: usize,
+        push: super::grouped::GroupedPush,
+        (lower_excl, upper_incl): (i64, i64),
+        explain: Option<&mut PlanExplain>,
+        reads: &mut compile::SelectorReads,
+        pending: &mut Vec<PendingPush>,
+    ) {
+        let sqls = build_grouped_sqls(
+            &self.config,
+            &push,
+            lower_excl,
+            upper_incl,
+            self.grouped_chunk_size,
+        );
+        if let Some(e) = explain {
+            // The same rule the sample fetch follows: a read is recorded
+            // only where a statement is sent, and it carries the FIRST
+            // chunk's fingerprint list.
+            if let Some(first_chunk) = sample_sql::chunk_fingerprints(
+                &sql_literals(&push.fingerprints),
+                self.grouped_chunk_size,
+            )
+            .first()
+            {
+                reads.push(compile::SelectorRead {
+                    selector: selector_id,
+                    pred: compile::grouped_selector_pred(
+                        &sample_sql::window_predicate(lower_excl, upper_incl),
+                        &sample_sql::fingerprints_predicate(first_chunk),
+                    ),
+                    shape: compile::PqlShape::GroupedRuns,
+                });
+            }
+            if let Some(first) = sqls.first() {
+                let note = (sqls.len() > 1).then(|| {
+                    format!(
+                        "(+{} more chunks like this one, {} fingerprints total)",
+                        sqls.len() - 1,
+                        push.fingerprints.len()
+                    )
+                });
+                e.push("grouped_fetch", first.clone(), note);
+            }
+        }
+        pending.push(PendingPush::Instant {
+            self_pos,
+            push,
+            sqls,
+        });
+    }
+
+    /// Issue #579: a shape-A node whose decision confirmed it — its
+    /// statements split by time, its read and its explain entry, and the
+    /// pending push with today's fetch as its F6 fallback.
+    #[allow(clippy::too_many_arguments)]
+    fn stage_range_push(
+        &self,
+        selector_id: SelectorId,
+        self_pos: usize,
+        push: super::grouped::RangePush,
+        fallback: SelectorFetchPlan,
+        explain: Option<&mut PlanExplain>,
+        reads: &mut compile::SelectorReads,
+        pending: &mut Vec<PendingPush>,
+    ) {
+        let fps = sql_literals(&push.fingerprints);
+        let sqls: Vec<(u32, String)> = if fps.is_empty() {
+            Vec::new()
+        } else {
+            super::grouped::time_chunks(push.grid, fps.len(), self.pushed_series_steps_cap)
+                .into_iter()
+                .map(|(g0, grid)| {
+                    (
+                        g0,
+                        super::grouped_sql::range_aggregate_fetch(
+                            &self.config.samples_table,
+                            &self.config.hist_samples_table,
+                            &fps,
+                            &push.gids,
+                            grid,
+                            push.range_ms,
+                            push.op,
+                            push.func,
+                        ),
+                    )
+                })
+                .collect()
+        };
+        if let Some(e) = explain {
+            if !fps.is_empty() {
+                let (lo, hi) = super::grouped_sql::range_window(push.grid, push.range_ms);
+                reads.push(compile::SelectorRead {
+                    selector: selector_id,
+                    pred: compile::selector_pred(
+                        None,
+                        &sample_sql::window_predicate(lo, hi),
+                        &sample_sql::fingerprints_predicate(&fps),
+                    ),
+                    shape: compile::PqlShape::Samples,
+                });
+            }
+            if let Some((_, first)) = sqls.first() {
+                let note = (sqls.len() > 1).then(|| {
+                    format!(
+                        "(+{} more statements like this one, split by time)",
+                        sqls.len() - 1
+                    )
+                });
+                e.push("pushed_aggregate", first.clone(), note);
+            }
+        }
+        pending.push(PendingPush::Range {
+            self_pos,
+            selector: selector_id,
+            push,
+            sqls,
+            fallback,
+        });
+    }
+
+    /// Issue #85 (M6-08c): resolves a name-less/regex-`__name__`
+    /// selector's `(metric_name → fingerprints)` groups from the name-keyed
+    /// cache (capped by `max_metric_fanout`), once, for the fetch
+    /// ([`Self::multi_fetch_plan`]) or a pushed node (issue #579 part 2) to
+    /// consume. A degraded cache is a named error, never an unbounded
+    /// scan.
+    fn resolve_multi(
         &self,
         sel: &SelectorSpec,
         window: DataWindow,
-        lower_excl: i64,
-        upper_incl: i64,
         mut explain: Option<&mut PlanExplain>,
-    ) -> Result<(SelectorFetchPlan, Option<Pred>), ReadError> {
+    ) -> Result<Vec<MetricSeriesGroup>, ReadError> {
         let resolution = self.resolver.resolve_multi_metric(
             &sel.name_matchers,
             &sel.matchers,
@@ -1353,10 +1427,21 @@ impl MetricsEngine {
                 None,
             );
         }
-        if groups.is_empty() {
-            return Ok((SelectorFetchPlan::Empty, None));
-        }
+        Ok(groups)
+    }
 
+    /// Issue #85 (M6-08c): the fan-out's ONE flat `fingerprint IN (…)`
+    /// fetch over every resolved series ID, and its histogram twin, from
+    /// [`Self::resolve_multi`]'s non-empty groups. Records the explain
+    /// stages and returns the read only when `explain` is given — issue
+    /// #579 part 2 builds a pushed shape-A node's F6 fallback without it.
+    fn multi_fetch_plan(
+        &self,
+        groups: Vec<MetricSeriesGroup>,
+        lower_excl: i64,
+        upper_incl: i64,
+        mut explain: Option<&mut PlanExplain>,
+    ) -> (SelectorFetchPlan, Option<Pred>) {
         // Group order is sorted-by-name (the resolver's contract) and
         // fingerprints are sorted within each group, so the rendered IN
         // lists — and therefore the explain trace — are deterministic.
@@ -1401,14 +1486,14 @@ impl MetricsEngine {
                 &sample_sql::fingerprints_predicate(&sql_literals(&fps)),
             )
         });
-        Ok((
+        (
             SelectorFetchPlan::Multi {
                 sql,
                 hist_sql,
                 labels_by,
             },
             read,
-        ))
+        )
     }
 
     /// Executes one selector's already-built [`SelectorFetchPlan`]: the
@@ -1606,10 +1691,9 @@ impl MetricsEngine {
     ///
     /// **The per-chunk shape is load-bearing twice.** The charge is
     /// per-statement partial runs, and the fold's replacement rule walks
-    /// chunks in order — which is fingerprint order, because
-    /// `build_grouped_sqls` chunks the ascending fingerprint list — so an
-    /// all-NaN group answers the payload its highest-fingerprint member
-    /// carried.
+    /// chunks in order — which is member order, because
+    /// `build_grouped_sqls` chunks the member list — so an all-NaN group
+    /// answers the payload its last member carried.
     ///
     /// `join_all` returns results in INPUT order regardless of which
     /// statement finishes first, so a slow first chunk cannot reorder the
@@ -1890,11 +1974,11 @@ impl MetricsEngine {
     /// #96) — a bounded `SELECT DISTINCT metric_name` probe over
     /// `metric_series` whose sorted names feed the SAME flat fetch shape
     /// with label matchers in SQL. The cap-breach error mapping stays
-    /// identical to [`Self::plan_multi_metric_fetch`] (the query path keeps
+    /// identical to [`Self::resolve_multi`] (the query path keeps
     /// its degraded `422`; only discovery falls back). A
     /// [`MultiMetricResolution::ScanBudgetExceeded`] breach (retroactive
     /// re-review) is a THIRD, distinct outcome: it maps to the same named
-    /// `422` [`Self::plan_multi_metric_fetch`] uses, never the `Probe`
+    /// `422` [`Self::resolve_multi`] uses, never the `Probe`
     /// fallback — the walk only reaches this bound on a warm, authoritative
     /// cache (the fallback exists for a degraded one, not a too-broad
     /// query against a healthy one).
@@ -2357,6 +2441,28 @@ struct ProbeSpec {
     matchers: Vec<super::matcher::LabelMatcher>,
 }
 
+/// Issue #549: the explain entry of a shape-B node `decide` declined.
+fn instant_push_declined(explain: Option<&mut PlanExplain>, reason: super::grouped::DeclineReason) {
+    if let Some(e) = explain {
+        e.push(
+            "grouped_push",
+            format!("declined: {reason:?}"),
+            Some("issue #549: this selector takes the sample fetch below".to_string()),
+        );
+    }
+}
+
+/// Issue #579: the explain entry of a shape-A node `decide_range` declined.
+fn range_push_declined(explain: Option<&mut PlanExplain>, reason: super::grouped::DeclineReason) {
+    if let Some(e) = explain {
+        e.push(
+            "pushed_aggregate",
+            format!("declined: {reason:?}"),
+            Some("issue #579: this selector takes the sample fetch below".to_string()),
+        );
+    }
+}
+
 /// Issues #549 and #579: a pushed node whose resolution confirmed it, with
 /// the statements it renders.
 enum PendingPush {
@@ -2622,9 +2728,11 @@ fn build_chunk_sqls(
 /// SAME chunker the sample fetch uses — so a chunk boundary falls in the
 /// same place on both routes.
 ///
-/// The fingerprint list is already ascending (`decide` sorted it), and
+/// The fingerprint list is in member order (`decide` sorted it), and
 /// `gids` is parallel to it, so each chunk's gid slice is the same
-/// window of the gid vector.
+/// window of the gid vector. For a concrete name member order is
+/// ascending fingerprint, so a chunk boundary falls where the sample
+/// fetch's does; over several names it is `(metric_name, fingerprint)`.
 fn build_grouped_sqls(
     config: &MetricsConfig,
     push: &super::grouped::GroupedPush,
