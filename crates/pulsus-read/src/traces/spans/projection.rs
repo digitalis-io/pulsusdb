@@ -37,9 +37,13 @@ use super::predicate::{
     element_select_in, resource_value_in,
 };
 use super::rows::SearchProjected;
+use crate::logql::error::ReadError;
 use crate::logql::escape;
 use crate::traces::PlanError;
+use crate::traces::exec::ByteBudget;
 use crate::traces::search_eval::{GroupValue, ProjectedAttribute};
+use crate::traces::search_plan::WireKey;
+use pulsus_clickhouse::ChError;
 
 /// The most groups one search projects: the group index travels as a
 /// `UInt8`, and `0` is "no value".
@@ -60,6 +64,9 @@ pub struct Projection {
 #[derive(Debug, Clone, PartialEq)]
 struct Group {
     field: Field,
+    /// The wire key's length, `WireKey::new(&field).as_str().len()`: the
+    /// key's charge, known before the key is built (issue #591 part 3).
+    key_len: usize,
     target: Target,
     sources: Vec<Source>,
 }
@@ -244,69 +251,133 @@ impl Projection {
         };
         self.groups.push(Group {
             field: field.clone(),
+            key_len: WireKey::new(field).as_str().len(),
             target,
             sources: vec![source],
         });
         Ok(())
     }
 
-    /// One span's projected values, decoded: its `name` when a `name`
-    /// group projected one, and its attributes in group order. A value that
-    /// does not parse as its kind is an error, never a default.
-    pub(crate) fn decode(
+    /// The attribute buffer's capacity: one slot per attribute group. A
+    /// span holds at most one value per group, so the buffer never grows.
+    pub(crate) fn attribute_capacity(&self) -> usize {
+        self.groups
+            .iter()
+            .filter(|g| g.target == Target::Attribute)
+            .count()
+    }
+
+    /// One span's projected values, decoded into `attributes`, returning
+    /// its `name` when a `name` group projected one. Each value is charged
+    /// before it is built, by today's engine's rule (`build_summary`): a
+    /// name its length; an attribute its key's length plus its string
+    /// payload, a number or boolean its key alone; an array its key plus
+    /// the length of its cut render, learned before the render is built.
+    /// A value that does not parse as its kind is a decode error, never a
+    /// default.
+    pub(crate) fn decode_charged(
         &self,
         projected: &[SearchProjected],
-    ) -> Result<(Option<String>, Vec<ProjectedAttribute>), String> {
+        attributes: &mut Vec<ProjectedAttribute>,
+        budget: &mut ByteBudget,
+    ) -> Result<Option<String>, ReadError> {
+        let decode = |m: String| ReadError::Clickhouse(ChError::Decode(m));
         let mut name = None;
-        let mut attributes = Vec::new();
         for p in projected {
             let group = usize::from(p.group)
                 .checked_sub(1)
                 .and_then(|i| self.groups.get(i))
-                .ok_or_else(|| format!("projected group {} is not in the projection", p.group))?;
-            match group.target {
-                Target::Name => name = Some(p.value.clone()),
-                Target::Attribute => {
-                    let value = typed_value(&p.value, &p.kind)?;
-                    attributes.push(ProjectedAttribute::new(&group.field, value));
-                }
+                .ok_or_else(|| {
+                    decode(format!(
+                        "projected group {} is not in the projection",
+                        p.group
+                    ))
+                })?;
+            if group.target == Target::Name {
+                budget.charge(p.value.len())?;
+                name = Some(p.value.clone());
+                continue;
             }
+            let value = match p.kind.as_str() {
+                "Int64" => GroupValue::Int(
+                    p.value
+                        .parse::<i64>()
+                        .map_err(|e| decode(format!("projected Int64 {:?}: {e}", p.value)))?,
+                ),
+                "Float64" => GroupValue::Double(
+                    p.value
+                        .parse::<f64>()
+                        .map_err(|e| decode(format!("projected Float64 {:?}: {e}", p.value)))?
+                        .to_bits(),
+                ),
+                "Bool" => GroupValue::Bool(p.value == "true"),
+                k if k.starts_with("Array(") => {
+                    let values = array_values(&p.value).map_err(decode)?;
+                    budget.charge(group.key_len + rendered_len(&values))?;
+                    let render =
+                        serde_json::to_string(&values).map_err(|e| decode(e.to_string()))?;
+                    attributes.push(ProjectedAttribute::new(
+                        &group.field,
+                        GroupValue::Str(ceiling(render)),
+                    ));
+                    continue;
+                }
+                _ => {
+                    budget.charge(group.key_len + p.value.len())?;
+                    attributes.push(ProjectedAttribute::new(
+                        &group.field,
+                        GroupValue::Str(p.value.clone()),
+                    ));
+                    continue;
+                }
+            };
+            budget.charge(group.key_len + value.payload_bytes())?;
+            attributes.push(ProjectedAttribute::new(&group.field, value));
         }
-        Ok((name, attributes))
+        Ok(name)
     }
 }
 
-/// A projected attribute's value, by the kind the statement sent with it.
-fn typed_value(value: &str, kind: &str) -> Result<GroupValue, String> {
-    Ok(match kind {
-        "String" => GroupValue::Str(value.to_string()),
-        "Int64" => GroupValue::Int(
-            value
-                .parse::<i64>()
-                .map_err(|e| format!("projected Int64 {value:?}: {e}"))?,
-        ),
-        "Float64" => GroupValue::Double(
-            value
-                .parse::<f64>()
-                .map_err(|e| format!("projected Float64 {value:?}: {e}"))?
-                .to_bits(),
-        ),
-        "Bool" => GroupValue::Bool(value == "true"),
-        k if k.starts_with("Array(") => GroupValue::Str(ceiling(array_json(value)?)),
-        _ => GroupValue::Str(value.to_string()),
-    })
-}
-
-/// An array's JSON as the writer stores it, from the statement's
-/// `[[type, text], …]`: each element rendered by its own type.
-fn array_json(value: &str) -> Result<String, String> {
-    serde_json::to_string(&array_values(value)?).map_err(|e| e.to_string())
-}
-
 /// The length of `ceiling(serde_json::to_string(values))`, learned
-/// without building it (issue #591 part 3). TESTS-FIRST STUB.
-fn rendered_len(_values: &[serde_json::Value]) -> usize {
-    0
+/// without building it (issue #591 part 3): the render is serialized into
+/// a counter of its bytes, and of the bytes of its first
+/// `CUT_CODE_POINTS` code points, which is the cut's length.
+fn rendered_len(values: &[serde_json::Value]) -> usize {
+    struct Counter {
+        bytes: usize,
+        code_points: usize,
+        cut_bytes: usize,
+    }
+    impl std::io::Write for Counter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            for &b in buf {
+                // A code point starts at every byte that is not a UTF-8
+                // continuation byte.
+                if b & 0xC0 != 0x80 {
+                    self.code_points += 1;
+                }
+                if self.code_points <= CUT_CODE_POINTS {
+                    self.cut_bytes += 1;
+                }
+            }
+            self.bytes += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter {
+        bytes: 0,
+        code_points: 0,
+        cut_bytes: 0,
+    };
+    serde_json::to_writer(&mut counter, values).expect("a JSON value always serializes");
+    if counter.bytes <= CEILING_BYTES {
+        counter.bytes
+    } else {
+        counter.cut_bytes
+    }
 }
 
 /// An array's elements, each by its own type, from the statement's

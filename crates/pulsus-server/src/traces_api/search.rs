@@ -96,13 +96,15 @@ async fn search_impl(
     let plan = pulsus_read::plan_search(&query, &search_params, &ctx).map_err(ApiError::Plan)?;
 
     let engine = engine_for(&state).await?;
+    // Issue #591 part 3: the route fork. A search the search statement
+    // covers is answered by it; everything else by today's engine.
     if !wants_explain(headers) {
-        let output = engine.search(&plan).await?;
+        let output = engine.search_routed(&plan).await?;
         return Ok((StatusCode::OK, Json(search_response::render(&output))).into_response());
     }
     // One execution that also captures the per-stage SQL — the same
     // single-pass contract the logs route has, never a second run.
-    let (output, explain) = engine.search_explained(&plan).await?;
+    let (output, explain) = engine.search_routed_explained(&plan).await?;
     let mut body = search_response::render(&output);
     if let Some(obj) = body.as_object_mut() {
         obj.insert(
