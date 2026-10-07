@@ -413,6 +413,7 @@ pub fn engine_config(db: &str, grouped_push: bool) -> MetricsConfig {
         experimental_functions: false,
         max_metric_fanout: 1_000,
         max_cache_scan: 200_000,
+        cache_max_series: 50_000,
         max_info_series: 100_000,
         max_samples: 50_000_000,
         distributed: false,

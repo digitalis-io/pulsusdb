@@ -130,6 +130,12 @@ pub struct MetricsConfig {
     /// the query and discovery paths — the discovery path never routes
     /// this to the degraded-cache probe fallback.
     pub max_cache_scan: u64,
+    /// Issue #635 part 3: `reader.cache_max_series` — the most series one
+    /// selector with no metric name and no `__name__` matcher may resolve
+    /// to in SQL. Statement R reads `cache_max_series + 1` rows at most;
+    /// more than `cache_max_series` answers `NamelessSelectorUnresolvable`
+    /// naming `OverCardinality`, the label cache's own error for the case.
+    pub cache_max_series: u64,
     /// Issue #82 (retroactive re-review): `ReaderConfig::
     /// promql_max_info_series` — the pathological-cardinality backstop
     /// on a PromQL `info()` node's synthetic `*_info` metadata-family
@@ -2643,6 +2649,16 @@ fn invalid_name_matcher_error(name_matchers: &[super::matcher::LabelMatcher]) ->
         .map(|detail| ReadError::Promql(PromqlError::InvalidRegexMatcher { detail }))
 }
 
+/// Issue #635 part 3: whether a selector resolves in SQL through the label
+/// index rather than in the label cache — no concrete metric name and no
+/// `__name__` matcher. A `__name__` matcher is resolved against the
+/// cache's names.
+#[cfg_attr(not(test), allow(dead_code))]
+fn resolves_through_the_label_index(sel: &SelectorSpec) -> bool {
+    let _ = sel;
+    false
+}
+
 /// The concrete metric name a [`SelectorFetchPlan::Chunks`]/`Fallback`
 /// plan was built for. Those variants are only ever built on the
 /// `Some(metric_name)` branch of `query_inner`, so the `None` arm is a
@@ -3610,6 +3626,37 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect::<Vec<_>>(),
         )
+    }
+
+    /// Issue #635 part 3, U1: a selector with no metric name and no
+    /// `__name__` matcher resolves through the label index; one with a
+    /// `__name__` matcher, or with a concrete name, does not.
+    #[test]
+    fn a_selector_with_no_name_and_no_name_matcher_resolves_through_the_index() {
+        let selector = |q: &str| {
+            let expr = pulsus_promql::parser::parse(q).expect("parse");
+            let params = MetricQueryParams {
+                start_ms: 0,
+                end_ms: 0,
+                step_ms: 0,
+            }
+            .plan_params(false);
+            pulsus_promql::plan(&expr, params)
+                .expect("plan")
+                .selectors
+                .remove(0)
+        };
+        for q in [r#"{job="api", status=~"5.."}"#, r#"{status=~"5.."}"#] {
+            assert!(resolves_through_the_label_index(&selector(q)), "{q}");
+        }
+        for q in [
+            r#"{__name__=~"m_1.*", job="api"}"#,
+            r#"{__name__!="up", job="api"}"#,
+            r#"up{job="api"}"#,
+            r#"{__name__="up", job="api"}"#,
+        ] {
+            assert!(!resolves_through_the_label_index(&selector(q)), "{q}");
+        }
     }
 
     // --- probe_fanout_bound: issue #96 (retroactive re-review) ---

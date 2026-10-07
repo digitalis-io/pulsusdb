@@ -377,6 +377,7 @@ pub(crate) fn metrics_config_from(config: &Config) -> MetricsConfig {
         // cache-enumeration scan-budget's production carrier —
         // `ReaderConfig -> MetricsConfig -> resolve_multi_metric`.
         max_cache_scan: config.reader.promql_max_cache_scan,
+        cache_max_series: config.reader.cache_max_series,
         // Issue #82 (retroactive re-review): the info() metadata-family
         // cardinality cap's production carrier — `ReaderConfig ->
         // MetricsConfig -> MetricsEngine::query_inner`'s info_family cap.

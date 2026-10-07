@@ -263,6 +263,34 @@ pub(super) fn discovery_label_values_query(
     discovery_read(filter, window).label_values(key, t)
 }
 
+/// Issue #635 part 3, statement R: the names and label sets of the series a
+/// selector with no metric name and no `__name__` matcher selects in
+/// `window`, through the label index when `t` names it, in `(metric_name,
+/// fingerprint)` order and capped at `cap + 1` rows, so a caller can tell
+/// a result past `cap` from one at it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn nameless_resolution_query(
+    t: SeriesTables<'_>,
+    matchers: &[LabelMatcher],
+    window: DataWindow,
+    cap: u64,
+) -> String {
+    let _ = (t, matchers, window, cap);
+    String::new()
+}
+
+/// Issue #635 part 3, statement 1: the IDs [`nameless_resolution_query`]
+/// selects, as the sub-query the sample statements nest.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn nameless_ids_query(
+    t: SeriesTables<'_>,
+    matchers: &[LabelMatcher],
+    window: DataWindow,
+) -> String {
+    let _ = (t, matchers, window);
+    String::new()
+}
+
 /// The one series read [`discovery_query`] and
 /// [`discovery_distinct_names_query`] share: the same window and the same
 /// lookup predicates, so the two cannot disagree about which series
@@ -1534,5 +1562,68 @@ mod tests {
         ] {
             assert!(!sql.contains("JOIN"), "{sql}");
         }
+    }
+
+    /// Issue #635 part 3, U2: the design's statement R and statement 1 for
+    /// `{job="api", status=~"5.."}` over a 15-minute range at 60 s ending
+    /// at 1791409260000, lookback 5 minutes.
+    #[test]
+    fn the_nameless_builders_render_statement_r_and_statement_1() {
+        let t = SeriesTables {
+            series: "metric_series",
+            labels: "metric_labels",
+            label_index: Some("metric_label_index"),
+            label_values: Some("metric_label_values"),
+        };
+        let matchers = [
+            eq("job", "api"),
+            LabelMatcher {
+                key: "status".to_string(),
+                op: MatchOp::Re,
+                value: "5..".to_string(),
+            },
+        ];
+        let window = DataWindow {
+            start_ms: 1_791_408_060_000,
+            end_ms: 1_791_409_260_000,
+        };
+        assert_eq!(
+            nameless_resolution_query(t, &matchers, window, 50_000),
+            "SELECT fingerprint, any(name) AS metric_name, any(label_text) AS labels
+FROM (
+  SELECT fingerprint, metric_name AS name, labels AS label_text
+  FROM metric_labels
+  WHERE fingerprint IN (
+      SELECT fingerprint
+      FROM metric_series
+      WHERE day BETWEEN '2026-10-07' AND '2026-10-07'
+        AND 0 * match('', '(?-s)^(?:5..)$') = 0
+        AND bitAnd(hours, multiIf(day = '2026-10-07' AND day = '2026-10-07', 2097152, day = '2026-10-07', 14680064, day = '2026-10-07', 4194303, 16777215)) != 0
+        AND fingerprint IN (
+          SELECT fingerprint FROM metric_label_index WHERE key = 'job' AND value = 'api'
+          INTERSECT
+          SELECT fingerprint FROM metric_label_index WHERE key = 'status' AND value IN (SELECT value FROM metric_label_values WHERE key = 'status' AND match(value, '(?-s)^(?:5..)$'))
+        )
+    )
+)
+GROUP BY fingerprint
+ORDER BY metric_name, fingerprint
+LIMIT 50001",
+            "statement R"
+        );
+        assert_eq!(
+            nameless_ids_query(t, &matchers, window),
+            "SELECT fingerprint
+FROM metric_series
+WHERE day BETWEEN '2026-10-07' AND '2026-10-07'
+  AND 0 * match('', '(?-s)^(?:5..)$') = 0
+  AND bitAnd(hours, multiIf(day = '2026-10-07' AND day = '2026-10-07', 2097152, day = '2026-10-07', 14680064, day = '2026-10-07', 4194303, 16777215)) != 0
+  AND fingerprint IN (
+    SELECT fingerprint FROM metric_label_index WHERE key = 'job' AND value = 'api'
+    INTERSECT
+    SELECT fingerprint FROM metric_label_index WHERE key = 'status' AND value IN (SELECT value FROM metric_label_values WHERE key = 'status' AND match(value, '(?-s)^(?:5..)$'))
+  )",
+            "statement 1"
+        );
     }
 }
