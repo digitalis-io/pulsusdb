@@ -4827,10 +4827,34 @@ fn a_tree_reads_the_window_once() {
 /// wrapping the `UInt8` group index.
 #[test]
 fn the_projection_is_bounded() {
-    let conditions: Vec<String> = (1..=256).map(|i| format!("span.a{i} = {i}")).collect();
-    let query = format!("{{ {} }}", conditions.join(" && "));
-    match compile_search_of(&query) {
-        Err(PlanError::UnsupportedField(_)) => {}
+    // Built as a tree, not parsed: the parser's 64-level nesting limit
+    // refuses a filter of 256 conditions before it reaches the compiler.
+    let mut body: Option<FieldExpr> = None;
+    for i in 1..=256 {
+        let cond = FieldExpr::Binary {
+            op: FieldOp::Cmp(ComparisonOp::Eq),
+            lhs: Box::new(FieldExpr::Field(scoped(AttrScope::Span, &format!("a{i}")))),
+            rhs: Box::new(FieldExpr::Literal(Value::Number(i.to_string()))),
+        };
+        body = Some(match body {
+            None => cond,
+            Some(prev) => FieldExpr::Binary {
+                op: FieldOp::Bool(pulsus_traceql::BoolOp::And),
+                lhs: Box::new(prev),
+                rhs: Box::new(cond),
+            },
+        });
+    }
+    let query = pulsus_traceql::Query {
+        spanset: SpansetExpr::Filter(SpansetFilter { body }),
+        pipeline: Vec::new(),
+        hints: Vec::new(),
+    };
+    match compile_search(&query, &ctx(), "spans", "traces", 20, 3) {
+        Err(PlanError::UnsupportedField(msg)) => assert!(
+            msg.contains("255"),
+            "the refusal names the limit of 255 fields, got {msg:?}"
+        ),
         Err(other) => panic!("expected UnsupportedField, got {other:?}"),
         Ok(_) => panic!("256 projection groups must be refused"),
     }

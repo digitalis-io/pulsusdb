@@ -6384,12 +6384,13 @@ fn value_text(v: &pulsus_read::traces::GroupValue) -> String {
 /// An answer written as section 8.4 writes it: `TTTT(m): SSSS…` per trace,
 /// `|` between traces; each span `SSSS`, then `{name="…"}` when a name is
 /// projected, then `[key=Kind value,…]` when attributes are. With `ids_only`
-/// a span is its `SSSS` alone.
+/// a span is its `SSSS` alone and a trace's spans are listed by id, as
+/// section 8.4's table lists them; otherwise in the answer's order.
 fn written(out: &pulsus_read::traces::SearchOutput, ids_only: bool) -> String {
     out.traces
         .iter()
         .map(|t| {
-            let spans: Vec<String> = t
+            let mut spans: Vec<String> = t
                 .spans
                 .iter()
                 .map(|s| {
@@ -6411,6 +6412,9 @@ fn written(out: &pulsus_read::traces::SearchOutput, ids_only: bool) -> String {
                     text
                 })
                 .collect();
+            if ids_only {
+                spans.sort();
+            }
             format!("{}({}): {}", tail4(&t.trace_id), t.matched, spans.join(" "))
         })
         .collect::<Vec<_>>()
