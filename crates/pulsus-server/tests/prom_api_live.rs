@@ -202,8 +202,52 @@ impl InsertSeries for ChClient {
             })
             .collect();
         self.insert_block("metric_series", &activity).await?;
-        self.insert_block("metric_labels", &labels).await
+        self.insert_block("metric_labels", &labels).await?;
+        // Issue #635: the label index and its values, as the two views
+        // write them from the same kind-2 row.
+        let (index, values) = index_rows(rows.iter().map(|r| (r.fingerprint, r.labels.as_str())));
+        self.insert_block("metric_label_index", &index).await?;
+        self.insert_block("metric_label_values", &values).await
     }
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SeedIndexRow {
+    key: String,
+    value: String,
+    fingerprint: u128,
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SeedValueRow {
+    key: String,
+    value: String,
+}
+
+/// One index row per label of each series, and one values row per
+/// distinct key and value.
+fn index_rows<'a>(
+    series: impl Iterator<Item = (u128, &'a str)>,
+) -> (Vec<SeedIndexRow>, Vec<SeedValueRow>) {
+    let mut index = Vec::new();
+    let mut pairs = std::collections::BTreeSet::new();
+    for (fingerprint, labels) in series {
+        let map: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(labels).expect("canonical label JSON");
+        for (key, value) in map {
+            pairs.insert((key.clone(), value.clone()));
+            index.push(SeedIndexRow {
+                key,
+                value,
+                fingerprint,
+            });
+        }
+    }
+    let values = pairs
+        .into_iter()
+        .map(|(key, value)| SeedValueRow { key, value })
+        .collect();
+    (index, values)
 }
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
