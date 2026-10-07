@@ -28,8 +28,8 @@ use std::time::Duration;
 
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, QuerySettings, Row};
 use pulsus_model::{
-    Fingerprint, LabelSet, SERIES_NAME_PREFIX_BITS, metric_fingerprint, series_fingerprint,
-    stream_fingerprint,
+    Fingerprint, LabelSet, SERIES_NAME_PREFIX_BITS, build_series_buffer, metric_fingerprint,
+    series_fingerprint, stream_fingerprint,
 };
 use serde_json::Value;
 
@@ -202,6 +202,53 @@ async fn the_series_id_prefix_is_the_servers_name_hash() {
             ours >> (128 - SERIES_NAME_PREFIX_BITS),
             server,
             "{name:?}: the prefix must be the server's cityHash64 of the name"
+        );
+    }
+}
+
+/// **T3 (issue #635): the whole series ID is the server's.** For the
+/// twenty names of F3 and `{job="api"}`, `series_fingerprint` equals the
+/// ID the server computes from the name and the series buffer with
+/// literal widths — the top 32 bits of `cityHash64(name)` above the low 96
+/// bits of the 128-bit hash — never through `SERIES_NAME_PREFIX_BITS`.
+#[tokio::test]
+async fn the_whole_series_id_is_the_servers() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let mut names: Vec<String> = vec![
+        String::new(),
+        "up".to_string(),
+        "métrique_é".to_string(),
+        "指標".to_string(),
+        "http_requests_total".to_string(),
+    ];
+    names.extend((0..15).map(|i| format!("metric_{i:02}_{}", "x".repeat(i))));
+    assert_eq!(names.len(), 20);
+    let labels = LabelSet::from_verbatim(vec![("job".to_string(), "api".to_string())]);
+    for name in &names {
+        let n = hex(name.as_bytes());
+        let b = hex(&build_series_buffer(name, &labels));
+        let sql = format!(
+            "SELECT bitOr(bitShiftLeft(toUInt128(bitShiftRight(cityHash64(unhex('{n}')), 32)), 96), \
+             bitAnd(bitOr(bitShiftLeft(toUInt128(cityHash64(unhex('{b}'))), 64), \
+             toUInt128(xxHash64(unhex('{b}')))), toUInt128('79228162514264337593543950335'))) \
+             AS fingerprint"
+        );
+        use futures::StreamExt;
+        let mut stream = client
+            .query_stream::<Compose128Row>(&sql, &QuerySettings::new())
+            .await
+            .expect("query_stream");
+        let server = stream
+            .next()
+            .await
+            .expect("one row")
+            .expect("row decode")
+            .fingerprint;
+        assert_eq!(
+            series_fingerprint(name, &labels),
+            Fingerprint::from_raw(server),
+            "{name:?}: the series ID must be the server's 32/96 split"
         );
     }
 }
