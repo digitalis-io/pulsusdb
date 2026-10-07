@@ -2,13 +2,15 @@
 -- each aggregation under rate, written by the design review's own generator from
 -- the inputs the tests in src/metrics/grouped_sql.rs pass. One section per
 -- marker line, which names the aggregation and the function.
+-- Issue #579 part 2 replaced the members' sort key, the fingerprint, with
+-- the member's position in `fps`, the text its design states.
 -- golden[sum rate]
 WITH 1782907200000 AS grid_start, 15000 AS grid_step, 241 AS grid_n, 300000 AS range_ms,
      [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps,
      CAST([0, 1, 0], 'Array(UInt32)') AS gids
 SELECT gid, gi, (arrayFold((acc, x) -> (acc.1 + x, if(isInfinite(acc.1 + x), 0., if(abs(acc.1) >= abs(x), acc.2 + ((acc.1 - (acc.1 + x)) + x), acc.2 + ((x - (acc.1 + x)) + acc.1)))), vs, CAST((0., 0.), 'Tuple(Float64, Float64)')) AS k).1 + k.2 AS agg
 FROM (
-  SELECT gid, gi, arrayMap(p -> p.2, arraySort(groupArray((fingerprint, v)))) AS vs
+  SELECT gid, gi, arrayMap(p -> p.2, arraySort(groupArray((transform(fingerprint, fps, arrayEnumerate(fps), toUInt32(0)), v)))) AS vs
   FROM (
     SELECT transform(fingerprint, fps, gids, CAST(0, 'UInt32')) AS gid, fingerprint, gi,
         i_l - i_f + 1 AS n,
@@ -85,7 +87,7 @@ WITH 1782907200000 AS grid_start, 15000 AS grid_step, 241 AS grid_n, 300000 AS r
      CAST([0, 1, 0], 'Array(UInt32)') AS gids
 SELECT gid, gi, (arrayFold((acc, x) -> (acc.1 + x, if(isInfinite(acc.1 + x), 0., if(abs(acc.1) >= abs(x), acc.2 + ((acc.1 - (acc.1 + x)) + x), acc.2 + ((x - (acc.1 + x)) + acc.1)))), vs, CAST((0., 0.), 'Tuple(Float64, Float64)')) AS k).1 + k.2 AS agg
 FROM (
-  SELECT gid, gi, arrayMap(p -> p.2, arraySort(groupArray((fingerprint, v)))) AS vs
+  SELECT gid, gi, arrayMap(p -> p.2, arraySort(groupArray((transform(fingerprint, fps, arrayEnumerate(fps), toUInt32(0)), v)))) AS vs
   FROM (
     SELECT transform(fingerprint, fps, gids, CAST(0, 'UInt32')) AS gid, fingerprint, gi,
         i_l - i_f + 1 AS n,
@@ -162,7 +164,7 @@ WITH 1782907200000 AS grid_start, 15000 AS grid_step, 241 AS grid_n, 300000 AS r
      CAST([0, 1, 0], 'Array(UInt32)') AS gids
 SELECT gid, gi, (arrayFold((acc, x) -> (acc.1 + x, if(isInfinite(acc.1 + x), 0., if(abs(acc.1) >= abs(x), acc.2 + ((acc.1 - (acc.1 + x)) + x), acc.2 + ((x - (acc.1 + x)) + acc.1)))), vs, CAST((0., 0.), 'Tuple(Float64, Float64)')) AS k).1 + k.2 AS agg
 FROM (
-  SELECT gid, gi, arrayMap(p -> p.2, arraySort(groupArray((fingerprint, v)))) AS vs
+  SELECT gid, gi, arrayMap(p -> p.2, arraySort(groupArray((transform(fingerprint, fps, arrayEnumerate(fps), toUInt32(0)), v)))) AS vs
   FROM (
     SELECT transform(fingerprint, fps, gids, CAST(0, 'UInt32')) AS gid, fingerprint, gi,
         if(y_l < y_p, y_l, y_l - y_p) / (toFloat64(t_l - t_p) / 1000.) AS v
@@ -226,7 +228,7 @@ WITH 1782907200000 AS grid_start, 15000 AS grid_step, 241 AS grid_n, 300000 AS r
      CAST([0, 1, 0], 'Array(UInt32)') AS gids
 SELECT gid, gi, if((arrayFold((acc, x) -> if(acc.1 = 0., (1., x, 0., toUInt8(0), 0.), if(acc.4 = 1, ((acc.1 + 1.), acc.2, if(isInfinite((((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * acc.5) + (x / (acc.1 + 1.)))), 0., if(abs(((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * acc.5)) >= abs((x / (acc.1 + 1.))), ((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * acc.3) + ((((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * acc.5) - (((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * acc.5) + (x / (acc.1 + 1.)))) + (x / (acc.1 + 1.))), ((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * acc.3) + (((x / (acc.1 + 1.)) - (((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * acc.5) + (x / (acc.1 + 1.)))) + ((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * acc.5)))), toUInt8(1), (((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * acc.5) + (x / (acc.1 + 1.)))), if(NOT isInfinite((acc.2 + x)), ((acc.1 + 1.), (acc.2 + x), if(isInfinite((acc.2 + x)), 0., if(abs(acc.2) >= abs(x), acc.3 + ((acc.2 - (acc.2 + x)) + x), acc.3 + ((x - (acc.2 + x)) + acc.2))), toUInt8(0), 0.), ((acc.1 + 1.), acc.2, if(isInfinite((((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * (acc.2 / ((acc.1 + 1.) - 1.))) + (x / (acc.1 + 1.)))), 0., if(abs(((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * (acc.2 / ((acc.1 + 1.) - 1.)))) >= abs((x / (acc.1 + 1.))), ((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * (acc.3 / ((acc.1 + 1.) - 1.))) + ((((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * (acc.2 / ((acc.1 + 1.) - 1.))) - (((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * (acc.2 / ((acc.1 + 1.) - 1.))) + (x / (acc.1 + 1.)))) + (x / (acc.1 + 1.))), ((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * (acc.3 / ((acc.1 + 1.) - 1.))) + (((x / (acc.1 + 1.)) - (((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * (acc.2 / ((acc.1 + 1.) - 1.))) + (x / (acc.1 + 1.)))) + ((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * (acc.2 / ((acc.1 + 1.) - 1.)))))), toUInt8(1), (((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * (acc.2 / ((acc.1 + 1.) - 1.))) + (x / (acc.1 + 1.))))))), vs, CAST((0., 0., 0., 0, 0.), 'Tuple(Float64, Float64, Float64, UInt8, Float64)')) AS st).4 = 1, st.5 + st.3, st.2 / st.1 + st.3 / st.1) AS agg
 FROM (
-  SELECT gid, gi, arrayMap(p -> p.2, arraySort(groupArray((fingerprint, v)))) AS vs
+  SELECT gid, gi, arrayMap(p -> p.2, arraySort(groupArray((transform(fingerprint, fps, arrayEnumerate(fps), toUInt32(0)), v)))) AS vs
   FROM (
     SELECT transform(fingerprint, fps, gids, CAST(0, 'UInt32')) AS gid, fingerprint, gi,
         i_l - i_f + 1 AS n,
@@ -303,7 +305,7 @@ WITH 1782907200000 AS grid_start, 15000 AS grid_step, 241 AS grid_n, 300000 AS r
      CAST([0, 1, 0], 'Array(UInt32)') AS gids
 SELECT gid, gi, toFloat64(length(vs)) AS agg
 FROM (
-  SELECT gid, gi, arrayMap(p -> p.2, arraySort(groupArray((fingerprint, v)))) AS vs
+  SELECT gid, gi, arrayMap(p -> p.2, arraySort(groupArray((transform(fingerprint, fps, arrayEnumerate(fps), toUInt32(0)), v)))) AS vs
   FROM (
     SELECT transform(fingerprint, fps, gids, CAST(0, 'UInt32')) AS gid, fingerprint, gi,
         i_l - i_f + 1 AS n,
@@ -380,7 +382,7 @@ WITH 1782907200000 AS grid_start, 15000 AS grid_step, 241 AS grid_n, 300000 AS r
      CAST([0, 1, 0], 'Array(UInt32)') AS gids
 SELECT gid, gi, arrayFold((acc, x) -> if(acc > x OR isNaN(acc), x, acc), vs, nan) AS agg
 FROM (
-  SELECT gid, gi, arrayMap(p -> p.2, arraySort(groupArray((fingerprint, v)))) AS vs
+  SELECT gid, gi, arrayMap(p -> p.2, arraySort(groupArray((transform(fingerprint, fps, arrayEnumerate(fps), toUInt32(0)), v)))) AS vs
   FROM (
     SELECT transform(fingerprint, fps, gids, CAST(0, 'UInt32')) AS gid, fingerprint, gi,
         i_l - i_f + 1 AS n,
@@ -457,7 +459,7 @@ WITH 1782907200000 AS grid_start, 15000 AS grid_step, 241 AS grid_n, 300000 AS r
      CAST([0, 1, 0], 'Array(UInt32)') AS gids
 SELECT gid, gi, arrayFold((acc, x) -> if(acc < x OR isNaN(acc), x, acc), vs, nan) AS agg
 FROM (
-  SELECT gid, gi, arrayMap(p -> p.2, arraySort(groupArray((fingerprint, v)))) AS vs
+  SELECT gid, gi, arrayMap(p -> p.2, arraySort(groupArray((transform(fingerprint, fps, arrayEnumerate(fps), toUInt32(0)), v)))) AS vs
   FROM (
     SELECT transform(fingerprint, fps, gids, CAST(0, 'UInt32')) AS gid, fingerprint, gi,
         i_l - i_f + 1 AS n,

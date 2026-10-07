@@ -271,7 +271,7 @@ WHERE day BETWEEN {first day} AND {last day}
 
 **Clustered honesty:** on a clustered deployment this fallback fetch reads `_dist` names throughout — `metric_samples_dist`, and the nested subqueries' `metric_series_dist` and `metric_labels_dist` — and additionally injects `distributed_product_mode = 'local'`, rewriting those nested subqueries to each shard's **local** tables (the same rewrite already applied to the traces metrics semi-join). It is exact because one kind-2 landing row writes a series' activity row and its lookup row on the node that received the push, beside that push's samples. Every series read that filters on labels or returns them carries the same setting, the label-cache sweep included. Without it, ClickHouse's default `distributed_product_mode = 'deny'` rejects the nested `_dist`-inside-`_dist` shape as a double-distributed `IN` (`DISTRIBUTED_IN_JOIN_SUBQUERY_DENIED`).
 
-**`max by (status) (http_requests_total)`, one hour, 15 s step — the grouped instant read (issue #549).** `min`, `max`, `count` and `group` over a **plain** instant selector — no range, no `offset`, no `@`, no subquery context, one concrete metric name — do not take the fetch above. They compile into ONE statement per fingerprint chunk, which returns the answer already reduced:
+**`max by (status) (http_requests_total)`, one hour, 15 s step — the grouped instant read (issue #549).** `min`, `max`, `count` and `group` over a **plain** instant selector — no range, no `offset`, no `@`, no subquery context, one concrete metric name with no other `__name__` matcher or none at all (issue #579) — do not take the fetch above. They compile into ONE statement per fingerprint chunk, which returns the answer already reduced:
 
 ```sql
 WITH 1782907200000 AS grid_start, 15000 AS grid_step, 241 AS grid_n, 300000 AS lookback,
@@ -288,7 +288,7 @@ FROM (
               OR flags != lagInFrame(flags) OVER w) AS is_new
     FROM (
       SELECT gid, gi,
-        if(countIf(NOT is_hist AND NOT isNaN(v)) = 0, argMaxIf(v, fingerprint, NOT is_hist),
+        if(countIf(NOT is_hist AND NOT isNaN(v)) = 0, argMaxIf(v, transform(fingerprint, fps, arrayEnumerate(fps), toUInt32(0)), NOT is_hist),
            maxIf(v, NOT is_hist AND NOT isNaN(v))) AS agg,
         toUInt8(if(countIf(NOT is_hist) > 0, 1, 0) + if(countIf(is_hist) > 0, 2, 0)) AS flags
       FROM (

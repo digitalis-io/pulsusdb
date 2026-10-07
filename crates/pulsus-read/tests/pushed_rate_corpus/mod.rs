@@ -691,16 +691,12 @@ pub struct LoggedStatement {
 }
 
 /// Every finished `SELECT` run in `db` since `marker`, oldest first.
+///
+/// The server can answer a statement before its `QueryFinish` row is
+/// queued for the log, so a single flush can miss the last statement to
+/// end. The read is repeated until two consecutive polls agree.
 pub async fn statements_since(admin: &ChClient, db: &str, marker: &str) -> Vec<LoggedStatement> {
     use futures::StreamExt;
-    admin
-        .execute(
-            "SYSTEM FLUSH LOGS",
-            &QuerySettings::new(),
-            Idempotency::Idempotent,
-        )
-        .await
-        .expect("flush logs");
     let sql = format!(
         "SELECT query, toUInt64(result_rows) AS result_rows FROM system.query_log \
          WHERE current_database = '{db}' AND type = 'QueryFinish' AND query_kind = 'Select' \
@@ -708,13 +704,30 @@ pub async fn statements_since(admin: &ChClient, db: &str, marker: &str) -> Vec<L
            AND query NOT LIKE '%system.query_log%' AND query NOT LIKE '%now64(6)%' \
          ORDER BY query_start_time_microseconds"
     );
-    let mut stream = admin
-        .query_stream::<LoggedStatement>(&sql, &QuerySettings::new())
-        .await
-        .expect("read the query log");
-    let mut out = Vec::new();
-    while let Some(row) = stream.next().await {
-        out.push(row.expect("decode"));
+    let mut previous: Option<usize> = None;
+    for _ in 0..30 {
+        admin
+            .execute(
+                "SYSTEM FLUSH LOGS",
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("flush logs");
+        let mut stream = admin
+            .query_stream::<LoggedStatement>(&sql, &QuerySettings::new())
+            .await
+            .expect("read the query log");
+        let mut out = Vec::new();
+        while let Some(row) = stream.next().await {
+            out.push(row.expect("decode"));
+        }
+        drop(stream);
+        if previous == Some(out.len()) {
+            return out;
+        }
+        previous = Some(out.len());
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    out
+    panic!("the query log never settled for {db}");
 }
