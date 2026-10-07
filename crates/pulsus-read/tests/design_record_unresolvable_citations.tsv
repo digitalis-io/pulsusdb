@@ -48,10 +48,10 @@ docs/query-lowering.md	plan.rs:3388	ambiguous_basename
 docs/query-lowering.md	plan.rs:3393	ambiguous_basename
 docs/query-lowering.md	plan.rs:3402	ambiguous_basename
 docs/query-lowering.md	plan.rs:3750	ambiguous_basename
-docs/query-lowering.md	search_plan.rs:1057	ambiguous_basename
-docs/query-lowering.md	search_plan.rs:1200	blank_target_line
-docs/query-lowering.md	search_plan.rs:1328	blank_target_line
-docs/query-lowering.md	search_plan.rs:1890	blank_target_line
+docs/query-lowering.md	search_plan.rs:1060	ambiguous_basename
+docs/query-lowering.md	search_plan.rs:1203	blank_target_line
+docs/query-lowering.md	search_plan.rs:1331	blank_target_line
+docs/query-lowering.md	search_plan.rs:1893	blank_target_line
 docs/query-lowering.md	sql.rs:774	ambiguous_basename
 docs/query-lowering.md	traces/compile.rs:181	ambiguous_basename
 docs/query-lowering.md	traces/compile.rs:185	ambiguous_basename
@@ -90,8 +90,8 @@ docs/query-to-sql.md	plan.rs:3778	ambiguous_basename
 docs/query-to-sql.md	plan.rs:3779	ambiguous_basename
 docs/query-to-sql.md	query_lowering_doc_gate.rs:472	ambiguous_basename
 docs/query-to-sql.md	query_lowering_doc_gate.rs:545	ambiguous_basename
-docs/query-to-sql.md	search_plan.rs:2136	ambiguous_basename
-docs/query-to-sql.md	search_plan.rs:2142	ambiguous_basename
+docs/query-to-sql.md	search_plan.rs:2139	ambiguous_basename
+docs/query-to-sql.md	search_plan.rs:2145	ambiguous_basename
 docs/query-to-sql.md	sql.rs:1036	ambiguous_basename
 docs/query-to-sql.md	sql.rs:105	ambiguous_basename
 docs/query-to-sql.md	sql.rs:1085	ambiguous_basename

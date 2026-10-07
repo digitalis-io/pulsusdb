@@ -2515,6 +2515,21 @@ impl ProjectedValue<'_> {
     }
 }
 
+/// Charged before a span summary's attribute buffer is reserved at
+/// `attr_capacity` slots (issue #591 part 3 shares it with the search
+/// statement's decode).
+pub(crate) fn summary_reserve_bytes(attr_capacity: usize) -> usize {
+    super::exec::RETAINED_ENTRY_OVERHEAD + attr_capacity * std::mem::size_of::<ProjectedAttribute>()
+}
+
+/// Charged before a trace match's summaries buffer is reserved at `take`
+/// slots: the match itself, one entry's overhead and the slots.
+pub(crate) fn match_reserve_bytes(take: usize) -> usize {
+    std::mem::size_of::<TraceMatch>()
+        + super::exec::RETAINED_ENTRY_OVERHEAD
+        + take * std::mem::size_of::<SpanSummary>()
+}
+
 /// Builds one span summary, charging the budget **before every retained
 /// allocation** (code review round 2): the summary's overhead + the
 /// attributes buffer at full capacity are charged before anything is
@@ -2534,10 +2549,7 @@ fn build_summary(
     budget: &mut ByteBudget,
 ) -> Result<SpanSummary, ReadError> {
     let attr_capacity = plan.projected_attr_capacity();
-    budget.charge(
-        super::exec::RETAINED_ENTRY_OVERHEAD
-            + attr_capacity * std::mem::size_of::<ProjectedAttribute>(),
-    )?;
+    budget.charge(summary_reserve_bytes(attr_capacity))?;
     let mut attributes = Vec::with_capacity(attr_capacity);
     let mut name: Option<String> = None;
     for group in &plan.projections {
@@ -3369,11 +3381,7 @@ pub(crate) fn evaluate_batch(
         let take = surviving.len().min(plan.spss as usize);
         // Charge the match base + the summaries buffer (at its exact
         // capacity) BEFORE allocating it.
-        budget.charge(
-            std::mem::size_of::<TraceMatch>()
-                + super::exec::RETAINED_ENTRY_OVERHEAD
-                + take * std::mem::size_of::<SpanSummary>(),
-        )?;
+        budget.charge(match_reserve_bytes(take))?;
         let mut summaries = Vec::with_capacity(take);
         for span in surviving.iter().take(take) {
             summaries.push(build_summary(plan, trace.trace_id, span, &env, budget)?);
