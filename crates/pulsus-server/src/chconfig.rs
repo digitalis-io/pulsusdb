@@ -396,7 +396,7 @@ pub(crate) fn metrics_config_from(config: &Config) -> MetricsConfig {
         // `MetricsDispatch`'s error mapper.
         read_max_memory_bytes: config.reader.promql_read_max_memory_bytes,
         // Issue #549: the grouped-instant-read flag's production carrier
-        // — `ReaderConfig -> MetricsConfig -> metrics::grouped::shape_of`,
+        // — `ReaderConfig -> MetricsConfig -> metrics::grouped::node_verdicts`,
         // which is the only reader of it.
         grouped_push: config.reader.promql_grouped_push,
     }

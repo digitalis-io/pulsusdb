@@ -47,6 +47,11 @@ use pulsus_read::{EngineConfig, LogQlEngine, QueryResult, ReadError};
 use pulsus_schema::{RenderCtx, SchemaParams};
 use pulsus_schema_testkit::run_init;
 
+// Issue #579: the CPU corpus and the two-engine harness, shared with
+// `live_metrics_pushed_rate.rs`.
+#[path = "pushed_rate_corpus/mod.rs"]
+mod pushed_rate_corpus;
+
 /// `true` when the gated half of this suite should run. Skips cleanly on a
 /// developer machine with no container; **panics** rather than skipping when
 /// the gate is absent in a live CI job, so a lost `env:` block reddens the
@@ -9100,4 +9105,56 @@ async fn a_metrics_samples_are_one_key_range() {
     );
 
     drop_db_623(&admin, &db).await;
+}
+
+/// Issue #579, T2 (item 2): the issue's query over 24 h at 60 s sends two
+/// statements — the shape-A statement, at most one row per group per step
+/// plus the sentinel row, and the run template for the inner
+/// `count by (cpu)` — and no statement selects the raw samples.
+///
+/// Without the push the same request sends four statements, a float and a
+/// histogram fetch per selector, and 1,478,966 rows (the design's
+/// measurement).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_cpu_query_sends_groups_not_samples() {
+    skip_unless_live!();
+    use pushed_rate_corpus::{ISSUE_QUERY, anchor, cpu_corpus, harness, statements_since};
+    let t = anchor();
+    let db = pulsus_testkit::test_db("pulsus_read_it_qlog_cpu_query");
+    let h = harness(&db, t, &cpu_corpus(t), None).await;
+    let p = h.day(60_000);
+    let marker = pushed_rate_corpus::server_marker(&h.admin).await;
+    let r = pushed_rate_corpus::Harness::run(&h.pushed, ISSUE_QUERY, &p).await;
+    assert!(!r.answer.is_empty());
+    let sent = statements_since(&h.admin, &h.db, &marker).await;
+    let summary: Vec<(u64, String)> = sent
+        .iter()
+        .map(|s| (s.result_rows, s.query.chars().take(160).collect()))
+        .collect();
+    assert_eq!(sent.len(), 2, "exactly two statements: {summary:?}");
+    let shape_a: Vec<_> = sent
+        .iter()
+        .filter(|s| s.query.contains("AS range_ms") && s.query.contains("UNION ALL"))
+        .collect();
+    let runs: Vec<_> = sent
+        .iter()
+        .filter(|s| s.query.contains("AS lookback") && s.query.contains("gi_start"))
+        .collect();
+    assert_eq!((shape_a.len(), runs.len()), (1, 1), "{summary:?}");
+    assert!(
+        shape_a[0].result_rows <= 8 * 1_441 + 1,
+        "the shape-A statement returned {} rows, over 8 groups x 1,441 steps + the sentinel",
+        shape_a[0].result_rows
+    );
+    assert!(
+        runs[0].result_rows <= 16 * 1_441,
+        "the run template returned {} rows, over 16 groups x 1,441 steps",
+        runs[0].result_rows
+    );
+    assert!(
+        sent.iter()
+            .all(|s| !s.query.contains("SELECT fingerprint, unix_milli, value")),
+        "a statement selects the raw samples: {summary:?}"
+    );
+    h.finish().await;
 }

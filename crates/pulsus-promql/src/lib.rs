@@ -37,7 +37,8 @@ pub use plan::{
 };
 pub use re2_syntax::re2_pattern_to_rust;
 pub use value::{
-    FetchedSeries, InstantSample, Labels, Point, QueryValue, RangeSeries, Sample, SeriesData,
+    FetchedSeries, InstantSample, Labels, Point, PushedNode, QueryValue, RangeSeries, Sample,
+    SeriesData,
 };
 
 /// True iff the (paren-stripped) root of `expr` is a call to one of the
