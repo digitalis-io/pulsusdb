@@ -14,6 +14,13 @@
 
 pub use pulsus_model::{LabelMatcher, MatchOp};
 
+/// Issue #635: whether `m` matches the empty string — what an absent label
+/// reads as. `None` when a regex's verdict cannot be decided in-process.
+pub(super) fn matches_empty(m: &LabelMatcher) -> Option<bool> {
+    let _ = m;
+    None
+}
+
 /// The full data window a query needs answered, **including** lookback and
 /// range-vector width — computed by issue #31, handed to
 /// [`super::labels::SeriesResolver::resolve`]. This is the resolver's
@@ -84,5 +91,33 @@ mod tests {
             value: "api".to_string(),
         };
         assert_eq!(m.op, pulsus_model::MatchOp::Eq);
+    }
+
+    fn mm(op: MatchOp, value: &str) -> LabelMatcher {
+        LabelMatcher {
+            key: "k".to_string(),
+            op,
+            value: value.to_string(),
+        }
+    }
+
+    /// U1 (issue #635): whether a matcher matches the empty string, which
+    /// decides its role on the label index; `None` where the in-process
+    /// screen cannot decide a regex.
+    #[test]
+    fn u1_matches_empty_per_matcher() {
+        for (op, value, want) in [
+            (MatchOp::Eq, "", Some(true)),
+            (MatchOp::Eq, "a", Some(false)),
+            (MatchOp::Neq, "", Some(false)),
+            (MatchOp::Neq, "a", Some(true)),
+            (MatchOp::Re, "prod|", Some(true)),
+            (MatchOp::Re, "5..", Some(false)),
+            (MatchOp::Nre, "5..", Some(true)),
+            (MatchOp::Nre, "prod|", Some(false)),
+            (MatchOp::Re, r"[\p{Alphabetic}]", None),
+        ] {
+            assert_eq!(matches_empty(&mm(op, value)), want, "{op:?} {value:?}");
+        }
     }
 }

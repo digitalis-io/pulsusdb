@@ -250,6 +250,9 @@ async fn run_init_clustered_creates_dist_wrappers_on_every_shard_with_identical_
         // Issue #623: one label row per series, keyed like the series;
         // nothing is inserted through this wrapper.
         ("metric_labels_dist", METRICS_KEY),
+        // Issue #635: the label index, keyed like the series; nothing is
+        // inserted through this wrapper.
+        ("metric_label_index_dist", METRICS_KEY),
         ("log_streams_dist", LOGS_KEY),
         ("log_streams_idx_dist", LOGS_KEY),
         ("log_samples_dist", LOGS_KEY),
@@ -949,7 +952,7 @@ async fn the_cluster_windows_are_the_replicated_pair_on_every_write_path_table()
     ctx.log_dedup_window = 5_000;
     run_init(&shard1, &ctx).await.expect("run_init (clustered)");
 
-    const WRITE_PATH_TABLES: [&str; 12] = [
+    const WRITE_PATH_TABLES: [&str; 14] = [
         "log_landing",
         "log_samples",
         "log_streams",
@@ -962,6 +965,8 @@ async fn the_cluster_windows_are_the_replicated_pair_on_every_write_path_table()
         "metric_metadata",
         "metric_hist_samples",
         "metric_labels",
+        "metric_label_index",
+        "metric_label_values",
     ];
 
     for (i, shard) in [&shard1, &shard2].into_iter().enumerate() {

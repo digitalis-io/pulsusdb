@@ -259,7 +259,7 @@ fn every_view_is_dropped_before_it_is_created() {
                 );
             }
         }
-        assert_eq!(dropped.len(), 19, "every view is dropped");
+        assert_eq!(dropped.len(), 21, "every view is dropped");
     }
 }
 
@@ -544,6 +544,8 @@ fn the_file_still_answers_the_two_run_time_questions() {
         "metric_metadata_mv",
         "metric_hist_samples_mv",
         "metric_labels_mv",
+        "metric_label_index_mv",
+        "metric_label_values_mv",
     ] {
         let projection =
             pulsus_schema::mv_projection(mv, &ctx).unwrap_or_else(|| panic!("{mv} is in the file"));

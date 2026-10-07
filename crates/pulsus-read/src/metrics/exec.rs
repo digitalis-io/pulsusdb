@@ -92,6 +92,14 @@ pub struct MetricsConfig {
     /// fingerprint)` (issue #623). Every read that needs a series' labels
     /// takes them from its own row here; `_dist`-aware like `series_table`.
     pub labels_table: String,
+    /// `metric_label_index` (issue #635): one row per key, value and series,
+    /// sorted by them; `_dist`-aware like `labels_table`. A name-less read
+    /// with a positive label matcher, and the label endpoints, read it.
+    pub label_index_table: String,
+    /// `metric_label_values` (issue #635): one row per key and value.
+    /// **Never** `_dist`-suffixed: it is named locally inside a statement
+    /// dispatched with `distributed_product_mode = 'local'`.
+    pub label_values_table: String,
     /// `metric_metadata` — issue #32's `/api/v1/metadata`
     /// ([`super::sql::metadata_query`]). **Never** `_dist`-suffixed
     /// (docs/schemas.md §2.1: it is a global, unsharded catalog table) —

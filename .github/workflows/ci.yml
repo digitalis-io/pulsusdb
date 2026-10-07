@@ -1811,6 +1811,16 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-read --test live_metrics_pushed_rate
 
+      # Issue #635 part 2: the inverted label index — name-less series reads
+      # and the label endpoints answered from it, an empty value read as
+      # absent, and escaped labels, each checked against expectations the
+      # suite computes from the generator's own label columns.
+      - name: Live metrics label index
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-read --test live_metrics_label_index
+
       # Issue #549: ADR 0008 D2 asked of ClickHouse's own parser over the
       # whole committed SQL corpus. It needs a server, so it cannot live
       # in the hermetic freeze; `require_live_gate` fails closed here, so

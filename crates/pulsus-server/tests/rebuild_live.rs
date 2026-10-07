@@ -320,3 +320,62 @@ async fn drop_and_replay_leaves_each_row_once() {
         );
     }
 }
+
+/// The rows of `table`, merged, one text per row.
+async fn merged_rows(client: &ChClient, db: &str, table: &str, columns: &str) -> Vec<String> {
+    client
+        .execute(
+            &format!("OPTIMIZE TABLE {db}.{table} FINAL"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("merge");
+    strings(
+        client,
+        &format!("SELECT concat({columns}) AS s FROM {db}.{table} ORDER BY s"),
+    )
+    .await
+}
+
+/// **RB (issue #635): a replay into the label index leaves its rows as the
+/// view wrote them.** The window is replayed into a table that already
+/// holds it; merged, the replay's copies collapse into the rows already
+/// there.
+async fn a_replay_keeps_the_rows(stem: &str, target: &str, columns: &str) {
+    let db = ScopedDb::fresh(pulsus_testkit::test_db(stem)).await;
+    let client = client_for(db.name()).await;
+    let received = now_ms();
+    seed_two_days(&client, received).await;
+    let before = merged_rows(&client, db.name(), target, columns).await;
+    assert!(!before.is_empty(), "{target}: the view wrote rows");
+    let (ok, out) = rebuild(db.name(), target, received, false);
+    assert!(ok, "{target}: the rebuild failed:\n{out}");
+    assert_eq!(
+        merged_rows(&client, db.name(), target, columns).await,
+        before,
+        "{target}: the rows after the replay"
+    );
+}
+
+#[tokio::test]
+async fn the_label_index_rebuilds_to_the_rows_the_view_wrote() {
+    skip_unless_live!();
+    a_replay_keeps_the_rows(
+        "rebuild_label_index",
+        "metric_label_index",
+        "key, '=', value, ' ', toString(fingerprint)",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn the_label_values_rebuild_to_the_rows_the_view_wrote() {
+    skip_unless_live!();
+    a_replay_keeps_the_rows(
+        "rebuild_label_values",
+        "metric_label_values",
+        "key, '=', value",
+    )
+    .await;
+}

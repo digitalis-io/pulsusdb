@@ -117,6 +117,8 @@ fn freeze_config() -> MetricsConfig {
         hist_samples_table: HIST.to_string(),
         series_table: "metric_series".to_string(),
         labels_table: "metric_labels".to_string(),
+        label_index_table: "metric_label_index".to_string(),
+        label_values_table: "metric_label_values".to_string(),
         metadata_table: "metric_metadata".to_string(),
         experimental_functions: true,
         max_metric_fanout: 1_000,
