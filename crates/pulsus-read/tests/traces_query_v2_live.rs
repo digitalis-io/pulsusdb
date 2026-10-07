@@ -6134,8 +6134,186 @@ fn fixture_b_bodies(base_ns: i64) -> Vec<ExportTraceServiceRequest> {
         .collect()
 }
 
-/// The 55 corpus queries section 8.3 names, read from their files.
-const CORPUS_QUERIES: [&str; 55] = [
+/// Fixture P (issue #591 part 2's section 7.2), one body: trace `11…` with
+/// a root holding events, links and a scope, and a child; trace `22…` with
+/// one root. Event times are offsets from `base_ns`, so `…02`'s and
+/// `…03`'s events sit at their spans' own start.
+fn fixture_p_body(base_ns: i64) -> ExportTraceServiceRequest {
+    const MS: i64 = 1_000_000;
+    let span_id = |b: u8| vec![0, 0, 0, 0, 0, 0, 0, b];
+    let arr = |values: &[&str]| str_array_value(values);
+    let resource = |attributes: Vec<KeyValue>| Resource {
+        attributes,
+        dropped_attributes_count: 0,
+        entity_refs: Vec::new(),
+    };
+    let link = |first: u8, last: u8, attrs: Vec<KeyValue>| {
+        link_of(vec![0x99; 16], vec![first, 0, 0, 0, 0, 0, 0, last], attrs)
+    };
+    let root = span_of(
+        vec![0x11; 16],
+        span_id(1),
+        Vec::new(),
+        "p-root",
+        2,
+        base_ns,
+        10 * MS,
+        vec![kv("q", str_value("span-q"))],
+        0,
+        vec![
+            event_of(
+                base_ns + MS,
+                "alpha",
+                vec![
+                    kv("k", int_value(1)),
+                    kv("t", str_value("a")),
+                    kv("r", str_value("ev-r1")),
+                ],
+            ),
+            event_of(
+                base_ns + 2 * MS,
+                "beta",
+                vec![kv("k", int_value(5)), kv("r", str_value("ev-r2"))],
+            ),
+            event_of(
+                base_ns + 3 * MS,
+                "gamma",
+                vec![kv("k", int_value(9)), kv("t", str_value("b"))],
+            ),
+        ],
+        vec![
+            link(
+                0x0a,
+                0x01,
+                vec![kv("lk", int_value(2)), kv("s", str_value("link-s1"))],
+            ),
+            link(
+                0x0b,
+                0x02,
+                vec![kv("lk", int_value(6)), kv("s", str_value("link-s2"))],
+            ),
+            link(0x0c, 0x03, vec![kv("lk", int_value(10))]),
+        ],
+    );
+    let child = span_of(
+        vec![0x11; 16],
+        span_id(2),
+        span_id(1),
+        "p-child",
+        1,
+        base_ns + 4 * MS,
+        MS,
+        vec![kv("k", str_value("span-k"))],
+        0,
+        vec![event_of(
+            base_ns + 4 * MS,
+            "delta",
+            vec![kv("k", int_value(3))],
+        )],
+        Vec::new(),
+    );
+    let other = span_of(
+        vec![0x22; 16],
+        span_id(3),
+        Vec::new(),
+        "p-other",
+        1,
+        base_ns + 20 * MS,
+        MS,
+        vec![kv("k", double_value(2.5))],
+        0,
+        vec![event_of(
+            base_ns + 20 * MS,
+            "beta",
+            vec![kv("k", double_value(4.5)), kv("t", arr(&["x", "y"]))],
+        )],
+        Vec::new(),
+    );
+    ExportTraceServiceRequest {
+        resource_spans: vec![
+            ResourceSpans {
+                resource: Some(resource(vec![
+                    kv("service.name", str_value("svc-p")),
+                    kv("rk_s", str_value("rv")),
+                    kv("rk_i", int_value(7)),
+                    kv("rk_d", double_value(2.5)),
+                    kv("rk_b", bool_value(true)),
+                    kv("rk_arr", arr(&["x", "y"])),
+                    kv("p", str_value("res")),
+                    kv("q", str_value("res-q")),
+                ])),
+                scope_spans: vec![ScopeSpans {
+                    scope: Some(scope_named(
+                        "sc",
+                        "1",
+                        vec![kv("u", str_value("instr-u")), kv("s", str_value("instr-s"))],
+                    )),
+                    spans: vec![root],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            },
+            ResourceSpans {
+                resource: Some(resource(vec![
+                    kv("service.name", str_value("svc-q")),
+                    kv("p", int_value(42)),
+                    kv("rk_i", int_value(3)),
+                ])),
+                scope_spans: vec![ScopeSpans {
+                    scope: Some(scope_named("sc2", "2", Vec::new())),
+                    spans: vec![child, other],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            },
+        ],
+    }
+}
+
+/// Fixture S: one span, `33…`/`…04`, whose events hold `k` = 2 then 5 and
+/// whose links hold `lk` = 2 then 5, and nothing else holds `k` or `lk`.
+/// The two-element sets on which the elementwise rule of
+/// `docs/benchmarks/traces-differential-ledger.md`,
+/// `traceql-event-link-set-operands`, answers where today's engine,
+/// reading the first element, does not.
+fn fixture_s_body(base_ns: i64) -> ExportTraceServiceRequest {
+    const MS: i64 = 1_000_000;
+    one_span_request(
+        vec![kv("service.name", str_value("svc-s"))],
+        scope_named("io.pulsus.s", "1.0", Vec::new()),
+        span_of(
+            vec![0x33; 16],
+            vec![0, 0, 0, 0, 0, 0, 0, 4],
+            Vec::new(),
+            "s-root",
+            1,
+            base_ns + 30 * MS,
+            MS,
+            Vec::new(),
+            0,
+            vec![
+                event_of(base_ns + 30 * MS, "e1", vec![kv("k", int_value(2))]),
+                event_of(base_ns + 31 * MS, "e2", vec![kv("k", int_value(5))]),
+            ],
+            vec![
+                link_of(
+                    vec![0x99; 16],
+                    vec![0x0d, 0, 0, 0, 0, 0, 0, 1],
+                    vec![kv("lk", int_value(2))],
+                ),
+                link_of(
+                    vec![0x99; 16],
+                    vec![0x0d, 0, 0, 0, 0, 0, 0, 2],
+                    vec![kv("lk", int_value(5))],
+                ),
+            ],
+        ),
+    )
+}
+
+/// The 55 corpus queries section 8.3 names, read from their files, and
+/// the 27 issue #591 part 2's section 7.2 adds.
+const CORPUS_QUERIES: [&str; 82] = [
     "attr_bool_false_neq",
     "attr_duration_value",
     "attr_neq_string",
@@ -6191,6 +6369,35 @@ const CORPUS_QUERIES: [&str; 55] = [
     "string_escape_octal",
     "string_escapes_short",
     "string_escape_unicode",
+    // Issue #591 part 2: every corpus query task 9 moves but the two
+    // nested-set ones.
+    "arith_minus",
+    "arith_mod",
+    "arith_plus",
+    "arith_pow",
+    "arith_slash",
+    "arith_star",
+    "arith_unary_neg",
+    "attr_bool_true",
+    "attr_unscoped_number",
+    "bare_attribute",
+    "existence_neq_nil",
+    "field_or",
+    "field_parens",
+    "field_precedence",
+    "hints_most_recent",
+    "hints_repeated",
+    "intrinsic_event_name",
+    "intrinsic_event_time_since_start",
+    "intrinsic_link_span_id",
+    "intrinsic_link_trace_id",
+    "scope_event",
+    "scope_link",
+    "spanset_and",
+    "spanset_parens",
+    "spanset_precedence",
+    "static_max_int",
+    "static_min_int",
 ];
 
 fn corpus_query(name: &str) -> String {
@@ -6261,6 +6468,48 @@ const RZ_QUERIES: [&str; 8] = [
 /// Fixture B's three queries.
 const B_QUERIES: [&str; 3] = ["{}", r#"{ span.s =~ ".+" }"#, r#"{ span.arr != nil }"#];
 
+/// Issue #591 part 2's section 7.2: fixture P's thirty-seven queries, q01
+/// to q30, then r01 to r04 and r06 to r08.
+const P_QUERIES: [&str; 37] = [
+    r#"{ resource.rk_s =~ "r.*" }"#,
+    r#"{ resource.rk_i > 5 }"#,
+    r#"{ resource.rk_d > 1 }"#,
+    r#"{ resource.rk_b != nil }"#,
+    r#"{ resource.rk_arr != nil }"#,
+    r#"{ resource.rk_s = "rv" }"#,
+    r#"{ event.k > 3 }"#,
+    r#"{ event.k >= 1 }"#,
+    r#"{ event.t =~ "b" }"#,
+    r#"{ event.k != nil }"#,
+    r#"{ event:name =~ "b.*" }"#,
+    r#"{ event:name = "gamma" }"#,
+    r#"{ event:timeSinceStart > 1500us }"#,
+    r#"{ link.lk > 5 }"#,
+    r#"{ link:spanID =~ "0b.*" }"#,
+    r#"{ link.lk != nil }"#,
+    r#"{ .q =~ ".*q" }"#,
+    r#"{ .p != nil }"#,
+    r#"{ .r =~ "ev-r.*" }"#,
+    r#"{ .s =~ "link.*" }"#,
+    r#"{ .u != nil }"#,
+    r#"{ .k > 2 }"#,
+    r#"{ .k != nil }"#,
+    r#"{ .r = "ev-r2" }"#,
+    r#"{ event.k > 3 && .p != nil }"#,
+    r#"{ resource.rk_i > 5 } || { event:name = "delta" }"#,
+    r#"{ link:spanID = "0B00000000000002" }"#,
+    r#"{ event.t != nil }"#,
+    r#"{ .t != nil }"#,
+    r#"{ resource.p = 42 }"#,
+    r#"{ event.k * 2 > 5 }"#,
+    r#"{ .k * 2 > 5 }"#,
+    r#"{ event.k = event.k }"#,
+    r#"{ link.lk - 1 > 4 }"#,
+    r#"{ .k = .k }"#,
+    r#"{ link.lk = link.lk }"#,
+    r#"{ .p * 2 > 50 }"#,
+];
+
 /// The `(limit, spss)` pairs every comparison runs at.
 const LIMIT_SPSS: [(u32, u32); 3] = [(100, 100), (20, 3), (2, 1)];
 
@@ -6311,6 +6560,13 @@ async fn search_statement_answers_as_today_on_fixture_c() {
         "t591-b",
     )
     .await;
+    let (db_p, client_p) = seed_both(
+        pulsus_testkit::test_db("pulsus_read_it_t591_both_p"),
+        &[fixture_p_body(base_ns)],
+        3,
+        "t591-p",
+    )
+    .await;
 
     let mut cases: Vec<(String, &str, &ChClient)> = Vec::new();
     for name in CORPUS_QUERIES {
@@ -6324,6 +6580,9 @@ async fn search_statement_answers_as_today_on_fixture_c() {
     }
     for q in B_QUERIES {
         cases.push((q.to_string(), db_b.as_str(), &client_b));
+    }
+    for q in P_QUERIES {
+        cases.push((q.to_string(), db_p.as_str(), &client_p));
     }
     let mut mismatches: Vec<String> = Vec::new();
     for (query, db, client) in &cases {
@@ -6346,14 +6605,14 @@ async fn search_statement_answers_as_today_on_fixture_c() {
             }
         }
     }
-    for db in [&db_c, &db_z, &db_b] {
+    for db in [&db_c, &db_z, &db_b, &db_p] {
         drop_db(db).await;
     }
     eprintln!("compared {} queries × 3", cases.len());
     assert_eq!(
         cases.len(),
-        108,
-        "55 corpus, 42 catalogue, 8 RZ and 3 B queries"
+        172,
+        "82 corpus, 42 catalogue, 8 RZ, 3 B and 37 P queries"
     );
     assert!(
         mismatches.is_empty(),
@@ -6642,6 +6901,198 @@ async fn search_statement_answers_written_out_on_fixture_c() {
         }
     }
     for db in [&db_c, &db_z, &db_b] {
+        drop_db(db).await;
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} written answer(s) differ:\n\n{}",
+        wrong.len(),
+        wrong.join("\n\n")
+    );
+}
+
+/// Issue #591 part 2's section 7.3: fixture P's answers written from its
+/// own table, by neither engine; `limit` and `spss` 100.
+///
+/// Then fixture S's two-element sets, `[2, 5]`: `/`, `%` and `^` over an
+/// event, link or unscoped field, and a set field compared with itself by
+/// `<` or `>`. Each ranges over the set's elements, as
+/// `docs/benchmarks/traces-differential-ledger.md`,
+/// `traceql-event-link-set-operands`, records ("arithmetic over event, link
+/// and unscoped operands ranges over their elements"; "two sets are
+/// compared pair by pair"). Today's engine reads the first element, `2`,
+/// and answers none of these: they are a documented difference, not
+/// parity, so neither engine wrote these rows either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_statement_answers_written_out_on_fixture_p() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let window = (base_ns, base_ns + CATALOGUE_WINDOW_NS);
+    let db_p = pulsus_testkit::test_db("pulsus_read_it_t591_written_p");
+    let client_p = fresh_db(&db_p).await;
+    land(
+        &client_p,
+        &fixture_p_body(base_ns),
+        &format!("t591w-p-{}", now_ns()),
+    )
+    .await;
+    let db_s = pulsus_testkit::test_db("pulsus_read_it_t591_written_s");
+    let client_s = fresh_db(&db_s).await;
+    land(
+        &client_s,
+        &fixture_s_body(base_ns),
+        &format!("t591w-s-{}", now_ns()),
+    )
+    .await;
+    for (client, want) in [(&client_p, 3), (&client_s, 1)] {
+        let n = count(client, &format!("SELECT count() AS n FROM {SPANS_TABLE}")).await;
+        assert_eq!(n, want, "seeded spans");
+    }
+
+    let mut wrong: Vec<String> = Vec::new();
+    let p_rows = [
+        // q02
+        (r#"{ resource.rk_i > 5 }"#, "1111(1): 0001[rk_i=Int 7]"),
+        // q05: the stored array's JSON, not `['x','y']`.
+        (
+            r#"{ resource.rk_arr != nil }"#,
+            "1111(1): 0001[rk_arr=Str [\"x\",\"y\"]]",
+        ),
+        // q07: the first element whose own condition holds — not the first
+        // carrying `k` (1), nor the last (9).
+        (
+            r#"{ event.k > 3 }"#,
+            "2222(1): 0003[k=Double 4.5] | 1111(1): 0001[k=Int 5]",
+        ),
+        // q10
+        (
+            r#"{ event.k != nil }"#,
+            "2222(1): 0003[k=Double 4.5] | 1111(2): 0001[k=Int 1] 0002[k=Int 3]",
+        ),
+        // q13
+        (
+            r#"{ event:timeSinceStart > 1500us }"#,
+            "1111(1): 0001[event:timeSinceStart=Int 2000000]",
+        ),
+        // q18
+        (
+            r#"{ .p != nil }"#,
+            "2222(1): 0003[p=Int 42] | 1111(2): 0001[p=Str res] 0002[p=Int 42]",
+        ),
+        // q19
+        (r#"{ .r =~ "ev-r.*" }"#, "1111(1): 0001[r=Str ev-r1]"),
+        // q20: the link before the instrumentation scope.
+        (r#"{ .s =~ "link.*" }"#, "1111(1): 0001[s=Str link-s1]"),
+        // q22: the span's own `k` before the event's on `…03`; `…02`'s
+        // string `"span-k"` is not compared with `2`.
+        (
+            r#"{ .k > 2 }"#,
+            "2222(1): 0003[k=Double 2.5] | 1111(1): 0001[k=Int 5]",
+        ),
+        // q23
+        (
+            r#"{ .k != nil }"#,
+            "2222(1): 0003[k=Double 2.5] | 1111(2): 0001[k=Int 1] 0002[k=Str span-k]",
+        ),
+        // q27: the literal, lowercased.
+        (
+            r#"{ link:spanID = "0B00000000000002" }"#,
+            "1111(1): 0001[link:spanID=Str 0b00000000000002]",
+        ),
+        // q29
+        (
+            r#"{ .t != nil }"#,
+            "2222(1): 0003[t=Str [\"x\",\"y\"]] | 1111(1): 0001[t=Str a]",
+        ),
+        // r01: the first element the comparison holds for.
+        (
+            r#"{ event.k * 2 > 5 }"#,
+            "2222(1): 0003[k=Double 4.5] | 1111(2): 0001[k=Int 5] 0002[k=Int 3]",
+        ),
+        // r02: the span's own `k = 2.5` on `…03` decides, and fails.
+        (r#"{ .k * 2 > 5 }"#, "1111(1): 0001[k=Int 5]"),
+        // r03: the first element carrying the field.
+        (
+            r#"{ event.k = event.k }"#,
+            "2222(1): 0003[k=Double 4.5] | 1111(2): 0001[k=Int 1] 0002[k=Int 3]",
+        ),
+        // r04: not `2`, the first link carrying `lk`.
+        (r#"{ link.lk - 1 > 4 }"#, "1111(1): 0001[lk=Int 6]"),
+        // r05
+        (
+            r#"{ event:timeSinceStart * 2 > 3ms }"#,
+            "1111(1): 0001[event:timeSinceStart=Int 2000000]",
+        ),
+        // r06
+        (
+            r#"{ .k = .k }"#,
+            "2222(1): 0003[k=Double 2.5] | 1111(2): 0001[k=Int 1] 0002[k=Str span-k]",
+        ),
+        // r07: the first link carrying `lk`.
+        (r#"{ link.lk = link.lk }"#, "1111(1): 0001[lk=Int 2]"),
+        // r08
+        (
+            r#"{ .p * 2 > 50 }"#,
+            "2222(1): 0003[p=Int 42] | 1111(1): 0002[p=Int 42]",
+        ),
+        // r09
+        (
+            r#"{ event:name = event:name }"#,
+            "2222(1): 0003[event:name=Str beta] | 1111(2): 0001[event:name=Str alpha] \
+             0002[event:name=Str delta]",
+        ),
+    ];
+    for (query, want) in p_rows {
+        check(
+            &mut wrong,
+            query,
+            written(&ask(&client_p, query, window).await, false),
+            want,
+        );
+    }
+    // Section 3.6's refusal holds under `!=` too: on fixture P the
+    // predicate's any-pair reading drops span `…01`, which today's engine,
+    // reading each element against itself, returns. The statement refuses,
+    // so the query is today's engine's.
+    for query in [r#"{ event.k * event.k != 5 }"#, r#"{ .k + 1 != .k }"#] {
+        match statement(&client_p, &parse_query(query), window, 100, 100).await {
+            Err(e) if e.contains("two occurrences") => {}
+            other => wrong.push(format!(
+                "{query}\n  want: a refusal naming two occurrences\n  got:  {:?}",
+                other.map(|o| written(&o, false))
+            )),
+        }
+    }
+    let five = |key: &str| format!("3333(1): 0004[{key}=Int 5]");
+    let two = |key: &str| format!("3333(1): 0004[{key}=Int 2]");
+    let s_rows = [
+        (r#"{ event.k / 5 >= 1 }"#, five("k")),
+        (r#"{ event.k % 2 = 1 }"#, five("k")),
+        (r#"{ event.k ^ 2 > 10 }"#, five("k")),
+        (r#"{ link.lk / 5 >= 1 }"#, five("lk")),
+        (r#"{ link.lk % 2 = 1 }"#, five("lk")),
+        (r#"{ link.lk ^ 2 > 10 }"#, five("lk")),
+        (r#"{ .k / 5 >= 1 }"#, five("k")),
+        (r#"{ .k % 2 = 1 }"#, five("k")),
+        (r#"{ .k ^ 2 > 10 }"#, five("k")),
+        // A set field compared with itself projects the first element
+        // carrying it; `2 < 5` and `5 > 2` are the pairs that hold.
+        (r#"{ event.k < event.k }"#, two("k")),
+        (r#"{ event.k > event.k }"#, two("k")),
+        (r#"{ link.lk < link.lk }"#, two("lk")),
+        (r#"{ link.lk > link.lk }"#, two("lk")),
+        (r#"{ .k < .k }"#, two("k")),
+        (r#"{ .k > .k }"#, two("k")),
+    ];
+    for (query, want) in s_rows {
+        check(
+            &mut wrong,
+            query,
+            written(&ask(&client_s, query, window).await, false),
+            &want,
+        );
+    }
+    for db in [&db_p, &db_s] {
         drop_db(db).await;
     }
     assert!(

@@ -226,8 +226,11 @@ const CONTROL: &str = "with_binding_control.txt";
 ///
 /// **Issue #591 part 1 moves them 137 -> 143 and 401 -> 407: SIX
 /// `traces_spans_search` goldens added, one statement each.**
-const SQL_FILES: usize = 143;
-const SQL_STATEMENTS: usize = 407;
+///
+/// **Issue #591 part 2 moves them 143 -> 147 and 407 -> 411: FOUR
+/// `traces_spans_search` goldens added, one statement each.**
+const SQL_FILES: usize = 147;
+const SQL_STATEMENTS: usize = 411;
 const PROMQL_ENTRIES: usize = 30;
 const PROMQL_STATEMENTS: usize = 55;
 const CONTROL_STATEMENTS: usize = 1;

@@ -272,9 +272,7 @@ use pulsus_read::traces::spans::predicate::{
     compile_span_predicate_in, span_membership_sql,
 };
 use pulsus_read::traces::spans::projection::Projection;
-use pulsus_read::traces::spans::search::{
-    SearchFilter, compile_search, compile_search_filter, search_sql,
-};
+use pulsus_read::traces::spans::search::{SearchFilter, compile_search, search_sql};
 use pulsus_read::traces::window_sql::WindowSql;
 use pulsus_traceql::{
     AttrScope, ComparisonOp, Field, FieldExpr, FieldOp, Intrinsic, SpansetExpr, SpansetFilter,
@@ -4563,82 +4561,87 @@ fn g1_window() -> WindowSql {
     WindowSql::start_closed_end_open(1_790_084_801_000_000_000, 1_790_095_601_000_000_000)
 }
 
-/// The search goldens: file stem, query, `limit`, `spss`, and whether the
-/// query's projection is part 2's, so the golden renders the statement
-/// with no projection (issue #591 part 1's section 8.1).
-const SEARCH_GOLDENS: [(&str, &str, u32, u32, bool); 13] = [
-    ("match_all", "{}", 20, 3, false),
+/// The search goldens: file stem, query, `limit` and `spss`. Every one
+/// renders through `compile_search`, its projection included: issue #591
+/// part 2 serves the off-row projections `resource_attribute` and
+/// `event_intrinsic` waited for, and adds the four after `instrumentation`.
+const SEARCH_GOLDENS: [(&str, &str, u32, u32); 17] = [
+    ("match_all", "{}", 20, 3),
     (
         "service",
         r#"{ resource.service.name = "checkout" }"#,
         20,
         3,
-        false,
     ),
     (
         "span_attribute",
         r#"{ span.http.response.status_code >= 500 }"#,
         20,
         3,
-        false,
     ),
     (
         "resource_attribute",
         r#"{ resource.k8s.pod.name =~ "checkout.*" }"#,
         20,
         3,
-        true,
     ),
-    (
-        "event_intrinsic",
-        r#"{ event:name = "exception" }"#,
-        20,
-        3,
-        true,
-    ),
-    ("demand", r#"{ !span.app.cache.hit }"#, 20, 3, false),
-    ("limits", "{}", 5, 10, false),
+    ("event_intrinsic", r#"{ event:name = "exception" }"#, 20, 3),
+    ("demand", r#"{ !span.app.cache.hit }"#, 20, 3),
+    ("limits", "{}", 5, 10),
     (
         "spanset_and",
         r#"{ resource.service.name = "checkout" } && { status = error }"#,
         20,
         3,
-        false,
     ),
     (
         "spanset_or",
         r#"{ resource.service.name = "frontend" } || { span.http.response.status_code >= 500 }"#,
         20,
         3,
-        false,
     ),
     (
         "spanset_nested",
         r#"{ span.a = 1 } || { span.b = 2 } && { span.c = 3 }"#,
         20,
         3,
-        false,
     ),
     (
         "name_and_kind",
         r#"{ name =~ "GET.*" && kind = client }"#,
         20,
         3,
-        false,
     ),
     (
         "literal_and_stored",
         r#"{ span.app.user.id = "u-10013" || span.app.discount.ratio > 0.45 }"#,
         20,
         3,
-        false,
     ),
     (
         "instrumentation",
         r#"{ instrumentation.otel.scope.build = "release" && instrumentation:name = "otel" }"#,
         20,
         3,
-        false,
+    ),
+    (
+        "unscoped_span",
+        r#"{ .http.response.status_code >= 500 }"#,
+        20,
+        3,
+    ),
+    (
+        "unscoped_resource",
+        r#"{ .k8s.pod.name =~ "checkout.*" }"#,
+        20,
+        3,
+    ),
+    ("event_element", r#"{ event.retry.count > 1 }"#, 20, 3),
+    (
+        "link_element",
+        r#"{ link.messaging.kafka.offset > 0 }"#,
+        20,
+        3,
     ),
 ];
 
@@ -4649,10 +4652,8 @@ fn search_golden_dir() -> std::path::PathBuf {
         .join("traces_spans_search")
 }
 
-/// One golden's text: two comment lines, then the one statement. A query
-/// whose projection is part 2's renders through `search_sql` with no
-/// projection, and its second line says so.
-fn search_golden(stem: &str, query: &str, limit: u32, spss: u32, no_projection: bool) -> String {
+/// One golden's text: two comment lines, then the one statement.
+fn search_golden(stem: &str, query: &str, limit: u32, spss: u32) -> String {
     let w = g1_window();
     let ctx = PredicateCtx {
         window: w,
@@ -4660,22 +4661,6 @@ fn search_golden(stem: &str, query: &str, limit: u32, spss: u32, no_projection: 
     };
     let parsed =
         pulsus_traceql::parse(query).unwrap_or_else(|e| panic!("{query} must parse: {e:?}"));
-    if no_projection {
-        let filter = compile_search_filter(&parsed.spanset, &ctx)
-            .unwrap_or_else(|e| panic!("{query} must compile: {e}"));
-        return format!(
-            "-- case: {stem}\n-- q: {query} limit={limit} spss={spss} projection=none\n{}\n",
-            search_sql(
-                "spans",
-                "traces",
-                w,
-                &filter,
-                &Projection::none(),
-                limit,
-                spss
-            )
-        );
-    }
     let statement = compile_search(&parsed, &ctx, "spans", "traces", limit, spss)
         .unwrap_or_else(|e| panic!("{query} must compile: {e}"));
     format!(
@@ -4684,18 +4669,18 @@ fn search_golden(stem: &str, query: &str, limit: u32, spss: u32, no_projection: 
     )
 }
 
-/// The seven goldens of `golden/traces_spans_search/`, byte for byte,
+/// The seventeen goldens of `golden/traces_spans_search/`, byte for byte,
 /// collected and asserted once.
 #[test]
 fn search_statement_goldens_match() {
     let mut missing: Vec<String> = Vec::new();
     let mut drifted: Vec<String> = Vec::new();
-    for (stem, query, limit, spss, none) in SEARCH_GOLDENS {
+    for (stem, query, limit, spss) in SEARCH_GOLDENS {
         let path = search_golden_dir().join(format!("{stem}.sql"));
         match std::fs::read_to_string(&path) {
             Err(e) => missing.push(format!("{stem} ({path:?}: {e})")),
             Ok(expected) => {
-                if search_golden(stem, query, limit, spss, none) != expected {
+                if search_golden(stem, query, limit, spss) != expected {
                     drifted.push(format!("{stem} ({path:?})"));
                 }
             }
@@ -4720,9 +4705,9 @@ fn search_statement_goldens_match() {
 fn regenerate_search_statement_goldens() {
     let dir = search_golden_dir();
     std::fs::create_dir_all(&dir).expect("create golden dir");
-    for (stem, query, limit, spss, none) in SEARCH_GOLDENS {
+    for (stem, query, limit, spss) in SEARCH_GOLDENS {
         let path = dir.join(format!("{stem}.sql"));
-        std::fs::write(&path, search_golden(stem, query, limit, spss, none))
+        std::fs::write(&path, search_golden(stem, query, limit, spss))
             .unwrap_or_else(|e| panic!("write {path:?}: {e}"));
     }
 }
@@ -4761,16 +4746,21 @@ fn compile_search_of(
     compile_search(&parsed, &ctx(), "spans", "traces", 20, 3)
 }
 
-/// Section 8.2: what parts 2 and 3 and issues #592–#594 serve is refused,
-/// each naming its target.
+/// Section 8.2: what part 3 and issues #592–#594 serve is refused, each
+/// naming its target, and part 2's one residual (its section 3.6).
 #[test]
 fn compile_search_refuses_what_parts_two_and_three_serve() {
     for (query, target) in [
-        (r#"{ .a = 1 }"#, "#591 part 2"),
-        (r#"{ resource.k = "x" }"#, "#591 part 2"),
-        (r#"{ event.k = "x" }"#, "#591 part 2"),
-        (r#"{ link.k = "x" }"#, "#591 part 2"),
-        (r#"{ event:name = "x" }"#, "#591 part 2"),
+        // Issue #591 part 2's section 3.6: one set field twice in a
+        // comparison holding arithmetic has no single element to project.
+        (r#"{ event.k * event.k > 5 }"#, "two occurrences"),
+        (r#"{ .k + 1 > .k }"#, "two occurrences"),
+        // The same under `!=`, which projects nothing but must still be
+        // refused: the predicate matches any pair, today's engine each
+        // element against itself (code review round 1 of part 2).
+        (r#"{ event.k * event.k != 5 }"#, "two occurrences"),
+        (r#"{ .k + 1 != .k }"#, "two occurrences"),
+        (r#"{ link.lk - link.lk != 0 }"#, "two occurrences"),
         (r#"{ .a = 1 } | count() > 1"#, "#592"),
         (r#"{ .a = 1 } > { .b = 2 }"#, "#593"),
         (r#"({ .a = 1 } > { .b = 2 }) && { .c = 3 }"#, "#593"),
@@ -4792,15 +4782,28 @@ fn compile_search_refuses_what_parts_two_and_three_serve() {
     }
 }
 
-/// Section 8.2: a query whose off-row fields project nothing compiles.
+/// Section 8.2: a query whose off-row fields project nothing compiles,
+/// and issue #591 part 2's section 7.1: so does one that projects an
+/// off-row value.
 #[test]
-fn compile_search_serves_what_projects_nothing_off_the_row() {
+fn compile_search_serves_off_row_projections() {
     for query in [
         r#"{ .env != "prod" }"#,
         r#"{ resource.k !~ "x" }"#,
         r#"{ .a = nil }"#,
         r#"{ .a = .b }"#,
         r#"{ !(.a = 1) }"#,
+        r#"{ .a = 1 }"#,
+        r#"{ resource.k = "x" }"#,
+        r#"{ event.k = "x" }"#,
+        r#"{ link.k = "x" }"#,
+        r#"{ event:name = "x" }"#,
+        r#"{ resource.k * 2 > 5 }"#,
+        r#"{ event.k * 2 > 5 }"#,
+        r#"{ .k * 2 > 5 }"#,
+        r#"{ event.k = event.k }"#,
+        r#"{ event:timeSinceStart * 2 > 3ms }"#,
+        r#"{ event:name = event:name }"#,
     ] {
         if let Err(e) = compile_search_of(query) {
             panic!("{query} must compile: {e}");
