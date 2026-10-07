@@ -90,13 +90,13 @@ Rust file — so writing a fingerprint straight into SQL is a compile error. Two
 further down the read path do emit fingerprint SQL, `SqlExpr` and `Pred` in
 `crates/pulsus-read/src/compile/fold.rs:83,535`; both write out a string the mint rendered earlier.
 
-- **Metrics:** the fingerprint is the **series ID** (issue #623): the top 24 bits of
-  `cityHash64(metric_name)`, then the low 104 bits of `fp128` over `metric_name \xff` followed by
+- **Metrics:** the fingerprint is the **series ID** (issue #623): the top 32 bits of
+  `cityHash64(metric_name)`, then the low 96 bits of `fp128` over `metric_name \xff` followed by
   the label set serialized as `key \xff value \xff ...`, keys sorted and `__name__` excluded. One
   label set under two names is two series; a metric's series share the name prefix, so they sort
   together under the samples' `(fingerprint, unix_milli)` key; the ID is stable across label
   reordering and the samples table stays string-free. The prefix is `bitShiftRight(cityHash64(name),
-  40)` on the server, pinned by `crates/pulsus-model/tests/live_cityhash.rs`.
+  32)` on the server, pinned by `crates/pulsus-model/tests/live_cityhash.rs`.
 - **Logs and profiles:** the buffer is a single canonical buffer — each sorted label appended as `key ++ 0xFF ++ value ++ 0xFF` — with the leading 64 bits computed by an implementation **bit-identical to ClickHouse's `cityHash64`** (ClickHouse's frozen CityHash 1.0.2 variant, not upstream CityHash 1.1). The writer is the sole fingerprint authority (the label-index MV only fans out the writer's fingerprint), but bit-identity keeps server-side derivation possible (`cityHash64(concat(...))` over the same buffer) and is enforced by a live cross-check test against `SELECT cityHash64(unhex(...))`.
 - **Traces carry no label fingerprint** (this supersedes earlier revisions of this section, which listed traces alongside logs/profiles — ratified with the M4 schema, issue #53/#54): a span's identity is `(trace_id, span_id)`, the attribute index keys on `(key, val, scope, timestamp_ns, trace_id, span_id)`, and distribution shards by `cityHash64(trace_id)` — a server-side expression over a physical column, never a writer-generated label-set fingerprint.
 
@@ -126,7 +126,7 @@ All DDL is written once, in `schema/schema.sql`, and applied by `schema/schema.s
 
 ### 3.1 Metrics
 
-Flat, ID-keyed layout ([schemas.md §2](schemas.md)): `metric_samples` ordered `(fingerprint, unix_milli)` with no string data on the hot path, where the fingerprint is the **series ID** — the top 24 bits of `cityHash64(metric_name)`, then the low bits of the hash of the name and the labels (issue #623) — so one metric's series sort together; `metric_labels`, the **lookup** (each series' name and label set once, keyed `(metric_name, fingerprint)`, with its first and last hour seen); `metric_series`, the **activity** (one row per series per UTC day, a 24-bit mask of the hours it had samples in); and `metric_metadata` (metric types, which also license counter functions on rollup tiers). Every name and label matcher runs on the lookup, a key range per metric name, and yields IDs; the activity table answers the window; the sample tables are read only with an exact ID list and a time range.
+Flat, ID-keyed layout ([schemas.md §2](schemas.md)): `metric_samples` ordered `(fingerprint, unix_milli)` with no string data on the hot path, where the fingerprint is the **series ID** — the top 32 bits of `cityHash64(metric_name)`, then the low bits of the hash of the name and the labels (issue #623) — so one metric's series sort together; `metric_labels`, the **lookup** (each series' name and label set once, keyed `(metric_name, fingerprint)`, with its first and last hour seen); `metric_series`, the **activity** (one row per series per UTC day, a 24-bit mask of the hours it had samples in); and `metric_metadata` (metric types, which also license counter functions on rollup tiers). Every name and label matcher runs on the lookup, a key range per metric name, and yields IDs; the activity table answers the window; the sample tables are read only with an exact ID list and a time range.
 
 Decisions and their reasons:
 

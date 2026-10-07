@@ -44,7 +44,7 @@ The schema's PromQL obligation is **fetch shapes, plus one reduction**: full Pro
 
 ```sql
 CREATE TABLE metric_samples (
-    fingerprint  UInt128   CODEC(Delta(8), ZSTD(1)),   -- the series ID
+    fingerprint  UInt128   CODEC(ZSTD(1)),   -- the series ID
     unix_milli   Int64    CODEC(DoubleDelta, ZSTD(1)),
     value        Float64  CODEC(Gorilla, ZSTD(1))
 ) ENGINE = MergeTree
@@ -55,7 +55,7 @@ SETTINGS ttl_only_drop_parts = 1,
          primary_key_ratio_of_unique_prefix_values_to_skip_suffix_columns = 1;
 ```
 
-- **The series ID leads the key** (issue #623). `fingerprint` is the series ID: the top 24 bits of `cityHash64(metric_name)`, then the low 104 bits of the 128-bit hash of `metric_name ++ 0xFF ++` the label buffer (`pulsus_model::series_fingerprint`). One label set under two names is two series, and a metric's series share the name prefix, so they sort together as they did when `metric_name` led the key: reading one metric's IDs reads one key range. Measured: 1,000 IDs of one of 200 metrics, a day merged into one part, read 81,920 sample rows; a uniform hash puts them in about 763 granules, 6.25 million rows. Two names sharing a prefix share their granules; identity is unaffected.
+- **The series ID leads the key** (issue #623). `fingerprint` is the series ID: the top 32 bits of `cityHash64(metric_name)`, then the low 96 bits of the 128-bit hash of `metric_name ++ 0xFF ++` the label buffer (`pulsus_model::series_fingerprint`). One label set under two names is two series, and a metric's series share the name prefix, so they sort together as they did when `metric_name` led the key: reading one metric's IDs reads one key range. Measured: 1,000 IDs of one of 200 metrics, a day merged into one part, read 81,920 sample rows; a uniform hash puts them in about 763 granules, 6.25 million rows. Two names sharing a prefix share their granules; identity is unaffected. Among 100,000 names about one pair is expected to share a 32-bit prefix (298 pairs at 24 bits); two names sharing a prefix each read the other's samples in that range, and no series is merged (issue #635).
 - **Sample tables are read only with an exact ID list and a time range.** Every flexible match — the metric name, regexes, label matchers — runs on the lookup table below, which yields the IDs.
 - **Each series is contiguous** → per-series reads (every PromQL evaluation) are sequential scans of a few granules.
 - **Daily partitions** on the raw table: retention drops whole partitions (`ttl_only_drop_parts`), and time predicates prune partitions before the index is even consulted.
@@ -348,7 +348,7 @@ The M7 extension foreshadowed in §2 lands as a **separate, dedicated samples ta
 
 ```sql
 CREATE TABLE metric_hist_samples (
-    fingerprint        UInt128   CODEC(Delta(8), ZSTD(1)),
+    fingerprint        UInt128   CODEC(ZSTD(1)),
     unix_milli         Int64    CODEC(DoubleDelta, ZSTD(1)),
     schema             Int8     CODEC(ZSTD(1)),   -- exponential schema (−4..8); −53 = NHCB
     zero_threshold     Float64  CODEC(Gorilla, ZSTD(1)),
