@@ -285,7 +285,8 @@ struct SeedLabelRow {
 }
 
 /// Seeds `fx` the way the write path's views fill the tables: one activity
-/// row and one label row per series, then the samples.
+/// row and one label row per series, the label index rows, then the
+/// samples.
 pub async fn seed(client: &ChClient, fx: &[SeedSeries], seen_ms: i64) {
     let bucket = (seen_ms / ACTIVITY_BUCKET_MS) * ACTIVITY_BUCKET_MS;
     let activity: Vec<SeedActivityRow> = fx
@@ -322,6 +323,22 @@ pub async fn seed(client: &ChClient, fx: &[SeedSeries], seen_ms: i64) {
         .insert_block("metric_labels", &labels)
         .await
         .expect("seed metric_labels");
+    // Issue #635: the label index, as its two views derive it from the
+    // same kind-2 row — a selector with no metric name and no `__name__`
+    // matcher resolves through it.
+    for sql in [
+        "INSERT INTO metric_label_index (key, value, fingerprint) \
+         SELECT kv.1, kv.2, fingerprint FROM metric_labels \
+         ARRAY JOIN JSONExtractKeysAndValues(labels, 'String') AS kv",
+        "INSERT INTO metric_label_values (key, value) \
+         SELECT DISTINCT kv.1, kv.2 FROM metric_labels \
+         ARRAY JOIN JSONExtractKeysAndValues(labels, 'String') AS kv",
+    ] {
+        client
+            .execute(sql, &QuerySettings::new(), Idempotency::NonIdempotent)
+            .await
+            .unwrap_or_else(|e| panic!("seed the label index: {e}"));
+    }
     let samples: Vec<SeedSampleRow> = fx
         .iter()
         .flat_map(|s| {
