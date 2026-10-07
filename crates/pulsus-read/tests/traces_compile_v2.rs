@@ -4862,3 +4862,81 @@ fn the_projection_is_bounded() {
         Ok(_) => panic!("256 projection groups must be refused"),
     }
 }
+
+// =====================================================================
+// Issue #591 part 3 — the fork routes by the plan
+// =====================================================================
+
+/// The plan today's planner makes for `query` over [`g1_window`], with the
+/// search defaults.
+fn fork_plan(query: &str) -> pulsus_read::SearchPlan {
+    use pulsus_read::SpanFilterCtx;
+    use pulsus_read::traces::search_plan::{SearchCtx, SearchParams, plan_search};
+    let parsed =
+        pulsus_traceql::parse(query).unwrap_or_else(|e| panic!("{query} must parse: {e:?}"));
+    plan_search(
+        &parsed,
+        &SearchParams {
+            start_ns: 1_790_084_801_000_000_000,
+            end_ns: 1_790_095_601_000_000_000,
+            limit: 20,
+            spss: 3,
+        },
+        &SearchCtx {
+            filter: SpanFilterCtx {
+                spans_table: "trace_spans",
+                attrs_table: "trace_attrs_idx",
+            },
+            recent_table: "trace_recent",
+            errors_table: "trace_error_spans",
+            max_candidates: 100_000,
+            max_series: 1_000,
+            distributed: false,
+        },
+    )
+    .unwrap_or_else(|e| panic!("{query} must plan: {e:?}"))
+}
+
+/// Section 6.1: `plan_statement` refuses every shape of section 3.1's
+/// table that reaches it — a `|` stage, a structural operator, a
+/// nested-set or trace-level intrinsic, part 2's residual set shapes — and
+/// gives a statement for a covered search.
+#[test]
+fn the_fork_routes_by_the_plan() {
+    use pulsus_read::traces::spans::search::plan_statement;
+    let mut wrong = Vec::new();
+    for query in [
+        r#"{ .a = 1 } | count() > 1"#,
+        r#"{ .a = 1 } | select(name)"#,
+        r#"{ .a = 1 } | coalesce()"#,
+        r#"{ .a = 1 } > { .b = 2 }"#,
+        r#"{ nestedSetLeft > 0 }"#,
+        r#"{ nestedSetParent < 0 }"#,
+        r#"{ traceDuration > 1s }"#,
+        r#"{ span:childCount > 2 }"#,
+        r#"{ event.k * event.k > 5 }"#,
+        r#"{ .k + 1 > .k }"#,
+        r#"{ link.lk - link.lk != 0 }"#,
+        r#"{ (event.k = 1) = true }"#,
+        r#"{ !event.k = false }"#,
+    ] {
+        if plan_statement(&fork_plan(query), "spans", "traces", "resources").is_some() {
+            wrong.push(format!(
+                "{query}: served by the statement, must be today's engine's"
+            ));
+        }
+    }
+    for query in [
+        r#"{ event.k * 2 > 5 }"#,
+        r#"{ .k = .k }"#,
+        r#"{ span.k = "x" }"#,
+        "{}",
+    ] {
+        if plan_statement(&fork_plan(query), "spans", "traces", "resources").is_none() {
+            wrong.push(format!(
+                "{query}: today's engine's, must be the statement's"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
