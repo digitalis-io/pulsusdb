@@ -2069,7 +2069,7 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
     // activity reads — a regex matcher on the lookup and its probe line on
     // the activity read, in both files. No production renderer is added:
     // the matchers still render in the sealed leaf.
-    ("pulsus-read/src/metrics/series_where.rs", 18),
+    ("pulsus-read/src/metrics/series_where.rs", 26),
     ("pulsus-read/src/metrics/sql.rs", 20),
     ("pulsus-read/src/traces/filter.rs", 12),
     ("pulsus-read/src/traces/search_plan.rs", 2),
@@ -2093,7 +2093,7 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
 
 /// The separately-asserted total, so "a file appeared" reads differently
 /// from "a file grew".
-const MATCH_RENDER_TOTAL: usize = 90;
+const MATCH_RENDER_TOTAL: usize = 98;
 
 /// Every string-literal CONTENT in a Rust source: ordinary `"…"`, raw
 /// `r"…"`/`r#"…"#`, byte `b"…"` and byte-raw. Comments are dropped.

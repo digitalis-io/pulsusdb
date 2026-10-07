@@ -44,7 +44,7 @@ use pulsus_model::FpLiteral;
 use crate::logql::escape::ch_string;
 
 use super::matcher::{DataWindow, DiscoveryFilter, LabelMatcher};
-use super::series_where::{Lookup, SeriesWhere};
+use super::series_where::{Lookup, SeriesTables, SeriesWhere};
 
 /// `metric_name = '<name>'`: one metric's scope on the lookup (issue #623).
 fn name_scope(metric_name: &str) -> String {
@@ -92,10 +92,21 @@ fn series_read(
     )
 }
 
+/// The lookup route's tables (issue #635): no label index, so every read
+/// renders today's lookup statement.
+fn lookup_tables<'a>(series_table: &'a str, labels_table: &'a str) -> SeriesTables<'a> {
+    SeriesTables {
+        series: series_table,
+        labels: labels_table,
+        label_index: None,
+        label_values: None,
+    }
+}
+
 /// The sweep's statement (`super::refresh`): statement 2 with no matcher,
 /// every series active in the cache window with its own name and labels.
 pub fn sweep_query(series_table: &str, labels_table: &str, window: DataWindow) -> String {
-    series_read(window, &[], &[], &[]).with_labels(series_table, labels_table)
+    series_read(window, &[], &[], &[]).with_labels(lookup_tables(series_table, labels_table))
 }
 
 /// Statement 1 (issue #623): the IDs of `metric_name`'s series that
@@ -114,7 +125,7 @@ pub fn historical_series_subquery(
     format!(
         "SELECT fingerprint\n{}",
         series_read(window, &[name_scope(metric_name)], &[], matchers)
-            .ids_from_where(series_table, labels_table)
+            .ids_from_where(lookup_tables(series_table, labels_table))
     )
 }
 
@@ -158,7 +169,7 @@ pub fn historical_resolution_query(
     matchers: &[LabelMatcher],
 ) -> String {
     series_read(window, &[name_scope(metric_name)], &[], matchers)
-        .with_labels(series_table, labels_table)
+        .with_labels(lookup_tables(series_table, labels_table))
 }
 
 /// Statement 4 (issue #623): `fingerprint, metric_name, labels` for an
@@ -205,7 +216,51 @@ pub fn discovery_query(
     filter: &DiscoveryFilter,
     window: DataWindow,
 ) -> String {
-    discovery_read(filter, window).with_labels(series_table, labels_table)
+    discovery_read(filter, window).with_labels(lookup_tables(series_table, labels_table))
+}
+
+/// [`discovery_query`] over `t` (issue #635): a name-less filter with a
+/// positive label matcher reads its IDs from the label index when `t`
+/// names it; every other filter renders [`discovery_query`]'s text.
+pub(super) fn discovery_series_query(
+    t: SeriesTables<'_>,
+    filter: &DiscoveryFilter,
+    window: DataWindow,
+) -> String {
+    discovery_read(filter, window).with_labels(t)
+}
+
+/// [`discovery_distinct_names_query`] over `t` (issue #635).
+pub(super) fn discovery_names_query(
+    t: SeriesTables<'_>,
+    filter: &DiscoveryFilter,
+    window: DataWindow,
+) -> String {
+    format!(
+        "SELECT DISTINCT metric_name\n{}\nORDER BY metric_name",
+        discovery_read(filter, window).ids_from_where(t)
+    )
+}
+
+/// Issue #635: `/labels` for one name-less filter, answered from the label
+/// index — the distinct keys of the series `filter` selects in `window`.
+pub(super) fn discovery_label_names_query(
+    t: SeriesTables<'_>,
+    filter: &DiscoveryFilter,
+    window: DataWindow,
+) -> String {
+    discovery_read(filter, window).label_keys(t)
+}
+
+/// Issue #635: `/label/{key}/values` for one name-less filter, answered
+/// from the label index.
+pub(super) fn discovery_label_values_query(
+    t: SeriesTables<'_>,
+    key: &str,
+    filter: &DiscoveryFilter,
+    window: DataWindow,
+) -> String {
+    discovery_read(filter, window).label_values(key, t)
 }
 
 /// The one series read [`discovery_query`] and
@@ -246,7 +301,7 @@ pub fn discovery_distinct_names_query(
 ) -> String {
     format!(
         "SELECT DISTINCT metric_name\n{}\nORDER BY metric_name",
-        discovery_read(filter, window).ids_from_where(series_table, labels_table)
+        discovery_read(filter, window).ids_from_where(lookup_tables(series_table, labels_table))
     )
 }
 
@@ -266,7 +321,7 @@ pub fn discovery_fetch_multi(
     window: DataWindow,
 ) -> String {
     let scope = [names_scope(metric_names), ids_scope(fps)];
-    series_read(window, &scope, &[], &[]).with_labels(series_table, labels_table)
+    series_read(window, &scope, &[], &[]).with_labels(lookup_tables(series_table, labels_table))
 }
 
 /// Issue #96's degraded-cache discovery **probe**, statement 3 with the
@@ -295,7 +350,8 @@ pub fn distinct_metric_names_probe(
 ) -> String {
     format!(
         "SELECT DISTINCT metric_name\n{}\nORDER BY metric_name\nLIMIT {}",
-        series_read(window, &[], name_matchers, &[]).ids_from_where(series_table, labels_table),
+        series_read(window, &[], name_matchers, &[])
+            .ids_from_where(lookup_tables(series_table, labels_table)),
         fanout_cap.saturating_add(1)
     )
 }
@@ -316,7 +372,7 @@ pub fn discovery_fetch_by_names(
     window: DataWindow,
 ) -> String {
     series_read(window, &[names_scope(metric_names)], &[], matchers)
-        .with_labels(series_table, labels_table)
+        .with_labels(lookup_tables(series_table, labels_table))
 }
 
 /// `GET /api/v1/metadata` (issue #32): `metric_metadata` is a

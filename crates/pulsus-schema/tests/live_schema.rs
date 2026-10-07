@@ -894,6 +894,7 @@ async fn a_fresh_database_creates_every_fingerprint_column_as_uint128() {
         "log_streams",
         "log_streams_idx",
         "metric_hist_samples",
+        "metric_label_index",
         "metric_labels",
         "metric_landing",
         "metric_samples",
@@ -1102,6 +1103,8 @@ async fn metric_landing_and_its_views_exist_after_init() {
         "metric_series_mv",
         "metric_metadata_mv",
         "metric_labels_mv",
+        "metric_label_index_mv",
+        "metric_label_values_mv",
     ] {
         assert!(
             names.contains(&view.to_string()),
@@ -1149,6 +1152,7 @@ async fn the_sample_tables_fingerprint_codec_is_zstd() {
 
     let want: Vec<(String, String)> = [
         ("metric_hist_samples", "CODEC(ZSTD(1))"),
+        ("metric_label_index", "CODEC(ZSTD(1))"),
         ("metric_labels", "CODEC(Delta(8), ZSTD(1))"),
         ("metric_landing", "CODEC(Delta(8), ZSTD(1))"),
         ("metric_samples", "CODEC(ZSTD(1))"),
@@ -1159,6 +1163,65 @@ async fn the_sample_tables_fingerprint_codec_is_zstd() {
     .collect();
     assert_eq!(seen, want, "every metrics table's fingerprint codec");
 
+    drop_database(&client, db).await;
+}
+
+/// **Issue #635: a kind-2 landing row fills the label index and its
+/// values table.** One row per label in `metric_label_index`, one row per
+/// pair in `metric_label_values`, an empty value included; a sample row
+/// writes neither.
+#[tokio::test]
+async fn a_kind_2_row_fills_the_label_index_and_its_values() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_label_index");
+    drop_database(&client, db).await;
+    run_init(&client, &test_ctx(db)).await.expect("run_init");
+    let names = table_names(&client, db).await;
+    for name in [
+        "metric_label_index",
+        "metric_label_values",
+        "metric_label_index_mv",
+        "metric_label_values_mv",
+    ] {
+        assert!(names.contains(&name.to_string()), "{name}: {names:?}");
+    }
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.metric_landing \
+                 (received_ms, kind, metric_name, fingerprint, unix_milli, labels, value_type) \
+                 VALUES (1, 2, 'm', 7, 1000, '{{\"env\":\"\",\"job\":\"api\",\"zone\":\"z07\"}}', 0), \
+                        (1, 2, 'm', 8, 1000, '{{\"job\":\"api\"}}', 0), \
+                        (1, 0, 'm', 7, 1000, '', 0)"
+            ),
+            &QuerySettings::new(),
+            Idempotency::NonIdempotent,
+        )
+        .await
+        .expect("insert landing rows");
+    let index = client
+        .query_strings(
+            &format!(
+                "SELECT concat(key, '=', value, ' ', toString(fingerprint)) AS s \
+                 FROM {db}.metric_label_index ORDER BY s"
+            ),
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("read the index");
+    assert_eq!(index, ["env= 7", "job=api 7", "job=api 8", "zone=z07 7"]);
+    let values = client
+        .query_strings(
+            &format!(
+                "SELECT concat(key, '=', value) AS s \
+                 FROM {db}.metric_label_values ORDER BY s"
+            ),
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("read the values");
+    assert_eq!(values, ["env=", "job=api", "zone=z07"]);
     drop_database(&client, db).await;
 }
 
@@ -1291,6 +1354,8 @@ async fn dedup_settings_reach_the_landing_table_and_all_four_targets() {
         "metric_metadata",
         "metric_hist_samples",
         "metric_labels",
+        "metric_label_index",
+        "metric_label_values",
     ] {
         let create = create_table_query(&client, db, table).await;
         assert!(

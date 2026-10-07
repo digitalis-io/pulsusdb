@@ -12,7 +12,7 @@
 -- and never add a substitution that matches one.
 --
 -- A REPLICATION PATH NAMES ITS OWN TABLE. The paths are written out rather
--- than derived, so a wrong one is a per-table error. Nineteen tables take
+-- than derived, so a wrong one is a per-table error. Twenty-one tables take
 -- `/clickhouse/tables/{shard}/` and five take `/clickhouse/tables/all/`
 -- (docs/architecture.md §3). `tests/schema_file.rs` holds the relation.
 --
@@ -165,6 +165,29 @@ CREATE TABLE IF NOT EXISTS {{db}}.metric_labels{{on_cluster}}
 --@single  ENGINE = AggregatingMergeTree
 --@cluster ENGINE = ReplicatedAggregatingMergeTree('/clickhouse/tables/{shard}/{{db}}.metric_labels', '{replica}')
 ORDER BY (metric_name, fingerprint)
+--@single  SETTINGS index_granularity = 8192, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy}};
+--@cluster SETTINGS index_granularity = 8192, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
+
+CREATE TABLE IF NOT EXISTS {{db}}.metric_label_index{{on_cluster}}
+(
+    key LowCardinality(String),
+    value String CODEC(ZSTD(1)),
+    fingerprint UInt128 CODEC(ZSTD(1))
+)
+--@single  ENGINE = ReplacingMergeTree
+--@cluster ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/{{db}}.metric_label_index', '{replica}')
+ORDER BY (key, value, fingerprint)
+--@single  SETTINGS index_granularity = 8192, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy}};
+--@cluster SETTINGS index_granularity = 8192, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
+
+CREATE TABLE IF NOT EXISTS {{db}}.metric_label_values{{on_cluster}}
+(
+    key LowCardinality(String),
+    value String CODEC(ZSTD(1))
+)
+--@single  ENGINE = ReplacingMergeTree
+--@cluster ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/{{db}}.metric_label_values', '{replica}')
+ORDER BY (key, value)
 --@single  SETTINGS index_granularity = 8192, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy}};
 --@cluster SETTINGS index_granularity = 8192, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
 
@@ -614,6 +637,9 @@ TTL toDateTime(least(intDiv(last_start_ns, 1000000000) + ({{retention_days}} * 8
 --@cluster CREATE TABLE IF NOT EXISTS {{db}}.metric_labels{{dist_suffix}}{{on_cluster}} AS {{db}}.metric_labels
 --@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'metric_labels', cityHash64(fingerprint));
 
+--@cluster CREATE TABLE IF NOT EXISTS {{db}}.metric_label_index{{dist_suffix}}{{on_cluster}} AS {{db}}.metric_label_index
+--@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'metric_label_index', cityHash64(fingerprint));
+
 --@cluster CREATE TABLE IF NOT EXISTS {{db}}.metric_samples{{dist_suffix}}{{on_cluster}} AS {{db}}.metric_samples
 --@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'metric_samples', cityHash64(fingerprint));
 
@@ -730,6 +756,25 @@ AS SELECT
     unix_milli AS first_seen,
     unix_milli AS last_seen
 FROM {{db}}.metric_landing
+WHERE kind = 2;
+
+DROP VIEW IF EXISTS {{db}}.metric_label_index_mv{{on_cluster}};
+CREATE MATERIALIZED VIEW {{db}}.metric_label_index_mv{{on_cluster}} TO {{db}}.metric_label_index
+AS SELECT
+    kv.1 AS key,
+    kv.2 AS value,
+    fingerprint AS fingerprint
+FROM {{db}}.metric_landing
+ARRAY JOIN JSONExtractKeysAndValues(labels, 'String') AS kv
+WHERE kind = 2;
+
+DROP VIEW IF EXISTS {{db}}.metric_label_values_mv{{on_cluster}};
+CREATE MATERIALIZED VIEW {{db}}.metric_label_values_mv{{on_cluster}} TO {{db}}.metric_label_values
+AS SELECT DISTINCT
+    kv.1 AS key,
+    kv.2 AS value
+FROM {{db}}.metric_landing
+ARRAY JOIN JSONExtractKeysAndValues(labels, 'String') AS kv
 WHERE kind = 2;
 
 DROP VIEW IF EXISTS {{db}}.metric_metadata_mv{{on_cluster}};

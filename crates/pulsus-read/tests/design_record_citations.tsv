@@ -207,6 +207,7 @@ docs/query-to-sql.md	crates/pulsus-read/src/logql/pipeline.rs:3050	crates/pulsus
 docs/query-to-sql.md	crates/pulsus-read/src/logql/pipeline.rs:3101	crates/pulsus-read/src/logql/pipeline.rs	3101		line	is_ascii_digit	.find(|c: char| !(c.is_ascii_digit() || c == '.'))
 docs/query-to-sql.md	crates/pulsus-read/src/logql/pipeline.rs:6428	crates/pulsus-read/src/logql/pipeline.rs	6428		line	serde_json	serde_json::Value::Number(n) => n.to_string(),
 docs/query-to-sql.md	crates/pulsus-read/src/logql/sql.rs:1216	crates/pulsus-read/src/logql/sql.rs	1216		line	formation	/// full-body `tie_rank` order is imposed in Rust at group formation. And
+docs/query-to-sql.md	crates/pulsus-read/src/logql/sql.rs:1216-1239	crates/pulsus-read/src/logql/sql.rs	1216	1239	prose	metric_raw_samples_sliding	metric_raw_samples_sliding
 docs/query-to-sql.md	crates/pulsus-read/src/logql/sql.rs:711	crates/pulsus-read/src/logql/sql.rs	711		line	streams_table	pub fn stage2(streams_table: &str, fingerprints: &[FpLiteral]) -> String {
 docs/query-to-sql.md	crates/pulsus-read/src/querytext.rs:52	crates/pulsus-read/src/querytext.rs	52		line	MAX_QUERY_TEXT_BYTES	pub const MAX_QUERY_TEXT_BYTES: u64 = 8 * 1024 * 1024;
 docs/query-to-sql.md	crates/pulsus-read/src/traces/exec.rs:3237	crates/pulsus-read/src/traces/exec.rs	3237		prose	generator_settings	generator_settings
@@ -341,7 +342,6 @@ docs/query-to-sql.md	search_sql.rs:718	crates/pulsus-read/src/traces/search_sql.
 docs/query-to-sql.md	search_sql.rs:742	crates/pulsus-read/src/traces/search_sql.rs	742		prose	child_count_sql	child_count_sql
 docs/query-to-sql.md	sql.rs:109	crates/pulsus-read/src/logql/sql.rs	109		prose	RollupBytes	sum(bytes)
 docs/query-to-sql.md	sql.rs:1123-1129	crates/pulsus-read/src/logql/sql.rs	1123	1129	prose	WithStructuredMetadata	structured_metadata
-docs/query-to-sql.md	sql.rs:1216-1239	crates/pulsus-read/src/logql/sql.rs	1216	1239	prose	metric_raw_samples_sliding	metric_raw_samples_sliding
 docs/query-to-sql.md	sql.rs:1303	crates/pulsus-read/src/logql/sql.rs	1303		prose	metric_range_bucketed	metric_range_bucketed
 docs/query-to-sql.md	sql.rs:1571	crates/pulsus-read/src/logql/sql.rs	1571		prose	metric_range_unwrapped	metric_range_unwrapped
 docs/query-to-sql.md	sql.rs:1634	crates/pulsus-read/src/logql/sql.rs	1634		prose	metric_range_unwrapped_rows	metric_range_unwrapped_rows

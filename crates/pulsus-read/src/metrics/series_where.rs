@@ -46,7 +46,7 @@
 //!
 //! # Boundary inventory
 //!
-//! Nine declarations carry a visibility modifier, pinned by the in-file
+//! Eighteen declarations carry a visibility modifier, pinned by the in-file
 //! census test `the_boundary_inventory_is_pinned` because a
 //! hand-maintained inventory here was wrong once (review round 3 found
 //! it listing three of the six). That pin reads `pub`-prefixed lines and
@@ -64,6 +64,12 @@
 //!   whole.
 //! * [`SeriesWhere::with_labels`] — statement 2, whole. The probe is in
 //!   the activity read of both, so it cannot be dropped from a regex.
+//! * [`SeriesWhere::label_keys`] — `/labels` over the label index, whole
+//!   (issue #635).
+//! * [`SeriesWhere::label_values`] — `/label/{name}/values` over the label
+//!   index, whole (issue #635).
+//! * [`SeriesTables`] — the tables a read names (`pub(super)`, with four
+//!   `pub(super)` fields): table names, nothing renderable.
 //! * [`Lookup`] — `activity`'s input (`pub(super)`), with three
 //!   `pub(super)` fields: a scope's predicates and the two matcher sets.
 //!   It carries no rendered matcher, so it yields nothing renderable.
@@ -128,7 +134,7 @@
 
 use crate::logql::escape::{ch_regex_anchored_promql_re2, ch_string};
 
-use super::matcher::{DataWindow, LabelMatcher, MatchOp};
+use super::matcher::{DataWindow, LabelMatcher, MatchOp, matches_empty};
 
 /// Capability token (issue #240). Possession proves the caller is on the
 /// PromQL fallback path, where ClickHouse's RE2 — not the Rust `regex`
@@ -177,6 +183,17 @@ pub(super) enum MatcherTarget {
     /// `__name__` matchers, which address the lookup's **`metric_name`
     /// column** — never a stored label (docs/schemas.md §2.1).
     MetricNameColumn,
+}
+
+/// The tables a series read names (issue #635): the activity table, the
+/// lookup, and the label index with its values table. Both index tables are
+/// `None` where a read must not use them; the index route needs both.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct SeriesTables<'a> {
+    pub(super) series: &'a str,
+    pub(super) labels: &'a str,
+    pub(super) label_index: Option<&'a str>,
+    pub(super) label_values: Option<&'a str>,
 }
 
 /// What a series read matches on the lookup table (issue #623): the
@@ -231,6 +248,12 @@ pub(super) struct SeriesWhere {
     /// The lookup read's conditions: the scope, then one predicate per
     /// matcher. Empty when the read has neither.
     lookup: Vec<String>,
+    /// Issue #635: the label matchers in order, each with whether it
+    /// matches the empty string — `Some` only when the read may take the
+    /// index route: no scope, no `__name__` matcher, every regex's verdict
+    /// decided in-process, and at least one matcher that does not match
+    /// `""`. Rendered on the index only when both index tables are named.
+    index: Option<Vec<(LabelMatcher, bool)>>,
 }
 
 impl SeriesWhere {
@@ -271,23 +294,35 @@ impl SeriesWhere {
                     .map(|m| predicate(m, MatcherTarget::Labels)),
             )
             .collect();
+        let index = if lookup.scope.is_empty() && lookup.name_matchers.is_empty() {
+            lookup
+                .matchers
+                .iter()
+                .map(|m| matches_empty(m).map(|e| (m.clone(), e)))
+                .collect::<Option<Vec<_>>>()
+                .filter(|roles| roles.iter().any(|(_, e)| !e))
+        } else {
+            None
+        };
         SeriesWhere {
             activity,
             lookup: lookup_preds,
+            index,
         }
     }
 
     /// Statement 1's `FROM … WHERE …`: the activity rows in the window
     /// whose IDs the lookup predicates select. A builder prepends its own
     /// projection.
-    pub(super) fn ids_from_where(&self, series_table: &str, labels_table: &str) -> String {
-        self.activity_read(series_table, labels_table, "")
+    pub(super) fn ids_from_where(&self, t: SeriesTables<'_>) -> String {
+        self.activity_read(t, "")
     }
 
     /// Statement 2 whole: each series the lookup predicates select whose
     /// ID the activity read finds in the window, with its own name and
     /// labels, once.
-    pub(super) fn with_labels(&self, series_table: &str, labels_table: &str) -> String {
+    pub(super) fn with_labels(&self, t: SeriesTables<'_>) -> String {
+        let labels_table = t.labels;
         let mut out = format!(
             "SELECT fingerprint, any(name) AS metric_name, any(label_text) AS labels\n\
              FROM (\n\
@@ -295,9 +330,13 @@ impl SeriesWhere {
              \x20 FROM {labels_table}\n"
         );
         let mut keyword = "WHERE";
-        for pred in &self.lookup {
-            out.push_str(&format!("  {keyword} {pred}\n"));
-            keyword = "  AND";
+        // On the index route the ID set decides every matcher, so the
+        // outer read repeats none of them.
+        if self.index_route(t).is_none() {
+            for pred in &self.lookup {
+                out.push_str(&format!("  {keyword} {pred}\n"));
+                keyword = "  AND";
+            }
         }
         out.push_str(&format!(
             "  {keyword} fingerprint IN (\n\
@@ -307,24 +346,109 @@ impl SeriesWhere {
              )\n\
              GROUP BY fingerprint\n\
              ORDER BY metric_name, fingerprint",
-            self.activity_read(series_table, labels_table, "      ")
+            self.activity_read(t, "      ")
         ));
         out
     }
 
+    /// Issue #635: the distinct label keys of the series this read selects,
+    /// from the label index.
+    pub(super) fn label_keys(&self, t: SeriesTables<'_>) -> String {
+        format!(
+            "SELECT DISTINCT key\n\
+             FROM {}\n\
+             WHERE fingerprint IN (\n\
+             \x20   SELECT fingerprint\n\
+             {}\n\
+             \x20 )\n\
+             ORDER BY key",
+            t.label_index.unwrap_or_default(),
+            self.activity_read(t, "    ")
+        )
+    }
+
+    /// Issue #635: the distinct values of `key` over the series this read
+    /// selects, from the label index.
+    pub(super) fn label_values(&self, key: &str, t: SeriesTables<'_>) -> String {
+        format!(
+            "SELECT DISTINCT value\n\
+             FROM {}\n\
+             WHERE key = {}\n\
+             \x20 AND fingerprint IN (\n\
+             \x20   SELECT fingerprint\n\
+             {}\n\
+             \x20 )\n\
+             ORDER BY value",
+            t.label_index.unwrap_or_default(),
+            ch_string(key),
+            self.activity_read(t, "    ")
+        )
+    }
+
+    /// The index route's matchers and both index tables, when the read may
+    /// take the route and `t` names both tables; `None` sends the read to
+    /// the lookup.
+    #[allow(clippy::type_complexity)]
+    fn index_route<'t>(
+        &self,
+        t: SeriesTables<'t>,
+    ) -> Option<(&[(LabelMatcher, bool)], &'t str, &'t str)> {
+        Some((self.index.as_deref()?, t.label_index?, t.label_values?))
+    }
+
     /// The activity read, every line indented by `indent`: the window, then
-    /// the IDs the lookup predicates select when there are any.
-    fn activity_read(&self, series_table: &str, labels_table: &str, indent: &str) -> String {
-        let mut lines = vec![format!("{indent}FROM {series_table}")];
+    /// the IDs the matchers select — from the label index when the read
+    /// takes the index route and `t` names both index tables, from the
+    /// lookup's predicates otherwise, when there are any.
+    fn activity_read(&self, t: SeriesTables<'_>, indent: &str) -> String {
+        let mut lines = vec![format!("{indent}FROM {}", t.series)];
         let mut keyword = "WHERE";
         for cond in &self.activity {
             lines.push(format!("{indent}{keyword} {cond}"));
             keyword = "  AND";
         }
-        if !self.lookup.is_empty() {
+        if let Some((roles, index_table, values_table)) = self.index_route(t) {
+            lines.push(format!("{indent}  AND fingerprint IN ("));
+            let row = |m: &LabelMatcher, e: bool| {
+                format!(
+                    "SELECT fingerprint FROM {index_table} WHERE {}",
+                    index_row(m, e, values_table)
+                )
+            };
+            let positive: Vec<String> = roles
+                .iter()
+                .filter(|(_, e)| !e)
+                .map(|(m, e)| row(m, *e))
+                .collect();
+            let negative: Vec<String> = roles
+                .iter()
+                .filter(|(_, e)| *e)
+                .map(|(m, e)| row(m, *e))
+                .collect();
+            if negative.is_empty() {
+                lines.push(format!(
+                    "{indent}    {}",
+                    positive.join(&format!("\n{indent}    INTERSECT\n{indent}    "))
+                ));
+            } else {
+                lines.push(format!("{indent}    SELECT fingerprint"));
+                lines.push(format!("{indent}    FROM ("));
+                lines.push(format!(
+                    "{indent}      {}",
+                    positive.join(&format!("\n{indent}      INTERSECT\n{indent}      "))
+                ));
+                lines.push(format!("{indent}    )"));
+                let mut keyword = "WHERE";
+                for set in negative {
+                    lines.push(format!("{indent}    {keyword} fingerprint NOT IN ({set})"));
+                    keyword = "  AND";
+                }
+            }
+            lines.push(format!("{indent}  )"));
+        } else if !self.lookup.is_empty() {
             lines.push(format!("{indent}  AND fingerprint IN ("));
             lines.push(format!("{indent}    SELECT fingerprint"));
-            lines.push(format!("{indent}    FROM {labels_table}"));
+            lines.push(format!("{indent}    FROM {}", t.labels));
             let mut keyword = "WHERE";
             for pred in &self.lookup {
                 lines.push(format!("{indent}    {keyword} {pred}"));
@@ -389,6 +513,37 @@ fn predicate(m: &LabelMatcher, target: MatcherTarget) -> String {
         MatchOp::Neq => format!("{column} != {}", ch_string(&m.value)),
         MatchOp::Re => format!("match({column}, {})", anchored_re2_literal(&m.value)),
         MatchOp::Nre => format!("NOT match({column}, {})", anchored_re2_literal(&m.value)),
+    }
+}
+
+/// One matcher's rows on the label index (issue #635). A matcher that does
+/// not match `""` (`matches_empty == false`) is positive: its rows are the
+/// series it holds for. One that does is negative: its rows are the series
+/// it fails for, and a series without the key satisfies it. A stored empty
+/// value reads as absent, exactly as `JSONExtractString` reads it: the two
+/// rows that test presence carry `value != ''`.
+fn index_row(m: &LabelMatcher, matches_empty: bool, values_table: &str) -> String {
+    let key = ch_string(&m.key);
+    let value = ch_string(&m.value);
+    match m.op {
+        MatchOp::Eq | MatchOp::Neq if m.value.is_empty() => {
+            format!("key = {key} AND value != ''")
+        }
+        MatchOp::Eq | MatchOp::Neq => format!("key = {key} AND value = {value}"),
+        MatchOp::Re | MatchOp::Nre => {
+            // The values the regex accepts hold for a positive `=~` and
+            // fail a negative `!~`; a regex that matches `""` flips both.
+            let regex_matches_empty = matches!(m.op, MatchOp::Re) == matches_empty;
+            let test = if regex_matches_empty {
+                "NOT match"
+            } else {
+                "match"
+            };
+            format!(
+                "key = {key} AND value IN (SELECT value FROM {values_table} WHERE key = {key} AND {test}(value, {}))",
+                anchored_re2_literal(&m.value)
+            )
+        }
     }
 }
 
@@ -495,7 +650,7 @@ mod tests {
             },
         );
         assert_eq!(
-            w.ids_from_where("metric_series", "metric_labels"),
+            w.ids_from_where(lookup()),
             "FROM metric_series\n\
              WHERE day BETWEEN '2026-09-07' AND '2026-09-07'\n\
              \x20 AND 0 * match('', '(?-s)^(?:up|down)$') = 0\n\
@@ -569,7 +724,7 @@ mod tests {
                 matchers: &labels,
             },
         )
-        .ids_from_where("metric_series", "metric_labels")
+        .ids_from_where(lookup())
     }
 
     /// The module-doc boundary inventory, kept honest mechanically
@@ -663,14 +818,21 @@ mod tests {
             [
                 "pub(crate) struct PromqlRe2Fallback(());",
                 "pub(super) enum MatcherTarget {",
+                "pub(super) struct SeriesTables<'a> {",
+                "pub(super) series: &'a str,",
+                "pub(super) labels: &'a str,",
+                "pub(super) label_index: Option<&'a str>,",
+                "pub(super) label_values: Option<&'a str>,",
                 "pub(super) struct Lookup<'a> {",
                 "pub(super) scope: &'a [String],",
                 "pub(super) name_matchers: &'a [LabelMatcher],",
                 "pub(super) matchers: &'a [LabelMatcher],",
                 "pub(super) struct SeriesWhere {",
                 "pub(super) fn activity(window: DataWindow, lookup: Lookup<'_>) -> Self {",
-                "pub(super) fn ids_from_where(&self, series_table: &str, labels_table: &str) -> String {",
-                "pub(super) fn with_labels(&self, series_table: &str, labels_table: &str) -> String {",
+                "pub(super) fn ids_from_where(&self, t: SeriesTables<'_>) -> String {",
+                "pub(super) fn with_labels(&self, t: SeriesTables<'_>) -> String {",
+                "pub(super) fn label_keys(&self, t: SeriesTables<'_>) -> String {",
+                "pub(super) fn label_values(&self, key: &str, t: SeriesTables<'_>) -> String {",
                 "pub fn anchored_re2_literal_for_test(pattern: &str) -> String {",
             ],
             "series_where.rs declarations drifted from this test's list"
@@ -714,6 +876,9 @@ mod tests {
                 "SeriesWhere::activity",
                 "SeriesWhere::ids_from_where",
                 "SeriesWhere::with_labels",
+                "SeriesWhere::label_keys",
+                "SeriesWhere::label_values",
+                "SeriesTables",
                 "Lookup",
                 "MatcherTarget",
                 "PromqlRe2Fallback",
@@ -826,11 +991,11 @@ mod tests {
             },
         );
         assert!(
-            w.ids_from_where("s", "l").ends_with(
+            w.ids_from_where(sl()).ends_with(
                 "    WHERE metric_name = 'up'\n      AND JSONExtractString(labels, 'job') = 'api'\n  )"
             ),
             "{}",
-            w.ids_from_where("s", "l")
+            w.ids_from_where(sl())
         );
         let none = SeriesWhere::activity(
             window(),
@@ -841,11 +1006,304 @@ mod tests {
             },
         );
         assert!(
-            none.with_labels("s", "l").contains(
+            none.with_labels(sl()).contains(
                 "  FROM l\n  WHERE fingerprint IN (\n      SELECT fingerprint\n      FROM s\n"
             ),
             "{}",
-            none.with_labels("s", "l")
+            none.with_labels(sl())
+        );
+    }
+
+    // ------------------------------------------------------- issue #635
+
+    fn lookup() -> SeriesTables<'static> {
+        SeriesTables {
+            series: "metric_series",
+            labels: "metric_labels",
+            label_index: None,
+            label_values: None,
+        }
+    }
+
+    fn sl() -> SeriesTables<'static> {
+        SeriesTables {
+            series: "s",
+            labels: "l",
+            label_index: None,
+            label_values: None,
+        }
+    }
+
+    fn indexed() -> SeriesTables<'static> {
+        SeriesTables {
+            series: "metric_series",
+            labels: "metric_labels",
+            label_index: Some("metric_label_index"),
+            label_values: Some("metric_label_values"),
+        }
+    }
+
+    /// The design's §4 window: 2026-10-06, the whole UTC day.
+    fn oct6() -> DataWindow {
+        DataWindow {
+            start_ms: 1_791_244_800_000,
+            end_ms: 1_791_331_199_999,
+        }
+    }
+
+    fn read(scope: &[String], names: &[LabelMatcher], labels: &[LabelMatcher]) -> SeriesWhere {
+        SeriesWhere::activity(
+            oct6(),
+            Lookup {
+                scope,
+                name_matchers: names,
+                matchers: labels,
+            },
+        )
+    }
+
+    const OCT6: &str = "WHERE day BETWEEN '2026-10-06' AND '2026-10-06'";
+    const MASK: &str = "bitAnd(hours, multiIf(day = '2026-10-06' AND day = '2026-10-06', 16777215, day = '2026-10-06', 16777215, day = '2026-10-06', 16777215, 16777215)) != 0";
+
+    /// U2: statement 1 on the index route, positive matchers only (S1),
+    /// and with a negative one (S2) — the design's §4 texts after the
+    /// projection line.
+    #[test]
+    fn u2_statement_one_reads_ids_from_the_index() {
+        let s1 = read(
+            &[],
+            &[],
+            &[
+                m(MatchOp::Eq, "job", "api"),
+                m(MatchOp::Re, "status", "5.."),
+            ],
+        );
+        assert_eq!(
+            s1.ids_from_where(indexed()),
+            format!(
+                "FROM metric_series\n\
+                 {OCT6}\n\
+                 \x20 AND 0 * match('', '(?-s)^(?:5..)$') = 0\n\
+                 \x20 AND {MASK}\n\
+                 \x20 AND fingerprint IN (\n\
+                 \x20   SELECT fingerprint FROM metric_label_index WHERE key = 'job' AND value = 'api'\n\
+                 \x20   INTERSECT\n\
+                 \x20   SELECT fingerprint FROM metric_label_index WHERE key = 'status' AND value IN (SELECT value FROM metric_label_values WHERE key = 'status' AND match(value, '(?-s)^(?:5..)$'))\n\
+                 \x20 )"
+            )
+        );
+        let s2 = read(
+            &[],
+            &[],
+            &[
+                m(MatchOp::Re, "job", "api.*"),
+                m(MatchOp::Eq, "zone", "z07"),
+                m(MatchOp::Neq, "env", "dev"),
+            ],
+        );
+        assert_eq!(
+            s2.ids_from_where(indexed()),
+            format!(
+                "FROM metric_series\n\
+                 {OCT6}\n\
+                 \x20 AND 0 * match('', '(?-s)^(?:api.*)$') = 0\n\
+                 \x20 AND {MASK}\n\
+                 \x20 AND fingerprint IN (\n\
+                 \x20   SELECT fingerprint\n\
+                 \x20   FROM (\n\
+                 \x20     SELECT fingerprint FROM metric_label_index WHERE key = 'job' AND value IN (SELECT value FROM metric_label_values WHERE key = 'job' AND match(value, '(?-s)^(?:api.*)$'))\n\
+                 \x20     INTERSECT\n\
+                 \x20     SELECT fingerprint FROM metric_label_index WHERE key = 'zone' AND value = 'z07'\n\
+                 \x20   )\n\
+                 \x20   WHERE fingerprint NOT IN (SELECT fingerprint FROM metric_label_index WHERE key = 'env' AND value = 'dev')\n\
+                 \x20 )"
+            )
+        );
+    }
+
+    /// U3: every row of §3. A positive matcher is the only one (its row is
+    /// the `INTERSECT` base); a negative one sits beside `zone="z07"` and
+    /// its row is the `NOT IN` set.
+    #[test]
+    fn u3_every_matcher_renders_its_index_row() {
+        let values = |op: &str, r: &str, k: &str| {
+            format!(
+                "key = '{k}' AND value IN (SELECT value FROM metric_label_values WHERE key = '{k}' AND {op}(value, '(?-s)^(?:{r})$'))"
+            )
+        };
+        let positive = [
+            (
+                m(MatchOp::Eq, "k", "v"),
+                "key = 'k' AND value = 'v'".to_string(),
+            ),
+            (
+                m(MatchOp::Neq, "k", ""),
+                "key = 'k' AND value != ''".to_string(),
+            ),
+            (m(MatchOp::Re, "k", "5.."), values("match", "5..", "k")),
+            (
+                m(MatchOp::Nre, "k", "prod|"),
+                values("NOT match", "prod|", "k"),
+            ),
+        ];
+        for (matcher, row) in positive {
+            let got = read(&[], &[], std::slice::from_ref(&matcher)).ids_from_where(indexed());
+            let want = format!("\n    SELECT fingerprint FROM metric_label_index WHERE {row}\n  )");
+            assert!(got.ends_with(&want), "{matcher:?}: {got}");
+        }
+        let negative = [
+            (
+                m(MatchOp::Eq, "k", ""),
+                "key = 'k' AND value != ''".to_string(),
+            ),
+            (
+                m(MatchOp::Neq, "k", "v"),
+                "key = 'k' AND value = 'v'".to_string(),
+            ),
+            (
+                m(MatchOp::Re, "k", "prod|"),
+                values("NOT match", "prod|", "k"),
+            ),
+            (m(MatchOp::Nre, "k", "5.."), values("match", "5..", "k")),
+        ];
+        for (matcher, row) in negative {
+            let got = read(&[], &[], &[m(MatchOp::Eq, "zone", "z07"), matcher.clone()])
+                .ids_from_where(indexed());
+            let want = format!(
+                "\n    FROM (\n      SELECT fingerprint FROM metric_label_index WHERE key = 'zone' AND value = 'z07'\n    )\n    WHERE fingerprint NOT IN (SELECT fingerprint FROM metric_label_index WHERE {row})\n  )"
+            );
+            assert!(got.ends_with(&want), "{matcher:?}: {got}");
+        }
+    }
+
+    /// U4: every read the index must not take renders today's lookup
+    /// text, byte for byte, with the index tables named.
+    #[test]
+    fn u4_reads_off_the_index_route_keep_todays_text() {
+        let cases: [(Vec<String>, Vec<LabelMatcher>, Vec<LabelMatcher>); 4] = [
+            (
+                vec!["metric_name = 'up'".to_string()],
+                vec![],
+                vec![m(MatchOp::Eq, "job", "api")],
+            ),
+            (
+                vec![],
+                vec![m(MatchOp::Re, "__name__", "up.*")],
+                vec![m(MatchOp::Eq, "job", "api")],
+            ),
+            (vec![], vec![], vec![m(MatchOp::Eq, "env", "")]),
+            (
+                vec![],
+                vec![],
+                vec![
+                    m(MatchOp::Eq, "job", "api"),
+                    m(MatchOp::Re, "x", r"[\p{Alphabetic}]"),
+                ],
+            ),
+        ];
+        for (scope, names, labels) in cases {
+            let w = read(&scope, &names, &labels);
+            assert_eq!(w.ids_from_where(indexed()), w.ids_from_where(lookup()));
+            assert_eq!(w.with_labels(indexed()), w.with_labels(lookup()));
+            assert!(
+                !w.ids_from_where(indexed()).contains("metric_label_index"),
+                "{labels:?}"
+            );
+        }
+        // An index-eligible read with no index table named.
+        let w = read(&[], &[], &[m(MatchOp::Eq, "job", "api")]);
+        let half = SeriesTables {
+            label_values: None,
+            ..indexed()
+        };
+        assert!(!w.ids_from_where(half).contains("metric_label_index"));
+        assert!(!w.ids_from_where(lookup()).contains("metric_label_index"));
+        assert!(
+            w.ids_from_where(lookup())
+                .contains("WHERE JSONExtractString(labels, 'job') = 'api'")
+        );
+    }
+
+    /// U5: statement 2 on the index route (S3), and the two label
+    /// statements, as the design's §4 prints them.
+    #[test]
+    fn u5_statement_two_and_the_label_statements() {
+        let s3 = read(
+            &[],
+            &[],
+            &[
+                m(MatchOp::Eq, "zone", "z07"),
+                m(MatchOp::Nre, "status", "2.."),
+            ],
+        );
+        assert_eq!(
+            s3.with_labels(indexed()),
+            format!(
+                "SELECT fingerprint, any(name) AS metric_name, any(label_text) AS labels\n\
+                 FROM (\n\
+                 \x20 SELECT fingerprint, metric_name AS name, labels AS label_text\n\
+                 \x20 FROM metric_labels\n\
+                 \x20 WHERE fingerprint IN (\n\
+                 \x20     SELECT fingerprint\n\
+                 \x20     FROM metric_series\n\
+                 \x20     {OCT6}\n\
+                 \x20       AND 0 * match('', '(?-s)^(?:2..)$') = 0\n\
+                 \x20       AND {MASK}\n\
+                 \x20       AND fingerprint IN (\n\
+                 \x20         SELECT fingerprint\n\
+                 \x20         FROM (\n\
+                 \x20           SELECT fingerprint FROM metric_label_index WHERE key = 'zone' AND value = 'z07'\n\
+                 \x20         )\n\
+                 \x20         WHERE fingerprint NOT IN (SELECT fingerprint FROM metric_label_index WHERE key = 'status' AND value IN (SELECT value FROM metric_label_values WHERE key = 'status' AND match(value, '(?-s)^(?:2..)$')))\n\
+                 \x20       )\n\
+                 \x20   )\n\
+                 )\n\
+                 GROUP BY fingerprint\n\
+                 ORDER BY metric_name, fingerprint"
+            )
+        );
+        assert_eq!(
+            read(&[], &[], &[]).label_keys(indexed()),
+            format!(
+                "SELECT DISTINCT key\n\
+                 FROM metric_label_index\n\
+                 WHERE fingerprint IN (\n\
+                 \x20   SELECT fingerprint\n\
+                 \x20   FROM metric_series\n\
+                 \x20   {OCT6}\n\
+                 \x20     AND {MASK}\n\
+                 \x20 )\n\
+                 ORDER BY key"
+            )
+        );
+        let s1 = read(
+            &[],
+            &[],
+            &[
+                m(MatchOp::Eq, "job", "api"),
+                m(MatchOp::Re, "status", "5.."),
+            ],
+        );
+        assert_eq!(
+            s1.label_values("instance", indexed()),
+            format!(
+                "SELECT DISTINCT value\n\
+                 FROM metric_label_index\n\
+                 WHERE key = 'instance'\n\
+                 \x20 AND fingerprint IN (\n\
+                 \x20   SELECT fingerprint\n\
+                 \x20   FROM metric_series\n\
+                 \x20   {OCT6}\n\
+                 \x20     AND 0 * match('', '(?-s)^(?:5..)$') = 0\n\
+                 \x20     AND {MASK}\n\
+                 \x20     AND fingerprint IN (\n\
+                 \x20       SELECT fingerprint FROM metric_label_index WHERE key = 'job' AND value = 'api'\n\
+                 \x20       INTERSECT\n\
+                 \x20       SELECT fingerprint FROM metric_label_index WHERE key = 'status' AND value IN (SELECT value FROM metric_label_values WHERE key = 'status' AND match(value, '(?-s)^(?:5..)$'))\n\
+                 \x20     )\n\
+                 \x20 )\n\
+                 ORDER BY value"
+            )
         );
     }
 }

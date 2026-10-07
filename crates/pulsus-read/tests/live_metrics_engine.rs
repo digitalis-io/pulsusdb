@@ -187,6 +187,8 @@ fn engine_config(db: &str) -> MetricsConfig {
         hist_samples_table: "metric_hist_samples".to_string(),
         series_table: "metric_series".to_string(),
         labels_table: "metric_labels".to_string(),
+        label_index_table: "metric_label_index".to_string(),
+        label_values_table: "metric_label_values".to_string(),
         metadata_table: "metric_metadata".to_string(),
         experimental_functions: false,
         max_metric_fanout: 1_000,
@@ -4207,4 +4209,45 @@ async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
         .insert_block("metric_labels", &labels)
         .await
         .expect("seed metric_labels");
+    // Issue #635: the label index and its values, as the two views write
+    // them from the same kind-2 row.
+    let mut index = Vec::new();
+    let mut pairs = std::collections::BTreeSet::new();
+    for r in rows {
+        let map: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(&r.labels).expect("canonical label JSON");
+        for (key, value) in map {
+            pairs.insert((key.clone(), value.clone()));
+            index.push(SeedIndexRow {
+                key,
+                value,
+                fingerprint: r.fingerprint,
+            });
+        }
+    }
+    let values: Vec<SeedValueRow> = pairs
+        .into_iter()
+        .map(|(key, value)| SeedValueRow { key, value })
+        .collect();
+    client
+        .insert_block("metric_label_index", &index)
+        .await
+        .expect("seed metric_label_index");
+    client
+        .insert_block("metric_label_values", &values)
+        .await
+        .expect("seed metric_label_values");
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SeedIndexRow {
+    key: String,
+    value: String,
+    fingerprint: u128,
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SeedValueRow {
+    key: String,
+    value: String,
 }
