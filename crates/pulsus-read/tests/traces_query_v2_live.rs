@@ -7338,14 +7338,193 @@ async fn search_routed_answers_as_today_on_fixture_c() {
     }
     drop_db(&db).await;
     eprintln!("compared {} × 3", cases.len());
+    // Issue #592 part 1's three small fixtures, each in its own database:
+    // every case must equal today's answer and its literal answer.
+    let mut fixture_cases = 0usize;
+    for (label, bodies, spans, cases) in pipeline_fixtures(base_ns) {
+        let (db, _client) = seed_both(
+            pulsus_testkit::test_db(&format!("pulsus_read_it_t592p1_{label}")),
+            &bodies,
+            spans,
+            &format!("t592p1-{label}"),
+        )
+        .await;
+        let engine = engine_of(&db).await;
+        for (query, limit, spss, literal) in cases {
+            fixture_cases += 1;
+            let ctx = format!("{label}: {query} (limit {limit}, spss {spss})");
+            let plan = plan_of(&engine, &parse_query(query), window, limit, spss);
+            if !covered(&plan) {
+                wrong.push(format!("{ctx}: not covered"));
+                continue;
+            }
+            let today = engine.search(&plan).await.map(normalise_today);
+            let routed = engine.search_routed(&plan).await;
+            if format!("{today:?}") != format!("{routed:?}") {
+                wrong.push(format!(
+                    "{ctx}\n  today:  {}\n  routed: {}",
+                    answer_of(&today),
+                    answer_of(&routed)
+                ));
+                continue;
+            }
+            if answer_of(&routed) != literal {
+                wrong.push(format!(
+                    "{ctx}\n  literal: {literal}\n  both:    {}",
+                    answer_of(&routed)
+                ));
+            }
+        }
+        drop_db(&db).await;
+    }
+    eprintln!("and {fixture_cases} fixture cases");
     assert_eq!(names.len(), 86, "the inventory's new rows");
     assert!(
         wrong.is_empty(),
         "{} of {} differ:\n\n{}",
         wrong.len(),
-        cases.len() * 3,
+        cases.len() * 3 + fixture_cases,
         wrong.join("\n\n")
     );
+}
+
+/// An answer as `(trace, matched, span ids)` per trace, in order, each id
+/// by its last byte in hex: `a1 1 [01]; b2 1 [03]`.
+fn answer_of(
+    out: &Result<pulsus_read::traces::SearchOutput, pulsus_read::logql::ReadError>,
+) -> String {
+    match out {
+        Err(e) => format!("Err({e})"),
+        Ok(o) => o
+            .traces
+            .iter()
+            .map(|t| {
+                let spans: Vec<String> = t
+                    .spans
+                    .iter()
+                    .map(|s| format!("{:02x}", s.span_id[7]))
+                    .collect();
+                format!(
+                    "{:02x} {} [{}]",
+                    t.trace_id[15],
+                    t.matched,
+                    spans.join(", ")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; "),
+    }
+}
+
+/// One fixture of [`pipeline_fixtures`]: its label, its bodies, its span
+/// count, and its cases `(query, limit, spss, literal answer)`.
+type PipelineFixture = (
+    &'static str,
+    Vec<ExportTraceServiceRequest>,
+    u64,
+    Vec<(&'static str, u32, u32, &'static str)>,
+);
+
+/// Issue #592 part 1's three small fixtures. Every span has kind server,
+/// a 0.1 s duration and no attributes, and the resource
+/// `service.name = "svc"` unless said otherwise; starts are seconds after
+/// `base_ns`.
+///
+/// - `rank`: today's engine ranks a trace by the newest span the
+///   selector matched, before any stage runs. `a1`'s newest span (+10 s)
+///   is removed by the later filter, and `a1` still comes first.
+/// - `cap`: `c1` and `c2` tie at +20 s, and the lower trace id comes
+///   first; `c1` keeps four spans and returns three; spans 12 and 13
+///   start together and come in span-id order.
+/// - `noservice`: `d1`'s span is in a resource with no attributes, and
+///   `select(resource.service.name)` returns its service as `""`, as
+///   today's engine does.
+fn pipeline_fixtures(base_ns: i64) -> Vec<PipelineFixture> {
+    const S: i64 = 1_000_000_000;
+    let sp = |trace: u8, span: u8, name: &str, at_s: i64| {
+        span_of(
+            vec![trace; 16],
+            vec![0, 0, 0, 0, 0, 0, 0, span],
+            Vec::new(),
+            name,
+            2,
+            base_ns + at_s * S,
+            S / 10,
+            Vec::new(),
+            0,
+            Vec::new(),
+            Vec::new(),
+        )
+    };
+    let body = |attributes: Vec<KeyValue>, spans: Vec<Span>| ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: Some(Resource {
+                attributes,
+                dropped_attributes_count: 0,
+                entity_refs: Vec::new(),
+            }),
+            scope_spans: vec![ScopeSpans {
+                scope: Some(scope()),
+                spans,
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    };
+    let svc = || vec![kv("service.name", str_value("svc"))];
+    let later = r#"{ } | { name = "b" }"#;
+    vec![
+        (
+            "rank",
+            vec![body(
+                svc(),
+                vec![
+                    sp(0xa1, 1, "b", 1),
+                    sp(0xa1, 2, "c", 10),
+                    sp(0xb2, 3, "b", 5),
+                ],
+            )],
+            3,
+            vec![
+                (later, 1, 3, "a1 1 [01]"),
+                (later, 20, 3, "a1 1 [01]; b2 1 [03]"),
+            ],
+        ),
+        (
+            "cap",
+            vec![body(
+                svc(),
+                vec![
+                    sp(0xc1, 11, "b", 1),
+                    sp(0xc1, 13, "b", 2),
+                    sp(0xc1, 12, "b", 2),
+                    sp(0xc1, 14, "b", 3),
+                    sp(0xc1, 15, "c", 20),
+                    sp(0xc2, 21, "b", 4),
+                    sp(0xc2, 22, "c", 20),
+                ],
+            )],
+            7,
+            vec![
+                (later, 1, 3, "c1 4 [0b, 0c, 0d]"),
+                (later, 20, 3, "c1 4 [0b, 0c, 0d]; c2 1 [15]"),
+            ],
+        ),
+        (
+            "noservice",
+            vec![
+                body(Vec::new(), vec![sp(0xd1, 31, "b", 2)]),
+                body(svc(), vec![sp(0xd2, 32, "b", 1)]),
+            ],
+            2,
+            vec![(
+                r#"{ } | select(resource.service.name)"#,
+                20,
+                3,
+                "d1 1 [1f]; d2 1 [20]",
+            )],
+        ),
+    ]
 }
 
 /// Issue #592 part 1's pipeline shapes beyond the corpus: later `{…}`
