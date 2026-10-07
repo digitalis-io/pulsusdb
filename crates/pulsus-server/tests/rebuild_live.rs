@@ -342,8 +342,7 @@ async fn merged_rows(client: &ChClient, db: &str, table: &str, columns: &str) ->
 /// view wrote them.** The window is replayed into a table that already
 /// holds it; merged, the replay's copies collapse into the rows already
 /// there.
-async fn a_replay_keeps_the_rows(stem: &str, target: &str, columns: &str) {
-    let db = ScopedDb::fresh(pulsus_testkit::test_db(stem)).await;
+async fn a_replay_keeps_the_rows(db: ScopedDb, target: &str, columns: &str) {
     let client = client_for(db.name()).await;
     let received = now_ms();
     seed_two_days(&client, received).await;
@@ -362,7 +361,7 @@ async fn a_replay_keeps_the_rows(stem: &str, target: &str, columns: &str) {
 async fn the_label_index_rebuilds_to_the_rows_the_view_wrote() {
     skip_unless_live!();
     a_replay_keeps_the_rows(
-        "rebuild_label_index",
+        ScopedDb::fresh(pulsus_testkit::test_db("rebuild_label_index")).await,
         "metric_label_index",
         "key, '=', value, ' ', toString(fingerprint)",
     )
@@ -373,7 +372,7 @@ async fn the_label_index_rebuilds_to_the_rows_the_view_wrote() {
 async fn the_label_values_rebuild_to_the_rows_the_view_wrote() {
     skip_unless_live!();
     a_replay_keeps_the_rows(
-        "rebuild_label_values",
+        ScopedDb::fresh(pulsus_testkit::test_db("rebuild_label_values")).await,
         "metric_label_values",
         "key, '=', value",
     )

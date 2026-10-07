@@ -181,8 +181,10 @@ SELECT toUnixTimestamp64Milli(now64(3)), 2, metric_name, fingerprint, unix_milli
        0
 FROM gen";
 
-async fn fixture(stem: &str, extra_landing: &[&str]) -> Fixture {
-    let db = pulsus_testkit::test_db(stem);
+/// `db` is composed by `pulsus_testkit::test_db` at the call site, where
+/// the naming guards read it.
+async fn fixture(db: &str, extra_landing: &[&str]) -> Fixture {
+    let db = db.to_string();
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
@@ -390,7 +392,11 @@ fn selectors() -> Vec<(&'static str, Vec<LabelMatcher>)> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn v1_name_less_selectors_answer_from_the_index() {
     skip_unless_live!();
-    let fx = fixture("pulsus_read_it_label_index_v1", &[]).await;
+    let fx = fixture(
+        &pulsus_testkit::test_db("pulsus_read_it_label_index_v1"),
+        &[],
+    )
+    .await;
     for (id, matchers) in selectors() {
         let want = expected_series(&fx, &matchers);
         assert!(!want.is_empty(), "{id}: the corpus selects something");
@@ -421,7 +427,11 @@ async fn v4_an_empty_value_reads_as_absent() {
          VALUES ({received}, 2, 'emp', 9001, {window_ms}, '{\"env\":\"\",\"job\":\"t\",\"x\":\"1\"}', 0), \
                 ({received}, 2, 'emp', 9002, {window_ms}, '{\"job\":\"t\",\"x\":\"2\"}', 0)",
     ];
-    let fx = fixture("pulsus_read_it_label_index_v4", &rows).await;
+    let fx = fixture(
+        &pulsus_testkit::test_db("pulsus_read_it_label_index_v4"),
+        &rows,
+    )
+    .await;
     use MatchOp::{Eq, Neq, Nre, Re};
     for (matchers, want) in [
         (vec![m("job", Eq, "t"), m("env", Eq, "")], 2usize),
@@ -446,7 +456,11 @@ async fn v4_an_empty_value_reads_as_absent() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn v2_the_label_endpoints_answer_from_the_index() {
     skip_unless_live!();
-    let fx = fixture("pulsus_read_it_label_index_v2", &[]).await;
+    let fx = fixture(
+        &pulsus_testkit::test_db("pulsus_read_it_label_index_v2"),
+        &[],
+    )
+    .await;
     let keys = |matchers: &[LabelMatcher]| -> Vec<String> {
         let mut set: BTreeSet<String> = fx
             .series
@@ -526,7 +540,11 @@ async fn v3_escaped_labels_round_trip() {
         "INSERT INTO metric_landing (received_ms, kind, metric_name, fingerprint, unix_milli, labels, value_type) \
          VALUES ({received}, 2, 'esc', 9100, {window_ms}, '{\"k\":\"a\\\\\"b\\\\\\\\c\",\"n\":\"line\\\\nx\",\"u\":\"é\"}', 0)",
     ];
-    let fx = fixture("pulsus_read_it_label_index_v3", &rows).await;
+    let fx = fixture(
+        &pulsus_testkit::test_db("pulsus_read_it_label_index_v3"),
+        &rows,
+    )
+    .await;
     let marker = fx.marker().await;
     assert_eq!(
         fx.engine

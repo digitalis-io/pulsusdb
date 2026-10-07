@@ -134,7 +134,7 @@
 
 use crate::logql::escape::{ch_regex_anchored_promql_re2, ch_string};
 
-use super::matcher::{DataWindow, LabelMatcher, MatchOp};
+use super::matcher::{DataWindow, LabelMatcher, MatchOp, matches_empty};
 
 /// Capability token (issue #240). Possession proves the caller is on the
 /// PromQL fallback path, where ClickHouse's RE2 — not the Rust `regex`
@@ -248,6 +248,12 @@ pub(super) struct SeriesWhere {
     /// The lookup read's conditions: the scope, then one predicate per
     /// matcher. Empty when the read has neither.
     lookup: Vec<String>,
+    /// Issue #635: the label matchers in order, each with whether it
+    /// matches the empty string — `Some` only when the read may take the
+    /// index route: no scope, no `__name__` matcher, every regex's verdict
+    /// decided in-process, and at least one matcher that does not match
+    /// `""`. Rendered on the index only when both index tables are named.
+    index: Option<Vec<(LabelMatcher, bool)>>,
 }
 
 impl SeriesWhere {
@@ -288,9 +294,20 @@ impl SeriesWhere {
                     .map(|m| predicate(m, MatcherTarget::Labels)),
             )
             .collect();
+        let index = if lookup.scope.is_empty() && lookup.name_matchers.is_empty() {
+            lookup
+                .matchers
+                .iter()
+                .map(|m| matches_empty(m).map(|e| (m.clone(), e)))
+                .collect::<Option<Vec<_>>>()
+                .filter(|roles| roles.iter().any(|(_, e)| !e))
+        } else {
+            None
+        };
         SeriesWhere {
             activity,
             lookup: lookup_preds,
+            index,
         }
     }
 
@@ -298,14 +315,14 @@ impl SeriesWhere {
     /// whose IDs the lookup predicates select. A builder prepends its own
     /// projection.
     pub(super) fn ids_from_where(&self, t: SeriesTables<'_>) -> String {
-        self.activity_read(t.series, t.labels, "")
+        self.activity_read(t, "")
     }
 
     /// Statement 2 whole: each series the lookup predicates select whose
     /// ID the activity read finds in the window, with its own name and
     /// labels, once.
     pub(super) fn with_labels(&self, t: SeriesTables<'_>) -> String {
-        let (series_table, labels_table) = (t.series, t.labels);
+        let labels_table = t.labels;
         let mut out = format!(
             "SELECT fingerprint, any(name) AS metric_name, any(label_text) AS labels\n\
              FROM (\n\
@@ -313,9 +330,13 @@ impl SeriesWhere {
              \x20 FROM {labels_table}\n"
         );
         let mut keyword = "WHERE";
-        for pred in &self.lookup {
-            out.push_str(&format!("  {keyword} {pred}\n"));
-            keyword = "  AND";
+        // On the index route the ID set decides every matcher, so the
+        // outer read repeats none of them.
+        if self.index_route(t).is_none() {
+            for pred in &self.lookup {
+                out.push_str(&format!("  {keyword} {pred}\n"));
+                keyword = "  AND";
+            }
         }
         out.push_str(&format!(
             "  {keyword} fingerprint IN (\n\
@@ -325,7 +346,7 @@ impl SeriesWhere {
              )\n\
              GROUP BY fingerprint\n\
              ORDER BY metric_name, fingerprint",
-            self.activity_read(series_table, labels_table, "      ")
+            self.activity_read(t, "      ")
         ));
         out
     }
@@ -333,30 +354,101 @@ impl SeriesWhere {
     /// Issue #635: the distinct label keys of the series this read selects,
     /// from the label index.
     pub(super) fn label_keys(&self, t: SeriesTables<'_>) -> String {
-        let _ = t;
-        String::new()
+        format!(
+            "SELECT DISTINCT key\n\
+             FROM {}\n\
+             WHERE fingerprint IN (\n\
+             \x20   SELECT fingerprint\n\
+             {}\n\
+             \x20 )\n\
+             ORDER BY key",
+            t.label_index.unwrap_or_default(),
+            self.activity_read(t, "    ")
+        )
     }
 
     /// Issue #635: the distinct values of `key` over the series this read
     /// selects, from the label index.
     pub(super) fn label_values(&self, key: &str, t: SeriesTables<'_>) -> String {
-        let _ = (key, t);
-        String::new()
+        format!(
+            "SELECT DISTINCT value\n\
+             FROM {}\n\
+             WHERE key = {}\n\
+             \x20 AND fingerprint IN (\n\
+             \x20   SELECT fingerprint\n\
+             {}\n\
+             \x20 )\n\
+             ORDER BY value",
+            t.label_index.unwrap_or_default(),
+            ch_string(key),
+            self.activity_read(t, "    ")
+        )
+    }
+
+    /// The index route's matchers and both index tables, when the read may
+    /// take the route and `t` names both tables; `None` sends the read to
+    /// the lookup.
+    #[allow(clippy::type_complexity)]
+    fn index_route<'t>(
+        &self,
+        t: SeriesTables<'t>,
+    ) -> Option<(&[(LabelMatcher, bool)], &'t str, &'t str)> {
+        Some((self.index.as_deref()?, t.label_index?, t.label_values?))
     }
 
     /// The activity read, every line indented by `indent`: the window, then
-    /// the IDs the lookup predicates select when there are any.
-    fn activity_read(&self, series_table: &str, labels_table: &str, indent: &str) -> String {
-        let mut lines = vec![format!("{indent}FROM {series_table}")];
+    /// the IDs the matchers select — from the label index when the read
+    /// takes the index route and `t` names both index tables, from the
+    /// lookup's predicates otherwise, when there are any.
+    fn activity_read(&self, t: SeriesTables<'_>, indent: &str) -> String {
+        let mut lines = vec![format!("{indent}FROM {}", t.series)];
         let mut keyword = "WHERE";
         for cond in &self.activity {
             lines.push(format!("{indent}{keyword} {cond}"));
             keyword = "  AND";
         }
-        if !self.lookup.is_empty() {
+        if let Some((roles, index_table, values_table)) = self.index_route(t) {
+            lines.push(format!("{indent}  AND fingerprint IN ("));
+            let row = |m: &LabelMatcher, e: bool| {
+                format!(
+                    "SELECT fingerprint FROM {index_table} WHERE {}",
+                    index_row(m, e, values_table)
+                )
+            };
+            let positive: Vec<String> = roles
+                .iter()
+                .filter(|(_, e)| !e)
+                .map(|(m, e)| row(m, *e))
+                .collect();
+            let negative: Vec<String> = roles
+                .iter()
+                .filter(|(_, e)| *e)
+                .map(|(m, e)| row(m, *e))
+                .collect();
+            if negative.is_empty() {
+                lines.push(format!(
+                    "{indent}    {}",
+                    positive.join(&format!("\n{indent}    INTERSECT\n{indent}    "))
+                ));
+            } else {
+                lines.push(format!("{indent}    SELECT fingerprint"));
+                lines.push(format!("{indent}    FROM ("));
+                lines.push(format!(
+                    "{indent}      {}",
+                    positive.join(&format!("\n{indent}      INTERSECT\n{indent}      "))
+                ));
+                lines.push(format!("{indent}    )"));
+                let mut keyword = "WHERE";
+                for set in negative {
+                    lines.push(format!("{indent}    {keyword} fingerprint NOT IN ({set})"));
+                    keyword = "  AND";
+                }
+            }
+            lines.push(format!("{indent}  )"));
+        } else if !self.lookup.is_empty() {
             lines.push(format!("{indent}  AND fingerprint IN ("));
             lines.push(format!("{indent}    SELECT fingerprint"));
-            lines.push(format!("{indent}    FROM {labels_table}"));
+            lines.push(format!("{indent}    FROM {}", t.labels));
             let mut keyword = "WHERE";
             for pred in &self.lookup {
                 lines.push(format!("{indent}    {keyword} {pred}"));
@@ -421,6 +513,37 @@ fn predicate(m: &LabelMatcher, target: MatcherTarget) -> String {
         MatchOp::Neq => format!("{column} != {}", ch_string(&m.value)),
         MatchOp::Re => format!("match({column}, {})", anchored_re2_literal(&m.value)),
         MatchOp::Nre => format!("NOT match({column}, {})", anchored_re2_literal(&m.value)),
+    }
+}
+
+/// One matcher's rows on the label index (issue #635). A matcher that does
+/// not match `""` (`matches_empty == false`) is positive: its rows are the
+/// series it holds for. One that does is negative: its rows are the series
+/// it fails for, and a series without the key satisfies it. A stored empty
+/// value reads as absent, exactly as `JSONExtractString` reads it: the two
+/// rows that test presence carry `value != ''`.
+fn index_row(m: &LabelMatcher, matches_empty: bool, values_table: &str) -> String {
+    let key = ch_string(&m.key);
+    let value = ch_string(&m.value);
+    match m.op {
+        MatchOp::Eq | MatchOp::Neq if m.value.is_empty() => {
+            format!("key = {key} AND value != ''")
+        }
+        MatchOp::Eq | MatchOp::Neq => format!("key = {key} AND value = {value}"),
+        MatchOp::Re | MatchOp::Nre => {
+            // The values the regex accepts hold for a positive `=~` and
+            // fail a negative `!~`; a regex that matches `""` flips both.
+            let regex_matches_empty = matches!(m.op, MatchOp::Re) == matches_empty;
+            let test = if regex_matches_empty {
+                "NOT match"
+            } else {
+                "match"
+            };
+            format!(
+                "key = {key} AND value IN (SELECT value FROM {values_table} WHERE key = {key} AND {test}(value, {}))",
+                anchored_re2_literal(&m.value)
+            )
+        }
     }
 }
 

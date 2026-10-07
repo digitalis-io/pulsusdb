@@ -1846,6 +1846,87 @@ impl MetricsEngine {
     /// [`DiscoveryProjection::SeriesLabels`] every arm's outcome — the
     /// concrete-name arm's issue #316 error mapping included — is byte-
     /// unchanged from before #472.
+    /// Issue #635: the tables a series read may name, the label index
+    /// included.
+    fn series_tables(&self) -> super::series_where::SeriesTables<'_> {
+        super::series_where::SeriesTables {
+            series: &self.config.series_table,
+            labels: &self.config.labels_table,
+            label_index: Some(&self.config.label_index_table),
+            label_values: Some(&self.config.label_values_table),
+        }
+    }
+
+    /// Issue #635: `/labels` and `/label/{name}/values` (`name` not
+    /// `__name__`) for the filters with no metric-name scope and no
+    /// `__name__` matcher, answered in SQL from the label index — one
+    /// `DISTINCT` statement per filter, concurrently, with every other
+    /// filter on [`Self::discovery_series`]. The union is the caller's.
+    ///
+    /// `key` is `None` for `/labels`. Returns the names or values the SQL
+    /// statements found, and the series the other filters selected.
+    async fn label_discovery(
+        &self,
+        key: Option<&str>,
+        filters: &[DiscoveryFilter],
+        window: DataWindow,
+    ) -> Result<(Vec<String>, Vec<(String, LabelSet)>), ReadError> {
+        let mut sqls: Vec<String> = Vec::new();
+        let mut rest: Vec<DiscoveryFilter> = Vec::new();
+        for filter in effective_filters(filters) {
+            if filter.metric_name.is_none() && filter.name_matchers.is_empty() {
+                sqls.push(match key {
+                    None => super::sql::discovery_label_names_query(
+                        self.series_tables(),
+                        &filter,
+                        window,
+                    ),
+                    Some(k) => super::sql::discovery_label_values_query(
+                        self.series_tables(),
+                        k,
+                        &filter,
+                        window,
+                    ),
+                });
+            } else {
+                rest.push(filter);
+            }
+        }
+        let indexed = async {
+            match key {
+                None => {
+                    join_all(sqls.into_iter().map(|sql| async move {
+                        self.fetch_series_rows::<super::rows::LabelKeyRow>(sql)
+                            .await
+                            .map(|rows| rows.into_iter().map(|r| r.key).collect::<Vec<_>>())
+                    }))
+                    .await
+                }
+                Some(_) => {
+                    join_all(sqls.into_iter().map(|sql| async move {
+                        self.fetch_series_rows::<super::rows::LabelValueRow>(sql)
+                            .await
+                            .map(|rows| rows.into_iter().map(|r| r.value).collect::<Vec<_>>())
+                    }))
+                    .await
+                }
+            }
+        };
+        let others = async {
+            if rest.is_empty() {
+                Ok(Vec::new())
+            } else {
+                self.discovery_series(&rest, window).await
+            }
+        };
+        let (indexed, others) = join(indexed, others).await;
+        let mut found = Vec::new();
+        for rows in indexed {
+            found.extend(rows?);
+        }
+        Ok((found, others?))
+    }
+
     fn discovery_query_for(
         &self,
         filter: &DiscoveryFilter,
@@ -1855,20 +1936,17 @@ impl MetricsEngine {
         if !takes_plain_discovery_route(filter) {
             return self.discovery_multi_query(filter, window);
         }
+        // Issue #635: a name-less filter with a positive label matcher
+        // reads its IDs from the label index; every other filter renders
+        // the lookup statement unchanged.
         let discovery_query = || {
             DiscoveryQuery::Sql(match projection {
-                DiscoveryProjection::SeriesLabels => super::sql::discovery_query(
-                    &self.config.series_table,
-                    &self.config.labels_table,
-                    filter,
-                    window,
-                ),
-                DiscoveryProjection::MetricNamesOnly => super::sql::discovery_distinct_names_query(
-                    &self.config.series_table,
-                    &self.config.labels_table,
-                    filter,
-                    window,
-                ),
+                DiscoveryProjection::SeriesLabels => {
+                    super::sql::discovery_series_query(self.series_tables(), filter, window)
+                }
+                DiscoveryProjection::MetricNamesOnly => {
+                    super::sql::discovery_names_query(self.series_tables(), filter, window)
+                }
             })
         };
         let Some(name) = filter.metric_name.as_deref() else {
@@ -2016,8 +2094,8 @@ impl MetricsEngine {
         filters: &[DiscoveryFilter],
         window: DataWindow,
     ) -> Result<Vec<String>, ReadError> {
-        let series = self.discovery_series(filters, window).await?;
-        let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let (keys, series) = self.label_discovery(None, filters, window).await?;
+        let mut names: std::collections::BTreeSet<String> = keys.into_iter().collect();
         names.insert("__name__".to_string());
         for (_, labels) in &series {
             for (k, _) in labels.iter() {
@@ -2115,8 +2193,8 @@ impl MetricsEngine {
         if name == "__name__" {
             return self.discovery_metric_names(filters, window).await;
         }
-        let series = self.discovery_series(filters, window).await?;
-        let mut values: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let (found, series) = self.label_discovery(Some(name), filters, window).await?;
+        let mut values: std::collections::BTreeSet<String> = found.into_iter().collect();
         for (_, labels) in &series {
             if let Some(v) = labels.get(name) {
                 values.insert(v.to_string());

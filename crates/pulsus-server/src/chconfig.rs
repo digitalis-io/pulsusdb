@@ -834,6 +834,8 @@ mod tests {
         assert_eq!(cfg.samples_table, "metric_samples");
         assert_eq!(cfg.series_table, "metric_series");
         assert_eq!(cfg.labels_table, "metric_labels");
+        assert_eq!(cfg.label_index_table, "metric_label_index");
+        assert_eq!(cfg.label_values_table, "metric_label_values");
         assert_eq!(cfg.metadata_table, "metric_metadata");
         assert!(!cfg.distributed);
     }
@@ -848,6 +850,11 @@ mod tests {
         assert_eq!(cfg.samples_table, "metric_samples_dist");
         assert_eq!(cfg.series_table, "metric_series_dist");
         assert_eq!(cfg.labels_table, "metric_labels_dist");
+        assert_eq!(cfg.label_index_table, "metric_label_index_dist");
+        assert_eq!(
+            cfg.label_values_table, "metric_label_values",
+            "metric_label_values is named locally inside a statement and never carries a _dist suffix"
+        );
         assert_eq!(
             cfg.metadata_table, "metric_metadata",
             "metric_metadata is a global catalog table and must never carry a _dist suffix"

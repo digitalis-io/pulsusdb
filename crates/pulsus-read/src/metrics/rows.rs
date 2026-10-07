@@ -32,6 +32,18 @@ pub struct MetricNameRow {
     pub metric_name: String,
 }
 
+/// Issue #635: one row of the label index's `SELECT DISTINCT key`.
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct LabelKeyRow {
+    pub key: String,
+}
+
+/// Issue #635: one row of the label index's `SELECT DISTINCT value`.
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct LabelValueRow {
+    pub value: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

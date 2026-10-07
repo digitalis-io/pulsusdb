@@ -15,10 +15,25 @@
 pub use pulsus_model::{LabelMatcher, MatchOp};
 
 /// Issue #635: whether `m` matches the empty string — what an absent label
-/// reads as. `None` when a regex's verdict cannot be decided in-process.
+/// reads as. A regex is decided by the same in-process compile the label
+/// cache's evaluator uses; `None` when the screen leaves the pattern to
+/// ClickHouse's RE2, or the compile fails.
 pub(super) fn matches_empty(m: &LabelMatcher) -> Option<bool> {
-    let _ = m;
-    None
+    let regex_matches_empty = || -> Option<bool> {
+        if super::re2_authority::pattern_requires_re2_authority(&m.value) {
+            return None;
+        }
+        let re =
+            pulsus_re2::compile_user_regex_anchored(&pulsus_promql::re2_pattern_to_rust(&m.value))
+                .ok()?;
+        Some(re.is_match(""))
+    };
+    match m.op {
+        MatchOp::Eq => Some(m.value.is_empty()),
+        MatchOp::Neq => Some(!m.value.is_empty()),
+        MatchOp::Re => regex_matches_empty(),
+        MatchOp::Nre => regex_matches_empty().map(|b| !b),
+    }
 }
 
 /// The full data window a query needs answered, **including** lookback and

@@ -47,7 +47,9 @@ rewrite docs/schemas.md:691-692 refs=#556
 # Issue #579 adds #549 and #579 to this file's lines. #549 is carried: the
 # two paragraphs of section 5.1 that already cited it now also state what
 # #579 pushes, so the rule reads them as added. #579 is the change itself.
-rewrite docs/architecture.md:378-378 refs=#560,#549,#579
+# Issue #635 adds #635, its own issue, where the clustering sentence names
+# the label values table among the per-shard tables with no wrapper.
+rewrite docs/architecture.md:378-378 refs=#560,#549,#579,#635
 rewrite docs/116.md:64-64
 rewrite docs/116.md:75-75
 rewrite crates/pulsus-clickhouse/src/client.rs:156-164 refs=#560

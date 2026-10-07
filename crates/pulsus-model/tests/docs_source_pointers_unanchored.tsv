@@ -6,11 +6,12 @@ docs/116.md	crates/pulsus-write/src/writer/spool.rs:98	no_name_the_target_file_h
 docs/116.md	docs/architecture.md:188	no_name_the_target_file_holds
 docs/116.md	docs/architecture.md:20	no_name_the_target_file_holds
 docs/116.md	docs/schemas.md:1050	no_name_the_target_file_holds
-docs/116.md	docs/schemas.md:194	no_name_the_target_file_holds
+docs/116.md	docs/schemas.md:209	no_name_the_target_file_holds
 docs/116.md	ingest/http.rs:116-121	no_name_the_target_file_holds
 docs/116.md	model.rs:156	no_name_the_target_file_holds
 docs/116.md	model.rs:79	no_name_the_target_file_holds
-docs/116.md	schemas.md:194	no_name_the_target_file_holds
+docs/116.md	schemas.md:173	no_name_the_target_file_holds
+docs/116.md	schemas.md:209	no_name_the_target_file_holds
 docs/116.md	schemas.md:519	no_name_the_target_file_holds
 docs/116.md	writer/rows.rs:428	no_name_the_target_file_holds
 docs/116.md	writer/rows.rs:963	no_name_the_target_file_holds
@@ -853,8 +854,7 @@ docs/query-to-sql.md	query_lowering_doc_gate.rs:472	no_name_the_target_file_hold
 docs/query-to-sql.md	query_lowering_doc_gate.rs:545	no_name_the_target_file_holds
 docs/query-to-sql.md	querytext.rs:52	ambiguous_basename
 docs/query-to-sql.md	querytext.rs:53	ambiguous_basename
-docs/query-to-sql.md	schema/schema.sql:395	no_name_the_target_file_holds
-docs/query-to-sql.md	schema/schema.sql:484	no_name_the_target_file_holds
+docs/query-to-sql.md	schema/schema.sql:507	no_name_the_target_file_holds
 docs/query-to-sql.md	search_eval.rs:2439	no_name_the_target_file_holds
 docs/query-to-sql.md	search_eval.rs:3127	no_name_the_target_file_holds
 docs/query-to-sql.md	search_plan.rs:1091-1092	no_name_the_target_file_holds

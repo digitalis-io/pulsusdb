@@ -1,5 +1,6 @@
 //! `pulsusdb rebuild-metrics`: replays a window of `metric_landing` into one
-//! of the five tables the materialized views maintain (issues #603, #623).
+//! of the seven tables the materialized views maintain (issues #603, #623,
+//! #635).
 //!
 //! **Why it exists.** A view never reconciles against its source — it reacts
 //! to new inserts. So if a target ends up wrong (a bad view definition, a
@@ -24,11 +25,11 @@ use pulsus_config::Config;
 
 use crate::chconfig::{conn_config_from, schema_params_from};
 
-/// The five targets, each with the materialized view that maintains it and,
+/// The seven targets, each with the materialized view that maintains it and,
 /// where a replay must drop partitions first, the expression they are keyed
 /// on.
 ///
-/// Three tolerate a replay without dropping. `metric_metadata` is a
+/// Five tolerate a replay without dropping. `metric_metadata` is a
 /// replacing table keyed on `metric_name`, so a replayed row is the same row
 /// or loses to a newer one; `metric_labels` and `metric_series` aggregate,
 /// so a replayed row folds into the one stored — `min` and `max` of the same
@@ -57,12 +58,18 @@ const TARGETS: &[(&str, &str, Option<&str>)] = &[
     // No partition key, and no need to drop: the engine folds on
     // `(metric_name, fingerprint)`, a series' one lookup row.
     ("metric_labels", "metric_labels_mv", None),
+    // No partition key, and no need to drop (issue #635): the engine
+    // replaces on the whole row, `(key, value, fingerprint)` and `(key,
+    // value)`, so a replayed row merges into the one stored.
+    ("metric_label_index", "metric_label_index_mv", None),
+    ("metric_label_values", "metric_label_values_mv", None),
 ];
 
 #[derive(Args, Debug)]
 pub(crate) struct RebuildMetrics {
     /// Which table to rebuild: `metric_samples`, `metric_series`,
-    /// `metric_metadata`, `metric_labels` or `metric_hist_samples`.
+    /// `metric_metadata`, `metric_labels`, `metric_hist_samples`,
+    /// `metric_label_index` or `metric_label_values`.
     #[arg(long)]
     target: String,
 
