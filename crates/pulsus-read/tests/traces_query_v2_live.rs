@@ -7306,10 +7306,18 @@ async fn search_routed_answers_as_today_on_fixture_c() {
     .await;
     let engine = engine_of(&db).await;
     let names = inventory_new_names();
+    // The inventory's covered corpus rows, then issue #592 part 1's shapes
+    // beyond the corpus.
+    let mut cases: Vec<(String, String)> = names
+        .iter()
+        .map(|name| (name.clone(), corpus_query(name)))
+        .collect();
+    for shape in PIPELINE_SHAPES_BEYOND_THE_CORPUS {
+        cases.push((shape.to_string(), shape.to_string()));
+    }
     let mut wrong: Vec<String> = Vec::new();
-    for name in &names {
-        let text = corpus_query(name);
-        let parsed = parse_query(&text);
+    for (name, text) in &cases {
+        let parsed = parse_query(text);
         for (limit, spss) in LIMIT_SPSS {
             let plan = plan_of(&engine, &parsed, window, limit, spss);
             if !covered(&plan) {
@@ -7329,16 +7337,31 @@ async fn search_routed_answers_as_today_on_fixture_c() {
         }
     }
     drop_db(&db).await;
-    eprintln!("compared {} × 3", names.len());
-    assert_eq!(names.len(), 82, "the inventory's new rows");
+    eprintln!("compared {} × 3", cases.len());
+    assert_eq!(names.len(), 86, "the inventory's new rows");
     assert!(
         wrong.is_empty(),
         "{} of {} differ:\n\n{}",
         wrong.len(),
-        names.len() * 3,
+        cases.len() * 3,
         wrong.join("\n\n")
     );
 }
+
+/// Issue #592 part 1's pipeline shapes beyond the corpus: later `{…}`
+/// filters and `select()` after a single filter, each answered by the
+/// search statement as by today's engine on fixture C.
+const PIPELINE_SHAPES_BEYOND_THE_CORPUS: [&str; 7] = [
+    // One field per scope read off the span row: span `…0004` holds all
+    // four, so a scope read from the wrong place changes the answer.
+    r#"{ } | select(event.exception.type, link.relation, resource.k8s.pod.name, instrumentation.otel.scope.build)"#,
+    r#"{ } | { name = "b" }"#,
+    r#"{ } | { .a = 1 } | { name = "b" }"#,
+    r#"{ .a = 1 } | select(.a) | { }"#,
+    r#"{ status = error } | select(status)"#,
+    r#"{ } | select(status, kind, duration, span:id, trace:id)"#,
+    r#"{ } | select(.a, span.a, resource.service.name)"#,
+];
 
 /// `T-C1`'s sixteen non-structural filters of
 /// `docs/TraceQL/measure/agreement.py`, by their ground-truth row.
