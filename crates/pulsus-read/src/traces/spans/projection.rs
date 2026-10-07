@@ -90,8 +90,9 @@ fn ceiling(text: String) -> String {
 
 /// What a condition projects for its one field.
 enum Projects {
-    /// Nothing: the condition supplies no value (`!=`, `!~`, the
-    /// envelope's own fields).
+    /// Nothing: the condition supplies no value. That is an attribute
+    /// compared with `!=` or `!~` (a span-row column projects itself under
+    /// any comparison), and any of the envelope's own fields.
     Nothing,
     /// A value's SQL, already cut, and its kind's SQL.
     Value { value: String, kind: String },
