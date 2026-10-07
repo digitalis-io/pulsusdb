@@ -4574,3 +4574,125 @@ async fn a_covered_search_explains_its_one_statement() {
         "no compiled plan: {json}"
     );
 }
+
+/// The trace ids `q` returns over `[start_ns, end_ns)`, sorted.
+fn sorted_trace_ids(port: u16, q: &str, start_ns: i64, end_ns: i64, ctx: &str) -> Vec<String> {
+    let res = search_q(port, q, start_ns, end_ns, "&limit=100&spss=100", ctx);
+    let json = res.json(ctx);
+    let mut ids: Vec<String> = json["traces"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{ctx}: a traces array, got {json}"))
+        .iter()
+        .map(|t| t["traceID"].as_str().expect("a traceID").to_string())
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// Issue #591 part 3's amendment: a search never returns a span past its
+/// retention, whether or not storage has deleted it yet, on either engine.
+///
+/// Three one-span traces: `A` and `C` an hour past the 7-day cutoff, `B`
+/// an hour inside it. The schema keeps everything (built at the suite's
+/// own retention), so expiry is played by hand and differently on each
+/// table set: today's tables lose `A`, the new tables lose `C`. Without
+/// the clamp each engine returns the expired trace its own tables still
+/// hold.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_search_never_returns_a_span_past_retention() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    const H: i64 = 3_600_000_000_000;
+    const D: i64 = 24 * H;
+    let port = 31_595;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_traces_api_v2_it_retention")).await;
+    let _server = spawn_ready_with_env(port, &db, &[("PULSUS_RETENTION_DAYS", "7")]);
+    let now = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let span = |trace: u8, start_ns: i64| {
+        f61_span(
+            trace,
+            1,
+            None,
+            "op",
+            1,
+            start_ns,
+            1_000_000,
+            vec![],
+            0,
+            vec![],
+            vec![],
+        )
+    };
+    let body = f61_request(
+        "svc",
+        "svc-a",
+        vec![
+            span(0xaa, now - 7 * D - H),
+            span(0xbb, now - 7 * D + H),
+            span(0xcc, now - 7 * D - H),
+        ],
+    );
+    let res = request(
+        port,
+        "POST",
+        "/v1/traces",
+        Some(("application/x-protobuf", &body.encode_to_vec())),
+        &[],
+    )
+    .expect("the push must be reachable");
+    assert_eq!(res.status, 200, "{:?}", String::from_utf8_lossy(&res.body));
+    settle_count(db.name(), "spans", 3, "spans").await;
+    settle_count(
+        db.name(),
+        "(SELECT DISTINCT trace_id FROM trace_recent)",
+        3,
+        "trace_recent",
+    )
+    .await;
+    settle_count(db.name(), "traces FINAL", 3, "traces").await;
+    let data = ch_data(db.name()).await;
+    let delete = |table: &str, trace: &str| {
+        format!(
+            "ALTER TABLE {table} DELETE WHERE trace_id = unhex('{trace}') \
+             SETTINGS mutations_sync = 2"
+        )
+    };
+    for table in [
+        "trace_recent",
+        "trace_spans",
+        "trace_attrs_idx",
+        "trace_error_spans",
+        "trace_edges",
+    ] {
+        ch_exec(&data, &delete(table, &"aa".repeat(16))).await;
+    }
+    for table in ["spans", "traces"] {
+        ch_exec(&data, &delete(table, &"cc".repeat(16))).await;
+    }
+    let b = vec!["bb".repeat(16)];
+    let none: Vec<String> = Vec::new();
+    let mut wrong = Vec::new();
+    for (q, start, end, want) in [
+        ("{}", now - 8 * D, now, &b),
+        (r#"{ name = "op" }"#, now - 8 * D, now, &b),
+        ("{} | coalesce()", now - 8 * D, now, &b),
+        ("{}", now - 9 * D, now - 8 * D, &none),
+        ("{} | coalesce()", now - 9 * D, now - 8 * D, &none),
+        ("{}", now - 7 * D - 2 * H, now - 7 * D + 2 * H, &b),
+        (
+            "{} | coalesce()",
+            now - 7 * D - 2 * H,
+            now - 7 * D + 2 * H,
+            &b,
+        ),
+    ] {
+        let ctx = format!("{q} over [{start}, {end})");
+        let got = sorted_trace_ids(port, q, start, end, &ctx);
+        if &got != want {
+            wrong.push(format!("{ctx}\n  want: {want:?}\n  got:  {got:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
+}

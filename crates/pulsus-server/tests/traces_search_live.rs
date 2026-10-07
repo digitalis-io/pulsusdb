@@ -4761,7 +4761,10 @@ async fn the_empty_search_and_the_error_field_answer_from_the_derived_tables() {
             traces: vec![],
             ordered: false,
             metrics: Some("complete"),
-            sql_has: vec!["bucket >= -7 AND bucket <= -4"],
+            // Issue #591 part 3's amendment: the window starts at the
+            // retention cutoff, so `[-2000 s, -1000 s)` clamps to
+            // `[-1000 s, -1000 s)`.
+            sql_has: vec!["bucket >= -4 AND bucket <= -4"],
             sql_lacks: vec![],
         },
     ];
