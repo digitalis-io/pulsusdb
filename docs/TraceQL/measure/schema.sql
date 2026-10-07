@@ -65,8 +65,7 @@ CREATE TABLE tqd_g1.traces (
     trace_id      FixedString(16)                                      CODEC(ZSTD(1)),
     start_ns      SimpleAggregateFunction(min, Int64)                  CODEC(ZSTD(1)),
     end_ns        SimpleAggregateFunction(max, Int64)                  CODEC(ZSTD(1)),
-    root_service  SimpleAggregateFunction(max, LowCardinality(String)) CODEC(ZSTD(1)),
-    root_name     SimpleAggregateFunction(max, LowCardinality(String)) CODEC(ZSTD(1)),
+    root          SimpleAggregateFunction(min, Tuple(UInt8, Int64, FixedString(8), String, String)) CODEC(ZSTD(1)),
     services      SimpleAggregateFunction(groupUniqArrayArray, Array(String)) CODEC(ZSTD(1)),
     last_start_ns SimpleAggregateFunction(max, Int64)                         CODEC(Delta, ZSTD(1)),
     buckets       SimpleAggregateFunction(groupUniqArrayArray(4096), Array(Int64)) CODEC(ZSTD(1))
@@ -77,12 +76,12 @@ SETTINGS index_granularity = 1024, ttl_only_drop_parts = 1;
 
 CREATE MATERIALIZED VIEW tqd_g1.traces_mv TO tqd_g1.traces AS
 SELECT toDate(fromUnixTimestamp64Nano(s), 'UTC') AS day, trace_id, s AS start_ns, e AS end_ns,
-       rs AS root_service, rn AS root_name, sv AS services,
+       r AS root, sv AS services,
        ls AS last_start_ns, bk AS buckets
 FROM (SELECT trace_id, min(start_ns) AS s,
              max(toInt64(least(toUInt64(start_ns) + toUInt64(duration_ns), 9223372036854775807))) AS e,
-             maxIf(service, parent_span_id = toFixedString('', 8)) AS rs,
-             maxIf(name, parent_span_id = toFixedString('', 8)) AS rn,
+             min((toUInt8(parent_span_id != toFixedString('', 8)), start_ns, span_id,
+                  toString(service), toString(name))) AS r,
              groupUniqArray(toString(service)) AS sv,
              max(start_ns) AS ls,
              groupUniqArray(4096)(intDiv(start_ns, 300000000000)) AS bk
