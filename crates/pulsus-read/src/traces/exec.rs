@@ -97,7 +97,8 @@ use super::metrics_result::{
 };
 use super::spans::fetch as span_fetch;
 use super::spans::rows::{
-    FallbackFetchRow, FetchRoute, FetchWindow, FetchedTrace, IndexedFetchRow, WideFetchRow,
+    FallbackFetchRow, FetchRoute, FetchWindow, FetchedTrace, IndexedFetchRow, SearchProjected,
+    SearchSpanTuple, SearchTraceRow, WideFetchRow,
 };
 
 use super::rows::{
@@ -636,6 +637,13 @@ pub struct TagValues {
     pub truncated: bool,
 }
 
+/// Charged before a search response's trace buffer is reserved at `n`
+/// entries: the buffer's slots and one entry's overhead (issue #591 part 3
+/// shares it between today's engine and the search statement's decode).
+pub(crate) fn output_reserve_bytes(n: usize) -> usize {
+    n * std::mem::size_of::<TraceSearchResult>() + RETAINED_ENTRY_OVERHEAD
+}
+
 /// The Layer-2 retention counter: one per request, charged on every
 /// retained allocation, released when a batch is discarded. A charge
 /// that would breach the cap is a `422 query_too_broad` — the byte
@@ -752,6 +760,40 @@ fn map_trace_metrics_error(e: ChError, config: &TraceReadConfig) -> ReadError {
 /// already-parsed `code` field — so it inherited #412's fix with no edit
 /// here when the streaming path stopped searching result bytes on a tagged
 /// response (`vendor/clickhouse/PATCHES.md` §2).
+/// The search statement's error mapper (issue #591 part 3): `Code: 395`,
+/// a `throwIf` demand, is kept as it came, so the fork can tell its own
+/// demands from any other; everything else is [`map_trace_read_error`],
+/// as every trace read.
+fn map_search_statement_error(e: ChError, config: &TraceReadConfig) -> ReadError {
+    match e {
+        ChError::Server { code: 395, .. } => ReadError::Clickhouse(e),
+        other => map_trace_read_error(other, config),
+    }
+}
+
+/// One search statement row's retained bytes, charged as it streams: the
+/// row, its two root strings, and per span the tuple, its service and per
+/// projected value the value and its two strings.
+fn search_row_bytes(row: &SearchTraceRow) -> usize {
+    std::mem::size_of::<SearchTraceRow>()
+        + row.root_service.len()
+        + row.root_name.len()
+        + row
+            .spans
+            .iter()
+            .map(|s| {
+                std::mem::size_of::<SearchSpanTuple>()
+                    + s.service.len()
+                    + s.projected
+                        .iter()
+                        .map(|p| {
+                            std::mem::size_of::<SearchProjected>() + p.value.len() + p.kind.len()
+                        })
+                        .sum::<usize>()
+            })
+            .sum::<usize>()
+}
+
 fn map_trace_read_error(e: ChError, config: &TraceReadConfig) -> ReadError {
     if let ChError::Server { code, .. } = &e {
         match *code {
@@ -2171,6 +2213,84 @@ impl TraceEngine {
         Ok((output, explain))
     }
 
+    /// Executes a [`SearchPlan`] by the route fork (issue #591 part 3): a
+    /// search the search statement covers
+    /// ([`super::spans::search::plan_statement`]) is answered by that one
+    /// statement, everything else by today's engine, unchanged.
+    pub async fn search_routed(&self, plan: &SearchPlan) -> Result<SearchOutput, ReadError> {
+        self.search_routed_inner(plan, None).await
+    }
+
+    /// [`Self::search_routed`], with the per-stage SQL: a covered search's
+    /// one `search_statement` stage, and no compiled plan.
+    pub async fn search_routed_explained(
+        &self,
+        plan: &SearchPlan,
+    ) -> Result<(SearchOutput, PlanExplain), ReadError> {
+        let mut explain = PlanExplain::new("traces");
+        let output = self.search_routed_inner(plan, Some(&mut explain)).await?;
+        Ok((output, explain))
+    }
+
+    /// The fork's shared body (section 3.2 of the part-3 design).
+    ///
+    /// A covered search is issued once with today's search settings plus
+    /// `final = 1`, so it carries the read budgets, the 64 MiB result
+    /// ceiling and the memory ceiling; its rows are collected against the
+    /// request's 256 MiB retention budget, and the decode charges the
+    /// response against the same budget. A run-time demand the statement
+    /// raises (`Code: 395` carrying one of its demand messages) sends the
+    /// request to today's engine, whose own answer stands.
+    async fn search_routed_inner(
+        &self,
+        plan: &SearchPlan,
+        mut explain: Option<&mut PlanExplain>,
+    ) -> Result<SearchOutput, ReadError> {
+        let Some(stmt) = super::spans::search::plan_statement(
+            plan,
+            &self.config.spans_v2_table,
+            &self.config.traces_table,
+            &self.config.resources_table,
+        ) else {
+            return self.search_inner(plan, explain).await;
+        };
+        if let Some(e) = explain.as_mut() {
+            e.push("search_statement", stmt.sql(), None);
+        }
+        let settings = self.search_settings().set("final", 1);
+        let mut budget = ByteBudget::new(HYDRATION_BYTE_BUDGET);
+        let mut charged = 0usize;
+        let rows = match self
+            .collect_rows_charged::<SearchTraceRow, _>(
+                stmt.sql(),
+                &settings,
+                &mut budget,
+                &mut charged,
+                map_search_statement_error,
+                search_row_bytes,
+            )
+            .await
+        {
+            Ok(rows) => rows,
+            Err(ReadError::Clickhouse(ChError::Server { code: 395, message }))
+                if stmt
+                    .demands()
+                    .iter()
+                    .any(|demand| message.contains(demand.as_str())) =>
+            {
+                return self.search_inner(plan, explain).await;
+            }
+            Err(ReadError::Clickhouse(e)) => return Err(map_trace_read_error(e, &self.config)),
+            Err(other) => return Err(other),
+        };
+        super::spans::search::decode_search_charged(
+            rows,
+            stmt.projection(),
+            plan.limit,
+            &mut budget,
+        )
+    }
+
     fn search_settings(&self) -> QuerySettings {
         search_settings(&self.config)
     }
@@ -2595,9 +2715,7 @@ impl TraceEngine {
         // reservation materializes every slot up front), then each
         // root-summary CLONE's string bytes (the map entry stays live
         // alongside the clone) are charged before that clone is made.
-        budget.charge(
-            winners.len() * std::mem::size_of::<TraceSearchResult>() + RETAINED_ENTRY_OVERHEAD,
-        )?;
+        budget.charge(output_reserve_bytes(winners.len()))?;
         let mut traces: Vec<TraceSearchResult> = Vec::with_capacity(winners.len());
         for w in winners {
             // Charge-before-materialize in BOTH branches (the module's

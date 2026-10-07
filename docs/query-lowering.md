@@ -61,12 +61,12 @@ five call sites across three files: `plan.rs:1710`, `plan.rs:1732`, `plan.rs:377
 TraceQL computes the same thing a fourth time and shares none of it:
 [`filter::collect`](../crates/pulsus-read/src/traces/filter.rs) (line 2737) walks a boolean tree
 choosing candidate generators, and
-[`plan_pipeline`](../crates/pulsus-read/src/traces/search_plan.rs) (line 1928) walks the pipeline.
+[`plan_pipeline`](../crates/pulsus-read/src/traces/search_plan.rs) (line 1931) walks the pipeline.
 
 The core replaces TraceQL's hand-written walks; LogQL's walks stay in LogQL's compiler by the decision above.
 
 **And the cost of not having it was measurable.** TraceQL's spanset aggregate had no SQL path at
-all when this record was written: `PlannedAggregate` was built at `search_plan.rs:2119` and read at
+all when this record was written: `PlannedAggregate` was built at `search_plan.rs:2122` and read at
 exactly one place, `search_eval.rs:2439`. Every matching span was therefore transported and then
 discarded. (Issue #492 part 4 gave `min(duration)`, `max(duration)` and `count()` over a
 single attribute-equality selector a `HAVING` in the generator statement; every other aggregate
@@ -592,7 +592,7 @@ per-trace instead of per-group; the shape it reads is the shape it gets, and it 
 Lowering one more stage always removes a round trip and never adds one. It can add rows read: the
 lowered form loses the client-side early termination the TraceQL loop has, and the crossover is at
 about one batch of `BATCH_TRACES` = 32 candidates
-(`crates/pulsus-read/src/traces/exec.rs:125`). The accepted worst case is bounded by one key-range
+(`crates/pulsus-read/src/traces/exec.rs:126`). The accepted worst case is bounded by one key-range
 scan — which is exactly what the phase-1 generator already costs — so there is no chain on which
 greedy lowering costs more than one generator's read. §2.7.5 gives the argument in full, together
 with the two measurements that looked like counterexamples and are not, and what would falsify it.
@@ -846,7 +846,7 @@ measurement.
   the fingerprint list, bounded by `DEFAULT_MAX_STREAMS = 100_000`
   (`crates/pulsus-read/src/logql/params.rs:121`).
 - The TraceQL search response's root summary is read trace-wide with **no time bound**, and
-  `TraceSearchResult.root` is not optional (`crates/pulsus-read/src/traces/exec.rs:490`,
+  `TraceSearchResult.root` is not optional (`crates/pulsus-read/src/traces/exec.rs:491`,
   `crates/pulsus-read/src/traces/search_sql.rs:596`). The seed is the winners' trace ids, bounded
   by the request `limit`.
 
@@ -867,7 +867,7 @@ link's `source_of` and emits an `Sql` part, not an `Engine` part.
 | rendered SQL text | 8 MiB, `422 query_too_broad` | `MAX_QUERY_TEXT_BYTES`, `crates/pulsus-read/src/querytext.rs:52` |
 
 Over either, the part becomes `Issue::PerSeed(Driver::Chunks { .. })`. That is today's phase-2 batch
-loop named for what it is: `BATCH_TRACES = 32` (`crates/pulsus-read/src/traces/exec.rs:125`).
+loop named for what it is: `BATCH_TRACES = 32` (`crates/pulsus-read/src/traces/exec.rs:126`).
 
 **And the chunk is 32 because the language says so, not because a ceiling says so** (issue #492
 part 3). The ceilings above answer *what a statement CAN hold*; they do not answer *what the
@@ -1062,7 +1062,7 @@ compiling it, so that the crate reads it the way RE2 does — `pulsus_re2::re2_p
 applied at `crates/pulsus-read/src/metrics/labels.rs:277` and `:623`,
 `crates/pulsus-read/src/metrics/re2_authority.rs:89` and `crates/pulsus-read/src/logql/plan.rs:174`.
 **The TraceQL path applies it nowhere.** `git grep -n re2_pattern_to_rust -- crates/pulsus-read/src/traces/ crates/pulsus-traceql/src/`
-returns no line; `search_plan.rs:954` compiles the **raw** pattern with
+returns no line; `search_plan.rs:957` compiles the **raw** pattern with
 `pulsus_re2::compile_user_regex_anchored(pat)`, which is `^(?:pat)$` built by
 `regex::RegexBuilder` with a size budget and no rewrite
 (`crates/pulsus-re2/src/compile_budget.rs:343`).
@@ -1084,7 +1084,7 @@ than everything.
 **Which leaves are exposed, and which are not.** An **attribute** regex is evaluated only in
 ClickHouse, through `match(val, …)` (`crates/pulsus-read/src/traces/filter.rs:912`), so it has one
 dialect and one reading. The exposed set is the leaves `plan_physical` and `plan_trace_ctx` compile
-a `StrOp::Re`/`Nre` for (`search_plan.rs:1017-1074`) — `name`, `service`, `statusMessage`,
+a `StrOp::Re`/`Nre` for (`search_plan.rs:1020-1077`) — `name`, `service`, `statusMessage`,
 `span:id`, `span:parentID`, `instrumentation:name`, `instrumentation:version`, `rootName` and
 `rootServiceName` — because those are re-checked in our process at `search_plan.rs:214-215` after a
 generator has already selected on them. The committed golden
@@ -1172,7 +1172,7 @@ blocking behaviour the reader has to infer.
 #### Payload validation runs BEFORE the fold, and the rejection governs
 
 **A disposition in the table below is only ever reached by a payload the shipped planner accepts.**
-`plan_pipeline` (`crates/pulsus-read/src/traces/search_plan.rs:1928`) refuses several payloads of
+`plan_pipeline` (`crates/pulsus-read/src/traces/search_plan.rs:1931`) refuses several payloads of
 `Aggregate`, `By` and `Select` with `PlanError`, which
 `crates/pulsus-server/src/traces_api/error.rs:304` maps to **`400`** with
 `Content-Type: text/plain; charset=utf-8` (`:270-277`). Without this rule the design would be a
@@ -1192,17 +1192,17 @@ cannot be reached by any request:
 
 | variant | rejected payload | `400` body, verbatim | reachable from a parsed+validated query |
 |---|---|---|---|
-| `Aggregate` | regex comparison operator (`search_plan.rs:1430`) | `type mismatch: aggregate filters do not support regex operators` | **no** — `validate` answers `illegal operation for the given types: count() =~ 2` |
-| `Aggregate` | `count()` given a field (`:1189`) | `type mismatch: count() takes no field` | **no** — parse error `expected ')' (count() takes no argument)` |
-| `Aggregate` | a one-arity op given no field (`:1194`) | ``type mismatch: `<op>`() requires a field`` | **no** — parse error `expected an aggregatable field (duration or an attribute)` |
-| `Aggregate` | a non-numeric intrinsic argument (`:1200`) | `type mismatch: span:childCount is not numerically aggregatable` | **yes** — `{ .service.namespace = "prod" } \| max(span:childCount) > 1` |
-| `Aggregate` | a composite argument expression (`:1212`) | `type mismatch: max((.a + .b)) is not an executable aggregation source: only a bare duration or attribute can be aggregated` | **yes** — `… \| max(.a + .b) > 1` |
-| `Aggregate` | a duration threshold on a non-duration aggregate (`:1057`) | `type mismatch: aggregate comparisons require a numeric (or duration, for duration aggregates) threshold` | **yes** — `… \| max(.a) > 1s` and `… \| count() > 1s` |
-| `Aggregate` | a non-finite numeric threshold (`:1046`) | `type mismatch: not a finite number: "999…"` | **yes** — `… \| max(.a) > <310 nines>`. The arm parses the raw literal as `f64` and filters on `is_finite`, so any decimal integer literal above `f64::MAX` reaches it; **measured** at 309, 310 and 320 digits, all three rejected here, while a 320-digit *fraction* is finite and plans. `nan`, `inf`, `1e400` and a leading `-` are refused by the lexer, but they are not the only spelling |
-| `By` | a composite key expression (`:1125`) | `type mismatch: by((.a + .b)) is not a group key this engine can execute: a grouping key must resolve to a single per-span value, so it must be an attribute or an intrinsic` | **yes** — `… \| by(.a + .b) \| count() > 1` |
-| `By` | a span-event / span-link intrinsic key (`:1435`) | `unsupported field: by(event:name): grouping by a span-event / span-link intrinsic is not supported (a span carries a collection of events/links, so there is no single group value)` | **yes** — `… \| by(event:name) \| count() > 1` |
-| `Select` | a nested-set intrinsic (`:2181`) | `type mismatch: select() of a nested-set intrinsic is not supported` | **yes** — `… \| select(nestedSetLeft)` |
-| `Select` | one of the twelve trace-level / scoped / event / link intrinsics (`:2226`) | `type mismatch: select() of this intrinsic is not supported` | **yes** — `… \| select(rootName)` |
+| `Aggregate` | regex comparison operator (`search_plan.rs:1433`) | `type mismatch: aggregate filters do not support regex operators` | **no** — `validate` answers `illegal operation for the given types: count() =~ 2` |
+| `Aggregate` | `count()` given a field (`:1192`) | `type mismatch: count() takes no field` | **no** — parse error `expected ')' (count() takes no argument)` |
+| `Aggregate` | a one-arity op given no field (`:1197`) | ``type mismatch: `<op>`() requires a field`` | **no** — parse error `expected an aggregatable field (duration or an attribute)` |
+| `Aggregate` | a non-numeric intrinsic argument (`:1203`) | `type mismatch: span:childCount is not numerically aggregatable` | **yes** — `{ .service.namespace = "prod" } \| max(span:childCount) > 1` |
+| `Aggregate` | a composite argument expression (`:1215`) | `type mismatch: max((.a + .b)) is not an executable aggregation source: only a bare duration or attribute can be aggregated` | **yes** — `… \| max(.a + .b) > 1` |
+| `Aggregate` | a duration threshold on a non-duration aggregate (`:1060`) | `type mismatch: aggregate comparisons require a numeric (or duration, for duration aggregates) threshold` | **yes** — `… \| max(.a) > 1s` and `… \| count() > 1s` |
+| `Aggregate` | a non-finite numeric threshold (`:1049`) | `type mismatch: not a finite number: "999…"` | **yes** — `… \| max(.a) > <310 nines>`. The arm parses the raw literal as `f64` and filters on `is_finite`, so any decimal integer literal above `f64::MAX` reaches it; **measured** at 309, 310 and 320 digits, all three rejected here, while a 320-digit *fraction* is finite and plans. `nan`, `inf`, `1e400` and a leading `-` are refused by the lexer, but they are not the only spelling |
+| `By` | a composite key expression (`:1128`) | `type mismatch: by((.a + .b)) is not a group key this engine can execute: a grouping key must resolve to a single per-span value, so it must be an attribute or an intrinsic` | **yes** — `… \| by(.a + .b) \| count() > 1` |
+| `By` | a span-event / span-link intrinsic key (`:1438`) | `unsupported field: by(event:name): grouping by a span-event / span-link intrinsic is not supported (a span carries a collection of events/links, so there is no single group value)` | **yes** — `… \| by(event:name) \| count() > 1` |
+| `Select` | a nested-set intrinsic (`:2184`) | `type mismatch: select() of a nested-set intrinsic is not supported` | **yes** — `… \| select(nestedSetLeft)` |
+| `Select` | one of the twelve trace-level / scoped / event / link intrinsics (`:2229`) | `type mismatch: select() of this intrinsic is not supported` | **yes** — `… \| select(rootName)` |
 | `Filter` | a mid-pipeline spanset OPERATION rather than a single filter | `type mismatch: ({ .b = 2 } && { .c = 3 }) is not executable as a pipeline stage: a ``|`` stage must be a single { ... } filter, not a cross-spanset or structural operation` | **yes** — `{ .a = 1 } \| { .b = 2 } && { .c = 3 }`. The reference's pipeline element is a full spanset expression, so the parser accepts it and the planner decides |
 
 `Coalesce` is zero-arity and has no payload to reject. `Metric`, `MetricSecondStage` and `Compare`
@@ -1212,8 +1212,8 @@ are rejected whole rather than by payload and are already "not in the chain" bel
 table marked the non-finite numeric threshold parser-shadowed on the strength of `nan`, `inf` and
 `1e400` all being refused by the lexer. They are — but a long decimal literal is not, and
 `{ .service.namespace = "prod" } | max(.a) > <320 nines>` parses, validates and returns
-`400 type mismatch: not a finite number: "999…"` from `search_plan.rs:1893`, whose rule is
-`raw.parse::<f64>()` filtered on `is_finite()`, `search_plan.rs:1890` to `:1886`. **An unreachability
+`400 type mismatch: not a finite number: "999…"` from `search_plan.rs:1896`, whose rule is
+`raw.parse::<f64>()` filtered on `is_finite()`, `search_plan.rs:1893` to `:1889`. **An unreachability
 claim is a universal over inputs**, so each of the four was re-checked by constructing the input
 that would defeat it rather than by reading the lexer: three spellings each for the regex-operator,
 `count()`-with-field and one-arity-without-field rows, and ten for the numeric threshold, including
@@ -1241,9 +1241,9 @@ re-checked the same way, with three to eight spellings each, and all four held.
 | `Coalesce`, with no preceding `By` | `Spans` → `Spans` | none — the identity | none | **always lowers**, contributing no SQL | *none* |
 | `Select { fields }` (`ast.rs:1024`) | any → same shape | **never lowers.** `apply` returns the relation unchanged and `capability` has no `Yes` arm, so field resolution decides only which `BlockReason` is reported: `select(name)` reports `NotYetLowered` and every attribute spelling reports `NameNotResolvable`, because a TraceQL seed's `ColSet` is `Closed([trace_id, name])`. Measured on both seed sources by `traces::compile::tests::select_refuses_and_names_its_reason_per_field`. **No exactness precondition** — projecting a column onto rows the evaluator will drop would be harmless | **wider `cols`**: no existing column moves, and `set_provenance` ADDS the selected field as `EvaluatorOnly` (`compile/fold.rs:245`), which the effect table already expects (`traces/compile.rs:1902`) | **never lowers** — the two refusal reasons are the only outcomes, and `NameNotResolvable` is what the explain surface renders (`compile/plan.rs:897`) for every spelling a client writes | *none* here; a left join would need an ADR 0008 clause that does not exist — [query-to-sql.md](query-to-sql.md) open question 4, and §9.8 measured the join and refused it |
 | `Filter(SpansetExpr)` (`ast.rs:1021`, issue #492 item 9) | `Spans` → `Spans` | **never lowers** (`No(NotYetLowered)`) — and the reason is soundness, not unfinished work. Pushing the filter as a `WHERE` conjunct is WRONG whenever the leading spanset is not a single filter: for `{ .tag = "x" } && { name = "a" } \| { .tag = "y" }` the qualifying span is supplied by the RIGHT operand, so `val = 'y'` ANDed onto the left leaf's `trace_attrs_idx` generator matches nothing and the trace is dropped. It would also favour one spelling over the identical `{A && B}`, which does not push its second leaf | **shape unchanged**; **clears `exact`** — the evaluator will drop spans, and traces, that the SQL returned | never lowers | *none*. It does decide WHICH generator statement phase 1 sends — `filter::collect`'s `&&` fold continued across the pipe, so `{A} \| {B}` sends the statement `{A && B}` sends — but that is a choice among statements the query already implies, not a fragment added to one |
-| `Metric(MetricStage)` (`ast.rs:1055`) | — | **not a search-path link.** `plan_pipeline` answers `400` (`search_plan.rs:2130`) | n/a | **not in the chain** — the metrics routes compile it in full already (`metrics_sql.rs:111`) | n/a |
-| `MetricSecondStage(SecondStage)` (`ast.rs:1059`) | — | `400` on search (`search_plan.rs:2137`) | n/a | not in the chain | n/a |
-| `Compare { .. }` (`ast.rs:1071`) | — | `400` on search (`search_plan.rs:2143`) | n/a | not in the chain | n/a |
+| `Metric(MetricStage)` (`ast.rs:1055`) | — | **not a search-path link.** `plan_pipeline` answers `400` (`search_plan.rs:2133`) | n/a | **not in the chain** — the metrics routes compile it in full already (`metrics_sql.rs:111`) | n/a |
+| `MetricSecondStage(SecondStage)` (`ast.rs:1059`) | — | `400` on search (`search_plan.rs:2140`) | n/a | not in the chain | n/a |
+| `Compare { .. }` (`ast.rs:1071`) | — | `400` on search (`search_plan.rs:2146`) | n/a | not in the chain | n/a |
 | `Order` (synthesised) | `Traces` → `Traces` | `exact` — over a superset the sort **key** is wrong, not just the set (§2.2) | leaves `ordering` unset | conditional | *none* |
 | `Limit(n)` (synthesised) | `Traces` → `Traces` | `ordering.is_some()` | leaves `limit` unset | conditional | *none* |
 | `Emit` (synthesised) | `Traces` \| `Groups` → answer | none — see below | records the winners' root read as the evaluator's | **must go residual**: `Never(NeedsUnwindowedRootRead)` | **served by a second SQL part, not by the evaluator** — `Cut::SourceHandoff` (§2.7.2), seeded by the winners' trace ids, `SeedBound::RequestLimit`, `Issue::Once` |
@@ -1258,7 +1258,7 @@ Four consequences fall out of the table rather than being written down.
 - **`Emit` is `Never`, and a lowered TraceQL search is three statements, not one.** The root summary
   is read trace-wide with **no time predicate** (the true root may predate the search window —
   [schemas.md §4.2](schemas.md)), and `TraceSearchResult.root` is not optional
-  (`crates/pulsus-read/src/traces/exec.rs:490`), so every search response needs it. That is exactly
+  (`crates/pulsus-read/src/traces/exec.rs:491`), so every search response needs it. That is exactly
   why the winners' root read exists today (`exec.rs:2165`), and lowering does not remove it: it
   removes the 1,108 round trips between it and the generator. The window-bounded hydration read
   survives lowering for its own reason — `spanSets[].matched` and `spanSets[].spans[]` are written
@@ -1299,7 +1299,7 @@ of the pipeline."
 | **spanset aggregate** (`count`/`sum`/`avg`/`min`/`max`) | the whole two-phase loop: 1,128 round trips, 77,572,021 metered bytes, 5,795,940,946 rows read (§9.2) | **measured on C1** |
 | **`by()` regrouping** | adds no query of its own; its saving is the same loop collapse when the selector is lowerable | argued — it adds no read |
 | **`select()` projection** | **nothing since #558** — the field's value, its numeric reading and its stored kind are projected expressions on the batch hydration statement, so the projection sends no statement and adds no round trip. It cost one extra read per batch, +4.6 KiB per request and one extra round trip when §9.8 measured and refused it; that refusal's premise — that an attribute value lives in a second table — no longer holds | measured on C2 (issue #478); the refusal measured on §9.8's corpus, and superseded by #558 |
-| **field-vs-field comparison** `{ .a = .b }` | **no read of its own since #558** — four projected slots on the hydration statement, not four statements: each attribute operand is interned into `select_attrs` *and* into `agg_fields` (`plan_operand`, `search_plan.rs:1632-1633`), so a two-operand leaf takes four slots. It sent four `attr_values_sql` reads per batch when C6 was measured. One whole request on C6: 37 statements and 300,984,841 rows read when 1 trace in 10 matches, **3,127 statements and 25,904,824,756 rows read** when 1 in 1,000 does (§9.7) | **measured on C6** |
+| **field-vs-field comparison** `{ .a = .b }` | **no read of its own since #558** — four projected slots on the hydration statement, not four statements: each attribute operand is interned into `select_attrs` *and* into `agg_fields` (`plan_operand`, `search_plan.rs:1635-1636`), so a two-operand leaf takes four slots. It sent four `attr_values_sql` reads per batch when C6 was measured. One whole request on C6: 37 statements and 300,984,841 rows read when 1 trace in 10 matches, **3,127 statements and 25,904,824,756 rows read** when 1 in 1,000 does (§9.7) | **measured on C6** |
 | **cross-field arithmetic** `{ .a * 2 > .b }` | the same four reads per batch; 347 statements and 2,869,590,609 rows read for a request matching 9,000 traces (§9.7) | **measured on C6** |
 | **event/link set comparison** `{ .a = event:name }` | one `event_set_sql` expansion per batch; the scalar operand's two value reads became slots on the hydration statement in #558, and the expansion moved onto `trace_spans`'s own arrays. It sent that co-load **plus two value reads** per batch when C6 was measured: 2,502 statements and 13,995,704,756 rows read (§9.7) | **measured on C6** |
 | **negated attribute leaf** `{ .a != "5" }` | drops the generator to the empty-predicate time-range superset (`GenClass::TimeRange`, `filter.rs:107`) and adds no read of its own, so the window's whole span scan is the cost: 4 statements, 12,097,152 rows read, 1,482 granules (§9.7) | **measured on C6** |
@@ -1472,7 +1472,7 @@ nobody later reads them as unfinished work.
 | **the nested-set numbering** `nestedSetLeft`, `nestedSetRight`, and `nestedSetParent` outside the root sentinel | a modified-preorder numbering computed per trace at query time from the `parent_id` forest; no stored column carries it. The root sentinel **is** expressible and is already lowered (`metrics_sql.rs:562`) |
 | **trace-level intrinsics** `traceDuration`, `rootName`, `rootServiceName`, `span:childCount` | resolved from a co-load that is deliberately trace-wide with **no time predicate**, because the true root may predate the window. A window-bounded statement cannot read those rows at all. Already refused on the metrics path for this reason (`lower_leaf`, `metrics_sql.rs:546`) |
 | **the `!` operator's whole-query type failure** | `{ !.a }` against a present non-boolean must fail the entire request, not skip the span. SQL evaluates row by row and cannot turn one row's type into a request-level refusal. The matching half is expressible, the failure half is not, and they are one leaf (`LeafEval::BoolTruth`, `filter.rs:529`) |
-| **`Emit` on the traces search route** | the response's root summary is read trace-wide and unwindowed, the same reason as the trace-level intrinsics — and `TraceSearchResult.root` is not optional (`crates/pulsus-read/src/traces/exec.rs:490`), so this is unconditional on that route, not a case that sometimes arises. **`Never` is the right classification and it does not mean the evaluator does the work**: the way the evaluator owns this link is to send a second statement, so `plan_of` gives it its own SQL part (`Cut::SourceHandoff`, §2.7.2). "Cannot be lowered into THIS statement" and "is not SQL" are different claims, and only the first is made here |
+| **`Emit` on the traces search route** | the response's root summary is read trace-wide and unwindowed, the same reason as the trace-level intrinsics — and `TraceSearchResult.root` is not optional (`crates/pulsus-read/src/traces/exec.rs:491`), so this is unconditional on that route, not a case that sometimes arises. **`Never` is the right classification and it does not mean the evaluator does the work**: the way the evaluator owns this link is to send a second statement, so `plan_of` gives it its own SQL part (`Cut::SourceHandoff`, §2.7.2). "Cannot be lowered into THIS statement" and "is not SQL" are different claims, and only the first is made here |
 
 **Cross-attribute comparison is deliberately not in this table.** `{ .a = .b }` compares two rows
 of the attribute index sharing a `(trace_id, span_id)`; the information is present, and the SQL
@@ -1850,7 +1850,7 @@ output kind**, and each kind has exactly one bound:
 **The cap is keyed on the SQL part, not on the request.** Each `Part::Sql` picks its cap from its
 own `yields` (§2.7.1), and a part whose `issue` is `PerSeed` applies that cap **per issue** against
 a cumulative request-scoped budget — which is exactly what `HYDRATION_BYTE_BUDGET`
-(`crates/pulsus-read/src/traces/exec.rs:155`) and `reader.logql_scan_budget_bytes` already do across
+(`crates/pulsus-read/src/traces/exec.rs:156`) and `reader.logql_scan_budget_bytes` already do across
 today's loops. A plan with three SQL parts therefore has three enforcement points, not one, and
 saying which is which is the whole reason the cap table is keyed this way. The table is the core's:
 LogQL's own compiler places its own caps — the scan budget and the limits in
@@ -1859,7 +1859,7 @@ LogQL's own compiler places its own caps — the scan budget and the limits in
 | `SqlPart::yields` | what crosses | the cap that applies |
 |---|---|---|
 | `Candidates` | up to `reader.traceql_max_candidates` keys | the candidate cap — today's mechanism, unchanged |
-| `Exact` | hydrated rows | `max_result_bytes` (`crates/pulsus-read/src/traces/exec.rs:162-172`) plus the `HYDRATION_BYTE_BUDGET` retention counter (`traces/exec.rs:155`) — today's mechanism, unchanged |
+| `Exact` | hydrated rows | `max_result_bytes` (`crates/pulsus-read/src/traces/exec.rs:163-173`) plus the `HYDRATION_BYTE_BUDGET` retention counter (`traces/exec.rs:156`) — today's mechanism, unchanged |
 | `Reduced` | at most `limit` rows | **nothing bounds the grouping that produced them** — the gap |
 
 So the placement question is answered once, structurally. The gap needs `max_rows_to_group_by`
@@ -2233,8 +2233,8 @@ never treat it as zero cost.
 
 **A third trap, and it is the one that decided an architectural question.** Our reader sends
 `max_block_size = 4096` on every search statement — `TRACE_SEARCH_MAX_BLOCK_ROWS: u64 = 4096`
-(`crates/pulsus-read/src/traces/exec.rs:181`), set in `search_settings` (`:3085`) and inherited by
-`generator_settings` (`:3119`). ClickHouse 26.3.29.7's own default is **65,409**
+(`crates/pulsus-read/src/traces/exec.rs:182`), set in `search_settings` (`:3203`) and inherited by
+`generator_settings` (`:3237`). ClickHouse 26.3.29.7's own default is **65,409**
 (`SELECT value, default FROM system.settings WHERE name = 'max_block_size'` prints `65409 65409`).
 A measurement taken at the server default is a measurement of a system we do not run, and the
 setting moves two different figures in opposite directions:
@@ -2280,7 +2280,7 @@ So a re-take at the default **refuses a statement the shipped reader would run**
 metered column by anywhere between 0% and 48% on the same statement. Two competent
 measurements of §9.7's headline figure landed a factor of 4.7 apart for exactly this reason, and
 neither was wrong about what it measured. `search_settings_pin_the_layer_1_budget_contract`
-(`crates/pulsus-read/src/traces/exec.rs:6038`) is what keeps 4,096 shipped: it asserts that the
+(`crates/pulsus-read/src/traces/exec.rs:6156`) is what keeps 4,096 shipped: it asserts that the
 rendered search settings contain the substring `max_block_size` and the substring `4096` — as two
 independent substring checks, not bound to each other, so it would not catch a different value
 arriving beside a stray `4096`.
@@ -2402,9 +2402,9 @@ beside the figures they govern rather than once here, and this list is the index
 | `max_block_size` | **4096** | the shipped value (`exec.rs:178`). At ClickHouse's own default, 65,409, the same statement peaks at **1,068.3 MiB** instead of **228.7 MiB** — across the 512 MiB ceiling — and the same statement's `result_bytes` moves by between 0% and 48% depending on the result size (§9.5's curve). Every figure below names the block size it was taken at |
 | `use_query_condition_cache` | **0**, or the cache dropped before each request | otherwise a repeat read reports an order of magnitude fewer rows (§9.5's first trap). Two routes, below |
 | `optimize_aggregation_in_order` | **1**, named on the rows that need it | it is what lets the span-ordered index stream the aggregation instead of holding a hash table over every span-group. On the current index order it buys nothing, because `(trace_id, span_id)` is not a prefix of that sorting key |
-| `max_memory_usage` | **536870912** | the shipped `reader.traceql_generator_max_memory_bytes` (`crates/pulsus-config/src/model.rs:693`), applied by `generator_settings` (`exec.rs:3119`) |
-| `max_bytes_before_external_group_by` | **0** | shipped: the generator throws rather than spilling (`exec.rs:3119`) |
-| `max_rows_to_read` | **50000000** shipped, **200000000** in the raised-budget rows | `reader.traceql_scan_budget_rows` (`model.rs:689`), carried with `read_overflow_mode = throw` by `search_settings` (`exec.rs:3079-3085`) |
+| `max_memory_usage` | **536870912** | the shipped `reader.traceql_generator_max_memory_bytes` (`crates/pulsus-config/src/model.rs:693`), applied by `generator_settings` (`exec.rs:3237`) |
+| `max_bytes_before_external_group_by` | **0** | shipped: the generator throws rather than spilling (`exec.rs:3237`) |
+| `max_rows_to_read` | **50000000** shipped, **200000000** in the raised-budget rows | `reader.traceql_scan_budget_rows` (`model.rs:689`), carried with `read_overflow_mode = throw` by `search_settings` (`exec.rs:3197-3203`) |
 | `min_bytes_for_wide_part` | **10485760** | pinned in the corpus recipe so the part format is reproducible; ClickHouse's own 26.3 default happens to be the same value, and neither trace `CREATE TABLE` pins it |
 
 **The rule this section follows: every metered figure carries its instrument beside the number.**
@@ -2438,7 +2438,7 @@ between two takes, is over statements and granules. Rows read and metered bytes 
 rather than checked, and they are outside it because they were measured to be, not because
 excluding them was convenient.**
 
-`search_settings_pin_the_layer_1_budget_contract` (`crates/pulsus-read/src/traces/exec.rs:6038`)
+`search_settings_pin_the_layer_1_budget_contract` (`crates/pulsus-read/src/traces/exec.rs:6156`)
 is what keeps 4,096 shipped, and it is worth knowing exactly how much it keeps: it asserts that the
 rendered search settings contain the substring `max_block_size` and the substring `4096`, as two
 independent checks that are not bound to each other. It would not catch a different block size
@@ -2828,7 +2828,7 @@ drops any of them answers differently from the evaluator.
   character-counted cap disagrees on any multi-byte value above 2,048 characters.
 - **Use a range test, not `anyIf`.** One `(trace_id, span_id, key)` can carry two rows, and the
   evaluator read `any(val_num)` and `any(val)` (`attr_values_sql`, deleted by #558; the reader now
-  subscripts ONE located element of the span row, `search_plan.rs:1262`), which was
+  subscripts ONE located element of the span row, `search_plan.rs:1265`), which was
   an **arbitrary** choice among them. On a three-row fixture (`a` = 5, `a` = 7, `b` = 7 on one span)
   `any(val_num)` for `key = 'a'` returned `5` on ten runs across `max_threads` 1–4 — arbitrary, and
   here stable — so `{ .a = .b }` on that span is decided by which row `any` picked. A pushed `anyIf`
@@ -2938,7 +2938,7 @@ span-group differs: 12 states, four of them `String`, for a field-vs-field equal
 of them `String`, for the arithmetic form. Per span-group at the full window the five forms cost
 1,129 / 1,116 / 1,104 / 454 / 571 bytes.
 
-Against that, `generator_settings` (`exec.rs:3119`) applies `max_memory_usage = 536870912` — the
+Against that, `generator_settings` (`exec.rs:3237`) applies `max_memory_usage = 536870912` — the
 shipped `reader.traceql_generator_max_memory_bytes` (`model.rs:693`) — with
 `max_bytes_before_external_group_by = 0`, so the statement throws rather than spilling:
 
@@ -2948,7 +2948,7 @@ Code: 241. DB::Exception: Query memory limit exceeded: would use 515.11 MiB
 While executing AggregatingTransform. (MEMORY_LIMIT_EXCEEDED) (version 26.3.29.7 (official build))
 ```
 
-`map_trace_generator_error` (`exec.rs:830`) classifies code 241 first, and `read_error_parts`
+`map_trace_generator_error` (`exec.rs:872`) classifies code 241 first, and `read_error_parts`
 (`crates/pulsus-server/src/traces_api/error.rs:366`) answers `422`. Executed rather than reasoned —
 same binary, same corpus, same query, the only change being
 `reader.traceql_generator_max_memory_bytes`:
@@ -3208,7 +3208,7 @@ from an argument.
 shape that justifies "replaces one statement per batch with one statement per query" — does not
 survive the shipped generator memory ceiling. At `max_memory_usage = 536870912`, the shipped
 `reader.traceql_generator_max_memory_bytes` (`crates/pulsus-config/src/model.rs:693`, applied by
-`generator_settings`, `crates/pulsus-read/src/traces/exec.rs:3119`), it refused on all three takes,
+`generator_settings`, `crates/pulsus-read/src/traces/exec.rs:3237`), it refused on all three takes,
 `exception_code` 241, 721 marks selected, no rows out. **The refusal is asserted on `Code: 241` and
 `512.00 MiB`, and on nothing else.** Everything else in the message is a record, and the three
 bodies below differ from each other in all four of the ways it can: the "would use" figure takes two
@@ -3290,7 +3290,7 @@ where both fail, or both succeed, means the corpus is not the one this recipe bu
 The corpus this happened on holds 10,000,000 `trace_attrs_idx` rows and 2,000,000 `trace_spans`
 rows, which is what the physical-layout statement printed under "The corpus" below returned.
 Code 241 on a generator read maps to `TooBroadReason::TraceGeneratorMemory`
-(`map_trace_generator_error`, `crates/pulsus-read/src/traces/exec.rs:830`) and the request answers
+(`map_trace_generator_error`, `crates/pulsus-read/src/traces/exec.rs:872`) and the request answers
 **422**. Table 4 is the whole measurement.
 
 #### The build these figures come from
@@ -3329,7 +3329,7 @@ default_format=RowBinaryWithNamesAndTypes&max_block_size=4096&use_query_conditio
 ```
 
 `max_block_size=4096` is the shipped `TRACE_SEARCH_MAX_BLOCK_ROWS`
-(`crates/pulsus-read/src/traces/exec.rs:181`). `use_query_condition_cache=0` is in the instrument so
+(`crates/pulsus-read/src/traces/exec.rs:182`). `use_query_condition_cache=0` is in the instrument so
 that a second take of a statement cannot be served in part from work an earlier take left behind;
 this section does not measure what that setting is worth, it holds it fixed. Table 4's ceiling takes
 are the same string with `max_memory_usage=536870912`.
@@ -3384,7 +3384,7 @@ figure is decided by the key predicate, not by the batch of trace ids.
 #### `<the 32>`, the batch every read below is taken over
 
 Every read below is one batch of 32 trace ids over the whole five-day window, which is what the
-shipped `BATCH_TRACES = 32` loop sends (`crates/pulsus-read/src/traces/exec.rs:125`). **`<the 32>`
+shipped `BATCH_TRACES = 32` loop sends (`crates/pulsus-read/src/traces/exec.rs:126`). **`<the 32>`
 means exactly this list, in this order, wherever it appears in a statement below**, and it is the
 only substitution any statement in this section carries:
 
@@ -4051,7 +4051,7 @@ at line 11). Seven committed goldens carry a join today and **none is planned by
 
 - `traces_graph/clustered_local_join.sql` and `traces_graph/single_node.sql`, one join line each,
   from `service_graph_sql` (`crates/pulsus-read/src/traces/graph_sql.rs:92`, `INNER JOIN` at 109),
-  called from `crates/pulsus-read/src/traces/exec.rs:1836` and nowhere else.
+  called from `crates/pulsus-read/src/traces/exec.rs:1878` and nowhere else.
 - `traces_metrics/compare_outer_attr.sql`, `traces_metrics/compare_status.sql` and
   `traces_metrics/compare_status_window.sql`, seven join lines each. The first was added by issue
   [#559](https://github.com/digitalis-io/pulsusdb/issues/559) — a comparison whose OUTER filter is
@@ -4387,7 +4387,7 @@ was smaller than the claim it was asked to support.**
    backstop, because reading its residue is what found three claims no verb list contained.
 2. **§3.1 said a non-finite numeric threshold was parser-shadowed. It is not.**
    `{ .service.namespace = "prod" } | max(.a) > <320 nines>` parses, validates and reaches
-   `search_plan.rs:1080`. The row is corrected to **reachable**, and **every other shadowing claim
+   `search_plan.rs:1083`. The row is corrected to **reachable**, and **every other shadowing claim
    in this document was re-checked by constructing the input that would defeat it** rather than by
    reading the lexer — four TraceQL rows with three to ten spellings each and four LogQL rows with
    three to eight. The other seven held. Two stale counts fell out of it: §10 said "four of the
@@ -5332,7 +5332,7 @@ round enumerated **every text node in both files** — `<title>`, `<desc>` and e
 nodes in the hops diagram (1 + 1 + 42) and **87** in the boundary (1 + 1 + 85), which is the literal
 and complete set of things an SVG can assert — and found **three more** in the hops diagram, all of them missed before because each earlier pass had searched for the
 *kind* of thing the pass before it found: `evaluator + heap of 20` (true of
-`crates/pulsus-read/src/traces/exec.rs:2307`, but stated nowhere in the prose), `renders 20 rows`,
+`crates/pulsus-read/src/traces/exec.rs:2427`, but stated nowhere in the prose), `renders 20 rows`,
 and "it is bounded by limit, not by candidates". All three are removed; the derived `1.12×` memory
 ratio now shows the division it comes from; and the cost model the `METERED` labels depend on is
 written into §9.1 as a **premise**, since it was the one thing the pictures asserted that the prose
@@ -5468,7 +5468,7 @@ choice. What changes is what a reader is entitled to conclude.
 
 | `NeverReason` | what it rules out | why no state can change it |
 |---|---|---|
-| `NeedsUnwindowedRootRead` | folding the winners' root read into the seed statement | the true root may start before the search window, so the root summary is read trace-wide with **no time predicate**, and `TraceSearchResult.root` is not optional (`crates/pulsus-read/src/traces/exec.rs:490`). A window-bounded statement cannot produce it, whatever has accumulated |
+| `NeedsUnwindowedRootRead` | folding the winners' root read into the seed statement | the true root may start before the search window, so the root summary is read trace-wide with **no time predicate**, and `TraceSearchResult.root` is not optional (`crates/pulsus-read/src/traces/exec.rs:491`). A window-bounded statement cannot produce it, whatever has accumulated |
 | `StructuralRelation` | pushing `>`, `>>`, `<`, `<<`, `~` into the seed statement | the relation holds between two spans of one trace, over a span set our own batching defines. Nothing in the seed statement's row scope can decide it |
 | `NestedSetNumbering` | pushing the modified-preorder numbering | it is computed per trace at query time; no stored column carries it, so there is nothing for SQL to read |
 | `TraceLevelIntrinsic` | pushing `traceDuration`, `rootName`, `rootServiceName` or `span:childCount` | they resolve from co-loads that are deliberately trace-wide and unwindowed, so they evaluate full-trace-exact whatever the search window is. A window-bounded statement cannot read those rows, in any state |
@@ -5515,7 +5515,7 @@ either half of the record.
 ### 12.3 The citations, and the hole that is enumerated rather than papered over
 
 The design record cites source files by line number, and nothing derived those citations until
-part 8: moving `search_plan.rs:2130` to `:3141` in [`query-to-sql.md`](query-to-sql.md) and running
+part 8: moving `search_plan.rs:2133` to `:3144` in [`query-to-sql.md`](query-to-sql.md) and running
 `cargo nextest run --workspace` exited 0 with no failing test. (The two numbers in that sentence
 are themselves citations as far as the dataset below is concerned, so they are kept at whatever
 lines those two pieces of code sit at today; issue #559 moved both.)
@@ -5569,11 +5569,11 @@ Of the 693 citation occurrences the five artefacts make, 503 name a bare basenam
 
 The language fallback and the anchor rule disagree on 4 citations, all of them read one at a time. 4 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
 
-The citations pointing at an empty line are `crates/pulsus-read/src/logql/plan.rs:1655` (in `docs/query-lowering.md`), `crates/pulsus-read/src/traces/metrics_sql.rs:627` (in `docs/query-lowering.md`), `metrics_sql.rs:951` (cited from 2 documents), `search_plan.rs:1200` (in `docs/query-lowering.md`), `search_plan.rs:1328` (in `docs/query-lowering.md`), `search_plan.rs:1890` (in `docs/query-lowering.md`).
+The citations pointing at an empty line are `crates/pulsus-read/src/logql/plan.rs:1655` (in `docs/query-lowering.md`), `crates/pulsus-read/src/traces/metrics_sql.rs:627` (in `docs/query-lowering.md`), `metrics_sql.rs:951` (cited from 2 documents), `search_plan.rs:1203` (in `docs/query-lowering.md`), `search_plan.rs:1331` (in `docs/query-lowering.md`), `search_plan.rs:1893` (in `docs/query-lowering.md`).
 
 The citations the rule answers differently for two occurrences of are .
 
-The citations where the fallback answers a file the citing prose does not describe are `exec.rs:3079-3085` in `docs/query-lowering.md`, `exec.rs:3119` in `docs/query-lowering.md`, `exec.rs:830` in `docs/query-lowering.md`. Each is named with its reasoning in `REVIEWED_FALLBACK_DIVERGENCES`, and the test prints them when it runs.
+The citations where the fallback answers a file the citing prose does not describe are `exec.rs:3197-3203` in `docs/query-lowering.md`, `exec.rs:3237` in `docs/query-lowering.md`, `exec.rs:872` in `docs/query-lowering.md`. Each is named with its reasoning in `REVIEWED_FALLBACK_DIVERGENCES`, and the test prints them when it runs.
 
 <!-- end generated -->
 

@@ -791,6 +791,9 @@ pub struct SearchPlan {
     /// [`generator_exactness`]'s six conditions refused (issue #492
     /// part 4).
     pub(crate) generator_exact: Result<(), NotExact>,
+    /// The query's `|` stages, counted (issue #591 part 3): a search with
+    /// any is not the search statement's (`spans::search::plan_statement`).
+    pub(crate) pipeline_len: usize,
 }
 
 impl SearchPlan {
@@ -3461,6 +3464,7 @@ pub fn plan_search(
         pushed_having,
         generator_fallback_sql,
         generator_exact: exactness,
+        pipeline_len: query.pipeline.len(),
     })
 }
 

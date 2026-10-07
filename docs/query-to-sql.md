@@ -491,14 +491,14 @@ is not a stage; it is `SpansetExpr` (`ast.rs:99`).
 | `{ traceDuration > 2s }` | none, plus one extra statement per batch reading each trace's full time span with **no time bound** | *emitted today*, golden `trace_duration.sql` |
 | `{ span:childCount > 2 }` | none, plus one extra statement per batch counting children with **no time bound** | *emitted today*, golden `child_count.sql` |
 | `{ a } > { b }` and every other structural relation | none — one statement per side, both applied after the read | *emitted today*, golden `structural_child.sql` |
-| `\| max(duration) > 1s` | none | *evaluated after the read*. `search_plan.rs:2119` records it; `search_eval.rs:3127` is the only code that reads it. Golden `count_pipeline.sql` shows no `HAVING` |
+| `\| max(duration) > 1s` | none | *evaluated after the read*. `search_plan.rs:2122` records it; `search_eval.rs:3139` is the only code that reads it. Golden `count_pipeline.sql` shows no `HAVING` |
 | `\| count() > 2` | none | *evaluated after the read*, golden `count_pipeline.sql` |
 | `\| by(span.foo)` | none — but it adds a per-batch statement reading `foo`'s value for every candidate span | *evaluated after the read*, golden `spanset_by_attr.sql` shows the value read and **no** `GROUP BY` |
 | `\| coalesce()` | none | *evaluated after the read*, golden `spanset_coalesce.sql` is byte-identical to the plain selector case |
 | `\| select(.foo)` | none — adds a per-batch value read | *evaluated after the read*, golden `spanset_by_attr.sql` second value statement |
 | `\| { name = "b" }` — a `{ ... }` filter written after another stage | none | *evaluated after the read* (issue #492 item 9). It does decide WHICH generator statement is sent: `filter::collect`'s `&&` fold continues across the `\|`, so `{A} \| {B}` sends the statement `{A && B}` sends |
-| `\| rate()`, `\| quantile_over_time(…)`, `compare(…)` | *already compiled in full* on the metrics routes | `metrics_plan.rs:398`. On the **search** route they are refused with `400` (`search_plan.rs:2130`, `:2136`, `:2142`) |
-| `\| topk(3)`, `\| bottomk(3)` — the metrics SECOND stage, after a metrics function | none | *evaluated after the read* on the metrics routes: `metrics_plan.rs:964` records it as the plan's `reduce` and `traces/exec.rs:3789` applies it to the framed series (called at `:865` for range, `:1562` for instant). Its input is the series the first stage produced, not rows, so there is nothing for it to become a `LIMIT … BY` over. On the **search** route it is refused with `400` (`search_plan.rs:2136`) |
+| `\| rate()`, `\| quantile_over_time(…)`, `compare(…)` | *already compiled in full* on the metrics routes | `metrics_plan.rs:398`. On the **search** route they are refused with `400` (`search_plan.rs:2133`, `:2139`, `:2145`) |
+| `\| topk(3)`, `\| bottomk(3)` — the metrics SECOND stage, after a metrics function | none | *evaluated after the read* on the metrics routes: `metrics_plan.rs:964` records it as the plan's `reduce` and `traces/exec.rs:3907` applies it to the framed series (called at `:907` for range, `:1604` for instant). Its input is the series the first stage produced, not rows, so there is nothing for it to become a `LIMIT … BY` over. On the **search** route it is refused with `400` (`search_plan.rs:2139`) |
 | ordering | `ORDER BY bound_ts DESC, trace_id ASC` on each first statement only | *emitted today*, `search_sql.rs:282`. The final ordering across statements is done in `pulsus-server` |
 | `limit=20` | `LIMIT 100001` on each first statement — the candidate ceiling, not the request limit | *emitted today*, `search_sql.rs:283`. The request limit is applied after the read |
 | the response | none | *never becomes SQL*. Part 5 gives the reason |
@@ -730,9 +730,9 @@ every `LIMIT` refuses unless the predicate so far means exactly what the query m
 | `\| coalesce()` after a `by()` | none — it FREES the grouping slot when the level carries no `HAVING`, and refuses when it does | *emitted today* (issue #492 part 5), superseding ADR 0008 D1's wrap. No wrap is emitted, and none was ever emitted |
 | `\| coalesce()` with no preceding `by()` | none, and none is needed | *from the design*, `docs/query-lowering.md:611`. It is the identity |
 | `\| { name = "b" }` — a `{ ... }` filter written after another stage | none | *evaluated after the read*, `docs/query-lowering.md` §3.1's `Filter` row (issue #492 item 9). Pushing it as a `WHERE` conjunct **onto the leading generator** is unsound whenever the leading spanset is not a single filter: for `{ .tag = "x" } && { name = "a" } \| { .tag = "y" }` the qualifying span comes from the RIGHT operand, so the pushed statement returns a wrong answer rather than a wider one. **That is a fact about one statement shape, not about SQL:** both tables store what the stage reads — `trace_spans.name` (`schema/schema.sql:507`) and the attribute index (`schema/schema.sql:367-385`) — and §5.1 names the rule of ours that holds the two-table form back. It clears exactness, and a mid-pipeline spanset OPERATION is a plan-time `400` |
-| `\| select(.foo)` | **emitted today** (issue #558): three projected expressions on the batch hydration statement, all three subscripted at one `arrayFirstIndex((k, s) -> k = 'foo' AND s = 'span', attr_key, attr_scope)` over the span row's own arrays — the byte-capped value, the numeric reading and the stored kind | *emitted today*, `search_sql.rs:448` and `search_plan.rs:1262`. **The join this row used to describe was never needed.** The refusal recorded in [query-lowering.md](query-lowering.md) §9.8 rested on the value living in a second table; since issue #557 the span row carries its own attributes, so putting the value beside the span reads no second table and contains no join. ADR 0008's unnamed-clause question does not arise |
-| `\| rate()`, `\| quantile_over_time(…)`, `compare(…)` | *already compiled in full* on the metrics routes | `metrics_sql.rs:111`. Still `400` on the search route (`search_plan.rs:2130`); this work does not change that |
-| `\| topk(3)`, `\| bottomk(3)` — the metrics SECOND stage | none | *evaluated after the read*, unchanged. It reduces the SERIES the first stage produced, so no clause of ADR 0008 carries it and no row set exists to apply it to: `metrics_plan.rs:964` records it, `traces/exec.rs:3789` applies it. Still `400` on the search route (`search_plan.rs:2136`) |
+| `\| select(.foo)` | **emitted today** (issue #558): three projected expressions on the batch hydration statement, all three subscripted at one `arrayFirstIndex((k, s) -> k = 'foo' AND s = 'span', attr_key, attr_scope)` over the span row's own arrays — the byte-capped value, the numeric reading and the stored kind | *emitted today*, `search_sql.rs:448` and `search_plan.rs:1265`. **The join this row used to describe was never needed.** The refusal recorded in [query-lowering.md](query-lowering.md) §9.8 rested on the value living in a second table; since issue #557 the span row carries its own attributes, so putting the value beside the span reads no second table and contains no join. ADR 0008's unnamed-clause question does not arise |
+| `\| rate()`, `\| quantile_over_time(…)`, `compare(…)` | *already compiled in full* on the metrics routes | `metrics_sql.rs:111`. Still `400` on the search route (`search_plan.rs:2133`); this work does not change that |
+| `\| topk(3)`, `\| bottomk(3)` — the metrics SECOND stage | none | *evaluated after the read*, unchanged. It reduces the SERIES the first stage produced, so no clause of ADR 0008 carries it and no row set exists to apply it to: `metrics_plan.rs:964` records it, `traces/exec.rs:3907` applies it. Still `400` on the search route (`search_plan.rs:2139`) |
 | structural relations `>` `>>` `<` `<<` `~` | none | *never becomes SQL*, `docs/query-lowering.md:776`. Part 5 |
 | `traceDuration`, `rootName`, `rootServiceName`, `span:childCount` | none | *never becomes SQL*, `docs/query-lowering.md:778`. Part 5 |
 | ordering | `ORDER BY sort_key DESC, trace_id ASC` | *from the design*, `docs/query-lowering.md:616`. Refuses over a wider-than-needed set: the sort key is the newest matching span's timestamp, so a row the SQL should not have returned changes the order, not only the set |
@@ -1191,7 +1191,7 @@ date (`schema/schema.sql:382-383`), and `trace_spans`, ordered by `(trace_id, ti
 | `\| coalesce()` after a `by()` | none — it FREES the grouping slot when the level carries no `HAVING` | — | *emitted today* (issue #492 part 5). **No subquery, no outer statement and no wrap.** With a `HAVING` in the level it refuses: the aggregate selected groups and the spans it selected are not recoverable from a statement that has already reduced them |
 | `\| coalesce()` with no preceding `by()` | none, and none is needed | — | *from the design*, `docs/query-lowering.md:611`. It is the identity |
 | `\| select(.foo)` | a left join whose right side is the attribute index restricted to `key = 'foo'`, one value per span, projected as an extra column | `FROM … LEFT JOIN (…)` | **Not decided — refused pending an ADR 0008 clause.** The per-query form this row describes refuses at the shipped generator memory ceiling: measured in [query-lowering.md](query-lowering.md) §9.8, `Code: 241` at `maximum: 512.00 MiB` on all three takes, where the identical statement with only the join removed answered its 20 rows. Two corrections to what this row used to say. **One:** widening the selector's own `key` predicate to `key IN ('a', 'foo')` and picking the values apart with `anyIf` is **one** join-free alternative, not the only one — and it is the worse one. Written instead as a disjunction of both full predicates, the merged statement keeps the `val` prune and selects exactly the granules the two statements it replaces select (§9.8, table 1). The granule comparison behind the original rejection stands for the widened form alone: `key = 'service.namespace' AND val = 'prod'` read **14 of 74** granules; `key IN ('service.namespace', 'foo')` read **51 of 74**. **Two:** the claim this row used to carry — that the join replaces one statement per batch with one for the whole request — is measured false. The whole-request form is the one that refuses, and the form that runs is the per-batch join, which is one statement per batch (§9.8, table 3). **A join is a clause ADR 0008 does not name** — §10's open question 4 |
-| `\| rate()`, `\| quantile_over_time(…)`, `compare(…)` | *already compiled in full* on the metrics routes | — | `metrics_sql.rs:111`. Still refused with `400` on the search route (`search_plan.rs:2130`) |
+| `\| rate()`, `\| quantile_over_time(…)`, `compare(…)` | *already compiled in full* on the metrics routes | — | `metrics_sql.rs:111`. Still refused with `400` on the search route (`search_plan.rs:2133`) |
 | ordering | `ORDER BY sort_key DESC, trace_id ASC` | `ORDER BY` | *from the design*, `docs/query-lowering.md:616`. Refuses over a set wider than the query: the sort key is the newest matching span's timestamp, so an extra row changes the order, not only the set |
 | `limit=20` | `LIMIT 20` | `LIMIT` | *from the design*, `docs/query-lowering.md:617` |
 | the response | none | — | **cannot become SQL.** The trace's root summary is read across the whole trace with no time bound and `TraceSearchResult.root` is not optional (`exec.rs:428`), so A compiled TraceQL search is never one statement**: the compiled generator, then the per-batch hydration read and one membership read per attribute probe, then the trace-root read with no time bound. The middle two cannot be dropped, because `spanSets[].matched` and `spanSets[].spans[]` are written unconditionally (`crates/pulsus-server/src/traces_api/search_response.rs:428-430` and `:507-512`), and a statement projecting `trace_id, max(timestamp_ns)` produces neither |
@@ -2121,8 +2121,8 @@ Under `crates/`: the route is mounted at `pulsus-server/src/logs_api/mod.rs:55-5
 `pulsus-read/src/logql/plan.rs:1053`. The three passes that make this decision today are `plan.rs:3763`,
 `plan.rs:1688` and `plan.rs:1722`; LogQL's compiler keeps or replaces them itself, and does not move
 them into the core (owner decision, #507). Evaluation after the read is `logql/pipeline.rs:1266`. The
-TraceQL equivalents are `traces/search_plan.rs:1117`, `traces/search_sql.rs:170` and
-`traces/exec.rs:2260`.
+TraceQL equivalents are `traces/search_plan.rs:1120`, `traces/search_sql.rs:170` and
+`traces/exec.rs:2380`.
 
 ### 3.3 The decision, per step
 
@@ -4075,7 +4075,7 @@ must produce SQL after. The design's own measurement on this kind of query: push
 
 **The aggregate produces no SQL today.** Every matching span is read and then discarded.
 
-**SQL today** — one first statement and one hydration statement per batch, and **no `HAVING`** anywhere. `search_plan.rs:1487` records the aggregate; `search_eval.rs:2439` is the only code that reads it.
+**SQL today** — one first statement and one hydration statement per batch, and **no `HAVING`** anywhere. `search_plan.rs:1490` records the aggregate; `search_eval.rs:2439` is the only code that reads it.
 
 `crates/pulsus-read/tests/golden/traces_search/count_pipeline.sql`, phase1 generator[0]:
 
@@ -4630,7 +4630,7 @@ Read this against TraceQL15. The two entries are the same condition on two route
 difference is the whole of what part 2 changes for it.
 ### 4.10 TraceQL — payloads that must be refused
 
-Each of these is refused by `plan_pipeline` (`crates/pulsus-read/src/traces/search_plan.rs:1928`)
+Each of these is refused by `plan_pipeline` (`crates/pulsus-read/src/traces/search_plan.rs:1931`)
 before any statement is built, and mapped to `400` at
 `crates/pulsus-server/src/traces_api/error.rs:303`. `PlanError` renders with the prefix
 `type mismatch: ` or `unsupported field: ` (`filter.rs:81-84`).
@@ -4640,14 +4640,14 @@ payload into a stage evaluated after the read and then answer it.
 
 | query | `400` body | where |
 |---|---|---|
-| `{ .service.namespace = "prod" } \| max(.a + .b) > 1` | `type mismatch: max((.a + .b)) is not an executable aggregation source: only a bare duration or attribute can be aggregated` | `search_plan.rs:1481-1484` |
-| `{ .service.namespace = "prod" } \| max(span:childCount) > 1` | `type mismatch: span:childCount is not numerically aggregatable` | `search_plan.rs:1469-1471` |
-| `{ .service.namespace = "prod" } \| max(.a) > 1s` | `type mismatch: aggregate comparisons require a numeric (or duration, for duration aggregates) threshold` | `search_plan.rs:1091-1092` |
-| `{ .service.namespace = "prod" } \| by(.a + .b) \| count() > 1` | `type mismatch: by((.a + .b)) is not a group key this engine can execute: a grouping key must resolve to a single per-span value, so it must be an attribute or an intrinsic` | `search_plan.rs:1394-1395` |
-| `{ .service.namespace = "prod" } \| by(event:name) \| count() > 1` | `unsupported field: by(event:name): grouping by a span-event / span-link intrinsic is not supported (a span carries a collection of events/links, so there is no single group value)` | `search_plan.rs:1709-1710` |
-| `{ .service.namespace = "prod" } \| select(rootName)` | `type mismatch: select() of this intrinsic is not supported` | `search_plan.rs:2226` |
-| `{ .service.namespace = "prod" } \| select(nestedSetLeft)` | `type mismatch: select() of a nested-set intrinsic is not supported` | `search_plan.rs:2181` |
-| `{ .service.namespace = "prod" } \| rate()` | the metrics stages are not search-route stages | `search_plan.rs:2130` |
+| `{ .service.namespace = "prod" } \| max(.a + .b) > 1` | `type mismatch: max((.a + .b)) is not an executable aggregation source: only a bare duration or attribute can be aggregated` | `search_plan.rs:1484-1487` |
+| `{ .service.namespace = "prod" } \| max(span:childCount) > 1` | `type mismatch: span:childCount is not numerically aggregatable` | `search_plan.rs:1472-1474` |
+| `{ .service.namespace = "prod" } \| max(.a) > 1s` | `type mismatch: aggregate comparisons require a numeric (or duration, for duration aggregates) threshold` | `search_plan.rs:1094-1095` |
+| `{ .service.namespace = "prod" } \| by(.a + .b) \| count() > 1` | `type mismatch: by((.a + .b)) is not a group key this engine can execute: a grouping key must resolve to a single per-span value, so it must be an attribute or an intrinsic` | `search_plan.rs:1397-1398` |
+| `{ .service.namespace = "prod" } \| by(event:name) \| count() > 1` | `unsupported field: by(event:name): grouping by a span-event / span-link intrinsic is not supported (a span carries a collection of events/links, so there is no single group value)` | `search_plan.rs:1712-1713` |
+| `{ .service.namespace = "prod" } \| select(rootName)` | `type mismatch: select() of this intrinsic is not supported` | `search_plan.rs:2229` |
+| `{ .service.namespace = "prod" } \| select(nestedSetLeft)` | `type mismatch: select() of a nested-set intrinsic is not supported` | `search_plan.rs:2184` |
+| `{ .service.namespace = "prod" } \| rate()` | the metrics stages are not search-route stages | `search_plan.rs:2133` |
 
 Every one carries `Content-Type: text/plain; charset=utf-8`. **The traces route does not set
 `X-Content-Type-Options: nosniff` and the logs route does** — `traces_api/error.rs:270-274` against
@@ -4657,7 +4657,7 @@ One refusal that is **not** a payload rejection, because it happens during evalu
 
 | query | status | body | where |
 |---|---|---|---|
-| `{ !.a = 1 }` against a span whose `a` is present and is not a boolean | `400` | `expression (!.a) expected a boolean` | raised at `search_eval.rs:1223`, mapped at `traces_api/error.rs:385`, pinned character for character by `crates/pulsus-server/tests/traces_search_live.rs:1439` |
+| `{ !.a = 1 }` against a span whose `a` is present and is not a boolean | `400` | `expression (!.a) expected a boolean` | raised at `search_eval.rs:1223`, mapped at `traces_api/error.rs:385`, pinned character for character by `crates/pulsus-server/tests/traces_search_live.rs:1467` |
 
 This one matters most for this work: **it is raised by a stage evaluated after the read, and it must
 stay a `400` regardless of how much of the query became SQL.** Compiling a stage changes which
@@ -5382,10 +5382,10 @@ engine will read, and what it will return:
 | LogQL result bytes | 1 GiB still held when the statement ends | `logql/charge.rs:1296`; refused `422`, never cut short |
 | LogQL over-fetch factor | `reader.logql_pipeline_scan_factor`, default 10 | field at `model.rs:532`, default at `:686`. Applies only while a stage that drops lines is evaluated after the read |
 | TraceQL candidates | `reader.traceql_max_candidates`, default 100,000 | field at `model.rs:544`, default at `:688`. Per first statement and for the merged set |
-| TraceQL batch size | 32 traces | `traces/exec.rs:125` |
-| spans per trace | 10,000 | `traces/exec.rs:130`; a trace over it is reported incomplete |
-| TraceQL span-read bytes | 256 MiB | `traces/exec.rs:155` |
-| ClickHouse result bytes, traces | 64 MiB, refusing rather than truncating | `traces/exec.rs:172`, applied at `:3074` |
+| TraceQL batch size | 32 traces | `traces/exec.rs:126` |
+| spans per trace | 10,000 | `traces/exec.rs:131`; a trace over it is reported incomplete |
+| TraceQL span-read bytes | 256 MiB | `traces/exec.rs:156` |
+| ClickHouse result bytes, traces | 64 MiB, refusing rather than truncating | `traces/exec.rs:173`, applied at `:3192` |
 | rendered SQL text | 8 MiB; at or past it is `422 query_too_broad` | `pulsus-read/src/querytext.rs:52` |
 | handover size | at most one set of values written into the text of the next statement. 32,768 literal ids is `Code: 168. DB::Exception: AST is too big. Maximum: 50000.` | ADR 0008 D3 |
 
@@ -5396,7 +5396,7 @@ engine will read, and what it will return:
   aggregate is evaluated after the read the statement has no `LIMIT` at all, so the grouping is the
   only thing left to bound. The bound is `max_rows_to_group_by` with
   `group_by_overflow_mode = 'throw'`, reported as the existing `422`. The metrics route already has
-  the same mechanism for sets — 1,000,000 rows, `traces/exec.rs:227` — and TraceQL20's series probe
+  the same mechanism for sets — 1,000,000 rows, `traces/exec.rs:228` — and TraceQL20's series probe
   is the same idea applied before the statement runs.
 - **The window on every statement.** Every compiled search statement carries the request's own
   half-open bound, `timestamp_ns >= start AND timestamp_ns < end`
@@ -5890,7 +5890,7 @@ noticed and are not grounds for a new round.
    **Measured, and it changes what an amendment has to meet: the whole-request join form does not
    survive the shipped generator memory ceiling.** At `max_memory_usage = 536870912` — the shipped
    `reader.traceql_generator_max_memory_bytes` (`crates/pulsus-config/src/model.rs:693`, applied by
-   `generator_settings`, `crates/pulsus-read/src/traces/exec.rs:3119`) — the form §2.9's TraceQL30
+   `generator_settings`, `crates/pulsus-read/src/traces/exec.rs:3237`) — the form §2.9's TraceQL30
    works refused on all three takes with `Code: 241` at `maximum: 512.00 MiB`, no rows out, while
    the identical statement with only the join removed answered its 20 rows on all three takes at the
    same ceiling. Code 241 on a generator read maps to `TooBroadReason::TraceGeneratorMemory`

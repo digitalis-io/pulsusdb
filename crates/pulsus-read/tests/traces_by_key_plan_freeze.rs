@@ -124,6 +124,11 @@ fn render_plan(key: &str) -> String {
 /// rule the search it guards uses, or it refuses searches that would have
 /// succeeded; that is the whole change, recorded in
 /// `docs/query-lowering.md` and in the differential ledger.
+///
+/// **Regenerated on issue #591 part 3, for one added line per key.**
+/// `SearchPlan` counts its `|` stages, `pipeline_len`, so the route fork
+/// can send a search with any to today's engine. Every key's plan gains
+/// `pipeline_len: 1` — each is a `| by(...)` — and nothing else moved.
 #[test]
 fn every_served_by_key_plans_as_it_did_before_the_grammar_change() {
     let mut rendered: BTreeMap<String, String> = BTreeMap::new();
