@@ -1,29 +1,42 @@
-//! Issue #549: the grouped instant read — eligibility, group assignment,
-//! the threshold, and the fold of the statements' run rows back into a
-//! PromQL value.
+//! Issues #549 and #579: the aggregate nodes the database answers —
+//! eligibility, group assignment, the threshold, and the reading of the
+//! statements' rows back into each node's answer.
+//!
+//! Two shapes, at any node of the query:
+//!
+//! - **shape B** (#549): `min`/`max`/`count`/`group` over a plain instant
+//!   selector, one run statement per fingerprint chunk;
+//! - **shape A** (#579): `sum`/`avg`/`count`/`min`/`max` over
+//!   `rate`/`irate`/`increase` of a plain range selector, one statement
+//!   per node — split by time over [`PUSHED_SERIES_STEPS_PER_STATEMENT`] —
+//!   returning one row per group per step.
 //!
 //! # Where the decision is taken
 //!
 //! ```text
 //! query_inner
 //!   |-- plan = pulsus_promql::plan(expr, params)
-//!   |-- grouped::shape_of(&plan, &plan_params, &cfg) -> Option<GroupedShape>
-//!   |     PURE, before the fetch loop. One selector; the root is
-//!   |     Aggregate{min|max|count|group, grouping, Selector(id)} over a
-//!   |     PLAIN instant selector; the grid arithmetic does not overflow;
-//!   |     the flag is on. None -> today's route, nothing else changes.
-//!   `-- the phase-1 loop, for that one selector
+//!   |-- grouped::node_verdicts(&plan, &plan_params, &cfg)
+//!   |     PURE, before the fetch loop. Every Aggregate node over a
+//!   |     selector or a range function, with a PushShape or the
+//!   |     NodeDecline that names why not. The flag is on.
+//!   `-- the phase-1 loop, for each selector a pushed node owns
 //!         resolution = resolver.resolve_labelled(...)   <- the ONE resolve
-//!         grouped::decide(shape, &resolution, grid)
-//!           Series(pairs) -> gids from the pairs, then `series >= 2 * groups`
+//!         grouped::decide / grouped::decide_range
+//!           Series(pairs) -> gids from the pairs (shape B: then the
+//!                            `series >= 2 * groups` threshold)
 //!           SqlFallback   -> Err(ResolutionNotFingerprints)
-//!         Ok  -> render the grouped statements, skip the chunk builders
+//!         Ok  -> render the node's statements, skip the chunk builders
 //!         Err -> fall through with the SAME resolution
 //! ```
 //!
-//! [`shape_of`] is the **sole owner** of the overflow guard and of the
-//! feature flag: [`decide`] re-checks neither, and
-//! [`super::grouped_sql::grouped_fetch`] re-checks neither.
+//! The evaluator then takes each pushed node's vector at every step from
+//! `SeriesData::pushed` and evaluates nothing below it; every other node
+//! is evaluated over the pushed nodes' results as before.
+//!
+//! [`node_verdicts`] is the **sole owner** of the overflow guard and of
+//! the feature flag: [`decide`] and [`decide_range`] re-check neither,
+//! and neither statement builder re-checks either.
 //!
 //! # The group key never enters SQL
 //!
@@ -131,9 +144,9 @@ impl GroupedOp {
 
 /// Why [`decide`] declined, and **only** what `decide` can produce.
 ///
-/// [`shape_of`] consumes the aggregate shape, the plain-selector checks,
-/// the grid arithmetic and the flag, returning `None` for all four, so
-/// none of them has a variant here. A refusal reason is written only
+/// [`node_verdicts`] consumes the aggregate shape, the plain-selector
+/// checks, the grid arithmetic and the flag, so none of them has a variant
+/// here. A refusal reason is written only
 /// after naming the line that returns it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeclineReason {
@@ -176,7 +189,8 @@ pub struct Run {
     pub flags: Option<u8>,
 }
 
-/// What [`shape_of`] establishes without looking at any resolution.
+/// What [`node_verdicts`] establishes for a shape-B node without looking
+/// at any resolution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupedShape {
     pub op: GroupedOp,
@@ -342,8 +356,209 @@ pub fn node_verdicts(
     params: &PlanParams,
     cfg: &MetricsConfig,
 ) -> Vec<(usize, Result<PushShape, NodeDecline>)> {
-    let _ = (plan, params, cfg);
-    Vec::new()
+    // The flag is read HERE and nowhere else in this module or in
+    // `grouped_sql`.
+    if !cfg.grouped_push {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    walk(&plan.root, plan, params, &mut out);
+    out
+}
+
+/// Visits `e` and its children in written order. A node that is pushed
+/// is not descended into: everything below it is the database's.
+fn walk(
+    e: &PlanExpr,
+    plan: &QueryPlan,
+    params: &PlanParams,
+    out: &mut Vec<(usize, Result<PushShape, NodeDecline>)>,
+) {
+    if let PlanExpr::Aggregate {
+        op,
+        expr,
+        param,
+        grouping,
+        expr_pos,
+        self_pos,
+        ..
+    } = e
+        && let Some(verdict) = verdict_of(
+            *op,
+            expr,
+            param.is_some(),
+            grouping.as_ref(),
+            *expr_pos,
+            plan,
+            params,
+        )
+    {
+        let pushed = verdict.is_ok();
+        out.push((
+            *self_pos,
+            verdict.map(|kind| PushShape {
+                self_pos: *self_pos,
+                kind,
+            }),
+        ));
+        if pushed {
+            return;
+        }
+    }
+    for child in children(e) {
+        walk(child, plan, params, out);
+    }
+}
+
+/// A node's children in written order. **No `_` arm**, so a new
+/// [`PlanExpr`] variant fails to compile here. A subquery's inner
+/// expression is deliberately not a child: it is evaluated on the
+/// subquery's own grid, never the request's.
+fn children(e: &PlanExpr) -> Vec<&PlanExpr> {
+    match e {
+        PlanExpr::Selector(_)
+        | PlanExpr::Time
+        | PlanExpr::Scalar(_)
+        | PlanExpr::StringLiteral(_)
+        | PlanExpr::RangeVector { .. }
+        | PlanExpr::RangeFn { .. }
+        | PlanExpr::OverTime { .. }
+        | PlanExpr::AbsentOverTime { .. } => Vec::new(),
+        PlanExpr::OverTimeParam { args, .. } | PlanExpr::ScalarFn { args, .. } => {
+            args.iter().map(Box::as_ref).collect()
+        }
+        PlanExpr::Absent { arg, .. }
+        | PlanExpr::Sort { arg, .. }
+        | PlanExpr::SortByLabel { arg, .. }
+        | PlanExpr::LabelReplace { arg, .. }
+        | PlanExpr::LabelJoin { arg, .. }
+        | PlanExpr::HistogramAccessor { arg, .. }
+        | PlanExpr::Timestamp { arg, .. }
+        | PlanExpr::ScalarOf { arg }
+        | PlanExpr::VectorOf { arg } => vec![arg.as_ref()],
+        PlanExpr::HistogramQuantile { quantile, expr, .. } => vec![quantile, expr],
+        PlanExpr::HistogramQuantiles {
+            expr, quantiles, ..
+        } => std::iter::once(expr.as_ref())
+            .chain(quantiles.iter().map(Box::as_ref))
+            .collect(),
+        PlanExpr::HistogramFraction {
+            lower, upper, expr, ..
+        } => vec![lower, upper, expr],
+        PlanExpr::Aggregate { expr, param, .. } => std::iter::once(expr.as_ref())
+            .chain(param.iter().map(Box::as_ref))
+            .collect(),
+        PlanExpr::CountValues { expr, .. } => vec![expr.as_ref()],
+        PlanExpr::Binary { lhs, rhs, .. } | PlanExpr::SetOp { lhs, rhs, .. } => vec![lhs, rhs],
+        PlanExpr::MathFn {
+            arg, scalar_args, ..
+        } => std::iter::once(arg.as_ref())
+            .chain(scalar_args.iter().map(Box::as_ref))
+            .collect(),
+        PlanExpr::DateFn { arg, .. } => arg.iter().map(Box::as_ref).collect(),
+        PlanExpr::Info { base, .. } => vec![base.as_ref()],
+    }
+}
+
+/// The verdict on one `Aggregate` node, or `None` when its child is
+/// neither a selector nor a range function — not a candidate for either
+/// shape, so there is nothing to report.
+fn verdict_of(
+    op: AggOp,
+    expr: &PlanExpr,
+    has_param: bool,
+    grouping: Option<&Grouping>,
+    expr_pos: usize,
+    plan: &QueryPlan,
+    params: &PlanParams,
+) -> Option<Result<PushKind, NodeDecline>> {
+    match expr {
+        // Shape B: issue #549's checks, at any node.
+        PlanExpr::Selector(id) => {
+            let Some(op) = GroupedOp::of(op).filter(|_| !has_param) else {
+                return Some(Err(NodeDecline::Aggregation));
+            };
+            let sel = plan.selectors.iter().find(|s| s.id == *id)?;
+            let Some(metric_name) = plain_metric_name(sel).filter(|_| sel.range_ms.is_none())
+            else {
+                return Some(Err(NodeDecline::Selector));
+            };
+            let Some(grid) = grid_of(params) else {
+                return Some(Err(NodeDecline::GridOverflow));
+            };
+            Some(Ok(PushKind::Instant(GroupedShape {
+                op,
+                selector: *id,
+                metric_name,
+                grouping: grouping.cloned(),
+                grid,
+                expr_pos,
+                instant: params.step_ms == 0,
+            })))
+        }
+        // Shape A.
+        PlanExpr::RangeFn { func, source, .. } => {
+            let Some(op) = RangeAggOp::of(op).filter(|_| !has_param) else {
+                return Some(Err(NodeDecline::Aggregation));
+            };
+            let Some(func) = PushedRangeFn::of(*func) else {
+                return Some(Err(NodeDecline::RangeFunction));
+            };
+            let pulsus_promql::plan::RangeSource::Selector(id) = source else {
+                return Some(Err(NodeDecline::Selector));
+            };
+            let sel = plan.selectors.iter().find(|s| s.id == *id)?;
+            let (Some(metric_name), Some(range_ms)) = (plain_metric_name(sel), sel.range_ms) else {
+                return Some(Err(NodeDecline::Selector));
+            };
+            // The output's name channel is the group key's, which the gid
+            // does not carry.
+            if grouping.is_some_and(|g| !g.without && g.labels.iter().any(|l| l == "__name__")) {
+                return Some(Err(NodeDecline::NameGrouping));
+            }
+            let Some(grid) = range_grid_of(params, range_ms) else {
+                return Some(Err(NodeDecline::GridOverflow));
+            };
+            Some(Ok(PushKind::Range(RangeShape {
+                op,
+                func,
+                selector: *id,
+                metric_name,
+                grouping: grouping.cloned(),
+                grid,
+                range_ms,
+                instant: params.step_ms == 0,
+            })))
+        }
+        PlanExpr::OverTime { .. } | PlanExpr::OverTimeParam { .. } => {
+            Some(Err(if RangeAggOp::of(op).is_some() && !has_param {
+                NodeDecline::RangeFunction
+            } else {
+                NodeDecline::Aggregation
+            }))
+        }
+        _ => None,
+    }
+}
+
+/// The selector's one concrete metric name when it is PLAIN: no non-`Eq`
+/// `__name__` matcher, no offset, no `@`, no enclosing subquery context,
+/// not the `info()` family, no histogram-stats reduction, and neither
+/// extended-range modifier. The range is the caller's to check.
+fn plain_metric_name(sel: &pulsus_promql::SelectorSpec) -> Option<String> {
+    let name = sel.metric_name.clone()?;
+    if !sel.name_matchers.is_empty()
+        || sel.offset_ms != 0
+        || sel.at_ms.is_some()
+        || sel.fetch != pulsus_promql::plan::FetchExtent::default()
+        || sel.info_family
+        || sel.histogram_stats
+        || sel.anchored
+        || sel.smoothed
+    {
+        return None;
+    }
+    Some(name)
 }
 
 /// Issue #579: every `Aggregate` node the database can answer.
@@ -361,16 +576,48 @@ pub fn decide_range(
     shape: &RangeShape,
     resolution: &LabelledResolution,
 ) -> Result<RangePush, DeclineReason> {
-    let _ = (shape, resolution);
-    Err(DeclineReason::ResolutionNotFingerprints)
+    let LabelledResolution::Series(pairs) = resolution else {
+        return Err(DeclineReason::ResolutionNotFingerprints);
+    };
+    let (fingerprints, gids, groups) =
+        assign_groups(pairs, &shape.metric_name, shape.grouping.as_ref());
+    Ok(RangePush {
+        op: shape.op,
+        func: shape.func,
+        selector: shape.selector,
+        fingerprints,
+        gids,
+        groups,
+        grid: shape.grid,
+        range_ms: shape.range_ms,
+    })
 }
 
 /// Issue #579: splits a shape-A node's grid by time so no statement
 /// computes more than `cap` series-steps. Each entry is the first grid
 /// index of the chunk and the chunk's own grid.
 pub fn time_chunks(grid: Grid, series: usize, cap: usize) -> Vec<(u32, Grid)> {
-    let _ = (series, cap);
-    vec![(0, grid)]
+    let series = series.max(1);
+    if series.saturating_mul(grid.points as usize) <= cap {
+        return vec![(0, grid)];
+    }
+    // At least one step a statement, whatever the series count.
+    let per = u32::try_from((cap / series).max(1)).unwrap_or(u32::MAX);
+    let mut out = Vec::new();
+    let mut g0 = 0u32;
+    while g0 < grid.points {
+        let points = per.min(grid.points - g0);
+        out.push((
+            g0,
+            Grid {
+                start_ms: grid.start_ms + i64::from(g0) * grid.step_ms,
+                points,
+                ..grid
+            },
+        ));
+        g0 += points;
+    }
+    out
 }
 
 /// Issue #579: a shape-A node's rows, one `Vec` per time chunk with that
@@ -380,8 +627,79 @@ pub fn range_node(
     chunks: Vec<(u32, Vec<super::grouped_rows::RangeAggRow>)>,
     cancel: &CancelToken,
 ) -> Result<RangeOutcome, PromqlError> {
-    let _ = (push, chunks, cancel);
-    Ok(RangeOutcome::Node(PushedNode::default()))
+    let points = push.grid.points as usize;
+    let mut cells: Vec<Vec<(u32, f64)>> = vec![Vec::new(); points];
+    let mut histograms = 0.0f64;
+    for (g0, rows) in chunks {
+        if cancel.is_cancelled() {
+            return Err(PromqlError::Cancelled);
+        }
+        for row in rows {
+            // Picked out by its id, never by its position: the final
+            // `ORDER BY` binds only to the last `SELECT` of the union.
+            if row.gid == HISTOGRAM_SENTINEL_GID {
+                histograms += row.agg.unwrap_or(0.0);
+                continue;
+            }
+            let Some(agg) = row.agg else {
+                return Err(PromqlError::Unsupported {
+                    construct: "a NULL aggregate in a pushed node's row".to_string(),
+                });
+            };
+            let gi = g0 as usize + row.gi as usize;
+            // Unreachable: every fingerprint read is in `fps`, so every
+            // gid indexes `groups`, and `gi` is below the chunk's points.
+            if gi >= points || row.gid as usize >= push.groups.len() {
+                continue;
+            }
+            cells[gi].push((row.gid, agg));
+        }
+    }
+    if histograms > 0.0 {
+        return Ok(RangeOutcome::Histograms(histograms as u64));
+    }
+    // `aggregate_reduce`'s output order: by labels, then name.
+    let mut rank: Vec<u32> = (0..push.groups.len() as u32).collect();
+    rank.sort_by(|a, b| {
+        let (la, na) = &push.groups[*a as usize];
+        let (lb, nb) = &push.groups[*b as usize];
+        (la, na).cmp(&(lb, nb))
+    });
+    let mut position = vec![0u32; push.groups.len()];
+    for (i, gid) in rank.iter().enumerate() {
+        position[*gid as usize] = i as u32;
+    }
+    let mut steps = Vec::with_capacity(points);
+    for (gi, mut cell) in cells.into_iter().enumerate() {
+        if gi % 1_024 == 0 && cancel.is_cancelled() {
+            return Err(PromqlError::Cancelled);
+        }
+        cell.sort_by_key(|(gid, _)| position[*gid as usize]);
+        let t_ms = push.grid.start_ms + gi as i64 * push.grid.step_ms;
+        steps.push(
+            cell.into_iter()
+                .map(|(gid, v)| {
+                    let (labels, metric_name) = &push.groups[gid as usize];
+                    InstantSample {
+                        labels: labels.clone(),
+                        metric_name: metric_name.clone(),
+                        // A range function drops the name, and the
+                        // group's verdict is the OR of its members'.
+                        drop_name: true,
+                        t_ms,
+                        v,
+                        h: None,
+                    }
+                })
+                .collect(),
+        );
+    }
+    Ok(RangeOutcome::Node(PushedNode {
+        start_ms: push.grid.start_ms,
+        step_ms: push.grid.step_ms,
+        steps,
+        annotations: Annotations::new(),
+    }))
 }
 
 /// Issue #579: a shape-B node's runs, folded into the node's answer.
@@ -390,81 +708,65 @@ pub fn instant_node(
     chunks: Vec<Vec<Run>>,
     cancel: &CancelToken,
 ) -> Result<PushedNode, PromqlError> {
-    let _ = (push, chunks, cancel);
-    Ok(PushedNode::default())
+    let mut annotations = Annotations::new();
+    let value = fold(push, chunks, &mut annotations, cancel)?;
+    let mut steps: Vec<Vec<InstantSample>> = vec![Vec::new(); push.grid.points as usize];
+    let index = |t_ms: i64| ((t_ms - push.grid.start_ms) / push.grid.step_ms) as usize;
+    // `fold`'s output is already in `(labels, name)` order, so each step
+    // receives its samples in that order.
+    match value {
+        QueryValue::Vector(v) => {
+            for s in v {
+                steps[index(s.t_ms)].push(s);
+            }
+        }
+        QueryValue::Matrix(m) => {
+            for series in m {
+                for p in series.points {
+                    steps[index(p.t_ms)].push(InstantSample {
+                        labels: series.labels.clone(),
+                        metric_name: series.metric_name.clone(),
+                        drop_name: series.drop_name,
+                        t_ms: p.t_ms,
+                        v: p.v,
+                        h: None,
+                    });
+                }
+            }
+        }
+        // `fold` answers a vector or a matrix and nothing else.
+        _ => {}
+    }
+    Ok(PushedNode {
+        start_ms: push.grid.start_ms,
+        step_ms: push.grid.step_ms,
+        steps,
+        annotations,
+    })
 }
 
-/// Is this plan one the grouped statement can answer?
-///
-/// Pure, and taken **before** the fetch loop, so a decline costs one
-/// walk of the plan root and nothing else changes.
-pub fn shape_of(
-    plan: &QueryPlan,
-    params: &PlanParams,
-    cfg: &MetricsConfig,
-) -> Option<GroupedShape> {
-    // The flag is read HERE and nowhere else in this module or in
-    // `grouped_sql`.
-    if !cfg.grouped_push {
-        return None;
+impl RangeAggOp {
+    fn of(op: AggOp) -> Option<Self> {
+        match op {
+            AggOp::Sum => Some(RangeAggOp::Sum),
+            AggOp::Avg => Some(RangeAggOp::Avg),
+            AggOp::Count => Some(RangeAggOp::Count),
+            AggOp::Min => Some(RangeAggOp::Min),
+            AggOp::Max => Some(RangeAggOp::Max),
+            _ => None,
+        }
     }
-    // One selector. A binary operator, a set operator or `info()` puts a
-    // second one in the plan, and none of those is in scope.
-    if plan.selectors.len() != 1 {
-        return None;
-    }
-    let PlanExpr::Aggregate {
-        op,
-        expr,
-        param,
-        grouping,
-        expr_pos,
-        ..
-    } = &plan.root
-    else {
-        return None;
-    };
-    // `min`/`max`/`count`/`group` take no parameter; a `param` here would
-    // mean the planner built a shape this code has not been written for.
-    if param.is_some() {
-        return None;
-    }
-    let op = GroupedOp::of(*op)?;
-    // The child must be the SELECTOR itself. `max by (status)
-    // (rate(m[5m]))` has a `RangeFn` here and keeps today's route.
-    let PlanExpr::Selector(id) = expr.as_ref() else {
-        return None;
-    };
-    let sel = plan.selectors.iter().find(|s| s.id == *id)?;
+}
 
-    // A PLAIN instant selector: one concrete metric name, no non-`Eq`
-    // `__name__` matcher, no range, no offset, no `@`, no enclosing
-    // subquery context, not the `info()` family, no histogram-stats
-    // reduction, and neither extended-range modifier.
-    let metric_name = sel.metric_name.clone()?;
-    if !sel.name_matchers.is_empty()
-        || sel.range_ms.is_some()
-        || sel.offset_ms != 0
-        || sel.at_ms.is_some()
-        || sel.fetch != pulsus_promql::plan::FetchExtent::default()
-        || sel.info_family
-        || sel.histogram_stats
-        || sel.anchored
-        || sel.smoothed
-    {
-        return None;
+impl PushedRangeFn {
+    fn of(f: pulsus_promql::RangeFn) -> Option<Self> {
+        match f {
+            pulsus_promql::RangeFn::Rate => Some(PushedRangeFn::Rate),
+            pulsus_promql::RangeFn::Irate => Some(PushedRangeFn::Irate),
+            pulsus_promql::RangeFn::Increase => Some(PushedRangeFn::Increase),
+            pulsus_promql::RangeFn::Delta => None,
+        }
     }
-
-    let grid = grid_of(params)?;
-    Some(GroupedShape {
-        op,
-        selector: *id,
-        metric_name,
-        grouping: grouping.clone(),
-        grid,
-        expr_pos: *expr_pos,
-        instant: params.step_ms == 0,
-    })
 }
 
 /// The request's grid, or `None` when the arithmetic the DATABASE
@@ -523,6 +825,22 @@ fn grid_of(params: &PlanParams) -> Option<Grid> {
     })
 }
 
+/// Issue #579: the request's grid for a shape-A node, or `None` when the
+/// arithmetic its statement evaluates would overflow: [`grid_of`]'s guard
+/// with the range in place of the lookback — a sample covers grid indices
+/// up to `ts + range` — and the window's lower bound, `start - range`.
+fn range_grid_of(params: &PlanParams, range_ms: i64) -> Option<Grid> {
+    params.start_ms.checked_sub(range_ms)?;
+    let grid = grid_of(&PlanParams {
+        lookback_ms: range_ms,
+        ..*params
+    })?;
+    Some(Grid {
+        lookback_ms: params.lookback_ms,
+        ..grid
+    })
+}
+
 /// A gid must fit the statement's `UInt32` column.
 ///
 /// There is **no runtime guard** on the cast, and there does not need to
@@ -549,36 +867,8 @@ pub fn decide(
     let LabelledResolution::Series(pairs) = resolution else {
         return Err(DeclineReason::ResolutionNotFingerprints);
     };
-    // Ascending fingerprint order, the order `build_chunk_sqls` sorts
-    // into — so a chunk boundary falls in the same place on both routes
-    // and the fold's chunk order IS fingerprint order.
-    let mut by_fp: Vec<(Fingerprint, &pulsus_model::LabelSet)> =
-        pairs.iter().map(|(fp, ls)| (*fp, ls)).collect();
-    by_fp.sort_unstable_by_key(|(fp, _)| *fp);
-
-    let mut groups: Vec<(Labels, Option<String>)> = Vec::new();
-    let mut seen: HashMap<(Labels, Option<String>), u32> = HashMap::new();
-    let mut fingerprints = Vec::with_capacity(by_fp.len());
-    let mut gids = Vec::with_capacity(by_fp.len());
-    for (fp, labelset) in by_fp {
-        let key = group_key_of(
-            &super::exec::to_promql_labels(labelset),
-            Some(&shape.metric_name),
-            shape.grouping.as_ref(),
-        );
-        let gid = match seen.get(&key) {
-            Some(g) => *g,
-            None => {
-                // The cast is safe under the ceiling asserted above.
-                let g = groups.len() as u32;
-                groups.push(key.clone());
-                seen.insert(key, g);
-                g
-            }
-        };
-        fingerprints.push(fp);
-        gids.push(gid);
-    }
+    let (fingerprints, gids, groups) =
+        assign_groups(pairs, &shape.metric_name, shape.grouping.as_ref());
 
     // The threshold. An empty resolution passes it (0 >= 0) and yields
     // zero chunks, zero statements and an empty answer — the same answer
@@ -598,6 +888,50 @@ pub fn decide(
         expr_pos: shape.expr_pos,
         instant: shape.instant,
     })
+}
+
+/// The group of every resolved fingerprint, by
+/// [`pulsus_promql::group_key_of`]: fingerprints ascending, their gids in
+/// parallel, and each group's key indexed by gid.
+///
+/// Ascending fingerprint order is the order `build_chunk_sqls` sorts
+/// into — so a chunk boundary falls in the same place on both routes and
+/// the fold's chunk order IS fingerprint order — and the order the
+/// shape-A statement's `sum` folds its members in.
+#[allow(clippy::type_complexity)]
+fn assign_groups(
+    pairs: &[(Fingerprint, pulsus_model::LabelSet)],
+    metric_name: &str,
+    grouping: Option<&Grouping>,
+) -> (Vec<Fingerprint>, Vec<u32>, Vec<(Labels, Option<String>)>) {
+    let mut by_fp: Vec<(Fingerprint, &pulsus_model::LabelSet)> =
+        pairs.iter().map(|(fp, ls)| (*fp, ls)).collect();
+    by_fp.sort_unstable_by_key(|(fp, _)| *fp);
+
+    let mut groups: Vec<(Labels, Option<String>)> = Vec::new();
+    let mut seen: HashMap<(Labels, Option<String>), u32> = HashMap::new();
+    let mut fingerprints = Vec::with_capacity(by_fp.len());
+    let mut gids = Vec::with_capacity(by_fp.len());
+    for (fp, labelset) in by_fp {
+        let key = group_key_of(
+            &super::exec::to_promql_labels(labelset),
+            Some(metric_name),
+            grouping,
+        );
+        let gid = match seen.get(&key) {
+            Some(g) => *g,
+            None => {
+                // The cast is safe under the ceiling asserted above.
+                let g = groups.len() as u32;
+                groups.push(key.clone());
+                seen.insert(key, g);
+                g
+            }
+        };
+        fingerprints.push(fp);
+        gids.push(gid);
+    }
+    (fingerprints, gids, groups)
 }
 
 /// One output series before it is given a value type: the group's
@@ -877,7 +1211,7 @@ mod tests {
         }
     }
 
-    /// The flag is read in `shape_of` and nowhere else, so turning it off
+    /// The flag is read in `node_verdicts` and nowhere else, so turning it off
     /// makes every eligible query take today's route.
     #[test]
     fn the_flag_off_declines_every_query() {
@@ -1735,17 +2069,14 @@ mod tests {
         );
     }
 
-    /// T5, F8: the database's grid arithmetic would wrap, extended by the
-    /// range: `(end + range) - start + step - 1` overflows one step
-    /// before the instant-selector numerator does.
+    /// T5, F8: the database's grid arithmetic would wrap: a sample covers
+    /// grid indices up to `ts + range`, and `end + range` passes
+    /// `i64::MAX` here for a 200-year range but not for five minutes.
     #[test]
     fn f8_a_grid_that_would_overflow_declines_and_names_it() {
-        let start_ms = 999_999_999_699_999i64;
-        let step_ms = 1_000_000_000_000_000i64;
-        let end_ms = 9_223_372_036_854_475_806i64 - step_ms;
-        let p = params(start_ms, end_ms, step_ms);
-        // 40000y is about 1.26e15 ms, past `start + lookback`.
-        let q = "sum by (mode) (rate(m[40000y]))";
+        let end_ms = i64::MAX - 5_000_000_000_000;
+        let p = params(end_ms - 10_000_000_000_000, end_ms, 10_000_000_000);
+        let q = "sum by (mode) (rate(m[200y]))";
         assert!(nodes(q, p).is_empty(), "{q} was pushed");
         assert!(
             verdicts(q, p)
@@ -1878,7 +2209,11 @@ mod tests {
     }
 
     fn row(gid: u32, gi: u32, agg: f64) -> super::super::grouped_rows::RangeAggRow {
-        super::super::grouped_rows::RangeAggRow { gid, gi, agg }
+        super::super::grouped_rows::RangeAggRow {
+            gid,
+            gi,
+            agg: Some(agg),
+        }
     }
 
     /// Rows are placed by `(gid, gi)`, never by position; the sentinel is

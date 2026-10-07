@@ -1,7 +1,7 @@
 -- Issue #579: the shape-A statement for each range function under sum, and for
 -- each aggregation under rate, written by the design review's own generator from
 -- the inputs the tests in src/metrics/grouped_sql.rs pass. One section per
--- "-- golden[<op> <func>]" line.
+-- marker line, which names the aggregation and the function.
 -- golden[sum rate]
 WITH 1782907200000 AS grid_start, 15000 AS grid_step, 241 AS grid_n, 300000 AS range_ms,
      [toUInt128('101'), toUInt128('205'), toUInt128('990')] AS fps,

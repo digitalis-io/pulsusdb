@@ -42,7 +42,7 @@ use pulsus_model::{Fingerprint, FpLiteral, LabelSet, NativeHistogram};
 use pulsus_promql::parser::Expr;
 use pulsus_promql::{
     DEFAULT_LOOKBACK_MS, FetchedSeries, InstantSample, Labels, PlanParams, PromqlError, QueryValue,
-    RangeSeries, Sample, SelectorSpec, SeriesData,
+    RangeSeries, Sample, SelectorId, SelectorSpec, SeriesData,
 };
 
 use super::compile;
@@ -167,9 +167,11 @@ pub struct MetricsConfig {
     /// Issue #549: `reader.promql_grouped_push` — compile `min`/`max`/
     /// `count`/`group` over a plain instant selector into ONE statement
     /// per fingerprint chunk ([`super::grouped`]), returning the answer
-    /// already reduced as a step function.
+    /// already reduced as a step function; and, issue #579, `sum`/`avg`/
+    /// `count`/`min`/`max` over `rate`/`irate`/`increase` into one
+    /// statement per node; both at any node of the query.
     ///
-    /// **Read in exactly one place**, [`super::grouped::shape_of`]:
+    /// **Read in exactly one place**, [`super::grouped::node_verdicts`]:
     /// neither `decide` nor the statement builders re-check it, so there
     /// is one line in the tree that decides whether the push is
     /// available. `false` → every query takes today's route and nothing
@@ -657,16 +659,34 @@ impl MetricsEngine {
         // header. On the unexplained path this vector is never pushed to
         // and never allocates.
         let mut reads = compile::SelectorReads::empty();
-        // Issue #549: is this query one the grouped statement can answer?
-        // PURE, decided before the loop, and `None` leaves every line
-        // below exactly as it was. `shape_of` is the sole reader of
-        // `config.grouped_push` and the sole owner of the grid-overflow
-        // guard.
-        let grouped_shape = super::grouped::shape_of(&plan, &plan_params, &self.config);
-        // The push, once a resolution has confirmed it: the decision and
-        // the statements it renders. A pushed plan has exactly one
-        // selector, so this is set at most once.
-        let mut grouped_plan: Option<(super::grouped::GroupedPush, Vec<String>)> = None;
+        // Issues #549 and #579: which aggregate nodes the database can
+        // answer. PURE, decided before the loop; a node that is not pushed
+        // leaves every line below exactly as it was. `node_verdicts` is
+        // the sole reader of `config.grouped_push` and the sole owner of
+        // the grid-overflow guard.
+        let mut owners: HashMap<SelectorId, super::grouped::PushShape> = HashMap::new();
+        for (_, verdict) in super::grouped::node_verdicts(&plan, &plan_params, &self.config) {
+            match verdict {
+                Ok(node) => {
+                    owners.insert(node.selector(), node);
+                }
+                Err(reason) => {
+                    if let Some(e) = explain.as_mut() {
+                        e.push(
+                            "pushed_aggregate",
+                            format!("declined: {reason:?}"),
+                            Some(
+                                "issue #579: this node is evaluated over the sample fetch"
+                                    .to_string(),
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+        // The pushes a resolution has confirmed: the decision and the
+        // statements it renders. A selector is owned by at most one node.
+        let mut pending: Vec<PendingPush> = Vec::new();
         for (selector_id, sel) in plan.selectors.iter().enumerate() {
             let (lower_excl, upper_incl) = sel.fetch_window(&plan_params);
             let window = DataWindow {
@@ -777,199 +797,178 @@ impl MetricsEngine {
                 }
             }
 
-            // Issue #549: the grouped instant read, decided on the SAME
+            // Issues #549 and #579: the pushed node, decided on the SAME
             // resolution the declining path then consumes — `decide`
             // borrows it, so there is no clone and no second resolve.
-            if let Some(shape) = &grouped_shape
-                && shape.selector == selector_id
-            {
-                match super::grouped::decide(shape, &resolution, shape.grid) {
-                    Ok(push) => {
-                        let sqls = build_grouped_sqls(
-                            &self.config,
-                            &push,
-                            lower_excl,
-                            upper_incl,
-                            self.grouped_chunk_size,
-                        );
-                        if explain.is_some()
-                            && let Some(first_chunk) = sample_sql::chunk_fingerprints(
-                                &sql_literals(&push.fingerprints),
+            match owners.get(&selector_id).map(|n| (n.self_pos, &n.kind)) {
+                Some((self_pos, super::grouped::PushKind::Instant(shape))) => {
+                    match super::grouped::decide(shape, &resolution, shape.grid) {
+                        Ok(push) => {
+                            let sqls = build_grouped_sqls(
+                                &self.config,
+                                &push,
+                                lower_excl,
+                                upper_incl,
                                 self.grouped_chunk_size,
-                            )
-                            .first()
-                        {
-                            // The same rule the sample fetch follows: a
-                            // read is recorded only where a statement is
-                            // sent, and it carries the FIRST chunk's
-                            // fingerprint list.
-                            reads.push(compile::SelectorRead {
-                                selector: selector_id,
-                                pred: compile::grouped_selector_pred(
-                                    &sample_sql::window_predicate(lower_excl, upper_incl),
-                                    &sample_sql::fingerprints_predicate(first_chunk),
-                                ),
-                                shape: compile::PqlShape::GroupedRuns,
-                            });
-                        }
-                        if let Some(e) = explain.as_mut()
-                            && let Some(first) = sqls.first()
-                        {
-                            let note = (sqls.len() > 1).then(|| {
-                                format!(
-                                    "(+{} more chunks like this one, {} fingerprints total)",
-                                    sqls.len() - 1,
-                                    push.fingerprints.len()
-                                )
-                            });
-                            e.push("grouped_fetch", first.clone(), note);
-                        }
-                        grouped_plan = Some((push, sqls));
-                        // The pushed route does not go through
-                        // `execute_fetch_plan` at all; the vector stays
-                        // aligned with `plan.selectors` for the code
-                        // below, which this path returns before reaching.
-                        fetch_plans.push(SelectorFetchPlan::Empty);
-                        continue;
-                    }
-                    Err(reason) => {
-                        if let Some(e) = explain.as_mut() {
-                            e.push(
-                                "grouped_push",
-                                format!("declined: {reason:?}"),
-                                Some(
-                                    "issue #549: this selector takes the sample fetch below"
-                                        .to_string(),
-                                ),
                             );
+                            if explain.is_some()
+                                && let Some(first_chunk) = sample_sql::chunk_fingerprints(
+                                    &sql_literals(&push.fingerprints),
+                                    self.grouped_chunk_size,
+                                )
+                                .first()
+                            {
+                                // The same rule the sample fetch follows: a
+                                // read is recorded only where a statement is
+                                // sent, and it carries the FIRST chunk's
+                                // fingerprint list.
+                                reads.push(compile::SelectorRead {
+                                    selector: selector_id,
+                                    pred: compile::grouped_selector_pred(
+                                        &sample_sql::window_predicate(lower_excl, upper_incl),
+                                        &sample_sql::fingerprints_predicate(first_chunk),
+                                    ),
+                                    shape: compile::PqlShape::GroupedRuns,
+                                });
+                            }
+                            if let Some(e) = explain.as_mut()
+                                && let Some(first) = sqls.first()
+                            {
+                                let note = (sqls.len() > 1).then(|| {
+                                    format!(
+                                        "(+{} more chunks like this one, {} fingerprints total)",
+                                        sqls.len() - 1,
+                                        push.fingerprints.len()
+                                    )
+                                });
+                                e.push("grouped_fetch", first.clone(), note);
+                            }
+                            pending.push(PendingPush::Instant {
+                                self_pos,
+                                push,
+                                sqls,
+                            });
+                            // The pushed node does not go through
+                            // `execute_fetch_plan`; the vector stays aligned
+                            // with `plan.selectors`.
+                            fetch_plans.push(SelectorFetchPlan::Empty);
+                            continue;
+                        }
+                        Err(reason) => {
+                            if let Some(e) = explain.as_mut() {
+                                e.push(
+                                    "grouped_push",
+                                    format!("declined: {reason:?}"),
+                                    Some(
+                                        "issue #549: this selector takes the sample fetch below"
+                                            .to_string(),
+                                    ),
+                                );
+                            }
                         }
                     }
                 }
+                Some((self_pos, super::grouped::PushKind::Range(shape))) => {
+                    match super::grouped::decide_range(shape, &resolution) {
+                        Ok(push) => {
+                            let fps = sql_literals(&push.fingerprints);
+                            let sqls: Vec<(u32, String)> = if fps.is_empty() {
+                                Vec::new()
+                            } else {
+                                super::grouped::time_chunks(
+                                    push.grid,
+                                    fps.len(),
+                                    self.pushed_series_steps_cap,
+                                )
+                                .into_iter()
+                                .map(|(g0, grid)| {
+                                    (
+                                        g0,
+                                        super::grouped_sql::range_aggregate_fetch(
+                                            &self.config.samples_table,
+                                            &self.config.hist_samples_table,
+                                            &fps,
+                                            &push.gids,
+                                            grid,
+                                            push.range_ms,
+                                            push.op,
+                                            push.func,
+                                        ),
+                                    )
+                                })
+                                .collect()
+                            };
+                            if explain.is_some() && !fps.is_empty() {
+                                let (lo, hi) =
+                                    super::grouped_sql::range_window(push.grid, push.range_ms);
+                                reads.push(compile::SelectorRead {
+                                    selector: selector_id,
+                                    pred: compile::selector_pred(
+                                        None,
+                                        &sample_sql::window_predicate(lo, hi),
+                                        &sample_sql::fingerprints_predicate(&fps),
+                                    ),
+                                    shape: compile::PqlShape::Samples,
+                                });
+                            }
+                            if let Some(e) = explain.as_mut()
+                                && let Some((_, first)) = sqls.first()
+                            {
+                                let note = (sqls.len() > 1).then(|| {
+                                    format!(
+                                        "(+{} more statements like this one, split by time)",
+                                        sqls.len() - 1
+                                    )
+                                });
+                                e.push("pushed_aggregate", first.clone(), note);
+                            }
+                            // F6: today's fetch, built now and sent only if
+                            // the statement counts a histogram sample.
+                            let fallback = self.concrete_fetch_plan(
+                                selector_id,
+                                sel,
+                                resolution,
+                                lower_excl,
+                                upper_incl,
+                                None,
+                                None,
+                            );
+                            pending.push(PendingPush::Range {
+                                self_pos,
+                                selector: selector_id,
+                                push,
+                                sqls,
+                                fallback,
+                            });
+                            fetch_plans.push(SelectorFetchPlan::Empty);
+                            continue;
+                        }
+                        Err(reason) => {
+                            if let Some(e) = explain.as_mut() {
+                                e.push(
+                                    "pushed_aggregate",
+                                    format!("declined: {reason:?}"),
+                                    Some(
+                                        "issue #579: this selector takes the sample fetch below"
+                                            .to_string(),
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                }
+                None => {}
             }
 
-            let fetch_plan = match resolution {
-                LabelledResolution::Series(pairs) => {
-                    let labels_by_fp: HashMap<Fingerprint, LabelSet> =
-                        pairs.iter().cloned().collect();
-                    let fps: Vec<Fingerprint> = pairs.into_iter().map(|(fp, _)| fp).collect();
-                    let total_fps = fps.len();
-                    // Issue #548: the leaf carries the FIRST chunk's
-                    // fingerprint list, which is the rule the explain
-                    // surface already follows for stage SQL — the chunk
-                    // driver is not represented and the module doc says
-                    // so. Sorted here the way `build_chunk_sqls` sorts,
-                    // so the leaf and the statement carry one list.
-                    //
-                    // **A read is recorded only where a chunk exists, and
-                    // that is the same condition as a statement being
-                    // sent**: `build_chunk_sqls` renders one statement per
-                    // chunk of this same list. An empty fingerprint set —
-                    // a concrete metric name the cache does not know —
-                    // yields ZERO chunks and zero statements, and a read
-                    // recorded there would put a plan naming two
-                    // statements on the explain surface for a read the
-                    // database never performed (code review round 2).
-                    if explain.is_some() {
-                        let mut sorted = fps.clone();
-                        sorted.sort_unstable();
-                        if let Some(first_chunk) = sample_sql::chunk_fingerprints(
-                            &sql_literals(&sorted),
-                            sample_sql::CHUNK_THRESHOLD,
-                        )
-                        .first()
-                        {
-                            reads.push(compile::SelectorRead {
-                                selector: selector_id,
-                                pred: compile::selector_pred(
-                                    None,
-                                    &sample_sql::window_predicate(lower_excl, upper_incl),
-                                    &sample_sql::fingerprints_predicate(first_chunk),
-                                ),
-                                shape: compile::PqlShape::Samples,
-                            });
-                        }
-                    }
-                    let hist_sqls = build_hist_chunk_sqls(
-                        &self.config.hist_samples_table,
-                        fps.clone(),
-                        lower_excl,
-                        upper_incl,
-                    );
-                    let sqls =
-                        build_chunk_sqls(&self.config.samples_table, fps, lower_excl, upper_incl);
-                    if let Some(e) = explain.as_mut() {
-                        // Chunk elision (finding 5): only the first chunk's
-                        // SQL is surfaced verbatim; a note names how many
-                        // more chunks (and total fingerprints) were fetched
-                        // identically, avoiding an O(chunks) explain blow-up
-                        // for a selector matching thousands of series.
-                        if let Some(first) = sqls.first() {
-                            let note = (sqls.len() > 1).then(|| {
-                                format!(
-                                    "(+{} more chunks like this one, {total_fps} fingerprints total)",
-                                    sqls.len() - 1
-                                )
-                            });
-                            e.push("sample_fetch", first.clone(), note);
-                        }
-                        // M7-A5a: the complementary histogram read appears in
-                        // the explain trace beside the float read (built once,
-                        // synchronously — never drifts from what executes).
-                        if let Some(first) = hist_sqls.first() {
-                            e.push("hist_sample_fetch", first.clone(), None);
-                        }
-                    }
-                    SelectorFetchPlan::Chunks {
-                        sqls,
-                        hist_sqls,
-                        labels_by_fp,
-                    }
-                }
-                LabelledResolution::SqlFallback { sql, .. } => {
-                    if explain.is_some() {
-                        reads.push(compile::SelectorRead {
-                            selector: selector_id,
-                            pred: compile::selector_pred(
-                                None,
-                                &sample_sql::window_predicate(lower_excl, upper_incl),
-                                &sample_sql::subquery_predicate(&sql),
-                            ),
-                            shape: compile::PqlShape::Samples,
-                        });
-                    }
-                    let fetch_sql = sample_sql::sample_fetch_subquery(
-                        &self.config.samples_table,
-                        &sql,
-                        lower_excl,
-                        upper_incl,
-                    );
-                    let hist_sql = sample_sql::hist_sample_fetch_subquery(
-                        &self.config.hist_samples_table,
-                        &sql,
-                        lower_excl,
-                        upper_incl,
-                    );
-                    if let Some(e) = explain.as_mut() {
-                        e.push("sample_fetch", fetch_sql.clone(), None);
-                        e.push("hist_sample_fetch", hist_sql.clone(), None);
-                    }
-                    SelectorFetchPlan::Fallback {
-                        sql: fetch_sql,
-                        hist_sql,
-                        // Issue #82 (retroactive re-review, Finding 1):
-                        // the degraded-path cap probe, built now (a pure
-                        // function of the already-computed series-
-                        // selection `sql`) but executed in phase 2,
-                        // BEFORE the sample fetch above runs.
-                        info_series_probe: sel.info_family.then(|| {
-                            super::sql::info_series_cardinality_probe(
-                                &sql,
-                                self.config.max_info_series,
-                            )
-                        }),
-                    }
-                }
-            };
+            let fetch_plan = self.concrete_fetch_plan(
+                selector_id,
+                sel,
+                resolution,
+                lower_excl,
+                upper_incl,
+                explain.as_deref_mut(),
+                Some(&mut reads),
+            );
             fetch_plans.push(fetch_plan);
         }
 
@@ -991,41 +990,82 @@ impl MetricsEngine {
         // not a per-selector one.
         let sample_budget = SampleBudget::new(self.config.max_samples);
 
-        // Issue #549: the pushed route. The statements return the answer
-        // already reduced, so there is no `SeriesData` to assemble — the
-        // fold IS the evaluation.
-        //
-        // The charge is the SAME `sample_budget`, charged per drained row
-        // inside the same drain loop, over what this path materialises:
-        // the per-statement partial runs.
-        //
-        // **The fold is offloaded and cancellable on exactly the same
-        // terms as the ordinary evaluator** (code review round 1). It is
-        // reduced data, but reducing it further is not free: a run is
-        // EXPANDED into the grid points it covers, one cell at a time, so
-        // the work is the sum of the run widths — bounded by (rows the
-        // budget admits) × (points the grid holds), not by the row count.
-        // Left inline it would hold a runtime worker for a client who has
-        // already gone. Every reason recorded below for the ordinary
-        // path's offload applies here unchanged, including why no pooled
-        // lease crosses it: `fetch_grouped_runs` returns owned `Vec<Run>`
-        // chunks and every `ChRowStream` is dropped before it returns.
-        if let Some((push, sqls)) = grouped_plan {
-            let chunks = self.fetch_grouped_runs(&push, sqls, &sample_budget).await?;
-            let (value, annotations) = fold_offloaded(&self.eval_gate, push, chunks).await?;
-            return Ok((value_to_query_result(value), annotations));
-        }
-
+        // Issues #549 and #579: every pushed node's statements run
+        // concurrently with every other selector's fetch. Their rows are
+        // charged to the SAME `sample_budget`, per drained row, inside the
+        // same drain loop.
         let fetches = plan
             .selectors
             .iter()
             .zip(fetch_plans)
             .map(|(sel, fetch_plan)| self.execute_fetch_plan(sel, fetch_plan, &sample_budget));
-        let fetched: Vec<Result<Vec<FetchedSeries>, ReadError>> = join_all(fetches).await;
+        let pushes = pending
+            .into_iter()
+            .map(|p| self.run_push(p, &sample_budget));
+        let (fetched, pushed) = join(join_all(fetches), join_all(pushes)).await;
 
         let mut data = SeriesData::new();
         for (sel, series) in plan.selectors.iter().zip(fetched) {
             data.insert(sel.id, series?);
+        }
+
+        // F6: a shape-A statement whose sentinel row counts a histogram
+        // sample is discarded, and its selector is fetched as it is without
+        // the push. Checked here, on the sentinel rows alone, because the
+        // fallback is another round trip.
+        let mut kept = Vec::with_capacity(pushed.len());
+        let mut fallbacks = Vec::new();
+        for result in pushed {
+            match result? {
+                PushResult::Range {
+                    selector,
+                    fallback,
+                    chunks,
+                    ..
+                } if chunks.iter().flat_map(|(_, rows)| rows).any(|r| {
+                    r.gid == super::grouped::HISTOGRAM_SENTINEL_GID && r.agg.unwrap_or(0.0) > 0.0
+                }) =>
+                {
+                    if let Some(e) = explain.as_mut() {
+                        e.push(
+                            "pushed_aggregate",
+                            "declined: HistogramSamples".to_string(),
+                            Some(
+                                "issue #579: the window holds histogram samples; this selector \
+                                 takes the sample fetch"
+                                    .to_string(),
+                            ),
+                        );
+                        if let SelectorFetchPlan::Chunks {
+                            sqls, hist_sqls, ..
+                        } = &fallback
+                        {
+                            if let Some(first) = sqls.first() {
+                                e.push("sample_fetch", first.clone(), None);
+                            }
+                            if let Some(first) = hist_sqls.first() {
+                                e.push("hist_sample_fetch", first.clone(), None);
+                            }
+                        }
+                    }
+                    fallbacks.push((selector, fallback));
+                }
+                other => kept.push(other),
+            }
+        }
+        let refetched: Vec<Result<Vec<FetchedSeries>, ReadError>> =
+            join_all(fallbacks.iter_mut().map(|(selector, fallback)| {
+                let fetch_plan = std::mem::replace(fallback, SelectorFetchPlan::Empty);
+                self.execute_fetch_plan(&plan.selectors[*selector], fetch_plan, &sample_budget)
+            }))
+            .await;
+        for ((selector, _), series) in fallbacks.into_iter().zip(refetched) {
+            data.insert(selector, series?);
+        }
+        if !kept.is_empty() {
+            for (self_pos, node) in nodes_offloaded(&self.eval_gate, kept).await? {
+                data.insert_pushed(self_pos, node);
+            }
         }
 
         // Issue #93 (finding 2): `pulsus_promql::evaluate` is CPU-bound and
@@ -1072,6 +1112,147 @@ impl MetricsEngine {
         )
         .await?;
         Ok((value_to_query_result(value), annotations))
+    }
+
+    /// The fetch plan of a concrete-name selector from its resolution —
+    /// the statements today's route sends. With `explain` and `reads` it
+    /// records what it renders; issue #579 builds a pushed shape-A node's
+    /// fallback (F6) with neither, because that plan is sent only when the
+    /// pushed statement counts a histogram sample.
+    #[allow(clippy::too_many_arguments)]
+    fn concrete_fetch_plan(
+        &self,
+        selector_id: SelectorId,
+        sel: &SelectorSpec,
+        resolution: LabelledResolution,
+        lower_excl: i64,
+        upper_incl: i64,
+        mut explain: Option<&mut PlanExplain>,
+        reads: Option<&mut compile::SelectorReads>,
+    ) -> SelectorFetchPlan {
+        match resolution {
+            LabelledResolution::Series(pairs) => {
+                let labels_by_fp: HashMap<Fingerprint, LabelSet> = pairs.iter().cloned().collect();
+                let fps: Vec<Fingerprint> = pairs.into_iter().map(|(fp, _)| fp).collect();
+                let total_fps = fps.len();
+                // Issue #548: the leaf carries the FIRST chunk's
+                // fingerprint list, which is the rule the explain
+                // surface already follows for stage SQL — the chunk
+                // driver is not represented and the module doc says
+                // so. Sorted here the way `build_chunk_sqls` sorts,
+                // so the leaf and the statement carry one list.
+                //
+                // **A read is recorded only where a chunk exists, and
+                // that is the same condition as a statement being
+                // sent**: `build_chunk_sqls` renders one statement per
+                // chunk of this same list. An empty fingerprint set —
+                // a concrete metric name the cache does not know —
+                // yields ZERO chunks and zero statements, and a read
+                // recorded there would put a plan naming two
+                // statements on the explain surface for a read the
+                // database never performed (code review round 2).
+                if explain.is_some()
+                    && let Some(reads) = reads
+                {
+                    let mut sorted = fps.clone();
+                    sorted.sort_unstable();
+                    if let Some(first_chunk) = sample_sql::chunk_fingerprints(
+                        &sql_literals(&sorted),
+                        sample_sql::CHUNK_THRESHOLD,
+                    )
+                    .first()
+                    {
+                        reads.push(compile::SelectorRead {
+                            selector: selector_id,
+                            pred: compile::selector_pred(
+                                None,
+                                &sample_sql::window_predicate(lower_excl, upper_incl),
+                                &sample_sql::fingerprints_predicate(first_chunk),
+                            ),
+                            shape: compile::PqlShape::Samples,
+                        });
+                    }
+                }
+                let hist_sqls = build_hist_chunk_sqls(
+                    &self.config.hist_samples_table,
+                    fps.clone(),
+                    lower_excl,
+                    upper_incl,
+                );
+                let sqls =
+                    build_chunk_sqls(&self.config.samples_table, fps, lower_excl, upper_incl);
+                if let Some(e) = explain.as_mut() {
+                    // Chunk elision (finding 5): only the first chunk's
+                    // SQL is surfaced verbatim; a note names how many
+                    // more chunks (and total fingerprints) were fetched
+                    // identically, avoiding an O(chunks) explain blow-up
+                    // for a selector matching thousands of series.
+                    if let Some(first) = sqls.first() {
+                        let note = (sqls.len() > 1).then(|| {
+                            format!(
+                                "(+{} more chunks like this one, {total_fps} fingerprints total)",
+                                sqls.len() - 1
+                            )
+                        });
+                        e.push("sample_fetch", first.clone(), note);
+                    }
+                    // M7-A5a: the complementary histogram read appears in
+                    // the explain trace beside the float read (built once,
+                    // synchronously — never drifts from what executes).
+                    if let Some(first) = hist_sqls.first() {
+                        e.push("hist_sample_fetch", first.clone(), None);
+                    }
+                }
+                SelectorFetchPlan::Chunks {
+                    sqls,
+                    hist_sqls,
+                    labels_by_fp,
+                }
+            }
+            LabelledResolution::SqlFallback { sql, .. } => {
+                if explain.is_some()
+                    && let Some(reads) = reads
+                {
+                    reads.push(compile::SelectorRead {
+                        selector: selector_id,
+                        pred: compile::selector_pred(
+                            None,
+                            &sample_sql::window_predicate(lower_excl, upper_incl),
+                            &sample_sql::subquery_predicate(&sql),
+                        ),
+                        shape: compile::PqlShape::Samples,
+                    });
+                }
+                let fetch_sql = sample_sql::sample_fetch_subquery(
+                    &self.config.samples_table,
+                    &sql,
+                    lower_excl,
+                    upper_incl,
+                );
+                let hist_sql = sample_sql::hist_sample_fetch_subquery(
+                    &self.config.hist_samples_table,
+                    &sql,
+                    lower_excl,
+                    upper_incl,
+                );
+                if let Some(e) = explain.as_mut() {
+                    e.push("sample_fetch", fetch_sql.clone(), None);
+                    e.push("hist_sample_fetch", hist_sql.clone(), None);
+                }
+                SelectorFetchPlan::Fallback {
+                    sql: fetch_sql,
+                    hist_sql,
+                    // Issue #82 (retroactive re-review, Finding 1):
+                    // the degraded-path cap probe, built now (a pure
+                    // function of the already-computed series-
+                    // selection `sql`) but executed in phase 2,
+                    // BEFORE the sample fetch above runs.
+                    info_series_probe: sel.info_family.then(|| {
+                        super::sql::info_series_cardinality_probe(&sql, self.config.max_info_series)
+                    }),
+                }
+            }
+        }
     }
 
     /// Issue #85 (M6-08c): builds a name-less/regex-`__name__` selector's
@@ -1370,6 +1551,52 @@ impl MetricsEngine {
                         .cmp(&(b.metric_name.as_deref(), b.fingerprint))
                 });
                 Ok(series)
+            }
+        }
+    }
+
+    /// Issues #549 and #579: runs one pushed node's statements.
+    async fn run_push(
+        &self,
+        pending: PendingPush,
+        budget: &SampleBudget,
+    ) -> Result<PushResult, ReadError> {
+        match pending {
+            PendingPush::Instant {
+                self_pos,
+                push,
+                sqls,
+            } => {
+                let runs = self.fetch_grouped_runs(&push, sqls, budget).await?;
+                Ok(PushResult::Instant {
+                    self_pos,
+                    push,
+                    runs,
+                })
+            }
+            PendingPush::Range {
+                self_pos,
+                selector,
+                push,
+                sqls,
+                fallback,
+            } => {
+                let (starts, sqls): (Vec<u32>, Vec<String>) = sqls.into_iter().unzip();
+                let results = join_all(sqls.into_iter().map(|sql| {
+                    self.fetch_sample_rows::<super::grouped_rows::RangeAggRow>(sql, budget)
+                }))
+                .await;
+                let mut chunks = Vec::with_capacity(results.len());
+                for (g0, rows) in starts.into_iter().zip(results) {
+                    chunks.push((g0, rows?));
+                }
+                Ok(PushResult::Range {
+                    self_pos,
+                    selector,
+                    push,
+                    chunks,
+                    fallback,
+                })
             }
         }
     }
@@ -2130,6 +2357,42 @@ struct ProbeSpec {
     matchers: Vec<super::matcher::LabelMatcher>,
 }
 
+/// Issues #549 and #579: a pushed node whose resolution confirmed it, with
+/// the statements it renders.
+enum PendingPush {
+    /// Shape B: one run statement per fingerprint chunk.
+    Instant {
+        self_pos: usize,
+        push: super::grouped::GroupedPush,
+        sqls: Vec<String>,
+    },
+    /// Shape A: one statement per time chunk, each with its first grid
+    /// index, and today's fetch for the selector, sent only on F6.
+    Range {
+        self_pos: usize,
+        selector: SelectorId,
+        push: super::grouped::RangePush,
+        sqls: Vec<(u32, String)>,
+        fallback: SelectorFetchPlan,
+    },
+}
+
+/// A [`PendingPush`] whose statements have run.
+enum PushResult {
+    Instant {
+        self_pos: usize,
+        push: super::grouped::GroupedPush,
+        runs: Vec<Vec<super::grouped::Run>>,
+    },
+    Range {
+        self_pos: usize,
+        selector: SelectorId,
+        push: super::grouped::RangePush,
+        chunks: Vec<(u32, Vec<super::grouped_rows::RangeAggRow>)>,
+        fallback: SelectorFetchPlan,
+    },
+}
+
 /// A selector's fully pre-built fetch plan — built once, synchronously, in
 /// `query_inner`'s phase-1 loop (so the actual generated SQL is available
 /// for `X-Pulsus-Explain`, code review round 1 finding 5), then executed
@@ -2264,32 +2527,54 @@ where
     }
 }
 
-/// Runs the grouped fold on the blocking pool behind the shared
-/// [`crate::eval_gate::EvalGate`], cancellable when this frame is dropped
-/// (code review round 1 on issue #549).
+/// Builds every pushed node's answer on the blocking pool behind the
+/// shared [`crate::eval_gate::EvalGate`], cancellable when this frame is
+/// dropped (code review round 1 on issue #549).
 ///
-/// This is [`evaluate_offloaded`] for the pushed route, and deliberately
+/// This is [`evaluate_offloaded`] for the pushed nodes, and deliberately
 /// the same shape rather than a second mechanism: the same gate bounds
 /// in-flight and queued work, the same [`CancelOnDrop`] guard fires when
 /// a disconnected or timed-out client's frame is dropped, the same
 /// `PromqlError::Cancelled` reaches the client as `503` `timeout`, and a
-/// panic is re-raised rather than turned into a domain error.
+/// panic is re-raised rather than turned into a domain error. The work is
+/// not free: a shape-B run is EXPANDED into the grid points it covers.
 ///
-/// `push` and `chunks` are moved in because `spawn_blocking` needs
-/// `Send + 'static`; both are owned data with no lifetimes and no pooled
-/// connection lease, so nothing is held across the offload.
-async fn fold_offloaded(
+/// The results are moved in because `spawn_blocking` needs `Send +
+/// 'static`; they are owned data with no pooled connection lease.
+async fn nodes_offloaded(
     gate: &crate::eval_gate::EvalGate,
-    push: super::grouped::GroupedPush,
-    chunks: Vec<Vec<super::grouped::Run>>,
-) -> Result<(pulsus_promql::QueryValue, pulsus_promql::Annotations), ReadError> {
+    results: Vec<PushResult>,
+) -> Result<Vec<(usize, pulsus_promql::PushedNode)>, ReadError> {
     let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let token = pulsus_promql::CancelToken::new(std::sync::Arc::clone(&flag));
     let _guard = CancelOnDrop(flag);
     let run = move || {
-        let mut annotations = pulsus_promql::Annotations::new();
-        super::grouped::fold(&push, chunks, &mut annotations, &token)
-            .map(|value| (value, annotations))
+        let mut out = Vec::with_capacity(results.len());
+        for result in results {
+            match result {
+                PushResult::Instant {
+                    self_pos,
+                    push,
+                    runs,
+                } => out.push((self_pos, super::grouped::instant_node(&push, runs, &token)?)),
+                PushResult::Range {
+                    self_pos,
+                    push,
+                    chunks,
+                    ..
+                } => match super::grouped::range_node(&push, chunks, &token)? {
+                    super::grouped::RangeOutcome::Node(node) => out.push((self_pos, node)),
+                    // The caller took every result whose sentinel counted
+                    // a histogram sample out before this point.
+                    super::grouped::RangeOutcome::Histograms(_) => {
+                        return Err(pulsus_promql::PromqlError::Unsupported {
+                            construct: "a pushed node over histogram samples".to_string(),
+                        });
+                    }
+                },
+            }
+        }
+        Ok(out)
     };
     match gate.run_blocking(run).await {
         Ok(res) => Ok(res?),

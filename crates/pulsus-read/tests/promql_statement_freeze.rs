@@ -27,7 +27,7 @@
 //!
 //! **And it is a characterization of the BUILDERS, not of what the server
 //! sends.** [`render`] calls `pulsus_promql::plan`,
-//! `metrics::grouped::shape_of` and the statement builders directly.
+//! `metrics::grouped::pushed_nodes` and the statement builders directly.
 //! Measured at issue #548's base: inserting
 //! `let lower_excl = lower_excl + 1;` after `sel.fetch_window(..)` in
 //! `crates/pulsus-read/src/metrics/exec.rs` shifts every fetch window the
@@ -44,6 +44,13 @@
 //! complementary histogram fetch. So the corpus went from 60 statements
 //! to 56 across the same 30 entries, and every other entry is
 //! byte-identical.
+//!
+//! # Issue #579 moved it, and which entry moved
+//!
+//! `sum by (status) (rate(…[5m]))` now compiles into ONE statement that
+//! returns one row per group per step, over both sample tables, instead
+//! of a float fetch and a histogram fetch: 56 statements became 55, and
+//! every other entry is byte-identical.
 //!
 //! # Every boundary in this golden is writer-emitted
 //!
@@ -127,13 +134,14 @@ const PINNED: &str = include_str!("golden/promql_statements.sha256");
 
 /// The three constants published on issue #548 before the code existed;
 /// the line and byte counts re-taken by issue #623, whose sample statements
-/// carry no metric name.
+/// carry no metric name, and again by issue #579.
 const ENTRIES: usize = 30;
-const LINES: usize = 676;
-const BYTES: usize = 36_167;
+const LINES: usize = 742;
+const BYTES: usize = 40_103;
 /// The statements the writer's markers declare. Sixty before issue #549;
-/// four entries now send ONE statement where they sent two.
-const STATEMENTS: usize = 56;
+/// four entries now send ONE statement where they sent two, and issue #579
+/// made it five.
+const STATEMENTS: usize = 55;
 
 const START_MS: i64 = 1_782_907_200_000;
 const END_MS: i64 = 1_782_928_800_000;
@@ -224,7 +232,8 @@ fn render() -> String {
         out.push_str(&format!("selectors {}\n", p.selectors.len()));
         // Issue #549: the same decision `exec` takes, so an eligibility
         // change reaches this golden.
-        let pushed = grouped::shape_of(&p, &params, &freeze_config());
+        // Issue #579: any node, either shape.
+        let pushed = grouped::pushed_nodes(&p, &params, &freeze_config());
         for (i, sel) in p.selectors.iter().enumerate() {
             let (lo, hi) = sel.fetch_window(&params);
             out.push_str(&format!(
@@ -233,10 +242,34 @@ fn render() -> String {
                 sel.range_ms
                     .map_or_else(|| "-".to_string(), |r| r.to_string()),
             ));
-            match (&pushed, &sel.metric_name) {
+            let owner = pushed
+                .iter()
+                .find(|n| n.selector() == sel.id)
+                .map(|n| &n.kind);
+            match (owner, &sel.metric_name) {
+                // Issue #579: ONE statement per node, over both tables.
+                (Some(grouped::PushKind::Range(shape)), Some(_)) => {
+                    out.push_str(&format!(
+                        "-- pushed op={:?} func={:?} gids={GIDS:?}\n",
+                        shape.op, shape.func
+                    ));
+                    emit(
+                        &mut out,
+                        &grouped_sql::range_aggregate_fetch(
+                            SAMPLES,
+                            HIST,
+                            &fps(),
+                            &GIDS,
+                            shape.grid,
+                            shape.range_ms,
+                            shape.op,
+                            shape.func,
+                        ),
+                    );
+                }
                 // ONE statement, over both tables, with the group ids
                 // stated above.
-                (Some(shape), Some(_)) if shape.selector == sel.id => {
+                (Some(grouped::PushKind::Instant(shape)), Some(_)) => {
                     out.push_str(&format!("-- grouped op={:?} gids={GIDS:?}\n", shape.op));
                     emit(
                         &mut out,

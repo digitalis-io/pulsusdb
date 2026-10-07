@@ -41,7 +41,8 @@ use crate::plan::{
     RangeSource, ScalarFn, SelectorId, SelectorSpec, SubqueryPlan,
 };
 use crate::value::{
-    FetchedSeries, InstantSample, Labels, Point, QueryValue, RangeSeries, Sample, SeriesData,
+    FetchedSeries, InstantSample, Labels, Point, PushedNode, QueryValue, RangeSeries, Sample,
+    SeriesData,
 };
 
 /// The evaluator's view over the fetched data (issue #125): a selector
@@ -87,6 +88,12 @@ impl<'a> EvalData<'a> {
             Some(v) => v.as_slice(),
             None => self.base.get(id),
         }
+    }
+
+    /// Issue #579: the database's answer for the `Aggregate` node at
+    /// `self_pos`, if the fetch layer pushed it.
+    fn pushed(&self, self_pos: usize) -> Option<&PushedNode> {
+        self.base.pushed(self_pos)
     }
 }
 
@@ -3673,6 +3680,25 @@ fn eval_step(
             param_pos,
             self_pos,
         } => {
+            // Issue #579: the database already answered this node. Its
+            // vector at this step is the answer, and nothing below it is
+            // evaluated — the fetch layer read no sample for its selector.
+            if let Some(node) = data.pushed(*self_pos) {
+                let Some(v) = node.at(t_ms) else {
+                    return Err(PromqlError::Unsupported {
+                        construct: format!(
+                            "a pushed aggregate read at {t_ms}, which is not a point of its grid"
+                        ),
+                    });
+                };
+                if !node.annotations.is_empty() {
+                    caches
+                        .annotations
+                        .borrow_mut()
+                        .merge(node.annotations.clone());
+                }
+                return Ok(StepValue::Vector(v.to_vec()));
+            }
             let StepValue::Vector(v) =
                 eval_step(input, selectors, data, t_ms, lookback_ms, caches)?
             else {
@@ -4276,7 +4302,6 @@ mod tests {
 
     use super::*;
     use crate::plan::{PlanParams, plan};
-    use crate::value::PushedNode;
 
     /// M7-A5b-i shim: the crate's public `evaluate` now returns
     /// `(QueryValue, Annotations)` (the annotations channel, plan v2

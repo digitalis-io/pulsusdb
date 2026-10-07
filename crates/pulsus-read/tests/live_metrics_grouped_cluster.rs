@@ -528,10 +528,9 @@ async fn the_pushed_rate_over_the_dist_tables_sees_every_shards_rows() {
         .insert_block("metric_samples", &on_shard2)
         .await
         .expect("seed shard 2's metric_samples");
-    let per_shard =
-        format!("SELECT toUInt64(count()) AS n FROM metric_samples WHERE fingerprint = 1");
+    let per_shard = "SELECT toUInt64(count()) AS n FROM metric_samples WHERE fingerprint = 1";
     assert!(
-        count(&client, &per_shard).await > 0 && count(&shard2, &per_shard).await > 0,
+        count(&client, per_shard).await > 0 && count(&shard2, per_shard).await > 0,
         "one series' samples must sit on both shards"
     );
 

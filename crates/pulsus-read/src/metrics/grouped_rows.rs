@@ -47,11 +47,16 @@ pub struct GroupedCountRow {
 /// The row whose `gid` is [`super::grouped::HISTOGRAM_SENTINEL_GID`]
 /// carries the window's histogram sample count in `agg` and is never part
 /// of the answer.
+///
+/// `agg` decodes as `Nullable(Float64)`: the server types the union's
+/// column from the sentinel's scalar subquery, which is nullable. No row
+/// carries a NULL — a count is never NULL, and an aggregate is computed
+/// only over a non-empty group — and the reader refuses one if it does.
 #[derive(Debug, Clone, Copy, Row, Serialize, Deserialize)]
 pub struct RangeAggRow {
     pub gid: u32,
     pub gi: u32,
-    pub agg: f64,
+    pub agg: Option<f64>,
 }
 
 impl GroupedRunRow {

@@ -217,10 +217,16 @@ const CONTROL: &str = "with_binding_control.txt";
 /// 401: SEVEN `traces_spans_search` goldens added, each one statement of
 /// `spans::search::search_sql` with no `== ` line.** Its `WITH (SELECT …)
 /// AS top` is a scalar alias, which carries no `WithElement`.
+///
+/// **Issue #579 moves `PROMQL_STATEMENTS` 56 -> 55:** the freeze's
+/// `sum by (status) (rate(…[5m]))` entry sends one shape-A statement where
+/// it sent a float and a histogram fetch. Its `WITH` items are scalars and
+/// arrays, and its histogram count is a scalar subquery in the projection,
+/// not a binding.
 const SQL_FILES: usize = 137;
 const SQL_STATEMENTS: usize = 401;
 const PROMQL_ENTRIES: usize = 30;
-const PROMQL_STATEMENTS: usize = 56;
+const PROMQL_STATEMENTS: usize = 55;
 const CONTROL_STATEMENTS: usize = 1;
 
 fn golden_root() -> PathBuf {

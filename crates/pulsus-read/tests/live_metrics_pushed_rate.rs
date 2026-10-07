@@ -251,13 +251,15 @@ async fn uncovered_queries_take_todays_route() {
         a.stages
     );
 
-    // F8: a grid whose arithmetic would wrap in the database.
+    // F8: a grid whose arithmetic would wrap in the database: `end +
+    // range` passes `i64::MAX` for a 200-year range.
+    let end_ms = i64::MAX - 5_000_000_000_000;
     let p = MetricQueryParams {
-        start_ms: 999_999_999_699_999,
-        end_ms: 9_223_372_036_854_475_806 - 1_000_000_000_000_000,
-        step_ms: 1_000_000_000_000_000,
+        start_ms: end_ms - 10_000_000_000_000,
+        end_ms,
+        step_ms: 10_000_000_000,
     };
-    let q = "sum by (mode) (rate(node_cpu_seconds_total[40000y]))";
+    let q = "sum by (mode) (rate(node_cpu_seconds_total[200y]))";
     let (a, b) = h.both(q, &p).await;
     assert_eq!(a.answer, b.answer, "F8 {q}: the answers differ");
     assert_eq!(statement_stages(&a), statement_stages(&b), "F8 {q}");

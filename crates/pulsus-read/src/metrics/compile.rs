@@ -1376,7 +1376,7 @@ mod tests {
     /// Issue #549 criterion 4: **the queries that keep today's route
     /// keep today's plan, byte for byte.**
     ///
-    /// The shape is taken from [`crate::metrics::grouped::shape_of`],
+    /// The shape is taken from [`crate::metrics::grouped::pushed_nodes`],
     /// not chosen by this test — which is what makes each mutation below
     /// reach it. **Every one was run** (review round 1 named one that did
     /// not):
@@ -1440,15 +1440,22 @@ mod tests {
     }
 
     /// The plan shapes for `query`, with each selector's seed shape taken
-    /// from `grouped::shape_of` — the same decision `exec` takes, so a
+    /// from `grouped::pushed_nodes` — the same decision `exec` takes, so a
     /// change to the eligibility rule reaches these literals.
     fn rendered_plan(query: &str) -> Vec<PlanShape> {
         let plan = planned(query);
         let cfg = grouped_test_config();
-        let shape = crate::metrics::grouped::shape_of(&plan, &plan_params(), &cfg);
+        // Shape B is what reads as runs; a shape-A node (issue #579)
+        // records the sample read, as `exec` does.
+        let runs: Vec<SelectorId> =
+            crate::metrics::grouped::pushed_nodes(&plan, &plan_params(), &cfg)
+                .into_iter()
+                .filter(|n| matches!(n.kind, crate::metrics::grouped::PushKind::Instant(_)))
+                .map(|n| n.selector())
+                .collect();
         let mut reads = SelectorReads::empty();
         for (i, _) in plan.selectors.iter().enumerate() {
-            let pushed = shape.as_ref().is_some_and(|s| s.selector == i);
+            let pushed = runs.contains(&i);
             reads.push(SelectorRead {
                 selector: i,
                 pred: if pushed {
