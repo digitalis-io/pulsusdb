@@ -130,7 +130,7 @@ ORDER BY (key, val, fingerprint)
 
 CREATE TABLE IF NOT EXISTS {{db}}.metric_hist_samples{{on_cluster}}
 (
-    fingerprint UInt128 CODEC(Delta(8), ZSTD(1)),
+    fingerprint UInt128 CODEC(ZSTD(1)),
     unix_milli Int64 CODEC(DoubleDelta, ZSTD(1)),
     schema Int8 CODEC(ZSTD(1)),
     zero_threshold Float64 CODEC(Gorilla(8), ZSTD(1)),
@@ -220,7 +220,7 @@ ORDER BY metric_name
 
 CREATE TABLE IF NOT EXISTS {{db}}.metric_samples{{on_cluster}}
 (
-    fingerprint UInt128 CODEC(Delta(8), ZSTD(1)),
+    fingerprint UInt128 CODEC(ZSTD(1)),
     unix_milli Int64 CODEC(DoubleDelta, ZSTD(1)),
     value Float64 CODEC(Gorilla(8), ZSTD(1))
 )

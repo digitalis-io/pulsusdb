@@ -154,7 +154,7 @@ pub fn raw_cityhash64(buf: &[u8]) -> u64 {
 /// #623): the top bits of `cityHash64(metric_name)`. A metric's series
 /// share it, so under `ORDER BY (fingerprint, unix_milli)` one metric's
 /// samples sit together, as they did when `metric_name` led the key.
-pub const SERIES_NAME_PREFIX_BITS: u32 = 24;
+pub const SERIES_NAME_PREFIX_BITS: u32 = 32;
 
 /// The bits of a series ID below the name prefix: the identity.
 const SERIES_BODY_BITS: u32 = 128 - SERIES_NAME_PREFIX_BITS;

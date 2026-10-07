@@ -25,7 +25,7 @@ pub struct InsertReport {
 pub fn metric_table_ddl(table: &str) -> String {
     format!(
         "CREATE TABLE IF NOT EXISTS {table} (
-            fingerprint  UInt128   CODEC(Delta(8), ZSTD(1)),
+            fingerprint  UInt128   CODEC(ZSTD(1)),
             unix_milli   Int64    CODEC(DoubleDelta, ZSTD(1)),
             value        Float64  CODEC(Gorilla, ZSTD(1))
         ) ENGINE = MergeTree
