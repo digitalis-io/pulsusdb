@@ -173,6 +173,54 @@ pub fn compile_span_leaf_in(
     Ok(c.finish(e))
 }
 
+/// Issue #591 part 2's section 3.2: `leaf` — a positive condition on one
+/// `event.`/`link.` attribute or event and link intrinsic against a
+/// literal-only side, or its presence — rendered as the predicate renders
+/// it, with `arrayFirstIndex` where the predicate writes `arrayExists`: the
+/// 1-based index of the first element whose own condition holds. `false`
+/// when the condition holds on no span.
+pub(super) fn element_index_in(
+    leaf: &FieldExpr,
+    ctx: &PredicateCtx<'_>,
+) -> Result<String, PlanError> {
+    let mut c = Compiler::new(Some(*ctx));
+    c.head = Head::FirstIndex;
+    c.render_expr(leaf)
+}
+
+/// Issue #591 part 2's section 3.5: `comparison`, holding one set field
+/// once inside arithmetic, in select mode — the first element of the
+/// field's set the comparison holds for, read through every binder outside
+/// the loop. `false` when the comparison holds on no span.
+pub(super) fn element_select_in(
+    comparison: &FieldExpr,
+    ctx: &PredicateCtx<'_>,
+) -> Result<String, PlanError> {
+    let mut c = Compiler::new(Some(*ctx));
+    c.head = Head::Select;
+    c.render_expr(comparison)
+}
+
+/// Issue #591 part 2's section 3.1: `V(k)`, the value of resource key
+/// `key` at the span's own `resource_id`, read through `Q(k)`, the text
+/// every resource operand of `key` reads.
+pub(super) fn resource_value_in(key: &str, ctx: &PredicateCtx<'_>) -> Result<String, PlanError> {
+    let mut c = Compiler::new(Some(*ctx));
+    let q = c.resource_read(key)?;
+    Ok(resource_value(&q))
+}
+
+/// Issue #591 part 2's section 3.3: `P_scope`, whether `scope` holds `key`
+/// as the unscoped chain tests it ([`Compiler::chain_presence`]).
+pub(super) fn chain_presence_in(
+    scope: AttrScope,
+    key: &str,
+    ctx: &PredicateCtx<'_>,
+) -> Result<String, PlanError> {
+    let mut c = Compiler::new(Some(*ctx));
+    c.chain_presence(scope, key)
+}
+
 /// The ONE place a window and a predicate compose. The live suite issues
 /// it; `tests/traces_compile_v2.rs`'s `T-C4` freezes its text, so the
 /// frozen text is what ran.
@@ -349,6 +397,31 @@ struct Compiler<'a> {
     /// The current comparison's scalar field leaves' presences, which
     /// `!=` over a set operand requires (decision 11 of the part-3e design).
     presences: Vec<String>,
+    /// What the element loops render: the predicate, or one of the search
+    /// projection's two element reads ([`element_index_in`],
+    /// [`element_select_in`]).
+    head: Head,
+}
+
+/// The head of an element loop: `arrayExists` for the predicate; for the
+/// search projection (issue #591 part 2), `arrayFirstIndex`, the first
+/// element whose own condition holds, or select mode, the first element
+/// itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Head {
+    Exists,
+    FirstIndex,
+    Select,
+}
+
+impl Head {
+    /// The function a leaf's element loop is rendered with.
+    fn leaf_function(self) -> &'static str {
+        match self {
+            Head::Exists | Head::Select => "arrayExists",
+            Head::FirstIndex => "arrayFirstIndex",
+        }
+    }
 }
 
 /// One set operand of a comparison, numbered `k` in pre-order: its element
@@ -430,6 +503,7 @@ impl<'a> Compiler<'a> {
             arith_nodes: 0,
             occurrences: Vec::new(),
             presences: Vec::new(),
+            head: Head::Exists,
         }
     }
 
@@ -690,8 +764,18 @@ impl<'a> Compiler<'a> {
             )),
             // Any element holds the key. Absence is `NOT` outside, so a span
             // carrying no elements lacks it.
-            AttrScope::Event => Ok(element_exists(EVENT_ATTRS, key, negated)),
-            AttrScope::Link => Ok(element_exists(LINK_ATTRS, key, negated)),
+            AttrScope::Event => Ok(element_exists(
+                EVENT_ATTRS,
+                key,
+                negated,
+                self.head.leaf_function(),
+            )),
+            AttrScope::Link => Ok(element_exists(
+                LINK_ATTRS,
+                key,
+                negated,
+                self.head.leaf_function(),
+            )),
             // Presence reads the arm, never the text: `service` is `''` for
             // an empty string and for no key alike.
             AttrScope::Resource if key == SERVICE_NAME => {
@@ -736,7 +820,9 @@ impl<'a> Compiler<'a> {
     ) -> Result<String, PlanError> {
         match field {
             Field::Attribute { scope, key } => self.scoped_leaf(*scope, key, op, value),
-            Field::Intrinsic(intrinsic) => intrinsic_leaf(*intrinsic, op, value),
+            Field::Intrinsic(intrinsic) => {
+                intrinsic_leaf(*intrinsic, op, value, self.head.leaf_function())
+            }
         }
     }
 
@@ -751,8 +837,10 @@ impl<'a> Compiler<'a> {
             AttrScope::Span => attr_leaf(ATTRS, key, op, value),
             AttrScope::Instrumentation => attr_leaf(SCOPE_ATTRS, key, op, value),
             AttrScope::Resource => self.resource_leaf(key, op, value),
-            AttrScope::Event => element_leaf(EVENT_ATTRS, key, op, value),
-            AttrScope::Link => element_leaf(LINK_ATTRS, key, op, value),
+            AttrScope::Event => {
+                element_leaf(EVENT_ATTRS, key, op, value, self.head.leaf_function())
+            }
+            AttrScope::Link => element_leaf(LINK_ATTRS, key, op, value, self.head.leaf_function()),
             AttrScope::Unscoped => self.unscoped_leaf(key, op, value),
         }
     }
@@ -988,8 +1076,15 @@ impl<'a> Compiler<'a> {
     ///
     /// With no term nothing matches under `= < <= > >=`; `!=` is built
     /// over a body of `false`, so it holds when a set is empty (decision 9).
+    ///
+    /// In select mode (issue #591 part 2's section 3.5) the loop is
+    /// `arrayFirst`, the first element the comparison holds for, and each
+    /// binder outside it reads that element: `arrayElement(arrayMap(…), 1)`.
+    /// The arithmetic sides' binders inside the loop stay `arrayExists`:
+    /// they are the loop's condition.
     fn occurrence_build(&self, op: ComparisonOp, l: &Arms, r: &Arms, body: String) -> String {
         let neq = op == ComparisonOp::Neq;
+        let select = self.head == Head::Select;
         if body == "false" && !neq {
             return body;
         }
@@ -1001,7 +1096,13 @@ impl<'a> Compiler<'a> {
             .partition(|(var, _)| is_arith_var(var));
         let mut text = bind_values(&arith, &[], body);
         for occ in self.occurrences.iter().rev() {
-            let each = if neq { "arrayAll" } else { "arrayExists" };
+            let each = if select {
+                "arrayFirst"
+            } else if neq {
+                "arrayAll"
+            } else {
+                "arrayExists"
+            };
             text = format!("{each}({} -> {text}, {})", occ.var, occ.array);
         }
         if neq {
@@ -1027,7 +1128,11 @@ impl<'a> Compiler<'a> {
         }
         for occ in self.occurrences.iter().rev() {
             if let Some((c, chain, _)) = &occ.chain {
-                text = format!("arrayExists({c} -> {text}, [{chain}])");
+                text = if select {
+                    format!("arrayElement(arrayMap({c} -> {text}, [{chain}]), 1)")
+                } else {
+                    format!("arrayExists({c} -> {text}, [{chain}])")
+                };
             }
         }
         let chain_values: Vec<(String, String)> = self
@@ -1035,7 +1140,11 @@ impl<'a> Compiler<'a> {
             .iter()
             .filter_map(|o| o.chain.as_ref().map(|(_, _, value)| value.clone()))
             .collect();
-        bind_values(&values, &chain_values, text)
+        if select {
+            select_values(&values, &chain_values, text)
+        } else {
+            bind_values(&values, &chain_values, text)
+        }
     }
 
     /// Registers the set operand `field` as the comparison's next
@@ -1777,7 +1886,7 @@ impl<'a> Compiler<'a> {
 
 /// The scopes of the unscoped chain, in the order a span's one value is
 /// taken from (`docs/api.md`, the unscoped attribute).
-const CHAIN: [AttrScope; 5] = [
+pub(super) const CHAIN: [AttrScope; 5] = [
     AttrScope::Span,
     AttrScope::Resource,
     AttrScope::Event,
@@ -1880,10 +1989,11 @@ pub(super) fn attr_path(root: &str, key: &str) -> String {
 }
 
 /// Any element holds the key. Absence is `NOT` outside, so a span carrying
-/// no elements lacks it.
-fn element_exists(root: &str, key: &str, negated: bool) -> String {
+/// no elements lacks it. `head` is the loop's function: `arrayExists`, or
+/// `arrayFirstIndex` for the search projection's first element holding it.
+fn element_exists(root: &str, key: &str, negated: bool, head: &str) -> String {
     let present = format!(
-        "arrayExists(d -> dynamicType(d) != 'None', {})",
+        "{head}(d -> dynamicType(d) != 'None', {})",
         attr_path(root, key)
     );
     if negated {
@@ -2280,15 +2390,38 @@ fn field_terms(l: &Arms, op: ComparisonOp, r: &Arms) -> String {
 /// an arithmetic side, a chain's resource value — left then right, each to
 /// its variable once: the body is a lambda applied to one-element arrays.
 fn bind_values(left: &[(String, String)], right: &[(String, String)], body: String) -> String {
+    bind_with("arrayExists", left, right, body)
+}
+
+/// [`bind_values`] in select mode (issue #591 part 2's section 3.5): the
+/// body is a value, not a condition, so it is mapped over the one-element
+/// arrays and the one element read back.
+fn select_values(left: &[(String, String)], right: &[(String, String)], body: String) -> String {
+    let binds: Vec<&(String, String)> = left.iter().chain(right).collect();
+    if binds.is_empty() {
+        return body;
+    }
+    format!(
+        "arrayElement({}, 1)",
+        bind_with("arrayMap", left, right, body)
+    )
+}
+
+fn bind_with(
+    function: &str,
+    left: &[(String, String)],
+    right: &[(String, String)],
+    body: String,
+) -> String {
     let binds: Vec<&(String, String)> = left.iter().chain(right).collect();
     match binds.as_slice() {
         [] => body,
-        [(v, value)] => format!("arrayExists({v} -> {body}, [{value}])"),
+        [(v, value)] => format!("{function}({v} -> {body}, [{value}])"),
         many => {
             let vars: Vec<&str> = many.iter().map(|(v, _)| v.as_str()).collect();
             let values: Vec<String> = many.iter().map(|(_, value)| format!("[{value}]")).collect();
             format!(
-                "arrayExists(({}) -> {body}, {})",
+                "{function}(({}) -> {body}, {})",
                 vars.join(", "),
                 values.join(", ")
             )
@@ -3144,6 +3277,7 @@ fn element_leaf(
     key: &str,
     op: ComparisonOp,
     value: &Value,
+    head: &str,
 ) -> Result<String, PlanError> {
     let mut used: Vec<Read> = Vec::new();
     let (negated, body) = {
@@ -3166,7 +3300,7 @@ fn element_leaf(
         .iter()
         .map(|r| format!("{path}{}", r.suffix()))
         .collect();
-    let positive = format!("arrayExists({args} -> {body}, {})", arrays.join(", "));
+    let positive = format!("{head}({args} -> {body}, {})", arrays.join(", "));
     Ok(if negated {
         format!("NOT {positive}")
     } else {
@@ -3283,6 +3417,7 @@ fn intrinsic_leaf(
     intrinsic: Intrinsic,
     op: ComparisonOp,
     value: &Value,
+    head: &str,
 ) -> Result<String, PlanError> {
     match intrinsic {
         Intrinsic::Name => string_column_leaf(intrinsic, "name", op, value),
@@ -3299,10 +3434,10 @@ fn intrinsic_leaf(
         Intrinsic::InstrumentationVersion => {
             untyped_string_leaf(&intrinsic.to_string(), "scope_version", op, value)
         }
-        Intrinsic::EventName => event_name_leaf(op, value),
-        Intrinsic::EventTimeSinceStart => time_since_start_leaf(op, value),
-        Intrinsic::LinkSpanId => link_id_leaf(intrinsic, "links.span_id", op, value),
-        Intrinsic::LinkTraceId => link_id_leaf(intrinsic, "links.trace_id", op, value),
+        Intrinsic::EventName => event_name_leaf(op, value, head),
+        Intrinsic::EventTimeSinceStart => time_since_start_leaf(op, value, head),
+        Intrinsic::LinkSpanId => link_id_leaf(intrinsic, "links.span_id", op, value, head),
+        Intrinsic::LinkTraceId => link_id_leaf(intrinsic, "links.trace_id", op, value, head),
         Intrinsic::NestedSetParent
         | Intrinsic::NestedSetLeft
         | Intrinsic::NestedSetRight
@@ -3572,9 +3707,10 @@ fn positive_op(op: ComparisonOp) -> (bool, ComparisonOp) {
 }
 
 /// Any element of `array`, bound to `var`, passes `body`; `NOT` outside
-/// when negated.
-fn any_element(var: &str, array: &str, negated: bool, body: &str) -> String {
-    let positive = format!("arrayExists({var} -> {body}, {array})");
+/// when negated. `head` is the loop's function: `arrayExists`, or
+/// `arrayFirstIndex` for the search projection's first passing element.
+fn any_element(var: &str, array: &str, negated: bool, body: &str, head: &str) -> String {
+    let positive = format!("{head}({var} -> {body}, {array})");
     if negated {
         format!("NOT {positive}")
     } else {
@@ -3583,10 +3719,10 @@ fn any_element(var: &str, array: &str, negated: bool, body: &str) -> String {
 }
 
 /// `event:name`: `name`'s rule over each event's name.
-fn event_name_leaf(op: ComparisonOp, value: &Value) -> Result<String, PlanError> {
+fn event_name_leaf(op: ComparisonOp, value: &Value, head: &str) -> Result<String, PlanError> {
     let (negated, pos) = positive_op(op);
     let body = string_column_leaf(Intrinsic::EventName, "n", pos, value)?;
-    Ok(any_element("n", "events.name", negated, &body))
+    Ok(any_element("n", "events.name", negated, &body, head))
 }
 
 /// `event:timeSinceStart`: each event's time less the span's start, in
@@ -3594,7 +3730,7 @@ fn event_name_leaf(op: ComparisonOp, value: &Value) -> Result<String, PlanError>
 /// difference is taken as `Int128`: exact for every stored pair, and
 /// negative for an event before its span. A bare number is nanoseconds.
 /// The operand is checked before the operator, as `duration`'s is.
-fn time_since_start_leaf(op: ComparisonOp, value: &Value) -> Result<String, PlanError> {
+fn time_since_start_leaf(op: ComparisonOp, value: &Value, head: &str) -> Result<String, PlanError> {
     let nanos = match value {
         Value::Duration(d) => duration_nanos(*d),
         Value::Number(raw) => render_number(raw)?,
@@ -3615,6 +3751,7 @@ fn time_since_start_leaf(op: ComparisonOp, value: &Value) -> Result<String, Plan
         "events.time_ns",
         negated,
         &format!("toInt128(t) - start_ns {sym} {nanos}"),
+        head,
     ))
 }
 
@@ -3627,6 +3764,7 @@ fn link_id_leaf(
     array: &str,
     op: ComparisonOp,
     value: &Value,
+    head: &str,
 ) -> Result<String, PlanError> {
     let Value::String(raw) = value else {
         return Err(PlanError::TypeMismatch(format!(
@@ -3643,5 +3781,5 @@ fn link_id_leaf(
             escape::ch_string(raw)
         ),
     };
-    Ok(any_element("h", array, negated, &body))
+    Ok(any_element("h", array, negated, &body, head))
 }

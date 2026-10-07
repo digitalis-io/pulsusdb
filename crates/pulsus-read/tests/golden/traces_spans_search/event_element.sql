@@ -1,0 +1,33 @@
+-- case: event_element
+-- q: { event.retry.count > 1 } limit=20 spss=3
+WITH (SELECT (groupArray(trace_id), groupArray(keys))
+      FROM (SELECT trace_id, max(start_ns) AS last,
+                   groupUniqArray(intDiv(start_ns, 300000000000)) AS keys
+            FROM spans
+            WHERE start_ns >= 1790084801000000000 AND start_ns < 1790095601000000000
+              AND intDiv(start_ns, 300000000000) BETWEEN intDiv(1790084801000000000, 300000000000) AND intDiv(1790095600999999999, 300000000000)
+              AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') >= toDate('2026-09-22') AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') <= toDate('2026-09-22')
+              AND (arrayExists((i, f) -> (coalesce(i > 1, false) OR coalesce(f > 1, false)), events.attrs.`retry%2Ecount`.:Int64, events.attrs.`retry%2Ecount`.:Float64))
+            GROUP BY trace_id
+            ORDER BY last DESC, trace_id ASC
+            LIMIT 20)) AS top
+SELECT m.trace_id AS trace_id, t.root_service AS root_service, t.root_name AS root_name,
+       t.start_ns AS start_ns, t.end_ns - t.start_ns AS duration_ns,
+       m.last AS last, m.matched AS matched, m.spans AS spans
+FROM (SELECT trace_id, max(start_ns) AS last, count() AS matched,
+             arraySlice(arraySort(x -> (x.2, x.1),
+                        groupArray((span_id, start_ns, duration_ns, service, arrayFilter(x -> x.1 != 0, [multiIf(arrayExists((i, f) -> (coalesce(i > 1, false) OR coalesce(f > 1, false)), events.attrs.`retry%2Ecount`.:Int64, events.attrs.`retry%2Ecount`.:Float64), (1, if(startsWith(dynamicType(arrayElement(events.attrs.`retry%2Ecount`, arrayFirstIndex((i, f) -> (coalesce(i > 1, false) OR coalesce(f > 1, false)), events.attrs.`retry%2Ecount`.:Int64, events.attrs.`retry%2Ecount`.:Float64))), 'Array'), toJSONString(arrayMap(x -> (toString(dynamicType(x)), toString(x)), CAST(arrayElement(events.attrs.`retry%2Ecount`, arrayFirstIndex((i, f) -> (coalesce(i > 1, false) OR coalesce(f > 1, false)), events.attrs.`retry%2Ecount`.:Int64, events.attrs.`retry%2Ecount`.:Float64)), 'Array(Dynamic)'))), if(length(toString(arrayElement(events.attrs.`retry%2Ecount`, arrayFirstIndex((i, f) -> (coalesce(i > 1, false) OR coalesce(f > 1, false)), events.attrs.`retry%2Ecount`.:Int64, events.attrs.`retry%2Ecount`.:Float64)))) <= 8192, toString(arrayElement(events.attrs.`retry%2Ecount`, arrayFirstIndex((i, f) -> (coalesce(i > 1, false) OR coalesce(f > 1, false)), events.attrs.`retry%2Ecount`.:Int64, events.attrs.`retry%2Ecount`.:Float64))), substringUTF8(toString(arrayElement(events.attrs.`retry%2Ecount`, arrayFirstIndex((i, f) -> (coalesce(i > 1, false) OR coalesce(f > 1, false)), events.attrs.`retry%2Ecount`.:Int64, events.attrs.`retry%2Ecount`.:Float64))), 1, 2048))), toString(dynamicType(arrayElement(events.attrs.`retry%2Ecount`, arrayFirstIndex((i, f) -> (coalesce(i > 1, false) OR coalesce(f > 1, false)), events.attrs.`retry%2Ecount`.:Int64, events.attrs.`retry%2Ecount`.:Float64))))), (0, '', ''))])))), 1, 3) AS spans
+      FROM spans
+      WHERE (intDiv(start_ns, 300000000000), trace_id) IN
+            (SELECT arrayJoin(arrayFlatten(arrayMap((t, ks) -> arrayMap(k -> (k, t), ks), top.1, top.2))))
+        AND start_ns >= 1790084801000000000 AND start_ns < 1790095601000000000
+        AND intDiv(start_ns, 300000000000) BETWEEN intDiv(1790084801000000000, 300000000000) AND intDiv(1790095600999999999, 300000000000)
+        AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') >= toDate('2026-09-22') AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') <= toDate('2026-09-22')
+        AND (arrayExists((i, f) -> (coalesce(i > 1, false) OR coalesce(f > 1, false)), events.attrs.`retry%2Ecount`.:Int64, events.attrs.`retry%2Ecount`.:Float64))
+      GROUP BY trace_id) AS m
+LEFT JOIN (SELECT trace_id, min(start_ns) AS start_ns, max(end_ns) AS end_ns,
+                  min(root) AS r, if(r.1 = 0, if(length(r.4) <= 8192, r.4, substringUTF8(r.4, 1, 2048)), '') AS root_service, if(r.1 = 0, if(length(r.5) <= 8192, r.5, substringUTF8(r.5, 1, 2048)), '') AS root_name
+           FROM traces
+           WHERE trace_id IN (SELECT arrayJoin(top.1))
+           GROUP BY trace_id) AS t USING trace_id
+ORDER BY last DESC, trace_id ASC
