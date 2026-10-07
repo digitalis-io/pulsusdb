@@ -802,7 +802,9 @@ impl MetricsEngine {
             // borrows it, so there is no clone and no second resolve.
             match owners.get(&selector_id).map(|n| (n.self_pos, &n.kind)) {
                 Some((self_pos, super::grouped::PushKind::Instant(shape))) => {
-                    match super::grouped::decide(shape, &resolution, shape.grid) {
+                    match super::grouped::members_of(&resolution, metric_name)
+                        .and_then(|members| super::grouped::decide(shape, &members, shape.grid))
+                    {
                         Ok(push) => {
                             let sqls = build_grouped_sqls(
                                 &self.config,
@@ -869,7 +871,9 @@ impl MetricsEngine {
                     }
                 }
                 Some((self_pos, super::grouped::PushKind::Range(shape))) => {
-                    match super::grouped::decide_range(shape, &resolution) {
+                    match super::grouped::members_of(&resolution, metric_name)
+                        .and_then(|members| super::grouped::decide_range(shape, &members))
+                    {
                         Ok(push) => {
                             let fps = sql_literals(&push.fingerprints);
                             let sqls: Vec<(u32, String)> = if fps.is_empty() {

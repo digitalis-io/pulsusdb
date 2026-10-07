@@ -51,6 +51,9 @@ use pulsus_schema_testkit::run_init;
 // `live_metrics_pushed_rate.rs`.
 #[path = "pushed_rate_corpus/mod.rs"]
 mod pushed_rate_corpus;
+// Issue #579 part 2: the multi-name corpus.
+#[path = "multi_name_corpus/mod.rs"]
+mod multi_name_corpus;
 
 /// `true` when the gated half of this suite should run. Skips cleanly on a
 /// developer machine with no container; **panics** rather than skipping when
@@ -9155,6 +9158,95 @@ async fn the_cpu_query_sends_groups_not_samples() {
         sent.iter()
             .all(|s| !s.query.contains("SELECT fingerprint, unix_milli, value")),
         "a statement selects the raw samples: {summary:?}"
+    );
+    h.finish().await;
+}
+
+/// Issue #579 part 2, T2: the Series panel over the last 6 h at 15 s sends
+/// only run statements, and fewer than 1,000 rows in all. Without the push
+/// it is the two-statement raw fetch of every sample.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_series_panel_sends_runs_not_samples() {
+    skip_unless_live!();
+    use pushed_rate_corpus::{anchor, harness, statements_since};
+    let t = anchor();
+    let db = pulsus_testkit::test_db("pulsus_read_it_qlog_series_panel");
+    let h = harness(&db, t, &multi_name_corpus::multi_name_corpus(t), None).await;
+    let p = pulsus_read::MetricQueryParams {
+        start_ms: t - 6 * multi_name_corpus::HOUR_MS,
+        end_ms: t,
+        step_ms: 15_000,
+    };
+    let marker = pushed_rate_corpus::server_marker(&h.admin).await;
+    let r = pushed_rate_corpus::Harness::run(&h.pushed, multi_name_corpus::SERIES_PANEL, &p).await;
+    assert!(!r.answer.is_empty());
+    let sent = statements_since(&h.admin, &h.db, &marker).await;
+    let summary: Vec<(u64, String)> = sent
+        .iter()
+        .map(|s| (s.result_rows, s.query.chars().take(160).collect()))
+        .collect();
+    assert!(!sent.is_empty(), "the request sent no statement");
+    assert!(
+        sent.iter()
+            .all(|s| !s.query.contains("SELECT fingerprint, unix_milli, value")),
+        "a statement selects the raw samples: {summary:?}"
+    );
+    assert!(
+        sent.iter()
+            .all(|s| s.query.contains("AS lookback") && s.query.contains("gi_start")),
+        "every statement is the run template: {summary:?}"
+    );
+    let rows: u64 = sent.iter().map(|s| s.result_rows).sum();
+    assert!(rows < 1_000, "{rows} rows sent: {summary:?}");
+    h.finish().await;
+}
+
+/// Issue #579 part 2, T3: `sum(rate({__name__=~"node_.+"}[5m]))` sends one
+/// shape-A statement per time chunk and no raw fetch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_name_rate_is_one_statement_per_chunk() {
+    skip_unless_live!();
+    use pulsus_read::metrics::grouped::{Grid, PUSHED_SERIES_STEPS_PER_STATEMENT, time_chunks};
+    use pushed_rate_corpus::{anchor, harness, statements_since};
+    let t = anchor();
+    let db = pulsus_testkit::test_db("pulsus_read_it_qlog_multi_rate");
+    let fx = multi_name_corpus::multi_name_corpus(t);
+    let series = fx.iter().filter(|s| s.metric.starts_with("node_")).count();
+    let h = harness(&db, t, &fx, None).await;
+    let p = pulsus_read::MetricQueryParams {
+        start_ms: t - 6 * multi_name_corpus::HOUR_MS,
+        end_ms: t,
+        step_ms: 15_000,
+    };
+    let points = u32::try_from((p.end_ms - p.start_ms) / p.step_ms + 1).expect("points");
+    let chunks = time_chunks(
+        Grid {
+            start_ms: p.start_ms,
+            step_ms: p.step_ms,
+            points,
+            lookback_ms: pulsus_promql::DEFAULT_LOOKBACK_MS,
+        },
+        series,
+        PUSHED_SERIES_STEPS_PER_STATEMENT,
+    )
+    .len();
+    let marker = pushed_rate_corpus::server_marker(&h.admin).await;
+    let q = "sum(rate({__name__=~\"node_.+\"}[5m]))";
+    let r = pushed_rate_corpus::Harness::run(&h.pushed, q, &p).await;
+    assert!(!r.answer.is_empty());
+    let sent = statements_since(&h.admin, &h.db, &marker).await;
+    let summary: Vec<(u64, String)> = sent
+        .iter()
+        .map(|s| (s.result_rows, s.query.chars().take(160).collect()))
+        .collect();
+    assert_eq!(
+        sent.len(),
+        chunks,
+        "{series} series x {points} steps is {chunks} statements: {summary:?}"
+    );
+    assert!(
+        sent.iter().all(|s| s.query.contains("AS range_ms")),
+        "every statement is shape A: {summary:?}"
     );
     h.finish().await;
 }

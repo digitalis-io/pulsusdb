@@ -19,6 +19,8 @@
 //!   cargo test -p pulsus-read --test live_metrics_pushed_rate
 //! ```
 
+#[path = "multi_name_corpus/mod.rs"]
+mod multi_name_corpus;
 #[path = "pushed_rate_corpus/mod.rs"]
 mod pushed_rate_corpus;
 
@@ -337,5 +339,175 @@ async fn a_large_node_is_split_by_time() {
     let unpushed = Harness::run(&h.unpushed, &q, &p).await;
     assert_eq!(r.answer, unpushed.answer, "{q}: the split answer differs");
     assert_eq!(p.end_ms - p.start_ms, DAY_MS);
+    h.finish().await;
+}
+
+// ------------------------------------------------ issue #579 part 2
+
+/// The last 6 h ending at the anchor.
+fn six_hours(h: &Harness, step_ms: i64) -> MetricQueryParams {
+    MetricQueryParams {
+        start_ms: h.t - 6 * multi_name_corpus::HOUR_MS,
+        end_ms: h.t,
+        step_ms,
+    }
+}
+
+/// Some statement of `r` is a pushed one: a run statement or a shape-A
+/// statement.
+fn assert_pushed_any(query: &str, step_ms: i64, r: &Routed) {
+    assert!(
+        r.stages.iter().any(
+            |(name, sql)| (name == "grouped_fetch" || name == "pushed_aggregate")
+                && sql.starts_with("WITH ")
+        ),
+        "{query} at step {step_ms}: nothing was pushed: {:?}",
+        r.stages
+    );
+    assert!(
+        !r.stages.iter().any(|(name, _)| name == "sample_fetch"),
+        "{query} at step {step_ms}: a sample fetch was sent: {:?}",
+        r.stages
+    );
+}
+
+/// T1: the design's queries over multi-name selectors, plus `min`/`max`
+/// over the NaN pair, at 60 s, 15 s and instant: identical with the push
+/// on and off, and pushed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_name_shapes_answer_identically() {
+    skip_unless_live!();
+    let t = anchor();
+    let db = pulsus_testkit::test_db("pulsus_read_it_multi_name_t1");
+    let h = harness(&db, t, &multi_name_corpus::multi_name_corpus(t), None).await;
+    let mut queries: Vec<&str> = multi_name_corpus::QUERIES.to_vec();
+    queries.extend([
+        "min({__name__=~\"node_nan_.+\"})",
+        "max({__name__=~\"node_nan_.+\"})",
+    ]);
+    for p in [six_hours(&h, 60_000), six_hours(&h, 15_000), h.instant()] {
+        for q in &queries {
+            let r = h.agree(q, &p).await;
+            assert_pushed_any(q, p.step_ms, &r);
+        }
+    }
+    h.finish().await;
+}
+
+/// T4: members fold in `(metric_name, fingerprint)` order. Over several
+/// names that differs from fingerprint order; `avg` of `irate` is the
+/// compensated fold and `max` of the all-NaN hour answers the last
+/// member's payload.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn member_order_is_name_then_id() {
+    skip_unless_live!();
+    let t = anchor();
+    let db = pulsus_testkit::test_db("pulsus_read_it_multi_name_t4");
+    let h = harness(&db, t, &multi_name_corpus::multi_name_corpus(t), None).await;
+    for p in [six_hours(&h, 60_000), six_hours(&h, 15_000)] {
+        for q in [
+            "avg(irate({__name__=~\"node_m27.*\"}[5m]))",
+            "max({__name__=~\"node_nan_.+\"})",
+        ] {
+            let r = h.agree(q, &p).await;
+            assert_pushed_any(q, p.step_ms, &r);
+        }
+    }
+    h.finish().await;
+}
+
+/// T8: one histogram sample in a multi-name shape-A selector. The answer
+/// is identical, explain names the decline, and the fallback is today's
+/// multi-name fetch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_name_histograms_fall_back() {
+    skip_unless_live!();
+    let t = anchor();
+    let db = pulsus_testkit::test_db("pulsus_read_it_multi_name_t8");
+    let h = harness(&db, t, &multi_name_corpus::multi_name_corpus(t), None).await;
+    let q = "sum(rate({__name__=~\"hmix_.+\"}[5m]))";
+    for p in [h.ten_minutes(15_000), h.instant()] {
+        let (a, b) = h.both(q, &p).await;
+        assert_eq!(a.answer, b.answer, "{q}: the answers differ");
+        assert_eq!(a.annotations, b.annotations, "{q}: the annotations differ");
+        assert!(
+            pushed_declines(&a)
+                .iter()
+                .any(|d| d.contains("HistogramSamples")),
+            "{q}: {:?}",
+            a.stages
+        );
+        let fetches = |r: &Routed| -> Vec<(String, String)> {
+            r.stages
+                .iter()
+                .filter(|(name, _)| name == "sample_fetch" || name == "hist_sample_fetch")
+                .cloned()
+                .collect()
+        };
+        assert!(!fetches(&b).is_empty());
+        assert_eq!(
+            fetches(&a),
+            fetches(&b),
+            "{q}: the fallback is today's fetch"
+        );
+    }
+    h.finish().await;
+}
+
+/// T9: a multi-name node the threshold declines takes today's route: one
+/// resolution, today's fetch, the same answer; a cold cache answers
+/// today's error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_name_declines_keep_todays_route() {
+    skip_unless_live!();
+    let t = anchor();
+    let db = pulsus_testkit::test_db("pulsus_read_it_multi_name_t9");
+    let h = harness(&db, t, &multi_name_corpus::multi_name_corpus(t), None).await;
+    // node_m10 … node_m19 hold one series each: ten groups, ten series.
+    let q = "count by (__name__)({__name__=~\"node_m1[0-9]\"})";
+    let p = six_hours(&h, 60_000);
+    let (a, b) = h.both(q, &p).await;
+    assert_eq!(a.answer, b.answer, "{q}: the answers differ");
+    assert!(
+        a.stages
+            .iter()
+            .any(|(name, sql)| name == "grouped_push" && sql == "declined: TooFewSeriesPerGroup"),
+        "{q}: {:?}",
+        a.stages
+    );
+    assert_eq!(
+        a.stages
+            .iter()
+            .filter(|(name, _)| name == "series_resolution")
+            .count(),
+        1,
+        "{q}: one resolution: {:?}",
+        a.stages
+    );
+    let statements = |r: &Routed| -> Vec<(String, String)> {
+        r.stages
+            .iter()
+            .filter(|(name, _)| name != "grouped_push" && name != "pushed_aggregate")
+            .cloned()
+            .collect()
+    };
+    assert_eq!(statements(&a), statements(&b), "{q}: today's statements");
+
+    let cold = Arc::new(LabelCache::new(
+        ChClient::new(test_config(&db)).await.expect("connect"),
+        cache_config(&db),
+    ));
+    let expr = pulsus_promql::parser::parse(q).expect("parse");
+    let mut errors = Vec::new();
+    for push in [true, false] {
+        let engine = MetricsEngine::new(
+            ChClient::new(test_config(&db)).await.expect("connect"),
+            Arc::clone(&cold),
+            engine_config(&db, push),
+        );
+        errors.push(format!("{:?}", engine.query(&expr, &p).await.err()));
+    }
+    assert!(errors[0] != "None", "a cold cache answers an error");
+    assert_eq!(errors[0], errors[1], "{q}: the cold-cache error differs");
     h.finish().await;
 }

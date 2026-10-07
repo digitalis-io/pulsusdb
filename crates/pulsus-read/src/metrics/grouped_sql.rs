@@ -541,7 +541,7 @@ mod tests {
              \x20   FROM (\n\
              \x20     SELECT gid, gi,\n\
              \x20       if(countIf(NOT is_hist AND NOT isNaN(v)) = 0, \
-             argMaxIf(v, fingerprint, NOT is_hist),\n\
+             argMaxIf(v, transform(fingerprint, fps, arrayEnumerate(fps), toUInt32(0)), NOT is_hist),\n\
              \x20          maxIf(v, NOT is_hist AND NOT isNaN(v))) AS agg,\n\
              \x20       toUInt8(if(countIf(NOT is_hist) > 0, 1, 0) + \
              if(countIf(is_hist) > 0, 2, 0)) AS flags\n\
@@ -600,7 +600,9 @@ mod tests {
         let max = sql(GroupedOp::Max);
         let min = sql(GroupedOp::Min);
         assert_eq!(max.replace("maxIf(v, NOT", "minIf(v, NOT"), min);
-        assert!(min.contains("argMaxIf(v, fingerprint, NOT is_hist)"));
+        assert!(min.contains(
+            "argMaxIf(v, transform(fingerprint, fps, arrayEnumerate(fps), toUInt32(0)), NOT is_hist)"
+        ));
         assert!(!min.contains("argMinIf"));
     }
 
