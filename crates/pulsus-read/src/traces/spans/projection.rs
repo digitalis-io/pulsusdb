@@ -522,6 +522,13 @@ fn comparison_value(
     ctx: &PredicateCtx<'_>,
 ) -> Result<Projects, PlanError> {
     let place = place_of(field);
+    // Section 3.6's refusal comes before every operator's own rule, `!=`
+    // and `!~` included: such a comparison projects nothing, but its
+    // predicate matches any pair of elements where today's engine reads
+    // each element against itself, so the statement must not serve it.
+    if matches!(place, Place::Set) {
+        refuse_two_occurrences(field, lhs, rhs)?;
+    }
     match place {
         Place::Column(sql) => return Ok(column(sql)),
         Place::Envelope => return Ok(Projects::Nothing),
@@ -614,9 +621,10 @@ fn arithmetic_only(expr: &FieldExpr) -> bool {
 /// 3.5 and 3.6): opposite a literal-only side, the first element whose own
 /// condition holds; once inside arithmetic, the first element the
 /// comparison holds for; compared with itself, the first element carrying
-/// it. Twice in a comparison holding arithmetic there is no single element,
-/// and the query is refused; so is any other shape — the field under `!`
-/// or inside a boolean-valued operand — which the design does not name.
+/// it. Twice in a comparison holding arithmetic was refused before this
+/// ([`refuse_two_occurrences`]); any other shape — the field under `!` or
+/// inside a boolean-valued operand — which the design does not name is
+/// refused here.
 fn set_value(
     field: &Field,
     lhs: &FieldExpr,
@@ -627,14 +635,7 @@ fn set_value(
     let mut fields = Vec::new();
     operand_fields(lhs, &mut fields);
     operand_fields(rhs, &mut fields);
-    let arithmetic = has_arithmetic(lhs) || has_arithmetic(rhs);
     if fields.len() >= 2 {
-        if arithmetic {
-            return Err(PlanError::UnsupportedField(format!(
-                "projecting {field} from two occurrences of an event, link or unscoped field in \
-                 one comparison is not supported by the search statement"
-            )));
-        }
         if matches!((lhs, rhs), (FieldExpr::Field(_), FieldExpr::Field(_))) {
             return first_carrying(field, ctx);
         }
@@ -658,6 +659,26 @@ fn set_value(
         }
         _ => Err(unnamed_shape(field)),
     }
+}
+
+/// Section 3.6: one set field twice in a comparison holding arithmetic has
+/// no single element — the predicate matches any pair of elements — and
+/// is refused, under every operator.
+fn refuse_two_occurrences(
+    field: &Field,
+    lhs: &FieldExpr,
+    rhs: &FieldExpr,
+) -> Result<(), PlanError> {
+    let mut fields = Vec::new();
+    operand_fields(lhs, &mut fields);
+    operand_fields(rhs, &mut fields);
+    if fields.len() >= 2 && (has_arithmetic(lhs) || has_arithmetic(rhs)) {
+        return Err(PlanError::UnsupportedField(format!(
+            "projecting {field} from two occurrences of an event, link or unscoped field in one \
+             comparison is not supported by the search statement"
+        )));
+    }
+    Ok(())
 }
 
 /// A set field in a comparison shape the design does not name: under `!`,
