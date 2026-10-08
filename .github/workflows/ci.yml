@@ -1668,6 +1668,15 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-read --test live_metrics_tenants
 
+      # Issue #500: `/api/v1/metadata`'s read returns every distinct
+      # descriptor of a name, `limit` counts names after `metric`, and a
+      # descriptor not resent within the retention leaves.
+      - name: Live metrics metadata
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-read --test live_metrics_metadata
+
       # Issue #635 part 4: `X-Scope-OrgID` through the real binary — pushes,
       # the header's rule on every metrics route, push suppression per
       # tenant, and every `/api/v1` route over two tenants' rows.
