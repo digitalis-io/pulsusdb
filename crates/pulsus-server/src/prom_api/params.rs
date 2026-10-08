@@ -106,6 +106,25 @@ pub(crate) enum ParamError {
     /// integer. The reference's own sentence.
     #[error("limit_per_metric must be a number")]
     LimitPerMetricNotANumber,
+    /// Issue #499: `lookback_delta` that is not a duration, or past int64
+    /// nanoseconds. The reference's own sentence, with no `invalid
+    /// parameter` prefix.
+    #[error("error parsing lookback delta duration: cannot parse {0:?} to a valid duration")]
+    InvalidLookbackDelta(String),
+    /// Issue #499: a float `lookback_delta` past int64 nanoseconds.
+    #[error(
+        "error parsing lookback delta duration: cannot parse {0:?} to a valid duration. It overflows int64"
+    )]
+    LookbackDeltaOverflow(String),
+    /// Issue #499: `/status/tsdb`'s `limit` below 1 or not an integer.
+    #[error("limit must be a positive number")]
+    TsdbLimitNotPositive,
+    /// Issue #499: `/status/tsdb`'s `limit` above [`TSDB_MAX_LIMIT`].
+    #[error("limit must not exceed 10000")]
+    TsdbLimitTooLarge,
+    /// Issue #499: `/query_exemplars`' `end` before its `start`.
+    #[error("end timestamp must not be before start timestamp")]
+    ExemplarsEndBeforeStart,
     /// Issue #635 part 4: an `X-Scope-OrgID` outside the tenant rule
     /// (`pulsus_model::Tenant::from_header`).
     #[error("invalid X-Scope-OrgID")]
@@ -312,6 +331,25 @@ pub(crate) fn parse_limit_per_metric(raw: Option<&str>) -> Result<Option<i64>, P
     }
 }
 
+/// The largest `lookback_delta` in milliseconds: int64 nanoseconds.
+pub(crate) const MAX_LOOKBACK_MS: i64 = i64::MAX / 1_000_000;
+
+/// The largest `/status/tsdb` `limit` (issue #499).
+pub(crate) const TSDB_MAX_LIMIT: usize = 10_000;
+
+/// `lookback_delta` (`/query`, `/query_range` — issue #499), in
+/// milliseconds; `None` is the engine's default.
+pub(crate) fn parse_lookback_delta(raw: Option<&str>) -> Result<Option<i64>, ParamError> {
+    let _ = raw;
+    Ok(None)
+}
+
+/// `/status/tsdb`'s `limit` (issue #499).
+pub(crate) fn parse_tsdb_limit(raw: Option<&str>) -> Result<usize, ParamError> {
+    let _ = raw;
+    Ok(10)
+}
+
 /// `limit` for the three **discovery** endpoints — `/labels`,
 /// `/label/{name}/values`, `/series` (issue #471 M4).
 ///
@@ -328,7 +366,7 @@ pub(crate) fn parse_limit_per_metric(raw: Option<&str>) -> Result<Option<i64>, P
 /// Truncation is a **response-size** cap, exactly as in the reference —
 /// never a scan bound (`PULSUS_PROMQL_MAX_METRIC_FANOUT` and
 /// `PULSUS_PROMQL_MAX_CACHE_SCAN` remain the scan bounds).
-pub(crate) fn parse_discovery_limit(raw: Option<&str>) -> Result<Option<usize>, ParamError> {
+pub(crate) fn parse_truncation_limit(raw: Option<&str>) -> Result<Option<usize>, ParamError> {
     let Some(s) = raw else {
         return Ok(None);
     };
@@ -848,28 +886,28 @@ mod tests {
     // -----------------------------------------------------------------
 
     #[test]
-    fn parse_discovery_limit_table() {
-        assert_eq!(parse_discovery_limit(None).unwrap(), None);
-        assert_eq!(parse_discovery_limit(Some("")).unwrap(), None);
+    fn parse_truncation_limit_table() {
+        assert_eq!(parse_truncation_limit(None).unwrap(), None);
+        assert_eq!(parse_truncation_limit(Some("")).unwrap(), None);
         // `0` means *no limit* here — the opposite of `/metadata`'s rule.
-        assert_eq!(parse_discovery_limit(Some("0")).unwrap(), None);
-        assert_eq!(parse_discovery_limit(Some("1")).unwrap(), Some(1));
+        assert_eq!(parse_truncation_limit(Some("0")).unwrap(), None);
+        assert_eq!(parse_truncation_limit(Some("1")).unwrap(), Some(1));
         // A leading `+` is accepted, exactly as on the reference.
-        assert_eq!(parse_discovery_limit(Some("+2")).unwrap(), Some(2));
+        assert_eq!(parse_truncation_limit(Some("+2")).unwrap(), Some(2));
         assert!(matches!(
-            parse_discovery_limit(Some("-1")).unwrap_err(),
+            parse_truncation_limit(Some("-1")).unwrap_err(),
             ParamError::LimitNegative
         ));
         assert!(matches!(
-            parse_discovery_limit(Some("abc")).unwrap_err(),
+            parse_truncation_limit(Some("abc")).unwrap_err(),
             ParamError::LimitNotAnInteger(_)
         ));
         assert!(matches!(
-            parse_discovery_limit(Some("1.5")).unwrap_err(),
+            parse_truncation_limit(Some("1.5")).unwrap_err(),
             ParamError::LimitNotAnInteger(_)
         ));
         assert!(matches!(
-            parse_discovery_limit(Some("99999999999999999999")).unwrap_err(),
+            parse_truncation_limit(Some("99999999999999999999")).unwrap_err(),
             ParamError::LimitNotAnInteger(_)
         ));
     }
@@ -879,12 +917,99 @@ mod tests {
     #[test]
     fn discovery_limit_rejection_messages_are_the_two_pinned_literals() {
         assert_eq!(
-            parse_discovery_limit(Some("-1")).unwrap_err().to_string(),
+            parse_truncation_limit(Some("-1")).unwrap_err().to_string(),
             "invalid parameter \"limit\": limit must be non-negative"
         );
         assert_eq!(
-            parse_discovery_limit(Some("1.5")).unwrap_err().to_string(),
+            parse_truncation_limit(Some("1.5")).unwrap_err().to_string(),
             "invalid parameter \"limit\": cannot parse \"1.5\" to an integer"
+        );
+    }
+
+    // -- issue #499 ---------------------------------------------------
+
+    /// P1: what `lookback_delta` accepts, in milliseconds.
+    #[test]
+    fn lookback_delta_accepts_the_references_values() {
+        for none in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("0s"),
+            Some("-5"),
+            Some("NaN"),
+        ] {
+            assert_eq!(parse_lookback_delta(none).unwrap(), None, "{none:?}");
+        }
+        for (raw, ms) in [
+            ("15m", 900_000),
+            ("90", 90_000),
+            ("1.5", 1_500),
+            ("1m30s", 90_000),
+            ("0.0005", 0),
+            ("292y", 292 * 365 * 86_400_000),
+            ("9223372036", 9_223_372_036_000),
+            ("9223372036.854775", 9_223_372_036_854),
+        ] {
+            assert_eq!(parse_lookback_delta(Some(raw)).unwrap(), Some(ms), "{raw}");
+        }
+        // Exactly 2^63 ns: past the reference's check, then non-positive,
+        // so its engine's default.
+        assert_eq!(
+            parse_lookback_delta(Some("9223372036.854776")).unwrap(),
+            None
+        );
+    }
+
+    /// P2: the two refusals, by value, and both messages as literals.
+    #[test]
+    fn lookback_delta_refusals_are_the_references_messages() {
+        for raw in ["abc", "1ns", "300y"] {
+            assert!(
+                matches!(
+                    parse_lookback_delta(Some(raw)),
+                    Err(ParamError::InvalidLookbackDelta(_))
+                ),
+                "{raw}"
+            );
+        }
+        for raw in ["1e300", "-1e300", "inf", "9223372037"] {
+            assert!(
+                matches!(
+                    parse_lookback_delta(Some(raw)),
+                    Err(ParamError::LookbackDeltaOverflow(_))
+                ),
+                "{raw}"
+            );
+        }
+        assert_eq!(
+            parse_lookback_delta(Some("abc")).unwrap_err().to_string(),
+            "error parsing lookback delta duration: cannot parse \"abc\" to a valid duration"
+        );
+        assert_eq!(
+            parse_lookback_delta(Some("1e300")).unwrap_err().to_string(),
+            "error parsing lookback delta duration: cannot parse \"1e300\" to a valid duration. \
+             It overflows int64"
+        );
+    }
+
+    /// P5: `/status/tsdb`'s `limit`.
+    #[test]
+    fn tsdb_limit_is_one_to_ten_thousand() {
+        assert_eq!(parse_tsdb_limit(None).unwrap(), 10);
+        assert_eq!(parse_tsdb_limit(Some("")).unwrap(), 10);
+        assert_eq!(parse_tsdb_limit(Some("1")).unwrap(), 1);
+        assert_eq!(parse_tsdb_limit(Some("10000")).unwrap(), 10_000);
+        for raw in ["0", "-1", "abc"] {
+            assert_eq!(
+                parse_tsdb_limit(Some(raw)).map_err(|e| e.to_string()),
+                Err("limit must be a positive number".to_string()),
+                "{raw}"
+            );
+        }
+        assert_eq!(
+            parse_tsdb_limit(Some("10001")).map_err(|e| e.to_string()),
+            Err("limit must not exceed 10000".to_string())
         );
     }
 

@@ -2768,3 +2768,335 @@ async fn limit_per_metric_is_read_and_checked() {
     let json: serde_json::Value = serde_json::from_str(&body).expect("json");
     assert_eq!(json["data"], want, "limit_per_metric=1: {body}");
 }
+
+// ---------------------------------------------------------------------
+// Issue #499: every query API parameter honoured, rejected or warned
+// ---------------------------------------------------------------------
+
+/// `path`'s status and parsed body.
+fn get_json(port: u16, path: &str) -> (u16, serde_json::Value) {
+    let (status, body) = http_get(port, path).unwrap_or_else(|| panic!("{path} unreachable"));
+    let json = serde_json::from_str(&body).unwrap_or_else(|e| panic!("{path}: {e}: {body}"));
+    (status, json)
+}
+
+/// The `label` values of a vector or matrix result, in the result's order.
+fn label_values_of(json: &serde_json::Value, label: &str) -> Vec<String> {
+    json["data"]["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no result array: {json}"))
+        .iter()
+        .map(|r| r["metric"][label].as_str().unwrap_or("").to_string())
+        .collect()
+}
+
+/// Issue #499, L1-L10: `lookback_delta`, `limit`, `stats`, the discovery
+/// default window, the tsdb `limit`, the exemplar validation and empty
+/// values, through the real binary.
+#[tokio::test(flavor = "multi_thread")]
+async fn prom_api_query_parameters_issue_499() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse to run this test");
+        return;
+    }
+    let db = pulsus_testkit::test_db("pulsus_prom_499_it");
+    let port: u16 = 31_520;
+    let guard = spawn_prom_server(port, &db, &[]);
+    let client = ChClient::new(test_ch_config(&db))
+        .await
+        .expect("connect to seed data");
+
+    const MIN: i64 = 60_000;
+    let t = (now_ms() / 15_000) * 15_000 - MIN;
+    let ts = t / 1_000;
+    let series = |name: &str, fp: u128, labels: &str, at: i64| SeedSeriesRow {
+        metric_name: name.to_string(),
+        fingerprint: fp,
+        unix_milli: at,
+        labels: labels.to_string(),
+    };
+    let mut rows = vec![
+        series("p499", 9901, r#"{"inst":"1","job":"a"}"#, t),
+        series("p499", 9902, r#"{"inst":"2","job":"a"}"#, t),
+        series("p499", 9903, r#"{"inst":"3","job":"b"}"#, t),
+        series("q499", 9904, r#"{"inst":"4"}"#, t),
+        series("q499", 9905, r#"{"inst":"5"}"#, t),
+        series("r499", 9906, r#"{"inst":"6"}"#, t),
+        series("v499", 9911, r#"{"inst":"c"}"#, t),
+        series("v499", 9912, r#"{"inst":"a"}"#, t),
+        series("v499", 9913, r#"{"inst":"b"}"#, t),
+        series("old499", 9907, r#"{"old_key":"v"}"#, t - 3 * 86_400_000),
+    ];
+    // Each p499 series is also active half an hour back, where its
+    // samples start.
+    for fp in [9901u128, 9902, 9903] {
+        let r = rows
+            .iter()
+            .find(|r| r.fingerprint == fp)
+            .expect("seeded")
+            .clone();
+        rows.push(SeedSeriesRow {
+            unix_milli: t - 30 * MIN,
+            ..r
+        });
+    }
+    client.insert_series(&rows).await.expect("seed series");
+    let sample = |fp: u128, at: i64, value: f64| SeedSampleRow {
+        org_id: String::new(),
+        fingerprint: fp,
+        unix_milli: at,
+        value,
+    };
+    let mut samples = Vec::new();
+    for (fp, value, until) in [
+        (9901u128, 1.0, t),
+        (9902, 2.0, t - 10 * MIN),
+        (9903, 3.0, t),
+    ] {
+        let mut at = t - 30 * MIN;
+        while at <= until {
+            samples.push(sample(fp, at, value));
+            at += 15_000;
+        }
+    }
+    for fp in [9904u128, 9905, 9906, 9911, 9912, 9913] {
+        samples.push(sample(fp, t, 1.0));
+    }
+    client
+        .insert_block("metric_samples", &samples)
+        .await
+        .expect("seed samples");
+    let _ = wait_for_body(port, "/api/v1/status/tsdb", |json| {
+        json["data"]["headStats"]["numSeries"] == 9
+    });
+
+    let q = |path: &str| get_json(port, path);
+    let at = format!("time={ts}");
+    let insts = |path: &str| {
+        let (status, json) = q(path);
+        assert_eq!(status, 200, "{path}: {json}");
+        label_values_of(&json, "inst")
+    };
+
+    // L1: the lookback is the request's.
+    assert_eq!(insts(&format!("/api/v1/query?query=p499&{at}")), ["1", "3"]);
+    assert_eq!(
+        insts(&format!("/api/v1/query?query=p499&{at}&lookback_delta=15m")),
+        ["1", "2", "3"],
+        "L1: lookback_delta=15m"
+    );
+    for empty in ["0", ""] {
+        assert_eq!(
+            insts(&format!(
+                "/api/v1/query?query=p499&{at}&lookback_delta={empty}"
+            )),
+            ["1", "3"],
+            "L1: lookback_delta={empty}"
+        );
+    }
+
+    // L2: the pushed and the fetched route both read the requested
+    // lookback.
+    for (query, needle) in [
+        ("count(p499)", "%900000 AS lookback%".to_string()),
+        (
+            "count(p499%20*%201)",
+            format!("%unix_milli > {}%", t - 900_000),
+        ),
+    ] {
+        let (status, json) = q(&format!(
+            "/api/v1/query?query={query}&{at}&lookback_delta=15m"
+        ));
+        assert_eq!(status, 200, "L2 {query}: {json}");
+        assert_eq!(
+            json["data"]["result"][0]["value"][1], "3",
+            "L2 {query}: {json}"
+        );
+        flush_logs(&client).await;
+        let sent = statements_matching(&client, &db, &format!("query LIKE '{needle}'")).await;
+        assert!(sent >= 1, "L2 {query}: no statement read `{needle}`");
+    }
+
+    // L3: and on a range query.
+    let range = format!("start={}&end={ts}&step=60", ts - 60);
+    assert_eq!(
+        insts(&format!("/api/v1/query_range?query=p499&{range}")).len(),
+        2
+    );
+    let (status, json) = q(&format!(
+        "/api/v1/query_range?query=p499&{range}&lookback_delta=15m"
+    ));
+    assert_eq!(status, 200, "L3: {json}");
+    assert_eq!(
+        label_values_of(&json, "inst"),
+        ["1", "2", "3"],
+        "L3: {json}"
+    );
+    assert_eq!(
+        json["data"]["result"][1]["values"].as_array().map(Vec::len),
+        Some(2),
+        "L3: inst=2 has two points: {json}"
+    );
+
+    // L4: `limit` truncates as the reference does.
+    let truncated = serde_json::json!(["results truncated due to limit"]);
+    let (status, json) = q(&format!("/api/v1/query?query=v499&{at}&limit=2"));
+    assert_eq!(status, 200, "L4: {json}");
+    assert_eq!(label_values_of(&json, "inst"), ["a", "c"], "L4: {json}");
+    assert_eq!(json["warnings"], truncated, "L4: {json}");
+    let (_, json) = q(&format!("/api/v1/query?query=v499&{at}&limit=3"));
+    assert_eq!(
+        label_values_of(&json, "inst").len(),
+        3,
+        "L4 limit=3: {json}"
+    );
+    assert!(json.get("warnings").is_none(), "L4 limit=3: {json}");
+    let (_, json) = q(&format!(
+        "/api/v1/query?query=sort_desc(p499)&{at}&lookback_delta=15m&limit=1"
+    ));
+    assert_eq!(
+        label_values_of(&json, "inst"),
+        ["3"],
+        "L4 sort_desc: {json}"
+    );
+    assert_eq!(
+        json["data"]["result"][0]["value"][1], "3",
+        "L4 sort_desc: {json}"
+    );
+    let (_, json) = q(&format!(
+        "/api/v1/query_range?query=p499&{range}&lookback_delta=15m&limit=1"
+    ));
+    assert_eq!(label_values_of(&json, "inst"), ["1"], "L4 range: {json}");
+    assert_eq!(json["warnings"], truncated, "L4 range: {json}");
+    let (_, json) = q(&format!("/api/v1/query?query=1&{at}&limit=1"));
+    assert_eq!(json["data"]["resultType"], "scalar", "L4 scalar: {json}");
+    assert!(json.get("warnings").is_none(), "L4 scalar: {json}");
+
+    // L5: `stats` adds the notice and no statistics.
+    let stats_notice = serde_json::json!([
+        "parameter \"stats\" is not supported; no query statistics are returned"
+    ]);
+    for path in [
+        format!("/api/v1/query?query=p499&{at}&stats=all"),
+        format!("/api/v1/query_range?query=p499&{range}&stats=all"),
+    ] {
+        let (status, json) = q(&path);
+        assert_eq!(status, 200, "L5 {path}: {json}");
+        assert_eq!(label_values_of(&json, "inst").len(), 2, "L5 {path}: {json}");
+        assert_eq!(json["warnings"], stats_notice, "L5 {path}: {json}");
+        assert!(json["data"].get("stats").is_none(), "L5 {path}: {json}");
+    }
+    for path in [
+        format!("/api/v1/query?query=p499&{at}&stats="),
+        format!("/api/v1/query_range?query=p499&{range}&stats="),
+    ] {
+        let (_, json) = q(&path);
+        assert!(json.get("warnings").is_none(), "L5 {path}: {json}");
+    }
+
+    // L6: a discovery with no range reads all time.
+    let (status, labels) = q("/api/v1/labels");
+    assert_eq!(status, 200, "L6: {labels}");
+    assert!(
+        labels["data"]
+            .as_array()
+            .expect("names")
+            .contains(&serde_json::json!("old_key")),
+        "L6 /labels: {labels}"
+    );
+    let (status, empty_range) = q("/api/v1/labels?start=&end=");
+    assert_eq!(status, 200, "L6 empty range: {empty_range}");
+    assert_eq!(empty_range, labels, "L6 empty range");
+    let (_, values) = q("/api/v1/label/old_key/values");
+    assert_eq!(values["data"], serde_json::json!(["v"]), "L6: {values}");
+    let (_, names) = q("/api/v1/label/__name__/values");
+    assert!(
+        names["data"]
+            .as_array()
+            .expect("names")
+            .contains(&serde_json::json!("old499")),
+        "L6: {names}"
+    );
+    for path in [
+        "/api/v1/series?match%5B%5D=old499",
+        "/api/v1/series?match%5B%5D=%7B__name__%3D~%22old4..%22%7D",
+    ] {
+        let (status, json) = q(path);
+        assert_eq!(status, 200, "L6 {path}: {json}");
+        assert_eq!(
+            json["data"].as_array().map(Vec::len),
+            Some(1),
+            "L6 {path}: {json}"
+        );
+    }
+
+    // L8: the tsdb limit.
+    let counts = |json: &serde_json::Value| -> Vec<(String, u64)> {
+        json["data"]["seriesCountByMetricName"]
+            .as_array()
+            .expect("counts")
+            .iter()
+            .map(|e| {
+                (
+                    e["name"].as_str().expect("name").to_string(),
+                    e["value"].as_u64().expect("value"),
+                )
+            })
+            .collect()
+    };
+    let named = |pairs: &[(&str, u64)]| -> Vec<(String, u64)> {
+        pairs.iter().map(|(n, c)| (n.to_string(), *c)).collect()
+    };
+    let (_, json) = q("/api/v1/status/tsdb");
+    assert_eq!(
+        counts(&json),
+        named(&[("p499", 3), ("v499", 3), ("q499", 2), ("r499", 1)]),
+        "L8: {json}"
+    );
+    let (_, json) = q("/api/v1/status/tsdb?limit=2");
+    assert_eq!(
+        counts(&json),
+        named(&[("p499", 3), ("v499", 3)]),
+        "L8 limit=2: {json}"
+    );
+    for (raw, error) in [
+        ("0", "limit must be a positive number"),
+        ("10001", "limit must not exceed 10000"),
+    ] {
+        let (status, json) = q(&format!("/api/v1/status/tsdb?limit={raw}"));
+        assert_eq!(status, 400, "L8 limit={raw}: {json}");
+        assert_eq!(json["error"], error, "L8 limit={raw}");
+    }
+
+    // L9: the exemplar validation.
+    let (status, json) = q("/api/v1/query_exemplars?query=p499");
+    assert_eq!(status, 200, "L9: {json}");
+    assert_eq!(json, serde_json::json!({"status": "success", "data": []}));
+    for params in [
+        "",
+        "query=p499%7B",
+        "query=p499&start=abc",
+        "query=p499&start=10&end=5",
+    ] {
+        let (status, json) = q(&format!("/api/v1/query_exemplars?{params}"));
+        assert_eq!(status, 400, "L9 {params}: {json}");
+        assert_eq!(json["errorType"], "bad_data", "L9 {params}");
+    }
+    let (_, json) = q("/api/v1/query_exemplars?query=p499&start=10&end=5");
+    assert_eq!(
+        json["error"],
+        "end timestamp must not be before start timestamp"
+    );
+
+    // L10: an empty `time` or `timeout` means absent.
+    for path in [
+        "/api/v1/query?query=p499&time=".to_string(),
+        format!("/api/v1/query?query=p499&{at}&timeout="),
+    ] {
+        let (status, json) = q(&path);
+        assert_eq!(status, 200, "L10 {path}: {json}");
+    }
+
+    drop(guard);
+    drop_db(&db).await;
+}

@@ -244,6 +244,13 @@ impl Annotations {
         self.add_item(AnnotationKind::Warning, message.into(), Some(pos), None);
     }
 
+    /// Adds a **warning** with no source position (issue #499): a notice
+    /// about the request rather than about a node of the query, such as a
+    /// truncated result. It renders without a position suffix.
+    pub fn plain_warning(&mut self, message: impl Into<String>) {
+        let _ = message;
+    }
+
     /// Adds an **info** with the emitting node's start byte offset — see
     /// [`Self::warning_at`].
     pub fn info_at(&mut self, pos: usize, message: impl Into<String>) {
@@ -962,6 +969,22 @@ pub mod messages {
 
 #[cfg(test)]
 mod tests {
+    /// Issue #499, A1: a plain warning follows a positioned one and renders
+    /// with no position suffix.
+    #[test]
+    fn a_plain_warning_renders_without_a_position() {
+        let mut a = Annotations::new();
+        a.warning_at(0, "w");
+        a.plain_warning("x");
+        assert_eq!(
+            a.as_strings("up", 10, 10),
+            (
+                vec!["w (1:1)".to_string(), "x".to_string()],
+                Vec::<String>::new()
+            )
+        );
+    }
+
     use super::*;
 
     /// Issue #128, byte-exactness vectors for [`start_pos_input`] — each

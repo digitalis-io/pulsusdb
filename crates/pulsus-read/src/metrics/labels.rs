@@ -1154,7 +1154,8 @@ pub const TSDB_TOP_METRIC_NAMES: usize = 10;
 /// [`LabelCache::tsdb_snapshot`]'s pure core, factored out the same way
 /// [`resolve_over`] is: testable against a hand-built [`CacheSnapshot`]
 /// with no `ChClient` at all.
-pub(crate) fn tsdb_snapshot_over(snapshot: &CacheSnapshot) -> TsdbCacheSnapshot {
+pub(crate) fn tsdb_snapshot_over(snapshot: &CacheSnapshot, limit: usize) -> TsdbCacheSnapshot {
+    let _ = limit;
     let mut by_metric: Vec<(String, u64)> = snapshot
         .by_metric
         .iter()
@@ -1176,7 +1177,10 @@ impl LabelCache {
     /// than a ClickHouse fallback query (task-manager resolution #2: "no
     /// SQL variant for M2").
     pub fn tsdb_snapshot(&self, tenant: &Tenant) -> TsdbCacheSnapshot {
-        tsdb_snapshot_over(&self.tenant_cache(tenant).current_snapshot())
+        tsdb_snapshot_over(
+            &self.tenant_cache(tenant).current_snapshot(),
+            TSDB_TOP_METRIC_NAMES,
+        )
     }
 }
 
@@ -2304,7 +2308,7 @@ mod tests {
 
     #[test]
     fn tsdb_snapshot_over_a_cold_cache_is_empty() {
-        let snap = tsdb_snapshot_over(&CacheSnapshot::default());
+        let snap = tsdb_snapshot_over(&CacheSnapshot::default(), TSDB_TOP_METRIC_NAMES);
         assert_eq!(snap.num_series, 0);
         assert!(snap.series_count_by_metric_name.is_empty());
     }
@@ -2321,7 +2325,7 @@ mod tests {
             BASE_SWEEP_MS,
             1,
         );
-        let summary = tsdb_snapshot_over(&snap);
+        let summary = tsdb_snapshot_over(&snap, TSDB_TOP_METRIC_NAMES);
         assert_eq!(summary.num_series, 3);
         assert_eq!(
             summary.series_count_by_metric_name,
@@ -2343,7 +2347,7 @@ mod tests {
             BASE_SWEEP_MS,
             1,
         );
-        let summary = tsdb_snapshot_over(&snap);
+        let summary = tsdb_snapshot_over(&snap, TSDB_TOP_METRIC_NAMES);
         assert_eq!(
             summary.series_count_by_metric_name,
             vec![("alpha".to_string(), 1), ("zeta".to_string(), 1)]
@@ -2822,10 +2826,40 @@ mod tests {
             })
             .collect();
         let snap = snapshot(entries, 0, BASE_SWEEP_MS, 1);
-        let summary = tsdb_snapshot_over(&snap);
+        let summary = tsdb_snapshot_over(&snap, TSDB_TOP_METRIC_NAMES);
         assert_eq!(
             summary.series_count_by_metric_name.len(),
             TSDB_TOP_METRIC_NAMES
+        );
+    }
+
+    /// Issue #499, R1: the request's `limit` cuts the list, keeping the
+    /// largest; the series count is the whole cache's.
+    #[test]
+    fn tsdb_snapshot_over_cuts_at_the_requested_limit() {
+        const NAMES: [&str; 15] = [
+            "m00", "m01", "m02", "m03", "m04", "m05", "m06", "m07", "m08", "m09", "m10", "m11",
+            "m12", "m13", "m14",
+        ];
+        let entries: Vec<SnapshotEntry<'_>> = NAMES
+            .iter()
+            .enumerate()
+            .map(|(i, name)| -> SnapshotEntry<'_> {
+                (name, Fingerprint::from_raw(i as u128), &[][..])
+            })
+            .collect();
+        let snap = snapshot(entries, 0, BASE_SWEEP_MS, 1);
+        let three = tsdb_snapshot_over(&snap, 3);
+        assert_eq!(
+            three.series_count_by_metric_name,
+            [("m00", 1), ("m01", 1), ("m02", 1)].map(|(n, c)| (n.to_string(), c))
+        );
+        assert_eq!(three.num_series, 15);
+        assert_eq!(
+            tsdb_snapshot_over(&snap, 100)
+                .series_count_by_metric_name
+                .len(),
+            15
         );
     }
 }

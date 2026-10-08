@@ -519,7 +519,29 @@ pub(crate) fn query_response(
     let empty = pulsus_promql::Annotations::new();
     // Empty annotations render zero bytes regardless of the query text,
     // so the float-only path needs no query threading (issue #128).
-    query_response_annotated(result, explain, at_ms, ordered, "", &empty)
+    query_response_annotated(
+        result,
+        explain,
+        at_ms,
+        "",
+        empty,
+        ResponseShape {
+            ordered,
+            limit: None,
+            stats_requested: false,
+        },
+    )
+}
+
+/// How a `query`/`query_range` answer is shaped beyond its result (issue
+/// #499): `ordered` keeps the evaluator's vector order (a sort-rooted
+/// instant query), `limit` truncates the series, and `stats_requested`
+/// adds the notice that no statistics are returned.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ResponseShape {
+    pub(crate) ordered: bool,
+    pub(crate) limit: Option<usize>,
+    pub(crate) stats_requested: bool,
 }
 
 /// `query_response` plus the `warnings`/`infos` envelope arrays (M7-A5b-i)
@@ -533,11 +555,12 @@ pub(crate) fn query_response_annotated(
     result: QueryResult,
     explain: Option<PlanExplain>,
     at_ms: i64,
-    ordered: bool,
     query: &str,
-    annotations: &pulsus_promql::Annotations,
+    annotations: pulsus_promql::Annotations,
+    shape: ResponseShape,
 ) -> Response {
-    let annos = annotations_suffix(query, annotations);
+    let ordered = shape.ordered;
+    let annos = annotations_suffix(query, &annotations);
     match result {
         QueryResult::Vector(mut items) => {
             if !ordered {
@@ -654,6 +677,11 @@ pub(crate) fn query_response_annotated(
 /// The truncation warning for the three discovery endpoints (issue #471
 /// M4) — the reference's own string, byte-for-byte.
 pub(crate) const TRUNCATION_WARNING: &str = "results truncated due to limit";
+
+/// The notice a non-empty `stats` parameter adds to `warnings` (issue
+/// #499): no query statistics are returned.
+pub(crate) const STATS_UNSUPPORTED_WARNING: &str =
+    "parameter \"stats\" is not supported; no query statistics are returned";
 
 /// The `]}`/`],"warnings":[...]}` suffix for the discovery encoders (issue
 /// #471 M4). `None` produces today's bytes exactly, so every existing body
@@ -875,6 +903,13 @@ pub(crate) fn status_tsdb_response(status: TsdbStatus) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// No limit, no stats, the presentation sort.
+    const NO_SHAPE: ResponseShape = ResponseShape {
+        ordered: false,
+        limit: None,
+        stats_requested: false,
+    };
 
     use axum::Router;
     use axum::body::to_bytes;
@@ -1149,9 +1184,13 @@ mod tests {
             QueryResult::Vector(vec![sample]),
             None,
             5_500,
-            false,
             "up",
-            &pulsus_promql::Annotations::new(),
+            pulsus_promql::Annotations::new(),
+            ResponseShape {
+                ordered: false,
+                limit: None,
+                stats_requested: false,
+            },
         );
         assert_eq!(body_string(plain).await, body_string(annotated).await);
     }
@@ -1165,7 +1204,7 @@ mod tests {
         // `" (<line>:<col>)"` source-position suffix rendered against the
         // SAME raw query string the handler parsed.
         let res =
-            query_response_annotated(QueryResult::Scalar(1.0), None, 0, false, "a + b", &annos);
+            query_response_annotated(QueryResult::Scalar(1.0), None, 0, "a + b", annos, NO_SHAPE);
         let body = body_string(res).await;
         assert_eq!(
             body,
@@ -1185,7 +1224,8 @@ mod tests {
             22,
             "PromQL warning: quantile value should be between 0 and 1, got 1.5",
         );
-        let res = query_response_annotated(QueryResult::Scalar(1.5), None, 0, false, query, &annos);
+        let res =
+            query_response_annotated(QueryResult::Scalar(1.5), None, 0, query, annos, NO_SHAPE);
         let body = body_string(res).await;
         assert_eq!(
             body,
@@ -1211,9 +1251,9 @@ mod tests {
             QueryResult::Matrix(vec![series]),
             None,
             0,
-            false,
             query,
-            &annos,
+            annos,
+            NO_SHAPE,
         );
         let body = body_string(res).await;
         assert_eq!(
@@ -1231,13 +1271,216 @@ mod tests {
         annos.warning_at(0, "w0"); // duplicate -- deduped, not double-counted.
         // Issue #128: the kept lines carry suffixes; the overflow line
         // (asserted below) never does.
-        let res = query_response_annotated(QueryResult::Scalar(1.0), None, 0, false, "up", &annos);
+        let res =
+            query_response_annotated(QueryResult::Scalar(1.0), None, 0, "up", annos, NO_SHAPE);
         let body = body_string(res).await;
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         let warnings = json["warnings"].as_array().expect("warnings array");
         assert_eq!(warnings.len(), 11, "10 kept + 1 overflow line");
         assert_eq!(warnings[10], "2 more warning annotations omitted");
         assert!(json.get("infos").is_none(), "omitempty: no infos at all");
+    }
+
+    // -- issue #499: `limit` and `stats` on the query routes -----------
+
+    fn shape(ordered: bool, limit: Option<usize>) -> ResponseShape {
+        ResponseShape {
+            ordered,
+            limit,
+            stats_requested: false,
+        }
+    }
+
+    fn lbl(v: &str) -> Vec<(String, String)> {
+        vec![("i".to_string(), v.to_string())]
+    }
+
+    /// The three results E1 truncates, labelled `c`, `a`, `b` in that order.
+    fn results() -> [(&'static str, QueryResult); 4] {
+        let vector = || {
+            QueryResult::Vector(
+                ["c", "a", "b"]
+                    .map(|v| VectorSample {
+                        labels: lbl(v),
+                        value: 1.0,
+                    })
+                    .into(),
+            )
+        };
+        let vector_hist = QueryResult::VectorHist(
+            ["c", "a", "b"]
+                .map(|v| HistVectorSample {
+                    labels: lbl(v),
+                    value: HistOrFloat::Float(1.0),
+                })
+                .into(),
+        );
+        let matrix = QueryResult::Matrix(
+            ["c", "a", "b"]
+                .map(|v| MatrixSeries {
+                    labels: lbl(v),
+                    points: vec![(0, 1.0)],
+                })
+                .into(),
+        );
+        let matrix_hist = QueryResult::MatrixHist(
+            ["c", "a", "b"]
+                .map(|v| HistMatrixSeries {
+                    labels: lbl(v),
+                    points: vec![(0, HistOrFloat::Float(1.0))],
+                })
+                .into(),
+        );
+        [
+            ("vector", vector()),
+            ("vector", vector_hist),
+            ("matrix", matrix),
+            ("matrix", matrix_hist),
+        ]
+    }
+
+    /// The labels of a body's result, in order, and its `warnings`.
+    async fn kept(res: Response) -> (Vec<String>, Option<serde_json::Value>, String) {
+        let body = body_string(res).await;
+        let json: serde_json::Value = serde_json::from_str(&body).expect("json");
+        let labels = json["data"]["result"]
+            .as_array()
+            .expect("result array")
+            .iter()
+            .map(|r| r["metric"]["i"].as_str().expect("label").to_string())
+            .collect();
+        (labels, json.get("warnings").cloned(), body)
+    }
+
+    /// E1: a vector is cut in the evaluator's order and then sorted; a
+    /// matrix is sorted and then cut; the warning appears only when the
+    /// limit cut something, and never on a scalar.
+    #[tokio::test]
+    async fn limit_truncates_as_the_reference_does() {
+        let warning = serde_json::json!(["results truncated due to limit"]);
+        for (i, (kind, result)) in results().into_iter().enumerate() {
+            let want: &[&str] = if kind == "vector" {
+                &["a", "c"]
+            } else {
+                &["a", "b"]
+            };
+            let res = query_response_annotated(
+                result,
+                None,
+                0,
+                "up",
+                pulsus_promql::Annotations::new(),
+                shape(false, Some(2)),
+            );
+            let (labels, warnings, body) = kept(res).await;
+            assert_eq!(labels, want, "result {i}: {body}");
+            assert_eq!(warnings, Some(warning.clone()), "result {i}: {body}");
+            assert!(
+                body.ends_with(r#"]},"warnings":["results truncated due to limit"]}"#),
+                "result {i}: {body}"
+            );
+        }
+        for (i, (kind, result)) in results().into_iter().enumerate() {
+            if kind != "vector" {
+                continue;
+            }
+            let res = query_response_annotated(
+                result,
+                None,
+                0,
+                "up",
+                pulsus_promql::Annotations::new(),
+                shape(true, Some(2)),
+            );
+            let (labels, _, body) = kept(res).await;
+            assert_eq!(labels, ["c", "a"], "result {i} ordered: {body}");
+        }
+        for (i, (_, result)) in results().into_iter().enumerate() {
+            let res = query_response_annotated(
+                result,
+                None,
+                0,
+                "up",
+                pulsus_promql::Annotations::new(),
+                shape(false, Some(3)),
+            );
+            let (labels, warnings, body) = kept(res).await;
+            assert_eq!(labels.len(), 3, "result {i}: {body}");
+            assert_eq!(warnings, None, "result {i}: {body}");
+        }
+        let res = query_response_annotated(
+            QueryResult::Scalar(1.0),
+            None,
+            0,
+            "1",
+            pulsus_promql::Annotations::new(),
+            shape(false, Some(1)),
+        );
+        let body = body_string(res).await;
+        assert!(!body.contains("warnings"), "{body}");
+    }
+
+    /// E2: the truncation warning follows the evaluation's own warnings.
+    #[tokio::test]
+    async fn the_truncation_warning_follows_the_evaluations_warnings() {
+        let mut annos = pulsus_promql::Annotations::new();
+        annos.warning_at(0, "w");
+        let result = QueryResult::Vector(
+            ["a", "b"]
+                .map(|v| VectorSample {
+                    labels: lbl(v),
+                    value: 1.0,
+                })
+                .into(),
+        );
+        let res = query_response_annotated(result, None, 0, "up", annos, shape(false, Some(1)));
+        let (_, warnings, body) = kept(res).await;
+        assert_eq!(
+            warnings,
+            Some(serde_json::json!([
+                "w (1:1)",
+                "results truncated due to limit"
+            ])),
+            "{body}"
+        );
+    }
+
+    /// E3: the `stats` notice comes after the 10-warning cap and its
+    /// overflow line, so the cap never drops it.
+    #[tokio::test]
+    async fn the_stats_notice_is_last_and_outside_the_cap() {
+        let stats = ResponseShape {
+            ordered: false,
+            limit: None,
+            stats_requested: true,
+        };
+        let mut annos = pulsus_promql::Annotations::new();
+        for i in 0..11 {
+            annos.warning_at(0, format!("w{i}"));
+        }
+        let res = query_response_annotated(QueryResult::Scalar(1.0), None, 0, "up", annos, stats);
+        let body = body_string(res).await;
+        let json: serde_json::Value = serde_json::from_str(&body).expect("json");
+        let mut want: Vec<String> = (0..10).map(|i| format!("w{i} (1:1)")).collect();
+        want.push("1 more warning annotations omitted".to_string());
+        want.push(STATS_UNSUPPORTED_WARNING.to_string());
+        assert_eq!(json["warnings"], serde_json::json!(want), "{body}");
+
+        let res = query_response_annotated(
+            QueryResult::Scalar(1.0),
+            None,
+            0,
+            "up",
+            pulsus_promql::Annotations::new(),
+            stats,
+        );
+        let body = body_string(res).await;
+        let json: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(
+            json["warnings"],
+            serde_json::json!([STATS_UNSUPPORTED_WARNING]),
+            "{body}"
+        );
     }
 
     #[tokio::test]
