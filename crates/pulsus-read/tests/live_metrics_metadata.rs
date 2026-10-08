@@ -112,13 +112,12 @@ fn t1_rows(now: i64) -> Vec<Descriptor<'static>> {
     rows
 }
 
-/// A fresh database holding `rows`, written as kind-3 landing rows, one
+/// `db`, fresh, holding `rows`, written as kind-3 landing rows, one
 /// insert per row; the client over it and the engine.
 async fn seeded(
-    name: &str,
+    db: String,
     rows: &[Descriptor<'_>],
 ) -> (String, ChClient, ChClient, MetricsEngine) {
-    let db = pulsus_testkit::test_db(name);
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
@@ -182,8 +181,11 @@ const ALL_FIVE: [&str; 5] = [
 #[tokio::test]
 async fn every_distinct_descriptor_is_returned() {
     skip_unless_live!();
-    let (db, bootstrap, _client, engine) =
-        seeded("pulsus_read_it_500_t1", &t1_rows(now_ms())).await;
+    let (db, bootstrap, _client, engine) = seeded(
+        pulsus_testkit::test_db("pulsus_read_it_500_t1"),
+        &t1_rows(now_ms()),
+    )
+    .await;
     let all = entries(&engine, "", None, None, None).await;
     let other = entries(&engine, "t2", None, None, None).await;
     drop_database(&bootstrap, &db).await;
@@ -195,8 +197,11 @@ async fn every_distinct_descriptor_is_returned() {
 #[tokio::test]
 async fn limit_counts_names_after_metric() {
     skip_unless_live!();
-    let (db, bootstrap, _client, engine) =
-        seeded("pulsus_read_it_500_t2", &t1_rows(now_ms())).await;
+    let (db, bootstrap, _client, engine) = seeded(
+        pulsus_testkit::test_db("pulsus_read_it_500_t2"),
+        &t1_rows(now_ms()),
+    )
+    .await;
     let one_name = entries(&engine, "", None, Some(1), None).await;
     let none = entries(&engine, "", None, Some(0), None).await;
     let n = entries(&engine, "", Some("n"), None, None).await;
@@ -217,8 +222,11 @@ async fn limit_counts_names_after_metric() {
 #[tokio::test]
 async fn limit_per_metric_cuts_each_name() {
     skip_unless_live!();
-    let (db, bootstrap, _client, engine) =
-        seeded("pulsus_read_it_500_t9", &t1_rows(now_ms())).await;
+    let (db, bootstrap, _client, engine) = seeded(
+        pulsus_testkit::test_db("pulsus_read_it_500_t9"),
+        &t1_rows(now_ms()),
+    )
+    .await;
     let two = entries(&engine, "", None, None, Some(2)).await;
     let zero = entries(&engine, "", None, None, Some(0)).await;
     let negative = entries(&engine, "", None, None, Some(-1)).await;
@@ -259,7 +267,8 @@ async fn a_repeated_descriptor_is_one_row_and_an_old_one_expires() {
     rows.push(("", "old", "gauge", "O", "", past));
     rows.push(("", "kept", "gauge", "K", "", past));
     rows.push(("", "kept", "gauge", "K", "", now - HOUR_MS));
-    let (db, bootstrap, client, _engine) = seeded("pulsus_read_it_500_t3", &rows).await;
+    let (db, bootstrap, client, _engine) =
+        seeded(pulsus_testkit::test_db("pulsus_read_it_500_t3"), &rows).await;
     exec(&client, "OPTIMIZE TABLE metric_metadata FINAL").await;
     let ours = rows_of(&client, "org_id = '' AND metric_name IN ('m', 'n')").await;
     let old = rows_of(&client, "metric_name = 'old'").await;

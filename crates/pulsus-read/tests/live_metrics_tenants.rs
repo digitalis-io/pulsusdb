@@ -201,7 +201,14 @@ fn data_sql(t0: i64) -> Vec<String> {
     ));
     let rows: Vec<String> = descriptors
         .iter()
-        .map(|(org, name, ty, help)| format!("('{org}', 0, 3, '{name}', '{ty}', '{help}', 1)"))
+        // A descriptor's version is its receive time: `metric_metadata`
+        // keeps one `retention_days` from it (issue #500).
+        .map(|(org, name, ty, help)| {
+            format!(
+                "('{org}', 0, 3, '{name}', '{ty}', '{help}', {})",
+                t0 * 1_000_000
+            )
+        })
         .collect();
     out.push(format!(
         "INSERT INTO metric_landing (org_id, received_ms, kind, metric_name, metric_type, \

@@ -841,19 +841,21 @@ async fn a_push_after_the_window_elapses_is_stored_again() {
 /// outside the push identity — it changes on every retry, and a retry that
 /// matched nothing would defeat the whole mechanism.
 ///
-/// That leaves one sequence the content digest cannot read correctly:
+/// The sequence a content digest once read wrongly:
 ///
 /// ```text
-///   counter at t1    emitted, wins
-///   gauge   at t2    emitted, wins
+///   counter at t1    emitted
+///   gauge   at t2    emitted
 ///   counter at t3    byte-identical content to t1
 /// ```
 ///
-/// Suppressing the third leaves `gauge` as the stored type of a metric
-/// that is a counter — a wrong answer, not a lost duplicate. So a push
-/// that emits a descriptor is never suppressed, and this is that rule.
+/// Since issue #500 the table keys on the whole descriptor, so `counter`
+/// and `gauge` are two rows and neither replaces the other: the counter
+/// row of t1 is still there at t3. The writer sent `counter` within the
+/// hour, so the third push carries no descriptor to send, and suppressing
+/// it as a repeat of the first loses nothing.
 #[tokio::test]
-async fn a_descriptor_that_comes_back_is_stored_again() {
+async fn a_descriptor_that_comes_back_within_the_hour_is_already_stored() {
     let landing = MockInserter::new(Behavior::Ok);
     let writer = metric_writer_with(WriterConfig::default(), landing.clone());
 
@@ -867,31 +869,24 @@ async fn a_descriptor_that_comes_back_is_stored_again() {
             .expect("queue has room");
         wait.await.expect("the flush settles");
     }
-    // The third push is suppressed, and its descriptor rides a landing block
-    // of its own with no waiter to await.
     drained(&writer).await;
     writer.shutdown(Duration::from_secs(2)).await;
 
     assert_eq!(
         landing.rows_of_kind(3),
-        3,
-        "all three descriptors reach the table: the third is the current \
-         value of the metric, and the version column is what decides the \
-         winner"
+        2,
+        "the two descriptors reach the table once each: the third push's \
+         counter is already a row of its own"
     );
     assert_eq!(
         landing.call_count(),
-        3,
-        "one landing insert per push, the suppressed push's descriptor-only \
-         block included"
+        2,
+        "one landing insert per push that carried something to store"
     );
     assert_eq!(
         writer.metrics().dedup.duplicate_pushes_total,
         1,
-        "the third push IS suppressed — it repeats the first — and the \
-         descriptor is written anyway, which is the whole point: \
-         suppression drops the rows a repeat would duplicate, not the one \
-         a repeat would correct"
+        "the third push is suppressed: it repeats the first"
     );
 }
 
