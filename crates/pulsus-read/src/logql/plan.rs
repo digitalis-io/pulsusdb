@@ -397,6 +397,7 @@ impl MetricPlan {
     pub fn source_shape(&self) -> Option<sql::MetricShape> {
         match &self.value {
             sql::MetricValue::Shaped(shape) => Some(*shape),
+            sql::MetricValue::Staged(staged) => Some(staged.shape),
             sql::MetricValue::Unwrapped(_) => None,
         }
     }
@@ -1749,6 +1750,15 @@ fn metric_pipeline_construct(pipeline: &[Stage]) -> Option<&'static str> {
             Stage::Drop(_) => Some("drop"),
             Stage::Keep(_) => Some("keep"),
         })
+}
+
+/// Whether every stage of `pipeline` reads only labels, so a counting
+/// reducer (or `absent_over_time`) can be counted in the database and the
+/// stages run once per returned group (issue #624, part 2). Not yet
+/// implemented.
+pub(in crate::logql) fn label_only_pipeline(pipeline: &[Stage], op: RangeAggOp) -> bool {
+    let _ = (pipeline, op);
+    false
 }
 
 /// Issue #507 (W4): does the pipeline carry a `| unwrap` with a
@@ -8296,6 +8306,78 @@ mod tests {
     /// whether the step divides the resolution — and 60s divides the
     /// fixture's 5s. Without the branch this issue adds, this plan would
     /// route to a table that has no `structured_metadata` column.
+    /// T2 (issue #624, part 2): a counting reducer, or `absent_over_time`,
+    /// whose pipeline holds only stages that read labels plans no client
+    /// aggregation and a staged value, at a range equal to, above and below
+    /// the step and with an end off the grid; every other pipeline stays on
+    /// today's route.
+    #[test]
+    fn label_only_pipelines_lower_and_the_rest_stay() {
+        use crate::logql::testkit::ADMITTED_PIPELINES;
+        const STAGED: &str =
+            "raw: range aggregation in the database, label stages over its rows (issue #624)";
+        const MIN: u64 = 60_000_000_000;
+        // (range, end): equal to the step, above, below, and an end off the grid.
+        let shapes: [(&str, i64); 4] = [
+            ("1m", 1_200_000_000_000),
+            ("5m", 1_200_000_000_000),
+            ("30s", 1_200_000_000_000),
+            ("1m", 1_210_000_000_000),
+        ];
+        for (range, end_ns) in shapes {
+            let spec = QuerySpec::Range {
+                start_ns: 600_000_000_000,
+                end_ns,
+                step_ns: MIN,
+            };
+            let mut lowered: Vec<String> = ADMITTED_PIPELINES
+                .iter()
+                .filter(|case| **case != r#"| x="y""#)
+                .map(|case| format!(r#"count_over_time({{a="b"}} {case} [{range}])"#))
+                .collect();
+            lowered.extend([
+                format!(r#"rate({{a="b"}} | decolorize [{range}])"#),
+                format!(r#"absent_over_time({{a="b"}}[{range}])"#),
+                format!(r#"absent_over_time({{a="b"}} | x="y" [{range}])"#),
+                format!(
+                    r#"sum by (level, detected_level) (count_over_time({{a="b"}} | drop __error__ [{range}]))"#
+                ),
+            ]);
+            for query in &lowered {
+                let mp = metric_mp(query, spec).unwrap_or_else(|e| panic!("{query}: {e}"));
+                assert!(
+                    mp.client.is_none(),
+                    "{query} at [{range}], end {end_ns}: must lower"
+                );
+                assert!(
+                    matches!(mp.value, sql::MetricValue::Staged(_)),
+                    "{query} at [{range}]: a staged value, got {:?}",
+                    mp.value
+                );
+                assert_eq!(mp.routing.reason, STAGED, "{query} at [{range}]");
+                assert!(!mp.rollup, "{query}: raw, never rollup");
+            }
+            // An equality over a metadata name lowers into the statement
+            // itself (issue #544), so the chain is a clean one.
+            let clean = format!(r#"count_over_time({{a="b"}} | x="y" [{range}])"#);
+            let mp = metric_mp(&clean, spec).expect("plans");
+            assert!(mp.client.is_none(), "{clean}");
+            assert!(matches!(mp.value, sql::MetricValue::Shaped(_)), "{clean}");
+            for query in [
+                format!(r#"bytes_over_time({{a="b"}} | decolorize [{range}])"#),
+                format!(r#"count_over_time({{a="b"}} | decolorize |= "x" [{range}])"#),
+                format!(r#"count_over_time({{a="b"}} |= ip("1.2.3.4") [{range}])"#),
+                format!(r#"count_over_time({{a="b"}} | line_format "x" [{range}])"#),
+                format!(r#"count_over_time({{a="b"}} | label_format a=b [{range}])"#),
+                format!(r#"count_over_time({{a="b"}} | json [{range}])"#),
+                format!(r#"count_over_time({{a="b"}} | unpack [{range}])"#),
+            ] {
+                let mp = metric_mp(&query, spec).unwrap_or_else(|e| panic!("{query}: {e}"));
+                assert!(mp.client.is_some(), "{query} at [{range}]: today's route");
+            }
+        }
+    }
+
     #[test]
     fn a_clean_bucketed_chain_plans_no_client_aggregation() {
         const MIN: u64 = 60_000_000_000;

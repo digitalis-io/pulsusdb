@@ -50,9 +50,9 @@ Site	Literal	crates/pulsus-read/src/logql/compile.rs:1464	-	-	<a>	accept	accept	
 Site	Literal	crates/pulsus-read/src/logql/compile.rs:1843	-	-	<a>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:3941	-	-	, 	reject	reject	-	-	-
 Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:7499	-	-	<__preserve_error__> <b>	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/src/logql/plan.rs:6424	-	-	<x> y	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/src/logql/plan.rs:7736	-	-	<a>	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/src/logql/plan.rs:8578	-	-	latency=<latency>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/src/logql/plan.rs:6434	-	-	<x> y	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/src/logql/plan.rs:7746	-	-	<a>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/src/logql/plan.rs:8660	-	-	latency=<latency>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/src/logql/predicate.rs:2110	-	-	{}	reject	reject	-	-	-
 Site	Literal	crates/pulsus-read/tests/fixtures/group_key/cases.tsv:213	-	-	latency=<latency>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/tests/fixtures/group_key/cases.tsv:269	-	-	<__error__> <__error___extracted>	accept	accept	-	-	-

@@ -3543,6 +3543,7 @@ async fn a_bucketed_statement_that_fails_for_memory_is_answered_by_todays_route(
             todays_route_group_bytes: None,
             key_statement_test_knobs: None,
             bucketed_statement_max_memory_bytes: Some(1),
+            ..Default::default()
         })
         .with_query_log_comment(comment.clone());
     let params = QueryParams {
@@ -3733,6 +3734,1083 @@ async fn a_reducing_aggregation_over_sparse_series_at_range_equal_to_step_is_ans
         )
         .await
         .expect("drop the run database");
+}
+
+// ---------------------------------------------------------------------
+// Issue #624, part 2: counting behind label-only stages, in the database.
+// ---------------------------------------------------------------------
+
+/// Which cap a search moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cap624 {
+    GroupBytes,
+    ResultPoints,
+}
+
+/// The hooks one run takes: today's route or the lowered one, an optional
+/// cap override, and an optional statement memory ceiling.
+fn hooks_624(
+    todays: bool,
+    cap: Option<(Cap624, u64)>,
+    memory: Option<u64>,
+) -> pulsus_read::logql::exec::KeyRouteTestHooks {
+    let mut caps = pulsus_read::logql::exec::AggCapOverrides::default();
+    match cap {
+        Some((Cap624::GroupBytes, n)) => caps.group_bytes = Some(n),
+        Some((Cap624::ResultPoints, n)) => caps.result_points = Some(n),
+        None => {}
+    }
+    pulsus_read::logql::exec::KeyRouteTestHooks {
+        bucketed_statement_max_memory_bytes: memory,
+        agg_caps: caps,
+        todays_route_only: todays,
+        ..Default::default()
+    }
+}
+
+/// One query through an engine built for this run: its answer, sorted, or
+/// its error. `comment` tags every statement the run issues.
+async fn run_624(
+    db: &str,
+    hooks: pulsus_read::logql::exec::KeyRouteTestHooks,
+    comment: Option<&str>,
+    query: &str,
+    params: &QueryParams,
+) -> Result<Vec<AnswerSeries>, ReadError> {
+    let mut engine = LogQlEngine::new(data_client(db).await, engine_config(db, 64 * 1024 * 1024))
+        .with_key_route_test_hooks(hooks);
+    if let Some(c) = comment {
+        engine = engine.with_query_log_comment(c.to_string());
+    }
+    let (result, _warnings) = engine.query(&parse(query).expect("parse"), params).await?;
+    let QueryResult::Matrix(series) = result else {
+        panic!("{query}: expected a matrix");
+    };
+    let mut out: Vec<AnswerSeries> = series
+        .into_iter()
+        .map(|s| {
+            let mut labels = s.labels;
+            labels.sort();
+            (
+                labels,
+                s.points
+                    .into_iter()
+                    .map(|(ts, v)| (ts, v.to_bits()))
+                    .collect(),
+            )
+        })
+        .collect();
+    out.sort();
+    Ok(out)
+}
+
+/// The two answers agree: equal matrices, or the same error kind and type.
+fn same_outcome_624(
+    what: &str,
+    lowered: &Result<Vec<AnswerSeries>, ReadError>,
+    todays: &Result<Vec<AnswerSeries>, ReadError>,
+) {
+    match (lowered, todays) {
+        (Ok(a), Ok(b)) => assert_eq!(a, b, "{what}: the lowered answer must be today's"),
+        (
+            Err(ReadError::MetricPipelineError { error_type: a, .. }),
+            Err(ReadError::MetricPipelineError { error_type: b, .. }),
+        ) => assert_eq!(a, b, "{what}: the same pipeline error"),
+        (a, b) => panic!("{what}: lowered {a:?}, today's {b:?}"),
+    }
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct CommentedRow624 {
+    log_comment: String,
+    query: String,
+    exception_code: i32,
+    read_rows: u64,
+    result_rows: u64,
+}
+
+/// Every finished or failed statement over `log_samples` under each of
+/// `comments`. `SYSTEM FLUSH LOGS` does not guarantee the rows are there, so
+/// this waits until every comment has one.
+async fn logged_624(
+    admin: &ChClient,
+    comments: &[String],
+) -> std::collections::HashMap<String, Vec<CommentedRow624>> {
+    let list = comments
+        .iter()
+        .map(|c| format!("'{c}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut out = std::collections::HashMap::new();
+    for _ in 0..30 {
+        admin
+            .execute(
+                "SYSTEM FLUSH LOGS",
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("flush logs");
+        let sql = format!(
+            "SELECT log_comment, query, exception_code, read_rows, result_rows \
+             FROM system.query_log WHERE log_comment IN ({list}) AND type != 'QueryStart' \
+             AND query LIKE '%log_samples%' AND query NOT LIKE '%system.query_log%' \
+             ORDER BY event_time_microseconds ASC"
+        );
+        let mut stream = admin
+            .query_stream::<CommentedRow624>(&sql, &QuerySettings::new())
+            .await
+            .expect("read system.query_log");
+        out = std::collections::HashMap::new();
+        while let Some(row) = stream.next().await {
+            let row = row.expect("decode a query_log row");
+            out.entry(row.log_comment.clone())
+                .or_insert_with(Vec::new)
+                .push(row);
+        }
+        drop(stream);
+        if comments.iter().all(|c| out.contains_key(c)) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    out
+}
+
+/// A statement of part 1 (either one): it carries the grid column.
+fn is_lowered_624(query: &str) -> bool {
+    query.contains("AS bucket_ns")
+}
+
+/// Today's route's raw read.
+fn is_todays_624(query: &str) -> bool {
+    query.starts_with("SELECT fingerprint, timestamp_ns, body")
+}
+
+/// Runs SQL against the admin client.
+async fn exec_624(admin: &ChClient, sql: &str) {
+    admin
+        .execute(sql, &QuerySettings::new(), Idempotency::NonIdempotent)
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+}
+
+/// Creates `db` fresh, with the schema, and returns it.
+async fn fresh_db_624(db: String) -> (ChClient, String) {
+    let admin = ChClient::new(test_config()).await.expect("connect admin");
+    for sql in [
+        format!("DROP DATABASE IF EXISTS {db}"),
+        format!("CREATE DATABASE {db}"),
+    ] {
+        admin
+            .execute(&sql, &QuerySettings::new(), Idempotency::Idempotent)
+            .await
+            .expect("create the run database");
+    }
+    run_init(&admin, &test_ctx(&db)).await.expect("run_init");
+    (admin, db)
+}
+
+async fn drop_db_624(admin: &ChClient, db: &str) {
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the run database");
+}
+
+/// Lands one stream through the landing table.
+async fn land_stream_624(admin: &ChClient, db: &str, t: i64, fp: u64, service: &str, labels: &str) {
+    exec_624(
+        admin,
+        &format!(
+            "INSERT INTO {db}.log_landing (received_ms, kind, service, fingerprint, timestamp_ns, \
+             severity, body, structured_metadata, month, labels, updated_ns, pattern, \
+             pattern_count) SELECT toUnixTimestamp64Milli(now64(3)), 1, '{service}', \
+             toUInt128({fp}), 0, 0, '', '', \
+             toStartOfMonth(toDate(fromUnixTimestamp64Nano(toInt64({t})))), '{labels}', 0, '', 0"
+        ),
+    )
+    .await;
+}
+
+/// Lands one line through the landing table.
+async fn land_line_624(
+    admin: &ChClient,
+    db: &str,
+    fp: u64,
+    service: &str,
+    ts: i64,
+    body: &str,
+    sm: &str,
+) {
+    let body = body.replace('\\', "\\\\").replace('\'', "\\'");
+    exec_624(
+        admin,
+        &format!(
+            "INSERT INTO {db}.log_landing (received_ms, kind, service, fingerprint, timestamp_ns, \
+             severity, body, structured_metadata, month, labels, updated_ns, pattern, \
+             pattern_count) SELECT toUnixTimestamp64Milli(now64(3)), 0, '{service}', \
+             toUInt128({fp}), toInt64({ts}), 0, '{body}', '{sm}', toDate(0), '', 0, '', 0"
+        ),
+    )
+    .await;
+}
+
+/// The bucketed fixture plus what the label stages read: metadata carrying
+/// the names the stages test (`x`, `n`, `d`, `b`, `addr`), a stream whose
+/// bodies carry colour codes, and a row whose metadata values do not
+/// convert. Every added row sits inside a window at `[30s]`, `[60s]` and
+/// `[150s]` on the 60 s grid from `T`.
+async fn seed_staged_corpus() -> (ChClient, String, i64) {
+    let (admin, db, t) = seed_bucketed_corpus().await;
+    let svc = "c507bucket";
+    land_stream_624(
+        &admin,
+        &db,
+        t,
+        333,
+        svc,
+        r#"{"app":"c","service_name":"c507bucket"}"#,
+    )
+    .await;
+    let good = r#"{"addr":"10.1.2.3","b":"2KB","d":"2s","n":"7","x":"1"}"#;
+    let other = r#"{"addr":"192.168.0.1","b":"1KB","d":"500ms","n":"3","x":"2"}"#;
+    let sec = 1_000_000_000i64;
+    land_line_624(
+        &admin,
+        &db,
+        333,
+        svc,
+        t + 50 * sec,
+        "\u{1b}[31mred\u{1b}[0m",
+        good,
+    )
+    .await;
+    land_line_624(
+        &admin,
+        &db,
+        333,
+        svc,
+        t + 110 * sec,
+        "\u{1b}[32mgreen\u{1b}[0m",
+        good,
+    )
+    .await;
+    land_line_624(&admin, &db, 111, svc, t + 55 * sec, "plain", other).await;
+    land_line_624(&admin, &db, 111, svc, t + 170 * sec, "plain", good).await;
+    land_line_624(
+        &admin,
+        &db,
+        222,
+        svc,
+        t + 115 * sec,
+        "malformed",
+        r#"{"b":"bad","d":"bad","n":"bad"}"#,
+    )
+    .await;
+    (admin, db, t)
+}
+
+/// The pipelines `label_only_pipeline` admits that this part stages: the
+/// planner's list, less the equality that lowers into the statement itself.
+const STAGED_PIPELINES_624: &[&str] = &[
+    "| drop x",
+    r#"| drop x="1""#,
+    r#"| drop x=~"1.*""#,
+    "| keep a",
+    r#"| keep a, x="1""#,
+    r#"| x=~"y.+""#,
+    r#"| x!~"y.+""#,
+    "| n > 5",
+    "| n >= 5.5",
+    "| d > 1s",
+    "| b > 1KB",
+    r#"| addr = ip("10.0.0.0/8")"#,
+    r#"| x=~"1" and n > 5"#,
+    r#"| x=~"1" or n > 5"#,
+    "| decolorize",
+    "| drop __error__",
+    r#"|= "tok" | drop x"#,
+];
+
+/// **T3 (issue #624, part 2): every staged query answers what today's route
+/// answers, bit for bit, at a range equal to, above and below the step, bare
+/// and under `sum by (lvl)` and `sum`.** The query log shows the lowered
+/// statement on one run and today's raw read on the other.
+#[tokio::test]
+async fn label_stages_answer_as_todays_route() {
+    skip_unless_live!();
+    let (admin, db, t) = seed_staged_corpus().await;
+    let sel = r#"{service_name="c507bucket"}"#;
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t + 240_000_000_000,
+            step_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let mut queries: Vec<String> = Vec::new();
+    for range in ["60s", "150s", "30s"] {
+        let mut inner: Vec<String> = STAGED_PIPELINES_624
+            .iter()
+            .map(|p| format!("count_over_time({sel} {p} [{range}])"))
+            .collect();
+        inner.push(format!("rate({sel} | decolorize [{range}])"));
+        inner.push(format!("rate({sel} | drop lvl [{range}])"));
+        inner.push(format!("bytes_over_time({sel} | drop lvl [{range}])"));
+        inner.push(format!("absent_over_time({sel} [{range}])"));
+        inner.push(format!(r#"absent_over_time({sel} | x="y" [{range}])"#));
+        inner.push(format!(r#"absent_over_time({sel} | x=~"zzz" [{range}])"#));
+        for q in inner {
+            queries.push(format!("sum by (lvl) ({q})"));
+            queries.push(format!("sum({q})"));
+            queries.push(q);
+        }
+    }
+
+    let mut comments: Vec<(String, bool)> = Vec::new();
+    for query in &queries {
+        let lowered_comment = format!("c624t3-{}", uuid::Uuid::new_v4().simple());
+        let todays_comment = format!("c624t3-{}", uuid::Uuid::new_v4().simple());
+        let lowered = run_624(
+            &db,
+            hooks_624(false, None, None),
+            Some(&lowered_comment),
+            query,
+            &params,
+        )
+        .await;
+        let todays = run_624(
+            &db,
+            hooks_624(true, None, None),
+            Some(&todays_comment),
+            query,
+            &params,
+        )
+        .await;
+        same_outcome_624(query, &lowered, &todays);
+        comments.push((lowered_comment, true));
+        comments.push((todays_comment, false));
+    }
+    let all: Vec<String> = comments.iter().map(|(c, _)| c.clone()).collect();
+    let logged = logged_624(&admin, &all).await;
+    for (comment, lowered) in &comments {
+        let rows = logged
+            .get(comment)
+            .unwrap_or_else(|| panic!("{comment}: no statement logged"));
+        if *lowered {
+            assert!(
+                rows.iter().any(|r| is_lowered_624(&r.query)),
+                "{comment}: {rows:#?}"
+            );
+            assert!(
+                !rows.iter().any(|r| is_todays_624(&r.query)),
+                "{comment}: {rows:#?}"
+            );
+        } else {
+            assert!(
+                rows.iter().any(|r| is_todays_624(&r.query)),
+                "{comment}: {rows:#?}"
+            );
+        }
+    }
+
+    // Non-vacuous: a stage drops a group, `drop` merges two fingerprints,
+    // and a filter is the only reason an absent point is 1.
+    let total = |a: &[AnswerSeries]| -> f64 {
+        a.iter()
+            .flat_map(|(_, p)| p.iter().map(|(_, v)| f64::from_bits(*v)))
+            .sum()
+    };
+    let plain = run_624(
+        &db,
+        hooks_624(false, None, None),
+        None,
+        &format!("count_over_time({sel} [60s])"),
+        &params,
+    )
+    .await
+    .expect("answers");
+    let filtered = run_624(
+        &db,
+        hooks_624(false, None, None),
+        None,
+        &format!(r#"count_over_time({sel} | x=~"1" [60s])"#),
+        &params,
+    )
+    .await
+    .expect("answers");
+    assert!(total(&filtered) < total(&plain), "a stage drops a group");
+    let dropped = run_624(
+        &db,
+        hooks_624(false, None, None),
+        None,
+        &format!("count_over_time({sel} | drop lvl [60s])"),
+        &params,
+    )
+    .await
+    .expect("answers");
+    assert!(
+        dropped.len() < plain.len(),
+        "drop merges two fingerprints: {dropped:?}"
+    );
+    let absent_all = run_624(
+        &db,
+        hooks_624(false, None, None),
+        None,
+        &format!("absent_over_time({sel} [60s])"),
+        &params,
+    )
+    .await
+    .expect("answers");
+    let absent_filtered = run_624(
+        &db,
+        hooks_624(false, None, None),
+        None,
+        &format!(r#"absent_over_time({sel} | x=~"zzz" [60s])"#),
+        &params,
+    )
+    .await
+    .expect("answers");
+    let points = |a: &[AnswerSeries]| a.iter().map(|(_, p)| p.len()).sum::<usize>();
+    assert!(
+        points(&absent_filtered) > points(&absent_all),
+        "a filter makes an absent point 1: {absent_all:?} / {absent_filtered:?}"
+    );
+
+    drop_db_624(&admin, &db).await;
+}
+
+/// **T4 (issue #624, part 2): the logs-volume query is counted in the
+/// database** by #507's statement, and answers what today's route answers.
+#[tokio::test]
+async fn the_logs_volume_query_is_counted_in_the_database() {
+    skip_unless_live!();
+    let (admin, db, t) = seed_staged_corpus().await;
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t + 240_000_000_000,
+            step_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let query = r#"sum by (level, detected_level) (count_over_time({service_name="c507bucket"} | drop __error__ [60s]))"#;
+    let comment = format!("c624t4-{}", uuid::Uuid::new_v4().simple());
+    let lowered = run_624(
+        &db,
+        hooks_624(false, None, None),
+        Some(&comment),
+        query,
+        &params,
+    )
+    .await;
+    let todays = run_624(&db, hooks_624(true, None, None), None, query, &params).await;
+    same_outcome_624(query, &lowered, &todays);
+    assert!(
+        lowered.as_ref().is_ok_and(|a| !a.is_empty()),
+        "an answer: {lowered:?}"
+    );
+    let logged = logged_624(&admin, std::slice::from_ref(&comment)).await;
+    let rows = &logged[&comment];
+    let statement = rows
+        .iter()
+        .find(|r| is_lowered_624(&r.query))
+        .unwrap_or_else(|| panic!("the lowered statement: {rows:#?}"));
+    assert!(
+        !statement.query.contains("leadInFrame"),
+        "range equal to step reads the equal-range statement: {}",
+        statement.query
+    );
+    assert!(
+        statement.result_rows < statement.read_rows,
+        "fewer rows sent than lines scanned: {statement:?}"
+    );
+    drop_db_624(&admin, &db).await;
+}
+
+/// **T6 (issue #624, part 2): a staged statement that fails for memory is
+/// answered by today's route**, with the carried aggregation.
+#[tokio::test]
+async fn a_staged_query_out_of_memory_answers_on_todays_route() {
+    skip_unless_live!();
+    let (admin, db, t) = seed_staged_corpus().await;
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t + 240_000_000_000,
+            step_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let query = r#"count_over_time({service_name="c507bucket"} | drop x [150s])"#;
+    let comment = format!("c624t6-{}", uuid::Uuid::new_v4().simple());
+    let lowered = run_624(
+        &db,
+        hooks_624(false, None, Some(1)),
+        Some(&comment),
+        query,
+        &params,
+    )
+    .await;
+    let todays = run_624(&db, hooks_624(true, None, None), None, query, &params).await;
+    same_outcome_624(query, &lowered, &todays);
+    assert!(
+        lowered.as_ref().is_ok_and(|a| !a.is_empty()),
+        "an answer: {lowered:?}"
+    );
+    let logged = logged_624(&admin, std::slice::from_ref(&comment)).await;
+    let rows = &logged[&comment];
+    assert!(
+        rows.iter()
+            .any(|r| is_lowered_624(&r.query) && r.exception_code == 241),
+        "the lowered statement failed for memory: {rows:#?}"
+    );
+    assert!(
+        rows.iter().any(|r| is_todays_624(&r.query)),
+        "then today's route: {rows:#?}"
+    );
+    drop_db_624(&admin, &db).await;
+}
+
+/// **`absent_over_time` answers on today's route** over a selector that
+/// resolves a stream (issue #624, part 2). One line at `T+30s`; the answer is
+/// 1 at every grid point whose window holds no line, under the selector's
+/// equality labels, and no point where a line falls in the window.
+#[tokio::test]
+async fn absent_over_time_answers_on_todays_route() {
+    skip_unless_live!();
+    let (admin, db) = fresh_db_624(pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_absent_{}",
+        uuid::Uuid::new_v4().simple()
+    )))
+    .await;
+    let t = ((now_ns() - 4 * 3_600_000_000_000) / 60_000_000_000) * 60_000_000_000;
+    let sec = 1_000_000_000i64;
+    land_stream_624(
+        &admin,
+        &db,
+        t,
+        7_400_000,
+        "c624abs",
+        r#"{"service_name":"c624abs"}"#,
+    )
+    .await;
+    land_line_624(&admin, &db, 7_400_000, "c624abs", t + 30 * sec, "x", "").await;
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t + 240 * sec,
+            step_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let labels = vec![("service_name".to_string(), "c624abs".to_string())];
+    for (range, empty) in [("1m", vec![0i64, 120, 180, 240]), ("2m", vec![0, 180, 240])] {
+        let query = format!(r#"absent_over_time({{service_name="c624abs"}}[{range}])"#);
+        let got = run_624(&db, hooks_624(true, None, None), None, &query, &params).await;
+        let want: Vec<AnswerSeries> = vec![(
+            labels.clone(),
+            empty
+                .iter()
+                .map(|s| (t + s * sec, 1.0f64.to_bits()))
+                .collect(),
+        )];
+        assert_eq!(got.as_ref().ok(), Some(&want), "{query}: {got:?}");
+    }
+    drop_db_624(&admin, &db).await;
+}
+
+/// The cap corpus of T5 and T10: `main` streams of service `c624cap`,
+/// labels `{app: a0|a1, pod}`, one line a second from `T+1s` to `T+600s`.
+async fn seed_cap_streams_624(admin: &ChClient, db: &str, t: i64, main: u64) {
+    exec_624(
+        admin,
+        &format!(
+            "INSERT INTO {db}.log_landing (received_ms, kind, service, fingerprint, timestamp_ns, \
+             severity, body, structured_metadata, month, labels, updated_ns, pattern, \
+             pattern_count) SELECT toUnixTimestamp64Milli(now64(3)), 1, 'c624cap', \
+             toUInt128(7000000 + number), 0, 0, '', '', \
+             toStartOfMonth(toDate(fromUnixTimestamp64Nano(toInt64({t})))), \
+             concat('{{\"app\":\"a', toString(number % 2), '\",\"pod\":\"p', toString(number), \
+             '\",\"service_name\":\"c624cap\"}}'), 0, '', 0 FROM numbers({main})"
+        ),
+    )
+    .await;
+    exec_624(
+        admin,
+        &format!(
+            "INSERT INTO {db}.log_landing (received_ms, kind, service, fingerprint, timestamp_ns, \
+             severity, body, structured_metadata, month, labels, updated_ns, pattern, \
+             pattern_count) SELECT toUnixTimestamp64Milli(now64(3)), 0, 'c624cap', \
+             toUInt128(7000000 + number % {main}), \
+             toInt64({t}) + toInt64(intDiv(number, {main}) + 1) * 1000000000, 0, 'x', '', \
+             toDate(0), '', 0, '', 0 FROM numbers({main} * 600)"
+        ),
+    )
+    .await;
+}
+
+/// The smallest cap at which `query` answers, by binary search over
+/// `[1, hi]`; `hi` must answer.
+async fn min_cap_624(
+    db: &str,
+    todays: bool,
+    cap: Cap624,
+    query: &str,
+    params: &QueryParams,
+    hi: u64,
+) -> u64 {
+    assert!(
+        run_624(
+            db,
+            hooks_624(todays, Some((cap, hi)), None),
+            None,
+            query,
+            params
+        )
+        .await
+        .is_ok(),
+        "{query}: must answer at {hi}"
+    );
+    let (mut lo, mut hi) = (1u64, hi);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        match run_624(
+            db,
+            hooks_624(todays, Some((cap, mid)), None),
+            None,
+            query,
+            params,
+        )
+        .await
+        {
+            Ok(_) => hi = mid,
+            Err(ReadError::QueryTooBroad(_)) => lo = mid + 1,
+            Err(e) => panic!("{query} at {cap:?} {mid}: {e}"),
+        }
+    }
+    lo
+}
+
+fn cap_refusal_624(cap: Cap624, e: &ReadError) -> bool {
+    match cap {
+        Cap624::GroupBytes => matches!(
+            e,
+            ReadError::QueryTooBroad(
+                pulsus_read::logql::TooBroadReason::MetricGroupLabelBytes { .. }
+            )
+        ),
+        Cap624::ResultPoints => matches!(
+            e,
+            ReadError::QueryTooBroad(pulsus_read::logql::TooBroadReason::MetricResultPoints { .. })
+        ),
+    }
+}
+
+/// **T5 (issue #624, part 2): a reducing aggregation answers wherever
+/// today's route answers.** For a fingerprint-route and a label-route query,
+/// at a range equal to and above the step, the smallest cap today's route
+/// answers at is the lowered route's: it answers there with today's matrix
+/// and refuses one below. And where today's route reserves a grid for
+/// streams whose lines lie only in the gaps between windows, the lowered
+/// route answers below it.
+#[tokio::test]
+async fn a_reducing_aggregation_answers_wherever_todays_route_answers() {
+    skip_unless_live!();
+    let (admin, db) = fresh_db_624(pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_t5_{}",
+        uuid::Uuid::new_v4().simple()
+    )))
+    .await;
+    let t = ((now_ns() - 4 * 3_600_000_000_000) / 60_000_000_000) * 60_000_000_000;
+    seed_cap_streams_624(&admin, &db, t, 200).await;
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t + 600_000_000_000,
+            step_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let sel = r#"{service_name="c624cap"}"#;
+    for range in ["60s", "150s"] {
+        for (query, points) in [
+            (
+                format!(r#"sum(count_over_time({sel} | pod=~".+" [{range}]))"#),
+                2_200u64,
+            ),
+            (
+                format!("sum(count_over_time({sel} | drop pod [{range}]))"),
+                22,
+            ),
+        ] {
+            for (cap, hi) in [
+                (Cap624::ResultPoints, 100_000u64),
+                (Cap624::GroupBytes, 256 * 1024 * 1024),
+            ] {
+                let today = min_cap_624(&db, true, cap, &query, &params, hi).await;
+                if cap == Cap624::ResultPoints {
+                    assert_eq!(today, points, "{query}: today's route's smallest point cap");
+                }
+                let want = run_624(
+                    &db,
+                    hooks_624(true, Some((cap, today)), None),
+                    None,
+                    &query,
+                    &params,
+                )
+                .await
+                .expect("today's route answers at its smallest cap");
+                let got = run_624(
+                    &db,
+                    hooks_624(false, Some((cap, today)), None),
+                    None,
+                    &query,
+                    &params,
+                )
+                .await;
+                assert_eq!(
+                    got.as_ref().ok(),
+                    Some(&want),
+                    "{query} at {cap:?} {today}: {got:?}"
+                );
+                let below = run_624(
+                    &db,
+                    hooks_624(false, Some((cap, today - 1)), None),
+                    None,
+                    &query,
+                    &params,
+                )
+                .await;
+                assert!(
+                    below.as_ref().is_err_and(|e| cap_refusal_624(cap, e)),
+                    "{query} at {cap:?} {}: the lowered route refuses one below, got {below:?}",
+                    today - 1
+                );
+            }
+        }
+    }
+    drop_db_624(&admin, &db).await;
+
+    // The gap case: 100 more pods whose only lines lie in `(g, g + 30s]`.
+    let (admin, db) = fresh_db_624(pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_t5gap_{}",
+        uuid::Uuid::new_v4().simple()
+    )))
+    .await;
+    seed_cap_streams_624(&admin, &db, t, 200).await;
+    exec_624(
+        &admin,
+        &format!(
+            "INSERT INTO {db}.log_landing (received_ms, kind, service, fingerprint, timestamp_ns, \
+             severity, body, structured_metadata, month, labels, updated_ns, pattern, \
+             pattern_count) SELECT toUnixTimestamp64Milli(now64(3)), 1, 'c624cap', \
+             toUInt128(7100000 + number), 0, 0, '', '', \
+             toStartOfMonth(toDate(fromUnixTimestamp64Nano(toInt64({t})))), \
+             concat('{{\"app\":\"a', toString(number % 2), '\",\"pod\":\"g', toString(number), \
+             '\",\"service_name\":\"c624cap\"}}'), 0, '', 0 FROM numbers(100)"
+        ),
+    )
+    .await;
+    exec_624(
+        &admin,
+        &format!(
+            "INSERT INTO {db}.log_landing (received_ms, kind, service, fingerprint, timestamp_ns, \
+             severity, body, structured_metadata, month, labels, updated_ns, pattern, \
+             pattern_count) SELECT toUnixTimestamp64Milli(now64(3)), 0, 'c624cap', \
+             toUInt128(7100000 + number % 100), \
+             toInt64({t}) + toInt64(intDiv(number, 100)) * 60000000000 + 15000000000, 0, 'x', '', \
+             toDate(0), '', 0, '', 0 FROM numbers(100 * 10)"
+        ),
+    )
+    .await;
+    let query = format!(r#"sum(count_over_time({sel} | pod=~".+" [30s]))"#);
+    let cap = Cap624::ResultPoints;
+    let today = min_cap_624(&db, true, cap, &query, &params, 100_000).await;
+    assert_eq!(
+        today, 3_300,
+        "today's route reserves a grid for all 300 fingerprints"
+    );
+    let want = run_624(
+        &db,
+        hooks_624(true, Some((cap, today)), None),
+        None,
+        &query,
+        &params,
+    )
+    .await
+    .expect("today's route answers at its smallest cap");
+    let got = run_624(
+        &db,
+        hooks_624(false, Some((cap, today)), None),
+        None,
+        &query,
+        &params,
+    )
+    .await;
+    assert_eq!(got.as_ref().ok(), Some(&want), "{query} at {today}");
+    let at_main = run_624(
+        &db,
+        hooks_624(false, Some((cap, 2_200)), None),
+        None,
+        &query,
+        &params,
+    )
+    .await;
+    assert_eq!(
+        at_main.as_ref().ok(),
+        Some(&want),
+        "the lowered route answers at 2,200"
+    );
+    let todays_at_main = run_624(
+        &db,
+        hooks_624(true, Some((cap, 2_200)), None),
+        None,
+        &query,
+        &params,
+    )
+    .await;
+    assert!(
+        todays_at_main
+            .as_ref()
+            .is_err_and(|e| cap_refusal_624(cap, e)),
+        "today's route refuses at 2,200: {todays_at_main:?}"
+    );
+    drop_db_624(&admin, &db).await;
+}
+
+/// **T10 (issue #624, part 2): a selected fingerprint that returns no group
+/// charges nothing.** Stream X is selected and hydrated, and its lines lie
+/// (i) only in the gaps between windows, (ii) only in the tail after the last
+/// grid point, or (iii) nowhere in the scan. The lowered route's smallest
+/// answering cap with X selected equals its smallest without X, and at
+/// today's route's smallest cap with X selected the lowered route answers
+/// with today's matrix.
+#[tokio::test]
+async fn fingerprints_that_return_no_group_charge_nothing() {
+    skip_unless_live!();
+    let t = ((now_ns() - 4 * 3_600_000_000_000) / 60_000_000_000) * 60_000_000_000;
+    let sec = 1_000_000_000i64;
+    for placement in ["gaps", "tail", "none"] {
+        let (admin, db) = fresh_db_624(pulsus_testkit::test_db(&format!(
+            "pulsus_read_it_qlg_t10_{}",
+            uuid::Uuid::new_v4().simple()
+        )))
+        .await;
+        seed_cap_streams_624(&admin, &db, t, 200).await;
+        land_stream_624(
+            &admin,
+            &db,
+            t,
+            7_200_000,
+            "c624cap",
+            r#"{"app":"solo","extra":"1","pod":"px","service_name":"c624cap"}"#,
+        )
+        .await;
+        let (range, end, lines): (&str, i64, Vec<i64>) = match placement {
+            "gaps" => (
+                "30s",
+                t + 600 * sec,
+                (0..10).map(|k| t + k * 60 * sec + 15 * sec).collect(),
+            ),
+            "tail" => (
+                "60s",
+                t + 630 * sec,
+                vec![t + 610 * sec, t + 620 * sec, t + 630 * sec],
+            ),
+            _ => ("60s", t + 600 * sec, vec![t - 86_400 * sec]),
+        };
+        for ts in lines {
+            land_line_624(&admin, &db, 7_200_000, "c624cap", ts, "x", "").await;
+        }
+        let params = QueryParams {
+            spec: QuerySpec::Range {
+                start_ns: t,
+                end_ns: end,
+                step_ns: 60_000_000_000,
+            },
+            limit: 100,
+            direction: Direction::Backward,
+        };
+        // (query with X selected, without it, the point minimum without X)
+        for (with_x, without_x, points) in [
+            (
+                format!(
+                    r#"sum(count_over_time({{service_name="c624cap"}} | pod=~".+" [{range}]))"#
+                ),
+                format!(
+                    r#"sum(count_over_time({{service_name="c624cap", extra!="1"}} | pod=~".+" [{range}]))"#
+                ),
+                2_200u64,
+            ),
+            (
+                format!(
+                    r#"sum(count_over_time({{service_name="c624cap"}} | drop pod, extra [{range}]))"#
+                ),
+                format!(
+                    r#"sum(count_over_time({{service_name="c624cap", extra!="1"}} | drop pod, extra [{range}]))"#
+                ),
+                22,
+            ),
+        ] {
+            for (cap, hi) in [
+                (Cap624::GroupBytes, 256 * 1024 * 1024u64),
+                (Cap624::ResultPoints, 100_000),
+            ] {
+                let lowered_with = min_cap_624(&db, false, cap, &with_x, &params, hi).await;
+                let lowered_without = min_cap_624(&db, false, cap, &without_x, &params, hi).await;
+                if cap == Cap624::ResultPoints {
+                    assert_eq!(
+                        lowered_without, points,
+                        "{placement}: {without_x}: one grid per series"
+                    );
+                }
+                assert_eq!(
+                    lowered_with, lowered_without,
+                    "{placement}: {with_x} at {cap:?}: X charges nothing"
+                );
+                let today = min_cap_624(&db, true, cap, &with_x, &params, hi).await;
+                let want = run_624(
+                    &db,
+                    hooks_624(true, Some((cap, today)), None),
+                    None,
+                    &with_x,
+                    &params,
+                )
+                .await
+                .expect("today's route answers at its smallest cap");
+                let got = run_624(
+                    &db,
+                    hooks_624(false, Some((cap, today)), None),
+                    None,
+                    &with_x,
+                    &params,
+                )
+                .await;
+                assert_eq!(
+                    got.as_ref().ok(),
+                    Some(&want),
+                    "{placement}: {with_x} at {cap:?} {today}"
+                );
+            }
+        }
+        drop_db_624(&admin, &db).await;
+    }
+}
+
+/// **T9 (issue #624, part 2): a row no window holds neither fails the query
+/// nor counts, as in the reference.** Stream A carries `n="7"`, a line every
+/// 10 s from `T-60s` to `T+270s`; stream B carries `n="bad"`, one line.
+#[tokio::test]
+async fn a_row_no_window_holds_neither_fails_nor_counts() {
+    skip_unless_live!();
+    let t = ((now_ns() - 4 * 3_600_000_000_000) / 60_000_000_000) * 60_000_000_000;
+    let sec = 1_000_000_000i64;
+    let query =
+        |range: &str| format!(r#"count_over_time({{service_name="c624gap"}} | n > 5 [{range}])"#);
+    let a_labels = vec![
+        ("n".to_string(), "7".to_string()),
+        ("service_name".to_string(), "c624gap".to_string()),
+    ];
+    // (B's line, range, end, the answer A gives at each grid point, or the
+    // error case).
+    for (b_at, range, end, per_point) in [
+        (t + 75 * sec, "30s", t + 240 * sec, Some(3.0f64)),
+        (t + 250 * sec, "60s", t + 270 * sec, Some(6.0)),
+        (t + 75 * sec, "60s", t + 240 * sec, None),
+    ] {
+        let (admin, db) = fresh_db_624(pulsus_testkit::test_db(&format!(
+            "pulsus_read_it_qlg_t9_{}",
+            uuid::Uuid::new_v4().simple()
+        )))
+        .await;
+        land_stream_624(
+            &admin,
+            &db,
+            t,
+            7_300_000,
+            "c624gap",
+            r#"{"n":"7","service_name":"c624gap"}"#,
+        )
+        .await;
+        land_stream_624(
+            &admin,
+            &db,
+            t,
+            7_300_001,
+            "c624gap",
+            r#"{"n":"bad","service_name":"c624gap"}"#,
+        )
+        .await;
+        for k in -6..=27 {
+            land_line_624(&admin, &db, 7_300_000, "c624gap", t + k * 10 * sec, "a", "").await;
+        }
+        land_line_624(&admin, &db, 7_300_001, "c624gap", b_at, "b", "").await;
+        let params = QueryParams {
+            spec: QuerySpec::Range {
+                start_ns: t,
+                end_ns: end,
+                step_ns: 60_000_000_000,
+            },
+            limit: 100,
+            direction: Direction::Backward,
+        };
+        let comment = format!("c624t9-{}", uuid::Uuid::new_v4().simple());
+        let got = run_624(
+            &db,
+            hooks_624(false, None, None),
+            Some(&comment),
+            &query(range),
+            &params,
+        )
+        .await;
+        match per_point {
+            Some(v) => {
+                let want: Vec<AnswerSeries> = vec![(
+                    a_labels.clone(),
+                    (0..5).map(|k| (t + k * 60 * sec, v.to_bits())).collect(),
+                )];
+                assert_eq!(
+                    got.as_ref().ok(),
+                    Some(&want),
+                    "{range} with B at {b_at}: {got:?}"
+                );
+            }
+            None => {
+                let todays = run_624(
+                    &db,
+                    hooks_624(true, None, None),
+                    None,
+                    &query(range),
+                    &params,
+                )
+                .await;
+                assert!(
+                    matches!(got, Err(ReadError::MetricPipelineError { .. })),
+                    "B inside a window fails the query: {got:?}"
+                );
+                same_outcome_624("the in-window control", &got, &todays);
+            }
+        }
+        let logged = logged_624(&admin, std::slice::from_ref(&comment)).await;
+        assert!(
+            logged[&comment].iter().any(|r| is_lowered_624(&r.query)),
+            "{range}: the lowered statement ran: {:#?}",
+            logged[&comment]
+        );
+        drop_db_624(&admin, &db).await;
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -6205,6 +7283,7 @@ async fn the_lane_answers_reserved_name_rows_under_the_rules() {
             todays_route_group_bytes: Some(1),
             key_statement_test_knobs: None,
             bucketed_statement_max_memory_bytes: None,
+            ..Default::default()
         });
     let params = QueryParams {
         spec: QuerySpec::Range {
@@ -6834,6 +7913,7 @@ async fn the_undecided_rows_come_from_one_read() {
             todays_route_group_bytes: Some(1),
             key_statement_test_knobs: None,
             bucketed_statement_max_memory_bytes: None,
+            ..Default::default()
         },
     );
     let plain = LogQlEngine::new(data_client(&db).await, config());
@@ -7184,6 +8264,7 @@ async fn the_lane_keeps_an_error_row_ungrouped() {
         todays_route_group_bytes: Some(LOWERED_GROUP_BYTES),
         key_statement_test_knobs: None,
         bucketed_statement_max_memory_bytes: None,
+        ..Default::default()
     });
 
     // (a) the shipped ceiling at W3: the query fails on the first error line
@@ -7350,6 +8431,7 @@ async fn the_key_statement_timeout_is_the_timeout_response() {
                 max_execution_s: server_limit_s,
             }),
             bucketed_statement_max_memory_bytes: None,
+            ..Default::default()
         });
         let from = server_micros(&admin).await;
         let res = slow.query(&expr, &params).await;

@@ -375,6 +375,22 @@ pub struct KeyRouteTestHooks {
     /// statement (issue #624), so a live test can make it fail with the
     /// server's memory code.
     pub bucketed_statement_max_memory_bytes: Option<u64>,
+    /// Test-only: cap overrides laid over the defaults, applied to the
+    /// lowered range fold and to today's route alike (issue #624, part 2).
+    /// Not yet applied.
+    pub agg_caps: AggCapOverrides,
+    /// Test-only: runs a staged plan on today's route (issue #624, part 2).
+    /// Not yet applied.
+    pub todays_route_only: bool,
+}
+
+/// Test-only cap overrides (issue #624, part 2): each `Some` replaces that
+/// cap's default; `None` keeps it.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AggCapOverrides {
+    pub group_bytes: Option<u64>,
+    pub result_points: Option<u64>,
 }
 
 impl LogQlEngine {
@@ -2733,7 +2749,7 @@ impl LogQlEngine {
                                 _ => Err(BucketGridRefusal::StepNotPositive),
                             }
                         }
-                        super::sql::MetricValue::Shaped(_) => {
+                        super::sql::MetricValue::Shaped(_) | super::sql::MetricValue::Staged(_) => {
                             bucketed_range_sql(mp, &services, &fingerprints, &lowered.predicates)
                         }
                     };
@@ -5366,6 +5382,28 @@ impl PushdownRangeGroups {
     pub(in crate::logql) fn with_sparse_points(mut self) -> Self {
         self.sparse = true;
         self
+    }
+
+    /// Runs the staged plan's label stages once per returned group, and
+    /// charges each output series as today's route charges it (issue #624,
+    /// part 2). Not yet implemented.
+    pub(in crate::logql) fn with_stages(
+        self,
+        compiled: CompiledPipeline,
+        todays_route: &ClientAgg,
+        step: super::pipeline::RangeStepRules,
+    ) -> Self {
+        let _ = (compiled, todays_route, step);
+        self
+    }
+
+    /// [`Self::finish`], with the charges a staged `absent_over_time` makes
+    /// when it emits (issue #624, part 2). Not yet implemented.
+    pub(in crate::logql) fn finish_checked(
+        self,
+        rate_window_ns: Option<u64>,
+    ) -> Result<Vec<MatrixSeries>, ReadError> {
+        Ok(self.finish(rate_window_ns))
     }
 
     /// Folds one returned row. A row whose fingerprint did not hydrate is
@@ -9863,6 +9901,185 @@ mod tests {
         let out = g.finish(None);
         assert_eq!(out.len() as u64, series);
         assert!(out.iter().all(|s| s.points.len() == 1));
+    }
+
+    /// T7 (issue #624, part 2): the staged fold charges each output series
+    /// what today's route charges it, by the route the row takes there.
+    #[test]
+    fn staged_fold_charges_by_route() {
+        use super::super::charge::{MUT_GROUP_SLOT, SERIES_OUT_SLOT};
+        use super::super::labels::render_labels_json_sorted;
+        use super::super::pipeline::RangeStepRules;
+        use super::super::plan::{ClientAgg, ClientValue};
+
+        fn pipeline_of(query: &str) -> Vec<pulsus_logql::Stage> {
+            match &pulsus_logql::parse(query).expect("parse") {
+                pulsus_logql::Expr::Metric(pulsus_logql::MetricExpr::Range { range, .. }) => {
+                    range.selector.pipeline.clone()
+                }
+                other => panic!("expected a range aggregation, got {other:?}"),
+            }
+        }
+        fn todays(op: RangeAggOp, query: &str, absent: Vec<(String, String)>) -> ClientAgg {
+            ClientAgg {
+                pipeline: pipeline_of(query),
+                value: ClientValue::Count,
+                range_op: op,
+                param: None,
+                absent_labels: absent,
+                grouping: None,
+            }
+        }
+        fn staged(
+            meta: &HashMap<Fingerprint, StreamMetaRow>,
+            c: &ClientAgg,
+            caps: AggCaps,
+        ) -> PushdownRangeGroups {
+            PushdownRangeGroups::new(
+                meta,
+                caps,
+                RANGE_GRID_START_NS,
+                DENSE_END_NS,
+                RANGE_STEP_NS,
+                DENSE_POINTS,
+            )
+            .with_stages(
+                CompiledPipeline::compile(&c.pipeline).expect("compiles"),
+                c,
+                RangeStepRules::PLAIN,
+            )
+        }
+        let pairs = |p: &[(&str, &str)]| -> Vec<(String, String)> {
+            p.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let meta = range_meta();
+        let base10 = series_labels(&meta[&Fingerprint::from_raw(10)]);
+
+        // (a) A stage that changes no label, over a slider-safe fingerprint
+        // with no metadata: the fingerprint route.
+        let filter = todays(
+            RangeAggOp::CountOverTime,
+            r#"count_over_time({a="b"} | app="x" [1m])"#,
+            vec![],
+        );
+        let mut g = staged(&meta, &filter, AggCaps::DEFAULT);
+        g.push_row(&bucket_row(
+            Fingerprint::from_raw(10),
+            RANGE_GRID_START_NS,
+            1,
+            "",
+        ))
+        .expect("folds");
+        assert_eq!(
+            g.charged_bytes(),
+            group_entry_bytes("", &base10, SERIES_OUT_SLOT),
+            "(a)"
+        );
+        assert_eq!(g.charged_points(), DENSE_POINTS, "(a)");
+
+        // (b) The same stage over a row with metadata: the label route.
+        let mut g = staged(&meta, &filter, AggCaps::DEFAULT);
+        g.push_row(&bucket_row(
+            Fingerprint::from_raw(10),
+            RANGE_GRID_START_NS,
+            1,
+            r#"{"lvl":"info"}"#,
+        ))
+        .expect("folds");
+        let labels = pairs(&[("app", "x"), ("lvl", "info"), ("service_name", "r")]);
+        assert_eq!(
+            g.charged_bytes(),
+            group_entry_bytes(&render_labels_json_sorted(&labels), &labels, MUT_GROUP_SLOT),
+            "(b)"
+        );
+        assert_eq!(g.charged_points(), DENSE_POINTS, "(b)");
+
+        // (c) `drop` merges two fingerprints into one series: charged once.
+        let drop = todays(
+            RangeAggOp::CountOverTime,
+            r#"count_over_time({a="b"} | drop lvl [1m])"#,
+            vec![],
+        );
+        let mut g = staged(&meta, &drop, AggCaps::DEFAULT);
+        g.push_row(&bucket_row(
+            Fingerprint::from_raw(10),
+            RANGE_GRID_START_NS,
+            1,
+            r#"{"lvl":"info"}"#,
+        ))
+        .expect("folds");
+        g.push_row(&bucket_row(
+            Fingerprint::from_raw(11),
+            RANGE_GRID_START_NS,
+            2,
+            "",
+        ))
+        .expect("folds");
+        let merged = pairs(&[("app", "x"), ("service_name", "r")]);
+        assert_eq!(
+            g.charged_bytes(),
+            group_entry_bytes(&render_labels_json_sorted(&merged), &merged, MUT_GROUP_SLOT),
+            "(c)"
+        );
+        assert_eq!(g.charged_points(), DENSE_POINTS, "(c)");
+        let series = g.finish_checked(None).expect("answers");
+        assert_eq!(series.len(), 1, "(c)");
+        assert_eq!(series[0].points, vec![(RANGE_GRID_START_NS, 3.0)], "(c)");
+
+        // (d) `absent_over_time` charges one grid, once, when it emits.
+        let absent = todays(
+            RangeAggOp::AbsentOverTime,
+            r#"absent_over_time({a="b"}[1m])"#,
+            pairs(&[("app", "x")]),
+        );
+        let caps = |points: u64| AggCaps {
+            result_points: points,
+            ..AggCaps::DEFAULT
+        };
+        let mut g = staged(&meta, &absent, caps(DENSE_POINTS - 1));
+        g.push_row(&bucket_row(
+            Fingerprint::from_raw(10),
+            RANGE_GRID_START_NS,
+            1,
+            "",
+        ))
+        .expect("folds");
+        assert!(
+            matches!(
+                g.finish_checked(None),
+                Err(ReadError::QueryTooBroad(
+                    TooBroadReason::MetricResultPoints { .. }
+                ))
+            ),
+            "(d): one grid is past a cap one point short of it"
+        );
+        let mut g = staged(&meta, &absent, caps(DENSE_POINTS));
+        g.push_row(&bucket_row(
+            Fingerprint::from_raw(10),
+            RANGE_GRID_START_NS,
+            1,
+            "",
+        ))
+        .expect("folds");
+        g.push_row(&bucket_row(
+            Fingerprint::from_raw(11),
+            RANGE_GRID_START_NS + RANGE_STEP_NS,
+            1,
+            "",
+        ))
+        .expect("folds");
+        let series = g.finish_checked(None).expect("one grid fits");
+        assert_eq!(series.len(), 1, "(d)");
+        assert_eq!(series[0].labels, pairs(&[("app", "x")]), "(d)");
+        assert_eq!(series[0].points.len() as u64, DENSE_POINTS - 2, "(d)");
+        assert!(
+            series[0].points.iter().all(|(t, v)| *v == 1.0
+                && *t != RANGE_GRID_START_NS
+                && *t != RANGE_GRID_START_NS + RANGE_STEP_NS),
+            "(d): 1 at every point no row covers"
+        );
     }
 
     /// N7 (issue #624): only the server's memory code hands a bucketed

@@ -366,9 +366,9 @@ distinct (`Distinct (Preliminary DISTINCT)` in the measured plan), so the
   `/detected_fields`' per-field `cardinality`, and — landed by issue #261,
   no longer a forward reference — `/detected_labels`' per-key
   `cardinality`, `uniqExact(val) AS cardinality` in
-  `crates/pulsus-read/src/logql/sql.rs:608-619`. On the reference both come
+  `crates/pulsus-read/src/logql/sql.rs:624-635`. On the reference both come
   from the same sketch type: `newParsedFields` and `newParsedLabels` each
-  build `hyperloglog.New()` (`pkg/querier/querier.go:934`, `:942` @ `grafana/loki`
+  build `hyperloglog.New()` (`pkg/querier/querier.go:934`, `:958` @ `grafana/loki`
   v3.7.4 = `b318f2829f0ae2094ab3a1e90780450e9e4b03be`), and
   `countLabelsAndCardinality` (`querier.go:757`) reports the raw
   `v.Estimate()` (`querier.go:799`). Informational note, not a gate
@@ -495,7 +495,7 @@ distinct (`Distinct (Preliminary DISTINCT)` in the measured plan), so the
   at all. `N` is the number of distinct values a stream-label key has
   across the whole month partition(s) the request's window touches,
   narrowed only by the optional `query=`'s `fingerprint IN` filter
-  (`sql::detected_labels`, `crates/pulsus-read/src/logql/sql.rs:608-619`);
+  (`sql::detected_labels`, `crates/pulsus-read/src/logql/sql.rs:624-635`);
   **no request parameter bounds it** — `line_limit` and `limit` do not
   exist on this endpoint, and `start`/`end` select partitions rather
   than rows (the within-month granularity gap is issue #399). The
@@ -4301,7 +4301,7 @@ unexplained.
 - **PulsusDB behaviour (the delta): a malformed query is a `400` in every
   window.** Nothing about our rejection depends on the dates asked for:
   `plan()` and `CompiledPipeline::compile` both run before any I/O
-  (`logql/exec.rs:617`, `:911`, `:2366`, `:2652`, `logql/variants.rs:509`,
+  (`logql/exec.rs:633`, `:927`, `:2382`, `:2668`, `logql/variants.rs:509`,
   propagated with `?` and surfaced by `logs_api/error.rs` as a 400), so an
   invalid pipeline cannot reach a "no chunks, return empty" path in the
   first place.

@@ -1028,7 +1028,7 @@ const NO_PARAM_CITE: &str = "pulsus-logql/src/parser.rs — a parameter is parse
                              topk/bottomk/approx_topk/quantile_over_time";
 const NO_GROUPING_CITE: &str = "pulsus-logql/src/ast.rs:907-912 (sort/sort_desc) and :901-906 \
                                 (approx_topk): grouping is rejected at parse";
-const APPROX_RANGE_CITE: &str = "crates/pulsus-read/src/logql/plan.rs:529 — approx_topk is \
+const APPROX_RANGE_CITE: &str = "crates/pulsus-read/src/logql/plan.rs:531 — approx_topk is \
                                  instant-only, rejected for a range query";
 const SORT_RANGE_CITE: &str = "crates/pulsus-read/src/logql/post_agg.rs group_range — sort/sort_desc \
                                are a matrix passthrough (the reference does not value-order a \

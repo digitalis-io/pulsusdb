@@ -219,6 +219,22 @@ pub enum MetricValue {
     /// the cost of one allocation per LOWERED plan, which is one per
     /// query and not one per row.
     Unwrapped(Box<UnwrappedValue>),
+    /// A counting reducer, or `absent_over_time`, whose pipeline holds only
+    /// stages that read labels (issue #624, part 2): part 1's statements
+    /// count the rows, and the stages run once per returned group. Carries
+    /// the column shape and the aggregation today's route runs, which the
+    /// fold and the fallbacks need.
+    Staged(Box<StagedCount>),
+}
+
+/// [`MetricValue::Staged`]'s payload (issue #624, part 2).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StagedCount {
+    /// The statement's column shape: `count()` or `sum(length(body))`.
+    pub shape: MetricShape,
+    /// The client aggregation today's route runs for this query: the full
+    /// pipeline, the reducer and `absent_over_time`'s labels.
+    pub todays_route: super::plan::ClientAgg,
 }
 
 /// [`MetricValue::Unwrapped`]'s payload: the extracted-field group key
