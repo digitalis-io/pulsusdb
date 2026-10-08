@@ -2610,13 +2610,14 @@ async fn the_incomplete_signal_follows_the_candidate_ceiling_and_not_the_request
     ] {
         let ctx = format!("[#502] {name}");
         let path =
-            // `{} | coalesce()`: the candidate ceiling is today's engine's,
-            // and a plain `{}` is the search statement's, which has no
-            // candidate phase (issue #591 part 3, section 7). `coalesce()`
-            // leaves a plain query's answer unchanged and keeps it on
-            // today's engine.
+            // `{} | by(trace:id) | coalesce()`: the candidate ceiling is
+            // today's engine's, and a plain `{}` is the search statement's,
+            // which has no candidate phase (issue #591 part 3, section 7).
+            // One group per trace, merged back, leaves a plain query's
+            // answer unchanged, and the statement does not serve that key,
+            // so it keeps the query on today's engine (issue #592 part 2).
             format!(
-                "/api/traces/v1/search?q=%7B%7D%20%7C%20coalesce%28%29&start={START_S}&end={END_S}\
+                "/api/traces/v1/search?q=%7B%7D%20%7C%20by%28trace%3Aid%29%20%7C%20coalesce%28%29&start={START_S}&end={END_S}\
                  &limit={limit}"
             );
         let res = get(port, &path, &[], &ctx);
