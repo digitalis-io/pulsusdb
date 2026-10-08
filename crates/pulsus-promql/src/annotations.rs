@@ -171,8 +171,8 @@ pub struct Annotation {
     pub message: String,
     /// Start byte offset into the query source text of the AST node
     /// upstream's constructor call site passes (`arg.PositionRange()`
-    /// etc.). Always `Some` via the `_at` adders; `None` is unreachable
-    /// through the public API and renders no suffix (defensive).
+    /// etc.). `Some` via the `_at` adders; `None` comes from
+    /// [`Annotations::plain_warning`] and renders no suffix.
     pub pos_start: Option<usize>,
     pub detail: Option<ForcedMonotonicityDetail>,
 }
@@ -242,6 +242,13 @@ impl Annotations {
     /// `map[string]error` insert (`annotations.go:41`).
     pub fn warning_at(&mut self, pos: usize, message: impl Into<String>) {
         self.add_item(AnnotationKind::Warning, message.into(), Some(pos), None);
+    }
+
+    /// Adds a **warning** with no source position (issue #499): a notice
+    /// about the request rather than about a node of the query, such as a
+    /// truncated result. It renders without a position suffix.
+    pub fn plain_warning(&mut self, message: impl Into<String>) {
+        self.add_item(AnnotationKind::Warning, message.into(), None, None);
     }
 
     /// Adds an **info** with the emitting node's start byte offset — see
@@ -962,6 +969,22 @@ pub mod messages {
 
 #[cfg(test)]
 mod tests {
+    /// Issue #499, A1: a plain warning follows a positioned one and renders
+    /// with no position suffix.
+    #[test]
+    fn a_plain_warning_renders_without_a_position() {
+        let mut a = Annotations::new();
+        a.warning_at(0, "w");
+        a.plain_warning("x");
+        assert_eq!(
+            a.as_strings("up", 10, 10),
+            (
+                vec!["w (1:1)".to_string(), "x".to_string()],
+                Vec::<String>::new()
+            )
+        );
+    }
+
     use super::*;
 
     /// Issue #128, byte-exactness vectors for [`start_pos_input`] — each

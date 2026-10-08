@@ -811,14 +811,17 @@ The standard Prometheus API is PulsusDB's native metrics API — its paths are p
 | Param | Notes |
 |-------|-------|
 | `query` | PromQL, required |
-| `time` | evaluation time (RFC3339 or unix); default now |
-| `timeout` | an additional, strictly shorter deadline for this request. A bare (possibly fractional) seconds literal (`60`, `0.001`) or a duration string (`1ms`, `1m30s`); `ns` is not an accepted unit. Installed only when it is **strictly shorter** than `PULSUS_QUERY_TIMEOUT` — an equal or longer value leaves the server deadline governing, so the two are never installed at once. A breach is `503` `timeout` with `query exceeded the requested timeout of <duration> (timeout parameter)`. Unparseable, zero or negative is `400 bad_data`. Read on `/api/v1/query` and `/api/v1/query_range` only |
+| `time` | evaluation time (RFC3339 or unix); absent or empty means now |
+| `timeout` | an additional, strictly shorter deadline for this request; empty means absent. A bare (possibly fractional) seconds literal (`60`, `0.001`) or a duration string (`1ms`, `1m30s`); `ns` is not an accepted unit. Installed only when it is **strictly shorter** than `PULSUS_QUERY_TIMEOUT` — an equal or longer value leaves the server deadline governing, so the two are never installed at once. A breach is `503` `timeout` with `query exceeded the requested timeout of <duration> (timeout parameter)`. Unparseable, zero or negative is `400 bad_data`. Read on `/api/v1/query` and `/api/v1/query_range` only |
+| `lookback_delta` | the staleness lookback for this request, default 5m (issue #499): a bare (possibly fractional) seconds literal or a duration string. Empty, `0`, a negative value or `NaN` means the default; a value past int64 nanoseconds is `400 bad_data` — `error parsing lookback delta duration: cannot parse "<raw>" to a valid duration`, with `. It overflows int64` appended for a numeric value |
+| `limit` | keep at most this many series, with `"warnings":["results truncated due to limit"]` when it cuts any (issue #499): an instant vector in evaluation order, before the label sort; a matrix after it. Same accept set and messages as the discovery `limit` (§3.3); absent, empty or `0` is no limit; a scalar or string result is not cut |
+| `stats` | not supported: a non-empty value adds `"warnings":["parameter \"stats\" is not supported; no query statistics are returned"]`, last, after any other warnings; no `data.stats` (issue #499) |
 
 Response: `{"status":"success","data":{"resultType":"vector"|"scalar"|"matrix","result":[...]}}`. Values formatted as Prometheus does (shortest round-trip float; `NaN`, `+Inf`, `-Inf` as strings).
 
 ### 3.2 `GET|POST /api/v1/query_range`
 
-`query`, `start`, `end`, `step` (required), plus §3.1's `timeout`. **Hard resolution cap: `(end - start) / step` must not exceed 11,000 step intervals.** 11,000 intervals — 11,001 grid points — is served; 11,001 intervals is `400 bad_data` with `exceeded maximum resolution of 11,000 points per timeseries. Try decreasing the query resolution (?step=XX)`. The rule counts **intervals** even though its message says *points*: that is the reference's own predicate, and implementing its sentence instead rejected one step early (issue #471). Long ranges are transparently served from downsampling tiers (M3); the segmentation is visible via `X-Pulsus-Explain`.
+`query`, `start`, `end`, `step` (required), plus §3.1's `timeout`, `lookback_delta`, `limit` and `stats`. **Hard resolution cap: `(end - start) / step` must not exceed 11,000 step intervals.** 11,000 intervals — 11,001 grid points — is served; 11,001 intervals is `400 bad_data` with `exceeded maximum resolution of 11,000 points per timeseries. Try decreasing the query resolution (?step=XX)`. The rule counts **intervals** even though its message says *points*: that is the reference's own predicate, and implementing its sentence instead rejected one step early (issue #471). Long ranges are transparently served from downsampling tiers (M3); the segmentation is visible via `X-Pulsus-Explain`.
 
 ### 3.3 Metadata & discovery
 
@@ -827,12 +830,16 @@ GET|POST /api/v1/labels                    ?match[]=&start=&end=&limit=
 GET      /api/v1/label/{name}/values       ?match[]=&start=&end=&limit=
 GET|POST /api/v1/series                    ?match[]=&start=&end=&limit=  (match[] required)
 GET      /api/v1/metadata                  ?metric=&limit=&limit_per_metric=
-GET|POST /api/v1/query_exemplars           (empty-success stub in v1)
+GET|POST /api/v1/query_exemplars           ?query=&start=&end=
 ```
 
 `__name__` is always present in labels responses. Metadata is sourced from `metric_metadata` (populated from remote-write metadata and OTLP): each name lists every distinct `(type, help, unit)` pushed for it within `PULSUS_RETENTION_DAYS` of its latest resend, in type, help, unit order (issue #500). `limit` counts names, after `metric` has selected them; `limit_per_metric` above 0 keeps each name's first that many entries, and 0, a negative value or none is no limit; a `limit_per_metric` that is not an integer is `400 bad_data`, `limit_per_metric must be a number`.
 
 **`limit` on the three discovery endpoints** (`/labels`, `/label/{name}/values`, `/series`): absent, empty and `0` all mean *no limit*; a negative value is `400 bad_data` with `invalid parameter "limit": limit must be non-negative`; a non-integer or out-of-range value is `400 bad_data` with `invalid parameter "limit": cannot parse "<raw>" to an integer` (our own wording — the reference emits its runtime's integer-parse text there, which we deliberately do not reproduce; the status and `errorType` are identical). When the limit actually cuts the result the response carries `"warnings":["results truncated due to limit"]` as a **top-level sibling of `data`**, and when it does not there is no `warnings` key at all. Truncation is applied last, to the already-sorted, already-deduplicated result — it is a **response-size** cap, never a scan bound (`PULSUS_PROMQL_MAX_METRIC_FANOUT` and `PULSUS_PROMQL_MAX_CACHE_SCAN` remain the scan bounds).
+
+**No `start`/`end` means all time** on `/labels`, `/label/{name}/values` and `/series`, as on the reference (issue #499): an absent or empty bound is the reference's own minimum or maximum time, bounded in practice by retention. A regex or negated `__name__` selector with no range is outside the label cache's window, so it takes the two-statement probe route.
+
+**`/query_exemplars`** validates as the reference does (issue #499): `start` and `end` as on discovery, `end` before `start` is `400 bad_data` `end timestamp must not be before start timestamp`, and `query` must parse (an empty one is `no expression found in input`). The answer is always `{"status":"success","data":[]}`: exemplars are not stored.
 
 **`limit` on `/metadata` is a different rule and is unchanged:** there `limit=0` means *return nothing* (`{"status":"success","data":{}}`), on this server and on the reference alike. The two meanings are not unified.
 
@@ -851,10 +858,10 @@ GET /api/v1/status/buildinfo     → version, revision, build metadata
 GET /api/v1/status/config        → effective config (redacted), Prometheus envelope
 GET /api/v1/status/flags         → static-equivalent flag map
 GET /api/v1/status/runtimeinfo   → process start time, storage retention
-GET /api/v1/status/tsdb          → numSeries, top metrics by cardinality
+GET /api/v1/status/tsdb          ?limit=   → numSeries, top metrics by cardinality
 ```
 
-`status/tsdb` is served entirely from the resident reader label cache (zero ClickHouse), fresh to within `PULSUS_CACHE_TTL`; it reports `numSeries` and `seriesCountByMetricName` (top cardinality). `numSamples` is **omitted** — it is not a Prometheus `headStats` field and cannot be served without a live sample scan, which the zero-ClickHouse contract forbids.
+`status/tsdb` is served entirely from the resident reader label cache (zero ClickHouse), fresh to within `PULSUS_CACHE_TTL`; it reports `numSeries` and `seriesCountByMetricName` (top cardinality; `limit` 1-10000, default 10 — `0` or less, or not an integer, is `400 bad_data` `limit must be a positive number`, over 10000 is `limit must not exceed 10000`; issue #499). `numSamples` is **omitted** — it is not a Prometheus `headStats` field and cannot be served without a live sample scan, which the zero-ClickHouse contract forbids.
 
 #### Errors (§3.1-3.4)
 
@@ -862,7 +869,7 @@ GET /api/v1/status/tsdb          → numSeries, top metrics by cardinality
 
 | Cause | HTTP | `errorType` |
 |-------|------|-------------|
-| Malformed params, malformed PromQL (parser position **in the message**), 11,000-interval resolution cap exceeded, invalid `limit`/`timeout`, an escaped label name that unescapes to the empty string | `400` | `bad_data` |
+| Malformed params, malformed PromQL (parser position **in the message**), 11,000-interval resolution cap exceeded, invalid `limit`/`timeout`/`lookback_delta`, an invalid `status/tsdb` `limit`, an invalid `query_exemplars` `query`/`start`/`end`, an escaped label name that unescapes to the empty string | `400` | `bad_data` |
 | A label-matcher regex **RE2 rejects** (issues #280, #309, #316) — see the note below | `400` | `bad_data` |
 | Out-of-subset construct / binary-op matching failure / histogram-bucket error | `422` | `execution` |
 | A deadline expired: the server request deadline (`PULSUS_QUERY_TIMEOUT`), the `timeout` request parameter, the ClickHouse stream deadline, the ClickHouse pool-permit wait, or ClickHouse's own server-side `max_execution_time` | `503` | `timeout` |

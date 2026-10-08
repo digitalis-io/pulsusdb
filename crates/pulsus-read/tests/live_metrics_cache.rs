@@ -880,7 +880,10 @@ async fn a_memory_bounded_sweep_failure_retains_the_last_good_snapshot() {
         .refresh()
         .await
         .expect("a small sweep fits under the tight ceiling");
-    let good = cache.tsdb_snapshot(&no_tenant());
+    let good = cache.tsdb_snapshot(
+        &no_tenant(),
+        pulsus_read::metrics::labels::TSDB_TOP_METRIC_NAMES,
+    );
     assert_eq!(good.num_series, 10, "the last GOOD snapshot");
     assert!(cache.is_warm());
 
@@ -923,7 +926,10 @@ async fn a_memory_bounded_sweep_failure_retains_the_last_good_snapshot() {
     // Behaviour deliberately unchanged: the last good snapshot is still
     // resident, not blanked — a blanked cache would mass-false-empty every
     // in-window query.
-    let after = cache.tsdb_snapshot(&no_tenant());
+    let after = cache.tsdb_snapshot(
+        &no_tenant(),
+        pulsus_read::metrics::labels::TSDB_TOP_METRIC_NAMES,
+    );
     assert_eq!(
         after.num_series, good.num_series,
         "a failed sweep must never clobber the last good snapshot"

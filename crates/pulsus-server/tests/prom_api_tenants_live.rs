@@ -8,6 +8,7 @@
 //!   T6   the header                                        '' / valid / 400 everywhere
 //!   T11  push suppression                                  two tenants, two pushes
 //!   T13  every /api/v1 route, seeded rows                  tenant-q sees none of tenant-o
+//!   T14  discovery with no range                           every day of the asking tenant, none of the other's
 //! ```
 //!
 //! Gated behind `PULSUS_TEST_CLICKHOUSE=1`:
@@ -40,6 +41,7 @@ const HEADER_PORT: u16 = 31_801;
 const DEDUP_PORT: u16 = 31_802;
 const ROUTES_PORT: u16 = 31_803;
 const DISCOVERY_PORT: u16 = 31_804;
+const NO_RANGE_PORT: u16 = 31_805;
 
 const MINUTE_MS: i64 = 60_000;
 const DAY_MS: i64 = 86_400_000;
@@ -1143,5 +1145,85 @@ async fn every_route_answers_the_asking_tenant() {
     assert!(
         statuses.iter().all(|s| *s == statuses[0]),
         "runtimeinfo: {statuses:?}"
+    );
+}
+
+/// T14 (issue #499): a discovery request with no `start`/`end` reads all
+/// time, and still only the asking tenant's rows. Each tenant has one
+/// series three days back, outside the hour main's default window read.
+#[tokio::test]
+async fn discovery_with_no_range_reads_every_day_of_the_asking_tenant() {
+    skip_unless_live!();
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_tenants_it_no_range")).await;
+    live_db::build_schema(db.name()).await;
+    let client = client_for(db.name()).await;
+    let old = (now_ms() / MINUTE_MS) * MINUTE_MS - 3 * DAY_MS;
+    exec(
+        &client,
+        &format!(
+            "INSERT INTO metric_landing (org_id, received_ms, kind, metric_name, fingerprint, \
+             unix_milli, value, labels, value_type) VALUES \
+             ('tenant-q', 0, 2, 'q14_old', toUInt128(61), {old}, 0, '{{\"q_old\":\"v\"}}', 0), \
+             ('tenant-o', 0, 2, 'o14_old', toUInt128(62), {old}, 0, '{{\"o_old\":\"w\"}}', 0)"
+        ),
+    )
+    .await;
+    let _server = spawn_ready(NO_RANGE_PORT, &db);
+
+    let answer = |path: &str, tenant: Option<&str>| {
+        let res = get(NO_RANGE_PORT, path, tenant);
+        assert_eq!(res.status, 200, "T14 {path} as {tenant:?}: {}", res.body);
+        json(&res.body)["data"].clone()
+    };
+    let holds = |data: &serde_json::Value, s: &str| {
+        data.as_array()
+            .expect("an array")
+            .contains(&serde_json::json!(s))
+    };
+    let labels_q = answer("/api/v1/labels", Some("tenant-q"));
+    assert!(
+        holds(&labels_q, "q_old"),
+        "T14 /labels as tenant-q: {labels_q}"
+    );
+    assert!(
+        !holds(&labels_q, "o_old"),
+        "T14 /labels as tenant-q: {labels_q}"
+    );
+    let names_q = answer("/api/v1/label/__name__/values", Some("tenant-q"));
+    assert!(
+        holds(&names_q, "q14_old"),
+        "T14 names as tenant-q: {names_q}"
+    );
+    assert!(
+        !holds(&names_q, "o14_old"),
+        "T14 names as tenant-q: {names_q}"
+    );
+    assert_eq!(
+        answer("/api/v1/label/o_old/values", Some("tenant-q")),
+        serde_json::json!([]),
+        "T14 tenant-o's key as tenant-q"
+    );
+    let series_q = answer(
+        &format!("/api/v1/series?match%5B%5D={}", urlencode(r#"{q_old="v"}"#)),
+        Some("tenant-q"),
+    );
+    assert_eq!(
+        series_q.as_array().map(Vec::len),
+        Some(1),
+        "T14 series as tenant-q: {series_q}"
+    );
+    let labels_o = answer("/api/v1/labels", Some("tenant-o"));
+    assert!(
+        holds(&labels_o, "o_old"),
+        "T14 /labels as tenant-o: {labels_o}"
+    );
+    assert!(
+        !holds(&labels_o, "q_old"),
+        "T14 /labels as tenant-o: {labels_o}"
+    );
+    assert_eq!(
+        answer("/api/v1/labels", None),
+        serde_json::json!(["__name__"]),
+        "T14 /labels with no tenant"
     );
 }
