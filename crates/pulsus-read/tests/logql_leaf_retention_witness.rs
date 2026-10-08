@@ -1120,7 +1120,15 @@ fn planned_value(text: &str) -> Option<Option<ClientValue>> {
     let Plan::Metric(mp) = p else {
         return Some(None);
     };
-    Some(mp.client.as_ref().map(|c| c.value))
+    // Issue #624: a clean counting range plan is counted in the database
+    // and carries no client aggregation; the value today's route derives for
+    // it is the counting fallback's.
+    Some(Some(
+        mp.client
+            .clone()
+            .unwrap_or_else(|| pulsus_read::logql::exec::bucketed_fallback_client_agg(&mp))
+            .value,
+    ))
 }
 
 /// The count of `(op, value)` pairs the planner can actually produce.

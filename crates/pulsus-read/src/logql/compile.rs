@@ -842,40 +842,21 @@ impl Lower<Lql> for WindowLower {
     /// to the shared core.
     ///
     /// So the decision is a PARTITION, not a duplication: this asserts the
-    /// necessary condition, [`super::predicate::bucket_expr`] asserts the
-    /// sufficient one, neither can express the other's input, and their
+    /// necessary condition, [`super::predicate::bucket_expr`] and
+    /// [`super::predicate::sliding_cover`] assert the sufficient one, neither
+    /// side can express the other's input, and their
     /// conjunction is taken by the planner. A partition has no shared
     /// content to drift; its one failure mode is the join dropping a half,
     /// which is what the planner's own exhaustive match is for.
     ///
-    /// **Why the range must equal the step, in both directions.** The
-    /// expression gives one grid point per row: the smallest grid point at
-    /// or above it, which is the window `(g - step, g]`. The window being
-    /// evaluated is `(g - range, g]`.
-    ///
-    /// * With a range WIDER than the step an entry belongs to several
-    ///   windows at once, and no single column can say which.
-    /// * With a range SHORTER than the step the entries in
-    ///   `(g - step, g - range]` belong to no window at all, and the
-    ///   column counts them into `g` anyway:
-    ///
-    /// ```text
-    ///   step 60s, range 10s, grid points 0 and 60
-    ///     the window        (-10, 0]   (50, 60]
-    ///     the grid column   (-60, 0]   ( 0, 60]   <- a row at 30 counted
-    /// ```
-    ///
-    /// This condition was `range <= step` when the model was written and
-    /// nothing executed from it; the shorter-range case is the one the
-    /// `<=` admitted and the statement answers wrongly (issue #507, the
-    /// W2 execution path).
-    ///
-    /// **Widening it again moves a frozen golden**, and the fact that
-    /// narrowing it did not is luck rather than design: every range in
-    /// `tests/golden/plan_build_differential.txt`'s corpus is `[5m]`
-    /// against a 60 s step, so no plan in it lowers. See the same note at
-    /// `plan.rs`'s `bucketed_range`, which is the other half of this
-    /// decision.
+    /// **Any positive range and step** (issue #624). When the range equals
+    /// the step, #507's statement gives a row the one grid point whose window
+    /// `(g - step, g]` holds it. At any other range the sliding statement
+    /// (`super::sql::metric_range_sliding`) gives a row every grid point
+    /// whose window `(g - range, g]` holds it — several when the range is
+    /// wider than the step, none when the row falls between two shorter
+    /// windows — so neither a wider nor a shorter range needs refusing.
+    /// `super::predicate::sliding_cover` holds the argument.
     fn capability(&self, s: &LqlLink, _rel: &Relation<Lql>) -> Capability {
         let LqlLink::Window {
             range_ns,
@@ -886,7 +867,7 @@ impl Lower<Lql> for WindowLower {
         else {
             return Capability::No(BlockReason::NotYetLowered);
         };
-        if *step_ns <= 0 || *range_ns <= 0 || range_ns != step_ns {
+        if *step_ns <= 0 || *range_ns <= 0 {
             return Capability::No(BlockReason::NotYetLowered);
         }
         if grid_start_ns.checked_sub(*step_ns).is_none() {
@@ -918,8 +899,8 @@ impl Lower<Lql> for WindowLower {
         Ok(rel)
     }
     /// A grid-point column removes no row and computes no aggregate: the
-    /// SQL assigns each row the same grid point the window's own rule
-    /// assigns it, so the evaluator must not re-apply the link.
+    /// SQL gives each row every grid point whose window holds it — the
+    /// window's own rule — so the evaluator must not re-apply the link.
     ///
     /// This is the window's fidelity alone. **The range aggregation above
     /// it keeps the conservative `Wider` default**, because whether
@@ -1989,9 +1970,11 @@ mod tests {
         // raises nothing: the aggregation still lowers over it.
         assert_eq!(agg_how(&[r#"|= "boom""#], count, MIN, MIN), lowered);
 
-        // The window did not lower, so there is no grid-point column.
+        // The window did not lower, so there is no grid-point column. A
+        // step that is not positive is the one chain-decidable reason left
+        // since issue #624 lowered every positive range.
         assert_eq!(
-            agg_how(&[], count, MIN + 1, MIN),
+            agg_how(&[], count, MIN, 0),
             Disposition::Residual(ResidualReason::Blocked(BlockReason::NameNotResolvable))
         );
         // A stage that can raise a pipeline error. A lowered `GROUP BY`

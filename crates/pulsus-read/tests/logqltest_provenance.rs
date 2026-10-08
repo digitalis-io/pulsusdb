@@ -293,8 +293,13 @@ fn check_c_pipeline_invalid_constructions_are_canonical_and_counted() {
         // state reachable and both arms now serve it. #240's sweep
         // numbers stand: neither carried a regex or reference-verbatim
         // text.
+        // Issue #624 adds ONE to `exec.rs`: 12 -> 13, the bucketed range
+        // fold's report of a row inside the grid's span but off its points
+        // — an internal defect of the statement, the `fold.rs` arrangement.
+        // #240's sweep numbers stand: it carries no regex and no
+        // reference-verbatim text.
         ("plan.rs", 17),
-        ("exec.rs", 12),
+        ("exec.rs", 13),
         ("client_agg.rs", 1),
         ("fold.rs", 1),
         ("post_agg.rs", 5),

@@ -1340,7 +1340,9 @@ pub fn metric_range_bucketed(
 }
 
 /// The scan bounds and the emit grid one sliding range read is rendered
-/// from (issue #624).
+/// from (issue #624), grouped into one parameter for the same reason
+/// [`TimeWindow`] is. `window.start_ns` is the scan start, `grid_start_ns -
+/// range_ns`; `grid_start_ns` is the emit grid's first point.
 #[derive(Debug, Clone, Copy)]
 pub struct SlidingScan {
     pub window: TimeWindow,
@@ -1350,15 +1352,117 @@ pub struct SlidingScan {
     pub range_ns: i64,
 }
 
-/// The sliding range metric read (issue #624). Not yet implemented.
+/// The sliding range metric read (issue #624): one row per `(fingerprint,
+/// grid point, structured_metadata)` whose window `(g - range, g]` holds at
+/// least one line, at any range and step.
+///
+/// ```text
+/// innermost   one row per (fingerprint, metadata, lo, hi): the grid indexes
+///             lo..hi whose windows hold the line; m = count or bytes,
+///             c = lines
+/// deltas      +m, +c at lo and -m, -c at hi + 1
+/// window      the cumulative sum of the deltas: the window total v and its
+///             line count p, constant from k0 up to the next delta k1
+/// outer       each run expanded to its grid points; p > 0 keeps a window
+///             with a line, so a bytes total of 0 over empty lines is a point
+/// ```
+///
+/// **Why not a window frame over buckets.** A frame is evaluated only at
+/// rows that exist, and a grid point whose own bucket is empty can still
+/// have a non-empty window. The deltas and the expansion reach every grid
+/// point a run covers. Memory grows with series × grid points, never with
+/// lines × windows. [`super::predicate::sliding_cover`] holds the grid
+/// arithmetic and its exactness argument.
+///
+/// When the range equals the step, [`metric_range_bucketed`] is the
+/// statement: smaller and faster for that case.
+///
+/// **`structured_metadata` is carried unconditionally**, as in
+/// [`metric_range_bucketed`]: it is part of the output series identity, and
+/// no expression here interprets it.
+///
+/// # Refusals
+///
+/// `RollupSource` when the shape's grid column is not `timestamp_ns` — the
+/// statement reads lines, and the rollup's buckets cannot say which side of
+/// a window edge a line fell — and every refusal of
+/// [`super::predicate::sliding_cover`].
 pub fn metric_range_sliding(
-    _source: MetricSource<'_>,
-    _services: &[CheckedLiteral],
-    _fingerprints: &[FpLiteral],
-    _scan: SlidingScan,
-    _extra_predicates: &[CheckedFragment],
+    source: MetricSource<'_>,
+    services: &[CheckedLiteral],
+    fingerprints: &[FpLiteral],
+    scan: SlidingScan,
+    extra_predicates: &[CheckedFragment],
 ) -> Result<String, super::predicate::BucketGridRefusal> {
-    Err(super::predicate::BucketGridRefusal::RollupSource)
+    let MetricSource { table, shape } = source;
+    if shape.bucket_col() != "timestamp_ns" {
+        return Err(super::predicate::BucketGridRefusal::RollupSource);
+    }
+    let SlidingScan {
+        window,
+        lower,
+        grid_start_ns,
+        step_ns,
+        range_ns,
+    } = scan;
+    let TimeWindow { start_ns, end_ns } = window;
+    let cover =
+        super::predicate::sliding_cover(start_ns, grid_start_ns, end_ns, step_ns, range_ns)?;
+    let (lo, hi, kend) = (cover.lo.as_sql(), cover.hi.as_sql(), cover.kend);
+    let agg_expr = shape.agg_expr();
+    let fp_list = fp_list(fingerprints);
+    let lower_op = lower.sql_op();
+    let mut lines: Vec<String> = vec![
+        format!(
+            "SELECT fingerprint, toInt64({grid_start_ns} + k * {step_ns}) AS bucket_ns, \
+             toUInt64(v) AS n, structured_metadata"
+        ),
+        "FROM (".to_string(),
+        "  SELECT fingerprint, structured_metadata, k0,".to_string(),
+        format!(
+            "         sum(dv) OVER cum AS v, sum(dc) OVER cum AS p, \
+             leadInFrame(k0, 1, {kend}) OVER whole AS k1"
+        ),
+        "  FROM (".to_string(),
+        "    SELECT fingerprint, structured_metadata, d.1 AS k0, sum(d.2) AS dv, sum(d.3) AS dc"
+            .to_string(),
+        "    FROM (".to_string(),
+        "      SELECT fingerprint, structured_metadata,".to_string(),
+        format!("             {lo} AS lo,"),
+        format!("             {hi} AS hi,"),
+        format!("             {agg_expr} AS m, count() AS c"),
+        format!("      FROM {table}"),
+    ];
+    if !services.is_empty() {
+        lines.push(format!("      PREWHERE {}", service_predicate(services)));
+    }
+    lines.push(format!("      WHERE fingerprint IN ({fp_list})"));
+    lines.push(format!(
+        "        AND timestamp_ns {lower_op} {start_ns} AND timestamp_ns <= {end_ns}"
+    ));
+    for clause in extra_predicates {
+        lines.push(format!("        AND {}", clause.as_sql()));
+    }
+    lines.extend([
+        "      GROUP BY fingerprint, structured_metadata, lo, hi".to_string(),
+        "      HAVING lo <= hi".to_string(),
+        "    )".to_string(),
+        "    ARRAY JOIN [(lo, toInt64(m), toInt64(c)), (hi + 1, -toInt64(m), -toInt64(c))] AS d"
+            .to_string(),
+        "    GROUP BY fingerprint, structured_metadata, k0".to_string(),
+        "  )".to_string(),
+        "  WINDOW cum AS (PARTITION BY fingerprint, structured_metadata ORDER BY k0 ASC \
+         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),"
+            .to_string(),
+        "         whole AS (PARTITION BY fingerprint, structured_metadata ORDER BY k0 ASC \
+         ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)"
+            .to_string(),
+        ")".to_string(),
+        format!("ARRAY JOIN range(k0, least(k1, {kend})) AS k"),
+        "WHERE p > 0".to_string(),
+    ]);
+    let sql = lines.join("\n");
+    Ok(sql)
 }
 
 /// Test-only knobs rendered into a group key statement (issue #507), so a

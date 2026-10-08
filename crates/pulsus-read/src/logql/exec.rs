@@ -30,9 +30,8 @@ use pulsus_logql::{
 use pulsus_model::{Fingerprint, FpLiteral};
 
 use super::charge::{
-    MAX_STREAMS_RESULT_BYTES, PUSHDOWN_INSTANT_SLOT, PUSHDOWN_RANGE_POINT_SLOT,
-    PUSHDOWN_RANGE_SLOT, StreamsResultBudget, charge_group_bytes, group_entry_bytes,
-    map_entry_bytes,
+    MAX_STREAMS_RESULT_BYTES, PUSHDOWN_INSTANT_SLOT, PUSHDOWN_RANGE_DENSE_SLOT,
+    StreamsResultBudget, charge_group_bytes, charge_result_points, group_entry_bytes,
 };
 use super::client_agg::check_surviving_error;
 use super::labels::render_series_labels;
@@ -1809,8 +1808,8 @@ impl LogQlEngine {
             // needs `client.is_none()` (the arm above returned otherwise)
             // AND `step_ns.is_some()`, which is exactly the shape
             // `metric_plan`'s `bucketed_range` admits: one of the four
-            // counting reducers, nothing in the pipeline beyond a pushable
-            // line filter, and a range equal to the step.
+            // counting reducers and nothing in the pipeline beyond a
+            // pushable line filter, at any range and step (issue #624).
             //
             // Until #507 this state was unreachable and the arm refused,
             // because `metric_plan` forced `client = Some(..)` for every
@@ -1854,10 +1853,14 @@ impl LogQlEngine {
             }
             match bucketed_range_sql(mp, &services, &fingerprints, &lowered.predicates) {
                 Ok(sql) => {
+                    let sql = match self.key_route_test.bucketed_statement_max_memory_bytes {
+                        Some(n) => format!("{sql}\nSETTINGS max_memory_usage = {n}"),
+                        None => sql,
+                    };
                     if let Some(e) = explain.as_mut() {
                         e.push("metric_read", sql.clone(), Some(mp.routing.reason.clone()));
                     }
-                    let mut groups = PushdownRangeGroups::new(
+                    let groups = PushdownRangeGroups::new(
                         &meta,
                         AggCaps::DEFAULT,
                         mp.grid_start_ns,
@@ -1866,30 +1869,59 @@ impl LogQlEngine {
                         grid_points,
                     )
                     .with_parent_sum(parent_sum_of(mp));
-                    {
-                        // Scoped: the row stream holds its pooled
-                        // connection until dropped (the `ChRowStream`
-                        // lease rule), and nothing else queries inside.
-                        let mut stream = self
-                            .query_stream::<MetricRangeBucketRow>(&sql, &self.budget_settings())
-                            .await?;
-                        while let Some(row) = stream.next().await {
-                            let row = row.map_err(|e| {
-                                map_read_error(
-                                    e,
-                                    self.config.scan_budget_bytes,
-                                    self.config.read_max_memory_bytes,
-                                )
-                            })?;
-                            groups.push_row(&row)?;
+                    // Scoped: the row stream holds its pooled connection
+                    // until dropped (the `ChRowStream` lease rule), and
+                    // today's route issues another query after it.
+                    let outcome = {
+                        let sql = escape_query_placeholders(&sql);
+                        if let Err(reason) = crate::querytext::ensure_query_text_fits(&sql) {
+                            return Err(ReadError::QueryTooBroad(reason));
                         }
+                        match self
+                            .client
+                            .query_stream::<MetricRangeBucketRow>(&sql, &self.budget_settings())
+                            .await
+                        {
+                            Ok(stream) => fold_bucketed_rows(stream, groups).await?,
+                            Err(e) if bucketed_statement_failure_goes_to_todays_route(&e) => {
+                                BucketedRows::TodaysRoute
+                            }
+                            Err(e) => BucketedRows::Failed(e),
+                        }
+                    };
+                    match outcome {
+                        BucketedRows::Folded(groups) => {
+                            let series = groups.finish(mp.rate_window_ns);
+                            // The emitted points are on the SHIFTED grid;
+                            // this puts them back on the caller's, the one
+                            // place the offset is added back on this path
+                            // (issue #343).
+                            let result =
+                                shift_emitted_points(QueryResult::Matrix(series), mp.offset_ns);
+                            apply_vector_aggs(result, &mp.vector_aggs)
+                        }
+                        // Issue #624, D4: the statement ran out of memory.
+                        // Today's route streams the same query in bounded
+                        // memory, so it answers instead, once. The fold's
+                        // partial state is already dropped: the variant
+                        // carries none.
+                        BucketedRows::TodaysRoute => {
+                            self.run_bucketed_fallback(
+                                mp,
+                                &fingerprints,
+                                &meta,
+                                &services,
+                                &lowered.predicates,
+                                explain,
+                            )
+                            .await
+                        }
+                        BucketedRows::Failed(e) => Err(map_read_error(
+                            e,
+                            self.config.scan_budget_bytes,
+                            self.config.read_max_memory_bytes,
+                        )),
                     }
-                    let series = groups.finish(mp.rate_window_ns);
-                    // The emitted points are on the SHIFTED grid; this
-                    // puts them back on the caller's, the one place the
-                    // offset is added back on this path (issue #343).
-                    let result = shift_emitted_points(QueryResult::Matrix(series), mp.offset_ns);
-                    apply_vector_aggs(result, &mp.vector_aggs)
                 }
                 Err(
                     BucketGridRefusal::StepNotPositive
@@ -1898,23 +1930,11 @@ impl LogQlEngine {
                     | BucketGridRefusal::RangeNotPositive
                     | BucketGridRefusal::RollupSource,
                 ) => {
-                    // No `_` arm: a fourth refusal reason fails to compile
+                    // No `_` arm: a further refusal reason fails to compile
                     // here rather than falling through to a behaviour
                     // nobody chose for it.
-                    let client = bucketed_fallback_client_agg(mp);
-                    let compiled = CompiledPipeline::compile(&client.pipeline)?;
-                    // **`lowered.predicates`, and the metadata fragment in
-                    // it is load-bearing** (issue #544 code review round
-                    // 1). This fallback's pipeline is EMPTY, and its own
-                    // doc says that is sound because the predicates are
-                    // already in the scan. Passing `mp.extra_predicates`
-                    // here would leave nothing to apply the metadata
-                    // filter at all, and the aggregate would count every
-                    // row in the window.
-                    self.run_metric_client(
+                    self.run_bucketed_fallback(
                         mp,
-                        &client,
-                        &compiled,
                         &fingerprints,
                         &meta,
                         &services,
@@ -1925,6 +1945,39 @@ impl LogQlEngine {
                 }
             }
         }
+    }
+
+    /// Today's route for a bucketed range plan (issues #507 and #624): the
+    /// client aggregation the lowered chain is equivalent to. Run when the
+    /// statement cannot be rendered, and once when it fails for memory.
+    async fn run_bucketed_fallback(
+        &self,
+        mp: &MetricPlan,
+        fingerprints: &[Fingerprint],
+        meta: &HashMap<Fingerprint, StreamMetaRow>,
+        services: &[CheckedLiteral],
+        predicates: &[CheckedFragment],
+        explain: Option<&mut PlanExplain>,
+    ) -> Result<QueryResult, ReadError> {
+        let client = bucketed_fallback_client_agg(mp);
+        let compiled = CompiledPipeline::compile(&client.pipeline)?;
+        // **The lowered predicates, and the metadata fragment in them is
+        // load-bearing** (issue #544 code review round 1). This fallback's
+        // pipeline is EMPTY, and its own doc says that is sound because the
+        // predicates are already in the scan. Passing `mp.extra_predicates`
+        // here would leave nothing to apply the metadata filter at all, and
+        // the aggregate would count every row in the window.
+        self.run_metric_client(
+            mp,
+            &client,
+            &compiled,
+            fingerprints,
+            meta,
+            services,
+            predicates,
+            explain,
+        )
+        .await
     }
 
     /// The extracted-field group key read (issue #507).
@@ -5209,20 +5262,35 @@ impl PushdownInstantGroups {
 /// Summing `u64` partials is exact, which is what lets the four counting
 /// reducers claim `Fidelity::Equivalent`: see
 /// `super::compile::RangeAggLower::fidelity`.
+///
+/// **One dense slot vector per output series** (issue #624), one slot per
+/// grid point, `None` where no row arrived. A series is charged ONCE, when
+/// it is created: its label bytes against the label-byte cap, and its grid
+/// width against the result-point cap, the cap today's route applies to the
+/// same series × grid. A point costs nothing further, so the label-byte cap
+/// bounds labels only, as it does on every other path.
+/// One output series of the bucketed fold: its labels, and one slot per
+/// grid point (issue #624).
+type DenseSeries = (LabelSet, Vec<Option<u64>>);
+
 pub(in crate::logql) struct PushdownRangeGroups {
     /// Each resolved stream's base label set, snapshotted ONCE — one
     /// fingerprint returns up to (grid points x metadata variants) rows.
     base_labels: HashMap<Fingerprint, LabelSet>,
-    /// Rendered final label set -> `(labels, grid point -> summed count)`.
-    groups: HashMap<String, (LabelSet, HashMap<i64, u64>)>,
+    /// Rendered final label set -> `(labels, one slot per grid point)`.
+    groups: HashMap<String, DenseSeries>,
     /// The emit grid's first point and the query's end. A row can arrive
     /// outside them and must not become a point — see [`Self::push_row`].
     grid_start_ns: i64,
     end_ns: i64,
+    /// The grid's step and its point count — the width of every series'
+    /// slot vector.
+    step_ns: i64,
+    grid_points: u64,
     /// Query-lifetime bytes, never discharged: the groups ARE the result
     /// (the `PushdownInstantGroups` precedent).
     charged: u64,
-    /// Result points reserved (issue #624). Not yet charged.
+    /// Result points reserved: `grid_points` per series (issue #624).
     points: u64,
     caps: AggCaps,
     merge_buf: Vec<(String, String)>,
@@ -5238,14 +5306,16 @@ impl PushdownRangeGroups {
         caps: AggCaps,
         grid_start_ns: i64,
         end_ns: i64,
-        _step_ns: i64,
-        _grid_points: u64,
+        step_ns: i64,
+        grid_points: u64,
     ) -> Self {
         PushdownRangeGroups {
             base_labels: meta.iter().map(|(fp, m)| (*fp, series_labels(m))).collect(),
             groups: HashMap::new(),
             grid_start_ns,
             end_ns,
+            step_ns,
+            grid_points,
             charged: 0,
             points: 0,
             caps,
@@ -5315,33 +5385,40 @@ impl PushdownRangeGroups {
         // instant pushdown path.
         check_surviving_error(&labels)?;
         let key = render_series_labels(&labels);
-        match self.groups.entry(key) {
-            std::collections::hash_map::Entry::Occupied(mut e) => {
-                let (_, points) = e.get_mut();
-                match points.entry(row.bucket_ns) {
-                    std::collections::hash_map::Entry::Occupied(mut p) => {
-                        *p.get_mut() = p.get().saturating_add(row.n);
-                    }
-                    std::collections::hash_map::Entry::Vacant(p) => {
-                        p.insert(row.n);
-                        charge_group_bytes(
-                            &mut self.charged,
-                            map_entry_bytes(PUSHDOWN_RANGE_POINT_SLOT),
-                            self.caps.group_bytes,
-                        )?;
-                    }
-                }
-            }
+        let slot = self.slot_of(row.bucket_ns)?;
+        let slots = match self.groups.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => &mut e.into_mut().1,
             std::collections::hash_map::Entry::Vacant(e) => {
-                let cost = group_entry_bytes(e.key(), &labels, PUSHDOWN_RANGE_SLOT)
-                    .saturating_add(map_entry_bytes(PUSHDOWN_RANGE_POINT_SLOT));
-                charge_group_bytes(&mut self.charged, cost, self.caps.group_bytes)?;
-                let mut points = HashMap::new();
-                points.insert(row.bucket_ns, row.n);
-                e.insert((labels, points));
+                // Both charges before the allocation, so a refused series
+                // is never retained.
+                charge_group_bytes(
+                    &mut self.charged,
+                    group_entry_bytes(e.key(), &labels, PUSHDOWN_RANGE_DENSE_SLOT),
+                    self.caps.group_bytes,
+                )?;
+                charge_result_points(&mut self.points, self.grid_points, self.caps.result_points)?;
+                let width = usize::try_from(self.grid_points)
+                    .map_err(|_| range_fold_off_grid(row.bucket_ns))?;
+                &mut e.insert((labels, vec![None; width])).1
             }
-        }
+        };
+        let cell = slots
+            .get_mut(slot)
+            .ok_or_else(|| range_fold_off_grid(row.bucket_ns))?;
+        *cell = Some(cell.unwrap_or(0).saturating_add(row.n));
         Ok(())
+    }
+
+    /// The slot a row inside `[grid_start, end]` folds into. A row there
+    /// that is not on the grid is an internal defect of the statement, never
+    /// a point.
+    fn slot_of(&self, bucket_ns: i64) -> Result<usize, ReadError> {
+        let offset = i128::from(bucket_ns) - i128::from(self.grid_start_ns);
+        let step = i128::from(self.step_ns);
+        if step <= 0 || offset % step != 0 {
+            return Err(range_fold_off_grid(bucket_ns));
+        }
+        usize::try_from(offset / step).map_err(|_| range_fold_off_grid(bucket_ns))
     }
 
     /// How many bytes this state has charged.
@@ -5362,36 +5439,54 @@ impl PushdownRangeGroups {
     /// ascending by grid point, so the value a downstream `sum`
     /// accumulates is reproducible run to run (a `HashMap` drain is not).
     pub(in crate::logql) fn finish(self, rate_window_ns: Option<u64>) -> Vec<MatrixSeries> {
-        let mut out: Vec<(String, LabelSet, HashMap<i64, u64>)> = self
-            .groups
-            .into_iter()
-            .map(|(key, (labels, points))| (key, labels, points))
-            .collect();
+        let (grid_start_ns, step_ns) = (self.grid_start_ns, self.step_ns);
+        let mut out: Vec<(String, DenseSeries)> = self.groups.into_iter().collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
+        // Each series' slots are consumed by its own iteration, so they are
+        // freed before the next series' points are built.
         out.into_iter()
-            .map(|(_, labels, points)| {
-                let mut points: Vec<(i64, f64)> = points
+            .map(|(_, (labels, slots))| {
+                let points = slots
                     .into_iter()
-                    .map(|(ts, n)| (ts, apply_rate(n as f64, rate_window_ns)))
+                    .enumerate()
+                    .filter_map(|(k, n)| {
+                        let n = n?;
+                        let ts = grid_start_ns.saturating_add((k as i64).saturating_mul(step_ns));
+                        Some((ts, apply_rate(n as f64, rate_window_ns)))
+                    })
                     .collect();
-                points.sort_by_key(|(ts, _)| *ts);
                 MatrixSeries { labels, points }
             })
             .collect()
     }
 }
 
-/// The bucketed range read's statement for a planned metric leaf (issue
-/// #507, W2) — the ONE implementation shared by execution and EXPLAIN, the
-/// [`client_metric_read_sql`] precedent, so an EXPLAIN cannot report a
+/// The internal-invariant breach the bucketed fold reports for a row inside
+/// the emit grid's span but off its points (issue #624), as `fold.rs` does
+/// for its own grid.
+fn range_fold_off_grid(t: i64) -> ReadError {
+    ReadError::PipelineInvalid {
+        reason: format!(
+            "internal: the bucketed range fold received a row at {t} off the query grid"
+        ),
+    }
+}
+
+/// The bucketed range read's statement for a planned metric leaf (issues
+/// #507 and #624) — the ONE implementation shared by execution and EXPLAIN,
+/// the [`client_metric_read_sql`] precedent, so an EXPLAIN cannot report a
 /// statement the engine would not issue.
 ///
-/// `lo_ns` is `grid_start_ns - step_ns`: the emit grid one step below its
-/// first point, and never `mp.start_ns`, which is the SCAN start and has
-/// been widened backwards by the range selector. They are equal exactly
-/// when the range equals the step, which is the only case `metric_plan`
-/// lowers, so a defect here would be invisible from this path alone —
-/// `super::predicate::bucket_expr` holds the derivation and
+/// Two statements: [`super::sql::metric_range_bucketed`] when the range
+/// equals the step, [`super::sql::metric_range_sliding`] at every other
+/// range (issue #624).
+///
+/// On the first, `lo_ns` is `grid_start_ns - step_ns`: the emit grid one
+/// step below its first point, and never `mp.start_ns`, which is the SCAN
+/// start and has been widened backwards by the range selector. They are
+/// equal exactly when the range equals the step, which is the only case that
+/// statement is chosen for, so a defect here would be invisible from this
+/// path alone — `super::predicate::bucket_expr` holds the derivation and
 /// `sql.rs`'s `the_bucket_anchor_is_the_emit_grid_not_the_widened_scan_start`
 /// is the test that separates them.
 ///
@@ -5409,6 +5504,27 @@ fn bucketed_range_sql(
         return Err(BucketGridRefusal::StepNotPositive);
     };
     let step_ns = step.get();
+    let window = super::sql::TimeWindow {
+        start_ns: mp.start_ns,
+        end_ns: mp.end_ns,
+    };
+    // Issue #624: #507's statement when the range equals the step, which is
+    // smaller and faster there; the sliding statement at every other range.
+    if mp.range_ns.get() != step_ns {
+        return super::sql::metric_range_sliding(
+            metric_source(mp),
+            services,
+            &sql_literals(fingerprints),
+            super::sql::SlidingScan {
+                window,
+                lower: mp.scan_lower,
+                grid_start_ns: mp.grid_start_ns,
+                step_ns,
+                range_ns: mp.range_ns.get(),
+            },
+            predicates,
+        );
+    }
     let lo_ns = mp
         .grid_start_ns
         .checked_sub(step_ns)
@@ -5418,10 +5534,7 @@ fn bucketed_range_sql(
         services,
         &sql_literals(fingerprints),
         super::sql::BucketedScan {
-            window: super::sql::TimeWindow {
-                start_ns: mp.start_ns,
-                end_ns: mp.end_ns,
-            },
+            window,
             lower: mp.scan_lower,
             lo_ns,
             step_ns,
@@ -5497,9 +5610,19 @@ pub fn unwrapped_fallback_client_agg(
 }
 
 /// Which failures of either bucketed range statement hand the query to
-/// today's route (issue #624). Not yet implemented.
-fn bucketed_statement_failure_goes_to_todays_route(_e: &ChError) -> bool {
-    false
+/// today's route (issue #624, D4): the server's memory code, 241, only.
+/// Today's route streams the same query in bounded memory, so it answers
+/// where the statement could not. The scan budget (307) is its `422`, a
+/// timeout (159) is the timeout response, and a row that does not decode is
+/// a defect in the row type — none of them is a reason to read the lines.
+fn bucketed_statement_failure_goes_to_todays_route(e: &ChError) -> bool {
+    matches!(
+        e,
+        ChError::Server {
+            code: CODE_MEMORY_LIMIT_EXCEEDED,
+            ..
+        }
+    )
 }
 
 /// How a bucketed range statement's rows ended (issue #624).
@@ -5518,12 +5641,24 @@ pub(in crate::logql) enum BucketedRows {
     Failed(ChError),
 }
 
-/// Folds a bucketed range statement's rows (issue #624). Not yet
-/// implemented.
+/// Folds a bucketed range statement's rows (issue #624). A failure of the
+/// statement — before its first row or after some rows folded — is
+/// classified by [`bucketed_statement_failure_goes_to_todays_route`], and
+/// the partial fold is dropped either way. `Err` is the fold's own refusal
+/// (a cap, a surviving `__error__`), which is the query's answer.
 pub(in crate::logql) async fn fold_bucketed_rows(
-    _rows: impl futures::Stream<Item = Result<MetricRangeBucketRow, ChError>> + Unpin,
-    groups: PushdownRangeGroups,
+    mut rows: impl futures::Stream<Item = Result<MetricRangeBucketRow, ChError>> + Unpin,
+    mut groups: PushdownRangeGroups,
 ) -> Result<BucketedRows, ReadError> {
+    while let Some(row) = rows.next().await {
+        match row {
+            Ok(row) => groups.push_row(&row)?,
+            Err(e) if bucketed_statement_failure_goes_to_todays_route(&e) => {
+                return Ok(BucketedRows::TodaysRoute);
+            }
+            Err(e) => return Ok(BucketedRows::Failed(e)),
+        }
+    }
     Ok(BucketedRows::Folded(groups))
 }
 

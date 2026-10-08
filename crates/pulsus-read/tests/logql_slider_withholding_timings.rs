@@ -96,7 +96,12 @@ fn client_and_window() -> (ClientAgg, ClientWindow, Option<u64>) {
     let Plan::Metric(mp) = plan(&expr, &params, &ctx).expect("plan") else {
         panic!("expected a Metric plan");
     };
-    let client = mp.client.clone().expect("client-aggregated");
+    // Issue #624: the clean chain is counted in the database and carries no
+    // client aggregation; this generator times today's route's object for it.
+    let client = mp
+        .client
+        .clone()
+        .unwrap_or_else(|| pulsus_read::logql::exec::bucketed_fallback_client_agg(&mp));
     let window = match mp.step_ns {
         Some(step_ns) => ClientWindow::Range {
             grid_start_ns: mp.grid_start_ns,

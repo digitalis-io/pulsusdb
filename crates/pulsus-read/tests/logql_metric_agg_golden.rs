@@ -170,7 +170,20 @@ fn run_client(
     meta: &HashMap<Fingerprint, StreamMetaRow>,
 ) -> Result<QueryResult, ReadError> {
     let mp = metric_plan_of(query, params);
-    let client = mp.client.as_ref().expect("client-aggregated plan");
+    // Issue #624: a clean counting range plan is counted in the database and
+    // carries no client aggregation. This suite has no database, so it runs
+    // the object today's route takes for it — the runner's selection: the
+    // restored stage of a lowered metadata filter, else the counting
+    // fallback the engine's capability join uses.
+    let client = match &mp.client {
+        Some(client) => client.clone(),
+        None => mp
+            .metadata_lowering
+            .as_ref()
+            .and_then(|m| m.client_without_lowering.clone())
+            .unwrap_or_else(|| pulsus_read::logql::exec::bucketed_fallback_client_agg(&mp)),
+    };
+    let client = &client;
     let compiled = CompiledPipeline::compile(&client.pipeline).expect("compile");
     let window = match mp.step_ns {
         Some(step_ns) => ClientWindow::Range {

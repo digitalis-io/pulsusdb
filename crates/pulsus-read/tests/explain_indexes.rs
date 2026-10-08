@@ -2662,8 +2662,9 @@ async fn the_re2_compile_probe_costs_the_metric_series_fallback_no_index_engagem
 // raw — two distinct table targets, both index-served.
 // ---------------------------------------------------------------------
 
-/// Issue #227: an un-piped range `count_over_time` slides raw (the rollup
-/// fast-path is retired for range reads) and prunes on the `log_samples`
+/// Issue #227: an un-piped range `count_over_time` reads raw (the rollup
+/// fast-path is retired for range reads); since issue #624 it is counted in
+/// the database by the sliding statement, which prunes on the `log_samples`
 /// primary key.
 #[tokio::test]
 async fn m6_10_unpiped_count_over_time_range_slides_raw() {
@@ -2677,22 +2678,30 @@ async fn m6_10_unpiped_count_over_time_range_slides_raw() {
         &range_params(ts_ns),
         db,
     );
-    assert!(!mp.rollup, "issue #227: a range count slides raw");
-    assert!(mp.client.is_some());
+    assert!(!mp.rollup, "issue #227: a range count reads raw");
+    assert!(
+        mp.client.is_none(),
+        "issue #624: a clean counting range read is counted in the database"
+    );
     assert_eq!(mp.table, "log_samples");
     let table = format!("{db}.log_samples");
-    let sql = sql::metric_raw_samples_sliding(
-        &table,
+    let sql = sql::metric_range_sliding(
+        sql::MetricSource::new(&table, sql::MetricShape::RawCount),
         &[literal("checkout")],
         &[Fingerprint::from_raw(u128::from(FP_PROD)).sql_literal()],
-        TimeWindow {
-            start_ns: mp.start_ns,
-            end_ns: mp.end_ns,
+        sql::SlidingScan {
+            window: TimeWindow {
+                start_ns: mp.start_ns,
+                end_ns: mp.end_ns,
+            },
+            lower: mp.scan_lower,
+            grid_start_ns: mp.grid_start_ns,
+            step_ns: mp.step_ns.expect("a range plan has a step").get(),
+            range_ns: mp.range_ns.get(),
         },
-        mp.scan_lower,
         &mp.extra_predicates,
-        projection_of(&mp),
-    );
+    )
+    .expect("a renderable sliding statement");
     let usage = explain(&client, &sql).await;
     assert_eq!(usage, expected_metric_instant_raw_usage());
 }
