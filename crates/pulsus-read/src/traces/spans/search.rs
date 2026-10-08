@@ -553,6 +553,9 @@ pub struct SearchStatement {
 pub struct Grouping {
     pub display: String,
     pub coalesced: bool,
+    /// An aggregate stage's value rather than a `by()` key (issue #592
+    /// part 3). Stub: always `false` until the aggregate is built.
+    pub aggregate: bool,
 }
 
 impl SearchStatement {
@@ -709,6 +712,7 @@ pub fn compile_search(
             key: key.clone(),
         };
         grouping = Some(Grouping {
+            aggregate: false,
             display: format!("by({field})"),
             coalesced: pipeline.coalesced,
         });
@@ -841,6 +845,13 @@ pub(crate) fn decode_search_charged(
         returned,
         limit,
     })
+}
+
+/// An aggregate's response value (issue #592 part 3). Stub until the
+/// aggregate is built.
+#[allow(dead_code)]
+pub(crate) fn aggregate_value(_text: &str, _value_type: &str) -> Result<GroupValue, String> {
+    Err("not built".to_string())
 }
 
 /// A `by()` key's value from the statement's text and stored type (issue
@@ -1216,5 +1227,71 @@ mod charge_tests {
             ),
             "one byte less is refused: {refused:?}"
         );
+    }
+
+    /// Issue #592 part 3: an aggregate's one group charges what today's
+    /// engine charges — `TraceMatch::retained_bytes` with
+    /// `groups_retained_bytes` — and no distinct-group tuple: one byte less
+    /// than that is refused.
+    #[test]
+    fn the_aggregated_decode_charges_what_todays_engine_charges() {
+        use crate::traces::search_eval::groups_retained_bytes;
+        let q =
+            pulsus_traceql::parse(r#"{ span.foo = "bar" } | avg(duration) > 1ms"#).expect("parses");
+        let w = WindowSql::start_closed_end_open(1_000_000_000_000, 2_000_000_000_000);
+        let ctx = PredicateCtx {
+            window: w,
+            resources_table: "resources",
+        };
+        let s = compile_search(&q, &ctx, "spans", "traces", 20, 3).expect("compiles");
+        let grouping = s.grouping().expect("an aggregate is one group");
+        let bar = || vec![projected(1, "bar", "String")];
+        let rows = || {
+            vec![SearchGroupedRow {
+                trace_id: [3; 16],
+                root_service: "frontend".to_string(),
+                root_name: "GET /".to_string(),
+                start_ns: 1,
+                duration_ns: 2,
+                last: 1,
+                matched: 2,
+                spans: vec![span(1, bar()), span(2, bar())],
+                groups: vec![SearchGroupTuple {
+                    value: "2166666666".to_string(),
+                    value_type: "DurationI".to_string(),
+                    matched: 2,
+                    spans: vec![span(1, bar()), span(2, bar())],
+                }],
+            }]
+        };
+        let decode = |budget: &mut ByteBudget| {
+            let mut counter = GroupCardinalityCounter::new(1_000);
+            decode_search_grouped_charged(
+                rows(),
+                s.projection(),
+                grouping,
+                20,
+                budget,
+                &mut counter,
+            )
+        };
+        let mut unbounded = ByteBudget::new(usize::MAX);
+        let out = decode(&mut unbounded).expect("decodes");
+        let used = unbounded.used();
+        let groups = out.traces[0]
+            .groups
+            .as_deref()
+            .expect("the aggregate's group");
+        assert_eq!(groups[0].attributes[0].0, "avg(duration)");
+        assert_eq!(
+            groups[0].attributes[0].1,
+            GroupValue::Str("2.166666666s".to_string())
+        );
+        assert_eq!(used, todays_charge(&out) + groups_retained_bytes(groups));
+        assert!(decode(&mut ByteBudget::new(used)).is_ok());
+        assert!(matches!(
+            decode(&mut ByteBudget::new(used - 1)),
+            Err(crate::logql::error::ReadError::QueryTooBroad(_))
+        ));
     }
 }
