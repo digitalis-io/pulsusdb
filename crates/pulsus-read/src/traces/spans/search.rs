@@ -928,11 +928,11 @@ pub(crate) fn decode_search_grouped_charged(
                         + grouping.display.len()
                         + group_value_payload(&g.value, &g.value_type).map_err(decode)?,
                 )?;
-                let mut attributes = Vec::with_capacity(1);
-                attributes.push((
+                // One slot, as `groups_retained_bytes` counts it.
+                let attributes = vec![(
                     grouping.display.clone(),
                     group_value(&g.value, &g.value_type).map_err(decode)?,
-                ));
+                )];
                 budget.charge(group_reserve_bytes(g.spans.len()))?;
                 let mut spans = Vec::with_capacity(g.spans.len());
                 for s in g.spans {
