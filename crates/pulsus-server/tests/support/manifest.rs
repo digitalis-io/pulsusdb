@@ -2299,7 +2299,7 @@ static MANIFEST: &[RouteSpec] = &[
         status: RouteStatus::Mounted,
         doc_ref: DocRef::Verbatim,
         success_status: 200,
-        base_query: "",
+        base_query: "query=up",
         cases: &[],
     },
     RouteSpec {

@@ -65,7 +65,9 @@ fn blob_at(commit: &str, rel: &str) -> String {
 /// says so rather than waving the regeneration through.
 #[test]
 fn the_regenerated_planner_golden_differs_only_by_the_new_field() {
-    let before = blob_at(MERGE_BASE, PLANNER_GOLDEN);
+    // Issue #624 moved one route on purpose: the merge base's golden is read
+    // with that edit applied, so this walk still measures #544's delta alone.
+    let before = with_the_sliding_route(&blob_at(MERGE_BASE, PLANNER_GOLDEN));
     let after = read(PLANNER_GOLDEN);
     let old: Vec<&str> = before.lines().collect();
     let new: Vec<&str> = after.lines().collect();
@@ -130,6 +132,48 @@ fn the_regenerated_planner_golden_differs_only_by_the_new_field() {
         "a corpus entry now carries a label filter, so the new field no longer prints its \
          empty value on every occurrence: {with_filter:?}"
     );
+}
+
+/// The golden as issue #624 edits it: a clean counting range leaf whose
+/// range is not its step is counted in the database, so each leaf that named
+/// #227's route names the sliding statement's and plans no client
+/// aggregation. The edit is the one `plan_build_differential.txt` received,
+/// and nothing else: every other line is kept as it is.
+fn with_the_sliding_route(golden: &str) -> String {
+    const SLIDING: &str = "reason: \"raw: sliding-window range aggregation (issue #227)\",";
+    const LOWERED: &str =
+        "reason: \"raw: sliding range aggregation in the database (issue #624)\",";
+    let lines: Vec<&str> = golden.split('\n').collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut pending = false;
+    let mut i = 0usize;
+    while i < lines.len() {
+        let line = lines[i];
+        if line.trim() == SLIDING {
+            out.push(line.replace(SLIDING, LOWERED));
+            pending = true;
+            i += 1;
+            continue;
+        }
+        if pending && line.trim() == "client: Some(" {
+            // `client: Some(ClientAgg { pipeline: [], .. })` is ten lines.
+            assert_eq!(
+                lines[i + 2].trim(),
+                "pipeline: [],",
+                "a counting fallback block"
+            );
+            assert_eq!(lines[i + 9].trim(), "),", "a ten-line client block");
+            let indent = &line[..line.len() - line.trim_start().len()];
+            out.push(format!("{indent}client: None,"));
+            pending = false;
+            i += 10;
+            continue;
+        }
+        out.push(line.to_string());
+        i += 1;
+    }
+    assert!(!pending, "a moved reason with no client block after it");
+    out.join("\n")
 }
 
 /// Does any pipeline in this expression carry a `| name = "v"` stage?

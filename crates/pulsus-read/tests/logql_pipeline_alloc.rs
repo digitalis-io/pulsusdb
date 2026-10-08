@@ -882,18 +882,24 @@ fn per_row_allocation_bounds_hold() {
             structured_metadata: format!(r#"{{"trace":"t{i}"}}"#),
         })
         .collect();
-    // **A 10s range against the 5s step, and the mismatch is deliberate**
-    // (issue #507): a range EQUAL to the step lowers the aggregation into
-    // the statement and plans `client: None`, which this leg — whose
-    // subject is the CLIENT path's per-row allocation profile — cannot
-    // drive. A range SHORTER than the step would leave half the rows in
-    // no window at all and the group count below would drop to 10 000, so
-    // the wider range is the one that keeps every row in the measurement.
+    // **A 10s range against the 5s step.** A range SHORTER than the step
+    // would leave half the rows in no window at all and the group count
+    // below would drop to 10 000, so the wider range is the one that keeps
+    // every row in the measurement. The plan is counted in the database at
+    // any range (issues #507 and #624), so this leg — whose subject is the
+    // CLIENT path's per-row allocation profile — drives today's route's
+    // object for it.
     let sm_expr = pulsus_logql::parse(r#"count_over_time({a="b"}[10s])"#).expect("parse");
     let Plan::Metric(sm_mp) = plan(&sm_expr, &params, &plan_ctx).expect("plan") else {
         panic!("expected a Metric plan");
     };
-    let sm_client = sm_mp.client.as_ref().expect("client-aggregated");
+    // Issue #624: the clean chain is counted in the database at any range,
+    // so it carries no client aggregation; this leg drives the object
+    // today's route takes for it.
+    let sm_client = &sm_mp
+        .client
+        .clone()
+        .unwrap_or_else(|| pulsus_read::logql::exec::bucketed_fallback_client_agg(&sm_mp));
     let sm_compiled = CompiledPipeline::compile(&sm_client.pipeline).expect("compile");
     let sm_window = match sm_mp.step_ns {
         Some(step_ns) => ClientWindow::Range {

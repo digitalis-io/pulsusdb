@@ -628,14 +628,38 @@ ORDER BY timestamp_ns DESC
 LIMIT 100
 ```
 
-**`sum by (service_name) (rate({env="prod"}[5m]))`** — no body access, so it never touches `log_samples`:
+**`sum by (service_name) (rate({env="prod"}[5m]))`** at a 15 s step — counted in the database, one row per series and grid point rather than one per line. `count_over_time` and `rate` read no `body`; `bytes_over_time` and `bytes_rate` read `length(body)` in place of the first `count()`. Each line's `lo` and `hi` are the first and last grid points whose window `(g - 5m, g]` holds it; the deltas at `lo` and `hi + 1`, summed cumulatively, are each window's total:
 
 ```sql
-SELECT fingerprint, intDiv(bucket_ns, 300000000000) * 300000000000 AS step, sum(count) AS n
-FROM log_metrics_5s
-WHERE fingerprint IN (...) AND bucket_ns > {start} AND bucket_ns <= {end}
-GROUP BY fingerprint, step
+SELECT fingerprint, toInt64({start} + k * 15000000000) AS bucket_ns, toUInt64(v) AS n, structured_metadata
+FROM (
+  SELECT fingerprint, structured_metadata, k0,
+         sum(dv) OVER cum AS v, sum(dc) OVER cum AS p, leadInFrame(k0, 1, {kend}) OVER whole AS k1
+  FROM (
+    SELECT fingerprint, structured_metadata, d.1 AS k0, sum(d.2) AS dv, sum(d.3) AS dc
+    FROM (
+      SELECT fingerprint, structured_metadata,
+             greatest(intDiv(timestamp_ns - {start - 300s} + 14999999999, 15000000000) - 20, 0) AS lo,
+             least(intDiv(timestamp_ns - {start - 600s} + 14999999999, 15000000000) - 21, {kmax}) AS hi,
+             count() AS m, count() AS c
+      FROM log_samples
+      PREWHERE service IN (...)
+      WHERE fingerprint IN (...)
+        AND timestamp_ns > {start - 300s} AND timestamp_ns <= {end}
+      GROUP BY fingerprint, structured_metadata, lo, hi
+      HAVING lo <= hi
+    )
+    ARRAY JOIN [(lo, toInt64(m), toInt64(c)), (hi + 1, -toInt64(m), -toInt64(c))] AS d
+    GROUP BY fingerprint, structured_metadata, k0
+  )
+  WINDOW cum AS (PARTITION BY fingerprint, structured_metadata ORDER BY k0 ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+         whole AS (PARTITION BY fingerprint, structured_metadata ORDER BY k0 ASC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+)
+ARRAY JOIN range(k0, least(k1, {kend})) AS k
+WHERE p > 0
 ```
+
+`{kmax}` is the last grid index, `({end} - {start}) / 15s`, and `{kend}` is one more.
 
 The engine maps fingerprints to `service` from stage 2 and finishes the `sum by`.
 
