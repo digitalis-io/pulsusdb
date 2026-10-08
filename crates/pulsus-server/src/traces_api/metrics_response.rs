@@ -522,7 +522,7 @@ mod tests {
     ///
     /// Bodies captured 2026-08-29 from
     /// `grafana/tempo@sha256:aa8df8d069f77b82e978464daf55169bb8d135852ad58700aa96880653c3d8f7`
-    /// (the digest `.github/workflows/ci.yml:648` pins) run with this
+    /// (the digest `.github/workflows/ci.yml:651` pins) run with this
     /// repo's `ci/tempo/tempo-compare.yaml`, over one OTLP/JSON push of 10
     /// spans `resource.service.name="w2a"` and 4 `"w2b"`, one per second
     /// from `base = now - 120s`, each 10 ms wide, queried over

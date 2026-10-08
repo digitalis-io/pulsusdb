@@ -563,7 +563,7 @@ docs/decisions/0007-clickhouse-vendor-patch.md	src/response.rs:85	pinned_to_anot
 docs/decisions/0007-clickhouse-vendor-patch.md	vendor/clickhouse/PATCHES.md:191	no_name_the_target_file_holds
 docs/decisions/0007-clickhouse-vendor-patch.md	vendor/clickhouse/PATCHES.md:241	no_name_the_target_file_holds
 docs/decisions/0007-clickhouse-vendor-patch.md	vendor/clickhouse/PATCHES.md:307	no_name_the_target_file_holds
-docs/decisions/0008-sql-composition-for-lowered-pipelines.md	.github/workflows/ci.yml:1302-1306	no_name_the_target_file_holds
+docs/decisions/0008-sql-composition-for-lowered-pipelines.md	.github/workflows/ci.yml:1031-1035	no_name_the_target_file_holds
 docs/decisions/0009-clickhouse-types-vendor-patch.md	crates/pulsus-schema/src/catalog.rs:1491	not_in_this_repository
 docs/decisions/0009-clickhouse-types-vendor-patch.md	crates/pulsus-schema/src/catalog.rs:1493	not_in_this_repository
 docs/decisions/0009-clickhouse-types-vendor-patch.md	crates/pulsus-schema/src/catalog.rs:1648	not_in_this_repository

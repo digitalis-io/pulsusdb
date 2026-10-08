@@ -5355,7 +5355,7 @@ with `PULSUS_TEST_CLICKHOUSE` unset it printed `Starting 14 tests across 1 binar
 `14 tests run: 14 passed, 0 skipped`, exit 0 — **and that green is not evidence of anything**,
 because each test self-skips internally when the variable is absent. The binary exists — run here it printed `Starting 14 tests` — and CI runs the whole of it with
 `cargo test -p pulsus-read --test query_log_gates` in the `schema-it` job, with the variable set
-(`.github/workflows/ci.yml:1302-1306`). A local run without it proves nothing, and this document
+(`.github/workflows/ci.yml:1031-1035`). A local run without it proves nothing, and this document
 does not count it.
 
 **The first is vacuous until wave 2 even after wave 1 writes it.** At base the golden corpus
