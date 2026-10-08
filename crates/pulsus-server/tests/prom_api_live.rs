@@ -2223,6 +2223,381 @@ async fn the_cache_route_and_the_sql_route_answer_a_c0_selector_identically() {
 }
 
 // ---------------------------------------------------------------------
+// Issue #495: remote write stores label names as sent
+// ---------------------------------------------------------------------
+
+/// Bare HTTP/1.1 POST of `body` with `content_type`.
+fn http_post_bytes(port: u16, path: &str, content_type: &str, body: &[u8]) -> (u16, String) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
+    let mut request = format!(
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: {content_type}\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(body);
+    stream.write_all(&request).expect("send");
+    let mut buf = String::new();
+    stream.read_to_string(&mut buf).ok();
+    let mut parts = buf.splitn(2, "\r\n\r\n");
+    let head = parts.next().unwrap_or_default();
+    let body = decode_body(head, parts.next().unwrap_or(""));
+    let status = head
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    (status, body)
+}
+
+/// One remote-write series: `(labels, value, ms)`.
+type Series495<'a> = (&'a [(&'a str, &'a str)], f64, i64);
+
+/// A remote write of one series per entry, each `(labels, value, ms)`.
+fn remote_write_495(series: &[Series495<'_>]) -> Vec<u8> {
+    use prost::Message;
+    use pulsus_write::protocols::remote_write::{Label, Sample, TimeSeries, WriteRequest};
+    let req = WriteRequest {
+        timeseries: series
+            .iter()
+            .map(|(labels, value, ms)| TimeSeries {
+                labels: labels
+                    .iter()
+                    .map(|(n, v)| Label {
+                        name: n.to_string(),
+                        value: v.to_string(),
+                    })
+                    .collect(),
+                samples: vec![Sample {
+                    value: *value,
+                    timestamp: *ms,
+                }],
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    };
+    snap::raw::Encoder::new()
+        .compress_vec(&req.encode_to_vec())
+        .expect("snappy-compress the write")
+}
+
+/// T5's two pushes: an OTLP gauge `checkout_requests` with the data-point
+/// attribute `service.name=checkout`, value 1 at `t`, and a remote write
+/// of `{__name__="checkout_requests", "service.name"="checkout"}`, value 2
+/// at `t + 15 s`.
+fn push_checkout_495(port: u16, t: i64) {
+    let otlp = format!(
+        r#"{{"resourceMetrics":[{{"scopeMetrics":[{{"metrics":[
+             {{"name":"checkout_requests","gauge":{{"dataPoints":[
+               {{"timeUnixNano":"{}","asDouble":1,
+                 "attributes":[{{"key":"service.name","value":{{"stringValue":"checkout"}}}}]}}]}}}}
+           ]}}]}}]}}"#,
+        t * 1_000_000
+    );
+    let (status, body) = http_post_bytes(port, "/v1/metrics", "application/json", otlp.as_bytes());
+    assert_eq!(status, 200, "the OTLP push: {body}");
+    let rw = remote_write_495(&[(
+        &[
+            ("__name__", "checkout_requests"),
+            ("service.name", "checkout"),
+        ],
+        2.0,
+        t + 15_000,
+    )]);
+    let (status, body) = http_post_bytes(port, "/api/v1/write", "application/x-protobuf", &rw);
+    assert_eq!(status, 204, "the remote write: {body}");
+}
+
+/// The anchor of the #495 tests: five minutes ago, minute-aligned.
+fn anchor_495() -> i64 {
+    (now_ms() / 60_000) * 60_000 - 300_000
+}
+
+/// `query_range` of `q` over `[t, t + 15 s]` at 15 s, as `(labels, values)`
+/// per series, sorted.
+fn range_495(port: u16, q: &str, t: i64) -> Vec<(serde_json::Value, Vec<String>)> {
+    let path = format!(
+        "/api/v1/query_range?query={}&start={}&end={}&step=15",
+        urlencode_query(q),
+        t as f64 / 1000.0,
+        (t + 15_000) as f64 / 1000.0
+    );
+    let (status, body) = http_get(port, &path).expect("query_range reachable");
+    assert_eq!(status, 200, "{q}: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+    let mut out: Vec<(serde_json::Value, Vec<String>)> = json["data"]["result"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| {
+            let values = s["values"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .map(|p| p[1].as_str().unwrap_or_default().to_string())
+                .collect();
+            (s["metric"].clone(), values)
+        })
+        .collect();
+    out.sort_by_key(|(m, _)| m.to_string());
+    out
+}
+
+/// The instant answer of `q` at `at_ms`, as `(labels, value)` per series.
+fn instant_495(port: u16, q: &str, at_ms: i64) -> Vec<(serde_json::Value, String)> {
+    let path = format!(
+        "/api/v1/query?query={}&time={}",
+        urlencode_query(q),
+        at_ms as f64 / 1000.0
+    );
+    let (status, body) = http_get(port, &path).expect("query reachable");
+    assert_eq!(status, 200, "{q}: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+    let mut out: Vec<(serde_json::Value, String)> = json["data"]["result"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| {
+            (
+                s["metric"].clone(),
+                s["value"][1].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    out.sort_by_key(|(m, _)| m.to_string());
+    out
+}
+
+/// Waits until `q` at `t + 15 s` answers `want` series: the writer flushes
+/// and the cache sweeps on timers.
+fn wait_for_series_495(port: u16, q: &str, t: i64, want: usize) {
+    let deadline = Instant::now() + Duration::from_secs(40);
+    while Instant::now() < deadline {
+        if instant_495(port, q, t + 15_000).len() >= want {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// **T5 (issue #495): a dotted label is one series on both transports**,
+/// with the OTLP translation strategy that keeps names.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dotted_label_is_one_series_on_both_transports() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse to run this test");
+        return;
+    }
+    let db = &pulsus_testkit::test_db("pulsus_prom_api_495_t5_it");
+    drop_db(db).await;
+    let port: u16 = 31_810;
+    let _guard = spawn_prom_server(
+        port,
+        db,
+        &[("PULSUS_OTLP_TRANSLATION_STRATEGY", "NoTranslation")],
+    );
+    let t = anchor_495();
+    push_checkout_495(port, t);
+    wait_for_series_495(port, "checkout_requests", t, 2);
+
+    let path = format!(
+        "/api/v1/series?match[]={}&start={}&end={}",
+        urlencode_query(r#"{"service.name"="checkout"}"#),
+        (t - 60_000) / 1000,
+        (t + 60_000) / 1000
+    );
+    let (status, body) = http_get(port, &path).expect("series reachable");
+    assert_eq!(status, 200, "{body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+    assert_eq!(
+        json["data"],
+        serde_json::json!([{"__name__": "checkout_requests", "service.name": "checkout"}]),
+        "T5 /series"
+    );
+    for q in [
+        r#"{"service.name"="checkout"}"#,
+        r#"checkout_requests{"service.name"="checkout"}"#,
+        r#"{__name__="checkout_requests", "service.name"="checkout"}"#,
+    ] {
+        assert_eq!(
+            range_495(port, q, t),
+            vec![(
+                serde_json::json!({"__name__": "checkout_requests", "service.name": "checkout"}),
+                vec!["1".to_string(), "2".to_string()]
+            )],
+            "T5 {q}"
+        );
+    }
+    assert!(
+        range_495(port, r#"{service_name="checkout"}"#, t).is_empty(),
+        "T5: nothing is stored as service_name"
+    );
+    drop_db(db).await;
+}
+
+/// **T6 (issue #495): under the default strategy OTLP escapes the name and
+/// remote write does not**, so the two pushes are two series.
+#[tokio::test(flavor = "multi_thread")]
+async fn under_the_default_strategy_otlp_escapes_and_remote_write_does_not() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse to run this test");
+        return;
+    }
+    let db = &pulsus_testkit::test_db("pulsus_prom_api_495_t6_it");
+    drop_db(db).await;
+    let port: u16 = 31_811;
+    let _guard = spawn_prom_server(port, db, &[]);
+    let t = anchor_495();
+    push_checkout_495(port, t);
+    wait_for_series_495(port, "checkout_requests", t, 2);
+    let at = t + 15_000;
+    assert_eq!(
+        instant_495(port, r#"{service_name="checkout"}"#, at),
+        vec![(
+            serde_json::json!({"__name__": "checkout_requests", "service_name": "checkout"}),
+            "1".to_string()
+        )],
+        "T6: the OTLP half"
+    );
+    assert_eq!(
+        instant_495(port, r#"{"service.name"="checkout"}"#, at),
+        vec![(
+            serde_json::json!({"__name__": "checkout_requests", "service.name": "checkout"}),
+            "2".to_string()
+        )],
+        "T6: the remote-write half"
+    );
+    assert_eq!(
+        instant_495(port, "checkout_requests", at).len(),
+        2,
+        "T6: two series"
+    );
+    drop_db(db).await;
+}
+
+/// **T7 (issue #495): a dotted name reaches every label route.**
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dotted_name_reaches_every_label_route() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse to run this test");
+        return;
+    }
+    let db = &pulsus_testkit::test_db("pulsus_prom_api_495_t7_it");
+    drop_db(db).await;
+    let port: u16 = 31_812;
+    let _guard = spawn_prom_server(
+        port,
+        db,
+        &[("PULSUS_OTLP_TRANSLATION_STRATEGY", "NoTranslation")],
+    );
+    let t = anchor_495();
+    push_checkout_495(port, t);
+    wait_for_series_495(port, "checkout_requests", t, 2);
+    let window = format!("start={}&end={}", (t - 60_000) / 1000, (t + 60_000) / 1000);
+    let (_, labels) = http_get(port, &format!("/api/v1/labels?{window}")).expect("labels");
+    let labels: serde_json::Value = serde_json::from_str(&labels).expect("JSON");
+    assert!(
+        labels["data"]
+            .as_array()
+            .is_some_and(|a| a.contains(&serde_json::json!("service.name"))),
+        "T7 /labels: {labels}"
+    );
+    let (_, values) = http_get(
+        port,
+        &format!("/api/v1/label/U__service_2e_name/values?{window}"),
+    )
+    .expect("values");
+    let values: serde_json::Value = serde_json::from_str(&values).expect("JSON");
+    assert_eq!(values["data"], serde_json::json!(["checkout"]), "T7 values");
+    let at = t + 15_000;
+    assert_eq!(
+        instant_495(port, r#"sum by ("service.name") (checkout_requests)"#, at),
+        vec![(
+            serde_json::json!({"service.name": "checkout"}),
+            "2".to_string()
+        )],
+        "T7 sum by"
+    );
+    assert_eq!(
+        instant_495(port, "count(checkout_requests)", at),
+        vec![(serde_json::json!({}), "1".to_string())],
+        "T7 count"
+    );
+    drop_db(db).await;
+}
+
+/// **T8 (issue #495): every name shape is found by a quoted matcher and by
+/// its escaped name.**
+#[tokio::test(flavor = "multi_thread")]
+async fn every_name_shape_is_found_by_a_quoted_matcher_and_by_its_escaped_name() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse to run this test");
+        return;
+    }
+    let db = &pulsus_testkit::test_db("pulsus_prom_api_495_t8_it");
+    drop_db(db).await;
+    let port: u16 = 31_813;
+    let _guard = spawn_prom_server(port, db, &[]);
+    let t = anchor_495();
+    let cases = [
+        ("service.name", "U__service_2e_name"),
+        ("http-method", "U__http_2d_method"),
+        ("k8s:pod", "U__k8s_3a_pod"),
+        ("path/segment", "U__path_2f_segment"),
+        ("with space", "U__with_20_space"),
+        ("café", "U__caf_e9_"),
+    ];
+    let values: Vec<String> = (0..cases.len()).map(|i| format!("v{i}")).collect();
+    type Owned<'a> = (Vec<(&'a str, &'a str)>, f64, i64);
+    let series: Vec<Owned<'_>> = cases
+        .iter()
+        .zip(&values)
+        .map(|((name, _), v)| {
+            (
+                vec![("__name__", "name_shapes"), (*name, v.as_str())],
+                1.0,
+                t,
+            )
+        })
+        .collect();
+    let refs: Vec<Series495<'_>> = series
+        .iter()
+        .map(|(l, v, ms)| (l.as_slice(), *v, *ms))
+        .collect();
+    let (status, body) = http_post_bytes(
+        port,
+        "/api/v1/write",
+        "application/x-protobuf",
+        &remote_write_495(&refs),
+    );
+    assert_eq!(status, 204, "{body}");
+    wait_for_series_495(port, "name_shapes", t - 15_000, cases.len());
+    let window = format!("start={}&end={}", (t - 60_000) / 1000, (t + 60_000) / 1000);
+    for ((name, url), v) in cases.iter().zip(&values) {
+        let q = format!(r#"name_shapes{{"{name}"="{v}"}}"#);
+        assert_eq!(
+            instant_495(port, &q, t),
+            vec![(
+                serde_json::json!({"__name__": "name_shapes", (*name): v}),
+                "1".to_string()
+            )],
+            "T8 {q}"
+        );
+        let (_, body) =
+            http_get(port, &format!("/api/v1/label/{url}/values?{window}")).expect("values");
+        let json: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+        assert_eq!(json["data"], serde_json::json!([v]), "T8 {url}");
+    }
+    drop_db(db).await;
+}
+
+// ---------------------------------------------------------------------
 // Issue #500: every distinct descriptor of a name
 // ---------------------------------------------------------------------
 
