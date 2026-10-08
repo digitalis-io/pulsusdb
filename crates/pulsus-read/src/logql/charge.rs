@@ -703,6 +703,11 @@ pub(in crate::logql) const PUSHDOWN_RANGE_SLOT: usize =
 pub(in crate::logql) const PUSHDOWN_RANGE_POINT_SLOT: usize =
     size_of::<(i64, u64)>() + size_of::<(i64, f64)>();
 
+/// The bucketed range path's per-SERIES slot once its points are a dense
+/// vector (issue #624). Not yet used.
+pub(in crate::logql) const PUSHDOWN_RANGE_DENSE_SLOT: usize =
+    size_of::<(String, (LabelSet, Vec<Option<u64>>))>() + size_of::<MatrixSeries>();
+
 /// A provable UPPER BOUND on the query-lifetime heap bytes ONE distinct
 /// output group's map entry retains: the rendered-JSON key, the cloned
 /// `LabelSet` (each owned string plus the element buffer), and the entry's

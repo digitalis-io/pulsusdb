@@ -4301,7 +4301,7 @@ unexplained.
 - **PulsusDB behaviour (the delta): a malformed query is a `400` in every
   window.** Nothing about our rejection depends on the dates asked for:
   `plan()` and `CompiledPipeline::compile` both run before any I/O
-  (`logql/exec.rs:612`, `:906`, `:2290`, `:2576`, `logql/variants.rs:509`,
+  (`logql/exec.rs:617`, `:911`, `:2304`, `:2590`, `logql/variants.rs:509`,
   propagated with `?` and surfaced by `logs_api/error.rs` as a 400), so an
   invalid pipeline cannot reach a "no chunks, return empty" path in the
   first place.

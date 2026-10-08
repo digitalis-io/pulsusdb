@@ -370,6 +370,11 @@ pub struct KeyRouteTestHooks {
     /// can make S1 outlast a deadline, and the server-side time limit that
     /// decides which deadline stops it.
     pub key_statement_test_knobs: Option<super::sql::KeyStatementTestKnobs>,
+    /// Test-only: renders a statement-level memory ceiling,
+    /// `SETTINGS max_memory_usage = <n>`, into either bucketed range
+    /// statement (issue #624), so a live test can make it fail with the
+    /// server's memory code.
+    pub bucketed_statement_max_memory_bytes: Option<u64>,
 }
 
 impl LogQlEngine {
@@ -1830,9 +1835,14 @@ impl LogQlEngine {
             // instead of refused, and a query that 422s today would start
             // returning a matrix. Same constant, same named refusal, no
             // round trip: it runs before the statement is issued.
-            if let Some(step) = mp.step_ns {
-                super::window::ensure_grid_resolution(mp.grid_start_ns, mp.end_ns, step.as_u64())?;
-            }
+            let grid_points = match mp.step_ns {
+                Some(step) => super::window::ensure_grid_resolution(
+                    mp.grid_start_ns,
+                    mp.end_ns,
+                    step.as_u64(),
+                )?,
+                None => 0,
+            };
             // Issue #507 (W4): the unwrapped read is a second lowered
             // shape with its own statement, its own row type and its own
             // fold. It is a `match` on the plan's `value` rather than a
@@ -1852,6 +1862,8 @@ impl LogQlEngine {
                         AggCaps::DEFAULT,
                         mp.grid_start_ns,
                         mp.end_ns,
+                        mp.step_ns.map_or(0, |s| s.get()),
+                        grid_points,
                     )
                     .with_parent_sum(parent_sum_of(mp));
                     {
@@ -1882,7 +1894,9 @@ impl LogQlEngine {
                 Err(
                     BucketGridRefusal::StepNotPositive
                     | BucketGridRefusal::AnchorAboveScanStart
-                    | BucketGridRefusal::WouldOverflow,
+                    | BucketGridRefusal::WouldOverflow
+                    | BucketGridRefusal::RangeNotPositive
+                    | BucketGridRefusal::RollupSource,
                 ) => {
                     // No `_` arm: a fourth refusal reason fails to compile
                     // here rather than falling through to a behaviour
@@ -2666,7 +2680,9 @@ impl LogQlEngine {
                         Err(
                             BucketGridRefusal::StepNotPositive
                             | BucketGridRefusal::AnchorAboveScanStart
-                            | BucketGridRefusal::WouldOverflow,
+                            | BucketGridRefusal::WouldOverflow
+                            | BucketGridRefusal::RangeNotPositive
+                            | BucketGridRefusal::RollupSource,
                         ) => client_metric_read_sql(
                             mp,
                             &services,
@@ -5206,6 +5222,8 @@ pub(in crate::logql) struct PushdownRangeGroups {
     /// Query-lifetime bytes, never discharged: the groups ARE the result
     /// (the `PushdownInstantGroups` precedent).
     charged: u64,
+    /// Result points reserved (issue #624). Not yet charged.
+    points: u64,
     caps: AggCaps,
     merge_buf: Vec<(String, String)>,
     sm_buf: Vec<(String, String)>,
@@ -5220,6 +5238,8 @@ impl PushdownRangeGroups {
         caps: AggCaps,
         grid_start_ns: i64,
         end_ns: i64,
+        _step_ns: i64,
+        _grid_points: u64,
     ) -> Self {
         PushdownRangeGroups {
             base_labels: meta.iter().map(|(fp, m)| (*fp, series_labels(m))).collect(),
@@ -5227,6 +5247,7 @@ impl PushdownRangeGroups {
             grid_start_ns,
             end_ns,
             charged: 0,
+            points: 0,
             caps,
             merge_buf: Vec::new(),
             sm_buf: Vec::new(),
@@ -5327,6 +5348,12 @@ impl PushdownRangeGroups {
     #[cfg(test)]
     pub(in crate::logql) fn charged_bytes(&self) -> u64 {
         self.charged
+    }
+
+    /// How many result points this state has reserved (issue #624).
+    #[cfg(test)]
+    pub(in crate::logql) fn charged_points(&self) -> u64 {
+        self.points
     }
 
     /// The rate divisor is applied ONCE per point, to the summed count —
@@ -5467,6 +5494,37 @@ pub fn unwrapped_fallback_client_agg(
         absent_labels: Vec::new(),
         grouping: value.grouping.clone().map(Box::new),
     }
+}
+
+/// Which failures of either bucketed range statement hand the query to
+/// today's route (issue #624). Not yet implemented.
+fn bucketed_statement_failure_goes_to_todays_route(_e: &ChError) -> bool {
+    false
+}
+
+/// How a bucketed range statement's rows ended (issue #624).
+///
+/// One value per query, moved once and never stored in a collection, so the
+/// fold is held inline rather than boxed.
+#[allow(clippy::large_enum_variant)]
+pub(in crate::logql) enum BucketedRows {
+    /// Every row folded.
+    Folded(PushdownRangeGroups),
+    /// The statement failed in a way that hands the query to today's
+    /// route. Carries no fold, so no row folded before the failure can
+    /// reach an answer.
+    TodaysRoute,
+    /// The statement failed in a way today's error mapping answers.
+    Failed(ChError),
+}
+
+/// Folds a bucketed range statement's rows (issue #624). Not yet
+/// implemented.
+pub(in crate::logql) async fn fold_bucketed_rows(
+    _rows: impl futures::Stream<Item = Result<MetricRangeBucketRow, ChError>> + Unpin,
+    groups: PushdownRangeGroups,
+) -> Result<BucketedRows, ReadError> {
+    Ok(BucketedRows::Folded(groups))
 }
 
 /// ClickHouse server exception code for `FUNCTION_THROW_IF_VALUE_IS_NON_ZERO`:
@@ -6371,14 +6429,28 @@ mod tests {
             structured_metadata: sm.to_string(),
         };
         assert!(
-            PushdownRangeGroups::new(&meta, AggCaps::DEFAULT, 60_000_000_000, 300_000_000_000)
-                .push_row(&bucket(""))
-                .is_err()
-        );
-        PushdownRangeGroups::new(&meta, AggCaps::DEFAULT, 60_000_000_000, 300_000_000_000)
-            .with_parent_sum(by_service)
+            PushdownRangeGroups::new(
+                &meta,
+                AggCaps::DEFAULT,
+                60_000_000_000,
+                300_000_000_000,
+                60_000_000_000,
+                5
+            )
             .push_row(&bucket(""))
-            .expect("range: removed by the parent sum");
+            .is_err()
+        );
+        PushdownRangeGroups::new(
+            &meta,
+            AggCaps::DEFAULT,
+            60_000_000_000,
+            300_000_000_000,
+            60_000_000_000,
+            5,
+        )
+        .with_parent_sum(by_service)
+        .push_row(&bucket(""))
+        .expect("range: removed by the parent sum");
         // The group key read's fold runs the group document under the
         // query's own rules, `RangeStepRules::parent_sum` included (issue
         // #507, `unwrap_group::run_group`).
@@ -9215,8 +9287,14 @@ mod tests {
         rate_window_ns: Option<u64>,
     ) -> Vec<RangeSeries> {
         let meta = range_meta();
-        let mut g =
-            PushdownRangeGroups::new(&meta, AggCaps::DEFAULT, RANGE_GRID_START_NS, RANGE_END_NS);
+        let mut g = PushdownRangeGroups::new(
+            &meta,
+            AggCaps::DEFAULT,
+            RANGE_GRID_START_NS,
+            RANGE_END_NS,
+            RANGE_STEP_NS,
+            5,
+        );
         for r in rows {
             g.push_row(r).expect("under the cap");
         }
@@ -9393,8 +9471,14 @@ mod tests {
     #[test]
     fn a_metadata_error_fails_the_bucketed_query_too() {
         let meta = range_meta();
-        let mut g =
-            PushdownRangeGroups::new(&meta, AggCaps::DEFAULT, RANGE_GRID_START_NS, RANGE_END_NS);
+        let mut g = PushdownRangeGroups::new(
+            &meta,
+            AggCaps::DEFAULT,
+            RANGE_GRID_START_NS,
+            RANGE_END_NS,
+            RANGE_STEP_NS,
+            5,
+        );
         let err = g
             .push_row(&bucket_row(
                 Fingerprint::from_raw(10),
@@ -9409,6 +9493,195 @@ mod tests {
         );
     }
 
+    /// Issue #624: a grid of 61 points from 60 s, one step 60 s.
+    const DENSE_POINTS: u64 = 61;
+    const DENSE_END_NS: i64 = RANGE_GRID_START_NS + 60 * RANGE_STEP_NS;
+
+    /// The `group_entry_bytes` one series of fp 11 with no metadata costs
+    /// on the dense fold.
+    fn dense_series_bytes() -> u64 {
+        let meta = range_meta();
+        let labels = series_labels(&meta[&Fingerprint::from_raw(11)]);
+        group_entry_bytes(
+            &render_series_labels(&labels),
+            &labels,
+            super::super::charge::PUSHDOWN_RANGE_DENSE_SLOT,
+        )
+    }
+
+    /// N5 (issue #624): a series' points are charged once, against the
+    /// result-point cap, and never against the label-byte cap. With the
+    /// label-byte cap set to exactly one series' entry, a series with a
+    /// point at every one of the 61 grid points folds.
+    #[test]
+    fn a_series_points_are_charged_once_against_the_result_point_cap() {
+        let meta = range_meta();
+        let caps = AggCaps {
+            group_bytes: dense_series_bytes(),
+            ..AggCaps::DEFAULT
+        };
+        let mut g = PushdownRangeGroups::new(
+            &meta,
+            caps,
+            RANGE_GRID_START_NS,
+            DENSE_END_NS,
+            RANGE_STEP_NS,
+            DENSE_POINTS,
+        );
+        for k in 0..DENSE_POINTS as i64 {
+            g.push_row(&bucket_row(
+                Fingerprint::from_raw(11),
+                RANGE_GRID_START_NS + k * RANGE_STEP_NS,
+                1,
+                "",
+            ))
+            .unwrap_or_else(|e| panic!("row {k} must fold: {e:?}"));
+        }
+        assert_eq!(g.charged_points(), DENSE_POINTS);
+        let series = g.finish(None);
+        assert_eq!(series.len(), 1);
+        assert_eq!(series[0].points.len(), DENSE_POINTS as usize);
+    }
+
+    /// N6 (issue #624): a second series past the result-point cap is the
+    /// named refusal, and nothing of it is retained.
+    #[test]
+    fn a_series_past_the_result_point_cap_is_refused() {
+        let meta = range_meta();
+        let caps = AggCaps {
+            result_points: DENSE_POINTS,
+            ..AggCaps::DEFAULT
+        };
+        let mut g = PushdownRangeGroups::new(
+            &meta,
+            caps,
+            RANGE_GRID_START_NS,
+            DENSE_END_NS,
+            RANGE_STEP_NS,
+            DENSE_POINTS,
+        );
+        g.push_row(&bucket_row(
+            Fingerprint::from_raw(11),
+            RANGE_GRID_START_NS,
+            1,
+            "",
+        ))
+        .expect("the first series fits");
+        let err = g
+            .push_row(&bucket_row(
+                Fingerprint::from_raw(10),
+                RANGE_GRID_START_NS,
+                1,
+                r#"{"lvl":"warn"}"#,
+            ))
+            .expect_err("the second series is past the cap");
+        assert!(
+            matches!(
+                err,
+                ReadError::QueryTooBroad(TooBroadReason::MetricResultPoints { .. })
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(
+            g.finish(None).len(),
+            1,
+            "the refused series is not retained"
+        );
+    }
+
+    /// N7 (issue #624): only the server's memory code hands a bucketed
+    /// statement's failure to today's route.
+    #[test]
+    fn only_the_memory_code_hands_a_bucketed_statement_to_todays_route() {
+        let server = |code: i32| ChError::Server {
+            code,
+            message: format!("Code: {code}. DB::Exception: x"),
+        };
+        for (e, want) in [
+            (server(241), true),
+            (server(307), false),
+            (server(159), false),
+            (server(395), false),
+            (ChError::Decode("bad row".to_string()), false),
+        ] {
+            assert_eq!(
+                super::bucketed_statement_failure_goes_to_todays_route(&e),
+                want,
+                "{e:?}"
+            );
+        }
+    }
+
+    fn dense_groups(meta: &HashMap<Fingerprint, StreamMetaRow>) -> PushdownRangeGroups {
+        PushdownRangeGroups::new(
+            meta,
+            AggCaps::DEFAULT,
+            RANGE_GRID_START_NS,
+            DENSE_END_NS,
+            RANGE_STEP_NS,
+            DENSE_POINTS,
+        )
+    }
+
+    /// N13 (issue #624): how a bucketed statement's row stream ends.
+    #[tokio::test]
+    async fn a_bucketed_statement_failure_after_a_row_is_classified_by_its_code() {
+        let meta = range_meta();
+        let row = |k: i64| {
+            Ok(bucket_row(
+                Fingerprint::from_raw(11),
+                RANGE_GRID_START_NS + k * RANGE_STEP_NS,
+                1,
+                "",
+            ))
+        };
+        let server = |code: i32| {
+            Err(ChError::Server {
+                code,
+                message: format!("Code: {code}. DB::Exception: x"),
+            })
+        };
+        // (a) a row, then the memory code: today's route, with no fold.
+        let got = super::fold_bucketed_rows(
+            futures::stream::iter(vec![row(0), server(241)]),
+            dense_groups(&meta),
+        )
+        .await
+        .expect("no fold refusal");
+        assert!(matches!(got, BucketedRows::TodaysRoute), "(a)");
+        // (b) a row, then the scan budget: today's error mapping.
+        let got = super::fold_bucketed_rows(
+            futures::stream::iter(vec![row(0), server(307)]),
+            dense_groups(&meta),
+        )
+        .await
+        .expect("no fold refusal");
+        assert!(
+            matches!(got, BucketedRows::Failed(ChError::Server { code: 307, .. })),
+            "(b)"
+        );
+        // (c) two rows: both folded.
+        let got = super::fold_bucketed_rows(
+            futures::stream::iter(vec![row(0), row(1)]),
+            dense_groups(&meta),
+        )
+        .await
+        .expect("no fold refusal");
+        let BucketedRows::Folded(groups) = got else {
+            panic!("(c): expected the folded rows");
+        };
+        let series = groups.finish(None);
+        assert_eq!(series.len(), 1, "(c)");
+        assert_eq!(
+            series[0].points,
+            vec![
+                (RANGE_GRID_START_NS, 1.0),
+                (RANGE_GRID_START_NS + RANGE_STEP_NS, 1.0)
+            ],
+            "(c)"
+        );
+    }
+
     /// The bucketed fold is bounded BEFORE it allocates, with the client
     /// paths' named 422 — the `PushdownInstantGroups` arrangement, and
     /// nothing is retained when the charge refuses.
@@ -9419,7 +9692,14 @@ mod tests {
             group_bytes: 4096,
             ..AggCaps::DEFAULT
         };
-        let mut g = PushdownRangeGroups::new(&meta, tiny, RANGE_GRID_START_NS, RANGE_END_NS);
+        let mut g = PushdownRangeGroups::new(
+            &meta,
+            tiny,
+            RANGE_GRID_START_NS,
+            RANGE_END_NS,
+            RANGE_STEP_NS,
+            5,
+        );
         let fat = "v".repeat(64 * 1024);
         let err = g
             .push_row(&bucket_row(

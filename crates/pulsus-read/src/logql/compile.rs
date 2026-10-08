@@ -1926,50 +1926,34 @@ mod tests {
         how[chain.len() - 1]
     }
 
-    /// Issue #507, W2 — a window lowers when the selector's range is
-    /// exactly the emit grid's step, and not otherwise.
-    ///
-    /// The expression gives one grid point per row — the smallest grid
-    /// point at or above it, i.e. the window `(g - step, g]`. A range
-    /// WIDER than the step would put an entry in several windows at once
-    /// and no single column could say which; a range SHORTER than the step
-    /// leaves the entries in `(g - step, g - range]` in no window at all,
-    /// and the column counts them into `g` regardless.
+    /// Issue #624 — a window lowers at any positive range and step: the
+    /// sliding statement gives a row every grid point whose window
+    /// `(g - range, g]` holds it, so a range wider or shorter than the step
+    /// is answered as exactly as one equal to it.
     ///
     /// **This is the chain-decidable half of a two-part decision.** Whether
     /// the grid's arithmetic is representable depends on the request's time
     /// bounds, which `Lower::capability` does not receive;
-    /// `logql::predicate::bucket_expr` answers that half and the planner
-    /// takes the conjunction.
+    /// `logql::predicate::sliding_cover` and `bucket_expr` answer that half
+    /// and the planner takes the conjunction.
     #[test]
-    fn a_window_lowers_only_when_its_range_is_exactly_the_step() {
+    fn a_window_lowers_at_any_positive_range_and_step() {
         const MIN: i64 = 60_000_000_000;
         let lowered = Disposition::Lowered(Fidelity::Equivalent);
         let blocked = Disposition::Residual(ResidualReason::Blocked(BlockReason::NotYetLowered));
-        // range == step.
-        assert_eq!(
-            window_how(&[], RangeAggOp::CountOverTime, MIN, MIN),
-            lowered
-        );
-        // range < step: the entries between the windows belong to none of
-        // them, and the grid column cannot say so.
-        assert_eq!(
-            window_how(&[], RangeAggOp::CountOverTime, MIN / 2, MIN),
-            blocked
-        );
-        assert_eq!(
-            window_how(&[], RangeAggOp::CountOverTime, MIN - 1, MIN),
-            blocked
-        );
-        // range > step: one entry, several windows.
-        assert_eq!(
-            window_how(&[], RangeAggOp::CountOverTime, MIN + 1, MIN),
-            blocked
-        );
-        assert_eq!(
-            window_how(&[], RangeAggOp::CountOverTime, 5 * MIN, MIN),
-            blocked
-        );
+        for (range, what) in [
+            (MIN, "range == step"),
+            (MIN + 1, "range == step + 1"),
+            (MIN - 1, "range == step - 1"),
+            (MIN / 2, "range == step / 2"),
+            (5 * MIN, "range == 5 * step"),
+        ] {
+            assert_eq!(
+                window_how(&[], RangeAggOp::CountOverTime, range, MIN),
+                lowered,
+                "{what}"
+            );
+        }
         // A step that is not positive has no grid points.
         assert_eq!(window_how(&[], RangeAggOp::CountOverTime, MIN, 0), blocked);
         // An anchor one step below the grid start must be representable.

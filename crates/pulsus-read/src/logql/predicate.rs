@@ -865,6 +865,13 @@ pub enum BucketGridRefusal {
     AnchorAboveScanStart,
     /// The worst-case arithmetic is not representable in `Int64`.
     WouldOverflow,
+    /// The selector's range is zero or negative, so no window holds a row
+    /// (issue #624).
+    RangeNotPositive,
+    /// The shape's grid column is not `timestamp_ns`: the sliding statement
+    /// reads lines, and the rollup's buckets have lost the timestamp that
+    /// decides which side of a window edge a line falls (issue #624).
+    RollupSource,
 }
 
 /// The anchored bucket expression: the grid point a row belongs to under a
@@ -930,6 +937,33 @@ pub fn bucket_expr(
             "{lo_ns} + intDiv({bucket_col} - {lo_ns} + {step_ns} - 1, {step_ns}) * {step_ns}"
         ),
     })
+}
+
+/// The grid indexes one line covers under the sliding statement (issue
+/// #624), and the grid's last index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlidingCover {
+    /// `lo`: the first grid index whose window holds the line.
+    pub lo: CheckedFragment,
+    /// `hi`: the last grid index whose window holds the line.
+    pub hi: CheckedFragment,
+    /// The last grid index, `floor((end - grid_start) / step)`.
+    pub kmax: i64,
+    /// `kmax + 1`.
+    pub kend: i64,
+}
+
+/// The sliding statement's per-line grid cover (issue #624). Not yet
+/// implemented.
+pub fn sliding_cover(
+    scan_start_ns: i64,
+    grid_start_ns: i64,
+    end_ns: i64,
+    step_ns: i64,
+    range_ns: i64,
+) -> Result<SlidingCover, BucketGridRefusal> {
+    let _ = (scan_start_ns, grid_start_ns, end_ns, step_ns, range_ns);
+    Err(BucketGridRefusal::RollupSource)
 }
 
 /// `countIf(toFloat64OrNull(val) IS NULL AND NOT match(val, '<UUID_RE>'))` —
@@ -2628,5 +2662,57 @@ mod tests {
         }
         assert_eq!(metadata_leaf_is_servable("trace_id", MatchOp::Eq), Ok(()));
         assert_eq!(metadata_leaf_is_servable("trace_id", MatchOp::Neq), Ok(()));
+    }
+
+    /// N2 (issue #624): the sliding statement's per-line grid cover, and
+    /// each way it refuses.
+    #[test]
+    fn the_sliding_cover_is_its_symbols_and_refuses_what_it_cannot_render() {
+        const S: i64 = 1_700_000_000_000_000_000;
+        const STEP: i64 = 60_000_000_000;
+        const RANGE: i64 = 150_000_000_000;
+        const E: i64 = S + 3_600_000_000_000;
+        // (a) N1's inputs: a = s - 3 * step, a_r = a - range, q = 3, kmax 60.
+        let cover = sliding_cover(S - RANGE, S, E, STEP, RANGE).expect("renderable");
+        assert_eq!(
+            cover.lo.as_sql(),
+            "greatest(intDiv(timestamp_ns - 1699999820000000000 + 59999999999, 60000000000) - 3, 0)"
+        );
+        assert_eq!(
+            cover.hi.as_sql(),
+            "least(intDiv(timestamp_ns - 1699999670000000000 + 59999999999, 60000000000) - 4, 60)"
+        );
+        assert_eq!((cover.kmax, cover.kend), (60, 61));
+        // (b) a step that is not positive.
+        assert_eq!(
+            sliding_cover(S - RANGE, S, E, 0, RANGE),
+            Err(BucketGridRefusal::StepNotPositive)
+        );
+        // (c) a range that is not positive.
+        assert_eq!(
+            sliding_cover(S, S, E, STEP, 0),
+            Err(BucketGridRefusal::RangeNotPositive)
+        );
+        // (d) the saturated inclusive scan: `s - r` underflowed, so `a` does.
+        let low = i64::MIN + 100_000_000_000;
+        assert_eq!(
+            sliding_cover(i64::MIN, low, low + 3_600_000_000_000, STEP, RANGE),
+            Err(BucketGridRefusal::WouldOverflow)
+        );
+        // (e) `a` is exactly `i64::MIN`, so `a_r` is below it.
+        let big = 1i64 << 62;
+        assert_eq!(
+            sliding_cover(-(big + 1), 0, 0, big, big + 1),
+            Err(BucketGridRefusal::WouldOverflow)
+        );
+        // (f) an end before the start: floor, not truncation, so no point.
+        let empty = sliding_cover(-STEP, 0, -1, STEP, STEP).expect("an empty grid renders");
+        assert_eq!((empty.kmax, empty.kend), (-1, 0));
+        // (g) a scan start below the anchor.
+        let a = S - 3 * STEP;
+        assert_eq!(
+            sliding_cover(a - 1, S, E, STEP, RANGE),
+            Err(BucketGridRefusal::AnchorAboveScanStart)
+        );
     }
 }

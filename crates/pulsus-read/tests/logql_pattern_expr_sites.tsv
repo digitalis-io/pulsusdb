@@ -53,7 +53,7 @@ Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:7499	-	-	<__preserve_error
 Site	Literal	crates/pulsus-read/src/logql/plan.rs:6427	-	-	<x> y	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/src/logql/plan.rs:7722	-	-	<a>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/src/logql/plan.rs:8556	-	-	latency=<latency>	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/src/logql/predicate.rs:2004	-	-	{}	reject	reject	-	-	-
+Site	Literal	crates/pulsus-read/src/logql/predicate.rs:2038	-	-	{}	reject	reject	-	-	-
 Site	Literal	crates/pulsus-read/tests/fixtures/group_key/cases.tsv:213	-	-	latency=<latency>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/tests/fixtures/group_key/cases.tsv:269	-	-	<__error__> <__error___extracted>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/tests/fixtures/group_key/cases.tsv:270	-	-	<__error___extracted> <__error__>	accept	accept	-	-	-

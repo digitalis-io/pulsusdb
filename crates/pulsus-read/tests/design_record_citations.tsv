@@ -238,18 +238,18 @@ docs/query-to-sql.md	filter.rs:81-84	crates/pulsus-read/src/traces/filter.rs	81	
 docs/query-to-sql.md	filter.rs:978	crates/pulsus-read/src/traces/filter.rs	978		prose	to_string	ValuePred::KeyExists
 docs/query-to-sql.md	labels.rs:328	crates/pulsus-read/src/logql/labels.rs	328		prose	merge_labels_with_structured_metadata	structured_metadata
 docs/query-to-sql.md	labels.rs:66	crates/pulsus-read/src/logql/labels.rs	66		prose	render_labels_json_sorted	render_labels_json_sorted
-docs/query-to-sql.md	logql/charge.rs:1296	crates/pulsus-read/src/logql/charge.rs	1296		line	MAX_STREAMS_RESULT_BYTES	pub const MAX_STREAMS_RESULT_BYTES: u64 = 1024 * 1024 * 1024;
+docs/query-to-sql.md	logql/charge.rs:1301	crates/pulsus-read/src/logql/charge.rs	1301		line	MAX_STREAMS_RESULT_BYTES	pub const MAX_STREAMS_RESULT_BYTES: u64 = 1024 * 1024 * 1024;
 docs/query-to-sql.md	logql/error.rs:809-815	crates/pulsus-read/src/logql/error.rs	809	815	prose	aggregation	400
 docs/query-to-sql.md	logql/error.rs:816-819	crates/pulsus-read/src/logql/error.rs	816	819	prose	intentionally	pipeline
 docs/query-to-sql.md	logql/params.rs:121	crates/pulsus-read/src/logql/params.rs	121		line	DEFAULT_MAX_STREAMS	pub const DEFAULT_MAX_STREAMS: usize = 100_000;
 docs/query-to-sql.md	logql/pipeline.rs:1266	crates/pulsus-read/src/logql/pipeline.rs	1266		line	PipelineError	pub fn compile(stages: &[Stage]) -> Result<Self, PipelineError> {
-docs/query-to-sql.md	logql/predicate.rs:1933-1940	crates/pulsus-read/src/logql/predicate.rs	1933	1940	prose	a_contains_line_filter_renders_an_escaped_like_pattern	LIKE
-docs/query-to-sql.md	logql/predicate.rs:1939	crates/pulsus-read/src/logql/predicate.rs	1939		prose	body	'%%'
+docs/query-to-sql.md	logql/predicate.rs:1967-1974	crates/pulsus-read/src/logql/predicate.rs	1967	1974	prose	a_contains_line_filter_renders_an_escaped_like_pattern	LIKE
+docs/query-to-sql.md	logql/predicate.rs:1973	crates/pulsus-read/src/logql/predicate.rs	1973		prose	body	'%%'
 docs/query-to-sql.md	logql/predicate.rs:501	crates/pulsus-read/src/logql/predicate.rs	501		line	or_matches	let core = if lf.or_matches.is_empty() {
 docs/query-to-sql.md	logql/predicate.rs:501-520	crates/pulsus-read/src/logql/predicate.rs	501	520	line	CheckedFragment	let core = if lf.or_matches.is_empty() { disjuncts .into_iter() .next() .expect("a line filter always has a head alterna
 docs/query-to-sql.md	logql/predicate.rs:522	crates/pulsus-read/src/logql/predicate.rs	522		prose	LineFilterOp	NOT
-docs/query-to-sql.md	logql/predicate.rs:947	crates/pulsus-read/src/logql/predicate.rs	947		line	contains_predicate	fn contains_predicate(phrase: &str) -> String {
-docs/query-to-sql.md	logql/predicate.rs:951	crates/pulsus-read/src/logql/predicate.rs	951		line	regex_predicate	fn regex_predicate(pattern: &str) -> Result<String, PipelineError> {
+docs/query-to-sql.md	logql/predicate.rs:981	crates/pulsus-read/src/logql/predicate.rs	981		line	contains_predicate	fn contains_predicate(phrase: &str) -> String {
+docs/query-to-sql.md	logql/predicate.rs:985	crates/pulsus-read/src/logql/predicate.rs	985		line	regex_predicate	fn regex_predicate(pattern: &str) -> Result<String, PipelineError> {
 docs/query-to-sql.md	logql/window.rs:148	crates/pulsus-read/src/logql/window.rs	148		line	MAX_CLIENT_AGG_BUCKETS	pub const MAX_CLIENT_AGG_BUCKETS: u64 = 11_000;
 docs/query-to-sql.md	logs_api/error.rs:148-153	crates/pulsus-server/src/logs_api/error.rs	148	153	line	X_CONTENT_TYPE_OPTIONS	( status, [ (header::CONTENT_TYPE, "text/plain; charset=utf-8"), (header::X_CONTENT_TYPE_OPTIONS, "nosniff"), ],
 docs/query-to-sql.md	metrics_plan.rs:398	crates/pulsus-read/src/traces/metrics_plan.rs	398		line	plan_trace_metrics	pub fn plan_trace_metrics(
@@ -344,8 +344,8 @@ docs/query-to-sql.md	search_sql.rs:742	crates/pulsus-read/src/traces/search_sql.
 docs/query-to-sql.md	sql.rs:109	crates/pulsus-read/src/logql/sql.rs	109		prose	RollupBytes	sum(bytes)
 docs/query-to-sql.md	sql.rs:1123-1129	crates/pulsus-read/src/logql/sql.rs	1123	1129	prose	WithStructuredMetadata	structured_metadata
 docs/query-to-sql.md	sql.rs:1303	crates/pulsus-read/src/logql/sql.rs	1303		prose	metric_range_bucketed	metric_range_bucketed
-docs/query-to-sql.md	sql.rs:1571	crates/pulsus-read/src/logql/sql.rs	1571		prose	metric_range_unwrapped	metric_range_unwrapped
-docs/query-to-sql.md	sql.rs:1634	crates/pulsus-read/src/logql/sql.rs	1634		prose	metric_range_unwrapped_rows	metric_range_unwrapped_rows
+docs/query-to-sql.md	sql.rs:1593	crates/pulsus-read/src/logql/sql.rs	1593		prose	metric_range_unwrapped	metric_range_unwrapped
+docs/query-to-sql.md	sql.rs:1656	crates/pulsus-read/src/logql/sql.rs	1656		prose	metric_range_unwrapped_rows	metric_range_unwrapped_rows
 docs/query-to-sql.md	sql.rs:521	crates/pulsus-read/src/logql/sql.rs	521		prose	probe	probe
 docs/query-to-sql.md	sql.rs:711	crates/pulsus-read/src/logql/sql.rs	711		prose	streams_table	stage2
 docs/query-to-sql.md	traces/exec.rs:126	crates/pulsus-read/src/traces/exec.rs	126		line	BATCH_TRACES	pub const BATCH_TRACES: usize = 32;

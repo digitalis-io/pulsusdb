@@ -139,8 +139,8 @@ was nine and every range metric query read raw lines.
 | `metric_raw_samples` | `sql.rs:1184` | `log_samples` | an instant metric query that must be aggregated in `pulsus-server` |
 | `metric_raw_samples_sliding` | `sql.rs:1216` | `log_samples` | every range metric query that neither of the next two serves, and the whole-query fallback of both |
 | `metric_range_bucketed` | `sql.rs:1303` | `log_samples` | a range `count_over_time`, `bytes_over_time`, `rate` or `bytes_rate` whose range equals its step, with no stage beyond a line filter (issue #507 W2) |
-| `metric_range_unwrapped` | `sql.rs:1571` | `log_samples` | S1, the extracted-field group key statement: a range `sum_over_time` or `avg_over_time` over `\| json … \| unwrap <n>` in one of the chains below, whose range equals its step (issue #507) |
-| `metric_range_unwrapped_rows` | `sql.rs:1634` | `log_samples` | L, the one read of the same queries, only after the raw read refused on one of four buffers the key statement does not allocate (issue #507) |
+| `metric_range_unwrapped` | `sql.rs:1593` | `log_samples` | S1, the extracted-field group key statement: a range `sum_over_time` or `avg_over_time` over `\| json … \| unwrap <n>` in one of the chains below, whose range equals its step (issue #507) |
+| `metric_range_unwrapped_rows` | `sql.rs:1656` | `log_samples` | L, the one read of the same queries, only after the raw read refused on one of four buffers the key statement does not allocate (issue #507) |
 | `probe` | `sql.rs:521` | `log_streams_idx` | only when the selector contains a regex matcher: a `count()` on one key's index prefix, to order the matchers cheapest-first |
 
 The three statements a plain log query produces, in order. Text from `sql.rs:482`, `:725` and `:776`;
@@ -253,14 +253,14 @@ missing    no value at the path, no spelling of it, the document is valid: dropp
 undecided  anything else
 ```
 
-**S1, the key statement** (`sql.rs:1571`), for
+**S1, the key statement** (`sql.rs:1593`), for
 `sum by (status) (sum_over_time({service_name="checkout"} | json | unwrap latency [1m]))` over two
 streams in one class, one hour, step 1m. The inner level's reader columns are elided here; the full
 text of this statement and of L below is committed in
 `crates/pulsus-read/tests/golden/unwrapped_statements.txt`:
 
 ```sql
--- emitted today, sql.rs:1571
+-- emitted today, sql.rs:1593
 SELECT toUInt64(0) AS class, <lo> + intDiv(timestamp_ns - <lo> + <step> - 1, <step>) * <step> AS bucket_ns,
        [(<status present>, <status value>)] AS keys,
        sumIf(ifNull(uw_x, 0), decided = 1) AS v, countIf(decided = 1) AS n_value,
@@ -325,13 +325,13 @@ S1 ─────────────┬── rows, folded ...............
                 └── 307 (the scan budget) .............................. 422, as today's route would answer
 ```
 
-**L, the one read** (`sql.rs:1634`). Its inner level is S1's with `body` added. It has no
+**L, the one read** (`sql.rs:1656`). Its inner level is S1's with `body` added. It has no
 `GROUP BY` and no throw: every row that is not missing is streamed, a decided row with its key labels
 and value and an undecided row with its body and stored metadata, which our parser reads as today's
 route would. Its outer level for the query above:
 
 ```sql
--- emitted today, sql.rs:1634
+-- emitted today, sql.rs:1656
 SELECT toUInt64(0) AS class, <bucket> AS bucket_ns, decided, [(<status present>, <status value>)] AS keys,
        if(decided = 1, ifNull(uw_x, 0), 0) AS v, if(decided = 1, '', body) AS body, fingerprint,
        if(decided = 1, '', structured_metadata) AS sm_text, <projected metadata> AS sm_kept
@@ -388,20 +388,20 @@ stages and collects the ones that become predicates on `body`. `has_unpushed_dro
 
 | stage as written | SQL emitted today | marking and source |
 |---|---|---|
-| `\|= "text"` | `body LIKE '%text%'` | *emitted today*, `logql/predicate.rs:947` via `escape.rs:93`. `%`, `_` and `\` inside the search text are escaped so they match themselves |
+| `\|= "text"` | `body LIKE '%text%'` | *emitted today*, `logql/predicate.rs:981` via `escape.rs:93`. `%`, `_` and `\` inside the search text are escaped so they match themselves |
 | `!= "text"` | `NOT (body LIKE '%text%')` | *emitted today*, `logql/predicate.rs:522` |
-| `\|~ "re"` | `match(body, 're')` | *emitted today*, `logql/predicate.rs:951`. Not anchored: a LogQL line filter searches for a substring |
+| `\|~ "re"` | `match(body, 're')` | *emitted today*, `logql/predicate.rs:985`. Not anchored: a LogQL line filter searches for a substring |
 | `!~ "re"` | `NOT (match(body, 're'))` | *emitted today*, `logql/predicate.rs:522` |
 | `\|= "a" or "b"` | `((body LIKE '%a%') OR (body LIKE '%b%'))` | *emitted today*, `logql/predicate.rs:501`. A filter with one value is not wrapped, so its text is unchanged |
 | `\|= ip("10.0.0.0/8")` | none | *evaluated after the read*. `is_pushable_line_filter` returns `false` (`plan.rs:3797`), the stage is skipped, and **the walk continues** — a later literal filter still compiles. What holds it back is pruning, not information — §5.1 |
-| `\| json` | none, except in the extracted-field group key | *evaluated after the read*. `metric_pipeline_construct` returns `"json"` (`plan.rs:1734`). **One exception, emitted today:** in a range `sum_over_time`/`avg_over_time` over one of the chains of §1.1's extracted-field group key, the unwrapped value and each key label are read by `JSONExtractRaw(body, '<name>')` inside `metric_range_unwrapped` (`sql.rs:1571`) and `metric_range_unwrapped_rows` (`sql.rs:1634`); the chain rule is `unwrapped_key_route` (`plan.rs:1810`) |
+| `\| json` | none, except in the extracted-field group key | *evaluated after the read*. `metric_pipeline_construct` returns `"json"` (`plan.rs:1734`). **One exception, emitted today:** in a range `sum_over_time`/`avg_over_time` over one of the chains of §1.1's extracted-field group key, the unwrapped value and each key label are read by `JSONExtractRaw(body, '<name>')` inside `metric_range_unwrapped` (`sql.rs:1593`) and `metric_range_unwrapped_rows` (`sql.rs:1656`); the chain rule is `unwrapped_key_route` (`plan.rs:1810`) |
 | `\| logfmt` | none | *evaluated after the read*, `plan.rs:1735` |
 | `\| regexp "…"` | none | *evaluated after the read*, `plan.rs:1736` |
 | `\| pattern "…"` | none | *evaluated after the read*, `plan.rs:1737` |
 | `\| level="error"` | none | *evaluated after the read*, `plan.rs:1743`. Also makes `has_unpushed_dropping_stage` return `true` (`plan.rs:1706`), which turns the read into a page loop |
 | `\| line_format "…"` | none | *evaluated after the read*, `plan.rs:1744`. **Ends the line-filter walk** (`plan.rs:3778`), so every line filter after it is evaluated after the read too |
 | `\| label_format k="…"` | none | *evaluated after the read*, `plan.rs:1745` |
-| `\| unwrap x` | none, except in the extracted-field group key | *evaluated after the read*, `plan.rs:1746`. In a bare log query it is a `400` — see part 6. **The same exception as `\| json`:** with no conversion, in those chains, it becomes the aggregate's argument `sumIf(ifNull(uw_x, 0), decided = 1)` over the rows the database decided (`sql.rs:1571`) |
+| `\| unwrap x` | none, except in the extracted-field group key | *evaluated after the read*, `plan.rs:1746`. In a bare log query it is a `400` — see part 6. **The same exception as `\| json`:** with no conversion, in those chains, it becomes the aggregate's argument `sumIf(ifNull(uw_x, 0), decided = 1)` over the rows the database decided (`sql.rs:1593`) |
 | `\| unpack` | none | *evaluated after the read*, `plan.rs:1747`. Ends the line-filter walk, `plan.rs:3778` |
 | `\| decolorize` | none | *evaluated after the read*, `plan.rs:1748`. Ends the line-filter walk, `plan.rs:3778` |
 | `\| drop a, b` | none | *evaluated after the read*, `plan.rs:1749` |
@@ -423,7 +423,7 @@ come from the request.
 | `count_over_time`, instant | `count()` | *emitted today*, `sql.rs:109`, through `metric_instant` (`sql.rs:1085`) |
 | `bytes_over_time`, instant | `sum(length(body))` | *emitted today*, `sql.rs:111` |
 | `count_over_time`, range | `count() AS n`, per grid point | *emitted today* when the range equals the step and no stage goes beyond a line filter — `metric_range_bucketed` (`sql.rs:1303`); `bytes_over_time`, `rate` and `bytes_rate` take the same statement. Otherwise *evaluated after the read* over the raw scan (`plan.rs:2398`) |
-| any `_over_time` with `\| unwrap` | `sumIf` over the converted value and `countIf` of the decided rows, for two reducers only | *emitted today* for `sum_over_time` and `avg_over_time` in the extracted-field group key — `metric_range_unwrapped` (`sql.rs:1571`); the reader divides for the average. Every other reducer, and every other chain, is *evaluated after the read*, `plan.rs:1746` |
+| any `_over_time` with `\| unwrap` | `sumIf` over the converted value and `countIf` of the decided rows, for two reducers only | *emitted today* for `sum_over_time` and `avg_over_time` in the extracted-field group key — `metric_range_unwrapped` (`sql.rs:1593`); the reader divides for the average. Every other reducer, and every other chain, is *evaluated after the read*, `plan.rs:1746` |
 | `absent_over_time` | none | *never becomes SQL*. The answer is a statement about rows that are **absent**, so there is no row to compute it from |
 | `sum by (level) (…)` | none | *evaluated after the read*. `has_grouping` forces the client path (`plan.rs:2399`) |
 | `topk(k, …)`, `bottomk(k, …)`, `approx_topk(k, …)`, `sort(…)`, `sort_desc(…)` | none | *evaluated after the read*. The planner records the chain on `MetricPlan::vector_aggs` (`plan.rs:365`) and nothing reads it when deciding what to lower — `bucketed_range` (`plan.rs:2545`) does not consult it — so no statement on any route carries the selection. `pulsus-server` applies it to the result the read produced: `post_agg.rs:1042` sends a matrix to `select_k_range` (`:807`), `post_agg.rs:1110` sends a vector to `select_k_instant` (`:858`), and `approx_topk` goes to `approx_topk_instant` (`post_agg.rs:983`). Applied at `exec.rs:1858` (the bucketed range read), `exec.rs:2285` (the client-aggregated range read, where the INNERMOST selection is folded at the leaf over the same rows instead — `client_agg.rs:2169`, `fold.rs:547`), `exec.rs:1770` (instant), `exec.rs:5534` (the extracted-field group-key read) and `exec.rs:2473` (a binary or `variants` tree). **One refusal:** `approx_topk` on a range query is a `400` at plan time, `count min sketches are only supported on instant queries` (`plan.rs:1534`). §2.8's LogQL56 carries the statement the range form issues |
@@ -2438,7 +2438,7 @@ so its pattern is unescaped — the contrast with LogQL1 is the point.
 {service_name="checkout"} |~ "CONN_REFUSED"
 ```
 
-**SQL today** — one statement, `sql.rs:774`. Not anchored, and **not** underscore-escaped: `_` is an ordinary character in a regular expression (`logql/predicate.rs:951`, `escape.rs:172-179`).
+**SQL today** — one statement, `sql.rs:774`. Not anchored, and **not** underscore-escaped: `_` is an ordinary character in a regular expression (`logql/predicate.rs:985`, `escape.rs:172-179`).
 
 ```sql
 SELECT fingerprint, timestamp_ns, body, structured_metadata
@@ -2499,7 +2499,7 @@ the exclusion directly. These two entries plus LogQL1's two are the whole four-e
 {service_name="checkout"} |= ""
 ```
 
-**SQL today** — one statement, `sql.rs:774`. `ch_like_contains("")` renders `'%%'`; the case is pinned at `logql/predicate.rs:1939`.
+**SQL today** — one statement, `sql.rs:774`. `ch_like_contains("")` renders `'%%'`; the case is pinned at `logql/predicate.rs:1973`.
 
 ```sql
 SELECT fingerprint, timestamp_ns, body, structured_metadata
@@ -3697,7 +3697,7 @@ The complement of LogQL41. The pair fixes both directions of the rule.
 {service_name="checkout"} |~ "("
 ```
 
-**SQL today** — none. The pattern is compiled **before any read**, at the point the predicate is built (`logql/predicate.rs:951` through `escape.rs:167-172`), so an uncompilable pattern is a `400` at planning time rather than a ClickHouse failure part-way through a query.
+**SQL today** — none. The pattern is compiled **before any read**, at the point the predicate is built (`logql/predicate.rs:985` through `escape.rs:167-172`), so an uncompilable pattern is a `400` at planning time rather than a ClickHouse failure part-way through a query.
 
 **SQL after this work** — unchanged, and this property is load-bearing for compiling more stages: every new predicate that carries a user pattern must validate at the same point.
 
@@ -5379,7 +5379,7 @@ engine will read, and what it will return:
 | LogQL stream count | 100,000 fingerprints | `logql/params.rs:121` |
 | LogQL byte scan budget | `reader.logql_scan_budget_bytes`, default 50 GiB | field at `pulsus-config/src/model.rs:510`, default at `:685`. Exhausting it returns the entries already kept, with `stats.pulsus_partial: true` |
 | LogQL per-query memory | `reader.logql_read_max_memory_bytes`, default 8 GiB | field at `model.rs:604`, default at `:699`; exceeding it is `422`. The setting refuses rather than writing intermediate state to disk |
-| LogQL result bytes | 1 GiB still held when the statement ends | `logql/charge.rs:1296`; refused `422`, never cut short |
+| LogQL result bytes | 1 GiB still held when the statement ends | `logql/charge.rs:1301`; refused `422`, never cut short |
 | LogQL over-fetch factor | `reader.logql_pipeline_scan_factor`, default 10 | field at `model.rs:532`, default at `:686`. Applies only while a stage that drops lines is evaluated after the read |
 | TraceQL candidates | `reader.traceql_max_candidates`, default 100,000 | field at `model.rs:544`, default at `:688`. Per first statement and for the merged set |
 | TraceQL batch size | 32 traces | `traces/exec.rs:126` |
@@ -5470,7 +5470,7 @@ cheaper than having the next reader find them.
 |---|---|---|
 | the 51 LogQL answers in part 4 | replayed against `grafana/loki:3.7.4`, digest `sha256:87f0a067…cfcc`, on 2026-09-01, over part 4.1's corpus; the run reproduced an earlier capture with **no differences** | only that the reference answers this way over **this** corpus. It says nothing about a corpus we did not write |
 | the corpus is exactly the 14 entries listed | the live instance was queried for each of the five streams and every line printed as hex before any answer was used | nothing — but note it caught a real problem: an earlier capture had been taken against a **different** corpus state, and one of its rows recorded a non-matching accented value that was a difference in how the accent was written, not a behaviour. That capture is discarded and is not in this document |
-| the escaped `LIKE` patterns in part 4 | computed by re-implementing `escape.rs:93-105` over `escape.rs:51-67` and printing the result for each value, rather than written by hand | that the re-implementation matches the Rust. It agrees with the five cases pinned at `logql/predicate.rs:1933-1940`, which is a check on five values, not on all of them |
+| the escaped `LIKE` patterns in part 4 | computed by re-implementing `escape.rs:93-105` over `escape.rs:51-67` and printing the result for each value, rather than written by hand | that the re-implementation matches the Rust. It agrees with the five cases pinned at `logql/predicate.rs:1967-1974`, which is a check on five values, not on all of them |
 | the `400` body of LogQL32 | the template at `logql/error.rs:816-819` was rendered with the captured values and compared to the captured body: **462 bytes each, identical** | that the template is reached for this query. That is read from `logql/error.rs:809-815`, not executed |
 | the committed corpus cannot distinguish the two colour-stripping behaviours | all 46 corpus files read as bytes; one line has escape bytes and it has four; 46 of 50 queries using the stage carry a later filter and all 46 load colour-free lines | it is a statement about the **committed** corpus at this commit. A row added tomorrow changes it, and nothing detects that |
 | every `file:line` in this document | each was printed with `sed -n "${n}p"` and read before being written down | that the line still says that after the next commit. There is no mechanism holding these citations true |

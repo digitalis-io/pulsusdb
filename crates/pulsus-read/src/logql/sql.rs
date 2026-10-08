@@ -1339,6 +1339,28 @@ pub fn metric_range_bucketed(
     Ok(sql)
 }
 
+/// The scan bounds and the emit grid one sliding range read is rendered
+/// from (issue #624).
+#[derive(Debug, Clone, Copy)]
+pub struct SlidingScan {
+    pub window: TimeWindow,
+    pub lower: ScanLowerBound,
+    pub grid_start_ns: i64,
+    pub step_ns: i64,
+    pub range_ns: i64,
+}
+
+/// The sliding range metric read (issue #624). Not yet implemented.
+pub fn metric_range_sliding(
+    _source: MetricSource<'_>,
+    _services: &[CheckedLiteral],
+    _fingerprints: &[FpLiteral],
+    _scan: SlidingScan,
+    _extra_predicates: &[CheckedFragment],
+) -> Result<String, super::predicate::BucketGridRefusal> {
+    Err(super::predicate::BucketGridRefusal::RollupSource)
+}
+
 /// Test-only knobs rendered into a group key statement (issue #507), so a
 /// live test can make the statement outlast a deadline and can choose WHICH
 /// deadline stops it.
@@ -3419,6 +3441,113 @@ mod tests {
             "anchoring on the scan start must render different text, or this test cannot see \
              the substitution it exists to catch"
         );
+    }
+
+    /// N1's statement (issue #624, §7.4 of its plan): count, one service, no
+    /// predicate, `[150s]` at a 60 s step over one hour.
+    const SLIDING_COUNT: &[&str] = &[
+        "SELECT fingerprint, toInt64(1700000000000000000 + k * 60000000000) AS bucket_ns, toUInt64(v) AS n, structured_metadata",
+        "FROM (",
+        "  SELECT fingerprint, structured_metadata, k0,",
+        "         sum(dv) OVER cum AS v, sum(dc) OVER cum AS p, leadInFrame(k0, 1, 61) OVER whole AS k1",
+        "  FROM (",
+        "    SELECT fingerprint, structured_metadata, d.1 AS k0, sum(d.2) AS dv, sum(d.3) AS dc",
+        "    FROM (",
+        "      SELECT fingerprint, structured_metadata,",
+        "             greatest(intDiv(timestamp_ns - 1699999820000000000 + 59999999999, 60000000000) - 3, 0) AS lo,",
+        "             least(intDiv(timestamp_ns - 1699999670000000000 + 59999999999, 60000000000) - 4, 60) AS hi,",
+        "             count() AS m, count() AS c",
+        "      FROM log_samples",
+        "      PREWHERE service = 'checkout'",
+        "      WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+        "        AND timestamp_ns > 1699999850000000000 AND timestamp_ns <= 1700003600000000000",
+        "      GROUP BY fingerprint, structured_metadata, lo, hi",
+        "      HAVING lo <= hi",
+        "    )",
+        "    ARRAY JOIN [(lo, toInt64(m), toInt64(c)), (hi + 1, -toInt64(m), -toInt64(c))] AS d",
+        "    GROUP BY fingerprint, structured_metadata, k0",
+        "  )",
+        "  WINDOW cum AS (PARTITION BY fingerprint, structured_metadata ORDER BY k0 ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),",
+        "         whole AS (PARTITION BY fingerprint, structured_metadata ORDER BY k0 ASC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)",
+        ")",
+        "ARRAY JOIN range(k0, least(k1, 61)) AS k",
+        "WHERE p > 0",
+    ];
+
+    const SLIDING_SCAN: SlidingScan = SlidingScan {
+        window: TimeWindow {
+            start_ns: 1_699_999_850_000_000_000,
+            end_ns: 1_700_003_600_000_000_000,
+        },
+        lower: ScanLowerBound::Exclusive,
+        grid_start_ns: 1_700_000_000_000_000_000,
+        step_ns: 60_000_000_000,
+        range_ns: 150_000_000_000,
+    };
+
+    /// N1 (issue #624): the sliding statement is byte-exact. The count form
+    /// is the frozen text; the bytes form differs only in its `m`; three
+    /// services and one pushed line filter render as the bucketed statement
+    /// renders them. Four statements, all distinct.
+    #[test]
+    fn metric_range_sliding_is_byte_exact() {
+        let f = W0Fixtures::new();
+        let render =
+            |shape: MetricShape, services: &[CheckedLiteral], predicates: &[CheckedFragment]| {
+                metric_range_sliding(
+                    MetricSource::new("log_samples", shape),
+                    services,
+                    &f.fingerprints,
+                    SLIDING_SCAN,
+                    predicates,
+                )
+                .expect("a renderable sliding statement")
+            };
+        let count = SLIDING_COUNT.join("\n");
+        let bytes = count.replace(
+            "             count() AS m, count() AS c",
+            "             sum(length(body)) AS m, count() AS c",
+        );
+        let three = count.replace(
+            "PREWHERE service = 'checkout'",
+            "PREWHERE service IN ('checkout', 'edge', 'ipcase')",
+        );
+        let with_predicate = count.replace(
+            "AND timestamp_ns <= 1700003600000000000\n",
+            "AND timestamp_ns <= 1700003600000000000\n        AND body LIKE '%CONN\\\\_REFUSED%'\n",
+        );
+        let cases = [
+            (
+                "count",
+                render(MetricShape::RawCount, &f.one_service, &f.no_predicate),
+                count,
+            ),
+            (
+                "bytes",
+                render(MetricShape::RawBytes, &f.one_service, &f.no_predicate),
+                bytes,
+            ),
+            (
+                "three services",
+                render(MetricShape::RawCount, &f.three_services, &f.no_predicate),
+                three,
+            ),
+            (
+                "one predicate",
+                render(MetricShape::RawCount, &f.one_service, &f.one_predicate),
+                with_predicate,
+            ),
+        ];
+        for (label, got, want) in &cases {
+            assert_eq!(
+                got, want,
+                "sliding statement ({label}) is not the frozen text"
+            );
+        }
+        let mut seen: Vec<&String> = cases.iter().map(|(_, got, _)| got).collect();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), cases.len(), "two rows render the same text");
     }
 
     /// W2 (issue #507): the three ways an anchored grid refuses, each with

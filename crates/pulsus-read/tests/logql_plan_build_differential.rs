@@ -309,36 +309,23 @@ fn both_return_bool_states_and_every_vector_matching_shape_are_planned() {
     }
 }
 
-/// Issues #241 and #507 — **every planned range leaf that is NOT a clean
-/// bucketed chain is client-aggregated, and a clean one is not.**
+/// Issues #241, #507 and #624 — **every planned range leaf that is NOT a
+/// clean counting chain is client-aggregated, and a clean one is not, at
+/// any range and step.**
 ///
-/// This said `every planned range leaf is client-aggregated` until #507,
-/// because `metric_plan` forced `client = Some(..)` for every
-/// `QuerySpec::Range`. W2 removes that for one shape — one of the four
-/// counting reducers, nothing in the pipeline beyond a pushable line
-/// filter, and a range equal to the step — and `exec.rs`'s range arm,
-/// which refused the state as unreachable, now serves it. A test still
-/// asserting the deleted invariant would be a green suite claiming the
-/// opposite of the behaviour, so it is restated rather than removed.
-///
-/// **Both halves run over the same corpus**, under two `step` values that
-/// differ in nothing else:
+/// #507 lowered one shape — one of the four counting reducers, nothing in
+/// the pipeline beyond a pushable line filter — at a range equal to the
+/// step; #624 lowers the same shape at every range and step. So the clean
+/// case is asserted at three steps against the corpus' `[5m]`:
 ///
 /// ```text
-///   step 60s, every range `[5m]`   range > step   nothing lowers
-///   step  5m, every range `[5m]`   range == step  the clean shapes lower
+///   step 60s    range > step    the sliding statement (issue #624)
+///   step  5m    range == step   #507's statement
+///   step 10m    range < step    the sliding statement (issue #624)
 /// ```
 ///
 /// The classifier is written here from the QUERY, not imported from the
 /// planner, so the two cannot agree by construction.
-///
-/// **The golden itself is untouched by #507, and that is luck.** Every
-/// range in `CORPUS` is `[5m]` against `range_params`' 60 s step, so no
-/// plan the golden records lowers and none of their `client` fields moved.
-/// A corpus row whose range equalled its step would move the golden and
-/// its digest, which `characterization_freeze.rs` refuses. The second half
-/// below carries its OWN params for exactly that reason — it must not be
-/// added to `CORPUS`.
 ///
 /// **Scope, so nobody reads this as the proof.** The PROOF is a total
 /// read of the only `MetricPlan` constructor: `git grep -n "MetricPlan {"
@@ -370,12 +357,6 @@ fn every_planned_range_leaf_that_is_not_a_clean_bucketed_chain_is_client_aggrega
         for mp in mps {
             leaves += 1;
             assert!(
-                mp.client.is_some(),
-                "`{query}` planned a RANGE leaf with `client: None` — the SQL-aggregated \
-                 range arm is removed as unreachable, so this plan now reaches an internal \
-                 refusal at execution (issue #241 / #257)"
-            );
-            assert!(
                 mp.step_ns.is_some(),
                 "`{query}` planned a range query with `step_ns: None` — the instant/range \
                  discriminant `run_metric_inner` branches on has moved"
@@ -388,21 +369,11 @@ fn every_planned_range_leaf_that_is_not_a_clean_bucketed_chain_is_client_aggrega
          pass here would prove nothing"
     );
 
-    // --- the clean case, asserted positively ------------------------
+    // --- the clean case, asserted positively, at three steps ---------
     //
-    // The same corpus at a step EQUAL to every range it contains. A leaf
-    // lowers exactly when its query names one of the four counting
+    // A leaf lowers exactly when its query names one of the four counting
     // reducers with nothing piped after the selector; the classifier is a
     // scan of the query text, so it shares no helper with the planner.
-    let bucketed_params = QueryParams {
-        spec: QuerySpec::Range {
-            start_ns: START_NS,
-            end_ns: END_NS,
-            step_ns: 300_000_000_000,
-        },
-        limit: 100,
-        direction: Direction::Backward,
-    };
     let clean_bucketed = |query: &str| {
         let reducers = [
             "count_over_time({",
@@ -418,49 +389,72 @@ fn every_planned_range_leaf_that_is_not_a_clean_bucketed_chain_is_client_aggrega
             && !query.contains('|')
             && !query.contains("variants(")
     };
-    let mut lowered = 0usize;
-    let mut client = 0usize;
-    for query in &all_queries() {
-        let expr = parse(query).unwrap_or_else(|e| panic!("{query}: {e}"));
-        let Ok(p) = plan(&expr, &bucketed_params, &c) else {
-            continue;
+    for (step_ns, reason) in [
+        (
+            60_000_000_000u64,
+            "raw: sliding range aggregation in the database (issue #624)",
+        ),
+        (
+            300_000_000_000,
+            "raw: bucketed range aggregation (issue #507)",
+        ),
+        (
+            600_000_000_000,
+            "raw: sliding range aggregation in the database (issue #624)",
+        ),
+    ] {
+        let step_params = QueryParams {
+            spec: QuerySpec::Range {
+                start_ns: START_NS,
+                end_ns: END_NS,
+                step_ns,
+            },
+            limit: 100,
+            direction: Direction::Backward,
         };
-        let mps: Vec<&pulsus_read::logql::MetricPlan> = match &p {
-            Plan::Streams(_) => Vec::new(),
-            Plan::Metric(mp) => vec![mp],
-            Plan::MetricBinary(node) => node.leaves(),
-        };
-        // A query holding several leaves can mix the two, so the
-        // classifier is applied to the WHOLE query only where it holds one.
-        if mps.len() != 1 {
-            continue;
-        }
-        for mp in mps {
-            if clean_bucketed(query) {
-                lowered += 1;
-                assert!(
-                    mp.client.is_none(),
-                    "`{query}` is a clean bucketed chain at a step equal to its range, so \
-                     its aggregation must lower into the statement (issue #507)"
-                );
-                assert_eq!(
-                    mp.routing.reason, "raw: bucketed range aggregation (issue #507)",
-                    "{query}"
-                );
-            } else {
-                client += 1;
-                assert!(
-                    mp.client.is_some(),
-                    "`{query}` is not a clean bucketed chain, so it must stay \
-                     client-aggregated (issues #241 / #507)"
-                );
+        let mut lowered = 0usize;
+        let mut client = 0usize;
+        for query in &all_queries() {
+            let expr = parse(query).unwrap_or_else(|e| panic!("{query}: {e}"));
+            let Ok(p) = plan(&expr, &step_params, &c) else {
+                continue;
+            };
+            let mps: Vec<&pulsus_read::logql::MetricPlan> = match &p {
+                Plan::Streams(_) => Vec::new(),
+                Plan::Metric(mp) => vec![mp],
+                Plan::MetricBinary(node) => node.leaves(),
+            };
+            // A query holding several leaves can mix the two, so the
+            // classifier is applied to the WHOLE query only where it holds
+            // one.
+            if mps.len() != 1 {
+                continue;
+            }
+            for mp in mps {
+                if clean_bucketed(query) {
+                    lowered += 1;
+                    assert!(
+                        mp.client.is_none(),
+                        "`{query}` at step {step_ns} is a clean counting chain, so its \
+                         aggregation must lower into the statement (issues #507 / #624)"
+                    );
+                    assert_eq!(mp.routing.reason, reason, "{query} at step {step_ns}");
+                } else {
+                    client += 1;
+                    assert!(
+                        mp.client.is_some(),
+                        "`{query}` at step {step_ns} is not a clean counting chain, so it \
+                         must stay client-aggregated (issues #241 / #507)"
+                    );
+                }
             }
         }
+        assert!(
+            lowered >= 4 && client >= 4,
+            "step {step_ns}: the positive half is vacuous: {lowered} lowered / {client} \
+             client-aggregated"
+        );
     }
-    assert!(
-        lowered >= 4 && client >= 4,
-        "the positive half is vacuous: {lowered} lowered / {client} client-aggregated"
-    );
 }
 
 /// `cargo test -p pulsus-read --test logql_plan_build_differential -- --ignored zz_regenerate`
