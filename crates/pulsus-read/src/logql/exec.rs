@@ -31,7 +31,8 @@ use pulsus_model::{Fingerprint, FpLiteral};
 
 use super::charge::{
     MAX_STREAMS_RESULT_BYTES, PUSHDOWN_INSTANT_SLOT, PUSHDOWN_RANGE_DENSE_SLOT,
-    StreamsResultBudget, charge_group_bytes, charge_result_points, group_entry_bytes,
+    PUSHDOWN_RANGE_POINT_SLOT, PUSHDOWN_RANGE_SLOT, StreamsResultBudget, charge_group_bytes,
+    charge_result_points, group_entry_bytes, map_entry_bytes,
 };
 use super::client_agg::check_surviving_error;
 use super::labels::render_series_labels;
@@ -1869,6 +1870,14 @@ impl LogQlEngine {
                         grid_points,
                     )
                     .with_parent_sum(parent_sum_of(mp));
+                    // #507's statement (range equal to step) keeps the
+                    // sparse charge it had; the sliding statement reserves a
+                    // grid per series, as today's sliding route does.
+                    let groups = if mp.step_ns.is_some_and(|s| s.get() == mp.range_ns.get()) {
+                        groups.with_sparse_points()
+                    } else {
+                        groups
+                    };
                     // Scoped: the row stream holds its pooled connection
                     // until dropped (the `ChRowStream` lease rule), and
                     // today's route issues another query after it.
@@ -5234,6 +5243,19 @@ impl PushdownInstantGroups {
     }
 }
 
+/// One output series' points in the bucketed fold.
+enum SeriesPoints {
+    /// One slot per grid point, `None` where no row arrived (issue #624):
+    /// the sliding statement, at a range unequal to the step.
+    Dense(Vec<Option<u64>>),
+    /// Only the grid points a row arrived at, each charged as it arrives
+    /// (issue #507): #507's statement, at a range equal to the step.
+    Sparse(HashMap<i64, u64>),
+}
+
+/// One output series of the bucketed fold: its labels and its points.
+type DenseSeries = (LabelSet, SeriesPoints);
+
 /// The bucketed range read's client-side fold (issue #507, W2).
 ///
 /// ```text
@@ -5263,16 +5285,19 @@ impl PushdownInstantGroups {
 /// reducers claim `Fidelity::Equivalent`: see
 /// `super::compile::RangeAggLower::fidelity`.
 ///
-/// **One dense slot vector per output series** (issue #624), one slot per
-/// grid point, `None` where no row arrived. A series is charged ONCE, when
-/// it is created: its label bytes against the label-byte cap, and its grid
-/// width against the result-point cap, the cap today's route applies to the
-/// same series × grid. A point costs nothing further, so the label-byte cap
-/// bounds labels only, as it does on every other path.
-/// One output series of the bucketed fold: its labels, and one slot per
-/// grid point (issue #624).
-type DenseSeries = (LabelSet, Vec<Option<u64>>);
-
+/// **Each series is charged as the route the query took before charged it**
+/// (issue #624, code review round 2):
+///
+/// - At a range unequal to the step (the sliding statement), one dense slot
+///   vector per output series, one slot per grid point, `None` where no row
+///   arrived. A series is charged ONCE, when it is created: its label bytes
+///   against the label-byte cap, and its grid width against the result-point
+///   cap — what today's sliding route reserves per series.
+/// - At a range equal to the step (#507's statement, [`Self::with_sparse_points`]),
+///   only the points that arrive, each charged against the label-byte cap as
+///   it arrives — what this fold charged before. A reducing aggregation over
+///   many sparse series then fits as it did, where a grid per series would
+///   not.
 pub(in crate::logql) struct PushdownRangeGroups {
     /// Each resolved stream's base label set, snapshotted ONCE — one
     /// fingerprint returns up to (grid points x metadata variants) rows.
@@ -5290,8 +5315,10 @@ pub(in crate::logql) struct PushdownRangeGroups {
     /// Query-lifetime bytes, never discharged: the groups ARE the result
     /// (the `PushdownInstantGroups` precedent).
     charged: u64,
-    /// Result points reserved: `grid_points` per series (issue #624).
+    /// Result points reserved: `grid_points` per dense series (issue #624).
     points: u64,
+    /// Whether series keep their points sparsely (range equal to step).
+    sparse: bool,
     caps: AggCaps,
     merge_buf: Vec<(String, String)>,
     sm_buf: Vec<(String, String)>,
@@ -5318,6 +5345,7 @@ impl PushdownRangeGroups {
             grid_points,
             charged: 0,
             points: 0,
+            sparse: false,
             caps,
             merge_buf: Vec::new(),
             sm_buf: Vec::new(),
@@ -5332,9 +5360,11 @@ impl PushdownRangeGroups {
         self
     }
 
-    /// Keeps each series' points sparsely (issue #624, code review round 2).
-    /// Not yet implemented.
-    pub(in crate::logql) fn with_sparse_points(self) -> Self {
+    /// Keeps each series' points sparsely and charges each as it arrives
+    /// (issue #624, code review round 2) — for #507's statement, at a range
+    /// equal to the step, where that is how the fold charged before.
+    pub(in crate::logql) fn with_sparse_points(mut self) -> Self {
+        self.sparse = true;
         self
     }
 
@@ -5392,8 +5422,14 @@ impl PushdownRangeGroups {
         check_surviving_error(&labels)?;
         let key = render_series_labels(&labels);
         let slot = self.slot_of(row.bucket_ns)?;
+        if self.sparse {
+            return self.push_sparse(key, labels, row);
+        }
         let slots = match self.groups.entry(key) {
-            std::collections::hash_map::Entry::Occupied(e) => &mut e.into_mut().1,
+            std::collections::hash_map::Entry::Occupied(e) => match &mut e.into_mut().1 {
+                SeriesPoints::Dense(slots) => slots,
+                SeriesPoints::Sparse(_) => return Err(range_fold_off_grid(row.bucket_ns)),
+            },
             std::collections::hash_map::Entry::Vacant(e) => {
                 // Both charges before the allocation, so a refused series
                 // is never retained.
@@ -5405,13 +5441,56 @@ impl PushdownRangeGroups {
                 charge_result_points(&mut self.points, self.grid_points, self.caps.result_points)?;
                 let width = usize::try_from(self.grid_points)
                     .map_err(|_| range_fold_off_grid(row.bucket_ns))?;
-                &mut e.insert((labels, vec![None; width])).1
+                match &mut e.insert((labels, SeriesPoints::Dense(vec![None; width]))).1 {
+                    SeriesPoints::Dense(slots) => slots,
+                    SeriesPoints::Sparse(_) => return Err(range_fold_off_grid(row.bucket_ns)),
+                }
             }
         };
         let cell = slots
             .get_mut(slot)
             .ok_or_else(|| range_fold_off_grid(row.bucket_ns))?;
         *cell = Some(cell.unwrap_or(0).saturating_add(row.n));
+        Ok(())
+    }
+
+    /// The sparse fold (issue #507): a series is charged its entry when it is
+    /// created, and each grid point its map entry when it first arrives,
+    /// both against the label-byte cap and before the insertion.
+    fn push_sparse(
+        &mut self,
+        key: String,
+        labels: LabelSet,
+        row: &MetricRangeBucketRow,
+    ) -> Result<(), ReadError> {
+        match self.groups.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                let SeriesPoints::Sparse(points) = &mut e.get_mut().1 else {
+                    return Err(range_fold_off_grid(row.bucket_ns));
+                };
+                match points.entry(row.bucket_ns) {
+                    std::collections::hash_map::Entry::Occupied(mut p) => {
+                        *p.get_mut() = p.get().saturating_add(row.n);
+                    }
+                    std::collections::hash_map::Entry::Vacant(p) => {
+                        charge_group_bytes(
+                            &mut self.charged,
+                            map_entry_bytes(PUSHDOWN_RANGE_POINT_SLOT),
+                            self.caps.group_bytes,
+                        )?;
+                        p.insert(row.n);
+                    }
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let cost = group_entry_bytes(e.key(), &labels, PUSHDOWN_RANGE_SLOT)
+                    .saturating_add(map_entry_bytes(PUSHDOWN_RANGE_POINT_SLOT));
+                charge_group_bytes(&mut self.charged, cost, self.caps.group_bytes)?;
+                let mut points = HashMap::new();
+                points.insert(row.bucket_ns, row.n);
+                e.insert((labels, SeriesPoints::Sparse(points)));
+            }
+        }
         Ok(())
     }
 
@@ -5451,16 +5530,27 @@ impl PushdownRangeGroups {
         // Each series' slots are consumed by its own iteration, so they are
         // freed before the next series' points are built.
         out.into_iter()
-            .map(|(_, (labels, slots))| {
-                let points = slots
-                    .into_iter()
-                    .enumerate()
-                    .filter_map(|(k, n)| {
-                        let n = n?;
-                        let ts = grid_start_ns.saturating_add((k as i64).saturating_mul(step_ns));
-                        Some((ts, apply_rate(n as f64, rate_window_ns)))
-                    })
-                    .collect();
+            .map(|(_, (labels, points))| {
+                let points = match points {
+                    SeriesPoints::Dense(slots) => slots
+                        .into_iter()
+                        .enumerate()
+                        .filter_map(|(k, n)| {
+                            let n = n?;
+                            let ts =
+                                grid_start_ns.saturating_add((k as i64).saturating_mul(step_ns));
+                            Some((ts, apply_rate(n as f64, rate_window_ns)))
+                        })
+                        .collect(),
+                    SeriesPoints::Sparse(points) => {
+                        let mut points: Vec<(i64, f64)> = points
+                            .into_iter()
+                            .map(|(ts, n)| (ts, apply_rate(n as f64, rate_window_ns)))
+                            .collect();
+                        points.sort_by_key(|(ts, _)| *ts);
+                        points
+                    }
+                };
                 MatrixSeries { labels, points }
             })
             .collect()

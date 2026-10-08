@@ -711,7 +711,8 @@ pub(in crate::logql) const PUSHDOWN_RANGE_POINT_SLOT: usize =
 /// wider than the point slot that counter prices (asserted below).
 ///
 /// [`PUSHDOWN_RANGE_SLOT`] and [`PUSHDOWN_RANGE_POINT_SLOT`] stay for the
-/// unwrapped fold, which still charges per point.
+/// unwrapped fold and for the bucketed fold's sparse arm at a range equal to
+/// the step, both of which charge per point.
 pub(in crate::logql) const PUSHDOWN_RANGE_DENSE_SLOT: usize =
     size_of::<(String, (LabelSet, Vec<Option<u64>>))>() + size_of::<MatrixSeries>();
 
@@ -2541,15 +2542,17 @@ mod tests {
             // `LEAF_COUNTERS.group_bytes` stays 2 and
             // `MAX_LEAF_RETAINED_BYTES` is unmoved.
             // Issue #507 (W2): `PushdownRangeGroups::charged`, the
-            // SQL-pushdown BUCKETED RANGE path's re-grouping map — since
-            // issue #624 charged once per series, at its creation. A
+            // SQL-pushdown BUCKETED RANGE path's re-grouping map (x3: the
+            // dense series arm of issue #624, and the sparse arm's series and
+            // grid-point charges at a range equal to the step, which charge
+            // the same counter in the same units). A
             // further XOR arm of the same cap for the same reason: it runs
             // only when `client == None` AND `step_ns.is_some()`, which
             // excludes the instant pushdown arm above it as well as both
             // `MetricAggState` arms and the variants path. So
             // `LEAF_COUNTERS.group_bytes` stays 2 and
             // `MAX_LEAF_RETAINED_BYTES` is unmoved.
-            ("exec.rs", "charge_group_bytes", "&mut self.charged", 2),
+            ("exec.rs", "charge_group_bytes", "&mut self.charged", 4),
             // Issue #624: `PushdownRangeGroups::points`, the bucketed range
             // path's dense slots, one grid's width per series. A further XOR
             // arm of `MAX_METRIC_RESULT_POINTS`: it runs only when
@@ -2701,12 +2704,13 @@ mod tests {
             // use, so a query's refusal surface does not depend on how it
             // routed. XOR with both `MetricAggState` arms (see
             // `CounterPlurality`), so the composed bound is unmoved.
-            // Issue #624: the bucketed range fold reads it once, at a new
-            // series, where it read it twice before (series and point).
+            // Issue #624: the bucketed range fold reads it three times — at a
+            // new dense series, and at a new sparse series and a new sparse
+            // grid point when the range equals the step.
             (
                 "exec.rs",
                 "group_bytes",
-                2,
+                4,
                 "PushdownInstantGroups::charged | PushdownRangeGroups::charged",
             ),
             // Issue #624: the bucketed range fold's dense slots, one grid's
