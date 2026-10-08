@@ -44,7 +44,14 @@ services:
       CLICKHOUSE_SERVER: "172.28.0.11" # ch-shard1's static ipv4_address
       PULSUS_CLUSTER: pulsus_test_cluster
       PULSUS_RETENTION_DAYS: "7"
-    depends_on: [ ch-shard1, ch-shard2 ]
+    # Healthy, not merely started: every statement carries `ON CLUSTER`,
+    # which needs Keeper serving. Waiting only for the shards to start
+    # failed with curl's exit 22; `schema-it-cluster` runs the same script
+    # after the same health checks and does not.
+    depends_on:
+      keeper: { condition: service_healthy }
+      ch-shard1: { condition: service_healthy }
+      ch-shard2: { condition: service_healthy }
 
   pulsusdb:
     build:
