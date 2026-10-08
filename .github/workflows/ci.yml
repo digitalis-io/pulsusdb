@@ -231,8 +231,8 @@ jobs:
   #
   # It began as step 3 of `ci`, which was wrong twice over. Its failure
   # skipped every later step, so a re-pin PR got no fmt, no clippy and no
-  # tests; and because every other job declares `needs: ci`, a red `ci`
-  # also skipped the four e2e/schema jobs. A PR touching the baseline
+  # tests; and because every other job then declared `needs: ci`, a red
+  # `ci` also skipped the four e2e/schema jobs. A PR touching the baseline
   # therefore lost its ENTIRE signal — and the downstream
   # `no such command: nextest` errors read as infrastructure noise rather
   # than as this gate firing on exactly the change it was built to catch.
@@ -2524,7 +2524,6 @@ jobs:
   # `_dist` write/read-back, and the live sharding-identity assertion
   # (docs/schemas.md §7). Fixture at ci/clickhouse-cluster/compose.yaml.
   schema-it-cluster:
-    needs: ci
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -2715,7 +2714,6 @@ jobs:
   # (`PULSUS_E2E_METRICS_SCALE` defaults to `ci` — `e2e/src/metrics.rs`);
   # the ~10k `full` tier is `e2e-metrics-full` below.
   e2e-single:
-    needs: ci
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -2757,7 +2755,6 @@ jobs:
           if-no-files-found: ignore
 
   e2e-cluster:
-    needs: ci
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
