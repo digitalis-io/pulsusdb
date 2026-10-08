@@ -185,7 +185,7 @@ fn the_inventory_is_complete_and_exact() {
             sides.get("old").copied().unwrap_or(0),
             sides.get("refused").copied().unwrap_or(0)
         ),
-        (96, 42, 3),
+        (106, 32, 3),
         "new, old and refused"
     );
 }

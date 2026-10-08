@@ -7378,7 +7378,7 @@ async fn search_routed_answers_as_today_on_fixture_c() {
         drop_db(&db).await;
     }
     eprintln!("and {fixture_cases} fixture cases");
-    assert_eq!(names.len(), 96, "the inventory's new rows");
+    assert_eq!(names.len(), 106, "the inventory's new rows");
     assert!(
         wrong.is_empty(),
         "{} of {} differ:\n\n{}",
@@ -9328,6 +9328,305 @@ async fn an_off_path_value_at_any_scope_is_answered_as_today() {
         };
         if got != *route {
             wrong.push(format!("{query}: {got:?} ({n} statements), want {route:?}"));
+        }
+    }
+    drop_db(&db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+// ---------------------------------------------------------------------
+// Issue #593 part 1 — `>`, `<`, `~`, plain, `!` and `&`
+// ---------------------------------------------------------------------
+
+/// `(query, literal answer)`: [`answer_of`]'s form, `limit = 20`,
+/// `spss = 20`, one statement each.
+type StructuralCase = (&'static str, &'static str);
+
+/// Runs `cases` over `bodies` (`spans` of them) landed in both stores:
+/// each must be covered, equal today's answer and its literal, and be one
+/// statement.
+async fn check_structural(
+    label: &str,
+    bodies: &[ExportTraceServiceRequest],
+    spans: u64,
+    base_ns: i64,
+    cases: &[StructuralCase],
+) {
+    let (db, client) = seed_both(
+        pulsus_testkit::test_db(&format!("pulsus_read_it_t593p1_{label}")),
+        bodies,
+        spans,
+        &format!("t593p1-{label}"),
+    )
+    .await;
+    let engine = engine_of(&db).await;
+    let mut wrong = Vec::new();
+    for (query, literal) in cases {
+        let plan = plan_of(
+            &engine,
+            &parse_query(query),
+            (base_ns, base_ns + 60_000_000_000),
+            20,
+            20,
+        );
+        if !covered(&plan) {
+            wrong.push(format!(
+                "{query}: today's engine's, must be the statement's"
+            ));
+            continue;
+        }
+        let (today, routed, n) = routed_and_today(&engine, &client, &db, &plan).await;
+        if format!("{today:?}") != format!("{routed:?}") {
+            wrong.push(format!(
+                "{query}\n  today:  {}\n  routed: {}",
+                answer_of(&today),
+                answer_of(&routed)
+            ));
+        } else if answer_of(&routed) != *literal {
+            wrong.push(format!(
+                "{query}\n  literal: {literal}\n  both:    {}",
+                answer_of(&routed)
+            ));
+        }
+        if n != 1 {
+            wrong.push(format!("{query}: {n} statements, want 1"));
+        }
+    }
+    drop_db(&db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// `T-A9`, the nine non-transitive forms on the §6.1 fixture: A is
+/// `checkout` (`03`, `04`), B is `payment` (`05` under `04`, `06` under
+/// `05`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_a9_the_nine_non_transitive_forms() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    check_structural("ta9", &fixture_61_bodies(base_ns), 9, base_ns, &[
+        (r#"{ resource.service.name = "checkout" } > { resource.service.name = "payment" }"#, "11 1 [05]"),
+        (r#"{ resource.service.name = "checkout" } !> { resource.service.name = "payment" }"#, "11 1 [06]"),
+        (r#"{ resource.service.name = "checkout" } &> { resource.service.name = "payment" }"#, "11 2 [04, 05]"),
+        (r#"{ resource.service.name = "checkout" } < { resource.service.name = "payment" }"#, ""),
+        (r#"{ resource.service.name = "checkout" } !< { resource.service.name = "payment" }"#, "11 2 [05, 06]"),
+        (r#"{ resource.service.name = "checkout" } &< { resource.service.name = "payment" }"#, ""),
+        (r#"{ resource.service.name = "checkout" } ~ { resource.service.name = "payment" }"#, ""),
+        (r#"{ resource.service.name = "checkout" } !~ { resource.service.name = "payment" }"#, "11 2 [05, 06]"),
+        (r#"{ resource.service.name = "checkout" } &~ { resource.service.name = "payment" }"#, ""),
+    ]).await;
+}
+
+/// Fixture E's `ee06` (`P → A2 → B1 → A1` beside `P → P2 → {A3, B2}`)
+/// and `ee07` (three `payment` spans, the root an error, no `frontend`).
+fn edge_bodies(base_ns: i64) -> Vec<ExportTraceServiceRequest> {
+    const S: i64 = 1_000_000_000;
+    let sp = |t: u8, n: u8, parent: u8, name: &str, at: i64, status: i32| {
+        span_of(
+            vec![t; 16],
+            span_id_bytes(n),
+            if parent == 0 {
+                Vec::new()
+            } else {
+                span_id_bytes(parent)
+            },
+            name,
+            2,
+            base_ns + at * S,
+            S,
+            Vec::new(),
+            status,
+            Vec::new(),
+            Vec::new(),
+        )
+    };
+    vec![
+        by_body(
+            "gateway",
+            vec![sp(0xe6, 1, 0, "P", 0, 0), sp(0xe6, 5, 1, "P2", 1, 0)],
+        ),
+        by_body(
+            "frontend",
+            vec![
+                sp(0xe6, 2, 1, "A2", 1, 0),
+                sp(0xe6, 4, 3, "A1", 3, 0),
+                sp(0xe6, 6, 5, "A3", 2, 0),
+            ],
+        ),
+        by_body(
+            "payment",
+            vec![
+                sp(0xe6, 3, 2, "B1", 2, 2),
+                sp(0xe6, 7, 5, "B2", 3, 2),
+                sp(0xe7, 1, 0, "checkout", 4, 2),
+                sp(0xe7, 2, 1, "checkout", 5, 0),
+                sp(0xe7, 3, 1, "checkout", 6, 0),
+            ],
+        ),
+    ]
+}
+
+/// `T-A9b` and the trace with no A span: A is `frontend`, B `payment`
+/// with an error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_a9b_the_union_partners_and_a_trace_with_no_a_span() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    check_structural("edge", &edge_bodies(base_ns), 10, base_ns, &[
+        (r#"{ resource.service.name = "frontend" } > { resource.service.name = "payment" && status = error }"#, "e6 1 [03]"),
+        (r#"{ resource.service.name = "frontend" } < { resource.service.name = "payment" && status = error }"#, "e6 1 [03]"),
+        (r#"{ resource.service.name = "frontend" } ~ { resource.service.name = "payment" && status = error }"#, "e6 1 [07]"),
+        (r#"{ resource.service.name = "frontend" } &> { resource.service.name = "payment" && status = error }"#, "e6 2 [02, 03]"),
+        (r#"{ resource.service.name = "frontend" } &< { resource.service.name = "payment" && status = error }"#, "e6 2 [03, 04]"),
+        (r#"{ resource.service.name = "frontend" } &~ { resource.service.name = "payment" && status = error }"#, "e6 2 [06, 07]"),
+        (r#"{ resource.service.name = "frontend" } !> { resource.service.name = "payment" && status = error }"#, "e7 1 [01]; e6 1 [07]"),
+        (r#"{ resource.service.name = "frontend" } !< { resource.service.name = "payment" && status = error }"#, "e7 1 [01]; e6 1 [07]"),
+        (r#"{ resource.service.name = "frontend" } !~ { resource.service.name = "payment" && status = error }"#, "e7 1 [01]; e6 1 [03]"),
+    ]).await;
+}
+
+/// The rule fixture: A is `{ span.a = true }`, B `{ span.b = true }`, C
+/// `{ span.c = true }`; one trace per rule. Starts are seconds after
+/// `base_ns`; `34` starts 30 s before it, outside the window.
+fn rule_bodies(base_ns: i64) -> Vec<ExportTraceServiceRequest> {
+    const S: i64 = 1_000_000_000;
+    let sp = |t: u8, n: u8, parent: Vec<u8>, at: i64, keys: &[&str]| {
+        span_of(
+            vec![t; 16],
+            span_id_bytes(n),
+            parent,
+            "op",
+            2,
+            base_ns + at * S,
+            S / 10,
+            keys.iter().map(|k| kv(k, bool_value(true))).collect(),
+            0,
+            Vec::new(),
+            Vec::new(),
+        )
+    };
+    let p = span_id_bytes;
+    let root = Vec::new;
+    vec![by_body(
+        "svc",
+        vec![
+            // r1: roots and the per-pair self-exclusion.
+            sp(0x31, 0x01, root(), 1, &["a"]),
+            sp(0x31, 0x02, p(0x01), 2, &["a", "b"]),
+            sp(0x31, 0x03, p(0x02), 3, &["b"]),
+            sp(0x31, 0x04, root(), 4, &["b"]),
+            // r2: a span on both sides with one other A sibling.
+            sp(0x32, 0x11, root(), 10, &[]),
+            sp(0x32, 0x12, p(0x11), 11, &["a", "b"]),
+            sp(0x32, 0x13, p(0x11), 12, &["a"]),
+            // r3: a span that is its own parent, on both sides, beside a root.
+            sp(0x33, 0x20, root(), 5, &[]),
+            sp(0x33, 0x21, p(0x21), 6, &["a", "b"]),
+            // r4: an orphan, and a parent outside the window.
+            sp(0x34, 0x31, root(), 20, &["a"]),
+            sp(0x34, 0x32, vec![0xff; 8], 21, &["b"]),
+            sp(0x34, 0x34, root(), -30, &["a"]),
+            sp(0x34, 0x33, p(0x34), 22, &["b"]),
+            // r5: composite operands.
+            sp(0x35, 0x51, root(), 30, &["a"]),
+            sp(0x35, 0x52, p(0x51), 31, &["b"]),
+            sp(0x35, 0x53, p(0x52), 32, &["c"]),
+            sp(0x35, 0x54, p(0x51), 33, &["c"]),
+            // r6: an `&&` operand with an empty side.
+            sp(0x36, 0x61, root(), 40, &["a"]),
+            sp(0x36, 0x62, p(0x61), 41, &["b"]),
+            // r7: a span whose id is all zero, beside a root.
+            sp(0x37, 0x00, root(), 50, &["a", "b"]),
+            sp(0x37, 0x71, root(), 51, &["a", "b"]),
+            // r8: a span holding `x` as a string, which `!span.x` refuses.
+            span_of(
+                vec![0x38; 16],
+                span_id_bytes(0x81),
+                Vec::new(),
+                "op",
+                2,
+                base_ns + 55 * S,
+                S / 10,
+                vec![kv("x", str_value("s"))],
+                0,
+                Vec::new(),
+                Vec::new(),
+            ),
+        ],
+    )]
+}
+
+/// Today's relation rules, one trace each, and the composed operands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_structural_operator_answers_as_today() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    check_structural("rules", &rule_bodies(base_ns), 22, base_ns, &[
+        ("{ span.a = true } > { span.b = true }", "36 1 [62]; 35 1 [52]; 31 2 [02, 03]"),
+        ("{ span.a = true } !> { span.b = true }", "37 2 [00, 71]; 34 2 [32, 33]; 32 1 [12]; 33 1 [21]; 31 1 [04]"),
+        ("{ span.a = true } &> { span.b = true }", "36 2 [61, 62]; 35 2 [51, 52]; 31 3 [01, 02, 03]"),
+        ("{ span.a = true } < { span.b = true }", ""),
+        ("{ span.a = true } !< { span.b = true }", "37 2 [00, 71]; 36 1 [62]; 35 1 [52]; 34 2 [32, 33]; 32 1 [12]; 33 1 [21]; 31 3 [02, 03, 04]"),
+        ("{ span.a = true } &< { span.b = true }", ""),
+        ("{ span.a = true } ~ { span.b = true }", "32 1 [12]"),
+        ("{ span.a = true } !~ { span.b = true }", "37 2 [00, 71]; 36 1 [62]; 35 1 [52]; 34 2 [32, 33]; 33 1 [21]; 31 3 [02, 03, 04]"),
+        ("{ span.a = true } &~ { span.b = true }", "32 2 [12, 13]"),
+        ("{ span.a = true } > { span.b = true } > { span.c = true }", "35 1 [53]"),
+        ("({ span.a = true } && { span.c = true }) > { span.b = true }", "35 1 [52]"),
+        ("({ span.a = true } || { span.c = true }) > { span.b = true }", "36 1 [62]; 35 1 [52]; 31 2 [02, 03]"),
+        ("{ span.a = true } > ({ span.b = true } || { span.c = true })", "36 1 [62]; 35 2 [52, 54]; 31 2 [02, 03]"),
+        ("({ span.a = true } > { span.b = true }) && { span.c = true }", "35 3 [52, 53, 54]"),
+        ("({ span.a = true } > { span.b = true }) || { span.c = true }", "36 1 [62]; 35 3 [52, 53, 54]; 31 2 [02, 03]"),
+        ("({ span.a = true } && { span.c = true }) !> { span.b = true }", "37 2 [00, 71]; 36 1 [62]; 34 2 [32, 33]; 32 1 [12]; 33 1 [21]; 31 3 [02, 03, 04]"),
+        ("{ span.a = true } > { span.b = true } | count() > 1", "31 2 [02, 03]"),
+        ("{ span.a = true } > { span.b = true } | { span.a = true }", "31 1 [02]"),
+        ("{ span.a = true } > { span.b = true } | select(span.c)", "36 1 [62]; 35 1 [52]; 31 2 [02, 03]"),
+    ]).await;
+}
+
+/// A condition the database cannot answer (`!span.x` over a string) under
+/// each relation: the statement raises its demand, the fork hands the
+/// request to today's engine, and both answer the same `PipelineInvalid`,
+/// which the route renders `400` (`traces_api/error.rs`). Only today's
+/// engine raises that variant; the statement's own error is a `Code: 395`
+/// server error, a `500`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_condition_under_a_relation_answers_as_today() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let (db, _client) = seed_both(
+        pulsus_testkit::test_db("pulsus_read_it_t593p1_demand"),
+        &rule_bodies(base_ns),
+        22,
+        "t593p1-demand",
+    )
+    .await;
+    let engine = engine_of(&db).await;
+    let mut wrong = Vec::new();
+    for query in [
+        "{ !span.x } > { span.b = true }",
+        "{ span.a = true } < { !span.x }",
+        "{ !span.x } ~ { span.b = true }",
+    ] {
+        let plan = plan_of(
+            &engine,
+            &parse_query(query),
+            (base_ns, base_ns + 60_000_000_000),
+            20,
+            20,
+        );
+        if !covered(&plan) {
+            wrong.push(format!(
+                "{query}: today's engine's, must be the statement's"
+            ));
+            continue;
+        }
+        let routed = engine.search_routed(&plan).await.map(normalise_today);
+        let today = engine.search(&plan).await.map(normalise_today);
+        let want = "Err(PipelineInvalid { reason: \"expression (!span.x) expected a boolean\" })";
+        if format!("{today:?}") != format!("{routed:?}") || format!("{routed:?}") != want {
+            wrong.push(format!(
+                "{query}\n  want:   {want}\n  today:  {today:?}\n  routed: {routed:?}"
+            ));
         }
     }
     drop_db(&db).await;
