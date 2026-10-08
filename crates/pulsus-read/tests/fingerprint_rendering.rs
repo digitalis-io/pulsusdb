@@ -197,7 +197,7 @@ fn site_4_render_fingerprint_list_renders_the_exact_call_form() {
     let rendered = sample_sql::render_fingerprint_list(&literals());
     assert_every_boundary_value_is_an_exact_call("render_fingerprint_list", &rendered);
     // And the statement that embeds it, so the list reaches SQL whole.
-    let sql = sample_sql::sample_fetch("metric_samples", &literals(), 0, 100);
+    let sql = sample_sql::sample_fetch(&no_tenant(), "metric_samples", &literals(), 0, 100);
     assert_every_boundary_value_is_an_exact_call("sample_fetch", &sql);
 }
 
@@ -205,6 +205,7 @@ fn site_4_render_fingerprint_list_renders_the_exact_call_form() {
 #[test]
 fn site_5_series_labels_by_fingerprint_renders_the_exact_call_form() {
     let sql = metrics_sql::series_labels_by_fingerprint(
+        &no_tenant(),
         "metric_labels",
         &["up".to_string()],
         &literals(),
@@ -216,6 +217,7 @@ fn site_5_series_labels_by_fingerprint_renders_the_exact_call_form() {
 #[test]
 fn site_6_discovery_fetch_multi_renders_the_exact_call_form() {
     let sql = metrics_sql::discovery_fetch_multi(
+        &no_tenant(),
         "metric_series",
         "metric_labels",
         &["up".to_string()],
@@ -227,4 +229,10 @@ fn site_6_discovery_fetch_multi_renders_the_exact_call_form() {
     );
     assert_every_boundary_value_is_an_exact_call("discovery_fetch_multi", &sql);
     let _ = DiscoveryFilter::default();
+}
+
+/// The single-tenant deployment's tenant: no `X-Scope-OrgID`.
+#[allow(dead_code)]
+fn no_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("no header is the empty tenant")
 }

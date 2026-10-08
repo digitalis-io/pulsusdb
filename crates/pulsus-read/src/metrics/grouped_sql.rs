@@ -78,7 +78,7 @@
 //! and no `by`/`without` list is rendered, so the three grouping forms
 //! produce **byte-identical text** outside the `gids` array.
 
-use pulsus_model::FpLiteral;
+use pulsus_model::{FpLiteral, Tenant};
 
 use super::grouped::{Grid, GroupedOp, PushedRangeFn, RangeAggOp};
 use super::sample_sql;
@@ -119,6 +119,7 @@ const STALE_NAN_DECIMAL: u64 = 9_218_868_437_227_405_314;
 /// text that test writes out itself.
 #[allow(clippy::too_many_arguments)]
 pub fn grouped_fetch(
+    tenant: &Tenant,
     samples_table: &str,
     hist_samples_table: &str,
     fps: &[FpLiteral],
@@ -128,6 +129,7 @@ pub fn grouped_fetch(
     upper_incl_ms: i64,
     op: GroupedOp,
 ) -> String {
+    let _ = tenant;
     let window = sample_sql::window_predicate(lower_excl_ms, upper_incl_ms);
     let fp_list = sample_sql::render_fingerprint_list(fps);
     let gid_list = gids
@@ -260,6 +262,7 @@ pub fn grouped_fetch(
 /// ([`super::grouped::node_verdicts`] owns that guard).
 #[allow(clippy::too_many_arguments)]
 pub fn range_aggregate_fetch(
+    tenant: &Tenant,
     samples_table: &str,
     hist_samples_table: &str,
     fps: &[FpLiteral],
@@ -270,6 +273,7 @@ pub fn range_aggregate_fetch(
     func: PushedRangeFn,
 ) -> String {
     let (lower_excl_ms, upper_incl_ms) = range_window(grid, range_ms);
+    let _ = tenant;
     let window = sample_sql::window_predicate(lower_excl_ms, upper_incl_ms);
     let fp_list = sample_sql::render_fingerprint_list(fps);
     let gid_list = gids
@@ -482,6 +486,11 @@ mod tests {
     use super::*;
     use pulsus_model::Fingerprint;
 
+    /// The single-tenant deployment's tenant: no `X-Scope-OrgID`.
+    fn no_tenant() -> Tenant {
+        Tenant::from_header(None, false).expect("no header is the empty tenant")
+    }
+
     fn grid() -> Grid {
         Grid {
             start_ms: 1_782_907_200_000,
@@ -493,6 +502,7 @@ mod tests {
 
     fn sql(op: GroupedOp) -> String {
         grouped_fetch(
+            &no_tenant(),
             "metric_samples",
             "metric_hist_samples",
             &[
@@ -629,6 +639,7 @@ mod tests {
     #[test]
     fn only_the_gids_array_carries_the_grouping() {
         let a = grouped_fetch(
+            &no_tenant(),
             "metric_samples",
             "metric_hist_samples",
             &[
@@ -642,6 +653,7 @@ mod tests {
             GroupedOp::Max,
         );
         let b = grouped_fetch(
+            &no_tenant(),
             "metric_samples",
             "metric_hist_samples",
             &[
@@ -716,6 +728,7 @@ mod tests {
 
     fn range_sql(op: RangeAggOp, func: PushedRangeFn) -> String {
         range_aggregate_fetch(
+            &no_tenant(),
             "metric_samples",
             "metric_hist_samples",
             &[
@@ -810,6 +823,7 @@ mod tests {
                 assert!(!s.contains("metric_name"), "{op:?} {func:?}");
                 assert!(!s.contains("AS (SELECT"), "{op:?} {func:?}");
                 let other = range_aggregate_fetch(
+                    &no_tenant(),
                     "metric_samples",
                     "metric_hist_samples",
                     &[

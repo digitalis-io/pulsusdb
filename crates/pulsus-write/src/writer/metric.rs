@@ -64,7 +64,7 @@ use std::time::Duration;
 
 use pulsus_clickhouse::{ChClient, QuerySettings};
 use pulsus_config::WriterConfig;
-use pulsus_model::{Fingerprint, floor_to_activity_bucket};
+use pulsus_model::{Fingerprint, Tenant, floor_to_activity_bucket};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::LogsIngestError;
@@ -350,6 +350,7 @@ impl MetricWriter {
     /// reservation. `mode` selects sync- versus async-mode admission.
     fn admit_batch(
         &self,
+        tenant: &Tenant,
         batch: ParsedMetrics,
         mode: AdmitMode,
         push: PushHeaders,
@@ -366,6 +367,7 @@ impl MetricWriter {
         // Every row of a push carries the same stamp, so the block lies in
         // one partition.
         let received_ms = now_unix_millis();
+        let org_id = tenant.as_arc();
         // The landing budget's anchor, taken before the claim and before any
         // admission work, because the claim deadline it must settle inside of
         // starts here too (issue #603 code review, finding 7). A budget
@@ -542,7 +544,7 @@ impl MetricWriter {
                 .map_err(AdmitRefusal::from)?;
                 let rows: Vec<MetricLandingRow> = descriptors
                     .iter()
-                    .map(|m| MetricLandingRow::metadata(received_ms, m))
+                    .map(|m| MetricLandingRow::metadata(org_id, received_ms, m))
                     .collect();
                 self.shared
                     .metrics
@@ -577,16 +579,17 @@ impl MetricWriter {
             batch
                 .samples
                 .iter()
-                .map(|s| MetricLandingRow::float_sample(received_ms, s)),
+                .map(|s| MetricLandingRow::float_sample(org_id, received_ms, s)),
         );
         rows.extend(
             batch
                 .hist_samples
                 .iter()
-                .map(|h| MetricLandingRow::hist_sample(received_ms, h)),
+                .map(|h| MetricLandingRow::hist_sample(org_id, received_ms, h)),
         );
         for (series, bucket, value_type) in &new_series {
             rows.push(MetricLandingRow::series(
+                org_id,
                 received_ms,
                 series,
                 *bucket,
@@ -596,7 +599,7 @@ impl MetricWriter {
         rows.extend(
             descriptors
                 .iter()
-                .map(|m| MetricLandingRow::metadata(received_ms, m)),
+                .map(|m| MetricLandingRow::metadata(org_id, received_ms, m)),
         );
 
         if !new_series.is_empty() {
@@ -856,16 +859,23 @@ impl MetricWriter {
 }
 
 impl MetricSink for MetricWriter {
-    fn admit(&self, batch: ParsedMetrics, push: PushHeaders) -> Result<(), AdmitRefusal> {
-        self.admit_batch(batch, AdmitMode::Async, push).map(|_| ())
+    fn admit(
+        &self,
+        tenant: &Tenant,
+        batch: ParsedMetrics,
+        push: PushHeaders,
+    ) -> Result<(), AdmitRefusal> {
+        self.admit_batch(tenant, batch, AdmitMode::Async, push)
+            .map(|_| ())
     }
 
     fn admit_flush(
         &self,
+        tenant: &Tenant,
         batch: ParsedMetrics,
         push: PushHeaders,
     ) -> Result<FlushWait, AdmitRefusal> {
-        match self.admit_batch(batch, AdmitMode::Sync, push)? {
+        match self.admit_batch(tenant, batch, AdmitMode::Sync, push)? {
             Admitted::Stored(receivers) => Ok(FlushWait::new(async move {
                 super::join_generations(receivers)
                     .await
@@ -986,6 +996,52 @@ mod tests {
     /// before it asks for the mutex — so the assertion is made at a point the
     /// worker has provably reached rather than after a sleep, and it is the
     /// release that has to have waited.
+    /// What a writer whose one insert never finishes is charged for one push
+    /// of `tenant`'s.
+    async fn charge_of_one_push(tenant: &Tenant) -> u64 {
+        let inserter = Arc::new(ParkingInserter::new());
+        let mut runtime = WriterRuntime::from_config(&pulsus_config::WriterConfig::default());
+        runtime.spool_dir =
+            std::env::temp_dir().join(format!("pulsus-tenant-charge-{}", std::process::id()));
+        runtime.metrics_landing_inserters = 1;
+        let writer = MetricWriter::with_landing_inserter_and_runtime(
+            inserter.clone(),
+            runtime,
+            BUCKET_MS,
+            MetricWriterTables::metrics_default(),
+        );
+        let batch = ParsedMetrics {
+            samples: vec![sample(7, 1_000), sample(7, 2_000)],
+            series: vec![series_ref(7)],
+            metadata: vec![descriptor()],
+            ..Default::default()
+        };
+        writer
+            .admit(tenant, batch, PushHeaders::default())
+            .expect("the push is admitted");
+        let charged = writer.shared.queued_bytes.load(Ordering::SeqCst);
+        inserter.release.add_permits(1);
+        charged
+    }
+
+    /// **T9 (issue #635 part 4): a push is charged its tenant's bytes, once.**
+    /// The same push from the empty tenant and from a 150-byte tenant: the
+    /// second is charged exactly 150 bytes more, whatever its row count.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_push_is_charged_its_tenants_bytes_once() {
+        let none = Tenant::from_header(None, false).expect("the empty tenant");
+        let long = "t".repeat(150);
+        let header = axum::http::HeaderValue::from_str(&long).expect("a header value");
+        let tenant = Tenant::from_header(Some(&header), false).expect("a 150-byte tenant");
+        let base = charge_of_one_push(&none).await;
+        let with_tenant = charge_of_one_push(&tenant).await;
+        assert_eq!(
+            with_tenant,
+            base + 150,
+            "the tenant's 150 bytes, charged once per push"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_committing_block_stays_charged_until_its_rows_are_released() {
         let inserter = Arc::new(ParkingInserter::new());
@@ -1009,7 +1065,11 @@ mod tests {
             ..Default::default()
         };
         writer
-            .admit(batch, PushHeaders::default())
+            .admit(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+                batch,
+                PushHeaders::default(),
+            )
             .expect("the push is admitted");
         let charged = writer.shared.queued_bytes.load(Ordering::SeqCst);
         assert!(charged > 0, "an admitted push holds a reservation");
@@ -1092,10 +1152,22 @@ mod tests {
     fn the_promotion_keys_are_derived_from_the_blocks_kind_2_rows() {
         let series = series_ref(7);
         let rows = vec![
-            MetricLandingRow::float_sample(5, &sample(7, 1_000)),
-            MetricLandingRow::series(5, &series, 3_600_000, VALUE_TYPE_FLOAT),
-            MetricLandingRow::metadata(5, &descriptor()),
-            MetricLandingRow::series(5, &series, 7_200_000, VALUE_TYPE_HISTOGRAM),
+            MetricLandingRow::float_sample(&std::sync::Arc::<str>::from(""), 5, &sample(7, 1_000)),
+            MetricLandingRow::series(
+                &std::sync::Arc::<str>::from(""),
+                5,
+                &series,
+                3_600_000,
+                VALUE_TYPE_FLOAT,
+            ),
+            MetricLandingRow::metadata(&std::sync::Arc::<str>::from(""), 5, &descriptor()),
+            MetricLandingRow::series(
+                &std::sync::Arc::<str>::from(""),
+                5,
+                &series,
+                7_200_000,
+                VALUE_TYPE_HISTOGRAM,
+            ),
         ];
 
         let keys: Vec<SeriesKey> = promotion_keys(&rows).collect();
@@ -1212,28 +1284,30 @@ mod tests {
                 + shape.descriptors.len();
             let mut rows: Vec<MetricLandingRow> = Vec::with_capacity(total_rows);
             rows.extend(
-                shape
-                    .samples
-                    .iter()
-                    .map(|s| MetricLandingRow::float_sample(5, s)),
+                shape.samples.iter().map(|s| {
+                    MetricLandingRow::float_sample(&std::sync::Arc::<str>::from(""), 5, s)
+                }),
             );
             rows.extend(
                 shape
                     .hist_samples
                     .iter()
-                    .map(|h| MetricLandingRow::hist_sample(5, h)),
+                    .map(|h| MetricLandingRow::hist_sample(&std::sync::Arc::<str>::from(""), 5, h)),
             );
-            rows.extend(
-                shape
-                    .series
-                    .iter()
-                    .map(|s| MetricLandingRow::series(5, s, 3_600_000, VALUE_TYPE_FLOAT)),
-            );
+            rows.extend(shape.series.iter().map(|s| {
+                MetricLandingRow::series(
+                    &std::sync::Arc::<str>::from(""),
+                    5,
+                    s,
+                    3_600_000,
+                    VALUE_TYPE_FLOAT,
+                )
+            }));
             rows.extend(
                 shape
                     .descriptors
                     .iter()
-                    .map(|m| MetricLandingRow::metadata(5, m)),
+                    .map(|m| MetricLandingRow::metadata(&std::sync::Arc::<str>::from(""), 5, m)),
             );
             assert_eq!(rows.len(), total_rows, "{}", shape.name);
 

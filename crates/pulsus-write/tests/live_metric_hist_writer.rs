@@ -137,7 +137,7 @@ fn writer(client: Arc<ChClient>) -> MetricWriter {
 
 async fn flush(writer: &MetricWriter, batch: ParsedMetrics) {
     let wait = writer
-        .admit_flush(batch, PushHeaders::default())
+        .admit_flush(&no_tenant(), batch, PushHeaders::default())
         .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(10), wait)
         .await
@@ -484,4 +484,10 @@ async fn cross_request_float_and_histogram_register_both_value_type_rows() {
     );
 
     drop_database(&bootstrap, db).await;
+}
+
+/// The single-tenant deployment's tenant: no `X-Scope-OrgID`.
+#[allow(dead_code)]
+fn no_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("no header is the empty tenant")
 }

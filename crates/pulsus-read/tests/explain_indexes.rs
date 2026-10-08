@@ -2027,6 +2027,7 @@ fn promql_sample_fetch_sql(query: &str, params: pulsus_promql::PlanParams, db: &
         "these cases use concrete-name selectors"
     );
     pulsus_read::metrics::sample_sql::sample_fetch(
+        &no_tenant(),
         &table,
         &[Fingerprint::from_raw(u128::from(MFP)).sql_literal()],
         lower_excl,
@@ -2158,6 +2159,7 @@ async fn promql_multi_metric_fanout_prunes_on_both_metric_name_and_fingerprint_k
     let (lower_excl, upper_incl) = plan.selectors[0].fetch_window(&params);
     let table = format!("{db}.metric_samples");
     let sql = pulsus_read::metrics::sample_sql::sample_fetch_multi(
+        &no_tenant(),
         &table,
         &[
             Fingerprint::from_raw(u128::from(MFP)).sql_literal(),
@@ -2256,6 +2258,7 @@ async fn info_selector_fetch_prunes_on_metric_name_and_its_resolution_probe_is_l
     let (lower_excl, upper_incl) = info_sel.fetch_window(&params);
     let samples_table = format!("{db}.metric_samples");
     let fetch_sql = pulsus_read::metrics::sample_sql::sample_fetch(
+        &no_tenant(),
         &samples_table,
         &[Fingerprint::from_raw(u128::from(INFO_FP)).sql_literal()],
         lower_excl,
@@ -2294,6 +2297,7 @@ async fn info_selector_fetch_prunes_on_metric_name_and_its_resolution_probe_is_l
     };
     let labels_table = format!("{db}.metric_labels");
     let series_sql = pulsus_read::metrics::sql::historical_series_subquery(
+        &no_tenant(),
         &series_table,
         &labels_table,
         "target_info",
@@ -2387,6 +2391,7 @@ async fn discovery_multi_metric_fanout_prunes_on_both_metric_name_and_fingerprin
     let table = format!("{db}.metric_series");
     let labels = format!("{db}.metric_labels");
     let sql = pulsus_read::metrics::sql::discovery_fetch_multi(
+        &no_tenant(),
         &table,
         &labels,
         &["sv".to_string(), "sv2".to_string()],
@@ -2446,9 +2451,15 @@ async fn discovery_distinct_names_engages_the_same_indexes_as_the_wide_discovery
     let table = format!("{db}.metric_series");
     let labels = format!("{db}.metric_labels");
     let filter = unfiltered_discovery_filter();
-    let narrow_sql =
-        pulsus_read::metrics::sql::discovery_distinct_names_query(&table, &labels, &filter, window);
-    let wide_sql = pulsus_read::metrics::sql::discovery_query(&table, &labels, &filter, window);
+    let narrow_sql = pulsus_read::metrics::sql::discovery_distinct_names_query(
+        &no_tenant(),
+        &table,
+        &labels,
+        &filter,
+        window,
+    );
+    let wide_sql =
+        pulsus_read::metrics::sql::discovery_query(&no_tenant(), &table, &labels, &filter, window);
 
     let narrow = explain(&client, &narrow_sql).await;
     assert_eq!(
@@ -2517,6 +2528,7 @@ async fn discovery_fetch_by_names_prunes_on_the_metric_name_primary_key_componen
     // names IN-set, with a label matcher applied in SQL. `bucket_ms = 1`
     // floors to the exact bounds so the seeded rows stay in-window.
     let sql = pulsus_read::metrics::sql::discovery_fetch_by_names(
+        &no_tenant(),
         &table,
         &format!("{db}.metric_labels"),
         &["sv".to_string(), "sv2".to_string()],
@@ -2581,6 +2593,7 @@ async fn the_re2_compile_probe_costs_the_metric_series_fallback_no_index_engagem
     };
     let subquery = |op| {
         pulsus_read::metrics::sql::historical_series_subquery(
+            &no_tenant(),
             &table,
             &format!("{db}.metric_labels"),
             "sv",
@@ -3278,4 +3291,10 @@ SQL:
                 )
             });
     }
+}
+
+/// The single-tenant deployment's tenant: no `X-Scope-OrgID`.
+#[allow(dead_code)]
+fn no_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("no header is the empty tenant")
 }

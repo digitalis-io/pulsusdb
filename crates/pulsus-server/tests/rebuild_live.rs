@@ -81,6 +81,12 @@ fn histogram() -> NativeHistogram {
 /// whatever the time of day the test runs; today would have none before
 /// 02:00 UTC.
 async fn seed_two_days(client: &ChClient, received_ms: i64) {
+    seed_two_days_for(client, received_ms, "").await;
+}
+
+/// [`seed_two_days`] for one tenant (issue #635 part 4).
+async fn seed_two_days_for(client: &ChClient, received_ms: i64, tenant: &str) {
+    let org: Arc<str> = Arc::from(tenant);
     let today = received_ms.div_euclid(DAY_MS) * DAY_MS;
     let mut rows = Vec::new();
     for s in 1..=3i64 {
@@ -90,6 +96,7 @@ async fn seed_two_days(client: &ChClient, received_ms: i64) {
             for hour in [2, 9] {
                 let at = day + hour * HOUR_MS + s * 1_000;
                 rows.push(MetricLandingRow::float_sample(
+                    &org,
                     received_ms,
                     &MetricPoint {
                         metric_name: Arc::from("rb"),
@@ -99,6 +106,7 @@ async fn seed_two_days(client: &ChClient, received_ms: i64) {
                     },
                 ));
                 rows.push(MetricLandingRow::hist_sample(
+                    &org,
                     received_ms,
                     &HistogramPoint {
                         metric_name: Arc::from("rb"),
@@ -108,6 +116,7 @@ async fn seed_two_days(client: &ChClient, received_ms: i64) {
                     },
                 ));
                 rows.push(MetricLandingRow::series(
+                    &org,
                     received_ms,
                     &SeriesRef {
                         metric_name: Arc::from("rb"),
@@ -129,6 +138,17 @@ async fn seed_two_days(client: &ChClient, received_ms: i64) {
 /// Runs `pulsusdb rebuild-metrics` for `target` over the hour either side of
 /// `received_ms`, and returns its exit status and output.
 fn rebuild(db: &str, target: &str, received_ms: i64, drop: bool) -> (bool, String) {
+    rebuild_tenant(db, target, received_ms, drop, None)
+}
+
+/// [`rebuild`], with `--tenant` when `tenant` names one (issue #635 part 4).
+fn rebuild_tenant(
+    db: &str,
+    target: &str,
+    received_ms: i64,
+    drop: bool,
+    tenant: Option<&str>,
+) -> (bool, String) {
     let at = |ms: i64| {
         chrono::DateTime::from_timestamp_millis(ms)
             .expect("an instant")
@@ -144,6 +164,9 @@ fn rebuild(db: &str, target: &str, received_ms: i64, drop: bool) -> (bool, Strin
         .args(["--to", &at(received_ms + HOUR_MS)]);
     if drop {
         command.arg("--drop-target-partitions");
+    }
+    if let Some(tenant) = tenant {
+        command.args(["--tenant", tenant]);
     }
     let output = command.output().expect("run pulsusdb rebuild-metrics");
     (
@@ -376,4 +399,133 @@ async fn the_label_values_rebuild_to_the_rows_the_view_wrote() {
         "key, '=', value",
     )
     .await;
+}
+
+/// The seven targets, and whether a replay into each must drop first.
+const ALL_TARGETS: [(&str, bool); 7] = [
+    ("metric_samples", true),
+    ("metric_hist_samples", true),
+    ("metric_series", false),
+    ("metric_metadata", false),
+    ("metric_labels", false),
+    ("metric_label_index", false),
+    ("metric_label_values", false),
+];
+
+/// One tenant's rows of `table`, merged: their count and a content hash.
+async fn tenant_digest(client: &ChClient, db: &str, table: &str, tenant: &str) -> String {
+    client
+        .execute(
+            &format!("OPTIMIZE TABLE {db}.{table} FINAL"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("merge");
+    strings(
+        client,
+        &format!(
+            "SELECT concat(toString(count()), ' ', toString(sum(cityHash64(*)))) AS s \
+             FROM {db}.{table} WHERE org_id = '{tenant}'"
+        ),
+    )
+    .await
+    .remove(0)
+}
+
+/// Deletes `tenant`'s rows of `table` whose `where_` holds.
+async fn delete_rows(client: &ChClient, db: &str, table: &str, tenant: &str, where_: &str) {
+    client
+        .execute(
+            &format!(
+                "DELETE FROM {db}.{table} WHERE org_id = '{tenant}' AND {where_} \
+                 SETTINGS lightweight_deletes_sync = 2"
+            ),
+            &QuerySettings::new(),
+            Idempotency::NonIdempotent,
+        )
+        .await
+        .expect("delete");
+}
+
+/// The descriptor rows `metric_metadata` is rebuilt from, for one tenant.
+async fn seed_descriptor(client: &ChClient, received_ms: i64, tenant: &str, help: &str) {
+    let row = MetricLandingRow::metadata(
+        &Arc::from(tenant),
+        received_ms,
+        &pulsus_write::MetricMetadata {
+            metric_name: Arc::from("rb"),
+            metric_type: "counter".to_string(),
+            help: help.to_string(),
+            unit: String::new(),
+            updated_ns: received_ms * 1_000_000,
+        },
+    );
+    client
+        .insert_block("metric_landing", &[row])
+        .await
+        .expect("seed a descriptor");
+}
+
+/// **T8 (issue #635 part 4): a rebuild with `--tenant` replays that tenant
+/// alone.** Two tenants land the same rows. Before each rebuild every row
+/// of tenant-a's is deleted from the target, and so is part of
+/// tenant-b's. With `--tenant tenant-a` the target holds tenant-a's rows
+/// as the views wrote them, and tenant-b's as they were before the
+/// rebuild: its deleted rows stay deleted. Without `--tenant` both are
+/// replayed, and both hold what the views wrote.
+#[tokio::test]
+async fn a_rebuild_with_a_tenant_replays_that_tenant_alone() {
+    skip_unless_live!();
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("rebuild_tenant")).await;
+    let client = client_for(db.name()).await;
+    let received = now_ms();
+    for tenant in ["tenant-a", "tenant-b"] {
+        seed_two_days_for(&client, received, tenant).await;
+        seed_descriptor(&client, received, tenant, tenant).await;
+    }
+    for (target, drop) in ALL_TARGETS {
+        let views_a = tenant_digest(&client, db.name(), target, "tenant-a").await;
+        let views_b = tenant_digest(&client, db.name(), target, "tenant-b").await;
+        assert_ne!(views_a, "0 0", "{target}: tenant-a has rows");
+
+        // Tenant-b loses part of its rows: one series, or its descriptor.
+        let partial = if target == "metric_metadata" {
+            "metric_name = 'rb'"
+        } else if target == "metric_label_values" {
+            "key = 'instance' AND value = 'i-1'"
+        } else {
+            "fingerprint = 1"
+        };
+        delete_rows(&client, db.name(), target, "tenant-a", "1").await;
+        delete_rows(&client, db.name(), target, "tenant-b", partial).await;
+        let before_b = tenant_digest(&client, db.name(), target, "tenant-b").await;
+        assert_ne!(before_b, views_b, "{target}: tenant-b lost rows");
+
+        let (ok, out) = rebuild_tenant(db.name(), target, received, drop, Some("tenant-a"));
+        assert!(ok, "{target}: the rebuild with --tenant failed:\n{out}");
+        assert_eq!(
+            tenant_digest(&client, db.name(), target, "tenant-a").await,
+            views_a,
+            "{target}: tenant-a holds the rows the views wrote"
+        );
+        assert_eq!(
+            tenant_digest(&client, db.name(), target, "tenant-b").await,
+            before_b,
+            "{target}: tenant-b is untouched"
+        );
+
+        let (ok, out) = rebuild_tenant(db.name(), target, received, drop, None);
+        assert!(ok, "{target}: the rebuild without --tenant failed:\n{out}");
+        assert_eq!(
+            tenant_digest(&client, db.name(), target, "tenant-a").await,
+            views_a,
+            "{target}: tenant-a after a rebuild of every tenant"
+        );
+        assert_eq!(
+            tenant_digest(&client, db.name(), target, "tenant-b").await,
+            views_b,
+            "{target}: tenant-b after a rebuild of every tenant"
+        );
+    }
 }

@@ -401,13 +401,20 @@ async fn fallback_fetch_sql_is_denied_by_default_on_the_cluster() {
         end_ms: bucket,
     };
     let series_sql = historical_series_subquery(
+        &no_tenant(),
         "metric_series_dist",
         "metric_labels_dist",
         metric_name,
         window,
         &[],
     );
-    let fetch_sql = sample_fetch_subquery("metric_samples_dist", &series_sql, bucket - 1, bucket);
+    let fetch_sql = sample_fetch_subquery(
+        &no_tenant(),
+        "metric_samples_dist",
+        &series_sql,
+        bucket - 1,
+        bucket,
+    );
 
     let mut cfg = shard1_config("default");
     cfg.database = db.to_string();
@@ -491,7 +498,7 @@ async fn engine_returns_exact_samples_across_shards_via_the_local_product_mode_f
         step_ms: 0,
     };
     let (result, _annotations, explain) = engine
-        .query_explained(&expr, &params)
+        .query_explained(&no_tenant(), &expr, &params)
         .await
         .expect("query_explained must succeed under the local-product-mode fix");
 
@@ -686,12 +693,20 @@ async fn label_reads_are_shard_local_and_answer_each_series_once() {
     };
     let (series, labels) = ("metric_series_dist", "metric_labels_dist");
     use pulsus_read::metrics::sql;
-    let subquery = historical_series_subquery(series, labels, metric_name, window, &matchers);
-    let resolution =
-        sql::historical_resolution_query(series, labels, metric_name, window, &matchers);
-    let discovery_named = sql::discovery_query(series, labels, &named, window);
-    let discovery_unnamed = sql::discovery_query(series, labels, &unnamed, window);
-    let names_unnamed = sql::discovery_distinct_names_query(series, labels, &unnamed, window);
+    let subquery =
+        historical_series_subquery(&no_tenant(), series, labels, metric_name, window, &matchers);
+    let resolution = sql::historical_resolution_query(
+        &no_tenant(),
+        series,
+        labels,
+        metric_name,
+        window,
+        &matchers,
+    );
+    let discovery_named = sql::discovery_query(&no_tenant(), series, labels, &named, window);
+    let discovery_unnamed = sql::discovery_query(&no_tenant(), series, labels, &unnamed, window);
+    let names_unnamed =
+        sql::discovery_distinct_names_query(&no_tenant(), series, labels, &unnamed, window);
 
     let want: Vec<(u128, String)> = (21..=45u128)
         .map(|fp| (fp, r#"{"job":"api"}"#.to_string()))
@@ -872,4 +887,10 @@ async fn seed_labels_on_every_shard(db: &str, rows: &[SeedSeriesRow]) {
             .await
             .expect("seed metric_labels on a shard");
     }
+}
+
+/// The single-tenant deployment's tenant: no `X-Scope-OrgID`.
+#[allow(dead_code)]
+fn no_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("no header is the empty tenant")
 }

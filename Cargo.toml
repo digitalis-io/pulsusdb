@@ -10,8 +10,9 @@ repository = "https://github.com/digitalis-io/pulsusdb"
 authors = ["PulsusDB contributors"]
 
 [workspace.dependencies]
+http = "1"
 clap = { version = "4", features = ["derive"] }
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_norway = "0.9"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "io-util", "net", "signal"] }

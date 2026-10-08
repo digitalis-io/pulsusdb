@@ -532,7 +532,7 @@ struct Ran {
 
 async fn run(engine: &MetricsEngine, query: &str, p: &MetricQueryParams) -> Result<Ran, ReadError> {
     let expr = parse(query).expect("parse");
-    let (result, _, explain) = engine.query_explained(&expr, p).await?;
+    let (result, _, explain) = engine.query_explained(&no_tenant(), &expr, p).await?;
     Ok(Ran {
         result,
         stages: explain
@@ -902,4 +902,10 @@ async fn p8_p9_p10_histograms_the_lookback_and_the_fallback() {
         other => panic!("expected a histogram rate, got {other:?}"),
     }
     fx.finish().await;
+}
+
+/// The single-tenant deployment's tenant: no `X-Scope-OrgID`.
+#[allow(dead_code)]
+fn no_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("no header is the empty tenant")
 }

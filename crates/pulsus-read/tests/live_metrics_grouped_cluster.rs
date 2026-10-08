@@ -419,11 +419,11 @@ async fn the_grouped_read_over_the_dist_tables_answers_what_the_shipped_route_do
         let query = format!("{op} by (status) ({METRIC})");
         let expr = parse(&query).expect("parse");
         let (a, _) = pushed
-            .query(&expr, &params)
+            .query(&no_tenant(), &expr, &params)
             .await
             .unwrap_or_else(|e| panic!("{query} (pushed, clustered): {e:?}"));
         let (b, _) = unpushed
-            .query(&expr, &params)
+            .query(&no_tenant(), &expr, &params)
             .await
             .unwrap_or_else(|e| panic!("{query} (unpushed, clustered): {e:?}"));
         let (a, b) = (answer_of(a), answer_of(b));
@@ -565,7 +565,7 @@ async fn the_pushed_rate_over_the_dist_tables_sees_every_shards_rows() {
     ] {
         let expr = parse(&query).expect("parse");
         let (a, _, explain) = pushed
-            .query_explained(&expr, &params)
+            .query_explained(&no_tenant(), &expr, &params)
             .await
             .unwrap_or_else(|e| panic!("{query} (pushed, clustered): {e:?}"));
         assert!(
@@ -577,7 +577,7 @@ async fn the_pushed_rate_over_the_dist_tables_sees_every_shards_rows() {
             explain.stages
         );
         let (b, _) = unpushed
-            .query(&expr, &params)
+            .query(&no_tenant(), &expr, &params)
             .await
             .unwrap_or_else(|e| panic!("{query} (unpushed, clustered): {e:?}"));
         let (a, b) = (answer_of(a), answer_of(b));
@@ -592,4 +592,10 @@ async fn the_pushed_rate_over_the_dist_tables_sees_every_shards_rows() {
         .await
         .expect("connect (bootstrap)");
     drop_database(&bootstrap, &db).await;
+}
+
+/// The single-tenant deployment's tenant: no `X-Scope-OrgID`.
+#[allow(dead_code)]
+fn no_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("no header is the empty tenant")
 }

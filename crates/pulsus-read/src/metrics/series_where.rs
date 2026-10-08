@@ -134,7 +134,9 @@
 
 use crate::logql::escape::{ch_regex_anchored_promql_re2, ch_string};
 
+use super::TenantSql;
 use super::matcher::{DataWindow, LabelMatcher, MatchOp, matches_empty};
+use pulsus_model::Tenant;
 
 /// Capability token (issue #240). Possession proves the caller is on the
 /// PromQL fallback path, where ClickHouse's RE2 — not the Rust `regex`
@@ -254,13 +256,17 @@ pub(super) struct SeriesWhere {
     /// decided in-process, and at least one matcher that does not match
     /// `""`. Rendered on the index only when both index tables are named.
     index: Option<Vec<(LabelMatcher, bool)>>,
+    /// Issue #635 part 4: `org_id = <the tenant>`, the term every metrics
+    /// table this read names carries.
+    #[allow(dead_code)]
+    tenant: String,
 }
 
 impl SeriesWhere {
     /// Renders `window` as the activity read's day range and hour mask, the
     /// compile probe for every regex in `lookup`, and `lookup`'s
     /// predicates.
-    pub(super) fn activity(window: DataWindow, lookup: Lookup<'_>) -> Self {
+    pub(super) fn activity(tenant: &Tenant, window: DataWindow, lookup: Lookup<'_>) -> Self {
         let (first, _) = day_and_hour(window.start_ms);
         let (last, _) = day_and_hour(window.end_ms);
         let mut activity = vec![format!(
@@ -308,6 +314,7 @@ impl SeriesWhere {
             activity,
             lookup: lookup_preds,
             index,
+            tenant: format!("org_id = {}", tenant.sql_literal()),
         }
     }
 
@@ -596,6 +603,11 @@ fn hour_mask(window: DataWindow) -> String {
 mod tests {
     use super::*;
 
+    /// The single-tenant deployment's tenant: no `X-Scope-OrgID`.
+    fn no_tenant() -> Tenant {
+        Tenant::from_header(None, false).expect("no header is the empty tenant")
+    }
+
     /// The §4 window of the design: 2026-09-07 22:30 to 23:30 UTC.
     fn evening() -> DataWindow {
         DataWindow {
@@ -642,6 +654,7 @@ mod tests {
         let names = [m(MatchOp::Re, "__name__", "up|down")];
         let labels = [m(MatchOp::Eq, "job", "api")];
         let w = SeriesWhere::activity(
+            &no_tenant(),
             evening(),
             Lookup {
                 scope: &[],
@@ -717,6 +730,7 @@ mod tests {
         let (names, labels): (Vec<LabelMatcher>, Vec<LabelMatcher>) =
             matchers.iter().cloned().partition(|m| m.key == "__name__");
         SeriesWhere::activity(
+            &no_tenant(),
             window(),
             Lookup {
                 scope: &[],
@@ -828,7 +842,7 @@ mod tests {
                 "pub(super) name_matchers: &'a [LabelMatcher],",
                 "pub(super) matchers: &'a [LabelMatcher],",
                 "pub(super) struct SeriesWhere {",
-                "pub(super) fn activity(window: DataWindow, lookup: Lookup<'_>) -> Self {",
+                "pub(super) fn activity(tenant: &Tenant, window: DataWindow, lookup: Lookup<'_>) -> Self {",
                 "pub(super) fn ids_from_where(&self, t: SeriesTables<'_>) -> String {",
                 "pub(super) fn with_labels(&self, t: SeriesTables<'_>) -> String {",
                 "pub(super) fn label_keys(&self, t: SeriesTables<'_>) -> String {",
@@ -976,6 +990,44 @@ mod tests {
         assert_eq!(names, "match(metric_name, '(?-s)^(?:up.*)$')");
     }
 
+    /// **T14 (issue #635 part 4): the label index route scopes its values
+    /// sub-query to the tenant.** A `=~` matcher (a positive branch) and a
+    /// `!~` matcher (a negative branch) each resolve their values from
+    /// `metric_label_values` with `org_id = 'tenant-q'` ahead of the key.
+    #[test]
+    fn index_row_scopes_the_values_sub_query() {
+        let header = http::HeaderValue::from_static("tenant-q");
+        let tenant = Tenant::from_header(Some(&header), false).expect("a tenant");
+        let t = SeriesTables {
+            series: "metric_series",
+            labels: "metric_labels",
+            label_index: Some("metric_label_index"),
+            label_values: Some("metric_label_values"),
+        };
+        for matchers in [
+            vec![m(MatchOp::Re, "status", "5..")],
+            vec![
+                m(MatchOp::Eq, "job", "api"),
+                m(MatchOp::Nre, "status", "5.."),
+            ],
+        ] {
+            let sql = SeriesWhere::activity(
+                &tenant,
+                window(),
+                Lookup {
+                    scope: &[],
+                    name_matchers: &[],
+                    matchers: &matchers,
+                },
+            )
+            .ids_from_where(t);
+            assert!(
+                sql.contains("FROM metric_label_values WHERE org_id = 'tenant-q' AND key ="),
+                "{matchers:?}:\n{sql}"
+            );
+        }
+    }
+
     /// The scope's predicates lead the lookup's, and a read with neither
     /// scope nor matcher reads the window alone in statement 2.
     #[test]
@@ -983,6 +1035,7 @@ mod tests {
         let scope = ["metric_name = 'up'".to_string()];
         let labels = [m(MatchOp::Eq, "job", "api")];
         let w = SeriesWhere::activity(
+            &no_tenant(),
             window(),
             Lookup {
                 scope: &scope,
@@ -998,6 +1051,7 @@ mod tests {
             w.ids_from_where(sl())
         );
         let none = SeriesWhere::activity(
+            &no_tenant(),
             window(),
             Lookup {
                 scope: &[],
@@ -1053,6 +1107,7 @@ mod tests {
 
     fn read(scope: &[String], names: &[LabelMatcher], labels: &[LabelMatcher]) -> SeriesWhere {
         SeriesWhere::activity(
+            &no_tenant(),
             oct6(),
             Lookup {
                 scope,

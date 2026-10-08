@@ -131,8 +131,53 @@ pub use sample_rows::SampleRow;
 pub use series_where::anchored_re2_literal_for_test;
 pub use stats::{CacheMetrics, CacheMetricsSnapshot};
 
+/// Issue #635 part 4: a [`pulsus_model::Tenant`] as SQL. The tenant
+/// reaches a statement only through [`TenantSql::sql_literal`].
+pub trait TenantSql {
+    /// The tenant as a ClickHouse string literal: the crate's one string
+    /// escaper, [`crate::logql::escape::ch_string`], over the validated
+    /// text. The character set needs no escaping; the escaper is applied
+    /// anyway, so a later widening of the set cannot open an injection.
+    fn sql_literal(&self) -> String;
+}
+
+impl TenantSql for pulsus_model::Tenant {
+    fn sql_literal(&self) -> String {
+        String::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::TenantSql;
+    use pulsus_model::Tenant;
+
     #[test]
     fn crate_compiles() {}
+
+    /// **T7 (issue #635 part 4): a tenant's SQL literal is the crate's
+    /// string escaper over its text**, for every character a tenant may
+    /// hold, and for the empty tenant.
+    #[test]
+    fn a_tenants_sql_literal_is_its_escaped_text() {
+        const VALID: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-";
+        let tenant = |v: &str| {
+            let header = http::HeaderValue::from_str(v).expect("a header value");
+            Tenant::from_header(Some(&header), false).expect("a valid tenant")
+        };
+        for c in VALID.chars() {
+            let text = c.to_string();
+            assert_eq!(
+                tenant(&text).sql_literal(),
+                crate::logql::escape::ch_string(&text),
+                "{c:?}"
+            );
+        }
+        assert_eq!(
+            tenant(VALID).sql_literal(),
+            crate::logql::escape::ch_string(VALID)
+        );
+        let none = Tenant::from_header(None, false).expect("the empty tenant");
+        assert_eq!(none.sql_literal(), "''");
+    }
 }

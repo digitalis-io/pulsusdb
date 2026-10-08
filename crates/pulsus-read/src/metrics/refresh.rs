@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use pulsus_clickhouse::{ChError, QuerySettings};
-use pulsus_model::{Fingerprint, LabelSet, floor_to_activity_bucket};
+use pulsus_model::{Fingerprint, LabelSet, Tenant, floor_to_activity_bucket};
 
 use super::matcher::DataWindow;
 use tokio::task::JoinHandle;
@@ -29,8 +29,13 @@ use super::rows::SeriesRow;
 /// active since `floor(now - window)`, with its labels, no upper bound (the
 /// sweep always runs "as of now"). Pure so it is snapshot-testable without a
 /// clock/DB.
-fn sweep_sql(series_table: &str, labels_table: &str, window: DataWindow) -> String {
-    super::sql::sweep_query(series_table, labels_table, window)
+fn sweep_sql(
+    tenant: &Tenant,
+    series_table: &str,
+    labels_table: &str,
+    window: DataWindow,
+) -> String {
+    super::sql::sweep_query(tenant, series_table, labels_table, window)
 }
 
 /// Wall-clock now, milliseconds since the Unix epoch. `SystemTime::now()`
@@ -59,7 +64,9 @@ pub(crate) async fn run_sweep(cache: &LabelCache) -> Result<(), ChError> {
         now_ms - cache.config.window_ms,
         pulsus_model::ACTIVITY_BUCKET_MS,
     );
+    let tenant = Tenant::from_header(None, false).expect("the empty tenant");
     let sql = sweep_sql(
+        &tenant,
         &cache.config.series_table,
         &cache.config.labels_table,
         DataWindow {
@@ -214,6 +221,7 @@ mod tests {
     fn sweep_sql_reads_the_lookup_for_the_active_series() {
         assert_eq!(
             sweep_sql(
+                &Tenant::from_header(None, false).expect("the empty tenant"),
                 "metric_series",
                 "metric_labels",
                 DataWindow {

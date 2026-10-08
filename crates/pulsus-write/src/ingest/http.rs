@@ -34,6 +34,7 @@
 //! delegates to them; [`ingest_remote_write`] has no such generic-`State`
 //! wrapper (no test or caller has needed one yet).
 
+use pulsus_model::Tenant;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -220,6 +221,7 @@ pub async fn ingest_metrics(
     settings: MetricIngestSettings,
 ) -> Response {
     let now_ns = now_unix_nanos();
+    let tenant = Tenant::from_header(None, false).expect("the empty tenant");
 
     let body = match read_capped_body(body, decompress::MAX_DECOMPRESSED_BYTES).await {
         Ok(body) => body,
@@ -247,13 +249,13 @@ pub async fn ingest_metrics(
     let push = push_headers(&headers);
 
     if is_async(&headers) {
-        return match sink.admit(parsed, push) {
+        return match sink.admit(&tenant, parsed, push) {
             Ok(()) => export_metrics_response(StatusCode::ACCEPTED, rejected, rejected_message),
             Err(refusal) => otlp_refusal_response(refusal),
         };
     }
 
-    match sink.admit_flush(parsed, push) {
+    match sink.admit_flush(&tenant, parsed, push) {
         Ok(wait) => match wait.await {
             Ok(()) => export_metrics_response(StatusCode::OK, rejected, rejected_message),
             Err(err) => error_response(err),
@@ -374,6 +376,7 @@ pub async fn ingest_remote_write(
     body: Body,
 ) -> Response {
     let now_ns = now_unix_nanos();
+    let tenant = Tenant::from_header(None, false).expect("the empty tenant");
 
     let body = match read_capped_body(body, decompress::MAX_DECOMPRESSED_BYTES).await {
         Ok(body) => body,
@@ -397,13 +400,13 @@ pub async fn ingest_remote_write(
     let push = push_headers(&headers);
 
     if is_async(&headers) {
-        return match sink.admit(parsed, push) {
+        return match sink.admit(&tenant, parsed, push) {
             Ok(()) => rw_success_response(StatusCode::ACCEPTED),
             Err(refusal) => remote_write_refusal_response(refusal),
         };
     }
 
-    match sink.admit_flush(parsed, push) {
+    match sink.admit_flush(&tenant, parsed, push) {
         Ok(wait) => match wait.await {
             Ok(()) => rw_success_response(StatusCode::NO_CONTENT),
             Err(err) => remote_write_error_response(&err),
@@ -2036,7 +2039,12 @@ mod tests {
     }
 
     impl MetricSink for MockMetricSink {
-        fn admit(&self, batch: ParsedMetrics, push: PushHeaders) -> Result<(), AdmitRefusal> {
+        fn admit(
+            &self,
+            _tenant: &Tenant,
+            batch: ParsedMetrics,
+            push: PushHeaders,
+        ) -> Result<(), AdmitRefusal> {
             self.admitted.lock().unwrap().push(batch);
             self.pushes.lock().unwrap().push(push);
             match self.outcome.refusal() {
@@ -2047,6 +2055,7 @@ mod tests {
 
         fn admit_flush(
             &self,
+            _tenant: &Tenant,
             batch: ParsedMetrics,
             push: PushHeaders,
         ) -> Result<FlushWait, AdmitRefusal> {

@@ -38,7 +38,7 @@ use std::future::Future;
 
 use futures::future::{join, join_all};
 use pulsus_clickhouse::{ChClient, ChRow, QuerySettings};
-use pulsus_model::{Fingerprint, FpLiteral, LabelSet, NativeHistogram};
+use pulsus_model::{Fingerprint, FpLiteral, LabelSet, NativeHistogram, Tenant};
 use pulsus_promql::parser::Expr;
 use pulsus_promql::{
     DEFAULT_LOOKBACK_MS, FetchedSeries, InstantSample, Labels, PlanParams, PromqlError, QueryValue,
@@ -601,10 +601,11 @@ impl MetricsEngine {
     /// float-only query (byte-identical to the pre-A5b-i behavior).
     pub async fn query(
         &self,
+        tenant: &Tenant,
         expr: &Expr,
         p: &MetricQueryParams,
     ) -> Result<(QueryResult, pulsus_promql::Annotations), ReadError> {
-        self.query_inner(expr, p, None).await
+        self.query_inner(tenant, expr, p, None).await
     }
 
     /// [`MetricsEngine::query`] plus its `X-Pulsus-Explain` trace, in the
@@ -612,16 +613,20 @@ impl MetricsEngine {
     /// [`crate::logql::LogQlEngine::query_explained`]'s contract.
     pub async fn query_explained(
         &self,
+        tenant: &Tenant,
         expr: &Expr,
         p: &MetricQueryParams,
     ) -> Result<(QueryResult, pulsus_promql::Annotations, PlanExplain), ReadError> {
         let mut explain = PlanExplain::new("metrics");
-        let (result, annotations) = self.query_inner(expr, p, Some(&mut explain)).await?;
+        let (result, annotations) = self
+            .query_inner(tenant, expr, p, Some(&mut explain))
+            .await?;
         Ok((result, annotations, explain))
     }
 
     async fn query_inner(
         &self,
+        tenant: &Tenant,
         expr: &Expr,
         p: &MetricQueryParams,
         mut explain: Option<&mut PlanExplain>,
@@ -722,10 +727,10 @@ impl MetricsEngine {
                 // a sub-query; with one, from the label cache.
                 let by_index = resolves_through_the_label_index(sel);
                 let groups = if by_index {
-                    self.resolve_nameless(sel, window, explain.as_deref_mut())
+                    self.resolve_nameless(tenant, sel, window, explain.as_deref_mut())
                         .await?
                 } else {
-                    self.resolve_multi(sel, window, explain.as_deref_mut())?
+                    self.resolve_multi(tenant, sel, window, explain.as_deref_mut())?
                 };
                 if groups.is_empty() {
                     fetch_plans.push(SelectorFetchPlan::Empty);
@@ -737,6 +742,7 @@ impl MetricsEngine {
                         match super::grouped::decide(shape, &members, shape.grid) {
                             Ok(push) => {
                                 self.stage_instant_push(
+                                    tenant,
                                     selector_id,
                                     self_pos,
                                     push,
@@ -758,11 +764,14 @@ impl MetricsEngine {
                                 // F6: today's multi-name fetch, sent only if
                                 // the statement counts a histogram sample.
                                 let (fallback, _) = if by_index {
-                                    self.nameless_fetch_plan(sel, groups, window, None)
+                                    self.nameless_fetch_plan(tenant, sel, groups, window, None)
                                 } else {
-                                    self.multi_fetch_plan(groups, lower_excl, upper_incl, None)
+                                    self.multi_fetch_plan(
+                                        tenant, groups, lower_excl, upper_incl, None,
+                                    )
                                 };
                                 self.stage_range_push(
+                                    tenant,
                                     selector_id,
                                     self_pos,
                                     push,
@@ -780,9 +789,15 @@ impl MetricsEngine {
                     None => {}
                 }
                 let (fetch_plan, read) = if by_index {
-                    self.nameless_fetch_plan(sel, groups, window, explain.as_deref_mut())
+                    self.nameless_fetch_plan(tenant, sel, groups, window, explain.as_deref_mut())
                 } else {
-                    self.multi_fetch_plan(groups, lower_excl, upper_incl, explain.as_deref_mut())
+                    self.multi_fetch_plan(
+                        tenant,
+                        groups,
+                        lower_excl,
+                        upper_incl,
+                        explain.as_deref_mut(),
+                    )
                 };
                 if let Some(pred) = read {
                     reads.push(compile::SelectorRead {
@@ -831,9 +846,9 @@ impl MetricsEngine {
                 }
             }
 
-            let resolution = self
-                .resolver
-                .resolve_labelled(metric_name, &sel.matchers, window);
+            let resolution =
+                self.resolver
+                    .resolve_labelled(tenant, metric_name, &sel.matchers, window);
 
             // Issue #82 (retroactive re-review, Finding 1): the info()
             // cardinality cap on the WARM path, enforced BEFORE
@@ -886,6 +901,7 @@ impl MetricsEngine {
                     {
                         Ok(push) => {
                             self.stage_instant_push(
+                                tenant,
                                 selector_id,
                                 self_pos,
                                 push,
@@ -908,6 +924,7 @@ impl MetricsEngine {
                             // F6: today's fetch, built now and sent only if
                             // the statement counts a histogram sample.
                             let fallback = self.concrete_fetch_plan(
+                                tenant,
                                 selector_id,
                                 sel,
                                 resolution,
@@ -917,6 +934,7 @@ impl MetricsEngine {
                                 None,
                             );
                             self.stage_range_push(
+                                tenant,
                                 selector_id,
                                 self_pos,
                                 push,
@@ -935,6 +953,7 @@ impl MetricsEngine {
             }
 
             let fetch_plan = self.concrete_fetch_plan(
+                tenant,
                 selector_id,
                 sel,
                 resolution,
@@ -972,7 +991,9 @@ impl MetricsEngine {
             .selectors
             .iter()
             .zip(fetch_plans)
-            .map(|(sel, fetch_plan)| self.execute_fetch_plan(sel, fetch_plan, &sample_budget));
+            .map(|(sel, fetch_plan)| {
+                self.execute_fetch_plan(tenant, sel, fetch_plan, &sample_budget)
+            });
         let pushes = pending
             .into_iter()
             .map(|p| self.run_push(p, &sample_budget));
@@ -1038,7 +1059,12 @@ impl MetricsEngine {
         let refetched: Vec<Result<Vec<FetchedSeries>, ReadError>> =
             join_all(fallbacks.iter_mut().map(|(selector, fallback)| {
                 let fetch_plan = std::mem::replace(fallback, SelectorFetchPlan::Empty);
-                self.execute_fetch_plan(&plan.selectors[*selector], fetch_plan, &sample_budget)
+                self.execute_fetch_plan(
+                    tenant,
+                    &plan.selectors[*selector],
+                    fetch_plan,
+                    &sample_budget,
+                )
             }))
             .await;
         for ((selector, _), series) in fallbacks.into_iter().zip(refetched) {
@@ -1104,6 +1130,7 @@ impl MetricsEngine {
     #[allow(clippy::too_many_arguments)]
     fn concrete_fetch_plan(
         &self,
+        tenant: &Tenant,
         selector_id: SelectorId,
         sel: &SelectorSpec,
         resolution: LabelledResolution,
@@ -1156,13 +1183,19 @@ impl MetricsEngine {
                     }
                 }
                 let hist_sqls = build_hist_chunk_sqls(
+                    tenant,
                     &self.config.hist_samples_table,
                     fps.clone(),
                     lower_excl,
                     upper_incl,
                 );
-                let sqls =
-                    build_chunk_sqls(&self.config.samples_table, fps, lower_excl, upper_incl);
+                let sqls = build_chunk_sqls(
+                    tenant,
+                    &self.config.samples_table,
+                    fps,
+                    lower_excl,
+                    upper_incl,
+                );
                 if let Some(e) = explain.as_mut() {
                     // Chunk elision (finding 5): only the first chunk's
                     // SQL is surfaced verbatim; a note names how many
@@ -1206,12 +1239,14 @@ impl MetricsEngine {
                     });
                 }
                 let fetch_sql = sample_sql::sample_fetch_subquery(
+                    tenant,
                     &self.config.samples_table,
                     &sql,
                     lower_excl,
                     upper_incl,
                 );
                 let hist_sql = sample_sql::hist_sample_fetch_subquery(
+                    tenant,
                     &self.config.hist_samples_table,
                     &sql,
                     lower_excl,
@@ -1243,6 +1278,7 @@ impl MetricsEngine {
     #[allow(clippy::too_many_arguments)]
     fn stage_instant_push(
         &self,
+        tenant: &Tenant,
         selector_id: SelectorId,
         self_pos: usize,
         push: super::grouped::GroupedPush,
@@ -1252,6 +1288,7 @@ impl MetricsEngine {
         pending: &mut Vec<PendingPush>,
     ) {
         let sqls = build_grouped_sqls(
+            tenant,
             &self.config,
             &push,
             lower_excl,
@@ -1301,6 +1338,7 @@ impl MetricsEngine {
     #[allow(clippy::too_many_arguments)]
     fn stage_range_push(
         &self,
+        tenant: &Tenant,
         selector_id: SelectorId,
         self_pos: usize,
         push: super::grouped::RangePush,
@@ -1319,6 +1357,7 @@ impl MetricsEngine {
                     (
                         g0,
                         super::grouped_sql::range_aggregate_fetch(
+                            tenant,
                             &self.config.samples_table,
                             &self.config.hist_samples_table,
                             &fps,
@@ -1372,11 +1411,13 @@ impl MetricsEngine {
     /// scan.
     fn resolve_multi(
         &self,
+        tenant: &Tenant,
         sel: &SelectorSpec,
         window: DataWindow,
         mut explain: Option<&mut PlanExplain>,
     ) -> Result<Vec<MetricSeriesGroup>, ReadError> {
         let resolution = self.resolver.resolve_multi_metric(
+            tenant,
             &sel.name_matchers,
             &sel.matchers,
             window,
@@ -1472,13 +1513,19 @@ impl MetricsEngine {
     /// the cache's own error for the case, `OverCardinality`.
     async fn resolve_nameless(
         &self,
+        tenant: &Tenant,
         sel: &SelectorSpec,
         window: DataWindow,
         mut explain: Option<&mut PlanExplain>,
     ) -> Result<Vec<MetricSeriesGroup>, ReadError> {
         let cap = self.config.cache_max_series;
-        let sql =
-            super::sql::nameless_resolution_query(self.series_tables(), &sel.matchers, window, cap);
+        let sql = super::sql::nameless_resolution_query(
+            tenant,
+            self.series_tables(),
+            &sel.matchers,
+            window,
+            cap,
+        );
         let rows: Vec<super::rows::SeriesRow> = self.fetch_series_rows(sql.clone()).await?;
         if rows.len() as u64 > cap {
             return Err(ReadError::NamelessSelectorUnresolvable {
@@ -1534,13 +1581,15 @@ impl MetricsEngine {
     /// as [`Self::multi_fetch_plan`] does.
     fn nameless_fetch_plan(
         &self,
+        tenant: &Tenant,
         sel: &SelectorSpec,
         groups: Vec<MetricSeriesGroup>,
         window: DataWindow,
         mut explain: Option<&mut PlanExplain>,
     ) -> (SelectorFetchPlan, Option<Pred>) {
         let (lower_excl, upper_incl) = (window.start_ms, window.end_ms);
-        let ids = super::sql::nameless_ids_query(self.series_tables(), &sel.matchers, window);
+        let ids =
+            super::sql::nameless_ids_query(tenant, self.series_tables(), &sel.matchers, window);
         let mut labels_by: HashMap<Fingerprint, (String, LabelSet)> = HashMap::new();
         for g in groups {
             for (fp, labels) in g.series {
@@ -1548,12 +1597,14 @@ impl MetricsEngine {
             }
         }
         let sql = sample_sql::sample_fetch_subquery(
+            tenant,
             &self.config.samples_table,
             &ids,
             lower_excl,
             upper_incl,
         );
         let hist_sql = sample_sql::hist_sample_fetch_subquery(
+            tenant,
             &self.config.hist_samples_table,
             &ids,
             lower_excl,
@@ -1588,6 +1639,7 @@ impl MetricsEngine {
     /// #579 part 2 builds a pushed shape-A node's F6 fallback without it.
     fn multi_fetch_plan(
         &self,
+        tenant: &Tenant,
         groups: Vec<MetricSeriesGroup>,
         lower_excl: i64,
         upper_incl: i64,
@@ -1613,12 +1665,14 @@ impl MetricsEngine {
         }
 
         let sql = sample_sql::sample_fetch_multi(
+            tenant,
             &self.config.samples_table,
             &sql_literals(&fps),
             lower_excl,
             upper_incl,
         );
         let hist_sql = sample_sql::hist_sample_fetch_multi(
+            tenant,
             &self.config.hist_samples_table,
             &sql_literals(&fps),
             lower_excl,
@@ -1662,6 +1716,7 @@ impl MetricsEngine {
     /// legitimate queries whose sample volume is under budget).
     async fn execute_fetch_plan(
         &self,
+        tenant: &Tenant,
         sel: &SelectorSpec,
         fetch_plan: SelectorFetchPlan,
         budget: &SampleBudget,
@@ -1753,6 +1808,7 @@ impl MetricsEngine {
                 fps.sort_unstable();
                 fps.dedup();
                 let hydrate_sql = super::sql::series_labels_by_fingerprint(
+                    tenant,
                     &self.config.labels_table,
                     &[metric_name.to_string()],
                     &sql_literals(&fps),
@@ -1984,6 +2040,7 @@ impl MetricsEngine {
     /// filter, still window-bound in SQL.
     async fn discovery_series(
         &self,
+        tenant: &Tenant,
         filters: &[DiscoveryFilter],
         window: DataWindow,
     ) -> Result<Vec<(String, LabelSet)>, ReadError> {
@@ -1996,7 +2053,12 @@ impl MetricsEngine {
         let mut fetch_sqls: Vec<String> = Vec::with_capacity(effective.len());
         let mut probe_specs: Vec<ProbeSpec> = Vec::new();
         for filter in &effective {
-            match self.discovery_query_for(filter, window, DiscoveryProjection::SeriesLabels)? {
+            match self.discovery_query_for(
+                tenant,
+                filter,
+                window,
+                DiscoveryProjection::SeriesLabels,
+            )? {
                 Some(DiscoveryQuery::Sql(sql)) => fetch_sqls.push(sql),
                 Some(DiscoveryQuery::Probe {
                     name_matchers,
@@ -2016,12 +2078,13 @@ impl MetricsEngine {
         if !probe_specs.is_empty() {
             let probe_futs = probe_specs
                 .iter()
-                .map(|spec| self.probe_distinct_names(&spec.name_matchers, window));
+                .map(|spec| self.probe_distinct_names(tenant, &spec.name_matchers, window));
             let probe_results: Vec<Result<Vec<String>, ReadError>> = join_all(probe_futs).await;
             for (names, spec) in probe_results.into_iter().zip(&probe_specs) {
                 let names = names?;
                 if !names.is_empty() {
                     fetch_sqls.push(super::sql::discovery_fetch_by_names(
+                        tenant,
                         &self.config.series_table,
                         &self.config.labels_table,
                         &names,
@@ -2103,6 +2166,7 @@ impl MetricsEngine {
     /// statements found, and the series the other filters selected.
     async fn label_discovery(
         &self,
+        tenant: &Tenant,
         key: Option<&str>,
         filters: &[DiscoveryFilter],
         window: DataWindow,
@@ -2113,11 +2177,13 @@ impl MetricsEngine {
             if filter.metric_name.is_none() && filter.name_matchers.is_empty() {
                 sqls.push(match key {
                     None => super::sql::discovery_label_names_query(
+                        tenant,
                         self.series_tables(),
                         &filter,
                         window,
                     ),
                     Some(k) => super::sql::discovery_label_values_query(
+                        tenant,
                         self.series_tables(),
                         k,
                         &filter,
@@ -2152,7 +2218,7 @@ impl MetricsEngine {
             if rest.is_empty() {
                 Ok(Vec::new())
             } else {
-                self.discovery_series(&rest, window).await
+                self.discovery_series(tenant, &rest, window).await
             }
         };
         let (indexed, others) = join(indexed, others).await;
@@ -2165,12 +2231,13 @@ impl MetricsEngine {
 
     fn discovery_query_for(
         &self,
+        tenant: &Tenant,
         filter: &DiscoveryFilter,
         window: DataWindow,
         projection: DiscoveryProjection,
     ) -> Result<Option<DiscoveryQuery>, ReadError> {
         if !takes_plain_discovery_route(filter) {
-            return self.discovery_multi_query(filter, window);
+            return self.discovery_multi_query(tenant, filter, window);
         }
         // Issue #635: a name-less filter with a positive label matcher
         // reads its IDs from the label index; every other filter renders
@@ -2178,10 +2245,10 @@ impl MetricsEngine {
         let discovery_query = || {
             DiscoveryQuery::Sql(match projection {
                 DiscoveryProjection::SeriesLabels => {
-                    super::sql::discovery_series_query(self.series_tables(), filter, window)
+                    super::sql::discovery_series_query(tenant, self.series_tables(), filter, window)
                 }
                 DiscoveryProjection::MetricNamesOnly => {
-                    super::sql::discovery_names_query(self.series_tables(), filter, window)
+                    super::sql::discovery_names_query(tenant, self.series_tables(), filter, window)
                 }
             })
         };
@@ -2222,10 +2289,12 @@ impl MetricsEngine {
     /// query against a healthy one).
     fn discovery_multi_query(
         &self,
+        tenant: &Tenant,
         filter: &DiscoveryFilter,
         window: DataWindow,
     ) -> Result<Option<DiscoveryQuery>, ReadError> {
         let resolution = self.resolver.resolve_multi_metric(
+            tenant,
             &filter.name_matchers,
             &filter.matchers,
             window,
@@ -2273,6 +2342,7 @@ impl MetricsEngine {
         fps.dedup();
         Ok(Some(DiscoveryQuery::Sql(
             super::sql::discovery_fetch_multi(
+                tenant,
                 &self.config.series_table,
                 &self.config.labels_table,
                 &names,
@@ -2298,11 +2368,13 @@ impl MetricsEngine {
     /// wall-time).
     async fn probe_distinct_names(
         &self,
+        tenant: &Tenant,
         name_matchers: &[super::matcher::LabelMatcher],
         window: DataWindow,
     ) -> Result<Vec<String>, ReadError> {
         let cap = self.config.max_metric_fanout;
         let sql = super::sql::distinct_metric_names_probe(
+            tenant,
             &self.config.series_table,
             &self.config.labels_table,
             name_matchers,
@@ -2327,10 +2399,11 @@ impl MetricsEngine {
     /// `__name__` as a known label name.
     pub async fn label_names(
         &self,
+        tenant: &Tenant,
         filters: &[DiscoveryFilter],
         window: DataWindow,
     ) -> Result<Vec<String>, ReadError> {
-        let (keys, series) = self.label_discovery(None, filters, window).await?;
+        let (keys, series) = self.label_discovery(tenant, None, filters, window).await?;
         let mut names: std::collections::BTreeSet<String> = keys.into_iter().collect();
         names.insert("__name__".to_string());
         for (_, labels) in &series {
@@ -2362,6 +2435,7 @@ impl MetricsEngine {
     /// that mixes both route kinds.
     async fn discovery_metric_names(
         &self,
+        tenant: &Tenant,
         filters: &[DiscoveryFilter],
         window: DataWindow,
     ) -> Result<Vec<String>, ReadError> {
@@ -2373,7 +2447,12 @@ impl MetricsEngine {
                 wide.push(filter.clone());
                 continue;
             }
-            match self.discovery_query_for(filter, window, DiscoveryProjection::MetricNamesOnly)? {
+            match self.discovery_query_for(
+                tenant,
+                filter,
+                window,
+                DiscoveryProjection::MetricNamesOnly,
+            )? {
                 Some(DiscoveryQuery::Sql(sql)) => narrow_sqls.push(sql),
                 // Unreachable while `discovery_query_for` branches on
                 // `takes_plain_discovery_route`: the plain arm returns
@@ -2397,7 +2476,7 @@ impl MetricsEngine {
             if wide.is_empty() {
                 Ok(Vec::new())
             } else {
-                self.discovery_series(&wide, window).await
+                self.discovery_series(tenant, &wide, window).await
             }
         };
         let (narrow_results, wide_result) = join(narrow, wide_series).await;
@@ -2422,14 +2501,17 @@ impl MetricsEngine {
     /// blob and discarding it.
     pub async fn label_values(
         &self,
+        tenant: &Tenant,
         name: &str,
         filters: &[DiscoveryFilter],
         window: DataWindow,
     ) -> Result<Vec<String>, ReadError> {
         if name == "__name__" {
-            return self.discovery_metric_names(filters, window).await;
+            return self.discovery_metric_names(tenant, filters, window).await;
         }
-        let (found, series) = self.label_discovery(Some(name), filters, window).await?;
+        let (found, series) = self
+            .label_discovery(tenant, Some(name), filters, window)
+            .await?;
         let mut values: std::collections::BTreeSet<String> = found.into_iter().collect();
         for (_, labels) in &series {
             if let Some(v) = labels.get(name) {
@@ -2446,10 +2528,11 @@ impl MetricsEngine {
     /// required), not re-validated here.
     pub async fn series(
         &self,
+        tenant: &Tenant,
         filters: &[DiscoveryFilter],
         window: DataWindow,
     ) -> Result<Vec<Vec<(String, String)>>, ReadError> {
-        let series = self.discovery_series(filters, window).await?;
+        let series = self.discovery_series(tenant, filters, window).await?;
         let mut out: Vec<Vec<(String, String)>> = series
             .into_iter()
             .map(|(metric_name, labels)| {
@@ -2472,10 +2555,11 @@ impl MetricsEngine {
     /// contract — never stripped/derived here).
     pub async fn metadata(
         &self,
+        tenant: &Tenant,
         metric: Option<&str>,
         limit: Option<usize>,
     ) -> Result<Vec<MetricMeta>, ReadError> {
-        let sql = super::sql::metadata_query(&self.config.metadata_table, metric, limit);
+        let sql = super::sql::metadata_query(tenant, &self.config.metadata_table, metric, limit);
         let rows: Vec<MetricMetaRow> = self.fetch_rows(sql).await?;
         Ok(rows
             .into_iter()
@@ -2494,8 +2578,8 @@ impl MetricsEngine {
     /// freshness = cache age. `async` only for call-site parity with
     /// every other `MetricsEngine` method; this never actually awaits
     /// anything.
-    pub async fn tsdb_status(&self) -> Result<TsdbStatus, ReadError> {
-        let cache_snapshot = self.resolver.tsdb_snapshot();
+    pub async fn tsdb_status(&self, tenant: &Tenant) -> Result<TsdbStatus, ReadError> {
+        let cache_snapshot = self.resolver.tsdb_snapshot(tenant);
         Ok(TsdbStatus {
             num_series: cache_snapshot.num_series,
             series_count_by_metric_name: cache_snapshot.series_count_by_metric_name,
@@ -2963,6 +3047,7 @@ impl Drop for CancelOnDrop {
 /// loop, making the real SQL available for explain before any fetch
 /// starts.
 fn build_chunk_sqls(
+    tenant: &Tenant,
     samples_table: &str,
     mut fps: Vec<Fingerprint>,
     lower_excl_ms: i64,
@@ -2971,7 +3056,9 @@ fn build_chunk_sqls(
     fps.sort_unstable();
     sample_sql::chunk_fingerprints(&sql_literals(&fps), sample_sql::CHUNK_THRESHOLD)
         .into_iter()
-        .map(|chunk| sample_sql::sample_fetch(samples_table, chunk, lower_excl_ms, upper_incl_ms))
+        .map(|chunk| {
+            sample_sql::sample_fetch(tenant, samples_table, chunk, lower_excl_ms, upper_incl_ms)
+        })
         .collect()
 }
 
@@ -2985,6 +3072,7 @@ fn build_chunk_sqls(
 /// ascending fingerprint, so a chunk boundary falls where the sample
 /// fetch's does; over several names it is `(metric_name, fingerprint)`.
 fn build_grouped_sqls(
+    tenant: &Tenant,
     config: &MetricsConfig,
     push: &super::grouped::GroupedPush,
     lower_excl_ms: i64,
@@ -2996,6 +3084,7 @@ fn build_grouped_sqls(
     for chunk in sample_sql::chunk_fingerprints(&sql_literals(&push.fingerprints), chunk_size) {
         let gids = &push.gids[start..start + chunk.len()];
         out.push(super::grouped_sql::grouped_fetch(
+            tenant,
             &config.samples_table,
             &config.hist_samples_table,
             chunk,
@@ -3017,6 +3106,7 @@ fn build_grouped_sqls(
 /// (both prune the identical granules; the complementary read is zero-
 /// granule for a pure-float fingerprint — the EXPLAIN gate).
 fn build_hist_chunk_sqls(
+    tenant: &Tenant,
     hist_samples_table: &str,
     mut fps: Vec<Fingerprint>,
     lower_excl_ms: i64,
@@ -3026,7 +3116,13 @@ fn build_hist_chunk_sqls(
     sample_sql::chunk_fingerprints(&sql_literals(&fps), sample_sql::CHUNK_THRESHOLD)
         .into_iter()
         .map(|chunk| {
-            sample_sql::hist_sample_fetch(hist_samples_table, chunk, lower_excl_ms, upper_incl_ms)
+            sample_sql::hist_sample_fetch(
+                tenant,
+                hist_samples_table,
+                chunk,
+                lower_excl_ms,
+                upper_incl_ms,
+            )
         })
         .collect()
 }
@@ -3759,6 +3855,11 @@ fn value_to_query_result(value: QueryValue) -> QueryResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The single-tenant deployment's tenant: no `X-Scope-OrgID`.
+    fn no_tenant() -> Tenant {
+        Tenant::from_header(None, false).expect("no header is the empty tenant")
+    }
     use pulsus_promql::Point;
     use pulsus_promql::eval::aggregation;
 
@@ -3989,7 +4090,7 @@ mod tests {
     fn metrics_default_envelope_fits_the_query_text_cap_and_exceeds_the_ch_default() {
         let fps: Vec<FpLiteral> =
             std::iter::repeat_n(Fingerprint::from_raw(u128::MAX).sql_literal(), 50_000).collect();
-        let sql = sample_sql::sample_fetch_multi("metric_samples", &fps, 0, i64::MAX);
+        let sql = sample_sql::sample_fetch_multi(&no_tenant(), "metric_samples", &fps, 0, i64::MAX);
         let bytes = sql.len() as u64;
         assert!(
             bytes > 262_144,
@@ -4011,7 +4112,7 @@ mod tests {
         let fps: Vec<FpLiteral> =
             std::iter::repeat_n(Fingerprint::from_raw(u128::MAX).sql_literal(), 1_000_000)
                 .collect();
-        let sql = sample_sql::sample_fetch_multi("metric_samples", &fps, 0, i64::MAX);
+        let sql = sample_sql::sample_fetch_multi(&no_tenant(), "metric_samples", &fps, 0, i64::MAX);
         match crate::querytext::ensure_query_text_fits(&sql) {
             Err(TooBroadReason::QueryTextBytes { .. }) => {}
             other => panic!("expected QueryTextBytes rejection, got {other:?}"),
@@ -4050,6 +4151,7 @@ mod tests {
         // single resulting SQL's `IN (...)` list must read ascending
         // regardless of input order.
         let sqls = build_chunk_sqls(
+            &no_tenant(),
             "metric_samples",
             vec![
                 Fingerprint::from_raw(3),
@@ -4070,7 +4172,7 @@ mod tests {
     #[test]
     fn build_chunk_sqls_splits_at_the_chunk_threshold() {
         let fps: Vec<Fingerprint> = (0..1_200).map(Fingerprint::from_raw).collect();
-        let sqls = build_chunk_sqls("metric_samples", fps, 0, 100);
+        let sqls = build_chunk_sqls(&no_tenant(), "metric_samples", fps, 0, 100);
         assert_eq!(sqls.len(), 3);
     }
 

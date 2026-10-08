@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use pulsus_clickhouse::ChClient;
-use pulsus_model::{Fingerprint, LabelSet};
+use pulsus_model::{Fingerprint, LabelSet, Tenant};
 use pulsus_promql::re2_pattern_to_rust;
 use regex::Regex;
 
@@ -528,6 +528,7 @@ pub trait SeriesResolver {
     /// and deduped.
     fn resolve(
         &self,
+        tenant: &Tenant,
         metric_name: &str,
         matchers: &[LabelMatcher],
         window: DataWindow,
@@ -665,11 +666,13 @@ fn matches(
 /// never disagree on *which* sub-query a given fallback reason renders.
 fn sql_fallback_sql(
     config: &LabelCacheConfig,
+    tenant: &Tenant,
     metric_name: &str,
     window: DataWindow,
     matchers: &[LabelMatcher],
 ) -> String {
     super::sql::historical_series_subquery(
+        tenant,
         &config.series_table,
         &config.labels_table,
         metric_name,
@@ -702,26 +705,28 @@ fn re2_authority_fallback(
 
 fn sql_fallback(
     config: &LabelCacheConfig,
+    tenant: &Tenant,
     metric_name: &str,
     window: DataWindow,
     matchers: &[LabelMatcher],
     reason: FallbackReason,
 ) -> Resolution {
     Resolution::SqlFallback {
-        sql: sql_fallback_sql(config, metric_name, window, matchers),
+        sql: sql_fallback_sql(config, tenant, metric_name, window, matchers),
         reason,
     }
 }
 
 fn labelled_sql_fallback(
     config: &LabelCacheConfig,
+    tenant: &Tenant,
     metric_name: &str,
     window: DataWindow,
     matchers: &[LabelMatcher],
     reason: FallbackReason,
 ) -> LabelledResolution {
     LabelledResolution::SqlFallback {
-        sql: sql_fallback_sql(config, metric_name, window, matchers),
+        sql: sql_fallback_sql(config, tenant, metric_name, window, matchers),
         reason,
     }
 }
@@ -749,11 +754,13 @@ fn labelled_sql_fallback(
 /// one refresh interval in normal operation (worst case
 /// `staleness_threshold_ms = staleness_multiplier * ttl`), after which the
 /// query is forced to the SQL fallback — see docs/architecture.md §5.2.
+#[allow(clippy::too_many_arguments)] // the tenant beside the resolver's own inputs
 pub(crate) fn resolve_over(
     snapshot: &CacheSnapshot,
     regex_cache: &RegexCache,
     metrics: &CacheMetrics,
     config: &LabelCacheConfig,
+    tenant: &Tenant,
     metric_name: &str,
     matchers: &[LabelMatcher],
     window: DataWindow,
@@ -762,6 +769,7 @@ pub(crate) fn resolve_over(
         metrics.miss_cold_total.fetch_add(1, Ordering::Relaxed);
         return sql_fallback(
             config,
+            tenant,
             metric_name,
             window,
             matchers,
@@ -775,6 +783,7 @@ pub(crate) fn resolve_over(
             .fetch_add(1, Ordering::Relaxed);
         return sql_fallback(
             config,
+            tenant,
             metric_name,
             window,
             matchers,
@@ -792,6 +801,7 @@ pub(crate) fn resolve_over(
         metrics.miss_stale_total.fetch_add(1, Ordering::Relaxed);
         return sql_fallback(
             config,
+            tenant,
             metric_name,
             window,
             matchers,
@@ -800,7 +810,7 @@ pub(crate) fn resolve_over(
     }
 
     if let Some(reason) = re2_authority_fallback(matchers, metrics) {
-        return sql_fallback(config, metric_name, window, matchers, reason);
+        return sql_fallback(config, tenant, metric_name, window, matchers, reason);
     }
 
     let Some(candidates) = snapshot.by_metric.get(metric_name) else {
@@ -820,7 +830,7 @@ pub(crate) fn resolve_over(
                 metrics
                     .miss_regex_unsupported_total
                     .fetch_add(1, Ordering::Relaxed);
-                return sql_fallback(config, metric_name, window, matchers, reason);
+                return sql_fallback(config, tenant, metric_name, window, matchers, reason);
             }
         }
     }
@@ -832,6 +842,7 @@ pub(crate) fn resolve_over(
         let matched_count = matched.len();
         return sql_fallback(
             config,
+            tenant,
             metric_name,
             window,
             matchers,
@@ -859,11 +870,13 @@ pub(crate) fn resolve_over(
 /// second (possibly-swapped) snapshot read — reading the snapshot once and
 /// walking it once for both fingerprint and label output avoids that
 /// race entirely.
+#[allow(clippy::too_many_arguments)] // the tenant beside the resolver's own inputs
 pub(crate) fn resolve_labelled_over(
     snapshot: &CacheSnapshot,
     regex_cache: &RegexCache,
     metrics: &CacheMetrics,
     config: &LabelCacheConfig,
+    tenant: &Tenant,
     metric_name: &str,
     matchers: &[LabelMatcher],
     window: DataWindow,
@@ -872,6 +885,7 @@ pub(crate) fn resolve_labelled_over(
         metrics.miss_cold_total.fetch_add(1, Ordering::Relaxed);
         return labelled_sql_fallback(
             config,
+            tenant,
             metric_name,
             window,
             matchers,
@@ -885,6 +899,7 @@ pub(crate) fn resolve_labelled_over(
             .fetch_add(1, Ordering::Relaxed);
         return labelled_sql_fallback(
             config,
+            tenant,
             metric_name,
             window,
             matchers,
@@ -902,6 +917,7 @@ pub(crate) fn resolve_labelled_over(
         metrics.miss_stale_total.fetch_add(1, Ordering::Relaxed);
         return labelled_sql_fallback(
             config,
+            tenant,
             metric_name,
             window,
             matchers,
@@ -910,7 +926,7 @@ pub(crate) fn resolve_labelled_over(
     }
 
     if let Some(reason) = re2_authority_fallback(matchers, metrics) {
-        return labelled_sql_fallback(config, metric_name, window, matchers, reason);
+        return labelled_sql_fallback(config, tenant, metric_name, window, matchers, reason);
     }
 
     let Some(candidates) = snapshot.by_metric.get(metric_name) else {
@@ -930,7 +946,14 @@ pub(crate) fn resolve_labelled_over(
                 metrics
                     .miss_regex_unsupported_total
                     .fetch_add(1, Ordering::Relaxed);
-                return labelled_sql_fallback(config, metric_name, window, matchers, reason);
+                return labelled_sql_fallback(
+                    config,
+                    tenant,
+                    metric_name,
+                    window,
+                    matchers,
+                    reason,
+                );
             }
         }
     }
@@ -942,6 +965,7 @@ pub(crate) fn resolve_labelled_over(
         let matched_count = matched.len();
         return labelled_sql_fallback(
             config,
+            tenant,
             metric_name,
             window,
             matchers,
@@ -988,6 +1012,12 @@ impl LabelCache {
     /// leaves the last good snapshot in place — see
     /// [`super::refresh::run_sweep`]'s doc comment.
     pub async fn refresh(&self) -> Result<(), pulsus_clickhouse::ChError> {
+        super::refresh::run_sweep(self).await
+    }
+
+    /// One sweep of `tenant`'s cache (issue #635 part 4).
+    pub async fn refresh_tenant(&self, tenant: &Tenant) -> Result<(), pulsus_clickhouse::ChError> {
+        let _ = tenant;
         super::refresh::run_sweep(self).await
     }
 
@@ -1073,7 +1103,8 @@ impl LabelCache {
     /// cache (`generation == 0`) yields an all-zero, empty summary rather
     /// than a ClickHouse fallback query (task-manager resolution #2: "no
     /// SQL variant for M2").
-    pub fn tsdb_snapshot(&self) -> TsdbCacheSnapshot {
+    pub fn tsdb_snapshot(&self, tenant: &Tenant) -> TsdbCacheSnapshot {
+        let _ = tenant;
         tsdb_snapshot_over(&self.current_snapshot())
     }
 }
@@ -1081,6 +1112,7 @@ impl LabelCache {
 impl SeriesResolver for LabelCache {
     fn resolve(
         &self,
+        tenant: &Tenant,
         metric_name: &str,
         matchers: &[LabelMatcher],
         window: DataWindow,
@@ -1091,6 +1123,7 @@ impl SeriesResolver for LabelCache {
             &self.regex_cache,
             &self.metrics,
             &self.config,
+            tenant,
             metric_name,
             matchers,
             window,
@@ -1109,6 +1142,7 @@ impl LabelCache {
     /// instead.
     pub fn resolve_labelled(
         &self,
+        tenant: &Tenant,
         metric_name: &str,
         matchers: &[LabelMatcher],
         window: DataWindow,
@@ -1119,6 +1153,7 @@ impl LabelCache {
             &self.regex_cache,
             &self.metrics,
             &self.config,
+            tenant,
             metric_name,
             matchers,
             window,
@@ -1135,12 +1170,14 @@ impl LabelCache {
     /// reader/query caps, not cache-shape parameters).
     pub fn resolve_multi_metric(
         &self,
+        tenant: &Tenant,
         name_matchers: &[LabelMatcher],
         matchers: &[LabelMatcher],
         window: DataWindow,
         fanout_cap: u64,
         scan_budget: u64,
     ) -> MultiMetricResolution {
+        let _ = tenant;
         let snapshot = self.current_snapshot();
         resolve_multi_metric_over(
             &snapshot,
@@ -1376,7 +1413,16 @@ mod tests {
     ) -> Resolution {
         let regex_cache = RegexCache::new(REGEX_CACHE_CAPACITY);
         let metrics = CacheMetrics::default();
-        resolve_over(snap, &regex_cache, &metrics, cfg, metric_name, matchers, w)
+        resolve_over(
+            snap,
+            &regex_cache,
+            &metrics,
+            cfg,
+            &Tenant::from_header(None, false).expect("the empty tenant"),
+            metric_name,
+            matchers,
+            w,
+        )
     }
 
     #[test]
@@ -2002,7 +2048,16 @@ mod tests {
     ) -> LabelledResolution {
         let regex_cache = RegexCache::new(REGEX_CACHE_CAPACITY);
         let metrics = CacheMetrics::default();
-        resolve_labelled_over(snap, &regex_cache, &metrics, cfg, metric_name, matchers, w)
+        resolve_labelled_over(
+            snap,
+            &regex_cache,
+            &metrics,
+            cfg,
+            &Tenant::from_header(None, false).expect("the empty tenant"),
+            metric_name,
+            matchers,
+            w,
+        )
     }
 
     #[test]

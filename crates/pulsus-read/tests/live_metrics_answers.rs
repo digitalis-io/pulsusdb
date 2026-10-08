@@ -962,12 +962,20 @@ async fn harness(db: &str) -> Harness {
 impl Harness {
     async fn read_path(&self, query: &str, p: &MetricQueryParams) -> Answer {
         let expr = parse(query).expect("parse");
-        let (result, _ann) = self.engine.query(&expr, p).await.expect("query");
+        let (result, _ann) = self
+            .engine
+            .query(&no_tenant(), &expr, p)
+            .await
+            .expect("query");
         answer_from_result(result)
     }
     async fn read_path_cold(&self, query: &str, p: &MetricQueryParams) -> Answer {
         let expr = parse(query).expect("parse");
-        let (result, _ann) = self.cold_engine.query(&expr, p).await.expect("query");
+        let (result, _ann) = self
+            .cold_engine
+            .query(&no_tenant(), &expr, p)
+            .await
+            .expect("query");
         answer_from_result(result)
     }
     fn memory(&self, query: &str, p: &MetricQueryParams) -> Answer {
@@ -1684,7 +1692,11 @@ async fn two_series_sharing_a_label_set_reach_the_evaluator_as_two_series() {
     let h = harness(&pulsus_testkit::test_db("pulsus_read_it_answers_dup")).await;
     let p = h.instant();
     let expr = parse("dup_labels").expect("parse");
-    let err = h.engine.query(&expr, &p).await.expect_err("must reject");
+    let err = h
+        .engine
+        .query(&no_tenant(), &expr, &p)
+        .await
+        .expect_err("must reject");
     assert_eq!(
         format!("{err:?}"),
         r#"Promql(LabelSet { detail: "vector cannot contain metrics with the same labelset" })"#,
@@ -1873,4 +1885,10 @@ async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
         .insert_block("metric_labels", &labels)
         .await
         .expect("seed metric_labels");
+}
+
+/// The single-tenant deployment's tenant: no `X-Scope-OrgID`.
+#[allow(dead_code)]
+fn no_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("no header is the empty tenant")
 }

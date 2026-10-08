@@ -407,7 +407,7 @@ impl Harness {
         let expr = parse(query).expect("parse");
         let (_result, _ann, explain) = self
             .engine
-            .query_explained(&expr, &self.range())
+            .query_explained(&no_tenant(), &expr, &self.range())
             .await
             .expect("query_explained");
         explain
@@ -416,7 +416,7 @@ impl Harness {
     async fn unexplained(&self, query: &str) {
         let expr = parse(query).expect("parse");
         self.engine
-            .query(&expr, &self.range())
+            .query(&no_tenant(), &expr, &self.range())
             .await
             .expect("query");
     }
@@ -874,4 +874,10 @@ async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
         .insert_block("metric_labels", &labels)
         .await
         .expect("seed metric_labels");
+}
+
+/// The single-tenant deployment's tenant: no `X-Scope-OrgID`.
+#[allow(dead_code)]
+fn no_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("no header is the empty tenant")
 }

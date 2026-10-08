@@ -519,6 +519,7 @@ struct RecordingSink {
 impl pulsus_write::MetricSink for RecordingSink {
     fn admit(
         &self,
+        _tenant: &pulsus_model::Tenant,
         batch: pulsus_write::ParsedMetrics,
         _push: pulsus_write::PushHeaders,
     ) -> Result<(), pulsus_write::AdmitRefusal> {
@@ -528,6 +529,7 @@ impl pulsus_write::MetricSink for RecordingSink {
 
     fn admit_flush(
         &self,
+        _tenant: &pulsus_model::Tenant,
         batch: pulsus_write::ParsedMetrics,
         _push: pulsus_write::PushHeaders,
     ) -> Result<pulsus_write::FlushWait, pulsus_write::AdmitRefusal> {

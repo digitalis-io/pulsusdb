@@ -2376,10 +2376,19 @@ async fn name_values_narrow_projection_reads_far_fewer_bytes_and_is_blob_invaria
     for (tag, table) in [("small", "series_small"), ("big", "series_big")] {
         let qualified = format!("{db}.{table}");
         let labels = format!("{db}.labels_{tag}");
-        let wide_sql =
-            pulsus_read::metrics::sql::discovery_query(&qualified, &labels, &filter, window);
+        let wide_sql = pulsus_read::metrics::sql::discovery_query(
+            &no_tenant(),
+            &qualified,
+            &labels,
+            &filter,
+            window,
+        );
         let narrow_sql = pulsus_read::metrics::sql::discovery_distinct_names_query(
-            &qualified, &labels, &filter, window,
+            &no_tenant(),
+            &qualified,
+            &labels,
+            &filter,
+            window,
         );
         let wide = run_name_projection::<pulsus_read::metrics::rows::SeriesRow>(
             &client,
@@ -9020,6 +9029,7 @@ async fn a_named_read_reads_its_metric() {
         (
             "statement 1",
             pulsus_read::metrics::sql::historical_series_subquery(
+                &no_tenant(),
                 "metric_series",
                 "metric_labels",
                 "m_q",
@@ -9031,6 +9041,7 @@ async fn a_named_read_reads_its_metric() {
         (
             "statement 2",
             pulsus_read::metrics::sql::discovery_query(
+                &no_tenant(),
                 "metric_series",
                 "metric_labels",
                 &filter,
@@ -9041,6 +9052,7 @@ async fn a_named_read_reads_its_metric() {
         (
             "statement 3",
             pulsus_read::metrics::sql::discovery_distinct_names_query(
+                &no_tenant(),
                 "metric_series",
                 "metric_labels",
                 &filter,
@@ -9124,6 +9136,7 @@ async fn a_metrics_samples_are_one_key_range() {
         .map(|s| series_id_623("m_7", s).sql_literal())
         .collect();
     let sql = pulsus_read::metrics::sample_sql::sample_fetch(
+        &no_tenant(),
         "metric_samples",
         &fps,
         day - 1,
@@ -9290,4 +9303,10 @@ async fn multi_name_rate_is_one_statement_per_chunk() {
         "every statement is shape A: {summary:?}"
     );
     h.finish().await;
+}
+
+/// The single-tenant deployment's tenant: no `X-Scope-OrgID`.
+#[allow(dead_code)]
+fn no_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("no header is the empty tenant")
 }

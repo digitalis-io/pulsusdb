@@ -329,7 +329,7 @@ async fn peak_over_push(push: ParsedMetrics, poison: bool) -> Measured {
     );
     let peak = peak_bytes_of(async {
         let wait = writer
-            .admit_flush(push, PushHeaders::default())
+            .admit_flush(&no_tenant(), push, PushHeaders::default())
             .expect("the queue has room");
         let answer = tokio::time::timeout(Duration::from_secs(60), wait)
             .await
@@ -860,4 +860,10 @@ fn spooling_a_trace_block_holds_no_copy_of_the_push() {
             long.abs_diff(short)
         );
     });
+}
+
+/// The single-tenant deployment's tenant: no `X-Scope-OrgID`.
+#[allow(dead_code)]
+fn no_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("no header is the empty tenant")
 }

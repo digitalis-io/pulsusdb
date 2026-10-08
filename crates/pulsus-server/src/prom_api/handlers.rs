@@ -308,8 +308,13 @@ async fn run_query(
     // the encoder's deterministic label sort.
     let ordered = query_params.step_ms == 0 && pulsus_promql::expr_is_sort_root(expr);
     if explain {
-        let (result, annotations, plan_explain) =
-            engine.query_explained(expr, query_params).await?;
+        let (result, annotations, plan_explain) = engine
+            .query_explained(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+                expr,
+                query_params,
+            )
+            .await?;
         Ok(encode::query_response_annotated(
             result,
             Some(plan_explain),
@@ -319,7 +324,13 @@ async fn run_query(
             &annotations,
         ))
     } else {
-        let (result, annotations) = engine.query(expr, query_params).await?;
+        let (result, annotations) = engine
+            .query(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+                expr,
+                query_params,
+            )
+            .await?;
         Ok(encode::query_response_annotated(
             result,
             None,
@@ -367,7 +378,13 @@ async fn labels_impl(state: AppState, pairs: Vec<(String, String)>) -> Result<Re
     let matches = params::get_all(&pairs, "match[]");
     let filters = parse_match_selectors(&matches)?;
     let engine = engine_for(&state).await?;
-    let names = engine.label_names(&filters, window).await?;
+    let names = engine
+        .label_names(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            &filters,
+            window,
+        )
+        .await?;
     let warn = truncated(&names, limit);
     Ok(encode::string_array_response(
         truncate(names, limit),
@@ -431,7 +448,14 @@ async fn label_values_impl(
     let matches = params::get_all(&pairs, "match[]");
     let filters = parse_match_selectors(&matches)?;
     let engine = engine_for(&state).await?;
-    let values = engine.label_values(name, &filters, window).await?;
+    let values = engine
+        .label_values(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            name,
+            &filters,
+            window,
+        )
+        .await?;
     let warn = truncated(&values, limit);
     Ok(encode::string_array_response(
         truncate(values, limit),
@@ -476,7 +500,13 @@ async fn series_impl(state: AppState, pairs: Vec<(String, String)>) -> Result<Re
     let limit = params::parse_discovery_limit(params::get(&pairs, "limit"))?;
     let filters = parse_match_selectors(&matches)?;
     let engine = engine_for(&state).await?;
-    let data = engine.series(&filters, window).await?;
+    let data = engine
+        .series(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            &filters,
+            window,
+        )
+        .await?;
     let warn = truncated(&data, limit);
     Ok(encode::series_response(
         truncate(data, limit),
@@ -502,7 +532,13 @@ async fn metadata_impl(
     let metric = params::metric(&pairs);
     let limit = params::parse_limit(params::get(&pairs, "limit"))?;
     let engine = engine_for(&state).await?;
-    let items = engine.metadata(metric, limit).await?;
+    let items = engine
+        .metadata(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            metric,
+            limit,
+        )
+        .await?;
     Ok(encode::metadata_response(items))
 }
 
@@ -558,7 +594,9 @@ pub(crate) async fn status_tsdb(State(state): State<AppState>) -> Response {
 
 async fn status_tsdb_impl(state: AppState) -> Result<Response, ApiError> {
     let engine = engine_for(&state).await?;
-    let status = engine.tsdb_status().await?;
+    let status = engine
+        .tsdb_status(&pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"))
+        .await?;
     Ok(encode::status_tsdb_response(status))
 }
 

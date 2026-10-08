@@ -257,13 +257,19 @@ struct CountingSink {
 }
 
 impl MetricSink for CountingSink {
-    fn admit(&self, batch: ParsedMetrics, _push: PushHeaders) -> Result<(), AdmitRefusal> {
+    fn admit(
+        &self,
+        _tenant: &pulsus_model::Tenant,
+        batch: ParsedMetrics,
+        _push: PushHeaders,
+    ) -> Result<(), AdmitRefusal> {
         self.admitted.lock().expect("sink lock").push(batch);
         Ok(())
     }
 
     fn admit_flush(
         &self,
+        _tenant: &pulsus_model::Tenant,
         batch: ParsedMetrics,
         _push: PushHeaders,
     ) -> Result<FlushWait, AdmitRefusal> {

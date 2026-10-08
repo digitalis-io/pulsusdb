@@ -546,9 +546,18 @@ async fn multi_name_declines_keep_todays_route() {
             Arc::clone(&cold),
             engine_config(&db, push),
         );
-        errors.push(format!("{:?}", engine.query(&expr, &p).await.err()));
+        errors.push(format!(
+            "{:?}",
+            engine.query(&no_tenant(), &expr, &p).await.err()
+        ));
     }
     assert!(errors[0] != "None", "a cold cache answers an error");
     assert_eq!(errors[0], errors[1], "{q}: the cold-cache error differs");
     h.finish().await;
+}
+
+/// The single-tenant deployment's tenant: no `X-Scope-OrgID`.
+#[allow(dead_code)]
+fn no_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("no header is the empty tenant")
 }

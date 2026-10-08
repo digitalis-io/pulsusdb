@@ -617,7 +617,7 @@ impl Harness {
     pub async fn run(engine: &MetricsEngine, query: &str, p: &MetricQueryParams) -> Routed {
         let expr = parse(query).expect("parse");
         let (r, a, e) = engine
-            .query_explained(&expr, p)
+            .query_explained(&no_tenant(), &expr, p)
             .await
             .unwrap_or_else(|err| panic!("{query}: {err:?}"));
         Routed {
@@ -748,4 +748,10 @@ pub async fn statements_since(admin: &ChClient, db: &str, marker: &str) -> Vec<L
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     panic!("the query log never settled for {db}");
+}
+
+/// The single-tenant deployment's tenant: no `X-Scope-OrgID`.
+#[allow(dead_code)]
+fn no_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("no header is the empty tenant")
 }
