@@ -917,7 +917,7 @@ impl Lower<Tql> for MembershipLower {
     }
 
     /// **Not the default.** [`Lower::fidelity`]'s default is
-    /// [`Fidelity::Wider`] (`crates/pulsus-read/src/compile/fold.rs:932-938`),
+    /// [`Fidelity::Wider`] (`crates/pulsus-read/src/compile/fold.rs:923-929`),
     /// and `fold.rs:974` clears `rel.exact` for anything but
     /// `Equivalent`. The column is the condition — the located element's
     /// value test, neither weaker nor stronger — so `Equivalent` is what
@@ -2302,10 +2302,10 @@ mod tests {
     /// `match` below has **no `_` arm**, so a ninth variant fails to
     /// build this binary rather than joining them.
     ///
-    /// **Two of the eight are LogQL's and are witnessed by a LogQL
-    /// chain**, not pretended to be TraceQL's: `NoRowToComputeFrom` is
-    /// `absent_over_time`'s (the answer is a statement about rows that
-    /// are absent) and `ResponseBuild` is that language's `Emit`.
+    /// **One of the seven is LogQL's and is witnessed by a LogQL chain**,
+    /// not pretended to be TraceQL's: `ResponseBuild` is that language's
+    /// `Emit`. (`NoRowToComputeFrom`, `absent_over_time`'s, left the enum
+    /// when issue #624 part 2 lowered that reducer: it had no producer.)
     ///
     /// **`TraceLevelIntrinsic` has TWO producers, and that is
     /// deliberate**: one reason, two trace-wide co-loads. This asserts
@@ -2368,7 +2368,6 @@ mod tests {
             N::NestedSetNumbering,
             N::TraceLevelIntrinsic,
             N::WholeQueryTypeFailure,
-            N::NoRowToComputeFrom,
             N::ResponseBuild,
             N::NotASearchLink,
         ] {
@@ -2397,17 +2396,6 @@ mod tests {
                         && tql_carries("{ span:childCount > 2 }", variant),
                 ),
                 N::WholeQueryTypeFailure => ("{ !.a }", tql_carries("{ !.a }", variant)),
-                N::NoRowToComputeFrom => (
-                    r#"absent_over_time({app="a"}[5m])"#,
-                    lql_carries(
-                        &[crate::logql::compile::LqlLink::RangeAgg {
-                            op: pulsus_logql::RangeAggOp::AbsentOverTime,
-                            grouping: None,
-                            param: None,
-                        }],
-                        variant,
-                    ),
-                ),
                 N::ResponseBuild => (
                     r#"{app="a"} (every LogQL query)"#,
                     lql_carries(&[crate::logql::compile::LqlLink::Emit], variant),

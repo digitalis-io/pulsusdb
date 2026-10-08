@@ -2849,8 +2849,8 @@ async fn seed_bucketed_corpus() -> (ChClient, String, i64) {
 ///
 /// `count_over_time({…}[1m])` at a 1m step is a clean bucketed chain and
 /// plans `client: None`, so the database counts. The same selector with
-/// `| drop zzz` — a label the corpus does not carry, so the stage changes
-/// no label set — is a pipeline, so it plans `client: Some(..)` and every
+/// `| line_format "{{__line__}}"` — which rewrites every line to itself, so the stage changes
+/// no line, no byte and no label set — is a pipeline, so it plans `client: Some(..)` and every
 /// line crosses the wire to be counted here. The answers must be
 /// identical, which is what `Fidelity::Equivalent` claims for the four
 /// counting reducers.
@@ -2878,7 +2878,9 @@ async fn a_bucketed_range_read_answers_exactly_what_the_client_path_answers() {
         direction: Direction::Backward,
     };
     let lowered_query = format!(r#"count_over_time({{service_name="{service}"}}[1m])"#);
-    let client_query = format!(r#"count_over_time({{service_name="{service}"}} | drop zzz [1m])"#);
+    let client_query = format!(
+        r#"count_over_time({{service_name="{service}"}} | line_format "{{{{__line__}}}}" [1m])"#
+    );
 
     // The two paths, asserted to BE two paths.
     let shape = |query: &str| match plan(&parse(query).expect("parse"), &params, &plan_ctx(&db))
@@ -2998,7 +3000,9 @@ async fn an_over_cap_grid_is_refused_on_the_bucketed_path_as_on_the_client_path(
             "the bucketed path",
         ),
         (
-            format!(r#"count_over_time({{service_name="{service}"}} | drop zzz [1s])"#),
+            format!(
+                r#"count_over_time({{service_name="{service}"}} | line_format "{{{{__line__}}}}" [1s])"#
+            ),
             "the client path",
         ),
     ] {
@@ -3403,8 +3407,9 @@ fn fixture_150s(t: i64, shift: i64) -> Vec<AnswerSeries> {
 ///
 /// Over the bucketed fixture (`seed_bucketed_corpus`), at a 60 s step:
 /// `[150s]` holds a line in two or three windows, `[30s]` leaves lines in
-/// none. The control `| drop zzz` names a label the corpus does not carry,
-/// so it changes no label set and keeps the query on today's route.
+/// none. The control `| line_format "{{__line__}}"` rewrites every line to itself,
+/// so it changes no line and no label set and keeps the query on today's route
+/// (`| drop zzz`, the control before issue #624 part 2, now lowers too).
 ///
 /// The fixture's own expectation is asserted too, so a defect both routes
 /// shared would not pass. A window closed below would give `[150s]`
@@ -3444,9 +3449,11 @@ async fn a_range_unequal_to_the_step_is_counted_in_the_database_and_answers_toda
         "raw: sliding range aggregation in the database (issue #624)"
     );
     assert!(
-        shape(&format!("count_over_time({selector} | drop zzz [150s])"))
-            .client
-            .is_some(),
+        shape(&format!(
+            "count_over_time({selector} | line_format \"{{{{__line__}}}}\" [150s])"
+        ))
+        .client
+        .is_some(),
         "the control query must stay on today's route"
     );
 
@@ -3465,7 +3472,7 @@ async fn a_range_unequal_to_the_step_is_counted_in_the_database_and_answers_toda
             sliding_answer(&engine, &format!("{reducer}({selector}[{range}])"), &at_t).await;
         let control = sliding_answer(
             &engine,
-            &format!("{reducer}({selector} | drop zzz [{range}])"),
+            &format!("{reducer}({selector} | line_format \"{{{{__line__}}}}\" [{range}])"),
             &at_t,
         )
         .await;
@@ -3500,7 +3507,9 @@ async fn a_range_unequal_to_the_step_is_counted_in_the_database_and_answers_toda
     assert_eq!(offset, fixture_150s(t, 60), "the offset is added back");
     let control = sliding_answer(
         &engine,
-        &format!("count_over_time({selector} | drop zzz [150s] offset 60s)"),
+        &format!(
+            "count_over_time({selector} | line_format \"{{{{__line__}}}}\" [150s] offset 60s)"
+        ),
         &later,
     )
     .await;
@@ -4282,9 +4291,11 @@ async fn a_staged_query_out_of_memory_answers_on_todays_route() {
 }
 
 /// **`absent_over_time` answers on today's route** over a selector that
-/// resolves a stream (issue #624, part 2). One line at `T+30s`; the answer is
-/// 1 at every grid point whose window holds no line, under the selector's
-/// equality labels, and no point where a line falls in the window.
+/// resolves streams (issue #624, part 2). A line at `T+30s` on one stream and
+/// at `T+150s` on a second that carries one more label — so its rows take
+/// the label route, not the per-stream slider; the answer is 1 at every grid
+/// point whose window holds no line, under the selector's equality labels,
+/// and no point where a line falls in the window.
 #[tokio::test]
 async fn absent_over_time_answers_on_todays_route() {
     skip_unless_live!();
@@ -4305,6 +4316,16 @@ async fn absent_over_time_answers_on_todays_route() {
     )
     .await;
     land_line_624(&admin, &db, 7_400_000, "c624abs", t + 30 * sec, "x", "").await;
+    land_stream_624(
+        &admin,
+        &db,
+        t,
+        7_400_001,
+        "c624abs",
+        r#"{"pod":"p","service_name":"c624abs"}"#,
+    )
+    .await;
+    land_line_624(&admin, &db, 7_400_001, "c624abs", t + 150 * sec, "y", "").await;
     let params = QueryParams {
         spec: QuerySpec::Range {
             start_ns: t,
@@ -4315,7 +4336,7 @@ async fn absent_over_time_answers_on_todays_route() {
         direction: Direction::Backward,
     };
     let labels = vec![("service_name".to_string(), "c624abs".to_string())];
-    for (range, empty) in [("1m", vec![0i64, 120, 180, 240]), ("2m", vec![0, 180, 240])] {
+    for (range, empty) in [("1m", vec![0i64, 120, 240]), ("2m", vec![0])] {
         let query = format!(r#"absent_over_time({{service_name="c624abs"}}[{range}])"#);
         let got = run_624(&db, hooks_624(true, None, None), None, &query, &params).await;
         let want: Vec<AnswerSeries> = vec![(

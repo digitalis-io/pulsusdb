@@ -2614,7 +2614,7 @@ const S12_HEADING: &str = "## 12. The end state";
 /// against a hand list.
 ///
 /// `Never` is a permanence claim: it says a construct is not lowerable in
-/// any state, ever, as against `No`, which says *not here*. A ninth
+/// any state, ever, as against `No`, which says *not here*. An eighth
 /// permanent reason added to the compiler without a row in §12 is a
 /// permanence claim nobody had to justify, which is the thing §12 exists
 /// to stop.
@@ -2626,7 +2626,9 @@ fn every_never_reason_variant_is_named_in_the_end_state() {
         .unwrap_or_else(|| panic!("{QUERY_LOWERING} must carry {S12_HEADING:?}"));
     let end_state = &md[start..];
     let variants = enum_variants("crates/pulsus-read/src/compile/fold.rs", "NeverReason");
-    assert_eq!(variants.len(), 8, "NeverReason: {variants:?}");
+    // Seven since issue #624 part 2, whose lowering of `absent_over_time`
+    // left `NoRowToComputeFrom` with no producer.
+    assert_eq!(variants.len(), 7, "NeverReason: {variants:?}");
 
     let table: Vec<Vec<String>> = tables(end_state)
         .into_iter()

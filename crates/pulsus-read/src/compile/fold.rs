@@ -704,9 +704,6 @@ pub enum NeverReason {
     /// One row's type must fail the whole request, and SQL evaluates row
     /// by row.
     WholeQueryTypeFailure,
-    /// The answer is a statement about rows that are absent, so there is
-    /// no row to compute it from.
-    NoRowToComputeFrom,
     /// The response builder.
     ResponseBuild,
     /// Not a chain link on this route at all — the shipped planner

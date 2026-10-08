@@ -1854,11 +1854,12 @@ enum ReviewedVerdict {
 // expression it cited before — the verdicts are unchanged and the
 // reasoning below is the same sentence.
 //
-// Issue #624 part 2: ONE new case, `plan.rs:1547`. The citation was
-// `plan.rs:1546` and unresolvable; a line added above it in
-// `logql/plan.rs` moved it to `:1547`, where `compile/plan.rs` happens to
-// carry a word the citing line prints, so the anchor rule now answers that
-// file. Read against both, recorded below.
+// Issue #624 part 2: ONE new case, `plan.rs:2428` (it was `:2408`, moved
+// by the lines the LogQL planner gained), where
+// `crates/pulsus-promql/src/plan.rs` carries a `let` the citing line
+// prints. Read against both, recorded below. (`plan.rs:1547` diverged
+// between this part's two commits and no longer does: the line its
+// coincidental match sat on in `compile/plan.rs` moved.)
 const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 5] = [
     (
         "docs/query-lowering.md",
@@ -1889,13 +1890,12 @@ const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str)
         "a LogQL section citing a line of the TraceQL executor",
     ),
     (
-        "docs/query-lowering.md",
-        "plan.rs:1547",
+        "docs/query-to-sql.md",
+        "plan.rs:2428",
         0,
         ReviewedVerdict::FallbackRight,
-        "the LogQL planner's refusal of a parameter given to a vector aggregation that takes \
-         none; the line in crates/pulsus-read/src/compile/plan.rs is a test the anchor rule \
-         matched on a word",
+        "`let client = if … || is_range`, the LogQL planner's client-aggregation condition; \
+         the PromQL planner's line is an unrelated `let` the anchor rule matched on",
     ),
 ];
 
@@ -2040,7 +2040,7 @@ fn the_language_fallback_disagrees_with_the_anchor_rule_only_where_a_person_has_
         // the two rules agree at every occurrence that remains. The other
         // two occurrences of that citation keep their reading.
         //
-        // Issue #624 part 2 adds one `FallbackRight` row, `plan.rs:1547`:
+        // Issue #624 part 2 adds one `FallbackRight` row, `plan.rs:2428`:
         // there the anchor rule is the one that points elsewhere. §12.3's
         // decision stands — the fallback still answers four reviewed
         // citations wrongly, so it is still not applied.

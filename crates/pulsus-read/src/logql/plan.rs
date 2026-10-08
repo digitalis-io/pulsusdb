@@ -1752,13 +1752,33 @@ fn metric_pipeline_construct(pipeline: &[Stage]) -> Option<&'static str> {
         })
 }
 
-/// Whether every stage of `pipeline` reads only labels, so a counting
-/// reducer (or `absent_over_time`) can be counted in the database and the
-/// stages run once per returned group (issue #624, part 2). Not yet
-/// implemented.
+/// Whether every stage of `pipeline` leaves the count unchanged and reads
+/// only labels, so a counting reducer (or `absent_over_time`) can be counted
+/// in the database and the stages run once per returned
+/// `(fingerprint, structured_metadata)` group (issue #624, part 2).
+///
+/// | stage | admitted |
+/// |---|---|
+/// | a pushable line filter before any line rewrite | yes — the statement carries it |
+/// | a label filter, lowered or not; `drop`; `keep` | yes — reads labels only |
+/// | `decolorize` | yes, unless a line filter follows it or the reducer sums bytes, which are the rewritten line's |
+/// | anything else (`ip()` line filter, parsers, `line_format`, `label_format`, `unwrap`, `unpack`) | no |
+///
+/// The labels of every line in a group are the group's, because
+/// `structured_metadata` is part of the statement's `GROUP BY`; so a stage
+/// that reads labels only gives each line of a group the same answer.
 pub(in crate::logql) fn label_only_pipeline(pipeline: &[Stage], op: RangeAggOp) -> bool {
-    let _ = (pipeline, op);
-    false
+    let sums_bytes = matches!(op, RangeAggOp::BytesOverTime | RangeAggOp::BytesRate);
+    let mut rewritten = false;
+    for stage in pipeline {
+        match stage {
+            Stage::LineFilter(lf) if !rewritten && is_pushable_line_filter(lf) => {}
+            Stage::LabelFilter(_) | Stage::Drop(_) | Stage::Keep(_) => {}
+            Stage::Decolorize if !sums_bytes => rewritten = true,
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Issue #507 (W4): does the pipeline carry a `| unwrap` with a
@@ -2538,21 +2558,29 @@ fn metric_plan(
     // it, sums +/- deltas cumulatively and expands each run to its grid
     // points — exact at every range and step (issue #624; the argument is at
     // `super::predicate::sliding_cover`).
+    //
+    // **Issue #624, part 2: stages that read only labels.** A pipeline
+    // whose every stage [`label_only_pipeline`] admits lowers too: the
+    // statement counts the rows of each `(fingerprint, structured_metadata)`
+    // group, and the stages run once per group in the engine, through the
+    // same pipeline today's route runs per line. `absent_over_time` lowers
+    // with them: the statement's count rows say which windows hold a line.
     let bucketed_range = is_range
         && !force_client
-        && !has_beyond_line_filter
+        && (!has_beyond_line_filter || label_only_pipeline(pipeline, *op))
         && !has_unwrap
-        // Implied by the reducer set below — none of the four requires
-        // `| unwrap` and none is `absent_over_time` — but named so that a
-        // future change to `requires_unwrap` disables the lowering rather
-        // than silently widening it.
-        && !client_only_op
+        // Implied by the reducer set below — none of the five requires
+        // `| unwrap` — but named so that a future change to
+        // `requires_unwrap` disables the lowering rather than silently
+        // widening it.
+        && !requires_unwrap
         && matches!(
             op,
             RangeAggOp::CountOverTime
                 | RangeAggOp::BytesOverTime
                 | RangeAggOp::Rate
                 | RangeAggOp::BytesRate
+                | RangeAggOp::AbsentOverTime
         )
         // A range aggregation's own `by`/`without` is carried on
         // `ClientAgg` and nothing on this path applies it. The parser
@@ -2568,6 +2596,11 @@ fn metric_plan(
             }
             None => false,
         };
+    // Issue #624, part 2: a lowered plan with stages to run per group, or
+    // `absent_over_time`, carries today's aggregation for its fold and its
+    // fallbacks.
+    let staged =
+        bucketed_range && (has_beyond_line_filter || matches!(op, RangeAggOp::AbsentOverTime));
     let client = if bucketed_range { None } else { client };
 
     // Issue #507 (W4): **the unwrapped bucketed shape** — the same
@@ -2685,7 +2718,10 @@ fn metric_plan(
         let equal = step_ns.is_some_and(|step| step.get() == range_ns.get());
         RoutingDecision {
             chosen: RouteChoice::Raw,
-            reason: if equal {
+            reason: if staged {
+                "raw: range aggregation in the database, label stages over its rows (issue #624)"
+                    .to_string()
+            } else if equal {
                 "raw: bucketed range aggregation (issue #507)".to_string()
             } else {
                 "raw: sliding range aggregation in the database (issue #624)".to_string()
@@ -2748,9 +2784,15 @@ fn metric_plan(
     } else {
         ctx.samples.to_string()
     };
-    let value = match unwrapped_range {
-        Some(value) => sql::MetricValue::Unwrapped(Box::new(value)),
-        None => sql::MetricValue::Shaped(shape),
+    let value = match (unwrapped_range, staged) {
+        (Some(value), _) => sql::MetricValue::Unwrapped(Box::new(value)),
+        (None, true) => sql::MetricValue::Staged(Box::new(sql::StagedCount {
+            shape,
+            todays_route: client_full
+                .clone()
+                .expect("a range plan always builds today's aggregation"),
+        })),
+        (None, false) => sql::MetricValue::Shaped(shape),
     };
     // Issue #544: the lowering removed the client stage exactly when the
     // unlowered answer would have kept one and this plan has none. The
@@ -6597,7 +6639,12 @@ mod tests {
             range_spec(),
         )
         .unwrap();
-        let client = mp.client.as_ref().expect("client mode");
+        // Issue #624 part 2: counted in the database; the aggregation today's
+        // route runs, which carries the labels, is the plan's staged value.
+        let sql::MetricValue::Staged(staged) = &mp.value else {
+            panic!("a staged plan, got {:?}", mp.value);
+        };
+        let client = &staged.todays_route;
         assert_eq!(client.range_op, pulsus_logql::RangeAggOp::AbsentOverTime);
         assert_eq!(
             client.absent_labels,
@@ -7547,10 +7594,18 @@ mod tests {
                 .metadata_lowering
                 .as_ref()
                 .and_then(|m| m.client_without_lowering.clone());
+            // Issue #624 part 2: a filter that does not lower leaves the
+            // read counted in the database too, with its stages run per
+            // group; the plan's staged value carries them.
+            let staged = match &mp.value {
+                sql::MetricValue::Staged(s) => Some(s.todays_route.clone()),
+                _ => None,
+            };
             let client = mp
                 .client
                 .clone()
                 .or(restored)
+                .or(staged)
                 .unwrap_or_else(|| panic!("{q}: a label filter keeps a client stage"));
             let filters = label_filters(&client.pipeline);
             assert_eq!(filters.len(), 1, "{q}: exactly one label filter");
@@ -8455,33 +8510,20 @@ mod tests {
             r#"count_over_time({a="b"} |= ip("10.0.0.0/8") [1m])"#,
             "a line filter that cannot be pushed",
         );
+        // `| drop`, `| keep`, a label filter and `| decolorize` under a
+        // counting reducer lower since issue #624 part 2, with their stages
+        // run per group — `label_only_pipelines_lower_and_the_rest_stay`.
+        // `decolorize` under a bytes reducer stays: the bytes are the
+        // rewritten line's.
         stays_client(
-            r#"count_over_time({a="b"} | decolorize [1m])"#,
-            "decolorize",
-        );
-        // `| drop` and `| keep` act on the label set rather than on what
-        // the statement counts, so they could in principle lower. **They
-        // are blocking by decision, not by omission** (issue #507): the
-        // reader has no channel to receive the stages, because `ClientAgg`
-        // is the only carrier of the pipeline and a lowered chain has
-        // none, and giving it one means a new `MetricPlan` field and a
-        // ~180-line regeneration of a golden whose own doc says not to
-        // regenerate it. These two queries keep working exactly as they do
-        // today, on the client path, correct and unaccelerated.
-        stays_client(
-            r#"count_over_time({a="b"} | drop x [1m])"#,
-            "drop, by decision",
-        );
-        stays_client(
-            r#"count_over_time({a="b"} | keep x [1m])"#,
-            "keep, by decision",
+            r#"bytes_over_time({a="b"} | decolorize [1m])"#,
+            "bytes of a rewritten line",
         );
         // A reducer outside the four, and the one permanent refusal.
         stays_client(
             r#"sum_over_time({a="b"} | unwrap v [1m])"#,
             "an f64 accumulator",
         );
-        stays_client(r#"absent_over_time({a="b"}[1m])"#, "no row to compute from");
         stays_client(
             r#"rate({a="b"} | unwrap v [1m])"#,
             "`rate` over an unwrap sums f64s",
