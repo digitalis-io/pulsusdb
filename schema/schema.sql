@@ -243,7 +243,8 @@ CREATE TABLE IF NOT EXISTS {{db}}.metric_metadata{{on_cluster}}
 )
 --@single  ENGINE = ReplacingMergeTree(updated_ns)
 --@cluster ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/all/{{db}}.metric_metadata', '{replica}', updated_ns)
-ORDER BY (org_id, metric_name)
+ORDER BY (org_id, metric_name, metric_type, help, unit)
+TTL toDateTime(least(intDiv(updated_ns, 1000000000) + ({{retention_days}} * 86400), 4294967295))
 --@single  SETTINGS index_granularity = 8192, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy}};
 --@cluster SETTINGS index_granularity = 8192, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
 

@@ -51,7 +51,7 @@ The hard requirements are columnar bulk-insert/fetch performance and reliable DD
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PULSUS_SKIP_DDL` | `false` | skip the startup check that the configured database exists (schema managed externally, e.g. reached through a view under another name). The binary issues no DDL either way |
-| `PULSUS_RETENTION_DAYS` | `7` | TTL for raw log/metric/trace/profile tables |
+| `PULSUS_RETENTION_DAYS` | `7` | TTL for raw log/metric/trace/profile tables; a metric descriptor in `metric_metadata` leaves this many days after its latest resend |
 | `PULSUS_STORAGE_POLICY` | unset | ClickHouse storage policy for all created tables |
 | `PULSUS_LOG_ROLLUP_RESOLUTION` | `5s` | bucket size of the derived log count/bytes rollup (table named for it, e.g. `log_metrics_5s`); raw log/metric samples always store source timestamps verbatim — no resolution is assumed or imposed anywhere |
 | `PULSUS_METRICS_LANDING_RETENTION_HOURS` | `6` | TTL for `metric_landing`, the one table a metrics push is inserted into (issue #603), in hours. The five tables queries read are maintained from it by materialized view; the sample and activity tables keep `PULSUS_RETENTION_DAYS`, and `metric_labels` keeps its label sets with no TTL (issue #623). It is the **replay window**: expiring it deletes nothing the views already wrote, but a target that ends up wrong can be rebuilt only from landed rows that are still there, so a deployment that wants a longer window raises it — on a cheap `PULSUS_STORAGE_POLICY` volume it buys more of that window at that volume's speed. Accepted range `1..=168`; values outside this range are rejected at config load |

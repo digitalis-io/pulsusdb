@@ -31,12 +31,13 @@
 //! kind-2 row inside the samples' own block rather than its own insert, so
 //! there is no "samples committed, registration lost" orphan left to heal
 //! and no registration backfill on this path. A push emits a metric's
-//! descriptor as a kind-3 row only when it differs from the one this writer
-//! last sent, or the hour has turned since (issue #623,
-//! [`DescriptorCache`]); that cache too is promoted only when the block
-//! commits. `metric_metadata` is a `ReplacingMergeTree(updated_ns)` keyed on
-//! `metric_name`, so a repeated row collapses on merge, and the read takes
-//! one whole tuple.
+//! descriptor as a kind-3 row only when this writer has not sent the same
+//! descriptor within its hour (issue #623, [`DescriptorCache`]); that cache
+//! too is promoted only when the block commits. `metric_metadata` is a
+//! `ReplacingMergeTree(updated_ns)` keyed on the whole descriptor `(org_id,
+//! metric_name, metric_type, help, unit)` (issue #500), so a resend
+//! collapses on merge, a name keeps every distinct descriptor, and one no
+//! longer resent leaves after `retention_days`.
 //!
 //! **Backpressure/shutdown**: `queued_bytes` is reserved atomically at
 //! admission and released exactly once, by whichever ending settles the
@@ -411,15 +412,23 @@ impl MetricWriter {
         };
 
         // A push's descriptors are its parser's metadata entries — one per
-        // metric name per request already — locally deduped to the last
-        // occurrence per name, then gated by what this writer last sent
-        // (issue #623): a descriptor is emitted only when its type, help or
-        // unit differs from that, or its hour has turned since. The hourly
-        // resend bounds how long another writer's different descriptor can
-        // stand in the table, since the version is a receiver clock.
-        let mut last_by_name: HashMap<&Arc<str>, &MetricMetadata> = HashMap::new();
+        // distinct descriptor per request already — locally deduped by the
+        // whole descriptor (issue #500), then gated by what this writer has
+        // sent (issue #623): a descriptor is emitted unless this writer sent
+        // the same `(name, type, help, unit)` within its hour. The hourly
+        // resend keeps a descriptor still pushed inside the table's
+        // retention, which counts from its latest resend.
+        let mut seen: HashSet<(&str, &str, &str, &str)> = HashSet::new();
+        let mut distinct: Vec<&MetricMetadata> = Vec::new();
         for meta in &batch.metadata {
-            last_by_name.insert(&meta.metric_name, meta);
+            if seen.insert((
+                &meta.metric_name,
+                meta.metric_type.as_str(),
+                meta.help.as_str(),
+                meta.unit.as_str(),
+            )) {
+                distinct.push(meta);
+            }
         }
         let hour = received_ms / DESCRIPTOR_RESEND_MS;
         let descriptors: Vec<&MetricMetadata> = {
@@ -428,8 +437,8 @@ impl MetricWriter {
                 .descriptors
                 .lock()
                 .expect("descriptor cache mutex poisoned");
-            last_by_name
-                .into_values()
+            distinct
+                .into_iter()
                 .filter(|m| {
                     !sent.is_current(
                         tenant.as_str(),

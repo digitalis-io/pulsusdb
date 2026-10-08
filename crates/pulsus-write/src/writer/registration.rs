@@ -60,28 +60,28 @@ pub type SeriesLru = LruSet<SeriesKey>;
 /// that has not changed is sent again once its hour turns.
 pub const DESCRIPTOR_RESEND_MS: i64 = 3_600_000;
 
-/// What the writer last sent for one metric name, and when.
+/// When the writer last sent one descriptor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SentDescriptor {
-    metric_type: String,
-    help: String,
-    unit: String,
     /// `received_ms / DESCRIPTOR_RESEND_MS` of the push that sent it.
     hour: i64,
-    /// The row's `updated_ns`, so a commit that finishes late cannot replace
-    /// a newer descriptor with an older one.
+    /// The row's `updated_ns`, so a commit that finishes late cannot lower
+    /// the hour recorded for the same descriptor.
     updated_ns: i64,
 }
 
-/// The key the descriptor cache records under (issue #635 part 4): the
-/// tenant and the metric name.
-type DescriptorKey = (Arc<str>, Arc<str>);
+/// The key the descriptor cache records under: the tenant (issue #635
+/// part 4) and the whole descriptor, `(name, type, help, unit)` (issue
+/// #500), so a name's two descriptors — two writers', say — are two
+/// entries and neither makes the other stale.
+type DescriptorKey = (Arc<str>, Arc<str>, Arc<str>, Arc<str>, Arc<str>);
 
-/// The descriptors this writer last sent, one per tenant and metric name, bounded like
-/// [`SeriesLru`] (issue #623). A push sends a metric's descriptor only when it
-/// differs from the one recorded here or the hour has turned since. Promoted
-/// only when a block commits, so a block that failed records nothing and the
-/// next push sends the descriptor again. An evicted name is sent again too.
+/// The descriptors this writer has sent, one entry per tenant and
+/// descriptor, bounded like [`SeriesLru`] (issue #623). A push sends a
+/// descriptor unless it is recorded here for the push's hour. Promoted only
+/// when a block commits, so a block that failed records nothing and the
+/// next push sends the descriptor again. An evicted descriptor is sent
+/// again too.
 pub struct DescriptorCache {
     names: LruSet<DescriptorKey>,
     sent: HashMap<DescriptorKey, SentDescriptor>,
@@ -95,8 +95,8 @@ impl DescriptorCache {
         }
     }
 
-    /// `true` when `(metric_type, help, unit)` is what this writer last sent
-    /// for `metric_name`, in `hour`: the push need not send it again.
+    /// `true` when this writer sent `(metric_name, metric_type, help, unit)`
+    /// in `hour`: the push need not send it again.
     pub fn is_current(
         &self,
         tenant: &str,
@@ -106,18 +106,13 @@ impl DescriptorCache {
         unit: &str,
         hour: i64,
     ) -> bool {
-        let key: DescriptorKey = (Arc::from(tenant), Arc::from(metric_name));
-        self.sent.get(&key).is_some_and(|sent| {
-            sent.hour == hour
-                && sent.metric_type == metric_type
-                && sent.help == help
-                && sent.unit == unit
-        })
+        let key = descriptor_key(tenant, metric_name, metric_type, help, unit);
+        self.sent.get(&key).is_some_and(|sent| sent.hour == hour)
     }
 
-    /// Records a descriptor a committed block carried. A descriptor older
-    /// than the one recorded is ignored: blocks can commit out of order, and
-    /// the table keeps the newest.
+    /// Records a descriptor a committed block carried. An older commit of a
+    /// descriptor already recorded is ignored: blocks can commit out of
+    /// order, and it must not lower the recorded hour.
     #[allow(clippy::too_many_arguments)] // the tenant beside the descriptor's own fields
     pub fn promote(
         &mut self,
@@ -129,7 +124,7 @@ impl DescriptorCache {
         hour: i64,
         updated_ns: i64,
     ) {
-        let key: DescriptorKey = (Arc::from(tenant), Arc::from(metric_name));
+        let key = descriptor_key(tenant, metric_name, metric_type, help, unit);
         if self
             .sent
             .get(&key)
@@ -140,22 +135,29 @@ impl DescriptorCache {
         if let Some(evicted) = self.names.insert_evicting(key.clone()) {
             self.sent.remove(&evicted);
         }
-        self.sent.insert(
-            key,
-            SentDescriptor {
-                metric_type: metric_type.to_string(),
-                help: help.to_string(),
-                unit: unit.to_string(),
-                hour,
-                updated_ns,
-            },
-        );
+        self.sent.insert(key, SentDescriptor { hour, updated_ns });
     }
 
     #[cfg(test)]
     fn len(&self) -> usize {
         self.sent.len()
     }
+}
+
+fn descriptor_key(
+    tenant: &str,
+    metric_name: &str,
+    metric_type: &str,
+    help: &str,
+    unit: &str,
+) -> DescriptorKey {
+    (
+        Arc::from(tenant),
+        Arc::from(metric_name),
+        Arc::from(metric_type),
+        Arc::from(help),
+        Arc::from(unit),
+    )
 }
 
 struct Slot<K> {

@@ -100,6 +100,19 @@ pub const MAX_EXPANDED_BYTES: usize = 4 * crate::ingest::decompress::MAX_DECOMPR
 /// `otlp_traces::ATTR_ROW_OVERHEAD`'s per-row floor).
 const SAMPLE_ROW_OVERHEAD: usize = 64;
 
+/// A descriptor as the within-request metadata dedup keys it (issue #500):
+/// `(name, type, help, unit)`.
+type SeenDescriptor = (Arc<str>, String, String, String);
+
+fn seen_descriptor(m: &MetricMetadata) -> SeenDescriptor {
+    (
+        Arc::clone(&m.metric_name),
+        m.metric_type.clone(),
+        m.help.clone(),
+        m.unit.clone(),
+    )
+}
+
 /// Estimated per-`(bound, count)` heap cost of the intermediate Vec
 /// [`exponential_bucket_pairs`] builds: `(f64, u64)` = 16 bytes. Bounded and
 /// non-multiplicative (one entry per wire bucket count), charged before that
@@ -351,16 +364,14 @@ pub fn parse(
     // fingerprint)` (architect plan: "a labels carrier, not a per-sample
     // registration").
     let mut seen_series: HashSet<(Arc<str>, Fingerprint)> = HashSet::new();
-    // Dedups `MetricMetadata` within this request by TRANSLATED family name
-    // (architect plan: "one MetricMetadata ... per Metric descriptor,
-    // deduped within-request by base name"). Ours, not the reference's —
-    // `metric_metadata` is a `ReplacingMergeTree(updated_ns)` keyed by
-    // family name (docs/schemas.md §2.1), so one row per family per request
-    // is the correct write and the reference has no equivalent table.
-    // Consequence of translation: two distinct OTLP names can now collapse
-    // to one family (`a.b` and `a_b` both -> `a_b`), and the first
-    // descriptor's `help`/`unit` is kept for both.
-    let mut seen_metadata: HashSet<Arc<str>> = HashSet::new();
+    // Dedups `MetricMetadata` within this request by the whole descriptor
+    // under its TRANSLATED family name (issue #500): `metric_metadata` keeps
+    // every distinct `(name, type, help, unit)` (docs/schemas.md §2.1), so
+    // one row per distinct descriptor per request is the correct write.
+    // Consequence of translation: two distinct OTLP names can collapse to
+    // one family (`a.b` and `a_b` both -> `a_b`), and each distinct
+    // descriptor of the two is kept.
+    let mut seen_metadata: HashSet<SeenDescriptor> = HashSet::new();
     // `seenTargetInfo` (`helper.go:569-585`): dedups `target_info` samples
     // by `(labels, timestamp)` across every `ResourceMetrics` in the batch.
     let mut seen_target_info: HashSet<(Fingerprint, i64)> = HashSet::new();
@@ -564,7 +575,7 @@ fn parse_metric(
     out: &mut ParsedMetrics,
     expanded_bytes: &mut usize,
     seen_series: &mut HashSet<(Arc<str>, Fingerprint)>,
-    seen_metadata: &mut HashSet<Arc<str>>,
+    seen_metadata: &mut HashSet<SeenDescriptor>,
     metric: &Metric,
     base: &ScopeBase<'_>,
     namers: &Namers<'_>,
@@ -609,17 +620,18 @@ fn parse_metric(
         metric::Data::Summary(_) => "summary",
     };
 
-    if seen_metadata.insert(Arc::clone(&name)) {
-        out.metadata.push(MetricMetadata {
-            metric_name: Arc::clone(&name),
-            metric_type: metric_type.to_string(),
-            help: metric.description.clone(),
-            // `unitNamer.Build(metric.Unit())` (`metrics_to_prw.go:244`) —
-            // the metadata unit is translated too, so `s` is stored as
-            // `seconds`.
-            unit: namers.unit.build(&metric.unit),
-            updated_ns: namers.now_ns,
-        });
+    let descriptor = MetricMetadata {
+        metric_name: Arc::clone(&name),
+        metric_type: metric_type.to_string(),
+        help: metric.description.clone(),
+        // `unitNamer.Build(metric.Unit())` (`metrics_to_prw.go:244`) —
+        // the metadata unit is translated too, so `s` is stored as
+        // `seconds`.
+        unit: namers.unit.build(&metric.unit),
+        updated_ns: namers.now_ns,
+    };
+    if seen_metadata.insert(seen_descriptor(&descriptor)) {
+        out.metadata.push(descriptor);
     }
 
     match data {
@@ -1772,7 +1784,7 @@ fn emit_target_info(
     out: &mut ParsedMetrics,
     expanded_bytes: &mut usize,
     seen_series: &mut HashSet<(Arc<str>, Fingerprint)>,
-    seen_metadata: &mut HashSet<Arc<str>>,
+    seen_metadata: &mut HashSet<SeenDescriptor>,
     seen_target_info: &mut HashSet<(Fingerprint, i64)>,
     resource_attrs: &[KeyValue],
     resource_pairs: &[(String, String)],
@@ -1844,14 +1856,15 @@ fn emit_target_info(
     )?;
 
     let name: Arc<str> = Arc::from(TARGET_INFO_METRIC_NAME);
-    if seen_metadata.insert(Arc::clone(&name)) {
-        out.metadata.push(MetricMetadata {
-            metric_name: Arc::clone(&name),
-            metric_type: "gauge".to_string(),
-            help: TARGET_INFO_HELP.to_string(),
-            unit: String::new(),
-            updated_ns: now_ns,
-        });
+    let descriptor = MetricMetadata {
+        metric_name: Arc::clone(&name),
+        metric_type: "gauge".to_string(),
+        help: TARGET_INFO_HELP.to_string(),
+        unit: String::new(),
+        updated_ns: now_ns,
+    };
+    if seen_metadata.insert(seen_descriptor(&descriptor)) {
+        out.metadata.push(descriptor);
     }
 
     let fingerprint = series_fingerprint(&name, &labels);

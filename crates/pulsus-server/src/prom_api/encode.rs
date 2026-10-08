@@ -697,27 +697,51 @@ pub(crate) fn series_response(
 }
 
 // ---------------------------------------------------------------------
-// metadata (issue #32) — Prometheus's own shape: a map keyed by metric
-// name, each value an array of descriptor objects (always length 1 here:
-// `metric_metadata` stores exactly one row per base family name).
+// metadata (issues #32 and #500) — Prometheus's own shape: a map keyed by
+// metric name, each value an array of that name's descriptor objects, one
+// per distinct descriptor `metric_metadata` holds.
 // ---------------------------------------------------------------------
 
-fn render_metadata_entry(m: &MetricMeta) -> Vec<u8> {
+fn render_metadata_descriptor(m: &MetricMeta) -> String {
     format!(
-        "{}:[{{\"type\":{},\"help\":{},\"unit\":{}}}]",
-        json_string(&m.name),
+        "{{\"type\":{},\"help\":{},\"unit\":{}}}",
         json_string(&m.metric_type),
         json_string(&m.help),
         json_string(&m.unit)
     )
+}
+
+/// One name's key and its array of descriptors.
+fn render_metadata_entry(group: &[MetricMeta]) -> Vec<u8> {
+    let descriptors: Vec<String> = group.iter().map(render_metadata_descriptor).collect();
+    format!(
+        "{}:[{}]",
+        json_string(&group[0].name),
+        descriptors.join(",")
+    )
     .into_bytes()
 }
 
+/// One key per name, whose array holds that name's entries in row order.
+/// The names are sorted; a stable sort keeps each name's entries in the
+/// order the rows arrived.
 pub(crate) fn metadata_response(mut items: Vec<MetricMeta>) -> Response {
     items.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut groups: Vec<Vec<MetricMeta>> = Vec::new();
+    for item in items {
+        match groups.last_mut() {
+            Some(group) if group[0].name == item.name => group.push(item),
+            _ => groups.push(vec![item]),
+        }
+    }
     let prefix = b"{\"status\":\"success\",\"data\":{".to_vec();
     let suffix = b"}}".to_vec();
-    json_response(stream_array(prefix, items, render_metadata_entry, suffix))
+    json_response(stream_array(
+        prefix,
+        groups,
+        |group: &Vec<MetricMeta>| render_metadata_entry(group),
+        suffix,
+    ))
 }
 
 // ---------------------------------------------------------------------
