@@ -80,6 +80,8 @@
 
 use pulsus_model::FpLiteral;
 
+use pulsus_promql::Grouping;
+
 use super::grouped::{Grid, GroupedOp, PushedRangeFn, RangeAggOp};
 use super::sample_sql;
 
@@ -262,6 +264,42 @@ pub fn grouped_fetch(
 pub fn range_aggregate_fetch(
     samples_table: &str,
     hist_samples_table: &str,
+    labels_table: &str,
+    ids_sql: &str,
+    members_scope: Option<&str>,
+    grouping: Option<&Grouping>,
+    grid: Grid,
+    range_ms: i64,
+    op: RangeAggOp,
+    func: PushedRangeFn,
+) -> String {
+    let _ = (
+        samples_table,
+        hist_samples_table,
+        labels_table,
+        ids_sql,
+        members_scope,
+        grouping,
+        grid,
+        range_ms,
+        op,
+        func,
+    );
+    String::new()
+}
+
+/// Issue #579 part 3: the group key of one series, computed in the
+/// statement from its stored label JSON `l`.
+pub fn group_key_expression(grouping: Option<&Grouping>) -> String {
+    let _ = grouping;
+    "CAST([], 'Array(Tuple(String, String))')".to_string()
+}
+
+/// Part 1's statement over a literal ID list.
+#[allow(clippy::too_many_arguments)]
+pub fn range_aggregate_fetch_literal(
+    samples_table: &str,
+    hist_samples_table: &str,
     fps: &[FpLiteral],
     gids: &[u32],
     grid: Grid,
@@ -328,7 +366,7 @@ pub fn range_aggregate_fetch(
          {range_ms} AS range_ms,\n\
          \x20    [{fp_list}] AS fps,\n\
          \x20    CAST([{gid_list}], 'Array(UInt32)') AS gids\n\
-         SELECT gid, gi, {agg} AS agg\n\
+         SELECT gid, gi, {agg}\n\
          FROM (\n\
          \x20 SELECT gid, gi, arrayMap(p -> p.2, arraySort(groupArray((transform(fingerprint, fps, arrayEnumerate(fps), toUInt32(0)), v)))) AS vs\n\
          \x20 FROM (\n\
@@ -427,8 +465,8 @@ fn kahan_inc(inc: &str, s: &str, c: &str) -> (String, String) {
 /// `{AGG}` of plan section 3.1, folded over `vs` — the members' values in
 /// member order, their position in `fps`, the evaluator's own
 /// accumulation order.
-fn range_agg_expression(op: RangeAggOp) -> String {
-    match op {
+pub fn range_agg_expression(op: RangeAggOp) -> String {
+    let expression = match op {
         // `KahanSum::add`, read out as `sum + c`.
         RangeAggOp::Sum => "(arrayFold((acc, x) -> (acc.1 + x, if(isInfinite(acc.1 + x), 0., \
              if(abs(acc.1) >= abs(x), acc.2 + ((acc.1 - (acc.1 + x)) + x), \
@@ -474,7 +512,8 @@ fn range_agg_expression(op: RangeAggOp) -> String {
         RangeAggOp::Max => {
             "arrayFold((acc, x) -> if(acc < x OR isNaN(acc), x, acc), vs, nan)".to_string()
         }
-    }
+    };
+    format!("{expression} AS agg")
 }
 
 #[cfg(test)]
@@ -715,7 +754,7 @@ mod tests {
     const RANGE_GOLDEN: &str = include_str!("../../tests/golden/range_aggregate_statements.txt");
 
     fn range_sql(op: RangeAggOp, func: PushedRangeFn) -> String {
-        range_aggregate_fetch(
+        range_aggregate_fetch_literal(
             "metric_samples",
             "metric_hist_samples",
             &[
@@ -809,7 +848,7 @@ mod tests {
                 );
                 assert!(!s.contains("metric_name"), "{op:?} {func:?}");
                 assert!(!s.contains("AS (SELECT"), "{op:?} {func:?}");
-                let other = range_aggregate_fetch(
+                let other = range_aggregate_fetch_literal(
                     "metric_samples",
                     "metric_hist_samples",
                     &[
@@ -836,5 +875,220 @@ mod tests {
     #[test]
     fn the_sentinel_id_is_the_readers() {
         assert_eq!(super::super::grouped::HISTOGRAM_SENTINEL_GID, 4_294_967_295);
+    }
+
+    // ------------------------------------------ issue #579 part 3, shape A
+
+    const BY_IDS_GOLDEN: &str =
+        include_str!("../../tests/golden/range_aggregate_by_ids_statements.txt");
+
+    /// The ID statement of the design's own example (part 3, section 2).
+    const PLAN_IDS: &str = "SELECT fingerprint\n\
+         FROM metric_series\n\
+         WHERE day BETWEEN '2026-10-08' AND '2026-10-08'\n\
+         \x20 AND bitAnd(hours, 24) != 0\n\
+         \x20 AND fingerprint IN (\n\
+         \x20   SELECT fingerprint\n\
+         \x20   FROM metric_labels\n\
+         \x20   WHERE metric_name = 'cpu_seconds'\n\
+         \x20 )";
+
+    /// The design's example grid: 52 steps of 60 s from 03:48 UTC.
+    fn plan_grid() -> Grid {
+        Grid {
+            start_ms: 1_791_431_280_000,
+            step_ms: 60_000,
+            points: 52,
+            lookback_ms: 300_000,
+        }
+    }
+
+    fn grouping_of(text: &str) -> Option<Grouping> {
+        let list = |t: &str| -> Vec<String> {
+            t.trim_start_matches('(')
+                .trim_end_matches(')')
+                .split(", ")
+                .map(str::to_string)
+                .collect()
+        };
+        if text == "none" {
+            None
+        } else if let Some(rest) = text.strip_prefix("by ") {
+            Some(Grouping {
+                without: false,
+                labels: list(rest),
+            })
+        } else if let Some(rest) = text.strip_prefix("without ") {
+            Some(Grouping {
+                without: true,
+                labels: list(rest),
+            })
+        } else {
+            panic!("unknown grouping {text}")
+        }
+    }
+
+    fn by_ids_sql(op: RangeAggOp, func: PushedRangeFn, grouping: Option<&Grouping>) -> String {
+        range_aggregate_fetch(
+            "metric_samples",
+            "metric_hist_samples",
+            "metric_labels",
+            PLAN_IDS,
+            Some("cpu_seconds"),
+            grouping,
+            plan_grid(),
+            300_000,
+            op,
+            func,
+        )
+    }
+
+    /// The by-ID golden's sections, keyed by `<op> <func> <grouping>`.
+    fn by_ids_golden() -> Vec<(String, String)> {
+        BY_IDS_GOLDEN
+            .split("-- golden[")
+            .skip(1)
+            .map(|part| {
+                let (key, body) = part.split_once("]\n").expect("a marker line");
+                (
+                    key.to_string(),
+                    body.strip_suffix('\n')
+                        .expect("a section ends in a newline")
+                        .to_string(),
+                )
+            })
+            .collect()
+    }
+
+    fn op_of(text: &str) -> RangeAggOp {
+        match text {
+            "sum" => RangeAggOp::Sum,
+            "avg" => RangeAggOp::Avg,
+            "count" => RangeAggOp::Count,
+            "min" => RangeAggOp::Min,
+            "max" => RangeAggOp::Max,
+            other => panic!("unknown op {other}"),
+        }
+    }
+
+    fn func_of(text: &str) -> PushedRangeFn {
+        match text {
+            "rate" => PushedRangeFn::Rate,
+            "irate" => PushedRangeFn::Irate,
+            "increase" => PushedRangeFn::Increase,
+            other => panic!("unknown function {other}"),
+        }
+    }
+
+    /// T7: `sum by (mode) (rate(cpu_seconds[5m]))` renders the design's
+    /// statement byte for byte — the text written out in part 3's plan,
+    /// section 2, before any of this was implemented.
+    #[test]
+    fn the_designs_by_id_statement_renders_byte_for_byte() {
+        let golden = by_ids_golden();
+        let (_, want) = golden
+            .iter()
+            .find(|(k, _)| k == "sum rate by (mode)")
+            .expect("the design's section");
+        let by_mode = grouping_of("by (mode)");
+        assert_eq!(
+            &by_ids_sql(RangeAggOp::Sum, PushedRangeFn::Rate, by_mode.as_ref()),
+            want
+        );
+    }
+
+    /// T7: every section of the by-ID golden renders byte for byte.
+    #[test]
+    fn every_by_id_section_renders_its_golden() {
+        let golden = by_ids_golden();
+        assert!(!golden.is_empty());
+        for (key, want) in golden {
+            let mut parts = key.splitn(3, ' ');
+            let op = op_of(parts.next().expect("op"));
+            let func = func_of(parts.next().expect("func"));
+            let grouping = grouping_of(parts.next().expect("grouping"));
+            assert_eq!(by_ids_sql(op, func, grouping.as_ref()), want, "{key}");
+        }
+    }
+
+    /// T7: the three grouping forms of the group key, as text.
+    #[test]
+    fn the_group_key_expression_renders_each_grouping_form() {
+        assert_eq!(
+            group_key_expression(None),
+            "CAST([], 'Array(Tuple(String, String))')"
+        );
+        assert_eq!(
+            group_key_expression(grouping_of("by (a, b)").as_ref()),
+            "arrayFilter(kv -> kv.1 IN ('a', 'b'), JSONExtractKeysAndValues(l, 'String'))"
+        );
+        assert_eq!(
+            group_key_expression(grouping_of("without (a)").as_ref()),
+            "arrayFilter(kv -> kv.1 NOT IN ('a'), JSONExtractKeysAndValues(l, 'String'))"
+        );
+        // A label name reaches the statement through the string escaper.
+        assert_eq!(
+            group_key_expression(grouping_of("by (it's)").as_ref()),
+            "arrayFilter(kv -> kv.1 IN ('it\\'s'), JSONExtractKeysAndValues(l, 'String'))"
+        );
+    }
+
+    /// T7: every op, function and grouping form reads its series through
+    /// the ID statement in all three places — the samples, the members
+    /// and the histogram count — and carries no ID literal; a name-less
+    /// selector's members carry no name scope.
+    #[test]
+    fn every_by_id_statement_reads_through_the_id_statement() {
+        for op in [
+            RangeAggOp::Sum,
+            RangeAggOp::Avg,
+            RangeAggOp::Count,
+            RangeAggOp::Min,
+            RangeAggOp::Max,
+        ] {
+            for func in [
+                PushedRangeFn::Rate,
+                PushedRangeFn::Irate,
+                PushedRangeFn::Increase,
+            ] {
+                for grouping in ["none", "by (mode)", "without (cpu)"] {
+                    let g = grouping_of(grouping);
+                    let s = by_ids_sql(op, func, g.as_ref());
+                    let what = format!("{op:?} {func:?} {grouping}");
+                    assert_eq!(s.matches(PLAN_IDS).count(), 3, "{what}");
+                    assert!(!s.contains("toUInt128("), "{what}");
+                    assert!(!s.contains("WINDOW "), "{what}");
+                    assert!(s.contains(&group_key_expression(g.as_ref())), "{what}");
+                    let tail = format!(
+                        "SELECT CAST([('', '')], 'Array(Tuple(String, String))') AS gid, \
+                         toUInt32(0) AS gi,\n  toFloat64((SELECT count() FROM metric_hist_samples\n\
+                         \x20            WHERE unix_milli > 1791430980000 AND unix_milli <= \
+                         1791434340000 AND fingerprint IN (\n{PLAN_IDS}\n))) AS agg\n\
+                         ORDER BY gid, gi"
+                    );
+                    assert!(s.ends_with(&tail), "{what}");
+                    let nameless = range_aggregate_fetch(
+                        "metric_samples",
+                        "metric_hist_samples",
+                        "metric_labels",
+                        PLAN_IDS,
+                        None,
+                        g.as_ref(),
+                        plan_grid(),
+                        300_000,
+                        op,
+                        func,
+                    );
+                    assert_eq!(
+                        nameless.replace(
+                            "WHERE fingerprint IN (",
+                            "WHERE metric_name = 'cpu_seconds'\n            AND fingerprint IN ("
+                        ),
+                        s,
+                        "{what}"
+                    );
+                }
+            }
+        }
     }
 }

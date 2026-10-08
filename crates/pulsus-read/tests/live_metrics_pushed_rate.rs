@@ -29,9 +29,12 @@ use std::sync::Arc;
 use pulsus_clickhouse::ChClient;
 use pulsus_read::{LabelCache, MetricQueryParams, MetricsEngine};
 use pushed_rate_corpus::{
-    CPU_METRIC, DAY_MS, EDGE_METRIC, HIST_ONLY_METRIC, Harness, ISSUE_QUERY, MIXED_METRIC, Routed,
-    anchor, cache_config, cpu_corpus, edge_corpus, engine_config, harness, histogram_corpora,
-    pushed_declines, pushed_statements, server_marker, statements_since, test_config,
+    CPU_METRIC, DAY_MS, EDGE_METRIC, EQUAL_TIME_METRIC, HIST_ONLY_METRIC, Harness, ISSUE_QUERY,
+    MIXED_METRIC, Routed, SAMPLE_EDGE_METRIC, SCALE_METRIC, SCRAPE_MS, SeedSeries, anchor,
+    cache_config, cpu_corpus, edge_corpus, engine_config, equal_time_corpus, fresh_database,
+    harness, harness_sql, histogram_corpora, now_ms, pushed_declines, pushed_statements,
+    sample_edge_corpus, scale_corpus_sql, seed, seed_activity, seed_samples, server_marker,
+    statements_since, test_config,
 };
 
 fn should_run() -> bool {
@@ -551,4 +554,362 @@ async fn multi_name_declines_keep_todays_route() {
     assert!(errors[0] != "None", "a cold cache answers an error");
     assert_eq!(errors[0], errors[1], "{q}: the cold-cache error differs");
     h.finish().await;
+}
+
+// ------------------------------------------------ issue #579 part 3
+
+/// T10's first half: every pushed statement is part 3's form — the
+/// samples gathered per series into arrays, merged with the step
+/// boundaries, summed by running sums — and holds no window function and
+/// no per-element Kahan fold.
+fn assert_by_id_shape(query: &str, r: &Routed) {
+    let statements = pushed_statements(r);
+    assert!(
+        !statements.is_empty(),
+        "{query}: no pushed_aggregate statement in {:?}",
+        r.stages
+    );
+    for s in statements {
+        for want in [
+            "arraySort(arrayZip(groupArray(unix_milli)",
+            "arrayReverseFill(",
+            "arrayCumSum(",
+        ] {
+            assert!(s.contains(want), "{query}: no `{want}` in {s}");
+        }
+        for unwanted in ["WINDOW w", "arrayFold((acc, x) -> (acc.1 + x"] {
+            assert!(!s.contains(unwanted), "{query}: `{unwanted}` in {s}");
+        }
+    }
+}
+
+/// The two queries of part 3's measurements.
+const SCALE_QUERIES: [&str; 2] = [
+    "sum(rate(cpu_seconds[5m]))",
+    "sum by (mode) (rate(cpu_seconds[5m]))",
+];
+
+/// T1: 100,000 series, above the label cache's 50,000-series cap, so the
+/// selector resolves by SQL: both queries are pushed and answer what the
+/// push turned off answers, bit for bit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hundred_thousand_series_push() {
+    skip_unless_live!();
+    let t = anchor();
+    let db = pulsus_testkit::test_db("pulsus_read_it_pushed_rate_p3_t1");
+    let h = harness_sql(&db, t, &scale_corpus_sql(t, 100_000, false), None).await;
+    let p = h.ten_minutes(60_000);
+    for (q, groups) in SCALE_QUERIES.iter().zip([1, 8]) {
+        let r = h.agree(q, &p).await;
+        assert_pushed(q, p.step_ms, &r);
+        assert_eq!(r.answer.len(), groups, "{q}: {:?}", r.answer);
+    }
+    h.finish().await;
+}
+
+/// T3: with the push turned off, a selector above the cache's cap takes
+/// the SQL route, and its label lookup reads by the ID statement rather
+/// than a list of 100,000 IDs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn push_off_above_the_cache_cap() {
+    skip_unless_live!();
+    let t = anchor();
+    let db = pulsus_testkit::test_db("pulsus_read_it_pushed_rate_p3_t3");
+    let h = harness_sql(&db, t, &scale_corpus_sql(t, 100_000, false), None).await;
+    let p = h.ten_minutes(60_000);
+    let q = SCALE_QUERIES[0];
+    let r = Harness::run(&h.unpushed, q, &p).await;
+    assert_eq!(r.answer.len(), 1, "{q}: one series: {:?}", r.answer);
+    assert_eq!(
+        r.answer[0].matches(':').count(),
+        11,
+        "{q}: a point at each of the 11 steps: {:?}",
+        r.answer
+    );
+    h.finish().await;
+}
+
+/// T4: 20,000 series, every grouping form and each aggregation and range
+/// function the push answers: push on and off identical.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn twenty_thousand_series_by_and_without() {
+    skip_unless_live!();
+    let t = anchor();
+    let db = pulsus_testkit::test_db("pulsus_read_it_pushed_rate_p3_t4");
+    let h = harness_sql(&db, t, &scale_corpus_sql(t, 20_000, false), None).await;
+    let p = h.ten_minutes(60_000);
+    for q in [
+        "sum by (mode) (rate(cpu_seconds[5m]))",
+        "sum without (cpu) (rate(cpu_seconds[5m]))",
+        "avg by (instance) (rate(cpu_seconds[5m]))",
+        "max(irate(cpu_seconds[5m]))",
+        "min(increase(cpu_seconds[5m]))",
+        "count(rate(cpu_seconds[5m]))",
+    ] {
+        let r = h.agree(q, &p).await;
+        assert_pushed(q, p.step_ms, &r);
+        assert!(!r.answer.is_empty(), "{q}");
+    }
+    h.finish().await;
+}
+
+/// T5: 20,000 float series and one histogram series in the selector: the
+/// statement counts the histogram samples and the push's fallback answers
+/// as the push turned off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn histogram_fallback_above_the_cap() {
+    skip_unless_live!();
+    let t = anchor();
+    let db = pulsus_testkit::test_db("pulsus_read_it_pushed_rate_p3_t5");
+    let h = harness_sql(&db, t, &scale_corpus_sql(t, 20_000, true), None).await;
+    let p = h.ten_minutes(60_000);
+    for q in SCALE_QUERIES {
+        let r = h.agree(q, &p).await;
+        assert!(
+            pushed_declines(&r)
+                .iter()
+                .any(|d| d.contains("HistogramSamples")),
+            "{q}: {:?}",
+            r.stages
+        );
+        assert!(!r.answer.is_empty(), "{q}");
+    }
+    h.finish().await;
+}
+
+/// T10: the sample edges part 3's merge and dedup stages must keep:
+/// scrape intervals from 5 to 75 s, a single-sample series, infinities,
+/// NaN, stale markers, negative and `-0.` values, and every third series's
+/// samples written again in another part. Every op over each function,
+/// `sum` and `sum by`: the statement is part 3's, and push on and off
+/// answer identically.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_sample_edges_answer_identically() {
+    skip_unless_live!();
+    let t = anchor();
+    let db = pulsus_testkit::test_db("pulsus_read_it_pushed_rate_p3_t10");
+    let (fx, repeats) = sample_edge_corpus(t);
+    let h = harness(&db, t, &fx, None).await;
+    seed_samples(&h.admin, &repeats).await;
+    let half_hour = |step_ms| pulsus_read::MetricQueryParams {
+        start_ms: t - 1_800_000,
+        end_ms: t,
+        step_ms,
+    };
+    for p in [half_hour(15_000), half_hour(60_000), h.instant()] {
+        for func in ["rate", "increase", "irate"] {
+            for agg in ["sum", "avg", "count", "min", "max"] {
+                for grouping in ["", "by (grp) "] {
+                    let q = format!("{agg} {grouping}({func}({SAMPLE_EDGE_METRIC}[5m]))");
+                    let (a, b) = h.both(&q, &p).await;
+                    assert_by_id_shape(&q, &a);
+                    assert_eq!(
+                        a.answer, b.answer,
+                        "{q} at step {}: the pushed answer differs from the unpushed one",
+                        p.step_ms
+                    );
+                    assert_eq!(a.annotations, b.annotations, "{q}: the annotations differ");
+                }
+            }
+        }
+    }
+    h.finish().await;
+}
+
+/// `rate` over `samples`, ordered by time then value bits, at the step
+/// ending `end` with a 5-minute range — the extrapolation every route
+/// computes, written out — or `None` with fewer than two samples.
+fn expected_rate(samples: &[(i64, f64)], end: i64) -> Option<f64> {
+    let range = 300_000i64;
+    let w: Vec<(i64, f64)> = samples
+        .iter()
+        .copied()
+        .filter(|(t, _)| *t > end - range && *t <= end)
+        .collect();
+    if w.len() < 2 {
+        return None;
+    }
+    let (t_f, y_f) = w[0];
+    let (t_l, y_l) = w[w.len() - 1];
+    let mut result = if y_f < 0.0 {
+        (y_l - y_f) + 0.0
+    } else {
+        y_l - y_f
+    };
+    for pair in w.windows(2) {
+        if pair[1].1 < pair[0].1 {
+            result += pair[0].1;
+        }
+    }
+    let n = w.len() as f64;
+    let d_start_raw = (t_f - (end - range)) as f64 / 1000.;
+    let d_end_raw = (end - t_l) as f64 / 1000.;
+    let sampled = (t_l - t_f) as f64 / 1000.;
+    let avg_dur = sampled / (n - 1.0);
+    let threshold = avg_dur * 1.1;
+    let d_start_1 = if d_start_raw >= threshold {
+        avg_dur / 2.
+    } else {
+        d_start_raw
+    };
+    let d_zero = if result > 0. && y_f >= 0. {
+        sampled * (y_f / result)
+    } else {
+        d_start_1
+    };
+    let d_start = if d_zero < d_start_1 {
+        d_zero
+    } else {
+        d_start_1
+    };
+    let d_end = if d_end_raw >= threshold {
+        avg_dur / 2.
+    } else {
+        d_end_raw
+    };
+    let factor = ((sampled + d_start + d_end) / sampled) / (range as f64 / 1000.);
+    Some(result * factor)
+}
+
+/// T11: two different values at one millisecond, written in both orders
+/// across two parts. The pushed answer is the same in ten runs and is
+/// `rate` over the samples ordered by time then value bits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn equal_time_samples_are_ordered_by_value_bits() {
+    skip_unless_live!();
+    let t = anchor();
+    let db = pulsus_testkit::test_db("pulsus_read_it_pushed_rate_p3_t11");
+    let (first, second) = equal_time_corpus(t);
+    let h = harness(&db, t, &first, None).await;
+    seed_samples(&h.admin, &second).await;
+    let p = h.ten_minutes(60_000);
+    let q = format!("sum by (series) (rate({EQUAL_TIME_METRIC}[5m]))");
+
+    let mut want: Vec<String> = first
+        .iter()
+        .zip(&second)
+        .map(|(a, b)| {
+            let mut samples: Vec<(i64, f64)> =
+                a.samples.iter().chain(&b.samples).copied().collect();
+            samples.sort_by_key(|(t, v)| (*t, v.to_bits()));
+            let points: Vec<String> = (0..=(p.end_ms - p.start_ms) / p.step_ms)
+                .filter_map(|g| {
+                    let end = p.start_ms + g * p.step_ms;
+                    expected_rate(&samples, end).map(|v| format!("{end}:{:016x}", v.to_bits()))
+                })
+                .collect();
+            format!("{:?} {}", a.labels, points.join(","))
+        })
+        .collect();
+    want.sort();
+
+    for run in 0..10 {
+        let r = Harness::run(&h.pushed, &q, &p).await;
+        assert_by_id_shape(&q, &r);
+        assert_eq!(r.answer, want, "{q}: run {run}");
+    }
+    h.finish().await;
+}
+
+#[derive(pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize, Debug)]
+struct CountRow {
+    n: u64,
+}
+
+/// T12: the time chunks count distinct series, not the ID statement's
+/// rows. 1,000 series whose activity is written in separate inserts that
+/// are never merged, on both days of a window crossing midnight UTC: four
+/// activity rows a series. With the label cache never refreshed, the
+/// series count comes from the database; under a cap of 30,500
+/// series-steps, 61 steps are 3 statements of 30 steps (4,000 rows would
+/// make 9 of 7).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn chunk_count_follows_distinct_series() {
+    skip_unless_live!();
+    use futures::StreamExt;
+    use pulsus_clickhouse::{Idempotency, QuerySettings};
+
+    let now = now_ms();
+    let mut midnight = now / DAY_MS * DAY_MS;
+    if now - midnight < 3_600_000 {
+        midnight -= DAY_MS;
+    }
+    let fx: Vec<SeedSeries> = (0..1_000u128)
+        .map(|i| SeedSeries {
+            fp: 0x5796_0000_0000_0000_0000_0000_0000_0000 | i,
+            metric: SCALE_METRIC.to_string(),
+            labels: vec![
+                ("cpu".to_string(), (i % 16).to_string()),
+                ("series".to_string(), i.to_string()),
+            ],
+            samples: (0..320i64)
+                .map(|k| {
+                    (
+                        midnight - 2_700_000 + k * SCRAPE_MS + (i as i64 % 900),
+                        (k * 3) as f64 + i as f64,
+                    )
+                })
+                .collect(),
+            hist: Vec::new(),
+        })
+        .collect();
+    let db = pulsus_testkit::test_db("pulsus_read_it_pushed_rate_p3_t12");
+    let (bootstrap, client) = fresh_database(&db).await;
+    client
+        .execute(
+            "SYSTEM STOP MERGES metric_series",
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("stop merges");
+    let day_before = u16::try_from(midnight / DAY_MS - 1).expect("day");
+    let day_after = u16::try_from(midnight / DAY_MS).expect("day");
+    seed(&client, &fx, midnight - 600_000).await;
+    seed_activity(&client, &fx, &[day_after], (1 << 24) - 1).await;
+    seed_activity(&client, &fx, &[day_before, day_after], (1 << 23) | 1).await;
+    let mut stream = client
+        .query_stream::<CountRow>(
+            "SELECT count() AS n FROM metric_series",
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("count activity rows");
+    let rows = stream.next().await.expect("one row").expect("decode").n;
+    drop(stream);
+    assert_eq!(rows, 4_000, "four activity rows a series");
+
+    let cold = std::sync::Arc::new(LabelCache::new(
+        ChClient::new(test_config(&db)).await.expect("connect"),
+        cache_config(&db),
+    ));
+    let pushed = MetricsEngine::new(
+        ChClient::new(test_config(&db)).await.expect("connect"),
+        cold,
+        engine_config(&db, true),
+    )
+    .with_pushed_series_steps_cap(30_500);
+    let p = MetricQueryParams {
+        start_ms: midnight - 1_800_000,
+        end_ms: midnight + 1_800_000,
+        step_ms: 60_000,
+    };
+    let q = format!("sum(rate({SCALE_METRIC}[5m]))");
+    let marker = server_marker(&client).await;
+    let r = Harness::run(&pushed, &q, &p).await;
+    assert!(!r.answer.is_empty(), "{q}");
+    let sent = statements_since(&client, &db, &marker).await;
+    let shape_a = sent
+        .iter()
+        .filter(|s| s.query.contains("AS range_ms"))
+        .count();
+    assert_eq!(
+        shape_a,
+        3,
+        "1,000 series x 61 steps under a cap of 30,500 is three statements: {:?}",
+        sent.iter()
+            .map(|s| s.query.chars().take(120).collect::<String>())
+            .collect::<Vec<_>>()
+    );
+    pushed_rate_corpus::drop_database(&bootstrap, &db).await;
 }

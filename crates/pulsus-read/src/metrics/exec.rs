@@ -1318,7 +1318,7 @@ impl MetricsEngine {
                 .map(|(g0, grid)| {
                     (
                         g0,
-                        super::grouped_sql::range_aggregate_fetch(
+                        super::grouped_sql::range_aggregate_fetch_literal(
                             &self.config.samples_table,
                             &self.config.hist_samples_table,
                             &fps,

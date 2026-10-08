@@ -263,7 +263,7 @@ fn render() -> String {
                     ));
                     emit(
                         &mut out,
-                        &grouped_sql::range_aggregate_fetch(
+                        &grouped_sql::range_aggregate_fetch_literal(
                             SAMPLES,
                             HIST,
                             &fps(),
