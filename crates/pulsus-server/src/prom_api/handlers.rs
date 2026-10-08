@@ -585,7 +585,7 @@ async fn metadata_impl(
     let metric = params::metric(&pairs);
     let limit = params::parse_limit(params::get(&pairs, "limit"))?;
     let engine = engine_for(&state).await?;
-    let items = engine.metadata(tenant, metric, limit).await?;
+    let items = engine.metadata(tenant, metric, limit, None).await?;
     Ok(encode::metadata_response(items))
 }
 

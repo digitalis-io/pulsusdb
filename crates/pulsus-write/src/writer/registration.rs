@@ -435,26 +435,26 @@ mod tests {
         assert!(!cache.is_current("", "up", "gauge", "h", "", 6));
     }
 
-    /// A then B then A: the last one sent is B, so A must go again. A set of
-    /// every descriptor ever sent would call A current.
+    /// Issue #500, T8: a name's two descriptors are two entries of the
+    /// table, so sending B does not make A stale: both are current.
     #[test]
-    fn going_back_to_an_earlier_descriptor_sends_it_again() {
+    fn two_descriptors_of_a_name_are_both_current() {
         let mut cache = DescriptorCache::new(10);
         cache.promote("", "up", "gauge", "a", "", 5, 100);
         cache.promote("", "up", "gauge", "b", "", 5, 200);
-        assert!(!cache.is_current("", "up", "gauge", "a", "", 5));
+        assert!(cache.is_current("", "up", "gauge", "a", "", 5));
         assert!(cache.is_current("", "up", "gauge", "b", "", 5));
     }
 
-    /// Two blocks can commit out of order. The older descriptor committing
-    /// last must not replace the newer one, which is what the table keeps.
+    /// Two blocks can commit out of order. An older commit of the SAME
+    /// descriptor must not lower the hour recorded for it.
     #[test]
-    fn a_late_commit_of_an_older_descriptor_does_not_replace_a_newer_one() {
+    fn an_older_commit_of_the_same_descriptor_does_not_lower_its_hour() {
         let mut cache = DescriptorCache::new(10);
-        cache.promote("", "up", "gauge", "new", "", 5, 200);
-        cache.promote("", "up", "gauge", "old", "", 5, 100);
-        assert!(cache.is_current("", "up", "gauge", "new", "", 5));
-        assert!(!cache.is_current("", "up", "gauge", "old", "", 5));
+        cache.promote("", "up", "gauge", "h", "", 6, 200);
+        cache.promote("", "up", "gauge", "h", "", 5, 100);
+        assert!(cache.is_current("", "up", "gauge", "h", "", 6));
+        assert!(!cache.is_current("", "up", "gauge", "h", "", 5));
     }
 
     #[test]

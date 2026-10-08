@@ -2998,7 +2998,7 @@ async fn metadata_collapses_to_the_latest_write() {
     let engine = MetricsEngine::new(engine_client, cache, engine_config(db));
 
     let all = engine
-        .metadata(&no_tenant(), None, None)
+        .metadata(&no_tenant(), None, None, None)
         .await
         .expect("metadata (all)");
     assert_eq!(all.len(), 2);
@@ -3009,7 +3009,7 @@ async fn metadata_collapses_to_the_latest_write() {
     );
 
     let scoped = engine
-        .metadata(&no_tenant(), Some("http_requests_total"), None)
+        .metadata(&no_tenant(), Some("http_requests_total"), None, None)
         .await
         .expect("metadata (scoped)");
     assert_eq!(scoped.len(), 1);
@@ -3017,7 +3017,7 @@ async fn metadata_collapses_to_the_latest_write() {
     assert_eq!(scoped[0].unit, "requests");
 
     let limited = engine
-        .metadata(&no_tenant(), None, Some(1))
+        .metadata(&no_tenant(), None, Some(1), None)
         .await
         .expect("metadata (limited)");
     assert_eq!(limited.len(), 1);
@@ -3085,7 +3085,7 @@ async fn a_tie_on_updated_ns_serves_one_whole_descriptor() {
     let engine = MetricsEngine::new(engine_client, cache, engine_config(db));
 
     let rows = engine
-        .metadata(&no_tenant(), Some("up"), None)
+        .metadata(&no_tenant(), Some("up"), None, None)
         .await
         .expect("metadata (tied)");
     assert_eq!(rows.len(), 1, "one descriptor per name");

@@ -3024,6 +3024,26 @@ mod tests {
         assert_eq!(out.samples.len(), 2);
     }
 
+    /// Issue #500, T7: two resources each carrying gauge `m`, described "A"
+    /// and "B", keep both descriptions.
+    #[test]
+    fn two_resources_keep_both_descriptions() {
+        let described = |description: &str, t: u64| {
+            let mut metric = gauge_metric("m", number_dp(t, 1.0, vec![]));
+            metric.description = description.to_string();
+            ResourceMetrics {
+                resource: None,
+                scope_metrics: vec![scope_metrics(vec![metric])],
+                schema_url: String::new(),
+            }
+        };
+        let out = parse(&request(vec![described("A", 1), described("B", 2)]), 0)
+            .expect("within the expansion budget");
+        let mut helps: Vec<&str> = out.metadata.iter().map(|m| m.help.as_str()).collect();
+        helps.sort_unstable();
+        assert_eq!(helps, ["A", "B"], "{:?}", out.metadata);
+    }
+
     /// Issue #461 narrowed where a collision can arise: resource and scope
     /// attributes no longer become per-sample labels, so the only source is
     /// two data-point attribute keys that sanitize alike. The reference

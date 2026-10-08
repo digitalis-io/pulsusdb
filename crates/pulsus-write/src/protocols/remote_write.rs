@@ -2750,6 +2750,26 @@ mod tests {
         assert_eq!(out.metadata[0].help, "second");
     }
 
+    /// Issue #500, T6: one request carrying `m` "A", then "B", then "A"
+    /// again keeps each distinct descriptor once.
+    #[test]
+    fn one_request_keeps_each_distinct_descriptor() {
+        let entry = |help: &str| MetricMetadataProto {
+            r#type: 2,
+            metric_family_name: "m".to_string(),
+            help: help.to_string(),
+            unit: String::new(),
+        };
+        let req = WriteRequest {
+            timeseries: vec![],
+            metadata: vec![entry("A"), entry("B"), entry("A")],
+        };
+        let out = parse(&req, 0).expect("within the expansion budget");
+        let mut helps: Vec<&str> = out.metadata.iter().map(|m| m.help.as_str()).collect();
+        helps.sort_unstable();
+        assert_eq!(helps, ["A", "B"], "{:?}", out.metadata);
+    }
+
     // -- expansion budget (issue #62) -------------------------------------
 
     /// A single named series carrying more than the admissible ~4.2M-sample

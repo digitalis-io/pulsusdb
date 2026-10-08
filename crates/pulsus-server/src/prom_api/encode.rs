@@ -1580,6 +1580,29 @@ mod tests {
         assert!(alpha_pos < zeta_pos);
     }
 
+    /// Issue #500, T4: one key per name, its array holding every entry of
+    /// that name in row order.
+    #[tokio::test]
+    async fn one_key_per_name_with_every_entry() {
+        let meta = |name: &str, t: &str, help: &str, unit: &str| MetricMeta {
+            name: name.to_string(),
+            metric_type: t.to_string(),
+            help: help.to_string(),
+            unit: unit.to_string(),
+        };
+        let res = metadata_response(vec![
+            meta("m", "counter", "A", ""),
+            meta("m", "gauge", "A", ""),
+            meta("m", "gauge", "A", "seconds"),
+            meta("n", "gauge", "N", ""),
+        ]);
+        let body = body_string(res).await;
+        assert_eq!(
+            body,
+            r#"{"status":"success","data":{"m":[{"type":"counter","help":"A","unit":""},{"type":"gauge","help":"A","unit":""},{"type":"gauge","help":"A","unit":"seconds"}],"n":[{"type":"gauge","help":"N","unit":""}]}}"#
+        );
+    }
+
     // --- query_exemplars stub ---
 
     #[tokio::test]

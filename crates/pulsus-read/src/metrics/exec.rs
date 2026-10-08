@@ -2625,7 +2625,9 @@ impl MetricsEngine {
         tenant: &Tenant,
         metric: Option<&str>,
         limit: Option<usize>,
+        limit_per_metric: Option<i64>,
     ) -> Result<Vec<MetricMeta>, ReadError> {
+        let _ = limit_per_metric;
         let sql = super::sql::metadata_query(tenant, &self.config.metadata_table, metric, limit);
         let rows: Vec<MetricMetaRow> = self.fetch_rows(sql).await?;
         Ok(rows

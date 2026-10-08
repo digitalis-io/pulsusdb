@@ -619,7 +619,7 @@ async fn every_read_answers_its_own_tenant() {
         let engine = &engine;
         async move {
             let mut got: Vec<String> = engine
-                .metadata(&t, None, None)
+                .metadata(&t, None, None, None)
                 .await
                 .expect("metadata")
                 .into_iter()
