@@ -2663,7 +2663,7 @@ fn go_duration_frac(mut u: u128, prec: u32) -> (String, u128) {
 /// sub-second uses `ns`/`µs`/`ms` with a trimmed fraction, `>= 1s` uses
 /// `[h][m]s` with a trimmed fractional-seconds part (`1.5s`, `1m30s`,
 /// `1h1m1s`, `500µs`, `0s`).
-fn go_duration_string(nanos: i64) -> String {
+pub(crate) fn go_duration_string(nanos: i64) -> String {
     if nanos == 0 {
         return "0s".to_string();
     }
