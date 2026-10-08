@@ -2804,6 +2804,76 @@ fn label_values_of(json: &serde_json::Value, label: &str) -> Vec<String> {
         .collect()
 }
 
+/// Issue #499, H2: every `lookback_delta` the reference accepts reaches
+/// the engine, on both query routes. The one series' last sample is eight
+/// minutes before `t`: outside the default 5m lookback, inside 10m. So
+/// `10m` returns it, and `""`, `0` and `-5`, which mean the default, are
+/// answered (not refused) without it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_accepted_lookback_delta_reaches_the_engine() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse to run this test");
+        return;
+    }
+    let db = pulsus_testkit::test_db("pulsus_prom_499_lookback_it");
+    let port: u16 = 31_521;
+    let guard = spawn_prom_server(port, &db, &[]);
+    let client = ChClient::new(test_ch_config(&db))
+        .await
+        .expect("connect to seed data");
+
+    const MIN: i64 = 60_000;
+    let t = (now_ms() / 15_000) * 15_000 - MIN;
+    let ts = t / 1_000;
+    client
+        .insert_series(&[SeedSeriesRow {
+            metric_name: "lb499".to_string(),
+            fingerprint: 9921,
+            unix_milli: t - 20 * MIN,
+            labels: r#"{"inst":"1"}"#.to_string(),
+        }])
+        .await
+        .expect("seed series");
+    let mut samples = Vec::new();
+    let mut at = t - 20 * MIN;
+    while at <= t - 8 * MIN {
+        samples.push(SeedSampleRow {
+            org_id: String::new(),
+            fingerprint: 9921,
+            unix_milli: at,
+            value: 1.0,
+        });
+        at += 15_000;
+    }
+    client
+        .insert_block("metric_samples", &samples)
+        .await
+        .expect("seed samples");
+    let _ = wait_for_body(port, "/api/v1/status/tsdb", |json| {
+        json["data"]["headStats"]["numSeries"] == 1
+    });
+
+    for route in [
+        format!("/api/v1/query?query=lb499&time={ts}"),
+        format!("/api/v1/query_range?query=lb499&start={ts}&end={ts}&step=60"),
+    ] {
+        for (raw, want) in [
+            ("10m", vec!["1"]),
+            ("", vec![]),
+            ("0", vec![]),
+            ("-5", vec![]),
+        ] {
+            let path = format!("{route}&lookback_delta={raw}");
+            let (status, json) = get_json(port, &path);
+            assert_eq!(status, 200, "H2 {path}: {json}");
+            assert_eq!(label_values_of(&json, "inst"), want, "H2 {path}: {json}");
+        }
+    }
+
+    drop(guard);
+    drop_db(&db).await;
+}
+
 /// Issue #499, L1-L10: `lookback_delta`, `limit`, `stats`, the discovery
 /// default window, the tsdb `limit`, the exemplar validation and empty
 /// values, through the real binary.

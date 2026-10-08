@@ -2021,25 +2021,6 @@ mod tests {
         }
     }
 
-    /// H2: the values the reference accepts reach the engine.
-    #[tokio::test]
-    async fn an_accepted_lookback_delta_reaches_the_engine() {
-        for path in ["/api/v1/query", "/api/v1/query_range"] {
-            for raw in ["", "0", "-5", "15m"] {
-                let (status, json) = get_status(
-                    path,
-                    &format!("query=up&start=0&end=100&step=1&lookback_delta={raw}"),
-                )
-                .await;
-                assert_eq!(
-                    status,
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "{path} {raw}: {json}"
-                );
-            }
-        }
-    }
-
     /// H3: `limit` on the query routes is read by the discovery parser.
     #[tokio::test]
     async fn the_query_routes_read_limit() {
