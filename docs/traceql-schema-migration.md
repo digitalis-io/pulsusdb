@@ -456,7 +456,7 @@ because the table it reads has no time column.
 
 Open a tag-value dropdown while a service filter is set and the read becomes a
 semi-join between the two tables at **day** grain
-(`crates/pulsus-read/src/traces/tags_sql.rs:282-312`, chosen at `crates/pulsus-read/src/traces/exec.rs:2081-2112`):
+(`crates/pulsus-read/src/traces/tags_sql.rs:282-312`, chosen at `crates/pulsus-read/src/traces/exec.rs:2104-2135`):
 
 ```sql
 SELECT DISTINCT val, val_type
@@ -1369,7 +1369,7 @@ repetitions: 2,000,000 rows / **288,001,456 bytes**, the same figure as the firs
 above.
 
 **The probe is POSITIVE and stays positive. Negation is not done in SQL.**
-`crates/pulsus-read/src/traces/search_eval.rs:1213-1216` evaluates a leaf as
+`crates/pulsus-read/src/traces/search_eval.rs:1217-1220` evaluates a leaf as
 `member != *negated`, so `{ span.k != "x" }` is a positive `k = 'x'` probe whose result
 the reader inverts. That stays exactly as it is; only what the positive probe computes
 changes, from "some element matches" to "the resolved element matches".
@@ -2198,7 +2198,7 @@ from names.
 | numeric value | `Nullable(Float64)` | `Nullable(Float64)` | none — same width, same NULL rule, same `toFloat64OrNull` source | **agree** |
 | the comparison `val_num >= 500` | `Nullable(UInt8)` | `Nullable(UInt8)` | none | **agree** |
 | the PROBE's result, as the reader sees it | a row present or absent in the membership set | `(i0 != 0) AND ifNull(<test on the located element>, 0)`, printed `UInt8` | **the row set moves on one class and only on it**: a span that carries the probed key more than once, or carries it at two scopes under an unscoped condition. There the membership set answers "some entry matched" and the column answers "the entry this span resolves to matched". Measured on the eight-span fixture in §4 Q1: three of eight differ. Everywhere else they agree, and `ifNull(…, 0)` keeps a NULL element reading as 0 exactly where the membership form returned no row | **differs, deliberately — the duplicate-key ledger row covers it** |
-| the probe under NEGATION | positive probe, reader inverts (`crates/pulsus-read/src/traces/search_eval.rs:1213-1216`, `member != *negated`) | **must stay exactly that** | negating inside the array function differs on an absent key and on a multi-valued key — §4 Q1's six-case table. The inversion itself is unchanged; the positive column it inverts is the locate-then-test one, so `['y','x']` under `!= "x"` moves from 0 to 1 | **agree on five of six; the sixth is the duplicate-key change** |
+| the probe under NEGATION | positive probe, reader inverts (`crates/pulsus-read/src/traces/search_eval.rs:1217-1220`, `member != *negated`) | **must stay exactly that** | negating inside the array function differs on an absent key and on a multi-valued key — §4 Q1's six-case table. The inversion itself is unchanged; the positive column it inverts is the locate-then-test one, so `['y','x']` under `!= "x"` moves from 0 to 1 | **agree on five of six; the sixth is the duplicate-key change** |
 | the value a DUPLICATED key yields | `any(val)` / `any(val_num)` over `GROUP BY (trace_id, span_id)` — arbitrary, not stable across merges | **locate on `(key, scope)` only, then read that element**; scope precedence span → resource → event → link → instrumentation | on `['7','5']`: today returned 5 in one measurement, the new form returns 7. On `['bad','5']`: today's numeric read returns 5, the new form returns NULL, because the FIRST match is not numeric | **CHANGED, deliberately.** The rule is **the first stored element within the highest-precedence scope that is present** — first-in-stored-order is the scoped half of it only — derived in §4 Q1 from what the alternatives cost a user and then checked against the reference, whose value path does the same: `tempodb/encoding/vparquet4/block_traceql.go:128-151` and `:249-280 @ v3.0.2`, quoted there. Its condition path does not, which is the divergence recorded in `docs/api.md` and in `docs/benchmarks/traces-differential-ledger.md`. Today's behaviour has no contract |
 | `val_num`'s determinant | — | `(scope, key, val)`, **not `val` alone** | `link:spanID` = `'0000000000000001'` stores `val_num = NULL` while the same text under an attribute key stores `1.0` (`crates/pulsus-write/src/protocols/otlp_traces.rs:581-630` sets `val_num: None` unconditionally for both link intrinsics) | **determined**, and all three columns are in the sorting key |
 | `timestamp_ns`, `duration_ns` | `Int64` nanoseconds | `Int64` nanoseconds | none | **agree** |
@@ -2228,7 +2228,7 @@ storage. If that answer should change, it should change on its own.
 | an event or link intrinsic | `event:name`, `link:spanID` | its own scope, one row per span | same tuple, trace grain | as the first row |
 | the tag dropdown's rows | any key ever ingested | every tuple ever seen | tuples seen in the retention window | **changed, deliberately** — a value last seen 400 days ago stops appearing. That is what every other endpoint already does |
 | **a span that carries the probed key twice** | `span.n = "7"` then `span.n = "5"`, filter `{ span.n = 5 }` | the membership row for the second entry exists, so the span **matches** — and `select(span.n)` then renders whichever entry `any()` reached | the span resolves to `7`, so it does **not** match, and `select(span.n)` renders `7` | **changed, deliberately.** Today's two answers contradict each other; the new pair agrees. §4 Q1's fixture moves on three rows, of two kinds — this one, and the next — and the third row is this kind under a negation. One ledger row covers filter, negation and read |
-| **a span that carries the probed key at two scopes, under an unscoped condition** | `resource.k = "x"` and `span.k = "y"`, filter `{ .k = "x" }` | matches — the unscoped probe unions the scopes | does not match — `.k` resolves to `"y"` by the precedence span → resource → event → link → instrumentation | **changed, deliberately**, same ledger row. `crates/pulsus-read/src/traces/search_eval.rs:3710` pins today's union behaviour and moves with it |
+| **a span that carries the probed key at two scopes, under an unscoped condition** | `resource.k = "x"` and `span.k = "y"`, filter `{ .k = "x" }` | matches — the unscoped probe unions the scopes | does not match — `.k` resolves to `"y"` by the precedence span → resource → event → link → instrumentation | **changed, deliberately**, same ledger row. `crates/pulsus-read/src/traces/search_eval.rs:3722` pins today's union behaviour and moves with it |
 
 **Where the two candidate generators first disagree**, as a case rather than a
 description:
@@ -2319,7 +2319,7 @@ Three aggregate conditions are pushed into the candidate generator today
 Losing a pushdown does not change an answer. The condition is re-evaluated over
 the hydrated spans either way; the pushed form only narrows the candidate list,
 and the plan already keeps a byte-for-byte fallback statement with nothing pushed
-(`crates/pulsus-read/src/traces/search_plan.rs:3084-3104`, used at `crates/pulsus-read/src/traces/exec.rs:2388-2416`). The effect is more
+(`crates/pulsus-read/src/traces/search_plan.rs:3084-3104`, used at `crates/pulsus-read/src/traces/exec.rs:2450-2478`). The effect is more
 candidates, not a different result.
 
 `by()` grouping already refuses to push whenever the generator is not

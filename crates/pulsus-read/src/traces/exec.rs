@@ -97,8 +97,8 @@ use super::metrics_result::{
 };
 use super::spans::fetch as span_fetch;
 use super::spans::rows::{
-    FallbackFetchRow, FetchRoute, FetchWindow, FetchedTrace, IndexedFetchRow, SearchProjected,
-    SearchSpanTuple, SearchTraceRow, WideFetchRow,
+    FallbackFetchRow, FetchRoute, FetchWindow, FetchedTrace, IndexedFetchRow, SearchGroupTuple,
+    SearchGroupedRow, SearchProjected, SearchSpanTuple, SearchTraceRow, WideFetchRow,
 };
 
 use super::rows::{
@@ -778,18 +778,41 @@ fn search_row_bytes(row: &SearchTraceRow) -> usize {
     std::mem::size_of::<SearchTraceRow>()
         + row.root_service.len()
         + row.root_name.len()
+        + search_spans_bytes(&row.spans)
+}
+
+/// The spans of a search statement row: per span the tuple, its service
+/// and per projected value the value and its two strings.
+fn search_spans_bytes(spans: &[SearchSpanTuple]) -> usize {
+    spans
+        .iter()
+        .map(|s| {
+            std::mem::size_of::<SearchSpanTuple>()
+                + s.service.len()
+                + s.projected
+                    .iter()
+                    .map(|p| std::mem::size_of::<SearchProjected>() + p.value.len() + p.kind.len())
+                    .sum::<usize>()
+        })
+        .sum::<usize>()
+}
+
+/// [`search_row_bytes`] for a grouped statement's row (issue #592 part 2):
+/// the trace's columns, and per group the tuple, its two strings and its
+/// spans.
+fn search_grouped_row_bytes(row: &SearchGroupedRow) -> usize {
+    std::mem::size_of::<SearchGroupedRow>()
+        + row.root_service.len()
+        + row.root_name.len()
+        + search_spans_bytes(&row.spans)
         + row
-            .spans
+            .groups
             .iter()
-            .map(|s| {
-                std::mem::size_of::<SearchSpanTuple>()
-                    + s.service.len()
-                    + s.projected
-                        .iter()
-                        .map(|p| {
-                            std::mem::size_of::<SearchProjected>() + p.value.len() + p.kind.len()
-                        })
-                        .sum::<usize>()
+            .map(|g| {
+                std::mem::size_of::<SearchGroupTuple>()
+                    + g.value.len()
+                    + g.value_type.len()
+                    + search_spans_bytes(&g.spans)
             })
             .sum::<usize>()
 }
@@ -2260,6 +2283,45 @@ impl TraceEngine {
         let settings = self.search_settings().set("final", 1);
         let mut budget = ByteBudget::new(HYDRATION_BYTE_BUDGET);
         let mut charged = 0usize;
+        // Issue #592 part 2: a grouped statement runs today's distinct-group
+        // preflight first, and its decode counts the groups it returns.
+        if let Some(grouping) = stmt.grouping() {
+            self.enforce_search_series_cap(plan).await?;
+            let rows = match self
+                .collect_rows_charged::<SearchGroupedRow, _>(
+                    stmt.sql(),
+                    &settings,
+                    &mut budget,
+                    &mut charged,
+                    map_search_statement_error,
+                    search_grouped_row_bytes,
+                )
+                .await
+            {
+                Ok(rows) => rows,
+                Err(ReadError::Clickhouse(ChError::Server { code: 395, message }))
+                    if stmt
+                        .demands()
+                        .iter()
+                        .any(|demand| message.contains(demand.as_str())) =>
+                {
+                    return self.search_inner(plan, explain).await;
+                }
+                Err(ReadError::Clickhouse(e)) => {
+                    return Err(map_trace_read_error(e, &self.config));
+                }
+                Err(other) => return Err(other),
+            };
+            let mut counter = GroupCardinalityCounter::new(self.config.max_series);
+            return super::spans::search::decode_search_grouped_charged(
+                rows,
+                stmt.projection(),
+                grouping,
+                plan.limit,
+                &mut budget,
+                &mut counter,
+            );
+        }
         let rows = match self
             .collect_rows_charged::<SearchTraceRow, _>(
                 stmt.sql(),

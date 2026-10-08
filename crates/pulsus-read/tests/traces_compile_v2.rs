@@ -4762,8 +4762,10 @@ fn compile_search_refuses_what_parts_two_and_three_serve() {
         (r#"{ .k + 1 != .k }"#, "two occurrences"),
         (r#"{ link.lk - link.lk != 0 }"#, "two occurrences"),
         (r#"{ .a = 1 } | count() > 1"#, "#592 part 3"),
-        (r#"{ .a = 1 } | by(name)"#, "#592 part 2"),
-        (r#"{ .a = 1 } | coalesce()"#, "#592 part 2"),
+        // Issue #592 part 2: a key the statement does not serve, and a
+        // second `by()`.
+        (r#"{ .a = 1 } | by(trace:id)"#, "#592"),
+        (r#"{ .a = 1 } | by(span.a) | by(name)"#, "#592"),
         (r#"{ .a = 1 } > { .b = 2 }"#, "#593"),
         (r#"({ .a = 1 } > { .b = 2 }) && { .c = 3 }"#, "#593"),
         (r#"{ nestedSetLeft > 0 }"#, "#594"),
@@ -4909,10 +4911,17 @@ fn the_fork_routes_by_the_plan() {
     let mut wrong = Vec::new();
     for query in [
         r#"{ .a = 1 } | count() > 1"#,
-        r#"{ .a = 1 } | coalesce()"#,
-        r#"{ .a = 1 } | by(name)"#,
-        r#"{ .a = 1 } | { name = "b" } | coalesce()"#,
         r#"{ .a = 1 } && { .b = 2 } | { .c = 3 }"#,
+        // Issue #592 part 2: the keys the statement does not serve, a
+        // second `by()`, and a `by()` after `coalesce()`.
+        r#"{ .a = 1 } | by(trace:id) | coalesce()"#,
+        r#"{ .a = 1 } | by(event.e)"#,
+        r#"{ .a = 1 } | by(resource.k)"#,
+        r#"{ .a = 1 } | by(link.l)"#,
+        r#"{ .a = 1 } | by(instrumentation.i)"#,
+        r#"{ .a = 1 } | by(.u)"#,
+        r#"{ .a = 1 } | by(span.a) | by(name)"#,
+        r#"{ .a = 1 } | by(span.a) | coalesce() | by(name)"#,
         r#"{ .a = 1 } > { .b = 2 }"#,
         r#"{ nestedSetLeft > 0 }"#,
         r#"{ nestedSetParent < 0 }"#,
@@ -4942,6 +4951,13 @@ fn the_fork_routes_by_the_plan() {
         r#"{ } | { .a = 1 } | { name = "b" }"#,
         r#"{ .a = 1 } | select(name)"#,
         r#"{ status = error } | select(span.http.status_code, .foo, resource.service.name)"#,
+        // Issue #592 part 2: the four inventory rows, and two shapes.
+        r#"{ .a = 1 } | by(resource.service.name)"#,
+        r#"{ .a = 1 } | coalesce()"#,
+        r#"{ .a = 1 } | by(name) | { name = "b" }"#,
+        r#"{ .a = 1 } | { name = "b" } | by(name)"#,
+        r#"{ } | by(span.a) | coalesce()"#,
+        r#"{ } | by(status) | select(span.a)"#,
     ] {
         if plan_statement(&fork_plan(query), "spans", "traces", "resources").is_none() {
             wrong.push(format!(
