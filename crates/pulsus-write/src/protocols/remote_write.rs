@@ -6,9 +6,8 @@
 //! are already distinct `TimeSeries`, each carrying its own `__name__` and
 //! `le`/`quantile` labels), so there is no per-type flattening, no
 //! temporality, no exponential-bucket math — just `__name__` extraction,
-//! label normalization through the frozen `LabelSet::from_normalized`,
-//! the series ID `series_fingerprint(name, labels)`, and verbatim
-//! `(ms, value)` samples.
+//! the labels stored verbatim, as sent (issue #495), the series ID
+//! `series_fingerprint(name, labels)`, and verbatim `(ms, value)` samples.
 //!
 //! ## Wire types: hand-rolled prompb structs
 //!
@@ -1217,8 +1216,8 @@ const SERIES_ROW_OVERHEAD: usize = 64;
 /// Fixed per-label heap floor charged for every materialized `(name, value)`
 /// label pair (issue #115, finding #62). A wire label can be ~2 bytes (both
 /// strings empty) yet, once `parse_time_series` clones it into `rest` and
-/// `LabelSet::from_normalized` builds its sorted map, it costs two `String`
-/// headers (48 B) plus the normalized-map node/container overhead — a fixed
+/// `LabelSet::from_verbatim` builds its sorted map, it costs two `String`
+/// headers (48 B) plus the map node/container overhead — a fixed
 /// heap cost the raw name+value byte charge undercounts to near zero. Without
 /// this floor an attacker fans ≤ [`MAX_TOTAL_LABELS_PER_REQUEST`] near-empty
 /// labels across many series (each under [`MAX_LABELS_PER_SERIES`]), staying
@@ -1527,12 +1526,15 @@ pub fn parse(req: &WriteRequest, now_ns: i64) -> Result<ParsedMetrics, LogsInges
     Ok(out)
 }
 
-/// Parses one `TimeSeries`: extracts `__name__` (missing/empty -> drop the
-/// whole series, `rejected += sample_count` — the only semantic per-series
-/// violation remote-write has, architect plan's reject-boundary rule),
-/// normalizes the remaining labels, fingerprints them, and emits one
+/// Parses one `TimeSeries`: extracts `__name__`, keeps the remaining labels
+/// verbatim, as sent (issue #495), fingerprints them, and emits one
 /// [`MetricPoint`] per sample plus (if it has >=1 accepted sample) one
 /// [`SeriesRef`] for the series.
+///
+/// A series is dropped, `rejected += sample_count`, when it has no
+/// `__name__` (or it is empty), a label with an empty name, or a label name
+/// given twice — `__name__` included, values not compared — the rule the
+/// reference's protocol 1.0 receiver applies.
 fn parse_time_series(
     out: &mut ParsedMetrics,
     expanded_bytes: &mut usize,
@@ -1540,7 +1542,7 @@ fn parse_time_series(
     ts: &TimeSeries,
 ) -> Result<(), LogsIngestError> {
     // Charge this series' label/`SeriesRef` materialization BEFORE building
-    // `rest`/`from_normalized` (issue #62). Allocation-free: sums wire
+    // `rest`/`from_verbatim` (issue #62). Allocation-free: sums wire
     // string lengths plus a fixed [`LABEL_ROW_OVERHEAD`] per label, so a
     // near-empty-label fan-out trips [`MAX_EXPANDED_BYTES`] before any
     // `(String, String)`/label-set materialization (issue #115, finding #62).
@@ -1550,6 +1552,28 @@ fn parse_time_series(
             .saturating_add(l.value.len())
     });
     charge_budget(expanded_bytes, label_charge)?;
+
+    // Issue #495: an empty name, or a name given twice, drops the series.
+    let mut seen_names: HashSet<&str> = HashSet::with_capacity(ts.labels.len());
+    for label in &ts.labels {
+        let refused = if label.name.is_empty() {
+            Some("invalid label name \"\" in series: series dropped".to_string())
+        } else if !seen_names.insert(label.name.as_str()) {
+            Some(format!(
+                "duplicate label name {:?} in series: series dropped",
+                label.name
+            ))
+        } else {
+            None
+        };
+        if let Some(message) = refused {
+            out.rejected += ts.samples.len() as u64;
+            if out.rejected_message.is_none() {
+                out.rejected_message = Some(message);
+            }
+            return Ok(());
+        }
+    }
 
     let mut name: Option<&str> = None;
     let mut rest: Vec<(String, String)> = Vec::with_capacity(ts.labels.len());
@@ -1572,8 +1596,7 @@ fn parse_time_series(
     };
     let metric_name: Arc<str> = Arc::from(name);
 
-    let (labels, collisions) = LabelSet::from_normalized(rest);
-    out.collisions += collisions as u64;
+    let labels = LabelSet::from_verbatim(rest);
     let fingerprint = series_fingerprint(&metric_name, &labels);
 
     // A sampleless series (legal on the wire, e.g. a metadata-only push)
@@ -2631,30 +2654,126 @@ mod tests {
         );
     }
 
+    /// One request of one series per entry, each `(labels, sample count)`.
+    fn request_of(series: &[(&[(&str, &str)], usize)]) -> WriteRequest {
+        WriteRequest {
+            timeseries: series
+                .iter()
+                .map(|(labels, samples)| TimeSeries {
+                    labels: labels.iter().map(|(n, v)| label(n, v)).collect(),
+                    samples: (0..*samples).map(|k| sample(1.0, 1 + k as i64)).collect(),
+                    histograms: vec![],
+                })
+                .collect(),
+            metadata: vec![],
+        }
+    }
+
+    /// **T1 (issue #495): label names are stored as sent.** Each name is
+    /// the set's one label, and its series is not the series of the name
+    /// with every character outside `[a-zA-Z0-9_]` replaced by `_`.
     #[test]
-    fn dotted_and_underscored_labels_fingerprint_identically_cross_transport_identity() {
-        let req_dot = WriteRequest {
-            timeseries: vec![TimeSeries {
-                labels: vec![label("__name__", "up"), label("service.name", "checkout")],
-                samples: vec![sample(1.0, 1)],
-                histograms: vec![],
-            }],
-            metadata: vec![],
-        };
-        let req_underscore = WriteRequest {
-            timeseries: vec![TimeSeries {
-                labels: vec![label("__name__", "up"), label("service_name", "checkout")],
-                samples: vec![sample(1.0, 1)],
-                histograms: vec![],
-            }],
-            metadata: vec![],
-        };
-        let out_dot = parse(&req_dot, 0).expect("within the expansion budget");
-        let out_underscore = parse(&req_underscore, 0).expect("within the expansion budget");
+    fn label_names_are_stored_as_sent() {
+        for name in [
+            "service.name",
+            "http-method",
+            "k8s:pod",
+            "path/segment",
+            "with space",
+            "café",
+        ] {
+            let replaced: String = name
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '_' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            let sent = parse(&request_of(&[(&[("__name__", "up"), (name, "v")], 1)]), 0)
+                .expect("within the expansion budget");
+            assert_eq!(
+                sent.series[0].labels.iter().collect::<Vec<_>>(),
+                vec![(name, "v")],
+                "{name}"
+            );
+            let other = parse(
+                &request_of(&[(&[("__name__", "up"), (replaced.as_str(), "v")], 1)]),
+                0,
+            )
+            .expect("within the expansion budget");
+            assert_ne!(
+                sent.series[0].fingerprint, other.series[0].fingerprint,
+                "{name} and {replaced} are two series"
+            );
+        }
+    }
+
+    /// **T2 (issue #495): a dotted and an underscored name are two labels.**
+    #[test]
+    fn a_dotted_and_an_underscored_name_are_two_labels() {
+        let out = parse(
+            &request_of(&[(&[("__name__", "up"), ("a.b", "1"), ("a_b", "2")], 1)]),
+            0,
+        )
+        .expect("within the expansion budget");
         assert_eq!(
-            out_dot.samples[0].fingerprint,
-            out_underscore.samples[0].fingerprint
+            out.series[0].labels.iter().collect::<Vec<_>>(),
+            vec![("a.b", "1"), ("a_b", "2")]
         );
+        assert_eq!(out.collisions, 0);
+        assert_eq!(out.rejected, 0);
+    }
+
+    /// **T3 (issue #495): a repeated label name drops its series**, values
+    /// not compared and `__name__` included; the request's other series is
+    /// written.
+    #[test]
+    fn a_repeated_label_name_drops_the_series() {
+        let cases: [(&[(&str, &str)], &str); 4] = [
+            (&[("__name__", "up"), ("job", "x"), ("job", "y")], "job"),
+            (&[("__name__", "up"), ("job", "x"), ("job", "x")], "job"),
+            (
+                &[("__name__", "up"), ("__name__", "down"), ("job", "a")],
+                "__name__",
+            ),
+            (
+                &[("__name__", "up"), ("__name__", "up"), ("job", "a")],
+                "__name__",
+            ),
+        ];
+        for (labels, repeated) in cases {
+            let out = parse(
+                &request_of(&[(labels, 2), (&[("__name__", "up"), ("job", "z")], 1)]),
+                0,
+            )
+            .expect("within the expansion budget");
+            assert_eq!(out.series.len(), 1, "{labels:?}");
+            assert_eq!(
+                out.series[0].labels.iter().collect::<Vec<_>>(),
+                vec![("job", "z")],
+                "{labels:?}"
+            );
+            assert_eq!(out.samples.len(), 1, "{labels:?}");
+            assert_eq!(out.rejected, 2, "{labels:?}");
+            let message = out.rejected_message.unwrap_or_default();
+            assert!(
+                message.contains(&format!("duplicate label name \"{repeated}\"")),
+                "{labels:?}: {message}"
+            );
+        }
+    }
+
+    /// **T4 (issue #495): an empty label name drops the series.**
+    #[test]
+    fn an_empty_label_name_drops_the_series() {
+        let out = parse(&request_of(&[(&[("__name__", "up"), ("", "x")], 1)]), 0)
+            .expect("within the expansion budget");
+        assert!(out.series.is_empty());
+        assert!(out.samples.is_empty());
+        assert_eq!(out.rejected, 1);
     }
 
     #[test]
