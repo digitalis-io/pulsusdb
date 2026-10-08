@@ -252,7 +252,8 @@ pub struct TsdbStatus {
 
 /// A metrics query's time span. Instant = `start_ms == end_ms`,
 /// `step_ms == 0` (mirrors `pulsus_promql::PlanParams`'s own contract,
-/// which this is turned into 1:1 plus the fixed M2 staleness lookback).
+/// which this is turned into 1:1 plus the request's staleness lookback,
+/// 5m unless the request sets `lookback_delta` — issue #499).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MetricQueryParams {
     pub start_ms: i64,
@@ -268,12 +269,12 @@ impl MetricQueryParams {
     /// server's production-path composition test can exercise the exact
     /// `ReaderConfig -> MetricsConfig -> PlanParams -> plan()` chain
     /// hermetically).
-    pub fn plan_params(&self, experimental_functions: bool) -> PlanParams {
+    pub fn plan_params(&self, experimental_functions: bool, lookback_ms: i64) -> PlanParams {
         PlanParams {
             start_ms: self.start_ms,
             end_ms: self.end_ms,
             step_ms: self.step_ms,
-            lookback_ms: DEFAULT_LOOKBACK_MS,
+            lookback_ms,
             experimental_functions,
         }
     }
@@ -530,6 +531,9 @@ pub struct MetricsEngine {
     /// production, lowered by [`MetricsEngine::with_pushed_series_steps_cap`]
     /// so a suite can split a node by time at a corpus it can afford.
     pushed_series_steps_cap: usize,
+    /// The staleness lookback, milliseconds (issue #499): the request's
+    /// `lookback_delta`, or [`DEFAULT_LOOKBACK_MS`].
+    lookback_ms: i64,
 }
 
 impl MetricsEngine {
@@ -549,7 +553,15 @@ impl MetricsEngine {
             statement_probe: None,
             grouped_chunk_size: sample_sql::CHUNK_THRESHOLD,
             pushed_series_steps_cap: super::grouped::PUSHED_SERIES_STEPS_PER_STATEMENT,
+            lookback_ms: DEFAULT_LOOKBACK_MS,
         }
+    }
+
+    /// Issue #499: the request's `lookback_delta`, in milliseconds, as the
+    /// staleness lookback every plan of this engine uses.
+    pub fn with_lookback_ms(mut self, lookback_ms: i64) -> Self {
+        self.lookback_ms = lookback_ms;
+        self
     }
 
     /// Issue #101: installs the shared process-wide eval-concurrency gate
@@ -631,7 +643,7 @@ impl MetricsEngine {
         p: &MetricQueryParams,
         mut explain: Option<&mut PlanExplain>,
     ) -> Result<(QueryResult, pulsus_promql::Annotations), ReadError> {
-        let plan_params = p.plan_params(self.config.experimental_functions);
+        let plan_params = p.plan_params(self.config.experimental_functions, self.lookback_ms);
         let plan = pulsus_promql::plan(expr, plan_params)?;
 
         // Issue #33 architect adjudication (superseding #31's ratified
@@ -2648,13 +2660,18 @@ impl MetricsEngine {
     }
 
     /// `GET /api/v1/status/tsdb` (issue #32; code-review round-1 fix):
-    /// `numSeries`/`seriesCountByMetricName` from the resident label-cache
+    /// `numSeries`, and the request's `limit` largest of
+    /// `seriesCountByMetricName` (issue #499), from the resident label-cache
     /// snapshot — **zero ClickHouse**, task-manager resolution #2,
     /// freshness = cache age. `async` only for call-site parity with
     /// every other `MetricsEngine` method; this never actually awaits
     /// anything.
-    pub async fn tsdb_status(&self, tenant: &Tenant) -> Result<TsdbStatus, ReadError> {
-        let cache_snapshot = self.resolver.tsdb_snapshot(tenant);
+    pub async fn tsdb_status(
+        &self,
+        tenant: &Tenant,
+        limit: usize,
+    ) -> Result<TsdbStatus, ReadError> {
+        let cache_snapshot = self.resolver.tsdb_snapshot(tenant, limit);
         Ok(TsdbStatus {
             num_series: cache_snapshot.num_series,
             series_count_by_metric_name: cache_snapshot.series_count_by_metric_name,
@@ -3971,7 +3988,7 @@ mod tests {
                 end_ms: 0,
                 step_ms: 0,
             }
-            .plan_params(false);
+            .plan_params(false, DEFAULT_LOOKBACK_MS);
             pulsus_promql::plan(&expr, params)
                 .expect("plan")
                 .selectors

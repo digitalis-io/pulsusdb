@@ -870,7 +870,11 @@ fn series_matches(s: &FixtureSeries, spec: &SelectorSpec) -> bool {
 /// window, no SQL, no ClickHouse.
 fn in_memory_answer(query: &str, fx: &[FixtureSeries], p: &MetricQueryParams) -> Answer {
     let expr = parse(query).expect("parse");
-    let plan = pulsus_promql::plan(&expr, p.plan_params(false)).expect("plan");
+    let plan = pulsus_promql::plan(
+        &expr,
+        p.plan_params(false, pulsus_promql::DEFAULT_LOOKBACK_MS),
+    )
+    .expect("plan");
     let mut data = SeriesData::new();
     for spec in &plan.selectors {
         let mut chosen: Vec<&FixtureSeries> =

@@ -99,17 +99,24 @@ async fn read_form_pairs(
     Ok(pairs)
 }
 
-/// Parses `start`/`end` for the discovery endpoints (defaults: `end =
-/// now`, `start = end - 1h` — see `params::default_start_ms`).
+/// The reference's `MinTime`/`MaxTime` (api.go:951-967) in milliseconds:
+/// a discovery request's or an exemplar request's absent `start` and `end`
+/// (issue #499).
+pub(crate) const DISCOVERY_MIN_MS: i64 = -9_223_309_901_257_974_000;
+pub(crate) const DISCOVERY_MAX_MS: i64 = 9_223_309_901_257_974_999;
+
+/// Parses `start`/`end` for the discovery endpoints. An absent or empty
+/// bound is the reference's own, [`DISCOVERY_MIN_MS`] or
+/// [`DISCOVERY_MAX_MS`]: all time, bounded in practice by retention
+/// (issue #499).
 fn parse_bounds(pairs: &[(String, String)]) -> Result<(i64, i64), ParamError> {
-    let now = params::now_ms();
-    let end_ms = match params::get(pairs, "end") {
+    let end_ms = match params::nonempty(pairs, "end") {
         Some(v) => params::parse_time(v)?,
-        None => now,
+        None => DISCOVERY_MAX_MS,
     };
-    let start_ms = match params::get(pairs, "start") {
+    let start_ms = match params::nonempty(pairs, "start") {
         Some(v) => params::parse_time(v)?,
-        None => params::default_start_ms(end_ms),
+        None => DISCOVERY_MIN_MS,
     };
     Ok((start_ms, end_ms))
 }
@@ -189,17 +196,18 @@ async fn query_impl(
 ) -> Result<Response, ApiError> {
     let query = params::get(&pairs, "query").ok_or(ParamError::MissingQuery)?;
     let expr = pulsus_promql::parse(query)?;
-    let at_ms = match params::get(&pairs, "time") {
+    let at_ms = match params::nonempty(&pairs, "time") {
         Some(v) => params::parse_time(v)?,
         None => params::now_ms(),
     };
     // Issue #471 M2: the `timeout` request parameter, read on `/query`
     // and `/query_range` only. Parsed here, before any engine work, so an
     // unparseable value is a `400 bad_data` rather than a slow query.
-    let requested = match params::get(&pairs, "timeout") {
+    let requested = match params::nonempty(&pairs, "timeout") {
         Some(v) => Some(params::parse_timeout(v)?),
         None => None,
     };
+    let (lookback_ms, opts) = query_options(&pairs, headers)?;
     let query_params = MetricQueryParams {
         start_ms: at_ms,
         end_ms: at_ms,
@@ -207,17 +215,8 @@ async fn query_impl(
     };
     let server_deadline = state.config.query_timeout.0;
     let work = async {
-        let engine = engine_for(&state).await?;
-        run_query(
-            &engine,
-            tenant,
-            &expr,
-            query,
-            &query_params,
-            wants_explain(headers),
-            at_ms,
-        )
-        .await
+        let engine = engine_with_lookback(&state, lookback_ms).await?;
+        run_query(&engine, tenant, &expr, query, &query_params, opts, at_ms).await
     };
     // `run_under_request_deadline` owns the strictly-shorter rule; the
     // handler cannot read a `Duration` out of a `RequestedTimeout`, so it
@@ -286,10 +285,11 @@ async fn query_range_impl(
     // Checked before any engine/ClickHouse call (architect plan AC).
     params::check_range(start_ms, end_ms, step_ms)?;
     // Issue #471 M2 — see `query_impl` for why this is parsed here.
-    let requested = match params::get(&pairs, "timeout") {
+    let requested = match params::nonempty(&pairs, "timeout") {
         Some(v) => Some(params::parse_timeout(v)?),
         None => None,
     };
+    let (lookback_ms, opts) = query_options(&pairs, headers)?;
     let query_params = MetricQueryParams {
         start_ms,
         end_ms,
@@ -297,17 +297,8 @@ async fn query_range_impl(
     };
     let server_deadline = state.config.query_timeout.0;
     let work = async {
-        let engine = engine_for(&state).await?;
-        run_query(
-            &engine,
-            tenant,
-            &expr,
-            query,
-            &query_params,
-            wants_explain(headers),
-            end_ms,
-        )
-        .await
+        let engine = engine_with_lookback(&state, lookback_ms).await?;
+        run_query(&engine, tenant, &expr, query, &query_params, opts, end_ms).await
     };
     match params::run_under_request_deadline(requested, server_deadline, work).await {
         Ok(res) => res,
@@ -315,6 +306,46 @@ async fn query_range_impl(
             expired,
         ))),
     }
+}
+
+/// How a `query`/`query_range` answer is asked for beyond its expression
+/// and range (issue #499).
+#[derive(Debug, Clone, Copy)]
+struct ResponseOptions {
+    explain: bool,
+    limit: Option<usize>,
+    stats_requested: bool,
+}
+
+/// The parameters `query` and `query_range` share beyond their range
+/// (issue #499): `lookback_delta`, `limit` and `stats`, all parsed before
+/// any engine work, so an invalid value is a `400 bad_data`.
+fn query_options(
+    pairs: &[(String, String)],
+    headers: &HeaderMap,
+) -> Result<(Option<i64>, ResponseOptions), ParamError> {
+    let lookback_ms = params::parse_lookback_delta(params::nonempty(pairs, "lookback_delta"))?;
+    let limit = params::parse_truncation_limit(params::get(pairs, "limit"))?;
+    Ok((
+        lookback_ms,
+        ResponseOptions {
+            explain: wants_explain(headers),
+            limit,
+            stats_requested: params::nonempty(pairs, "stats").is_some(),
+        },
+    ))
+}
+
+/// [`engine_for`], with the request's `lookback_delta` when it set one.
+async fn engine_with_lookback(
+    state: &AppState,
+    lookback_ms: Option<i64>,
+) -> Result<MetricsEngine, ApiError> {
+    let engine = engine_for(state).await?;
+    Ok(match lookback_ms {
+        Some(ms) => engine.with_lookback_ms(ms),
+        None => engine,
+    })
 }
 
 /// Shared success path for `query`/`query_range`: run with or without the
@@ -328,7 +359,7 @@ async fn run_query(
     expr: &Expr,
     query: &str,
     query_params: &MetricQueryParams,
-    explain: bool,
+    opts: ResponseOptions,
     at_ms: i64,
 ) -> Result<Response, ApiError> {
     // Issue #68 (M6-05): a sort-rooted INSTANT query's wire order is the
@@ -337,16 +368,21 @@ async fn run_query(
     // (upstream's own "sort is ineffective for range queries") — keeps
     // the encoder's deterministic label sort.
     let ordered = query_params.step_ms == 0 && pulsus_promql::expr_is_sort_root(expr);
-    if explain {
+    let shape = encode::ResponseShape {
+        ordered,
+        limit: opts.limit,
+        stats_requested: opts.stats_requested,
+    };
+    if opts.explain {
         let (result, annotations, plan_explain) =
             engine.query_explained(tenant, expr, query_params).await?;
         Ok(encode::query_response_annotated(
             result,
             Some(plan_explain),
             at_ms,
-            ordered,
             query,
-            &annotations,
+            annotations,
+            shape,
         ))
     } else {
         let (result, annotations) = engine.query(tenant, expr, query_params).await?;
@@ -354,9 +390,9 @@ async fn run_query(
             result,
             None,
             at_ms,
-            ordered,
             query,
-            &annotations,
+            annotations,
+            shape,
         ))
     }
 }
@@ -409,7 +445,7 @@ async fn labels_impl(
     let window = DataWindow { start_ms, end_ms };
     // Issue #471 M4: parsed before the engine call so an invalid value is
     // a `400 bad_data` rather than a served-then-discarded answer.
-    let limit = params::parse_discovery_limit(params::get(&pairs, "limit"))?;
+    let limit = params::parse_truncation_limit(params::get(&pairs, "limit"))?;
     let matches = params::get_all(&pairs, "match[]");
     let filters = parse_match_selectors(&matches)?;
     let engine = engine_for(&state).await?;
@@ -479,7 +515,7 @@ async fn label_values_impl(
 ) -> Result<Response, ApiError> {
     let (start_ms, end_ms) = parse_bounds(&pairs)?;
     let window = DataWindow { start_ms, end_ms };
-    let limit = params::parse_discovery_limit(params::get(&pairs, "limit"))?;
+    let limit = params::parse_truncation_limit(params::get(&pairs, "limit"))?;
     let matches = params::get_all(&pairs, "match[]");
     let filters = parse_match_selectors(&matches)?;
     let engine = engine_for(&state).await?;
@@ -541,7 +577,7 @@ async fn series_impl(
     }
     let (start_ms, end_ms) = parse_bounds(&pairs)?;
     let window = DataWindow { start_ms, end_ms };
-    let limit = params::parse_discovery_limit(params::get(&pairs, "limit"))?;
+    let limit = params::parse_truncation_limit(params::get(&pairs, "limit"))?;
     let filters = parse_match_selectors(&matches)?;
     let engine = engine_for(&state).await?;
     let data = engine.series(tenant, &filters, window).await?;
@@ -597,19 +633,53 @@ async fn metadata_impl(
 // ---------------------------------------------------------------------
 
 /// Reads no data, and still refuses an invalid `X-Scope-OrgID` (issue
-/// #635 part 4), as every metrics route does.
-pub(crate) async fn query_exemplars(headers: HeaderMap) -> Response {
-    match tenant_of(&headers) {
-        Ok(_) => encode::query_exemplars_response(),
+/// #635 part 4), as every metrics route does. Its parameters are
+/// validated as the reference validates them (issue #499); the answer is
+/// empty because exemplars are not stored.
+pub(crate) async fn query_exemplars(headers: HeaderMap, RawQuery(raw): RawQuery) -> Response {
+    if let Err(e) = tenant_of(&headers) {
+        return e.into_response();
+    }
+    match exemplars_impl(&params::parse_pairs(raw.as_deref().unwrap_or(""))) {
+        Ok(res) => res,
         Err(e) => e.into_response(),
     }
 }
 
-pub(crate) async fn query_exemplars_post(headers: HeaderMap) -> Response {
-    match tenant_of(&headers) {
-        Ok(_) => encode::query_exemplars_response(),
+pub(crate) async fn query_exemplars_post(
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+    body: Bytes,
+) -> Response {
+    if let Err(e) = tenant_of(&headers) {
+        return e.into_response();
+    }
+    match read_form_pairs(&headers, raw.as_deref(), body).await {
+        Ok(pairs) => match exemplars_impl(&pairs) {
+            Ok(res) => res,
+            Err(e) => e.into_response(),
+        },
         Err(e) => e.into_response(),
     }
+}
+
+/// `/query_exemplars`' validation (issue #499): `start` and `end`, absent
+/// or empty meaning all time, `end` not before `start`, then the query.
+/// No engine call.
+fn exemplars_impl(pairs: &[(String, String)]) -> Result<Response, ApiError> {
+    let start_ms = match params::nonempty(pairs, "start") {
+        Some(v) => params::parse_time(v)?,
+        None => DISCOVERY_MIN_MS,
+    };
+    let end_ms = match params::nonempty(pairs, "end") {
+        Some(v) => params::parse_time(v)?,
+        None => DISCOVERY_MAX_MS,
+    };
+    if end_ms < start_ms {
+        return Err(ApiError::Param(ParamError::ExemplarsEndBeforeStart));
+    }
+    pulsus_promql::parse(params::get(pairs, "query").unwrap_or(""))?;
+    Ok(encode::query_exemplars_response())
 }
 
 // ---------------------------------------------------------------------
@@ -643,20 +713,30 @@ pub(crate) async fn status_runtimeinfo(State(state): State<AppState>) -> Respons
     encode::status_runtimeinfo_response(start_time, state.config.retention_days)
 }
 
-pub(crate) async fn status_tsdb(State(state): State<AppState>, headers: HeaderMap) -> Response {
+pub(crate) async fn status_tsdb(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
     let tenant = match tenant_of(&headers) {
         Ok(t) => t,
         Err(e) => return e.into_response(),
     };
-    match status_tsdb_impl(state, &tenant).await {
+    let pairs = params::parse_pairs(raw.as_deref().unwrap_or(""));
+    match status_tsdb_impl(state, &tenant, &pairs).await {
         Ok(res) => res,
         Err(e) => e.into_response(),
     }
 }
 
-async fn status_tsdb_impl(state: AppState, tenant: &Tenant) -> Result<Response, ApiError> {
+async fn status_tsdb_impl(
+    state: AppState,
+    tenant: &Tenant,
+    pairs: &[(String, String)],
+) -> Result<Response, ApiError> {
+    let limit = params::parse_tsdb_limit(params::get(pairs, "limit"))?;
     let engine = engine_for(&state).await?;
-    let status = engine.tsdb_status(tenant).await?;
+    let status = engine.tsdb_status(tenant, limit).await?;
     Ok(encode::status_tsdb_response(status))
 }
 
@@ -871,7 +951,6 @@ mod tests {
         let expected: BTreeMap<(&str, &str), StatusCode> = [
             ("/api/v1/metadata", StatusCode::SERVICE_UNAVAILABLE),
             ("/api/v1/status/tsdb", StatusCode::SERVICE_UNAVAILABLE),
-            ("/api/v1/query_exemplars", StatusCode::OK),
             ("/api/v1/status/buildinfo", StatusCode::OK),
             ("/api/v1/status/config", StatusCode::OK),
             ("/api/v1/status/flags", StatusCode::OK),
@@ -879,6 +958,16 @@ mod tests {
         ]
         .into_iter()
         .flat_map(|(path, status)| [(path, "GET"), (path, "POST")].map(|k| (k, status)))
+        .collect();
+
+        // Issue #499: `query_exemplars` parses its `query` and needs no
+        // engine, so an over-deep expression is a 400 and a well-formed
+        // one a 200.
+        let exemplars: BTreeSet<(&str, &str)> = [
+            ("/api/v1/query_exemplars", "GET"),
+            ("/api/v1/query_exemplars", "POST"),
+        ]
+        .into_iter()
         .collect();
 
         let over_deep = every_param(&bin_chain(MAX_EXPR_DEPTH + 1));
@@ -908,6 +997,14 @@ mod tests {
                     "{path} {method} control leg"
                 );
                 assert_eq!(json["errorType"], "unavailable", "{path} {method}");
+            } else if exemplars.contains(&key) {
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{path} {method}");
+                assert_eq!(
+                    json["error"], "query expression nesting depth 251 exceeds the 250 level limit",
+                    "{path} {method}"
+                );
+                let (status, _, _) = drive(path, method, &well_formed).await;
+                assert_eq!(status, StatusCode::OK, "{path} {method} control leg");
             } else {
                 let want = expected
                     .get(&key)
@@ -921,7 +1018,9 @@ mod tests {
         let pinned: BTreeMap<(String, &'static str), u16> = pairs
             .iter()
             .map(|(path, method)| {
-                let code = if reading.contains(&(path.as_str(), *method)) {
+                let code = if reading.contains(&(path.as_str(), *method))
+                    || exemplars.contains(&(path.as_str(), *method))
+                {
                     400
                 } else {
                     expected[&(path.as_str(), *method)].as_u16()
@@ -1185,15 +1284,18 @@ mod tests {
             assert_eq!(content_type, "application/json", "{id}");
         }
 
-        // Q10 — the routes that never reach the guard, driven with the
-        // same over-deep `query`. `query_exemplars` takes no arguments
-        // at all; `metadata` calls `engine_for` itself, so its plan-set
-        // `200` is a LIVE answer and 503 is the hermetic one.
+        // Q10 — driven with the same over-deep `query`. Since issue #499
+        // `query_exemplars` parses its `query`, so the depth guard refuses
+        // it; `metadata` calls `engine_for` itself, so its plan-set `200`
+        // is a LIVE answer and 503 is the hermetic one.
         let over_deep = every_param(&bin_chain(251));
         let (status, content_type, json) =
             drive("/api/v1/query_exemplars", "POST", &over_deep).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(json, serde_json::json!({"status": "success", "data": []}));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json["error"],
+            "query expression nesting depth 251 exceeds the 250 level limit"
+        );
         assert_eq!(content_type, "application/json");
         let (status, _, json) = drive("/api/v1/metadata", "GET", &over_deep).await;
         assert_eq!(status, UNAVAILABLE);
@@ -1530,7 +1632,7 @@ mod tests {
     async fn query_exemplars_is_an_empty_success_with_no_engine_call() {
         // No pool established at all — a stub that reached the engine would
         // 503 instead.
-        let res = query_exemplars(HeaderMap::new()).await;
+        let res = query_exemplars(HeaderMap::new(), RawQuery(Some("query=up".to_string()))).await;
         let (status, json) = status_and_body(res).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["status"], "success");
@@ -1539,7 +1641,12 @@ mod tests {
 
     #[tokio::test]
     async fn query_exemplars_post_is_an_empty_success() {
-        let res = query_exemplars_post(HeaderMap::new()).await;
+        let res = query_exemplars_post(
+            form_headers(),
+            RawQuery(None),
+            Bytes::from_static(b"query=up"),
+        )
+        .await;
         let (status, json) = status_and_body(res).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["data"], serde_json::json!([]));
@@ -1599,7 +1706,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_tsdb_without_a_pool_is_503_unavailable() {
-        let res = status_tsdb(State(test_state()), HeaderMap::new()).await;
+        let res = status_tsdb(State(test_state()), HeaderMap::new(), RawQuery(None)).await;
         let (status, json) = status_and_body(res).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(json["errorType"], "unavailable");
@@ -1858,5 +1965,141 @@ mod tests {
             let (status, _) = status_and_body(res).await;
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{name}");
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #499 — every query API parameter honoured, rejected or warned
+    // -----------------------------------------------------------------
+
+    fn pairs_of(raw: &str) -> Vec<(String, String)> {
+        params::parse_pairs(raw)
+    }
+
+    /// P6: a discovery request with no range, or an empty one, reads all
+    /// time.
+    #[test]
+    fn a_discovery_with_no_range_reads_all_time() {
+        let all_time = (DISCOVERY_MIN_MS, DISCOVERY_MAX_MS);
+        assert_eq!(
+            all_time,
+            (-9_223_309_901_257_974_000, 9_223_309_901_257_974_999)
+        );
+        assert_eq!(parse_bounds(&[]).unwrap(), all_time);
+        assert_eq!(parse_bounds(&pairs_of("start=&end=")).unwrap(), all_time);
+        assert_eq!(
+            parse_bounds(&pairs_of("start=10")).unwrap(),
+            (10_000, DISCOVERY_MAX_MS)
+        );
+    }
+
+    /// One `(status, error)` through the real router, GET.
+    async fn get_status(path: &str, params: &str) -> (StatusCode, JsonValue) {
+        let (status, _, json) = drive(path, "GET", params).await;
+        (status, json)
+    }
+
+    const LOOKBACK_ABC: &str =
+        "error parsing lookback delta duration: cannot parse \"abc\" to a valid duration";
+    const LOOKBACK_1E300: &str = "error parsing lookback delta duration: cannot parse \"1e300\" \
+                                  to a valid duration. It overflows int64";
+
+    /// H1: an invalid `lookback_delta` is a 400 on both query routes,
+    /// before any engine.
+    #[tokio::test]
+    async fn an_invalid_lookback_delta_is_400_on_both_query_routes() {
+        for (path, base) in [
+            ("/api/v1/query", "query=up"),
+            ("/api/v1/query_range", "query=up&start=0&end=100&step=1"),
+        ] {
+            for (raw, want) in [("abc", LOOKBACK_ABC), ("1e300", LOOKBACK_1E300)] {
+                let (status, json) =
+                    get_status(path, &format!("{base}&lookback_delta={raw}")).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{path} {raw}: {json}");
+                assert_eq!(json["errorType"], "bad_data", "{path} {raw}");
+                assert_eq!(json["error"], want, "{path} {raw}");
+            }
+        }
+    }
+
+    /// H3: `limit` on the query routes is read by the discovery parser.
+    #[tokio::test]
+    async fn the_query_routes_read_limit() {
+        for (path, base) in [
+            ("/api/v1/query", "query=up"),
+            ("/api/v1/query_range", "query=up&start=0&end=100&step=1"),
+        ] {
+            let (status, json) = get_status(path, &format!("{base}&limit=-1")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {json}");
+            assert_eq!(
+                json["error"], "invalid parameter \"limit\": limit must be non-negative",
+                "{path}"
+            );
+            let (status, json) = get_status(path, &format!("{base}&limit=abc")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {json}");
+            assert_eq!(
+                json["error"], "invalid parameter \"limit\": cannot parse \"abc\" to an integer",
+                "{path}"
+            );
+            let (status, json) = get_status(path, &format!("{base}&limit=2")).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}: {json}");
+        }
+    }
+
+    /// H4: an empty `time`, `timeout`, `start` or `end` means absent.
+    #[tokio::test]
+    async fn an_empty_value_means_absent() {
+        for (path, params) in [
+            ("/api/v1/query", "query=up&time="),
+            ("/api/v1/query", "query=up&timeout="),
+            ("/api/v1/labels", "start=&end="),
+            ("/api/v1/series", "match%5B%5D=up&start="),
+        ] {
+            let (status, json) = get_status(path, params).await;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{path}?{params}: {json}"
+            );
+        }
+    }
+
+    /// H6: `/status/tsdb`'s `limit`.
+    #[tokio::test]
+    async fn the_tsdb_limit_is_checked() {
+        for (raw, want) in [
+            ("0", "limit must be a positive number"),
+            ("10001", "limit must not exceed 10000"),
+        ] {
+            let (status, json) = get_status("/api/v1/status/tsdb", &format!("limit={raw}")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{raw}: {json}");
+            assert_eq!(json["error"], want, "{raw}");
+        }
+        let (status, json) = get_status("/api/v1/status/tsdb", "limit=5").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{json}");
+    }
+
+    /// H7: `/query_exemplars` validates as the reference does, and answers
+    /// empty.
+    #[tokio::test]
+    async fn query_exemplars_validates_its_parameters() {
+        let path = "/api/v1/query_exemplars";
+        let (status, json) = get_status(path, "").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(json["error"], "no expression found in input");
+        for params in ["query=up%7B", "query=up&start=abc"] {
+            let (status, json) = get_status(path, params).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{params}: {json}");
+        }
+        let (status, json) = get_status(path, "query=up&start=10&end=5").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(
+            json["error"],
+            "end timestamp must not be before start timestamp"
+        );
+        let (status, json) = get_status(path, "query=up").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json, serde_json::json!({"status": "success", "data": []}));
+        let (status, _, json) = drive(path, "POST", "query=up%7B").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
     }
 }

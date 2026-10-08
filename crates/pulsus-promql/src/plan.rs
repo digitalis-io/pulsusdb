@@ -42,10 +42,9 @@ pub struct PlanParams {
     pub start_ms: i64,
     pub end_ms: i64,
     pub step_ms: i64,
-    /// The PromQL staleness lookback, milliseconds — a fixed `300_000`
-    /// (5m) default for M2 (task-manager resolution #4 on issue #31);
-    /// promote to a per-request/config knob only when a deployment needs
-    /// it.
+    /// The PromQL staleness lookback, milliseconds: the request's
+    /// `lookback_delta`, defaulting to 5m (`DEFAULT_LOOKBACK_MS`; issue
+    /// #499).
     pub lookback_ms: i64,
     /// Mirrors upstream Prometheus's
     /// `--enable-feature=promql-experimental-functions` (issue #65 —
