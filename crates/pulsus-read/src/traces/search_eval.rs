@@ -3192,6 +3192,20 @@ fn run_pipeline<'a>(
     Ok(sets)
 }
 
+/// Charged before a trace's `by()` group vector is reserved at `n`
+/// groups (issue #592 part 2).
+pub(crate) fn groups_reserve_bytes(n: usize) -> usize {
+    let _ = n;
+    0
+}
+
+/// Charged before one group's span buffer is reserved at `take` slots
+/// (issue #592 part 2).
+pub(crate) fn group_reserve_bytes(take: usize) -> usize {
+    let _ = take;
+    0
+}
+
 /// Materialises the fold's surviving spansets into the response's
 /// `groups` layer (issue #193's builder, reduced by #492 item 2 to the
 /// final step it always was): `spss` is applied PER spanset on its full

@@ -60,13 +60,15 @@ use pulsus_traceql::{
 
 use super::predicate::{PredicateCtx, SpanPredicate, compile_span_predicate_in};
 use super::projection::{Projection, ceiling_sql};
-use super::rows::SearchTraceRow;
+use super::rows::{SearchGroupedRow, SearchTraceRow};
 use crate::logql::error::ReadError;
 use crate::traces::PlanError;
 use crate::traces::exec::{
     ByteBudget, RootSummary, SearchOutput, TraceSearchResult, output_reserve_bytes,
 };
-use crate::traces::search_eval::{SpanSummary, match_reserve_bytes, summary_reserve_bytes};
+use crate::traces::search_eval::{
+    GroupCardinalityCounter, SpanSummary, match_reserve_bytes, summary_reserve_bytes,
+};
 use crate::traces::search_plan::SearchPlan;
 use crate::traces::window_sql::WindowSql;
 use pulsus_clickhouse::ChError;
@@ -444,6 +446,15 @@ pub struct SearchStatement {
     demands: Vec<String>,
 }
 
+/// A statement's one `by()` (issue #592 part 2): the group key's display,
+/// `by(<field>)`, and whether a `coalesce()` after it merges the groups
+/// back, so the response carries none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Grouping {
+    pub display: String,
+    pub coalesced: bool,
+}
+
 impl SearchStatement {
     pub fn sql(&self) -> &str {
         &self.sql
@@ -458,6 +469,12 @@ impl SearchStatement {
     /// into a `400` only when the message is one of these.
     pub fn demands(&self) -> &[String] {
         &self.demands
+    }
+
+    /// The statement's `by()`, when it has one; its rows are then
+    /// [`SearchGroupedRow`]s.
+    pub fn grouping(&self) -> Option<&Grouping> {
+        None
     }
 }
 
@@ -658,6 +675,21 @@ pub(crate) fn decode_search_charged(
     })
 }
 
+/// [`decode_search_charged`] for a grouped statement (issue #592 part 2).
+pub(crate) fn decode_search_grouped_charged(
+    rows: Vec<SearchGroupedRow>,
+    proj: &Projection,
+    grouping: &Grouping,
+    limit: u32,
+    budget: &mut ByteBudget,
+    counter: &mut GroupCardinalityCounter,
+) -> Result<SearchOutput, ReadError> {
+    let _ = (rows, proj, grouping, limit, budget, counter);
+    Err(ReadError::Clickhouse(ChError::Decode(
+        "not built".to_string(),
+    )))
+}
+
 /// A row the decode could not read: a projected value that does not parse
 /// as its kind, or a count out of range. Never a default.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -683,7 +715,7 @@ mod charge_tests {
     use super::*;
     use crate::traces::exec::{ByteBudget, RETAINED_ENTRY_OVERHEAD, output_reserve_bytes};
     use crate::traces::search_eval::TraceMatch;
-    use crate::traces::spans::rows::{SearchProjected, SearchSpanTuple};
+    use crate::traces::spans::rows::{SearchGroupTuple, SearchProjected, SearchSpanTuple};
 
     /// Section 6.1's four groups: a string, an int, `name` and an array.
     fn statement() -> SearchStatement {
@@ -811,6 +843,101 @@ mod charge_tests {
         );
         let refused =
             decode_search_charged(rows(), s.projection(), 20, &mut ByteBudget::new(used - 1));
+        assert!(
+            matches!(
+                refused,
+                Err(crate::logql::error::ReadError::QueryTooBroad(_))
+            ),
+            "one byte less is refused: {refused:?}"
+        );
+    }
+
+    // ---------------------------------------------- issue #592 part 2
+
+    /// A grouped trace: the flat spans of the union, and three groups — a
+    /// string with two spans, an integer the filter after `by()` emptied,
+    /// and the `nil` group with one span.
+    fn grouped_rows() -> Vec<SearchGroupedRow> {
+        let bar = || vec![projected(1, "bar", "String")];
+        vec![SearchGroupedRow {
+            trace_id: [3; 16],
+            root_service: "frontend".to_string(),
+            root_name: "GET /".to_string(),
+            start_ns: 1,
+            duration_ns: 2,
+            last: 1,
+            matched: 3,
+            spans: vec![span(1, bar()), span(2, bar()), span(3, bar())],
+            groups: vec![
+                SearchGroupTuple {
+                    value: "x".to_string(),
+                    value_type: "String".to_string(),
+                    matched: 2,
+                    spans: vec![span(1, bar()), span(2, bar())],
+                },
+                SearchGroupTuple {
+                    value: "5".to_string(),
+                    value_type: "Int64".to_string(),
+                    matched: 0,
+                    spans: Vec::new(),
+                },
+                SearchGroupTuple {
+                    value: String::new(),
+                    value_type: "None".to_string(),
+                    matched: 1,
+                    spans: vec![span(3, bar())],
+                },
+            ],
+        }]
+    }
+
+    /// Issue #592 part 2, section 7.1: the grouped decode charges what
+    /// today's engine charges for the same response, its groups included
+    /// (`TraceMatch::retained_bytes` with `groups_retained_bytes`); it
+    /// fits a budget of that plus the distinct group tuples the cap's
+    /// counter holds while it runs, and one byte less is refused.
+    #[test]
+    fn the_grouped_decode_charges_what_todays_engine_charges() {
+        use crate::traces::search_eval::{GroupValue, group_tuple_bytes, groups_retained_bytes};
+        let q = pulsus_traceql::parse(r#"{ span.foo = "bar" } | by(span.k)"#).expect("parses");
+        let w = WindowSql::start_closed_end_open(1_000_000_000_000, 2_000_000_000_000);
+        let ctx = PredicateCtx {
+            window: w,
+            resources_table: "resources",
+        };
+        let s = compile_search(&q, &ctx, "spans", "traces", 20, 3).expect("compiles");
+        let grouping = s.grouping().expect("grouped");
+        let decode = |budget: &mut ByteBudget| {
+            let mut counter = GroupCardinalityCounter::new(1_000);
+            decode_search_grouped_charged(
+                grouped_rows(),
+                s.projection(),
+                grouping,
+                20,
+                budget,
+                &mut counter,
+            )
+        };
+        let mut unbounded = ByteBudget::new(usize::MAX);
+        let out = decode(&mut unbounded).expect("decodes unbounded");
+        let used = unbounded.used();
+        let groups = out.traces[0].groups.as_deref().expect("the trace's groups");
+        assert_eq!(groups.len(), 2, "the emptied group is not in the response");
+        let want = todays_charge(&out) + groups_retained_bytes(groups);
+        assert_eq!(used, want, "the decode's charge against today's");
+        let tuples: usize = [
+            GroupValue::Str("x".to_string()),
+            GroupValue::Int(5),
+            GroupValue::Nil,
+        ]
+        .into_iter()
+        .map(|v| group_tuple_bytes(&vec![v]))
+        .sum();
+        assert!(
+            decode(&mut ByteBudget::new(used + tuples)).is_ok(),
+            "a budget of the charge and the counter's tuples decodes"
+        );
+        let refused = decode(&mut ByteBudget::new(used + tuples - 1));
         assert!(
             matches!(
                 refused,

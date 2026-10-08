@@ -7378,7 +7378,7 @@ async fn search_routed_answers_as_today_on_fixture_c() {
         drop_db(&db).await;
     }
     eprintln!("and {fixture_cases} fixture cases");
-    assert_eq!(names.len(), 86, "the inventory's new rows");
+    assert_eq!(names.len(), 90, "the inventory's new rows");
     assert!(
         wrong.is_empty(),
         "{} of {} differ:\n\n{}",
@@ -7528,9 +7528,10 @@ fn pipeline_fixtures(base_ns: i64) -> Vec<PipelineFixture> {
 }
 
 /// Issue #592 part 1's pipeline shapes beyond the corpus: later `{…}`
-/// filters and `select()` after a single filter, each answered by the
-/// search statement as by today's engine on fixture C.
-const PIPELINE_SHAPES_BEYOND_THE_CORPUS: [&str; 7] = [
+/// filters and `select()` after a single filter, and part 2's `by()` and
+/// `coalesce()`, each answered by the search statement as by today's
+/// engine on fixture C.
+const PIPELINE_SHAPES_BEYOND_THE_CORPUS: [&str; 14] = [
     // One field per scope read off the span row: span `…0004` holds all
     // four, so a scope read from the wrong place changes the answer.
     r#"{ } | select(event.exception.type, link.relation, resource.k8s.pod.name, instrumentation.otel.scope.build)"#,
@@ -7540,6 +7541,14 @@ const PIPELINE_SHAPES_BEYOND_THE_CORPUS: [&str; 7] = [
     r#"{ status = error } | select(status)"#,
     r#"{ } | select(status, kind, duration, span:id, trace:id)"#,
     r#"{ } | select(.a, span.a, resource.service.name)"#,
+    // Issue #592 part 2.
+    r#"{ } | by(span.a)"#,
+    r#"{ } | by(name)"#,
+    r#"{ } | by(status) | { .a = 1 }"#,
+    r#"{ } | by(kind) | select(span.a)"#,
+    r#"{ } | by(span.success)"#,
+    r#"{ } | by(span.a) | coalesce()"#,
+    r#"{ } | by(span.a) | coalesce() | { name = "b" }"#,
 ];
 
 /// `T-C1`'s sixteen non-structural filters of
@@ -7980,4 +7989,575 @@ async fn seed_long_keys(db: String) -> (String, ChClient, WindowSql) {
     assert_eq!(seeded, 70_000, "70,000 spans");
     let w = WindowSql::start_closed_end_open(base_ns, base_ns + CORPUS_S_NS);
     (db, client, w)
+}
+
+// =====================================================================
+// Issue #592 part 2 — by() and coalesce() on the search statement
+// =====================================================================
+
+/// The window [`by_fixtures`] land in: 200 s from `base_ns`.
+const BY_WINDOW_NS: i64 = 200_000_000_000;
+
+/// An answer with its groups: per trace `(trace, matched, span ids)` as
+/// [`answer_of`] writes it, then, when the trace carries groups,
+/// `{value matched [span ids]; …}` in the response's order. A value is
+/// its text, `int:` or `double:` and its number, `bool:` and its value,
+/// or `nil`.
+fn grouped_answer_of(
+    out: &Result<pulsus_read::traces::SearchOutput, pulsus_read::logql::ReadError>,
+) -> String {
+    match out {
+        Err(e) => format!("Err({e})"),
+        Ok(o) => o
+            .traces
+            .iter()
+            .map(grouped_trace_of)
+            .collect::<Vec<_>>()
+            .join("; "),
+    }
+}
+
+/// One trace of [`grouped_answer_of`].
+fn grouped_trace_of(t: &pulsus_read::traces::TraceSearchResult) -> String {
+    use pulsus_read::traces::GroupValue;
+    let ids = |spans: &[pulsus_read::traces::SpanSummary]| -> String {
+        spans
+            .iter()
+            .map(|s| format!("{:02x}", s.span_id[7]))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut text = format!("{:02x} {} [{}]", t.trace_id[15], t.matched, ids(&t.spans));
+    if let Some(groups) = &t.groups {
+        let groups: Vec<String> = groups
+            .iter()
+            .map(|g| {
+                let value = match g.attributes.first().map(|(_, v)| v) {
+                    Some(GroupValue::Str(s)) => s.clone(),
+                    Some(GroupValue::Int(i)) => format!("int:{i}"),
+                    Some(GroupValue::Double(bits)) => format!("double:{}", f64::from_bits(*bits)),
+                    Some(GroupValue::Bool(b)) => format!("bool:{b}"),
+                    Some(GroupValue::Nil) => "nil".to_string(),
+                    None => "<no key>".to_string(),
+                };
+                format!("{value} {} [{}]", g.matched, ids(&g.spans))
+            })
+            .collect();
+        text.push_str(&format!(" {{{}}}", groups.join("; ")));
+    }
+    text
+}
+
+/// One server span of 0.1 s at `at_s` seconds after `base_ns`.
+fn by_span(base_ns: i64, trace: u8, span: u8, name: &str, at_s: i64, attrs: Vec<KeyValue>) -> Span {
+    const S: i64 = 1_000_000_000;
+    span_of(
+        vec![trace; 16],
+        vec![0, 0, 0, 0, 0, 0, 0, span],
+        Vec::new(),
+        name,
+        2,
+        base_ns + at_s * S,
+        S / 10,
+        attrs,
+        0,
+        Vec::new(),
+        Vec::new(),
+    )
+}
+
+/// One push of `spans` in a resource named `service`.
+fn by_body(service: &str, spans: Vec<Span>) -> ExportTraceServiceRequest {
+    ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: Some(Resource {
+                attributes: vec![kv("service.name", str_value(service))],
+                dropped_attributes_count: 0,
+                entity_refs: Vec::new(),
+            }),
+            scope_spans: vec![ScopeSpans {
+                scope: Some(scope()),
+                spans,
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    }
+}
+
+/// Issue #592 part 2's fixtures (section 7.2), by label: their bodies and
+/// span counts. Spans are kind server and 0.1 s long; ids are written in
+/// hex, as [`grouped_answer_of`] writes them.
+///
+/// - `rpc`: resource `checkout` holds trace `e1`'s spans 41-46 and `e2`'s
+///   48; resource `cart` holds `e1`'s 47. `rpc.method` is `"Get"`,
+///   `"List"`, none, `"Get"`, the integer 1, the double 1.0 (41-46), 48
+///   `"List"`, 47 `"Get"`.
+/// - `firstseen`: `f1`'s 51 (`k = "x"`, `c`), 52 (`"y"`, `b`), 53 (`"x"`, `b`).
+/// - `values`: trace `90`'s spans 91-97 (name `all`) hold key `v` as an
+///   array of strings, a key-value list, bytes, an array of integers, a
+///   string, nothing and an empty array; trace `91`'s a1-a5 (`arr`) key
+///   `arrx` as the two arrays, the empty array, a string and nothing;
+///   `92`'s b1-b2 (`kv`) key `kvx` as a key-value list and a string; `93`'s
+///   c1-c2 (`bytes`) key `bytesx` as bytes and a string.
+/// - `topk`: trace `60`'s spans 60-65 hold `k = "g0"` … `"g5"` at 100-105
+///   s; traces `70` … `84` hold one span each, `k = "x"`, at 50-70 s.
+fn by_fixtures(base_ns: i64) -> Vec<(&'static str, Vec<ExportTraceServiceRequest>, u64)> {
+    let sp = |trace, span, name, at, attrs| by_span(base_ns, trace, span, name, at, attrs);
+    let method = |v: AnyValue| vec![kv("rpc.method", v)];
+    let k = |v: &str| vec![kv("k", str_value(v))];
+    let kvlist = || kvlist_value(vec![kv("a", int_value(1)), kv("b", str_value("z"))]);
+    let rpc = vec![
+        by_body(
+            "checkout",
+            vec![
+                sp(0xe1, 0x41, "op", 1, method(str_value("Get"))),
+                sp(0xe1, 0x42, "op", 2, method(str_value("List"))),
+                sp(0xe1, 0x43, "op", 3, Vec::new()),
+                sp(0xe1, 0x44, "op", 4, method(str_value("Get"))),
+                sp(0xe1, 0x45, "op", 5, method(int_value(1))),
+                sp(0xe1, 0x46, "op", 6, method(double_value(1.0))),
+                sp(0xe2, 0x48, "op", 8, method(str_value("List"))),
+            ],
+        ),
+        by_body(
+            "cart",
+            vec![sp(0xe1, 0x47, "op", 7, method(str_value("Get")))],
+        ),
+    ];
+    let firstseen = vec![by_body(
+        "svc",
+        vec![
+            sp(0xf1, 0x51, "c", 1, k("x")),
+            sp(0xf1, 0x52, "b", 2, k("y")),
+            sp(0xf1, 0x53, "b", 3, k("x")),
+        ],
+    )];
+    let v = |key: &str, value: AnyValue| vec![kv(key, value)];
+    let values = vec![by_body(
+        "svc",
+        vec![
+            sp(0x90, 0x91, "all", 1, v("v", str_array_value(&["x", "y"]))),
+            sp(0x90, 0x92, "all", 2, v("v", kvlist())),
+            sp(0x90, 0x93, "all", 3, v("v", bytes_value(&[1, 2, 3]))),
+            sp(0x90, 0x94, "all", 4, v("v", int_array_value(&[1, 2]))),
+            sp(0x90, 0x95, "all", 5, v("v", str_value("x"))),
+            sp(0x90, 0x96, "all", 6, Vec::new()),
+            sp(0x90, 0x97, "all", 7, v("v", str_array_value(&[]))),
+            sp(
+                0x91,
+                0xa1,
+                "arr",
+                1,
+                v("arrx", str_array_value(&["x", "y"])),
+            ),
+            sp(0x91, 0xa2, "arr", 2, v("arrx", int_array_value(&[1, 2]))),
+            sp(0x91, 0xa3, "arr", 3, v("arrx", str_array_value(&[]))),
+            sp(0x91, 0xa4, "arr", 4, v("arrx", str_value("x"))),
+            sp(0x91, 0xa5, "arr", 5, Vec::new()),
+            sp(0x92, 0xb1, "kv", 1, v("kvx", kvlist())),
+            sp(0x92, 0xb2, "kv", 2, v("kvx", str_value("x"))),
+            sp(0x93, 0xc1, "bytes", 1, v("bytesx", bytes_value(&[1, 2, 3]))),
+            sp(0x93, 0xc2, "bytes", 2, v("bytesx", str_value("x"))),
+        ],
+    )];
+    let mut topk_spans: Vec<Span> = (0..6u8)
+        .map(|i| {
+            sp(
+                0x60,
+                0x60 + i,
+                "op",
+                100 + i64::from(i),
+                k(&format!("g{i}")),
+            )
+        })
+        .collect();
+    for i in 0..21u8 {
+        topk_spans.push(sp(0x70 + i, 0x70 + i, "op", 50 + i64::from(i), k("x")));
+    }
+    vec![
+        ("rpc", rpc, 8),
+        ("firstseen", firstseen, 3),
+        ("values", values, 16),
+        ("topk", vec![by_body("svc", topk_spans)], 27),
+    ]
+}
+
+/// Seeds the [`by_fixtures`] fixture `label` in both stores of its own
+/// database.
+async fn seed_by_fixture(label: &str, base_ns: i64) -> (String, ChClient) {
+    let (_, bodies, spans) = by_fixtures(base_ns)
+        .into_iter()
+        .find(|(l, ..)| *l == label)
+        .unwrap_or_else(|| panic!("no fixture {label}"));
+    seed_both(
+        pulsus_testkit::test_db(&format!("pulsus_read_it_t592p2_{label}")),
+        &bodies,
+        spans,
+        &format!("t592p2-{label}"),
+    )
+    .await
+}
+
+/// One routed search, then the query log's statement count for it, then
+/// today's answer: `(today, routed, statements)`. The query log is read
+/// before today's engine runs, so the count is the fork's alone.
+async fn routed_and_today(
+    engine: &pulsus_read::TraceEngine,
+    client: &ChClient,
+    db: &str,
+    plan: &pulsus_read::SearchPlan,
+) -> (
+    Result<pulsus_read::traces::SearchOutput, pulsus_read::logql::ReadError>,
+    Result<pulsus_read::traces::SearchOutput, pulsus_read::logql::ReadError>,
+    u64,
+) {
+    let t0 = now_ns();
+    let routed = engine.search_routed(plan).await;
+    let (statements, _) = settled_statements(client, db, t0).await;
+    let today = engine.search(plan).await.map(normalise_today);
+    (today, routed, statements)
+}
+
+/// Records a case whose routed answer is not today's, or not its literal.
+fn check_grouped(
+    wrong: &mut Vec<String>,
+    label: &str,
+    today: &Result<pulsus_read::traces::SearchOutput, pulsus_read::logql::ReadError>,
+    routed: &Result<pulsus_read::traces::SearchOutput, pulsus_read::logql::ReadError>,
+    literal: &str,
+) {
+    if format!("{today:?}") != format!("{routed:?}") {
+        wrong.push(format!(
+            "{label}\n  today:  {}\n  routed: {}",
+            grouped_answer_of(today),
+            grouped_answer_of(routed)
+        ));
+        return;
+    }
+    if grouped_answer_of(routed) != literal {
+        wrong.push(format!(
+            "{label}\n  literal: {literal}\n  both:    {}",
+            grouped_answer_of(routed)
+        ));
+    }
+}
+
+/// `T-A8`: one spanset per value and stored type, a span without the key
+/// in the `nil` group, in the order the groups' first spans appear; one
+/// statement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_a8_one_spanset_per_value_and_stored_type() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let (db, client) = seed_by_fixture("rpc", base_ns).await;
+    let engine = engine_of(&db).await;
+    let query = r#"{ resource.service.name = "checkout" } | by(span.rpc.method)"#;
+    let plan = plan_of(
+        &engine,
+        &parse_query(query),
+        (base_ns, base_ns + BY_WINDOW_NS),
+        20,
+        3,
+    );
+    let (today, routed, statements) = routed_and_today(&engine, &client, &db, &plan).await;
+    drop_db(&db).await;
+    let mut wrong = Vec::new();
+    if !covered(&plan) {
+        wrong.push(format!(
+            "{query}: today's engine's, must be the statement's"
+        ));
+    }
+    check_grouped(
+        &mut wrong,
+        query,
+        &today,
+        &routed,
+        "e2 1 [48] {List 1 [48]}; \
+         e1 6 [41, 42, 43] {Get 2 [41, 44]; List 1 [42]; nil 1 [43]; int:1 1 [45]; double:1 1 [46]}",
+    );
+    if statements != 1 {
+        wrong.push(format!("{query}: {statements} statements, want 1"));
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// The integer 1 and the double 1 are two groups: fixture C's trace
+/// `11…11` under `{ } | by(span.a)`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_integer_and_the_double_do_not_merge() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let window = (base_ns, base_ns + CATALOGUE_WINDOW_NS);
+    let (db, _client) = seed_both(
+        pulsus_testkit::test_db("pulsus_read_it_t592p2_intdouble"),
+        &fixture_catalogue_bodies(base_ns),
+        34,
+        "t592p2-intdouble",
+    )
+    .await;
+    let engine = engine_of(&db).await;
+    let query = "{ } | by(span.a)";
+    let plan = plan_of(&engine, &parse_query(query), window, 20, 3);
+    let today = engine.search(&plan).await.map(normalise_today);
+    let routed = engine.search_routed(&plan).await;
+    drop_db(&db).await;
+    let mut wrong = Vec::new();
+    if !covered(&plan) {
+        wrong.push(format!(
+            "{query}: today's engine's, must be the statement's"
+        ));
+    }
+    if format!("{today:?}") != format!("{routed:?}") {
+        wrong.push(format!(
+            "{query}\n  today:  {}\n  routed: {}",
+            grouped_answer_of(&today),
+            grouped_answer_of(&routed)
+        ));
+    }
+    let trace = routed
+        .as_ref()
+        .ok()
+        .and_then(|o| o.traces.iter().find(|t| t.trace_id == [0x11; 16]))
+        .map(grouped_trace_of);
+    let want = "11 3 [01, 02, 03] {int:1 1 [01]; nil 1 [02]; double:1 1 [03]}";
+    if trace.as_deref() != Some(want) {
+        wrong.push(format!(
+            "trace 11…11\n  want: {want}\n  got:  {trace:?}\n  answer: {}",
+            grouped_answer_of(&routed)
+        ));
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// `coalesce()` merges the groups back: no groups, the union's spans,
+/// and the same answer as the ungrouped query.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coalesce_drops_the_key() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let window = (base_ns, base_ns + BY_WINDOW_NS);
+    let (db, client) = seed_by_fixture("rpc", base_ns).await;
+    let engine = engine_of(&db).await;
+    let query = r#"{ resource.service.name = "checkout" } | by(span.rpc.method) | coalesce()"#;
+    let plan = plan_of(&engine, &parse_query(query), window, 20, 3);
+    let (today, routed, statements) = routed_and_today(&engine, &client, &db, &plan).await;
+    let flat = engine
+        .search_routed(&plan_of(
+            &engine,
+            &parse_query(r#"{ resource.service.name = "checkout" }"#),
+            window,
+            20,
+            3,
+        ))
+        .await;
+    drop_db(&db).await;
+    let mut wrong = Vec::new();
+    if !covered(&plan) {
+        wrong.push(format!(
+            "{query}: today's engine's, must be the statement's"
+        ));
+    }
+    check_grouped(
+        &mut wrong,
+        query,
+        &today,
+        &routed,
+        "e2 1 [48]; e1 6 [41, 42, 43]",
+    );
+    if format!("{flat:?}") != format!("{routed:?}") {
+        wrong.push(format!(
+            "{query} is not the ungrouped answer\n  ungrouped: {}\n  coalesced: {}",
+            grouped_answer_of(&flat),
+            grouped_answer_of(&routed)
+        ));
+    }
+    if statements != 1 {
+        wrong.push(format!("{query}: {statements} statements, want 1"));
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// The top-K keeps traces, not groups: trace `60`'s six groups take one
+/// place of twenty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_top_k_stays_per_trace() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let (db, client) = seed_by_fixture("topk", base_ns).await;
+    let engine = engine_of(&db).await;
+    let query = "{ } | by(span.k)";
+    let plan = plan_of(
+        &engine,
+        &parse_query(query),
+        (base_ns, base_ns + BY_WINDOW_NS),
+        20,
+        3,
+    );
+    let (today, routed, statements) = routed_and_today(&engine, &client, &db, &plan).await;
+    drop_db(&db).await;
+    let mut literal = vec![
+        "60 6 [60, 61, 62] {g0 1 [60]; g1 1 [61]; g2 1 [62]; g3 1 [63]; g4 1 [64]; g5 1 [65]}"
+            .to_string(),
+    ];
+    for t in (0x72..=0x84u8).rev() {
+        literal.push(format!("{t:02x} 1 [{t:02x}] {{x 1 [{t:02x}]}}"));
+    }
+    let mut wrong = Vec::new();
+    if !covered(&plan) {
+        wrong.push(format!(
+            "{query}: today's engine's, must be the statement's"
+        ));
+    }
+    check_grouped(&mut wrong, query, &today, &routed, &literal.join("; "));
+    if statements != 1 {
+        wrong.push(format!("{query}: {statements} statements, want 1"));
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A filter after `by()` keeps the groups in the order their first span
+/// appeared before it; a filter before `by()` decides that order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_filter_before_or_after_by_keeps_todays_group_order() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let window = (base_ns, base_ns + BY_WINDOW_NS);
+    let (db, client) = seed_by_fixture("firstseen", base_ns).await;
+    let engine = engine_of(&db).await;
+    let mut wrong = Vec::new();
+    for (query, literal) in [
+        (
+            r#"{ } | by(span.k) | { name = "b" }"#,
+            "f1 2 [52, 53] {x 1 [53]; y 1 [52]}",
+        ),
+        (
+            r#"{ } | { name = "b" } | by(span.k)"#,
+            "f1 2 [52, 53] {y 1 [52]; x 1 [53]}",
+        ),
+    ] {
+        let plan = plan_of(&engine, &parse_query(query), window, 20, 3);
+        if !covered(&plan) {
+            wrong.push(format!(
+                "{query}: today's engine's, must be the statement's"
+            ));
+        }
+        let (today, routed, statements) = routed_and_today(&engine, &client, &db, &plan).await;
+        check_grouped(&mut wrong, query, &today, &routed, literal);
+        if statements != 1 {
+            wrong.push(format!("{query}: {statements} statements, want 1"));
+        }
+    }
+    drop_db(&db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Each kind of stored value groups as today's engine renders it: an
+/// array as its JSON, which the statement answers; a key-value list and
+/// bytes, which it hands to today's engine.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn by_keeps_todays_value_kinds() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let window = (base_ns, base_ns + BY_WINDOW_NS);
+    let (db, client) = seed_by_fixture("values", base_ns).await;
+    let engine = engine_of(&db).await;
+    let mut wrong = Vec::new();
+    for (query, literal, answered) in [
+        (
+            r#"{ name = "all" } | by(span.v)"#,
+            r#"90 7 [91, 92, 93, 94, 95, 96, 97] {["x","y"] 1 [91]; {"a":1,"b":"z"} 1 [92]; AQID 1 [93]; [1,2] 1 [94]; x 1 [95]; nil 1 [96]; [] 1 [97]}"#,
+            false,
+        ),
+        (
+            r#"{ name = "arr" } | by(span.arrx)"#,
+            r#"91 5 [a1, a2, a3, a4, a5] {["x","y"] 1 [a1]; [1,2] 1 [a2]; [] 1 [a3]; x 1 [a4]; nil 1 [a5]}"#,
+            true,
+        ),
+        (
+            r#"{ name = "kv" } | by(span.kvx)"#,
+            r#"92 2 [b1, b2] {{"a":1,"b":"z"} 1 [b1]; x 1 [b2]}"#,
+            false,
+        ),
+        (
+            r#"{ name = "bytes" } | by(span.bytesx)"#,
+            "93 2 [c1, c2] {AQID 1 [c1]; x 1 [c2]}",
+            false,
+        ),
+    ] {
+        let plan = plan_of(&engine, &parse_query(query), window, 20, 10);
+        if !covered(&plan) {
+            wrong.push(format!(
+                "{query}: today's engine's, must be the statement's"
+            ));
+        }
+        let (today, routed, statements) = routed_and_today(&engine, &client, &db, &plan).await;
+        check_grouped(&mut wrong, query, &today, &routed, literal);
+        if (statements == 1) != answered {
+            wrong.push(format!(
+                "{query}: {statements} statements; the statement must {} it",
+                if answered { "answer" } else { "hand over" }
+            ));
+        }
+    }
+    drop_db(&db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// The distinct-group `422`: on today's engine and on the statement
+/// alike at `max_series = 2`, by the preflight and by the counter; and
+/// `{ } | by(status)` at `limit = 1`, which today's engine refuses
+/// counting the groups of every trace it evaluated, the statement answers,
+/// counting those of the trace it returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_routed_keeps_the_group_cap() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let window = (base_ns, base_ns + CATALOGUE_WINDOW_NS);
+    let (db, _client) = seed_both(
+        pulsus_testkit::test_db("pulsus_read_it_t592p2_cap"),
+        &fixture_catalogue_bodies(base_ns),
+        34,
+        "t592p2-cap",
+    )
+    .await;
+    let engine = pulsus_read::TraceEngine::new(
+        ChClient::new(client_config(&db))
+            .await
+            .expect("connect the engine"),
+        pulsus_read::TraceReadConfig {
+            max_series: 2,
+            ..engine_config()
+        },
+    );
+    let cap = "Err(QueryTooBroad(TraceSearchSeriesCap { count: 3, cap: 2 }))";
+    let mut wrong = Vec::new();
+    for (query, limit, want_today, want_routed) in [
+        ("{ } | by(span.a)", 20, cap, cap),
+        ("{ .a = 1 } | by(resource.service.name)", 1, cap, cap),
+        ("{ } | by(span.a) | coalesce()", 20, cap, cap),
+        (r#"{ } | by(name) | { name = "b" }"#, 20, cap, cap),
+        ("{ } | by(status)", 1, cap, "Ok(1 traces"),
+    ] {
+        let plan = plan_of(&engine, &parse_query(query), window, limit, 3);
+        if !covered(&plan) {
+            wrong.push(format!(
+                "{query}: today's engine's, must be the statement's"
+            ));
+        }
+        let today = shape(&engine.search(&plan).await);
+        let routed = shape(&engine.search_routed(&plan).await);
+        if !today.starts_with(want_today) {
+            wrong.push(format!(
+                "{query} ({limit}) today: want {want_today}, got {today}"
+            ));
+        }
+        if !routed.starts_with(want_routed) {
+            wrong.push(format!(
+                "{query} ({limit}) routed: want {want_routed}, got {routed}"
+            ));
+        }
+    }
+    drop_db(&db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
