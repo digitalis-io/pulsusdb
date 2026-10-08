@@ -8183,15 +8183,16 @@ fn by_fixtures(base_ns: i64) -> Vec<(&'static str, Vec<ExportTraceServiceRequest
     ]
 }
 
-/// Seeds the [`by_fixtures`] fixture `label` in both stores of its own
-/// database.
-async fn seed_by_fixture(label: &str, base_ns: i64) -> (String, ChClient) {
+/// Seeds the [`by_fixtures`] fixture `label` in both stores of the
+/// database `test`'s own name gives: two tests may seed one fixture, and
+/// the suite runs them at once.
+async fn seed_by_fixture(label: &str, test: &str, base_ns: i64) -> (String, ChClient) {
     let (_, bodies, spans) = by_fixtures(base_ns)
         .into_iter()
         .find(|(l, ..)| *l == label)
         .unwrap_or_else(|| panic!("no fixture {label}"));
     seed_both(
-        pulsus_testkit::test_db(&format!("pulsus_read_it_t592p2_{label}")),
+        pulsus_testkit::test_db(&format!("pulsus_read_it_t592p2_{test}")),
         &bodies,
         spans,
         &format!("t592p2-{label}"),
@@ -8252,7 +8253,7 @@ fn check_grouped(
 async fn t_a8_one_spanset_per_value_and_stored_type() {
     skip_unless_live!();
     let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
-    let (db, client) = seed_by_fixture("rpc", base_ns).await;
+    let (db, client) = seed_by_fixture("rpc", "ta8", base_ns).await;
     let engine = engine_of(&db).await;
     let query = r#"{ resource.service.name = "checkout" } | by(span.rpc.method)"#;
     let plan = plan_of(
@@ -8339,7 +8340,7 @@ async fn coalesce_drops_the_key() {
     skip_unless_live!();
     let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
     let window = (base_ns, base_ns + BY_WINDOW_NS);
-    let (db, client) = seed_by_fixture("rpc", base_ns).await;
+    let (db, client) = seed_by_fixture("rpc", "coalesce", base_ns).await;
     let engine = engine_of(&db).await;
     let query = r#"{ resource.service.name = "checkout" } | by(span.rpc.method) | coalesce()"#;
     let plan = plan_of(&engine, &parse_query(query), window, 20, 3);
@@ -8386,7 +8387,7 @@ async fn coalesce_drops_the_key() {
 async fn the_top_k_stays_per_trace() {
     skip_unless_live!();
     let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
-    let (db, client) = seed_by_fixture("topk", base_ns).await;
+    let (db, client) = seed_by_fixture("topk", "topk", base_ns).await;
     let engine = engine_of(&db).await;
     let query = "{ } | by(span.k)";
     let plan = plan_of(
@@ -8425,7 +8426,7 @@ async fn a_filter_before_or_after_by_keeps_todays_group_order() {
     skip_unless_live!();
     let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
     let window = (base_ns, base_ns + BY_WINDOW_NS);
-    let (db, client) = seed_by_fixture("firstseen", base_ns).await;
+    let (db, client) = seed_by_fixture("firstseen", "firstseen", base_ns).await;
     let engine = engine_of(&db).await;
     let mut wrong = Vec::new();
     for (query, literal) in [
@@ -8462,7 +8463,7 @@ async fn by_keeps_todays_value_kinds() {
     skip_unless_live!();
     let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
     let window = (base_ns, base_ns + BY_WINDOW_NS);
-    let (db, client) = seed_by_fixture("values", base_ns).await;
+    let (db, client) = seed_by_fixture("values", "values", base_ns).await;
     let engine = engine_of(&db).await;
     let mut wrong = Vec::new();
     for (query, literal, answered) in [
