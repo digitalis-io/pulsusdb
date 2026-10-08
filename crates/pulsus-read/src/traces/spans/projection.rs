@@ -416,6 +416,94 @@ fn rendered_len(values: &[serde_json::Value]) -> usize {
     }
 }
 
+/// Issue #592 part 2: an array value's text as the writer stored it — the
+/// JSON of its elements, each by its own type — from the statement's
+/// `[[type, text], …]`. A `by()` key is not cut, as today's group key is
+/// not.
+pub(crate) fn rendered_array(text: &str) -> Result<String, String> {
+    serde_json::to_string(&array_values(text)?).map_err(|e| e.to_string())
+}
+
+/// The length of [`rendered_array`]'s text, learned without building it,
+/// so the decode charges it first.
+pub(crate) fn rendered_array_len(text: &str) -> Result<usize, String> {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, &array_values(text)?).map_err(|e| e.to_string())?;
+    Ok(counter.0)
+}
+
+/// Issue #592 part 2: how the search statement reads one `by()` key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupKeySql {
+    /// The key's value as text: a column's keyword text, or a span
+    /// attribute's stored text, an array as the JSON of its typed elements.
+    pub value: String,
+    /// The value's stored type, for a span attribute; a column key has
+    /// none.
+    pub value_type: Option<String>,
+    /// The condition under which the key's value is held off its own path
+    /// — a key-value list flattened into paths under the key, or bytes in
+    /// `attrs_other` — which the statement cannot read as the key's value.
+    pub off_path: Option<String>,
+}
+
+/// The `by()` keys the search statement serves (issue #592 part 2): `name`,
+/// `status`, `kind`, `resource.service.name` and a `span.` attribute.
+/// `None` for any other key, which today's engine answers.
+pub fn group_key_sql(field: &Field) -> Option<GroupKeySql> {
+    let column = |sql: &str| GroupKeySql {
+        value: sql.to_string(),
+        value_type: None,
+        off_path: None,
+    };
+    match field {
+        Field::Intrinsic(Intrinsic::Name | Intrinsic::Status | Intrinsic::Kind) => {
+            match place_of(field) {
+                Place::Column(sql) => Some(column(sql)),
+                _ => None,
+            }
+        }
+        Field::Attribute {
+            scope: AttrScope::Resource,
+            key,
+        } if key == "service.name" => Some(column("toString(service)")),
+        Field::Attribute {
+            scope: AttrScope::Span,
+            key,
+        } => {
+            let p = attr_path("attrs", key);
+            Some(GroupKeySql {
+                value: format!(
+                    "if(startsWith(dynamicType({p}), 'Array'), toJSONString(arrayMap(x -> \
+                     (toString(dynamicType(x)), toString(x)), CAST({p}, 'Array(Dynamic)'))), \
+                     toString({p}))"
+                ),
+                value_type: Some(format!("toString(dynamicType({p}))")),
+                off_path: Some(format!(
+                    "dynamicType({p}) = 'None' AND (position(attrs_other, {}) > 0 OR \
+                     arrayExists(x -> startsWith(x, {}), JSONAllPaths(attrs)))",
+                    escape::ch_string(key),
+                    escape::ch_string(&format!(
+                        "{}.",
+                        pulsus_clickhouse::json_column::escape_json_path(key)
+                    ))
+                )),
+            })
+        }
+        _ => None,
+    }
+}
+
 /// An array's elements, each by its own type, from the statement's
 /// `[[type, text], …]`.
 fn array_values(value: &str) -> Result<Vec<serde_json::Value>, String> {

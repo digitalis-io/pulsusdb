@@ -659,3 +659,76 @@ impl<'de> Deserialize<'de> for SearchSpanTuple {
         d.deserialize_tuple(SEARCH_SPAN_TUPLE_ELEMENTS, SearchSpanVisitor)
     }
 }
+
+/// One row of the grouped search statement (issue #592 part 2): the
+/// trace's columns as [`SearchTraceRow`], and its `by()` groups, in the
+/// order their first span appeared.
+#[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
+pub struct SearchGroupedRow {
+    pub trace_id: [u8; 16],
+    pub root_service: String,
+    pub root_name: String,
+    pub start_ns: i64,
+    pub duration_ns: i64,
+    pub last: i64,
+    pub matched: u64,
+    pub spans: Vec<SearchSpanTuple>,
+    pub groups: Vec<SearchGroupTuple>,
+}
+
+/// One element of [`SearchGroupedRow::groups`], in the tuple's order: the
+/// key's value as text, its stored type (`""` for a column key), the spans
+/// of the group that every filter kept, before the `spss` cap, and its
+/// first `spss` spans.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchGroupTuple {
+    pub value: String,
+    pub value_type: String,
+    pub matched: u64,
+    pub spans: Vec<SearchSpanTuple>,
+}
+
+/// See [`SPAN_TUPLE_ELEMENTS`].
+pub const SEARCH_GROUP_TUPLE_ELEMENTS: usize = 4;
+
+impl Serialize for SearchGroupTuple {
+    /// See [`FetchedEventTuple::serialize`].
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeTuple;
+        let mut t = s.serialize_tuple(SEARCH_GROUP_TUPLE_ELEMENTS)?;
+        t.serialize_element(self.value.as_str())?;
+        t.serialize_element(self.value_type.as_str())?;
+        t.serialize_element(&self.matched)?;
+        t.serialize_element(&self.spans)?;
+        t.end()
+    }
+}
+
+struct SearchGroupVisitor;
+
+impl<'de> Visitor<'de> for SearchGroupVisitor {
+    type Value = SearchGroupTuple;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "a {SEARCH_GROUP_TUPLE_ELEMENTS}-element search group tuple"
+        )
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        const T: &str = "search group";
+        Ok(SearchGroupTuple {
+            value: element(&mut seq, T, "value")?,
+            value_type: element(&mut seq, T, "value_type")?,
+            matched: element(&mut seq, T, "matched")?,
+            spans: element(&mut seq, T, "spans")?,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for SearchGroupTuple {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_tuple(SEARCH_GROUP_TUPLE_ELEMENTS, SearchGroupVisitor)
+    }
+}

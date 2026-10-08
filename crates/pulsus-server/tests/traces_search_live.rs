@@ -1285,14 +1285,14 @@ async fn candidate_cap_partial_and_boundary_semantics() {
 
     // Issue #591 part 3, section 7: this test pins today's engine's own
     // mechanics, which a covered query no longer reaches, so each query is
-    // kept on today's engine with ` | coalesce()`, which leaves a plain
+    // kept on today's engine with ` | by(trace:id) | coalesce()`, which leaves a plain
     // query's answer unchanged.
     // Over-cap: 6 name-matching traces against a cap of 3 → partial, and
     // the returned set is the exact newest-3 by the public order.
     let ctx = "over-cap";
     let res = search(
         port,
-        r#"{ name = "cap" } | coalesce()"#,
+        r#"{ name = "cap" } | by(trace:id) | coalesce()"#,
         base,
         base + 60,
         "",
@@ -1314,7 +1314,7 @@ async fn candidate_cap_partial_and_boundary_semantics() {
     let ctx = "false-positive-newer";
     let res = search(
         port,
-        r#"{ name = "cap" } && { span.marked = "yes" } | coalesce()"#,
+        r#"{ name = "cap" } && { span.marked = "yes" } | by(trace:id) | coalesce()"#,
         base,
         base + 60,
         "",
@@ -1332,7 +1332,7 @@ async fn candidate_cap_partial_and_boundary_semantics() {
     let ctx = "sub-cap";
     let res = search(
         port,
-        r#"{ name = "cap" } | coalesce()"#,
+        r#"{ name = "cap" } | by(trace:id) | coalesce()"#,
         base + 4,
         base + 6,
         "",
@@ -1349,7 +1349,7 @@ async fn candidate_cap_partial_and_boundary_semantics() {
     let ctx = "exactly-at-cap";
     let res = search(
         port,
-        r#"{ name = "cap" } | coalesce()"#,
+        r#"{ name = "cap" } | by(trace:id) | coalesce()"#,
         base + 3,
         base + 6,
         "",
@@ -1914,9 +1914,9 @@ async fn a_wide_event_set_is_refused_by_the_budget_not_materialized() {
     let ctx = "wide-event-set-is-422";
     // Issue #591 part 3, section 7: this test pins today's engine's own
     // mechanics, which a covered query no longer reaches, so each query is
-    // kept on today's engine with ` | coalesce()`, which leaves a plain
+    // kept on today's engine with ` | by(trace:id) | coalesce()`, which leaves a plain
     // query's answer unchanged.
-    let wide_query = "{ name != event:name } | coalesce()";
+    let wide_query = "{ name != event:name } | by(trace:id) | coalesce()";
     let path = format!(
         "/api/traces/v1/search?q={}&start={w0}&end={w1}",
         enc(wide_query)
@@ -2578,9 +2578,9 @@ async fn the_traces_search_route_answers_the_explain_header() {
     );
 
     // Issue #591 part 3, section 7: the compiled plan is today's
-    // engine's, so the query is kept on it with ` | coalesce()`, which
+    // engine's, so the query is kept on it with ` | by(trace:id) | coalesce()`, which
     // leaves a plain query's answer unchanged and adds its one link.
-    let q = r#"{ resource.service.name = "explain-checkout" } | coalesce()"#;
+    let q = r#"{ resource.service.name = "explain-checkout" } | by(trace:id) | coalesce()"#;
     let path = format!("/api/traces/v1/search?q={}&start={w0}&end={w1}", enc(q));
 
     // Without the header: no `explain` key at all.
@@ -2680,7 +2680,7 @@ async fn the_traces_search_route_answers_the_explain_header() {
                                 "name": "reader.traceql_max_candidates",
                                 "value": 100_000u64}},
              "yields": "exact"},
-            {"kind": "engine", "links": [3, 4]},
+            {"kind": "engine", "links": [2, 3, 4, 5]},
             {"kind": "sql", "name": "trace_spans:root", "issue": "once",
              "cut": {"why": "source_handoff", "source": "trace_spans:root", "key": "trace_id"},
              "seed": {"from": [1], "bound": {"kind": "request_limit", "value": 20u64}},
@@ -2689,16 +2689,20 @@ async fn the_traces_search_route_answers_the_explain_header() {
         "links": [
             {"i": 0, "part": 0, "stage": "Source",     "how": "lowered",  "fidelity": "equivalent"},
             {"i": 1, "part": 1, "stage": "Hydrate",    "how": "residual", "why": "not_yet_lowered"},
-            // Issue #591 part 3: the ` | coalesce()` that keeps this query
-            // on today's engine, lowered into the first part. It is the
-            // one link the edit adds, and it moves the links after it on
-            // by one.
-            {"i": 2, "part": 0, "stage": "Pipe(Coalesce)", "how": "lowered",
+            // Issue #591 part 3: the ` | coalesce()` that kept this query
+            // on today's engine, lowered into the first part; issue #592
+            // part 2: the search statement serves `coalesce()`, so the
+            // query carries ` | by(trace:id)` before it, which the
+            // statement does not serve, residual in the engine part. Each
+            // added link moves the links after it on by one.
+            {"i": 2, "part": 2, "stage": "Pipe(By)", "how": "residual",
+             "why": "not_yet_lowered"},
+            {"i": 3, "part": 0, "stage": "Pipe(Coalesce)", "how": "lowered",
              "fidelity": "equivalent"},
-            {"i": 3, "part": 2, "stage": "Order",      "how": "residual", "why": "not_yet_lowered"},
-            {"i": 4, "part": 2, "stage": "Limit(20)",  "how": "residual",
+            {"i": 4, "part": 2, "stage": "Order",      "how": "residual", "why": "not_yet_lowered"},
+            {"i": 5, "part": 2, "stage": "Limit(20)",  "how": "residual",
              "why": "ordering_not_established"},
-            {"i": 5, "part": 3, "stage": "Emit",       "how": "residual",
+            {"i": 6, "part": 3, "stage": "Emit",       "how": "residual",
              "why": "needs_unwindowed_root_read"},
         ],
     });
@@ -2723,8 +2727,9 @@ async fn the_traces_search_route_answers_the_explain_header() {
     // sentence.
     const CRITERION_33: &str = "Criterion 33: the frozen plan object for a bare service \
         selector moves on exactly three fields — `links[0].fidelity` becomes \"equivalent\", \
-        `links[3].why` (the `Order` link, `links[2]` before issue #591 part 3 added the \
-        coalesce link ahead of it) becomes \"not_yet_lowered\", and `parts[0].yields`, \
+        `links[4].why` (the `Order` link, `links[2]` before issue #591 part 3 added the \
+        coalesce link ahead of it and `links[3]` before issue #592 part 2 added the by link) \
+        becomes \"not_yet_lowered\", and `parts[0].yields`, \
         `parts[1].yields` \
         and `parts[3].yields` become \"exact\".";
     let before_part_5 = {
@@ -2733,14 +2738,14 @@ async fn the_traces_search_route_answers_the_explain_header() {
         o["parts"][1]["yields"] = serde_json::json!("candidates");
         o["parts"][3]["yields"] = serde_json::json!("candidates");
         o["links"][0]["fidelity"] = serde_json::json!("wider");
-        o["links"][3]["why"] = serde_json::json!("not_exact");
+        o["links"][4]["why"] = serde_json::json!("not_exact");
         o
     };
     let mut differing = differing_paths(&before_part_5, &expected_plan, "");
     differing.sort();
     let expected_paths = [
         "links[0].fidelity",
-        "links[3].why",
+        "links[4].why",
         "parts[0].yields",
         "parts[1].yields",
         "parts[3].yields",
@@ -2772,8 +2777,7 @@ async fn the_traces_search_route_answers_the_explain_header() {
     // `span.zzz` matches nothing on purpose: the plan's shape is decided
     // at plan time and does not depend on what the data holds, so the
     // answer beside it is the same two traces as above.
-    let or_q =
-        r#"{ resource.service.name = "explain-checkout" || span.zzz = "no-such" } | coalesce()"#;
+    let or_q = r#"{ resource.service.name = "explain-checkout" || span.zzz = "no-such" } | by(trace:id) | coalesce()"#;
     let or_path = format!("/api/traces/v1/search?q={}&start={w0}&end={w1}", enc(or_q));
     let or_raw = request_with_headers(port, "GET", &or_path, None, &[("X-Pulsus-Explain", "1")])
         .expect("explain: the disjunctive request must be reachable");
@@ -3348,10 +3352,13 @@ async fn one_request_with_an_attribute_condition_sends_three_statements() {
     // onto the hydration statement would send beyond the three)`.
     for (q, extra) in [
         // Issue #591 part 3, section 7: today's three stages are today's
-        // engine's, so each query is kept on it with ` | coalesce()`,
+        // engine's, so each query is kept on it with ` | by(trace:id) | coalesce()`,
         // which leaves a plain query's answer unchanged.
-        (r#"{ span.k = "x" } | coalesce()"#, 1usize),
-        (r#"{ span.k = "x" && span.j = "x" } | coalesce()"#, 2usize),
+        (r#"{ span.k = "x" } | by(trace:id) | coalesce()"#, 1usize),
+        (
+            r#"{ span.k = "x" && span.j = "x" } | by(trace:id) | coalesce()"#,
+            2usize,
+        ),
         // Issue #558 criterion 10: no attribute CONDITION at all —
         // `resource.service.name` is a physical column — and two value
         // reads, one `select()` field and one aggregate argument. Before,
@@ -4029,11 +4036,18 @@ async fn the_event_set_budget_admits_exactly_its_own_count_and_refuses_one_more(
     // the offset the span was seeded at.
     // Issue #591 part 3, section 7: this test pins today's engine's own
     // mechanics, which a covered query no longer reaches, so each query is
-    // kept on today's engine with ` | coalesce()`, which leaves a plain
+    // kept on today's engine with ` | by(trace:id) | coalesce()`, which leaves a plain
     // query's answer unchanged.
     let ctx = "exactly-the-budget-is-200";
     let (a0, a1) = (base, base + 2);
-    let res = search(port, "{ name != event:name } | coalesce()", a0, a1, "", ctx);
+    let res = search(
+        port,
+        "{ name != event:name } | by(trace:id) | coalesce()",
+        a0,
+        a1,
+        "",
+        ctx,
+    );
     assert_eq!(res.status, 200, "{ctx}");
     assert_eq!(
         trace_set(&res.json(ctx)),
@@ -4047,7 +4061,7 @@ async fn the_event_set_budget_admits_exactly_its_own_count_and_refuses_one_more(
     let (b0, b1) = (base + 2, base + 3);
     let path = format!(
         "/api/traces/v1/search?q={}&start={b0}&end={b1}",
-        enc("{ name != event:name } | coalesce()")
+        enc("{ name != event:name } | by(trace:id) | coalesce()")
     );
     let res = get(port, &path, ctx);
     let body = assert_error_body(&res, 422, ctx);
@@ -4695,12 +4709,12 @@ async fn the_empty_search_and_the_error_field_answer_from_the_derived_tables() {
     let all = vec![1, 3, 6, 7, 8, 9, 10, 11];
     // Issue #591 part 3, section 7: this test pins today's engine's own
     // mechanics, which a covered query no longer reaches, so each query is
-    // kept on today's engine with ` | coalesce()`, which leaves a plain
+    // kept on today's engine with ` | by(trace:id) | coalesce()`, which leaves a plain
     // query's answer unchanged.
     let cases = vec![
         RecencyCase {
             label: "Q1 {}",
-            q: "{} | coalesce()",
+            q: "{} | by(trace:id) | coalesce()",
             start_s: s,
             end_s: e,
             traces: vec![8, 10, 9, 3, 7, 6, 1, 11],
@@ -4711,7 +4725,7 @@ async fn the_empty_search_and_the_error_field_answer_from_the_derived_tables() {
         },
         RecencyCase {
             label: "Q2 {} inside one bucket",
-            q: "{} | coalesce()",
+            q: "{} | by(trace:id) | coalesce()",
             start_s: base + 60,
             end_s: base + 90,
             traces: vec![9, 10],
@@ -4722,7 +4736,7 @@ async fn the_empty_search_and_the_error_field_answer_from_the_derived_tables() {
         },
         RecencyCase {
             label: "Q3 { status = error }",
-            q: "{ status = error } | coalesce()",
+            q: "{ status = error } | by(trace:id) | coalesce()",
             start_s: s,
             end_s: e,
             traces: vec![6],
@@ -4733,7 +4747,7 @@ async fn the_empty_search_and_the_error_field_answer_from_the_derived_tables() {
         },
         RecencyCase {
             label: "Q4 { status != error }",
-            q: "{ status != error } | coalesce()",
+            q: "{ status != error } | by(trace:id) | coalesce()",
             start_s: s,
             end_s: e,
             traces: all.clone(),
@@ -4744,7 +4758,7 @@ async fn the_empty_search_and_the_error_field_answer_from_the_derived_tables() {
         },
         RecencyCase {
             label: "Q5 { status = ok }",
-            q: "{ status = ok } | coalesce()",
+            q: "{ status = ok } | by(trace:id) | coalesce()",
             start_s: s,
             end_s: e,
             traces: vec![6],
@@ -4755,7 +4769,7 @@ async fn the_empty_search_and_the_error_field_answer_from_the_derived_tables() {
         },
         RecencyCase {
             label: "Q6 {} before the epoch",
-            q: "{} | coalesce()",
+            q: "{} | by(trace:id) | coalesce()",
             start_s: -2_000,
             end_s: -1_000,
             traces: vec![],
@@ -4826,12 +4840,12 @@ async fn the_candidate_ceiling_with_tail_and_gap_candidates() {
     );
     // Issue #591 part 3, section 7: this test pins today's engine's own
     // mechanics, which a covered query no longer reaches, so each query is
-    // kept on today's engine with ` | coalesce()`, which leaves a plain
+    // kept on today's engine with ` | by(trace:id) | coalesce()`, which leaves a plain
     // query's answer unchanged.
     let cases = vec![
         RecencyCase {
             label: "Q8 {} at a ceiling of 2",
-            q: "{} | coalesce()",
+            q: "{} | by(trace:id) | coalesce()",
             start_s: base - 600,
             end_s: base + 110,
             traces: vec![9, 8],
@@ -4842,7 +4856,7 @@ async fn the_candidate_ceiling_with_tail_and_gap_candidates() {
         },
         RecencyCase {
             label: "Q2c {} inside one bucket at a ceiling of 2",
-            q: "{} | coalesce()",
+            q: "{} | by(trace:id) | coalesce()",
             start_s: base + 60,
             end_s: base + 90,
             traces: vec![9],
