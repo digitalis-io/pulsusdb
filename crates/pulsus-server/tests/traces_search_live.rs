@@ -3364,7 +3364,7 @@ async fn one_request_with_an_attribute_condition_sends_three_statements() {
         // reads, one `select()` field and one aggregate argument. Before,
         // this query sent five statements.
         (
-            r#"{ resource.service.name = "checkout" } | avg(span.retries) > 1 | select(span.foo)"#,
+            r#"{ resource.service.name = "checkout" } | avg(span.retries) > 1 | select(span.foo) | by(trace:id) | coalesce()"#,
             2usize,
         ),
     ] {

@@ -7378,7 +7378,7 @@ async fn search_routed_answers_as_today_on_fixture_c() {
         drop_db(&db).await;
     }
     eprintln!("and {fixture_cases} fixture cases");
-    assert_eq!(names.len(), 90, "the inventory's new rows");
+    assert_eq!(names.len(), 96, "the inventory's new rows");
     assert!(
         wrong.is_empty(),
         "{} of {} differ:\n\n{}",
@@ -7531,7 +7531,15 @@ fn pipeline_fixtures(base_ns: i64) -> Vec<PipelineFixture> {
 /// filters and `select()` after a single filter, and part 2's `by()` and
 /// `coalesce()`, each answered by the search statement as by today's
 /// engine on fixture C.
-const PIPELINE_SHAPES_BEYOND_THE_CORPUS: [&str; 14] = [
+const PIPELINE_SHAPES_BEYOND_THE_CORPUS: [&str; 22] = [
+    "{ } | sum(span.a) > 0",
+    "{ } | min(span.a) < 100",
+    "{ } | max(span.a) > 0",
+    "{ } | avg(span.a) > 0",
+    "{ } | avg(duration) > 1ms",
+    "{ } | min(.a) < 10",
+    "{ } | count() > 2 | coalesce()",
+    r#"{ } | { status = error } | count() > 1 | select(span.a)"#,
     // One field per scope read off the span row: span `…0004` holds all
     // four, so a scope read from the wrong place changes the answer.
     r#"{ } | select(event.exception.type, link.relation, resource.k8s.pod.name, instrumentation.otel.scope.build)"#,
@@ -8559,6 +8567,767 @@ async fn search_routed_keeps_the_group_cap() {
             wrong.push(format!(
                 "{query} ({limit}) routed: want {want_routed}, got {routed}"
             ));
+        }
+    }
+    drop_db(&db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Issue #592 part 3's fixture: `(label, bodies, spans)`.
+fn agg_fixtures(base_ns: i64) -> Vec<(&'static str, Vec<ExportTraceServiceRequest>, u64)> {
+    const S: i64 = 1_000_000_000;
+    let at =
+        |trace: u8, span: u8, name: &str, t: i64, dur: i64, status: i32, attrs: Vec<KeyValue>| {
+            span_of(
+                vec![trace; 16],
+                vec![0, 0, 0, 0, 0, 0, 0, span],
+                Vec::new(),
+                name,
+                2,
+                base_ns + t * S,
+                dur,
+                attrs,
+                status,
+                Vec::new(),
+                Vec::new(),
+            )
+        };
+    let ok = |trace: u8, span: u8, t: i64| at(trace, span, "op", t, S / 10, 0, Vec::new());
+    let err = |trace: u8, span: u8, t: i64| at(trace, span, "op", t, S / 10, 2, Vec::new());
+    let n = |v: AnyValue| vec![kv("n", v)];
+    let with_resource = |mut body: ExportTraceServiceRequest, extra: Vec<KeyValue>| {
+        body.resource_spans[0]
+            .resource
+            .as_mut()
+            .unwrap()
+            .attributes
+            .extend(extra);
+        body
+    };
+    let ta19 = vec![
+        by_body(
+            "checkout",
+            vec![
+                ok(0xa1, 0x01, 1),
+                err(0xa1, 0x02, 2),
+                ok(0xa1, 0x03, 3),
+                ok(0xa1, 0x04, 4),
+                err(0xa1, 0x05, 5),
+                ok(0xa1, 0x06, 40),
+                ok(0xa2, 0x11, 10),
+                ok(0xa2, 0x12, 11),
+                ok(0xa2, 0x13, 12),
+                ok(0xa2, 0x14, 13),
+                ok(0xa2, 0x15, 14),
+                ok(0xa2, 0x16, 15),
+                ok(0xa3, 0x21, 20),
+                ok(0xa3, 0x22, 21),
+                err(0xa3, 0x23, 22),
+                ok(0xa3, 0x24, 23),
+                ok(0xa3, 0x25, 24),
+                err(0xa4, 0x31, 30),
+                ok(0xa4, 0x32, 31),
+                err(0xa4, 0x33, 32),
+                ok(0xa4, 0x34, 33),
+                err(0xa4, 0x35, 34),
+                ok(0xa4, 0x36, 35),
+                err(0xa4, 0x37, 36),
+            ],
+        ),
+        by_body("cart", vec![ok(0xa1, 0x07, 50)]),
+    ];
+    let ty =
+        |trace: u8, span: u8, t: i64, v: AnyValue| at(trace, span, "types", t, S / 10, 0, n(v));
+    let types = vec![by_body(
+        "svc",
+        vec![
+            ty(0xb1, 0x41, 40, int_value(1)),
+            ty(0xb1, 0x42, 41, int_value(2)),
+            ty(0xb2, 0x43, 42, int_value(1)),
+            ty(0xb2, 0x44, 43, double_value(2.5)),
+            ty(0xb3, 0x45, 44, str_value("5")),
+            ty(0xb3, 0x46, 45, str_value("abc")),
+            ty(0xb3, 0x47, 46, bool_value(true)),
+            ty(0xb4, 0x48, 47, int_value(7)),
+            ty(0xb4, 0x49, 48, double_value(7.0)),
+            ty(0xb5, 0x4a, 49, double_value(7.0)),
+            ty(0xb5, 0x4b, 50, int_value(7)),
+            ty(0xb6, 0x4c, 51, str_value("x")),
+            ty(0xb7, 0x4d, 52, str_value("+5")),
+            ty(0xb7, 0x4e, 53, str_value("5.")),
+            ty(0xb7, 0x4f, 54, str_value(" 5")),
+            ty(0xb7, 0x50, 55, str_value("1e2")),
+            ty(0xb7, 0x51, 56, str_value("e5")),
+            ty(0xb7, 0x52, 57, str_value("inf")),
+        ],
+    )];
+    let dur = vec![by_body(
+        "svc",
+        vec![
+            at(0xc1, 0x61, "dur", 60, 2 * S, 0, Vec::new()),
+            at(0xc1, 0x62, "dur", 61, 2 * S, 0, Vec::new()),
+            at(0xc1, 0x63, "dur", 62, 2 * S + S / 2, 0, Vec::new()),
+            at(0xc2, 0x64, "dur", 63, 1, 0, Vec::new()),
+            at(0xc2, 0x65, "dur", 64, 3, 0, Vec::new()),
+        ],
+    )];
+    let unsc = vec![
+        with_resource(
+            by_body(
+                "unsc1",
+                vec![at(0xd1, 0x71, "unsc", 70, S / 10, 0, Vec::new())],
+            ),
+            vec![kv("n", int_value(4))],
+        ),
+        with_resource(
+            by_body(
+                "unsc2",
+                vec![at(0xd2, 0x72, "unsc", 71, S / 10, 0, n(int_value(3)))],
+            ),
+            vec![kv("n", int_value(100))],
+        ),
+    ];
+    // fold: four spans five minutes apart, each its own insert, the last
+    // span first: the database reads them in parts and buckets, today's
+    // engine adds them in span order.
+    let fold = vec![
+        by_body(
+            "svc",
+            vec![at(
+                0xb8,
+                0x56,
+                "fold",
+                930,
+                S / 10,
+                0,
+                n(int_value(-9_007_199_254_740_991)),
+            )],
+        ),
+        by_body(
+            "svc",
+            vec![at(0xb8, 0x55, "fold", 620, S / 10, 0, n(int_value(1)))],
+        ),
+        by_body(
+            "svc",
+            vec![at(0xb8, 0x54, "fold", 310, S / 10, 0, n(int_value(1)))],
+        ),
+        by_body(
+            "svc",
+            vec![at(
+                0xb8,
+                0x53,
+                "fold",
+                0,
+                S / 10,
+                0,
+                n(int_value(9_007_199_254_740_991)),
+            )],
+        ),
+    ];
+    vec![
+        ("ta19", ta19, 25),
+        ("types", types, 18),
+        ("dur", dur, 5),
+        ("unsc", unsc, 2),
+        ("fold", fold, 4),
+    ]
+}
+
+/// Twenty minutes: the `fold` fixture's spans sit in four 5-minute buckets.
+const AGG_WINDOW_NS: i64 = 1_200_000_000_000;
+
+/// Seeds `agg_fixtures`' fixture `label` for `test`.
+async fn seed_agg_fixture(label: &str, test: &str, base_ns: i64) -> (String, ChClient) {
+    let (_, bodies, spans) = agg_fixtures(base_ns)
+        .into_iter()
+        .find(|(l, ..)| *l == label)
+        .unwrap_or_else(|| panic!("no fixture {label}"));
+    seed_both(
+        pulsus_testkit::test_db(&format!("pulsus_read_it_t592p3_{test}")),
+        &bodies,
+        spans,
+        &format!("t592p3-{label}"),
+    )
+    .await
+}
+
+/// Runs `cases` — query, literal answer, statements — over fixture
+/// `label`: each must be the statement's, equal today's answer and its
+/// literal, and issue the statements listed (1: the statement answered;
+/// more: it handed the request to today's engine).
+async fn check_agg_cases(label: &str, test: &str, cases: &[(&str, &str, Option<u64>)]) {
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let (db, client) = seed_agg_fixture(label, test, base_ns).await;
+    let engine = engine_of(&db).await;
+    let mut wrong = Vec::new();
+    for (query, literal, statements) in cases {
+        let plan = plan_of(
+            &engine,
+            &parse_query(query),
+            (base_ns, base_ns + AGG_WINDOW_NS),
+            20,
+            3,
+        );
+        let (today, routed, n) = routed_and_today(&engine, &client, &db, &plan).await;
+        if !covered(&plan) {
+            wrong.push(format!(
+                "{query}: today's engine's, must be the statement's"
+            ));
+        }
+        check_grouped(&mut wrong, query, &today, &routed, literal);
+        match statements {
+            Some(want) if n != *want => wrong.push(format!("{query}: {n} statements, want {want}")),
+            None if n < 2 => wrong.push(format!("{query}: {n} statement, want a hand-over")),
+            _ => {}
+        }
+    }
+    drop_db(&db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// `T-A19`: the aggregate counts the spans that reach it, the later filter
+/// keeps the error spans, and the trace is ranked by its newest checkout
+/// span; one statement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_a19_an_aggregate_then_a_later_filter_is_one_statement() {
+    skip_unless_live!();
+    check_agg_cases(
+        "ta19",
+        "ta19",
+        &[(
+            r#"{ resource.service.name = "checkout" } | count() > 5 | { status = error }"#,
+            "a1 2 [02, 05] {int:6 2 [02, 05]}; a4 4 [31, 33, 35] {int:7 4 [31, 33, 35]}",
+            Some(1),
+        )],
+    )
+    .await;
+}
+
+/// Each aggregate's value and wire type, as `aggregate_value` decides it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_aggregate_keeps_todays_value_and_type() {
+    skip_unless_live!();
+    check_agg_cases("types", "types", &[
+        (r#"{ name = "types" } | sum(span.n) > 0"#,
+         "b7 6 [4d, 4e, 4f] {double:110 6 [4d, 4e, 4f]}; b5 2 [4a, 4b] {double:14 2 [4a, 4b]}; b4 2 [48, 49] {double:14 2 [48, 49]}; b3 3 [45, 46, 47] {double:5 3 [45, 46, 47]}; b2 2 [43, 44] {double:3.5 2 [43, 44]}; b1 2 [41, 42] {int:3 2 [41, 42]}", Some(1)),
+        (r#"{ name = "types" } | min(span.n) > 0"#,
+         "b7 6 [4d, 4e, 4f] {double:5 6 [4d, 4e, 4f]}; b5 2 [4a, 4b] {double:7 2 [4a, 4b]}; b4 2 [48, 49] {int:7 2 [48, 49]}; b3 3 [45, 46, 47] {double:5 3 [45, 46, 47]}; b2 2 [43, 44] {int:1 2 [43, 44]}; b1 2 [41, 42] {int:1 2 [41, 42]}", Some(1)),
+        (r#"{ name = "types" } | max(span.n) > 0"#,
+         "b7 6 [4d, 4e, 4f] {double:100 6 [4d, 4e, 4f]}; b5 2 [4a, 4b] {double:7 2 [4a, 4b]}; b4 2 [48, 49] {int:7 2 [48, 49]}; b3 3 [45, 46, 47] {double:5 3 [45, 46, 47]}; b2 2 [43, 44] {double:2.5 2 [43, 44]}; b1 2 [41, 42] {int:2 2 [41, 42]}", Some(1)),
+        (r#"{ name = "types" } | avg(span.n) > 0"#,
+         "b7 6 [4d, 4e, 4f] {double:36.666666666666664 6 [4d, 4e, 4f]}; b5 2 [4a, 4b] {double:7 2 [4a, 4b]}; b4 2 [48, 49] {double:7 2 [48, 49]}; b3 3 [45, 46, 47] {double:5 3 [45, 46, 47]}; b2 2 [43, 44] {double:1.75 2 [43, 44]}; b1 2 [41, 42] {double:1.5 2 [41, 42]}", Some(1)),
+        (r#"{ name = "types" } | sum(span.n) < 1"#, "", Some(1)),
+        (r#"{ name = "types" } | count() = 2"#,
+         "b5 2 [4a, 4b] {int:2 2 [4a, 4b]}; b4 2 [48, 49] {int:2 2 [48, 49]}; b2 2 [43, 44] {int:2 2 [43, 44]}; b1 2 [41, 42] {int:2 2 [41, 42]}", Some(1)),
+        (r#"{ name = "types" } | count() != 2"#,
+         "b7 6 [4d, 4e, 4f] {int:6 6 [4d, 4e, 4f]}; b6 1 [4c] {int:1 1 [4c]}; b3 3 [45, 46, 47] {int:3 3 [45, 46, 47]}", Some(1)),
+        (r#"{ name = "types" } | coalesce() | sum(span.n) > 0"#,
+         "b7 6 [4d, 4e, 4f] {double:110 6 [4d, 4e, 4f]}; b5 2 [4a, 4b] {double:14 2 [4a, 4b]}; b4 2 [48, 49] {double:14 2 [48, 49]}; b3 3 [45, 46, 47] {double:5 3 [45, 46, 47]}; b2 2 [43, 44] {double:3.5 2 [43, 44]}; b1 2 [41, 42] {int:3 2 [41, 42]}", Some(1)),
+
+    ]).await;
+    check_agg_cases(
+        "dur",
+        "dur",
+        &[
+            (
+                r#"{ name = "dur" } | avg(duration) > 0ms"#,
+                "c2 2 [64, 65] {2ns 2 [64, 65]}; c1 3 [61, 62, 63] {2.166666666s 3 [61, 62, 63]}",
+                Some(1),
+            ),
+            (
+                r#"{ name = "dur" } | sum(duration) > 0ms"#,
+                "c2 2 [64, 65] {4ns 2 [64, 65]}; c1 3 [61, 62, 63] {6.5s 3 [61, 62, 63]}",
+                Some(1),
+            ),
+            (
+                r#"{ name = "dur" } | min(duration) > 0ms"#,
+                "c2 2 [64, 65] {1ns 2 [64, 65]}; c1 3 [61, 62, 63] {2s 3 [61, 62, 63]}",
+                Some(1),
+            ),
+            (
+                r#"{ name = "dur" } | max(duration) > 0ms"#,
+                "c2 2 [64, 65] {3ns 2 [64, 65]}; c1 3 [61, 62, 63] {2.5s 3 [61, 62, 63]}",
+                Some(1),
+            ),
+        ],
+    )
+    .await;
+    check_agg_cases(
+        "unsc",
+        "unsc",
+        &[(
+            r#"{ name = "unsc" } | min(.n) < 1000"#,
+            "d2 1 [72] {int:3 1 [72]}; d1 1 [71] {int:4 1 [71]}",
+            Some(1),
+        )],
+    )
+    .await;
+}
+
+/// A non-count aggregate written before a later filter sees every span
+/// that reached it; written after, only the spans the filter kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_non_count_aggregate_before_and_after_a_later_filter() {
+    skip_unless_live!();
+    check_agg_cases("ta19", "ta19_sum", &[
+        (r#"{ resource.service.name = "checkout" } | sum(duration) > 0ms | { status = error }"#,
+         "a1 2 [02, 05] {600ms 2 [02, 05]}; a4 4 [31, 33, 35] {700ms 4 [31, 33, 35]}; a3 1 [23] {500ms 1 [23]}", Some(1)),
+        (r#"{ resource.service.name = "checkout" } | { status = error } | sum(duration) > 0ms"#,
+         "a1 2 [02, 05] {200ms 2 [02, 05]}; a4 4 [31, 33, 35] {400ms 4 [31, 33, 35]}; a3 1 [23] {100ms 1 [23]}", Some(1)),
+    ]).await;
+}
+
+/// Float addition in today's order: (2^53 - 1) + 1 + 1 - (2^53 - 1) is 1,
+/// and their mean 0.25, where another order gives 2 and 0.5.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_float_sum_adds_in_todays_order() {
+    skip_unless_live!();
+    check_agg_cases(
+        "fold",
+        "fold",
+        &[
+            (
+                r#"{ name = "fold" } | sum(span.n) > 0"#,
+                "b8 4 [53, 54, 55] {int:1 4 [53, 54, 55]}",
+                Some(1),
+            ),
+            (
+                r#"{ name = "fold" } | avg(span.n) > 0"#,
+                "b8 4 [53, 54, 55] {double:0.25 4 [53, 54, 55]}",
+                Some(1),
+            ),
+        ],
+    )
+    .await;
+}
+
+/// One trace per entry, `trace [span key=value, …]`.
+fn selected_answer_of(
+    out: &Result<pulsus_read::traces::SearchOutput, pulsus_read::logql::ReadError>,
+) -> String {
+    use pulsus_read::traces::GroupValue;
+    match out {
+        Err(e) => format!("Err({e})"),
+        Ok(o) => o
+            .traces
+            .iter()
+            .map(|t| {
+                let spans: Vec<String> = t
+                    .spans
+                    .iter()
+                    .map(|s| {
+                        let attrs: Vec<String> = s
+                            .attributes
+                            .iter()
+                            .map(|a| {
+                                let v = match a.value() {
+                                    GroupValue::Str(s) => s.clone(),
+                                    GroupValue::Int(i) => format!("int:{i}"),
+                                    GroupValue::Double(b) => {
+                                        format!("double:{}", f64::from_bits(*b))
+                                    }
+                                    GroupValue::Bool(b) => format!("bool:{b}"),
+                                    GroupValue::Nil => "nil".to_string(),
+                                };
+                                format!("{}={v}", a.key())
+                            })
+                            .collect();
+                        format!("{:02x} {}", s.span_id[7], attrs.join(" "))
+                    })
+                    .collect();
+                format!("{:02x} [{}]", t.trace_id[15], spans.join(", "))
+            })
+            .collect::<Vec<_>>()
+            .join("; "),
+    }
+}
+
+/// Issue #592 part 3's off-path fixture: per scope — span, resource,
+/// event, link, instrumentation — one one-span trace holding `x` as bytes
+/// `d7 6d f8` (base64 `1234`) and one holding the list `{a: 1}`: traces
+/// and spans `a0`.. in that order, named `<scope>b` / `<scope>k`, a
+/// second apart. Then two controls: `aa` (`int`) a span `x = 5`; `ab`
+/// (`shadow`) a span list over a resource `x = 9`.
+fn off_scope_fixture(base_ns: i64) -> Vec<ExportTraceServiceRequest> {
+    const S: i64 = 1_000_000_000;
+    let bytes = || bytes_value(&[0xd7, 0x6d, 0xf8]);
+    let list = || kvlist_value(vec![kv("a", int_value(1))]);
+    let mut bodies = Vec::new();
+    for (i, scope) in ["span", "resource", "event", "link", "instrumentation"]
+        .into_iter()
+        .enumerate()
+    {
+        for (j, (tag, value)) in [("b", bytes()), ("k", list())].into_iter().enumerate() {
+            let id = 0xa0 + (2 * i + j) as u8;
+            let at = base_ns + i64::from(id - 0xa0 + 1) * S;
+            let held = vec![kv("x", value)];
+            let (attrs, events, links) = match scope {
+                "span" => (held.clone(), Vec::new(), Vec::new()),
+                "event" => (
+                    Vec::new(),
+                    vec![span::Event {
+                        time_unix_nano: at as u64,
+                        name: "e".into(),
+                        attributes: held.clone(),
+                        dropped_attributes_count: 0,
+                    }],
+                    Vec::new(),
+                ),
+                "link" => (
+                    Vec::new(),
+                    Vec::new(),
+                    vec![span::Link {
+                        trace_id: vec![0x77; 16],
+                        span_id: vec![0x77; 8],
+                        trace_state: String::new(),
+                        attributes: held.clone(),
+                        dropped_attributes_count: 0,
+                        flags: 0,
+                    }],
+                ),
+                _ => (Vec::new(), Vec::new(), Vec::new()),
+            };
+            let mut body = by_body(
+                "svc",
+                vec![span_of(
+                    vec![id; 16],
+                    vec![0, 0, 0, 0, 0, 0, 0, id],
+                    Vec::new(),
+                    &format!("{scope}{tag}"),
+                    2,
+                    at,
+                    S / 10,
+                    attrs,
+                    0,
+                    events,
+                    links,
+                )],
+            );
+            match scope {
+                "resource" => body.resource_spans[0]
+                    .resource
+                    .as_mut()
+                    .unwrap()
+                    .attributes
+                    .extend(held),
+                "instrumentation" => body.resource_spans[0].scope_spans[0]
+                    .scope
+                    .as_mut()
+                    .unwrap()
+                    .attributes
+                    .extend(held),
+                _ => {}
+            }
+            bodies.push(body);
+        }
+    }
+    let one = |id: u8, name: &str, x: AnyValue| {
+        span_of(
+            vec![id; 16],
+            vec![0, 0, 0, 0, 0, 0, 0, id],
+            Vec::new(),
+            name,
+            2,
+            base_ns + i64::from(id - 0xa0 + 1) * S,
+            S / 10,
+            vec![kv("x", x)],
+            0,
+            Vec::new(),
+            Vec::new(),
+        )
+    };
+    bodies.push(by_body("svc", vec![one(0xaa, "int", int_value(5))]));
+    let mut shadow = by_body("svc", vec![one(0xab, "shadow", list())]);
+    shadow.resource_spans[0]
+        .resource
+        .as_mut()
+        .unwrap()
+        .attributes
+        .push(kv("x", int_value(9)));
+    bodies.push(shadow);
+    bodies
+}
+
+/// How a row of [`OFF_SCOPE_ROWS`] must be answered.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Route {
+    /// The statement hands the request to today's engine.
+    HandOver,
+    /// Today's engine answers it before the fork (an aggregate over a
+    /// scope the statement does not serve, section 3.1).
+    Refused,
+    /// The statement answers it, one statement.
+    Statement,
+}
+
+/// `(query, literal answer, route)`. A `select()` row's literal is
+/// [`selected_answer_of`]'s, an aggregate's [`grouped_answer_of`]'s.
+const OFF_SCOPE_ROWS: &[(&str, &str, Route)] = &[
+    (
+        r#"{ name = "spanb" } | select(span.x)"#,
+        r#"a0 [a0 x=1234]"#,
+        Route::HandOver,
+    ),
+    (
+        r#"{ name = "spanb" } | select(.x)"#,
+        r#"a0 [a0 x=1234]"#,
+        Route::HandOver,
+    ),
+    (
+        r#"{ name = "spanb" } | min(span.x) < 10000"#,
+        r#"a0 1 [a0] {double:1234 1 [a0]}"#,
+        Route::HandOver,
+    ),
+    (
+        r#"{ name = "spanb" } | min(.x) < 10000"#,
+        r#"a0 1 [a0] {double:1234 1 [a0]}"#,
+        Route::HandOver,
+    ),
+    (
+        r#"{ name = "spank" } | select(span.x)"#,
+        r#"a1 [a1 x={"a":1}]"#,
+        Route::HandOver,
+    ),
+    (
+        r#"{ name = "spank" } | select(.x)"#,
+        r#"a1 [a1 x={"a":1}]"#,
+        Route::HandOver,
+    ),
+    (
+        r#"{ name = "spank" } | min(span.x) < 10000"#,
+        r#""#,
+        Route::HandOver,
+    ),
+    (
+        r#"{ name = "spank" } | min(.x) < 10000"#,
+        r#""#,
+        Route::HandOver,
+    ),
+    (
+        r#"{ name = "resourceb" } | select(resource.x)"#,
+        r#"a2 [a2 x=1234]"#,
+        Route::HandOver,
+    ),
+    (
+        r#"{ name = "resourceb" } | select(.x)"#,
+        r#"a2 [a2 x=1234]"#,
+        Route::HandOver,
+    ),
+    (
+        r#"{ name = "resourceb" } | min(resource.x) < 10000"#,
+        r#"a2 1 [a2] {double:1234 1 [a2]}"#,
+        Route::Refused,
+    ),
+    (
+        r#"{ name = "resourceb" } | min(.x) < 10000"#,
+        r#"a2 1 [a2] {double:1234 1 [a2]}"#,
+        Route::HandOver,
+    ),
+    (
+        r#"{ name = "resourcek" } | select(resource.x)"#,
+        r#"a3 [a3 x={"a":1}]"#,
+        Route::HandOver,
+    ),
+    (
+        r#"{ name = "resourcek" } | select(.x)"#,
+        r#"a3 [a3 x={"a":1}]"#,
+        Route::HandOver,
+    ),
+    (
+        r#"{ name = "resourcek" } | min(resource.x) < 10000"#,
+        r#""#,
+        Route::Refused,
+    ),
+    (
+        r#"{ name = "resourcek" } | min(.x) < 10000"#,
+        r#""#,
+        Route::HandOver,
+    ),
+    (
+        r#"{ name = "eventb" } | select(event.x)"#,
+        r#"a4 [a4 x=1234]"#,
+        Route::HandOver,
+    ),
+    (
+        r#"{ name = "eventb" } | select(.x)"#,
+        r#"a4 [a4 x=1234]"#,
+        Route::HandOver,
+    ),
+    (
+        r#"{ name = "eventb" } | min(event.x) < 10000"#,
+        r#"a4 1 [a4] {double:1234 1 [a4]}"#,
+        Route::Refused,
+    ),
+    (
+        r#"{ name = "eventb" } | min(.x) < 10000"#,
+        r#"a4 1 [a4] {double:1234 1 [a4]}"#,
+        Route::HandOver,
+    ),
+    (
+        r#"{ name = "eventk" } | select(event.x)"#,
+        r#"a5 [a5 x={"a":1}]"#,
+        Route::HandOver,
+    ),
+    (
+        r#"{ name = "eventk" } | select(.x)"#,
+        r#"a5 [a5 x={"a":1}]"#,
+        Route::HandOver,
+    ),
+    (
+        r#"{ name = "eventk" } | min(event.x) < 10000"#,
+        r#""#,
+        Route::Refused,
+    ),
+    (
+        r#"{ name = "eventk" } | min(.x) < 10000"#,
+        r#""#,
+        Route::HandOver,
+    ),
+    (
+        r#"{ name = "linkb" } | select(link.x)"#,
+        r#"a6 [a6 x=1234]"#,
+        Route::HandOver,
+    ),
+    (
+        r#"{ name = "linkb" } | select(.x)"#,
+        r#"a6 [a6 x=1234]"#,
+        Route::HandOver,
+    ),
+    (
+        r#"{ name = "linkb" } | min(link.x) < 10000"#,
+        r#"a6 1 [a6] {double:1234 1 [a6]}"#,
+        Route::Refused,
+    ),
+    (
+        r#"{ name = "linkb" } | min(.x) < 10000"#,
+        r#"a6 1 [a6] {double:1234 1 [a6]}"#,
+        Route::HandOver,
+    ),
+    (
+        r#"{ name = "linkk" } | select(link.x)"#,
+        r#"a7 [a7 x={"a":1}]"#,
+        Route::HandOver,
+    ),
+    (
+        r#"{ name = "linkk" } | select(.x)"#,
+        r#"a7 [a7 x={"a":1}]"#,
+        Route::HandOver,
+    ),
+    (
+        r#"{ name = "linkk" } | min(link.x) < 10000"#,
+        r#""#,
+        Route::Refused,
+    ),
+    (
+        r#"{ name = "linkk" } | min(.x) < 10000"#,
+        r#""#,
+        Route::HandOver,
+    ),
+    (
+        r#"{ name = "instrumentationb" } | select(instrumentation.x)"#,
+        r#"a8 [a8 x=1234]"#,
+        Route::HandOver,
+    ),
+    (
+        r#"{ name = "instrumentationb" } | select(.x)"#,
+        r#"a8 [a8 x=1234]"#,
+        Route::HandOver,
+    ),
+    (
+        r#"{ name = "instrumentationb" } | min(instrumentation.x) < 10000"#,
+        r#"a8 1 [a8] {double:1234 1 [a8]}"#,
+        Route::Refused,
+    ),
+    (
+        r#"{ name = "instrumentationb" } | min(.x) < 10000"#,
+        r#"a8 1 [a8] {double:1234 1 [a8]}"#,
+        Route::HandOver,
+    ),
+    (
+        r#"{ name = "instrumentationk" } | select(instrumentation.x)"#,
+        r#"a9 [a9 x={"a":1}]"#,
+        Route::HandOver,
+    ),
+    (
+        r#"{ name = "instrumentationk" } | select(.x)"#,
+        r#"a9 [a9 x={"a":1}]"#,
+        Route::HandOver,
+    ),
+    (
+        r#"{ name = "instrumentationk" } | min(instrumentation.x) < 10000"#,
+        r#""#,
+        Route::Refused,
+    ),
+    (
+        r#"{ name = "instrumentationk" } | min(.x) < 10000"#,
+        r#""#,
+        Route::HandOver,
+    ),
+    (
+        r#"{ name = "int" } | select(span.x)"#,
+        r#"aa [aa x=int:5]"#,
+        Route::Statement,
+    ),
+    (
+        r#"{ name = "shadow" } | min(.x) < 10000"#,
+        r#""#,
+        Route::HandOver,
+    ),
+];
+
+/// Every scope, scoped and unscoped, bytes and a key-value list, through
+/// an aggregate and `select()`: each answer is today's and its literal,
+/// routed as the row says.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_off_path_value_at_any_scope_is_answered_as_today() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let bodies = off_scope_fixture(base_ns);
+    let (db, client) = seed_both(
+        pulsus_testkit::test_db("pulsus_read_it_t592p3_offscope"),
+        &bodies,
+        12,
+        "t592p3-offscope",
+    )
+    .await;
+    let engine = engine_of(&db).await;
+    let mut wrong = Vec::new();
+    for (query, literal, route) in OFF_SCOPE_ROWS {
+        let plan = plan_of(
+            &engine,
+            &parse_query(query),
+            (base_ns, base_ns + 60_000_000_000),
+            20,
+            3,
+        );
+        let (today, routed, n) = routed_and_today(&engine, &client, &db, &plan).await;
+        let answer =
+            |o: &Result<pulsus_read::traces::SearchOutput, pulsus_read::logql::ReadError>| {
+                if query.contains("select(") {
+                    selected_answer_of(o)
+                } else {
+                    grouped_answer_of(o)
+                }
+            };
+        if format!("{today:?}") != format!("{routed:?}") {
+            wrong.push(format!(
+                "{query}\n  today:  {}\n  routed: {}",
+                answer(&today),
+                answer(&routed)
+            ));
+        } else if answer(&routed) != *literal {
+            wrong.push(format!(
+                "{query}\n  literal: {literal}\n  both:    {}",
+                answer(&routed)
+            ));
+        }
+        let got = match (covered(&plan), n) {
+            (false, _) => Route::Refused,
+            (true, 1) => Route::Statement,
+            (true, _) => Route::HandOver,
+        };
+        if got != *route {
+            wrong.push(format!("{query}: {got:?} ({n} statements), want {route:?}"));
         }
     }
     drop_db(&db).await;

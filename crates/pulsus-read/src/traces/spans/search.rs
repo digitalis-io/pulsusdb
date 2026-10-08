@@ -193,6 +193,53 @@ FROM (SELECT trace_id, max(g_last) AS last, sum(g_matched) AS matched,
       GROUP BY trace_id) AS m
 {trace_read}";
 
+/// One filter, the selector, then one aggregate stage with filters before
+/// and after it (issue #592 part 3). The top-K is part 1's, over traces,
+/// keeping a trace when its spans that reached the aggregate (`{before}`)
+/// pass it (`{pass}`) and a span passes every filter (`{later}`). The
+/// detail read carries the aggregate's response value as one group
+/// holding the trace's surviving spans.
+const SEARCH_AGGREGATED: &str = r"WITH (SELECT (groupArray(trace_id), groupArray(keys))
+      FROM (SELECT trace_id, max(start_ns) AS last,
+                   groupUniqArray(intDiv(start_ns, 300000000000)) AS keys
+            FROM {spans}
+            WHERE {time}
+              AND {bucket}
+              AND {day}
+              AND ({predicate}){demand}
+            GROUP BY trace_id
+            HAVING countIf({before}) > 0 AND ({pass}) AND countIf({later}) > 0
+            ORDER BY last DESC, trace_id ASC
+            LIMIT {limit})) AS top
+SELECT m.trace_id AS trace_id, t.root_service AS root_service, t.root_name AS root_name,
+       t.start_ns AS start_ns, t.end_ns - t.start_ns AS duration_ns,
+       m.last AS last, m.matched AS matched, m.spans AS spans,
+       [(m.agg_text, m.agg_type, m.matched, m.spans)] AS groups
+FROM (SELECT trace_id, max(start_ns) AS last, countIf({later}) AS matched,
+             arraySlice(arraySort(x -> (x.2, x.1),
+                        groupArrayIf((span_id, start_ns, duration_ns, service, {projection}), {later})), 1, {spss}) AS spans,
+             {agg_text} AS agg_text, {agg_type} AS agg_type
+      FROM {spans}
+      WHERE (intDiv(start_ns, 300000000000), trace_id) IN
+            (SELECT arrayJoin(arrayFlatten(arrayMap((t, ks) -> arrayMap(k -> (k, t), ks), top.1, top.2))))
+        AND {time}
+        AND {bucket}
+        AND {day}
+        AND ({predicate}){demand}
+      GROUP BY trace_id) AS m
+{trace_read}";
+
+/// The message of an aggregate argument's off-path demand (issue #592
+/// part 3).
+pub const AGGREGATE_OFF_PATH_DEMAND: &str =
+    "an aggregate value held off its own path is answered by the old engine (issue #592)";
+
+/// The message of a projected value's off-path demand (issue #592 part
+/// 3): `select(k)` or `{ k != nil }` where a span holds `k` as a key-value
+/// list or bytes, whose JSON or base64 today's engine returns.
+pub const SELECT_OFF_PATH_DEMAND: &str =
+    "a selected value held off its own path is answered by the old engine (issue #592)";
+
 /// The message of a `by()` key's off-path demand (issue #592 part 2): the
 /// statement cannot read a key-value list's or bytes' value as the key's,
 /// so the request goes to today's engine.
@@ -287,6 +334,26 @@ pub enum SearchFilter {
         all: Option<SpanPredicate>,
         key: GroupKeySql,
     },
+    /// One `{ … }`, the selector, then one aggregate stage (issue #592
+    /// part 3): `before` is the AND of the filters before it, `all` of
+    /// every later filter, and `agg` the aggregate's SQL over `before`.
+    Aggregated {
+        selector: SpanPredicate,
+        before: Option<SpanPredicate>,
+        all: Option<SpanPredicate>,
+        agg: AggregateSql,
+    },
+}
+
+/// One aggregate stage's SQL over a trace's spans (issue #592 part 3): the
+/// pass, and the response value as `(text, type)` for
+/// [`aggregate_value`]; `off_path` as [`GroupKeySql::off_path`].
+#[derive(Debug, Clone)]
+pub struct AggregateSql {
+    pub pass: String,
+    pub text: String,
+    pub value_type: String,
+    pub off_path: Option<String>,
 }
 
 impl SearchFilter {
@@ -296,6 +363,12 @@ impl SearchFilter {
             SearchFilter::Later { selector, later } => vec![selector, later],
             SearchFilter::Tree { filters, .. } => filters.iter().collect(),
             SearchFilter::Grouped {
+                selector,
+                before,
+                all,
+                ..
+            }
+            | SearchFilter::Aggregated {
                 selector,
                 before,
                 all,
@@ -534,6 +607,32 @@ pub fn search_sql(
             ]);
             fill(SEARCH_GROUPED, &values)
         }
+        SearchFilter::Aggregated {
+            selector,
+            before,
+            all,
+            agg,
+        } => {
+            let pre = before.as_ref().map_or("true", |p| p.sql());
+            let later = all.as_ref().map_or("true", |p| p.sql());
+            let demand = agg.off_path.as_ref().map_or_else(String::new, |off| {
+                format!(
+                    "\n              AND throwIf(({pre}) AND ({off}), {}) = 0",
+                    crate::logql::escape::ch_string(AGGREGATE_OFF_PATH_DEMAND)
+                )
+            });
+            let mut values: Vec<(&str, &str)> = common.to_vec();
+            values.extend([
+                ("predicate", selector.sql()),
+                ("before", pre),
+                ("later", later),
+                ("pass", agg.pass.as_str()),
+                ("agg_text", agg.text.as_str()),
+                ("agg_type", agg.value_type.as_str()),
+                ("demand", demand.as_str()),
+            ]);
+            fill(SEARCH_AGGREGATED, &values)
+        }
     }
 }
 
@@ -553,6 +652,10 @@ pub struct SearchStatement {
 pub struct Grouping {
     pub display: String,
     pub coalesced: bool,
+    /// An aggregate stage's value rather than a `by()` key (issue #592
+    /// part 3): decoded by [`aggregate_value`] and never counted against
+    /// the distinct-group cap.
+    pub aggregate: bool,
 }
 
 impl SearchStatement {
@@ -588,6 +691,9 @@ struct Pipeline<'a> {
     by: Option<(&'a Field, GroupKeySql)>,
     coalesced: bool,
     selected: Vec<Field>,
+    /// The one aggregate stage (issue #592 part 3); `before` then holds the
+    /// filters written before it.
+    aggregate: Option<&'a PipelineStage>,
 }
 
 /// [`Pipeline`] of `query`. Only a single `{…}` selector followed by later
@@ -608,13 +714,14 @@ fn pipeline_of(query: &Query) -> Result<Pipeline<'_>, PlanError> {
         by: None,
         coalesced: false,
         selected: Vec::new(),
+        aggregate: None,
     };
     let mut coalesce_seen = false;
     for stage in &query.pipeline {
         match stage {
             PipelineStage::Filter(SpansetExpr::Filter(f)) => {
                 if let Some(body) = f.body.as_ref() {
-                    if out.by.is_none() {
+                    if out.by.is_none() && out.aggregate.is_none() {
                         out.before.push(body);
                     }
                     out.all.push(body);
@@ -625,6 +732,9 @@ fn pipeline_of(query: &Query) -> Result<Pipeline<'_>, PlanError> {
             }
             PipelineStage::Select { fields } => out.selected.extend(fields.iter().cloned()),
             PipelineStage::By { key } => {
+                if out.aggregate.is_some() {
+                    return Err(refused("a by() stage with an aggregate", "#592"));
+                }
                 if out.by.is_some() {
                     return Err(refused("a second by() stage", "#592"));
                 }
@@ -641,12 +751,18 @@ fn pipeline_of(query: &Query) -> Result<Pipeline<'_>, PlanError> {
             }
             PipelineStage::Coalesce => {
                 coalesce_seen = true;
-                if out.by.is_some() {
+                if out.by.is_some() || out.aggregate.is_some() {
                     out.coalesced = true;
                 }
             }
             PipelineStage::Aggregate { .. } => {
-                return Err(refused("an aggregate stage", "#592 part 3"));
+                if out.by.is_some() {
+                    return Err(refused("an aggregate with a by() stage", "#592"));
+                }
+                if out.aggregate.is_some() {
+                    return Err(refused("a second aggregate stage", "#592"));
+                }
+                out.aggregate = Some(stage);
             }
             PipelineStage::Metric(_)
             | PipelineStage::MetricSecondStage(_)
@@ -676,6 +792,231 @@ fn later_body(later: &[&FieldExpr]) -> Option<FieldExpr> {
     }))
 }
 
+/// A number as today's writer reads one from an attribute's stored text:
+/// Rust's `f64` grammar, finite (`numeric_val_num`).
+const NUMBER_TEXT: &str = "[+-]?([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?";
+
+/// Issue #592 part 3: one aggregate stage's SQL over the spans `cond`
+/// keeps, by today's `aggregate_value` (`search_eval.rs`): the pass is the
+/// scalar compared with the planner's own threshold; the response value
+/// is `count()` an `Int64`, a duration in nanoseconds (`DurationI` exact,
+/// `DurationF` from the `f64` sum), an attribute's `min`/`max` `AggInt`
+/// when the first span holding the extreme stored an `Int64`, its `sum`
+/// `AggInt` when every contributor did, and otherwise `AggDouble`.
+fn aggregate_sql(
+    op: pulsus_traceql::AggregateOp,
+    field: Option<&FieldExpr>,
+    cmp: pulsus_traceql::ComparisonOp,
+    value: &pulsus_traceql::Value,
+    cond: &str,
+    ctx: &PredicateCtx<'_>,
+) -> Result<AggregateSql, PlanError> {
+    use pulsus_traceql::{AggregateOp as A, ComparisonOp as C};
+    let threshold = crate::traces::search_plan::aggregate_threshold(op, &field.cloned(), value)?;
+    let sql_op = match cmp {
+        C::Eq => "=",
+        C::Neq => "!=",
+        C::Gt => ">",
+        C::Gte => ">=",
+        C::Lt => "<",
+        C::Lte => "<=",
+        C::Re | C::Nre => {
+            return Err(PlanError::TypeMismatch(
+                "aggregate filters do not support regex operators".to_string(),
+            ));
+        }
+    };
+    let t = format!("toFloat64('{threshold:?}')");
+    let refuse = |what: String| {
+        PlanError::UnsupportedField(format!(
+            "{what} is not supported by the search statement (issue #592)"
+        ))
+    };
+    let out = |scalar: String, contributors: String, text: String, value_type: String, off_path| {
+        AggregateSql {
+            pass: format!("{contributors} > 0 AND ({scalar}) {sql_op} {t}"),
+            text,
+            value_type,
+            off_path,
+        }
+    };
+    Ok(match (op, field) {
+        (A::Count, None) => out(
+            format!("toFloat64(countIf({cond}))"),
+            format!("countIf({cond})"),
+            format!("toString(countIf({cond}))"),
+            "'Int64'".to_string(),
+            None,
+        ),
+        (_, Some(FieldExpr::Field(Field::Intrinsic(pulsus_traceql::Intrinsic::Duration)))) => {
+            let fsum = ordered_sum("toFloat64(duration_ns)", cond);
+            let (scalar, text, ty) = match op {
+                A::Sum => (fsum.clone(), format!("toString({fsum})"), "'DurationF'"),
+                A::Avg => (
+                    format!("{fsum} / countIf({cond})"),
+                    format!("toString(intDiv(sumIf(duration_ns, {cond}), countIf({cond})))"),
+                    "'DurationI'",
+                ),
+                A::Min => (
+                    format!("toFloat64(minIf(duration_ns, {cond}))"),
+                    format!("toString(minIf(duration_ns, {cond}))"),
+                    "'DurationI'",
+                ),
+                A::Max => (
+                    format!("toFloat64(maxIf(duration_ns, {cond}))"),
+                    format!("toString(maxIf(duration_ns, {cond}))"),
+                    "'DurationI'",
+                ),
+                A::Count => return Err(refuse(format!("{op}(duration)"))),
+            };
+            out(
+                scalar,
+                format!("countIf({cond})"),
+                text,
+                ty.to_string(),
+                None,
+            )
+        }
+        (_, Some(FieldExpr::Field(f @ Field::Attribute { scope, key }))) => {
+            let Some((text_sql, kind)) = super::projection::aggregate_argument_sql(f, ctx)? else {
+                return Err(refuse(format!("{op}({f})")));
+            };
+            let plain = format!("replaceRegexpOne({text_sql}, '^[+]', '')");
+            let number = crate::traces::filter::anchored_regex_sql(NUMBER_TEXT)?;
+            let v = format!(
+                "if(match({text_sql}, {number}) AND isFinite(toFloat64OrZero({plain})), \
+                 toFloat64OrZero({plain}), NULL)"
+            );
+            let contrib = format!("({cond}) AND isNotNull({v})");
+            let (scalar, ty) = match op {
+                A::Sum => (
+                    ordered_sum(&format!("assumeNotNull({v})"), &contrib),
+                    format!(
+                        "if(countIf(({contrib}) AND ({kind}) != 'Int64') = 0, 'AggInt', 'AggDouble')"
+                    ),
+                ),
+                A::Avg => (
+                    format!(
+                        "{} / countIf({contrib})",
+                        ordered_sum(&format!("assumeNotNull({v})"), &contrib)
+                    ),
+                    "'AggDouble'".to_string(),
+                ),
+                A::Min => (
+                    format!("minIf(assumeNotNull({v}), {contrib})"),
+                    format!(
+                        "if(argMinIf({kind}, (assumeNotNull({v}), start_ns, span_id), {contrib}) = 'Int64', 'AggInt', 'AggDouble')"
+                    ),
+                ),
+                A::Max => (
+                    format!("maxIf(assumeNotNull({v}), {contrib})"),
+                    format!(
+                        "if(argMinIf({kind}, (-assumeNotNull({v}), start_ns, span_id), {contrib}) = 'Int64', 'AggInt', 'AggDouble')"
+                    ),
+                ),
+                A::Count => return Err(refuse(format!("{op}({f})"))),
+            };
+            let off_path = Some(off_path_at(*scope, key, ctx));
+            out(
+                scalar.clone(),
+                format!("countIf({contrib})"),
+                format!("toString({scalar})"),
+                ty,
+                off_path,
+            )
+        }
+        _ => {
+            return Err(refuse(format!(
+                "{op}({})",
+                field.map_or_else(String::new, |f| f.to_string())
+            )));
+        }
+    })
+}
+
+/// Issue #592 part 3: `key` held off its typed path at `scope` — a
+/// key-value list flattened under the key (its sub-object is not empty) or
+/// a value in that scope's `attrs_other`. The unscoped key tests every
+/// scope of the chain: the span, its resource row, an event, a link, the
+/// instrumentation scope. Today's engine reads the key's holder whatever
+/// its kind, so any such holder hands the request over.
+pub(super) fn off_path_at(
+    scope: pulsus_traceql::AttrScope,
+    key: &str,
+    ctx: &PredicateCtx<'_>,
+) -> String {
+    use pulsus_traceql::AttrScope as S;
+    let lit = crate::logql::escape::ch_string(key);
+    let path = pulsus_clickhouse::json_column::escape_json_path(key);
+    let ident = crate::logql::escape::ch_ident(&path);
+    let one = |root: &str, other: &str| {
+        format!(
+            "(dynamicType({root}.{ident}) = 'None' AND (position({other}, {lit}) > 0 \
+             OR toString({root}.^{ident}) != '{{}}'))"
+        )
+    };
+    let set = |arr: &str| {
+        format!(
+            "arrayExists((d, s, o) -> dynamicType(d) = 'None' AND (position(o, {lit}) > 0 \
+             OR toString(s) != '{{}}'), {arr}.attrs.{ident}, {arr}.attrs.^{ident}, {arr}.attrs_other)"
+        )
+    };
+    let resource = format!(
+        "resource_id IN (SELECT resource_id FROM {} WHERE {} AND {})",
+        ctx.resources_table,
+        ctx.window.resources_day_clause(),
+        one("attrs", "attrs_other"),
+    );
+    match scope {
+        S::Span => one("attrs", "attrs_other"),
+        S::Resource => resource,
+        S::Event => set("events"),
+        S::Link => set("links"),
+        S::Instrumentation => one("scope_attrs", "scope_attrs_other"),
+        S::Unscoped => format!(
+            "({} OR {} OR {} OR {} OR {})",
+            off_path_at(S::Span, key, ctx),
+            off_path_at(S::Resource, key, ctx),
+            off_path_at(S::Event, key, ctx),
+            off_path_at(S::Link, key, ctx),
+            off_path_at(S::Instrumentation, key, ctx),
+        ),
+    }
+}
+
+/// The `f64` sum of `x` over the spans `cond` keeps, added in today's
+/// order — the spanset's, ascending `(start_ns, span_id)` — from `-0.0`,
+/// as `Iterator::sum` folds it: float addition is not associative, so a
+/// sum the database adds in its own order can differ in the last bits.
+fn ordered_sum(x: &str, cond: &str) -> String {
+    format!(
+        "arrayFold((acc, e) -> acc + e.1, arraySort(e -> (e.2, e.3), \
+         groupArrayIf(({x}, start_ns, span_id), {cond})), toFloat64('-0'))"
+    )
+}
+
+/// An aggregate's response value (issue #592 part 3), as today's
+/// `aggregate_value` builds its wire: a count and an `AggInt` as an `Int`
+/// (an `f64` cast as today casts it), an `AggDouble` as its raw bits, a
+/// duration as Go's duration text.
+pub(crate) fn aggregate_value(text: &str, value_type: &str) -> Result<GroupValue, String> {
+    let f = || {
+        text.parse::<f64>()
+            .map_err(|e| format!("aggregate {text:?}: {e}"))
+    };
+    Ok(match value_type {
+        "Int64" => GroupValue::Int(text.parse().map_err(|e| format!("count {text:?}: {e}"))?),
+        "AggInt" => GroupValue::Int(f()? as i64),
+        "AggDouble" => GroupValue::Double(f()?.to_bits()),
+        "DurationI" => GroupValue::Str(crate::traces::search_eval::go_duration_string(
+            text.parse()
+                .map_err(|e| format!("duration {text:?}: {e}"))?,
+        )),
+        "DurationF" => GroupValue::Str(crate::traces::search_eval::go_duration_string(f()? as i64)),
+        other => return Err(format!("an aggregate value of type {other} is not decoded")),
+    })
+}
+
 /// Compiles `query` to the search statement. Its `|` stages are
 /// [`pipeline_of`]'s; a structural operator is #593's; a set field projected from a
 /// comparison that holds it twice beside arithmetic, or under `!` or inside
@@ -698,7 +1039,34 @@ pub fn compile_search(
             .transpose()
     };
     let mut grouping = None;
-    if let Some((field, key)) = &pipeline.by {
+    if let Some(PipelineStage::Aggregate {
+        op,
+        field,
+        cmp,
+        value,
+    }) = pipeline.aggregate
+    {
+        let SearchFilter::One(selector) = filter else {
+            unreachable!("pipeline_of refuses a stage after anything but one filter")
+        };
+        let before = compiled(&pipeline.before)?;
+        let cond = before.as_ref().map_or("true", |p| p.sql()).to_string();
+        let agg = aggregate_sql(*op, field.as_ref(), *cmp, value, &cond, ctx)?;
+        filter = SearchFilter::Aggregated {
+            selector,
+            before,
+            all: compiled(&pipeline.all)?,
+            agg,
+        };
+        grouping = Some(Grouping {
+            display: match field {
+                Some(FieldExpr::Field(f)) => format!("{op}({f})"),
+                _ => format!("{op}()"),
+            },
+            coalesced: pipeline.coalesced,
+            aggregate: true,
+        });
+    } else if let Some((field, key)) = &pipeline.by {
         let SearchFilter::One(selector) = filter else {
             unreachable!("pipeline_of refuses a stage after anything but one filter")
         };
@@ -711,6 +1079,7 @@ pub fn compile_search(
         grouping = Some(Grouping {
             display: format!("by({field})"),
             coalesced: pipeline.coalesced,
+            aggregate: false,
         });
     } else if let Some(later) = compiled(&pipeline.all)? {
         let SearchFilter::One(selector) = filter else {
@@ -735,6 +1104,14 @@ pub fn compile_search(
         && key.off_path.is_some()
     {
         demands.push(OFF_PATH_DEMAND.to_string());
+    }
+    if let SearchFilter::Aggregated { agg, .. } = &filter
+        && agg.off_path.is_some()
+    {
+        demands.push(AGGREGATE_OFF_PATH_DEMAND.to_string());
+    }
+    if projection.has_off_path() {
+        demands.push(SELECT_OFF_PATH_DEMAND.to_string());
     }
     let sql = search_sql(
         spans_table,
@@ -893,10 +1270,19 @@ pub(crate) fn decode_search_grouped_charged(
     counter: &mut GroupCardinalityCounter,
 ) -> Result<SearchOutput, ReadError> {
     let decode = |m: String| ReadError::Clickhouse(ChError::Decode(m));
-    for row in &rows {
-        for g in &row.groups {
-            let value = group_value(&g.value, &g.value_type).map_err(decode)?;
-            counter.observe(&vec![value], budget)?;
+    let value_of = |g: &SearchGroupTuple| {
+        if grouping.aggregate {
+            aggregate_value(&g.value, &g.value_type)
+        } else {
+            group_value(&g.value, &g.value_type)
+        }
+    };
+    if !grouping.aggregate {
+        for row in &rows {
+            for g in &row.groups {
+                let value = group_value(&g.value, &g.value_type).map_err(decode)?;
+                counter.observe(&vec![value], budget)?;
+            }
         }
     }
     let mut trace_rows = Vec::with_capacity(rows.len());
@@ -923,16 +1309,19 @@ pub(crate) fn decode_search_grouped_charged(
             budget.charge(groups_reserve_bytes(kept.len()))?;
             let mut built = Vec::with_capacity(kept.len());
             for g in kept {
+                // An aggregate's value is built, then charged, as today's
+                // `run_pipeline` charges it after `aggregate_value`.
+                let value = value_of(&g).map_err(decode)?;
+                let payload = if grouping.aggregate {
+                    value.payload_bytes()
+                } else {
+                    group_value_payload(&g.value, &g.value_type).map_err(decode)?
+                };
                 budget.charge(
-                    std::mem::size_of::<(String, GroupValue)>()
-                        + grouping.display.len()
-                        + group_value_payload(&g.value, &g.value_type).map_err(decode)?,
+                    std::mem::size_of::<(String, GroupValue)>() + grouping.display.len() + payload,
                 )?;
                 // One slot, as `groups_retained_bytes` counts it.
-                let attributes = vec![(
-                    grouping.display.clone(),
-                    group_value(&g.value, &g.value_type).map_err(decode)?,
-                )];
+                let attributes = vec![(grouping.display.clone(), value)];
                 budget.charge(group_reserve_bytes(g.spans.len()))?;
                 let mut spans = Vec::with_capacity(g.spans.len());
                 for s in g.spans {
@@ -1216,5 +1605,71 @@ mod charge_tests {
             ),
             "one byte less is refused: {refused:?}"
         );
+    }
+
+    /// Issue #592 part 3: an aggregate's one group charges what today's
+    /// engine charges — `TraceMatch::retained_bytes` with
+    /// `groups_retained_bytes` — and no distinct-group tuple: one byte less
+    /// than that is refused.
+    #[test]
+    fn the_aggregated_decode_charges_what_todays_engine_charges() {
+        use crate::traces::search_eval::groups_retained_bytes;
+        let q =
+            pulsus_traceql::parse(r#"{ span.foo = "bar" } | avg(duration) > 1ms"#).expect("parses");
+        let w = WindowSql::start_closed_end_open(1_000_000_000_000, 2_000_000_000_000);
+        let ctx = PredicateCtx {
+            window: w,
+            resources_table: "resources",
+        };
+        let s = compile_search(&q, &ctx, "spans", "traces", 20, 3).expect("compiles");
+        let grouping = s.grouping().expect("an aggregate is one group");
+        let bar = || vec![projected(1, "bar", "String")];
+        let rows = || {
+            vec![SearchGroupedRow {
+                trace_id: [3; 16],
+                root_service: "frontend".to_string(),
+                root_name: "GET /".to_string(),
+                start_ns: 1,
+                duration_ns: 2,
+                last: 1,
+                matched: 2,
+                spans: vec![span(1, bar()), span(2, bar())],
+                groups: vec![SearchGroupTuple {
+                    value: "2166666666".to_string(),
+                    value_type: "DurationI".to_string(),
+                    matched: 2,
+                    spans: vec![span(1, bar()), span(2, bar())],
+                }],
+            }]
+        };
+        let decode = |budget: &mut ByteBudget| {
+            let mut counter = GroupCardinalityCounter::new(1_000);
+            decode_search_grouped_charged(
+                rows(),
+                s.projection(),
+                grouping,
+                20,
+                budget,
+                &mut counter,
+            )
+        };
+        let mut unbounded = ByteBudget::new(usize::MAX);
+        let out = decode(&mut unbounded).expect("decodes");
+        let used = unbounded.used();
+        let groups = out.traces[0]
+            .groups
+            .as_deref()
+            .expect("the aggregate's group");
+        assert_eq!(groups[0].attributes[0].0, "avg(duration)");
+        assert_eq!(
+            groups[0].attributes[0].1,
+            GroupValue::Str("2.166666666s".to_string())
+        );
+        assert_eq!(used, todays_charge(&out) + groups_retained_bytes(groups));
+        assert!(decode(&mut ByteBudget::new(used)).is_ok());
+        assert!(matches!(
+            decode(&mut ByteBudget::new(used - 1)),
+            Err(crate::logql::error::ReadError::QueryTooBroad(_))
+        ));
     }
 }

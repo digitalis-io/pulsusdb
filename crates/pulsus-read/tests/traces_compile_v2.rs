@@ -4761,7 +4761,9 @@ fn compile_search_refuses_what_parts_two_and_three_serve() {
         (r#"{ event.k * event.k != 5 }"#, "two occurrences"),
         (r#"{ .k + 1 != .k }"#, "two occurrences"),
         (r#"{ link.lk - link.lk != 0 }"#, "two occurrences"),
-        (r#"{ .a = 1 } | count() > 1"#, "#592 part 3"),
+        (r#"{ .a = 1 } | count() > 1 | count() > 2"#, "#592"),
+        (r#"{ .a = 1 } | by(name) | count() > 1"#, "#592"),
+        (r#"{ .a = 1 } | avg(resource.k) > 1"#, "#592"),
         // Issue #592 part 2: a key the statement does not serve, and a
         // second `by()`.
         (r#"{ .a = 1 } | by(trace:id)"#, "#592"),
@@ -4910,8 +4912,16 @@ fn the_fork_routes_by_the_plan() {
     use pulsus_read::traces::spans::search::plan_statement;
     let mut wrong = Vec::new();
     for query in [
-        r#"{ .a = 1 } | count() > 1"#,
         r#"{ .a = 1 } && { .b = 2 } | { .c = 3 }"#,
+        // Issue #592 part 3: an aggregate with `by()`, a second aggregate,
+        // and arguments the statement does not read.
+        r#"{ .a = 1 } | by(name) | count() > 1"#,
+        r#"{ .a = 1 } | count() > 1 | by(name)"#,
+        r#"{ .a = 1 } | count() > 1 | count() > 2"#,
+        r#"{ .a = 1 } | avg(resource.k) > 1"#,
+        r#"{ .a = 1 } | sum(event.e) > 1"#,
+        r#"{ .a = 1 } | max(link.l) > 1"#,
+        r#"{ .a = 1 } | min(instrumentation.i) > 1"#,
         // Issue #592 part 2: the keys the statement does not serve, a
         // second `by()`, and a `by()` after `coalesce()`.
         r#"{ .a = 1 } | by(trace:id) | coalesce()"#,
@@ -4958,6 +4968,16 @@ fn the_fork_routes_by_the_plan() {
         r#"{ .a = 1 } | { name = "b" } | by(name)"#,
         r#"{ } | by(span.a) | coalesce()"#,
         r#"{ } | by(status) | select(span.a)"#,
+        // Issue #592 part 3: the six inventory rows, and three shapes.
+        r#"{ resource.service.name = "checkout" } | avg(duration) > 100ms"#,
+        r#"{ .a = 1 } | count() > 2 | select(duration)"#,
+        r#"{ status = error } | count() > 3"#,
+        r#"{} | max(duration) <= 5s"#,
+        r#"{} | min(.retries) < 2"#,
+        r#"{} | sum(span.bytes) >= 1000"#,
+        r#"{ resource.service.name = "checkout" } | count() > 5 | { status = error }"#,
+        r#"{ } | { status = error } | count() > 1"#,
+        r#"{ } | count() > 2 | coalesce()"#,
     ] {
         if plan_statement(&fork_plan(query), "spans", "traces", "resources").is_none() {
             wrong.push(format!(
@@ -4966,4 +4986,30 @@ fn the_fork_routes_by_the_plan() {
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Issue #592 part 3: a float `sum`/`avg` adds in today's order — the
+/// spanset's, ascending `(start_ns, span_id)` — by an ordered fold, not
+/// the database's own `sum`, whose order is its reading strategy's.
+#[test]
+fn a_float_sum_folds_in_span_order() {
+    for query in [
+        r#"{ } | sum(span.n) > 0"#,
+        r#"{ } | avg(span.n) > 0"#,
+        r#"{ } | sum(duration) > 1s"#,
+        r#"{ } | avg(duration) > 1s"#,
+    ] {
+        let sql = compile_search_of(query)
+            .unwrap_or_else(|e| panic!("{query}: {e:?}"))
+            .sql()
+            .to_string();
+        assert!(
+            sql.contains(
+                "arrayFold((acc, e) -> acc + e.1, arraySort(e -> (e.2, e.3), groupArrayIf("
+            ) && !sql.contains("sumIf(toFloat64(duration_ns)")
+                && !sql.contains("sumIf(assumeNotNull(")
+                && !sql.contains("avgIf("),
+            "{query}: the float sum must fold in span order"
+        );
+    }
 }
