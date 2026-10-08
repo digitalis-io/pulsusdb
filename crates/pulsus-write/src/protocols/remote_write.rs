@@ -6,9 +6,8 @@
 //! are already distinct `TimeSeries`, each carrying its own `__name__` and
 //! `le`/`quantile` labels), so there is no per-type flattening, no
 //! temporality, no exponential-bucket math — just `__name__` extraction,
-//! label normalization through the frozen `LabelSet::from_normalized`,
-//! the series ID `series_fingerprint(name, labels)`, and verbatim
-//! `(ms, value)` samples.
+//! the labels stored verbatim, as sent (issue #495), the series ID
+//! `series_fingerprint(name, labels)`, and verbatim `(ms, value)` samples.
 //!
 //! ## Wire types: hand-rolled prompb structs
 //!
@@ -1217,8 +1216,8 @@ const SERIES_ROW_OVERHEAD: usize = 64;
 /// Fixed per-label heap floor charged for every materialized `(name, value)`
 /// label pair (issue #115, finding #62). A wire label can be ~2 bytes (both
 /// strings empty) yet, once `parse_time_series` clones it into `rest` and
-/// `LabelSet::from_normalized` builds its sorted map, it costs two `String`
-/// headers (48 B) plus the normalized-map node/container overhead — a fixed
+/// `LabelSet::from_verbatim` builds its sorted map, it costs two `String`
+/// headers (48 B) plus the map node/container overhead — a fixed
 /// heap cost the raw name+value byte charge undercounts to near zero. Without
 /// this floor an attacker fans ≤ [`MAX_TOTAL_LABELS_PER_REQUEST`] near-empty
 /// labels across many series (each under [`MAX_LABELS_PER_SERIES`]), staying
@@ -1527,12 +1526,15 @@ pub fn parse(req: &WriteRequest, now_ns: i64) -> Result<ParsedMetrics, LogsInges
     Ok(out)
 }
 
-/// Parses one `TimeSeries`: extracts `__name__` (missing/empty -> drop the
-/// whole series, `rejected += sample_count` — the only semantic per-series
-/// violation remote-write has, architect plan's reject-boundary rule),
-/// normalizes the remaining labels, fingerprints them, and emits one
+/// Parses one `TimeSeries`: extracts `__name__`, keeps the remaining labels
+/// verbatim, as sent (issue #495), fingerprints them, and emits one
 /// [`MetricPoint`] per sample plus (if it has >=1 accepted sample) one
 /// [`SeriesRef`] for the series.
+///
+/// A series is dropped, `rejected += sample_count`, when it has no
+/// `__name__` (or it is empty), a label with an empty name, or a label name
+/// given twice — `__name__` included, values not compared — the rule the
+/// reference's protocol 1.0 receiver applies.
 fn parse_time_series(
     out: &mut ParsedMetrics,
     expanded_bytes: &mut usize,
@@ -1540,7 +1542,7 @@ fn parse_time_series(
     ts: &TimeSeries,
 ) -> Result<(), LogsIngestError> {
     // Charge this series' label/`SeriesRef` materialization BEFORE building
-    // `rest`/`from_normalized` (issue #62). Allocation-free: sums wire
+    // `rest`/`from_verbatim` (issue #62). Allocation-free: sums wire
     // string lengths plus a fixed [`LABEL_ROW_OVERHEAD`] per label, so a
     // near-empty-label fan-out trips [`MAX_EXPANDED_BYTES`] before any
     // `(String, String)`/label-set materialization (issue #115, finding #62).
@@ -1550,6 +1552,28 @@ fn parse_time_series(
             .saturating_add(l.value.len())
     });
     charge_budget(expanded_bytes, label_charge)?;
+
+    // Issue #495: an empty name, or a name given twice, drops the series.
+    let mut seen_names: HashSet<&str> = HashSet::with_capacity(ts.labels.len());
+    for label in &ts.labels {
+        let refused = if label.name.is_empty() {
+            Some("invalid label name \"\" in series: series dropped".to_string())
+        } else if !seen_names.insert(label.name.as_str()) {
+            Some(format!(
+                "duplicate label name {:?} in series: series dropped",
+                label.name
+            ))
+        } else {
+            None
+        };
+        if let Some(message) = refused {
+            out.rejected += ts.samples.len() as u64;
+            if out.rejected_message.is_none() {
+                out.rejected_message = Some(message);
+            }
+            return Ok(());
+        }
+    }
 
     let mut name: Option<&str> = None;
     let mut rest: Vec<(String, String)> = Vec::with_capacity(ts.labels.len());
@@ -1572,8 +1596,7 @@ fn parse_time_series(
     };
     let metric_name: Arc<str> = Arc::from(name);
 
-    let (labels, collisions) = LabelSet::from_normalized(rest);
-    out.collisions += collisions as u64;
+    let labels = LabelSet::from_verbatim(rest);
     let fingerprint = series_fingerprint(&metric_name, &labels);
 
     // A sampleless series (legal on the wire, e.g. a metadata-only push)

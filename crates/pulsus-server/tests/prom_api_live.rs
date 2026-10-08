@@ -2252,8 +2252,11 @@ fn http_post_bytes(port: u16, path: &str, content_type: &str, body: &[u8]) -> (u
     (status, body)
 }
 
+/// One remote-write series: `(labels, value, ms)`.
+type Series495<'a> = (&'a [(&'a str, &'a str)], f64, i64);
+
 /// A remote write of one series per entry, each `(labels, value, ms)`.
-fn remote_write_495(series: &[(&[(&str, &str)], f64, i64)]) -> Vec<u8> {
+fn remote_write_495(series: &[Series495<'_>]) -> Vec<u8> {
     use prost::Message;
     use pulsus_write::protocols::remote_write::{Label, Sample, TimeSeries, WriteRequest};
     let req = WriteRequest {
@@ -2551,7 +2554,8 @@ async fn every_name_shape_is_found_by_a_quoted_matcher_and_by_its_escaped_name()
         ("café", "U__caf_e9_"),
     ];
     let values: Vec<String> = (0..cases.len()).map(|i| format!("v{i}")).collect();
-    let series: Vec<(Vec<(&str, &str)>, f64, i64)> = cases
+    type Owned<'a> = (Vec<(&'a str, &'a str)>, f64, i64);
+    let series: Vec<Owned<'_>> = cases
         .iter()
         .zip(&values)
         .map(|((name, _), v)| {
@@ -2562,7 +2566,7 @@ async fn every_name_shape_is_found_by_a_quoted_matcher_and_by_its_escaped_name()
             )
         })
         .collect();
-    let refs: Vec<(&[(&str, &str)], f64, i64)> = series
+    let refs: Vec<Series495<'_>> = series
         .iter()
         .map(|(l, v, ms)| (l.as_slice(), *v, *ms))
         .collect();

@@ -442,8 +442,11 @@ impl LabelSet {
         Ok(LabelSet { entries })
     }
 
-    /// Verbatim constructor for traces (docs/architecture.md §2.2): keys
-    /// are never canonicalized. An exact duplicate key still resolves
+    /// Verbatim constructor (docs/architecture.md §2.2): keys are never
+    /// canonicalized. Its users are traces, OTLP metrics and remote write;
+    /// remote write refuses a label name given twice before calling it
+    /// (issue #495), so the tie-break below never runs there. An exact
+    /// duplicate key still resolves
     /// deterministically (greatest value wins, same tie-break rule as
     /// [`LabelSet::from_normalized`]) so `LabelSet`'s sorted/unique
     /// invariant always holds — but this is not a normalization collision,
