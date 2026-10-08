@@ -4761,7 +4761,9 @@ fn compile_search_refuses_what_parts_two_and_three_serve() {
         (r#"{ event.k * event.k != 5 }"#, "two occurrences"),
         (r#"{ .k + 1 != .k }"#, "two occurrences"),
         (r#"{ link.lk - link.lk != 0 }"#, "two occurrences"),
-        (r#"{ .a = 1 } | count() > 1"#, "#592"),
+        (r#"{ .a = 1 } | count() > 1"#, "#592 part 3"),
+        (r#"{ .a = 1 } | by(name)"#, "#592 part 2"),
+        (r#"{ .a = 1 } | coalesce()"#, "#592 part 2"),
         (r#"{ .a = 1 } > { .b = 2 }"#, "#593"),
         (r#"({ .a = 1 } > { .b = 2 }) && { .c = 3 }"#, "#593"),
         (r#"{ nestedSetLeft > 0 }"#, "#594"),
@@ -4907,8 +4909,10 @@ fn the_fork_routes_by_the_plan() {
     let mut wrong = Vec::new();
     for query in [
         r#"{ .a = 1 } | count() > 1"#,
-        r#"{ .a = 1 } | select(name)"#,
         r#"{ .a = 1 } | coalesce()"#,
+        r#"{ .a = 1 } | by(name)"#,
+        r#"{ .a = 1 } | { name = "b" } | coalesce()"#,
+        r#"{ .a = 1 } && { .b = 2 } | { .c = 3 }"#,
         r#"{ .a = 1 } > { .b = 2 }"#,
         r#"{ nestedSetLeft > 0 }"#,
         r#"{ nestedSetParent < 0 }"#,
@@ -4931,6 +4935,13 @@ fn the_fork_routes_by_the_plan() {
         r#"{ .k = .k }"#,
         r#"{ span.k = "x" }"#,
         "{}",
+        // Issue #592 part 1: later `{…}` filters and `select()` after a
+        // single filter.
+        r#"{ .a = 1 } | { }"#,
+        r#"{ .a = 1 } | ({ name = "b" })"#,
+        r#"{ } | { .a = 1 } | { name = "b" }"#,
+        r#"{ .a = 1 } | select(name)"#,
+        r#"{ status = error } | select(span.http.status_code, .foo, resource.service.name)"#,
     ] {
         if plan_statement(&fork_plan(query), "spans", "traces", "resources").is_none() {
             wrong.push(format!(

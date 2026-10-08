@@ -1169,6 +1169,42 @@ async fn flush_and_count_trace_reads(admin: &ChClient, db: &str) -> u64 {
     n
 }
 
+/// How long [`settled_trace_reads`] re-reads the count before it fails.
+const TRACE_READS_DEADLINE: Duration = Duration::from_secs(10);
+
+/// How long the count must hold still before it is taken as settled.
+const TRACE_READS_SETTLE: Duration = Duration::from_secs(1);
+
+/// [`flush_and_count_trace_reads`], re-read until it is at least `at_least`
+/// and has then held still for [`TRACE_READS_SETTLE`], or until
+/// [`TRACE_READS_DEADLINE`] passes. The caller asserts the exact count.
+///
+/// `SYSTEM FLUSH LOGS` writes only what is already queued, and the
+/// `QueryFinish` row of a read that has just returned can be queued after
+/// it: such a row was seen arriving after the flush that should have held
+/// it. One flush and one read therefore miss it now and then, which moves
+/// the row into the next count. Waiting for the count to hold still keeps
+/// each row in the count it belongs to — the positive control's in its own
+/// step, and any read inside the static window inside that window.
+async fn settled_trace_reads(admin: &ChClient, db: &str, at_least: u64) -> u64 {
+    let deadline = Instant::now() + TRACE_READS_DEADLINE;
+    let mut n = flush_and_count_trace_reads(admin, db).await;
+    let mut held_since = Instant::now();
+    loop {
+        if Instant::now() >= deadline
+            || (n >= at_least && held_since.elapsed() >= TRACE_READS_SETTLE)
+        {
+            return n;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let next = flush_and_count_trace_reads(admin, db).await;
+        if next != n {
+            held_since = Instant::now();
+        }
+        n = next;
+    }
+}
+
 /// Only used to build a panic message: `query` and `tables` for every
 /// row the counting predicate matches.
 async fn trace_read_rows(admin: &ChClient, db: &str) -> Vec<(String, Vec<String>)> {
@@ -1588,8 +1624,8 @@ async fn intrinsic_discovery_answers_from_the_vocabulary_and_reads_no_trace_tabl
     // directly, so no query text enters the check at all.
     // =================================================================
 
-    // (1) baseline.
-    let b0 = flush_and_count_trace_reads(&admin, db).await;
+    // (1) baseline, once every earlier read's row has landed.
+    let b0 = settled_trace_reads(&admin, db, 0).await;
     // (2) the positive control: one real catalog read.
     let ctx = "positive control";
     assert_eq!(
@@ -1598,7 +1634,7 @@ async fn intrinsic_discovery_answers_from_the_vocabulary_and_reads_no_trace_tabl
         "{ctx}"
     );
     // (3) it moved the count by exactly one.
-    let a0 = flush_and_count_trace_reads(&admin, db).await;
+    let a0 = settled_trace_reads(&admin, db, b0 + 1).await;
     assert_eq!(
         a0,
         b0 + 1,
@@ -1608,7 +1644,7 @@ async fn intrinsic_discovery_answers_from_the_vocabulary_and_reads_no_trace_tabl
     );
 
     // (4) the static window opens. Nothing else runs between here and (6).
-    let b1 = flush_and_count_trace_reads(&admin, db).await;
+    let b1 = settled_trace_reads(&admin, db, a0).await;
 
     let intrinsic_scope_body = serde_json::json!({
         "scopes": [{"name": "intrinsic", "tags": INTRINSIC_NAMES}]
@@ -1740,7 +1776,7 @@ async fn intrinsic_discovery_answers_from_the_vocabulary_and_reads_no_trace_tabl
 
     // (6) the window closes: not one of those fifteen requests read a
     // trace table.
-    let a1 = flush_and_count_trace_reads(&admin, db).await;
+    let a1 = settled_trace_reads(&admin, db, b1).await;
     assert_eq!(
         a1,
         b1,

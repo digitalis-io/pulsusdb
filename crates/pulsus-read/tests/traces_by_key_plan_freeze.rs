@@ -129,6 +129,11 @@ fn render_plan(key: &str) -> String {
 /// `SearchPlan` counts its `|` stages, `pipeline_len`, so the route fork
 /// can send a search with any to today's engine. Every key's plan gains
 /// `pipeline_len: 1` — each is a `| by(...)` — and nothing else moved.
+///
+/// **Regenerated on issue #592 part 1, for that one field.** `SearchPlan`
+/// now keeps its `|` stages, `pipeline`, so the search statement can
+/// compile later filters and `select()`. In each key `pipeline_len: 1`
+/// becomes `pipeline: [ By { key: … } ]`, and nothing else moved.
 #[test]
 fn every_served_by_key_plans_as_it_did_before_the_grammar_change() {
     let mut rendered: BTreeMap<String, String> = BTreeMap::new();

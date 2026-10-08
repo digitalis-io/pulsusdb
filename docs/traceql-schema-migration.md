@@ -1337,7 +1337,7 @@ returns **0** — no span in C1 repeats a key — and both forms return the same
 positive.** `crates/pulsus-read/src/traces/search_plan.rs:667` carries
 `probe_predicates: Vec<String>`, documented as "Each probe's pre-escaped **positive**
 predicate", built by `membership_predicate`
-(`crates/pulsus-read/src/traces/search_plan.rs:1114`) against the column names `key`,
+(`crates/pulsus-read/src/traces/search_plan.rs:1115`) against the column names `key`,
 `scope`, `val`, `val_num`. What changes is where the string is spent: the
 `key`/`scope` conjuncts become the locate, and the value conjunct becomes the test on
 the located element. Splitting it that way is what the planner must render — the
@@ -1579,9 +1579,9 @@ same table, the same 32 ids, three repetitions each, zero spread:
 is why the wrong explanation survived a round: the builder takes `with_value` as an
 argument (`crates/pulsus-read/src/traces/search_sql.rs:556`), but the caller passes
 `self.probe_values[probe_idx]`
-(`crates/pulsus-read/src/traces/search_plan.rs:897-905`), and that vector is filled at
+(`crates/pulsus-read/src/traces/search_plan.rs:898-906`), and that vector is filled at
 plan time by `projection_value`
-(`crates/pulsus-read/src/traces/search_plan.rs:2596-2667`), which sets it **true** for
+(`crates/pulsus-read/src/traces/search_plan.rs:2597-2668`), which sets it **true** for
 exactly four predicate classes — `Regex`, `Num`, `KeyExists`, `NumExpr` — because those
 are the ones whose matched value the response needs and cannot take from the query's own
 literal. Q1's probe is `val_num >= 500`, a `Num`, so production sends the **with-value**
@@ -2319,7 +2319,7 @@ Three aggregate conditions are pushed into the candidate generator today
 Losing a pushdown does not change an answer. The condition is re-evaluated over
 the hydrated spans either way; the pushed form only narrows the candidate list,
 and the plan already keeps a byte-for-byte fallback statement with nothing pushed
-(`crates/pulsus-read/src/traces/search_plan.rs:3083-3103`, used at `crates/pulsus-read/src/traces/exec.rs:2388-2416`). The effect is more
+(`crates/pulsus-read/src/traces/search_plan.rs:3084-3104`, used at `crates/pulsus-read/src/traces/exec.rs:2388-2416`). The effect is more
 candidates, not a different result.
 
 `by()` grouping already refuses to push whenever the generator is not

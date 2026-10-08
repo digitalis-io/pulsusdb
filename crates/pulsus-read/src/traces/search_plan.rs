@@ -791,9 +791,10 @@ pub struct SearchPlan {
     /// [`generator_exactness`]'s six conditions refused (issue #492
     /// part 4).
     pub(crate) generator_exact: Result<(), NotExact>,
-    /// The query's `|` stages, counted (issue #591 part 3): a search with
-    /// any is not the search statement's (`spans::search::plan_statement`).
-    pub(crate) pipeline_len: usize,
+    /// The query's `|` stages (issue #591 part 3; issue #592 part 1): the
+    /// search statement compiles the later `{…}` filters and `select()`,
+    /// and refuses the rest (`spans::search::plan_statement`).
+    pub(crate) pipeline: Vec<PipelineStage>,
 }
 
 impl SearchPlan {
@@ -3464,7 +3465,7 @@ pub fn plan_search(
         pushed_having,
         generator_fallback_sql,
         generator_exact: exactness,
-        pipeline_len: query.pipeline.len(),
+        pipeline: query.pipeline.clone(),
     })
 }
 

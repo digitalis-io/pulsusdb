@@ -61,12 +61,12 @@ five call sites across three files: `plan.rs:1710`, `plan.rs:1732`, `plan.rs:377
 TraceQL computes the same thing a fourth time and shares none of it:
 [`filter::collect`](../crates/pulsus-read/src/traces/filter.rs) (line 2737) walks a boolean tree
 choosing candidate generators, and
-[`plan_pipeline`](../crates/pulsus-read/src/traces/search_plan.rs) (line 1931) walks the pipeline.
+[`plan_pipeline`](../crates/pulsus-read/src/traces/search_plan.rs) (line 1932) walks the pipeline.
 
 The core replaces TraceQL's hand-written walks; LogQL's walks stay in LogQL's compiler by the decision above.
 
 **And the cost of not having it was measurable.** TraceQL's spanset aggregate had no SQL path at
-all when this record was written: `PlannedAggregate` was built at `search_plan.rs:2122` and read at
+all when this record was written: `PlannedAggregate` was built at `search_plan.rs:2123` and read at
 exactly one place, `search_eval.rs:2439`. Every matching span was therefore transported and then
 discarded. (Issue #492 part 4 gave `min(duration)`, `max(duration)` and `count()` over a
 single attribute-equality selector a `HAVING` in the generator statement; every other aggregate
@@ -1062,7 +1062,7 @@ compiling it, so that the crate reads it the way RE2 does — `pulsus_re2::re2_p
 applied at `crates/pulsus-read/src/metrics/labels.rs:277` and `:623`,
 `crates/pulsus-read/src/metrics/re2_authority.rs:89` and `crates/pulsus-read/src/logql/plan.rs:174`.
 **The TraceQL path applies it nowhere.** `git grep -n re2_pattern_to_rust -- crates/pulsus-read/src/traces/ crates/pulsus-traceql/src/`
-returns no line; `search_plan.rs:957` compiles the **raw** pattern with
+returns no line; `search_plan.rs:958` compiles the **raw** pattern with
 `pulsus_re2::compile_user_regex_anchored(pat)`, which is `^(?:pat)$` built by
 `regex::RegexBuilder` with a size budget and no rewrite
 (`crates/pulsus-re2/src/compile_budget.rs:343`).
@@ -1084,7 +1084,7 @@ than everything.
 **Which leaves are exposed, and which are not.** An **attribute** regex is evaluated only in
 ClickHouse, through `match(val, …)` (`crates/pulsus-read/src/traces/filter.rs:912`), so it has one
 dialect and one reading. The exposed set is the leaves `plan_physical` and `plan_trace_ctx` compile
-a `StrOp::Re`/`Nre` for (`search_plan.rs:1020-1077`) — `name`, `service`, `statusMessage`,
+a `StrOp::Re`/`Nre` for (`search_plan.rs:1021-1078`) — `name`, `service`, `statusMessage`,
 `span:id`, `span:parentID`, `instrumentation:name`, `instrumentation:version`, `rootName` and
 `rootServiceName` — because those are re-checked in our process at `search_plan.rs:214-215` after a
 generator has already selected on them. The committed golden
@@ -1172,7 +1172,7 @@ blocking behaviour the reader has to infer.
 #### Payload validation runs BEFORE the fold, and the rejection governs
 
 **A disposition in the table below is only ever reached by a payload the shipped planner accepts.**
-`plan_pipeline` (`crates/pulsus-read/src/traces/search_plan.rs:1931`) refuses several payloads of
+`plan_pipeline` (`crates/pulsus-read/src/traces/search_plan.rs:1932`) refuses several payloads of
 `Aggregate`, `By` and `Select` with `PlanError`, which
 `crates/pulsus-server/src/traces_api/error.rs:304` maps to **`400`** with
 `Content-Type: text/plain; charset=utf-8` (`:270-277`). Without this rule the design would be a
@@ -1192,17 +1192,17 @@ cannot be reached by any request:
 
 | variant | rejected payload | `400` body, verbatim | reachable from a parsed+validated query |
 |---|---|---|---|
-| `Aggregate` | regex comparison operator (`search_plan.rs:1433`) | `type mismatch: aggregate filters do not support regex operators` | **no** — `validate` answers `illegal operation for the given types: count() =~ 2` |
-| `Aggregate` | `count()` given a field (`:1192`) | `type mismatch: count() takes no field` | **no** — parse error `expected ')' (count() takes no argument)` |
-| `Aggregate` | a one-arity op given no field (`:1197`) | ``type mismatch: `<op>`() requires a field`` | **no** — parse error `expected an aggregatable field (duration or an attribute)` |
-| `Aggregate` | a non-numeric intrinsic argument (`:1203`) | `type mismatch: span:childCount is not numerically aggregatable` | **yes** — `{ .service.namespace = "prod" } \| max(span:childCount) > 1` |
-| `Aggregate` | a composite argument expression (`:1215`) | `type mismatch: max((.a + .b)) is not an executable aggregation source: only a bare duration or attribute can be aggregated` | **yes** — `… \| max(.a + .b) > 1` |
-| `Aggregate` | a duration threshold on a non-duration aggregate (`:1060`) | `type mismatch: aggregate comparisons require a numeric (or duration, for duration aggregates) threshold` | **yes** — `… \| max(.a) > 1s` and `… \| count() > 1s` |
-| `Aggregate` | a non-finite numeric threshold (`:1049`) | `type mismatch: not a finite number: "999…"` | **yes** — `… \| max(.a) > <310 nines>`. The arm parses the raw literal as `f64` and filters on `is_finite`, so any decimal integer literal above `f64::MAX` reaches it; **measured** at 309, 310 and 320 digits, all three rejected here, while a 320-digit *fraction* is finite and plans. `nan`, `inf`, `1e400` and a leading `-` are refused by the lexer, but they are not the only spelling |
-| `By` | a composite key expression (`:1128`) | `type mismatch: by((.a + .b)) is not a group key this engine can execute: a grouping key must resolve to a single per-span value, so it must be an attribute or an intrinsic` | **yes** — `… \| by(.a + .b) \| count() > 1` |
-| `By` | a span-event / span-link intrinsic key (`:1438`) | `unsupported field: by(event:name): grouping by a span-event / span-link intrinsic is not supported (a span carries a collection of events/links, so there is no single group value)` | **yes** — `… \| by(event:name) \| count() > 1` |
-| `Select` | a nested-set intrinsic (`:2184`) | `type mismatch: select() of a nested-set intrinsic is not supported` | **yes** — `… \| select(nestedSetLeft)` |
-| `Select` | one of the twelve trace-level / scoped / event / link intrinsics (`:2229`) | `type mismatch: select() of this intrinsic is not supported` | **yes** — `… \| select(rootName)` |
+| `Aggregate` | regex comparison operator (`search_plan.rs:1434`) | `type mismatch: aggregate filters do not support regex operators` | **no** — `validate` answers `illegal operation for the given types: count() =~ 2` |
+| `Aggregate` | `count()` given a field (`:1193`) | `type mismatch: count() takes no field` | **no** — parse error `expected ')' (count() takes no argument)` |
+| `Aggregate` | a one-arity op given no field (`:1198`) | ``type mismatch: `<op>`() requires a field`` | **no** — parse error `expected an aggregatable field (duration or an attribute)` |
+| `Aggregate` | a non-numeric intrinsic argument (`:1204`) | `type mismatch: span:childCount is not numerically aggregatable` | **yes** — `{ .service.namespace = "prod" } \| max(span:childCount) > 1` |
+| `Aggregate` | a composite argument expression (`:1216`) | `type mismatch: max((.a + .b)) is not an executable aggregation source: only a bare duration or attribute can be aggregated` | **yes** — `… \| max(.a + .b) > 1` |
+| `Aggregate` | a duration threshold on a non-duration aggregate (`:1061`) | `type mismatch: aggregate comparisons require a numeric (or duration, for duration aggregates) threshold` | **yes** — `… \| max(.a) > 1s` and `… \| count() > 1s` |
+| `Aggregate` | a non-finite numeric threshold (`:1050`) | `type mismatch: not a finite number: "999…"` | **yes** — `… \| max(.a) > <310 nines>`. The arm parses the raw literal as `f64` and filters on `is_finite`, so any decimal integer literal above `f64::MAX` reaches it; **measured** at 309, 310 and 320 digits, all three rejected here, while a 320-digit *fraction* is finite and plans. `nan`, `inf`, `1e400` and a leading `-` are refused by the lexer, but they are not the only spelling |
+| `By` | a composite key expression (`:1129`) | `type mismatch: by((.a + .b)) is not a group key this engine can execute: a grouping key must resolve to a single per-span value, so it must be an attribute or an intrinsic` | **yes** — `… \| by(.a + .b) \| count() > 1` |
+| `By` | a span-event / span-link intrinsic key (`:1439`) | `unsupported field: by(event:name): grouping by a span-event / span-link intrinsic is not supported (a span carries a collection of events/links, so there is no single group value)` | **yes** — `… \| by(event:name) \| count() > 1` |
+| `Select` | a nested-set intrinsic (`:2185`) | `type mismatch: select() of a nested-set intrinsic is not supported` | **yes** — `… \| select(nestedSetLeft)` |
+| `Select` | one of the twelve trace-level / scoped / event / link intrinsics (`:2230`) | `type mismatch: select() of this intrinsic is not supported` | **yes** — `… \| select(rootName)` |
 | `Filter` | a mid-pipeline spanset OPERATION rather than a single filter | `type mismatch: ({ .b = 2 } && { .c = 3 }) is not executable as a pipeline stage: a ``|`` stage must be a single { ... } filter, not a cross-spanset or structural operation` | **yes** — `{ .a = 1 } \| { .b = 2 } && { .c = 3 }`. The reference's pipeline element is a full spanset expression, so the parser accepts it and the planner decides |
 
 `Coalesce` is zero-arity and has no payload to reject. `Metric`, `MetricSecondStage` and `Compare`
@@ -1212,8 +1212,8 @@ are rejected whole rather than by payload and are already "not in the chain" bel
 table marked the non-finite numeric threshold parser-shadowed on the strength of `nan`, `inf` and
 `1e400` all being refused by the lexer. They are — but a long decimal literal is not, and
 `{ .service.namespace = "prod" } | max(.a) > <320 nines>` parses, validates and returns
-`400 type mismatch: not a finite number: "999…"` from `search_plan.rs:1896`, whose rule is
-`raw.parse::<f64>()` filtered on `is_finite()`, `search_plan.rs:1893` to `:1889`. **An unreachability
+`400 type mismatch: not a finite number: "999…"` from `search_plan.rs:1897`, whose rule is
+`raw.parse::<f64>()` filtered on `is_finite()`, `search_plan.rs:1894` to `:1890`. **An unreachability
 claim is a universal over inputs**, so each of the four was re-checked by constructing the input
 that would defeat it rather than by reading the lexer: three spellings each for the regex-operator,
 `count()`-with-field and one-arity-without-field rows, and ten for the numeric threshold, including
@@ -1241,9 +1241,9 @@ re-checked the same way, with three to eight spellings each, and all four held.
 | `Coalesce`, with no preceding `By` | `Spans` → `Spans` | none — the identity | none | **always lowers**, contributing no SQL | *none* |
 | `Select { fields }` (`ast.rs:1024`) | any → same shape | **never lowers.** `apply` returns the relation unchanged and `capability` has no `Yes` arm, so field resolution decides only which `BlockReason` is reported: `select(name)` reports `NotYetLowered` and every attribute spelling reports `NameNotResolvable`, because a TraceQL seed's `ColSet` is `Closed([trace_id, name])`. Measured on both seed sources by `traces::compile::tests::select_refuses_and_names_its_reason_per_field`. **No exactness precondition** — projecting a column onto rows the evaluator will drop would be harmless | **wider `cols`**: no existing column moves, and `set_provenance` ADDS the selected field as `EvaluatorOnly` (`compile/fold.rs:245`), which the effect table already expects (`traces/compile.rs:1902`) | **never lowers** — the two refusal reasons are the only outcomes, and `NameNotResolvable` is what the explain surface renders (`compile/plan.rs:897`) for every spelling a client writes | *none* here; a left join would need an ADR 0008 clause that does not exist — [query-to-sql.md](query-to-sql.md) open question 4, and §9.8 measured the join and refused it |
 | `Filter(SpansetExpr)` (`ast.rs:1021`, issue #492 item 9) | `Spans` → `Spans` | **never lowers** (`No(NotYetLowered)`) — and the reason is soundness, not unfinished work. Pushing the filter as a `WHERE` conjunct is WRONG whenever the leading spanset is not a single filter: for `{ .tag = "x" } && { name = "a" } \| { .tag = "y" }` the qualifying span is supplied by the RIGHT operand, so `val = 'y'` ANDed onto the left leaf's `trace_attrs_idx` generator matches nothing and the trace is dropped. It would also favour one spelling over the identical `{A && B}`, which does not push its second leaf | **shape unchanged**; **clears `exact`** — the evaluator will drop spans, and traces, that the SQL returned | never lowers | *none*. It does decide WHICH generator statement phase 1 sends — `filter::collect`'s `&&` fold continued across the pipe, so `{A} \| {B}` sends the statement `{A && B}` sends — but that is a choice among statements the query already implies, not a fragment added to one |
-| `Metric(MetricStage)` (`ast.rs:1055`) | — | **not a search-path link.** `plan_pipeline` answers `400` (`search_plan.rs:2133`) | n/a | **not in the chain** — the metrics routes compile it in full already (`metrics_sql.rs:111`) | n/a |
-| `MetricSecondStage(SecondStage)` (`ast.rs:1059`) | — | `400` on search (`search_plan.rs:2140`) | n/a | not in the chain | n/a |
-| `Compare { .. }` (`ast.rs:1071`) | — | `400` on search (`search_plan.rs:2146`) | n/a | not in the chain | n/a |
+| `Metric(MetricStage)` (`ast.rs:1055`) | — | **not a search-path link.** `plan_pipeline` answers `400` (`search_plan.rs:2134`) | n/a | **not in the chain** — the metrics routes compile it in full already (`metrics_sql.rs:111`) | n/a |
+| `MetricSecondStage(SecondStage)` (`ast.rs:1059`) | — | `400` on search (`search_plan.rs:2141`) | n/a | not in the chain | n/a |
+| `Compare { .. }` (`ast.rs:1071`) | — | `400` on search (`search_plan.rs:2147`) | n/a | not in the chain | n/a |
 | `Order` (synthesised) | `Traces` → `Traces` | `exact` — over a superset the sort **key** is wrong, not just the set (§2.2) | leaves `ordering` unset | conditional | *none* |
 | `Limit(n)` (synthesised) | `Traces` → `Traces` | `ordering.is_some()` | leaves `limit` unset | conditional | *none* |
 | `Emit` (synthesised) | `Traces` \| `Groups` → answer | none — see below | records the winners' root read as the evaluator's | **must go residual**: `Never(NeedsUnwindowedRootRead)` | **served by a second SQL part, not by the evaluator** — `Cut::SourceHandoff` (§2.7.2), seeded by the winners' trace ids, `SeedBound::RequestLimit`, `Issue::Once` |
@@ -1299,7 +1299,7 @@ of the pipeline."
 | **spanset aggregate** (`count`/`sum`/`avg`/`min`/`max`) | the whole two-phase loop: 1,128 round trips, 77,572,021 metered bytes, 5,795,940,946 rows read (§9.2) | **measured on C1** |
 | **`by()` regrouping** | adds no query of its own; its saving is the same loop collapse when the selector is lowerable | argued — it adds no read |
 | **`select()` projection** | **nothing since #558** — the field's value, its numeric reading and its stored kind are projected expressions on the batch hydration statement, so the projection sends no statement and adds no round trip. It cost one extra read per batch, +4.6 KiB per request and one extra round trip when §9.8 measured and refused it; that refusal's premise — that an attribute value lives in a second table — no longer holds | measured on C2 (issue #478); the refusal measured on §9.8's corpus, and superseded by #558 |
-| **field-vs-field comparison** `{ .a = .b }` | **no read of its own since #558** — four projected slots on the hydration statement, not four statements: each attribute operand is interned into `select_attrs` *and* into `agg_fields` (`plan_operand`, `search_plan.rs:1635-1636`), so a two-operand leaf takes four slots. It sent four `attr_values_sql` reads per batch when C6 was measured. One whole request on C6: 37 statements and 300,984,841 rows read when 1 trace in 10 matches, **3,127 statements and 25,904,824,756 rows read** when 1 in 1,000 does (§9.7) | **measured on C6** |
+| **field-vs-field comparison** `{ .a = .b }` | **no read of its own since #558** — four projected slots on the hydration statement, not four statements: each attribute operand is interned into `select_attrs` *and* into `agg_fields` (`plan_operand`, `search_plan.rs:1636-1637`), so a two-operand leaf takes four slots. It sent four `attr_values_sql` reads per batch when C6 was measured. One whole request on C6: 37 statements and 300,984,841 rows read when 1 trace in 10 matches, **3,127 statements and 25,904,824,756 rows read** when 1 in 1,000 does (§9.7) | **measured on C6** |
 | **cross-field arithmetic** `{ .a * 2 > .b }` | the same four reads per batch; 347 statements and 2,869,590,609 rows read for a request matching 9,000 traces (§9.7) | **measured on C6** |
 | **event/link set comparison** `{ .a = event:name }` | one `event_set_sql` expansion per batch; the scalar operand's two value reads became slots on the hydration statement in #558, and the expansion moved onto `trace_spans`'s own arrays. It sent that co-load **plus two value reads** per batch when C6 was measured: 2,502 statements and 13,995,704,756 rows read (§9.7) | **measured on C6** |
 | **negated attribute leaf** `{ .a != "5" }` | drops the generator to the empty-predicate time-range superset (`GenClass::TimeRange`, `filter.rs:107`) and adds no read of its own, so the window's whole span scan is the cost: 4 statements, 12,097,152 rows read, 1,482 granules (§9.7) | **measured on C6** |
@@ -2828,7 +2828,7 @@ drops any of them answers differently from the evaluator.
   character-counted cap disagrees on any multi-byte value above 2,048 characters.
 - **Use a range test, not `anyIf`.** One `(trace_id, span_id, key)` can carry two rows, and the
   evaluator read `any(val_num)` and `any(val)` (`attr_values_sql`, deleted by #558; the reader now
-  subscripts ONE located element of the span row, `search_plan.rs:1265`), which was
+  subscripts ONE located element of the span row, `search_plan.rs:1266`), which was
   an **arbitrary** choice among them. On a three-row fixture (`a` = 5, `a` = 7, `b` = 7 on one span)
   `any(val_num)` for `key = 'a'` returned `5` on ten runs across `max_threads` 1–4 — arbitrary, and
   here stable — so `{ .a = .b }` on that span is decided by which row `any` picked. A pushed `anyIf`
@@ -4387,7 +4387,7 @@ was smaller than the claim it was asked to support.**
    backstop, because reading its residue is what found three claims no verb list contained.
 2. **§3.1 said a non-finite numeric threshold was parser-shadowed. It is not.**
    `{ .service.namespace = "prod" } | max(.a) > <320 nines>` parses, validates and reaches
-   `search_plan.rs:1083`. The row is corrected to **reachable**, and **every other shadowing claim
+   `search_plan.rs:1084`. The row is corrected to **reachable**, and **every other shadowing claim
    in this document was re-checked by constructing the input that would defeat it** rather than by
    reading the lexer — four TraceQL rows with three to ten spellings each and four LogQL rows with
    three to eight. The other seven held. Two stale counts fell out of it: §10 said "four of the
@@ -5515,7 +5515,7 @@ either half of the record.
 ### 12.3 The citations, and the hole that is enumerated rather than papered over
 
 The design record cites source files by line number, and nothing derived those citations until
-part 8: moving `search_plan.rs:2133` to `:3144` in [`query-to-sql.md`](query-to-sql.md) and running
+part 8: moving `search_plan.rs:2134` to `:3145` in [`query-to-sql.md`](query-to-sql.md) and running
 `cargo nextest run --workspace` exited 0 with no failing test. (The two numbers in that sentence
 are themselves citations as far as the dataset below is concerned, so they are kept at whatever
 lines those two pieces of code sit at today; issue #559 moved both.)
@@ -5537,21 +5537,21 @@ The block below, tables and sentences alike, is rendered from the two citation d
 
 | quantity | at this revision |
 |---|---|
-| citation occurrences in the five artefacts | 693 |
-| of those, citing a bare basename | 503 |
+| citation occurrences in the five artefacts | 692 |
+| of those, citing a bare basename | 502 |
 | of those, written as a continuation of a citation earlier in the paragraph | 75 |
 | of those continuations, on a later line than the citation they continue | 32 |
 | `(document, token)` pairs the rule resolves | 364 |
 | occurrences those resolved pairs cover | 494 |
-| `(document, token)` pairs it cannot resolve | 109 |
-| occurrences those frozen pairs cover | 199 |
+| `(document, token)` pairs it cannot resolve | 108 |
+| occurrences those frozen pairs cover | 198 |
 | resolved rows anchored on a token the citing prose prints | 175 |
 | resolved rows anchored on a snapshot of the cited line | 189 |
 
 | reason it cannot be resolved | pairs | what it means |
 |---|---|---|
 | `ambiguous_basename` | 100 | the basename matches several tracked files and the citing line prints no identifier that separates them |
-| `blank_target_line` | 7 | the cited line exists and is **empty**, so there is nothing to anchor on |
+| `blank_target_line` | 6 | the cited line exists and is **empty**, so there is nothing to anchor on |
 | `not_a_tracked_file` | 2 | the citation names a throwaway probe that was never committed, which §10 records deliberately |
 
 | the reviewed verdict on a fallback disagreement | cases |
@@ -5565,11 +5565,11 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | `prose` | a token the citing prose prints, so the claim and its evidence are reviewable side by side |
 | `line` | a snapshot of the cited line, taken because the citing prose prints no such token: it detects the line moving or changing and cannot show the citation means the right thing |
 
-Of the 693 citation occurrences the five artefacts make, 503 name a bare basename and 75 are written as a continuation of a citation earlier on the same line. The rule resolves 364 `(document, token)` pairs covering 494 occurrences, and cannot resolve 109 covering 199. Of the resolved rows, 175 are anchored on a token the citing prose prints and 189 on a snapshot of the cited line.
+Of the 692 citation occurrences the five artefacts make, 502 name a bare basename and 75 are written as a continuation of a citation earlier on the same line. The rule resolves 364 `(document, token)` pairs covering 494 occurrences, and cannot resolve 108 covering 198. Of the resolved rows, 175 are anchored on a token the citing prose prints and 189 on a snapshot of the cited line.
 
 The language fallback and the anchor rule disagree on 4 citations, all of them read one at a time. 4 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
 
-The citations pointing at an empty line are `crates/pulsus-read/src/logql/plan.rs:1655` (in `docs/query-lowering.md`), `crates/pulsus-read/src/traces/metrics_sql.rs:627` (in `docs/query-lowering.md`), `metrics_sql.rs:951` (cited from 2 documents), `search_plan.rs:1203` (in `docs/query-lowering.md`), `search_plan.rs:1331` (in `docs/query-lowering.md`), `search_plan.rs:1893` (in `docs/query-lowering.md`).
+The citations pointing at an empty line are `crates/pulsus-read/src/logql/plan.rs:1655` (in `docs/query-lowering.md`), `crates/pulsus-read/src/traces/metrics_sql.rs:627` (in `docs/query-lowering.md`), `metrics_sql.rs:951` (cited from 2 documents), `search_plan.rs:1204` (in `docs/query-lowering.md`), `search_plan.rs:1894` (in `docs/query-lowering.md`).
 
 The citations the rule answers differently for two occurrences of are .
 
