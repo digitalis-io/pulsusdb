@@ -130,6 +130,7 @@ struct SeedSeriesRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedSampleRow {
+    org_id: String,
     fingerprint: u128,
     unix_milli: i64,
     value: f64,
@@ -137,6 +138,7 @@ struct SeedSampleRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedHistRow {
+    org_id: String,
     fingerprint: u128,
     unix_milli: i64,
     schema: i8,
@@ -281,6 +283,7 @@ async fn seed(client: &ChClient, fx: &[Series], bucket: i64) {
         .iter()
         .flat_map(|s| {
             s.samples.iter().map(move |(t, bits)| SeedSampleRow {
+                org_id: String::new(),
                 fingerprint: u128::from(s.fp),
                 unix_milli: *t,
                 value: f64::from_bits(*bits),
@@ -300,6 +303,7 @@ async fn seed(client: &ChClient, fx: &[Series], bucket: i64) {
         .flat_map(|s| {
             let cols = cols.clone();
             s.hist_samples.iter().map(move |t| SeedHistRow {
+                org_id: String::new(),
                 fingerprint: u128::from(s.fp),
                 unix_milli: *t,
                 schema: cols.schema,
@@ -2019,6 +2023,7 @@ async fn the_grouped_fps_array_types_as_uint128_and_maps_each_boundary_value() {
 /// and its own label row in `metric_labels`.
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedActivityRow {
+    org_id: String,
     day: u16,
     fingerprint: u128,
     metric_name: String,
@@ -2027,6 +2032,7 @@ struct SeedActivityRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedLabelRow {
+    org_id: String,
     metric_name: String,
     fingerprint: u128,
     labels: String,
@@ -2039,6 +2045,7 @@ async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
     let activity: Vec<SeedActivityRow> = rows
         .iter()
         .map(|r| SeedActivityRow {
+            org_id: String::new(),
             day: r.unix_milli.div_euclid(86_400_000) as u16,
             fingerprint: r.fingerprint,
             metric_name: r.metric_name.clone(),
@@ -2048,6 +2055,7 @@ async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
     let labels: Vec<SeedLabelRow> = rows
         .iter()
         .map(|r| SeedLabelRow {
+            org_id: String::new(),
             metric_name: r.metric_name.clone(),
             fingerprint: r.fingerprint,
             labels: r.labels.clone(),

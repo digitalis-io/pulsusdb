@@ -43,6 +43,7 @@ use pulsus_model::{FpLiteral, Tenant};
 
 use crate::logql::escape::ch_string;
 
+use super::TenantSql;
 use super::matcher::{DataWindow, DiscoveryFilter, LabelMatcher};
 use super::series_where::{Lookup, SeriesTables, SeriesWhere};
 
@@ -195,17 +196,18 @@ pub fn series_labels_by_fingerprint(
     metric_names: &[String],
     fps: &[FpLiteral],
 ) -> String {
-    let _ = tenant;
     format!(
         "SELECT fingerprint, any(name) AS metric_name, any(label_text) AS labels\n\
          FROM (\n\
          \x20 SELECT fingerprint, metric_name AS name, labels AS label_text\n\
          \x20 FROM {labels_table}\n\
-         \x20 WHERE {}\n\
+         \x20 WHERE org_id = {}\n\
+         \x20   AND {}\n\
          \x20   AND {}\n\
          )\n\
          GROUP BY fingerprint\n\
          ORDER BY metric_name, fingerprint",
+        tenant.sql_literal(),
         names_scope(metric_names),
         ids_scope(fps)
     )
@@ -471,13 +473,13 @@ pub fn metadata_query(
     metric: Option<&str>,
     limit: Option<usize>,
 ) -> String {
-    let _ = tenant;
     let mut sql = String::from(
         "SELECT metric_name, tupleElement(d, 1) AS metric_type, tupleElement(d, 2) AS help, tupleElement(d, 3) AS unit\nFROM (SELECT metric_name, argMax((metric_type, help, unit), updated_ns) AS d",
     );
     sql.push_str(&format!("\nFROM {metadata_table}"));
+    sql.push_str(&format!("\nWHERE org_id = {}", tenant.sql_literal()));
     if let Some(name) = metric {
-        sql.push_str(&format!("\nWHERE metric_name = {}", ch_string(name)));
+        sql.push_str(&format!("\n  AND metric_name = {}", ch_string(name)));
     }
     sql.push_str("\nGROUP BY metric_name)\nORDER BY metric_name");
     if let Some(n) = limit {
@@ -524,7 +526,7 @@ mod tests {
             &[],
         );
         assert!(sql.contains("metric_name = 'http_requests_total'"));
-        assert!(sql.contains("WHERE day BETWEEN '1970-01-01' AND '1970-01-01'\n"));
+        assert!(sql.contains("\n  AND day BETWEEN '1970-01-01' AND '1970-01-01'\n"));
         assert!(sql.starts_with("SELECT fingerprint\nFROM metric_series"));
     }
 
@@ -1064,7 +1066,7 @@ mod tests {
             window(),
         );
         assert!(!sql.contains("metric_name ="));
-        assert!(sql.contains("WHERE day BETWEEN '1970-01-01' AND '1970-01-01'\n"));
+        assert!(sql.contains(" AND day BETWEEN '1970-01-01' AND '1970-01-01'\n"));
     }
 
     #[test]
@@ -1217,7 +1219,7 @@ mod tests {
             &[Fingerprint::from_raw(1).sql_literal()],
             window(),
         );
-        assert!(sql.contains("WHERE day BETWEEN "));
+        assert!(sql.contains("AND day BETWEEN "));
         assert!(sql.contains("AND bitAnd(hours, "));
     }
 
@@ -1262,14 +1264,16 @@ mod tests {
             sql,
             "SELECT DISTINCT metric_name\n\
              FROM metric_series\n\
-             WHERE day BETWEEN '1970-01-01' AND '1970-01-01'\n\
+             WHERE org_id = ''\n\
+             \x20 AND day BETWEEN '1970-01-01' AND '1970-01-01'\n\
              \x20 AND 0 * match('', '(?-s)^(?:up.*)$') = 0\n\
              \x20 AND bitAnd(hours, multiIf(day = '1970-01-01' AND day = '1970-01-01', 3, \
              day = '1970-01-01', 16777215, day = '1970-01-01', 3, 16777215)) != 0\n\
              \x20 AND fingerprint IN (\n\
              \x20   SELECT fingerprint\n\
              \x20   FROM metric_labels\n\
-             \x20   WHERE match(metric_name, '(?-s)^(?:up.*)$')\n\
+             \x20   WHERE org_id = ''\n\
+             \x20     AND match(metric_name, '(?-s)^(?:up.*)$')\n\
              \x20 )\n\
              ORDER BY metric_name\n\
              LIMIT 3"
@@ -1296,7 +1300,7 @@ mod tests {
             window(),
             5,
         );
-        assert!(sql.contains("    WHERE metric_name != 'up'\n"), "{sql}");
+        assert!(sql.contains("      AND metric_name != 'up'\n"), "{sql}");
         assert!(
             sql.contains("      AND NOT match(metric_name, '(?-s)^(?:down.*)$')\n"),
             "{sql}"
@@ -1426,6 +1430,7 @@ mod tests {
              tupleElement(d, 2) AS help, tupleElement(d, 3) AS unit\n\
              FROM (SELECT metric_name, argMax((metric_type, help, unit), updated_ns) AS d\n\
              FROM metric_metadata\n\
+             WHERE org_id = ''\n\
              GROUP BY metric_name)\n\
              ORDER BY metric_name"
         );
@@ -1434,7 +1439,7 @@ mod tests {
             1,
             "one aggregate, so one row wins whole: {sql}"
         );
-        assert!(!sql.contains("WHERE"));
+        assert!(!sql.contains("metric_name ="));
         assert!(!sql.contains("LIMIT"));
 
         let filtered = metadata_query(&no_tenant(), "metric_metadata", Some("up"), Some(10));
@@ -1444,7 +1449,8 @@ mod tests {
              tupleElement(d, 2) AS help, tupleElement(d, 3) AS unit\n\
              FROM (SELECT metric_name, argMax((metric_type, help, unit), updated_ns) AS d\n\
              FROM metric_metadata\n\
-             WHERE metric_name = 'up'\n\
+             WHERE org_id = ''\n\
+             \x20 AND metric_name = 'up'\n\
              GROUP BY metric_name)\n\
              ORDER BY metric_name\n\
              LIMIT 10"
@@ -1455,7 +1461,7 @@ mod tests {
     #[test]
     fn metadata_query_filters_on_the_given_metric_name() {
         let sql = metadata_query(&no_tenant(), "metric_metadata", Some("up"), None);
-        assert!(sql.contains("WHERE metric_name = 'up'"));
+        assert!(sql.contains("\n  AND metric_name = 'up'"));
     }
 
     #[test]
@@ -1468,7 +1474,7 @@ mod tests {
     fn metadata_query_metric_name_injection_stays_inside_one_literal() {
         let payload = "up'; DROP TABLE metric_metadata; --";
         let sql = metadata_query(&no_tenant(), "metric_metadata", Some(payload), None);
-        assert!(sql.contains(&format!("WHERE metric_name = {}", ch_string(payload))));
+        assert!(sql.contains(&format!("AND metric_name = {}", ch_string(payload))));
         assert_no_unescaped_quote(&ch_string(payload));
     }
 
@@ -1539,6 +1545,10 @@ mod tests {
             while let Some(line) = lines.next() {
                 if line.trim() == "FROM metric_labels" {
                     reads += 1;
+                    // Issue #635 part 4: the tenant, then the name, as the
+                    // key orders them.
+                    let tenant = lines.next().unwrap_or_default();
+                    assert!(tenant.contains("org_id = ''"), "{tenant:?} in {sql}");
                     let next = lines.next().unwrap_or_default();
                     assert!(next.contains("metric_name"), "{next:?} in {sql}");
                 }
@@ -1578,13 +1588,15 @@ mod tests {
         let s1 = format!(
             "SELECT fingerprint\n\
              FROM metric_series\n\
-             WHERE day BETWEEN '2026-09-07' AND '2026-09-07'\n\
+             WHERE org_id = ''\n\
+             \x20 AND day BETWEEN '2026-09-07' AND '2026-09-07'\n\
              \x20 AND 0 * match('', '(?-s)^(?:5..)$') = 0\n\
              \x20 AND bitAnd(hours, {MASK}) != 0\n\
              \x20 AND fingerprint IN (\n\
              \x20   SELECT fingerprint\n\
              \x20   FROM metric_labels\n\
-             \x20   WHERE metric_name = 'up'\n\
+             \x20   WHERE org_id = ''\n\
+             \x20     AND metric_name = 'up'\n\
              \x20     AND JSONExtractString(labels, 'job') = 'api'\n\
              \x20     AND match(JSONExtractString(labels, 'status'), '(?-s)^(?:5..)$')\n\
              \x20 )"
@@ -1606,19 +1618,22 @@ mod tests {
              FROM (\n\
              \x20 SELECT fingerprint, metric_name AS name, labels AS label_text\n\
              \x20 FROM metric_labels\n\
-             \x20 WHERE metric_name = 'up'\n\
+             \x20 WHERE org_id = ''\n\
+             \x20   AND metric_name = 'up'\n\
              \x20   AND JSONExtractString(labels, 'job') = 'api'\n\
              \x20   AND match(JSONExtractString(labels, 'status'), '(?-s)^(?:5..)$')\n\
              \x20   AND fingerprint IN (\n\
              \x20     SELECT fingerprint\n\
              \x20     FROM metric_series\n\
-             \x20     WHERE day BETWEEN '2026-09-07' AND '2026-09-07'\n\
+             \x20     WHERE org_id = ''\n\
+             \x20       AND day BETWEEN '2026-09-07' AND '2026-09-07'\n\
              \x20       AND 0 * match('', '(?-s)^(?:5..)$') = 0\n\
              \x20       AND bitAnd(hours, {MASK}) != 0\n\
              \x20       AND fingerprint IN (\n\
              \x20         SELECT fingerprint\n\
              \x20         FROM metric_labels\n\
-             \x20         WHERE metric_name = 'up'\n\
+             \x20         WHERE org_id = ''\n\
+             \x20           AND metric_name = 'up'\n\
              \x20           AND JSONExtractString(labels, 'job') = 'api'\n\
              \x20           AND match(JSONExtractString(labels, 'status'), '(?-s)^(?:5..)$')\n\
              \x20       )\n\
@@ -1671,13 +1686,15 @@ mod tests {
             format!(
                 "SELECT DISTINCT metric_name\n\
                  FROM metric_series\n\
-                 WHERE day BETWEEN '2026-09-07' AND '2026-09-07'\n\
+                 WHERE org_id = ''\n\
+                 \x20 AND day BETWEEN '2026-09-07' AND '2026-09-07'\n\
                  \x20 AND 0 * match('', '(?-s)^(?:5..)$') = 0\n\
                  \x20 AND bitAnd(hours, {MASK}) != 0\n\
                  \x20 AND fingerprint IN (\n\
                  \x20   SELECT fingerprint\n\
                  \x20   FROM metric_labels\n\
-                 \x20   WHERE JSONExtractString(labels, 'job') = 'api'\n\
+                 \x20   WHERE org_id = ''\n\
+                 \x20     AND JSONExtractString(labels, 'job') = 'api'\n\
                  \x20     AND match(JSONExtractString(labels, 'status'), '(?-s)^(?:5..)$')\n\
                  \x20 )\n\
                  ORDER BY metric_name"
@@ -1695,7 +1712,8 @@ mod tests {
             format!(
                 "SELECT DISTINCT metric_name\n\
                  FROM metric_series\n\
-                 WHERE day BETWEEN '2026-09-07' AND '2026-09-07'\n\
+                 WHERE org_id = ''\n\
+                 \x20 AND day BETWEEN '2026-09-07' AND '2026-09-07'\n\
                  \x20 AND bitAnd(hours, {MASK}) != 0\n\
                  ORDER BY metric_name"
             ),
@@ -1708,7 +1726,8 @@ mod tests {
              FROM (\n\
              \x20 SELECT fingerprint, metric_name AS name, labels AS label_text\n\
              \x20 FROM metric_labels\n\
-             \x20 WHERE metric_name IN ('up', 'down')\n\
+             \x20 WHERE org_id = ''\n\
+             \x20   AND metric_name IN ('up', 'down')\n\
              \x20   AND fingerprint IN (toUInt128('101'), toUInt128('205'))\n\
              )\n\
              GROUP BY fingerprint\n\
@@ -1729,17 +1748,20 @@ mod tests {
                  FROM (\n\
                  \x20 SELECT fingerprint, metric_name AS name, labels AS label_text\n\
                  \x20 FROM metric_labels\n\
-                 \x20 WHERE metric_name IN ('up', 'down')\n\
+                 \x20 WHERE org_id = ''\n\
+                 \x20   AND metric_name IN ('up', 'down')\n\
                  \x20   AND fingerprint IN (toUInt128('101'), toUInt128('205'))\n\
                  \x20   AND fingerprint IN (\n\
                  \x20     SELECT fingerprint\n\
                  \x20     FROM metric_series\n\
-                 \x20     WHERE day BETWEEN '2026-09-07' AND '2026-09-07'\n\
+                 \x20     WHERE org_id = ''\n\
+                 \x20       AND day BETWEEN '2026-09-07' AND '2026-09-07'\n\
                  \x20       AND bitAnd(hours, {MASK}) != 0\n\
                  \x20       AND fingerprint IN (\n\
                  \x20         SELECT fingerprint\n\
                  \x20         FROM metric_labels\n\
-                 \x20         WHERE metric_name IN ('up', 'down')\n\
+                 \x20         WHERE org_id = ''\n\
+                 \x20           AND metric_name IN ('up', 'down')\n\
                  \x20           AND fingerprint IN (toUInt128('101'), toUInt128('205'))\n\
                  \x20       )\n\
                  \x20   )\n\
@@ -1759,7 +1781,7 @@ mod tests {
         );
         assert!(
             by_names.contains(
-                "\n  WHERE metric_name IN ('up', 'down')\n    AND JSONExtractString(labels, 'job') = 'api'\n"
+                "\n  WHERE org_id = ''\n    AND metric_name IN ('up', 'down')\n    AND JSONExtractString(labels, 'job') = 'api'\n"
             ),
             "{by_names}"
         );
@@ -1792,26 +1814,31 @@ mod tests {
                 value: "5..".to_string(),
             },
         ];
+        // Issue #635 part 4: the design's scoped statements, as tenant-q.
+        let header = http::HeaderValue::from_static("tenant-q");
+        let tenant_q = Tenant::from_header(Some(&header), false).expect("a tenant");
         let window = DataWindow {
             start_ms: 1_791_408_060_000,
             end_ms: 1_791_409_260_000,
         };
         assert_eq!(
-            nameless_resolution_query(&no_tenant(), t, &matchers, window, 50_000),
+            nameless_resolution_query(&tenant_q, t, &matchers, window, 50_000),
             "SELECT fingerprint, any(name) AS metric_name, any(label_text) AS labels
 FROM (
   SELECT fingerprint, metric_name AS name, labels AS label_text
   FROM metric_labels
-  WHERE fingerprint IN (
+  WHERE org_id = 'tenant-q'
+    AND fingerprint IN (
       SELECT fingerprint
       FROM metric_series
-      WHERE day BETWEEN '2026-10-07' AND '2026-10-07'
+      WHERE org_id = 'tenant-q'
+        AND day BETWEEN '2026-10-07' AND '2026-10-07'
         AND 0 * match('', '(?-s)^(?:5..)$') = 0
         AND bitAnd(hours, multiIf(day = '2026-10-07' AND day = '2026-10-07', 2097152, day = '2026-10-07', 14680064, day = '2026-10-07', 4194303, 16777215)) != 0
         AND fingerprint IN (
-          SELECT fingerprint FROM metric_label_index WHERE key = 'job' AND value = 'api'
+          SELECT fingerprint FROM metric_label_index WHERE org_id = 'tenant-q' AND key = 'job' AND value = 'api'
           INTERSECT
-          SELECT fingerprint FROM metric_label_index WHERE key = 'status' AND value IN (SELECT value FROM metric_label_values WHERE key = 'status' AND match(value, '(?-s)^(?:5..)$'))
+          SELECT fingerprint FROM metric_label_index WHERE org_id = 'tenant-q' AND key = 'status' AND value IN (SELECT value FROM metric_label_values WHERE org_id = 'tenant-q' AND key = 'status' AND match(value, '(?-s)^(?:5..)$'))
         )
     )
 )
@@ -1821,16 +1848,17 @@ LIMIT 50001",
             "statement R"
         );
         assert_eq!(
-            nameless_ids_query(&no_tenant(), t, &matchers, window),
+            nameless_ids_query(&tenant_q, t, &matchers, window),
             "SELECT fingerprint
 FROM metric_series
-WHERE day BETWEEN '2026-10-07' AND '2026-10-07'
+WHERE org_id = 'tenant-q'
+  AND day BETWEEN '2026-10-07' AND '2026-10-07'
   AND 0 * match('', '(?-s)^(?:5..)$') = 0
   AND bitAnd(hours, multiIf(day = '2026-10-07' AND day = '2026-10-07', 2097152, day = '2026-10-07', 14680064, day = '2026-10-07', 4194303, 16777215)) != 0
   AND fingerprint IN (
-    SELECT fingerprint FROM metric_label_index WHERE key = 'job' AND value = 'api'
+    SELECT fingerprint FROM metric_label_index WHERE org_id = 'tenant-q' AND key = 'job' AND value = 'api'
     INTERSECT
-    SELECT fingerprint FROM metric_label_index WHERE key = 'status' AND value IN (SELECT value FROM metric_label_values WHERE key = 'status' AND match(value, '(?-s)^(?:5..)$'))
+    SELECT fingerprint FROM metric_label_index WHERE org_id = 'tenant-q' AND key = 'status' AND value IN (SELECT value FROM metric_label_values WHERE org_id = 'tenant-q' AND key = 'status' AND match(value, '(?-s)^(?:5..)$'))
   )",
             "statement 1"
         );

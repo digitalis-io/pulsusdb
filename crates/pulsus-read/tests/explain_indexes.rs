@@ -2051,9 +2051,10 @@ fn expected_metric_samples_fetch_usage() -> Vec<String> {
         "Condition: true",
         "PrimaryKey",
         "Keys:",
+        "org_id",
         "fingerprint",
         "unix_milli",
-        "Condition: and((fingerprint in #-element set), and((unix_milli in (-Inf, #]), (unix_milli in [#, +Inf))))",
+        "Condition: and((fingerprint in #-element set), and((unix_milli in (-Inf, #]), and((unix_milli in [#, +Inf)), (org_id in ['', '']))))",
     ])
 }
 
@@ -2181,9 +2182,10 @@ async fn promql_multi_metric_fanout_prunes_on_both_metric_name_and_fingerprint_k
             "Condition: true",
             "PrimaryKey",
             "Keys:",
+            "org_id",
             "fingerprint",
             "unix_milli",
-            "Condition: and((fingerprint in #-element set), and((unix_milli in (-Inf, #]), (unix_milli in [#, +Inf))))",
+            "Condition: and((fingerprint in #-element set), and((unix_milli in (-Inf, #]), and((unix_milli in [#, +Inf)), (org_id in ['', '']))))",
         ]),
         "the fingerprint IN component must engage the primary key"
     );
@@ -2276,9 +2278,10 @@ async fn info_selector_fetch_prunes_on_metric_name_and_its_resolution_probe_is_l
             "Condition: true",
             "PrimaryKey",
             "Keys:",
+            "org_id",
             "fingerprint",
             "unix_milli",
-            "Condition: and((fingerprint in #-element set), and((unix_milli in (-Inf, #]), (unix_milli in [#, +Inf))))",
+            "Condition: and((fingerprint in #-element set), and((unix_milli in (-Inf, #]), and((unix_milli in [#, +Inf)), (org_id in ['', '']))))",
         ]),
         "the info() sample fetch must PK-prune on its IDs exactly like any concrete-name fetch"
     );
@@ -2329,8 +2332,9 @@ async fn info_selector_fetch_prunes_on_metric_name_and_its_resolution_probe_is_l
             "Condition: and((day in (-Inf, #]), (day in [#, +Inf)))",
             "PrimaryKey",
             "Keys:",
+            "org_id",
             "fingerprint",
-            "Condition: (fingerprint in #-element set)",
+            "Condition: and((fingerprint in #-element set), (org_id in ['', '']))",
         ]),
         "the LIMIT-bounded resolution probe must prune activity by its day partitions and by \
          the IDs the lookup selects"
@@ -2413,9 +2417,10 @@ async fn discovery_multi_metric_fanout_prunes_on_both_metric_name_and_fingerprin
             // set is built and not printed here.
             "PrimaryKey",
             "Keys:",
+            "org_id",
             "metric_name",
             "fingerprint",
-            "Condition: and((fingerprint in #-element set), and((fingerprint in #-element set), (metric_name in #-element set)))",
+            "Condition: and((fingerprint in #-element set), and((fingerprint in #-element set), and((metric_name in #-element set), (org_id in ['', '']))))",
         ]),
         "both the metric_name IN and fingerprint IN components must engage the lookup's primary key"
     );
@@ -2474,7 +2479,9 @@ async fn discovery_distinct_names_engages_the_same_indexes_as_the_wide_discovery
             "day",
             "Condition: and((day in (-Inf, #]), (day in [#, +Inf)))",
             "PrimaryKey",
-            "Condition: true",
+            "Keys:",
+            "org_id",
+            "Condition: (org_id in ['', ''])",
         ]),
         "the narrow name projection must carry the day window into the MinMax and \
          Partition analysis"
@@ -2489,8 +2496,9 @@ async fn discovery_distinct_names_engages_the_same_indexes_as_the_wide_discovery
         v(&[
             "PrimaryKey",
             "Keys:",
+            "org_id",
             "fingerprint",
-            "Condition: (fingerprint in #-element set)",
+            "Condition: and((fingerprint in #-element set), (org_id in ['', '']))",
         ]),
         "the wide discovery read must reach `metric_labels` through its key"
     );
@@ -2549,9 +2557,10 @@ async fn discovery_fetch_by_names_prunes_on_the_metric_name_primary_key_componen
             // the IDs the activity read finds in the window.
             "PrimaryKey",
             "Keys:",
+            "org_id",
             "metric_name",
             "fingerprint",
-            "Condition: and((fingerprint in #-element set), (metric_name in #-element set))",
+            "Condition: and((fingerprint in #-element set), and((metric_name in #-element set), (org_id in ['', ''])))",
         ]),
         "the metric_name IN component must engage the lookup's primary key"
     );
@@ -2637,8 +2646,9 @@ async fn the_re2_compile_probe_costs_the_metric_series_fallback_no_index_engagem
             // activity key prunes on.
             "PrimaryKey",
             "Keys:",
+            "org_id",
             "fingerprint",
-            "Condition: (fingerprint in #-element set)",
+            "Condition: and((fingerprint in #-element set), (org_id in ['', '']))",
         ]),
         "the day window must still prune the activity partitions and the IDs its key"
     );

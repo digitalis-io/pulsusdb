@@ -49,7 +49,11 @@ pub type StreamLru = LruSet<StreamKey>;
 /// and a histogram sample in the same activity bucket registers **both**
 /// `metric_series` rows (the per-series float/histogram discriminator) —
 /// they are distinct keys, not a false LRU hit that would suppress one.
-pub type SeriesKey = (Arc<str>, Fingerprint, i64, u8);
+///
+/// Issue #635 part 4: the leading `Arc<str>` is the push's tenant. Without
+/// it tenant B's first registration of a series tenant A already
+/// registered would be suppressed.
+pub type SeriesKey = (Arc<str>, Arc<str>, Fingerprint, i64, u8);
 pub type SeriesLru = LruSet<SeriesKey>;
 
 /// The resend interval for a metric's descriptor (issue #623): a descriptor
@@ -69,14 +73,18 @@ struct SentDescriptor {
     updated_ns: i64,
 }
 
-/// The descriptors this writer last sent, one per metric name, bounded like
+/// The key the descriptor cache records under (issue #635 part 4): the
+/// tenant and the metric name.
+type DescriptorKey = (Arc<str>, Arc<str>);
+
+/// The descriptors this writer last sent, one per tenant and metric name, bounded like
 /// [`SeriesLru`] (issue #623). A push sends a metric's descriptor only when it
 /// differs from the one recorded here or the hour has turned since. Promoted
 /// only when a block commits, so a block that failed records nothing and the
 /// next push sends the descriptor again. An evicted name is sent again too.
 pub struct DescriptorCache {
-    names: LruSet<Arc<str>>,
-    sent: HashMap<Arc<str>, SentDescriptor>,
+    names: LruSet<DescriptorKey>,
+    sent: HashMap<DescriptorKey, SentDescriptor>,
 }
 
 impl DescriptorCache {
@@ -91,13 +99,15 @@ impl DescriptorCache {
     /// for `metric_name`, in `hour`: the push need not send it again.
     pub fn is_current(
         &self,
+        tenant: &str,
         metric_name: &str,
         metric_type: &str,
         help: &str,
         unit: &str,
         hour: i64,
     ) -> bool {
-        self.sent.get(metric_name).is_some_and(|sent| {
+        let key: DescriptorKey = (Arc::from(tenant), Arc::from(metric_name));
+        self.sent.get(&key).is_some_and(|sent| {
             sent.hour == hour
                 && sent.metric_type == metric_type
                 && sent.help == help
@@ -108,8 +118,10 @@ impl DescriptorCache {
     /// Records a descriptor a committed block carried. A descriptor older
     /// than the one recorded is ignored: blocks can commit out of order, and
     /// the table keeps the newest.
+    #[allow(clippy::too_many_arguments)] // the tenant beside the descriptor's own fields
     pub fn promote(
         &mut self,
+        tenant: &str,
         metric_name: &str,
         metric_type: &str,
         help: &str,
@@ -117,19 +129,19 @@ impl DescriptorCache {
         hour: i64,
         updated_ns: i64,
     ) {
+        let key: DescriptorKey = (Arc::from(tenant), Arc::from(metric_name));
         if self
             .sent
-            .get(metric_name)
+            .get(&key)
             .is_some_and(|sent| sent.updated_ns > updated_ns)
         {
             return;
         }
-        let name: Arc<str> = Arc::from(metric_name);
-        if let Some(evicted) = self.names.insert_evicting(name.clone()) {
+        if let Some(evicted) = self.names.insert_evicting(key.clone()) {
             self.sent.remove(&evicted);
         }
         self.sent.insert(
-            name,
+            key,
             SentDescriptor {
                 metric_type: metric_type.to_string(),
                 help: help.to_string(),
@@ -357,9 +369,9 @@ mod tests {
         let mut lru: SeriesLru = LruSet::new(10);
         let a: Arc<str> = Arc::from("http_requests_total");
         let b: Arc<str> = Arc::from("http_errors_total");
-        lru.insert((a.clone(), Fingerprint::from_raw(42), 0, 0));
-        assert!(lru.contains(&(a, Fingerprint::from_raw(42), 0, 0)));
-        assert!(!lru.contains(&(b, Fingerprint::from_raw(42), 0, 0)));
+        lru.insert((Arc::from(""), a.clone(), Fingerprint::from_raw(42), 0, 0));
+        assert!(lru.contains(&(Arc::from(""), a, Fingerprint::from_raw(42), 0, 0)));
+        assert!(!lru.contains(&(Arc::from(""), b, Fingerprint::from_raw(42), 0, 0)));
     }
 
     #[test]
@@ -369,9 +381,9 @@ mod tests {
         // register, never one suppressing the other.
         let mut lru: SeriesLru = LruSet::new(10);
         let name: Arc<str> = Arc::from("http_request_duration");
-        lru.insert((name.clone(), Fingerprint::from_raw(7), 0, 0));
-        assert!(lru.contains(&(name.clone(), Fingerprint::from_raw(7), 0, 0)));
-        assert!(!lru.contains(&(name, Fingerprint::from_raw(7), 0, 1)));
+        lru.insert((Arc::from(""), name.clone(), Fingerprint::from_raw(7), 0, 0));
+        assert!(lru.contains(&(Arc::from(""), name.clone(), Fingerprint::from_raw(7), 0, 0)));
+        assert!(!lru.contains(&(Arc::from(""), name, Fingerprint::from_raw(7), 0, 1)));
     }
 
     #[test]
@@ -396,13 +408,13 @@ mod tests {
     fn an_unchanged_descriptor_in_the_same_hour_is_current() {
         let mut cache = DescriptorCache::new(10);
         assert!(
-            !cache.is_current("up", "gauge", "h", "", 5),
+            !cache.is_current("", "up", "gauge", "h", "", 5),
             "nothing sent yet"
         );
-        cache.promote("up", "gauge", "h", "", 5, 100);
-        assert!(cache.is_current("up", "gauge", "h", "", 5));
+        cache.promote("", "up", "gauge", "h", "", 5, 100);
+        assert!(cache.is_current("", "up", "gauge", "h", "", 5));
         assert!(
-            !cache.is_current("down", "gauge", "h", "", 5),
+            !cache.is_current("", "down", "gauge", "h", "", 5),
             "another name is not current"
         );
     }
@@ -410,17 +422,17 @@ mod tests {
     #[test]
     fn a_changed_type_help_or_unit_is_not_current() {
         let mut cache = DescriptorCache::new(10);
-        cache.promote("up", "gauge", "h", "s", 5, 100);
-        assert!(!cache.is_current("up", "counter", "h", "s", 5));
-        assert!(!cache.is_current("up", "gauge", "other", "s", 5));
-        assert!(!cache.is_current("up", "gauge", "h", "bytes", 5));
+        cache.promote("", "up", "gauge", "h", "s", 5, 100);
+        assert!(!cache.is_current("", "up", "counter", "h", "s", 5));
+        assert!(!cache.is_current("", "up", "gauge", "other", "s", 5));
+        assert!(!cache.is_current("", "up", "gauge", "h", "bytes", 5));
     }
 
     #[test]
     fn a_descriptor_is_sent_again_once_its_hour_turns() {
         let mut cache = DescriptorCache::new(10);
-        cache.promote("up", "gauge", "h", "", 5, 100);
-        assert!(!cache.is_current("up", "gauge", "h", "", 6));
+        cache.promote("", "up", "gauge", "h", "", 5, 100);
+        assert!(!cache.is_current("", "up", "gauge", "h", "", 6));
     }
 
     /// A then B then A: the last one sent is B, so A must go again. A set of
@@ -428,10 +440,10 @@ mod tests {
     #[test]
     fn going_back_to_an_earlier_descriptor_sends_it_again() {
         let mut cache = DescriptorCache::new(10);
-        cache.promote("up", "gauge", "a", "", 5, 100);
-        cache.promote("up", "gauge", "b", "", 5, 200);
-        assert!(!cache.is_current("up", "gauge", "a", "", 5));
-        assert!(cache.is_current("up", "gauge", "b", "", 5));
+        cache.promote("", "up", "gauge", "a", "", 5, 100);
+        cache.promote("", "up", "gauge", "b", "", 5, 200);
+        assert!(!cache.is_current("", "up", "gauge", "a", "", 5));
+        assert!(cache.is_current("", "up", "gauge", "b", "", 5));
     }
 
     /// Two blocks can commit out of order. The older descriptor committing
@@ -439,23 +451,23 @@ mod tests {
     #[test]
     fn a_late_commit_of_an_older_descriptor_does_not_replace_a_newer_one() {
         let mut cache = DescriptorCache::new(10);
-        cache.promote("up", "gauge", "new", "", 5, 200);
-        cache.promote("up", "gauge", "old", "", 5, 100);
-        assert!(cache.is_current("up", "gauge", "new", "", 5));
-        assert!(!cache.is_current("up", "gauge", "old", "", 5));
+        cache.promote("", "up", "gauge", "new", "", 5, 200);
+        cache.promote("", "up", "gauge", "old", "", 5, 100);
+        assert!(cache.is_current("", "up", "gauge", "new", "", 5));
+        assert!(!cache.is_current("", "up", "gauge", "old", "", 5));
     }
 
     #[test]
     fn the_descriptor_cache_is_bounded() {
         let mut cache = DescriptorCache::new(2);
-        cache.promote("a", "gauge", "", "", 5, 1);
-        cache.promote("b", "gauge", "", "", 5, 1);
-        cache.promote("c", "gauge", "", "", 5, 1);
+        cache.promote("", "a", "gauge", "", "", 5, 1);
+        cache.promote("", "b", "gauge", "", "", 5, 1);
+        cache.promote("", "c", "gauge", "", "", 5, 1);
         assert_eq!(cache.len(), 2);
         assert!(
-            !cache.is_current("a", "gauge", "", "", 5),
+            !cache.is_current("", "a", "gauge", "", "", 5),
             "the oldest was evicted"
         );
-        assert!(cache.is_current("c", "gauge", "", "", 5));
+        assert!(cache.is_current("", "c", "gauge", "", "", 5));
     }
 }

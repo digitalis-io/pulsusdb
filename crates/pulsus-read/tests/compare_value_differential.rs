@@ -29,7 +29,7 @@
 //! verbatim (no `arrayFilter` fold to nil) to match. The `ci` job's
 //! aggregate `--workspace` run executes this binary, where it self-skips
 //! green; the `schema-it` job supplies its gate and runs it **enforced**
-//! (`.github/workflows/ci.yml:1774-1779`, no `continue-on-error`). (Issue
+//! (`.github/workflows/ci.yml:1792-1797`, no `continue-on-error`). (Issue
 //! #278 measured the claim this sentence replaced — that being env-gated
 //! kept fast CI from running the binary at all — and found it false in
 //! both of those ways.)

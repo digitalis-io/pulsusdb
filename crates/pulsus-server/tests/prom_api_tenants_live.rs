@@ -952,7 +952,8 @@ const TENANT_O_ONLY: [&str; 15] = [
     "\"h_y\"",
 ];
 
-/// Whether an answer's payload is empty: no series, no names, no values.
+/// Whether an answer's payload is empty: no series, no names, no values,
+/// and of label names only the `__name__` every `/labels` answer lists.
 fn is_empty_answer(body: &str) -> bool {
     let v = json(body);
     let data = &v["data"];
@@ -963,7 +964,8 @@ fn is_empty_answer(body: &str) -> bool {
         return stats["numSeries"] == serde_json::json!(0);
     }
     match data {
-        serde_json::Value::Array(a) => a.is_empty(),
+        // `/labels` always lists `__name__` (docs/api.md §3.3), data or none.
+        serde_json::Value::Array(a) => a.iter().all(|v| v == "__name__"),
         serde_json::Value::Object(o) => o.is_empty(),
         _ => false,
     }

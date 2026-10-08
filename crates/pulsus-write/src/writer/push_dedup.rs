@@ -71,7 +71,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use pulsus_model::{Fingerprint, LabelSet};
+use pulsus_model::{Fingerprint, LabelSet, Tenant};
 use tokio::sync::oneshot;
 // `tokio::time::Instant`, not `std::time::Instant`: the window and the
 // claim deadline are both minutes long, and a test that has to wait them
@@ -303,12 +303,18 @@ fn key_digest(key: &str) -> PushDigest {
 /// Resolves a log push's identity — the digest of the `Idempotency-Key`
 /// when the client sent one, else of the request's own content.
 pub fn log_identity(batch: &ParsedLogs, headers: &PushHeaders) -> PushIdentity {
-    identity_from(log_content_digest(batch), headers)
+    identity_from(log_content_digest(batch), headers, None)
 }
 
-/// Resolves a metric push's identity — see [`log_identity`].
-pub fn metric_identity(batch: &ParsedMetrics, headers: &PushHeaders) -> PushIdentity {
-    identity_from(metric_content_digest(batch), headers)
+/// Resolves a metric push's identity — see [`log_identity`]. Issue #635
+/// part 4: the push's tenant is in the key, so two tenants' identical
+/// pushes, with or without one `Idempotency-Key`, are two pushes.
+pub fn metric_identity(
+    batch: &ParsedMetrics,
+    headers: &PushHeaders,
+    tenant: &Tenant,
+) -> PushIdentity {
+    identity_from(metric_content_digest(batch), headers, Some(tenant))
 }
 
 /// The content digest of a parsed trace push (issue #586).
@@ -393,13 +399,31 @@ fn trace_content_digest(batch: &ParsedTraces) -> PushDigest {
 
 /// Resolves a trace push's identity — see [`log_identity`].
 pub fn trace_identity(batch: &ParsedTraces, headers: &PushHeaders) -> PushIdentity {
-    identity_from(trace_content_digest(batch), headers)
+    identity_from(trace_content_digest(batch), headers, None)
 }
 
-fn identity_from(content: PushDigest, headers: &PushHeaders) -> PushIdentity {
+/// `tenant` is `None` for the logs and traces identities, which are
+/// unchanged; a metric push's tenant is hashed into the key on both
+/// branches, the `Idempotency-Key` digest and the content digest.
+fn identity_from(
+    content: PushDigest,
+    headers: &PushHeaders,
+    tenant: Option<&Tenant>,
+) -> PushIdentity {
     let key = match &headers.idempotency_key {
         Some(k) => key_digest(k),
         None => content,
+    };
+    let key = match tenant {
+        Some(tenant) => {
+            let mut d = DigestBuilder::new();
+            d.str("tenant")
+                .str(tenant.as_str())
+                .u64((key.0 >> 64) as u64)
+                .u64(key.0 as u64);
+            d.finish()
+        }
+        None => key,
     };
     PushIdentity {
         key,
@@ -2165,6 +2189,7 @@ mod tests {
                     idempotency_key: Some(k.to_string()),
                     declared_retry: false,
                 },
+                &Tenant::from_header(None, false).expect("the empty tenant"),
             )
         };
         assert_ne!(keyed("a").key, keyed("b").key);

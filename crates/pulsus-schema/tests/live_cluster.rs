@@ -425,6 +425,7 @@ async fn run_init_clustered_creates_dist_wrappers_on_every_shard_with_identical_
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 struct MetricMetadataRow {
+    org_id: String,
     metric_name: String,
     metric_type: String,
     help: String,
@@ -1382,6 +1383,7 @@ async fn the_same_block_twice_through_the_wrapper_leaves_every_shard_count_uncha
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 struct MetricSampleRow {
+    org_id: String,
     fingerprint: u128,
     unix_milli: i64,
     value: f64,
@@ -1477,6 +1479,7 @@ async fn a_disabling_profile_keeps_repeated_log_and_metric_blocks_and_drops_the_
         body: "issue 560 repeated log block".to_string(),
     };
     let metric = MetricSampleRow {
+        org_id: String::new(),
         fingerprint: 0x0560_0560_0560_0561,
         unix_milli: now / 1_000_000,
         value: 1.0,

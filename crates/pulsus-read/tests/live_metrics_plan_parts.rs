@@ -159,6 +159,7 @@ struct SeedSeriesRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedSampleRow {
+    org_id: String,
     fingerprint: u128,
     unix_milli: i64,
     value: f64,
@@ -166,6 +167,7 @@ struct SeedSampleRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedHistRow {
+    org_id: String,
     fingerprint: u128,
     unix_milli: i64,
     schema: i8,
@@ -253,6 +255,7 @@ async fn seed(client: &ChClient, t: i64, bucket: i64) {
             labels: serde_json::to_string(&labels).expect("labels json"),
         });
         samples.push(SeedSampleRow {
+            org_id: String::new(),
             fingerprint: u128::from(*fp),
             unix_milli: t,
             value: i as f64,
@@ -268,6 +271,7 @@ async fn seed(client: &ChClient, t: i64, bucket: i64) {
             labels: serde_json::to_string(&labels).expect("labels json"),
         });
         samples.push(SeedSampleRow {
+            org_id: String::new(),
             fingerprint: u128::from(*fp),
             unix_milli: t,
             value: i as f64,
@@ -282,6 +286,7 @@ async fn seed(client: &ChClient, t: i64, bucket: i64) {
     // carries, so the dual read has rows on both sides and no `IN` list
     // gains a member.
     let hist = vec![SeedHistRow {
+        org_id: String::new(),
         fingerprint: u128::from(FPS[1]),
         unix_milli: t,
         schema: 0,
@@ -426,7 +431,7 @@ impl Harness {
     fn float_read(&self, fps: &str, back: i64) -> String {
         let p = self.range();
         format!(
-            "SELECT fingerprint, unix_milli, value\nFROM metric_samples\nWHERE unix_milli > {} \
+            "SELECT fingerprint, unix_milli, value\nFROM metric_samples\nWHERE org_id = '' AND unix_milli > {} \
              AND unix_milli <= {}\n  AND fingerprint IN ({fps})\nORDER BY fingerprint, unix_milli",
             p.start_ms - back,
             p.end_ms
@@ -491,14 +496,14 @@ impl Harness {
              CAST(0, 'UInt8') AS is_hist,\n\
              \x20                  reinterpretAsUInt64(value) = 9218868437227405314 AS stale\n\
              \x20           FROM metric_samples\n\
-             \x20           WHERE unix_milli > {lower} AND unix_milli <= {upper} \
+             \x20           WHERE org_id = '' AND unix_milli > {lower} AND unix_milli <= {upper} \
              AND fingerprint IN fps\n\
              \x20           UNION ALL\n\
              \x20           SELECT fingerprint, unix_milli AS ts, CAST(0, 'Float64') AS v, \
              CAST(1, 'UInt8') AS is_hist,\n\
              \x20                  reinterpretAsUInt64(sum) = 9218868437227405314 AS stale\n\
              \x20           FROM metric_hist_samples\n\
-             \x20           WHERE unix_milli > {lower} AND unix_milli <= {upper} \
+             \x20           WHERE org_id = '' AND unix_milli > {lower} AND unix_milli <= {upper} \
              AND fingerprint IN fps\n\
              \x20         )\n\
              \x20       )\n\
@@ -521,7 +526,7 @@ impl Harness {
         let p = self.range();
         format!(
             "SELECT fingerprint, unix_milli, {HIST_COLUMNS}\nFROM \
-             metric_hist_samples\nWHERE unix_milli > {} AND \
+             metric_hist_samples\nWHERE org_id = '' AND unix_milli > {} AND \
              unix_milli <= {}\n  AND fingerprint IN ({fps})\nORDER BY fingerprint, unix_milli",
             p.start_ms - back,
             p.end_ms
@@ -830,6 +835,7 @@ async fn the_plans_sql_parts_are_the_statements_the_database_received() {
 /// and its own label row in `metric_labels`.
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedActivityRow {
+    org_id: String,
     day: u16,
     fingerprint: u128,
     metric_name: String,
@@ -838,6 +844,7 @@ struct SeedActivityRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedLabelRow {
+    org_id: String,
     metric_name: String,
     fingerprint: u128,
     labels: String,
@@ -850,6 +857,7 @@ async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
     let activity: Vec<SeedActivityRow> = rows
         .iter()
         .map(|r| SeedActivityRow {
+            org_id: String::new(),
             day: r.unix_milli.div_euclid(86_400_000) as u16,
             fingerprint: r.fingerprint,
             metric_name: r.metric_name.clone(),
@@ -859,6 +867,7 @@ async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
     let labels: Vec<SeedLabelRow> = rows
         .iter()
         .map(|r| SeedLabelRow {
+            org_id: String::new(),
             metric_name: r.metric_name.clone(),
             fingerprint: r.fingerprint,
             labels: r.labels.clone(),

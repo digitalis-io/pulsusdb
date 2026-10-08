@@ -22,7 +22,7 @@ use pulsus_model::{Fingerprint, LabelSet, Tenant, floor_to_activity_bucket};
 use super::matcher::DataWindow;
 use tokio::task::JoinHandle;
 
-use super::labels::{CacheSnapshot, LabelCache};
+use super::labels::{CacheSnapshot, LabelCache, TenantCache};
 use super::rows::SeriesRow;
 
 /// Renders the §5.2 sweep SQL ([`super::sql::sweep_query`]): every series
@@ -58,15 +58,18 @@ pub(crate) fn now_unix_ms() -> i64 {
 /// `ChError`, the last good snapshot is left untouched and
 /// `refresh_failures_total` is bumped — this is the self-healing contract
 /// [`LabelCache::refresh`] and [`spawn_refresh_loop`] both rely on.
-pub(crate) async fn run_sweep(cache: &LabelCache) -> Result<(), ChError> {
+pub(crate) async fn run_sweep(
+    cache: &LabelCache,
+    tenant: &Tenant,
+    slot: &TenantCache,
+) -> Result<(), ChError> {
     let now_ms = now_unix_ms();
     let lower_bound_ms = floor_to_activity_bucket(
         now_ms - cache.config.window_ms,
         pulsus_model::ACTIVITY_BUCKET_MS,
     );
-    let tenant = Tenant::from_header(None, false).expect("the empty tenant");
     let sql = sweep_sql(
-        &tenant,
+        tenant,
         &cache.config.series_table,
         &cache.config.labels_table,
         DataWindow {
@@ -107,7 +110,7 @@ pub(crate) async fn run_sweep(cache: &LabelCache) -> Result<(), ChError> {
     }
 
     let series_count = by_fingerprint.len() as u64;
-    let generation = cache.current_snapshot().generation.saturating_add(1);
+    let generation = slot.current_snapshot().generation.saturating_add(1);
     let snapshot = CacheSnapshot {
         by_fingerprint,
         by_metric,
@@ -122,7 +125,7 @@ pub(crate) async fn run_sweep(cache: &LabelCache) -> Result<(), ChError> {
     };
 
     {
-        let mut guard = match cache.snapshot.write() {
+        let mut guard = match slot.snapshot.write() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
@@ -200,7 +203,7 @@ pub fn spawn_refresh_loop(cache: Arc<LabelCache>, ttl: Duration) -> JoinHandle<(
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
-            if let Err(err) = run_sweep(&cache).await {
+            if let Err(err) = cache.refresh().await {
                 tracing::warn!(
                     error = %err,
                     "label cache refresh sweep failed; serving the last good snapshot"
@@ -233,10 +236,12 @@ mod tests {
              FROM (\n\
              \x20 SELECT fingerprint, metric_name AS name, labels AS label_text\n\
              \x20 FROM metric_labels\n\
-             \x20 WHERE fingerprint IN (\n\
+             \x20 WHERE org_id = ''\n\
+             \x20   AND fingerprint IN (\n\
              \x20     SELECT fingerprint\n\
              \x20     FROM metric_series\n\
-             \x20     WHERE day BETWEEN '2026-09-07' AND '2026-09-07'\n\
+             \x20     WHERE org_id = ''\n\
+             \x20       AND day BETWEEN '2026-09-07' AND '2026-09-07'\n\
              \x20       AND bitAnd(hours, multiIf(day = '2026-09-07' AND day = '2026-09-07', 12582912, \
              day = '2026-09-07', 12582912, day = '2026-09-07', 16777215, 16777215)) != 0\n\
              \x20   )\n\

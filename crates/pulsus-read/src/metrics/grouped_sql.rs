@@ -80,6 +80,7 @@
 
 use pulsus_model::{FpLiteral, Tenant};
 
+use super::TenantSql;
 use super::grouped::{Grid, GroupedOp, PushedRangeFn, RangeAggOp};
 use super::sample_sql;
 
@@ -129,8 +130,11 @@ pub fn grouped_fetch(
     upper_incl_ms: i64,
     op: GroupedOp,
 ) -> String {
-    let _ = tenant;
-    let window = sample_sql::window_predicate(lower_excl_ms, upper_incl_ms);
+    let window = format!(
+        "org_id = {} AND {}",
+        tenant.sql_literal(),
+        sample_sql::window_predicate(lower_excl_ms, upper_incl_ms)
+    );
     let fp_list = sample_sql::render_fingerprint_list(fps);
     let gid_list = gids
         .iter()
@@ -273,8 +277,11 @@ pub fn range_aggregate_fetch(
     func: PushedRangeFn,
 ) -> String {
     let (lower_excl_ms, upper_incl_ms) = range_window(grid, range_ms);
-    let _ = tenant;
-    let window = sample_sql::window_predicate(lower_excl_ms, upper_incl_ms);
+    let window = format!(
+        "org_id = {} AND {}",
+        tenant.sql_literal(),
+        sample_sql::window_predicate(lower_excl_ms, upper_incl_ms)
+    );
     let fp_list = sample_sql::render_fingerprint_list(fps);
     let gid_list = gids
         .iter()
@@ -580,14 +587,14 @@ mod tests {
              CAST(0, 'UInt8') AS is_hist,\n\
              \x20                  reinterpretAsUInt64(value) = 9218868437227405314 AS stale\n\
              \x20           FROM metric_samples\n\
-             \x20           WHERE unix_milli > 1782906900000 AND unix_milli <= 1782910800000 \
+             \x20           WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782910800000 \
              AND fingerprint IN fps\n\
              \x20           UNION ALL\n\
              \x20           SELECT fingerprint, unix_milli AS ts, CAST(0, 'Float64') AS v, \
              CAST(1, 'UInt8') AS is_hist,\n\
              \x20                  reinterpretAsUInt64(sum) = 9218868437227405314 AS stale\n\
              \x20           FROM metric_hist_samples\n\
-             \x20           WHERE unix_milli > 1782906900000 AND unix_milli <= 1782910800000 \
+             \x20           WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782910800000 \
              AND fingerprint IN fps\n\
              \x20         )\n\
              \x20       )\n\

@@ -257,8 +257,7 @@ pub(super) struct SeriesWhere {
     /// `""`. Rendered on the index only when both index tables are named.
     index: Option<Vec<(LabelMatcher, bool)>>,
     /// Issue #635 part 4: `org_id = <the tenant>`, the term every metrics
-    /// table this read names carries.
-    #[allow(dead_code)]
+    /// table this read names carries in its own `WHERE`.
     tenant: String,
 }
 
@@ -269,11 +268,11 @@ impl SeriesWhere {
     pub(super) fn activity(tenant: &Tenant, window: DataWindow, lookup: Lookup<'_>) -> Self {
         let (first, _) = day_and_hour(window.start_ms);
         let (last, _) = day_and_hour(window.end_ms);
-        let mut activity = vec![format!(
-            "day BETWEEN '{}' AND '{}'",
-            day_text(first),
-            day_text(last)
-        )];
+        let tenant = format!("org_id = {}", tenant.sql_literal());
+        let mut activity = vec![
+            tenant.clone(),
+            format!("day BETWEEN '{}' AND '{}'", day_text(first), day_text(last)),
+        ];
         for literal in lookup
             .name_matchers
             .iter()
@@ -314,7 +313,7 @@ impl SeriesWhere {
             activity,
             lookup: lookup_preds,
             index,
-            tenant: format!("org_id = {}", tenant.sql_literal()),
+            tenant,
         }
     }
 
@@ -336,17 +335,16 @@ impl SeriesWhere {
              \x20 SELECT fingerprint, metric_name AS name, labels AS label_text\n\
              \x20 FROM {labels_table}\n"
         );
-        let mut keyword = "WHERE";
+        out.push_str(&format!("  WHERE {}\n", self.tenant));
         // On the index route the ID set decides every matcher, so the
         // outer read repeats none of them.
         if self.index_route(t).is_none() {
             for pred in &self.lookup {
-                out.push_str(&format!("  {keyword} {pred}\n"));
-                keyword = "  AND";
+                out.push_str(&format!("    AND {pred}\n"));
             }
         }
         out.push_str(&format!(
-            "  {keyword} fingerprint IN (\n\
+            "    AND fingerprint IN (\n\
              \x20     SELECT fingerprint\n\
              {}\n\
              \x20   )\n\
@@ -364,12 +362,14 @@ impl SeriesWhere {
         format!(
             "SELECT DISTINCT key\n\
              FROM {}\n\
-             WHERE fingerprint IN (\n\
+             WHERE {}\n\
+             \x20 AND fingerprint IN (\n\
              \x20   SELECT fingerprint\n\
              {}\n\
              \x20 )\n\
              ORDER BY key",
             t.label_index.unwrap_or_default(),
+            self.tenant,
             self.activity_read(t, "    ")
         )
     }
@@ -380,13 +380,15 @@ impl SeriesWhere {
         format!(
             "SELECT DISTINCT value\n\
              FROM {}\n\
-             WHERE key = {}\n\
+             WHERE {}\n\
+             \x20 AND key = {}\n\
              \x20 AND fingerprint IN (\n\
              \x20   SELECT fingerprint\n\
              {}\n\
              \x20 )\n\
              ORDER BY value",
             t.label_index.unwrap_or_default(),
+            self.tenant,
             ch_string(key),
             self.activity_read(t, "    ")
         )
@@ -418,8 +420,9 @@ impl SeriesWhere {
             lines.push(format!("{indent}  AND fingerprint IN ("));
             let row = |m: &LabelMatcher, e: bool| {
                 format!(
-                    "SELECT fingerprint FROM {index_table} WHERE {}",
-                    index_row(m, e, values_table)
+                    "SELECT fingerprint FROM {index_table} WHERE {} AND {}",
+                    self.tenant,
+                    index_row(m, e, values_table, &self.tenant)
                 )
             };
             let positive: Vec<String> = roles
@@ -456,10 +459,9 @@ impl SeriesWhere {
             lines.push(format!("{indent}  AND fingerprint IN ("));
             lines.push(format!("{indent}    SELECT fingerprint"));
             lines.push(format!("{indent}    FROM {}", t.labels));
-            let mut keyword = "WHERE";
+            lines.push(format!("{indent}    WHERE {}", self.tenant));
             for pred in &self.lookup {
-                lines.push(format!("{indent}    {keyword} {pred}"));
-                keyword = "  AND";
+                lines.push(format!("{indent}      AND {pred}"));
             }
             lines.push(format!("{indent}  )"));
         }
@@ -529,7 +531,7 @@ fn predicate(m: &LabelMatcher, target: MatcherTarget) -> String {
 /// it fails for, and a series without the key satisfies it. A stored empty
 /// value reads as absent, exactly as `JSONExtractString` reads it: the two
 /// rows that test presence carry `value != ''`.
-fn index_row(m: &LabelMatcher, matches_empty: bool, values_table: &str) -> String {
+fn index_row(m: &LabelMatcher, matches_empty: bool, values_table: &str, tenant: &str) -> String {
     let key = ch_string(&m.key);
     let value = ch_string(&m.value);
     match m.op {
@@ -547,7 +549,7 @@ fn index_row(m: &LabelMatcher, matches_empty: bool, values_table: &str) -> Strin
                 "match"
             };
             format!(
-                "key = {key} AND value IN (SELECT value FROM {values_table} WHERE key = {key} AND {test}(value, {}))",
+                "key = {key} AND value IN (SELECT value FROM {values_table} WHERE {tenant} AND key = {key} AND {test}(value, {}))",
                 anchored_re2_literal(&m.value)
             )
         }
@@ -665,13 +667,15 @@ mod tests {
         assert_eq!(
             w.ids_from_where(lookup()),
             "FROM metric_series\n\
-             WHERE day BETWEEN '2026-09-07' AND '2026-09-07'\n\
+             WHERE org_id = ''\n\
+             \x20 AND day BETWEEN '2026-09-07' AND '2026-09-07'\n\
              \x20 AND 0 * match('', '(?-s)^(?:up|down)$') = 0\n\
              \x20 AND bitAnd(hours, multiIf(day = '2026-09-07' AND day = '2026-09-07', 12582912, day = '2026-09-07', 12582912, day = '2026-09-07', 16777215, 16777215)) != 0\n\
              \x20 AND fingerprint IN (\n\
              \x20   SELECT fingerprint\n\
              \x20   FROM metric_labels\n\
-             \x20   WHERE match(metric_name, '(?-s)^(?:up|down)$')\n\
+             \x20   WHERE org_id = ''\n\
+             \x20     AND match(metric_name, '(?-s)^(?:up|down)$')\n\
              \x20     AND JSONExtractString(labels, 'job') = 'api'\n\
              \x20 )"
         );
@@ -941,7 +945,8 @@ mod tests {
         assert_eq!(
             ids(&[]),
             "FROM metric_series\n\
-             WHERE day BETWEEN '1970-01-01' AND '1970-01-01'\n\
+             WHERE org_id = ''\n\
+             \x20 AND day BETWEEN '1970-01-01' AND '1970-01-01'\n\
              \x20 AND bitAnd(hours, multiIf(day = '1970-01-01' AND day = '1970-01-01', 3, \
              day = '1970-01-01', 16777215, day = '1970-01-01', 3, 16777215)) != 0"
         );
@@ -1045,7 +1050,7 @@ mod tests {
         );
         assert!(
             w.ids_from_where(sl()).ends_with(
-                "    WHERE metric_name = 'up'\n      AND JSONExtractString(labels, 'job') = 'api'\n  )"
+                "    WHERE org_id = ''\n      AND metric_name = 'up'\n      AND JSONExtractString(labels, 'job') = 'api'\n  )"
             ),
             "{}",
             w.ids_from_where(sl())
@@ -1061,7 +1066,7 @@ mod tests {
         );
         assert!(
             none.with_labels(sl()).contains(
-                "  FROM l\n  WHERE fingerprint IN (\n      SELECT fingerprint\n      FROM s\n"
+                "  FROM l\n  WHERE org_id = ''\n    AND fingerprint IN (\n      SELECT fingerprint\n      FROM s\n"
             ),
             "{}",
             none.with_labels(sl())
@@ -1117,7 +1122,7 @@ mod tests {
         )
     }
 
-    const OCT6: &str = "WHERE day BETWEEN '2026-10-06' AND '2026-10-06'";
+    const OCT6: &str = "AND day BETWEEN '2026-10-06' AND '2026-10-06'";
     const MASK: &str = "bitAnd(hours, multiIf(day = '2026-10-06' AND day = '2026-10-06', 16777215, day = '2026-10-06', 16777215, day = '2026-10-06', 16777215, 16777215)) != 0";
 
     /// U2: statement 1 on the index route, positive matchers only (S1),
@@ -1137,13 +1142,14 @@ mod tests {
             s1.ids_from_where(indexed()),
             format!(
                 "FROM metric_series\n\
-                 {OCT6}\n\
+                 WHERE org_id = ''\n\
+                 \x20 {OCT6}\n\
                  \x20 AND 0 * match('', '(?-s)^(?:5..)$') = 0\n\
                  \x20 AND {MASK}\n\
                  \x20 AND fingerprint IN (\n\
-                 \x20   SELECT fingerprint FROM metric_label_index WHERE key = 'job' AND value = 'api'\n\
+                 \x20   SELECT fingerprint FROM metric_label_index WHERE org_id = '' AND key = 'job' AND value = 'api'\n\
                  \x20   INTERSECT\n\
-                 \x20   SELECT fingerprint FROM metric_label_index WHERE key = 'status' AND value IN (SELECT value FROM metric_label_values WHERE key = 'status' AND match(value, '(?-s)^(?:5..)$'))\n\
+                 \x20   SELECT fingerprint FROM metric_label_index WHERE org_id = '' AND key = 'status' AND value IN (SELECT value FROM metric_label_values WHERE org_id = '' AND key = 'status' AND match(value, '(?-s)^(?:5..)$'))\n\
                  \x20 )"
             )
         );
@@ -1160,17 +1166,18 @@ mod tests {
             s2.ids_from_where(indexed()),
             format!(
                 "FROM metric_series\n\
-                 {OCT6}\n\
+                 WHERE org_id = ''\n\
+                 \x20 {OCT6}\n\
                  \x20 AND 0 * match('', '(?-s)^(?:api.*)$') = 0\n\
                  \x20 AND {MASK}\n\
                  \x20 AND fingerprint IN (\n\
                  \x20   SELECT fingerprint\n\
                  \x20   FROM (\n\
-                 \x20     SELECT fingerprint FROM metric_label_index WHERE key = 'job' AND value IN (SELECT value FROM metric_label_values WHERE key = 'job' AND match(value, '(?-s)^(?:api.*)$'))\n\
+                 \x20     SELECT fingerprint FROM metric_label_index WHERE org_id = '' AND key = 'job' AND value IN (SELECT value FROM metric_label_values WHERE org_id = '' AND key = 'job' AND match(value, '(?-s)^(?:api.*)$'))\n\
                  \x20     INTERSECT\n\
-                 \x20     SELECT fingerprint FROM metric_label_index WHERE key = 'zone' AND value = 'z07'\n\
+                 \x20     SELECT fingerprint FROM metric_label_index WHERE org_id = '' AND key = 'zone' AND value = 'z07'\n\
                  \x20   )\n\
-                 \x20   WHERE fingerprint NOT IN (SELECT fingerprint FROM metric_label_index WHERE key = 'env' AND value = 'dev')\n\
+                 \x20   WHERE fingerprint NOT IN (SELECT fingerprint FROM metric_label_index WHERE org_id = '' AND key = 'env' AND value = 'dev')\n\
                  \x20 )"
             )
         );
@@ -1183,7 +1190,7 @@ mod tests {
     fn u3_every_matcher_renders_its_index_row() {
         let values = |op: &str, r: &str, k: &str| {
             format!(
-                "key = '{k}' AND value IN (SELECT value FROM metric_label_values WHERE key = '{k}' AND {op}(value, '(?-s)^(?:{r})$'))"
+                "key = '{k}' AND value IN (SELECT value FROM metric_label_values WHERE org_id = '' AND key = '{k}' AND {op}(value, '(?-s)^(?:{r})$'))"
             )
         };
         let positive = [
@@ -1203,7 +1210,9 @@ mod tests {
         ];
         for (matcher, row) in positive {
             let got = read(&[], &[], std::slice::from_ref(&matcher)).ids_from_where(indexed());
-            let want = format!("\n    SELECT fingerprint FROM metric_label_index WHERE {row}\n  )");
+            let want = format!(
+                "\n    SELECT fingerprint FROM metric_label_index WHERE org_id = '' AND {row}\n  )"
+            );
             assert!(got.ends_with(&want), "{matcher:?}: {got}");
         }
         let negative = [
@@ -1225,7 +1234,7 @@ mod tests {
             let got = read(&[], &[], &[m(MatchOp::Eq, "zone", "z07"), matcher.clone()])
                 .ids_from_where(indexed());
             let want = format!(
-                "\n    FROM (\n      SELECT fingerprint FROM metric_label_index WHERE key = 'zone' AND value = 'z07'\n    )\n    WHERE fingerprint NOT IN (SELECT fingerprint FROM metric_label_index WHERE {row})\n  )"
+                "\n    FROM (\n      SELECT fingerprint FROM metric_label_index WHERE org_id = '' AND key = 'zone' AND value = 'z07'\n    )\n    WHERE fingerprint NOT IN (SELECT fingerprint FROM metric_label_index WHERE org_id = '' AND {row})\n  )"
             );
             assert!(got.ends_with(&want), "{matcher:?}: {got}");
         }
@@ -1275,7 +1284,7 @@ mod tests {
         assert!(!w.ids_from_where(lookup()).contains("metric_label_index"));
         assert!(
             w.ids_from_where(lookup())
-                .contains("WHERE JSONExtractString(labels, 'job') = 'api'")
+                .contains("WHERE org_id = ''\n      AND JSONExtractString(labels, 'job') = 'api'")
         );
     }
 
@@ -1298,18 +1307,20 @@ mod tests {
                  FROM (\n\
                  \x20 SELECT fingerprint, metric_name AS name, labels AS label_text\n\
                  \x20 FROM metric_labels\n\
-                 \x20 WHERE fingerprint IN (\n\
+                 \x20 WHERE org_id = ''\n\
+                 \x20   AND fingerprint IN (\n\
                  \x20     SELECT fingerprint\n\
                  \x20     FROM metric_series\n\
-                 \x20     {OCT6}\n\
+                 \x20     WHERE org_id = ''\n\
+                 \x20       {OCT6}\n\
                  \x20       AND 0 * match('', '(?-s)^(?:2..)$') = 0\n\
                  \x20       AND {MASK}\n\
                  \x20       AND fingerprint IN (\n\
                  \x20         SELECT fingerprint\n\
                  \x20         FROM (\n\
-                 \x20           SELECT fingerprint FROM metric_label_index WHERE key = 'zone' AND value = 'z07'\n\
+                 \x20           SELECT fingerprint FROM metric_label_index WHERE org_id = '' AND key = 'zone' AND value = 'z07'\n\
                  \x20         )\n\
-                 \x20         WHERE fingerprint NOT IN (SELECT fingerprint FROM metric_label_index WHERE key = 'status' AND value IN (SELECT value FROM metric_label_values WHERE key = 'status' AND match(value, '(?-s)^(?:2..)$')))\n\
+                 \x20         WHERE fingerprint NOT IN (SELECT fingerprint FROM metric_label_index WHERE org_id = '' AND key = 'status' AND value IN (SELECT value FROM metric_label_values WHERE org_id = '' AND key = 'status' AND match(value, '(?-s)^(?:2..)$')))\n\
                  \x20       )\n\
                  \x20   )\n\
                  )\n\
@@ -1322,10 +1333,12 @@ mod tests {
             format!(
                 "SELECT DISTINCT key\n\
                  FROM metric_label_index\n\
-                 WHERE fingerprint IN (\n\
+                 WHERE org_id = ''\n\
+                 \x20 AND fingerprint IN (\n\
                  \x20   SELECT fingerprint\n\
                  \x20   FROM metric_series\n\
-                 \x20   {OCT6}\n\
+                 \x20   WHERE org_id = ''\n\
+                 \x20     {OCT6}\n\
                  \x20     AND {MASK}\n\
                  \x20 )\n\
                  ORDER BY key"
@@ -1344,17 +1357,19 @@ mod tests {
             format!(
                 "SELECT DISTINCT value\n\
                  FROM metric_label_index\n\
-                 WHERE key = 'instance'\n\
+                 WHERE org_id = ''\n\
+                 \x20 AND key = 'instance'\n\
                  \x20 AND fingerprint IN (\n\
                  \x20   SELECT fingerprint\n\
                  \x20   FROM metric_series\n\
-                 \x20   {OCT6}\n\
+                 \x20   WHERE org_id = ''\n\
+                 \x20     {OCT6}\n\
                  \x20     AND 0 * match('', '(?-s)^(?:5..)$') = 0\n\
                  \x20     AND {MASK}\n\
                  \x20     AND fingerprint IN (\n\
-                 \x20       SELECT fingerprint FROM metric_label_index WHERE key = 'job' AND value = 'api'\n\
+                 \x20       SELECT fingerprint FROM metric_label_index WHERE org_id = '' AND key = 'job' AND value = 'api'\n\
                  \x20       INTERSECT\n\
-                 \x20       SELECT fingerprint FROM metric_label_index WHERE key = 'status' AND value IN (SELECT value FROM metric_label_values WHERE key = 'status' AND match(value, '(?-s)^(?:5..)$'))\n\
+                 \x20       SELECT fingerprint FROM metric_label_index WHERE org_id = '' AND key = 'status' AND value IN (SELECT value FROM metric_label_values WHERE org_id = '' AND key = 'status' AND match(value, '(?-s)^(?:5..)$'))\n\
                  \x20     )\n\
                  \x20 )\n\
                  ORDER BY value"

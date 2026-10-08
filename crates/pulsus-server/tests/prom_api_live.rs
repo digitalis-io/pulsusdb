@@ -161,6 +161,7 @@ struct SeedSeriesRow {
 /// landing row.
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedActivityRow {
+    org_id: String,
     day: u16,
     fingerprint: u128,
     metric_name: String,
@@ -169,6 +170,7 @@ struct SeedActivityRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedLabelRow {
+    org_id: String,
     metric_name: String,
     fingerprint: u128,
     labels: String,
@@ -185,6 +187,7 @@ impl InsertSeries for ChClient {
         let activity: Vec<SeedActivityRow> = rows
             .iter()
             .map(|r| SeedActivityRow {
+                org_id: String::new(),
                 day: r.unix_milli.div_euclid(86_400_000) as u16,
                 fingerprint: r.fingerprint,
                 metric_name: r.metric_name.clone(),
@@ -194,6 +197,7 @@ impl InsertSeries for ChClient {
         let labels: Vec<SeedLabelRow> = rows
             .iter()
             .map(|r| SeedLabelRow {
+                org_id: String::new(),
                 metric_name: r.metric_name.clone(),
                 fingerprint: r.fingerprint,
                 labels: r.labels.clone(),
@@ -213,6 +217,7 @@ impl InsertSeries for ChClient {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedIndexRow {
+    org_id: String,
     key: String,
     value: String,
     fingerprint: u128,
@@ -220,6 +225,7 @@ struct SeedIndexRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedValueRow {
+    org_id: String,
     key: String,
     value: String,
 }
@@ -237,6 +243,7 @@ fn index_rows<'a>(
         for (key, value) in map {
             pairs.insert((key.clone(), value.clone()));
             index.push(SeedIndexRow {
+                org_id: String::new(),
                 key,
                 value,
                 fingerprint,
@@ -245,13 +252,18 @@ fn index_rows<'a>(
     }
     let values = pairs
         .into_iter()
-        .map(|(key, value)| SeedValueRow { key, value })
+        .map(|(key, value)| SeedValueRow {
+            org_id: String::new(),
+            key,
+            value,
+        })
         .collect();
     (index, values)
 }
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedSampleRow {
+    org_id: String,
     fingerprint: u128,
     unix_milli: i64,
     value: f64,
@@ -344,11 +356,13 @@ async fn prom_api_serves_discovery_and_query_against_real_clickhouse() {
             "metric_samples",
             &[
                 SeedSampleRow {
+                    org_id: String::new(),
                     fingerprint: 1,
                     unix_milli: now,
                     value: 1.0,
                 },
                 SeedSampleRow {
+                    org_id: String::new(),
                     fingerprint: 2,
                     unix_milli: now,
                     value: 0.0,
@@ -918,6 +932,7 @@ async fn promql_memory_breach_is_422_and_actually_dispatched() {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedMetadataRow {
+    org_id: String,
     metric_name: String,
     metric_type: String,
     help: String,
@@ -1023,6 +1038,7 @@ async fn prom_api_query_surface_bundle_issue_471() {
             &series
                 .iter()
                 .map(|(_, fp, _)| SeedSampleRow {
+                    org_id: String::new(),
                     fingerprint: u128::from(*fp),
                     unix_milli: now,
                     value: 1.0,
@@ -1038,6 +1054,7 @@ async fn prom_api_query_surface_bundle_issue_471() {
             "metric_metadata",
             &[
                 SeedMetadataRow {
+                    org_id: String::new(),
                     metric_name: "up".to_string(),
                     metric_type: "gauge".to_string(),
                     help: "up".to_string(),
@@ -1045,6 +1062,7 @@ async fn prom_api_query_surface_bundle_issue_471() {
                     updated_ns: now * 1_000_000,
                 },
                 SeedMetadataRow {
+                    org_id: String::new(),
                     metric_name: "http_requests_total".to_string(),
                     metric_type: "counter".to_string(),
                     help: "requests".to_string(),
@@ -1694,13 +1712,13 @@ async fn prom_api_name_values_bodies_and_narrow_dispatch_issue_472() {
     flush_logs(&admin).await;
 
     // The #472 statement, told apart from the #96 degraded probe: both
-    // begin `SELECT DISTINCT metric_name FROM metric_series WHERE day
-    // BETWEEN` (issue #623), and the probe additionally carries the
-    // name-matcher regex's compile probe and a `LIMIT <fanout cap + 1>`. The
-    // discovery `limit` is a response-size cap applied last (docs/api.md
-    // §3.3), so the #472 statement never carries a `LIMIT` at all.
-    const NARROW_PREFIX: &str =
-        "query LIKE 'SELECT DISTINCT metric_name\\nFROM metric_series\\nWHERE day BETWEEN %'";
+    // begin `SELECT DISTINCT metric_name FROM metric_series WHERE org_id =
+    // '' AND day BETWEEN` (issues #623 and #635), and the probe additionally
+    // carries the name-matcher regex's compile probe and a `LIMIT <fanout
+    // cap + 1>`. The discovery `limit` is a response-size cap applied last
+    // (docs/api.md §3.3), so the #472 statement never carries a `LIMIT` at
+    // all.
+    const NARROW_PREFIX: &str = "query LIKE 'SELECT DISTINCT metric_name\\nFROM metric_series\\nWHERE org_id = \\'\\'\\n  AND day BETWEEN %'";
     let narrow_472 = format!("{NARROW_PREFIX} AND query NOT LIKE '%\\nLIMIT %'");
     let narrow_472 = narrow_472.as_str();
     // The #96 degraded probe, named unambiguously: the same projection
@@ -1739,7 +1757,9 @@ async fn prom_api_name_values_bodies_and_narrow_dispatch_issue_472() {
     // (…)` rather than `= '…'`. Since issue #623 the name is a lookup
     // predicate in both statements. The quotes are backslash-escaped because
     // the pattern becomes a ClickHouse string literal.
-    const CONCRETE: &str = "%WHERE metric_name = \\'http_requests_total\\'%";
+    // Issue #635: the lookup's tenant term leads it, so the name follows
+    // on an `AND` line.
+    const CONCRETE: &str = "%AND metric_name = \\'http_requests_total\\'%";
     // The wide statement's head since issue #623: statement 2, the lookup
     // rows of the series the activity read finds.
     const WIDE_HEAD: &str =
@@ -1790,11 +1810,11 @@ async fn prom_api_name_values_bodies_and_narrow_dispatch_issue_472() {
     // check.
     let narrow_before = narrow;
     // Issue #623: the names-only fetch is statement 2 scoped to the probed
-    // names on the lookup.
+    // names on the lookup, after its tenant term (issue #635).
     const IN_FETCH: &str = "query LIKE 'SELECT fingerprint, any(name) AS metric_name, \
                             any(label_text) AS labels\\nFROM (\\n  SELECT fingerprint, \
                             metric_name AS name, labels AS label_text\\n  FROM metric_labels\\n  \
-                            WHERE metric_name IN (%'";
+                            WHERE org_id = \\'\\'\\n    AND metric_name IN (%'";
     let in_fetch_before = statements_matching(&admin, db, IN_FETCH).await;
     let probes_before = statements_matching(&admin, db, probe_96).await;
 
@@ -1852,7 +1872,7 @@ async fn prom_api_name_values_bodies_and_narrow_dispatch_issue_472() {
 //
 // The stored label text is `LabelSet::to_canonical_json`'s output — the
 // exact expression `MetricSeriesRow::from_series_at_bucket` uses at
-// `crates/pulsus-write/src/writer/rows.rs:342` — so this seed is the
+// `crates/pulsus-write/src/writer/rows.rs:344` — so this seed is the
 // writer's own bytes and not a hand-written literal.
 //
 // Before the fix both series decoded to the same label set and the
@@ -1902,11 +1922,13 @@ async fn seed_c0_series(client: &ChClient, values: [f64; 2]) -> i64 {
             "metric_samples",
             &[
                 SeedSampleRow {
+                    org_id: String::new(),
                     fingerprint: 1,
                     unix_milli: now,
                     value: values[0],
                 },
                 SeedSampleRow {
+                    org_id: String::new(),
                     fingerprint: 2,
                     unix_milli: now,
                     value: values[1],
@@ -2014,7 +2036,7 @@ fn vector_bs_values(json: &serde_json::Value) -> Vec<(String, String)> {
 
 /// Q7, Q8 and Q9 of issue #539, and the criterion that pins the cache
 /// path and the SQL path to the same answer
-/// (`crates/pulsus-read/src/metrics/labels.rs:629-632`).
+/// (`crates/pulsus-read/src/metrics/labels.rs:630-633`).
 #[tokio::test(flavor = "multi_thread")]
 async fn two_metric_series_differing_only_at_a_c0_escape_stay_two_series() {
     if !should_run() {
@@ -2112,7 +2134,7 @@ async fn two_metric_series_differing_only_at_a_c0_escape_stay_two_series() {
 /// the stored label text with our decoder; the SQL route lets ClickHouse
 /// decode it. So the two agree only while our decoder agrees with
 /// ClickHouse's, which is what
-/// `crates/pulsus-read/src/metrics/labels.rs:629-632` states as a
+/// `crates/pulsus-read/src/metrics/labels.rs:630-633` states as a
 /// contract and what nothing checked.
 ///
 /// `PULSUS_CACHE_MAX_SERIES=1` puts the second server over its

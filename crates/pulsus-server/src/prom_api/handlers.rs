@@ -9,6 +9,7 @@ use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, header};
 use axum::response::{IntoResponse, Response};
 
+use pulsus_model::Tenant;
 use pulsus_promql::parser::Expr;
 use pulsus_read::{DataWindow, DiscoveryFilter, MetricQueryParams, MetricsEngine};
 
@@ -27,6 +28,14 @@ fn wants_explain(headers: &HeaderMap) -> bool {
         .get("x-pulsus-explain")
         .and_then(|v| v.to_str().ok())
         == Some("1")
+}
+
+/// Issue #635 part 4: the request's tenant, from its `X-Scope-OrgID`,
+/// read before anything else a metrics route does. An invalid value is
+/// `400 bad_data`, and nothing is read.
+fn tenant_of(headers: &HeaderMap) -> Result<Tenant, ApiError> {
+    pulsus_model::tenant_from_headers(headers)
+        .map_err(|_| ApiError::Param(ParamError::InvalidTenant))
 }
 
 /// Acquires the shared `Arc<ChPool>` and the constructed `Arc<LabelCache>`
@@ -142,8 +151,12 @@ pub(crate) async fn query(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
+    let tenant = match tenant_of(&headers) {
+        Ok(t) => t,
+        Err(e) => return e.into_response(),
+    };
     let pairs = params::parse_pairs(raw.as_deref().unwrap_or(""));
-    match query_impl(state, &headers, pairs).await {
+    match query_impl(state, &tenant, &headers, pairs).await {
         Ok(res) => res,
         Err(e) => e.into_response(),
     }
@@ -155,8 +168,12 @@ pub(crate) async fn query_post(
     RawQuery(raw): RawQuery,
     body: Bytes,
 ) -> Response {
+    let tenant = match tenant_of(&headers) {
+        Ok(t) => t,
+        Err(e) => return e.into_response(),
+    };
     match read_form_pairs(&headers, raw.as_deref(), body).await {
-        Ok(pairs) => match query_impl(state, &headers, pairs).await {
+        Ok(pairs) => match query_impl(state, &tenant, &headers, pairs).await {
             Ok(res) => res,
             Err(e) => e.into_response(),
         },
@@ -166,6 +183,7 @@ pub(crate) async fn query_post(
 
 async fn query_impl(
     state: AppState,
+    tenant: &Tenant,
     headers: &HeaderMap,
     pairs: Vec<(String, String)>,
 ) -> Result<Response, ApiError> {
@@ -192,6 +210,7 @@ async fn query_impl(
         let engine = engine_for(&state).await?;
         run_query(
             &engine,
+            tenant,
             &expr,
             query,
             &query_params,
@@ -220,8 +239,12 @@ pub(crate) async fn query_range(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
+    let tenant = match tenant_of(&headers) {
+        Ok(t) => t,
+        Err(e) => return e.into_response(),
+    };
     let pairs = params::parse_pairs(raw.as_deref().unwrap_or(""));
-    match query_range_impl(state, &headers, pairs).await {
+    match query_range_impl(state, &tenant, &headers, pairs).await {
         Ok(res) => res,
         Err(e) => e.into_response(),
     }
@@ -233,8 +256,12 @@ pub(crate) async fn query_range_post(
     RawQuery(raw): RawQuery,
     body: Bytes,
 ) -> Response {
+    let tenant = match tenant_of(&headers) {
+        Ok(t) => t,
+        Err(e) => return e.into_response(),
+    };
     match read_form_pairs(&headers, raw.as_deref(), body).await {
-        Ok(pairs) => match query_range_impl(state, &headers, pairs).await {
+        Ok(pairs) => match query_range_impl(state, &tenant, &headers, pairs).await {
             Ok(res) => res,
             Err(e) => e.into_response(),
         },
@@ -244,6 +271,7 @@ pub(crate) async fn query_range_post(
 
 async fn query_range_impl(
     state: AppState,
+    tenant: &Tenant,
     headers: &HeaderMap,
     pairs: Vec<(String, String)>,
 ) -> Result<Response, ApiError> {
@@ -272,6 +300,7 @@ async fn query_range_impl(
         let engine = engine_for(&state).await?;
         run_query(
             &engine,
+            tenant,
             &expr,
             query,
             &query_params,
@@ -295,6 +324,7 @@ async fn query_range_impl(
 /// #128, upstream `AsStrings(r.FormValue("query"), 10, 10)`).
 async fn run_query(
     engine: &MetricsEngine,
+    tenant: &Tenant,
     expr: &Expr,
     query: &str,
     query_params: &MetricQueryParams,
@@ -308,13 +338,8 @@ async fn run_query(
     // the encoder's deterministic label sort.
     let ordered = query_params.step_ms == 0 && pulsus_promql::expr_is_sort_root(expr);
     if explain {
-        let (result, annotations, plan_explain) = engine
-            .query_explained(
-                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
-                expr,
-                query_params,
-            )
-            .await?;
+        let (result, annotations, plan_explain) =
+            engine.query_explained(tenant, expr, query_params).await?;
         Ok(encode::query_response_annotated(
             result,
             Some(plan_explain),
@@ -324,13 +349,7 @@ async fn run_query(
             &annotations,
         ))
     } else {
-        let (result, annotations) = engine
-            .query(
-                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
-                expr,
-                query_params,
-            )
-            .await?;
+        let (result, annotations) = engine.query(tenant, expr, query_params).await?;
         Ok(encode::query_response_annotated(
             result,
             None,
@@ -346,9 +365,17 @@ async fn run_query(
 // GET|POST /api/v1/labels
 // ---------------------------------------------------------------------
 
-pub(crate) async fn labels(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
+pub(crate) async fn labels(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let tenant = match tenant_of(&headers) {
+        Ok(t) => t,
+        Err(e) => return e.into_response(),
+    };
     let pairs = params::parse_pairs(raw.as_deref().unwrap_or(""));
-    match labels_impl(state, pairs).await {
+    match labels_impl(state, &tenant, pairs).await {
         Ok(res) => res,
         Err(e) => e.into_response(),
     }
@@ -360,8 +387,12 @@ pub(crate) async fn labels_post(
     RawQuery(raw): RawQuery,
     body: Bytes,
 ) -> Response {
+    let tenant = match tenant_of(&headers) {
+        Ok(t) => t,
+        Err(e) => return e.into_response(),
+    };
     match read_form_pairs(&headers, raw.as_deref(), body).await {
-        Ok(pairs) => match labels_impl(state, pairs).await {
+        Ok(pairs) => match labels_impl(state, &tenant, pairs).await {
             Ok(res) => res,
             Err(e) => e.into_response(),
         },
@@ -369,7 +400,11 @@ pub(crate) async fn labels_post(
     }
 }
 
-async fn labels_impl(state: AppState, pairs: Vec<(String, String)>) -> Result<Response, ApiError> {
+async fn labels_impl(
+    state: AppState,
+    tenant: &Tenant,
+    pairs: Vec<(String, String)>,
+) -> Result<Response, ApiError> {
     let (start_ms, end_ms) = parse_bounds(&pairs)?;
     let window = DataWindow { start_ms, end_ms };
     // Issue #471 M4: parsed before the engine call so an invalid value is
@@ -378,13 +413,7 @@ async fn labels_impl(state: AppState, pairs: Vec<(String, String)>) -> Result<Re
     let matches = params::get_all(&pairs, "match[]");
     let filters = parse_match_selectors(&matches)?;
     let engine = engine_for(&state).await?;
-    let names = engine
-        .label_names(
-            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
-            &filters,
-            window,
-        )
-        .await?;
+    let names = engine.label_names(tenant, &filters, window).await?;
     let warn = truncated(&names, limit);
     Ok(encode::string_array_response(
         truncate(names, limit),
@@ -419,9 +448,14 @@ fn warning_for(truncated: bool) -> Option<&'static str> {
 
 pub(crate) async fn label_values(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(name): Path<String>,
     RawQuery(raw): RawQuery,
 ) -> Response {
+    let tenant = match tenant_of(&headers) {
+        Ok(t) => t,
+        Err(e) => return e.into_response(),
+    };
     let pairs = params::parse_pairs(raw.as_deref().unwrap_or(""));
     // Issue #471 M6: unescape the path segment BEFORE any storage lookup,
     // exactly as the reference does. Without this a `U__`-escaped
@@ -431,7 +465,7 @@ pub(crate) async fn label_values(
     if name.is_empty() {
         return ApiError::Param(ParamError::EmptyLabelName).into_response();
     }
-    match label_values_impl(state, &name, pairs).await {
+    match label_values_impl(state, &tenant, &name, pairs).await {
         Ok(res) => res,
         Err(e) => e.into_response(),
     }
@@ -439,6 +473,7 @@ pub(crate) async fn label_values(
 
 async fn label_values_impl(
     state: AppState,
+    tenant: &Tenant,
     name: &str,
     pairs: Vec<(String, String)>,
 ) -> Result<Response, ApiError> {
@@ -448,14 +483,7 @@ async fn label_values_impl(
     let matches = params::get_all(&pairs, "match[]");
     let filters = parse_match_selectors(&matches)?;
     let engine = engine_for(&state).await?;
-    let values = engine
-        .label_values(
-            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
-            name,
-            &filters,
-            window,
-        )
-        .await?;
+    let values = engine.label_values(tenant, name, &filters, window).await?;
     let warn = truncated(&values, limit);
     Ok(encode::string_array_response(
         truncate(values, limit),
@@ -467,9 +495,17 @@ async fn label_values_impl(
 // GET|POST /api/v1/series
 // ---------------------------------------------------------------------
 
-pub(crate) async fn series(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
+pub(crate) async fn series(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let tenant = match tenant_of(&headers) {
+        Ok(t) => t,
+        Err(e) => return e.into_response(),
+    };
     let pairs = params::parse_pairs(raw.as_deref().unwrap_or(""));
-    match series_impl(state, pairs).await {
+    match series_impl(state, &tenant, pairs).await {
         Ok(res) => res,
         Err(e) => e.into_response(),
     }
@@ -481,8 +517,12 @@ pub(crate) async fn series_post(
     RawQuery(raw): RawQuery,
     body: Bytes,
 ) -> Response {
+    let tenant = match tenant_of(&headers) {
+        Ok(t) => t,
+        Err(e) => return e.into_response(),
+    };
     match read_form_pairs(&headers, raw.as_deref(), body).await {
-        Ok(pairs) => match series_impl(state, pairs).await {
+        Ok(pairs) => match series_impl(state, &tenant, pairs).await {
             Ok(res) => res,
             Err(e) => e.into_response(),
         },
@@ -490,7 +530,11 @@ pub(crate) async fn series_post(
     }
 }
 
-async fn series_impl(state: AppState, pairs: Vec<(String, String)>) -> Result<Response, ApiError> {
+async fn series_impl(
+    state: AppState,
+    tenant: &Tenant,
+    pairs: Vec<(String, String)>,
+) -> Result<Response, ApiError> {
     let matches = params::get_all(&pairs, "match[]");
     if matches.is_empty() {
         return Err(ApiError::Param(ParamError::MissingMatch));
@@ -500,13 +544,7 @@ async fn series_impl(state: AppState, pairs: Vec<(String, String)>) -> Result<Re
     let limit = params::parse_discovery_limit(params::get(&pairs, "limit"))?;
     let filters = parse_match_selectors(&matches)?;
     let engine = engine_for(&state).await?;
-    let data = engine
-        .series(
-            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
-            &filters,
-            window,
-        )
-        .await?;
+    let data = engine.series(tenant, &filters, window).await?;
     let warn = truncated(&data, limit);
     Ok(encode::series_response(
         truncate(data, limit),
@@ -518,8 +556,22 @@ async fn series_impl(state: AppState, pairs: Vec<(String, String)>) -> Result<Re
 // GET /api/v1/metadata
 // ---------------------------------------------------------------------
 
-pub(crate) async fn metadata(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
-    match metadata_impl(state, params::parse_pairs(raw.as_deref().unwrap_or(""))).await {
+pub(crate) async fn metadata(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let tenant = match tenant_of(&headers) {
+        Ok(t) => t,
+        Err(e) => return e.into_response(),
+    };
+    match metadata_impl(
+        state,
+        &tenant,
+        params::parse_pairs(raw.as_deref().unwrap_or("")),
+    )
+    .await
+    {
         Ok(res) => res,
         Err(e) => e.into_response(),
     }
@@ -527,18 +579,13 @@ pub(crate) async fn metadata(State(state): State<AppState>, RawQuery(raw): RawQu
 
 async fn metadata_impl(
     state: AppState,
+    tenant: &Tenant,
     pairs: Vec<(String, String)>,
 ) -> Result<Response, ApiError> {
     let metric = params::metric(&pairs);
     let limit = params::parse_limit(params::get(&pairs, "limit"))?;
     let engine = engine_for(&state).await?;
-    let items = engine
-        .metadata(
-            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
-            metric,
-            limit,
-        )
-        .await?;
+    let items = engine.metadata(tenant, metric, limit).await?;
     Ok(encode::metadata_response(items))
 }
 
@@ -546,12 +593,20 @@ async fn metadata_impl(
 // GET|POST /api/v1/query_exemplars (empty-success stub, issue #32 scope)
 // ---------------------------------------------------------------------
 
-pub(crate) async fn query_exemplars() -> Response {
-    encode::query_exemplars_response()
+/// Reads no data, and still refuses an invalid `X-Scope-OrgID` (issue
+/// #635 part 4), as every metrics route does.
+pub(crate) async fn query_exemplars(headers: HeaderMap) -> Response {
+    match tenant_of(&headers) {
+        Ok(_) => encode::query_exemplars_response(),
+        Err(e) => e.into_response(),
+    }
 }
 
-pub(crate) async fn query_exemplars_post() -> Response {
-    encode::query_exemplars_response()
+pub(crate) async fn query_exemplars_post(headers: HeaderMap) -> Response {
+    match tenant_of(&headers) {
+        Ok(_) => encode::query_exemplars_response(),
+        Err(e) => e.into_response(),
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -585,18 +640,20 @@ pub(crate) async fn status_runtimeinfo(State(state): State<AppState>) -> Respons
     encode::status_runtimeinfo_response(start_time, state.config.retention_days)
 }
 
-pub(crate) async fn status_tsdb(State(state): State<AppState>) -> Response {
-    match status_tsdb_impl(state).await {
+pub(crate) async fn status_tsdb(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let tenant = match tenant_of(&headers) {
+        Ok(t) => t,
+        Err(e) => return e.into_response(),
+    };
+    match status_tsdb_impl(state, &tenant).await {
         Ok(res) => res,
         Err(e) => e.into_response(),
     }
 }
 
-async fn status_tsdb_impl(state: AppState) -> Result<Response, ApiError> {
+async fn status_tsdb_impl(state: AppState, tenant: &Tenant) -> Result<Response, ApiError> {
     let engine = engine_for(&state).await?;
-    let status = engine
-        .tsdb_status(&pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"))
-        .await?;
+    let status = engine.tsdb_status(tenant).await?;
     Ok(encode::status_tsdb_response(status))
 }
 
@@ -1278,7 +1335,7 @@ mod tests {
 
     #[tokio::test]
     async fn labels_without_a_pool_is_503_unavailable() {
-        let res = labels(State(test_state()), RawQuery(None)).await;
+        let res = labels(State(test_state()), HeaderMap::new(), RawQuery(None)).await;
         let (status, json) = status_and_body(res).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(json["errorType"], "unavailable");
@@ -1288,7 +1345,7 @@ mod tests {
     async fn labels_with_no_match_params_still_reaches_the_pool_check() {
         // Optional match[] (Prometheus's own "no filter" contract) must not
         // be rejected as a param error.
-        let res = labels(State(test_state()), RawQuery(None)).await;
+        let res = labels(State(test_state()), HeaderMap::new(), RawQuery(None)).await;
         let (status, _) = status_and_body(res).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -1301,6 +1358,7 @@ mod tests {
     async fn labels_with_a_matcher_only_selector_reaches_the_pool_check() {
         let res = labels(
             State(test_state()),
+            HeaderMap::new(),
             RawQuery(Some(r#"match[]=%7Bjob%3D%22x%22%7D"#.to_string())),
         )
         .await;
@@ -1313,6 +1371,7 @@ mod tests {
     async fn label_values_with_a_matcher_only_selector_reaches_the_pool_check() {
         let res = label_values(
             State(test_state()),
+            HeaderMap::new(),
             Path("job".to_string()),
             RawQuery(Some(r#"match[]=%7Bjob%3D%22x%22%7D"#.to_string())),
         )
@@ -1326,6 +1385,7 @@ mod tests {
     async fn series_with_a_matcher_only_selector_reaches_the_pool_check() {
         let res = series(
             State(test_state()),
+            HeaderMap::new(),
             RawQuery(Some(r#"match[]=%7Bjob%3D%22x%22%7D"#.to_string())),
         )
         .await;
@@ -1342,6 +1402,7 @@ mod tests {
     async fn labels_with_a_name_regex_matcher_reaches_the_pool_check() {
         let res = labels(
             State(test_state()),
+            HeaderMap::new(),
             RawQuery(Some(
                 r#"match[]=%7B__name__%3D~%22up.%2A%22%7D"#.to_string(),
             )),
@@ -1359,6 +1420,7 @@ mod tests {
     async fn labels_with_a_non_selector_match_is_422_execution() {
         let res = labels(
             State(test_state()),
+            HeaderMap::new(),
             RawQuery(Some(r#"match[]=sum(up)"#.to_string())),
         )
         .await;
@@ -1391,7 +1453,13 @@ mod tests {
 
     #[tokio::test]
     async fn label_values_without_a_pool_is_503_unavailable() {
-        let res = label_values(State(test_state()), Path("job".to_string()), RawQuery(None)).await;
+        let res = label_values(
+            State(test_state()),
+            HeaderMap::new(),
+            Path("job".to_string()),
+            RawQuery(None),
+        )
+        .await;
         let (status, json) = status_and_body(res).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(json["errorType"], "unavailable");
@@ -1399,7 +1467,7 @@ mod tests {
 
     #[tokio::test]
     async fn series_without_any_match_param_is_400_bad_data() {
-        let res = series(State(test_state()), RawQuery(None)).await;
+        let res = series(State(test_state()), HeaderMap::new(), RawQuery(None)).await;
         let (status, json) = status_and_body(res).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(json["errorType"], "bad_data");
@@ -1409,6 +1477,7 @@ mod tests {
     async fn series_with_a_match_param_reaches_the_pool_check() {
         let res = series(
             State(test_state()),
+            HeaderMap::new(),
             RawQuery(Some("match[]=up".to_string())),
         )
         .await;
@@ -1435,7 +1504,7 @@ mod tests {
 
     #[tokio::test]
     async fn metadata_without_a_pool_is_503_unavailable() {
-        let res = metadata(State(test_state()), RawQuery(None)).await;
+        let res = metadata(State(test_state()), HeaderMap::new(), RawQuery(None)).await;
         let (status, json) = status_and_body(res).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(json["errorType"], "unavailable");
@@ -1443,7 +1512,12 @@ mod tests {
 
     #[tokio::test]
     async fn metadata_invalid_limit_is_400_bad_data() {
-        let res = metadata(State(test_state()), RawQuery(Some("limit=abc".to_string()))).await;
+        let res = metadata(
+            State(test_state()),
+            HeaderMap::new(),
+            RawQuery(Some("limit=abc".to_string())),
+        )
+        .await;
         let (status, json) = status_and_body(res).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(json["errorType"], "bad_data");
@@ -1453,7 +1527,7 @@ mod tests {
     async fn query_exemplars_is_an_empty_success_with_no_engine_call() {
         // No pool established at all — a stub that reached the engine would
         // 503 instead.
-        let res = query_exemplars().await;
+        let res = query_exemplars(HeaderMap::new()).await;
         let (status, json) = status_and_body(res).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["status"], "success");
@@ -1462,7 +1536,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_exemplars_post_is_an_empty_success() {
-        let res = query_exemplars_post().await;
+        let res = query_exemplars_post(HeaderMap::new()).await;
         let (status, json) = status_and_body(res).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["data"], serde_json::json!([]));
@@ -1522,7 +1596,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_tsdb_without_a_pool_is_503_unavailable() {
-        let res = status_tsdb(State(test_state())).await;
+        let res = status_tsdb(State(test_state()), HeaderMap::new()).await;
         let (status, json) = status_and_body(res).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(json["errorType"], "unavailable");
@@ -1697,7 +1771,12 @@ mod tests {
                 "invalid parameter \"limit\": cannot parse \"abc\" to an integer",
             ),
         ] {
-            let res = labels(State(test_state()), RawQuery(Some(path_pairs.to_string()))).await;
+            let res = labels(
+                State(test_state()),
+                HeaderMap::new(),
+                RawQuery(Some(path_pairs.to_string())),
+            )
+            .await;
             let (status, json) = status_and_body(res).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{path_pairs}");
             assert_eq!(json["errorType"], "bad_data", "{path_pairs}");
@@ -1705,6 +1784,7 @@ mod tests {
 
             let res = label_values(
                 State(test_state()),
+                HeaderMap::new(),
                 Path("job".to_string()),
                 RawQuery(Some(path_pairs.to_string())),
             )
@@ -1715,6 +1795,7 @@ mod tests {
 
             let res = series(
                 State(test_state()),
+                HeaderMap::new(),
                 RawQuery(Some(format!("match%5B%5D=up&{path_pairs}"))),
             )
             .await;
@@ -1730,7 +1811,12 @@ mod tests {
     #[tokio::test]
     async fn a_valid_discovery_limit_reaches_the_pool_check() {
         for raw in ["limit=0", "limit=1", "limit=%2B2", "limit="] {
-            let res = labels(State(test_state()), RawQuery(Some(raw.to_string()))).await;
+            let res = labels(
+                State(test_state()),
+                HeaderMap::new(),
+                RawQuery(Some(raw.to_string())),
+            )
+            .await;
             let (status, _) = status_and_body(res).await;
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{raw}");
         }
@@ -1741,7 +1827,13 @@ mod tests {
     /// before the pool is ever consulted.
     #[tokio::test]
     async fn an_empty_unescaped_label_name_is_400_bad_data() {
-        let res = label_values(State(test_state()), Path("U__".to_string()), RawQuery(None)).await;
+        let res = label_values(
+            State(test_state()),
+            HeaderMap::new(),
+            Path("U__".to_string()),
+            RawQuery(None),
+        )
+        .await;
         let (status, json) = status_and_body(res).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(json["errorType"], "bad_data");
@@ -1753,8 +1845,13 @@ mod tests {
     #[tokio::test]
     async fn a_non_legacy_label_name_without_the_prefix_is_not_rejected() {
         for name in ["a-b", "U__bad_zz"] {
-            let res =
-                label_values(State(test_state()), Path(name.to_string()), RawQuery(None)).await;
+            let res = label_values(
+                State(test_state()),
+                HeaderMap::new(),
+                Path(name.to_string()),
+                RawQuery(None),
+            )
+            .await;
             let (status, _) = status_and_body(res).await;
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{name}");
         }

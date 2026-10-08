@@ -835,7 +835,11 @@ mod tests {
         let ticked = PushDedup::new(16 * 1024 * 1024, Duration::from_secs(300), claim_deadline);
         let unticked = PushDedup::new(16 * 1024 * 1024, Duration::from_secs(300), claim_deadline);
         for index in [&ticked, &unticked] {
-            let id = metric_identity(&batch, &PushHeaders::default());
+            let id = metric_identity(
+                &batch,
+                &PushHeaders::default(),
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            );
             match index.admit(id, WaitMode::None) {
                 Admission::Admit(mut guard) => {
                     guard.note_target(true);

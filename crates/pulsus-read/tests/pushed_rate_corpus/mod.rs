@@ -244,6 +244,7 @@ pub fn histogram_corpora(t_end: i64) -> Vec<SeedSeries> {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedSampleRow {
+    org_id: String,
     fingerprint: u128,
     unix_milli: i64,
     value: f64,
@@ -251,6 +252,7 @@ struct SeedSampleRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedHistRow {
+    org_id: String,
     fingerprint: u128,
     unix_milli: i64,
     schema: i8,
@@ -269,6 +271,7 @@ struct SeedHistRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedActivityRow {
+    org_id: String,
     day: u16,
     fingerprint: u128,
     metric_name: String,
@@ -277,6 +280,7 @@ struct SeedActivityRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedLabelRow {
+    org_id: String,
     metric_name: String,
     fingerprint: u128,
     labels: String,
@@ -292,6 +296,7 @@ pub async fn seed(client: &ChClient, fx: &[SeedSeries], seen_ms: i64) {
     let activity: Vec<SeedActivityRow> = fx
         .iter()
         .map(|s| SeedActivityRow {
+            org_id: String::new(),
             day: bucket.div_euclid(DAY_MS) as u16,
             fingerprint: s.fp,
             metric_name: s.metric.clone(),
@@ -307,6 +312,7 @@ pub async fn seed(client: &ChClient, fx: &[SeedSeries], seen_ms: i64) {
                 .map(|(k, v)| (k.as_str(), v.as_str()))
                 .collect();
             SeedLabelRow {
+                org_id: String::new(),
                 metric_name: s.metric.clone(),
                 fingerprint: s.fp,
                 labels: serde_json::to_string(&map).expect("labels json"),
@@ -343,6 +349,7 @@ pub async fn seed(client: &ChClient, fx: &[SeedSeries], seen_ms: i64) {
         .iter()
         .flat_map(|s| {
             s.samples.iter().map(move |(t, v)| SeedSampleRow {
+                org_id: String::new(),
                 fingerprint: s.fp,
                 unix_milli: *t,
                 value: *v,
@@ -359,6 +366,7 @@ pub async fn seed(client: &ChClient, fx: &[SeedSeries], seen_ms: i64) {
         .iter()
         .flat_map(|s| {
             s.hist.iter().map(move |t| SeedHistRow {
+                org_id: String::new(),
                 fingerprint: s.fp,
                 unix_milli: *t,
                 schema: 0,

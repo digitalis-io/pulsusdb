@@ -142,10 +142,11 @@ const PINNED: &str = include_str!("golden/promql_statements.sha256");
 
 /// The three constants published on issue #548 before the code existed;
 /// the line and byte counts re-taken by issue #623, whose sample statements
-/// carry no metric name, and again by issue #579 and its part 2.
+/// carry no metric name, again by issue #579 and its part 2, and by issue
+/// #635 part 4, whose statements each carry the tenant.
 const ENTRIES: usize = 30;
 const LINES: usize = 742;
-const BYTES: usize = 40_253;
+const BYTES: usize = 41_213;
 /// The statements the writer's markers declare. Sixty before issue #549;
 /// four entries now send ONE statement where they sent two, and issue #579
 /// made it five.

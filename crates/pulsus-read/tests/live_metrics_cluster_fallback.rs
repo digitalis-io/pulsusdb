@@ -173,6 +173,7 @@ struct SeedSeriesRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedSampleRow {
+    org_id: String,
     fingerprint: u128,
     unix_milli: i64,
     value: f64,
@@ -200,6 +201,7 @@ async fn seed_dist(db: &str, metric_name: &str, fps: &[u64], unix_milli: i64) {
     let sample_rows: Vec<SeedSampleRow> = fps
         .iter()
         .map(|&fp| SeedSampleRow {
+            org_id: String::new(),
             fingerprint: u128::from(fp),
             unix_milli,
             value: 1.0,
@@ -838,6 +840,7 @@ async fn first_and_last_seen_span_shards() {
 /// set, once, in `metric_labels`.
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedActivityRow {
+    org_id: String,
     day: u16,
     fingerprint: u128,
     metric_name: String,
@@ -846,6 +849,7 @@ struct SeedActivityRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedLabelRow {
+    org_id: String,
     metric_name: String,
     fingerprint: u128,
     labels: String,
@@ -856,6 +860,7 @@ struct SeedLabelRow {
 fn activity_rows(rows: &[SeedSeriesRow]) -> Vec<SeedActivityRow> {
     rows.iter()
         .map(|r| SeedActivityRow {
+            org_id: String::new(),
             day: r.unix_milli.div_euclid(86_400_000) as u16,
             fingerprint: r.fingerprint,
             metric_name: r.metric_name.clone(),
@@ -873,6 +878,7 @@ async fn seed_labels_on_every_shard(db: &str, rows: &[SeedSeriesRow]) {
     let labels: Vec<SeedLabelRow> = rows
         .iter()
         .map(|r| SeedLabelRow {
+            org_id: String::new(),
             metric_name: r.metric_name.clone(),
             fingerprint: r.fingerprint,
             labels: r.labels.clone(),

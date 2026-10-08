@@ -34,7 +34,6 @@
 //! delegates to them; [`ingest_remote_write`] has no such generic-`State`
 //! wrapper (no test or caller has needed one yet).
 
-use pulsus_model::Tenant;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -220,8 +219,12 @@ pub async fn ingest_metrics(
     body: Body,
     settings: MetricIngestSettings,
 ) -> Response {
+    // Issue #635 part 4: the tenant first; an invalid one stores nothing.
+    let tenant = match pulsus_model::tenant_from_headers(&headers) {
+        Ok(tenant) => tenant,
+        Err(err) => return status_response(StatusCode::BAD_REQUEST, 3, err.to_string()),
+    };
     let now_ns = now_unix_nanos();
-    let tenant = Tenant::from_header(None, false).expect("the empty tenant");
 
     let body = match read_capped_body(body, decompress::MAX_DECOMPRESSED_BYTES).await {
         Ok(body) => body,
@@ -375,8 +378,12 @@ pub async fn ingest_remote_write(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
+    // Issue #635 part 4: the tenant first; an invalid one stores nothing.
+    let tenant = match pulsus_model::tenant_from_headers(&headers) {
+        Ok(tenant) => tenant,
+        Err(err) => return go_http_error_response(StatusCode::BAD_REQUEST, format!("{err}\n")),
+    };
     let now_ns = now_unix_nanos();
-    let tenant = Tenant::from_header(None, false).expect("the empty tenant");
 
     let body = match read_capped_body(body, decompress::MAX_DECOMPRESSED_BYTES).await {
         Ok(body) => body,
@@ -2041,7 +2048,7 @@ mod tests {
     impl MetricSink for MockMetricSink {
         fn admit(
             &self,
-            _tenant: &Tenant,
+            _tenant: &pulsus_model::Tenant,
             batch: ParsedMetrics,
             push: PushHeaders,
         ) -> Result<(), AdmitRefusal> {
@@ -2055,7 +2062,7 @@ mod tests {
 
         fn admit_flush(
             &self,
-            _tenant: &Tenant,
+            _tenant: &pulsus_model::Tenant,
             batch: ParsedMetrics,
             push: PushHeaders,
         ) -> Result<FlushWait, AdmitRefusal> {

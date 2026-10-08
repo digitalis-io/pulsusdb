@@ -109,6 +109,7 @@ struct SeedSeriesRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedSampleRow {
+    org_id: String,
     fingerprint: u128,
     unix_milli: i64,
     value: f64,
@@ -118,6 +119,7 @@ struct SeedSampleRow {
 /// catalog CREATE, RowBinary is positional).
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedHistRow {
+    org_id: String,
     fingerprint: u128,
     unix_milli: i64,
     schema: i8,
@@ -277,6 +279,7 @@ async fn count_by_job_up_is_lookback_correct_and_excludes_a_silent_series() {
         &[
             // fp1 (job=api): live, sampled at the query instant itself.
             SeedSampleRow {
+                org_id: String::new(),
                 fingerprint: 1,
                 unix_milli: recent_bucket,
                 value: 1.0,
@@ -286,12 +289,14 @@ async fn count_by_job_up_is_lookback_correct_and_excludes_a_silent_series() {
             // lookback of this instant" case the removed cache-only path
             // got wrong. Must be excluded from the count.
             SeedSampleRow {
+                org_id: String::new(),
                 fingerprint: 2,
                 unix_milli: recent_bucket - (DEFAULT_LOOKBACK_MS + 60_000),
                 value: 1.0,
             },
             // fp3 (job=web): live.
             SeedSampleRow {
+                org_id: String::new(),
                 fingerprint: 3,
                 unix_milli: recent_bucket,
                 value: 1.0,
@@ -385,6 +390,7 @@ async fn bare_selector_query_keeps_metric_name_end_to_end() {
     seed_samples(
         &client,
         &[SeedSampleRow {
+            org_id: String::new(),
             fingerprint: 1,
             unix_milli: recent_bucket,
             value: 1.0,
@@ -492,6 +498,7 @@ async fn count_by_job_up_historical_variant_routes_through_metric_series() {
     seed_samples(
         &client,
         &[SeedSampleRow {
+            org_id: String::new(),
             fingerprint: 4242,
             unix_milli: last_week_bucket,
             value: 1.0,
@@ -588,6 +595,7 @@ async fn group_with_offset_routes_through_metric_series() {
     seed_samples(
         &client,
         &[SeedSampleRow {
+            org_id: String::new(),
             fingerprint: 777,
             unix_milli: two_days_ago_bucket,
             value: 1.0,
@@ -695,31 +703,37 @@ async fn count_by_service_up_over_query_range_returns_a_matrix_not_a_vector() {
         &client,
         &[
             SeedSampleRow {
+                org_id: String::new(),
                 fingerprint: 10,
                 unix_milli: t0,
                 value: 1.0,
             },
             SeedSampleRow {
+                org_id: String::new(),
                 fingerprint: 10,
                 unix_milli: t1,
                 value: 1.0,
             },
             SeedSampleRow {
+                org_id: String::new(),
                 fingerprint: 10,
                 unix_milli: t2,
                 value: 1.0,
             },
             SeedSampleRow {
+                org_id: String::new(),
                 fingerprint: 11,
                 unix_milli: t0,
                 value: 1.0,
             },
             SeedSampleRow {
+                org_id: String::new(),
                 fingerprint: 11,
                 unix_milli: t1,
                 value: 1.0,
             },
             SeedSampleRow {
+                org_id: String::new(),
                 fingerprint: 11,
                 unix_milli: t2,
                 value: 1.0,
@@ -823,11 +837,13 @@ async fn count_by_service_routes_sample_fetch_for_both_instant_and_range() {
         &client,
         &[
             SeedSampleRow {
+                org_id: String::new(),
                 fingerprint: 20,
                 unix_milli: t0,
                 value: 1.0,
             },
             SeedSampleRow {
+                org_id: String::new(),
                 fingerprint: 20,
                 unix_milli: t1,
                 value: 1.0,
@@ -968,6 +984,7 @@ async fn binary_expression_fetches_both_sides_concurrently() {
             });
             for t in 0..SAMPLES_PER_SERIES {
                 sample_rows.push(SeedSampleRow {
+                    org_id: String::new(),
                     fingerprint: u128::from(fp),
                     unix_milli: recent_bucket - t * 1_000,
                     value: t as f64,
@@ -1142,11 +1159,13 @@ async fn rate_end_to_end_against_real_samples() {
         &client,
         &[
             SeedSampleRow {
+                org_id: String::new(),
                 fingerprint: 55,
                 unix_milli: recent_bucket - 59_999,
                 value: 0.0,
             },
             SeedSampleRow {
+                org_id: String::new(),
                 fingerprint: 55,
                 unix_milli: recent_bucket,
                 value: 60.0,
@@ -1302,6 +1321,7 @@ async fn info_cardinality_cap_rejects_over_cap_before_materialization() {
     let info_samples: Vec<SeedSampleRow> = info_series
         .iter()
         .map(|s| SeedSampleRow {
+            org_id: String::new(),
             fingerprint: s.fingerprint,
             unix_milli: now,
             value: 1.0,
@@ -1319,6 +1339,7 @@ async fn info_cardinality_cap_rejects_over_cap_before_materialization() {
     seed_samples(
         &cache_client,
         &[SeedSampleRow {
+            org_id: String::new(),
             fingerprint: base.fingerprint,
             unix_milli: now,
             value: 1.0,
@@ -1410,6 +1431,7 @@ async fn info_cardinality_cap_rejects_over_cap_on_the_degraded_sql_fallback_path
     let info_samples: Vec<SeedSampleRow> = info_series
         .iter()
         .map(|s| SeedSampleRow {
+            org_id: String::new(),
             fingerprint: s.fingerprint,
             unix_milli: last_week_bucket,
             value: 1.0,
@@ -1427,6 +1449,7 @@ async fn info_cardinality_cap_rejects_over_cap_on_the_degraded_sql_fallback_path
     seed_samples(
         &client,
         &[SeedSampleRow {
+            org_id: String::new(),
             fingerprint: base.fingerprint,
             unix_milli: last_week_bucket,
             value: 1.0,
@@ -1522,6 +1545,7 @@ async fn sample_budget_rejects_over_cap_fetch_and_admits_exactly_at_cap() {
     // window ending at b0 + 4s.
     let samples: Vec<SeedSampleRow> = (0..5i64)
         .map(|i| SeedSampleRow {
+            org_id: String::new(),
             fingerprint: series.fingerprint,
             unix_milli: b0 + i * 1_000,
             value: i as f64,
@@ -1658,6 +1682,7 @@ async fn info_cardinality_probe_counts_distinct_series_not_activity_bucket_rows(
                 labels: format!(r#"{{"instance":"i{i}","job":"j","data":"d{i}"}}"#),
             });
             samples.push(SeedSampleRow {
+                org_id: String::new(),
                 fingerprint: u128::from(fp),
                 unix_milli: t,
                 value: 1.0,
@@ -1679,6 +1704,7 @@ async fn info_cardinality_probe_counts_distinct_series_not_activity_bucket_rows(
     .await;
     for &t in &buckets {
         samples.push(SeedSampleRow {
+            org_id: String::new(),
             fingerprint: base_fp,
             unix_milli: t,
             value: 1.0,
@@ -1860,6 +1886,7 @@ async fn explain_carries_the_real_generated_sample_fetch_sql() {
     seed_samples(
         &client,
         &[SeedSampleRow {
+            org_id: String::new(),
             fingerprint: 1,
             unix_milli: recent_bucket,
             value: 1.0,
@@ -1942,6 +1969,7 @@ async fn every_fetch_path_sends_both_reads_at_once() {
                 labels: r#"{"job":"api"}"#.to_string(),
             });
             samples.push(SeedSampleRow {
+                org_id: String::new(),
                 fingerprint: fp,
                 unix_milli: at,
                 value: 1.0,
@@ -2050,6 +2078,7 @@ async fn explain_carries_the_fallback_subquery_sample_fetch_sql() {
     seed_samples(
         &client,
         &[SeedSampleRow {
+            org_id: String::new(),
             fingerprint: 1,
             unix_milli: historical_bucket,
             value: 1.0,
@@ -2097,6 +2126,7 @@ async fn explain_carries_the_fallback_subquery_sample_fetch_sql() {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedMetadataRow {
+    org_id: String,
     metric_name: String,
     metric_type: String,
     help: String,
@@ -2328,6 +2358,7 @@ async fn an_re2_rejected_matcher_regex_is_a_client_rejection_not_a_server_error(
     seed_samples(
         &client,
         &[SeedSampleRow {
+            org_id: String::new(),
             fingerprint: 1,
             unix_milli: old_bucket,
             value: 1.0,
@@ -2533,6 +2564,7 @@ async fn a_warm_cache_does_not_answer_an_re2_rejected_matcher_in_process() {
     seed_samples(
         &client,
         &[SeedSampleRow {
+            org_id: String::new(),
             fingerprint: 1,
             unix_milli: recent_bucket,
             value: 1.0,
@@ -2931,6 +2963,7 @@ async fn metadata_collapses_to_the_latest_write() {
         &client,
         &[
             SeedMetadataRow {
+                org_id: String::new(),
                 metric_name: "up".to_string(),
                 metric_type: "gauge".to_string(),
                 help: "old help".to_string(),
@@ -2938,6 +2971,7 @@ async fn metadata_collapses_to_the_latest_write() {
                 updated_ns: 1_000,
             },
             SeedMetadataRow {
+                org_id: String::new(),
                 metric_name: "up".to_string(),
                 metric_type: "gauge".to_string(),
                 help: "1 if the target is healthy".to_string(),
@@ -2945,6 +2979,7 @@ async fn metadata_collapses_to_the_latest_write() {
                 updated_ns: 2_000,
             },
             SeedMetadataRow {
+                org_id: String::new(),
                 metric_name: "http_requests_total".to_string(),
                 metric_type: "counter".to_string(),
                 help: "total requests".to_string(),
@@ -3023,6 +3058,7 @@ async fn a_tie_on_updated_ns_serves_one_whole_descriptor() {
         &client,
         &[
             SeedMetadataRow {
+                org_id: String::new(),
                 metric_name: "up".to_string(),
                 metric_type: "gauge".to_string(),
                 help: "help a".to_string(),
@@ -3030,6 +3066,7 @@ async fn a_tie_on_updated_ns_serves_one_whole_descriptor() {
                 updated_ns: 3_000,
             },
             SeedMetadataRow {
+                org_id: String::new(),
                 metric_name: "up".to_string(),
                 metric_type: "counter".to_string(),
                 help: "help b".to_string(),
@@ -3197,16 +3234,19 @@ async fn nameless_selector_fans_out_with_per_series_names_and_one_flat_in_set_fe
         &client,
         &[
             SeedSampleRow {
+                org_id: String::new(),
                 fingerprint: 1,
                 unix_milli: recent_bucket,
                 value: 11.0,
             },
             SeedSampleRow {
+                org_id: String::new(),
                 fingerprint: 3,
                 unix_milli: recent_bucket,
                 value: 22.0,
             },
             SeedSampleRow {
+                org_id: String::new(),
                 fingerprint: 2,
                 unix_milli: recent_bucket,
                 value: 99.0,
@@ -3366,6 +3406,7 @@ async fn dual_read_merges_and_decodes_histogram_samples_end_to_end() {
     seed_samples(
         &client,
         &[SeedSampleRow {
+            org_id: String::new(),
             fingerprint: 1,
             unix_milli: recent_bucket,
             value: 42.0,
@@ -3375,6 +3416,7 @@ async fn dual_read_merges_and_decodes_histogram_samples_end_to_end() {
     seed_hist_samples(
         &client,
         &[SeedHistRow {
+            org_id: String::new(),
             fingerprint: 2,
             unix_milli: recent_bucket,
             schema: 0,
@@ -3549,6 +3591,7 @@ async fn a_nameless_selector_with_an_uncompilable_matcher_is_bad_data_not_execut
     seed_samples(
         &client,
         &[SeedSampleRow {
+            org_id: String::new(),
             fingerprint: 1,
             unix_milli: recent_bucket,
             value: 1.0,
@@ -3821,6 +3864,7 @@ async fn selector_regex_matches_prometheus_on_cold_and_warm_resolution() {
         .iter()
         .enumerate()
         .map(|(i, (_, v))| SeedSampleRow {
+            org_id: String::new(),
             fingerprint: u128::from(i as u64 + 1),
             unix_milli: recent_bucket,
             value: *v,
@@ -4231,6 +4275,7 @@ async fn label_values_name_equals_the_wide_discovery_paths_name_set() {
 /// and its own label row in `metric_labels`.
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedActivityRow {
+    org_id: String,
     day: u16,
     fingerprint: u128,
     metric_name: String,
@@ -4239,6 +4284,7 @@ struct SeedActivityRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedLabelRow {
+    org_id: String,
     metric_name: String,
     fingerprint: u128,
     labels: String,
@@ -4251,6 +4297,7 @@ async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
     let activity: Vec<SeedActivityRow> = rows
         .iter()
         .map(|r| SeedActivityRow {
+            org_id: String::new(),
             day: r.unix_milli.div_euclid(86_400_000) as u16,
             fingerprint: r.fingerprint,
             metric_name: r.metric_name.clone(),
@@ -4260,6 +4307,7 @@ async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
     let labels: Vec<SeedLabelRow> = rows
         .iter()
         .map(|r| SeedLabelRow {
+            org_id: String::new(),
             metric_name: r.metric_name.clone(),
             fingerprint: r.fingerprint,
             labels: r.labels.clone(),
@@ -4285,6 +4333,7 @@ async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
         for (key, value) in map {
             pairs.insert((key.clone(), value.clone()));
             index.push(SeedIndexRow {
+                org_id: String::new(),
                 key,
                 value,
                 fingerprint: r.fingerprint,
@@ -4293,7 +4342,11 @@ async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
     }
     let values: Vec<SeedValueRow> = pairs
         .into_iter()
-        .map(|(key, value)| SeedValueRow { key, value })
+        .map(|(key, value)| SeedValueRow {
+            org_id: String::new(),
+            key,
+            value,
+        })
         .collect();
     client
         .insert_block("metric_label_index", &index)
@@ -4307,6 +4360,7 @@ async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedIndexRow {
+    org_id: String,
     key: String,
     value: String,
     fingerprint: u128,
@@ -4314,6 +4368,7 @@ struct SeedIndexRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedValueRow {
+    org_id: String,
     key: String,
     value: String,
 }

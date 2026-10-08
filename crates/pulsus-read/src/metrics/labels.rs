@@ -981,16 +981,42 @@ pub(crate) fn resolve_labelled_over(
     LabelledResolution::Series(matched)
 }
 
-/// The resident label cache: owns the snapshot slot, config, the compiled-
-/// regex cache, the `ChClient` the refresh sweep queries through, and the
-/// metrics atomics. Fields are `pub(crate)` — visible to [`super::refresh`]
-/// (which owns the sweep + swap) without leaking outside this crate.
+/// The resident label cache: one snapshot slot and compiled-regex cache
+/// per tenant in use (issue #635 part 4), the config, the `ChClient` the
+/// refresh sweep queries through, and the metrics atomics. Fields are
+/// `pub(crate)` — visible to [`super::refresh`] (which owns the sweep +
+/// swap) without leaking outside this crate.
 pub struct LabelCache {
     pub(crate) client: ChClient,
     pub(crate) config: LabelCacheConfig,
+    /// Every tenant a read has asked for, and the empty tenant from the
+    /// start. The refresh loop sweeps each, with that tenant's statement.
+    pub(crate) tenants: RwLock<HashMap<Tenant, Arc<TenantCache>>>,
+    pub(crate) metrics: CacheMetrics,
+}
+
+/// One tenant's resident cache (issue #635 part 4): its snapshot, swept
+/// with its own statement, and its compiled regexes.
+pub(crate) struct TenantCache {
     pub(crate) snapshot: RwLock<Arc<CacheSnapshot>>,
     pub(crate) regex_cache: RegexCache,
-    pub(crate) metrics: CacheMetrics,
+}
+
+impl TenantCache {
+    fn new() -> Self {
+        TenantCache {
+            snapshot: RwLock::new(Arc::new(CacheSnapshot::default())),
+            regex_cache: RegexCache::new(REGEX_CACHE_CAPACITY),
+        }
+    }
+
+    pub(crate) fn current_snapshot(&self) -> Arc<CacheSnapshot> {
+        let guard = match self.snapshot.read() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        Arc::clone(&guard)
+    }
 }
 
 impl LabelCache {
@@ -998,27 +1024,74 @@ impl LabelCache {
     /// until the first successful [`super::refresh::spawn_refresh_loop`]
     /// sweep.
     pub fn new(client: ChClient, cfg: LabelCacheConfig) -> Self {
+        let mut tenants = HashMap::new();
+        tenants.insert(
+            Tenant::from_header(None, false).expect("the empty tenant"),
+            Arc::new(TenantCache::new()),
+        );
         LabelCache {
             client,
             config: cfg,
-            snapshot: RwLock::new(Arc::new(CacheSnapshot::default())),
-            regex_cache: RegexCache::new(REGEX_CACHE_CAPACITY),
+            tenants: RwLock::new(tenants),
             metrics: CacheMetrics::default(),
         }
     }
 
-    /// One refresh sweep + atomic swap (delegates to [`super::refresh`],
-    /// the only ClickHouse-touching code in this module). A failed sweep
-    /// leaves the last good snapshot in place — see
-    /// [`super::refresh::run_sweep`]'s doc comment.
+    /// One refresh sweep + atomic swap for every tenant in use (delegates
+    /// to [`super::refresh`], the only ClickHouse-touching code in this
+    /// module). A failed sweep leaves that tenant's last good snapshot in
+    /// place — see [`super::refresh::run_sweep`]'s doc comment — and the
+    /// others are still swept; the first failure is returned.
     pub async fn refresh(&self) -> Result<(), pulsus_clickhouse::ChError> {
-        super::refresh::run_sweep(self).await
+        let mut first_err = None;
+        for tenant in self.tenants_in_use() {
+            if let Err(err) = self.refresh_tenant(&tenant).await
+                && first_err.is_none()
+            {
+                first_err = Some(err);
+            }
+        }
+        first_err.map_or(Ok(()), Err)
     }
 
-    /// One sweep of `tenant`'s cache (issue #635 part 4).
+    /// One sweep of `tenant`'s cache (issue #635 part 4), which puts the
+    /// tenant in use.
     pub async fn refresh_tenant(&self, tenant: &Tenant) -> Result<(), pulsus_clickhouse::ChError> {
-        let _ = tenant;
-        super::refresh::run_sweep(self).await
+        let slot = self.tenant_cache(tenant);
+        super::refresh::run_sweep(self, tenant, &slot).await
+    }
+
+    /// The tenants the refresh loop sweeps, sorted.
+    pub(crate) fn tenants_in_use(&self) -> Vec<Tenant> {
+        let guard = match self.tenants.read() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut out: Vec<Tenant> = guard.keys().cloned().collect();
+        out.sort();
+        out
+    }
+
+    /// `tenant`'s cache, started cold the first time a read asks for it.
+    pub(crate) fn tenant_cache(&self, tenant: &Tenant) -> Arc<TenantCache> {
+        {
+            let guard = match self.tenants.read() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if let Some(slot) = guard.get(tenant) {
+                return Arc::clone(slot);
+            }
+        }
+        let mut guard = match self.tenants.write() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        Arc::clone(
+            guard
+                .entry(tenant.clone())
+                .or_insert_with(|| Arc::new(TenantCache::new())),
+        )
     }
 
     /// `true` once at least one sweep has succeeded (task-manager
@@ -1051,12 +1124,11 @@ impl LabelCache {
         self.metrics.snapshot()
     }
 
+    /// The empty tenant's snapshot: the single-tenant deployment's, and
+    /// what readiness and the age gauge report.
     pub(crate) fn current_snapshot(&self) -> Arc<CacheSnapshot> {
-        let guard = match self.snapshot.read() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        Arc::clone(&guard)
+        self.tenant_cache(&Tenant::from_header(None, false).expect("the empty tenant"))
+            .current_snapshot()
     }
 }
 
@@ -1104,8 +1176,7 @@ impl LabelCache {
     /// than a ClickHouse fallback query (task-manager resolution #2: "no
     /// SQL variant for M2").
     pub fn tsdb_snapshot(&self, tenant: &Tenant) -> TsdbCacheSnapshot {
-        let _ = tenant;
-        tsdb_snapshot_over(&self.current_snapshot())
+        tsdb_snapshot_over(&self.tenant_cache(tenant).current_snapshot())
     }
 }
 
@@ -1117,10 +1188,11 @@ impl SeriesResolver for LabelCache {
         matchers: &[LabelMatcher],
         window: DataWindow,
     ) -> Resolution {
-        let snapshot = self.current_snapshot();
+        let slot = self.tenant_cache(tenant);
+        let snapshot = slot.current_snapshot();
         resolve_over(
             &snapshot,
-            &self.regex_cache,
+            &slot.regex_cache,
             &self.metrics,
             &self.config,
             tenant,
@@ -1147,10 +1219,11 @@ impl LabelCache {
         matchers: &[LabelMatcher],
         window: DataWindow,
     ) -> LabelledResolution {
-        let snapshot = self.current_snapshot();
+        let slot = self.tenant_cache(tenant);
+        let snapshot = slot.current_snapshot();
         resolve_labelled_over(
             &snapshot,
-            &self.regex_cache,
+            &slot.regex_cache,
             &self.metrics,
             &self.config,
             tenant,
@@ -1177,11 +1250,11 @@ impl LabelCache {
         fanout_cap: u64,
         scan_budget: u64,
     ) -> MultiMetricResolution {
-        let _ = tenant;
-        let snapshot = self.current_snapshot();
+        let slot = self.tenant_cache(tenant);
+        let snapshot = slot.current_snapshot();
         resolve_multi_metric_over(
             &snapshot,
-            &self.regex_cache,
+            &slot.regex_cache,
             &self.metrics,
             &self.config,
             name_matchers,

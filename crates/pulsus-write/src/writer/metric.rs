@@ -126,6 +126,7 @@ fn promotion_keys(rows: &[MetricLandingRow]) -> impl Iterator<Item = SeriesKey> 
         .filter(|row| row.kind == MetricLandingRow::KIND_SERIES)
         .map(|row| {
             (
+                Arc::clone(&row.org_id),
                 Arc::from(row.metric_name.as_str()),
                 row.fingerprint,
                 row.unix_milli,
@@ -284,6 +285,7 @@ impl MetricWriter {
                     .filter(|row| row.kind == MetricLandingRow::KIND_METADATA)
                 {
                     sent.promote(
+                        &row.org_id,
                         &row.metric_name,
                         &row.metric_type,
                         &row.help,
@@ -386,7 +388,7 @@ impl MetricWriter {
         let mut suppressed: Option<Suppressed> = None;
         let mut guard = match &self.shared.dedup {
             Some(dedup) => {
-                let id = push_dedup::metric_identity(&batch, &push);
+                let id = push_dedup::metric_identity(&batch, &push, tenant);
                 let rows = (batch.samples.len() + batch.hist_samples.len()) as u64;
                 match dedup.admit(id, mode.wait_mode()) {
                     Admission::Admit(guard) => Some(guard),
@@ -429,7 +431,14 @@ impl MetricWriter {
             last_by_name
                 .into_values()
                 .filter(|m| {
-                    !sent.is_current(&m.metric_name, &m.metric_type, &m.help, &m.unit, hour)
+                    !sent.is_current(
+                        tenant.as_str(),
+                        &m.metric_name,
+                        &m.metric_type,
+                        &m.help,
+                        &m.unit,
+                        hour,
+                    )
                 })
                 .collect()
         };
@@ -460,7 +469,7 @@ impl MetricWriter {
         // below is over the whole push and has to be complete before any
         // branch can queue anything; its counters do not move for one, so
         // issue #494's suppression path is observably unchanged.
-        let new_series = self.series_to_register(&batch, suppressed.is_none());
+        let new_series = self.series_to_register(tenant, &batch, suppressed.is_none());
         let series_bytes: u64 = new_series
             .iter()
             .map(|(s, _, _)| {
@@ -491,9 +500,13 @@ impl MetricWriter {
             return Ok(Admitted::Stored(Vec::new()));
         }
 
+        // Issue #635 part 4: every row shares the push's one tenant string,
+        // whose bytes are charged once, beside the slot each row's `Arc`
+        // already occupies.
+        let tenant_bytes = tenant.as_str().len() as u64;
         let total_bytes = landing_charge::<MetricLandingRow>(
             sample_bytes + series_bytes + metadata_bytes + hist_sample_bytes,
-        );
+        ) + tenant_bytes;
 
         // The two per-push ceilings, counted over all four kinds, and decided
         // **before** either branch below queues anything (issue #603 code
@@ -534,7 +547,8 @@ impl MetricWriter {
         // emits them again.
         if let Some(suppressed) = suppressed {
             if !descriptors.is_empty() {
-                let descriptor_bytes = landing_charge::<MetricLandingRow>(metadata_bytes);
+                let descriptor_bytes =
+                    landing_charge::<MetricLandingRow>(metadata_bytes) + tenant_bytes;
                 super::reserve_queued_bytes(
                     &self.shared.queued_bytes,
                     &self.shared.metrics.backpressure_total,
@@ -676,6 +690,7 @@ impl MetricWriter {
     /// and the LRU hit/miss counters must not move for it.
     fn series_to_register<'a>(
         &self,
+        tenant: &Tenant,
         batch: &'a ParsedMetrics,
         count: bool,
     ) -> Vec<(&'a SeriesRef, i64, u8)> {
@@ -714,7 +729,13 @@ impl MetricWriter {
         });
         for (metric_name, fingerprint, unix_milli, value_type) in float_keys.chain(hist_keys) {
             let bucket = floor_to_activity_bucket(unix_milli, self.shared.bucket_ms);
-            let key: SeriesKey = (metric_name.clone(), fingerprint, bucket, value_type);
+            let key: SeriesKey = (
+                Arc::clone(tenant.as_arc()),
+                metric_name.clone(),
+                fingerprint,
+                bucket,
+                value_type,
+            );
             if !seen_in_request.insert(key.clone()) {
                 continue; // already queued by an earlier sample this request
             }
@@ -1126,6 +1147,7 @@ mod tests {
                 .lock()
                 .expect("series lru mutex poisoned");
             lru.contains(&(
+                Arc::from(""),
                 Arc::from(LONG_NAME),
                 Fingerprint::from_raw(7),
                 floor_to_activity_bucket(1_000, BUCKET_MS),
@@ -1174,12 +1196,14 @@ mod tests {
 
         let expected: Vec<SeriesKey> = vec![
             (
+                Arc::from(""),
                 Arc::from(LONG_NAME),
                 Fingerprint::from_raw(7),
                 3_600_000,
                 VALUE_TYPE_FLOAT,
             ),
             (
+                Arc::from(""),
                 Arc::from(LONG_NAME),
                 Fingerprint::from_raw(7),
                 7_200_000,

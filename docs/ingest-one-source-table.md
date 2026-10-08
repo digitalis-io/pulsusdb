@@ -104,7 +104,7 @@ Decisions inside that statement, each of which a second signal has to make again
   out of the settings a push has to reason about (§2.1).
 - **No identity column** (issue #623). The table carried a server-filled `event_id`
   that nothing outside tests read and that was 87% of its bytes; it is gone.
-  `MetricLandingRow` declares all 25 columns, and the insert's column list is exactly
+  `MetricLandingRow` declares all 26 columns (`org_id` first, issue #635), and the insert's column list is exactly
   that row type's `COLUMN_NAMES`. The retry mechanism is the deduplication token (§3).
 - **The two engine settings that are fixed sit here.** The delete-TTL and the
   deduplication window carry configuration values, so they are applied at run time

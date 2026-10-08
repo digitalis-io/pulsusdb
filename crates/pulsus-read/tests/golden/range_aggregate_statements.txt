@@ -55,7 +55,7 @@ FROM (
                     ts = lagInFrame(unix_milli, 1, toInt64(-1)) OVER w0
                       AND yb = lagInFrame(reinterpretAsUInt64(value), 1, toUInt64(0)) OVER w0 AS dup
                   FROM metric_samples
-                  WHERE unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps
+                  WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps
                     AND reinterpretAsUInt64(value) != 9218868437227405314
                   WINDOW w0 AS (PARTITION BY fingerprint ORDER BY unix_milli, reinterpretAsUInt64(value)
                                 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
@@ -79,7 +79,7 @@ FROM (
 UNION ALL
 SELECT toUInt32(4294967295) AS gid, toUInt32(0) AS gi,
   toFloat64((SELECT count() FROM metric_hist_samples
-             WHERE unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps)) AS agg
+             WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps)) AS agg
 ORDER BY gid, gi
 -- golden[sum increase]
 WITH 1782907200000 AS grid_start, 15000 AS grid_step, 241 AS grid_n, 300000 AS range_ms,
@@ -132,7 +132,7 @@ FROM (
                     ts = lagInFrame(unix_milli, 1, toInt64(-1)) OVER w0
                       AND yb = lagInFrame(reinterpretAsUInt64(value), 1, toUInt64(0)) OVER w0 AS dup
                   FROM metric_samples
-                  WHERE unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps
+                  WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps
                     AND reinterpretAsUInt64(value) != 9218868437227405314
                   WINDOW w0 AS (PARTITION BY fingerprint ORDER BY unix_milli, reinterpretAsUInt64(value)
                                 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
@@ -156,7 +156,7 @@ FROM (
 UNION ALL
 SELECT toUInt32(4294967295) AS gid, toUInt32(0) AS gi,
   toFloat64((SELECT count() FROM metric_hist_samples
-             WHERE unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps)) AS agg
+             WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps)) AS agg
 ORDER BY gid, gi
 -- golden[sum irate]
 WITH 1782907200000 AS grid_start, 15000 AS grid_step, 241 AS grid_n, 300000 AS range_ms,
@@ -196,7 +196,7 @@ FROM (
                     ts = lagInFrame(unix_milli, 1, toInt64(-1)) OVER w0
                       AND yb = lagInFrame(reinterpretAsUInt64(value), 1, toUInt64(0)) OVER w0 AS dup
                   FROM metric_samples
-                  WHERE unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps
+                  WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps
                     AND reinterpretAsUInt64(value) != 9218868437227405314
                   WINDOW w0 AS (PARTITION BY fingerprint ORDER BY unix_milli, reinterpretAsUInt64(value)
                                 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
@@ -220,7 +220,7 @@ FROM (
 UNION ALL
 SELECT toUInt32(4294967295) AS gid, toUInt32(0) AS gi,
   toFloat64((SELECT count() FROM metric_hist_samples
-             WHERE unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps)) AS agg
+             WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps)) AS agg
 ORDER BY gid, gi
 -- golden[avg rate]
 WITH 1782907200000 AS grid_start, 15000 AS grid_step, 241 AS grid_n, 300000 AS range_ms,
@@ -273,7 +273,7 @@ FROM (
                     ts = lagInFrame(unix_milli, 1, toInt64(-1)) OVER w0
                       AND yb = lagInFrame(reinterpretAsUInt64(value), 1, toUInt64(0)) OVER w0 AS dup
                   FROM metric_samples
-                  WHERE unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps
+                  WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps
                     AND reinterpretAsUInt64(value) != 9218868437227405314
                   WINDOW w0 AS (PARTITION BY fingerprint ORDER BY unix_milli, reinterpretAsUInt64(value)
                                 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
@@ -297,7 +297,7 @@ FROM (
 UNION ALL
 SELECT toUInt32(4294967295) AS gid, toUInt32(0) AS gi,
   toFloat64((SELECT count() FROM metric_hist_samples
-             WHERE unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps)) AS agg
+             WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps)) AS agg
 ORDER BY gid, gi
 -- golden[count rate]
 WITH 1782907200000 AS grid_start, 15000 AS grid_step, 241 AS grid_n, 300000 AS range_ms,
@@ -350,7 +350,7 @@ FROM (
                     ts = lagInFrame(unix_milli, 1, toInt64(-1)) OVER w0
                       AND yb = lagInFrame(reinterpretAsUInt64(value), 1, toUInt64(0)) OVER w0 AS dup
                   FROM metric_samples
-                  WHERE unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps
+                  WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps
                     AND reinterpretAsUInt64(value) != 9218868437227405314
                   WINDOW w0 AS (PARTITION BY fingerprint ORDER BY unix_milli, reinterpretAsUInt64(value)
                                 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
@@ -374,7 +374,7 @@ FROM (
 UNION ALL
 SELECT toUInt32(4294967295) AS gid, toUInt32(0) AS gi,
   toFloat64((SELECT count() FROM metric_hist_samples
-             WHERE unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps)) AS agg
+             WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps)) AS agg
 ORDER BY gid, gi
 -- golden[min rate]
 WITH 1782907200000 AS grid_start, 15000 AS grid_step, 241 AS grid_n, 300000 AS range_ms,
@@ -427,7 +427,7 @@ FROM (
                     ts = lagInFrame(unix_milli, 1, toInt64(-1)) OVER w0
                       AND yb = lagInFrame(reinterpretAsUInt64(value), 1, toUInt64(0)) OVER w0 AS dup
                   FROM metric_samples
-                  WHERE unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps
+                  WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps
                     AND reinterpretAsUInt64(value) != 9218868437227405314
                   WINDOW w0 AS (PARTITION BY fingerprint ORDER BY unix_milli, reinterpretAsUInt64(value)
                                 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
@@ -451,7 +451,7 @@ FROM (
 UNION ALL
 SELECT toUInt32(4294967295) AS gid, toUInt32(0) AS gi,
   toFloat64((SELECT count() FROM metric_hist_samples
-             WHERE unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps)) AS agg
+             WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps)) AS agg
 ORDER BY gid, gi
 -- golden[max rate]
 WITH 1782907200000 AS grid_start, 15000 AS grid_step, 241 AS grid_n, 300000 AS range_ms,
@@ -504,7 +504,7 @@ FROM (
                     ts = lagInFrame(unix_milli, 1, toInt64(-1)) OVER w0
                       AND yb = lagInFrame(reinterpretAsUInt64(value), 1, toUInt64(0)) OVER w0 AS dup
                   FROM metric_samples
-                  WHERE unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps
+                  WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps
                     AND reinterpretAsUInt64(value) != 9218868437227405314
                   WINDOW w0 AS (PARTITION BY fingerprint ORDER BY unix_milli, reinterpretAsUInt64(value)
                                 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
@@ -528,5 +528,5 @@ FROM (
 UNION ALL
 SELECT toUInt32(4294967295) AS gid, toUInt32(0) AS gi,
   toFloat64((SELECT count() FROM metric_hist_samples
-             WHERE unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps)) AS agg
+             WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps)) AS agg
 ORDER BY gid, gi

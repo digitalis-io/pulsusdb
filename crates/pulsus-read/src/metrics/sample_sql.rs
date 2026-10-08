@@ -30,6 +30,7 @@
 
 use pulsus_model::{FpLiteral, Tenant};
 
+use super::TenantSql;
 use crate::logql::escape::ch_string;
 
 // ---------------------------------------------------------------------
@@ -88,8 +89,11 @@ pub fn sample_fetch(
     lower_excl_ms: i64,
     upper_incl_ms: i64,
 ) -> String {
-    let _ = tenant;
-    let window = window_predicate(lower_excl_ms, upper_incl_ms);
+    let window = format!(
+        "org_id = {} AND {}",
+        tenant.sql_literal(),
+        window_predicate(lower_excl_ms, upper_incl_ms)
+    );
     let fps = fingerprints_predicate(fps);
     format!(
         "SELECT fingerprint, unix_milli, value\nFROM {table}\nWHERE {window}\n  AND {fps}\nORDER BY fingerprint, unix_milli"
@@ -107,8 +111,11 @@ pub fn sample_fetch_subquery(
     lower_excl_ms: i64,
     upper_incl_ms: i64,
 ) -> String {
-    let _ = tenant;
-    let window = window_predicate(lower_excl_ms, upper_incl_ms);
+    let window = format!(
+        "org_id = {} AND {}",
+        tenant.sql_literal(),
+        window_predicate(lower_excl_ms, upper_incl_ms)
+    );
     let sub = subquery_predicate(subquery);
     format!(
         "SELECT fingerprint, unix_milli, value\nFROM {table}\nWHERE {window}\n  AND {sub}\nORDER BY fingerprint, unix_milli"
@@ -128,8 +135,11 @@ pub fn sample_fetch_multi(
     lower_excl_ms: i64,
     upper_incl_ms: i64,
 ) -> String {
-    let _ = tenant;
-    let window = window_predicate(lower_excl_ms, upper_incl_ms);
+    let window = format!(
+        "org_id = {} AND {}",
+        tenant.sql_literal(),
+        window_predicate(lower_excl_ms, upper_incl_ms)
+    );
     let fps = fingerprints_predicate(fps);
     format!(
         "SELECT fingerprint, unix_milli, value\nFROM {table}\nWHERE {window}\n  AND {fps}\nORDER BY fingerprint, unix_milli"
@@ -160,8 +170,11 @@ pub fn hist_sample_fetch(
     lower_excl_ms: i64,
     upper_incl_ms: i64,
 ) -> String {
-    let _ = tenant;
-    let window = window_predicate(lower_excl_ms, upper_incl_ms);
+    let window = format!(
+        "org_id = {} AND {}",
+        tenant.sql_literal(),
+        window_predicate(lower_excl_ms, upper_incl_ms)
+    );
     let fps = fingerprints_predicate(fps);
     format!(
         "SELECT fingerprint, unix_milli, {HIST_VALUE_COLUMNS}\nFROM {table}\nWHERE {window}\n  AND {fps}\nORDER BY fingerprint, unix_milli"
@@ -179,8 +192,11 @@ pub fn hist_sample_fetch_subquery(
     lower_excl_ms: i64,
     upper_incl_ms: i64,
 ) -> String {
-    let _ = tenant;
-    let window = window_predicate(lower_excl_ms, upper_incl_ms);
+    let window = format!(
+        "org_id = {} AND {}",
+        tenant.sql_literal(),
+        window_predicate(lower_excl_ms, upper_incl_ms)
+    );
     let sub = subquery_predicate(subquery);
     format!(
         "SELECT fingerprint, unix_milli, {HIST_VALUE_COLUMNS}\nFROM {table}\nWHERE {window}\n  AND {sub}\nORDER BY fingerprint, unix_milli"
@@ -198,8 +214,11 @@ pub fn hist_sample_fetch_multi(
     lower_excl_ms: i64,
     upper_incl_ms: i64,
 ) -> String {
-    let _ = tenant;
-    let window = window_predicate(lower_excl_ms, upper_incl_ms);
+    let window = format!(
+        "org_id = {} AND {}",
+        tenant.sql_literal(),
+        window_predicate(lower_excl_ms, upper_incl_ms)
+    );
     let fps = fingerprints_predicate(fps);
     format!(
         "SELECT fingerprint, unix_milli, {HIST_VALUE_COLUMNS}\nFROM {table}\nWHERE {window}\n  AND {fps}\nORDER BY fingerprint, unix_milli"
@@ -307,7 +326,7 @@ mod tests {
             sql,
             "SELECT fingerprint, unix_milli, value\n\
              FROM metric_samples\n\
-             WHERE unix_milli > 1000 AND unix_milli <= 2000\n\
+             WHERE org_id = '' AND unix_milli > 1000 AND unix_milli <= 2000\n\
              \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))\n\
              ORDER BY fingerprint, unix_milli"
         );
@@ -405,7 +424,7 @@ mod tests {
             sql,
             "SELECT fingerprint, unix_milli, value\n\
              FROM metric_samples\n\
-             WHERE unix_milli > 1000 AND unix_milli <= 2000\n\
+             WHERE org_id = '' AND unix_milli > 1000 AND unix_milli <= 2000\n\
              \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'))\n\
              ORDER BY fingerprint, unix_milli"
         );
@@ -452,7 +471,7 @@ mod tests {
             format!(
                 "SELECT fingerprint, unix_milli, {HIST_COLS}\n\
                  FROM metric_hist_samples\n\
-                 WHERE unix_milli > 1000 AND unix_milli <= 2000\n\
+                 WHERE org_id = '' AND unix_milli > 1000 AND unix_milli <= 2000\n\
                  \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))\n\
                  ORDER BY fingerprint, unix_milli"
             )
@@ -497,7 +516,7 @@ mod tests {
             format!(
                 "SELECT fingerprint, unix_milli, {HIST_COLS}\n\
                  FROM metric_hist_samples\n\
-                 WHERE unix_milli > 1000 AND unix_milli <= 2000\n\
+                 WHERE org_id = '' AND unix_milli > 1000 AND unix_milli <= 2000\n\
                  \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'))\n\
                  ORDER BY fingerprint, unix_milli"
             )

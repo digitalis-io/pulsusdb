@@ -3850,7 +3850,7 @@ async fn c0_escaped_label_values_survive_push_and_come_back_decoded() {
 /// Before the fix the first was right and the second was wrong, on the
 /// same server and the same stored bytes. The seed is written with
 /// `LabelSet::to_canonical_json` — the writer's own expression
-/// (`crates/pulsus-write/src/writer/rows.rs:103`) — and with EMPTY
+/// (`crates/pulsus-write/src/writer/rows.rs:105`) — and with EMPTY
 /// structured metadata, which is what makes the verbatim path reachable.
 #[tokio::test(flavor = "multi_thread")]
 async fn both_label_rendering_paths_agree_on_a_c0_escaped_value() {

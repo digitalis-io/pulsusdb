@@ -143,7 +143,7 @@ pub trait TenantSql {
 
 impl TenantSql for pulsus_model::Tenant {
     fn sql_literal(&self) -> String {
-        String::new()
+        crate::logql::escape::ch_string(self.as_str())
     }
 }
 

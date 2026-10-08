@@ -106,9 +106,9 @@ async fn setup_db(db: &str) -> ChClient {
     // accepts it; this test still never touches storage pruning.
     client
         .execute(
-            "CREATE TABLE metric_samples (metric_name String, fingerprint UInt128, \
+            "CREATE TABLE metric_samples (org_id String, metric_name String, fingerprint UInt128, \
              unix_milli Int64, value Float64) ENGINE = MergeTree \
-             ORDER BY (metric_name, fingerprint, unix_milli)",
+             ORDER BY (org_id, metric_name, fingerprint, unix_milli)",
             &QuerySettings::new(),
             Idempotency::Idempotent,
         )

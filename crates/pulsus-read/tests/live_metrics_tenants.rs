@@ -553,14 +553,21 @@ async fn every_read_answers_its_own_tenant() {
             ],
         ),
     ] {
+        // `/series` answers label sets: two series of one name and one
+        // label set (tenant-o's IDs 42 and 49) are one answer.
+        let unique = |v: &[&str]| {
+            let mut v = sorted(v);
+            v.dedup();
+            v
+        };
         assert_eq!(
             series(&q, which).await,
-            sorted(&want_q),
+            unique(&want_q),
             "C4 {which} as tenant-q"
         );
         assert_eq!(
             series(&o, which).await,
-            sorted(&want_o),
+            unique(&want_o),
             "C4 {which} as tenant-o"
         );
     }

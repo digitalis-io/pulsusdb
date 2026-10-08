@@ -31,12 +31,24 @@ impl Tenant {
         value: Option<&http::HeaderValue>,
         repeated: bool,
     ) -> Result<Tenant, TenantError> {
-        let _ = repeated;
-        Ok(Tenant(Arc::from(
-            value
-                .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
-                .unwrap_or_default(),
-        )))
+        if repeated {
+            return Err(TenantError);
+        }
+        let Some(value) = value else {
+            return Ok(Tenant(Arc::from("")));
+        };
+        let bytes = value.as_bytes();
+        let valid = !bytes.is_empty()
+            && bytes.len() <= MAX_TENANT_BYTES
+            && bytes
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'));
+        if !valid {
+            return Err(TenantError);
+        }
+        // Every byte is ASCII, so the text is the bytes.
+        let text = std::str::from_utf8(bytes).map_err(|_| TenantError)?;
+        Ok(Tenant(Arc::from(text)))
     }
 
     /// The tenant's text.

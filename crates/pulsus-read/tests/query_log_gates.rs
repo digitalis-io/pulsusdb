@@ -2196,23 +2196,25 @@ async fn seed_metric_series_472(
     for ddl in [
         format!(
             "CREATE TABLE {db}.{table} (\
+               org_id       LowCardinality(String), \
                day          Date, \
                fingerprint  UInt128  CODEC(ZSTD(1)), \
                metric_name  LowCardinality(String), \
                hours        SimpleAggregateFunction(groupBitOr, UInt32)\
              ) ENGINE = AggregatingMergeTree \
              PARTITION BY day \
-             ORDER BY fingerprint"
+             ORDER BY (org_id, fingerprint)"
         ),
         format!(
             "CREATE TABLE {db}.{labels} (\
+               org_id       LowCardinality(String), \
                metric_name  LowCardinality(String), \
                fingerprint  UInt128  CODEC(Delta(8), ZSTD(1)), \
                labels       String  CODEC(ZSTD(5)), \
                first_seen   SimpleAggregateFunction(min, Int64) CODEC(ZSTD(1)), \
                last_seen    SimpleAggregateFunction(max, Int64) CODEC(ZSTD(1))\
              ) ENGINE = AggregatingMergeTree \
-             ORDER BY (metric_name, fingerprint)"
+             ORDER BY (org_id, metric_name, fingerprint)"
         ),
         format!(
             "INSERT INTO {db}.{table} (day, fingerprint, metric_name, hours) \
@@ -2224,7 +2226,7 @@ async fn seed_metric_series_472(
              FROM numbers({SERIES_472})"
         ),
         format!(
-            "INSERT INTO {db}.{labels} \
+            "INSERT INTO {db}.{labels} (metric_name, fingerprint, labels, first_seen, last_seen) \
              SELECT concat('metric_', leftPad(toString(number % {NAMES_472}), 2, '0')), \
                     number + 1, \
                     concat('{{\"job\":\"api\",\"namespace\":\"ns-', toString(number % 13), \

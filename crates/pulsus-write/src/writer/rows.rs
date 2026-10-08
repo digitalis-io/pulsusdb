@@ -858,7 +858,7 @@ impl SpoolEncode for MetricMetadataRow {
 ///
 /// `kind` says which event the row is; a row sets that kind's columns and
 /// leaves the rest at the type's default. The fields are the landing
-/// table's 25 columns, in the table's own declaration order: the insert's
+/// table's 26 columns, in the table's own declaration order: the insert's
 /// column list is exactly this type's `COLUMN_NAMES`.
 ///
 /// No `PartialEq` derive, for [`MetricSampleRow`]'s reason: `value`,
@@ -1054,6 +1054,7 @@ impl SpoolEncode for MetricLandingRow {
         match self.kind {
             Self::KIND_FLOAT => serde_json::json!({
                 "kind": self.kind,
+                "org_id": &*self.org_id,
                 "received_ms": self.received_ms,
                 "metric_name": self.metric_name,
                 "fingerprint": self.fingerprint,
@@ -1063,6 +1064,7 @@ impl SpoolEncode for MetricLandingRow {
             }),
             Self::KIND_HIST => serde_json::json!({
                 "kind": self.kind,
+                "org_id": &*self.org_id,
                 "received_ms": self.received_ms,
                 "metric_name": self.metric_name,
                 "fingerprint": self.fingerprint,
@@ -1088,6 +1090,7 @@ impl SpoolEncode for MetricLandingRow {
             }),
             Self::KIND_SERIES => serde_json::json!({
                 "kind": self.kind,
+                "org_id": &*self.org_id,
                 "received_ms": self.received_ms,
                 "metric_name": self.metric_name,
                 "fingerprint": self.fingerprint,
@@ -1102,6 +1105,7 @@ impl SpoolEncode for MetricLandingRow {
             // which is a failure path.
             _ => serde_json::json!({
                 "kind": self.kind,
+                "org_id": &*self.org_id,
                 "received_ms": self.received_ms,
                 "metric_name": self.metric_name,
                 "metric_type": self.metric_type,
@@ -1139,6 +1143,7 @@ impl SpoolEncode for MetricLandingRow {
                 o.field("fingerprint", &self.fingerprint).await?;
                 o.field("kind", &self.kind).await?;
                 o.str_field("metric_name", &self.metric_name).await?;
+                o.str_field("org_id", &self.org_id).await?;
                 o.field("received_ms", &self.received_ms).await?;
                 o.field("unix_milli", &self.unix_milli).await?;
                 o.field("value", &FiniteOrNull(self.value)).await?;
@@ -1171,6 +1176,7 @@ impl SpoolEncode for MetricLandingRow {
                     .await?;
                 o.array("neg_span_offsets", &self.hist_neg_span_offsets)
                     .await?;
+                o.str_field("org_id", &self.org_id).await?;
                 o.array("pos_bucket_deltas", &self.hist_pos_bucket_deltas)
                     .await?;
                 o.array("pos_span_lengths", &self.hist_pos_span_lengths)
@@ -1197,6 +1203,7 @@ impl SpoolEncode for MetricLandingRow {
                 o.field("kind", &self.kind).await?;
                 o.str_field("labels", &self.labels).await?;
                 o.str_field("metric_name", &self.metric_name).await?;
+                o.str_field("org_id", &self.org_id).await?;
                 o.field("received_ms", &self.received_ms).await?;
                 o.field("unix_milli", &self.unix_milli).await?;
                 o.field("value_type", &self.value_type).await?;
@@ -1208,6 +1215,7 @@ impl SpoolEncode for MetricLandingRow {
                 o.field("kind", &self.kind).await?;
                 o.str_field("metric_name", &self.metric_name).await?;
                 o.str_field("metric_type", &self.metric_type).await?;
+                o.str_field("org_id", &self.org_id).await?;
                 o.field("received_ms", &self.received_ms).await?;
                 o.str_field("unit", &self.unit).await?;
                 o.field("updated_ns", &self.updated_ns).await?;
@@ -2313,10 +2321,11 @@ mod tests {
 
     // -- the landing row (issue #603) ---------------------------------
 
-    /// The 25 columns `metric_landing` declares, in its own declaration
+    /// The 26 columns `metric_landing` declares, in its own declaration
     /// order. Written out here so the row type cannot drift from the schema
     /// silently.
-    const LANDING_COLUMNS: [&str; 25] = [
+    const LANDING_COLUMNS: [&str; 26] = [
+        "org_id",
         "received_ms",
         "kind",
         "metric_name",
@@ -2586,6 +2595,7 @@ mod tests {
                 .collect();
             let mut want: BTreeSet<String> = own_keys.into_iter().map(str::to_string).collect();
             want.insert("kind".to_string());
+            want.insert("org_id".to_string());
             want.insert("received_ms".to_string());
             assert_eq!(got, want, "kind {kind}'s key set");
             assert_eq!(value["kind"].as_u64(), Some(u64::from(kind)));

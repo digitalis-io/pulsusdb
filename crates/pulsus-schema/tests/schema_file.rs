@@ -1005,8 +1005,9 @@ fn metric_landing_carries_no_event_id() {
         !columns.contains(&"event_id"),
         "metric_landing still declares event_id: {columns:?}"
     );
-    assert_eq!(columns.len(), 25, "the 25 columns the writer sends");
-    assert_eq!(columns.first(), Some(&"received_ms"));
+    assert_eq!(columns.len(), 26, "the 26 columns the writer sends");
+    // Issue #635 part 4: the tenant leads, as it leads the key.
+    assert_eq!(columns.first(), Some(&"org_id"));
     // The log and trace landing tables keep theirs.
     for other in ["log_landing", "trace_landing"] {
         let columns = pulsus_schema::table_column_names(other).expect("in the file");
@@ -1023,7 +1024,7 @@ fn metric_landing_carries_no_event_id() {
 fn metric_series_is_one_row_per_series_day() {
     assert_eq!(
         pulsus_schema::table_column_names("metric_series").expect("in the file"),
-        vec!["day", "fingerprint", "metric_name", "hours"],
+        vec!["org_id", "day", "fingerprint", "metric_name", "hours"],
     );
     let single_create = create_of(&single(), "metric_series");
     assert!(
@@ -1037,7 +1038,10 @@ fn metric_series_is_one_row_per_series_day() {
     for ctx in [single(), clustered()] {
         let series = create_of(&ctx, "metric_series");
         assert_eq!(line_of(&series, "PARTITION BY"), "PARTITION BY day");
-        assert_eq!(line_of(&series, "ORDER BY"), "ORDER BY fingerprint");
+        assert_eq!(
+            line_of(&series, "ORDER BY"),
+            "ORDER BY (org_id, fingerprint)"
+        );
         assert_eq!(
             line_of(&series, "TTL"),
             "TTL toDateTime(least((toUInt64(toUInt16(day)) + 1 + 7) * 86400, 4294967295))"
@@ -1076,6 +1080,7 @@ fn metric_labels_holds_one_label_row_per_series_and_never_expires() {
     assert_eq!(
         pulsus_schema::table_column_names("metric_labels").expect("in the file"),
         vec![
+            "org_id",
             "metric_name",
             "fingerprint",
             "labels",
@@ -1096,7 +1101,7 @@ fn metric_labels_holds_one_label_row_per_series_and_never_expires() {
     }
     assert_eq!(
         line_of(&single_create, "ORDER BY"),
-        "ORDER BY (metric_name, fingerprint)"
+        "ORDER BY (org_id, metric_name, fingerprint)"
     );
     for ctx in [single(), clustered()] {
         let create = create_of(&ctx, "metric_labels");
@@ -1137,17 +1142,17 @@ fn metric_labels_holds_one_label_row_per_series_and_never_expires() {
 fn the_sample_tables_are_keyed_by_the_series_id() {
     assert_eq!(
         pulsus_schema::table_column_names("metric_samples").expect("in the file"),
-        vec!["fingerprint", "unix_milli", "value"],
+        vec!["org_id", "fingerprint", "unix_milli", "value"],
     );
     let hist = pulsus_schema::table_column_names("metric_hist_samples").expect("in the file");
-    assert_eq!(&hist[..2], &["fingerprint", "unix_milli"]);
+    assert_eq!(&hist[..3], &["org_id", "fingerprint", "unix_milli"]);
     assert!(!hist.contains(&"metric_name"), "{hist:?}");
     for ctx in [single(), clustered()] {
         for table in ["metric_samples", "metric_hist_samples"] {
             let create = create_of(&ctx, table);
             assert_eq!(
                 line_of(&create, "ORDER BY"),
-                "ORDER BY (fingerprint, unix_milli)",
+                "ORDER BY (org_id, fingerprint, unix_milli)",
                 "{table}"
             );
             let view = pulsus_schema::mv_projection(&format!("{table}_mv"), &ctx)
