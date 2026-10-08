@@ -1555,6 +1555,47 @@ async fn mem_ceiling_rows(admin: &ChClient, db: &str, marker: &str) -> Vec<MemCe
     rows
 }
 
+/// How long a count of `system.query_log` rows is re-read before the caller
+/// asserts on whatever it holds.
+const QUERY_LOG_DEADLINE: Duration = Duration::from_secs(10);
+
+/// How long a count must hold still before it is taken as settled.
+const QUERY_LOG_SETTLE: Duration = Duration::from_secs(1);
+
+/// [`mem_ceiling_rows`], re-read until it holds at least `expected` rows and
+/// has then held still for [`QUERY_LOG_SETTLE`], or until
+/// [`QUERY_LOG_DEADLINE`] passes. The caller asserts the exact count.
+///
+/// `SYSTEM FLUSH LOGS` writes only what is already queued, and the
+/// `QueryFinish` row of a statement that has just returned can be queued
+/// after it: such a row was seen arriving after the flush that should have
+/// held it. One flush and one read therefore miss it now and then. The wait
+/// past `expected` is what keeps an exact count able to fail: a statement
+/// the engine should not have issued comes after the expected ones, so its
+/// row is as late as theirs or later.
+async fn mem_ceiling_rows_expecting(
+    admin: &ChClient,
+    db: &str,
+    marker: &str,
+    expected: usize,
+) -> Vec<MemCeilingRow> {
+    let deadline = std::time::Instant::now() + QUERY_LOG_DEADLINE;
+    let mut rows = mem_ceiling_rows(admin, db, marker).await;
+    let mut held_since = std::time::Instant::now();
+    loop {
+        let now = std::time::Instant::now();
+        if now >= deadline || (rows.len() >= expected && now - held_since >= QUERY_LOG_SETTLE) {
+            return rows;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let next = mem_ceiling_rows(admin, db, marker).await;
+        if next.len() != rows.len() {
+            held_since = std::time::Instant::now();
+        }
+        rows = next;
+    }
+}
+
 /// Asserts the sweep is non-empty and that EVERY row carries the ceiling at
 /// the configured value.
 fn assert_every_row_carries_the_ceiling(rows: &[MemCeilingRow], what: &str) {
@@ -1733,7 +1774,7 @@ async fn a_no_match_scoped_discovery_request_issues_stage_one_and_no_stage_two()
         .await
         .expect("no-match label_values");
     assert_eq!(out, Vec::<String>::new());
-    let rows = mem_ceiling_rows(&admin, &run_db, &m1).await;
+    let rows = mem_ceiling_rows_expecting(&admin, &run_db, &m1, 1).await;
     assert_eq!(
         rows.len(),
         1,
@@ -1768,7 +1809,7 @@ async fn a_no_match_scoped_discovery_request_issues_stage_one_and_no_stage_two()
         .await
         .expect("matching label_values");
     assert_eq!(out, vec![SERVICE.to_string()]);
-    let rows = mem_ceiling_rows(&admin, &run_db, &m2).await;
+    let rows = mem_ceiling_rows_expecting(&admin, &run_db, &m2, 3).await;
     // Issue #603: the activity scan sits between them as a statement of its
     // own. It used to be a subquery nested inside stage two, so this run saw
     // two statements; the predicate is unchanged, but its result now arrives
