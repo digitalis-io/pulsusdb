@@ -1235,7 +1235,7 @@ pub struct SelectorRead {
 ///
 /// Saturating is safe here **only because nothing reads these
 /// nanoseconds**: no link's `capability` consults `bounds`, and `limit`
-/// is always `None` because PromQL has no limit parameter, so
+/// is always `None` because the API's `limit` truncates the evaluated result in the handler and never reaches a plan, so
 /// `inexact_limit_fires` is `false` for every PromQL plan by
 /// construction. A window lowered into SQL reads
 /// `SelectorSpec::fetch_window`'s milliseconds.

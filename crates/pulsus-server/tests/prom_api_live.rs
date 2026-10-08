@@ -577,8 +577,16 @@ async fn prom_api_name_regex_discovery_over_the_fanout_cap_is_422_execution() {
     // Both names are resident: the name-less selector now resolves 2 names
     // against a cap of 1 -> a deterministic fan-out breach.
     let name_regex = "%7B__name__%3D~%22up.%2A%22%7D"; // {__name__=~"up.*"}
-    let (status, body) = http_get(port, &format!("/api/v1/series?match[]={name_regex}"))
-        .expect("/series (name regex over cap) reachable");
+    // Issue #499: a request with no range reads all time, which no cache
+    // window covers; this test is about the cache route, so it asks for
+    // the last half hour.
+    let now_s = now_ms() / 1_000;
+    let range = format!("start={}&end={now_s}", now_s - 1_800);
+    let (status, body) = http_get(
+        port,
+        &format!("/api/v1/series?match[]={name_regex}&{range}"),
+    )
+    .expect("/series (name regex over cap) reachable");
     assert_eq!(status, 422, "body: {body}");
     assert!(body.contains("\"errorType\":\"execution\""), "body: {body}");
     // Discriminate the fan-out breach from the (identically-tupled)
@@ -699,8 +707,14 @@ async fn prom_api_name_regex_discovery_over_the_cache_scan_budget_is_422_executi
     // fingerprint pair to examine past a budget of 1.
     let name_regex_all = "%7B__name__%3D~%22.%2B%22%7D"; // {__name__=~".+"}
     for path in ["series", "labels"] {
-        let (status, body) = http_get(port, &format!("/api/v1/{path}?match[]={name_regex_all}"))
-            .unwrap_or_else(|| panic!("/{path} (name regex over scan budget) reachable"));
+        // Issue #499: the cache route needs a range inside its window.
+        let now_s = now_ms() / 1_000;
+        let range = format!("start={}&end={now_s}", now_s - 1_800);
+        let (status, body) = http_get(
+            port,
+            &format!("/api/v1/{path}?match[]={name_regex_all}&{range}"),
+        )
+        .unwrap_or_else(|| panic!("/{path} (name regex over scan budget) reachable"));
         assert_eq!(status, 422, "path {path}, body: {body}");
         assert!(
             body.contains("\"errorType\":\"execution\""),
@@ -1446,9 +1460,9 @@ async fn statement_texts(admin: &ChClient, db: &str) -> Vec<String> {
 /// label value. Rows are seeded **directly into `metric_series`** (this
 /// suite's established style), so nothing here exercises the writer's
 /// registration path. They are seeded at the CURRENT activity bucket on
-/// purpose: the no-bounds request's default window is the current hour, so
-/// a historically-placed fixture would answer `[]` and every body below
-/// would be asserting an empty list.
+/// purpose: the default window is all time; the fixture is the only data
+/// (issue #499), so the no-bounds request answers exactly what was
+/// seeded.
 ///
 /// The `{zone=""}` rejection's wording differs from the reference's
 /// (`vector selector must contain at least one non-empty matcher` against
@@ -1589,8 +1603,8 @@ async fn prom_api_name_values_bodies_and_narrow_dispatch_issue_472() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(body.trim(), ALL_SEVEN);
 
-    // No bounds at all: the default window is the current hour, which is
-    // where the fixture sits.
+    // No bounds at all: the default window is all time; the fixture is
+    // the only data (issue #499).
     let (status, body) = http_get(port, "/api/v1/label/__name__/values").expect("no bounds");
     assert_eq!(status, 200, "{body}");
     assert_eq!(body.trim(), ALL_SEVEN);

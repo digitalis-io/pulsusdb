@@ -35,13 +35,6 @@ use thiserror::Error;
 /// drifting apart.
 pub(crate) const POINTS_CAP: i64 = 11_000;
 
-/// Default `start`/`end` lookback (`end - start`) when `start` is omitted
-/// from a discovery request (`/labels`, `/label/{name}/values`, `/series`)
-/// — matches `logs_api`'s own "last hour" default (docs/api.md §2.1),
-/// there being no more specific convention pinned for the metrics
-/// discovery endpoints.
-const DEFAULT_LOOKBACK_MS: i64 = 3_600_000;
-
 /// Errors from parsing `/api/v1/*` request parameters — mapped to `400
 /// bad_data` by `error::ApiError` (the one exception, `UnsupportedContentType`,
 /// still maps to `400`, just for a POST-specific reason).
@@ -157,12 +150,6 @@ pub(crate) fn parse_time(raw: &str) -> Result<i64, ParamError> {
     let dt = chrono::DateTime::parse_from_rfc3339(raw)
         .map_err(|_| ParamError::InvalidTime(raw.to_string()))?;
     Ok(dt.timestamp_millis())
-}
-
-/// `start`'s default when omitted from a discovery request: `end - 1h`
-/// (see [`DEFAULT_LOOKBACK_MS`]).
-pub(crate) fn default_start_ms(end_ms: i64) -> i64 {
-    end_ms.saturating_sub(DEFAULT_LOOKBACK_MS)
 }
 
 /// `step` (`query_range` only): a bare (possibly fractional) seconds
@@ -338,20 +325,61 @@ pub(crate) const MAX_LOOKBACK_MS: i64 = i64::MAX / 1_000_000;
 pub(crate) const TSDB_MAX_LIMIT: usize = 10_000;
 
 /// `lookback_delta` (`/query`, `/query_range` — issue #499), in
-/// milliseconds; `None` is the engine's default.
+/// milliseconds, as the reference reads it; `None` is the engine's
+/// default, 5m.
+///
+/// - Absent or empty: `None`.
+/// - A float literal of seconds: past int64 nanoseconds either way is
+///   [`ParamError::LookbackDeltaOverflow`]; exactly `2^63` ns passes the
+///   reference's check and then turns non-positive, so `None` (tested
+///   before the cast, which would saturate); otherwise its nanoseconds,
+///   `<= 0` (NaN included) being `None`, cut to milliseconds.
+/// - A duration string: `0` is `None`; past int64 nanoseconds or
+///   unparseable is [`ParamError::InvalidLookbackDelta`].
 pub(crate) fn parse_lookback_delta(raw: Option<&str>) -> Result<Option<i64>, ParamError> {
-    let _ = raw;
-    Ok(None)
+    const TWO_63: f64 = 9_223_372_036_854_775_808.0;
+    let Some(raw) = raw.filter(|r| !r.is_empty()) else {
+        return Ok(None);
+    };
+    if let Ok(secs) = raw.parse::<f64>() {
+        let ns = secs * 1e9;
+        if ns.abs() > TWO_63 {
+            return Err(ParamError::LookbackDeltaOverflow(raw.to_string()));
+        }
+        if ns == TWO_63 {
+            return Ok(None);
+        }
+        let ns = ns as i64;
+        return Ok((ns > 0).then_some(ns / 1_000_000));
+    }
+    match parse_duration_ms(raw) {
+        Ok(0) => Ok(None),
+        Ok(ms) if ms <= MAX_LOOKBACK_MS => Ok(Some(ms)),
+        _ => Err(ParamError::InvalidLookbackDelta(raw.to_string())),
+    }
 }
 
-/// `/status/tsdb`'s `limit` (issue #499).
+/// `/status/tsdb`'s `limit` (issue #499): absent or empty is the default
+/// [`pulsus_read::TSDB_TOP_METRIC_NAMES`]; 1 to [`TSDB_MAX_LIMIT`]
+/// otherwise.
 pub(crate) fn parse_tsdb_limit(raw: Option<&str>) -> Result<usize, ParamError> {
-    let _ = raw;
-    Ok(10)
+    let Some(s) = raw.filter(|r| !r.is_empty()) else {
+        return Ok(pulsus_read::TSDB_TOP_METRIC_NAMES);
+    };
+    let n: i64 = s.parse().map_err(|_| ParamError::TsdbLimitNotPositive)?;
+    if n < 1 {
+        return Err(ParamError::TsdbLimitNotPositive);
+    }
+    match usize::try_from(n) {
+        Ok(n) if n <= TSDB_MAX_LIMIT => Ok(n),
+        _ => Err(ParamError::TsdbLimitTooLarge),
+    }
 }
 
 /// `limit` for the three **discovery** endpoints — `/labels`,
-/// `/label/{name}/values`, `/series` (issue #471 M4).
+/// `/label/{name}/values`, `/series` (issue #471 M4) — and for `/query`
+/// and `/query_range` (issue #499), the reference's `parseLimitParam` on
+/// all five.
 ///
 /// Absent, empty and `"0"` all mean *no limit*, which is the reference's
 /// rule on these three routes. It is **not** [`parse_limit`]'s rule:
@@ -576,6 +604,12 @@ pub(crate) fn parse_pairs(raw: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The first value for `key`, if present and not empty (issue #499): the
+/// reference reads these parameters only when they carry a value.
+pub(crate) fn nonempty<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    get(pairs, key).filter(|v| !v.is_empty())
+}
+
 /// The first value for `key`, if present.
 pub(crate) fn get<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
     pairs
@@ -669,11 +703,6 @@ mod tests {
             parse_time("inf").unwrap_err(),
             ParamError::InvalidTime(_)
         ));
-    }
-
-    #[test]
-    fn default_start_ms_is_one_hour_before_end() {
-        assert_eq!(default_start_ms(3_600_000), 0);
     }
 
     #[test]

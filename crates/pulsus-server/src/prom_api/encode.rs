@@ -465,8 +465,19 @@ fn render_hist_matrix_item(s: &HistMatrixSeries) -> Vec<u8> {
 /// 10)`, `web/api/v1/api.go`). `query` is the SAME raw query text the
 /// handler parsed (issue #128): each kept line ends with the byte-exact
 /// `" (<line>:<col>)"` source-position suffix upstream renders there.
-fn annotations_suffix(query: &str, annotations: &pulsus_promql::Annotations) -> String {
-    let (warnings, infos) = annotations.as_strings(query, 10, 10);
+///
+/// `stats_requested` (issue #499) appends [`STATS_UNSUPPORTED_WARNING`]
+/// AFTER the cap and its overflow line: it is our own notice, not one of
+/// the evaluation's, so the cap can never drop it.
+fn annotations_suffix(
+    query: &str,
+    annotations: &pulsus_promql::Annotations,
+    stats_requested: bool,
+) -> String {
+    let (mut warnings, infos) = annotations.as_strings(query, 10, 10);
+    if stats_requested {
+        warnings.push(STATS_UNSUPPORTED_WARNING.to_string());
+    }
     let mut s = String::new();
     if !warnings.is_empty() {
         s.push_str(",\"warnings\":[");
@@ -533,6 +544,13 @@ pub(crate) fn query_response(
     )
 }
 
+/// Keeps the first `n` of `items`; `true` when that dropped some.
+fn cut_to<T>(items: &mut Vec<T>, n: usize) -> bool {
+    let cut = items.len() > n;
+    items.truncate(n);
+    cut
+}
+
 /// How a `query`/`query_range` answer is shaped beyond its result (issue
 /// #499): `ordered` keeps the evaluator's vector order (a sort-rooted
 /// instant query), `limit` truncates the series, and `stats_requested`
@@ -560,7 +578,29 @@ pub(crate) fn query_response_annotated(
     shape: ResponseShape,
 ) -> Response {
     let ordered = shape.ordered;
-    let annos = annotations_suffix(query, &annotations);
+    // Issue #499: `limit` cuts what the evaluator returned, as the
+    // reference does — an instant vector in the evaluator's order, before
+    // the presentation sort; a matrix after it, since the reference's
+    // matrix is already sorted by labels — and says so in `warnings`.
+    let mut result = result;
+    let cut = match (&mut result, shape.limit) {
+        (QueryResult::Vector(items), Some(n)) => cut_to(items, n),
+        (QueryResult::VectorHist(items), Some(n)) => cut_to(items, n),
+        (QueryResult::Matrix(items), Some(n)) => {
+            items.sort_by(|a, b| a.labels.cmp(&b.labels));
+            cut_to(items, n)
+        }
+        (QueryResult::MatrixHist(items), Some(n)) => {
+            items.sort_by(|a, b| a.labels.cmp(&b.labels));
+            cut_to(items, n)
+        }
+        _ => false,
+    };
+    let mut annotations = annotations;
+    if cut {
+        annotations.plain_warning(TRUNCATION_WARNING);
+    }
+    let annos = annotations_suffix(query, &annotations, shape.stats_requested);
     match result {
         QueryResult::Vector(mut items) => {
             if !ordered {
@@ -675,7 +715,8 @@ pub(crate) fn query_response_annotated(
 // ---------------------------------------------------------------------
 
 /// The truncation warning for the three discovery endpoints (issue #471
-/// M4) — the reference's own string, byte-for-byte.
+/// M4) and for `/query` and `/query_range` (issue #499) — the reference's
+/// own string, byte-for-byte.
 pub(crate) const TRUNCATION_WARNING: &str = "results truncated due to limit";
 
 /// The notice a non-empty `stats` parameter adds to `warnings` (issue

@@ -171,8 +171,8 @@ pub struct Annotation {
     pub message: String,
     /// Start byte offset into the query source text of the AST node
     /// upstream's constructor call site passes (`arg.PositionRange()`
-    /// etc.). Always `Some` via the `_at` adders; `None` is unreachable
-    /// through the public API and renders no suffix (defensive).
+    /// etc.). `Some` via the `_at` adders; `None` comes from
+    /// [`Annotations::plain_warning`] and renders no suffix.
     pub pos_start: Option<usize>,
     pub detail: Option<ForcedMonotonicityDetail>,
 }
@@ -248,7 +248,7 @@ impl Annotations {
     /// about the request rather than about a node of the query, such as a
     /// truncated result. It renders without a position suffix.
     pub fn plain_warning(&mut self, message: impl Into<String>) {
-        let _ = message;
+        self.add_item(AnnotationKind::Warning, message.into(), None, None);
     }
 
     /// Adds an **info** with the emitting node's start byte offset — see

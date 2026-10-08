@@ -927,7 +927,10 @@ mod tests {
         // Flag off (the default): rejected by name at plan time.
         let config = Config::default();
         let mc = metrics_config_from(&config);
-        let pp = qp.plan_params(mc.experimental_functions);
+        let pp = qp.plan_params(
+            mc.experimental_functions,
+            pulsus_promql::DEFAULT_LOOKBACK_MS,
+        );
         match pulsus_promql::plan(&expr, pp) {
             Err(pulsus_promql::PromqlError::Unsupported { construct }) => assert!(
                 construct.contains("max_of") && construct.contains("experimental"),
@@ -940,7 +943,10 @@ mod tests {
         let mut config = Config::default();
         config.reader.promql_experimental_functions = true;
         let mc = metrics_config_from(&config);
-        let pp = qp.plan_params(mc.experimental_functions);
+        let pp = qp.plan_params(
+            mc.experimental_functions,
+            pulsus_promql::DEFAULT_LOOKBACK_MS,
+        );
         let plan = pulsus_promql::plan(&expr, pp).expect("plan with the flag on");
         assert!(
             matches!(

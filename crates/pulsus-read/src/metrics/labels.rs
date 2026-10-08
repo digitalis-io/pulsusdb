@@ -1142,27 +1142,26 @@ impl LabelCache {
 pub struct TsdbCacheSnapshot {
     pub num_series: u64,
     /// Sorted descending by count, ties broken ascending by name, capped
-    /// at [`TSDB_TOP_METRIC_NAMES`].
+    /// at the request's `limit`, [`TSDB_TOP_METRIC_NAMES`] by default
+    /// (issue #499).
     pub series_count_by_metric_name: Vec<(String, u64)>,
 }
 
-/// The bound on `status/tsdb`'s `seriesCountByMetricName` (issue #32) — a
-/// documented constant, same "cap first, promote to a config knob only if a
-/// deployment needs it" precedent as [`REGEX_CACHE_CAPACITY`].
+/// The default bound on `status/tsdb`'s `seriesCountByMetricName` (issue
+/// #32); a request's `limit` sets its own (issue #499).
 pub const TSDB_TOP_METRIC_NAMES: usize = 10;
 
 /// [`LabelCache::tsdb_snapshot`]'s pure core, factored out the same way
 /// [`resolve_over`] is: testable against a hand-built [`CacheSnapshot`]
 /// with no `ChClient` at all.
 pub(crate) fn tsdb_snapshot_over(snapshot: &CacheSnapshot, limit: usize) -> TsdbCacheSnapshot {
-    let _ = limit;
     let mut by_metric: Vec<(String, u64)> = snapshot
         .by_metric
         .iter()
         .map(|(name, fps)| (name.clone(), fps.len() as u64))
         .collect();
     by_metric.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    by_metric.truncate(TSDB_TOP_METRIC_NAMES);
+    by_metric.truncate(limit);
     TsdbCacheSnapshot {
         num_series: snapshot.series_count() as u64,
         series_count_by_metric_name: by_metric,
@@ -1176,11 +1175,8 @@ impl LabelCache {
     /// cache (`generation == 0`) yields an all-zero, empty summary rather
     /// than a ClickHouse fallback query (task-manager resolution #2: "no
     /// SQL variant for M2").
-    pub fn tsdb_snapshot(&self, tenant: &Tenant) -> TsdbCacheSnapshot {
-        tsdb_snapshot_over(
-            &self.tenant_cache(tenant).current_snapshot(),
-            TSDB_TOP_METRIC_NAMES,
-        )
+    pub fn tsdb_snapshot(&self, tenant: &Tenant, limit: usize) -> TsdbCacheSnapshot {
+        tsdb_snapshot_over(&self.tenant_cache(tenant).current_snapshot(), limit)
     }
 }
 

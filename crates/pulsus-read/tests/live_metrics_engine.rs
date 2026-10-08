@@ -2203,7 +2203,15 @@ async fn discovery_endpoints_honor_the_query_window_and_include_name() {
     // Both fingerprints are cache-resident (proving the leak-check below is
     // meaningful: the cache's own superset genuinely contains the older,
     // out-of-window series).
-    assert_eq!(cache.tsdb_snapshot(&no_tenant(),).num_series, 2);
+    assert_eq!(
+        cache
+            .tsdb_snapshot(
+                &no_tenant(),
+                pulsus_read::metrics::labels::TSDB_TOP_METRIC_NAMES
+            )
+            .num_series,
+        2
+    );
 
     let engine = MetricsEngine::new(engine_client, cache, engine_config(db));
     let window = DataWindow {
@@ -3158,7 +3166,13 @@ async fn tsdb_status_reports_series_counts_with_zero_sample_table_access() {
     cache.refresh().await.expect("refresh");
     let engine = MetricsEngine::new(engine_client, cache, engine_config(db));
 
-    let status = engine.tsdb_status(&no_tenant()).await.expect("tsdb_status");
+    let status = engine
+        .tsdb_status(
+            &no_tenant(),
+            pulsus_read::metrics::labels::TSDB_TOP_METRIC_NAMES,
+        )
+        .await
+        .expect("tsdb_status");
     assert_eq!(status.num_series, 2);
     assert_eq!(
         status.series_count_by_metric_name,
