@@ -1423,43 +1423,44 @@ async fn keyset_backward_page_keeps_the_primary_key_engaged_via_the_redundant_ti
 // Metric reads — rollup-served vs raw fallback, range vs instant.
 // ---------------------------------------------------------------------
 
-/// Issue #227 Tier-1 gate: a RANGE metric read slides raw off `log_samples`
-/// (the rollup fast-path is retired for range) and its PK-ordered sliding
-/// scan (`metric_raw_samples_sliding`) engages the `(service, fingerprint,
-/// timestamp_ns)` primary key — the same prune as every raw `log_samples`
-/// read (the `ORDER BY` change to `optimize_read_in_order` shape does not
-/// alter the index prune). Never a full scan (the query-performance mandate).
+/// Issue #624 Tier-1 gate: a clean counting RANGE read whose range is not
+/// its step is counted in the database by the sliding statement
+/// (`metric_range_sliding`), and that statement's scan engages the
+/// `(service, fingerprint, timestamp_ns)` primary key — the same prune as
+/// every raw `log_samples` read. Never a full scan (the query-performance
+/// mandate).
 #[tokio::test]
-async fn metric_range_slides_raw_and_prunes_on_the_service_fingerprint_timestamp_primary_key() {
+async fn metric_range_sliding_statement_prunes_on_the_service_fingerprint_timestamp_primary_key() {
     skip_unless_live!();
     let db = &pulsus_testkit::test_db("pulsus_read_it_metric_range_sliding");
     let ts_ns = now_ns();
     let client = setup(db, ts_ns).await;
 
     let mp = metric_plan(r#"rate({env="prod"}[5m])"#, &range_params(ts_ns), db);
+    assert!(!mp.rollup, "a range query reads raw, never rollup");
     assert!(
-        !mp.rollup,
-        "issue #227: a range query slides raw, never rollup"
+        mp.client.is_none(),
+        "issue #624: a clean counting range read is counted in the database"
     );
-    assert!(mp.client.is_some());
     assert_eq!(mp.table, "log_samples");
     let table = format!("{db}.log_samples");
-    let sql = sql::metric_raw_samples_sliding(
-        &table,
+    let sql = sql::metric_range_sliding(
+        sql::MetricSource::new(&table, sql::MetricShape::RawCount),
         &[literal("checkout")],
         &[Fingerprint::from_raw(u128::from(FP_PROD)).sql_literal()],
-        TimeWindow {
-            start_ns: mp.start_ns,
-            end_ns: mp.end_ns,
+        sql::SlidingScan {
+            window: TimeWindow {
+                start_ns: mp.start_ns,
+                end_ns: mp.end_ns,
+            },
+            lower: mp.scan_lower,
+            grid_start_ns: mp.grid_start_ns,
+            step_ns: mp.step_ns.expect("a range plan has a step").get(),
+            range_ns: mp.range_ns.get(),
         },
-        mp.scan_lower,
         &mp.extra_predicates,
-        projection_of(&mp),
-    );
-    assert!(
-        sql.contains("ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC"),
-        "PK read order (optimize_read_in_order), no body/global-ts sort: {sql}"
-    );
+    )
+    .expect("a renderable sliding statement");
     let usage = explain(&client, &sql).await;
     assert_eq!(usage, expected_metric_instant_raw_usage());
 }
@@ -2661,8 +2662,9 @@ async fn the_re2_compile_probe_costs_the_metric_series_fallback_no_index_engagem
 // raw — two distinct table targets, both index-served.
 // ---------------------------------------------------------------------
 
-/// Issue #227: an un-piped range `count_over_time` slides raw (the rollup
-/// fast-path is retired for range reads) and prunes on the `log_samples`
+/// Issue #227: an un-piped range `count_over_time` reads raw (the rollup
+/// fast-path is retired for range reads); since issue #624 it is counted in
+/// the database by the sliding statement, which prunes on the `log_samples`
 /// primary key.
 #[tokio::test]
 async fn m6_10_unpiped_count_over_time_range_slides_raw() {
@@ -2676,22 +2678,30 @@ async fn m6_10_unpiped_count_over_time_range_slides_raw() {
         &range_params(ts_ns),
         db,
     );
-    assert!(!mp.rollup, "issue #227: a range count slides raw");
-    assert!(mp.client.is_some());
+    assert!(!mp.rollup, "issue #227: a range count reads raw");
+    assert!(
+        mp.client.is_none(),
+        "issue #624: a clean counting range read is counted in the database"
+    );
     assert_eq!(mp.table, "log_samples");
     let table = format!("{db}.log_samples");
-    let sql = sql::metric_raw_samples_sliding(
-        &table,
+    let sql = sql::metric_range_sliding(
+        sql::MetricSource::new(&table, sql::MetricShape::RawCount),
         &[literal("checkout")],
         &[Fingerprint::from_raw(u128::from(FP_PROD)).sql_literal()],
-        TimeWindow {
-            start_ns: mp.start_ns,
-            end_ns: mp.end_ns,
+        sql::SlidingScan {
+            window: TimeWindow {
+                start_ns: mp.start_ns,
+                end_ns: mp.end_ns,
+            },
+            lower: mp.scan_lower,
+            grid_start_ns: mp.grid_start_ns,
+            step_ns: mp.step_ns.expect("a range plan has a step").get(),
+            range_ns: mp.range_ns.get(),
         },
-        mp.scan_lower,
         &mp.extra_predicates,
-        projection_of(&mp),
-    );
+    )
+    .expect("a renderable sliding statement");
     let usage = explain(&client, &sql).await;
     assert_eq!(usage, expected_metric_instant_raw_usage());
 }

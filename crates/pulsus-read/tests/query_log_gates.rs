@@ -3108,6 +3108,634 @@ async fn the_explain_seam_reports_the_bucketed_statement_the_reader_issues() {
 }
 
 // ---------------------------------------------------------------------
+// Issue #624: the sliding statement, executed.
+// ---------------------------------------------------------------------
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SlidingRow {
+    fingerprint: u128,
+    bucket_ns: i64,
+    n: u64,
+    structured_metadata: String,
+}
+
+/// One `(start, end, step, range)` the sliding statement is checked at.
+#[derive(Debug, Clone, Copy)]
+struct SlidingCase {
+    s: i64,
+    e: i64,
+    step: i64,
+    range: i64,
+}
+
+/// One cell of an answer: `(fingerprint, metadata, grid point)`.
+type SlidingCell = (u128, String, i64);
+
+/// **N3 (issue #624): every row the sliding statement returns is the
+/// window definition, evaluated here by brute force.**
+///
+/// 1,200 lines on three streams and three metadata values, at ±1 ns of
+/// 400 points an hour wide, one third with empty bodies. Sixty
+/// `(start, end, step, range)` drawn from a fixed seed — steps of 1 s to
+/// 300 s with a nanosecond remainder, ranges equal to the step, one
+/// nanosecond either side of it, half, twice, twenty times and random,
+/// unaligned starts and ends — each rendered for count and for bytes.
+///
+/// The expectation is independent code: every grid point `g` scans every
+/// line and counts it when `g - range < ts <= g`. A cell is expected when
+/// its window holds at least one line, so a bytes total of 0 over empty
+/// bodies is a point.
+#[tokio::test]
+async fn the_sliding_statement_is_the_window_definition_at_every_range_and_step() {
+    skip_unless_live!();
+    const SEC: i64 = 1_000_000_000;
+    let db = pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_sliding_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let admin = ChClient::new(test_config()).await.expect("connect admin");
+    for sql in [
+        format!("DROP DATABASE IF EXISTS {db}"),
+        format!("CREATE DATABASE {db}"),
+    ] {
+        admin
+            .execute(&sql, &QuerySettings::new(), Idempotency::Idempotent)
+            .await
+            .expect("create the run database");
+    }
+    run_init(&admin, &test_ctx(&db)).await.expect("run_init");
+    let client = data_client(&db).await;
+
+    // The lines.
+    let service = "c624sliding";
+    let fps: [u128; 3] = [6_240_001, 6_240_002, 6_240_003];
+    let metadata = ["", r#"{"lvl":"info"}"#, r#"{"lvl":"warn"}"#];
+    let t0 = ((now_ns() - 2 * 3_600 * SEC) / SEC) * SEC;
+    let mut seed = 624u64;
+    let mut next = || {
+        seed = splitmix64(seed);
+        seed
+    };
+    let mut rows = Vec::new();
+    for i in 0..400i64 {
+        let point = t0 + i * 9 * SEC + i * 7;
+        for d in [-1i64, 0, 1] {
+            let n = rows.len();
+            let body = if n % 3 == 0 {
+                String::new()
+            } else {
+                "x".repeat(1 + (next() % 40) as usize)
+            };
+            rows.push(BucketedSeedRow {
+                service: service.to_string(),
+                fingerprint: fps[(next() % 3) as usize],
+                timestamp_ns: point + d,
+                severity: 0,
+                body,
+                structured_metadata: metadata[(next() % 3) as usize].to_string(),
+            });
+        }
+    }
+    assert_eq!(rows.len(), 1_200);
+    client
+        .insert_block("log_samples", &rows)
+        .await
+        .expect("insert the sliding fixture");
+    land_seeded_lines(&client, &db).await;
+
+    // The cases.
+    let span = 400 * 9 * SEC;
+    let mut cases = Vec::new();
+    for i in 0..60u64 {
+        let step = (1 + (next() % 300) as i64) * SEC + (next() % SEC as u64) as i64;
+        let range = match i % 7 {
+            0 => step,
+            1 => step + 1,
+            2 => step - 1,
+            3 => step / 2,
+            4 => 2 * step,
+            5 => 20 * step,
+            _ => 1 + (next() % (30 * step as u64)) as i64,
+        };
+        let s = t0 + (next() % span as u64) as i64 - range / 2;
+        let points = 1 + (next() % (span / step + 2).min(150) as u64) as i64;
+        let e = s + (points - 1) * step + (next() % step as u64) as i64;
+        cases.push(SlidingCase { s, e, step, range });
+    }
+
+    let fp_literals: Vec<_> = fps
+        .iter()
+        .map(|fp| Fingerprint::from_raw(*fp).sql_literal())
+        .collect();
+    let (mut cells, mut zero_bytes, mut statements) = (0usize, 0usize, 0usize);
+    let (mut below, mut equal, mut above) = (0usize, 0usize, 0usize);
+    let mut mismatches: Vec<String> = Vec::new();
+    for case in &cases {
+        match case.range.cmp(&case.step) {
+            std::cmp::Ordering::Less => below += 1,
+            std::cmp::Ordering::Equal => equal += 1,
+            std::cmp::Ordering::Greater => above += 1,
+        }
+        let kmax = (case.e - case.s).div_euclid(case.step);
+        for shape in [sql::MetricShape::RawCount, sql::MetricShape::RawBytes] {
+            let is_bytes = shape == sql::MetricShape::RawBytes;
+            let statement = sql::metric_range_sliding(
+                sql::MetricSource::new("log_samples", shape),
+                &[literal(service)],
+                &fp_literals,
+                sql::SlidingScan {
+                    window: TimeWindow {
+                        start_ns: case.s - case.range,
+                        end_ns: case.e,
+                    },
+                    lower: sql::ScanLowerBound::Exclusive,
+                    grid_start_ns: case.s,
+                    step_ns: case.step,
+                    range_ns: case.range,
+                },
+                &[],
+            )
+            .unwrap_or_else(|r| panic!("{case:?}: the sliding statement refused: {r:?}"));
+            statements += 1;
+
+            let mut got: std::collections::BTreeMap<SlidingCell, u64> = Default::default();
+            let mut stream = client
+                .query_stream::<SlidingRow>(&statement, &QuerySettings::new())
+                .await
+                .unwrap_or_else(|e| panic!("{case:?}: execute: {e}"));
+            while let Some(row) = stream.next().await {
+                let row = row.expect("decode a sliding row");
+                let prior = got.insert(
+                    (row.fingerprint, row.structured_metadata, row.bucket_ns),
+                    row.n,
+                );
+                assert!(prior.is_none(), "{case:?}: a cell returned twice");
+            }
+            drop(stream);
+
+            let mut want: std::collections::BTreeMap<SlidingCell, u64> = Default::default();
+            for k in 0..=kmax {
+                let g = case.s + k * case.step;
+                cells += fps.len() * metadata.len();
+                for line in &rows {
+                    if g - case.range < line.timestamp_ns && line.timestamp_ns <= g {
+                        let v = if is_bytes { line.body.len() as u64 } else { 1 };
+                        *want
+                            .entry((line.fingerprint, line.structured_metadata.clone(), g))
+                            .or_insert(0) += v;
+                    }
+                }
+            }
+            if is_bytes {
+                zero_bytes += want.values().filter(|v| **v == 0).count();
+            }
+            if got != want {
+                mismatches.push(format!(
+                    "{case:?} bytes={is_bytes}: {} cells returned, {} expected",
+                    got.len(),
+                    want.len()
+                ));
+            }
+        }
+    }
+
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the run database");
+
+    assert_eq!(statements, 120);
+    assert!(
+        mismatches.is_empty(),
+        "{} of {statements} statements differ from the window definition: {mismatches:#?}",
+        mismatches.len()
+    );
+    assert!(cells >= 10_000, "only {cells} grid cells compared");
+    assert!(
+        below >= 1 && equal >= 1 && above >= 1,
+        "range below / equal / above the step: {below} / {equal} / {above}"
+    );
+    assert!(zero_bytes >= 1, "no zero-byte point was compared");
+}
+
+/// One engine answer, as sorted `(labels, (timestamp, value bits))` series.
+async fn sliding_answer(
+    engine: &LogQlEngine,
+    query: &str,
+    params: &QueryParams,
+) -> Vec<AnswerSeries> {
+    let (result, _warnings) = engine
+        .query(&parse(query).expect("parse"), params)
+        .await
+        .unwrap_or_else(|e| panic!("{query}: {e}"));
+    let QueryResult::Matrix(series) = result else {
+        panic!("{query}: expected a matrix");
+    };
+    let mut out: Vec<AnswerSeries> = series
+        .into_iter()
+        .map(|s| {
+            let mut labels = s.labels;
+            labels.sort();
+            (
+                labels,
+                s.points
+                    .into_iter()
+                    .map(|(ts, v)| (ts, v.to_bits()))
+                    .collect(),
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// The three series of the bucketed fixture, by their extra label.
+fn fixture_series(lvl: Option<&str>) -> Vec<(String, String)> {
+    let mut labels = vec![
+        ("app".to_string(), "a".to_string()),
+        ("service_name".to_string(), "c507bucket".to_string()),
+    ];
+    if let Some(lvl) = lvl {
+        labels.push(("lvl".to_string(), lvl.to_string()));
+    }
+    labels.sort();
+    labels
+}
+
+/// A series' expected points from `(seconds after T, count)`.
+fn fixture_points(t: i64, points: &[(i64, f64)]) -> Vec<(i64, u64)> {
+    points
+        .iter()
+        .map(|(sec, v)| (t + sec * 1_000_000_000, v.to_bits()))
+        .collect()
+}
+
+/// The `[150s]` count answer over `T..T+240s` at 60 s, shifted by `shift`
+/// seconds.
+fn fixture_150s(t: i64, shift: i64) -> Vec<AnswerSeries> {
+    let at = |p: &[(i64, f64)]| {
+        fixture_points(
+            t,
+            &p.iter().map(|(s, v)| (s + shift, *v)).collect::<Vec<_>>(),
+        )
+    };
+    let mut out = vec![
+        (
+            fixture_series(Some("info")),
+            at(&[(0, 2.0), (60, 2.0), (120, 4.0), (180, 4.0), (240, 3.0)]),
+        ),
+        (
+            fixture_series(Some("warn")),
+            at(&[(0, 1.0), (60, 1.0), (120, 1.0)]),
+        ),
+        (fixture_series(None), at(&[(0, 1.0), (60, 1.0), (120, 1.0)])),
+    ];
+    out.sort();
+    out
+}
+
+/// **N4 (issue #624): a range wider or narrower than the step is counted
+/// in the database, and answers what today's route answers, bit for bit.**
+///
+/// Over the bucketed fixture (`seed_bucketed_corpus`), at a 60 s step:
+/// `[150s]` holds a line in two or three windows, `[30s]` leaves lines in
+/// none. The control `| drop zzz` names a label the corpus does not carry,
+/// so it changes no label set and keeps the query on today's route.
+///
+/// The fixture's own expectation is asserted too, so a defect both routes
+/// shared would not pass. A window closed below would give `[150s]`
+/// `(T+120, 5)` and `(T+240, 4)`, and `[30s]` `(T, 2)`, `(T+120, 3)` and
+/// `(T+180, 1)`.
+#[tokio::test]
+async fn a_range_unequal_to_the_step_is_counted_in_the_database_and_answers_todays_answer() {
+    skip_unless_live!();
+    const STEP: i64 = 60_000_000_000;
+    let (admin, db, t) = seed_bucketed_corpus().await;
+    let selector = r#"{service_name="c507bucket"}"#;
+    let params = |from: i64| QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: from,
+            end_ns: from + 4 * STEP,
+            step_ns: STEP as u64,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let at_t = params(t);
+
+    // (i) the two routes, asserted to BE two routes.
+    let shape = |query: &str| match plan(&parse(query).expect("parse"), &at_t, &plan_ctx(&db))
+        .expect("plan")
+    {
+        Plan::Metric(mp) => mp,
+        _ => panic!("expected a metric plan"),
+    };
+    let lowered = shape(&format!("count_over_time({selector}[150s])"));
+    assert!(
+        lowered.client.is_none(),
+        "a clean counting range read at a range wider than the step is counted in the database"
+    );
+    assert_eq!(
+        lowered.routing.reason,
+        "raw: sliding range aggregation in the database (issue #624)"
+    );
+    assert!(
+        shape(&format!("count_over_time({selector} | drop zzz [150s])"))
+            .client
+            .is_some(),
+        "the control query must stay on today's route"
+    );
+
+    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+
+    // (ii) every reducer, both ranges: the lowered answer is the control's.
+    let mut answers = std::collections::HashMap::new();
+    for (reducer, range) in [
+        ("count_over_time", "150s"),
+        ("bytes_over_time", "150s"),
+        ("rate", "150s"),
+        ("bytes_rate", "150s"),
+        ("count_over_time", "30s"),
+    ] {
+        let lowered =
+            sliding_answer(&engine, &format!("{reducer}({selector}[{range}])"), &at_t).await;
+        let control = sliding_answer(
+            &engine,
+            &format!("{reducer}({selector} | drop zzz [{range}])"),
+            &at_t,
+        )
+        .await;
+        assert_eq!(
+            lowered, control,
+            "{reducer} [{range}]: the lowered answer must equal today's route's"
+        );
+        answers.insert((reducer, range), lowered);
+    }
+
+    // (iii) the fixture's own expectation.
+    assert_eq!(answers[&("count_over_time", "150s")], fixture_150s(t, 0));
+    let mut want_30s = vec![
+        (
+            fixture_series(Some("info")),
+            fixture_points(t, &[(0, 1.0), (120, 2.0)]),
+        ),
+        (fixture_series(Some("warn")), fixture_points(t, &[(0, 1.0)])),
+        (fixture_series(None), fixture_points(t, &[(0, 1.0)])),
+    ];
+    want_30s.sort();
+    assert_eq!(answers[&("count_over_time", "30s")], want_30s);
+
+    // (iv) an offset: the same windows, reported 60 s later.
+    let later = params(t + STEP);
+    let offset = sliding_answer(
+        &engine,
+        &format!("count_over_time({selector}[150s] offset 60s)"),
+        &later,
+    )
+    .await;
+    assert_eq!(offset, fixture_150s(t, 60), "the offset is added back");
+    let control = sliding_answer(
+        &engine,
+        &format!("count_over_time({selector} | drop zzz [150s] offset 60s)"),
+        &later,
+    )
+    .await;
+    assert_eq!(
+        offset, control,
+        "offset: the lowered answer equals today's route's"
+    );
+
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the run database");
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct CommentedStatementRow {
+    query: String,
+    exception_code: i32,
+}
+
+/// **N8 (issue #624): a bucketed statement that fails for memory hands the
+/// query to today's route, once, and the answer is today's.**
+///
+/// The test hook renders `SETTINGS max_memory_usage = 1` into the
+/// statement, so the server refuses it with code 241. The query must still
+/// answer N4's `[150s]` points, and the query log must hold the sliding
+/// statement, failed with 241, under this engine's comment.
+#[tokio::test]
+async fn a_bucketed_statement_that_fails_for_memory_is_answered_by_todays_route() {
+    skip_unless_live!();
+    const STEP: i64 = 60_000_000_000;
+    let (admin, db, t) = seed_bucketed_corpus().await;
+    let comment = format!("c624-memory-{}", uuid::Uuid::new_v4().simple());
+    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024))
+        .with_key_route_test_hooks(pulsus_read::logql::exec::KeyRouteTestHooks {
+            todays_route_group_bytes: None,
+            key_statement_test_knobs: None,
+            bucketed_statement_max_memory_bytes: Some(1),
+        })
+        .with_query_log_comment(comment.clone());
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t + 4 * STEP,
+            step_ns: STEP as u64,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let got = sliding_answer(
+        &engine,
+        r#"count_over_time({service_name="c507bucket"}[150s])"#,
+        &params,
+    )
+    .await;
+    assert_eq!(got, fixture_150s(t, 0), "today's route answers");
+
+    // The failed statement, from the query log. `SYSTEM FLUSH LOGS` does not
+    // guarantee the row is there, so this waits for it.
+    let mut logged: Vec<CommentedStatementRow> = Vec::new();
+    for _ in 0..30 {
+        admin
+            .execute(
+                "SYSTEM FLUSH LOGS",
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("flush logs");
+        let sql = format!(
+            "SELECT query, exception_code FROM system.query_log \
+             WHERE log_comment = '{comment}' AND type != 'QueryStart' \
+             ORDER BY event_time_microseconds ASC"
+        );
+        let mut stream = admin
+            .query_stream::<CommentedStatementRow>(&sql, &QuerySettings::new())
+            .await
+            .expect("read system.query_log");
+        logged.clear();
+        while let Some(row) = stream.next().await {
+            logged.push(row.expect("decode a query_log row"));
+        }
+        drop(stream);
+        if logged
+            .iter()
+            .any(|r| r.query.contains("leadInFrame(k0, 1, "))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    let sliding: Vec<&CommentedStatementRow> = logged
+        .iter()
+        .filter(|r| r.query.contains("leadInFrame(k0, 1, "))
+        .collect();
+    assert_eq!(
+        sliding.len(),
+        1,
+        "one sliding statement under the comment: {logged:#?}"
+    );
+    assert_eq!(
+        sliding[0].exception_code, 241,
+        "the sliding statement must fail for memory: {logged:#?}"
+    );
+
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the run database");
+}
+
+/// Seeds `streams` streams of service `c624cap`, one line each at `T + 100s`,
+/// into a fresh database, and returns `(admin, db, T)`.
+async fn seed_cap_corpus(streams: u64) -> (ChClient, String, i64) {
+    let db = pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_cap_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let admin = ChClient::new(test_config()).await.expect("connect admin");
+    for sql in [
+        format!("DROP DATABASE IF EXISTS {db}"),
+        format!("CREATE DATABASE {db}"),
+    ] {
+        admin
+            .execute(&sql, &QuerySettings::new(), Idempotency::Idempotent)
+            .await
+            .expect("create the run database");
+    }
+    run_init(&admin, &test_ctx(&db)).await.expect("run_init");
+    let client = data_client(&db).await;
+    let t = ((now_ns() - 4 * 3_600_000_000_000) / 1_000_000_000) * 1_000_000_000;
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, updated_ns) \
+                 SELECT toStartOfMonth(fromUnixTimestamp64Nano(toInt64({t}))), 6240000 + number, \
+                 'c624cap', concat('{{\"pod\":\"p', toString(number), \
+                 '\",\"service_name\":\"c624cap\"}}'), 0 FROM numbers({streams})"
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("seed log_streams");
+    land_seeded_streams(&client, &db).await;
+    let rows: Vec<BucketedSeedRow> = (0..streams)
+        .map(|i| BucketedSeedRow {
+            service: "c624cap".to_string(),
+            fingerprint: u128::from(6_240_000 + i),
+            timestamp_ns: t + 100_000_000_000,
+            severity: 0,
+            body: "x".to_string(),
+            structured_metadata: String::new(),
+        })
+        .collect();
+    client
+        .insert_block("log_samples", &rows)
+        .await
+        .expect("insert the cap fixture");
+    land_seeded_lines(&client, &db).await;
+    (admin, db, t)
+}
+
+/// **At a range equal to the step, a reducing aggregation over many sparse
+/// series is answered, as it was before** (issue #624, code review round 2).
+///
+/// 1,091 one-line streams on an 11,001-point grid at a 1 s step, `[1s]`. The
+/// bucketed fold keeps each series' points sparsely and charges them one by
+/// one, so 1,091 points are charged; reserving one grid per series would be
+/// 12,002,091 slots, past `MAX_METRIC_RESULT_POINTS`, and a 422. Each query
+/// answers one point at `T + 100s`.
+#[tokio::test]
+async fn a_reducing_aggregation_over_sparse_series_at_range_equal_to_step_is_answered() {
+    skip_unless_live!();
+    const GRID: u64 = 11_001;
+    let streams = pulsus_read::logql::MAX_METRIC_RESULT_POINTS / GRID + 1;
+    let (admin, db, t) = seed_cap_corpus(streams).await;
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t + 11_000_000_000_000,
+            step_ns: 1_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+    let at = t + 100_000_000_000;
+    let sel = r#"{service_name=~".+"}"#;
+    let by_service = vec![("service_name".to_string(), "c624cap".to_string())];
+    for (query, labels, value) in [
+        (format!("topk(1, rate({sel}[1s]))"), None, 1.0f64),
+        (format!("max(rate({sel}[1s]))"), Some(vec![]), 1.0),
+        (
+            format!("count by (service_name) (count_over_time({sel}[1s]))"),
+            Some(by_service),
+            streams as f64,
+        ),
+    ] {
+        let mp = match plan(&parse(&query).expect("parse"), &params, &plan_ctx(&db)).expect("plan")
+        {
+            Plan::Metric(mp) => mp,
+            _ => panic!("expected a metric plan"),
+        };
+        assert!(
+            mp.client.is_none(),
+            "{query}: must be counted in the database"
+        );
+        let got = sliding_answer(&engine, &query, &params).await;
+        assert_eq!(got.len(), 1, "{query}: one series, got {got:?}");
+        if let Some(labels) = labels {
+            assert_eq!(got[0].0, labels, "{query}");
+        }
+        assert_eq!(got[0].1, vec![(at, value.to_bits())], "{query}");
+    }
+
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the run database");
+}
+
+// ---------------------------------------------------------------------
 // W4 (issue #507): does a single-threaded `sum` accumulate in scan order?
 // ---------------------------------------------------------------------
 
@@ -5576,6 +6204,7 @@ async fn the_lane_answers_reserved_name_rows_under_the_rules() {
         .with_key_route_test_hooks(pulsus_read::logql::exec::KeyRouteTestHooks {
             todays_route_group_bytes: Some(1),
             key_statement_test_knobs: None,
+            bucketed_statement_max_memory_bytes: None,
         });
     let params = QueryParams {
         spec: QuerySpec::Range {
@@ -6204,6 +6833,7 @@ async fn the_undecided_rows_come_from_one_read() {
         pulsus_read::logql::exec::KeyRouteTestHooks {
             todays_route_group_bytes: Some(1),
             key_statement_test_knobs: None,
+            bucketed_statement_max_memory_bytes: None,
         },
     );
     let plain = LogQlEngine::new(data_client(&db).await, config());
@@ -6553,6 +7183,7 @@ async fn the_lane_keeps_an_error_row_ungrouped() {
     .with_key_route_test_hooks(pulsus_read::logql::exec::KeyRouteTestHooks {
         todays_route_group_bytes: Some(LOWERED_GROUP_BYTES),
         key_statement_test_knobs: None,
+        bucketed_statement_max_memory_bytes: None,
     });
 
     // (a) the shipped ceiling at W3: the query fails on the first error line
@@ -6718,6 +7349,7 @@ async fn the_key_statement_timeout_is_the_timeout_response() {
                 row_delay_micros: 40,
                 max_execution_s: server_limit_s,
             }),
+            bucketed_statement_max_memory_bytes: None,
         });
         let from = server_micros(&admin).await;
         let res = slow.query(&expr, &params).await;

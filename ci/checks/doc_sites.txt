@@ -52,7 +52,10 @@ rewrite docs/schemas.md:691-692 refs=#556
 # #579 pushes, so the rule reads them as added. #579 is the change itself.
 # Issue #635 adds #635, its own issue, where the clustering sentence names
 # the label values table among the per-shard tables with no wrapper.
-rewrite docs/architecture.md:378-378 refs=#560,#549,#579,#635
+# Issue #624 adds #544, carried: the pipeline-evaluation paragraph that
+# already cited it now says which counting range aggregations the database
+# counts, so the rule reads the paragraph as added.
+rewrite docs/architecture.md:378-378 refs=#560,#549,#579,#635,#544
 rewrite docs/116.md:64-64
 rewrite docs/116.md:75-75
 rewrite crates/pulsus-clickhouse/src/client.rs:156-164 refs=#560
@@ -66,7 +69,11 @@ rewrite crates/pulsus-clickhouse/src/client.rs:156-164 refs=#560
 # this manifest already uses to record a decision a reader can follow.
 rewrite crates/pulsus-clickhouse/src/lib.rs:6-10 refs=#587
 rewrite docs/decisions/0006-log-pattern-extraction.md:52-62 refs=#603
-rewrite crates/pulsus-read/src/logql/plan.rs:5573-5581 refs=#507
+# Issue #624 adds #624, its own issue, where the planner names the sliding
+# statement's route and its tests assert it; and #544, carried: the comments
+# beside the lowered structured-metadata filter that already cited it were
+# rewritten when that filter's range read moved into the database.
+rewrite crates/pulsus-read/src/logql/plan.rs:5573-5581 refs=#507,#544,#624
 leave docs/116.md:76-76
 leave docs/traceql-schema-migration.md:2289-2289
 # #478 and #555 join this column for the same reason as `docs/schemas.md`'s:

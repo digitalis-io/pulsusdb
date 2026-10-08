@@ -865,6 +865,13 @@ pub enum BucketGridRefusal {
     AnchorAboveScanStart,
     /// The worst-case arithmetic is not representable in `Int64`.
     WouldOverflow,
+    /// The selector's range is zero or negative, so no window holds a row
+    /// (issue #624).
+    RangeNotPositive,
+    /// The shape's grid column is not `timestamp_ns`: the sliding statement
+    /// reads lines, and the rollup's buckets have lost the timestamp that
+    /// decides which side of a window edge a line falls (issue #624).
+    RollupSource,
 }
 
 /// The anchored bucket expression: the grid point a row belongs to under a
@@ -929,6 +936,105 @@ pub fn bucket_expr(
         sql: format!(
             "{lo_ns} + intDiv({bucket_col} - {lo_ns} + {step_ns} - 1, {step_ns}) * {step_ns}"
         ),
+    })
+}
+
+/// The grid indexes one line covers under the sliding statement (issue
+/// #624), and the grid's last index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlidingCover {
+    /// `lo`: the first grid index whose window holds the line, clipped to 0.
+    pub lo: CheckedFragment,
+    /// `hi`: the last grid index whose window holds the line, clipped to
+    /// `kmax`.
+    pub hi: CheckedFragment,
+    /// The last grid index, `floor((end - grid_start) / step)`: `-1` when the
+    /// end is before the start, so the grid has no point.
+    pub kmax: i64,
+    /// `kmax + 1`, the end of the grid's index range.
+    pub kend: i64,
+}
+
+/// The sliding statement's per-line grid cover (issue #624): for a line at
+/// `ts`, the grid indexes `k` whose window `(g - range, g]`, `g = grid_start
+/// + k * step`, holds it.
+///
+/// ```text
+/// ts in (g - range, g]   <=>   g in [ts, ts + range)   <=>   k in [lo, hi]
+/// lo = ceil((ts - grid_start) / step)
+/// hi = ceil((ts + range - grid_start) / step) - 1
+/// ```
+///
+/// Both are rendered as `intDiv` over a numerator shifted by an anchor
+/// `a = grid_start - q * step`, `q = ceil(range / step)`, which sits at or
+/// below `grid_start - range` and so below every line the scan admits:
+/// `intDiv` truncates toward zero, which is a floor only for a non-negative
+/// numerator. `hi` uses `a - range` the same way. Every symbol is computed in
+/// `i128` and rendered as `i64`.
+///
+/// The column is always `timestamp_ns`: the statement reads lines, and the
+/// caller refuses a rollup shape before it gets here.
+///
+/// # Refusals
+///
+/// - `StepNotPositive`: the grid has no points.
+/// - `RangeNotPositive`: no window holds a line.
+/// - `AnchorAboveScanStart`: the scan admits a line below `a`, whose
+///   numerator would be negative.
+/// - `WouldOverflow`: `a`, `a - range`, the widest `hi` numerator or the
+///   last grid point is not representable in `Int64`. This covers the
+///   saturated inclusive scan, where `grid_start - range` underflowed and so
+///   does `a`.
+pub fn sliding_cover(
+    scan_start_ns: i64,
+    grid_start_ns: i64,
+    end_ns: i64,
+    step_ns: i64,
+    range_ns: i64,
+) -> Result<SlidingCover, BucketGridRefusal> {
+    if step_ns <= 0 {
+        return Err(BucketGridRefusal::StepNotPositive);
+    }
+    if range_ns <= 0 {
+        return Err(BucketGridRefusal::RangeNotPositive);
+    }
+    let (s, e, step, r) = (
+        i128::from(grid_start_ns),
+        i128::from(end_ns),
+        i128::from(step_ns),
+        i128::from(range_ns),
+    );
+    let q = (r + step - 1) / step;
+    let a = s - q * step;
+    let a_r = a - r;
+    let kmax = (e - s).div_euclid(step);
+    let kend = kmax + 1;
+    if i128::from(scan_start_ns) < a {
+        return Err(BucketGridRefusal::AnchorAboveScanStart);
+    }
+    let fits = |v: i128| i64::try_from(v).map_err(|_| BucketGridRefusal::WouldOverflow);
+    fits(e - a_r + step - 1)?;
+    fits(s + kend * step)?;
+    let (a, a_r, q, q1, kmax, kend) = (
+        fits(a)?,
+        fits(a_r)?,
+        fits(q)?,
+        fits(q + 1)?,
+        fits(kmax)?,
+        fits(kend)?,
+    );
+    let step_m1 = step_ns - 1;
+    Ok(SlidingCover {
+        lo: CheckedFragment {
+            sql: format!("greatest(intDiv(timestamp_ns - {a} + {step_m1}, {step_ns}) - {q}, 0)"),
+        },
+        hi: CheckedFragment {
+            sql: format!(
+                "least(intDiv(timestamp_ns - {a_r} + {step_m1}, {step_ns}) - {q1}, {kmax})"
+            ),
+        },
+        kmax,
+        kend,
     })
 }
 
@@ -2628,5 +2734,57 @@ mod tests {
         }
         assert_eq!(metadata_leaf_is_servable("trace_id", MatchOp::Eq), Ok(()));
         assert_eq!(metadata_leaf_is_servable("trace_id", MatchOp::Neq), Ok(()));
+    }
+
+    /// N2 (issue #624): the sliding statement's per-line grid cover, and
+    /// each way it refuses.
+    #[test]
+    fn the_sliding_cover_is_its_symbols_and_refuses_what_it_cannot_render() {
+        const S: i64 = 1_700_000_000_000_000_000;
+        const STEP: i64 = 60_000_000_000;
+        const RANGE: i64 = 150_000_000_000;
+        const E: i64 = S + 3_600_000_000_000;
+        // (a) N1's inputs: a = s - 3 * step, a_r = a - range, q = 3, kmax 60.
+        let cover = sliding_cover(S - RANGE, S, E, STEP, RANGE).expect("renderable");
+        assert_eq!(
+            cover.lo.as_sql(),
+            "greatest(intDiv(timestamp_ns - 1699999820000000000 + 59999999999, 60000000000) - 3, 0)"
+        );
+        assert_eq!(
+            cover.hi.as_sql(),
+            "least(intDiv(timestamp_ns - 1699999670000000000 + 59999999999, 60000000000) - 4, 60)"
+        );
+        assert_eq!((cover.kmax, cover.kend), (60, 61));
+        // (b) a step that is not positive.
+        assert_eq!(
+            sliding_cover(S - RANGE, S, E, 0, RANGE),
+            Err(BucketGridRefusal::StepNotPositive)
+        );
+        // (c) a range that is not positive.
+        assert_eq!(
+            sliding_cover(S, S, E, STEP, 0),
+            Err(BucketGridRefusal::RangeNotPositive)
+        );
+        // (d) the saturated inclusive scan: `s - r` underflowed, so `a` does.
+        let low = i64::MIN + 100_000_000_000;
+        assert_eq!(
+            sliding_cover(i64::MIN, low, low + 3_600_000_000_000, STEP, RANGE),
+            Err(BucketGridRefusal::WouldOverflow)
+        );
+        // (e) `a` is exactly `i64::MIN`, so `a_r` is below it.
+        let big = 1i64 << 62;
+        assert_eq!(
+            sliding_cover(-(big + 1), 0, 0, big, big + 1),
+            Err(BucketGridRefusal::WouldOverflow)
+        );
+        // (f) an end before the start: floor, not truncation, so no point.
+        let empty = sliding_cover(-STEP, 0, -1, STEP, STEP).expect("an empty grid renders");
+        assert_eq!((empty.kmax, empty.kend), (-1, 0));
+        // (g) a scan start below the anchor.
+        let a = S - 3 * STEP;
+        assert_eq!(
+            sliding_cover(a - 1, S, E, STEP, RANGE),
+            Err(BucketGridRefusal::AnchorAboveScanStart)
+        );
     }
 }

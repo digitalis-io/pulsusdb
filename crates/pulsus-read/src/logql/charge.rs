@@ -703,6 +703,23 @@ pub(in crate::logql) const PUSHDOWN_RANGE_SLOT: usize =
 pub(in crate::logql) const PUSHDOWN_RANGE_POINT_SLOT: usize =
     size_of::<(i64, u64)>() + size_of::<(i64, f64)>();
 
+/// The bucketed range path's per-SERIES slot (issue #624): the map entry
+/// (`(rendered key, LabelSet, dense slot vector)`) AND the [`MatrixSeries`]
+/// element the group becomes, the [`PUSHDOWN_RANGE_SLOT`] arrangement. The
+/// slot vector's contents are not priced here: they are the series' grid
+/// points, reserved through [`charge_result_points`], and each slot is no
+/// wider than the point slot that counter prices (asserted below).
+///
+/// [`PUSHDOWN_RANGE_SLOT`] and [`PUSHDOWN_RANGE_POINT_SLOT`] stay for the
+/// unwrapped fold and for the bucketed fold's sparse arm at a range equal to
+/// the step, both of which charge per point.
+pub(in crate::logql) const PUSHDOWN_RANGE_DENSE_SLOT: usize =
+    size_of::<(String, (LabelSet, Vec<Option<u64>>))>() + size_of::<MatrixSeries>();
+
+/// A dense slot is priced as one emitted point (issue #624), so it must be no
+/// wider than the point slot [`MAX_LEAF_RETAINED_BYTES`] prices for it.
+const _: () = assert!(size_of::<Option<u64>>() as u64 <= RESULT_POINT_SLOT_BYTES[0]);
+
 /// A provable UPPER BOUND on the query-lifetime heap bytes ONE distinct
 /// output group's map entry retains: the rendered-JSON key, the cloned
 /// `LabelSet` (each owned string plus the element buffer), and the entry's
@@ -2525,16 +2542,24 @@ mod tests {
             // `LEAF_COUNTERS.group_bytes` stays 2 and
             // `MAX_LEAF_RETAINED_BYTES` is unmoved.
             // Issue #507 (W2): `PushdownRangeGroups::charged`, the
-            // SQL-pushdown BUCKETED RANGE path's re-grouping map (x2: the
-            // new-series arm and the new-grid-point arm, which charge the
-            // same counter in the same units). A further XOR arm of the
-            // same cap for the same reason: it runs only when
-            // `client == None` AND `step_ns.is_some()`, which excludes the
-            // instant pushdown arm above it as well as both
+            // SQL-pushdown BUCKETED RANGE path's re-grouping map (x3: the
+            // dense series arm of issue #624, and the sparse arm's series and
+            // grid-point charges at a range equal to the step, which charge
+            // the same counter in the same units). A
+            // further XOR arm of the same cap for the same reason: it runs
+            // only when `client == None` AND `step_ns.is_some()`, which
+            // excludes the instant pushdown arm above it as well as both
             // `MetricAggState` arms and the variants path. So
             // `LEAF_COUNTERS.group_bytes` stays 2 and
             // `MAX_LEAF_RETAINED_BYTES` is unmoved.
-            ("exec.rs", "charge_group_bytes", "&mut self.charged", 3),
+            ("exec.rs", "charge_group_bytes", "&mut self.charged", 4),
+            // Issue #624: `PushdownRangeGroups::points`, the bucketed range
+            // path's dense slots, one grid's width per series. A further XOR
+            // arm of `MAX_METRIC_RESULT_POINTS`: it runs only when
+            // `client == None` and `step_ns.is_some()`, where no slider and
+            // no fold is live. So `LEAF_COUNTERS` and
+            // `MAX_LEAF_RETAINED_BYTES` are unmoved.
+            ("exec.rs", "charge_result_points", "&mut self.points", 1),
             // Issue #507: `KeyRouteFold::charged`, the extracted-field group
             // key read's partials (x2, the new-series and new-grid-point
             // arms). A further XOR arm of the same cap: S1's fold is dropped
@@ -2679,12 +2704,19 @@ mod tests {
             // use, so a query's refusal surface does not depend on how it
             // routed. XOR with both `MetricAggState` arms (see
             // `CounterPlurality`), so the composed bound is unmoved.
+            // Issue #624: the bucketed range fold reads it three times — at a
+            // new dense series, and at a new sparse series and a new sparse
+            // grid point when the range equals the step.
             (
                 "exec.rs",
                 "group_bytes",
-                3,
+                4,
                 "PushdownInstantGroups::charged | PushdownRangeGroups::charged",
             ),
+            // Issue #624: the bucketed range fold's dense slots, one grid's
+            // width per series. XOR with the slider and the fold (see the
+            // charge census), so `LEAF_COUNTERS` is unmoved.
+            ("exec.rs", "result_points", 1, "PushdownRangeGroups::points"),
             (
                 "unwrap_group.rs",
                 "group_bytes",

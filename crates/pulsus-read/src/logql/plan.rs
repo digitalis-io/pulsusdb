@@ -2506,10 +2506,10 @@ fn metric_plan(
 
     let extra_predicates = compile_line_filters(&range.selector.pipeline)?;
 
-    // Issue #507 (W2): **the clean bucketed shape lowers the aggregation
-    // into the statement.** The read returns one row per `(fingerprint,
-    // grid point, structured_metadata)` instead of one row per log line,
-    // so the plan carries no client aggregation at all and
+    // Issue #507 (W2), widened by issue #624: **the clean bucketed shape
+    // lowers the aggregation into the statement.** The read returns one row
+    // per `(fingerprint, grid point, structured_metadata)` instead of one row
+    // per log line, so the plan carries no client aggregation at all and
     // `super::exec`'s range arm reads the counts.
     //
     // Every condition below is the fold model's
@@ -2519,29 +2519,15 @@ fn metric_plan(
     //
     //   the reducer is one of the four that accumulate INTEGERS
     //   nothing in the pipeline beyond a pushable line filter
-    //   step > 0, range == step, and `grid_start - step` is representable
+    //   step > 0, and `grid_start - step` is representable
     //
-    // **Why the range must EQUAL the step rather than merely fit inside
-    // it.** The grid column (`super::predicate::bucket_expr`) is
-    // `lo + ceil((t - lo) / step) * step`, which gives every scanned row
-    // the smallest grid point at or above it — the window `(g - step, g]`.
-    // The reference's window is `(g - range, g]`. Those are the same set
-    // of rows only when `range == step`; with a shorter range the rows in
-    // `(g - step, g - range]` belong to no window at all, and one column
-    // cannot say so:
-    //
-    //   step 60s, range 10s, grid points 0 and 60
-    //     reference windows   (-10, 0]   (50, 60]
-    //     the grid column     (-60, 0]   ( 0, 60]   <- a row at 30 counted
-    //
-    // **Widening this equality moves a frozen golden, and the fact that it
-    // does not move one today is luck.** Every range in
-    // `tests/golden/plan_build_differential.txt`'s corpus is `[5m]` against
-    // a 60 s step, so nothing in it lowers and the golden and its digest
-    // are untouched by this issue. A corpus row with a range equal to its
-    // step, or a relaxation here, changes `client` on those plans and
-    // moves the golden — which `tests/characterization_freeze.rs` refuses
-    // and `logql_plan_build_differential.rs`'s replay refuses with it.
+    // **Any range.** At a range equal to the step, #507's statement gives
+    // each line the one grid point whose window holds it. At any other range
+    // the sliding statement (`super::sql::metric_range_sliding`) gives each
+    // line the grid indexes `[lo, hi]` whose windows `(g - range, g]` hold
+    // it, sums +/- deltas cumulatively and expands each run to its grid
+    // points — exact at every range and step (issue #624; the argument is at
+    // `super::predicate::sliding_cover`).
     let bucketed_range = is_range
         && !force_client
         && !has_beyond_line_filter
@@ -2568,9 +2554,7 @@ fn metric_plan(
         && match step_ns {
             Some(step) => {
                 let step = step.get();
-                step > 0
-                    && range_ns.get() == step
-                    && grid_start_ns.checked_sub(step).is_some()
+                step > 0 && grid_start_ns.checked_sub(step).is_some()
             }
             None => false,
         };
@@ -2685,9 +2669,17 @@ fn metric_plan(
         // this branch a bucketed plan would fall into the rollup
         // eligibility test below, whose only input is whether the step
         // divides the resolution.
+        //
+        // Issue #624: named by the statement that runs — #507's when the
+        // range equals the step, the sliding statement otherwise.
+        let equal = step_ns.is_some_and(|step| step.get() == range_ns.get());
         RoutingDecision {
             chosen: RouteChoice::Raw,
-            reason: "raw: bucketed range aggregation (issue #507)".to_string(),
+            reason: if equal {
+                "raw: bucketed range aggregation (issue #507)".to_string()
+            } else {
+                "raw: sliding range aggregation in the database (issue #624)".to_string()
+            },
         }
     } else {
         match p.spec {
@@ -5540,8 +5532,8 @@ mod tests {
 
     /// Issue #227: a range query NO LONGER routes to the 5s rollup on a
     /// resolution-dividing step — the rollup cannot reproduce Loki's
-    /// per-event sliding-window boundary, so every range read is the
-    /// streaming raw path.
+    /// per-event sliding-window boundary, so every range read is raw. Since
+    /// issue #624 a clean counting one is counted in the database.
     #[test]
     fn a_range_query_routes_to_the_sliding_raw_path_regardless_of_step() {
         let mp = metric_mp(
@@ -5555,10 +5547,13 @@ mod tests {
         .unwrap();
         assert_eq!(mp.routing.chosen, RouteChoice::Raw);
         assert!(!mp.rollup);
-        assert!(mp.client.is_some(), "range routes to the client slide");
+        assert!(
+            mp.client.is_none(),
+            "a clean counting range read is counted in the database"
+        );
         assert_eq!(
             mp.routing.reason,
-            "raw: sliding-window range aggregation (issue #227)"
+            "raw: sliding range aggregation in the database (issue #624)"
         );
     }
 
@@ -5676,7 +5671,7 @@ mod tests {
         assert!(!mp.rollup);
         assert_eq!(
             mp.routing.reason,
-            "raw: sliding-window range aggregation (issue #227)"
+            "raw: sliding range aggregation in the database (issue #624)"
         );
     }
 
@@ -5742,12 +5737,12 @@ mod tests {
         .unwrap();
         assert_eq!(mp.routing.chosen, RouteChoice::Raw);
         assert!(!mp.rollup);
-        assert!(mp.client.is_some());
         // A plain line filter is pushed as a predicate, not a beyond-line
-        // stage, so the reason is the sliding-range reason.
+        // stage, so the read is counted in the database (issue #624).
+        assert!(mp.client.is_none());
         assert_eq!(
             mp.routing.reason,
-            "raw: sliding-window range aggregation (issue #227)"
+            "raw: sliding range aggregation in the database (issue #624)"
         );
         assert_eq!(mp.extra_predicates.len(), 1, "the line filter is pushed");
     }
@@ -5789,7 +5784,7 @@ mod tests {
         assert_eq!(mp.routing.chosen, RouteChoice::Raw);
         assert_eq!(
             mp.routing.reason,
-            "raw: sliding-window range aggregation (issue #227)"
+            "raw: sliding range aggregation in the database (issue #624)"
         );
     }
 
@@ -6163,8 +6158,8 @@ mod tests {
     }
 
     /// Issue #544 — the restored client stage is stored exactly on the
-    /// two routes where the aggregate is the database's, and nowhere
-    /// else.
+    /// routes where the aggregate is the database's: instant, and since
+    /// issue #624 range at any step.
     #[test]
     fn the_restored_client_stage_is_stored_on_the_database_aggregated_routes() {
         let instant = QuerySpec::Instant {
@@ -6184,7 +6179,9 @@ mod tests {
         for (spec, want_client, want_restored, what) in [
             (instant, false, true, "instant, database-aggregated"),
             (bucketed, false, true, "range, bucketed"),
-            (raw_range, true, false, "range, raw — the client re-filters"),
+            // Issue #624: at a step unequal to the range the sliding
+            // statement counts it in the database too.
+            (raw_range, false, true, "range, sliding"),
         ] {
             let mp = metric_mp(q, spec).expect("plans");
             assert_eq!(mp.client.is_some(), want_client, "{what}: client");
@@ -6434,23 +6431,29 @@ mod tests {
         ] {
             let mp = metric_mp(query, range_spec())
                 .unwrap_or_else(|e| panic!("expected {query:?} to plan in client mode, got {e}"));
+            assert!(!mp.rollup, "client mode always routes raw: {query}");
+            // Issue #544: a structured-metadata equality filter no longer
+            // names a beyond-line-filter construct, and its filter is in
+            // the statement; since issue #624 the range query is then
+            // counted in the database. It still plans, which is what this
+            // test is about.
+            if query.contains("| level = \"error\"") {
+                assert!(mp.client.is_none(), "{query}");
+                assert_eq!(
+                    mp.routing.reason,
+                    "raw: sliding range aggregation in the database (issue #624)",
+                    "{query}"
+                );
+                continue;
+            }
             let client = mp
                 .client
                 .as_ref()
                 .unwrap_or_else(|| panic!("expected {query:?} to carry a client-aggregation spec"));
-            assert!(!mp.rollup, "client mode always routes raw: {query}");
-            // Issue #544: a structured-metadata equality filter no longer
-            // names a beyond-line-filter construct, so this range query is
-            // client-aggregated for the reason EVERY range query is —
-            // Loki's sliding window (issue #227) — and its filter is in
-            // the statement. It still plans in client mode, which is what
-            // this test is about.
-            let want = if query.contains("| level = \"error\"") {
-                "raw: sliding-window range aggregation (issue #227)"
-            } else {
-                "raw: client-side pipeline/unwrap aggregation"
-            };
-            assert_eq!(mp.routing.reason, want, "{query}");
+            assert_eq!(
+                mp.routing.reason, "raw: client-side pipeline/unwrap aggregation",
+                "{query}"
+            );
             assert_eq!(
                 client.pipeline.len(),
                 mp.client.as_ref().unwrap().pipeline.len()
@@ -6695,11 +6698,12 @@ mod tests {
         assert!(!return_bool);
         let leaves = node.leaves();
         assert_eq!(leaves.len(), 2);
-        // Each leaf routes exactly as it would standalone — issue #227: a
-        // range leaf slides raw (client-aggregated), never rollup.
+        // Each leaf routes exactly as it would standalone — a clean
+        // counting range leaf is counted in the database (issue #624),
+        // never rollup.
         for leaf in leaves {
             assert!(!leaf.rollup);
-            assert!(leaf.client.is_some());
+            assert!(leaf.client.is_none());
         }
     }
 
@@ -6765,10 +6769,11 @@ mod tests {
         assert_eq!(mp.vector_aggs.len(), 1);
         assert_eq!(mp.vector_aggs[0].0, VectorAggOp::Topk);
         assert_eq!(mp.vector_aggs[0].2, Some(5.0));
-        // topk/bottomk never disturb the inner query's routing — issue #227:
-        // a range leaf slides raw (client-aggregated), never rollup.
+        // topk/bottomk never disturb the inner query's routing — a clean
+        // counting range leaf is counted in the database (issue #624),
+        // never rollup.
         assert!(!mp.rollup);
-        assert!(mp.client.is_some());
+        assert!(mp.client.is_none());
     }
 
     #[test]
@@ -7483,8 +7488,8 @@ mod tests {
     /// produced nothing at all would satisfy every negative here, and fails
     /// the control.
     ///
-    /// Swept at RANGE, where `is_range` forces `client = Some(..)` so both
-    /// arms genuinely render a raw scan. The instant leg is
+    /// Swept at RANGE, rendering today's raw scan for both arms — the
+    /// statement a range read falls back to (issue #624). The instant leg is
     /// `an_instant_metadata_filter_can_never_reach_the_pushdown_path`.
     #[test]
     fn no_label_filter_operator_ever_renders_sql() {
@@ -7495,8 +7500,8 @@ mod tests {
         )
         .expect("plans");
         assert!(
-            baseline.client.is_some(),
-            "a range aggregation is client-side"
+            baseline.client.is_none(),
+            "a clean counting range aggregation is counted in the database (issue #624)"
         );
         let baseline_sql = range_read_sql(&baseline);
 
@@ -7524,10 +7529,19 @@ mod tests {
             let mp = metric_mp(q, range_spec_for_filters()).unwrap_or_else(|e| {
                 panic!("{q} must plan, got {e:?}");
             });
+            // Issue #624: a filter that lowers into the statement leaves the
+            // range read counted in the database, with the stage it would
+            // have had restored beside it — the runner's selection. The
+            // rest still force the client path.
+            let restored = mp
+                .metadata_lowering
+                .as_ref()
+                .and_then(|m| m.client_without_lowering.clone());
             let client = mp
                 .client
-                .as_ref()
-                .unwrap_or_else(|| panic!("{q}: a label filter forces the client path"));
+                .clone()
+                .or(restored)
+                .unwrap_or_else(|| panic!("{q}: a label filter keeps a client stage"));
             let filters = label_filters(&client.pipeline);
             assert_eq!(filters.len(), 1, "{q}: exactly one label filter");
             for f in &filters {
@@ -8334,13 +8348,21 @@ mod tests {
         // does not block the leaf.
         lowers(r#"sum(count_over_time({a="b"}[1m]))"#);
 
-        // The range is WIDER than the step: one entry would belong to
-        // several windows and one grid column cannot say which.
-        stays_client(r#"count_over_time({a="b"}[2m])"#, "range > step");
-        // The range is SHORTER than the step: the entries between the
-        // windows belong to none of them, and the grid column would count
-        // them into the next point.
-        stays_client(r#"count_over_time({a="b"}[30s])"#, "range < step");
+        // Issue #624: a range WIDER or SHORTER than the step lowers too, to
+        // the sliding statement, which gives an entry every window that
+        // holds it — several, or none.
+        for query in [
+            r#"count_over_time({a="b"}[2m])"#,
+            r#"count_over_time({a="b"}[30s])"#,
+        ] {
+            let mp = metric_mp(query, spec).unwrap_or_else(|e| panic!("{query}: {e}"));
+            assert!(mp.client.is_none(), "{query} must lower");
+            assert_eq!(
+                mp.routing.reason, "raw: sliding range aggregation in the database (issue #624)",
+                "{query}"
+            );
+            assert!(!mp.rollup, "{query} must route RAW, never rollup");
+        }
         // A stage beyond a pushable line filter.
         stays_client(r#"count_over_time({a="b"} | json [1m])"#, "a parser");
         stays_client(
