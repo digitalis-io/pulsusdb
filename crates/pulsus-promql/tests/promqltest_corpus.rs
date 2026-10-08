@@ -914,7 +914,7 @@ fn driver_sources() -> Vec<(String, String)> {
 /// `store.rs::compile_selector_regex`, and it routes through
 /// `pulsus_re2::compile_user_regex_anchored(&pulsus_re2::re2_pattern_to_rust(..))`
 /// — the same expression production uses at
-/// `crates/pulsus-read/src/metrics/labels.rs:274` and `:620`.
+/// `crates/pulsus-read/src/metrics/labels.rs:274` and `:621`.
 ///
 /// **What this cannot do:** it pins a list of call sites, not their
 /// purpose. It cannot tell a future reader whether a newly added

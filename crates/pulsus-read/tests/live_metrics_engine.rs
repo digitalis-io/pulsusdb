@@ -109,6 +109,7 @@ struct SeedSeriesRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedSampleRow {
+    org_id: String,
     fingerprint: u128,
     unix_milli: i64,
     value: f64,
@@ -118,6 +119,7 @@ struct SeedSampleRow {
 /// catalog CREATE, RowBinary is positional).
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedHistRow {
+    org_id: String,
     fingerprint: u128,
     unix_milli: i64,
     schema: i8,
@@ -277,6 +279,7 @@ async fn count_by_job_up_is_lookback_correct_and_excludes_a_silent_series() {
         &[
             // fp1 (job=api): live, sampled at the query instant itself.
             SeedSampleRow {
+                org_id: String::new(),
                 fingerprint: 1,
                 unix_milli: recent_bucket,
                 value: 1.0,
@@ -286,12 +289,14 @@ async fn count_by_job_up_is_lookback_correct_and_excludes_a_silent_series() {
             // lookback of this instant" case the removed cache-only path
             // got wrong. Must be excluded from the count.
             SeedSampleRow {
+                org_id: String::new(),
                 fingerprint: 2,
                 unix_milli: recent_bucket - (DEFAULT_LOOKBACK_MS + 60_000),
                 value: 1.0,
             },
             // fp3 (job=web): live.
             SeedSampleRow {
+                org_id: String::new(),
                 fingerprint: 3,
                 unix_milli: recent_bucket,
                 value: 1.0,
@@ -315,7 +320,7 @@ async fn count_by_job_up_is_lookback_correct_and_excludes_a_silent_series() {
         step_ms: 0,
     };
     let (result, _annotations, explain) = engine
-        .query_explained(&expr, &params)
+        .query_explained(&no_tenant(), &expr, &params)
         .await
         .expect("query_explained");
     stage(&explain, "sample_fetch");
@@ -385,6 +390,7 @@ async fn bare_selector_query_keeps_metric_name_end_to_end() {
     seed_samples(
         &client,
         &[SeedSampleRow {
+            org_id: String::new(),
             fingerprint: 1,
             unix_milli: recent_bucket,
             value: 1.0,
@@ -406,7 +412,12 @@ async fn bare_selector_query_keeps_metric_name_end_to_end() {
         end_ms: recent_bucket,
         step_ms: 0,
     };
-    match engine.query(&expr, &params).await.expect("query").0 {
+    match engine
+        .query(&no_tenant(), &expr, &params)
+        .await
+        .expect("query")
+        .0
+    {
         QueryResult::Vector(v) => {
             assert_eq!(v.len(), 1);
             assert!(
@@ -421,7 +432,12 @@ async fn bare_selector_query_keeps_metric_name_end_to_end() {
 
     // Aggregation over the same data: drops __name__.
     let expr = parse("sum(up)").expect("parse");
-    match engine.query(&expr, &params).await.expect("query").0 {
+    match engine
+        .query(&no_tenant(), &expr, &params)
+        .await
+        .expect("query")
+        .0
+    {
         QueryResult::Vector(v) => {
             assert_eq!(v.len(), 1);
             assert!(
@@ -482,6 +498,7 @@ async fn count_by_job_up_historical_variant_routes_through_metric_series() {
     seed_samples(
         &client,
         &[SeedSampleRow {
+            org_id: String::new(),
             fingerprint: 4242,
             unix_milli: last_week_bucket,
             value: 1.0,
@@ -508,7 +525,10 @@ async fn count_by_job_up_historical_variant_routes_through_metric_series() {
         end_ms: last_week_bucket,
         step_ms: 0,
     };
-    let (result, _annotations) = engine.query(&expr, &params).await.expect("query");
+    let (result, _annotations) = engine
+        .query(&no_tenant(), &expr, &params)
+        .await
+        .expect("query");
     match result {
         QueryResult::Vector(v) => {
             assert_eq!(
@@ -575,6 +595,7 @@ async fn group_with_offset_routes_through_metric_series() {
     seed_samples(
         &client,
         &[SeedSampleRow {
+            org_id: String::new(),
             fingerprint: 777,
             unix_milli: two_days_ago_bucket,
             value: 1.0,
@@ -599,7 +620,10 @@ async fn group_with_offset_routes_through_metric_series() {
         end_ms: recent_bucket,
         step_ms: 0,
     };
-    let (result, _annotations) = engine.query(&expr, &params).await.expect("query");
+    let (result, _annotations) = engine
+        .query(&no_tenant(), &expr, &params)
+        .await
+        .expect("query");
     match result {
         QueryResult::Vector(v) => {
             assert_eq!(
@@ -679,31 +703,37 @@ async fn count_by_service_up_over_query_range_returns_a_matrix_not_a_vector() {
         &client,
         &[
             SeedSampleRow {
+                org_id: String::new(),
                 fingerprint: 10,
                 unix_milli: t0,
                 value: 1.0,
             },
             SeedSampleRow {
+                org_id: String::new(),
                 fingerprint: 10,
                 unix_milli: t1,
                 value: 1.0,
             },
             SeedSampleRow {
+                org_id: String::new(),
                 fingerprint: 10,
                 unix_milli: t2,
                 value: 1.0,
             },
             SeedSampleRow {
+                org_id: String::new(),
                 fingerprint: 11,
                 unix_milli: t0,
                 value: 1.0,
             },
             SeedSampleRow {
+                org_id: String::new(),
                 fingerprint: 11,
                 unix_milli: t1,
                 value: 1.0,
             },
             SeedSampleRow {
+                org_id: String::new(),
                 fingerprint: 11,
                 unix_milli: t2,
                 value: 1.0,
@@ -726,7 +756,10 @@ async fn count_by_service_up_over_query_range_returns_a_matrix_not_a_vector() {
         end_ms: t2,
         step_ms,
     };
-    let (result, _annotations) = engine.query(&expr, &params).await.expect("query");
+    let (result, _annotations) = engine
+        .query(&no_tenant(), &expr, &params)
+        .await
+        .expect("query");
     match result {
         QueryResult::Matrix(mut m) => {
             // `by (service)` splits into one group per distinct `service`
@@ -804,11 +837,13 @@ async fn count_by_service_routes_sample_fetch_for_both_instant_and_range() {
         &client,
         &[
             SeedSampleRow {
+                org_id: String::new(),
                 fingerprint: 20,
                 unix_milli: t0,
                 value: 1.0,
             },
             SeedSampleRow {
+                org_id: String::new(),
                 fingerprint: 20,
                 unix_milli: t1,
                 value: 1.0,
@@ -834,7 +869,7 @@ async fn count_by_service_routes_sample_fetch_for_both_instant_and_range() {
         step_ms: 0,
     };
     let (instant_result, _annotations, instant_explain) = engine
-        .query_explained(&expr, &instant_params)
+        .query_explained(&no_tenant(), &expr, &instant_params)
         .await
         .expect("instant query_explained");
     stage(&instant_explain, "sample_fetch");
@@ -861,7 +896,7 @@ async fn count_by_service_routes_sample_fetch_for_both_instant_and_range() {
         step_ms,
     };
     let (range_result, _annotations, range_explain) = engine
-        .query_explained(&expr, &range_params)
+        .query_explained(&no_tenant(), &expr, &range_params)
         .await
         .expect("range query_explained");
     stage(&range_explain, "sample_fetch");
@@ -949,6 +984,7 @@ async fn binary_expression_fetches_both_sides_concurrently() {
             });
             for t in 0..SAMPLES_PER_SERIES {
                 sample_rows.push(SeedSampleRow {
+                    org_id: String::new(),
                     fingerprint: u128::from(fp),
                     unix_milli: recent_bucket - t * 1_000,
                     value: t as f64,
@@ -987,7 +1023,7 @@ async fn binary_expression_fetches_both_sides_concurrently() {
     // connection, confounding the comparison with connection setup cost
     // rather than fetch concurrency.
     engine
-        .query(&both_expr, &params)
+        .query(&no_tenant(), &both_expr, &params)
         .await
         .expect("warm-up query");
 
@@ -1001,11 +1037,11 @@ async fn binary_expression_fetches_both_sides_concurrently() {
         // (A) Sequential: two independent queries, one per metric.
         let seq_start = std::time::Instant::now();
         engine
-            .query(&foo_expr, &params)
+            .query(&no_tenant(), &foo_expr, &params)
             .await
             .expect("sequential foo query");
         engine
-            .query(&bar_expr, &params)
+            .query(&no_tenant(), &bar_expr, &params)
             .await
             .expect("sequential bar query");
         seq_trials.push(seq_start.elapsed());
@@ -1013,7 +1049,7 @@ async fn binary_expression_fetches_both_sides_concurrently() {
         // (B) Concurrent: one query whose two selectors fetch via `join_all`.
         let concurrent_start = std::time::Instant::now();
         engine
-            .query(&both_expr, &params)
+            .query(&no_tenant(), &both_expr, &params)
             .await
             .expect("concurrent binop query");
         concurrent_trials.push(concurrent_start.elapsed());
@@ -1046,20 +1082,22 @@ async fn binary_expression_fetches_both_sides_concurrently() {
     let probe_engine = MetricsEngine::new(probe_client, Arc::clone(&cache), engine_config(db))
         .with_fetch_probe(Arc::clone(&probe));
 
-    let (query_res, rendezvous) = tokio::join!(probe_engine.query(&both_expr, &params), async {
-        let seen = tokio::time::timeout(Duration::from_secs(30), async {
-            while probe.in_flight() < 2 {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
-        .await;
-        // ALWAYS release, even on a rendezvous timeout, so a mutated
-        // (sequential-fetch) engine's query still completes and fails at
-        // the assertion below instead of hanging forever on a parked
-        // fetch.
-        probe.release();
-        seen
-    });
+    let tenant = no_tenant();
+    let (query_res, rendezvous) =
+        tokio::join!(probe_engine.query(&tenant, &both_expr, &params), async {
+            let seen = tokio::time::timeout(Duration::from_secs(30), async {
+                while probe.in_flight() < 2 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await;
+            // ALWAYS release, even on a rendezvous timeout, so a mutated
+            // (sequential-fetch) engine's query still completes and fails at
+            // the assertion below instead of hanging forever on a parked
+            // fetch.
+            probe.release();
+            seen
+        });
     query_res.expect("binop query under probe");
     assert!(
         rendezvous.is_ok(),
@@ -1121,11 +1159,13 @@ async fn rate_end_to_end_against_real_samples() {
         &client,
         &[
             SeedSampleRow {
+                org_id: String::new(),
                 fingerprint: 55,
                 unix_milli: recent_bucket - 59_999,
                 value: 0.0,
             },
             SeedSampleRow {
+                org_id: String::new(),
                 fingerprint: 55,
                 unix_milli: recent_bucket,
                 value: 60.0,
@@ -1147,7 +1187,10 @@ async fn rate_end_to_end_against_real_samples() {
         end_ms: recent_bucket,
         step_ms: 0,
     };
-    let (result, _annotations) = engine.query(&expr, &params).await.expect("query");
+    let (result, _annotations) = engine
+        .query(&no_tenant(), &expr, &params)
+        .await
+        .expect("query");
     match result {
         QueryResult::Vector(v) => {
             assert_eq!(v.len(), 1);
@@ -1201,7 +1244,7 @@ async fn experimental_function_gate_applies_at_the_engine_query_boundary() {
     // Flag off (engine_config's default): a named rejection.
     let off_engine = MetricsEngine::new(off_client, Arc::clone(&cache), engine_config(db));
     let err = off_engine
-        .query(&expr, &params)
+        .query(&no_tenant(), &expr, &params)
         .await
         .expect_err("max_of must be rejected with the flag off");
     let msg = err.to_string();
@@ -1223,7 +1266,7 @@ async fn experimental_function_gate_applies_at_the_engine_query_boundary() {
         },
     );
     let (result, _annotations, explain) = on_engine
-        .query_explained(&expr, &params)
+        .query_explained(&no_tenant(), &expr, &params)
         .await
         .expect("max_of must evaluate with the flag on");
     match result {
@@ -1278,6 +1321,7 @@ async fn info_cardinality_cap_rejects_over_cap_before_materialization() {
     let info_samples: Vec<SeedSampleRow> = info_series
         .iter()
         .map(|s| SeedSampleRow {
+            org_id: String::new(),
             fingerprint: s.fingerprint,
             unix_milli: now,
             value: 1.0,
@@ -1295,6 +1339,7 @@ async fn info_cardinality_cap_rejects_over_cap_before_materialization() {
     seed_samples(
         &cache_client,
         &[SeedSampleRow {
+            org_id: String::new(),
             fingerprint: base.fingerprint,
             unix_milli: now,
             value: 1.0,
@@ -1328,7 +1373,7 @@ async fn info_cardinality_cap_rejects_over_cap_before_materialization() {
         step_ms: 0,
     };
     let err = engine
-        .query(&expr, &params)
+        .query(&no_tenant(), &expr, &params)
         .await
         .expect_err("3 target_info series over a cap of 2 must be rejected");
     let msg = err.to_string();
@@ -1386,6 +1431,7 @@ async fn info_cardinality_cap_rejects_over_cap_on_the_degraded_sql_fallback_path
     let info_samples: Vec<SeedSampleRow> = info_series
         .iter()
         .map(|s| SeedSampleRow {
+            org_id: String::new(),
             fingerprint: s.fingerprint,
             unix_milli: last_week_bucket,
             value: 1.0,
@@ -1403,6 +1449,7 @@ async fn info_cardinality_cap_rejects_over_cap_on_the_degraded_sql_fallback_path
     seed_samples(
         &client,
         &[SeedSampleRow {
+            org_id: String::new(),
             fingerprint: base.fingerprint,
             unix_milli: last_week_bucket,
             value: 1.0,
@@ -1437,7 +1484,7 @@ async fn info_cardinality_cap_rejects_over_cap_on_the_degraded_sql_fallback_path
         step_ms: 0,
     };
     let err = engine
-        .query(&expr, &params)
+        .query(&no_tenant(), &expr, &params)
         .await
         .expect_err("3 target_info series over a cap of 2 must be rejected (degraded path)");
     let msg = err.to_string();
@@ -1498,6 +1545,7 @@ async fn sample_budget_rejects_over_cap_fetch_and_admits_exactly_at_cap() {
     // window ending at b0 + 4s.
     let samples: Vec<SeedSampleRow> = (0..5i64)
         .map(|i| SeedSampleRow {
+            org_id: String::new(),
             fingerprint: series.fingerprint,
             unix_milli: b0 + i * 1_000,
             value: i as f64,
@@ -1534,7 +1582,7 @@ async fn sample_budget_rejects_over_cap_fetch_and_admits_exactly_at_cap() {
         },
     );
     let err = capped_engine
-        .query(&expr, &params)
+        .query(&no_tenant(), &expr, &params)
         .await
         .expect_err("5 fetched sample rows over a budget of 4 must be rejected");
     let msg = err.to_string();
@@ -1561,7 +1609,7 @@ async fn sample_budget_rejects_over_cap_fetch_and_admits_exactly_at_cap() {
         },
     );
     let (result, _annotations) = at_cap_engine
-        .query(&expr, &params)
+        .query(&no_tenant(), &expr, &params)
         .await
         .expect("exactly-cap (5 rows, budget 5) must succeed");
     match result {
@@ -1634,6 +1682,7 @@ async fn info_cardinality_probe_counts_distinct_series_not_activity_bucket_rows(
                 labels: format!(r#"{{"instance":"i{i}","job":"j","data":"d{i}"}}"#),
             });
             samples.push(SeedSampleRow {
+                org_id: String::new(),
                 fingerprint: u128::from(fp),
                 unix_milli: t,
                 value: 1.0,
@@ -1655,6 +1704,7 @@ async fn info_cardinality_probe_counts_distinct_series_not_activity_bucket_rows(
     .await;
     for &t in &buckets {
         samples.push(SeedSampleRow {
+            org_id: String::new(),
             fingerprint: base_fp,
             unix_milli: t,
             value: 1.0,
@@ -1690,7 +1740,7 @@ async fn info_cardinality_probe_counts_distinct_series_not_activity_bucket_rows(
         end_ms: b0 + 2 * bucket,
         step_ms: bucket,
     };
-    let (result, _annotations) = engine.query(&expr, &params).await.expect(
+    let (result, _annotations) = engine.query(&no_tenant(), &expr, &params).await.expect(
         "2 distinct series across 3 activity buckets (6 raw rows) must NOT trip the cap of 2",
     );
     match result {
@@ -1747,7 +1797,7 @@ async fn time_only_query_shapes_execute_with_zero_fetch_stages() {
     // time() -> the eval time in seconds, as a scalar.
     let expr = parse("time()").expect("parse");
     let (result, _annotations, explain) = engine
-        .query_explained(&expr, &params)
+        .query_explained(&no_tenant(), &expr, &params)
         .await
         .expect("time() query");
     match result {
@@ -1767,7 +1817,7 @@ async fn time_only_query_shapes_execute_with_zero_fetch_stages() {
     // (no __name__ spliced back in), same zero-fetch story.
     let expr = parse("vector(time())").expect("parse");
     let (result, _annotations, explain) = engine
-        .query_explained(&expr, &params)
+        .query_explained(&no_tenant(), &expr, &params)
         .await
         .expect("vector(time()) query");
     match result {
@@ -1836,6 +1886,7 @@ async fn explain_carries_the_real_generated_sample_fetch_sql() {
     seed_samples(
         &client,
         &[SeedSampleRow {
+            org_id: String::new(),
             fingerprint: 1,
             unix_milli: recent_bucket,
             value: 1.0,
@@ -1861,7 +1912,7 @@ async fn explain_carries_the_real_generated_sample_fetch_sql() {
     // in-window) cache.
     let expr = parse("sum(up)").expect("parse");
     let (_, _annotations, explain) = engine
-        .query_explained(&expr, &params)
+        .query_explained(&no_tenant(), &expr, &params)
         .await
         .expect("query_explained");
     let fetch_stage = stage(&explain, "sample_fetch");
@@ -1918,6 +1969,7 @@ async fn every_fetch_path_sends_both_reads_at_once() {
                 labels: r#"{"job":"api"}"#.to_string(),
             });
             samples.push(SeedSampleRow {
+                org_id: String::new(),
                 fingerprint: fp,
                 unix_milli: at,
                 value: 1.0,
@@ -1956,7 +2008,7 @@ async fn every_fetch_path_sends_both_reads_at_once() {
             step_ms: 0,
         };
         let (_, _, explain) = engine
-            .query_explained(&parse(query).expect("parse"), &params)
+            .query_explained(&no_tenant(), &parse(query).expect("parse"), &params)
             .await
             .unwrap_or_else(|e| panic!("{path}: {e}"));
         // The path taken: only the fallback's fetch nests the activity
@@ -2026,6 +2078,7 @@ async fn explain_carries_the_fallback_subquery_sample_fetch_sql() {
     seed_samples(
         &client,
         &[SeedSampleRow {
+            org_id: String::new(),
             fingerprint: 1,
             unix_milli: historical_bucket,
             value: 1.0,
@@ -2049,7 +2102,7 @@ async fn explain_carries_the_fallback_subquery_sample_fetch_sql() {
 
     let expr = parse("sum(up)").expect("parse");
     let (_, _annotations, explain) = engine
-        .query_explained(&expr, &params)
+        .query_explained(&no_tenant(), &expr, &params)
         .await
         .expect("query_explained");
     let fetch_stage = stage(&explain, "sample_fetch");
@@ -2073,6 +2126,7 @@ async fn explain_carries_the_fallback_subquery_sample_fetch_sql() {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedMetadataRow {
+    org_id: String,
     metric_name: String,
     metric_type: String,
     help: String,
@@ -2149,7 +2203,7 @@ async fn discovery_endpoints_honor_the_query_window_and_include_name() {
     // Both fingerprints are cache-resident (proving the leak-check below is
     // meaningful: the cache's own superset genuinely contains the older,
     // out-of-window series).
-    assert_eq!(cache.tsdb_snapshot().num_series, 2);
+    assert_eq!(cache.tsdb_snapshot(&no_tenant(),).num_series, 2);
 
     let engine = MetricsEngine::new(engine_client, cache, engine_config(db));
     let window = DataWindow {
@@ -2162,7 +2216,10 @@ async fn discovery_endpoints_honor_the_query_window_and_include_name() {
         matchers: vec![],
     }];
 
-    let series = engine.series(&filters, window).await.expect("series");
+    let series = engine
+        .series(&no_tenant(), &filters, window)
+        .await
+        .expect("series");
     assert_eq!(
         series.len(),
         1,
@@ -2172,20 +2229,20 @@ async fn discovery_endpoints_honor_the_query_window_and_include_name() {
     assert!(series[0].contains(&("job".to_string(), "api".to_string())));
 
     let names = engine
-        .label_names(&filters, window)
+        .label_names(&no_tenant(), &filters, window)
         .await
         .expect("label_names");
     assert!(names.contains(&"__name__".to_string()));
     assert!(names.contains(&"job".to_string()));
 
     let values = engine
-        .label_values("job", &filters, window)
+        .label_values(&no_tenant(), "job", &filters, window)
         .await
         .expect("label_values");
     assert_eq!(values, vec!["api".to_string()]);
 
     let name_values = engine
-        .label_values("__name__", &filters, window)
+        .label_values(&no_tenant(), "__name__", &filters, window)
         .await
         .expect("label_values(__name__)");
     assert_eq!(name_values, vec!["up".to_string()]);
@@ -2198,7 +2255,7 @@ async fn discovery_endpoints_honor_the_query_window_and_include_name() {
         end_ms: recent_bucket,
     };
     let wide_series = engine
-        .series(&filters, wide_window)
+        .series(&no_tenant(), &filters, wide_window)
         .await
         .expect("series (wide window)");
     assert_eq!(wide_series.len(), 2);
@@ -2301,6 +2358,7 @@ async fn an_re2_rejected_matcher_regex_is_a_client_rejection_not_a_server_error(
     seed_samples(
         &client,
         &[SeedSampleRow {
+            org_id: String::new(),
             fingerprint: 1,
             unix_milli: old_bucket,
             value: 1.0,
@@ -2375,19 +2433,22 @@ async fn an_re2_rejected_matcher_regex_is_a_client_rejection_not_a_server_error(
     };
 
     expect_rejection(
-        engine.series(&filters, window).await.expect_err("series"),
+        engine
+            .series(&no_tenant(), &filters, window)
+            .await
+            .expect_err("series"),
         "series",
     );
     expect_rejection(
         engine
-            .label_names(&filters, window)
+            .label_names(&no_tenant(), &filters, window)
             .await
             .expect_err("label_names"),
         "label_names",
     );
     expect_rejection(
         engine
-            .label_values("job", &filters, window)
+            .label_values(&no_tenant(), "job", &filters, window)
             .await
             .expect_err("label_values"),
         "label_values",
@@ -2401,7 +2462,10 @@ async fn an_re2_rejected_matcher_regex_is_a_client_rejection_not_a_server_error(
         step_ms: 0,
     };
     expect_rejection(
-        engine.query(&expr, &params).await.expect_err("query"),
+        engine
+            .query(&no_tenant(), &expr, &params)
+            .await
+            .expect_err("query"),
         "query",
     );
 
@@ -2421,7 +2485,7 @@ async fn an_re2_rejected_matcher_regex_is_a_client_rejection_not_a_server_error(
         matchers: c_matchers,
     }];
     let control = engine
-        .series(&control_filters, window)
+        .series(&no_tenant(), &control_filters, window)
         .await
         .expect("an RE2-valid pattern must still be answered, not rejected");
     assert!(
@@ -2429,7 +2493,7 @@ async fn an_re2_rejected_matcher_regex_is_a_client_rejection_not_a_server_error(
         "`a{{bbb}}c` matches no seeded job, but the query must SUCCEED: {control:?}"
     );
     engine
-        .query(&control_expr, &params)
+        .query(&no_tenant(), &control_expr, &params)
         .await
         .expect("an RE2-valid pattern must still be answered on the query path too");
 
@@ -2500,6 +2564,7 @@ async fn a_warm_cache_does_not_answer_an_re2_rejected_matcher_in_process() {
     seed_samples(
         &client,
         &[SeedSampleRow {
+            org_id: String::new(),
             fingerprint: 1,
             unix_milli: recent_bucket,
             value: 1.0,
@@ -2550,7 +2615,10 @@ async fn a_warm_cache_does_not_answer_an_re2_rejected_matcher_in_process() {
     }
 
     let expr = parse(&format!(r#"up{{job=~"\{RE2_REJECTED}"}}"#)).expect("parse");
-    expect_re2_rejection(engine.query(&expr, &params).await, "warm cache, in-process");
+    expect_re2_rejection(
+        engine.query(&no_tenant(), &expr, &params).await,
+        "warm cache, in-process",
+    );
 
     // The metric-absent selector: warm cache vs the degraded path must
     // agree. The degraded path is reached with a window reaching back
@@ -2569,8 +2637,8 @@ async fn a_warm_cache_does_not_answer_an_re2_rejected_matcher_in_process() {
         end_ms: recent_bucket - 2 * 24 * 3_600_000,
         step_ms: 0,
     };
-    let warm = engine.query(&absent, &params).await;
-    let degraded = engine.query(&absent, &degraded_params).await;
+    let warm = engine.query(&no_tenant(), &absent, &params).await;
+    let degraded = engine.query(&no_tenant(), &absent, &degraded_params).await;
     assert_eq!(
         format!("{warm:?}"),
         format!("{degraded:?}"),
@@ -2586,9 +2654,12 @@ async fn a_warm_cache_does_not_answer_an_re2_rejected_matcher_in_process() {
     for pattern in ["ap.*", "api|web", "a{bbb}c", ".+"] {
         let expr = parse(&format!(r#"absent_metric{{job=~"{pattern}"}}"#)).expect("parse");
         for (label, p) in [("warm", &params), ("degraded", &degraded_params)] {
-            engine.query(&expr, p).await.unwrap_or_else(|e| {
-                panic!("{label}: {pattern:?} is RE2-valid and must answer, got {e:?}")
-            });
+            engine
+                .query(&no_tenant(), &expr, p)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("{label}: {pattern:?} is RE2-valid and must answer, got {e:?}")
+                });
         }
     }
 
@@ -2604,7 +2675,7 @@ async fn a_warm_cache_does_not_answer_an_re2_rejected_matcher_in_process() {
     for pattern in [RE2_ACCEPTED, "ap.*", "api|web"] {
         let expr = parse(&format!(r#"up{{job=~"{pattern}"}}"#)).expect("parse (control)");
         engine
-            .query(&expr, &params)
+            .query(&no_tenant(), &expr, &params)
             .await
             .unwrap_or_else(|e| panic!("{pattern}: an RE2-valid pattern must answer, got {e:?}"));
     }
@@ -2669,7 +2740,7 @@ async fn label_names_with_no_filters_covers_every_metric_in_window() {
     };
 
     let names = engine
-        .label_names(&[], window)
+        .label_names(&no_tenant(), &[], window)
         .await
         .expect("label_names (unfiltered)");
     assert!(names.contains(&"__name__".to_string()));
@@ -2677,7 +2748,7 @@ async fn label_names_with_no_filters_covers_every_metric_in_window() {
     assert!(names.contains(&"status".to_string()));
 
     let metric_names = engine
-        .label_values("__name__", &[], window)
+        .label_values(&no_tenant(), "__name__", &[], window)
         .await
         .expect("label_values(__name__) (unfiltered)");
     assert_eq!(
@@ -2752,7 +2823,10 @@ async fn series_applies_regex_matchers() {
         }],
     }];
 
-    let series = engine.series(&filters, window).await.expect("series");
+    let series = engine
+        .series(&no_tenant(), &filters, window)
+        .await
+        .expect("series");
     assert_eq!(series.len(), 1);
     assert!(series[0].contains(&("status".to_string(), "500".to_string())));
 
@@ -2833,7 +2907,10 @@ async fn series_with_a_matcher_only_filter_matches_across_metric_names() {
         }],
     }];
 
-    let series = engine.series(&filters, window).await.expect("series");
+    let series = engine
+        .series(&no_tenant(), &filters, window)
+        .await
+        .expect("series");
     let names: Vec<&str> = series
         .iter()
         .map(|pairs| {
@@ -2886,6 +2963,7 @@ async fn metadata_collapses_to_the_latest_write() {
         &client,
         &[
             SeedMetadataRow {
+                org_id: String::new(),
                 metric_name: "up".to_string(),
                 metric_type: "gauge".to_string(),
                 help: "old help".to_string(),
@@ -2893,6 +2971,7 @@ async fn metadata_collapses_to_the_latest_write() {
                 updated_ns: 1_000,
             },
             SeedMetadataRow {
+                org_id: String::new(),
                 metric_name: "up".to_string(),
                 metric_type: "gauge".to_string(),
                 help: "1 if the target is healthy".to_string(),
@@ -2900,6 +2979,7 @@ async fn metadata_collapses_to_the_latest_write() {
                 updated_ns: 2_000,
             },
             SeedMetadataRow {
+                org_id: String::new(),
                 metric_name: "http_requests_total".to_string(),
                 metric_type: "counter".to_string(),
                 help: "total requests".to_string(),
@@ -2917,7 +2997,10 @@ async fn metadata_collapses_to_the_latest_write() {
     cache.refresh().await.expect("refresh");
     let engine = MetricsEngine::new(engine_client, cache, engine_config(db));
 
-    let all = engine.metadata(None, None).await.expect("metadata (all)");
+    let all = engine
+        .metadata(&no_tenant(), None, None)
+        .await
+        .expect("metadata (all)");
     assert_eq!(all.len(), 2);
     let up = all.iter().find(|m| m.name == "up").expect("up metadata");
     assert_eq!(
@@ -2926,7 +3009,7 @@ async fn metadata_collapses_to_the_latest_write() {
     );
 
     let scoped = engine
-        .metadata(Some("http_requests_total"), None)
+        .metadata(&no_tenant(), Some("http_requests_total"), None)
         .await
         .expect("metadata (scoped)");
     assert_eq!(scoped.len(), 1);
@@ -2934,7 +3017,7 @@ async fn metadata_collapses_to_the_latest_write() {
     assert_eq!(scoped[0].unit, "requests");
 
     let limited = engine
-        .metadata(None, Some(1))
+        .metadata(&no_tenant(), None, Some(1))
         .await
         .expect("metadata (limited)");
     assert_eq!(limited.len(), 1);
@@ -2975,6 +3058,7 @@ async fn a_tie_on_updated_ns_serves_one_whole_descriptor() {
         &client,
         &[
             SeedMetadataRow {
+                org_id: String::new(),
                 metric_name: "up".to_string(),
                 metric_type: "gauge".to_string(),
                 help: "help a".to_string(),
@@ -2982,6 +3066,7 @@ async fn a_tie_on_updated_ns_serves_one_whole_descriptor() {
                 updated_ns: 3_000,
             },
             SeedMetadataRow {
+                org_id: String::new(),
                 metric_name: "up".to_string(),
                 metric_type: "counter".to_string(),
                 help: "help b".to_string(),
@@ -3000,7 +3085,7 @@ async fn a_tie_on_updated_ns_serves_one_whole_descriptor() {
     let engine = MetricsEngine::new(engine_client, cache, engine_config(db));
 
     let rows = engine
-        .metadata(Some("up"), None)
+        .metadata(&no_tenant(), Some("up"), None)
         .await
         .expect("metadata (tied)");
     assert_eq!(rows.len(), 1, "one descriptor per name");
@@ -3072,7 +3157,7 @@ async fn tsdb_status_reports_series_counts_with_zero_sample_table_access() {
     cache.refresh().await.expect("refresh");
     let engine = MetricsEngine::new(engine_client, cache, engine_config(db));
 
-    let status = engine.tsdb_status().await.expect("tsdb_status");
+    let status = engine.tsdb_status(&no_tenant()).await.expect("tsdb_status");
     assert_eq!(status.num_series, 2);
     assert_eq!(
         status.series_count_by_metric_name,
@@ -3149,16 +3234,19 @@ async fn nameless_selector_fans_out_with_per_series_names_and_one_flat_in_set_fe
         &client,
         &[
             SeedSampleRow {
+                org_id: String::new(),
                 fingerprint: 1,
                 unix_milli: recent_bucket,
                 value: 11.0,
             },
             SeedSampleRow {
+                org_id: String::new(),
                 fingerprint: 3,
                 unix_milli: recent_bucket,
                 value: 22.0,
             },
             SeedSampleRow {
+                org_id: String::new(),
                 fingerprint: 2,
                 unix_milli: recent_bucket,
                 value: 99.0,
@@ -3182,7 +3270,7 @@ async fn nameless_selector_fans_out_with_per_series_names_and_one_flat_in_set_fe
         step_ms: 0,
     };
     let (result, _annotations, explain) = engine
-        .query_explained(&expr, &params)
+        .query_explained(&no_tenant(), &expr, &params)
         .await
         .expect("query_explained");
 
@@ -3246,7 +3334,7 @@ async fn nameless_selector_fans_out_with_per_series_names_and_one_flat_in_set_fe
         },
     );
     let err = capped_engine
-        .query(&expr, &params)
+        .query(&no_tenant(), &expr, &params)
         .await
         .expect_err("fan-out above the cap must be rejected");
     let msg = err.to_string();
@@ -3318,6 +3406,7 @@ async fn dual_read_merges_and_decodes_histogram_samples_end_to_end() {
     seed_samples(
         &client,
         &[SeedSampleRow {
+            org_id: String::new(),
             fingerprint: 1,
             unix_milli: recent_bucket,
             value: 42.0,
@@ -3327,6 +3416,7 @@ async fn dual_read_merges_and_decodes_histogram_samples_end_to_end() {
     seed_hist_samples(
         &client,
         &[SeedHistRow {
+            org_id: String::new(),
             fingerprint: 2,
             unix_milli: recent_bucket,
             schema: 0,
@@ -3362,7 +3452,7 @@ async fn dual_read_merges_and_decodes_histogram_samples_end_to_end() {
     // The float metric converts unchanged (dual-read's complementary hist
     // read is empty for `up`).
     let (float, _annotations) = engine
-        .query(&parse("up").expect("parse"), &params)
+        .query(&no_tenant(), &parse("up").expect("parse"), &params)
         .await
         .expect("float query ok");
     match float {
@@ -3379,7 +3469,7 @@ async fn dual_read_merges_and_decodes_histogram_samples_end_to_end() {
     // `HistogramResultUnsupported` reject: proves the hist row was
     // dual-read, merged, decoded, and `to_float`'d end to end.
     let (hist_instant, _annotations) = engine
-        .query(&parse("req_seconds").expect("parse"), &params)
+        .query(&no_tenant(), &parse("req_seconds").expect("parse"), &params)
         .await
         .expect("histogram instant query ok");
     match hist_instant {
@@ -3412,7 +3502,11 @@ async fn dual_read_merges_and_decodes_histogram_samples_end_to_end() {
         step_ms: 60_000,
     };
     let (hist_range, _annotations) = engine
-        .query(&parse("req_seconds").expect("parse"), &range_params)
+        .query(
+            &no_tenant(),
+            &parse("req_seconds").expect("parse"),
+            &range_params,
+        )
         .await
         .expect("histogram range query ok");
     match hist_range {
@@ -3497,6 +3591,7 @@ async fn a_nameless_selector_with_an_uncompilable_matcher_is_bad_data_not_execut
     seed_samples(
         &client,
         &[SeedSampleRow {
+            org_id: String::new(),
             fingerprint: 1,
             unix_milli: recent_bucket,
             value: 1.0,
@@ -3541,6 +3636,7 @@ async fn a_nameless_selector_with_an_uncompilable_matcher_is_bad_data_not_execut
     expect_bad_data(
         engine
             .query(
+                &no_tenant(),
                 &parse(&format!(r#"{{__name__=~"up.*",job=~"{INVALID}"}}"#)).expect("parse"),
                 &warm,
             )
@@ -3552,6 +3648,7 @@ async fn a_nameless_selector_with_an_uncompilable_matcher_is_bad_data_not_execut
     expect_bad_data(
         engine
             .query(
+                &no_tenant(),
                 &parse(&format!(r#"{{__name__=~"nothing.*",job=~"{INVALID}"}}"#)).expect("parse"),
                 &warm,
             )
@@ -3564,6 +3661,7 @@ async fn a_nameless_selector_with_an_uncompilable_matcher_is_bad_data_not_execut
     expect_bad_data(
         engine
             .query(
+                &no_tenant(),
                 &parse(&format!(r#"{{__name__=~"{INVALID}"}}"#)).expect("parse"),
                 &warm,
             )
@@ -3573,6 +3671,7 @@ async fn a_nameless_selector_with_an_uncompilable_matcher_is_bad_data_not_execut
     expect_bad_data(
         engine
             .query(
+                &no_tenant(),
                 &parse(&format!(r#"{{__name__=~"up.*",job=~"{INVALID}"}}"#)).expect("parse"),
                 &out_of_window,
             )
@@ -3586,6 +3685,7 @@ async fn a_nameless_selector_with_an_uncompilable_matcher_is_bad_data_not_execut
     expect_bad_data(
         engine
             .query(
+                &no_tenant(),
                 &parse(&format!(r#"{{__name__="up",__name__=~"{INVALID}"}}"#)).expect("parse"),
                 &warm,
             )
@@ -3610,13 +3710,17 @@ async fn a_nameless_selector_with_an_uncompilable_matcher_is_bad_data_not_execut
         start_ms: recent_bucket,
         end_ms: recent_bucket,
     };
-    expect_bad_data(engine.series(&filters, window).await, "series");
+    expect_bad_data(
+        engine.series(&no_tenant(), &filters, window).await,
+        "series",
+    );
 
     // Boundary: SCREENED is not INVALID. `\p{Alphabetic}` compiles here and
     // only RE2 can say whether it is valid, so this path — which cannot ask
     // — keeps its named `422` rather than inventing a rejection.
     match engine
         .query(
+            &no_tenant(),
             &parse(r#"{__name__=~"up.*",job=~"\\p{Alphabetic}"}"#).expect("parse"),
             &warm,
         )
@@ -3631,7 +3735,11 @@ async fn a_nameless_selector_with_an_uncompilable_matcher_is_bad_data_not_execut
     // Controls: valid name-less selectors still answer.
     for selector in [r#"{__name__=~"up.*"}"#, r#"{__name__=~"up",job=~"ap.*"}"#] {
         engine
-            .query(&parse(selector).expect("parse (control)"), &warm)
+            .query(
+                &no_tenant(),
+                &parse(selector).expect("parse (control)"),
+                &warm,
+            )
             .await
             .unwrap_or_else(|e| panic!("{selector}: a valid selector must answer, got {e:?}"));
     }
@@ -3756,6 +3864,7 @@ async fn selector_regex_matches_prometheus_on_cold_and_warm_resolution() {
         .iter()
         .enumerate()
         .map(|(i, (_, v))| SeedSampleRow {
+            org_id: String::new(),
             fingerprint: u128::from(i as u64 + 1),
             unix_milli: recent_bucket,
             value: *v,
@@ -3801,7 +3910,7 @@ async fn selector_regex_matches_prometheus_on_cold_and_warm_resolution() {
         for (query, want) in p278_expectations() {
             let expr = parse(query).unwrap_or_else(|e| panic!("parse {query}: {e}"));
             let (result, _annotations, explain) = engine
-                .query_explained(&expr, &params)
+                .query_explained(&no_tenant(), &expr, &params)
                 .await
                 .unwrap_or_else(|e| panic!("[{leg}] {query}: {e}"));
 
@@ -4093,11 +4202,11 @@ async fn label_values_name_equals_the_wide_discovery_paths_name_set() {
     let mut answers: Vec<Vec<String>> = Vec::new();
     for (what, filters) in &cases {
         let narrow = engine
-            .label_values("__name__", filters, window)
+            .label_values(&no_tenant(), "__name__", filters, window)
             .await
             .unwrap_or_else(|e| panic!("label_values(__name__) for {what}: {e}"));
         let wide_series = engine
-            .series(filters, window)
+            .series(&no_tenant(), filters, window)
             .await
             .unwrap_or_else(|e| panic!("series for {what}: {e}"));
         let mut wide: Vec<String> = wide_series
@@ -4166,6 +4275,7 @@ async fn label_values_name_equals_the_wide_discovery_paths_name_set() {
 /// and its own label row in `metric_labels`.
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedActivityRow {
+    org_id: String,
     day: u16,
     fingerprint: u128,
     metric_name: String,
@@ -4174,6 +4284,7 @@ struct SeedActivityRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedLabelRow {
+    org_id: String,
     metric_name: String,
     fingerprint: u128,
     labels: String,
@@ -4186,6 +4297,7 @@ async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
     let activity: Vec<SeedActivityRow> = rows
         .iter()
         .map(|r| SeedActivityRow {
+            org_id: String::new(),
             day: r.unix_milli.div_euclid(86_400_000) as u16,
             fingerprint: r.fingerprint,
             metric_name: r.metric_name.clone(),
@@ -4195,6 +4307,7 @@ async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
     let labels: Vec<SeedLabelRow> = rows
         .iter()
         .map(|r| SeedLabelRow {
+            org_id: String::new(),
             metric_name: r.metric_name.clone(),
             fingerprint: r.fingerprint,
             labels: r.labels.clone(),
@@ -4220,6 +4333,7 @@ async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
         for (key, value) in map {
             pairs.insert((key.clone(), value.clone()));
             index.push(SeedIndexRow {
+                org_id: String::new(),
                 key,
                 value,
                 fingerprint: r.fingerprint,
@@ -4228,7 +4342,11 @@ async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
     }
     let values: Vec<SeedValueRow> = pairs
         .into_iter()
-        .map(|(key, value)| SeedValueRow { key, value })
+        .map(|(key, value)| SeedValueRow {
+            org_id: String::new(),
+            key,
+            value,
+        })
         .collect();
     client
         .insert_block("metric_label_index", &index)
@@ -4242,6 +4360,7 @@ async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedIndexRow {
+    org_id: String,
     key: String,
     value: String,
     fingerprint: u128,
@@ -4249,6 +4368,13 @@ struct SeedIndexRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedValueRow {
+    org_id: String,
     key: String,
     value: String,
+}
+
+/// The single-tenant deployment's tenant: no `X-Scope-OrgID`.
+#[allow(dead_code)]
+fn no_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("no header is the empty tenant")
 }

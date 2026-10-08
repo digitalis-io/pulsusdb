@@ -149,10 +149,11 @@ const PINNED: &str = include_str!("golden/promql_statements.sha256");
 
 /// The three constants published on issue #548 before the code existed;
 /// the line and byte counts re-taken by issue #623, whose sample statements
-/// carry no metric name, and again by issue #579 and its parts 2 and 3.
+/// carry no metric name, again by issue #579 and its parts 2 and 3, and by
+/// issue #635 part 4, whose statements each carry the tenant.
 const ENTRIES: usize = 30;
-const LINES: usize = 795;
-const BYTES: usize = 42_552;
+const LINES: usize = 801;
+const BYTES: usize = 43_648;
 /// The statements the writer's markers declare. Sixty before issue #549;
 /// four entries now send ONE statement where they sent two, and issue #579
 /// made it five.
@@ -271,6 +272,7 @@ fn render() -> String {
                         shape.op, shape.func, shape.grouping
                     ));
                     let ids_sql = metrics_sql::historical_series_subquery(
+                        &no_tenant(),
                         "metric_series",
                         "metric_labels",
                         name,
@@ -283,6 +285,7 @@ fn render() -> String {
                     emit(
                         &mut out,
                         &grouped_sql::range_aggregate_fetch(
+                            &no_tenant(),
                             SAMPLES,
                             HIST,
                             "metric_labels",
@@ -303,6 +306,7 @@ fn render() -> String {
                     emit(
                         &mut out,
                         &grouped_sql::grouped_fetch(
+                            &no_tenant(),
                             SAMPLES,
                             HIST,
                             &fps(),
@@ -315,20 +319,23 @@ fn render() -> String {
                     );
                 }
                 (_, Some(_)) => {
-                    emit(&mut out, &sample_sql::sample_fetch(SAMPLES, &fps(), lo, hi));
                     emit(
                         &mut out,
-                        &sample_sql::hist_sample_fetch(HIST, &fps(), lo, hi),
+                        &sample_sql::sample_fetch(&no_tenant(), SAMPLES, &fps(), lo, hi),
+                    );
+                    emit(
+                        &mut out,
+                        &sample_sql::hist_sample_fetch(&no_tenant(), HIST, &fps(), lo, hi),
                     );
                 }
                 (_, None) => {
                     emit(
                         &mut out,
-                        &sample_sql::sample_fetch_multi(SAMPLES, &fps(), lo, hi),
+                        &sample_sql::sample_fetch_multi(&no_tenant(), SAMPLES, &fps(), lo, hi),
                     );
                     emit(
                         &mut out,
-                        &sample_sql::hist_sample_fetch_multi(HIST, &fps(), lo, hi),
+                        &sample_sql::hist_sample_fetch_multi(&no_tenant(), HIST, &fps(), lo, hi),
                     );
                 }
             }
@@ -462,6 +469,7 @@ fn the_grouped_statement_in_schemas_md_is_the_one_the_builder_renders() {
         .expect("workspace root");
     let schemas = std::fs::read_to_string(root.join("docs/schemas.md")).expect("read schemas.md");
     let rendered = grouped_sql::grouped_fetch(
+        &no_tenant(),
         SAMPLES,
         HIST,
         &fps(),
@@ -565,4 +573,10 @@ fn zz_regenerate_golden() {
         format!("{digest:x}\n"),
     )
     .expect("write digest");
+}
+
+/// The single-tenant deployment's tenant: no `X-Scope-OrgID`.
+#[allow(dead_code)]
+fn no_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("no header is the empty tenant")
 }

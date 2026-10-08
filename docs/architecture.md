@@ -114,7 +114,7 @@ Label keys are part of the user-visible query surface *and* the fingerprint inpu
 
 ### 2.4 Tenancy
 
-v1 is **single-tenant**. One per-request escape hatch exists for routing: `X-Pulsus-Database` selects a target ClickHouse database. Retention is per-table configuration only — there is deliberately **no per-write TTL override** in v1 (row-level expiry columns would defeat whole-part TTL drops; one retention policy per database is the validatable baseline). A first-class org-ID tenancy layer is a deliberate non-goal until the single-tenant read path is proven.
+**Metrics are tenant-scoped; logs and traces stay single-tenant** (issue #635). A metrics request names its tenant in `X-Scope-OrgID` (no header is the empty tenant, the single-tenant deployment; 1 to 150 bytes of `[A-Za-z0-9_.-]` is a tenant; anything else is `400`). The value is stored as `org_id`, the first column of every metrics table's sorting key, every view copies it from `metric_landing`, and every metrics read carries `org_id = <tenant>` on every metrics table it names; the label cache is one per tenant in use. One per-request escape hatch exists for routing: `X-Pulsus-Database` selects a target ClickHouse database. Retention is per-table configuration only — there is deliberately **no per-write TTL override** in v1 (row-level expiry columns would defeat whole-part TTL drops; one retention policy per database is the validatable baseline).
 
 ---
 

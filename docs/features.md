@@ -178,7 +178,7 @@ and for the one performance cliff it introduces.
 | Alerting rules | stored/validated from M7 API; evaluation + notification delivery | post-1.0 |
 | Query explain | `X-Pulsus-Explain` returns planner SQL | M2 |
 
-**Explicit non-goals for 1.0:** multi-tenant org isolation, built-in UI, DuckDB or object-store backends other than via ClickHouse storage policies, Prometheus remote *read*.
+**Explicit non-goals for 1.0:** multi-tenant org isolation for logs and traces, built-in UI, DuckDB or object-store backends other than via ClickHouse storage policies, Prometheus remote *read*.
 
 ## 7. Milestones
 

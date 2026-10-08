@@ -919,6 +919,37 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// **T9 (issue #635 part 4): a failed push's audit record names its
+    /// tenant.** Every metrics landing row kind, carrying `tenant-a`, is
+    /// written to the spool as a failed block is; the record on disk holds
+    /// `"org_id": "tenant-a"` for each.
+    #[tokio::test]
+    async fn every_landing_row_kind_records_its_tenant() {
+        let dir = tempdir();
+        for (name, mut row) in landing_rows_of_every_kind() {
+            row.org_id = Arc::from("tenant-a");
+            let path = dir.join(format!("{name}.tenant.json"));
+            write_record(
+                &path,
+                "metric_landing",
+                "boom",
+                1_700_000_000_123_456_789,
+                &[row],
+            )
+            .await
+            .expect("the document is written");
+            let doc: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).expect("read the document back"))
+                    .expect("the document is JSON");
+            assert_eq!(
+                doc["rows"][0]["org_id"],
+                serde_json::json!("tenant-a"),
+                "the {name} row's audit record: {doc}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// **T40.** Each LOGS landing row kind streams the shape that kind
     /// declares. A row written field by field into the sink must put the same
     /// document on disk as the declared [`SpoolEncode::to_spool_value`] shape,
@@ -1336,18 +1367,45 @@ mod tests {
             },
         };
         vec![
-            ("float", MetricLandingRow::float_sample(5, &point)),
-            ("hist-empty", MetricLandingRow::hist_sample(5, &hist(0))),
-            ("hist-wide", MetricLandingRow::hist_sample(5, &hist(65_536))),
-            ("series", MetricLandingRow::series(5, &series, 3_600_000, 1)),
+            (
+                "float",
+                MetricLandingRow::float_sample(&std::sync::Arc::<str>::from(""), 5, &point),
+            ),
+            (
+                "hist-empty",
+                MetricLandingRow::hist_sample(&std::sync::Arc::<str>::from(""), 5, &hist(0)),
+            ),
+            (
+                "hist-wide",
+                MetricLandingRow::hist_sample(&std::sync::Arc::<str>::from(""), 5, &hist(65_536)),
+            ),
+            (
+                "series",
+                MetricLandingRow::series(
+                    &std::sync::Arc::<str>::from(""),
+                    5,
+                    &series,
+                    3_600_000,
+                    1,
+                ),
+            ),
             (
                 "series-long-labels",
-                MetricLandingRow::series(5, &long_series, 3_600_000, 1),
+                MetricLandingRow::series(
+                    &std::sync::Arc::<str>::from(""),
+                    5,
+                    &long_series,
+                    3_600_000,
+                    1,
+                ),
             ),
-            ("metadata", MetricLandingRow::metadata(5, &meta)),
+            (
+                "metadata",
+                MetricLandingRow::metadata(&std::sync::Arc::<str>::from(""), 5, &meta),
+            ),
             (
                 "metadata-long-text",
-                MetricLandingRow::metadata(5, &long_meta),
+                MetricLandingRow::metadata(&std::sync::Arc::<str>::from(""), 5, &long_meta),
             ),
         ]
     }

@@ -2196,23 +2196,25 @@ async fn seed_metric_series_472(
     for ddl in [
         format!(
             "CREATE TABLE {db}.{table} (\
+               org_id       LowCardinality(String), \
                day          Date, \
                fingerprint  UInt128  CODEC(ZSTD(1)), \
                metric_name  LowCardinality(String), \
                hours        SimpleAggregateFunction(groupBitOr, UInt32)\
              ) ENGINE = AggregatingMergeTree \
              PARTITION BY day \
-             ORDER BY fingerprint"
+             ORDER BY (org_id, fingerprint)"
         ),
         format!(
             "CREATE TABLE {db}.{labels} (\
+               org_id       LowCardinality(String), \
                metric_name  LowCardinality(String), \
                fingerprint  UInt128  CODEC(Delta(8), ZSTD(1)), \
                labels       String  CODEC(ZSTD(5)), \
                first_seen   SimpleAggregateFunction(min, Int64) CODEC(ZSTD(1)), \
                last_seen    SimpleAggregateFunction(max, Int64) CODEC(ZSTD(1))\
              ) ENGINE = AggregatingMergeTree \
-             ORDER BY (metric_name, fingerprint)"
+             ORDER BY (org_id, metric_name, fingerprint)"
         ),
         format!(
             "INSERT INTO {db}.{table} (day, fingerprint, metric_name, hours) \
@@ -2224,7 +2226,7 @@ async fn seed_metric_series_472(
              FROM numbers({SERIES_472})"
         ),
         format!(
-            "INSERT INTO {db}.{labels} \
+            "INSERT INTO {db}.{labels} (metric_name, fingerprint, labels, first_seen, last_seen) \
              SELECT concat('metric_', leftPad(toString(number % {NAMES_472}), 2, '0')), \
                     number + 1, \
                     concat('{{\"job\":\"api\",\"namespace\":\"ns-', toString(number % 13), \
@@ -2376,10 +2378,19 @@ async fn name_values_narrow_projection_reads_far_fewer_bytes_and_is_blob_invaria
     for (tag, table) in [("small", "series_small"), ("big", "series_big")] {
         let qualified = format!("{db}.{table}");
         let labels = format!("{db}.labels_{tag}");
-        let wide_sql =
-            pulsus_read::metrics::sql::discovery_query(&qualified, &labels, &filter, window);
+        let wide_sql = pulsus_read::metrics::sql::discovery_query(
+            &no_tenant(),
+            &qualified,
+            &labels,
+            &filter,
+            window,
+        );
         let narrow_sql = pulsus_read::metrics::sql::discovery_distinct_names_query(
-            &qualified, &labels, &filter, window,
+            &no_tenant(),
+            &qualified,
+            &labels,
+            &filter,
+            window,
         );
         let wide = run_name_projection::<pulsus_read::metrics::rows::SeriesRow>(
             &client,
@@ -9020,6 +9031,7 @@ async fn a_named_read_reads_its_metric() {
         (
             "statement 1",
             pulsus_read::metrics::sql::historical_series_subquery(
+                &no_tenant(),
                 "metric_series",
                 "metric_labels",
                 "m_q",
@@ -9031,6 +9043,7 @@ async fn a_named_read_reads_its_metric() {
         (
             "statement 2",
             pulsus_read::metrics::sql::discovery_query(
+                &no_tenant(),
                 "metric_series",
                 "metric_labels",
                 &filter,
@@ -9041,6 +9054,7 @@ async fn a_named_read_reads_its_metric() {
         (
             "statement 3",
             pulsus_read::metrics::sql::discovery_distinct_names_query(
+                &no_tenant(),
                 "metric_series",
                 "metric_labels",
                 &filter,
@@ -9124,6 +9138,7 @@ async fn a_metrics_samples_are_one_key_range() {
         .map(|s| series_id_623("m_7", s).sql_literal())
         .collect();
     let sql = pulsus_read::metrics::sample_sql::sample_fetch(
+        &no_tenant(),
         "metric_samples",
         &fps,
         day - 1,
@@ -9353,4 +9368,10 @@ async fn shape_a_sends_no_id_list() {
         }
     }
     h.finish().await;
+}
+
+/// The single-tenant deployment's tenant: no `X-Scope-OrgID`.
+#[allow(dead_code)]
+fn no_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("no header is the empty tenant")
 }

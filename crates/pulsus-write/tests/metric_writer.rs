@@ -501,7 +501,7 @@ async fn one_push_is_one_insert_into_the_landing_table() {
 
     let t0 = epoch_millis();
     let wait = writer
-        .admit_flush(batch, PushHeaders::default())
+        .admit_flush(&no_tenant(), batch, PushHeaders::default())
         .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(5), wait)
         .await
@@ -536,7 +536,11 @@ async fn one_push_is_one_insert_into_the_landing_table() {
     // A valid push with no rows of any kind: no block, no insert, a success.
     let before = writer.metrics().dedup.rollbacks_total;
     let wait = writer
-        .admit_flush(ParsedMetrics::default(), PushHeaders::default())
+        .admit_flush(
+            &no_tenant(),
+            ParsedMetrics::default(),
+            PushHeaders::default(),
+        )
         .expect("an empty push is admitted");
     tokio::time::timeout(Duration::from_secs(5), wait)
         .await
@@ -565,7 +569,11 @@ async fn two_pushes_are_two_inserts() {
 
     for unix_milli in [1_000, 1_001] {
         let wait = writer
-            .admit_flush(batch_for("m", 1, unix_milli, true), PushHeaders::default())
+            .admit_flush(
+                &no_tenant(),
+                batch_for("m", 1, unix_milli, true),
+                PushHeaders::default(),
+            )
             .expect("queue has room");
         tokio::time::timeout(Duration::from_secs(5), wait)
             .await
@@ -606,7 +614,11 @@ async fn a_token_is_minted_per_sealed_block_and_repeated_on_resend() {
     let writer = writer_with(&cfg, &root, inserter.clone());
 
     let wait = writer
-        .admit_flush(batch_for("m", 1, 1_000, true), PushHeaders::default())
+        .admit_flush(
+            &no_tenant(),
+            batch_for("m", 1, 1_000, true),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
     let answer = tokio::time::timeout(Duration::from_secs(30), wait)
         .await
@@ -671,7 +683,11 @@ async fn the_fate_never_walks_back_from_uncertain() {
         let writer = writer_with(&cfg, &root, inserter.clone());
 
         let wait = writer
-            .admit_flush(batch_for("m", 1, 1_000, true), PushHeaders::default())
+            .admit_flush(
+                &no_tenant(),
+                batch_for("m", 1, 1_000, true),
+                PushHeaders::default(),
+            )
             .expect("queue has room");
         let answer = tokio::time::timeout(Duration::from_secs(600), wait)
             .await
@@ -780,7 +796,11 @@ async fn the_insert_loop_endings() {
         let writer = writer_with(&cfg, &root, inserter.clone());
 
         let wait = writer
-            .admit_flush(batch_for("m", 1, 1_000, true), PushHeaders::default())
+            .admit_flush(
+                &no_tenant(),
+                batch_for("m", 1, 1_000, true),
+                PushHeaders::default(),
+            )
             .expect("queue has room");
         let answer = tokio::time::timeout(Duration::from_secs(600), wait)
             .await
@@ -822,7 +842,11 @@ async fn the_insert_loop_endings() {
         // block's series key emits its kind-2 row again next push.
         let before = inserter.call_count();
         let wait = writer
-            .admit_flush(batch_for("m", 1, 1_500, true), PushHeaders::default())
+            .admit_flush(
+                &no_tenant(),
+                batch_for("m", 1, 1_500, true),
+                PushHeaders::default(),
+            )
             .expect("queue has room");
         let _ = tokio::time::timeout(Duration::from_secs(600), wait)
             .await
@@ -861,7 +885,11 @@ async fn the_landing_budget_bounds_the_loop() {
 
     let started = Instant::now();
     let wait = writer
-        .admit_flush(batch_for("m", 1, 1_000, true), PushHeaders::default())
+        .admit_flush(
+            &no_tenant(),
+            batch_for("m", 1, 1_000, true),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
     let answer = wait.await;
     let elapsed = started.elapsed();
@@ -917,7 +945,11 @@ async fn a_retry_sleep_never_carries_a_block_past_the_budget() {
 
     let started = Instant::now();
     let wait = writer
-        .admit_flush(batch_for("m", 1, 1_000, true), PushHeaders::default())
+        .admit_flush(
+            &no_tenant(),
+            batch_for("m", 1, 1_000, true),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
     let answer = wait.await;
     let elapsed = started.elapsed();
@@ -959,7 +991,11 @@ async fn the_budget_expiring_inside_an_attempt_reports_an_unknown_fate() {
     let writer = writer_with(&cfg, &root, inserter.clone());
 
     let wait = writer
-        .admit_flush(batch_for("m", 1, 1_000, true), PushHeaders::default())
+        .admit_flush(
+            &no_tenant(),
+            batch_for("m", 1, 1_000, true),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
     let answer = wait.await;
 
@@ -1046,7 +1082,11 @@ async fn a_retry_sleep_never_starts_an_attempt_after_the_drain_deadline() {
         let writer = Arc::new(writer_at(runtime, inserter.clone()));
 
         let wait = writer
-            .admit_flush(batch_for("m", 1, 1_000, true), PushHeaders::default())
+            .admit_flush(
+                &no_tenant(),
+                batch_for("m", 1, 1_000, true),
+                PushHeaders::default(),
+            )
             .expect("queue has room");
         settle_until(|| writer.metrics().landing.retries_total as usize >= retries).await;
         // The counter is bumped immediately before the sleep; the yields let
@@ -1124,12 +1164,20 @@ async fn shutdown_files_an_inflight_block_and_a_queued_block_differently() {
     let writer = Arc::new(writer_with(&cfg, &root, inserter.clone()));
 
     let a = writer
-        .admit_flush(batch_for("a", 1, 1_000, true), PushHeaders::default())
+        .admit_flush(
+            &no_tenant(),
+            batch_for("a", 1, 1_000, true),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
     settle_until(|| inserter.call_count() == 1).await;
     assert_eq!(inserter.call_count(), 1, "A is in flight");
     let b = writer
-        .admit_flush(batch_for("b", 2, 1_000, true), PushHeaders::default())
+        .admit_flush(
+            &no_tenant(),
+            batch_for("b", 2, 1_000, true),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
 
     let shutdown = {
@@ -1187,7 +1235,11 @@ async fn a_block_sent_after_the_queue_closed_is_settled_by_the_admitting_task() 
     writer.reopen_admission_for_test();
 
     let wait = writer
-        .admit_flush(batch_for("m", 1, 1_000, true), PushHeaders::default())
+        .admit_flush(
+            &no_tenant(),
+            batch_for("m", 1, 1_000, true),
+            PushHeaders::default(),
+        )
         .expect("admission accepts: the flag is clear");
     let answer = tokio::time::timeout(Duration::from_secs(5), wait)
         .await
@@ -1207,7 +1259,11 @@ async fn a_block_sent_after_the_queue_closed_is_settled_by_the_admitting_task() 
     // The claim was reported provably-not-committed, so it was released: the
     // identical body sent again is admitted rather than suppressed.
     let wait = writer
-        .admit_flush(batch_for("m", 1, 1_000, true), PushHeaders::default())
+        .admit_flush(
+            &no_tenant(),
+            batch_for("m", 1, 1_000, true),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
     let _ = tokio::time::timeout(Duration::from_secs(5), wait).await;
     assert_eq!(
@@ -1316,6 +1372,7 @@ async fn the_drain_accounts_for_every_push_it_admitted() {
             tokio::time::sleep(Duration::from_micros(120 * p as u64)).await;
             for i in 0..CAP {
                 match writer.admit_flush(
+                    &no_tenant(),
                     restamped(&template, p * CAP + i + 1),
                     PushHeaders::default(),
                 ) {
@@ -1418,14 +1475,22 @@ async fn an_empty_push_is_a_success_at_the_smallest_accepted_byte_limits() {
         let writer = writer_with(&cfg, &root, inserter.clone());
 
         let wait = writer
-            .admit_flush(ParsedMetrics::default(), PushHeaders::default())
+            .admit_flush(
+                &no_tenant(),
+                ParsedMetrics::default(),
+                PushHeaders::default(),
+            )
             .unwrap_or_else(|e| panic!("{name}: an empty push is admitted: {e:?}"));
         tokio::time::timeout(Duration::from_secs(5), wait)
             .await
             .unwrap_or_else(|_| panic!("{name}: it settles at admission"))
             .unwrap_or_else(|e| panic!("{name}: an empty push is a success: {e}"));
         writer
-            .admit(ParsedMetrics::default(), PushHeaders::default())
+            .admit(
+                &no_tenant(),
+                ParsedMetrics::default(),
+                PushHeaders::default(),
+            )
             .unwrap_or_else(|e| panic!("{name}: and so is the async-mode one: {e:?}"));
 
         assert_eq!(inserter.call_count(), 0, "{name}: nothing is inserted");
@@ -1463,7 +1528,11 @@ async fn a_push_at_a_ceiling_is_refused_whole() {
     let writer = writer_with(&cfg, &root, inserter.clone());
     let before = writer.metrics().dedup.rollbacks_total;
     let err = writer
-        .admit_flush(mixed_push(1_000, 1, true), PushHeaders::default())
+        .admit_flush(
+            &no_tenant(),
+            mixed_push(1_000, 1, true),
+            PushHeaders::default(),
+        )
         .expect_err("a push at the row ceiling is refused");
     assert_eq!(
         err,
@@ -1485,7 +1554,11 @@ async fn a_push_at_a_ceiling_is_refused_whole() {
     // An immediately following identical push is refused the same way rather
     // than suppressed as a repeat.
     let again = writer
-        .admit_flush(mixed_push(1_000, 1, true), PushHeaders::default())
+        .admit_flush(
+            &no_tenant(),
+            mixed_push(1_000, 1, true),
+            PushHeaders::default(),
+        )
         .expect_err("still refused");
     assert_eq!(again, err);
     assert_eq!(writer.metrics().dedup.duplicate_pushes_total, 0);
@@ -1493,7 +1566,11 @@ async fn a_push_at_a_ceiling_is_refused_whole() {
     // The same push without its descriptor is 4 rows, under the ceiling, and
     // is inserted once.
     let wait = writer
-        .admit_flush(mixed_push(1_000, 1, false), PushHeaders::default())
+        .admit_flush(
+            &no_tenant(),
+            mixed_push(1_000, 1, false),
+            PushHeaders::default(),
+        )
         .expect("4 rows fit");
     tokio::time::timeout(Duration::from_secs(5), wait)
         .await
@@ -1513,7 +1590,11 @@ async fn a_push_at_a_ceiling_is_refused_whole() {
         let inserter = MockInserter::always(Act::Ok);
         let writer = writer_with(&cfg, &root, inserter.clone());
         let before = writer.metrics().dedup.rollbacks_total;
-        let result = writer.admit_flush(mixed_push(1_000, 1, true), PushHeaders::default());
+        let result = writer.admit_flush(
+            &no_tenant(),
+            mixed_push(1_000, 1, true),
+            PushHeaders::default(),
+        );
         if refused {
             let err = result.expect_err("refused at one byte under the estimate");
             assert_eq!(
@@ -1559,7 +1640,11 @@ async fn the_queue_charge_covers_the_landing_rows_it_holds() {
     let inserter = MockInserter::always(Act::Ok);
     let writer = writer_with(&cfg, &root, inserter.clone());
     let err = writer
-        .admit_flush(mixed_push(1_000, 1, true), PushHeaders::default())
+        .admit_flush(
+            &no_tenant(),
+            mixed_push(1_000, 1, true),
+            PushHeaders::default(),
+        )
         .expect_err("one byte under its own charge");
     let AdmitRefusal::PushTooLarge { rows, bytes, .. } = err else {
         panic!("expected PushTooLarge, got {err:?}");
@@ -1583,7 +1668,11 @@ async fn the_queue_charge_covers_the_landing_rows_it_holds() {
     let cfg = WriterConfig::default();
     let writer = writer_with(&cfg, &root, inserter.clone());
     let wait = writer
-        .admit_flush(mixed_push(1_000, 1, true), PushHeaders::default())
+        .admit_flush(
+            &no_tenant(),
+            mixed_push(1_000, 1, true),
+            PushHeaders::default(),
+        )
         .expect("the default ceiling has room");
     tokio::time::timeout(Duration::from_secs(5), wait)
         .await
@@ -1633,6 +1722,7 @@ async fn a_push_whose_points_were_all_rejected_succeeds_and_counts_them() {
 
     let wait = writer
         .admit_flush(
+            &no_tenant(),
             ParsedMetrics {
                 rejected: 3,
                 collisions: 2,
@@ -1694,7 +1784,7 @@ async fn the_queue_charge_covers_the_escaped_labels_it_holds() {
     };
 
     let err = writer
-        .admit_flush(push, PushHeaders::default())
+        .admit_flush(&no_tenant(), push, PushHeaders::default())
         .expect_err("one byte of ceiling refuses every push");
     let AdmitRefusal::PushTooLarge { rows, bytes, .. } = err else {
         panic!("expected PushTooLarge, got {err:?}");
@@ -1707,7 +1797,9 @@ async fn the_queue_charge_covers_the_escaped_labels_it_holds() {
     // depend on the bucket, so any bucket argument gives the same string.
     let held = rows * LANDING_ROW_SLOT_BYTES
         + 2 * ESCAPING_METRIC.len() as u64
-        + MetricLandingRow::series(0, &series, 0, 0).labels.len() as u64;
+        + MetricLandingRow::series(&std::sync::Arc::<str>::from(""), 0, &series, 0, 0)
+            .labels
+            .len() as u64;
     assert!(
         bytes >= held,
         "the charge ({bytes}) must cover the {held} bytes the queue holds, \
@@ -1757,7 +1849,11 @@ fn a_failed_blocks_reservation_is_held_until_its_spool_copy_is_written() {
             .expect("the blocking thread is now occupied");
 
         let wait = writer
-            .admit_flush(mixed_push(1_000, 1, true), PushHeaders::default())
+            .admit_flush(
+                &no_tenant(),
+                mixed_push(1_000, 1, true),
+                PushHeaders::default(),
+            )
             .expect("queue has room");
         // The worker reaches its ending and then parks on the spool write.
         settle_until(|| inserter.call_count() == 1).await;
@@ -1831,7 +1927,11 @@ async fn a_suppressed_copy_of_an_oversized_push_stores_nothing() {
 
     // Register `m` in the LRU: 1 sample + 1 registration = 2 rows.
     let wait = writer
-        .admit_flush(batch_for("m", 1, 1_000, true), PushHeaders::default())
+        .admit_flush(
+            &no_tenant(),
+            batch_for("m", 1, 1_000, true),
+            PushHeaders::default(),
+        )
         .expect("2 rows fit");
     tokio::time::timeout(Duration::from_secs(5), wait)
         .await
@@ -1850,13 +1950,17 @@ async fn a_suppressed_copy_of_an_oversized_push_stores_nothing() {
         updated_ns: 1,
     });
     writer
-        .admit(a.clone(), PushHeaders::default())
+        .admit(&no_tenant(), a.clone(), PushHeaders::default())
         .expect("2 rows fit");
     settle_until(|| inserter.call_count() == 2).await;
 
     // A second series commits on the other worker and evicts `m`'s key.
     let wait = writer
-        .admit_flush(batch_for("e", 2, 1_000, true), PushHeaders::default())
+        .admit_flush(
+            &no_tenant(),
+            batch_for("e", 2, 1_000, true),
+            PushHeaders::default(),
+        )
         .expect("2 rows fit");
     tokio::time::timeout(Duration::from_secs(5), wait)
         .await
@@ -1869,7 +1973,7 @@ async fn a_suppressed_copy_of_an_oversized_push_stores_nothing() {
     // descriptor = 3 rows, which is AT the ceiling of 3, so it does not fit
     // one block and must be refused whole rather than landing its descriptor.
     let before_queue = writer.metrics().queue_bytes;
-    let result = writer.admit(a, PushHeaders::default());
+    let result = writer.admit(&no_tenant(), a, PushHeaders::default());
     let err = result.expect_err("the copy no longer fits one block");
     match err {
         AdmitRefusal::PushTooLarge {
@@ -1913,7 +2017,7 @@ fn the_push_too_large_message_names_the_size_and_both_limits() {
 /// One synchronous push, settled and committed.
 async fn push_and_commit(writer: &MetricWriter, batch: ParsedMetrics) {
     let wait = writer
-        .admit_flush(batch, PushHeaders::default())
+        .admit_flush(&no_tenant(), batch, PushHeaders::default())
         .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(5), wait)
         .await
@@ -2003,7 +2107,11 @@ async fn a_descriptor_whose_block_failed_is_sent_again() {
         let writer = writer_with(&cfg, &root, inserter.clone());
 
         let wait = writer
-            .admit_flush(mixed_push(1_000, 1, true), PushHeaders::default())
+            .admit_flush(
+                &no_tenant(),
+                mixed_push(1_000, 1, true),
+                PushHeaders::default(),
+            )
             .expect("queue has room");
         let failed = tokio::time::timeout(Duration::from_secs(5), wait)
             .await
@@ -2093,7 +2201,7 @@ async fn every_landing_column_is_the_value_its_kind_was_built_from() {
     };
 
     let wait = writer
-        .admit_flush(batch, PushHeaders::default())
+        .admit_flush(&no_tenant(), batch, PushHeaders::default())
         .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(5), wait)
         .await
@@ -2176,7 +2284,11 @@ async fn the_inserter_count_bounds_concurrent_inserts() {
 
     for unix_milli in [1_000, 1_001, 1_002] {
         writer
-            .admit(batch_for("m", 1, unix_milli, true), PushHeaders::default())
+            .admit(
+                &no_tenant(),
+                batch_for("m", 1, unix_milli, true),
+                PushHeaders::default(),
+            )
             .expect("queue has room");
     }
     settle_until(|| inserter.call_count() >= 2).await;
@@ -2217,7 +2329,11 @@ async fn the_queue_byte_allowance_is_aggregate_across_pushes() {
     // so all three emit their two kind-2 rows.
     for unix_milli in [1_000, 1_001, 1_002] {
         writer
-            .admit(mixed_push(unix_milli, 1, true), PushHeaders::default())
+            .admit(
+                &no_tenant(),
+                mixed_push(unix_milli, 1, true),
+                PushHeaders::default(),
+            )
             .expect("queue has room for three");
     }
     settle_until(|| inserter.call_count() >= 1).await;
@@ -2225,7 +2341,11 @@ async fn the_queue_byte_allowance_is_aggregate_across_pushes() {
 
     let before = writer.metrics();
     let err = writer
-        .admit(mixed_push(1_003, 1, true), PushHeaders::default())
+        .admit(
+            &no_tenant(),
+            mixed_push(1_003, 1, true),
+            PushHeaders::default(),
+        )
         .expect_err("the fourth push does not fit the aggregate allowance");
     assert_eq!(err, AdmitRefusal::Backpressure);
     let after = writer.metrics();
@@ -2255,7 +2375,11 @@ async fn the_queue_byte_allowance_is_aggregate_across_pushes() {
 
     // The fourth body again: admitted, and the fourth insert call.
     writer
-        .admit(mixed_push(1_003, 1, true), PushHeaders::default())
+        .admit(
+            &no_tenant(),
+            mixed_push(1_003, 1, true),
+            PushHeaders::default(),
+        )
         .expect("queue has room now");
     inserter.release_one();
     settle_until(|| inserter.call_count() >= 4).await;
@@ -2293,12 +2417,20 @@ async fn a_block_whose_budget_expired_while_queued_never_starts_an_insert() {
     let writer = writer_with(&cfg, &root, inserter.clone());
 
     writer
-        .admit(batch_for("a", 1, 1_000, true), PushHeaders::default())
+        .admit(
+            &no_tenant(),
+            batch_for("a", 1, 1_000, true),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
     settle_until(|| inserter.call_count() == 1).await;
     assert_eq!(inserter.call_count(), 1, "A is in flight");
     let b = writer
-        .admit_flush(batch_for("b", 2, 1_000, true), PushHeaders::default())
+        .admit_flush(
+            &no_tenant(),
+            batch_for("b", 2, 1_000, true),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
 
     let answer = tokio::time::timeout(Duration::from_secs(600), b)
@@ -2361,7 +2493,11 @@ async fn the_landing_loop_counts_what_it_did() {
     let writer = writer_with(&cfg, &root, inserter.clone());
 
     let wait = writer
-        .admit_flush(mixed_push(1_000, 1, true), PushHeaders::default())
+        .admit_flush(
+            &no_tenant(),
+            mixed_push(1_000, 1, true),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(5), wait)
         .await
@@ -2390,7 +2526,11 @@ async fn the_landing_loop_counts_what_it_did() {
     let held = MockInserter::always(Act::Gate);
     let writer = writer_with(&cfg, &root, held.clone());
     writer
-        .admit(mixed_push(1_000, 1, true), PushHeaders::default())
+        .admit(
+            &no_tenant(),
+            mixed_push(1_000, 1, true),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
     settle_until(|| held.call_count() == 1).await;
     assert_eq!(writer.metrics().landing.inflight, 1);
@@ -2401,7 +2541,11 @@ async fn the_landing_loop_counts_what_it_did() {
     let retried = MockInserter::new(vec![Step::now(Act::Retryable), Step::now(Act::Ok)]);
     let writer = writer_with(&cfg, &root, retried.clone());
     let wait = writer
-        .admit_flush(mixed_push(1_000, 1, true), PushHeaders::default())
+        .admit_flush(
+            &no_tenant(),
+            mixed_push(1_000, 1, true),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(30), wait)
         .await
@@ -2432,7 +2576,11 @@ async fn a_failed_spool_write_is_counted_and_changes_no_outcome() {
     let writer = writer_at(runtime_at(&cfg, &root), inserter.clone());
 
     let wait = writer
-        .admit_flush(mixed_push(1_000, 1, true), PushHeaders::default())
+        .admit_flush(
+            &no_tenant(),
+            mixed_push(1_000, 1, true),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
     let answer = tokio::time::timeout(Duration::from_secs(5), wait)
         .await
@@ -2467,6 +2615,7 @@ async fn same_bucket_second_sample_is_suppressed_by_the_series_lru() {
 
     let wait = writer
         .admit_flush(
+            &no_tenant(),
             batch_for("http_requests_total", 1, 0, true),
             PushHeaders::default(),
         )
@@ -2483,6 +2632,7 @@ async fn same_bucket_second_sample_is_suppressed_by_the_series_lru() {
     // 0 under the default 1h bucket).
     let wait = writer
         .admit_flush(
+            &no_tenant(),
             batch_for("http_requests_total", 1, 60_000, false),
             PushHeaders::default(),
         )
@@ -2521,6 +2671,7 @@ async fn new_bucket_for_an_already_registered_series_emits_a_new_registration() 
     for unix_milli in [0, BUCKET_MS] {
         let wait = writer
             .admit_flush(
+                &no_tenant(),
                 batch_for("http_requests_total", 1, unix_milli, true),
                 PushHeaders::default(),
             )
@@ -2559,6 +2710,7 @@ async fn registered_series_row_carries_the_bucket_floored_timestamp_not_the_raw_
     let raw_unix_milli = BUCKET_MS + 12_345; // mid-bucket, not on a boundary
     let wait = writer
         .admit_flush(
+            &no_tenant(),
             batch_for("http_requests_total", 1, raw_unix_milli, true),
             PushHeaders::default(),
         )
@@ -2602,7 +2754,7 @@ async fn native_histogram_batch_writes_hist_row_and_registers_value_type_one() {
         ..Default::default()
     };
     let wait = writer
-        .admit_flush(batch, PushHeaders::default())
+        .admit_flush(&no_tenant(), batch, PushHeaders::default())
         .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(5), wait)
         .await
@@ -2631,7 +2783,11 @@ async fn transition_bucket_registers_both_float_and_histogram_series_rows() {
     let writer = writer_with(&cfg, &root, inserter.clone());
 
     let wait = writer
-        .admit_flush(batch_for("m", 1, 0, true), PushHeaders::default())
+        .admit_flush(
+            &no_tenant(),
+            batch_for("m", 1, 0, true),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(5), wait)
         .await
@@ -2651,7 +2807,7 @@ async fn transition_bucket_registers_both_float_and_histogram_series_rows() {
         ..Default::default()
     };
     let wait = writer
-        .admit_flush(batch, PushHeaders::default())
+        .admit_flush(&no_tenant(), batch, PushHeaders::default())
         .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(5), wait)
         .await
@@ -2670,4 +2826,10 @@ async fn transition_bucket_registers_both_float_and_histogram_series_rows() {
 
     writer.shutdown(Duration::from_secs(2)).await;
     std::fs::remove_dir_all(&root).ok();
+}
+
+/// The single-tenant deployment's tenant: no `X-Scope-OrgID`.
+#[allow(dead_code)]
+fn no_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("no header is the empty tenant")
 }

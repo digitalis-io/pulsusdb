@@ -219,6 +219,11 @@ pub async fn ingest_metrics(
     body: Body,
     settings: MetricIngestSettings,
 ) -> Response {
+    // Issue #635 part 4: the tenant first; an invalid one stores nothing.
+    let tenant = match pulsus_model::tenant_from_headers(&headers) {
+        Ok(tenant) => tenant,
+        Err(err) => return status_response(StatusCode::BAD_REQUEST, 3, err.to_string()),
+    };
     let now_ns = now_unix_nanos();
 
     let body = match read_capped_body(body, decompress::MAX_DECOMPRESSED_BYTES).await {
@@ -247,13 +252,13 @@ pub async fn ingest_metrics(
     let push = push_headers(&headers);
 
     if is_async(&headers) {
-        return match sink.admit(parsed, push) {
+        return match sink.admit(&tenant, parsed, push) {
             Ok(()) => export_metrics_response(StatusCode::ACCEPTED, rejected, rejected_message),
             Err(refusal) => otlp_refusal_response(refusal),
         };
     }
 
-    match sink.admit_flush(parsed, push) {
+    match sink.admit_flush(&tenant, parsed, push) {
         Ok(wait) => match wait.await {
             Ok(()) => export_metrics_response(StatusCode::OK, rejected, rejected_message),
             Err(err) => error_response(err),
@@ -373,6 +378,11 @@ pub async fn ingest_remote_write(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
+    // Issue #635 part 4: the tenant first; an invalid one stores nothing.
+    let tenant = match pulsus_model::tenant_from_headers(&headers) {
+        Ok(tenant) => tenant,
+        Err(err) => return go_http_error_response(StatusCode::BAD_REQUEST, format!("{err}\n")),
+    };
     let now_ns = now_unix_nanos();
 
     let body = match read_capped_body(body, decompress::MAX_DECOMPRESSED_BYTES).await {
@@ -397,13 +407,13 @@ pub async fn ingest_remote_write(
     let push = push_headers(&headers);
 
     if is_async(&headers) {
-        return match sink.admit(parsed, push) {
+        return match sink.admit(&tenant, parsed, push) {
             Ok(()) => rw_success_response(StatusCode::ACCEPTED),
             Err(refusal) => remote_write_refusal_response(refusal),
         };
     }
 
-    match sink.admit_flush(parsed, push) {
+    match sink.admit_flush(&tenant, parsed, push) {
         Ok(wait) => match wait.await {
             Ok(()) => rw_success_response(StatusCode::NO_CONTENT),
             Err(err) => remote_write_error_response(&err),
@@ -2036,7 +2046,12 @@ mod tests {
     }
 
     impl MetricSink for MockMetricSink {
-        fn admit(&self, batch: ParsedMetrics, push: PushHeaders) -> Result<(), AdmitRefusal> {
+        fn admit(
+            &self,
+            _tenant: &pulsus_model::Tenant,
+            batch: ParsedMetrics,
+            push: PushHeaders,
+        ) -> Result<(), AdmitRefusal> {
             self.admitted.lock().unwrap().push(batch);
             self.pushes.lock().unwrap().push(push);
             match self.outcome.refusal() {
@@ -2047,6 +2062,7 @@ mod tests {
 
         fn admit_flush(
             &self,
+            _tenant: &pulsus_model::Tenant,
             batch: ParsedMetrics,
             push: PushHeaders,
         ) -> Result<FlushWait, AdmitRefusal> {

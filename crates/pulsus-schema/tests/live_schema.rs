@@ -118,6 +118,7 @@ async fn drop_database(client: &ChClient, db: &str) {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 struct MetricSampleRow {
+    org_id: String,
     /// `UInt128` since issue #498, read as the bare integer: this suite
     /// pins the COLUMN, and `pulsus-model`'s newtype is not a dependency
     /// of this crate.
@@ -245,6 +246,7 @@ async fn run_init_creates_every_m0_table_and_mv_and_is_idempotent() {
     let timestamp_ns = i64::try_from(now.as_nanos()).expect("fits i64");
 
     let metric_rows = vec![MetricSampleRow {
+        org_id: String::new(),
         fingerprint: 0xFFFF_FFFF_FFFF_FFF1,
         unix_milli,
         value: 42.5,
@@ -269,7 +271,7 @@ async fn run_init_creates_every_m0_table_and_mv_and_is_idempotent() {
 
     let mut ms = client
         .query_stream::<MetricSampleRow>(
-            &format!("SELECT fingerprint, unix_milli, value FROM {db}.metric_samples"),
+            &format!("SELECT org_id, fingerprint, unix_milli, value FROM {db}.metric_samples"),
             &QuerySettings::new(),
         )
         .await
@@ -1016,7 +1018,8 @@ struct LandingColumnRow {
 /// `Gorilla` is reported as `Gorilla(8)`, and a column with no codec clause
 /// reports the empty string. The same normalisation the four shipped TTL
 /// assertions read around a parenthesised product.
-const LANDING_COLUMNS: [(&str, &str, &str); 25] = [
+const LANDING_COLUMNS: [(&str, &str, &str); 26] = [
+    ("org_id", "LowCardinality(String)", ""),
     ("received_ms", "Int64", "CODEC(DoubleDelta, ZSTD(1))"),
     ("kind", "UInt8", "CODEC(ZSTD(1))"),
     ("metric_name", "LowCardinality(String)", ""),
@@ -1089,7 +1092,7 @@ async fn metric_landing_and_its_views_exist_after_init() {
     for want in [
         "ENGINE = MergeTree",
         "PARTITION BY toStartOfHour(fromUnixTimestamp64Milli(received_ms))",
-        "ORDER BY (kind, metric_name, fingerprint, unix_milli)",
+        "ORDER BY (org_id, kind, metric_name, fingerprint, unix_milli)",
         "ttl_only_drop_parts = 1",
         "merge_with_ttl_timeout = 3600",
     ] {
@@ -1250,6 +1253,7 @@ async fn an_existing_landing_table_is_adopted_by_a_rerun() {
 
     let create = format!(
         "CREATE TABLE IF NOT EXISTS {db}.metric_landing (
+             org_id                   LowCardinality(String),
              received_ms              Int64  CODEC(DoubleDelta, ZSTD(1)),
              kind                     UInt8  CODEC(ZSTD(1)),
              metric_name              LowCardinality(String),
@@ -1277,7 +1281,7 @@ async fn an_existing_landing_table_is_adopted_by_a_rerun() {
              hist_counter_reset_hint  UInt8  CODEC(ZSTD(1))
          ) ENGINE = MergeTree
          PARTITION BY toStartOfHour(fromUnixTimestamp64Milli(received_ms))
-         ORDER BY (kind, metric_name, fingerprint, unix_milli)
+         ORDER BY (org_id, kind, metric_name, fingerprint, unix_milli)
          SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600;"
     );
     client
@@ -1371,6 +1375,7 @@ async fn dedup_settings_reach_the_landing_table_and_all_four_targets() {
 /// a full row; a kind-2 row leaves the other kinds' columns at zero.
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
 struct LandingSeriesRow {
+    org_id: String,
     received_ms: i64,
     kind: u8,
     metric_name: String,

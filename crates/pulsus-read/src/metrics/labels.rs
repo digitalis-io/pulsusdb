@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use pulsus_clickhouse::ChClient;
-use pulsus_model::{Fingerprint, LabelSet};
+use pulsus_model::{Fingerprint, LabelSet, Tenant};
 use pulsus_promql::re2_pattern_to_rust;
 use regex::Regex;
 
@@ -528,6 +528,7 @@ pub trait SeriesResolver {
     /// and deduped.
     fn resolve(
         &self,
+        tenant: &Tenant,
         metric_name: &str,
         matchers: &[LabelMatcher],
         window: DataWindow,
@@ -665,11 +666,13 @@ fn matches(
 /// never disagree on *which* sub-query a given fallback reason renders.
 fn sql_fallback_sql(
     config: &LabelCacheConfig,
+    tenant: &Tenant,
     metric_name: &str,
     window: DataWindow,
     matchers: &[LabelMatcher],
 ) -> String {
     super::sql::historical_series_subquery(
+        tenant,
         &config.series_table,
         &config.labels_table,
         metric_name,
@@ -702,26 +705,28 @@ fn re2_authority_fallback(
 
 fn sql_fallback(
     config: &LabelCacheConfig,
+    tenant: &Tenant,
     metric_name: &str,
     window: DataWindow,
     matchers: &[LabelMatcher],
     reason: FallbackReason,
 ) -> Resolution {
     Resolution::SqlFallback {
-        sql: sql_fallback_sql(config, metric_name, window, matchers),
+        sql: sql_fallback_sql(config, tenant, metric_name, window, matchers),
         reason,
     }
 }
 
 fn labelled_sql_fallback(
     config: &LabelCacheConfig,
+    tenant: &Tenant,
     metric_name: &str,
     window: DataWindow,
     matchers: &[LabelMatcher],
     reason: FallbackReason,
 ) -> LabelledResolution {
     LabelledResolution::SqlFallback {
-        sql: sql_fallback_sql(config, metric_name, window, matchers),
+        sql: sql_fallback_sql(config, tenant, metric_name, window, matchers),
         reason,
     }
 }
@@ -749,11 +754,13 @@ fn labelled_sql_fallback(
 /// one refresh interval in normal operation (worst case
 /// `staleness_threshold_ms = staleness_multiplier * ttl`), after which the
 /// query is forced to the SQL fallback — see docs/architecture.md §5.2.
+#[allow(clippy::too_many_arguments)] // the tenant beside the resolver's own inputs
 pub(crate) fn resolve_over(
     snapshot: &CacheSnapshot,
     regex_cache: &RegexCache,
     metrics: &CacheMetrics,
     config: &LabelCacheConfig,
+    tenant: &Tenant,
     metric_name: &str,
     matchers: &[LabelMatcher],
     window: DataWindow,
@@ -762,6 +769,7 @@ pub(crate) fn resolve_over(
         metrics.miss_cold_total.fetch_add(1, Ordering::Relaxed);
         return sql_fallback(
             config,
+            tenant,
             metric_name,
             window,
             matchers,
@@ -775,6 +783,7 @@ pub(crate) fn resolve_over(
             .fetch_add(1, Ordering::Relaxed);
         return sql_fallback(
             config,
+            tenant,
             metric_name,
             window,
             matchers,
@@ -792,6 +801,7 @@ pub(crate) fn resolve_over(
         metrics.miss_stale_total.fetch_add(1, Ordering::Relaxed);
         return sql_fallback(
             config,
+            tenant,
             metric_name,
             window,
             matchers,
@@ -800,7 +810,7 @@ pub(crate) fn resolve_over(
     }
 
     if let Some(reason) = re2_authority_fallback(matchers, metrics) {
-        return sql_fallback(config, metric_name, window, matchers, reason);
+        return sql_fallback(config, tenant, metric_name, window, matchers, reason);
     }
 
     let Some(candidates) = snapshot.by_metric.get(metric_name) else {
@@ -820,7 +830,7 @@ pub(crate) fn resolve_over(
                 metrics
                     .miss_regex_unsupported_total
                     .fetch_add(1, Ordering::Relaxed);
-                return sql_fallback(config, metric_name, window, matchers, reason);
+                return sql_fallback(config, tenant, metric_name, window, matchers, reason);
             }
         }
     }
@@ -832,6 +842,7 @@ pub(crate) fn resolve_over(
         let matched_count = matched.len();
         return sql_fallback(
             config,
+            tenant,
             metric_name,
             window,
             matchers,
@@ -859,11 +870,13 @@ pub(crate) fn resolve_over(
 /// second (possibly-swapped) snapshot read — reading the snapshot once and
 /// walking it once for both fingerprint and label output avoids that
 /// race entirely.
+#[allow(clippy::too_many_arguments)] // the tenant beside the resolver's own inputs
 pub(crate) fn resolve_labelled_over(
     snapshot: &CacheSnapshot,
     regex_cache: &RegexCache,
     metrics: &CacheMetrics,
     config: &LabelCacheConfig,
+    tenant: &Tenant,
     metric_name: &str,
     matchers: &[LabelMatcher],
     window: DataWindow,
@@ -872,6 +885,7 @@ pub(crate) fn resolve_labelled_over(
         metrics.miss_cold_total.fetch_add(1, Ordering::Relaxed);
         return labelled_sql_fallback(
             config,
+            tenant,
             metric_name,
             window,
             matchers,
@@ -885,6 +899,7 @@ pub(crate) fn resolve_labelled_over(
             .fetch_add(1, Ordering::Relaxed);
         return labelled_sql_fallback(
             config,
+            tenant,
             metric_name,
             window,
             matchers,
@@ -902,6 +917,7 @@ pub(crate) fn resolve_labelled_over(
         metrics.miss_stale_total.fetch_add(1, Ordering::Relaxed);
         return labelled_sql_fallback(
             config,
+            tenant,
             metric_name,
             window,
             matchers,
@@ -910,7 +926,7 @@ pub(crate) fn resolve_labelled_over(
     }
 
     if let Some(reason) = re2_authority_fallback(matchers, metrics) {
-        return labelled_sql_fallback(config, metric_name, window, matchers, reason);
+        return labelled_sql_fallback(config, tenant, metric_name, window, matchers, reason);
     }
 
     let Some(candidates) = snapshot.by_metric.get(metric_name) else {
@@ -930,7 +946,14 @@ pub(crate) fn resolve_labelled_over(
                 metrics
                     .miss_regex_unsupported_total
                     .fetch_add(1, Ordering::Relaxed);
-                return labelled_sql_fallback(config, metric_name, window, matchers, reason);
+                return labelled_sql_fallback(
+                    config,
+                    tenant,
+                    metric_name,
+                    window,
+                    matchers,
+                    reason,
+                );
             }
         }
     }
@@ -942,6 +965,7 @@ pub(crate) fn resolve_labelled_over(
         let matched_count = matched.len();
         return labelled_sql_fallback(
             config,
+            tenant,
             metric_name,
             window,
             matchers,
@@ -957,16 +981,42 @@ pub(crate) fn resolve_labelled_over(
     LabelledResolution::Series(matched)
 }
 
-/// The resident label cache: owns the snapshot slot, config, the compiled-
-/// regex cache, the `ChClient` the refresh sweep queries through, and the
-/// metrics atomics. Fields are `pub(crate)` — visible to [`super::refresh`]
-/// (which owns the sweep + swap) without leaking outside this crate.
+/// The resident label cache: one snapshot slot and compiled-regex cache
+/// per tenant in use (issue #635 part 4), the config, the `ChClient` the
+/// refresh sweep queries through, and the metrics atomics. Fields are
+/// `pub(crate)` — visible to [`super::refresh`] (which owns the sweep +
+/// swap) without leaking outside this crate.
 pub struct LabelCache {
     pub(crate) client: ChClient,
     pub(crate) config: LabelCacheConfig,
+    /// Every tenant a read has asked for, and the empty tenant from the
+    /// start. The refresh loop sweeps each, with that tenant's statement.
+    pub(crate) tenants: RwLock<HashMap<Tenant, Arc<TenantCache>>>,
+    pub(crate) metrics: CacheMetrics,
+}
+
+/// One tenant's resident cache (issue #635 part 4): its snapshot, swept
+/// with its own statement, and its compiled regexes.
+pub(crate) struct TenantCache {
     pub(crate) snapshot: RwLock<Arc<CacheSnapshot>>,
     pub(crate) regex_cache: RegexCache,
-    pub(crate) metrics: CacheMetrics,
+}
+
+impl TenantCache {
+    fn new() -> Self {
+        TenantCache {
+            snapshot: RwLock::new(Arc::new(CacheSnapshot::default())),
+            regex_cache: RegexCache::new(REGEX_CACHE_CAPACITY),
+        }
+    }
+
+    pub(crate) fn current_snapshot(&self) -> Arc<CacheSnapshot> {
+        let guard = match self.snapshot.read() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        Arc::clone(&guard)
+    }
 }
 
 impl LabelCache {
@@ -974,21 +1024,74 @@ impl LabelCache {
     /// until the first successful [`super::refresh::spawn_refresh_loop`]
     /// sweep.
     pub fn new(client: ChClient, cfg: LabelCacheConfig) -> Self {
+        let mut tenants = HashMap::new();
+        tenants.insert(
+            Tenant::from_header(None, false).expect("the empty tenant"),
+            Arc::new(TenantCache::new()),
+        );
         LabelCache {
             client,
             config: cfg,
-            snapshot: RwLock::new(Arc::new(CacheSnapshot::default())),
-            regex_cache: RegexCache::new(REGEX_CACHE_CAPACITY),
+            tenants: RwLock::new(tenants),
             metrics: CacheMetrics::default(),
         }
     }
 
-    /// One refresh sweep + atomic swap (delegates to [`super::refresh`],
-    /// the only ClickHouse-touching code in this module). A failed sweep
-    /// leaves the last good snapshot in place — see
-    /// [`super::refresh::run_sweep`]'s doc comment.
+    /// One refresh sweep + atomic swap for every tenant in use (delegates
+    /// to [`super::refresh`], the only ClickHouse-touching code in this
+    /// module). A failed sweep leaves that tenant's last good snapshot in
+    /// place — see [`super::refresh::run_sweep`]'s doc comment — and the
+    /// others are still swept; the first failure is returned.
     pub async fn refresh(&self) -> Result<(), pulsus_clickhouse::ChError> {
-        super::refresh::run_sweep(self).await
+        let mut first_err = None;
+        for tenant in self.tenants_in_use() {
+            if let Err(err) = self.refresh_tenant(&tenant).await
+                && first_err.is_none()
+            {
+                first_err = Some(err);
+            }
+        }
+        first_err.map_or(Ok(()), Err)
+    }
+
+    /// One sweep of `tenant`'s cache (issue #635 part 4), which puts the
+    /// tenant in use.
+    pub async fn refresh_tenant(&self, tenant: &Tenant) -> Result<(), pulsus_clickhouse::ChError> {
+        let slot = self.tenant_cache(tenant);
+        super::refresh::run_sweep(self, tenant, &slot).await
+    }
+
+    /// The tenants the refresh loop sweeps, sorted.
+    pub(crate) fn tenants_in_use(&self) -> Vec<Tenant> {
+        let guard = match self.tenants.read() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut out: Vec<Tenant> = guard.keys().cloned().collect();
+        out.sort();
+        out
+    }
+
+    /// `tenant`'s cache, started cold the first time a read asks for it.
+    pub(crate) fn tenant_cache(&self, tenant: &Tenant) -> Arc<TenantCache> {
+        {
+            let guard = match self.tenants.read() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if let Some(slot) = guard.get(tenant) {
+                return Arc::clone(slot);
+            }
+        }
+        let mut guard = match self.tenants.write() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        Arc::clone(
+            guard
+                .entry(tenant.clone())
+                .or_insert_with(|| Arc::new(TenantCache::new())),
+        )
     }
 
     /// `true` once at least one sweep has succeeded (task-manager
@@ -1021,12 +1124,11 @@ impl LabelCache {
         self.metrics.snapshot()
     }
 
+    /// The empty tenant's snapshot: the single-tenant deployment's, and
+    /// what readiness and the age gauge report.
     pub(crate) fn current_snapshot(&self) -> Arc<CacheSnapshot> {
-        let guard = match self.snapshot.read() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        Arc::clone(&guard)
+        self.tenant_cache(&Tenant::from_header(None, false).expect("the empty tenant"))
+            .current_snapshot()
     }
 }
 
@@ -1073,24 +1175,27 @@ impl LabelCache {
     /// cache (`generation == 0`) yields an all-zero, empty summary rather
     /// than a ClickHouse fallback query (task-manager resolution #2: "no
     /// SQL variant for M2").
-    pub fn tsdb_snapshot(&self) -> TsdbCacheSnapshot {
-        tsdb_snapshot_over(&self.current_snapshot())
+    pub fn tsdb_snapshot(&self, tenant: &Tenant) -> TsdbCacheSnapshot {
+        tsdb_snapshot_over(&self.tenant_cache(tenant).current_snapshot())
     }
 }
 
 impl SeriesResolver for LabelCache {
     fn resolve(
         &self,
+        tenant: &Tenant,
         metric_name: &str,
         matchers: &[LabelMatcher],
         window: DataWindow,
     ) -> Resolution {
-        let snapshot = self.current_snapshot();
+        let slot = self.tenant_cache(tenant);
+        let snapshot = slot.current_snapshot();
         resolve_over(
             &snapshot,
-            &self.regex_cache,
+            &slot.regex_cache,
             &self.metrics,
             &self.config,
+            tenant,
             metric_name,
             matchers,
             window,
@@ -1109,16 +1214,19 @@ impl LabelCache {
     /// instead.
     pub fn resolve_labelled(
         &self,
+        tenant: &Tenant,
         metric_name: &str,
         matchers: &[LabelMatcher],
         window: DataWindow,
     ) -> LabelledResolution {
-        let snapshot = self.current_snapshot();
+        let slot = self.tenant_cache(tenant);
+        let snapshot = slot.current_snapshot();
         resolve_labelled_over(
             &snapshot,
-            &self.regex_cache,
+            &slot.regex_cache,
             &self.metrics,
             &self.config,
+            tenant,
             metric_name,
             matchers,
             window,
@@ -1135,16 +1243,18 @@ impl LabelCache {
     /// reader/query caps, not cache-shape parameters).
     pub fn resolve_multi_metric(
         &self,
+        tenant: &Tenant,
         name_matchers: &[LabelMatcher],
         matchers: &[LabelMatcher],
         window: DataWindow,
         fanout_cap: u64,
         scan_budget: u64,
     ) -> MultiMetricResolution {
-        let snapshot = self.current_snapshot();
+        let slot = self.tenant_cache(tenant);
+        let snapshot = slot.current_snapshot();
         resolve_multi_metric_over(
             &snapshot,
-            &self.regex_cache,
+            &slot.regex_cache,
             &self.metrics,
             &self.config,
             name_matchers,
@@ -1376,7 +1486,16 @@ mod tests {
     ) -> Resolution {
         let regex_cache = RegexCache::new(REGEX_CACHE_CAPACITY);
         let metrics = CacheMetrics::default();
-        resolve_over(snap, &regex_cache, &metrics, cfg, metric_name, matchers, w)
+        resolve_over(
+            snap,
+            &regex_cache,
+            &metrics,
+            cfg,
+            &Tenant::from_header(None, false).expect("the empty tenant"),
+            metric_name,
+            matchers,
+            w,
+        )
     }
 
     #[test]
@@ -2002,7 +2121,16 @@ mod tests {
     ) -> LabelledResolution {
         let regex_cache = RegexCache::new(REGEX_CACHE_CAPACITY);
         let metrics = CacheMetrics::default();
-        resolve_labelled_over(snap, &regex_cache, &metrics, cfg, metric_name, matchers, w)
+        resolve_labelled_over(
+            snap,
+            &regex_cache,
+            &metrics,
+            cfg,
+            &Tenant::from_header(None, false).expect("the empty tenant"),
+            metric_name,
+            matchers,
+            w,
+        )
     }
 
     #[test]

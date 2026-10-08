@@ -28,8 +28,9 @@
 //! at the execution boundary, exactly as `logql::exec` does for its own
 //! regex SQL.
 
-use pulsus_model::FpLiteral;
+use pulsus_model::{FpLiteral, Tenant};
 
+use super::TenantSql;
 use crate::logql::escape::ch_string;
 
 // ---------------------------------------------------------------------
@@ -82,12 +83,17 @@ pub fn subquery_predicate(subquery: &str) -> String {
 /// function renders whatever order it is given, unmodified — snapshot
 /// stability is the caller's responsibility, not re-derived here.
 pub fn sample_fetch(
+    tenant: &Tenant,
     table: &str,
     fps: &[FpLiteral],
     lower_excl_ms: i64,
     upper_incl_ms: i64,
 ) -> String {
-    let window = window_predicate(lower_excl_ms, upper_incl_ms);
+    let window = format!(
+        "org_id = {} AND {}",
+        tenant.sql_literal(),
+        window_predicate(lower_excl_ms, upper_incl_ms)
+    );
     let fps = fingerprints_predicate(fps);
     format!(
         "SELECT fingerprint, unix_milli, value\nFROM {table}\nWHERE {window}\n  AND {fps}\nORDER BY fingerprint, unix_milli"
@@ -99,12 +105,17 @@ pub fn sample_fetch(
 /// verbatim as `fingerprint IN ( <subquery> )` — never a materialized
 /// giant `IN` list (edge case 6, AC).
 pub fn sample_fetch_subquery(
+    tenant: &Tenant,
     table: &str,
     subquery: &str,
     lower_excl_ms: i64,
     upper_incl_ms: i64,
 ) -> String {
-    let window = window_predicate(lower_excl_ms, upper_incl_ms);
+    let window = format!(
+        "org_id = {} AND {}",
+        tenant.sql_literal(),
+        window_predicate(lower_excl_ms, upper_incl_ms)
+    );
     let sub = subquery_predicate(subquery);
     format!(
         "SELECT fingerprint, unix_milli, value\nFROM {table}\nWHERE {window}\n  AND {sub}\nORDER BY fingerprint, unix_milli"
@@ -118,12 +129,17 @@ pub fn sample_fetch_subquery(
 /// #623), so rows group by ID ([`super::sample_rows::MultiSampleRow`]) and
 /// take their names from the resolution.
 pub fn sample_fetch_multi(
+    tenant: &Tenant,
     table: &str,
     fps: &[FpLiteral],
     lower_excl_ms: i64,
     upper_incl_ms: i64,
 ) -> String {
-    let window = window_predicate(lower_excl_ms, upper_incl_ms);
+    let window = format!(
+        "org_id = {} AND {}",
+        tenant.sql_literal(),
+        window_predicate(lower_excl_ms, upper_incl_ms)
+    );
     let fps = fingerprints_predicate(fps);
     format!(
         "SELECT fingerprint, unix_milli, value\nFROM {table}\nWHERE {window}\n  AND {fps}\nORDER BY fingerprint, unix_milli"
@@ -148,12 +164,17 @@ const HIST_VALUE_COLUMNS: &str = "schema, zero_threshold, zero_count, count, sum
 /// [`sample_fetch`]'s window/`IN`/ORDER-BY
 /// shape — only the SELECT column list and table name differ (M7-A5a).
 pub fn hist_sample_fetch(
+    tenant: &Tenant,
     table: &str,
     fps: &[FpLiteral],
     lower_excl_ms: i64,
     upper_incl_ms: i64,
 ) -> String {
-    let window = window_predicate(lower_excl_ms, upper_incl_ms);
+    let window = format!(
+        "org_id = {} AND {}",
+        tenant.sql_literal(),
+        window_predicate(lower_excl_ms, upper_incl_ms)
+    );
     let fps = fingerprints_predicate(fps);
     format!(
         "SELECT fingerprint, unix_milli, {HIST_VALUE_COLUMNS}\nFROM {table}\nWHERE {window}\n  AND {fps}\nORDER BY fingerprint, unix_milli"
@@ -165,12 +186,17 @@ pub fn hist_sample_fetch(
 /// sub-query inlined verbatim as `fingerprint IN ( <subquery> )`), only the
 /// SELECT column list and table name differ (M7-A5a).
 pub fn hist_sample_fetch_subquery(
+    tenant: &Tenant,
     table: &str,
     subquery: &str,
     lower_excl_ms: i64,
     upper_incl_ms: i64,
 ) -> String {
-    let window = window_predicate(lower_excl_ms, upper_incl_ms);
+    let window = format!(
+        "org_id = {} AND {}",
+        tenant.sql_literal(),
+        window_predicate(lower_excl_ms, upper_incl_ms)
+    );
     let sub = subquery_predicate(subquery);
     format!(
         "SELECT fingerprint, unix_milli, {HIST_VALUE_COLUMNS}\nFROM {table}\nWHERE {window}\n  AND {sub}\nORDER BY fingerprint, unix_milli"
@@ -182,12 +208,17 @@ pub fn hist_sample_fetch_subquery(
 /// `fingerprint IN (…)` shape, only the SELECT column list (the 13 value
 /// columns) and table name differ (M7-A5a).
 pub fn hist_sample_fetch_multi(
+    tenant: &Tenant,
     table: &str,
     fps: &[FpLiteral],
     lower_excl_ms: i64,
     upper_incl_ms: i64,
 ) -> String {
-    let window = window_predicate(lower_excl_ms, upper_incl_ms);
+    let window = format!(
+        "org_id = {} AND {}",
+        tenant.sql_literal(),
+        window_predicate(lower_excl_ms, upper_incl_ms)
+    );
     let fps = fingerprints_predicate(fps);
     format!(
         "SELECT fingerprint, unix_milli, {HIST_VALUE_COLUMNS}\nFROM {table}\nWHERE {window}\n  AND {fps}\nORDER BY fingerprint, unix_milli"
@@ -244,6 +275,11 @@ mod tests {
 
     use super::*;
 
+    /// The single-tenant deployment's tenant: no `X-Scope-OrgID`.
+    fn no_tenant() -> Tenant {
+        Tenant::from_header(None, false).expect("no header is the empty tenant")
+    }
+
     /// A minted literal from a small decimal, so these tests keep reading
     /// as `&[fp(101), fp(205)]` after the identity widened (issue #498).
     fn fp(v: u128) -> FpLiteral {
@@ -276,6 +312,7 @@ mod tests {
     #[test]
     fn sample_fetch_renders_the_schemas_md_2_3_shape() {
         let sql = sample_fetch(
+            &no_tenant(),
             "metric_samples",
             &[
                 Fingerprint::from_raw(101).sql_literal(),
@@ -289,7 +326,7 @@ mod tests {
             sql,
             "SELECT fingerprint, unix_milli, value\n\
              FROM metric_samples\n\
-             WHERE unix_milli > 1000 AND unix_milli <= 2000\n\
+             WHERE org_id = '' AND unix_milli > 1000 AND unix_milli <= 2000\n\
              \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))\n\
              ORDER BY fingerprint, unix_milli"
         );
@@ -298,6 +335,7 @@ mod tests {
     #[test]
     fn sample_fetch_window_is_left_open_right_closed() {
         let sql = sample_fetch(
+            &no_tenant(),
             "metric_samples",
             &[Fingerprint::from_raw(1).sql_literal()],
             0,
@@ -311,14 +349,14 @@ mod tests {
 
     #[test]
     fn sample_fetch_of_an_empty_fingerprint_list_renders_empty_parens() {
-        let sql = sample_fetch("metric_samples", &[], 0, 100);
+        let sql = sample_fetch(&no_tenant(), "metric_samples", &[], 0, 100);
         assert!(sql.contains("fingerprint IN ()"));
     }
 
     #[test]
     fn sample_fetch_subquery_inlines_the_subquery_verbatim() {
         let subquery = "SELECT fingerprint FROM metric_series WHERE metric_name = 'up'";
-        let sql = sample_fetch_subquery("metric_samples", subquery, 0, 100);
+        let sql = sample_fetch_subquery(&no_tenant(), "metric_samples", subquery, 0, 100);
         assert!(sql.contains(&format!("fingerprint IN (\n{subquery}\n  )")));
         assert!(!sql.contains("IN (SELECT fingerprint FROM metric_series"));
     }
@@ -326,7 +364,7 @@ mod tests {
     #[test]
     fn sample_fetch_subquery_never_materializes_a_giant_in_list() {
         let subquery = "SELECT fingerprint FROM metric_series WHERE metric_name = 'up'";
-        let sql = sample_fetch_subquery("metric_samples", subquery, 0, 100);
+        let sql = sample_fetch_subquery(&no_tenant(), "metric_samples", subquery, 0, 100);
         // No comma-separated numeric literal list anywhere in this SQL.
         assert!(!sql.contains("IN (1,"));
     }
@@ -373,6 +411,7 @@ mod tests {
     #[test]
     fn sample_fetch_multi_renders_the_flat_in_in_shape() {
         let sql = sample_fetch_multi(
+            &no_tenant(),
             "metric_samples",
             &[
                 Fingerprint::from_raw(101).sql_literal(),
@@ -385,7 +424,7 @@ mod tests {
             sql,
             "SELECT fingerprint, unix_milli, value\n\
              FROM metric_samples\n\
-             WHERE unix_milli > 1000 AND unix_milli <= 2000\n\
+             WHERE org_id = '' AND unix_milli > 1000 AND unix_milli <= 2000\n\
              \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'))\n\
              ORDER BY fingerprint, unix_milli"
         );
@@ -394,6 +433,7 @@ mod tests {
     #[test]
     fn sample_fetch_multi_window_is_left_open_right_closed() {
         let sql = sample_fetch_multi(
+            &no_tenant(),
             "metric_samples",
             &[Fingerprint::from_raw(1).sql_literal()],
             0,
@@ -416,6 +456,7 @@ mod tests {
     #[test]
     fn hist_sample_fetch_renders_the_12_column_shape() {
         let sql = hist_sample_fetch(
+            &no_tenant(),
             "metric_hist_samples",
             &[
                 Fingerprint::from_raw(101).sql_literal(),
@@ -430,7 +471,7 @@ mod tests {
             format!(
                 "SELECT fingerprint, unix_milli, {HIST_COLS}\n\
                  FROM metric_hist_samples\n\
-                 WHERE unix_milli > 1000 AND unix_milli <= 2000\n\
+                 WHERE org_id = '' AND unix_milli > 1000 AND unix_milli <= 2000\n\
                  \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'))\n\
                  ORDER BY fingerprint, unix_milli"
             )
@@ -440,6 +481,7 @@ mod tests {
     #[test]
     fn hist_sample_fetch_window_is_left_open_right_closed() {
         let sql = hist_sample_fetch(
+            &no_tenant(),
             "metric_hist_samples",
             &[Fingerprint::from_raw(1).sql_literal()],
             0,
@@ -452,7 +494,7 @@ mod tests {
     #[test]
     fn hist_sample_fetch_subquery_inlines_the_subquery_verbatim() {
         let subquery = "SELECT fingerprint FROM metric_series WHERE metric_name = 'up'";
-        let sql = hist_sample_fetch_subquery("metric_hist_samples", subquery, 0, 100);
+        let sql = hist_sample_fetch_subquery(&no_tenant(), "metric_hist_samples", subquery, 0, 100);
         assert!(sql.contains(&format!("fingerprint IN (\n{subquery}\n  )")));
         assert!(sql.starts_with(&format!("SELECT fingerprint, unix_milli, {HIST_COLS}")));
     }
@@ -460,6 +502,7 @@ mod tests {
     #[test]
     fn hist_sample_fetch_multi_renders_the_flat_in_in_shape() {
         let sql = hist_sample_fetch_multi(
+            &no_tenant(),
             "metric_hist_samples",
             &[
                 Fingerprint::from_raw(101).sql_literal(),
@@ -473,7 +516,7 @@ mod tests {
             format!(
                 "SELECT fingerprint, unix_milli, {HIST_COLS}\n\
                  FROM metric_hist_samples\n\
-                 WHERE unix_milli > 1000 AND unix_milli <= 2000\n\
+                 WHERE org_id = '' AND unix_milli > 1000 AND unix_milli <= 2000\n\
                  \x20 AND fingerprint IN (toUInt128('101'), toUInt128('205'))\n\
                  ORDER BY fingerprint, unix_milli"
             )
@@ -495,6 +538,7 @@ mod tests {
     #[test]
     fn ac7a_chunks_float_and_hist_predicates_are_identical() {
         let float = sample_fetch(
+            &no_tenant(),
             "metric_samples",
             &[
                 Fingerprint::from_raw(7).sql_literal(),
@@ -504,6 +548,7 @@ mod tests {
             2_000,
         );
         let hist = hist_sample_fetch(
+            &no_tenant(),
             "metric_hist_samples",
             &[
                 Fingerprint::from_raw(7).sql_literal(),
@@ -523,8 +568,9 @@ mod tests {
     #[test]
     fn ac7a_fallback_float_and_hist_predicates_are_identical() {
         let subquery = "SELECT fingerprint FROM metric_series WHERE metric_name = 'up'";
-        let float = sample_fetch_subquery("metric_samples", subquery, 1_000, 2_000);
-        let hist = hist_sample_fetch_subquery("metric_hist_samples", subquery, 1_000, 2_000);
+        let float = sample_fetch_subquery(&no_tenant(), "metric_samples", subquery, 1_000, 2_000);
+        let hist =
+            hist_sample_fetch_subquery(&no_tenant(), "metric_hist_samples", subquery, 1_000, 2_000);
         assert_eq!(predicate_tail(&float), predicate_tail(&hist));
     }
 
@@ -532,6 +578,7 @@ mod tests {
     #[test]
     fn ac7a_multi_float_and_hist_predicates_are_identical() {
         let float = sample_fetch_multi(
+            &no_tenant(),
             "metric_samples",
             &[
                 Fingerprint::from_raw(7).sql_literal(),
@@ -541,6 +588,7 @@ mod tests {
             2_000,
         );
         let hist = hist_sample_fetch_multi(
+            &no_tenant(),
             "metric_hist_samples",
             &[
                 Fingerprint::from_raw(7).sql_literal(),
@@ -561,12 +609,12 @@ mod tests {
         let ids = [fp(101), fp(205)];
         let sub = "SELECT fingerprint FROM metric_series";
         for sql in [
-            sample_fetch("metric_samples", &ids, 0, 100),
-            sample_fetch_subquery("metric_samples", sub, 0, 100),
-            sample_fetch_multi("metric_samples", &ids, 0, 100),
-            hist_sample_fetch("metric_hist_samples", &ids, 0, 100),
-            hist_sample_fetch_subquery("metric_hist_samples", sub, 0, 100),
-            hist_sample_fetch_multi("metric_hist_samples", &ids, 0, 100),
+            sample_fetch(&no_tenant(), "metric_samples", &ids, 0, 100),
+            sample_fetch_subquery(&no_tenant(), "metric_samples", sub, 0, 100),
+            sample_fetch_multi(&no_tenant(), "metric_samples", &ids, 0, 100),
+            hist_sample_fetch(&no_tenant(), "metric_hist_samples", &ids, 0, 100),
+            hist_sample_fetch_subquery(&no_tenant(), "metric_hist_samples", sub, 0, 100),
+            hist_sample_fetch_multi(&no_tenant(), "metric_hist_samples", &ids, 0, 100),
         ] {
             assert!(!sql.contains("metric_name"), "{sql}");
             assert!(sql.ends_with("ORDER BY fingerprint, unix_milli"), "{sql}");

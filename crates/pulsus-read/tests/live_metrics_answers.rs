@@ -10,7 +10,7 @@
 //! worth stating exactly, because the wider claim is false.
 //!
 //! The read path builds a float sample at two places — `group_rows` and
-//! `group_multi_rows` (`crates/pulsus-read/src/metrics/exec.rs:2268` and
+//! `group_multi_rows` (`crates/pulsus-read/src/metrics/exec.rs:2337` and
 //! `:2170`). Mutating **both**, one mutation at a time, against the three
 //! live suites for this engine (`live_metrics_engine`,
 //! `live_metrics_cache`, `live_discovery_fallback` — 39 tests) and the two
@@ -201,6 +201,7 @@ struct SeedSeriesRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedSampleRow {
+    org_id: String,
     fingerprint: u128,
     unix_milli: i64,
     value: f64,
@@ -271,6 +272,7 @@ struct FixtureSeries {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedHistRow {
+    org_id: String,
     fingerprint: u128,
     unix_milli: i64,
     schema: i8,
@@ -621,6 +623,7 @@ async fn seed(client: &ChClient, fx: &[FixtureSeries], bucket: i64) {
         .iter()
         .flat_map(|s| {
             s.samples.iter().map(move |(t, bits)| SeedSampleRow {
+                org_id: String::new(),
                 fingerprint: u128::from(s.fp),
                 unix_milli: *t,
                 value: f64::from_bits(*bits),
@@ -638,6 +641,7 @@ async fn seed(client: &ChClient, fx: &[FixtureSeries], bucket: i64) {
         .flat_map(|s| {
             let cols = cols.clone();
             s.hist_samples.iter().map(move |t| SeedHistRow {
+                org_id: String::new(),
                 fingerprint: u128::from(s.fp),
                 unix_milli: *t,
                 schema: cols.schema,
@@ -962,12 +966,20 @@ async fn harness(db: &str) -> Harness {
 impl Harness {
     async fn read_path(&self, query: &str, p: &MetricQueryParams) -> Answer {
         let expr = parse(query).expect("parse");
-        let (result, _ann) = self.engine.query(&expr, p).await.expect("query");
+        let (result, _ann) = self
+            .engine
+            .query(&no_tenant(), &expr, p)
+            .await
+            .expect("query");
         answer_from_result(result)
     }
     async fn read_path_cold(&self, query: &str, p: &MetricQueryParams) -> Answer {
         let expr = parse(query).expect("parse");
-        let (result, _ann) = self.cold_engine.query(&expr, p).await.expect("query");
+        let (result, _ann) = self
+            .cold_engine
+            .query(&no_tenant(), &expr, p)
+            .await
+            .expect("query");
         answer_from_result(result)
     }
     fn memory(&self, query: &str, p: &MetricQueryParams) -> Answer {
@@ -1684,7 +1696,11 @@ async fn two_series_sharing_a_label_set_reach_the_evaluator_as_two_series() {
     let h = harness(&pulsus_testkit::test_db("pulsus_read_it_answers_dup")).await;
     let p = h.instant();
     let expr = parse("dup_labels").expect("parse");
-    let err = h.engine.query(&expr, &p).await.expect_err("must reject");
+    let err = h
+        .engine
+        .query(&no_tenant(), &expr, &p)
+        .await
+        .expect_err("must reject");
     assert_eq!(
         format!("{err:?}"),
         r#"Promql(LabelSet { detail: "vector cannot contain metrics with the same labelset" })"#,
@@ -1829,6 +1845,7 @@ async fn every_query_answers_the_same_through_the_read_path_and_in_memory() {
 /// and its own label row in `metric_labels`.
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedActivityRow {
+    org_id: String,
     day: u16,
     fingerprint: u128,
     metric_name: String,
@@ -1837,6 +1854,7 @@ struct SeedActivityRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedLabelRow {
+    org_id: String,
     metric_name: String,
     fingerprint: u128,
     labels: String,
@@ -1849,6 +1867,7 @@ async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
     let activity: Vec<SeedActivityRow> = rows
         .iter()
         .map(|r| SeedActivityRow {
+            org_id: String::new(),
             day: r.unix_milli.div_euclid(86_400_000) as u16,
             fingerprint: r.fingerprint,
             metric_name: r.metric_name.clone(),
@@ -1858,6 +1877,7 @@ async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
     let labels: Vec<SeedLabelRow> = rows
         .iter()
         .map(|r| SeedLabelRow {
+            org_id: String::new(),
             metric_name: r.metric_name.clone(),
             fingerprint: r.fingerprint,
             labels: r.labels.clone(),
@@ -1873,4 +1893,10 @@ async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
         .insert_block("metric_labels", &labels)
         .await
         .expect("seed metric_labels");
+}
+
+/// The single-tenant deployment's tenant: no `X-Scope-OrgID`.
+#[allow(dead_code)]
+fn no_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("no header is the empty tenant")
 }

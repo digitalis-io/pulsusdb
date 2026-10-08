@@ -22,6 +22,9 @@ use std::process::ExitCode;
 use clap::Args;
 use pulsus_clickhouse::{ChClient, Idempotency, QuerySettings};
 use pulsus_config::Config;
+use pulsus_model::Tenant;
+use pulsus_read::logql::escape::ch_string;
+use pulsus_read::metrics::TenantSql;
 
 use crate::chconfig::{conn_config_from, schema_params_from};
 
@@ -82,11 +85,19 @@ pub(crate) struct RebuildMetrics {
     to: String,
 
     /// Drop the target partitions the replayed rows fall in first. This
-    /// deletes **every** row in those partitions, including data the landing
-    /// table no longer holds. Without it the two sample tables are refused,
-    /// because a replay would store their rows twice.
+    /// deletes **every** row in those partitions, every tenant's, including
+    /// data the landing table no longer holds. Without it the two sample
+    /// tables are refused, because a replay would store their rows twice.
+    /// With `--tenant` no partition is dropped: that tenant's rows on those
+    /// days are deleted instead, and no other tenant's.
     #[arg(long)]
     drop_target_partitions: bool,
+
+    /// Replay one tenant's rows alone (issue #635): the landed rows whose
+    /// `org_id` is this `X-Scope-OrgID` value, `""` for the single-tenant
+    /// deployment. Without it, every tenant's rows are replayed.
+    #[arg(long)]
+    tenant: Option<String>,
 }
 
 pub(crate) async fn run(config: &Config, args: RebuildMetrics) -> ExitCode {
@@ -122,10 +133,23 @@ async fn rebuild(config: &Config, args: RebuildMetrics) -> Result<String, String
         return Err(format!(
             "{target} is append-only: a replay without --drop-target-partitions would store \
              every replayed row a second time. Pass --drop-target-partitions, which first \
-             deletes EVERY row in the partitions the replayed rows fall in — including data \
-             the landing table no longer holds"
+             deletes EVERY row of every tenant's in the partitions the replayed rows fall in — \
+             including data the landing table no longer holds — or with --tenant, that \
+             tenant's rows on those days"
         ));
     }
+
+    // Issue #635 part 4: the tenant, validated by the header's own rule.
+    let tenant = match &args.tenant {
+        None => None,
+        Some(text) => {
+            let value = axum::http::HeaderValue::from_str(text)
+                .map_err(|_| format!("--tenant {text:?}: invalid X-Scope-OrgID"))?;
+            let tenant = Tenant::from_header((!text.is_empty()).then_some(&value), false)
+                .map_err(|e| format!("--tenant {text:?}: {e}"))?;
+            Some(tenant)
+        }
+    };
 
     let from_ms = parse_rfc3339_millis(&args.from).map_err(|e| format!("--from: {e}"))?;
     let to_ms = parse_rfc3339_millis(&args.to).map_err(|e| format!("--to: {e}"))?;
@@ -137,14 +161,42 @@ async fn rebuild(config: &Config, args: RebuildMetrics) -> Result<String, String
     let projection = pulsus_schema::mv_projection(mv_name, &ctx)
         .ok_or_else(|| format!("no materialized view named {mv_name} in the catalogue"))?;
     let window = format!(" AND received_ms >= {from_ms} AND received_ms < {to_ms}");
-    let select = format!("{projection}{window}");
+    let scope = tenant
+        .as_ref()
+        .map(|t| format!(" AND org_id = {}", t.sql_literal()))
+        .unwrap_or_default();
+    let select = format!("{projection}{window}{scope}");
 
     let client = ChClient::new(conn_config_from(config))
         .await
         .map_err(|e| e.to_string())?;
     let db = &ctx.db;
 
-    if let Some(expr) = partition_expr {
+    if let (Some(expr), Some(tenant)) = (partition_expr, &tenant) {
+        // One tenant: delete its rows on the replayed days, and no other
+        // tenant's; no partition is dropped.
+        let days = distinct_days(&client, &select, expr).await?;
+        if !days.is_empty() {
+            let sql = format!(
+                "DELETE FROM {db}.{target} WHERE org_id = {} AND {expr} IN ({}) \
+                 SETTINGS lightweight_deletes_sync = 2",
+                tenant.sql_literal(),
+                days.iter()
+                    .map(|d| ch_string(d))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            client
+                .execute(&sql, &QuerySettings::new(), Idempotency::NonIdempotent)
+                .await
+                .map_err(|e| format!("deleting the tenant's rows: {e}"))?;
+        }
+        tracing::info!(
+            target = %target,
+            days = days.len(),
+            "deleted the tenant's rows on the days the replayed rows fall in"
+        );
+    } else if let Some(expr) = partition_expr {
         let partitions = distinct_partitions(&client, &select, expr).await?;
         for partition in &partitions {
             let sql = format!(
@@ -192,6 +244,21 @@ async fn distinct_partitions(
         .query_strings(&sql, &QuerySettings::new())
         .await
         .map_err(|e| format!("reading the partitions to drop: {e}"))
+}
+
+/// The days the replayed rows fall in, as the text of the target's own
+/// partition expression (issue #635 part 4): what a tenant's rebuild
+/// deletes that tenant's rows on.
+async fn distinct_days(
+    client: &ChClient,
+    select: &str,
+    partition_expr: &str,
+) -> Result<Vec<String>, String> {
+    let sql = format!("SELECT DISTINCT toString({partition_expr}) AS s FROM ({select}) ORDER BY s");
+    client
+        .query_strings(&sql, &QuerySettings::new())
+        .await
+        .map_err(|e| format!("reading the days to delete: {e}"))
 }
 
 /// `pulsusdb rebuild-traces`: replays a window of `trace_landing` into

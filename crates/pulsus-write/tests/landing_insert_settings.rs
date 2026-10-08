@@ -445,7 +445,7 @@ async fn a_retryable_pre_send_failure_is_resent_and_settles_not_committed() {
     );
 
     let wait = writer
-        .admit_flush(one_sample_push(), PushHeaders::default())
+        .admit_flush(&no_tenant(), one_sample_push(), PushHeaders::default())
         .expect("the queue has room");
     let answer = tokio::time::timeout(Duration::from_secs(60), wait)
         .await
@@ -768,4 +768,10 @@ fn one_span_trace_push() -> (pulsus_write::ParsedTraces, pulsus_write::ParsedTra
         pulsus_write::parse_traces(&req, TS).expect("the old path's decode"),
         pulsus_write::parse_trace_landing(&req, TS).expect("the landing decode"),
     )
+}
+
+/// The single-tenant deployment's tenant: no `X-Scope-OrgID`.
+#[allow(dead_code)]
+fn no_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("no header is the empty tenant")
 }

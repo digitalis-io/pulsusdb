@@ -404,7 +404,7 @@ async fn v1_name_less_selectors_answer_from_the_index() {
         let marker = fx.marker().await;
         let got = fx
             .engine
-            .series(&[filter(matchers.clone())], fx.window)
+            .series(&no_tenant(), &[filter(matchers.clone())], fx.window)
             .await
             .unwrap_or_else(|e| panic!("{id}: {e:?}"));
         assert_eq!(got.len(), want.len(), "{id}: series count");
@@ -443,7 +443,7 @@ async fn v4_an_empty_value_reads_as_absent() {
         let marker = fx.marker().await;
         let got = fx
             .engine
-            .series(&[filter(matchers.clone())], fx.window)
+            .series(&no_tenant(), &[filter(matchers.clone())], fx.window)
             .await
             .unwrap_or_else(|e| panic!("{matchers:?}: {e:?}"));
         assert_eq!(got.len(), want, "{matchers:?}: {got:?}");
@@ -492,7 +492,7 @@ async fn v2_the_label_endpoints_answer_from_the_index() {
         let marker = fx.marker().await;
         let got = fx
             .engine
-            .label_names(&filters, fx.window)
+            .label_names(&no_tenant(), &filters, fx.window)
             .await
             .expect("label names");
         assert_eq!(got, keys(&matchers), "{filters:?}");
@@ -521,7 +521,7 @@ async fn v2_the_label_endpoints_answer_from_the_index() {
         let marker = fx.marker().await;
         let got = fx
             .engine
-            .label_values(key, &filters, fx.window)
+            .label_values(&no_tenant(), key, &filters, fx.window)
             .await
             .expect("label values");
         assert_eq!(got, values(key, &matchers), "{key}");
@@ -549,21 +549,25 @@ async fn v3_escaped_labels_round_trip() {
     let marker = fx.marker().await;
     assert_eq!(
         fx.engine
-            .label_values("k", &[], fx.window)
+            .label_values(&no_tenant(), "k", &[], fx.window)
             .await
             .expect("k values"),
         vec!["a\"b\\c".to_string()]
     );
     assert_eq!(
         fx.engine
-            .label_values("n", &[], fx.window)
+            .label_values(&no_tenant(), "n", &[], fx.window)
             .await
             .expect("n values"),
         vec!["line\nx".to_string()]
     );
     let got = fx
         .engine
-        .series(&[filter(vec![m("k", MatchOp::Eq, "a\"b\\c")])], fx.window)
+        .series(
+            &no_tenant(),
+            &[filter(vec![m("k", MatchOp::Eq, "a\"b\\c")])],
+            fx.window,
+        )
         .await
         .expect("series");
     let names: BTreeMap<String, String> =
@@ -572,4 +576,10 @@ async fn v3_escaped_labels_round_trip() {
     assert_eq!(names.get("u").map(String::as_str), Some("é"));
     assert!(fx.reads_index(&fx.tables_since(&marker).await));
     fx.finish().await;
+}
+
+/// The single-tenant deployment's tenant: no `X-Scope-OrgID`.
+#[allow(dead_code)]
+fn no_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("no header is the empty tenant")
 }

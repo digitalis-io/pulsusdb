@@ -26,6 +26,7 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::Response;
 use axum::routing::post;
+use pulsus_model::Tenant;
 
 use pulsus_write::writer::{
     MetricWriterMetricsSnapshot, TraceWriterMetricsSnapshot, WriterMetricsSnapshot,
@@ -143,20 +144,26 @@ impl MetricWriterSink {
 }
 
 impl MetricSink for MetricWriterSink {
-    fn admit(&self, batch: ParsedMetrics, push: PushHeaders) -> Result<(), AdmitRefusal> {
+    fn admit(
+        &self,
+        tenant: &Tenant,
+        batch: ParsedMetrics,
+        push: PushHeaders,
+    ) -> Result<(), AdmitRefusal> {
         match self.slot.get() {
-            Some(writer) => writer.admit(batch, push),
+            Some(writer) => writer.admit(tenant, batch, push),
             None => Err(AdmitRefusal::Backpressure),
         }
     }
 
     fn admit_flush(
         &self,
+        tenant: &Tenant,
         batch: ParsedMetrics,
         push: PushHeaders,
     ) -> Result<FlushWait, AdmitRefusal> {
         match self.slot.get() {
-            Some(writer) => writer.admit_flush(batch, push),
+            Some(writer) => writer.admit_flush(tenant, batch, push),
             None => Err(AdmitRefusal::Backpressure),
         }
     }
@@ -408,7 +415,11 @@ mod tests {
     fn metric_admit_is_backpressure_while_the_slot_is_empty() {
         let sink = MetricWriterSink::new(Arc::new(OnceLock::new()));
         assert_eq!(
-            sink.admit(metrics_batch(), PushHeaders::default()),
+            sink.admit(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+                metrics_batch(),
+                PushHeaders::default()
+            ),
             Err(AdmitRefusal::Backpressure)
         );
     }
@@ -417,8 +428,12 @@ mod tests {
     fn metric_admit_flush_is_backpressure_while_the_slot_is_empty() {
         let sink = MetricWriterSink::new(Arc::new(OnceLock::new()));
         assert!(
-            sink.admit_flush(metrics_batch(), PushHeaders::default())
-                .is_err()
+            sink.admit_flush(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+                metrics_batch(),
+                PushHeaders::default()
+            )
+            .is_err()
         );
     }
 

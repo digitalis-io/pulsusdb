@@ -86,6 +86,7 @@ fn series_row(
 ) -> MetricLandingRow {
     let (labels, _) = LabelSet::from_normalized(pairs.iter().cloned());
     MetricLandingRow::series(
+        &std::sync::Arc::<str>::from(""),
         received_ms,
         &SeriesRef {
             metric_name: Arc::from(name),
@@ -106,6 +107,7 @@ fn float_row(
     value: f64,
 ) -> MetricLandingRow {
     MetricLandingRow::float_sample(
+        &std::sync::Arc::<str>::from(""),
         received_ms,
         &MetricPoint {
             metric_name: Arc::from(name),
@@ -119,6 +121,7 @@ fn float_row(
 /// A kind-1 landing row: a three-bucket histogram of count 4 and sum 5.
 fn hist_row(received_ms: i64, name: &str, fp: u128, unix_milli: i64) -> MetricLandingRow {
     MetricLandingRow::hist_sample(
+        &std::sync::Arc::<str>::from(""),
         received_ms,
         &HistogramPoint {
             metric_name: Arc::from(name),
@@ -289,7 +292,7 @@ async fn every_series_read_returns_the_seeded_series_with_their_labels() {
     };
     let mut swept = BTreeSet::new();
     for name in corpus.keys() {
-        match cache.resolve_labelled(name, &[], window) {
+        match cache.resolve_labelled(&no_tenant(), name, &[], window) {
             LabelledResolution::Series(series) => {
                 for (fp, labels) in series {
                     swept.insert((name.clone(), fp, pairs(&labels)));
@@ -310,7 +313,7 @@ async fn every_series_read_returns_the_seeded_series_with_their_labels() {
         let engine = &engine;
         async move {
             engine
-                .series(&[filter], window)
+                .series(&no_tenant(), &[filter], window)
                 .await
                 .expect("discovery")
                 .into_iter()
@@ -403,7 +406,11 @@ async fn every_series_read_returns_the_seeded_series_with_their_labels() {
         step_ms: 0,
     };
     let (result, _) = cold_engine
-        .query(&parse(r#"metric_03{job="job-0"}"#).expect("parse"), &params)
+        .query(
+            &no_tenant(),
+            &parse(r#"metric_03{job="job-0"}"#).expect("parse"),
+            &params,
+        )
         .await
         .expect("fallback query");
     let got: BTreeSet<Vec<(String, String)>> = match result {
@@ -450,7 +457,7 @@ async fn every_series_read_returns_the_seeded_series_with_their_labels() {
         .await
         .expect("seed an activity row with no label row");
     cache.refresh().await.expect("refresh");
-    match cache.resolve_labelled("orphan", &[], window) {
+    match cache.resolve_labelled(&no_tenant(), "orphan", &[], window) {
         LabelledResolution::Series(series) => {
             assert!(series.is_empty(), "the sweep returned {series:?}")
         }
@@ -618,7 +625,7 @@ async fn every_fetch_path_sends_both_reads_and_the_answer_is_unchanged() {
             engine_config(&db),
         );
         let (result, _, explain) = engine
-            .query_explained(&parse(query).expect("parse"), &params)
+            .query_explained(&no_tenant(), &parse(query).expect("parse"), &params)
             .await
             .unwrap_or_else(|e| panic!("{path}: {e}"));
         assert_eq!(
@@ -702,7 +709,7 @@ async fn a_late_sample_of_the_other_kind_is_read() {
         step_ms: 0,
     };
     let (result, _) = engine
-        .query(&parse("late").expect("parse"), &params)
+        .query(&no_tenant(), &parse("late").expect("parse"), &params)
         .await
         .expect("query");
     assert_eq!(
@@ -969,7 +976,13 @@ async fn matchers_answer_from_the_lookup() {
             assert_eq!(
                 triples_of(
                     &client,
-                    &sql::discovery_query("metric_series", "metric_labels", &filter, window),
+                    &sql::discovery_query(
+                        &no_tenant(),
+                        "metric_series",
+                        "metric_labels",
+                        &filter,
+                        window
+                    ),
                     &what,
                 )
                 .await,
@@ -980,6 +993,7 @@ async fn matchers_answer_from_the_lookup() {
             let names: BTreeSet<String> = rows_of::<pulsus_read::metrics::rows::MetricNameRow>(
                 &client,
                 &sql::discovery_distinct_names_query(
+                    &no_tenant(),
                     "metric_series",
                     "metric_labels",
                     &filter,
@@ -1009,7 +1023,12 @@ async fn matchers_answer_from_the_lookup() {
             assert_eq!(
                 triples_of(
                     &client,
-                    &sql::series_labels_by_fingerprint("metric_labels", &answer_names, &ids_sql),
+                    &sql::series_labels_by_fingerprint(
+                        &no_tenant(),
+                        "metric_labels",
+                        &answer_names,
+                        &ids_sql
+                    ),
                     &what,
                 )
                 .await,
@@ -1025,6 +1044,7 @@ async fn matchers_answer_from_the_lookup() {
                 rows_of::<pulsus_read::metrics::exec::FingerprintOnlyRow>(
                     &client,
                     &sql::historical_series_subquery(
+                        &no_tenant(),
                         "metric_series",
                         "metric_labels",
                         "m_q",
@@ -1045,6 +1065,7 @@ async fn matchers_answer_from_the_lookup() {
                 triples_of(
                     &client,
                     &sql::historical_resolution_query(
+                        &no_tenant(),
                         "metric_series",
                         "metric_labels",
                         "m_q",
@@ -1064,6 +1085,7 @@ async fn matchers_answer_from_the_lookup() {
                 triples_of(
                     &client,
                     &sql::discovery_fetch_by_names(
+                        &no_tenant(),
                         "metric_series",
                         "metric_labels",
                         &two,
@@ -1093,7 +1115,14 @@ async fn matchers_answer_from_the_lookup() {
         assert_eq!(
             triples_of(
                 &client,
-                &sql::discovery_fetch_multi("metric_series", "metric_labels", &two, &ids, window),
+                &sql::discovery_fetch_multi(
+                    &no_tenant(),
+                    "metric_series",
+                    "metric_labels",
+                    &two,
+                    &ids,
+                    window
+                ),
                 wname,
             )
             .await,
@@ -1206,18 +1235,24 @@ async fn an_old_series_is_not_discovered_in_a_short_window() {
             ),
         };
         assert_eq!(
-            engine.series(one, window).await.expect("/series"),
+            engine
+                .series(&no_tenant(), one, window)
+                .await
+                .expect("/series"),
             want_series,
             "/series {what}"
         );
         assert_eq!(
-            engine.label_names(one, window).await.expect("/labels"),
+            engine
+                .label_names(&no_tenant(), one, window)
+                .await
+                .expect("/labels"),
             vec!["__name__".to_string(), "job".to_string()],
             "/labels {what}"
         );
         assert_eq!(
             engine
-                .label_values("job", one, window)
+                .label_values(&no_tenant(), "job", one, window)
                 .await
                 .expect("/label/job/values"),
             vec!["api".to_string()],
@@ -1225,7 +1260,7 @@ async fn an_old_series_is_not_discovered_in_a_short_window() {
         );
         assert_eq!(
             engine
-                .label_values("__name__", one, window)
+                .label_values(&no_tenant(), "__name__", one, window)
                 .await
                 .expect("/label/__name__/values"),
             want_names,
@@ -1349,6 +1384,7 @@ async fn activity_is_exact_to_the_hour() {
         let from_days: BTreeSet<u128> = rows_of::<pulsus_read::metrics::exec::FingerprintOnlyRow>(
             &client,
             &pulsus_read::metrics::sql::historical_series_subquery(
+                &no_tenant(),
                 "metric_series",
                 "metric_labels",
                 "m_hours",
@@ -1426,7 +1462,7 @@ async fn a_failed_read_fails_its_selector_with_that_reads_error() {
                 config.clone(),
             );
             let err = engine
-                .query(&parse(query).expect("parse"), &params)
+                .query(&no_tenant(), &parse(query).expect("parse"), &params)
                 .await
                 .err()
                 .unwrap_or_else(|| panic!("{path}, {read} read failing: the selector answered"));
@@ -1628,4 +1664,10 @@ async fn count(client: &ChClient, sql: &str) -> u64 {
         .await
         .unwrap_or_else(|e| panic!("count failed: {e}\n{sql}"));
     stream.next().await.expect("one row").expect("decode").n
+}
+
+/// The single-tenant deployment's tenant: no `X-Scope-OrgID`.
+#[allow(dead_code)]
+fn no_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("no header is the empty tenant")
 }

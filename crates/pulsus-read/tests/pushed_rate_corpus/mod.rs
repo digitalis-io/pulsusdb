@@ -422,6 +422,7 @@ pub async fn seed_samples(client: &ChClient, fx: &[SeedSeries]) {
         .iter()
         .flat_map(|s| {
             s.samples.iter().map(move |(t, v)| SeedSampleRow {
+                org_id: String::new(),
                 fingerprint: s.fp,
                 unix_milli: *t,
                 value: *v,
@@ -442,6 +443,7 @@ pub async fn seed_activity(client: &ChClient, fx: &[SeedSeries], days: &[u16], h
         .iter()
         .flat_map(|day| {
             fx.iter().map(move |s| SeedActivityRow {
+                org_id: String::new(),
                 day: *day,
                 fingerprint: s.fp,
                 metric_name: s.metric.clone(),
@@ -459,6 +461,7 @@ pub async fn seed_activity(client: &ChClient, fx: &[SeedSeries], days: &[u16], h
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedSampleRow {
+    org_id: String,
     fingerprint: u128,
     unix_milli: i64,
     value: f64,
@@ -466,6 +469,7 @@ struct SeedSampleRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedHistRow {
+    org_id: String,
     fingerprint: u128,
     unix_milli: i64,
     schema: i8,
@@ -484,6 +488,7 @@ struct SeedHistRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedActivityRow {
+    org_id: String,
     day: u16,
     fingerprint: u128,
     metric_name: String,
@@ -492,6 +497,7 @@ struct SeedActivityRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedLabelRow {
+    org_id: String,
     metric_name: String,
     fingerprint: u128,
     labels: String,
@@ -507,6 +513,7 @@ pub async fn seed(client: &ChClient, fx: &[SeedSeries], seen_ms: i64) {
     let activity: Vec<SeedActivityRow> = fx
         .iter()
         .map(|s| SeedActivityRow {
+            org_id: String::new(),
             day: bucket.div_euclid(DAY_MS) as u16,
             fingerprint: s.fp,
             metric_name: s.metric.clone(),
@@ -522,6 +529,7 @@ pub async fn seed(client: &ChClient, fx: &[SeedSeries], seen_ms: i64) {
                 .map(|(k, v)| (k.as_str(), v.as_str()))
                 .collect();
             SeedLabelRow {
+                org_id: String::new(),
                 metric_name: s.metric.clone(),
                 fingerprint: s.fp,
                 labels: serde_json::to_string(&map).expect("labels json"),
@@ -558,6 +566,7 @@ pub async fn seed(client: &ChClient, fx: &[SeedSeries], seen_ms: i64) {
         .iter()
         .flat_map(|s| {
             s.samples.iter().map(move |(t, v)| SeedSampleRow {
+                org_id: String::new(),
                 fingerprint: s.fp,
                 unix_milli: *t,
                 value: *v,
@@ -574,6 +583,7 @@ pub async fn seed(client: &ChClient, fx: &[SeedSeries], seen_ms: i64) {
         .iter()
         .flat_map(|s| {
             s.hist.iter().map(move |t| SeedHistRow {
+                org_id: String::new(),
                 fingerprint: s.fp,
                 unix_milli: *t,
                 schema: 0,
@@ -867,7 +877,7 @@ impl Harness {
     pub async fn run(engine: &MetricsEngine, query: &str, p: &MetricQueryParams) -> Routed {
         let expr = parse(query).expect("parse");
         let (r, a, e) = engine
-            .query_explained(&expr, p)
+            .query_explained(&no_tenant(), &expr, p)
             .await
             .unwrap_or_else(|err| panic!("{query}: {err:?}"));
         Routed {
@@ -1005,4 +1015,10 @@ pub async fn statements_since(admin: &ChClient, db: &str, marker: &str) -> Vec<L
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     panic!("the query log never settled for {db}");
+}
+
+/// The single-tenant deployment's tenant: no `X-Scope-OrgID`.
+#[allow(dead_code)]
+fn no_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("no header is the empty tenant")
 }

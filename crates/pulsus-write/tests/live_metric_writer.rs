@@ -162,7 +162,7 @@ async fn a_push_lands_one_block_carrying_every_kind() {
     };
 
     let wait = writer
-        .admit_flush(batch, PushHeaders::default())
+        .admit_flush(&no_tenant(), batch, PushHeaders::default())
         .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(10), wait)
         .await
@@ -227,7 +227,7 @@ async fn same_bucket_samples_land_exactly_one_registration_row() {
     };
 
     let wait = writer
-        .admit_flush(batch, PushHeaders::default())
+        .admit_flush(&no_tenant(), batch, PushHeaders::default())
         .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(10), wait)
         .await
@@ -290,7 +290,7 @@ async fn registration_rows_for_one_fingerprint_carry_byte_identical_labels() {
     };
 
     let wait = writer
-        .admit_flush(batch, PushHeaders::default())
+        .admit_flush(&no_tenant(), batch, PushHeaders::default())
         .expect("queue has room");
     tokio::time::timeout(Duration::from_secs(10), wait)
         .await
@@ -330,4 +330,10 @@ async fn registration_rows_for_one_fingerprint_carry_byte_identical_labels() {
     );
 
     drop_database(&bootstrap, &db).await;
+}
+
+/// The single-tenant deployment's tenant: no `X-Scope-OrgID`.
+#[allow(dead_code)]
+fn no_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("no header is the empty tenant")
 }

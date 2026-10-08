@@ -148,6 +148,7 @@ struct ExplainRow {
 /// positional). `Vec<T>` maps to `Array(T)`.
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 struct HistSampleRow {
+    org_id: String,
     /// `UInt128` since issue #498, read as the bare integer: this suite
     /// pins the COLUMN, and `pulsus-model`'s newtype is not a dependency
     /// of this crate.
@@ -167,7 +168,7 @@ struct HistSampleRow {
     custom_values: Vec<f64>,
 }
 
-const HIST_SELECT_COLS: &str = "fingerprint, unix_milli, schema, zero_threshold, \
+const HIST_SELECT_COLS: &str = "org_id, fingerprint, unix_milli, schema, zero_threshold, \
      zero_count, count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, \
      neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values";
 
@@ -262,6 +263,7 @@ async fn counter_reset_hint_column_is_additive_uint8_default_zero() {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock");
     let seed = HistSampleRow {
+        org_id: String::new(),
         fingerprint: 7,
         unix_milli: i64::try_from(now.as_millis()).expect("fits i64"),
         schema: 0,
@@ -333,6 +335,7 @@ async fn metric_hist_samples_explain_shows_series_id_pk_pruning() {
         .expect("clock");
     let unix_milli = i64::try_from(now.as_millis()).expect("fits i64");
     let seed = HistSampleRow {
+        org_id: String::new(),
         fingerprint: 18374588331335825905,
         unix_milli,
         schema: 2,
@@ -434,6 +437,7 @@ async fn complementary_hist_read_selects_zero_granules_for_single_type_series() 
     // read and would make the prune trivially/meaninglessly pass).
     const HIST_FP: u128 = 18374588331335825905;
     let seed = HistSampleRow {
+        org_id: String::new(),
         fingerprint: HIST_FP,
         unix_milli,
         schema: 0,
@@ -518,6 +522,7 @@ async fn native_histogram_row_round_trips_losslessly_exponential_and_nhcb() {
     // negative spans/deltas; no custom_values. Deltas are the Prometheus
     // wire form (first absolute, then signed deltas) stored verbatim.
     let exponential = HistSampleRow {
+        org_id: String::new(),
         fingerprint: 0xFFFF_FFFF_FFFF_FFF1,
         unix_milli: base_ms,
         schema: 2,
@@ -538,6 +543,7 @@ async fn native_histogram_row_round_trips_losslessly_exponential_and_nhcb() {
     // custom_values (explicit bucket bounds) are used; zero/negative fields
     // empty (matches upstream custom-buckets contract). Lossless too.
     let nhcb = HistSampleRow {
+        org_id: String::new(),
         fingerprint: 0xFFFF_FFFF_FFFF_FFF1,
         unix_milli: base_ms + 1,
         schema: -53,

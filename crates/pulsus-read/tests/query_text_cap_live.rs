@@ -106,9 +106,9 @@ async fn setup_db(db: &str) -> ChClient {
     // accepts it; this test still never touches storage pruning.
     client
         .execute(
-            "CREATE TABLE metric_samples (metric_name String, fingerprint UInt128, \
+            "CREATE TABLE metric_samples (org_id String, metric_name String, fingerprint UInt128, \
              unix_milli Int64, value Float64) ENGINE = MergeTree \
-             ORDER BY (metric_name, fingerprint, unix_milli)",
+             ORDER BY (org_id, metric_name, fingerprint, unix_milli)",
             &QuerySettings::new(),
             Idempotency::Idempotent,
         )
@@ -210,8 +210,13 @@ async fn metrics_multi_oversized_sql_fails_under_ch_defaults_and_succeeds_under_
     ))
     .await;
     let fps = oversized_fingerprint_set();
-    let sql =
-        pulsus_read::metrics::sample_sql::sample_fetch_multi("metric_samples", &fps, 0, i64::MAX);
+    let sql = pulsus_read::metrics::sample_sql::sample_fetch_multi(
+        &no_tenant(),
+        "metric_samples",
+        &fps,
+        0,
+        i64::MAX,
+    );
     assert!(
         sql.len() > 262_144,
         "fixture SQL is {} bytes, expected > 262,144 to exercise the ClickHouse default",
@@ -235,4 +240,10 @@ async fn metrics_multi_oversized_sql_fails_under_ch_defaults_and_succeeds_under_
         .await
         .expect("the same SQL text must succeed once max_query_size is raised");
     assert_eq!(rows, 0, "the fixture table is empty by construction");
+}
+
+/// The single-tenant deployment's tenant: no `X-Scope-OrgID`.
+#[allow(dead_code)]
+fn no_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("no header is the empty tenant")
 }

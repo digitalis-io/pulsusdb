@@ -422,7 +422,7 @@ own planner, lower is better (`crates/pulsus-read/src/traces/filter.rs:89-103`):
 
 `status`, `name` and the empty query `{}` are the three things the Grafana traces
 search form puts in front of a user before they type anything, and all three land
-in rank 4 or 5. `docs/schemas.md:818` already names the class: *"no selective
+in rank 4 or 5. `docs/schemas.md:832` already names the class: *"no selective
 index — window-bounded, budget-limited"*.
 
 The proportions of a real query mix were derived separately, by reading what the
@@ -2433,7 +2433,7 @@ What remains unmeasured:
 | `d`, the trace-grain collapse factor, on real traces | it scales the whole index saving. §11 P5 |
 | the byte cost of the `event_set_sql` read after it moves to an `ARRAY JOIN` over `trace_spans` | it is the one phase-2 read that stays a separate statement. §4 Q1 |
 | the scalar value read (`arrayFirstIndex` + element extraction) against today's `attr_values_sql` | the shape is bounded by construction; the byte cost is not measured |
-| whether `Array(LowCardinality(String))` and `Array(Nullable(Float64))` insert through our own writer | `metric_hist_samples` proves `Array(Int32)`/`Array(Float64)` from a `Vec` field (`crates/pulsus-schema/src/catalog.rs:492-498`, `crates/pulsus-write/src/writer/rows.rs:437, 443`); the low-cardinality and nullable element types have no precedent in this repository |
+| whether `Array(LowCardinality(String))` and `Array(Nullable(Float64))` insert through our own writer | `metric_hist_samples` proves `Array(Int32)`/`Array(Float64)` from a `Vec` field (`crates/pulsus-schema/src/catalog.rs:492-498`, `crates/pulsus-write/src/writer/rows.rs:439, 443`); the low-cardinality and nullable element types have no precedent in this repository |
 | the cost of the drop/add/materialise interval on `service_time` (§8 ids 44–46) on a populated table | during it, a `resource.service.name` search falls back to a base-table scan. Empty on a fresh database |
 | the clustered path beyond column presence | §8's twins were measured on a single-node `Distributed('default', …)`: the column appears and the insert lands. Multi-shard routing, `cityHash64(trace_id)` co-sharding of the four new wrappers, and a clustered read were not measured |
 | storage at Appendix A's `Z_p` = 4 | §5's measured storage row was taken at `Z_p` = 15.91 and carries its payload component so the figure can be re-derived at another `Z_p`; it was not re-run at 4 |
@@ -2494,7 +2494,7 @@ the migration catalogue is append-only and that the window for in-place amendmen
 > — `docs/architecture.md:96`
 
 > the trace-index scope amendment (issue #54) was the last such amendment window
-> — `docs/schemas.md:995`
+> — `docs/schemas.md:1009`
 
 > issue #54's scope amendment of migrations 17/18 + `trace_tag_catalog_mv` was the last
 > such amendment window (task-manager ruling on #54) — `crates/pulsus-schema/src/catalog.rs:16-23`

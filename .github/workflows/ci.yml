@@ -1659,6 +1659,24 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-read --test live_metrics_nameless
 
+      # Issue #635 part 4: two tenants holding the same series IDs; every
+      # engine read, cold cache and warm, answers the asking tenant's own
+      # rows, as the design's case table writes them.
+      - name: Live metrics tenants
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-read --test live_metrics_tenants
+
+      # Issue #635 part 4: `X-Scope-OrgID` through the real binary — pushes,
+      # the header's rule on every metrics route, push suppression per
+      # tenant, and every `/api/v1` route over two tenants' rows.
+      - name: Live Prometheus API tenants
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-server --test prom_api_tenants_live
+
       # Issue #548: the statements the database actually received, read
       # back out of `system.query_log` and compared against text the test
       # writes out itself, plus the plan's own SQL part names against the

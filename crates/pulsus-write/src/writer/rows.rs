@@ -5,6 +5,8 @@
 //! reservation (architect plan).
 
 use pulsus_clickhouse::Row;
+use std::sync::Arc;
+
 use pulsus_model::{Fingerprint, LabelSet};
 use serde::{Deserialize, Serialize};
 
@@ -856,7 +858,7 @@ impl SpoolEncode for MetricMetadataRow {
 ///
 /// `kind` says which event the row is; a row sets that kind's columns and
 /// leaves the rest at the type's default. The fields are the landing
-/// table's 25 columns, in the table's own declaration order: the insert's
+/// table's 26 columns, in the table's own declaration order: the insert's
 /// column list is exactly this type's `COLUMN_NAMES`.
 ///
 /// No `PartialEq` derive, for [`MetricSampleRow`]'s reason: `value`,
@@ -864,6 +866,8 @@ impl SpoolEncode for MetricMetadataRow {
 /// markers, so equality must compare `.to_bits()`.
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct MetricLandingRow {
+    /// Issue #635 part 4: the push's tenant, one shared string per push.
+    pub org_id: Arc<str>,
     pub received_ms: i64,
     pub kind: u8,
     pub metric_name: String,
@@ -926,8 +930,9 @@ impl MetricLandingRow {
     pub const KIND_METADATA: u8 = 3;
 
     /// A row of `kind` with every kind-specific column at its default.
-    fn of_kind(received_ms: i64, kind: u8) -> Self {
+    fn of_kind(org_id: &Arc<str>, received_ms: i64, kind: u8) -> Self {
         MetricLandingRow {
+            org_id: Arc::clone(org_id),
             received_ms,
             kind,
             metric_name: String::new(),
@@ -957,20 +962,20 @@ impl MetricLandingRow {
     }
 
     /// A kind-0 row: the columns `metric_samples_mv` reads, and no others.
-    pub fn float_sample(received_ms: i64, point: &MetricPoint) -> Self {
+    pub fn float_sample(org_id: &Arc<str>, received_ms: i64, point: &MetricPoint) -> Self {
         MetricLandingRow {
             metric_name: point.metric_name.to_string(),
             fingerprint: point.fingerprint,
             unix_milli: point.unix_milli,
             value: point.value,
-            ..Self::of_kind(received_ms, Self::KIND_FLOAT)
+            ..Self::of_kind(org_id, received_ms, Self::KIND_FLOAT)
         }
     }
 
     /// A kind-1 row: the columns `metric_hist_samples_mv` reads, and no
     /// others. As in [`MetricHistSampleRow`]'s conversion, the histogram was
     /// validated at the ingest seam, so `to_columns` cannot fail here.
-    pub fn hist_sample(received_ms: i64, point: &HistogramPoint) -> Self {
+    pub fn hist_sample(org_id: &Arc<str>, received_ms: i64, point: &HistogramPoint) -> Self {
         let cols = point
             .histogram
             .to_columns()
@@ -992,7 +997,7 @@ impl MetricLandingRow {
             hist_neg_bucket_deltas: cols.neg_bucket_deltas,
             hist_custom_values: cols.custom_values,
             hist_counter_reset_hint: cols.counter_reset_hint,
-            ..Self::of_kind(received_ms, Self::KIND_HIST)
+            ..Self::of_kind(org_id, received_ms, Self::KIND_HIST)
         }
     }
 
@@ -1001,6 +1006,7 @@ impl MetricLandingRow {
     /// computed, never a sample time — the same contract
     /// [`MetricSeriesRow::from_series_at_bucket`] carries.
     pub fn series(
+        org_id: &Arc<str>,
         received_ms: i64,
         series: &SeriesRef,
         bucket_unix_milli: i64,
@@ -1020,19 +1026,19 @@ impl MetricLandingRow {
             unix_milli: bucket_unix_milli,
             labels,
             value_type,
-            ..Self::of_kind(received_ms, Self::KIND_SERIES)
+            ..Self::of_kind(org_id, received_ms, Self::KIND_SERIES)
         }
     }
 
     /// A kind-3 row: the columns `metric_metadata_mv` reads, and no others.
-    pub fn metadata(received_ms: i64, meta: &MetricMetadata) -> Self {
+    pub fn metadata(org_id: &Arc<str>, received_ms: i64, meta: &MetricMetadata) -> Self {
         MetricLandingRow {
             metric_name: meta.metric_name.to_string(),
             metric_type: meta.metric_type.clone(),
             help: meta.help.clone(),
             unit: meta.unit.clone(),
             updated_ns: meta.updated_ns,
-            ..Self::of_kind(received_ms, Self::KIND_METADATA)
+            ..Self::of_kind(org_id, received_ms, Self::KIND_METADATA)
         }
     }
 }
@@ -1048,6 +1054,7 @@ impl SpoolEncode for MetricLandingRow {
         match self.kind {
             Self::KIND_FLOAT => serde_json::json!({
                 "kind": self.kind,
+                "org_id": &*self.org_id,
                 "received_ms": self.received_ms,
                 "metric_name": self.metric_name,
                 "fingerprint": self.fingerprint,
@@ -1057,6 +1064,7 @@ impl SpoolEncode for MetricLandingRow {
             }),
             Self::KIND_HIST => serde_json::json!({
                 "kind": self.kind,
+                "org_id": &*self.org_id,
                 "received_ms": self.received_ms,
                 "metric_name": self.metric_name,
                 "fingerprint": self.fingerprint,
@@ -1082,6 +1090,7 @@ impl SpoolEncode for MetricLandingRow {
             }),
             Self::KIND_SERIES => serde_json::json!({
                 "kind": self.kind,
+                "org_id": &*self.org_id,
                 "received_ms": self.received_ms,
                 "metric_name": self.metric_name,
                 "fingerprint": self.fingerprint,
@@ -1096,6 +1105,7 @@ impl SpoolEncode for MetricLandingRow {
             // which is a failure path.
             _ => serde_json::json!({
                 "kind": self.kind,
+                "org_id": &*self.org_id,
                 "received_ms": self.received_ms,
                 "metric_name": self.metric_name,
                 "metric_type": self.metric_type,
@@ -1133,6 +1143,7 @@ impl SpoolEncode for MetricLandingRow {
                 o.field("fingerprint", &self.fingerprint).await?;
                 o.field("kind", &self.kind).await?;
                 o.str_field("metric_name", &self.metric_name).await?;
+                o.str_field("org_id", &self.org_id).await?;
                 o.field("received_ms", &self.received_ms).await?;
                 o.field("unix_milli", &self.unix_milli).await?;
                 o.field("value", &FiniteOrNull(self.value)).await?;
@@ -1165,6 +1176,7 @@ impl SpoolEncode for MetricLandingRow {
                     .await?;
                 o.array("neg_span_offsets", &self.hist_neg_span_offsets)
                     .await?;
+                o.str_field("org_id", &self.org_id).await?;
                 o.array("pos_bucket_deltas", &self.hist_pos_bucket_deltas)
                     .await?;
                 o.array("pos_span_lengths", &self.hist_pos_span_lengths)
@@ -1191,6 +1203,7 @@ impl SpoolEncode for MetricLandingRow {
                 o.field("kind", &self.kind).await?;
                 o.str_field("labels", &self.labels).await?;
                 o.str_field("metric_name", &self.metric_name).await?;
+                o.str_field("org_id", &self.org_id).await?;
                 o.field("received_ms", &self.received_ms).await?;
                 o.field("unix_milli", &self.unix_milli).await?;
                 o.field("value_type", &self.value_type).await?;
@@ -1202,6 +1215,7 @@ impl SpoolEncode for MetricLandingRow {
                 o.field("kind", &self.kind).await?;
                 o.str_field("metric_name", &self.metric_name).await?;
                 o.str_field("metric_type", &self.metric_type).await?;
+                o.str_field("org_id", &self.org_id).await?;
                 o.field("received_ms", &self.received_ms).await?;
                 o.str_field("unit", &self.unit).await?;
                 o.field("updated_ns", &self.updated_ns).await?;
@@ -2307,10 +2321,11 @@ mod tests {
 
     // -- the landing row (issue #603) ---------------------------------
 
-    /// The 25 columns `metric_landing` declares, in its own declaration
+    /// The 26 columns `metric_landing` declares, in its own declaration
     /// order. Written out here so the row type cannot drift from the schema
     /// silently.
-    const LANDING_COLUMNS: [&str; 25] = [
+    const LANDING_COLUMNS: [&str; 26] = [
+        "org_id",
         "received_ms",
         "kind",
         "metric_name",
@@ -2416,6 +2431,7 @@ mod tests {
 
     fn landing_float(value: f64) -> MetricLandingRow {
         MetricLandingRow::float_sample(
+            &std::sync::Arc::<str>::from(""),
             7,
             &MetricPoint {
                 metric_name: Arc::from("m"),
@@ -2428,6 +2444,7 @@ mod tests {
 
     fn landing_hist(sum: f64, zero_threshold: f64, custom_values: Vec<f64>) -> MetricLandingRow {
         MetricLandingRow::hist_sample(
+            &std::sync::Arc::<str>::from(""),
             7,
             &HistogramPoint {
                 metric_name: Arc::from("m"),
@@ -2546,7 +2563,13 @@ mod tests {
                 ],
             ),
             (
-                MetricLandingRow::series(7, &series, 3_600_000, 1),
+                MetricLandingRow::series(
+                    &std::sync::Arc::<str>::from(""),
+                    7,
+                    &series,
+                    3_600_000,
+                    1,
+                ),
                 vec![
                     "metric_name",
                     "fingerprint",
@@ -2556,7 +2579,7 @@ mod tests {
                 ],
             ),
             (
-                MetricLandingRow::metadata(7, &meta),
+                MetricLandingRow::metadata(&std::sync::Arc::<str>::from(""), 7, &meta),
                 vec!["metric_name", "metric_type", "help", "unit", "updated_ns"],
             ),
         ];
@@ -2572,6 +2595,7 @@ mod tests {
                 .collect();
             let mut want: BTreeSet<String> = own_keys.into_iter().map(str::to_string).collect();
             want.insert("kind".to_string());
+            want.insert("org_id".to_string());
             want.insert("received_ms".to_string());
             assert_eq!(got, want, "kind {kind}'s key set");
             assert_eq!(value["kind"].as_u64(), Some(u64::from(kind)));
@@ -2600,6 +2624,7 @@ mod tests {
 
         let (labels, _) = LabelSet::from_normalized([("a".to_string(), "b".to_string())]);
         let series = MetricLandingRow::series(
+            &std::sync::Arc::<str>::from(""),
             7,
             &SeriesRef {
                 metric_name: Arc::from("m"),
@@ -2617,6 +2642,7 @@ mod tests {
         assert_eq!(series.help, "");
 
         let meta = MetricLandingRow::metadata(
+            &std::sync::Arc::<str>::from(""),
             7,
             &MetricMetadata {
                 metric_name: Arc::from("m"),
@@ -2695,7 +2721,7 @@ mod tests {
             labels,
         };
 
-        let row = MetricLandingRow::series(0, &series, 0, 0);
+        let row = MetricLandingRow::series(&std::sync::Arc::<str>::from(""), 0, &series, 0, 0);
 
         assert_eq!(
             row.labels, r#"{"instance":"10.0.0.7:9100","job":"checkout"}"#,

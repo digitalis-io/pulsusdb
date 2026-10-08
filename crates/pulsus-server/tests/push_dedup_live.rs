@@ -1182,6 +1182,7 @@ async fn seed_series(client: &ChClient, name: &str, fp: u128, at_ms: i64, job: &
     // Issue #623: one kind-2 landing row, which the two views turn into the
     // activity row and the label row.
     let series = vec![MetricLandingRow::series(
+        &std::sync::Arc::<str>::from(""),
         at_ms,
         &SeriesRef {
             metric_name: name.into(),
@@ -1205,6 +1206,7 @@ async fn seed_floats(client: &ChClient, name: &str, fp: u128, rows: &[(i64, f64)
         .iter()
         .map(|(at_ms, value)| {
             MetricLandingRow::float_sample(
+                &std::sync::Arc::<str>::from(""),
                 *at_ms,
                 &pulsus_write::MetricPoint {
                     metric_name: name.into(),
@@ -1285,6 +1287,7 @@ async fn one_answer_per_series_millisecond() {
     )
     .await;
     let hist = vec![MetricLandingRow::hist_sample(
+        &std::sync::Arc::<str>::from(""),
         at_ms,
         &pulsus_write::HistogramPoint {
             metric_name: "m4_probe".into(),

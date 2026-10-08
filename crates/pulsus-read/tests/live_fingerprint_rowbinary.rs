@@ -221,6 +221,7 @@ async fn seed(client: &ChClient, db: &str) {
         .into_iter()
         .map(|fingerprint| {
             MetricLandingRow::series(
+                &std::sync::Arc::<str>::from(""),
                 ts_ms,
                 &SeriesRef {
                     metric_name: "pulsus_probe".into(),
@@ -250,6 +251,7 @@ async fn seed(client: &ChClient, db: &str) {
         .flat_map(|fingerprint| {
             [
                 MetricLandingRow::float_sample(
+                    &std::sync::Arc::<str>::from(""),
                     ts_ms,
                     &pulsus_write::MetricPoint {
                         metric_name: "pulsus_probe".into(),
@@ -259,6 +261,7 @@ async fn seed(client: &ChClient, db: &str) {
                     },
                 ),
                 MetricLandingRow::hist_sample(
+                    &std::sync::Arc::<str>::from(""),
                     ts_ms,
                     &pulsus_write::HistogramPoint {
                         metric_name: "pulsus_probe_hist".into(),

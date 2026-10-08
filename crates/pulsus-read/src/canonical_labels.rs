@@ -17,12 +17,12 @@
 //!   labels through this decoder.
 //! * The metric label pushdown renders
 //!   `JSONExtractString(labels, '<key>') = '<value>'`
-//!   (`crates/pulsus-read/src/metrics/series_where.rs:384`), and the
+//!   (`crates/pulsus-read/src/metrics/series_where.rs:393`), and the
 //!   in-process matcher answers the same selector from the label cache,
 //!   which is filled through this decoder. Which of the two paths answers a
 //!   given query is a runtime decision (`crates/pulsus-read/src/metrics/labels.rs:9-14`),
 //!   so the same query can take either — the absent-label rule at
-//!   `crates/pulsus-read/src/metrics/labels.rs:629-632` says so in those
+//!   `crates/pulsus-read/src/metrics/labels.rs:630-633` says so in those
 //!   words.
 //!
 //! So a byte this decoder reads differently from `JSONExtractString` is a
@@ -236,7 +236,7 @@ mod tests {
     ///
     /// `LabelSet::to_canonical_json` is the writer's own expression, the
     /// one `MetricSeriesRow::from_series_at_bucket` and `From<&StreamRow>`
-    /// call (`crates/pulsus-write/src/writer/rows.rs:342` and `:103`), so
+    /// call (`crates/pulsus-write/src/writer/rows.rs:344` and `:105`), so
     /// this is the stored bytes and not a hand-written literal.
     #[test]
     fn every_unicode_scalar_value_survives_the_writer_then_the_reader() {

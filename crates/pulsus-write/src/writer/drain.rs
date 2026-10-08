@@ -31,7 +31,7 @@
 //!   [`DrainWatch::attempt`] takes that constructor rather than a future and
 //!   hands it to [`Deadline::authorize`]. The landing path issues one insert
 //!   and it is inside that constructor, at
-//!   `crates/pulsus-write/src/writer/metric.rs:1111`: `git grep -nE
+//!   `crates/pulsus-write/src/writer/metric.rs:1207`: `git grep -nE
 //!   'inserter$' -- crates/pulsus-write/src` returns that call's first line
 //!   and nothing else. The pattern is anchored so this comment is not one of
 //!   its own results — an unanchored one is, which is how the count read as

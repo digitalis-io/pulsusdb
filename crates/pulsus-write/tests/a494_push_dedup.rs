@@ -860,6 +860,7 @@ async fn a_descriptor_that_comes_back_is_stored_again() {
     for (metric_type, updated_ns) in [("counter", 1), ("gauge", 2), ("counter", 3)] {
         let wait = writer
             .admit_flush(
+                &no_tenant(),
                 metadata_batch("http_requests_total", metric_type, updated_ns),
                 PushHeaders::default(),
             )
@@ -931,7 +932,12 @@ async fn concurrent_identical_descriptor_bearing_pushes_store_one_copy() {
         let gate = gate.clone();
         tasks.spawn(async move {
             gate.wait().await;
-            MetricSink::admit(writer.as_ref(), body(), PushHeaders::default())
+            MetricSink::admit(
+                writer.as_ref(),
+                &no_tenant(),
+                body(),
+                PushHeaders::default(),
+            )
         });
     }
     let results: Vec<Result<(), AdmitRefusal>> = tasks.join_all().await;
@@ -988,7 +994,7 @@ async fn a_retried_push_carrying_the_same_descriptor_is_still_suppressed() {
 
     for _ in 0..2 {
         let wait = writer
-            .admit_flush(body(), PushHeaders::default())
+            .admit_flush(&no_tenant(), body(), PushHeaders::default())
             .expect("queue has room");
         wait.await.expect("the flush settles");
     }
@@ -1038,14 +1044,14 @@ async fn a_suppressed_push_still_lands_its_descriptor_alone() {
     };
 
     let wait = writer
-        .admit_flush(body(), PushHeaders::default())
+        .admit_flush(&no_tenant(), body(), PushHeaders::default())
         .expect("queue has room");
     wait.await.expect("the first push settles");
     assert_eq!(landing.call_count(), 1);
     writer.forget_sent_descriptors_for_test();
 
     let wait = writer
-        .admit_flush(body(), PushHeaders::default())
+        .admit_flush(&no_tenant(), body(), PushHeaders::default())
         .expect("queue has room");
     wait.await
         .expect("the suppressed caller gets the original push's outcome, a success");
@@ -1162,4 +1168,10 @@ async fn a_settle_wakes_its_own_keys_waiters_and_no_others() {
         "a settle of one key must not wake another key's waiter"
     );
     drop((b_guard, b_rx));
+}
+
+/// The single-tenant deployment's tenant: no `X-Scope-OrgID`.
+#[allow(dead_code)]
+fn no_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("no header is the empty tenant")
 }

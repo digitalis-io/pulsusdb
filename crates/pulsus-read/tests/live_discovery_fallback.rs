@@ -265,8 +265,14 @@ async fn degraded_regex_name_discovery_matches_the_warm_path_byte_for_byte() {
     let warm = warm_engine(db, 1_000).await;
     let cold = cold_engine(db, 1_000).await;
 
-    let warm_series = warm.series(&filters, window).await.expect("warm series");
-    let cold_series = cold.series(&filters, window).await.expect("cold series");
+    let warm_series = warm
+        .series(&no_tenant(), &filters, window)
+        .await
+        .expect("warm series");
+    let cold_series = cold
+        .series(&no_tenant(), &filters, window)
+        .await
+        .expect("cold series");
     assert_eq!(
         warm_series, cold_series,
         "degraded /series must equal the warm path byte-for-byte"
@@ -281,11 +287,11 @@ async fn degraded_regex_name_discovery_matches_the_warm_path_byte_for_byte() {
     );
 
     let warm_names = warm
-        .label_names(&filters, window)
+        .label_names(&no_tenant(), &filters, window)
         .await
         .expect("warm label_names");
     let cold_names = cold
-        .label_names(&filters, window)
+        .label_names(&no_tenant(), &filters, window)
         .await
         .expect("cold label_names");
     assert_eq!(warm_names, cold_names, "degraded /labels must equal warm");
@@ -293,11 +299,11 @@ async fn degraded_regex_name_discovery_matches_the_warm_path_byte_for_byte() {
     assert!(cold_names.contains(&"job".to_string()));
 
     let warm_metric_values = warm
-        .label_values("__name__", &filters, window)
+        .label_values(&no_tenant(), "__name__", &filters, window)
         .await
         .expect("warm label_values(__name__)");
     let cold_metric_values = cold
-        .label_values("__name__", &filters, window)
+        .label_values(&no_tenant(), "__name__", &filters, window)
         .await
         .expect("cold label_values(__name__)");
     assert_eq!(
@@ -318,6 +324,7 @@ async fn degraded_regex_name_discovery_matches_the_warm_path_byte_for_byte() {
     // `clickhouse` crate's `SqlBuilder`. Reproduce that here for the raw
     // recording query.
     let probe_sql = pulsus_read::metrics::sql::distinct_metric_names_probe(
+        &no_tenant(),
         &format!("{db}.metric_series"),
         &format!("{db}.metric_labels"),
         &filters[0].name_matchers,
@@ -419,7 +426,7 @@ async fn degraded_regex_name_discovery_over_the_fanout_cap_is_query_too_broad() 
 
     let cold = cold_engine(db, 2).await;
     let err = cold
-        .series(&filters, window)
+        .series(&no_tenant(), &filters, window)
         .await
         .expect_err("3 names over a cap of 2 must be rejected");
     match err {
@@ -437,6 +444,7 @@ async fn degraded_regex_name_discovery_over_the_fanout_cap_is_query_too_broad() 
 /// and its own label row in `metric_labels`.
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedActivityRow {
+    org_id: String,
     day: u16,
     fingerprint: u128,
     metric_name: String,
@@ -445,6 +453,7 @@ struct SeedActivityRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedLabelRow {
+    org_id: String,
     metric_name: String,
     fingerprint: u128,
     labels: String,
@@ -457,6 +466,7 @@ async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
     let activity: Vec<SeedActivityRow> = rows
         .iter()
         .map(|r| SeedActivityRow {
+            org_id: String::new(),
             day: r.unix_milli.div_euclid(86_400_000) as u16,
             fingerprint: r.fingerprint,
             metric_name: r.metric_name.clone(),
@@ -466,6 +476,7 @@ async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
     let labels: Vec<SeedLabelRow> = rows
         .iter()
         .map(|r| SeedLabelRow {
+            org_id: String::new(),
             metric_name: r.metric_name.clone(),
             fingerprint: r.fingerprint,
             labels: r.labels.clone(),
@@ -481,4 +492,10 @@ async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
         .insert_block("metric_labels", &labels)
         .await
         .expect("seed metric_labels");
+}
+
+/// The single-tenant deployment's tenant: no `X-Scope-OrgID`.
+#[allow(dead_code)]
+fn no_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("no header is the empty tenant")
 }

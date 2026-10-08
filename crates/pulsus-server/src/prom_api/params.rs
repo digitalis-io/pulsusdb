@@ -102,6 +102,10 @@ pub(crate) enum ParamError {
     UnsupportedContentType(String),
     #[error("request body is not valid UTF-8")]
     InvalidFormBody,
+    /// Issue #635 part 4: an `X-Scope-OrgID` outside the tenant rule
+    /// (`pulsus_model::Tenant::from_header`).
+    #[error("invalid X-Scope-OrgID")]
+    InvalidTenant,
 }
 
 /// Unix milliseconds, right now. Matches `logs_api::params::now_ns`'s own

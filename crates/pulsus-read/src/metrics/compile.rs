@@ -1228,7 +1228,7 @@ pub struct SelectorRead {
 ///
 /// **`saturating_mul`, not `*`.** `parse_time` clamps to `i64::MAX`
 /// milliseconds rather than rejecting
-/// (`crates/pulsus-server/src/prom_api/params.rs:127`), so `start_ms ==
+/// (`crates/pulsus-server/src/prom_api/params.rs:131`), so `start_ms ==
 /// i64::MAX` is reachable from a request; a plain multiply panics in a
 /// debug build — every test binary is one — and wraps in release. The
 /// first millisecond value that does not fit is `9_223_372_036_855`.

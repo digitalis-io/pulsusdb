@@ -81,12 +81,13 @@
 //! and no `by`/`without` list is rendered, so the three grouping forms
 //! produce **byte-identical text** outside the `gids` array.
 
-use pulsus_model::FpLiteral;
+use pulsus_model::{FpLiteral, Tenant};
 
 use pulsus_promql::Grouping;
 
 use crate::logql::escape::ch_string;
 
+use super::TenantSql;
 use super::grouped::{Grid, GroupedOp, PushedRangeFn, RangeAggOp};
 use super::sample_sql;
 
@@ -126,6 +127,7 @@ const STALE_NAN_DECIMAL: u64 = 9_218_868_437_227_405_314;
 /// text that test writes out itself.
 #[allow(clippy::too_many_arguments)]
 pub fn grouped_fetch(
+    tenant: &Tenant,
     samples_table: &str,
     hist_samples_table: &str,
     fps: &[FpLiteral],
@@ -135,7 +137,11 @@ pub fn grouped_fetch(
     upper_incl_ms: i64,
     op: GroupedOp,
 ) -> String {
-    let window = sample_sql::window_predicate(lower_excl_ms, upper_incl_ms);
+    let window = format!(
+        "org_id = {} AND {}",
+        tenant.sql_literal(),
+        sample_sql::window_predicate(lower_excl_ms, upper_incl_ms)
+    );
     let fp_list = sample_sql::render_fingerprint_list(fps);
     let gid_list = gids
         .iter()
@@ -296,6 +302,7 @@ pub fn grouped_fetch(
 /// ([`super::grouped::node_verdicts`] owns that guard).
 #[allow(clippy::too_many_arguments)]
 pub fn range_aggregate_fetch(
+    tenant: &Tenant,
     samples_table: &str,
     hist_samples_table: &str,
     labels_table: &str,
@@ -308,7 +315,11 @@ pub fn range_aggregate_fetch(
     func: PushedRangeFn,
 ) -> String {
     let (lower_excl_ms, upper_incl_ms) = range_window(grid, range_ms);
-    let window = sample_sql::window_predicate(lower_excl_ms, upper_incl_ms);
+    let window = format!(
+        "org_id = {} AND {}",
+        tenant.sql_literal(),
+        sample_sql::window_predicate(lower_excl_ms, upper_incl_ms)
+    );
     let Grid {
         start_ms,
         step_ms,
@@ -368,12 +379,18 @@ pub fn range_aggregate_fetch(
     };
     let agg = range_agg_expression(op);
     let gkey = group_key_expression(grouping);
+    // Issue #635 part 4: the member read is scoped to the tenant like
+    // every other metrics table read.
     let members_where = match members_scope {
         Some(name) => format!(
-            "WHERE metric_name = {}\n            AND fingerprint IN (",
+            "WHERE org_id = {} AND metric_name = {}\n            AND fingerprint IN (",
+            tenant.sql_literal(),
             ch_string(name)
         ),
-        None => "WHERE fingerprint IN (".to_string(),
+        None => format!(
+            "WHERE org_id = {} AND fingerprint IN (",
+            tenant.sql_literal()
+        ),
     };
 
     format!(
@@ -631,6 +648,11 @@ mod tests {
     use super::*;
     use pulsus_model::Fingerprint;
 
+    /// The single-tenant deployment's tenant: no `X-Scope-OrgID`.
+    fn no_tenant() -> Tenant {
+        Tenant::from_header(None, false).expect("no header is the empty tenant")
+    }
+
     fn grid() -> Grid {
         Grid {
             start_ms: 1_782_907_200_000,
@@ -642,6 +664,7 @@ mod tests {
 
     fn sql(op: GroupedOp) -> String {
         grouped_fetch(
+            &no_tenant(),
             "metric_samples",
             "metric_hist_samples",
             &[
@@ -719,14 +742,14 @@ mod tests {
              CAST(0, 'UInt8') AS is_hist,\n\
              \x20                  reinterpretAsUInt64(value) = 9218868437227405314 AS stale\n\
              \x20           FROM metric_samples\n\
-             \x20           WHERE unix_milli > 1782906900000 AND unix_milli <= 1782910800000 \
+             \x20           WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782910800000 \
              AND fingerprint IN fps\n\
              \x20           UNION ALL\n\
              \x20           SELECT fingerprint, unix_milli AS ts, CAST(0, 'Float64') AS v, \
              CAST(1, 'UInt8') AS is_hist,\n\
              \x20                  reinterpretAsUInt64(sum) = 9218868437227405314 AS stale\n\
              \x20           FROM metric_hist_samples\n\
-             \x20           WHERE unix_milli > 1782906900000 AND unix_milli <= 1782910800000 \
+             \x20           WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782910800000 \
              AND fingerprint IN fps\n\
              \x20         )\n\
              \x20       )\n\
@@ -778,6 +801,7 @@ mod tests {
     #[test]
     fn only_the_gids_array_carries_the_grouping() {
         let a = grouped_fetch(
+            &no_tenant(),
             "metric_samples",
             "metric_hist_samples",
             &[
@@ -791,6 +815,7 @@ mod tests {
             GroupedOp::Max,
         );
         let b = grouped_fetch(
+            &no_tenant(),
             "metric_samples",
             "metric_hist_samples",
             &[
@@ -912,6 +937,7 @@ mod tests {
 
     fn by_ids_sql(op: RangeAggOp, func: PushedRangeFn, grouping: Option<&Grouping>) -> String {
         range_aggregate_fetch(
+            &no_tenant(),
             "metric_samples",
             "metric_hist_samples",
             "metric_labels",
@@ -1100,12 +1126,13 @@ mod tests {
                     let tail = format!(
                         "SELECT CAST([('', '')], 'Array(Tuple(String, String))') AS gid, \
                          toUInt32(0) AS gi,\n  toFloat64((SELECT count() FROM metric_hist_samples\n\
-                         \x20            WHERE unix_milli > 1791430980000 AND unix_milli <= \
+                         \x20            WHERE org_id = '' AND unix_milli > 1791430980000 AND unix_milli <= \
                          1791434340000 AND fingerprint IN (\n{PLAN_IDS}\n))) AS agg\n\
                          ORDER BY gid, gi"
                     );
                     assert!(s.ends_with(&tail), "{what}");
                     let nameless = range_aggregate_fetch(
+                        &no_tenant(),
                         "metric_samples",
                         "metric_hist_samples",
                         "metric_labels",
@@ -1119,8 +1146,8 @@ mod tests {
                     );
                     assert_eq!(
                         nameless.replace(
-                            "WHERE fingerprint IN (",
-                            "WHERE metric_name = 'cpu_seconds'\n            AND fingerprint IN ("
+                            "WHERE org_id = '' AND fingerprint IN (",
+                            "WHERE org_id = '' AND metric_name = 'cpu_seconds'\n            AND fingerprint IN ("
                         ),
                         s,
                         "{what}"

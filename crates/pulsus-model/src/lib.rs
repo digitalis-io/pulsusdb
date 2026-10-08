@@ -9,6 +9,7 @@ mod histogram;
 mod labels;
 mod matcher;
 mod sample;
+mod tenant;
 mod time;
 
 pub use canonical::{
@@ -30,6 +31,7 @@ pub use histogram::{
 pub use labels::{LabelError, LabelSet, resolve_structured_metadata, retain_non_empty_values};
 pub use matcher::{LabelMatcher, MatchOp};
 pub use sample::{LogSample, MetricSample, STALE_NAN_BITS, Series};
+pub use tenant::{MAX_TENANT_BYTES, TENANT_HEADER, Tenant, TenantError, tenant_from_headers};
 pub use time::{
     ACTIVITY_BUCKET_MS, Date, Fingerprint, FpLiteral, UnixMilli, UnixNano, floor_to_activity_bucket,
 };

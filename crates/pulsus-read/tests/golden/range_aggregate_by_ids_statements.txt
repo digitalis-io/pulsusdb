@@ -64,7 +64,7 @@ FROM (
                     FROM (
                       SELECT fingerprint, arraySort(arrayZip(groupArray(unix_milli), arrayMap(v -> reinterpretAsUInt64(v), groupArray(value)))) AS raw
                       FROM metric_samples
-                      WHERE unix_milli > 1791430980000 AND unix_milli <= 1791434340000 AND fingerprint IN (
+                      WHERE org_id = '' AND unix_milli > 1791430980000 AND unix_milli <= 1791434340000 AND fingerprint IN (
 SELECT fingerprint
 FROM metric_series
 WHERE day BETWEEN '2026-10-08' AND '2026-10-08'
@@ -90,7 +90,7 @@ WHERE day BETWEEN '2026-10-08' AND '2026-10-08'
         FROM (
           SELECT fingerprint, any(metric_name) AS name, any(labels) AS l
           FROM metric_labels
-          WHERE metric_name = 'cpu_seconds'
+          WHERE org_id = '' AND metric_name = 'cpu_seconds'
             AND fingerprint IN (
 SELECT fingerprint
 FROM metric_series
@@ -113,7 +113,7 @@ WHERE day BETWEEN '2026-10-08' AND '2026-10-08'
 UNION ALL
 SELECT CAST([('', '')], 'Array(Tuple(String, String))') AS gid, toUInt32(0) AS gi,
   toFloat64((SELECT count() FROM metric_hist_samples
-             WHERE unix_milli > 1791430980000 AND unix_milli <= 1791434340000 AND fingerprint IN (
+             WHERE org_id = '' AND unix_milli > 1791430980000 AND unix_milli <= 1791434340000 AND fingerprint IN (
 SELECT fingerprint
 FROM metric_series
 WHERE day BETWEEN '2026-10-08' AND '2026-10-08'
@@ -181,7 +181,7 @@ FROM (
                     FROM (
                       SELECT fingerprint, arraySort(arrayZip(groupArray(unix_milli), arrayMap(v -> reinterpretAsUInt64(v), groupArray(value)))) AS raw
                       FROM metric_samples
-                      WHERE unix_milli > 1791430980000 AND unix_milli <= 1791434340000 AND fingerprint IN (
+                      WHERE org_id = '' AND unix_milli > 1791430980000 AND unix_milli <= 1791434340000 AND fingerprint IN (
 SELECT fingerprint
 FROM metric_series
 WHERE day BETWEEN '2026-10-08' AND '2026-10-08'
@@ -207,7 +207,7 @@ WHERE day BETWEEN '2026-10-08' AND '2026-10-08'
         FROM (
           SELECT fingerprint, any(metric_name) AS name, any(labels) AS l
           FROM metric_labels
-          WHERE metric_name = 'cpu_seconds'
+          WHERE org_id = '' AND metric_name = 'cpu_seconds'
             AND fingerprint IN (
 SELECT fingerprint
 FROM metric_series
@@ -231,7 +231,7 @@ WHERE day BETWEEN '2026-10-08' AND '2026-10-08'
 UNION ALL
 SELECT CAST([('', '')], 'Array(Tuple(String, String))') AS gid, toUInt32(0) AS gi,
   toFloat64((SELECT count() FROM metric_hist_samples
-             WHERE unix_milli > 1791430980000 AND unix_milli <= 1791434340000 AND fingerprint IN (
+             WHERE org_id = '' AND unix_milli > 1791430980000 AND unix_milli <= 1791434340000 AND fingerprint IN (
 SELECT fingerprint
 FROM metric_series
 WHERE day BETWEEN '2026-10-08' AND '2026-10-08'
@@ -309,7 +309,7 @@ FROM (
                     FROM (
                       SELECT fingerprint, arraySort(arrayZip(groupArray(unix_milli), arrayMap(v -> reinterpretAsUInt64(v), groupArray(value)))) AS raw
                       FROM metric_samples
-                      WHERE unix_milli > 1791430980000 AND unix_milli <= 1791434340000 AND fingerprint IN (
+                      WHERE org_id = '' AND unix_milli > 1791430980000 AND unix_milli <= 1791434340000 AND fingerprint IN (
 SELECT fingerprint
 FROM metric_series
 WHERE day BETWEEN '2026-10-08' AND '2026-10-08'
@@ -335,7 +335,7 @@ WHERE day BETWEEN '2026-10-08' AND '2026-10-08'
         FROM (
           SELECT fingerprint, any(metric_name) AS name, any(labels) AS l
           FROM metric_labels
-          WHERE metric_name = 'cpu_seconds'
+          WHERE org_id = '' AND metric_name = 'cpu_seconds'
             AND fingerprint IN (
 SELECT fingerprint
 FROM metric_series
@@ -358,7 +358,7 @@ WHERE day BETWEEN '2026-10-08' AND '2026-10-08'
 UNION ALL
 SELECT CAST([('', '')], 'Array(Tuple(String, String))') AS gid, toUInt32(0) AS gi,
   toFloat64((SELECT count() FROM metric_hist_samples
-             WHERE unix_milli > 1791430980000 AND unix_milli <= 1791434340000 AND fingerprint IN (
+             WHERE org_id = '' AND unix_milli > 1791430980000 AND unix_milli <= 1791434340000 AND fingerprint IN (
 SELECT fingerprint
 FROM metric_series
 WHERE day BETWEEN '2026-10-08' AND '2026-10-08'
@@ -438,7 +438,7 @@ FROM (
                     FROM (
                       SELECT fingerprint, arraySort(arrayZip(groupArray(unix_milli), arrayMap(v -> reinterpretAsUInt64(v), groupArray(value)))) AS raw
                       FROM metric_samples
-                      WHERE unix_milli > 1791430980000 AND unix_milli <= 1791434340000 AND fingerprint IN (
+                      WHERE org_id = '' AND unix_milli > 1791430980000 AND unix_milli <= 1791434340000 AND fingerprint IN (
 SELECT fingerprint
 FROM metric_series
 WHERE day BETWEEN '2026-10-08' AND '2026-10-08'
@@ -464,7 +464,7 @@ WHERE day BETWEEN '2026-10-08' AND '2026-10-08'
         FROM (
           SELECT fingerprint, any(metric_name) AS name, any(labels) AS l
           FROM metric_labels
-          WHERE metric_name = 'cpu_seconds'
+          WHERE org_id = '' AND metric_name = 'cpu_seconds'
             AND fingerprint IN (
 SELECT fingerprint
 FROM metric_series
@@ -487,7 +487,7 @@ WHERE day BETWEEN '2026-10-08' AND '2026-10-08'
 UNION ALL
 SELECT CAST([('', '')], 'Array(Tuple(String, String))') AS gid, toUInt32(0) AS gi,
   toFloat64((SELECT count() FROM metric_hist_samples
-             WHERE unix_milli > 1791430980000 AND unix_milli <= 1791434340000 AND fingerprint IN (
+             WHERE org_id = '' AND unix_milli > 1791430980000 AND unix_milli <= 1791434340000 AND fingerprint IN (
 SELECT fingerprint
 FROM metric_series
 WHERE day BETWEEN '2026-10-08' AND '2026-10-08'
@@ -561,7 +561,7 @@ FROM (
                     FROM (
                       SELECT fingerprint, arraySort(arrayZip(groupArray(unix_milli), arrayMap(v -> reinterpretAsUInt64(v), groupArray(value)))) AS raw
                       FROM metric_samples
-                      WHERE unix_milli > 1791430980000 AND unix_milli <= 1791434340000 AND fingerprint IN (
+                      WHERE org_id = '' AND unix_milli > 1791430980000 AND unix_milli <= 1791434340000 AND fingerprint IN (
 SELECT fingerprint
 FROM metric_series
 WHERE day BETWEEN '2026-10-08' AND '2026-10-08'
@@ -587,7 +587,7 @@ WHERE day BETWEEN '2026-10-08' AND '2026-10-08'
         FROM (
           SELECT fingerprint, any(metric_name) AS name, any(labels) AS l
           FROM metric_labels
-          WHERE metric_name = 'cpu_seconds'
+          WHERE org_id = '' AND metric_name = 'cpu_seconds'
             AND fingerprint IN (
 SELECT fingerprint
 FROM metric_series
@@ -610,7 +610,7 @@ WHERE day BETWEEN '2026-10-08' AND '2026-10-08'
 UNION ALL
 SELECT CAST([('', '')], 'Array(Tuple(String, String))') AS gid, toUInt32(0) AS gi,
   toFloat64((SELECT count() FROM metric_hist_samples
-             WHERE unix_milli > 1791430980000 AND unix_milli <= 1791434340000 AND fingerprint IN (
+             WHERE org_id = '' AND unix_milli > 1791430980000 AND unix_milli <= 1791434340000 AND fingerprint IN (
 SELECT fingerprint
 FROM metric_series
 WHERE day BETWEEN '2026-10-08' AND '2026-10-08'
@@ -686,7 +686,7 @@ FROM (
                     FROM (
                       SELECT fingerprint, arraySort(arrayZip(groupArray(unix_milli), arrayMap(v -> reinterpretAsUInt64(v), groupArray(value)))) AS raw
                       FROM metric_samples
-                      WHERE unix_milli > 1791430980000 AND unix_milli <= 1791434340000 AND fingerprint IN (
+                      WHERE org_id = '' AND unix_milli > 1791430980000 AND unix_milli <= 1791434340000 AND fingerprint IN (
 SELECT fingerprint
 FROM metric_series
 WHERE day BETWEEN '2026-10-08' AND '2026-10-08'
@@ -712,7 +712,7 @@ WHERE day BETWEEN '2026-10-08' AND '2026-10-08'
         FROM (
           SELECT fingerprint, any(metric_name) AS name, any(labels) AS l
           FROM metric_labels
-          WHERE metric_name = 'cpu_seconds'
+          WHERE org_id = '' AND metric_name = 'cpu_seconds'
             AND fingerprint IN (
 SELECT fingerprint
 FROM metric_series
@@ -735,7 +735,7 @@ WHERE day BETWEEN '2026-10-08' AND '2026-10-08'
 UNION ALL
 SELECT CAST([('', '')], 'Array(Tuple(String, String))') AS gid, toUInt32(0) AS gi,
   toFloat64((SELECT count() FROM metric_hist_samples
-             WHERE unix_milli > 1791430980000 AND unix_milli <= 1791434340000 AND fingerprint IN (
+             WHERE org_id = '' AND unix_milli > 1791430980000 AND unix_milli <= 1791434340000 AND fingerprint IN (
 SELECT fingerprint
 FROM metric_series
 WHERE day BETWEEN '2026-10-08' AND '2026-10-08'
@@ -811,7 +811,7 @@ FROM (
                     FROM (
                       SELECT fingerprint, arraySort(arrayZip(groupArray(unix_milli), arrayMap(v -> reinterpretAsUInt64(v), groupArray(value)))) AS raw
                       FROM metric_samples
-                      WHERE unix_milli > 1791430980000 AND unix_milli <= 1791434340000 AND fingerprint IN (
+                      WHERE org_id = '' AND unix_milli > 1791430980000 AND unix_milli <= 1791434340000 AND fingerprint IN (
 SELECT fingerprint
 FROM metric_series
 WHERE day BETWEEN '2026-10-08' AND '2026-10-08'
@@ -837,7 +837,7 @@ WHERE day BETWEEN '2026-10-08' AND '2026-10-08'
         FROM (
           SELECT fingerprint, any(metric_name) AS name, any(labels) AS l
           FROM metric_labels
-          WHERE metric_name = 'cpu_seconds'
+          WHERE org_id = '' AND metric_name = 'cpu_seconds'
             AND fingerprint IN (
 SELECT fingerprint
 FROM metric_series
@@ -860,7 +860,7 @@ WHERE day BETWEEN '2026-10-08' AND '2026-10-08'
 UNION ALL
 SELECT CAST([('', '')], 'Array(Tuple(String, String))') AS gid, toUInt32(0) AS gi,
   toFloat64((SELECT count() FROM metric_hist_samples
-             WHERE unix_milli > 1791430980000 AND unix_milli <= 1791434340000 AND fingerprint IN (
+             WHERE org_id = '' AND unix_milli > 1791430980000 AND unix_milli <= 1791434340000 AND fingerprint IN (
 SELECT fingerprint
 FROM metric_series
 WHERE day BETWEEN '2026-10-08' AND '2026-10-08'
@@ -938,7 +938,7 @@ FROM (
                     FROM (
                       SELECT fingerprint, arraySort(arrayZip(groupArray(unix_milli), arrayMap(v -> reinterpretAsUInt64(v), groupArray(value)))) AS raw
                       FROM metric_samples
-                      WHERE unix_milli > 1791430980000 AND unix_milli <= 1791434340000 AND fingerprint IN (
+                      WHERE org_id = '' AND unix_milli > 1791430980000 AND unix_milli <= 1791434340000 AND fingerprint IN (
 SELECT fingerprint
 FROM metric_series
 WHERE day BETWEEN '2026-10-08' AND '2026-10-08'
@@ -964,7 +964,7 @@ WHERE day BETWEEN '2026-10-08' AND '2026-10-08'
         FROM (
           SELECT fingerprint, any(metric_name) AS name, any(labels) AS l
           FROM metric_labels
-          WHERE metric_name = 'cpu_seconds'
+          WHERE org_id = '' AND metric_name = 'cpu_seconds'
             AND fingerprint IN (
 SELECT fingerprint
 FROM metric_series
@@ -987,7 +987,7 @@ WHERE day BETWEEN '2026-10-08' AND '2026-10-08'
 UNION ALL
 SELECT CAST([('', '')], 'Array(Tuple(String, String))') AS gid, toUInt32(0) AS gi,
   toFloat64((SELECT count() FROM metric_hist_samples
-             WHERE unix_milli > 1791430980000 AND unix_milli <= 1791434340000 AND fingerprint IN (
+             WHERE org_id = '' AND unix_milli > 1791430980000 AND unix_milli <= 1791434340000 AND fingerprint IN (
 SELECT fingerprint
 FROM metric_series
 WHERE day BETWEEN '2026-10-08' AND '2026-10-08'
@@ -1065,7 +1065,7 @@ FROM (
                     FROM (
                       SELECT fingerprint, arraySort(arrayZip(groupArray(unix_milli), arrayMap(v -> reinterpretAsUInt64(v), groupArray(value)))) AS raw
                       FROM metric_samples
-                      WHERE unix_milli > 1791430980000 AND unix_milli <= 1791434340000 AND fingerprint IN (
+                      WHERE org_id = '' AND unix_milli > 1791430980000 AND unix_milli <= 1791434340000 AND fingerprint IN (
 SELECT fingerprint
 FROM metric_series
 WHERE day BETWEEN '2026-10-08' AND '2026-10-08'
@@ -1091,7 +1091,7 @@ WHERE day BETWEEN '2026-10-08' AND '2026-10-08'
         FROM (
           SELECT fingerprint, any(metric_name) AS name, any(labels) AS l
           FROM metric_labels
-          WHERE metric_name = 'cpu_seconds'
+          WHERE org_id = '' AND metric_name = 'cpu_seconds'
             AND fingerprint IN (
 SELECT fingerprint
 FROM metric_series
@@ -1114,7 +1114,7 @@ WHERE day BETWEEN '2026-10-08' AND '2026-10-08'
 UNION ALL
 SELECT CAST([('', '')], 'Array(Tuple(String, String))') AS gid, toUInt32(0) AS gi,
   toFloat64((SELECT count() FROM metric_hist_samples
-             WHERE unix_milli > 1791430980000 AND unix_milli <= 1791434340000 AND fingerprint IN (
+             WHERE org_id = '' AND unix_milli > 1791430980000 AND unix_milli <= 1791434340000 AND fingerprint IN (
 SELECT fingerprint
 FROM metric_series
 WHERE day BETWEEN '2026-10-08' AND '2026-10-08'

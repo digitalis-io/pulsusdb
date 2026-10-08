@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use pulsus_model::{Fingerprint, LabelSet, NativeHistogram};
+use pulsus_model::{Fingerprint, LabelSet, NativeHistogram, Tenant};
 
 use crate::ingest::{AdmitRefusal, FlushWait, PushHeaders};
 
@@ -153,13 +153,19 @@ pub trait MetricSink: Send + Sync {
     /// headers (issue #494); `Ok(())` does not promise rows were buffered,
     /// because a content-identical push inside the suppression window
     /// stores nothing.
-    fn admit(&self, batch: ParsedMetrics, push: PushHeaders) -> Result<(), AdmitRefusal>;
+    fn admit(
+        &self,
+        tenant: &Tenant,
+        batch: ParsedMetrics,
+        push: PushHeaders,
+    ) -> Result<(), AdmitRefusal>;
 
     /// Admits `batch` for sync-mode requests: the caller `.await`s the
     /// returned [`FlushWait`] before responding. For a suppressed push that
     /// wait resolves to **the original push's** outcome.
     fn admit_flush(
         &self,
+        tenant: &Tenant,
         batch: ParsedMetrics,
         push: PushHeaders,
     ) -> Result<FlushWait, AdmitRefusal>;

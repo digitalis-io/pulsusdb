@@ -205,7 +205,7 @@ async fn silent_last_week_series_is_absent_from_the_cache_but_resolves_via_metri
         start_ms: last_week_bucket - bucket,
         end_ms: last_week_bucket + bucket,
     };
-    let resolution = cache.resolve("up", &[], window);
+    let resolution = cache.resolve(&no_tenant(), "up", &[], window);
     let sql = match resolution {
         Resolution::SqlFallback { sql, reason } => {
             assert_eq!(reason, pulsus_read::FallbackReason::OutOfWindow);
@@ -278,7 +278,14 @@ async fn bucket_floor_boundary_includes_the_mid_bucket_row_and_excludes_the_late
         start_ms: ten_am_bucket + 30 * 60_000,
         end_ms: ten_am_bucket + 40 * 60_000,
     };
-    let sql = historical_series_subquery("metric_series", "metric_labels", "up", window, &[]);
+    let sql = historical_series_subquery(
+        &no_tenant(),
+        "metric_series",
+        "metric_labels",
+        "up",
+        window,
+        &[],
+    );
     let fingerprints = execute_fingerprint_sql(&client, &sql).await;
     assert_eq!(
         fingerprints,
@@ -360,6 +367,7 @@ async fn warm_cache_and_sql_fallback_return_identical_results() {
     };
 
     let in_process = match cache.resolve(
+        &no_tenant(),
         "http_requests_total",
         std::slice::from_ref(&matcher),
         window,
@@ -369,6 +377,7 @@ async fn warm_cache_and_sql_fallback_return_identical_results() {
     };
 
     let sql = historical_resolution_query(
+        &no_tenant(),
         "metric_series",
         "metric_labels",
         "http_requests_total",
@@ -453,7 +462,7 @@ async fn a_cold_cache_falls_back_to_sql_with_the_same_result_a_warm_cache_would_
         start_ms: recent_bucket - bucket,
         end_ms: now_ms,
     };
-    let sql = match cold_cache.resolve("up", &[], window) {
+    let sql = match cold_cache.resolve(&no_tenant(), "up", &[], window) {
         Resolution::SqlFallback { sql, reason } => {
             assert_eq!(reason, pulsus_read::FallbackReason::ColdCache);
             sql
@@ -465,7 +474,7 @@ async fn a_cold_cache_falls_back_to_sql_with_the_same_result_a_warm_cache_would_
 
     // Now warm the same data and confirm the in-process answer agrees.
     cold_cache.refresh().await.expect("refresh");
-    match cold_cache.resolve("up", &[], window) {
+    match cold_cache.resolve(&no_tenant(), "up", &[], window) {
         Resolution::Fingerprints(fps) => assert_eq!(fps, [99].map(Fingerprint::from_raw)),
         other => panic!("expected Fingerprints, got {other:?}"),
     }
@@ -576,6 +585,7 @@ async fn stale_cache_degrades_to_sql_identical_to_ground_truth_and_a_fresh_refre
     };
 
     let sql = match cache.resolve(
+        &no_tenant(),
         "http_requests_total",
         std::slice::from_ref(&matcher),
         far_future_window,
@@ -644,6 +654,7 @@ async fn stale_cache_degrades_to_sql_identical_to_ground_truth_and_a_fresh_refre
         end_ms: now_ms,
     };
     let fresh_in_process = match cache.resolve(
+        &no_tenant(),
         "http_requests_total",
         std::slice::from_ref(&matcher),
         fresh_window,
@@ -737,14 +748,21 @@ async fn a_quote_and_backslash_bearing_label_key_round_trips_identically_on_both
         end_ms: now_ms,
     };
 
-    let in_process = match cache.resolve("up", std::slice::from_ref(&matcher), window) {
+    let in_process = match cache.resolve(&no_tenant(), "up", std::slice::from_ref(&matcher), window)
+    {
         Resolution::Fingerprints(fps) => fps,
         other => panic!("expected a cache hit, got {other:?}"),
     };
     assert_eq!(in_process, [7].map(Fingerprint::from_raw));
 
-    let sql =
-        historical_series_subquery("metric_series", "metric_labels", "up", window, &[matcher]);
+    let sql = historical_series_subquery(
+        &no_tenant(),
+        "metric_series",
+        "metric_labels",
+        "up",
+        window,
+        &[matcher],
+    );
     let via_sql = execute_fingerprint_sql(&client, &sql).await;
     assert_eq!(in_process, via_sql);
 
@@ -862,7 +880,7 @@ async fn a_memory_bounded_sweep_failure_retains_the_last_good_snapshot() {
         .refresh()
         .await
         .expect("a small sweep fits under the tight ceiling");
-    let good = cache.tsdb_snapshot();
+    let good = cache.tsdb_snapshot(&no_tenant());
     assert_eq!(good.num_series, 10, "the last GOOD snapshot");
     assert!(cache.is_warm());
 
@@ -905,7 +923,7 @@ async fn a_memory_bounded_sweep_failure_retains_the_last_good_snapshot() {
     // Behaviour deliberately unchanged: the last good snapshot is still
     // resident, not blanked — a blanked cache would mass-false-empty every
     // in-window query.
-    let after = cache.tsdb_snapshot();
+    let after = cache.tsdb_snapshot(&no_tenant());
     assert_eq!(
         after.num_series, good.num_series,
         "a failed sweep must never clobber the last good snapshot"
@@ -919,6 +937,7 @@ async fn a_memory_bounded_sweep_failure_retains_the_last_good_snapshot() {
 /// and its own label row in `metric_labels`.
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedActivityRow {
+    org_id: String,
     day: u16,
     fingerprint: u128,
     metric_name: String,
@@ -927,6 +946,7 @@ struct SeedActivityRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedLabelRow {
+    org_id: String,
     metric_name: String,
     fingerprint: u128,
     labels: String,
@@ -939,6 +959,7 @@ async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
     let activity: Vec<SeedActivityRow> = rows
         .iter()
         .map(|r| SeedActivityRow {
+            org_id: String::new(),
             day: r.unix_milli.div_euclid(86_400_000) as u16,
             fingerprint: r.fingerprint,
             metric_name: r.metric_name.clone(),
@@ -948,6 +969,7 @@ async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
     let labels: Vec<SeedLabelRow> = rows
         .iter()
         .map(|r| SeedLabelRow {
+            org_id: String::new(),
             metric_name: r.metric_name.clone(),
             fingerprint: r.fingerprint,
             labels: r.labels.clone(),
@@ -963,4 +985,10 @@ async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
         .insert_block("metric_labels", &labels)
         .await
         .expect("seed metric_labels");
+}
+
+/// The single-tenant deployment's tenant: no `X-Scope-OrgID`.
+#[allow(dead_code)]
+fn no_tenant() -> pulsus_model::Tenant {
+    pulsus_model::Tenant::from_header(None, false).expect("no header is the empty tenant")
 }

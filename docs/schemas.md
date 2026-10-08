@@ -44,18 +44,20 @@ The schema's PromQL obligation is **fetch shapes, plus one reduction**: full Pro
 
 ```sql
 CREATE TABLE metric_samples (
+    org_id       LowCardinality(String),     -- the tenant (issue #635)
     fingerprint  UInt128   CODEC(ZSTD(1)),   -- the series ID
     unix_milli   Int64    CODEC(DoubleDelta, ZSTD(1)),
     value        Float64  CODEC(Gorilla, ZSTD(1))
 ) ENGINE = MergeTree
 PARTITION BY toDate(fromUnixTimestamp64Milli(unix_milli))
-ORDER BY (fingerprint, unix_milli)
+ORDER BY (org_id, fingerprint, unix_milli)
 TTL toDateTime(fromUnixTimestamp64Milli(unix_milli)) + INTERVAL 7 DAY DELETE
 SETTINGS ttl_only_drop_parts = 1,
          primary_key_ratio_of_unique_prefix_values_to_skip_suffix_columns = 1;
 ```
 
-- **The series ID leads the key** (issue #623). `fingerprint` is the series ID: the top 32 bits of `cityHash64(metric_name)`, then the low 96 bits of the 128-bit hash of `metric_name ++ 0xFF ++` the label buffer (`pulsus_model::series_fingerprint`). One label set under two names is two series, and a metric's series share the name prefix, so they sort together as they did when `metric_name` led the key: reading one metric's IDs reads one key range. Measured: 1,000 IDs of one of 200 metrics, a day merged into one part, read 81,920 sample rows; a uniform hash puts them in about 763 granules, 6.25 million rows. Two names sharing a prefix share their granules; identity is unaffected. Among 100,000 names about one pair is expected to share a 32-bit prefix (298 pairs at 24 bits); two names sharing a prefix each read the other's samples in that range, and no series is merged (issue #635).
+- **The tenant leads every metrics key** (issue #635). A metrics request names its tenant in `X-Scope-OrgID`; no header is the empty tenant `''`, the single-tenant deployment. Every metrics table carries `org_id LowCardinality(String)` first in its sorting key, every view copies it from `metric_landing`, and every metrics table a read names carries `org_id = <tenant>` in its own `WHERE`, so two tenants' equal series IDs never meet in one statement. The five tables that collapse rows with equal keys would otherwise merge two tenants' series into one row. Partitions and the `_dist` sharding key are unchanged. Measured on 200 metrics over ten tenants: the column costs 0.005 bytes per sample row, and one metric's read is unchanged.
+- **The series ID leads the key after the tenant** (issue #623). `fingerprint` is the series ID: the top 32 bits of `cityHash64(metric_name)`, then the low 96 bits of the 128-bit hash of `metric_name ++ 0xFF ++` the label buffer (`pulsus_model::series_fingerprint`). One label set under two names is two series, and a metric's series share the name prefix, so they sort together as they did when `metric_name` led the key: reading one metric's IDs reads one key range. Measured: 1,000 IDs of one of 200 metrics, a day merged into one part, read 81,920 sample rows; a uniform hash puts them in about 763 granules, 6.25 million rows. Two names sharing a prefix share their granules; identity is unaffected. Among 100,000 names about one pair is expected to share a 32-bit prefix (298 pairs at 24 bits); two names sharing a prefix each read the other's samples in that range, and no series is merged (issue #635).
 - **Sample tables are read only with an exact ID list and a time range.** Every flexible match — the metric name, regexes, label matchers — runs on the lookup table below, which yields the IDs.
 - **Each series is contiguous** → per-series reads (every PromQL evaluation) are sequential scans of a few granules.
 - **Daily partitions** on the raw table: retention drops whole partitions (`ttl_only_drop_parts`), and time predicates prune partitions before the index is even consulted.
@@ -66,37 +68,41 @@ SETTINGS ttl_only_drop_parts = 1,
 
 ```sql
 CREATE TABLE metric_labels (                       -- the lookup
+    org_id       LowCardinality(String),
     metric_name  LowCardinality(String),
     fingerprint  UInt128  CODEC(Delta(8), ZSTD(1)),
     labels       String  CODEC(ZSTD(5)),              -- canonical JSON, sorted keys, no __name__
     first_seen   SimpleAggregateFunction(min, Int64) CODEC(ZSTD(1)),
     last_seen    SimpleAggregateFunction(max, Int64) CODEC(ZSTD(1))
 ) ENGINE = AggregatingMergeTree
-ORDER BY (metric_name, fingerprint);
+ORDER BY (org_id, metric_name, fingerprint);
 
 CREATE TABLE metric_series (                       -- the activity
+    org_id       LowCardinality(String),
     day          Date,
     fingerprint  UInt128  CODEC(ZSTD(1)),
     metric_name  LowCardinality(String),
     hours        SimpleAggregateFunction(groupBitOr, UInt32)   -- bit h: samples in hour h, UTC
 ) ENGINE = AggregatingMergeTree
 PARTITION BY day
-ORDER BY fingerprint
+ORDER BY (org_id, fingerprint)
 TTL toDateTime(least((toUInt64(toUInt16(day)) + 1 + 7) * 86400, 4294967295))
 SETTINGS ttl_only_drop_parts = 1;
 
 CREATE TABLE metric_label_index (                  -- the label index (issue #635)
+    org_id       LowCardinality(String),
     key          LowCardinality(String),
     value        String   CODEC(ZSTD(1)),
     fingerprint  UInt128  CODEC(ZSTD(1))
 ) ENGINE = ReplacingMergeTree
-ORDER BY (key, value, fingerprint);
+ORDER BY (org_id, key, value, fingerprint);
 
 CREATE TABLE metric_label_values (                 -- the index's distinct values
+    org_id       LowCardinality(String),
     key          LowCardinality(String),
     value        String   CODEC(ZSTD(1))
 ) ENGINE = ReplacingMergeTree
-ORDER BY (key, value);
+ORDER BY (org_id, key, value);
 ```
 
 - **The label index answers a read with no metric name** (issue #635). The same kind-2 row feeds `metric_label_index_mv`, one row per label of the series, and `metric_label_values_mv`, one row per key and value. A series read with no metric-name scope, no `__name__` matcher and at least one label matcher that does not match the empty string takes its IDs from the index: matchers that do not match `""` intersect their rows, the others remove theirs with `NOT IN`, and a regex runs on `metric_label_values`' distinct values, the index then reading only those values' rows. A stored empty value reads as absent, as `JSONExtractString` reads it, so the two rows that test presence carry `value != ''`. Every other read renders the lookup statement unchanged. `/labels` and `/label/{name}/values` answer a filter with no metric name as `SELECT DISTINCT` over the index. Each kind-2 row writes one index row per label: measured on a 200,000-series block, the views raise the insert's CPU from 902 to 2,571 ms and its rows written from 600,021 to 1,848,989, and the merged index stores 99.8 bytes per series.
@@ -115,13 +121,15 @@ Statement 1, series IDs — the fallback's `IN` set and the `info()` cardinality
 ```sql
 SELECT fingerprint
 FROM metric_series
-WHERE day BETWEEN '2026-09-07' AND '2026-09-07'
+WHERE org_id = ''
+  AND day BETWEEN '2026-09-07' AND '2026-09-07'
   AND 0 * match('', '(?-s)^(?:5..)$') = 0
   AND bitAnd(hours, multiIf(day = '2026-09-07' AND day = '2026-09-07', 12582912, day = '2026-09-07', 12582912, day = '2026-09-07', 16777215, 16777215)) != 0
   AND fingerprint IN (
     SELECT fingerprint
     FROM metric_labels
-    WHERE metric_name = 'up'
+    WHERE org_id = ''
+      AND metric_name = 'up'
       AND JSONExtractString(labels, 'job') = 'api'
       AND match(JSONExtractString(labels, 'status'), '(?-s)^(?:5..)$')
   )
@@ -134,7 +142,8 @@ SELECT fingerprint, any(name) AS metric_name, any(label_text) AS labels
 FROM (
   SELECT fingerprint, metric_name AS name, labels AS label_text
   FROM metric_labels
-  WHERE metric_name = 'up'
+  WHERE org_id = ''
+    AND metric_name = 'up'
     AND JSONExtractString(labels, 'job') = 'api'
     AND match(JSONExtractString(labels, 'status'), '(?-s)^(?:5..)$')
     AND fingerprint IN (
@@ -150,7 +159,8 @@ Statement 3, names — `/label/__name__/values`, and with name matchers and a `L
 ```sql
 SELECT DISTINCT metric_name
 FROM metric_series
-WHERE day BETWEEN '2026-09-07' AND '2026-09-07'
+WHERE org_id = ''
+  AND day BETWEEN '2026-09-07' AND '2026-09-07'
   AND bitAnd(hours, multiIf(…)) != 0
 ORDER BY metric_name
 ```
@@ -162,7 +172,8 @@ SELECT fingerprint, any(name) AS metric_name, any(label_text) AS labels
 FROM (
   SELECT fingerprint, metric_name AS name, labels AS label_text
   FROM metric_labels
-  WHERE metric_name IN ('up', 'down')
+  WHERE org_id = ''
+    AND metric_name IN ('up', 'down')
     AND fingerprint IN (toUInt128('101'), toUInt128('205'))
 )
 GROUP BY fingerprint
@@ -176,13 +187,14 @@ ORDER BY metric_name, fingerprint
 
 ```sql
 CREATE TABLE metric_metadata (
+    org_id       LowCardinality(String),
     metric_name  LowCardinality(String),
     metric_type  LowCardinality(String),   -- counter | gauge | histogram | summary
     help         String,
     unit         String,
     updated_ns   Int64
 ) ENGINE = ReplacingMergeTree(updated_ns)
-ORDER BY metric_name;
+ORDER BY (org_id, metric_name);
 ```
 
 `metric_type` also drives the planner: counter functions on rollup tiers are only legal because the type is known. **`updated_ns` is the `ReplacingMergeTree` version column** (issue #26 fix, mirroring `log_streams`' `ReplacingMergeTree(updated_ns)`): every non-key column here (`metric_type`/`help`/`unit`) sits outside `ORDER BY metric_name`, so without a version column a merge's latest-wins outcome would be nondeterministic — unacceptable given `metric_type` drives planner correctness. The writer emits a new row (receiver-injected `now_ns`) only when the incoming `(metric_type, help, unit)` tuple differs from the last value it durably emitted for that `metric_name`, or the hour has turned since it did (a bounded last-value cache, promoted only when the block commits; issue #623) — idempotent on repeats, and a type change that later reverts (A→B→A) re-emits on the second A rather than being suppressed by a static once-only registration. The hourly resend bounds how long one writer's descriptor can stand over another writer's different one; on a single-host demo every push re-sending every descriptor came to 345,362 rows an hour, 39% of all landed rows.
@@ -238,7 +250,8 @@ GROUP BY fingerprint, ts;
 ```sql
 SELECT fingerprint, unix_milli, value
 FROM metric_samples
-WHERE unix_milli >  {start - 300000 - lookback}
+WHERE org_id = {tenant}
+  AND unix_milli >  {start - 300000 - lookback}
   AND unix_milli <= {end}
   AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990'), ...)
 ORDER BY fingerprint, unix_milli
@@ -310,12 +323,12 @@ FROM (
             SELECT fingerprint, unix_milli AS ts, value AS v, CAST(0, 'UInt8') AS is_hist,
                    reinterpretAsUInt64(value) = 9218868437227405314 AS stale
             FROM metric_samples
-            WHERE unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps
+            WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps
             UNION ALL
             SELECT fingerprint, unix_milli AS ts, CAST(0, 'Float64') AS v, CAST(1, 'UInt8') AS is_hist,
                    reinterpretAsUInt64(sum) = 9218868437227405314 AS stale
             FROM metric_hist_samples
-            WHERE unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps
+            WHERE org_id = '' AND unix_milli > 1782906900000 AND unix_milli <= 1782910800000 AND fingerprint IN fps
           )
         )
         WHERE NOT stale
@@ -363,6 +376,7 @@ The M7 extension foreshadowed in §2 lands as a **separate, dedicated samples ta
 
 ```sql
 CREATE TABLE metric_hist_samples (
+    org_id             LowCardinality(String),
     fingerprint        UInt128   CODEC(ZSTD(1)),
     unix_milli         Int64    CODEC(DoubleDelta, ZSTD(1)),
     schema             Int8     CODEC(ZSTD(1)),   -- exponential schema (−4..8); −53 = NHCB
@@ -379,7 +393,7 @@ CREATE TABLE metric_hist_samples (
     custom_values      Array(Float64) CODEC(ZSTD(1))
 ) ENGINE = MergeTree
 PARTITION BY toDate(fromUnixTimestamp64Milli(unix_milli))
-ORDER BY (fingerprint, unix_milli)
+ORDER BY (org_id, fingerprint, unix_milli)
 TTL toDateTime(fromUnixTimestamp64Milli(unix_milli)) + INTERVAL 7 DAY DELETE
 SETTINGS ttl_only_drop_parts = 1;
 ```
