@@ -130,6 +130,12 @@ pub struct MetricsConfig {
     /// the query and discovery paths — the discovery path never routes
     /// this to the degraded-cache probe fallback.
     pub max_cache_scan: u64,
+    /// Issue #635 part 3: `reader.cache_max_series` — the most series one
+    /// selector with no metric name and no `__name__` matcher may resolve
+    /// to in SQL. Statement R reads `cache_max_series + 1` rows at most;
+    /// more than `cache_max_series` answers `NamelessSelectorUnresolvable`
+    /// naming `OverCardinality`, the label cache's own error for the case.
+    pub cache_max_series: u64,
     /// Issue #82 (retroactive re-review): `ReaderConfig::
     /// promql_max_info_series` — the pathological-cardinality backstop
     /// on a PromQL `info()` node's synthetic `*_info` metadata-family
@@ -660,7 +666,9 @@ impl MetricsEngine {
         // `sample_fetch` explain stages with the real generated SQL (code
         // review round 1, finding 5 — AC requires explain to carry SQL,
         // not just a table name + series count). Nothing here awaits — see
-        // `LabelCache::resolve_labelled`'s own purity contract.
+        // `LabelCache::resolve_labelled`'s own purity contract — except
+        // statement R of a selector with no metric name and no `__name__`
+        // matcher, once per such selector (issue #635 part 3).
         let mut fetch_plans = Vec::with_capacity(plan.selectors.len());
         // Issue #548: what each selector's statements read, in the compile
         // core's predicate lattice, recorded ONLY under the explain
@@ -708,7 +716,17 @@ impl MetricsEngine {
             // issue #579 part 2, into a pushed node's statements over the
             // same groups. One resolution on every path.
             let Some(metric_name) = &sel.metric_name else {
-                let groups = self.resolve_multi(sel, window, explain.as_deref_mut())?;
+                // Issue #635 part 3: with no `__name__` matcher either, the
+                // series resolve in SQL through the label index (statement
+                // R, awaited here, in phase 1) and the samples are read by
+                // a sub-query; with one, from the label cache.
+                let by_index = resolves_through_the_label_index(sel);
+                let groups = if by_index {
+                    self.resolve_nameless(sel, window, explain.as_deref_mut())
+                        .await?
+                } else {
+                    self.resolve_multi(sel, window, explain.as_deref_mut())?
+                };
                 if groups.is_empty() {
                     fetch_plans.push(SelectorFetchPlan::Empty);
                     continue;
@@ -739,8 +757,11 @@ impl MetricsEngine {
                             Ok(push) => {
                                 // F6: today's multi-name fetch, sent only if
                                 // the statement counts a histogram sample.
-                                let (fallback, _) =
-                                    self.multi_fetch_plan(groups, lower_excl, upper_incl, None);
+                                let (fallback, _) = if by_index {
+                                    self.nameless_fetch_plan(sel, groups, window, None)
+                                } else {
+                                    self.multi_fetch_plan(groups, lower_excl, upper_incl, None)
+                                };
                                 self.stage_range_push(
                                     selector_id,
                                     self_pos,
@@ -758,8 +779,11 @@ impl MetricsEngine {
                     }
                     None => {}
                 }
-                let (fetch_plan, read) =
-                    self.multi_fetch_plan(groups, lower_excl, upper_incl, explain.as_deref_mut());
+                let (fetch_plan, read) = if by_index {
+                    self.nameless_fetch_plan(sel, groups, window, explain.as_deref_mut())
+                } else {
+                    self.multi_fetch_plan(groups, lower_excl, upper_incl, explain.as_deref_mut())
+                };
                 if let Some(pred) = read {
                     reads.push(compile::SelectorRead {
                         selector: selector_id,
@@ -1438,6 +1462,125 @@ impl MetricsEngine {
         Ok(groups)
     }
 
+    /// Issue #635 part 3: resolves a selector with no metric name and no
+    /// `__name__` matcher in SQL — statement R reads the names and label
+    /// sets of the series the label index selects in `window`, in
+    /// `(metric_name, fingerprint)` order, and they fold into the same
+    /// groups [`Self::resolve_multi`] answers. The label cache, its scan
+    /// budget and the name fan-out are not consulted: they bound a cache
+    /// walk this route does not do. More than `cache_max_series` series is
+    /// the cache's own error for the case, `OverCardinality`.
+    async fn resolve_nameless(
+        &self,
+        sel: &SelectorSpec,
+        window: DataWindow,
+        mut explain: Option<&mut PlanExplain>,
+    ) -> Result<Vec<MetricSeriesGroup>, ReadError> {
+        let cap = self.config.cache_max_series;
+        let sql =
+            super::sql::nameless_resolution_query(self.series_tables(), &sel.matchers, window, cap);
+        let rows: Vec<super::rows::SeriesRow> = self.fetch_series_rows(sql.clone()).await?;
+        if rows.len() as u64 > cap {
+            return Err(ReadError::NamelessSelectorUnresolvable {
+                reason: format!(
+                    "{:?}",
+                    super::labels::FallbackReason::OverCardinality {
+                        matched: rows.len(),
+                        cap,
+                    }
+                ),
+            });
+        }
+        let total_series = rows.len();
+        let mut groups: Vec<MetricSeriesGroup> = Vec::new();
+        for row in rows {
+            let labels = crate::canonical_labels::parse_canonical_label_set(&row.labels);
+            match groups.last_mut() {
+                Some(g) if g.metric_name == row.metric_name => {
+                    g.series.push((row.fingerprint, labels));
+                }
+                _ => groups.push(MetricSeriesGroup {
+                    metric_name: row.metric_name,
+                    series: vec![(row.fingerprint, labels)],
+                }),
+            }
+        }
+        // Issue #82: the info() cap, as [`Self::resolve_multi`] applies it.
+        if sel.info_family
+            && let Some(reason) = info_cardinality_bound(total_series, self.config.max_info_series)
+        {
+            return Err(ReadError::QueryTooBroad(reason));
+        }
+        if let Some(e) = explain.as_mut() {
+            e.push(
+                "series_resolution",
+                sql,
+                Some(format!(
+                    "label index: {total_series} matching series across {} metric names \
+                     (name-less selector, cap {cap})",
+                    groups.len()
+                )),
+            );
+        }
+        Ok(groups)
+    }
+
+    /// Issue #635 part 3: the sample fetch of a selector
+    /// [`Self::resolve_nameless`] answered — the float and histogram reads
+    /// over statement 1 as a sub-query, never a literal ID list, with each
+    /// ID's name and labels from `groups`. The reads nest the series
+    /// tables, so they run with [`series_read_settings`]. Records the
+    /// explain stages and returns the read only when `explain` is given,
+    /// as [`Self::multi_fetch_plan`] does.
+    fn nameless_fetch_plan(
+        &self,
+        sel: &SelectorSpec,
+        groups: Vec<MetricSeriesGroup>,
+        window: DataWindow,
+        mut explain: Option<&mut PlanExplain>,
+    ) -> (SelectorFetchPlan, Option<Pred>) {
+        let (lower_excl, upper_incl) = (window.start_ms, window.end_ms);
+        let ids = super::sql::nameless_ids_query(self.series_tables(), &sel.matchers, window);
+        let mut labels_by: HashMap<Fingerprint, (String, LabelSet)> = HashMap::new();
+        for g in groups {
+            for (fp, labels) in g.series {
+                labels_by.insert(fp, (g.metric_name.clone(), labels));
+            }
+        }
+        let sql = sample_sql::sample_fetch_subquery(
+            &self.config.samples_table,
+            &ids,
+            lower_excl,
+            upper_incl,
+        );
+        let hist_sql = sample_sql::hist_sample_fetch_subquery(
+            &self.config.hist_samples_table,
+            &ids,
+            lower_excl,
+            upper_incl,
+        );
+        if let Some(e) = explain.as_mut() {
+            e.push("sample_fetch", sql.clone(), None);
+            e.push("hist_sample_fetch", hist_sql.clone(), None);
+        }
+        let read = explain.is_some().then(|| {
+            compile::selector_pred(
+                None,
+                &sample_sql::window_predicate(lower_excl, upper_incl),
+                &sample_sql::subquery_predicate(&ids),
+            )
+        });
+        (
+            SelectorFetchPlan::Multi {
+                sql,
+                hist_sql,
+                labels_by,
+                nested: true,
+            },
+            read,
+        )
+    }
+
     /// Issue #85 (M6-08c): the fan-out's ONE flat `fingerprint IN (…)`
     /// fetch over every resolved series ID, and its histogram twin, from
     /// [`Self::resolve_multi`]'s non-empty groups. Records the explain
@@ -1499,6 +1642,7 @@ impl MetricsEngine {
                 sql,
                 hist_sql,
                 labels_by,
+                nested: false,
             },
             read,
         )
@@ -1629,11 +1773,19 @@ impl MetricsEngine {
                 sql,
                 hist_sql,
                 labels_by,
+                nested,
             } => {
+                // Issue #635 part 3: a read over statement 1 nests the
+                // series tables, so it carries `series_read_settings`.
+                let settings = if nested {
+                    series_read_settings(self.config.read_max_memory_bytes, self.config.distributed)
+                } else {
+                    metrics_read_settings(self.config.read_max_memory_bytes)
+                };
                 let (rows, hist_rows): (Vec<MultiSampleRow>, Vec<MultiHistSampleRow>) =
                     fetch_dual_concurrently(
-                        self.fetch_sample_rows(sql, budget),
-                        self.fetch_sample_rows(hist_sql, budget),
+                        self.fetch_rows_with(sql, &settings, Some(budget)),
+                        self.fetch_rows_with(hist_sql, &settings, Some(budget)),
                     )
                     .await?;
                 let mut series = group_merged_multi_rows(rows, hist_rows, &labels_by)?;
@@ -2622,10 +2774,15 @@ enum SelectorFetchPlan {
     /// name and labels pre-resolved (an ID names one series, issue #623),
     /// plus the paired complementary `metric_hist_samples` fetch (M7-A5a).
     /// Labels are never fabricated empty — see [`group_multi_rows`].
+    ///
+    /// Issue #635 part 3: `nested` when `sql` and `hist_sql` read the IDs
+    /// by statement 1 as a sub-query rather than a literal list — they
+    /// then run with [`series_read_settings`].
     Multi {
         sql: String,
         hist_sql: String,
         labels_by: HashMap<Fingerprint, (String, LabelSet)>,
+        nested: bool,
     },
     /// Provably-empty selection with no fetch at all: a concrete-name
     /// selector whose `name_matchers` exclude its own name (issue #85),
@@ -2641,6 +2798,14 @@ enum SelectorFetchPlan {
 fn invalid_name_matcher_error(name_matchers: &[super::matcher::LabelMatcher]) -> Option<ReadError> {
     super::re2_authority::first_invalid_regex_detail(&[name_matchers])
         .map(|detail| ReadError::Promql(PromqlError::InvalidRegexMatcher { detail }))
+}
+
+/// Issue #635 part 3: whether a selector resolves in SQL through the label
+/// index rather than in the label cache — no concrete metric name and no
+/// `__name__` matcher. A `__name__` matcher is resolved against the
+/// cache's names.
+fn resolves_through_the_label_index(sel: &SelectorSpec) -> bool {
+    sel.metric_name.is_none() && sel.name_matchers.is_empty()
 }
 
 /// The concrete metric name a [`SelectorFetchPlan::Chunks`]/`Fallback`
@@ -3610,6 +3775,37 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect::<Vec<_>>(),
         )
+    }
+
+    /// Issue #635 part 3, U1: a selector with no metric name and no
+    /// `__name__` matcher resolves through the label index; one with a
+    /// `__name__` matcher, or with a concrete name, does not.
+    #[test]
+    fn a_selector_with_no_name_and_no_name_matcher_resolves_through_the_index() {
+        let selector = |q: &str| {
+            let expr = pulsus_promql::parser::parse(q).expect("parse");
+            let params = MetricQueryParams {
+                start_ms: 0,
+                end_ms: 0,
+                step_ms: 0,
+            }
+            .plan_params(false);
+            pulsus_promql::plan(&expr, params)
+                .expect("plan")
+                .selectors
+                .remove(0)
+        };
+        for q in [r#"{job="api", status=~"5.."}"#, r#"{status=~"5.."}"#] {
+            assert!(resolves_through_the_label_index(&selector(q)), "{q}");
+        }
+        for q in [
+            r#"{__name__=~"m_1.*", job="api"}"#,
+            r#"{__name__!="up", job="api"}"#,
+            r#"up{job="api"}"#,
+            r#"{__name__="up", job="api"}"#,
+        ] {
+            assert!(!resolves_through_the_label_index(&selector(q)), "{q}");
+        }
     }
 
     // --- probe_fanout_bound: issue #96 (retroactive re-review) ---
