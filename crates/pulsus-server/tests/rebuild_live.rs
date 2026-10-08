@@ -75,21 +75,20 @@ fn histogram() -> NativeHistogram {
     }
 }
 
-/// Landing rows of three series on two UTC days, yesterday and today: a
-/// float sample, a histogram sample and a kind-2 row at hours 2 and 9 of
-/// each day, today's only where that hour has already begun.
+/// Landing rows of three series on two whole UTC days, the two before
+/// today: a float sample, a histogram sample and a kind-2 row at hours 2
+/// and 9 of each day. Both days are wholly past, so every row is seeded
+/// whatever the time of day the test runs; today would have none before
+/// 02:00 UTC.
 async fn seed_two_days(client: &ChClient, received_ms: i64) {
     let today = received_ms.div_euclid(DAY_MS) * DAY_MS;
     let mut rows = Vec::new();
     for s in 1..=3i64 {
         let fp = Fingerprint::from_raw(u128::try_from(s).expect("positive"));
         let (labels, _) = LabelSet::from_normalized([("instance".to_string(), format!("i-{s}"))]);
-        for day in [today - DAY_MS, today] {
+        for day in [today - 2 * DAY_MS, today - DAY_MS] {
             for hour in [2, 9] {
                 let at = day + hour * HOUR_MS + s * 1_000;
-                if at > received_ms {
-                    continue;
-                }
                 rows.push(MetricLandingRow::float_sample(
                     received_ms,
                     &MetricPoint {
