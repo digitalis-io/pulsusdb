@@ -759,7 +759,11 @@ impl GroupCardinalityCounter {
     /// Observes one distinct group tuple: charges its actual retained
     /// bytes BEFORE retaining it, then trips the `422` the moment the
     /// distinct count exceeds `cap`. A tuple already seen charges nothing.
-    fn observe(&mut self, tuple: &GroupTuple, budget: &mut ByteBudget) -> Result<(), ReadError> {
+    pub(crate) fn observe(
+        &mut self,
+        tuple: &GroupTuple,
+        budget: &mut ByteBudget,
+    ) -> Result<(), ReadError> {
         if self.seen.contains(tuple) {
             return Ok(());
         }
@@ -3195,15 +3199,13 @@ fn run_pipeline<'a>(
 /// Charged before a trace's `by()` group vector is reserved at `n`
 /// groups (issue #592 part 2).
 pub(crate) fn groups_reserve_bytes(n: usize) -> usize {
-    let _ = n;
-    0
+    super::exec::RETAINED_ENTRY_OVERHEAD + n * std::mem::size_of::<SpanSetGroup>()
 }
 
 /// Charged before one group's span buffer is reserved at `take` slots
 /// (issue #592 part 2).
 pub(crate) fn group_reserve_bytes(take: usize) -> usize {
-    let _ = take;
-    0
+    super::exec::RETAINED_ENTRY_OVERHEAD + take * std::mem::size_of::<SpanSummary>()
 }
 
 /// Materialises the fold's surviving spansets into the response's
@@ -3230,17 +3232,13 @@ fn build_span_set_groups(
     transient: &mut usize,
 ) -> Result<Vec<SpanSetGroup>, ReadError> {
     // Retained groups: charge the enclosing Vec slot before the reservation.
-    budget.charge(
-        super::exec::RETAINED_ENTRY_OVERHEAD + sets.len() * std::mem::size_of::<SpanSetGroup>(),
-    )?;
+    budget.charge(groups_reserve_bytes(sets.len()))?;
     let mut groups = Vec::with_capacity(sets.len());
     for set in sets {
         let take = set.spans.len().min(plan.spss as usize);
         // Per-group container: overhead + span slots. The attribute slots
         // and payloads are the fold's allocation, moved in below.
-        budget.charge(
-            super::exec::RETAINED_ENTRY_OVERHEAD + take * std::mem::size_of::<SpanSummary>(),
-        )?;
+        budget.charge(group_reserve_bytes(take))?;
         *transient -= attributes_bytes(&set.attributes);
         let mut spans = Vec::with_capacity(take);
         for span in set.spans.iter().take(take) {

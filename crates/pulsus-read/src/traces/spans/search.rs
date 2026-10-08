@@ -59,15 +59,18 @@ use pulsus_traceql::{
 };
 
 use super::predicate::{PredicateCtx, SpanPredicate, compile_span_predicate_in};
-use super::projection::{Projection, ceiling_sql};
-use super::rows::{SearchGroupedRow, SearchTraceRow};
+use super::projection::{
+    GroupKeySql, Projection, ceiling_sql, group_key_sql, rendered_array, rendered_array_len,
+};
+use super::rows::{SearchGroupTuple, SearchGroupedRow, SearchTraceRow};
 use crate::logql::error::ReadError;
 use crate::traces::PlanError;
 use crate::traces::exec::{
     ByteBudget, RootSummary, SearchOutput, TraceSearchResult, output_reserve_bytes,
 };
 use crate::traces::search_eval::{
-    GroupCardinalityCounter, SpanSummary, match_reserve_bytes, summary_reserve_bytes,
+    GroupCardinalityCounter, GroupValue, SpanSetGroup, SpanSummary, group_double_bits,
+    group_reserve_bytes, groups_reserve_bytes, match_reserve_bytes, summary_reserve_bytes,
 };
 use crate::traces::search_plan::SearchPlan;
 use crate::traces::window_sql::WindowSql;
@@ -147,6 +150,55 @@ FROM (SELECT trace_id, max(start_ns) AS last, countIf({later}) AS matched,
       GROUP BY trace_id) AS m
 {trace_read}";
 
+/// One filter, the selector, then one `by()` with filters before and after
+/// it (issue #592 part 2). The top-K is part 1's, over traces: a trace is
+/// kept when a span passes every filter (`{later}`). The detail read groups
+/// each trace's spans by `(trace_id, key, key type)`: a group exists when a
+/// span reached `by()` (`g_pre`, the filters before it), it is ordered by
+/// the first such span, and its members are the spans every filter kept
+/// (`g_matched`, `g_spans`). The trace's own `matched` and spans are the
+/// union of its groups'.
+const SEARCH_GROUPED: &str = r"WITH (SELECT (groupArray(trace_id), groupArray(keys))
+      FROM (SELECT trace_id, max(start_ns) AS last,
+                   groupUniqArray(intDiv(start_ns, 300000000000)) AS keys
+            FROM {spans}
+            WHERE {time}
+              AND {bucket}
+              AND {day}
+              AND ({predicate})
+            GROUP BY trace_id
+            HAVING countIf({later}) > 0
+            ORDER BY last DESC, trace_id ASC
+            LIMIT {limit})) AS top
+SELECT m.trace_id AS trace_id, t.root_service AS root_service, t.root_name AS root_name,
+       t.start_ns AS start_ns, t.end_ns - t.start_ns AS duration_ns,
+       m.last AS last, m.matched AS matched, m.spans AS spans, m.groups AS groups
+FROM (SELECT trace_id, max(g_last) AS last, sum(g_matched) AS matched,
+             arraySlice(arraySort(x -> (x.2, x.1), arrayFlatten(groupArray(g_spans))), 1, {spss}) AS spans,
+             arrayMap(x -> (x.2, x.3, x.4, x.5),
+                      arraySort(x -> x.1, groupArrayIf((g_first, grp, grp_type, g_matched, g_spans), g_pre > 0))) AS groups
+      FROM (SELECT trace_id, {grp} AS grp, {grp_type} AS grp_type,
+                   max(start_ns) AS g_last, countIf({pre}) AS g_pre, countIf({later}) AS g_matched,
+                   minIf((start_ns, span_id), {pre}) AS g_first,
+                   arraySlice(arraySort(x -> (x.2, x.1),
+                              groupArrayIf((span_id, start_ns, duration_ns, service, {projection}), {later})), 1, {spss}) AS g_spans
+            FROM {spans}
+            WHERE (intDiv(start_ns, 300000000000), trace_id) IN
+                  (SELECT arrayJoin(arrayFlatten(arrayMap((t, ks) -> arrayMap(k -> (k, t), ks), top.1, top.2))))
+              AND {time}
+              AND {bucket}
+              AND {day}
+              AND ({predicate}){demand}
+            GROUP BY trace_id, grp, grp_type)
+      GROUP BY trace_id) AS m
+{trace_read}";
+
+/// The message of a `by()` key's off-path demand (issue #592 part 2): the
+/// statement cannot read a key-value list's or bytes' value as the key's,
+/// so the request goes to today's engine.
+pub const OFF_PATH_DEMAND: &str =
+    "a by() value held off its own path is answered by the old engine (issue #592)";
+
 /// A spanset tree (section 4.3): one flag per filter, a `HAVING` over each
 /// trace's flags, and the detail read keeping each trace's spans by them.
 const SEARCH_TREE: &str = r"WITH (SELECT (groupArray(trace_id), groupArray(keys))
@@ -225,6 +277,16 @@ pub enum SearchFilter {
         holds: String,
         guards: Vec<Option<String>>,
     },
+    /// One `{ … }`, the selector, then one `by()` (issue #592 part 2):
+    /// `before` is the AND of the filters before it, `all` of every later
+    /// filter, before and after it (`None` = true), and `key` how the
+    /// statement reads its key.
+    Grouped {
+        selector: SpanPredicate,
+        before: Option<SpanPredicate>,
+        all: Option<SpanPredicate>,
+        key: GroupKeySql,
+    },
 }
 
 impl SearchFilter {
@@ -233,6 +295,15 @@ impl SearchFilter {
             SearchFilter::One(p) => vec![p],
             SearchFilter::Later { selector, later } => vec![selector, later],
             SearchFilter::Tree { filters, .. } => filters.iter().collect(),
+            SearchFilter::Grouped {
+                selector,
+                before,
+                all,
+                ..
+            } => std::iter::once(selector)
+                .chain(before.iter())
+                .chain(all.iter())
+                .collect(),
         }
     }
 }
@@ -435,6 +506,34 @@ pub fn search_sql(
             ]);
             fill(SEARCH_TREE, &values)
         }
+        SearchFilter::Grouped {
+            selector,
+            before,
+            all,
+            key,
+        } => {
+            fn text(p: &Option<SpanPredicate>) -> &str {
+                p.as_ref().map_or("true", |p| p.sql())
+            }
+            let (pre, later) = (text(before), text(all));
+            let demand = key.off_path.as_ref().map_or_else(String::new, |off| {
+                format!(
+                    "\n              AND throwIf(({pre}) AND ({off}), {}) = 0",
+                    crate::logql::escape::ch_string(OFF_PATH_DEMAND)
+                )
+            });
+            let grp_type = key.value_type.as_deref().unwrap_or("''");
+            let mut values: Vec<(&str, &str)> = common.to_vec();
+            values.extend([
+                ("predicate", selector.sql()),
+                ("pre", pre),
+                ("later", later),
+                ("grp", key.value.as_str()),
+                ("grp_type", grp_type),
+                ("demand", demand.as_str()),
+            ]);
+            fill(SEARCH_GROUPED, &values)
+        }
     }
 }
 
@@ -444,6 +543,7 @@ pub struct SearchStatement {
     sql: String,
     projection: Projection,
     demands: Vec<String>,
+    grouping: Option<Grouping>,
 }
 
 /// A statement's one `by()` (issue #592 part 2): the group key's display,
@@ -474,32 +574,77 @@ impl SearchStatement {
     /// The statement's `by()`, when it has one; its rows are then
     /// [`SearchGroupedRow`]s.
     pub fn grouping(&self) -> Option<&Grouping> {
-        None
+        self.grouping.as_ref()
     }
 }
 
-/// The later `{…}` filters' bodies, in written order, and the `select()`
-/// fields of `query`'s `|` stages (issue #592 part 1). Only a single `{…}`
-/// selector followed by later `{…}` filters and `select()` is the
-/// statement's: `by()` and `coalesce()` are #592 part 2's, an aggregate
-/// part 3's, and any other shape is refused naming #592.
-fn pipeline_of(query: &Query) -> Result<(Vec<&FieldExpr>, Vec<Field>), PlanError> {
+/// A query's `|` stages, as the search statement serves them (issues #592
+/// parts 1 and 2): the later `{…}` filters' bodies, in written order — all
+/// of them, and those before `by()` — the one `by()` key, whether a
+/// `coalesce()` after it merges its groups back, and the `select()` fields.
+struct Pipeline<'a> {
+    before: Vec<&'a FieldExpr>,
+    all: Vec<&'a FieldExpr>,
+    by: Option<(&'a Field, GroupKeySql)>,
+    coalesced: bool,
+    selected: Vec<Field>,
+}
+
+/// [`Pipeline`] of `query`. Only a single `{…}` selector followed by later
+/// `{…}` filters, `select()`, one `by()` on a key [`group_key_sql`] serves
+/// and `coalesce()` is the statement's; a `coalesce()` with no `by()`
+/// before it changes nothing. A second `by()`, a `by()` after
+/// `coalesce()`, any other key or any other shape is refused naming #592,
+/// an aggregate naming part 3.
+fn pipeline_of(query: &Query) -> Result<Pipeline<'_>, PlanError> {
     let refused = |what: &str, target: &str| {
         PlanError::UnsupportedField(format!(
             "{what} is not supported by the search statement yet (issue {target})"
         ))
     };
-    let mut later = Vec::new();
-    let mut selected = Vec::new();
+    let mut out = Pipeline {
+        before: Vec::new(),
+        all: Vec::new(),
+        by: None,
+        coalesced: false,
+        selected: Vec::new(),
+    };
+    let mut coalesce_seen = false;
     for stage in &query.pipeline {
         match stage {
-            PipelineStage::Filter(SpansetExpr::Filter(f)) => later.extend(f.body.as_ref()),
+            PipelineStage::Filter(SpansetExpr::Filter(f)) => {
+                if let Some(body) = f.body.as_ref() {
+                    if out.by.is_none() {
+                        out.before.push(body);
+                    }
+                    out.all.push(body);
+                }
+            }
             PipelineStage::Filter(_) => {
                 return Err(refused("a spanset operation as a pipeline stage", "#592"));
             }
-            PipelineStage::Select { fields } => selected.extend(fields.iter().cloned()),
-            PipelineStage::By { .. } => return Err(refused("a by() stage", "#592 part 2")),
-            PipelineStage::Coalesce => return Err(refused("a coalesce() stage", "#592 part 2")),
+            PipelineStage::Select { fields } => out.selected.extend(fields.iter().cloned()),
+            PipelineStage::By { key } => {
+                if out.by.is_some() {
+                    return Err(refused("a second by() stage", "#592"));
+                }
+                if coalesce_seen {
+                    return Err(refused("a by() stage after coalesce()", "#592"));
+                }
+                let FieldExpr::Field(field) = key else {
+                    return Err(refused("a by() over an expression", "#592"));
+                };
+                let Some(sql) = group_key_sql(field) else {
+                    return Err(refused(&format!("by({field})"), "#592"));
+                };
+                out.by = Some((field, sql));
+            }
+            PipelineStage::Coalesce => {
+                coalesce_seen = true;
+                if out.by.is_some() {
+                    out.coalesced = true;
+                }
+            }
             PipelineStage::Aggregate { .. } => {
                 return Err(refused("an aggregate stage", "#592 part 3"));
             }
@@ -516,7 +661,7 @@ fn pipeline_of(query: &Query) -> Result<(Vec<&FieldExpr>, Vec<Field>), PlanError
             "#592",
         ));
     }
-    Ok((later, selected))
+    Ok(out)
 }
 
 /// The AND of the later filters' bodies, in written order; `None` when
@@ -545,22 +690,39 @@ pub fn compile_search(
     limit: u32,
     spss: u32,
 ) -> Result<SearchStatement, PlanError> {
-    let (later, selected) = pipeline_of(query)?;
+    let pipeline = pipeline_of(query)?;
     let mut filter = compile_search_filter(&query.spanset, ctx)?;
-    if let Some(body) = later_body(&later) {
+    let compiled = |bodies: &[&FieldExpr]| -> Result<Option<SpanPredicate>, PlanError> {
+        later_body(bodies)
+            .map(|body| compile_span_predicate_in(&body, ctx))
+            .transpose()
+    };
+    let mut grouping = None;
+    if let Some((field, key)) = &pipeline.by {
         let SearchFilter::One(selector) = filter else {
             unreachable!("pipeline_of refuses a stage after anything but one filter")
         };
-        filter = SearchFilter::Later {
+        filter = SearchFilter::Grouped {
             selector,
-            later: compile_span_predicate_in(&body, ctx)?,
+            before: compiled(&pipeline.before)?,
+            all: compiled(&pipeline.all)?,
+            key: key.clone(),
         };
+        grouping = Some(Grouping {
+            display: format!("by({field})"),
+            coalesced: pipeline.coalesced,
+        });
+    } else if let Some(later) = compiled(&pipeline.all)? {
+        let SearchFilter::One(selector) = filter else {
+            unreachable!("pipeline_of refuses a stage after anything but one filter")
+        };
+        filter = SearchFilter::Later { selector, later };
     }
     let mut filters = Vec::new();
     filters_of(&query.spanset, &mut filters)?;
     let mut bodies: Vec<&FieldExpr> = filters.iter().filter_map(|f| f.body.as_ref()).collect();
-    bodies.extend(later.iter().copied());
-    let projection = Projection::of_filters(&bodies, &selected, ctx)?;
+    bodies.extend(pipeline.all.iter().copied());
+    let projection = Projection::of_filters(&bodies, &pipeline.selected, ctx)?;
     let mut demands: Vec<String> = Vec::new();
     for p in filter.predicates() {
         for m in p.demand_messages() {
@@ -568,6 +730,11 @@ pub fn compile_search(
                 demands.push(m.clone());
             }
         }
+    }
+    if let SearchFilter::Grouped { key, .. } = &filter
+        && key.off_path.is_some()
+    {
+        demands.push(OFF_PATH_DEMAND.to_string());
     }
     let sql = search_sql(
         spans_table,
@@ -582,6 +749,7 @@ pub fn compile_search(
         sql,
         projection,
         demands,
+        grouping,
     })
 }
 
@@ -675,7 +843,47 @@ pub(crate) fn decode_search_charged(
     })
 }
 
-/// [`decode_search_charged`] for a grouped statement (issue #592 part 2).
+/// A `by()` key's value from the statement's text and stored type (issue
+/// #592 part 2), as today's engine types it: `Int64`, `Float64` (its group
+/// bits), `Bool` and `String` in their own arms, an array as the JSON the
+/// writer rendered it to, a span without the key the `nil` group, and a
+/// column key, which has no type, its text.
+pub(crate) fn group_value(text: &str, value_type: &str) -> Result<GroupValue, String> {
+    Ok(match value_type {
+        "" | "String" => GroupValue::Str(text.to_string()),
+        "Int64" => GroupValue::Int(
+            text.parse::<i64>()
+                .map_err(|e| format!("a by() Int64 {text:?}: {e}"))?,
+        ),
+        "Float64" => GroupValue::Double(group_double_bits(
+            text.parse::<f64>()
+                .map_err(|e| format!("a by() Float64 {text:?}: {e}"))?,
+        )),
+        "Bool" => GroupValue::Bool(text == "true"),
+        "None" => GroupValue::Nil,
+        t if t.starts_with("Array(") => GroupValue::Str(rendered_array(text)?),
+        other => return Err(format!("a by() key stored as {other} is not decoded")),
+    })
+}
+
+/// The payload a [`group_value`] holds, learned before it is built.
+fn group_value_payload(text: &str, value_type: &str) -> Result<usize, String> {
+    Ok(match value_type {
+        "" | "String" => text.len(),
+        t if t.starts_with("Array(") => rendered_array_len(text)?,
+        _ => 0,
+    })
+}
+
+/// [`decode_search_charged`] for a grouped statement (issue #592 part 2),
+/// in today's engine's order:
+/// 1. every group of every row goes to `counter`, so a breach is today's
+///    `TraceSearchSeriesCap` before anything is built;
+/// 2. the flat response, as [`decode_search_charged`] builds it;
+/// 3. unless `coalesce()` merged them, each trace's groups that kept a
+///    span, charged as `build_span_set_groups` charges them: the group
+///    vector, per group its attribute, its span buffer and each span;
+/// 4. the counter's charge is released, as on today's success path.
 pub(crate) fn decode_search_grouped_charged(
     rows: Vec<SearchGroupedRow>,
     proj: &Projection,
@@ -684,10 +892,73 @@ pub(crate) fn decode_search_grouped_charged(
     budget: &mut ByteBudget,
     counter: &mut GroupCardinalityCounter,
 ) -> Result<SearchOutput, ReadError> {
-    let _ = (rows, proj, grouping, limit, budget, counter);
-    Err(ReadError::Clickhouse(ChError::Decode(
-        "not built".to_string(),
-    )))
+    let decode = |m: String| ReadError::Clickhouse(ChError::Decode(m));
+    for row in &rows {
+        for g in &row.groups {
+            let value = group_value(&g.value, &g.value_type).map_err(decode)?;
+            counter.observe(&vec![value], budget)?;
+        }
+    }
+    let mut trace_rows = Vec::with_capacity(rows.len());
+    let mut row_groups = Vec::with_capacity(rows.len());
+    for row in rows {
+        trace_rows.push(SearchTraceRow {
+            trace_id: row.trace_id,
+            root_service: row.root_service,
+            root_name: row.root_name,
+            start_ns: row.start_ns,
+            duration_ns: row.duration_ns,
+            last: row.last,
+            matched: row.matched,
+            spans: row.spans,
+        });
+        row_groups.push(row.groups);
+    }
+    let mut out = decode_search_charged(trace_rows, proj, limit, budget)?;
+    if !grouping.coalesced {
+        let capacity = proj.attribute_capacity();
+        for (trace, groups) in out.traces.iter_mut().zip(row_groups) {
+            let kept: Vec<SearchGroupTuple> =
+                groups.into_iter().filter(|g| g.matched > 0).collect();
+            budget.charge(groups_reserve_bytes(kept.len()))?;
+            let mut built = Vec::with_capacity(kept.len());
+            for g in kept {
+                budget.charge(
+                    std::mem::size_of::<(String, GroupValue)>()
+                        + grouping.display.len()
+                        + group_value_payload(&g.value, &g.value_type).map_err(decode)?,
+                )?;
+                let mut attributes = Vec::with_capacity(1);
+                attributes.push((
+                    grouping.display.clone(),
+                    group_value(&g.value, &g.value_type).map_err(decode)?,
+                ));
+                budget.charge(group_reserve_bytes(g.spans.len()))?;
+                let mut spans = Vec::with_capacity(g.spans.len());
+                for s in g.spans {
+                    budget.charge(summary_reserve_bytes(capacity))?;
+                    let mut attrs = Vec::with_capacity(capacity);
+                    let name = proj.decode_charged(&s.projected, &mut attrs, budget)?;
+                    spans.push(SpanSummary::new(
+                        s.span_id,
+                        name,
+                        s.start_ns,
+                        s.duration_ns,
+                        attrs,
+                    ));
+                }
+                built.push(SpanSetGroup {
+                    attributes,
+                    matched: u32::try_from(g.matched)
+                        .map_err(|_| decode(format!("matched {} exceeds u32", g.matched)))?,
+                    spans,
+                });
+            }
+            trace.groups = Some(built);
+        }
+    }
+    counter.release(budget);
+    Ok(out)
 }
 
 /// A row the decode could not read: a projected value that does not parse
@@ -715,7 +986,7 @@ mod charge_tests {
     use super::*;
     use crate::traces::exec::{ByteBudget, RETAINED_ENTRY_OVERHEAD, output_reserve_bytes};
     use crate::traces::search_eval::TraceMatch;
-    use crate::traces::spans::rows::{SearchGroupTuple, SearchProjected, SearchSpanTuple};
+    use crate::traces::spans::rows::{SearchProjected, SearchSpanTuple};
 
     /// Section 6.1's four groups: a string, an int, `name` and an array.
     fn statement() -> SearchStatement {

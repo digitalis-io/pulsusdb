@@ -8201,7 +8201,9 @@ async fn seed_by_fixture(label: &str, base_ns: i64) -> (String, ChClient) {
 
 /// One routed search, then the query log's statement count for it, then
 /// today's answer: `(today, routed, statements)`. The query log is read
-/// before today's engine runs, so the count is the fork's alone.
+/// before today's engine runs, so the count is the fork's alone. Both
+/// answers are normalised as [`normalise_today`] does: a request the
+/// statement hands over is answered by today's engine, roots and all.
 async fn routed_and_today(
     engine: &pulsus_read::TraceEngine,
     client: &ChClient,
@@ -8213,7 +8215,7 @@ async fn routed_and_today(
     u64,
 ) {
     let t0 = now_ns();
-    let routed = engine.search_routed(plan).await;
+    let routed = engine.search_routed(plan).await.map(normalise_today);
     let (statements, _) = settled_statements(client, db, t0).await;
     let today = engine.search(plan).await.map(normalise_today);
     (today, routed, statements)

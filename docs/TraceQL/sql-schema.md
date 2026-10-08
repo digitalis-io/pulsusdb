@@ -362,7 +362,7 @@ statements read, not a second measurement.
 Three more rules are in that shape, and each is one a simpler statement gets
 wrong: the groups come back in **first-appearance order**, which is
 `min((start_ns, span_id))` per group and not the group value's own order; a span
-**lacking the key gets no spanset**, which is the `AND <present>`; and the top-K
+**lacking the key is in the one `nil` group**, as `docs/api.md` §4.2 and today's engine place it; and the top-K
 that chooses the twenty traces is still per trace, not per group, so a trace with
 many groups does not crowd out another trace. `| coalesce()` drops the key again,
 which is the ungrouped statement above.
@@ -876,7 +876,7 @@ writing `{ nestedSetParent < 0 }` — both `grafana/explore_root_rate_by_service
 and `grafana/explore_root_rate_sample` in the corpus do — so a span left
 unnumbered is a span missing from an answer. Three shapes decide it, and the
 retained implementation
-(`crates/pulsus-read/src/traces/search_eval.rs:2085-2139`) settles each:
+(`crates/pulsus-read/src/traces/search_eval.rs:2089-2143`) settles each:
 
 | shape | the rule | what a naive walk does |
 |---|---|---|
