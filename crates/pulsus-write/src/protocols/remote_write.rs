@@ -2631,30 +2631,126 @@ mod tests {
         );
     }
 
+    /// One request of one series per entry, each `(labels, sample count)`.
+    fn request_of(series: &[(&[(&str, &str)], usize)]) -> WriteRequest {
+        WriteRequest {
+            timeseries: series
+                .iter()
+                .map(|(labels, samples)| TimeSeries {
+                    labels: labels.iter().map(|(n, v)| label(n, v)).collect(),
+                    samples: (0..*samples).map(|k| sample(1.0, 1 + k as i64)).collect(),
+                    histograms: vec![],
+                })
+                .collect(),
+            metadata: vec![],
+        }
+    }
+
+    /// **T1 (issue #495): label names are stored as sent.** Each name is
+    /// the set's one label, and its series is not the series of the name
+    /// with every character outside `[a-zA-Z0-9_]` replaced by `_`.
     #[test]
-    fn dotted_and_underscored_labels_fingerprint_identically_cross_transport_identity() {
-        let req_dot = WriteRequest {
-            timeseries: vec![TimeSeries {
-                labels: vec![label("__name__", "up"), label("service.name", "checkout")],
-                samples: vec![sample(1.0, 1)],
-                histograms: vec![],
-            }],
-            metadata: vec![],
-        };
-        let req_underscore = WriteRequest {
-            timeseries: vec![TimeSeries {
-                labels: vec![label("__name__", "up"), label("service_name", "checkout")],
-                samples: vec![sample(1.0, 1)],
-                histograms: vec![],
-            }],
-            metadata: vec![],
-        };
-        let out_dot = parse(&req_dot, 0).expect("within the expansion budget");
-        let out_underscore = parse(&req_underscore, 0).expect("within the expansion budget");
+    fn label_names_are_stored_as_sent() {
+        for name in [
+            "service.name",
+            "http-method",
+            "k8s:pod",
+            "path/segment",
+            "with space",
+            "café",
+        ] {
+            let replaced: String = name
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '_' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            let sent = parse(&request_of(&[(&[("__name__", "up"), (name, "v")], 1)]), 0)
+                .expect("within the expansion budget");
+            assert_eq!(
+                sent.series[0].labels.iter().collect::<Vec<_>>(),
+                vec![(name, "v")],
+                "{name}"
+            );
+            let other = parse(
+                &request_of(&[(&[("__name__", "up"), (replaced.as_str(), "v")], 1)]),
+                0,
+            )
+            .expect("within the expansion budget");
+            assert_ne!(
+                sent.series[0].fingerprint, other.series[0].fingerprint,
+                "{name} and {replaced} are two series"
+            );
+        }
+    }
+
+    /// **T2 (issue #495): a dotted and an underscored name are two labels.**
+    #[test]
+    fn a_dotted_and_an_underscored_name_are_two_labels() {
+        let out = parse(
+            &request_of(&[(&[("__name__", "up"), ("a.b", "1"), ("a_b", "2")], 1)]),
+            0,
+        )
+        .expect("within the expansion budget");
         assert_eq!(
-            out_dot.samples[0].fingerprint,
-            out_underscore.samples[0].fingerprint
+            out.series[0].labels.iter().collect::<Vec<_>>(),
+            vec![("a.b", "1"), ("a_b", "2")]
         );
+        assert_eq!(out.collisions, 0);
+        assert_eq!(out.rejected, 0);
+    }
+
+    /// **T3 (issue #495): a repeated label name drops its series**, values
+    /// not compared and `__name__` included; the request's other series is
+    /// written.
+    #[test]
+    fn a_repeated_label_name_drops_the_series() {
+        let cases: [(&[(&str, &str)], &str); 4] = [
+            (&[("__name__", "up"), ("job", "x"), ("job", "y")], "job"),
+            (&[("__name__", "up"), ("job", "x"), ("job", "x")], "job"),
+            (
+                &[("__name__", "up"), ("__name__", "down"), ("job", "a")],
+                "__name__",
+            ),
+            (
+                &[("__name__", "up"), ("__name__", "up"), ("job", "a")],
+                "__name__",
+            ),
+        ];
+        for (labels, repeated) in cases {
+            let out = parse(
+                &request_of(&[(labels, 2), (&[("__name__", "up"), ("job", "z")], 1)]),
+                0,
+            )
+            .expect("within the expansion budget");
+            assert_eq!(out.series.len(), 1, "{labels:?}");
+            assert_eq!(
+                out.series[0].labels.iter().collect::<Vec<_>>(),
+                vec![("job", "z")],
+                "{labels:?}"
+            );
+            assert_eq!(out.samples.len(), 1, "{labels:?}");
+            assert_eq!(out.rejected, 2, "{labels:?}");
+            let message = out.rejected_message.unwrap_or_default();
+            assert!(
+                message.contains(&format!("duplicate label name \"{repeated}\"")),
+                "{labels:?}: {message}"
+            );
+        }
+    }
+
+    /// **T4 (issue #495): an empty label name drops the series.**
+    #[test]
+    fn an_empty_label_name_drops_the_series() {
+        let out = parse(&request_of(&[(&[("__name__", "up"), ("", "x")], 1)]), 0)
+            .expect("within the expansion budget");
+        assert!(out.series.is_empty());
+        assert!(out.samples.is_empty());
+        assert_eq!(out.rejected, 1);
     }
 
     #[test]
