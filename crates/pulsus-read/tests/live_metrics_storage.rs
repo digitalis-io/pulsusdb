@@ -1009,12 +1009,17 @@ async fn matchers_answer_from_the_lookup() {
                 all.iter().map(|(n, _, _)| n.clone()).collect(),
                 "statement 3 {what}"
             );
-            // Statement 4, over the answer's own IDs.
+            // Statement 4, over the answer's own IDs, as an ID statement
+            // (issue #579 part 3).
             let answer_names: Vec<String> = names.iter().cloned().collect();
-            let ids: Vec<pulsus_model::FpLiteral> = all
-                .iter()
-                .map(|(_, id, _)| Fingerprint::from_raw(*id).sql_literal())
-                .collect();
+            let ids_sql = format!(
+                "SELECT arrayJoin([{}]) AS fingerprint",
+                pulsus_read::metrics::sample_sql::render_fingerprint_list(
+                    &all.iter()
+                        .map(|(_, id, _)| Fingerprint::from_raw(*id).sql_literal())
+                        .collect::<Vec<_>>()
+                )
+            );
             assert_eq!(
                 triples_of(
                     &client,
@@ -1022,7 +1027,7 @@ async fn matchers_answer_from_the_lookup() {
                         &no_tenant(),
                         "metric_labels",
                         &answer_names,
-                        &ids
+                        &ids_sql
                     ),
                     &what,
                 )

@@ -673,8 +673,9 @@ async fn the_fallback_hydration_reads_its_own_tenants_labels() {
 
 /// **T12: a warm cache answers each tenant its own members.** The same
 /// rows, the label cache refreshed for both tenants, the push on; cases
-/// W1-W5 as each tenant. W3 as tenant-q reads the sample tables in exactly
-/// one statement, the pushed one.
+/// W1-W5 as each tenant, and W6, the pushed rate grouped by a label. W3
+/// and W6 as tenant-q read the sample tables in exactly one statement,
+/// the pushed one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_warm_cache_answers_each_tenant_its_own_members() {
     skip_unless_live!();
@@ -777,6 +778,41 @@ async fn a_warm_cache_answers_each_tenant_its_own_members() {
         query(&engine, &o, w4, &w4_params, t0).await,
         sorted(&["{} 1:2.0 7:1.0"]),
         "W4 as tenant-o"
+    );
+
+    // W6 (issue #579 part 3 on #635 part 4): the pushed rate grouped by
+    // `status`. Its statement takes each series' group key from
+    // `metric_labels`, where tenant-o's IDs 42 and 43 carry `status="500"`:
+    // a member read that leaked tenant-o's rows would put tenant-q's ID 42
+    // in the wrong group. One statement reads the samples, the pushed one.
+    let w6 = r#"sum by (status) (rate(m_x{job="api"}[5m]))"#;
+    let marker = server_marker(&fx.admin).await;
+    let groups = |answer: Vec<String>| -> Vec<String> {
+        answer
+            .into_iter()
+            .map(|line| line.split(' ').next().unwrap_or_default().to_string())
+            .collect()
+    };
+    assert_eq!(
+        groups(query(&engine, &q, w6, &w3_params, t0).await),
+        sorted(&[
+            r#"{status="200"}"#,
+            r#"{status="404"}"#,
+            r#"{status="500"}"#
+        ]),
+        "W6 as tenant-q"
+    );
+    let sent = statements_since(&fx.admin, &fx.db, &marker).await;
+    let sample_reads: Vec<&str> = sent
+        .iter()
+        .map(|s| s.query.as_str())
+        .filter(|s| s.contains("metric_samples") || s.contains("metric_hist_samples"))
+        .collect();
+    assert_eq!(sample_reads.len(), 1, "W6 is pushed: {sample_reads:#?}");
+    assert_eq!(
+        groups(query(&engine, &o, w6, &w3_params, t0).await),
+        sorted(&[r#"{status="500"}"#]),
+        "W6 as tenant-o"
     );
 
     // W5: the cache's IDs, a histogram fetch.

@@ -2073,6 +2073,166 @@ async fn seed_series_rows(client: &ChClient, rows: &[SeedSeriesRow]) {
         .expect("seed metric_labels");
 }
 
+// ------------------------------------------------ issue #579 part 3
+
+/// T6: the group key a shape-A statement computes from a series' stored
+/// label JSON is the evaluator's `group_key_of` over the same label set,
+/// for present, absent and empty-valued labels under `by (a)`,
+/// `by (a, b)`, `without (a)` and no grouping.
+#[tokio::test]
+async fn the_group_key_rule_matches_the_evaluator() {
+    skip_unless_live!();
+    use pulsus_promql::{Grouping, Labels, group_key_of};
+
+    #[derive(pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize, Debug)]
+    struct KeyRow {
+        gkey: Vec<(String, String)>,
+    }
+
+    let client = ChClient::new(test_config("default"))
+        .await
+        .expect("connect");
+    let sets: [&[(&str, &str)]; 8] = [
+        &[("a", "x"), ("b", "y"), ("c", "z")],
+        &[("a", "x")],
+        &[("b", "y")],
+        &[],
+        &[("a", ""), ("b", "y")],
+        &[("a", "x"), ("b", "")],
+        &[("a", ""), ("b", "")],
+        &[("aa", "x"), ("b", "y"), ("ba", "w")],
+    ];
+    let groupings = [
+        None,
+        Some(Grouping {
+            without: false,
+            labels: vec!["a".to_string()],
+        }),
+        Some(Grouping {
+            without: false,
+            labels: vec!["a".to_string(), "b".to_string()],
+        }),
+        Some(Grouping {
+            without: true,
+            labels: vec!["a".to_string()],
+        }),
+    ];
+    for set in sets {
+        // The writer's canonical form: a flat object, keys sorted.
+        let map: BTreeMap<&str, &str> = set.iter().copied().collect();
+        let json = serde_json::to_string(&map).expect("labels json");
+        let labels = Labels::new(set.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        for grouping in &groupings {
+            let sql = format!(
+                "SELECT {} AS gkey FROM (SELECT '{json}' AS l)",
+                grouped_sql::group_key_expression(grouping.as_ref())
+            );
+            let mut stream = client
+                .query_stream::<KeyRow>(&sql, &QuerySettings::new())
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e}"));
+            let got = stream.next().await.expect("one row").expect("decode").gkey;
+            drop(stream);
+            let (want, name) = group_key_of(&labels, Some("m"), grouping.as_ref());
+            assert_eq!(name, None, "{json} {grouping:?}");
+            assert_eq!(got, want.0, "{json} {grouping:?}: {sql}");
+        }
+    }
+}
+
+// Part 1's group stages, each the fold the evaluator's accumulation is
+// written as, kept here as the text the new stages must equal.
+const SUM_FOLD: &str = r#"(arrayFold((acc, x) -> (acc.1 + x, if(isInfinite(acc.1 + x), 0., if(abs(acc.1) >= abs(x), acc.2 + ((acc.1 - (acc.1 + x)) + x), acc.2 + ((x - (acc.1 + x)) + acc.1)))), vs, CAST((0., 0.), 'Tuple(Float64, Float64)')) AS k).1 + k.2"#;
+const AVG_FOLD: &str = r#"if((arrayFold((acc, x) -> if(acc.1 = 0., (1., x, 0., toUInt8(0), 0.), if(acc.4 = 1, ((acc.1 + 1.), acc.2, if(isInfinite((((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * acc.5) + (x / (acc.1 + 1.)))), 0., if(abs(((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * acc.5)) >= abs((x / (acc.1 + 1.))), ((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * acc.3) + ((((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * acc.5) - (((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * acc.5) + (x / (acc.1 + 1.)))) + (x / (acc.1 + 1.))), ((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * acc.3) + (((x / (acc.1 + 1.)) - (((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * acc.5) + (x / (acc.1 + 1.)))) + ((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * acc.5)))), toUInt8(1), (((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * acc.5) + (x / (acc.1 + 1.)))), if(NOT isInfinite((acc.2 + x)), ((acc.1 + 1.), (acc.2 + x), if(isInfinite((acc.2 + x)), 0., if(abs(acc.2) >= abs(x), acc.3 + ((acc.2 - (acc.2 + x)) + x), acc.3 + ((x - (acc.2 + x)) + acc.2))), toUInt8(0), 0.), ((acc.1 + 1.), acc.2, if(isInfinite((((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * (acc.2 / ((acc.1 + 1.) - 1.))) + (x / (acc.1 + 1.)))), 0., if(abs(((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * (acc.2 / ((acc.1 + 1.) - 1.)))) >= abs((x / (acc.1 + 1.))), ((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * (acc.3 / ((acc.1 + 1.) - 1.))) + ((((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * (acc.2 / ((acc.1 + 1.) - 1.))) - (((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * (acc.2 / ((acc.1 + 1.) - 1.))) + (x / (acc.1 + 1.)))) + (x / (acc.1 + 1.))), ((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * (acc.3 / ((acc.1 + 1.) - 1.))) + (((x / (acc.1 + 1.)) - (((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * (acc.2 / ((acc.1 + 1.) - 1.))) + (x / (acc.1 + 1.)))) + ((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * (acc.2 / ((acc.1 + 1.) - 1.)))))), toUInt8(1), (((((acc.1 + 1.) - 1.) / (acc.1 + 1.)) * (acc.2 / ((acc.1 + 1.) - 1.))) + (x / (acc.1 + 1.))))))), vs, CAST((0., 0., 0., 0, 0.), 'Tuple(Float64, Float64, Float64, UInt8, Float64)')) AS st).4 = 1, st.5 + st.3, st.2 / st.1 + st.3 / st.1)"#;
+const MIN_FOLD: &str = r#"arrayFold((acc, x) -> if(acc > x OR isNaN(acc), x, acc), vs, nan)"#;
+const MAX_FOLD: &str = r#"arrayFold((acc, x) -> if(acc < x OR isNaN(acc), x, acc), vs, nan)"#;
+/// T9's generator (part 3's plan, section 5): 100,000 arrays of 1 to 300
+/// values — infinities, NaN one value in `nan_in`, `-0.`, `±1e308` and
+/// magnitudes from 1e-20 to 1e20.
+fn fold_generator(nan_in: u32) -> String {
+    format!(
+        "SELECT arrayMap(i -> multiIf(\
+             cityHash64(number, i, 1) % 1000 = 0, inf, \
+             cityHash64(number, i, 1) % 1000 = 1, -inf, \
+             cityHash64(number, i, 1) % {nan_in} = 2, nan, \
+             cityHash64(number, i, 1) % 50 = 3, -0., \
+             cityHash64(number, i, 1) % 7 = 4, 1e308 * (toFloat64(cityHash64(number, i, 2) % 3) - 1.), \
+             (toFloat64(cityHash64(number, i, 3) % 2000001) - 1000000.) \
+               * exp10(toFloat64(cityHash64(number, i, 4) % 41) - 20.)), \
+           range(1 + number % 300)) AS vs \
+         FROM numbers(100000)"
+    )
+}
+
+/// T9: each group stage of a shape-A statement, as
+/// `grouped_sql::range_agg_expression` renders it, answers what part 1's
+/// fold answered over 100,000 generated arrays, bit for bit; a NaN answer
+/// equals a NaN answer of either sign. First, the stages are the
+/// element-wise forms rather than the folds.
+#[tokio::test]
+async fn group_stages_equal_their_folds() {
+    skip_unless_live!();
+    use pulsus_read::metrics::grouped::RangeAggOp;
+
+    #[derive(pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize, Debug)]
+    struct FoldRow {
+        arrays: u64,
+        value_diffs: u64,
+        nan_answers: u64,
+        inf_answers: u64,
+        finite_answers: u64,
+    }
+
+    for op in [
+        RangeAggOp::Sum,
+        RangeAggOp::Avg,
+        RangeAggOp::Min,
+        RangeAggOp::Max,
+    ] {
+        let stage = grouped_sql::range_agg_expression(op);
+        assert!(stage.ends_with(" AS agg"), "{op:?}: {stage}");
+        assert!(
+            !stage.contains("arrayFold((acc, x) -> (acc.1 + x")
+                && !stage.contains("arrayFold((acc, x) -> if(acc > x")
+                && !stage.contains("arrayFold((acc, x) -> if(acc < x"),
+            "{op:?}: the stage is still a per-element fold: {stage}"
+        );
+        if matches!(op, RangeAggOp::Sum | RangeAggOp::Avg) {
+            assert!(stage.contains("arrayCumSum("), "{op:?}: {stage}");
+        }
+    }
+
+    let client = ChClient::new(test_config("default"))
+        .await
+        .expect("connect");
+    for (op, fold, nan_in) in [
+        (RangeAggOp::Sum, SUM_FOLD, 4_000),
+        (RangeAggOp::Avg, AVG_FOLD, 400),
+        (RangeAggOp::Min, MIN_FOLD, 400),
+        (RangeAggOp::Max, MAX_FOLD, 400),
+    ] {
+        let sql = format!(
+            "SELECT count() AS arrays, \
+                    countIf(reinterpretAsUInt64(a) != reinterpretAsUInt64(agg) \
+                            AND NOT (isNaN(a) AND isNaN(agg))) AS value_diffs, \
+                    countIf(isNaN(a)) AS nan_answers, countIf(isInfinite(a)) AS inf_answers, \
+                    countIf(isFinite(a)) AS finite_answers \
+             FROM (SELECT vs, {fold} AS a, {} FROM ({}))",
+            grouped_sql::range_agg_expression(op),
+            fold_generator(nan_in)
+        );
+        let mut stream = client
+            .query_stream::<FoldRow>(&sql, &QuerySettings::new())
+            .await
+            .unwrap_or_else(|e| panic!("{op:?}: {e}"));
+        let row = stream.next().await.expect("one row").expect("decode");
+        drop(stream);
+        eprintln!("{op:?}: {row:?}");
+        assert_eq!(row.arrays, 100_000, "{op:?}");
+        assert_eq!(row.value_diffs, 0, "{op:?}: {row:?}");
+    }
+}
+
 /// The single-tenant deployment's tenant: no `X-Scope-OrgID`.
 #[allow(dead_code)]
 fn no_tenant() -> pulsus_model::Tenant {

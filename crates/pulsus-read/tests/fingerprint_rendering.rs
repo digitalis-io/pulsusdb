@@ -32,8 +32,7 @@
 //!                                                           metadata_string_filter
 //!   4  render_fingerprint_list        metrics/sample_sql.rs
 //!   5  ids_scope                      metrics/sql.rs      private, reached through
-//!                                                           series_labels_by_fingerprint
-//!                                                           and discovery_fetch_multi
+//!                                                           discovery_fetch_multi
 //! ```
 //!
 //! `metrics/sample_sql.rs`'s `fingerprints_predicate` and
@@ -201,19 +200,8 @@ fn site_4_render_fingerprint_list_renders_the_exact_call_form() {
     assert_every_boundary_value_is_an_exact_call("sample_fetch", &sql);
 }
 
-/// Site 5: `ids_scope`, reached through `series_labels_by_fingerprint`.
-#[test]
-fn site_5_series_labels_by_fingerprint_renders_the_exact_call_form() {
-    let sql = metrics_sql::series_labels_by_fingerprint(
-        &no_tenant(),
-        "metric_labels",
-        &["up".to_string()],
-        &literals(),
-    );
-    assert_every_boundary_value_is_an_exact_call("series_labels_by_fingerprint", &sql);
-}
-
-/// Site 5 again: `ids_scope`, reached through `discovery_fetch_multi`.
+/// Site 5: `ids_scope`, reached through `discovery_fetch_multi` (issue
+/// #579 part 3: `series_labels_by_fingerprint` reads by an ID statement).
 #[test]
 fn site_6_discovery_fetch_multi_renders_the_exact_call_form() {
     let sql = metrics_sql::discovery_fetch_multi(

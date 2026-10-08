@@ -208,6 +208,7 @@ docs/query-to-sql.md	crates/pulsus-read/src/logql/pipeline.rs:3101	crates/pulsus
 docs/query-to-sql.md	crates/pulsus-read/src/logql/pipeline.rs:6428	crates/pulsus-read/src/logql/pipeline.rs	6428		line	serde_json	serde_json::Value::Number(n) => n.to_string(),
 docs/query-to-sql.md	crates/pulsus-read/src/logql/sql.rs:1216	crates/pulsus-read/src/logql/sql.rs	1216		line	formation	/// full-body `tie_rank` order is imposed in Rust at group formation. And
 docs/query-to-sql.md	crates/pulsus-read/src/logql/sql.rs:1216-1239	crates/pulsus-read/src/logql/sql.rs	1216	1239	prose	metric_raw_samples_sliding	metric_raw_samples_sliding
+docs/query-to-sql.md	crates/pulsus-read/src/logql/sql.rs:1251	crates/pulsus-read/src/logql/sql.rs	1251		prose	timestamp_ns	ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC
 docs/query-to-sql.md	crates/pulsus-read/src/logql/sql.rs:711	crates/pulsus-read/src/logql/sql.rs	711		line	streams_table	pub fn stage2(streams_table: &str, fingerprints: &[FpLiteral]) -> String {
 docs/query-to-sql.md	crates/pulsus-read/src/querytext.rs:52	crates/pulsus-read/src/querytext.rs	52		line	MAX_QUERY_TEXT_BYTES	pub const MAX_QUERY_TEXT_BYTES: u64 = 8 * 1024 * 1024;
 docs/query-to-sql.md	crates/pulsus-read/src/traces/exec.rs:3237	crates/pulsus-read/src/traces/exec.rs	3237		prose	generator_settings	generator_settings

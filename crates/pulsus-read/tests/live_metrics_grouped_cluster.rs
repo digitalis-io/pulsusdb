@@ -453,8 +453,16 @@ async fn count(client: &ChClient, sql: &str) -> u64 {
 
 /// Issue #579, T7: shape A over the distributed tables, where every
 /// series' samples were written to BOTH shards — alternate samples to each
-/// shard's local table. The window functions must see all of a series'
-/// rows, so the pushed answer equals the unpushed one.
+/// shard's local table. The statement must see all of a series' rows, so
+/// the pushed answer equals the unpushed one.
+///
+/// Part 3: the statement reads its series through the ID statement, which
+/// on a cluster runs shard-local (`distributed_product_mode = 'local'`, as
+/// the SQL route's does): each shard reads the samples of the series its
+/// own activity table holds. The write path puts a series' activity row
+/// on the shard its samples go to — every metric table is sharded by
+/// `cityHash64(fingerprint)` — so each shard here holds the series rows
+/// for the samples it holds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_pushed_rate_over_the_dist_tables_sees_every_shards_rows() {
     skip_unless_live!();
@@ -514,18 +522,20 @@ async fn the_pushed_rate_over_the_dist_tables_sees_every_shards_rows() {
         })
         .collect::<Vec<_>>()
         .join(", ");
-    client
-        .execute(
-            &format!(
-                "INSERT INTO metric_landing \
-                 (received_ms, kind, metric_name, fingerprint, unix_milli, labels, value_type) \
-                 VALUES {values}"
-            ),
-            &QuerySettings::new(),
-            Idempotency::NonIdempotent,
-        )
-        .await
-        .expect("seed shard 1's metric_landing");
+    for (shard, which) in [(&client, "shard 1"), (&shard2, "shard 2")] {
+        shard
+            .execute(
+                &format!(
+                    "INSERT INTO metric_landing \
+                     (received_ms, kind, metric_name, fingerprint, unix_milli, labels, value_type) \
+                     VALUES {values}"
+                ),
+                &QuerySettings::new(),
+                Idempotency::NonIdempotent,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("seed {which}'s metric_landing: {e}"));
+    }
     client
         .insert_block("metric_samples", &on_shard1)
         .await
