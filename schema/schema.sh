@@ -174,9 +174,18 @@ auth=""
 # `curl` exits 0 when ClickHouse answers with an error in the body, so every
 # request below carries --fail-with-body.
 
+# A refused request prints the server's answer to stderr and returns curl's
+# own exit code, so a caller under `set -e` still stops with it.
 # shellcheck disable=SC2086
 ask() {
-    curl -sS --fail-with-body $auth "$url" --data-binary "$1"
+    if ask_body=$(curl -sS --fail-with-body $auth "$url" --data-binary "$1"); then
+        printf '%s\n' "$ask_body"
+    else
+        ask_rc=$?
+        echo "schema.sh: the server refused a request; it said:" >&2
+        printf '%s\n' "$ask_body" >&2
+        return "$ask_rc"
+    fi
 }
 
 # **Prints the statement and the server's answer when one fails.** The body
