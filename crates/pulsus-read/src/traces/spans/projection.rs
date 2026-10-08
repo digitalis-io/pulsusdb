@@ -58,6 +58,9 @@ const CUT_CODE_POINTS: usize = 2048;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Projection {
     groups: Vec<Group>,
+    /// Issue #592 part 3: per projected attribute, the condition under
+    /// which a span holds it off its typed path (`search::off_path_at`).
+    off_path: Vec<String>,
 }
 
 /// One projected field.
@@ -117,7 +120,10 @@ enum Projects {
 impl Projection {
     /// The projection of a query that projects nothing.
     pub fn none() -> Projection {
-        Projection { groups: Vec::new() }
+        Projection {
+            groups: Vec::new(),
+            off_path: Vec::new(),
+        }
     }
 
     /// The SQL the detail read projects per span: an array of
@@ -141,7 +147,23 @@ impl Projection {
                 format!("multiIf({})", args.join(", "))
             })
             .collect();
-        format!("arrayFilter(x -> x.1 != 0, [{}])", groups.join(", "))
+        let projected = format!("arrayFilter(x -> x.1 != 0, [{}])", groups.join(", "));
+        if self.off_path.is_empty() {
+            return projected;
+        }
+        // Issue #592 part 3: a span holding a projected attribute off its
+        // typed path hands the request to today's engine.
+        format!(
+            "if(throwIf({}, {}) = 0, {projected}, CAST([], 'Array(Tuple(UInt8, String, String))'))",
+            self.off_path.join(" OR "),
+            escape::ch_string(super::search::SELECT_OFF_PATH_DEMAND)
+        )
+    }
+
+    /// Whether a projected attribute can be held off its typed path, so the
+    /// statement carries [`super::search::SELECT_OFF_PATH_DEMAND`].
+    pub(crate) fn has_off_path(&self) -> bool {
+        !self.off_path.is_empty()
     }
 
     /// The projection of `bodies`, the query's filter bodies in pre-order,
@@ -194,6 +216,12 @@ impl Projection {
                         negated: false,
                     };
                     self.add(field, stored_value(field, ctx)?, &presence, ctx)?;
+                    if let Field::Attribute { scope, key } = field {
+                        let off = super::search::off_path_at(*scope, key, ctx);
+                        if !self.off_path.contains(&off) {
+                            self.off_path.push(off);
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -1048,6 +1076,26 @@ fn selected_value(field: &Field, element: &str) -> Projects {
         Field::Attribute { .. } => stored(element),
         Field::Intrinsic(Intrinsic::EventTimeSinceStart) => offset_value(element),
         Field::Intrinsic(_) => string_value(&format!("toString({element})")),
+    }
+}
+
+/// Issue #592 part 3: an aggregate argument's located element, as the
+/// projection reads a field's stored value — a `span.` attribute's own, or
+/// the unscoped `.k` at the first scope of the chain that holds it — as
+/// `(text, stored type)` SQL. `None` for any other field.
+pub(crate) fn aggregate_argument_sql(
+    field: &Field,
+    ctx: &PredicateCtx<'_>,
+) -> Result<Option<(String, String)>, PlanError> {
+    match field {
+        Field::Attribute {
+            scope: AttrScope::Span | AttrScope::Unscoped,
+            ..
+        } => match stored_value(field, ctx)? {
+            Projects::Value { value, kind } => Ok(Some((value, kind))),
+            Projects::Nothing => Ok(None),
+        },
+        _ => Ok(None),
     }
 }
 
