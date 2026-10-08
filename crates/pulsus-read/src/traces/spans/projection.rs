@@ -148,11 +148,15 @@ impl Projection {
     /// its gates compiled in `ctx`.
     pub(crate) fn of_filters(
         bodies: &[&FieldExpr],
+        selected: &[Field],
         ctx: &PredicateCtx<'_>,
     ) -> Result<Projection, PlanError> {
         let mut projection = Projection::none();
         for body in bodies {
             projection.walk(body, false, ctx)?;
+        }
+        for field in selected {
+            projection.select(field, ctx)?;
         }
         if projection.groups.len() > MAX_PROJECTION_GROUPS {
             return Err(PlanError::UnsupportedField(format!(
@@ -222,6 +226,38 @@ impl Projection {
                 self.walk(lhs, neg, ctx)?;
                 self.walk(rhs, neg, ctx)
             }
+        }
+    }
+
+    /// `select(field)` (issue #592 part 1), as today's engine projects it:
+    /// a span-row column on every span, `resource.service.name` included,
+    /// as the span's own service, empty or not; any other attribute where
+    /// the span holds it; nothing for the fields the envelope carries
+    /// (`duration`, `span:id`, `trace:id`); any other intrinsic refused.
+    fn select(&mut self, field: &Field, ctx: &PredicateCtx<'_>) -> Result<(), PlanError> {
+        if let Place::Column(sql) = place_of(field) {
+            return self.add(
+                field,
+                column(sql),
+                &FieldExpr::Literal(Value::Bool(true)),
+                ctx,
+            );
+        }
+        match field {
+            Field::Attribute { .. } => self.walk(
+                &FieldExpr::Exists {
+                    field: field.clone(),
+                    negated: false,
+                },
+                false,
+                ctx,
+            ),
+            Field::Intrinsic(Intrinsic::Duration | Intrinsic::SpanId | Intrinsic::TraceId) => {
+                Ok(())
+            }
+            Field::Intrinsic(_) => Err(PlanError::UnsupportedField(format!(
+                "select({field}) is not supported by the search statement (issue #592)"
+            ))),
         }
     }
 
