@@ -389,8 +389,8 @@ fn body_of(filter: &SpansetFilter) -> FieldExpr {
         .unwrap_or(FieldExpr::Literal(Value::Bool(true)))
 }
 
-/// The filters of `spanset` in pre-order; a structural operator anywhere
-/// is #593's.
+/// The filters of `spanset` in pre-order, through structural operators
+/// too (issue #593): the projection reads every filter's body.
 fn filters_of<'a>(
     spanset: &'a SpansetExpr,
     out: &mut Vec<&'a SpansetFilter>,
@@ -404,10 +404,10 @@ fn filters_of<'a>(
             filters_of(lhs, out)?;
             filters_of(rhs, out)
         }
-        SpansetExpr::Structural { .. } => Err(PlanError::UnsupportedField(
-            "a structural operator is not supported by the search statement yet (issue #593)"
-                .to_string(),
-        )),
+        SpansetExpr::Structural { lhs, rhs, .. } => {
+            filters_of(lhs, out)?;
+            filters_of(rhs, out)
+        }
     }
 }
 
@@ -442,7 +442,9 @@ fn holds_and_guards(
             }
             joined
         }
-        SpansetExpr::Structural { .. } => unreachable!("refused by filters_of first"),
+        SpansetExpr::Structural { .. } => {
+            unreachable!("a structural spanset compiles to its membership")
+        }
     }
 }
 
@@ -771,7 +773,10 @@ fn pipeline_of(query: &Query) -> Result<Pipeline<'_>, PlanError> {
             }
         }
     }
-    if !query.pipeline.is_empty() && !matches!(query.spanset, SpansetExpr::Filter(_)) {
+    if !query.pipeline.is_empty()
+        && !matches!(query.spanset, SpansetExpr::Filter(_))
+        && !super::structural::holds_structural(&query.spanset)
+    {
         return Err(refused(
             "a pipeline stage after a spanset operation",
             "#592",
@@ -1032,7 +1037,17 @@ pub fn compile_search(
     spss: u32,
 ) -> Result<SearchStatement, PlanError> {
     let pipeline = pipeline_of(query)?;
-    let mut filter = compile_search_filter(&query.spanset, ctx)?;
+    // Issue #593: a spanset holding a structural operator is one
+    // membership predicate, the selector of every template.
+    let mut filter = if super::structural::holds_structural(&query.spanset) {
+        SearchFilter::One(super::structural::compile_membership_in(
+            &query.spanset,
+            ctx,
+            spans_table,
+        )?)
+    } else {
+        compile_search_filter(&query.spanset, ctx)?
+    };
     let compiled = |bodies: &[&FieldExpr]| -> Result<Option<SpanPredicate>, PlanError> {
         later_body(bodies)
             .map(|body| compile_span_predicate_in(&body, ctx))
