@@ -69,7 +69,10 @@
 //! the rule selects the last member, not the extremum, so there is no
 //! `argMinIf` variant.
 //!
-//! # The group key never enters SQL
+//! # The run statement's group key never enters SQL
+//!
+//! (The shape-A statement, [`range_aggregate_fetch`], computes its group
+//! key in the statement instead: issue #579 part 3.)
 //!
 //! `gid` is assigned in our process by
 //! [`pulsus_promql::group_key_of`] over the label sets the resolver
@@ -81,6 +84,8 @@
 use pulsus_model::FpLiteral;
 
 use pulsus_promql::Grouping;
+
+use crate::logql::escape::ch_string;
 
 use super::grouped::{Grid, GroupedOp, PushedRangeFn, RangeAggOp};
 use super::sample_sql;
@@ -251,11 +256,40 @@ pub fn grouped_fetch(
     )
 }
 
-/// Issue #579: one shape-A statement (plan section 3.1) for one time
-/// chunk of one node: one row per group per grid index, `SELECT gid, gi,
-/// agg`, and one sentinel row whose `gid` is
-/// [`super::grouped::HISTOGRAM_SENTINEL_GID`] carrying the count of
-/// histogram samples in the window.
+/// Issue #579: one shape-A statement for one time chunk of one node: one
+/// row per group per grid index, `SELECT gid, gi, agg`, where `gid` is the
+/// group's labels, and one sentinel row whose `gid` is
+/// [`HISTOGRAM_SENTINEL_KEY`] carrying the count of histogram samples in
+/// the window.
+///
+/// Part 3: the statement reads its series through `ids_sql`, the
+/// selector's ID statement, in all three places — the samples, the
+/// members and the histogram count — so its size does not grow with the
+/// series count. `members_scope` is the selector's metric name when it has
+/// one: the members' label rows are read in that name's key range.
+/// `grouping` is computed in the statement from each series' stored
+/// labels ([`group_key_expression`]).
+///
+/// Each stage is its own subquery, so no alias is expanded into another
+/// stage:
+///
+/// ```text
+/// gather       one row per series: (time, value bits), sorted, stale
+///              markers dropped
+/// dedup        the same without an exact repeat of the sample before
+/// samples      pts: (time, index, value[, previous time, previous value])
+///              rs: (index, previous value) of every reset
+/// runs         pts_l / pts_f: each sample carries the last / first sample
+///              of its equal-time run
+/// merge        lasts / firsts: per step, the last sample at or before its
+///              end and the first after its start, by one sort of the
+///              samples with the step boundaries and a fill
+/// windows      sts: (first, last, result, step) for each step with two
+///              or more samples in its window
+/// series-step  part 1's arithmetic over first, last and result
+/// members      rank in (name, ID) order, and the group key
+/// groups       the values in rank order, reduced
+/// ```
 ///
 /// The window is `(grid start - range, grid end]`. The caller has
 /// established that the grid arithmetic cannot overflow
@@ -273,48 +307,8 @@ pub fn range_aggregate_fetch(
     op: RangeAggOp,
     func: PushedRangeFn,
 ) -> String {
-    let _ = (
-        samples_table,
-        hist_samples_table,
-        labels_table,
-        ids_sql,
-        members_scope,
-        grouping,
-        grid,
-        range_ms,
-        op,
-        func,
-    );
-    String::new()
-}
-
-/// Issue #579 part 3: the group key of one series, computed in the
-/// statement from its stored label JSON `l`.
-pub fn group_key_expression(grouping: Option<&Grouping>) -> String {
-    let _ = grouping;
-    "CAST([], 'Array(Tuple(String, String))')".to_string()
-}
-
-/// Part 1's statement over a literal ID list.
-#[allow(clippy::too_many_arguments)]
-pub fn range_aggregate_fetch_literal(
-    samples_table: &str,
-    hist_samples_table: &str,
-    fps: &[FpLiteral],
-    gids: &[u32],
-    grid: Grid,
-    range_ms: i64,
-    op: RangeAggOp,
-    func: PushedRangeFn,
-) -> String {
     let (lower_excl_ms, upper_incl_ms) = range_window(grid, range_ms);
     let window = sample_sql::window_predicate(lower_excl_ms, upper_incl_ms);
-    let fp_list = sample_sql::render_fingerprint_list(fps);
-    let gid_list = gids
-        .iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join(", ");
     let Grid {
         start_ms,
         step_ms,
@@ -322,121 +316,193 @@ pub fn range_aggregate_fetch_literal(
         ..
     } = grid;
 
-    // The value columns and the condition a window must meet. `rate` and
-    // `increase` extrapolate from the window's first and last samples and
-    // differ only in the division by the range; `irate` reads the last
-    // two samples.
+    // `irate` reads the last sample and the one before it, so each sample
+    // carries its predecessor's time and value (`0`, `0.` for the first);
+    // `rate` and `increase` need neither.
+    let irate = matches!(func, PushedRangeFn::Irate);
+    let (pts, none, marker_tail) = if irate {
+        (
+            "arrayMap((t, j, y, tp, yp) -> (t, toUInt32(j), y, tp, yp), ts, arrayEnumerate(ts), ys, \
+             arrayPushFront(arrayPopBack(ts), toInt64(0)), arrayPushFront(arrayPopBack(ys), 0.))",
+            "(toInt64(-9223372036854775808), toUInt32(0), 0., toInt64(0), 0.)",
+            ", toUInt32(0), 0., toInt64(0), 0.)",
+        )
+    } else {
+        (
+            "arrayMap((t, j, y) -> (t, toUInt32(j), y), ts, arrayEnumerate(ts), ys)",
+            "(toInt64(-9223372036854775808), toUInt32(0), 0.)",
+            ", toUInt32(0), 0.)",
+        )
+    };
     let (value, keep) = match func {
         PushedRangeFn::Rate | PushedRangeFn::Increase => {
-            let per_second = if matches!(func, PushedRangeFn::Rate) {
+            let factor = if matches!(func, PushedRangeFn::Rate) {
                 "((sampled + d_start + d_end) / sampled) / (toFloat64(range_ms) / 1000.) AS factor"
             } else {
                 "(sampled + d_start + d_end) / sampled AS factor"
             };
             (
                 format!(
-                    "\n        i_l - i_f + 1 AS n,\
-                     \n        arrayFold((acc, x) -> acc + x.2, arrayFilter(x -> x.1 > i_f, r_l),\
-                     \n                  if(y_f < 0., (y_l - y_f) + 0., y_l - y_f)) AS result,\
-                     \n        toFloat64(t_f - (grid_start + gi * grid_step - range_ms)) / 1000. AS d_start_raw,\
-                     \n        toFloat64((grid_start + gi * grid_step) - t_l) / 1000. AS d_end_raw,\
-                     \n        toFloat64(t_l - t_f) / 1000. AS sampled,\
-                     \n        sampled / toFloat64(n - 1) AS avg_dur,\
-                     \n        avg_dur * 1.1 AS threshold,\
-                     \n        if(d_start_raw >= threshold, avg_dur / 2., d_start_raw) AS d_start_1,\
-                     \n        if(result > 0. AND y_f >= 0., sampled * (y_f / result), d_start_1) AS d_zero,\
-                     \n        if(d_zero < d_start_1, d_zero, d_start_1) AS d_start,\
-                     \n        if(d_end_raw >= threshold, avg_dur / 2., d_end_raw) AS d_end,\
-                     \n        {per_second},\
-                     \n        result * factor AS v"
+                    "        i_l - i_f + 1 AS n,\n\
+                     \x20       toFloat64(t_f - (grid_start + gi * grid_step - range_ms)) / 1000. AS d_start_raw,\n\
+                     \x20       toFloat64((grid_start + gi * grid_step) - t_l) / 1000. AS d_end_raw,\n\
+                     \x20       toFloat64(t_l - t_f) / 1000. AS sampled,\n\
+                     \x20       sampled / toFloat64(n - 1) AS avg_dur,\n\
+                     \x20       avg_dur * 1.1 AS threshold,\n\
+                     \x20       if(d_start_raw >= threshold, avg_dur / 2., d_start_raw) AS d_start_1,\n\
+                     \x20       if(result > 0. AND y_f >= 0., sampled * (y_f / result), d_start_1) AS d_zero,\n\
+                     \x20       if(d_zero < d_start_1, d_zero, d_start_1) AS d_start,\n\
+                     \x20       if(d_end_raw >= threshold, avg_dur / 2., d_end_raw) AS d_end,\n\
+                     \x20       {factor},\n\
+                     \x20       result * factor AS v"
                 ),
-                "i_l > i_f",
+                String::new(),
             )
         }
         PushedRangeFn::Irate => (
-            "\n        if(y_l < y_p, y_l, y_l - y_p) / (toFloat64(t_l - t_p) / 1000.) AS v"
+            "        st.2.4 AS t_p, st.2.5 AS y_p,\n\
+             \x20       if(y_l < y_p, y_l, y_l - y_p) / (toFloat64(t_l - t_p) / 1000.) AS v"
                 .to_string(),
-            "t_p > grid_start + gi * grid_step - range_ms AND t_l != t_p",
+            "\n    WHERE t_p > grid_start + gi * grid_step - range_ms AND t_l != t_p".to_string(),
         ),
     };
     let agg = range_agg_expression(op);
+    let gkey = group_key_expression(grouping);
+    let members_where = match members_scope {
+        Some(name) => format!(
+            "WHERE metric_name = {}\n            AND fingerprint IN (",
+            ch_string(name)
+        ),
+        None => "WHERE fingerprint IN (".to_string(),
+    };
 
     format!(
-        "WITH {start_ms} AS grid_start, {step_ms} AS grid_step, {points} AS grid_n, \
-         {range_ms} AS range_ms,\n\
-         \x20    [{fp_list}] AS fps,\n\
-         \x20    CAST([{gid_list}], 'Array(UInt32)') AS gids\n\
-         SELECT gid, gi, {agg}\n\
-         FROM (\n\
-         \x20 SELECT gid, gi, arrayMap(p -> p.2, arraySort(groupArray((transform(fingerprint, fps, arrayEnumerate(fps), toUInt32(0)), v)))) AS vs\n\
-         \x20 FROM (\n\
-         \x20   SELECT transform(fingerprint, fps, gids, CAST(0, 'UInt32')) AS gid, fingerprint, gi,{value}\n\
-         \x20   FROM (\n\
-         \x20     SELECT fingerprint, gi, i_f, t_f, y_f, i AS i_l, ts AS t_l, y AS y_l, \
-         ts_prev AS t_p, y_prev AS y_p, resets AS r_l\n\
-         \x20     FROM (\n\
-         \x20       SELECT fingerprint, gi, role, i, ts, y, ts_prev, y_prev, resets,\n\
-         \x20         lagInFrame(i) OVER wr AS i_f, lagInFrame(ts) OVER wr AS t_f, \
-         lagInFrame(y) OVER wr AS y_f\n\
-         \x20       FROM (\n\
-         \x20         SELECT fingerprint, i, ts, y, ts_prev, y_prev, resets, role,\n\
-         \x20           arrayJoin(range(\n\
-         \x20             toUInt32(least(toInt64(grid_n), if(a <= grid_start, 0, \
-         intDiv(a - grid_start + grid_step - 1, grid_step)))),\n\
-         \x20             toUInt32(least(toInt64(grid_n), if(b <= grid_start, 0, \
-         intDiv(b - grid_start + grid_step - 1, grid_step)))))) AS gi\n\
-         \x20         FROM (\n\
-         \x20           SELECT fingerprint, i, ts, y, ts_prev, y_prev, resets, role,\n\
-         \x20             if(role = 0, if(i = 1, ts, greatest(ts, ts_prev + range_ms)), ts) AS a,\n\
-         \x20             if(role = 0, ts + range_ms, least(ts_next, ts + range_ms)) AS b\n\
-         \x20           FROM (\n\
-         \x20             SELECT fingerprint, ts, y, i, ts_prev, y_prev, ts_next,\n\
-         \x20               groupArrayIf((i, y_prev), i > 1 AND y < y_prev) OVER w AS resets\n\
-         \x20             FROM (\n\
-         \x20               SELECT fingerprint, ts, y, yb,\n\
-         \x20                 row_number() OVER w AS i,\n\
-         \x20                 lagInFrame(ts, 1, toInt64(0)) OVER w AS ts_prev,\n\
-         \x20                 lagInFrame(y, 1, 0.) OVER w AS y_prev,\n\
-         \x20                 leadInFrame(ts, 1, toInt64(9223372036854775807)) OVER wf AS ts_next\n\
-         \x20               FROM (\n\
-         \x20                 SELECT fingerprint, unix_milli AS ts, reinterpretAsUInt64(value) AS yb, \
-         value AS y,\n\
-         \x20                   ts = lagInFrame(unix_milli, 1, toInt64(-1)) OVER w0\n\
-         \x20                     AND yb = lagInFrame(reinterpretAsUInt64(value), 1, toUInt64(0)) \
-         OVER w0 AS dup\n\
-         \x20                 FROM {samples_table}\n\
-         \x20                 WHERE {window} AND fingerprint IN fps\n\
-         \x20                   AND reinterpretAsUInt64(value) != {STALE_NAN_DECIMAL}\n\
-         \x20                 WINDOW w0 AS (PARTITION BY fingerprint ORDER BY unix_milli, \
-         reinterpretAsUInt64(value)\n\
-         \x20                               ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)\n\
-         \x20               )\n\
-         \x20               WHERE NOT dup\n\
-         \x20               WINDOW w AS (PARTITION BY fingerprint ORDER BY ts, yb \
-         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),\n\
-         \x20                      wf AS (PARTITION BY fingerprint ORDER BY ts, yb \
-         ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING)\n\
-         \x20             )\n\
-         \x20             WINDOW w AS (PARTITION BY fingerprint ORDER BY ts, yb \
-         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)\n\
-         \x20           ) ARRAY JOIN [0, 1] AS role\n\
-         \x20         )\n\
-         \x20       )\n\
-         \x20       WINDOW wr AS (PARTITION BY fingerprint ORDER BY gi, role \
-         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)\n\
-         \x20     )\n\
-         \x20     WHERE role = 1\n\
-         \x20   )\n\
-         \x20   WHERE {keep}\n\
-         \x20 )\n\
-         \x20 GROUP BY gid, gi\n\
-         )\n\
-         UNION ALL\n\
-         SELECT toUInt32(4294967295) AS gid, toUInt32(0) AS gi,\n\
-         \x20 toFloat64((SELECT count() FROM {hist_samples_table}\n\
-         \x20            WHERE {window} AND fingerprint IN fps)) AS agg\n\
-         ORDER BY gid, gi"
+        "WITH {start_ms} AS grid_start, {step_ms} AS grid_step, {points} AS grid_n, {range_ms} AS range_ms
+SELECT gid, gi, agg FROM (
+SELECT gid, gi,
+{agg}
+FROM (
+  SELECT gid, gi, arraySort((x, r) -> r, groupArray(v), groupArray(rank)) AS vs
+  FROM (
+    SELECT gid, rank, toUInt32(st.4) AS gi,
+        st.1.2 AS i_f, st.1.1 AS t_f, st.1.3 AS y_f, st.2.2 AS i_l, st.2.1 AS t_l, st.2.3 AS y_l, st.3 AS result,
+{value}
+    FROM (
+      SELECT m.gkey AS gid, m.rank AS rank, arrayJoin(s.sts) AS st
+      FROM (
+        SELECT fingerprint,
+          arrayFilter(x -> x.1.2 > 0 AND x.2.2 > x.1.2, arrayZip(firsts, lasts,
+            if(empty(rs),
+               arrayMap((f, l) -> if(f.3 < 0., (l.3 - f.3) + 0., l.3 - f.3), firsts, lasts),
+               arrayMap((f, l) -> arrayCumSum(arrayPushFront(arrayMap(x -> x.2, arrayFilter(x -> x.1 > f.2 AND x.1 <= l.2, rs)),
+                                                            if(f.3 < 0., (l.3 - f.3) + 0., l.3 - f.3)))[-1], firsts, lasts)),
+            range(grid_n))) AS sts
+        FROM (
+          SELECT fingerprint, rs,
+            arrayFilter((x, b) -> b, arrayFill((x, b) -> NOT b, m_l, arrayMap(x -> x.2 = 0, m_l)), arrayMap(x -> x.2 = 0, m_l)) AS lasts,
+            arrayFilter((x, b) -> b, arrayReverseFill((x, b) -> NOT b, m_f, arrayMap(x -> x.2 = 0, m_f)), arrayMap(x -> x.2 = 0, m_f)) AS firsts
+          FROM (
+            SELECT fingerprint, rs,
+              arraySort((x, k) -> k, arrayConcat(pts_l, arrayMap(e -> (e{marker_tail}, ends)),
+                        arrayConcat(arrayMap(x -> x.1 * 2, pts), arrayMap(e -> e * 2 + 1, ends))) AS m_l,
+              arraySort((x, k) -> k, arrayConcat(pts_f, arrayMap(e -> (e - range_ms{marker_tail}, ends)),
+                        arrayConcat(arrayMap(x -> x.1 * 2, pts), arrayMap(e -> (e - range_ms) * 2 + 1, ends))) AS m_f
+            FROM (
+              SELECT fingerprint, pts, rs,
+                arrayMap(g -> grid_start + toInt64(g) * grid_step, range(grid_n)) AS ends,
+                arrayReverseFill((x, b) -> b, pts, arrayMap((x, n) -> x.1 != n.1, pts, arrayPushBack(arrayPopFront(pts), {none}))) AS pts_l,
+                arrayFill((x, b) -> b, pts, arrayMap((x, p) -> x.1 != p.1, pts, arrayPushFront(arrayPopBack(pts), {none}))) AS pts_f
+              FROM (
+                SELECT fingerprint,
+                  {pts} AS pts,
+                  arrayFilter(x -> x.1 > 0, arrayMap((y, yp, j) -> if(j > 1 AND y < yp, (toUInt32(j), yp), (toUInt32(0), 0.)),
+                                                      ys, arrayPushFront(arrayPopBack(ys), 0.), arrayEnumerate(ys))) AS rs
+                FROM (
+                  SELECT fingerprint,
+                    arrayFilter((t, k) -> k, arrayMap(x -> x.1, raw), keep) AS ts,
+                    arrayMap(b -> reinterpretAsFloat64(b), arrayFilter((b, k) -> k, arrayMap(x -> x.2, raw), keep)) AS ys
+                  FROM (
+                    SELECT fingerprint, raw,
+                      arrayMap((x, p) -> x.1 != p.1 OR x.2 != p.2, raw, arrayPushFront(arrayPopBack(raw), (toInt64(-9223372036854775808), toUInt64(0)))) AS keep
+                    FROM (
+                      SELECT fingerprint, arraySort(arrayZip(groupArray(unix_milli), arrayMap(v -> reinterpretAsUInt64(v), groupArray(value)))) AS raw
+                      FROM {samples_table}
+                      WHERE {window} AND fingerprint IN (
+{ids_sql}
+)
+                        AND reinterpretAsUInt64(value) != {STALE_NAN_DECIMAL}
+                      GROUP BY fingerprint
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      ) AS s
+      INNER JOIN (
+        SELECT fingerprint, row_number() OVER (ORDER BY name, fingerprint) AS rank, {gkey} AS gkey
+        FROM (
+          SELECT fingerprint, any(metric_name) AS name, any(labels) AS l
+          FROM {labels_table}
+          {members_where}
+{ids_sql}
+            )
+          GROUP BY fingerprint
+        )
+      ) AS m USING (fingerprint)
+    ){keep}
+  )
+  GROUP BY gid, gi
+)
+)
+UNION ALL
+SELECT {HISTOGRAM_SENTINEL_KEY} AS gid, toUInt32(0) AS gi,
+  toFloat64((SELECT count() FROM {hist_samples_table}
+             WHERE {window} AND fingerprint IN (
+{ids_sql}
+))) AS agg
+ORDER BY gid, gi"
     )
+}
+
+/// Issue #579 part 3: the number of distinct series `ids_sql` selects —
+/// the series count a shape-A node is split by time over when the label
+/// cache has no list. Distinct, because the ID statement returns one row
+/// per activity row: a series active on two days, or not yet merged,
+/// appears more than once.
+pub fn series_count(ids_sql: &str) -> String {
+    format!("SELECT uniqExact(fingerprint) AS n FROM (\n{ids_sql}\n)")
+}
+
+/// Issue #579 part 3: the `gid` of the row that carries the count of
+/// histogram samples in a shape-A statement's window. No series' group
+/// key can take it: no label name is empty.
+pub const HISTOGRAM_SENTINEL_KEY: &str = "CAST([('', '')], 'Array(Tuple(String, String))')";
+
+/// Issue #579 part 3: the group key of one series, computed in the
+/// statement from its stored label JSON `l` — [`pulsus_promql::group_key_of`]'s
+/// rule over the stored label set: no grouping is the one empty key,
+/// `by` keeps the named labels a series has, `without` drops them. The
+/// stored JSON's keys are sorted, so the key's pairs are in label order.
+/// `by (__name__)` over a range function is never pushed (F4), so the
+/// metric name never enters the key.
+pub fn group_key_expression(grouping: Option<&Grouping>) -> String {
+    match grouping {
+        None => "CAST([], 'Array(Tuple(String, String))')".to_string(),
+        Some(g) => {
+            let names = g
+                .labels
+                .iter()
+                .map(|l| ch_string(l))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let not = if g.without { "NOT " } else { "" };
+            format!(
+                "arrayFilter(kv -> kv.1 {not}IN ({names}), JSONExtractKeysAndValues(l, 'String'))"
+            )
+        }
+    }
 }
 
 /// Issue #579: a shape-A statement's window, `(grid start - range, grid
@@ -462,58 +528,102 @@ fn kahan_inc(inc: &str, s: &str, c: &str) -> (String, String) {
     )
 }
 
-/// `{AGG}` of plan section 3.1, folded over `vs` — the members' values in
-/// member order, their position in `fps`, the evaluator's own
-/// accumulation order.
+/// The group stage of a shape-A statement: the projection over `vs` — the
+/// members' values in member order, `(metric_name, fingerprint)`, the
+/// evaluator's own accumulation order — that ends in `agg`. Each is the
+/// value part 1's per-element fold answered, computed element-wise over
+/// running sums instead (issue #579 part 3); `live_metrics_grouped.rs`'s
+/// `group_stages_equal_their_folds` holds each to its fold, bit for bit.
 pub fn range_agg_expression(op: RangeAggOp) -> String {
-    let expression = match op {
-        // `KahanSum::add`, read out as `sum + c`.
-        RangeAggOp::Sum => "(arrayFold((acc, x) -> (acc.1 + x, if(isInfinite(acc.1 + x), 0., \
-             if(abs(acc.1) >= abs(x), acc.2 + ((acc.1 - (acc.1 + x)) + x), \
-             acc.2 + ((x - (acc.1 + x)) + acc.1)))), vs, \
-             CAST((0., 0.), 'Tuple(Float64, Float64)')) AS k).1 + k.2"
+    match op {
+        // `KahanSum::add`, read out as `sum + c`. `t` is the running sum
+        // `0, v1, v1+v2, …` — the fold's first accumulator — and each
+        // member's compensation term is the fold's own, zeroed up to the
+        // last member whose running sum is infinite, where the fold resets
+        // it.
+        RangeAggOp::Sum => "  arrayCumSum(arrayPushFront(vs, 0.)) AS t,\n\
+             \x20 arrayLastIndex(x -> isInfinite(x), t) AS inf_at,\n\
+             \x20 arrayMap((p, x, s, j) -> if(j <= inf_at, 0., if(abs(p) >= abs(x), (p - s) + x, (x - s) + p)),\n\
+             \x20          arrayPopBack(t), vs, arrayPopFront(t), arrayEnumerate(vs)) AS terms,\n\
+             \x20 t[-1] + arrayCumSum(arrayPushFront(terms, 0.))[-1] AS agg"
             .to_string(),
-        // `aggregate_reduce`'s float `avg`, over state `(n, sum, c,
-        // incremental, mean)`: the first member raw; Kahan while the sum
-        // stays finite; on the first infinite sum the incremental mean,
-        // which absorbs that member and every later one; the split readout.
-        RangeAggOp::Avg => {
-            let n1 = "(acc.1 + 1.)";
-            let (ks, kc) = kahan_inc("x", "acc.2", "acc.3");
-            let q = format!("(({n1} - 1.) / {n1})");
-            let (im_s, im_c) = kahan_inc(
-                &format!("(x / {n1})"),
-                &format!("({q} * (acc.2 / ({n1} - 1.)))"),
-                &format!("({q} * (acc.3 / ({n1} - 1.)))"),
-            );
-            let (ii_s, ii_c) = kahan_inc(
-                &format!("(x / {n1})"),
-                &format!("({q} * acc.5)"),
-                &format!("({q} * acc.3)"),
-            );
-            let lambda = format!(
-                "(acc, x) -> if(acc.1 = 0., (1., x, 0., toUInt8(0), 0.), \
-                 if(acc.4 = 1, ({n1}, acc.2, {ii_c}, toUInt8(1), {ii_s}), \
-                 if(NOT isInfinite({ks}), ({n1}, {ks}, {kc}, toUInt8(0), 0.), \
-                 ({n1}, acc.2, {im_c}, toUInt8(1), {im_s}))))"
-            );
-            let state = format!(
-                "arrayFold({lambda}, vs, CAST((0., 0., 0., 0, 0.), \
-                 'Tuple(Float64, Float64, Float64, UInt8, Float64)'))"
-            );
-            format!("if(({state} AS st).4 = 1, st.5 + st.3, st.2 / st.1 + st.3 / st.1)")
-        }
-        RangeAggOp::Count => "toFloat64(length(vs))".to_string(),
+        // `aggregate_reduce`'s float `avg`: the first member raw, then
+        // Kahan while the running sum stays finite, read out as
+        // `sum / n + c / n`. That is the running sum `t` and the running
+        // sum of the compensation terms after the first member. A running
+        // sum that turns infinite switches the evaluator to its
+        // incremental mean, which only part 1's fold computes, so those
+        // rows keep it: the fold runs over their members and over an empty
+        // array on every other row.
+        //
+        // The two answers are picked by index rather than by `if`. Under
+        // `if` the fold's readout runs only on the rows that take it, and
+        // there two NaN members' sum answered the other member's payload
+        // from the evaluator's (measured on ClickHouse 26.3.29.7:
+        // `0x7ff8000000000108` against `0x7ff800000000002c`); over the
+        // whole column, as part 1 ran it, it answers the evaluator's.
+        RangeAggOp::Avg => format!(
+            "  arrayCumSum(vs) AS t,\n\
+             \x20 arrayExists(x -> isInfinite(x), arrayPopFront(t)) AS inf_sum,\n\
+             \x20 arrayMap((p, x, s) -> if(abs(p) >= abs(x), (p - s) + x, (x - s) + p),\n\
+             \x20          arrayPopBack(t), arrayPopFront(vs), arrayPopFront(t)) AS terms,\n\
+             \x20 toFloat64(length(vs)) AS n,\n\
+             \x20 [t[-1] / n + arrayCumSum(arrayPushFront(terms, 0.))[-1] / n,\n\
+             \x20  {}][inf_sum + 1] AS agg",
+            avg_fold("if(inf_sum, vs, [])", "fs")
+        ),
+        RangeAggOp::Count => "  toFloat64(length(vs)) AS agg".to_string(),
         // The reference's replacement rule: replace when the comparison
-        // says to or the accumulator is NaN; the first member wins a tie.
-        RangeAggOp::Min => {
-            "arrayFold((acc, x) -> if(acc > x OR isNaN(acc), x, acc), vs, nan)".to_string()
+        // says to or the accumulator is NaN, so the answer is the first
+        // member holding the extremum of the non-NaN members, or the last
+        // member when every member is NaN.
+        RangeAggOp::Min | RangeAggOp::Max => {
+            let extremum = if matches!(op, RangeAggOp::Min) {
+                "arrayMin"
+            } else {
+                "arrayMax"
+            };
+            format!(
+                "  arrayFilter(x -> NOT isNaN(x), vs) AS nn,\n\
+                 \x20 {extremum}(nn) AS extremum,\n\
+                 \x20 if(empty(nn), vs[-1], arrayFirst(x -> x = extremum, nn)) AS agg"
+            )
         }
-        RangeAggOp::Max => {
-            "arrayFold((acc, x) -> if(acc < x OR isNaN(acc), x, acc), vs, nan)".to_string()
-        }
-    };
-    format!("{expression} AS agg")
+    }
+}
+
+/// Part 1's `avg` over `values`, over state `(n, sum, c, incremental,
+/// mean)` named `state`: the first member raw; Kahan while the sum stays
+/// finite; on the first infinite sum the incremental mean, which absorbs
+/// that member and every later one; the split readout.
+fn avg_fold(values: &str, state: &str) -> String {
+    let n1 = "(acc.1 + 1.)";
+    let (ks, kc) = kahan_inc("x", "acc.2", "acc.3");
+    let q = format!("(({n1} - 1.) / {n1})");
+    let (im_s, im_c) = kahan_inc(
+        &format!("(x / {n1})"),
+        &format!("({q} * (acc.2 / ({n1} - 1.)))"),
+        &format!("({q} * (acc.3 / ({n1} - 1.)))"),
+    );
+    let (ii_s, ii_c) = kahan_inc(
+        &format!("(x / {n1})"),
+        &format!("({q} * acc.5)"),
+        &format!("({q} * acc.3)"),
+    );
+    let lambda = format!(
+        "(acc, x) -> if(acc.1 = 0., (1., x, 0., toUInt8(0), 0.), \
+         if(acc.4 = 1, ({n1}, acc.2, {ii_c}, toUInt8(1), {ii_s}), \
+         if(NOT isInfinite({ks}), ({n1}, {ks}, {kc}, toUInt8(0), 0.), \
+         ({n1}, acc.2, {im_c}, toUInt8(1), {im_s}))))"
+    );
+    let fold = format!(
+        "arrayFold({lambda}, {values}, CAST((0., 0., 0., 0, 0.), \
+         'Tuple(Float64, Float64, Float64, UInt8, Float64)'))"
+    );
+    format!(
+        "if(({fold} AS {state}).4 = 1, {state}.5 + {state}.3, \
+         {state}.2 / {state}.1 + {state}.3 / {state}.1)"
+    )
 }
 
 #[cfg(test)]
@@ -749,134 +859,6 @@ mod tests {
         }
     }
 
-    // ------------------------------------------------ issue #579, shape A
-
-    const RANGE_GOLDEN: &str = include_str!("../../tests/golden/range_aggregate_statements.txt");
-
-    fn range_sql(op: RangeAggOp, func: PushedRangeFn) -> String {
-        range_aggregate_fetch_literal(
-            "metric_samples",
-            "metric_hist_samples",
-            &[
-                Fingerprint::from_raw(101).sql_literal(),
-                Fingerprint::from_raw(205).sql_literal(),
-                Fingerprint::from_raw(990).sql_literal(),
-            ],
-            &[0, 1, 0],
-            grid(),
-            300_000,
-            op,
-            func,
-        )
-    }
-
-    /// The golden's sections, keyed by their `<op> <func>` marker.
-    fn range_golden() -> Vec<(String, String)> {
-        let mut out = Vec::new();
-        let mut parts = RANGE_GOLDEN.split("-- golden[").skip(1);
-        for part in parts.by_ref() {
-            let (key, body) = part.split_once("]\n").expect("a marker line");
-            out.push((
-                key.to_string(),
-                body.strip_suffix('\n')
-                    .expect("a section ends in a newline")
-                    .to_string(),
-            ));
-        }
-        out
-    }
-
-    /// Every function under `sum`, and every aggregation under `rate`,
-    /// renders the statement the design's generator wrote, byte for byte.
-    #[test]
-    fn each_range_function_and_aggregation_renders_the_designs_statement() {
-        let golden = range_golden();
-        assert_eq!(golden.len(), 7, "seven sections in the golden");
-        for (key, want) in golden {
-            let (op, func) = key.split_once(' ').expect("<op> <func>");
-            let op = match op {
-                "sum" => RangeAggOp::Sum,
-                "avg" => RangeAggOp::Avg,
-                "count" => RangeAggOp::Count,
-                "min" => RangeAggOp::Min,
-                "max" => RangeAggOp::Max,
-                other => panic!("unknown op {other}"),
-            };
-            let func = match func {
-                "rate" => PushedRangeFn::Rate,
-                "irate" => PushedRangeFn::Irate,
-                "increase" => PushedRangeFn::Increase,
-                other => panic!("unknown function {other}"),
-            };
-            assert_eq!(range_sql(op, func), want, "{key}");
-        }
-    }
-
-    /// The window is `(grid start - range, grid end]` on both tables, and
-    /// the stale literal is the model's stale marker.
-    #[test]
-    fn the_range_statement_reads_its_window_and_drops_stale_markers() {
-        let s = range_sql(RangeAggOp::Sum, PushedRangeFn::Rate);
-        let window = sample_sql::window_predicate(1_782_906_900_000, 1_782_910_800_000);
-        assert_eq!(s.matches(&window).count(), 2, "both tables, one window");
-        assert!(s.contains(&format!(
-            "reinterpretAsUInt64(value) != {}",
-            pulsus_model::STALE_NAN_BITS
-        )));
-    }
-
-    /// The grouping reaches the statement only through `gids`, and the
-    /// sentinel row is in every statement.
-    #[test]
-    fn the_range_statement_carries_the_grouping_only_in_gids_and_always_a_sentinel() {
-        for op in [
-            RangeAggOp::Sum,
-            RangeAggOp::Avg,
-            RangeAggOp::Count,
-            RangeAggOp::Min,
-            RangeAggOp::Max,
-        ] {
-            for func in [
-                PushedRangeFn::Rate,
-                PushedRangeFn::Irate,
-                PushedRangeFn::Increase,
-            ] {
-                let s = range_sql(op, func);
-                assert!(
-                    s.contains("SELECT toUInt32(4294967295) AS gid, toUInt32(0) AS gi,"),
-                    "{op:?} {func:?}"
-                );
-                assert!(!s.contains("metric_name"), "{op:?} {func:?}");
-                assert!(!s.contains("AS (SELECT"), "{op:?} {func:?}");
-                let other = range_aggregate_fetch_literal(
-                    "metric_samples",
-                    "metric_hist_samples",
-                    &[
-                        Fingerprint::from_raw(101).sql_literal(),
-                        Fingerprint::from_raw(205).sql_literal(),
-                        Fingerprint::from_raw(990).sql_literal(),
-                    ],
-                    &[0, 0, 0],
-                    grid(),
-                    300_000,
-                    op,
-                    func,
-                );
-                assert_eq!(
-                    s.replace("[0, 1, 0], 'Array(UInt32)'", "[0, 0, 0], 'Array(UInt32)'"),
-                    other,
-                    "{op:?} {func:?}"
-                );
-            }
-        }
-    }
-
-    /// The sentinel id is the one the reader looks for.
-    #[test]
-    fn the_sentinel_id_is_the_readers() {
-        assert_eq!(super::super::grouped::HISTOGRAM_SENTINEL_GID, 4_294_967_295);
-    }
-
     // ------------------------------------------ issue #579 part 3, shape A
 
     const BY_IDS_GOLDEN: &str =
@@ -997,18 +979,74 @@ mod tests {
         );
     }
 
+    /// The golden's sections: the design's statement first, then each
+    /// other function and aggregation under it, then each other grouping
+    /// form. Every combination's structure is
+    /// `every_by_id_statement_reads_through_the_id_statement`'s.
+    const BY_IDS_SECTIONS: [&str; 9] = [
+        "sum rate by (mode)",
+        "sum irate by (mode)",
+        "sum increase by (mode)",
+        "avg rate by (mode)",
+        "count rate by (mode)",
+        "min rate by (mode)",
+        "max rate by (mode)",
+        "sum rate none",
+        "sum rate without (cpu)",
+    ];
+
+    fn render_section(key: &str) -> String {
+        let mut parts = key.splitn(3, ' ');
+        let op = op_of(parts.next().expect("op"));
+        let func = func_of(parts.next().expect("func"));
+        let grouping = grouping_of(parts.next().expect("grouping"));
+        by_ids_sql(op, func, grouping.as_ref())
+    }
+
+    /// Writes the by-ID golden from the builder. `#[ignore]`d: run only to
+    /// capture a deliberate change to the statement, and read the diff.
+    #[test]
+    #[ignore = "regenerates the golden; run only to capture a deliberate change"]
+    fn regenerate_the_by_id_golden() {
+        let mut out = String::new();
+        for key in BY_IDS_SECTIONS {
+            out.push_str(&format!("-- golden[{key}]\n{}\n", render_section(key)));
+        }
+        std::fs::write(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/golden/range_aggregate_by_ids_statements.txt"
+            ),
+            out,
+        )
+        .expect("write the golden");
+    }
+
     /// T7: every section of the by-ID golden renders byte for byte.
     #[test]
     fn every_by_id_section_renders_its_golden() {
         let golden = by_ids_golden();
-        assert!(!golden.is_empty());
+        assert_eq!(
+            golden.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+            BY_IDS_SECTIONS,
+            "the golden's sections"
+        );
         for (key, want) in golden {
-            let mut parts = key.splitn(3, ' ');
-            let op = op_of(parts.next().expect("op"));
-            let func = func_of(parts.next().expect("func"));
-            let grouping = grouping_of(parts.next().expect("grouping"));
-            assert_eq!(by_ids_sql(op, func, grouping.as_ref()), want, "{key}");
+            assert_eq!(render_section(&key), want, "{key}");
         }
+    }
+
+    /// The window is `(grid start - range, grid end]` on both tables, and
+    /// the stale literal is the model's stale marker.
+    #[test]
+    fn the_by_id_statement_reads_its_window_and_drops_stale_markers() {
+        let s = by_ids_sql(RangeAggOp::Sum, PushedRangeFn::Rate, None);
+        let window = sample_sql::window_predicate(1_791_430_980_000, 1_791_434_340_000);
+        assert_eq!(s.matches(&window).count(), 2, "both tables, one window");
+        assert!(s.contains(&format!(
+            "reinterpretAsUInt64(value) != {}",
+            pulsus_model::STALE_NAN_BITS
+        )));
     }
 
     /// T7: the three grouping forms of the group key, as text.

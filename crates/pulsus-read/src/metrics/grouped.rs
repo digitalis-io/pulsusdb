@@ -22,10 +22,14 @@
 //!   |     NodeDecline that names why not. The flag is on.
 //!   `-- the phase-1 loop, for each selector a pushed node owns
 //!         resolution = resolver.resolve_labelled(...)   <- the ONE resolve
-//!         grouped::decide / grouped::decide_range
-//!           Series(pairs) -> gids from the pairs (shape B: then the
-//!                            `series >= 2 * groups` threshold)
+//!         grouped::decide (shape B)
+//!           Series(pairs) -> gids from the pairs, then the
+//!                            `series >= 2 * groups` threshold
 //!           SqlFallback   -> Err(ResolutionNotFingerprints)
+//!         grouped::decide_range (shape A)
+//!           any resolution -> the node's statements read the selector's
+//!                             ID statement; the resolution only says how
+//!                             many series there are, when it knows
 //!         Ok  -> render the node's statements, skip the chunk builders
 //!         Err -> fall through with the SAME resolution
 //! ```
@@ -38,14 +42,20 @@
 //! the feature flag: [`decide`] and [`decide_range`] re-check neither,
 //! and neither statement builder re-checks either.
 //!
-//! # The group key never enters SQL
+//! # Where the group key is computed
 //!
-//! A group id is assigned here, in this process, by
+//! Shape B: a group id is assigned here, in this process, by
 //! [`pulsus_promql::group_key_of`] — the same function the evaluator's
 //! own aggregation uses, so the pushed route cannot partition series
 //! differently from the unpushed one. `by`, `without` and bare therefore
 //! produce byte-identical statement text for the same assignment; only
 //! the `gids` array moves.
+//!
+//! Shape A (issue #579 part 3): the statement computes each series' group
+//! key from its stored labels, by `group_key_of`'s rule
+//! ([`super::grouped_sql::group_key_expression`]), and each row carries
+//! its group's labels, so no ID list reaches the statement whatever the
+//! series count.
 //!
 //! # The threshold
 //!
@@ -235,12 +245,6 @@ pub struct GroupedPush {
 /// measured.
 pub const PUSHED_SERIES_STEPS_PER_STATEMENT: usize = 1_048_576;
 
-/// Issue #579: the group id of the row that carries the count of
-/// histogram samples in a shape-A statement's window. No real group can
-/// take it: a gid is below the series count, which the build-time
-/// assertion below keeps under `u32::MAX`.
-pub const HISTOGRAM_SENTINEL_GID: u32 = u32::MAX;
-
 /// Issue #579: the aggregations shape A answers in the database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RangeAggOp {
@@ -321,19 +325,18 @@ pub enum NodeDecline {
     GridOverflow,
 }
 
-/// Issue #579: what [`decide_range`] establishes once the resolution is in
-/// hand.
+/// Issue #579: a shape-A node the database answers. Part 3: its
+/// statements read the selector's ID statement and compute the groups
+/// themselves, so nothing here depends on the resolution.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RangePush {
     pub op: RangeAggOp,
     pub func: PushedRangeFn,
     pub selector: SelectorId,
-    /// In member order, `(metric_name, fingerprint)`.
-    pub fingerprints: Vec<Fingerprint>,
-    /// Parallel to `fingerprints`.
-    pub gids: Vec<u32>,
-    /// Indexed by group id.
-    pub groups: Vec<(Labels, Option<String>)>,
+    /// The selector's one metric name, when it has one: the members'
+    /// label rows are read in that name's key range.
+    pub metric_name: Option<String>,
+    pub grouping: Option<Grouping>,
     pub grid: Grid,
     pub range_ms: i64,
 }
@@ -616,21 +619,27 @@ pub fn pushed_nodes(plan: &QueryPlan, params: &PlanParams, cfg: &MetricsConfig) 
         .collect()
 }
 
-/// Issue #579: assign every resolved fingerprint of a shape-A node to its
-/// group. No threshold: one row per group per step is fewer rows than the
-/// raw samples for every grouping.
-pub fn decide_range(shape: &RangeShape, members: &[Member]) -> Result<RangePush, DeclineReason> {
-    let (fingerprints, gids, groups) = assign_groups(members, shape.grouping.as_ref());
-    Ok(RangePush {
+/// Issue #579: a shape-A node, pushed whatever the resolution. No
+/// threshold: one row per group per step is fewer rows than the raw
+/// samples for every grouping. Part 3: no member list either — the
+/// statement reads the selector's ID statement — so nothing declines here.
+pub fn decide_range(shape: &RangeShape) -> RangePush {
+    RangePush {
         op: shape.op,
         func: shape.func,
         selector: shape.selector,
-        fingerprints,
-        gids,
-        groups,
+        metric_name: shape.metric_name.clone(),
+        grouping: shape.grouping.clone(),
         grid: shape.grid,
         range_ms: shape.range_ms,
-    })
+    }
+}
+
+/// Issue #579 part 3: whether a shape-A row is the sentinel that counts
+/// the window's histogram samples — the one key no series' labels make,
+/// [`super::grouped_sql::HISTOGRAM_SENTINEL_KEY`].
+pub fn is_histogram_sentinel(gid: &[(String, String)]) -> bool {
+    matches!(gid, [(k, v)] if k.is_empty() && v.is_empty())
 }
 
 /// Issue #579: splits a shape-A node's grid by time so no statement
@@ -661,7 +670,9 @@ pub fn time_chunks(grid: Grid, series: usize, cap: usize) -> Vec<(u32, Grid)> {
 }
 
 /// Issue #579: a shape-A node's rows, one `Vec` per time chunk with that
-/// chunk's first grid index, read into the node's answer.
+/// chunk's first grid index, read into the node's answer. Each row's `gid`
+/// is its group's labels; the groups are output in label order,
+/// `aggregate_reduce`'s own.
 pub fn range_node(
     push: &RangePush,
     chunks: Vec<(u32, Vec<super::grouped_rows::RangeAggRow>)>,
@@ -670,14 +681,16 @@ pub fn range_node(
     let points = push.grid.points as usize;
     let mut cells: Vec<Vec<(u32, f64)>> = vec![Vec::new(); points];
     let mut histograms = 0.0f64;
+    let mut groups: Vec<Labels> = Vec::new();
+    let mut seen: HashMap<Vec<(String, String)>, u32> = HashMap::new();
     for (g0, rows) in chunks {
         if cancel.is_cancelled() {
             return Err(PromqlError::Cancelled);
         }
         for row in rows {
-            // Picked out by its id, never by its position: the final
+            // Picked out by its key, never by its position: the final
             // `ORDER BY` binds only to the last `SELECT` of the union.
-            if row.gid == HISTOGRAM_SENTINEL_GID {
+            if is_histogram_sentinel(&row.gid) {
                 histograms += row.agg.unwrap_or(0.0);
                 continue;
             }
@@ -687,25 +700,30 @@ pub fn range_node(
                 });
             };
             let gi = g0 as usize + row.gi as usize;
-            // Unreachable: every fingerprint read is in `fps`, so every
-            // gid indexes `groups`, and `gi` is below the chunk's points.
-            if gi >= points || row.gid as usize >= push.groups.len() {
+            // Unreachable: `gi` is below the chunk's points.
+            if gi >= points {
                 continue;
             }
-            cells[gi].push((row.gid, agg));
+            let gid = match seen.get(&row.gid) {
+                Some(g) => *g,
+                None => {
+                    let g = groups.len() as u32;
+                    groups.push(Labels::new(row.gid.iter().cloned()));
+                    seen.insert(row.gid, g);
+                    g
+                }
+            };
+            cells[gi].push((gid, agg));
         }
     }
     if histograms > 0.0 {
         return Ok(RangeOutcome::Histograms(histograms as u64));
     }
-    // `aggregate_reduce`'s output order: by labels, then name.
-    let mut rank: Vec<u32> = (0..push.groups.len() as u32).collect();
-    rank.sort_by(|a, b| {
-        let (la, na) = &push.groups[*a as usize];
-        let (lb, nb) = &push.groups[*b as usize];
-        (la, na).cmp(&(lb, nb))
-    });
-    let mut position = vec![0u32; push.groups.len()];
+    // `aggregate_reduce`'s output order: by labels. The name is never
+    // part of a shape-A key (F4).
+    let mut rank: Vec<u32> = (0..groups.len() as u32).collect();
+    rank.sort_by(|a, b| groups[*a as usize].cmp(&groups[*b as usize]));
+    let mut position = vec![0u32; groups.len()];
     for (i, gid) in rank.iter().enumerate() {
         position[*gid as usize] = i as u32;
     }
@@ -718,18 +736,15 @@ pub fn range_node(
         let t_ms = push.grid.start_ms + gi as i64 * push.grid.step_ms;
         steps.push(
             cell.into_iter()
-                .map(|(gid, v)| {
-                    let (labels, metric_name) = &push.groups[gid as usize];
-                    InstantSample {
-                        labels: labels.clone(),
-                        metric_name: metric_name.clone(),
-                        // A range function drops the name, and the
-                        // group's verdict is the OR of its members'.
-                        drop_name: true,
-                        t_ms,
-                        v,
-                        h: None,
-                    }
+                .map(|(gid, v)| InstantSample {
+                    labels: groups[gid as usize].clone(),
+                    metric_name: None,
+                    // A range function drops the name, and the group's
+                    // verdict is the OR of its members'.
+                    drop_name: true,
+                    t_ms,
+                    v,
+                    h: None,
                 })
                 .collect(),
         );
@@ -2152,51 +2167,24 @@ mod tests {
         }
     }
 
-    /// T5, F5: a cold or degraded cache has no fingerprint list.
+    /// Issue #579 part 3: a shape-A node is pushed whatever the resolution
+    /// — the statement reads the selector's ID statement — and carries the
+    /// selector's name and grouping for it.
     #[test]
-    fn f5_a_sql_fallback_resolution_declines_a_range_node() {
+    fn a_range_node_is_pushed_without_a_member_list() {
         let s = range_shape_for("sum by (mode) (rate(m[5m]))");
-        let r = LabelledResolution::SqlFallback {
-            sql: "SELECT fingerprint FROM metric_series".to_string(),
-            reason: crate::FallbackReason::ColdCache,
-        };
+        let push = decide_range(&s);
+        assert_eq!(push.metric_name.as_deref(), Some("m"));
         assert_eq!(
-            members_of(&r, "m").and_then(|members| decide_range(&s, &members)),
-            Err(DeclineReason::ResolutionNotFingerprints)
+            push.grouping,
+            Some(Grouping {
+                without: false,
+                labels: vec!["mode".to_string()],
+            })
         );
-    }
-
-    /// Shape A assigns groups as the evaluator keys them and applies no
-    /// threshold: one group per series is still pushed.
-    #[test]
-    fn a_range_node_assigns_groups_and_has_no_threshold() {
-        let s = range_shape_for("sum by (mode) (rate(m[5m]))");
-        let r = resolution(&[
-            (3, &[("mode", "user"), ("cpu", "1")]),
-            (1, &[("mode", "idle"), ("cpu", "0")]),
-            (2, &[("mode", "user"), ("cpu", "0")]),
-        ]);
-        let push = decide_range(&s, &r).expect("pushed");
-        assert_eq!(push.fingerprints, [1, 2, 3].map(Fingerprint::from_raw));
-        assert_eq!(push.gids, vec![0, 1, 1]);
-        assert_eq!(
-            push.groups,
-            vec![
-                (
-                    Labels::new([("mode".to_string(), "idle".to_string())]),
-                    None
-                ),
-                (
-                    Labels::new([("mode".to_string(), "user".to_string())]),
-                    None
-                ),
-            ]
-        );
+        assert_eq!((push.op, push.func), (RangeAggOp::Sum, PushedRangeFn::Rate));
         assert_eq!(push.range_ms, 300_000);
-
-        let s = range_shape_for("sum by (cpu, mode) (rate(m[5m]))");
-        let push = decide_range(&s, &r).expect("one group per series is pushed");
-        assert_eq!(push.groups.len(), 3);
+        assert_eq!(push.grid, s.grid);
     }
 
     /// Section 3.4: over the cap, the grid is split by time, never by
@@ -2233,17 +2221,13 @@ mod tests {
         assert_eq!(time_chunks(grid, 300_000, 262_144).len(), 5_761);
     }
 
-    fn range_push(groups: &[&str], points: u32) -> RangePush {
+    fn range_push(points: u32) -> RangePush {
         RangePush {
             op: RangeAggOp::Sum,
             func: PushedRangeFn::Rate,
             selector: 0,
-            fingerprints: Vec::new(),
-            gids: Vec::new(),
-            groups: groups
-                .iter()
-                .map(|m| (Labels::new([("mode".to_string(), m.to_string())]), None))
-                .collect(),
+            metric_name: Some("m".to_string()),
+            grouping: None,
             grid: Grid {
                 start_ms: 1_000,
                 step_ms: 10,
@@ -2254,34 +2238,42 @@ mod tests {
         }
     }
 
-    fn row(gid: u32, gi: u32, agg: f64) -> super::super::grouped_rows::RangeAggRow {
+    fn row(mode: &str, gi: u32, agg: f64) -> super::super::grouped_rows::RangeAggRow {
         super::super::grouped_rows::RangeAggRow {
-            gid,
+            gid: vec![("mode".to_string(), mode.to_string())],
             gi,
             agg: Some(agg),
         }
     }
 
+    fn sentinel(agg: f64) -> super::super::grouped_rows::RangeAggRow {
+        super::super::grouped_rows::RangeAggRow {
+            gid: vec![(String::new(), String::new())],
+            gi: 0,
+            agg: Some(agg),
+        }
+    }
+
     /// Rows are placed by `(gid, gi)`, never by position; the sentinel is
-    /// picked out by its id wherever it arrives; each step's vector is in
+    /// picked out by its key wherever it arrives; each step's vector is in
     /// label order, carries the step's time and `drop_name`; and a chunk's
     /// `gi` is offset by its first grid index.
     #[test]
     fn range_rows_are_placed_by_group_and_index() {
-        // Group 0 is "user" and group 1 is "idle": the output order is the
-        // labels', not the gids'.
-        let push = range_push(&["user", "idle"], 4);
+        // "user" arrives first: the output order is the labels', not the
+        // rows'.
+        let push = range_push(4);
         let chunks = vec![
             (
                 0,
                 vec![
-                    row(HISTOGRAM_SENTINEL_GID, 0, 0.0),
-                    row(0, 1, 2.0),
-                    row(1, 0, 3.0),
-                    row(0, 0, 1.0),
+                    sentinel(0.0),
+                    row("user", 1, 2.0),
+                    row("idle", 0, 3.0),
+                    row("user", 0, 1.0),
                 ],
             ),
-            (2, vec![row(1, 1, 5.0), row(HISTOGRAM_SENTINEL_GID, 0, 0.0)]),
+            (2, vec![row("idle", 1, 5.0), sentinel(0.0)]),
         ];
         let RangeOutcome::Node(node) =
             range_node(&push, chunks, &CancelToken::never()).expect("read")
@@ -2323,10 +2315,10 @@ mod tests {
     /// node's answer.
     #[test]
     fn a_sentinel_counting_histograms_discards_the_answer() {
-        let push = range_push(&["user"], 2);
+        let push = range_push(2);
         let chunks = vec![
-            (0, vec![row(0, 0, 1.0), row(HISTOGRAM_SENTINEL_GID, 0, 0.0)]),
-            (1, vec![row(HISTOGRAM_SENTINEL_GID, 0, 20.0)]),
+            (0, vec![row("user", 0, 1.0), sentinel(0.0)]),
+            (1, vec![sentinel(20.0)]),
         ];
         match range_node(&push, chunks, &CancelToken::never()).expect("read") {
             RangeOutcome::Histograms(n) => assert_eq!(n, 20),
@@ -2450,18 +2442,6 @@ mod tests {
                 (Labels::default(), Some("b".to_string())),
             ]
         );
-
-        let s = match nodes("sum by (k) (rate({__name__=~\"a|b\"}[5m]))", range_params())
-            .into_iter()
-            .next()
-            .map(|n| n.kind)
-        {
-            Some(PushKind::Range(r)) => r,
-            other => panic!("not shape A: {other:?}"),
-        };
-        let push = decide_range(&s, &members).expect("pushed");
-        assert_eq!(push.fingerprints, [2, 4, 1, 3].map(Fingerprint::from_raw));
-        assert_eq!(push.gids, vec![0, 1, 0, 1]);
     }
 
     /// The fan-out's groups become members carrying their own name.

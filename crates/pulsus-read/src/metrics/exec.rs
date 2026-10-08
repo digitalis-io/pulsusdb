@@ -752,30 +752,48 @@ impl MetricsEngine {
                         }
                     }
                     Some((self_pos, super::grouped::PushKind::Range(shape))) => {
-                        let members = super::grouped::members_of_groups(&groups);
-                        match super::grouped::decide_range(shape, &members) {
-                            Ok(push) => {
-                                // F6: today's multi-name fetch, sent only if
-                                // the statement counts a histogram sample.
-                                let (fallback, _) = if by_index {
-                                    self.nameless_fetch_plan(sel, groups, window, None)
-                                } else {
-                                    self.multi_fetch_plan(groups, lower_excl, upper_incl, None)
-                                };
-                                self.stage_range_push(
-                                    selector_id,
-                                    self_pos,
-                                    push,
-                                    fallback,
-                                    explain.as_deref_mut(),
-                                    &mut reads,
-                                    &mut pending,
-                                );
-                                fetch_plans.push(SelectorFetchPlan::Empty);
-                                continue;
-                            }
-                            Err(reason) => range_push_declined(explain.as_deref_mut(), reason),
-                        }
+                        // Issue #579 part 3: the statement reads the
+                        // selector's own ID statement; the resolution gives
+                        // only the series count the time chunks are cut by.
+                        let series: usize = groups.iter().map(|g| g.series.len()).sum();
+                        let ids_sql = if by_index {
+                            super::sql::nameless_ids_query(
+                                self.series_tables(),
+                                &sel.matchers,
+                                window,
+                            )
+                        } else {
+                            super::sql::name_matcher_ids_query(
+                                &self.config.series_table,
+                                &self.config.labels_table,
+                                &sel.name_matchers,
+                                &sel.matchers,
+                                window,
+                            )
+                        };
+                        // F6: today's multi-name fetch, sent only if the
+                        // statement counts a histogram sample.
+                        let (fallback, _) = if by_index {
+                            self.nameless_fetch_plan(sel, groups, window, None)
+                        } else {
+                            self.multi_fetch_plan(groups, lower_excl, upper_incl, None)
+                        };
+                        self.stage_range_push(
+                            RangeStage {
+                                selector_id,
+                                self_pos,
+                                push: super::grouped::decide_range(shape),
+                                ids_sql,
+                                series: Some(series),
+                                fallback,
+                            },
+                            explain.as_deref_mut(),
+                            &mut reads,
+                            &mut pending,
+                        )
+                        .await?;
+                        fetch_plans.push(SelectorFetchPlan::Empty);
+                        continue;
                     }
                     None => {}
                 }
@@ -901,35 +919,49 @@ impl MetricsEngine {
                     }
                 }
                 Some((self_pos, super::grouped::PushKind::Range(shape))) => {
-                    match super::grouped::members_of(&resolution, metric_name)
-                        .and_then(|members| super::grouped::decide_range(shape, &members))
-                    {
-                        Ok(push) => {
-                            // F6: today's fetch, built now and sent only if
-                            // the statement counts a histogram sample.
-                            let fallback = self.concrete_fetch_plan(
-                                selector_id,
-                                sel,
-                                resolution,
-                                lower_excl,
-                                upper_incl,
-                                None,
-                                None,
-                            );
-                            self.stage_range_push(
-                                selector_id,
-                                self_pos,
-                                push,
-                                fallback,
-                                explain.as_deref_mut(),
-                                &mut reads,
-                                &mut pending,
-                            );
-                            fetch_plans.push(SelectorFetchPlan::Empty);
-                            continue;
-                        }
-                        Err(reason) => range_push_declined(explain.as_deref_mut(), reason),
-                    }
+                    // Issue #579 part 3: pushed whatever the resolution.
+                    // The statement reads the selector's ID statement —
+                    // matchers included, warm cache or not — and the
+                    // cache's list, when it has one, gives the series
+                    // count the time chunks are cut by.
+                    let series = match &resolution {
+                        LabelledResolution::Series(pairs) => Some(pairs.len()),
+                        LabelledResolution::SqlFallback { .. } => None,
+                    };
+                    let ids_sql = super::sql::historical_series_subquery(
+                        &self.config.series_table,
+                        &self.config.labels_table,
+                        metric_name,
+                        window,
+                        &sel.matchers,
+                    );
+                    // F6: today's fetch, built now and sent only if the
+                    // statement counts a histogram sample.
+                    let fallback = self.concrete_fetch_plan(
+                        selector_id,
+                        sel,
+                        resolution,
+                        lower_excl,
+                        upper_incl,
+                        None,
+                        None,
+                    );
+                    self.stage_range_push(
+                        RangeStage {
+                            selector_id,
+                            self_pos,
+                            push: super::grouped::decide_range(shape),
+                            ids_sql,
+                            series,
+                            fallback,
+                        },
+                        explain.as_deref_mut(),
+                        &mut reads,
+                        &mut pending,
+                    )
+                    .await?;
+                    fetch_plans.push(SelectorFetchPlan::Empty);
+                    continue;
                 }
                 None => {}
             }
@@ -997,7 +1029,7 @@ impl MetricsEngine {
                     chunks,
                     ..
                 } if chunks.iter().flat_map(|(_, rows)| rows).any(|r| {
-                    r.gid == super::grouped::HISTOGRAM_SENTINEL_GID && r.agg.unwrap_or(0.0) > 0.0
+                    super::grouped::is_histogram_sentinel(&r.gid) && r.agg.unwrap_or(0.0) > 0.0
                 }) =>
                 {
                     if let Some(e) = explain.as_mut() {
@@ -1024,6 +1056,12 @@ impl MetricsEngine {
                             // Issue #579 part 2: a multi-name node's
                             // fallback is the fan-out's one fetch.
                             SelectorFetchPlan::Multi { sql, hist_sql, .. } => {
+                                e.push("sample_fetch", sql.clone(), None);
+                                e.push("hist_sample_fetch", hist_sql.clone(), None);
+                            }
+                            // Issue #579 part 3: a node pushed over the SQL
+                            // route falls back to that route's fetch.
+                            SelectorFetchPlan::Fallback { sql, hist_sql, .. } => {
                                 e.push("sample_fetch", sql.clone(), None);
                                 e.push("hist_sample_fetch", hist_sql.clone(), None);
                             }
@@ -1224,6 +1262,7 @@ impl MetricsEngine {
                 SelectorFetchPlan::Fallback {
                     sql: fetch_sql,
                     hist_sql,
+                    ids_sql: sql.clone(),
                     // Issue #82 (retroactive re-review, Finding 1):
                     // the degraded-path cap probe, built now (a pure
                     // function of the already-computed series-
@@ -1295,34 +1334,59 @@ impl MetricsEngine {
         });
     }
 
-    /// Issue #579: a shape-A node whose decision confirmed it — its
-    /// statements split by time, its read and its explain entry, and the
-    /// pending push with today's fetch as its F6 fallback.
-    #[allow(clippy::too_many_arguments)]
-    fn stage_range_push(
+    /// Issue #579: a shape-A node — its statements split by time, its read
+    /// and its explain entry, and the pending push with today's fetch as
+    /// its F6 fallback.
+    ///
+    /// Part 3: every statement reads the selector's ID statement, so none
+    /// grows with the series count. The time chunks are cut by the series
+    /// count: the cache's, when the resolution carried a list, or else the
+    /// distinct IDs the ID statement selects, counted by one statement sent
+    /// first.
+    async fn stage_range_push(
         &self,
-        selector_id: SelectorId,
-        self_pos: usize,
-        push: super::grouped::RangePush,
-        fallback: SelectorFetchPlan,
+        stage: RangeStage,
         explain: Option<&mut PlanExplain>,
         reads: &mut compile::SelectorReads,
         pending: &mut Vec<PendingPush>,
-    ) {
-        let fps = sql_literals(&push.fingerprints);
-        let sqls: Vec<(u32, String)> = if fps.is_empty() {
+    ) -> Result<(), ReadError> {
+        let RangeStage {
+            selector_id,
+            self_pos,
+            push,
+            ids_sql,
+            series,
+            fallback,
+        } = stage;
+        let mut explain = explain;
+        let series = match series {
+            Some(n) => n,
+            None => {
+                let count_sql = super::grouped_sql::series_count(&ids_sql);
+                if let Some(e) = explain.as_mut() {
+                    e.push("pushed_series_count", count_sql.clone(), None);
+                }
+                let rows: Vec<super::grouped_rows::SeriesCountRow> =
+                    self.fetch_series_rows(count_sql).await?;
+                rows.first()
+                    .map_or(0, |r| usize::try_from(r.n).unwrap_or(usize::MAX))
+            }
+        };
+        let sqls: Vec<(u32, String)> = if series == 0 {
             Vec::new()
         } else {
-            super::grouped::time_chunks(push.grid, fps.len(), self.pushed_series_steps_cap)
+            super::grouped::time_chunks(push.grid, series, self.pushed_series_steps_cap)
                 .into_iter()
                 .map(|(g0, grid)| {
                     (
                         g0,
-                        super::grouped_sql::range_aggregate_fetch_literal(
+                        super::grouped_sql::range_aggregate_fetch(
                             &self.config.samples_table,
                             &self.config.hist_samples_table,
-                            &fps,
-                            &push.gids,
+                            &self.config.labels_table,
+                            &ids_sql,
+                            push.metric_name.as_deref(),
+                            push.grouping.as_ref(),
                             grid,
                             push.range_ms,
                             push.op,
@@ -1333,14 +1397,14 @@ impl MetricsEngine {
                 .collect()
         };
         if let Some(e) = explain {
-            if !fps.is_empty() {
+            if !sqls.is_empty() {
                 let (lo, hi) = super::grouped_sql::range_window(push.grid, push.range_ms);
                 reads.push(compile::SelectorRead {
                     selector: selector_id,
                     pred: compile::selector_pred(
                         None,
                         &sample_sql::window_predicate(lo, hi),
-                        &sample_sql::fingerprints_predicate(&fps),
+                        &sample_sql::subquery_predicate(&ids_sql),
                     ),
                     shape: compile::PqlShape::Samples,
                 });
@@ -1362,6 +1426,7 @@ impl MetricsEngine {
             sqls,
             fallback,
         });
+        Ok(())
     }
 
     /// Issue #85 (M6-08c): resolves a name-less/regex-`__name__`
@@ -1704,6 +1769,7 @@ impl MetricsEngine {
             SelectorFetchPlan::Fallback {
                 sql,
                 hist_sql,
+                ids_sql,
                 info_series_probe,
             } => {
                 // Issue #82 (retroactive re-review, Finding 1): run the
@@ -1742,22 +1808,17 @@ impl MetricsEngine {
                 if rows.is_empty() && hist_rows.is_empty() {
                     return Ok(Vec::new());
                 }
-                // Hydrate labels over the UNION of both reads' fingerprints
-                // (M7-A5a): a histogram-only fingerprint must still hydrate,
-                // or its series reaches the evaluator label-less.
-                let mut fps: Vec<Fingerprint> = rows
-                    .iter()
-                    .map(|r| r.fingerprint)
-                    .chain(hist_rows.iter().map(|r| r.fingerprint))
-                    .collect();
-                fps.sort_unstable();
-                fps.dedup();
+                // Hydrate labels over the ID statement both reads used
+                // (issue #579 part 3, D2), so every fingerprint either read
+                // returned — a histogram-only one included (M7-A5a) — has
+                // its labels, with no list of IDs in the statement.
                 let hydrate_sql = super::sql::series_labels_by_fingerprint(
                     &self.config.labels_table,
                     &[metric_name.to_string()],
-                    &sql_literals(&fps),
+                    &ids_sql,
                 );
-                let series_rows: Vec<super::rows::SeriesRow> = self.fetch_rows(hydrate_sql).await?;
+                let series_rows: Vec<super::rows::SeriesRow> =
+                    self.fetch_series_rows(hydrate_sql).await?;
                 let labels_by_fp: HashMap<Fingerprint, LabelSet> = series_rows
                     .into_iter()
                     .map(|r| {
@@ -1826,14 +1887,19 @@ impl MetricsEngine {
                 sqls,
                 fallback,
             } => {
-                let (starts, sqls): (Vec<u32>, Vec<String>) = sqls.into_iter().unzip();
-                let results = join_all(sqls.into_iter().map(|sql| {
-                    self.fetch_sample_rows::<super::grouped_rows::RangeAggRow>(sql, budget)
-                }))
-                .await;
-                let mut chunks = Vec::with_capacity(results.len());
-                for (g0, rows) in starts.into_iter().zip(results) {
-                    chunks.push((g0, rows?));
+                // Issue #579 part 3 (D3): one chunk after another, so a
+                // node holds one statement's memory in the database, not
+                // the chunk count times it. Each statement nests the
+                // series tables, so it carries `series_read_settings`.
+                let settings = series_read_settings(
+                    self.config.read_max_memory_bytes,
+                    self.config.distributed,
+                );
+                let mut chunks = Vec::with_capacity(sqls.len());
+                for (g0, sql) in sqls {
+                    let rows: Vec<super::grouped_rows::RangeAggRow> =
+                        self.fetch_rows_with(sql, &settings, Some(budget)).await?;
+                    chunks.push((g0, rows));
                 }
                 Ok(PushResult::Range {
                     self_pos,
@@ -2690,15 +2756,18 @@ fn instant_push_declined(explain: Option<&mut PlanExplain>, reason: super::group
     }
 }
 
-/// Issue #579: the explain entry of a shape-A node `decide_range` declined.
-fn range_push_declined(explain: Option<&mut PlanExplain>, reason: super::grouped::DeclineReason) {
-    if let Some(e) = explain {
-        e.push(
-            "pushed_aggregate",
-            format!("declined: {reason:?}"),
-            Some("issue #579: this selector takes the sample fetch below".to_string()),
-        );
-    }
+/// Issue #579: a shape-A node as the phase-1 loop hands it to
+/// `stage_range_push`.
+struct RangeStage {
+    selector_id: SelectorId,
+    self_pos: usize,
+    push: super::grouped::RangePush,
+    /// The selector's series ID statement, which every statement nests.
+    ids_sql: String,
+    /// The series count, when the resolution carried a list.
+    series: Option<usize>,
+    /// Today's fetch for the selector, sent only on F6.
+    fallback: SelectorFetchPlan,
 }
 
 /// Issues #549 and #579: a pushed node whose resolution confirmed it, with
@@ -2760,6 +2829,9 @@ enum SelectorFetchPlan {
     Fallback {
         sql: String,
         hist_sql: String,
+        /// The series ID statement `sql` and `hist_sql` nest, which the
+        /// label lookup reads by (issue #579 part 3, D2).
+        ids_sql: String,
         /// Issue #82 (retroactive re-review, Finding 1): `Some` only for
         /// an `info_family` selector — the `LIMIT cap+1`-bounded
         /// series-selection probe [`MetricsEngine::execute_fetch_plan`]

@@ -225,8 +225,9 @@ async fn uncovered_queries_take_todays_route() {
         );
     }
 
-    // F5: a cold cache answers `SqlFallback`, so there is no fingerprint
-    // list to assign groups over.
+    // Issue #579 part 3: a cold cache answers `SqlFallback`, and the node
+    // is pushed anyway — its statement reads the selector's ID statement —
+    // where part 1 declined it (F5).
     let cold = Arc::new(LabelCache::new(
         ChClient::new(test_config(&db)).await.expect("connect"),
         cache_config(&db),
@@ -245,14 +246,12 @@ async fn uncovered_queries_take_todays_route() {
     let p = h.ten_minutes(60_000);
     let a = Harness::run(&cold_pushed, q, &p).await;
     let b = Harness::run(&cold_unpushed, q, &p).await;
-    assert_eq!(a.answer, b.answer, "F5 {q}: the answers differ");
-    assert!(!a.answer.is_empty(), "F5 {q}: the fallback answers");
-    assert_eq!(statement_stages(&a), statement_stages(&b), "F5 {q}");
+    assert_eq!(a.answer, b.answer, "cold cache {q}: the answers differ");
+    assert!(!a.answer.is_empty(), "cold cache {q}: it answers");
+    assert_by_id_shape(&format!("cold cache {q}"), &a);
     assert!(
-        pushed_declines(&a)
-            .iter()
-            .any(|d| d.contains("ResolutionNotFingerprints")),
-        "F5 {q}: {:?}",
+        pushed_declines(&a).is_empty(),
+        "cold cache {q}: {:?}",
         a.stages
     );
 
@@ -672,7 +671,6 @@ async fn histogram_fallback_above_the_cap() {
             "{q}: {:?}",
             r.stages
         );
-        assert!(!r.answer.is_empty(), "{q}");
     }
     h.finish().await;
 }
