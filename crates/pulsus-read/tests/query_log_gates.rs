@@ -3620,6 +3620,121 @@ async fn a_bucketed_statement_that_fails_for_memory_is_answered_by_todays_route(
         .expect("drop the run database");
 }
 
+/// Seeds `streams` streams of service `c624cap`, one line each at `T + 100s`,
+/// into a fresh database, and returns `(admin, db, T)`.
+async fn seed_cap_corpus(streams: u64) -> (ChClient, String, i64) {
+    let db = pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_cap_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let admin = ChClient::new(test_config()).await.expect("connect admin");
+    for sql in [
+        format!("DROP DATABASE IF EXISTS {db}"),
+        format!("CREATE DATABASE {db}"),
+    ] {
+        admin
+            .execute(&sql, &QuerySettings::new(), Idempotency::Idempotent)
+            .await
+            .expect("create the run database");
+    }
+    run_init(&admin, &test_ctx(&db)).await.expect("run_init");
+    let client = data_client(&db).await;
+    let t = ((now_ns() - 4 * 3_600_000_000_000) / 1_000_000_000) * 1_000_000_000;
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, updated_ns) \
+                 SELECT toStartOfMonth(fromUnixTimestamp64Nano(toInt64({t}))), 6240000 + number, \
+                 'c624cap', concat('{{\"pod\":\"p', toString(number), \
+                 '\",\"service_name\":\"c624cap\"}}'), 0 FROM numbers({streams})"
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("seed log_streams");
+    land_seeded_streams(&client, &db).await;
+    let rows: Vec<BucketedSeedRow> = (0..streams)
+        .map(|i| BucketedSeedRow {
+            service: "c624cap".to_string(),
+            fingerprint: u128::from(6_240_000 + i),
+            timestamp_ns: t + 100_000_000_000,
+            severity: 0,
+            body: "x".to_string(),
+            structured_metadata: String::new(),
+        })
+        .collect();
+    client
+        .insert_block("log_samples", &rows)
+        .await
+        .expect("insert the cap fixture");
+    land_seeded_lines(&client, &db).await;
+    (admin, db, t)
+}
+
+/// **At a range equal to the step, a reducing aggregation over many sparse
+/// series is answered, as it was before** (issue #624, code review round 2).
+///
+/// 1,091 one-line streams on an 11,001-point grid at a 1 s step, `[1s]`. The
+/// bucketed fold keeps each series' points sparsely and charges them one by
+/// one, so 1,091 points are charged; reserving one grid per series would be
+/// 12,002,091 slots, past `MAX_METRIC_RESULT_POINTS`, and a 422. Each query
+/// answers one point at `T + 100s`.
+#[tokio::test]
+async fn a_reducing_aggregation_over_sparse_series_at_range_equal_to_step_is_answered() {
+    skip_unless_live!();
+    const GRID: u64 = 11_001;
+    let streams = pulsus_read::logql::MAX_METRIC_RESULT_POINTS / GRID + 1;
+    let (admin, db, t) = seed_cap_corpus(streams).await;
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t + 11_000_000_000_000,
+            step_ns: 1_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+    let at = t + 100_000_000_000;
+    let sel = r#"{service_name=~".+"}"#;
+    let by_service = vec![("service_name".to_string(), "c624cap".to_string())];
+    for (query, labels, value) in [
+        (format!("topk(1, rate({sel}[1s]))"), None, 1.0f64),
+        (format!("max(rate({sel}[1s]))"), Some(vec![]), 1.0),
+        (
+            format!("count by (service_name) (count_over_time({sel}[1s]))"),
+            Some(by_service),
+            streams as f64,
+        ),
+    ] {
+        let mp = match plan(&parse(&query).expect("parse"), &params, &plan_ctx(&db)).expect("plan")
+        {
+            Plan::Metric(mp) => mp,
+            _ => panic!("expected a metric plan"),
+        };
+        assert!(
+            mp.client.is_none(),
+            "{query}: must be counted in the database"
+        );
+        let got = sliding_answer(&engine, &query, &params).await;
+        assert_eq!(got.len(), 1, "{query}: one series, got {got:?}");
+        if let Some(labels) = labels {
+            assert_eq!(got[0].0, labels, "{query}");
+        }
+        assert_eq!(got[0].1, vec![(at, value.to_bits())], "{query}");
+    }
+
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the run database");
+}
+
 // ---------------------------------------------------------------------
 // W4 (issue #507): does a single-threaded `sum` accumulate in scan order?
 // ---------------------------------------------------------------------

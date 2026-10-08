@@ -5332,6 +5332,12 @@ impl PushdownRangeGroups {
         self
     }
 
+    /// Keeps each series' points sparsely (issue #624, code review round 2).
+    /// Not yet implemented.
+    pub(in crate::logql) fn with_sparse_points(self) -> Self {
+        self
+    }
+
     /// Folds one returned row. A row whose fingerprint did not hydrate is
     /// skipped, as on the instant path.
     ///
@@ -9722,6 +9728,51 @@ mod tests {
             1,
             "the refused series is not retained"
         );
+    }
+
+    /// Issue #624, code review round 2: when the range equals the step the
+    /// fold keeps each series' points sparsely and charges them one by one,
+    /// as the bucketed fold did before (#507). 1,091 one-point series on an
+    /// 11,001-point grid are 1,091 points; reserving a grid per series would
+    /// be 12,002,091 slots, past `MAX_METRIC_RESULT_POINTS`.
+    #[test]
+    fn sparse_points_are_charged_per_point_not_per_grid() {
+        const POINTS: u64 = 11_001;
+        let series = super::super::charge::MAX_METRIC_RESULT_POINTS / POINTS + 1;
+        let mut meta = HashMap::new();
+        for i in 0..series {
+            let fp = Fingerprint::from_raw(u128::from(1_000 + i));
+            meta.insert(
+                fp,
+                StreamMetaRow {
+                    fingerprint: fp,
+                    service: "r".to_string(),
+                    labels: format!(r#"{{"pod":"p{i}","service_name":"r"}}"#),
+                },
+            );
+        }
+        let end = RANGE_GRID_START_NS + (POINTS as i64 - 1) * RANGE_STEP_NS;
+        let mut g = PushdownRangeGroups::new(
+            &meta,
+            AggCaps::DEFAULT,
+            RANGE_GRID_START_NS,
+            end,
+            RANGE_STEP_NS,
+            POINTS,
+        )
+        .with_sparse_points();
+        for i in 0..series {
+            g.push_row(&bucket_row(
+                Fingerprint::from_raw(u128::from(1_000 + i)),
+                RANGE_GRID_START_NS + 100 * RANGE_STEP_NS,
+                1,
+                "",
+            ))
+            .unwrap_or_else(|e| panic!("series {i} must fold: {e:?}"));
+        }
+        let out = g.finish(None);
+        assert_eq!(out.len() as u64, series);
+        assert!(out.iter().all(|s| s.points.len() == 1));
     }
 
     /// N7 (issue #624): only the server's memory code hands a bucketed
