@@ -1422,7 +1422,7 @@ when we are asking it to slow down, so we keep `429`; recorded as
      ungrouped **aggregation** or **quantile** over an empty window we emit
      one series whose zero `value` is protojson-omitted, where the reference
      emits no series. Our `PlanKind::Agg` instant arm folds an absent row to
-     `0.0` (`crates/pulsus-read/src/traces/exec.rs:1789-1802`, "an empty
+     `0.0` (`crates/pulsus-read/src/traces/exec.rs:1812-1825`, "an empty
      aggregate window is a 0-valued sample"), and the reference drops a
      series with no samples
      (`modules/frontend/metrics_query_handler.go:193-196` @ v3.0.2). This is
