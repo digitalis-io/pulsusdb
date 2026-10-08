@@ -24,7 +24,10 @@ rewrite docs/schemas.md:33-33
 # introduced.
 # Issue #579 adds #579, its own issue, where the schema's PromQL obligation
 # paragraph names the second reduction it compiles into SQL.
-rewrite docs/schemas.md:174-174 refs=#25,#559,#560,#603,#16,#171,#498,#2,#57,#584,#586,#587,#5,#63,#75,#478,#555,#26,#623,#125,#315,#472,#549,#7,#579,#635
+# Issue #500 adds #500, its own issue, where the `metric_metadata` paragraph
+# states the descriptor key and its retention; #26 is carried in that
+# paragraph's rewrite.
+rewrite docs/schemas.md:174-174 refs=#25,#559,#560,#603,#16,#171,#498,#2,#57,#584,#586,#587,#5,#63,#75,#478,#555,#26,#623,#125,#315,#472,#549,#7,#579,#635,#500
 # `refs=#112` is a NEW reference on this file rather than a carried one. §2.4's
 # writer-contract paragraph gained the reason the read path does not route on
 # `metric_series.value_type`, and that reason is the decision A1's plan v5
