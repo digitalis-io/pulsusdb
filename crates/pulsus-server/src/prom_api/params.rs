@@ -102,6 +102,10 @@ pub(crate) enum ParamError {
     UnsupportedContentType(String),
     #[error("request body is not valid UTF-8")]
     InvalidFormBody,
+    /// Issue #500: `/metadata`'s `limit_per_metric` that is not an
+    /// integer. The reference's own sentence.
+    #[error("limit_per_metric must be a number")]
+    LimitPerMetricNotANumber,
     /// Issue #635 part 4: an `X-Scope-OrgID` outside the tenant rule
     /// (`pulsus_model::Tenant::from_header`).
     #[error("invalid X-Scope-OrgID")]
@@ -291,6 +295,20 @@ pub(crate) fn parse_limit(raw: Option<&str>) -> Result<Option<usize>, ParamError
             .parse::<usize>()
             .map(Some)
             .map_err(|_| ParamError::InvalidLimit(s.to_string())),
+    }
+}
+
+/// `/metadata`'s `limit_per_metric` (issue #500), as the reference reads
+/// it: absent or empty is no limit, an integer is passed on (0 or a
+/// negative value is no limit too, which the statement decides), anything
+/// else is [`ParamError::LimitPerMetricNotANumber`].
+pub(crate) fn parse_limit_per_metric(raw: Option<&str>) -> Result<Option<i64>, ParamError> {
+    match raw {
+        None | Some("") => Ok(None),
+        Some(s) => s
+            .parse::<i64>()
+            .map(Some)
+            .map_err(|_| ParamError::LimitPerMetricNotANumber),
     }
 }
 

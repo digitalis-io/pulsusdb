@@ -2032,9 +2032,9 @@ fn descriptor_hour() -> i64 {
 
 /// **Issue #623: a descriptor is sent when it changes, not on every push.**
 /// Three pushes carrying the same descriptor in one hour land one kind-3 row.
-/// A changed type lands one; going back to the first lands it again, since
-/// what the writer last sent was the changed one. A push with no metadata
-/// lands none.
+/// A changed type lands one; going back to the first lands none within the
+/// hour, since the writer has sent it and the table keeps both (issue #500).
+/// A push with no metadata lands none.
 ///
 /// The writer keys the hourly resend on the wall clock, so a run that
 /// crosses an hour boundary is repeated rather than read.
@@ -2081,14 +2081,10 @@ async fn a_descriptor_is_sent_only_when_it_changes() {
             .collect();
         assert_eq!(
             sent,
-            vec![
-                (0, "gauge".to_string(), 1),
-                (3, "counter".to_string(), 4),
-                (4, "gauge".to_string(), 5),
-            ],
+            vec![(0, "gauge".to_string(), 1), (3, "counter".to_string(), 4)],
             "only a changed descriptor is sent again within the hour"
         );
-        assert_eq!(writer.metrics().metadata_upserts_total, 3);
+        assert_eq!(writer.metrics().metadata_upserts_total, 2);
         return;
     }
     panic!("two attempts in a row crossed an hour boundary");

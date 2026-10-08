@@ -584,8 +584,11 @@ async fn metadata_impl(
 ) -> Result<Response, ApiError> {
     let metric = params::metric(&pairs);
     let limit = params::parse_limit(params::get(&pairs, "limit"))?;
+    let limit_per_metric = params::parse_limit_per_metric(params::get(&pairs, "limit_per_metric"))?;
     let engine = engine_for(&state).await?;
-    let items = engine.metadata(tenant, metric, limit).await?;
+    let items = engine
+        .metadata(tenant, metric, limit, limit_per_metric)
+        .await?;
     Ok(encode::metadata_response(items))
 }
 

@@ -1493,34 +1493,34 @@ pub fn parse(req: &WriteRequest, now_ns: i64) -> Result<ParsedMetrics, LogsInges
     // are resolved by the read path, not here.
     dedup_histogram_wins(&mut out, &mut expanded_bytes)?;
 
-    // Metadata dedup within-request by family name, last-wins (architect
-    // plan) — a later entry for the same name overwrites an earlier one
-    // rather than both being emitted; `metric_family_name` is used verbatim
-    // as `metric_name` (RW carries the base family name explicitly, unlike
-    // OTLP where a suffix must never be stripped either — there is simply
-    // no suffix to strip here).
-    let mut by_name: std::collections::HashMap<Arc<str>, usize> = std::collections::HashMap::new();
+    // Metadata dedup within-request by the whole descriptor (issue #500):
+    // each distinct `(name, type, help, unit)` is kept once, so a name with
+    // two descriptors in one request keeps both. `metric_family_name` is
+    // used verbatim as `metric_name` (RW carries the base family name
+    // explicitly, unlike OTLP where a suffix must never be stripped either —
+    // there is simply no suffix to strip here).
+    let mut seen: HashSet<(&str, &str, &str, &str)> = HashSet::new();
     for meta in &req.metadata {
         // Charge the metadata row BEFORE building it (issue #62).
         charge_budget(
             &mut expanded_bytes,
             META_ROW_OVERHEAD + meta.metric_family_name.len() + meta.help.len() + meta.unit.len(),
         )?;
-        let name: Arc<str> = Arc::from(meta.metric_family_name.as_str());
-        let row = MetricMetadata {
-            metric_name: Arc::clone(&name),
+        if !seen.insert((
+            meta.metric_family_name.as_str(),
+            metric_type_name(meta.r#type),
+            meta.help.as_str(),
+            meta.unit.as_str(),
+        )) {
+            continue;
+        }
+        out.metadata.push(MetricMetadata {
+            metric_name: Arc::from(meta.metric_family_name.as_str()),
             metric_type: metric_type_name(meta.r#type).to_string(),
             help: meta.help.clone(),
             unit: meta.unit.clone(),
             updated_ns: now_ns,
-        };
-        match by_name.get(&name) {
-            Some(&idx) => out.metadata[idx] = row,
-            None => {
-                by_name.insert(name, out.metadata.len());
-                out.metadata.push(row);
-            }
-        }
+        });
     }
 
     Ok(out)
@@ -2845,28 +2845,24 @@ mod tests {
         assert_eq!(out.metadata[0].metric_type, "histogram");
     }
 
+    /// Issue #500, T6: one request carrying `m` "A", then "B", then "A"
+    /// again keeps each distinct descriptor once.
     #[test]
-    fn duplicate_metadata_family_name_dedups_last_wins() {
+    fn one_request_keeps_each_distinct_descriptor() {
+        let entry = |help: &str| MetricMetadataProto {
+            r#type: 2,
+            metric_family_name: "m".to_string(),
+            help: help.to_string(),
+            unit: String::new(),
+        };
         let req = WriteRequest {
             timeseries: vec![],
-            metadata: vec![
-                MetricMetadataProto {
-                    r#type: 2,
-                    metric_family_name: "up".to_string(),
-                    help: "first".to_string(),
-                    unit: String::new(),
-                },
-                MetricMetadataProto {
-                    r#type: 2,
-                    metric_family_name: "up".to_string(),
-                    help: "second".to_string(),
-                    unit: String::new(),
-                },
-            ],
+            metadata: vec![entry("A"), entry("B"), entry("A")],
         };
         let out = parse(&req, 0).expect("within the expansion budget");
-        assert_eq!(out.metadata.len(), 1);
-        assert_eq!(out.metadata[0].help, "second");
+        let mut helps: Vec<&str> = out.metadata.iter().map(|m| m.help.as_str()).collect();
+        helps.sort_unstable();
+        assert_eq!(helps, ["A", "B"], "{:?}", out.metadata);
     }
 
     // -- expansion budget (issue #62) -------------------------------------

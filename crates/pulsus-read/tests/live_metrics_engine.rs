@@ -2938,10 +2938,10 @@ async fn series_with_a_matcher_only_filter_matches_across_metric_names() {
     drop_database(&bootstrap, db).await;
 }
 
-/// AC: `metadata` reads `metric_metadata`, collapsing the
-/// `ReplacingMergeTree`'s version column to the latest write.
+/// AC: `metadata` reads `metric_metadata`, every distinct descriptor of a
+/// name (issue #500): `up`'s two helps are two entries.
 #[tokio::test]
-async fn metadata_collapses_to_the_latest_write() {
+async fn metadata_lists_each_descriptor_of_a_name() {
     skip_unless_live!();
 
     let bootstrap = ChClient::new(test_config("default"))
@@ -2968,7 +2968,7 @@ async fn metadata_collapses_to_the_latest_write() {
                 metric_type: "gauge".to_string(),
                 help: "old help".to_string(),
                 unit: "".to_string(),
-                updated_ns: 1_000,
+                updated_ns: now_ms() * 1_000_000 - 1_000,
             },
             SeedMetadataRow {
                 org_id: String::new(),
@@ -2976,7 +2976,7 @@ async fn metadata_collapses_to_the_latest_write() {
                 metric_type: "gauge".to_string(),
                 help: "1 if the target is healthy".to_string(),
                 unit: "".to_string(),
-                updated_ns: 2_000,
+                updated_ns: now_ms() * 1_000_000,
             },
             SeedMetadataRow {
                 org_id: String::new(),
@@ -2984,7 +2984,7 @@ async fn metadata_collapses_to_the_latest_write() {
                 metric_type: "counter".to_string(),
                 help: "total requests".to_string(),
                 unit: "requests".to_string(),
-                updated_ns: 1_000,
+                updated_ns: now_ms() * 1_000_000,
             },
         ],
     )
@@ -2998,18 +2998,23 @@ async fn metadata_collapses_to_the_latest_write() {
     let engine = MetricsEngine::new(engine_client, cache, engine_config(db));
 
     let all = engine
-        .metadata(&no_tenant(), None, None)
+        .metadata(&no_tenant(), None, None, None)
         .await
         .expect("metadata (all)");
-    assert_eq!(all.len(), 2);
-    let up = all.iter().find(|m| m.name == "up").expect("up metadata");
+    assert_eq!(all.len(), 3);
+    let up_helps: Vec<&str> = all
+        .iter()
+        .filter(|m| m.name == "up")
+        .map(|m| m.help.as_str())
+        .collect();
     assert_eq!(
-        up.help, "1 if the target is healthy",
-        "must collapse to the latest write"
+        up_helps,
+        ["1 if the target is healthy", "old help"],
+        "each descriptor of up, in help order"
     );
 
     let scoped = engine
-        .metadata(&no_tenant(), Some("http_requests_total"), None)
+        .metadata(&no_tenant(), Some("http_requests_total"), None, None)
         .await
         .expect("metadata (scoped)");
     assert_eq!(scoped.len(), 1);
@@ -3017,7 +3022,7 @@ async fn metadata_collapses_to_the_latest_write() {
     assert_eq!(scoped[0].unit, "requests");
 
     let limited = engine
-        .metadata(&no_tenant(), None, Some(1))
+        .metadata(&no_tenant(), None, Some(1), None)
         .await
         .expect("metadata (limited)");
     assert_eq!(limited.len(), 1);
@@ -3025,18 +3030,11 @@ async fn metadata_collapses_to_the_latest_write() {
     drop_database(&bootstrap, db).await;
 }
 
-/// Issue #603: two rows for one name with the SAME `updated_ns` and no field
-/// in common. One aggregate over the whole descriptor tuple means one of the
-/// two wins **whole**; three independent `argMax` calls may resolve column by
-/// column and answer `("gauge", "help b", …)` — a descriptor no client ever
-/// sent.
-///
-/// The statement's own text is what reddens on the defect
-/// (`metadata_query_aggregates_the_descriptor_as_one_tuple`): one block of two
-/// rows may resolve the same row three times, so this case alone can pass on
-/// it. It is here because the property is about what a client is served.
+/// Issue #603's case, two rows for one name with the SAME `updated_ns` and
+/// no field in common: since issue #500 they are two descriptors, and the
+/// read serves each whole — never a tuple assembled from both.
 #[tokio::test]
-async fn a_tie_on_updated_ns_serves_one_whole_descriptor() {
+async fn two_descriptors_with_one_updated_ns_are_both_served_whole() {
     skip_unless_live!();
 
     let bootstrap = ChClient::new(test_config("default"))
@@ -3054,6 +3052,7 @@ async fn a_tie_on_updated_ns_serves_one_whole_descriptor() {
         .await
         .expect("connect (engine client)");
 
+    let at = now_ms() * 1_000_000;
     seed_metadata(
         &client,
         &[
@@ -3063,7 +3062,7 @@ async fn a_tie_on_updated_ns_serves_one_whole_descriptor() {
                 metric_type: "gauge".to_string(),
                 help: "help a".to_string(),
                 unit: "unit_a".to_string(),
-                updated_ns: 3_000,
+                updated_ns: at,
             },
             SeedMetadataRow {
                 org_id: String::new(),
@@ -3071,7 +3070,7 @@ async fn a_tie_on_updated_ns_serves_one_whole_descriptor() {
                 metric_type: "counter".to_string(),
                 help: "help b".to_string(),
                 unit: "unit_b".to_string(),
-                updated_ns: 3_000,
+                updated_ns: at,
             },
         ],
     )
@@ -3085,18 +3084,20 @@ async fn a_tie_on_updated_ns_serves_one_whole_descriptor() {
     let engine = MetricsEngine::new(engine_client, cache, engine_config(db));
 
     let rows = engine
-        .metadata(&no_tenant(), Some("up"), None)
+        .metadata(&no_tenant(), Some("up"), None, None)
         .await
         .expect("metadata (tied)");
-    assert_eq!(rows.len(), 1, "one descriptor per name");
-    let got = (
-        rows[0].metric_type.as_str(),
-        rows[0].help.as_str(),
-        rows[0].unit.as_str(),
-    );
-    assert!(
-        got == ("gauge", "help a", "unit_a") || got == ("counter", "help b", "unit_b"),
-        "one of the two rows must win WHOLE, not a tuple assembled from both: {got:?}"
+    let got: Vec<(&str, &str, &str)> = rows
+        .iter()
+        .map(|m| (m.metric_type.as_str(), m.help.as_str(), m.unit.as_str()))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("counter", "help b", "unit_b"),
+            ("gauge", "help a", "unit_a")
+        ],
+        "both descriptors, each whole"
     );
 
     drop_database(&bootstrap, db).await;

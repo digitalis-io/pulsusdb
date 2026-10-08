@@ -470,42 +470,46 @@ pub fn discovery_fetch_by_names(
         .with_labels(lookup_tables(series_table, labels_table))
 }
 
-/// `GET /api/v1/metadata` (issue #32): `metric_metadata` is a
-/// `ReplacingMergeTree(updated_ns)` (docs/schemas.md §2.1) whose merges are
-/// asynchronous, so a plain `SELECT` can observe more than one row per
-/// `metric_name` — `argMax(_, updated_ns)` deterministically collapses to the
-/// latest-written value without waiting for a merge, grouped by the base
-/// family name (schemas.md §2.1's writer contract: a derived series' suffix
-/// is never stripped here — callers must already be querying by the base
-/// name). `metric` is an optional exact-name filter, `limit` an optional row
-/// cap.
+/// `GET /api/v1/metadata` (issues #32 and #500): every distinct
+/// `(metric_type, help, unit)` of each name in `tenant`. `metric_metadata`
+/// is a `ReplacingMergeTree(updated_ns)` keyed by the whole descriptor
+/// (docs/schemas.md §2.1), so a resend collapses on merge; merges are not
+/// guaranteed, so the read groups by the descriptor. The name is the base
+/// family name as the writer stored it, never stripped here.
 ///
-/// **One `argMax` over the whole tuple, not three independent ones** (issue
-/// #603). Three separate calls may resolve column by column where two rows
-/// for a name carry EQUAL `updated_ns`, and answer a descriptor assembled
-/// from both — the type from one row, the help from the other. One aggregate
-/// over the tuple makes one of the two rows win whole; which one is
-/// unspecified and needs no rule, since both are descriptors a client sent in
-/// that nanosecond, and the next push for that name settles it with a larger
-/// stamp. The columns are unpacked outside the grouping, so the four the
-/// caller decodes are unchanged, in order.
+/// `metric` selects one name. `limit` counts names after `metric` has
+/// selected them, as a sub-query of the first `limit` names; `limit = 0`
+/// returns nothing. `limit_per_metric` above 0 keeps each name's first that
+/// many entries, in `type`, `help`, `unit` order; 0 or a negative value is
+/// no limit.
 pub fn metadata_query(
     tenant: &Tenant,
     metadata_table: &str,
     metric: Option<&str>,
     limit: Option<usize>,
+    limit_per_metric: Option<i64>,
 ) -> String {
-    let mut sql = String::from(
-        "SELECT metric_name, tupleElement(d, 1) AS metric_type, tupleElement(d, 2) AS help, tupleElement(d, 3) AS unit\nFROM (SELECT metric_name, argMax((metric_type, help, unit), updated_ns) AS d",
+    let org = tenant.sql_literal();
+    let name = metric.map(|n| format!(" AND metric_name = {}", ch_string(n)));
+    let mut sql = format!(
+        "SELECT metric_name, metric_type, help, unit\nFROM {metadata_table}\nWHERE org_id = {org}"
     );
-    sql.push_str(&format!("\nFROM {metadata_table}"));
-    sql.push_str(&format!("\nWHERE org_id = {}", tenant.sql_literal()));
-    if let Some(name) = metric {
-        sql.push_str(&format!("\n  AND metric_name = {}", ch_string(name)));
+    if let Some(name) = &name {
+        sql.push_str(&format!("\n {name}"));
     }
-    sql.push_str("\nGROUP BY metric_name)\nORDER BY metric_name");
     if let Some(n) = limit {
-        sql.push_str(&format!("\nLIMIT {n}"));
+        sql.push_str(&format!(
+            "\n  AND metric_name IN (SELECT metric_name FROM {metadata_table} WHERE org_id = {org}{} \
+             GROUP BY metric_name ORDER BY metric_name LIMIT {n})",
+            name.as_deref().unwrap_or("")
+        ));
+    }
+    sql.push_str(
+        "\nGROUP BY metric_name, metric_type, help, unit\n\
+         ORDER BY metric_name, metric_type, help, unit",
+    );
+    if let Some(k) = limit_per_metric.filter(|k| *k > 0) {
+        sql.push_str(&format!("\nLIMIT {k} BY metric_name"));
     }
     sql
 }
@@ -1443,59 +1447,56 @@ mod tests {
     /// `updated_ns` tie and answer a descriptor assembled from two rows; the
     /// substring count is what catches that, and the whole statement is
     /// written out so the shape cannot drift silently.
+    /// Issue #500: the statement of the design's section 3 for
+    /// `metric=m&limit=1&limit_per_metric=2`, byte for byte, and the whole
+    /// endpoint's.
     #[test]
-    fn metadata_query_aggregates_the_descriptor_as_one_tuple() {
-        let sql = metadata_query(&no_tenant(), "metric_metadata", None, None);
+    fn metadata_query_reads_every_distinct_descriptor() {
         assert_eq!(
-            sql,
-            "SELECT metric_name, tupleElement(d, 1) AS metric_type, \
-             tupleElement(d, 2) AS help, tupleElement(d, 3) AS unit\n\
-             FROM (SELECT metric_name, argMax((metric_type, help, unit), updated_ns) AS d\n\
+            metadata_query(&no_tenant(), "metric_metadata", Some("m"), Some(1), Some(2)),
+            "SELECT metric_name, metric_type, help, unit\n\
              FROM metric_metadata\n\
              WHERE org_id = ''\n\
-             GROUP BY metric_name)\n\
-             ORDER BY metric_name"
+             \x20 AND metric_name = 'm'\n\
+             \x20 AND metric_name IN (SELECT metric_name FROM metric_metadata WHERE org_id = '' \
+             AND metric_name = 'm' GROUP BY metric_name ORDER BY metric_name LIMIT 1)\n\
+             GROUP BY metric_name, metric_type, help, unit\n\
+             ORDER BY metric_name, metric_type, help, unit\n\
+             LIMIT 2 BY metric_name"
         );
         assert_eq!(
-            sql.matches("argMax(").count(),
-            1,
-            "one aggregate, so one row wins whole: {sql}"
-        );
-        assert!(!sql.contains("metric_name ="));
-        assert!(!sql.contains("LIMIT"));
-
-        let filtered = metadata_query(&no_tenant(), "metric_metadata", Some("up"), Some(10));
-        assert_eq!(
-            filtered,
-            "SELECT metric_name, tupleElement(d, 1) AS metric_type, \
-             tupleElement(d, 2) AS help, tupleElement(d, 3) AS unit\n\
-             FROM (SELECT metric_name, argMax((metric_type, help, unit), updated_ns) AS d\n\
+            metadata_query(&no_tenant(), "metric_metadata", None, None, None),
+            "SELECT metric_name, metric_type, help, unit\n\
              FROM metric_metadata\n\
              WHERE org_id = ''\n\
-             \x20 AND metric_name = 'up'\n\
-             GROUP BY metric_name)\n\
-             ORDER BY metric_name\n\
-             LIMIT 10"
+             GROUP BY metric_name, metric_type, help, unit\n\
+             ORDER BY metric_name, metric_type, help, unit"
         );
-        assert_eq!(filtered.matches("argMax(").count(), 1);
+        for no_limit in [Some(0), Some(-1)] {
+            assert!(
+                !metadata_query(&no_tenant(), "metric_metadata", None, None, no_limit)
+                    .contains("LIMIT"),
+                "{no_limit:?} is no limit"
+            );
+        }
     }
 
     #[test]
     fn metadata_query_filters_on_the_given_metric_name() {
-        let sql = metadata_query(&no_tenant(), "metric_metadata", Some("up"), None);
+        let sql = metadata_query(&no_tenant(), "metric_metadata", Some("up"), None, None);
         assert!(sql.contains("\n  AND metric_name = 'up'"));
     }
 
     #[test]
     fn metadata_query_applies_the_given_limit() {
-        let sql = metadata_query(&no_tenant(), "metric_metadata", None, Some(10));
-        assert!(sql.ends_with("LIMIT 10"));
+        let sql = metadata_query(&no_tenant(), "metric_metadata", None, Some(10), None);
+        assert!(sql.contains("ORDER BY metric_name LIMIT 10)"));
     }
 
     #[test]
     fn metadata_query_metric_name_injection_stays_inside_one_literal() {
         let payload = "up'; DROP TABLE metric_metadata; --";
-        let sql = metadata_query(&no_tenant(), "metric_metadata", Some(payload), None);
+        let sql = metadata_query(&no_tenant(), "metric_metadata", Some(payload), None, None);
         assert!(sql.contains(&format!("AND metric_name = {}", ch_string(payload))));
         assert_no_unescaped_quote(&ch_string(payload));
     }

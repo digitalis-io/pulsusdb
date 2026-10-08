@@ -826,11 +826,11 @@ Response: `{"status":"success","data":{"resultType":"vector"|"scalar"|"matrix","
 GET|POST /api/v1/labels                    ?match[]=&start=&end=&limit=
 GET      /api/v1/label/{name}/values       ?match[]=&start=&end=&limit=
 GET|POST /api/v1/series                    ?match[]=&start=&end=&limit=  (match[] required)
-GET      /api/v1/metadata                  ?metric=&limit=
+GET      /api/v1/metadata                  ?metric=&limit=&limit_per_metric=
 GET|POST /api/v1/query_exemplars           (empty-success stub in v1)
 ```
 
-`__name__` is always present in labels responses. Metadata is sourced from `metric_metadata` (populated from remote-write metadata and OTLP).
+`__name__` is always present in labels responses. Metadata is sourced from `metric_metadata` (populated from remote-write metadata and OTLP): each name lists every distinct `(type, help, unit)` pushed for it within `PULSUS_RETENTION_DAYS` of its latest resend, in type, help, unit order (issue #500). `limit` counts names, after `metric` has selected them; `limit_per_metric` above 0 keeps each name's first that many entries, and 0, a negative value or none is no limit; a `limit_per_metric` that is not an integer is `400 bad_data`, `limit_per_metric must be a number`.
 
 **`limit` on the three discovery endpoints** (`/labels`, `/label/{name}/values`, `/series`): absent, empty and `0` all mean *no limit*; a negative value is `400 bad_data` with `invalid parameter "limit": limit must be non-negative`; a non-integer or out-of-range value is `400 bad_data` with `invalid parameter "limit": cannot parse "<raw>" to an integer` (our own wording — the reference emits its runtime's integer-parse text there, which we deliberately do not reproduce; the status and `errorType` are identical). When the limit actually cuts the result the response carries `"warnings":["results truncated due to limit"]` as a **top-level sibling of `data`**, and when it does not there is no `warnings` key at all. Truncation is applied last, to the already-sorted, already-deduplicated result — it is a **response-size** cap, never a scan bound (`PULSUS_PROMQL_MAX_METRIC_FANOUT` and `PULSUS_PROMQL_MAX_CACHE_SCAN` remain the scan bounds).
 

@@ -2596,3 +2596,175 @@ async fn every_name_shape_is_found_by_a_quoted_matcher_and_by_its_escaped_name()
     }
     drop_db(db).await;
 }
+
+// ---------------------------------------------------------------------
+// Issue #500: every distinct descriptor of a name
+// ---------------------------------------------------------------------
+
+/// One remote-write request: a sample of each named series, and the
+/// descriptors `(name, help, unit)`, every one a gauge.
+fn remote_write_descriptors(t_ms: i64, descriptors: &[(&str, &str, &str)]) -> Vec<u8> {
+    use prost::Message;
+    use pulsus_write::protocols::remote_write::{
+        Label, MetricMetadataProto, Sample, TimeSeries, WriteRequest,
+    };
+    let mut names: Vec<&str> = descriptors.iter().map(|(n, ..)| *n).collect();
+    names.dedup();
+    let req = WriteRequest {
+        timeseries: names
+            .iter()
+            .map(|name| TimeSeries {
+                labels: vec![Label {
+                    name: "__name__".to_string(),
+                    value: name.to_string(),
+                }],
+                samples: vec![Sample {
+                    value: 1.0,
+                    timestamp: t_ms,
+                }],
+                ..Default::default()
+            })
+            .collect(),
+        metadata: descriptors
+            .iter()
+            .map(|(name, help, unit)| MetricMetadataProto {
+                r#type: 2,
+                metric_family_name: name.to_string(),
+                help: help.to_string(),
+                unit: unit.to_string(),
+            })
+            .collect(),
+    };
+    snap::raw::Encoder::new()
+        .compress_vec(&req.encode_to_vec())
+        .expect("snappy-compress the write")
+}
+
+/// Bare HTTP/1.1 POST of a remote-write body; the status.
+fn post_remote_write(port: u16, body: &[u8]) -> u16 {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("timeout");
+    let head = format!(
+        "POST /api/v1/write HTTP/1.1\r\nHost: localhost\r\n\
+         Content-Type: application/x-protobuf\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n",
+        body.len()
+    );
+    let mut request = head.into_bytes();
+    request.extend_from_slice(body);
+    stream.write_all(&request).expect("send the write");
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).expect("read the answer");
+    String::from_utf8_lossy(&buf)
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())
+        .expect("a status line")
+}
+
+/// T5's pushes: `m` "A" and `m` "B" in two requests, then one request
+/// carrying `s` "S1" and "S2", and `u` "U" without and with a unit.
+fn push_t5_descriptors(port: u16) {
+    let t = now_ms();
+    for body in [
+        remote_write_descriptors(t, &[("m", "A", "")]),
+        remote_write_descriptors(t + 1_000, &[("m", "B", "")]),
+        remote_write_descriptors(
+            t + 2_000,
+            &[
+                ("s", "S1", ""),
+                ("s", "S2", ""),
+                ("u", "U", ""),
+                ("u", "U", "seconds"),
+            ],
+        ),
+    ] {
+        let status = post_remote_write(port, &body);
+        assert!(
+            (200..300).contains(&status),
+            "the remote write answered {status}"
+        );
+    }
+}
+
+/// Issue #500, T5: two requests carrying `m` "A" and "B", and one request
+/// carrying two descriptors each of `s` and `u`, list every descriptor —
+/// the single request goes through the parser and the writer's per-push
+/// dedup, so either keeping one per name loses an entry.
+#[tokio::test(flavor = "multi_thread")]
+async fn metadata_lists_each_descriptor_of_a_name() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse to run this test");
+        return;
+    }
+    let db = pulsus_testkit::test_db("pulsus_prom_500_t5");
+    let port: u16 = 31_510;
+    let guard = spawn_prom_server(port, &db, &[]);
+    push_t5_descriptors(port);
+    let entry =
+        |help: &str, unit: &str| serde_json::json!({"type": "gauge", "help": help, "unit": unit});
+    let want = serde_json::json!({
+        "m": [entry("A", ""), entry("B", "")],
+        "s": [entry("S1", ""), entry("S2", "")],
+        "u": [entry("U", ""), entry("U", "seconds")],
+    });
+    let mut last = serde_json::Value::Null;
+    let deadline = Instant::now() + Duration::from_secs(40);
+    while Instant::now() < deadline {
+        if let Some((200, body)) = http_get(port, "/api/v1/metadata")
+            && let Ok(json) = serde_json::from_str::<serde_json::Value>(&body)
+        {
+            last = json["data"].clone();
+            if last == want {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    drop(guard);
+    drop_db(&db).await;
+    assert_eq!(last, want, "/api/v1/metadata's data");
+}
+
+/// Issue #500, T10: `limit_per_metric` is read — one entry per name — and
+/// a value that is not an integer is `400` `bad_data`.
+#[tokio::test(flavor = "multi_thread")]
+async fn limit_per_metric_is_read_and_checked() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse to run this test");
+        return;
+    }
+    let db = pulsus_testkit::test_db("pulsus_prom_500_t10");
+    let port: u16 = 31_511;
+    let guard = spawn_prom_server(port, &db, &[]);
+    push_t5_descriptors(port);
+    let entry =
+        |help: &str, unit: &str| serde_json::json!({"type": "gauge", "help": help, "unit": unit});
+    let want = serde_json::json!({
+        "m": [entry("A", "")],
+        "s": [entry("S1", "")],
+        "u": [entry("U", "")],
+    });
+    // Waits until every pushed name is listed, then reads one per name.
+    let _ = wait_for_body(port, "/api/v1/metadata", |json| {
+        ["m", "s", "u"]
+            .iter()
+            .all(|name| json["data"][name].as_array().is_some())
+    });
+    let one = http_get(port, "/api/v1/metadata?limit_per_metric=1");
+    let bad = http_get(port, "/api/v1/metadata?limit_per_metric=x");
+    drop(guard);
+    drop_db(&db).await;
+    let (status, body) = bad.expect("/metadata?limit_per_metric=x");
+    assert_eq!(status, 400, "limit_per_metric=x: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(json["errorType"], "bad_data", "{body}");
+    assert_eq!(json["error"], "limit_per_metric must be a number", "{body}");
+    let (status, body) = one.expect("/metadata?limit_per_metric=1");
+    assert_eq!(status, 200, "{body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(json["data"], want, "limit_per_metric=1: {body}");
+}

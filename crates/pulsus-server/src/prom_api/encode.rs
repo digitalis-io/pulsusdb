@@ -697,27 +697,51 @@ pub(crate) fn series_response(
 }
 
 // ---------------------------------------------------------------------
-// metadata (issue #32) — Prometheus's own shape: a map keyed by metric
-// name, each value an array of descriptor objects (always length 1 here:
-// `metric_metadata` stores exactly one row per base family name).
+// metadata (issues #32 and #500) — Prometheus's own shape: a map keyed by
+// metric name, each value an array of that name's descriptor objects, one
+// per distinct descriptor `metric_metadata` holds.
 // ---------------------------------------------------------------------
 
-fn render_metadata_entry(m: &MetricMeta) -> Vec<u8> {
+fn render_metadata_descriptor(m: &MetricMeta) -> String {
     format!(
-        "{}:[{{\"type\":{},\"help\":{},\"unit\":{}}}]",
-        json_string(&m.name),
+        "{{\"type\":{},\"help\":{},\"unit\":{}}}",
         json_string(&m.metric_type),
         json_string(&m.help),
         json_string(&m.unit)
     )
+}
+
+/// One name's key and its array of descriptors.
+fn render_metadata_entry(group: &[MetricMeta]) -> Vec<u8> {
+    let descriptors: Vec<String> = group.iter().map(render_metadata_descriptor).collect();
+    format!(
+        "{}:[{}]",
+        json_string(&group[0].name),
+        descriptors.join(",")
+    )
     .into_bytes()
 }
 
+/// One key per name, whose array holds that name's entries in row order.
+/// The names are sorted; a stable sort keeps each name's entries in the
+/// order the rows arrived.
 pub(crate) fn metadata_response(mut items: Vec<MetricMeta>) -> Response {
     items.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut groups: Vec<Vec<MetricMeta>> = Vec::new();
+    for item in items {
+        match groups.last_mut() {
+            Some(group) if group[0].name == item.name => group.push(item),
+            _ => groups.push(vec![item]),
+        }
+    }
     let prefix = b"{\"status\":\"success\",\"data\":{".to_vec();
     let suffix = b"}}".to_vec();
-    json_response(stream_array(prefix, items, render_metadata_entry, suffix))
+    json_response(stream_array(
+        prefix,
+        groups,
+        |group: &Vec<MetricMeta>| render_metadata_entry(group),
+        suffix,
+    ))
 }
 
 // ---------------------------------------------------------------------
@@ -1578,6 +1602,29 @@ mod tests {
         let alpha_pos = body.find("alpha").expect("alpha present");
         let zeta_pos = body.find("zeta").expect("zeta present");
         assert!(alpha_pos < zeta_pos);
+    }
+
+    /// Issue #500, T4: one key per name, its array holding every entry of
+    /// that name in row order.
+    #[tokio::test]
+    async fn one_key_per_name_with_every_entry() {
+        let meta = |name: &str, t: &str, help: &str, unit: &str| MetricMeta {
+            name: name.to_string(),
+            metric_type: t.to_string(),
+            help: help.to_string(),
+            unit: unit.to_string(),
+        };
+        let res = metadata_response(vec![
+            meta("m", "counter", "A", ""),
+            meta("m", "gauge", "A", ""),
+            meta("m", "gauge", "A", "seconds"),
+            meta("n", "gauge", "N", ""),
+        ]);
+        let body = body_string(res).await;
+        assert_eq!(
+            body,
+            r#"{"status":"success","data":{"m":[{"type":"counter","help":"A","unit":""},{"type":"gauge","help":"A","unit":""},{"type":"gauge","help":"A","unit":"seconds"}],"n":[{"type":"gauge","help":"N","unit":""}]}}"#
+        );
     }
 
     // --- query_exemplars stub ---

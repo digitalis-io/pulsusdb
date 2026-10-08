@@ -210,7 +210,7 @@ pub struct FingerprintOnlyRow {
 }
 
 /// [`MetricsEngine::metadata`]'s `metric_metadata` result row
-/// ([`super::sql::metadata_query`]'s `argMax`-collapsed columns).
+/// ([`super::sql::metadata_query`]'s columns: one distinct descriptor of a name).
 #[derive(
     Debug, Clone, PartialEq, Eq, pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize,
 )]
@@ -2617,16 +2617,24 @@ impl MetricsEngine {
         Ok(out)
     }
 
-    /// `GET /api/v1/metadata` (issue #32): `metric_metadata` rows, already
-    /// keyed by the base family name (docs/schemas.md §2.1's writer
-    /// contract — never stripped/derived here).
+    /// `GET /api/v1/metadata` (issues #32 and #500): every distinct
+    /// descriptor of each name, in name, type, help, unit order; the names
+    /// are the base family names the writer stored (docs/schemas.md §2.1's
+    /// writer contract — never stripped/derived here).
     pub async fn metadata(
         &self,
         tenant: &Tenant,
         metric: Option<&str>,
         limit: Option<usize>,
+        limit_per_metric: Option<i64>,
     ) -> Result<Vec<MetricMeta>, ReadError> {
-        let sql = super::sql::metadata_query(tenant, &self.config.metadata_table, metric, limit);
+        let sql = super::sql::metadata_query(
+            tenant,
+            &self.config.metadata_table,
+            metric,
+            limit,
+            limit_per_metric,
+        );
         let rows: Vec<MetricMetaRow> = self.fetch_rows(sql).await?;
         Ok(rows
             .into_iter()
