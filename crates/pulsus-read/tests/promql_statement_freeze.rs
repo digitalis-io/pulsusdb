@@ -57,6 +57,12 @@
 //! a member's position in `fps` instead of its fingerprint. The statement
 //! count and every other entry are unchanged.
 //!
+//! Issue #579 part 3 moved the text of the one shape-A entry: its
+//! statement reads the selector's ID statement in place of an ID list and
+//! computes each series' group key from its stored labels, so the entry
+//! states its grouping where it stated the `gids`. The statement count and
+//! every other entry are unchanged.
+//!
 //! # Every boundary in this golden is writer-emitted
 //!
 //! The writer emits `-- statement[i]` before each statement, and the live
@@ -73,7 +79,8 @@ use sha2::{Digest, Sha256};
 use pulsus_model::{Fingerprint, FpLiteral};
 use pulsus_promql::{DEFAULT_LOOKBACK_MS, PlanParams, parse, plan};
 use pulsus_read::metrics::grouped::Grid;
-use pulsus_read::metrics::{MetricsConfig, grouped, grouped_sql, sample_sql};
+use pulsus_read::metrics::matcher::DataWindow;
+use pulsus_read::metrics::{MetricsConfig, grouped, grouped_sql, sample_sql, sql as metrics_sql};
 
 /// The marker the writer emits before every statement, and the prefix the
 /// live corpus check splits on (issue #549).
@@ -142,10 +149,10 @@ const PINNED: &str = include_str!("golden/promql_statements.sha256");
 
 /// The three constants published on issue #548 before the code existed;
 /// the line and byte counts re-taken by issue #623, whose sample statements
-/// carry no metric name, and again by issue #579 and its part 2.
+/// carry no metric name, and again by issue #579 and its parts 2 and 3.
 const ENTRIES: usize = 30;
-const LINES: usize = 742;
-const BYTES: usize = 40_253;
+const LINES: usize = 795;
+const BYTES: usize = 42_552;
 /// The statements the writer's markers declare. Sixty before issue #549;
 /// four entries now send ONE statement where they sent two, and issue #579
 /// made it five.
@@ -256,18 +263,32 @@ fn render() -> String {
                 .map(|n| &n.kind);
             match (owner, &sel.metric_name) {
                 // Issue #579: ONE statement per node, over both tables.
-                (Some(grouped::PushKind::Range(shape)), Some(_)) => {
+                // Issue #579 part 3: over the selector's ID statement, with
+                // the group key computed in the statement.
+                (Some(grouped::PushKind::Range(shape)), Some(name)) => {
                     out.push_str(&format!(
-                        "-- pushed op={:?} func={:?} gids={GIDS:?}\n",
-                        shape.op, shape.func
+                        "-- pushed op={:?} func={:?} grouping={:?}\n",
+                        shape.op, shape.func, shape.grouping
                     ));
+                    let ids_sql = metrics_sql::historical_series_subquery(
+                        "metric_series",
+                        "metric_labels",
+                        name,
+                        DataWindow {
+                            start_ms: lo,
+                            end_ms: hi,
+                        },
+                        &sel.matchers,
+                    );
                     emit(
                         &mut out,
                         &grouped_sql::range_aggregate_fetch(
                             SAMPLES,
                             HIST,
-                            &fps(),
-                            &GIDS,
+                            "metric_labels",
+                            &ids_sql,
+                            Some(name),
+                            shape.grouping.as_ref(),
                             shape.grid,
                             shape.range_ms,
                             shape.op,

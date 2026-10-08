@@ -172,17 +172,20 @@ pub fn historical_resolution_query(
         .with_labels(lookup_tables(series_table, labels_table))
 }
 
-/// Statement 4 (issue #623): `fingerprint, metric_name, labels` for an
-/// already-**resolved** ID list (mirrors `logql::exec`'s stage-2 hydration
-/// precedent). Used only to hydrate the `SqlFallback` sample fetch
-/// ([`super::sample_sql::sample_fetch_subquery`]), whose IDs are those that
-/// returned samples in the request window — so this read needs no window
-/// of its own. `metric_names` scopes the lookup to a key range; `any`
-/// collapses the copies the table holds until it merges.
+/// Statement 4 (issue #623): `fingerprint, metric_name, labels` for the
+/// series an ID statement selects (mirrors `logql::exec`'s stage-2
+/// hydration precedent). Used only to hydrate the `SqlFallback` sample
+/// fetch ([`super::sample_sql::sample_fetch_subquery`]), with that fetch's
+/// own ID statement ([`historical_series_subquery`]) — the statement the
+/// samples were read by, so every ID a sample came back for is in it.
+/// Issue #579 part 3: the ID statement rather than the IDs the samples
+/// returned, which past a few thousand IDs is a statement the server
+/// refuses as too big. `metric_names` scopes the lookup to a key range;
+/// `any` collapses the copies the table holds until it merges.
 pub fn series_labels_by_fingerprint(
     labels_table: &str,
     metric_names: &[String],
-    fps: &[FpLiteral],
+    ids_sql: &str,
 ) -> String {
     format!(
         "SELECT fingerprint, any(name) AS metric_name, any(label_text) AS labels\n\
@@ -190,12 +193,13 @@ pub fn series_labels_by_fingerprint(
          \x20 SELECT fingerprint, metric_name AS name, labels AS label_text\n\
          \x20 FROM {labels_table}\n\
          \x20 WHERE {}\n\
-         \x20   AND {}\n\
+         \x20   AND fingerprint IN (\n\
+         {ids_sql}\n\
+         \x20   )\n\
          )\n\
          GROUP BY fingerprint\n\
          ORDER BY metric_name, fingerprint",
         names_scope(metric_names),
-        ids_scope(fps)
     )
 }
 
@@ -291,6 +295,23 @@ pub(super) fn nameless_ids_query(
     format!(
         "SELECT fingerprint\n{}",
         discovery_read(&nameless_filter(matchers), window).ids_from_where(t)
+    )
+}
+
+/// Issue #579 part 3: the IDs of the series a selector with no concrete
+/// metric name and at least one `__name__` matcher selects in `window`, as
+/// the sub-query a pushed shape-A statement nests.
+pub fn name_matcher_ids_query(
+    series_table: &str,
+    labels_table: &str,
+    name_matchers: &[LabelMatcher],
+    matchers: &[LabelMatcher],
+    window: DataWindow,
+) -> String {
+    format!(
+        "SELECT fingerprint\n{}",
+        series_read(window, &[], name_matchers, matchers)
+            .ids_from_where(lookup_tables(series_table, labels_table))
     )
 }
 
@@ -542,7 +563,7 @@ mod tests {
         let sql = series_labels_by_fingerprint(
             "metric_labels",
             &["up".to_string()],
-            &[Fingerprint::from_raw(1).sql_literal()],
+            "SELECT fingerprint FROM ids",
         );
         assert!(!sql.contains("day BETWEEN"));
         assert!(!sql.contains("JSONExtractString"));
@@ -1352,7 +1373,11 @@ mod tests {
                 &[eq("job", "api")],
                 window(),
             ),
-            series_labels_by_fingerprint("metric_labels", &["up".to_string()], &fps),
+            series_labels_by_fingerprint(
+                "metric_labels",
+                &["up".to_string()],
+                "SELECT fingerprint FROM ids",
+            ),
         ] {
             let mut lines = sql.lines();
             let mut reads = 0;
@@ -1507,14 +1532,22 @@ mod tests {
             "statement 3 with no matcher"
         );
         let two_names = ["up".to_string(), "down".to_string()];
+        // Issue #579 part 3 (D2): statement 4 reads by an ID statement.
         assert_eq!(
-            series_labels_by_fingerprint("metric_labels", &two_names, &ids()),
+            series_labels_by_fingerprint(
+                "metric_labels",
+                &two_names,
+                "SELECT fingerprint\nFROM metric_series"
+            ),
             "SELECT fingerprint, any(name) AS metric_name, any(label_text) AS labels\n\
              FROM (\n\
              \x20 SELECT fingerprint, metric_name AS name, labels AS label_text\n\
              \x20 FROM metric_labels\n\
              \x20 WHERE metric_name IN ('up', 'down')\n\
-             \x20   AND fingerprint IN (toUInt128('101'), toUInt128('205'))\n\
+             \x20   AND fingerprint IN (\n\
+             SELECT fingerprint\n\
+             FROM metric_series\n\
+             \x20   )\n\
              )\n\
              GROUP BY fingerprint\n\
              ORDER BY metric_name, fingerprint",

@@ -240,6 +240,221 @@ pub fn histogram_corpora(t_end: i64) -> Vec<SeedSeries> {
     out
 }
 
+// ------------------------------------------------ issue #579 part 3
+
+/// The metric of the scale corpus.
+pub const SCALE_METRIC: &str = "cpu_seconds";
+
+/// The series ID of the scale corpus's one histogram series.
+pub const SCALE_HIST_FP: u128 = 0x5793_0000_0000_0000_0000_0000_0000_0001;
+
+/// Part 3's corpus (plan section 4) at `n` series, with 20 one-minute
+/// samples a series ending a minute before `t_end` rather than 260
+/// fifteen-second ones: `cpu_seconds` with `cpu`, `instance` and `mode`
+/// (8 values) labels, every 97th series reset half-way. `hist` adds one
+/// more series of the same metric holding only histogram samples, one a
+/// minute.
+pub fn scale_corpus_sql(t_end: i64, n: u64, hist: bool) -> Vec<String> {
+    let mut out = vec![
+        format!("CREATE TABLE p3_anchor ENGINE = Memory AS SELECT toInt64({t_end}) AS t_end"),
+        format!(
+            "CREATE TABLE p3_series ENGINE = Memory AS \
+             SELECT s, 'cpu_seconds' AS metric_name, \
+                    concat('{{\"cpu\":\"', toString(intDiv(s, 8) % 16), '\",\"instance\":\"host-', \
+                           toString(intDiv(s, 128)), ':9100\",\"mode\":\"', \
+                           ['idle', 'iowait', 'irq', 'nice', 'softirq', 'steal', 'system', 'user'][s % 8 + 1], \
+                           '\"}}') AS labels, \
+                    concat(metric_name, unhex('FF'), 'cpu', unhex('FF'), toString(intDiv(s, 8) % 16), unhex('FF'), \
+                           'instance', unhex('FF'), 'host-', toString(intDiv(s, 128)), ':9100', unhex('FF'), \
+                           'mode', unhex('FF'), \
+                           ['idle', 'iowait', 'irq', 'nice', 'softirq', 'steal', 'system', 'user'][s % 8 + 1], \
+                           unhex('FF')) AS buf, \
+                    bitOr(bitShiftLeft(toUInt128(bitShiftRight(cityHash64(metric_name), 32)), 96), \
+                          bitAnd(bitOr(bitShiftLeft(toUInt128(cityHash64(buf)), 64), toUInt128(xxHash64(buf))), \
+                                 toUInt128('79228162514264337593543950335'))) AS fingerprint \
+             FROM numbers({n}) AS n \
+             ARRAY JOIN [toUInt32(n.number)] AS s"
+        ),
+        "INSERT INTO metric_landing (received_ms, kind, metric_name, fingerprint, unix_milli, labels, value_type) \
+         SELECT toUnixTimestamp64Milli(now64(3)), 2, metric_name, fingerprint, \
+                (SELECT t_end FROM p3_anchor) - h * 3600000, labels, 0 \
+         FROM p3_series ARRAY JOIN [0, 1] AS h"
+            .to_string(),
+        "INSERT INTO metric_samples (fingerprint, unix_milli, value) \
+         SELECT fingerprint, \
+                (SELECT t_end FROM p3_anchor) - 1200000 + k * 60000 + cityHash64(s, k) % 900, \
+                if(s % 97 = 0 AND k >= 10, toFloat64(k - 10) * 0.25, toFloat64(k) * (1 + s % 7) * 0.25 + s) \
+         FROM p3_series ARRAY JOIN range(20) AS k"
+            .to_string(),
+    ];
+    if hist {
+        out.push(format!(
+            "INSERT INTO metric_landing (received_ms, kind, metric_name, fingerprint, unix_milli, labels, value_type) \
+             SELECT toUnixTimestamp64Milli(now64(3)), 2, 'cpu_seconds', toUInt128('{SCALE_HIST_FP}'), \
+                    (SELECT t_end FROM p3_anchor) - h * 3600000, \
+                    '{{\"cpu\":\"h\",\"instance\":\"host-h:9100\",\"mode\":\"idle\"}}', 0 \
+             FROM numbers(1) ARRAY JOIN [0, 1] AS h"
+        ));
+        out.push(format!(
+            "INSERT INTO metric_hist_samples (fingerprint, unix_milli, schema, zero_threshold, zero_count, \
+                                              count, sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, \
+                                              neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values) \
+             SELECT toUInt128('{SCALE_HIST_FP}'), (SELECT t_end FROM p3_anchor) - 1200000 + k * 60000, \
+                    0, 0., 0, 4 + k, 5. + toFloat64(k), [0], [3], [1, 1, -1], [], [], [], [] \
+             FROM numbers(20) ARRAY JOIN [number] AS k"
+        ));
+    }
+    for table in ["metric_labels", "metric_series", "metric_samples"] {
+        out.push(format!("OPTIMIZE TABLE {table} FINAL"));
+    }
+    out
+}
+
+pub const SAMPLE_EDGE_METRIC: &str = "sample_edge_total";
+
+/// T10: 300 counters scraped every 5 to 75 s over the 40 minutes before
+/// `t_end`, in four groups (`grp`): a single-sample series, positive and
+/// negative infinities, NaN samples, stale markers, negative and `-0.`
+/// values and resets. The second vector is every third series's samples
+/// again, to be written by a second insert: exact repeats in another
+/// part.
+pub fn sample_edge_corpus(t_end: i64) -> (Vec<SeedSeries>, Vec<SeedSeries>) {
+    let mut rng = Rng::new(5_793);
+    let stale = f64::from_bits(STALE_NAN_BITS);
+    let mut out = Vec::new();
+    for i in 0..300i64 {
+        let interval = 5_000 + (i % 15) * 5_000;
+        let mut samples = Vec::new();
+        let mut v = if i % 11 == 3 {
+            -rng.uniform(1.0, 50.0)
+        } else {
+            rng.uniform(0.0, 1_000.0)
+        };
+        let mut ts = t_end - 2_400_000 + rng.upto(interval as u64);
+        let mut k = 0i64;
+        while ts <= t_end {
+            let value = match (i % 10, k % 23) {
+                (1, 7) => f64::INFINITY,
+                (2, 9) => f64::NEG_INFINITY,
+                (3, 5) => f64::from_bits(0x7FF8_0000_0000_0000 | (i as u64 + 1)),
+                (4, 11) => stale,
+                (5, 13) => -0.0,
+                (6, 4) => {
+                    v = rng.uniform(0.0, 2.0);
+                    v
+                }
+                _ => {
+                    v += rng.uniform(0.0, 20.0);
+                    v
+                }
+            };
+            samples.push((ts, value));
+            if i == 0 {
+                break;
+            }
+            ts += interval - interval / 10 + rng.upto((interval / 5) as u64);
+            k += 1;
+        }
+        out.push(SeedSeries {
+            fp: 0x5794_0000_0000_0000_0000_0000_0000_0000 | i as u128,
+            metric: SAMPLE_EDGE_METRIC.to_string(),
+            labels: vec![
+                ("grp".to_string(), (i % 4).to_string()),
+                ("series".to_string(), i.to_string()),
+            ],
+            samples,
+            hist: Vec::new(),
+        });
+    }
+    let repeats = out
+        .iter()
+        .filter(|s| (s.fp & 0xFFFF) % 3 == 0)
+        .cloned()
+        .collect();
+    (out, repeats)
+}
+
+pub const EQUAL_TIME_METRIC: &str = "equal_time_total";
+
+/// T11: six counters scraped every 15 s over the 25 minutes before
+/// `t_end`, rising by 10 a scrape, and at every fourth scrape a second
+/// sample at the same millisecond 0.5 higher. The two vectors are the two
+/// inserts: an even series's first insert holds the lower value of each
+/// pair and its second the higher, an odd series's the other way round.
+pub fn equal_time_corpus(t_end: i64) -> (Vec<SeedSeries>, Vec<SeedSeries>) {
+    let mut first = Vec::new();
+    let mut second = Vec::new();
+    for i in 0..6u128 {
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        for k in 0..100i64 {
+            let ts = t_end - 1_500_000 + k * SCRAPE_MS + (i as i64) * 37;
+            let v = (k * 10) as f64 + i as f64;
+            if k % 4 == 0 {
+                let (lo, hi) = ((ts, v), (ts, v + 0.5));
+                if i % 2 == 0 {
+                    a.push(lo);
+                    b.push(hi);
+                } else {
+                    a.push(hi);
+                    b.push(lo);
+                }
+            } else {
+                a.push((ts, v));
+            }
+        }
+        let series = |samples| SeedSeries {
+            fp: 0x5795_0000_0000_0000_0000_0000_0000_0000 | i,
+            metric: EQUAL_TIME_METRIC.to_string(),
+            labels: vec![("series".to_string(), i.to_string())],
+            samples,
+            hist: Vec::new(),
+        };
+        first.push(series(a));
+        second.push(series(b));
+    }
+    (first, second)
+}
+
+/// Inserts `fx`'s float samples alone, as one more part.
+pub async fn seed_samples(client: &ChClient, fx: &[SeedSeries]) {
+    let samples: Vec<SeedSampleRow> = fx
+        .iter()
+        .flat_map(|s| {
+            s.samples.iter().map(move |(t, v)| SeedSampleRow {
+                fingerprint: s.fp,
+                unix_milli: *t,
+                value: *v,
+            })
+        })
+        .collect();
+    client
+        .insert_block("metric_samples", &samples)
+        .await
+        .expect("seed metric_samples");
+}
+
+/// Inserts one activity row per series of `fx` for each of `days` with the
+/// hour bits `hours`, as one more part. Two inserts of one day must differ
+/// in `hours`: the table drops a block identical to one it already holds.
+pub async fn seed_activity(client: &ChClient, fx: &[SeedSeries], days: &[u16], hours: u32) {
+    let rows: Vec<SeedActivityRow> = days
+        .iter()
+        .flat_map(|day| {
+            fx.iter().map(move |s| SeedActivityRow {
+                day: *day,
+                fingerprint: s.fp,
+                metric_name: s.metric.clone(),
+                hours,
+            })
+        })
+        .collect();
+    client
+        .insert_block("metric_series", &rows)
+        .await
+        .expect("seed metric_series");
+}
+
 // ------------------------------------------------------------- seeding
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -543,6 +758,31 @@ pub struct Harness {
 /// builds two engines over it, the push on and off. `cap` lowers the
 /// pushed engine's series-steps cap.
 pub async fn harness(db: &str, t: i64, fx: &[SeedSeries], cap: Option<usize>) -> Harness {
+    let (bootstrap, client) = fresh_database(db).await;
+    seed(&client, fx, t).await;
+    engines(bootstrap, client, db, t, cap).await
+}
+
+/// Issue #579 part 3: [`harness`] over a corpus written by SQL statements,
+/// run in order in the fresh database.
+pub async fn harness_sql(db: &str, t: i64, statements: &[String], cap: Option<usize>) -> Harness {
+    let (bootstrap, client) = fresh_database(db).await;
+    execute_all(&client, statements).await;
+    engines(bootstrap, client, db, t, cap).await
+}
+
+/// Runs `statements` in order, failing the test on the first error.
+pub async fn execute_all(client: &ChClient, statements: &[String]) {
+    for sql in statements {
+        client
+            .execute(sql, &QuerySettings::new(), Idempotency::NonIdempotent)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
+/// Drops and recreates `db`: the bootstrap client and one over `db`.
+pub async fn fresh_database(db: &str) -> (ChClient, ChClient) {
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
@@ -551,7 +791,17 @@ pub async fn harness(db: &str, t: i64, fx: &[SeedSeries], cap: Option<usize>) ->
         .await
         .expect("run_init");
     let client = ChClient::new(test_config(db)).await.expect("connect");
-    seed(&client, fx, t).await;
+    (bootstrap, client)
+}
+
+/// The label cache, refreshed once, and the two engines over it.
+async fn engines(
+    bootstrap: ChClient,
+    client: ChClient,
+    db: &str,
+    t: i64,
+    cap: Option<usize>,
+) -> Harness {
     let cache = Arc::new(LabelCache::new(
         ChClient::new(test_config(db)).await.expect("connect"),
         cache_config(db),
@@ -706,6 +956,10 @@ pub async fn server_marker(admin: &ChClient) -> String {
 pub struct LoggedStatement {
     pub query: String,
     pub result_rows: u64,
+    /// When the server started it, in microseconds since the epoch.
+    pub start_us: u64,
+    /// When the server finished it, in microseconds since the epoch.
+    pub end_us: u64,
 }
 
 /// Every finished `SELECT` run in `db` since `marker`, oldest first.
@@ -716,7 +970,10 @@ pub struct LoggedStatement {
 pub async fn statements_since(admin: &ChClient, db: &str, marker: &str) -> Vec<LoggedStatement> {
     use futures::StreamExt;
     let sql = format!(
-        "SELECT query, toUInt64(result_rows) AS result_rows FROM system.query_log \
+        "SELECT query, toUInt64(result_rows) AS result_rows, \
+                toUInt64(toUnixTimestamp64Micro(query_start_time_microseconds)) AS start_us, \
+                toUInt64(toUnixTimestamp64Micro(event_time_microseconds)) AS end_us \
+         FROM system.query_log \
          WHERE current_database = '{db}' AND type = 'QueryFinish' AND query_kind = 'Select' \
            AND query_start_time_microseconds >= toDateTime64('{marker}', 6) \
            AND query NOT LIKE '%system.query_log%' AND query NOT LIKE '%now64(6)%' \

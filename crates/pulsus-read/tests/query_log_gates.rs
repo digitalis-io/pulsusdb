@@ -9291,3 +9291,66 @@ async fn multi_name_rate_is_one_statement_per_chunk() {
     );
     h.finish().await;
 }
+
+/// Issue #579 part 3, T2: at 100,000 series, above the label cache's cap,
+/// a shape-A node sends its statements one after another, each reading
+/// its series through the selector's ID statement: no ID literal, and
+/// every statement under 64 KiB.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shape_a_sends_no_id_list() {
+    skip_unless_live!();
+    use pushed_rate_corpus::{anchor, harness_sql, scale_corpus_sql, statements_since};
+    let t = anchor();
+    let db = pulsus_testkit::test_db("pulsus_read_it_qlog_p3_no_id_list");
+    let h = harness_sql(&db, t, &scale_corpus_sql(t, 100_000, false), None).await;
+    let p = h.ten_minutes(60_000);
+    for q in [
+        "sum(rate(cpu_seconds[5m]))",
+        "sum by (mode) (rate(cpu_seconds[5m]))",
+    ] {
+        let marker = pushed_rate_corpus::server_marker(&h.admin).await;
+        let r = pushed_rate_corpus::Harness::run(&h.pushed, q, &p).await;
+        assert!(!r.answer.is_empty(), "{q}");
+        let sent = statements_since(&h.admin, &h.db, &marker).await;
+        let summary: Vec<(u64, usize, String)> = sent
+            .iter()
+            .map(|s| {
+                (
+                    s.result_rows,
+                    s.query.len(),
+                    s.query.chars().take(120).collect(),
+                )
+            })
+            .collect();
+        let mut shape_a: Vec<_> = sent
+            .iter()
+            .filter(|s| s.query.contains("AS range_ms"))
+            .collect();
+        assert_eq!(
+            shape_a.len(),
+            2,
+            "{q}: 100,000 series x 11 steps is two statements: {summary:?}"
+        );
+        for s in &shape_a {
+            assert!(
+                !s.query.contains("toUInt128("),
+                "{q}: an ID literal in a shape-A statement: {summary:?}"
+            );
+            assert!(
+                s.query.len() < 64 * 1024,
+                "{q}: a shape-A statement of {} bytes",
+                s.query.len()
+            );
+        }
+        shape_a.sort_by_key(|s| s.start_us);
+        for pair in shape_a.windows(2) {
+            assert!(
+                pair[1].start_us >= pair[0].end_us,
+                "{q}: two statements of one node ran at once: {} started before {} ended",
+                pair[1].start_us,
+                pair[0].end_us
+            );
+        }
+    }
+    h.finish().await;
+}

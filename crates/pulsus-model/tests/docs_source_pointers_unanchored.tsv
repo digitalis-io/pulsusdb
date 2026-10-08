@@ -876,7 +876,6 @@ docs/query-to-sql.md	search_sql.rs:632-656	no_name_the_target_file_holds
 docs/query-to-sql.md	sql.rs:105	ambiguous_basename
 docs/query-to-sql.md	sql.rs:111	ambiguous_basename
 docs/query-to-sql.md	sql.rs:1247	ambiguous_basename
-docs/query-to-sql.md	sql.rs:1253	ambiguous_basename
 docs/query-to-sql.md	sql.rs:725	ambiguous_basename
 docs/query-to-sql.md	sql.rs:776	ambiguous_basename
 docs/query-to-sql.md	sql.rs:799	ambiguous_basename

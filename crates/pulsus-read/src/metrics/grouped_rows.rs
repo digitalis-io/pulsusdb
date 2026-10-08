@@ -43,20 +43,27 @@ pub struct GroupedCountRow {
 }
 
 /// Issue #579: one row of a shape-A statement
-/// ([`super::grouped_sql::range_aggregate_fetch`]): `SELECT gid, gi, agg`.
-/// The row whose `gid` is [`super::grouped::HISTOGRAM_SENTINEL_GID`]
-/// carries the window's histogram sample count in `agg` and is never part
-/// of the answer.
+/// ([`super::grouped_sql::range_aggregate_fetch`]): `SELECT gid, gi, agg`,
+/// where `gid` is the group's labels (part 3). The row whose `gid` is
+/// [`super::grouped_sql::HISTOGRAM_SENTINEL_KEY`] carries the window's
+/// histogram sample count in `agg` and is never part of the answer.
 ///
 /// `agg` decodes as `Nullable(Float64)`: the server types the union's
 /// column from the sentinel's scalar subquery, which is nullable. No row
 /// carries a NULL — a count is never NULL, and an aggregate is computed
 /// only over a non-empty group — and the reader refuses one if it does.
-#[derive(Debug, Clone, Copy, Row, Serialize, Deserialize)]
+#[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct RangeAggRow {
-    pub gid: u32,
+    pub gid: Vec<(String, String)>,
     pub gi: u32,
     pub agg: Option<f64>,
+}
+
+/// Issue #579 part 3: the distinct series a shape-A node's ID statement
+/// selects ([`super::grouped_sql::series_count`]).
+#[derive(Debug, Clone, Copy, Row, Serialize, Deserialize)]
+pub struct SeriesCountRow {
+    pub n: u64,
 }
 
 impl GroupedRunRow {
