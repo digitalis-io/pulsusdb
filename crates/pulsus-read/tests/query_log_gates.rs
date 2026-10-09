@@ -12301,3 +12301,103 @@ async fn a_variant_tail_regexp_reads_captures_from_the_database() {
     );
     drop_db_624(&admin, &db).await;
 }
+
+/// **T18 (issue #624, part 3a, code review round 1): a `regexp` whose
+/// braces RE2 reads as literals answers on every route that takes its
+/// captures from the database**, as it does where the stage runs in process.
+/// For `a{bbb}c`, `a{,5}` and `a{}` the stream's matching line is captured
+/// whole — by a log query, a lowered count and today's route — and each
+/// database route ran `extractGroups` with the pattern as written.
+#[tokio::test]
+async fn a_brace_pattern_answers_on_every_database_route() {
+    skip_unless_live!();
+    let (admin, db) = fresh_db_624(pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_p3t18_{}",
+        uuid::Uuid::new_v4().simple()
+    )))
+    .await;
+    let t = ((now_ns() - 4 * 3_600_000_000_000) / 60_000_000_000) * 60_000_000_000;
+    let sec = 1_000_000_000i64;
+    land_stream_624(
+        &admin,
+        &db,
+        t,
+        7_950_000,
+        "c624br",
+        r#"{"s":"br","service_name":"c624br"}"#,
+    )
+    .await;
+    for (at, body) in [(10i64, "a{bbb}c"), (20, "a{,5}"), (30, "a{}"), (40, "abc")] {
+        land_line_624(&admin, &db, 7_950_000, "c624br", t + at * sec, body, "").await;
+    }
+    let logs = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t + 60 * sec,
+            step_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let range = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t + 60 * sec,
+            end_ns: t + 60 * sec,
+            step_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let mut comments: Vec<(String, String)> = Vec::new();
+    for literal_text in ["a{bbb}c", "a{,5}", "a{}"] {
+        let stage = format!(r#"| regexp "(?P<x>{literal_text})""#);
+        let want = vec![literal_text.to_string()];
+
+        let comment = format!("c624p3t18-{}", uuid::Uuid::new_v4().simple());
+        let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024))
+            .with_query_log_comment(comment.clone());
+        let query = format!(r#"{{s="br"}} {stage} | x != """#);
+        let (result, _) = engine
+            .query(&parse(&query).expect("parse"), &logs)
+            .await
+            .unwrap_or_else(|e| panic!("{query}: {e}"));
+        let QueryResult::Streams { items, .. } = result else {
+            panic!("{query}: streams");
+        };
+        assert_eq!(label_values_624p3(&items, "x"), want, "{query}");
+        comments.push((comment, query));
+
+        let count = format!(r#"sum by (x) (count_over_time({{s="br"}} {stage} | x != "" [1m]))"#);
+        for todays in [false, true] {
+            let comment = format!("c624p3t18-{}", uuid::Uuid::new_v4().simple());
+            let got = run_624(
+                &db,
+                hooks_624(todays, None, None),
+                Some(&comment),
+                &count,
+                &range,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{count}, today's route {todays}: {e}"));
+            let pair = ("x".to_string(), literal_text.to_string());
+            assert_eq!(
+                got,
+                vec![(vec![pair], vec![(t + 60 * sec, 1.0f64.to_bits())])],
+                "{count}, today's route {todays}"
+            );
+            comments.push((comment, count.clone()));
+        }
+    }
+    let all: Vec<String> = comments.iter().map(|(c, _)| c.clone()).collect();
+    let logged = logged_624(&admin, &all).await;
+    for (comment, query) in &comments {
+        let rows = logged
+            .get(comment)
+            .unwrap_or_else(|| panic!("{query}: no statement logged"));
+        assert!(
+            rows.iter().any(|r| r.query.contains("extractGroups")),
+            "{query}: the database ran the regexp: {rows:#?}"
+        );
+    }
+    drop_db_624(&admin, &db).await;
+}
