@@ -240,7 +240,11 @@ docs/query-to-sql.md	labels.rs:66	crates/pulsus-read/src/logql/labels.rs	66		pro
 docs/query-to-sql.md	logql/charge.rs:1326	crates/pulsus-read/src/logql/charge.rs	1326		line	MAX_STREAMS_RESULT_BYTES	pub const MAX_STREAMS_RESULT_BYTES: u64 = 1024 * 1024 * 1024;
 docs/query-to-sql.md	logql/error.rs:819-825	crates/pulsus-read/src/logql/error.rs	819	825	prose	aggregation	400
 docs/query-to-sql.md	logql/error.rs:826-829	crates/pulsus-read/src/logql/error.rs	826	829	prose	intentionally	pipeline
-docs/query-to-sql.md	logql/exec.rs:2505	crates/pulsus-read/src/logql/exec.rs	2505		line	CLIENT_AGG_CHUNK_ROWS	let mut chunk: Vec<MetricScanRow> = Vec::with_capacity(CLIENT_AGG_CHUNK_ROWS);
+docs/query-to-sql.md	logql/exec.rs:1890	crates/pulsus-read/src/logql/exec.rs	1890		prose	charged_instant_chain	vector_aggs
+docs/query-to-sql.md	logql/exec.rs:2046	crates/pulsus-read/src/logql/exec.rs	2046		prose	apply_vector_aggs	vector_aggs
+docs/query-to-sql.md	logql/exec.rs:2529	crates/pulsus-read/src/logql/exec.rs	2529		prose	apply_vector_aggs	vector_aggs
+docs/query-to-sql.md	logql/exec.rs:2711	crates/pulsus-read/src/logql/exec.rs	2711		prose	apply_vector_aggs	vector_aggs
+docs/query-to-sql.md	logql/exec.rs:6461	crates/pulsus-read/src/logql/exec.rs	6461		prose	apply_vector_aggs	vector_aggs
 docs/query-to-sql.md	logql/params.rs:121	crates/pulsus-read/src/logql/params.rs	121		line	DEFAULT_MAX_STREAMS	pub const DEFAULT_MAX_STREAMS: usize = 100_000;
 docs/query-to-sql.md	logql/pipeline.rs:1323	crates/pulsus-read/src/logql/pipeline.rs	1323		line	PipelineError	pub fn compile(stages: &[Stage]) -> Result<Self, PipelineError> {
 docs/query-to-sql.md	logql/predicate.rs:1115	crates/pulsus-read/src/logql/predicate.rs	1115		line	contains_predicate	fn contains_predicate(phrase: &str) -> String {

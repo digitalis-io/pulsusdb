@@ -57,12 +57,8 @@ docs/query-lowering.md	traces/compile.rs:185	ambiguous_basename
 docs/query-to-sql.md	exec.rs:120	ambiguous_basename
 docs/query-to-sql.md	exec.rs:125	ambiguous_basename
 docs/query-to-sql.md	exec.rs:126	ambiguous_basename
-docs/query-to-sql.md	exec.rs:1868	ambiguous_basename
-docs/query-to-sql.md	exec.rs:2004	ambiguous_basename
 docs/query-to-sql.md	exec.rs:2088	ambiguous_basename
-docs/query-to-sql.md	exec.rs:2707	ambiguous_basename
 docs/query-to-sql.md	exec.rs:428	ambiguous_basename
-docs/query-to-sql.md	exec.rs:6419	ambiguous_basename
 docs/query-to-sql.md	exec.rs:744	ambiguous_basename
 docs/query-to-sql.md	fold.rs:547	ambiguous_basename
 docs/query-to-sql.md	metrics_sql.rs:1036	ambiguous_basename
