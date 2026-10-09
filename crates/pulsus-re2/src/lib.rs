@@ -113,7 +113,8 @@ pub use re2_syntax::re2_pattern_to_rust;
 // fourth RE2-compatibility surface, landed alongside the #328
 // extraction and living here with the walker helpers it shares.
 pub use re2_syntax::{
-    ClickhouseMatchStrategy, clickhouse_match_head_rewrite, clickhouse_match_strategy,
+    ClickhouseMatchStrategy, case_folded_alternation_in_group, clickhouse_match_head_rewrite,
+    clickhouse_match_strategy,
 };
 
 /// RE2's repetition ceiling — `kMaxRepeat` in `re2/parse.cc`, `maxRepeat`

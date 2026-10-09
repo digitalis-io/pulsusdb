@@ -67,6 +67,7 @@ fn rows_on(fp: u64) -> Vec<MetricScanRow> {
             timestamp_ns: (i as i64) * 1_000_000,
             body: "line".to_string(),
             structured_metadata: String::new(),
+            rx: Vec::new(),
         })
         .collect()
 }

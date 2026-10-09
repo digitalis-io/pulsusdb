@@ -65,7 +65,10 @@ const EXEMPTIONS: &[(&str, &str, &str)] = &[];
 /// The five rendering sites, by enclosing function and module.
 const RENDERERS: &[(&str, &str)] = &[
     ("crates/pulsus-read/src/logql/sql.rs", "fp_list"),
-    ("crates/pulsus-read/src/logql/sql.rs", "stage3_keyset"),
+    (
+        "crates/pulsus-read/src/logql/sql.rs",
+        "stage3_keyset_with_rx",
+    ),
     (
         "crates/pulsus-read/src/logql/predicate.rs",
         "fingerprint_test",

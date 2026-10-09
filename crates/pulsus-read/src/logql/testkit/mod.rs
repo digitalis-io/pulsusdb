@@ -66,6 +66,7 @@ pub(in crate::logql) fn sample(fp: u64, ts: i64, body: &str) -> SampleRow {
         timestamp_ns: ts,
         body: body.to_string(),
         structured_metadata: String::new(),
+        rx: Vec::new(),
     }
 }
 

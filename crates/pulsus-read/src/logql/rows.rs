@@ -37,6 +37,36 @@ pub struct SampleRow {
     pub timestamp_ns: i64,
     pub body: String,
     pub structured_metadata: String,
+    /// The captures of each `regexp` stage the database runs (issue #624,
+    /// part 3a): one element per pattern, `extractGroups(body, <p>)`, empty
+    /// when the line does not match. Never a column of this type — it is
+    /// decoded by the twin that names it, and empty when the statement sent
+    /// no such column.
+    #[serde(skip)]
+    pub rx: Vec<Vec<String>>,
+}
+
+/// [`SampleRow`] with the `rx` column (issue #624, part 3a), decoded when
+/// the statement sends it.
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct SampleRxRow {
+    pub fingerprint: Fingerprint,
+    pub timestamp_ns: i64,
+    pub body: String,
+    pub structured_metadata: String,
+    pub rx: Vec<Vec<String>>,
+}
+
+impl From<SampleRxRow> for SampleRow {
+    fn from(r: SampleRxRow) -> Self {
+        SampleRow {
+            fingerprint: r.fingerprint,
+            timestamp_ns: r.timestamp_ns,
+            body: r.body,
+            structured_metadata: r.structured_metadata,
+            rx: r.rx,
+        }
+    }
 }
 
 /// A live-tail keyset page row (issue #74): stage 3's sample columns plus
@@ -52,6 +82,37 @@ pub struct TailSampleRow {
     pub body: String,
     pub body_hash: u64,
     pub structured_metadata: String,
+    /// The captures of each `regexp` stage the database runs (issue #624,
+    /// part 3a): one element per pattern, `extractGroups(body, <p>)`, empty
+    /// when the line does not match. Never a column of this type — it is
+    /// decoded by the twin that names it, and empty when the statement sent
+    /// no such column.
+    #[serde(skip)]
+    pub rx: Vec<Vec<String>>,
+}
+
+/// [`TailSampleRow`] with the `rx` column (issue #624, part 3a).
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct TailSampleRxRow {
+    pub fingerprint: Fingerprint,
+    pub timestamp_ns: i64,
+    pub body: String,
+    pub body_hash: u64,
+    pub structured_metadata: String,
+    pub rx: Vec<Vec<String>>,
+}
+
+impl From<TailSampleRxRow> for TailSampleRow {
+    fn from(r: TailSampleRxRow) -> Self {
+        TailSampleRow {
+            fingerprint: r.fingerprint,
+            timestamp_ns: r.timestamp_ns,
+            body: r.body,
+            body_hash: r.body_hash,
+            structured_metadata: r.structured_metadata,
+            rx: r.rx,
+        }
+    }
 }
 
 /// The client-aggregated LogQL metric raw scan (`metric_raw_samples` /
@@ -83,6 +144,35 @@ pub struct MetricScanRow {
     pub timestamp_ns: i64,
     pub body: String,
     pub structured_metadata: String,
+    /// The captures of each `regexp` stage the database runs (issue #624,
+    /// part 3a): one element per pattern, `extractGroups(body, <p>)`, empty
+    /// when the line does not match. Never a column of this type — it is
+    /// decoded by the twin that names it, and empty when the statement sent
+    /// no such column.
+    #[serde(skip)]
+    pub rx: Vec<Vec<String>>,
+}
+
+/// [`MetricScanRow`] with the `rx` column (issue #624, part 3a).
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct MetricScanRxRow {
+    pub fingerprint: Fingerprint,
+    pub timestamp_ns: i64,
+    pub body: String,
+    pub structured_metadata: String,
+    pub rx: Vec<Vec<String>>,
+}
+
+impl From<MetricScanRxRow> for MetricScanRow {
+    fn from(r: MetricScanRxRow) -> Self {
+        MetricScanRow {
+            fingerprint: r.fingerprint,
+            timestamp_ns: r.timestamp_ns,
+            body: r.body,
+            structured_metadata: r.structured_metadata,
+            rx: r.rx,
+        }
+    }
 }
 
 /// The single `/api/logs/v1/stats` aggregation row (issue #74): both the
@@ -210,6 +300,40 @@ pub struct MetricRangeBucketRow {
     pub bucket_ns: i64,
     pub n: u64,
     pub structured_metadata: String,
+    /// Whether the group's lines matched the `regexp` stage (issue #624,
+    /// part 3a). Never a column of this type: decoded by
+    /// [`MetricRangeRegexpRow`], and 0 for a statement with no stage.
+    #[serde(skip)]
+    pub matched: u8,
+    /// The captures the plan sends, in capture-index order; empty when the
+    /// lines did not match. Decoded as `matched` is.
+    #[serde(skip)]
+    pub caps: Vec<String>,
+}
+
+/// [`MetricRangeBucketRow`] with the `regexp` stage's two group-key columns
+/// (issue #624, part 3a).
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct MetricRangeRegexpRow {
+    pub fingerprint: Fingerprint,
+    pub bucket_ns: i64,
+    pub n: u64,
+    pub structured_metadata: String,
+    pub matched: u8,
+    pub caps: Vec<String>,
+}
+
+impl From<MetricRangeRegexpRow> for MetricRangeBucketRow {
+    fn from(r: MetricRangeRegexpRow) -> Self {
+        MetricRangeBucketRow {
+            fingerprint: r.fingerprint,
+            bucket_ns: r.bucket_ns,
+            n: r.n,
+            structured_metadata: r.structured_metadata,
+            matched: r.matched,
+            caps: r.caps,
+        }
+    }
 }
 
 /// One row of the extracted-field group key statement, S1 (issue #507,

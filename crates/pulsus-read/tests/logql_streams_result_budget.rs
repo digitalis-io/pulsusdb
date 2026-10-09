@@ -152,6 +152,7 @@ fn row(i: usize, body_len: usize, sm: &str) -> SampleRow {
         timestamp_ns: 1_700_000_000_000_000_000i64 + i as i64,
         body: "x".repeat(body_len),
         structured_metadata: sm.to_string(),
+        rx: Vec::new(),
     }
 }
 
@@ -162,6 +163,7 @@ fn tail_row(i: usize, body_len: usize) -> TailSampleRow {
         body: "x".repeat(body_len),
         body_hash: i as u64,
         structured_metadata: String::new(),
+        rx: Vec::new(),
     }
 }
 
@@ -347,6 +349,7 @@ fn the_ledger_equals_what_came_back() {
                     timestamp_ns: 1_700_000_000_000_000_000i64 + i as i64,
                     body: format!("lvl=info seq={i} msg=xxxxxxxxxxxxxxxxxxxx"),
                     structured_metadata: String::new(),
+                    rx: Vec::new(),
                 },
                 &pipeline,
             )
@@ -735,6 +738,7 @@ fn the_categorised_shape_charges_its_third_element() {
             timestamp_ns: 1_700_000_000_000_000_000i64 + i as i64,
             body: "b".repeat(body_len),
             structured_metadata: sm.clone(),
+            rx: Vec::new(),
         };
         plain.push_row(r(40), &meta).expect("admitted");
         categorised.push_row(r(40), &meta).expect("admitted");
@@ -777,6 +781,7 @@ fn a_categorised_query_whose_metadata_alone_exceeds_the_cap_is_refused() {
         timestamp_ns: 1_700_000_000_000_000_000i64 + i as i64,
         body: "b".repeat(8),
         structured_metadata: sm.clone(),
+        rx: Vec::new(),
     };
 
     // A cap that admits the plain shape's whole retention and nothing

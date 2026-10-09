@@ -55,7 +55,7 @@
 # below put the same escapes in a LINE FILTER instead. **`| decolorize`
 # was load-bearing and not decoration when these rows were written**: a
 # line filter sitting directly on the selector is PUSHED DOWN to SQL, so
-# `CompiledPipeline::compile` skips it (`pipeline.rs:1009-1014` returns
+# `CompiledPipeline::compile` skips it (`pipeline.rs:1017-1022` returns
 # `Ok(None)`) and this runner — which executes the pipeline and no SQL —
 # returned every loaded line whatever the pattern said. Written without
 # it, every row here would have passed before and after Stage 1 while

@@ -4419,6 +4419,7 @@ mod tests {
                 // metadata, so the hermetic mirror of the metric path sees
                 // exactly what the live one does (issue #249).
                 structured_metadata: String::new(),
+                rx: Vec::new(),
             })
             .collect();
         assert!(!rows.is_empty(), "the witness record must exist");
@@ -4601,6 +4602,7 @@ mod tests {
                 // metadata, so the hermetic mirror of the metric path sees
                 // exactly what the live one does (issue #249).
                 structured_metadata: String::new(),
+                rx: Vec::new(),
             })
             .collect();
         let result = pulsus_read::logql::run_client_agg_rows(

@@ -25,7 +25,7 @@
 # precedes the first line-REWRITING stage and carries no `ip(…)`
 # alternative is rendered into stage-3 SQL by `plan::compile_line_filters`,
 # and `CompiledPipeline::compile` then returns `Ok(None)` for exactly
-# those (`pipeline.rs:1009-1014`) so the engine does not evaluate them
+# those (`pipeline.rs:1017-1022`) so the engine does not evaluate them
 # twice. Until this issue the corpus runner called `compile` directly and
 # executed no SQL underneath it, so a row of the form `{x="y"} |= "foo"`
 # returned EVERY loaded line — and passed, because its expectation had

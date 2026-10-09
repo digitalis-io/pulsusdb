@@ -1327,6 +1327,7 @@ fn variants_allocation_gates() {
                     timestamp_ns: (i as i64 % 50) * NS,
                     body: fat.clone(),
                     structured_metadata: String::new(),
+                    rx: Vec::new(),
                 })
                 .collect();
             if shuffled {
@@ -1933,6 +1934,11 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
         file: "variants.rs",
         ty: Some("VariantArena"),
         anchor: "build",
+        // Issue #624, part 3a: `.take_rx_patterns` moves the common
+        // pipeline's `regexp` pattern list out to seed the arena's one
+        // registry — a `mem::take`, no allocation. W-MEM disposition:
+        // **NIL**, inside row C-j's preamble.
+        // FRAME variants.rs VariantArena::build 11 18 :: .client .enumerate .extended_with .is_empty .iter .len .map_err .push .take_rx_patterns Err Ok QueryTooBroad Some charge_fanout_bytes compile variant_driver_buffer_bytes variant_pipeline_entry_bytes with_capacity
         branches: 11,
         callees: &[
             ".client",
@@ -1943,6 +1949,7 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
             ".len",
             ".map_err",
             ".push",
+            ".take_rx_patterns",
             "Err",
             "Ok",
             "QueryTooBroad",
@@ -2928,7 +2935,10 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
         // shortcut gained `reserved_fps.is_empty()` / `.contains`. W-MEM
         // disposition unchanged: **NOT-EXEC, row F-d** — both new calls read a
         // set built once per query, and none allocates.
-        // FRAME client_agg.rs ClientAggState::push_one_row 25 34 :: .add .as_deref .collect .contains .contains_key .copied .entry .flush_pending .get .get_mut .insert .into_mut .is_empty .iter .key .len .map .run_metric_step_into .sort_unstable .stage .to_string .unwrap_or Err Ok QueryTooBroad charge_group_bytes check_surviving_error debug_assert_eq! group_entry_bytes matches! new render_labels_json_sorted route_row_counted row_route
+        // Issue #624, part 3a: `.run_metric_step_into_with_captures` and
+        // `Rows` replace `.run_metric_step_into` — the row's `rx` column,
+        // borrowed. W-MEM disposition unchanged: **NOT-EXEC, row F-d**.
+        // FRAME client_agg.rs ClientAggState::push_one_row 25 35 :: .add .as_deref .collect .contains .contains_key .copied .entry .flush_pending .get .get_mut .insert .into_mut .is_empty .iter .key .len .map .run_metric_step_into_with_captures .sort_unstable .stage .to_string .unwrap_or Err Ok QueryTooBroad Rows charge_group_bytes check_surviving_error debug_assert_eq! group_entry_bytes matches! new render_labels_json_sorted route_row_counted row_route
         branches: 25,
         callees: &[
             ".add",
@@ -2948,7 +2958,7 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
             ".key",
             ".len",
             ".map",
-            ".run_metric_step_into",
+            ".run_metric_step_into_with_captures",
             ".sort_unstable",
             ".stage",
             ".to_string",
@@ -2956,6 +2966,7 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
             "Err",
             "Ok",
             "QueryTooBroad",
+            "Rows",
             "charge_group_bytes",
             "check_surviving_error",
             "debug_assert_eq!",
@@ -2986,16 +2997,18 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
         // for term (`.unwrap_or` replaces the unwrap arm's `match`;
         // `.run_metric_step_into`; `reserved_fps.is_empty()` / `.contains`).
         // W-MEM disposition: **NOT-EXEC, row F-d**.
-        // FRAME client_agg.rs RangeSlideState::push_one_row 7 12 :: .contains .is_empty .len .run_metric_step_into .stage_member .unwrap_or Ok check_surviving_error debug_assert_eq! matches! route_row_counted row_route
+        // Issue #624, part 3a: as the instant twin, term for term.
+        // FRAME client_agg.rs RangeSlideState::push_one_row 7 13 :: .contains .is_empty .len .run_metric_step_into_with_captures .stage_member .unwrap_or Ok Rows check_surviving_error debug_assert_eq! matches! route_row_counted row_route
         branches: 7,
         callees: &[
             ".contains",
             ".is_empty",
             ".len",
-            ".run_metric_step_into",
+            ".run_metric_step_into_with_captures",
             ".stage_member",
             ".unwrap_or",
             "Ok",
+            "Rows",
             "check_surviving_error",
             "debug_assert_eq!",
             "matches!",
@@ -3521,8 +3534,10 @@ static BOUNDARY_CALLEES: [Boundary; 13] = [
         // through the same call with the shared empty context — one
         // implementation, so the boundary is one name. Issue #507: the
         // two row bodies call its rules-taking form, `run_metric_step_into`,
-        // which the older form now delegates to.
-        callee: ".run_metric_step_into",
+        // which the older form now delegates to. Issue #624, part 3a: they
+        // call `run_metric_step_into_with_captures`, passing the row's `rx`
+        // column as `RegexpCaptures::Rows` — a borrow, no allocation.
+        callee: ".run_metric_step_into_with_captures",
         rows: &["F-d"],
         disp: Disp::NotExec,
     },

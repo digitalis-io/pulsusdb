@@ -1781,6 +1781,100 @@ pub(in crate::logql) fn label_only_pipeline(pipeline: &[Stage], op: RangeAggOp) 
     true
 }
 
+/// The `regexp` count a range query lowers to, or `None` (issue #624, part
+/// 3a, D1 and D4).
+///
+/// D1: the reducer is one part 2 lowers, and the pipeline is pushable line
+/// filters, **one** `regexp` stage that no line-rewriting stage precedes,
+/// and otherwise only what [`label_only_pipeline`] admits.
+///
+/// D4: the captures sent are the named groups whose sanitised name `n` —
+/// or `n_extracted` — is a label the answer can read: one a parent `sum`
+/// keeps (every label when there is no such parent), or one a later stage
+/// reads. They keep their capture-index order.
+pub(in crate::logql) fn regexp_count_route(
+    pipeline: &[Stage],
+    op: RangeAggOp,
+    vector_aggs: &[VectorAggSpec],
+) -> Option<sql::RegexpCount> {
+    if !matches!(
+        op,
+        RangeAggOp::CountOverTime
+            | RangeAggOp::Rate
+            | RangeAggOp::BytesOverTime
+            | RangeAggOp::BytesRate
+            | RangeAggOp::AbsentOverTime
+    ) {
+        return None;
+    }
+    // D1 and R4: pushable line filters, then the one parser, which no line
+    // rewrite precedes.
+    let at = pipeline
+        .iter()
+        .position(|s| !matches!(s, Stage::LineFilter(lf) if is_pushable_line_filter(lf)))?;
+    let Stage::Parser(ParserStage::Regexp(pattern)) = &pipeline[at] else {
+        return None;
+    };
+    let after = &pipeline[at + 1..];
+    if !label_only_pipeline(after, op) {
+        return None;
+    }
+    // The statement runs the pattern as a pushed `|~` would render it.
+    super::predicate::regexp_group_columns(pattern, &[]).ok()?;
+    let re = super::pipeline::compile_regex_as_database(pattern).ok()?;
+
+    // D4: the labels the answer can read.
+    let grouping = parent_sum_grouping(op, false, vector_aggs);
+    let mut read: Vec<&str> = Vec::new();
+    for stage in after {
+        match stage {
+            Stage::LabelFilter(expr) => {
+                pulsus_logql::for_each_label_filter(expr, |node: &LabelFilterExpr| match node {
+                    LabelFilterExpr::Match(m) => read.push(m.name.as_str()),
+                    LabelFilterExpr::Compare { name, .. } | LabelFilterExpr::Ip { name, .. } => {
+                        read.push(name.as_str())
+                    }
+                    LabelFilterExpr::And(_, _) | LabelFilterExpr::Or(_, _) => {}
+                });
+            }
+            Stage::Drop(elems) | Stage::Keep(elems) => {
+                read.extend(elems.iter().map(|e| e.label.as_str()));
+            }
+            _ => {}
+        }
+    }
+    let answer_reads = |name: &str| -> bool {
+        let kept = match grouping {
+            None => true,
+            Some(None) => false,
+            Some(Some(g)) => match g.kind {
+                GroupingKind::By => g.labels.iter().any(|l| l == name),
+                GroupingKind::Without => !g.labels.iter().any(|l| l == name),
+            },
+        };
+        kept || read.contains(&name)
+    };
+    let groups: Vec<(String, usize)> = re
+        .capture_names()
+        .enumerate()
+        .filter_map(|(index, name)| {
+            let name = name?;
+            let sanitised = if super::pipeline::key_needs_sanitizing(name) {
+                super::pipeline::sanitize_label_key(name)
+            } else {
+                name.to_string()
+            };
+            let extracted = format!("{sanitised}_extracted");
+            (answer_reads(&sanitised) || answer_reads(&extracted))
+                .then(|| (name.to_string(), index))
+        })
+        .collect();
+    Some(sql::RegexpCount {
+        pattern: pattern.clone(),
+        groups,
+    })
+}
+
 /// Issue #507 (W4): does the pipeline carry a `| unwrap` with a
 /// CONVERSION — `duration(x)`, `duration_seconds(x)`, `bytes(x)`?
 ///
@@ -2565,9 +2659,16 @@ fn metric_plan(
     // group, and the stages run once per group in the engine, through the
     // same pipeline today's route runs per line. `absent_over_time` lowers
     // with them: the statement's count rows say which windows hold a line.
+    // Issue #624, part 3a: a counting reducer after one `regexp` stage, which
+    // the statement runs; its captures join the group key.
+    let regexp = if is_range && !force_client {
+        regexp_count_route(pipeline, *op, &vector_aggs)
+    } else {
+        None
+    };
     let bucketed_range = is_range
         && !force_client
-        && (!has_beyond_line_filter || label_only_pipeline(pipeline, *op))
+        && (!has_beyond_line_filter || label_only_pipeline(pipeline, *op) || regexp.is_some())
         && !has_unwrap
         // Implied by the reducer set below — none of the five requires
         // `| unwrap` — but named so that a future change to
@@ -2718,7 +2819,10 @@ fn metric_plan(
         let equal = step_ns.is_some_and(|step| step.get() == range_ns.get());
         RoutingDecision {
             chosen: RouteChoice::Raw,
-            reason: if staged {
+            reason: if staged && regexp.is_some() {
+                "raw: range aggregation in the database, regexp captures and label stages over its rows (issue #624)"
+                    .to_string()
+            } else if staged {
                 "raw: range aggregation in the database, label stages over its rows (issue #624)"
                     .to_string()
             } else if equal {
@@ -2791,6 +2895,7 @@ fn metric_plan(
             todays_route: client_full
                 .clone()
                 .expect("a range plan always builds today's aggregation"),
+            regexp: regexp.clone(),
         })),
         (None, false) => sql::MetricValue::Shaped(shape),
     };
@@ -6498,6 +6603,17 @@ mod tests {
                 );
                 continue;
             }
+            // Issue #624, part 3a: a `regexp` count is counted in the
+            // database, which runs the parser too. It still plans.
+            if query.contains("| regexp ") {
+                assert!(mp.client.is_none(), "{query}");
+                assert_eq!(
+                    mp.routing.reason,
+                    "raw: range aggregation in the database, regexp captures and label stages over its rows (issue #624)",
+                    "{query}"
+                );
+                continue;
+            }
             let client = mp
                 .client
                 .as_ref()
@@ -8430,6 +8546,137 @@ mod tests {
                 let mp = metric_mp(&query, spec).unwrap_or_else(|e| panic!("{query}: {e}"));
                 assert!(mp.client.is_some(), "{query} at [{range}]: today's route");
             }
+        }
+    }
+
+    /// The routing reason of a lowered `regexp` count (issue #624, part 3a).
+    const REGEXP_STAGED: &str = "raw: range aggregation in the database, regexp captures and label stages over its rows (issue #624)";
+
+    /// **T1 (issue #624, part 3a): a `regexp` counting chain lowers** at a
+    /// range equal to, above and below the step, under every reducer part 2
+    /// lowers and the stages after the parser part 2 admits; a line rewrite
+    /// before the parser, a rewrite or `label_format` after it, two parsers,
+    /// and `decolorize` under a bytes reducer stay on today's route.
+    #[test]
+    fn a_regexp_counting_chain_lowers() {
+        const MIN: u64 = 60_000_000_000;
+        let parser = r#"| regexp "(?P<proc>[a-z]+)\\[[0-9]+\\]""#;
+        for range in ["1m", "5m", "30s"] {
+            let spec = QuerySpec::Range {
+                start_ns: 600_000_000_000,
+                end_ns: 1_200_000_000_000,
+                step_ns: MIN,
+            };
+            let sel = r#"{a="b"}"#;
+            let mut inner: Vec<String> = Vec::new();
+            for op in [
+                "count_over_time",
+                "rate",
+                "bytes_over_time",
+                "bytes_rate",
+                "absent_over_time",
+            ] {
+                for after in [r#"| proc != """#, r#"| proc=~"s.*""#, "| drop proc"] {
+                    inner.push(format!("{op}({sel} {parser} {after} [{range}])"));
+                }
+            }
+            for op in ["count_over_time", "rate"] {
+                inner.push(format!("{op}({sel} {parser} | decolorize [{range}])"));
+            }
+            for pattern in [r#"(?P<a>x)?y"#, r#"(?P<a>x)|(?P<b>y)"#, r#"(?P<a>\\w+)"#] {
+                inner.push(format!(
+                    r#"count_over_time({sel} | regexp "{pattern}" [{range}])"#
+                ));
+            }
+            let mut lowered: Vec<String> = Vec::new();
+            for q in &inner {
+                lowered.push(format!("sum by (proc) ({q})"));
+                lowered.push(format!("topk(10, sum by (proc) ({q}))"));
+                lowered.push(format!("count by (proc) ({q})"));
+            }
+            lowered.push(format!(
+                r#"topk(10, sum by (proc) (count_over_time({sel} | regexp `(?P<proc>[a-zA-Z0-9_.-]+)\[[0-9]+\]` | proc != "" [{range}])))"#
+            ));
+            for query in &lowered {
+                let mp = metric_mp(query, spec).unwrap_or_else(|e| panic!("{query}: {e}"));
+                assert!(mp.client.is_none(), "{query} at [{range}]: must lower");
+                match &mp.value {
+                    sql::MetricValue::Staged(s) => assert!(
+                        s.regexp.is_some(),
+                        "{query} at [{range}]: the statement runs the regexp"
+                    ),
+                    other => panic!("{query} at [{range}]: a staged value, got {other:?}"),
+                }
+                assert_eq!(mp.routing.reason, REGEXP_STAGED, "{query} at [{range}]");
+                assert!(!mp.rollup, "{query}: raw, never rollup");
+            }
+            for query in [
+                format!("bytes_over_time({sel} {parser} | decolorize [{range}])"),
+                format!("bytes_rate({sel} {parser} | decolorize [{range}])"),
+                format!("count_over_time({sel} | decolorize {parser} [{range}])"),
+                format!(r#"count_over_time({sel} | line_format "x" {parser} [{range}])"#),
+                format!("count_over_time({sel} | label_format a=b {parser} [{range}])"),
+                format!(r#"count_over_time({sel} {parser} | line_format "x" [{range}])"#),
+                format!("count_over_time({sel} {parser} | label_format a=b [{range}])"),
+                format!(r#"count_over_time({sel} {parser} | regexp "(?P<q>[0-9])" [{range}])"#),
+                format!("count_over_time({sel} {parser} | json [{range}])"),
+            ] {
+                let mp = metric_mp(&query, spec).unwrap_or_else(|e| panic!("{query}: {e}"));
+                assert!(mp.client.is_some(), "{query} at [{range}]: today's route");
+            }
+        }
+    }
+
+    /// **T2 (issue #624, part 3a): the captures sent follow the parent
+    /// `sum`.** Under `sum` only the labels the sum keeps, and the names a
+    /// later stage reads, can reach the answer; any other parent, or none,
+    /// reads every label. `n_extracted` in the kept set sends `n`, and the
+    /// sent groups keep their capture-index order.
+    #[test]
+    fn the_capture_list_follows_the_parent_sum() {
+        let spec = QuerySpec::Range {
+            start_ns: 600_000_000_000,
+            end_ns: 1_200_000_000_000,
+            step_ns: 60_000_000_000,
+        };
+        let ab = r#"| regexp "(?P<a>[a-z])(?P<b>[0-9])""#;
+        let aa = r#"| regexp "(?P<a>[a-z])(?P<a_extracted>[0-9])""#;
+        let sel = r#"{x="y"}"#;
+        let cases: Vec<(String, Vec<(&str, usize)>)> = vec![
+            (
+                format!("sum by (a) (count_over_time({sel} {ab} [1m]))"),
+                vec![("a", 1)],
+            ),
+            (
+                format!(r#"sum by (a) (count_over_time({sel} {ab} | b != "" [1m]))"#),
+                vec![("a", 1), ("b", 2)],
+            ),
+            (
+                format!("count by (a) (count_over_time({sel} {ab} [1m]))"),
+                vec![("a", 1), ("b", 2)],
+            ),
+            (
+                format!("count_over_time({sel} {ab} [1m])"),
+                vec![("a", 1), ("b", 2)],
+            ),
+            (
+                format!("sum by (a_extracted) (count_over_time({sel} {ab} [1m]))"),
+                vec![("a", 1)],
+            ),
+            (
+                format!("sum by (a_extracted) (count_over_time({sel} {aa} [1m]))"),
+                vec![("a", 1), ("a_extracted", 2)],
+            ),
+        ];
+        for (query, want) in cases {
+            let mp = metric_mp(&query, spec).unwrap_or_else(|e| panic!("{query}: {e}"));
+            let groups = match &mp.value {
+                sql::MetricValue::Staged(s) => s.regexp.as_ref().map(|r| r.groups.clone()),
+                _ => None,
+            };
+            let want: Vec<(String, usize)> =
+                want.into_iter().map(|(n, i)| (n.to_string(), i)).collect();
+            assert_eq!(groups, Some(want), "{query}");
         }
     }
 

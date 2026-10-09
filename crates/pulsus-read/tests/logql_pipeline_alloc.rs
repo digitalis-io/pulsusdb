@@ -424,6 +424,7 @@ fn per_row_allocation_bounds_hold() {
             timestamp_ns: i as i64,
             body: logfmt_bodies[i % logfmt_bodies.len()].clone(),
             structured_metadata: String::new(),
+            rx: Vec::new(),
         })
         .collect();
 
@@ -466,6 +467,7 @@ fn per_row_allocation_bounds_hold() {
             timestamp_ns: i as i64,
             body: format!("id=r{i} level=info"),
             structured_metadata: String::new(),
+            rx: Vec::new(),
         })
         .collect();
     let n = high_card_rows.len() as u64;
@@ -558,6 +560,7 @@ fn per_row_allocation_bounds_hold() {
             timestamp_ns: i as i64,
             body: logfmt_bodies[i % logfmt_bodies.len()].clone(),
             structured_metadata: String::new(),
+            rx: Vec::new(),
         })
         .collect();
     let n = sm_absent_rows.len() as u64;
@@ -583,6 +586,7 @@ fn per_row_allocation_bounds_hold() {
             timestamp_ns: i as i64,
             body: logfmt_bodies[i % logfmt_bodies.len()].clone(),
             structured_metadata: format!(r#"{{"trace_id":"t{i}","user_id":"u{}"}}"#, i % 97),
+            rx: Vec::new(),
         })
         .collect();
     let n = sm_present_rows.len() as u64;
@@ -630,6 +634,7 @@ fn per_row_allocation_bounds_hold() {
             // The SM-FREE leg: issue #249's merge must leave this budget
             // unmoved. The SM-PRESENT leg is a separate test below.
             structured_metadata: String::new(),
+            rx: Vec::new(),
         })
         .collect();
     let params = QueryParams {
@@ -776,6 +781,7 @@ fn per_row_allocation_bounds_hold() {
                 timestamp_ns: (i as i64) * (20_000_000_000 / n as i64),
                 body: logfmt_bodies[i % logfmt_bodies.len()].clone(),
                 structured_metadata: String::new(),
+                rx: Vec::new(),
             })
             .collect()
     };
@@ -887,6 +893,7 @@ fn per_row_allocation_bounds_hold() {
             // DISTINCT per row: one output group per row, so the merge and
             // the group retention are both fully exercised.
             structured_metadata: format!(r#"{{"trace":"t{i}"}}"#),
+            rx: Vec::new(),
         })
         .collect();
     // **A 10s range against the 5s step.** A range SHORTER than the step

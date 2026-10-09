@@ -107,6 +107,7 @@ fn row(fp: u64, ts_ns: i64, body: &str) -> MetricScanRow {
         // Issue #249 added the column; every fixture in THIS file is
         // metadata-free, so no expected value in it moves.
         structured_metadata: String::new(),
+        rx: Vec::new(),
     }
 }
 
