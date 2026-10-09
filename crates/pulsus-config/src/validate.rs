@@ -362,6 +362,7 @@ pub const TRACEQL_EVENT_SET_MAX_VALUES_CEILING: u64 = 10_000_000;
 /// links than the 10,000 spans one trace is hydrated to
 /// (`MAX_SPANS_PER_TRACE`).
 pub const TRACEQL_MAX_DEPTH_CEILING: u64 = 10_000;
+
 /// `reader.traceql_generator_max_memory_bytes` — the phase-1 candidate
 /// generator's `max_memory_usage` (throw-not-OOM) ceiling. ClickHouse
 /// treats `0` as *unlimited*, so zero is rejected too. 1024x the
@@ -976,6 +977,20 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
     // Issue #182: the metrics by()-series cap is rendered into a
     // `LIMIT {cap + 1}` probe; zero would reject every grouped query and
     // the ceiling keeps `cap + 1` overflow-free.
+    // Issue #593 part 2: zero would refuse every `>>` and `<<`; past the
+    // spans one trace may hold, no chain can be deeper.
+    positive_u64(
+        "reader.traceql_max_depth",
+        u64::from(cfg.reader.traceql_max_depth),
+    )?;
+    if u64::from(cfg.reader.traceql_max_depth) > TRACEQL_MAX_DEPTH_CEILING {
+        return Err(ceiling_err(
+            "reader.traceql_max_depth",
+            TRACEQL_MAX_DEPTH_CEILING,
+            1,
+            "the structural climb bound",
+        ));
+    }
     positive_u64("reader.traceql_max_series", cfg.reader.traceql_max_series)?;
     if cfg.reader.traceql_max_series > TRACEQL_MAX_SERIES_CEILING {
         return Err(ceiling_err(
@@ -2009,6 +2024,7 @@ mod tests {
             TRACEQL_MAX_DEPTH_CEILING,
         );
     }
+
     /// Issue #133 AC9: same shape as the row budget —
     /// `max_memory_usage = 0` is ClickHouse-unlimited, so zero is a
     /// silently disabled generator memory guard.

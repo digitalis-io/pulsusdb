@@ -91,6 +91,7 @@ pub const ALL_ENV_VARS: &[&str] = &[
     "PULSUS_TRACEQL_MAX_CANDIDATES",
     "PULSUS_TRACEQL_SCAN_BUDGET_ROWS",
     "PULSUS_TRACEQL_EVENT_SET_MAX_VALUES",
+    "PULSUS_TRACEQL_MAX_DEPTH",
     "PULSUS_TRACEQL_MAX_SERIES",
     "PULSUS_TRACEQL_TAG_LOOKBACK",
     "PULSUS_TRACEQL_GENERATOR_MAX_MEMORY_BYTES",
@@ -430,6 +431,9 @@ pub fn apply_env(cfg: &mut Config) -> Result<(), ConfigError> {
     if let Some(v) = read("PULSUS_TRACEQL_EVENT_SET_MAX_VALUES") {
         cfg.reader.traceql_event_set_max_values =
             parse_int("PULSUS_TRACEQL_EVENT_SET_MAX_VALUES", &v)?;
+    }
+    if let Some(v) = read("PULSUS_TRACEQL_MAX_DEPTH") {
+        cfg.reader.traceql_max_depth = parse_int("PULSUS_TRACEQL_MAX_DEPTH", &v)?;
     }
     if let Some(v) = read("PULSUS_TRACEQL_MAX_SERIES") {
         cfg.reader.traceql_max_series = parse_int("PULSUS_TRACEQL_MAX_SERIES", &v)?;

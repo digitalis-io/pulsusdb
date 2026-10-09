@@ -559,8 +559,8 @@ pub struct ReaderConfig {
     pub traceql_event_set_max_values: u64,
     /// Issue #593 part 2: the most parent links one climb of the `>>` and
     /// `<<` structural operators follows (`PULSUS_TRACEQL_MAX_DEPTH`). A
-    /// span with a parent left past it — a deeper chain or a cycle —
-    /// answers `422 query_too_broad`.
+    /// span with a parent left past it — a deeper chain — answers
+    /// `422 query_too_broad`; a cycle ends the climb.
     pub traceql_max_depth: u32,
     /// Issue #478: the window a §4.3 tag-value read covers when the
     /// client sends no usable `start`/`end`.

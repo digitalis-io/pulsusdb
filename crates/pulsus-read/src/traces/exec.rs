@@ -771,6 +771,16 @@ fn map_trace_metrics_error(e: ChError, config: &TraceReadConfig) -> ReadError {
 /// as every trace read.
 fn map_search_statement_error(e: ChError, config: &TraceReadConfig) -> ReadError {
     match e {
+        // Issue #593 part 2: a climb with a parent link left after
+        // `max_depth` links — a chain deeper than the bound.
+        ChError::Server {
+            code: 395,
+            ref message,
+        } if message.contains(super::spans::structural::CLIMB_OVERFLOW) => {
+            ReadError::QueryTooBroad(TooBroadReason::TraceStructuralDepth {
+                max_depth: u64::from(config.max_depth),
+            })
+        }
         ChError::Server { code: 395, .. } => ReadError::Clickhouse(e),
         other => map_trace_read_error(other, config),
     }
@@ -2286,7 +2296,13 @@ impl TraceEngine {
         if let Some(e) = explain.as_mut() {
             e.push("search_statement", stmt.sql(), None);
         }
-        let settings = self.search_settings().set("final", 1);
+        let mut settings = self.search_settings().set("final", 1);
+        // Issue #593 part 2: a climb runs `max_depth + 1` levels, the last
+        // only to see whether a parent was left; the server's own bound
+        // must not end it first.
+        if let Some(depth) = stmt.climb_depth() {
+            settings = settings.set("max_recursive_cte_evaluation_depth", u64::from(depth) + 1);
+        }
         let mut budget = ByteBudget::new(HYDRATION_BYTE_BUDGET);
         let mut charged = 0usize;
         // Issue #592 part 2: a grouped statement runs today's distinct-group
