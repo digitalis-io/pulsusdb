@@ -1143,3 +1143,34 @@ async fn the_landed_storage_is_priced() {
 
     drop_database(&client, db).await;
 }
+
+/// Issue #595: `spans` carries exactly three skip indexes, a
+/// `bloom_filter(0.01)` of granularity 1 over `name`, `resource_id` and
+/// `service`, and no other table of the five carries one.
+#[tokio::test]
+async fn the_span_table_carries_three_bloom_indexes() {
+    skip_unless_live!();
+    let db = &pulsus_testkit::test_db("pulsus_trace_landing_it_span_indexes");
+    let client = ChClient::new(test_config()).await.expect("connect");
+    drop_database(&client, db).await;
+    run_init(&client, &test_ctx(db)).await.expect("run_init");
+    let got = names(
+        &client,
+        &format!(
+            "SELECT concat(table, ' ', name, ' ', expr, ' ', type_full, ' ', toString(granularity)) AS name \
+             FROM system.data_skipping_indices \
+             WHERE database = '{db}' AND table IN ({TARGET_TABLE_LIST}) ORDER BY table, name"
+        ),
+    )
+    .await;
+    assert_eq!(
+        got,
+        vec![
+            "spans idx_name name bloom_filter(0.01) 1",
+            "spans idx_resource resource_id bloom_filter(0.01) 1",
+            "spans idx_service service bloom_filter(0.01) 1",
+        ],
+        "the span table's skip indexes"
+    );
+    drop_database(&client, db).await;
+}

@@ -10729,3 +10729,512 @@ async fn a_fetched_trace_keeps_a_resource_seen_on_two_days() {
     assert_eq!(got.spans.len(), 1, "the trace's one span");
     assert_eq!(got.resources.len(), 1, "the span's resource");
 }
+
+// ---------------------------------------------------------------------
+// Issue #595: the newest-slice-first search plan, and the span indexes
+// ---------------------------------------------------------------------
+
+/// A 16-byte trace id whose last byte is `n`.
+fn tid595(n: u8) -> Vec<u8> {
+    let mut v = vec![0u8; 16];
+    v[15] = n;
+    v
+}
+
+/// The window's end: a whole five-minute boundary at least five minutes
+/// before now, so every fixture span is in the past.
+fn end595() -> i64 {
+    (now_ns() / 300_000_000_000 - 1) * 300_000_000_000
+}
+
+/// Fixture P (issue #595): 43 one-span traces over the three hours
+/// before `e`, `…01` to `…2b` in ascending start order.
+fn fixture_p595_bodies(e: i64) -> Vec<ExportTraceServiceRequest> {
+    let s = e - 10_800_000_000_000;
+    let mut starts: Vec<i64> = Vec::new();
+    starts.extend((0..20).map(|i| s + i * 300_000_000_000));
+    starts.extend((0..10).map(|i| s + 9_600_000_000_000 + i * 60_000_000_000));
+    starts.extend((0..6).map(|i| s + 10_200_000_000_000 + i * 10_000_000_000));
+    starts.extend((0..6).map(|i| s + 10_500_000_000_000 + i * 10_000_000_000));
+    let mut out = Vec::new();
+    for (i, start) in starts.into_iter().enumerate() {
+        let n = u8::try_from(i + 1).expect("43 traces");
+        let mut attrs = vec![kv("http.response.status_code", int_value(500))];
+        if n == 0x29 || n == 0x2a {
+            attrs.push(kv("app.slice.probe", bool_value(true)));
+        }
+        let span = span_of(
+            tid595(n),
+            span_id_bytes(n),
+            Vec::new(),
+            "op",
+            2,
+            start,
+            1_000_000,
+            attrs,
+            2,
+            Vec::new(),
+            Vec::new(),
+        );
+        out.push(request("checkout", "checkout-0", vec![span]));
+    }
+    let rare = span_of(
+        tid595(0x2b),
+        span_id_bytes(0x2b),
+        Vec::new(),
+        "op",
+        2,
+        s,
+        1_000_000,
+        vec![kv("app.user.id", str_value("u-10013"))],
+        0,
+        Vec::new(),
+        Vec::new(),
+    );
+    out.push(request("payment", "payment-0", vec![rare]));
+    // `…2a`'s second span, two and a half hours before its first: the
+    // slice finds the trace, and the whole window counts both spans.
+    let old = span_of(
+        tid595(0x2a),
+        span_id_bytes(0x2c),
+        Vec::new(),
+        "op",
+        2,
+        s + 1_500_000_000_000,
+        1_000_000,
+        vec![
+            kv("http.response.status_code", int_value(500)),
+            kv("app.old", bool_value(true)),
+        ],
+        2,
+        Vec::new(),
+        Vec::new(),
+    );
+    out.push(request("checkout", "checkout-0", vec![old]));
+    // `…2d`, at exactly `e`: outside `[e - 3 h, e)`, so in no answer and
+    // in no slice's count.
+    let at_end = span_of(
+        tid595(0x2d),
+        span_id_bytes(0x2d),
+        Vec::new(),
+        "op",
+        2,
+        e,
+        1_000_000,
+        vec![
+            kv("http.response.status_code", int_value(500)),
+            kv("app.slice.probe", bool_value(true)),
+            kv("app.user.id", str_value("u-10013")),
+        ],
+        2,
+        Vec::new(),
+        Vec::new(),
+    );
+    out.push(request("checkout", "checkout-0", vec![at_end]));
+    out
+}
+
+/// Fixture Q (issue #595): 19 one-span traces carrying `app.bound`, at
+/// these seconds before `e`, so the newest 5, 10, 20, 40, 80 and 160
+/// minutes hold 2, 3, 5, 8, 14 and 17 of them and the window all 19.
+const FIXTURE_Q595_AGO_S: [i64; 19] = [
+    10, 20, 400, 700, 800, 1_300, 1_500, 1_700, 2_500, 2_900, 3_300, 3_700, 4_100, 4_500, 5_000,
+    6_500, 9_000, 9_700, 10_500,
+];
+
+fn fixture_q595_bodies(e: i64) -> Vec<ExportTraceServiceRequest> {
+    FIXTURE_Q595_AGO_S
+        .iter()
+        .enumerate()
+        .map(|(i, ago)| {
+            let n = u8::try_from(i + 1).expect("19 traces");
+            let span = span_of(
+                tid595(n),
+                span_id_bytes(n),
+                Vec::new(),
+                "op",
+                2,
+                e - ago * 1_000_000_000,
+                1_000_000,
+                vec![kv("app.bound", bool_value(true))],
+                0,
+                Vec::new(),
+                Vec::new(),
+            );
+            request("checkout", "checkout-0", vec![span])
+        })
+        .collect()
+}
+
+async fn seed595(label: &str, bodies: Vec<ExportTraceServiceRequest>) -> (String, ChClient) {
+    let db = pulsus_testkit::test_db(label);
+    let client = fresh_db(&db).await;
+    for (i, req) in bodies.iter().enumerate() {
+        land(&client, req, &format!("{label}-{i}")).await;
+    }
+    (db, client)
+}
+
+/// The answer's trace ids, by the last byte, as `…2a`.
+fn last_bytes(out: &pulsus_read::traces::SearchOutput) -> Vec<String> {
+    out.traces
+        .iter()
+        .map(|t| match t.matched {
+            1 => format!("…{:02x}", t.trace_id[15]),
+            m => format!("…{:02x}×{m}", t.trace_id[15]),
+        })
+        .collect()
+}
+
+/// `(answer, statements, explain stages, partial)` for `query` over
+/// `[e - 3 h, e)` at `limit`; a trace that matched more than one span is
+/// written `…2a×2`.
+async fn sliced_run(
+    engine: &pulsus_read::TraceEngine,
+    client: &ChClient,
+    db: &str,
+    e: i64,
+    query: &str,
+    limit: u32,
+) -> (Vec<String>, u64, String, bool) {
+    let plan = plan_of(
+        engine,
+        &parse_query(query),
+        (e - 10_800_000_000_000, e),
+        limit,
+        3,
+    );
+    let t0 = now_ns();
+    let (out, explain) = engine
+        .search_routed_explained(&plan)
+        .await
+        .unwrap_or_else(|err| panic!("{query}: {err}"));
+    let (n, _) = settled_statements(client, db, t0).await;
+    let stages: Vec<&str> = explain.stages.iter().map(|s| s.name).collect();
+    (last_bytes(&out), n, stages.join(" "), out.partial)
+}
+
+/// The explain stages of `slices` sliced statements, then the whole
+/// window's when `whole`.
+fn stages595(slices: usize, whole: bool) -> String {
+    let mut v = vec!["search_slice"; slices];
+    if whole {
+        v.push("search_statement");
+    }
+    v.join(" ")
+}
+
+/// Issue #595: over fixture P each broad query answers the twenty newest
+/// traces in three statements (the 5-minute slice finds 6, the 10-minute
+/// 12, the 20-minute 22); the rare filter answers in two; the probe stops
+/// doubling at the 10-minute slice and answers in three.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_newest_slice_first_plan_answers_fixture_p() {
+    skip_unless_live!();
+    let e = end595();
+    let (db, client) = seed595("pulsus_read_it_t595_p", fixture_p595_bodies(e)).await;
+    let engine = engine_of(&db).await;
+    let newest = |n: usize| -> Vec<String> {
+        let mut v: Vec<String> = (0x01..=0x2a_u8)
+            .rev()
+            .map(|n| match n {
+                0x2a => "…2a×2".to_string(),
+                _ => format!("…{n:02x}"),
+            })
+            .collect();
+        v.truncate(n);
+        v
+    };
+    let newest20 = newest(20);
+    let mut wrong = Vec::new();
+    for (query, limit, want, statements, stages) in [
+        ("{}", 20_u32, newest20.clone(), 3_u64, stages595(3, false)),
+        ("{}", 22, newest(22), 3, stages595(3, false)),
+        ("{}", 23, newest(23), 6, stages595(6, false)),
+        (
+            r#"{ resource.service.name = "checkout" }"#,
+            20,
+            newest20.clone(),
+            3,
+            stages595(3, false),
+        ),
+        (
+            "{ span.http.response.status_code >= 500 }",
+            20,
+            newest20.clone(),
+            3,
+            stages595(3, false),
+        ),
+        (
+            "{ status = error } | select(name)",
+            20,
+            newest20.clone(),
+            3,
+            stages595(3, false),
+        ),
+        (
+            r#"{ span.app.user.id = "u-10013" }"#,
+            20,
+            vec!["…2b".to_string()],
+            2,
+            stages595(1, true),
+        ),
+        (
+            "{ span.app.slice.probe }",
+            20,
+            vec!["…2a".to_string(), "…29".to_string()],
+            3,
+            stages595(2, true),
+        ),
+        (
+            "{ status = error } >> { status = error }",
+            20,
+            Vec::new(),
+            1,
+            stages595(0, true),
+        ),
+        (
+            "{ span.app.old } && { span.app.slice.probe }",
+            20,
+            vec!["…2a×2".to_string()],
+            1,
+            stages595(0, true),
+        ),
+    ] {
+        let (got, n, seen, partial) = sliced_run(&engine, &client, &db, e, query, limit).await;
+        if got != want || n != statements || seen != stages || partial {
+            wrong.push(format!(
+                "{query} limit {limit}: {got:?} in {n} statements ({seen}), partial {partial}; \
+                 want {want:?} in {statements} ({stages}), partial false"
+            ));
+        }
+    }
+    drop_db(&db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Issue #595: over fixture Q the plan doubles through 5, 10, 20, 40, 80
+/// and 160 minutes and then reads the window, ⌈log₂ 36⌉ + 1 = 7
+/// statements, and answers all nineteen traces newest first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_statement_count_reaches_its_bound_and_no_further() {
+    skip_unless_live!();
+    let e = end595();
+    let (db, client) = seed595("pulsus_read_it_t595_q", fixture_q595_bodies(e)).await;
+    let engine = engine_of(&db).await;
+    let want: Vec<String> = (1..=19_u8).map(|n| format!("…{n:02x}")).collect();
+    let (got, n, seen, partial) =
+        sliced_run(&engine, &client, &db, e, "{ span.app.bound }", 20).await;
+    drop_db(&db).await;
+    assert_eq!(
+        (got, n, seen, partial),
+        (want, 7, stages595(6, true), false),
+        "the answer, the statement count, the explain stages and partial"
+    );
+}
+
+/// Issue #595: the rare-value fixture, 40,000 one-span traces in one part
+/// of twenty granules; trace 17,000's span alone has service `rare`, name
+/// `rare-op` and the resource whose `env` is `rare`.
+async fn seed_rare(db: String) -> (String, ChClient, (i64, i64)) {
+    let client = fresh_db(&db).await;
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000 - 60_000_000_000;
+    run_bounded(
+        &client,
+        format!(
+            "INSERT INTO {SPANS_TABLE} (trace_id, span_id, parent_span_id, start_ns, duration_ns, \
+             service, resource_id, name, kind, end_ns, service_type, status_code) \
+             SELECT sipHash128(t), reinterpretAsFixedString(cityHash64(t)), toFixedString('', 8), \
+             {base_ns} + t * 1000000, 1000000, \
+             if(t = 17000, 'rare', ['frontend', 'checkout'][1 + t % 2]), if(t = 17000, 2, 1), \
+             if(t = 17000, 'rare-op', 'op'), 2, toUInt64({base_ns} + t * 1000000 + 1000000), 'string', 0 \
+             FROM (SELECT number AS t FROM numbers(40000))"
+        ),
+    )
+    .await;
+    run_bounded(
+        &client,
+        format!(
+            "INSERT INTO {RESOURCES_TABLE} (day, resource_id, service, attrs) VALUES \
+             (toDate(fromUnixTimestamp64Nano({base_ns}), 'UTC'), 1, 'frontend', '{{\"env\":\"prod\"}}'), \
+             (toDate(fromUnixTimestamp64Nano({base_ns}), 'UTC'), 2, 'rare', '{{\"env\":\"rare\"}}')"
+        ),
+    )
+    .await;
+    run_bounded(&client, TRACES_FROM_SPANS.to_string()).await;
+    run_bounded(&client, format!("OPTIMIZE TABLE {SPANS_TABLE} FINAL")).await;
+    (db, client, (base_ns, base_ns + 60_000_000_000))
+}
+
+/// The rows every statement on `db` read since `t0_ns`, once the log settles.
+async fn read_rows_since(client: &ChClient, db: &str, t0_ns: i64) -> u64 {
+    let _ = settled_statements(client, db, t0_ns).await;
+    count(
+        client,
+        &format!(
+            "SELECT sum(read_rows) AS n FROM system.query_log WHERE type = 'QueryFinish' \
+             AND query_kind = 'Select' AND has(databases, '{db}') \
+             AND event_time_microseconds >= toDateTime64({}, 6)",
+            t0_ns as f64 / 1e9
+        ),
+    )
+    .await
+}
+
+/// Issue #595: a search for a service, a name or a resource attribute
+/// that one span carries, or none does, reads that span's granules and
+/// not the window's twenty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rare_value_reads_only_its_granules() {
+    skip_unless_live!();
+    let (db, client, w) = seed_rare(pulsus_testkit::test_db("pulsus_read_it_t595_rare")).await;
+    let engine = engine_of(&db).await;
+    let mut wrong = Vec::new();
+    for (query, traces) in [
+        (r#"{ resource.service.name = "rare" }"#, 1usize),
+        (r#"{ name = "rare-op" }"#, 1),
+        (r#"{ resource.env = "rare" }"#, 1),
+        (r#"{ resource.service.name = "nosuch" }"#, 0),
+        (r#"{ name = "nosuch" }"#, 0),
+        (r#"{ resource.env = "nosuch" }"#, 0),
+    ] {
+        let plan = plan_of(&engine, &parse_query(query), w, 20, 3);
+        let t0 = now_ns();
+        let out = engine
+            .search_routed(&plan)
+            .await
+            .expect("the search answers");
+        let rows = read_rows_since(&client, &db, t0).await;
+        let got: Vec<u32> = out.traces.iter().map(|t| t.matched).collect();
+        if got.len() != traces || got.iter().any(|m| *m != 1) {
+            wrong.push(format!(
+                "{query}: matched {got:?}, want {traces} trace(s) of one span"
+            ));
+        }
+        if rows > 12_288 {
+            wrong.push(format!("{query}: {rows} rows read, more than six granules"));
+        }
+    }
+    drop_db(&db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// The rows one statement read, by its `log_comment`.
+async fn rows_of_statement(client: &ChClient, sql: &str, tag: &str) -> u64 {
+    let settings = QuerySettings::new()
+        .set("final", 1)
+        .set("do_not_merge_across_partitions_select_final", 1)
+        .set("log_comment", tag);
+    let mut stream = client
+        .query_stream::<SearchTraceRow>(sql, &settings)
+        .await
+        .unwrap_or_else(|e| panic!("{tag}: {e}"));
+    while let Some(row) = stream.next().await {
+        row.unwrap_or_else(|e| panic!("{tag}: {e}"));
+    }
+    drop(stream);
+    let deadline = std::time::Instant::now() + StdDuration::from_secs(30);
+    loop {
+        client
+            .execute(
+                "SYSTEM FLUSH LOGS",
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("flush the logs");
+        let n = count(
+            client,
+            &format!(
+                "SELECT count() AS n FROM system.query_log \
+                 WHERE type = 'QueryFinish' AND log_comment = '{tag}'"
+            ),
+        )
+        .await;
+        if n == 1 {
+            return count(
+                client,
+                &format!(
+                    "SELECT any(read_rows) AS n FROM system.query_log \
+                     WHERE type = 'QueryFinish' AND log_comment = '{tag}'"
+                ),
+            )
+            .await;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{tag} never reached the log"
+        );
+        tokio::time::sleep(StdDuration::from_millis(500)).await;
+    }
+}
+
+/// Issue #595: a slice the scan budget refuses hands the search to the
+/// whole-window statement, which the budget admits. Over fixture P with
+/// `spans` and `traces` merged to one part each, `{}`'s first sliced
+/// statement reads more rows than the whole-window statement (its `tb`
+/// reads `traces` a second time); with the budget set to the whole-window
+/// statement's rows the search answers the twenty newest traces.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slice_the_budget_refuses_falls_back_to_the_window() {
+    skip_unless_live!();
+    let e = end595();
+    let (db, client) = seed595("pulsus_read_it_t595_budget", fixture_p595_bodies(e)).await;
+    run_bounded(&client, "OPTIMIZE TABLE spans FINAL".to_string()).await;
+    run_bounded(&client, "OPTIMIZE TABLE traces FINAL".to_string()).await;
+    let engine = engine_of(&db).await;
+    let plan = plan_of(
+        &engine,
+        &parse_query("{}"),
+        (e - 10_800_000_000_000, e),
+        20,
+        3,
+    );
+    let st = |slice| {
+        pulsus_read::traces::spans::search::plan_statement_sliced(
+            &plan,
+            "spans",
+            "traces",
+            "resources",
+            64,
+            slice,
+        )
+        .expect("covered")
+        .sql()
+        .to_string()
+    };
+    let tag = format!("{}_{}", pulsus_testkit::test_ident("t595_budget"), now_ns());
+    let whole = rows_of_statement(&client, &st(None), &format!("{tag}_whole")).await;
+    let slice = rows_of_statement(
+        &client,
+        &st(Some(pulsus_read::traces::spans::search::SLICE_NS)),
+        &format!("{tag}_slice"),
+    )
+    .await;
+    let mut cfg = engine_config();
+    cfg.scan_budget_rows = whole;
+    let tight = pulsus_read::TraceEngine::new(
+        ChClient::new(client_config(&db)).await.expect("connect"),
+        cfg,
+    );
+    let out = tight.search_routed_explained(&plan).await;
+    drop_db(&db).await;
+    assert!(
+        slice > whole,
+        "the fixture must make the slice read more: {slice} against {whole}"
+    );
+    let (out, explain) = out.unwrap_or_else(|err| panic!("the window answers: {err}"));
+    let want: Vec<String> = (0x17..=0x2a_u8)
+        .rev()
+        .map(|n| match n {
+            0x2a => "…2a×2".to_string(),
+            _ => format!("…{n:02x}"),
+        })
+        .collect();
+    let stages: Vec<&str> = explain.stages.iter().map(|s| s.name).collect();
+    assert_eq!(
+        (last_bytes(&out), stages.join(" "), out.partial),
+        (want, stages595(1, true), false),
+        "the answer, the explain stages and partial"
+    );
+}

@@ -1223,6 +1223,22 @@ pub fn plan_statement(
     .ok()
 }
 
+/// Test stub (issue #595): the newest slice a sliceable statement reads
+/// first. Not yet wired.
+pub const SLICE_NS: i64 = 300_000_000_000;
+
+/// Test stub (issue #595): ignores `slice_ns` until the loop lands.
+pub fn plan_statement_sliced(
+    plan: &SearchPlan,
+    spans_table: &str,
+    traces_table: &str,
+    resources_table: &str,
+    max_depth: u32,
+    _slice_ns: Option<i64>,
+) -> Option<SearchStatement> {
+    plan_statement(plan, spans_table, traces_table, resources_table, max_depth)
+}
+
 /// [`decode_search`], charging every retained entry against `budget`
 /// before the allocation it pays for, with today's engine's own charges in
 /// today's order (issue #591 part 3, section 3.2): the trace buffer, then
