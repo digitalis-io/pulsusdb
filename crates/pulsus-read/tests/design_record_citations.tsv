@@ -244,7 +244,7 @@ docs/query-to-sql.md	logql/exec.rs:1890	crates/pulsus-read/src/logql/exec.rs	189
 docs/query-to-sql.md	logql/exec.rs:2091	crates/pulsus-read/src/logql/exec.rs	2091		line	apply_leaf_aggs	apply_leaf_aggs(mp, result, 0)
 docs/query-to-sql.md	logql/exec.rs:2574	crates/pulsus-read/src/logql/exec.rs	2574		line	apply_leaf_aggs	apply_leaf_aggs(mp, result, folded)
 docs/query-to-sql.md	logql/exec.rs:2756	crates/pulsus-read/src/logql/exec.rs	2756		prose	apply_vector_aggs	vector_aggs
-docs/query-to-sql.md	logql/exec.rs:6567	crates/pulsus-read/src/logql/exec.rs	6567		prose	apply_vector_aggs	vector_aggs
+docs/query-to-sql.md	logql/exec.rs:6571	crates/pulsus-read/src/logql/exec.rs	6571		prose	apply_vector_aggs	vector_aggs
 docs/query-to-sql.md	logql/fold.rs:543	crates/pulsus-read/src/logql/fold.rs	543		line	SelectFold	pub(in crate::logql) struct SelectFold {
 docs/query-to-sql.md	logql/params.rs:121	crates/pulsus-read/src/logql/params.rs	121		line	DEFAULT_MAX_STREAMS	pub const DEFAULT_MAX_STREAMS: usize = 100_000;
 docs/query-to-sql.md	logql/pipeline.rs:1323	crates/pulsus-read/src/logql/pipeline.rs	1323		line	PipelineError	pub fn compile(stages: &[Stage]) -> Result<Self, PipelineError> {

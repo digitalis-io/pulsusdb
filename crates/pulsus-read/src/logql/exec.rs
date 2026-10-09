@@ -5632,15 +5632,19 @@ struct StagedFold {
     /// keys become the document its stages run over.
     json: Option<Vec<String>>,
     /// The last group's outcome, keyed by the whole group key.
-    memo: Option<(
-        Fingerprint,
-        String,
-        u8,
-        Vec<String>,
-        Vec<(u8, String)>,
-        StagedOutcome,
-    )>,
+    memo: Option<StagedMemo>,
 }
+
+/// [`StagedFold`]'s memo: the group key — `(fingerprint,
+/// structured_metadata, matched, caps, keys)` — and that group's outcome.
+type StagedMemo = (
+    Fingerprint,
+    String,
+    u8,
+    Vec<String>,
+    Vec<(u8, String)>,
+    StagedOutcome,
+);
 
 /// What the stages make of one group.
 #[derive(Clone)]
