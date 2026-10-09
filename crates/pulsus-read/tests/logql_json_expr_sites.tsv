@@ -83,7 +83,7 @@ Site	Literal	crates/pulsus-logql/src/parser.rs:769	-	-	b	accept	accept	-	-
 Site	Literal	crates/pulsus-logql/tests/snapshots.rs:940	-	-	request.headers.User-Agent	accept	reject	-	-	a PARSER-level snapshot (crates/pulsus-logql/tests/snapshots.rs). The reference accepts it in ParseExpr too -- a json expression is refused at Stage(), one layer later -- and that test never compiles a pipeline, so it is unaffected. The expression itself is now correctly refused: `-` is not an identifier character (jsonexpr/lexer.go:80)
 Site	Literal	crates/pulsus-logql/tests/snapshots.rs:940	-	-	servers[0]	accept	accept	-	-	
 Site	LogqlUnparseable	crates/pulsus-logql/tests/string_escapes.rs:365	-	-	\d	-	-	-	-	the sweep's text is not a valid LogQL string body, so no expression reaches the sub-grammar from this site (an invalid escape, or a `format!` placeholder). Outside the compile domain; no verdict is recorded rather than a made-up one
-Site	Literal	crates/pulsus-read/src/logql/error.rs:441	-	-	b.c	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/error.rs:446	-	-	b.c	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/src/logql/logfmt_expr.rs:168	-	-	b c	accept	reject	-	-	PROSE and FIXTURE about this expression, never a query that must keep working: one of the two #394 glosses that said it was `accepted here` (which this change makes false and rewrites), and b26_json_expr.test's own eval_fail row, which pins the new verdict
 Site	Literal	crates/pulsus-read/src/logql/logfmt_expr.rs:169	-	-	b-c	accept	reject	-	-	the same: the second #394 gloss, this issue's two corpus-file headers, and b26_json_expr.test's eval_fail row pinning the new verdict
 Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:3881	-	-	p	accept	accept	-	-	
@@ -396,23 +396,23 @@ Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:97	-	-
 Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b28_reserved_names.test:278	-	-	latency	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b3_metric_range.test:211	-	-	v	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/tests/logqltest_corpus.rs:876	-	-	c	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:5844	-	-	latency	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:5847	-	-	latency	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:6061	-	-	latency	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:6265	-	-	latency	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:6269	-	-	latency	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:7068	-	-	latency	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:7086	-	-	latency	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:8835	-	-	code	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:8835	-	-	latency	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:8839	-	-	code	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:8839	-	-	latency	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:9241	-	-	latency	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:9245	-	-	latency	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:9249	-	-	latency	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:9253	-	-	latency	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:9265	-	-	req.latency	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:9269	-	-	req.latency	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:5845	-	-	latency	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:5848	-	-	latency	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:6062	-	-	latency	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:6266	-	-	latency	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:6270	-	-	latency	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:7069	-	-	latency	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:7087	-	-	latency	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:8836	-	-	code	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:8836	-	-	latency	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:8840	-	-	code	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:8840	-	-	latency	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:9242	-	-	latency	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:9246	-	-	latency	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:9250	-	-	latency	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:9254	-	-	latency	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:9266	-	-	req.latency	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:9270	-	-	req.latency	accept	accept	-	-	
 Site	Literal	crates/pulsus-server/tests/categorize_labels_differential.rs:203	-	-	lvl	accept	accept	-	-	
 Site	Literal	crates/pulsus-server/tests/categorize_labels_differential.rs:203	-	-	tid	accept	accept	-	-	
 Site	Literal	docs/api.md:277	-	-	path	accept	accept	-	-	

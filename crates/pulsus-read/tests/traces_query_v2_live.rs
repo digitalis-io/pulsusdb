@@ -10012,7 +10012,7 @@ async fn t_a10_t_a11_a_climb_past_the_bound_answers_422() {
     let mut wrong = Vec::new();
     for (label, bodies, spans, query, today_literal, routed_literal) in cases {
         let (db, _client) = seed_both(
-            pulsus_testkit::test_db(&format!("pulsus_read_it_t593p2_{label}")),
+            pulsus_testkit::test_db(&format!("pulsus_read_it_t593p2_chain_{label}")),
             &bodies,
             spans,
             &format!("t593p2-{label}"),
@@ -10060,7 +10060,7 @@ async fn a_configured_bound_counts_parent_links() {
         ("d1003", 1003, 1001, "Err(query too broad: a structural operator (>> or <<) found a chain of parent spans deeper than 1001 links)".to_string()),
     ] {
         let (db, _client) = seed_both(
-            pulsus_testkit::test_db(&format!("pulsus_read_it_t593p2_{label}")),
+            pulsus_testkit::test_db(&format!("pulsus_read_it_t593p2_depth_{label}")),
             &long_chain_bodies(base_ns, n),
             u64::from(n),
             &format!("t593p2-{label}"),
