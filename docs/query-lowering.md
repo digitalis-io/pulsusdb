@@ -52,11 +52,11 @@ Those are three projections of one traversal. `metric_pipeline_construct` is exa
 returning the first refusal and its reason"; `has_unpushed_dropping_stage` is "did the boundary
 fall short"; `compile_line_filters` is "the predicate the fold accumulated".
 
-Underneath them, `is_pushable_line_filter` (`plan.rs:3841`) carries a doc comment that states the
+Underneath them, `is_pushable_line_filter` (`plan.rs:3946`) carries a doc comment that states the
 problem in the codebase's own words — *"the single source of truth for 'does this line filter push
 down to SQL, or must it run in the client pipeline?' … so the two paths never drift"* — and it has
-five call sites across three files: `plan.rs:1711`, `plan.rs:1733`, `plan.rs:3815`,
-`pipeline.rs:1117`, `exec.rs:2809`.
+five call sites across three files: `plan.rs:1711`, `plan.rs:1733`, `plan.rs:3920`,
+`pipeline.rs:1151`, `exec.rs:2809`.
 
 TraceQL computes the same thing a fourth time and shares none of it:
 [`filter::collect`](../crates/pulsus-read/src/traces/filter.rs) (line 2737) walks a boolean tree
@@ -412,7 +412,7 @@ disagrees on **463**; and the model below disagrees on **0**.
 
 **What that 0 covers, stated wherever the number appears.** The comparison is the **ordered list of
 line-filter values the model would conjoin** against the ordered list a **transcription** of
-`compile_line_filters` (`crates/pulsus-read/src/logql/plan.rs:3807`) emits — not against emitted
+`compile_line_filters` (`crates/pulsus-read/src/logql/plan.rs:3912`) emits — not against emitted
 SQL, and not against a running server. So 0 means the two agree on **which filters push and in what
 order**, over that atom set at that chain length. It does **not** cover the operator each filter
 renders, the escaping, the rest of the statement, or any stage the atom set does not contain. Two
@@ -563,7 +563,7 @@ exit=101
 ```
 
 That run's `predicate` line is a line filter pushed into SQL **after** a `line_format`, which is
-exactly the rule `compile_line_filters` breaks at today (`plan.rs:3822`). Break B's panic traces to the unchanged
+exactly the rule `compile_line_filters` breaks at today (`plan.rs:3927`). Break B's panic traces to the unchanged
 provenance and nothing incidental: with `body` left `Stored`, link 3's `capability` answers `Yes`,
 so it lowers.
 
@@ -840,8 +840,8 @@ measurement.
 **One shipped instance on the core's route, and the same shape in LogQL's own compiler.**
 
 - LogQL's compiler, which is not built on the core, resolves the selector to fingerprints over
-  `log_streams_idx` (`crates/pulsus-read/src/logql/sql.rs:500`), then reads `log_streams` and
-  `log_samples` filtered on `fingerprint IN (…)` (`sql.rs:727`, `sql.rs:790`). Three statements; in
+  `log_streams_idx` (`crates/pulsus-read/src/logql/sql.rs:513`), then reads `log_streams` and
+  `log_samples` filtered on `fingerprint IN (…)` (`sql.rs:740`, `sql.rs:838`). Three statements; in
   the core's terms that is two source handoffs, but LogQL's compiler does not use `Cut`. Its seed is
   the fingerprint list, bounded by `DEFAULT_MAX_STREAMS = 100_000`
   (`crates/pulsus-read/src/logql/params.rs:121`).
@@ -972,7 +972,7 @@ core builds carries either today.
 compiler, separate from the core (owner decision, #507). Its page loop is
 `StreamsPlan::fetch_until_limit` (`crates/pulsus-read/src/logql/plan.rs:83`, set at `:1659` from
 `has_unpushed_dropping_stage`, `:1689`); when it is set the read is one statement per page through
-`stage3_keyset` (`crates/pulsus-read/src/logql/sql.rs:867`) with
+`stage3_keyset` (`crates/pulsus-read/src/logql/sql.rs:916`) with
 `scan_limit = result_limit × reader.logql_pipeline_scan_factor`. Whether a compiled LogQL filter
 lets the request's limit into the statement is decided in `plan.rs`; §2.7.7's `Fidelity` does not
 reach it. §7.1's `Limit` row reads that decision in the model's terms, as analysis.
@@ -1151,7 +1151,7 @@ on every run.
 | the request's limit, window and step | **yes** |
 | a seed's plan-time upper bound | **yes** — every one is a request parameter, a config field or a named constant |
 | a seed's rendered size against the two ceilings | **yes**, O(1), no round trip |
-| how many rows a predicate will match — its selectivity | **no.** There is no statistics catalogue, and the only two shipped ways to get a number are round-trip probes: the regular-expression matcher `count()` probe (`crates/pulsus-read/src/logql/sql.rs:537`) and the grouping cardinality pre-flight. **No rule in §2.7 may depend on selectivity**, and none does |
+| how many rows a predicate will match — its selectivity | **no.** There is no statistics catalogue, and the only two shipped ways to get a number are round-trip probes: the regular-expression matcher `count()` probe (`crates/pulsus-read/src/logql/sql.rs:550`) and the grouping cardinality pre-flight. **No rule in §2.7 may depend on selectivity**, and none does |
 | the per-row cost of a database-side expression against the cost of transporting the row | **no.** Nothing measures it. Under the cost model of §9.1 it does not matter; if that model is ever revised this is the first number needed |
 | behaviour across shards | **out of scope** by owner ruling on [#492](https://github.com/digitalis-io/pulsusdb/issues/492) |
 | behaviour at 1 TB | **no** — [#25](https://github.com/digitalis-io/pulsusdb/issues/25) |
@@ -1468,7 +1468,7 @@ nobody later reads them as unfinished work.
 
 | construct | why SQL does not have the information |
 |---|---|
-| **structural relations** `>` `>>` `<` `<<` `~` and their `!`/`&` forms | the relation holds between two spans of one trace and is evaluated over the **hydrated** span set — window-bounded and truncated at `MAX_SPANS_PER_TRACE` = 10,000 (`exec.rs:124`). The answer is a function of our own batching, so a SQL form would have to reproduce a limit that only the client-side query defines |
+| **structural relations** `>` `>>` `<` `<<` `~` and their `!`/`&` forms | the relation holds between two spans of one trace and is evaluated over the **hydrated** span set — window-bounded and truncated at `MAX_SPANS_PER_TRACE` = 10,000 (`exec.rs:125`). The answer is a function of our own batching, so a SQL form would have to reproduce a limit that only the client-side query defines |
 | **the nested-set numbering** `nestedSetLeft`, `nestedSetRight`, and `nestedSetParent` outside the root sentinel | a modified-preorder numbering computed per trace at query time from the `parent_id` forest; no stored column carries it. The root sentinel **is** expressible and is already lowered (`metrics_sql.rs:562`) |
 | **trace-level intrinsics** `traceDuration`, `rootName`, `rootServiceName`, `span:childCount` | resolved from a co-load that is deliberately trace-wide with **no time predicate**, because the true root may predate the window. A window-bounded statement cannot read those rows at all. Already refused on the metrics path for this reason (`lower_leaf`, `metrics_sql.rs:546`) |
 | **the `!` operator's whole-query type failure** | `{ !.a }` against a present non-boolean must fail the entire request, not skip the span. SQL evaluates row by row and cannot turn one row's type into a request-level refusal. The matching half is expressible, the failure half is not, and they are one leaf (`LeafEval::BoolTruth`, `filter.rs:529`) |
@@ -1585,7 +1585,7 @@ ordering, the limit or the response builder — while `Unwrap` **is** one of the
 `unwrap` field is *"retained-but-unused … the parser represents `| unwrap …` as an ordered
 `Stage::Unwrap` inside `selector.pipeline` … and always leaves this field `None`"*
 (`ast.rs:2294-2299`, `parser.rs:1298`, and the defence-in-depth comment at
-`crates/pulsus-read/src/logql/plan.rs:2313`). So `Unwrap` reaches the chain through `Pipe`, in its
+`crates/pulsus-read/src/logql/plan.rs:2407`). So `Unwrap` reaches the chain through `Pipe`, in its
 written position — which is the whole reason the parser puts it there, so post-`unwrap` label
 filters keep theirs — and a separate `Unwrap` link would be a second spelling of one construct.
 
@@ -1626,7 +1626,7 @@ alternative, so it composes in every metric position; an earlier version of this
 while the table below carried it, and the two disagreed.
 
 **The *m* links cannot be derived from `unwrap_vector_aggs`, and the sentence that said they could
-was wrong twice over.** `unwrap_vector_aggs_into` (`plan.rs:2934`) descends the spine and
+was wrong twice over.** `unwrap_vector_aggs_into` (`plan.rs:3039`) descends the spine and
 `ControlFlow::Break`s at the first non-`Vector` `MetricExpr` — `LabelReplace` included — so it
 never sees a level below one. Worse, a query carrying a `label_replace` **never produces a
 `MetricPlan` at all**: `plan_metric_expr` (`plan.rs:1122`) routes on that same base, and only a
@@ -1667,7 +1667,7 @@ maps to **`400`** with `Content-Type: text/plain; charset=utf-8` and `X-Content-
 
 **How this table is derived, because the previous one was transcribed and missed two rejections a
 user can reach today.** The enumeration is over a literal scope: **every `ReadError::` construction
-in `crates/pulsus-read/src/logql/plan.rs` above `mod tests` (`plan.rs:4287`)**, which is 25 sites at
+in `crates/pulsus-read/src/logql/plan.rs` above `mod tests` (`plan.rs:4392`)**, which is 25 sites at
 `2f78c53`, listed by `grep -n 'ReadError::[A-Z]' crates/pulsus-read/src/logql/plan.rs`. Every one of
 the 25 is either a row below or is excluded beneath the table with its reason, so completeness is a
 property of that grep and not of anyone's reading. Each row's body **and its reachability** were
@@ -1685,10 +1685,10 @@ and folded a helper with four distinct message bodies into a single row.
 | `VectorAgg` | an op that takes `k`, given none (`plan.rs:1542`) | **nothing — parser-shadowed.** `topk(count_over_time({service_name="checkout"}[5m]))` is refused by the parser: `unexpected identifier "count_over_time" at byte 5: expected the k parameter (e.g. topk(5, ...))` | `` `<op>` requires a k parameter (e.g. <op>(5, ...)) `` — unreachable |
 | `VectorAgg` | an op that takes no parameter, given one (`plan.rs:1547`) | **nothing — parser-shadowed.** `sum(3, count_over_time({service_name="checkout"}[5m]))` is refused: `unexpected ',' at byte 5: expected ')'` | `` `<op>` takes no parameter `` — unreachable |
 | `VectorAgg` | a `k` that is not a finite number (`plan.rs:1500`, from `plan.rs:1540`) | **nothing — parser-shadowed.** `topk(<320 nines>, count_over_time({service_name="checkout"}[5m]))` is refused: `invalid parameter topk(…)` | `` invalid `<op>` parameter "…" `` — unreachable |
-| `RangeAgg` | a quantile that is not a finite number (`plan.rs:1500`, from `plan.rs:2356`) | `quantile_over_time(<320 nines>, {service_name="checkout"} \| unwrap latency [5m])` | `invalid quantile parameter "999…"` |
-| `RangeAgg` | an op that requires `unwrap`, without one (`plan.rs:2338`) | `sum_over_time({service_name="checkout"}[5m])` | `invalid aggregation sum_over_time without unwrap` |
-| `RangeAgg` | an op that forbids `unwrap`, with one (`plan.rs:2343`) | `count_over_time({service_name="checkout"} \| unwrap latency [5m])` | `invalid aggregation count_over_time with unwrap` |
-| `RangeAgg` | `quantile_over_time` with no quantile (`plan.rs:2358`) | **nothing — parser-shadowed.** `quantile_over_time({service_name="checkout"} \| unwrap latency [5m])` is refused: `unexpected '{' at byte 19: expected the quantile parameter (e.g. 0.95)` | `quantile_over_time requires a quantile parameter` — unreachable |
+| `RangeAgg` | a quantile that is not a finite number (`plan.rs:1500`, from `plan.rs:2450`) | `quantile_over_time(<320 nines>, {service_name="checkout"} \| unwrap latency [5m])` | `invalid quantile parameter "999…"` |
+| `RangeAgg` | an op that requires `unwrap`, without one (`plan.rs:2432`) | `sum_over_time({service_name="checkout"}[5m])` | `invalid aggregation sum_over_time without unwrap` |
+| `RangeAgg` | an op that forbids `unwrap`, with one (`plan.rs:2437`) | `count_over_time({service_name="checkout"} \| unwrap latency [5m])` | `invalid aggregation count_over_time with unwrap` |
+| `RangeAgg` | `quantile_over_time` with no quantile (`plan.rs:2452`) | **nothing — parser-shadowed.** `quantile_over_time({service_name="checkout"} \| unwrap latency [5m])` is refused: `unexpected '{' at byte 19: expected the quantile parameter (e.g. 0.95)` | `quantile_over_time requires a quantile parameter` — unreachable |
 | `Pipe(Stage::Unwrap)` | an `unwrap` in a **log** query (`plan.rs:1650`) | `{service_name="checkout"} \| unwrap latency` | `` `unwrap` is only valid inside a range aggregation (e.g. sum_over_time({...} \| unwrap x [5m])) `` |
 | `LabelReplace` | a **scalar** operand (`plan.rs:1426`) | `label_replace(1, "d", "$1", "src", "(.*)")` · `label_replace(1 + 2, …)` · `sum(label_replace(1, …))` | `label_replace requires a vector operand, got a scalar expression` |
 | `LabelReplace` | a regex using a group flag RE2 does not have (`plan.rs:170`) | `label_replace(count_over_time({service_name="checkout"}[5m]), "d", "$1", "src", "(?x)a")` | ``invalid regex in label_replace: a `(?x`/`(?u`/`(?R` group flag RE2 does not have: `(?x)a` `` |
@@ -1696,7 +1696,7 @@ and folded a helper with four distinct message bodies into a single row.
 
 **14 rows over 13 of the 25 construction sites.** `plan.rs:1500` is a shared helper with **four**
 call sites and therefore four distinct message bodies; two of them — `plan.rs:1540` and
-`plan.rs:2356` — are reached from a chain link and get a row each, which is why 13 sites give 14
+`plan.rs:2450` — are reached from a chain link and get a row each, which is why 13 sites give 14
 rows. The helper's other two call sites, `plan.rs:1288` (`invalid scalar literal "…"`) and
 `plan.rs:1297` (`invalid vector() value "…"`), belong to `MetricExpr::Literal` and `VectorFn`,
 which the synthesised-link table marks **not in the chain**; both were confirmed reachable by the
@@ -1710,24 +1710,24 @@ deleted row would not be there to notice.
 **partitions** the 25 rather than merely covering part of them: 13 + 12 = 25, with no site in both
 lists and none in neither.
 
-- `plan.rs:1109` (`QuerySpanTooLong`), `plan.rs:1140` and `plan.rs:2278` (`InvalidStep`),
-  `plan.rs:3119`, `plan.rs:3297`, `plan.rs:3313` (`QueryTooBroad`) — **request parameters and
+- `plan.rs:1109` (`QuerySpanTooLong`), `plan.rs:1140` and `plan.rs:2372` (`InvalidStep`),
+  `plan.rs:3224`, `plan.rs:3402`, `plan.rs:3418` (`QueryTooBroad`) — **request parameters and
   resource guards, not a link payload.** They refuse the request before any chain exists.
-- `plan.rs:3356` — one `reject` closure returned from three conditions (`plan.rs:3364`,
-  `plan.rs:3373`, `plan.rs:3382`; those three are call sites, not constructions, so they are not
+- `plan.rs:3461` — one `reject` closure returned from three conditions (`plan.rs:3469`,
+  `plan.rs:3478`, `plan.rs:3487`; those three are call sites, not constructions, so they are not
   among the 25). It states the shape a `variants(…)` operand must have, and `Variants` is
   **out of scope, named** in the synthesised-link table above. Reachable, and checked:
   `variants(sum(topk(2, count_over_time({service_name="checkout"}[5m])))) of ({service_name="checkout"}[5m])`
   returns `variant 0 must be a range aggregation, optionally wrapped in one vector aggregation …`.
-- `plan.rs:3432`, `plan.rs:3437`, `plan.rs:3446` — the same three range-aggregation arity
+- `plan.rs:3537`, `plan.rs:3542`, `plan.rs:3551` — the same three range-aggregation arity
   rejections as the rows above, re-checked on the `variants(…)` path. Identical bodies, identical
   links, reached only through a construct that is not in the chain.
-- `plan.rs:3740` (`ContradictoryMatchers`) and `plan.rs:3770` (`EmptyMatcherSet`) — the
+- `plan.rs:3845` (`ContradictoryMatchers`) and `plan.rs:3875` (`EmptyMatcherSet`) — the
   **selector's** payload. `Source` "always lowers" and has no rejectable payload of its own; the
   selector is refused before a chain is built. Recorded rather than assumed:
   `{service_name="checkout", service_name="other"}` does return
   `matchers are contradictory: the selector can never match a stream`, while `{service_name=~".*"}`
-  **plans** — so `plan.rs:3770` was not reached by the obvious candidate and is excluded on the
+  **plans** — so `plan.rs:3875` was not reached by the obvious candidate and is excluded on the
   link argument, not on a demonstration.
 
 §3.1's TraceQL table was enumerated the same way in the previous round, in the source direction over
@@ -1745,10 +1745,10 @@ says so in its own doc comment; that is why `RangeAgg::param` and `VectorAgg::pa
 
 | link | accepts → produces | precondition to lower | residual state effect | disposition | continuation |
 |---|---|---|---|---|---|
-| `LineFilter(lf)` (`ast.rs:134`) | `Lines` → `Lines` | `body` provenance resolves to a SQL expression — `Stored`, or `Computed(e)` from `decolorize`/`unpack` (§5) — **and** `is_pushable_line_filter(lf)` (`plan.rs:3841`: no `ip()` alternative) | **clears `exact`**: it removes lines in the evaluator, so the SQL result is a superset | conditional | *none* |
+| `LineFilter(lf)` (`ast.rs:134`) | `Lines` → `Lines` | `body` provenance resolves to a SQL expression — `Stored`, or `Computed(e)` from `decolorize`/`unpack` (§5) — **and** `is_pushable_line_filter(lf)` (`plan.rs:3946`: no `ip()` alternative) | **clears `exact`**: it removes lines in the evaluator, so the SQL result is a superset | conditional | *none* |
 | `Parser(Json { extractions })` (`ast.rs:237`) | `Lines` → `Lines`, `cols` widened by an open source over `body` | `body`'s provenance is expressible | `cols` still widened, but with an **evaluator-only** open source whose `resolve` answers `None`, so a following `LabelFilter` goes residual instead of lowering against a name SQL cannot see. Does **not** clear `exact` | conditional | *none* |
 | `Parser(Logfmt { strict, keep_empty, extractions })` (`ast.rs:242`) | as above | as above | as above | conditional | *none* |
-| `Parser(Regexp(re))` (`ast.rs:248`) | as above, names = capture groups | as above, and the pattern expressible | as above | conditional | *none* |
+| `Parser(Regexp(re))` (`ast.rs:248`) | as above, names = capture groups | as above, and the pattern expressible | as above | conditional. **Issue #624 part 3a: the statement runs it** — `extractGroups(body, 're')` as an element of the raw reads' `rx` column, and, in a counting range query, as the group key's `matched` and captures, with the stages after it run once per group. **Whether that query lowers is the planner's decision (`regexp_count_route`), as window-grid representability is:** it turns on the reducer and on every stage after the parser, which a per-link capability does not see, so this link stays residual in the model and the model-agreement walks over log-query chains are unchanged | *none* |
 | `Parser(Pattern(p))` (`ast.rs:251`) | as above, names = `<name>` captures | as above | as above | conditional | *none* |
 | `LabelFilter(expr)` (`ast.rs:136`) | `Lines` → `Lines` | every referenced name resolves in `cols`, and the comparison is expressible | **clears `exact`** — it drops lines in the evaluator — unless every name it reads is a stream label or a structured-metadata key, which is constant across a `(fingerprint, structured_metadata)` group, so it keeps or drops whole groups and `exact` stays (#624 part 2) | conditional | *none*. **Fidelity `Wider`** over a parser-produced name (its predicate carries guard terms SQL cannot decide), **`Equivalent`** over a structured-metadata key — which, in the model, is what decides whether the `Limit` link may lower; LogQL's compiler decides its own limit (§2.7.5) |
 | `LineFormat(tpl)` (`ast.rs:140`) | `Lines` → `Lines`, `body` → `Computed` | none today: a Go text/template has no SQL form here | sets `body` provenance `Computed` with **no resolvable expression**, so every later link needing the line goes residual. Does **not** clear `exact` — it removes no lines | **must go residual** today: `No(NotYetLowered)`, not `Never` (§5) | *none* |
@@ -1796,10 +1796,10 @@ because the merge happens at range and not at instant.
 #### Three rules the model derives rather than restates
 
 - **`compile_line_filters`' `break`.** It does two things: it skips a non-pushable filter, and it
-  `break`s at `LineFormat | Decolorize | Unpack` (`plan.rs:3822`). The first is the
+  `break`s at `LineFormat | Decolorize | Unpack` (`plan.rs:3927`). The first is the
   `is_pushable_line_filter` precondition above. The second is not a special case here — it is
   `body`'s provenance turning `Computed`. The documented *exception* falls out too: a filter after a
-  **parser** still lowers, because *"parsers read but never rewrite the line"* (`plan.rs:3794`), so
+  **parser** still lowers, because *"parsers read but never rewrite the line"* (`plan.rs:3899`), so
   `body` stays `Stored`.
 - **`has_unpushed_dropping_stage` is `!exact` on a `Lines` shape.** That function
   (`plan.rs:1689`) decides `fetch_until_limit` (`plan.rs:1659`), and it returns `true` for exactly
@@ -1865,7 +1865,7 @@ LogQL's own compiler places its own caps — the scan budget and the limits in
 So the placement question is answered once, structurally. The gap needs `max_rows_to_group_by`
 with `group_by_overflow_mode = 'throw'`, mapped to the existing 422 taxonomy; the metrics path
 already carries the analogous `max_rows_in_set`/`max_bytes_in_set` pair with
-`set_overflow_mode = 'throw'` (`TRACE_METRICS_MAX_SET_ROWS`, `exec.rs:202`), so both the mechanism
+`set_overflow_mode = 'throw'` (`TRACE_METRICS_MAX_SET_ROWS`, `exec.rs:203`), so both the mechanism
 and the error class exist.
 
 This also corrects a natural misreading: `max_result_bytes` is **not** "unreachable on the lowered
@@ -2334,7 +2334,7 @@ load ≤ 1.41, is on [#478](https://github.com/digitalis-io/pulsusdb/issues/478)
 ### 9.6 The stopping rule: what the first version of this document got wrong
 
 The fold originally returned at the first refusal. Measured on **#507**'s LogQL corpus, against the
-shipped `compile_line_filters` (`crates/pulsus-read/src/logql/plan.rs:3807`) transcribed as the
+shipped `compile_line_filters` (`crates/pulsus-read/src/logql/plan.rs:3912`) transcribed as the
 oracle, over every chain of length 3 built from 15 concrete LogQL atoms parsed with our real
 parser — an equality on the **ordered** list of pushed predicates, not a count and not a
 containment:
@@ -2399,7 +2399,7 @@ beside the figures they govern rather than once here, and this list is the index
 
 | setting | value used | why it decides a figure here |
 |---|---|---|
-| `max_block_size` | **4096** | the shipped value (`exec.rs:178`). At ClickHouse's own default, 65,409, the same statement peaks at **1,068.3 MiB** instead of **228.7 MiB** — across the 512 MiB ceiling — and the same statement's `result_bytes` moves by between 0% and 48% depending on the result size (§9.5's curve). Every figure below names the block size it was taken at |
+| `max_block_size` | **4096** | the shipped value (`exec.rs:179`). At ClickHouse's own default, 65,409, the same statement peaks at **1,068.3 MiB** instead of **228.7 MiB** — across the 512 MiB ceiling — and the same statement's `result_bytes` moves by between 0% and 48% depending on the result size (§9.5's curve). Every figure below names the block size it was taken at |
 | `use_query_condition_cache` | **0**, or the cache dropped before each request | otherwise a repeat read reports an order of magnitude fewer rows (§9.5's first trap). Two routes, below |
 | `optimize_aggregation_in_order` | **1**, named on the rows that need it | it is what lets the span-ordered index stream the aggregation instead of holding a hash table over every span-group. On the current index order it buys nothing, because `(trace_id, span_id)` is not a prefix of that sorting key |
 | `max_memory_usage` | **536870912** | the shipped `reader.traceql_generator_max_memory_bytes` (`crates/pulsus-config/src/model.rs:693`), applied by `generator_settings` (`exec.rs:3299`) |
@@ -4987,11 +4987,11 @@ to be that argument as tests: the model must reproduce **each** walk, not just t
 measured. None of them exists at base.
 
 These are **lib unit tests**, because `compile_line_filters` is `pub(crate)`
-(`crates/pulsus-read/src/logql/plan.rs:3807`) and `has_unpushed_dropping_stage` (`:1689`) and
+(`crates/pulsus-read/src/logql/plan.rs:3912`) and `has_unpushed_dropping_stage` (`:1689`) and
 `metric_pipeline_construct` (`:1723`) are private — an integration test cannot call any of them.
-**They go in `plan.rs`'s existing `mod tests` (`plan.rs:4287`), and no production item is widened
+**They go in `plan.rs`'s existing `mod tests` (`plan.rs:4392`), and no production item is widened
 for them.** That module is a child of `logql::plan`, so it already reaches both private functions —
-directly, and again through its `use super::*` (`plan.rs:4544`). An earlier version of this section
+directly, and again through its `use super::*` (`plan.rs:4649`). An earlier version of this section
 offered a second option — **wave 1** writes them wherever they go — moving the gates to
 `logql::compile`'s test module with the two functions raised to `pub(super)`. That option is **withdrawn**: the widening was never needed, and a design
 that offers two placements has not decided.
@@ -5012,7 +5012,7 @@ line rewrites, parsers and `label_format` — every stage the 15-atom set does n
 
 **What these three gates will NOT establish once wave 1 has written them, because they share a
 helper — today they establish nothing, because they do not exist.** All three walks call
-`is_pushable_line_filter` (`crates/pulsus-read/src/logql/plan.rs:3841`) — `plan.rs:3815`,
+`is_pushable_line_filter` (`crates/pulsus-read/src/logql/plan.rs:3946`) — `plan.rs:3920`,
 `plan.rs:1711`, `plan.rs:1733` — and so does the model's `LineFilter::capability` (§7.1). The
 sharing is deliberate and stays: that function's doc comment calls itself *"the single source of
 truth for 'does this line filter push down to SQL, or must it run in the client pipeline?' … so the
@@ -5536,15 +5536,15 @@ The block below, tables and sentences alike, is rendered from the two citation d
 
 | quantity | at this revision |
 |---|---|
-| citation occurrences in the five artefacts | 694 |
-| of those, citing a bare basename | 503 |
+| citation occurrences in the five artefacts | 692 |
+| of those, citing a bare basename | 501 |
 | of those, written as a continuation of a citation earlier in the paragraph | 75 |
 | of those continuations, on a later line than the citation they continue | 32 |
-| `(document, token)` pairs the rule resolves | 365 |
-| occurrences those resolved pairs cover | 493 |
+| `(document, token)` pairs the rule resolves | 364 |
+| occurrences those resolved pairs cover | 491 |
 | `(document, token)` pairs it cannot resolve | 110 |
 | occurrences those frozen pairs cover | 201 |
-| resolved rows anchored on a token the citing prose prints | 176 |
+| resolved rows anchored on a token the citing prose prints | 175 |
 | resolved rows anchored on a snapshot of the cited line | 189 |
 
 | reason it cannot be resolved | pairs | what it means |
@@ -5564,7 +5564,7 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | `prose` | a token the citing prose prints, so the claim and its evidence are reviewable side by side |
 | `line` | a snapshot of the cited line, taken because the citing prose prints no such token: it detects the line moving or changing and cannot show the citation means the right thing |
 
-Of the 694 citation occurrences the five artefacts make, 503 name a bare basename and 75 are written as a continuation of a citation earlier on the same line. The rule resolves 365 `(document, token)` pairs covering 493 occurrences, and cannot resolve 110 covering 201. Of the resolved rows, 176 are anchored on a token the citing prose prints and 189 on a snapshot of the cited line.
+Of the 692 citation occurrences the five artefacts make, 501 name a bare basename and 75 are written as a continuation of a citation earlier on the same line. The rule resolves 364 `(document, token)` pairs covering 491 occurrences, and cannot resolve 110 covering 201. Of the resolved rows, 175 are anchored on a token the citing prose prints and 189 on a snapshot of the cited line.
 
 The language fallback and the anchor rule disagree on 5 citations, all of them read one at a time. 4 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
 

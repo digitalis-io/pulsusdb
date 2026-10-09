@@ -670,7 +670,7 @@ pub enum ParsedFilterRefusal {
 /// Can this label name have been produced by more than one raw key?
 ///
 /// **No, exactly when it contains no `_`.** `sanitize_label_key`
-/// (`pipeline.rs:3939-3952`) does three things and no more: it prepends
+/// (`pipeline.rs:4205-4218`) does three things and no more: it prepends
 /// `_` when the first character is an ASCII digit, keeps ASCII
 /// alphanumerics and `_`, and replaces every other character with `_`. It
 /// never deletes and never shortens. A bare `| json` additionally flattens

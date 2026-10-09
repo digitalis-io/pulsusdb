@@ -1064,9 +1064,9 @@ fn flat_json_body(k: usize) -> String {
 /// separated: 28 671 B at `K_SHAPE`). Shape (iv)'s body — logfmt is the
 /// only auto-parse format where the owned-copy delta 13(b) floors
 /// literally exists, because logfmt captures are `Cow::Borrowed` slices
-/// of the line (`pipeline.rs:2749` under the `Cow::Borrowed` arm at
+/// of the line (`pipeline.rs:3012` under the `Cow::Borrowed` arm at
 /// `:1044`), so the legacy `into_owned()` genuinely COPIES; a JSON body's
-/// captures are already `Cow::Owned` (`pipeline.rs:2622`) and
+/// captures are already `Cow::Owned` (`pipeline.rs:2858`) and
 /// `into_owned()` is a move.
 fn logfmt_body(k: usize) -> String {
     let mut s = String::with_capacity(k * 14);
@@ -1095,7 +1095,7 @@ fn push_one_static_pair(out: &mut Vec<(Cow<'static, str>, Cow<'static, str>)>) {
 /// libstd growth-rule change moves the control and the gate together
 /// instead of reddening one of them. Both `Cow`s are `Borrowed(&'static
 /// str)`, exactly as the out-of-band error pair is
-/// (`pipeline.rs:2613-2614`), so no string bytes enter the measurement.
+/// (`pipeline.rs:2849-2850`), so no string bytes enter the measurement.
 ///
 /// `Vec::new()` plus a push through a `&mut` callee is the whole point,
 /// and it is NOT interchangeable with the `vec![…]` macro that
@@ -1225,7 +1225,7 @@ fn ac13_shape_ii_json_with_wide_sm_is_not_worse_at_helper_granularity() {
 /// path). Derived before measurement, from the code:
 ///
 /// * the `| json` attempt FAILS, and a failed json parse writes the
-///   out-of-band pair (`pipeline.rs:2613-2614`,
+///   out-of-band pair (`pipeline.rs:2849-2850`,
 ///   `Cow::Borrowed("JSONParserErr")` + `Cow::Borrowed(JSON_ERROR_DETAILS)`),
 ///   which `ErrorSlots::merge_into` (`pipeline.rs:222-232`) sets into the
 ///   legacy helper's fresh `Vec::new()` (`detected.rs:431`) on the kept
@@ -1297,7 +1297,7 @@ fn ac13_shape_iii_non_parseable_body_costs_the_legacy_one_error_spine() {
 /// spine `98 304` + `pairs` copies `24 576` = `245 760` legacy-only, on
 /// top of the shared `R 28 673` + the `| logfmt` stage's copies `24 576`
 /// (the rewritten line is `Cow::Owned`, so `to_cow` copies,
-/// `pipeline.rs:1053-1059`) — so `peak_legacy = 299 009`, and
+/// `pipeline.rs:1086-1092`) — so `peak_legacy = 299 009`, and
 /// `peak_new <= 3R + 24 576 = 110 595`, giving `Δ >= 188 414 >=
 /// LEGACY_DELTA_FLOOR 98 304`.
 ///

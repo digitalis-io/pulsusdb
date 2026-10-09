@@ -4347,7 +4347,8 @@ mod tests {
             two.as_sql(),
             r"[extractGroups(body, '(?P<a>x)'), extractGroups(body, '(?P<b>[0-9]+)')]"
         );
-        let builders: Vec<(&str, Box<dyn Fn(Option<&CheckedFragment>) -> String>)> = vec![
+        type Builder<'a> = Box<dyn Fn(Option<&CheckedFragment>) -> String + 'a>;
+        let builders: Vec<(&str, Builder<'_>)> = vec![
             (
                 "stage3",
                 Box::new(|rx| {

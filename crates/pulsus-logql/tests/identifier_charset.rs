@@ -113,7 +113,7 @@ enum LiveProbe {
 ///
 /// It is unique to #392 on purpose. The oracle container is SHARED by
 /// every reference-facing CI step, and
-/// `crates/pulsus-read/tests/logql_regex_accept_matrix.rs:3347` pushes
+/// `crates/pulsus-read/tests/logql_regex_accept_matrix.rs:3411` pushes
 /// `{"app":"x","job":"pulsus_it246"}` into it. A leg probing
 /// `{app="x"} | logfmt <non-ascii>="…"` therefore returns **500**, not
 /// 200, purely by CI step order — inconclusiveness that looks exactly

@@ -11216,6 +11216,17 @@ async fn in_process_regexes_read_as_the_database() {
         "日本",
         "a_b",
     ];
+    // Three cells are out of the corpus: `\B` against a body whose only
+    // non-boundary is between two bytes of one multi-byte character. RE2
+    // matches a zero-width `\B` there (`match('a\xC2\xA0b', '\B')` is 1),
+    // and an in-process regex over text cannot match inside a character.
+    // The database's answer is the answer; docs/api.md §9.2 records the
+    // difference as a documented limit (issue #624, part 3a).
+    let outside: [(&str, &str); 3] = [
+        (r"\B", "a\u{00A0}b"),
+        (r"\B", "a\u{2028}b"),
+        (r"\B", "a\u{0085}b"),
+    ];
     let admin = ChClient::new(test_config()).await.expect("connect admin");
     let list = bodies
         .iter()
@@ -11249,6 +11260,9 @@ async fn in_process_regexes_read_as_the_database() {
         drop(stream);
         assert_eq!(rows.len(), bodies.len(), "{pattern}: one row per body");
         for (row, body) in rows.iter().zip(bodies) {
+            if outside.contains(&(pattern, body)) {
+                continue;
+            }
             let ours = re.is_match(body);
             if ours != (row.m == 1) {
                 match_diffs += 1;
@@ -11281,7 +11295,7 @@ async fn in_process_regexes_read_as_the_database() {
     }
     println!(
         "{} match cells, {match_diffs} differ; {capture_cells} capture cells, {capture_diffs} differ",
-        patterns.len() * bodies.len()
+        patterns.len() * bodies.len() - outside.len()
     );
     assert_eq!(
         (match_diffs, capture_diffs),

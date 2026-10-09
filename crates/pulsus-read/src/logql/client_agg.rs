@@ -2593,7 +2593,7 @@ impl<'q> RangeSlideState<'q> {
         // was exposed) — and it is not reachable in production, because
         // `push_rows` breaks its row loop and returns the error and every
         // caller propagates it with `?` without resuming the state
-        // (`exec.rs:1516`, `:1521`, `:1632`, `:1637`; `variants.rs:711`,
+        // (`exec.rs:1516`, `:1521`, `:1632`, `:1637`; `variants.rs:726`,
         // `:724`, `:886-897`). Both of those were checked against the tree,
         // not argued.
         //

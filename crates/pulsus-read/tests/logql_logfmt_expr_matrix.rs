@@ -92,7 +92,7 @@
 //!   parse → plan → the pipeline compile that runs before any I/O. Every
 //!   position is a `query_range`-shaped query, so the sites it actually
 //!   drives are `exec.rs:612` (streams), `:906` (metric, incl. every
-//!   binary leaf), `plan.rs`'s variant validation and `variants.rs:509`.
+//!   binary leaf), `plan.rs`'s variant validation and `variants.rs:512`.
 //!   NOT `exec.rs:2290` or `:2576` — see "unmeasured routes and
 //!   uncovered call sites" below.
 //! - [`the_pre_247_rule_disagrees_wherever_the_reference_refuses_an_expression`]
@@ -220,7 +220,7 @@ impl Layer {
 
     /// The rule PulsusDB shipped at `7980344`. `compile_parser`'s
     /// `ParserStage::Logfmt` arm cloned `e.expression` verbatim
-    /// (`pipeline.rs:2393-2404` at that SHA), so nothing in the
+    /// (`pipeline.rs:2629-2640` at that SHA), so nothing in the
     /// sub-grammar could refuse anything; and `parse_extraction_list`
     /// looped `while peek is Ident`, so a comma with nothing after it
     /// simply ended the list. Every other rejection is unchanged.
@@ -440,7 +440,7 @@ const EXPRESSIONS: &[Expression] = &[
 /// Every position is a `query_range`-shaped query, so between them they
 /// drive `exec.rs:612` (streams), `:906` (metric, each leaf of a binary
 /// plan through `run_metric_node` → `run_metric_inner`), `plan.rs`'s
-/// variant validation and `variants.rs:509`. They do NOT drive
+/// variant validation and `variants.rs:512`. They do NOT drive
 /// `exec.rs:2290` (`detected_fields`) or `:2576` (`tail`) — see the
 /// module docs' "uncovered call sites".
 ///
@@ -492,7 +492,7 @@ enum Outcome {
 enum Refusal {
     /// `CompiledPipeline::compile` on a pipeline the plan carries — the
     /// ordinary case (`exec.rs:612`, `:906`, `:2290`, `:2576`;
-    /// `variants.rs:509` for a variants common pipeline).
+    /// `variants.rs:512` for a variants common pipeline).
     PipelineCompile,
     /// Inside `plan()` itself: `build_variants_node` compiles a variant's
     /// OWN pipeline purely to validate it (issue #247 round 2), because
@@ -577,7 +577,7 @@ const POSITIONS: &[Position] = &[
         refuses_at: Refusal::PipelineCompile,
     },
     // --- `variants(...) of (...)`: the FIFTH compile site
-    //     (`variants.rs:509`), missed by the first version of this
+    //     (`variants.rs:512`), missed by the first version of this
     //     matrix. It has TWO pipeline positions and the reference gives
     //     them OPPOSITE verdicts, so both are here and neither agrees
     //     with us. See [`Outcome`] for the mechanism behind each.
@@ -852,7 +852,7 @@ fn params() -> QueryParams {
 /// reading of the plan types.
 ///
 /// The variants arm reproduces `VariantArena::build`
-/// (`variants.rs:507-512`) rather than approximating it: the common
+/// (`variants.rs:510-520`) rather than approximating it: the common
 /// pipeline is compiled alone, and each variant's tail is compiled as
 /// `common ++ tail`, because `VariantSpec::client`'s own doc says
 /// "nothing may compile `client.pipeline` on its own".
@@ -878,7 +878,7 @@ fn pulsus_verdict(query: &str) -> (Verdict, String) {
             for leaf in node.leaves() {
                 pipelines.extend(leaf.client.iter().map(|c| c.pipeline.clone()));
             }
-            // `variants.rs:509` — the fifth site, and the one the twelve
+            // `variants.rs:512` — the fifth site, and the one the twelve
             // -position enumeration missed. `leaves()` already yielded the
             // scan above; add each variant's `common ++ tail`.
             collect_variant_pipelines(node, &mut pipelines);
@@ -1196,7 +1196,7 @@ fn points_disagree_with_the_reference_only_where_the_table_says_so() {
 /// **The oracle's variants arm is tied to the code it mirrors, and the
 /// tie is falsifiable today.** [`pulsus_verdict`]'s variants arm is a
 /// hand-written reproduction of `VariantArena::build`
-/// (`variants.rs:507-540`): it compiles the common pipeline, then
+/// (`variants.rs:510-548`): it compiles the common pipeline, then
 /// `common ++ tail` per variant. The real code does the second half with
 /// `extended_with`, so there is no shared code keeping them honest. This
 /// test asks the REAL `VariantArena::build` for a verdict on each planned
@@ -1236,7 +1236,7 @@ fn points_disagree_with_the_reference_only_where_the_table_says_so() {
 ///
 /// It is deliberately not a code-sharing refactor: `extended_with` exists
 /// to avoid recompiling the common pipeline's regexes once per tail
-/// (`pipeline.rs:1155-1162`), so making the oracle call it would couple
+/// (`pipeline.rs:1212-1219`), so making the oracle call it would couple
 /// this fixture to a performance mechanism instead of to the rule.
 ///
 /// **Still relevant to #397.** When a variant gets a live pipeline of its
@@ -1343,14 +1343,14 @@ fn planned_leaves_include(node: &MetricNode, want: &[pulsus_logql::Stage]) -> bo
 /// **The compile sites are enumerated from the code that CALLS the
 /// compiler, not from a reading of the plan types.** Twelve query
 /// positions were enumerated carefully for #247 and still missed
-/// `variants.rs:509`, because that enumeration started from "where can a
+/// `variants.rs:512`, because that enumeration started from "where can a
 /// `| logfmt` sit" instead of "who compiles a pipeline".
 ///
 /// **There are TWO ways into the compiler, and both are scanned.**
 /// `CompiledPipeline::compile` is the obvious one. The other is
-/// `CompiledPipeline::extended_with` (`pipeline.rs:1163`), which appends
+/// `CompiledPipeline::extended_with` (`pipeline.rs:1220`), which appends
 /// stages to an already-compiled pipeline through the same
-/// `compile_stage` the `compile` loop uses (`pipeline.rs:1180`'s
+/// `compile_stage` the `compile` loop uses (`pipeline.rs:1237`'s
 /// `from_parts` is their shared assembly point) — so it compiles user
 /// stages without ever mentioning `compile`. That is precisely the path
 /// `VariantArena::build` takes for a variant's unwrap tail, i.e. the

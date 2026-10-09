@@ -411,7 +411,7 @@ const POSITIONS: &[Position] = &[
               there. PulsusDB validates a BARE variant's discarded prefix in \
               `VariantSpec::try_new` \
               (`plan.rs:2641`) — but through `CompiledPipeline::compile`, whose `compile_stage` \
-              returns `Ok(None)` for a PUSHABLE line filter (`pipeline.rs:986-996`) before it \
+              returns `Ok(None)` for a PUSHABLE line filter (`pipeline.rs:994-1004`) before it \
               reaches `compile_regex` at `:1013`; the regex of a pushable filter is validated on \
               the SQL-rendering path instead, and a discarded prefix renders no SQL. Hence \
               `AcceptsEverything` here, and a divergence row. The escape needs BOTH facts — \

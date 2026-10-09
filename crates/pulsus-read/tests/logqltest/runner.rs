@@ -89,7 +89,7 @@ type VectorEntry = (Labels, f64);
 /// into stage-3 SQL — because this runner executes the pipeline and no
 /// SQL, then CHECKS that nothing was elided. The check is not
 /// decoration: `CompiledPipeline::compile` returns `Ok(None)` for every
-/// pushable pre-`line_format` line filter (`pipeline.rs:1009-1014`), so
+/// pushable pre-`line_format` line filter (`pipeline.rs:1017-1022`), so
 /// a filter lost here produces no error at all — just extra lines, in a
 /// case whose expectation was captured through the same hole.
 fn compile_for_corpus(stages: &[Stage]) -> Result<CompiledPipeline, String> {
@@ -1447,7 +1447,7 @@ pub fn eval_node(
             MetricNode::Variants { scan, variants, .. } => {
                 // Issue #278: the ONE leg `compile_for_corpus` cannot
                 // reach. `VariantArena::build` compiles the COMMON
-                // pipeline itself (`variants.rs:510`) with the pushdown
+                // pipeline itself (`variants.rs:513`) with the pushdown
                 // ACTIVE — correct in production, where stage-3 SQL
                 // applies those filters, and wrong here, where nothing
                 // does. A hermetic case would silently not apply them,

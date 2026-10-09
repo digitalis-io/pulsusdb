@@ -7,7 +7,9 @@
 //! RE2 (issue #280, which made RE2 the authority on *acceptance*). The
 //! in-process paths that ROUTE THROUGH THIS MODULE — the warm label
 //! cache, `concrete_name_matches`, `info()`'s ignore-set matchers,
-//! `label_replace` on both signals — compile with the Rust
+//! `label_replace` on both signals, and — since issue #624 part 3a — the
+//! LogQL line filter and `| regexp` parser where they run in process
+//! (`pulsus-read`'s `compile_regex_as_database`) — compile with the Rust
 //! `regex` crate instead. The two grammars overlap without either
 //! containing the other, and several constructs they both accept mean
 //! different things.
@@ -33,11 +35,11 @@
 //! indicate it.
 //!
 //! NOT every in-process regex site routes through here. The callers that
-//! do are the four named above; `pulsus-read`'s LogQL pipeline compiles
-//! the user's pattern with the Rust crate and does NOT call
-//! [`re2_pattern_to_rust`], which is the open defect behind docs/api.md
-//! §9.1's "as written" rows (issue #336). Adding a caller means adding it
-//! to that list, not assuming it.
+//! do are the five named above; `pulsus-read`'s LogQL label filter and
+//! `drop`/`keep` matchers compile the user's pattern with the Rust crate
+//! and do NOT call [`re2_pattern_to_rust`], which is the open defect
+//! behind docs/api.md §9.1's "as written" rows (issue #336). Adding a
+//! caller means adding it to that list, not assuming it.
 //!
 //! The rewrite is
 //! applied **only to the Rust side**: the pattern that reaches ClickHouse
