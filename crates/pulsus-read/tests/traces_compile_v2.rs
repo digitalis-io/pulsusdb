@@ -2553,7 +2553,7 @@ fn t_c27_the_field_against_field_refusals() {
         Intrinsic::ChildCount,
     ] {
         let want = PlanError::UnsupportedField(format!(
-            "{intrinsic} as an operand is not supported by the search statement (issue #602)"
+            "{intrinsic} as an operand is not supported by the search statement (issue #594)"
         ));
         let f = Field::Intrinsic(intrinsic);
         check(

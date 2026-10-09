@@ -322,10 +322,10 @@ fn unsupported(construct: &str, target: &str) -> PlanError {
 }
 
 /// The four per-trace intrinsics as an operand (issue #594 part 1, D6):
-/// refused, so today's engine answers until #602.
+/// refused, so today's engine answers until #594 part 3.
 fn operand_refusal(intrinsic: Intrinsic) -> PlanError {
     PlanError::UnsupportedField(format!(
-        "{intrinsic} as an operand is not supported by the search statement (issue #602)"
+        "{intrinsic} as an operand is not supported by the search statement (issue #594)"
     ))
 }
 
