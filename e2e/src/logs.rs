@@ -4567,6 +4567,11 @@ mod tests {
                     pulsus_read::logql::sql::MetricValue::Shaped(_) => {
                         pulsus_read::logql::bucketed_fallback_client_agg(mp)
                     }
+                    // Issue #624, part 2: a staged plan carries the
+                    // aggregation today's route runs.
+                    pulsus_read::logql::sql::MetricValue::Staged(staged) => {
+                        staged.todays_route.clone()
+                    }
                 };
                 &fallback
             }

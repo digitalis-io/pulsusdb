@@ -219,6 +219,22 @@ pub enum MetricValue {
     /// the cost of one allocation per LOWERED plan, which is one per
     /// query and not one per row.
     Unwrapped(Box<UnwrappedValue>),
+    /// A counting reducer, or `absent_over_time`, whose pipeline holds only
+    /// stages that read labels (issue #624, part 2): part 1's statements
+    /// count the rows, and the stages run once per returned group. Carries
+    /// the column shape and the aggregation today's route runs, which the
+    /// fold and the fallbacks need.
+    Staged(Box<StagedCount>),
+}
+
+/// [`MetricValue::Staged`]'s payload (issue #624, part 2).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StagedCount {
+    /// The statement's column shape: `count()` or `sum(length(body))`.
+    pub shape: MetricShape,
+    /// The client aggregation today's route runs for this query: the full
+    /// pipeline, the reducer and `absent_over_time`'s labels.
+    pub todays_route: super::plan::ClientAgg,
 }
 
 /// [`MetricValue::Unwrapped`]'s payload: the extracted-field group key
@@ -1113,16 +1129,16 @@ pub fn metric_instant(
 /// Whether a raw metric scan projects `structured_metadata` (issue #249).
 ///
 /// The metric path merges structured metadata into the label set, so it must
-/// normally be read. [`ScanProjection::Lean`] has exactly ONE caller —
-/// `absent_over_time` — and its exemption is proved rather than assumed:
-/// `pkg/logql/syntax/extractor.go:46-47 @ v3.7.4` forces `noLabels = true`
-/// for `OpRangeTypeAbsent`, and `pkg/logql/log/labels.go:667-668` then
-/// returns `EmptyLabelsResult`, so the reducer's label set cannot depend on
-/// metadata at all. Reading the column for it would be a permanent cost on
-/// an unbounded scan with no observable effect.
+/// normally be read. [`ScanProjection::Lean`] has no caller on a read path
+/// since issue #624 part 2. Its one caller was `absent_over_time`, whose
+/// label set cannot depend on metadata (`pkg/logql/syntax/extractor.go:46-47
+/// @ v3.7.4` forces `noLabels = true` for `OpRangeTypeAbsent`); but every raw
+/// scan decodes into the one row type, which carries the column, so the
+/// lean read failed to decode wherever the selector resolved a stream. The
+/// variant stays for the builders it shapes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanProjection {
-    /// `absent_over_time` only — no `structured_metadata` column.
+    /// No `structured_metadata` column; no read path takes it.
     Lean,
     /// Every other metric reducer.
     WithStructuredMetadata,

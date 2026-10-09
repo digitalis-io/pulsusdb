@@ -910,7 +910,6 @@ fn never_wire(n: super::fold::NeverReason) -> &'static str {
         N::NestedSetNumbering => "nested_set_numbering",
         N::TraceLevelIntrinsic => "trace_level_intrinsic",
         N::WholeQueryTypeFailure => "whole_query_type_failure",
-        N::NoRowToComputeFrom => "no_row_to_compute_from",
         N::ResponseBuild => "response_build",
         N::NotASearchLink => "not_a_search_link",
     }

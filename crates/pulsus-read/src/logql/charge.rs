@@ -720,6 +720,19 @@ pub(in crate::logql) const PUSHDOWN_RANGE_DENSE_SLOT: usize =
 /// wider than the point slot [`MAX_LEAF_RETAINED_BYTES`] prices for it.
 const _: () = assert!(size_of::<Option<u64>>() as u64 <= RESULT_POINT_SLOT_BYTES[0]);
 
+/// The staged fold (issue #624, part 2) charges a label-routed series
+/// today's route's per-label-set slot, so its own map entry must fit it.
+const _: () = assert!(
+    size_of::<(String, super::exec::DenseSeries)>() <= MUT_GROUP_SLOT,
+    "a staged label-routed series must fit the slot it is charged"
+);
+
+/// And a fingerprint-routed series today's route's per-fingerprint slot.
+const _: () = assert!(
+    size_of::<(pulsus_model::Fingerprint, Vec<Option<u64>>)>() <= SERIES_OUT_SLOT,
+    "a staged fingerprint-routed series must fit the slot it is charged"
+);
+
 /// A provable UPPER BOUND on the query-lifetime heap bytes ONE distinct
 /// output group's map entry retains: the rendered-JSON key, the cloned
 /// `LabelSet` (each owned string plus the element buffer), and the entry's
@@ -2552,14 +2565,21 @@ mod tests {
             // `MetricAggState` arms and the variants path. So
             // `LEAF_COUNTERS.group_bytes` stays 2 and
             // `MAX_LEAF_RETAINED_BYTES` is unmoved.
-            ("exec.rs", "charge_group_bytes", "&mut self.charged", 4),
+            // Issue #624 part 2: x5 — the staged mode's per-fingerprint and
+            // per-label-set series, charged what today's route charges the
+            // same series. Same counter, same cap, and still an XOR arm: the
+            // staged fold is dropped before today's route runs on a refusal
+            // or a memory failure, and runs only when `value` is `Staged`.
+            ("exec.rs", "charge_group_bytes", "&mut self.charged", 6),
             // Issue #624: `PushdownRangeGroups::points`, the bucketed range
             // path's dense slots, one grid's width per series. A further XOR
             // arm of `MAX_METRIC_RESULT_POINTS`: it runs only when
             // `client == None` and `step_ns.is_some()`, where no slider and
             // no fold is live. So `LEAF_COUNTERS` and
             // `MAX_LEAF_RETAINED_BYTES` are unmoved.
-            ("exec.rs", "charge_result_points", "&mut self.points", 1),
+            // Issue #624 part 2: x4 — the staged mode's two series kinds and
+            // `absent_over_time`'s one grid at finish, under the same XOR.
+            ("exec.rs", "charge_result_points", "&mut self.points", 4),
             // Issue #507: `KeyRouteFold::charged`, the extracted-field group
             // key read's partials (x2, the new-series and new-grid-point
             // arms). A further XOR arm of the same cap: S1's fold is dropped
@@ -2706,17 +2726,21 @@ mod tests {
             // `CounterPlurality`), so the composed bound is unmoved.
             // Issue #624: the bucketed range fold reads it three times — at a
             // new dense series, and at a new sparse series and a new sparse
-            // grid point when the range equals the step.
+            // grid point when the range equals the step — and part 2's staged
+            // mode twice more, at a new per-fingerprint and a new
+            // per-label-set series.
             (
                 "exec.rs",
                 "group_bytes",
-                4,
+                6,
                 "PushdownInstantGroups::charged | PushdownRangeGroups::charged",
             ),
             // Issue #624: the bucketed range fold's dense slots, one grid's
             // width per series. XOR with the slider and the fold (see the
-            // charge census), so `LEAF_COUNTERS` is unmoved.
-            ("exec.rs", "result_points", 1, "PushdownRangeGroups::points"),
+            // charge census), so `LEAF_COUNTERS` is unmoved. Part 2's
+            // staged mode reads it three times more: its two series kinds
+            // and `absent_over_time`'s grid at finish.
+            ("exec.rs", "result_points", 4, "PushdownRangeGroups::points"),
             (
                 "unwrap_group.rs",
                 "group_bytes",

@@ -704,12 +704,12 @@ text:
   double collision above, which those three arms do not cover and which
   therefore does not lower — rather than being a reason it cannot exist. The `ORDER BY` clauses are unchanged, so
   `optimize_read_in_order` is intact.
-- **`absent_over_time` does not read the column at all.** It is the one
-  reducer whose label set is provably metadata-independent
-  (`syntax/extractor.go:46-47` forces `noLabels = true`, and
-  `labels.go:667-668` then returns `EmptyLabelsResult`), so it keeps the
-  lean projection rather than paying for a column it cannot use on an
-  unbounded scan.
+- **`absent_over_time` reads the column too.** Its label set is
+  metadata-independent (`syntax/extractor.go:46-47` forces
+  `noLabels = true`, and `labels.go:667-668` then returns
+  `EmptyLabelsResult`), but every raw scan decodes into the one row type,
+  which carries the column. It once kept a lean projection, and the read
+  then failed to decode wherever the selector resolved a stream.
 - **A mixed-shape selection loses the zero-allocation slider, and it costs
   about 2.1x.** The per-fingerprint streaming slider is kept only where a
   fingerprint's base label set is provably unreachable by merging any

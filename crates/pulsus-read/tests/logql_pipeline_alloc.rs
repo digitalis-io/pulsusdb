@@ -659,7 +659,14 @@ fn per_row_allocation_bounds_hold() {
     let Plan::Metric(mp) = plan(&expr, &params, &plan_ctx).expect("plan") else {
         panic!("expected a Metric plan");
     };
-    let client = mp.client.as_ref().expect("client-aggregated");
+    // Issue #624 part 2: a label filter over a range read is counted in the
+    // database now, with its stage run per group; this leg measures today's
+    // route's per-row path, so it drives the aggregation the plan carries
+    // for today's route.
+    let client = &mp
+        .client
+        .clone()
+        .unwrap_or_else(|| pulsus_read::logql::exec::bucketed_fallback_client_agg(&mp));
     let compiled = CompiledPipeline::compile(&client.pipeline).expect("compile");
     let window = match mp.step_ns {
         Some(step_ns) => ClientWindow::Range {

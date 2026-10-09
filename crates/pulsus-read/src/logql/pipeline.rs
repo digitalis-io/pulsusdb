@@ -10514,4 +10514,129 @@ mod tests {
         }
         assert_eq!(index.len, 5_000);
     }
+
+    /// T1 (issue #624, part 2): every pipeline `label_only_pipeline` admits
+    /// gives the same kept flag, labels and error state whatever the line
+    /// and the timestamp, over label sets with and without structured
+    /// metadata and with a metadata error slot — so running it once per
+    /// `(fingerprint, structured_metadata)` group is running it per line.
+    /// And the refused list is refused.
+    #[test]
+    fn admitted_stages_read_no_line_and_no_time() {
+        use crate::logql::labels::{StructuredMetadataCtx, merge_labels_with_structured_metadata};
+        use crate::logql::plan::label_only_pipeline;
+        use crate::logql::testkit::{ADMITTED_PIPELINES, REFUSED_PIPELINES};
+        use pulsus_logql::{Expr, MetricExpr, RangeAggOp};
+
+        fn pipeline_of(query: &str) -> Vec<Stage> {
+            match &pulsus_logql::parse(query).unwrap_or_else(|e| panic!("{query}: {e}")) {
+                Expr::Metric(MetricExpr::Range { range, .. }) => range.selector.pipeline.clone(),
+                other => panic!("{query}: expected a range aggregation, got {other:?}"),
+            }
+        }
+        let base: Vec<(String, String)> = [
+            ("a", "b"),
+            ("addr", "10.1.2.3"),
+            ("b", "2KB"),
+            ("d", "2s"),
+            ("n", "7"),
+            ("x", "1"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let bodies = ["", "x", "\u{1b}[31mred\u{1b}[0m"];
+        let times = [0i64, 1_000_000_000_000_000_000];
+        let metadata = ["", r#"{"lvl":"info"}"#, r#"{"__error__":"boom"}"#];
+
+        let mut seen: std::collections::BTreeSet<&'static str> = Default::default();
+        for case in ADMITTED_PIPELINES {
+            let query = format!(r#"count_over_time({{a="b"}} {case} [1m])"#);
+            let pipeline = pipeline_of(&query);
+            assert!(
+                label_only_pipeline(&pipeline, RangeAggOp::CountOverTime),
+                "{query}: must be admitted"
+            );
+            for stage in &pipeline {
+                seen.insert(match stage {
+                    Stage::LineFilter(_) => "line filter",
+                    Stage::LabelFilter(_) => "label filter",
+                    Stage::Drop(_) => "drop",
+                    Stage::Keep(_) => "keep",
+                    Stage::Decolorize => "decolorize",
+                    _ => "other",
+                });
+            }
+            let compiled = CompiledPipeline::compile(&pipeline).expect("compiles");
+            for sm in metadata {
+                let mut merge_buf = Vec::new();
+                let mut sm_buf = Vec::new();
+                let mut sm_ctx = StructuredMetadataCtx::default();
+                let pipeline_base: &[(String, String)] = if sm.is_empty() {
+                    &base
+                } else {
+                    merge_labels_with_structured_metadata(
+                        &base,
+                        sm,
+                        &mut merge_buf,
+                        &mut sm_buf,
+                        &mut sm_ctx,
+                    );
+                    &merge_buf
+                };
+                let mut first: Option<(bool, Vec<(String, String)>)> = None;
+                for body in bodies {
+                    for ts in times {
+                        let mut scratch = Vec::new();
+                        let run = compiled
+                            .run_metric_step_into(
+                                body,
+                                pipeline_base,
+                                ts,
+                                &sm_ctx,
+                                None,
+                                &RangeStepRules::PLAIN,
+                                &mut scratch,
+                            )
+                            .expect("within the row budget");
+                        let kept = matches!(run, MetricRun::Kept { .. });
+                        let mut labels: Vec<(String, String)> = scratch
+                            .iter()
+                            .map(|(k, v)| (k.to_string(), v.to_string()))
+                            .collect();
+                        labels.sort();
+                        let outcome = (kept, labels);
+                        match &first {
+                            None => first = Some(outcome),
+                            Some(want) => assert_eq!(
+                                &outcome, want,
+                                "{query} with metadata {sm:?}: body {body:?} at {ts}"
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+        // The admitted stage kinds, every one exercised and nothing else.
+        assert_eq!(
+            seen.into_iter().collect::<Vec<_>>(),
+            vec!["decolorize", "drop", "keep", "label filter", "line filter"],
+            "the admitted list covers exactly the admitted stage kinds"
+        );
+        for case in REFUSED_PIPELINES {
+            let query = format!(r#"count_over_time({{a="b"}} {case} [1m])"#);
+            assert!(
+                !label_only_pipeline(&pipeline_of(&query), RangeAggOp::CountOverTime),
+                "{query}: must be refused"
+            );
+        }
+        // `decolorize` rewrites the line, so a bytes reducer over it is not
+        // the database's `length(body)`.
+        let decolorized = pipeline_of(r#"bytes_over_time({a="b"} | decolorize [1m])"#);
+        assert!(!label_only_pipeline(
+            &decolorized,
+            RangeAggOp::BytesOverTime
+        ));
+        assert!(!label_only_pipeline(&decolorized, RangeAggOp::BytesRate));
+    }
 }
