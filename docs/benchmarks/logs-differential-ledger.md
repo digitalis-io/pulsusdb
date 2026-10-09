@@ -366,7 +366,7 @@ distinct (`Distinct (Preliminary DISTINCT)` in the measured plan), so the
   `/detected_fields`' per-field `cardinality`, and — landed by issue #261,
   no longer a forward reference — `/detected_labels`' per-key
   `cardinality`, `uniqExact(val) AS cardinality` in
-  `crates/pulsus-read/src/logql/sql.rs:767-778`. On the reference both come
+  `crates/pulsus-read/src/logql/sql.rs:777-788`. On the reference both come
   from the same sketch type: `newParsedFields` and `newParsedLabels` each
   build `hyperloglog.New()` (`pkg/querier/querier.go:934`, `:1035` @ `grafana/loki`
   v3.7.4 = `b318f2829f0ae2094ab3a1e90780450e9e4b03be`), and
@@ -495,7 +495,7 @@ distinct (`Distinct (Preliminary DISTINCT)` in the measured plan), so the
   at all. `N` is the number of distinct values a stream-label key has
   across the whole month partition(s) the request's window touches,
   narrowed only by the optional `query=`'s `fingerprint IN` filter
-  (`sql::detected_labels`, `crates/pulsus-read/src/logql/sql.rs:767-778`);
+  (`sql::detected_labels`, `crates/pulsus-read/src/logql/sql.rs:777-788`);
   **no request parameter bounds it** — `line_limit` and `limit` do not
   exist on this endpoint, and `start`/`end` select partitions rather
   than rows (the within-month granularity gap is issue #399). The
@@ -4266,10 +4266,10 @@ unexplained.
 
   **The escape is the PUSHDOWN, not the construct**, which the first
   version of this correction got wrong by writing "line filter" flat.
-  `VariantSpec::try_new` (`plan.rs:2641`) does compile the variant's
+  `VariantSpec::try_new` (`plan.rs:2684`) does compile the variant's
   discarded prefix, but `compile_stage` returns `Ok(None)` for a pushable
-  line filter (`pipeline.rs:1149-1154`) before it reaches `compile_regex_as_database` at
-  `:1174`; a pushable filter's regex is validated on the SQL-rendering
+  line filter (`pipeline.rs:1175-1180`) before it reaches `compile_regex_as_database` at
+  `:1200`; a pushable filter's regex is validated on the SQL-rendering
   path instead (`logql/escape.rs`'s `_checked` renderers), and a discarded
   prefix renders no SQL. Put the filter after a `line_format` and
   `seen_line_format` clears the pushdown, so the filter IS compiled and
@@ -4301,7 +4301,7 @@ unexplained.
 - **PulsusDB behaviour (the delta): a malformed query is a `400` in every
   window.** Nothing about our rejection depends on the dates asked for:
   `plan()` and `CompiledPipeline::compile` both run before any I/O
-  (`logql/exec.rs:644`, `:938`, `:2511`, `:2812`, `logql/variants.rs:512`,
+  (`logql/exec.rs:644`, `:938`, `:2511`, `:2813`, `logql/variants.rs:517`,
   propagated with `?` and surfaced by `logs_api/error.rs` as a 400), so an
   invalid pipeline cannot reach a "no chunks, return empty" path in the
   first place.
