@@ -11128,8 +11128,10 @@ fn no_tenant() -> pulsus_model::Tenant {
 /// The regex text the database receives for `pattern`, read back out of the
 /// production renderer's `rx` column.
 fn rendered_pattern_624p3(pattern: &str) -> String {
-    let column = pulsus_read::logql::predicate::regexp_captures_column(&[pattern.to_string()])
-        .unwrap_or_else(|e| panic!("{pattern}: {e}"));
+    let column = pulsus_read::logql::predicate::regexp_captures_column(&[
+        pulsus_read::logql::pipeline::RxSource::Regexp(pattern.to_string()),
+    ])
+    .unwrap_or_else(|e| panic!("{pattern}: {e}"));
     column
         .as_sql()
         .strip_prefix("[extractGroups(body, ")
@@ -12761,7 +12763,7 @@ async fn a_json_count_answers_as_todays_route() {
         limit: 100,
         direction: Direction::Backward,
     };
-    let mut comments: Vec<(String, bool)> = Vec::new();
+    let mut comments: Vec<(String, bool, bool)> = Vec::new();
     let mut nonempty = 0usize;
     for range in ["60s", "150s", "30s"] {
         let mut queries: Vec<(String, bool)> = json_lowered_queries_624p3b(sel, range)
@@ -12790,19 +12792,25 @@ async fn a_json_count_answers_as_todays_route() {
             if lowered.as_ref().is_ok_and(|a| !a.is_empty()) {
                 nonempty += 1;
             }
-            comments.push((comment, *lowers));
+            // Issue #624, part 3c (D7): a bare `sum` or an
+            // `absent_over_time` with no stage reading a label skips the
+            // `| json`; part 2's statement counts it, with no readers.
+            let no_label = *lowers
+                && (query.starts_with("sum(") || query.starts_with("absent_over_time("))
+                && !query.contains("| json |");
+            comments.push((comment, *lowers, no_label));
         }
     }
     assert!(nonempty >= 90, "the corpus answers: {nonempty}");
-    let all: Vec<String> = comments.iter().map(|(c, _)| c.clone()).collect();
+    let all: Vec<String> = comments.iter().map(|(c, _, _)| c.clone()).collect();
     let logged = logged_624(&admin, &all).await;
-    for (comment, lowers) in &comments {
+    for (comment, lowers, no_label) in &comments {
         let rows = logged
             .get(comment)
             .unwrap_or_else(|| panic!("{comment}: no statement logged"));
         let lowered = rows.iter().any(|r| {
             is_lowered_624(&r.query)
-                && r.query.contains("throwIf(decided = 0)")
+                && r.query.contains("throwIf(decided = 0)") != *no_label
                 && r.exception_code == 0
         });
         assert_eq!(lowered, *lowers, "{comment}: {rows:#?}");
@@ -13242,6 +13250,1034 @@ async fn a_decided_row_error_fails_the_lowered_json_count() {
         assert!(
             !rows.iter().any(|r| is_todays_624(&r.query)),
             "{comment}: today's route did not run: {rows:#?}"
+        );
+    }
+    drop_db_624(&admin, &db).await;
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct PatternCellRow624p3c {
+    id: u32,
+    pm: Vec<String>,
+}
+
+/// The rows of a statement returning `(id, pm)` (issue #624, part 3c).
+async fn read_pattern_cells_624p3c(admin: &ChClient, sql: String) -> Vec<PatternCellRow624p3c> {
+    let mut stream = admin
+        .query_stream::<PatternCellRow624p3c>(&sql.replace('?', "??"), &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    let mut out: Vec<PatternCellRow624p3c> = Vec::new();
+    while let Some(row) = stream.next().await {
+        out.push(row.unwrap_or_else(|e| panic!("{e}\n{sql}")));
+    }
+    out
+}
+
+/// The patterns and lines of T4's sweep (issue #624, part 3c).
+const PATTERNS_624P3C: [&str; 27] = [
+    "foo <foo> bar",
+    "foo <foo> bar<fuzz>",
+    "<foo>foo <bar> bar",
+    "<foo> bar<fuzz>",
+    "<foo>bar<baz>",
+    "<foo> bar<baz>",
+    "<foo>bar <baz>",
+    "<foo>",
+    "<path>?<_>",
+    r#"<ip> <userid> <user> [<_>] "<method> <path> <_>" <status> <size>"#,
+    "<_> <a>",
+    "<a> <_>",
+    "<_> <a> <_>",
+    "x<a>",
+    "<a>x",
+    "x<a>x",
+    "<a> <b> <c>",
+    "<a>,<b>",
+    "[<a>]",
+    "<a>\n<b>",
+    "é<a>ü<b>",
+    "<a> <b>",
+    "<_>:<a>:<b>",
+    "level=<lvl> msg=<msg>",
+    "<a>  <b>",
+    "aa<a>aa",
+    "<a>aa<b>",
+];
+const LINES_624P3C: [&str; 40] = [
+    "foo buzz bar",
+    " bar",
+    " bar ",
+    "foo buzz bar bar",
+    "",
+    "x",
+    "xx",
+    "xyx",
+    "a b c",
+    "a b",
+    "a",
+    " ",
+    "  ",
+    "a,b,c",
+    ",",
+    "[x]",
+    "[x",
+    "x]",
+    "a\nb",
+    "a\nb\nc",
+    "éxüy",
+    "éüü",
+    "level=info msg=hi there",
+    "level=info",
+    "msg=x level=y",
+    "/api/plugins/versioncheck?slugIn=a&b=c",
+    "/api/plugins/status",
+    r#"127.0.0.1 - frank [10/Oct/2000:13:55:36 -0700] "GET /apache_pb.gif HTTP/1.0" 200 2326"#,
+    "127.0.0.1 - frank [10/Oct/2000",
+    "aaaa",
+    "aaa",
+    "aa",
+    "aaaaa",
+    "a  b",
+    "a   b",
+    ":x:y",
+    "x:y",
+    "::",
+    "foofoo bar",
+    "foo  bar",
+];
+
+/// **T4 (issue #624, part 3c, D2): the database's pattern captures are the
+/// reference's.** (a) The reference's own 23 matcher fixtures, each line as
+/// `body`: the statement's expression returns the fixture's captures. (b)
+/// 27 patterns × 40 lines in one table: the expression equals the in-process
+/// matcher (which T3 holds to the same fixtures) on all 1,080 cells.
+#[tokio::test]
+async fn the_database_pattern_matches_the_reference_and_the_walk() {
+    skip_unless_live!();
+    let (admin, db) = fresh_db_624(pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_p3ct4_{}",
+        uuid::Uuid::new_v4().simple()
+    )))
+    .await;
+    // (a)
+    let fixtures: Vec<(String, String, Vec<String>)> =
+        include_str!("fixtures/pattern_matcher/reference_fixtures.tsv")
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+            .map(|l| {
+                let cols: Vec<&str> = l.split('\t').collect();
+                (
+                    serde_json::from_str(cols[0]).expect("pattern"),
+                    serde_json::from_str(cols[1]).expect("line"),
+                    serde_json::from_str(cols[2]).expect("captures"),
+                )
+            })
+            .collect();
+    assert_eq!(fixtures.len(), 23);
+    for (pattern, line, want) in &fixtures {
+        let expr = pulsus_read::logql::predicate::pattern_captures(pattern).expect("renders");
+        let sql = format!(
+            "SELECT toUInt32(0) AS id, {} AS pm FROM (SELECT {} AS body)",
+            expr.as_sql(),
+            pulsus_read::logql::predicate::literal(line).as_sql()
+        );
+        let rows = read_pattern_cells_624p3c(&admin, sql).await;
+        assert_eq!(rows[0].pm, *want, "{pattern:?} over {line:?}");
+    }
+    // (b)
+    let table = format!("{db}.p3c_sweep");
+    exec_624(
+        &admin,
+        &format!("CREATE TABLE {table} (id UInt32, body String) ENGINE = MergeTree ORDER BY id"),
+    )
+    .await;
+    let values = LINES_624P3C
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            format!(
+                "({i}, {})",
+                pulsus_read::logql::predicate::literal(b).as_sql()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    exec_624(
+        &admin,
+        &format!("INSERT INTO {table} VALUES {values}").replace('?', "??"),
+    )
+    .await;
+    let mut cells = 0usize;
+    let mut differing: Vec<String> = Vec::new();
+    for pattern in PATTERNS_624P3C {
+        let expr = pulsus_read::logql::predicate::pattern_captures(pattern).expect("renders");
+        let rows = read_pattern_cells_624p3c(
+            &admin,
+            format!(
+                "SELECT id, {} AS pm FROM {table} ORDER BY id",
+                expr.as_sql()
+            ),
+        )
+        .await;
+        for row in rows {
+            let line = LINES_624P3C[row.id as usize];
+            let want = pulsus_read::logql::pipeline::pattern_matches_in_process(pattern, line)
+                .expect("a valid pattern");
+            cells += 1;
+            if row.pm != want {
+                differing.push(format!(
+                    "{pattern:?} over {line:?}: {:?} against {want:?}",
+                    row.pm
+                ));
+            }
+        }
+    }
+    assert_eq!(cells, 1_080);
+    assert!(differing.is_empty(), "{differing:#?}");
+    drop_db_624(&admin, &db).await;
+}
+
+/// Issue #624, part 3c: syslog-shaped lines under `c624p3c` — some fit
+/// `<_> <proc>[<pid>]: <msg>`, some only a prefix of it, some not at all.
+/// Stream 912 carries the stream label `proc`, which the capture collides
+/// with; one line carries metadata `pid`.
+async fn seed_pattern_corpus_624p3c() -> (ChClient, String, i64) {
+    let (admin, db) = fresh_db_624(pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_p3c_{}",
+        uuid::Uuid::new_v4().simple()
+    )))
+    .await;
+    let t = ((now_ns() - 3_600_000_000_000) / 60_000_000_000) * 60_000_000_000;
+    let svc = "c624p3c";
+    for (fp, labels) in [
+        (911u64, r#"{"app":"a","service_name":"c624p3c"}"#),
+        (
+            912,
+            r#"{"app":"a","proc":"stream","service_name":"c624p3c"}"#,
+        ),
+        (913, r#"{"app":"b","service_name":"c624p3c"}"#),
+    ] {
+        land_stream_624(&admin, &db, t, fp, svc, labels).await;
+    }
+    let sec = 1_000_000_000i64;
+    for (fp, at, body, sm) in [
+        (911u64, 10i64, "host-1 sshd[42]: session opened café", ""),
+        (911, 20, "host-1 sshd[43]: closed", ""),
+        (911, 70, "host-1 cron[7", ""),
+        (911, 80, "host-1 kernel: audit", ""),
+        (911, 130, "orphan", ""),
+        (911, 200, "host-2 systemd[1]: Started Ελληνικά", ""),
+        (912, 15, "host-1 sshd[44]: ok", ""),
+        (912, 75, "host-3 dockerd[9]: x", r#"{"pid":"meta"}"#),
+        (912, 140, "host-3 dockerd", ""),
+        (913, 25, "host-4 \u{1b}[31mcron\u{1b}[0m[8]: done", ""),
+        (913, 85, "host-4 polkitd[3]: auth", ""),
+        (913, 210, " [5]: odd", ""),
+        (911, 45, "host-1 sshd[45]: again", ""),
+        (912, 105, "host-1 sshd[46", ""),
+        (913, 235, "host-4 cron[9]: ", ""),
+    ] {
+        land_line_624(&admin, &db, fp, svc, t + at * sec, body, sm).await;
+    }
+    (admin, db, t)
+}
+
+/// T5's lowered queries over `sel` at `range`.
+fn pattern_lowered_queries_624p3c(sel: &str, range: &str) -> Vec<String> {
+    let parser = r#"| pattern "<_> <proc>[<pid>]: <msg>""#;
+    let mut inner: Vec<String> = Vec::new();
+    for op in [
+        "count_over_time",
+        "rate",
+        "bytes_over_time",
+        "bytes_rate",
+        "absent_over_time",
+    ] {
+        for after in [r#"| proc != """#, r#"| pid=~"4.*""#, "| drop msg", ""] {
+            inner.push(format!("{op}({sel} {parser} {after} [{range}])"));
+        }
+    }
+    for op in ["count_over_time", "rate"] {
+        inner.push(format!("{op}({sel} {parser} | decolorize [{range}])"));
+    }
+    for pattern in ["<a> <b>", "<_> <a>[<_>", "host-<n> <_>", "<a>"] {
+        inner.push(format!(
+            r#"count_over_time({sel} | pattern "{pattern}" [{range}])"#
+        ));
+    }
+    let mut out: Vec<String> = Vec::new();
+    for q in &inner {
+        out.push(format!("sum by (proc) ({q})"));
+        out.push(format!("topk(10, sum by (proc, pid) ({q}))"));
+        out.push(format!("count by (proc) ({q})"));
+        out.push(q.clone());
+    }
+    out
+}
+
+/// **T5 (issue #624, part 3c): a `pattern` count answers what today's route
+/// answers, bit for bit**, for every query T1's shapes lower over a corpus of
+/// lines that fit the pattern, a prefix of it, or none of it, at a range
+/// equal to, above and below the step; the query log holds the lowered
+/// statement with `arrayFold`.
+#[tokio::test]
+async fn a_pattern_count_answers_as_todays_route() {
+    skip_unless_live!();
+    let (admin, db, t) = seed_pattern_corpus_624p3c().await;
+    let sel = r#"{service_name="c624p3c"}"#;
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t + 240_000_000_000,
+            step_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let mut comments: Vec<(String, bool)> = Vec::new();
+    let mut nonempty = 0usize;
+    let mut total = 0usize;
+    for range in ["60s", "150s", "30s"] {
+        for query in pattern_lowered_queries_624p3c(sel, range) {
+            let comment = format!("c624p3ct5-{}", uuid::Uuid::new_v4().simple());
+            let lowered = run_624(
+                &db,
+                hooks_624(false, None, None),
+                Some(&comment),
+                &query,
+                &params,
+            )
+            .await;
+            let todays = run_624(&db, hooks_624(true, None, None), None, &query, &params).await;
+            same_outcome_624(&query, &lowered, &todays);
+            total += 1;
+            if lowered.as_ref().is_ok_and(|a| !a.is_empty()) {
+                nonempty += 1;
+            }
+            // D7: `absent_over_time` with no stage reading a capture needs
+            // no labels; its statement runs no pattern.
+            let no_label = query.contains("absent_over_time")
+                && !query.contains("| proc != ")
+                && !query.contains("| pid=~");
+            comments.push((comment, no_label));
+        }
+    }
+    assert_eq!(total, 3 * 4 * (5 * 4 + 2 + 4));
+    assert!(nonempty >= 250, "the corpus answers: {nonempty} of {total}");
+    let all: Vec<String> = comments.iter().map(|(c, _)| c.clone()).collect();
+    let logged = logged_624(&admin, &all).await;
+    for (comment, no_label) in &comments {
+        let rows = logged
+            .get(comment)
+            .unwrap_or_else(|| panic!("{comment}: no statement logged"));
+        assert!(
+            rows.iter().any(|r| is_lowered_624(&r.query)
+                && r.query.contains("arrayFold") != *no_label
+                && r.exception_code == 0),
+            "{comment}: the lowered statement ran: {rows:#?}"
+        );
+    }
+    drop_db_624(&admin, &db).await;
+}
+
+/// **T6 (issue #624, part 3c, F1 and D6): a line that fits part of a
+/// pattern sets the captures before the missing literal, on every route.**
+/// Stream `{s="pc"}`, lines `p q r` and `x`; `| pattern "<a> <b>"`: the
+/// reference sets `a="p", b="q r"` and, from `x`, `a="x"`. Asserted on a log
+/// query, a tail page, a log query after `line_format "z{{__line__}}"` (in
+/// process, over the rewritten line: `zp`, `zx`), a
+/// lowered count and today's route, an instant count and a `variants` tail;
+/// the database routes' statements hold `arrayFold`.
+#[tokio::test]
+async fn a_partial_pattern_line_sets_its_prefix_on_every_route() {
+    skip_unless_live!();
+    let (admin, db) = fresh_db_624(pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_p3ct6_{}",
+        uuid::Uuid::new_v4().simple()
+    )))
+    .await;
+    let t = ((now_ns() - 3_600_000_000_000) / 60_000_000_000) * 60_000_000_000;
+    let sec = 1_000_000_000i64;
+    land_stream_624(
+        &admin,
+        &db,
+        t,
+        931,
+        "c624pc",
+        r#"{"s":"pc","service_name":"c624pc"}"#,
+    )
+    .await;
+    land_line_624(&admin, &db, 931, "c624pc", t + 10 * sec, "p q r", "").await;
+    land_line_624(&admin, &db, 931, "c624pc", t + 20 * sec, "x", "").await;
+    let want = vec!["p".to_string(), "x".to_string()];
+    let logs = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t + 60 * sec,
+            step_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let engine_with = |comment: &str| {
+        let comment = comment.to_string();
+        let db = db.clone();
+        async move {
+            LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024))
+                .with_query_log_comment(comment)
+        }
+    };
+    let mut database_routes: Vec<(String, &str)> = Vec::new();
+    for (query, database, want, want_b) in [
+        (r#"{s="pc"} | pattern "<a> <b>""#, true, want.clone(), "q r"),
+        (
+            r#"{s="pc"} | line_format "z{{__line__}}" | pattern "<a> <b>""#,
+            false,
+            vec!["zp".to_string(), "zx".to_string()],
+            "q r",
+        ),
+    ] {
+        let comment = format!("c624p3ct6-{}", uuid::Uuid::new_v4().simple());
+        let (result, _) = engine_with(&comment)
+            .await
+            .query(&parse(query).expect("parse"), &logs)
+            .await
+            .unwrap_or_else(|e| panic!("{query}: {e}"));
+        let QueryResult::Streams { items, .. } = result else {
+            panic!("{query}: streams");
+        };
+        assert_eq!(label_values_624p3(&items, "a"), want, "{query}");
+        assert_eq!(
+            label_values_624p3(&items, "b"),
+            vec![want_b.to_string()],
+            "{query}"
+        );
+        if database {
+            database_routes.push((comment, "the log query"));
+        }
+    }
+    {
+        let comment = format!("c624p3ct6-{}", uuid::Uuid::new_v4().simple());
+        let engine = engine_with(&comment).await;
+        let mut setup = engine
+            .tail_setup(
+                &parse(r#"{s="pc"} | pattern "<a> <b>""#).expect("parse"),
+                &logs,
+            )
+            .expect("a tail setup");
+        let page = engine
+            .tail_poll(
+                &mut setup,
+                pulsus_read::logql::exec::TailLower::Start { start_ns: t },
+                t + 60 * sec,
+                100,
+            )
+            .await
+            .expect("a tail page");
+        assert_eq!(
+            label_values_624p3(&page.streams, "a"),
+            want,
+            "the tail page"
+        );
+        database_routes.push((comment, "the tail page"));
+    }
+    let range = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t + 60 * sec,
+            end_ns: t + 60 * sec,
+            step_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let count = r#"sum by (a) (count_over_time({s="pc"} | pattern "<a> <b>" [1m]))"#;
+    for todays in [false, true] {
+        let comment = format!("c624p3ct6-{}", uuid::Uuid::new_v4().simple());
+        let got = run_624(
+            &db,
+            hooks_624(todays, None, None),
+            Some(&comment),
+            count,
+            &range,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{count}: {e}"));
+        let mut a: Vec<String> = got
+            .iter()
+            .filter_map(|(l, _)| l.iter().find(|(k, _)| k == "a").map(|(_, v)| v.clone()))
+            .collect();
+        a.sort();
+        assert_eq!(a, want, "{count}, today's route {todays}");
+        database_routes.push((
+            comment,
+            if todays {
+                "today's route"
+            } else {
+                "the lowered count"
+            },
+        ));
+    }
+    for query in [
+        count.to_string(),
+        r#"variants(sum by (a) (count_over_time({s="pc"} | pattern "<a> <b>" [1m]))) of ({s="pc"} [1m])"#
+            .to_string(),
+    ] {
+        let comment = format!("c624p3ct6-{}", uuid::Uuid::new_v4().simple());
+        let instant = QueryParams {
+            spec: QuerySpec::Instant { at_ns: t + 60 * sec },
+            limit: 100,
+            direction: Direction::Backward,
+        };
+        let (result, _) = engine_with(&comment)
+            .await
+            .query(&parse(&query).expect("parse"), &instant)
+            .await
+            .unwrap_or_else(|e| panic!("{query}: {e}"));
+        let QueryResult::Vector(samples) = result else {
+            panic!("{query}: an instant query answers a vector");
+        };
+        let mut a: Vec<String> = samples
+            .iter()
+            .filter_map(|s| s.labels.iter().find(|(k, _)| k == "a").map(|(_, v)| v.clone()))
+            .collect();
+        a.sort();
+        assert_eq!(a, want, "{query}: instant");
+        database_routes.push((comment, "an instant query"));
+    }
+    let comments: Vec<String> = database_routes.iter().map(|(c, _)| c.clone()).collect();
+    let logged = logged_624(&admin, &comments).await;
+    for (comment, route) in &database_routes {
+        let rows = logged
+            .get(comment)
+            .unwrap_or_else(|| panic!("{route}: no statement logged"));
+        assert!(
+            rows.iter().any(|r| r.query.contains("arrayFold")),
+            "{route}: the database ran the pattern: {rows:#?}"
+        );
+    }
+    drop_db_624(&admin, &db).await;
+}
+
+/// **T7 (issue #624, part 3c): a `pattern` count out of memory answers on
+/// today's route.** The lowered statement under a one-byte ceiling fails
+/// with code 241; today's read follows under the same comment, and the
+/// answer is today's.
+#[tokio::test]
+async fn a_pattern_count_out_of_memory_answers_on_todays_route() {
+    skip_unless_live!();
+    let (admin, db, t) = seed_pattern_corpus_624p3c().await;
+    let query = r#"sum by (proc) (count_over_time({service_name="c624p3c"} | pattern "<_> <proc>[<pid>]: <msg>" [150s]))"#;
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t + 240_000_000_000,
+            step_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let comment = format!("c624p3ct7-{}", uuid::Uuid::new_v4().simple());
+    let lowered = run_624(
+        &db,
+        hooks_624(false, None, Some(1)),
+        Some(&comment),
+        query,
+        &params,
+    )
+    .await;
+    let todays = run_624(&db, hooks_624(true, None, None), None, query, &params).await;
+    same_outcome_624(query, &lowered, &todays);
+    let logged = logged_624(&admin, std::slice::from_ref(&comment)).await;
+    let rows = &logged[&comment];
+    let oom = rows
+        .iter()
+        .position(|r| is_lowered_624(&r.query) && r.exception_code == 241);
+    let todays_at = rows.iter().position(|r| is_todays_624(&r.query));
+    assert!(
+        matches!((oom, todays_at), (Some(a), Some(b)) if a < b),
+        "the lowered statement ran out of memory, then today's read ran: {rows:#?}"
+    );
+    drop_db_624(&admin, &db).await;
+}
+
+/// **T9 (issue #624, part 3c, D4 and the no-label hints): `absent_over_time`
+/// extracts no pattern capture unless a later stage reads one.** Stream
+/// `{s="x"}`, lines at `t+10s` `boom`, `t+20s` `hit x`, `t+70s` `miss y`,
+/// `t+190s` `hit z`; range `t`..`t+240s`, step 60 s. (A) `| pattern
+/// "<__error__>"`, read by no stage: the reference's parser extracts
+/// nothing, so no line carries `__error__` and the answer is 1 where no line
+/// lies, at `t` and `t+180s`; the lowered statement runs no pattern. (B)
+/// `| pattern "<a> <_>" | a="hit"`: 1 where no `hit` line lies, at `t`,
+/// `t+120s` and `t+180s`. On the lowered statement, on today's route
+/// (`todays_route_only` and a one-byte ceiling), and instant at `t+120s` and
+/// `t+180s`.
+#[tokio::test]
+async fn an_absent_pattern_count_extracts_only_what_a_stage_reads() {
+    skip_unless_live!();
+    let (admin, db) = fresh_db_624(pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_p3ct9_{}",
+        uuid::Uuid::new_v4().simple()
+    )))
+    .await;
+    let t = ((now_ns() - 3_600_000_000_000) / 60_000_000_000) * 60_000_000_000;
+    let sec = 1_000_000_000i64;
+    land_stream_624(
+        &admin,
+        &db,
+        t,
+        941,
+        "c624ab",
+        r#"{"s":"x","service_name":"c624ab"}"#,
+    )
+    .await;
+    for (at, body) in [
+        (10i64, "boom"),
+        (20, "hit x"),
+        (70, "miss y"),
+        (190, "hit z"),
+    ] {
+        land_line_624(&admin, &db, 941, "c624ab", t + at * sec, body, "").await;
+    }
+    let range = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t + 240 * sec,
+            step_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let one = 1.0f64.to_bits();
+    let labels = vec![("s".to_string(), "x".to_string())];
+    let cases: [(&str, &[i64], &str); 2] = [
+        (
+            r#"absent_over_time({s="x"} | pattern "<__error__>" [1m])"#,
+            &[0, 180],
+            "",
+        ),
+        (
+            r#"absent_over_time({s="x"} | pattern "<a> <_>" | a="hit" [1m])"#,
+            &[0, 120, 180],
+            "arraySlice([g[1]]",
+        ),
+    ];
+    let mut comments: Vec<(String, &str)> = Vec::new();
+    for (query, absent_at, caps) in cases {
+        let want: Vec<AnswerSeries> = vec![(
+            labels.clone(),
+            absent_at.iter().map(|s| (t + s * sec, one)).collect(),
+        )];
+        for hooks in [
+            hooks_624(false, None, None),
+            hooks_624(true, None, None),
+            hooks_624(false, None, Some(1)),
+        ] {
+            let comment = format!("c624p3ct9-{}", uuid::Uuid::new_v4().simple());
+            let got = run_624(&db, hooks, Some(&comment), query, &range)
+                .await
+                .unwrap_or_else(|e| panic!("{query} ({hooks:?}): {e}"));
+            assert_eq!(got, want, "{query} ({hooks:?})");
+            if hooks == hooks_624(false, None, None) {
+                comments.push((comment, caps));
+            }
+        }
+        for at in [120i64, 180] {
+            let engine =
+                LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+            let instant = QueryParams {
+                spec: QuerySpec::Instant {
+                    at_ns: t + at * sec,
+                },
+                limit: 100,
+                direction: Direction::Backward,
+            };
+            let (result, _) = engine
+                .query(&parse(query).expect("parse"), &instant)
+                .await
+                .unwrap_or_else(|e| panic!("{query} instant at +{at}s: {e}"));
+            let QueryResult::Vector(samples) = result else {
+                panic!("{query}: a vector");
+            };
+            let got: Vec<f64> = samples.iter().map(|s| s.value).collect();
+            let want: Vec<f64> = if absent_at.contains(&at) {
+                vec![1.0]
+            } else {
+                vec![]
+            };
+            assert_eq!(got, want, "{query} instant at +{at}s");
+        }
+    }
+    let all: Vec<String> = comments.iter().map(|(c, _)| c.clone()).collect();
+    let logged = logged_624(&admin, &all).await;
+    for (comment, caps) in &comments {
+        let rows = logged
+            .get(comment)
+            .unwrap_or_else(|| panic!("{comment}: no statement logged"));
+        // (A) needs no labels: part 2's statement, no pattern run at all.
+        let ok = if caps.is_empty() {
+            rows.iter().any(|r| is_lowered_624(&r.query))
+                && !rows.iter().any(|r| r.query.contains("arrayFold"))
+        } else {
+            rows.iter()
+                .any(|r| is_lowered_624(&r.query) && r.query.contains(caps))
+        };
+        assert!(
+            ok,
+            "{comment}: the lowered statement for `{caps}`: {rows:#?}"
+        );
+    }
+    drop_db_624(&admin, &db).await;
+}
+
+/// **T10 (issue #624, part 3c, D7): a query that needs no labels skips
+/// `json`, `logfmt`, `unpack` and `pattern`, as the reference does; one that
+/// needs a label runs them.** One service per parser form, each with a line
+/// the parser reads and one it fails on (for `pattern`, one that fits only
+/// part of it). The cells are the product of three constant tables, and the
+/// count is asserted: parser form × need (`sum(bytes_over_time(…))` needs
+/// no labels: the two stored lines' bytes, so no parse, no rewrite and no
+/// extraction in the database; `sum by (a) (bytes_over_time(…))` needs `a`:
+/// the parser's error, or for `pattern` one series per captured `a`) ×
+/// route (lowered, `todays_route_only`, a one-byte ceiling, instant, a
+/// `variants(...)` of it). A lowered no-label cell's statements all end
+/// without an exception; a `pattern` cell runs `arrayFold` in the database
+/// exactly when it needs a label.
+#[tokio::test]
+async fn a_query_that_needs_no_labels_skips_the_parsers() {
+    skip_unless_live!();
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Route10 {
+        Lowered,
+        TodaysOnly,
+        Memory,
+        Instant,
+        Variants,
+    }
+    // (service, stage, line it reads, line it fails on, what `sum by (a)` gives)
+    const PARSERS: [(&str, &str, &str, &str, &str); 6] = [
+        (
+            "t10j",
+            "| json",
+            r#"{"a":"x","_entry":"hi"}"#,
+            "not json",
+            "JSONParserErr",
+        ),
+        (
+            "t10e",
+            r#"| json a="a""#,
+            r#"{"a":"x","_entry":"hi"}"#,
+            "not json",
+            "JSONParserErr",
+        ),
+        (
+            "t10l",
+            "| logfmt --strict",
+            "a=x",
+            r#"a="open"#,
+            "LogfmtParserErr",
+        ),
+        (
+            "t10m",
+            r#"| logfmt --strict a="a""#,
+            "a=x",
+            r#"a="open"#,
+            "LogfmtParserErr",
+        ),
+        (
+            "t10u",
+            "| unpack",
+            r#"{"a":"x","_entry":"hi"}"#,
+            "not json",
+            "JSONParserErr",
+        ),
+        (
+            "t10p",
+            r#"| pattern "<a> <_>""#,
+            "x y",
+            "z",
+            r#"a="x":3,a="z":1"#,
+        ),
+    ];
+    const NEEDS: [bool; 2] = [false, true];
+    const ROUTES: [Route10; 5] = [
+        Route10::Lowered,
+        Route10::TodaysOnly,
+        Route10::Memory,
+        Route10::Instant,
+        Route10::Variants,
+    ];
+    let (admin, db) = fresh_db_624(pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_p3ct10_{}",
+        uuid::Uuid::new_v4().simple()
+    )))
+    .await;
+    let t = ((now_ns() - 3_600_000_000_000) / 60_000_000_000) * 60_000_000_000;
+    let sec = 1_000_000_000i64;
+    for (i, (svc, _, good, bad, _)) in PARSERS.iter().enumerate() {
+        let fp = 960 + i as u64;
+        land_stream_624(
+            &admin,
+            &db,
+            t,
+            fp,
+            svc,
+            &format!(r#"{{"s":"{svc}","service_name":"{svc}"}}"#),
+        )
+        .await;
+        land_line_624(&admin, &db, fp, svc, t + 10 * sec, good, "").await;
+        land_line_624(&admin, &db, fp, svc, t + 20 * sec, bad, "").await;
+    }
+    let range = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t + 60 * sec,
+            end_ns: t + 60 * sec,
+            step_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let instant = QueryParams {
+        spec: QuerySpec::Instant {
+            at_ns: t + 60 * sec,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let mut cells = 0usize;
+    let mut wrong: Vec<String> = Vec::new();
+    let mut lowered_no_label: Vec<String> = Vec::new();
+    let mut pattern_cells: Vec<(String, bool, String)> = Vec::new();
+    for (svc, parser, good, bad, needed) in PARSERS {
+        let bytes = (good.len() + bad.len()) as f64;
+        for needs in NEEDS {
+            for route in ROUTES {
+                cells += 1;
+                let inner = format!(r#"bytes_over_time({{s="{svc}"}} {parser} [1m])"#);
+                let metric = if needs {
+                    format!("sum by (a) ({inner})")
+                } else {
+                    format!("sum({inner})")
+                };
+                let query = match route {
+                    Route10::Variants => format!(r#"variants({metric}) of ({{s="{svc}"}} [1m])"#),
+                    _ => metric,
+                };
+                let comment = format!("c624p3ct10-{}", uuid::Uuid::new_v4().simple());
+                let hooks = match route {
+                    Route10::TodaysOnly => hooks_624(true, None, None),
+                    Route10::Memory => hooks_624(false, None, Some(1)),
+                    _ => hooks_624(false, None, None),
+                };
+                let mut engine =
+                    LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024))
+                        .with_key_route_test_hooks(hooks);
+                engine = engine.with_query_log_comment(comment.clone());
+                let params = if route == Route10::Instant {
+                    &instant
+                } else {
+                    &range
+                };
+                let got = engine.query(&parse(&query).expect("parse"), params).await;
+                // The answer as `a="<value>":total` per series, or
+                // `a=<absent>:total` where the series has no `a`, sorted.
+                let series_of = |labels: Vec<(String, String)>, value: f64| -> String {
+                    match labels.iter().find(|(k, _)| k == "a") {
+                        Some((_, v)) => format!("a={v:?}:{value}"),
+                        None => format!("a=<absent>:{value}"),
+                    }
+                };
+                let answer: Result<Vec<String>, String> = match &got {
+                    Ok((QueryResult::Matrix(series), _)) => Ok(series
+                        .iter()
+                        .map(|s| series_of(s.labels.clone(), s.points.iter().map(|p| p.1).sum()))
+                        .collect()),
+                    Ok((QueryResult::Vector(samples), _)) => Ok(samples
+                        .iter()
+                        .map(|s| series_of(s.labels.clone(), s.value))
+                        .collect()),
+                    Ok(_) => Err("another result".to_string()),
+                    Err(ReadError::MetricPipelineError { error_type, .. }) => {
+                        Err(error_type.clone())
+                    }
+                    Err(e) => Err(e.to_string()),
+                };
+                let ok = match (answer.clone(), needs) {
+                    (Ok(series), false) => series == vec![format!("a=<absent>:{bytes}")],
+                    (Ok(mut series), true) => {
+                        series.sort();
+                        series.join(",") == needed
+                    }
+                    (Err(e), true) => e == needed,
+                    (Err(_), false) => false,
+                };
+                if !ok {
+                    wrong.push(format!("{query} ({route:?}): {answer:?}"));
+                }
+                if !needs && route == Route10::Lowered {
+                    lowered_no_label.push(comment.clone());
+                }
+                if svc == "t10p" {
+                    pattern_cells.push((comment, needs, format!("{query} ({route:?})")));
+                }
+            }
+        }
+    }
+    assert_eq!(cells, PARSERS.len() * NEEDS.len() * ROUTES.len());
+    assert!(
+        wrong.is_empty(),
+        "{} of {cells} cells:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+    let mut all = lowered_no_label.clone();
+    all.extend(pattern_cells.iter().map(|(c, _, _)| c.clone()));
+    let logged = logged_624(&admin, &all).await;
+    for comment in &lowered_no_label {
+        let rows = logged
+            .get(comment)
+            .unwrap_or_else(|| panic!("{comment}: no statement logged"));
+        assert!(
+            rows.iter().any(|r| is_lowered_624(&r.query))
+                && rows.iter().all(|r| r.exception_code == 0),
+            "{comment}: the lowered statement answered, with no fallback: {rows:#?}"
+        );
+    }
+    for (comment, needs, what) in &pattern_cells {
+        let rows = logged
+            .get(comment)
+            .unwrap_or_else(|| panic!("{what}: no statement logged"));
+        assert_eq!(
+            rows.iter().any(|r| r.query.contains("arrayFold")),
+            *needs,
+            "{what}: the database runs the pattern exactly when a label is needed: {rows:#?}"
+        );
+    }
+
+    // (R) A `regexp` reading after a skipped `pattern`: the pattern's empty
+    // element keeps the regexp's position, element 2. The query needs no
+    // labels, the regexp still extracts (the reference's has no early
+    // return), and its `__error__` group fails the query. It does not lower
+    // (two parsers), so every route reads the raw rows.
+    land_stream_624(
+        &admin,
+        &db,
+        t,
+        970,
+        "t10r",
+        r#"{"s":"t10r","service_name":"t10r"}"#,
+    )
+    .await;
+    land_line_624(&admin, &db, 970, "t10r", t + 10 * sec, "bad x", "").await;
+    land_line_624(&admin, &db, 970, "t10r", t + 20 * sec, "ok y", "").await;
+    const R_ROUTES: [Route10; 4] = [
+        Route10::Lowered,
+        Route10::TodaysOnly,
+        Route10::Memory,
+        Route10::Instant,
+    ];
+    let r_query =
+        r#"absent_over_time({s="t10r"} | pattern "<p> <_>" | regexp "(?P<__error__>bad)" [1m])"#;
+    let r_column =
+        r#"[CAST([], 'Array(String)'), extractGroups(body, '(?P<__error__>bad)')] AS rx"#;
+    let mut r_comments: Vec<(String, Route10)> = Vec::new();
+    for route in R_ROUTES {
+        let comment = format!("c624p3ct10r-{}", uuid::Uuid::new_v4().simple());
+        let hooks = match route {
+            Route10::TodaysOnly => hooks_624(true, None, None),
+            Route10::Memory => hooks_624(false, None, Some(1)),
+            _ => hooks_624(false, None, None),
+        };
+        let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024))
+            .with_key_route_test_hooks(hooks)
+            .with_query_log_comment(comment.clone());
+        let params = if route == Route10::Instant {
+            &instant
+        } else {
+            &range
+        };
+        let got = engine.query(&parse(r_query).expect("parse"), params).await;
+        assert!(
+            matches!(&got, Err(ReadError::MetricPipelineError { error_type, .. }) if error_type == "bad"),
+            "{r_query} ({route:?}): {:?}",
+            got.map(|r| r.0)
+        );
+        r_comments.push((comment, route));
+    }
+    let comments: Vec<String> = r_comments.iter().map(|(c, _)| c.clone()).collect();
+    let logged = logged_624(&admin, &comments).await;
+    for (comment, route) in &r_comments {
+        let rows = logged
+            .get(comment)
+            .unwrap_or_else(|| panic!("{route:?}: no statement logged"));
+        assert!(
+            rows.iter().any(|r| r.query.contains(r_column)),
+            "{route:?}: the raw read's rx column is `{r_column}`: {rows:#?}"
+        );
+    }
+
+    // (V) A `variants(...)` set sharing one `pattern` between a label-free
+    // operand and a `by (a)` operand: the element is needed by one reader,
+    // so it is sent ("every variant" that reads it must need no labels).
+    land_stream_624(
+        &admin,
+        &db,
+        t,
+        971,
+        "t10v",
+        r#"{"s":"t10v","service_name":"t10v"}"#,
+    )
+    .await;
+    land_line_624(&admin, &db, 971, "t10v", t + 10 * sec, "x y", "").await;
+    land_line_624(&admin, &db, 971, "t10v", t + 20 * sec, "z", "").await;
+    let v_query = r#"variants(sum(bytes_over_time({s="t10v"} | pattern "<a> <_>" [1m])), sum by (a) (bytes_over_time({s="t10v"} | pattern "<a> <_>" [1m]))) of ({s="t10v"} [1m])"#;
+    for params in [&range, &instant] {
+        let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+        let (result, _) = engine
+            .query(&parse(v_query).expect("parse"), params)
+            .await
+            .unwrap_or_else(|e| panic!("{v_query}: {e}"));
+        let mut got: Vec<String> = match result {
+            QueryResult::Matrix(series) => series
+                .iter()
+                .map(|s| (s.labels.clone(), s.points.iter().map(|p| p.1).sum::<f64>()))
+                .map(|(l, v)| {
+                    let get = |k: &str| {
+                        l.iter()
+                            .find(|(n, _)| n == k)
+                            .map(|(_, x)| format!("{x:?}"))
+                    };
+                    format!(
+                        "{}/{}:{v}",
+                        get("__variant__").unwrap_or_default(),
+                        get("a").unwrap_or_else(|| "<absent>".to_string())
+                    )
+                })
+                .collect(),
+            QueryResult::Vector(samples) => samples
+                .iter()
+                .map(|s| {
+                    let get = |k: &str| {
+                        s.labels
+                            .iter()
+                            .find(|(n, _)| n == k)
+                            .map(|(_, x)| format!("{x:?}"))
+                    };
+                    format!(
+                        "{}/{}:{}",
+                        get("__variant__").unwrap_or_default(),
+                        get("a").unwrap_or_else(|| "<absent>".to_string()),
+                        s.value
+                    )
+                })
+                .collect(),
+            other => panic!("{v_query}: {other:?}"),
+        };
+        got.sort();
+        assert_eq!(
+            got,
+            [r#""0"/<absent>:4"#, r#""1"/"x":3"#, r#""1"/"z":1"#],
+            "{v_query}"
         );
     }
     drop_db_624(&admin, &db).await;

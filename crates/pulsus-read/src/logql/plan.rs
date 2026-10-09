@@ -1812,16 +1812,28 @@ pub(in crate::logql) fn regexp_count_route(
     let at = pipeline
         .iter()
         .position(|s| !matches!(s, Stage::LineFilter(lf) if is_pushable_line_filter(lf)))?;
-    let Stage::Parser(ParserStage::Regexp(pattern)) = &pipeline[at] else {
-        return None;
+    let (pattern, parser) = match &pipeline[at] {
+        Stage::Parser(ParserStage::Regexp(p)) => (p, sql::CaptureParser::Regexp),
+        _ => return None,
     };
     let after = &pipeline[at + 1..];
     if !label_only_pipeline(after, op) {
         return None;
     }
-    // The statement runs the pattern as a pushed `|~` would render it.
-    super::predicate::regexp_group_columns(pattern, &[]).ok()?;
-    let re = super::pipeline::compile_regex_as_database(pattern).ok()?;
+    // The capture names, in order, each with its 1-based index in the
+    // statement's `g`.
+    let names: Vec<(String, usize)> = match parser {
+        sql::CaptureParser::Regexp => {
+            // The statement runs the pattern as a pushed `|~` would render it.
+            super::predicate::regexp_group_columns(pattern, &[]).ok()?;
+            let re = super::pipeline::compile_regex_as_database(pattern).ok()?;
+            re.capture_names()
+                .enumerate()
+                .filter_map(|(index, name)| Some((name?.to_string(), index)))
+                .collect()
+        }
+        sql::CaptureParser::Pattern => return None,
+    };
 
     // D4: the labels the answer can read.
     let grouping = parent_sum_grouping(op, false, vector_aggs);
@@ -1854,24 +1866,22 @@ pub(in crate::logql) fn regexp_count_route(
         };
         kept || read.contains(&name)
     };
-    let groups: Vec<(String, usize)> = re
-        .capture_names()
-        .enumerate()
-        .filter_map(|(index, name)| {
-            let name = name?;
+    let groups: Vec<(String, usize)> = names
+        .into_iter()
+        .filter(|(name, _)| {
             let sanitised = if super::pipeline::key_needs_sanitizing(name) {
                 super::pipeline::sanitize_label_key(name)
             } else {
-                name.to_string()
+                name.clone()
             };
             let extracted = format!("{sanitised}_extracted");
-            (answer_reads(&sanitised) || answer_reads(&extracted))
-                .then(|| (name.to_string(), index))
+            answer_reads(&sanitised) || answer_reads(&extracted)
         })
         .collect();
     Some(sql::RegexpCount {
         pattern: pattern.clone(),
         groups,
+        parser,
     })
 }
 
@@ -2312,6 +2322,7 @@ pub(in crate::logql) fn range_step_rules(
             active,
             requires_error: active && names_required(ERROR_LABEL),
             requires_preserve: active && names_required(PRESERVE_ERROR_LABEL),
+            no_labels: false,
         },
     }
 }
@@ -2938,6 +2949,13 @@ fn metric_plan(
             chosen: RouteChoice::Raw,
             reason: if staged && json.is_some() {
                 "raw: range aggregation in the database, json key labels and label stages over its rows (issue #624)"
+                    .to_string()
+            } else if staged
+                && regexp
+                    .as_ref()
+                    .is_some_and(|r| r.parser == sql::CaptureParser::Pattern)
+            {
+                "raw: range aggregation in the database, pattern captures and label stages over its rows (issue #624)"
                     .to_string()
             } else if staged && regexp.is_some() {
                 "raw: range aggregation in the database, regexp captures and label stages over its rows (issue #624)"
@@ -4628,6 +4646,11 @@ mod tests {
             active,
             requires_error,
             requires_preserve,
+            no_labels: false,
+        };
+        let no_labels = ParserHints {
+            no_labels: true,
+            ..ParserHints::default()
         };
         let cases = [
             (
@@ -4638,7 +4661,7 @@ mod tests {
             (
                 r#"sum(count_over_time({a="b"} | json [5m]))"#,
                 p(false, false, false),
-                h(false, false, false),
+                no_labels,
             ),
             (
                 r#"sum without (__error__) (count_over_time({a="b"} | json [5m]))"#,
@@ -6735,6 +6758,16 @@ mod tests {
                 );
                 continue;
             }
+            // Issue #624, part 3c: a `pattern` count likewise.
+            if query.contains("| pattern ") {
+                assert!(mp.client.is_none(), "{query}");
+                assert_eq!(
+                    mp.routing.reason,
+                    "raw: range aggregation in the database, pattern captures and label stages over its rows (issue #624)",
+                    "{query}"
+                );
+                continue;
+            }
             let client = mp
                 .client
                 .as_ref()
@@ -8748,6 +8781,153 @@ mod tests {
         }
     }
 
+    /// The routing reason of a count whose parsers the no-label hints make
+    /// do nothing (issue #624, part 3c, D7): part 2's.
+    const NO_LABEL_STAGED: &str =
+        "raw: range aggregation in the database, label stages over its rows (issue #624)";
+
+    /// The routing reason of a lowered `pattern` count (issue #624, part 3c).
+    const PATTERN_STAGED: &str = "raw: range aggregation in the database, pattern captures and label stages over its rows (issue #624)";
+
+    /// **T1 (issue #624, part 3c): a `pattern` counting chain lowers** at a
+    /// range equal to, above and below the step, under the parents and after
+    /// the stages part 3a lowers a `regexp` under; the rest stays.
+    #[test]
+    fn a_pattern_counting_chain_lowers() {
+        const MIN: u64 = 60_000_000_000;
+        let parser = r#"| pattern "<_> <proc>[<pid>]: <_>""#;
+        for range in ["1m", "5m", "30s"] {
+            let spec = QuerySpec::Range {
+                start_ns: 600_000_000_000,
+                end_ns: 1_200_000_000_000,
+                step_ns: MIN,
+            };
+            let sel = r#"{a="b"}"#;
+            let mut inner: Vec<String> = Vec::new();
+            for op in [
+                "count_over_time",
+                "rate",
+                "bytes_over_time",
+                "bytes_rate",
+                "absent_over_time",
+            ] {
+                for after in [r#"| proc != """#, r#"| proc=~"s.*""#, "| drop proc", ""] {
+                    inner.push(format!("{op}({sel} {parser} {after} [{range}])"));
+                }
+            }
+            for op in ["count_over_time", "rate"] {
+                inner.push(format!("{op}({sel} {parser} | decolorize [{range}])"));
+            }
+            for pattern in ["<a>", "x<a>", "<a>x", "<a> <_> <b>", "[<a>] <b>"] {
+                inner.push(format!(
+                    r#"count_over_time({sel} | pattern "{pattern}" [{range}])"#
+                ));
+            }
+            inner.push(format!(
+                r#"count_over_time({sel} |= "x" {parser} [{range}])"#
+            ));
+            let mut lowered: Vec<String> = Vec::new();
+            for q in &inner {
+                lowered.push(format!("sum by (proc) ({q})"));
+                lowered.push(format!("topk(10, sum by (proc) ({q}))"));
+                lowered.push(format!("count by (proc) ({q})"));
+                lowered.push(q.clone());
+            }
+            for query in &lowered {
+                let mp = metric_mp(query, spec).unwrap_or_else(|e| panic!("{query}: {e}"));
+                assert!(mp.client.is_none(), "{query} at [{range}]: must lower");
+                // D7: `absent_over_time` with no stage reading a capture
+                // needs no labels, and its `pattern` does nothing.
+                if query.contains("absent_over_time")
+                    && !query.contains("| proc != ")
+                    && !query.contains("| proc=~")
+                {
+                    assert_eq!(mp.routing.reason, NO_LABEL_STAGED, "{query} at [{range}]");
+                    continue;
+                }
+                match &mp.value {
+                    sql::MetricValue::Staged(s) => assert!(
+                        s.regexp
+                            .as_ref()
+                            .is_some_and(|r| r.parser == sql::CaptureParser::Pattern),
+                        "{query} at [{range}]: the statement runs the pattern"
+                    ),
+                    other => panic!("{query} at [{range}]: a staged value, got {other:?}"),
+                }
+                assert_eq!(mp.routing.reason, PATTERN_STAGED, "{query} at [{range}]");
+            }
+            for query in [
+                format!("bytes_over_time({sel} {parser} | decolorize [{range}])"),
+                format!("bytes_rate({sel} {parser} | decolorize [{range}])"),
+                format!("count_over_time({sel} | decolorize {parser} [{range}])"),
+                format!(r#"count_over_time({sel} | line_format "x" {parser} [{range}])"#),
+                format!("count_over_time({sel} | label_format a=b {parser} [{range}])"),
+                format!(r#"count_over_time({sel} {parser} | line_format "x" [{range}])"#),
+                format!("count_over_time({sel} {parser} | label_format a=b [{range}])"),
+                format!(r#"count_over_time({sel} {parser} | pattern "<q> <_>" [{range}])"#),
+                format!(r#"count_over_time({sel} {parser} | regexp "(?P<q>[0-9])" [{range}])"#),
+                format!("count_over_time({sel} {parser} | json [{range}])"),
+                format!("sum_over_time({sel} {parser} | unwrap pid [{range}])"),
+            ] {
+                let mp = metric_mp(&query, spec).unwrap_or_else(|e| panic!("{query}: {e}"));
+                assert!(mp.client.is_some(), "{query} at [{range}]: today's route");
+            }
+        }
+    }
+
+    /// **T2 (issue #624, part 3c): the captures sent follow the parent
+    /// `sum`**, as part 3a's D4: `(name, ordinal among the named captures)`.
+    #[test]
+    fn the_pattern_capture_list_follows_the_parent_sum() {
+        let spec = QuerySpec::Range {
+            start_ns: 600_000_000_000,
+            end_ns: 1_200_000_000_000,
+            step_ns: 60_000_000_000,
+        };
+        let groups = |query: &str| -> Vec<(String, usize)> {
+            match metric_mp(query, spec)
+                .unwrap_or_else(|e| panic!("{query}: {e}"))
+                .value
+            {
+                sql::MetricValue::Staged(s) => s.regexp.expect("a pattern count").groups,
+                other => panic!("{query}: {other:?}"),
+            }
+        };
+        let g = |v: &[(&str, usize)]| -> Vec<(String, usize)> {
+            v.iter().map(|(n, i)| (n.to_string(), *i)).collect()
+        };
+        let p = r#"{x="y"} | pattern "<a> <_> <b>""#;
+        assert_eq!(
+            groups(&format!("sum by (a) (count_over_time({p} [1m]))")),
+            g(&[("a", 1)])
+        );
+        assert_eq!(
+            groups(&format!("sum by (b) (count_over_time({p} [1m]))")),
+            g(&[("b", 2)])
+        );
+        assert_eq!(
+            groups(&format!(
+                r#"sum by (a) (count_over_time({p} | b != "" [1m]))"#
+            )),
+            g(&[("a", 1), ("b", 2)])
+        );
+        assert_eq!(
+            groups(&format!("count by (a) (count_over_time({p} [1m]))")),
+            g(&[("a", 1), ("b", 2)])
+        );
+        assert_eq!(
+            groups(&format!("count_over_time({p} [1m])")),
+            g(&[("a", 1), ("b", 2)])
+        );
+        assert_eq!(
+            groups(&format!("sum by (a_extracted) (count_over_time({p} [1m]))")),
+            g(&[("a", 1)])
+        );
+        // D7: a bare `sum` needs no labels; the `pattern` does nothing.
+        let bare = metric_mp(&format!("sum(count_over_time({p} [1m]))"), spec).expect("plans");
+        assert_eq!(bare.routing.reason, NO_LABEL_STAGED);
+    }
+
     const JSON_STAGED: &str = "raw: range aggregation in the database, json key labels and label stages over its rows (issue #624)";
 
     /// **T1 (issue #624, part 3b): a `| json` counting chain lowers**, bare
@@ -8795,9 +8975,20 @@ mod tests {
                 format!(r#"absent_over_time({sel} | json lvl="level" [{range}])"#),
                 &["lvl"],
             ));
+            lowered.push((format!("absent_over_time({sel} | json [{range}])"), &[]));
             for (query, keys) in &lowered {
                 let mp = metric_mp(query, spec).unwrap_or_else(|e| panic!("{query}: {e}"));
                 assert!(mp.client.is_none(), "{query} at [{range}]: must lower");
+                // Issue #624, part 3c (D7): a query that needs no labels
+                // skips its `| json`; part 2's statement counts it.
+                if query.starts_with("sum(") || query.starts_with("absent_over_time(") {
+                    match &mp.value {
+                        sql::MetricValue::Staged(s) => assert!(s.json.is_none(), "{query}"),
+                        other => panic!("{query}: a staged value, got {other:?}"),
+                    }
+                    assert_eq!(mp.routing.reason, NO_LABEL_STAGED, "{query} at [{range}]");
+                    continue;
+                }
                 match &mp.value {
                     sql::MetricValue::Staged(s) => {
                         let j = s
@@ -8819,7 +9010,6 @@ mod tests {
                 format!("count_over_time({sel} | json [{range}])"),
                 format!("count by (level) (count_over_time({sel} | json [{range}]))"),
                 format!("sum without (level) (count_over_time({sel} | json [{range}]))"),
-                format!("absent_over_time({sel} | json [{range}])"),
                 format!("sum by (level_extracted) (count_over_time({sel} | json [{range}]))"),
                 format!(
                     r#"sum by (level) (count_over_time({sel} | json | __error__="" [{range}]))"#

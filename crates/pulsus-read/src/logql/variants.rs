@@ -466,7 +466,7 @@ pub struct VariantArena {
     charged: u64,
     /// The `regexp` patterns the database runs for every pipeline here
     /// (issue #624, part 3a): the statement's `rx` column, in this order.
-    rx: Vec<String>,
+    rx: Vec<super::pipeline::RxSource>,
 }
 
 impl VariantArena {
@@ -563,7 +563,7 @@ impl VariantArena {
 
     /// The `regexp` patterns the one statement runs for every pipeline of
     /// the arena (issue #624, part 3a, D6).
-    pub fn rx_patterns(&self) -> &[String] {
+    pub fn rx_patterns(&self) -> &[super::pipeline::RxSource] {
         &self.rx
     }
 
