@@ -1077,6 +1077,7 @@ impl Store {
                     timestamp_ns: *ts,
                     body: body.clone(),
                     structured_metadata: sm.clone(),
+                    rx: Vec::new(),
                 });
             }
             self.streams.push(StoredStream {

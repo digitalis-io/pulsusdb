@@ -1482,6 +1482,7 @@ mod tests {
                 timestamp_ns: (i as i64 + 1) * 100 * 1_000_000,
                 body: format!("id={i}"),
                 structured_metadata: String::new(),
+                rx: Vec::new(),
             })
             .collect()
     }
@@ -1728,5 +1729,62 @@ mod tests {
             QueryResult::Vector(items) => assert!(items.is_empty(), "every variant was removed"),
             other => panic!("expected an empty vector, got {other:?}"),
         }
+    }
+
+    /// **T17 (b) (issue #624, part 3a, D6): a variant whose tail's `regexp`
+    /// the database runs reads the row's `rx` column**; a variant that
+    /// rewrites the line first runs its own regex over the rewritten line,
+    /// reading as the database does (D7).
+    #[test]
+    fn supplied_captures_are_used_not_recomputed() {
+        let query = r#"variants(sum by (w) (count_over_time({s="u"} | regexp "(?P<w>\\w+)" [1m])), sum by (v) (count_over_time({s="u"} | line_format "z{{__line__}}" | regexp "(?P<v>\\w+)" [1m]))) of ({s="u"} [1m])"#;
+        let (scan, variants, _) = variants_fixture(
+            query,
+            QuerySpec::Range {
+                start_ns: 60 * VSEC,
+                end_ns: 60 * VSEC,
+                step_ns: 60 * VSEC as u64,
+            },
+        );
+        let common = scan.client.expect("client scan").pipeline;
+        let rows = vec![MetricScanRow {
+            fingerprint: Fingerprint::from_raw(1),
+            timestamp_ns: 30 * VSEC,
+            body: "café 12".to_string(),
+            structured_metadata: String::new(),
+            rx: vec![vec!["SUPPLIED".to_string()]],
+        }];
+        let mut meta = HashMap::new();
+        meta.insert(
+            Fingerprint::from_raw(1),
+            StreamMetaRow {
+                fingerprint: Fingerprint::from_raw(1),
+                service: "u".to_string(),
+                labels: r#"{"s":"u"}"#.to_string(),
+            },
+        );
+        let mut warnings = Warnings::new();
+        let out =
+            run_variants_rows(&rows, &meta, &common, &variants, &mut warnings).expect("answers");
+        let QueryResult::Matrix(series) = out else {
+            panic!("a matrix: {out:?}");
+        };
+        let mut labels: Vec<Vec<(String, String)>> = series
+            .into_iter()
+            .map(|s| {
+                let mut l = s.labels;
+                l.sort();
+                l
+            })
+            .collect();
+        labels.sort();
+        let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
+        assert_eq!(
+            labels,
+            vec![
+                vec![pair(VARIANT_LABEL, "0"), pair("w", "SUPPLIED")],
+                vec![pair(VARIANT_LABEL, "1"), pair("v", "zcaf")],
+            ]
+        );
     }
 }

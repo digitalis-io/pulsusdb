@@ -463,6 +463,21 @@ pub fn clickhouse_match_head_rewrite(pattern: &str) -> Option<String> {
     Some(build_head_rewrite(&cs, &leaking))
 }
 
+/// Whether a pushed `|~` line filter must keep the body's n-gram index out
+/// of its `match()` (issue #624, part 3a): the pattern has a group —
+/// capturing, non-capturing or flag-scoped `(?flags:…)` — holding an
+/// alternation at any depth, where case-insensitivity is on at the group's
+/// opening or is switched on by a flag anywhere inside it.
+///
+/// The `ngrambf_v1` index on `body` drops granules that `match()` accepts
+/// for such a pattern: `match(s, '(?i)(denied|refused)')` counts 0 over a
+/// row `audit DENIED open` with the index and 1 without it. Decided on our
+/// own parse of the pattern; a pattern that does not parse is not flagged,
+/// because it never reaches the database.
+pub fn case_folded_alternation_in_group(_pattern: &str) -> bool {
+    false
+}
+
 /// One scan: every valid flag head, split into the affected (no-`i`)
 /// list and an any-`i`-head flag. Shared by the strategy and the
 /// measurement seam so the two can never disagree about what a head is.

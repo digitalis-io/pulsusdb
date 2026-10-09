@@ -11110,3 +11110,1180 @@ async fn shape_a_sends_no_id_list() {
 fn no_tenant() -> pulsus_model::Tenant {
     pulsus_model::Tenant::from_header(None, false).expect("no header is the empty tenant")
 }
+
+// ---------------------------------------------------------------------
+// Issue #624, part 3a: counting after a `regexp` parser, in the database;
+// every LogQL regex reads as the database reads it.
+// ---------------------------------------------------------------------
+
+/// The regex text the database receives for `pattern`, read back out of the
+/// production renderer's `rx` column.
+fn rendered_pattern_624p3(pattern: &str) -> String {
+    let column = pulsus_read::logql::predicate::regexp_captures_column(&[pattern.to_string()])
+        .unwrap_or_else(|e| panic!("{pattern}: {e}"));
+    column
+        .as_sql()
+        .strip_prefix("[extractGroups(body, ")
+        .and_then(|s| s.strip_suffix(")]"))
+        .unwrap_or_else(|| panic!("{pattern}: {}", column.as_sql()))
+        .to_string()
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct RegexProbeRow624p3 {
+    i: u64,
+    m: u8,
+    g: Vec<String>,
+}
+
+/// **T4 (issue #624, part 3a, D7): a regex that runs in PulsusDB reads as
+/// the database reads it.** For every pattern and body of §2.2's corpus —
+/// Perl classes, boundaries, `.`, case folding with `K`, `ſ`, `σ`, `straße`;
+/// bodies with `é`, `٣`, U+00A0, U+2028, U+000B, U+0085, `\n`, `\r\n` —
+/// `compile_regex_as_database(p)` agrees with ClickHouse's `match()` on
+/// whether it matches and with `extractGroups` on what it captures, over the
+/// literal the read path renders.
+#[tokio::test]
+async fn in_process_regexes_read_as_the_database() {
+    skip_unless_live!();
+    let patterns: [&str; 34] = [
+        r"\w",
+        r"\W",
+        r"\d",
+        r"\D",
+        r"\s",
+        r"\S",
+        r"\b\w+\b",
+        r"\B",
+        r"^\w+$",
+        r".",
+        r"^.$",
+        r"a.b",
+        r"^.*$",
+        r"(?i)k",
+        r"(?i)K",
+        r"(?i)s",
+        r"(?i)ſ",
+        r"(?i)σ",
+        r"(?i)Σ",
+        r"(?i)straße",
+        r"(?i)STRASSE",
+        r"[\w]",
+        r"[^\w]",
+        r"[\d.]",
+        r"[\s]",
+        r"\pL",
+        r"[[:alpha:]]",
+        r"(?P<w>\w+)",
+        r"(?P<d>\d+)",
+        r"(?P<x>.+)",
+        r"(?P<s>\S+)\s(?P<t>\S+)",
+        r"x\b",
+        r"(?m)^b",
+        r"(?s).",
+    ];
+    let bodies: [&str; 32] = [
+        "",
+        "a",
+        "é",
+        "café",
+        "٣",
+        "12",
+        "x y",
+        "a\u{00A0}b",
+        "a\u{2028}b",
+        "a\u{000B}b",
+        "a\u{0085}b",
+        "a\nb",
+        "a\r\nb",
+        "\n",
+        "K",
+        "k",
+        "\u{212A}",
+        "ſ",
+        "s",
+        "S",
+        "σ",
+        "Σ",
+        "ς",
+        "straße",
+        "STRASSE",
+        "Straße",
+        "\u{1E9E}",
+        "x",
+        "xé",
+        "éx",
+        "日本",
+        "a_b",
+    ];
+    let admin = ChClient::new(test_config()).await.expect("connect admin");
+    let list = bodies
+        .iter()
+        .map(|b| literal(b).as_sql().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let (mut match_diffs, mut capture_diffs, mut capture_cells) = (0usize, 0usize, 0usize);
+    let mut shown: Vec<String> = Vec::new();
+    for pattern in patterns {
+        let re = pulsus_read::logql::pipeline::compile_regex_as_database(pattern)
+            .unwrap_or_else(|e| panic!("{pattern}: {e}"));
+        let groups = re.captures_len() > 1;
+        let lit = rendered_pattern_624p3(pattern);
+        let g = if groups {
+            format!("extractGroups(bs[i], {lit})")
+        } else {
+            "CAST([], 'Array(String)')".to_string()
+        };
+        let sql = format!(
+            "SELECT toUInt64(i) AS i, toUInt8(match(bs[i], {lit})) AS m, {g} AS g \
+             FROM (SELECT [{list}] AS bs) ARRAY JOIN arrayEnumerate(bs) AS i ORDER BY i"
+        );
+        let mut stream = admin
+            .query_stream::<RegexProbeRow624p3>(&sql.replace('?', "??"), &QuerySettings::new())
+            .await
+            .unwrap_or_else(|e| panic!("{pattern}: {e}\n{sql}"));
+        let mut rows = Vec::new();
+        while let Some(row) = stream.next().await {
+            rows.push(row.unwrap_or_else(|e| panic!("{pattern}: {e}")));
+        }
+        drop(stream);
+        assert_eq!(rows.len(), bodies.len(), "{pattern}: one row per body");
+        for (row, body) in rows.iter().zip(bodies) {
+            let ours = re.is_match(body);
+            if ours != (row.m == 1) {
+                match_diffs += 1;
+                if shown.len() < 40 {
+                    shown.push(format!(
+                        "match {pattern:?} {body:?}: ours {ours}, database {}",
+                        row.m
+                    ));
+                }
+            }
+            if groups {
+                capture_cells += 1;
+                let caps: Vec<String> = match re.captures(body) {
+                    Some(c) => (1..re.captures_len())
+                        .map(|k| c.get(k).map_or(String::new(), |m| m.as_str().to_string()))
+                        .collect(),
+                    None => Vec::new(),
+                };
+                if caps != row.g {
+                    capture_diffs += 1;
+                    if shown.len() < 40 {
+                        shown.push(format!(
+                            "captures {pattern:?} {body:?}: ours {caps:?}, database {:?}",
+                            row.g
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    println!(
+        "{} match cells, {match_diffs} differ; {capture_cells} capture cells, {capture_diffs} differ",
+        patterns.len() * bodies.len()
+    );
+    assert_eq!(
+        (match_diffs, capture_diffs),
+        (0, 0),
+        "the in-process compile reads as the database:\n{}",
+        shown.join("\n")
+    );
+}
+
+/// The two-stream bucketed fixture, a third stream labelled `proc`, and
+/// `syslog`-shaped lines: `name[pid]` processes, a kernel line with no
+/// match, bodies with `é`, Greek and ANSI colour codes, different `proc`
+/// captures on each stream. Every line sits inside a window at `[30s]`,
+/// `[60s]` and `[150s]` on the 60 s grid from `T`.
+async fn seed_regexp_corpus_624p3() -> (ChClient, String, i64) {
+    let (admin, db, t) = seed_bucketed_corpus().await;
+    let svc = "c507bucket";
+    land_stream_624(
+        &admin,
+        &db,
+        t,
+        444,
+        svc,
+        r#"{"app":"d","proc":"p0","service_name":"c507bucket"}"#,
+    )
+    .await;
+    let sec = 1_000_000_000i64;
+    for (fp, at, body) in [
+        (111u64, 40i64, "sshd[42]: session opened café"),
+        (111, 100, "cron[7]: run σ"),
+        (111, 170, "kernel: [12.5] audit"),
+        (222, 45, "sshd[43]: closed"),
+        (222, 110, "systemd[1]: Started Ελληνικά"),
+        (222, 230, "\u{1b}[31mERROR\u{1b}[0m dockerd[9]: x"),
+        (444, 50, "kubelet[5]: ok"),
+        (444, 115, "\u{1b}[32mcron[8]\u{1b}[0m: done"),
+        (444, 175, "plain é line"),
+        (444, 235, "polkitd[3]: auth"),
+    ] {
+        land_line_624(&admin, &db, fp, svc, t + at * sec, body, "").await;
+    }
+    (admin, db, t)
+}
+
+/// T1's lowered queries over `sel` at `range`.
+fn regexp_lowered_queries_624p3(sel: &str, range: &str) -> Vec<String> {
+    let parser = r#"| regexp "(?P<proc>[a-z]+)\\[[0-9]+\\]""#;
+    let mut inner: Vec<String> = Vec::new();
+    for op in [
+        "count_over_time",
+        "rate",
+        "bytes_over_time",
+        "bytes_rate",
+        "absent_over_time",
+    ] {
+        for after in [r#"| proc != """#, r#"| proc=~"s.*""#, "| drop proc"] {
+            inner.push(format!("{op}({sel} {parser} {after} [{range}])"));
+        }
+    }
+    for op in ["count_over_time", "rate"] {
+        inner.push(format!("{op}({sel} {parser} | decolorize [{range}])"));
+    }
+    for pattern in [r#"(?P<a>x)?y"#, r#"(?P<a>x)|(?P<b>y)"#, r#"(?P<a>\\w+)"#] {
+        inner.push(format!(
+            r#"count_over_time({sel} | regexp "{pattern}" [{range}])"#
+        ));
+    }
+    let mut out: Vec<String> = Vec::new();
+    for q in &inner {
+        out.push(format!("sum by (proc) ({q})"));
+        out.push(format!("topk(10, sum by (proc) ({q}))"));
+        out.push(format!("count by (proc) ({q})"));
+    }
+    out.push(format!(
+        r#"topk(10, sum by (proc) (count_over_time({sel} | regexp `(?P<proc>[a-zA-Z0-9_.-]+)\[[0-9]+\]` | proc != "" [{range}])))"#
+    ));
+    out
+}
+
+/// **T5 (issue #624, part 3a): a `regexp` count answers what today's route
+/// answers, bit for bit**, for every query T1 lowers, at a range equal to,
+/// above and below the step; the query log shows the lowered statement.
+/// `bytes_over_time` and `bytes_rate` with `| decolorize` after the parser
+/// stay on today's route and answer the same.
+#[tokio::test]
+async fn a_regexp_count_answers_as_todays_route() {
+    skip_unless_live!();
+    let (admin, db, t) = seed_regexp_corpus_624p3().await;
+    let sel = r#"{service_name="c507bucket"}"#;
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t + 240_000_000_000,
+            step_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let mut comments: Vec<(String, bool)> = Vec::new();
+    let mut nonempty = 0usize;
+    let parser = r#"| regexp "(?P<proc>[a-z]+)\\[[0-9]+\\]""#;
+    for range in ["60s", "150s", "30s"] {
+        let mut queries: Vec<(String, bool)> = regexp_lowered_queries_624p3(sel, range)
+            .into_iter()
+            .map(|q| (q, true))
+            .collect();
+        for op in ["bytes_over_time", "bytes_rate"] {
+            queries.push((
+                format!("sum by (proc) ({op}({sel} {parser} | decolorize [{range}]))"),
+                false,
+            ));
+        }
+        for (query, lowers) in &queries {
+            let comment = format!("c624p3t5-{}", uuid::Uuid::new_v4().simple());
+            let lowered = run_624(
+                &db,
+                hooks_624(false, None, None),
+                Some(&comment),
+                query,
+                &params,
+            )
+            .await;
+            let todays = run_624(&db, hooks_624(true, None, None), None, query, &params).await;
+            same_outcome_624(query, &lowered, &todays);
+            if lowered.as_ref().is_ok_and(|a| !a.is_empty()) {
+                nonempty += 1;
+            }
+            comments.push((comment, *lowers));
+        }
+    }
+    assert!(nonempty > 150, "the corpus answers: {nonempty}");
+    let all: Vec<String> = comments.iter().map(|(c, _)| c.clone()).collect();
+    let logged = logged_624(&admin, &all).await;
+    for (comment, lowers) in &comments {
+        let rows = logged
+            .get(comment)
+            .unwrap_or_else(|| panic!("{comment}: no statement logged"));
+        let lowered = rows
+            .iter()
+            .any(|r| is_lowered_624(&r.query) && r.query.contains("extractGroups"));
+        assert_eq!(lowered, *lowers, "{comment}: {rows:#?}");
+    }
+    drop_db_624(&admin, &db).await;
+}
+
+/// **T6 (issue #624, part 3a, D4): a parent that is not a `sum` keeps every
+/// capture.** `count by (a)` counts the series below it, which differ in `b`
+/// alone, so `b` must reach the group key: two, as today's route answers.
+#[tokio::test]
+async fn a_parent_count_keeps_every_capture() {
+    skip_unless_live!();
+    let (admin, db) = fresh_db_624(pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_p3t6_{}",
+        uuid::Uuid::new_v4().simple()
+    )))
+    .await;
+    let t = ((now_ns() - 4 * 3_600_000_000_000) / 60_000_000_000) * 60_000_000_000;
+    let sec = 1_000_000_000i64;
+    land_stream_624(
+        &admin,
+        &db,
+        t,
+        7_600_000,
+        "c624t6",
+        r#"{"service_name":"c624t6"}"#,
+    )
+    .await;
+    land_line_624(&admin, &db, 7_600_000, "c624t6", t + 10 * sec, "x1", "").await;
+    land_line_624(&admin, &db, 7_600_000, "c624t6", t + 20 * sec, "x2", "").await;
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t + 60 * sec,
+            end_ns: t + 60 * sec,
+            step_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let query = r#"count by (a) (count_over_time({service_name="c624t6"} | regexp "(?P<a>[a-z])(?P<b>[0-9])" [60s]))"#;
+    let comment = format!("c624p3t6-{}", uuid::Uuid::new_v4().simple());
+    let lowered = run_624(
+        &db,
+        hooks_624(false, None, None),
+        Some(&comment),
+        query,
+        &params,
+    )
+    .await;
+    let todays = run_624(&db, hooks_624(true, None, None), None, query, &params).await;
+    same_outcome_624(query, &lowered, &todays);
+    let want: Vec<AnswerSeries> = vec![(
+        vec![("a".to_string(), "x".to_string())],
+        vec![(t + 60 * sec, 2.0f64.to_bits())],
+    )];
+    assert_eq!(lowered.as_ref().ok(), Some(&want), "{lowered:?}");
+    let logged = logged_624(&admin, std::slice::from_ref(&comment)).await;
+    assert!(
+        logged[&comment]
+            .iter()
+            .any(|r| is_lowered_624(&r.query) && r.query.contains("extractGroups")),
+        "the lowered statement ran: {:#?}",
+        logged[&comment]
+    );
+    drop_db_624(&admin, &db).await;
+}
+
+/// **T7 (issue #624, part 3a, D5): a `regexp` count answers wherever
+/// today's route answers.** Part 2's cap search over a `regexp` chain, at a
+/// range equal to and above the step, with one more stream whose lines lie
+/// only in the tail after the last grid point: at today's smallest answering
+/// cap the lowered route answers with today's matrix, and the request ran
+/// the lowered statement.
+#[tokio::test]
+async fn a_regexp_count_answers_wherever_todays_route_answers() {
+    skip_unless_live!();
+    let (admin, db) = fresh_db_624(pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_p3t7_{}",
+        uuid::Uuid::new_v4().simple()
+    )))
+    .await;
+    let t = ((now_ns() - 4 * 3_600_000_000_000) / 60_000_000_000) * 60_000_000_000;
+    let sec = 1_000_000_000i64;
+    seed_cap_streams_624(&admin, &db, t, 200).await;
+    land_stream_624(
+        &admin,
+        &db,
+        t,
+        7_200_000,
+        "c624cap",
+        r#"{"app":"solo","extra":"1","pod":"px","service_name":"c624cap"}"#,
+    )
+    .await;
+    for at in [610i64, 620, 630] {
+        land_line_624(&admin, &db, 7_200_000, "c624cap", t + at * sec, "x", "").await;
+    }
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t + 630 * sec,
+            step_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let mut comments: Vec<String> = Vec::new();
+    for range in ["60s", "150s"] {
+        let query = format!(
+            r#"sum(count_over_time({{service_name="c624cap"}} | regexp "(?P<pod>[a-z0-9]+)" [{range}]))"#
+        );
+        for (cap, hi) in [
+            (Cap624::ResultPoints, 100_000u64),
+            (Cap624::GroupBytes, 256 * 1024 * 1024),
+        ] {
+            let today = min_cap_624(&db, true, cap, &query, &params, hi).await;
+            let want = run_624(
+                &db,
+                hooks_624(true, Some((cap, today)), None),
+                None,
+                &query,
+                &params,
+            )
+            .await
+            .expect("today's route answers at its smallest cap");
+            let comment = format!("c624p3t7-{}", uuid::Uuid::new_v4().simple());
+            let got = run_624(
+                &db,
+                hooks_624(false, Some((cap, today)), None),
+                Some(&comment),
+                &query,
+                &params,
+            )
+            .await;
+            assert_eq!(
+                got.as_ref().ok(),
+                Some(&want),
+                "{query} at {cap:?} {today}: {got:?}"
+            );
+            comments.push(comment);
+        }
+    }
+    let logged = logged_624(&admin, &comments).await;
+    for comment in &comments {
+        let rows = logged
+            .get(comment)
+            .unwrap_or_else(|| panic!("{comment}: no statement logged"));
+        assert!(
+            rows.iter()
+                .any(|r| is_lowered_624(&r.query) && r.query.contains("extractGroups")),
+            "{comment}: the lowered statement answered: {rows:#?}"
+        );
+    }
+    drop_db_624(&admin, &db).await;
+}
+
+/// **T8 (issue #624, part 3a, D5): a `regexp` count that fails for memory
+/// is answered by today's route**, which reads the captures from the
+/// database too: the lowered statement fails with code 241, then
+/// `metric_raw_samples_sliding` runs with `extractGroups`.
+#[tokio::test]
+async fn a_regexp_count_out_of_memory_answers_on_todays_route() {
+    skip_unless_live!();
+    let (admin, db, t) = seed_regexp_corpus_624p3().await;
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t + 240_000_000_000,
+            step_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let query = r#"topk(10, sum by (proc) (count_over_time({service_name="c507bucket"} | regexp `(?P<proc>[a-zA-Z0-9_.-]+)\[[0-9]+\]` | proc != "" [150s])))"#;
+    let comment = format!("c624p3t8-{}", uuid::Uuid::new_v4().simple());
+    let lowered = run_624(
+        &db,
+        hooks_624(false, None, Some(1)),
+        Some(&comment),
+        query,
+        &params,
+    )
+    .await;
+    let todays = run_624(&db, hooks_624(true, None, None), None, query, &params).await;
+    same_outcome_624(query, &lowered, &todays);
+    assert!(
+        lowered.as_ref().is_ok_and(|a| !a.is_empty()),
+        "an answer: {lowered:?}"
+    );
+    let logged = logged_624(&admin, std::slice::from_ref(&comment)).await;
+    let rows = &logged[&comment];
+    let failed = rows
+        .iter()
+        .position(|r| is_lowered_624(&r.query) && r.exception_code == 241)
+        .unwrap_or_else(|| panic!("the lowered statement failed for memory: {rows:#?}"));
+    assert!(
+        rows[failed + 1..].iter().any(|r| is_todays_624(&r.query)
+            && r.query.contains("extractGroups")
+            && r.query
+                .contains("ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC")),
+        "then today's sliding read, with the captures column: {rows:#?}"
+    );
+    drop_db_624(&admin, &db).await;
+}
+
+/// One stream `{s="u"}` with the lines `café 12` and `x 1`, for T11, T15
+/// and T16. Returns `(admin, db, T)`; both lines lie in `(T, T + 60s]`.
+async fn seed_u_624p3() -> (ChClient, String, i64) {
+    let (admin, db) = fresh_db_624(pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_p3u_{}",
+        uuid::Uuid::new_v4().simple()
+    )))
+    .await;
+    let t = ((now_ns() - 4 * 3_600_000_000_000) / 60_000_000_000) * 60_000_000_000;
+    let sec = 1_000_000_000i64;
+    land_stream_624(
+        &admin,
+        &db,
+        t,
+        7_700_000,
+        "c624u",
+        r#"{"s":"u","service_name":"c624u"}"#,
+    )
+    .await;
+    land_line_624(&admin, &db, 7_700_000, "c624u", t + 10 * sec, "café 12", "").await;
+    land_line_624(&admin, &db, 7_700_000, "c624u", t + 20 * sec, "x 1", "").await;
+    (admin, db, t)
+}
+
+/// The values of label `name` across a log query's streams, sorted.
+fn label_values_624p3(streams: &[pulsus_read::logql::StreamResult], name: &str) -> Vec<String> {
+    let mut out: Vec<String> = streams
+        .iter()
+        .filter(|s| !s.entries.is_empty())
+        .filter_map(|s| {
+            let labels: std::collections::BTreeMap<String, String> =
+                serde_json::from_str(&s.labels_json).expect("labels json");
+            labels.get(name).cloned()
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// **T11 (issue #624, part 3a, D6 and D7): a LogQL regex answers the same
+/// on every route.** `\w` is ASCII in the database, so `café 12` is not
+/// `^\w+ \d+$` and `\w+` captures `caf` from it — in a pushed line filter, a
+/// line filter after a rewrite, a log query, a tail page, a `regexp` after a
+/// rewrite, and a `regexp` count on both of its routes.
+#[tokio::test]
+async fn a_logql_regex_answers_the_same_on_every_route() {
+    skip_unless_live!();
+    let (admin, db, t) = seed_u_624p3().await;
+    let sec = 1_000_000_000i64;
+    let range = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t + 60 * sec,
+            end_ns: t + 60 * sec,
+            step_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    for query in [
+        r#"count_over_time({s="u"} |~ "^\\w+ \\d+$" [1m])"#,
+        r#"count_over_time({s="u"} | line_format "{{__line__}}" |~ "^\\w+ \\d+$" [1m])"#,
+    ] {
+        let got = run_624(&db, hooks_624(false, None, None), None, query, &range)
+            .await
+            .unwrap_or_else(|e| panic!("{query}: {e}"));
+        let total: f64 = got
+            .iter()
+            .flat_map(|(_, p)| p.iter().map(|(_, v)| f64::from_bits(*v)))
+            .sum();
+        assert_eq!(total, 1.0, "{query}: only `x 1` matches: {got:?}");
+    }
+
+    let logs = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t + 60 * sec,
+            step_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let want = vec!["caf".to_string(), "x".to_string()];
+    let engine_with = |comment: &str| {
+        let comment = comment.to_string();
+        let db = db.clone();
+        async move {
+            LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024))
+                .with_query_log_comment(comment)
+        }
+    };
+    let mut database_routes: Vec<(String, &str)> = Vec::new();
+    for (query, database) in [
+        (r#"{s="u"} | regexp "(?P<w>\\w+)""#, true),
+        (
+            r#"{s="u"} | line_format "{{__line__}}" | regexp "(?P<w>\\w+)""#,
+            false,
+        ),
+    ] {
+        let comment = format!("c624p3t11-{}", uuid::Uuid::new_v4().simple());
+        let engine = engine_with(&comment).await;
+        let (result, _) = engine
+            .query(&parse(query).expect("parse"), &logs)
+            .await
+            .unwrap_or_else(|e| panic!("{query}: {e}"));
+        let QueryResult::Streams { items, .. } = result else {
+            panic!("{query}: streams");
+        };
+        assert_eq!(label_values_624p3(&items, "w"), want, "{query}");
+        if database {
+            database_routes.push((comment, "the log query"));
+        }
+    }
+    {
+        let comment = format!("c624p3t11-{}", uuid::Uuid::new_v4().simple());
+        let engine = engine_with(&comment).await;
+        let mut setup = engine
+            .tail_setup(
+                &parse(r#"{s="u"} | regexp "(?P<w>\\w+)""#).expect("parse"),
+                &logs,
+            )
+            .expect("a tail setup");
+        let page = engine
+            .tail_poll(
+                &mut setup,
+                pulsus_read::logql::exec::TailLower::Start { start_ns: t },
+                t + 60 * sec,
+                100,
+            )
+            .await
+            .expect("a tail page");
+        assert_eq!(
+            label_values_624p3(&page.streams, "w"),
+            want,
+            "the tail page"
+        );
+        database_routes.push((comment, "the tail page"));
+    }
+    let count = r#"sum by (w) (count_over_time({s="u"} | regexp "(?P<w>\\w+)" [1m]))"#;
+    for todays in [false, true] {
+        let comment = format!("c624p3t11-{}", uuid::Uuid::new_v4().simple());
+        let got = run_624(
+            &db,
+            hooks_624(todays, None, None),
+            Some(&comment),
+            count,
+            &range,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{count}: {e}"));
+        let mut ws: Vec<String> = got
+            .iter()
+            .filter_map(|(l, _)| l.iter().find(|(k, _)| k == "w").map(|(_, v)| v.clone()))
+            .collect();
+        ws.sort();
+        assert_eq!(ws, want, "{count}, today's route {todays}");
+        database_routes.push((
+            comment,
+            if todays {
+                "today's route"
+            } else {
+                "the lowered count"
+            },
+        ));
+    }
+    let comments: Vec<String> = database_routes.iter().map(|(c, _)| c.clone()).collect();
+    let logged = logged_624(&admin, &comments).await;
+    for (comment, route) in &database_routes {
+        let rows = logged
+            .get(comment)
+            .unwrap_or_else(|| panic!("{route}: no statement logged"));
+        assert!(
+            rows.iter().any(|r| r.query.contains("extractGroups")),
+            "{route}: the database ran the regexp: {rows:#?}"
+        );
+    }
+    drop_db_624(&admin, &db).await;
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct CountRow624p3 {
+    n: u64,
+}
+
+/// One `count()` over `db.table` under `predicate`, with the skip indexes on
+/// or off.
+async fn count_where_624p3(admin: &ChClient, table: &str, predicate: &str, indexes: bool) -> u64 {
+    let settings = if indexes {
+        String::new()
+    } else {
+        " SETTINGS use_skip_indexes = 0".to_string()
+    };
+    let sql = format!("SELECT count() AS n FROM {table} WHERE {predicate}{settings}");
+    let mut stream = admin
+        .query_stream::<CountRow624p3>(&sql.replace('?', "??"), &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    let row = stream
+        .next()
+        .await
+        .expect("one row")
+        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    row.n
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct ExplainLine624p3 {
+    explain: String,
+}
+
+/// **T12 (issue #624, part 3a, F2): a pushed line filter returns the rows
+/// it returns without the skip indexes.** (a) The n-gram index drops a
+/// granule `match()` accepts for `(?i)(denied|refused)`; (b) over §2.3's
+/// sweep — 16 shapes × 11 flag placements, 26 bodies, one granule per row —
+/// every pattern's pushed predicate counts what it counts unindexed; (c) the
+/// fix is per predicate, so a second filter in the same statement keeps its
+/// n-gram pruning.
+#[tokio::test]
+async fn pushed_line_filters_equal_the_unindexed_answer() {
+    skip_unless_live!();
+    // (a)
+    let (admin, db) = fresh_db_624(pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_p3t12_{}",
+        uuid::Uuid::new_v4().simple()
+    )))
+    .await;
+    let t = ((now_ns() - 4 * 3_600_000_000_000) / 60_000_000_000) * 60_000_000_000;
+    let sec = 1_000_000_000i64;
+    land_stream_624(
+        &admin,
+        &db,
+        t,
+        7_800_000,
+        "c624f2",
+        r#"{"service_name":"c624f2"}"#,
+    )
+    .await;
+    land_line_624(
+        &admin,
+        &db,
+        7_800_000,
+        "c624f2",
+        t + 10 * sec,
+        "audit DENIED open",
+        "",
+    )
+    .await;
+    let range = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t + 60 * sec,
+            end_ns: t + 60 * sec,
+            step_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let query = r#"count_over_time({service_name="c624f2"} |~ "(?i)(denied|refused)" [1m])"#;
+    let got = run_624(&db, hooks_624(false, None, None), None, query, &range)
+        .await
+        .unwrap_or_else(|e| panic!("{query}: {e}"));
+    let total: f64 = got
+        .iter()
+        .flat_map(|(_, p)| p.iter().map(|(_, v)| f64::from_bits(*v)))
+        .sum();
+    assert_eq!(total, 1.0, "(a) {query}: {got:?}");
+
+    // (b)
+    let table = format!("{db}.f2_sweep");
+    exec_624(
+        &admin,
+        &format!(
+            "CREATE TABLE {table} (body String, \
+             INDEX idx_body_tokens body TYPE tokenbf_v1(32768, 3, 0) GRANULARITY 1, \
+             INDEX idx_body_ngrams body TYPE ngrambf_v1(4, 32768, 3, 0) GRANULARITY 1) \
+             ENGINE = MergeTree ORDER BY tuple() SETTINGS index_granularity = 1"
+        ),
+    )
+    .await;
+    let bodies: [&str; 26] = [
+        "audit DENIED open",
+        "audit denied open",
+        "Denied",
+        "DENIED",
+        "access denied",
+        "refused",
+        "REFUSED",
+        "Refused x",
+        "connection refused",
+        "ERROR",
+        "error",
+        "Error!",
+        "an error here",
+        "fail",
+        "FAIL",
+        "Fail",
+        "failed hard",
+        "denied refused",
+        "auditDENIEDopen",
+        "xdeniedy",
+        "xREFUSEDy",
+        "x refused y",
+        "ok",
+        "nothing here",
+        "panic",
+        "success",
+    ];
+    let values = bodies
+        .iter()
+        .map(|b| format!("({})", literal(b).as_sql()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    exec_624(
+        &admin,
+        &format!("INSERT INTO {table} (body) VALUES {values}"),
+    )
+    .await;
+    // `{H}` a flag head at the start, `{M}` after a leading literal, `{A}`
+    // inside the first alternation arm.
+    let shapes: [&str; 16] = [
+        "{H}{M}denied{A}",
+        "{H}{M}{A}denied|refused",
+        "{H}{M}({A}denied|refused)",
+        "{H}{M}(?:{A}denied|refused)",
+        "{H}audit {M}({A}denied|refused)",
+        "{H}{M}({A}denied|refused) open",
+        "{H}{M}((?:{A}denied|refused)|(?:error|fail))",
+        "{H}audit {M}({A}denied|refused)?",
+        "{H}{M}({A}denied|refused)+",
+        "{H}{M}({A}den[i]ed|ref[u]sed)",
+        "{H}{M}({A}den.ed|ref.sed)",
+        "{H}{M}({A}error|fail)",
+        "{H}{M}({A}error|fail|denied|refused)",
+        "{H}{M}({A}DENIED|REFUSED)",
+        "{H}x{M}({A}denied|refused)y",
+        "{H}{M}({A}denied)|(refused)",
+    ];
+    let fill = |shape: &str, h: &str, m: &str, a: &str| {
+        shape.replace("{H}", h).replace("{M}", m).replace("{A}", a)
+    };
+    let mut patterns: Vec<String> = Vec::new();
+    for shape in shapes {
+        for placement in 0..11 {
+            patterns.push(match placement {
+                0 => fill(shape, "", "", ""),
+                1 => fill(shape, "(?i)", "", ""),
+                2 => format!("(?i:{})", fill(shape, "", "", "")),
+                3 => fill(shape, "", "(?i)", ""),
+                4 => fill(shape, "", "", "(?i)"),
+                5 => fill(shape, "(?i)(?-i)", "", ""),
+                6 => fill(shape, "(?s)", "", ""),
+                7 => fill(shape, "(?m)", "", ""),
+                8 => fill(shape, "(?U)", "", ""),
+                9 => fill(shape, "(?-s)", "", ""),
+                _ => fill(shape, "(?-s)(?i)", "", ""),
+            });
+        }
+    }
+    assert_eq!(patterns.len(), 176);
+    let mut differing: Vec<String> = Vec::new();
+    for pattern in &patterns {
+        let fragment = pulsus_read::logql::predicate::line_filter(&pulsus_logql::LineFilter {
+            op: pulsus_logql::LineFilterOp::Regex,
+            value: pattern.clone(),
+            value_is_ip: false,
+            or_matches: Vec::new(),
+        })
+        .unwrap_or_else(|e| panic!("{pattern}: {e}"));
+        let indexed = count_where_624p3(&admin, &table, fragment.as_sql(), true).await;
+        let unindexed = count_where_624p3(&admin, &table, fragment.as_sql(), false).await;
+        if indexed != unindexed {
+            differing.push(format!(
+                "{pattern}: {indexed} indexed, {unindexed} unindexed"
+            ));
+        }
+    }
+    println!(
+        "{} of 176 patterns differ from the unindexed answer",
+        differing.len()
+    );
+    assert!(
+        differing.is_empty(),
+        "(b) {} patterns lose rows:\n{}",
+        differing.len(),
+        differing.join("\n")
+    );
+
+    // (c)
+    let table = format!("{db}.f2_prune");
+    exec_624(
+        &admin,
+        &format!(
+            "CREATE TABLE {table} (body String, \
+             INDEX idx_body_tokens body TYPE tokenbf_v1(32768, 3, 0) GRANULARITY 1, \
+             INDEX idx_body_ngrams body TYPE ngrambf_v1(4, 32768, 3, 0) GRANULARITY 1) \
+             ENGINE = MergeTree ORDER BY tuple() SETTINGS index_granularity = 1"
+        ),
+    )
+    .await;
+    exec_624(
+        &admin,
+        &format!(
+            "INSERT INTO {table} (body) SELECT if(number % 50 = 7, \
+             concat('app[1]: panic: rare failure ', toString(number)), \
+             concat('session opened for user ', toString(number))) FROM numbers(500)"
+        ),
+    )
+    .await;
+    let filter = |op, value: &str| {
+        pulsus_read::logql::predicate::line_filter(&pulsus_logql::LineFilter {
+            op,
+            value: value.to_string(),
+            value_is_ip: false,
+            or_matches: Vec::new(),
+        })
+        .expect("renders")
+    };
+    let contains = filter(pulsus_logql::LineFilterOp::Contains, "rare failure");
+    let regex = filter(pulsus_logql::LineFilterOp::Regex, "(?i)(panic|refused)");
+    let predicate = format!("{} AND {}", contains.as_sql(), regex.as_sql());
+    assert_eq!(
+        count_where_624p3(&admin, &table, &predicate, true).await,
+        10,
+        "(c) the ten rare lines"
+    );
+    let sql = format!("EXPLAIN indexes = 1 SELECT count() FROM {table} WHERE {predicate}");
+    let mut stream = admin
+        .query_stream::<ExplainLine624p3>(&sql.replace('?', "??"), &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    let mut lines = Vec::new();
+    while let Some(row) = stream.next().await {
+        lines.push(row.expect("an explain line").explain);
+    }
+    drop(stream);
+    let at = lines
+        .iter()
+        .position(|l| l.contains("Name: idx_body_ngrams"))
+        .unwrap_or_else(|| panic!("(c) the n-gram index is used: {lines:#?}"));
+    let granules = lines[at..]
+        .iter()
+        .find_map(|l| l.trim().strip_prefix("Granules: "))
+        .unwrap_or_else(|| panic!("(c) its granules: {lines:#?}"));
+    let (kept, total) = granules.split_once('/').expect("kept/total");
+    let (kept, total): (u64, u64) = (
+        kept.trim().parse().expect("kept"),
+        total.trim().parse().expect("total"),
+    );
+    assert!(kept < total, "(c) idx_body_ngrams prunes: {granules}");
+    drop_db_624(&admin, &db).await;
+}
+
+/// **T14 (issue #624, part 3a, D6): two `regexp` stages read two columns**
+/// of one `rx` — on a log query and on today's route for a count with two
+/// parsers.
+#[tokio::test]
+async fn two_regexp_stages_read_two_columns() {
+    skip_unless_live!();
+    let (admin, db) = fresh_db_624(pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_p3t14_{}",
+        uuid::Uuid::new_v4().simple()
+    )))
+    .await;
+    let t = ((now_ns() - 4 * 3_600_000_000_000) / 60_000_000_000) * 60_000_000_000;
+    let sec = 1_000_000_000i64;
+    land_stream_624(
+        &admin,
+        &db,
+        t,
+        7_900_000,
+        "c624v",
+        r#"{"s":"v","service_name":"c624v"}"#,
+    )
+    .await;
+    land_line_624(&admin, &db, 7_900_000, "c624v", t + 10 * sec, "ab 12", "").await;
+    land_line_624(&admin, &db, 7_900_000, "c624v", t + 20 * sec, "cd 34", "").await;
+    let column =
+        r"[extractGroups(body, '(?P<a>[a-z]+)'), extractGroups(body, '(?P<b>[0-9]+)')] AS rx";
+    let stages = r#"| regexp "(?P<a>[a-z]+)" | regexp "(?P<b>[0-9]+)""#;
+
+    let log_comment = format!("c624p3t14-{}", uuid::Uuid::new_v4().simple());
+    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024))
+        .with_query_log_comment(log_comment.clone());
+    let logs = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t + 60 * sec,
+            step_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let query = format!(r#"{{s="v"}} {stages}"#);
+    let (result, _) = engine
+        .query(&parse(&query).expect("parse"), &logs)
+        .await
+        .expect("answers");
+    let QueryResult::Streams { items, .. } = result else {
+        panic!("streams");
+    };
+    let mut pairs: Vec<(String, String)> = items
+        .iter()
+        .map(|s| {
+            let labels: std::collections::BTreeMap<String, String> =
+                serde_json::from_str(&s.labels_json).expect("labels json");
+            (labels["a"].clone(), labels["b"].clone())
+        })
+        .collect();
+    pairs.sort();
+    assert_eq!(
+        pairs,
+        vec![
+            ("ab".to_string(), "12".to_string()),
+            ("cd".to_string(), "34".to_string())
+        ]
+    );
+
+    let count_comment = format!("c624p3t14-{}", uuid::Uuid::new_v4().simple());
+    let range = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t + 60 * sec,
+            end_ns: t + 60 * sec,
+            step_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let count = format!(r#"sum by (a, b) (count_over_time({{s="v"}} {stages} [1m]))"#);
+    let got = run_624(
+        &db,
+        hooks_624(false, None, None),
+        Some(&count_comment),
+        &count,
+        &range,
+    )
+    .await
+    .expect("answers");
+    let one = 1.0f64.to_bits();
+    let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
+    assert_eq!(
+        got,
+        vec![
+            (
+                vec![pair("a", "ab"), pair("b", "12")],
+                vec![(t + 60 * sec, one)]
+            ),
+            (
+                vec![pair("a", "cd"), pair("b", "34")],
+                vec![(t + 60 * sec, one)]
+            ),
+        ]
+    );
+    let logged = logged_624(&admin, &[log_comment.clone(), count_comment.clone()]).await;
+    for comment in [&log_comment, &count_comment] {
+        assert!(
+            logged[comment].iter().any(|r| r.query.contains(column)),
+            "{comment}: both captures from one column: {:#?}",
+            logged[comment]
+        );
+    }
+    drop_db_624(&admin, &db).await;
+}
+
+/// **T15 (issue #624, part 3a, D6): an instant `regexp` count reads its
+/// captures from the database**, through `metric_raw_samples`.
+#[tokio::test]
+async fn an_instant_regexp_count_reads_captures_from_the_database() {
+    skip_unless_live!();
+    let (admin, db, t) = seed_u_624p3().await;
+    let comment = format!("c624p3t15-{}", uuid::Uuid::new_v4().simple());
+    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024))
+        .with_query_log_comment(comment.clone());
+    let params = QueryParams {
+        spec: QuerySpec::Instant {
+            at_ns: t + 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let query = r#"sum by (w) (count_over_time({s="u"} | regexp "(?P<w>\\w+)" [1m]))"#;
+    let (result, _) = engine
+        .query(&parse(query).expect("parse"), &params)
+        .await
+        .expect("answers");
+    let QueryResult::Vector(samples) = result else {
+        panic!("a vector: {result:?}");
+    };
+    let mut got: Vec<(Vec<(String, String)>, f64)> =
+        samples.into_iter().map(|s| (s.labels, s.value)).collect();
+    got.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        got,
+        vec![
+            (vec![("w".to_string(), "caf".to_string())], 1.0),
+            (vec![("w".to_string(), "x".to_string())], 1.0),
+        ]
+    );
+    let logged = logged_624(&admin, std::slice::from_ref(&comment)).await;
+    assert!(
+        logged[&comment].iter().any(|r| r
+            .query
+            .contains("ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC")
+            && r.query.contains("extractGroups")),
+        "metric_raw_samples with the captures column: {:#?}",
+        logged[&comment]
+    );
+    drop_db_624(&admin, &db).await;
+}
+
+/// **T16 (issue #624, part 3a, D6): a `variants(...)` tail's `regexp` reads
+/// its captures from the database**, and a tail that rewrites the line first
+/// runs its own, reading as the database does (D7). One statement, one
+/// `extractGroups`.
+#[tokio::test]
+async fn a_variant_tail_regexp_reads_captures_from_the_database() {
+    skip_unless_live!();
+    let (admin, db, t) = seed_u_624p3().await;
+    let sec = 1_000_000_000i64;
+    let comment = format!("c624p3t16-{}", uuid::Uuid::new_v4().simple());
+    let range = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t + 60 * sec,
+            end_ns: t + 60 * sec,
+            step_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let query = r#"variants(sum by (w) (count_over_time({s="u"} | regexp "(?P<w>\\w+)" [1m])), sum by (v) (count_over_time({s="u"} | line_format "z{{__line__}}" | regexp "(?P<v>\\w+)" [1m]))) of ({s="u"} [1m])"#;
+    let got = run_624(
+        &db,
+        hooks_624(false, None, None),
+        Some(&comment),
+        query,
+        &range,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("{query}: {e}"));
+    let mut labels: Vec<Vec<(String, String)>> = got.into_iter().map(|(l, _)| l).collect();
+    labels.sort();
+    let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
+    assert_eq!(
+        labels,
+        vec![
+            vec![pair("__variant__", "0"), pair("w", "caf")],
+            vec![pair("__variant__", "0"), pair("w", "x")],
+            vec![pair("__variant__", "1"), pair("v", "zcaf")],
+            vec![pair("__variant__", "1"), pair("v", "zx")],
+        ]
+    );
+    let logged = logged_624(&admin, std::slice::from_ref(&comment)).await;
+    let reads: Vec<&CommentedRow624> = logged[&comment]
+        .iter()
+        .filter(|r| is_todays_624(&r.query))
+        .collect();
+    assert_eq!(reads.len(), 1, "one statement: {reads:#?}");
+    assert_eq!(
+        reads[0].query.matches("extractGroups").count(),
+        1,
+        "one pattern: {}",
+        reads[0].query
+    );
+    drop_db_624(&admin, &db).await;
+}

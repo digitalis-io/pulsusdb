@@ -787,6 +787,7 @@ fn a_budget_breach_surfaces_as_the_bounded_query_too_broad_422_class() {
         timestamp_ns: 0,
         body: "line".to_string(),
         structured_metadata: String::new(),
+        rx: Vec::new(),
     }];
     let err = run_pipeline_rows(rows, &pipeline, &meta, 100)
         .expect_err("the streams assembly must abort");
@@ -1326,6 +1327,7 @@ fn a_thirty_two_mib_duration_argument_is_the_bounded_422_not_a_served_error_deta
         timestamp_ns: 0,
         body: line.clone(),
         structured_metadata: String::new(),
+        rx: Vec::new(),
     }];
     let err = run_pipeline_rows(rows, &pipeline, &meta, 100)
         .expect_err("a 33,554,400-byte argument must abort the query");
@@ -1356,6 +1358,7 @@ fn a_thirty_two_mib_duration_argument_is_the_bounded_422_not_a_served_error_deta
         timestamp_ns: 0,
         body: line,
         structured_metadata: String::new(),
+        rx: Vec::new(),
     }];
     let streams = run_pipeline_rows(rows, &pipeline, &meta, 100)
         .expect("one repeat fewer must still be served");

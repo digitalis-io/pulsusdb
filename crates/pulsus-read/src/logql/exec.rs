@@ -4213,6 +4213,7 @@ impl LogQlEngine {
                         timestamp_ns: row.timestamp_ns,
                         body: row.body,
                         structured_metadata: row.structured_metadata,
+                        rx: Vec::new(),
                     },
                     &setup.compiled,
                 )?;
@@ -4544,6 +4545,7 @@ impl StreamsPagedState {
                     timestamp_ns: row.timestamp_ns,
                     body: row.body,
                     structured_metadata: row.structured_metadata,
+                    rx: Vec::new(),
                 },
                 compiled,
             ) {
@@ -7052,6 +7054,8 @@ mod tests {
             bucket_ns: 60_000_000_000,
             n: 1,
             structured_metadata: sm.to_string(),
+            matched: 0,
+            caps: Vec::new(),
         };
         assert!(
             PushdownRangeGroups::new(
@@ -8618,6 +8622,7 @@ mod tests {
             body: format!("b{hash}"),
             body_hash: hash,
             structured_metadata: String::new(),
+            rx: Vec::new(),
         }
     }
 
@@ -8696,6 +8701,7 @@ mod tests {
             body: "alpha".to_string(),
             body_hash: 42,
             structured_metadata: String::new(),
+            rx: Vec::new(),
         };
         let second = TailSampleRow {
             fingerprint: Fingerprint::from_raw(7),
@@ -8703,6 +8709,7 @@ mod tests {
             body: "beta".to_string(),
             body_hash: 42, // injected collision: distinct body, same hash
             structured_metadata: String::new(),
+            rx: Vec::new(),
         };
         let c1 = advance_tail_cursor(None, std::slice::from_ref(&first)).expect("cursor");
         assert_eq!(c1.tuple, (10, Fingerprint::from_raw(7), 42));
@@ -8782,12 +8789,14 @@ mod tests {
                     timestamp_ns: 10,
                     body: "keep y=z msg=a".to_string(),
                     structured_metadata: String::new(),
+                    rx: Vec::new(),
                 },
                 SampleRow {
                     fingerprint: Fingerprint::from_raw(1),
                     timestamp_ns: 11,
                     body: "keep y=other".to_string(),
                     structured_metadata: String::new(),
+                    rx: Vec::new(),
                 },
             ]
         };
@@ -8894,6 +8903,7 @@ mod tests {
             timestamp_ns: 10,
             body: "line".to_string(),
             structured_metadata: r#"{"env":"SMVAL","trace_id":"abc"}"#.to_string(),
+            rx: Vec::new(),
         }];
         let results =
             run_pipeline_rows(rows, &compiled, &meta, 100).expect("no template budget breach");
@@ -8935,6 +8945,7 @@ mod tests {
             timestamp_ns: 10,
             body: "line".to_string(),
             structured_metadata: r#"{"env":"smval"}"#.to_string(),
+            rx: Vec::new(),
         }];
         let results =
             run_pipeline_rows(rows, &compiled, &meta, 100).expect("no template budget breach");
@@ -8970,6 +8981,7 @@ mod tests {
             timestamp_ns: 10,
             body: "line".to_string(),
             structured_metadata: r#"{"env":"smval","env_extracted":"smextra"}"#.to_string(),
+            rx: Vec::new(),
         }];
         let results =
             run_pipeline_rows(rows, &compiled, &meta, 100).expect("no template budget breach");
@@ -9315,6 +9327,7 @@ mod tests {
             timestamp_ns: ts,
             body: body.to_string(),
             structured_metadata: sm.to_string(),
+            rx: Vec::new(),
         };
         vec![
             row(
@@ -9899,6 +9912,8 @@ mod tests {
             bucket_ns,
             n,
             structured_metadata: sm.to_string(),
+            matched: 0,
+            caps: Vec::new(),
         }
     }
 

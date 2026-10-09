@@ -3893,6 +3893,7 @@ mod tests {
             timestamp_ns: 30_000_000_000,
             body: "__preserve_error__=true latency=abc".to_string(),
             structured_metadata: String::new(),
+            rx: Vec::new(),
         }];
         let window = ClientWindow::Instant {
             start_ns: 0,
@@ -3984,6 +3985,7 @@ mod tests {
             timestamp_ns: ts,
             body: body.to_string(),
             structured_metadata: String::new(),
+            rx: Vec::new(),
         }
     }
 
@@ -3995,6 +3997,7 @@ mod tests {
             timestamp_ns: ts,
             body: body.to_string(),
             structured_metadata: sm.to_string(),
+            rx: Vec::new(),
         }
     }
 

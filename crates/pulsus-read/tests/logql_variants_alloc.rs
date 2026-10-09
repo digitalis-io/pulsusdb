@@ -1327,6 +1327,7 @@ fn variants_allocation_gates() {
                     timestamp_ns: (i as i64 % 50) * NS,
                     body: fat.clone(),
                     structured_metadata: String::new(),
+                    rx: Vec::new(),
                 })
                 .collect();
             if shuffled {

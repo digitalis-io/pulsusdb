@@ -1763,6 +1763,7 @@ mod tests {
                     timestamp_ns: 1_700_000_000_000_000_000i64 + i as i64,
                     body: body.clone(),
                     structured_metadata: String::new(),
+                    rx: Vec::new(),
                 },
                 &compiled,
             )
@@ -3699,6 +3700,7 @@ mod tests {
                         timestamp_ns: 1_700_000_000_000_000_000i64 + i,
                         body: ctrl.clone(),
                         structured_metadata: sm.clone(),
+                        rx: Vec::new(),
                     },
                     &meta,
                 )

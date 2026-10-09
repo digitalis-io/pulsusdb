@@ -524,6 +524,66 @@ pub fn line_filter(lf: &LineFilter) -> Result<CheckedFragment, PipelineError> {
     })
 }
 
+/// The `rx` column of a raw read (issue #624, part 3a, D6): one
+/// `extractGroups(body, <p>)` per pattern, in the order given, each pattern
+/// through the validating renderer a pushed `|~` line filter takes, so the
+/// text is the one `match()` would read.
+///
+/// `[extractGroups(body, '<p1>'), extractGroups(body, '<p2>')]`
+pub fn regexp_captures_column(patterns: &[String]) -> Result<CheckedFragment, PipelineError> {
+    let mut parts: Vec<String> = Vec::with_capacity(patterns.len());
+    for p in patterns {
+        parts.push(format!(
+            "extractGroups(body, {})",
+            ch_regex_unanchored_checked(p)?
+        ));
+    }
+    Ok(CheckedFragment {
+        sql: format!("[{}]", parts.join(", ")),
+    })
+}
+
+/// The two expressions a lowered `regexp` count groups by (issue #624, part
+/// 3a, D2): the stage's `extractGroups` over the stored line, and the
+/// captures the plan sends from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegexpGroupColumns {
+    /// `extractGroups(body, '<p>')`.
+    pub extract: CheckedFragment,
+    /// `if(matched = 1, [g[i1], …], CAST([], 'Array(String)'))` over the
+    /// 1-based group indexes, in the order given; `CAST([], 'Array(String)')`
+    /// when none is sent.
+    pub caps: CheckedFragment,
+}
+
+/// [`RegexpGroupColumns`] for `pattern` and the sent groups' 1-based
+/// indexes. The indexes are integers, so they carry no text into the
+/// statement.
+pub fn regexp_group_columns(
+    pattern: &str,
+    indexes: &[usize],
+) -> Result<RegexpGroupColumns, PipelineError> {
+    let extract = CheckedFragment {
+        sql: format!(
+            "extractGroups(body, {})",
+            ch_regex_unanchored_checked(pattern)?
+        ),
+    };
+    let caps = if indexes.is_empty() {
+        "CAST([], 'Array(String)')".to_string()
+    } else {
+        let picks: Vec<String> = indexes.iter().map(|i| format!("g[{i}]")).collect();
+        format!(
+            "if(matched = 1, [{}], CAST([], 'Array(String)'))",
+            picks.join(", ")
+        )
+    };
+    Ok(RegexpGroupColumns {
+        extract,
+        caps: CheckedFragment { sql: caps },
+    })
+}
+
 /// The ONLY two ways an emitted statement may NAME the
 /// structured-metadata column (issue #507, condition 6).
 ///

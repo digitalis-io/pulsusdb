@@ -689,6 +689,7 @@ fn level_rows(n: u64) -> Vec<Result<TailSampleRow, ReadError>> {
                 body: format!(r#"{{"level":"v{i}"}}"#),
                 body_hash: i,
                 structured_metadata: String::new(),
+                rx: Vec::new(),
             })
         })
         .collect()
@@ -818,6 +819,7 @@ fn case_e_sampled_rows_are_streamed_one_row_live() {
                 body: "z".repeat(65_536),
                 body_hash: i,
                 structured_metadata: String::new(),
+                rx: Vec::new(),
             })
         });
         let mut stream = futures::stream::iter(rows);

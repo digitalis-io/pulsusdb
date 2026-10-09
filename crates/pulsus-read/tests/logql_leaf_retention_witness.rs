@@ -554,6 +554,7 @@ fn build_rows(fx: &Fixture) -> Vec<MetricScanRow> {
                 timestamp_ns: ts,
                 body: format!("v={} env=prod w={pad}{fp} tag=t{i:03}", i + 1),
                 structured_metadata: String::new(),
+                rx: Vec::new(),
             });
         }
     }
