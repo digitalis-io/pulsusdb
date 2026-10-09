@@ -1875,6 +1875,27 @@ pub(in crate::logql) fn regexp_count_route(
     })
 }
 
+/// Issue #624, part 3b: the `| json` counts the statement lowers, as
+/// [`sql::JsonCount`], or `None` for today's route.
+///
+/// ```text
+/// reducer   count_over_time, rate, bytes_over_time, bytes_rate, absent_over_time
+/// chain     pushable line filters | json [<d>="<k>", …] [| <label filter>…]
+/// targeted  every destination a plain top-level key; keys = the destinations
+/// bare      a parent `sum` or `sum by (L)`; keys = L and the filter labels
+/// never     a reserved name as a key, filter label or destination; a bare
+///           key ending in `_extracted`; two destinations of one label
+/// ```
+pub(in crate::logql) fn json_count_route(
+    pipeline: &[Stage],
+    op: RangeAggOp,
+    vector_aggs: &[VectorAggSpec],
+) -> Option<sql::JsonCount> {
+    // Tests-first stub (issue #624, part 3b): nothing lowers yet.
+    let _ = (pipeline, op, vector_aggs);
+    None
+}
+
 /// Issue #507 (W4): does the pipeline carry a `| unwrap` with a
 /// CONVERSION — `duration(x)`, `duration_seconds(x)`, `bytes(x)`?
 ///
@@ -2214,7 +2235,7 @@ pub(in crate::logql) fn range_step_rules(
 /// `pkg/logql/syntax/ast.go:1632-1642 @ v3.7.4`): `Some(None)` for a bare `sum`
 /// (whose empty grouping the reference treats as a singleton),
 /// `Some(Some(g))` for `sum by`/`sum without`, `None` when nothing is handed.
-fn parent_sum_grouping(
+pub(in crate::logql) fn parent_sum_grouping(
     op: RangeAggOp,
     has_own: bool,
     vector_aggs: &[VectorAggSpec],
@@ -2666,9 +2687,19 @@ fn metric_plan(
     } else {
         None
     };
+    // Issue #624, part 3b: a counting reducer after one `| json` stage,
+    // whose key labels the statement reads.
+    let json = if is_range && !force_client && regexp.is_none() {
+        json_count_route(pipeline, *op, &vector_aggs)
+    } else {
+        None
+    };
     let bucketed_range = is_range
         && !force_client
-        && (!has_beyond_line_filter || label_only_pipeline(pipeline, *op) || regexp.is_some())
+        && (!has_beyond_line_filter
+            || label_only_pipeline(pipeline, *op)
+            || regexp.is_some()
+            || json.is_some())
         && !has_unwrap
         // Implied by the reducer set below — none of the five requires
         // `| unwrap` — but named so that a future change to
@@ -2819,7 +2850,10 @@ fn metric_plan(
         let equal = step_ns.is_some_and(|step| step.get() == range_ns.get());
         RoutingDecision {
             chosen: RouteChoice::Raw,
-            reason: if staged && regexp.is_some() {
+            reason: if staged && json.is_some() {
+                "raw: range aggregation in the database, json key labels and label stages over its rows (issue #624)"
+                    .to_string()
+            } else if staged && regexp.is_some() {
                 "raw: range aggregation in the database, regexp captures and label stages over its rows (issue #624)"
                     .to_string()
             } else if staged {
@@ -2896,6 +2930,7 @@ fn metric_plan(
                 .clone()
                 .expect("a range plan always builds today's aggregation"),
             regexp: regexp.clone(),
+            json: json.clone(),
         })),
         (None, false) => sql::MetricValue::Shaped(shape),
     };
@@ -8620,6 +8655,104 @@ mod tests {
                 format!("count_over_time({sel} {parser} | label_format a=b [{range}])"),
                 format!(r#"count_over_time({sel} {parser} | regexp "(?P<q>[0-9])" [{range}])"#),
                 format!("count_over_time({sel} {parser} | json [{range}])"),
+            ] {
+                let mp = metric_mp(&query, spec).unwrap_or_else(|e| panic!("{query}: {e}"));
+                assert!(mp.client.is_some(), "{query} at [{range}]: today's route");
+            }
+        }
+    }
+
+    const JSON_STAGED: &str = "raw: range aggregation in the database, json key labels and label stages over its rows (issue #624)";
+
+    /// **T1 (issue #624, part 3b): a `| json` counting chain lowers**, bare
+    /// under a parent `sum`, targeted under any parent, at any range; the
+    /// rest stays on today's route.
+    #[test]
+    fn a_json_counting_chain_lowers() {
+        const MIN: u64 = 60_000_000_000;
+        let spec = QuerySpec::Range {
+            start_ns: 600_000_000_000,
+            end_ns: 1_200_000_000_000,
+            step_ns: MIN,
+        };
+        let sel = r#"{a="b"}"#;
+        for range in ["1m", "5m", "30s"] {
+            let mut lowered: Vec<(String, &[&str])> = Vec::new();
+            for op in ["count_over_time", "rate", "bytes_over_time", "bytes_rate"] {
+                lowered.push((
+                    format!("sum by (level) ({op}({sel} | json [{range}]))"),
+                    &["level"],
+                ));
+                lowered.push((format!("sum({op}({sel} | json [{range}]))"), &[]));
+                lowered.push((
+                    format!(
+                        r#"topk(3, sum by (level) ({op}({sel} | json | status != "" [{range}])))"#
+                    ),
+                    &["level", "status"],
+                ));
+                lowered.push((
+                    format!(
+                        r#"sum by (level) ({op}({sel} |= "x" | json | status >= 400 [{range}]))"#
+                    ),
+                    &["level", "status"],
+                ));
+                lowered.push((
+                    format!(r#"{op}({sel} | json lvl="level" [{range}])"#),
+                    &["lvl"],
+                ));
+                lowered.push((
+                    format!(r#"count by (st) ({op}({sel} | json st="status", m="method" | m="GET" [{range}]))"#),
+                    &["st", "m"],
+                ));
+            }
+            lowered.push((
+                format!(r#"absent_over_time({sel} | json lvl="level" [{range}])"#),
+                &["lvl"],
+            ));
+            for (query, keys) in &lowered {
+                let mp = metric_mp(query, spec).unwrap_or_else(|e| panic!("{query}: {e}"));
+                assert!(mp.client.is_none(), "{query} at [{range}]: must lower");
+                match &mp.value {
+                    sql::MetricValue::Staged(s) => {
+                        let j = s
+                            .json
+                            .as_ref()
+                            .unwrap_or_else(|| panic!("{query}: json keys"));
+                        let got: Vec<&str> = j.keys.iter().map(|k| k.label.as_str()).collect();
+                        let mut want = keys.to_vec();
+                        if j.form == sql::UnwrapForm::Bare {
+                            want.sort_unstable();
+                        }
+                        assert_eq!(got, want, "{query} at [{range}]: the key labels");
+                    }
+                    other => panic!("{query} at [{range}]: a staged value, got {other:?}"),
+                }
+                assert_eq!(mp.routing.reason, JSON_STAGED, "{query} at [{range}]");
+            }
+            for query in [
+                format!("count_over_time({sel} | json [{range}])"),
+                format!("count by (level) (count_over_time({sel} | json [{range}]))"),
+                format!("sum without (level) (count_over_time({sel} | json [{range}]))"),
+                format!("absent_over_time({sel} | json [{range}])"),
+                format!("sum by (level_extracted) (count_over_time({sel} | json [{range}]))"),
+                format!(
+                    r#"sum by (level) (count_over_time({sel} | json | __error__="" [{range}]))"#
+                ),
+                format!(
+                    "sum by (level) (count_over_time({sel} | json | drop __error__ [{range}]))"
+                ),
+                format!(
+                    r#"sum by (level) (count_over_time({sel} | json | line_format "x" [{range}]))"#
+                ),
+                format!(
+                    r#"sum by (level) (count_over_time({sel} | line_format "x" | json [{range}]))"#
+                ),
+                format!(r#"count_over_time({sel} | json a="lvl.nested" [{range}])"#),
+                format!(r#"count_over_time({sel} | json a="lvl[0]" [{range}])"#),
+                format!(r#"count_over_time({sel} | json a="x", a="y" [{range}])"#),
+                format!(r#"count_over_time({sel} | json a="x", a_extracted="y" [{range}])"#),
+                format!(r#"count_over_time({sel} | json __error__="x" [{range}])"#),
+                format!(r#"sum by (level) (count_over_time({sel} | json | logfmt [{range}]))"#),
             ] {
                 let mp = metric_mp(&query, spec).unwrap_or_else(|e| panic!("{query}: {e}"));
                 assert!(mp.client.is_some(), "{query} at [{range}]: today's route");

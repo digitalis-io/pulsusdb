@@ -16,7 +16,7 @@
 //! granule count).
 //!
 //! **Corpus sizing (edge case #4).** A too-small corpus can't prove
-//! granule skipping — every granule fits in one bloom filter check either
+//! granule skipping — every granule fits in one skip-index check either
 //! way. [`CORPUS_ROWS`] (100,000, one stream) yields ~13 marks at the
 //! default `index_granularity = 8192`
 //! ([`total_marks`], asserted by `corpus_is_large_enough_to_prove_skip_index_pruning`),
@@ -6696,6 +6696,8 @@ enum GroupKeyStatement {
     Lane,
     /// Today's raw scan.
     Raw,
+    /// A lowered `| json` count (issue #624, part 3b).
+    Count,
 }
 
 /// Every finished or failed statement over `db`'s samples, per fingerprint,
@@ -6748,6 +6750,8 @@ async fn group_key_statements(
                 .starts_with("SELECT fingerprint, timestamp_ns, body")
             {
                 GroupKeyStatement::Raw
+            } else if row.query.contains("throwIf(decided = 0) = 0") {
+                GroupKeyStatement::Count
             } else {
                 continue;
             };
@@ -6772,9 +6776,11 @@ async fn group_key_statements(
 
 /// What `system.query_log` shows for one case, in the fixture's words.
 fn group_key_observed(statements: &[(GroupKeyStatement, i32)]) -> String {
-    use GroupKeyStatement::{Key, Lane, Raw};
+    use GroupKeyStatement::{Count, Key, Lane, Raw};
     match statements {
         [] => "none".to_string(),
+        [(Count, 0)] => "count".to_string(),
+        [(Count, 395), (Raw, _)] => "count-throw".to_string(),
         [(Key, 0)] => "s1".to_string(),
         [(Key, 0), (Raw, _)] => "s1+raw".to_string(),
         [(Key, 395), (Raw, _)] => "throw".to_string(),
@@ -7452,6 +7458,8 @@ async fn group_key_statements_between(
                 .starts_with("SELECT fingerprint, timestamp_ns, body")
             {
                 GroupKeyStatement::Raw
+            } else if row.query.contains("throwIf(decided = 0) = 0") {
+                GroupKeyStatement::Count
             } else {
                 continue;
             };
@@ -11911,8 +11919,7 @@ async fn pushed_line_filters_equal_the_unindexed_answer() {
         &admin,
         &format!(
             "CREATE TABLE {table} (body String, \
-             INDEX idx_body_tokens body TYPE tokenbf_v1(32768, 3, 0) GRANULARITY 1, \
-             INDEX idx_body_ngrams body TYPE ngrambf_v1(4, 32768, 3, 0) GRANULARITY 1) \
+             INDEX idx_body_ngrams body TYPE text(tokenizer = ngrams(4))) \
              ENGINE = MergeTree ORDER BY tuple() SETTINGS index_granularity = 1"
         ),
     )
@@ -12031,8 +12038,7 @@ async fn pushed_line_filters_equal_the_unindexed_answer() {
         &admin,
         &format!(
             "CREATE TABLE {table} (body String, \
-             INDEX idx_body_tokens body TYPE tokenbf_v1(32768, 3, 0) GRANULARITY 1, \
-             INDEX idx_body_ngrams body TYPE ngrambf_v1(4, 32768, 3, 0) GRANULARITY 1) \
+             INDEX idx_body_ngrams body TYPE text(tokenizer = ngrams(4))) \
              ENGINE = MergeTree ORDER BY tuple() SETTINGS index_granularity = 1"
         ),
     )
@@ -12419,6 +12425,824 @@ async fn a_brace_pattern_answers_on_every_database_route() {
                 "{query}: no fallback to today's route: {rows:#?}"
             );
         }
+    }
+    drop_db_624(&admin, &db).await;
+}
+
+/// Issue #624, part 3b (§7): one stream of 300,000 lines, 100 of them in a run
+/// holding `panic: rare`, written straight to the tables.
+async fn seed_condition_cache_corpus_624p3b() -> (ChClient, String, i64) {
+    let (admin, db) = fresh_db_624(pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_p3bs_{}",
+        uuid::Uuid::new_v4().simple()
+    )))
+    .await;
+    let t = ((now_ns() - 3_600_000_000_000) / 60_000_000_000) * 60_000_000_000;
+    let month = format!("toStartOfMonth(fromUnixTimestamp64Nano(toInt64({t})))");
+    for sql in [
+        format!(
+            "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, updated_ns) \
+             SELECT {month}, 931, 'c3s', '{{\"service_name\":\"c3s\"}}', 0"
+        ),
+        format!(
+            "INSERT INTO {db}.log_streams_idx (month, key, val, fingerprint) \
+             SELECT {month}, 'service_name', 'c3s', 931"
+        ),
+        format!(
+            "INSERT INTO {db}.log_samples (service, fingerprint, timestamp_ns, severity, body, \
+             structured_metadata) SELECT 'c3s', 931, {t} + 1 + number * 1000000, 0, \
+             if(number BETWEEN 150000 AND 150099, 'x panic: rare y', 'hay'), '' \
+             FROM numbers(300000)"
+        ),
+    ] {
+        exec_624(&admin, &sql).await;
+    }
+    (admin, db, t)
+}
+
+/// **S-T3 (issue #624, part 3b): a line filter leaves the next query's count
+/// intact.** On 26.3.29.7 a `PREWHERE service = …` statement whose `WHERE`
+/// holds `body LIKE` over a `text` index records, in the query condition
+/// cache, granules of the `service` condition as matching nothing; a later
+/// statement with the same `PREWHERE` and no body predicate then counts
+/// too few lines. The log query runs first, then the count: 300,000.
+#[tokio::test]
+async fn a_line_filter_leaves_the_next_count_intact() {
+    skip_unless_live!();
+    let (admin, db, t) = seed_condition_cache_corpus_624p3b().await;
+    exec_624(&admin, "SYSTEM DROP QUERY CONDITION CACHE").await;
+    let engine = LogQlEngine::new(
+        data_client(&db).await,
+        engine_config(&db, 64 * 1024 * 1024 * 1024),
+    );
+    let logs = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t + 600_000_000_000,
+            step_ns: 60_000_000_000,
+        },
+        limit: 1000,
+        direction: Direction::Backward,
+    };
+    let (found, _) = engine
+        .query(
+            &parse(r#"{service_name="c3s"} |= "panic: rare""#).expect("parse"),
+            &logs,
+        )
+        .await
+        .expect("the log query answers");
+    let QueryResult::Streams { items: streams, .. } = found else {
+        panic!("a log query answers streams");
+    };
+    let lines: usize = streams.iter().map(|s| s.entries.len()).sum();
+    assert_eq!(lines, 100, "the needle's lines");
+    let at = QueryParams {
+        spec: QuerySpec::Instant {
+            at_ns: t + 600_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let (count, _) = engine
+        .query(
+            &parse(r#"sum(count_over_time({service_name="c3s"} [10m]))"#).expect("parse"),
+            &at,
+        )
+        .await
+        .expect("the count answers");
+    let QueryResult::Vector(samples) = count else {
+        panic!("an instant query answers a vector");
+    };
+    let total: f64 = samples.iter().map(|s| s.value).sum();
+    assert_eq!(total, 300_000.0, "every line, after the line filter ran");
+    exec_624(&admin, "SYSTEM DROP QUERY CONDITION CACHE").await;
+    drop_db_624(&admin, &db).await;
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct DirectReadRow624p3b {
+    query: String,
+    direct_read: String,
+}
+
+/// **S-T4 (issue #624, part 3b): every statement over `log_samples` that
+/// carries a body predicate is sent with
+/// `query_plan_direct_read_from_text_index = 0`** — a log query, a page
+/// loop, a lowered count, today's route for a staged count, an instant
+/// query — and at least one statement of each shape is logged.
+#[tokio::test]
+async fn every_body_predicate_statement_disables_the_text_index_direct_read() {
+    skip_unless_live!();
+    let (admin, db, t) = seed_condition_cache_corpus_624p3b().await;
+    let comment = format!("c624p3bs4-{}", uuid::Uuid::new_v4().simple());
+    let engine = LogQlEngine::new(
+        data_client(&db).await,
+        engine_config(&db, 64 * 1024 * 1024 * 1024),
+    )
+    .with_query_log_comment(comment.clone());
+    let range = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t + 600_000_000_000,
+            step_ns: 60_000_000_000,
+        },
+        limit: 50,
+        direction: Direction::Backward,
+    };
+    let instant = QueryParams {
+        spec: QuerySpec::Instant {
+            at_ns: t + 600_000_000_000,
+        },
+        limit: 50,
+        direction: Direction::Backward,
+    };
+    for (query, params) in [
+        (r#"{service_name="c3s"} |= "panic: rare""#, &range),
+        (
+            r#"{service_name="c3s"} |~ "panic: r.re" | json | x="1""#,
+            &range,
+        ),
+        (r#"{service_name="c3s"} != "hay""#, &range),
+        (
+            r#"sum(count_over_time({service_name="c3s"} |= "panic" [1m]))"#,
+            &range,
+        ),
+        (
+            r#"sum(count_over_time({service_name="c3s"} |= "panic" | drop x [2m]))"#,
+            &range,
+        ),
+        (
+            r#"sum(count_over_time({service_name="c3s"} |~ "(?i)(panic|refused)" [10m]))"#,
+            &instant,
+        ),
+    ] {
+        engine
+            .query(&parse(query).expect("parse"), params)
+            .await
+            .unwrap_or_else(|e| panic!("{query}: {e}"));
+    }
+    let sql = format!(
+        "SELECT query, Settings['query_plan_direct_read_from_text_index'] AS direct_read \
+         FROM system.query_log WHERE log_comment = '{comment}' AND type = 'QueryFinish' \
+         AND query LIKE '%log_samples%' AND query LIKE '%body%' \
+         AND (query LIKE '%body LIKE%' OR query LIKE '%match(body%' OR query LIKE '%match(identity(body)%')"
+    );
+    let mut rows: Vec<DirectReadRow624p3b> = Vec::new();
+    for _ in 0..30 {
+        exec_624(&admin, "SYSTEM FLUSH LOGS").await;
+        let mut stream = admin
+            .query_stream::<DirectReadRow624p3b>(&sql, &QuerySettings::new())
+            .await
+            .expect("read system.query_log");
+        rows.clear();
+        while let Some(row) = stream.next().await {
+            rows.push(row.expect("decode"));
+        }
+        drop(stream);
+        if rows.len() >= 6 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert!(
+        rows.len() >= 6,
+        "every shape logged a body-predicate statement: {rows:#?}"
+    );
+    for r in &rows {
+        assert_eq!(r.direct_read, "0", "{}", r.query);
+    }
+    drop_db_624(&admin, &db).await;
+}
+
+/// Issue #624, part 3b: four streams of JSON lines under `p3bj`. Stream 602
+/// carries a stream label `level`, which the body's `level` collides with;
+/// stream 603's lines carry metadata `level`. Every value is one the
+/// database decides. Lines sit in windows at `[30s]`, `[60s]` and `[150s]`
+/// on the 60 s grid from `T`, two groups of one stream in one window.
+async fn seed_json_corpus_624p3b() -> (ChClient, String, i64) {
+    let (admin, db) = fresh_db_624(pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_p3b_{}",
+        uuid::Uuid::new_v4().simple()
+    )))
+    .await;
+    let t = ((now_ns() - 3_600_000_000_000) / 60_000_000_000) * 60_000_000_000;
+    let svc = "p3bj";
+    for (fp, labels) in [
+        (601u64, r#"{"app":"j","service_name":"p3bj"}"#),
+        (602, r#"{"app":"j","level":"stream","service_name":"p3bj"}"#),
+        (603, r#"{"app":"k","service_name":"p3bj"}"#),
+    ] {
+        land_stream_624(&admin, &db, t, fp, svc, labels).await;
+    }
+    let sec = 1_000_000_000i64;
+    for (fp, at, body, sm) in [
+        (
+            601u64,
+            10i64,
+            r#"{"level":"info","status":200,"method":"GET","msg":"ok"}"#,
+            "",
+        ),
+        (
+            601,
+            20,
+            r#"{"level":"error","status":500,"method":"POST","msg":"café"}"#,
+            "",
+        ),
+        (
+            601,
+            70,
+            r#"{"level":"info","status":"404","method":"GET"}"#,
+            "",
+        ),
+        (601, 80, r#"{"level":"warn","method":"PUT"}"#, ""),
+        (
+            601,
+            130,
+            r#"{"level":"info","status":200,"method":"GET","msg":"ok"}"#,
+            "",
+        ),
+        (
+            601,
+            200,
+            r#"{"level":"error","status":502,"method":"GET","msg":"Ελληνικά"}"#,
+            "",
+        ),
+        (
+            602,
+            15,
+            r#"{"level":"debug","status":201,"method":"GET"}"#,
+            "",
+        ),
+        (602, 75, r#"{"level":"error","status":503}"#, ""),
+        (602, 140, r#"{"method":"DELETE","status":204}"#, ""),
+        (
+            603,
+            25,
+            r#"{"level":"info","status":200}"#,
+            r#"{"level":"meta"}"#,
+        ),
+        (603, 85, r#"{"status":400,"method":"GET"}"#, ""),
+        (603, 210, r#"{"level":"info","status":200}"#, ""),
+        (
+            601,
+            45,
+            r#"{"level":"info","status":301,"method":"GET"}"#,
+            "",
+        ),
+        (
+            601,
+            50,
+            r#"{"level":"error","status":500,"method":"GET"}"#,
+            "",
+        ),
+        (
+            602,
+            105,
+            r#"{"level":"warn","status":429,"method":"POST"}"#,
+            "",
+        ),
+        (
+            603,
+            170,
+            r#"{"level":"info","status":200,"method":"GET"}"#,
+            r#"{"level":"meta"}"#,
+        ),
+        (
+            601,
+            235,
+            r#"{"level":"debug","method":"GET","status":200}"#,
+            "",
+        ),
+    ] {
+        land_line_624(&admin, &db, fp, svc, t + at * sec, body, sm).await;
+    }
+    (admin, db, t)
+}
+
+/// T3's lowered queries over `sel` at `range`.
+fn json_lowered_queries_624p3b(sel: &str, range: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for op in ["count_over_time", "rate", "bytes_over_time", "bytes_rate"] {
+        out.push(format!("sum by (level) ({op}({sel} | json [{range}]))"));
+        out.push(format!("sum({op}({sel} | json [{range}]))"));
+        out.push(format!(
+            r#"topk(3, sum by (level) ({op}({sel} | json | status != "" [{range}])))"#
+        ));
+        out.push(format!(
+            r#"sum by (level, method) ({op}({sel} | json | status >= 400 [{range}]))"#
+        ));
+        out.push(format!(r#"{op}({sel} | json lvl="level" [{range}])"#));
+        out.push(format!(r#"{op}({sel} | json level="level" [{range}])"#));
+        out.push(format!(
+            r#"count by (st) ({op}({sel} | json st="status", m="method" | m="GET" [{range}]))"#
+        ));
+    }
+    out.push(format!(
+        r#"absent_over_time({sel} | json lvl="level" [{range}])"#
+    ));
+    out
+}
+
+/// **T3 (issue #624, part 3b): a `| json` count answers what today's route
+/// answers, bit for bit**, for every query T1 lowers, at a range equal to,
+/// above and below the step; the query log shows the lowered statement, and
+/// for the queries that stay, only today's read.
+#[tokio::test]
+async fn a_json_count_answers_as_todays_route() {
+    skip_unless_live!();
+    let (admin, db, t) = seed_json_corpus_624p3b().await;
+    let sel = r#"{service_name="p3bj"}"#;
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t + 240_000_000_000,
+            step_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let mut comments: Vec<(String, bool)> = Vec::new();
+    let mut nonempty = 0usize;
+    for range in ["60s", "150s", "30s"] {
+        let mut queries: Vec<(String, bool)> = json_lowered_queries_624p3b(sel, range)
+            .into_iter()
+            .map(|q| (q, true))
+            .collect();
+        for q in [
+            format!("count_over_time({sel} | json [{range}])"),
+            format!("count by (level) (count_over_time({sel} | json [{range}]))"),
+            format!(r#"count_over_time({sel} | json a="level.x" [{range}])"#),
+        ] {
+            queries.push((q, false));
+        }
+        for (query, lowers) in &queries {
+            let comment = format!("c624p3bt3-{}", uuid::Uuid::new_v4().simple());
+            let lowered = run_624(
+                &db,
+                hooks_624(false, None, None),
+                Some(&comment),
+                query,
+                &params,
+            )
+            .await;
+            let todays = run_624(&db, hooks_624(true, None, None), None, query, &params).await;
+            same_outcome_624(query, &lowered, &todays);
+            if lowered.as_ref().is_ok_and(|a| !a.is_empty()) {
+                nonempty += 1;
+            }
+            comments.push((comment, *lowers));
+        }
+    }
+    assert!(nonempty >= 90, "the corpus answers: {nonempty}");
+    let all: Vec<String> = comments.iter().map(|(c, _)| c.clone()).collect();
+    let logged = logged_624(&admin, &all).await;
+    for (comment, lowers) in &comments {
+        let rows = logged
+            .get(comment)
+            .unwrap_or_else(|| panic!("{comment}: no statement logged"));
+        let lowered = rows.iter().any(|r| {
+            is_lowered_624(&r.query)
+                && r.query.contains("throwIf(decided = 0)")
+                && r.exception_code == 0
+        });
+        assert_eq!(lowered, *lowers, "{comment}: {rows:#?}");
+    }
+    drop_db_624(&admin, &db).await;
+}
+
+/// **T4 (issue #624, part 3b): a row the database does not decide sends the
+/// query to today's route.** One service per case, each with one decided
+/// line and one undecided line: the lowered statement fails with code 395,
+/// today's read runs under the same comment, and the answer — a matrix or
+/// the pipeline error — is today's.
+#[tokio::test]
+async fn an_undecided_json_row_answers_on_todays_route() {
+    skip_unless_live!();
+    let (admin, db) = fresh_db_624(pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_p3bu_{}",
+        uuid::Uuid::new_v4().simple()
+    )))
+    .await;
+    let t = ((now_ns() - 3_600_000_000_000) / 60_000_000_000) * 60_000_000_000;
+    let sec = 1_000_000_000i64;
+    let cases: [(&str, &str, &str); 9] = [
+        ("u1", "not json", "bare"),
+        ("u2", "[1]", "bare"),
+        ("u3", r#"{"level":1.5}"#, "bare"),
+        ("u4", r#"{"level":0}"#, "bare"),
+        ("u5", r#"{"level":true}"#, "bare"),
+        ("u6", r#"{"level":"a\"b"}"#, "bare"),
+        ("u7", "5", "bare"),
+        ("u8", r#"{"level":"x"} trailing"#, "targeted"),
+        ("u9", r#"{"level":1.5}"#, "targeted"),
+    ];
+    for (i, (case, body, _)) in cases.iter().enumerate() {
+        let svc = format!("p3b{case}");
+        let fp = 700 + i as u64;
+        land_stream_624(
+            &admin,
+            &db,
+            t,
+            fp,
+            &svc,
+            &format!(r#"{{"app":"u","service_name":"{svc}"}}"#),
+        )
+        .await;
+        land_line_624(
+            &admin,
+            &db,
+            fp,
+            &svc,
+            t + 10 * sec,
+            r#"{"level":"info"}"#,
+            "",
+        )
+        .await;
+        land_line_624(&admin, &db, fp, &svc, t + 20 * sec, body, "").await;
+    }
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t + 60 * sec,
+            end_ns: t + 120 * sec,
+            step_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let mut comments: Vec<String> = Vec::new();
+    for (case, _, form) in &cases {
+        let sel = format!(r#"{{service_name="p3b{case}"}}"#);
+        for range in ["60s", "150s"] {
+            let query = if *form == "bare" {
+                format!("sum by (level) (count_over_time({sel} | json [{range}]))")
+            } else {
+                format!(r#"count_over_time({sel} | json lvl="level" [{range}])"#)
+            };
+            let comment = format!("c624p3bt4-{}", uuid::Uuid::new_v4().simple());
+            let lowered = run_624(
+                &db,
+                hooks_624(false, None, None),
+                Some(&comment),
+                &query,
+                &params,
+            )
+            .await;
+            let todays = run_624(&db, hooks_624(true, None, None), None, &query, &params).await;
+            same_outcome_624(&query, &lowered, &todays);
+            comments.push(comment);
+        }
+    }
+    let logged = logged_624(&admin, &comments).await;
+    for comment in &comments {
+        let rows = logged
+            .get(comment)
+            .unwrap_or_else(|| panic!("{comment}: no statement logged"));
+        let thrown = rows
+            .iter()
+            .position(|r| is_lowered_624(&r.query) && r.exception_code == 395);
+        let todays = rows.iter().position(|r| is_todays_624(&r.query));
+        assert!(
+            matches!((thrown, todays), (Some(a), Some(b)) if a < b),
+            "{comment}: the lowered statement threw, then today's read ran: {rows:#?}"
+        );
+    }
+    drop_db_624(&admin, &db).await;
+}
+
+/// **T5 (issue #624, part 3b): a `| json` count out of memory answers on
+/// today's route.** The lowered statement under a one-byte ceiling fails
+/// with code 241; today's read follows under the same comment.
+#[tokio::test]
+async fn a_json_count_out_of_memory_answers_on_todays_route() {
+    skip_unless_live!();
+    let (admin, db, t) = seed_json_corpus_624p3b().await;
+    let query = r#"sum by (level) (count_over_time({service_name="p3bj"} | json [150s]))"#;
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t + 240_000_000_000,
+            step_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let comment = format!("c624p3bt5-{}", uuid::Uuid::new_v4().simple());
+    let lowered = run_624(
+        &db,
+        hooks_624(false, None, Some(1)),
+        Some(&comment),
+        query,
+        &params,
+    )
+    .await;
+    let todays = run_624(&db, hooks_624(true, None, None), None, query, &params).await;
+    same_outcome_624(query, &lowered, &todays);
+    assert!(todays.as_ref().is_ok_and(|a| !a.is_empty()));
+    let logged = logged_624(&admin, std::slice::from_ref(&comment)).await;
+    let rows = &logged[&comment];
+    let oom = rows.iter().position(|r| {
+        is_lowered_624(&r.query)
+            && r.query.contains("throwIf(decided = 0)")
+            && r.exception_code == 241
+    });
+    let todays_at = rows.iter().position(|r| is_todays_624(&r.query));
+    assert!(
+        matches!((oom, todays_at), (Some(a), Some(b)) if a < b),
+        "the lowered statement ran out of memory, then today's read ran: {rows:#?}"
+    );
+    drop_db_624(&admin, &db).await;
+}
+
+/// **T7 (issue #624, part 3b): a `rate` or `bytes_rate` directly under a
+/// `sum` divides once per sum group, on every route.** Two streams, 7 and 3
+/// lines of `{}` (2 bytes each) in one minute: the reference counts each
+/// sum group as one series (`canInjectVectorGrouping`), so the answer is the
+/// bits of `10 / R` (rate) or `20 / R` (bytes), never of `7 / R + 3 / R`.
+///
+/// The cells are the product of four tables, so none can be left out:
+/// reducer (`rate`, `bytes_rate`, the two F1 changes) × parent (`sum`,
+/// `sum by`, `sum without`) × pipeline (none, `| json`, `| drop extra`) ×
+/// route (range lowered and range on today's route at `[60s]` and
+/// `[120s]`; instant, which is the clean statement with no pipeline and
+/// today's route with one). Each cell checks its route in the query log;
+/// a bare `| json` under `sum without` does not lower (D1), so its range
+/// cells are today's route.
+#[tokio::test]
+async fn a_rate_under_a_sum_divides_once_per_group() {
+    skip_unless_live!();
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Route7 {
+        RangeLowered(&'static str, f64),
+        RangeTodays(&'static str, f64),
+        Instant,
+    }
+    const OPS: [(&str, f64); 2] = [("rate", 10.0), ("bytes_rate", 20.0)];
+    const PARENTS: [&str; 3] = ["sum", "sum by (service_name)", "sum without (app)"];
+    // `| drop extra` drops a label no stream has: label-only (part 2), and the
+    // two streams stay two series until the sum.
+    const PIPELINES: [&str; 3] = ["", " | json", " | drop extra"];
+    const ROUTES: [Route7; 5] = [
+        Route7::RangeLowered("60s", 60.0),
+        Route7::RangeLowered("120s", 120.0),
+        Route7::RangeTodays("60s", 60.0),
+        Route7::RangeTodays("120s", 120.0),
+        Route7::Instant,
+    ];
+    let (admin, db) = fresh_db_624(pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_p3brate_{}",
+        uuid::Uuid::new_v4().simple()
+    )))
+    .await;
+    let t = ((now_ns() - 3_600_000_000_000) / 60_000_000_000) * 60_000_000_000;
+    let sec = 1_000_000_000i64;
+    let svc = "p3brate";
+    for (fp, n) in [(811u64, 7i64), (812, 3)] {
+        land_stream_624(
+            &admin,
+            &db,
+            t,
+            fp,
+            svc,
+            &format!(r#"{{"app":"r{fp}","service_name":"{svc}"}}"#),
+        )
+        .await;
+        for i in 0..n {
+            land_line_624(&admin, &db, fp, svc, t + (10 + i) * sec, "{}", "").await;
+        }
+    }
+    let sel = r#"{service_name="p3brate"}"#;
+    let range = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t + 120 * sec,
+            step_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let instant = QueryParams {
+        spec: QuerySpec::Instant {
+            at_ns: t + 60 * sec,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let mut cells: Vec<(String, Route7, &str, bool, String)> = Vec::new();
+    // Every problem found, by cell, so the count is of cells.
+    let mut divided: Vec<(usize, String)> = Vec::new();
+    let mut routed: Vec<(usize, String)> = Vec::new();
+    for (op, total) in OPS {
+        for parent in PARENTS {
+            for pipeline in PIPELINES {
+                for route in ROUTES {
+                    let (r, secs) = match route {
+                        Route7::RangeLowered(r, s) | Route7::RangeTodays(r, s) => (r, s),
+                        Route7::Instant => ("60s", 60.0),
+                    };
+                    let query = format!("{parent} ({op}({sel}{pipeline} [{r}]))");
+                    let want = (total / secs).to_bits();
+                    let comment = format!("c624p3bt7-{}", uuid::Uuid::new_v4().simple());
+                    let hooks = match route {
+                        Route7::RangeTodays(..) => hooks_624(false, None, Some(1)),
+                        _ => hooks_624(false, None, None),
+                    };
+                    let mut engine = LogQlEngine::new(
+                        data_client(&db).await,
+                        engine_config(&db, 64 * 1024 * 1024),
+                    )
+                    .with_key_route_test_hooks(hooks);
+                    engine = engine.with_query_log_comment(comment.clone());
+                    let params = if route == Route7::Instant {
+                        &instant
+                    } else {
+                        &range
+                    };
+                    let (result, _) = engine
+                        .query(&parse(&query).expect("parse"), params)
+                        .await
+                        .unwrap_or_else(|e| panic!("{query} ({route:?}): {e}"));
+                    let points: Vec<u64> = match result {
+                        QueryResult::Matrix(series) => series
+                            .iter()
+                            .flat_map(|s| s.points.iter().map(|(_, v)| v.to_bits()))
+                            .collect(),
+                        QueryResult::Vector(samples) => {
+                            samples.iter().map(|s| s.value.to_bits()).collect()
+                        }
+                        other => panic!("{query}: {other:?}"),
+                    };
+                    if points.is_empty() || points.iter().any(|v| *v != want) {
+                        divided.push((
+                            cells.len(),
+                            format!(
+                                "{query} ({route:?}): want every point the bits of {total} / {secs} = {want}, got {points:?}"
+                            ),
+                        ));
+                    }
+                    // D1: a bare `| json` lowers under `sum` and `sum by` only.
+                    let lowers = !(pipeline == " | json" && parent.starts_with("sum without"));
+                    cells.push((comment, route, pipeline, lowers, query));
+                }
+            }
+        }
+    }
+    assert_eq!(
+        cells.len(),
+        OPS.len() * PARENTS.len() * PIPELINES.len() * ROUTES.len()
+    );
+    let comments: Vec<String> = cells.iter().map(|c| c.0.clone()).collect();
+    let logged = logged_624(&admin, &comments).await;
+    for (cell, (comment, route, pipeline, lowers, query)) in cells.iter().enumerate() {
+        let Some(rows) = logged.get(comment) else {
+            routed.push((cell, format!("{query} ({route:?}): no statement logged")));
+            continue;
+        };
+        let lowered_at = |code: i32| {
+            rows.iter()
+                .position(|r| is_lowered_624(&r.query) && r.exception_code == code)
+        };
+        let todays_at = rows.iter().position(|r| is_todays_624(&r.query));
+        let ok = match route {
+            Route7::RangeLowered(..) | Route7::RangeTodays(..) if !*lowers => {
+                todays_at.is_some() && !rows.iter().any(|r| is_lowered_624(&r.query))
+            }
+            Route7::RangeLowered(..) => lowered_at(0).is_some() && todays_at.is_none(),
+            Route7::RangeTodays(..) => {
+                matches!((lowered_at(241), todays_at), (Some(a), Some(b)) if a < b)
+            }
+            Route7::Instant if pipeline.is_empty() => {
+                todays_at.is_none() && rows.iter().all(|r| r.exception_code == 0)
+            }
+            Route7::Instant => todays_at.is_some(),
+        };
+        if !ok {
+            routed.push((
+                cell,
+                format!("{query} ({route:?}): the route is not the cell's: {rows:#?}"),
+            ));
+        }
+    }
+    let wrong: std::collections::BTreeSet<usize> = divided
+        .iter()
+        .chain(&routed)
+        .map(|(cell, _)| *cell)
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "{} of {} cells are wrong; {} divide before the sum, {} ran on another route:\n{}",
+        wrong.len(),
+        cells.len(),
+        divided.len(),
+        routed.len(),
+        divided
+            .iter()
+            .chain(&routed)
+            .map(|(_, m)| m.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    drop_db_624(&admin, &db).await;
+}
+
+/// **T8 (issue #624, part 3b): a decided row whose labels carry an error
+/// fails the lowered `| json` count as it fails today's route.** Every line
+/// is one the database decides, so the lowered statement answers (no 395)
+/// and the group's pipeline run in PulsusDB meets the error: a `status`
+/// that is the string `abc` under `| status >= 400` (`LabelFilterErr`), and
+/// a line whose structured metadata holds `__error__`. The query log holds
+/// the lowered statement with exception 0 and no read of today's route.
+#[tokio::test]
+async fn a_decided_row_error_fails_the_lowered_json_count() {
+    skip_unless_live!();
+    let (admin, db) = fresh_db_624(pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_p3berr_{}",
+        uuid::Uuid::new_v4().simple()
+    )))
+    .await;
+    let t = ((now_ns() - 3_600_000_000_000) / 60_000_000_000) * 60_000_000_000;
+    let sec = 1_000_000_000i64;
+    for (fp, svc, lines) in [
+        (
+            821u64,
+            "p3berr1",
+            [
+                (r#"{"level":"info","status":500}"#, ""),
+                (r#"{"level":"info","status":"abc"}"#, ""),
+            ],
+        ),
+        (
+            822,
+            "p3berr2",
+            [
+                (r#"{"level":"info","status":500}"#, ""),
+                (
+                    r#"{"level":"warn","status":500}"#,
+                    r#"{"__error__":"SampleExtractionErr"}"#,
+                ),
+            ],
+        ),
+    ] {
+        land_stream_624(
+            &admin,
+            &db,
+            t,
+            fp,
+            svc,
+            &format!(r#"{{"app":"e","service_name":"{svc}"}}"#),
+        )
+        .await;
+        for (i, (body, sm)) in lines.iter().enumerate() {
+            land_line_624(&admin, &db, fp, svc, t + (10 + i as i64) * sec, body, sm).await;
+        }
+    }
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t + 120 * sec,
+            step_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let mut comments: Vec<String> = Vec::new();
+    for svc in ["p3berr1", "p3berr2"] {
+        for range in ["60s", "150s"] {
+            let query = format!(
+                r#"sum by (level) (count_over_time({{service_name="{svc}"}} | json | status >= 400 [{range}]))"#
+            );
+            let comment = format!("c624p3bt8-{}", uuid::Uuid::new_v4().simple());
+            let lowered = run_624(
+                &db,
+                hooks_624(false, None, None),
+                Some(&comment),
+                &query,
+                &params,
+            )
+            .await;
+            let todays = run_624(&db, hooks_624(true, None, None), None, &query, &params).await;
+            assert!(
+                matches!(lowered, Err(ReadError::MetricPipelineError { .. })),
+                "{query}: a pipeline error, got {lowered:?}"
+            );
+            same_outcome_624(&query, &lowered, &todays);
+            comments.push(comment);
+        }
+    }
+    let logged = logged_624(&admin, &comments).await;
+    for comment in &comments {
+        let rows = logged
+            .get(comment)
+            .unwrap_or_else(|| panic!("{comment}: no statement logged"));
+        assert!(
+            rows.iter().any(|r| is_lowered_624(&r.query)
+                && r.query.contains("throwIf(decided = 0)")
+                && r.exception_code == 0),
+            "{comment}: the lowered statement answered: {rows:#?}"
+        );
+        assert!(
+            !rows.iter().any(|r| is_todays_624(&r.query)),
+            "{comment}: today's route did not run: {rows:#?}"
+        );
     }
     drop_db_624(&admin, &db).await;
 }
