@@ -683,8 +683,8 @@ fn check_d_escape_rs_surface_is_allowlisted_and_fail_closed() {
 /// Issue #450 AC3b — the pruning residual is stated where the renderer is
 /// read, not only in the issue trail.
 ///
-/// `ch_like_contains` recovered granule pruning by rendering a form
-/// `ngrambf_v1` can serve. That index has order `n = 4`, so a needle
+/// `ch_like_contains` recovered granule pruning by rendering a form the
+/// body's `text` index can serve. Its tokenizer is `ngrams(4)`, so a needle
 /// shorter than four bytes produces no n-gram to test and prunes nothing;
 /// the next reader of this function is entitled to learn that from the
 /// function, and to be told the scale question belongs to issue #25 rather
@@ -709,7 +709,7 @@ fn check_d8_the_like_renderer_states_its_pruning_residual() {
         "`ch_like_contains` must carry a doc comment stating its pruning residual"
     );
     let doc = doc.join("\n");
-    for marker in ["ngrambf_v1", "4", "#25"] {
+    for marker in ["ngrams(4)", "4", "#25"] {
         assert!(
             doc.contains(marker),
             "the doc block immediately above `ch_like_contains` must state its pruning \

@@ -134,7 +134,7 @@ const BODIES: &[&str] = &[
 
 /// Substring lengths, in CHARS, the generator cuts at every char-boundary
 /// offset of every body. Committed: 1–3 exercise the sub-4-byte no-pruning
-/// residual, 4 is exactly the `ngrambf_v1` order, and the rest walk up to
+/// residual, 4 is exactly the body index's n-gram length, and the rest walk up to
 /// needles spanning several fields.
 const LENGTHS: &[usize] = &[1, 2, 3, 4, 5, 6, 8, 11, 16, 24];
 

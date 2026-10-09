@@ -87,8 +87,7 @@ CREATE TABLE IF NOT EXISTS {{db}}.log_samples{{on_cluster}}
     severity Int8 DEFAULT 0,
     body String CODEC(ZSTD(1)),
     structured_metadata String DEFAULT '',
-    INDEX idx_body_tokens body TYPE tokenbf_v1(32768, 3, 0) GRANULARITY 1,
-    INDEX idx_body_ngrams body TYPE ngrambf_v1(4, 32768, 3, 0) GRANULARITY 1,
+    INDEX idx_body_ngrams body TYPE text(tokenizer = ngrams(4)),
     INDEX idx_severity severity TYPE minmax GRANULARITY 4
 )
 --@single  ENGINE = MergeTree

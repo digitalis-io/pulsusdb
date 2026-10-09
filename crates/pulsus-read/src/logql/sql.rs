@@ -291,11 +291,7 @@ impl GroupExtraction<'_> {
     fn throw_line(&self, indent: &str) -> Option<String> {
         match self {
             GroupExtraction::Regexp(_) => None,
-            GroupExtraction::Json(_) => {
-                // Tests-first stub (issue #624, part 3b): no `throwIf` yet.
-                let _ = indent;
-                None
-            }
+            GroupExtraction::Json(_) => Some(format!("{indent}WHERE throwIf(decided = 0) = 0")),
         }
     }
 }

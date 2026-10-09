@@ -6395,7 +6395,7 @@ fn bucketed_statement_failure_goes_to_todays_route(e: &ChError) -> bool {
     matches!(
         e,
         ChError::Server {
-            code: CODE_MEMORY_LIMIT_EXCEEDED,
+            code: CODE_MEMORY_LIMIT_EXCEEDED | CODE_THROW_IF,
             ..
         }
     )
@@ -6442,9 +6442,22 @@ pub(in crate::logql) async fn fold_bucketed_rows(
 /// part 3b): each present key's source with its decided text as a JSON
 /// string, in key order; an absent key is omitted.
 fn json_group_document(sources: &[String], keys: &[(u8, String)]) -> String {
-    // Tests-first stub (issue #624, part 3b): an empty line.
-    let _ = (sources, keys);
-    String::new()
+    let mut doc = String::from("{");
+    let mut first = true;
+    for (source, (present, text)) in sources.iter().zip(keys) {
+        if *present == 0 {
+            continue;
+        }
+        if !first {
+            doc.push(',');
+        }
+        first = false;
+        super::labels::push_json_string(&mut doc, source);
+        doc.push(':');
+        super::labels::push_json_string(&mut doc, text);
+    }
+    doc.push('}');
+    doc
 }
 
 /// ClickHouse server exception code for `FUNCTION_THROW_IF_VALUE_IS_NON_ZERO`:
@@ -6704,6 +6717,7 @@ pub fn read_query_settings(scan_budget_bytes: u64, read_max_memory_bytes: u64) -
         .set("max_query_size", crate::querytext::MAX_QUERY_TEXT_BYTES)
         .set("max_memory_usage", read_max_memory_bytes)
         .set("max_bytes_before_external_group_by", 0u64)
+        .set("query_plan_direct_read_from_text_index", 0u64)
 }
 
 /// Pure paging-termination decision (issue #133, the #96
@@ -6827,9 +6841,11 @@ pub(in crate::logql) fn range_seconds(ns: u64) -> f64 {
 /// `Some(range)` then; the four reducers take no grouping of their own
 /// (`RangeAggOp::allows_grouping`).
 fn rate_after_sum(mp: &MetricPlan) -> Option<u64> {
-    // Tests-first stub (issue #624, part 3b): every route divides per series.
-    let _ = mp;
-    None
+    if !matches!(mp.op, RangeAggOp::Rate | RangeAggOp::BytesRate) {
+        return None;
+    }
+    super::plan::parent_sum_grouping(mp.op, false, &mp.vector_aggs)?;
+    mp.rate_window_ns
 }
 
 /// The divisor the range step applies per series: none when the parent

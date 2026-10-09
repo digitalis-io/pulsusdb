@@ -1891,9 +1891,95 @@ pub(in crate::logql) fn json_count_route(
     op: RangeAggOp,
     vector_aggs: &[VectorAggSpec],
 ) -> Option<sql::JsonCount> {
-    // Tests-first stub (issue #624, part 3b): nothing lowers yet.
-    let _ = (pipeline, op, vector_aggs);
-    None
+    if !matches!(
+        op,
+        RangeAggOp::CountOverTime
+            | RangeAggOp::Rate
+            | RangeAggOp::BytesOverTime
+            | RangeAggOp::BytesRate
+            | RangeAggOp::AbsentOverTime
+    ) {
+        return None;
+    }
+    let at = pipeline
+        .iter()
+        .position(|s| !matches!(s, Stage::LineFilter(lf) if is_pushable_line_filter(lf)))?;
+    let Stage::Parser(ParserStage::Json { extractions }) = &pipeline[at] else {
+        return None;
+    };
+    let mut filter_names: Vec<String> = Vec::new();
+    for stage in &pipeline[at + 1..] {
+        let Stage::LabelFilter(expr) = stage else {
+            return None;
+        };
+        pulsus_logql::for_each_label_filter(expr, |e| match e {
+            LabelFilterExpr::Match(m) => filter_names.push(m.name.clone()),
+            LabelFilterExpr::Compare { name, .. } | LabelFilterExpr::Ip { name, .. } => {
+                filter_names.push(name.clone())
+            }
+            LabelFilterExpr::And(..) | LabelFilterExpr::Or(..) => {}
+        });
+    }
+    if filter_names.iter().any(|n| is_reserved_key_name(n)) {
+        return None;
+    }
+    if extractions.is_empty() {
+        // The bare form: only a parent `sum` bounds the labels the answer reads.
+        let by: Vec<String> = match parent_sum_grouping(op, false, vector_aggs)? {
+            None => Vec::new(),
+            Some(g) if g.kind == GroupingKind::By => g.labels.clone(),
+            Some(_) => return None,
+        };
+        let mut names: Vec<String> = by.into_iter().chain(filter_names).collect();
+        names.sort_unstable();
+        names.dedup();
+        if names
+            .iter()
+            .any(|n| is_reserved_key_name(n) || n.ends_with("_extracted"))
+        {
+            return None;
+        }
+        return Some(sql::JsonCount {
+            form: sql::UnwrapForm::Bare,
+            keys: names
+                .into_iter()
+                .map(|n| sql::UnwrapKeyLabel {
+                    label: n.clone(),
+                    source: n,
+                })
+                .collect(),
+        });
+    }
+    let mut keys: Vec<sql::UnwrapKeyLabel> = Vec::new();
+    for e in extractions {
+        if is_reserved_key_name(&e.label) {
+            return None;
+        }
+        let segs = super::json_expr::parse_json_expr(&e.expression).ok()?;
+        let [super::pipeline::JsonPathSeg::Field(source)] = segs.as_slice() else {
+            return None;
+        };
+        if !plain_path_segment(source) {
+            return None;
+        }
+        keys.push(sql::UnwrapKeyLabel {
+            label: e.label.clone(),
+            source: source.clone(),
+        });
+    }
+    let mut destinations: Vec<&str> = keys.iter().map(|k| k.label.as_str()).collect();
+    destinations.sort_unstable();
+    for (i, d) in destinations.iter().enumerate() {
+        let renamed = format!("{d}_extracted");
+        if destinations[i + 1..].iter().any(|o| o == d) || destinations.contains(&renamed.as_str())
+        {
+            return None;
+        }
+    }
+    Some(sql::JsonCount {
+        form: sql::UnwrapForm::Targeted,
+        keys,
+    })
 }
 
 /// Issue #507 (W4): does the pipeline carry a `| unwrap` with a
@@ -3974,7 +4060,7 @@ pub(crate) fn compile_line_filters(pipeline: &[Stage]) -> Result<Vec<CheckedFrag
 /// `exec.rs`'s `stats` gate) so the two paths never drift.
 ///
 /// An `ip(…)` alternative is a range test over IP-shaped substrings — it
-/// renders no `body LIKE`/`match(body, …)` predicate the body skip indexes
+/// renders no `body LIKE`/`match(body, …)` predicate the body index
 /// could prune with, so it (and any `or` group containing one) evaluates
 /// client-side. A pure literal/regex `or` group pushes down as a
 /// disjunction of the same per-alternative predicate.

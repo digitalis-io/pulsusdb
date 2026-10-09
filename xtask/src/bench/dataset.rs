@@ -30,8 +30,8 @@ use pulsus_model::{Date, Fingerprint, LabelSet, stream_fingerprint};
 
 use super::Profile;
 
-/// A single-token (no separators — ClickHouse's `tokenbf_v1` bloom index
-/// rejects tokens containing whitespace/separators) needle injected into a
+/// A single-token (no separators, as the body's former token bloom index
+/// required) needle injected into a
 /// controlled fraction of bodies so the body-search shape's selectivity is
 /// a known constant, not incidental to random content.
 pub const NEEDLE: &str = "xtaskneedle7c91a";

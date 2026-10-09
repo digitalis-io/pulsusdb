@@ -90,6 +90,8 @@ const INJECTED_SETTINGS: &[&str] = &[
     "optimize_skip_unused_shards",
     "prefer_localhost_replica",
     "query_id",
+    // Issue #624: the `text` body index's direct read is off on every LogQL read.
+    "query_plan_direct_read_from_text_index",
     "read_overflow_mode",
     "read_overflow_mode_leaf",
     "result_overflow_mode",
