@@ -324,8 +324,8 @@ impl Lower<Lql> for LineFilterLower {
     /// Two conditions, and both are the shipped rule rather than a new
     /// one: the line must resolve to a SQL expression, and the filter
     /// must be one [`super::plan::is_pushable_line_filter`] accepts — an
-    /// `ip()` alternative renders no predicate the body skip indexes
-    /// could prune with.
+    /// `ip()` alternative renders no predicate the body index could prune
+    /// with.
     fn capability(&self, s: &LqlLink, rel: &Relation<Lql>) -> Capability {
         let LqlLink::Pipe(Stage::LineFilter(lf)) = s else {
             return Capability::No(BlockReason::NotYetLowered);

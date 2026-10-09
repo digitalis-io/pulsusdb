@@ -18,9 +18,9 @@ use super::plan::{self, ClientAgg, ClientValue, MetricNode, MetricPlan, Plan, St
 use super::predicate::{BucketGridRefusal, CheckedFragment, CheckedLiteral};
 use super::rows::{
     DetectedLabelRow, LabelNameRow, LabelValueRow, LogStatsRow, MetricInstantRow,
-    MetricRangeBucketRow, MetricRangeRegexpRow, MetricRangeUnwrappedRow, MetricScanRow,
-    MetricScanRxRow, PatternFetchRow, SampleRow, SampleRxRow, StreamMetaRow, StreamRow,
-    TailSampleRow, TailSampleRxRow, UnwrappedLaneRow, VolumeRow,
+    MetricRangeBucketRow, MetricRangeJsonRow, MetricRangeRegexpRow, MetricRangeUnwrappedRow,
+    MetricScanRow, MetricScanRxRow, PatternFetchRow, SampleRow, SampleRxRow, StreamMetaRow,
+    StreamRow, TailSampleRow, TailSampleRxRow, UnwrappedLaneRow, VolumeRow,
 };
 use futures::Stream;
 use futures::StreamExt;
@@ -1886,8 +1886,25 @@ impl LogQlEngine {
                 })?;
                 groups.push_row(&row)?;
             }
-            let series = groups.finish(mp.rate_window_ns);
-            let series = charged_instant_chain(series, &mp.vector_aggs, MAX_POST_AGG_BYTES)?;
+            let series = groups.finish(step_rate_window(mp));
+            let series = match rate_after_sum(mp) {
+                None => charged_instant_chain(series, &mp.vector_aggs, MAX_POST_AGG_BYTES)?,
+                Some(window) => {
+                    let (sum, outer) = mp
+                        .vector_aggs
+                        .split_last()
+                        .expect("rate_after_sum holds only under a parent sum");
+                    let mut summed = charged_instant_chain(
+                        series,
+                        std::slice::from_ref(sum),
+                        MAX_POST_AGG_BYTES,
+                    )?;
+                    for s in &mut summed {
+                        s.value = apply_rate(s.value, Some(window));
+                    }
+                    charged_instant_chain(summed, outer, MAX_POST_AGG_BYTES)?
+                }
+            };
             Ok(QueryResult::Vector(
                 series
                     .into_iter()
@@ -1986,6 +2003,9 @@ impl LogQlEngine {
                                 &s.todays_route,
                                 step,
                                 s.regexp.as_ref().map(|r| r.groups.clone()),
+                                s.json
+                                    .as_ref()
+                                    .map(|j| j.keys.iter().map(|k| k.source.clone()).collect()),
                             )
                         }
                         // #507's statement (range equal to step) keeps the
@@ -2015,35 +2035,60 @@ impl LogQlEngine {
                             &mp.value,
                             super::sql::MetricValue::Staged(s) if s.regexp.is_some()
                         );
-                        let opened = if regexp {
-                            self.client
-                                .query_stream::<MetricRangeRegexpRow>(&sql, &self.budget_settings())
+                        let json = matches!(
+                            &mp.value,
+                            super::sql::MetricValue::Staged(s) if s.json.is_some()
+                        );
+                        if json {
+                            match self
+                                .client
+                                .query_stream::<MetricRangeJsonRow>(&sql, &self.budget_settings())
                                 .await
                                 .map(RxRows::<MetricRangeBucketRow, _>::Rx)
-                        } else {
-                            self.client
-                                .query_stream::<MetricRangeBucketRow>(&sql, &self.budget_settings())
-                                .await
-                                .map(RxRows::<_, MetricRangeRegexpRow>::Plain)
-                        };
-                        match opened {
-                            Ok(stream) => fold_bucketed_rows(stream, groups).await?,
-                            Err(e) if bucketed_statement_failure_goes_to_todays_route(&e) => {
-                                BucketedRows::TodaysRoute
+                            {
+                                Ok(stream) => fold_bucketed_rows(stream, groups).await?,
+                                Err(e) if bucketed_statement_failure_goes_to_todays_route(&e) => {
+                                    BucketedRows::TodaysRoute
+                                }
+                                Err(e) => BucketedRows::Failed(e),
                             }
-                            Err(e) => BucketedRows::Failed(e),
+                        } else {
+                            let opened = if regexp {
+                                self.client
+                                    .query_stream::<MetricRangeRegexpRow>(
+                                        &sql,
+                                        &self.budget_settings(),
+                                    )
+                                    .await
+                                    .map(RxRows::<MetricRangeBucketRow, _>::Rx)
+                            } else {
+                                self.client
+                                    .query_stream::<MetricRangeBucketRow>(
+                                        &sql,
+                                        &self.budget_settings(),
+                                    )
+                                    .await
+                                    .map(RxRows::<_, MetricRangeRegexpRow>::Plain)
+                            };
+                            match opened {
+                                Ok(stream) => fold_bucketed_rows(stream, groups).await?,
+                                Err(e) if bucketed_statement_failure_goes_to_todays_route(&e) => {
+                                    BucketedRows::TodaysRoute
+                                }
+                                Err(e) => BucketedRows::Failed(e),
+                            }
                         }
                     };
                     match outcome {
                         BucketedRows::Folded(groups) => {
-                            let series = groups.finish_checked(mp.rate_window_ns)?;
+                            let series = groups.finish_checked(step_rate_window(mp))?;
                             // The emitted points are on the SHIFTED grid;
                             // this puts them back on the caller's, the one
                             // place the offset is added back on this path
                             // (issue #343).
                             let result =
                                 shift_emitted_points(QueryResult::Matrix(series), mp.offset_ns);
-                            apply_vector_aggs(result, &mp.vector_aggs)
+                            apply_leaf_aggs(mp, result, 0)
                         }
                         // Issue #624, D4: the statement ran out of memory.
                         // Today's route streams the same query in bounded
@@ -2466,7 +2511,7 @@ impl LogQlEngine {
                 meta,
                 client,
                 window,
-                mp.rate_window_ns,
+                step_rate_window(mp),
                 self.todays_route_caps(),
             )?
             .with_range_step(step);
@@ -2494,7 +2539,7 @@ impl LogQlEngine {
                         meta,
                         client,
                         instant,
-                        mp.rate_window_ns,
+                        step_rate_window(mp),
                         self.todays_route_caps(),
                     )?
                     .with_range_step(step),
@@ -2526,7 +2571,7 @@ impl LogQlEngine {
         }
         state.push_rows(&chunk)?;
         let result = state.finish()?;
-        apply_vector_aggs(result, &mp.vector_aggs[..mp.vector_aggs.len() - folded])
+        apply_leaf_aggs(mp, result, folded)
     }
 
     /// Executes `variants(...) of (...)` (issue #221): ONE scan (planned
@@ -5583,9 +5628,23 @@ struct StagedFold {
     /// A `regexp` count's sent groups, `(name, 1-based index)` (issue #624,
     /// part 3a): the stage reads each row's `matched` and `caps` (D3).
     regexp: Option<Vec<(String, usize)>>,
+    /// A `| json` count's key sources (issue #624, part 3b): each group's
+    /// keys become the document its stages run over.
+    json: Option<Vec<String>>,
     /// The last group's outcome, keyed by the whole group key.
-    memo: Option<(Fingerprint, String, u8, Vec<String>, StagedOutcome)>,
+    memo: Option<StagedMemo>,
 }
+
+/// [`StagedFold`]'s memo: the group key — `(fingerprint,
+/// structured_metadata, matched, caps, keys)` — and that group's outcome.
+type StagedMemo = (
+    Fingerprint,
+    String,
+    u8,
+    Vec<String>,
+    Vec<(u8, String)>,
+    StagedOutcome,
+);
 
 /// What the stages make of one group.
 #[derive(Clone)]
@@ -5653,6 +5712,7 @@ impl PushdownRangeGroups {
         todays_route: &ClientAgg,
         step: super::pipeline::RangeStepRules,
         regexp: Option<Vec<(String, usize)>>,
+        json: Option<Vec<String>>,
     ) -> Self {
         let fan_out = compiled.metric_mutates_labels() || todays_route.grouping.is_some();
         let width = usize::try_from(self.grid_points).unwrap_or(0);
@@ -5666,6 +5726,7 @@ impl PushdownRangeGroups {
             fp_series: HashMap::new(),
             absent,
             regexp,
+            json,
             memo: None,
         }));
         self
@@ -5696,11 +5757,12 @@ impl PushdownRangeGroups {
             ..
         } = self;
         let staged = staged.as_mut().expect("the staged mode");
-        if let Some((fp, sm, matched, caps, outcome)) = &staged.memo
+        if let Some((fp, sm, matched, caps, keys, outcome)) = &staged.memo
             && *fp == row.fingerprint
             && *sm == row.structured_metadata
             && *matched == row.matched
             && *caps == row.caps
+            && *keys == row.keys
         {
             return Ok(outcome.clone());
         }
@@ -5729,8 +5791,15 @@ impl PushdownRangeGroups {
             },
             None => super::pipeline::RegexpCaptures::None,
         };
+        // Issue #624, part 3b: the group's key labels as the document its
+        // `| json` stage reads; every line of the group gives that stage the
+        // same labels.
+        let document = match &staged.json {
+            Some(sources) => json_group_document(sources, &row.keys),
+            None => String::new(),
+        };
         let run = staged.compiled.run_metric_step_into_with_captures(
-            "",
+            &document,
             pipeline_base,
             0,
             sm,
@@ -5772,6 +5841,7 @@ impl PushdownRangeGroups {
             row.structured_metadata.clone(),
             row.matched,
             row.caps.clone(),
+            row.keys.clone(),
             outcome.clone(),
         ));
         Ok(outcome)
@@ -6198,6 +6268,22 @@ fn bucketed_range_sql(
         }),
         _ => None,
     };
+    // Issue #624, part 3b: a `| json` count's key labels join the group key.
+    let json = match &mp.value {
+        super::sql::MetricValue::Staged(s) => match &s.json {
+            Some(j) => Some(
+                super::sql::json_count_columns(j.form, &j.keys)
+                    .map_err(|_| BucketGridRefusal::RollupSource)?,
+            ),
+            None => None,
+        },
+        _ => None,
+    };
+    let extraction = match (&regexp, &json) {
+        (Some(r), _) => Some(super::sql::GroupExtraction::Regexp(r)),
+        (None, Some(j)) => Some(super::sql::GroupExtraction::Json(j)),
+        (None, None) => None,
+    };
     // Issue #624: #507's statement when the range equals the step, which is
     // smaller and faster there; the sliding statement at every other range.
     if mp.range_ns.get() != step_ns {
@@ -6213,7 +6299,7 @@ fn bucketed_range_sql(
                 range_ns: mp.range_ns.get(),
             },
             predicates,
-            regexp.as_ref(),
+            extraction,
         );
     }
     let lo_ns = mp
@@ -6235,7 +6321,7 @@ fn bucketed_range_sql(
         // `absent_over_time`, which never lowers onto this path
         // (`compile.rs`'s `RangeAggLower::capability` makes it `Never`).
         ScanProjection::WithStructuredMetadata,
-        regexp.as_ref(),
+        extraction,
     )
 }
 
@@ -6302,8 +6388,10 @@ pub fn unwrapped_fallback_client_agg(
 }
 
 /// Which failures of either bucketed range statement hand the query to
-/// today's route (issue #624, D4): the server's memory code, 241, only.
-/// Today's route streams the same query in bounded memory, so it answers
+/// today's route (issue #624, D4): the server's memory code, 241, and the
+/// `throwIf` code, 395, which a lowered `| json` count raises on a row the
+/// database does not decide (part 3b, D4). Today's route streams the same
+/// query in bounded memory and parses every line itself, so it answers
 /// where the statement could not. The scan budget (307) is its `422`, a
 /// timeout (159) is the timeout response, and a row that does not decode is
 /// a defect in the row type — none of them is a reason to read the lines.
@@ -6311,7 +6399,7 @@ fn bucketed_statement_failure_goes_to_todays_route(e: &ChError) -> bool {
     matches!(
         e,
         ChError::Server {
-            code: CODE_MEMORY_LIMIT_EXCEEDED,
+            code: CODE_MEMORY_LIMIT_EXCEEDED | CODE_THROW_IF,
             ..
         }
     )
@@ -6352,6 +6440,28 @@ pub(in crate::logql) async fn fold_bucketed_rows(
         }
     }
     Ok(BucketedRows::Folded(groups))
+}
+
+/// The document a `| json` count's group runs its stages over (issue #624,
+/// part 3b): each present key's source with its decided text as a JSON
+/// string, in key order; an absent key is omitted.
+fn json_group_document(sources: &[String], keys: &[(u8, String)]) -> String {
+    let mut doc = String::from("{");
+    let mut first = true;
+    for (source, (present, text)) in sources.iter().zip(keys) {
+        if *present == 0 {
+            continue;
+        }
+        if !first {
+            doc.push(',');
+        }
+        first = false;
+        super::labels::push_json_string(&mut doc, source);
+        doc.push(':');
+        super::labels::push_json_string(&mut doc, text);
+    }
+    doc.push('}');
+    doc
 }
 
 /// ClickHouse server exception code for `FUNCTION_THROW_IF_VALUE_IS_NON_ZERO`:
@@ -6597,6 +6707,13 @@ fn metric_plan_window(mp: &MetricPlan) -> ClientWindow {
 /// shared stage-1 stream resolution several endpoints run — a breach is
 /// server code 241 → [`TooBroadReason::LogqlReadMemory`] → `422`, never
 /// the raw-exception `500` it was before.
+///
+/// Issue #624, part 3b adds `query_plan_direct_read_from_text_index = 0`.
+/// With the body's `text` index, a statement whose `WHERE` holds a line
+/// filter leaves a query-condition-cache entry under its `PREWHERE service =
+/// …` condition that makes the next statement with that condition count too
+/// few lines (measured on 26.3.29.7). Turning the direct read off corrects
+/// it and leaves the condition cache and the index analysis on.
 pub fn read_query_settings(scan_budget_bytes: u64, read_max_memory_bytes: u64) -> QuerySettings {
     QuerySettings::new()
         .set("max_bytes_to_read", scan_budget_bytes)
@@ -6604,6 +6721,7 @@ pub fn read_query_settings(scan_budget_bytes: u64, read_max_memory_bytes: u64) -
         .set("max_query_size", crate::querytext::MAX_QUERY_TEXT_BYTES)
         .set("max_memory_usage", read_max_memory_bytes)
         .set("max_bytes_before_external_group_by", 0u64)
+        .set("query_plan_direct_read_from_text_index", 0u64)
 }
 
 /// Pure paging-termination decision (issue #133, the #96
@@ -6718,6 +6836,75 @@ pub(in crate::logql) fn range_seconds(ns: u64) -> f64 {
     // `Duration` is an int64 nanosecond count with the same ceiling, so the
     // two forms agree over the whole representable domain, not just here.
     sec as f64 + nsec as f64 / 1_000_000_000.0
+}
+
+/// The divisor of a `rate`/`bytes_rate` directly under a `sum` (issue
+/// #624, part 3b): the reference hands the sum's grouping to the range step
+/// (`canInjectVectorGrouping`, `pkg/logql/syntax/ast.go:1616-1640 @
+/// v3.7.4`), so each sum group is one series whose count is divided once.
+/// `Some(range)` then; the four reducers take no grouping of their own
+/// (`RangeAggOp::allows_grouping`).
+fn rate_after_sum(mp: &MetricPlan) -> Option<u64> {
+    if !matches!(mp.op, RangeAggOp::Rate | RangeAggOp::BytesRate) {
+        return None;
+    }
+    super::plan::parent_sum_grouping(mp.op, false, &mp.vector_aggs)?;
+    mp.rate_window_ns
+}
+
+/// The divisor the range step applies per series: none when the parent
+/// sum divides instead ([`rate_after_sum`]).
+fn step_rate_window(mp: &MetricPlan) -> Option<u64> {
+    match rate_after_sum(mp) {
+        Some(_) => None,
+        None => mp.rate_window_ns,
+    }
+}
+
+/// `mp`'s vector aggregations over a range step's result, the innermost
+/// `folded` of them already applied by the fold; under [`rate_after_sum`]
+/// the division runs between the parent sum and the rest.
+fn apply_leaf_aggs(
+    mp: &MetricPlan,
+    result: QueryResult,
+    folded: usize,
+) -> Result<QueryResult, ReadError> {
+    let Some(window) = rate_after_sum(mp) else {
+        return apply_vector_aggs(result, &mp.vector_aggs[..mp.vector_aggs.len() - folded]);
+    };
+    let (sum, outer) = mp
+        .vector_aggs
+        .split_last()
+        .expect("rate_after_sum holds only under a parent sum");
+    let summed = if folded == 0 {
+        apply_vector_aggs(result, std::slice::from_ref(sum))?
+    } else {
+        result
+    };
+    let divided = match summed {
+        QueryResult::Matrix(series) => QueryResult::Matrix(
+            series
+                .into_iter()
+                .map(|mut s| {
+                    for p in &mut s.points {
+                        p.1 = apply_rate(p.1, Some(window));
+                    }
+                    s
+                })
+                .collect(),
+        ),
+        QueryResult::Vector(samples) => QueryResult::Vector(
+            samples
+                .into_iter()
+                .map(|mut s| {
+                    s.value = apply_rate(s.value, Some(window));
+                    s
+                })
+                .collect(),
+        ),
+        other => other,
+    };
+    apply_vector_aggs(divided, outer)
 }
 
 pub(in crate::logql) fn apply_rate(n: f64, rate_window_ns: Option<u64>) -> f64 {
@@ -7262,6 +7449,7 @@ mod tests {
             structured_metadata: sm.to_string(),
             matched: 0,
             caps: Vec::new(),
+            keys: Vec::new(),
         };
         assert!(
             PushdownRangeGroups::new(
@@ -7917,6 +8105,8 @@ mod tests {
             s.get("max_query_size"),
             Some(crate::querytext::MAX_QUERY_TEXT_BYTES.to_string().as_str())
         );
+        // S-T5 (issue #624, part 3b): the `text` body index's direct read is off.
+        assert_eq!(s.get("query_plan_direct_read_from_text_index"), Some("0"));
     }
 
     /// **T37.** The three discovery dispatches carry `budget_settings`' set
@@ -10132,6 +10322,7 @@ mod tests {
             structured_metadata: sm.to_string(),
             matched: 0,
             caps: Vec::new(),
+            keys: Vec::new(),
         }
     }
 
@@ -10537,6 +10728,7 @@ mod tests {
                 c,
                 RangeStepRules::PLAIN,
                 None,
+                None,
             )
         }
         let pairs = |p: &[(&str, &str)]| -> Vec<(String, String)> {
@@ -10672,10 +10864,11 @@ mod tests {
         );
     }
 
-    /// N7 (issue #624): only the server's memory code hands a bucketed
-    /// statement's failure to today's route.
+    /// N7 (issue #624) and T6 (part 3b): the server's memory code and the
+    /// `| json` count's `throwIf` code hand a bucketed statement's failure
+    /// to today's route; nothing else does.
     #[test]
-    fn only_the_memory_code_hands_a_bucketed_statement_to_todays_route() {
+    fn the_memory_and_throw_codes_hand_a_bucketed_statement_to_todays_route() {
         let server = |code: i32| ChError::Server {
             code,
             message: format!("Code: {code}. DB::Exception: x"),
@@ -10684,7 +10877,7 @@ mod tests {
             (server(241), true),
             (server(307), false),
             (server(159), false),
-            (server(395), false),
+            (server(395), true),
             (ChError::Decode("bad row".to_string()), false),
         ] {
             assert_eq!(

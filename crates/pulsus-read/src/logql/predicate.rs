@@ -470,18 +470,16 @@ pub fn index_nre_branch(key: &str, pattern: &str) -> Result<CheckedFragment, Pip
 /// **No token prefilter is minted, in any form (issue #450).** The old
 /// rendering ANDed `hasToken(body, <token>)` onto the exact predicate on
 /// the claim that a bloom filter has no false negatives. That is true of
-/// the `tokenbf_v1` *skip index* and false of the `hasToken()` *function*,
+/// a token bloom-filter *skip index* and false of the `hasToken()` *function*,
 /// which is an exact whole-token membership test: a needle that is a
 /// fragment of a longer token gives `hasToken = 0` while the text is
 /// plainly present, so `|=` dropped matching lines, `!=` kept lines it
 /// should have excluded, and a needle containing `_` failed the query
 /// outright (`BAD_ARGUMENTS`). There is no safe subset for us to write —
 /// a token prefilter is equivalence-preserving only when the needle is
-/// token-aligned *in the data*, which the query cannot know. ClickHouse's
-/// own `LIKE`/`match` index analysis derives the sound version of that
-/// rule (a token is required only when it is separator-delimited *inside
-/// the pattern*) and applies it to `tokenbf_v1` for free, and the
-/// `ngrambf_v1(4, …)` body index prunes for both forms.
+/// token-aligned *in the data*, which the query cannot know. The body's
+/// one index, `text(tokenizer = ngrams(4))`, prunes for both forms from
+/// ClickHouse's own `LIKE`/`match` index analysis; there is no token index.
 ///
 /// An `or` group (M8-LQ2 `linefilter.or`) is a disjunction of the same
 /// per-alternative predicate: `((a) OR (b) …)` for positive ops,
@@ -755,7 +753,7 @@ fn parsed_name_expr(name: &str, parser: &ParserStage) -> Option<String> {
 /// equalled `v` and those bytes are in the body. Rows without `v` anywhere
 /// are dropped, and the evaluator drops them too.
 ///
-/// It reaches the body skip indexes, so for a selective value it prunes
+/// It reaches the body index, so for a selective value it prunes
 /// better than a key-precise comparison would.
 ///
 /// **Route B is NOT offered for `| json` or `| logfmt`**, and the reason is
@@ -1122,7 +1120,8 @@ fn contains_predicate(phrase: &str) -> String {
 /// whose pattern the `idx_body_ngrams` index would under-count.** For a
 /// case-insensitive alternation inside a group
 /// ([`pulsus_re2::case_folded_alternation_in_group`]), the database's
-/// n-gram index drops granules `match()` accepts: `match(s,
+/// `text` index of 4-grams drops granules `match()` accepts, as the
+/// bloom-filter index it replaced (part 3b) did: `match(s,
 /// '(?i)(denied|refused)')` over a row `audit DENIED open` counts 0 with the
 /// index and 1 without it. Wrapping the column in `identity()` keeps the
 /// index out of this one predicate — not out of the statement, so a second

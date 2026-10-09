@@ -238,6 +238,136 @@ pub struct StagedCount {
     /// The pipeline's one `regexp` stage, when the statement runs it (issue
     /// #624, part 3a): its captures join the group key.
     pub regexp: Option<RegexpCount>,
+    /// The pipeline's one `| json` stage, when the statement reads its key
+    /// labels (issue #624, part 3b): the keys join the group key.
+    pub json: Option<JsonCount>,
+}
+
+/// The `| json` stage of a lowered count (issue #624, part 3b): its form
+/// and the key labels the statement reads, `(label, top-level source)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsonCount {
+    pub form: UnwrapForm,
+    pub keys: Vec<UnwrapKeyLabel>,
+}
+
+/// The reader columns of a lowered `| json` count (issue #624, part 3b),
+/// each `<expr> AS <name>`, ending in `decided` and `keys`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsonCountColumns {
+    pub readers: Vec<String>,
+}
+
+/// What a lowered count extracts from the stored line into its group key
+/// (issue #624, parts 3a and 3b).
+#[derive(Debug, Clone, Copy)]
+pub enum GroupExtraction<'a> {
+    Regexp(&'a super::predicate::RegexpGroupColumns),
+    Json(&'a JsonCountColumns),
+}
+
+impl GroupExtraction<'_> {
+    fn key_columns(&self) -> &'static str {
+        match self {
+            GroupExtraction::Regexp(_) => "matched, caps",
+            GroupExtraction::Json(_) => "keys",
+        }
+    }
+    fn lines(&self, indent: &str) -> Vec<String> {
+        match self {
+            GroupExtraction::Regexp(r) => regexp_extraction_lines(r, indent).to_vec(),
+            GroupExtraction::Json(j) => {
+                let n = j.readers.len();
+                j.readers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| format!("{indent}{r}{}", if i + 1 < n { "," } else { "" }))
+                    .collect()
+            }
+        }
+    }
+    /// The filter under the extraction level: a `| json` count fails with
+    /// code 395 on the first row the database did not decide.
+    fn throw_line(&self, indent: &str) -> Option<String> {
+        match self {
+            GroupExtraction::Regexp(_) => None,
+            GroupExtraction::Json(_) => Some(format!("{indent}WHERE throwIf(decided = 0) = 0")),
+        }
+    }
+}
+
+/// [`JsonCountColumns`] for a lowered `| json` count (issue #624, part 3b):
+/// per key label #507's readers (`l<i>_r`, `_amb`, `_str`, `_int`,
+/// `_absent`), the nesting bound, and on the bare form the key budget and
+/// `doc_ok` (a valid document whose top level is an object); `decided` is
+/// their product and `keys` the decided texts.
+pub fn json_count_columns(
+    form: UnwrapForm,
+    keys: &[UnwrapKeyLabel],
+) -> Result<JsonCountColumns, KeyStatementRefusal> {
+    use super::predicate::{
+        ReaderColumns, json_depth_bound, json_flatten_key_budget_bound, literal,
+        unwrap_label_integer_text, unwrap_name_absence, unwrap_name_ambiguity,
+    };
+    let backslash = literal("\\");
+    let mut w: Vec<String> = Vec::new();
+    let mut decided: Vec<String> = Vec::new();
+    for (i, key) in keys.iter().enumerate() {
+        let t = format!("l{i}");
+        let src = literal(&key.source);
+        let src = src.as_sql();
+        w.push(format!("JSONExtractRaw(body, {src}) AS {t}_r"));
+        w.push(format!(
+            "{} AS {t}_amb",
+            match form {
+                UnwrapForm::Targeted => "toUInt8(0)".to_string(),
+                UnwrapForm::Bare => unwrap_name_ambiguity(&key.source)?.as_sql().to_string(),
+            }
+        ));
+        w.push(format!(
+            "toUInt8({t}_amb = 0 AND startsWith({t}_r, '\"') AND position({t}_r, {}) = 0) AS {t}_str",
+            backslash.as_sql()
+        ));
+        w.push(format!(
+            "toUInt8({t}_amb = 0 AND {} AND JSONType(body, {src}) IN ('Int64', 'UInt64')) AS {t}_int",
+            unwrap_label_integer_text(ReaderColumns::Key(i)).as_sql()
+        ));
+        w.push(format!(
+            "{} AS {t}_absent",
+            unwrap_name_absence(ReaderColumns::Key(i), &key.source, form)?.as_sql()
+        ));
+        decided.push(format!("toUInt8(({t}_str + {t}_int + {t}_absent) > 0)"));
+    }
+    w.push(format!(
+        "toUInt8({}) AS depth_ok",
+        json_depth_bound().as_sql()
+    ));
+    decided.push("depth_ok".to_string());
+    if form == UnwrapForm::Bare {
+        w.push(format!(
+            "toUInt8({}) AS keybudget_ok",
+            json_flatten_key_budget_bound().as_sql()
+        ));
+        w.push("toUInt8(isValidJSON(body) AND JSONType(body) = 'Object') AS doc_ok".to_string());
+        decided.push("keybudget_ok".to_string());
+        decided.push("doc_ok".to_string());
+    }
+    w.push(format!("toUInt8({}) AS decided", decided.join(" * ")));
+    if keys.is_empty() {
+        w.push("CAST([], 'Array(Tuple(UInt8, String))') AS keys".to_string());
+    } else {
+        let items: Vec<String> = (0..keys.len())
+            .map(|i| {
+                let t = format!("l{i}");
+                format!(
+                    "(toUInt8(decided * ({t}_str + {t}_int)), if(decided = 1, if({t}_str = 1, \
+                     substring({t}_r, 2, length({t}_r) - 2), if({t}_int = 1, {t}_r, '')), ''))"
+                )
+            })
+            .collect();
+        w.push(format!("[{}] AS keys", items.join(", ")));
+    }
+    Ok(JsonCountColumns { readers: w })
 }
 
 /// The `regexp` stage of a lowered count (issue #624, part 3a, D2 and D4):
@@ -1477,7 +1607,7 @@ pub fn metric_range_bucketed_with_regexp(
     scan: BucketedScan,
     extra_predicates: &[CheckedFragment],
     projection: ScanProjection,
-    regexp: Option<&super::predicate::RegexpGroupColumns>,
+    regexp: Option<GroupExtraction<'_>>,
 ) -> Result<String, super::predicate::BucketGridRefusal> {
     let MetricSource { table, shape } = source;
     let (bucket_col, agg_expr) = (shape.bucket_col(), shape.agg_expr());
@@ -1502,7 +1632,8 @@ pub fn metric_range_bucketed_with_regexp(
         let mut lines: Vec<String> = vec![
             format!(
                 "SELECT fingerprint, {bucket_sql} AS bucket_ns, {agg_expr} AS n, \
-                 structured_metadata, matched, caps"
+                 structured_metadata, {}",
+                regexp.key_columns()
             ),
             "FROM (".to_string(),
             format!(
@@ -1510,7 +1641,7 @@ pub fn metric_range_bucketed_with_regexp(
                 regexp_body_column(agg_expr)
             ),
         ];
-        lines.extend(regexp_extraction_lines(regexp, "         "));
+        lines.extend(regexp.lines("         "));
         lines.push(format!("  FROM {table}"));
         if !services.is_empty() {
             lines.push(format!("  PREWHERE {}", service_predicate(services)));
@@ -1523,9 +1654,11 @@ pub fn metric_range_bucketed_with_regexp(
             lines.push(format!("    AND {}", clause.as_sql()));
         }
         lines.push(")".to_string());
-        lines.push(
-            "GROUP BY fingerprint, bucket_ns, structured_metadata, matched, caps".to_string(),
-        );
+        lines.extend(regexp.throw_line(""));
+        lines.push(format!(
+            "GROUP BY fingerprint, bucket_ns, structured_metadata, {}",
+            regexp.key_columns()
+        ));
         return Ok(lines.join("\n"));
     }
     let mut sql = format!(
@@ -1613,7 +1746,7 @@ pub fn metric_range_sliding_with_regexp(
     fingerprints: &[FpLiteral],
     scan: SlidingScan,
     extra_predicates: &[CheckedFragment],
-    regexp: Option<&super::predicate::RegexpGroupColumns>,
+    regexp: Option<GroupExtraction<'_>>,
 ) -> Result<String, super::predicate::BucketGridRefusal> {
     let MetricSource { table, shape } = source;
     if shape.bucket_col() != "timestamp_ns" {
@@ -1636,17 +1769,16 @@ pub fn metric_range_sliding_with_regexp(
     // Issue #624, part 3a: a `regexp` stage's captures join the group key,
     // computed one level under the innermost `SELECT`.
     let key = match regexp {
-        Some(_) => "fingerprint, structured_metadata, matched, caps",
-        None => "fingerprint, structured_metadata",
+        Some(x) => format!("fingerprint, structured_metadata, {}", x.key_columns()),
+        None => "fingerprint, structured_metadata".to_string(),
     };
     let mut lines: Vec<String> = vec![
         format!(
             "SELECT fingerprint, toInt64({grid_start_ns} + k * {step_ns}) AS bucket_ns, \
              toUInt64(v) AS n, structured_metadata{}",
-            if regexp.is_some() {
-                ", matched, caps"
-            } else {
-                ""
+            match regexp {
+                Some(x) => format!(", {}", x.key_columns()),
+                None => String::new(),
             }
         ),
         "FROM (".to_string(),
@@ -1674,7 +1806,7 @@ pub fn metric_range_sliding_with_regexp(
                     ", body"
                 }
             ));
-            lines.extend(regexp_extraction_lines(regexp, "               "));
+            lines.extend(regexp.lines("               "));
             lines.push(format!("        FROM {table}"));
             ("        ", "          ")
         }
@@ -1693,8 +1825,9 @@ pub fn metric_range_sliding_with_regexp(
     for clause in extra_predicates {
         lines.push(format!("{filter}AND {}", clause.as_sql()));
     }
-    if regexp.is_some() {
+    if let Some(x) = regexp {
         lines.push("      )".to_string());
+        lines.extend(x.throw_line("      "));
     }
     lines.extend([
         format!("      GROUP BY {key}, lo, hi"),

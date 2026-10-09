@@ -471,7 +471,7 @@ pub fn clickhouse_match_head_rewrite(pattern: &str) -> Option<String> {
 /// alternation at any depth, where case-insensitivity is on at the group's
 /// opening or is switched on by a flag anywhere inside it.
 ///
-/// The `ngrambf_v1` index on `body` drops granules that `match()` accepts
+/// The `text` index of 4-grams on `body` drops granules that `match()` accepts
 /// for such a pattern: `match(s, '(?i)(denied|refused)')` counts 0 over a
 /// row `audit DENIED open` with the index and 1 without it. Decided on our
 /// own parse of the pattern; a pattern that does not parse is not flagged,

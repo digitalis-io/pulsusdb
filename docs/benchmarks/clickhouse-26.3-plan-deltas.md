@@ -26,6 +26,8 @@ detectable. Digests from `podman images --digests | grep clickhouse-server`.
 
 Two of the 79 gated shapes, plus one live fixture outside that set (row 3).
 
+Measured with the two bloom-filter indexes, before #624 part 3b.
+
 | # | shape | 24.8.14.39 | 26.3.17.110 | verdict | the in-run identity that proves it |
 |---|---|---|---|---|---|
 | 1 | `explain_indexes :: stage3_not_contains_line_filter_uses_the_primary_key_and_the_token_skip_index` | `Skip` blocks: `idx_body_tokens`, `idx_body_ngrams`. No `<Combined skip indexes>` entry. Net granules 12/12 | same two `Skip` blocks, **plus** a third block `Name: <Combined skip indexes>`. Net granules 12/12 | **moved-correct** | `assert_prunes_at_least(gated, control = SETTINGS use_skip_indexes = 0, k = 1)` in the test itself, plus the 100k-corpus A/B below: the extra block changes no granule on either server |
@@ -87,6 +89,8 @@ gate **passed on a table that had lost an index**, where the old literal
 would have failed. A moved plan must never be replaced by something that
 would pass on a worse configuration. The expectation is now written down,
 where only a human edit moves it, and three DDL breaks were run to prove it:
+
+Measured with the two bloom-filter indexes, before #624 part 3b.
 
 | break | before (derived) | now (committed) |
 |---|---|---|

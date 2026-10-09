@@ -293,7 +293,8 @@ fn line_filter_not_regex_negates_the_whole_compound_predicate() {
 #[test]
 fn or_line_filter_of_literals_pushes_down_as_a_parenthesized_disjunction() {
     // M8-LQ2 `linefilter.or`: each disjunct is the same `body LIKE`
-    // predicate, so the `ngrambf_v1` skip index still prunes per alternative.
+    // predicate, so the body's `text` index of 4-grams still prunes per
+    // alternative.
     let sp = streams_plan(
         r#"{service_name="checkout"} |= "foo" or "bar""#,
         &range_params(100, Direction::Backward),

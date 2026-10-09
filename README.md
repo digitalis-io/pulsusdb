@@ -23,7 +23,7 @@ PulsusDB starts from the opposite end — the queries — and works backwards to
 
 * **Purpose-built tables per signal.** Logs, metrics, traces, and profiles have different query shapes, so they get different schemas, ordering keys, and rollups — not one generic samples table.
 * **Shard-aware label indexing.** Series lookups are laid out so that label resolution can prune shards instead of broadcasting to all of them, and intermediate fingerprint sets are bounded by the planner.
-* **Indexed log search.** Message bodies carry token/n-gram skip indexes so `|= "connection refused"` doesn't mean scanning a week of raw log lines.
+* **Indexed log search.** Message bodies carry a `text` index of 4-grams so `|= "connection refused"` doesn't mean scanning a week of raw log lines.
 * **Trace search that matches how people search.** Span data is ordered and indexed for service + time + attribute queries, not just exact trace-ID fetches.
 * **A query planner that respects ClickHouse.** Time filters pushed into `PREWHERE`, automatic rollup selection for wide time ranges, partial aggregation on shards, and no redundant index scans.
 * **Rust end to end.** Predictable memory use under ingest bursts and heavy dashboard fan-out, with no GC pauses in the hot path.

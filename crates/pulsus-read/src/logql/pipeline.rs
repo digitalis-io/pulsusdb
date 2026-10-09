@@ -3,7 +3,7 @@
 //! `regexp`/`pattern`), label filters, `line_format`, and `label_format`
 //! are opaque to the columnar store (they read the log body), so they
 //! evaluate here, over rows stage 3 already fetched — **after** line
-//! filters pushed down to the `ngrambf_v1` body skip index / PREWHERE
+//! filters pushed down to the body's `text` index of 4-grams / PREWHERE
 //! reduced the row set (features.md §2; the pushdown itself is
 //! [`super::plan::compile_line_filters`]'s job and is untouched by this
 //! module).

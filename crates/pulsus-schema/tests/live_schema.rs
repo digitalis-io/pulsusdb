@@ -1998,3 +1998,67 @@ async fn a_catalogue_the_user_cannot_read_is_unchecked_not_a_refusal() {
     exec(format!("DROP USER IF EXISTS {user}")).await;
     drop_database(&admin, db).await;
 }
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SkipIndexRow {
+    table: String,
+    name: String,
+    expr: String,
+    type_full: String,
+}
+
+/// **S-T2 (issue #624, part 3b): the log body carries one index, a `text` index of
+/// 4-grams.** Every skip index on every table of a fresh database, read
+/// from `system.data_skipping_indices`: on `log_samples` exactly
+/// `idx_body_ngrams` over `body` as `text(tokenizer = ngrams(4))`, and the
+/// `minmax` on `severity`; no bloom-filter index anywhere.
+#[tokio::test]
+async fn the_log_body_has_one_text_index_of_4_grams() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_body_text");
+    drop_database(&client, db).await;
+    run_init(&client, &test_ctx(db)).await.expect("run_init");
+
+    let sql = format!(
+        "SELECT table, name, expr, type_full FROM system.data_skipping_indices \
+         WHERE database = '{db}' ORDER BY table, name"
+    );
+    let mut stream = client
+        .query_stream::<SkipIndexRow>(&sql, &QuerySettings::new())
+        .await
+        .expect("query system.data_skipping_indices");
+    let mut seen: Vec<(String, String, String, String)> = Vec::new();
+    while let Some(row) = stream.next().await {
+        let row = row.expect("decode SkipIndexRow");
+        seen.push((row.table, row.name, row.expr, row.type_full));
+    }
+    drop(stream);
+    let on_samples: Vec<&(String, String, String, String)> =
+        seen.iter().filter(|r| r.0 == "log_samples").collect();
+    assert_eq!(
+        on_samples,
+        [
+            &(
+                "log_samples".to_string(),
+                "idx_body_ngrams".to_string(),
+                "body".to_string(),
+                "text(tokenizer = ngrams(4))".to_string()
+            ),
+            &(
+                "log_samples".to_string(),
+                "idx_severity".to_string(),
+                "severity".to_string(),
+                "minmax".to_string()
+            ),
+        ],
+        "log_samples' skip indexes"
+    );
+    assert!(
+        !seen
+            .iter()
+            .any(|r| r.3.starts_with("tokenbf_v1") || r.3.starts_with("ngrambf_v1")),
+        "no bloom-filter body index anywhere: {seen:#?}"
+    );
+    drop_database(&client, db).await;
+}
