@@ -674,6 +674,7 @@ docs/query-lowering.md	plan.rs:2602	ambiguous_basename
 docs/query-lowering.md	plan.rs:3718	ambiguous_basename
 docs/query-lowering.md	plan.rs:3723	ambiguous_basename
 docs/query-lowering.md	plan.rs:3732	ambiguous_basename
+docs/query-lowering.md	schema/schema.sql:386	no_name_the_target_file_holds
 docs/query-lowering.md	search_eval.rs:2443	no_name_the_target_file_holds
 docs/query-lowering.md	search_eval.rs:2464	no_name_the_target_file_holds
 docs/query-lowering.md	search_eval.rs:2487	no_name_the_target_file_holds
@@ -856,7 +857,11 @@ docs/query-to-sql.md	query_lowering_doc_gate.rs:472	no_name_the_target_file_hold
 docs/query-to-sql.md	query_lowering_doc_gate.rs:545	no_name_the_target_file_holds
 docs/query-to-sql.md	querytext.rs:52	ambiguous_basename
 docs/query-to-sql.md	querytext.rs:53	ambiguous_basename
+docs/query-to-sql.md	schema/schema.sql:382	no_name_the_target_file_holds
+docs/query-to-sql.md	schema/schema.sql:385	no_name_the_target_file_holds
+docs/query-to-sql.md	schema/schema.sql:403	no_name_the_target_file_holds
 docs/query-to-sql.md	schema/schema.sql:515	no_name_the_target_file_holds
+docs/query-to-sql.md	schema/schema.sql:533	no_name_the_target_file_holds
 docs/query-to-sql.md	search_eval.rs:2443	no_name_the_target_file_holds
 docs/query-to-sql.md	search_eval.rs:3143	no_name_the_target_file_holds
 docs/query-to-sql.md	search_plan.rs:1095-1096	no_name_the_target_file_holds
