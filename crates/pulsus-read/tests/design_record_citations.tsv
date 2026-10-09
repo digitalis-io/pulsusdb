@@ -68,7 +68,7 @@ docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:2511	crates/pulsus-
 docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:3287	crates/pulsus-read/src/traces/exec.rs	3287		line	TRACE_SEARCH_MAX_BLOCK_ROWS	.set("max_block_size", TRACE_SEARCH_MAX_BLOCK_ROWS)
 docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:3321	crates/pulsus-read/src/traces/exec.rs	3321		prose	generator_settings	generator_settings
 docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:496	crates/pulsus-read/src/traces/exec.rs	496		line	RootSummary	pub root: RootSummary,
-docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:6242	crates/pulsus-read/src/traces/exec.rs	6242		line	search_settings_pin_the_layer_1_budget_contract	fn search_settings_pin_the_layer_1_budget_contract() {
+docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:6258	crates/pulsus-read/src/traces/exec.rs	6258		line	search_settings_pin_the_layer_1_budget_contract	fn search_settings_pin_the_layer_1_budget_contract() {
 docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:910	crates/pulsus-read/src/traces/exec.rs	910		prose	map_trace_generator_error	map_trace_generator_error
 docs/query-lowering.md	crates/pulsus-read/src/traces/filter.rs:912	crates/pulsus-read/src/traces/filter.rs	912		prose	anchored_regex_sql	match
 docs/query-lowering.md	crates/pulsus-read/src/traces/graph_sql.rs:92	crates/pulsus-read/src/traces/graph_sql.rs	92		prose	service_graph_sql	service_graph_sql
@@ -363,7 +363,7 @@ docs/query-to-sql.md	traces/exec.rs:173	crates/pulsus-read/src/traces/exec.rs	17
 docs/query-to-sql.md	traces/exec.rs:228	crates/pulsus-read/src/traces/exec.rs	228		line	TRACE_METRICS_MAX_SET_ROWS	pub const TRACE_METRICS_MAX_SET_ROWS: u64 = 1_000_000;
 docs/query-to-sql.md	traces/exec.rs:2464	crates/pulsus-read/src/traces/exec.rs	2464		line	dispatch	.dispatch
 docs/query-to-sql.md	traces/exec.rs:3276	crates/pulsus-read/src/traces/exec.rs	3276		line	search_settings	fn search_settings(config: &TraceReadConfig) -> QuerySettings {
-docs/query-to-sql.md	traces/exec.rs:3991	crates/pulsus-read/src/traces/exec.rs	3991		prose	apply_series_reduce	reduce
+docs/query-to-sql.md	traces/exec.rs:4005	crates/pulsus-read/src/traces/exec.rs	4005		prose	apply_series_reduce	reduce
 docs/query-to-sql.md	traces/exec.rs:945	crates/pulsus-read/src/traces/exec.rs	945		line	0	.0
 docs/query-to-sql.md	traces/metrics_sql.rs:89	crates/pulsus-read/src/traces/metrics_sql.rs	89		line	nanosecond	/// the window and the last nanosecond it contains is `end_ns - 1`.
 docs/query-to-sql.md	traces/search_plan.rs:1121	crates/pulsus-read/src/traces/search_plan.rs	1121		line	parts	Ok(parts.join(" AND "))

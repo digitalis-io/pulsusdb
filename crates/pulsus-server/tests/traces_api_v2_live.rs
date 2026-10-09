@@ -4556,6 +4556,7 @@ async fn a_covered_search_explains_its_one_statement() {
     let window = pulsus_read::traces::window_sql::WindowSql::start_closed_end_open(start, end);
     let ctx = pulsus_read::traces::spans::predicate::PredicateCtx {
         window,
+        spans_table: "spans",
         resources_table: "resources",
     };
     let want =

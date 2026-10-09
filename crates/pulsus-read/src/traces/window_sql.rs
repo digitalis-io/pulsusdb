@@ -277,6 +277,34 @@ impl WindowSql {
         )
     }
 
+    /// The per-trace read's `day` bound (issue #594 part 1): the day
+    /// before this window's first day to the day after its last, so a
+    /// trace crossing a midnight either side is read whole.
+    pub fn per_trace_day_clause(self) -> String {
+        resources_day_bound(
+            &self
+                .first_included_ns()
+                .saturating_sub(NS_PER_DAY)
+                .to_string(),
+            &self
+                .last_included_ns()
+                .saturating_add(NS_PER_DAY)
+                .to_string(),
+        )
+    }
+
+    /// Whether the span-table bucket `var` lies outside this window's
+    /// buckets (issue #594 part 1), divided server-side as
+    /// [`WindowSql::span_bucket_clause`] is.
+    pub fn bucket_outside(self, var: &str) -> String {
+        format!(
+            "NOT ({var} BETWEEN intDiv({}, {bucket}) AND intDiv({}, {bucket}))",
+            self.first_included_ns(),
+            self.last_included_ns(),
+            bucket = RECENT_BUCKET_NS
+        )
+    }
+
     /// The span table's leading sort-key bound (issue #587).
     ///
     /// **Both sides are divided server-side**, so the reader never

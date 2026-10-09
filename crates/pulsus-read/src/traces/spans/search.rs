@@ -63,6 +63,7 @@ use super::projection::{
     GroupKeySql, Projection, ceiling_sql, group_key_sql, rendered_array, rendered_array_len,
 };
 use super::rows::{SearchGroupTuple, SearchGroupedRow, SearchTraceRow};
+use super::tracelevel::{TraceLeaf, per_trace_sql};
 use crate::logql::error::ReadError;
 use crate::traces::PlanError;
 use crate::traces::exec::{
@@ -89,7 +90,7 @@ ORDER BY last DESC, trace_id ASC";
 /// One filter (section 4.2): #590's statement, the detail read carrying
 /// the projection. A `const` at column zero, filled by [`fill`], so no
 /// source indentation can leak into it.
-const SEARCH: &str = r"WITH (SELECT (groupArray(trace_id), groupArray(keys))
+const SEARCH: &str = r"WITH {scalars}(SELECT (groupArray(trace_id), groupArray(keys))
       FROM (SELECT trace_id, max(start_ns) AS last,
                    groupUniqArray(intDiv(start_ns, 300000000000)) AS keys
             FROM {spans}
@@ -122,7 +123,7 @@ FROM (SELECT trace_id, max(start_ns) AS last, count() AS matched,
 /// both reads filter by the selector alone; the top-K keeps a trace only
 /// when a span satisfies the later filters, `matched` counts those spans,
 /// and the spans returned are theirs.
-const SEARCH_LATER: &str = r"WITH (SELECT (groupArray(trace_id), groupArray(keys))
+const SEARCH_LATER: &str = r"WITH {scalars}(SELECT (groupArray(trace_id), groupArray(keys))
       FROM (SELECT trace_id, max(start_ns) AS last,
                    groupUniqArray(intDiv(start_ns, 300000000000)) AS keys
             FROM {spans}
@@ -158,7 +159,7 @@ FROM (SELECT trace_id, max(start_ns) AS last, countIf({later}) AS matched,
 /// the first such span, and its members are the spans every filter kept
 /// (`g_matched`, `g_spans`). The trace's own `matched` and spans are the
 /// union of its groups'.
-const SEARCH_GROUPED: &str = r"WITH (SELECT (groupArray(trace_id), groupArray(keys))
+const SEARCH_GROUPED: &str = r"WITH {scalars}(SELECT (groupArray(trace_id), groupArray(keys))
       FROM (SELECT trace_id, max(start_ns) AS last,
                    groupUniqArray(intDiv(start_ns, 300000000000)) AS keys
             FROM {spans}
@@ -199,7 +200,7 @@ FROM (SELECT trace_id, max(g_last) AS last, sum(g_matched) AS matched,
 /// pass it (`{pass}`) and a span passes every filter (`{later}`). The
 /// detail read carries the aggregate's response value as one group
 /// holding the trace's surviving spans.
-const SEARCH_AGGREGATED: &str = r"WITH (SELECT (groupArray(trace_id), groupArray(keys))
+const SEARCH_AGGREGATED: &str = r"WITH {scalars}(SELECT (groupArray(trace_id), groupArray(keys))
       FROM (SELECT trace_id, max(start_ns) AS last,
                    groupUniqArray(intDiv(start_ns, 300000000000)) AS keys
             FROM {spans}
@@ -248,7 +249,7 @@ pub const OFF_PATH_DEMAND: &str =
 
 /// A spanset tree (section 4.3): one flag per filter, a `HAVING` over each
 /// trace's flags, and the detail read keeping each trace's spans by them.
-const SEARCH_TREE: &str = r"WITH (SELECT (groupArray(trace_id), groupArray(keys))
+const SEARCH_TREE: &str = r"WITH {scalars}(SELECT (groupArray(trace_id), groupArray(keys))
       FROM (SELECT trace_id, {counts}, greatest({lasts}) AS last,
                    groupUniqArray(intDiv(start_ns, 300000000000)) AS keys
             FROM (SELECT trace_id, start_ns, {flags}
@@ -519,7 +520,13 @@ pub fn search_sql(
         w.span_day_clause(),
     );
     let (limit, spss, projection) = (limit.to_string(), spss.to_string(), proj.sql());
-    let common: [(&str, &str); 9] = [
+    // Issue #594 part 1: one per-trace scalar for every filter's leaves.
+    let predicates = f.predicates();
+    let trace_leaves: Vec<&TraceLeaf> = predicates.iter().flat_map(|p| p.trace_leaves()).collect();
+    let child_counts = predicates.iter().any(|p| p.reads_child_counts());
+    let scalars = per_trace_sql(&trace_leaves, child_counts, w, traces_table);
+    let common: [(&str, &str); 10] = [
+        ("scalars", &scalars),
         ("spans", spans_table),
         ("time", &time),
         ("bucket", &bucket),
@@ -1196,6 +1203,7 @@ pub fn plan_statement(
     let window = WindowSql::start_closed_end_open(plan.window.start_ns, plan.window.end_ns);
     let ctx = PredicateCtx {
         window,
+        spans_table,
         resources_table,
     };
     let query = Query {
@@ -1440,6 +1448,7 @@ mod charge_tests {
         let w = WindowSql::start_closed_end_open(1_000_000_000_000, 2_000_000_000_000);
         let ctx = PredicateCtx {
             window: w,
+            spans_table: "spans",
             resources_table: "resources",
         };
         compile_search(&q, &ctx, "spans", "traces", 20, 3).expect("compiles")
@@ -1617,6 +1626,7 @@ mod charge_tests {
         let w = WindowSql::start_closed_end_open(1_000_000_000_000, 2_000_000_000_000);
         let ctx = PredicateCtx {
             window: w,
+            spans_table: "spans",
             resources_table: "resources",
         };
         let s = compile_search(&q, &ctx, "spans", "traces", 20, 3).expect("compiles");
@@ -1673,6 +1683,7 @@ mod charge_tests {
         let w = WindowSql::start_closed_end_open(1_000_000_000_000, 2_000_000_000_000);
         let ctx = PredicateCtx {
             window: w,
+            spans_table: "spans",
             resources_table: "resources",
         };
         let s = compile_search(&q, &ctx, "spans", "traces", 20, 3).expect("compiles");

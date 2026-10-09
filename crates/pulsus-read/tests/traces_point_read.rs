@@ -1151,6 +1151,7 @@ async fn a_retention_edge_trace_keeps_its_resource_and_per_trace_rows() {
         &body,
         &PredicateCtx {
             window: w,
+            spans_table: "spans",
             resources_table: "resources",
         },
     )
