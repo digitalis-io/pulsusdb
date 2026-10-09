@@ -4813,6 +4813,7 @@ mod tests {
             ("max_memory_usage", mem.as_str()),
             ("max_bytes_before_external_group_by", "0"),
             ("final", "1"),
+            ("do_not_merge_across_partitions_select_final", "1"),
         ]
         .iter()
         .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
@@ -4845,6 +4846,7 @@ mod tests {
                 "max_memory_usage",
                 "max_bytes_before_external_group_by",
                 "final",
+                "do_not_merge_across_partitions_select_final",
             ]
         );
     }

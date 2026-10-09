@@ -9,7 +9,7 @@
 //! assertions, and the two halves meet at `T-C4`, which freezes the exact
 //! statement this suite issues.
 //!
-//! **Sixteen fixtures, each test function in its own database.**
+//! **Nineteen fixtures, each test function in its own database.**
 //!
 //! * The worked fixture of `docs/TraceQL/functional-requirements.md` §6.1 —
 //!   three traces, nine spans, every attribute type, one event, one link,
@@ -62,6 +62,11 @@
 //!   the 8,192-byte response ceiling. RZ, B and the catalogue fixture are
 //!   landed in both stores, so the search statement is compared with
 //!   today's engine over the same pushes.
+//! * Fixtures TL, CC and RD (issue #594 part 1) — six traces whose
+//!   extent, root and root's day differ from their window's spans'; two
+//!   traces sharing span ids, with children inside and outside the window;
+//!   and one resource seen on two days. All three are landed in both
+//!   stores.
 //!
 //! Each is seeded by building the OTLP request bodies and handing them to
 //! `pulsus_write::parse_trace_landing`, then inserting the rows it
@@ -1451,6 +1456,7 @@ const RESOURCES_TABLE: &str = "resources";
 fn ctx_of(w: WindowSql) -> PredicateCtx<'static> {
     PredicateCtx {
         window: w,
+        spans_table: SPANS_TABLE,
         resources_table: RESOURCES_TABLE,
     }
 }
@@ -7379,7 +7385,7 @@ async fn search_routed_answers_as_today_on_fixture_c() {
         drop_db(&db).await;
     }
     eprintln!("and {fixture_cases} fixture cases");
-    assert_eq!(names.len(), 109, "the inventory's new rows");
+    assert_eq!(names.len(), 116, "the inventory's new rows");
     assert!(
         wrong.is_empty(),
         "{} of {} differ:\n\n{}",
@@ -10299,4 +10305,427 @@ async fn a_cycle_back_to_its_start_answers_as_today() {
         ],
     )
     .await;
+}
+
+// ---------------------------------------------------------------------
+// issue #594 part 1: trace-level intrinsics and `span:childCount`
+// ---------------------------------------------------------------------
+
+/// One case: the query, the routed answer, and today's when it differs.
+type LevelCase = (&'static str, &'static str, Option<&'static str>);
+
+/// Seeds `bodies` in both stores and, for each case, plans the query over
+/// `[base, base + 60 s)` (limit 20, spss 20), requires it covered and
+/// answered by one statement, and compares the routed answer with the case
+/// and today's with the routed answer, or with the case's own when the two
+/// differ by decision. Returns every difference.
+async fn check_levels(
+    label: &str,
+    bodies: &[ExportTraceServiceRequest],
+    spans: u64,
+    base_ns: i64,
+    cases: &[LevelCase],
+) -> Vec<String> {
+    let (db, client) = seed_both(
+        pulsus_testkit::test_db(&format!("pulsus_read_it_t594p1_{label}")),
+        bodies,
+        spans,
+        &format!("t594p1-{label}"),
+    )
+    .await;
+    let engine = engine_of(&db).await;
+    let mut wrong = Vec::new();
+    for (query, routed_want, today_want) in cases {
+        let plan = plan_of(
+            &engine,
+            &parse_query(query),
+            (base_ns, base_ns + 60_000_000_000),
+            20,
+            20,
+        );
+        if !covered(&plan) {
+            wrong.push(format!(
+                "{query}: today's engine's, must be the statement's"
+            ));
+            continue;
+        }
+        let t0 = now_ns();
+        let routed = engine.search_routed(&plan).await.map(normalise_today);
+        if let Err(e) = &routed {
+            wrong.push(format!("{query}: routed Err({e})"));
+            continue;
+        }
+        let (n, _) = settled_statements(&client, &db, t0).await;
+        let today = engine.search(&plan).await.map(normalise_today);
+        match today_want {
+            None => {
+                if format!("{today:?}") != format!("{routed:?}") {
+                    wrong.push(format!(
+                        "{query}\n  today:  {}\n  routed: {}",
+                        answer_of(&today),
+                        answer_of(&routed)
+                    ));
+                }
+            }
+            Some(t) => {
+                if answer_of(&today) != *t {
+                    wrong.push(format!(
+                        "{query}\n  today want: {t}\n  today got:  {}",
+                        answer_of(&today)
+                    ));
+                }
+            }
+        }
+        if answer_of(&routed) != *routed_want {
+            wrong.push(format!(
+                "{query}\n  routed want: {routed_want}\n  routed got:  {}",
+                answer_of(&routed)
+            ));
+        }
+        if n != 1 {
+            wrong.push(format!("{query}: {n} statements, want 1"));
+        }
+    }
+    if label == "tl" {
+        let plan = plan_of(
+            &engine,
+            &parse_query(r#"{ trace:rootService = "loadgen" && trace:duration > 1h }"#),
+            (base_ns, base_ns + 60_000_000_000),
+            20,
+            20,
+        );
+        let out = engine.search_routed(&plan).await.expect("routed");
+        let t = out
+            .traces
+            .iter()
+            .find(|t| t.trace_id == [0xc5; 16])
+            .expect("c5 returned");
+        if (t.trace_duration_ns, t.root.service.as_str()) != (3_602_000_000_000, "loadgen") {
+            wrong.push(format!(
+                "c5 envelope: {} {}",
+                t.trace_duration_ns, t.root.service
+            ));
+        }
+    }
+    drop_db(&db).await;
+    wrong
+}
+
+/// One server span, status unset, of trace `[t; 16]`, id `n`, parent
+/// `parent` (0 for none), starting `at_ns` after `base_ns`.
+fn lsp(base_ns: i64, t: u8, n: u8, parent: u8, name: &str, at_ns: i64, dur_ns: i64) -> Span {
+    span_of(
+        vec![t; 16],
+        span_id_bytes(n),
+        if parent == 0 {
+            Vec::new()
+        } else {
+            span_id_bytes(parent)
+        },
+        name,
+        2,
+        base_ns + at_ns,
+        dur_ns,
+        Vec::new(),
+        0,
+        Vec::new(),
+        Vec::new(),
+    )
+}
+
+/// Fixture TL (section 7.2 of the part's plan): `c5`'s root an hour before
+/// the window; `d1` one second long; `d2` a two-hour root; `d3` no stored
+/// root; `dd`'s root the day before, `de`'s child the day after.
+fn tl_bodies(base_ns: i64) -> Vec<ExportTraceServiceRequest> {
+    const S: i64 = 1_000_000_000;
+    const DAY: i64 = 86_400 * S;
+    let midnight = base_ns - base_ns.rem_euclid(DAY);
+    vec![
+        by_body(
+            "loadgen",
+            vec![lsp(base_ns, 0xc5, 1, 0, "GET /cart", -3600 * S, S)],
+        ),
+        by_body("cart", vec![lsp(base_ns, 0xc5, 2, 1, "add", 0, 2 * S)]),
+        by_body(
+            "loadgen",
+            vec![
+                lsp(base_ns, 0xd1, 1, 0, "GET /", 10 * S, S),
+                lsp(base_ns, 0xd1, 2, 1, "q", 10 * S, S),
+            ],
+        ),
+        by_body(
+            "cart",
+            vec![lsp(base_ns, 0xd2, 1, 0, "POST /", 20 * S, 7200 * S)],
+        ),
+        by_body("loadgen", vec![lsp(base_ns, 0xd2, 2, 1, "r", 21 * S, S)]),
+        by_body(
+            "loadgen",
+            vec![
+                lsp(base_ns, 0xd3, 5, 4, "GET /", 30 * S, S),
+                lsp(base_ns, 0xd3, 6, 5, "w", 31 * S, S),
+            ],
+        ),
+        by_body(
+            "gw",
+            vec![lsp(
+                base_ns,
+                0xdd,
+                1,
+                0,
+                "GET /",
+                midnight - base_ns - 3600 * S,
+                S,
+            )],
+        ),
+        by_body("cart", vec![lsp(base_ns, 0xdd, 2, 1, "x", 40 * S, S)]),
+        by_body("cart", vec![lsp(base_ns, 0xde, 1, 0, "PUT /", 50 * S, S)]),
+        by_body(
+            "cart",
+            vec![lsp(
+                base_ns,
+                0xde,
+                2,
+                1,
+                "y",
+                midnight + DAY - base_ns + 3600 * S,
+                S,
+            )],
+        ),
+    ]
+}
+
+/// T-C5: a trace-level intrinsic is the whole trace's value, the root
+/// the response reports, in every template and under a structural operator.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_c5_trace_level_values_are_the_whole_traces() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let wrong = check_levels(
+        "tl",
+        &tl_bodies(base_ns),
+        12,
+        base_ns,
+        &[
+            (
+                r#"{ trace:rootService = "loadgen" && trace:duration > 1h }"#,
+                "c5 1 [02]",
+                None,
+            ),
+            (
+                r#"{ trace:rootService = "loadgen" }"#,
+                "d1 2 [01, 02]; c5 1 [02]",
+                Some("d3 2 [05, 06]; d1 2 [01, 02]; c5 1 [02]"),
+            ),
+            (r#"{ rootServiceName = "gw" }"#, "dd 1 [02]", None),
+            (
+                r#"{ trace:rootName != "GET /" }"#,
+                "de 1 [01]; d3 2 [05, 06]; d2 2 [01, 02]; c5 1 [02]",
+                Some("de 1 [01]; d2 2 [01, 02]; c5 1 [02]"),
+            ),
+            (
+                r#"{ rootName =~ "GET.*" }"#,
+                "dd 1 [02]; d1 2 [01, 02]; c5 1 [02]",
+                Some("dd 1 [02]; d3 2 [05, 06]; d1 2 [01, 02]; c5 1 [02]"),
+            ),
+            (r#"{ trace:rootName =~ "GET" }"#, "", None),
+            (
+                r#"{ trace:duration > 1h }"#,
+                "de 1 [01]; dd 1 [02]; d2 2 [01, 02]; c5 1 [02]",
+                None,
+            ),
+            (r#"{ traceDuration <= 1s }"#, "d1 2 [01, 02]", None),
+            (
+                r#"{ !(trace:duration > 1h) }"#,
+                "d3 2 [05, 06]; d1 2 [01, 02]",
+                Some("d3 2 [05, 06]; d1 2 [01, 02]"),
+            ),
+            (
+                r#"{ resource.service.name = "cart" && trace:duration > 1h }"#,
+                "de 1 [01]; dd 1 [02]; d2 1 [01]; c5 1 [02]",
+                None,
+            ),
+            (
+                r#"{ } | { trace:duration > 1h }"#,
+                "de 1 [01]; dd 1 [02]; d2 2 [01, 02]; c5 1 [02]",
+                None,
+            ),
+            (
+                r#"{ trace:duration > 1h } && { span:childCount > 0 }"#,
+                "de 1 [01]; d2 2 [01, 02]",
+                None,
+            ),
+            (
+                r#"{ trace:duration > 1h } | count() > 1"#,
+                "d2 2 [01, 02]",
+                None,
+            ),
+            (
+                r#"{ trace:duration > 1h } | by(name)"#,
+                "de 1 [01]; dd 1 [02]; d2 2 [01, 02]; c5 1 [02]",
+                None,
+            ),
+            (
+                r#"{ } | { trace:duration > 1h } | by(name)"#,
+                "de 1 [01]; dd 1 [02]; d2 2 [01, 02]; c5 1 [02]",
+                None,
+            ),
+            (
+                r#"{ } | by(name) | { trace:duration > 1h }"#,
+                "de 1 [01]; dd 1 [02]; d2 2 [01, 02]; c5 1 [02]",
+                None,
+            ),
+            (
+                r#"{ } | { trace:duration > 1h } | count() > 1"#,
+                "d2 2 [01, 02]",
+                None,
+            ),
+            (
+                r#"{ } | count() > 1 | { span:childCount > 0 }"#,
+                "d3 1 [05]; d2 1 [01]; d1 1 [01]",
+                Some("d3 1 [05]; d2 1 [01]; d1 1 [01]"),
+            ),
+            (r#"{ trace:duration > 1h } > { }"#, "d2 1 [02]", None),
+            (r#"{ trace:duration > 1h } >> { }"#, "d2 1 [02]", None),
+            (
+                r#"{ } << { span:childCount = 1 && trace:rootService = "cart" }"#,
+                "d2 1 [01]",
+                None,
+            ),
+        ],
+    )
+    .await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Fixture CC: `cc`'s `01` has four children, two outside the window;
+/// `c3` reuses the span ids `01` and `02` under its own parents.
+fn cc_bodies(base_ns: i64) -> Vec<ExportTraceServiceRequest> {
+    const S: i64 = 1_000_000_000;
+    vec![by_body(
+        "svc",
+        vec![
+            lsp(base_ns, 0xcc, 1, 0, "P", 30 * S, S),
+            lsp(base_ns, 0xcc, 2, 1, "Q", 31 * S, S),
+            lsp(base_ns, 0xcc, 3, 1, "R", 32 * S, S),
+            lsp(base_ns, 0xcc, 4, 1, "late", 900 * S, S),
+            lsp(base_ns, 0xcc, 5, 1, "early", -900 * S, S),
+            lsp(base_ns, 0xcc, 7, 2, "q1", 33 * S, S),
+            lsp(base_ns, 0xcc, 8, 2, "q2", 34 * S, S),
+            lsp(base_ns, 0xcc, 9, 2, "q3", 35 * S, S),
+            lsp(base_ns, 0xcc, 10, 3, "r1", 36 * S, S),
+            lsp(base_ns, 0xc3, 1, 0, "P", 40 * S, S),
+            lsp(base_ns, 0xc3, 2, 1, "Q", 41 * S, S),
+            lsp(base_ns, 0xc3, 11, 2, "q1", 42 * S, S),
+            lsp(base_ns, 0xc3, 12, 2, "q2", 43 * S, S),
+        ],
+    )]
+}
+
+/// T-A20's `{ span:childCount > 3 }`: a span's children are counted
+/// across its whole trace, per parent, and a span with none counts 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_a20_a_child_count_is_the_whole_traces() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let wrong = check_levels(
+        "cc",
+        &cc_bodies(base_ns),
+        13,
+        base_ns,
+        &[
+            (r#"{ span:childCount > 3 }"#, "cc 1 [01]", None),
+            (r#"{ span:childCount = 3 }"#, "cc 1 [02]", None),
+            (r#"{ span:childCount > 2 }"#, "cc 2 [01, 02]", None),
+            (
+                r#"{ span:childCount < 1 }"#,
+                "c3 2 [0b, 0c]; cc 4 [07, 08, 09, 0a]",
+                None,
+            ),
+            (
+                r#"{ span:childCount >= 1 && span:childCount <= 2 }"#,
+                "c3 2 [01, 02]; cc 1 [03]",
+                None,
+            ),
+            (
+                r#"{ span:childCount != 4 }"#,
+                "c3 4 [01, 02, 0b, 0c]; cc 6 [02, 03, 07, 08, 09, 0a]",
+                None,
+            ),
+        ],
+    )
+    .await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Fixture RD: one resource, pushed with trace `a1` today and `a2` the
+/// next day.
+fn rd_bodies(base_ns: i64) -> Vec<ExportTraceServiceRequest> {
+    const S: i64 = 1_000_000_000;
+    const DAY: i64 = 86_400 * S;
+    let req = |at: i64| ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: Some(Resource {
+                attributes: vec![
+                    kv("service.name", str_value("svc")),
+                    kv("env", str_value("prod")),
+                ],
+                dropped_attributes_count: 0,
+                entity_refs: Vec::new(),
+            }),
+            scope_spans: vec![ScopeSpans {
+                scope: Some(scope()),
+                spans: vec![lsp(
+                    base_ns,
+                    if at < DAY { 0xa1 } else { 0xa2 },
+                    1,
+                    0,
+                    "op",
+                    at,
+                    S,
+                )],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    };
+    vec![req(10 * S), req(DAY + 10 * S)]
+}
+
+/// A resource row is identical on every day it is seen; a search on the
+/// earlier day finds it (`do_not_merge_across_partitions_select_final`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resource_seen_on_two_days_answers_its_earlier_day() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let wrong = check_levels(
+        "rd",
+        &rd_bodies(base_ns),
+        2,
+        base_ns,
+        &[(r#"{ resource.env = "prod" }"#, "a1 1 [01]", None)],
+    )
+    .await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// The fetch reads the same resource on its own day.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fetched_trace_keeps_a_resource_seen_on_two_days() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let (db, _client) = seed_both(
+        pulsus_testkit::test_db("pulsus_read_it_t594p1_rf"),
+        &rd_bodies(base_ns),
+        2,
+        "t594p1-rf",
+    )
+    .await;
+    let engine = engine_of(&db).await;
+    let got = engine
+        .fetch_by_id(&"a1".repeat(16), None)
+        .await
+        .expect("fetch");
+    drop_db(&db).await;
+    assert_eq!(got.spans.len(), 1, "the trace's one span");
+    assert_eq!(got.resources.len(), 1, "the span's resource");
 }

@@ -132,6 +132,9 @@ impl SpanPredicate {
 #[derive(Debug, Clone, Copy)]
 pub struct PredicateCtx<'a> {
     pub window: WindowSql,
+    /// The span table a `span:childCount` leaf reads (issue #594 part 1):
+    /// unqualified in the live suite, `<db>.spans` in production.
+    pub spans_table: &'a str,
     /// Unqualified in the live suite, `<db>.resources` in production. A
     /// trusted schema name, as `span_membership_sql`'s `spans_table` is.
     pub resources_table: &'a str,

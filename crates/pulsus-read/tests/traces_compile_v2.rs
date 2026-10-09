@@ -551,7 +551,11 @@ fn t_c4_the_membership_statement_is_frozen_whole() {
 
 /// The intrinsics this compiler serves. Every other `Intrinsic` variant is
 /// #594's and must REFUSE rather than compile something wrong.
-const IN_SCOPE_INTRINSICS: [Intrinsic; 14] = [
+const IN_SCOPE_INTRINSICS: [Intrinsic; 18] = [
+    Intrinsic::TraceDuration,
+    Intrinsic::RootName,
+    Intrinsic::RootServiceName,
+    Intrinsic::ChildCount,
     Intrinsic::Name,
     Intrinsic::Duration,
     Intrinsic::Status,
@@ -586,14 +590,14 @@ fn intrinsic_target(intrinsic: Intrinsic) -> Option<&'static str> {
         | Intrinsic::EventName
         | Intrinsic::EventTimeSinceStart
         | Intrinsic::LinkSpanId
-        | Intrinsic::LinkTraceId => None,
-        Intrinsic::NestedSetParent
-        | Intrinsic::NestedSetLeft
-        | Intrinsic::NestedSetRight
+        | Intrinsic::LinkTraceId
         | Intrinsic::ChildCount
         | Intrinsic::TraceDuration
         | Intrinsic::RootName
-        | Intrinsic::RootServiceName => Some("#594"),
+        | Intrinsic::RootServiceName => None,
+        Intrinsic::NestedSetParent | Intrinsic::NestedSetLeft | Intrinsic::NestedSetRight => {
+            Some("#594")
+        }
     }
 }
 
@@ -903,6 +907,7 @@ fn t_c11_a_literal_on_the_left_mirrors_the_operator() {
 fn ctx() -> PredicateCtx<'static> {
     PredicateCtx {
         window: t_b1_window(),
+        spans_table: "spans",
         resources_table: "resources",
     }
 }
@@ -2540,7 +2545,23 @@ fn t_c27_the_field_against_field_refusals() {
         );
         check(field_compare_expr(&span_a, ComparisonOp::Eq, &f), want);
     }
-    assert_eq!(nested_and_trace, 7);
+    assert_eq!(nested_and_trace, 3);
+    for intrinsic in [
+        Intrinsic::TraceDuration,
+        Intrinsic::RootName,
+        Intrinsic::RootServiceName,
+        Intrinsic::ChildCount,
+    ] {
+        let want = PlanError::UnsupportedField(format!(
+            "{intrinsic} as an operand is not supported by the search statement (issue #602)"
+        ));
+        let f = Field::Intrinsic(intrinsic);
+        check(
+            field_compare_expr(&f, ComparisonOp::Eq, &span_a),
+            want.clone(),
+        );
+        check(field_compare_expr(&span_a, ComparisonOp::Eq, &f), want);
+    }
 
     // An event set opposite a #594 intrinsic: the intrinsic's own refusal,
     // whichever side it is on (part 3d's section 5.6).
@@ -4657,6 +4678,7 @@ fn search_golden(stem: &str, query: &str, limit: u32, spss: u32) -> String {
     let w = g1_window();
     let ctx = PredicateCtx {
         window: w,
+        spans_table: "spans",
         resources_table: "resources",
     };
     let parsed =
@@ -4932,8 +4954,9 @@ fn the_fork_routes_by_the_plan() {
         r#"{ .a = 1 } | by(span.a) | coalesce() | by(name)"#,
         r#"{ nestedSetLeft > 0 }"#,
         r#"{ nestedSetParent < 0 }"#,
-        r#"{ traceDuration > 1s }"#,
-        r#"{ span:childCount > 2 }"#,
+        r#"{ .a = trace:duration }"#,
+        r#"{ span:childCount + 1 > 2 }"#,
+        r#"{ event.k = trace:rootName }"#,
         r#"{ event.k * event.k > 5 }"#,
         r#"{ .k + 1 > .k }"#,
         r#"{ link.lk - link.lk != 0 }"#,
@@ -4997,6 +5020,12 @@ fn the_fork_routes_by_the_plan() {
         r#"{ .a = 1 } !<< { .b = 2 }"#,
         r#"({ .a = 1 } > { .b = 2 }) && ({ .c = 3 } &>> { .d = 4 })"#,
         r#"{ .a = 1 } !>> { .b = 2 } | by(name)"#,
+        // Issue #594 part 1: two inventory rows, and three shapes.
+        r#"{ traceDuration > 1s }"#,
+        r#"{ span:childCount > 2 }"#,
+        r#"{ rootName = "x" } | count() > 1"#,
+        r#"{ span:childCount < 1 } && { trace:rootService = "a" }"#,
+        r#"{ trace:duration > 1s } >> { }"#,
     ] {
         if plan_statement(&fork_plan(query), "spans", "traces", "resources", 64).is_none() {
             wrong.push(format!(
@@ -5031,4 +5060,30 @@ fn a_float_sum_folds_in_span_order() {
             "{query}: the float sum must fold in span order"
         );
     }
+}
+
+/// Issue #594 part 1: every trace leaf of a statement reads one per-trace
+/// scalar, and a child leaf reads it for the trace's outside buckets.
+#[test]
+fn one_per_trace_read_serves_every_leaf() {
+    let count = |sql: &str, needle: &str| sql.matches(needle).count();
+    let s = compile_search_of(
+        r#"{ trace:rootService = "a" && trace:duration > 1h } | { rootName != "b" }"#,
+    )
+    .expect("served");
+    let sql = s.sql();
+    assert_eq!(count(sql, "FROM traces"), 2, "{sql}");
+    let defs: Vec<&str> = sql
+        .match_indices(" AS tl_")
+        .map(|(i, _)| &sql[i + 4..i + 39])
+        .collect();
+    assert_eq!(defs.len(), 3, "{sql}");
+    for d in &defs {
+        assert_eq!(count(sql, &format!(" AS {d}")), 1, "{d} defined once");
+    }
+    let s = compile_search_of(r#"{ span:childCount > 2 }"#).expect("served");
+    assert_eq!(count(s.sql(), "FROM traces"), 2, "{}", s.sql());
+    assert!(s.sql().contains("per_trace.1"), "{}", s.sql());
+    let s = compile_search_of(r#"{ name = "a" }"#).expect("served");
+    assert_eq!(count(s.sql(), "FROM traces"), 1, "{}", s.sql());
 }

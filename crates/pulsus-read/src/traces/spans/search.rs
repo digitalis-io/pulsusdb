@@ -1196,6 +1196,7 @@ pub fn plan_statement(
     let window = WindowSql::start_closed_end_open(plan.window.start_ns, plan.window.end_ns);
     let ctx = PredicateCtx {
         window,
+        spans_table,
         resources_table,
     };
     let query = Query {
@@ -1440,6 +1441,7 @@ mod charge_tests {
         let w = WindowSql::start_closed_end_open(1_000_000_000_000, 2_000_000_000_000);
         let ctx = PredicateCtx {
             window: w,
+            spans_table: "spans",
             resources_table: "resources",
         };
         compile_search(&q, &ctx, "spans", "traces", 20, 3).expect("compiles")
@@ -1617,6 +1619,7 @@ mod charge_tests {
         let w = WindowSql::start_closed_end_open(1_000_000_000_000, 2_000_000_000_000);
         let ctx = PredicateCtx {
             window: w,
+            spans_table: "spans",
             resources_table: "resources",
         };
         let s = compile_search(&q, &ctx, "spans", "traces", 20, 3).expect("compiles");
@@ -1673,6 +1676,7 @@ mod charge_tests {
         let w = WindowSql::start_closed_end_open(1_000_000_000_000, 2_000_000_000_000);
         let ctx = PredicateCtx {
             window: w,
+            spans_table: "spans",
             resources_table: "resources",
         };
         let s = compile_search(&q, &ctx, "spans", "traces", 20, 3).expect("compiles");

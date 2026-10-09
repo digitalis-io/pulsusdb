@@ -44,6 +44,7 @@ const INJECTED_SETTINGS: &[&str] = &[
     "distributed_aggregation_memory_efficient",
     "distributed_foreground_insert",
     "distributed_product_mode",
+    "do_not_merge_across_partitions_select_final",
     // Issue #587: the trace fetch's own settings root carries `final = 1`
     // as a SETTING rather than as SQL text, which is what makes a retried
     // span single on a read taken before the next merge.
