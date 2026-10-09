@@ -198,8 +198,8 @@ or lost by accident: `served` must keep working, `400` must keep refusing.
 | `name`, `kind`, `status`, `statusMessage`, `duration` | served | the column of that name | `s05`, `s06`, fixture F3/F9/F20 |
 | `span:id`, `span:parentID` | served | `span_id` / `parent_span_id` | column comparison on the raw bytes |
 | `trace:id` | served | `trace_id`, the sort key's second column | key read |
-| `trace:duration`, `trace:rootName`, `trace:rootService` | served | the per-trace table, joined on `trace_id` | `s14`, fixture F15/F16 |
-| `span:childCount` | served | a per-`(trace_id, parent_span_id)` count joined back to the span | `c06` |
+| `trace:duration`, `trace:rootName`, `trace:rootService` | served | one scalar per statement over `traces` rows dated from the day before the window to the day after, an array of the matching traces per leaf, each span tested by `trace_id IN` that array | `s14`, fixture F15/F16 |
+| `span:childCount` | served | a `(trace_id, parent_span_id)` count over the window's buckets and the trace's buckets outside them, each span tested by `(trace_id, span_id)` `IN` the passing groups — `NOT IN` the failing ones when a span with no child passes | `c06` |
 | `nestedSetParent < 0` — a root | served | **no numbering**: a root of the hydrated forest is a span whose parent is not stored, which is one anti-join over the window (`sql-schema.md` §5.9) | `c20`, 437 ms over 2,000,064 spans |
 | `nestedSetLeft > 0`, `nestedSetRight >= 1` | served | **no numbering**: the numbering starts at 1, so every stored span satisfies them | the ordinary search statement |
 | any other `nestedSetLeft` / `nestedSetRight` / `nestedSetParent` comparison | served | two statements: the search without the condition, then the candidate traces hydrated whole (`c21`, 35 ms for 20 traces), and the reader numbers those spans with the retained Euler tour. Numbering a window in SQL is not possible at corpus scale — measured, it exhausted a 6 GB server after 2 m 12 s | `c21`, §3.5's second case; the rule itself is checked by `c14`, `c15`, `measure/nested_set_check.sh` and the catalogue |
@@ -233,6 +233,13 @@ or lost by accident: `served` must keep working, `400` must keep refusing.
 The three reads of `sql-schema.md` §5.2, with the top-K as a **scalar** subquery
 so it is computed once: written as an ordinary CTE it ran twice, 4,098,432 rows
 against 2,098,370.
+
+Every search statement and every fetch carries `final = 1` with
+`do_not_merge_across_partitions_select_final = 1`: on `traces` and `resources`,
+whose partition key is not in their sorting key, a `FINAL` that merges across
+partitions defers partition pruning until after it, so a `day` bound prunes
+nothing and filters rows merged from several days by an arbitrary one, and a
+resource seen on two days was lost on its earlier day.
 
 ### 3.4 Trace by id, tags, metrics, service graph
 
