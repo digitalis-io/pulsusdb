@@ -467,6 +467,11 @@ pub struct VariantArena {
     /// The `regexp` patterns the database runs for every pipeline here
     /// (issue #624, part 3a): the statement's `rx` column, in this order.
     rx: Vec<super::pipeline::RxSource>,
+    /// Issue #624, part 3c (D7): the common pipeline holds a `json`,
+    /// `logfmt`, `pattern` or `unpack` stage. The reference runs the common
+    /// pipeline without hints, so a variant takes the no-label skip only
+    /// when this is `false`.
+    common_parses: bool,
 }
 
 impl VariantArena {
@@ -552,6 +557,7 @@ impl VariantArena {
             slot,
             charged,
             rx,
+            common_parses: common_parses(common),
         })
     }
 
@@ -565,6 +571,26 @@ impl VariantArena {
     /// the arena (issue #624, part 3a, D6).
     pub fn rx_patterns(&self) -> &[super::pipeline::RxSource] {
         &self.rx
+    }
+
+    /// Per `rx` element, whether every variant pipeline that reads it runs
+    /// under the no-label hints (issue #624, part 3c, D7): such a `pattern`
+    /// element is rendered empty, since no stage extracts from it.
+    pub fn rx_skipped(&self, variants: &[plan::VariantSpec]) -> Vec<bool> {
+        let mut read = vec![false; self.rx.len()];
+        let mut needed = vec![false; self.rx.len()];
+        for (i, spec) in variants.iter().enumerate() {
+            let no_labels = !self.common_parses && variant_needs_no_labels(spec);
+            for at in self.get(i).rx_slots() {
+                if let Some(r) = read.get_mut(at) {
+                    *r = true;
+                }
+                if !no_labels && let Some(n) = needed.get_mut(at) {
+                    *n = true;
+                }
+            }
+        }
+        read.iter().zip(&needed).map(|(r, n)| *r && !*n).collect()
     }
 
     pub fn charged_bytes(&self) -> u64 {
@@ -656,7 +682,7 @@ impl<'q> VariantsAggState<'q> {
                         spec.rate_window_ns(),
                         caps,
                     )?
-                    .with_range_step(variant_range_step(spec)),
+                    .with_range_step(variant_range_step(spec, !arena.common_parses)),
                 ))
             } else {
                 let instant =
@@ -676,7 +702,7 @@ impl<'q> VariantsAggState<'q> {
                         spec.rate_window_ns(),
                         caps,
                     )?
-                    .with_range_step(variant_range_step(spec)),
+                    .with_range_step(variant_range_step(spec, !arena.common_parses)),
                 ))
             };
             if i == 0 {
@@ -941,7 +967,10 @@ pub fn run_variants_rows(
 /// parser hints are not applied inside `variants(...)`, whose reserved-name
 /// behaviour on the reference is recorded as an open question (issue #507,
 /// revision 9).
-fn variant_range_step(spec: &super::plan::VariantSpec) -> super::pipeline::RangeStepRules {
+fn variant_range_step(
+    spec: &super::plan::VariantSpec,
+    may_skip: bool,
+) -> super::pipeline::RangeStepRules {
     let unwrap_label = spec.client().pipeline.iter().find_map(|s| match s {
         pulsus_logql::Stage::Unwrap(u) => Some(u.label.as_str()),
         _ => None,
@@ -953,8 +982,57 @@ fn variant_range_step(spec: &super::plan::VariantSpec) -> super::pipeline::Range
             spec.vector_aggs(),
             unwrap_label,
         ),
-        hints: super::pipeline::ParserHints::default(),
+        hints: super::pipeline::ParserHints {
+            no_labels: may_skip && variant_needs_no_labels(spec),
+            ..super::pipeline::ParserHints::default()
+        },
     }
+}
+
+/// Issue #624, part 3c (D7): whether the common pipeline holds a stage the
+/// no-label hints would skip. A scan of the borrowed stages: no allocation.
+fn common_parses(common: &[Stage]) -> bool {
+    common.iter().any(|s| {
+        matches!(
+            s,
+            Stage::Unpack
+                | Stage::Parser(
+                    pulsus_logql::ParserStage::Json { .. }
+                        | pulsus_logql::ParserStage::Logfmt { .. }
+                        | pulsus_logql::ParserStage::Pattern(_)
+                )
+        )
+    })
+}
+
+/// Issue #624, part 3c (D7): whether the reference's hints for this
+/// variant's extractor say it needs no labels. The reference builds the
+/// extractor from the variant as written, before its evaluator appends
+/// `__variant__` to the grouping (`pkg/logql/evaluator.go:1439`), so the
+/// label is taken out of a `by` grouping here.
+fn variant_needs_no_labels(spec: &super::plan::VariantSpec) -> bool {
+    let written: Vec<plan::VectorAggSpec> = spec
+        .vector_aggs()
+        .iter()
+        .map(|(op, grouping, param)| {
+            let grouping = grouping.as_ref().map(|g| {
+                let mut g = g.clone();
+                if g.kind == pulsus_logql::GroupingKind::By {
+                    g.labels.retain(|l| l != VARIANT_LABEL);
+                }
+                g
+            });
+            (*op, grouping, *param)
+        })
+        .collect();
+    super::plan::range_step_rules(
+        spec.client().range_op,
+        &spec.client().pipeline,
+        spec.client().grouping.as_deref(),
+        &written,
+    )
+    .hints
+    .no_labels
 }
 
 #[cfg(test)]
@@ -1416,10 +1494,11 @@ mod tests {
         }
         let n = variants.len() as u64;
         let VariantArena {
-            pipelines,        // C — with_capacity(n + 1)
-            slot,             // C — with_capacity(n)
-            charged: a_bytes, // S
-            rx: _rx,          // H — the query's own regexp patterns (issue #624)
+            pipelines,                       // C — with_capacity(n + 1)
+            slot,                            // C — with_capacity(n)
+            charged: a_bytes,                // S
+            rx: _rx,                         // H — the query's own regexp patterns (issue #624)
+            common_parses: _s_common_parses, // S — a bool, no allocation (issue #624 part 3c)
         } = arena;
         assert_eq!(pipelines.capacity(), 4);
         assert_eq!(slot.capacity(), 3);

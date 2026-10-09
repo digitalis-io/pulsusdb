@@ -1781,6 +1781,28 @@ pub(in crate::logql) fn label_only_pipeline(pipeline: &[Stage], op: RangeAggOp) 
     true
 }
 
+/// Issue #624, part 3c (D7): [`label_only_pipeline`] once the stages the
+/// reference's no-label hints make do nothing are taken out — `json`,
+/// `logfmt` and `pattern`, and an `unpack` no line filter follows (the
+/// statement pushes no line filter after an `unpack`,
+/// [`compile_line_filters`]). Asked only when the hints say the query needs
+/// no labels.
+pub(in crate::logql) fn no_label_pipeline(pipeline: &[Stage], op: RangeAggOp) -> bool {
+    let mut unpacked = false;
+    let mut rest: Vec<Stage> = Vec::with_capacity(pipeline.len());
+    for stage in pipeline {
+        match stage {
+            Stage::Parser(
+                ParserStage::Json { .. } | ParserStage::Logfmt { .. } | ParserStage::Pattern(_),
+            ) => {}
+            Stage::Unpack => unpacked = true,
+            Stage::LineFilter(_) if unpacked => return false,
+            other => rest.push(other.clone()),
+        }
+    }
+    label_only_pipeline(&rest, op)
+}
+
 /// The `regexp` count a range query lowers to, or `None` (issue #624, part
 /// 3a, D1 and D4).
 ///
@@ -1814,6 +1836,8 @@ pub(in crate::logql) fn regexp_count_route(
         .position(|s| !matches!(s, Stage::LineFilter(lf) if is_pushable_line_filter(lf)))?;
     let (pattern, parser) = match &pipeline[at] {
         Stage::Parser(ParserStage::Regexp(p)) => (p, sql::CaptureParser::Regexp),
+        // Issue #624, part 3c: a `| pattern` lowers as a `regexp` does.
+        Stage::Parser(ParserStage::Pattern(p)) => (p, sql::CaptureParser::Pattern),
         _ => return None,
     };
     let after = &pipeline[at + 1..];
@@ -1832,7 +1856,15 @@ pub(in crate::logql) fn regexp_count_route(
                 .filter_map(|(index, name)| Some((name?.to_string(), index)))
                 .collect()
         }
-        sql::CaptureParser::Pattern => return None,
+        sql::CaptureParser::Pattern => {
+            super::predicate::pattern_group_columns(pattern, &[]).ok()?;
+            super::pipeline::pattern_capture_names(pattern)
+                .ok()?
+                .into_iter()
+                .enumerate()
+                .map(|(i, name)| (name, i + 1))
+                .collect()
+        }
     };
 
     // D4: the labels the answer can read.
@@ -2322,7 +2354,7 @@ pub(in crate::logql) fn range_step_rules(
             active,
             requires_error: active && names_required(ERROR_LABEL),
             requires_preserve: active && names_required(PRESERVE_ERROR_LABEL),
-            no_labels: false,
+            no_labels: no_labels && hint_list_empty,
         },
     }
 }
@@ -2779,14 +2811,23 @@ fn metric_plan(
     // with them: the statement's count rows say which windows hold a line.
     // Issue #624, part 3a: a counting reducer after one `regexp` stage, which
     // the statement runs; its captures join the group key.
-    let regexp = if is_range && !force_client {
+    // Issue #624, part 3c (D7): under the reference's no-label hints the
+    // `json`, `logfmt`, `pattern` and `unpack` stages do nothing, so the
+    // statement counts as part 2's and the fold skips them.
+    let no_label_parsers = is_range
+        && !force_client
+        && range_step_rules(*op, pipeline, None, &vector_aggs)
+            .hints
+            .no_labels
+        && no_label_pipeline(pipeline, *op);
+    let regexp = if is_range && !force_client && !no_label_parsers {
         regexp_count_route(pipeline, *op, &vector_aggs)
     } else {
         None
     };
     // Issue #624, part 3b: a counting reducer after one `| json` stage,
     // whose key labels the statement reads.
-    let json = if is_range && !force_client && regexp.is_none() {
+    let json = if is_range && !force_client && regexp.is_none() && !no_label_parsers {
         json_count_route(pipeline, *op, &vector_aggs)
     } else {
         None
@@ -2795,6 +2836,7 @@ fn metric_plan(
         && !force_client
         && (!has_beyond_line_filter
             || label_only_pipeline(pipeline, *op)
+            || no_label_parsers
             || regexp.is_some()
             || json.is_some())
         && !has_unwrap

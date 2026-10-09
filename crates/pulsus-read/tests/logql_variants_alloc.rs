@@ -1938,7 +1938,10 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
         // pipeline's `regexp` pattern list out to seed the arena's one
         // registry — a `mem::take`, no allocation. W-MEM disposition:
         // **NIL**, inside row C-j's preamble.
-        // FRAME variants.rs VariantArena::build 11 18 :: .client .enumerate .extended_with .is_empty .iter .len .map_err .push .take_rx_patterns Err Ok QueryTooBroad Some charge_fanout_bytes compile variant_driver_buffer_bytes variant_pipeline_entry_bytes with_capacity
+        // Issue #624, part 3c: `common_parses` scans the borrowed common
+        // stages for a parser the no-label hints skip — `.any`, no
+        // allocation. W-MEM disposition: **NIL**.
+        // FRAME variants.rs VariantArena::build 11 19 :: .client .enumerate .extended_with .is_empty .iter .len .map_err .push .take_rx_patterns Err Ok QueryTooBroad Some charge_fanout_bytes common_parses compile variant_driver_buffer_bytes variant_pipeline_entry_bytes with_capacity
         branches: 11,
         callees: &[
             ".client",
@@ -1955,6 +1958,7 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
             "QueryTooBroad",
             "Some",
             "charge_fanout_bytes",
+            "common_parses",
             "compile",
             "variant_driver_buffer_bytes",
             "variant_pipeline_entry_bytes",
