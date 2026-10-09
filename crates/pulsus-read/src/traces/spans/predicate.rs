@@ -79,6 +79,8 @@ use crate::traces::filter::{
 };
 use crate::traces::window_sql::WindowSql;
 
+use super::tracelevel::{TraceLeaf, child_leaf, trace_leaf, type_refusal};
+
 /// A ClickHouse boolean over a `spans` row. Private fields, no public
 /// constructor: the four `compile_*` functions are the only ways to obtain
 /// one, so no later task can splice un-escaped query text into a
@@ -95,19 +97,44 @@ pub struct SpanPredicate {
     /// The messages of the statement's `!` demands, in pre-order; empty for
     /// most predicates.
     demands: Vec<String>,
+    /// The per-trace scalar's elements the text reads (issue #594 part 1).
+    trace_leaves: Vec<TraceLeaf>,
+    /// Whether the text reads the scalar's outside buckets, element 1.
+    child_counts: bool,
 }
 
 impl SpanPredicate {
     /// A spanset's membership (issue #593, [`super::structural`]), built
     /// from predicates this module compiled: `sql` composes their texts,
     /// `window` is the request's when any of them, or the composition,
-    /// reads a window-bounded subquery, and `demands` are theirs.
-    pub(super) fn composed(sql: String, window: Option<WindowSql>, demands: Vec<String>) -> Self {
+    /// reads a window-bounded subquery, and `demands`, `trace_leaves` and
+    /// `child_counts` are theirs.
+    pub(super) fn composed(
+        sql: String,
+        window: Option<WindowSql>,
+        demands: Vec<String>,
+        trace_leaves: Vec<TraceLeaf>,
+        child_counts: bool,
+    ) -> Self {
         SpanPredicate {
             sql,
             window,
             demands,
+            trace_leaves,
+            child_counts,
         }
+    }
+
+    /// The per-trace scalar's elements the text reads (issue #594 part 1),
+    /// each once.
+    pub fn trace_leaves(&self) -> &[TraceLeaf] {
+        &self.trace_leaves
+    }
+
+    /// Whether the text reads the per-trace scalar's outside buckets: it
+    /// holds a `span:childCount` leaf.
+    pub fn reads_child_counts(&self) -> bool {
+        self.child_counts
     }
 
     pub fn sql(&self) -> &str {
@@ -294,6 +321,14 @@ fn unsupported(construct: &str, target: &str) -> PlanError {
     ))
 }
 
+/// The four per-trace intrinsics as an operand (issue #594 part 1, D6):
+/// refused, so today's engine answers until #602.
+fn operand_refusal(intrinsic: Intrinsic) -> PlanError {
+    PlanError::UnsupportedField(format!(
+        "{intrinsic} as an operand is not supported by the search statement (issue #602)"
+    ))
+}
+
 fn unsupported_intrinsic(intrinsic: Intrinsic, target: &str) -> PlanError {
     unsupported(&format!("{intrinsic}"), target)
 }
@@ -416,6 +451,10 @@ struct Compiler<'a> {
     /// projection's two element reads ([`element_index_in`],
     /// [`element_select_in`]).
     head: Head,
+    /// The trace leaves compiled so far, each once (issue #594 part 1).
+    trace_leaves: Vec<TraceLeaf>,
+    /// Whether a `span:childCount` leaf was compiled.
+    child_counts: bool,
 }
 
 /// The head of an element loop: `arrayExists` for the predicate; for the
@@ -519,6 +558,8 @@ impl<'a> Compiler<'a> {
             occurrences: Vec::new(),
             presences: Vec::new(),
             head: Head::Exists,
+            trace_leaves: Vec::new(),
+            child_counts: false,
         }
     }
 
@@ -549,6 +590,8 @@ impl<'a> Compiler<'a> {
                 None
             },
             demands: self.demands.into_iter().map(|(_, m)| m).collect(),
+            trace_leaves: self.trace_leaves,
+            child_counts: self.child_counts,
         }
     }
 
@@ -835,10 +878,43 @@ impl<'a> Compiler<'a> {
     ) -> Result<String, PlanError> {
         match field {
             Field::Attribute { scope, key } => self.scoped_leaf(*scope, key, op, value),
+            Field::Intrinsic(
+                i @ (Intrinsic::TraceDuration | Intrinsic::RootName | Intrinsic::RootServiceName),
+            ) => {
+                let (sql, leaf) = trace_leaf(*i, op, value)?;
+                if !self.trace_leaves.contains(&leaf) {
+                    self.trace_leaves.push(leaf);
+                }
+                Ok(sql)
+            }
+            Field::Intrinsic(Intrinsic::ChildCount) => self.child_count_leaf(op, value),
             Field::Intrinsic(intrinsic) => {
                 intrinsic_leaf(*intrinsic, op, value, self.head.leaf_function())
             }
         }
+    }
+
+    /// `span:childCount op n` (issue #594 part 1). Its subquery reads the
+    /// window's buckets, so the predicate is tied to the window, as a
+    /// resource subquery ties it.
+    fn child_count_leaf(&mut self, op: ComparisonOp, value: &Value) -> Result<String, PlanError> {
+        let Value::Number(raw) = value else {
+            return Err(type_refusal(Intrinsic::ChildCount, op, value));
+        };
+        if sql_op(op).is_none() {
+            return Err(type_refusal(Intrinsic::ChildCount, op, value));
+        }
+        let ctx = self.ctx.ok_or_else(|| {
+            PlanError::UnsupportedField(
+                "span:childCount needs the request window: compile it with \
+                 compile_span_predicate_in (issue #594)"
+                    .to_string(),
+            )
+        })?;
+        let sql = child_leaf(op, value, &render_number(raw)?, ctx.window, ctx.spans_table)?;
+        self.uses_resources = true;
+        self.child_counts = true;
+        Ok(sql)
     }
 
     fn scoped_leaf(
@@ -1267,13 +1343,13 @@ impl<'a> Compiler<'a> {
                 | Intrinsic::LinkTraceId => Ok(()),
                 Intrinsic::NestedSetParent
                 | Intrinsic::NestedSetLeft
-                | Intrinsic::NestedSetRight
-                | Intrinsic::ChildCount
-                | Intrinsic::TraceDuration
-                | Intrinsic::RootName
-                | Intrinsic::RootServiceName => {
+                | Intrinsic::NestedSetRight => {
                     Err(unsupported_intrinsic(*intrinsic, NESTED_AND_TRACE))
                 }
+                Intrinsic::ChildCount
+                | Intrinsic::TraceDuration
+                | Intrinsic::RootName
+                | Intrinsic::RootServiceName => Err(operand_refusal(*intrinsic)),
             },
         }
     }
@@ -1586,13 +1662,13 @@ impl<'a> Compiler<'a> {
             | Intrinsic::EventTimeSinceStart
             | Intrinsic::LinkSpanId
             | Intrinsic::LinkTraceId => unreachable!("a set operand is taken by set_leaf first"),
-            Intrinsic::NestedSetParent
-            | Intrinsic::NestedSetLeft
-            | Intrinsic::NestedSetRight
-            | Intrinsic::ChildCount
+            Intrinsic::NestedSetParent | Intrinsic::NestedSetLeft | Intrinsic::NestedSetRight => {
+                Err(unsupported_intrinsic(intrinsic, NESTED_AND_TRACE))
+            }
+            Intrinsic::ChildCount
             | Intrinsic::TraceDuration
             | Intrinsic::RootName
-            | Intrinsic::RootServiceName => Err(unsupported_intrinsic(intrinsic, NESTED_AND_TRACE)),
+            | Intrinsic::RootServiceName => Err(operand_refusal(intrinsic)),
         }
     }
 
@@ -1688,13 +1764,13 @@ impl<'a> Compiler<'a> {
             | Intrinsic::LinkTraceId => {
                 unreachable!("every set operand is classified before operand_arms")
             }
-            Intrinsic::NestedSetParent
-            | Intrinsic::NestedSetLeft
-            | Intrinsic::NestedSetRight
-            | Intrinsic::ChildCount
+            Intrinsic::NestedSetParent | Intrinsic::NestedSetLeft | Intrinsic::NestedSetRight => {
+                Err(unsupported_intrinsic(intrinsic, NESTED_AND_TRACE))
+            }
+            Intrinsic::ChildCount
             | Intrinsic::TraceDuration
             | Intrinsic::RootName
-            | Intrinsic::RootServiceName => Err(unsupported_intrinsic(intrinsic, NESTED_AND_TRACE)),
+            | Intrinsic::RootServiceName => Err(operand_refusal(intrinsic)),
         }
     }
 
@@ -3453,13 +3529,13 @@ fn intrinsic_leaf(
         Intrinsic::EventTimeSinceStart => time_since_start_leaf(op, value, head),
         Intrinsic::LinkSpanId => link_id_leaf(intrinsic, "links.span_id", op, value, head),
         Intrinsic::LinkTraceId => link_id_leaf(intrinsic, "links.trace_id", op, value, head),
-        Intrinsic::NestedSetParent
-        | Intrinsic::NestedSetLeft
-        | Intrinsic::NestedSetRight
-        | Intrinsic::ChildCount
+        Intrinsic::NestedSetParent | Intrinsic::NestedSetLeft | Intrinsic::NestedSetRight => {
+            Err(unsupported_intrinsic(intrinsic, NESTED_AND_TRACE))
+        }
+        Intrinsic::ChildCount
         | Intrinsic::TraceDuration
         | Intrinsic::RootName
-        | Intrinsic::RootServiceName => Err(unsupported_intrinsic(intrinsic, NESTED_AND_TRACE)),
+        | Intrinsic::RootServiceName => unreachable!("taken by Compiler::leaf"),
     }
 }
 
@@ -3489,7 +3565,11 @@ fn string_column_leaf(
 /// `<column> <op> <s>` over a non-nullable string, under all eight
 /// operators. An invalid pattern is refused here, at compile time: the
 /// engine would fail the statement.
-fn string_column_text(column: &str, op: ComparisonOp, s: &str) -> Result<String, PlanError> {
+pub(super) fn string_column_text(
+    column: &str,
+    op: ComparisonOp,
+    s: &str,
+) -> Result<String, PlanError> {
     Ok(match op {
         ComparisonOp::Re => format!("match({column}, {})", anchored_regex_sql(s)?),
         ComparisonOp::Nre => format!("NOT match({column}, {})", anchored_regex_sql(s)?),

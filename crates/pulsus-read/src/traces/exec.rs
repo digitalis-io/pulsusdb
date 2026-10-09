@@ -2296,7 +2296,7 @@ impl TraceEngine {
         if let Some(e) = explain.as_mut() {
             e.push("search_statement", stmt.sql(), None);
         }
-        let mut settings = self.search_settings().set("final", 1);
+        let mut settings = with_final(self.search_settings());
         // Issue #593 part 2: a climb runs `max_depth + 1` levels, the last
         // only to see whether a parent was left; the server's own bound
         // must not end it first.
@@ -3393,13 +3393,27 @@ fn fetch_settings(config: &TraceReadConfig) -> QuerySettings {
     } else {
         QuerySettings::new()
     };
-    base.set("max_rows_to_read", config.scan_budget_rows)
-        .set("max_bytes_to_read", TRACE_READ_BYTES_BUDGET)
-        .set("read_overflow_mode", "throw")
-        .set("max_query_size", crate::querytext::MAX_QUERY_TEXT_BYTES)
-        .set("max_memory_usage", config.read_max_memory_bytes)
-        .set("max_bytes_before_external_group_by", 0u64)
-        .set("final", 1)
+    with_final(
+        base.set("max_rows_to_read", config.scan_budget_rows)
+            .set("max_bytes_to_read", TRACE_READ_BYTES_BUDGET)
+            .set("read_overflow_mode", "throw")
+            .set("max_query_size", crate::querytext::MAX_QUERY_TEXT_BYTES)
+            .set("max_memory_usage", config.read_max_memory_bytes)
+            .set("max_bytes_before_external_group_by", 0u64),
+    )
+}
+
+/// `final = 1`, with each partition merged on its own (issue #594 part 1):
+/// on `traces` and `resources`, whose partition key is not in their
+/// sorting key, a `FINAL` merging across partitions defers partition
+/// pruning until after it, so a `day` bound prunes nothing and filters
+/// rows merged from several days by an arbitrary one. No read here needs a
+/// row merged across days: a `spans` row's partition follows from its key,
+/// every `traces` read aggregates its rows, and a `resources` row is the
+/// same on every day it is seen.
+fn with_final(s: QuerySettings) -> QuerySettings {
+    s.set("final", 1)
+        .set("do_not_merge_across_partitions_select_final", 1)
 }
 
 /// What §2.4's branch decides: which route answers, and the second

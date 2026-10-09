@@ -12,6 +12,7 @@
 use pulsus_traceql::{BoolOp, FieldExpr, SpansetExpr, StructuralModifier, StructuralOp, Value};
 
 use super::predicate::{PredicateCtx, SpanPredicate, compile_span_predicate_in};
+use super::tracelevel::TraceLeaf;
 use crate::traces::PlanError;
 
 /// The all-zero parent: a root.
@@ -73,11 +74,19 @@ pub fn compile_membership_in(
         max_depth,
         climbs: false,
         demands: Vec::new(),
+        trace_leaves: Vec::new(),
+        child_counts: false,
     };
     let sql = c.member(spanset)?;
     // Every relation and every `&&` reads a window-bounded subquery.
     Ok(MembershipSql {
-        predicate: SpanPredicate::composed(sql, Some(ctx.window), c.demands),
+        predicate: SpanPredicate::composed(
+            sql,
+            Some(ctx.window),
+            c.demands,
+            c.trace_leaves,
+            c.child_counts,
+        ),
         climbs: c.climbs,
     })
 }
@@ -88,6 +97,10 @@ struct Membership<'a, 'b> {
     max_depth: u32,
     climbs: bool,
     demands: Vec<String>,
+    /// The filters' trace leaves, each once, and whether any reads child
+    /// counts (issue #594 part 1): the statement's scalar defines them.
+    trace_leaves: Vec<TraceLeaf>,
+    child_counts: bool,
 }
 
 impl Membership<'_, '_> {
@@ -116,6 +129,12 @@ impl Membership<'_, '_> {
                         self.demands.push(d.clone());
                     }
                 }
+                for l in p.trace_leaves() {
+                    if !self.trace_leaves.contains(l) {
+                        self.trace_leaves.push(l.clone());
+                    }
+                }
+                self.child_counts |= p.reads_child_counts();
                 Ok(format!("({})", p.sql()))
             }
             SpansetExpr::Binary { op, lhs, rhs } => {

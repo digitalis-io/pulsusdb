@@ -15,7 +15,9 @@
 //!   one place a window and a predicate compose;
 //! * [`search`] — the search statement (issue #590): the newest traces
 //!   with a matching span, their capped spansets and their roots, in one
-//!   statement.
+//!   statement;
+//! * [`tracelevel`] — the search statement's trace-level intrinsics and
+//!   `span:childCount` (issue #594 part 1).
 
 pub mod fetch;
 pub mod predicate;
@@ -23,3 +25,4 @@ pub mod projection;
 pub mod rows;
 pub mod search;
 pub mod structural;
+pub mod tracelevel;
