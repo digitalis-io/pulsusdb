@@ -1373,7 +1373,7 @@ fn the_compile_sites_are_enumerated_from_the_callers_of_the_compiler() {
         ),
         (
             "exec.rs",
-            9,
+            12,
             0,
             "streams :1160, metric :1444 (incl. every binary leaf), the bucketed range \
              read's capability-join fallback, the extracted-field group key read, \
@@ -1396,9 +1396,14 @@ fn the_compile_sites_are_enumerated_from_the_callers_of_the_compiler() {
              Issue #624 part 2 adds the eighth and ninth: a staged plan's pipeline, compiled \
              before any read, and the same pipeline less its line filters, compiled for the \
              fold. Both hold only the stages `label_only_pipeline` admits — line filters, \
-             label filters, `drop`, `keep`, `decolorize` — so no parser and no logfmt \
-             expression reaches them, and the bucketed fallback's pipeline, which a staged \
-             plan fills with those same stages, still holds none",
+             label filters, `drop`, `keep`, `decolorize` — and, since issue #624 part 3a, \
+             one `regexp` parser; no logfmt expression reaches them, and the bucketed \
+             fallback's pipeline, which a staged plan fills with those same stages, still \
+             holds none. Issue #624 part 3a adds the tenth to twelfth: EXPLAIN compiles the \
+             pipeline the streams read, the client-aggregated metric read and the bucketed \
+             fallback would each run, to render the `rx` column of their `regexp` stages. \
+             Each is a pipeline one of the executing sites above compiles for the same \
+             query, so any logfmt expression in it is one those sites already compile",
         ),
         (
             "plan.rs",

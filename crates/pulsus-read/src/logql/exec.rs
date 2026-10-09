@@ -18,8 +18,9 @@ use super::plan::{self, ClientAgg, ClientValue, MetricNode, MetricPlan, Plan, St
 use super::predicate::{BucketGridRefusal, CheckedFragment, CheckedLiteral};
 use super::rows::{
     DetectedLabelRow, LabelNameRow, LabelValueRow, LogStatsRow, MetricInstantRow,
-    MetricRangeBucketRow, MetricRangeUnwrappedRow, MetricScanRow, PatternFetchRow, SampleRow,
-    StreamMetaRow, StreamRow, TailSampleRow, UnwrappedLaneRow, VolumeRow,
+    MetricRangeBucketRow, MetricRangeRegexpRow, MetricRangeUnwrappedRow, MetricScanRow,
+    MetricScanRxRow, PatternFetchRow, SampleRow, SampleRxRow, StreamMetaRow, StreamRow,
+    TailSampleRow, TailSampleRxRow, UnwrappedLaneRow, VolumeRow,
 };
 use futures::Stream;
 use futures::StreamExt;
@@ -1021,6 +1022,22 @@ impl LogQlEngine {
             })
     }
 
+    /// [`LogQlEngine::query_stream`] for a read that sends the `rx` column
+    /// when `rx` is true (issue #624, part 3a, D6): the twin `T` is decoded
+    /// and turned into the base row `B`, which carries the captures.
+    async fn query_rows<'a, B: ChRow, T: ChRow + Into<B>>(
+        &'a self,
+        sql: &str,
+        settings: &QuerySettings,
+        rx: bool,
+    ) -> Result<RxRows<'a, B, T>, ReadError> {
+        Ok(if rx {
+            RxRows::Rx(self.query_stream::<T>(sql, settings).await?)
+        } else {
+            RxRows::Plain(self.query_stream::<B>(sql, settings).await?)
+        })
+    }
+
     /// Stage 1 — stream resolution. **Budget-capped** (fix-plan amendment
     /// §1, code review finding "Stage 1 bypasses the scan budget"):
     /// docs/schemas.md §3.2 line 305 ties the "aborts with 'query too
@@ -1358,7 +1375,10 @@ impl LogQlEngine {
         let lowered = stage3_predicates(sp, &fingerprints, &meta, self.metadata_budget());
         let fetch_until_limit = sp.fetch_until_limit || !lowered.metadata_lowered;
         let scan_limit = self.effective_scan_limit(sp, fetch_until_limit);
-        let sql = super::sql::stage3(
+        // Issue #624, part 3a (D6): the database runs the `regexp` stages
+        // over the stored line.
+        let rx = rx_column(&compiled)?;
+        let sql = super::sql::stage3_with_rx(
             &sp.samples_table,
             &services,
             &sql_literals(&fingerprints),
@@ -1369,6 +1389,7 @@ impl LogQlEngine {
             &lowered.predicates,
             sp.direction,
             scan_limit,
+            rx.as_ref(),
         );
         if let Some(e) = explain.as_mut() {
             e.push("stage3_samples", sql.clone(), None);
@@ -1421,6 +1442,7 @@ impl LogQlEngine {
                     &fingerprints,
                     scan_limit,
                     opts,
+                    rx.as_ref(),
                 )
                 .await;
         }
@@ -1441,7 +1463,7 @@ impl LogQlEngine {
             // Scoped: the row stream holds its pooled connection until
             // dropped (the `ChRowStream` lease rule).
             let mut stream = self
-                .query_stream::<SampleRow>(&sql, &self.budget_settings())
+                .query_rows::<SampleRow, SampleRxRow>(&sql, &self.budget_settings(), rx.is_some())
                 .await?;
             while let Some(row) = stream.next().await {
                 let row = row.map_err(|e| {
@@ -1528,6 +1550,7 @@ impl LogQlEngine {
         fingerprints: &[Fingerprint],
         scan_limit: u32,
         opts: ResponseOptions,
+        rx: Option<&CheckedFragment>,
     ) -> Result<(Vec<StreamResult>, bool), ReadError> {
         let budget = self.config.scan_budget_bytes;
         let window = super::sql::TimeWindow {
@@ -1569,7 +1592,7 @@ impl LogQlEngine {
                     offset: c.seen,
                 },
             };
-            let sql = super::sql::stage3_keyset(
+            let sql = super::sql::stage3_keyset_with_rx(
                 &sp.samples_table,
                 services,
                 &sql_literals(fingerprints),
@@ -1578,6 +1601,7 @@ impl LogQlEngine {
                 sp.direction,
                 &lowered.predicates,
                 st.page_size,
+                rx,
             );
 
             // Open, then stream-drain one page; `read_bytes` is meaningful
@@ -1595,7 +1619,11 @@ impl LogQlEngine {
             // first-page-vs-later-page branch split unchanged.
             let decision = {
                 let mut stream = match self
-                    .query_stream::<TailSampleRow>(&sql, &self.paging_settings(page_cap))
+                    .query_rows::<TailSampleRow, TailSampleRxRow>(
+                        &sql,
+                        &self.paging_settings(page_cap),
+                        rx.is_some(),
+                    )
                     .await
                 {
                     Ok(stream) => stream,
@@ -1957,6 +1985,7 @@ impl LogQlEngine {
                                 CompiledPipeline::compile(&stages)?,
                                 &s.todays_route,
                                 step,
+                                s.regexp.as_ref().map(|r| r.groups.clone()),
                             )
                         }
                         // #507's statement (range equal to step) keeps the
@@ -1980,11 +2009,24 @@ impl LogQlEngine {
                         if let Err(reason) = crate::querytext::ensure_query_text_fits(&sql) {
                             return Err(ReadError::QueryTooBroad(reason));
                         }
-                        match self
-                            .client
-                            .query_stream::<MetricRangeBucketRow>(&sql, &self.budget_settings())
-                            .await
-                        {
+                        // Issue #624, part 3a: a `regexp` count's rows carry
+                        // its two group-key columns.
+                        let regexp = matches!(
+                            &mp.value,
+                            super::sql::MetricValue::Staged(s) if s.regexp.is_some()
+                        );
+                        let opened = if regexp {
+                            self.client
+                                .query_stream::<MetricRangeRegexpRow>(&sql, &self.budget_settings())
+                                .await
+                                .map(RxRows::<MetricRangeBucketRow, _>::Rx)
+                        } else {
+                            self.client
+                                .query_stream::<MetricRangeBucketRow>(&sql, &self.budget_settings())
+                                .await
+                                .map(RxRows::<_, MetricRangeRegexpRow>::Plain)
+                        };
+                        match opened {
                             Ok(stream) => fold_bucketed_rows(stream, groups).await?,
                             Err(e) if bucketed_statement_failure_goes_to_todays_route(&e) => {
                                 BucketedRows::TodaysRoute
@@ -2369,7 +2411,15 @@ impl LogQlEngine {
         // Issue #227: a range query reads in physical-key order
         // (`optimize_read_in_order`, no server sort) for the streaming slide;
         // an instant query keeps the total-timestamp order its reducers pin.
-        let sql = client_metric_read_sql(mp, services, fingerprints, time_window, predicates);
+        let rx = rx_column(compiled)?;
+        let sql = client_metric_read_sql(
+            mp,
+            services,
+            fingerprints,
+            time_window,
+            predicates,
+            rx.as_ref(),
+        );
         // Issue #398: the hard-coded 8 GiB `max_memory_usage` override
         // that used to sit here is gone — every
         // LogQL read now carries the ceiling from
@@ -2457,7 +2507,9 @@ impl LogQlEngine {
             // Scoped: the row stream holds its pooled connection until
             // dropped (the `ChRowStream` lease rule) — no other query
             // runs inside this block, and the lease ends at the brace.
-            let mut stream = self.query_stream::<MetricScanRow>(&sql, &settings).await?;
+            let mut stream = self
+                .query_rows::<MetricScanRow, MetricScanRxRow>(&sql, &settings, rx.is_some())
+                .await?;
             while let Some(row) = stream.next().await {
                 chunk.push(row.map_err(|e| {
                     map_read_error(
@@ -2554,12 +2606,22 @@ impl LogQlEngine {
         // pipeline carries one — is re-applied per variant by the arena;
         // the fragment narrows the scan and cannot change the answer.
         let lowered = metric_predicates(scan, &fingerprints, &meta, self.metadata_budget());
+        // Issue #624, part 3a (D6): one `rx` column serves the common
+        // pipeline and every distinct tail the arena built.
+        let rx = if arena.rx_patterns().is_empty() {
+            None
+        } else {
+            Some(super::predicate::regexp_captures_column(
+                arena.rx_patterns(),
+            )?)
+        };
         let sql = client_metric_read_sql(
             scan,
             &services,
             &fingerprints,
             time_window,
             &lowered.predicates,
+            rx.as_ref(),
         );
         // Issue #398: the hard-coded 8 GiB `max_memory_usage` override
         // that used to sit here is gone — every
@@ -2586,7 +2648,9 @@ impl LogQlEngine {
         {
             // Scoped: the row stream holds its pooled connection until
             // dropped (the `ChRowStream` lease rule).
-            let mut stream = self.query_stream::<MetricScanRow>(&sql, &settings).await?;
+            let mut stream = self
+                .query_rows::<MetricScanRow, MetricScanRxRow>(&sql, &settings, rx.is_some())
+                .await?;
             while let Some(row) = stream.next().await {
                 chunk.push(row.map_err(|e| {
                     map_read_error(
@@ -2706,7 +2770,8 @@ impl LogQlEngine {
         let services = distinct_escaped_services(&meta);
         let lowered = stage3_predicates(sp, &fingerprints, &meta, self.metadata_budget());
         let fetch_until_limit = sp.fetch_until_limit || !lowered.metadata_lowered;
-        let stage3_sql = super::sql::stage3(
+        let rx = rx_column(&CompiledPipeline::compile(&sp.pipeline)?)?;
+        let stage3_sql = super::sql::stage3_with_rx(
             &sp.samples_table,
             &services,
             &sql_literals(&fingerprints),
@@ -2717,6 +2782,7 @@ impl LogQlEngine {
             &lowered.predicates,
             sp.direction,
             self.effective_scan_limit(sp, fetch_until_limit),
+            rx.as_ref(),
         );
         explain.push("stage3_samples", stage3_sql, None);
         Ok(explain)
@@ -2787,7 +2853,25 @@ impl LogQlEngine {
             // query runs the PK-ordered sliding scan (`run_metric_client`),
             // so reporting `metric_raw_samples` here made the
             // `explain_indexes` gates validate a query we never issue.
-            client_metric_read_sql(mp, &services, &fingerprints, window, &lowered.predicates)
+            let pipeline = match (&mp.client, &mp.metadata_lowering) {
+                (Some(client), _) => &client.pipeline,
+                (None, Some(m)) => {
+                    &m.client_without_lowering
+                        .as_ref()
+                        .expect("the restored aggregation")
+                        .pipeline
+                }
+                (None, None) => unreachable!("one of the two conditions above holds"),
+            };
+            let rx = rx_column(&CompiledPipeline::compile(pipeline)?)?;
+            client_metric_read_sql(
+                mp,
+                &services,
+                &fingerprints,
+                window,
+                &lowered.predicates,
+                rx.as_ref(),
+            )
         } else {
             match mp.step_ns {
                 // The execution twin's range arm (issue #507, the
@@ -2845,6 +2929,10 @@ impl LogQlEngine {
                             &fingerprints,
                             window,
                             &lowered.predicates,
+                            rx_column(&CompiledPipeline::compile(
+                                &bucketed_fallback_client_agg(mp).pipeline,
+                            )?)?
+                            .as_ref(),
                         ),
                     }
                 }
@@ -3783,6 +3871,9 @@ impl LogQlEngine {
             start_ns: sp.start_ns,
             end_ns: sp.end_ns,
         };
+        // Issue #624, part 3a (D6): the database runs the `regexp` stages
+        // over the stored line.
+        let rx = rx_column(&compiled)?;
         if !sp.fetch_until_limit {
             // Fast path — provably complete, not just fast: with no
             // unpushed dropping stage the pipeline cannot drop a line the
@@ -3791,7 +3882,7 @@ impl LogQlEngine {
             // `LIMIT line_limit` rows ARE the newest `line_limit`
             // post-pipeline matches (`scan_limit == line_limit` by
             // construction). Never partial.
-            let sql = super::sql::stage3(
+            let sql = super::sql::stage3_with_rx(
                 &sp.samples_table,
                 &services,
                 &sql_literals(&fingerprints),
@@ -3799,6 +3890,7 @@ impl LogQlEngine {
                 &sp.line_filters,
                 sp.direction,
                 sp.scan_limit,
+                rx.as_ref(),
             );
             if let Some(e) = explain.as_mut() {
                 e.push(
@@ -3818,7 +3910,11 @@ impl LogQlEngine {
                 // line_limit`), and the lease still releases at end of
                 // scope, before `finish()`.
                 let mut stream = self
-                    .query_stream::<SampleRow>(&sql, &self.budget_settings())
+                    .query_rows::<SampleRow, SampleRxRow>(
+                        &sql,
+                        &self.budget_settings(),
+                        rx.is_some(),
+                    )
                     .await?;
                 while let Some(row) = stream.next().await {
                     let row = row.map_err(|e| {
@@ -3841,6 +3937,7 @@ impl LogQlEngine {
                         row.fingerprint,
                         row.timestamp_ns,
                         &row.body,
+                        &row.rx,
                         &row.structured_metadata,
                         &base_labels,
                         &compiled,
@@ -3859,7 +3956,7 @@ impl LogQlEngine {
         // review fix) — keyset-page until `line_limit` post-pipeline
         // matches, window exhaustion, or budget exhaustion.
         if let Some(e) = explain.as_mut() {
-            let first_page_sql = super::sql::stage3_keyset(
+            let first_page_sql = super::sql::stage3_keyset_with_rx(
                 &sp.samples_table,
                 &services,
                 &sql_literals(&fingerprints),
@@ -3868,6 +3965,7 @@ impl LogQlEngine {
                 sp.direction,
                 &sp.line_filters,
                 sp.scan_limit.max(1),
+                rx.as_ref(),
             );
             e.push(
                 "detected_fields_read",
@@ -3884,6 +3982,7 @@ impl LogQlEngine {
                 &fingerprints,
                 line_limit,
                 acc,
+                rx.as_ref(),
             )
             .await?;
         Ok(Some(truncated))
@@ -3954,6 +4053,7 @@ impl LogQlEngine {
         fingerprints: &[Fingerprint],
         line_limit: u32,
         acc: &mut FieldAccumulator,
+        rx: Option<&CheckedFragment>,
     ) -> Result<bool, ReadError> {
         let budget = self.config.scan_budget_bytes;
         let window = super::sql::TimeWindow {
@@ -3989,7 +4089,7 @@ impl LogQlEngine {
                     offset: c.seen,
                 },
             };
-            let sql = super::sql::stage3_keyset(
+            let sql = super::sql::stage3_keyset_with_rx(
                 &sp.samples_table,
                 services,
                 &sql_literals(fingerprints),
@@ -3998,6 +4098,7 @@ impl LogQlEngine {
                 sp.direction,
                 &sp.line_filters,
                 st.page_size,
+                rx,
             );
 
             // Open, then stream-drain one page; `read_bytes` is meaningful
@@ -4007,7 +4108,11 @@ impl LogQlEngine {
             // releases before the next page opens.
             let decision = {
                 let mut stream = match self
-                    .query_stream::<TailSampleRow>(&sql, &self.paging_settings(page_cap))
+                    .query_rows::<TailSampleRow, TailSampleRxRow>(
+                        &sql,
+                        &self.paging_settings(page_cap),
+                        rx.is_some(),
+                    )
                     .await
                 {
                     Ok(stream) => stream,
@@ -4172,7 +4277,10 @@ impl LogQlEngine {
                 offset: c.seen,
             },
         };
-        let sql = super::sql::stage3_keyset(
+        // Issue #624, part 3a (D6): the database runs the `regexp` stages
+        // over the stored line.
+        let rx = rx_column(&setup.compiled)?;
+        let sql = super::sql::stage3_keyset_with_rx(
             &setup.plan.samples_table,
             &services,
             &sql_literals(fingerprints),
@@ -4181,6 +4289,7 @@ impl LogQlEngine {
             Direction::Forward,
             &setup.plan.line_filters,
             fetch_limit,
+            rx.as_ref(),
         );
 
         // Streamed, not staged (issue #312): a poll used to build a
@@ -4196,7 +4305,11 @@ impl LogQlEngine {
             // Scoped: the row stream holds its pooled connection until
             // dropped (the `ChRowStream` lease rule).
             let mut stream = self
-                .query_stream::<TailSampleRow>(&sql, &self.budget_settings())
+                .query_rows::<TailSampleRow, TailSampleRxRow>(
+                    &sql,
+                    &self.budget_settings(),
+                    rx.is_some(),
+                )
                 .await?;
             while let Some(row) = stream.next().await {
                 let row = row.map_err(|e| {
@@ -4213,7 +4326,7 @@ impl LogQlEngine {
                         timestamp_ns: row.timestamp_ns,
                         body: row.body,
                         structured_metadata: row.structured_metadata,
-                        rx: Vec::new(),
+                        rx: row.rx,
                     },
                     &setup.compiled,
                 )?;
@@ -4545,7 +4658,7 @@ impl StreamsPagedState {
                     timestamp_ns: row.timestamp_ns,
                     body: row.body,
                     structured_metadata: row.structured_metadata,
-                    rx: Vec::new(),
+                    rx: row.rx,
                 },
                 compiled,
             ) {
@@ -5068,17 +5181,28 @@ impl<'m> StreamAccumulator<'m> {
                 // Zero-structured-metadata fast path — UNCHANGED (the
                 // `logql_pipeline_alloc` golden pins its zero-per-row
                 // profile; AC-8 byte-identity for pre-#97 data).
+                // Issue #624, part 3a (D6): the `regexp` captures the
+                // database ran, when the read sent them.
+                let captures = super::pipeline::RegexpCaptures::Rows(&row.rx);
                 let Some(line) = (if categorize {
-                    compiled.run_into_with_sm_categorized(
+                    compiled.run_into_with_sm_categorized_captured(
                         &row.body,
                         base,
                         row.timestamp_ns,
                         &EMPTY_STRUCTURED_METADATA,
+                        captures,
                         &mut scratch,
                         &mut cat_scratch,
                     )?
                 } else {
-                    compiled.run_into(&row.body, base, row.timestamp_ns, &mut scratch)?
+                    compiled.run_into_with_sm_captured(
+                        &row.body,
+                        base,
+                        row.timestamp_ns,
+                        &EMPTY_STRUCTURED_METADATA,
+                        captures,
+                        &mut scratch,
+                    )?
                 }) else {
                     continue;
                 };
@@ -5151,6 +5275,7 @@ impl<'m> StreamAccumulator<'m> {
                 let (survived, used) = eval_structured_metadata_row(
                     compiled,
                     &row.body,
+                    &row.rx,
                     &merge_buf,
                     &sm_ctx,
                     label_groups,
@@ -5455,8 +5580,11 @@ struct StagedFold {
     /// `absent_over_time`: its labels and which grid points a kept group
     /// covers. `None` for the counting reducers.
     absent: Option<(LabelSet, Vec<bool>)>,
-    /// The last group's outcome.
-    memo: Option<(Fingerprint, String, StagedOutcome)>,
+    /// A `regexp` count's sent groups, `(name, 1-based index)` (issue #624,
+    /// part 3a): the stage reads each row's `matched` and `caps` (D3).
+    regexp: Option<Vec<(String, usize)>>,
+    /// The last group's outcome, keyed by the whole group key.
+    memo: Option<(Fingerprint, String, u8, Vec<String>, StagedOutcome)>,
 }
 
 /// What the stages make of one group.
@@ -5524,6 +5652,7 @@ impl PushdownRangeGroups {
         compiled: CompiledPipeline,
         todays_route: &ClientAgg,
         step: super::pipeline::RangeStepRules,
+        regexp: Option<Vec<(String, usize)>>,
     ) -> Self {
         let fan_out = compiled.metric_mutates_labels() || todays_route.grouping.is_some();
         let width = usize::try_from(self.grid_points).unwrap_or(0);
@@ -5536,6 +5665,7 @@ impl PushdownRangeGroups {
             slider_safe: super::client_agg::slider_safe_fingerprints(&self.base_labels),
             fp_series: HashMap::new(),
             absent,
+            regexp,
             memo: None,
         }));
         self
@@ -5566,9 +5696,11 @@ impl PushdownRangeGroups {
             ..
         } = self;
         let staged = staged.as_mut().expect("the staged mode");
-        if let Some((fp, sm, outcome)) = &staged.memo
+        if let Some((fp, sm, matched, caps, outcome)) = &staged.memo
             && *fp == row.fingerprint
             && *sm == row.structured_metadata
+            && *matched == row.matched
+            && *caps == row.caps
         {
             return Ok(outcome.clone());
         }
@@ -5587,13 +5719,24 @@ impl PushdownRangeGroups {
                 (merge_buf, sm_ctx)
             };
         let mut scratch: Vec<(Cow<'_, str>, Cow<'_, str>)> = Vec::new();
-        let run = staged.compiled.run_metric_step_into(
+        // Issue #624, part 3a (D3): the `regexp` stage takes the group's
+        // captures; every line of the group has them.
+        let captures = match &staged.regexp {
+            Some(groups) => super::pipeline::RegexpCaptures::Group {
+                matched: row.matched == 1,
+                caps: &row.caps,
+                groups,
+            },
+            None => super::pipeline::RegexpCaptures::None,
+        };
+        let run = staged.compiled.run_metric_step_into_with_captures(
             "",
             pipeline_base,
             0,
             sm,
             None,
             &staged.step,
+            captures,
             &mut scratch,
         )?;
         let outcome = match run {
@@ -5627,6 +5770,8 @@ impl PushdownRangeGroups {
         staged.memo = Some((
             row.fingerprint,
             row.structured_metadata.clone(),
+            row.matched,
+            row.caps.clone(),
             outcome.clone(),
         ));
         Ok(outcome)
@@ -5983,6 +6128,50 @@ fn range_fold_off_grid(t: i64) -> ReadError {
 ///
 /// `Err` is a fall back to the client path, never a failed query — see the
 /// call site's capability join.
+/// A raw read's rows, decoded as the base row or as its twin with the
+/// `rx` column (issue #624, part 3a, D6), either way yielding the base row.
+pub(in crate::logql) enum RxRows<'a, B, T> {
+    Plain(ChRowStream<'a, B>),
+    Rx(ChRowStream<'a, T>),
+}
+
+impl<B, T> RxRows<'_, B, T> {
+    /// [`ChRowStream::read_bytes`] of whichever stream this is.
+    pub(in crate::logql) fn read_bytes(&self) -> Option<u64> {
+        match self {
+            RxRows::Plain(s) => s.read_bytes(),
+            RxRows::Rx(s) => s.read_bytes(),
+        }
+    }
+}
+
+impl<B: ChRow, T: ChRow + Into<B>> Stream for RxRows<'_, B, T> {
+    type Item = Result<B, ChError>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        match self.get_mut() {
+            RxRows::Plain(s) => std::pin::Pin::new(s).poll_next(cx),
+            RxRows::Rx(s) => std::pin::Pin::new(s)
+                .poll_next(cx)
+                .map(|item| item.map(|row| row.map(Into::into))),
+        }
+    }
+}
+
+/// The `rx` column for `compiled`'s database `regexp` stages (issue #624,
+/// part 3a, D6), or `None` when it has none.
+fn rx_column(compiled: &CompiledPipeline) -> Result<Option<CheckedFragment>, ReadError> {
+    if compiled.rx_patterns().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(super::predicate::regexp_captures_column(
+        compiled.rx_patterns(),
+    )?))
+}
+
 fn bucketed_range_sql(
     mp: &MetricPlan,
     services: &[CheckedLiteral],
@@ -5999,10 +6188,20 @@ fn bucketed_range_sql(
         start_ns: mp.start_ns,
         end_ns: mp.end_ns,
     };
+    // Issue #624, part 3a (D2): a `regexp` count's captures join the group
+    // key. The planner rendered the pattern before it chose this route.
+    let regexp = match &mp.value {
+        super::sql::MetricValue::Staged(s) => s.regexp.as_ref().map(|r| {
+            let indexes: Vec<usize> = r.groups.iter().map(|(_, i)| *i).collect();
+            super::predicate::regexp_group_columns(&r.pattern, &indexes)
+                .expect("the planner rendered this pattern (issue #624, part 3a)")
+        }),
+        _ => None,
+    };
     // Issue #624: #507's statement when the range equals the step, which is
     // smaller and faster there; the sliding statement at every other range.
     if mp.range_ns.get() != step_ns {
-        return super::sql::metric_range_sliding(
+        return super::sql::metric_range_sliding_with_regexp(
             metric_source(mp),
             services,
             &sql_literals(fingerprints),
@@ -6014,13 +6213,14 @@ fn bucketed_range_sql(
                 range_ns: mp.range_ns.get(),
             },
             predicates,
+            regexp.as_ref(),
         );
     }
     let lo_ns = mp
         .grid_start_ns
         .checked_sub(step_ns)
         .ok_or(BucketGridRefusal::WouldOverflow)?;
-    super::sql::metric_range_bucketed(
+    super::sql::metric_range_bucketed_with_regexp(
         metric_source(mp),
         services,
         &sql_literals(fingerprints),
@@ -6035,6 +6235,7 @@ fn bucketed_range_sql(
         // `absent_over_time`, which never lowers onto this path
         // (`compile.rs`'s `RangeAggLower::capability` makes it `Never`).
         ScanProjection::WithStructuredMetadata,
+        regexp.as_ref(),
     )
 }
 
@@ -6315,6 +6516,7 @@ fn client_metric_read_sql(
     fingerprints: &[Fingerprint],
     window: super::sql::TimeWindow,
     predicates: &[CheckedFragment],
+    rx: Option<&CheckedFragment>,
 ) -> String {
     // Issue #624, part 2: every reducer reads `structured_metadata`, the
     // column `MetricScanRow` decodes. `absent_over_time` read the lean
@@ -6322,8 +6524,10 @@ fn client_metric_read_sql(
     // result: the query failed with a decode error wherever the selector
     // resolved a stream.
     let projection = ScanProjection::WithStructuredMetadata;
+    // Issue #624, part 3a (D6): `rx` carries the captures of the `regexp`
+    // stages the database runs over the stored line.
     if mp.step_ns.is_some() {
-        super::sql::metric_raw_samples_sliding(
+        super::sql::metric_raw_samples_sliding_with_rx(
             &mp.table,
             services,
             &sql_literals(fingerprints),
@@ -6331,9 +6535,10 @@ fn client_metric_read_sql(
             mp.scan_lower,
             predicates,
             projection,
+            rx,
         )
     } else {
-        super::sql::metric_raw_samples(
+        super::sql::metric_raw_samples_with_rx(
             &mp.table,
             services,
             &sql_literals(fingerprints),
@@ -6341,6 +6546,7 @@ fn client_metric_read_sql(
             mp.scan_lower,
             predicates,
             projection,
+            rx,
         )
     }
 }
@@ -7139,8 +7345,14 @@ mod tests {
             end_ns: 60_000_000_000,
             step_ns: 15_000_000_000,
         });
-        let range_sql =
-            client_metric_read_sql(&range_mp, &svc, &[Fingerprint::from_raw(1)], window, &[]);
+        let range_sql = client_metric_read_sql(
+            &range_mp,
+            &svc,
+            &[Fingerprint::from_raw(1)],
+            window,
+            &[],
+            None,
+        );
         assert!(
             range_sql.contains("ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC"),
             "range EXPLAIN/exec must report the sliding scan: {range_sql}"
@@ -7149,8 +7361,14 @@ mod tests {
         let instant_mp = mk(QuerySpec::Instant {
             at_ns: 60_000_000_000,
         });
-        let instant_sql =
-            client_metric_read_sql(&instant_mp, &svc, &[Fingerprint::from_raw(1)], window, &[]);
+        let instant_sql = client_metric_read_sql(
+            &instant_mp,
+            &svc,
+            &[Fingerprint::from_raw(1)],
+            window,
+            &[],
+            None,
+        );
         assert!(
             instant_sql.contains("ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC"),
             "instant must keep its total order: {instant_sql}"
@@ -10318,6 +10536,7 @@ mod tests {
                 CompiledPipeline::compile(&c.pipeline).expect("compiles"),
                 c,
                 RangeStepRules::PLAIN,
+                None,
             )
         }
         let pairs = |p: &[(&str, &str)]| -> Vec<(String, String)> {

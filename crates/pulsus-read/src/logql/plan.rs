@@ -1793,11 +1793,86 @@ pub(in crate::logql) fn label_only_pipeline(pipeline: &[Stage], op: RangeAggOp) 
 /// keeps (every label when there is no such parent), or one a later stage
 /// reads. They keep their capture-index order.
 pub(in crate::logql) fn regexp_count_route(
-    _pipeline: &[Stage],
-    _op: RangeAggOp,
-    _vector_aggs: &[VectorAggSpec],
+    pipeline: &[Stage],
+    op: RangeAggOp,
+    vector_aggs: &[VectorAggSpec],
 ) -> Option<sql::RegexpCount> {
-    None
+    if !matches!(
+        op,
+        RangeAggOp::CountOverTime
+            | RangeAggOp::Rate
+            | RangeAggOp::BytesOverTime
+            | RangeAggOp::BytesRate
+            | RangeAggOp::AbsentOverTime
+    ) {
+        return None;
+    }
+    // D1 and R4: pushable line filters, then the one parser, which no line
+    // rewrite precedes.
+    let at = pipeline
+        .iter()
+        .position(|s| !matches!(s, Stage::LineFilter(lf) if is_pushable_line_filter(lf)))?;
+    let Stage::Parser(ParserStage::Regexp(pattern)) = &pipeline[at] else {
+        return None;
+    };
+    let after = &pipeline[at + 1..];
+    if !label_only_pipeline(after, op) {
+        return None;
+    }
+    // The statement runs the pattern as a pushed `|~` would render it.
+    super::predicate::regexp_group_columns(pattern, &[]).ok()?;
+    let re = super::pipeline::compile_regex_as_database(pattern).ok()?;
+
+    // D4: the labels the answer can read.
+    let grouping = parent_sum_grouping(op, false, vector_aggs);
+    let mut read: Vec<&str> = Vec::new();
+    for stage in after {
+        match stage {
+            Stage::LabelFilter(expr) => {
+                pulsus_logql::for_each_label_filter(expr, |node: &LabelFilterExpr| match node {
+                    LabelFilterExpr::Match(m) => read.push(m.name.as_str()),
+                    LabelFilterExpr::Compare { name, .. } | LabelFilterExpr::Ip { name, .. } => {
+                        read.push(name.as_str())
+                    }
+                    LabelFilterExpr::And(_, _) | LabelFilterExpr::Or(_, _) => {}
+                });
+            }
+            Stage::Drop(elems) | Stage::Keep(elems) => {
+                read.extend(elems.iter().map(|e| e.label.as_str()));
+            }
+            _ => {}
+        }
+    }
+    let answer_reads = |name: &str| -> bool {
+        let kept = match grouping {
+            None => true,
+            Some(None) => false,
+            Some(Some(g)) => match g.kind {
+                GroupingKind::By => g.labels.iter().any(|l| l == name),
+                GroupingKind::Without => !g.labels.iter().any(|l| l == name),
+            },
+        };
+        kept || read.contains(&name)
+    };
+    let groups: Vec<(String, usize)> = re
+        .capture_names()
+        .enumerate()
+        .filter_map(|(index, name)| {
+            let name = name?;
+            let sanitised = if super::pipeline::key_needs_sanitizing(name) {
+                super::pipeline::sanitize_label_key(name)
+            } else {
+                name.to_string()
+            };
+            let extracted = format!("{sanitised}_extracted");
+            (answer_reads(&sanitised) || answer_reads(&extracted))
+                .then(|| (name.to_string(), index))
+        })
+        .collect();
+    Some(sql::RegexpCount {
+        pattern: pattern.clone(),
+        groups,
+    })
 }
 
 /// Issue #507 (W4): does the pipeline carry a `| unwrap` with a
@@ -2584,9 +2659,16 @@ fn metric_plan(
     // group, and the stages run once per group in the engine, through the
     // same pipeline today's route runs per line. `absent_over_time` lowers
     // with them: the statement's count rows say which windows hold a line.
+    // Issue #624, part 3a: a counting reducer after one `regexp` stage, which
+    // the statement runs; its captures join the group key.
+    let regexp = if is_range && !force_client {
+        regexp_count_route(pipeline, *op, &vector_aggs)
+    } else {
+        None
+    };
     let bucketed_range = is_range
         && !force_client
-        && (!has_beyond_line_filter || label_only_pipeline(pipeline, *op))
+        && (!has_beyond_line_filter || label_only_pipeline(pipeline, *op) || regexp.is_some())
         && !has_unwrap
         // Implied by the reducer set below — none of the five requires
         // `| unwrap` — but named so that a future change to
@@ -2737,7 +2819,10 @@ fn metric_plan(
         let equal = step_ns.is_some_and(|step| step.get() == range_ns.get());
         RoutingDecision {
             chosen: RouteChoice::Raw,
-            reason: if staged {
+            reason: if staged && regexp.is_some() {
+                "raw: range aggregation in the database, regexp captures and label stages over its rows (issue #624)"
+                    .to_string()
+            } else if staged {
                 "raw: range aggregation in the database, label stages over its rows (issue #624)"
                     .to_string()
             } else if equal {
@@ -2810,7 +2895,7 @@ fn metric_plan(
             todays_route: client_full
                 .clone()
                 .expect("a range plan always builds today's aggregation"),
-            regexp: None,
+            regexp: regexp.clone(),
         })),
         (None, false) => sql::MetricValue::Shaped(shape),
     };
@@ -6514,6 +6599,17 @@ mod tests {
                 assert_eq!(
                     mp.routing.reason,
                     "raw: sliding range aggregation in the database (issue #624)",
+                    "{query}"
+                );
+                continue;
+            }
+            // Issue #624, part 3a: a `regexp` count is counted in the
+            // database, which runs the parser too. It still plans.
+            if query.contains("| regexp ") {
+                assert!(mp.client.is_none(), "{query}");
+                assert_eq!(
+                    mp.routing.reason,
+                    "raw: range aggregation in the database, regexp captures and label stages over its rows (issue #624)",
                     "{query}"
                 );
                 continue;

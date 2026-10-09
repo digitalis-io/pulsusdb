@@ -1568,7 +1568,7 @@ const EXPECTED_CENSUS: [(FrameKey, &str); 16] = [
     (("detected_probe.rs", Some("DetectedRowFeeder"), "trim"),
      ".capacityx2 .clearx2 newx2 trim_strx2 trim_vecx3"),
     (("detected_probe.rs", None, "observe_detected_row"),
-     ".anyx1 .as_refx4 .as_strx1 .clearx3 .intox1 .iterx3 .observe_pairx2 .run_into_with_smx1 Errx1 Okx1 auto_parse_observex1 parse_canonical_labels_intox1 recycle_label_scratchx2"),
+     ".anyx1 .as_refx4 .as_strx1 .clearx3 .intox1 .iterx3 .observe_pairx2 .run_into_with_sm_capturedx1 Errx1 Okx1 Rowsx1 auto_parse_observex1 parse_canonical_labels_intox1 recycle_label_scratchx2"),
     (("detected_probe.rs", None, "auto_parse_observe"),
      ".as_refx2 .clearx1 .enumeratex1 .getx1 .intox1 .iterx1 .observe_pairx1 Errx1 Okx1 auto_parse_intox1 defaultx1 recycle_label_scratchx1"),
     // Issue #463 moved the upsert from `.find` to `.position`: the INDEX

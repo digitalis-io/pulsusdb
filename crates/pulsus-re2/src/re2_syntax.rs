@@ -474,8 +474,90 @@ pub fn clickhouse_match_head_rewrite(pattern: &str) -> Option<String> {
 /// row `audit DENIED open` with the index and 1 without it. Decided on our
 /// own parse of the pattern; a pattern that does not parse is not flagged,
 /// because it never reaches the database.
-pub fn case_folded_alternation_in_group(_pattern: &str) -> bool {
-    false
+pub fn case_folded_alternation_in_group(pattern: &str) -> bool {
+    let Ok(ast) = regex_syntax::ast::parse::Parser::new().parse(pattern) else {
+        return false;
+    };
+    let mut case_insensitive = false;
+    fold_walk(&ast, &mut case_insensitive).flagged
+}
+
+/// What [`fold_walk`] found under one node.
+#[derive(Default)]
+struct FoldWalk {
+    /// A group in it satisfies [`case_folded_alternation_in_group`].
+    flagged: bool,
+    /// It holds an alternation, at any depth.
+    alternation: bool,
+    /// A flag in it switches case-insensitivity on, at any depth.
+    sets_i: bool,
+}
+
+/// One node of [`case_folded_alternation_in_group`]'s walk. `ci` is the
+/// case-insensitivity in force where the node starts; a flag-only item
+/// changes it for what follows in the same group, and a group restores it
+/// when it closes.
+fn fold_walk(ast: &regex_syntax::ast::Ast, ci: &mut bool) -> FoldWalk {
+    use regex_syntax::ast::{Ast, Flag, GroupKind};
+    match ast {
+        Ast::Flags(set) => {
+            let state = set.flags.flag_state(Flag::CaseInsensitive);
+            if let Some(on) = state {
+                *ci = on;
+            }
+            FoldWalk {
+                sets_i: state == Some(true),
+                ..FoldWalk::default()
+            }
+        }
+        Ast::Group(group) => {
+            let mut inner = *ci;
+            let mut sets_i = false;
+            if let GroupKind::NonCapturing(flags) = &group.kind
+                && let Some(on) = flags.flag_state(Flag::CaseInsensitive)
+            {
+                inner = on;
+                sets_i = on;
+            }
+            let open = inner;
+            let walk = fold_walk(&group.ast, &mut inner);
+            FoldWalk {
+                flagged: walk.flagged || (walk.alternation && (open || walk.sets_i)),
+                alternation: walk.alternation,
+                sets_i: sets_i || walk.sets_i,
+            }
+        }
+        Ast::Alternation(alt) => {
+            let mut out = FoldWalk {
+                alternation: true,
+                ..FoldWalk::default()
+            };
+            for branch in &alt.asts {
+                let walk = fold_walk(branch, ci);
+                out.flagged |= walk.flagged;
+                out.sets_i |= walk.sets_i;
+            }
+            out
+        }
+        Ast::Concat(concat) => {
+            let mut out = FoldWalk::default();
+            for item in &concat.asts {
+                let walk = fold_walk(item, ci);
+                out.flagged |= walk.flagged;
+                out.alternation |= walk.alternation;
+                out.sets_i |= walk.sets_i;
+            }
+            out
+        }
+        Ast::Repetition(rep) => fold_walk(&rep.ast, ci),
+        Ast::Empty(_)
+        | Ast::Literal(_)
+        | Ast::Dot(_)
+        | Ast::Assertion(_)
+        | Ast::ClassUnicode(_)
+        | Ast::ClassPerl(_)
+        | Ast::ClassBracketed(_) => FoldWalk::default(),
+    }
 }
 
 /// One scan: every valid flag head, split into the affected (no-`i`)

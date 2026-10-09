@@ -723,7 +723,15 @@ enum CompiledStage {
         /// Empty = all pairs; else `(label, source_key)`.
         extractions: Vec<(String, String)>,
     },
-    Regexp(regex::Regex),
+    /// `| regexp`. `re` is D7's compile (issue #624, part 3a): the pattern as
+    /// the database reads it. `rx` is the stage's element of the row's `rx`
+    /// column when the database runs it — no line-rewriting stage precedes
+    /// it and a statement reads the stored line beneath it — and `None` when
+    /// it runs here.
+    Regexp {
+        re: regex::Regex,
+        rx: Option<usize>,
+    },
     Pattern(Vec<PatternTok>),
     LabelFilter(CompiledLabelFilter),
     LineFormat {
@@ -1119,6 +1127,7 @@ impl Default for CompileState {
 fn compile_stage(
     stage: &Stage,
     st: &mut CompileState,
+    rx: Option<&mut Vec<String>>,
 ) -> Result<Option<CompiledStage>, PipelineError> {
     if !matches!(stage, Stage::LineFilter(_)) {
         st.all_line_filter_source = false;
@@ -1159,8 +1168,10 @@ fn compile_stage(
                         }
                         LineFilterOp::Regex | LineFilterOp::NotRegex => {
                             // Unanchored, like the SQL pushdown's
-                            // `match(body, ...)`.
-                            LineMatcher::Regex(compile_regex(value)?)
+                            // `match(body, ...)`, and read as the database
+                            // reads it (issue #624, part 3a, D7), so the
+                            // filter answers the same on every route.
+                            LineMatcher::Regex(compile_regex_as_database(value)?)
                         }
                     }
                 };
@@ -1171,7 +1182,28 @@ fn compile_stage(
         }
         Stage::Parser(p) => {
             st.mutates_labels = true;
-            Ok(Some(compile_parser(p)?))
+            let mut compiled = compile_parser(p)?;
+            // Issue #624, part 3a (D6): a `regexp` stage over the stored
+            // line takes its captures from the database, which runs it
+            // once per row as one element of the statement's `rx` column.
+            // One element per distinct pattern, in first use.
+            if let (
+                CompiledStage::Regexp { rx: slot, .. },
+                ParserStage::Regexp(pattern),
+                Some(registry),
+            ) = (&mut compiled, p, rx)
+                && !st.seen_line_format
+            {
+                let at = match registry.iter().position(|q| q == pattern) {
+                    Some(at) => at,
+                    None => {
+                        registry.push(pattern.clone());
+                        registry.len() - 1
+                    }
+                };
+                *slot = Some(at);
+            }
+            Ok(Some(compiled))
         }
         Stage::LabelFilter(expr) => {
             // Issue #248: the parser admits label filters after `| unwrap`
@@ -1291,12 +1323,13 @@ impl CompiledPipeline {
     pub fn compile(stages: &[Stage]) -> Result<Self, PipelineError> {
         let mut st = CompileState::default();
         let mut compiled = Vec::new();
+        let mut rx = Vec::new();
         for stage in stages {
-            if let Some(cs) = compile_stage(stage, &mut st)? {
+            if let Some(cs) = compile_stage(stage, &mut st, Some(&mut rx))? {
                 compiled.push(cs);
             }
         }
-        Ok(Self::from_parts(compiled, st))
+        Ok(Self::from_parts(compiled, st, rx))
     }
 
     /// Compiles every stage CLIENT-SIDE, **including the line filters a
@@ -1327,11 +1360,13 @@ impl CompiledPipeline {
         };
         let mut compiled = Vec::new();
         for stage in stages {
-            if let Some(cs) = compile_stage(stage, &mut st)? {
+            // No statement beneath it, so no `regexp` stage reads the
+            // database (issue #624, part 3a).
+            if let Some(cs) = compile_stage(stage, &mut st, None)? {
                 compiled.push(cs);
             }
         }
-        Ok(Self::from_parts(compiled, st))
+        Ok(Self::from_parts(compiled, st, Vec::new()))
     }
 
     /// A clone of `self` with `tail` compiled and appended, RESUMING the
@@ -1351,7 +1386,20 @@ impl CompiledPipeline {
     /// pushdown, `tail`'s never are — the variants scan is planned from
     /// the COMMON range alone — so a pushable line filter in `tail` must
     /// compile client-side or it is silently dropped.
-    pub fn extended_with(&self, tail: &[Stage]) -> Result<Self, PipelineError> {
+    ///
+    /// **Issue #624, part 3a (D6): `registry` numbers the tail's `regexp`
+    /// stages the database runs.** It must begin with `self`'s own patterns
+    /// ([`CompiledPipeline::take_rx_patterns`]); the tail's are added in
+    /// first use. The variants arena passes one registry through every
+    /// distinct tail, so the one statement's `rx` column serves every
+    /// pipeline it builds. The registry is the caller's: the returned
+    /// pipeline's own [`CompiledPipeline::rx_patterns`] is empty, so the
+    /// arena keeps one copy of the patterns rather than one per tail.
+    pub fn extended_with(
+        &self,
+        tail: &[Stage],
+        registry: &mut Vec<String>,
+    ) -> Result<Self, PipelineError> {
         let mut st = CompileState {
             seen_line_format: self.seen_line_format,
             mutates_labels: self.mutates_labels,
@@ -1362,11 +1410,11 @@ impl CompiledPipeline {
         };
         let mut stages = self.stages.clone();
         for stage in tail {
-            if let Some(cs) = compile_stage(stage, &mut st)? {
+            if let Some(cs) = compile_stage(stage, &mut st, Some(&mut *registry))? {
                 stages.push(cs);
             }
         }
-        Ok(Self::from_parts(stages, st))
+        Ok(Self::from_parts(stages, st, Vec::new()))
     }
 
     /// The ONE assembly point `compile`/`extended_with` share, so the
@@ -1375,7 +1423,7 @@ impl CompiledPipeline {
     /// pushed down (nothing compiled to run). A non-pushable `ip(…)`/
     /// mixed-`or` filter compiles a run-stage, so `stages` is non-empty
     /// and the fast path is (correctly) declined.
-    fn from_parts(stages: Vec<CompiledStage>, st: CompileState) -> Self {
+    fn from_parts(stages: Vec<CompiledStage>, st: CompileState, rx_patterns: Vec<String>) -> Self {
         let line_filter_only = stages.is_empty() && st.all_line_filter_source;
         CompiledPipeline {
             stages,
@@ -1388,7 +1436,7 @@ impl CompiledPipeline {
             has_unwrap: st.has_unwrap,
             seen_line_format: st.seen_line_format,
             all_line_filter_source: st.all_line_filter_source,
-            rx_patterns: Vec::new(),
+            rx_patterns,
         }
     }
 
@@ -1397,6 +1445,13 @@ impl CompiledPipeline {
     /// per element, in this order. Empty when no stage reads the database.
     pub fn rx_patterns(&self) -> &[String] {
         &self.rx_patterns
+    }
+
+    /// Moves [`CompiledPipeline::rx_patterns`] out, to seed the registry
+    /// [`CompiledPipeline::extended_with`] numbers a tail in (issue #624,
+    /// part 3a). The pipeline's stages keep their numbers.
+    pub fn take_rx_patterns(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.rx_patterns)
     }
 
     /// Structural equality of two compiled pipelines' LABEL-FILTER
@@ -1931,7 +1986,7 @@ impl CompiledPipeline {
         metric: bool,
         mut json_paths: Option<&mut JsonPaths>,
         categories: Option<&mut Vec<LabelCategory>>,
-        _captures: RegexpCaptures<'a>,
+        captures: RegexpCaptures<'a>,
     ) -> Result<(MetricRun<'a>, bool), RowBudgetExceeded> {
         let mut line: Cow<'a, str> = Cow::Borrowed(body);
         let mut value: Option<f64> = None;
@@ -2053,43 +2108,97 @@ impl CompiledPipeline {
                         ),
                     }
                 }
-                CompiledStage::Regexp(re) => {
-                    // A non-matching line adds no labels and is kept.
-                    match &line {
-                        Cow::Borrowed(text) => {
-                            if let Some(caps) = re.captures(text) {
-                                for name in re.capture_names().flatten() {
-                                    if let Some(m) = caps.name(name) {
+                CompiledStage::Regexp { re, rx } => {
+                    // A non-matching line adds no labels and is kept. On a
+                    // match every named group is set, in capture-index
+                    // order, a group that took no part to `""` (issue #624,
+                    // part 3a, F1) — the reference's `regexp` parser, which
+                    // also marks the builder changed for an empty value.
+                    match (rx, captures) {
+                        // D6: the database ran the stage over the stored
+                        // line; its element is `extractGroups`, empty on no
+                        // match, otherwise one capture per group index.
+                        (Some(at), RegexpCaptures::Rows(rows)) if *at < rows.len() => {
+                            let found = &rows[*at];
+                            if !found.is_empty() {
+                                for (index, name) in re.capture_names().enumerate() {
+                                    let Some(name) = name else { continue };
+                                    let value = index
+                                        .checked_sub(1)
+                                        .and_then(|k| found.get(k))
+                                        .map_or("", String::as_str);
+                                    add_extracted(
+                                        labels,
+                                        &mut st,
+                                        Cow::Borrowed(name),
+                                        KeyOrigin::Line,
+                                        Cow::Borrowed(value),
+                                        OnAlreadyExtracted::Skip,
+                                        &mut errs.dirty,
+                                    );
+                                }
+                            }
+                        }
+                        // D3: a lowered group. Its lines matched or did
+                        // not; the captures the plan sends are the only
+                        // ones any answer reads.
+                        (
+                            Some(_),
+                            RegexpCaptures::Group {
+                                matched,
+                                caps,
+                                groups,
+                            },
+                        ) => {
+                            if matched {
+                                errs.dirty = true;
+                                for ((name, _), value) in groups.iter().zip(caps.iter()) {
+                                    add_extracted(
+                                        labels,
+                                        &mut st,
+                                        Cow::Borrowed(name.as_str()),
+                                        KeyOrigin::Line,
+                                        Cow::Borrowed(value.as_str()),
+                                        OnAlreadyExtracted::Skip,
+                                        &mut errs.dirty,
+                                    );
+                                }
+                            }
+                        }
+                        _ => match &line {
+                            Cow::Borrowed(text) => {
+                                if let Some(caps) = re.captures(text) {
+                                    for name in re.capture_names().flatten() {
+                                        let value = caps.name(name).map_or("", |m| m.as_str());
                                         add_extracted(
                                             labels,
                                             &mut st,
                                             Cow::Borrowed(name),
                                             KeyOrigin::Line,
-                                            Cow::Borrowed(m.as_str()),
+                                            Cow::Borrowed(value),
                                             OnAlreadyExtracted::Skip,
                                             &mut errs.dirty,
                                         );
                                     }
                                 }
                             }
-                        }
-                        Cow::Owned(text) => {
-                            if let Some(caps) = re.captures(text) {
-                                for name in re.capture_names().flatten() {
-                                    if let Some(m) = caps.name(name) {
+                            Cow::Owned(text) => {
+                                if let Some(caps) = re.captures(text) {
+                                    for name in re.capture_names().flatten() {
+                                        let value = caps.name(name).map_or("", |m| m.as_str());
                                         add_extracted(
                                             labels,
                                             &mut st,
                                             Cow::Borrowed(name),
                                             KeyOrigin::Line,
-                                            Cow::Owned(m.as_str().to_string()),
+                                            Cow::Owned(value.to_string()),
                                             OnAlreadyExtracted::Skip,
                                             &mut errs.dirty,
                                         );
                                     }
                                 }
                             }
-                        }
+                        },
                     }
                 }
                 CompiledStage::Pattern(tokens) => {
@@ -2851,7 +2960,23 @@ fn compile_regex(pattern: &str) -> Result<regex::Regex, PipelineError> {
 /// filter or `regexp` stage that runs here rather than in the database.
 #[doc(hidden)]
 pub fn compile_regex_as_database(pattern: &str) -> Result<regex::Regex, PipelineError> {
-    compile_regex(pattern)
+    re2_reject_precheck(pattern)?;
+    let as_database = format!("(?s){}", pulsus_re2::re2_pattern_to_rust(pattern));
+    match pulsus_re2::compile_user_regex(&as_database) {
+        Ok(re) => Ok(re),
+        // A pattern that does not compile reports today's error, about the
+        // pattern as the user wrote it; one that compiles as written and
+        // not rewritten reports the rewrite's error against the same text.
+        Err(e) => {
+            compile_regex(pattern)?;
+            Err(match e {
+                pulsus_re2::RegexCompileError::Engine(e) => bad_regex(pattern, &e),
+                e @ pulsus_re2::RegexCompileError::TooLarge { .. } => {
+                    PipelineError::BadRegex(e.to_string())
+                }
+            })
+        }
+    }
 }
 
 /// The ANSI SGR (Select Graphic Rendition) color-escape pattern
@@ -2972,13 +3097,16 @@ fn compile_parser(p: &ParserStage) -> Result<CompiledStage, PipelineError> {
             })
         }
         ParserStage::Regexp(pattern) => {
-            let re = compile_regex(pattern)?;
+            // Read as the database reads it (issue #624, part 3a, D7): the
+            // stage runs here only where the database cannot run it, and
+            // gives the answer the database would.
+            let re = compile_regex_as_database(pattern)?;
             if re.capture_names().flatten().next().is_none() {
                 return Err(PipelineError::BadParserExpr(
                     "regexp parser requires at least one named capture group".to_string(),
                 ));
             }
-            Ok(CompiledStage::Regexp(re))
+            Ok(CompiledStage::Regexp { re, rx: None })
         }
         ParserStage::Pattern(pattern) => {
             // Issue #388: the reference refuses a malformed pattern
@@ -4355,7 +4483,7 @@ enum KeyOrigin {
 }
 
 #[inline]
-fn key_needs_sanitizing(key: &str) -> bool {
+pub(in crate::logql) fn key_needs_sanitizing(key: &str) -> bool {
     // Byte-wise, not char-wise (issue #507 review round 1): a key is left
     // alone exactly when every BYTE is `[A-Za-z0-9_]` and the first is not a
     // digit. That is the same answer the character walk gives — every byte
@@ -4374,7 +4502,7 @@ fn key_needs_sanitizing(key: &str) -> bool {
 
 /// Canonical label-key sanitization for parser-extracted keys: characters
 /// outside `[a-zA-Z0-9_]` become `_`; a leading digit gains a `_` prefix.
-fn sanitize_label_key(key: &str) -> String {
+pub(in crate::logql) fn sanitize_label_key(key: &str) -> String {
     let mut out = String::with_capacity(key.len() + 1);
     for (i, c) in key.chars().enumerate() {
         if i == 0 && c.is_ascii_digit() {

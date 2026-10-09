@@ -495,7 +495,8 @@ pub fn line_filter(lf: &LineFilter) -> Result<CheckedFragment, PipelineError> {
     for (value, _) in lf.alternatives() {
         disjuncts.push(match lf.op {
             LineFilterOp::Contains | LineFilterOp::NotContains => contains_predicate(value),
-            LineFilterOp::Regex | LineFilterOp::NotRegex => regex_predicate(value)?,
+            LineFilterOp::Regex => regex_predicate(value, true)?,
+            LineFilterOp::NotRegex => regex_predicate(value, false)?,
         });
     }
     let core = if lf.or_matches.is_empty() {
@@ -1114,9 +1115,27 @@ fn contains_predicate(phrase: &str) -> String {
     format!("body LIKE {}", ch_like_contains(phrase))
 }
 
-fn regex_predicate(pattern: &str) -> Result<String, PipelineError> {
+/// `match(body, <p>)`, the pushed `|~`/`!~` predicate.
+///
+/// **Issue #624, part 3a (F2): `match(identity(body), <p>)` for a `|~`
+/// whose pattern the `idx_body_ngrams` index would under-count.** For a
+/// case-insensitive alternation inside a group
+/// ([`pulsus_re2::case_folded_alternation_in_group`]), the database's
+/// n-gram index drops granules `match()` accepts: `match(s,
+/// '(?i)(denied|refused)')` over a row `audit DENIED open` counts 0 with the
+/// index and 1 without it. Wrapping the column in `identity()` keeps the
+/// index out of this one predicate — not out of the statement, so a second
+/// pushed filter keeps its pruning. The pattern text is unchanged. A `!~`
+/// keeps `match(body, …)`: over the same sweep its `NOT match` lost no row
+/// (docs/query-to-sql.md, the n-gram index note).
+fn regex_predicate(pattern: &str, positive: bool) -> Result<String, PipelineError> {
+    let column = if positive && pulsus_re2::case_folded_alternation_in_group(pattern) {
+        "identity(body)"
+    } else {
+        "body"
+    };
     Ok(format!(
-        "match(body, {})",
+        "match({column}, {})",
         ch_regex_unanchored_checked(pattern)?
     ))
 }

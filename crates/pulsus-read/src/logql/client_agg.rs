@@ -868,13 +868,16 @@ impl<'q> ClientAggState<'q> {
         let compiled = self.compiled;
         let is_absent = matches!(self.client.range_op, RangeAggOp::AbsentOverTime);
         {
-            let (line, value) = match compiled.run_metric_step_into(
+            let (line, value) = match compiled.run_metric_step_into_with_captures(
                 &row.body,
                 pipeline_base,
                 row.timestamp_ns,
                 sm,
                 self.client.grouping.as_deref(),
                 &self.step_rules,
+                // Issue #624, part 3a (D6): the `regexp` captures the
+                // database ran, when the read sent them.
+                super::pipeline::RegexpCaptures::Rows(&row.rx),
                 scratch,
             )? {
                 MetricRun::Dropped => return Ok(()),
@@ -2323,13 +2326,16 @@ impl<'q> RangeSlideState<'q> {
     {
         let compiled = self.compiled;
         let grouping = self.grouping;
-        let (line, value) = match compiled.run_metric_step_into(
+        let (line, value) = match compiled.run_metric_step_into_with_captures(
             &row.body,
             pipeline_base,
             row.timestamp_ns,
             sm,
             grouping,
             &self.step_rules,
+            // Issue #624, part 3a (D6): the `regexp` captures the database
+            // ran, when the read sent them.
+            super::pipeline::RegexpCaptures::Rows(&row.rx),
             scratch,
         )? {
             MetricRun::Dropped => return Ok(()),

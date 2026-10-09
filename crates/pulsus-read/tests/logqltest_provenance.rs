@@ -2389,6 +2389,12 @@ const PREDICATE_ITEMS: &[&str] = &[
     "pub fn index_neq_branch(key: &str, value: &str) -> CheckedFragment",
     "pub fn index_nre_branch(key: &str, pattern: &str) -> Result<CheckedFragment, PipelineError>",
     "pub fn line_filter(lf: &LineFilter) -> Result<CheckedFragment, PipelineError>",
+    "pub fn regexp_captures_column(patterns: &[String]) -> Result<CheckedFragment, PipelineError>",
+    "#[derive(Debug, Clone, PartialEq, Eq)]",
+    "pub struct RegexpGroupColumns",
+    "pub struct RegexpGroupColumns :: pub extract: CheckedFragment,",
+    "pub struct RegexpGroupColumns :: pub caps: CheckedFragment,",
+    "pub fn regexp_group_columns(pattern: &str, indexes: &[usize]) -> Result<RegexpGroupColumns, PipelineError>",
     "#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
     "pub enum MetadataTerm",
     "pub enum MetadataTerm :: Project,",
@@ -2426,7 +2432,7 @@ const PREDICATE_ITEMS: &[&str] = &[
     "pub fn sliding_cover(scan_start_ns: i64, grid_start_ns: i64, end_ns: i64, step_ns: i64, range_ns: i64) -> Result<SlidingCover, BucketGridRefusal>",
     "pub(super) fn non_id_values_expr() -> CheckedFragment",
     "fn contains_predicate(phrase: &str) -> String",
-    "fn regex_predicate(pattern: &str) -> Result<String, PipelineError>",
+    "fn regex_predicate(pattern: &str, positive: bool) -> Result<String, PipelineError>",
     "const KEY_TRIM_CLASS: &str = r_",
     "const JSON_WS: &str = r_",
     "const KEY_SEP: &str = r#_\\\\]|\\\\.)+_ const INTEGER_TEXT: &str = _",
@@ -2586,8 +2592,12 @@ const PREDICATE_ITEMS: &[&str] = &[
 /// filter, and the two combiners `metadata_filter_and` and
 /// `metadata_filter_or`, which join one stage's leaves — a fragment can
 /// only be minted in this module, so an `and`/`or` tree has to be
-/// combined here rather than at the caller.
-const MINT_COUNT: usize = 21;
+/// combined here rather than at the caller. **22 at issue #624, part 3a**:
+/// `regexp_captures_column`, the `rx` column a raw read sends for the
+/// `regexp` stages the database runs. Its sibling `regexp_group_columns`
+/// returns its two fragments inside `RegexpGroupColumns`, so its own
+/// signature names none and the shape does not count it.
+const MINT_COUNT: usize = 22;
 
 /// Attributes permitted anywhere in `predicate.rs`.
 const PREDICATE_ATTRIBUTES: &[&str] = &[

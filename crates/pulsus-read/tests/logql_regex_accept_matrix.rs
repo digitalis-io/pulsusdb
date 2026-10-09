@@ -1112,6 +1112,46 @@ const EXCEPTIONS: &[Exception] = &[
         Verdict::Accept,
         "the rewrite escapes the braces",
     ),
+    // Issue #624, part 3a (D7): a line filter or `| regexp` that runs in
+    // process reads its pattern as the database does — `(?s)` and the same
+    // `re2_pattern_to_rust` rewrite — so these two positions now agree with
+    // the reference on the brace forms too.
+    ex_pulsus(
+        "line_after_line_format",
+        "brace_word",
+        Verdict::Accept,
+        "read as the database reads it: the rewrite escapes the braces",
+    ),
+    ex_pulsus(
+        "line_after_line_format",
+        "brace_open_ended",
+        Verdict::Accept,
+        "read as the database reads it: the rewrite escapes the braces",
+    ),
+    ex_pulsus(
+        "line_after_line_format",
+        "brace_empty",
+        Verdict::Accept,
+        "read as the database reads it: the rewrite escapes the braces",
+    ),
+    ex_pulsus(
+        "regexp_named",
+        "brace_word",
+        Verdict::Accept,
+        "read as the database reads it: the rewrite escapes the braces",
+    ),
+    ex_pulsus(
+        "regexp_named",
+        "brace_open_ended",
+        Verdict::Accept,
+        "read as the database reads it: the rewrite escapes the braces",
+    ),
+    ex_pulsus(
+        "regexp_named",
+        "brace_empty",
+        Verdict::Accept,
+        "read as the database reads it: the rewrite escapes the braces",
+    ),
     // **The two `label_replace` rows for `class_double_dash` and
     // `brace_unicode` were DELETED by #400 Stage 2, not lost.** They
     // recorded that `re2_pattern_to_rust`'s rewrite made this one site
@@ -1273,8 +1313,6 @@ const DIVERGENCES: &[Divergence] = &[
             "sel_nre",
             "line_re",
             "line_nre",
-            "line_after_line_format",
-            "regexp_named",
             "labelfilter_re",
             "labelfilter_nre",
             "drop",
@@ -1287,7 +1325,8 @@ const DIVERGENCES: &[Divergence] = &[
         ],
         owner: "#400",
         why: "literal braces. `label_replace` is absent because its rewrite escapes them — the \
-              partial fix #331 deferred, applied at one site out of thirteen.",
+              partial fix #331 deferred — and so, since issue #624 part 3a, are the line filter \
+              after a `line_format` and `| regexp`, which read the pattern as the database does.",
     },
     Divergence {
         id: "engine_dir_a_duplicate_capture_name",
@@ -2041,8 +2080,11 @@ fn pulsus_verdicts_match_the_committed_table() {
 /// directions at once — nine patterns stop disagreeing at fifteen
 /// positions each, three new ones start — so it is taken from this
 /// test's own printed value and pasted into
-/// `docs/benchmarks/logs-differential-ledger.md`, not carried over.
-const DISAGREEING_POINTS: usize = 226;
+/// `docs/benchmarks/logs-differential-ledger.md`, not carried over. Issue
+/// #624 part 3a moved it 226 -> 220: the three brace forms stopped
+/// disagreeing at the two positions that now read a pattern as the database
+/// does (the line filter after a `line_format`, and `| regexp`).
+const DISAGREEING_POINTS: usize = 220;
 
 /// **The divergence set is exactly the committed enumeration.**
 #[test]
@@ -2830,15 +2872,16 @@ fn the_regex_compile_sites_are_enumerated_from_the_source() {
             "pipeline.rs",
             &[
                 ("Regex::new(", 1),
-                ("compile_regex(", 5),
+                ("compile_regex(", 4),
+                ("compile_regex_as_database(", 3),
                 ("compile_anchored_regex(", 4),
                 ("validate_anchored_regex(", 1),
                 ("validate_unanchored_regex(", 1),
                 ("compile_drop_keep(", 3),
-                ("compile_user_regex(", 1),
+                ("compile_user_regex(", 2),
                 ("compile_user_regex_anchored(", 1),
                 ("re2_rejection_construct(", 1),
-                ("re2_reject_precheck(", 3),
+                ("re2_reject_precheck(", 4),
             ],
             "the in-process seam and its callers: the line filter compiled after a \
              `line_format` (`line_after_line_format`), `DECOLORIZE_PATTERN` (EXCLUDED, a \
@@ -2855,11 +2898,22 @@ fn the_regex_compile_sites_are_enumerated_from_the_source() {
              `compile_regex` and `compile_anchored_regex`, which is the whole LogQL seam — \
              and the single `re2_rejection_construct(` inside it. It runs BEFORE the compile, \
              on purpose: for the constructs RE2 rejects, a successful compile is the wrong \
-             answer rather than a slow one.",
+             answer rather than a slow one. **Issue #624 part 3a added \
+             `compile_regex_as_database`** (D7) — its definition and its two calls, from the \
+             line filter compiled in process and from the `| regexp` parser, which moved off \
+             `compile_regex` (now four: its definition, `DECOLORIZE_PATTERN`, \
+             `validate_unanchored_regex`, and the error fallback inside the new seam). The \
+             seam runs `re2_reject_precheck` on the pattern as written, then \
+             `compile_user_regex` over `(?s)` and `re2_pattern_to_rust`'s rewrite: one more \
+             of each. Its verdict can differ from `compile_regex`'s only where the rewrite \
+             compiles what the pattern as written does not — the brace forms of docs/api.md \
+             §9.2, which RE2 reads as literals — and `line_after_line_format`/`regexp_named` \
+             measure exactly that.",
         ),
         (
             "plan.rs",
             &[
+                ("compile_regex_as_database(", 1),
                 ("validate_unanchored_regex(", 1),
                 ("compile_user_regex_anchored(", 1),
                 ("re2_rejection_construct(", 1),
@@ -2877,7 +2931,11 @@ fn the_regex_compile_sites_are_enumerated_from_the_source() {
              arm, which validates the regex of a pushable line filter in a discarded variant \
              prefix. `compile_stage` skips exactly those, and a discarded prefix renders no \
              SQL, so before this nothing in the workspace compiled them: it is the position \
-             `variants_variant_side` measures, and the reason its rule moved to `PerPattern`.",
+             `variants_variant_side` measures, and the reason its rule moved to `PerPattern`. \
+             **Issue #624 part 3a added `compile_regex_as_database(`** in \
+             `regexp_count_route`, which compiles a `regexp` count's pattern to read its group \
+             names and indexes. It decides no verdict: a pattern it cannot compile only keeps \
+             the query on today's route, whose pipeline compile then answers.",
         ),
         (
             "template/funcs.rs",
@@ -2917,6 +2975,12 @@ fn the_regex_compile_sites_are_enumerated_from_the_source() {
         "Regex::new(",
         "RegexBuilder::new(",
         "compile_regex(",
+        // Issue #624, part 3a: the seam that reads a pattern as the
+        // database does (D7). Listed for the reason the two blocks below
+        // give: the line filter and the `regexp` parser moved onto it, and
+        // without it they would leave the census while still compiling
+        // user patterns.
+        "compile_regex_as_database(",
         // Issue #302: `template/funcs.rs`'s charged seam, renamed out of
         // a collision with `pipeline.rs`'s `compile_regex`. It is listed
         // because a marker vocabulary is what this census SEES: without

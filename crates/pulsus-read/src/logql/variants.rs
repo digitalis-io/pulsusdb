@@ -464,6 +464,9 @@ pub struct VariantArena {
     pipelines: Vec<CompiledPipeline>,
     slot: Vec<usize>,
     charged: u64,
+    /// The `regexp` patterns the database runs for every pipeline here
+    /// (issue #624, part 3a): the statement's `rx` column, in this order.
+    rx: Vec<String>,
 }
 
 impl VariantArena {
@@ -509,6 +512,11 @@ impl VariantArena {
         let mut pipelines: Vec<CompiledPipeline> = Vec::with_capacity(variants.len() + 1);
         let mut slot: Vec<usize> = Vec::with_capacity(variants.len());
         pipelines.push(CompiledPipeline::compile(common)?);
+        // Issue #624, part 3a (D6): one registry of the `regexp` patterns the
+        // database runs, through the common pipeline and then every distinct
+        // tail in index order, so the one statement's `rx` column serves
+        // every pipeline here.
+        let mut rx = pipelines[0].take_rx_patterns();
         for (i, spec) in variants.iter().enumerate() {
             let tail = &spec.client().pipeline;
             if tail.is_empty() {
@@ -535,7 +543,7 @@ impl VariantArena {
                 cap,
             )
             .map_err(variant_state_breach)?;
-            let extended = pipelines[0].extended_with(tail)?;
+            let extended = pipelines[0].extended_with(tail, &mut rx)?;
             pipelines.push(extended);
             slot.push(pipelines.len() - 1);
         }
@@ -543,6 +551,7 @@ impl VariantArena {
             pipelines,
             slot,
             charged,
+            rx,
         })
     }
 
@@ -550,6 +559,12 @@ impl VariantArena {
     /// tail`, shared for empty/duplicate tails).
     fn get(&self, variant_index: usize) -> &CompiledPipeline {
         &self.pipelines[self.slot.get(variant_index).copied().unwrap_or(0)]
+    }
+
+    /// The `regexp` patterns the one statement runs for every pipeline of
+    /// the arena (issue #624, part 3a, D6).
+    pub fn rx_patterns(&self) -> &[String] {
+        &self.rx
     }
 
     pub fn charged_bytes(&self) -> u64 {
@@ -1404,6 +1419,7 @@ mod tests {
             pipelines,        // C — with_capacity(n + 1)
             slot,             // C — with_capacity(n)
             charged: a_bytes, // S
+            rx: _rx,          // H — the query's own regexp patterns (issue #624)
         } = arena;
         assert_eq!(pipelines.capacity(), 4);
         assert_eq!(slot.capacity(), 3);

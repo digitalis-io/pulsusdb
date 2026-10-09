@@ -807,6 +807,15 @@ pub fn stage3(
     )
 }
 
+/// `,\n       <rx> AS rx`, the `rx` column after a raw read's column list
+/// (issue #624, part 3a, D6), or nothing.
+fn rx_projection(rx: Option<&CheckedFragment>) -> String {
+    match rx {
+        Some(rx) => format!(",\n       {} AS rx", rx.as_sql()),
+        None => String::new(),
+    }
+}
+
 /// [`stage3`], with the `rx` column of the `regexp` stages the database
 /// runs (issue #624, part 3a, D6) after the column list. `None` renders
 /// [`stage3`]'s text byte for byte.
@@ -819,7 +828,7 @@ pub fn stage3_with_rx(
     line_filters: &[CheckedFragment],
     direction: Direction,
     limit: u32,
-    _rx: Option<&CheckedFragment>,
+    rx: Option<&CheckedFragment>,
 ) -> String {
     let service_pred = service_predicate(services);
     let fp_list = fp_list(fingerprints);
@@ -828,9 +837,10 @@ pub fn stage3_with_rx(
         Direction::Forward => "ASC",
     };
     let TimeWindow { start_ns, end_ns } = window;
+    let rx = rx_projection(rx);
 
     let mut sql = format!(
-        "SELECT fingerprint, timestamp_ns, body, structured_metadata\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE fingerprint IN ({fp_list})\n  AND timestamp_ns > {start_ns} AND timestamp_ns <= {end_ns}"
+        "SELECT fingerprint, timestamp_ns, body, structured_metadata{rx}\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE fingerprint IN ({fp_list})\n  AND timestamp_ns > {start_ns} AND timestamp_ns <= {end_ns}"
     );
     for clause in line_filters {
         sql.push_str("\n  AND ");
@@ -938,14 +948,15 @@ pub fn stage3_keyset_with_rx(
     direction: Direction,
     line_filters: &[CheckedFragment],
     limit: u32,
-    _rx: Option<&CheckedFragment>,
+    rx: Option<&CheckedFragment>,
 ) -> String {
     let service_pred = service_predicate(services);
     let fp_list = fp_list(fingerprints);
     let TimeWindow { start_ns, end_ns } = window;
+    let rx = rx_projection(rx);
 
     let mut sql = format!(
-        "SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash, structured_metadata\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE fingerprint IN ({fp_list})"
+        "SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash, structured_metadata{rx}\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE fingerprint IN ({fp_list})"
     );
     match (direction, lower) {
         (_, KeysetLower::First) => {
@@ -1294,15 +1305,16 @@ pub fn metric_raw_samples_with_rx(
     lower: ScanLowerBound,
     extra_predicates: &[CheckedFragment],
     projection: ScanProjection,
-    _rx: Option<&CheckedFragment>,
+    rx: Option<&CheckedFragment>,
 ) -> String {
     let service_pred = service_predicate(services);
     let fp_list = fp_list(fingerprints);
     let TimeWindow { start_ns, end_ns } = window;
     let lower_op = lower.sql_op();
     let sm = projection.column_suffix();
+    let rx = rx_projection(rx);
     let mut sql = format!(
-        "SELECT fingerprint, timestamp_ns, body{sm}\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE fingerprint IN ({fp_list})\n  AND timestamp_ns {lower_op} {start_ns} AND timestamp_ns <= {end_ns}"
+        "SELECT fingerprint, timestamp_ns, body{sm}{rx}\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE fingerprint IN ({fp_list})\n  AND timestamp_ns {lower_op} {start_ns} AND timestamp_ns <= {end_ns}"
     );
     for clause in extra_predicates {
         sql.push_str("\n  AND ");
@@ -1368,15 +1380,16 @@ pub fn metric_raw_samples_sliding_with_rx(
     lower: ScanLowerBound,
     extra_predicates: &[CheckedFragment],
     projection: ScanProjection,
-    _rx: Option<&CheckedFragment>,
+    rx: Option<&CheckedFragment>,
 ) -> String {
     let service_pred = service_predicate(services);
     let fp_list = fp_list(fingerprints);
     let TimeWindow { start_ns, end_ns } = window;
     let lower_op = lower.sql_op();
     let sm = projection.column_suffix();
+    let rx = rx_projection(rx);
     let mut sql = format!(
-        "SELECT fingerprint, timestamp_ns, body{sm}\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE fingerprint IN ({fp_list})\n  AND timestamp_ns {lower_op} {start_ns} AND timestamp_ns <= {end_ns}"
+        "SELECT fingerprint, timestamp_ns, body{sm}{rx}\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE fingerprint IN ({fp_list})\n  AND timestamp_ns {lower_op} {start_ns} AND timestamp_ns <= {end_ns}"
     );
     for clause in extra_predicates {
         sql.push_str("\n  AND ");
@@ -1464,7 +1477,7 @@ pub fn metric_range_bucketed_with_regexp(
     scan: BucketedScan,
     extra_predicates: &[CheckedFragment],
     projection: ScanProjection,
-    _regexp: Option<&super::predicate::RegexpGroupColumns>,
+    regexp: Option<&super::predicate::RegexpGroupColumns>,
 ) -> Result<String, super::predicate::BucketGridRefusal> {
     let MetricSource { table, shape } = source;
     let (bucket_col, agg_expr) = (shape.bucket_col(), shape.agg_expr());
@@ -1481,6 +1494,40 @@ pub fn metric_range_bucketed_with_regexp(
     let prewhere = metric_prewhere(services);
     let sm = projection.column_suffix();
     let bucket_sql = bucket.as_sql();
+    if let Some(regexp) = regexp {
+        // The stage reads the stored line, which the rollup has not got.
+        if bucket_col != "timestamp_ns" {
+            return Err(super::predicate::BucketGridRefusal::RollupSource);
+        }
+        let mut lines: Vec<String> = vec![
+            format!(
+                "SELECT fingerprint, {bucket_sql} AS bucket_ns, {agg_expr} AS n, \
+                 structured_metadata, matched, caps"
+            ),
+            "FROM (".to_string(),
+            format!(
+                "  SELECT fingerprint, timestamp_ns, {}structured_metadata,",
+                regexp_body_column(agg_expr)
+            ),
+        ];
+        lines.extend(regexp_extraction_lines(regexp, "         "));
+        lines.push(format!("  FROM {table}"));
+        if !services.is_empty() {
+            lines.push(format!("  PREWHERE {}", service_predicate(services)));
+        }
+        lines.push(format!("  WHERE fingerprint IN ({fp_list})"));
+        lines.push(format!(
+            "    AND {bucket_col} {lower_op} {start_ns} AND {bucket_col} <= {end_ns}"
+        ));
+        for clause in extra_predicates {
+            lines.push(format!("    AND {}", clause.as_sql()));
+        }
+        lines.push(")".to_string());
+        lines.push(
+            "GROUP BY fingerprint, bucket_ns, structured_metadata, matched, caps".to_string(),
+        );
+        return Ok(lines.join("\n"));
+    }
     let mut sql = format!(
         "SELECT fingerprint, {bucket_sql} AS bucket_ns, {agg_expr} AS n{sm}\nFROM {table}\n{prewhere}WHERE fingerprint IN ({fp_list})\n  AND {bucket_col} {lower_op} {start_ns} AND {bucket_col} <= {end_ns}"
     );
@@ -1566,7 +1613,7 @@ pub fn metric_range_sliding_with_regexp(
     fingerprints: &[FpLiteral],
     scan: SlidingScan,
     extra_predicates: &[CheckedFragment],
-    _regexp: Option<&super::predicate::RegexpGroupColumns>,
+    regexp: Option<&super::predicate::RegexpGroupColumns>,
 ) -> Result<String, super::predicate::BucketGridRefusal> {
     let MetricSource { table, shape } = source;
     if shape.bucket_col() != "timestamp_ns" {
@@ -1586,51 +1633,85 @@ pub fn metric_range_sliding_with_regexp(
     let agg_expr = shape.agg_expr();
     let fp_list = fp_list(fingerprints);
     let lower_op = lower.sql_op();
+    // Issue #624, part 3a: a `regexp` stage's captures join the group key,
+    // computed one level under the innermost `SELECT`.
+    let key = match regexp {
+        Some(_) => "fingerprint, structured_metadata, matched, caps",
+        None => "fingerprint, structured_metadata",
+    };
     let mut lines: Vec<String> = vec![
         format!(
             "SELECT fingerprint, toInt64({grid_start_ns} + k * {step_ns}) AS bucket_ns, \
-             toUInt64(v) AS n, structured_metadata"
+             toUInt64(v) AS n, structured_metadata{}",
+            if regexp.is_some() {
+                ", matched, caps"
+            } else {
+                ""
+            }
         ),
         "FROM (".to_string(),
-        "  SELECT fingerprint, structured_metadata, k0,".to_string(),
+        format!("  SELECT {key}, k0,"),
         format!(
             "         sum(dv) OVER cum AS v, sum(dc) OVER cum AS p, \
              leadInFrame(k0, 1, {kend}) OVER whole AS k1"
         ),
         "  FROM (".to_string(),
-        "    SELECT fingerprint, structured_metadata, d.1 AS k0, sum(d.2) AS dv, sum(d.3) AS dc"
-            .to_string(),
+        format!("    SELECT {key}, d.1 AS k0, sum(d.2) AS dv, sum(d.3) AS dc"),
         "    FROM (".to_string(),
-        "      SELECT fingerprint, structured_metadata,".to_string(),
+        format!("      SELECT {key},"),
         format!("             {lo} AS lo,"),
         format!("             {hi} AS hi,"),
         format!("             {agg_expr} AS m, count() AS c"),
-        format!("      FROM {table}"),
     ];
+    let (inner, filter) = match regexp {
+        Some(regexp) => {
+            lines.push("      FROM (".to_string());
+            lines.push(format!(
+                "        SELECT fingerprint, structured_metadata, timestamp_ns{},",
+                if regexp_body_column(agg_expr).is_empty() {
+                    ""
+                } else {
+                    ", body"
+                }
+            ));
+            lines.extend(regexp_extraction_lines(regexp, "               "));
+            lines.push(format!("        FROM {table}"));
+            ("        ", "          ")
+        }
+        None => {
+            lines.push(format!("      FROM {table}"));
+            ("      ", "        ")
+        }
+    };
     if !services.is_empty() {
-        lines.push(format!("      PREWHERE {}", service_predicate(services)));
+        lines.push(format!("{inner}PREWHERE {}", service_predicate(services)));
     }
-    lines.push(format!("      WHERE fingerprint IN ({fp_list})"));
+    lines.push(format!("{inner}WHERE fingerprint IN ({fp_list})"));
     lines.push(format!(
-        "        AND timestamp_ns {lower_op} {start_ns} AND timestamp_ns <= {end_ns}"
+        "{filter}AND timestamp_ns {lower_op} {start_ns} AND timestamp_ns <= {end_ns}"
     ));
     for clause in extra_predicates {
-        lines.push(format!("        AND {}", clause.as_sql()));
+        lines.push(format!("{filter}AND {}", clause.as_sql()));
+    }
+    if regexp.is_some() {
+        lines.push("      )".to_string());
     }
     lines.extend([
-        "      GROUP BY fingerprint, structured_metadata, lo, hi".to_string(),
+        format!("      GROUP BY {key}, lo, hi"),
         "      HAVING lo <= hi".to_string(),
         "    )".to_string(),
         "    ARRAY JOIN [(lo, toInt64(m), toInt64(c)), (hi + 1, -toInt64(m), -toInt64(c))] AS d"
             .to_string(),
-        "    GROUP BY fingerprint, structured_metadata, k0".to_string(),
+        format!("    GROUP BY {key}, k0"),
         "  )".to_string(),
-        "  WINDOW cum AS (PARTITION BY fingerprint, structured_metadata ORDER BY k0 ASC \
-         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),"
-            .to_string(),
-        "         whole AS (PARTITION BY fingerprint, structured_metadata ORDER BY k0 ASC \
-         ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)"
-            .to_string(),
+        format!(
+            "  WINDOW cum AS (PARTITION BY {key} ORDER BY k0 ASC \
+             ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),"
+        ),
+        format!(
+            "         whole AS (PARTITION BY {key} ORDER BY k0 ASC \
+             ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)"
+        ),
         ")".to_string(),
         format!("ARRAY JOIN range(k0, least(k1, {kend})) AS k"),
         "WHERE p > 0".to_string(),
@@ -2027,6 +2108,30 @@ fn unwrapped_metadata_columns(metadata: &MetadataSent, lane: bool) -> (String, S
 /// Renders the metric-read `PREWHERE service ...\n` line, or an empty
 /// string when `services` is empty (the rollup path — no `service` column
 /// to filter on).
+/// `body, ` when the reducer reads the line's length, so the extraction
+/// level under a `regexp` count carries it (issue #624, part 3a); empty for
+/// `count()`.
+fn regexp_body_column(agg_expr: &str) -> &'static str {
+    if agg_expr.contains("body") {
+        "body, "
+    } else {
+        ""
+    }
+}
+
+/// The three extraction columns of a `regexp` count (issue #624, part 3a,
+/// D2), each line indented by `indent`.
+fn regexp_extraction_lines(
+    regexp: &super::predicate::RegexpGroupColumns,
+    indent: &str,
+) -> [String; 3] {
+    [
+        format!("{indent}{} AS g,", regexp.extract.as_sql()),
+        format!("{indent}toUInt8(length(g) > 0) AS matched,"),
+        format!("{indent}{} AS caps", regexp.caps.as_sql()),
+    ]
+}
+
 fn metric_prewhere(services: &[CheckedLiteral]) -> String {
     if services.is_empty() {
         String::new()
