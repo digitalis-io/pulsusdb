@@ -22,3 +22,4 @@ pub mod predicate;
 pub mod projection;
 pub mod rows;
 pub mod search;
+pub mod structural;

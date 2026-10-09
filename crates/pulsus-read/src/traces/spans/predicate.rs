@@ -98,6 +98,18 @@ pub struct SpanPredicate {
 }
 
 impl SpanPredicate {
+    /// A spanset's membership (issue #593, [`super::structural`]), built
+    /// from predicates this module compiled: `sql` composes their texts,
+    /// `window` is the request's when any of them, or the composition,
+    /// reads a window-bounded subquery, and `demands` are theirs.
+    pub(super) fn composed(sql: String, window: Option<WindowSql>, demands: Vec<String>) -> Self {
+        SpanPredicate {
+            sql,
+            window,
+            demands,
+        }
+    }
+
     pub fn sql(&self) -> &str {
         &self.sql
     }

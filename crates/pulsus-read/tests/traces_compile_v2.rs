@@ -4768,8 +4768,14 @@ fn compile_search_refuses_what_parts_two_and_three_serve() {
         // second `by()`.
         (r#"{ .a = 1 } | by(trace:id)"#, "#592"),
         (r#"{ .a = 1 } | by(span.a) | by(name)"#, "#592"),
-        (r#"{ .a = 1 } > { .b = 2 }"#, "#593"),
-        (r#"({ .a = 1 } > { .b = 2 }) && { .c = 3 }"#, "#593"),
+        // Issue #593 part 2: the transitive operators, alone and under a
+        // non-transitive one.
+        (r#"{ .a = 1 } >> { .b = 2 }"#, "#593 part 2"),
+        (r#"{ .a = 1 } !<< { .b = 2 }"#, "#593 part 2"),
+        (
+            r#"({ .a = 1 } > { .b = 2 }) && ({ .c = 3 } &>> { .d = 4 })"#,
+            "#593 part 2",
+        ),
         (r#"{ nestedSetLeft > 0 }"#, "#594"),
     ] {
         match compile_search_of(query) {
@@ -4932,7 +4938,10 @@ fn the_fork_routes_by_the_plan() {
         r#"{ .a = 1 } | by(.u)"#,
         r#"{ .a = 1 } | by(span.a) | by(name)"#,
         r#"{ .a = 1 } | by(span.a) | coalesce() | by(name)"#,
-        r#"{ .a = 1 } > { .b = 2 }"#,
+        // Issue #593 part 1: the transitive operators are part 2's.
+        r#"{ .a = 1 } >> { .b = 2 }"#,
+        r#"{ .a = 1 } << { .b = 2 }"#,
+        r#"{ .a = 1 } && { .b = 2 } >> { .c = 3 } || { .d = 4 }"#,
         r#"{ nestedSetLeft > 0 }"#,
         r#"{ nestedSetParent < 0 }"#,
         r#"{ traceDuration > 1s }"#,
@@ -4978,6 +4987,21 @@ fn the_fork_routes_by_the_plan() {
         r#"{ resource.service.name = "checkout" } | count() > 5 | { status = error }"#,
         r#"{ } | { status = error } | count() > 1"#,
         r#"{ } | count() > 2 | coalesce()"#,
+        // Issue #593 part 1: the ten inventory rows, and four shapes.
+        r#"{ .a = 1 } > { .b = 2 } > { .c = 3 }"#,
+        r#"{ .a = 1 } > { .b = 2 }"#,
+        r#"{ .a = 1 } < { .b = 2 }"#,
+        r#"{ .a = 1 } !> { .b = 2 }"#,
+        r#"{ .a = 1 } !~ { .b = 2 }"#,
+        r#"({ .a = 1 } && { .b = 2 }) > { .c = 3 }"#,
+        r#"{ .a = 1 } ~ { .b = 2 } | count() > 1"#,
+        r#"{ .a = 1 } ~ { .b = 2 }"#,
+        r#"{ .a = 1 } &> { .b = 2 }"#,
+        r#"{ .a = 1 } &~ { .b = 2 }"#,
+        r#"({ .a = 1 } > { .b = 2 }) && { .c = 3 }"#,
+        r#"{ .a = 1 } &< ({ .b = 2 } || { .c = 3 })"#,
+        r#"{ .a = 1 } !< { .b = 2 } | by(name)"#,
+        r#"{ .a = 1 } > { .b = 2 } | { .c = 3 } | select(span.d)"#,
     ] {
         if plan_statement(&fork_plan(query), "spans", "traces", "resources").is_none() {
             wrong.push(format!(
