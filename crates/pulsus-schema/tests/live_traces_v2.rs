@@ -668,10 +668,13 @@ async fn the_target_tables_carry_the_codecs_this_design_names() {
     drop_database(&client, db).await;
 }
 
-/// **T-S6.** Applying the schema twice is a no-op: no error, and the column
-/// set of each of the six tables is identical after both runs.
+/// **T-S6.** Applying the schema to a database that already holds it fails
+/// at the first materialized view: the file holds only `CREATE`
+/// statements, so nothing in it restates an object, and
+/// `schema/schema.sh` drops the database before applying it. The columns
+/// the first application built are untouched by the failed second one.
 #[tokio::test]
-async fn applying_the_schema_twice_is_a_no_op() {
+async fn applying_the_schema_to_a_built_database_fails() {
     skip_unless_live!();
     let db = &pulsus_testkit::test_db("pulsus_trace_landing_it_twice");
     let client = ChClient::new(test_config()).await.expect("connect");
@@ -690,17 +693,22 @@ async fn applying_the_schema_twice_is_a_no_op() {
         before.push(cols);
     }
 
-    run_init(&client, &ctx).await.expect("second run_init");
+    let second = run_init(&client, &ctx).await;
 
-    for (i, table) in WRITE_PATH_TABLES.iter().enumerate() {
-        assert_eq!(
-            columns(&client, db, table).await,
-            before[i],
-            "{table}'s column set moved between two run_init calls"
-        );
+    let mut after = Vec::new();
+    for table in WRITE_PATH_TABLES {
+        after.push(columns(&client, db, table).await);
     }
-
     drop_database(&client, db).await;
+    let err = second.expect_err("a second application to a built database must fail");
+    assert!(
+        err.to_string().contains("already exists"),
+        "the second application fails on an existing object: {err}"
+    );
+    assert_eq!(
+        after, before,
+        "the failed second application moved a column"
+    );
 }
 
 /// The two tag catalogs carry a deduplication window and **no TTL**, because
