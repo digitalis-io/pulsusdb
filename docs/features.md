@@ -95,7 +95,7 @@ and for the one performance cliff it introduces.
 
 **LogQL pipeline exact fetch-until-limit (M6-09, #90):** pipelines containing an in-engine dropping stage that cannot push down (a label filter, or a line filter after `line_format`) are served by keyset-cursor paging: the engine pages `reader.logql_pipeline_scan_factor × limit` rows at a time (default factor 10) through the pipeline until the true `limit` fills, the query window is exhausted, or the byte scan budget is spent. Responses fill exactly to `limit` (no under-return) and never over-return; the fast/non-dropping paths keep a single byte-identical `LIMIT` scan. The byte scan budget (`reader.logql_scan_budget_bytes`) is the hard cumulative scan ceiling and aborts first — a budget-truncated result returns the survivors so far and signals incompleteness via `data.stats.pulsus_partial` (configuration.md §6, api.md §2.1/§2.2).
 
-**Read-path differentiators:** token/ngram skip indexes accelerate line filters (no full body scans within the selected streams); stream-selector-bounded scans otherwise; per-query scan budget with explicit "query too broad" errors instead of OOM.
+**Read-path differentiators:** a `text` index of 4-grams accelerates line filters (no full body scans within the selected streams); stream-selector-bounded scans otherwise; per-query scan budget with explicit "query too broad" errors instead of OOM.
 
 ## 3. Query — metrics (PromQL, Prometheus HTTP API)
 

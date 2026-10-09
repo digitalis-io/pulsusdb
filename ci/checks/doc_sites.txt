@@ -30,7 +30,11 @@ rewrite docs/schemas.md:33-33
 # Issue #593 part 1 adds #593, its own issue, where the structural
 # operators paragraph says the search statement answers `>`, `<` and `~`;
 # #172 and #183 are carried on that paragraph's rewritten first sentence.
-rewrite docs/schemas.md:174-174 refs=#25,#559,#560,#603,#16,#171,#498,#2,#57,#584,#586,#587,#5,#63,#75,#478,#555,#26,#623,#125,#315,#472,#549,#7,#579,#635,#500,#172,#183,#593
+# Issue #624 part 3b adds #624, its own issue, and #235, the body index
+# issue, where the body `text` index paragraph names the change and the issue
+# the swap closes; `finding #3` is carried on that paragraph's rewritten first
+# sentence, and #450 on its unchanged `hasToken` sentences.
+rewrite docs/schemas.md:174-174 refs=#25,#559,#560,#603,#16,#171,#498,#2,#57,#584,#586,#587,#5,#63,#75,#478,#555,#26,#623,#125,#315,#472,#549,#7,#579,#635,#500,#172,#183,#593,#235,#3,#450,#624
 # `refs=#112` is a NEW reference on this file rather than a carried one. §2.4's
 # writer-contract paragraph gained the reason the read path does not route on
 # `metric_series.value_type`, and that reason is the decision A1's plan v5
@@ -58,7 +62,9 @@ rewrite docs/schemas.md:691-692 refs=#556
 # Issue #624 adds #544, carried: the pipeline-evaluation paragraph that
 # already cited it now says which counting range aggregations the database
 # counts, so the rule reads the paragraph as added.
-rewrite docs/architecture.md:378-378 refs=#560,#549,#579,#635,#544
+# Issue #624 part 3b adds #624, its own issue, where the risk table says the
+# body's `text` index has no false positives to tune.
+rewrite docs/architecture.md:378-378 refs=#560,#549,#579,#635,#544,#624
 rewrite docs/116.md:64-64
 rewrite docs/116.md:75-75
 rewrite crates/pulsus-clickhouse/src/client.rs:156-164 refs=#560
@@ -96,10 +102,12 @@ leave docs/configuration.md:126-126
 # whose file a change deletes cannot be expressed as a row at all — not even
 # as a `rewrite` one. They pinned `fingerprint UInt128 CODEC(Delta(8),
 # ZSTD(1))` and `INDEX idx_body_tokens body TYPE tokenbf_v1(32768, 3, 0)
-# GRANULARITY 1`, which are now in `schema/schema.sql` and asserted live by
-# `a_fresh_database_creates_every_fingerprint_column_as_uint128`
-# (`crates/pulsus-schema/tests/live_schema.rs`) and by the token-index gates
-# in `crates/pulsus-read/tests/query_log_gates.rs`.
+# GRANULARITY 1`. The first is now in `schema/schema.sql` and asserted live
+# by `a_fresh_database_creates_every_fingerprint_column_as_uint128`
+# (`crates/pulsus-schema/tests/live_schema.rs`). `idx_body_tokens` is gone
+# with #624 part 3b; the token-index gates in
+# `crates/pulsus-read/tests/query_log_gates.rs` are now the `text` index
+# gates, beside `the_log_body_has_one_text_index_of_4_grams`.
 # `#587` here is the other half of the same move, and also new: the comment
 # records where the `JSON` column's codec went. Same decision as
 # `crates/pulsus-clickhouse/src/lib.rs` above.

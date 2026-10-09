@@ -1,12 +1,12 @@
 id	path	prefix	suffix	rendering	line
-traceql_pipeline_stage_variants	docs/query-to-sql.md	### 1.5 TraceQL — the	stage kinds, and the selector	word	490
-traceql_pipeline_stage_variants	docs/query-to-sql.md	`PipelineStage` has exactly	variants	word	490
-traceql_pipeline_stage_variants	docs/query-to-sql.md	### 2.4 TraceQL — the	stage kinds, and the selector	word	730
+traceql_pipeline_stage_variants	docs/query-to-sql.md	### 1.5 TraceQL — the	stage kinds, and the selector	word	491
+traceql_pipeline_stage_variants	docs/query-to-sql.md	`PipelineStage` has exactly	variants	word	491
+traceql_pipeline_stage_variants	docs/query-to-sql.md	### 2.4 TraceQL — the	stage kinds, and the selector	word	731
 traceql_pipeline_stage_variants	docs/query-lowering.md	([`crates/pulsus-traceql/src/ast.rs`](../crates/pulsus-traceql/src/ast.rs), line 981) has exactly **	** variants	word	1174
 traceql_pipeline_stage_variants	docs/query-lowering.md	** variants; all	are below	word	1174
 logql_stage_variants	docs/query-to-sql.md	### 1.2 LogQL — the	stage kinds	word	393
 logql_stage_variants	docs/query-to-sql.md	`Stage` has exactly	variants	word	393
-logql_stage_variants	docs/query-lowering.md	no validation. #### The	`Stage` variants, each as a `Pipe` link	word	1750
+logql_stage_variants	docs/query-lowering.md	no validation. #### The	`Stage` variants, each as a `Pipe` link	word	1749
 never_reason_variants	docs/query-lowering.md	`NeverReason` has exactly **	** variants	word	5481
 lql_link_variants	docs/query-lowering.md	`LqlLink` has exactly **	** variants	digits	5300
 cut_variants	docs/query-lowering.md	every continuation naming a cut names one of the	|	word	5322

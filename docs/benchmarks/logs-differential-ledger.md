@@ -366,7 +366,7 @@ distinct (`Distinct (Preliminary DISTINCT)` in the measured plan), so the
   `/detected_fields`' per-field `cardinality`, and — landed by issue #261,
   no longer a forward reference — `/detected_labels`' per-key
   `cardinality`, `uniqExact(val) AS cardinality` in
-  `crates/pulsus-read/src/logql/sql.rs:637-648`. On the reference both come
+  `crates/pulsus-read/src/logql/sql.rs:767-778`. On the reference both come
   from the same sketch type: `newParsedFields` and `newParsedLabels` each
   build `hyperloglog.New()` (`pkg/querier/querier.go:934`, `:1035` @ `grafana/loki`
   v3.7.4 = `b318f2829f0ae2094ab3a1e90780450e9e4b03be`), and
@@ -495,7 +495,7 @@ distinct (`Distinct (Preliminary DISTINCT)` in the measured plan), so the
   at all. `N` is the number of distinct values a stream-label key has
   across the whole month partition(s) the request's window touches,
   narrowed only by the optional `query=`'s `fingerprint IN` filter
-  (`sql::detected_labels`, `crates/pulsus-read/src/logql/sql.rs:637-648`);
+  (`sql::detected_labels`, `crates/pulsus-read/src/logql/sql.rs:767-778`);
   **no request parameter bounds it** — `line_limit` and `limit` do not
   exist on this endpoint, and `start`/`end` select partitions rather
   than rows (the within-month granularity gap is issue #399). The

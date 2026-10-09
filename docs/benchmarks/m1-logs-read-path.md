@@ -158,6 +158,8 @@ absolute threshold breaks the moment the corpus grows):
 > serves `LIKE` — but the `SelectedMarks`/`read_rows` figures below were
 > measured against the old predicate and should not be quoted as current.
 
+Measured with the two bloom-filter indexes, before #624 part 3b.
+
 Verified live in this session (podman, ClickHouse 24.8):
 
 ```
@@ -245,7 +247,7 @@ not** be read as evidence toward the targets.
 prefix (`service`, `fingerprint`, `timestamp_ns`, pruning 8/93 granules) and
 the two skip indexes firing (`idx_body_tokens` tokenbf_v1, `idx_body_ngrams`
 ngrambf_v1, each pruning to 8/8 of the already-narrowed granule set) — full
-output in the linked JSON.
+output in the linked JSON. Measured with the two bloom-filter indexes, before #624 part 3b.
 
 ## 4-shard fixture: Tier-1 distributed evidence
 
