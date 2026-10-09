@@ -120,6 +120,7 @@ fn engine_config(max_candidates: u64, generator_max_memory_bytes: u64) -> TraceR
         max_candidates,
         scan_budget_rows: 50_000_000,
         event_set_max_values: 1_000_000,
+        max_depth: 64,
         max_series: 1_000,
         generator_max_memory_bytes,
         distributed: false,

@@ -462,6 +462,7 @@ pub(crate) fn trace_read_config_from(config: &Config) -> TraceReadConfig {
         max_candidates: config.reader.traceql_max_candidates,
         scan_budget_rows: config.reader.traceql_scan_budget_rows,
         event_set_max_values: config.reader.traceql_event_set_max_values,
+        max_depth: config.reader.traceql_max_depth,
         max_series: config.reader.traceql_max_series,
         generator_max_memory_bytes: config.reader.traceql_generator_max_memory_bytes,
         // Issue #398: the TraceQL per-query ClickHouse memory ceiling's

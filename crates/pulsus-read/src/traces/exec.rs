@@ -423,6 +423,11 @@ pub struct TraceReadConfig {
     /// counts the values one batch's set will hold. They coincided only
     /// while the set came from an index storing one value per row.
     pub event_set_max_values: u64,
+    /// `reader.traceql_max_depth` (`PULSUS_TRACEQL_MAX_DEPTH`, issue #593
+    /// part 2): the most parent links one climb of `>>` or `<<` follows.
+    /// A span with a parent left to follow past it answers `422`
+    /// ([`TooBroadReason::TraceStructuralDepth`]).
+    pub max_depth: u32,
     /// `reader.traceql_max_series` (issue #182) — the metrics `by(...)`
     /// distinct-series cap; the `LIMIT cap+1` probe breach → 422
     /// ([`TooBroadReason::TraceMetricsSeriesCap`]).
@@ -766,6 +771,16 @@ fn map_trace_metrics_error(e: ChError, config: &TraceReadConfig) -> ReadError {
 /// as every trace read.
 fn map_search_statement_error(e: ChError, config: &TraceReadConfig) -> ReadError {
     match e {
+        // Issue #593 part 2: a climb with a parent link left after
+        // `max_depth` links — a chain deeper than the bound.
+        ChError::Server {
+            code: 395,
+            ref message,
+        } if message.contains(super::spans::structural::CLIMB_OVERFLOW) => {
+            ReadError::QueryTooBroad(TooBroadReason::TraceStructuralDepth {
+                max_depth: u64::from(config.max_depth),
+            })
+        }
         ChError::Server { code: 395, .. } => ReadError::Clickhouse(e),
         other => map_trace_read_error(other, config),
     }
@@ -2274,13 +2289,20 @@ impl TraceEngine {
             &self.config.spans_v2_table,
             &self.config.traces_table,
             &self.config.resources_table,
+            self.config.max_depth,
         ) else {
             return self.search_inner(plan, explain).await;
         };
         if let Some(e) = explain.as_mut() {
             e.push("search_statement", stmt.sql(), None);
         }
-        let settings = self.search_settings().set("final", 1);
+        let mut settings = self.search_settings().set("final", 1);
+        // Issue #593 part 2: a climb runs `max_depth + 1` levels, the last
+        // only to see whether a parent was left; the server's own bound
+        // must not end it first.
+        if let Some(depth) = stmt.climb_depth() {
+            settings = settings.set("max_recursive_cte_evaluation_depth", u64::from(depth) + 1);
+        }
         let mut budget = ByteBudget::new(HYDRATION_BYTE_BUDGET);
         let mut charged = 0usize;
         // Issue #592 part 2: a grouped statement runs today's distinct-group
@@ -4719,6 +4741,7 @@ mod tests {
             max_candidates: 100_000,
             scan_budget_rows: 50_000_000,
             event_set_max_values: 1_000_000,
+            max_depth: 64,
             max_series: 1_000,
             generator_max_memory_bytes: 536_870_912,
             read_max_memory_bytes: TEST_READ_MEM,
@@ -4744,6 +4767,7 @@ mod tests {
             max_candidates: 100,
             scan_budget_rows: 1_000,
             event_set_max_values: 1_000_000,
+            max_depth: 64,
             max_series: 1_000,
             generator_max_memory_bytes: 536_870_912,
             read_max_memory_bytes: TEST_READ_MEM,

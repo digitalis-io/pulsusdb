@@ -127,6 +127,11 @@ pub enum TooBroadReason {
     /// mapper (`traces::exec::map_trace_metrics_error`); never conflated
     /// with the byte scan budget or the trace row budget.
     TraceMetricsSetRows { max_set_rows: u64 },
+    /// Issue #593 part 2: a `>>` or `<<` climb had a parent link left to
+    /// follow after `reader.traceql_max_depth` links — a chain deeper than
+    /// the bound. A cycle ends the climb, as it ends today's. Set **only** by `traces::exec`'s search
+    /// statement error mapper, from the statement's own `throwIf`.
+    TraceStructuralDepth { max_depth: u64 },
     /// Issue #182: a TraceQL metrics `by(...)` query resolved more distinct
     /// output series than `reader.traceql_max_series`. A Rust-side
     /// structural limit — the distinct-by-key `GROUP BY <by-keys> LIMIT
@@ -489,6 +494,11 @@ impl fmt::Display for TooBroadReason {
                     None => Ok(()),
                 }
             }
+            TooBroadReason::TraceStructuralDepth { max_depth } => write!(
+                f,
+                "a structural operator (>> or <<) found a chain of parent spans deeper than \
+                 {max_depth} links"
+            ),
             TooBroadReason::TraceMetricsSetRows { max_set_rows } => {
                 write!(
                     f,

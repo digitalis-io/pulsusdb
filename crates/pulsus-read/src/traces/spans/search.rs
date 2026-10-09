@@ -645,6 +645,10 @@ pub struct SearchStatement {
     projection: Projection,
     demands: Vec<String>,
     grouping: Option<Grouping>,
+    /// `Some(max_depth)` when the statement climbs (`>>`, `<<`, issue
+    /// #593 part 2): it is issued with `max_recursive_cte_evaluation_depth
+    /// = max_depth + 1`.
+    climb_depth: Option<u32>,
 }
 
 /// A statement's one `by()` (issue #592 part 2): the group key's display,
@@ -663,6 +667,11 @@ pub struct Grouping {
 impl SearchStatement {
     pub fn sql(&self) -> &str {
         &self.sql
+    }
+
+    /// The climb bound the statement carries, when it climbs.
+    pub fn climb_depth(&self) -> Option<u32> {
+        self.climb_depth
     }
 
     pub fn projection(&self) -> &Projection {
@@ -1036,15 +1045,39 @@ pub fn compile_search(
     limit: u32,
     spss: u32,
 ) -> Result<SearchStatement, PlanError> {
+    compile_search_at_depth(
+        query,
+        ctx,
+        spans_table,
+        traces_table,
+        limit,
+        spss,
+        super::structural::DEFAULT_MAX_DEPTH,
+    )
+}
+
+/// [`compile_search`], with `>>` and `<<` following at most `max_depth`
+/// parent links (`PULSUS_TRACEQL_MAX_DEPTH`, issue #593 part 2).
+pub fn compile_search_at_depth(
+    query: &Query,
+    ctx: &PredicateCtx<'_>,
+    spans_table: &str,
+    traces_table: &str,
+    limit: u32,
+    spss: u32,
+    max_depth: u32,
+) -> Result<SearchStatement, PlanError> {
     let pipeline = pipeline_of(query)?;
     // Issue #593: a spanset holding a structural operator is one
     // membership predicate, the selector of every template.
+    let mut climb_depth = None;
     let mut filter = if super::structural::holds_structural(&query.spanset) {
-        SearchFilter::One(super::structural::compile_membership_in(
-            &query.spanset,
-            ctx,
-            spans_table,
-        )?)
+        let m =
+            super::structural::compile_membership_in(&query.spanset, ctx, spans_table, max_depth)?;
+        if m.climbs {
+            climb_depth = Some(max_depth);
+        }
+        SearchFilter::One(m.predicate)
     } else {
         compile_search_filter(&query.spanset, ctx)?
     };
@@ -1128,6 +1161,9 @@ pub fn compile_search(
     if projection.has_off_path() {
         demands.push(SELECT_OFF_PATH_DEMAND.to_string());
     }
+    if climb_depth.is_some() {
+        demands.push(super::structural::CLIMB_HANDOVER.to_string());
+    }
     let sql = search_sql(
         spans_table,
         traces_table,
@@ -1142,6 +1178,7 @@ pub fn compile_search(
         projection,
         demands,
         grouping,
+        climb_depth,
     })
 }
 
@@ -1154,6 +1191,7 @@ pub fn plan_statement(
     spans_table: &str,
     traces_table: &str,
     resources_table: &str,
+    max_depth: u32,
 ) -> Option<SearchStatement> {
     let window = WindowSql::start_closed_end_open(plan.window.start_ns, plan.window.end_ns);
     let ctx = PredicateCtx {
@@ -1165,13 +1203,14 @@ pub fn plan_statement(
         pipeline: plan.pipeline.clone(),
         hints: Vec::new(),
     };
-    compile_search(
+    compile_search_at_depth(
         &query,
         &ctx,
         spans_table,
         traces_table,
         plan.limit,
         plan.spss,
+        max_depth,
     )
     .ok()
 }

@@ -1860,31 +1860,36 @@ enum ReviewedVerdict {
 // prints. Read against both, recorded below. (`plan.rs:1547` diverged
 // between this part's two commits and no longer does: the line its
 // coincidental match sat on in `compile/plan.rs` moved.)
+//
+// Issue #593 part 2: coordinates and nothing else. The climb bound's
+// additions to `traces/exec.rs` moved `exec.rs:3299` to `:3321`,
+// `exec.rs:3259-3265` to `:3281-3287` and `exec.rs:895` to `:910`. Each
+// still cites the same expression; the verdicts are unchanged.
 const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 5] = [
     (
         "docs/query-lowering.md",
-        "exec.rs:3299",
+        "exec.rs:3321",
         0,
         ReviewedVerdict::FallbackWrong,
         "a LogQL section citing the TraceQL search executor's generator settings;          crates/pulsus-read/src/logql/exec.rs has no such thing",
     ),
     (
         "docs/query-lowering.md",
-        "exec.rs:3299",
+        "exec.rs:3321",
         2,
         ReviewedVerdict::FallbackWrong,
         "the same citation again, in the same section, with the same answer",
     ),
     (
         "docs/query-lowering.md",
-        "exec.rs:3259-3265",
+        "exec.rs:3281-3287",
         0,
         ReviewedVerdict::FallbackWrong,
         "the search settings block the same section quotes; it is in traces/exec.rs",
     ),
     (
         "docs/query-lowering.md",
-        "exec.rs:895",
+        "exec.rs:910",
         0,
         ReviewedVerdict::FallbackWrong,
         "a LogQL section citing a line of the TraceQL executor",

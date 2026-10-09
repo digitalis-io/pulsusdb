@@ -557,6 +557,11 @@ pub struct ReaderConfig {
     /// **The number is CHOSEN, not derived.** See
     /// `crate::validate::TRACEQL_EVENT_SET_MAX_VALUES_CEILING`.
     pub traceql_event_set_max_values: u64,
+    /// Issue #593 part 2: the most parent links one climb of the `>>` and
+    /// `<<` structural operators follows (`PULSUS_TRACEQL_MAX_DEPTH`). A
+    /// span with a parent left past it — a deeper chain — answers
+    /// `422 query_too_broad`; a cycle ends the climb.
+    pub traceql_max_depth: u32,
     /// Issue #478: the window a §4.3 tag-value read covers when the
     /// client sends no usable `start`/`end`.
     ///
@@ -684,6 +689,7 @@ impl Default for ReaderConfig {
             traceql_max_candidates: 100_000,
             traceql_scan_budget_rows: 50_000_000,
             traceql_event_set_max_values: 1_000_000,
+            traceql_max_depth: 64,
             traceql_tag_lookback: HumanDuration(Duration::from_secs(24 * 3_600)),
             traceql_max_series: 1_000,
             traceql_generator_max_memory_bytes: 536_870_912,

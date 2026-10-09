@@ -5109,3 +5109,73 @@ async fn a_profile_that_disables_deduplication_does_not_reach_the_derived_tables
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+// ---------------------------------------------------------------------
+// Issue #593 part 2: `PULSUS_TRACEQL_MAX_DEPTH` bounds the climb of `>>`.
+// ---------------------------------------------------------------------
+
+/// At a bound of 2, a span two parent links under `top` is answered, and
+/// one three links under it answers `422 query_too_broad`, end to end from
+/// the environment variable.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_climb_past_the_configured_depth_answers_422() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_596;
+    let db = &pulsus_testkit::test_db("pulsus_traces_search_it_593");
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[("PULSUS_TRACEQL_MAX_DEPTH", "2")]);
+    let base = now_s() - 3_600;
+    let names = ["top", "mid1", "mid2", "leaf"];
+    ingest(
+        port,
+        (1..=4u8)
+            .map(|n| {
+                let parent = if n == 1 { None } else { Some(sid(n - 1)) };
+                span(
+                    tid(0x59),
+                    sid(n),
+                    parent,
+                    names[usize::from(n - 1)],
+                    ts(base, i64::from(n)),
+                    MS,
+                    vec![],
+                )
+            })
+            .collect(),
+        checkout_resource(),
+        "seed chain",
+    );
+    let path = |q: &str| {
+        format!(
+            "/api/traces/v1/search?q={}&start={}&end={}",
+            enc(q),
+            base,
+            base + 3_600
+        )
+    };
+    let ok = get(
+        port,
+        &path(r#"{ name = "top" } >> { name = "mid2" }"#),
+        "two links",
+    );
+    assert_eq!(
+        ok.status,
+        200,
+        "two links: {}",
+        String::from_utf8_lossy(&ok.body)
+    );
+    let res = get(
+        port,
+        &path(r#"{ name = "top" } >> { name = "leaf" }"#),
+        "three links",
+    );
+    let body = assert_error_body(&res, 422, "three links");
+    assert!(
+        body.contains("deeper than 2 links"),
+        "three links: {body:?}"
+    );
+    drop_db(db).await;
+}
