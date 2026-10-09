@@ -338,7 +338,10 @@ CREATE TABLE IF NOT EXISTS {{db}}.spans{{on_cluster}}
     scope_dropped_attrs UInt32 CODEC(ZSTD(1)),
     scope_attrs_other String CODEC(ZSTD(1)),
     end_ns UInt64 CODEC(Delta(8), ZSTD(1)),
-    service_type LowCardinality(String) CODEC(ZSTD(1))
+    service_type LowCardinality(String) CODEC(ZSTD(1)),
+    INDEX idx_service service TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_name name TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_resource resource_id TYPE bloom_filter(0.01) GRANULARITY 1
 )
 --@single  ENGINE = ReplacingMergeTree
 --@cluster ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/{{db}}.spans', '{replica}')

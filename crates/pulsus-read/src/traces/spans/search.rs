@@ -1,5 +1,6 @@
 //! The TraceQL search statement (issue #590): `docs/TraceQL/sql-schema.md`
-//! §5.2, without `by()` and without the newest-slice loop. One pure
+//! §5.2, without `by()`. The newest slice is [`search_sql_at`]'s; the loop
+//! that widens it is `exec/newest_first.rs`'s (issue #595). One pure
 //! builder, `validated inputs -> String`, as [`super::fetch`]'s are; no
 //! route calls it yet.
 //!
@@ -94,13 +95,13 @@ const SEARCH: &str = r"WITH {scalars}(SELECT (groupArray(trace_id), groupArray(k
       FROM (SELECT trace_id, max(start_ns) AS last,
                    groupUniqArray(intDiv(start_ns, 300000000000)) AS keys
             FROM {spans}
-            WHERE {time}
-              AND {bucket}
-              AND {day}
+            WHERE {top_time}
+              AND {top_bucket}
+              AND {top_day}
               AND ({predicate})
             GROUP BY trace_id
             ORDER BY last DESC, trace_id ASC
-            LIMIT {limit})) AS top
+            LIMIT {limit})) AS top{window_keys}
 SELECT m.trace_id AS trace_id, t.root_service AS root_service, t.root_name AS root_name,
        t.start_ns AS start_ns, t.end_ns - t.start_ns AS duration_ns,
        m.last AS last, m.matched AS matched, m.spans AS spans
@@ -109,13 +110,38 @@ FROM (SELECT trace_id, max(start_ns) AS last, count() AS matched,
                         groupArray((span_id, start_ns, duration_ns, service, {projection}))), 1, {spss}) AS spans
       FROM {spans}
       WHERE (intDiv(start_ns, 300000000000), trace_id) IN
-            (SELECT arrayJoin(arrayFlatten(arrayMap((t, ks) -> arrayMap(k -> (k, t), ks), top.1, top.2))))
+            {keys}
         AND {time}
         AND {bucket}
         AND {day}
         AND ({predicate})
       GROUP BY trace_id) AS m
 {trace_read}";
+
+/// The newest slice a sliceable statement's top-K reads first, and the
+/// unit it doubles in (issue #595): the span table's bucket.
+pub const SLICE_NS: i64 = 300_000_000_000;
+
+/// The detail read's key set when the top-K read the whole window: the
+/// buckets each chosen trace matched in.
+const KEYS_WHOLE: &str = "(SELECT arrayJoin(arrayFlatten(arrayMap((t, ks) -> arrayMap(k -> (k, t), ks), top.1, top.2))))";
+
+/// A sliced statement's second scalar (issue #595): each chosen trace's
+/// buckets in the window, from `traces`. A scalar, so a clustered
+/// statement reads `traces` once on the initiator, never as a subquery of
+/// the span read.
+const WINDOW_KEYS: &str = ",
+     (SELECT arrayFlatten(groupArray(arrayMap(k -> (k, trace_id), arrayFilter(k -> {within}, bk))))
+      FROM (SELECT trace_id, groupUniqArrayArray(buckets) AS bk
+            FROM {traces}
+            WHERE trace_id IN (SELECT arrayJoin(top.1))
+            GROUP BY trace_id)) AS tb";
+
+/// The detail read's key set when the top-K read a slice (issue #595):
+/// the buckets each chosen trace matched in the slice and its buckets in
+/// the window, so a trace `traces` has no row for still answers from the
+/// slice.
+const KEYS_SLICED: &str = "(SELECT arrayJoin(arrayConcat(arrayFlatten(arrayMap((t, ks) -> arrayMap(k -> (k, t), ks), top.1, top.2)), tb)))";
 
 /// One filter followed by later `{…}` filters (issue #592 part 1): today's
 /// engine ranks a trace by the newest span the selector matched, before
@@ -477,13 +503,14 @@ pub fn compile_search_filter(
     })
 }
 
-/// The search statement (`sql-schema.md` §5.2, ungrouped, without the
-/// newest-slice loop): the newest `limit` traces with a span `f` keeps,
-/// their matched spans capped at `spss`, each carrying `proj`'s values,
-/// and their roots. `limit` and `spss` are the request's, already
-/// validated positive by the caller. Issue it with `final = 1`, as every
-/// read of these tables is; clustered, pass the distributed table names —
-/// spans are sharded by trace, so each trace's rows are on one shard.
+/// The search statement (`sql-schema.md` §5.2, ungrouped, its top-K over
+/// the whole window; [`search_sql_at`] reads a slice): the newest `limit`
+/// traces with a span `f` keeps, their matched spans capped at `spss`,
+/// each carrying `proj`'s values, and their roots. `limit` and `spss` are
+/// the request's, already validated positive by the caller. Issue it with
+/// `final = 1`, as every read of these tables is; clustered, pass the
+/// distributed table names — spans are sharded by trace, so each trace's
+/// rows are on one shard.
 ///
 /// # Panics
 ///
@@ -495,6 +522,22 @@ pub fn search_sql(
     spans_table: &str,
     traces_table: &str,
     w: WindowSql,
+    f: &SearchFilter,
+    proj: &Projection,
+    limit: u32,
+    spss: u32,
+) -> String {
+    search_sql_at(spans_table, traces_table, w, None, f, proj, limit, spss)
+}
+
+/// [`search_sql`], a [`SearchFilter::One`]'s top-K reading `slice`, the
+/// newest part of `w`, when one is given (issue #595).
+#[allow(clippy::too_many_arguments)]
+pub fn search_sql_at(
+    spans_table: &str,
+    traces_table: &str,
+    w: WindowSql,
+    slice: Option<WindowSql>,
     f: &SearchFilter,
     proj: &Projection,
     limit: u32,
@@ -539,8 +582,29 @@ pub fn search_sql(
     ];
     match f {
         SearchFilter::One(p) => {
+            let top = slice.unwrap_or(w);
+            let (top_time, top_bucket, top_day) = (
+                top.span_time_clause(),
+                top.span_bucket_clause(),
+                top.span_day_clause(),
+            );
+            let (window_keys, keys) = match slice {
+                None => (String::new(), KEYS_WHOLE),
+                Some(_) => (
+                    fill(
+                        WINDOW_KEYS,
+                        &[("within", &w.bucket_within("k")), ("traces", traces_table)],
+                    ),
+                    KEYS_SLICED,
+                ),
+            };
             let mut values: Vec<(&str, &str)> = common.to_vec();
             values.push(("predicate", p.sql()));
+            values.push(("top_time", &top_time));
+            values.push(("top_bucket", &top_bucket));
+            values.push(("top_day", &top_day));
+            values.push(("window_keys", &window_keys));
+            values.push(("keys", keys));
             fill(SEARCH, &values)
         }
         SearchFilter::Later { selector, later } => {
@@ -656,6 +720,10 @@ pub struct SearchStatement {
     /// #593 part 2): it is issued with `max_recursive_cte_evaluation_depth
     /// = max_depth + 1`.
     climb_depth: Option<u32>,
+    /// Whether the newest-slice-first loop may bound its top-K to a slice
+    /// (issue #595): one filter, no `|` stage but `select()`, no structural
+    /// operator.
+    sliceable: bool,
 }
 
 /// A statement's one `by()` (issue #592 part 2): the group key's display,
@@ -679,6 +747,11 @@ impl SearchStatement {
     /// The climb bound the statement carries, when it climbs.
     pub fn climb_depth(&self) -> Option<u32> {
         self.climb_depth
+    }
+
+    /// Whether the statement's top-K may read a slice (issue #595).
+    pub fn sliceable(&self) -> bool {
+        self.sliceable
     }
 
     pub fn projection(&self) -> &Projection {
@@ -1074,7 +1147,33 @@ pub fn compile_search_at_depth(
     spss: u32,
     max_depth: u32,
 ) -> Result<SearchStatement, PlanError> {
+    compile_search_sliced(
+        query,
+        ctx,
+        spans_table,
+        traces_table,
+        limit,
+        spss,
+        max_depth,
+        None,
+    )
+}
+
+/// [`compile_search_at_depth`], the top-K of a sliceable statement reading
+/// `slice` (issue #595); a statement that is not sliceable ignores it.
+#[allow(clippy::too_many_arguments)]
+pub fn compile_search_sliced(
+    query: &Query,
+    ctx: &PredicateCtx<'_>,
+    spans_table: &str,
+    traces_table: &str,
+    limit: u32,
+    spss: u32,
+    max_depth: u32,
+    slice: Option<WindowSql>,
+) -> Result<SearchStatement, PlanError> {
     let pipeline = pipeline_of(query)?;
+    let structural = super::structural::holds_structural(&query.spanset);
     // Issue #593: a spanset holding a structural operator is one
     // membership predicate, the selector of every template.
     let mut climb_depth = None;
@@ -1171,10 +1270,12 @@ pub fn compile_search_at_depth(
     if climb_depth.is_some() {
         demands.push(super::structural::CLIMB_HANDOVER.to_string());
     }
-    let sql = search_sql(
+    let sliceable = !structural && matches!(filter, SearchFilter::One(_));
+    let sql = search_sql_at(
         spans_table,
         traces_table,
         ctx.window,
+        if sliceable { slice } else { None },
         &filter,
         &projection,
         limit,
@@ -1186,6 +1287,7 @@ pub fn compile_search_at_depth(
         demands,
         grouping,
         climb_depth,
+        sliceable,
     })
 }
 
@@ -1200,7 +1302,36 @@ pub fn plan_statement(
     resources_table: &str,
     max_depth: u32,
 ) -> Option<SearchStatement> {
+    plan_statement_sliced(
+        plan,
+        spans_table,
+        traces_table,
+        resources_table,
+        max_depth,
+        None,
+    )
+}
+
+/// [`plan_statement`], a sliceable statement's top-K reading the newest
+/// `slice_ns` of the window (issue #595).
+pub fn plan_statement_sliced(
+    plan: &SearchPlan,
+    spans_table: &str,
+    traces_table: &str,
+    resources_table: &str,
+    max_depth: u32,
+    slice_ns: Option<i64>,
+) -> Option<SearchStatement> {
     let window = WindowSql::start_closed_end_open(plan.window.start_ns, plan.window.end_ns);
+    let slice = slice_ns.map(|len| {
+        WindowSql::start_closed_end_open(
+            plan.window
+                .end_ns
+                .saturating_sub(len)
+                .max(plan.window.start_ns),
+            plan.window.end_ns,
+        )
+    });
     let ctx = PredicateCtx {
         window,
         spans_table,
@@ -1211,7 +1342,7 @@ pub fn plan_statement(
         pipeline: plan.pipeline.clone(),
         hints: Vec::new(),
     };
-    compile_search_at_depth(
+    compile_search_sliced(
         &query,
         &ctx,
         spans_table,
@@ -1219,24 +1350,9 @@ pub fn plan_statement(
         plan.limit,
         plan.spss,
         max_depth,
+        slice,
     )
     .ok()
-}
-
-/// Test stub (issue #595): the newest slice a sliceable statement reads
-/// first. Not yet wired.
-pub const SLICE_NS: i64 = 300_000_000_000;
-
-/// Test stub (issue #595): ignores `slice_ns` until the loop lands.
-pub fn plan_statement_sliced(
-    plan: &SearchPlan,
-    spans_table: &str,
-    traces_table: &str,
-    resources_table: &str,
-    max_depth: u32,
-    _slice_ns: Option<i64>,
-) -> Option<SearchStatement> {
-    plan_statement(plan, spans_table, traces_table, resources_table, max_depth)
 }
 
 /// [`decode_search`], charging every retained entry against `budget`
