@@ -4768,14 +4768,6 @@ fn compile_search_refuses_what_parts_two_and_three_serve() {
         // second `by()`.
         (r#"{ .a = 1 } | by(trace:id)"#, "#592"),
         (r#"{ .a = 1 } | by(span.a) | by(name)"#, "#592"),
-        // Issue #593 part 2: the transitive operators, alone and under a
-        // non-transitive one.
-        (r#"{ .a = 1 } >> { .b = 2 }"#, "#593 part 2"),
-        (r#"{ .a = 1 } !<< { .b = 2 }"#, "#593 part 2"),
-        (
-            r#"({ .a = 1 } > { .b = 2 }) && ({ .c = 3 } &>> { .d = 4 })"#,
-            "#593 part 2",
-        ),
         (r#"{ nestedSetLeft > 0 }"#, "#594"),
     ] {
         match compile_search_of(query) {
@@ -4938,10 +4930,6 @@ fn the_fork_routes_by_the_plan() {
         r#"{ .a = 1 } | by(.u)"#,
         r#"{ .a = 1 } | by(span.a) | by(name)"#,
         r#"{ .a = 1 } | by(span.a) | coalesce() | by(name)"#,
-        // Issue #593 part 1: the transitive operators are part 2's.
-        r#"{ .a = 1 } >> { .b = 2 }"#,
-        r#"{ .a = 1 } << { .b = 2 }"#,
-        r#"{ .a = 1 } && { .b = 2 } >> { .c = 3 } || { .d = 4 }"#,
         r#"{ nestedSetLeft > 0 }"#,
         r#"{ nestedSetParent < 0 }"#,
         r#"{ traceDuration > 1s }"#,
@@ -4952,7 +4940,7 @@ fn the_fork_routes_by_the_plan() {
         r#"{ (event.k = 1) = true }"#,
         r#"{ !event.k = false }"#,
     ] {
-        if plan_statement(&fork_plan(query), "spans", "traces", "resources").is_some() {
+        if plan_statement(&fork_plan(query), "spans", "traces", "resources", 64).is_some() {
             wrong.push(format!(
                 "{query}: served by the statement, must be today's engine's"
             ));
@@ -5002,8 +4990,15 @@ fn the_fork_routes_by_the_plan() {
         r#"{ .a = 1 } &< ({ .b = 2 } || { .c = 3 })"#,
         r#"{ .a = 1 } !< { .b = 2 } | by(name)"#,
         r#"{ .a = 1 } > { .b = 2 } | { .c = 3 } | select(span.d)"#,
+        // Issue #593 part 2: the three inventory rows, and three shapes.
+        r#"{ .a = 1 } && { .b = 2 } >> { .c = 3 } || { .d = 4 }"#,
+        r#"{ .a = 1 } << { .b = 2 }"#,
+        r#"{ .a = 1 } >> { .b = 2 }"#,
+        r#"{ .a = 1 } !<< { .b = 2 }"#,
+        r#"({ .a = 1 } > { .b = 2 }) && ({ .c = 3 } &>> { .d = 4 })"#,
+        r#"{ .a = 1 } !>> { .b = 2 } | by(name)"#,
     ] {
-        if plan_statement(&fork_plan(query), "spans", "traces", "resources").is_none() {
+        if plan_statement(&fork_plan(query), "spans", "traces", "resources", 64).is_none() {
             wrong.push(format!(
                 "{query}: today's engine's, must be the statement's"
             ));

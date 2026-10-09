@@ -5857,6 +5857,7 @@ fn engine_config() -> pulsus_read::TraceReadConfig {
         max_candidates: 100_000,
         scan_budget_rows: 50_000_000,
         event_set_max_values: 1_000_000,
+        max_depth: 64,
         max_series: 1_000,
         generator_max_memory_bytes: 536_870_912,
         distributed: false,
@@ -7271,7 +7272,7 @@ fn plan_of(
 /// Whether the fork's coverage function gives `plan` a statement, with
 /// [`engine_config`]'s tables.
 fn covered(plan: &pulsus_read::SearchPlan) -> bool {
-    pulsus_read::traces::spans::search::plan_statement(plan, "spans", "traces", "resources")
+    pulsus_read::traces::spans::search::plan_statement(plan, "spans", "traces", "resources", 64)
         .is_some()
 }
 
@@ -7378,7 +7379,7 @@ async fn search_routed_answers_as_today_on_fixture_c() {
         drop_db(&db).await;
     }
     eprintln!("and {fixture_cases} fixture cases");
-    assert_eq!(names.len(), 106, "the inventory's new rows");
+    assert_eq!(names.len(), 109, "the inventory's new rows");
     assert!(
         wrong.is_empty(),
         "{} of {} differ:\n\n{}",
@@ -9631,4 +9632,663 @@ async fn a_refused_condition_under_a_relation_answers_as_today() {
     }
     drop_db(&db).await;
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+// ---------------------------------------------------------------------
+// Issue #593 part 2 — `>>`, `<<`, plain, `!` and `&`, and the climb bound
+// ---------------------------------------------------------------------
+
+/// [`check_structural`] for part 2: the route's answer is read first, and
+/// its statements counted only when it answered, so a statement that
+/// failed — a `422` — is reported as the answer it gave.
+async fn check_climbing(
+    label: &str,
+    bodies: &[ExportTraceServiceRequest],
+    spans: u64,
+    base_ns: i64,
+    cases: &[StructuralCase],
+) {
+    let (db, client) = seed_both(
+        pulsus_testkit::test_db(&format!("pulsus_read_it_t593p2_{label}")),
+        bodies,
+        spans,
+        &format!("t593p2-{label}"),
+    )
+    .await;
+    let engine = engine_of(&db).await;
+    let mut wrong = Vec::new();
+    for (query, literal) in cases {
+        let plan = plan_of(
+            &engine,
+            &parse_query(query),
+            (base_ns, base_ns + 60_000_000_000),
+            20,
+            20,
+        );
+        if !covered(&plan) {
+            wrong.push(format!(
+                "{query}: today's engine's, must be the statement's"
+            ));
+            continue;
+        }
+        let t0 = now_ns();
+        let routed = engine.search_routed(&plan).await.map(normalise_today);
+        let n = match &routed {
+            Ok(_) => settled_statements(&client, &db, t0).await.0,
+            Err(_) => 0,
+        };
+        let today = engine.search(&plan).await.map(normalise_today);
+        if format!("{today:?}") != format!("{routed:?}") {
+            wrong.push(format!(
+                "{query}\n  today:  {}\n  routed: {}",
+                answer_of(&today),
+                answer_of(&routed)
+            ));
+        } else if answer_of(&routed) != *literal {
+            wrong.push(format!(
+                "{query}\n  literal: {literal}\n  both:    {}",
+                answer_of(&routed)
+            ));
+        }
+        if routed.is_ok() && n != 1 {
+            wrong.push(format!("{query}: {n} statements, want 1"));
+        }
+    }
+    drop_db(&db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// `T-A9`'s six transitive forms on the §6.1 fixture: A is `checkout`
+/// (`03`, `04`), B is `payment` (`05` under `04`, `06` under `05`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_a9_the_six_transitive_forms() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    check_climbing("ta9t", &fixture_61_bodies(base_ns), 9, base_ns, &[
+        (r#"{ resource.service.name = "checkout" } >> { resource.service.name = "payment" }"#, "11 2 [05, 06]"),
+        (r#"{ resource.service.name = "checkout" } !>> { resource.service.name = "payment" }"#, ""),
+        (r#"{ resource.service.name = "checkout" } &>> { resource.service.name = "payment" }"#, "11 4 [03, 04, 05, 06]"),
+        (r#"{ resource.service.name = "checkout" } << { resource.service.name = "payment" }"#, ""),
+        (r#"{ resource.service.name = "checkout" } !<< { resource.service.name = "payment" }"#, "11 2 [05, 06]"),
+        (r#"{ resource.service.name = "checkout" } &<< { resource.service.name = "payment" }"#, ""),
+    ]).await;
+}
+
+/// Fixture E's `ee06` and `ee07` under the transitive forms: A is
+/// `frontend`, B `payment` with an error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_transitive_forms_on_the_edge_fixture() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    check_climbing("edget", &edge_bodies(base_ns), 10, base_ns, &[
+        (r#"{ resource.service.name = "frontend" } >> { resource.service.name = "payment" && status = error }"#, "e6 1 [03]"),
+        (r#"{ resource.service.name = "frontend" } << { resource.service.name = "payment" && status = error }"#, "e6 1 [03]"),
+        (r#"{ resource.service.name = "frontend" } &>> { resource.service.name = "payment" && status = error }"#, "e6 2 [02, 03]"),
+        (r#"{ resource.service.name = "frontend" } &<< { resource.service.name = "payment" && status = error }"#, "e6 2 [03, 04]"),
+        (r#"{ resource.service.name = "frontend" } !>> { resource.service.name = "payment" && status = error }"#, "e7 1 [01]; e6 1 [07]"),
+        (r#"{ resource.service.name = "frontend" } !<< { resource.service.name = "payment" && status = error }"#, "e7 1 [01]; e6 1 [07]"),
+    ]).await;
+}
+
+/// The rule fixture of part 1, and `r9`: an A root, its child stored 20 s
+/// before the window, and a B span under that child.
+fn climb_rule_bodies(base_ns: i64) -> Vec<ExportTraceServiceRequest> {
+    const S: i64 = 1_000_000_000;
+    let sp = |n: u8, parent: Vec<u8>, at: i64, keys: &[&str]| {
+        span_of(
+            vec![0x39; 16],
+            span_id_bytes(n),
+            parent,
+            "op",
+            2,
+            base_ns + at * S,
+            S / 10,
+            keys.iter().map(|k| kv(k, bool_value(true))).collect(),
+            0,
+            Vec::new(),
+            Vec::new(),
+        )
+    };
+    let mut bodies = rule_bodies(base_ns);
+    bodies.push(by_body(
+        "svc",
+        vec![
+            sp(0x91, Vec::new(), 56, &["a"]),
+            sp(0x92, span_id_bytes(0x91), -20, &[]),
+            sp(0x93, span_id_bytes(0x92), 57, &["b"]),
+        ],
+    ));
+    bodies
+}
+
+/// Today's climbing rules, one trace each, and composed operands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_transitive_operator_answers_as_today() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    check_climbing("climb", &climb_rule_bodies(base_ns), 25, base_ns, &[
+        ("{ span.a = true } >> { span.b = true }", "36 1 [62]; 35 1 [52]; 31 2 [02, 03]"),
+        ("{ span.a = true } !>> { span.b = true }", "39 1 [93]; 37 2 [00, 71]; 34 2 [32, 33]; 32 1 [12]; 33 1 [21]; 31 1 [04]"),
+        ("{ span.a = true } &>> { span.b = true }", "36 2 [61, 62]; 35 2 [51, 52]; 31 3 [01, 02, 03]"),
+        ("{ span.a = true } << { span.b = true }", ""),
+        ("{ span.a = true } !<< { span.b = true }", "39 1 [93]; 37 2 [00, 71]; 36 1 [62]; 35 1 [52]; 34 2 [32, 33]; 32 1 [12]; 33 1 [21]; 31 3 [02, 03, 04]"),
+        ("{ span.a = true } &<< { span.b = true }", ""),
+        ("{ span.a = true } >> { span.c = true }", "35 2 [53, 54]"),
+        ("{ span.c = true } << { span.a = true }", "35 1 [51]"),
+        ("{ span.a = true } > { span.b = true } >> { span.c = true }", "35 1 [53]"),
+        ("{ span.a = true } && { span.b = true } >> { span.c = true } || { span.d = true }", "35 2 [51, 53]"),
+        ("({ span.a = true } >> { span.b = true }) && { span.c = true }", "35 3 [52, 53, 54]"),
+        ("{ span.a = true } &>> ({ span.b = true } || { span.c = true })", "36 2 [61, 62]; 35 4 [51, 52, 53, 54]; 31 3 [01, 02, 03]"),
+        ("{ span.a = true } >> { span.b = true } | count() > 1", "31 2 [02, 03]"),
+        ("{ span.a = true } << { span.b = true } | select(span.c)", ""),
+    ]).await;
+}
+
+/// A chain of `n` spans in trace `t`: the root is A (`frontend`), the
+/// deepest B (`payment`, error), the rest neutral; `n - 1` parent links.
+/// With `cycle`, two spans each the other's parent, A and B.
+fn chain_bodies(base_ns: i64, t: u8, n: u8, cycle: bool) -> Vec<ExportTraceServiceRequest> {
+    const S: i64 = 1_000_000_000;
+    let sp = |i: u8, parent: Vec<u8>, status: i32| {
+        span_of(
+            vec![t; 16],
+            span_id_bytes(i),
+            parent,
+            "op",
+            2,
+            base_ns + i64::from(i.min(50)) * S,
+            S / 10,
+            Vec::new(),
+            status,
+            Vec::new(),
+            Vec::new(),
+        )
+    };
+    if cycle {
+        return vec![
+            by_body("frontend", vec![sp(1, span_id_bytes(2), 0)]),
+            by_body("payment", vec![sp(2, span_id_bytes(1), 2)]),
+        ];
+    }
+    let mid: Vec<Span> = (2..n).map(|i| sp(i, span_id_bytes(i - 1), 0)).collect();
+    vec![
+        by_body("frontend", vec![sp(1, Vec::new(), 0)]),
+        by_body("gateway", mid),
+        by_body("payment", vec![sp(n, span_id_bytes(n - 1), 2)]),
+    ]
+}
+
+/// [`chain_bodies`] for a chain of up to 65,535 spans in trace `d1…d1`,
+/// span ids the chain position as eight big-endian bytes.
+fn long_chain_bodies(base_ns: i64, n: u16) -> Vec<ExportTraceServiceRequest> {
+    const S: i64 = 1_000_000_000;
+    let id = |i: u16| u64::from(i).to_be_bytes().to_vec();
+    let sp = |i: u16, parent: Vec<u8>, status: i32| {
+        span_of(
+            vec![0xd1; 16],
+            id(i),
+            parent,
+            "op",
+            2,
+            base_ns + i64::from(i.min(50)) * S,
+            S / 10,
+            Vec::new(),
+            status,
+            Vec::new(),
+            Vec::new(),
+        )
+    };
+    let mid: Vec<Span> = (2..n).map(|i| sp(i, id(i - 1), 0)).collect();
+    vec![
+        by_body("frontend", vec![sp(1, Vec::new(), 0)]),
+        by_body("gateway", mid),
+        by_body("payment", vec![sp(n, id(n - 1), 2)]),
+    ]
+}
+
+/// `(label, bodies, spans, query, today's answer, the route's answer)`.
+type ClimbCase = (
+    &'static str,
+    Vec<ExportTraceServiceRequest>,
+    u64,
+    &'static str,
+    &'static str,
+    &'static str,
+);
+
+/// `T-A10`, `T-A11`: a chain at the bound matches; one link past it
+/// answers `422 query_too_broad`, also beside the matching chain, where
+/// today's engine answers the deep span. A cycle ends the climb, and is
+/// answered as today's engine answers it; so is a deep chain whose climb
+/// meets its A span within the bound, and one with no A span.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_a10_t_a11_a_climb_past_the_bound_answers_422() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    const DOWN: &str = r#"{ resource.service.name = "frontend" } >> { resource.service.name = "payment" && status = error }"#;
+    const UP: &str = r#"{ resource.service.name = "payment" && status = error } << { resource.service.name = "frontend" }"#;
+    let both = {
+        let mut b = chain_bodies(base_ns, 0xe3, 65, false);
+        b.extend(chain_bodies(base_ns, 0xe4, 66, false));
+        b
+    };
+    // The 66-span chain under a `gateway` root: no A span in the trace,
+    // so nothing climbs there.
+    let no_a = {
+        let mut b = chain_bodies(base_ns, 0xe8, 66, false);
+        b[0].resource_spans[0].resource.as_mut().unwrap().attributes[0] =
+            kv("service.name", str_value("gateway"));
+        b
+    };
+    // A 66-span chain whose leaf's parent is the only A span: the leaf is
+    // decided one link up, and its climb stops there.
+    let decided = {
+        const S: i64 = 1_000_000_000;
+        let sp = |i: u8, parent: Vec<u8>, status: i32| {
+            span_of(
+                vec![0xe9; 16],
+                span_id_bytes(i),
+                parent,
+                "op",
+                2,
+                base_ns + i64::from(i.min(50)) * S,
+                S / 10,
+                Vec::new(),
+                status,
+                Vec::new(),
+                Vec::new(),
+            )
+        };
+        vec![
+            by_body(
+                "gateway",
+                (1..65u8)
+                    .map(|i| {
+                        sp(
+                            i,
+                            if i == 1 {
+                                Vec::new()
+                            } else {
+                                span_id_bytes(i - 1)
+                            },
+                            0,
+                        )
+                    })
+                    .collect(),
+            ),
+            by_body("frontend", vec![sp(65, span_id_bytes(64), 0)]),
+            by_body("payment", vec![sp(66, span_id_bytes(65), 2)]),
+        ]
+    };
+    // A cycle of two neutral spans with a B span under it, beside an A
+    // root: the climb from B goes round once and stops.
+    let ring = {
+        const S: i64 = 1_000_000_000;
+        let sp = |i: u8, parent: Vec<u8>, status: i32| {
+            span_of(
+                vec![0xea; 16],
+                span_id_bytes(i),
+                parent,
+                "op",
+                2,
+                base_ns + i64::from(i) * S,
+                S / 10,
+                Vec::new(),
+                status,
+                Vec::new(),
+                Vec::new(),
+            )
+        };
+        vec![
+            by_body("frontend", vec![sp(1, Vec::new(), 0)]),
+            by_body(
+                "gateway",
+                vec![sp(2, span_id_bytes(3), 0), sp(3, span_id_bytes(2), 0)],
+            ),
+            by_body("payment", vec![sp(4, span_id_bytes(2), 2)]),
+        ]
+    };
+    let cases: Vec<ClimbCase> = vec![
+        (
+            "ee03",
+            chain_bodies(base_ns, 0xe3, 65, false),
+            65,
+            DOWN,
+            "e3 1 [41]",
+            "e3 1 [41]",
+        ),
+        (
+            "ee03up",
+            chain_bodies(base_ns, 0xe3, 65, false),
+            65,
+            UP,
+            "e3 1 [01]",
+            "e3 1 [01]",
+        ),
+        (
+            "ee04",
+            chain_bodies(base_ns, 0xe4, 66, false),
+            66,
+            DOWN,
+            "e4 1 [42]",
+            "Err(query too broad: a structural operator (>> or <<) found a chain of parent spans deeper than 64 links)",
+        ),
+        (
+            "ee04up",
+            chain_bodies(base_ns, 0xe4, 66, false),
+            66,
+            UP,
+            "e4 1 [01]",
+            "Err(query too broad: a structural operator (>> or <<) found a chain of parent spans deeper than 64 links)",
+        ),
+        (
+            "ee0304",
+            both,
+            131,
+            DOWN,
+            "e3 1 [41]; e4 1 [42]",
+            "Err(query too broad: a structural operator (>> or <<) found a chain of parent spans deeper than 64 links)",
+        ),
+        ("ee08", no_a, 66, DOWN, "", ""),
+        ("ee09", decided, 66, DOWN, "e9 1 [42]", "e9 1 [42]"),
+        ("ee10", ring, 4, DOWN, "", ""),
+        (
+            "ee05",
+            chain_bodies(base_ns, 0xe5, 2, true),
+            2,
+            DOWN,
+            "e5 1 [02]",
+            "e5 1 [02]",
+        ),
+        (
+            "ee05up",
+            chain_bodies(base_ns, 0xe5, 2, true),
+            2,
+            UP,
+            "e5 1 [01]",
+            "e5 1 [01]",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (label, bodies, spans, query, today_literal, routed_literal) in cases {
+        let (db, _client) = seed_both(
+            pulsus_testkit::test_db(&format!("pulsus_read_it_t593p2_{label}")),
+            &bodies,
+            spans,
+            &format!("t593p2-{label}"),
+        )
+        .await;
+        let engine = engine_of(&db).await;
+        let plan = plan_of(
+            &engine,
+            &parse_query(query),
+            (base_ns, base_ns + 60_000_000_000),
+            20,
+            20,
+        );
+        if !covered(&plan) {
+            wrong.push(format!(
+                "{label}: today's engine's, must be the statement's"
+            ));
+        } else {
+            let routed = engine.search_routed(&plan).await.map(normalise_today);
+            let today = engine.search(&plan).await.map(normalise_today);
+            let (t, r) = (answer_of(&today), answer_of(&routed));
+            if t != today_literal || r != routed_literal {
+                wrong.push(format!("{label}\n  today:  {t}\n  routed: {r}"));
+            }
+        }
+        drop_db(&db).await;
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// `PULSUS_TRACEQL_MAX_DEPTH` counts parent links: at a bound of 2, a B
+/// span two links under an A span matches and one three links under
+/// answers `422`; at 1,001, past the server's default recursion depth of
+/// 1,000, the same at 1,001 and 1,002 links.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_configured_bound_counts_parent_links() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    const DOWN: &str = r#"{ resource.service.name = "frontend" } >> { resource.service.name = "payment" && status = error }"#;
+    let mut wrong = Vec::new();
+    for (label, n, depth, want) in [
+        ("d3", 3u16, 2u32, "d1 1 [03]".to_string()),
+        ("d4", 4, 2, "Err(query too broad: a structural operator (>> or <<) found a chain of parent spans deeper than 2 links)".to_string()),
+        ("d1002", 1002, 1001, "d1 1 [ea]".to_string()),
+        ("d1003", 1003, 1001, "Err(query too broad: a structural operator (>> or <<) found a chain of parent spans deeper than 1001 links)".to_string()),
+    ] {
+        let (db, _client) = seed_both(
+            pulsus_testkit::test_db(&format!("pulsus_read_it_t593p2_{label}")),
+            &long_chain_bodies(base_ns, n),
+            u64::from(n),
+            &format!("t593p2-{label}"),
+        )
+        .await;
+        let mut config = engine_config();
+        config.max_depth = depth;
+        let engine = pulsus_read::TraceEngine::new(ChClient::new(client_config(&db)).await.expect("connect"), config);
+        let plan = plan_of(&engine, &parse_query(DOWN), (base_ns, base_ns + 60_000_000_000), 20, 20);
+        let routed = answer_of(&engine.search_routed(&plan).await.map(normalise_today));
+        if routed != want {
+            wrong.push(format!("{label}: {routed}, want {want}"));
+        }
+        drop_db(&db).await;
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A condition the database cannot answer under `>>` and `<<`: the same
+/// `PipelineInvalid` from the route and today's engine.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_condition_under_a_climb_answers_as_today() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let (db, _client) = seed_both(
+        pulsus_testkit::test_db("pulsus_read_it_t593p2_demand"),
+        &rule_bodies(base_ns),
+        22,
+        "t593p2-demand",
+    )
+    .await;
+    let engine = engine_of(&db).await;
+    let mut wrong = Vec::new();
+    for query in [
+        "{ !span.x } >> { span.b = true }",
+        "{ span.a = true } << { !span.x }",
+    ] {
+        let plan = plan_of(
+            &engine,
+            &parse_query(query),
+            (base_ns, base_ns + 60_000_000_000),
+            20,
+            20,
+        );
+        if !covered(&plan) {
+            wrong.push(format!(
+                "{query}: today's engine's, must be the statement's"
+            ));
+            continue;
+        }
+        let routed = engine.search_routed(&plan).await.map(normalise_today);
+        let today = engine.search(&plan).await.map(normalise_today);
+        let want = "Err(PipelineInvalid { reason: \"expression (!span.x) expected a boolean\" })";
+        if format!("{today:?}") != format!("{routed:?}") || format!("{routed:?}") != want {
+            wrong.push(format!(
+                "{query}\n  today:  {today:?}\n  routed: {routed:?}"
+            ));
+        }
+    }
+    drop_db(&db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A climb whose candidate traces cover most of a window of more than 64
+/// granules hands the request to today's engine; a selective one in the
+/// same window stays one statement. 1,000 traces of 140 spans in one
+/// five-minute bucket: a root, 138 children of it, and an error span under
+/// the last child; trace `000…07` alone has a root named `pick`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_broad_climb_hands_over_to_todays_engine() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let mut spans = Vec::new();
+    for t in 0..1000u32 {
+        let trace = {
+            let mut v = vec![0u8; 12];
+            v.extend(t.to_be_bytes());
+            v
+        };
+        let id = |i: u32| u64::from(t * 1000 + i + 1).to_be_bytes().to_vec();
+        let at = base_ns + i64::from(t) * 1_000_000;
+        spans.push(span_of(
+            trace.clone(),
+            id(0),
+            Vec::new(),
+            if t == 7 { "pick" } else { "root" },
+            2,
+            at,
+            1_000,
+            Vec::new(),
+            0,
+            Vec::new(),
+            Vec::new(),
+        ));
+        for i in 1..139 {
+            spans.push(span_of(
+                trace.clone(),
+                id(i),
+                id(0),
+                "child",
+                2,
+                at + i64::from(i),
+                1_000,
+                Vec::new(),
+                0,
+                Vec::new(),
+                Vec::new(),
+            ));
+        }
+        spans.push(span_of(
+            trace.clone(),
+            id(139),
+            id(138),
+            "leaf",
+            2,
+            at + 139,
+            1_000,
+            Vec::new(),
+            2,
+            Vec::new(),
+            Vec::new(),
+        ));
+    }
+    let (db, client) = seed_both(
+        pulsus_testkit::test_db("pulsus_read_it_t593p2_broad"),
+        &[by_body("svc", spans)],
+        140_000,
+        "t593p2-broad",
+    )
+    .await;
+    let engine = engine_of(&db).await;
+    let mut wrong = Vec::new();
+    for (query, want) in [
+        (r#"{ status = error } << { }"#, "hand over"),
+        (r#"{ } >> { status = error }"#, "hand over"),
+        (r#"{ name = "pick" } >> { status = error }"#, "statement"),
+    ] {
+        let plan = plan_of(
+            &engine,
+            &parse_query(query),
+            (base_ns, base_ns + 60_000_000_000),
+            20,
+            3,
+        );
+        if !covered(&plan) {
+            wrong.push(format!(
+                "{query}: today's engine's, must be the statement's"
+            ));
+            continue;
+        }
+        let t0 = now_ns();
+        let routed = engine.search_routed(&plan).await.map(normalise_today);
+        let n = match &routed {
+            Ok(_) => settled_statements(&client, &db, t0).await.0,
+            Err(_) => 0,
+        };
+        let today = engine.search(&plan).await.map(normalise_today);
+        if format!("{today:?}") != format!("{routed:?}") {
+            wrong.push(format!(
+                "{query}\n  today:  {}\n  routed: {}",
+                answer_of(&today),
+                answer_of(&routed)
+            ));
+        }
+        if query.contains("pick") && answer_of(&routed) != "07 1 [e4]" {
+            wrong.push(format!("{query}: {}, want 07 1 [e4]", answer_of(&routed)));
+        }
+        let got = if n == 1 { "statement" } else { "hand over" };
+        if got != want {
+            wrong.push(format!("{query}: {n} statements, want {want}"));
+        }
+    }
+    drop_db(&db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A two-span cycle beside a root, `81` on both sides and `82` on neither: today's walk
+/// leaves `81`, reaches `82`, and comes back to `81` once, so `81` is its
+/// own descendant and ancestor through the cycle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cycle_back_to_its_start_answers_as_today() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    const S: i64 = 1_000_000_000;
+    let sp = |n: u8, parent: u8, keys: &[&str]| {
+        span_of(
+            vec![0x3a; 16],
+            span_id_bytes(n),
+            span_id_bytes(parent),
+            "op",
+            2,
+            base_ns + i64::from(n - 0x80) * S,
+            S / 10,
+            keys.iter().map(|k| kv(k, bool_value(true))).collect(),
+            0,
+            Vec::new(),
+            Vec::new(),
+        )
+    };
+    let root = span_of(
+        vec![0x3a; 16],
+        span_id_bytes(0x80),
+        Vec::new(),
+        "op",
+        2,
+        base_ns,
+        S / 10,
+        Vec::new(),
+        0,
+        Vec::new(),
+        Vec::new(),
+    );
+    check_climbing(
+        "loop",
+        &[by_body(
+            "svc",
+            vec![root, sp(0x81, 0x82, &["a", "b"]), sp(0x82, 0x81, &[])],
+        )],
+        3,
+        base_ns,
+        &[
+            ("{ span.a = true } >> { span.b = true }", "3a 1 [81]"),
+            ("{ span.a = true } !>> { span.b = true }", ""),
+            ("{ span.a = true } &>> { span.b = true }", "3a 1 [81]"),
+            ("{ span.a = true } << { span.b = true }", "3a 1 [81]"),
+            ("{ span.a = true } !<< { span.b = true }", ""),
+            ("{ span.a = true } &<< { span.b = true }", "3a 1 [81]"),
+        ],
+    )
+    .await;
 }

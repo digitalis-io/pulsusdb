@@ -109,7 +109,7 @@ fn side_of(query: &pulsus_traceql::Query, route: &str) -> &'static str {
     };
     match plan_search(query, &params, &ctx) {
         Err(_) => "refused",
-        Ok(plan) => match plan_statement(&plan, "spans", "traces", "resources") {
+        Ok(plan) => match plan_statement(&plan, "spans", "traces", "resources", 64) {
             Some(_) => "new",
             None => "old",
         },
@@ -185,7 +185,7 @@ fn the_inventory_is_complete_and_exact() {
             sides.get("old").copied().unwrap_or(0),
             sides.get("refused").copied().unwrap_or(0)
         ),
-        (106, 32, 3),
+        (109, 29, 3),
         "new, old and refused"
     );
 }

@@ -14,6 +14,17 @@ use pulsus_traceql::{BoolOp, FieldExpr, SpansetExpr, StructuralModifier, Structu
 use super::predicate::{PredicateCtx, SpanPredicate, compile_span_predicate_in};
 use crate::traces::PlanError;
 
+/// The climb bound when none is configured (`PULSUS_TRACEQL_MAX_DEPTH`,
+/// issue #593 part 2).
+pub const DEFAULT_MAX_DEPTH: u32 = 64;
+
+/// A spanset's membership predicate, and whether it climbs (`>>`, `<<`).
+/// Stub: nothing climbs yet.
+pub struct MembershipSql {
+    pub predicate: SpanPredicate,
+    pub climbs: bool,
+}
+
 /// The all-zero parent: a root.
 const ZERO: &str = "toFixedString('', 8)";
 
@@ -32,7 +43,9 @@ pub fn compile_membership_in(
     spanset: &SpansetExpr,
     ctx: &PredicateCtx<'_>,
     spans_table: &str,
-) -> Result<SpanPredicate, PlanError> {
+    max_depth: u32,
+) -> Result<MembershipSql, PlanError> {
+    let _ = max_depth;
     let mut c = Membership {
         ctx,
         spans_table,
@@ -40,7 +53,10 @@ pub fn compile_membership_in(
     };
     let sql = c.member(spanset)?;
     // Every relation and every `&&` reads a window-bounded subquery.
-    Ok(SpanPredicate::composed(sql, Some(ctx.window), c.demands))
+    Ok(MembershipSql {
+        predicate: SpanPredicate::composed(sql, Some(ctx.window), c.demands),
+        climbs: false,
+    })
 }
 
 struct Membership<'a, 'b> {

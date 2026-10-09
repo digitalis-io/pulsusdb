@@ -423,6 +423,11 @@ pub struct TraceReadConfig {
     /// counts the values one batch's set will hold. They coincided only
     /// while the set came from an index storing one value per row.
     pub event_set_max_values: u64,
+    /// `reader.traceql_max_depth` (`PULSUS_TRACEQL_MAX_DEPTH`, issue #593
+    /// part 2): the most parent links one climb of `>>` or `<<` follows.
+    /// A span with a parent left to follow past it answers `422`
+    /// ([`TooBroadReason::TraceStructuralDepth`]).
+    pub max_depth: u32,
     /// `reader.traceql_max_series` (issue #182) — the metrics `by(...)`
     /// distinct-series cap; the `LIMIT cap+1` probe breach → 422
     /// ([`TooBroadReason::TraceMetricsSeriesCap`]).
@@ -2274,6 +2279,7 @@ impl TraceEngine {
             &self.config.spans_v2_table,
             &self.config.traces_table,
             &self.config.resources_table,
+            self.config.max_depth,
         ) else {
             return self.search_inner(plan, explain).await;
         };
@@ -4719,6 +4725,7 @@ mod tests {
             max_candidates: 100_000,
             scan_budget_rows: 50_000_000,
             event_set_max_values: 1_000_000,
+            max_depth: 64,
             max_series: 1_000,
             generator_max_memory_bytes: 536_870_912,
             read_max_memory_bytes: TEST_READ_MEM,
@@ -4744,6 +4751,7 @@ mod tests {
             max_candidates: 100,
             scan_budget_rows: 1_000,
             event_set_max_values: 1_000_000,
+            max_depth: 64,
             max_series: 1_000,
             generator_max_memory_bytes: 536_870_912,
             read_max_memory_bytes: TEST_READ_MEM,

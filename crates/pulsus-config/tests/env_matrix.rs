@@ -424,6 +424,11 @@ const ROWS: &[Row] = &[
         check: |c| c.reader.traceql_event_set_max_values == 2_500,
     },
     Row {
+        var: "PULSUS_TRACEQL_MAX_DEPTH",
+        value: "128",
+        check: |c| c.reader.traceql_max_depth == 128,
+    },
+    Row {
         var: "PULSUS_TRACEQL_MAX_SERIES",
         value: "250",
         check: |c| c.reader.traceql_max_series == 250,
@@ -533,8 +538,8 @@ fn matrix_rows_exactly_match_all_env_vars() {
     );
     assert_eq!(
         declared.len(),
-        95,
-        "docs/configuration.md §§1-8 document exactly 95 variables"
+        96,
+        "docs/configuration.md §§1-8 document exactly 96 variables"
     );
 
     let mut canonical: Vec<&str> = pulsus_config::ALL_ENV_VARS.to_vec();

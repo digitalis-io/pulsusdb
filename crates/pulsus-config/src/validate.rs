@@ -358,6 +358,10 @@ pub const TRACEQL_SCAN_BUDGET_ROWS_CEILING: u64 = 50_000_000_000;
 /// outright.
 pub const TRACEQL_EVENT_SET_MAX_VALUES_CEILING: u64 = 10_000_000;
 
+/// `reader.traceql_max_depth` (issue #593 part 2): a climb never needs more
+/// links than the 10,000 spans one trace is hydrated to
+/// (`MAX_SPANS_PER_TRACE`).
+pub const TRACEQL_MAX_DEPTH_CEILING: u64 = 10_000;
 /// `reader.traceql_generator_max_memory_bytes` — the phase-1 candidate
 /// generator's `max_memory_usage` (throw-not-OOM) ceiling. ClickHouse
 /// treats `0` as *unlimited*, so zero is rejected too. 1024x the
@@ -1983,6 +1987,28 @@ mod tests {
         );
     }
 
+    /// Issue #593 part 2: the structural climb bound. Zero would refuse
+    /// every `>>` and `<<`; past the 10,000 spans one trace is hydrated to,
+    /// no chain is deeper.
+    #[test]
+    fn traceql_max_depth_rejects_zero_and_past_the_ceiling() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.reader.traceql_max_depth, 64, "the default");
+        cfg.reader.traceql_max_depth = 0;
+        match validate(&cfg) {
+            Err(ConfigError::Value { field, .. }) => assert_eq!(field, "reader.traceql_max_depth"),
+            other => panic!("expected a Value error for zero, got {other:?}"),
+        }
+        let mut cfg = Config::default();
+        cfg.reader.traceql_max_depth = 1;
+        assert!(validate(&cfg).is_ok(), "1 is the accepted floor");
+        assert_ceiling_boundary(
+            "reader.traceql_max_depth",
+            |c, v| c.reader.traceql_max_depth = u32::try_from(v).expect("fits"),
+            u64::from(u32::MAX),
+            TRACEQL_MAX_DEPTH_CEILING,
+        );
+    }
     /// Issue #133 AC9: same shape as the row budget —
     /// `max_memory_usage = 0` is ClickHouse-unlimited, so zero is a
     /// silently disabled generator memory guard.

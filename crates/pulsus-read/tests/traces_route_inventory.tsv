@@ -132,9 +132,9 @@ structural_not_child	search	new	9
 structural_not_sibling	search	new	9
 structural_parens	search	new	9
 structural_pipeline	search	new	9
-structural_precedence	search	old	11
-structural_shl	search	old	11
-structural_shr	search	old	11
+structural_precedence	search	new	9
+structural_shl	search	new	9
+structural_shr	search	new	9
 structural_tilde	search	new	9
 structural_union_child	search	new	9
 structural_union_sibling	search	new	9
