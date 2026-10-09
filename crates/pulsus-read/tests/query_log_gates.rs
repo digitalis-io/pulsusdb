@@ -12348,7 +12348,9 @@ async fn a_brace_pattern_answers_on_every_database_route() {
         limit: 100,
         direction: Direction::Backward,
     };
-    let mut comments: Vec<(String, String)> = Vec::new();
+    // (comment, query, the lowered statement's `extractGroups` when the
+    // request must have run it)
+    let mut comments: Vec<(String, String, Option<String>)> = Vec::new();
     for literal_text in ["a{bbb}c", "a{,5}", "a{}"] {
         let stage = format!(r#"| regexp "(?P<x>{literal_text})""#);
         let want = vec![literal_text.to_string()];
@@ -12365,7 +12367,7 @@ async fn a_brace_pattern_answers_on_every_database_route() {
             panic!("{query}: streams");
         };
         assert_eq!(label_values_624p3(&items, "x"), want, "{query}");
-        comments.push((comment, query));
+        comments.push((comment, query, None));
 
         let count = format!(r#"sum by (x) (count_over_time({{s="br"}} {stage} | x != "" [1m]))"#);
         for todays in [false, true] {
@@ -12385,12 +12387,14 @@ async fn a_brace_pattern_answers_on_every_database_route() {
                 vec![(vec![pair], vec![(t + 60 * sec, 1.0f64.to_bits())])],
                 "{count}, today's route {todays}"
             );
-            comments.push((comment, count.clone()));
+            let lowered =
+                (!todays).then(|| format!("extractGroups(body, '(?P<x>{literal_text})') AS g"));
+            comments.push((comment, count.clone(), lowered));
         }
     }
-    let all: Vec<String> = comments.iter().map(|(c, _)| c.clone()).collect();
+    let all: Vec<String> = comments.iter().map(|(c, _, _)| c.clone()).collect();
     let logged = logged_624(&admin, &all).await;
-    for (comment, query) in &comments {
+    for (comment, query, lowered) in &comments {
         let rows = logged
             .get(comment)
             .unwrap_or_else(|| panic!("{query}: no statement logged"));
@@ -12398,6 +12402,22 @@ async fn a_brace_pattern_answers_on_every_database_route() {
             rows.iter().any(|r| r.query.contains("extractGroups")),
             "{query}: the database ran the regexp: {rows:#?}"
         );
+        // The count not forced onto today's route ran the lowered range
+        // statement, the brace pattern in its group key, and nothing after
+        // it: a decline to today's route would answer the same.
+        if let Some(extract) = lowered {
+            assert!(
+                rows.iter().any(|r| is_lowered_624(&r.query)
+                    && r.query.contains(extract.as_str())
+                    && r.query.contains("matched, caps")
+                    && r.exception_code == 0),
+                "{query}: the lowered statement with `{extract}` in its group key: {rows:#?}"
+            );
+            assert!(
+                !rows.iter().any(|r| is_todays_624(&r.query)),
+                "{query}: no fallback to today's route: {rows:#?}"
+            );
+        }
     }
     drop_db_624(&admin, &db).await;
 }
