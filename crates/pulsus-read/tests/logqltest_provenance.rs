@@ -2391,7 +2391,11 @@ const PREDICATE_ITEMS: &[&str] = &[
     "pub fn index_neq_branch(key: &str, value: &str) -> CheckedFragment",
     "pub fn index_nre_branch(key: &str, pattern: &str) -> Result<CheckedFragment, PipelineError>",
     "pub fn line_filter(lf: &LineFilter) -> Result<CheckedFragment, PipelineError>",
-    "pub fn regexp_captures_column(patterns: &[String]) -> Result<CheckedFragment, PipelineError>",
+    "pub fn regexp_captures_column(patterns: &[super::pipeline::RxSource]) -> Result<CheckedFragment, PipelineError>",
+    "pub fn regexp_captures_column_skipping(patterns: &[super::pipeline::RxSource], skipped: &[bool]) -> Result<CheckedFragment, PipelineError>",
+    "pub fn pattern_captures(pattern: &str) -> Result<CheckedFragment, PipelineError>",
+    "pub fn pattern_captures(pattern: &str) -> Result<CheckedFragment, PipelineError> :: use super::pipeline::PatternTok",
+    "pub fn pattern_group_columns(pattern: &str, indexes: &[usize]) -> Result<RegexpGroupColumns, PipelineError>",
     "#[derive(Debug, Clone, PartialEq, Eq)]",
     "pub struct RegexpGroupColumns",
     "pub struct RegexpGroupColumns :: pub extract: CheckedFragment,",
@@ -2598,8 +2602,13 @@ const PREDICATE_ITEMS: &[&str] = &[
 /// `regexp_captures_column`, the `rx` column a raw read sends for the
 /// `regexp` stages the database runs. Its sibling `regexp_group_columns`
 /// returns its two fragments inside `RegexpGroupColumns`, so its own
-/// signature names none and the shape does not count it.
-const MINT_COUNT: usize = 22;
+/// signature names none and the shape does not count it. **24 at issue
+/// #624, part 3c**: `regexp_captures_column_skipping`, the same column with
+/// an empty array for a `pattern` element no stage extracts from, and
+/// `pattern_captures`, the reference's pattern matcher as one `arrayFold`.
+/// `pattern_group_columns` returns `RegexpGroupColumns`, as
+/// `regexp_group_columns` does, and is not counted.
+const MINT_COUNT: usize = 24;
 
 /// Attributes permitted anywhere in `predicate.rs`.
 const PREDICATE_ATTRIBUTES: &[&str] = &[

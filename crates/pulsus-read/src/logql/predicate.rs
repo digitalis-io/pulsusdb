@@ -530,16 +530,136 @@ pub fn line_filter(lf: &LineFilter) -> Result<CheckedFragment, PipelineError> {
 /// database reads it (`ch_regex_capture_checked`).
 ///
 /// `[extractGroups(body, '<p1>'), extractGroups(body, '<p2>')]`
-pub fn regexp_captures_column(patterns: &[String]) -> Result<CheckedFragment, PipelineError> {
+pub fn regexp_captures_column(
+    patterns: &[super::pipeline::RxSource],
+) -> Result<CheckedFragment, PipelineError> {
+    regexp_captures_column_skipping(patterns, &[])
+}
+
+/// [`regexp_captures_column`] with the `pattern` elements whose index is
+/// `true` in `skipped` rendered `CAST([], 'Array(String)')` (issue #624,
+/// part 3c, D7): every stage that reads such an element runs under the
+/// no-label hints and extracts nothing, so the database runs no pattern for
+/// it and sends one empty array per row. The element keeps its index, so
+/// the other stages' slots are unchanged.
+pub fn regexp_captures_column_skipping(
+    patterns: &[super::pipeline::RxSource],
+    skipped: &[bool],
+) -> Result<CheckedFragment, PipelineError> {
     let mut parts: Vec<String> = Vec::with_capacity(patterns.len());
-    for p in patterns {
-        parts.push(format!(
-            "extractGroups(body, {})",
-            ch_regex_capture_checked(p)?
-        ));
+    for (i, p) in patterns.iter().enumerate() {
+        if matches!(p, super::pipeline::RxSource::Pattern(_))
+            && skipped.get(i).copied().unwrap_or(false)
+        {
+            parts.push("CAST([], 'Array(String)')".to_string());
+            continue;
+        }
+        parts.push(match p {
+            super::pipeline::RxSource::Regexp(p) => {
+                format!("extractGroups(body, {})", ch_regex_capture_checked(p)?)
+            }
+            super::pipeline::RxSource::Pattern(p) => pattern_captures(p)?.sql,
+        });
     }
     Ok(CheckedFragment {
         sql: format!("[{}]", parts.join(", ")),
+    })
+}
+
+/// The named captures the reference's pattern matcher sets over `body`
+/// (issue #624, part 3c, D2), as `Array(String)`, in order: one
+/// `arrayFold` over the steps after the leading literal, its accumulator
+/// `(offset, captures)`, offset 0 once the walk has ended. A step is
+/// `(literal, kind)`: kind 0 an unnamed capture before the literal, 1 a
+/// named one, 2 a named trailing capture, 3 an unnamed trailing one. Each
+/// literal is found from the offset with `position`; a missing literal ends
+/// the walk, a named capture before it taking the rest of the line
+/// (`pkg/logql/log/pattern/pattern.go`, `Matcher.Matches`).
+///
+/// ```text
+/// arrayFold((acc, l, k) -> if(acc.1 = 0, acc, multiIf(
+///     k >= 2, (0, if(k = 2, arrayPushBack(acc.2, substring(body, acc.1)), acc.2)),
+///     position(body, l, acc.1) > 0, (position(body, l, acc.1) + length(l),
+///         if(k = 1, arrayPushBack(acc.2, substring(body, acc.1, position(body, l, acc.1) - acc.1)), acc.2)),
+///     (0, if(k = 1, arrayPushBack(acc.2, substring(body, acc.1)), acc.2)))),
+///   [<literals>], [<kinds>], (toUInt64(<start>), CAST([], 'Array(String)'))).2
+/// ```
+///
+/// `<start>` is `if(length(body) > 0, 1, 0)`, or with a leading literal
+/// `if(length(body) > 0 AND startsWith(body, '<lit>'), <1 + its bytes>, 0)`.
+/// A chain of `position()` aliases is not used: the analyzer expands each
+/// alias where it is read, and a pattern of eight captures exceeds its
+/// 500,000-node query tree.
+pub fn pattern_captures(pattern: &str) -> Result<CheckedFragment, PipelineError> {
+    use super::pipeline::PatternTok;
+    let tokens = super::pattern_expr::parse_pattern(pattern).map_err(|err| {
+        PipelineError::BadParserExpr(format!("pattern {pattern:?}: {}", err.message()))
+    })?;
+    let mut rest: &[PatternTok] = &tokens;
+    let start = match rest.first() {
+        Some(PatternTok::Literal(lit)) => {
+            rest = &rest[1..];
+            format!(
+                "if(length(body) > 0 AND startsWith(body, {}), {}, 0)",
+                ch_string(lit),
+                1 + lit.len()
+            )
+        }
+        _ => "if(length(body) > 0, 1, 0)".to_string(),
+    };
+    let mut lits: Vec<String> = Vec::new();
+    let mut kinds: Vec<&str> = Vec::new();
+    while let Some(capture) = rest.first() {
+        let named = matches!(capture, PatternTok::Capture(_));
+        match rest.get(1) {
+            Some(PatternTok::Literal(lit)) => {
+                lits.push(ch_string(lit));
+                kinds.push(if named { "1" } else { "0" });
+                rest = &rest[2..];
+            }
+            _ => {
+                lits.push(ch_string(""));
+                kinds.push(if named { "2" } else { "3" });
+                rest = &[];
+            }
+        }
+    }
+    Ok(CheckedFragment {
+        sql: format!(
+            "arrayFold((acc, l, k) -> if(acc.1 = 0, acc, multiIf(\
+             k >= 2, (0, if(k = 2, arrayPushBack(acc.2, substring(body, acc.1)), acc.2)), \
+             position(body, l, acc.1) > 0, (position(body, l, acc.1) + length(l), \
+             if(k = 1, arrayPushBack(acc.2, substring(body, acc.1, position(body, l, acc.1) - acc.1)), acc.2)), \
+             (0, if(k = 1, arrayPushBack(acc.2, substring(body, acc.1)), acc.2)))), \
+             [{}], [{}], (toUInt64({start}), CAST([], 'Array(String)'))).2",
+            lits.join(", "),
+            kinds.join(", ")
+        ),
+    })
+}
+
+/// [`RegexpGroupColumns`] for a `pattern` stage (issue #624, part 3c, D2):
+/// `extract` is [`pattern_captures`]; `caps` the sent captures among those
+/// the line set, in order — a prefix, since a line sets a prefix.
+pub fn pattern_group_columns(
+    pattern: &str,
+    indexes: &[usize],
+) -> Result<RegexpGroupColumns, PipelineError> {
+    let extract = pattern_captures(pattern)?;
+    let caps = if indexes.is_empty() {
+        "CAST([], 'Array(String)')".to_string()
+    } else {
+        let picks: Vec<String> = indexes.iter().map(|i| format!("g[{i}]")).collect();
+        let at: Vec<String> = indexes.iter().map(|i| i.to_string()).collect();
+        format!(
+            "if(matched = 1, arraySlice([{}], 1, arrayCount(i -> i <= length(g), [{}])), CAST([], 'Array(String)'))",
+            picks.join(", "),
+            at.join(", ")
+        )
+    };
+    Ok(RegexpGroupColumns {
+        extract,
+        caps: CheckedFragment { sql: caps },
     })
 }
 

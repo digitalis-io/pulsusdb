@@ -2456,7 +2456,7 @@ impl LogQlEngine {
         // Issue #227: a range query reads in physical-key order
         // (`optimize_read_in_order`, no server sort) for the streaming slide;
         // an instant query keeps the total-timestamp order its reducers pin.
-        let rx = rx_column(compiled)?;
+        let rx = rx_column_for(compiled, client_needs_no_labels(mp, client))?;
         let sql = client_metric_read_sql(
             mp,
             services,
@@ -2656,8 +2656,9 @@ impl LogQlEngine {
         let rx = if arena.rx_patterns().is_empty() {
             None
         } else {
-            Some(super::predicate::regexp_captures_column(
+            Some(super::predicate::regexp_captures_column_skipping(
                 arena.rx_patterns(),
+                &arena.rx_skipped(variants),
             )?)
         };
         let sql = client_metric_read_sql(
@@ -2908,7 +2909,18 @@ impl LogQlEngine {
                 }
                 (None, None) => unreachable!("one of the two conditions above holds"),
             };
-            let rx = rx_column(&CompiledPipeline::compile(pipeline)?)?;
+            let restored = match (&mp.client, &mp.metadata_lowering) {
+                (Some(client), _) => client,
+                (None, Some(m)) => m
+                    .client_without_lowering
+                    .as_ref()
+                    .expect("the restored aggregation"),
+                (None, None) => unreachable!("one of the two conditions above holds"),
+            };
+            let rx = rx_column_for(
+                &CompiledPipeline::compile(pipeline)?,
+                client_needs_no_labels(mp, restored),
+            )?;
             client_metric_read_sql(
                 mp,
                 &services,
@@ -2974,9 +2986,12 @@ impl LogQlEngine {
                             &fingerprints,
                             window,
                             &lowered.predicates,
-                            rx_column(&CompiledPipeline::compile(
-                                &bucketed_fallback_client_agg(mp).pipeline,
-                            )?)?
+                            rx_column_for(
+                                &CompiledPipeline::compile(
+                                    &bucketed_fallback_client_agg(mp).pipeline,
+                                )?,
+                                client_needs_no_labels(mp, &bucketed_fallback_client_agg(mp)),
+                            )?
                             .as_ref(),
                         ),
                     }
@@ -6234,12 +6249,36 @@ impl<B: ChRow, T: ChRow + Into<B>> Stream for RxRows<'_, B, T> {
 /// The `rx` column for `compiled`'s database `regexp` stages (issue #624,
 /// part 3a, D6), or `None` when it has none.
 fn rx_column(compiled: &CompiledPipeline) -> Result<Option<CheckedFragment>, ReadError> {
+    rx_column_for(compiled, false)
+}
+
+/// [`rx_column`] for a metric read (issue #624, part 3c, D7): when the
+/// range step's hints say the query needs no labels every `pattern` stage
+/// extracts nothing, so its element is an empty array.
+fn rx_column_for(
+    compiled: &CompiledPipeline,
+    no_labels: bool,
+) -> Result<Option<CheckedFragment>, ReadError> {
     if compiled.rx_patterns().is_empty() {
         return Ok(None);
     }
-    Ok(Some(super::predicate::regexp_captures_column(
+    let skipped = vec![no_labels; compiled.rx_patterns().len()];
+    Ok(Some(super::predicate::regexp_captures_column_skipping(
         compiled.rx_patterns(),
+        &skipped,
     )?))
+}
+
+/// Whether `client`'s range step needs no labels (issue #624, part 3c, D7).
+fn client_needs_no_labels(mp: &MetricPlan, client: &ClientAgg) -> bool {
+    super::plan::range_step_rules(
+        client.range_op,
+        &client.pipeline,
+        client.grouping.as_deref(),
+        &mp.vector_aggs,
+    )
+    .hints
+    .no_labels
 }
 
 fn bucketed_range_sql(
@@ -6263,8 +6302,15 @@ fn bucketed_range_sql(
     let regexp = match &mp.value {
         super::sql::MetricValue::Staged(s) => s.regexp.as_ref().map(|r| {
             let indexes: Vec<usize> = r.groups.iter().map(|(_, i)| *i).collect();
-            super::predicate::regexp_group_columns(&r.pattern, &indexes)
-                .expect("the planner rendered this pattern (issue #624, part 3a)")
+            match r.parser {
+                super::sql::CaptureParser::Regexp => {
+                    super::predicate::regexp_group_columns(&r.pattern, &indexes)
+                }
+                super::sql::CaptureParser::Pattern => {
+                    super::predicate::pattern_group_columns(&r.pattern, &indexes)
+                }
+            }
+            .expect("the planner rendered this pattern (issue #624, parts 3a and 3c)")
         }),
         _ => None,
     };

@@ -1126,7 +1126,7 @@ Before this issue the runner compiled a query's pipeline with
 pipeline's line filters in two — a filter that precedes the first
 line-REWRITING stage and carries no `ip(…)` alternative is rendered into
 stage-3 SQL by `plan::compile_line_filters`, and `compile` then returns
-`Ok(None)` for exactly those (`pipeline.rs:1017-1022`) so the engine does
+`Ok(None)` for exactly those (`pipeline.rs:1032-1037`) so the engine does
 not evaluate them twice. The runner executes no SQL, so those filters
 were **not applied at all**: a row `{x="y"} |= "foo"` returned every
 loaded line and passed, because its expectation had been captured through

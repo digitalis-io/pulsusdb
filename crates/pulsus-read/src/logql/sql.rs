@@ -378,6 +378,16 @@ pub fn json_count_columns(
 pub struct RegexpCount {
     pub pattern: String,
     pub groups: Vec<(String, usize)>,
+    /// Issue #624, part 3c: the stage is a `| pattern`, whose groups are
+    /// its named captures, `(name, 1-based ordinal among them)`.
+    pub parser: CaptureParser,
+}
+
+/// Which parser a [`RegexpCount`] lowers (issue #624, parts 3a and 3c).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureParser {
+    Regexp,
+    Pattern,
 }
 
 /// [`MetricValue::Unwrapped`]'s payload: the extracted-field group key
@@ -4472,9 +4482,15 @@ mod tests {
     fn the_regexp_column_is_added_only_when_asked() {
         use crate::logql::predicate::regexp_captures_column;
         let f = W0Fixtures::new();
-        let one = regexp_captures_column(&[r"(?P<a>x)".to_string()]).expect("renders");
-        let two = regexp_captures_column(&[r"(?P<a>x)".to_string(), r"(?P<b>[0-9]+)".to_string()])
-            .expect("renders");
+        let one = regexp_captures_column(&[super::super::pipeline::RxSource::Regexp(
+            r"(?P<a>x)".to_string(),
+        )])
+        .expect("renders");
+        let two = regexp_captures_column(&[
+            super::super::pipeline::RxSource::Regexp(r"(?P<a>x)".to_string()),
+            super::super::pipeline::RxSource::Regexp(r"(?P<b>[0-9]+)".to_string()),
+        ])
+        .expect("renders");
         assert_eq!(one.as_sql(), r"[extractGroups(body, '(?P<a>x)')]");
         assert_eq!(
             two.as_sql(),
