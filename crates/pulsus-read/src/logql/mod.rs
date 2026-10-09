@@ -202,7 +202,8 @@ pub use params::{
 };
 pub use pipeline::{
     CompiledPipeline, EntryOut, LabelCategory, MAX_JSON_FLATTEN_KEY_BYTES, MetricRun,
-    PipelineError, RangeGrouping, RowBudget, RowBudgetExceeded, SAMPLE_EXTRACTION_ERROR,
+    PipelineError, RangeGrouping, RegexpCaptures, RowBudget, RowBudgetExceeded,
+    SAMPLE_EXTRACTION_ERROR,
 };
 pub use walkbound::{
     MAX_LOGQL_WALK_TRANSIENT_BYTES, REFERENCE_MAX_QUERY_BYTES, admit_logql_walk,

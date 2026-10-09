@@ -27,7 +27,9 @@
 //!
 //! ```text
 //!   1  fp_list                        logql/sql.rs        private, reached through stage2
-//!   2  stage3_keyset                  logql/sql.rs        the keyset tuple's middle term
+//!   2  stage3_keyset_with_rx          logql/sql.rs        the keyset tuple's middle term;
+//!                                                           `stage3_keyset` is it without
+//!                                                           the `rx` column (issue #624)
 //!   3  fingerprint_test               logql/predicate.rs  private, reached through
 //!                                                           metadata_string_filter
 //!   4  render_fingerprint_list        metrics/sample_sql.rs
@@ -115,7 +117,7 @@ fn site_1_fp_list_renders_the_exact_call_form() {
 #[test]
 fn site_2_stage3_keyset_renders_the_exact_call_form_in_its_tuple() {
     for value in BOUNDARY {
-        let sql = sql::stage3_keyset(
+        let sql = sql::stage3_keyset_with_rx(
             "log_samples",
             &[predicate::literal("checkout")],
             &literals(),
@@ -131,6 +133,7 @@ fn site_2_stage3_keyset_renders_the_exact_call_form_in_its_tuple() {
             Direction::Forward,
             &[],
             100,
+            None,
         );
         assert!(
             sql.contains(&format!(

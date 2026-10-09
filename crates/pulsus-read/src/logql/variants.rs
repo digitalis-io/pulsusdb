@@ -464,6 +464,9 @@ pub struct VariantArena {
     pipelines: Vec<CompiledPipeline>,
     slot: Vec<usize>,
     charged: u64,
+    /// The `regexp` patterns the database runs for every pipeline here
+    /// (issue #624, part 3a): the statement's `rx` column, in this order.
+    rx: Vec<String>,
 }
 
 impl VariantArena {
@@ -509,6 +512,11 @@ impl VariantArena {
         let mut pipelines: Vec<CompiledPipeline> = Vec::with_capacity(variants.len() + 1);
         let mut slot: Vec<usize> = Vec::with_capacity(variants.len());
         pipelines.push(CompiledPipeline::compile(common)?);
+        // Issue #624, part 3a (D6): one registry of the `regexp` patterns the
+        // database runs, through the common pipeline and then every distinct
+        // tail in index order, so the one statement's `rx` column serves
+        // every pipeline here.
+        let mut rx = pipelines[0].take_rx_patterns();
         for (i, spec) in variants.iter().enumerate() {
             let tail = &spec.client().pipeline;
             if tail.is_empty() {
@@ -535,7 +543,7 @@ impl VariantArena {
                 cap,
             )
             .map_err(variant_state_breach)?;
-            let extended = pipelines[0].extended_with(tail)?;
+            let extended = pipelines[0].extended_with(tail, &mut rx)?;
             pipelines.push(extended);
             slot.push(pipelines.len() - 1);
         }
@@ -543,6 +551,7 @@ impl VariantArena {
             pipelines,
             slot,
             charged,
+            rx,
         })
     }
 
@@ -550,6 +559,12 @@ impl VariantArena {
     /// tail`, shared for empty/duplicate tails).
     fn get(&self, variant_index: usize) -> &CompiledPipeline {
         &self.pipelines[self.slot.get(variant_index).copied().unwrap_or(0)]
+    }
+
+    /// The `regexp` patterns the one statement runs for every pipeline of
+    /// the arena (issue #624, part 3a, D6).
+    pub fn rx_patterns(&self) -> &[String] {
+        &self.rx
     }
 
     pub fn charged_bytes(&self) -> u64 {
@@ -1404,6 +1419,7 @@ mod tests {
             pipelines,        // C — with_capacity(n + 1)
             slot,             // C — with_capacity(n)
             charged: a_bytes, // S
+            rx: _rx,          // H — the query's own regexp patterns (issue #624)
         } = arena;
         assert_eq!(pipelines.capacity(), 4);
         assert_eq!(slot.capacity(), 3);
@@ -1482,6 +1498,7 @@ mod tests {
                 timestamp_ns: (i as i64 + 1) * 100 * 1_000_000,
                 body: format!("id={i}"),
                 structured_metadata: String::new(),
+                rx: Vec::new(),
             })
             .collect()
     }
@@ -1728,5 +1745,62 @@ mod tests {
             QueryResult::Vector(items) => assert!(items.is_empty(), "every variant was removed"),
             other => panic!("expected an empty vector, got {other:?}"),
         }
+    }
+
+    /// **T17 (b) (issue #624, part 3a, D6): a variant whose tail's `regexp`
+    /// the database runs reads the row's `rx` column**; a variant that
+    /// rewrites the line first runs its own regex over the rewritten line,
+    /// reading as the database does (D7).
+    #[test]
+    fn supplied_captures_are_used_not_recomputed() {
+        let query = r#"variants(sum by (w) (count_over_time({s="u"} | regexp "(?P<w>\\w+)" [1m])), sum by (v) (count_over_time({s="u"} | line_format "z{{__line__}}" | regexp "(?P<v>\\w+)" [1m]))) of ({s="u"} [1m])"#;
+        let (scan, variants, _) = variants_fixture(
+            query,
+            QuerySpec::Range {
+                start_ns: 60 * VSEC,
+                end_ns: 60 * VSEC,
+                step_ns: 60 * VSEC as u64,
+            },
+        );
+        let common = scan.client.expect("client scan").pipeline;
+        let rows = vec![MetricScanRow {
+            fingerprint: Fingerprint::from_raw(1),
+            timestamp_ns: 30 * VSEC,
+            body: "café 12".to_string(),
+            structured_metadata: String::new(),
+            rx: vec![vec!["SUPPLIED".to_string()]],
+        }];
+        let mut meta = HashMap::new();
+        meta.insert(
+            Fingerprint::from_raw(1),
+            StreamMetaRow {
+                fingerprint: Fingerprint::from_raw(1),
+                service: "u".to_string(),
+                labels: r#"{"s":"u"}"#.to_string(),
+            },
+        );
+        let mut warnings = Warnings::new();
+        let out =
+            run_variants_rows(&rows, &meta, &common, &variants, &mut warnings).expect("answers");
+        let QueryResult::Matrix(series) = out else {
+            panic!("a matrix: {out:?}");
+        };
+        let mut labels: Vec<Vec<(String, String)>> = series
+            .into_iter()
+            .map(|s| {
+                let mut l = s.labels;
+                l.sort();
+                l
+            })
+            .collect();
+        labels.sort();
+        let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
+        assert_eq!(
+            labels,
+            vec![
+                vec![pair(VARIANT_LABEL, "0"), pair("w", "SUPPLIED")],
+                vec![pair(VARIANT_LABEL, "1"), pair("v", "zcaf")],
+            ]
+        );
     }
 }

@@ -1048,7 +1048,7 @@ fn collect_variant_pipelines(node: &MetricNode, out: &mut Vec<Vec<pulsus_logql::
 // The rule PulsusDB shipped at `5d91ef1`, replayed.
 // ---------------------------------------------------------------------
 
-/// `parse_json_path` as it stood at `5d91ef1` (`pipeline.rs:2576-2629`),
+/// `parse_json_path` as it stood at `5d91ef1` (`pipeline.rs:2812-2865`),
 /// reproduced verbatim apart from returning a [`Verdict`].
 ///
 /// This is the baseline freeze: not a committed scoreboard file (LogQL

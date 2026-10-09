@@ -205,6 +205,7 @@ pub(in crate::logql) type LabelScratch<'a> = Vec<(Cow<'a, str>, Cow<'a, str>)>;
 pub(in crate::logql) fn eval_structured_metadata_row<'a>(
     compiled: &'a super::pipeline::CompiledPipeline,
     body: &'a str,
+    rx: &'a [Vec<String>],
     merged: &'a [(String, String)],
     sm: &'a StructuredMetadataCtx,
     label_groups: &mut HashMap<String, FanOutGroup>,
@@ -214,13 +215,23 @@ pub(in crate::logql) fn eval_structured_metadata_row<'a>(
     mut scratch: LabelScratch<'a>,
     mut cat_scratch: Option<&mut Vec<LabelCategory>>,
 ) -> (bool, Result<LabelScratch<'a>, ReadError>) {
+    // Issue #624, part 3a (D6): the `regexp` captures the database ran.
+    let captures = super::pipeline::RegexpCaptures::Rows(rx);
     let run = match cat_scratch.as_deref_mut() {
-        None => compiled.run_into_with_sm(body, merged, timestamp_ns, sm, &mut scratch),
-        Some(cats) => compiled.run_into_with_sm_categorized(
+        None => compiled.run_into_with_sm_captured(
             body,
             merged,
             timestamp_ns,
             sm,
+            captures,
+            &mut scratch,
+        ),
+        Some(cats) => compiled.run_into_with_sm_categorized_captured(
+            body,
+            merged,
+            timestamp_ns,
+            sm,
+            captures,
             &mut scratch,
             cats,
         ),
@@ -384,11 +395,13 @@ impl DetectedRowFeeder {
     /// An `Err` is the #230 template render-budget breach — the whole
     /// query fails, exactly as before.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::logql) fn feed_row(
         &mut self,
         fingerprint: Fingerprint,
         timestamp_ns: i64,
         body: &str,
+        rx: &[Vec<String>],
         structured_metadata: &str,
         base_labels: &HashMap<Fingerprint, Vec<(String, String)>>,
         compiled: &super::pipeline::CompiledPipeline,
@@ -431,6 +444,7 @@ impl DetectedRowFeeder {
             let (survived, used) = observe_detected_row(
                 compiled,
                 body,
+                rx,
                 run_base,
                 timestamp_ns,
                 sm,
@@ -478,6 +492,7 @@ impl DetectedRowFeeder {
 fn observe_detected_row<'a>(
     compiled: &'a super::pipeline::CompiledPipeline,
     body: &'a str,
+    rx: &'a [Vec<String>],
     run_base: &'a [(String, String)],
     ts_ns: i64,
     sm: &'a StructuredMetadataCtx,
@@ -486,7 +501,15 @@ fn observe_detected_row<'a>(
     scratch: LabelScratch<'static>,
 ) -> (bool, Result<LabelScratch<'static>, ReadError>) {
     let mut scratch: LabelScratch<'a> = scratch; // 'static -> 'a by covariance
-    let line = match compiled.run_into_with_sm(body, run_base, ts_ns, sm, &mut scratch) {
+    // Issue #624, part 3a (D6): the `regexp` captures the database ran.
+    let line = match compiled.run_into_with_sm_captured(
+        body,
+        run_base,
+        ts_ns,
+        sm,
+        super::pipeline::RegexpCaptures::Rows(rx),
+        &mut scratch,
+    ) {
         Ok(Some(line)) => line,
         Ok(None) => {
             scratch.clear();
@@ -775,6 +798,7 @@ impl DetectedPagedState {
                 row.fingerprint,
                 row.timestamp_ns,
                 &row.body,
+                &row.rx,
                 &row.structured_metadata,
                 base_labels,
                 compiled,
@@ -909,6 +933,7 @@ impl DetectedFieldsProbe {
             fingerprint,
             timestamp_ns,
             body,
+            &[],
             structured_metadata,
             &self.base_labels,
             compiled,
@@ -1249,6 +1274,7 @@ mod tests {
                 row.fingerprint,
                 row.timestamp_ns,
                 &row.body,
+                &row.rx,
                 &row.structured_metadata,
                 base_labels,
                 compiled,
@@ -1282,18 +1308,21 @@ mod tests {
                 timestamp_ns: 3,
                 body: r#"{"level":"common","code":1}"#.to_string(),
                 structured_metadata: String::new(),
+                rx: Vec::new(),
             },
             SampleRow {
                 fingerprint: Fingerprint::from_raw(1),
                 timestamp_ns: 2,
                 body: "not json at all".to_string(),
                 structured_metadata: String::new(),
+                rx: Vec::new(),
             },
             SampleRow {
                 fingerprint: Fingerprint::from_raw(1),
                 timestamp_ns: 1,
                 body: r#"{"level":"rare","code":7}"#.to_string(),
                 structured_metadata: String::new(),
+                rx: Vec::new(),
             },
         ];
         let mut acc = super::super::detected::FieldAccumulator::new(1000);
@@ -1337,6 +1366,7 @@ mod tests {
                 timestamp_ns: i,
                 body: format!(r#"{{"seq":"{i}"}}"#),
                 structured_metadata: String::new(),
+                rx: Vec::new(),
             })
             .collect();
         let mut acc = super::super::detected::FieldAccumulator::new(1000);
@@ -1381,6 +1411,7 @@ mod tests {
             body: format!(r#"{{"f{i}":{i}}}"#),
             body_hash: 0x9000 + i,
             structured_metadata: String::new(),
+            rx: Vec::new(),
         }
     }
 
@@ -1633,6 +1664,7 @@ mod tests {
                         body: format!("b{i}"),
                         body_hash: h,
                         structured_metadata: String::new(),
+                        rx: Vec::new(),
                     }
                 })
                 .collect();
@@ -1696,6 +1728,7 @@ mod tests {
                 Fingerprint::from_raw(1),
                 1,
                 "body",
+                &[],
                 &sm,
                 &base_labels,
                 &compiled,
@@ -1741,6 +1774,7 @@ mod tests {
                 Fingerprint::from_raw(999),
                 1,
                 "body",
+                &[],
                 "",
                 &base_labels,
                 &compiled,
@@ -1971,12 +2005,14 @@ mod tests {
                 timestamp_ns: 1,
                 body: "a=Hello b=World".to_string(),
                 structured_metadata: r#"{"__error__":"boom"}"#.to_string(),
+                rx: Vec::new(),
             },
             SampleRow {
                 fingerprint: Fingerprint::from_raw(2),
                 timestamp_ns: 2,
                 body: "a=Hello b=World".to_string(),
                 structured_metadata: r#"{"__error_details__":"bdet"}"#.to_string(),
+                rx: Vec::new(),
             },
         ];
         let mut budget = StreamsResultBudget::new();

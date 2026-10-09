@@ -689,6 +689,7 @@ fn level_rows(n: u64) -> Vec<Result<TailSampleRow, ReadError>> {
                 body: format!(r#"{{"level":"v{i}"}}"#),
                 body_hash: i,
                 structured_metadata: String::new(),
+                rx: Vec::new(),
             })
         })
         .collect()
@@ -818,6 +819,7 @@ fn case_e_sampled_rows_are_streamed_one_row_live() {
                 body: "z".repeat(65_536),
                 body_hash: i,
                 structured_metadata: String::new(),
+                rx: Vec::new(),
             })
         });
         let mut stream = futures::stream::iter(rows);
@@ -1062,9 +1064,9 @@ fn flat_json_body(k: usize) -> String {
 /// separated: 28 671 B at `K_SHAPE`). Shape (iv)'s body — logfmt is the
 /// only auto-parse format where the owned-copy delta 13(b) floors
 /// literally exists, because logfmt captures are `Cow::Borrowed` slices
-/// of the line (`pipeline.rs:2749` under the `Cow::Borrowed` arm at
+/// of the line (`pipeline.rs:3019` under the `Cow::Borrowed` arm at
 /// `:1044`), so the legacy `into_owned()` genuinely COPIES; a JSON body's
-/// captures are already `Cow::Owned` (`pipeline.rs:2622`) and
+/// captures are already `Cow::Owned` (`pipeline.rs:2858`) and
 /// `into_owned()` is a move.
 fn logfmt_body(k: usize) -> String {
     let mut s = String::with_capacity(k * 14);
@@ -1093,7 +1095,7 @@ fn push_one_static_pair(out: &mut Vec<(Cow<'static, str>, Cow<'static, str>)>) {
 /// libstd growth-rule change moves the control and the gate together
 /// instead of reddening one of them. Both `Cow`s are `Borrowed(&'static
 /// str)`, exactly as the out-of-band error pair is
-/// (`pipeline.rs:2613-2614`), so no string bytes enter the measurement.
+/// (`pipeline.rs:2849-2850`), so no string bytes enter the measurement.
 ///
 /// `Vec::new()` plus a push through a `&mut` callee is the whole point,
 /// and it is NOT interchangeable with the `vec![…]` macro that
@@ -1223,7 +1225,7 @@ fn ac13_shape_ii_json_with_wide_sm_is_not_worse_at_helper_granularity() {
 /// path). Derived before measurement, from the code:
 ///
 /// * the `| json` attempt FAILS, and a failed json parse writes the
-///   out-of-band pair (`pipeline.rs:2613-2614`,
+///   out-of-band pair (`pipeline.rs:2849-2850`,
 ///   `Cow::Borrowed("JSONParserErr")` + `Cow::Borrowed(JSON_ERROR_DETAILS)`),
 ///   which `ErrorSlots::merge_into` (`pipeline.rs:222-232`) sets into the
 ///   legacy helper's fresh `Vec::new()` (`detected.rs:431`) on the kept
@@ -1295,7 +1297,7 @@ fn ac13_shape_iii_non_parseable_body_costs_the_legacy_one_error_spine() {
 /// spine `98 304` + `pairs` copies `24 576` = `245 760` legacy-only, on
 /// top of the shared `R 28 673` + the `| logfmt` stage's copies `24 576`
 /// (the rewritten line is `Cow::Owned`, so `to_cow` copies,
-/// `pipeline.rs:1053-1059`) — so `peak_legacy = 299 009`, and
+/// `pipeline.rs:1086-1092`) — so `peak_legacy = 299 009`, and
 /// `peak_new <= 3R + 24 576 = 110 595`, giving `Δ >= 188 414 >=
 /// LEGACY_DELTA_FLOOR 98 304`.
 ///
@@ -1566,7 +1568,7 @@ const EXPECTED_CENSUS: [(FrameKey, &str); 16] = [
     (("detected_probe.rs", Some("DetectedRowFeeder"), "trim"),
      ".capacityx2 .clearx2 newx2 trim_strx2 trim_vecx3"),
     (("detected_probe.rs", None, "observe_detected_row"),
-     ".anyx1 .as_refx4 .as_strx1 .clearx3 .intox1 .iterx3 .observe_pairx2 .run_into_with_smx1 Errx1 Okx1 auto_parse_observex1 parse_canonical_labels_intox1 recycle_label_scratchx2"),
+     ".anyx1 .as_refx4 .as_strx1 .clearx3 .intox1 .iterx3 .observe_pairx2 .run_into_with_sm_capturedx1 Errx1 Okx1 Rowsx1 auto_parse_observex1 parse_canonical_labels_intox1 recycle_label_scratchx2"),
     (("detected_probe.rs", None, "auto_parse_observe"),
      ".as_refx2 .clearx1 .enumeratex1 .getx1 .intox1 .iterx1 .observe_pairx1 Errx1 Okx1 auto_parse_intox1 defaultx1 recycle_label_scratchx1"),
     // Issue #463 moved the upsert from `.find` to `.position`: the INDEX

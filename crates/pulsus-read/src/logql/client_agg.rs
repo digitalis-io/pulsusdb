@@ -868,13 +868,16 @@ impl<'q> ClientAggState<'q> {
         let compiled = self.compiled;
         let is_absent = matches!(self.client.range_op, RangeAggOp::AbsentOverTime);
         {
-            let (line, value) = match compiled.run_metric_step_into(
+            let (line, value) = match compiled.run_metric_step_into_with_captures(
                 &row.body,
                 pipeline_base,
                 row.timestamp_ns,
                 sm,
                 self.client.grouping.as_deref(),
                 &self.step_rules,
+                // Issue #624, part 3a (D6): the `regexp` captures the
+                // database ran, when the read sent them.
+                super::pipeline::RegexpCaptures::Rows(&row.rx),
                 scratch,
             )? {
                 MetricRun::Dropped => return Ok(()),
@@ -2323,13 +2326,16 @@ impl<'q> RangeSlideState<'q> {
     {
         let compiled = self.compiled;
         let grouping = self.grouping;
-        let (line, value) = match compiled.run_metric_step_into(
+        let (line, value) = match compiled.run_metric_step_into_with_captures(
             &row.body,
             pipeline_base,
             row.timestamp_ns,
             sm,
             grouping,
             &self.step_rules,
+            // Issue #624, part 3a (D6): the `regexp` captures the database
+            // ran, when the read sent them.
+            super::pipeline::RegexpCaptures::Rows(&row.rx),
             scratch,
         )? {
             MetricRun::Dropped => return Ok(()),
@@ -2587,7 +2593,7 @@ impl<'q> RangeSlideState<'q> {
         // was exposed) — and it is not reachable in production, because
         // `push_rows` breaks its row loop and returns the error and every
         // caller propagates it with `?` without resuming the state
-        // (`exec.rs:1516`, `:1521`, `:1632`, `:1637`; `variants.rs:711`,
+        // (`exec.rs:1516`, `:1521`, `:1632`, `:1637`; `variants.rs:726`,
         // `:724`, `:886-897`). Both of those were checked against the tree,
         // not argued.
         //
@@ -3893,6 +3899,7 @@ mod tests {
             timestamp_ns: 30_000_000_000,
             body: "__preserve_error__=true latency=abc".to_string(),
             structured_metadata: String::new(),
+            rx: Vec::new(),
         }];
         let window = ClientWindow::Instant {
             start_ns: 0,
@@ -3984,6 +3991,7 @@ mod tests {
             timestamp_ns: ts,
             body: body.to_string(),
             structured_metadata: String::new(),
+            rx: Vec::new(),
         }
     }
 
@@ -3995,6 +4003,7 @@ mod tests {
             timestamp_ns: ts,
             body: body.to_string(),
             structured_metadata: sm.to_string(),
+            rx: Vec::new(),
         }
     }
 

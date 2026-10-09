@@ -1525,6 +1525,65 @@ async fn a_staged_range_reads_the_lowered_statement() {
     assert_eq!(usage, expected_metric_instant_raw_usage());
 }
 
+/// T9 (issue #624, part 3a): a `regexp` count reads the sliding statement
+/// with the stage's `extractGroups` one level under its innermost `SELECT`,
+/// under its own routing reason, and the statement prunes exactly as the
+/// clean query's does.
+#[tokio::test]
+async fn a_regexp_count_reads_the_lowered_statement() {
+    skip_unless_live!();
+    let db = &pulsus_testkit::test_db("pulsus_read_it_regexp_range");
+    let ts_ns = now_ns();
+    let client = setup(db, ts_ns).await;
+
+    let panel = metric_plan(
+        r#"topk(10, sum by (proc) (count_over_time({env="prod"} | regexp `(?P<proc>[a-zA-Z0-9_.-]+)\[[0-9]+\]` | proc != "" [5m])))"#,
+        &range_params(ts_ns),
+        db,
+    );
+    assert!(
+        panel.client.is_none(),
+        "the regexp runs in the statement: {:?}",
+        panel.routing
+    );
+    assert_eq!(
+        panel.routing.reason,
+        "raw: range aggregation in the database, regexp captures and label stages over its rows (issue #624)"
+    );
+    let regexp = match &panel.value {
+        sql::MetricValue::Staged(s) => s.regexp.clone().expect("a regexp count"),
+        other => panic!("a staged value, got {other:?}"),
+    };
+    let indexes: Vec<usize> = regexp.groups.iter().map(|(_, i)| *i).collect();
+    let columns = pulsus_read::logql::predicate::regexp_group_columns(&regexp.pattern, &indexes)
+        .expect("renders");
+    let sql = sql::metric_range_sliding_with_regexp(
+        sql::MetricSource::new(
+            &format!("{db}.log_samples"),
+            panel.source_shape().expect("a counting plan"),
+        ),
+        &[literal("checkout")],
+        &[Fingerprint::from_raw(u128::from(FP_PROD)).sql_literal()],
+        sql::SlidingScan {
+            window: TimeWindow {
+                start_ns: panel.start_ns,
+                end_ns: panel.end_ns,
+            },
+            lower: panel.scan_lower,
+            grid_start_ns: panel.grid_start_ns,
+            step_ns: panel.step_ns.expect("a range plan has a step").get(),
+            range_ns: panel.range_ns.get(),
+        },
+        &panel.extra_predicates,
+        Some(&columns),
+    )
+    .expect("a renderable sliding statement");
+    assert!(sql.contains("extractGroups(body, "), "{sql}");
+    assert!(sql.contains("matched, caps"), "{sql}");
+    let usage = explain(&client, &sql).await;
+    assert_eq!(usage, expected_metric_instant_raw_usage());
+}
+
 /// Issue #169 Tier-1 gate: the `/volume` rollup aggregation carries the
 /// identical `(fingerprint IN, bucket_ns > s AND <= e)` predicate family
 /// as the rollup metric reads, so its `EXPLAIN indexes = 1` extract must

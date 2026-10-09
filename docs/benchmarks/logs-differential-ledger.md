@@ -366,9 +366,9 @@ distinct (`Distinct (Preliminary DISTINCT)` in the measured plan), so the
   `/detected_fields`' per-field `cardinality`, and — landed by issue #261,
   no longer a forward reference — `/detected_labels`' per-key
   `cardinality`, `uniqExact(val) AS cardinality` in
-  `crates/pulsus-read/src/logql/sql.rs:624-635`. On the reference both come
+  `crates/pulsus-read/src/logql/sql.rs:637-648`. On the reference both come
   from the same sketch type: `newParsedFields` and `newParsedLabels` each
-  build `hyperloglog.New()` (`pkg/querier/querier.go:934`, `:958` @ `grafana/loki`
+  build `hyperloglog.New()` (`pkg/querier/querier.go:934`, `:1035` @ `grafana/loki`
   v3.7.4 = `b318f2829f0ae2094ab3a1e90780450e9e4b03be`), and
   `countLabelsAndCardinality` (`querier.go:757`) reports the raw
   `v.Estimate()` (`querier.go:799`). Informational note, not a gate
@@ -495,7 +495,7 @@ distinct (`Distinct (Preliminary DISTINCT)` in the measured plan), so the
   at all. `N` is the number of distinct values a stream-label key has
   across the whole month partition(s) the request's window touches,
   narrowed only by the optional `query=`'s `fingerprint IN` filter
-  (`sql::detected_labels`, `crates/pulsus-read/src/logql/sql.rs:624-635`);
+  (`sql::detected_labels`, `crates/pulsus-read/src/logql/sql.rs:637-648`);
   **no request parameter bounds it** — `line_limit` and `limit` do not
   exist on this endpoint, and `start`/`end` select partitions rather
   than rows (the within-month granularity gap is issue #399). The
@@ -4268,8 +4268,8 @@ unexplained.
   version of this correction got wrong by writing "line filter" flat.
   `VariantSpec::try_new` (`plan.rs:2641`) does compile the variant's
   discarded prefix, but `compile_stage` returns `Ok(None)` for a pushable
-  line filter (`pipeline.rs:1115-1120`) before it reaches `compile_regex` at
-  `:1138`; a pushable filter's regex is validated on the SQL-rendering
+  line filter (`pipeline.rs:1149-1154`) before it reaches `compile_regex_as_database` at
+  `:1174`; a pushable filter's regex is validated on the SQL-rendering
   path instead (`logql/escape.rs`'s `_checked` renderers), and a discarded
   prefix renders no SQL. Put the filter after a `line_format` and
   `seen_line_format` clears the pushdown, so the filter IS compiled and
@@ -4301,7 +4301,7 @@ unexplained.
 - **PulsusDB behaviour (the delta): a malformed query is a `400` in every
   window.** Nothing about our rejection depends on the dates asked for:
   `plan()` and `CompiledPipeline::compile` both run before any I/O
-  (`logql/exec.rs:643`, `:937`, `:2460`, `:2746`, `logql/variants.rs:509`,
+  (`logql/exec.rs:644`, `:938`, `:2511`, `:2812`, `logql/variants.rs:512`,
   propagated with `?` and surfaced by `logs_api/error.rs` as a 400), so an
   invalid pipeline cannot reach a "no chunks, return empty" path in the
   first place.
@@ -4368,8 +4368,11 @@ often than they agree about it.
   5-minute window **ending at `now`** — load-bearing, see
   `malformed-query-refused-in-every-window`. PulsusDB: `parse → plan →
   CompiledPipeline::compile`, the compile `exec` runs before any I/O.
-  **226 of the 768 unmasked points disagree**, in the classes below —
-  down from 321 of 720 before #400 Stage 2, which both REMOVED
+  **220 of the 768 unmasked points disagree**, in the classes below —
+  226 before issue #624 part 3a, which compiles a line filter run in
+  process and `| regexp` as the database reads them, so the three brace
+  forms stopped disagreeing at those two positions; 321 of 720 before
+  #400 Stage 2, which both REMOVED
   disagreements (nine patterns at fifteen positions each) and ADDED them
   (two new Class E patterns at sixteen), so the figure is taken from the
   test's own printed line and not from arithmetic on the old one. Every
@@ -4384,7 +4387,7 @@ often than they agree about it.
   | class | patterns | positions | note |
   |---|---|---|---|
   | `engine_dir_a_perl_and_flag_forms` | `\Qa*\E`, `\101`, `a(?i){2}`, `(?ss:ab)`, `(?)a` | 15 | the `re2_pattern_to_rust` rewrite does not change them, so `label_replace` is affected too |
-  | `engine_dir_a_brace_forms` | `a{bbb}c`, `a{,5}`, `a{}` | 14 | `label_replace` excluded — its rewrite escapes the braces. That is #331's deferred partial fix, live at one site out of fourteen |
+  | `engine_dir_a_brace_forms` | `a{bbb}c`, `a{,5}`, `a{}` | 12 | `label_replace` excluded — its rewrite escapes the braces. That is #331's deferred partial fix. Since issue #624 part 3a the line filter after a `line_format` and `\| regexp` are excluded too: they read a pattern as the database does |
   | `engine_dir_a_duplicate_capture_name` | `(?P<n>a)(?P<n>b)` | 14 | **not one of the eighteen classes #400 was filed with** — found by this matrix. The reference's vendored parser has no duplicate-name check (`git grep -n duplicate vendor/github.com/grafana/regexp/ @ v3.7.4` finds only an unrelated comment); the Rust crate refuses it. `regexp_named` excluded: the reference refuses it there for its own reason, `duplicate extracted label name 'n'` (`pkg/logql/log/parser.go:309-311 @ v3.7.4`) |
   | `engine_dir_a_nesting_limit` | 999 nested groups | 7 | a LIMIT, not a construct. The reference's `maxHeight` is 1000 (`vendor/github.com/grafana/regexp/syntax/parse.go:93 @ v3.7.4`) and every site that wraps the pattern in `^(?:…)$` spends part of it, so this rejects on both sides at the anchored positions and only diverges at the unanchored ones |
   | `variants_common_side_hides_the_build_error` | the 14 patterns both sides reject | 1 | **owned by #380**, not #400: the reference swallows a `variants(...)` common-pipeline build error in every window. Deliberate, and the direction the owner ruled for |
@@ -4663,6 +4666,12 @@ often than they agree about it.
   `crates/pulsus-read/tests/logqltest/corpus/b24_string_escapes.test`.
 
 ### `logql-class-algebra-wrong-rows` (issue #400, owner ruling 2026-08-12 — ACCEPTED, deliberately not fixed)
+
+**Narrowed by issue #624 part 3a.** A line filter run in process and
+`| regexp` now compile the pattern rewritten, as the database reads it, so
+the measurement below — taken at a line filter after a rewrite — describes
+the state before that change. The family still reads differently at a
+label filter over a parsed name and at a `drop`/`keep` matcher.
 
 - **What differs.** Eight patterns are accepted by **both** engines and
   read differently by each, so the same filter selects different lines

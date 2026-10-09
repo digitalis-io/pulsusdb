@@ -235,6 +235,19 @@ pub struct StagedCount {
     /// The client aggregation today's route runs for this query: the full
     /// pipeline, the reducer and `absent_over_time`'s labels.
     pub todays_route: super::plan::ClientAgg,
+    /// The pipeline's one `regexp` stage, when the statement runs it (issue
+    /// #624, part 3a): its captures join the group key.
+    pub regexp: Option<RegexpCount>,
+}
+
+/// The `regexp` stage of a lowered count (issue #624, part 3a, D2 and D4):
+/// its pattern as the query wrote it, and the named groups whose captures
+/// the statement sends — `(name, 1-based group index)`, in capture-index
+/// order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegexpCount {
+    pub pattern: String,
+    pub groups: Vec<(String, usize)>,
 }
 
 /// [`MetricValue::Unwrapped`]'s payload: the extracted-field group key
@@ -782,6 +795,41 @@ pub fn stage3(
     direction: Direction,
     limit: u32,
 ) -> String {
+    stage3_with_rx(
+        samples_table,
+        services,
+        fingerprints,
+        window,
+        line_filters,
+        direction,
+        limit,
+        None,
+    )
+}
+
+/// `,\n       <rx> AS rx`, the `rx` column after a raw read's column list
+/// (issue #624, part 3a, D6), or nothing.
+fn rx_projection(rx: Option<&CheckedFragment>) -> String {
+    match rx {
+        Some(rx) => format!(",\n       {} AS rx", rx.as_sql()),
+        None => String::new(),
+    }
+}
+
+/// [`stage3`], with the `rx` column of the `regexp` stages the database
+/// runs (issue #624, part 3a, D6) after the column list. `None` renders
+/// [`stage3`]'s text byte for byte.
+#[allow(clippy::too_many_arguments)]
+pub fn stage3_with_rx(
+    samples_table: &str,
+    services: &[CheckedLiteral],
+    fingerprints: &[FpLiteral],
+    window: TimeWindow,
+    line_filters: &[CheckedFragment],
+    direction: Direction,
+    limit: u32,
+    rx: Option<&CheckedFragment>,
+) -> String {
     let service_pred = service_predicate(services);
     let fp_list = fp_list(fingerprints);
     let order = match direction {
@@ -789,9 +837,10 @@ pub fn stage3(
         Direction::Forward => "ASC",
     };
     let TimeWindow { start_ns, end_ns } = window;
+    let rx = rx_projection(rx);
 
     let mut sql = format!(
-        "SELECT fingerprint, timestamp_ns, body, structured_metadata\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE fingerprint IN ({fp_list})\n  AND timestamp_ns > {start_ns} AND timestamp_ns <= {end_ns}"
+        "SELECT fingerprint, timestamp_ns, body, structured_metadata{rx}\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE fingerprint IN ({fp_list})\n  AND timestamp_ns > {start_ns} AND timestamp_ns <= {end_ns}"
     );
     for clause in line_filters {
         sql.push_str("\n  AND ");
@@ -874,12 +923,40 @@ pub fn stage3_keyset(
     line_filters: &[CheckedFragment],
     limit: u32,
 ) -> String {
+    stage3_keyset_with_rx(
+        samples_table,
+        services,
+        fingerprints,
+        window,
+        lower,
+        direction,
+        line_filters,
+        limit,
+        None,
+    )
+}
+
+/// [`stage3_keyset`], with the `rx` column (issue #624, part 3a, D6) after
+/// the column list. `None` renders [`stage3_keyset`]'s text byte for byte.
+#[allow(clippy::too_many_arguments)]
+pub fn stage3_keyset_with_rx(
+    samples_table: &str,
+    services: &[CheckedLiteral],
+    fingerprints: &[FpLiteral],
+    window: TimeWindow,
+    lower: KeysetLower,
+    direction: Direction,
+    line_filters: &[CheckedFragment],
+    limit: u32,
+    rx: Option<&CheckedFragment>,
+) -> String {
     let service_pred = service_predicate(services);
     let fp_list = fp_list(fingerprints);
     let TimeWindow { start_ns, end_ns } = window;
+    let rx = rx_projection(rx);
 
     let mut sql = format!(
-        "SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash, structured_metadata\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE fingerprint IN ({fp_list})"
+        "SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash, structured_metadata{rx}\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE fingerprint IN ({fp_list})"
     );
     match (direction, lower) {
         (_, KeysetLower::First) => {
@@ -1204,13 +1281,40 @@ pub fn metric_raw_samples(
     extra_predicates: &[CheckedFragment],
     projection: ScanProjection,
 ) -> String {
+    metric_raw_samples_with_rx(
+        samples_table,
+        services,
+        fingerprints,
+        window,
+        lower,
+        extra_predicates,
+        projection,
+        None,
+    )
+}
+
+/// [`metric_raw_samples`], with the `rx` column (issue #624, part 3a, D6)
+/// after the column list. `None` renders [`metric_raw_samples`]'s text byte
+/// for byte.
+#[allow(clippy::too_many_arguments)]
+pub fn metric_raw_samples_with_rx(
+    samples_table: &str,
+    services: &[CheckedLiteral],
+    fingerprints: &[FpLiteral],
+    window: TimeWindow,
+    lower: ScanLowerBound,
+    extra_predicates: &[CheckedFragment],
+    projection: ScanProjection,
+    rx: Option<&CheckedFragment>,
+) -> String {
     let service_pred = service_predicate(services);
     let fp_list = fp_list(fingerprints);
     let TimeWindow { start_ns, end_ns } = window;
     let lower_op = lower.sql_op();
     let sm = projection.column_suffix();
+    let rx = rx_projection(rx);
     let mut sql = format!(
-        "SELECT fingerprint, timestamp_ns, body{sm}\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE fingerprint IN ({fp_list})\n  AND timestamp_ns {lower_op} {start_ns} AND timestamp_ns <= {end_ns}"
+        "SELECT fingerprint, timestamp_ns, body{sm}{rx}\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE fingerprint IN ({fp_list})\n  AND timestamp_ns {lower_op} {start_ns} AND timestamp_ns <= {end_ns}"
     );
     for clause in extra_predicates {
         sql.push_str("\n  AND ");
@@ -1252,13 +1356,40 @@ pub fn metric_raw_samples_sliding(
     extra_predicates: &[CheckedFragment],
     projection: ScanProjection,
 ) -> String {
+    metric_raw_samples_sliding_with_rx(
+        samples_table,
+        services,
+        fingerprints,
+        window,
+        lower,
+        extra_predicates,
+        projection,
+        None,
+    )
+}
+
+/// [`metric_raw_samples_sliding`], with the `rx` column (issue #624, part
+/// 3a, D6) after the column list. `None` renders
+/// [`metric_raw_samples_sliding`]'s text byte for byte.
+#[allow(clippy::too_many_arguments)]
+pub fn metric_raw_samples_sliding_with_rx(
+    samples_table: &str,
+    services: &[CheckedLiteral],
+    fingerprints: &[FpLiteral],
+    window: TimeWindow,
+    lower: ScanLowerBound,
+    extra_predicates: &[CheckedFragment],
+    projection: ScanProjection,
+    rx: Option<&CheckedFragment>,
+) -> String {
     let service_pred = service_predicate(services);
     let fp_list = fp_list(fingerprints);
     let TimeWindow { start_ns, end_ns } = window;
     let lower_op = lower.sql_op();
     let sm = projection.column_suffix();
+    let rx = rx_projection(rx);
     let mut sql = format!(
-        "SELECT fingerprint, timestamp_ns, body{sm}\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE fingerprint IN ({fp_list})\n  AND timestamp_ns {lower_op} {start_ns} AND timestamp_ns <= {end_ns}"
+        "SELECT fingerprint, timestamp_ns, body{sm}{rx}\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE fingerprint IN ({fp_list})\n  AND timestamp_ns {lower_op} {start_ns} AND timestamp_ns <= {end_ns}"
     );
     for clause in extra_predicates {
         sql.push_str("\n  AND ");
@@ -1324,6 +1455,30 @@ pub fn metric_range_bucketed(
     extra_predicates: &[CheckedFragment],
     projection: ScanProjection,
 ) -> Result<String, super::predicate::BucketGridRefusal> {
+    metric_range_bucketed_with_regexp(
+        source,
+        services,
+        fingerprints,
+        scan,
+        extra_predicates,
+        projection,
+        None,
+    )
+}
+
+/// [`metric_range_bucketed`] over a `regexp` stage (issue #624, part 3a,
+/// D2): the extraction is one level under the statement's `SELECT`, and
+/// `matched, caps` join `fingerprint, structured_metadata` in the `GROUP
+/// BY`. `None` renders [`metric_range_bucketed`]'s text byte for byte.
+pub fn metric_range_bucketed_with_regexp(
+    source: MetricSource<'_>,
+    services: &[CheckedLiteral],
+    fingerprints: &[FpLiteral],
+    scan: BucketedScan,
+    extra_predicates: &[CheckedFragment],
+    projection: ScanProjection,
+    regexp: Option<&super::predicate::RegexpGroupColumns>,
+) -> Result<String, super::predicate::BucketGridRefusal> {
     let MetricSource { table, shape } = source;
     let (bucket_col, agg_expr) = (shape.bucket_col(), shape.agg_expr());
     let BucketedScan {
@@ -1339,6 +1494,40 @@ pub fn metric_range_bucketed(
     let prewhere = metric_prewhere(services);
     let sm = projection.column_suffix();
     let bucket_sql = bucket.as_sql();
+    if let Some(regexp) = regexp {
+        // The stage reads the stored line, which the rollup has not got.
+        if bucket_col != "timestamp_ns" {
+            return Err(super::predicate::BucketGridRefusal::RollupSource);
+        }
+        let mut lines: Vec<String> = vec![
+            format!(
+                "SELECT fingerprint, {bucket_sql} AS bucket_ns, {agg_expr} AS n, \
+                 structured_metadata, matched, caps"
+            ),
+            "FROM (".to_string(),
+            format!(
+                "  SELECT fingerprint, timestamp_ns, {}structured_metadata,",
+                regexp_body_column(agg_expr)
+            ),
+        ];
+        lines.extend(regexp_extraction_lines(regexp, "         "));
+        lines.push(format!("  FROM {table}"));
+        if !services.is_empty() {
+            lines.push(format!("  PREWHERE {}", service_predicate(services)));
+        }
+        lines.push(format!("  WHERE fingerprint IN ({fp_list})"));
+        lines.push(format!(
+            "    AND {bucket_col} {lower_op} {start_ns} AND {bucket_col} <= {end_ns}"
+        ));
+        for clause in extra_predicates {
+            lines.push(format!("    AND {}", clause.as_sql()));
+        }
+        lines.push(")".to_string());
+        lines.push(
+            "GROUP BY fingerprint, bucket_ns, structured_metadata, matched, caps".to_string(),
+        );
+        return Ok(lines.join("\n"));
+    }
     let mut sql = format!(
         "SELECT fingerprint, {bucket_sql} AS bucket_ns, {agg_expr} AS n{sm}\nFROM {table}\n{prewhere}WHERE fingerprint IN ({fp_list})\n  AND {bucket_col} {lower_op} {start_ns} AND {bucket_col} <= {end_ns}"
     );
@@ -1410,6 +1599,22 @@ pub fn metric_range_sliding(
     scan: SlidingScan,
     extra_predicates: &[CheckedFragment],
 ) -> Result<String, super::predicate::BucketGridRefusal> {
+    metric_range_sliding_with_regexp(source, services, fingerprints, scan, extra_predicates, None)
+}
+
+/// [`metric_range_sliding`] over a `regexp` stage (issue #624, part 3a,
+/// D2): the extraction is one level under the innermost `SELECT`, and
+/// `matched, caps` join `fingerprint, structured_metadata` in every `GROUP
+/// BY` and window partition. `None` renders [`metric_range_sliding`]'s text
+/// byte for byte.
+pub fn metric_range_sliding_with_regexp(
+    source: MetricSource<'_>,
+    services: &[CheckedLiteral],
+    fingerprints: &[FpLiteral],
+    scan: SlidingScan,
+    extra_predicates: &[CheckedFragment],
+    regexp: Option<&super::predicate::RegexpGroupColumns>,
+) -> Result<String, super::predicate::BucketGridRefusal> {
     let MetricSource { table, shape } = source;
     if shape.bucket_col() != "timestamp_ns" {
         return Err(super::predicate::BucketGridRefusal::RollupSource);
@@ -1428,51 +1633,85 @@ pub fn metric_range_sliding(
     let agg_expr = shape.agg_expr();
     let fp_list = fp_list(fingerprints);
     let lower_op = lower.sql_op();
+    // Issue #624, part 3a: a `regexp` stage's captures join the group key,
+    // computed one level under the innermost `SELECT`.
+    let key = match regexp {
+        Some(_) => "fingerprint, structured_metadata, matched, caps",
+        None => "fingerprint, structured_metadata",
+    };
     let mut lines: Vec<String> = vec![
         format!(
             "SELECT fingerprint, toInt64({grid_start_ns} + k * {step_ns}) AS bucket_ns, \
-             toUInt64(v) AS n, structured_metadata"
+             toUInt64(v) AS n, structured_metadata{}",
+            if regexp.is_some() {
+                ", matched, caps"
+            } else {
+                ""
+            }
         ),
         "FROM (".to_string(),
-        "  SELECT fingerprint, structured_metadata, k0,".to_string(),
+        format!("  SELECT {key}, k0,"),
         format!(
             "         sum(dv) OVER cum AS v, sum(dc) OVER cum AS p, \
              leadInFrame(k0, 1, {kend}) OVER whole AS k1"
         ),
         "  FROM (".to_string(),
-        "    SELECT fingerprint, structured_metadata, d.1 AS k0, sum(d.2) AS dv, sum(d.3) AS dc"
-            .to_string(),
+        format!("    SELECT {key}, d.1 AS k0, sum(d.2) AS dv, sum(d.3) AS dc"),
         "    FROM (".to_string(),
-        "      SELECT fingerprint, structured_metadata,".to_string(),
+        format!("      SELECT {key},"),
         format!("             {lo} AS lo,"),
         format!("             {hi} AS hi,"),
         format!("             {agg_expr} AS m, count() AS c"),
-        format!("      FROM {table}"),
     ];
+    let (inner, filter) = match regexp {
+        Some(regexp) => {
+            lines.push("      FROM (".to_string());
+            lines.push(format!(
+                "        SELECT fingerprint, structured_metadata, timestamp_ns{},",
+                if regexp_body_column(agg_expr).is_empty() {
+                    ""
+                } else {
+                    ", body"
+                }
+            ));
+            lines.extend(regexp_extraction_lines(regexp, "               "));
+            lines.push(format!("        FROM {table}"));
+            ("        ", "          ")
+        }
+        None => {
+            lines.push(format!("      FROM {table}"));
+            ("      ", "        ")
+        }
+    };
     if !services.is_empty() {
-        lines.push(format!("      PREWHERE {}", service_predicate(services)));
+        lines.push(format!("{inner}PREWHERE {}", service_predicate(services)));
     }
-    lines.push(format!("      WHERE fingerprint IN ({fp_list})"));
+    lines.push(format!("{inner}WHERE fingerprint IN ({fp_list})"));
     lines.push(format!(
-        "        AND timestamp_ns {lower_op} {start_ns} AND timestamp_ns <= {end_ns}"
+        "{filter}AND timestamp_ns {lower_op} {start_ns} AND timestamp_ns <= {end_ns}"
     ));
     for clause in extra_predicates {
-        lines.push(format!("        AND {}", clause.as_sql()));
+        lines.push(format!("{filter}AND {}", clause.as_sql()));
+    }
+    if regexp.is_some() {
+        lines.push("      )".to_string());
     }
     lines.extend([
-        "      GROUP BY fingerprint, structured_metadata, lo, hi".to_string(),
+        format!("      GROUP BY {key}, lo, hi"),
         "      HAVING lo <= hi".to_string(),
         "    )".to_string(),
         "    ARRAY JOIN [(lo, toInt64(m), toInt64(c)), (hi + 1, -toInt64(m), -toInt64(c))] AS d"
             .to_string(),
-        "    GROUP BY fingerprint, structured_metadata, k0".to_string(),
+        format!("    GROUP BY {key}, k0"),
         "  )".to_string(),
-        "  WINDOW cum AS (PARTITION BY fingerprint, structured_metadata ORDER BY k0 ASC \
-         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),"
-            .to_string(),
-        "         whole AS (PARTITION BY fingerprint, structured_metadata ORDER BY k0 ASC \
-         ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)"
-            .to_string(),
+        format!(
+            "  WINDOW cum AS (PARTITION BY {key} ORDER BY k0 ASC \
+             ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),"
+        ),
+        format!(
+            "         whole AS (PARTITION BY {key} ORDER BY k0 ASC \
+             ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)"
+        ),
         ")".to_string(),
         format!("ARRAY JOIN range(k0, least(k1, {kend})) AS k"),
         "WHERE p > 0".to_string(),
@@ -1869,6 +2108,30 @@ fn unwrapped_metadata_columns(metadata: &MetadataSent, lane: bool) -> (String, S
 /// Renders the metric-read `PREWHERE service ...\n` line, or an empty
 /// string when `services` is empty (the rollup path — no `service` column
 /// to filter on).
+/// `body, ` when the reducer reads the line's length, so the extraction
+/// level under a `regexp` count carries it (issue #624, part 3a); empty for
+/// `count()`.
+fn regexp_body_column(agg_expr: &str) -> &'static str {
+    if agg_expr.contains("body") {
+        "body, "
+    } else {
+        ""
+    }
+}
+
+/// The three extraction columns of a `regexp` count (issue #624, part 3a,
+/// D2), each line indented by `indent`.
+fn regexp_extraction_lines(
+    regexp: &super::predicate::RegexpGroupColumns,
+    indent: &str,
+) -> [String; 3] {
+    [
+        format!("{indent}{} AS g,", regexp.extract.as_sql()),
+        format!("{indent}toUInt8(length(g) > 0) AS matched,"),
+        format!("{indent}{} AS caps", regexp.caps.as_sql()),
+    ]
+}
+
 fn metric_prewhere(services: &[CheckedLiteral]) -> String {
     if services.is_empty() {
         String::new()
@@ -4067,5 +4330,138 @@ mod tests {
              NAME and in ORDER — the decode binds on the name, and one of these two is \
              SQL text the compiler never reads"
         );
+    }
+
+    /// **T13 (issue #624, part 3a, D6): each raw read adds the `rx` column
+    /// only when asked**, right after its column list; without it, the
+    /// statement is today's text byte for byte.
+    #[test]
+    fn the_regexp_column_is_added_only_when_asked() {
+        use crate::logql::predicate::regexp_captures_column;
+        let f = W0Fixtures::new();
+        let one = regexp_captures_column(&[r"(?P<a>x)".to_string()]).expect("renders");
+        let two = regexp_captures_column(&[r"(?P<a>x)".to_string(), r"(?P<b>[0-9]+)".to_string()])
+            .expect("renders");
+        assert_eq!(one.as_sql(), r"[extractGroups(body, '(?P<a>x)')]");
+        assert_eq!(
+            two.as_sql(),
+            r"[extractGroups(body, '(?P<a>x)'), extractGroups(body, '(?P<b>[0-9]+)')]"
+        );
+        type Builder<'a> = Box<dyn Fn(Option<&CheckedFragment>) -> String + 'a>;
+        let builders: Vec<(&str, Builder<'_>)> = vec![
+            (
+                "stage3",
+                Box::new(|rx| {
+                    stage3_with_rx(
+                        "log_samples",
+                        &f.one_service,
+                        &f.fingerprints,
+                        f.window,
+                        &f.one_predicate,
+                        Direction::Backward,
+                        100,
+                        rx,
+                    )
+                }),
+            ),
+            (
+                "stage3_keyset",
+                Box::new(|rx| {
+                    stage3_keyset_with_rx(
+                        "log_samples",
+                        &f.one_service,
+                        &f.fingerprints,
+                        f.window,
+                        KeysetLower::First,
+                        Direction::Forward,
+                        &f.one_predicate,
+                        100,
+                        rx,
+                    )
+                }),
+            ),
+            (
+                "metric_raw_samples",
+                Box::new(|rx| {
+                    metric_raw_samples_with_rx(
+                        "log_samples",
+                        &f.one_service,
+                        &f.fingerprints,
+                        f.window,
+                        ScanLowerBound::Exclusive,
+                        &f.one_predicate,
+                        ScanProjection::WithStructuredMetadata,
+                        rx,
+                    )
+                }),
+            ),
+            (
+                "metric_raw_samples_sliding",
+                Box::new(|rx| {
+                    metric_raw_samples_sliding_with_rx(
+                        "log_samples",
+                        &f.one_service,
+                        &f.fingerprints,
+                        f.window,
+                        ScanLowerBound::Exclusive,
+                        &f.one_predicate,
+                        ScanProjection::WithStructuredMetadata,
+                        rx,
+                    )
+                }),
+            ),
+        ];
+        let todays = [
+            stage3(
+                "log_samples",
+                &f.one_service,
+                &f.fingerprints,
+                f.window,
+                &f.one_predicate,
+                Direction::Backward,
+                100,
+            ),
+            stage3_keyset(
+                "log_samples",
+                &f.one_service,
+                &f.fingerprints,
+                f.window,
+                KeysetLower::First,
+                Direction::Forward,
+                &f.one_predicate,
+                100,
+            ),
+            metric_raw_samples(
+                "log_samples",
+                &f.one_service,
+                &f.fingerprints,
+                f.window,
+                ScanLowerBound::Exclusive,
+                &f.one_predicate,
+                ScanProjection::WithStructuredMetadata,
+            ),
+            metric_raw_samples_sliding(
+                "log_samples",
+                &f.one_service,
+                &f.fingerprints,
+                f.window,
+                ScanLowerBound::Exclusive,
+                &f.one_predicate,
+                ScanProjection::WithStructuredMetadata,
+            ),
+        ];
+        for ((name, build), today) in builders.iter().zip(todays.iter()) {
+            let none = build(None);
+            assert_eq!(&none, today, "{name}: no column, today's text");
+            for rx in [&one, &two] {
+                let want = none.replacen(
+                    "\nFROM log_samples",
+                    &format!(",\n       {} AS rx\nFROM log_samples", rx.as_sql()),
+                    1,
+                );
+                assert_ne!(want, none, "{name}: the fixture has a FROM line");
+                assert_eq!(build(Some(rx)), want, "{name}");
+            }
+        }
     }
 }

@@ -496,7 +496,7 @@ const PATTERNS: &[Pattern] = &[
 ///
 /// Every position is a `query_range`-shaped query, so between them they
 /// drive `exec.rs:612` (streams), `exec.rs:906` (metric, each leaf of a
-/// binary plan), `plan.rs`'s variant validation and `variants.rs:509`.
+/// binary plan), `plan.rs`'s variant validation and `variants.rs:512`.
 /// They do NOT drive `exec.rs:2290` (`detected_fields`) or `:2576`
 /// (`tail`).
 ///
@@ -713,7 +713,7 @@ fn collect_variant_pipelines(node: &MetricNode, out: &mut Vec<Vec<pulsus_logql::
 // The rule PulsusDB shipped at `5d91ef1`, replayed.
 // ---------------------------------------------------------------------
 
-/// `compile_pattern` as it stood at `5d91ef1` (`pipeline.rs:2631-2674`),
+/// `compile_pattern` as it stood at `5d91ef1` (`pipeline.rs:2867-2917`),
 /// reproduced verbatim apart from returning a [`Verdict`] instead of a
 /// `PipelineError`. This is the baseline freeze the issue asked for: not
 /// a committed scoreboard file (LogQL has none) but the pre-change rule
