@@ -357,13 +357,16 @@ catalogs. Those two statements are in the suite for that comparison, not as the
 design's tag path.
 
 **The exempt class, measured** (`results/comparison.tsv`,
-`results/g1-new-design-sliced.tsv`): `{}` 62 ms whole-window, **34 ms** with the
-newest-slice-first plan in 2 statements, against the reference's 9 ms; a service
-search 36/31 against 10; `status_code >= 500` 47/32 against 19; `select()` 36/32
-against 12. The one shape where the loop costs more than it saves is the rare
-point filter: `{ span.app.user.id = "u-10013" }` is 44 ms whole-window and 116 ms
-sliced over 6 statements, which is why the compiler uses the loop only when the
-first slice's own match count says the filter is broad.
+`results/g1-new-design-sliced.tsv`, by `measure/search_sliced.py`, a loop that
+continues past an empty slice): `{}` 62 ms whole-window, **34 ms** sliced in 2
+statements, against the reference's 9 ms; a service search 36/31 against 10;
+`status_code >= 500` 47/32 against 19; `select()` 36/32 against 12. The rare
+point filter `{ span.app.user.id = "u-10013" }` is 44 ms whole-window and 116 ms
+sliced over 6 statements. The rule PulsusDB applies is
+`server-implementation.md` §3.5's. g1's corpus window has no span in its newest
+five minutes (`measure/gen_corpus.py:249` places no trace start in the last
+600 s), so under that rule every sliceable g1 search reads one empty slice, then
+the window.
 
 The reference's own answer to `{}` is not the newest twenty, and is not the same
 answer twice: in three consecutive calls it returned **none** of the corpus's
