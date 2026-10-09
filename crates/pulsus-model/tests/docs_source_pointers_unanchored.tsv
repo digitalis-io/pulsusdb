@@ -794,6 +794,7 @@ docs/query-to-sql.md	fold.rs:547	ambiguous_basename
 docs/query-to-sql.md	labels.rs:328	ambiguous_basename
 docs/query-to-sql.md	logql/charge.rs:1326	no_name_the_target_file_holds
 docs/query-to-sql.md	logql/error.rs:819-825	no_name_the_target_file_holds
+docs/query-to-sql.md	logql/exec.rs:2505	no_name_the_target_file_holds
 docs/query-to-sql.md	logql/params.rs:121	no_name_the_target_file_holds
 docs/query-to-sql.md	logql/pipeline.rs:1323	no_name_the_target_file_holds
 docs/query-to-sql.md	logql/predicate.rs:1115	no_name_the_target_file_holds

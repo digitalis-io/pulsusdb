@@ -231,7 +231,6 @@ docs/query-to-sql.md	escape.rs:83-92	crates/pulsus-read/src/logql/escape.rs	83	9
 docs/query-to-sql.md	escape.rs:93	crates/pulsus-read/src/logql/escape.rs	93		line	ch_like_contains	pub fn ch_like_contains(needle: &str) -> String {
 docs/query-to-sql.md	escape.rs:93-105	crates/pulsus-read/src/logql/escape.rs	93	105	line	ch_like_contains	pub fn ch_like_contains(needle: &str) -> String { let mut pattern = String::with_capacity(needle.len() + 2); pattern.pus
 docs/query-to-sql.md	escape.rs:99	crates/pulsus-read/src/logql/escape.rs	99		prose	push_str	\\%
-docs/query-to-sql.md	exec.rs:2505	crates/pulsus-read/src/traces/exec.rs	2505		prose	TraceSearchSeriesCap	count
 docs/query-to-sql.md	filter.rs:1220	crates/pulsus-read/src/traces/filter.rs	1220		prose	AttrScope	AttrScope::Unscoped => None
 docs/query-to-sql.md	filter.rs:1455-1457	crates/pulsus-read/src/traces/filter.rs	1455	1457	line	ch_string	if let Some(scope) = probe.scope { parts.push(format!("scope = {}", escape::ch_string(scope))); }
 docs/query-to-sql.md	filter.rs:81-84	crates/pulsus-read/src/traces/filter.rs	81	84	prose	UnsupportedField	unsupported field:
@@ -241,6 +240,7 @@ docs/query-to-sql.md	labels.rs:66	crates/pulsus-read/src/logql/labels.rs	66		pro
 docs/query-to-sql.md	logql/charge.rs:1326	crates/pulsus-read/src/logql/charge.rs	1326		line	MAX_STREAMS_RESULT_BYTES	pub const MAX_STREAMS_RESULT_BYTES: u64 = 1024 * 1024 * 1024;
 docs/query-to-sql.md	logql/error.rs:819-825	crates/pulsus-read/src/logql/error.rs	819	825	prose	aggregation	400
 docs/query-to-sql.md	logql/error.rs:826-829	crates/pulsus-read/src/logql/error.rs	826	829	prose	intentionally	pipeline
+docs/query-to-sql.md	logql/exec.rs:2505	crates/pulsus-read/src/logql/exec.rs	2505		line	CLIENT_AGG_CHUNK_ROWS	let mut chunk: Vec<MetricScanRow> = Vec::with_capacity(CLIENT_AGG_CHUNK_ROWS);
 docs/query-to-sql.md	logql/params.rs:121	crates/pulsus-read/src/logql/params.rs	121		line	DEFAULT_MAX_STREAMS	pub const DEFAULT_MAX_STREAMS: usize = 100_000;
 docs/query-to-sql.md	logql/pipeline.rs:1323	crates/pulsus-read/src/logql/pipeline.rs	1323		line	PipelineError	pub fn compile(stages: &[Stage]) -> Result<Self, PipelineError> {
 docs/query-to-sql.md	logql/predicate.rs:1115	crates/pulsus-read/src/logql/predicate.rs	1115		line	contains_predicate	fn contains_predicate(phrase: &str) -> String {
