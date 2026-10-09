@@ -713,7 +713,7 @@ fn collect_variant_pipelines(node: &MetricNode, out: &mut Vec<Vec<pulsus_logql::
 // The rule PulsusDB shipped at `5d91ef1`, replayed.
 // ---------------------------------------------------------------------
 
-/// `compile_pattern` as it stood at `5d91ef1` (`pipeline.rs:2867-2910`),
+/// `compile_pattern` as it stood at `5d91ef1` (`pipeline.rs:2867-2917`),
 /// reproduced verbatim apart from returning a [`Verdict`] instead of a
 /// `PipelineError`. This is the baseline freeze the issue asked for: not
 /// a committed scoreboard file (LogQL has none) but the pre-change rule

@@ -228,6 +228,7 @@ use pulsus_logql::{CompareOp, LineFilter, LineFilterOp, MatchOp, ParserStage};
 use pulsus_model::FpLiteral;
 
 use super::escape::ch_like_contains;
+use super::escape::ch_regex_capture_checked;
 use super::escape::{ch_regex_anchored_checked, ch_regex_unanchored_checked, ch_string};
 use super::pipeline::PipelineError;
 
@@ -527,8 +528,8 @@ pub fn line_filter(lf: &LineFilter) -> Result<CheckedFragment, PipelineError> {
 
 /// The `rx` column of a raw read (issue #624, part 3a, D6): one
 /// `extractGroups(body, <p>)` per pattern, in the order given, each pattern
-/// through the validating renderer a pushed `|~` line filter takes, so the
-/// text is the one `match()` would read.
+/// rendered as a pushed `|~` line filter renders it and validated as the
+/// database reads it (`ch_regex_capture_checked`).
 ///
 /// `[extractGroups(body, '<p1>'), extractGroups(body, '<p2>')]`
 pub fn regexp_captures_column(patterns: &[String]) -> Result<CheckedFragment, PipelineError> {
@@ -536,7 +537,7 @@ pub fn regexp_captures_column(patterns: &[String]) -> Result<CheckedFragment, Pi
     for p in patterns {
         parts.push(format!(
             "extractGroups(body, {})",
-            ch_regex_unanchored_checked(p)?
+            ch_regex_capture_checked(p)?
         ));
     }
     Ok(CheckedFragment {
@@ -567,7 +568,7 @@ pub fn regexp_group_columns(
     let extract = CheckedFragment {
         sql: format!(
             "extractGroups(body, {})",
-            ch_regex_unanchored_checked(pattern)?
+            ch_regex_capture_checked(pattern)?
         ),
     };
     let caps = if indexes.is_empty() {
@@ -670,7 +671,7 @@ pub enum ParsedFilterRefusal {
 /// Can this label name have been produced by more than one raw key?
 ///
 /// **No, exactly when it contains no `_`.** `sanitize_label_key`
-/// (`pipeline.rs:4205-4218`) does three things and no more: it prepends
+/// (`pipeline.rs:4212-4225`) does three things and no more: it prepends
 /// `_` when the first character is an ASCII digit, keeps ASCII
 /// alphanumerics and `_`, and replaces every other character with `_`. It
 /// never deletes and never shortens. A bare `| json` additionally flattens

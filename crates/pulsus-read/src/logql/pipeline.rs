@@ -2900,6 +2900,13 @@ pub(super) fn validate_unanchored_regex(p: &str) -> Result<(), PipelineError> {
     compile_regex(p).map(|_| ())
 }
 
+/// Validation-only entry for [`super::escape::ch_regex_capture_checked`]
+/// (issue #624, part 3a): a `regexp` stage's pattern, accepted as the
+/// database reads it, because the database is what runs it.
+pub(super) fn validate_regex_as_database(p: &str) -> Result<(), PipelineError> {
+    compile_regex_as_database(p).map(|_| ())
+}
+
 /// Validation-only entry for [`super::escape::ch_regex_anchored_checked`].
 pub(super) fn validate_anchored_regex(p: &str) -> Result<(), PipelineError> {
     compile_anchored_regex(p).map(|_| ())

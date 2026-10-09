@@ -1064,7 +1064,7 @@ fn flat_json_body(k: usize) -> String {
 /// separated: 28 671 B at `K_SHAPE`). Shape (iv)'s body — logfmt is the
 /// only auto-parse format where the owned-copy delta 13(b) floors
 /// literally exists, because logfmt captures are `Cow::Borrowed` slices
-/// of the line (`pipeline.rs:3012` under the `Cow::Borrowed` arm at
+/// of the line (`pipeline.rs:3019` under the `Cow::Borrowed` arm at
 /// `:1044`), so the legacy `into_owned()` genuinely COPIES; a JSON body's
 /// captures are already `Cow::Owned` (`pipeline.rs:2858`) and
 /// `into_owned()` is a move.

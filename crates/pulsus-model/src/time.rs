@@ -47,7 +47,7 @@ pub struct UnixNano(pub i64);
 /// error rather than a wrong answer.
 ///
 /// This is `MonthLiteral`'s mechanism
-/// (`crates/pulsus-read/src/logql/predicate.rs:363`): the
+/// (`crates/pulsus-read/src/logql/predicate.rs:364`): the
 /// mint takes an integer, so "no caller text enters the predicate" is a
 /// property rustc holds up rather than an observation about callers.
 ///

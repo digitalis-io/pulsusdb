@@ -219,6 +219,17 @@ pub(crate) fn ch_regex_unanchored_checked(pat: &str) -> Result<String, PipelineE
     Ok(ch_regex_unanchored(pat))
 }
 
+/// As [`ch_regex_unanchored_checked`], for a `regexp` stage's pattern in
+/// `extractGroups` (issue #624, part 3a): the same rendered text, validated
+/// as the database reads the pattern — `(?s)` and the RE2 rewrite, the
+/// compile that stage takes where it runs in process — so a pattern the
+/// database accepts, such as the literal braces of `a{bbb}c`, is not refused
+/// on the routes that send it there.
+pub(crate) fn ch_regex_capture_checked(pat: &str) -> Result<String, PipelineError> {
+    super::pipeline::validate_regex_as_database(pat)?;
+    Ok(ch_regex_unanchored(pat))
+}
+
 /// THE ONE EXEMPTION — PromQL, and permanently so (the numbering this
 /// comment used to carry existed only because TraceQL held the second;
 /// #282 retired that one). Its SQL path is by design where a pattern the

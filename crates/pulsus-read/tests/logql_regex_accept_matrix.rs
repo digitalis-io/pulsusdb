@@ -2854,12 +2854,17 @@ fn the_regex_compile_sites_are_enumerated_from_the_source() {
         (
             "escape.rs",
             &[
+                ("validate_regex_as_database(", 1),
                 ("validate_anchored_regex(", 1),
                 ("validate_unanchored_regex(", 1),
             ],
             "the SQL-rendering seam: every pushed-down regex is compiled in the exact form it \
              will emit, first. Covered by `sel_re`/`sel_nre` (anchored) and \
-             `line_re`/`line_nre`/`metric_line`/`metric_binary` (unanchored).",
+             `line_re`/`line_nre`/`metric_line`/`metric_binary` (unanchored). Issue #624 part \
+             3a adds `ch_regex_capture_checked`, the seam for a `| regexp` pattern in \
+             `extractGroups`: it validates as the database reads the pattern, the compile the \
+             stage takes where it runs in process, so `regexp_named` answers the same on the \
+             routes that send the pattern to the database.",
         ),
         (
             "ip.rs",
@@ -2873,7 +2878,8 @@ fn the_regex_compile_sites_are_enumerated_from_the_source() {
             &[
                 ("Regex::new(", 1),
                 ("compile_regex(", 4),
-                ("compile_regex_as_database(", 3),
+                ("compile_regex_as_database(", 4),
+                ("validate_regex_as_database(", 1),
                 ("compile_anchored_regex(", 4),
                 ("validate_anchored_regex(", 1),
                 ("validate_unanchored_regex(", 1),
@@ -2908,7 +2914,9 @@ fn the_regex_compile_sites_are_enumerated_from_the_source() {
              of each. Its verdict can differ from `compile_regex`'s only where the rewrite \
              compiles what the pattern as written does not — the brace forms of docs/api.md \
              §9.2, which RE2 reads as literals — and `line_after_line_format`/`regexp_named` \
-             measure exactly that.",
+             measure exactly that. The fourth `compile_regex_as_database(` is \
+             `validate_regex_as_database`, which the `extractGroups` renderer calls (issue #624 \
+             part 3a, code review round 1).",
         ),
         (
             "plan.rs",
@@ -2981,6 +2989,9 @@ fn the_regex_compile_sites_are_enumerated_from_the_source() {
         // without it they would leave the census while still compiling
         // user patterns.
         "compile_regex_as_database(",
+        // Issue #624, part 3a, code review round 1: the capture column's
+        // validation, which reads the pattern as the database does.
+        "validate_regex_as_database(",
         // Issue #302: `template/funcs.rs`'s charged seam, renamed out of
         // a collision with `pipeline.rs`'s `compile_regex`. It is listed
         // because a marker vocabulary is what this census SEES: without

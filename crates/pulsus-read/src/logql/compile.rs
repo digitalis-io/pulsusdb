@@ -390,7 +390,7 @@ impl Lower<Lql> for ParserLower {
     fn residual_effect(&self, s: &LqlLink, mut rel: Relation<Lql>) -> Relation<Lql> {
         // The four forms share this dispatcher and DIFFER here: only the
         // JSON and logfmt arms write the error slot
-        // (`pipeline.rs:4998`, `:5057`, `:6694`, reached from the arms at
+        // (`pipeline.rs:5005`, `:5064`, `:6701`, reached from the arms at
         // `:1743` and `:1752`). A non-matching `| regexp` or `| pattern`
         // extracts nothing and raises nothing — measured, the reference
         // answers `200` with an unlabelled group for both.
@@ -774,7 +774,7 @@ impl Lower<Lql> for UnpackLower {
     ///
     /// **It raises**, which two earlier derivations of this table missed:
     /// its two error writes sit inside `run_unpack`
-    /// (`pipeline.rs:6424`, `:6432`), which is a helper reached from the
+    /// (`pipeline.rs:6431`, `:6439`), which is a helper reached from the
     /// `Unpack` arm at `:2263`, so walking backwards to the nearest
     /// preceding `CompiledStage::` line attributes them to a different
     /// stage entirely. Measured on both engines: `| unpack` over a
@@ -1283,7 +1283,7 @@ impl Shape for LqlShape {}
 /// workspace-wide, and mapping each call site to the arm it is reached
 /// FROM rather than to the nearest preceding `CompiledStage::` line — the
 /// two writes for `| unpack` sit inside `run_unpack`
-/// (`crates/pulsus-read/src/logql/pipeline.rs:6409`), reached from the
+/// (`crates/pulsus-read/src/logql/pipeline.rs:6416`), reached from the
 /// `Unpack` arm at `:2258`, and a nearest-line reading attributes them to
 /// the JSON parser.
 ///
@@ -1302,7 +1302,7 @@ fn mark_error_raisable(mut rel: Relation<Lql>) -> Relation<Lql> {
 /// `CompiledStage::LabelFilter`'s only write to the error slot is the
 /// conversion failure of a numeric comparison: `eval_label_filter`
 /// assigns its `failed` slot in exactly one arm, `LfOp::Compare`
-/// (`crates/pulsus-read/src/logql/pipeline.rs:4383-4403`), and the stage
+/// (`crates/pulsus-read/src/logql/pipeline.rs:4390-4410`), and the stage
 /// calls `set_err` only when that slot is filled (`:1888-1891`). A filter
 /// made only of string matchers therefore raises nothing.
 fn holds_a_numeric_comparison(expr: &LabelFilterExpr) -> bool {

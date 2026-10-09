@@ -451,6 +451,7 @@ const ESCAPE_ITEMS: &[&str] = &[
     "fn ch_regex_unanchored(pat: &str) -> String",
     "pub(crate) fn ch_regex_anchored_checked(pat: &str) -> Result<String, PipelineError>",
     "pub(crate) fn ch_regex_unanchored_checked(pat: &str) -> Result<String, PipelineError>",
+    "pub(crate) fn ch_regex_capture_checked(pat: &str) -> Result<String, PipelineError>",
     "pub(crate) fn ch_regex_anchored_promql_re2(_authority: crate::metrics::PromqlRe2Fallback, pat: &str) -> String",
     "mod tests",
 ];
@@ -2365,6 +2366,7 @@ const PREDICATE_ITEMS: &[&str] = &[
     "use pulsus_logql::{CompareOp, LineFilter, LineFilterOp, MatchOp, ParserStage}",
     "use pulsus_model::FpLiteral",
     "use super::escape::ch_like_contains",
+    "use super::escape::ch_regex_capture_checked",
     "use super::escape::{ch_regex_anchored_checked, ch_regex_unanchored_checked, ch_string}",
     "use super::pipeline::PipelineError",
     "const UUID_RE: &str = r_",

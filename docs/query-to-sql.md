@@ -396,11 +396,11 @@ stages and collects the ones that become predicates on `body`. `has_unpushed_dro
 
 | stage as written | SQL emitted today | marking and source |
 |---|---|---|
-| `\|= "text"` | `body LIKE '%text%'` | *emitted today*, `logql/predicate.rs:1114` via `escape.rs:93`. `%`, `_` and `\` inside the search text are escaped so they match themselves |
-| `!= "text"` | `NOT (body LIKE '%text%')` | *emitted today*, `logql/predicate.rs:523` |
-| `\|~ "re"` | `match(body, 're')`, or `match(identity(body), 're')` | *emitted today*, `logql/predicate.rs:1131`. Not anchored: a LogQL line filter searches for a substring. `identity(body)` when the pattern has a case-insensitive alternation inside a group, which the n-gram index would under-count (issue #624 part 3a; §2.7.1) |
-| `!~ "re"` | `NOT (match(body, 're'))` | *emitted today*, `logql/predicate.rs:523` |
-| `\|= "a" or "b"` | `((body LIKE '%a%') OR (body LIKE '%b%'))` | *emitted today*, `logql/predicate.rs:502`. A filter with one value is not wrapped, so its text is unchanged |
+| `\|= "text"` | `body LIKE '%text%'` | *emitted today*, `logql/predicate.rs:1115` via `escape.rs:93`. `%`, `_` and `\` inside the search text are escaped so they match themselves |
+| `!= "text"` | `NOT (body LIKE '%text%')` | *emitted today*, `logql/predicate.rs:524` |
+| `\|~ "re"` | `match(body, 're')`, or `match(identity(body), 're')` | *emitted today*, `logql/predicate.rs:1132`. Not anchored: a LogQL line filter searches for a substring. `identity(body)` when the pattern has a case-insensitive alternation inside a group, which the n-gram index would under-count (issue #624 part 3a; §2.7.1) |
+| `!~ "re"` | `NOT (match(body, 're'))` | *emitted today*, `logql/predicate.rs:524` |
+| `\|= "a" or "b"` | `((body LIKE '%a%') OR (body LIKE '%b%'))` | *emitted today*, `logql/predicate.rs:503`. A filter with one value is not wrapped, so its text is unchanged |
 | `\|= ip("10.0.0.0/8")` | none | *evaluated after the read*. `is_pushable_line_filter` returns `false` (`plan.rs:3946`), the stage is skipped, and **the walk continues** — a later literal filter still compiles. What holds it back is pruning, not information — §5.1 |
 | `\| json` | none, except in the extracted-field group key | *evaluated after the read*. `metric_pipeline_construct` returns `"json"` (`plan.rs:1735`). **One exception, emitted today:** in a range `sum_over_time`/`avg_over_time` over one of the chains of §1.1's extracted-field group key, the unwrapped value and each key label are read by `JSONExtractRaw(body, '<name>')` inside `metric_range_unwrapped` (`sql.rs:1952`) and `metric_range_unwrapped_rows` (`sql.rs:2015`); the chain rule is `unwrapped_key_route` (`plan.rs:1934`) |
 | `\| logfmt` | none | *evaluated after the read*, `plan.rs:1736` |
@@ -683,7 +683,7 @@ every `LIMIT` refuses unless the predicate so far means exactly what the query m
 | `!~ "re"` | `NOT (match(body, 're'))` | *emitted today*, unchanged |
 | `\|= "a" or "b"` | `((body LIKE '%a%') OR (body LIKE '%b%'))` | *emitted today*, unchanged |
 | `\|= ip("10.0.0.0/8")` | none | *evaluated after the read*, `docs/query-lowering.md:1043`. Unchanged: the walk skips it and continues. `BlockReason::NotPushable` — a pruning fact, not a boundary (§5.1) |
-| `\| json` | none of its own; a later reference to name `k` compiles against `JSONExtractString(body, 'k')` | **decided here**, §2.7.1. The design widens the known column set through an *open source* over `body` — a source whose member names are not known until a row is read — and records that its `resolve` answers `None` (`docs/query-lowering.md:1044`). This document gives it an answer. A parser adds no predicate of its own; what it adds is the expression a later stage compiles against, and today's flattening and malformed-input rules (`pipeline.rs:5302`) and the collision renaming (`labels.rs:328`) are what the guards in §2.7.0 are for |
+| `\| json` | none of its own; a later reference to name `k` compiles against `JSONExtractString(body, 'k')` | **decided here**, §2.7.1. The design widens the known column set through an *open source* over `body` — a source whose member names are not known until a row is read — and records that its `resolve` answers `None` (`docs/query-lowering.md:1044`). This document gives it an answer. A parser adds no predicate of its own; what it adds is the expression a later stage compiles against, and today's flattening and malformed-input rules (`pipeline.rs:5309`) and the collision renaming (`labels.rs:328`) are what the guards in §2.7.0 are for |
 | `\| logfmt` | none of its own; `k` compiles against `extractKeyValuePairs(body, '=', ' \t\r\n', '"')['k']` | **decided here**, §2.7.1 |
 | `\| regexp "re"` | none of its own; the *n*-th capture group compiles against `extractGroups(body, 're')[n]` | **decided here**, §2.7.1. No prefix: ClickHouse compiles the pattern with RE2's dot-matches-newline option on and the reference does not, and the owner decided on 2026-10-09 that the database's reading is the answer (issue #624 part 3a) |
 | `\| pattern "p"` | none of its own; capture `<name>` compiles against `extractGroups(body, '<p as a regular expression>')[n]` | **decided here**, §2.7.1, from the reference's own matcher (`pkg/logql/log/pattern/pattern.go:66-116` @ `v3.7.4`) |
@@ -950,7 +950,7 @@ after the read, `stage3_keyset` (`sql.rs:953`) when something does.
 | `!~ "re"` | `NOT (match(body, 're'))` | `WHERE`, third statement | *emitted today*. As `!=` |
 | `\|= "a" or "b"` | `((body LIKE '%a%') OR (body LIKE '%b%'))` | `WHERE`, third statement | *emitted today*. A granule survives if it can hold either alternative, so the prune is the union |
 | `\|= ip("10.0.0.0/8")` | none | — | *evaluated after the read* (`plan.rs:3946`). The walk skips it and asks the next stage, so a later literal filter still compiles — §2.8's LogQL58. What holds it back is that no predicate it could render prunes. The unwired LogQL model records the same as `BlockReason::NotPushable` (`crates/pulsus-read/src/compile/fold.rs:685`, answered at `crates/pulsus-read/src/logql/compile.rs:337`), which is a cost, not a boundary — §5.1 |
-| `\| json` | none of its own; it makes a name `k` resolve to `JSONExtractString(body, 'k')` | nothing until a later stage names `k` | **decided here.** A parser is not a filter and adds no predicate. `JSONExtractString` decodes `\uXXXX` escapes in both the key and the value, and so does our parser, so the two agree byte for byte whenever the value is a JSON string. On a repeated key both take the **first** occurrence (measured: `JSONExtractString('{"a":"x","a":"y"}','a')` is `x`; our parser renames the second to `a_extracted`, `pipeline.rs:6529`) |
+| `\| json` | none of its own; it makes a name `k` resolve to `JSONExtractString(body, 'k')` | nothing until a later stage names `k` | **decided here.** A parser is not a filter and adds no predicate. `JSONExtractString` decodes `\uXXXX` escapes in both the key and the value, and so does our parser, so the two agree byte for byte whenever the value is a JSON string. On a repeated key both take the **first** occurrence (measured: `JSONExtractString('{"a":"x","a":"y"}','a')` is `x`; our parser renames the second to `a_extracted`, `pipeline.rs:6536`) |
 | `\| logfmt` | none of its own; `k` resolves to `extractKeyValuePairs(body, '=', ' \t\r\n', '"')['k']` | as above | **decided here.** The delimiter set is `' \t\r\n'`, not a single space, because the reference's decoder ends a key or an unquoted value at any byte at or below `0x20` (`pkg/logql/log/logfmt/decode.go`, the `c <= ' '` arms @ `v3.7.4`). Measured over eleven awkward lines; one shape disagrees and the escape guard covers it |
 | `\| regexp "re"` | `extractGroups(body, 're')`; the *n*-th capture group is its element `[n]` | the `rx` column, or the group key of a lowered count | *emitted since issue #624 part 3a*, with the pattern as the user wrote it. ClickHouse compiles it with RE2's dot-matches-newline option **on**, so `extractGroups('a\nb', '(?P<x>a.b)')` answers `['a\nb']`; the reference leaves that option off. The owner decided on 2026-10-09 that the database's reading is the answer, so a LogQL `.` matches a newline here, and a stage that runs in process after a line rewrite reads `(?s)` the same way (docs/api.md §9.1) |
 | `\| pattern "p"` | none of its own; capture `<name>` resolves to `extractGroups(body, '<p as a regular expression>')[n]` | as above | **decided here.** The pattern becomes `(?s)^` then, in order, each literal with its regular-expression characters escaped, each `<name>` as `(?P<name>.*?)`, each `<_>` as `(?:.*?)`, and a trailing capture as `(?P<name>.*)`. `(?s)` — dot matches newline — is required here and `(?-s)` is required for `\| regexp`, because the reference's pattern matcher slices raw bytes with `bytes.Index` and never treats a newline specially (`pkg/logql/log/pattern/pattern.go:66-116` @ `v3.7.4`) |
@@ -2408,7 +2408,7 @@ LIMIT 100
 ```
 
 Reaches the changed code through `compile_line_filters` (`plan.rs:3912`) and
-`predicate::line_filter` (`predicate.rs:493`). No stage forces evaluation after the read, so
+`predicate::line_filter` (`predicate.rs:494`). No stage forces evaluation after the read, so
 ClickHouse genuinely executes this predicate.
 
 #### LogQL2 — a mixed-case value that occurs once
@@ -2447,7 +2447,7 @@ so its pattern is unescaped — the contrast with LogQL1 is the point.
 {service_name="checkout"} |~ "CONN_REFUSED"
 ```
 
-**SQL today** — one statement, `sql.rs:838`. Not anchored, and **not** underscore-escaped: `_` is an ordinary character in a regular expression (`logql/predicate.rs:1131`, `escape.rs:172-179`).
+**SQL today** — one statement, `sql.rs:838`. Not anchored, and **not** underscore-escaped: `_` is an ordinary character in a regular expression (`logql/predicate.rs:1132`, `escape.rs:172-179`).
 
 ```sql
 SELECT fingerprint, timestamp_ns, body, structured_metadata
@@ -2478,7 +2478,7 @@ kind of query that was answering wrongly before issue #450.
 {service_name="checkout"} != "CONN_REFUSED"
 ```
 
-**SQL today** — one statement, `sql.rs:838`. `logql/predicate.rs:523` wraps the positive predicate.
+**SQL today** — one statement, `sql.rs:838`. `logql/predicate.rs:524` wraps the positive predicate.
 
 ```sql
 SELECT fingerprint, timestamp_ns, body, structured_metadata
@@ -2508,7 +2508,7 @@ the exclusion directly. These two entries plus LogQL1's two are the whole four-e
 {service_name="checkout"} |= ""
 ```
 
-**SQL today** — one statement, `sql.rs:838`. `ch_like_contains("")` renders `'%%'`; the case is pinned at `logql/predicate.rs:2124`.
+**SQL today** — one statement, `sql.rs:838`. `ch_like_contains("")` renders `'%%'`; the case is pinned at `logql/predicate.rs:2125`.
 
 ```sql
 SELECT fingerprint, timestamp_ns, body, structured_metadata
@@ -2538,7 +2538,7 @@ value as an error would return `400`; one emitting `body LIKE ''` would return z
 {service_name="checkout"} |= "CONN" or "06Q924X3qTas"
 ```
 
-**SQL today** — one statement, `sql.rs:838`. Each alternative is wrapped and the group is wrapped again (`logql/predicate.rs:502-521`).
+**SQL today** — one statement, `sql.rs:838`. Each alternative is wrapped and the group is wrapped again (`logql/predicate.rs:503-522`).
 
 ```sql
 SELECT fingerprint, timestamp_ns, body, structured_metadata
@@ -2568,7 +2568,7 @@ first alternative matches two entries and the second a third.
 {service_name="checkout"} != "CONN" or "06Q924X3qTas"
 ```
 
-**SQL today** — one statement, `sql.rs:838`. `logql/predicate.rs:523` wraps the **whole group**, not each alternative.
+**SQL today** — one statement, `sql.rs:838`. `logql/predicate.rs:524` wraps the **whole group**, not each alternative.
 
 ```sql
 SELECT fingerprint, timestamp_ns, body, structured_metadata
@@ -2680,7 +2680,7 @@ LIMIT 100
 ```
 
 The value that made an earlier token-based prefilter fail the query outright with
-`BAD_ARGUMENTS` (`predicate.rs:467-483`). It must be an ordinary substring search now.
+`BAD_ARGUMENTS` (`predicate.rs:468-484`). It must be an ordinary substring search now.
 
 #### LogQL11 — a value that is not ASCII
 
@@ -2977,8 +2977,8 @@ LIMIT 1000
 ```
 
 The reference returns the two entries whose `dur_ms` exceeds 10: `12.5` and `31.0`. We reject at
-`classify_numeric_literal` (`pipeline.rs:3293`) because `e1` is in neither `QUERY_BYTES_SUFFIXES`
-(`pipeline.rs:3419`) nor `DURATION_UNITS` (`pipeline.rs:3307`). Part 7 records this as a defect of
+`classify_numeric_literal` (`pipeline.rs:3300`) because `e1` is in neither `QUERY_BYTES_SUFFIXES`
+(`pipeline.rs:3426`) nor `DURATION_UNITS` (`pipeline.rs:3314`). Part 7 records this as a defect of
 ours, not an accepted difference.
 
 #### LogQL20 — a regular-expression parser with a named group
@@ -3706,7 +3706,7 @@ The complement of LogQL41. The pair fixes both directions of the rule.
 {service_name="checkout"} |~ "("
 ```
 
-**SQL today** — none. The pattern is compiled **before any read**, at the point the predicate is built (`logql/predicate.rs:1131` through `escape.rs:167-172`), so an uncompilable pattern is a `400` at planning time rather than a ClickHouse failure part-way through a query.
+**SQL today** — none. The pattern is compiled **before any read**, at the point the predicate is built (`logql/predicate.rs:1132` through `escape.rs:167-172`), so an uncompilable pattern is a `400` at planning time rather than a ClickHouse failure part-way through a query.
 
 **SQL after this work** — unchanged, and this property is load-bearing for compiling more stages: every new predicate that carries a user pattern must validate at the same point.
 
@@ -5252,7 +5252,7 @@ table.
 | `sum by (level) (count_over_time({service_name="checkout"} \| json \| __error__!="LogfmtParserErr" [1m]))` | `400` `pipeline error: 'JSONParserErr' ...` | `200`, four series: `{level="error"} 1`, `{level="info"} 1`, `{level="warn"} 1`, `{} 1` | **unverified.** Read only: the filter does not clear a `JSONParserErr` label, and a non-empty error label reaching the aggregation raises the error at `logql/error.rs:816-819`. Settled by one live request against the streams route with the fourth corpus line ingested, asserting status and body |
 | `quantile_over_time(1e-1, {service_name="checkout"} \| json \| unwrap dur_ms [1m])` | `400` `unexpected duration "1e" at byte 19: expected the quantile parameter (e.g. 0.95)` | `200`, three series | **measured** 2026-09-01: `pulsus_logql::parse` on this exact text returns that error character for character. The parser is the whole refusal, so no later layer is involved |
 | `vector(1e3)` | `400` `unexpected duration "1e3" at byte 7: expected the vector value (e.g. vector(0))` | `200`, one series, `{}` = `1000` at every grid point | **measured** 2026-09-01, the same way |
-| `{service_name="checkout"} \| json \| dur_ms > 1e1` | `400` `bad parser expression: literal "1e1" is neither a duration nor a bytes quantity` | `200`, two entries — `dur_ms` `12.5` and `31.0` | **partly measured.** The parse was run: it succeeds, giving a comparison whose right-hand side is the literal `1e1`. The refusal itself is read, not executed — the suffix `e1` is in neither `QUERY_BYTES_SUFFIXES` (`pipeline.rs:3419`) nor `DURATION_UNITS` (`pipeline.rs:3307`), so `classify_numeric_literal` (`pipeline.rs:3293`) returns that message. Part 4's LogQL19 |
+| `{service_name="checkout"} \| json \| dur_ms > 1e1` | `400` `bad parser expression: literal "1e1" is neither a duration nor a bytes quantity` | `200`, two entries — `dur_ms` `12.5` and `31.0` | **partly measured.** The parse was run: it succeeds, giving a comparison whose right-hand side is the literal `1e1`. The refusal itself is read, not executed — the suffix `e1` is in neither `QUERY_BYTES_SUFFIXES` (`pipeline.rs:3426`) nor `DURATION_UNITS` (`pipeline.rs:3314`), so `classify_numeric_literal` (`pipeline.rs:3300`) returns that message. Part 4's LogQL19 |
 | `{service_name="colors"} \| decolorize \|= "upstream ok"` | `200`, **one** entry | `200`, **zero** entries | **unverified.** See below. Part 4's LogQL24, LogQL25, LogQL26 |
 | `sum by (id) (sum_over_time({…} \| json \| unwrap duration(v) \| __error__="" [30m]))` over `v` in `1d`, `2w`, `-5s`, `+5s` | two series: `{id="d_1d"} 86400`, `{id="d_2w"} 1209600` | two series: `{id="d_minus5s"} -5`, `{id="d_plus5s"} 5` | **measured** 2026-09-09 on both sides. The two answers are disjoint: each engine accepts exactly the values the other rejects. Values, corpus and the source on each side: below |
 | `{…} \|= ip("10.0.0.0/8")` over two lines containing `10.1.2.3.4` and one containing `10.1.2.3` | `200`, **three** entries | `200`, **one** entry | **measured** 2026-09-09 on both sides. We extract a fixed-width dotted quad; the reference parses a maximal run. Below |
@@ -5283,9 +5283,9 @@ Four lines, `{"id":"…","v":"…"}`, queried as
 | `+5s` | dropped | `5` |
 
 The two answers are disjoint sets: every value one engine accepts, the other rejects. Ours reads
-`DURATION_UNITS` (`crates/pulsus-read/src/logql/pipeline.rs:3307`), which carries `d` at `:3315` and
-`w` at `:3316`, through a scanner whose first token must begin with an ASCII digit or `.`
-(`:3367`). The reference's conversion is Go's `time.ParseDuration`
+`DURATION_UNITS` (`crates/pulsus-read/src/logql/pipeline.rs:3314`), which carries `d` at `:3322` and
+`w` at `:3323`, through a scanner whose first token must begin with an ASCII digit or `.`
+(`:3374`). The reference's conversion is Go's `time.ParseDuration`
 (`pkg/logql/log/metrics_extraction.go:321` @ `v3.7.4`), which has neither `d` nor `w` and does take
 a leading `+` or `-`. A full port of the Go parser already exists in this tree —
 `go_parse_duration` (`crates/pulsus-read/src/logql/template/funcs.rs`), used by the `duration`
@@ -5329,7 +5329,7 @@ Eight lines, `{"id":"n…","c":<number>}`, read for the text of the `c` label.
 
 Six differ. Each difference is a different label value, so on a metric query each is a different
 series name. Ours ends at `Value::Number(n) => n.to_string()`
-(`crates/pulsus-read/src/logql/pipeline.rs:6694`), which renders through the parsed number; the
+(`crates/pulsus-read/src/logql/pipeline.rs:6701`), which renders through the parsed number; the
 reference copies the document's own bytes (`pkg/logql/log/parser.go:258-259` @ `v3.7.4`). Note the
 direction this one points: §5.1's row 4 records that `simpleJSONExtractRaw` returns the reference's
 bytes, so an expression that made the group key compile would move our answer **towards** the
@@ -5478,7 +5478,7 @@ cheaper than having the next reader find them.
 |---|---|---|
 | the 51 LogQL answers in part 4 | replayed against `grafana/loki:3.7.4`, digest `sha256:87f0a067…cfcc`, on 2026-09-01, over part 4.1's corpus; the run reproduced an earlier capture with **no differences** | only that the reference answers this way over **this** corpus. It says nothing about a corpus we did not write |
 | the corpus is exactly the 14 entries listed | the live instance was queried for each of the five streams and every line printed as hex before any answer was used | nothing — but note it caught a real problem: an earlier capture had been taken against a **different** corpus state, and one of its rows recorded a non-matching accented value that was a difference in how the accent was written, not a behaviour. That capture is discarded and is not in this document |
-| the escaped `LIKE` patterns in part 4 | computed by re-implementing `escape.rs:93-105` over `escape.rs:51-67` and printing the result for each value, rather than written by hand | that the re-implementation matches the Rust. It agrees with the five cases pinned at `logql/predicate.rs:2118-2125`, which is a check on five values, not on all of them |
+| the escaped `LIKE` patterns in part 4 | computed by re-implementing `escape.rs:93-105` over `escape.rs:51-67` and printing the result for each value, rather than written by hand | that the re-implementation matches the Rust. It agrees with the five cases pinned at `logql/predicate.rs:2119-2126`, which is a check on five values, not on all of them |
 | the `400` body of LogQL32 | the template at `logql/error.rs:816-819` was rendered with the captured values and compared to the captured body: **462 bytes each, identical** | that the template is reached for this query. That is read from `logql/error.rs:809-815`, not executed |
 | the committed corpus cannot distinguish the two colour-stripping behaviours | all 46 corpus files read as bytes; one line has escape bytes and it has four; 46 of 50 queries using the stage carry a later filter and all 46 load colour-free lines | it is a statement about the **committed** corpus at this commit. A row added tomorrow changes it, and nothing detects that |
 | every `file:line` in this document | each was printed with `sed -n "${n}p"` and read before being written down | that the line still says that after the next commit. There is no mechanism holding these citations true |
@@ -5504,7 +5504,7 @@ cheaper than having the next reader find them.
 | the reference's pattern matcher takes the rest of the line when it cannot find the literal that ends a capture | `pkg/logql/log/pattern/pattern.go:96-101` @ `v3.7.4`, checkout verified at tag `v3.7.4`, commit `b318f2829f0ae2094ab3a1e90780450e9e4b03be` | that our translation to a regular expression is right in every other respect. Reading the matcher gives the rule; §2.8's LogQL49 is one case of it |
 | the reference's logfmt decoder ends a key or an unquoted value at any byte at or below `0x20` | `pkg/logql/log/logfmt/decode.go`, the `c <= ' '` arms @ `v3.7.4` | which other shapes the two decoders disagree on — that is the enumeration above, and it is not complete |
 | `structured_metadata` is a flat JSON object of text keys to text values | `crates/pulsus-read/src/canonical_labels.rs:131-163`, a hand-written reader that accepts nothing else, and `render_labels_json_sorted` (`labels.rs:66`) on the writing side | that every row in an existing database obeys it. Rows written before the column existed read back as the empty string (`schema/schema.sql:89`), which the reader treats as none |
-| a parsed name that collides with a stream label or a structured-metadata key is renamed rather than overwriting | `crates/pulsus-read/src/logql/labels.rs:328` and `pipeline.rs:6529` | nothing further — but note the direction it forces: a **stream** label can never be overwritten, which is what makes §2.7.2's stream-label group key exact, while a parsed name can be, which is what the metadata guard is for |
+| a parsed name that collides with a stream label or a structured-metadata key is renamed rather than overwriting | `crates/pulsus-read/src/logql/labels.rs:328` and `pipeline.rs:6536` | nothing further — but note the direction it forces: a **stream** label can never be overwritten, which is what makes §2.7.2's stream-label group key exact, while a parsed name can be, which is what the metadata guard is for |
 
 ### Argued
 
@@ -5942,7 +5942,7 @@ noticed and are not grounds for a new round.
    the restriction is in code.** `JSONExtractString(body, 'k')` reads the document key literally
    named `k`. The parser also produces `k` by flattening a nested path with `_`, by replacing a
    character that is not a letter, digit or underscore with `_`, and by prefixing `_` to a key that
-   starts with a digit (`pipeline.rs:6613-6633`), so several document keys can produce one label
+   starts with a digit (`pipeline.rs:6620-6640`), so several document keys can produce one label
    name. Every one of those cases is covered by a guard — the extra keys are simply not found, and a
    line where SQL finds nothing is kept — so no answer is wrong. What is open is whether the
    resolver should decline a name that cannot be a top-level key at all, which would save a

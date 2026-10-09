@@ -15,9 +15,9 @@
 //! 'serde_json::(from_str|from_slice|from_reader|from_value)|Deserializer::from_'
 //! -- crates/pulsus-read/src`):
 //!
-//! * `| json` — `run_json`, `crates/pulsus-read/src/logql/pipeline.rs:3842`,
+//! * `| json` — `run_json`, `crates/pulsus-read/src/logql/pipeline.rs:3849`,
 //!   both of its arms (full flatten and targeted extraction);
-//! * `| unpack` — `run_unpack`, `pipeline.rs:4309`. It promotes only STRING
+//! * `| unpack` — `run_unpack`, `pipeline.rs:4316`. It promotes only STRING
 //!   fields, so no float is ever decoded into an observable value; pinned
 //!   below so that stays true rather than being assumed;
 //! * `fromJson` — the template function,
@@ -241,7 +241,7 @@ fn label<'a>(labels: &'a [(String, String)], name: &str) -> &'a str {
 }
 
 // ---------------------------------------------------------------------------
-// `| json` — pipeline.rs:3842
+// `| json` — pipeline.rs:3849
 // ---------------------------------------------------------------------------
 
 /// The full-flatten arm: every bare number in the line reaches
@@ -336,7 +336,7 @@ fn json_array_index_extraction_preserves_the_exact_bits_of_every_vector() {
 }
 
 // ---------------------------------------------------------------------------
-// `| unpack` — pipeline.rs:4309
+// `| unpack` — pipeline.rs:4316
 // ---------------------------------------------------------------------------
 
 /// `unpack` decodes through the same parser but promotes only STRING fields,
