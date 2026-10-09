@@ -10068,7 +10068,15 @@ async fn a_configured_bound_counts_parent_links() {
         .await;
         let mut config = engine_config();
         config.max_depth = depth;
-        let engine = pulsus_read::TraceEngine::new(ChClient::new(client_config(&db)).await.expect("connect"), config);
+        // The 1,001-link climbs take 40-47 s on an idle machine, close to the
+        // shared client's 60 s timeout, and one timed out under load. Those
+        // two cases get a longer client timeout; the depth stays past 1,000
+        // so the database's own recursion limit is still exercised.
+        let mut conn = client_config(&db);
+        if depth > 1_000 {
+            conn.query_timeout = StdDuration::from_secs(300);
+        }
+        let engine = pulsus_read::TraceEngine::new(ChClient::new(conn).await.expect("connect"), config);
         let plan = plan_of(&engine, &parse_query(DOWN), (base_ns, base_ns + 60_000_000_000), 20, 20);
         let routed = answer_of(&engine.search_routed(&plan).await.map(normalise_today));
         if routed != want {
