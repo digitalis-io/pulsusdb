@@ -10866,11 +10866,10 @@ fn fixture_q595_bodies(e: i64) -> Vec<ExportTraceServiceRequest> {
         .collect()
 }
 
-async fn seed595(label: &str, bodies: Vec<ExportTraceServiceRequest>) -> (String, ChClient) {
-    let db = pulsus_testkit::test_db(label);
+async fn seed595(db: String, bodies: Vec<ExportTraceServiceRequest>) -> (String, ChClient) {
     let client = fresh_db(&db).await;
     for (i, req) in bodies.iter().enumerate() {
-        land(&client, req, &format!("{label}-{i}")).await;
+        land(&client, req, &format!("{db}-{i}")).await;
     }
     (db, client)
 }
@@ -10932,7 +10931,11 @@ fn stages595(slices: usize, whole: bool) -> String {
 async fn the_newest_slice_first_plan_answers_fixture_p() {
     skip_unless_live!();
     let e = end595();
-    let (db, client) = seed595("pulsus_read_it_t595_p", fixture_p595_bodies(e)).await;
+    let (db, client) = seed595(
+        pulsus_testkit::test_db("pulsus_read_it_t595_p"),
+        fixture_p595_bodies(e),
+    )
+    .await;
     let engine = engine_of(&db).await;
     let newest = |n: usize| -> Vec<String> {
         let mut v: Vec<String> = (0x01..=0x2a_u8)
@@ -11020,7 +11023,11 @@ async fn the_newest_slice_first_plan_answers_fixture_p() {
 async fn the_statement_count_reaches_its_bound_and_no_further() {
     skip_unless_live!();
     let e = end595();
-    let (db, client) = seed595("pulsus_read_it_t595_q", fixture_q595_bodies(e)).await;
+    let (db, client) = seed595(
+        pulsus_testkit::test_db("pulsus_read_it_t595_q"),
+        fixture_q595_bodies(e),
+    )
+    .await;
     let engine = engine_of(&db).await;
     let want: Vec<String> = (1..=19_u8).map(|n| format!("…{n:02x}")).collect();
     let (got, n, seen, partial) =
@@ -11179,7 +11186,11 @@ async fn rows_of_statement(client: &ChClient, sql: &str, tag: &str) -> u64 {
 async fn a_slice_the_budget_refuses_falls_back_to_the_window() {
     skip_unless_live!();
     let e = end595();
-    let (db, client) = seed595("pulsus_read_it_t595_budget", fixture_p595_bodies(e)).await;
+    let (db, client) = seed595(
+        pulsus_testkit::test_db("pulsus_read_it_t595_budget"),
+        fixture_p595_bodies(e),
+    )
+    .await;
     run_bounded(&client, "OPTIMIZE TABLE spans FINAL".to_string()).await;
     run_bounded(&client, "OPTIMIZE TABLE traces FINAL".to_string()).await;
     let engine = engine_of(&db).await;
