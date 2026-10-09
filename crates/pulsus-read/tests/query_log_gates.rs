@@ -13809,9 +13809,13 @@ async fn a_pattern_count_out_of_memory_answers_on_todays_route() {
 /// nothing, so no line carries `__error__` and the answer is 1 where no line
 /// lies, at `t` and `t+180s`; the lowered statement runs no pattern. (B)
 /// `| pattern "<a> <_>" | a="hit"`: 1 where no `hit` line lies, at `t`,
-/// `t+120s` and `t+180s`. On the lowered statement, on today's route
-/// (`todays_route_only` and a one-byte ceiling), and instant at `t+120s` and
-/// `t+180s`.
+/// `t+120s` and `t+180s`. (C) `| line_format "{{__line__}}" | pattern
+/// "<__error__>"`: (A) after a line rewrite, so the stage walks the line in
+/// process and has no `rx` element; only the stage's own no-label skip keeps
+/// `boom` from becoming `__error__`. It stays on today's route, so no
+/// lowered statement is asked of it. On the lowered statement, on today's
+/// route (`todays_route_only` and a one-byte ceiling), and instant at
+/// `t+120s` and `t+180s`.
 #[tokio::test]
 async fn an_absent_pattern_count_extracts_only_what_a_stage_reads() {
     skip_unless_live!();
@@ -13850,7 +13854,9 @@ async fn an_absent_pattern_count_extracts_only_what_a_stage_reads() {
     };
     let one = 1.0f64.to_bits();
     let labels = vec![("s".to_string(), "x".to_string())];
-    let cases: [(&str, &[i64], &str); 2] = [
+    // The third column is what the lowered statement must hold: "" for no
+    // pattern at all, `-` for a query that does not lower.
+    let cases: [(&str, &[i64], &str); 3] = [
         (
             r#"absent_over_time({s="x"} | pattern "<__error__>" [1m])"#,
             &[0, 180],
@@ -13860,6 +13866,11 @@ async fn an_absent_pattern_count_extracts_only_what_a_stage_reads() {
             r#"absent_over_time({s="x"} | pattern "<a> <_>" | a="hit" [1m])"#,
             &[0, 120, 180],
             "arraySlice([g[1]]",
+        ),
+        (
+            r#"absent_over_time({s="x"} | line_format "{{__line__}}" | pattern "<__error__>" [1m])"#,
+            &[0, 180],
+            "-",
         ),
     ];
     let mut comments: Vec<(String, &str)> = Vec::new();
@@ -13878,7 +13889,7 @@ async fn an_absent_pattern_count_extracts_only_what_a_stage_reads() {
                 .await
                 .unwrap_or_else(|e| panic!("{query} ({hooks:?}): {e}"));
             assert_eq!(got, want, "{query} ({hooks:?})");
-            if hooks == hooks_624(false, None, None) {
+            if hooks == hooks_624(false, None, None) && caps != "-" {
                 comments.push((comment, caps));
             }
         }

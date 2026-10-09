@@ -5536,15 +5536,15 @@ The block below, tables and sentences alike, is rendered from the two citation d
 
 | quantity | at this revision |
 |---|---|
-| citation occurrences in the five artefacts | 697 |
+| citation occurrences in the five artefacts | 698 |
 | of those, citing a bare basename | 497 |
 | of those, written as a continuation of a citation earlier in the paragraph | 75 |
 | of those continuations, on a later line than the citation they continue | 32 |
-| `(document, token)` pairs the rule resolves | 374 |
-| occurrences those resolved pairs cover | 503 |
+| `(document, token)` pairs the rule resolves | 375 |
+| occurrences those resolved pairs cover | 504 |
 | `(document, token)` pairs it cannot resolve | 103 |
 | occurrences those frozen pairs cover | 194 |
-| resolved rows anchored on a token the citing prose prints | 181 |
+| resolved rows anchored on a token the citing prose prints | 182 |
 | resolved rows anchored on a snapshot of the cited line | 193 |
 
 | reason it cannot be resolved | pairs | what it means |
@@ -5564,7 +5564,7 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | `prose` | a token the citing prose prints, so the claim and its evidence are reviewable side by side |
 | `line` | a snapshot of the cited line, taken because the citing prose prints no such token: it detects the line moving or changing and cannot show the citation means the right thing |
 
-Of the 697 citation occurrences the five artefacts make, 497 name a bare basename and 75 are written as a continuation of a citation earlier on the same line. The rule resolves 374 `(document, token)` pairs covering 503 occurrences, and cannot resolve 103 covering 194. Of the resolved rows, 181 are anchored on a token the citing prose prints and 193 on a snapshot of the cited line.
+Of the 698 citation occurrences the five artefacts make, 497 name a bare basename and 75 are written as a continuation of a citation earlier on the same line. The rule resolves 375 `(document, token)` pairs covering 504 occurrences, and cannot resolve 103 covering 194. Of the resolved rows, 182 are anchored on a token the citing prose prints and 193 on a snapshot of the cited line.
 
 The language fallback and the anchor rule disagree on 5 citations, all of them read one at a time. 4 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
 

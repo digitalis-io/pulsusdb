@@ -414,7 +414,7 @@ Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:12739	-	-	status	accept
 Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:12743	-	-	level	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:12776	-	-	level.x	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:12887	-	-	level	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:13968	-	-	a	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:13979	-	-	a	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:5845	-	-	latency	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:5848	-	-	latency	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:6062	-	-	latency	accept	accept	-	-	

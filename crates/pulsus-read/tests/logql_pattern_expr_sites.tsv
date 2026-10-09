@@ -109,12 +109,13 @@ Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:13694	-	-	<a> <b>	accep
 Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:13723	-	-	<a> <b>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:13770	-	-	<_> <proc>[<pid>]: <msg>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:13811	-	-	<a> <_>	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:13855	-	-	<__error__>	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:13860	-	-	<a> <_>	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:13996	-	-	<a> <_>	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:14180	-	-	<p> <_>	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:14233	-	-	<a> <_>	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:14233	-	-	<a> <_>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:13861	-	-	<__error__>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:13866	-	-	<a> <_>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:13871	-	-	<__error__>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:14007	-	-	<a> <_>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:14191	-	-	<p> <_>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:14244	-	-	<a> <_>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:14244	-	-	<a> <_>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-server/tests/categorize_labels_differential.rs:201	-	-	PT <app> <trace_id> end	accept	accept	-	-	-
 Site	Literal	crates/pulsus-server/tests/fixtures/categorize_labels/capture.json:145	-	-	PT <app> <trace_id> end	accept	accept	-	-	-
 Site	Literal	docs/benchmarks/logs-differential-ledger.md:4189	-	-	<a> <a>	accept	reject	-	-	b25_pattern_expr_reject.test's eval_fail rows and the ledger's window-independence table -- THE ISSUE. Added by this change to pin the move, not moved by it
@@ -128,4 +129,4 @@ Site	Literal	docs/query-to-sql.md:408	-	-	…	panicked	reject	-	-	a doc-comment/
 Site	Literal	docs/query-to-sql.md:690	-	-	p	reject	reject	-	-	-
 Site	Literal	docs/query-to-sql.md:925	-	-	) | write the comparison as 	reject	reject	-	-	-
 Site	Literal	docs/query-to-sql.md:957	-	-	p	reject	reject	-	-	-
-Site	Literal	docs/query-to-sql.md:958	-	-	 the group may be empty where the reference still produced a value, so it is 	reject	reject	-	-	-
+Site	Literal	docs/query-to-sql.md:958	-	-	 the code writes no expression for the capture: 	reject	reject	-	-	-
