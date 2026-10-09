@@ -1373,7 +1373,7 @@ fn the_compile_sites_are_enumerated_from_the_callers_of_the_compiler() {
         ),
         (
             "exec.rs",
-            7,
+            9,
             0,
             "streams :1160, metric :1444 (incl. every binary leaf), the bucketed range \
              read's capability-join fallback, the extracted-field group key read, \
@@ -1392,7 +1392,13 @@ fn the_compile_sites_are_enumerated_from_the_callers_of_the_compiler() {
              pipeline, which is EMPTY by construction, so no user stage of any kind reaches \
              that compiler. The extracted-field group key read compiles a pipeline this \
              file's positions never write either: the planner admits only a `json` stage, \
-             label filters and an `unwrap` (issue #507), so no logfmt expression can be in it",
+             label filters and an `unwrap` (issue #507), so no logfmt expression can be in it. \
+             Issue #624 part 2 adds the eighth and ninth: a staged plan's pipeline, compiled \
+             before any read, and the same pipeline less its line filters, compiled for the \
+             fold. Both hold only the stages `label_only_pipeline` admits — line filters, \
+             label filters, `drop`, `keep`, `decolorize` — so no parser and no logfmt \
+             expression reaches them, and the bucketed fallback's pipeline, which a staged \
+             plan fills with those same stages, still holds none",
         ),
         (
             "plan.rs",

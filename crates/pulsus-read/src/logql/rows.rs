@@ -203,9 +203,7 @@ pub struct MetricInstantRow {
 /// uninterpreted; the reader decides what it means.
 ///
 /// **One row type, always four columns.** [`crate::logql::sql::ScanProjection::Lean`]
-/// would drop the fourth, and its only caller is `absent_over_time`, which
-/// is never lowered onto this path — the same argument [`MetricInstantRow`]
-/// already carries.
+/// would drop the fourth, and no read path takes it (issue #624 part 2).
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct MetricRangeBucketRow {
     pub fingerprint: Fingerprint,

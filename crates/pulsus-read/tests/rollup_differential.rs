@@ -688,10 +688,10 @@ async fn engine_query_on_the_client_agg_path_matches_the_sql_aggregated_count() 
         },
     );
 
-    // The base-label filter `env =~ "prod"` is a beyond-line-filter stage:
-    // it forces the client-aggregated mode (asserted below) without
-    // changing which rows survive — so the in-engine count must equal
-    // the SQL-aggregated truth exactly.
+    // The stage below forces the client-aggregated mode (asserted below)
+    // without changing which rows survive — so the in-engine count must
+    // equal the SQL-aggregated truth exactly. It was the base-label filter
+    // `env =~ "prod"` until the two notes that follow.
     //
     // **Why the regular-expression operator and not `=`** (issue #544):
     // an equality or inequality over a name the merged label set resolves
@@ -701,7 +701,12 @@ async fn engine_query_on_the_client_agg_path_matches_the_sql_aggregated_count() 
     // cell — the reference's own regex label matcher disagrees with the
     // pattern it says it compiles — so it still evaluates in-engine, and
     // it still keeps every row, which is what this comparison needs.
-    let query = r#"count_over_time({env="prod"} |= "longer" | env =~ "prod" [1m])"#;
+    //
+    // **And why not that either, since issue #624 part 2**: a label filter
+    // now lowers too, with its stage run over the statement's rows. The
+    // stage below rewrites every line to itself, so it keeps every row and
+    // its bytes, and no counting reducer lowers over a line a stage rewrote.
+    let query = r#"count_over_time({env="prod"} |= "longer" | line_format "{{__line__}}" [1m])"#;
     let params = QueryParams {
         spec: QuerySpec::Range {
             start_ns: w.start_ns,
@@ -714,7 +719,7 @@ async fn engine_query_on_the_client_agg_path_matches_the_sql_aggregated_count() 
     let mp = metric_plan(query, &params, db);
     assert!(
         mp.client.is_some(),
-        "the label filter must force client aggregation"
+        "the line rewrite must force client aggregation"
     );
 
     let expr = parse(query).expect("parse");

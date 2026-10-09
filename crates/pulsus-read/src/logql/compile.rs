@@ -509,8 +509,23 @@ impl Lower<Lql> for LabelFilterLower {
     }
     /// It drops lines in the evaluator, and a NUMERIC comparison in it can
     /// raise a pipeline error on a value that does not convert.
+    ///
+    /// **Issue #624, part 2: a filter over names constant per group keeps
+    /// `exact`.** With the column set closed — no parser or `| unpack` has
+    /// opened it — every name the filter reads is a stream label or a
+    /// structured-metadata key, unless a stage computed it in the evaluator.
+    /// Such a name has one value across every line of a `(fingerprint,
+    /// structured_metadata)` group, so the filter keeps or drops whole
+    /// groups, and applying it after the statement's `GROUP BY` drops the
+    /// same lines as applying it before.
     fn residual_effect(&self, s: &LqlLink, mut rel: Relation<Lql>) -> Relation<Lql> {
-        rel.exact = false;
+        let constant_per_group = match s {
+            LqlLink::Pipe(Stage::LabelFilter(expr)) => filter_reads_group_constants(expr, &rel),
+            _ => false,
+        };
+        if !constant_per_group {
+            rel.exact = false;
+        }
         if let LqlLink::Pipe(Stage::LabelFilter(expr)) = s
             && holds_a_numeric_comparison(expr)
         {
@@ -541,6 +556,33 @@ impl Lower<Lql> for LabelFilterLower {
 /// The structured-metadata class the fold lowers (issue #544). See
 /// [`LabelFilterLower::capability`] for what each condition is the model's
 /// half of.
+/// Whether every name `expr` reads is constant across a `(fingerprint,
+/// structured_metadata)` group (issue #624, part 2): the column set is
+/// closed, and no name is a column only the evaluator computes.
+fn filter_reads_group_constants(expr: &LabelFilterExpr, rel: &Relation<Lql>) -> bool {
+    if !matches!(rel.cols, ColSet::Closed(_)) {
+        return false;
+    }
+    let mut constant = true;
+    pulsus_logql::for_each_label_filter(expr, |node: &LabelFilterExpr| {
+        let name = match node {
+            LabelFilterExpr::Match(m) => m.name.as_str(),
+            LabelFilterExpr::Compare { name, .. } | LabelFilterExpr::Ip { name, .. } => {
+                name.as_str()
+            }
+            LabelFilterExpr::And(_, _) | LabelFilterExpr::Or(_, _) => return,
+        };
+        let evaluator_only =
+            rel.cols.known().iter().any(|c| {
+                c.name.as_str() == name && matches!(c.provenance, Provenance::EvaluatorOnly)
+            });
+        if evaluator_only || name == BODY || name == TIMESTAMP_NS {
+            constant = false;
+        }
+    });
+    constant
+}
+
 fn metadata_filter_lowers_here(expr: &LabelFilterExpr, rel: &Relation<Lql>) -> bool {
     if !matches!(rel.cols, ColSet::Closed(_)) {
         return false;
@@ -924,18 +966,18 @@ impl Lower<Lql> for WindowLower {
 }
 
 impl Lower<Lql> for RangeAggLower {
-    /// `AbsentOverTime` is `Never`: the answer is a statement about rows
-    /// that are **absent**, so there is no row to compute it from.
+    /// `AbsentOverTime` lowers with `count()` (issue #624, part 2): the
+    /// statement's count rows say which windows hold a line, and the answer
+    /// is 1 at every grid point none does — presence, which a count above
+    /// zero is.
     fn capability(&self, s: &LqlLink, rel: &Relation<Lql>) -> Capability {
         let LqlLink::RangeAgg { op, .. } = s else {
             return Capability::No(BlockReason::NotYetLowered);
         };
-        if matches!(op, RangeAggOp::AbsentOverTime) {
-            return Capability::Never(NeverReason::NoRowToComputeFrom);
-        }
         // Four of the fifteen reducers accumulate INTEGERS, so summing the
         // database's per-group partials reproduces the single accumulator
-        // exactly. The other ten take an `f64` sample through `| unwrap`,
+        // exactly, and `absent_over_time` reads presence from the same
+        // counts. The other ten take an `f64` sample through `| unwrap`,
         // and a sum of `f64`s is not associative.
         if !matches!(
             op,
@@ -943,8 +985,17 @@ impl Lower<Lql> for RangeAggLower {
                 | RangeAggOp::BytesOverTime
                 | RangeAggOp::Rate
                 | RangeAggOp::BytesRate
+                | RangeAggOp::AbsentOverTime
         ) {
             return Capability::No(BlockReason::NotYetLowered);
+        }
+        // Issue #624, part 2: a bytes reducer sums the length of the line
+        // AFTER the pipeline; once a stage has rewritten the line, the
+        // stored `length(body)` is not that length.
+        if matches!(op, RangeAggOp::BytesOverTime | RangeAggOp::BytesRate)
+            && rel.cols.resolve(&Name::from(BODY)).is_none()
+        {
+            return Capability::No(BlockReason::NameNotResolvable);
         }
         // `rate` is the one of the four that ADMITS `| unwrap`, and with
         // one its accumulator is an `f64` sum. The exclusion is carried by
@@ -1415,8 +1466,9 @@ mod tests {
     /// Issue #492: every LogQL link's residual state effect is the one
     /// the design record states.
     ///
-    /// **Twenty rows** — thirteen `Pipe` rows (the line filter, the four
-    /// parser forms, the label filter, `line_format`, `label_format`,
+    /// **Twenty-one rows** — fourteen `Pipe` rows (the line filter, the four
+    /// parser forms, the label filter over a parsed name and over group
+    /// constants (issue #624 part 2), `line_format`, `label_format`,
     /// `unwrap`, `unpack`, `decolorize`, `drop`, `keep`) and seven
     /// synthesised links (`Window`, `RangeAgg`, `VectorAgg`,
     /// `LabelReplace`, `Order`, `Limit`, `Emit`).
@@ -1478,15 +1530,40 @@ mod tests {
             });
         }
 
+        // A label filter over a name a parser may have made clears
+        // `exact`: it drops lines in the evaluator.
         rows.push(EffectRow {
             name: "LabelFilter",
+            link: LqlLink::Pipe(stage(r#"| a="x""#)),
+            s1: widened(with_exact(base(LqlKind::Lines, CLEAN), true), "parser:json"),
+            s2: widened(
+                with_exact(base(LqlKind::Samples, RAISABLE), true),
+                "parser:json",
+            ),
+            e1: widened(
+                with_exact(base(LqlKind::Lines, CLEAN), false),
+                "parser:json",
+            ),
+            e2: widened(
+                with_exact(base(LqlKind::Samples, RAISABLE), false),
+                "parser:json",
+            ),
+            effect_is_constant: false,
+            has_effect: true,
+        });
+        // Issue #624 part 2: over a closed column set every name is a stream
+        // label or a metadata key, constant across a `(fingerprint,
+        // structured_metadata)` group, so the filter keeps or drops whole
+        // groups and `exact` stays. Its stated effect is none.
+        rows.push(EffectRow {
+            name: "LabelFilter over group constants",
             link: LqlLink::Pipe(stage(r#"| level="error""#)),
             s1: with_exact(base(LqlKind::Lines, CLEAN), true),
             s2: with_exact(base(LqlKind::Samples, RAISABLE), true),
-            e1: with_exact(base(LqlKind::Lines, CLEAN), false),
-            e2: with_exact(base(LqlKind::Samples, RAISABLE), false),
+            e1: with_exact(base(LqlKind::Lines, CLEAN), true),
+            e2: with_exact(base(LqlKind::Samples, RAISABLE), true),
             effect_is_constant: false,
-            has_effect: true,
+            has_effect: false,
         });
 
         // A line rewrite leaves the line with no resolvable expression
@@ -1773,7 +1850,7 @@ mod tests {
             has_effect: true,
         });
 
-        assert_every_residual_state_effect::<Lql>(&rows, 20);
+        assert_every_residual_state_effect::<Lql>(&rows, 21);
     }
 
     /// Issue #507, W2 — a label filter makes the pipeline error raisable
@@ -2036,11 +2113,12 @@ mod tests {
     /// match below is exhaustive with no `_` arm: a sixteenth variant is a
     /// build failure here rather than a silent absence from the census.
     ///
-    /// Four lower. Ten require `| unwrap`, whose sample is an `f64`, and a
-    /// sum of `f64`s is not associative, so summing the database's
-    /// per-group partials need not reproduce the single accumulator.
-    /// `absent_over_time` is the one permanent refusal: its answer is about
-    /// rows that are absent, and there is no row to compute it from.
+    /// Five lower: the four counting reducers, and — since issue #624
+    /// part 2 — `absent_over_time`, which reads presence from the same
+    /// counts. Ten require `| unwrap`, whose sample is an `f64`, and a sum
+    /// of `f64`s is not associative, so summing the database's per-group
+    /// partials need not reproduce the single accumulator. None is a
+    /// permanent refusal any more.
     #[test]
     fn ac33_reducer_census() {
         const MIN: i64 = 60_000_000_000;
@@ -2081,9 +2159,15 @@ mod tests {
         lowered.sort_unstable();
         assert_eq!(
             lowered,
-            vec!["bytes_over_time", "bytes_rate", "count_over_time", "rate"]
+            vec![
+                "absent_over_time",
+                "bytes_over_time",
+                "bytes_rate",
+                "count_over_time",
+                "rate"
+            ]
         );
-        assert_eq!(never, vec!["absent_over_time"]);
+        assert!(never.is_empty(), "{never:?}");
         assert_eq!(blocked.len(), 10, "{blocked:?}");
     }
 

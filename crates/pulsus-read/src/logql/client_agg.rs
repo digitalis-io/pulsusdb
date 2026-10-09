@@ -2379,8 +2379,11 @@ impl<'q> RangeSlideState<'q> {
         };
         // A label-routed INERT row's output set is `base_labels[fp]`, a
         // per-fingerprint constant — so it need not be rendered or cloned
-        // per row. This is arms B and C's whole cost.
-        let base_member = inert && matches!(route, RowRoute::Labels);
+        // per row. This is arms B and C's whole cost. `absent_over_time` is
+        // label-blind and stages no output set at all, so it never takes
+        // one (issue #624 part 2: its read failed to decode before, and this
+        // row was never reached).
+        let base_member = inert && matches!(route, RowRoute::Labels) && !self.is_absent;
         self.coll_active = true;
         self.coll_fp = row.fingerprint;
         self.coll_ts = row.timestamp_ns;

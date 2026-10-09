@@ -111,3 +111,42 @@ pub(in crate::logql) fn fold_labels(pairs: &[(&str, &str)]) -> LabelSet {
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect()
 }
+
+// ---- Issue #624, part 2: counting behind label-only stages ----
+
+/// The pipelines [`super::plan::label_only_pipeline`] admits, as they
+/// follow a selector (issue #624, part 2). One list for the pipeline-level test (T1) and the
+/// planner's (T2), so a stage admitted by one and not exercised by the other
+/// cannot pass both.
+pub(in crate::logql) const ADMITTED_PIPELINES: &[&str] = &[
+    "| drop x",
+    r#"| drop x="1""#,
+    r#"| drop x=~"1.*""#,
+    "| keep a",
+    r#"| keep a, x="1""#,
+    r#"| x="y""#,
+    r#"| x=~"y.+""#,
+    r#"| x!~"y.+""#,
+    "| n > 5",
+    "| n >= 5.5",
+    "| d > 1s",
+    "| b > 1KB",
+    r#"| addr = ip("10.0.0.0/8")"#,
+    r#"| x=~"1" and n > 5"#,
+    r#"| x=~"1" or n > 5"#,
+    "| decolorize",
+    "| drop __error__",
+    r#"|= "tok" | drop x"#,
+];
+
+/// The pipelines [`super::plan::label_only_pipeline`] refuses: each reads or rewrites the
+/// line a later stage or the reducer depends on (issue #624, part 2).
+pub(in crate::logql) const REFUSED_PIPELINES: &[&str] = &[
+    r#"| line_format "x""#,
+    r#"|= ip("1.2.3.4")"#,
+    "| json",
+    "| logfmt",
+    r#"| decolorize |= "a""#,
+    "| label_format a=b",
+    "| unpack",
+];

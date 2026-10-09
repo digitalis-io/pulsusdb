@@ -380,14 +380,16 @@ fn every_planned_range_leaf_that_is_not_a_clean_bucketed_chain_is_client_aggrega
             "bytes_over_time({",
             "rate({",
             "bytes_rate({",
+            // Issue #624 part 2: presence, from the same counts.
+            "absent_over_time({",
         ];
         // `variants(...)` plans ONE multi-extractor scan with
         // `force_client = true` — its leaf is a scan shared by every
         // variant, not a chain of its own, so it never lowers however
         // clean the extractor looks.
         reducers.iter().any(|r| query.contains(r))
-            && !query.contains('|')
             && !query.contains("variants(")
+            && staged_stages(query).is_some()
     };
     for (step_ns, reason) in [
         (
@@ -438,7 +440,16 @@ fn every_planned_range_leaf_that_is_not_a_clean_bucketed_chain_is_client_aggrega
                         "`{query}` at step {step_ns} is a clean counting chain, so its \
                          aggregation must lower into the statement (issues #507 / #624)"
                     );
-                    assert_eq!(mp.routing.reason, reason, "{query} at step {step_ns}");
+                    // Issue #624 part 2: label stages, or `absent_over_time`,
+                    // run over the statement's rows, and the reason says so.
+                    let staged = staged_stages(query).is_some_and(|n| n > 0)
+                        || query.contains("absent_over_time(");
+                    let want = if staged {
+                        "raw: range aggregation in the database, label stages over its rows (issue #624)"
+                    } else {
+                        reason
+                    };
+                    assert_eq!(mp.routing.reason, want, "{query} at step {step_ns}");
                 } else {
                     client += 1;
                     assert!(
@@ -455,6 +466,40 @@ fn every_planned_range_leaf_that_is_not_a_clean_bucketed_chain_is_client_aggrega
              client-aggregated"
         );
     }
+}
+
+/// The count of label-only stages in a single-reducer query's pipeline, or
+/// `None` when it holds any other stage (issue #624, part 2). Read from the
+/// query text, so it shares nothing with the planner: a stage is `drop`,
+/// `keep`, `decolorize` (not under a bytes reducer), or a filter on a label
+/// name with a string matcher; a line filter (`|=`, `|~`, `!=`, `!~`) or
+/// anything else is not one.
+fn staged_stages(query: &str) -> Option<usize> {
+    let open = query.find("({")?;
+    let close = query[open..]
+        .find('[')
+        .map(|i| open + i)
+        .unwrap_or(query.len());
+    let selector_end = query[open..close].find('}').map(|i| open + i + 1)?;
+    let pipeline = &query[selector_end..close];
+    let bytes = query.contains("bytes_over_time(") || query.contains("bytes_rate(");
+    let mut stages = 0usize;
+    for segment in pipeline.split('|').skip(1) {
+        let segment = segment.trim();
+        let label_filter = segment.split_once(['=', '!']).is_some_and(|(name, _)| {
+            let name = name.trim();
+            !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }) && segment.contains('"');
+        let admitted = segment.starts_with("drop ")
+            || segment.starts_with("keep ")
+            || (segment == "decolorize" && !bytes)
+            || label_filter;
+        if !admitted {
+            return None;
+        }
+        stages += 1;
+    }
+    Some(stages)
 }
 
 /// `cargo test -p pulsus-read --test logql_plan_build_differential -- --ignored zz_regenerate`

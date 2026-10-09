@@ -1465,6 +1465,66 @@ async fn metric_range_sliding_statement_prunes_on_the_service_fingerprint_timest
     assert_eq!(usage, expected_metric_instant_raw_usage());
 }
 
+/// T8 (issue #624, part 2): a counting range read behind a label-only
+/// stage reads the same statement as the clean query — the sliding
+/// statement, primary-key pruned — and runs the stage over its rows.
+#[tokio::test]
+async fn a_staged_range_reads_the_lowered_statement() {
+    skip_unless_live!();
+    let db = &pulsus_testkit::test_db("pulsus_read_it_staged_range");
+    let ts_ns = now_ns();
+    let client = setup(db, ts_ns).await;
+
+    let render = |mp: &pulsus_read::logql::MetricPlan| {
+        sql::metric_range_sliding(
+            sql::MetricSource::new(
+                &format!("{db}.log_samples"),
+                mp.source_shape().expect("a counting plan"),
+            ),
+            &[literal("checkout")],
+            &[Fingerprint::from_raw(u128::from(FP_PROD)).sql_literal()],
+            sql::SlidingScan {
+                window: TimeWindow {
+                    start_ns: mp.start_ns,
+                    end_ns: mp.end_ns,
+                },
+                lower: mp.scan_lower,
+                grid_start_ns: mp.grid_start_ns,
+                step_ns: mp.step_ns.expect("a range plan has a step").get(),
+                range_ns: mp.range_ns.get(),
+            },
+            &mp.extra_predicates,
+        )
+        .expect("a renderable sliding statement")
+    };
+    let staged = metric_plan(
+        r#"count_over_time({env="prod"} | drop x [5m])"#,
+        &range_params(ts_ns),
+        db,
+    );
+    assert!(
+        staged.client.is_none(),
+        "the label stage runs over the statement's rows"
+    );
+    assert_eq!(
+        staged.routing.reason,
+        "raw: range aggregation in the database, label stages over its rows (issue #624)"
+    );
+    let clean = metric_plan(
+        r#"count_over_time({env="prod"}[5m])"#,
+        &range_params(ts_ns),
+        db,
+    );
+    let sql = render(&staged);
+    assert_eq!(
+        sql,
+        render(&clean),
+        "the staged query reads the clean query's statement"
+    );
+    let usage = explain(&client, &sql).await;
+    assert_eq!(usage, expected_metric_instant_raw_usage());
+}
+
 /// Issue #169 Tier-1 gate: the `/volume` rollup aggregation carries the
 /// identical `(fingerprint IN, bucket_ns > s AND <= e)` predicate family
 /// as the rollup metric reads, so its `EXPLAIN indexes = 1` extract must
