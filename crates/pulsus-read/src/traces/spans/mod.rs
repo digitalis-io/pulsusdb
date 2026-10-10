@@ -19,6 +19,7 @@
 //! * [`tracelevel`] — the search statement's trace-level intrinsics and
 //!   `span:childCount` (issue #594 part 1).
 
+pub mod attr_index;
 pub mod fetch;
 pub mod predicate;
 pub mod projection;

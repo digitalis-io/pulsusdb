@@ -189,6 +189,7 @@ pub(crate) fn schema_params_from(config: &Config) -> SchemaParams {
         log_dedup_window: config.log_dedup_window,
         trace_landing_retention_hours: config.trace_landing_retention_hours,
         trace_dedup_window: config.trace_dedup_window,
+        trace_indexed_attributes: config.traceql_indexed_attributes.clone(),
     }
 }
 
@@ -480,7 +481,13 @@ pub(crate) fn trace_read_config_from(config: &Config) -> TraceReadConfig {
 pub(crate) fn trace_engine(pool: Arc<ChPool>, config: &Config) -> Result<TraceEngine, ChError> {
     let client = ChClient::from_shared_pool(pool, config.query_timeout.0)
         .with_consistency(consistency_from(config))?;
-    Ok(TraceEngine::new(client, trace_read_config_from(config)))
+    Ok(
+        TraceEngine::new(client, trace_read_config_from(config)).with_indexed_attrs(
+            pulsus_read::traces::spans::attr_index::IndexedAttr::from_config(
+                &config.traceql_indexed_attributes,
+            ),
+        ),
+    )
 }
 
 #[cfg(test)]

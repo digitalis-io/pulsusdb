@@ -878,6 +878,28 @@ fn leb128_len(mut n: u64) -> u64 {
     bytes
 }
 
+/// The bloom-filter index expression over one span attribute key (issue
+/// #595 part 2): every string the key holds on the span, as a scalar or
+/// as an array element, a missing one as `''`. The schema renders it into
+/// the index and the search compiler into the `indexHint` that reaches
+/// it, so the two are one text. `key` is a validated
+/// `traceql_indexed_attributes` key: no backtick can occur in it.
+pub fn span_attr_index_expr(key: &str) -> String {
+    let p = escape_json_path(key);
+    format!(
+        "arrayMap(x -> ifNull(x, ''), arrayConcat(attrs.`{p}`.:`Array(Nullable(String))`, [attrs.`{p}`.:String]))"
+    )
+}
+
+/// [`span_attr_index_expr`] for a span-event attribute key: every string
+/// any of the span's events holds under it.
+pub fn event_attr_index_expr(key: &str) -> String {
+    let p = escape_json_path(key);
+    format!(
+        "arrayMap(x -> ifNull(x, ''), arrayConcat(events.attrs.`{p}`.:String, arrayFlatten(events.attrs.`{p}`.:`Array(Nullable(String))`)))"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

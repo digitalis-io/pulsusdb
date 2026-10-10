@@ -16,6 +16,16 @@ use crate::traces::spans::search::{
 };
 
 impl TraceEngine {
+    /// The attribute indexes this engine's search statements may hint
+    /// (issue #595 part 2): `PULSUS_TRACEQL_INDEXED_ATTRIBUTES`.
+    pub fn with_indexed_attrs(
+        mut self,
+        indexed: Vec<crate::traces::spans::attr_index::IndexedAttr>,
+    ) -> Self {
+        self.indexed = indexed;
+        self
+    }
+
     /// Runs `stmt`'s top-K over the newest 5 minutes of the window, then
     /// 10, then 20, while the slice holds fewer than `limit` traces and
     /// its density says doubling is cheaper than the window: `n * k >=
@@ -42,6 +52,7 @@ impl TraceEngine {
                 &self.config.traces_table,
                 &self.config.resources_table,
                 self.config.max_depth,
+                &self.indexed,
                 Some(len),
             )
             .expect("a statement that compiled whole compiles sliced");

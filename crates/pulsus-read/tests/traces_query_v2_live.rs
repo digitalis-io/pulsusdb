@@ -1458,6 +1458,7 @@ fn ctx_of(w: WindowSql) -> PredicateCtx<'static> {
         window: w,
         spans_table: SPANS_TABLE,
         resources_table: RESOURCES_TABLE,
+        indexed: &[],
     }
 }
 
@@ -7278,8 +7279,15 @@ fn plan_of(
 /// Whether the fork's coverage function gives `plan` a statement, with
 /// [`engine_config`]'s tables.
 fn covered(plan: &pulsus_read::SearchPlan) -> bool {
-    pulsus_read::traces::spans::search::plan_statement(plan, "spans", "traces", "resources", 64)
-        .is_some()
+    pulsus_read::traces::spans::search::plan_statement(
+        plan,
+        "spans",
+        "traces",
+        "resources",
+        64,
+        &[],
+    )
+    .is_some()
 }
 
 /// The inventory's `new` rows, by name.
@@ -11208,6 +11216,7 @@ async fn a_slice_the_budget_refuses_falls_back_to_the_window() {
             "traces",
             "resources",
             64,
+            &[],
             slice,
         )
         .expect("covered")
@@ -11247,5 +11256,232 @@ async fn a_slice_the_budget_refuses_falls_back_to_the_window() {
         (last_bytes(&out), stages.join(" "), out.partial),
         (want, stages595(1, true), false),
         "the answer, the explain stages and partial"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Issue #595 part 2: operator-named attribute indexes
+// ---------------------------------------------------------------------
+
+const P2_ATTRS: [&str; 3] = [
+    "span.app.request.id",
+    "span.app.code",
+    "event.exception.type",
+];
+
+/// `fresh_db`, its schema rendered with `attrs` as
+/// `PULSUS_TRACEQL_INDEXED_ATTRIBUTES`.
+async fn fresh_db_with_attrs(db: &str, attrs: &[&str]) -> ChClient {
+    let admin = ChClient::new(base_config()).await.expect("connect admin");
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the test database");
+    let ctx = SchemaParams {
+        trace_indexed_attributes: attrs.iter().map(|a| a.to_string()).collect(),
+        ..RenderCtx::for_tests(db)
+    };
+    run_init(&admin, &ctx).await.expect("run_init");
+    ChClient::new(ChConnConfig {
+        database: db.to_string(),
+        ..base_config()
+    })
+    .await
+    .expect("connect to the test database")
+}
+
+/// Fixture A (issue #595 part 2): 40,000 one-span traces, trace id the
+/// little-endian `t`, one per millisecond, in one part of twenty granules.
+/// Span `t` has `app.request.id = "r<t>"` and name `op`, except: `t =
+/// 5000` adds `app.code = "500"` (a string), `t = 10000` `app.code = 500`
+/// (an integer), `t = 20000` `app.code = ["500"]` (a string array),
+/// `t = 17000` one event with `exception.type = "boom-17000"`, `t = 25000`
+/// one event with `exception.type = ["boom-a", "boom-b"]`, `t = 30000`
+/// is named `rare-op`, and `t = 35000` has no span attribute and
+/// resource 3, whose `app.request.id` is `"r-res"`.
+async fn seed_fixture_a(db: &str, attrs: &[&str]) -> (ChClient, (i64, i64)) {
+    let client = fresh_db_with_attrs(db, attrs).await;
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000 - 60_000_000_000;
+    run_bounded(
+        &client,
+        format!(
+            "INSERT INTO {SPANS_TABLE} (trace_id, span_id, parent_span_id, start_ns, duration_ns, \
+             service, resource_id, name, kind, end_ns, service_type, status_code, attrs, events) \
+             SELECT reinterpretAsFixedString(toUInt128(t)), reinterpretAsFixedString(cityHash64(t)), \
+             toFixedString('', 8), {base_ns} + t * 1000000, 1000000, 'checkout', \
+             if(t = 35000, 3, 1), if(t = 30000, 'rare-op', 'op'), 2, \
+             toUInt64({base_ns} + t * 1000000 + 1000000), 'string', 0, \
+             if(t = 35000, '{{}}', concat('{{\"app%2Erequest%2Eid\":\"r', toString(t), '\"', \
+                    multiIf(t = 5000, ',\"app%2Ecode\":\"500\"', t = 10000, ',\"app%2Ecode\":500', \
+                            t = 20000, ',\"app%2Ecode\":[\"500\"]', ''), '}}')), \
+             CAST(multiIf(t = 17000, [tuple(toUInt64({base_ns} + t * 1000000), 'exception', \
+                  '{{\"exception%2Etype\":\"boom-17000\"}}', '', toUInt32(0))], \
+                  t = 25000, [tuple(toUInt64({base_ns} + t * 1000000), 'exception', \
+                  '{{\"exception%2Etype\":[\"boom-a\",\"boom-b\"]}}', '', toUInt32(0))], []), \
+                  'Array(Tuple(time_ns UInt64, name LowCardinality(String), attrs JSON, attrs_other String, dropped_attrs UInt32))') \
+             FROM (SELECT number AS t FROM numbers(40000))"
+        ),
+    )
+    .await;
+    run_bounded(
+        &client,
+        format!(
+            "INSERT INTO {RESOURCES_TABLE} (day, resource_id, service, attrs) VALUES \
+             (toDate(fromUnixTimestamp64Nano({base_ns}), 'UTC'), 1, 'checkout', '{{}}'), \
+             (toDate(fromUnixTimestamp64Nano({base_ns}), 'UTC'), 3, 'checkout', '{{\"app%2Erequest%2Eid\":\"r-res\"}}')"
+        ),
+    )
+    .await;
+    run_bounded(&client, TRACES_FROM_SPANS.to_string()).await;
+    run_bounded(&client, format!("OPTIMIZE TABLE {SPANS_TABLE} FINAL")).await;
+    (client, (base_ns, base_ns + 60_000_000_000))
+}
+
+/// Issue #595 part 2: over fixture A, with the three attributes indexed
+/// and named to the engine, each query answers its literal traces, and
+/// the four point queries read at most six granules; the same answers
+/// come back when the engine names none, and when it names them but the
+/// schema carries no index.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_indexed_attribute_reads_only_its_granules_and_answers_as_before() {
+    skip_unless_live!();
+    use pulsus_read::traces::spans::attr_index::IndexedAttr;
+    let named = IndexedAttr::from_config(&P2_ATTRS.map(str::to_string));
+    let cases: [(&str, Vec<u128>, bool); 9] = [
+        (r#"{ span.app.request.id = "r17000" }"#, vec![17000], true),
+        (r#"{ event.exception.type = "boom-b" }"#, vec![25000], true),
+        (r#"{ span.app.request.id = "nosuch" }"#, vec![], true),
+        (
+            r#"{ event.exception.type = "boom-17000" }"#,
+            vec![17000],
+            true,
+        ),
+        (r#"{ span.app.code = "500" }"#, vec![20000, 5000], false),
+        ("{ span.app.code = 500 }", vec![10000], false),
+        (
+            r#"{ span.app.request.id = "r17000" || name = "rare-op" }"#,
+            vec![30000, 17000],
+            false,
+        ),
+        (
+            r#"{ !(span.app.request.id = "r17000") && name = "rare-op" }"#,
+            vec![30000],
+            false,
+        ),
+        (r#"{ .app.request.id = "r-res" }"#, vec![35000], false),
+    ];
+    let mut wrong = Vec::new();
+    for (label, schema_attrs, engine_attrs, bound) in [
+        ("indexed and named", &P2_ATTRS[..], named.clone(), true),
+        ("indexed, not named", &P2_ATTRS[..], Vec::new(), false),
+        ("named, not indexed", &[][..], named.clone(), false),
+    ] {
+        let db = pulsus_testkit::test_db(&format!("pulsus_read_it_t595p2_{}", label.len()));
+        let (client, w) = seed_fixture_a(&db, schema_attrs).await;
+        let engine = engine_of(&db).await.with_indexed_attrs(engine_attrs);
+        for (query, want, point) in &cases {
+            let plan = plan_of(&engine, &parse_query(query), w, 20, 3);
+            let t0 = now_ns();
+            let out = engine
+                .search_routed(&plan)
+                .await
+                .unwrap_or_else(|e| panic!("{query}: {e}"));
+            let rows = read_rows_since(&client, &db, t0).await;
+            let got: Vec<u128> = out
+                .traces
+                .iter()
+                .map(|t| u128::from_le_bytes(t.trace_id))
+                .collect();
+            eprintln!("P2\t{label}\t{query}\t{rows}\t{got:?}");
+            if &got != want {
+                wrong.push(format!("{label}: {query}: {got:?}, want {want:?}"));
+            }
+            if bound && *point && rows > 12_288 {
+                wrong.push(format!(
+                    "{label}: {query}: {rows} rows read, more than six granules"
+                ));
+            }
+        }
+        drop_db(&db).await;
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// The peak memory of the one `INSERT INTO spans` statement run in `db`
+/// since `t0_ns`, and how many wide `spans` parts were created there
+/// since then. The logs are flushed until the insert's row is there, for
+/// up to 30 s.
+async fn spans_insert_memory_and_wide_parts(client: &ChClient, db: &str, t0_ns: i64) -> (u64, u64) {
+    let since = format!("toDateTime64({}, 6)", t0_ns as f64 / 1e9);
+    let inserts = format!(
+        "FROM system.query_log WHERE type = 'QueryFinish' AND query_kind = 'Insert' \
+         AND current_database = '{db}' AND startsWith(query, 'INSERT INTO spans ') \
+         AND event_time_microseconds >= {since}"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        client
+            .execute(
+                "SYSTEM FLUSH LOGS",
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("flush the logs");
+        let n = count(client, &format!("SELECT count() AS n {inserts}")).await;
+        if n == 1 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{db}: {n} logged inserts into spans after 30 s, want one"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    let peak = count(
+        client,
+        &format!("SELECT toUInt64(memory_usage) AS n {inserts}"),
+    )
+    .await;
+    let wide = count(
+        client,
+        &format!(
+            "SELECT count() AS n FROM system.part_log WHERE event_type = 'NewPart' \
+             AND database = '{db}' AND table = 'spans' AND part_type = 'Wide' \
+             AND event_time_microseconds >= {since}"
+        ),
+    )
+    .await;
+    (peak, wide)
+}
+
+/// Issue #595 part 2, D8: fixture A's insert with three attribute indexes
+/// writes a wide part, which without adaptive write buffers takes a
+/// buffer per column stream and over four times the unindexed insert's
+/// memory. With them it stays within twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn three_attribute_indexes_keep_the_fixture_a_insert_within_twice_its_unindexed_memory() {
+    skip_unless_live!();
+    let mut got = Vec::new();
+    for (label, attrs) in [("none", &[][..]), ("three", &P2_ATTRS[..])] {
+        let db = pulsus_testkit::test_db(&format!("pulsus_read_it_t595p2_mem_{label}"));
+        let t0 = now_ns();
+        let (client, _) = seed_fixture_a(&db, attrs).await;
+        got.push(spans_insert_memory_and_wide_parts(&client, &db, t0).await);
+        drop_db(&db).await;
+    }
+    let ((plain, plain_wide), (indexed, indexed_wide)) = (got[0], got[1]);
+    assert_eq!(
+        (plain_wide, indexed_wide),
+        (0, 1),
+        "the unindexed insert must write a compact part and the indexed one a wide part"
+    );
+    assert!(
+        indexed <= 2 * plain,
+        "three indexes: {indexed} bytes, more than twice the unindexed {plain}"
     );
 }

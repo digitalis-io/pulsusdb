@@ -196,6 +196,7 @@ async fn run_logs_read(args: BenchArgs) -> anyhow::Result<()> {
         log_dedup_window: 10_000,
         trace_landing_retention_hours: 6,
         trace_dedup_window: 10_000,
+        trace_indexed_attributes: Vec::new(),
     };
     eprintln!(
         "=== initializing schema (db={}, cluster={:?}) ===",

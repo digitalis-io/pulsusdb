@@ -487,8 +487,12 @@ pub fn compile_search_filter(
     filters_of(spanset, &mut filters)?;
     let predicates: Vec<SpanPredicate> = filters
         .iter()
-        .map(|f| compile_span_predicate_in(&body_of(f), ctx))
-        .collect::<Result<_, _>>()?;
+        .map(|f| {
+            let body = body_of(f);
+            let p = compile_span_predicate_in(&body, ctx)?;
+            Ok(p.with_hints(&super::attr_index::index_hints(&body, ctx.indexed)))
+        })
+        .collect::<Result<_, PlanError>>()?;
     if let (SpansetExpr::Filter(_), [_]) = (spanset, predicates.as_slice()) {
         let p = predicates.into_iter().next().expect("one filter");
         return Ok(SearchFilter::One(p));
@@ -1301,6 +1305,7 @@ pub fn plan_statement(
     traces_table: &str,
     resources_table: &str,
     max_depth: u32,
+    indexed: &[super::attr_index::IndexedAttr],
 ) -> Option<SearchStatement> {
     plan_statement_sliced(
         plan,
@@ -1308,6 +1313,7 @@ pub fn plan_statement(
         traces_table,
         resources_table,
         max_depth,
+        indexed,
         None,
     )
 }
@@ -1320,6 +1326,7 @@ pub fn plan_statement_sliced(
     traces_table: &str,
     resources_table: &str,
     max_depth: u32,
+    indexed: &[super::attr_index::IndexedAttr],
     slice_ns: Option<i64>,
 ) -> Option<SearchStatement> {
     let window = WindowSql::start_closed_end_open(plan.window.start_ns, plan.window.end_ns);
@@ -1336,6 +1343,7 @@ pub fn plan_statement_sliced(
         window,
         spans_table,
         resources_table,
+        indexed,
     };
     let query = Query {
         spanset: plan.spanset.clone(),
@@ -1582,6 +1590,7 @@ mod charge_tests {
             window: w,
             spans_table: "spans",
             resources_table: "resources",
+            indexed: &[],
         };
         compile_search(&q, &ctx, "spans", "traces", 20, 3).expect("compiles")
     }
@@ -1760,6 +1769,7 @@ mod charge_tests {
             window: w,
             spans_table: "spans",
             resources_table: "resources",
+            indexed: &[],
         };
         let s = compile_search(&q, &ctx, "spans", "traces", 20, 3).expect("compiles");
         let grouping = s.grouping().expect("grouped");
@@ -1817,6 +1827,7 @@ mod charge_tests {
             window: w,
             spans_table: "spans",
             resources_table: "resources",
+            indexed: &[],
         };
         let s = compile_search(&q, &ctx, "spans", "traces", 20, 3).expect("compiles");
         let grouping = s.grouping().expect("an aggregate is one group");

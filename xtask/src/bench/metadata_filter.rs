@@ -179,6 +179,7 @@ pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
         log_dedup_window: 10_000,
         trace_landing_retention_hours: 6,
         trace_dedup_window: 10_000,
+        trace_indexed_attributes: Vec::new(),
     };
     run_init(&admin, &schema).await?;
     let mut data_cfg = admin_cfg.clone();
