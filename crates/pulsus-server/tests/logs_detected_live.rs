@@ -30,7 +30,7 @@
 //!
 //! ```text
 //! podman run -d --rm --name pulsus-ch-test -p 19123:8123 -p 19000:9000 \
-//!     clickhouse/clickhouse-server:26.3
+//!     clickhouse/clickhouse-server:26.8.21.10
 //! PULSUS_TEST_CLICKHOUSE=1 cargo test -p pulsus-server --test logs_detected_live
 //! podman rm -f pulsus-ch-test
 //! ```
@@ -891,7 +891,7 @@ async fn detected_fields_budget_truncation_signals_pulsus_partial() {
 /// Swapping `uniqExact(val)` in `sql::detected_labels` for
 /// `uniqCombined`, `uniqCombined64` or `uniqHLL12` reddens this
 /// assertion at both fixtures, and `uniqTheta` at the `pod-` one
-/// (measured on `clickhouse/clickhouse-server:24.8`, 2026-08-08: at
+/// (measured on server 24.8, 2026-08-08: at
 /// 7708 distinct values those four answer 7696 / 7696 / 7733 / 7665, and
 /// at 4533 they answer 4534 / 4534 / 4552 / 4533).
 ///
@@ -1151,7 +1151,7 @@ async fn detected_labels_is_scoped_to_the_requested_window() {
 /// `sql::log_stats_rollup`'s half-open `bucket_ns > start_ns` — which is
 /// correct on the SAMPLE axis and wrong on the BUCKET axis — is the
 /// plausible wrong fix. Introduced deliberately against this fixture on
-/// `clickhouse/clickhouse-server:24.8.14.39`, it answers
+/// server 24.8.14.39, it answers
 /// `{"detectedLabels":[]}`: it silently loses a label whose line is
 /// genuinely inside the window. This case fails under that fix (via
 /// `edge` vanishing) and on the pre-#399 tree (via `outwin` appearing),

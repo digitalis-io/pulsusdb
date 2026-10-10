@@ -21,7 +21,7 @@
 //!
 //! ```text
 //! # single-node:
-//! podman run -d --rm --name pulsus-ch-test -p 19123:8123 clickhouse/clickhouse-server:26.3
+//! podman run -d --rm --name pulsus-ch-test -p 19123:8123 clickhouse/clickhouse-server:26.8.21.10
 //! PULSUS_TEST_CLICKHOUSE=1 \
 //!   PULSUS_TEST_CH_SHARD1_HOST=localhost PULSUS_TEST_CH_SHARD1_HTTP_PORT=19123 \
 //!   PULSUS_TEST_CH_SHARD2_HOST=localhost PULSUS_TEST_CH_SHARD2_HTTP_PORT=19123 \

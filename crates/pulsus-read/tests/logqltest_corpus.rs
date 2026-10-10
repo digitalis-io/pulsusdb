@@ -1128,7 +1128,7 @@ fn unwrap_takes_the_metadata_value_when_the_metadata_carries_the_name() {
 /// ```
 ///
 /// The `JSONExtractFloat` column was measured against
-/// `clickhouse/clickhouse-server:26.3`; this test measures the evaluator
+/// server 26.3; this test measures the evaluator
 /// column, which is the half that can change under us.
 ///
 /// **So a lowered `| unwrap` needs a per-group guard**: the statement must

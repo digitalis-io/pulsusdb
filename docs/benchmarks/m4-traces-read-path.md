@@ -232,7 +232,7 @@ artefact, not against a rebuild.
 
 ```text
 podman run -d --name pulsus-lowering-ch -p 18923:8123 \
-    docker.io/clickhouse/clickhouse-server:26.3
+    docker.io/clickhouse/clickhouse-server:26.8.21.10
 cargo run -p xtask -- bench traces-lowering \
     --http-url http://127.0.0.1:18923 --database pulsus_lowering_bench \
     --out docs/benchmarks/data/traces-lowering-92.json

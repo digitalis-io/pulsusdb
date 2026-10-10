@@ -13,12 +13,12 @@ pub enum SchemaError {
     #[error("clickhouse: {0}")]
     Clickhouse(#[from] ChError),
 
-    /// The connected server's `SELECT version()` is older than the M0
-    /// minimum (docs/schemas.md §8: ClickHouse 24.8 LTS).
+    /// The connected server's `SELECT version()` is older than the
+    /// minimum (docs/schemas.md §8: ClickHouse 26.8 LTS).
     #[error(
-        "unsupported ClickHouse version {found:?}: PulsusDB requires >= 26.3 \
-         (docs/schemas.md §8 — the supported LTS line; older servers do not \
-         tag an HTTP-200 mid-stream exception, so it cannot be told apart \
+        "unsupported ClickHouse version {found:?}: PulsusDB requires >= 26.8 \
+         (docs/schemas.md §8 — the supported LTS line; servers before 26.3 do \
+         not tag an HTTP-200 mid-stream exception, so it cannot be told apart \
          from result text — issue #412)"
     )]
     UnsupportedVersion { found: String },
@@ -38,7 +38,7 @@ mod tests {
             found: "24.8.14.39".to_string(),
         };
         assert!(err.to_string().contains("24.8.14.39"));
-        assert!(err.to_string().contains("26.3"));
+        assert!(err.to_string().contains(">= 26.8"));
     }
 
     #[test]

@@ -47,7 +47,7 @@
 //!
 //! ```text
 //! podman run -d --name <your-container> -p $PORT_CH:8123 \
-//!     clickhouse/clickhouse-server:26.3
+//!     clickhouse/clickhouse-server:26.8.21.10
 //! PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=$PORT_CH \
 //!   PULSUS_TEST_CH_DATABASE_PREFIX=<yours> \
 //!   cargo test -p pulsus-read --test live_metrics_plan_parts

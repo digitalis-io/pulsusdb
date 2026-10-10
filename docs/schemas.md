@@ -75,7 +75,8 @@ CREATE TABLE metric_labels (                       -- the lookup
     first_seen   SimpleAggregateFunction(min, Int64) CODEC(ZSTD(1)),
     last_seen    SimpleAggregateFunction(max, Int64) CODEC(ZSTD(1))
 ) ENGINE = AggregatingMergeTree
-ORDER BY (org_id, metric_name, fingerprint);
+ORDER BY (org_id, metric_name, fingerprint)
+SETTINGS allow_dimensions_outside_sorting_key = 1;
 
 CREATE TABLE metric_series (                       -- the activity
     org_id       LowCardinality(String),
@@ -87,7 +88,7 @@ CREATE TABLE metric_series (                       -- the activity
 PARTITION BY day
 ORDER BY (org_id, fingerprint)
 TTL toDateTime(least((toUInt64(toUInt16(day)) + 1 + 7) * 86400, 4294967295))
-SETTINGS ttl_only_drop_parts = 1;
+SETTINGS allow_dimensions_outside_sorting_key = 1, ttl_only_drop_parts = 1;
 
 CREATE TABLE metric_label_index (                  -- the label index (issue #635)
     org_id       LowCardinality(String),
@@ -108,6 +109,7 @@ ORDER BY (org_id, key, value);
 - **The label index answers a read with no metric name** (issue #635). The same kind-2 row feeds `metric_label_index_mv`, one row per label of the series, and `metric_label_values_mv`, one row per key and value. A series read with no metric-name scope, no `__name__` matcher and at least one label matcher that does not match the empty string takes its IDs from the index: matchers that do not match `""` intersect their rows, the others remove theirs with `NOT IN`, and a regex runs on `metric_label_values`' distinct values, the index then reading only those values' rows. A stored empty value reads as absent, as `JSONExtractString` reads it, so the two rows that test presence carry `value != ''`. Every other read renders the lookup statement unchanged. `/labels` and `/label/{name}/values` answer a filter with no metric name as `SELECT DISTINCT` over the index. Each kind-2 row writes one index row per label: measured on a 200,000-series block, the views raise the insert's CPU from 902 to 2,571 ms and its rows written from 600,021 to 1,848,989, and the merged index stores 99.8 bytes per series.
 
 - **The lookup answers every matcher; the activity answers the window** (issue #623). One kind-2 landing row feeds both views: `metric_labels_mv` writes the series' lookup row and `metric_series_mv` its activity row. `metric_labels` holds **one row per series**, keyed `(metric_name, fingerprint)`: a name equality, or a regex with a literal prefix, is a key range; other name regexes run once per distinct name; label matchers read the rows the name leaves, by `JSONExtractString(labels, '<key>')` (absent is `''`). `metric_series` holds one row per series per UTC day, `hours` a 24-bit mask of the hours the series had samples in, OR'd together on merge. No read joins the two: a read takes the IDs the lookup selects and keeps those the activity table finds in the window.
+- **`labels` and `metric_name` are functions of `fingerprint`.** Each sits outside its table's key and is not an aggregate, which 26.8 refuses unless the table sets `allow_dimensions_outside_sorting_key = 1`; both tables set it. One fingerprint has one label set and one name, so a merge cannot pick between different values.
 - **First and last seen.** The lookup view sets both `first_seen` and `last_seen` to the kind-2 row's `unix_milli`, the hour the writer registered the series in; merges keep the `min` and the `max`. A read takes `min(first_seen)` and `max(last_seen)` by fingerprint, exact across unmerged parts and shards. No read uses them yet.
 - **Activity expires with the samples; lookup rows are kept.** `metric_series` keeps a day until its last sample has expired (`day + 1 + retention`), capped as the sample tables are. `metric_labels` has no TTL: the label sets are kept on disk permanently, by the owner's decision.
 - **Exact to the hour, no `FINAL`.** The writer registers a series once per hour it has samples in (`pulsus_model::ACTIVITY_BUCKET_MS`, fixed), skipping known `(metric_name, fingerprint, hour)` triples through an in-process LRU. A read bounds `day` by the window's first and last UTC day and tests each row's `hours` against that day's hours of the window, so an unmerged row is tested on its own and a merge changes no answer. Measured: 300 random windows of up to six days over 1,000 series active in a random tenth of 168 hours answered exactly the hourly form's sets (`activity_is_exact_to_the_hour`). The discovery endpoints built on this table (`/api/v1/series`, `/labels`, `/label/{name}/values`, docs/api.md §3.3) therefore answer the series active in the window's hours: a bounded superset of the reference's exact-sample-window set, never a subset and never a false empty.
@@ -1645,7 +1647,7 @@ Reader-issued settings in clustered mode: `optimize_skip_unused_shards = 1`, `op
 | TTL | `ttl_only_drop_parts = 1` on all raw tables; per-tier retention on rollups; `PULSUS_STORAGE_POLICY` for hot/cold volumes |
 | Dedup strategy | metadata: `ReplacingMergeTree` + duplicate-tolerant reads (`LIMIT 1 BY`, `GROUP BY`); samples: append-only `MergeTree`, with a retried push suppressed at ingest by the writer that accepted the original, inside `PULSUS_INGEST_DEDUP_WINDOW` (issue #494), and writer batch atomicity below that |
 | Codecs | timestamps `DoubleDelta`, gauge-like floats `Gorilla`, counters/ids `Delta`/`T64`, payloads/labels `ZSTD(3..5)`, everything wrapped in `ZSTD(1)` minimum |
-| Minimum ClickHouse | 26.3 LTS (the supported LTS line; older servers do not tag an HTTP-200 mid-stream exception, so it cannot be told apart from result text — issue #412. All MVs are classic incremental — no refreshable-MV or scheduler dependency) |
+| Minimum ClickHouse | 26.8 LTS (the supported LTS line; servers before 26.3 do not tag an HTTP-200 mid-stream exception, so it cannot be told apart from result text — issue #412. All MVs are classic incremental — no refreshable-MV or scheduler dependency) |
 
 ---
 

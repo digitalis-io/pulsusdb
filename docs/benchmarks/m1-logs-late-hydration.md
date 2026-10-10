@@ -298,7 +298,7 @@ above.
 
 ```text
 podman run -d --rm --name pulsus-ch-hydration -p 19123:8123 -p 19000:9000 \
-    clickhouse/clickhouse-server:24.8
+    clickhouse/clickhouse-server:26.8.21.10
 
 # CI tier (record-only, no verdict — does not reach the 50,000-breadth anchor):
 cargo run -p xtask -- bench logs-hydration \

@@ -166,8 +166,11 @@ CREATE TABLE IF NOT EXISTS {{db}}.metric_labels{{on_cluster}}
 --@single  ENGINE = AggregatingMergeTree
 --@cluster ENGINE = ReplicatedAggregatingMergeTree('/clickhouse/tables/{shard}/{{db}}.metric_labels', '{replica}')
 ORDER BY (org_id, metric_name, fingerprint)
---@single  SETTINGS index_granularity = 8192, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy}};
---@cluster SETTINGS index_granularity = 8192, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
+-- `labels` is outside the key and not an aggregate. It is a function of
+-- `fingerprint`, so a merge never chooses between two different values;
+-- 26.8 refuses such a column unless the table allows it.
+--@single  SETTINGS allow_dimensions_outside_sorting_key = 1, index_granularity = 8192, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy}};
+--@cluster SETTINGS allow_dimensions_outside_sorting_key = 1, index_granularity = 8192, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
 
 CREATE TABLE IF NOT EXISTS {{db}}.metric_label_index{{on_cluster}}
 (
@@ -275,8 +278,11 @@ CREATE TABLE IF NOT EXISTS {{db}}.metric_series{{on_cluster}}
 PARTITION BY day
 ORDER BY (org_id, fingerprint)
 TTL toDateTime(least((toUInt64(toUInt16(day)) + 1 + {{retention_days}}) * 86400, 4294967295))
---@single  SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy}};
---@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
+-- `metric_name` is outside the key and not an aggregate. It is a function
+-- of `fingerprint`, so a merge never chooses between two different values;
+-- 26.8 refuses such a column unless the table allows it.
+--@single  SETTINGS allow_dimensions_outside_sorting_key = 1, ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy}};
+--@cluster SETTINGS allow_dimensions_outside_sorting_key = 1, ttl_only_drop_parts = 1, index_granularity = 8192, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
 
 CREATE TABLE IF NOT EXISTS {{db}}.resources{{on_cluster}}
 (

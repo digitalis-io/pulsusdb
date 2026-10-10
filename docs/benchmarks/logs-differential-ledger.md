@@ -506,7 +506,7 @@ distinct (`Distinct (Preliminary DISTINCT)` in the measured plan), so the
   ordinary operation rather than at an extreme.
 - **Cost — reference-faithfulness is the MOST expensive option,
   measured.**
-  `clickhouse/clickhouse-server:24.8`, one node, `system.query_log`,
+  server 24.8, one node, `system.query_log`,
   3 reps, 2026-08-08. Corpus A: 3,000,000 rows in ONE month partition of
   the `log_streams_idx` shape = 1,000,000 distinct `pod` values + 50
   `namespace` + 500 `service`. The query is the production text of

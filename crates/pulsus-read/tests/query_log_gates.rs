@@ -29,7 +29,7 @@
 //!
 //! ```text
 //! podman run -d --rm --name pulsus-ch-test -p 19123:8123 -p 19000:9000 \
-//!     clickhouse/clickhouse-server:26.3
+//!     clickhouse/clickhouse-server:26.8.21.10
 //! PULSUS_TEST_CLICKHOUSE=1 cargo test -p pulsus-read --test query_log_gates
 //! podman rm -f pulsus-ch-test
 //! ```
@@ -2204,7 +2204,8 @@ async fn seed_metric_series_472(
                hours        SimpleAggregateFunction(groupBitOr, UInt32)\
              ) ENGINE = AggregatingMergeTree \
              PARTITION BY day \
-             ORDER BY (org_id, fingerprint)"
+             ORDER BY (org_id, fingerprint) \
+             SETTINGS allow_dimensions_outside_sorting_key = 1"
         ),
         format!(
             "CREATE TABLE {db}.{labels} (\
@@ -2215,7 +2216,8 @@ async fn seed_metric_series_472(
                first_seen   SimpleAggregateFunction(min, Int64) CODEC(ZSTD(1)), \
                last_seen    SimpleAggregateFunction(max, Int64) CODEC(ZSTD(1))\
              ) ENGINE = AggregatingMergeTree \
-             ORDER BY (org_id, metric_name, fingerprint)"
+             ORDER BY (org_id, metric_name, fingerprint) \
+             SETTINGS allow_dimensions_outside_sorting_key = 1"
         ),
         format!(
             "INSERT INTO {db}.{table} (day, fingerprint, metric_name, hours) \
@@ -4912,7 +4914,7 @@ struct SumRow {
 /// summations are the same summation and agree bit for bit.
 ///
 /// **They do not agree, at any of the three sizes**, measured on
-/// `clickhouse/clickhouse-server:26.3` (server 26.3.29.7):
+/// server 26.3 (26.3.29.7):
 ///
 /// ```text
 ///  N        ours                 the database         ULPs   |diff|      bound

@@ -21,7 +21,7 @@
 //!
 //! ```text
 //! podman run -d --rm --name pulsus-ch-patterns -p 19123:8123 \
-//!     clickhouse/clickhouse-server:26.3
+//!     clickhouse/clickhouse-server:26.8.21.10
 //! PULSUS_TEST_CLICKHOUSE=1 cargo test -p pulsus-read --test patterns_explain
 //! podman rm -f pulsus-ch-patterns
 //! ```

@@ -11,8 +11,8 @@ use pulsus_clickhouse::{ChClient, ChError, QuerySettings, Row};
 
 use crate::error::SchemaError;
 
-/// Parses a ClickHouse `SELECT version()` string (e.g. `26.3.17.110`) and
-/// refuses anything older than 26.3 (docs/schemas.md §8). Pure and
+/// Parses a ClickHouse `SELECT version()` string (e.g. `26.8.21.10`) and
+/// refuses anything older than 26.8 (docs/schemas.md §8). Pure and
 /// injectable (task-manager resolution #3 on issue #5) so refusal messages
 /// are unit-tested without a live server; `run_init` supplies the real
 /// server-reported string.
@@ -26,7 +26,7 @@ pub fn check_version(version: &str) -> Result<(), SchemaError> {
         .next()
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| SchemaError::Version(version.to_string()))?;
-    if (major, minor) < (26, 3) {
+    if (major, minor) < (26, 8) {
         return Err(SchemaError::UnsupportedVersion {
             found: version.to_string(),
         });

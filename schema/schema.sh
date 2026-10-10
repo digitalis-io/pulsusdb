@@ -238,8 +238,8 @@ case "$major$minor" in
         exit 1
         ;;
 esac
-if [ "$major" -lt 26 ] || { [ "$major" -eq 26 ] && [ "$minor" -lt 3 ]; }; then
-    echo "schema.sh: clickhouse $version is below the minimum supported version 26.3" >&2
+if [ "$major" -lt 26 ] || { [ "$major" -eq 26 ] && [ "$minor" -lt 8 ]; }; then
+    echo "schema.sh: clickhouse $version is below the minimum supported version 26.8" >&2
     exit 1
 fi
 

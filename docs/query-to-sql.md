@@ -67,7 +67,7 @@ appears and nothing else in those blocks is. This applies to every such block an
 at each one. The three sentences that stated the convention in prose carry the new rule.
 
 **Statements marked *decided here* were run.** They are this document's own decisions, and each was
-executed against `clickhouse/clickhouse-server:26.3`, server version 26.3.17.110, over the corpus of
+executed against server 26.3, server version 26.3.17.110, over the corpus of
 part 4.1 loaded into tables built from the shipped DDL. That establishes that
 the text parses, executes and returns what the entry says it returns. It does **not** establish that
 our code will produce that text, because the code does not exist — the same limit as *from the
@@ -633,8 +633,8 @@ column expressions, escaping, regular-expression handling, time-bucket expressio
 each language's compiler (`docs/query-lowering.md:829-830`). This part is
 that work for the two languages. Each decision rests on three things and says which: the table
 schema in `schema/schema.sql`, what the shipped builders already emit, and what
-ClickHouse 26.3 does when the expression is executed — the version floor is 26.3
-(`crates/pulsus-schema/src/checks.rs:29`).
+ClickHouse 26.3 did when the expression was executed. The version floor is now
+26.8 LTS (`crates/pulsus-schema/src/checks.rs:29`).
 
 **Part 2.7 is where the decisions are set out in full**, one row per stage kind, with the clause the
 fragment lands in and what the database stops doing because of it. Parts 2.8 and 2.9 work fourteen
@@ -904,7 +904,7 @@ Parts 2.2 to 2.4 say *what* each stage becomes. This section says *where the tex
 statement* and *what the database stops doing because of it*. Every row that was empty in parts 2.2
 to 2.4 is filled here and marked **decided here**; the basis for each decision is the table schema
 (`schema/schema.sql`), the shipped builders, and what ClickHouse 26.3 does when
-the expression is executed — every SQL text below was run on `clickhouse/clickhouse-server:26.3`,
+the expression is executed — every SQL text below was run on server 26.3,
 server version 26.3.17.110, over part 4.1's corpus. Parts 2.8 and 2.9 give the runs.
 
 #### 2.7.0 Four standing guards, and one plan-time precondition
@@ -1210,7 +1210,7 @@ date (`schema/schema.sql:391-392`), and `trace_spans`, ordered by `(trace_id, ti
 
 Each entry is one query, the one statement it becomes, and the answer it must return. **Statements
 here carry literal values, not placeholders, because each one was executed** against
-`clickhouse/clickhouse-server:26.3`, server version 26.3.17.110, over part 4.1's corpus loaded into a
+server 26.3, server version 26.3.17.110, over part 4.1's corpus loaded into a
 `log_samples` table built from `schema/schema.sql:82-104` plus the `structured_metadata` column
 (`schema/schema.sql:89`). The fingerprints are `checkout` 18374, `colors` 99120, `edge` 30001,
 `ipcase` 40001, `bnd` 50001. Unless an entry says otherwise the request is
@@ -1741,7 +1741,7 @@ first refusal would emit no `body` term and read every `ipcase` line.
 ### 2.9 Eight worked TraceQL pipelines
 
 Same rule as §2.8 for the SQL and a different one for the answers. **Every statement below was
-executed** on `clickhouse/clickhouse-server:26.3`, server version 26.3.17.110, against
+executed** on server 26.3, server version 26.3.17.110, against
 `trace_spans` and `trace_attrs_idx` built from `schema/schema.sql:376-394` plus the later added columns,
 holding 200,000 spans in 50,000 traces of four spans each and 600,000 attribute rows.
 **No response bodies are stated**, for the reason part 4.8 gives and part 9 repeats: no reference
@@ -4750,7 +4750,7 @@ different answer from the reference on some input, and the inputs are named belo
 | 6 | TraceQL `\| { … }` written after another stage | pushing it as a `WHERE` conjunct returns a wrong answer | true of that one statement shape, and that shape is not the only one. Both tables store what the stage reads: `trace_spans.name` (`schema/schema.sql:515`) and the attribute index (`schema/schema.sql:376-394`) | for the attribute-only form, exactness — two shapes disagree, below. For the mixed-source form, **`docs/schemas.md` §4.2** (`docs/schemas.md:1104`): every phase-1 generator is its own index-served top-K query, "never a `UNION ALL`". That is a rule of ours and can be amended. **ADR 0008's join clause is not the obstacle**, because a statement reading both tables needs no join. What an amendment turns on is the pruning that rule protects, which is unmeasured; the cost table below names the instrument that would measure it |
 
 **Every measurement below was taken on 2026-09-09** against ClickHouse `26.3.29.7`
-(`clickhouse/clickhouse-server:26.3`) and `grafana/loki:3.7.4`, digest
+(server 26.3) and `grafana/loki:3.7.4`, digest
 `sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc`, whose
 `/loki/api/v1/status/buildinfo` answered `{"version":"3.7.4","revision":"b318f282",…}` — the same
 `b318f282` the checkout at `v3.7.4` resolves to. Row 6 is the one exception and names its own
@@ -4950,7 +4950,7 @@ it as a cost for any row above would be the same mistake this section exists to 
 #### Row 5, priced — and the whole instrument, so it can be rebuilt
 
 Everything below was run on 2026-09-09 against ClickHouse `26.3.29.7`
-(`clickhouse/clickhouse-server:26.3`). **The table, the loader and the two settings are all printed**,
+(server 26.3). **The table, the loader and the two settings are all printed**,
 because a byte figure whose corpus is not published is a number nobody else can produce.
 
 The table is `log_samples` as `schema/schema.sql:82-104` declares it, with the
@@ -5484,13 +5484,13 @@ cheaper than having the next reader find them.
 | the `400` body of LogQL32 | the template at `logql/error.rs:826-829` was rendered with the captured values and compared to the captured body: **462 bytes each, identical** | that the template is reached for this query. That is read from `logql/error.rs:819-825`, not executed |
 | the committed corpus cannot distinguish the two colour-stripping behaviours | all 46 corpus files read as bytes; one line has escape bytes and it has four; 46 of 50 queries using the stage carry a later filter and all 46 load colour-free lines | it is a statement about the **committed** corpus at this commit. A row added tomorrow changes it, and nothing detects that |
 | every `file:line` in this document | each was printed with `sed -n "${n}p"` and read before being written down | that the line still says that after the next commit. There is no mechanism holding these citations true |
-| every SQL text marked *decided here* parses and executes | each was run against `clickhouse/clickhouse-server:26.3`, server version 26.3.17.110, on 2026-09-01, over part 4.1's corpus in a `log_samples` built from `schema/schema.sql:82-104` plus `structured_metadata`, and over 200,000 synthetic spans in `trace_spans`/`trace_attrs_idx` built from `schema/schema.sql:376-394` | that our code will emit that text. No code emits it. It also cannot see whether a **different** corpus makes the statement and the reference disagree |
+| every SQL text marked *decided here* parses and executes | each was run against server 26.3, server version 26.3.17.110, on 2026-09-01, over part 4.1's corpus in a `log_samples` built from `schema/schema.sql:82-104` plus `structured_metadata`, and over 200,000 synthetic spans in `trace_spans`/`trace_attrs_idx` built from `schema/schema.sql:376-394` | that our code will emit that text. No code emits it. It also cannot see whether a **different** corpus makes the statement and the reference disagree |
 | the §2.8 statements agree with the reference over this corpus | the **nine** log-query statements (LogQL45–51, LogQL53, LogQL58) were run and their returned timestamps compared to the reference's captured entries: all nine contain every answer row, and LogQL45, LogQL48 and LogQL51 return exactly it. The **three** metric statements (LogQL54, LogQL55, LogQL56) were run and compared for equality, not containment, and each reproduced the reference's answer exactly — including LogQL56's tie between `edge` and `ipcase` | that containment holds on **any** corpus. The corpus is fourteen lines. The property is argued below and the argument, not this run, is what carries it. LogQL52 is held back and LogQL57's aggregation does not compile, so neither is in either count |
 | the fourteen answers of §2.8 | captured from `grafana/loki:3.7.4`, digest `sha256:87f0a067…cfcc`, on 2026-09-01, over part 4.1's corpus, with `data.stats` removed and no other edit | the same limit as part 4's answers: only that the reference answers this way over **this** corpus |
-| the ClickHouse behaviours the guards rest on | run and pasted into the cells that use them: `JSONExtractString('{"c":31.0}','c')` is `31`; `JSONExtractString('{"b":500}','b')` is `500`; `JSONExtractFloat('{"i":1e3}','i')` is `1000`; `JSONExtractFloat('{"s":"12abc"}','s')` is `0`; `JSONType('{"a":1}trailing')` is `Null`; `JSONExtractString('{"a":"x","a":"y"}','a')` is `x`; `extractGroups('a\nb','(?P<x>a.b)')` is `['a\nb']` and with `(?-s)` is `[]` | that they hold on another ClickHouse version. They were run on 26.3.17.110 only, which is the version floor (`crates/pulsus-schema/src/checks.rs:29`) |
+| the ClickHouse behaviours the guards rest on | run and pasted into the cells that use them: `JSONExtractString('{"c":31.0}','c')` is `31`; `JSONExtractString('{"b":500}','b')` is `500`; `JSONExtractFloat('{"i":1e3}','i')` is `1000`; `JSONExtractFloat('{"s":"12abc"}','s')` is `0`; `JSONType('{"a":1}trailing')` is `Null`; `JSONExtractString('{"a":"x","a":"y"}','a')` is `x`; `extractGroups('a\nb','(?P<x>a.b)')` is `['a\nb']` and with `(?-s)` is `[]` | that they hold on another ClickHouse version. They were run on 26.3.17.110 only; the version floor is 26.8 LTS (`crates/pulsus-schema/src/checks.rs:29`) |
 | the granule and byte figures | `EXPLAIN indexes=1` and `system.query_log` over 3,000,000 synthetic log rows and 200,000 synthetic spans on the same server. Log side: the primary key cuts 367 granules to 124; a rare needle's `LIKE` cuts 124 to 10 and reads 81,920 rows against 1,015,808; the parsed-field predicate adds **no `Skip` section at all**; a 1,000-row page holds 250 matching entries without it and 1,000 with it; today's range-count shape returns 192,956 rows and reads 27.54 MiB where the bucketed form returns 12 rows and reads 3.72 MiB. Trace side: `key='service.namespace' AND val='prod'` reads 14 of 74 granules and `key IN ('service.namespace','foo')` reads 51 of 74 | how any of it scales. These are CI-scale ratios on synthetic data, chosen because a ratio is scale-invariant and a wall-clock number is not. Behaviour at 1 TB is [issue #25](https://github.com/digitalis-io/pulsusdb/issues/25) |
 | the key/value extractor disagrees with the reference's logfmt decoder on exactly one of eleven shapes tried | eleven awkward lines were run through `extractKeyValuePairs(body, '=', ' \t\r\n', '"')` and each answer compared to what `pkg/logql/log/logfmt/decode.go` @ `v3.7.4` produces by its own rules. Ten agree or answer the empty string; `k="a\"b" x=1` answers `a\` where the reference answers `a"b` | **that eleven is enough.** It is an enumeration, not a proof. §10's open question 3 says what would close it |
-| §5.1's ClickHouse answers — `parseTimeDelta`, `parseReadableSize`, `simpleJSONExtractRaw`, `JSONExtractString`, `leftPad`, `upperUTF8` | each run on 2026-09-09 against `clickhouse/clickhouse-server:26.3`, `SELECT version()` = **26.3.29.7**; the command sits beside each table | that they hold on 26.3.17.110, the version part 4's *decided here* statements were run on. `simpleJSONExtractRaw` is a text scanner and `parseTimeDelta` a parser, and both are the kind of surface a patch release moves |
+| §5.1's ClickHouse answers — `parseTimeDelta`, `parseReadableSize`, `simpleJSONExtractRaw`, `JSONExtractString`, `leftPad`, `upperUTF8` | each run on 2026-09-09 against server 26.3, `SELECT version()` = **26.3.29.7**; the command sits beside each table | that they hold on 26.3.17.110, the version part 4's *decided here* statements were run on. `simpleJSONExtractRaw` is a text scanner and `parseTimeDelta` a parser, and both are the kind of surface a patch release moves |
 | §5.1's and part 7's reference answers | replayed on 2026-09-09 against `grafana/loki:3.7.4`, digest `sha256:87f0a067…cfcc`, with buildinfo read from the running process, over the corpora printed in each subsection | only that the reference answers this way over **those** lines. Each corpus is 3–8 lines, chosen against a specific wrong model, not a sample of anything |
 | part 7's three PulsusDB columns | driven on 2026-09-09 through the hermetic corpus runner — `crates/pulsus-read/tests/logqltest_corpus.rs` over `crates/pulsus-read/tests/logqltest/runner.rs` — which plans the query and evaluates the **planned** pipeline | that a live request answers the same. The runner executes no SQL; all three defects are in the evaluator, which it does execute, and none of the three is a stage that compiles. **No committed test covers any of them** — each subsection names the corpus row that would |
 | §5.1's row 6 — a single statement with no join reproduces the reference's answer | measured on 2026-09-09 against `grafana/tempo:v3.0.2`, digest `sha256:aa8df8d0…d8f7`, over a five-trace corpus built so that three wrong models each fail on a different trace | that the statement is exact in general. Two shapes outside that corpus disagree and the row names both. What it establishes is that the permanence claim was wrong, not that a translation exists |
