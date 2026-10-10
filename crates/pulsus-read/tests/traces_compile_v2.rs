@@ -2537,9 +2537,6 @@ fn t_c27_the_field_against_field_refusals() {
         Intrinsic::NestedSetParent,
         Intrinsic::NestedSetLeft,
         Intrinsic::NestedSetRight,
-        Intrinsic::TraceDuration,
-        Intrinsic::RootName,
-        Intrinsic::RootServiceName,
         Intrinsic::ChildCount,
     ] {
         let want = PlanError::UnsupportedField(format!(
@@ -4945,15 +4942,13 @@ fn the_fork_routes_by_the_plan() {
         r#"{ .a = 1 } | by(span.a) | coalesce() | by(name)"#,
         r#"{ nestedSetLeft = nestedSetParent }"#,
         r#"{ nestedSetLeft + 1 > 2 }"#,
-        r#"{ } | by(nestedSetParent)"#,
         r#"{ nestedSetLeft > 2 } && { nestedSetParent < 0 }"#,
         r#"{ nestedSetParent < 0 } > { nestedSetLeft > 2 }"#,
         r#"{ nestedSetLeft > 0 } | by(name)"#,
         r#"{ } | { nestedSetLeft = 0 } | count() > 1"#,
         r#"{ nestedSetLeft > 1 && nestedSetRight < 6 }"#,
-        r#"{ .a = trace:duration }"#,
         r#"{ span:childCount + 1 > 2 }"#,
-        r#"{ event.k = trace:rootName }"#,
+        r#"{ span:childCount = nestedSetLeft }"#,
         r#"{ event.k * event.k > 5 }"#,
         r#"{ .k + 1 > .k }"#,
         r#"{ link.lk - link.lk != 0 }"#,
@@ -5031,6 +5026,19 @@ fn the_fork_routes_by_the_plan() {
         r#"{ nestedSetParent < 0 } && { name = "a" }"#,
         r#"{ nestedSetParent < 0 } > { }"#,
         r#"{ nestedSetParent < 0 } | by(name)"#,
+        // Issue #594 part 3: the per-trace values as operands, and the
+        // seven as by() keys.
+        r#"{ .a = trace:duration }"#,
+        r#"{ event.k = trace:rootName }"#,
+        r#"{ duration * 2 > traceDuration }"#,
+        r#"{ rootServiceName != resource.service.name } > { }"#,
+        r#"{ } | by(trace:duration)"#,
+        r#"{ } | by(rootName)"#,
+        r#"{ } | by(trace:rootService) | coalesce()"#,
+        r#"{ } | by(span:childCount)"#,
+        r#"{ } | by(nestedSetParent)"#,
+        r#"{ } | by(nestedSetLeft)"#,
+        r#"{ name = "a" } | by(nestedSetRight)"#,
     ] {
         if plan_statement(&fork_plan(query), "spans", "traces", "resources", 64, &[]).is_none() {
             wrong.push(format!(
@@ -5292,4 +5300,90 @@ fn a_filter_hints_only_what_its_body_requires() {
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Issue #594 part 3: a per-trace value read as an operand is a lookup into
+/// one scalar per value, over the traces reaching the part of the window
+/// the top-K reads; a by() key on one of the seven reads the returned
+/// traces after the top-K.
+#[test]
+fn a_trace_value_reads_the_traces_its_top_k_reads() {
+    let count = |sql: &str, needle: &str| sql.matches(needle).count();
+    let p =
+        compile_span_predicate(&filter_body("{ duration = trace:duration }")).expect("compiles");
+    assert_eq!(
+        p.sql(),
+        "(coalesce(duration_ns = transform(trace_id, tv_duration.1, tv_duration.2, \
+         CAST(NULL, 'Nullable(Int64)')), false))"
+    );
+    let whole = compile_search_of("{ duration = trace:duration }").expect("served");
+    let (first, last) = (
+        t_b1_window().first_included_ns(),
+        t_b1_window().last_included_ns(),
+    );
+    assert_eq!(
+        count(
+            whole.sql(),
+            &format!(
+                "HAVING max(last_start_ns) >= {first} AND min(start_ns) <= {last})) AS tv_duration,"
+            )
+        ),
+        1,
+        "{}",
+        whole.sql()
+    );
+    let parsed = pulsus_traceql::parse("{ duration = trace:duration }").expect("parses");
+    let slice = WindowSql::start_closed_end_open(T_B1_END - 300_000_000_000, T_B1_END);
+    let sliced = pulsus_read::traces::spans::search::compile_search_sliced(
+        &parsed,
+        &ctx(),
+        "spans",
+        "traces",
+        20,
+        3,
+        64,
+        Some(slice),
+    )
+    .expect("served");
+    assert_eq!(
+        count(
+            sliced.sql(),
+            "HAVING max(last_start_ns) >= 1790094546486853637 AND min(start_ns) <= 1790094846486853636)) AS tv_duration,"
+        ),
+        1,
+        "{}",
+        sliced.sql()
+    );
+    let s = compile_search_of("{ name = trace:rootName && trace:rootService != name }")
+        .expect("served");
+    for (needle, n) in [
+        (" AS tv_root_name,", 1),
+        (" AS tv_root_service,", 1),
+        ("tv_duration", 0),
+    ] {
+        assert_eq!(count(s.sql(), needle), n, "{needle}: {}", s.sql());
+    }
+    for query in ["{ trace:duration > 1s }", r#"{ name = "a" }"#] {
+        let s = compile_search_of(query).expect("served");
+        assert_eq!(count(s.sql(), "tv_"), 0, "{query}: {}", s.sql());
+    }
+    for (query, values, keys, numbering) in [
+        ("{ } | by(trace:rootService)", 1, 0, 0),
+        ("{ } | by(span:childCount)", 1, 1, 0),
+        ("{ } | by(nestedSetLeft)", 1, 1, 1),
+        ("{ } | by(name)", 0, 0, 0),
+    ] {
+        let s = compile_search_of(query).unwrap_or_else(|e| panic!("{query}: {e:?}"));
+        let sql = s.sql();
+        assert_eq!(
+            (
+                count(sql, ") AS group_values"),
+                count(sql, ") AS group_keys"),
+                count(sql, "SETTINGS max_block_size = 256"),
+                count(sql, " AND trace_id IN (SELECT arrayJoin(top.1))"),
+            ),
+            (values, keys, numbering, values),
+            "{query}: {sql}"
+        );
+    }
 }

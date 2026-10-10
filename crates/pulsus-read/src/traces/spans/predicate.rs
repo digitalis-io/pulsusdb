@@ -80,7 +80,7 @@ use crate::traces::filter::{
 use crate::traces::window_sql::WindowSql;
 
 use super::numbering::nested_leaf;
-use super::tracelevel::{TraceLeaf, child_leaf, trace_leaf, type_refusal};
+use super::tracelevel::{TraceLeaf, TraceValue, child_leaf, trace_leaf, type_refusal};
 
 /// A ClickHouse boolean over a `spans` row. Private fields, no public
 /// constructor: the four `compile_*` functions are the only ways to obtain
@@ -104,6 +104,9 @@ pub struct SpanPredicate {
     child_counts: bool,
     /// The numbered nested-set leaves the text holds (issue #594 part 2).
     numbered: usize,
+    /// The per-trace values the text reads as operands (issue #594 part
+    /// 3), each once.
+    trace_values: Vec<TraceValue>,
 }
 
 impl SpanPredicate {
@@ -119,6 +122,7 @@ impl SpanPredicate {
         trace_leaves: Vec<TraceLeaf>,
         child_counts: bool,
         numbered: usize,
+        trace_values: Vec<TraceValue>,
     ) -> Self {
         SpanPredicate {
             sql,
@@ -127,7 +131,13 @@ impl SpanPredicate {
             trace_leaves,
             child_counts,
             numbered,
+            trace_values,
         }
+    }
+
+    /// The per-trace values the text reads as operands (issue #594 part 3).
+    pub fn trace_values(&self) -> &[TraceValue] {
+        &self.trace_values
     }
 
     /// Whether the text reads the nested-set numbering, which the statement
@@ -342,9 +352,8 @@ pub fn span_membership_sql(spans_table: &str, w: WindowSql, p: &SpanPredicate) -
 // the refusals
 // ---------------------------------------------------------------------
 
-/// The four per-trace intrinsics and the three nested-set intrinsics as an
-/// operand (issue #594 parts 1 and 2): refused, so today's engine answers
-/// until #594 part 3.
+/// `span:childCount` and the three nested-set intrinsics as an operand:
+/// refused, so today's engine answers until #594 part 4.
 fn operand_refusal(intrinsic: Intrinsic) -> PlanError {
     PlanError::UnsupportedField(format!(
         "{intrinsic} as an operand is not supported by the search statement (issue #594)"
@@ -475,6 +484,8 @@ struct Compiler<'a> {
     child_counts: bool,
     /// The numbered nested-set leaves compiled.
     numbered: usize,
+    /// The per-trace values read as operands, each once (issue #594 part 3).
+    trace_values: Vec<TraceValue>,
 }
 
 /// The head of an element loop: `arrayExists` for the predicate; for the
@@ -581,6 +592,7 @@ impl<'a> Compiler<'a> {
             trace_leaves: Vec::new(),
             child_counts: false,
             numbered: 0,
+            trace_values: Vec::new(),
         }
     }
 
@@ -614,6 +626,7 @@ impl<'a> Compiler<'a> {
             trace_leaves: self.trace_leaves,
             child_counts: self.child_counts,
             numbered: self.numbered,
+            trace_values: self.trace_values,
         }
     }
 
@@ -1380,10 +1393,10 @@ impl<'a> Compiler<'a> {
                 Intrinsic::NestedSetParent
                 | Intrinsic::NestedSetLeft
                 | Intrinsic::NestedSetRight => Err(operand_refusal(*intrinsic)),
-                Intrinsic::ChildCount
-                | Intrinsic::TraceDuration
-                | Intrinsic::RootName
-                | Intrinsic::RootServiceName => Err(operand_refusal(*intrinsic)),
+                Intrinsic::TraceDuration | Intrinsic::RootName | Intrinsic::RootServiceName => {
+                    Ok(())
+                }
+                Intrinsic::ChildCount => Err(operand_refusal(*intrinsic)),
             },
         }
     }
@@ -1696,14 +1709,29 @@ impl<'a> Compiler<'a> {
             | Intrinsic::EventTimeSinceStart
             | Intrinsic::LinkSpanId
             | Intrinsic::LinkTraceId => unreachable!("a set operand is taken by set_leaf first"),
+            Intrinsic::TraceDuration => {
+                let v = self.trace_value(TraceValue::Duration);
+                self.note_presence(Some(format!("isNotNull({v})")));
+                Ok(Some(Tuple {
+                    text: format!("tuple(toInt256({v}), {NULL_FLOAT})"),
+                    dur: true,
+                }))
+            }
+            Intrinsic::RootName | Intrinsic::RootServiceName => Ok(None),
             Intrinsic::NestedSetParent
             | Intrinsic::NestedSetLeft
             | Intrinsic::NestedSetRight
-            | Intrinsic::ChildCount
-            | Intrinsic::TraceDuration
-            | Intrinsic::RootName
-            | Intrinsic::RootServiceName => Err(operand_refusal(intrinsic)),
+            | Intrinsic::ChildCount => Err(operand_refusal(intrinsic)),
         }
+    }
+
+    /// The span row's value of `v`, recorded so the statement defines its
+    /// scalar.
+    fn trace_value(&mut self, v: TraceValue) -> String {
+        if !self.trace_values.contains(&v) {
+            self.trace_values.push(v);
+        }
+        v.lookup_sql(v.alias())
     }
 
     /// A set operand as an arithmetic leaf (the part-3e design's section
@@ -1798,13 +1826,25 @@ impl<'a> Compiler<'a> {
             | Intrinsic::LinkTraceId => {
                 unreachable!("every set operand is classified before operand_arms")
             }
+            Intrinsic::TraceDuration => Ok(Arms {
+                i: Some(self.trace_value(TraceValue::Duration)),
+                nullable: true,
+                ..Arms::default()
+            }),
+            Intrinsic::RootName => Ok(Arms {
+                s: Some(self.trace_value(TraceValue::RootName)),
+                nullable: true,
+                ..Arms::default()
+            }),
+            Intrinsic::RootServiceName => Ok(Arms {
+                s: Some(self.trace_value(TraceValue::RootService)),
+                nullable: true,
+                ..Arms::default()
+            }),
             Intrinsic::NestedSetParent
             | Intrinsic::NestedSetLeft
             | Intrinsic::NestedSetRight
-            | Intrinsic::ChildCount
-            | Intrinsic::TraceDuration
-            | Intrinsic::RootName
-            | Intrinsic::RootServiceName => Err(operand_refusal(intrinsic)),
+            | Intrinsic::ChildCount => Err(operand_refusal(intrinsic)),
         }
     }
 
@@ -2747,7 +2787,9 @@ fn scalar_presence(field: &Field, var: &str) -> Option<String> {
             AttrScope::Resource => Some(format!("dynamicType({var}) != 'None'")),
             AttrScope::Event | AttrScope::Link | AttrScope::Unscoped => None,
         },
-        Field::Intrinsic(_) => None,
+        Field::Intrinsic(intrinsic) => {
+            TraceValue::of(*intrinsic).map(|v| format!("isNotNull({})", v.lookup_sql(v.alias())))
+        }
     }
 }
 

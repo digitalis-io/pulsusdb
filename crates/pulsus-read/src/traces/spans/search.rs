@@ -65,7 +65,7 @@ use super::projection::{
     GroupKeySql, Projection, ceiling_sql, group_key_sql, rendered_array, rendered_array_len,
 };
 use super::rows::{SearchGroupTuple, SearchGroupedRow, SearchTraceRow};
-use super::tracelevel::{TraceLeaf, per_trace_sql};
+use super::tracelevel::{TraceLeaf, TraceValue, group_values_sql, per_trace_sql, trace_values_sql};
 use crate::logql::error::ReadError;
 use crate::traces::PlanError;
 use crate::traces::exec::{
@@ -197,7 +197,7 @@ const SEARCH_GROUPED: &str = r"WITH {scalars}(SELECT (groupArray(trace_id), grou
             GROUP BY trace_id
             HAVING countIf({later}) > 0
             ORDER BY last DESC, trace_id ASC
-            LIMIT {limit})) AS top
+            LIMIT {limit})) AS top{group_values}
 SELECT m.trace_id AS trace_id, t.root_service AS root_service, t.root_name AS root_name,
        t.start_ns AS start_ns, t.end_ns - t.start_ns AS duration_ns,
        m.last AS last, m.matched AS matched, m.spans AS spans, m.groups AS groups
@@ -589,6 +589,15 @@ pub fn search_sql_at(
         _ => w,
     };
     let mut scalars = per_trace_sql(&trace_leaves, child_counts, w, traces_table);
+    // Issue #594 part 3: the per-trace values read as operands, over the
+    // traces reaching the part of the window the top-K reads.
+    let mut values: Vec<TraceValue> = Vec::new();
+    for v in predicates.iter().flat_map(|p| p.trace_values()) {
+        if !values.contains(v) {
+            values.push(*v);
+        }
+    }
+    scalars.push_str(&trace_values_sql(&values, top_w, w, traces_table));
     if numbered {
         scalars.push_str(&keys_sql(top_w, w, traces_table));
     }
@@ -701,8 +710,12 @@ pub fn search_sql_at(
                 )
             });
             let grp_type = key.value_type.as_deref().unwrap_or("''");
+            let group_values = key.values.map_or_else(String::new, |k| {
+                group_values_sql(k, w, spans_table, traces_table)
+            });
             let mut values: Vec<(&str, &str)> = common.to_vec();
             values.extend([
+                ("group_values", group_values.as_str()),
                 ("predicate", selector.sql()),
                 ("pre", pre),
                 ("later", later),
@@ -1490,6 +1503,10 @@ pub(crate) fn group_value(text: &str, value_type: &str) -> Result<GroupValue, St
         )),
         "Bool" => GroupValue::Bool(text == "true"),
         "None" => GroupValue::Nil,
+        "Duration" => GroupValue::Str(crate::traces::search_eval::go_duration_string(
+            text.parse::<i64>()
+                .map_err(|e| format!("a by() duration {text:?}: {e}"))?,
+        )),
         t if t.starts_with("Array(") => GroupValue::Str(rendered_array(text)?),
         other => return Err(format!("a by() key stored as {other} is not decoded")),
     })
@@ -1499,6 +1516,10 @@ pub(crate) fn group_value(text: &str, value_type: &str) -> Result<GroupValue, St
 fn group_value_payload(text: &str, value_type: &str) -> Result<usize, String> {
     Ok(match value_type {
         "" | "String" => text.len(),
+        "Duration" => match group_value(text, value_type)? {
+            GroupValue::Str(s) => s.len(),
+            _ => 0,
+        },
         t if t.starts_with("Array(") => rendered_array_len(text)?,
         _ => 0,
     })

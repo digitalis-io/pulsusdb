@@ -261,6 +261,40 @@ fn numbers_of(out: &pulsus_read::traces::SearchOutput) -> String {
         .join("; ")
 }
 
+/// `tt {v [ids]; …}` per trace with groups, `tt [ids]` without; `v` is
+/// `int:` and the number, or the text.
+fn groups_of(out: &pulsus_read::traces::SearchOutput) -> String {
+    use pulsus_read::traces::GroupValue;
+    let ids = |spans: &[pulsus_read::traces::SpanSummary]| -> String {
+        spans
+            .iter()
+            .map(|s| format!("{:02x}", s.span_id[7]))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    out.traces
+        .iter()
+        .map(|t| match &t.groups {
+            None => format!("{:02x} [{}]", t.trace_id[15], ids(&t.spans)),
+            Some(groups) => {
+                let groups: Vec<String> = groups
+                    .iter()
+                    .map(|g| {
+                        let v = match g.attributes.first().map(|(_, v)| v) {
+                            Some(GroupValue::Int(i)) => format!("int:{i}"),
+                            Some(GroupValue::Str(s)) => s.clone(),
+                            other => format!("{other:?}"),
+                        };
+                        format!("{v} [{}]", ids(&g.spans))
+                    })
+                    .collect();
+                format!("{:02x} {{{}}}", t.trace_id[15], groups.join("; "))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// `{ … }`'s answer for every trace `10…` to `23…`, newest first, each
 /// span rendered by `each`.
 fn every_trace(each: &dyn Fn(u8) -> String) -> String {
@@ -388,6 +422,36 @@ async fn a_numbered_search_answers_over_two_shards() {
         let got = match got {
             Ok(out) => numbers_of(&out),
             Err(ReadError::Clickhouse(e)) => format!("Err({e})"),
+            Err(e) => format!("Err({e})"),
+        };
+        if got != want {
+            wrong.push(format!("{query}\n  want: {want}\n  got:  {got}"));
+        }
+    }
+    // Issue #594 part 3: the seven as by() keys and a per-trace value as an
+    // operand, over the same fixture. Each trace's extent is 103 ms.
+    for (query, each) in [
+        (
+            "{ } | by(nestedSetParent)",
+            "{int:-1 [01]; int:1 [02]; int:2 [03]; int:0 [04]}",
+        ),
+        (
+            "{ } | by(span:childCount)",
+            "{int:1 [01, 02]; int:0 [03, 04]}",
+        ),
+        ("{ } | by(trace:duration)", "{103ms [01, 02, 03, 04]}"),
+        ("{ duration * 2 > trace:duration }", "[01, 02, 03, 04]"),
+    ] {
+        let want = (0x10..=0x23u8)
+            .rev()
+            .map(|t| format!("{t:02x} {each}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let got = match engine
+            .search_routed(&plan(query, window.0, window.1, 30))
+            .await
+        {
+            Ok(out) => groups_of(&out),
             Err(e) => format!("Err({e})"),
         };
         if got != want {
