@@ -59,6 +59,7 @@ use pulsus_traceql::{
     BoolOp, Field, FieldExpr, FieldOp, PipelineStage, Query, SpansetExpr, SpansetFilter, Value,
 };
 
+use super::numbering::{SCOPE_DETAIL, SCOPE_TOP, after_top_sql, keys_sql};
 use super::predicate::{PredicateCtx, SpanPredicate, compile_span_predicate_in};
 use super::projection::{
     GroupKeySql, Projection, ceiling_sql, group_key_sql, rendered_array, rendered_array_len,
@@ -92,7 +93,7 @@ ORDER BY last DESC, trace_id ASC";
 /// the projection. A `const` at column zero, filled by [`fill`], so no
 /// source indentation can leak into it.
 const SEARCH: &str = r"WITH {scalars}(SELECT (groupArray(trace_id), groupArray(keys))
-      FROM (SELECT trace_id, max(start_ns) AS last,
+      FROM ({scope_top}SELECT trace_id, max(start_ns) AS last,
                    groupUniqArray(intDiv(start_ns, 300000000000)) AS keys
             FROM {spans}
             WHERE {top_time}
@@ -101,11 +102,11 @@ const SEARCH: &str = r"WITH {scalars}(SELECT (groupArray(trace_id), groupArray(k
               AND ({predicate})
             GROUP BY trace_id
             ORDER BY last DESC, trace_id ASC
-            LIMIT {limit})) AS top{window_keys}
+            LIMIT {limit})) AS top{window_keys}{after_top}
 SELECT m.trace_id AS trace_id, t.root_service AS root_service, t.root_name AS root_name,
        t.start_ns AS start_ns, t.end_ns - t.start_ns AS duration_ns,
        m.last AS last, m.matched AS matched, m.spans AS spans
-FROM (SELECT trace_id, max(start_ns) AS last, count() AS matched,
+FROM ({scope_detail}SELECT trace_id, max(start_ns) AS last, count() AS matched,
              arraySlice(arraySort(x -> (x.2, x.1),
                         groupArray((span_id, start_ns, duration_ns, service, {projection}))), 1, {spss}) AS spans
       FROM {spans}
@@ -255,6 +256,12 @@ FROM (SELECT trace_id, max(start_ns) AS last, countIf({later}) AS matched,
         AND ({predicate}){demand}
       GROUP BY trace_id) AS m
 {trace_read}";
+
+/// The refusal of a numbered nested-set comparison in a statement the
+/// newest-slice loop does not slice, or of a second one (issue #594 part
+/// 2): today's engine answers it.
+pub const NUMBERED_NOT_SLICEABLE: &str = "a nested-set comparison that reads the numbering is \
+     served by the search statement only once, in a one-filter search (issue #594)";
 
 /// The message of an aggregate argument's off-path demand (issue #592
 /// part 3).
@@ -571,9 +578,30 @@ pub fn search_sql_at(
     let predicates = f.predicates();
     let trace_leaves: Vec<&TraceLeaf> = predicates.iter().flat_map(|p| p.trace_leaves()).collect();
     let child_counts = predicates.iter().any(|p| p.reads_child_counts());
-    let scalars = per_trace_sql(&trace_leaves, child_counts, w, traces_table);
-    let common: [(&str, &str); 10] = [
+    // Issue #594 part 2: the numbering, scoped per read.
+    let numbered = predicates.iter().any(|p| p.reads_numbering());
+    assert!(
+        !numbered || matches!(f, SearchFilter::One(_)),
+        "search_sql: a numbered nested-set leaf is served in a one-filter search only"
+    );
+    let top_w = match f {
+        SearchFilter::One(_) => slice.unwrap_or(w),
+        _ => w,
+    };
+    let mut scalars = per_trace_sql(&trace_leaves, child_counts, w, traces_table);
+    if numbered {
+        scalars.push_str(&keys_sql(top_w, w, traces_table));
+    }
+    let (scope_top, scope_detail, after_top) = if numbered {
+        (SCOPE_TOP, SCOPE_DETAIL, after_top_sql(spans_table))
+    } else {
+        ("", "", String::new())
+    };
+    let common: [(&str, &str); 13] = [
         ("scalars", &scalars),
+        ("scope_top", scope_top),
+        ("scope_detail", scope_detail),
+        ("after_top", &after_top),
         ("spans", spans_table),
         ("time", &time),
         ("bucket", &bucket),
@@ -728,6 +756,9 @@ pub struct SearchStatement {
     /// (issue #595): one filter, no `|` stage but `select()`, no structural
     /// operator.
     sliceable: bool,
+    /// Whether a predicate reads the nested-set numbering (issue #594 part
+    /// 2).
+    numbered: bool,
 }
 
 /// A statement's one `by()` (issue #592 part 2): the group key's display,
@@ -756,6 +787,12 @@ impl SearchStatement {
     /// Whether the statement's top-K may read a slice (issue #595).
     pub fn sliceable(&self) -> bool {
         self.sliceable
+    }
+
+    /// Whether a predicate reads the nested-set numbering (issue #594 part
+    /// 2): the newest-slice loop keeps doubling for it.
+    pub fn reads_numbering(&self) -> bool {
+        self.numbered
     }
 
     pub fn projection(&self) -> &Projection {
@@ -1275,6 +1312,18 @@ pub fn compile_search_sliced(
         demands.push(super::structural::CLIMB_HANDOVER.to_string());
     }
     let sliceable = !structural && matches!(filter, SearchFilter::One(_));
+    // Issue #594 part 2: a comparison that reads the numbering is served
+    // only where the newest-slice loop bounds what the top-K numbers.
+    let numbered: usize = filter
+        .predicates()
+        .iter()
+        .map(|p| p.numbered_leaves())
+        .sum();
+    if numbered > 1 || (numbered == 1 && !sliceable) {
+        return Err(PlanError::UnsupportedField(
+            NUMBERED_NOT_SLICEABLE.to_string(),
+        ));
+    }
     let sql = search_sql_at(
         spans_table,
         traces_table,
@@ -1292,6 +1341,7 @@ pub fn compile_search_sliced(
         grouping,
         climb_depth,
         sliceable,
+        numbered: numbered == 1,
     })
 }
 

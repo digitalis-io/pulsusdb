@@ -50,9 +50,9 @@ intrinsic_link_span_id	search	new	9
 intrinsic_link_trace_id	search	new	9
 intrinsic_name_eq	search	new	9
 intrinsic_name_regex	search	new	9
-intrinsic_nested_set_left_gt	search	old	12
-intrinsic_nested_set_parent_lt	search	old	12
-intrinsic_nested_set_right_gte	search	old	12
+intrinsic_nested_set_left_gt	search	new	9
+intrinsic_nested_set_parent_lt	search	new	9
+intrinsic_nested_set_right_gte	search	new	9
 intrinsic_root_name_legacy	search	new	9
 intrinsic_root_service_name_legacy	search	new	9
 intrinsic_span_child_count	search	new	9

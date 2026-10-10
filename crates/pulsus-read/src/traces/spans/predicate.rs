@@ -79,6 +79,7 @@ use crate::traces::filter::{
 };
 use crate::traces::window_sql::WindowSql;
 
+use super::numbering::nested_leaf;
 use super::tracelevel::{TraceLeaf, child_leaf, trace_leaf, type_refusal};
 
 /// A ClickHouse boolean over a `spans` row. Private fields, no public
@@ -101,6 +102,8 @@ pub struct SpanPredicate {
     trace_leaves: Vec<TraceLeaf>,
     /// Whether the text reads the scalar's outside buckets, element 1.
     child_counts: bool,
+    /// The numbered nested-set leaves the text holds (issue #594 part 2).
+    numbered: usize,
 }
 
 impl SpanPredicate {
@@ -115,6 +118,7 @@ impl SpanPredicate {
         demands: Vec<String>,
         trace_leaves: Vec<TraceLeaf>,
         child_counts: bool,
+        numbered: usize,
     ) -> Self {
         SpanPredicate {
             sql,
@@ -122,7 +126,19 @@ impl SpanPredicate {
             demands,
             trace_leaves,
             child_counts,
+            numbered,
         }
+    }
+
+    /// Whether the text reads the nested-set numbering, which the statement
+    /// scopes per read (issue #594 part 2).
+    pub fn reads_numbering(&self) -> bool {
+        self.numbered > 0
+    }
+
+    /// How many numbered nested-set leaves the text holds.
+    pub fn numbered_leaves(&self) -> usize {
+        self.numbered
     }
 
     /// The per-trace scalar's elements the text reads (issue #594 part 1),
@@ -326,27 +342,13 @@ pub fn span_membership_sql(spans_table: &str, w: WindowSql, p: &SpanPredicate) -
 // the refusals
 // ---------------------------------------------------------------------
 
-/// The issue each deferred construct is served by.
-const NESTED_AND_TRACE: &str = "#594";
-
-/// The refusal every deferred construct takes: it names the construct and
-/// the issue that serves it.
-fn unsupported(construct: &str, target: &str) -> PlanError {
-    PlanError::UnsupportedField(format!(
-        "{construct} is not supported by the span-scope predicate compiler yet (issue {target})"
-    ))
-}
-
-/// The four per-trace intrinsics as an operand (issue #594 part 1, D6):
-/// refused, so today's engine answers until #594 part 3.
+/// The four per-trace intrinsics and the three nested-set intrinsics as an
+/// operand (issue #594 parts 1 and 2): refused, so today's engine answers
+/// until #594 part 3.
 fn operand_refusal(intrinsic: Intrinsic) -> PlanError {
     PlanError::UnsupportedField(format!(
         "{intrinsic} as an operand is not supported by the search statement (issue #594)"
     ))
-}
-
-fn unsupported_intrinsic(intrinsic: Intrinsic, target: &str) -> PlanError {
-    unsupported(&format!("{intrinsic}"), target)
 }
 
 /// A `resource.` or `.` field compiled with no [`PredicateCtx`]: both
@@ -471,6 +473,8 @@ struct Compiler<'a> {
     trace_leaves: Vec<TraceLeaf>,
     /// Whether a `span:childCount` leaf was compiled.
     child_counts: bool,
+    /// The numbered nested-set leaves compiled.
+    numbered: usize,
 }
 
 /// The head of an element loop: `arrayExists` for the predicate; for the
@@ -576,6 +580,7 @@ impl<'a> Compiler<'a> {
             head: Head::Exists,
             trace_leaves: Vec::new(),
             child_counts: false,
+            numbered: 0,
         }
     }
 
@@ -608,6 +613,7 @@ impl<'a> Compiler<'a> {
             demands: self.demands.into_iter().map(|(_, m)| m).collect(),
             trace_leaves: self.trace_leaves,
             child_counts: self.child_counts,
+            numbered: self.numbered,
         }
     }
 
@@ -904,6 +910,20 @@ impl<'a> Compiler<'a> {
                 Ok(sql)
             }
             Field::Intrinsic(Intrinsic::ChildCount) => self.child_count_leaf(op, value),
+            Field::Intrinsic(
+                i @ (Intrinsic::NestedSetParent
+                | Intrinsic::NestedSetLeft
+                | Intrinsic::NestedSetRight),
+            ) => {
+                let rendered = match value {
+                    Value::Number(raw) if sql_op(op).is_some() => render_number(raw)?,
+                    _ => String::new(),
+                };
+                let (sql, numbered) =
+                    nested_leaf(*i, op, value, &rendered, self.ctx.map(|c| c.spans_table))?;
+                self.numbered += usize::from(numbered);
+                Ok(sql)
+            }
             Field::Intrinsic(intrinsic) => {
                 intrinsic_leaf(*intrinsic, op, value, self.head.leaf_function())
             }
@@ -1359,9 +1379,7 @@ impl<'a> Compiler<'a> {
                 | Intrinsic::LinkTraceId => Ok(()),
                 Intrinsic::NestedSetParent
                 | Intrinsic::NestedSetLeft
-                | Intrinsic::NestedSetRight => {
-                    Err(unsupported_intrinsic(*intrinsic, NESTED_AND_TRACE))
-                }
+                | Intrinsic::NestedSetRight => Err(operand_refusal(*intrinsic)),
                 Intrinsic::ChildCount
                 | Intrinsic::TraceDuration
                 | Intrinsic::RootName
@@ -1678,10 +1696,10 @@ impl<'a> Compiler<'a> {
             | Intrinsic::EventTimeSinceStart
             | Intrinsic::LinkSpanId
             | Intrinsic::LinkTraceId => unreachable!("a set operand is taken by set_leaf first"),
-            Intrinsic::NestedSetParent | Intrinsic::NestedSetLeft | Intrinsic::NestedSetRight => {
-                Err(unsupported_intrinsic(intrinsic, NESTED_AND_TRACE))
-            }
-            Intrinsic::ChildCount
+            Intrinsic::NestedSetParent
+            | Intrinsic::NestedSetLeft
+            | Intrinsic::NestedSetRight
+            | Intrinsic::ChildCount
             | Intrinsic::TraceDuration
             | Intrinsic::RootName
             | Intrinsic::RootServiceName => Err(operand_refusal(intrinsic)),
@@ -1780,10 +1798,10 @@ impl<'a> Compiler<'a> {
             | Intrinsic::LinkTraceId => {
                 unreachable!("every set operand is classified before operand_arms")
             }
-            Intrinsic::NestedSetParent | Intrinsic::NestedSetLeft | Intrinsic::NestedSetRight => {
-                Err(unsupported_intrinsic(intrinsic, NESTED_AND_TRACE))
-            }
-            Intrinsic::ChildCount
+            Intrinsic::NestedSetParent
+            | Intrinsic::NestedSetLeft
+            | Intrinsic::NestedSetRight
+            | Intrinsic::ChildCount
             | Intrinsic::TraceDuration
             | Intrinsic::RootName
             | Intrinsic::RootServiceName => Err(operand_refusal(intrinsic)),
@@ -2581,11 +2599,15 @@ fn is_set_intrinsic(intrinsic: Intrinsic) -> bool {
 }
 
 /// Whether a lone `field` opposite a literal-only side that folds to a
-/// constant is the leaf over that constant: any attribute, and the four
-/// event and link intrinsics (decision 8 of the part-3d design).
+/// constant is the leaf over that constant: any attribute, the four
+/// event and link intrinsics (decision 8 of the part-3d design), and the
+/// three nested-set intrinsics (issue #594 part 2).
 fn folds_to_leaf(field: &Field) -> bool {
     match field {
         Field::Attribute { .. } => true,
+        Field::Intrinsic(
+            Intrinsic::NestedSetParent | Intrinsic::NestedSetLeft | Intrinsic::NestedSetRight,
+        ) => true,
         Field::Intrinsic(intrinsic) => is_set_intrinsic(*intrinsic),
     }
 }
@@ -3545,10 +3567,10 @@ fn intrinsic_leaf(
         Intrinsic::EventTimeSinceStart => time_since_start_leaf(op, value, head),
         Intrinsic::LinkSpanId => link_id_leaf(intrinsic, "links.span_id", op, value, head),
         Intrinsic::LinkTraceId => link_id_leaf(intrinsic, "links.trace_id", op, value, head),
-        Intrinsic::NestedSetParent | Intrinsic::NestedSetLeft | Intrinsic::NestedSetRight => {
-            Err(unsupported_intrinsic(intrinsic, NESTED_AND_TRACE))
-        }
-        Intrinsic::ChildCount
+        Intrinsic::NestedSetParent
+        | Intrinsic::NestedSetLeft
+        | Intrinsic::NestedSetRight
+        | Intrinsic::ChildCount
         | Intrinsic::TraceDuration
         | Intrinsic::RootName
         | Intrinsic::RootServiceName => unreachable!("taken by Compiler::leaf"),

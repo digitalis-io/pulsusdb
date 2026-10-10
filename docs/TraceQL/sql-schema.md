@@ -918,29 +918,17 @@ entry and on exit, so n spans occupy 1..2n:
 `r` is the order of each span's root path, and `s` is the number of spans whose
 path has this span's path as a prefix.
 
-**The numbering is total over the stored spans, and does not depend on the order
-rows come back in.** That is not a detail: a client asks for root spans by
-writing `{ nestedSetParent < 0 }` — both `grafana/explore_root_rate_by_service`
-and `grafana/explore_root_rate_sample` in the corpus do — so a span left
-unnumbered is a span missing from an answer. Three shapes decide it, and the
-retained implementation
-(`crates/pulsus-read/src/traces/search_eval.rs:2089-2143`) settles each:
+**The rule is the reference's** (issue #594 part 2), read in its source:
 
-| shape | the rule | what a naive walk does |
+| shape | the reference | the statement |
 |---|---|---|
-| two children of one parent with the **same** `start_ns` | the walk carries `(start_ns, span_id)`, so sibling order is total, and a subtree's rows are exactly the rows whose path begins with its own | ordering on `start_ns` alone leaves the order undefined and lets one sibling's prefix match the other's rows |
-| a span whose **parent is not stored** in the window | it is a root of the hydrated forest, seeded like any root | seeding only `parent_span_id = ''` never reaches it: it and its subtree are unnumbered |
-| a **cycle** | no member is a forest root, so the walk cannot reach any of them; each unnumbered component's first span by `(start_ns, span_id)` is promoted to a root, keeps `parent = -1`, and the walk from it stops when it would revisit a span already on its path | the whole component is unnumbered |
-
-In SQL the promotion needs no iteration. After the forest walk, every remaining
-span's parent is also remaining, so the spans that can reach a span X are
-exactly X's own parent chain; X is promoted when X is the smallest
-`(start_ns, span_id)` on that chain, which is one more bounded climb. The walk's
-bound is `MAX_SPANS_PER_TRACE` (10,000, `crates/pulsus-read/src/traces/exec.rs:131`),
-deeper than ClickHouse's default recursive-CTE depth, so the statement carries
-`max_recursive_cte_evaluation_depth`. Any span the two passes still do not
-number is counted in `unnumbered`, a column of the one row the statement
-returns, so it cannot be lost.
+| roots | spans with an empty parent id, toured in order | the same |
+| the tour | `left` on the way down, `right` on the way up, one counter from 1; `parent` = the parent's `left`, `-1` at a root | the same |
+| an orphan (parent id not stored) and its subtree | not numbered: `left = right = parent = 0` | the same |
+| a cycle, and spans hanging off it | not numbered | the same |
+| no parentless span in the trace | nothing numbered | the same |
+| sibling and root order | the order of the stored block | `(start_ns, span_id)` — `docs/api.md` §4.2, ledger row `traceql-nestedset-sibling-order` |
+| the spans numbered | the whole trace | the trace's spans in its `traces` buckets dated from the day before the window to the day after — whole, whichever slice the read reads |
 
 Verified against a tree whose answer is written out by hand
 (`measure/nested_set_check.sh`):
@@ -952,75 +940,52 @@ Verified against a tree whose answer is written out by hand
 | C (under A) | 3 | 4 | 2 |
 | B | 6 | 7 | 1 |
 
-and against the two awkward traces of `measure/fixture/make_edge_fixture.py`,
-where the same numbers are produced twice — once by this SQL and once by the
-independent Python of `measure/catalogue_interp.py`, which reads the fixture rows
-directly — and agree span for span:
-
-| trace | spans | numbering | roots | unnumbered | the earlier statement gave |
-|---|---:|---|---:|---:|---|
-| a root, two children at the same instant, a grandchild, an orphan | 5 | 1..10 | 2 | 0 | 4 spans, 1..9, 1 root |
-| a two-span cycle with a child hanging off it, beside a well-formed root | 5 | 1..10 | 2 | 0 | 2 spans, 1..4, 1 root |
-
 and on the corpus: the 1,000-span trace numbers 1..**2,000** with 1,000 distinct
 left values and one root (`c14`); the 20-span trace 1..**40** (`c15`).
 
 #### What the query path does, and what it does not
 
-**Numbering a whole window is not possible at this scale, and the query path
-never does it.** ClickHouse inlines a CTE at each reference and re-reads it on
-each iteration of a recursive one, so the walk reads the span set tens of times.
-Measured on the 3-hour corpus (2,000,064 spans, 70,413 traces), a statement
-numbering every trace in the window was killed by the server's memory ceiling:
+The search statement numbers per trace without recursion
+(`crates/pulsus-read/src/traces/spans/numbering.rs`), every lookup a sort and a
+fill over the trace's arrays:
 
-```
-Code: 241 … (total) memory limit exceeded: would use 5.04 GiB … maximum: 5.40 GiB
-real 2m12.744s
-```
+| level | computes |
+|---|---|
+| innermost | `s` per trace, its spans as `(span_id, parent_span_id, start_ns)` in `(start_ns, span_id)` order, over the rows of the read's `nested_keys`, grouped in blocks of 256 traces |
+| `pidx` | each span's parent's index in `s`, 0 when the parent id is not stored, by one sort of `(key, type, index)` and a reverse fill; then 0 for every span whose parent id is empty, so no root binds to a span whose own id is all zero bytes |
+| `grp` | the sibling group: the parent's index; `0` for a span with an empty parent id; `-i` for any other span with no stored parent, so it has no siblings |
+| `qg`, `q`, `nsib`, `fc` | the spans sorted by `(grp, index)`, each span's next sibling and first child |
+| `tour` | events `1..n` enter, `n+1..2n` exit, `2n+1` the end, `2n+2` a dead end. Enter goes to the first child, else its own exit; exit to the next sibling, else the parent's exit, else the end (a span with an empty parent id) or the dead end. `arrayFold` doubles `(next, distance)` `ceil(log2(2n + 2))` times; each doubling is one sort and a fill |
+| `lft`, `rgt`, `par` | a span is numbered when its enter event reaches the end; `left = m2 − distance(enter) + 1`, `right = m2 − distance(exit) + 1`, `m2` = 2 × the numbered spans; `parent` the parent's `left`, `-1` with no parent; all three 0 when not numbered |
 
-and numbering ONE 1,000-span trace reads 14.9M rows for 3.0 s (`c14`). So the
-design answers the three shapes a client sends like this:
+Run on all of g1 (2,000,064 spans, 70,413 traces; `final = 1`,
+`do_not_merge_across_partitions_select_final = 1`, `max_block_size = 4096`), it
+reads 2,070,478 rows, 82.3 MB, in 253–254 MiB, numbers every span, and an
+independent Python numbering of the same rows gives the same totals; on 300
+random traces per seed with orphans, cycles, self-parents and equal starts,
+seeds 1–5, 65,530 spans, the two agree on every `(left, right, parent)`. A
+recursive CTE numbering the same window was killed by the server's memory
+ceiling at 5.04 GiB after 2 m 12 s.
 
-| the query | how it is answered | measured |
-|---|---|---|
-| `{ nestedSetParent < 0 }` — both Grafana queries in the corpus | **no numbering**: a root of the hydrated forest is a span with no stored parent, which is one anti-join (`c20`) | **437 ms** warm over the window, 4.0M rows read, and the count it returns is 70,413 — exactly the number of traces in the window |
-| `{ nestedSetLeft > 0 }`, `{ nestedSetRight >= 1 }` | **no numbering**: the numbering starts at 1, so every stored span satisfies them | the ordinary search statement |
-| any other nested-set comparison | the search runs without the nested-set condition, a second statement hydrates the candidate traces whole (`c21`), and the reader numbers those spans with the retained Euler tour it already carries | **35 ms** for 20 candidate traces, 924 spans, 44,352 bytes returned |
+The top read binds `nested_keys` to `trace_keys`: the traces whose span starts
+reach the slice it reads (§5.3), each with all its `traces` rows in those days.
+The detail read binds it to `detail_keys`, the returned traces' pairs. A
+comparison that reads the numbering is served in a one-filter search, once per
+query; elsewhere today's engine answers, as the unsliced statement would number
+every trace of the window. The slice loop keeps doubling for it past the
+density stop, until a slice fills or reaches the window. The innermost
+`GROUP BY` carries `max_block_size = 256`: the 2,105 traces of g1's newest
+5-minute slice number in 9.3 MiB, against 17.2 in one block. A
+`nestedSetParent` comparison true for `-1` alone is `parent_span_id` empty and
+reads no numbering.
 
-**Where the shortcut and the numbering differ, and why that is the right trade.**
-A span inside a *pure cycle* has a stored parent, so the anti-join does not
-return it, while the numbering promotes one member of each cyclic component to a
-root with `parent = -1`. Returning it from the window shortcut would mean
-numbering the window, which is the thing that cannot be afforded — 2 m 12 s and a
-dead server against 437 ms. So the difference is stated rather than closed: an
-orphan **is** a root on both paths (measured on the edge fixture, which returns
-`ee01:05`), and a span inside a cycle is a root only where the numbering is
-actually computed. A cycle is malformed data — a span cannot be its own ancestor
-— and this is the one shape where the two disagree. It gets a ledger row and a
-`docs/api.md` §4.2 entry.
-
-That last row is one of `server-implementation.md` §3.5's four cases — two
-statements, named, with its reason. The bound is the search's own: at most the
-trace cap × `MAX_SPANS_PER_TRACE` spans are numbered, never a window.
-
-The SQL numbering above is not dead: it is how the rule is checked. `c14` and
-`c15` number one corpus trace; `measure/nested_set_check.sh` numbers a
-hand-computed tree; and `measure/edge_checks.sh` numbers the two awkward traces
-of fixture E — a root with two same-instant siblings, a grandchild and an
-orphan, and a two-span cycle with a child hanging off it — against the four
-answers written out in that script
-(`results/edge-checks.tsv`, rows `nested_ee01_detail` … `nested_ee02_totals`).
-So the rule the reader implements is verified against an independent
-statement of itself on the shapes that break a naive walk, without that
-statement being in the query path.
-
-**The catalogue does not number.** The corpus's three nested-set queries are
-exactly the three shapes §3.2 answers without a numbering — `nestedSetParent < 0`
-is the root anti-join, `nestedSetLeft > 0` and `nestedSetRight >= 1` are `true` —
-so **none of the three nested-set query pairs** in `measure/catalogue-sql/`
-carries a recursive CTE, and the catalogue's interpreter answers the root test
-from the stored parent for the same reason the statement does. Six other files
-there do carry one — `structural_shl`, `structural_shr` and
+**The catalogue does not number.** Its three nested-set query pairs in
+`measure/catalogue-sql/` predate the reference's rule: `nestedSetParent < 0` is
+the root test the statement also uses, and `nestedSetLeft > 0` and
+`nestedSetRight >= 1` read `true`, which the rule gives only to numbered spans.
+Corpus g1 holds no orphan and no cycle — every one of its 2,000,064 spans is
+numbered — so the catalogue's answers are the statement's there. Six other files
+there carry a recursive CTE — `structural_shl`, `structural_shr` and
 `structural_precedence`, each with its membership twin — where the recursion is
 the bounded climb of §5.8 and not a numbering.
 

@@ -17,10 +17,13 @@
 //!   with a matching span, their capped spansets and their roots, in one
 //!   statement;
 //! * [`tracelevel`] — the search statement's trace-level intrinsics and
-//!   `span:childCount` (issue #594 part 1).
+//!   `span:childCount` (issue #594 part 1);
+//! * [`numbering`] — the search statement's nested-set intrinsics (issue
+//!   #594 part 2).
 
 pub mod attr_index;
 pub mod fetch;
+pub mod numbering;
 pub mod predicate;
 pub mod projection;
 pub mod rows;
