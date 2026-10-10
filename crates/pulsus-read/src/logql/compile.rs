@@ -258,12 +258,13 @@ impl Lang for Lql {
         rel.source_ref()
     }
 
-    /// A fingerprint renders as an unsigned decimal inside an `IN (…)`
-    /// list: at most 20 digits plus `", "`, and one AST element per
-    /// literal. The 32-byte constant is the `fingerprint IN ()` frame.
+    /// A fingerprint renders inside an `IN (…)` list as
+    /// `toUInt128('<up to 39 digits>')` plus `", "`, at most 54 bytes, and
+    /// one AST element per literal. The 32-byte constant is the
+    /// `fingerprint IN ()` frame.
     fn handoff_cost(n: u64) -> HandoffCost {
         HandoffCost {
-            text_bytes: 32 + n * 22,
+            text_bytes: 32 + n * 54,
             ast_elements: 4 + n,
         }
     }

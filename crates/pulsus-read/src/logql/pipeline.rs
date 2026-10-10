@@ -3130,6 +3130,41 @@ fn compile_anchored_regex(pattern: &str) -> Result<regex::Regex, PipelineError> 
     })
 }
 
+/// A targeted `| logfmt` stage's `(identifier, source key)` pairs, as the
+/// compile collapses them (issue #624, part 3d-3: the pushed label filter
+/// reads them too, so both take them from here).
+///
+/// Every expression is parsed by `parse_logfmt_expr`, so a bad one is
+/// refused even when a later one replaces it.
+///
+/// `paths[exp.Identifier] = path` (`pkg/logql/log/parser.go:521
+/// @ v3.7.4`) is a MAP assignment, so a REPEATED identifier keeps only its
+/// LAST source key and is pre-seeded/scanned once. Measured on
+/// `grafana/loki:3.7.4` over `b=1 a-b=2 x=3`: `| logfmt a="b", a="nosuch"`
+/// answers `a=""` (the surviving expression misses) and
+/// `| logfmt a="nosuch", a="b"` answers `a="1"`.
+///
+/// The slot keeps the FIRST declaration's POSITION. The reference has no
+/// position at all here (map iteration), and position is only ever
+/// consulted as the tie-break between two DIFFERENT identifiers sharing
+/// one source key — see `logfmt_target_for` and the
+/// `logfmt-expression-duplicate-source-key-tiebreak` ledger entry.
+pub(super) fn logfmt_targets(
+    extractions: &[pulsus_logql::LabelExtraction],
+) -> Result<Vec<(String, String)>, PipelineError> {
+    let mut compiled: Vec<(String, String)> = Vec::with_capacity(extractions.len());
+    for e in extractions {
+        let key = logfmt_expr::parse_logfmt_expr(&e.expression).map_err(|msg| {
+            PipelineError::BadParserExpr(format!("logfmt expression {:?}: {msg}", e.expression))
+        })?;
+        match compiled.iter_mut().find(|(id, _)| *id == e.label) {
+            Some(slot) => slot.1 = key,
+            None => compiled.push((e.label.clone(), key)),
+        }
+    }
+    Ok(compiled)
+}
+
 fn compile_parser(p: &ParserStage) -> Result<CompiledStage, PipelineError> {
     match p {
         ParserStage::Json { extractions } => {
@@ -3165,35 +3200,7 @@ fn compile_parser(p: &ParserStage) -> Result<CompiledStage, PipelineError> {
             // the pipeline compile every entry point runs before any I/O.
             // A bare `| logfmt` has no extractions, so the loop body never
             // runs and `detected.rs`'s `LOGFMT_PARSER` still cannot fail.
-            let mut compiled: Vec<(String, String)> = Vec::with_capacity(extractions.len());
-            for e in extractions {
-                let key = logfmt_expr::parse_logfmt_expr(&e.expression).map_err(|msg| {
-                    PipelineError::BadParserExpr(format!(
-                        "logfmt expression {:?}: {msg}",
-                        e.expression
-                    ))
-                })?;
-                // `paths[exp.Identifier] = path` (`pkg/logql/log/parser.go:521
-                // @ v3.7.4`) is a MAP assignment, so a REPEATED identifier
-                // keeps only its LAST source key and is pre-seeded/scanned
-                // once. Every expression is still parsed first, so a later
-                // bad one is still refused. Measured on `grafana/loki:3.7.4`
-                // over `b=1 a-b=2 x=3`: `| logfmt a="b", a="nosuch"` answers
-                // `a=""` (the surviving expression misses) and
-                // `| logfmt a="nosuch", a="b"` answers `a="1"`.
-                //
-                // The slot keeps the FIRST declaration's POSITION. The
-                // reference has no position at all here (map iteration), and
-                // position is only ever consulted as the tie-break between
-                // two DIFFERENT identifiers sharing one source key — see
-                // `logfmt_target_for` and the
-                // `logfmt-expression-duplicate-source-key-tiebreak` ledger
-                // entry.
-                match compiled.iter_mut().find(|(id, _)| *id == e.label) {
-                    Some(slot) => slot.1 = key,
-                    None => compiled.push((e.label.clone(), key)),
-                }
-            }
+            let compiled = logfmt_targets(extractions)?;
             Ok(CompiledStage::Logfmt {
                 strict: *strict,
                 keep_empty: *keep_empty,

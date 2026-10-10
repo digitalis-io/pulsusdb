@@ -7187,15 +7187,38 @@ fn stage3_predicates(
     let mut out = sp.line_filters.clone();
     let candidates = super::plan::compile_parsed_label_filters(&sp.pipeline);
     if !candidates.is_empty() {
+        // One pass over the stream labels serves the name check and every
+        // stream guard the candidates ask for (issue #624, part 3d-3): a
+        // stream carrying a name's stem label lands a hit on the stem
+        // under `<stem>_extracted`, so its rows are kept whole.
+        let stems: BTreeSet<&str> = candidates
+            .iter()
+            .filter_map(|p| p.stream_guard.as_deref())
+            .collect();
         let mut stream_label_names: BTreeSet<String> = BTreeSet::new();
-        for m in meta.values() {
+        let mut guarded: HashMap<&str, Vec<pulsus_model::FpLiteral>> = HashMap::new();
+        for (fp, m) in meta {
             for (k, _) in series_labels(m) {
+                if let Some(stem) = stems.get(k.as_str()) {
+                    guarded.entry(stem).or_default().push(fp.sql_literal());
+                }
                 stream_label_names.insert(k);
             }
         }
-        for pred in candidates {
-            if !stream_label_names.contains(&pred.name) {
-                out.push(pred.fragment);
+        for fps in guarded.values_mut() {
+            fps.sort();
+        }
+        for pred in &candidates {
+            if stream_label_names.contains(&pred.name) {
+                continue;
+            }
+            match pred
+                .stream_guard
+                .as_deref()
+                .and_then(|stem| guarded.get(stem))
+            {
+                Some(fps) => out.push(super::predicate::guard_streams(fps, &pred.fragment)),
+                None => out.push(pred.fragment.clone()),
             }
         }
     }

@@ -4547,6 +4547,10 @@ pub(crate) struct ProvisoPredicate {
     /// The label name the fragment reads.
     pub(crate) name: String,
     pub(crate) fragment: CheckedFragment,
+    /// The stem of a name ending `_extracted` (issue #624, part 3d-3): a
+    /// stream carrying the stem as a label keeps every row, since there a
+    /// hit on the stem lands under this name.
+    pub(crate) stream_guard: Option<String>,
 }
 
 /// Compiles the parsed-name label filters of `pipeline` into fragments for
@@ -4612,6 +4616,14 @@ pub(crate) fn compile_parsed_label_filters(pipeline: &[Stage]) -> Vec<ProvisoPre
     out
 }
 
+/// The stem of a label name ending `_extracted`, for
+/// [`ProvisoPredicate::stream_guard`].
+fn stem_of(name: &str) -> Option<String> {
+    name.strip_suffix("_extracted")
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
 /// One label-filter leaf, or `None` when this cell does not serve it.
 ///
 /// A conjunction or a disjunction is refused: each leaf would carry its
@@ -4627,6 +4639,7 @@ fn compile_one_parsed_filter(
                 .map(|fragment| ProvisoPredicate {
                     name: m.name.clone(),
                     fragment,
+                    stream_guard: stem_of(&m.name),
                 })
         }
         LabelFilterExpr::Compare { name, op, rhs } => {
@@ -4640,6 +4653,7 @@ fn compile_one_parsed_filter(
                 .map(|fragment| ProvisoPredicate {
                     name: name.clone(),
                     fragment,
+                    stream_guard: stem_of(name),
                 })
         }
         LabelFilterExpr::Ip { .. } | LabelFilterExpr::And(_, _) | LabelFilterExpr::Or(_, _) => None,

@@ -46,22 +46,22 @@ Site	Literal	crates/pulsus-logql/tests/case_folding.rs:277	-	-	<a>	accept	accept
 Site	Literal	crates/pulsus-logql/tests/case_folding.rs:278	-	-	<a>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-logql/tests/snapshots.rs:946	-	-	<method> <path> <_> <status>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/src/logql/charge.rs:549	-	-	, 	reject	reject	-	-	-
-Site	Literal	crates/pulsus-read/src/logql/compile.rs:1516	-	-	<a>	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/src/logql/compile.rs:1920	-	-	<a>	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:11301	-	-	<w> <v>	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:11340	-	-	<w> <v>	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4314	-	-	, 	reject	reject	-	-	-
+Site	Literal	crates/pulsus-read/src/logql/compile.rs:1517	-	-	<a>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/src/logql/compile.rs:1921	-	-	<a>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:11308	-	-	<w> <v>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:11347	-	-	<w> <v>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4321	-	-	, 	reject	reject	-	-	-
 Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:736	-	-	. 	reject	reject	-	-	-
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:7951	-	-	<__preserve_error__> <b>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:7958	-	-	<__preserve_error__> <b>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/src/logql/plan.rs:1839	-	-	 lowers as a 	reject	reject	-	-	-
-Site	Literal	crates/pulsus-read/src/logql/plan.rs:6860	-	-	<x> y	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/src/logql/plan.rs:8206	-	-	<a>	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/src/logql/plan.rs:8933	-	-	<_> <proc>[<pid>]: <_>	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/src/logql/plan.rs:8958	-	-	{pattern}	reject	reject	-	-	-
-Site	Literal	crates/pulsus-read/src/logql/plan.rs:9002	-	-	<q> <_>	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/src/logql/plan.rs:9034	-	-	<a> <_> <b>	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/src/logql/plan.rs:9651	-	-	latency=<latency>	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/src/logql/predicate.rs:2309	-	-	{}	reject	reject	-	-	-
+Site	Literal	crates/pulsus-read/src/logql/plan.rs:6874	-	-	<x> y	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/src/logql/plan.rs:8220	-	-	<a>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/src/logql/plan.rs:8947	-	-	<_> <proc>[<pid>]: <_>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/src/logql/plan.rs:8972	-	-	{pattern}	reject	reject	-	-	-
+Site	Literal	crates/pulsus-read/src/logql/plan.rs:9016	-	-	<q> <_>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/src/logql/plan.rs:9048	-	-	<a> <_> <b>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/src/logql/plan.rs:9665	-	-	latency=<latency>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/src/logql/predicate.rs:2496	-	-	{}	reject	reject	-	-	-
 Site	Literal	crates/pulsus-read/tests/fixtures/group_key/cases.tsv:213	-	-	latency=<latency>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/tests/fixtures/group_key/cases.tsv:269	-	-	<__error__> <__error___extracted>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/tests/fixtures/group_key/cases.tsv:270	-	-	<__error___extracted> <__error__>	accept	accept	-	-	-

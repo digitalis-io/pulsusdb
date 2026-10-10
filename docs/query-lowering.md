@@ -1667,7 +1667,7 @@ maps to **`400`** with `Content-Type: text/plain; charset=utf-8` and `X-Content-
 
 **How this table is derived, because the previous one was transcribed and missed two rejections a
 user can reach today.** The enumeration is over a literal scope: **every `ReadError::` construction
-in `crates/pulsus-read/src/logql/plan.rs` above `mod tests` (`plan.rs:4666`)**, which is 25 sites at
+in `crates/pulsus-read/src/logql/plan.rs` above `mod tests` (`plan.rs:4680`)**, which is 25 sites at
 `2f78c53`, listed by `grep -n 'ReadError::[A-Z]' crates/pulsus-read/src/logql/plan.rs`. Every one of
 the 25 is either a row below or is excluded beneath the table with its reason, so completeness is a
 property of that grep and not of anyone's reading. Each row's body **and its reachability** were
@@ -1763,7 +1763,7 @@ says so in its own doc comment; that is why `RangeAgg::param` and `VectorAgg::pa
 
 | link | source | accepts → produces | precondition to lower | residual state effect | disposition | continuation |
 |---|---|---|---|---|---|---|
-| `Source` | the stream selector (`LogQL`'s `{…}`) | — → `Lines` | none; the seed is lowered by the predicate lattice rather than by the stage fold, so it always emits | **none — the identity.** The seed is always applied, so there is no residual case, and the row asserts the identity rather than leaving the exemption silent (`logql/compile.rs:314-317`) | **always lowers**, `Fidelity::Equivalent` | *none* |
+| `Source` | the stream selector (`LogQL`'s `{…}`) | — → `Lines` | none; the seed is lowered by the predicate lattice rather than by the stage fold, so it always emits | **none — the identity.** The seed is always applied, so there is no residual case, and the row asserts the identity rather than leaving the exemption silent (`logql/compile.rs:315-318`) | **always lowers**, `Fidelity::Equivalent` | *none* |
 | `Window` | `LogRange` (`ast.rs:2301`) + the request step | `Lines`\|`Samples` → the same, bucketed | the origin-shifted bucket expression is emittable and the offset is representable | records the bucketing as evaluator-owned, so a following aggregation cannot lower | conditional | *none* |
 | `RangeAgg` | `MetricExpr::Range` (`ast.rs:940`) | `Samples` → `Series{by}` | `exact`, the `Window` lowered, and `__error__` either filtered or carried in the grouping | **shape unchanged** — `Lines` whenever the `Unwrap` above went residual, which is the case its own row describes; clears `exact` | conditional. `AbsentOverTime` lowers with `count()`: the answer is 1 where no counted row covers a grid point, so presence is a count above zero (#624 part 2). `bytes_over_time`/`bytes_rate` do not lower once `body` is no longer the stored column — a stage rewrote the line, and the bytes are the rewritten line's | *none* |
 | `VectorAgg`, one link per level | `MetricExpr::Vector` (`ast.rs:956`) | `Series` → `Series` | the prior level lowered and the grouping is expressible | retains the prior series state; clears `exact` | conditional | *none* |
@@ -4989,9 +4989,9 @@ measured. None of them exists at base.
 These are **lib unit tests**, because `compile_line_filters` is `pub(crate)`
 (`crates/pulsus-read/src/logql/plan.rs:4186`) and `has_unpushed_dropping_stage` (`:1689`) and
 `metric_pipeline_construct` (`:1723`) are private — an integration test cannot call any of them.
-**They go in `plan.rs`'s existing `mod tests` (`plan.rs:4666`), and no production item is widened
+**They go in `plan.rs`'s existing `mod tests` (`plan.rs:4680`), and no production item is widened
 for them.** That module is a child of `logql::plan`, so it already reaches both private functions —
-directly, and again through its `use super::*` (`plan.rs:4928`). An earlier version of this section
+directly, and again through its `use super::*` (`plan.rs:4942`). An earlier version of this section
 offered a second option — **wave 1** writes them wherever they go — moving the gates to
 `logql::compile`'s test module with the two functions raised to `pub(super)`. That option is **withdrawn**: the widening was never needed, and a design
 that offers two placements has not decided.
@@ -5544,8 +5544,8 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | occurrences those resolved pairs cover | 509 |
 | `(document, token)` pairs it cannot resolve | 103 |
 | occurrences those frozen pairs cover | 194 |
-| resolved rows anchored on a token the citing prose prints | 185 |
-| resolved rows anchored on a snapshot of the cited line | 193 |
+| resolved rows anchored on a token the citing prose prints | 183 |
+| resolved rows anchored on a snapshot of the cited line | 195 |
 
 | reason it cannot be resolved | pairs | what it means |
 |---|---|---|
@@ -5564,7 +5564,7 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | `prose` | a token the citing prose prints, so the claim and its evidence are reviewable side by side |
 | `line` | a snapshot of the cited line, taken because the citing prose prints no such token: it detects the line moving or changing and cannot show the citation means the right thing |
 
-Of the 703 citation occurrences the five artefacts make, 502 name a bare basename and 75 are written as a continuation of a citation earlier on the same line. The rule resolves 378 `(document, token)` pairs covering 509 occurrences, and cannot resolve 103 covering 194. Of the resolved rows, 185 are anchored on a token the citing prose prints and 193 on a snapshot of the cited line.
+Of the 703 citation occurrences the five artefacts make, 502 name a bare basename and 75 are written as a continuation of a citation earlier on the same line. The rule resolves 378 `(document, token)` pairs covering 509 occurrences, and cannot resolve 103 covering 194. Of the resolved rows, 183 are anchored on a token the citing prose prints and 195 on a snapshot of the cited line.
 
 The language fallback and the anchor rule disagree on 5 citations, all of them read one at a time. 4 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
 

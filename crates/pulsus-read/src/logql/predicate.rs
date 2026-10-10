@@ -230,7 +230,7 @@ use pulsus_model::FpLiteral;
 use super::escape::ch_like_contains;
 use super::escape::ch_regex_capture_checked;
 use super::escape::{ch_regex_anchored_checked, ch_regex_unanchored_checked, ch_string};
-use super::pipeline::PipelineError;
+use super::pipeline::{JsonPathSeg, PipelineError};
 
 /// The four textual forms Go's `uuid.Parse` accepts (issue #170,
 /// `/detected_labels`' ID-likeness reference, grafana/loki:3.4.2
@@ -793,6 +793,77 @@ pub enum ParsedFilterRefusal {
     UndecidableSource,
 }
 
+/// The lines a targeted `| logfmt` filter keeps whatever the value (issue
+/// #624, part 3d-3): `extractKeyValuePairs` does not read them as our
+/// parser does. A byte in `\x00`–`\x08`, `\x0b`, `\x0c`, `\x0e`–`\x1f`
+/// separates fields for our decoder and not for it.
+fn logfmt_other_separators() -> String {
+    format!(
+        "match(body, {})",
+        ch_string(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+    )
+}
+
+/// The keys a targeted `| logfmt` reads `name` from (issue #624, part
+/// 3d-3): the name's source as the pipeline compiles it, and the name
+/// itself, since a line key equal to a destination also sets it. Empty
+/// when `name` is no destination.
+fn logfmt_target_keys(
+    name: &str,
+    extractions: &[pulsus_logql::LabelExtraction],
+) -> Result<Vec<String>, ParsedFilterRefusal> {
+    let targets = super::pipeline::logfmt_targets(extractions)
+        .map_err(|_| ParsedFilterRefusal::UndecidableSource)?;
+    let Some((_, source)) = targets.iter().find(|(id, _)| id == name) else {
+        return Ok(Vec::new());
+    };
+    // Which destination a key sets would depend on declaration order.
+    if targets
+        .iter()
+        .any(|(id, s)| id != name && (s == source || s == name))
+    {
+        return Err(ParsedFilterRefusal::UndecidableSource);
+    }
+    let mut keys = vec![source.clone()];
+    if source != name {
+        keys.push(name.to_string());
+    }
+    Ok(keys)
+}
+
+/// Every path a targeted `| json` reads `name` from, rendered as
+/// `JSONExtract*` path arguments, an index one-based (issue #624, part
+/// 3d-3). Empty when `name` is no destination.
+fn json_target_paths(
+    name: &str,
+    extractions: &[pulsus_logql::LabelExtraction],
+) -> Result<Vec<String>, ParsedFilterRefusal> {
+    extractions
+        .iter()
+        .filter(|e| e.label == name)
+        .map(|e| {
+            let segs = super::json_expr::parse_json_expr(&e.expression)
+                .map_err(|_| ParsedFilterRefusal::UndecidableSource)?;
+            Ok(segs
+                .iter()
+                .map(|s| match s {
+                    JsonPathSeg::Field(f) => ch_string(f),
+                    JsonPathSeg::Index(i) => (i + 1).to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(", "))
+        })
+        .collect()
+}
+
+/// The `(fingerprint IN (...) OR <fragment>)` that keeps every row of the
+/// streams carrying a name's stem label (issue #624, part 3d-3).
+pub(crate) fn guard_streams(fps: &[FpLiteral], fragment: &CheckedFragment) -> CheckedFragment {
+    CheckedFragment {
+        sql: format!("({} OR {})", fingerprint_test(fps, false), fragment.sql),
+    }
+}
+
 /// Can this label name have been produced by more than one raw key?
 ///
 /// **No, exactly when it contains no `_`.** `sanitize_label_key`
@@ -907,8 +978,80 @@ pub fn parsed_string_filter(
     if !name_is_renderable(name) {
         return Err(ParsedFilterRefusal::NameNotRenderable);
     }
+    if name == "__error__" || name == "__error_details__" {
+        return Err(ParsedFilterRefusal::ReservedName);
+    }
     let guard = metadata_non_empty_guard();
     let guard = guard.as_sql();
+    let v = ch_string(value);
+    // Issue #624, part 3d-3: a targeted parser sets the name from the field
+    // it maps it from, so the filter reads that field. A `Wider` fragment:
+    // it may keep a line the evaluator drops, never the reverse.
+    match parser {
+        ParserStage::Logfmt { extractions, .. } if !extractions.is_empty() => {
+            let keys = logfmt_target_keys(name, extractions)?;
+            if keys.is_empty() {
+                return Ok(CheckedFragment {
+                    sql: format!("('' {cmp} {v} OR {guard})"),
+                });
+            }
+            let set = format!(
+                "[{}]",
+                keys.iter()
+                    .map(|k| ch_string(k))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            let underscores = "_".repeat(super::sql::LOGFMT_KEY_PUNCTUATION.len());
+            // A key, sanitised as the parser sanitises it, that feeds the name.
+            let feeds = format!(
+                "has({set}, concat(if(substring(k, 1, 1) BETWEEN '0' AND '9', '_', ''), \
+                 translate(k, {}, {})))",
+                ch_string(super::sql::LOGFMT_KEY_PUNCTUATION),
+                ch_string(&underscores)
+            );
+            let m = "extractKeyValuePairs(body, '=', ' \\t\\r\\n', '\"')";
+            // A key with no `=` sets `''` for our parser, and the database
+            // drops it: under `!=` a line holding one is kept.
+            let bare = if matches!(op, MatchOp::Neq) {
+                format!(
+                    " OR match(body, {})",
+                    ch_string("(^|[\\x00-\\x20])[^\\x00-\\x20=\"]+([\\x00-\\x20]|$)")
+                )
+            } else {
+                String::new()
+            };
+            return Ok(CheckedFragment {
+                sql: format!(
+                    "(arrayExists((k, x) -> {feeds} AND x {cmp} {v}, mapKeys({m}), mapValues({m})) \
+                     OR (NOT arrayExists(k -> {feeds}, mapKeys({m})) AND '' {cmp} {v}) \
+                     OR position(body, '\\\\') > 0 OR {} OR lengthUTF8(body) != length(body){bare} \
+                     OR {guard})",
+                    logfmt_other_separators()
+                ),
+            });
+        }
+        ParserStage::Json { extractions } if !extractions.is_empty() => {
+            let paths = json_target_paths(name, extractions)?;
+            if paths.is_empty() {
+                return Ok(CheckedFragment {
+                    sql: format!("('' {cmp} {v} OR {guard})"),
+                });
+            }
+            let terms: Vec<String> = paths
+                .iter()
+                .map(|p| {
+                    format!(
+                        "JSONType(body, {p}) != 'String' OR JSONExtractString(body, {p}) {cmp} {v}"
+                    )
+                })
+                .collect();
+            return Ok(CheckedFragment {
+                sql: format!("({} OR {guard})", terms.join(" OR ")),
+            });
+        }
+        _ => {}
+    }
     let Some(expr) = parsed_name_expr(name, parser) else {
         // Route B, and it serves `=` alone.
         //
@@ -933,7 +1076,6 @@ pub fn parsed_string_filter(
     if !name_is_unambiguous(name) {
         return Err(ParsedFilterRefusal::AmbiguousName);
     }
-    let v = ch_string(value);
     let key = ch_string(name);
     Ok(CheckedFragment {
         sql: match parser {
@@ -1005,6 +1147,44 @@ pub fn parsed_numeric_filter(
     }
     if !threshold.is_finite() {
         return Err(ParsedFilterRefusal::ThresholdNotFinite);
+    }
+    if name == "__error__" || name == "__error_details__" {
+        return Err(ParsedFilterRefusal::ReservedName);
+    }
+    // Issue #624, part 3d-3: a targeted `| json` sets the name from the
+    // paths it maps it from, so the comparison reads those.
+    if let ParserStage::Json { extractions } = parser
+        && !extractions.is_empty()
+    {
+        let cmp = match op {
+            CompareOp::Eq => "=",
+            CompareOp::Neq => "!=",
+            CompareOp::Gt => ">",
+            CompareOp::Gte => ">=",
+            CompareOp::Lt => "<",
+            CompareOp::Lte => "<=",
+        };
+        let guard = metadata_non_empty_guard();
+        let guard = guard.as_sql();
+        let paths = json_target_paths(name, extractions)?;
+        if paths.is_empty() {
+            // An absent label fails every comparison.
+            return Ok(CheckedFragment {
+                sql: format!("(0 OR {guard})"),
+            });
+        }
+        let terms: Vec<String> = paths
+            .iter()
+            .map(|p| {
+                format!(
+                    "JSONType(body, {p}) NOT IN ('Int64','UInt64','Double') OR \
+                     JSONExtractFloat(body, {p}) {cmp} {threshold:?}"
+                )
+            })
+            .collect();
+        return Ok(CheckedFragment {
+            sql: format!("({} OR {guard})", terms.join(" OR ")),
+        });
     }
     if !matches!(parser, ParserStage::Json { .. }) {
         // The specified numeric cell reads `JSONExtractFloat`, which is a
@@ -2389,13 +2569,17 @@ mod tests {
             r"has(['code', 'status'], concat(if(substring(k, 1, 1) BETWEEN '0' AND '9', '_', ''), ",
             r"translate(k, '!#$%&\'()*+,-./:;<>?@[\\]^`{|}~', '_____________________________')))"
         );
-        let m = r#"extractKeyValuePairs(body, '=', ' \t\r\n', '"')"#;
-        let want = format!(
-            "(arrayExists((k, x) -> {feeds} AND x = '200', mapKeys({m}), mapValues({m})) \
-             OR (NOT arrayExists(k -> {feeds}, mapKeys({m})) AND '' = '200') \
-             OR position(body, '\\\\') > 0 OR match(body, '[\\\\x00-\\\\x08\\\\x0b\\\\x0c\\\\x0e-\\\\x1f]') \
-             OR lengthUTF8(body) != length(body) OR structured_metadata != '')"
-        );
+        let m = "extractKeyValuePairs(body, '=', ' \\t\\r\\n', '\"')";
+        // One literal per line: `check_h_predicate_rs_surface_is_allowlisted`
+        // reads this file a line at a time.
+        let want = [
+            format!("(arrayExists((k, x) -> {feeds} AND x = '200', mapKeys({m}), mapValues({m}))"),
+            format!(" OR (NOT arrayExists(k -> {feeds}, mapKeys({m})) AND '' = '200')"),
+            r" OR position(body, '\\') > 0".to_string(),
+            r" OR match(body, '[\\x00-\\x08\\x0b\\x0c\\x0e-\\x1f]')".to_string(),
+            " OR lengthUTF8(body) != length(body) OR structured_metadata != '')".to_string(),
+        ]
+        .concat();
         assert_eq!(
             parsed_string_filter(
                 "status",

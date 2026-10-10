@@ -53,7 +53,7 @@ PARTITION BY toDate(fromUnixTimestamp64Milli(unix_milli))
 ORDER BY (org_id, fingerprint, unix_milli)
 TTL toDateTime(fromUnixTimestamp64Milli(unix_milli)) + INTERVAL 7 DAY DELETE
 SETTINGS ttl_only_drop_parts = 1,
-         primary_key_ratio_of_unique_prefix_values_to_skip_suffix_columns = 1;
+         primary_key_ratio_of_unique_prefix_values_to_skip_suffix_columns = 1, min_columns_to_activate_adaptive_write_buffer = 1;
 ```
 
 - **The tenant leads every metrics key** (issue #635). A metrics request names its tenant in `X-Scope-OrgID`; no header is the empty tenant `''`, the single-tenant deployment. Every metrics table carries `org_id LowCardinality(String)` first in its sorting key, every view copies it from `metric_landing`, and every metrics table a read names carries `org_id = <tenant>` in its own `WHERE`, so two tenants' equal series IDs never meet in one statement. The five tables that collapse rows with equal keys would otherwise merge two tenants' series into one row. Partitions and the `_dist` sharding key are unchanged. Measured on 200 metrics over ten tenants: the column costs 0.005 bytes per sample row, and one metric's read is unchanged.
@@ -75,7 +75,7 @@ CREATE TABLE metric_labels (                       -- the lookup
     first_seen   SimpleAggregateFunction(min, Int64) CODEC(ZSTD(1)),
     last_seen    SimpleAggregateFunction(max, Int64) CODEC(ZSTD(1))
 ) ENGINE = AggregatingMergeTree
-ORDER BY (org_id, metric_name, fingerprint) SETTINGS allow_dimensions_outside_sorting_key = 1;
+ORDER BY (org_id, metric_name, fingerprint) SETTINGS allow_dimensions_outside_sorting_key = 1, min_columns_to_activate_adaptive_write_buffer = 1;
 
 CREATE TABLE metric_series (                       -- the activity
     org_id       LowCardinality(String),
@@ -396,7 +396,7 @@ CREATE TABLE metric_hist_samples (
 PARTITION BY toDate(fromUnixTimestamp64Milli(unix_milli))
 ORDER BY (org_id, fingerprint, unix_milli)
 TTL toDateTime(fromUnixTimestamp64Milli(unix_milli)) + INTERVAL 7 DAY DELETE
-SETTINGS ttl_only_drop_parts = 1;
+SETTINGS ttl_only_drop_parts = 1, min_columns_to_activate_adaptive_write_buffer = 1;
 ```
 
 - **Identity and access shape are byte-identical to `metric_samples`** (§2.1): the series ID leads the key and clusters each series, `unix_milli` orders within it — same PK/ordering key `(fingerprint, unix_milli)`, same daily partitioning, same `ttl_only_drop_parts` retention. Per-series reads are the same sequential granule scans; the codecs on `fingerprint`/`unix_milli` match §2.1 exactly. Timestamps are stored **verbatim at millisecond precision** (§2.1's resolution-agnostic rule).
@@ -455,7 +455,7 @@ CREATE TABLE log_landing (
 ) ENGINE = MergeTree
 PARTITION BY toStartOfHour(fromUnixTimestamp64Milli(received_ms))
 ORDER BY (kind, service, fingerprint, timestamp_ns)
-SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600;
+SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600, min_columns_to_activate_adaptive_write_buffer = 1;
 -- `apply_ttl` issues at init and on every rotation tick:
 --   ALTER TABLE log_landing MODIFY TTL
 --     toDateTime(intDiv(received_ms, 1000)) + INTERVAL {retention_hours} HOUR DELETE
@@ -544,7 +544,7 @@ CREATE TABLE log_samples (
 PARTITION BY toDate(fromUnixTimestamp64Nano(timestamp_ns))
 ORDER BY (service, fingerprint, timestamp_ns)
 TTL toDateTime(fromUnixTimestamp64Nano(timestamp_ns)) + INTERVAL 7 DAY DELETE
-SETTINGS ttl_only_drop_parts = 1;
+SETTINGS ttl_only_drop_parts = 1, min_columns_to_activate_adaptive_write_buffer = 1;
 ```
 
 ```sql

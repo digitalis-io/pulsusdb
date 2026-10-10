@@ -2068,7 +2068,10 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
     ("pulsus-clickhouse/src/error.rs", 1),
     ("pulsus-read/src/logql/exec.rs", 3),
     ("pulsus-read/src/logql/plan.rs", 1),
-    ("pulsus-read/src/logql/predicate.rs", 15),
+    // Issue #624, part 3d-3 adds three: a targeted `| logfmt` filter's
+    // control-separator test and its `!=` key-with-no-`=` test, and the
+    // expected text of the test that pins them.
+    ("pulsus-read/src/logql/predicate.rs", 18),
     // Issue #624, part 3d adds three to `sql.rs`: the `| logfmt` line
     // grammar in its `decided` column, and the out-of-range integer test in
     // each of the two `| json` key readers.
@@ -2108,7 +2111,7 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
 
 /// The separately-asserted total, so "a file appeared" reads differently
 /// from "a file grew".
-const MATCH_RENDER_TOTAL: usize = 106;
+const MATCH_RENDER_TOTAL: usize = 109;
 
 /// Every string-literal CONTENT in a Rust source: ordinary `"…"`, raw
 /// `r"…"`/`r#"…"#`, byte `b"…"` and byte-raw. Comments are dropped.
@@ -2371,7 +2374,7 @@ const PREDICATE_ITEMS: &[&str] = &[
     "use super::escape::ch_like_contains",
     "use super::escape::ch_regex_capture_checked",
     "use super::escape::{ch_regex_anchored_checked, ch_regex_unanchored_checked, ch_string}",
-    "use super::pipeline::PipelineError",
+    "use super::pipeline::{JsonPathSeg, PipelineError}",
     "const UUID_RE: &str = r_",
     "#[derive(Debug, Clone, PartialEq, Eq)]",
     "pub struct CheckedFragment",
@@ -2419,6 +2422,15 @@ const PREDICATE_ITEMS: &[&str] = &[
     "pub enum ParsedFilterRefusal :: NoKeyExpression,",
     "pub enum ParsedFilterRefusal :: ThresholdNotFinite,",
     "pub enum ParsedFilterRefusal :: NameNotRenderable,",
+    // Issue #624, part 3d-3: a filter after a targeted parser reads the
+    // field the stage maps it from; `guard_streams` wraps an `_extracted`
+    // name's fragment in its stream guard.
+    "pub enum ParsedFilterRefusal :: ReservedName,",
+    "pub enum ParsedFilterRefusal :: UndecidableSource,",
+    "fn logfmt_other_separators() -> String",
+    "fn logfmt_target_keys(name: &str, extractions: &[pulsus_logql::LabelExtraction]) -> Result<Vec<String>, ParsedFilterRefusal>",
+    "fn json_target_paths(name: &str, extractions: &[pulsus_logql::LabelExtraction]) -> Result<Vec<String>, ParsedFilterRefusal>",
+    "pub(crate) fn guard_streams(fps: &[FpLiteral], fragment: &CheckedFragment) -> CheckedFragment",
     "pub(in crate::logql) fn name_is_unambiguous(name: &str) -> bool",
     "fn name_is_renderable(name: &str) -> bool",
     "fn parsed_name_expr(name: &str, parser: &ParserStage) -> Option<String>",
@@ -2547,6 +2559,9 @@ const PREDICATE_ITEMS: &[&str] = &[
     "mod tests :: fn every_witness_row_states_the_answer_the_pipeline_gives()",
     "mod tests :: fn json_parser() -> ParserStage",
     "mod tests :: fn logfmt_parser() -> ParserStage",
+    "mod tests :: fn targeted_logfmt(pairs: &[(&str, &str)]) -> ParserStage",
+    "mod tests :: #[test]",
+    "mod tests :: fn a_targeted_filter_reads_the_mapped_field()",
     "mod tests :: #[test]",
     "mod tests :: fn a_parsed_name_filter_renders_the_specified_fragment()",
     "mod tests :: #[test]",
@@ -2610,8 +2625,10 @@ const PREDICATE_ITEMS: &[&str] = &[
 /// an empty array for a `pattern` element no stage extracts from, and
 /// `pattern_captures`, the reference's pattern matcher as one `arrayFold`.
 /// `pattern_group_columns` returns `RegexpGroupColumns`, as
-/// `regexp_group_columns` does, and is not counted.
-const MINT_COUNT: usize = 24;
+/// `regexp_group_columns` does, and is not counted. **25 at issue #624,
+/// part 3d-3**: `guard_streams`, which keeps every row of the streams
+/// carrying an `_extracted` name's stem label.
+const MINT_COUNT: usize = 25;
 
 /// Attributes permitted anywhere in `predicate.rs`.
 const PREDICATE_ATTRIBUTES: &[&str] = &[

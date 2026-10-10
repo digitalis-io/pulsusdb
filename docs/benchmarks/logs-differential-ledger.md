@@ -5958,7 +5958,9 @@ mechanism stayed unmodelled. Two axes, one moved.
   | `sum by (level) (count_over_time({…} \| logfmt level="level" [1m]))` | `level=info level=error` | `{level="info"}` | `{level="error"}` |
   | the same | `lvl=1 level=2 level=3` | `{level="2"}` | `{level="3"}` |
 
-  The fix is part 3d-2 of #624. Otherwise only the EXPRESSION parsers
+  These are documented limits, not fixed (owner, 2026-10-10): each line
+  in the table is bad source data, a broken quote or a stray `=` under
+  `--strict`, or a key twice. Otherwise only the EXPRESSION parsers
   make it observable, and only because of the pre-seed — there has to
   be an empty value already sitting under the identifier for the skipped
   extraction to leave something behind.
