@@ -1673,7 +1673,12 @@ mod tests {
             test_cfg(),
             rx,
         ));
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Shut down once a frame has been sent (10 ms steps, at most 10 s):
+        // a fixed wait can end before a loaded machine sends one.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while sent.lock().unwrap().is_empty() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         tx.send(true).expect("receiver alive");
         tokio::time::timeout(Duration::from_secs(1), handle)
             .await

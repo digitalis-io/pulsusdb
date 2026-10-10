@@ -495,28 +495,16 @@ impl Harness {
         stream.next().await.expect("a row").expect("decode").n
     }
 
-    /// Does `sql` drain fully under a `max_memory_usage` of `ceiling`?
-    ///
-    /// The settings are the engine's own
-    /// (`metrics::exec::metrics_read_settings`), reproduced here because
-    /// that function is private: the ceiling, no external group-by
-    /// spilling, and the pinned block size.
-    ///
-    /// **Which of the three is load-bearing here was measured, not
-    /// assumed.** Raising `max_bytes_before_external_group_by` to allow a
-    /// spill leaves every row of the sweep unchanged, so the group-by is
-    /// not what breaches the ceiling on this corpus — the window
-    /// functions and the coverage expansion are. Dropping
-    /// `max_memory_usage` reddens the sweep at its first row. The spill
-    /// setting stays because it mirrors what the engine sends, not
-    /// because it is what refuses.
+    /// Does `sql` drain fully under a `max_rows_to_read` of `rows`, which
+    /// throws when breached (issue #624, part 3d)? The pinned block size is
+    /// the engine's own (`metrics::exec::metrics_read_settings`).
     ///
     /// `true` means every row arrived; `false` means the server refused,
     /// either at dispatch or mid-stream.
-    async fn drains_under_ceiling(&self, sql: &str, ceiling: u64) -> bool {
+    async fn drains_under_rows(&self, sql: &str, rows: u64) -> bool {
         let settings = QuerySettings::new()
-            .set("max_memory_usage", ceiling)
-            .set("max_bytes_before_external_group_by", 0u64)
+            .set("max_rows_to_read", rows)
+            .set("read_overflow_mode", "throw")
             .set("max_block_size", 65_409u64);
         let mut stream = match self
             .admin
@@ -1640,13 +1628,18 @@ async fn the_charge_depends_on_where_the_chunk_boundary_falls() {
 /// Criterion 10, across TWO statements: **a completed earlier statement's
 /// charge answers before a later statement's failure.**
 ///
-/// The query sends two statements. The second is made to fail by a memory
-/// ceiling it alone breaches; the first drains and charges.
+/// The query sends two statements. The second is made to fail by a
+/// rows-read ceiling it alone breaches; the first drains and charges.
 ///
 /// ```text
-///   max_samples = the first statement's charge        -> the memory error
+///   max_samples = the first statement's charge        -> the rows error (158)
 ///   max_samples = that charge - 1                     -> the BUDGET error
 /// ```
+///
+/// The ceiling is on rows read, not memory (issue #624, part 3d): on 26.8
+/// the two statements' memory peaks overlap at every thread count, while
+/// the light statement reads 8,192 rows and the heavy one 100,400 at every
+/// `max_threads` from 1 to 16.
 ///
 /// # What this does NOT prove, and where that is proved instead
 ///
@@ -1769,36 +1762,20 @@ async fn the_budget_answers_before_a_later_statements_failure() {
     // A ceiling the light statement clears and the heavy one does not.
     // **The sweep RUNS** (review round 1): it was a comment, and a table
     // nobody executes is a claim about a tree nobody checked. Each of the
-    // two statements is executed alone and fully drained under the
-    // engine's own settings at each ceiling, and the window the test
-    // depends on is asserted rather than described.
+    // two statements is executed alone and fully drained at each ceiling,
+    // and the window the test depends on is asserted rather than
+    // described.
     //
     // ```text
-    //   ceiling    chunk 1 (4,000 rows in)   chunk 2 (96,400 rows in)
-    //    4 MiB     refused                   refused
-    //   10 MiB     ran                       refused      <- the test runs here
-    //   64 MiB     ran                       ran
+    //   rows read   chunk 1 (8,192 read)   chunk 2 (100,400 read)
+    //     5,000     refused                refused
+    //    50,000     ran                    refused      <- the test runs here
+    //   200,000     ran                    ran
     // ```
     //
-    // **The window moved with issue #498** and the figures are the ones
-    // measured after it. The identity is a `UInt128`, so every place this
-    // statement carries the `fingerprint` column — the two scans, the
-    // `PARTITION BY`, the `transform` array — costs twice the bytes it
-    // did, and the light statement's peak crossed the old 6 MiB ceiling.
-    // The edges were re-measured one ceiling at a time:
-    //
-    // ```text
-    //    6 MiB     refused                   refused
-    //    8 MiB     ran                       refused
-    //   12 MiB     ran                       refused
-    //   16 MiB     ran                       ran
-    // ```
-    //
-    // 10 MiB is inside the new window with a row either side of it that
-    // this test executes. The 8 and 12 MiB rows are recorded here rather
-    // than run: they say what 4 and 64 already say, at a minute of live
-    // time each.
-    const CEILING: u64 = 10 * 1024 * 1024;
+    // Rows, not memory (issue #624, part 3d): the memory ceiling this
+    // used, 10 MiB, sat between the two statements' peaks on 26.3, and on
+    // 26.8 the peaks overlap (both 12.2 MB at one thread).
     let heavy_chunk: Vec<FpLiteral> = (401..=800u128)
         .map(|v| Fingerprint::from_raw(v).sql_literal())
         .collect();
@@ -1818,21 +1795,41 @@ async fn the_budget_answers_before_a_later_statements_failure() {
         params.end_ms,
         GroupedOp::Max,
     );
-    for (ceiling, light_ok, heavy_ok) in [
-        (4 * 1024 * 1024u64, false, false),
-        (CEILING, true, false),
-        (64 * 1024 * 1024u64, true, true),
+    const ROWS: u64 = 50_000;
+    for (rows, light_ok, heavy_ok) in [
+        (5_000u64, false, false),
+        (ROWS, true, false),
+        (200_000, true, true),
     ] {
         for (which, stmt, want_ok) in [("light", &sql, light_ok), ("heavy", &heavy_sql, heavy_ok)] {
-            let got = h.drains_under_ceiling(stmt, ceiling).await;
+            let got = h.drains_under_rows(stmt, rows).await;
             assert_eq!(
                 got,
                 want_ok,
-                "at a {} MiB ceiling the {which} statement must {}",
-                ceiling / (1024 * 1024),
+                "at a {rows}-row ceiling the {which} statement must {}",
                 if want_ok { "drain" } else { "be refused" }
             );
         }
+    }
+    // The engine sends no rows-read limit, so it connects as a user whose
+    // settings carry one. The user is dropped only here, before it is
+    // created: a run leaves it behind and the next run's drop clears it.
+    let user = format!("{db}_rows");
+    for stmt in [
+        format!("DROP USER IF EXISTS {user}"),
+        format!(
+            "CREATE USER {user} IDENTIFIED WITH no_password SETTINGS max_rows_to_read = {ROWS}, read_overflow_mode = 'throw'"
+        ),
+        format!("GRANT SELECT ON {db}.* TO {user}"),
+    ] {
+        h.admin
+            .execute(
+                &stmt,
+                &QuerySettings::new(),
+                pulsus_clickhouse::Idempotency::Idempotent,
+            )
+            .await
+            .expect("the row-ceiling user");
     }
     let run = |cap: u64| {
         let db = db.clone();
@@ -1840,11 +1837,15 @@ async fn the_budget_answers_before_a_later_statements_failure() {
         let resolver = Arc::clone(&h.cache);
         async move {
             let engine = MetricsEngine::new(
-                ChClient::new(test_config(&db)).await.expect("connect"),
+                ChClient::new(ChConnConfig {
+                    user: format!("{db}_rows"),
+                    ..test_config(&db)
+                })
+                .await
+                .expect("connect"),
                 resolver,
                 MetricsConfig {
                     max_samples: cap,
-                    read_max_memory_bytes: CEILING,
                     ..engine_config(&db, true)
                 },
             )
@@ -1858,17 +1859,17 @@ async fn the_budget_answers_before_a_later_statements_failure() {
     };
 
     // The ceiling bites: with the budget effectively unbounded, the only
-    // refusal available is the heavy statement's memory ceiling.
+    // refusal available is the heavy statement's rows-read ceiling.
     let unbounded = run(50_000_000).await.expect("the heavy statement fails");
     assert!(
-        unbounded.contains("PromqlReadMemory"),
-        "the ceiling must be the thing that refuses, got {unbounded}"
+        unbounded.contains("code: 158"),
+        "the row ceiling must be the thing that refuses, got {unbounded}"
     );
 
     let at_charge = run(first_charge).await.expect("the heavy statement fails");
     assert!(
-        at_charge.contains("PromqlReadMemory"),
-        "at a cap equal to the first statement's charge the memory refusal surfaces, got \
+        at_charge.contains("code: 158"),
+        "at a cap equal to the first statement's charge the rows refusal surfaces, got \
          {at_charge}"
     );
     let below = run(first_charge - 1).await.expect("refused");
@@ -1879,7 +1880,7 @@ async fn the_budget_answers_before_a_later_statements_failure() {
     );
     eprintln!(
         "[549] precedence: the first statement charges {first_charge}; at {first_charge} the \
-         memory error surfaces, at {} the budget error does",
+         rows error surfaces, at {} the budget error does",
         first_charge - 1
     );
     h.finish().await;

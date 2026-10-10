@@ -418,7 +418,11 @@ async fn tail_streams_new_rows_through_a_pipeline_in_order_exactly_once() {
     seed_stream(&client, db, 1, r#"{"service_name":"checkout"}"#, now_ns()).await;
 
     let start = now_ns() - 60_000_000_000;
-    let query = "query=%7Bservice_name%3D%22checkout%22%7D%20%7C%3D%20%22keep%22";
+    // `delay_for=5`: the lines are inserted after the socket opens, so the
+    // tail's horizon trails now by 5 s, as in the suite's other
+    // insert-after-connect tests; without it the watermark can pass a
+    // line's instant before the insert lands (issue #624, part 3d).
+    let query = "query=%7Bservice_name%3D%22checkout%22%7D%20%7C%3D%20%22keep%22&delay_for=5";
     let mut ws = WsClient::connect(port, &format!("/api/logs/v1/tail?{query}&start={start}"));
 
     // Insert AFTER connecting: two matching lines and one the pushed-down
@@ -1246,7 +1250,11 @@ async fn loki_tail_alias_streams_like_native() {
 
     let start = now_ns() - 60_000_000_000;
     let query = "query=%7Bservice_name%3D%22checkout%22%7D";
-    let mut ws = WsClient::connect(port, &format!("/loki/api/v1/tail?{query}&start={start}"));
+    // `delay_for=5`, for the reason the native test above gives.
+    let mut ws = WsClient::connect(
+        port,
+        &format!("/loki/api/v1/tail?{query}&start={start}&delay_for=5"),
+    );
     seed_samples(&client, db, &[(1, now_ns(), "via-alias")]).await;
     let entries = collect_entries(&mut ws, 1, Instant::now() + Duration::from_secs(20));
     assert_eq!(entries.len(), 1);

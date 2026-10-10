@@ -365,3 +365,100 @@ impl Drop for ScopedDb {
         }
     }
 }
+
+/// The database each spawned server writes to, by its port, so a push
+/// helper that knows only the port can wait for the data it pushed
+/// (issue #624, part 3d). Each suite's spawn helper registers its server.
+static PUSH_TARGETS: std::sync::Mutex<Vec<(u16, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// Records that the server on `port` writes to `db`.
+pub fn register_push_target(port: u16, db: &str) {
+    let mut targets = PUSH_TARGETS.lock().expect("the push-target registry");
+    targets.retain(|(p, _)| *p != port);
+    targets.push((port, db.to_string()));
+}
+
+/// After a trace push to the server on `port` is acknowledged, waits until
+/// every `(trace_id, span_id)` it carried is in `spans` (issue #624, part
+/// 3d).
+///
+/// **Why.** A trace push is acknowledged once the old path's tables hold
+/// it; the landing block, which feeds `spans`, `traces`, `resources`,
+/// `tag_names`, `tag_values` and the other derived tables through their
+/// views, carries no waiter (`crates/pulsus-write/src/writer/trace.rs`).
+/// A route that reads those tables right after the acknowledgement may
+/// not see the push yet. Writes not being readable the instant they are
+/// acknowledged is a known, deferred property; a test does not assume
+/// otherwise.
+///
+/// **Why `spans` stands for every derived table.** The views run inside the
+/// one landing `INSERT`, and their target parts become visible together
+/// when that insert ends: measured on 26.8.21.10 with a source table and
+/// three views, one of them sleeping a second per row, all three targets
+/// went from 0 rows to all rows in the same 200 ms poll, after the insert
+/// returned.
+///
+/// Polls every 200 ms for at most 10 s. A push whose spans never arrive
+/// (the product may drop them) ends the wait at the limit and the test's
+/// own assertions decide; the wait never fails a test by itself.
+pub fn settle_pushed_spans(port: u16, keys: &[(Vec<u8>, Vec<u8>)], ctx: &str) {
+    let mut pairs: Vec<String> = keys
+        .iter()
+        .map(|(t, s)| format!("('{}', '{}')", hex_upper(t), hex_upper(s)))
+        .collect();
+    pairs.sort_unstable();
+    pairs.dedup();
+    if pairs.is_empty() {
+        return;
+    }
+    let db = PUSH_TARGETS
+        .lock()
+        .expect("the push-target registry")
+        .iter()
+        .find(|(p, _)| *p == port)
+        .map(|(_, d)| d.clone())
+        .unwrap_or_else(|| panic!("{ctx}: no database registered for port {port}"));
+    let want = pairs.len() as u64;
+    let sql = format!(
+        "SELECT toString(count()) AS s FROM (SELECT DISTINCT trace_id, span_id FROM {db}.spans \
+         WHERE (hex(trace_id), hex(span_id)) IN ({}))",
+        pairs.join(", ")
+    );
+    let ctx = ctx.to_string();
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build a current-thread runtime")
+            .block_on(async move {
+                let client = ChClient::new(conn_config(&db))
+                    .await
+                    .expect("connect to the test database");
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                loop {
+                    let got: u64 = client
+                        .query_strings(&sql, &QuerySettings::new())
+                        .await
+                        .unwrap_or_else(|e| panic!("{ctx}: {sql}: {e}"))
+                        .into_iter()
+                        .next()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0);
+                    if got >= want {
+                        return;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        eprintln!("{ctx}: {got} of {want} pushed spans in `spans` after 10 s");
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            });
+    })
+    .join()
+    .expect("the settle thread");
+}
+
+fn hex_upper(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02X}")).collect()
+}
