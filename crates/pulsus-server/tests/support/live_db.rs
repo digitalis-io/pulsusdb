@@ -171,12 +171,11 @@ pub async fn build_schema_with_retention(db: &str, retention_days: u32) {
         .await
         .unwrap_or_else(|e| panic!("connect bootstrap client to build {db}: {e}"));
 
-    // **Already there means leave it alone.** Building restates every view,
-    // and restating one is `DROP VIEW` then `CREATE` — so a second call
-    // while the suite is running would take the views away under rows
-    // already landed. Suites that spawn a second server reach this a second
-    // time, and three of them lost their rows to it. A suite that wants a
-    // fresh schema drops the database first; `ScopedDb` does.
+    // **Already there means leave it alone.** The schema file holds only
+    // `CREATE` statements, so applying it to a database that holds it fails
+    // at the first view. Suites that spawn a second server reach this a
+    // second time. A suite that wants a fresh schema drops the database
+    // first; `ScopedDb` does.
     if pulsus_schema::database_exists(&client, db)
         .await
         .unwrap_or_else(|e| panic!("read whether {db} exists: {e}"))

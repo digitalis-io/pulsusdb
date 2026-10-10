@@ -338,7 +338,10 @@ CREATE TABLE IF NOT EXISTS {{db}}.spans{{on_cluster}}
     scope_dropped_attrs UInt32 CODEC(ZSTD(1)),
     scope_attrs_other String CODEC(ZSTD(1)),
     end_ns UInt64 CODEC(Delta(8), ZSTD(1)),
-    service_type LowCardinality(String) CODEC(ZSTD(1))
+    service_type LowCardinality(String) CODEC(ZSTD(1)),
+    INDEX idx_service service TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_name name TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_resource resource_id TYPE bloom_filter(0.01) GRANULARITY 1
 )
 --@single  ENGINE = ReplacingMergeTree
 --@cluster ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/{{db}}.spans', '{replica}')
@@ -677,7 +680,6 @@ TTL toDateTime(least(intDiv(last_start_ns, 1000000000) + ({{retention_days}} * 8
 --@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'traces', cityHash64(trace_id))
 --@cluster SETTINGS fsync_after_insert = 1, fsync_directories = 1;
 
-DROP VIEW IF EXISTS {{db}}.log_metrics_{{log_rollup_suffix}}_mv{{on_cluster}};
 CREATE MATERIALIZED VIEW {{db}}.log_metrics_{{log_rollup_suffix}}_mv{{on_cluster}} TO {{db}}.log_metrics_{{log_rollup_suffix}}
 AS SELECT
     fingerprint AS fingerprint,
@@ -690,7 +692,6 @@ GROUP BY
     fingerprint,
     bucket_ns;
 
-DROP VIEW IF EXISTS {{db}}.log_patterns_mv{{on_cluster}};
 CREATE MATERIALIZED VIEW {{db}}.log_patterns_mv{{on_cluster}} TO {{db}}.log_patterns
 AS SELECT
     fingerprint AS fingerprint,
@@ -700,7 +701,6 @@ AS SELECT
 FROM {{db}}.log_landing
 WHERE kind = 2;
 
-DROP VIEW IF EXISTS {{db}}.log_samples_mv{{on_cluster}};
 CREATE MATERIALIZED VIEW {{db}}.log_samples_mv{{on_cluster}} TO {{db}}.log_samples
 AS SELECT
     service AS service,
@@ -712,7 +712,6 @@ AS SELECT
 FROM {{db}}.log_landing
 WHERE kind = 0;
 
-DROP VIEW IF EXISTS {{db}}.log_streams_idx_mv{{on_cluster}};
 CREATE MATERIALIZED VIEW {{db}}.log_streams_idx_mv{{on_cluster}} TO {{db}}.log_streams_idx
 AS SELECT
     month,
@@ -723,7 +722,6 @@ FROM {{db}}.log_landing
 ARRAY JOIN JSONExtractKeysAndValues(labels, 'String') AS kv
 WHERE kind = 1;
 
-DROP VIEW IF EXISTS {{db}}.log_streams_mv{{on_cluster}};
 CREATE MATERIALIZED VIEW {{db}}.log_streams_mv{{on_cluster}} TO {{db}}.log_streams
 AS SELECT
     month AS month,
@@ -734,7 +732,6 @@ AS SELECT
 FROM {{db}}.log_landing
 WHERE kind = 1;
 
-DROP VIEW IF EXISTS {{db}}.metric_hist_samples_mv{{on_cluster}};
 CREATE MATERIALIZED VIEW {{db}}.metric_hist_samples_mv{{on_cluster}} TO {{db}}.metric_hist_samples
 AS SELECT
     org_id AS org_id,
@@ -756,7 +753,6 @@ AS SELECT
 FROM {{db}}.metric_landing
 WHERE kind = 1;
 
-DROP VIEW IF EXISTS {{db}}.metric_labels_mv{{on_cluster}};
 CREATE MATERIALIZED VIEW {{db}}.metric_labels_mv{{on_cluster}} TO {{db}}.metric_labels
 AS SELECT
     org_id AS org_id,
@@ -768,7 +764,6 @@ AS SELECT
 FROM {{db}}.metric_landing
 WHERE kind = 2;
 
-DROP VIEW IF EXISTS {{db}}.metric_label_index_mv{{on_cluster}};
 CREATE MATERIALIZED VIEW {{db}}.metric_label_index_mv{{on_cluster}} TO {{db}}.metric_label_index
 AS SELECT
     org_id AS org_id,
@@ -779,7 +774,6 @@ FROM {{db}}.metric_landing
 ARRAY JOIN JSONExtractKeysAndValues(labels, 'String') AS kv
 WHERE kind = 2;
 
-DROP VIEW IF EXISTS {{db}}.metric_label_values_mv{{on_cluster}};
 CREATE MATERIALIZED VIEW {{db}}.metric_label_values_mv{{on_cluster}} TO {{db}}.metric_label_values
 AS SELECT DISTINCT
     org_id AS org_id,
@@ -789,7 +783,6 @@ FROM {{db}}.metric_landing
 ARRAY JOIN JSONExtractKeysAndValues(labels, 'String') AS kv
 WHERE kind = 2;
 
-DROP VIEW IF EXISTS {{db}}.metric_metadata_mv{{on_cluster}};
 CREATE MATERIALIZED VIEW {{db}}.metric_metadata_mv{{on_cluster}} TO {{db}}.metric_metadata
 AS SELECT
     org_id AS org_id,
@@ -801,7 +794,6 @@ AS SELECT
 FROM {{db}}.metric_landing
 WHERE kind = 3;
 
-DROP VIEW IF EXISTS {{db}}.metric_samples_mv{{on_cluster}};
 CREATE MATERIALIZED VIEW {{db}}.metric_samples_mv{{on_cluster}} TO {{db}}.metric_samples
 AS SELECT
     org_id AS org_id,
@@ -811,7 +803,6 @@ AS SELECT
 FROM {{db}}.metric_landing
 WHERE kind = 0;
 
-DROP VIEW IF EXISTS {{db}}.metric_series_mv{{on_cluster}};
 CREATE MATERIALIZED VIEW {{db}}.metric_series_mv{{on_cluster}} TO {{db}}.metric_series
 AS SELECT
     org_id AS org_id,
@@ -822,7 +813,6 @@ AS SELECT
 FROM {{db}}.metric_landing
 WHERE kind = 2;
 
-DROP VIEW IF EXISTS {{db}}.resources_mv{{on_cluster}};
 CREATE MATERIALIZED VIEW {{db}}.resources_mv{{on_cluster}} TO {{db}}.resources
 AS SELECT
     day AS day,
@@ -836,7 +826,6 @@ AS SELECT
 FROM {{db}}.trace_landing
 WHERE row_kind = 1;
 
-DROP VIEW IF EXISTS {{db}}.spans_mv{{on_cluster}};
 CREATE MATERIALIZED VIEW {{db}}.spans_mv{{on_cluster}} TO {{db}}.spans{{route_suffix}}
 AS SELECT
     trace_id AS trace_id,
@@ -870,7 +859,6 @@ AS SELECT
 FROM {{db}}.trace_landing
 WHERE row_kind = 0;
 
-DROP VIEW IF EXISTS {{db}}.tag_names_mv{{on_cluster}};
 CREATE MATERIALIZED VIEW {{db}}.tag_names_mv{{on_cluster}} TO {{db}}.tag_names
 AS SELECT
     tag_scope AS scope,
@@ -878,7 +866,6 @@ AS SELECT
 FROM {{db}}.trace_landing
 WHERE row_kind = 2;
 
-DROP VIEW IF EXISTS {{db}}.tag_values_mv{{on_cluster}};
 CREATE MATERIALIZED VIEW {{db}}.tag_values_mv{{on_cluster}} TO {{db}}.tag_values
 AS SELECT
     tag_scope AS scope,
@@ -888,7 +875,6 @@ AS SELECT
 FROM {{db}}.trace_landing
 WHERE row_kind = 3;
 
-DROP VIEW IF EXISTS {{db}}.trace_edges_mv{{on_cluster}};
 CREATE MATERIALIZED VIEW {{db}}.trace_edges_mv{{on_cluster}} TO {{db}}.trace_edges
 AS SELECT
     toDate(fromUnixTimestamp64Nano(timestamp_ns)) AS date,
@@ -904,7 +890,6 @@ AS SELECT
 FROM {{db}}.trace_spans
 WHERE (kind IN (3, 4)) OR ((kind IN (2, 5)) AND ((shared = 1) OR (parent_id != toFixedString(unhex('0000000000000000'), 8))));
 
-DROP VIEW IF EXISTS {{db}}.trace_error_spans_mv{{on_cluster}};
 CREATE MATERIALIZED VIEW {{db}}.trace_error_spans_mv{{on_cluster}} TO {{db}}.trace_error_spans
 AS SELECT
     toDate(fromUnixTimestamp64Nano(timestamp_ns)) AS date,
@@ -918,7 +903,6 @@ AS SELECT
 FROM {{db}}.trace_spans
 WHERE status_code = 2;
 
-DROP VIEW IF EXISTS {{db}}.trace_recent_mv{{on_cluster}};
 CREATE MATERIALIZED VIEW {{db}}.trace_recent_mv{{on_cluster}} TO {{db}}.trace_recent
 AS SELECT
     toDate(fromUnixTimestamp64Nano(timestamp_ns)) AS date,
@@ -932,7 +916,6 @@ GROUP BY
     bucket,
     trace_id;
 
-DROP VIEW IF EXISTS {{db}}.trace_tag_catalog_mv{{on_cluster}};
 CREATE MATERIALIZED VIEW {{db}}.trace_tag_catalog_mv{{on_cluster}} TO {{db}}.trace_tag_catalog
 AS SELECT
     scope,
@@ -941,7 +924,6 @@ AS SELECT
     val_type
 FROM {{db}}.trace_attrs_idx;
 
-DROP VIEW IF EXISTS {{db}}.traces_mv{{on_cluster}};
 CREATE MATERIALIZED VIEW {{db}}.traces_mv{{on_cluster}} TO {{db}}.traces{{route_suffix}}
 AS SELECT
     toDate(fromUnixTimestamp64Nano(s), 'UTC') AS day,

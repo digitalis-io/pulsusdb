@@ -297,8 +297,14 @@ impl WindowSql {
     /// buckets (issue #594 part 1), divided server-side as
     /// [`WindowSql::span_bucket_clause`] is.
     pub fn bucket_outside(self, var: &str) -> String {
+        format!("NOT ({})", self.bucket_within(var))
+    }
+
+    /// Whether the span-table bucket `var` lies inside this window's
+    /// buckets (issue #595), divided server-side.
+    pub fn bucket_within(self, var: &str) -> String {
         format!(
-            "NOT ({var} BETWEEN intDiv({}, {bucket}) AND intDiv({}, {bucket}))",
+            "{var} BETWEEN intDiv({}, {bucket}) AND intDiv({}, {bucket})",
             self.first_included_ns(),
             self.last_included_ns(),
             bucket = RECENT_BUCKET_NS

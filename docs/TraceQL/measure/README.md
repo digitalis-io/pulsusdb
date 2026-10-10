@@ -19,7 +19,7 @@ They take hosts, ports and directories as arguments; nothing is hard-coded.
 | `layouts.sql` | the layout alternatives compared in `sql-schema.md` §8 |
 | `make_sql.py` | writes `sql/*.sql`: the statement each query shape compiles to |
 | `run_query.sh` | runs one statement warm or cold; rows, bytes, memory, time |
-| `search_sliced.py` | the newest-slice-first search loop and its statement count |
+| `search_sliced.py` | the disjoint-slice loop the 2026-09-23 run measured, and its statement count |
 | `http_bench.py` | the same queries over HTTP against the reference or PulsusDB |
 | `fetch_compare.py` | trace by id, interleaved between the two stores, as a distribution |
 | `agreement.py`, `ground_truth.py` | per-filter counts from both stores, and from the corpus file |

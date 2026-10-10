@@ -9,6 +9,9 @@
 //!   those exact characters (a macro replaced by a constant is accepted by
 //!   the server and silently gives every shard one replica set);
 //! - every replication path names the table of the `CREATE` it sits in;
+//! - the file holds only `CREATE` statements: it is the schema, not a
+//!   script that walks one forward, and `schema/schema.sh` drops the
+//!   database before applying it;
 //! - a statement ends at a line ending in `;` and nowhere else, which is
 //!   what lets the script send one statement per request;
 //! - the script and this crate render the identical text, so the two
@@ -46,17 +49,16 @@ fn repo_root() -> std::path::PathBuf {
         .expect("the crate directory resolves")
 }
 
-/// The inventory, single-node: one database, 26 tables, 21 views each
-/// dropped before it is created. No `Replicated*` engine, no `Distributed`
-/// wrapper, no `ON CLUSTER`.
+/// The inventory, single-node: one database, 26 tables, 21 views, and
+/// nothing else. No `Replicated*` engine, no `Distributed` wrapper, no `ON
+/// CLUSTER`.
 #[test]
 fn the_single_node_render_is_the_whole_inventory_with_every_token_resolved() {
     let stmts = rendered_statements(&single());
-    assert_eq!(stmts.len(), 69, "statement count");
+    assert_eq!(stmts.len(), 48, "statement count");
     assert_eq!(starting_with(&stmts, "CREATE DATABASE"), 1);
     assert_eq!(starting_with(&stmts, "CREATE TABLE"), 26);
     assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 21);
-    assert_eq!(starting_with(&stmts, "DROP VIEW"), 21);
 
     let text = rendered(&single());
     assert!(
@@ -90,7 +92,7 @@ fn the_single_node_render_is_the_whole_inventory_with_every_token_resolved() {
 #[test]
 fn the_clustered_render_adds_the_wrappers_and_keeps_the_server_macros() {
     let stmts = rendered_statements(&clustered());
-    assert_eq!(stmts.len(), 86, "statement count");
+    assert_eq!(stmts.len(), 65, "statement count");
     assert_eq!(
         starting_with(&stmts, "CREATE TABLE"),
         43,
@@ -105,7 +107,7 @@ fn the_clustered_render_adds_the_wrappers_and_keeps_the_server_macros() {
     );
     assert_eq!(
         text.matches("ON CLUSTER 'prod'").count(),
-        86,
+        65,
         "every statement carries ON CLUSTER"
     );
 
@@ -239,28 +241,35 @@ fn the_only_single_brace_names_in_the_file_are_the_two_server_macros() {
     );
 }
 
-/// Every materialized view is dropped before it is created: `CREATE
-/// MATERIALIZED VIEW` carries no `IF NOT EXISTS`, so a second run without
-/// the drop fails on the first view.
+/// The file holds only `CREATE` statements, in both variants. It is the
+/// schema, not a script that walks a database forward: `schema/schema.sh`
+/// drops the database and applies the file to an empty one.
 #[test]
-fn every_view_is_dropped_before_it_is_created() {
+fn the_file_holds_only_create_statements() {
     for ctx in [single(), clustered()] {
-        let stmts = rendered_statements(&ctx);
-        let mut dropped = Vec::new();
-        for s in &stmts {
-            if let Some(rest) = s.trim().strip_prefix("DROP VIEW IF EXISTS ") {
-                dropped.push(rest.split([' ', ';']).next().unwrap().to_string());
-            }
-            if let Some(rest) = s.trim().strip_prefix("CREATE MATERIALIZED VIEW ") {
-                let name = rest.split([' ', '\n']).next().unwrap().to_string();
-                assert!(
-                    dropped.contains(&name),
-                    "{name} is created without being dropped first"
-                );
-            }
-        }
-        assert_eq!(dropped.len(), 21, "every view is dropped");
+        let not_create: Vec<String> = rendered_statements(&ctx)
+            .iter()
+            .map(|s| {
+                s.lines()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty() && !l.starts_with("--"))
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .filter(|first| !first.starts_with("CREATE "))
+            .collect();
+        assert!(
+            not_create.is_empty(),
+            "statements other than CREATE (cluster {:?}): {not_create:?}",
+            ctx.cluster
+        );
     }
+    let drops: Vec<&str> = SCHEMA_SQL
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("-- "))
+        .filter(|l| l.to_ascii_uppercase().contains("DROP "))
+        .collect();
+    assert!(drops.is_empty(), "DROP in schema/schema.sql: {drops:?}");
 }
 
 /// A family's routing wrappers all shard on one expression: a series'

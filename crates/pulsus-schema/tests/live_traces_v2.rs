@@ -668,10 +668,13 @@ async fn the_target_tables_carry_the_codecs_this_design_names() {
     drop_database(&client, db).await;
 }
 
-/// **T-S6.** Applying the schema twice is a no-op: no error, and the column
-/// set of each of the six tables is identical after both runs.
+/// **T-S6.** Applying the schema to a database that already holds it fails
+/// at the first materialized view: the file holds only `CREATE`
+/// statements, so nothing in it restates an object, and
+/// `schema/schema.sh` drops the database before applying it. The columns
+/// the first application built are untouched by the failed second one.
 #[tokio::test]
-async fn applying_the_schema_twice_is_a_no_op() {
+async fn applying_the_schema_to_a_built_database_fails() {
     skip_unless_live!();
     let db = &pulsus_testkit::test_db("pulsus_trace_landing_it_twice");
     let client = ChClient::new(test_config()).await.expect("connect");
@@ -690,17 +693,22 @@ async fn applying_the_schema_twice_is_a_no_op() {
         before.push(cols);
     }
 
-    run_init(&client, &ctx).await.expect("second run_init");
+    let second = run_init(&client, &ctx).await;
 
-    for (i, table) in WRITE_PATH_TABLES.iter().enumerate() {
-        assert_eq!(
-            columns(&client, db, table).await,
-            before[i],
-            "{table}'s column set moved between two run_init calls"
-        );
+    let mut after = Vec::new();
+    for table in WRITE_PATH_TABLES {
+        after.push(columns(&client, db, table).await);
     }
-
     drop_database(&client, db).await;
+    let err = second.expect_err("a second application to a built database must fail");
+    assert!(
+        err.to_string().contains("already exists"),
+        "the second application fails on an existing object: {err}"
+    );
+    assert_eq!(
+        after, before,
+        "the failed second application moved a column"
+    );
 }
 
 /// The two tag catalogs carry a deduplication window and **no TTL**, because
@@ -1141,5 +1149,36 @@ async fn the_landed_storage_is_priced() {
          this case guards ({bytes} bytes over 100 spans)"
     );
 
+    drop_database(&client, db).await;
+}
+
+/// Issue #595: `spans` carries exactly three skip indexes, a
+/// `bloom_filter(0.01)` of granularity 1 over `name`, `resource_id` and
+/// `service`, and no other table of the five carries one.
+#[tokio::test]
+async fn the_span_table_carries_three_bloom_indexes() {
+    skip_unless_live!();
+    let db = &pulsus_testkit::test_db("pulsus_trace_landing_it_span_indexes");
+    let client = ChClient::new(test_config()).await.expect("connect");
+    drop_database(&client, db).await;
+    run_init(&client, &test_ctx(db)).await.expect("run_init");
+    let got = names(
+        &client,
+        &format!(
+            "SELECT concat(table, ' ', name, ' ', expr, ' ', type_full, ' ', toString(granularity)) AS name \
+             FROM system.data_skipping_indices \
+             WHERE database = '{db}' AND table IN ({TARGET_TABLE_LIST}) ORDER BY table, name"
+        ),
+    )
+    .await;
+    assert_eq!(
+        got,
+        vec![
+            "spans idx_name name bloom_filter(0.01) 1",
+            "spans idx_resource resource_id bloom_filter(0.01) 1",
+            "spans idx_service service bloom_filter(0.01) 1",
+        ],
+        "the span table's skip indexes"
+    );
     drop_database(&client, db).await;
 }

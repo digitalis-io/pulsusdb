@@ -2293,8 +2293,8 @@ impl TraceEngine {
         ) else {
             return self.search_inner(plan, explain).await;
         };
-        if let Some(e) = explain.as_mut() {
-            e.push("search_statement", stmt.sql(), None);
+        if let Some(out) = self.newest_first(plan, &stmt, &mut explain).await? {
+            return Ok(out);
         }
         let mut settings = with_final(self.search_settings());
         // Issue #593 part 2: a climb runs `max_depth + 1` levels, the last
@@ -6542,3 +6542,5 @@ mod tests {
         assert!(!req.narrowing().is_empty(), "a well-formed q must narrow");
     }
 }
+
+mod newest_first;
