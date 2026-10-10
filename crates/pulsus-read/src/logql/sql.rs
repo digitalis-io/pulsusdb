@@ -2359,7 +2359,7 @@ fn metric_prewhere(services: &[CheckedLiteral]) -> String {
 /// every granule under `IN` (issue #498, measured on ClickHouse
 /// 26.3.29.7). The parameter is a minted literal, never a `Fingerprint`,
 /// so the form is the type's rather than this function's.
-fn fp_list(fingerprints: &[FpLiteral]) -> String {
+pub(in crate::logql) fn fp_list(fingerprints: &[FpLiteral]) -> String {
     fingerprints
         .iter()
         .map(FpLiteral::to_string)

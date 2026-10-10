@@ -784,6 +784,13 @@ pub enum ParsedFilterRefusal {
     ThresholdNotFinite,
     /// The label name is not one a fragment may name.
     NameNotRenderable,
+    /// `__error__` or `__error_details__`: the evaluator reads them from
+    /// the error slot, not from a label (issue #624, part 3d-3).
+    ReservedName,
+    /// A targeted `| logfmt` whose source for this name is not one key
+    /// the stage alone decides: a source declared for two destinations, or
+    /// a destination that is another's source (issue #624, part 3d-3).
+    UndecidableSource,
 }
 
 /// Can this label name have been produced by more than one raw key?
@@ -2358,6 +2365,73 @@ mod tests {
             keep_empty: false,
             extractions: Vec::new(),
         }
+    }
+
+    fn targeted_logfmt(pairs: &[(&str, &str)]) -> ParserStage {
+        ParserStage::Logfmt {
+            strict: false,
+            keep_empty: false,
+            extractions: pairs
+                .iter()
+                .map(|(label, expression)| pulsus_logql::LabelExtraction {
+                    label: label.to_string(),
+                    expression: expression.to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    /// **T2 (issue #624, part 3d-3): a filter after a targeted parser reads
+    /// the field the stage maps the name from.**
+    #[test]
+    fn a_targeted_filter_reads_the_mapped_field() {
+        let feeds = concat!(
+            r"has(['code', 'status'], concat(if(substring(k, 1, 1) BETWEEN '0' AND '9', '_', ''), ",
+            r"translate(k, '!#$%&\'()*+,-./:;<>?@[\\]^`{|}~', '_____________________________')))"
+        );
+        let m = r#"extractKeyValuePairs(body, '=', ' \t\r\n', '"')"#;
+        let want = format!(
+            "(arrayExists((k, x) -> {feeds} AND x = '200', mapKeys({m}), mapValues({m})) \
+             OR (NOT arrayExists(k -> {feeds}, mapKeys({m})) AND '' = '200') \
+             OR position(body, '\\\\') > 0 OR match(body, '[\\\\x00-\\\\x08\\\\x0b\\\\x0c\\\\x0e-\\\\x1f]') \
+             OR lengthUTF8(body) != length(body) OR structured_metadata != '')"
+        );
+        assert_eq!(
+            parsed_string_filter(
+                "status",
+                MatchOp::Eq,
+                "200",
+                &targeted_logfmt(&[("status", "code")])
+            )
+            .expect("served")
+            .as_sql(),
+            want
+        );
+        let json = ParserStage::Json {
+            extractions: vec![pulsus_logql::LabelExtraction {
+                label: "status".to_string(),
+                expression: "a[1].b".to_string(),
+            }],
+        };
+        assert_eq!(
+            parsed_string_filter("status", MatchOp::Eq, "200", &json)
+                .expect("served")
+                .as_sql(),
+            "(JSONType(body, 'a', 2, 'b') != 'String' OR JSONExtractString(body, 'a', 2, 'b') = '200' OR structured_metadata != '')"
+        );
+        assert_eq!(
+            parsed_string_filter("__error__", MatchOp::Eq, "", &json_parser()),
+            Err(ParsedFilterRefusal::ReservedName)
+        );
+        assert_eq!(
+            parsed_string_filter(
+                "a",
+                MatchOp::Eq,
+                "200",
+                &targeted_logfmt(&[("a", "code"), ("b", "code")])
+            ),
+            Err(ParsedFilterRefusal::UndecidableSource)
+        );
     }
 
     /// W3 (issue #507) — the three served fragments, byte for byte.

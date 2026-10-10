@@ -14707,3 +14707,214 @@ async fn the_database_logfmt_fields_are_the_reference_decoders() {
     );
     drop_db_624(&admin, &db).await;
 }
+
+/// **T1 (issue #624, part 3d-3): a filter after a targeted parser returns
+/// what the evaluator returns.** Each line alone in a stream; the log
+/// query's lines equal the expected count and those of the same query with
+/// its filter not pushed (a regular expression, or the same filter's
+/// equivalent). Each pushed request's statements must carry the mapped
+/// field, or for a collision case the stream guard, so a filter or guard
+/// that is not pushed fails the test.
+#[tokio::test]
+async fn a_filter_after_a_targeted_parser_returns_what_the_evaluator_returns() {
+    skip_unless_live!();
+    let (admin, db) = fresh_db_624(pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_d33_{}",
+        uuid::Uuid::new_v4().simple()
+    )))
+    .await;
+    let t = ((now_ns() - 3_600_000_000_000) / 60_000_000_000) * 60_000_000_000;
+    let sec = 1_000_000_000i64;
+    const BASE: &str = r#","status":"base""#;
+    const GUARD: &str = "(fingerprint IN (toUInt128('";
+    // (line, extra stream labels, pushed pipeline, the not-pushed control,
+    //  expected lines, what the pushed statements must carry)
+    let cases: &[(&str, &str, &str, &str, usize, &str)] = &[
+        (
+            "status=500 code=200",
+            "",
+            r#"| logfmt status="code" | status="200""#,
+            r#"| logfmt status="code" | status=~"200""#,
+            1,
+            "has(['code', 'status'],",
+        ),
+        (
+            "status=200 code=500",
+            "",
+            r#"| logfmt status="code" | status!="200""#,
+            r#"| logfmt status="code" | status!~"200""#,
+            1,
+            "has(['code', 'status'],",
+        ),
+        (
+            "status=500 code",
+            "",
+            r#"| logfmt status="code" | status!="500""#,
+            r#"| logfmt status="code" | status!~"500""#,
+            1,
+            "has(['code', 'status'],",
+        ),
+        (
+            r#"{"status":"500","code":"200"}"#,
+            "",
+            r#"| json status="code" | status="200""#,
+            r#"| json status="code" | status=~"200""#,
+            1,
+            "JSONExtractString(body, 'code')",
+        ),
+        (
+            r#"{"status":"200","code":"500"}"#,
+            "",
+            r#"| json status="code" | status!="200""#,
+            r#"| json status="code" | status!~"200""#,
+            1,
+            "JSONExtractString(body, 'code')",
+        ),
+        (
+            r#"{"a":{"b":"200"},"status":"500"}"#,
+            "",
+            r#"| json status="a.b" | status="200""#,
+            r#"| json status="a.b" | status=~"200""#,
+            1,
+            "JSONExtractString(body, 'a', 'b')",
+        ),
+        (
+            r#"{"status":100,"code":300}"#,
+            "",
+            r#"| json status="code" | status >= 200"#,
+            r#"| json status="code" | status=~"300""#,
+            1,
+            "JSONExtractFloat(body, 'code')",
+        ),
+        (
+            "code=200",
+            BASE,
+            r#"| logfmt status="code" | status_extracted="200""#,
+            r#"| logfmt status="code" | status_extracted=~"200""#,
+            1,
+            GUARD,
+        ),
+        (
+            r#"{"code":"200"}"#,
+            BASE,
+            r#"| json status="code" | status_extracted="200""#,
+            r#"| json status="code" | status_extracted=~"200""#,
+            1,
+            GUARD,
+        ),
+        (
+            "code=200 status=500",
+            "",
+            r#"| logfmt status="code" | status="200""#,
+            r#"| logfmt status="code" | status=~"200""#,
+            0,
+            "has(['code', 'status'],",
+        ),
+        (
+            r#"x=1 code="2 0""#,
+            "",
+            r#"| logfmt status="code" | status="2 0""#,
+            r#"| logfmt status="code" | status=~"2 0""#,
+            1,
+            "has(['code', 'status'],",
+        ),
+        (
+            r#"{"other":5}"#,
+            "",
+            r#"| json status="code" | other >= 1"#,
+            r#"| json status="code" | other=~"5""#,
+            0,
+            "(0 OR structured_metadata != '')",
+        ),
+        (
+            "code=200",
+            "",
+            r#"| logfmt status="\"code\"" | status="200""#,
+            r#"| logfmt status="\"code\"" | status=~"200""#,
+            1,
+            "has(['code', 'status'],",
+        ),
+        (
+            "code=200",
+            "",
+            r#"| logfmt status="code", status="other" | status!="200""#,
+            r#"| logfmt status="code", status="other" | status!~"200""#,
+            1,
+            "has(['other', 'status'],",
+        ),
+    ];
+    for (i, (line, extra, _, _, _, _)) in cases.iter().enumerate() {
+        let fp = 9600 + i as u64;
+        land_stream_624(
+            &admin,
+            &db,
+            t,
+            fp,
+            "d33",
+            &format!(r#"{{"s":"d33k{i}","service_name":"d33"{extra}}}"#),
+        )
+        .await;
+        land_line_624(&admin, &db, fp, "d33", t + sec, line, "").await;
+    }
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t + 120 * sec,
+            step_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let lines = |result: Result<(QueryResult, _), ReadError>, q: &str| match result {
+        Ok((QueryResult::Streams { items, .. }, _)) => {
+            items.iter().map(|s| s.entries.len()).sum::<usize>()
+        }
+        other => panic!("{q}: {:?}", other.map(|_| ())),
+    };
+    let mut wrong: Vec<String> = Vec::new();
+    let mut comments: Vec<(String, usize)> = Vec::new();
+    for (i, (_, _, pushed, control, want, _)) in cases.iter().enumerate() {
+        let comment = format!("c624d33-{}", uuid::Uuid::new_v4().simple());
+        let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024))
+            .with_query_log_comment(comment.clone());
+        let q = format!(r#"{{s="d33k{i}"}} {pushed}"#);
+        let got = lines(engine.query(&parse(&q).expect("parse"), &params).await, &q);
+        let cq = format!(r#"{{s="d33k{i}"}} {control}"#);
+        let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+        let not_pushed = lines(
+            engine.query(&parse(&cq).expect("parse"), &params).await,
+            &cq,
+        );
+        if got != *want || not_pushed != *want {
+            wrong.push(format!(
+                "{q}: {got} lines, not pushed {not_pushed}, want {want}"
+            ));
+        }
+        comments.push((comment, i));
+    }
+    let names: Vec<String> = comments.iter().map(|(c, _)| c.clone()).collect();
+    let logged = logged_624(&admin, &names).await;
+    for (comment, i) in &comments {
+        let (_, _, pushed, _, _, carries) = cases[*i];
+        let carries = if carries == GUARD {
+            format!("{GUARD}{}'))", 9600 + *i as u64)
+        } else {
+            carries.to_string()
+        };
+        let rows = logged.get(comment).cloned().unwrap_or_default();
+        if !rows.iter().any(|r| r.query.contains(&carries)) {
+            wrong.push(format!(
+                "{pushed}: no statement carries {carries:?}: {:#?}",
+                rows.iter().map(|r| &r.query).collect::<Vec<_>>()
+            ));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} of {} cases:\n{}",
+        wrong.len(),
+        cases.len(),
+        wrong.join("\n")
+    );
+    drop_db_624(&admin, &db).await;
+}

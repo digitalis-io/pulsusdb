@@ -1299,3 +1299,27 @@ fn the_span_table_writes_with_adaptive_buffers_in_both_modes() {
         );
     }
 }
+
+/// **T4 (issue #624, part 3d-3): the logs and metrics write-path tables
+/// grow their write buffers as needed**, as `spans` does, in both modes.
+#[test]
+fn the_write_path_tables_write_with_adaptive_buffers_in_both_modes() {
+    for table in [
+        "log_landing",
+        "log_samples",
+        "metric_landing",
+        "metric_samples",
+        "metric_hist_samples",
+        "metric_labels",
+        "metric_label_index",
+    ] {
+        for (mode, ctx) in [("single", single()), ("clustered", clustered())] {
+            let create = create_of(&ctx, table);
+            let settings = line_of(&create, "SETTINGS");
+            assert!(
+                settings.contains("min_columns_to_activate_adaptive_write_buffer = 1"),
+                "{table}, {mode}: {settings}"
+            );
+        }
+    }
+}
