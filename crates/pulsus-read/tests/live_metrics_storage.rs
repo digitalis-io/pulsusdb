@@ -1583,9 +1583,17 @@ async fn a_failed_label_view_fails_the_push() {
                 ))
                 .await
             }
-            _ => run_init(&bootstrap, &RenderCtx::for_tests(&db))
-                .await
-                .expect("re-create the lookup table"),
+            // The schema file holds only `CREATE` statements, so it cannot
+            // be applied again to this database: the table's own statement
+            // re-creates it, and its view still writes into it.
+            _ => {
+                let head = format!("CREATE TABLE IF NOT EXISTS {db}.metric_labels\n");
+                let create = pulsus_schema::rendered_statements(&RenderCtx::for_tests(&db))
+                    .into_iter()
+                    .find(|s| s.starts_with(&head))
+                    .expect("the schema file creates metric_labels");
+                exec(create).await
+            }
         }
         pusher
             .insert_block_with("metric_landing", &rows, &settings)

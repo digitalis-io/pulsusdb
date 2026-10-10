@@ -177,11 +177,10 @@ async fn count(client: &ChClient, sql: &str) -> u64 {
 }
 
 /// The core M0 acceptance contract (issue #5): `run_init` on a fresh
-/// database creates every table/MV, a second run is a no-op, sample data
-/// round-trips, and the metrics fetch path (docs/schemas.md §2.3) uses the
+/// database creates every table/MV, sample data round-trips, and the metrics fetch path (docs/schemas.md §2.3) uses the
 /// `metric_name` primary-key prefix.
 #[tokio::test]
-async fn run_init_creates_every_m0_table_and_mv_and_is_idempotent() {
+async fn run_init_creates_every_m0_table_and_mv() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
     let db = &pulsus_testkit::test_db("pulsus_schema_it_full");
@@ -208,17 +207,6 @@ async fn run_init_creates_every_m0_table_and_mv_and_is_idempotent() {
             "missing {t} in system.tables: {names:?}"
         );
     }
-
-    // Second run: idempotent, no error — every `CREATE TABLE` carries `IF
-    // NOT EXISTS` and every view is dropped before it is created.
-    run_init(&client, &ctx)
-        .await
-        .expect("run_init (second run, no-op)");
-    let names_after = table_names(&client, db).await;
-    assert_eq!(
-        names, names_after,
-        "second run must not add or remove objects"
-    );
 
     // Smoke insert + round-trip on both raw sample tables. `insert_block`
     // (the `clickhouse` crate's typed insert path) escapes its whole
@@ -319,8 +307,7 @@ async fn run_init_creates_every_m0_table_and_mv_and_is_idempotent() {
 /// Issue #97 (AC-1/AC-2): the additive `structured_metadata` ALTER (migration
 /// id 21) lands the canonical JSON String column on `log_samples`, existing
 /// rows read back the empty-string default (backward compatible — no data
-/// migration), and a second `run_init` no-ops ids 21/22 with no
-/// `MigrationDrift`.
+/// migration).
 #[tokio::test]
 async fn structured_metadata_column_is_additive_and_backward_compatible() {
     skip_unless_live!();
@@ -419,58 +406,7 @@ async fn structured_metadata_column_is_additive_and_backward_compatible() {
         "the modern row round-trips its structured metadata verbatim"
     );
 
-    // AC-2: a second run_init is a no-op.
-    run_init(&client, &ctx)
-        .await
-        .expect("run_init (second run, no-op — ids 21/22 must not drift)");
-
     drop_database(&client, db).await;
-}
-
-/// A view dropped out from under an existing schema comes back on the next
-/// run. The file carries `DROP VIEW IF EXISTS` before every `CREATE
-/// MATERIALIZED VIEW`, so a run always restates every view's definition —
-/// which is also why a second run cannot fail on one.
-#[tokio::test]
-async fn a_second_run_recreates_a_view_that_was_dropped() {
-    skip_unless_live!();
-    let client = ChClient::new(test_config()).await.expect("connect");
-    let db = &pulsus_testkit::test_db("pulsus_schema_it_mv_absent");
-    drop_database(&client, db).await;
-    let ctx = test_ctx(db);
-
-    run_init(&client, &ctx).await.expect("initial run");
-    let before = create_table_query(&client, db, "log_streams_idx_mv").await;
-
-    client
-        .execute(
-            &format!("DROP VIEW IF EXISTS {db}.log_streams_idx_mv"),
-            &QuerySettings::new(),
-            Idempotency::Idempotent,
-        )
-        .await
-        .expect("drop the view out from under the schema");
-    assert!(
-        !table_names(&client, db)
-            .await
-            .contains(&"log_streams_idx_mv".to_string())
-    );
-
-    run_init(&client, &ctx)
-        .await
-        .expect("the next run heals it");
-
-    assert!(
-        table_names(&client, db)
-            .await
-            .contains(&"log_streams_idx_mv".to_string()),
-        "a view missing from system.tables must be recreated"
-    );
-    assert_eq!(
-        before,
-        create_table_query(&client, db, "log_streams_idx_mv").await,
-        "the recreated view's definition must be byte-identical"
-    );
 }
 
 /// Pure version-gate refusal, proven against a real server's actual
@@ -573,47 +509,31 @@ async fn the_configured_retention_reaches_every_retained_tables_ttl() {
 }
 
 /// `PULSUS_LOG_ROLLUP_RESOLUTION` is config-derived into the rollup
-/// table/MV *name* — a re-init after it changes must succeed, create the
-/// new-named objects, and leave the old ones (and their data) in place
-/// rather than dropping them.
-/// This test proves the live functional outcome: the new objects are
-/// created and the old ones are left alone.
+/// table/MV *name*: a database built at 10 seconds holds `log_metrics_10s`
+/// and its view, and none of the 5-second objects.
 #[tokio::test]
-async fn run_init_after_log_rollup_resolution_change_creates_new_table_and_retains_old() {
+async fn the_log_rollup_resolution_names_the_rollup_table_and_view() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
     let db = &pulsus_testkit::test_db("pulsus_schema_it_rollup_change");
     drop_database(&client, db).await;
     let mut ctx = test_ctx(db);
-    ctx.log_rollup = Duration::from_secs(5);
-
-    run_init(&client, &ctx).await.expect("run_init (rollup=5s)");
-    let names_before = table_names(&client, db).await;
-    assert!(names_before.contains(&"log_metrics_5s".to_string()));
-    assert!(names_before.contains(&"log_metrics_5s_mv".to_string()));
-
     ctx.log_rollup = Duration::from_secs(10);
+
     run_init(&client, &ctx)
         .await
-        .expect("re-init after a PULSUS_LOG_ROLLUP_RESOLUTION change must succeed");
-
-    let names_after = table_names(&client, db).await;
-    assert!(
-        names_after.contains(&"log_metrics_10s".to_string()),
-        "the new-resolution rollup table must be created: {names_after:?}"
-    );
-    assert!(
-        names_after.contains(&"log_metrics_10s_mv".to_string()),
-        "the new-resolution rollup MV must be created: {names_after:?}"
-    );
-    assert!(
-        names_after.contains(&"log_metrics_5s".to_string()),
-        "the old-resolution rollup table must be retained, not dropped: {names_after:?}"
-    );
-    assert!(
-        names_after.contains(&"log_metrics_5s_mv".to_string()),
-        "the old-resolution rollup MV must be retained, not dropped: {names_after:?}"
-    );
+        .expect("run_init (rollup=10s)");
+    let names = table_names(&client, db).await;
+    drop_database(&client, db).await;
+    for t in ["log_metrics_10s", "log_metrics_10s_mv"] {
+        assert!(names.contains(&t.to_string()), "{t} must exist: {names:?}");
+    }
+    for t in ["log_metrics_5s", "log_metrics_5s_mv"] {
+        assert!(
+            !names.contains(&t.to_string()),
+            "{t} must not exist: {names:?}"
+        );
+    }
 }
 
 /// The last admitted metric millisecond (issue #137): the final millisecond

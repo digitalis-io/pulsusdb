@@ -1,6 +1,6 @@
 //! Traces-family integration tests against a real ClickHouse server (issue
 //! #53, M4-T1): `run_init` creates the three trace tables + the tag-catalog
-//! MV idempotently, sample data round-trips (the MV populates
+//! MV, sample data round-trips (the MV populates
 //! `trace_tag_catalog`), a `PULSUS_RETENTION_DAYS` change propagates to both
 //! retained trace tables, and the two docs/schemas.md §4.2 EXPLAIN gates
 //! hold on a seeded ≥100k-row corpus.
@@ -328,7 +328,7 @@ async fn seed_attrs_corpus(client: &ChClient, db: &str, base_ns: i64) {
 }
 
 /// AC2 (issue #53): `run_init` on a fresh database creates every trace
-/// object, a second run adds and removes nothing, inserted spans + attrs
+/// object, inserted spans + attrs
 /// round-trip, and the MV
 /// populates `trace_tag_catalog` with the deduplicated `(key, val)` set.
 #[tokio::test]
@@ -356,15 +356,6 @@ async fn run_init_creates_trace_tables_and_mv_and_round_trips_via_the_catalog_mv
     // Single-node mode: no `_dist` wrappers at all — and `trace_tag_catalog`
     // never gets one in any mode (Replication::Global catalog).
     assert!(!names.iter().any(|n| n.ends_with("_dist")));
-
-    run_init(&client, &ctx)
-        .await
-        .expect("run_init (second run, no-op)");
-    let names_after = table_names(&client, db).await;
-    assert_eq!(
-        names, names_after,
-        "second run must not add or remove objects"
-    );
 
     // Round-trip: recent timestamps (within the 7-day TTL window —
     // `ttl_only_drop_parts = 1` would make an already-expired part eligible
@@ -1247,8 +1238,7 @@ async fn insert_span(
 }
 
 /// Issue #173 AC1/AC2/AC5/AC6: `run_init` creates `trace_edges` +
-/// `trace_edges_mv` idempotently (run twice),
-/// the MV exists, SQL-inserted client/server pairs
+/// `trace_edges_mv`, the MV exists, SQL-inserted client/server pairs
 /// materialize completed edges through the MV, within-type pairing rejects a
 /// cross-kind decoy, and a byte-identical re-insert leaves the read's
 /// `calls` unchanged (replay idempotence via read-time dedup).
@@ -1260,10 +1250,7 @@ async fn run_init_creates_the_edge_ledger_and_mv_and_pairs_client_server_edges()
     drop_database(&client, db).await;
     let ctx = test_ctx(db);
 
-    run_init(&client, &ctx).await.expect("run_init (first run)");
-    run_init(&client, &ctx)
-        .await
-        .expect("run_init (second run must be a no-op)");
+    run_init(&client, &ctx).await.expect("run_init");
 
     let names = table_names(&client, db).await;
     for t in ["trace_edges", "trace_edges_mv"] {
@@ -1437,12 +1424,12 @@ async fn run_init_creates_the_edge_ledger_and_mv_and_pairs_client_server_edges()
 
 /// Issue #184 (M7-TQ5): migration 35 adds `trace_spans.status_message
 /// String DEFAULT ''` — `run_init` on a fresh database lands the column
-/// (reconcile applies the additive ALTER after the frozen id-16 CREATE), a
-/// second run is a no-op (idempotent), pre-existing
+/// (reconcile applies the additive ALTER after the frozen id-16 CREATE),
+/// pre-existing
 /// rows read back `''`, and a freshly inserted `status_message` value
 /// round-trips.
 #[tokio::test]
-async fn migration_35_adds_status_message_idempotently_and_round_trips() {
+async fn migration_35_adds_status_message_and_round_trips() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
     let db = &pulsus_testkit::test_db("pulsus_schema_it_traces_status_msg");
@@ -1522,11 +1509,6 @@ async fn migration_35_adds_status_message_idempotently_and_round_trips() {
     )
     .await;
     assert_eq!(filled, 1, "a stored status_message round-trips");
-
-    // Idempotence: the second run neither drifts nor duplicates.
-    run_init(&client, &ctx)
-        .await
-        .expect("run_init (second run, no-op)");
 
     drop_database(&client, db).await;
 }
@@ -1646,10 +1628,9 @@ async fn migration_status_message_add_column_survives_a_populated_projection_tab
 /// Issue #192: migration 37 adds `trace_spans.scope_name`/`scope_version`
 /// `LowCardinality(String) DEFAULT ''` — `run_init` on a fresh database
 /// lands both columns (reconcile applies the additive ALTER after the frozen
-/// id-16 CREATE), a second run is a no-op (idempotent),
-/// pre-existing rows read back `''`, and freshly inserted values round-trip.
+/// id-16 CREATE), pre-existing rows read back `''`, and freshly inserted values round-trip.
 #[tokio::test]
-async fn migration_37_adds_scope_name_version_idempotently_and_round_trips() {
+async fn migration_37_adds_scope_name_version_and_round_trips() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
     let db = &pulsus_testkit::test_db("pulsus_schema_it_traces_scope_name_ver");
@@ -1735,11 +1716,6 @@ async fn migration_37_adds_scope_name_version_idempotently_and_round_trips() {
     )
     .await;
     assert_eq!(filled, 1, "stored scope name/version round-trip");
-
-    // Idempotence: the second run neither drifts nor duplicates.
-    run_init(&client, &ctx)
-        .await
-        .expect("run_init (second run, no-op)");
 
     drop_database(&client, db).await;
 }
@@ -1976,8 +1952,7 @@ async fn migration_shared_add_column_survives_a_populated_projection_table() {
 
 /// Issue #476: migrations 39 and 41 add `val_type` to `trace_attrs_idx`
 /// and `trace_tag_catalog`. `run_init` on a fresh database lands both
-/// columns with the DIFFERENT defaults they must carry, a second run is a
-/// no-op, and `trace_tag_catalog`'s sorting key gains the column while its
+/// columns with the DIFFERENT defaults they must carry, and `trace_tag_catalog`'s sorting key gains the column while its
 /// primary key does not.
 ///
 /// The two defaults differ on purpose and the difference is the whole
@@ -1988,7 +1963,7 @@ async fn migration_shared_add_column_survives_a_populated_projection_table() {
 /// equally refuses a standalone `MODIFY ORDER BY` afterwards — the
 /// single-statement, no-default form is the only one it accepts.
 #[tokio::test]
-async fn migrations_39_41_add_val_type_idempotently_and_extend_only_the_sorting_key() {
+async fn migrations_39_41_add_val_type_and_extend_only_the_sorting_key() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
     let db = &pulsus_testkit::test_db("pulsus_schema_it_traces_val_type");
@@ -2081,11 +2056,6 @@ async fn migrations_39_41_add_val_type_idempotently_and_extend_only_the_sorting_
     drop(stream);
     assert_eq!(keys.primary_key, "scope, key, val");
     assert_eq!(keys.sorting_key, "scope, key, val, val_type");
-
-    // Idempotence: the second run neither drifts nor duplicates.
-    run_init(&client, &ctx)
-        .await
-        .expect("run_init (second run, no-op)");
 
     drop_database(&client, db).await;
 }
@@ -2284,11 +2254,11 @@ async fn engine_full(client: &ChClient, db: &str, table: &str) -> Option<String>
 }
 
 /// Issue #560 criterion 7: after `run_init` the two tables and their two
-/// views exist; a second `run_init` is a no-op; both TTLs render the
+/// views exist; both TTLs render the
 /// saturating form; and neither table's routing wrapper is created, because
 /// a single node renders no `_dist` object at all.
 #[tokio::test]
-async fn the_derived_trace_tables_exist_and_reinit_is_a_no_op() {
+async fn the_derived_trace_tables_exist() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
     let db = &pulsus_testkit::test_db("pulsus_schema_it_traces_derived");
@@ -2296,7 +2266,6 @@ async fn the_derived_trace_tables_exist_and_reinit_is_a_no_op() {
     let ctx = test_ctx(db);
 
     run_init(&client, &ctx).await.expect("run_init");
-    let second = run_init(&client, &ctx).await;
 
     let mut failures: Vec<String> = Vec::new();
     let names = table_names(&client, db).await;
@@ -2309,9 +2278,6 @@ async fn the_derived_trace_tables_exist_and_reinit_is_a_no_op() {
         if !names.iter().any(|n| n == object) {
             failures.push(format!("{db}.{object} does not exist"));
         }
-    }
-    if let Err(e) = &second {
-        failures.push(format!("the second run_init failed: {e}"));
     }
     // The two routing wrappers are clustered-only: single-node renders no
     // `_dist` object at all, and the wrappers are asserted on the cluster

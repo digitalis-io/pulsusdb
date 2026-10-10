@@ -107,7 +107,7 @@ fn the_clustered_render_adds_the_wrappers_and_keeps_the_server_macros() {
     );
     assert_eq!(
         text.matches("ON CLUSTER 'prod'").count(),
-        86,
+        65,
         "every statement carries ON CLUSTER"
     );
 
