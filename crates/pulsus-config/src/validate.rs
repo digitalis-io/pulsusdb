@@ -19,6 +19,9 @@ pub const MAX_INDEXED_ATTRIBUTES: usize = 16;
 /// server's default `max_query_size`.
 pub const MAX_INDEXED_KEY_BYTES: usize = 128;
 
+const INDEXED_ATTRIBUTE_FORM: &str =
+    "span.<key> or event.<key>, the key dot-separated segments of letters, digits, '_' and '-'";
+
 /// Where an indexed attribute is stored (issue #595 part 2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexedScope {
@@ -31,8 +34,32 @@ pub enum IndexedScope {
 /// One `traceql_indexed_attributes` item, `span.<key>` or `event.<key>`:
 /// its scope and its key. The key is one or more segments of ASCII
 /// letters, digits, `_` and `-`, joined by single dots.
-pub fn parse_indexed_attribute(_item: &str) -> Result<(IndexedScope, String), String> {
-    Err(String::new())
+pub fn parse_indexed_attribute(item: &str) -> Result<(IndexedScope, String), String> {
+    let (scope, key) = if let Some(k) = item.strip_prefix("span.") {
+        (IndexedScope::Span, k)
+    } else if let Some(k) = item.strip_prefix("event.") {
+        (IndexedScope::Event, k)
+    } else if item.starts_with("resource.") {
+        return Err("a resource attribute is read through resource_id, which the span table already indexes".to_string());
+    } else {
+        return Err("the scope must be span. or event.".to_string());
+    };
+    let ok = !key.is_empty()
+        && key.split('.').all(|seg| {
+            !seg.is_empty()
+                && seg
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        });
+    if !ok {
+        return Err(
+            "the key must be dot-separated segments of letters, digits, '_' and '-'".to_string(),
+        );
+    }
+    if key.len() > MAX_INDEXED_KEY_BYTES {
+        return Err("the key is longer than 128 bytes".to_string());
+    }
+    Ok((scope, key.to_string()))
 }
 
 fn value_err(field: &str, msg: &str, expected: &str) -> ConfigError {
@@ -569,6 +596,31 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
     // Rule 13: retention_days.
     if cfg.retention_days < 1 {
         return Err(value_err("retention_days", "must be >= 1", ">= 1"));
+    }
+
+    // Issue #595 part 2: the indexed trace attributes.
+    if cfg.traceql_indexed_attributes.len() > MAX_INDEXED_ATTRIBUTES {
+        return Err(value_err(
+            "traceql_indexed_attributes",
+            "names more attributes than the ceiling",
+            "at most 16",
+        ));
+    }
+    for (i, item) in cfg.traceql_indexed_attributes.iter().enumerate() {
+        if let Err(why) = parse_indexed_attribute(item) {
+            return Err(value_err(
+                "traceql_indexed_attributes",
+                &format!("{item:?}: {why}"),
+                INDEXED_ATTRIBUTE_FORM,
+            ));
+        }
+        if cfg.traceql_indexed_attributes[..i].contains(item) {
+            return Err(value_err(
+                "traceql_indexed_attributes",
+                &format!("{item:?} is listed twice"),
+                "each attribute once",
+            ));
+        }
     }
 
     // Issue #603: the metrics landing table's dials. Both ends matter for

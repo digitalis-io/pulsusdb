@@ -487,8 +487,12 @@ pub fn compile_search_filter(
     filters_of(spanset, &mut filters)?;
     let predicates: Vec<SpanPredicate> = filters
         .iter()
-        .map(|f| compile_span_predicate_in(&body_of(f), ctx))
-        .collect::<Result<_, _>>()?;
+        .map(|f| {
+            let body = body_of(f);
+            let p = compile_span_predicate_in(&body, ctx)?;
+            Ok(p.with_hints(&super::attr_index::index_hints(&body, ctx.indexed)))
+        })
+        .collect::<Result<_, PlanError>>()?;
     if let (SpansetExpr::Filter(_), [_]) = (spanset, predicates.as_slice()) {
         let p = predicates.into_iter().next().expect("one filter");
         return Ok(SearchFilter::One(p));

@@ -1330,12 +1330,21 @@ CREATE TABLE spans (
     scope_dropped_attrs UInt32               CODEC(ZSTD(1)),
     scope_attrs_other   String               CODEC(ZSTD(1)),
     end_ns              UInt64               CODEC(Delta, ZSTD(1)),
-    service_type        LowCardinality(String)  CODEC(ZSTD(1))
+    service_type        LowCardinality(String)  CODEC(ZSTD(1)),
+    INDEX idx_service service TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_name name TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_resource resource_id TYPE bloom_filter(0.01) GRANULARITY 1
+    -- INDEX idx_attr_<n> <expression> TYPE bloom_filter(0.01) GRANULARITY 1, one per PULSUS_TRACEQL_INDEXED_ATTRIBUTES item:
+    --   span.<key>:  arrayMap(x -> ifNull(x, ''), arrayConcat(attrs.`P`.:`Array(Nullable(String))`, [attrs.`P`.:String]))
+    --   event.<key>: arrayMap(x -> ifNull(x, ''), arrayConcat(events.attrs.`P`.:String, arrayFlatten(events.attrs.`P`.:`Array(Nullable(String))`)))
+    --   where P is the key with each '.' written '%2E'
 ) ENGINE = ReplacingMergeTree
 PARTITION BY toDate(fromUnixTimestamp64Nano(start_ns), 'UTC')
 ORDER BY (intDiv(start_ns, 300000000000), trace_id, start_ns, span_id, kind)
 TTL toDateTime(least(intDiv(start_ns, 1000000000) + (7 * 86400), 4294967295))
 SETTINGS ttl_only_drop_parts = 1, index_granularity = 2048;
+
+The `idx_attr_<n>` indexes exist only for the attributes `PULSUS_TRACEQL_INDEXED_ATTRIBUTES` names (`docs/configuration.md` §3); a search whose filter requires `key = "<string>"` on one of them skips the granules that hold no such string.
 
 CREATE TABLE traces (
     day           Date                                                 CODEC(ZSTD(1)),

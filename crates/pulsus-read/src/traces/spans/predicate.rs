@@ -141,6 +141,19 @@ impl SpanPredicate {
         &self.sql
     }
 
+    /// This predicate behind `hints` (issue #595 part 2): `h1 AND … AND
+    /// (p)`. Each hint is an `indexHint`, true and never evaluated, so the
+    /// predicate's answer is unchanged.
+    pub(super) fn with_hints(&self, hints: &[String]) -> SpanPredicate {
+        if hints.is_empty() {
+            return self.clone();
+        }
+        SpanPredicate {
+            sql: format!("{} AND ({})", hints.join(" AND "), self.sql),
+            ..self.clone()
+        }
+    }
+
     /// Whether this predicate may sit in a statement bounded by `w`: it
     /// carries no resource subquery, or was compiled for `w`.
     pub(crate) fn composes_with(&self, w: WindowSql) -> bool {

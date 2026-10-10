@@ -481,7 +481,13 @@ pub(crate) fn trace_read_config_from(config: &Config) -> TraceReadConfig {
 pub(crate) fn trace_engine(pool: Arc<ChPool>, config: &Config) -> Result<TraceEngine, ChError> {
     let client = ChClient::from_shared_pool(pool, config.query_timeout.0)
         .with_consistency(consistency_from(config))?;
-    Ok(TraceEngine::new(client, trace_read_config_from(config)))
+    Ok(
+        TraceEngine::new(client, trace_read_config_from(config)).with_indexed_attrs(
+            pulsus_read::traces::spans::attr_index::IndexedAttr::from_config(
+                &config.traceql_indexed_attributes,
+            ),
+        ),
+    )
 }
 
 #[cfg(test)]

@@ -170,6 +170,26 @@ pub(crate) fn substitute_tokens(tmpl: &str, ctx: &RenderCtx) -> String {
             &crate::checks::DEDUP_WINDOW_SECONDS.to_string(),
         )
         .replace("{{storage_policy}}", &storage_policy)
+        .replace("{{trace_attr_indexes}}", &trace_attr_indexes(ctx))
+}
+
+/// `{{trace_attr_indexes}}` (issue #595 part 2): for the `n`th configured
+/// attribute, `,` then `INDEX idx_attr_<n> <expression> TYPE
+/// bloom_filter(0.01) GRANULARITY 1` on its own line; nothing for none.
+fn trace_attr_indexes(ctx: &RenderCtx) -> String {
+    let mut out = String::new();
+    for (i, item) in ctx.trace_indexed_attributes.iter().enumerate() {
+        let expr = match (item.strip_prefix("span."), item.strip_prefix("event.")) {
+            (Some(key), _) => pulsus_clickhouse::json_column::span_attr_index_expr(key),
+            (None, Some(key)) => pulsus_clickhouse::json_column::event_attr_index_expr(key),
+            (None, None) => panic!("an unvalidated indexed attribute: {item:?}"),
+        };
+        out.push_str(&format!(
+            ",\n    INDEX idx_attr_{} {expr} TYPE bloom_filter(0.01) GRANULARITY 1",
+            i + 1
+        ));
+    }
+    out
 }
 
 /// The suffix a materialized view's `TO` clause carries when its target is

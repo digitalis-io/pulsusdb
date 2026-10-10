@@ -341,7 +341,7 @@ CREATE TABLE IF NOT EXISTS {{db}}.spans{{on_cluster}}
     service_type LowCardinality(String) CODEC(ZSTD(1)),
     INDEX idx_service service TYPE bloom_filter(0.01) GRANULARITY 1,
     INDEX idx_name name TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_resource resource_id TYPE bloom_filter(0.01) GRANULARITY 1
+    INDEX idx_resource resource_id TYPE bloom_filter(0.01) GRANULARITY 1{{trace_attr_indexes}}
 )
 --@single  ENGINE = ReplacingMergeTree
 --@cluster ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/{{db}}.spans', '{replica}')

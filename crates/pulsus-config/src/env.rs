@@ -41,6 +41,7 @@ pub const ALL_ENV_VARS: &[&str] = &[
     "CLICKHOUSE_SELECT_SEQUENTIAL_CONSISTENCY",
     "PULSUS_SKIP_DDL",
     "PULSUS_RETENTION_DAYS",
+    "PULSUS_TRACEQL_INDEXED_ATTRIBUTES",
     "PULSUS_STORAGE_POLICY",
     "PULSUS_LOG_ROLLUP_RESOLUTION",
     "PULSUS_METRICS_LANDING_RETENTION_HOURS",
@@ -278,6 +279,13 @@ pub fn apply_env(cfg: &mut Config) -> Result<(), ConfigError> {
     }
     if let Some(v) = read("PULSUS_RETENTION_DAYS") {
         cfg.retention_days = parse_int("PULSUS_RETENTION_DAYS", &v)?;
+    }
+    if let Some(v) = read("PULSUS_TRACEQL_INDEXED_ATTRIBUTES") {
+        cfg.traceql_indexed_attributes = if v.is_empty() {
+            Vec::new()
+        } else {
+            v.split(',').map(str::to_string).collect()
+        };
     }
     if let Some(v) = read("PULSUS_STORAGE_POLICY") {
         cfg.storage_policy = Some(v);

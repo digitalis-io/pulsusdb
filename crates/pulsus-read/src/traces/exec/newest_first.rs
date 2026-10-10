@@ -22,8 +22,7 @@ impl TraceEngine {
         mut self,
         indexed: Vec<crate::traces::spans::attr_index::IndexedAttr>,
     ) -> Self {
-        drop(indexed);
-        self.indexed = Vec::new();
+        self.indexed = indexed;
         self
     }
 
