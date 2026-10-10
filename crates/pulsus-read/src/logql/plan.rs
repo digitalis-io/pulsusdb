@@ -2024,6 +2024,16 @@ pub(in crate::logql) fn json_count_route(
     })
 }
 
+/// Issue #624, part 3d: the `| logfmt` count a range query lowers to.
+/// Stub for the tests-first commit: always today's route.
+pub(in crate::logql) fn logfmt_count_route(
+    _pipeline: &[Stage],
+    _op: RangeAggOp,
+    _vector_aggs: &[VectorAggSpec],
+) -> Option<sql::LogfmtCount> {
+    None
+}
+
 /// Issue #507 (W4): does the pipeline carry a `| unwrap` with a
 /// CONVERSION — `duration(x)`, `duration_seconds(x)`, `bytes(x)`?
 ///
@@ -2832,13 +2842,22 @@ fn metric_plan(
     } else {
         None
     };
+    // Issue #624, part 3d: a counting reducer after one `| logfmt` stage,
+    // whose relevant fields the statement sends.
+    let logfmt =
+        if is_range && !force_client && regexp.is_none() && json.is_none() && !no_label_parsers {
+            logfmt_count_route(pipeline, *op, &vector_aggs)
+        } else {
+            None
+        };
     let bucketed_range = is_range
         && !force_client
         && (!has_beyond_line_filter
             || label_only_pipeline(pipeline, *op)
             || no_label_parsers
             || regexp.is_some()
-            || json.is_some())
+            || json.is_some()
+            || logfmt.is_some())
         && !has_unwrap
         // Implied by the reducer set below — none of the five requires
         // `| unwrap` — but named so that a future change to
@@ -2989,7 +3008,10 @@ fn metric_plan(
         let equal = step_ns.is_some_and(|step| step.get() == range_ns.get());
         RoutingDecision {
             chosen: RouteChoice::Raw,
-            reason: if staged && json.is_some() {
+            reason: if staged && logfmt.is_some() {
+                "raw: range aggregation in the database, logfmt fields and label stages over its rows (issue #624)"
+                    .to_string()
+            } else if staged && json.is_some() {
                 "raw: range aggregation in the database, json key labels and label stages over its rows (issue #624)"
                     .to_string()
             } else if staged
@@ -3077,6 +3099,7 @@ fn metric_plan(
                 .expect("a range plan always builds today's aggregation"),
             regexp: regexp.clone(),
             json: json.clone(),
+            logfmt: logfmt.clone(),
         })),
         (None, false) => sql::MetricValue::Shaped(shape),
     };
@@ -9076,6 +9099,164 @@ mod tests {
                 assert!(mp.client.is_some(), "{query} at [{range}]: today's route");
             }
         }
+    }
+
+    const LOGFMT_STAGED: &str = "raw: range aggregation in the database, logfmt fields and label stages over its rows (issue #624)";
+
+    /// **T1 (issue #624, part 3d): a `| logfmt` counting chain lowers, and
+    /// the field names it sends are the ones the answer can read.**
+    #[test]
+    fn a_logfmt_counting_chain_lowers() {
+        let spec = QuerySpec::Range {
+            start_ns: 600_000_000_000,
+            end_ns: 1_200_000_000_000,
+            step_ns: 60_000_000_000,
+        };
+        const OPS: [&str; 4] = ["count_over_time", "rate", "bytes_over_time", "bytes_rate"];
+        const RANGES: [&str; 3] = ["1m", "5m", "30s"];
+        // (query with <op> and <r>, the names sent; empty = part 2's no-label route)
+        const LOWERED: [(&str, &[&str]); 10] = [
+            (
+                "sum by (level) (<op>({a=\"b\"} | logfmt [<r>]))",
+                &["level"],
+            ),
+            (
+                "sum by (level) (<op>({a=\"b\"} |= \"x\" | logfmt --strict | status >= 400 [<r>]))",
+                &["level", "status"],
+            ),
+            (
+                "sum(<op>({a=\"b\"} | logfmt --keep-empty | level=\"error\" [<r>]))",
+                &["level"],
+            ),
+            (
+                "sum by (level_extracted) (<op>({a=\"b\"} | logfmt [<r>]))",
+                &["level", "level_extracted"],
+            ),
+            (
+                "<op>({a=\"b\"} | logfmt lvl=\"level\" [<r>])",
+                &["level", "lvl"],
+            ),
+            (
+                "count by (m) (<op>({a=\"b\"} | logfmt --strict m=\"msg\", st=\"status\" | st=\"500\" [<r>]))",
+                &["m", "msg", "st", "status"],
+            ),
+            (
+                "topk(3, sum by (path) (<op>({a=\"b\"} | logfmt | drop msg [<r>])))",
+                &["msg", "path"],
+            ),
+            (
+                "sum by (level) (<op>({a=\"b\"} | logfmt | __error__=\"\" [<r>]))",
+                &["__error__", "level"],
+            ),
+            ("sum(<op>({a=\"b\"} | logfmt [<r>]))", &[]),
+            (
+                "<op>({a=\"b\"} | logfmt x=\"id_extracted\" [<r>])",
+                &["id_extracted", "x"],
+            ),
+        ];
+        // `absent_over_time`, once per range: (template, names; empty = part
+        // 2's route, None = today's route).
+        const ABSENT: [(&str, Option<&[&str]>); 3] = [
+            (
+                "absent_over_time({a=\"b\"} | logfmt lvl=\"level\" | lvl=\"info\" [<r>])",
+                Some(&["level", "lvl"]),
+            ),
+            (
+                "absent_over_time({a=\"b\"} | logfmt --strict lvl=\"level\" [<r>])",
+                Some(&[]),
+            ),
+            (
+                "absent_over_time({a=\"b\"} | logfmt | level=\"error\" [<r>])",
+                None,
+            ),
+        ];
+        const STAYS: [&str; 9] = [
+            "<op>({a=\"b\"} | logfmt [<r>])",
+            "count by (level) (<op>({a=\"b\"} | logfmt [<r>]))",
+            "sum without (level) (<op>({a=\"b\"} | logfmt [<r>]))",
+            "sum by (level) (<op>({a=\"b\"} | logfmt | line_format \"x\" [<r>]))",
+            "sum by (level) (<op>({a=\"b\"} | line_format \"x\" | logfmt [<r>]))",
+            "sum by (level) (<op>({a=\"b\"} | logfmt | label_format a=level [<r>]))",
+            "sum by (level) (<op>({a=\"b\"} | logfmt | json [<r>]))",
+            "sum by (level) (<op>({a=\"b\"} | json | logfmt [<r>]))",
+            "sum by (level) (<op>({a=\"b\"} | unpack | logfmt [<r>]))",
+        ];
+        let mut cells = 0usize;
+        let mut wrong: Vec<String> = Vec::new();
+        for r in RANGES {
+            for (template, names) in ABSENT {
+                cells += 1;
+                let query = template.replace("<r>", r);
+                let mp = metric_mp(&query, spec).unwrap_or_else(|e| panic!("{query}: {e}"));
+                let got = match &mp.value {
+                    sql::MetricValue::Staged(s) => s.logfmt.as_ref().map(|l| l.names.clone()),
+                    _ => None,
+                };
+                let ok = match names {
+                    None => mp.client.is_some(),
+                    Some([]) => {
+                        mp.client.is_none() && got.is_none() && mp.routing.reason == NO_LABEL_STAGED
+                    }
+                    Some(n) => {
+                        mp.client.is_none()
+                            && got == Some(n.iter().map(|x| x.to_string()).collect())
+                            && mp.routing.reason == LOGFMT_STAGED
+                    }
+                };
+                if !ok {
+                    wrong.push(format!(
+                        "{query}: client {:?}, names {got:?}, reason {}",
+                        mp.client.is_some(),
+                        mp.routing.reason
+                    ));
+                }
+            }
+            for op in OPS {
+                for (template, names) in LOWERED {
+                    cells += 1;
+                    let query = template.replace("<op>", op).replace("<r>", r);
+                    let mp = metric_mp(&query, spec).unwrap_or_else(|e| panic!("{query}: {e}"));
+                    let got = match &mp.value {
+                        sql::MetricValue::Staged(s) => s.logfmt.as_ref().map(|l| l.names.clone()),
+                        _ => None,
+                    };
+                    let (want_names, want_reason) = if names.is_empty() {
+                        (None, NO_LABEL_STAGED)
+                    } else {
+                        (
+                            Some(names.iter().map(|n| n.to_string()).collect::<Vec<_>>()),
+                            LOGFMT_STAGED,
+                        )
+                    };
+                    if mp.client.is_some() || got != want_names || mp.routing.reason != want_reason
+                    {
+                        wrong.push(format!(
+                            "{query}: client {:?}, names {got:?}, reason {}",
+                            mp.client.is_some(),
+                            mp.routing.reason
+                        ));
+                    }
+                }
+                for template in STAYS {
+                    cells += 1;
+                    let query = template.replace("<op>", op).replace("<r>", r);
+                    let mp = metric_mp(&query, spec).unwrap_or_else(|e| panic!("{query}: {e}"));
+                    if mp.client.is_none() {
+                        wrong.push(format!("{query}: lowered, today's route expected"));
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            cells,
+            RANGES.len() * (OPS.len() * (LOWERED.len() + STAYS.len()) + ABSENT.len())
+        );
+        assert!(
+            wrong.is_empty(),
+            "{} of {cells} cells:\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        );
     }
 
     /// **T2 (issue #624, part 3a): the captures sent follow the parent

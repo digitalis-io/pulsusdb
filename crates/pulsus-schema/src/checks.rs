@@ -780,20 +780,23 @@ mod tests {
 
     #[test]
     fn check_version_accepts_the_minimum_supported_version() {
-        assert!(check_version("26.3.0.1").is_ok());
+        assert!(check_version("26.8.0.1").is_ok());
     }
 
     #[test]
     fn check_version_accepts_newer_versions() {
-        assert!(check_version("26.4.0.0").is_ok());
+        assert!(check_version("26.9.0.0").is_ok());
         assert!(check_version("27.1.0.0").is_ok());
     }
 
     #[test]
     fn check_version_refuses_older_minor_versions() {
-        let err = check_version("26.2.9.1").unwrap_err();
-        assert!(matches!(err, SchemaError::UnsupportedVersion { .. }));
-        assert!(err.to_string().contains("26.2.9.1"));
+        // 26.3.29.7 is the floor 26.8 replaced (issue #624, part 3d).
+        for v in ["26.7.9.1", "26.3.29.7"] {
+            let err = check_version(v).unwrap_err();
+            assert!(matches!(err, SchemaError::UnsupportedVersion { .. }), "{v}");
+            assert!(err.to_string().contains(v), "{v}");
+        }
     }
 
     #[test]

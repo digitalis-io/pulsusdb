@@ -241,6 +241,25 @@ pub struct StagedCount {
     /// The pipeline's one `| json` stage, when the statement reads its key
     /// labels (issue #624, part 3b): the keys join the group key.
     pub json: Option<JsonCount>,
+    /// The pipeline's one `| logfmt` stage, when the statement sends its
+    /// relevant fields (issue #624, part 3d): they join the group key.
+    pub logfmt: Option<LogfmtCount>,
+}
+
+/// The `| logfmt` stage of a lowered count (issue #624, part 3d): the
+/// sanitised key names whose fields the stage can read for the answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogfmtCount {
+    pub names: Vec<String>,
+}
+
+/// The two columns of a lowered `| logfmt` count (issue #624, part 3d).
+/// Stub for the tests-first commit: decides no line and sends no field.
+pub fn logfmt_count_columns(_names: &[String]) -> [String; 2] {
+    [
+        "toUInt8(0) AS decided".to_string(),
+        "'' AS fields".to_string(),
+    ]
 }
 
 /// The `| json` stage of a lowered count (issue #624, part 3b): its form
