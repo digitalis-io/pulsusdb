@@ -7,7 +7,7 @@ traceql_pipeline_stage_variants	docs/query-lowering.md	** variants; all	are belo
 logql_stage_variants	docs/query-to-sql.md	### 1.2 LogQL — the	stage kinds	word	393
 logql_stage_variants	docs/query-to-sql.md	`Stage` has exactly	variants	word	393
 logql_stage_variants	docs/query-lowering.md	no validation. #### The	`Stage` variants, each as a `Pipe` link	word	1749
-never_reason_variants	docs/query-lowering.md	`NeverReason` has exactly **	** variants	word	5481
+never_reason_variants	docs/query-lowering.md	`NeverReason` has exactly **	** variants	word	5482
 lql_link_variants	docs/query-lowering.md	`LqlLink` has exactly **	** variants	digits	5300
 cut_variants	docs/query-lowering.md	every continuation naming a cut names one of the	|	word	5322
 logql_stage_variants	docs/query-lowering.md	reason — a `find_map` over the	stage variants	word	51
