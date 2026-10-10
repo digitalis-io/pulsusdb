@@ -817,8 +817,14 @@ async fn the_second_attribute_condition_reads_no_more_bytes(
         drain_tagged_rows(client, &sql_b, &counted_settings(&id_b)).await;
     let rows_c: Vec<HydrationProbeValueRow> =
         drain_tagged_rows(client, &sql_c, &counted_settings(&id_c)).await;
-    let rows_d: Vec<HydrationRow> =
-        drain_tagged_rows(client, &sql_d, &counted_settings(&id_d)).await;
+    // D reads the base table as A, B and C do: from 26.8 a statement with
+    // no probe column may be served by a projection (issue #624, part 3d).
+    let rows_d: Vec<HydrationRow> = drain_tagged_rows(
+        client,
+        &sql_d,
+        &counted_settings(&id_d).set("optimize_use_projections", "0"),
+    )
+    .await;
 
     // 10b: probe TRUTH. The counts are deterministic from the seed —
     // every span carries `env`, and `number % ERROR_EVERY = 0` holds for
@@ -1287,8 +1293,18 @@ async fn two_phase_search_explain_and_budget_gates() {
     // corpus's durations grow monotonically with time (`number * 10µs`),
     // so slow spans cluster and the minmax index can prune for a
     // top-decile threshold. -----------------------------------------------
+    // From 26.8 the server's column statistics can prune the parts the
+    // index would, before the index is read (issue #624, part 3d), so the
+    // index is measured with that pruning off.
     let plan = plan_for(&engine, "{ duration > 1100ms }", base, now);
-    let raw = explain_raw(&client, &plan.generator_sqls[0]).await;
+    let raw = explain_raw(
+        &client,
+        &format!(
+            "{}\nSETTINGS use_statistics_for_part_pruning = 0",
+            plan.generator_sqls[0]
+        ),
+    )
+    .await;
     let (sel, total) = skip_index_granules(&raw, "idx_duration");
     assert!(
         sel < total,
@@ -3459,6 +3475,13 @@ async fn two_phase_search_explain_and_budget_gates() {
     // This replaces issue #479's membership gates, which lost their
     // subject: the statement they compared is no longer issued.
     //
+    // From 26.8 the plain statement alone may be served by the
+    // `service_time` or `name_time` projection when that selects fewer
+    // granules (issue #624, part 3d). The probed statement reads the base
+    // table, so the control reads the base table too
+    // (`optimize_use_projections = 0`), and the identity stays one between
+    // two reads of the same table.
+    //
     // The four classes enumerated are the four `ValuePred` classes that
     // FUSE a value, so the `ProbesAndValues` render — three array columns,
     // not one — is what the identity is taken over. `StringEq` never
@@ -3496,7 +3519,11 @@ async fn two_phase_search_explain_and_budget_gates() {
             "{label}: the control render must carry no probe column at all:\n{plain}"
         );
         let raw_probed = explain_raw(&client, &probed).await;
-        let raw_plain = explain_raw(&client, &plain).await;
+        let raw_plain = explain_raw(
+            &client,
+            &format!("{plain}\nSETTINGS optimize_use_projections = 0"),
+        )
+        .await;
         assert_eq!(
             primary_key_granules(&raw_probed),
             primary_key_granules(&raw_plain),
@@ -4008,9 +4035,12 @@ async fn the_pushdown_keeps_the_generators_index_selection(
 
     // POSITIVE CONTROL, on the same corpus: narrowing the time predicate
     // MUST move part selection.
-    let narrowed = statements[0]
-        .1
-        .replace("timestamp_ns >= ", &format!("timestamp_ns >= {now} + "));
+    // It narrows to the last 30 minutes: from 26.8 a contradictory range
+    // is planned with no index section at all (issue #624, part 3d).
+    let narrowed = statements[0].1.replace(
+        &format!("timestamp_ns >= {base} AND"),
+        &format!("timestamp_ns >= {} AND", now - 1_800_000_000_000),
+    );
     assert_ne!(
         &narrowed, statements[0].1,
         "the positive control must differ"

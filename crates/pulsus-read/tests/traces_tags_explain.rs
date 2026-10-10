@@ -852,6 +852,29 @@ async fn seed_spans(client: &ChClient, db: &str, base_ns: i64) {
     .await;
 }
 
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct EstimateRow {
+    database: String,
+    table: String,
+    parts: u64,
+    rows: u64,
+    marks: u64,
+}
+
+/// The rows `EXPLAIN ESTIMATE` says `sql` reads, summed over its tables.
+async fn estimate_rows(client: &ChClient, sql: &str) -> u64 {
+    let full = format!("EXPLAIN ESTIMATE {sql}");
+    let mut stream = client
+        .query_stream::<EstimateRow>(&full, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("estimate failed: {e}\nSQL:\n{full}"));
+    let mut n = 0;
+    while let Some(row) = stream.next().await {
+        n += row.expect("decode estimate row").rows;
+    }
+    n
+}
+
 /// The name of the table or projection an `EXPLAIN` plan reads from.
 fn read_source(raw: &str) -> String {
     for line in raw.lines() {
@@ -951,29 +974,25 @@ async fn span_name_projection_is_selected_and_prunes() {
         "span_name_day",
         "the unnarrowed span-name read must be served by the day-grain projection:\n{raw}"
     );
-    let (selected, total) = final_granules(&raw);
 
     // (b) the same query WITHOUT the projection reads the base table, and
-    //     reads strictly more granules out of the same denominator.
-    let base_raw = explain_raw(
-        &client,
-        &format!("{sql} SETTINGS optimize_use_projections = 0"),
-    )
-    .await;
+    //     reads more rows. Rows, by `EXPLAIN ESTIMATE`, not granules: from
+    //     26.8 a projection read counts the projection part's own
+    //     granules, so the two granule counts share no denominator
+    //     (issue #624, part 3d).
+    let projected_rows = estimate_rows(&client, &sql).await;
+    let base_sql = format!("{sql}\nSETTINGS optimize_use_projections = 0");
+    let base_raw = explain_raw(&client, &base_sql).await;
     assert_eq!(
         read_source(&base_raw),
         format!("{SPAN_DB}.trace_spans"),
         "the control must read the base table:\n{base_raw}"
     );
-    let (base_selected, base_total) = final_granules(&base_raw);
+    let base_rows = estimate_rows(&client, &base_sql).await;
     assert_eq!(
-        total, base_total,
-        "the two plans must share a denominator, or the comparison is not a comparison"
-    );
-    assert!(
-        selected < base_selected,
-        "the projection must select strictly fewer granules ({selected}/{total}) than the \
-         base-table read ({base_selected}/{base_total})"
+        (projected_rows, base_rows),
+        (SPAN_NAMES, SPAN_ROWS),
+        "the projection reads one row per (day, name), the base table every span of the day"
     );
 
     // (c) the discriminator: the same window on `timestamp_ns` is NOT

@@ -89,6 +89,9 @@ const INJECTED_SETTINGS: &[&str] = &[
     "optimize_move_to_prewhere",
     "optimize_read_in_order",
     "optimize_skip_unused_shards",
+    // Issue #624, part 3d: a trace EXPLAIN test reads the base table, which
+    // a projection may otherwise serve from 26.8.
+    "optimize_use_projections",
     "prefer_localhost_replica",
     "query_id",
     // Issue #624: the `text` body index's direct read is off on every LogQL read.

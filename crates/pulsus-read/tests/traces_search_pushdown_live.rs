@@ -1074,39 +1074,44 @@ async fn duplicate_index_rows_do_not_move_a_pushed_min_max_or_count() {
 // Criteria 10' and 11' — the ceiling that refuses
 // ---------------------------------------------------------------------
 
-/// Corpus M1: one `trace_attrs_idx` row per distinct trace id, all
-/// carrying `http.method = GET` at `scope = 'span'`, plus `SPANS` rows in
-/// `trace_spans` for the trace ids with the LARGEST timestamps — so the
+/// Corpus M1: `M1_TRACES` trace ids of `M1_SPANS_PER_TRACE` spans each in
+/// `trace_attrs_idx`, every row carrying `http.method = GET` at
+/// `scope = 'span'`, plus `M1_SPANS` rows in `trace_spans` for the 64 trace
+/// ids with the LARGEST timestamps — so the
 /// control query below fills its heap on the first batch and stops on the
 /// threshold rule instead of walking every candidate two statements at a
 /// time.
 ///
-/// **The two stores are deliberately unequal — 1,000,000 index rows
-/// against 64 span rows — which is why issue #558's
+/// **The two stores are deliberately unequal — 4,000,000 index rows
+/// against 1,280 span rows — which is why issue #558's
 /// `pulsus_testkit::assert_stores_agree` is not called on it.** The
-/// subject is the phase-1 generator's `GROUP BY trace_id` state at a
-/// million distinct trace ids; seeding a million spans to match would
+/// subject is the phase-1 generator's `GROUP BY trace_id` state at
+/// 200,000 distinct trace ids of 20 spans each, where the pushed
+/// `uniqExact(span_id)` holds a set per trace; seeding every span to match
+/// would
 /// measure something else and would take the corpus out of the size this
 /// gate can be run at. Every fixture in this file that writes both stores
 /// for the same spans is checked, inside `seed` and `seed_u`.
-const M1_ROWS: u64 = 1_000_000;
-const M1_SPANS: u64 = 64;
+const M1_TRACES: u64 = 200_000;
+const M1_SPANS_PER_TRACE: u64 = 20;
+const M1_ROWS: u64 = M1_TRACES * M1_SPANS_PER_TRACE;
+const M1_SPANS: u64 = 64 * M1_SPANS_PER_TRACE;
 const M1_STEP_NS: i64 = 1_000;
-/// 150 MiB. Measured on ClickHouse 26.8.21.10 (`memory_usage` in
-/// `system.query_log`, issue #624 part 3d): the pushed statement's
-/// grouping state over corpus M1 peaks at 176,299,455 to 182,223,176
-/// bytes over five runs and the unpushed one at 129,310,554 over four, so
-/// this ceiling
-/// sits between them and tells the two apart. It is a fixture value, not
-/// the shipped default.
-const M1_CEILING_BYTES: u64 = 157_286_400;
+/// 128 MiB. Measured on ClickHouse 26.8.21.10 (`memory_usage` in
+/// `system.query_log`, issue #624 part 3d), the statements run at
+/// `M1_MAX_THREADS` (1 to 4 threads, three runs each): the pushed
+/// statement's grouping state over corpus M1 peaks at 493,026,587 to
+/// 514,421,635 bytes and the unpushed one at 20,512,016 to 41,060,443, so
+/// this ceiling sits 3.7 times below the one and 3.3 times above the other
+/// and tells the two apart. It is a fixture value, not the shipped default.
+const M1_CEILING_BYTES: u64 = 134_217_728;
 const M1_MAX_CANDIDATES: u64 = 1_000;
-/// 16 MiB — below the BARE generator's own peak over corpus M1, whose
-/// `GROUP BY trace_id` holds one aggregation state per distinct trace id
-/// across 1,000,000 of them. At this ceiling there is no statement that
+/// 8 MiB — below the BARE generator's own peak over corpus M1 (at least
+/// 20,512,016 bytes, as above), whose `GROUP BY trace_id` holds one
+/// aggregation state per distinct trace id across 200,000 of them. At this ceiling there is no statement that
 /// answers, which is the only boundary a `422` is owed at (issue #492
 /// part 5).
-const M1_FLOOR_CEILING_BYTES: u64 = 16_777_216;
+const M1_FLOOR_CEILING_BYTES: u64 = 8_388_608;
 
 async fn seed_m1(client: &ChClient, db: &str, base_ns: i64) {
     exec(
@@ -1117,7 +1122,7 @@ async fn seed_m1(client: &ChClient, db: &str, base_ns: i64) {
                toDate(fromUnixTimestamp64Nano({base_ns} + toInt64(number) * {M1_STEP_NS})), \
                'http.method', 'GET', 'span', 'string', NULL, \
                {base_ns} + toInt64(number) * {M1_STEP_NS}, \
-               toFixedString(unhex(leftPad(lower(hex(number)), 32, '0')), 16), \
+               toFixedString(unhex(leftPad(lower(hex(intDiv(number, {M1_SPANS_PER_TRACE}))), 32, '0')), 16), \
                toFixedString(unhex(leftPad(lower(hex(number)), 16, '0')), 8), \
                1500000000 \
              FROM numbers({M1_ROWS})"
@@ -1130,7 +1135,7 @@ async fn seed_m1(client: &ChClient, db: &str, base_ns: i64) {
             "INSERT INTO {db}.trace_spans (trace_id, span_id, parent_id, name, service, \
              timestamp_ns, duration_ns, status_code, kind, payload_type, payload, \
              attr_key, attr_scope, attr_val, attr_type, attr_num) SELECT \
-               toFixedString(unhex(leftPad(lower(hex(number)), 32, '0')), 16), \
+               toFixedString(unhex(leftPad(lower(hex(intDiv(number, {M1_SPANS_PER_TRACE}))), 32, '0')), 16), \
                toFixedString(unhex(leftPad(lower(hex(number)), 16, '0')), 8), \
                toFixedString(unhex('0000000000000000'), 8), \
                'op', 'svc', \
@@ -1143,6 +1148,37 @@ async fn seed_m1(client: &ChClient, db: &str, base_ns: i64) {
         ),
     )
     .await;
+}
+
+/// The threads every M1 statement runs on (issue #624, part 3d). The
+/// generator's peak memory over M1 depends on the threads the server
+/// gives it, and the engine sends no `max_threads`, so the tests pin it.
+const M1_MAX_THREADS: u64 = 4;
+
+/// An engine whose statements run as a user, `<db>_m1`, whose settings pin
+/// `max_threads` to [`M1_MAX_THREADS`]. The user is dropped only here,
+/// before it is created: a run leaves it behind, passing or failing, and
+/// the next run's drop clears it. Returns the engine and the user name.
+async fn m1_engine(client: &ChClient, db: &str, ceiling: u64) -> (TraceEngine, String) {
+    let user = format!("{db}_m1");
+    exec(client, &format!("DROP USER IF EXISTS {user}")).await;
+    exec(
+        client,
+        &format!(
+            "CREATE USER {user} IDENTIFIED WITH no_password SETTINGS max_threads = {M1_MAX_THREADS}"
+        ),
+    )
+    .await;
+    exec(client, &format!("GRANT SELECT ON {db}.* TO {user}")).await;
+    let cfg = ChConnConfig {
+        user: user.clone(),
+        ..conn(db)
+    };
+    let engine = TraceEngine::new(
+        ChClient::new(cfg).await.expect("connect (engine)"),
+        engine_config(M1_MAX_CANDIDATES, ceiling),
+    );
+    (engine, user)
 }
 
 fn m1_params(base_ns: i64) -> SearchParams {
@@ -1202,10 +1238,7 @@ async fn the_pushed_aggregate_outgrows_the_ceiling_and_the_fallback_answers() {
     let base = now_ns() - (M1_ROWS as i64) * M1_STEP_NS - 3_600_000_000_000;
     seed_m1(&client, db, base).await;
 
-    let engine = TraceEngine::new(
-        ChClient::new(conn(db)).await.expect("connect (engine)"),
-        engine_config(M1_MAX_CANDIDATES, M1_CEILING_BYTES),
-    );
+    let (engine, _m1_user) = m1_engine(&client, db, M1_CEILING_BYTES).await;
     let p = m1_params(base);
     let plan = plan_for(&engine, r#"{ span.http.method = "GET" } | count() > 0"#, &p);
     assert_eq!(
@@ -1229,7 +1262,7 @@ async fn the_pushed_aggregate_outgrows_the_ceiling_and_the_fallback_answers() {
     assert_eq!(out.traces.len(), 20);
     assert!(
         out.partial,
-        "1,000,000 candidates against a cap of {M1_MAX_CANDIDATES}: the depth bound engaged"
+        "200,000 candidates against a cap of {M1_MAX_CANDIDATES}: the depth bound engaged"
     );
     let entry = explain
         .stages
@@ -1291,10 +1324,7 @@ async fn a_ceiling_below_the_bare_statements_own_peak_still_refuses() {
     let base = now_ns() - (M1_ROWS as i64) * M1_STEP_NS - 3_600_000_000_000;
     seed_m1(&client, db, base).await;
 
-    let engine = TraceEngine::new(
-        ChClient::new(conn(db)).await.expect("connect (engine)"),
-        engine_config(M1_MAX_CANDIDATES, M1_FLOOR_CEILING_BYTES),
-    );
+    let (engine, _m1_user) = m1_engine(&client, db, M1_FLOOR_CEILING_BYTES).await;
     let p = m1_params(base);
     // BOTH statements must breach, and the second half is what makes
     // this the honest boundary rather than a repeat of the withdrawn
@@ -1339,10 +1369,7 @@ async fn the_same_corpus_without_the_pushed_aggregate_answers_two_hundred() {
     let base = now_ns() - (M1_ROWS as i64) * M1_STEP_NS - 3_600_000_000_000;
     seed_m1(&client, db, base).await;
 
-    let engine = TraceEngine::new(
-        ChClient::new(conn(db)).await.expect("connect (engine)"),
-        engine_config(M1_MAX_CANDIDATES, M1_CEILING_BYTES),
-    );
+    let (engine, _m1_user) = m1_engine(&client, db, M1_CEILING_BYTES).await;
     let p = m1_params(base);
     let plan = plan_for(&engine, r#"{ span.http.method = "GET" }"#, &p);
     assert_eq!(
@@ -1354,7 +1381,7 @@ async fn the_same_corpus_without_the_pushed_aggregate_answers_two_hundred() {
     assert_eq!(out.traces.len(), 20);
     assert!(
         out.partial,
-        "1,000,000 candidates against a cap of {M1_MAX_CANDIDATES}: the depth bound engaged"
+        "200,000 candidates against a cap of {M1_MAX_CANDIDATES}: the depth bound engaged"
     );
     exec(&client, &format!("DROP DATABASE IF EXISTS {db}")).await;
 }
