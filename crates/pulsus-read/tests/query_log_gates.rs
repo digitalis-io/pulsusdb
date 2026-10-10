@@ -9309,26 +9309,29 @@ async fn the_group_key_read_agrees_on_every_fixed_body() {
         ),
     ];
     // The design's decided / missing / undecided counts (§6.2; H5B from
-    // revision 8, less its two flat bodies).
+    // revision 8, less its two flat bodies). NAMED6's were re-taken on 26.8
+    // (issue #624, part 3d): there a JSON integer outside `[-2^63, 2^64)`
+    // reads as a string, so its documents, and `{"latency":"1e400"}`, move
+    // from undecided to decided or missing; every answer is unchanged.
     let design_counts = |corpus: &str, form: &str| -> Option<(u64, u64, u64)> {
         let form = form.split(' ').next().unwrap_or(form);
         let named = [
-            ("B", (819, 6, 201)),
-            ("BK", (594, 6, 426)),
+            ("B", (825, 6, 195)),
+            ("BK", (598, 6, 422)),
             ("BU", (0, 6, 1020)),
-            ("BF", (738, 6, 282)),
-            ("BN", (788, 6, 232)),
-            ("T", (909, 12, 105)),
-            ("R", (909, 12, 105)),
-            ("M", (879, 12, 135)),
-            ("P", (9, 943, 74)),
-            ("GBY1", (738, 6, 282)),
-            ("GBY2", (654, 6, 366)),
-            ("GBYS", (819, 6, 201)),
-            ("GBYE", (819, 6, 201)),
+            ("BF", (744, 6, 276)),
+            ("BN", (792, 6, 228)),
+            ("T", (915, 12, 99)),
+            ("R", (915, 12, 99)),
+            ("M", (883, 12, 131)),
+            ("P", (9, 948, 69)),
+            ("GBY1", (744, 6, 276)),
+            ("GBY2", (658, 6, 362)),
+            ("GBYS", (825, 6, 195)),
+            ("GBYE", (825, 6, 195)),
             ("GBU", (0, 6, 1020)),
-            ("GTBY", (879, 12, 135)),
-            ("GTWO", (879, 12, 135)),
+            ("GTBY", (883, 12, 131)),
+            ("GTWO", (883, 12, 131)),
         ];
         let h5b = [
             ("B", (1, 0, 5)),

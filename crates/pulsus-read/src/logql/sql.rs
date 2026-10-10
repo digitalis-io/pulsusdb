@@ -385,8 +385,11 @@ pub fn json_count_columns(
                 UnwrapForm::Bare => unwrap_name_ambiguity(&key.source)?.as_sql().to_string(),
             }
         ));
+        // Issue #624, part 3d: from 26.8 an integer outside
+        // `[-2^63, 2^64)` reads back quoted, as a string; a quoted value of
+        // 19 or more digits is left to today's route.
         w.push(format!(
-            "toUInt8({t}_amb = 0 AND startsWith({t}_r, '\"') AND position({t}_r, {}) = 0) AS {t}_str",
+            "toUInt8({t}_amb = 0 AND startsWith({t}_r, '\"') AND position({t}_r, {}) = 0 AND NOT match({t}_r, '^\"-?[0-9]{{19,}}\"$')) AS {t}_str",
             backslash.as_sql()
         ));
         w.push(format!(
@@ -1991,8 +1994,11 @@ fn unwrapped_reader_columns(
         let src = src.as_sql();
         w.push(format!("JSONExtractRaw(body, {src}) AS {t}_r"));
         w.push(format!("{} AS {t}_amb", ambiguity(&key.source)?));
+        // Issue #624, part 3d: from 26.8 an integer outside
+        // `[-2^63, 2^64)` reads back quoted, as a string; a quoted value of
+        // 19 or more digits is left to today's route.
         w.push(format!(
-            "toUInt8({t}_amb = 0 AND startsWith({t}_r, '\"') AND position({t}_r, {}) = 0) AS {t}_str",
+            "toUInt8({t}_amb = 0 AND startsWith({t}_r, '\"') AND position({t}_r, {}) = 0 AND NOT match({t}_r, '^\"-?[0-9]{{19,}}\"$')) AS {t}_str",
             backslash.as_sql()
         ));
         w.push(format!(
