@@ -11410,3 +11410,78 @@ async fn an_indexed_attribute_reads_only_its_granules_and_answers_as_before() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+/// The peak memory of the one `INSERT INTO spans` statement run in `db`
+/// since `t0_ns`, and how many wide `spans` parts were created there
+/// since then. The logs are flushed until the insert's row is there, for
+/// up to 30 s.
+async fn spans_insert_memory_and_wide_parts(client: &ChClient, db: &str, t0_ns: i64) -> (u64, u64) {
+    let since = format!("toDateTime64({}, 6)", t0_ns as f64 / 1e9);
+    let inserts = format!(
+        "FROM system.query_log WHERE type = 'QueryFinish' AND query_kind = 'Insert' \
+         AND current_database = '{db}' AND startsWith(query, 'INSERT INTO spans ') \
+         AND event_time_microseconds >= {since}"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        client
+            .execute(
+                "SYSTEM FLUSH LOGS",
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("flush the logs");
+        let n = count(client, &format!("SELECT count() AS n {inserts}")).await;
+        if n == 1 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{db}: {n} logged inserts into spans after 30 s, want one"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    let peak = count(
+        client,
+        &format!("SELECT toUInt64(memory_usage) AS n {inserts}"),
+    )
+    .await;
+    let wide = count(
+        client,
+        &format!(
+            "SELECT count() AS n FROM system.part_log WHERE event_type = 'NewPart' \
+             AND database = '{db}' AND table = 'spans' AND part_type = 'Wide' \
+             AND event_time_microseconds >= {since}"
+        ),
+    )
+    .await;
+    (peak, wide)
+}
+
+/// Issue #595 part 2, D8: fixture A's insert with three attribute indexes
+/// writes a wide part, which without adaptive write buffers takes a
+/// buffer per column stream and over four times the unindexed insert's
+/// memory. With them it stays within twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn three_attribute_indexes_keep_the_fixture_a_insert_within_twice_its_unindexed_memory() {
+    skip_unless_live!();
+    let mut got = Vec::new();
+    for (label, attrs) in [("none", &[][..]), ("three", &P2_ATTRS[..])] {
+        let db = pulsus_testkit::test_db(&format!("pulsus_read_it_t595p2_mem_{label}"));
+        let t0 = now_ns();
+        let (client, _) = seed_fixture_a(&db, attrs).await;
+        got.push(spans_insert_memory_and_wide_parts(&client, &db, t0).await);
+        drop_db(&db).await;
+    }
+    let ((plain, plain_wide), (indexed, indexed_wide)) = (got[0], got[1]);
+    assert_eq!(
+        (plain_wide, indexed_wide),
+        (0, 1),
+        "the unindexed insert must write a compact part and the indexed one a wide part"
+    );
+    assert!(
+        indexed <= 2 * plain,
+        "three indexes: {indexed} bytes, more than twice the unindexed {plain}"
+    );
+}

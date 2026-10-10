@@ -1284,3 +1284,18 @@ fn a_refused_list_stops_the_script_before_it_touches_the_server() {
     assert_eq!(out.status.code(), Some(2), "{err}");
     assert!(err.contains("PULSUS_TRACEQL_INDEXED_ATTRIBUTES"), "{err}");
 }
+
+/// Issue #595 part 2, D8: `spans` grows each column stream's write buffers
+/// as needed instead of allocating them whole, in both modes. The
+/// clustered statement has no live run, so this is its only check.
+#[test]
+fn the_span_table_writes_with_adaptive_buffers_in_both_modes() {
+    for (mode, ctx) in [("single", single()), ("clustered", clustered())] {
+        let create = create_of(&ctx, "spans");
+        let settings = line_of(&create, "SETTINGS");
+        assert!(
+            settings.contains("min_columns_to_activate_adaptive_write_buffer = 1"),
+            "{mode}: {settings}"
+        );
+    }
+}
