@@ -48,6 +48,8 @@ const ALLOWLIST: &[(&str, &str, &str, usize, &str)] = &[
      "span-name values read (issue #478) - same class again: outside the search budget by design (no SearchPlan/ByteBudget on this path), hard-bounded by the SQL LIMIT to TAG_VALUES_MAX + 1 rows, each at most the 8192-byte string-column cap"),
     ("exec.rs", "search_inner", "HashMap::", 1,
      "the empty-winners roots arm: HashMap::new() with zero entries - nothing to charge"),
+    ("exec.rs", "new", "Vec::new", 1,
+     "the engine's indexed attributes (issue #595 part 2): an empty Vec::new() at construction, once per engine and never per query - nothing to charge"),
     ("exec.rs", "frame_range_series", "Vec::new", 4,
      "metrics range series/samples (issue #59/#182) - outside the search ByteBudget by design (no SearchPlan on this path); hard-bounded by MAX_METRICS_POINTS + 1 emitted buckets x the series count (grouped series pre-capped by reader.traceql_max_series via the distinct-by-key probe; the quantile series count is the requested quantile list, and since issue #252 the histogram's is data-dependent but hard-bounded by the bit width of Int64 (63 reachable buckets)). Issue #477 split this function out of frame_range so the densify post-pass has its own charge row below; the bound is unchanged"),
     ("exec.rs", "frame_range_series", ".collect", 3,

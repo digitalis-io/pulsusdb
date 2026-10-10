@@ -135,6 +135,7 @@ pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
         log_dedup_window: 10_000,
         trace_landing_retention_hours: 6,
         trace_dedup_window: 10_000,
+        trace_indexed_attributes: Vec::new(),
     };
 
     // Frozen once, for the whole run — see `now_unix_ns`'s doc comment.

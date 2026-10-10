@@ -21,6 +21,7 @@
 //! * [`numbering`] — the search statement's nested-set intrinsics (issue
 //!   #594 part 2).
 
+pub mod attr_index;
 pub mod fetch;
 pub mod numbering;
 pub mod predicate;

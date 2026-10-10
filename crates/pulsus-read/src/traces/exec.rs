@@ -952,6 +952,7 @@ impl Ord for HeapEntry {
 pub struct TraceEngine {
     dispatch: super::dispatch::TraceDispatch,
     config: TraceReadConfig,
+    indexed: Vec<super::spans::attr_index::IndexedAttr>,
 }
 
 impl TraceEngine {
@@ -959,6 +960,7 @@ impl TraceEngine {
         Self {
             dispatch: super::dispatch::TraceDispatch::new(client),
             config,
+            indexed: Vec::new(),
         }
     }
 
@@ -2290,6 +2292,7 @@ impl TraceEngine {
             &self.config.traces_table,
             &self.config.resources_table,
             self.config.max_depth,
+            &self.indexed,
         ) else {
             return self.search_inner(plan, explain).await;
         };

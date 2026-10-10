@@ -1153,6 +1153,7 @@ async fn a_retention_edge_trace_keeps_its_resource_and_per_trace_rows() {
             window: w,
             spans_table: "spans",
             resources_table: "resources",
+            indexed: &[],
         },
     )
     .unwrap_or_else(|e| panic!("{query} must compile: {e}"));

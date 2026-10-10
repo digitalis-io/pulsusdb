@@ -109,7 +109,7 @@ fn side_of(query: &pulsus_traceql::Query, route: &str) -> &'static str {
     };
     match plan_search(query, &params, &ctx) {
         Err(_) => "refused",
-        Ok(plan) => match plan_statement(&plan, "spans", "traces", "resources", 64) {
+        Ok(plan) => match plan_statement(&plan, "spans", "traces", "resources", 64, &[]) {
             Some(_) => "new",
             None => "old",
         },

@@ -88,6 +88,7 @@ fn cluster_ctx(db: &str) -> RenderCtx {
         log_dedup_window: 10_000,
         trace_landing_retention_hours: 6,
         trace_dedup_window: 10_000,
+        trace_indexed_attributes: Vec::new(),
     }
 }
 
@@ -332,7 +333,8 @@ async fn a_numbered_search_answers_over_two_shards() {
 
     // The negative control: the statement, without the setting, is refused.
     let p = plan("{ nestedSetLeft > 0 }", window.0, window.1, 30);
-    let stmt = plan_statement(&p, "spans_dist", "traces_dist", "resources", 64).expect("covered");
+    let stmt =
+        plan_statement(&p, "spans_dist", "traces_dist", "resources", 64, &[]).expect("covered");
     let settings = QuerySettings::clustered_reader(false)
         .set("final", 1)
         .set("do_not_merge_across_partitions_select_final", 1);
