@@ -123,16 +123,11 @@ its own refusal site:
 
 Of the 150 queries it serves, 0
 failed to run and 0 returned an
-answer other than the independent check's. Two limits of the design are stated
-rather than counted, because they are properties of the rules rather than of any
+answer other than the independent check's. One limit of the design is stated
+rather than counted, because it is a property of the rules rather than of any
 query:
 
-1. **A nested-set comparison other than the three shapes §3.2 answers directly**
-   needs two statements (`server-implementation.md` §3.5). No corpus query asks
-   for one: the corpus's three nested-set queries are `nestedSetParent < 0`,
-   `nestedSetLeft > 0` and `nestedSetRight >= 1`, which compile to the root
-   anti-join and to `true`.
-2. **An unscoped read in VALUE position** — inside `select()`, `by()` or a
+1. **An unscoped read in VALUE position** — inside `select()`, `by()` or a
    field-against-field comparison — resolves the span scope and then the
    instrumentation scope, and stops. In predicate position it resolves all five
    scopes in the documented order. A resource, event or link value in value

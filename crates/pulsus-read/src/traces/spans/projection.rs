@@ -32,6 +32,7 @@ use pulsus_traceql::{
     AttrScope, ComparisonOp, Field, FieldExpr, FieldOp, Intrinsic, UnaryOp, Value,
 };
 
+use super::numbering::projected_sql;
 use super::predicate::{
     CHAIN, PredicateCtx, attr_path, chain_presence_in, compile_span_predicate_in, element_index_in,
     element_select_in, resource_value_in,
@@ -41,6 +42,7 @@ use crate::logql::error::ReadError;
 use crate::logql::escape;
 use crate::traces::PlanError;
 use crate::traces::exec::ByteBudget;
+use crate::traces::filter::flip_comparison;
 use crate::traces::search_eval::{GroupValue, ProjectedAttribute};
 use crate::traces::search_plan::WireKey;
 use pulsus_clickhouse::ChError;
@@ -596,6 +598,8 @@ enum Place {
     /// A set: an `event.` or `link.` attribute, the unscoped `.k`, or an
     /// event or link intrinsic.
     Set,
+    /// A nested-set intrinsic: its number (issue #594 part 2).
+    Numbered(Intrinsic),
 }
 
 /// **No wildcard arm**: a new scope or intrinsic decides here.
@@ -626,10 +630,10 @@ fn place_of(field: &Field) -> Place {
             | Intrinsic::EventTimeSinceStart
             | Intrinsic::LinkSpanId
             | Intrinsic::LinkTraceId => Place::Set,
-            Intrinsic::NestedSetParent
-            | Intrinsic::NestedSetLeft
-            | Intrinsic::NestedSetRight
-            | Intrinsic::ChildCount
+            Intrinsic::NestedSetParent | Intrinsic::NestedSetLeft | Intrinsic::NestedSetRight => {
+                Place::Numbered(*intrinsic)
+            }
+            Intrinsic::ChildCount
             | Intrinsic::TraceDuration
             | Intrinsic::RootName
             | Intrinsic::RootServiceName => Place::Envelope,
@@ -711,9 +715,8 @@ fn stored_value(field: &Field, ctx: &PredicateCtx<'_>) -> Result<Projects, PlanE
         (Place::Column(sql), _) => column(sql),
         (Place::Resource, Field::Attribute { key, .. }) => resource_stored(key, ctx)?,
         (Place::Set, _) => first_carrying(field, ctx)?,
-        (Place::Envelope, _) | (Place::Attribute(_) | Place::Resource, Field::Intrinsic(_)) => {
-            Projects::Nothing
-        }
+        (Place::Envelope | Place::Numbered(_), _)
+        | (Place::Attribute(_) | Place::Resource, Field::Intrinsic(_)) => Projects::Nothing,
     })
 }
 
@@ -725,7 +728,7 @@ fn truthiness_value(field: &Field) -> Projects {
         Place::Attribute(_) | Place::Resource => literal("true", "Bool"),
         Place::Set if matches!(field, Field::Attribute { .. }) => literal("true", "Bool"),
         Place::Column(sql) => column(sql),
-        Place::Envelope | Place::Set => Projects::Nothing,
+        Place::Envelope | Place::Set | Place::Numbered(_) => Projects::Nothing,
     }
 }
 
@@ -767,6 +770,25 @@ fn comparison_value(
     match place {
         Place::Column(sql) => return Ok(column(sql)),
         Place::Envelope => return Ok(Projects::Nothing),
+        // A number literal on either side; the operator as the predicate
+        // reads it, field first.
+        Place::Numbered(intrinsic) => {
+            return Ok(match literal_side(field, lhs, rhs) {
+                Some(v) => Projects::Value {
+                    value: projected_sql(
+                        intrinsic,
+                        if matches!(lhs, FieldExpr::Field(_)) {
+                            op
+                        } else {
+                            flip_comparison(op)
+                        },
+                        v,
+                    ),
+                    kind: "'Int64'".to_string(),
+                },
+                None => Projects::Nothing,
+            });
+        }
         Place::Attribute(_) | Place::Resource | Place::Set
             if matches!(op, ComparisonOp::Neq | ComparisonOp::Nre) =>
         {

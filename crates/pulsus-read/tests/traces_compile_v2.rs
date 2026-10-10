@@ -551,7 +551,10 @@ fn t_c4_the_membership_statement_is_frozen_whole() {
 
 /// The intrinsics this compiler serves. Every other `Intrinsic` variant is
 /// #594's and must REFUSE rather than compile something wrong.
-const IN_SCOPE_INTRINSICS: [Intrinsic; 18] = [
+const IN_SCOPE_INTRINSICS: [Intrinsic; 21] = [
+    Intrinsic::NestedSetParent,
+    Intrinsic::NestedSetLeft,
+    Intrinsic::NestedSetRight,
     Intrinsic::TraceDuration,
     Intrinsic::RootName,
     Intrinsic::RootServiceName,
@@ -594,10 +597,10 @@ fn intrinsic_target(intrinsic: Intrinsic) -> Option<&'static str> {
         | Intrinsic::ChildCount
         | Intrinsic::TraceDuration
         | Intrinsic::RootName
-        | Intrinsic::RootServiceName => None,
-        Intrinsic::NestedSetParent | Intrinsic::NestedSetLeft | Intrinsic::NestedSetRight => {
-            Some("#594")
-        }
+        | Intrinsic::RootServiceName
+        | Intrinsic::NestedSetParent
+        | Intrinsic::NestedSetLeft
+        | Intrinsic::NestedSetRight => None,
     }
 }
 
@@ -2530,24 +2533,10 @@ fn t_c27_the_field_against_field_refusals() {
         assert_eq!(refused_in(&expr), want, "{expr} in a context");
     };
 
-    let mut nested_and_trace = 0usize;
-    for intrinsic in Intrinsic::ALL.iter().copied() {
-        if intrinsic_target(intrinsic) != Some("#594") {
-            continue;
-        }
-        nested_and_trace += 1;
-        let want = PlanError::UnsupportedField(format!(
-            "{intrinsic} is not supported by the span-scope predicate compiler yet (issue #594)"
-        ));
-        let f = Field::Intrinsic(intrinsic);
-        check(
-            field_compare_expr(&f, ComparisonOp::Eq, &span_a),
-            want.clone(),
-        );
-        check(field_compare_expr(&span_a, ComparisonOp::Eq, &f), want);
-    }
-    assert_eq!(nested_and_trace, 3);
     for intrinsic in [
+        Intrinsic::NestedSetParent,
+        Intrinsic::NestedSetLeft,
+        Intrinsic::NestedSetRight,
         Intrinsic::TraceDuration,
         Intrinsic::RootName,
         Intrinsic::RootServiceName,
@@ -2569,7 +2558,7 @@ fn t_c27_the_field_against_field_refusals() {
     let event_k = scoped(AttrScope::Event, "k");
     let nested_left = Field::Intrinsic(Intrinsic::NestedSetLeft);
     let nested_refusal = PlanError::UnsupportedField(
-        "nestedSetLeft is not supported by the span-scope predicate compiler yet (issue #594)"
+        "nestedSetLeft as an operand is not supported by the search statement (issue #594)"
             .to_string(),
     );
     check(
@@ -4521,7 +4510,7 @@ fn t_c42_the_limits_and_the_refusals_that_remain() {
     assert_eq!(
         refusal(r#"{ event.a + nestedSetLeft > 1 }"#),
         PlanError::UnsupportedField(
-            "nestedSetLeft is not supported by the span-scope predicate compiler yet (issue #594)"
+            "nestedSetLeft as an operand is not supported by the search statement (issue #594)"
                 .to_string()
         )
     );
@@ -4792,7 +4781,7 @@ fn compile_search_refuses_what_parts_two_and_three_serve() {
         // second `by()`.
         (r#"{ .a = 1 } | by(trace:id)"#, "#592"),
         (r#"{ .a = 1 } | by(span.a) | by(name)"#, "#592"),
-        (r#"{ nestedSetLeft > 0 }"#, "#594"),
+        (r#"{ nestedSetLeft = nestedSetParent }"#, "#594"),
     ] {
         match compile_search_of(query) {
             Err(PlanError::UnsupportedField(msg)) => assert!(
@@ -4954,8 +4943,14 @@ fn the_fork_routes_by_the_plan() {
         r#"{ .a = 1 } | by(.u)"#,
         r#"{ .a = 1 } | by(span.a) | by(name)"#,
         r#"{ .a = 1 } | by(span.a) | coalesce() | by(name)"#,
-        r#"{ nestedSetLeft > 0 }"#,
-        r#"{ nestedSetParent < 0 }"#,
+        r#"{ nestedSetLeft = nestedSetParent }"#,
+        r#"{ nestedSetLeft + 1 > 2 }"#,
+        r#"{ } | by(nestedSetParent)"#,
+        r#"{ nestedSetLeft > 2 } && { nestedSetParent < 0 }"#,
+        r#"{ nestedSetParent < 0 } > { nestedSetLeft > 2 }"#,
+        r#"{ nestedSetLeft > 0 } | by(name)"#,
+        r#"{ } | { nestedSetLeft = 0 } | count() > 1"#,
+        r#"{ nestedSetLeft > 1 && nestedSetRight < 6 }"#,
         r#"{ .a = trace:duration }"#,
         r#"{ span:childCount + 1 > 2 }"#,
         r#"{ event.k = trace:rootName }"#,
@@ -5028,6 +5023,14 @@ fn the_fork_routes_by_the_plan() {
         r#"{ rootName = "x" } | count() > 1"#,
         r#"{ span:childCount < 1 } && { trace:rootService = "a" }"#,
         r#"{ trace:duration > 1s } >> { }"#,
+        // Issue #594 part 2: three inventory rows, and four shapes.
+        r#"{ nestedSetLeft > 0 }"#,
+        r#"{ nestedSetParent < 0 }"#,
+        r#"{ nestedSetRight >= 1 }"#,
+        r#"{ nestedSetLeft > 0 } | select(name)"#,
+        r#"{ nestedSetParent < 0 } && { name = "a" }"#,
+        r#"{ nestedSetParent < 0 } > { }"#,
+        r#"{ nestedSetParent < 0 } | by(name)"#,
     ] {
         if plan_statement(&fork_plan(query), "spans", "traces", "resources", 64, &[]).is_none() {
             wrong.push(format!(
@@ -5088,6 +5091,98 @@ fn one_per_trace_read_serves_every_leaf() {
     assert!(s.sql().contains("per_trace.1"), "{}", s.sql());
     let s = compile_search_of(r#"{ name = "a" }"#).expect("served");
     assert_eq!(count(s.sql(), "FROM traces"), 1, "{}", s.sql());
+}
+
+/// Issue #594 part 2 (`T-A21`): a `nestedSetParent` comparison that holds
+/// for `-1` alone reads no numbering; any other nested-set comparison
+/// reads it, scoped per read.
+#[test]
+fn a_root_comparison_reads_no_numbering() {
+    let count = |sql: &str, needle: &str| sql.matches(needle).count();
+    for query in [
+        "{ nestedSetParent < 0 }",
+        "{ nestedSetParent = -1 }",
+        "{ nestedSetParent <= -0.5 }",
+        "{ 0 > nestedSetParent }",
+    ] {
+        let s = compile_search_of(query).unwrap_or_else(|e| panic!("{query}: {e:?}"));
+        let sql = s.sql();
+        assert!(
+            sql.contains("parent_span_id = toFixedString('', 8)")
+                && !sql.contains("arrayFold")
+                && !sql.contains("RECURSIVE")
+                && !sql.contains("nested_keys"),
+            "{query}: {sql}"
+        );
+    }
+    for query in [
+        "{ nestedSetParent < 1 }",
+        "{ nestedSetLeft > 5 }",
+        "{ nestedSetLeft > 2 && nestedSetParent < 0 }",
+    ] {
+        let s = compile_search_of(query).unwrap_or_else(|e| panic!("{query}: {e:?}"));
+        let sql = s.sql();
+        for needle in [
+            "WITH trace_keys AS nested_keys ",
+            "WITH detail_keys AS nested_keys ",
+            " AS trace_keys,",
+            " AS detail_keys,",
+            " AS nested_values",
+        ] {
+            assert_eq!(count(sql, needle), 1, "{query}: {needle} in {sql}");
+        }
+    }
+    // The numbering groups traces in blocks of 256 (section 4.1).
+    let s = compile_search_of("{ nestedSetLeft > 5 }").expect("served");
+    assert_eq!(
+        s.sql().matches("SETTINGS max_block_size = 256").count(),
+        4,
+        "{}",
+        s.sql()
+    );
+    let s = compile_search_of(r#"{ name = "a" }"#).expect("served");
+    assert!(!s.sql().contains("nested_keys"), "{}", s.sql());
+    // Outside a one-filter search the loop does not slice, so a numbered
+    // comparison is today's engine's.
+    for query in [
+        "{ nestedSetLeft > 2 } && { nestedSetParent < 0 }",
+        "{ nestedSetParent < 0 } > { nestedSetLeft > 2 }",
+        "{ nestedSetLeft > 0 } | by(name)",
+        "{ } | { nestedSetLeft = 0 }",
+        "{ nestedSetLeft > 0 } | count() > 1",
+        "{ nestedSetLeft > 1 && nestedSetRight < 6 }",
+    ] {
+        match compile_search_of(query) {
+            Err(PlanError::UnsupportedField(m)) => assert_eq!(
+                m,
+                "a nested-set comparison that reads the numbering is served by the search \
+                 statement only once, in a one-filter search (issue #594)",
+                "{query}"
+            ),
+            other => panic!("{query}: {:?}", other.map(|s| s.sql().to_string())),
+        }
+    }
+    // A sliced statement numbers the traces that reach its slice.
+    let parsed = pulsus_traceql::parse("{ nestedSetLeft > 5 }").expect("parses");
+    let slice = WindowSql::start_closed_end_open(T_B1_END - 300_000_000_000, T_B1_END);
+    let s = pulsus_read::traces::spans::search::compile_search_sliced(
+        &parsed,
+        &ctx(),
+        "spans",
+        "traces",
+        20,
+        3,
+        64,
+        Some(slice),
+    )
+    .expect("served");
+    assert!(
+        s.sql().contains(
+            "AND last_start_ns >= 1790094546486853637 AND start_ns <= 1790094846486853636))) AS trace_keys"
+        ),
+        "{}",
+        s.sql()
+    );
 }
 
 /// Issue #595 part 2: a filter carries `indexHint(has(<index expression>,

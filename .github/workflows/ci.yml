@@ -2681,6 +2681,17 @@ jobs:
           PULSUS_TEST_CH_CLUSTER: "pulsus_test_cluster"
         run: cargo test -p pulsus-read --test live_metrics_grouped_cluster
 
+      # Issue #594 part 2: a nested-set search over the distributed span and
+      # per-trace tables. The statement reads `spans_dist` inside
+      # `spans_dist` and `traces_dist` inside `traces_dist`, which the
+      # default `distributed_product_mode` refuses; the search sends
+      # `'local'` for it. The negative control pins the refusal (288), the
+      # positive cases the answers over traces split across both shards.
+      - name: Nested-set search over the distributed tables (cluster)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+        run: cargo test -p pulsus-read --test traces_nested_set_cluster
+
       # Issue #507, criterion 19: the extracted-field group key read's one
       # read (L) over the `_dist` tables — L answers where today's route
       # refuses, its 2-minute answer is today's within the summation bound,

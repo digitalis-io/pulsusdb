@@ -2299,7 +2299,7 @@ impl TraceEngine {
         if let Some(out) = self.newest_first(plan, &stmt, &mut explain).await? {
             return Ok(out);
         }
-        let mut settings = with_final(self.search_settings());
+        let mut settings = self.statement_settings(&stmt);
         // Issue #593 part 2: a climb runs `max_depth + 1` levels, the last
         // only to see whether a parent was left; the server's own bound
         // must not end it first.
