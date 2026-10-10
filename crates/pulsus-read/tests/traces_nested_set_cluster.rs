@@ -463,7 +463,11 @@ async fn a_numbered_search_answers_over_two_shards() {
     for (query, numbers, each) in [
         ("{ nestedSetRight - nestedSetLeft = 1 }", false, "[03]"),
         ("{ span:childCount * 1s > duration }", false, "[01, 02]"),
-        ("{ nestedSetLeft > 0 } | count() > 2", false, "[01, 02, 03]"),
+        (
+            "{ nestedSetLeft > 0 } | count() > 2",
+            false,
+            "{int:3 [01, 02, 03]}",
+        ),
         (
             "{ } | select(nestedSetParent)",
             true,

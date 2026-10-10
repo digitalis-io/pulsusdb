@@ -1317,8 +1317,9 @@ pub fn compile_search_sliced(
         demands.push(super::structural::CLIMB_HANDOVER.to_string());
     }
     let sliceable = !structural && matches!(filter, SearchFilter::One(_));
-    // Issue #594 part 2: a comparison that reads the numbering is served
-    // only where the newest-slice loop bounds what the top-K numbers.
+    // Issue #594 parts 2 and 4: a comparison that reads the numbering is
+    // served in every statement; the top-K numbers the slice's traces when
+    // the statement is sliced, the window's otherwise.
     let numbered: usize = filter
         .predicates()
         .iter()

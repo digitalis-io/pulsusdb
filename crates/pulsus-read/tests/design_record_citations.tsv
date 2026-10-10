@@ -217,7 +217,7 @@ docs/query-to-sql.md	crates/pulsus-schema/src/checks.rs:76	crates/pulsus-schema/
 docs/query-to-sql.md	crates/pulsus-server/src/traces_api/error.rs:303	crates/pulsus-server/src/traces_api/error.rs	303		line	BAD_REQUEST	ApiError::Plan(e) => (StatusCode::BAD_REQUEST, e.to_string()),
 docs/query-to-sql.md	crates/pulsus-server/src/traces_api/search_response.rs:428-430	crates/pulsus-server/src/traces_api/search_response.rs	428	430	line	matched	let mut set = json!({ "matched": group.matched, "spans": spans,
 docs/query-to-sql.md	crates/pulsus-server/src/traces_api/search_response.rs:507-512	crates/pulsus-server/src/traces_api/search_response.rs	507	512	line	span_json	"matched": trace.matched, "spans": trace .spans .iter() .map(|span| span_json(span, report)) .collect::<Vec<_>>(),
-docs/query-to-sql.md	crates/pulsus-server/tests/traces_search_live.rs:1467	crates/pulsus-server/tests/traces_search_live.rs	1467		line	attribute	// string-valued attribute (issue #335 Stage B).
+docs/query-to-sql.md	crates/pulsus-server/tests/traces_search_live.rs:1468	crates/pulsus-server/tests/traces_search_live.rs	1468		line	attribute	// string-valued attribute (issue #335 Stage B).
 docs/query-to-sql.md	crates/pulsus-traceql/src/ast.rs:981	crates/pulsus-traceql/src/ast.rs	981		prose	PipelineStage	PipelineStage
 docs/query-to-sql.md	escape.rs:100	crates/pulsus-read/src/logql/escape.rs	100		line	pattern	other => pattern.push(other),
 docs/query-to-sql.md	escape.rs:154-164	crates/pulsus-read/src/logql/escape.rs	154	164	line	clickhouse_match_strategy	// One `^(?:…)$` template occurrence, whatever the strategy — the // issue #240 anchoring guard counts this site and kee
