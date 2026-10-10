@@ -38,6 +38,10 @@ use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySetti
 use pulsus_schema::{RenderCtx, SchemaParams};
 use pulsus_schema_testkit::run_init;
 
+/// From 26.7 `EXPLAIN` defaults to a new layout; every `EXPLAIN` here asks
+/// for the one these assertions read (issue #624, part 3d).
+const EXPLAIN_LAYOUT: &str = "\nSETTINGS explain_query_plan_default = 'legacy'";
+
 /// Corpus size for both EXPLAIN gates — ≥100k per the binding 24.8 finding
 /// on issue #53 (projection selection is data-dependent below that scale).
 const CORPUS_ROWS: u64 = 120_000;
@@ -160,7 +164,7 @@ struct ExplainRow {
 
 /// Collects `EXPLAIN indexes = 1` output as one line per element.
 async fn explain_indexes(client: &ChClient, sql: &str) -> Vec<String> {
-    let explain_sql = format!("EXPLAIN indexes = 1 {sql}");
+    let explain_sql = format!("EXPLAIN indexes = 1 {sql}{EXPLAIN_LAYOUT}");
     let mut stream = client
         .query_stream::<ExplainRow>(&explain_sql, &QuerySettings::new())
         .await
@@ -172,29 +176,43 @@ async fn explain_indexes(client: &ChClient, sql: &str) -> Vec<String> {
     out
 }
 
-/// Parses the LAST `Granules: k/N` line of an `EXPLAIN indexes = 1` plan —
-/// the PrimaryKey section's post-pruning selection (MinMax/Partition
-/// sections precede it).
+/// The granules an `EXPLAIN indexes = 1` plan selects after every index —
+/// the numerator of its LAST `Granules: k/N` line — and the table's
+/// granule total, the denominator of its FIRST. From 26.8 a `Statistics`
+/// block can prune parts before the `PrimaryKey` block, whose own
+/// denominator is then what is left (issue #624, part 3d).
 fn last_granules(plan: &[String]) -> (u64, u64) {
-    let line = plan
+    let ratios: Vec<(u64, u64)> = plan
         .iter()
-        .rev()
-        .find_map(|l| l.trim().strip_prefix("Granules: "))
-        .unwrap_or_else(|| panic!("no Granules line in plan:\n{}", plan.join("\n")));
-    let (k, n) = line.split_once('/').expect("k/N shape");
-    (
-        k.trim().parse().expect("granules selected"),
-        n.trim().parse().expect("granules total"),
-    )
+        .filter_map(|l| l.trim().strip_prefix("Granules: "))
+        .map(|line| {
+            let (k, n) = line.split_once('/').expect("k/N shape");
+            (
+                k.trim().parse().expect("granules selected"),
+                n.trim().parse().expect("granules total"),
+            )
+        })
+        .collect();
+    let (Some(first), Some(last)) = (ratios.first(), ratios.last()) else {
+        panic!("no Granules line in plan:\n{}", plan.join("\n"));
+    };
+    (last.0, first.1)
 }
 
 /// Asserts the plan's `PrimaryKey` `Keys:` list starts with `expected` in
-/// order (the plan prints one key per line under `Keys:`).
+/// order (the plan prints one key per line under `Keys:`). The list read
+/// is the one under the `PrimaryKey` title: from 26.8 a `Statistics` block
+/// with its own `Keys:` can come first.
 fn assert_primary_key_keys(plan: &[String], expected: &[&str]) {
-    let keys_at = plan
+    let block_at = plan
         .iter()
-        .position(|l| l.trim() == "Keys:")
-        .unwrap_or_else(|| panic!("no Keys: section in plan:\n{}", plan.join("\n")));
+        .position(|l| l.trim() == "PrimaryKey")
+        .unwrap_or_else(|| panic!("no PrimaryKey block in plan:\n{}", plan.join("\n")));
+    let keys_at = block_at
+        + plan[block_at..]
+            .iter()
+            .position(|l| l.trim() == "Keys:")
+            .unwrap_or_else(|| panic!("no Keys: section in plan:\n{}", plan.join("\n")));
     for (i, key) in expected.iter().enumerate() {
         let got = plan
             .get(keys_at + 1 + i)

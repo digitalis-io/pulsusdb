@@ -1092,11 +1092,14 @@ async fn duplicate_index_rows_do_not_move_a_pushed_min_max_or_count() {
 const M1_ROWS: u64 = 1_000_000;
 const M1_SPANS: u64 = 64;
 const M1_STEP_NS: i64 = 1_000;
-/// 320 MiB. Measured on ClickHouse 26.3: the pushed statement's grouping
-/// state over corpus M1 peaks at about 534 MB and the unpushed one at
-/// about 193 MB, so this ceiling sits between them and tells the two
-/// apart. It is a fixture value, not the shipped default.
-const M1_CEILING_BYTES: u64 = 335_544_320;
+/// 150 MiB. Measured on ClickHouse 26.8.21.10 (`memory_usage` in
+/// `system.query_log`, issue #624 part 3d): the pushed statement's
+/// grouping state over corpus M1 peaks at 176,299,455 to 182,223,176
+/// bytes over five runs and the unpushed one at 129,310,554 over four, so
+/// this ceiling
+/// sits between them and tells the two apart. It is a fixture value, not
+/// the shipped default.
+const M1_CEILING_BYTES: u64 = 157_286_400;
 const M1_MAX_CANDIDATES: u64 = 1_000;
 /// 16 MiB — below the BARE generator's own peak over corpus M1, whose
 /// `GROUP BY trace_id` holds one aggregation state per distinct trace id

@@ -21,6 +21,10 @@ use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, QuerySettings, Row};
 use pulsus_schema::{RenderCtx, SchemaParams};
 use pulsus_schema_testkit::run_init;
 
+/// From 26.7 `EXPLAIN` defaults to a new layout; every `EXPLAIN` here asks
+/// for the one these assertions read (issue #624, part 3d).
+const EXPLAIN_LAYOUT: &str = "\nSETTINGS explain_query_plan_default = 'legacy'";
+
 /// `true` when the gated half of this suite should run. Skips cleanly on a
 /// developer machine with no container; **panics** rather than skipping when
 /// the gate is absent in a live CI job, so a lost `env:` block reddens the
@@ -361,7 +365,7 @@ async fn metric_hist_samples_explain_shows_series_id_pk_pruning() {
             &format!(
                 "EXPLAIN indexes = 1 SELECT fingerprint, unix_milli, count, sum \
                  FROM {db}.metric_hist_samples \
-                 WHERE fingerprint IN (toUInt128('18374588331335825905'))"
+                 WHERE fingerprint IN (toUInt128('18374588331335825905')){EXPLAIN_LAYOUT}"
             ),
             &QuerySettings::new(),
         )
@@ -381,7 +385,10 @@ async fn metric_hist_samples_explain_shows_series_id_pk_pruning() {
 /// Collects the raw `EXPLAIN indexes = 1` lines for `sql`.
 async fn explain_lines(client: &ChClient, sql: &str) -> Vec<String> {
     let mut stream = client
-        .query_stream::<ExplainRow>(&format!("EXPLAIN indexes = 1 {sql}"), &QuerySettings::new())
+        .query_stream::<ExplainRow>(
+            &format!("EXPLAIN indexes = 1 {sql}{EXPLAIN_LAYOUT}"),
+            &QuerySettings::new(),
+        )
         .await
         .unwrap_or_else(|e| panic!("EXPLAIN failed: {e}\nSQL:\n{sql}"));
     let mut out = Vec::new();

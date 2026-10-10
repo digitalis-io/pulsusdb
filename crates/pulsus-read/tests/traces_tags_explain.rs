@@ -47,6 +47,10 @@ use pulsus_read::{TAG_NAMES_MAX, TAG_VALUES_MAX, TraceEngine, TraceReadConfig};
 use pulsus_schema::{RenderCtx, SchemaParams};
 use pulsus_schema_testkit::run_init;
 
+/// From 26.7 `EXPLAIN` defaults to a new layout; every `EXPLAIN` here asks
+/// for the one these assertions read (issue #624, part 3d).
+const EXPLAIN_LAYOUT: &str = "\nSETTINGS explain_query_plan_default = 'legacy'";
+
 /// `true` when the gated half of this suite should run. Skips cleanly on a
 /// developer machine with no container; **panics** rather than skipping when
 /// the gate is absent in a live CI job, so a lost `env:` block reddens the
@@ -147,7 +151,7 @@ struct ExplainRow {
 }
 
 async fn explain_raw(client: &ChClient, sql: &str) -> String {
-    let full = format!("EXPLAIN indexes = 1 {sql}");
+    let full = format!("EXPLAIN indexes = 1 {sql}{EXPLAIN_LAYOUT}");
     let mut out = String::new();
     let mut stream = client
         .query_stream::<ExplainRow>(&full, &QuerySettings::new())
@@ -165,7 +169,7 @@ async fn explain_raw(client: &ChClient, sql: &str) -> String {
 /// The `PrimaryKey` block's `Granules: k/N` ratio (panics with the raw
 /// text when absent — the `traces_search_explain.rs` idiom).
 fn primary_key_granules(raw: &str) -> (u64, u64) {
-    const BLOCK_TITLES: &[&str] = &["MinMax", "Partition", "PrimaryKey", "Skip"];
+    const BLOCK_TITLES: &[&str] = &["Min-Max", "Partition", "Statistics", "PrimaryKey", "Skip"];
     let mut in_pk = false;
     for line in raw.lines() {
         let trimmed = line.trim();
@@ -861,7 +865,7 @@ fn read_source(raw: &str) -> String {
 
 /// The PrimaryKey block's `Condition:` line.
 fn primary_key_condition(raw: &str) -> String {
-    const BLOCK_TITLES: &[&str] = &["MinMax", "Partition", "PrimaryKey", "Skip"];
+    const BLOCK_TITLES: &[&str] = &["Min-Max", "Partition", "Statistics", "PrimaryKey", "Skip"];
     let mut in_pk = false;
     for line in raw.lines() {
         let trimmed = line.trim();

@@ -79,6 +79,10 @@ use pulsus_read::{SearchPlan, TraceEngine, TraceReadConfig};
 use pulsus_schema::{RenderCtx, SchemaParams};
 use pulsus_schema_testkit::run_init;
 
+/// From 26.7 `EXPLAIN` defaults to a new layout; every `EXPLAIN` here asks
+/// for the one these assertions read (issue #624, part 3d).
+const EXPLAIN_LAYOUT: &str = "\nSETTINGS explain_query_plan_default = 'legacy'";
+
 /// `true` when the gated half of this suite should run. Skips cleanly on a
 /// developer machine with no container; **panics** rather than skipping when
 /// the gate is absent in a live CI job, so a lost `env:` block reddens the
@@ -255,7 +259,10 @@ async fn explain_raw(client: &ChClient, sql: &str) -> String {
     // The engine doubles literal `?` at its own execution boundary
     // (`escape_query_placeholders`); this raw EXPLAIN path must apply the
     // same driver-quirk fix for regex generators (`(?:` patterns).
-    let full = format!("EXPLAIN indexes = 1 {}", sql.replace('?', "??"));
+    let full = format!(
+        "EXPLAIN indexes = 1 {}{EXPLAIN_LAYOUT}",
+        sql.replace('?', "??")
+    );
     let mut out = String::new();
     let mut stream = client
         .query_stream::<ExplainRow>(&full, &QuerySettings::new())
@@ -291,7 +298,7 @@ async fn explain_pipeline_raw(client: &ChClient, sql: &str) -> String {
 /// The `PrimaryKey` block's `Granules: k/N` ratio (panics with the raw
 /// text when absent — same idiom as `traces_point_read.rs`).
 fn primary_key_granules(raw: &str) -> (u64, u64) {
-    const BLOCK_TITLES: &[&str] = &["MinMax", "Partition", "PrimaryKey", "Skip"];
+    const BLOCK_TITLES: &[&str] = &["Min-Max", "Partition", "Statistics", "PrimaryKey", "Skip"];
     let mut in_pk = false;
     for line in raw.lines() {
         let trimmed = line.trim();
@@ -315,7 +322,7 @@ fn primary_key_granules(raw: &str) -> (u64, u64) {
 /// A named `Skip` index block's `Granules: k/N` ratio — used for the
 /// `idx_duration` minmax reduction gate.
 fn skip_index_granules(raw: &str, index_name: &str) -> (u64, u64) {
-    const BLOCK_TITLES: &[&str] = &["MinMax", "Partition", "PrimaryKey", "Skip"];
+    const BLOCK_TITLES: &[&str] = &["Min-Max", "Partition", "Statistics", "PrimaryKey", "Skip"];
     let mut in_skip = false;
     let mut named = false;
     for line in raw.lines() {
@@ -518,7 +525,7 @@ async fn attr_value_reads_keep_their_index_selection(
     /// `EXPLAIN indexes = 1` render, with the SELECT list dropped — the
     /// part index selection is decided by.
     fn index_blocks(raw: &str) -> String {
-        const BLOCK_TITLES: &[&str] = &["MinMax", "Partition", "PrimaryKey", "Skip"];
+        const BLOCK_TITLES: &[&str] = &["Min-Max", "Partition", "Statistics", "PrimaryKey", "Skip"];
         let mut out = String::new();
         let mut inside = false;
         for line in raw.lines() {
@@ -3925,7 +3932,7 @@ async fn the_pushdown_keeps_the_generators_index_selection(
     /// `EXPLAIN indexes = 1` render — what part and granule selection is
     /// decided by.
     fn index_blocks(raw: &str) -> String {
-        const BLOCK_TITLES: &[&str] = &["MinMax", "Partition", "PrimaryKey", "Skip"];
+        const BLOCK_TITLES: &[&str] = &["Min-Max", "Partition", "Statistics", "PrimaryKey", "Skip"];
         let mut out = String::new();
         let mut inside = false;
         for line in raw.lines() {

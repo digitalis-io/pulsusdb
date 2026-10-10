@@ -810,8 +810,11 @@ fn bits_sql(pattern: &str) -> String {
     // `match` half is the literal the read path actually renders, which
     // since issue #324 is not the same text (`(?-s)` prefix). Comparing
     // them is the whole point: the fix has to make ClickHouse's wrapper
-    // agree with RE2's own reading of what the user wrote.
-    let anchored = sql_literal(&format!("^(?:{pattern})$"));
+    // agree with RE2's own reading of what the user wrote. From 26.8
+    // `replaceRegexpOne` reads `.` as matching `\n`, which RE2 by default
+    // does not, so the reference half asks for RE2's default with `(?-s)`
+    // (issue #624, part 3d).
+    let anchored = sql_literal(&format!("(?-s)^(?:{pattern})$"));
     let rendered = rendered_sql_pattern(pattern);
     let mut parts: Vec<String> = Vec::with_capacity(SUBJECTS.len() * 2);
     for subject in SUBJECTS {

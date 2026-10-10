@@ -36,6 +36,10 @@ use pulsus_read::{GraphWindow, ServiceGraph, TraceEngine, TraceReadConfig, servi
 use pulsus_schema::{RenderCtx, SchemaParams};
 use pulsus_schema_testkit::run_init;
 
+/// From 26.7 `EXPLAIN` defaults to a new layout; every `EXPLAIN` here asks
+/// for the one these assertions read (issue #624, part 3d).
+const EXPLAIN_LAYOUT: &str = "\nSETTINGS explain_query_plan_default = 'legacy'";
+
 /// `true` when the gated half of this suite should run. Skips cleanly on a
 /// developer machine with no container; **panics** rather than skipping when
 /// the gate is absent in a live CI job, so a lost `env:` block reddens the
@@ -137,7 +141,7 @@ struct ExplainRow {
 }
 
 async fn explain_indexes(client: &ChClient, sql: &str) -> String {
-    let full = format!("EXPLAIN indexes = 1 {sql}");
+    let full = format!("EXPLAIN indexes = 1 {sql}{EXPLAIN_LAYOUT}");
     let mut out = String::new();
     let mut stream = client
         .query_stream::<ExplainRow>(&full, &QuerySettings::new())
@@ -162,7 +166,7 @@ fn selected_parts(raw: &str) -> u64 {
 
 /// The single `PrimaryKey` `Granules: k/N` ratio of a single-table plan.
 fn primary_key_granules(raw: &str) -> (u64, u64) {
-    const TITLES: &[&str] = &["MinMax", "Partition", "PrimaryKey", "Skip"];
+    const TITLES: &[&str] = &["Min-Max", "Partition", "Statistics", "PrimaryKey", "Skip"];
     let mut in_pk = false;
     for line in raw.lines() {
         let t = line.trim();
