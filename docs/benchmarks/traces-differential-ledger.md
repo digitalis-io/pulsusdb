@@ -828,6 +828,26 @@ when we are asking it to slow down, so we keep `429`; recorded as
   asserts each of the five facts above individually, so the entry cannot
   be satisfied by existing.
 
+- **Closed on the search route** (issue #594 part 2): the search statement
+  answers the measurement's query the reference's way — its root test is
+  `parent_span_id` empty — so the split no longer exists for this query.
+
+### `traceql-nestedset-sibling-order` (issue #594) — **siblings in start order, not in the reference's stored order**
+
+- **What.** `nestedSetLeft`, `nestedSetRight` and `nestedSetParent` tour a
+  span's children, and a trace's roots, in `(start_ns, span_id)` order. The
+  reference tours them in the order of its stored block: as pushed for a trace
+  stored from one push, and after a combine by resource, then scope, then
+  `(start, span id)` within a scope, with merged batches appended — read in
+  the reference's source.
+- **Which side is right: the reference**, by the parity mandate.
+- **Why it is not matched.** Neither the push order nor a trace's combine
+  history is stored here, and the reference's own numbers change when a block is
+  combined again.
+- **Effect.** Where the two orders differ, `left` and `right` of the later
+  subtrees, and `parent` of their children, differ. The rule for which spans are
+  numbered — the reference's — is the same on both sides.
+
 ### `traceql-differential-legs-skip-green-on-a-missing-endpoint` (issue #458) — **CLOSED against every accidental form; a deliberate bypass is still possible (issue #523)**
 
 - **What.** Reference-facing differential suites that read the URL of the
