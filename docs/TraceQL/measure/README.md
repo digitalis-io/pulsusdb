@@ -357,7 +357,7 @@ directory and every port bound to the loopback address:
 # the design's store: user_files_path must be $WORK, so file('g1/spans.jsonl') resolves
 podman run -d --name <ch> --network <net> -p 127.0.0.1:<port>:8123 \
   -v $WORK:/corpus:ro -v <conf>/tqd.xml:/etc/clickhouse-server/config.d/tqd.xml:ro \
-  -e CLICKHOUSE_DO_NOT_CHOWN=1 clickhouse/clickhouse-server:26.3
+  -e CLICKHOUSE_DO_NOT_CHOWN=1 clickhouse/clickhouse-server:26.8.21.10
 # tqd.xml sets <user_files_path>/corpus/</user_files_path> and listen_host 0.0.0.0
 
 # the reference, at the build deploy/e2e/compose.single.yaml pins, with reference.yaml

@@ -365,3 +365,119 @@ impl Drop for ScopedDb {
         }
     }
 }
+
+/// The database each spawned server writes to, by its port, so a push
+/// helper that knows only the port can wait for the data it pushed
+/// (issue #624, part 3d). Each suite's spawn helper registers its server.
+static PUSH_TARGETS: std::sync::Mutex<Vec<(u16, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// Records that the server on `port` writes to `db`.
+pub fn register_push_target(port: u16, db: &str) {
+    let mut targets = PUSH_TARGETS.lock().expect("the push-target registry");
+    targets.retain(|(p, _)| *p != port);
+    targets.push((port, db.to_string()));
+}
+
+/// After a trace push to the server on `port` is acknowledged, waits until
+/// every table its landing block feeds holds the push (issue #624, part
+/// 3d).
+///
+/// **Why.** A trace push is acknowledged once the old path's tables hold
+/// it; the landing block, which feeds `spans`, `traces`, `resources`,
+/// `tag_names`, `tag_values` and the other derived tables through their
+/// views, carries no waiter (`crates/pulsus-write/src/writer/trace.rs`).
+/// A route that reads those tables right after the acknowledgement may
+/// not see the push yet. Writes not being readable the instant they are
+/// acknowledged is a known, deferred property; a test does not assume
+/// otherwise.
+///
+/// **What it waits for.** Both, in one poll:
+///
+/// * every `(trace_id, span_id)` the push carried is in `spans`, so the
+///   landing insert that carries them has started writing; and
+/// * no insert into `trace_landing` is running in the test's database
+///   (`system.processes`), so that insert has ended.
+///
+/// The views run inside the landing `INSERT`, and each view's target
+/// commits its part on its own: measured on 26.8.21.10 with a source
+/// table and two views, the second sleeping a second per row, the first
+/// target held all 3 rows while the second held 0 for three seconds,
+/// with the insert still listed in `system.processes`; in the first poll
+/// after it left the list, both held all 3. So the pairs alone do not
+/// show that the other tables the routes read hold the push; the two
+/// together do, for every table the landing block feeds.
+///
+/// Polls every 200 ms for at most 10 s. A push whose data never arrives
+/// (the product may drop it) ends the wait at the limit and the test's own
+/// assertions decide; the wait never fails a test by itself.
+pub fn settle_pushed_spans(port: u16, keys: &[(Vec<u8>, Vec<u8>)], ctx: &str) {
+    let mut pairs: Vec<String> = keys
+        .iter()
+        .map(|(t, s)| format!("('{}', '{}')", hex_upper(t), hex_upper(s)))
+        .collect();
+    pairs.sort_unstable();
+    pairs.dedup();
+    if pairs.is_empty() {
+        return;
+    }
+    let db = PUSH_TARGETS
+        .lock()
+        .expect("the push-target registry")
+        .iter()
+        .find(|(p, _)| *p == port)
+        .map(|(_, d)| d.clone())
+        .unwrap_or_else(|| panic!("{ctx}: no database registered for port {port}"));
+    let want = pairs.len() as u64;
+    // `<pairs in spans>,<landing inserts running>`.
+    let sql = format!(
+        "SELECT assumeNotNull(concat(toString((SELECT count() FROM (SELECT DISTINCT trace_id, span_id \
+         FROM {db}.spans WHERE (hex(trace_id), hex(span_id)) IN ({})))), ',', \
+         toString((SELECT count() FROM system.processes WHERE query_kind = 'Insert' \
+         AND position(query, 'trace_landing') > 0 \
+         AND (current_database = '{db}' OR position(query, '{db}.') > 0))))) AS s",
+        pairs.join(", ")
+    );
+    let ctx = ctx.to_string();
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build a current-thread runtime")
+            .block_on(async move {
+                let client = ChClient::new(conn_config(&db))
+                    .await
+                    .expect("connect to the test database");
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                loop {
+                    let answer = client
+                        .query_strings(&sql, &QuerySettings::new())
+                        .await
+                        .unwrap_or_else(|e| panic!("{ctx}: {sql}: {e}"))
+                        .into_iter()
+                        .next()
+                        .unwrap_or_default();
+                    let (got, running) = answer
+                        .split_once(',')
+                        .and_then(|(g, r)| Some((g.parse::<u64>().ok()?, r.parse::<u64>().ok()?)))
+                        .unwrap_or((0, 0));
+                    if got >= want && running == 0 {
+                        return;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        eprintln!(
+                            "{ctx}: after 10 s, {got} of {want} pushed spans in `spans`, \
+                             {running} landing inserts running"
+                        );
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            });
+    })
+    .join()
+    .expect("the settle thread");
+}
+
+fn hex_upper(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02X}")).collect()
+}

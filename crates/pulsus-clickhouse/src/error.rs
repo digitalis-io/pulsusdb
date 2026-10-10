@@ -572,7 +572,7 @@ mod tests {
     ///
     /// # Provenance, replayable without cargo
     ///
-    /// All three against `clickhouse/clickhouse-server:24.8` (24.8.14.39) on
+    /// All three against server 24.8 (24.8.14.39) on
     /// `localhost:8123`. Only the first reproduces; the other two are the ways
     /// to miss it, so the next reader can land on either side deliberately.
     ///

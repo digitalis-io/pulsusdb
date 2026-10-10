@@ -218,6 +218,7 @@ fn spawn_ready(port: u16, db: &ScopedDb) -> ChildGuard {
     // does not exist: build it with `schema/schema.sh`" and `/ready` never
     // reaches 200. Idempotent, so repeated spawns cost one no-op render.
     live_db::build_schema_blocking(db);
+    live_db::register_push_target(port, db);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_pulsusdb"));
     cmd.env("PULSUS_HOST", "127.0.0.1")
         .env("PULSUS_PORT", port.to_string())
@@ -360,6 +361,18 @@ fn ingest(port: u16, service: &str, spans: Vec<Span>, ctx: &str) {
         "{ctx}: sync ingest must succeed, body {:?}",
         String::from_utf8_lossy(&res.body)
     );
+    live_db::settle_pushed_spans(port, &pushed_keys(&req), ctx);
+}
+
+/// The `(trace_id, span_id)` of every span `req` carries, for
+/// [`live_db::settle_pushed_spans`].
+fn pushed_keys(req: &ExportTraceServiceRequest) -> Vec<(Vec<u8>, Vec<u8>)> {
+    req.resource_spans
+        .iter()
+        .flat_map(|r| r.scope_spans.iter())
+        .flat_map(|s| s.spans.iter())
+        .map(|s| (s.trace_id.clone(), s.span_id.clone()))
+        .collect()
 }
 
 /// Seeds fixture B: g0 under `gw`, b1-b4 under `checkout`, all in one
@@ -817,6 +830,7 @@ fn spawn_ready_with_env(port: u16, db: &ScopedDb, extra: &[(&str, &str)]) -> Chi
     // does not exist: build it with `schema/schema.sh`" and `/ready` never
     // reaches 200. Idempotent, so repeated spawns cost one no-op render.
     live_db::build_schema_blocking(db);
+    live_db::register_push_target(port, db);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_pulsusdb"));
     cmd.env("PULSUS_HOST", "127.0.0.1")
         .env("PULSUS_PORT", port.to_string())
@@ -1469,6 +1483,7 @@ fn push(port: u16, resource_spans: Vec<ResourceSpans>, ctx: &str) {
         "{ctx}: sync ingest must succeed, body {:?}",
         String::from_utf8_lossy(&res.body)
     );
+    live_db::settle_pushed_spans(port, &pushed_keys(&req), ctx);
 }
 
 /// The v2 envelope's field 1, as a `TracesData`, plus the request's own
@@ -4331,6 +4346,7 @@ async fn the_route_answers_f1_to_f20_on_the_worked_fixture() {
             "push {i}: {:?}",
             String::from_utf8_lossy(&res.body)
         );
+        live_db::settle_pushed_spans(port, &pushed_keys(&body), &format!("push {i}"));
     }
     let mut wrong = Vec::new();
     for (case, q, want) in F_CASES {

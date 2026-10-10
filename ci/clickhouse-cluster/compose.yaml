@@ -6,8 +6,8 @@
 # existing `xtask/docker/docker-compose.ch.yml` convention. CI uses the
 # runner's docker; local runs use podman.
 #
-# Both images below are 26.3.38.2, pinned by digest. The reason is in
-# `.github/workflows/ci.yml`, above its "Start ClickHouse 26.3" step.
+# Both images below are 26.8.21.10, pinned by digest. The reason is in
+# `.github/workflows/ci.yml`, above its "Start ClickHouse 26.8" step.
 #
 # Bring up:
 #   podman-compose -f ci/clickhouse-cluster/compose.yaml up -d
@@ -31,7 +31,7 @@ networks:
 
 services:
   keeper:
-    image: docker.io/clickhouse/clickhouse-keeper@sha256:e9ca270ad171e6fc55f2416916d4d581a7d7ad7242504a58fc6dedc1be91ab03
+    image: docker.io/clickhouse/clickhouse-keeper@sha256:112ce72cf0ad4c48b5884159d40c4821914c06e3df3e73da61a5b69398960c63
     container_name: pulsus-keeper-it
     networks:
       pulsus-schema-it:
@@ -47,7 +47,7 @@ services:
       retries: 30
 
   ch-shard1:
-    image: docker.io/clickhouse/clickhouse-server@sha256:e6b2c8a8146ad052062ca38bee3b29f9c20b2bfab7aa0720b10b201b202bf83a
+    image: docker.io/clickhouse/clickhouse-server@sha256:d3fd302416d9523d5d64239d5713d1c16c20ecea2045ac70d7e941b376cb266e
     container_name: pulsus-ch-shard1-it
     networks:
       pulsus-schema-it:
@@ -73,7 +73,7 @@ services:
         hard: 262144
 
   ch-shard2:
-    image: docker.io/clickhouse/clickhouse-server@sha256:e6b2c8a8146ad052062ca38bee3b29f9c20b2bfab7aa0720b10b201b202bf83a
+    image: docker.io/clickhouse/clickhouse-server@sha256:d3fd302416d9523d5d64239d5713d1c16c20ecea2045ac70d7e941b376cb266e
     container_name: pulsus-ch-shard2-it
     networks:
       pulsus-schema-it:

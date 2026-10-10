@@ -48,7 +48,7 @@ directory is empty in the base image (nothing baked-in to lose by
 mounting over it). Boot-proven: `podman run --read-only --tmpfs /tmp
 --tmpfs /var/lib/clickhouse --tmpfs /var/log/clickhouse-server --tmpfs
 /etc/clickhouse-server/users.d --user 101:101 -e
-CLICKHOUSE_PASSWORD=... clickhouse/clickhouse-server:26.3.17` reaches
+CLICKHOUSE_PASSWORD=... clickhouse/clickhouse-server:26.8.21.10` (measured on server 26.3.17) reaches
 `/ping` 200 and accepts authenticated queries with the set password, and
 the same run WITHOUT the `users.d` tmpfs still exits 1 with
 `/entrypoint.sh: line 122: /etc/clickhouse-server/users.d/default-user.xml:

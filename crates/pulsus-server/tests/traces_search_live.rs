@@ -15,7 +15,7 @@
 //! Gated behind `PULSUS_TEST_CLICKHOUSE=1`. Run locally:
 //!
 //! ```text
-//! podman run -d --rm --name pulsus-ch-test -p 19123:8123 clickhouse/clickhouse-server:26.3
+//! podman run -d --rm --name pulsus-ch-test -p 19123:8123 clickhouse/clickhouse-server:26.8.21.10
 //! PULSUS_TEST_CLICKHOUSE=1 cargo test -p pulsus-server --test traces_search_live
 //! podman rm -f pulsus-ch-test
 //! ```
@@ -239,6 +239,7 @@ fn spawn_ready(port: u16, db: &str, extra_env: &[(&str, &str)]) -> ChildGuard {
     // does not exist: build it with `schema/schema.sh`" and `/ready` never
     // reaches 200. Idempotent, so repeated spawns cost one no-op render.
     live_db::build_schema_blocking(db);
+    live_db::register_push_target(port, db);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_pulsusdb"));
     cmd.env("PULSUS_HOST", "127.0.0.1")
         .env("PULSUS_PORT", port.to_string())
@@ -349,9 +350,10 @@ fn span(
     }
 }
 
-/// Seeds `spans` through `POST /v1/traces` (sync — a `200` means the
-/// rows are flushed and read-visible) with the given resource attrs
-/// (always including `service.name=checkout` unless overridden).
+/// Seeds `spans` through `POST /v1/traces` with the given resource attrs
+/// (always including `service.name=checkout` unless overridden). A `200`
+/// means the old path's tables hold the rows; the helper then waits for
+/// them in the landing-fed tables ([`live_db::settle_pushed_spans`]).
 fn ingest(port: u16, spans: Vec<Span>, resource_attrs: Vec<KeyValue>, ctx: &str) {
     let req = ExportTraceServiceRequest {
         resource_spans: vec![ResourceSpans {
@@ -386,6 +388,18 @@ fn ingest(port: u16, spans: Vec<Span>, resource_attrs: Vec<KeyValue>, ctx: &str)
         "{ctx}: sync ingest must succeed, body {:?}",
         String::from_utf8_lossy(&res.body)
     );
+    live_db::settle_pushed_spans(port, &pushed_keys(&req), ctx);
+}
+
+/// The `(trace_id, span_id)` of every span `req` carries, for
+/// [`live_db::settle_pushed_spans`].
+fn pushed_keys(req: &ExportTraceServiceRequest) -> Vec<(Vec<u8>, Vec<u8>)> {
+    req.resource_spans
+        .iter()
+        .flat_map(|r| r.scope_spans.iter())
+        .flat_map(|s| s.spans.iter())
+        .map(|s| (s.trace_id.clone(), s.span_id.clone()))
+        .collect()
 }
 
 fn checkout_resource() -> Vec<KeyValue> {
@@ -3523,6 +3537,7 @@ async fn an_unscoped_condition_reaches_five_attribute_scopes_and_no_intrinsic_on
         "ingest body {:?}",
         String::from_utf8_lossy(&res.body)
     );
+    live_db::settle_pushed_spans(port, &pushed_keys(&req), "the five-scope ingest");
 
     for (q, expected, ctx) in [
         (

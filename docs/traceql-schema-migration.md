@@ -3574,12 +3574,14 @@ repository-relative.
 
 **`:567-572`**
 
+The image line (`:571`) is shown at today's floor; the source quoted here pinned server 26.3.
+
 ```yaml
   567        - name: Start ClickHouse 26.3
   568          run: |
   569            docker run -d --name pulsus-ch-schema-it -p 19123:8123 -p 19000:9000 \
   570              -v "$GITHUB_WORKSPACE"/ci/clickhouse-cluster/users.d/network.xml:/etc/clickhouse-server/users.d/zz-network.xml:ro \
-  571              clickhouse/clickhouse-server:26.3
+  571              clickhouse/clickhouse-server:26.8.21.10
   572            for _ in $(seq 1 30); do
 ```
 

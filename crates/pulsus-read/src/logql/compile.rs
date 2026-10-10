@@ -258,12 +258,13 @@ impl Lang for Lql {
         rel.source_ref()
     }
 
-    /// A fingerprint renders as an unsigned decimal inside an `IN (…)`
-    /// list: at most 20 digits plus `", "`, and one AST element per
-    /// literal. The 32-byte constant is the `fingerprint IN ()` frame.
+    /// A fingerprint renders inside an `IN (…)` list as
+    /// `toUInt128('<up to 39 digits>')` plus `", "`, at most 54 bytes, and
+    /// one AST element per literal. The 32-byte constant is the
+    /// `fingerprint IN ()` frame.
     fn handoff_cost(n: u64) -> HandoffCost {
         HandoffCost {
-            text_bytes: 32 + n * 22,
+            text_bytes: 32 + n * 54,
             ast_elements: 4 + n,
         }
     }
@@ -2434,5 +2435,24 @@ mod tests {
             keys: vec!["level".to_string()],
         });
         assert_eq!(rel.grouping.as_ref().map(|g| g.keys.len()), Some(1));
+    }
+
+    /// **T3 (issue #624, part 3d-3): the handoff cost bounds the text it
+    /// stands for.** A fingerprint renders as `toUInt128('<up to 39
+    /// digits>')` and `", "`.
+    #[test]
+    fn handoff_cost_bounds_the_rendered_fingerprint_list() {
+        use crate::compile::fold::Lang;
+        for n in [0usize, 1, 2, 500] {
+            let fps = vec![pulsus_model::Fingerprint::from_raw(u128::MAX).sql_literal(); n];
+            let rendered = format!("fingerprint IN ({})", crate::logql::sql::fp_list(&fps));
+            let cost = Lql::handoff_cost(n as u64);
+            assert!(
+                cost.text_bytes >= rendered.len() as u64,
+                "n = {n}: {} bytes counted, {} rendered",
+                cost.text_bytes,
+                rendered.len()
+            );
+        }
     }
 }

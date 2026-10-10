@@ -29,7 +29,7 @@
 //!
 //! ```text
 //! podman run -d --rm --name pulsus-ch-test -p 19123:8123 -p 19000:9000 \
-//!     clickhouse/clickhouse-server:26.3
+//!     clickhouse/clickhouse-server:26.8.21.10
 //! PULSUS_TEST_CLICKHOUSE=1 cargo test -p pulsus-read --test query_log_gates
 //! podman rm -f pulsus-ch-test
 //! ```
@@ -2204,7 +2204,8 @@ async fn seed_metric_series_472(
                hours        SimpleAggregateFunction(groupBitOr, UInt32)\
              ) ENGINE = AggregatingMergeTree \
              PARTITION BY day \
-             ORDER BY (org_id, fingerprint)"
+             ORDER BY (org_id, fingerprint) \
+             SETTINGS allow_dimensions_outside_sorting_key = 1"
         ),
         format!(
             "CREATE TABLE {db}.{labels} (\
@@ -2215,7 +2216,8 @@ async fn seed_metric_series_472(
                first_seen   SimpleAggregateFunction(min, Int64) CODEC(ZSTD(1)), \
                last_seen    SimpleAggregateFunction(max, Int64) CODEC(ZSTD(1))\
              ) ENGINE = AggregatingMergeTree \
-             ORDER BY (org_id, metric_name, fingerprint)"
+             ORDER BY (org_id, metric_name, fingerprint) \
+             SETTINGS allow_dimensions_outside_sorting_key = 1"
         ),
         format!(
             "INSERT INTO {db}.{table} (day, fingerprint, metric_name, hours) \
@@ -4912,7 +4914,7 @@ struct SumRow {
 /// summations are the same summation and agree bit for bit.
 ///
 /// **They do not agree, at any of the three sizes**, measured on
-/// `clickhouse/clickhouse-server:26.3` (server 26.3.29.7):
+/// server 26.3 (26.3.29.7):
 ///
 /// ```text
 ///  N        ours                 the database         ULPs   |diff|      bound
@@ -9307,26 +9309,29 @@ async fn the_group_key_read_agrees_on_every_fixed_body() {
         ),
     ];
     // The design's decided / missing / undecided counts (§6.2; H5B from
-    // revision 8, less its two flat bodies).
+    // revision 8, less its two flat bodies). NAMED6's were re-taken on 26.8
+    // (issue #624, part 3d): there a JSON integer outside `[-2^63, 2^64)`
+    // reads as a string, so its documents, and `{"latency":"1e400"}`, move
+    // from undecided to decided or missing; every answer is unchanged.
     let design_counts = |corpus: &str, form: &str| -> Option<(u64, u64, u64)> {
         let form = form.split(' ').next().unwrap_or(form);
         let named = [
-            ("B", (819, 6, 201)),
-            ("BK", (594, 6, 426)),
+            ("B", (825, 6, 195)),
+            ("BK", (598, 6, 422)),
             ("BU", (0, 6, 1020)),
-            ("BF", (738, 6, 282)),
-            ("BN", (788, 6, 232)),
-            ("T", (909, 12, 105)),
-            ("R", (909, 12, 105)),
-            ("M", (879, 12, 135)),
-            ("P", (9, 943, 74)),
-            ("GBY1", (738, 6, 282)),
-            ("GBY2", (654, 6, 366)),
-            ("GBYS", (819, 6, 201)),
-            ("GBYE", (819, 6, 201)),
+            ("BF", (744, 6, 276)),
+            ("BN", (792, 6, 228)),
+            ("T", (915, 12, 99)),
+            ("R", (915, 12, 99)),
+            ("M", (883, 12, 131)),
+            ("P", (9, 948, 69)),
+            ("GBY1", (744, 6, 276)),
+            ("GBY2", (658, 6, 362)),
+            ("GBYS", (825, 6, 195)),
+            ("GBYE", (825, 6, 195)),
             ("GBU", (0, 6, 1020)),
-            ("GTBY", (879, 12, 135)),
-            ("GTWO", (879, 12, 135)),
+            ("GTBY", (883, 12, 131)),
+            ("GTWO", (883, 12, 131)),
         ];
         let h5b = [
             ("B", (1, 0, 5)),
@@ -12833,7 +12838,9 @@ async fn an_undecided_json_row_answers_on_todays_route() {
     .await;
     let t = ((now_ns() - 3_600_000_000_000) / 60_000_000_000) * 60_000_000_000;
     let sec = 1_000_000_000i64;
-    let cases: [(&str, &str, &str); 9] = [
+    let cases: [(&str, &str, &str); 11] = [
+        ("u10", r#"{"level":18446744073709551616}"#, "bare"),
+        ("u11", r#"{"level":-9223372036854775809}"#, "targeted"),
         ("u1", "not json", "bare"),
         ("u2", "[1]", "bare"),
         ("u3", r#"{"level":1.5}"#, "bare"),
@@ -14291,5 +14298,623 @@ async fn a_query_that_needs_no_labels_skips_the_parsers() {
             "{v_query}"
         );
     }
+    drop_db_624(&admin, &db).await;
+}
+
+/// Issue #624, part 3d: T2's lines, each with whether the reference's
+/// decoder reads it cleanly (no error, no field directly followed by a byte
+/// above `' '`, every key printable ASCII) — the lines the statement decides.
+const LINES_624P3D: [(&str, bool); 40] = [
+    ("level=info msg=hello", true),
+    ("level=info level=error", true),
+    ("level= level=error", true),
+    ("level level=warn", true),
+    ("level=\"\" level=x", true),
+    ("a.b=1 a_b=2", true),
+    ("a_b=1 a.b=2", true),
+    ("1x=7 _1x=8", true),
+    ("_1x=8 1x=7", true),
+    ("b.c=4 b_c=5", true),
+    ("msg=\"said \\\"hi\\\"\" level=info", true),
+    ("level=info msg=\"unterminated", false),
+    ("level=info =x", false),
+    ("=x level=info", false),
+    ("level=\"x\"b=1", false),
+    ("level=info a=b=c", false),
+    ("level=info a\"b", false),
+    ("", true),
+    ("   ", true),
+    ("level=info\u{1}msg=x", true),
+    ("lvl=1 level=2 level=3", true),
+    ("level=error", true),
+    ("msg=\"a\\x\" level=info", false),
+    ("level=info\nmsg=x", true),
+    ("é=1 level=info", false),
+    ("level=\u{fffd}", true),
+    ("level_extracted=z level=y", true),
+    ("level=\"\\u0041\" msg=x", true),
+    ("a.b=1 a_b=2 level=info", true),
+    ("__error__=boom level=x", true),
+    ("k=v\u{fffd} level=y", true),
+    ("level=\"x y\" msg=\"k=v z=w\"", true),
+    ("level_extracted=z level=w", true),
+    ("lvl=w level=v lvl=q", true),
+    ("level=\"a\\\"b\" lvl=\"\\ud800x\"", true),
+    ("b.c=4 level=k _1x=3", true),
+    ("msg=a=b level=x", false),
+    ("level=\"\\x\"", false),
+    ("a-b=1 level=warn a_b=", true),
+    ("level=info msg=\"said \\\"hi\\\"\"", true),
+];
+
+/// Issue #624, part 3d: T2's queries; `{S}` is one stream's selector.
+const FORMS_624P3D: [&str; 15] = [
+    r#"sum by (level) (count_over_time({S} | logfmt [1m]))"#,
+    r#"sum by (level, msg) (count_over_time({S} | logfmt --strict [1m]))"#,
+    r#"sum by (a_b) (count_over_time({S} | logfmt --keep-empty [1m]))"#,
+    r#"sum by (_1x, b_c) (count_over_time({S} | logfmt --strict --keep-empty [1m]))"#,
+    r#"sum by (level) (count_over_time({S} | logfmt | msg != "" [1m]))"#,
+    r#"count_over_time({S} | logfmt lvl="level" [1m])"#,
+    r#"sum by (lvl) (count_over_time({S} | logfmt --strict lvl="level", m="msg" [1m]))"#,
+    r#"sum by (level) (count_over_time({S} | logfmt level="level" [1m]))"#,
+    r#"count_over_time({S} | logfmt --strict a="b_c" [1m])"#,
+    r#"count_over_time({S} | logfmt a="a", b="a_b" [1m])"#,
+    r#"sum by (level_extracted) (count_over_time({S} | logfmt [1m]))"#,
+    r#"sum by (level) (bytes_over_time({S} | logfmt | __error__="" [1m]))"#,
+    r#"sum by (level) (count_over_time({S} | logfmt | drop msg [1m]))"#,
+    r#"count_over_time({S} | logfmt __error__="level" [1m])"#,
+    r#"absent_over_time({S} | logfmt lvl="level" | lvl="info" [1m])"#,
+];
+
+/// An engine answer as text: each series' sorted labels and its total, or
+/// the error.
+fn answer_624p3d<W>(got: &Result<(QueryResult, W), ReadError>) -> String {
+    match got {
+        Ok((QueryResult::Matrix(series), _)) => {
+            let mut s: Vec<String> = series
+                .iter()
+                .map(|s| {
+                    let mut l = s.labels.clone();
+                    l.sort();
+                    format!("{l:?}={}", s.points.iter().map(|p| p.1).sum::<f64>())
+                })
+                .collect();
+            s.sort();
+            s.join(" ")
+        }
+        Ok(_) => "another result".to_string(),
+        Err(ReadError::MetricPipelineError { error_type, .. }) => format!("error {error_type}"),
+        Err(e) => format!("failed {e}"),
+    }
+}
+
+/// **T2 (issue #624, part 3d).** Every line of `LINES_624P3D` alone in a
+/// stream without and with a stream label `level`, under every query of
+/// `FORMS_624P3D`, and the decided lines together in one stream: the
+/// lowered answer equals today's route's, a decided line is answered by the
+/// statement alone and an undecided one hands over with code 395; and the
+/// decided stream under a one-byte ceiling hands over with code 241.
+#[tokio::test]
+async fn a_logfmt_count_answers_as_todays_route() {
+    skip_unless_live!();
+    let (admin, db) = fresh_db_624(pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_p3d_{}",
+        uuid::Uuid::new_v4().simple()
+    )))
+    .await;
+    let t = ((now_ns() - 3_600_000_000_000) / 60_000_000_000) * 60_000_000_000;
+    let sec = 1_000_000_000i64;
+    let cols = "(received_ms, kind, service, fingerprint, timestamp_ns, severity, body, \
+                structured_metadata, month, labels, updated_ns, pattern, pattern_count)";
+    let mut streams = Vec::new();
+    let mut rows = Vec::new();
+    let mut stream = |svc: &str, fp: u64, extra: &str| {
+        streams.push(format!(
+            "(toUnixTimestamp64Milli(now64(3)), 1, '{svc}', toUInt128({fp}), 0, 0, '', '', \
+             toStartOfMonth(toDate(fromUnixTimestamp64Nano(toInt64({t})))), \
+             '{{\"s\":\"{svc}\",\"service_name\":\"{svc}\"{extra}}}', 0, '', 0)"
+        ));
+    };
+    let mut line = |svc: &str, fp: u64, at: i64, body: &str| {
+        rows.push(format!(
+            "(toUnixTimestamp64Milli(now64(3)), 0, '{svc}', toUInt128({fp}), toInt64({at}), 0, \
+             {}, '', toDate(0), '', 0, '', 0)",
+            literal(body).as_sql()
+        ));
+    };
+    for (i, (body, _)) in LINES_624P3D.iter().enumerate() {
+        for (b, extra) in [(0u64, ""), (1, r#","level":"stream""#)] {
+            let svc = format!("p3d{b}x{i}");
+            stream(&svc, 2000 + 2 * i as u64 + b, extra);
+            line(&svc, 2000 + 2 * i as u64 + b, t + 10 * sec, body);
+        }
+    }
+    stream("p3dall", 1999, "");
+    for (i, (body, decided)) in LINES_624P3D.iter().enumerate() {
+        if *decided {
+            line("p3dall", 1999, t + sec + i as i64 * 1_000_000_000, body);
+        }
+    }
+    for chunk in [streams, rows] {
+        exec_624(
+            &admin,
+            &format!(
+                "INSERT INTO {db}.log_landing {cols} VALUES {}",
+                chunk.join(", ")
+            ),
+        )
+        .await;
+    }
+    let range = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t + 60 * sec,
+            end_ns: t + 60 * sec,
+            step_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    // (query, decided, a one-byte ceiling, the lowered request's comment, answers)
+    let mut cells: Vec<(String, bool, bool, String, String, String)> = Vec::new();
+    let (db_r, range_r) = (&db, &range);
+    let ask = move |query: String, decided: bool, memory: bool| async move {
+        let mut out = Vec::new();
+        for todays in [true, false] {
+            let comment = format!("c624p3d-{}", uuid::Uuid::new_v4().simple());
+            let hooks = hooks_624(todays, None, if memory && !todays { Some(1) } else { None });
+            let engine = LogQlEngine::new(
+                data_client(db_r).await,
+                engine_config(db_r, 64 * 1024 * 1024),
+            )
+            .with_key_route_test_hooks(hooks)
+            .with_query_log_comment(comment.clone());
+            let got = engine.query(&parse(&query).expect("parse"), range_r).await;
+            out.push((comment, answer_624p3d(&got)));
+        }
+        (
+            query,
+            decided,
+            memory,
+            out[1].0.clone(),
+            out[0].1.clone(),
+            out[1].1.clone(),
+        )
+    };
+    for form in FORMS_624P3D {
+        for (i, (_, decided)) in LINES_624P3D.iter().enumerate() {
+            for b in 0..2 {
+                let query = form.replace("{S}", &format!(r#"{{s="p3d{b}x{i}"}}"#));
+                cells.push(ask(query, *decided, false).await);
+            }
+        }
+        // A destination named `__error__` fails the query with the value of
+        // whichever line the route reads first; one line per stream above.
+        if !form.contains(r#"__error__="level""#) {
+            cells.push(ask(form.replace("{S}", r#"{s="p3dall"}"#), true, false).await);
+        }
+    }
+    cells.push(
+        ask(
+            FORMS_624P3D[0].replace("{S}", r#"{s="p3dall"}"#),
+            true,
+            true,
+        )
+        .await,
+    );
+    assert_eq!(
+        cells.len(),
+        FORMS_624P3D.len() * (2 * LINES_624P3D.len() + 1) - 1 + 1
+    );
+    let comments: Vec<String> = cells.iter().map(|c| c.3.clone()).collect();
+    let logged = logged_624(&admin, &comments).await;
+    let mut wrong: Vec<String> = Vec::new();
+    let mut non_empty = 0usize;
+    for (query, decided, memory, comment, todays, lowered) in &cells {
+        if !lowered.is_empty() {
+            non_empty += 1;
+        }
+        if todays != lowered {
+            wrong.push(format!("{query}: today's {todays} | lowered {lowered}"));
+        }
+        let rows = logged.get(comment).cloned().unwrap_or_default();
+        let statement = rows.iter().find(|r| r.query.contains(" AS fields"));
+        let handed = rows.iter().any(|r| is_todays_624(&r.query));
+        let want = match (decided, memory) {
+            (_, true) => Some(241),
+            (true, false) => Some(0),
+            (false, false) => Some(395),
+        };
+        let route_ok = statement.map(|r| r.exception_code) == want && handed == (want != Some(0));
+        if !route_ok {
+            wrong.push(format!(
+                "{query}: statement {:?}, today's read {handed}, want {want:?}",
+                statement.map(|r| r.exception_code)
+            ));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} of {} cells:\n{}",
+        wrong.len(),
+        cells.len(),
+        wrong.join("\n")
+    );
+    assert!(non_empty >= 1000, "{non_empty} non-empty answers");
+    drop_db_624(&admin, &db).await;
+}
+
+/// **T6 (issue #624, part 3d).** A targeted source `id_extracted` is not a
+/// field the parser reads, so 50 lines whose `id` differs form one group:
+/// the statement sends one row, with code 0, and answers as today's route.
+#[tokio::test]
+async fn a_targeted_logfmt_count_groups_only_on_the_fields_it_reads() {
+    skip_unless_live!();
+    let (admin, db) = fresh_db_624(pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_p3dt6_{}",
+        uuid::Uuid::new_v4().simple()
+    )))
+    .await;
+    let t = ((now_ns() - 3_600_000_000_000) / 60_000_000_000) * 60_000_000_000;
+    let sec = 1_000_000_000i64;
+    land_stream_624(
+        &admin,
+        &db,
+        t,
+        2500,
+        "p3did",
+        r#"{"s":"p3did","service_name":"p3did"}"#,
+    )
+    .await;
+    let rows: Vec<String> = (0..50)
+        .map(|i| {
+            format!(
+                "(toUnixTimestamp64Milli(now64(3)), 0, 'p3did', toUInt128(2500), toInt64({}), 0, \
+                 {}, '', toDate(0), '', 0, '', 0)",
+                t + sec + i * 100_000_000,
+                literal(&format!("id={i} level=info")).as_sql()
+            )
+        })
+        .collect();
+    exec_624(
+        &admin,
+        &format!(
+            "INSERT INTO {db}.log_landing (received_ms, kind, service, fingerprint, timestamp_ns, \
+             severity, body, structured_metadata, month, labels, updated_ns, pattern, \
+             pattern_count) VALUES {}",
+            rows.join(", ")
+        ),
+    )
+    .await;
+    let range = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t + 60 * sec,
+            end_ns: t + 60 * sec,
+            step_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let query = r#"count_over_time({s="p3did"} | logfmt x="id_extracted" [1m])"#;
+    let mut answers = Vec::new();
+    let mut comment = String::new();
+    for todays in [true, false] {
+        comment = format!("c624p3dt6-{}", uuid::Uuid::new_v4().simple());
+        let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024))
+            .with_key_route_test_hooks(hooks_624(todays, None, None))
+            .with_query_log_comment(comment.clone());
+        answers.push(answer_624p3d(
+            &engine.query(&parse(query).expect("parse"), &range).await,
+        ));
+    }
+    assert_eq!(answers[0], answers[1], "the lowered answer is today's");
+    let logged = logged_624(&admin, std::slice::from_ref(&comment)).await;
+    let rows = logged.get(&comment).expect("logged");
+    let statement = rows
+        .iter()
+        .find(|r| r.query.contains(" AS fields"))
+        .unwrap_or_else(|| panic!("no lowered statement: {rows:#?}"));
+    assert_eq!(
+        (statement.exception_code, statement.result_rows),
+        (0, 1),
+        "one group for 50 ids"
+    );
+    drop_db_624(&admin, &db).await;
+}
+
+/// **T3 (issue #624, part 3d).** The statement's two columns over the 650
+/// lines of `fixtures/logfmt_fields/reference_fields.tsv` — every field of
+/// a table alone and every ordered pair — for each of its three name sets:
+/// `decided` is the fixture's `ok`, and on a decided line `fields` is the
+/// reference decoder's.
+#[tokio::test]
+async fn the_database_logfmt_fields_are_the_reference_decoders() {
+    skip_unless_live!();
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+    struct FieldsRow {
+        i: u32,
+        decided: u8,
+        fields: String,
+    }
+    const SETS: [&[&str]; 3] = [
+        &["level"],
+        &["_1x", "a_b", "level", "level_extracted"],
+        &["__error__", "b_c", "level", "lvl", "msg"],
+    ];
+    let text = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/logfmt_fields/reference_fields.tsv"
+    ))
+    .expect("the fixture");
+    let rows: Vec<(String, bool, [String; 3])> = text
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.starts_with("line\t"))
+        .map(|l| {
+            let c: Vec<&str> = l.split('\t').collect();
+            let s = |x: &str| serde_json::from_str::<String>(x).expect("a JSON string");
+            (s(c[0]), c[1] == "1", [s(c[2]), s(c[3]), s(c[4])])
+        })
+        .collect();
+    assert_eq!(rows.len(), 650);
+    let (admin, db) = fresh_db_624(pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_p3dt3_{}",
+        uuid::Uuid::new_v4().simple()
+    )))
+    .await;
+    exec_624(
+        &admin,
+        &format!("CREATE TABLE {db}.lf (i UInt32, body String) ENGINE = MergeTree ORDER BY i"),
+    )
+    .await;
+    let values: Vec<String> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, (line, _, _))| format!("({i}, {})", literal(line).as_sql()))
+        .collect();
+    exec_624(
+        &admin,
+        &format!("INSERT INTO {db}.lf VALUES {}", values.join(", ")),
+    )
+    .await;
+    let client = data_client(&db).await;
+    let mut cells = 0usize;
+    let mut wrong: Vec<String> = Vec::new();
+    for (n, set) in SETS.iter().enumerate() {
+        let names: Vec<String> = set.iter().map(|s| s.to_string()).collect();
+        let [decided, fields] = sql::logfmt_count_columns(&names);
+        let query = format!("SELECT i, {decided}, {fields} FROM lf ORDER BY i").replace('?', "??");
+        let mut stream = client
+            .query_stream::<FieldsRow>(&query, &QuerySettings::new())
+            .await
+            .unwrap_or_else(|e| panic!("{e}\n{query}"));
+        while let Some(row) = stream.next().await {
+            let row = row.expect("a row");
+            let (line, ok, want) = &rows[row.i as usize];
+            cells += 1;
+            if (row.decided == 1) != *ok || (*ok && row.fields != want[n]) {
+                wrong.push(format!(
+                    "set {n} {line:?}: decided {} fields {:?}, want {ok} {:?}",
+                    row.decided, row.fields, want[n]
+                ));
+            }
+        }
+    }
+    assert_eq!(cells, SETS.len() * rows.len());
+    assert!(
+        wrong.is_empty(),
+        "{} of {cells} cells:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+    drop_db_624(&admin, &db).await;
+}
+
+/// **T1 (issue #624, part 3d-3): a filter after a targeted parser returns
+/// what the evaluator returns.** Each line alone in a stream; the log
+/// query's lines equal the expected count and those of the same query with
+/// its filter not pushed (a regular expression, or the same filter's
+/// equivalent). Each pushed request's statements must carry the mapped
+/// field, or for a collision case the stream guard, so a filter or guard
+/// that is not pushed fails the test.
+#[tokio::test]
+async fn a_filter_after_a_targeted_parser_returns_what_the_evaluator_returns() {
+    skip_unless_live!();
+    let (admin, db) = fresh_db_624(pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_d33_{}",
+        uuid::Uuid::new_v4().simple()
+    )))
+    .await;
+    let t = ((now_ns() - 3_600_000_000_000) / 60_000_000_000) * 60_000_000_000;
+    let sec = 1_000_000_000i64;
+    const BASE: &str = r#","status":"base""#;
+    const GUARD: &str = "(fingerprint IN (toUInt128('";
+    // (line, extra stream labels, pushed pipeline, the not-pushed control,
+    //  expected lines, what the pushed statements must carry)
+    let cases: &[(&str, &str, &str, &str, usize, &str)] = &[
+        (
+            "status=500 code=200",
+            "",
+            r#"| logfmt status="code" | status="200""#,
+            r#"| logfmt status="code" | status=~"200""#,
+            1,
+            "has(['code', 'status'],",
+        ),
+        (
+            "status=200 code=500",
+            "",
+            r#"| logfmt status="code" | status!="200""#,
+            r#"| logfmt status="code" | status!~"200""#,
+            1,
+            "has(['code', 'status'],",
+        ),
+        (
+            "status=500 code",
+            "",
+            r#"| logfmt status="code" | status!="500""#,
+            r#"| logfmt status="code" | status!~"500""#,
+            1,
+            "has(['code', 'status'],",
+        ),
+        (
+            r#"{"status":"500","code":"200"}"#,
+            "",
+            r#"| json status="code" | status="200""#,
+            r#"| json status="code" | status=~"200""#,
+            1,
+            "JSONExtractString(body, 'code')",
+        ),
+        (
+            r#"{"status":"200","code":"500"}"#,
+            "",
+            r#"| json status="code" | status!="200""#,
+            r#"| json status="code" | status!~"200""#,
+            1,
+            "JSONExtractString(body, 'code')",
+        ),
+        (
+            r#"{"a":{"b":"200"},"status":"500"}"#,
+            "",
+            r#"| json status="a.b" | status="200""#,
+            r#"| json status="a.b" | status=~"200""#,
+            1,
+            "JSONExtractString(body, 'a', 'b')",
+        ),
+        (
+            r#"{"status":100,"code":300}"#,
+            "",
+            r#"| json status="code" | status >= 200"#,
+            r#"| json status="code" | status=~"300""#,
+            1,
+            "JSONExtractFloat(body, 'code')",
+        ),
+        (
+            "code=200",
+            BASE,
+            r#"| logfmt status="code" | status_extracted="200""#,
+            r#"| logfmt status="code" | status_extracted=~"200""#,
+            1,
+            GUARD,
+        ),
+        (
+            r#"{"code":"200"}"#,
+            BASE,
+            r#"| json status="code" | status_extracted="200""#,
+            r#"| json status="code" | status_extracted=~"200""#,
+            1,
+            GUARD,
+        ),
+        (
+            "code=200 status=500",
+            "",
+            r#"| logfmt status="code" | status="200""#,
+            r#"| logfmt status="code" | status=~"200""#,
+            0,
+            "has(['code', 'status'],",
+        ),
+        (
+            r#"x=1 code="2 0""#,
+            "",
+            r#"| logfmt status="code" | status="2 0""#,
+            r#"| logfmt status="code" | status=~"2 0""#,
+            1,
+            "has(['code', 'status'],",
+        ),
+        (
+            r#"{"other":5}"#,
+            "",
+            r#"| json status="code" | other >= 1"#,
+            r#"| json status="code" | other=~"5""#,
+            0,
+            "(0 OR structured_metadata != '')",
+        ),
+        (
+            "code=200",
+            "",
+            r#"| logfmt status="\"code\"" | status="200""#,
+            r#"| logfmt status="\"code\"" | status=~"200""#,
+            1,
+            "has(['code', 'status'],",
+        ),
+        (
+            "code=200",
+            "",
+            r#"| logfmt status="code", status="other" | status!="200""#,
+            r#"| logfmt status="code", status="other" | status!~"200""#,
+            1,
+            "has(['other', 'status'],",
+        ),
+    ];
+    for (i, (line, extra, _, _, _, _)) in cases.iter().enumerate() {
+        let fp = 9600 + i as u64;
+        land_stream_624(
+            &admin,
+            &db,
+            t,
+            fp,
+            "d33",
+            &format!(r#"{{"s":"d33k{i}","service_name":"d33"{extra}}}"#),
+        )
+        .await;
+        land_line_624(&admin, &db, fp, "d33", t + sec, line, "").await;
+    }
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t + 120 * sec,
+            step_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let lines = |result: Result<(QueryResult, _), ReadError>, q: &str| match result {
+        Ok((QueryResult::Streams { items, .. }, _)) => {
+            items.iter().map(|s| s.entries.len()).sum::<usize>()
+        }
+        other => panic!("{q}: {:?}", other.map(|_| ())),
+    };
+    let mut wrong: Vec<String> = Vec::new();
+    let mut comments: Vec<(String, usize)> = Vec::new();
+    for (i, (_, _, pushed, control, want, _)) in cases.iter().enumerate() {
+        let comment = format!("c624d33-{}", uuid::Uuid::new_v4().simple());
+        let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024))
+            .with_query_log_comment(comment.clone());
+        let q = format!(r#"{{s="d33k{i}"}} {pushed}"#);
+        let got = lines(engine.query(&parse(&q).expect("parse"), &params).await, &q);
+        let cq = format!(r#"{{s="d33k{i}"}} {control}"#);
+        let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+        let not_pushed = lines(
+            engine.query(&parse(&cq).expect("parse"), &params).await,
+            &cq,
+        );
+        if got != *want || not_pushed != *want {
+            wrong.push(format!(
+                "{q}: {got} lines, not pushed {not_pushed}, want {want}"
+            ));
+        }
+        comments.push((comment, i));
+    }
+    let names: Vec<String> = comments.iter().map(|(c, _)| c.clone()).collect();
+    let logged = logged_624(&admin, &names).await;
+    for (comment, i) in &comments {
+        let (_, _, pushed, _, _, carries) = cases[*i];
+        let carries = if carries == GUARD {
+            format!("{GUARD}{}'))", 9600 + *i as u64)
+        } else {
+            carries.to_string()
+        };
+        let rows = logged.get(comment).cloned().unwrap_or_default();
+        if !rows.iter().any(|r| r.query.contains(&carries)) {
+            wrong.push(format!(
+                "{pushed}: no statement carries {carries:?}: {:#?}",
+                rows.iter().map(|r| &r.query).collect::<Vec<_>>()
+            ));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} of {} cases:\n{}",
+        wrong.len(),
+        cases.len(),
+        wrong.join("\n")
+    );
     drop_db_624(&admin, &db).await;
 }

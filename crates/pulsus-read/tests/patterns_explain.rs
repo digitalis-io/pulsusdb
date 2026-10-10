@@ -21,7 +21,7 @@
 //!
 //! ```text
 //! podman run -d --rm --name pulsus-ch-patterns -p 19123:8123 \
-//!     clickhouse/clickhouse-server:26.3
+//!     clickhouse/clickhouse-server:26.8.21.10
 //! PULSUS_TEST_CLICKHOUSE=1 cargo test -p pulsus-read --test patterns_explain
 //! podman rm -f pulsus-ch-patterns
 //! ```
@@ -36,6 +36,10 @@ use pulsus_read::logql::sql::{self, TimeWindow};
 use pulsus_read::{EngineConfig, LogQlEngine, TimeBounds};
 use pulsus_schema::{RenderCtx, SchemaParams};
 use pulsus_schema_testkit::run_init;
+
+/// From 26.7 `EXPLAIN` defaults to a new layout; every `EXPLAIN` here asks
+/// for the one these assertions read (issue #624, part 3d).
+const EXPLAIN_LAYOUT: &str = "\nSETTINGS explain_query_plan_default = 'legacy'";
 
 /// `true` when the gated half of this suite should run. Skips cleanly on a
 /// developer machine with no container; **panics** rather than skipping when
@@ -140,7 +144,7 @@ async fn insert_patterns(db: &str, rows: &[PatSeedRow]) {
 }
 
 async fn explain_raw(client: &ChClient, sql: &str) -> String {
-    let full = format!("EXPLAIN indexes = 1 {sql}");
+    let full = format!("EXPLAIN indexes = 1 {sql}{EXPLAIN_LAYOUT}");
     let mut stream = client
         .query_stream::<ExplainRow>(&full, &QuerySettings::new())
         .await
@@ -164,7 +168,7 @@ fn block_parts(raw: &str, block: &str) -> Option<(u64, u64)> {
     slash_pair(raw, block, "Parts:")
 }
 
-const BLOCK_TITLES: &[&str] = &["MinMax", "Partition", "PrimaryKey"];
+const BLOCK_TITLES: &[&str] = &["Min-Max", "Partition", "Statistics", "PrimaryKey"];
 
 fn slash_pair(raw: &str, block: &str, field: &str) -> Option<(u64, u64)> {
     let mut in_block = false;
@@ -338,7 +342,7 @@ async fn patterns_read_prunes_daily_partitions() {
     )
     .await;
     let (sel, total) =
-        block_parts(&raw, "MinMax").unwrap_or_else(|| panic!("no MinMax Parts:\n{raw}"));
+        block_parts(&raw, "Min-Max").unwrap_or_else(|| panic!("no MinMax Parts:\n{raw}"));
     assert_eq!(total, 2, "two daily partitions (two parts) seeded:\n{raw}");
     assert_eq!(
         sel, 1,

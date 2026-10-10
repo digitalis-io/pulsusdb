@@ -63,7 +63,7 @@ Reproduce:
   podman run -d --rm --name pulsus-loki-374 -p 13375:3100 \
       docker.io/grafana/loki@sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc
   podman run -d --rm --name pulsus-ch-374 -p 19375:8123 \
-      docker.io/clickhouse/clickhouse-server:24.8
+      docker.io/clickhouse/clickhouse-server:26.8.21.10
   PULSUS_HOST=127.0.0.1 PULSUS_PORT=18375 CLICKHOUSE_SERVER=localhost \
       CLICKHOUSE_HTTP_PORT=19375 CLICKHOUSE_DB=pulsus_374_probe \
       PULSUS_COMPAT_ENDPOINTS=1 ./target/debug/pulsusdb &

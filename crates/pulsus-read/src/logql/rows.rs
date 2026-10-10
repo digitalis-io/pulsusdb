@@ -313,6 +313,10 @@ pub struct MetricRangeBucketRow {
     /// part 3b). Decoded by [`MetricRangeJsonRow`]; empty otherwise.
     #[serde(skip)]
     pub keys: Vec<(u8, String)>,
+    /// A `| logfmt` count's relevant fields, joined by one space (issue
+    /// #624, part 3d). Decoded by [`MetricRangeLogfmtRow`]; empty otherwise.
+    #[serde(skip)]
+    pub fields: String,
 }
 
 /// [`MetricRangeBucketRow`] with the `regexp` stage's two group-key columns
@@ -337,6 +341,7 @@ impl From<MetricRangeRegexpRow> for MetricRangeBucketRow {
             matched: r.matched,
             caps: r.caps,
             keys: Vec::new(),
+            fields: String::new(),
         }
     }
 }
@@ -362,6 +367,33 @@ impl From<MetricRangeJsonRow> for MetricRangeBucketRow {
             matched: 0,
             caps: Vec::new(),
             keys: r.keys,
+            fields: String::new(),
+        }
+    }
+}
+
+/// [`MetricRangeBucketRow`] with a `| logfmt` count's `fields` column
+/// (issue #624, part 3d).
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct MetricRangeLogfmtRow {
+    pub fingerprint: Fingerprint,
+    pub bucket_ns: i64,
+    pub n: u64,
+    pub structured_metadata: String,
+    pub fields: String,
+}
+
+impl From<MetricRangeLogfmtRow> for MetricRangeBucketRow {
+    fn from(r: MetricRangeLogfmtRow) -> Self {
+        MetricRangeBucketRow {
+            fingerprint: r.fingerprint,
+            bucket_ns: r.bucket_ns,
+            n: r.n,
+            structured_metadata: r.structured_metadata,
+            matched: 0,
+            caps: Vec::new(),
+            keys: Vec::new(),
+            fields: r.fields,
         }
     }
 }

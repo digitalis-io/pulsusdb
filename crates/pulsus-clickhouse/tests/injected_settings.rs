@@ -17,7 +17,7 @@
 //!
 //! ```text
 //! podman run -d --rm --name pulsus-ch-test -p 19123:8123 -p 19000:9000 \
-//!     clickhouse/clickhouse-server:26.3
+//!     clickhouse/clickhouse-server:26.8.21.10
 //! PULSUS_TEST_CLICKHOUSE=1 cargo test -p pulsus-clickhouse --test injected_settings
 //! podman rm -f pulsus-ch-test
 //! ```
@@ -89,6 +89,9 @@ const INJECTED_SETTINGS: &[&str] = &[
     "optimize_move_to_prewhere",
     "optimize_read_in_order",
     "optimize_skip_unused_shards",
+    // Issue #624, part 3d: a trace EXPLAIN test reads the base table, which
+    // a projection may otherwise serve from 26.8.
+    "optimize_use_projections",
     "prefer_localhost_replica",
     "query_id",
     // Issue #624: the `text` body index's direct read is off on every LogQL read.

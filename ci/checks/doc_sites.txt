@@ -34,7 +34,7 @@ rewrite docs/schemas.md:33-33
 # issue, where the body `text` index paragraph names the change and the issue
 # the swap closes; `finding #3` is carried on that paragraph's rewritten first
 # sentence, and #450 on its unchanged `hasToken` sentences.
-rewrite docs/schemas.md:174-174 refs=#25,#559,#560,#603,#16,#171,#498,#2,#57,#584,#586,#587,#5,#63,#75,#478,#555,#26,#623,#125,#315,#472,#549,#7,#579,#635,#500,#172,#183,#593,#235,#3,#450,#624
+rewrite docs/schemas.md:174-174 refs=#25,#559,#560,#603,#16,#171,#498,#2,#57,#584,#586,#587,#5,#63,#75,#478,#555,#26,#623,#125,#315,#472,#549,#7,#579,#635,#500,#172,#183,#593,#235,#3,#450,#624,#412
 # `refs=#112` is a NEW reference on this file rather than a carried one. §2.4's
 # writer-contract paragraph gained the reason the read path does not route on
 # `metric_series.value_type`, and that reason is the decision A1's plan v5

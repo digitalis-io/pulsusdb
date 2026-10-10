@@ -62,7 +62,7 @@
 //! optimizer). Live-gated behind `PULSUS_TEST_CLICKHOUSE=1`:
 //!
 //! ```text
-//! podman run -d --rm --name pulsus-ch-test -p 19123:8123 clickhouse/clickhouse-server:26.3
+//! podman run -d --rm --name pulsus-ch-test -p 19123:8123 clickhouse/clickhouse-server:26.8.21.10
 //! PULSUS_TEST_CLICKHOUSE=1 cargo test -p pulsus-read --test traces_search_explain
 //! podman rm -f pulsus-ch-test
 //! ```
@@ -78,6 +78,10 @@ use pulsus_read::traces::search_sql;
 use pulsus_read::{SearchPlan, TraceEngine, TraceReadConfig};
 use pulsus_schema::{RenderCtx, SchemaParams};
 use pulsus_schema_testkit::run_init;
+
+/// From 26.7 `EXPLAIN` defaults to a new layout; every `EXPLAIN` here asks
+/// for the one these assertions read (issue #624, part 3d).
+const EXPLAIN_LAYOUT: &str = "\nSETTINGS explain_query_plan_default = 'legacy'";
 
 /// `true` when the gated half of this suite should run. Skips cleanly on a
 /// developer machine with no container; **panics** rather than skipping when
@@ -255,7 +259,10 @@ async fn explain_raw(client: &ChClient, sql: &str) -> String {
     // The engine doubles literal `?` at its own execution boundary
     // (`escape_query_placeholders`); this raw EXPLAIN path must apply the
     // same driver-quirk fix for regex generators (`(?:` patterns).
-    let full = format!("EXPLAIN indexes = 1 {}", sql.replace('?', "??"));
+    let full = format!(
+        "EXPLAIN indexes = 1 {}{EXPLAIN_LAYOUT}",
+        sql.replace('?', "??")
+    );
     let mut out = String::new();
     let mut stream = client
         .query_stream::<ExplainRow>(&full, &QuerySettings::new())
@@ -291,7 +298,7 @@ async fn explain_pipeline_raw(client: &ChClient, sql: &str) -> String {
 /// The `PrimaryKey` block's `Granules: k/N` ratio (panics with the raw
 /// text when absent — same idiom as `traces_point_read.rs`).
 fn primary_key_granules(raw: &str) -> (u64, u64) {
-    const BLOCK_TITLES: &[&str] = &["MinMax", "Partition", "PrimaryKey", "Skip"];
+    const BLOCK_TITLES: &[&str] = &["Min-Max", "Partition", "Statistics", "PrimaryKey", "Skip"];
     let mut in_pk = false;
     for line in raw.lines() {
         let trimmed = line.trim();
@@ -315,7 +322,7 @@ fn primary_key_granules(raw: &str) -> (u64, u64) {
 /// A named `Skip` index block's `Granules: k/N` ratio — used for the
 /// `idx_duration` minmax reduction gate.
 fn skip_index_granules(raw: &str, index_name: &str) -> (u64, u64) {
-    const BLOCK_TITLES: &[&str] = &["MinMax", "Partition", "PrimaryKey", "Skip"];
+    const BLOCK_TITLES: &[&str] = &["Min-Max", "Partition", "Statistics", "PrimaryKey", "Skip"];
     let mut in_skip = false;
     let mut named = false;
     for line in raw.lines() {
@@ -518,7 +525,7 @@ async fn attr_value_reads_keep_their_index_selection(
     /// `EXPLAIN indexes = 1` render, with the SELECT list dropped — the
     /// part index selection is decided by.
     fn index_blocks(raw: &str) -> String {
-        const BLOCK_TITLES: &[&str] = &["MinMax", "Partition", "PrimaryKey", "Skip"];
+        const BLOCK_TITLES: &[&str] = &["Min-Max", "Partition", "Statistics", "PrimaryKey", "Skip"];
         let mut out = String::new();
         let mut inside = false;
         for line in raw.lines() {
@@ -810,8 +817,14 @@ async fn the_second_attribute_condition_reads_no_more_bytes(
         drain_tagged_rows(client, &sql_b, &counted_settings(&id_b)).await;
     let rows_c: Vec<HydrationProbeValueRow> =
         drain_tagged_rows(client, &sql_c, &counted_settings(&id_c)).await;
-    let rows_d: Vec<HydrationRow> =
-        drain_tagged_rows(client, &sql_d, &counted_settings(&id_d)).await;
+    // D reads the base table as A, B and C do: from 26.8 a statement with
+    // no probe column may be served by a projection (issue #624, part 3d).
+    let rows_d: Vec<HydrationRow> = drain_tagged_rows(
+        client,
+        &sql_d,
+        &counted_settings(&id_d).set("optimize_use_projections", "0"),
+    )
+    .await;
 
     // 10b: probe TRUTH. The counts are deterministic from the seed —
     // every span carries `env`, and `number % ERROR_EVERY = 0` holds for
@@ -1280,8 +1293,18 @@ async fn two_phase_search_explain_and_budget_gates() {
     // corpus's durations grow monotonically with time (`number * 10µs`),
     // so slow spans cluster and the minmax index can prune for a
     // top-decile threshold. -----------------------------------------------
+    // From 26.8 the server's column statistics can prune the parts the
+    // index would, before the index is read (issue #624, part 3d), so the
+    // index is measured with that pruning off.
     let plan = plan_for(&engine, "{ duration > 1100ms }", base, now);
-    let raw = explain_raw(&client, &plan.generator_sqls[0]).await;
+    let raw = explain_raw(
+        &client,
+        &format!(
+            "{}\nSETTINGS use_statistics_for_part_pruning = 0",
+            plan.generator_sqls[0]
+        ),
+    )
+    .await;
     let (sel, total) = skip_index_granules(&raw, "idx_duration");
     assert!(
         sel < total,
@@ -3452,6 +3475,13 @@ async fn two_phase_search_explain_and_budget_gates() {
     // This replaces issue #479's membership gates, which lost their
     // subject: the statement they compared is no longer issued.
     //
+    // From 26.8 the plain statement alone may be served by the
+    // `service_time` or `name_time` projection when that selects fewer
+    // granules (issue #624, part 3d). The probed statement reads the base
+    // table, so the control reads the base table too
+    // (`optimize_use_projections = 0`), and the identity stays one between
+    // two reads of the same table.
+    //
     // The four classes enumerated are the four `ValuePred` classes that
     // FUSE a value, so the `ProbesAndValues` render — three array columns,
     // not one — is what the identity is taken over. `StringEq` never
@@ -3489,7 +3519,11 @@ async fn two_phase_search_explain_and_budget_gates() {
             "{label}: the control render must carry no probe column at all:\n{plain}"
         );
         let raw_probed = explain_raw(&client, &probed).await;
-        let raw_plain = explain_raw(&client, &plain).await;
+        let raw_plain = explain_raw(
+            &client,
+            &format!("{plain}\nSETTINGS optimize_use_projections = 0"),
+        )
+        .await;
         assert_eq!(
             primary_key_granules(&raw_probed),
             primary_key_granules(&raw_plain),
@@ -3925,7 +3959,7 @@ async fn the_pushdown_keeps_the_generators_index_selection(
     /// `EXPLAIN indexes = 1` render — what part and granule selection is
     /// decided by.
     fn index_blocks(raw: &str) -> String {
-        const BLOCK_TITLES: &[&str] = &["MinMax", "Partition", "PrimaryKey", "Skip"];
+        const BLOCK_TITLES: &[&str] = &["Min-Max", "Partition", "Statistics", "PrimaryKey", "Skip"];
         let mut out = String::new();
         let mut inside = false;
         for line in raw.lines() {
@@ -4001,9 +4035,12 @@ async fn the_pushdown_keeps_the_generators_index_selection(
 
     // POSITIVE CONTROL, on the same corpus: narrowing the time predicate
     // MUST move part selection.
-    let narrowed = statements[0]
-        .1
-        .replace("timestamp_ns >= ", &format!("timestamp_ns >= {now} + "));
+    // It narrows to the last 30 minutes: from 26.8 a contradictory range
+    // is planned with no index section at all (issue #624, part 3d).
+    let narrowed = statements[0].1.replace(
+        &format!("timestamp_ns >= {base} AND"),
+        &format!("timestamp_ns >= {} AND", now - 1_800_000_000_000),
+    );
     assert_ne!(
         &narrowed, statements[0].1,
         "the positive control must differ"

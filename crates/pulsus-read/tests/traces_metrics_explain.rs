@@ -23,7 +23,7 @@
 //! `PULSUS_TEST_CLICKHOUSE=1`:
 //!
 //! ```text
-//! podman run -d --rm --name pulsus-ch-test -p 19123:8123 clickhouse/clickhouse-server:26.3
+//! podman run -d --rm --name pulsus-ch-test -p 19123:8123 clickhouse/clickhouse-server:26.8.21.10
 //! PULSUS_TEST_CLICKHOUSE=1 cargo test -p pulsus-read --test traces_metrics_explain
 //! podman rm -f pulsus-ch-test
 //! ```
@@ -39,6 +39,10 @@ use pulsus_read::traces::metrics_plan::{MetricsParams, plan_trace_metrics};
 use pulsus_read::{TRACE_METRICS_MAX_SET_ROWS, TraceEngine, TraceMetricsPlan, TraceReadConfig};
 use pulsus_schema::{RenderCtx, SchemaParams};
 use pulsus_schema_testkit::run_init;
+
+/// From 26.7 `EXPLAIN` defaults to a new layout; every `EXPLAIN` here asks
+/// for the one these assertions read (issue #624, part 3d).
+const EXPLAIN_LAYOUT: &str = "\nSETTINGS explain_query_plan_default = 'legacy'";
 
 /// `true` when the gated half of this suite should run. Skips cleanly on a
 /// developer machine with no container; **panics** rather than skipping when
@@ -192,7 +196,10 @@ async fn explain_raw(client: &ChClient, sql: &str) -> String {
     // The engine doubles literal `?` at its own execution boundary
     // (`escape_query_placeholders`); this raw EXPLAIN path must apply the
     // same driver-quirk fix (regex fragments carry `(?:`).
-    let full = format!("EXPLAIN indexes = 1 {}", sql.replace('?', "??"));
+    let full = format!(
+        "EXPLAIN indexes = 1 {}{EXPLAIN_LAYOUT}",
+        sql.replace('?', "??")
+    );
     let mut out = String::new();
     let mut stream = client
         .query_stream::<ExplainRow>(&full, &QuerySettings::new())
@@ -244,7 +251,7 @@ fn with_projections_off(sql: &str) -> String {
 /// (the outer `trace_spans` scan and the semi-join's `trace_attrs_idx`
 /// subquery), so the parse is scoped to the named table's section.
 fn table_primary_key_granules(raw: &str, table: &str) -> (u64, u64) {
-    const BLOCK_TITLES: &[&str] = &["MinMax", "Partition", "PrimaryKey", "Skip"];
+    const BLOCK_TITLES: &[&str] = &["Min-Max", "Partition", "Statistics", "PrimaryKey", "Skip"];
     let mut in_table = false;
     let mut in_pk = false;
     for line in raw.lines() {

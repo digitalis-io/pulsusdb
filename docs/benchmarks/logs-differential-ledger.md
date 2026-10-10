@@ -366,7 +366,7 @@ distinct (`Distinct (Preliminary DISTINCT)` in the measured plan), so the
   `/detected_fields`' per-field `cardinality`, and — landed by issue #261,
   no longer a forward reference — `/detected_labels`' per-key
   `cardinality`, `uniqExact(val) AS cardinality` in
-  `crates/pulsus-read/src/logql/sql.rs:777-788`. On the reference both come
+  `crates/pulsus-read/src/logql/sql.rs:841-852`. On the reference both come
   from the same sketch type: `newParsedFields` and `newParsedLabels` each
   build `hyperloglog.New()` (`pkg/querier/querier.go:934`, `:1035` @ `grafana/loki`
   v3.7.4 = `b318f2829f0ae2094ab3a1e90780450e9e4b03be`), and
@@ -495,7 +495,7 @@ distinct (`Distinct (Preliminary DISTINCT)` in the measured plan), so the
   at all. `N` is the number of distinct values a stream-label key has
   across the whole month partition(s) the request's window touches,
   narrowed only by the optional `query=`'s `fingerprint IN` filter
-  (`sql::detected_labels`, `crates/pulsus-read/src/logql/sql.rs:777-788`);
+  (`sql::detected_labels`, `crates/pulsus-read/src/logql/sql.rs:841-852`);
   **no request parameter bounds it** — `line_limit` and `limit` do not
   exist on this endpoint, and `start`/`end` select partitions rather
   than rows (the within-month granularity gap is issue #399). The
@@ -506,7 +506,7 @@ distinct (`Distinct (Preliminary DISTINCT)` in the measured plan), so the
   ordinary operation rather than at an extreme.
 - **Cost — reference-faithfulness is the MOST expensive option,
   measured.**
-  `clickhouse/clickhouse-server:24.8`, one node, `system.query_log`,
+  server 24.8, one node, `system.query_log`,
   3 reps, 2026-08-08. Corpus A: 3,000,000 rows in ONE month partition of
   the `log_streams_idx` shape = 1,000,000 distinct `pod` values + 50
   `namespace` + 500 `service`. The query is the production text of
@@ -4301,7 +4301,7 @@ unexplained.
 - **PulsusDB behaviour (the delta): a malformed query is a `400` in every
   window.** Nothing about our rejection depends on the dates asked for:
   `plan()` and `CompiledPipeline::compile` both run before any I/O
-  (`logql/exec.rs:644`, `:938`, `:2511`, `:2813`, `logql/variants.rs:517`,
+  (`logql/exec.rs:645`, `:939`, `:2530`, `:2832`, `logql/variants.rs:517`,
   propagated with `?` and surfaced by `logs_api/error.rs` as a 400), so an
   invalid pipeline cannot reach a "no chunks, return empty" path in the
   first place.
@@ -5941,12 +5941,29 @@ mechanism stayed unmodelled. Two axes, one moved.
   identifier is skipped, and the identifier's PRE-SEEDED empty string
   survives to the grouping. `git grep ShouldExtract -- crates/` returns
   doc comments only: PulsusDB extracts every key, always.
-- **This is invisible for the implicit parsers** (`| logfmt`, `| json`,
-  `| regexp`, `| pattern`), because grouping discards the extra labels
-  anyway. Only the EXPRESSION parsers make it observable, and only
-  because of the pre-seed — there has to be an empty value already
-  sitting under the identifier for the skipped extraction to leave
-  something behind.
+- **For the implicit parsers it is mostly invisible** (`| logfmt`,
+  `| json`, `| regexp`, `| pattern`), because grouping discards the
+  extra labels anyway. Mostly: the reference also STOPS reading a line
+  once every label the query needs is set (`AllRequiredExtracted`,
+  `pkg/logql/log/parser.go:432`, `:612`; `:118` for `json`), and ours
+  reads on. Issue #624 part 3d measured, on `main` against a port of the
+  reference's parsers, that this is visible for `| logfmt --strict` and
+  for a repeated targeted key:
+
+  | query | line | the reference | ours |
+  |---|---|---|---|
+  | `sum by (level) (count_over_time({…} \| logfmt --strict [1m]))` | `level=info msg="un` | `{level="info"}` 1 | `LogfmtParserErr` |
+  | the same | `level=info a=b=c` | `{level="info"}` 1 | `LogfmtParserErr` |
+  | `sum by (level) (count_over_time({…} \| logfmt --strict level="level" [1m]))` | `level=info msg="un` | `{level="info"}` 1 | `LogfmtParserErr` |
+  | `sum by (level) (count_over_time({…} \| logfmt level="level" [1m]))` | `level=info level=error` | `{level="info"}` | `{level="error"}` |
+  | the same | `lvl=1 level=2 level=3` | `{level="2"}` | `{level="3"}` |
+
+  These are documented limits, not fixed (owner, 2026-10-10): each line
+  in the table is bad source data, a broken quote or a stray `=` under
+  `--strict`, or a key twice. Otherwise only the EXPRESSION parsers
+  make it observable, and only because of the pre-seed — there has to
+  be an empty value already sitting under the identifier for the skipped
+  extraction to leave something behind.
 - **Measured on `grafana/loki:3.7.4` digest
   `sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc`
   (buildinfo read from the running process: version 3.7.4, revision

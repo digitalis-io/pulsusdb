@@ -27,8 +27,7 @@ measured wall-clock result from this run, not an estimate.
 
 **Hardware / environment (measured on):** 12th Gen Intel Core i7-1260P (16
 logical CPUs), Linux 5.15 (WSL2), `rustc`/`cargo` 1.93.0. ClickHouse
-24.8.14.39 (official build) run via `podman run --rm -p 9000:9000 -p
-8123:8123 clickhouse/clickhouse-server:24.8`, no resource limits applied
+24.8.14.39 (official build) run in one container of server 24.8, no resource limits applied
 (shares the host with other processes — see the row-count deviation below).
 
 **Row shapes and codecs are byte-identical to the authoritative DDL**
@@ -330,7 +329,7 @@ scenarios captured together, plus the isolated fetch (peak-RSS) run and the
 TLS run, are reproducible via:
 
 ```text
-podman run -d --rm -p 9000:9000 -p 8123:8123 clickhouse/clickhouse-server:24.8
+podman run -d --rm -p 9000:9000 -p 8123:8123 clickhouse/clickhouse-server:26.8.21.10
 cargo run -p xtask --release -- ch-bench --scenario all \
     --rows 1000000 --block-rows 200000 --reps 5 --pool-size 8 \
     --out /tmp/ch-bench-full.json
@@ -341,7 +340,7 @@ xtask/docker/gen-certs.sh
 podman run -d --rm -p 9440:9440 -p 8443:8443 \
     -v "$PWD/xtask/docker/certs:/certs:ro" \
     -v "$PWD/xtask/docker/config.d/tls.xml:/etc/clickhouse-server/config.d/tls.xml:ro" \
-    clickhouse/clickhouse-server:24.8
+    clickhouse/clickhouse-server:26.8.21.10
 cargo run -p xtask --release -- ch-bench --scenario tls \
     --https-url https://127.0.0.1:8443 --native-tls-addr 127.0.0.1:9440 \
     --tls-server-name localhost --tls-ca-cert xtask/docker/certs/ca.crt \

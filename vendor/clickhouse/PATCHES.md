@@ -28,10 +28,11 @@ error path). If it has, drop this patch and read the typed value instead. The
 gate that proves the patch is still doing its job is
 `pulsus-clickhouse`'s live test
 `a_result_limit_tripped_after_output_has_been_written_carries_its_code`
-**run against ClickHouse 26.3 or newer** — on 24.8 it passed either way. Since
-issue #376 moved the supported floor to 26.3 LTS, 26.3 is the only version we
-run, so that gate is live in every CI job and on every developer machine
-rather than conditional on which server happened to be up.
+**run against ClickHouse 26.3 or newer** — on 24.8 it passed either way. The
+supported floor is 26.8 LTS (issue #376 moved it to 26.3, issue #624 to 26.8),
+and 26.8 is the only version we run, so that gate is live in every CI job and
+on every developer machine rather than conditional on which server happened
+to be up.
 
 ## 1. `collect_bad_response` keeps the header-derived exception code
 

@@ -38,7 +38,7 @@
 //!
 //! ```text
 //! podman run -d --rm --name pulsus-ch-test -p 19123:8123 -p 19000:9000 \
-//!     clickhouse/clickhouse-server:26.3
+//!     clickhouse/clickhouse-server:26.8.21.10
 //! PULSUS_TEST_CLICKHOUSE=1 cargo test -p pulsus-read --test explain_indexes
 //! podman rm -f pulsus-ch-test
 //! ```
@@ -54,6 +54,10 @@ use pulsus_read::logql::sql::{self, ScanProjection, TimeWindow};
 use pulsus_read::logql::{Direction, Plan, PlanCtx, QueryParams, QuerySpec, plan};
 use pulsus_schema::{RenderCtx, SchemaParams};
 use pulsus_schema_testkit::run_init;
+
+/// From 26.7 `EXPLAIN` defaults to a new layout; every `EXPLAIN` here asks
+/// for the one these assertions read (issue #624, part 3d).
+const EXPLAIN_LAYOUT: &str = "\nSETTINGS explain_query_plan_default = 'legacy'";
 
 /// `true` when the gated half of this suite should run. Skips cleanly on a
 /// developer machine with no container; **panics** rather than skipping when
@@ -118,7 +122,7 @@ async fn explain_raw(client: &ChClient, sql: &str) -> String {
     // contains one. Double it here exactly as `LogQlEngine::query_stream`
     // does internally — this test file calls `ChClient` directly, bypassing
     // that wrapper, so it must apply the same fix.
-    let full = format!("EXPLAIN indexes = 1 {sql}").replace('?', "??");
+    let full = format!("EXPLAIN indexes = 1 {sql}{EXPLAIN_LAYOUT}").replace('?', "??");
     let mut stream = client
         .query_stream::<ExplainRow>(&full, &QuerySettings::new())
         .await
@@ -152,10 +156,15 @@ fn normalize_numbers(s: &str) -> String {
 }
 
 /// ClickHouse's `EXPLAIN indexes = 1` block titles this crate's tables ever
-/// produce (`MinMax`/`Partition`/`PrimaryKey` for `ORDER BY`/`PARTITION BY`
+/// produce (`Min-Max`/`Partition`/`PrimaryKey` for `ORDER BY`/`PARTITION BY`
 /// analysis, `Skip` per `text`/`minmax` secondary index) — kept as an explicit allow-list so [`index_usage`]'s extract is
 /// self-describing (which *kind* of index, not just position-in-list).
-const INDEX_BLOCK_TITLES: &[&str] = &["MinMax", "Partition", "PrimaryKey", "Skip"];
+const INDEX_BLOCK_TITLES: &[&str] = &["Min-Max", "Partition", "PrimaryKey", "Skip"];
+
+/// The title of the block 26.8 adds when column statistics prune parts
+/// (issue #624, part 3d). Whether it appears depends on how the rows lie
+/// in parts, not on the statement, so [`index_usage`] drops the block.
+const STATISTICS_BLOCK_TITLE: &str = "Statistics";
 
 /// The `Name:` line of the pseudo-block ClickHouse 26.x emits when a
 /// filter mixes AND and OR over skip-indexed columns. It is not an index
@@ -192,11 +201,25 @@ fn combined_skip_present(raw: &str) -> bool {
 /// The `<Combined skip indexes>` pseudo-block is excluded entirely (title
 /// and name), because it is not an index the table declares; ask
 /// [`combined_skip_present`] for it instead.
+///
+/// The `Statistics` block is excluded too ([`STATISTICS_BLOCK_TITLE`]).
 fn index_usage(raw: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut capturing_keys = false;
+    let mut in_statistics = false;
     for line in raw.lines() {
         let trimmed = line.trim();
+        if trimmed == STATISTICS_BLOCK_TITLE {
+            in_statistics = true;
+            capturing_keys = false;
+            continue;
+        }
+        if in_statistics {
+            if !INDEX_BLOCK_TITLES.contains(&trimmed) {
+                continue;
+            }
+            in_statistics = false;
+        }
         if trimmed == COMBINED_SKIP_NAME {
             // Drop the `Skip` title this pseudo-block's name belongs to,
             // so the extract holds only declared indexes.
@@ -820,7 +843,7 @@ async fn stage1_single_equality_uses_the_key_val_primary_key() {
     assert_eq!(
         usage,
         v(&[
-            "MinMax",
+            "Min-Max",
             "Keys:",
             "month",
             "Condition: (month in [#, #])",
@@ -854,7 +877,7 @@ async fn stage1_multi_equality_uses_the_key_val_primary_key() {
     assert_eq!(
         usage,
         v(&[
-            "MinMax",
+            "Min-Max",
             "Keys:",
             "month",
             "Condition: (month in [#, #])",
@@ -888,7 +911,7 @@ async fn stage1_regex_matcher_uses_the_key_primary_key_prefix() {
     assert_eq!(
         usage,
         v(&[
-            "MinMax",
+            "Min-Max",
             "Keys:",
             "month",
             "Condition: (month in [#, #])",
@@ -921,7 +944,7 @@ async fn stage1_mixed_positive_and_negative_matchers_uses_the_key_val_primary_ke
     assert_eq!(
         usage,
         v(&[
-            "MinMax",
+            "Min-Max",
             "Keys:",
             "month",
             "Condition: (month in [#, #])",
@@ -959,7 +982,7 @@ async fn stage2_hydration_uses_the_fingerprint_primary_key() {
     assert_eq!(
         usage,
         v(&[
-            "MinMax",
+            "Min-Max",
             "Condition: true",
             "Partition",
             "Condition: true",
@@ -1102,7 +1125,7 @@ async fn assert_stage3_usage(
 /// across 24.8.14.39 and 26.3.17.110 (measured).
 fn expected_stage3_prefix() -> Vec<String> {
     v(&[
-        "MinMax",
+        "Min-Max",
         "Keys:",
         "timestamp_ns",
         "Condition: and((timestamp_ns in (-Inf, #]), (timestamp_ns in [#, +Inf)))",
@@ -1203,25 +1226,24 @@ async fn stage3_regex_line_filter_over_a_plain_literal_uses_the_body_index() {
 }
 
 #[tokio::test]
-async fn stage3_not_regex_line_filter_over_a_metacharacter_pattern_lists_the_body_index_with_no_grams()
- {
+async fn stage3_not_regex_line_filter_over_a_metacharacter_pattern_engages_no_body_index() {
     skip_unless_live!();
     let db = &pulsus_testkit::test_db("pulsus_read_it_s3_not_regex");
     let ts_ns = now_ns();
     let client = setup_with_line_filter_corpus(db, ts_ns).await;
 
     // `!~` renders `NOT (match(body, ...))` and nothing else — no
-    // prefilter of any kind is minted (issue #450).
-    // ClickHouse's `EXPLAIN indexes = 1` still lists
-    // the `body` `text` index, with no grams to test (`tokens: []`); it
-    // prunes nothing, which `PrunesBy::NotAtAll` pins.
+    // prefilter of any kind is minted (issue #450). From 26.8 ClickHouse's
+    // `EXPLAIN indexes = 1` no longer lists the `body` `text` index, which
+    // has no grams to test (26.3 listed it with `tokens: []`); it prunes
+    // nothing, which `PrunesBy::NotAtAll` pins.
     assert_stage3_usage(
         db,
         ts_ns,
         &client,
         r#"{service_name="checkout"} !~ "err.*""#,
         PrunesBy::NotAtAll,
-        Some("(mode: Any; tokens: [])"),
+        None,
     )
     .await;
 }
@@ -1587,7 +1609,7 @@ async fn detected_labels_aggregation_prunes_on_the_month_partition() {
         // separately, on the subquery's standalone form, by
         // `detected_labels_activity_subquery_prunes_the_rollup_by_bucket_range`.
         v(&[
-            "MinMax",
+            "Min-Max",
             "Keys:",
             "month",
             "Condition: (month in [#, #])",
@@ -1647,7 +1669,7 @@ async fn detected_labels_activity_subquery_prunes_the_rollup_by_bucket_range() {
     assert_eq!(
         index_usage(&raw),
         v(&[
-            "MinMax",
+            "Min-Max",
             "Keys:",
             "bucket_ns",
             "Condition: and((bucket_ns in (-Inf, #]), (bucket_ns in [#, +Inf)))",
@@ -1680,7 +1702,7 @@ async fn detected_labels_activity_subquery_prunes_the_rollup_by_bucket_range() {
     assert_eq!(
         explain(&client, &scoped).await,
         v(&[
-            "MinMax",
+            "Min-Max",
             "Keys:",
             "bucket_ns",
             "Condition: and((bucket_ns in (-Inf, #]), (bucket_ns in [#, +Inf)))",
@@ -1745,7 +1767,7 @@ async fn series_without_a_selector_prunes_the_rollup_and_hits_the_streams_primar
     assert_eq!(
         index_usage(&raw),
         v(&[
-            "MinMax",
+            "Min-Max",
             "Keys:",
             "bucket_ns",
             "Condition: and((bucket_ns in (-Inf, #]), (bucket_ns in [#, +Inf)))",
@@ -1780,7 +1802,7 @@ async fn series_without_a_selector_prunes_the_rollup_and_hits_the_streams_primar
         )
         .await,
         v(&[
-            "MinMax",
+            "Min-Max",
             "Condition: true",
             "Partition",
             "Condition: true",
@@ -1826,7 +1848,7 @@ async fn label_discovery_scans_prune_on_the_month_partition_and_the_activity_buc
     // standalone form by
     // `detected_labels_activity_subquery_prunes_the_rollup_by_bucket_range`.
     let month_blocks = [
-        "MinMax",
+        "Min-Max",
         "Keys:",
         "month",
         "Condition: (month in [#, #])",
@@ -1916,7 +1938,7 @@ async fn label_discovery_scans_prune_on_the_month_partition_and_the_activity_buc
 /// predicates over `fingerprint`/`bucket_ns` that drive index usage.
 fn expected_metric_rollup_usage() -> Vec<String> {
     v(&[
-        "MinMax",
+        "Min-Max",
         "Keys:",
         "bucket_ns",
         "Condition: and((bucket_ns in (-Inf, #]), (bucket_ns in [#, +Inf)))",
@@ -2003,7 +2025,7 @@ fn projection_of(mp: &pulsus_read::logql::MetricPlan) -> ScanProjection {
 /// references `body` and the body index is never considered.
 fn expected_metric_instant_raw_usage() -> Vec<String> {
     v(&[
-        "MinMax",
+        "Min-Max",
         "Keys:",
         "timestamp_ns",
         "Condition: and((timestamp_ns in (-Inf, #]), (timestamp_ns in [#, +Inf)))",
@@ -2084,7 +2106,7 @@ fn promql_sample_fetch_sql(query: &str, params: pulsus_promql::PlanParams, db: &
 /// the MinMax block instead).
 fn expected_metric_samples_fetch_usage() -> Vec<String> {
     v(&[
-        "MinMax",
+        "Min-Max",
         "Keys:",
         "unix_milli",
         "Condition: and((unix_milli in (-Inf, #]), (unix_milli in [#, +Inf)))",
@@ -2215,7 +2237,7 @@ async fn promql_multi_metric_fanout_prunes_on_both_metric_name_and_fingerprint_k
     assert_eq!(
         usage,
         v(&[
-            "MinMax",
+            "Min-Max",
             "Keys:",
             "unix_milli",
             "Condition: and((unix_milli in (-Inf, #]), (unix_milli in [#, +Inf)))",
@@ -2311,7 +2333,7 @@ async fn info_selector_fetch_prunes_on_metric_name_and_its_resolution_probe_is_l
     assert_eq!(
         usage,
         v(&[
-            "MinMax",
+            "Min-Max",
             "Keys:",
             "unix_milli",
             "Condition: and((unix_milli in (-Inf, #]), (unix_milli in [#, +Inf)))",
@@ -2363,7 +2385,7 @@ async fn info_selector_fetch_prunes_on_metric_name_and_its_resolution_probe_is_l
     assert_eq!(
         probe_usage,
         v(&[
-            "MinMax",
+            "Min-Max",
             "Keys:",
             "day",
             "Condition: and((day in (-Inf, #]), (day in [#, +Inf)))",
@@ -2511,7 +2533,7 @@ async fn discovery_distinct_names_engages_the_same_indexes_as_the_wide_discovery
     assert_eq!(
         narrow,
         v(&[
-            "MinMax",
+            "Min-Max",
             "Keys:",
             "day",
             "Condition: and((day in (-Inf, #]), (day in [#, +Inf)))",
@@ -2675,7 +2697,7 @@ async fn the_re2_compile_probe_costs_the_metric_series_fallback_no_index_engagem
     assert_eq!(
         explain(&client, &with_probe).await,
         v(&[
-            "MinMax",
+            "Min-Max",
             "Keys:",
             "day",
             "Condition: and((day in (-Inf, #]), (day in [#, +Inf)))",
@@ -2908,7 +2930,7 @@ fn primary_key_granules(raw: &str) -> Option<(u64, u64)> {
     let mut in_pk = false;
     for line in raw.lines() {
         let t = line.trim();
-        if matches!(t, "MinMax" | "Partition" | "PrimaryKey" | "Skip") {
+        if matches!(t, "Min-Max" | "Partition" | "PrimaryKey" | "Skip") {
             in_pk = t == "PrimaryKey";
         } else if in_pk && let Some(rest) = t.strip_prefix("Granules: ") {
             let (m, n) = rest.split_once('/')?;

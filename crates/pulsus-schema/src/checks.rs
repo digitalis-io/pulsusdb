@@ -11,8 +11,8 @@ use pulsus_clickhouse::{ChClient, ChError, QuerySettings, Row};
 
 use crate::error::SchemaError;
 
-/// Parses a ClickHouse `SELECT version()` string (e.g. `26.3.17.110`) and
-/// refuses anything older than 26.3 (docs/schemas.md §8). Pure and
+/// Parses a ClickHouse `SELECT version()` string (e.g. `26.8.21.10`) and
+/// refuses anything older than 26.8 (docs/schemas.md §8). Pure and
 /// injectable (task-manager resolution #3 on issue #5) so refusal messages
 /// are unit-tested without a live server; `run_init` supplies the real
 /// server-reported string.
@@ -26,7 +26,7 @@ pub fn check_version(version: &str) -> Result<(), SchemaError> {
         .next()
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| SchemaError::Version(version.to_string()))?;
-    if (major, minor) < (26, 3) {
+    if (major, minor) < (26, 8) {
         return Err(SchemaError::UnsupportedVersion {
             found: version.to_string(),
         });
@@ -780,20 +780,23 @@ mod tests {
 
     #[test]
     fn check_version_accepts_the_minimum_supported_version() {
-        assert!(check_version("26.3.0.1").is_ok());
+        assert!(check_version("26.8.0.1").is_ok());
     }
 
     #[test]
     fn check_version_accepts_newer_versions() {
-        assert!(check_version("26.4.0.0").is_ok());
+        assert!(check_version("26.9.0.0").is_ok());
         assert!(check_version("27.1.0.0").is_ok());
     }
 
     #[test]
     fn check_version_refuses_older_minor_versions() {
-        let err = check_version("26.2.9.1").unwrap_err();
-        assert!(matches!(err, SchemaError::UnsupportedVersion { .. }));
-        assert!(err.to_string().contains("26.2.9.1"));
+        // 26.3.29.7 is the floor 26.8 replaced (issue #624, part 3d).
+        for v in ["26.7.9.1", "26.3.29.7"] {
+            let err = check_version(v).unwrap_err();
+            assert!(matches!(err, SchemaError::UnsupportedVersion { .. }), "{v}");
+            assert!(err.to_string().contains(v), "{v}");
+        }
     }
 
     #[test]

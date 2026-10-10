@@ -669,7 +669,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: clickhouse-keeper
-          image: docker.io/clickhouse/clickhouse-keeper:26.3.17
+          image: docker.io/clickhouse/clickhouse-keeper:26.8.21.10
           env:
             - name: CLICKHOUSE_INTERSERVER_SECRET
               valueFrom:
@@ -779,7 +779,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: clickhouse
-          image: docker.io/clickhouse/clickhouse-server:26.3.17
+          image: docker.io/clickhouse/clickhouse-server:26.8.21.10
           env:
             - name: CLICKHOUSE_DB
               value: pulsus
@@ -915,7 +915,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: clickhouse
-          image: docker.io/clickhouse/clickhouse-server:26.3.17
+          image: docker.io/clickhouse/clickhouse-server:26.8.21.10
           env:
             - name: CLICKHOUSE_DB
               value: pulsus
@@ -1051,7 +1051,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: clickhouse
-          image: docker.io/clickhouse/clickhouse-server:26.3.17
+          image: docker.io/clickhouse/clickhouse-server:26.8.21.10
           env:
             - name: CLICKHOUSE_DB
               value: pulsus

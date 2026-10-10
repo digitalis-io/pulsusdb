@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! podman run -d --rm --name pulsus-ch-test -p 19124:8123 -p 19001:9000 \
-//!     clickhouse/clickhouse-server:26.3
+//!     clickhouse/clickhouse-server:26.8.21.10
 //! PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19124 \
 //!     cargo test -p pulsus-schema --test live_hist_schema
 //! podman rm -f pulsus-ch-test
@@ -20,6 +20,10 @@ use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, QuerySettings, Row};
 use pulsus_schema::{RenderCtx, SchemaParams};
 use pulsus_schema_testkit::run_init;
+
+/// From 26.7 `EXPLAIN` defaults to a new layout; every `EXPLAIN` here asks
+/// for the one these assertions read (issue #624, part 3d).
+const EXPLAIN_LAYOUT: &str = "\nSETTINGS explain_query_plan_default = 'legacy'";
 
 /// `true` when the gated half of this suite should run. Skips cleanly on a
 /// developer machine with no container; **panics** rather than skipping when
@@ -346,7 +350,7 @@ async fn metric_hist_samples_explain_shows_series_id_pk_pruning() {
             &format!(
                 "EXPLAIN indexes = 1 SELECT fingerprint, unix_milli, count, sum \
                  FROM {db}.metric_hist_samples \
-                 WHERE fingerprint IN (toUInt128('18374588331335825905'))"
+                 WHERE fingerprint IN (toUInt128('18374588331335825905')){EXPLAIN_LAYOUT}"
             ),
             &QuerySettings::new(),
         )
@@ -366,7 +370,10 @@ async fn metric_hist_samples_explain_shows_series_id_pk_pruning() {
 /// Collects the raw `EXPLAIN indexes = 1` lines for `sql`.
 async fn explain_lines(client: &ChClient, sql: &str) -> Vec<String> {
     let mut stream = client
-        .query_stream::<ExplainRow>(&format!("EXPLAIN indexes = 1 {sql}"), &QuerySettings::new())
+        .query_stream::<ExplainRow>(
+            &format!("EXPLAIN indexes = 1 {sql}{EXPLAIN_LAYOUT}"),
+            &QuerySettings::new(),
+        )
         .await
         .unwrap_or_else(|e| panic!("EXPLAIN failed: {e}\nSQL:\n{sql}"));
     let mut out = Vec::new();

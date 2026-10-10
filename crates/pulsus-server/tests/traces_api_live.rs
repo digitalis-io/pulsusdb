@@ -20,7 +20,7 @@
 //!
 //! ```text
 //! podman run -d --rm --name pulsus-ch-test -p 19123:8123 -p 19000:9000 \
-//!     clickhouse/clickhouse-server:26.3
+//!     clickhouse/clickhouse-server:26.8.21.10
 //! PULSUS_TEST_CLICKHOUSE=1 cargo test -p pulsus-server --test traces_api_live
 //! podman rm -f pulsus-ch-test
 //! ```
@@ -531,6 +531,7 @@ fn spawn_ready_with_env(port: u16, db: &ScopedDb, extra_env: &[(&str, &str)]) ->
     // does not exist: build it with `schema/schema.sh`" and `/ready` never
     // reaches 200. Idempotent, so repeated spawns cost one no-op render.
     live_db::build_schema_blocking(db);
+    live_db::register_push_target(port, db);
     let mut command = Command::new(env!("CARGO_BIN_EXE_pulsusdb"));
     let command = command
         .env("PULSUS_HOST", "127.0.0.1")
@@ -594,8 +595,21 @@ fn span(trace_id: [u8; 16], span_id: [u8; 8], name: &str, start_ns: u64) -> Span
     }
 }
 
+/// The `(trace_id, span_id)` of every span `req` carries, for
+/// [`live_db::settle_pushed_spans`].
+fn pushed_keys(req: &ExportTraceServiceRequest) -> Vec<(Vec<u8>, Vec<u8>)> {
+    req.resource_spans
+        .iter()
+        .flat_map(|r| r.scope_spans.iter())
+        .flat_map(|s| s.spans.iter())
+        .map(|s| (s.trace_id.clone(), s.span_id.clone()))
+        .collect()
+}
+
 /// Seeds `spans` through `POST /v1/traces` (sync — no `X-Pulsus-Async`
-/// header, so a `200` means the rows are flushed and read-visible), with
+/// header, so a `200` means the old path's tables hold the rows; the helper
+/// then waits for them in the landing-fed tables,
+/// [`live_db::settle_pushed_spans`]), with
 /// the fixed resource (`service.name=checkout`) and scope (`live-scope`)
 /// context every fetch assertion below checks for.
 fn ingest(port: u16, spans: Vec<Span>, ctx: &str) {
@@ -633,6 +647,7 @@ fn ingest(port: u16, spans: Vec<Span>, ctx: &str) {
         "{ctx}: sync ingest must succeed, body {:?}",
         String::from_utf8_lossy(&res.body)
     );
+    live_db::settle_pushed_spans(port, &pushed_keys(&req), ctx);
 }
 
 /// [`ingest`] with the resource's `service.name` supplied by the caller —
@@ -675,6 +690,7 @@ fn ingest_as(port: u16, service: &str, spans: Vec<Span>, ctx: &str) {
         "{ctx}: sync ingest must succeed, body {:?}",
         String::from_utf8_lossy(&res.body)
     );
+    live_db::settle_pushed_spans(port, &pushed_keys(&req), ctx);
 }
 
 /// Seeds `spans` through `POST /v1/traces` with a resource carrying **no
@@ -718,6 +734,7 @@ fn ingest_rootless(port: u16, spans: Vec<Span>, ctx: &str) {
         "{ctx}: sync ingest must succeed, body {:?}",
         String::from_utf8_lossy(&res.body)
     );
+    live_db::settle_pushed_spans(port, &pushed_keys(&req), ctx);
 }
 
 // ---------------------------------------------------------------------
@@ -1312,9 +1329,22 @@ async fn zipkin_shared_span_trace_by_id_returns_both_the_server_and_client_sides
         String::from_utf8_lossy(&res.body)
     );
 
-    // Trace-by-ID returns BOTH sides — the correctness gate.
+    // Trace-by-ID returns BOTH sides — the correctness gate. A `202` does
+    // not make the landing-fed tables hold the push yet (issue #624, part
+    // 3d), so the read is repeated every 200 ms, for at most 10 s, until it
+    // answers both sides; the assertions below then run unchanged.
     let ctx = "GET trace-by-ID (shared span)";
-    let res = get(ZIPKIN_PORT, &fetch_path(trace_hex), &[], ctx);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let res = loop {
+        let res = get(ZIPKIN_PORT, &fetch_path(trace_hex), &[], ctx);
+        let both = res.status == 200
+            && serde_json::from_slice::<TracesData>(&res.body)
+                .is_ok_and(|decoded| spans_of(&decoded).len() == 2);
+        if both || std::time::Instant::now() >= deadline {
+            break res;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
     assert_eq!(
         res.status,
         200,
@@ -1475,6 +1505,7 @@ async fn duration_seconds_reach_the_wire_exactly_as_the_reference_emits_them() {
         "{ctx}: sync ingest must succeed, body {:?}",
         String::from_utf8_lossy(&res.body)
     );
+    live_db::settle_pushed_spans(ULP_PORT, &pushed_keys(&req), ctx);
 
     // Window math in unix SECONDS (magnitude < 10^12), the file's
     // existing fixture idiom; the instant query returns one series with
@@ -2202,6 +2233,12 @@ async fn absent_submessages_are_materialized_present_and_empty_on_the_wire() {
         200,
         "sync push must succeed, body {:?}",
         String::from_utf8_lossy(&res.body)
+    );
+    let pushed = ExportTraceServiceRequest::decode(&push_body[..]).expect("an OTLP request");
+    live_db::settle_pushed_spans(
+        NULLABLE_WIRE_PORT,
+        &pushed_keys(&pushed),
+        "the captured push",
     );
 
     // The rows survived retention. A sync `200` means they are flushed and

@@ -13,7 +13,7 @@ One row per gated shape. A shape's verdict is one of:
 - **moved-regression** — halts the commit and goes back to the owner. **No
   row below carries this verdict.**
 
-Servers: `docker.io/clickhouse/clickhouse-server:24.8` →
+Servers: 24.8 →
 `24.8.14.39` (digest `sha256:1ffa82edee000a42c09313bd9f1293d94c570aee74babc1b3ca9983a35fa597b`)
 and `:26.3` → `26.3.17.110`
 (digest `sha256:2ef11bbe2e44ab7022f37ff3019b3f2125ed09e919ea6194660be6130b7ca4b7`).

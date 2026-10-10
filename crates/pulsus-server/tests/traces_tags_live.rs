@@ -48,7 +48,7 @@
 //! Gated behind `PULSUS_TEST_CLICKHOUSE=1`. Run locally:
 //!
 //! ```text
-//! podman run -d --rm --name pulsus-ch-test -p 19123:8123 clickhouse/clickhouse-server:26.3
+//! podman run -d --rm --name pulsus-ch-test -p 19123:8123 clickhouse/clickhouse-server:26.8.21.10
 //! PULSUS_TEST_CLICKHOUSE=1 cargo test -p pulsus-server --test traces_tags_live
 //! podman rm -f pulsus-ch-test
 //! ```
