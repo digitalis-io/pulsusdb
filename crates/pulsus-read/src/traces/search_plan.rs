@@ -5006,12 +5006,27 @@ mod tests {
         ));
     }
 
+    /// Issue #594 part 4: `select()` of the nested-set, trace-level and
+    /// child-count intrinsics is planned, projecting nothing here, so the
+    /// fork can give it to the search statement.
     #[test]
-    fn select_of_a_nested_set_intrinsic_is_a_type_mismatch() {
-        let query = parse(r#"{ .k = "v" } | select(nestedSetLeft)"#).expect("parse");
-        match plan_search(&query, &PARAMS, &ctx()) {
-            Err(PlanError::TypeMismatch(msg)) => assert!(msg.contains("nested-set"), "{msg}"),
-            other => panic!("expected TypeMismatch, got {other:?}"),
+    fn select_of_the_seven_plans_and_projects_nothing() {
+        for q in [
+            r#"{ .k = "v" } | select(nestedSetLeft)"#,
+            r#"{ .k = "v" } | select(nestedSetRight)"#,
+            r#"{ .k = "v" } | select(nestedSetParent)"#,
+            r#"{ .k = "v" } | select(traceDuration)"#,
+            r#"{ .k = "v" } | select(rootName)"#,
+            r#"{ .k = "v" } | select(rootServiceName)"#,
+            r#"{ .k = "v" } | select(span:childCount)"#,
+        ] {
+            let query = parse(q).expect("parse");
+            let p = plan_search(&query, &PARAMS, &ctx()).unwrap_or_else(|e| panic!("{q}: {e}"));
+            assert_eq!(
+                p.projected_attr_capacity(),
+                1,
+                "{q}: only `.k = \"v\"` projects"
+            );
         }
     }
 
@@ -5060,10 +5075,6 @@ mod tests {
     fn select_of_a_trace_level_or_scoped_intrinsic_is_a_type_mismatch() {
         for q in [
             r#"{ .k = "v" } | select(statusMessage)"#,
-            r#"{ .k = "v" } | select(traceDuration)"#,
-            r#"{ .k = "v" } | select(rootName)"#,
-            r#"{ .k = "v" } | select(rootServiceName)"#,
-            r#"{ .k = "v" } | select(span:childCount)"#,
             r#"{ .k = "v" } | select(span:parentID)"#,
         ] {
             let query = parse(q).expect("parse");

@@ -458,6 +458,35 @@ async fn a_numbered_search_answers_over_two_shards() {
             wrong.push(format!("{query}\n  want: {want}\n  got:  {got}"));
         }
     }
+    // Issue #594 part 4: a child count or a number as an operand, a
+    // numbered comparison before an aggregate, and select() of a number.
+    for (query, numbers, each) in [
+        ("{ nestedSetRight - nestedSetLeft = 1 }", false, "[03]"),
+        ("{ span:childCount * 1s > duration }", false, "[01, 02]"),
+        ("{ nestedSetLeft > 0 } | count() > 2", false, "[01, 02, 03]"),
+        (
+            "{ } | select(nestedSetParent)",
+            true,
+            "[01 -1, 02 1, 03 2, 04 0]",
+        ),
+    ] {
+        let want = (0x10..=0x23u8)
+            .rev()
+            .map(|t| format!("{t:02x} {each}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let got = match engine
+            .search_routed(&plan(query, window.0, window.1, 30))
+            .await
+        {
+            Ok(out) if numbers => numbers_of(&out),
+            Ok(out) => groups_of(&out),
+            Err(e) => format!("Err({e})"),
+        };
+        if got != want {
+            wrong.push(format!("{query}\n  want: {want}\n  got:  {got}"));
+        }
+    }
     exec(
         &bootstrap,
         &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
