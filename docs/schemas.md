@@ -1342,7 +1342,7 @@ CREATE TABLE spans (
 PARTITION BY toDate(fromUnixTimestamp64Nano(start_ns), 'UTC')
 ORDER BY (intDiv(start_ns, 300000000000), trace_id, start_ns, span_id, kind)
 TTL toDateTime(least(intDiv(start_ns, 1000000000) + (7 * 86400), 4294967295))
-SETTINGS ttl_only_drop_parts = 1, index_granularity = 2048;
+SETTINGS ttl_only_drop_parts = 1, index_granularity = 2048, min_columns_to_activate_adaptive_write_buffer = 1;
 
 The `idx_attr_<n>` indexes exist only for the attributes `PULSUS_TRACEQL_INDEXED_ATTRIBUTES` names (`docs/configuration.md` §3); a search whose filter requires `key = "<string>"` on one of them skips the granules that hold no such string.
 
