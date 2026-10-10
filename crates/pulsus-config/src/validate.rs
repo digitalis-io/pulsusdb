@@ -10,6 +10,31 @@ use crate::error::ConfigError;
 use crate::model::{ChProto, Config};
 use crate::units::{ByteSize, HumanDuration};
 
+/// The most attributes `traceql_indexed_attributes` may name (issue #595
+/// part 2): each is one more index every insert and merge builds.
+pub const MAX_INDEXED_ATTRIBUTES: usize = 16;
+
+/// The longest key `traceql_indexed_attributes` may name, in bytes (issue
+/// #595 part 2): sixteen of them keep the `spans` statement far inside the
+/// server's default `max_query_size`.
+pub const MAX_INDEXED_KEY_BYTES: usize = 128;
+
+/// Where an indexed attribute is stored (issue #595 part 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexedScope {
+    /// `spans.attrs`.
+    Span,
+    /// `spans.events.attrs`.
+    Event,
+}
+
+/// One `traceql_indexed_attributes` item, `span.<key>` or `event.<key>`:
+/// its scope and its key. The key is one or more segments of ASCII
+/// letters, digits, `_` and `-`, joined by single dots.
+pub fn parse_indexed_attribute(_item: &str) -> Result<(IndexedScope, String), String> {
+    Err(String::new())
+}
+
 fn value_err(field: &str, msg: &str, expected: &str) -> ConfigError {
     ConfigError::Value {
         field: field.to_string(),
@@ -2443,5 +2468,87 @@ mod tests {
         let cfg = Config::default();
         assert!(cfg.downsampling.raw_retention.is_none());
         assert!(validate(&cfg).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod indexed_attribute_tests {
+    use super::*;
+
+    /// Issue #595 part 2: the accepted and refused items of
+    /// `PULSUS_TRACEQL_INDEXED_ATTRIBUTES`. `schema/schema.sh` refuses the
+    /// same refused items (`crates/pulsus-schema/tests/schema_file.rs`).
+    #[test]
+    fn an_indexed_attribute_is_span_or_event_and_a_plain_dotted_key() {
+        for (item, want) in [
+            (
+                "span.app.request.id",
+                Some((IndexedScope::Span, "app.request.id")),
+            ),
+            (
+                "event.exception.type",
+                Some((IndexedScope::Event, "exception.type")),
+            ),
+            ("span.http-x.a_b", Some((IndexedScope::Span, "http-x.a_b"))),
+            ("span.k", Some((IndexedScope::Span, "k"))),
+            ("resource.k8s.pod.name", None),
+            ("link.x", None),
+            ("instrumentation.x", None),
+            (".k", None),
+            ("SPAN.k", None),
+            ("span.", None),
+            ("span..a", None),
+            ("span.a.", None),
+            ("span.a..b", None),
+            ("span.a b", None),
+            ("span.a`b", None),
+            ("span.a%b", None),
+        ] {
+            let got = parse_indexed_attribute(item).ok();
+            let want = want.map(|(s, k)| (s, k.to_string()));
+            assert_eq!(got, want, "{item}");
+        }
+    }
+
+    #[test]
+    fn a_key_of_128_bytes_is_accepted_and_one_of_129_refused() {
+        let at = format!("span.{}", "a.".repeat(63) + "ab");
+        let past = format!("span.{}", "a.".repeat(64) + "a");
+        assert_eq!(at.len() - "span.".len(), 128);
+        assert_eq!(past.len() - "span.".len(), 129);
+        assert!(parse_indexed_attribute(&at).is_ok(), "{at}");
+        let err = parse_indexed_attribute(&past).expect_err("129 bytes");
+        assert!(err.contains("128 bytes"), "{err}");
+    }
+
+    #[test]
+    fn a_resource_item_is_refused_naming_itself_and_the_resource_id_index() {
+        let err = validate(&Config {
+            traceql_indexed_attributes: vec!["resource.k8s.pod.name".into()],
+            ..Config::default()
+        })
+        .expect_err("refused")
+        .to_string();
+        assert!(
+            err.contains("resource.k8s.pod.name") && err.contains("resource_id"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_list_is_refused_for_a_bad_item_a_repeat_or_more_than_sixteen() {
+        let with = |items: Vec<String>| Config {
+            traceql_indexed_attributes: items,
+            ..Config::default()
+        };
+        assert!(validate(&with(vec![])).is_ok());
+        assert!(validate(&with(vec!["span.a".into(), "event.a".into()])).is_ok());
+        assert!(validate(&with(vec!["span.a".into(), "resource.a".into()])).is_err());
+        assert!(validate(&with(vec!["span.a".into(), "span.a".into()])).is_err());
+        let sixteen: Vec<String> = (0..16).map(|i| format!("span.k{i}")).collect();
+        assert!(validate(&with(sixteen.clone())).is_ok());
+        let mut seventeen = sixteen;
+        seventeen.push("span.k16".into());
+        assert!(validate(&with(seventeen)).is_err());
     }
 }

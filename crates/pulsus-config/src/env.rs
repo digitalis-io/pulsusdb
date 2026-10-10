@@ -516,8 +516,8 @@ mod tests {
         assert_eq!(sorted, deduped, "ALL_ENV_VARS must not contain duplicates");
         assert_eq!(
             ALL_ENV_VARS.len(),
-            96,
-            "docs/configuration.md §§1-8 document exactly 96 variables"
+            97,
+            "docs/configuration.md §§1-8 document exactly 97 variables"
         );
     }
 

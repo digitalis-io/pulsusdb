@@ -168,6 +168,11 @@ const ROWS: &[Row] = &[
         check: |c| c.retention_days == 30,
     },
     Row {
+        var: "PULSUS_TRACEQL_INDEXED_ATTRIBUTES",
+        value: "span.app.request.id,event.exception.type",
+        check: |c| c.traceql_indexed_attributes == ["span.app.request.id", "event.exception.type"],
+    },
+    Row {
         var: "PULSUS_STORAGE_POLICY",
         value: "row-policy",
         check: |c| c.storage_policy.as_deref() == Some("row-policy"),
@@ -538,8 +543,8 @@ fn matrix_rows_exactly_match_all_env_vars() {
     );
     assert_eq!(
         declared.len(),
-        96,
-        "docs/configuration.md §§1-8 document exactly 96 variables"
+        97,
+        "docs/configuration.md §§1-8 document exactly 97 variables"
     );
 
     let mut canonical: Vec<&str> = pulsus_config::ALL_ENV_VARS.to_vec();

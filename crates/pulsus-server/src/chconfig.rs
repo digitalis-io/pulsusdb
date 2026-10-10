@@ -189,6 +189,7 @@ pub(crate) fn schema_params_from(config: &Config) -> SchemaParams {
         log_dedup_window: config.log_dedup_window,
         trace_landing_retention_hours: config.trace_landing_retention_hours,
         trace_dedup_window: config.trace_dedup_window,
+        trace_indexed_attributes: config.traceql_indexed_attributes.clone(),
     }
 }
 

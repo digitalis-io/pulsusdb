@@ -909,6 +909,7 @@ fn ctx() -> PredicateCtx<'static> {
         window: t_b1_window(),
         spans_table: "spans",
         resources_table: "resources",
+        indexed: &[],
     }
 }
 
@@ -4680,6 +4681,7 @@ fn search_golden(stem: &str, query: &str, limit: u32, spss: u32) -> String {
         window: w,
         spans_table: "spans",
         resources_table: "resources",
+        indexed: &[],
     };
     let parsed =
         pulsus_traceql::parse(query).unwrap_or_else(|e| panic!("{query} must parse: {e:?}"));
@@ -4963,7 +4965,7 @@ fn the_fork_routes_by_the_plan() {
         r#"{ (event.k = 1) = true }"#,
         r#"{ !event.k = false }"#,
     ] {
-        if plan_statement(&fork_plan(query), "spans", "traces", "resources", 64).is_some() {
+        if plan_statement(&fork_plan(query), "spans", "traces", "resources", 64, &[]).is_some() {
             wrong.push(format!(
                 "{query}: served by the statement, must be today's engine's"
             ));
@@ -5027,7 +5029,7 @@ fn the_fork_routes_by_the_plan() {
         r#"{ span:childCount < 1 } && { trace:rootService = "a" }"#,
         r#"{ trace:duration > 1s } >> { }"#,
     ] {
-        if plan_statement(&fork_plan(query), "spans", "traces", "resources", 64).is_none() {
+        if plan_statement(&fork_plan(query), "spans", "traces", "resources", 64, &[]).is_none() {
             wrong.push(format!(
                 "{query}: today's engine's, must be the statement's"
             ));
@@ -5086,4 +5088,113 @@ fn one_per_trace_read_serves_every_leaf() {
     assert!(s.sql().contains("per_trace.1"), "{}", s.sql());
     let s = compile_search_of(r#"{ name = "a" }"#).expect("served");
     assert_eq!(count(s.sql(), "FROM traces"), 1, "{}", s.sql());
+}
+
+/// Issue #595 part 2: a filter carries `indexHint(has(<index expression>,
+/// '<value>'))` exactly for each `key = "<string>"` among its body's
+/// top-level `&&` operands on an indexed key of that scope, and nothing
+/// for any other shape.
+#[test]
+fn a_filter_hints_only_what_its_body_requires() {
+    use pulsus_config::IndexedScope;
+    use pulsus_read::traces::spans::attr_index::IndexedAttr;
+    let attr = |scope, key: &str| IndexedAttr {
+        scope,
+        key: key.to_string(),
+    };
+    let indexed = [
+        attr(IndexedScope::Span, "app.request.id"),
+        attr(IndexedScope::Span, "app.code"),
+        attr(IndexedScope::Event, "exception.type"),
+    ];
+    // The index expressions, written out here rather than taken from the
+    // code under test: a span key's every string, and an event key's.
+    let span_expr = |p: &str| {
+        format!(
+            "arrayMap(x -> ifNull(x, ''), arrayConcat(attrs.`{p}`.:`Array(Nullable(String))`, [attrs.`{p}`.:String]))"
+        )
+    };
+    let event_expr = |p: &str| {
+        format!(
+            "arrayMap(x -> ifNull(x, ''), arrayConcat(events.attrs.`{p}`.:String, arrayFlatten(events.attrs.`{p}`.:`Array(Nullable(String))`)))"
+        )
+    };
+    let w = pulsus_read::traces::window_sql::WindowSql::start_closed_end_open(
+        1_000_000_000_000,
+        2_000_000_000_000,
+    );
+    let ctx = pulsus_read::traces::spans::predicate::PredicateCtx {
+        window: w,
+        spans_table: "spans",
+        resources_table: "resources",
+        indexed: &indexed,
+    };
+    let req = |v: &str| format!("indexHint(has({}, '{v}'))", span_expr("app%2Erequest%2Eid"));
+    let mut wrong = Vec::new();
+    for (q, want) in [
+        (r#"{ span.app.request.id = "r1" }"#, vec![req("r1")]),
+        (r#"{ "r1" = span.app.request.id }"#, vec![req("r1")]),
+        (
+            r#"{ span.app.request.id = "r1" && name = "x" }"#,
+            vec![req("r1")],
+        ),
+        (
+            r#"{ span.app.request.id = "r1" && span.app.code = "500" }"#,
+            vec![
+                req("r1"),
+                format!("indexHint(has({}, '500'))", span_expr("app%2Ecode")),
+            ],
+        ),
+        (r#"{ span.app.request.id = "it's" }"#, vec![req("it\\'s")]),
+        (
+            r#"{ event.exception.type = "boom" }"#,
+            vec![format!(
+                "indexHint(has({}, 'boom'))",
+                event_expr("exception%2Etype")
+            )],
+        ),
+        (
+            r#"{ span.app.request.id = "r1" } && { name = "x" }"#,
+            vec![req("r1")],
+        ),
+        (r#"{ span.app.request.id = "r1" || name = "x" }"#, vec![]),
+        (r#"{ !(span.app.request.id = "r1") }"#, vec![]),
+        (r#"{ span.app.request.id != "r1" }"#, vec![]),
+        (r#"{ span.app.request.id =~ "r1" }"#, vec![]),
+        ("{ span.app.code = 500 }", vec![]),
+        (r#"{ .app.request.id = "r1" }"#, vec![]),
+        (r#"{ resource.app.request.id = "r1" }"#, vec![]),
+        (r#"{ span.other = "r1" }"#, vec![]),
+        (r#"{ span.exception.type = "boom" }"#, vec![]),
+        (
+            r#"{ span.app.request.id = "r1" } >> { name = "x" }"#,
+            vec![],
+        ),
+    ] {
+        let st = pulsus_read::traces::spans::search::compile_search(
+            &pulsus_traceql::parse(q).unwrap(),
+            &ctx,
+            "spans",
+            "traces",
+            20,
+            3,
+        )
+        .unwrap_or_else(|e| panic!("{q}: {e}"));
+        let sql = st.sql();
+        let mut got: Vec<String> = Vec::new();
+        let mut rest = sql;
+        while let Some(i) = rest.find("indexHint(") {
+            let tail = &rest[i..];
+            let end = tail.find(")) AND ").map(|j| j + 2).unwrap_or(tail.len());
+            let h = tail[..end].to_string();
+            if !got.contains(&h) {
+                got.push(h);
+            }
+            rest = &tail[end..];
+        }
+        if got != want {
+            wrong.push(format!("{q}\n  got  {got:?}\n  want {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }

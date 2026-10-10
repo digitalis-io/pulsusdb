@@ -53,6 +53,8 @@ pub struct Config {
     pub skip_ddl: bool,
     pub retention_days: u32,
     pub storage_policy: Option<String>,
+    /// `PULSUS_TRACEQL_INDEXED_ATTRIBUTES` (issue #595 part 2).
+    pub traceql_indexed_attributes: Vec<String>,
     pub log_rollup_resolution: HumanDuration,
     /// `PULSUS_METRICS_LANDING_RETENTION_HOURS` (issue #603): the metrics
     /// landing table's delete-TTL, in hours. It is the replay window — the
@@ -163,6 +165,7 @@ impl Default for Config {
             skip_ddl: false,
             retention_days: 7,
             storage_policy: None,
+            traceql_indexed_attributes: Vec::new(),
             log_rollup_resolution: HumanDuration(Duration::from_secs(5)),
             metrics_landing_retention_hours: 6,
             metrics_dedup_window: 10_000,

@@ -60,6 +60,10 @@ pub struct RenderCtx {
     /// block-deduplication window the traces landing table and the five
     /// derived trace tables carry.
     pub trace_dedup_window: u64,
+    /// `PULSUS_TRACEQL_INDEXED_ATTRIBUTES` (issue #595 part 2): validated
+    /// `span.<key>` / `event.<key>` items, each rendered into one index on
+    /// `spans` by `{{trace_attr_indexes}}`.
+    pub trace_indexed_attributes: Vec<String>,
 }
 
 impl RenderCtx {
@@ -85,6 +89,7 @@ impl RenderCtx {
             log_dedup_window: 10_000,
             trace_landing_retention_hours: 6,
             trace_dedup_window: 10_000,
+            trace_indexed_attributes: Vec::new(),
         }
     }
 }
@@ -220,6 +225,7 @@ mod tests {
             log_dedup_window: 10_000,
             trace_landing_retention_hours: 6,
             trace_dedup_window: 10_000,
+            trace_indexed_attributes: Vec::new(),
         }
     }
 

@@ -1301,6 +1301,7 @@ pub fn plan_statement(
     traces_table: &str,
     resources_table: &str,
     max_depth: u32,
+    indexed: &[super::attr_index::IndexedAttr],
 ) -> Option<SearchStatement> {
     plan_statement_sliced(
         plan,
@@ -1308,6 +1309,7 @@ pub fn plan_statement(
         traces_table,
         resources_table,
         max_depth,
+        indexed,
         None,
     )
 }
@@ -1320,6 +1322,7 @@ pub fn plan_statement_sliced(
     traces_table: &str,
     resources_table: &str,
     max_depth: u32,
+    indexed: &[super::attr_index::IndexedAttr],
     slice_ns: Option<i64>,
 ) -> Option<SearchStatement> {
     let window = WindowSql::start_closed_end_open(plan.window.start_ns, plan.window.end_ns);
@@ -1336,6 +1339,7 @@ pub fn plan_statement_sliced(
         window,
         spans_table,
         resources_table,
+        indexed,
     };
     let query = Query {
         spanset: plan.spanset.clone(),
@@ -1582,6 +1586,7 @@ mod charge_tests {
             window: w,
             spans_table: "spans",
             resources_table: "resources",
+            indexed: &[],
         };
         compile_search(&q, &ctx, "spans", "traces", 20, 3).expect("compiles")
     }
@@ -1760,6 +1765,7 @@ mod charge_tests {
             window: w,
             spans_table: "spans",
             resources_table: "resources",
+            indexed: &[],
         };
         let s = compile_search(&q, &ctx, "spans", "traces", 20, 3).expect("compiles");
         let grouping = s.grouping().expect("grouped");
@@ -1817,6 +1823,7 @@ mod charge_tests {
             window: w,
             spans_table: "spans",
             resources_table: "resources",
+            indexed: &[],
         };
         let s = compile_search(&q, &ctx, "spans", "traces", 20, 3).expect("compiles");
         let grouping = s.grouping().expect("an aggregate is one group");

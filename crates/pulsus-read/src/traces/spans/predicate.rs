@@ -165,6 +165,9 @@ pub struct PredicateCtx<'a> {
     /// Unqualified in the live suite, `<db>.resources` in production. A
     /// trusted schema name, as `span_membership_sql`'s `spans_table` is.
     pub resources_table: &'a str,
+    /// The operator-named attribute indexes (issue #595 part 2) a search
+    /// filter's hints may reach; empty where none are configured.
+    pub indexed: &'a [super::attr_index::IndexedAttr],
 }
 
 /// Compiles one spanset filter body with no context. A `resource.` field

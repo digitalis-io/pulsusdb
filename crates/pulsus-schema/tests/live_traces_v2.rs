@@ -1182,3 +1182,37 @@ async fn the_span_table_carries_three_bloom_indexes() {
     );
     drop_database(&client, db).await;
 }
+
+/// Issue #595 part 2: each configured attribute is one bloom-filter index
+/// on `spans`, numbered in list order, over the expression
+/// `pulsus_clickhouse::json_column` renders for its scope.
+#[tokio::test]
+async fn the_span_table_carries_one_index_per_named_attribute() {
+    skip_unless_live!();
+    let db = &pulsus_testkit::test_db("pulsus_trace_landing_it_attr_indexes");
+    let client = ChClient::new(test_config()).await.expect("connect");
+    drop_database(&client, db).await;
+    let ctx = SchemaParams {
+        trace_indexed_attributes: vec!["span.app.request.id".into(), "event.exception.type".into()],
+        ..test_ctx(db)
+    };
+    run_init(&client, &ctx).await.expect("run_init");
+    let got = names(
+        &client,
+        &format!(
+            "SELECT concat(name, ' ', expr, ' ', type_full, ' ', toString(granularity)) AS name \
+             FROM system.data_skipping_indices \
+             WHERE database = '{db}' AND table = 'spans' AND name LIKE 'idx_attr_%' ORDER BY name"
+        ),
+    )
+    .await;
+    drop_database(&client, db).await;
+    assert_eq!(
+        got,
+        vec![
+            "idx_attr_1 arrayMap(x -> ifNull(x, ''), arrayConcat(attrs.`app%2Erequest%2Eid`.:`Array(Nullable(String))`, [attrs.`app%2Erequest%2Eid`.:String])) bloom_filter(0.01) 1".to_string(),
+            "idx_attr_2 arrayMap(x -> ifNull(x, ''), arrayConcat(events.attrs.`exception%2Etype`.:String, arrayFlatten(events.attrs.`exception%2Etype`.:`Array(Nullable(String))`))) bloom_filter(0.01) 1".to_string(),
+        ],
+        "the named attributes' indexes"
+    );
+}

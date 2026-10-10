@@ -378,6 +378,7 @@ fn the_configured_values_reach_the_statements() {
         metrics_dedup_window: 21,
         log_dedup_window: 22,
         trace_dedup_window: 23,
+        trace_indexed_attributes: Vec::new(),
         dist_suffix: "_routed".to_string(),
         ..clustered()
     };
@@ -448,6 +449,11 @@ fn the_script_renders_exactly_what_this_crate_renders() {
                 metrics_dedup_window: 21,
                 log_dedup_window: 22,
                 trace_dedup_window: 23,
+                trace_indexed_attributes: vec![
+                    "span.app.request.id".to_string(),
+                    "event.exception.type".to_string(),
+                    "span.http-x.a_b".to_string(),
+                ],
             },
         ),
         (
@@ -496,6 +502,10 @@ fn the_script_renders_exactly_what_this_crate_renders() {
         cmd.env(
             "PULSUS_TRACE_DEDUP_WINDOW",
             ctx.trace_dedup_window.to_string(),
+        );
+        cmd.env(
+            "PULSUS_TRACEQL_INDEXED_ATTRIBUTES",
+            ctx.trace_indexed_attributes.join(","),
         );
         match &ctx.cluster {
             Some(name) => cmd.env("PULSUS_CLUSTER", name),
@@ -1188,4 +1198,89 @@ fn both_sample_tables_keep_the_whole_key_in_memory() {
             );
         }
     }
+}
+
+/// Issue #595 part 2: the script refuses, with exit status 2, every item
+/// `pulsus_config::parse_indexed_attribute` refuses
+/// (`an_indexed_attribute_is_span_or_event_and_a_plain_dotted_key`), a
+/// repeat, an empty item and a seventeenth item.
+#[test]
+fn the_script_refuses_the_attribute_lists_the_configuration_refuses() {
+    let root = repo_root();
+    let seventeen: Vec<String> = (0..17).map(|i| format!("span.k{i}")).collect();
+    let seventeen = seventeen.join(",");
+    let too_long = format!("span.{}", "a.".repeat(64) + "a");
+    for list in [
+        "resource.k8s.pod.name",
+        "link.x",
+        "instrumentation.x",
+        ".k",
+        "SPAN.k",
+        "span.",
+        "span..a",
+        "span.a.",
+        "span.a..b",
+        "span.a b",
+        "span.a`b",
+        "span.a%b",
+        too_long.as_str(),
+        "span.a,span.a",
+        "span.a,",
+        ",span.a",
+        "span.a,,span.b",
+        seventeen.as_str(),
+    ] {
+        let out = Command::new("sh")
+            .arg(root.join("schema/schema.sh"))
+            .arg("--print")
+            .current_dir(&root)
+            .env_remove("PULSUS_CLUSTER")
+            .env("PULSUS_TRACEQL_INDEXED_ATTRIBUTES", list)
+            .output()
+            .expect("the script runs");
+        assert_eq!(out.status.code(), Some(2), "{list:?} must be refused");
+        if list.starts_with("resource.") {
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                err.contains("resource.k8s.pod.name") && err.contains("resource_id"),
+                "the refusal names the item and the resource_id index: {err}"
+            );
+        }
+    }
+    // A key of exactly 128 bytes renders.
+    let at = format!("span.{}", "a.".repeat(63) + "ab");
+    let out = Command::new("sh")
+        .arg(root.join("schema/schema.sh"))
+        .arg("--print")
+        .current_dir(&root)
+        .env_remove("PULSUS_CLUSTER")
+        .env("PULSUS_TRACEQL_INDEXED_ATTRIBUTES", &at)
+        .output()
+        .expect("the script runs");
+    assert!(out.status.success(), "a 128-byte key is accepted");
+}
+
+/// Issue #595 part 2: a refused list stops the script before it reaches the
+/// server, so it can never drop a database it will not rebuild. The
+/// server named here does not answer: had the script got as far as
+/// waiting for it, it would exit 1, not 2.
+#[test]
+fn a_refused_list_stops_the_script_before_it_touches_the_server() {
+    let root = repo_root();
+    let out = Command::new("sh")
+        .arg(root.join("schema/schema.sh"))
+        .current_dir(&root)
+        .env_remove("PULSUS_CLUSTER")
+        .env("CLICKHOUSE_SERVER", "127.0.0.1")
+        .env("CLICKHOUSE_HTTP_PORT", "1")
+        .env("PULSUS_SCHEMA_WAIT_SECONDS", "1")
+        .env(
+            "PULSUS_TRACEQL_INDEXED_ATTRIBUTES",
+            "span.a,resource.k8s.pod.name",
+        )
+        .output()
+        .expect("the script runs");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(err.contains("PULSUS_TRACEQL_INDEXED_ATTRIBUTES"), "{err}");
 }
