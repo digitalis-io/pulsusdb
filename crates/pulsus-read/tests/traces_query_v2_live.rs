@@ -7333,6 +7333,16 @@ async fn search_routed_answers_as_today_on_fixture_c() {
             }
             let want = engine.search(&plan).await.map(normalise_today);
             let got = engine.search_routed(&plan).await;
+            if let Some((_, at_100)) = NESTED_SET_ON_C.iter().find(|(n, _)| n == name) {
+                let want = cut(at_100, limit, spss);
+                if numbers_of(&got) != want {
+                    wrong.push(format!(
+                        "{name} (limit {limit}, spss {spss})\n  want: {want}\n  got:  {}",
+                        numbers_of(&got)
+                    ));
+                }
+                continue;
+            }
             let (want, got) = (format!("{want:?}"), format!("{got:?}"));
             if want != got {
                 wrong.push(format!(
@@ -7385,7 +7395,7 @@ async fn search_routed_answers_as_today_on_fixture_c() {
         drop_db(&db).await;
     }
     eprintln!("and {fixture_cases} fixture cases");
-    assert_eq!(names.len(), 116, "the inventory's new rows");
+    assert_eq!(names.len(), 119, "the inventory's new rows");
     assert!(
         wrong.is_empty(),
         "{} of {} differ:\n\n{}",
@@ -7393,6 +7403,44 @@ async fn search_routed_answers_as_today_on_fixture_c() {
         cases.len() * 3 + fixture_cases,
         wrong.join("\n\n")
     );
+}
+
+/// Issue #594 part 2 (decision D1): the three nested-set rows answer by
+/// the reference's numbering and today's engine by its own, so on fixture
+/// C, which holds an orphan (`44…1b`) and a pure cycle (trace `55…`), each
+/// is checked against its answer at limit 100 and spss 100 as
+/// [`numbers_of`] writes it, cut to `limit` traces of `spss` spans.
+const NESTED_SET_ON_C: [(&str, &str); 3] = [
+    (
+        "intrinsic_nested_set_left_gt",
+        "66 [28 1, 29 2, 2a 4, 2b 6, 2c 8, 2d 10, 2e 16, 2f 18, 31 11, 32 13, 30 20]; 44 [14 1, 15 2, 16 3, 17 4, 18 8, 19 9, 1a 11, 24 13, 20 16, 25 17, 26 18, 21 19]; 33 [07 1, 08 2]; 22 [04 1, 05 2, 06 3]; 11 [01 1, 02 2, 03 3]",
+    ),
+    (
+        "intrinsic_nested_set_parent_lt",
+        "66 [28 -1]; 44 [14 -1]; 33 [07 -1]; 22 [04 -1]; 11 [01 -1]",
+    ),
+    (
+        "intrinsic_nested_set_right_gte",
+        "66 [28 22, 29 3, 2a 5, 2b 7, 2c 9, 2d 15, 2e 17, 2f 19, 31 12, 32 14, 30 21]; 44 [14 24, 15 7, 16 6, 17 5, 18 15, 19 10, 1a 12, 24 14, 20 23, 25 22, 26 21, 21 20]; 33 [07 4, 08 3]; 22 [04 6, 05 5, 06 4]; 11 [01 6, 02 5, 03 4]",
+    ),
+];
+
+/// `answer` cut to its first `limit` traces, each to its first `spss` spans.
+fn cut(answer: &str, limit: u32, spss: u32) -> String {
+    answer
+        .split("; ")
+        .take(limit as usize)
+        .map(|t| {
+            let (head, spans) = t.split_once(" [").expect("a trace");
+            let spans: Vec<&str> = spans
+                .trim_end_matches(']')
+                .split(", ")
+                .take(spss as usize)
+                .collect();
+            format!("{head} [{}]", spans.join(", "))
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// An answer as `(trace, matched, span ids)` per trace, in order, each id
@@ -10326,6 +10374,22 @@ async fn check_levels(
     base_ns: i64,
     cases: &[LevelCase],
 ) -> Vec<String> {
+    check_levels_by(label, bodies, spans, base_ns, cases, answer_of).await
+}
+
+/// An answer as a test writes it.
+type Render =
+    fn(&Result<pulsus_read::traces::SearchOutput, pulsus_read::logql::ReadError>) -> String;
+
+/// [`check_levels`], each answer written by `render` (issue #594 part 2).
+async fn check_levels_by(
+    label: &str,
+    bodies: &[ExportTraceServiceRequest],
+    spans: u64,
+    base_ns: i64,
+    cases: &[LevelCase],
+    render: Render,
+) -> Vec<String> {
     let (db, client) = seed_both(
         pulsus_testkit::test_db(&format!("pulsus_read_it_t594p1_{label}")),
         bodies,
@@ -10362,24 +10426,24 @@ async fn check_levels(
                 if format!("{today:?}") != format!("{routed:?}") {
                     wrong.push(format!(
                         "{query}\n  today:  {}\n  routed: {}",
-                        answer_of(&today),
-                        answer_of(&routed)
+                        render(&today),
+                        render(&routed)
                     ));
                 }
             }
             Some(t) => {
-                if answer_of(&today) != *t {
+                if render(&today) != *t {
                     wrong.push(format!(
                         "{query}\n  today want: {t}\n  today got:  {}",
-                        answer_of(&today)
+                        render(&today)
                     ));
                 }
             }
         }
-        if answer_of(&routed) != *routed_want {
+        if render(&routed) != *routed_want {
             wrong.push(format!(
                 "{query}\n  routed want: {routed_want}\n  routed got:  {}",
-                answer_of(&routed)
+                render(&routed)
             ));
         }
         if n != 1 {
@@ -11247,5 +11311,632 @@ async fn a_slice_the_budget_refuses_falls_back_to_the_window() {
         (last_bytes(&out), stages.join(" "), out.partial),
         (want, stages595(1, true), false),
         "the answer, the explain stages and partial"
+    );
+}
+
+// ---------------------------------------------------------------------
+// issue #594 part 2: the nested-set intrinsics
+// ---------------------------------------------------------------------
+
+/// Fixture NS (section 6.2 of the part's plan), one push per trace,
+/// service `svc`, every span 1 s; `(span, parent, name, start − base in s)`.
+fn ns_bodies(base_ns: i64) -> Vec<ExportTraceServiceRequest> {
+    const S: i64 = 1_000_000_000;
+    let tr = |t: u8, spans: &[(u8, u8, &str, i64)]| {
+        by_body(
+            "svc",
+            spans
+                .iter()
+                .map(|&(n, p, name, at)| lsp(base_ns, t, n, p, name, at * S, S))
+                .collect(),
+        )
+    };
+    vec![
+        tr(
+            0xa1,
+            &[
+                (1, 0, "root", 1),
+                (2, 1, "child", 2),
+                (3, 2, "child", 3),
+                (4, 1, "child", 4),
+            ],
+        ),
+        tr(
+            0xe1,
+            &[
+                (1, 0, "root", 10),
+                (2, 1, "child", 11),
+                (3, 1, "child", 11),
+                (4, 2, "child", 12),
+                (5, 0xff, "child", 13),
+                (6, 5, "child", 14),
+            ],
+        ),
+        tr(
+            0xe2,
+            &[
+                (4, 0, "root", 20),
+                (5, 4, "child", 21),
+                (1, 2, "child", 21),
+                (2, 1, "child", 22),
+                (3, 2, "child", 23),
+            ],
+        ),
+        tr(0xe5, &[(1, 2, "child", 30), (2, 1, "child", 31)]),
+        tr(
+            0xc1,
+            &[
+                (1, 0, "root", -3600),
+                (2, 1, "child", 40),
+                (3, 2, "child", 41),
+            ],
+        ),
+        tr(
+            0xb2,
+            &[
+                (2, 0, "root", 45),
+                (5, 2, "child", 44),
+                (4, 2, "child", 46),
+                (1, 0, "root", 50),
+                (3, 1, "child", 51),
+            ],
+        ),
+    ]
+}
+
+/// `T-A20`, `T-A22`, `T-A23`: the numbers are the reference's, and each
+/// matched span projects its number.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_a22_a_nested_set_number_is_the_references() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let wrong = check_levels_by(
+        "ns",
+        &ns_bodies(base_ns),
+        25,
+        base_ns,
+        NS_VALUE_CASES,
+        numbers_of,
+    )
+    .await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// The nested-set comparison under `!`, each template and a structural
+/// operator.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_nested_set_comparison_composes() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let wrong = check_levels("nc", &ns_bodies(base_ns), 25, base_ns, NS_SHAPE_CASES).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// `T-A20`'s 1,000-span trace, and the two numberings agree on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_a20_a_thousand_span_chain_ends_at_2000() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let wrong = check_levels_by(
+        "nk",
+        &long_chain_bodies(base_ns, 1000),
+        1000,
+        base_ns,
+        &[
+            ("{ nestedSetRight = 2000 }", "d1 [01 2000]", None),
+            ("{ nestedSetLeft = 1000 }", "d1 [e8 1000]", None),
+            ("{ nestedSetRight = 1001 }", "d1 [e8 1001]", None),
+            ("{ nestedSetParent = 999 }", "d1 [e8 999]", None),
+        ],
+        numbers_of,
+    )
+    .await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Projected values, answered as [`numbers_of`] writes them.
+const NS_VALUE_CASES: &[LevelCase] = &[
+    (
+        r#"{ nestedSetParent < 0 }"#,
+        "b2 [02 -1, 01 -1]; e2 [04 -1]; e1 [01 -1]; a1 [01 -1]",
+        Some(
+            "b2 [02 -1, 01 -1]; c1 [02 -1]; e5 [01 -1]; e2 [04 -1, 01 -1]; e1 [01 -1, 05 -1]; a1 [01 -1]",
+        ),
+    ),
+    (
+        r#"{ 0 > nestedSetParent }"#,
+        "b2 [02 -1, 01 -1]; e2 [04 -1]; e1 [01 -1]; a1 [01 -1]",
+        Some("b2 [02, 01]; c1 [02]; e5 [01]; e2 [04, 01]; e1 [01, 05]; a1 [01]"),
+    ),
+    (
+        r#"{ nestedSetLeft > 0 }"#,
+        "b2 [05 2, 02 1, 04 4, 01 7, 03 8]; c1 [02 2, 03 3]; e2 [04 1, 05 2]; e1 [01 1, 02 2, 03 6, 04 3]; a1 [01 1, 02 2, 03 3, 04 6]",
+        Some(
+            "b2 [05 2, 02 1, 04 4, 01 7, 03 8]; c1 [02 1, 03 2]; e5 [01 1, 02 2]; e2 [04 1, 01 5, 05 2, 02 6, 03 7]; e1 [01 1, 02 2, 03 6, 04 3, 05 9, 06 10]; a1 [01 1, 02 2, 03 3, 04 6]",
+        ),
+    ),
+    (
+        r#"{ nestedSetLeft < 1 }"#,
+        "e5 [01 0, 02 0]; e2 [01 0, 02 0, 03 0]; e1 [05 0, 06 0]",
+        Some(""),
+    ),
+    (
+        r#"{ 1 > nestedSetLeft }"#,
+        "e5 [01 0, 02 0]; e2 [01 0, 02 0, 03 0]; e1 [05 0, 06 0]",
+        Some(""),
+    ),
+    (
+        r#"{ nestedSetParent = 1 }"#,
+        "b2 [05 1, 04 1]; c1 [02 1]; e2 [05 1]; e1 [02 1, 03 1]; a1 [02 1, 04 1]",
+        Some("b2 [05 1, 04 1]; c1 [03 1]; e5 [02 1]; e2 [05 1]; e1 [02 1, 03 1]; a1 [02 1, 04 1]"),
+    ),
+    (
+        r#"{ nestedSetParent = 0 }"#,
+        "e5 [01 0, 02 0]; e2 [01 0, 02 0, 03 0]; e1 [05 0, 06 0]",
+        Some(""),
+    ),
+    (
+        r#"{ nestedSetRight = 8 }"#,
+        "e1 [01 8]; a1 [01 8]",
+        Some("e2 [03 8]; e1 [01 8]; a1 [01 8]"),
+    ),
+    (
+        r#"{ nestedSetParent < 0 || nestedSetLeft = 0 }"#,
+        "b2 [02 -1, 01 -1]; e5 [01 0, 02 0]; e2 [04 -1, 01 0, 02 0, 03 0]; e1 [01 -1, 05 0, 06 0]; a1 [01 -1]",
+        Some(
+            "b2 [02 -1, 01 -1]; c1 [02 -1]; e5 [01 -1]; e2 [04 -1, 01 -1]; e1 [01 -1, 05 -1]; a1 [01 -1]",
+        ),
+    ),
+];
+
+/// `!`, each template, and a structural operator, answered as
+/// [`answer_of`] writes it.
+const NS_SHAPE_CASES: &[LevelCase] = &[
+    (
+        "{ nestedSetParent = -1 }",
+        "b2 2 [02, 01]; e2 1 [04]; e1 1 [01]; a1 1 [01]",
+        Some("b2 2 [02, 01]; c1 1 [02]; e5 1 [01]; e2 2 [04, 01]; e1 2 [01, 05]; a1 1 [01]"),
+    ),
+    (
+        "{ !(nestedSetLeft > 0) }",
+        "e5 2 [01, 02]; e2 3 [01, 02, 03]; e1 2 [05, 06]",
+        Some(""),
+    ),
+    (
+        "{ nestedSetLeft > 0 } | select(name)",
+        "b2 5 [05, 02, 04, 01, 03]; c1 2 [02, 03]; e2 2 [04, 05]; e1 4 [01, 02, 03, 04]; a1 4 [01, 02, 03, 04]",
+        Some(
+            "b2 5 [05, 02, 04, 01, 03]; c1 2 [02, 03]; e5 2 [01, 02]; e2 5 [04, 01, 05, 02, 03]; e1 6 [01, 02, 03, 04, 05, 06]; a1 4 [01, 02, 03, 04]",
+        ),
+    ),
+    (
+        "{ nestedSetParent < 0 } | by(name)",
+        "b2 2 [02, 01]; e2 1 [04]; e1 1 [01]; a1 1 [01]",
+        Some("b2 2 [02, 01]; c1 1 [02]; e5 1 [01]; e2 2 [04, 01]; e1 2 [01, 05]; a1 1 [01]"),
+    ),
+    (
+        r#"{ nestedSetParent < 0 } && { name = "child" }"#,
+        "b2 5 [05, 02, 04, 01, 03]; e2 5 [04, 01, 05, 02, 03]; e1 6 [01, 02, 03, 04, 05, 06]; a1 4 [01, 02, 03, 04]",
+        Some(
+            "b2 5 [05, 02, 04, 01, 03]; c1 2 [02, 03]; e5 2 [01, 02]; e2 5 [04, 01, 05, 02, 03]; e1 6 [01, 02, 03, 04, 05, 06]; a1 4 [01, 02, 03, 04]",
+        ),
+    ),
+    (
+        "{ nestedSetParent < 0 } > { }",
+        "b2 3 [05, 04, 03]; e2 1 [05]; e1 2 [02, 03]; a1 2 [02, 04]",
+        Some(
+            "b2 3 [05, 04, 03]; c1 1 [03]; e5 1 [02]; e2 2 [05, 02]; e1 3 [02, 03, 06]; a1 2 [02, 04]",
+        ),
+    ),
+];
+
+/// An answer as `(trace) [(span) (values), …]` per trace, ids by their
+/// last byte in hex, each span's projected integers joined by `/`:
+/// `b2 [05 2/3]; e2 [04 -1]`.
+fn numbers_of(
+    out: &Result<pulsus_read::traces::SearchOutput, pulsus_read::logql::ReadError>,
+) -> String {
+    use pulsus_read::traces::GroupValue;
+    match out {
+        Err(e) => format!("Err({e})"),
+        Ok(o) => o
+            .traces
+            .iter()
+            .map(|t| {
+                let spans: Vec<String> = t
+                    .spans
+                    .iter()
+                    .map(|s| {
+                        let values: Vec<String> = s
+                            .attributes
+                            .iter()
+                            .map(|a| match a.value() {
+                                GroupValue::Int(i) => i.to_string(),
+                                other => value_text(other),
+                            })
+                            .collect();
+                        format!("{:02x} {}", s.span_id[7], values.join("/"))
+                            .trim_end()
+                            .to_string()
+                    })
+                    .collect();
+                format!("{:02x} [{}]", t.trace_id[15], spans.join(", "))
+            })
+            .collect::<Vec<_>>()
+            .join("; "),
+    }
+}
+
+/// Fixture NW: 30 well-formed traces `31…` to `4e…`, trace `k` (0-based)
+/// holding `1 + (7k mod 24)` spans; span 1 the root, span `i ≥ 2` the
+/// child of span `1 + ((13i + k) mod (i − 1))`, starting `(5i + k) mod 9`
+/// seconds after `base_ns`. Every parent is stored and in the window, so
+/// today's numbering and the reference's are one rule here.
+fn nw_bodies(base_ns: i64) -> (Vec<ExportTraceServiceRequest>, u64) {
+    const S: i64 = 1_000_000_000;
+    let mut bodies = Vec::new();
+    let mut total = 0u64;
+    for k in 0..30u8 {
+        let n = 1 + (7 * u16::from(k)) % 24;
+        let spans: Vec<Span> = (1..=n as u8)
+            .map(|i| {
+                let parent = if i == 1 {
+                    0
+                } else {
+                    1 + ((13 * u16::from(i) + u16::from(k)) % u16::from(i - 1)) as u8
+                };
+                let at = i64::from((5 * u16::from(i) + u16::from(k)) % 9) * S;
+                lsp(base_ns, 0x31 + k, i, parent, "op", at, S)
+            })
+            .collect();
+        total += u64::from(n);
+        bodies.push(by_body("svc", spans));
+    }
+    (bodies, total)
+}
+
+/// The issue's "the carried numbering is the same function": on
+/// well-formed traces today's engine's Euler tour and the statement's
+/// numbering give every span the same three numbers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_two_numberings_agree_on_well_formed_traces() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let (bodies, spans) = nw_bodies(base_ns);
+    let (db, _client) = seed_both(
+        pulsus_testkit::test_db("pulsus_read_it_t594p2_nw"),
+        &bodies,
+        spans,
+        "t594p2-nw",
+    )
+    .await;
+    let engine = engine_of(&db).await;
+    let mut wrong = Vec::new();
+    for query in [
+        "{ nestedSetLeft > 0 }",
+        "{ nestedSetRight > 0 }",
+        "{ nestedSetParent > -2 }",
+    ] {
+        let plan = plan_of(
+            &engine,
+            &parse_query(query),
+            (base_ns, base_ns + 60_000_000_000),
+            100,
+            100,
+        );
+        if !covered(&plan) {
+            wrong.push(format!("{query}: must be the statement's"));
+            continue;
+        }
+        let routed = numbers_of(&engine.search_routed(&plan).await);
+        let today = numbers_of(&engine.search(&plan).await.map(normalise_today));
+        if routed.matches(';').count() != 29 || today != routed {
+            wrong.push(format!("{query}\n  today:  {today}\n  routed: {routed}"));
+        }
+    }
+    drop_db(&db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Fixture NS placed in the newest two minutes before `e`, and trace
+/// `f1`: its root half an hour before `e`, outside the newest slice, and
+/// its child inside it.
+fn nsf_bodies(e: i64) -> Vec<ExportTraceServiceRequest> {
+    const S: i64 = 1_000_000_000;
+    let base = e - 120 * S;
+    let mut bodies = ns_bodies(base);
+    bodies.push(by_body(
+        "svc",
+        vec![lsp(base, 0xf1, 1, 0, "root", -1800 * S, S)],
+    ));
+    bodies.push(by_body(
+        "svc",
+        vec![lsp(base, 0xf1, 2, 1, "child", 55 * S, S)],
+    ));
+    bodies
+}
+
+/// The newest-slice loop (issue #595) answers from its first slice, and
+/// that statement numbers each trace whole: `f1`'s child is numbered from
+/// a root outside the slice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sliced_search_numbers_whole_traces() {
+    skip_unless_live!();
+    let e = end595();
+    let (db, client) = seed_both(
+        pulsus_testkit::test_db("pulsus_read_it_t594p2_nsf"),
+        &nsf_bodies(e),
+        27,
+        "t594p2-nsf",
+    )
+    .await;
+    let engine = engine_of(&db).await;
+    let mut wrong = Vec::new();
+    for (query, routed_want, today_want) in [
+        (
+            "{ nestedSetParent = 1 }",
+            "f1 [02 1]; b2 [05 1, 04 1]",
+            "f1 [02 1]; b2 [05 1, 04 1]",
+        ),
+        (
+            "{ nestedSetLeft < 1 }",
+            "e5 [01 0, 02 0]; e2 [01 0, 02 0, 03 0]",
+            "",
+        ),
+        (
+            "{ nestedSetLeft > 1 }",
+            "f1 [02 2]; b2 [05 2, 04 4, 01 7, 03 8]",
+            "f1 [02 2]; b2 [05 2, 04 4, 01 7, 03 8]",
+        ),
+    ] {
+        let plan = plan_of(
+            &engine,
+            &parse_query(query),
+            (e - 10_800_000_000_000, e),
+            2,
+            20,
+        );
+        if !covered(&plan) {
+            wrong.push(format!(
+                "{query}: today's engine's, must be the statement's"
+            ));
+            continue;
+        }
+        let t0 = now_ns();
+        let routed = engine.search_routed_explained(&plan).await;
+        let (n, _) = settled_statements(&client, &db, t0).await;
+        let today = engine.search(&plan).await.map(normalise_today);
+        let stages = match &routed {
+            Ok((_, x)) => x
+                .stages
+                .iter()
+                .map(|s| s.name)
+                .collect::<Vec<_>>()
+                .join(" "),
+            Err(e) => format!("Err({e})"),
+        };
+        let routed = numbers_of(&routed.map(|(o, _)| o));
+        if (routed.as_str(), n, stages.as_str()) != (routed_want, 1, "search_slice") {
+            wrong.push(format!(
+                "{query}\n  want {routed_want}, 1, search_slice\n  got  {routed}, {n}, {stages}"
+            ));
+        }
+        if numbers_of(&today) != today_want {
+            wrong.push(format!(
+                "{query}\n  today want {today_want}\n  today got  {}",
+                numbers_of(&today)
+            ));
+        }
+    }
+    drop_db(&db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A sliced search over a slice that starts at a UTC midnight, so it reads
+/// one day: trace `a3`, pushed once, has one per-trace row, dated the day
+/// before (its root's), holding its child's bucket in the slice; trace
+/// `a4`, pushed twice, has a row each side of midnight, the earlier not
+/// reaching the slice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sliced_search_numbers_a_trace_across_midnight() {
+    skip_unless_live!();
+    const S: i64 = 1_000_000_000;
+    const DAY: i64 = 86_400 * S;
+    let n = now_ns();
+    let e = n - n.rem_euclid(DAY) - DAY + 300 * S;
+    let bodies = vec![
+        by_body(
+            "svc",
+            vec![
+                lsp(e, 0xa3, 1, 0, "root", -1800 * S, S),
+                lsp(e, 0xa3, 2, 1, "child", -60 * S, S),
+            ],
+        ),
+        by_body("svc", vec![lsp(e, 0xa4, 1, 0, "root", -1700 * S, S)]),
+        by_body("svc", vec![lsp(e, 0xa4, 2, 1, "child", -100 * S, S)]),
+    ];
+    let (db, client) = seed_both(
+        pulsus_testkit::test_db("pulsus_read_it_t594p2_mid"),
+        &bodies,
+        4,
+        "t594p2-mid",
+    )
+    .await;
+    let engine = engine_of(&db).await;
+    let plan = plan_of(
+        &engine,
+        &parse_query("{ nestedSetParent = 1 }"),
+        (e - 10_800_000_000_000, e),
+        2,
+        20,
+    );
+    assert!(covered(&plan), "must be the statement's");
+    let t0 = now_ns();
+    let routed = engine.search_routed_explained(&plan).await;
+    let (stmts, _) = settled_statements(&client, &db, t0).await;
+    drop_db(&db).await;
+    let (out, explain) = routed.expect("routed");
+    let stages: Vec<&str> = explain.stages.iter().map(|s| s.name).collect();
+    assert_eq!(
+        (numbers_of(&Ok(out)), stmts, stages.join(" ")),
+        (
+            "a3 [02 1]; a4 [02 1]".to_string(),
+            1,
+            "search_slice".to_string()
+        )
+    );
+}
+
+/// A span whose id is all zero bytes, beside another root (the shape of
+/// `rule_bodies`' `r7`): both are roots, and no span's empty parent binds
+/// to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_all_zero_span_id_is_a_root() {
+    skip_unless_live!();
+    const S: i64 = 1_000_000_000;
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let bodies = vec![by_body(
+        "svc",
+        vec![
+            lsp(base_ns, 0xa7, 0, 0, "root", S, S),
+            lsp(base_ns, 0xa7, 0x71, 0, "root", 2 * S, S),
+        ],
+    )];
+    let wrong = check_levels_by(
+        "nz",
+        &bodies,
+        2,
+        base_ns,
+        &[
+            ("{ nestedSetLeft > 0 }", "a7 [00 1, 71 3]", None),
+            ("{ nestedSetRight = 4 }", "a7 [71 4]", None),
+        ],
+        numbers_of,
+    )
+    .await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Every comparison operator, the literal on either side, from one table:
+/// `(operator, its mirror, routed, today's with the field first)` for
+/// `nestedSetLeft <op> 3` and `3 <mirror> nestedSetLeft` over `a1` and the
+/// pure cycle `e5`. Today's engine projects nothing for a literal on the
+/// left, so its answer there is the same with the values dropped.
+const OPERATOR_CASES: [(&str, &str, &str, &str); 6] = [
+    ("=", "=", "a1 [03 3]", "a1 [03 3]"),
+    (
+        "!=",
+        "!=",
+        "e5 [01 0, 02 0]; a1 [01 1, 02 2, 04 6]",
+        "e5 [01 1, 02 2]; a1 [01 1, 02 2, 04 6]",
+    ),
+    (
+        "<",
+        ">",
+        "e5 [01 0, 02 0]; a1 [01 1, 02 2]",
+        "e5 [01 1, 02 2]; a1 [01 1, 02 2]",
+    ),
+    (
+        "<=",
+        ">=",
+        "e5 [01 0, 02 0]; a1 [01 1, 02 2, 03 3]",
+        "e5 [01 1, 02 2]; a1 [01 1, 02 2, 03 3]",
+    ),
+    (">", "<", "a1 [04 6]", "a1 [04 6]"),
+    (">=", "<=", "a1 [03 3, 04 6]", "a1 [03 3, 04 6]"),
+];
+
+/// `numbers_of`'s answer with each span's values dropped.
+fn ids_only(answer: &str) -> String {
+    answer
+        .split("; ")
+        .map(|t| {
+            let (head, spans) = t.split_once(" [").expect("a trace");
+            let ids: Vec<&str> = spans
+                .trim_end_matches(']')
+                .split(", ")
+                .map(|s| s.split(' ').next().expect("an id"))
+                .collect();
+            format!("{head} [{}]", ids.join(", "))
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_operator_compares_the_number() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let all = ns_bodies(base_ns);
+    // `a1` and `e5`, the first and fourth bodies.
+    let bodies = vec![all[0].clone(), all[3].clone()];
+    let mut cases: Vec<(String, String, Option<String>)> = Vec::new();
+    for (op, mirror, routed, today) in OPERATOR_CASES {
+        cases.push((
+            format!("{{ nestedSetLeft {op} 3 }}"),
+            routed.to_string(),
+            (today != routed).then(|| today.to_string()),
+        ));
+        cases.push((
+            format!("{{ 3 {mirror} nestedSetLeft }}"),
+            routed.to_string(),
+            Some(ids_only(today)),
+        ));
+    }
+    let leaked: Vec<LevelCase> = cases
+        .into_iter()
+        .map(|(q, r, t)| {
+            (
+                &*Box::leak(q.into_boxed_str()),
+                &*Box::leak(r.into_boxed_str()),
+                t.map(|t| &*Box::leak(t.into_boxed_str())),
+            )
+        })
+        .collect();
+    let wrong = check_levels_by("no", &bodies, 6, base_ns, &leaked, numbers_of).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A numbered search keeps doubling past an empty newest slice (decision
+/// D11 of #594 part 2): two one-span traces 400 s and 450 s before `e`,
+/// so the 5-minute slice is empty and the 10-minute one answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_numbered_search_doubles_past_an_empty_slice() {
+    skip_unless_live!();
+    const S: i64 = 1_000_000_000;
+    let e = end595();
+    let bodies = vec![
+        by_body("svc", vec![lsp(e, 0xb5, 1, 0, "root", -450 * S, S)]),
+        by_body("svc", vec![lsp(e, 0xb6, 1, 0, "root", -400 * S, S)]),
+    ];
+    let (db, client) = seed_both(
+        pulsus_testkit::test_db("pulsus_read_it_t594p2_dbl"),
+        &bodies,
+        2,
+        "t594p2-dbl",
+    )
+    .await;
+    let engine = engine_of(&db).await;
+    let plan = plan_of(
+        &engine,
+        &parse_query("{ nestedSetLeft > 0 }"),
+        (e - 10_800_000_000_000, e),
+        2,
+        20,
+    );
+    assert!(covered(&plan), "must be the statement's");
+    let t0 = now_ns();
+    let routed = engine.search_routed_explained(&plan).await;
+    let (stmts, _) = settled_statements(&client, &db, t0).await;
+    drop_db(&db).await;
+    let (out, explain) = routed.expect("routed");
+    let stages: Vec<&str> = explain.stages.iter().map(|s| s.name).collect();
+    assert_eq!(
+        (numbers_of(&Ok(out)), stmts, stages.join(" ")),
+        (
+            "b6 [01 1]; b5 [01 1]".to_string(),
+            2,
+            "search_slice search_slice".to_string()
+        )
     );
 }

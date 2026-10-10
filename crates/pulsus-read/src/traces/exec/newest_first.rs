@@ -1,7 +1,7 @@
 //! The newest-slice-first search plan (issue #595,
 //! `docs/TraceQL/server-implementation.md` §3.5).
 
-use pulsus_clickhouse::ChError;
+use pulsus_clickhouse::{ChError, QuerySettings};
 
 use super::{
     ByteBudget, HYDRATION_BYTE_BUDGET, SearchOutput, TraceEngine, map_search_statement_error,
@@ -97,5 +97,33 @@ impl TraceEngine {
             e.push("search_statement", stmt.sql(), None);
         }
         Ok(None)
+    }
+}
+
+/// Stub for the tests-first commit: the rule lands with the change.
+fn product_mode(settings: QuerySettings, _distributed: bool, _numbered: bool) -> QuerySettings {
+    settings
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Only a clustered statement that reads the numbering is shard-local.
+    #[test]
+    fn a_clustered_numbered_statement_reads_its_nested_tables_locally() {
+        for (distributed, numbered, want) in [
+            (true, true, Some("local")),
+            (true, false, None),
+            (false, true, None),
+            (false, false, None),
+        ] {
+            let s = product_mode(QuerySettings::new(), distributed, numbered);
+            assert_eq!(
+                s.get("distributed_product_mode"),
+                want,
+                "distributed {distributed}, numbered {numbered}"
+            );
+        }
     }
 }
