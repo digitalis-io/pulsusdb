@@ -253,12 +253,46 @@ pub struct LogfmtCount {
     pub names: Vec<String>,
 }
 
-/// The two columns of a lowered `| logfmt` count (issue #624, part 3d).
-/// Stub for the tests-first commit: decides no line and sends no field.
-pub fn logfmt_count_columns(_names: &[String]) -> [String; 2] {
+/// The line grammar a lowered `| logfmt` count decides (issue #624, part
+/// 3d): separators are the bytes at or below `' '`; a key is one or more
+/// printable ASCII bytes other than `"` and `=`; a value is unquoted (no
+/// separator, `=` or `"`) or quoted, its escapes the ones both decoders
+/// unquote; a separator or the end follows every field. A line matching it
+/// is one the reference's decoder reads with no error, no field directly
+/// followed by a byte above `' '`, and every key printable ASCII.
+pub const LOGFMT_DECIDED_LINE: &str = r#"^[\x00-\x20]*(?:[!#-<>-~]+(?:=(?:"(?:[^"\\]|\\["\\/'bfnrt]|\\u[0-9A-Fa-f]{4})*"|[^\x00-\x20="]*))?(?:[\x00-\x20]+|$))*$"#;
+
+/// One field of a decided line (issue #624, part 3d), as
+/// [`LOGFMT_DECIDED_LINE`] spells it.
+pub const LOGFMT_FIELD: &str = r#"[!#-<>-~]+(?:=(?:"(?:[^"\\]|\\.)*"|[^\x00-\x20="]*))?"#;
+
+/// The bytes a decided key may hold that the key sanitiser turns into `_`:
+/// every printable ASCII byte but a letter, a digit, `_`, `"` and `=`.
+pub const LOGFMT_KEY_PUNCTUATION: &str = "!#$%&'()*+,-./:;<>?@[\\]^`{|}~";
+
+/// The two columns of a lowered `| logfmt` count (issue #624, part 3d):
+/// `decided`, the line matching [`LOGFMT_DECIDED_LINE`], and `fields`, the
+/// line's fields whose sanitised key is one of `names`, in line order,
+/// joined by one space.
+pub fn logfmt_count_columns(names: &[String]) -> [String; 2] {
+    use super::predicate::literal;
+    let names: Vec<String> = names
+        .iter()
+        .map(|n| literal(n).as_sql().to_string())
+        .collect();
     [
-        "toUInt8(0) AS decided".to_string(),
-        "'' AS fields".to_string(),
+        format!(
+            "toUInt8(match(body, {})) AS decided",
+            literal(LOGFMT_DECIDED_LINE).as_sql()
+        ),
+        format!(
+            "arrayStringConcat(arrayFilter(f -> has([{}], concat(if(substring(f, 1, 1) BETWEEN '0' AND '9', '_', ''), \
+             translate(substringIndex(f, '=', 1), {}, {}))), extractAll(body, {})), ' ') AS fields",
+            names.join(", "),
+            literal(LOGFMT_KEY_PUNCTUATION).as_sql(),
+            literal(&"_".repeat(LOGFMT_KEY_PUNCTUATION.len())).as_sql(),
+            literal(LOGFMT_FIELD).as_sql()
+        ),
     ]
 }
 
@@ -283,6 +317,7 @@ pub struct JsonCountColumns {
 pub enum GroupExtraction<'a> {
     Regexp(&'a super::predicate::RegexpGroupColumns),
     Json(&'a JsonCountColumns),
+    Logfmt(&'a [String; 2]),
 }
 
 impl GroupExtraction<'_> {
@@ -290,6 +325,7 @@ impl GroupExtraction<'_> {
         match self {
             GroupExtraction::Regexp(_) => "matched, caps",
             GroupExtraction::Json(_) => "keys",
+            GroupExtraction::Logfmt(_) => "fields",
         }
     }
     fn lines(&self, indent: &str) -> Vec<String> {
@@ -303,14 +339,20 @@ impl GroupExtraction<'_> {
                     .map(|(i, r)| format!("{indent}{r}{}", if i + 1 < n { "," } else { "" }))
                     .collect()
             }
+            GroupExtraction::Logfmt([decided, fields]) => {
+                vec![format!("{indent}{decided},"), format!("{indent}{fields}")]
+            }
         }
     }
-    /// The filter under the extraction level: a `| json` count fails with
-    /// code 395 on the first row the database did not decide.
+    /// The filter under the extraction level: a `| json` or `| logfmt`
+    /// count fails with code 395 on the first row the database did not
+    /// decide.
     fn throw_line(&self, indent: &str) -> Option<String> {
         match self {
             GroupExtraction::Regexp(_) => None,
-            GroupExtraction::Json(_) => Some(format!("{indent}WHERE throwIf(decided = 0) = 0")),
+            GroupExtraction::Json(_) | GroupExtraction::Logfmt(_) => {
+                Some(format!("{indent}WHERE throwIf(decided = 0) = 0"))
+            }
         }
     }
 }

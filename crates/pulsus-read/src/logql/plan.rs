@@ -2024,14 +2024,84 @@ pub(in crate::logql) fn json_count_route(
     })
 }
 
-/// Issue #624, part 3d: the `| logfmt` count a range query lowers to.
-/// Stub for the tests-first commit: always today's route.
+/// Issue #624, part 3d: the `| logfmt` count a range query lowers to, as
+/// [`sql::LogfmtCount`], or `None` for today's route.
+///
+/// ```text
+/// reducer   count_over_time, rate, bytes_over_time, bytes_rate, absent_over_time
+/// chain     pushable line filters | logfmt [flags] [<d>="<k>", …] | what label_only_pipeline admits
+/// bare      a parent `sum` or `sum by (L)`; names = L, every label a later stage
+///           reads, and the stem of each such name ending `_extracted`
+/// targeted  any parent; names = every destination and every source key, nothing else
+/// ```
 pub(in crate::logql) fn logfmt_count_route(
-    _pipeline: &[Stage],
-    _op: RangeAggOp,
-    _vector_aggs: &[VectorAggSpec],
+    pipeline: &[Stage],
+    op: RangeAggOp,
+    vector_aggs: &[VectorAggSpec],
 ) -> Option<sql::LogfmtCount> {
-    None
+    if !matches!(
+        op,
+        RangeAggOp::CountOverTime
+            | RangeAggOp::Rate
+            | RangeAggOp::BytesOverTime
+            | RangeAggOp::BytesRate
+            | RangeAggOp::AbsentOverTime
+    ) {
+        return None;
+    }
+    let at = pipeline
+        .iter()
+        .position(|s| !matches!(s, Stage::LineFilter(lf) if is_pushable_line_filter(lf)))?;
+    let Stage::Parser(ParserStage::Logfmt { extractions, .. }) = &pipeline[at] else {
+        return None;
+    };
+    let after = &pipeline[at + 1..];
+    if !label_only_pipeline(after, op) {
+        return None;
+    }
+    let mut names: Vec<String> = Vec::new();
+    if extractions.is_empty() {
+        // The plain parser sets a label for every field: the answer reads
+        // `L` and the labels the later stages read, and a field whose key
+        // is a name's stem renames to `<stem>_extracted` on a collision.
+        match parent_sum_grouping(op, false, vector_aggs)? {
+            None => {}
+            Some(g) if g.kind == GroupingKind::By => names.extend(g.labels.iter().cloned()),
+            Some(_) => return None,
+        }
+        for stage in after {
+            match stage {
+                Stage::LabelFilter(expr) => {
+                    pulsus_logql::for_each_label_filter(expr, |e| match e {
+                        LabelFilterExpr::Match(m) => names.push(m.name.clone()),
+                        LabelFilterExpr::Compare { name, .. }
+                        | LabelFilterExpr::Ip { name, .. } => names.push(name.clone()),
+                        LabelFilterExpr::And(..) | LabelFilterExpr::Or(..) => {}
+                    });
+                }
+                Stage::Drop(elems) | Stage::Keep(elems) => {
+                    names.extend(elems.iter().map(|e| e.label.clone()));
+                }
+                _ => {}
+            }
+        }
+        let stems: Vec<String> = names
+            .iter()
+            .filter_map(|n| n.strip_suffix("_extracted").map(str::to_string))
+            .collect();
+        names.extend(stems);
+    } else {
+        // The targeted parser reads a field only when its sanitised key is a
+        // source or a destination (`logfmt_target_for`), so no other field
+        // can set a label, whatever the later stages read.
+        for e in extractions {
+            names.push(e.label.clone());
+            names.push(super::logfmt_expr::parse_logfmt_expr(&e.expression).ok()?);
+        }
+    }
+    names.sort_unstable();
+    names.dedup();
+    Some(sql::LogfmtCount { names })
 }
 
 /// Issue #507 (W4): does the pipeline carry a `| unwrap` with a

@@ -18,9 +18,10 @@ use super::plan::{self, ClientAgg, ClientValue, MetricNode, MetricPlan, Plan, St
 use super::predicate::{BucketGridRefusal, CheckedFragment, CheckedLiteral};
 use super::rows::{
     DetectedLabelRow, LabelNameRow, LabelValueRow, LogStatsRow, MetricInstantRow,
-    MetricRangeBucketRow, MetricRangeJsonRow, MetricRangeRegexpRow, MetricRangeUnwrappedRow,
-    MetricScanRow, MetricScanRxRow, PatternFetchRow, SampleRow, SampleRxRow, StreamMetaRow,
-    StreamRow, TailSampleRow, TailSampleRxRow, UnwrappedLaneRow, VolumeRow,
+    MetricRangeBucketRow, MetricRangeJsonRow, MetricRangeLogfmtRow, MetricRangeRegexpRow,
+    MetricRangeUnwrappedRow, MetricScanRow, MetricScanRxRow, PatternFetchRow, SampleRow,
+    SampleRxRow, StreamMetaRow, StreamRow, TailSampleRow, TailSampleRxRow, UnwrappedLaneRow,
+    VolumeRow,
 };
 use futures::Stream;
 use futures::StreamExt;
@@ -2006,6 +2007,7 @@ impl LogQlEngine {
                                 s.json
                                     .as_ref()
                                     .map(|j| j.keys.iter().map(|k| k.source.clone()).collect()),
+                                s.logfmt.is_some(),
                             )
                         }
                         // #507's statement (range equal to step) keeps the
@@ -2039,7 +2041,24 @@ impl LogQlEngine {
                             &mp.value,
                             super::sql::MetricValue::Staged(s) if s.json.is_some()
                         );
-                        if json {
+                        let logfmt = matches!(
+                            &mp.value,
+                            super::sql::MetricValue::Staged(s) if s.logfmt.is_some()
+                        );
+                        if logfmt {
+                            match self
+                                .client
+                                .query_stream::<MetricRangeLogfmtRow>(&sql, &self.budget_settings())
+                                .await
+                                .map(RxRows::<MetricRangeBucketRow, _>::Rx)
+                            {
+                                Ok(stream) => fold_bucketed_rows(stream, groups).await?,
+                                Err(e) if bucketed_statement_failure_goes_to_todays_route(&e) => {
+                                    BucketedRows::TodaysRoute
+                                }
+                                Err(e) => BucketedRows::Failed(e),
+                            }
+                        } else if json {
                             match self
                                 .client
                                 .query_stream::<MetricRangeJsonRow>(&sql, &self.budget_settings())
@@ -5646,18 +5665,23 @@ struct StagedFold {
     /// A `| json` count's key sources (issue #624, part 3b): each group's
     /// keys become the document its stages run over.
     json: Option<Vec<String>>,
+    /// A `| logfmt` count (issue #624, part 3d): each group's `fields` are
+    /// the line its stages run over.
+    logfmt: bool,
     /// The last group's outcome, keyed by the whole group key.
     memo: Option<StagedMemo>,
 }
 
 /// [`StagedFold`]'s memo: the group key — `(fingerprint,
-/// structured_metadata, matched, caps, keys)` — and that group's outcome.
+/// structured_metadata, matched, caps, keys, fields)` — and that group's
+/// outcome.
 type StagedMemo = (
     Fingerprint,
     String,
     u8,
     Vec<String>,
     Vec<(u8, String)>,
+    String,
     StagedOutcome,
 );
 
@@ -5728,6 +5752,7 @@ impl PushdownRangeGroups {
         step: super::pipeline::RangeStepRules,
         regexp: Option<Vec<(String, usize)>>,
         json: Option<Vec<String>>,
+        logfmt: bool,
     ) -> Self {
         let fan_out = compiled.metric_mutates_labels() || todays_route.grouping.is_some();
         let width = usize::try_from(self.grid_points).unwrap_or(0);
@@ -5742,6 +5767,7 @@ impl PushdownRangeGroups {
             absent,
             regexp,
             json,
+            logfmt,
             memo: None,
         }));
         self
@@ -5772,12 +5798,13 @@ impl PushdownRangeGroups {
             ..
         } = self;
         let staged = staged.as_mut().expect("the staged mode");
-        if let Some((fp, sm, matched, caps, keys, outcome)) = &staged.memo
+        if let Some((fp, sm, matched, caps, keys, fields, outcome)) = &staged.memo
             && *fp == row.fingerprint
             && *sm == row.structured_metadata
             && *matched == row.matched
             && *caps == row.caps
             && *keys == row.keys
+            && *fields == row.fields
         {
             return Ok(outcome.clone());
         }
@@ -5809,9 +5836,12 @@ impl PushdownRangeGroups {
         // Issue #624, part 3b: the group's key labels as the document its
         // `| json` stage reads; every line of the group gives that stage the
         // same labels.
+        // Issue #624, part 3d: a `| logfmt` count's group runs its stages
+        // over the group's relevant fields, which are a decided line.
         let document = match &staged.json {
-            Some(sources) => json_group_document(sources, &row.keys),
-            None => String::new(),
+            Some(sources) => std::borrow::Cow::Owned(json_group_document(sources, &row.keys)),
+            None if staged.logfmt => std::borrow::Cow::Borrowed(row.fields.as_str()),
+            None => std::borrow::Cow::Borrowed(""),
         };
         let run = staged.compiled.run_metric_step_into_with_captures(
             &document,
@@ -5857,6 +5887,7 @@ impl PushdownRangeGroups {
             row.matched,
             row.caps.clone(),
             row.keys.clone(),
+            row.fields.clone(),
             outcome.clone(),
         ));
         Ok(outcome)
@@ -6325,10 +6356,20 @@ fn bucketed_range_sql(
         },
         _ => None,
     };
-    let extraction = match (&regexp, &json) {
-        (Some(r), _) => Some(super::sql::GroupExtraction::Regexp(r)),
-        (None, Some(j)) => Some(super::sql::GroupExtraction::Json(j)),
-        (None, None) => None,
+    // Issue #624, part 3d: a `| logfmt` count's relevant fields join the
+    // group key.
+    let logfmt = match &mp.value {
+        super::sql::MetricValue::Staged(s) => s
+            .logfmt
+            .as_ref()
+            .map(|l| super::sql::logfmt_count_columns(&l.names)),
+        _ => None,
+    };
+    let extraction = match (&regexp, &json, &logfmt) {
+        (Some(r), _, _) => Some(super::sql::GroupExtraction::Regexp(r)),
+        (None, Some(j), _) => Some(super::sql::GroupExtraction::Json(j)),
+        (None, None, Some(l)) => Some(super::sql::GroupExtraction::Logfmt(l)),
+        (None, None, None) => None,
     };
     // Issue #624: #507's statement when the range equals the step, which is
     // smaller and faster there; the sliding statement at every other range.
@@ -7496,6 +7537,7 @@ mod tests {
             matched: 0,
             caps: Vec::new(),
             keys: Vec::new(),
+            fields: String::new(),
         };
         assert!(
             PushdownRangeGroups::new(
@@ -10369,6 +10411,7 @@ mod tests {
             matched: 0,
             caps: Vec::new(),
             keys: Vec::new(),
+            fields: String::new(),
         }
     }
 
@@ -10775,6 +10818,7 @@ mod tests {
                 RangeStepRules::PLAIN,
                 None,
                 None,
+                false,
             )
         }
         let pairs = |p: &[(&str, &str)]| -> Vec<(String, String)> {
