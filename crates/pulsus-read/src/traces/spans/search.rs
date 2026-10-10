@@ -59,7 +59,7 @@ use pulsus_traceql::{
     BoolOp, Field, FieldExpr, FieldOp, PipelineStage, Query, SpansetExpr, SpansetFilter, Value,
 };
 
-use super::numbering::{SCOPE_DETAIL, SCOPE_TOP, after_top_sql, keys_sql};
+use super::numbering::{SCOPE_DETAIL, SCOPE_TOP, after_top_sql, keys_sql, returned_numbers_sql};
 use super::predicate::{PredicateCtx, SpanPredicate, compile_span_predicate_in};
 use super::projection::{
     GroupKeySql, Projection, ceiling_sql, group_key_sql, rendered_array, rendered_array_len,
@@ -151,7 +151,7 @@ const KEYS_SLICED: &str = "(SELECT arrayJoin(arrayConcat(arrayFlatten(arrayMap((
 /// when a span satisfies the later filters, `matched` counts those spans,
 /// and the spans returned are theirs.
 const SEARCH_LATER: &str = r"WITH {scalars}(SELECT (groupArray(trace_id), groupArray(keys))
-      FROM (SELECT trace_id, max(start_ns) AS last,
+      FROM ({scope_top}SELECT trace_id, max(start_ns) AS last,
                    groupUniqArray(intDiv(start_ns, 300000000000)) AS keys
             FROM {spans}
             WHERE {time}
@@ -161,11 +161,11 @@ const SEARCH_LATER: &str = r"WITH {scalars}(SELECT (groupArray(trace_id), groupA
             GROUP BY trace_id
             HAVING countIf({later}) > 0
             ORDER BY last DESC, trace_id ASC
-            LIMIT {limit})) AS top
+            LIMIT {limit})) AS top{after_top}
 SELECT m.trace_id AS trace_id, t.root_service AS root_service, t.root_name AS root_name,
        t.start_ns AS start_ns, t.end_ns - t.start_ns AS duration_ns,
        m.last AS last, m.matched AS matched, m.spans AS spans
-FROM (SELECT trace_id, max(start_ns) AS last, countIf({later}) AS matched,
+FROM ({scope_detail}SELECT trace_id, max(start_ns) AS last, countIf({later}) AS matched,
              arraySlice(arraySort(x -> (x.2, x.1),
                         groupArrayIf((span_id, start_ns, duration_ns, service, {projection}), {later})), 1, {spss}) AS spans
       FROM {spans}
@@ -187,7 +187,7 @@ FROM (SELECT trace_id, max(start_ns) AS last, countIf({later}) AS matched,
 /// (`g_matched`, `g_spans`). The trace's own `matched` and spans are the
 /// union of its groups'.
 const SEARCH_GROUPED: &str = r"WITH {scalars}(SELECT (groupArray(trace_id), groupArray(keys))
-      FROM (SELECT trace_id, max(start_ns) AS last,
+      FROM ({scope_top}SELECT trace_id, max(start_ns) AS last,
                    groupUniqArray(intDiv(start_ns, 300000000000)) AS keys
             FROM {spans}
             WHERE {time}
@@ -197,7 +197,7 @@ const SEARCH_GROUPED: &str = r"WITH {scalars}(SELECT (groupArray(trace_id), grou
             GROUP BY trace_id
             HAVING countIf({later}) > 0
             ORDER BY last DESC, trace_id ASC
-            LIMIT {limit})) AS top{group_values}
+            LIMIT {limit})) AS top{after_top}{group_values}
 SELECT m.trace_id AS trace_id, t.root_service AS root_service, t.root_name AS root_name,
        t.start_ns AS start_ns, t.end_ns - t.start_ns AS duration_ns,
        m.last AS last, m.matched AS matched, m.spans AS spans, m.groups AS groups
@@ -205,7 +205,7 @@ FROM (SELECT trace_id, max(g_last) AS last, sum(g_matched) AS matched,
              arraySlice(arraySort(x -> (x.2, x.1), arrayFlatten(groupArray(g_spans))), 1, {spss}) AS spans,
              arrayMap(x -> (x.2, x.3, x.4, x.5),
                       arraySort(x -> x.1, groupArrayIf((g_first, grp, grp_type, g_matched, g_spans), g_pre > 0))) AS groups
-      FROM (SELECT trace_id, {grp} AS grp, {grp_type} AS grp_type,
+      FROM ({scope_detail}SELECT trace_id, {grp} AS grp, {grp_type} AS grp_type,
                    max(start_ns) AS g_last, countIf({pre}) AS g_pre, countIf({later}) AS g_matched,
                    minIf((start_ns, span_id), {pre}) AS g_first,
                    arraySlice(arraySort(x -> (x.2, x.1),
@@ -228,7 +228,7 @@ FROM (SELECT trace_id, max(g_last) AS last, sum(g_matched) AS matched,
 /// detail read carries the aggregate's response value as one group
 /// holding the trace's surviving spans.
 const SEARCH_AGGREGATED: &str = r"WITH {scalars}(SELECT (groupArray(trace_id), groupArray(keys))
-      FROM (SELECT trace_id, max(start_ns) AS last,
+      FROM ({scope_top}SELECT trace_id, max(start_ns) AS last,
                    groupUniqArray(intDiv(start_ns, 300000000000)) AS keys
             FROM {spans}
             WHERE {time}
@@ -238,12 +238,12 @@ const SEARCH_AGGREGATED: &str = r"WITH {scalars}(SELECT (groupArray(trace_id), g
             GROUP BY trace_id
             HAVING countIf({before}) > 0 AND ({pass}) AND countIf({later}) > 0
             ORDER BY last DESC, trace_id ASC
-            LIMIT {limit})) AS top
+            LIMIT {limit})) AS top{after_top}
 SELECT m.trace_id AS trace_id, t.root_service AS root_service, t.root_name AS root_name,
        t.start_ns AS start_ns, t.end_ns - t.start_ns AS duration_ns,
        m.last AS last, m.matched AS matched, m.spans AS spans,
        [(m.agg_text, m.agg_type, m.matched, m.spans)] AS groups
-FROM (SELECT trace_id, max(start_ns) AS last, countIf({later}) AS matched,
+FROM ({scope_detail}SELECT trace_id, max(start_ns) AS last, countIf({later}) AS matched,
              arraySlice(arraySort(x -> (x.2, x.1),
                         groupArrayIf((span_id, start_ns, duration_ns, service, {projection}), {later})), 1, {spss}) AS spans,
              {agg_text} AS agg_text, {agg_type} AS agg_type
@@ -256,12 +256,6 @@ FROM (SELECT trace_id, max(start_ns) AS last, countIf({later}) AS matched,
         AND ({predicate}){demand}
       GROUP BY trace_id) AS m
 {trace_read}";
-
-/// The refusal of a numbered nested-set comparison in a statement the
-/// newest-slice loop does not slice, or of a second one (issue #594 part
-/// 2): today's engine answers it.
-pub const NUMBERED_NOT_SLICEABLE: &str = "a nested-set comparison that reads the numbering is \
-     served by the search statement only once, in a one-filter search (issue #594)";
 
 /// The message of an aggregate argument's off-path demand (issue #592
 /// part 3).
@@ -285,7 +279,7 @@ pub const OFF_PATH_DEMAND: &str =
 const SEARCH_TREE: &str = r"WITH {scalars}(SELECT (groupArray(trace_id), groupArray(keys))
       FROM (SELECT trace_id, {counts}, greatest({lasts}) AS last,
                    groupUniqArray(intDiv(start_ns, 300000000000)) AS keys
-            FROM (SELECT trace_id, start_ns, {flags}
+            FROM ({scope_top}SELECT trace_id, start_ns, {flags}
                   FROM {spans}
                   WHERE {time}
                     AND {bucket}
@@ -294,7 +288,7 @@ const SEARCH_TREE: &str = r"WITH {scalars}(SELECT (groupArray(trace_id), groupAr
             GROUP BY trace_id
             HAVING {holds}
             ORDER BY last DESC, trace_id ASC
-            LIMIT {limit})) AS top
+            LIMIT {limit})) AS top{after_top}
 SELECT m.trace_id AS trace_id, t.root_service AS root_service, t.root_name AS root_name,
        t.start_ns AS start_ns, t.end_ns - t.start_ns AS duration_ns,
        m.last AS last, m.matched AS matched, m.spans AS spans
@@ -304,7 +298,7 @@ FROM (SELECT trace_id, arrayMax(arrayMap(x -> x.2, sp)) AS last, length(sp) AS m
                    arrayMap(x -> (x.1, x.2, x.3, x.4, x.5),
                             arrayFilter(x -> {member},
                                         groupArray((span_id, start_ns, duration_ns, service, proj, {fnames})))) AS sp
-            FROM (SELECT trace_id, span_id, start_ns, duration_ns, service, {projection} AS proj, {flags}
+            FROM ({scope_detail}SELECT trace_id, span_id, start_ns, duration_ns, service, {projection} AS proj, {flags}
                   FROM {spans}
                   WHERE (intDiv(start_ns, 300000000000), trace_id) IN
                         (SELECT arrayJoin(arrayFlatten(arrayMap((t, ks) -> arrayMap(k -> (k, t), ks), top.1, top.2))))
@@ -580,10 +574,6 @@ pub fn search_sql_at(
     let child_counts = predicates.iter().any(|p| p.reads_child_counts());
     // Issue #594 part 2: the numbering, scoped per read.
     let numbered = predicates.iter().any(|p| p.reads_numbering());
-    assert!(
-        !numbered || matches!(f, SearchFilter::One(_)),
-        "search_sql: a numbered nested-set leaf is served in a one-filter search only"
-    );
     let top_w = match f {
         SearchFilter::One(_) => slice.unwrap_or(w),
         _ => w,
@@ -603,6 +593,8 @@ pub fn search_sql_at(
     }
     let (scope_top, scope_detail, after_top) = if numbered {
         (SCOPE_TOP, SCOPE_DETAIL, after_top_sql(spans_table))
+    } else if proj.reads_numbers() {
+        ("", "", returned_numbers_sql(spans_table, traces_table, w))
     } else {
         ("", "", String::new())
     };
@@ -1332,11 +1324,6 @@ pub fn compile_search_sliced(
         .iter()
         .map(|p| p.numbered_leaves())
         .sum();
-    if numbered > 1 || (numbered == 1 && !sliceable) {
-        return Err(PlanError::UnsupportedField(
-            NUMBERED_NOT_SLICEABLE.to_string(),
-        ));
-    }
     let sql = search_sql_at(
         spans_table,
         traces_table,
@@ -1354,7 +1341,7 @@ pub fn compile_search_sliced(
         grouping,
         climb_depth,
         sliceable,
-        numbered: numbered == 1,
+        numbered: numbered > 0,
     })
 }
 

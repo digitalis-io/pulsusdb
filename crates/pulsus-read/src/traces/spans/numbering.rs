@@ -15,10 +15,14 @@
 //!
 //! A comparison is `(trace_id, span_id) IN` the spans of the read's traces
 //! whose number satisfies it. The traces are `nested_keys`, which each read
-//! binds: the traces whose span starts reach the slice the top read reads
-//! (`trace_keys`), the returned traces in the detail read (`detail_keys`). A `nestedSetParent`
+//! binds: the traces whose span starts reach the slice the top read reads,
+//! or the window when the statement is not sliced (`trace_keys`), the returned traces in the detail read (`detail_keys`). A `nestedSetParent`
 //! comparison that holds for `-1` alone is `parent_span_id` empty, with no
 //! numbering.
+//!
+//! A comparison reading a number or a child count as an operand (issue
+//! #594 part 4) is `(trace_id, span_id) IN` the read's spans joined to
+//! them ([`span_values_membership`]).
 
 use pulsus_traceql::{ComparisonOp, Intrinsic, Value};
 
@@ -201,5 +205,88 @@ pub fn projected_sql(intrinsic: Intrinsic, op: ComparisonOp, value: &Value) -> S
         "toString(transform(concat(trace_id, span_id), nested_values.1, nested_values.{}, \
          toInt64(0)))",
         column(intrinsic).1
+    )
+}
+
+/// The per-span values one comparison reads as operands (issue #594 part
+/// 4): the numbering, the child counts, or both.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SpanValues {
+    pub numbered: bool,
+    pub children: bool,
+}
+
+impl SpanValues {
+    /// Notes `intrinsic`'s value and returns its joined column.
+    pub fn read(&mut self, intrinsic: Intrinsic) -> &'static str {
+        match intrinsic {
+            Intrinsic::ChildCount => {
+                self.children = true;
+                "pv_children"
+            }
+            Intrinsic::NestedSetLeft => {
+                self.numbered = true;
+                "pv_left"
+            }
+            Intrinsic::NestedSetRight => {
+                self.numbered = true;
+                "pv_right"
+            }
+            _ => {
+                self.numbered = true;
+                "pv_parent"
+            }
+        }
+    }
+}
+
+/// A comparison `cond` over per-span values: the spans of the read's
+/// traces (`nested_keys`) joined to their numbers and child counts, a span
+/// without a child count or a number reading `0`.
+pub fn span_values_membership(cond: &str, v: SpanValues, spans_table: &str) -> String {
+    let mut joins = String::new();
+    if v.numbered {
+        joins.push_str(&format!(
+            " LEFT JOIN (SELECT trace_id, sp.1 AS span_id, nl AS pv_left, nr AS pv_right, \
+             np AS pv_parent FROM ({}) ARRAY JOIN s AS sp, lft AS nl, rgt AS nr, par AS np) \
+             AS pv_n USING (trace_id, span_id)",
+            numbering_sql(spans_table, "nested_keys")
+        ));
+    }
+    if v.children {
+        joins.push_str(&format!(
+            " LEFT JOIN (SELECT trace_id, parent_span_id AS span_id, count() AS pv_children \
+             FROM {spans_table} WHERE (intDiv(start_ns, 300000000000), trace_id) IN \
+             (SELECT arrayJoin(nested_keys)) AND parent_span_id != toFixedString('', 8) \
+             GROUP BY trace_id, parent_span_id) AS pv_c USING (trace_id, span_id)"
+        ));
+    }
+    format!(
+        "(trace_id, span_id) IN (SELECT trace_id, span_id FROM {spans_table}{joins} WHERE \
+         (intDiv(start_ns, 300000000000), trace_id) IN (SELECT arrayJoin(nested_keys)) AND ({cond}))"
+    )
+}
+
+/// The number `select(<intrinsic>)` projects (issue #594 part 4): the
+/// span's, from `nested_values`.
+pub fn selected_sql(intrinsic: Intrinsic) -> String {
+    format!(
+        "toString(transform(concat(trace_id, span_id), nested_values.1, nested_values.{}, \
+         toInt64(0)))",
+        column(intrinsic).1
+    )
+}
+
+/// The scalars after `top` when the projection reads `nested_values` and
+/// no predicate numbers: the returned traces' pairs within `w`'s per-trace
+/// days, and their numbering.
+pub fn returned_numbers_sql(spans_table: &str, traces_table: &str, w: WindowSql) -> String {
+    format!(
+        ",\n     (SELECT groupArray((k, trace_id)) FROM (SELECT trace_id, arrayJoin(buckets) AS k \
+         FROM {traces_table} WHERE {} AND trace_id IN (SELECT arrayJoin(top.1)))) AS detail_keys,\n     \
+         (SELECT (groupArray(concat(trace_id, sp.1)), groupArray(nl), groupArray(nr), groupArray(np))\n      \
+         FROM ({})\n      ARRAY JOIN s AS sp, lft AS nl, rgt AS nr, par AS np) AS nested_values",
+        w.per_trace_day_clause(),
+        numbering_sql(spans_table, "detail_keys")
     )
 }

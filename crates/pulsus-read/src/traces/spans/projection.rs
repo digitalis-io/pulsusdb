@@ -128,6 +128,14 @@ impl Projection {
         }
     }
 
+    /// Whether a projected value reads `nested_values` (issue #594 parts 2
+    /// and 4).
+    pub fn reads_numbers(&self) -> bool {
+        self.groups
+            .iter()
+            .any(|g| g.sources.iter().any(|s| s.value.contains("nested_values.")))
+    }
+
     /// The SQL the detail read projects per span: an array of
     /// `(group, value, kind)`, one element per group whose condition held.
     pub fn sql(&self) -> String {
@@ -282,9 +290,28 @@ impl Projection {
                 false,
                 ctx,
             ),
-            Field::Intrinsic(Intrinsic::Duration | Intrinsic::SpanId | Intrinsic::TraceId) => {
-                Ok(())
-            }
+            Field::Intrinsic(
+                Intrinsic::Duration
+                | Intrinsic::SpanId
+                | Intrinsic::TraceId
+                | Intrinsic::TraceDuration
+                | Intrinsic::RootName
+                | Intrinsic::RootServiceName
+                | Intrinsic::ChildCount,
+            ) => Ok(()),
+            Field::Intrinsic(
+                i @ (Intrinsic::NestedSetLeft
+                | Intrinsic::NestedSetRight
+                | Intrinsic::NestedSetParent),
+            ) => self.add(
+                field,
+                Projects::Value {
+                    value: super::numbering::selected_sql(*i),
+                    kind: "'Int64'".to_string(),
+                },
+                &FieldExpr::Literal(Value::Bool(true)),
+                ctx,
+            ),
             Field::Intrinsic(_) => Err(PlanError::UnsupportedField(format!(
                 "select({field}) is not supported by the search statement (issue #592)"
             ))),
