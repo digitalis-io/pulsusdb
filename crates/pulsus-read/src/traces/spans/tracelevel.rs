@@ -186,3 +186,153 @@ pub fn type_refusal(intrinsic: Intrinsic, op: ComparisonOp, value: &Value) -> Pl
         }
     })
 }
+
+/// A per-trace value read as an operand or a `by()` key (issue #594 part
+/// 3): the trace's extent, its root's name, its root's service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraceValue {
+    Duration,
+    RootName,
+    RootService,
+}
+
+impl TraceValue {
+    /// The value for `intrinsic`, when it is one of the three.
+    pub fn of(intrinsic: Intrinsic) -> Option<TraceValue> {
+        match intrinsic {
+            Intrinsic::TraceDuration => Some(TraceValue::Duration),
+            Intrinsic::RootName => Some(TraceValue::RootName),
+            Intrinsic::RootServiceName => Some(TraceValue::RootService),
+            _ => None,
+        }
+    }
+
+    /// The scalar alias an operand reads.
+    pub fn alias(self) -> &'static str {
+        match self {
+            TraceValue::Duration => "tv_duration",
+            TraceValue::RootName => "tv_root_name",
+            TraceValue::RootService => "tv_root_service",
+        }
+    }
+
+    /// The per-trace subquery's columns for the value, ending `AS v`.
+    fn columns(self) -> String {
+        match self {
+            TraceValue::Duration => "max(end_ns) - min(start_ns) AS v".to_string(),
+            TraceValue::RootName => {
+                format!(
+                    "min(root) AS r, if(r.1 = 0, {}, '') AS v",
+                    ceiling_sql("r.5")
+                )
+            }
+            TraceValue::RootService => {
+                format!(
+                    "min(root) AS r, if(r.1 = 0, {}, '') AS v",
+                    ceiling_sql("r.4")
+                )
+            }
+        }
+    }
+
+    /// The value's SQL type, `NULL` when the trace has none.
+    fn nullable_type(self) -> &'static str {
+        match self {
+            TraceValue::Duration => "Nullable(Int64)",
+            TraceValue::RootName | TraceValue::RootService => "Nullable(String)",
+        }
+    }
+
+    /// `(ids, values)` of the traces `filter` keeps, one row per trace
+    /// within `w`'s per-trace days.
+    fn pairs_sql(self, traces_table: &str, w: WindowSql, filter: &str) -> String {
+        format!(
+            "(SELECT (groupArray(trace_id), groupArray(v)) FROM (SELECT trace_id, {cols} \
+             FROM {traces_table} WHERE {days} {filter}))",
+            cols = self.columns(),
+            days = w.per_trace_day_clause(),
+        )
+    }
+
+    /// The value on the span row: the trace's, read from `alias`'s pairs,
+    /// `NULL` when the trace is not among them.
+    pub fn lookup_sql(self, alias: &str) -> String {
+        format!(
+            "transform(trace_id, {alias}.1, {alias}.2, CAST(NULL, '{}'))",
+            self.nullable_type()
+        )
+    }
+}
+
+/// The operand scalars, ending in `,\n     `: per value read, the pairs of
+/// every trace with a `traces` row in `w`'s per-trace days that reaches
+/// `top`, the part of the window the top-K reads.
+pub fn trace_values_sql(
+    values: &[TraceValue],
+    top: WindowSql,
+    w: WindowSql,
+    traces_table: &str,
+) -> String {
+    let mut out = String::new();
+    for v in values {
+        let having = format!(
+            "GROUP BY trace_id HAVING max(last_start_ns) >= {} AND min(start_ns) <= {}",
+            top.first_included_ns(),
+            top.last_included_ns()
+        );
+        out.push_str(&format!(
+            "{} AS {},\n     ",
+            v.pairs_sql(traces_table, w, &having),
+            v.alias()
+        ));
+    }
+    out
+}
+
+/// What a `by()` key reads beside the span row (issue #594 part 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyValues {
+    Trace(TraceValue),
+    ChildCount,
+    Numbered(Intrinsic),
+}
+
+/// The grouped statement's scalars after `top` for `key`, starting `,\n`:
+/// `group_keys`, the returned traces' `(bucket, trace_id)` pairs within
+/// `w`'s per-trace days, when the key reads spans; and `group_values`, the
+/// key's `(ids, values)` over the returned traces.
+pub fn group_values_sql(
+    key: KeyValues,
+    w: WindowSql,
+    spans_table: &str,
+    traces_table: &str,
+) -> String {
+    let returned = "AND trace_id IN (SELECT arrayJoin(top.1))";
+    let keys = format!(
+        ",\n     (SELECT groupArray((k, trace_id)) FROM (SELECT trace_id, arrayJoin(buckets) AS k \
+         FROM {traces_table} WHERE {} {returned})) AS group_keys",
+        w.per_trace_day_clause()
+    );
+    match key {
+        KeyValues::Trace(v) => format!(
+            ",\n     {} AS group_values",
+            v.pairs_sql(traces_table, w, &format!("{returned} GROUP BY trace_id"))
+        ),
+        KeyValues::ChildCount => format!(
+            "{keys},\n     (SELECT (groupArray(concat(trace_id, parent_span_id)), groupArray(c)) \
+             FROM (SELECT trace_id, parent_span_id, count() AS c FROM {spans_table} \
+             WHERE (intDiv(start_ns, {RECENT_BUCKET_NS}), trace_id) IN (SELECT arrayJoin(group_keys)) \
+             AND parent_span_id != toFixedString('', 8) GROUP BY trace_id, parent_span_id)) AS group_values"
+        ),
+        KeyValues::Numbered(i) => format!(
+            "{keys},\n     (SELECT (groupArray(concat(trace_id, sp.1)), groupArray({})) FROM ({}) \
+             ARRAY JOIN s AS sp, lft AS nl, rgt AS nr, par AS np) AS group_values",
+            match i {
+                Intrinsic::NestedSetLeft => "nl",
+                Intrinsic::NestedSetRight => "nr",
+                _ => "np",
+            },
+            super::numbering::numbering_sql(spans_table, "group_keys")
+        ),
+    }
+}

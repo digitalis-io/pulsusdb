@@ -485,18 +485,56 @@ pub struct GroupKeySql {
     /// — a key-value list flattened into paths under the key, or bytes in
     /// `attrs_other` — which the statement cannot read as the key's value.
     pub off_path: Option<String>,
+    /// What the key reads beside the span row (issue #594 part 3): the
+    /// grouped statement's `group_values`.
+    pub values: Option<super::tracelevel::KeyValues>,
 }
 
 /// The `by()` keys the search statement serves (issue #592 part 2): `name`,
-/// `status`, `kind`, `resource.service.name` and a `span.` attribute.
-/// `None` for any other key, which today's engine answers.
+/// `status`, `kind`, `resource.service.name` and a `span.` attribute; and
+/// (issue #594 part 3) the three per-trace intrinsics, `span:childCount`
+/// and the three nested-set intrinsics, each read from the grouped
+/// statement's `group_values`. `None` for any other key, which today's
+/// engine answers.
 pub fn group_key_sql(field: &Field) -> Option<GroupKeySql> {
+    use super::tracelevel::{KeyValues, TraceValue};
     let column = |sql: &str| GroupKeySql {
         value: sql.to_string(),
         value_type: None,
         off_path: None,
+        values: None,
+    };
+    let looked_up = |values: KeyValues, value: String, value_type: String| GroupKeySql {
+        value,
+        value_type: Some(value_type),
+        off_path: None,
+        values: Some(values),
     };
     match field {
+        Field::Intrinsic(i @ (Intrinsic::TraceDuration | Intrinsic::RootName | Intrinsic::RootServiceName)) => {
+            let v = TraceValue::of(*i).expect("one of the three");
+            let x = v.lookup_sql("group_values");
+            let (value, kind) = if v == TraceValue::Duration {
+                (format!("ifNull(toString({x}), '')"), "Duration")
+            } else {
+                (format!("ifNull({x}, '')"), "String")
+            };
+            Some(looked_up(
+                KeyValues::Trace(v),
+                value,
+                format!("if(isNull({x}), 'None', '{kind}')"),
+            ))
+        }
+        Field::Intrinsic(Intrinsic::ChildCount) => Some(looked_up(
+            KeyValues::ChildCount,
+            "toString(transform(concat(trace_id, span_id), group_values.1, group_values.2, toUInt64(0)))".to_string(),
+            "'Int64'".to_string(),
+        )),
+        Field::Intrinsic(i @ (Intrinsic::NestedSetLeft | Intrinsic::NestedSetRight | Intrinsic::NestedSetParent)) => Some(looked_up(
+            KeyValues::Numbered(*i),
+            "toString(transform(concat(trace_id, span_id), group_values.1, group_values.2, toInt64(0)))".to_string(),
+            "'Int64'".to_string(),
+        )),
         Field::Intrinsic(Intrinsic::Name | Intrinsic::Status | Intrinsic::Kind) => {
             match place_of(field) {
                 Place::Column(sql) => Some(column(sql)),
@@ -519,6 +557,7 @@ pub fn group_key_sql(field: &Field) -> Option<GroupKeySql> {
                      toString({p}))"
                 ),
                 value_type: Some(format!("toString(dynamicType({p}))")),
+                values: None,
                 off_path: Some(format!(
                     "dynamicType({p}) = 'None' AND (position(attrs_other, {}) > 0 OR \
                      arrayExists(x -> startsWith(x, {}), JSONAllPaths(attrs)))",

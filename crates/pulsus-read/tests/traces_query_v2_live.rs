@@ -12176,3 +12176,403 @@ async fn three_attribute_indexes_keep_the_fixture_a_insert_within_twice_its_unin
         "three indexes: {indexed} bytes, more than twice the unindexed {plain}"
     );
 }
+
+// ---------------------------------------------------------------------
+// issue #594 part 3: the per-trace values as operands, and the seven as
+// by() keys
+// ---------------------------------------------------------------------
+
+/// The three per-trace intrinsics as operands over fixture TL, in every
+/// template and under a structural operator.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_trace_value_is_an_operand() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let wrong = check_levels("tv", &tl_bodies(base_ns), 12, base_ns, TV_CASES).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+const TV_CASES: &[LevelCase] = &[
+    (
+        "{ duration = trace:duration }",
+        "d2 1 [01]; d1 2 [01, 02]",
+        None,
+    ),
+    (
+        "{ trace:duration - duration <= 1s }",
+        "d3 2 [05, 06]; d2 1 [01]; d1 2 [01, 02]",
+        Some("d3 2 [05, 06]; d2 1 [01]; d1 2 [01, 02]"),
+    ),
+    (
+        "{ traceDuration > duration * 3000 }",
+        "de 1 [01]; dd 1 [02]; d2 1 [02]",
+        None,
+    ),
+    (
+        "{ name = trace:rootName }",
+        "de 1 [01]; d2 1 [01]; d1 1 [01]",
+        Some("de 1 [01]; d3 1 [05]; d2 1 [01]; d1 1 [01]"),
+    ),
+    (
+        "{ rootServiceName = resource.service.name }",
+        "de 1 [01]; d2 1 [01]; d1 2 [01, 02]",
+        Some("de 1 [01]; d3 2 [05, 06]; d2 1 [01]; d1 2 [01, 02]"),
+    ),
+    (
+        "{ trace:rootName != name }",
+        "dd 1 [02]; d3 2 [05, 06]; d2 1 [02]; d1 1 [02]; c5 1 [02]",
+        Some("dd 1 [02]; d3 1 [06]; d2 1 [02]; d1 1 [02]; c5 1 [02]"),
+    ),
+    (
+        "{ !(duration = trace:duration) }",
+        "de 1 [01]; dd 1 [02]; d3 2 [05, 06]; d2 1 [02]; c5 1 [02]",
+        Some("de 1 [01]; dd 1 [02]; d3 2 [05, 06]; d2 1 [02]; c5 1 [02]"),
+    ),
+    (
+        "{ } | { name = trace:rootName }",
+        "de 1 [01]; d2 1 [01]; d1 1 [01]",
+        Some("de 1 [01]; d3 1 [05]; d2 1 [01]; d1 1 [01]"),
+    ),
+    (
+        "{ name = trace:rootName } && { duration = trace:duration }",
+        "d2 1 [01]; d1 2 [01, 02]",
+        None,
+    ),
+    (
+        "{ name = trace:rootName } | by(name)",
+        "de 1 [01]; d2 1 [01]; d1 1 [01]",
+        Some("de 1 [01]; d3 1 [05]; d2 1 [01]; d1 1 [01]"),
+    ),
+    (
+        "{ duration = trace:duration } | count() > 1",
+        "d1 2 [01, 02]",
+        None,
+    ),
+    (
+        "{ name = trace:rootName } > { }",
+        "d2 1 [02]; d1 1 [02]",
+        Some("d3 1 [06]; d2 1 [02]; d1 1 [02]"),
+    ),
+];
+
+/// A trace whose per-trace row is gone has no value: no comparison holds
+/// for its spans, `!=` included, and its `by()` key is `nil`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_trace_without_its_row_has_no_value() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let (db, client) = seed_both(
+        pulsus_testkit::test_db("pulsus_read_it_t594p3_tvn"),
+        &tl_bodies(base_ns),
+        12,
+        "t594p3-tvn",
+    )
+    .await;
+    client
+        .execute(
+            "ALTER TABLE traces DELETE WHERE trace_id = unhex('d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1') \
+             SETTINGS mutations_sync = 2",
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("delete d1's per-trace rows");
+    let engine = engine_of(&db).await;
+    let mut wrong = Vec::new();
+    for (query, want, render) in [
+        (
+            "{ trace:rootName != name }",
+            "dd 1 [02]; d3 2 [05, 06]; d2 1 [02]; c5 1 [02]",
+            answer_of as Render,
+        ),
+        (
+            "{ duration = trace:duration }",
+            "d2 1 [01]",
+            answer_of as Render,
+        ),
+        (
+            "{ event.k != trace:rootName }",
+            "de 1 [01]; dd 1 [02]; d3 2 [05, 06]; d2 2 [01, 02]; c5 1 [02]",
+            answer_of as Render,
+        ),
+        (
+            r#"{ resource.service.name = "loadgen" } | by(trace:rootService)"#,
+            "d3 2 [05, 06] { 2 [05, 06]}; d2 1 [02] {cart 1 [02]}; d1 2 [01, 02] {nil 2 [01, 02]}",
+            grouped_answer_of as Render,
+        ),
+    ] {
+        let plan = plan_of(
+            &engine,
+            &parse_query(query),
+            (base_ns, base_ns + 60_000_000_000),
+            20,
+            20,
+        );
+        if !covered(&plan) {
+            wrong.push(format!(
+                "{query}: today's engine's, must be the statement's"
+            ));
+            continue;
+        }
+        let routed = engine.search_routed(&plan).await.map(normalise_today);
+        if render(&routed) != want {
+            wrong.push(format!(
+                "{query}\n  want {want}\n  got  {}",
+                render(&routed)
+            ));
+        }
+    }
+    drop_db(&db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// The seven as `by()` keys: fixture TL's trace values, CC's child counts,
+/// NS's numbers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_trace_value_is_a_by_key() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let wrong = check_levels_by(
+        "tk",
+        &tl_bodies(base_ns),
+        12,
+        base_ns,
+        TK_CASES,
+        grouped_answer_of,
+    )
+    .await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+const TK_CASES: &[LevelCase] = &[
+    (
+        r#"{ resource.service.name = "loadgen" } | by(trace:rootService)"#,
+        "d3 2 [05, 06] { 2 [05, 06]}; d2 1 [02] {cart 1 [02]}; d1 2 [01, 02] {loadgen 2 [01, 02]}",
+        Some(
+            "d3 2 [05, 06] {loadgen 2 [05, 06]}; d2 1 [02] {cart 1 [02]}; d1 2 [01, 02] {loadgen 2 [01, 02]}",
+        ),
+    ),
+    (
+        r#"{ resource.service.name = "loadgen" } | by(trace:duration)"#,
+        "d3 2 [05, 06] {2s 2 [05, 06]}; d2 1 [02] {2h0m0s 1 [02]}; d1 2 [01, 02] {1s 2 [01, 02]}",
+        Some(
+            "d3 2 [05, 06] {2s 2 [05, 06]}; d2 1 [02] {2h0m0s 1 [02]}; d1 2 [01, 02] {1s 2 [01, 02]}",
+        ),
+    ),
+    (
+        r#"{ resource.service.name = "loadgen" } | by(rootName)"#,
+        "d3 2 [05, 06] { 2 [05, 06]}; d2 1 [02] {POST / 1 [02]}; d1 2 [01, 02] {GET / 2 [01, 02]}",
+        Some(
+            "d3 2 [05, 06] {GET / 2 [05, 06]}; d2 1 [02] {POST / 1 [02]}; d1 2 [01, 02] {GET / 2 [01, 02]}",
+        ),
+    ),
+];
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_child_count_is_a_by_key() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let wrong = check_levels_by(
+        "ck",
+        &cc_bodies(base_ns),
+        13,
+        base_ns,
+        &[(
+            "{ } | by(span:childCount)",
+            "c3 4 [01, 02, 0b, 0c] {int:1 1 [01]; int:2 1 [02]; int:0 2 [0b, 0c]}; cc 7 [01, 02, 03, 07, 08, 09, 0a] {int:4 1 [01]; int:3 1 [02]; int:1 1 [03]; int:0 4 [07, 08, 09, 0a]}",
+            None,
+        )],
+        grouped_answer_of,
+    )
+    .await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_nested_set_number_is_a_by_key() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let wrong = check_levels_by(
+        "nk3",
+        &ns_bodies(base_ns),
+        25,
+        base_ns,
+        NK_CASES,
+        grouped_answer_of,
+    )
+    .await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+const NK_CASES: &[LevelCase] = &[
+    (
+        "{ } | by(nestedSetParent)",
+        "b2 5 [05, 02, 04, 01, 03] {int:1 2 [05, 04]; int:-1 2 [02, 01]; int:7 1 [03]}; c1 2 [02, 03] {int:1 1 [02]; int:2 1 [03]}; e5 2 [01, 02] {int:0 2 [01, 02]}; e2 5 [04, 01, 05, 02, 03] {int:-1 1 [04]; int:0 3 [01, 02, 03]; int:1 1 [05]}; e1 6 [01, 02, 03, 04, 05, 06] {int:-1 1 [01]; int:1 2 [02, 03]; int:2 1 [04]; int:0 2 [05, 06]}; a1 4 [01, 02, 03, 04] {int:-1 1 [01]; int:1 2 [02, 04]; int:2 1 [03]}",
+        Some(
+            "b2 5 [05, 02, 04, 01, 03] {int:1 2 [05, 04]; int:-1 2 [02, 01]; int:7 1 [03]}; c1 2 [02, 03] {int:-1 1 [02]; int:1 1 [03]}; e5 2 [01, 02] {int:-1 1 [01]; int:1 1 [02]}; e2 5 [04, 01, 05, 02, 03] {int:-1 2 [04, 01]; int:1 1 [05]; int:5 1 [02]; int:6 1 [03]}; e1 6 [01, 02, 03, 04, 05, 06] {int:-1 2 [01, 05]; int:1 2 [02, 03]; int:2 1 [04]; int:9 1 [06]}; a1 4 [01, 02, 03, 04] {int:-1 1 [01]; int:1 2 [02, 04]; int:2 1 [03]}",
+        ),
+    ),
+    (
+        "{ } | by(nestedSetLeft)",
+        "b2 5 [05, 02, 04, 01, 03] {int:2 1 [05]; int:1 1 [02]; int:4 1 [04]; int:7 1 [01]; int:8 1 [03]}; c1 2 [02, 03] {int:2 1 [02]; int:3 1 [03]}; e5 2 [01, 02] {int:0 2 [01, 02]}; e2 5 [04, 01, 05, 02, 03] {int:1 1 [04]; int:0 3 [01, 02, 03]; int:2 1 [05]}; e1 6 [01, 02, 03, 04, 05, 06] {int:1 1 [01]; int:2 1 [02]; int:6 1 [03]; int:3 1 [04]; int:0 2 [05, 06]}; a1 4 [01, 02, 03, 04] {int:1 1 [01]; int:2 1 [02]; int:3 1 [03]; int:6 1 [04]}",
+        Some(
+            "b2 5 [05, 02, 04, 01, 03] {int:2 1 [05]; int:1 1 [02]; int:4 1 [04]; int:7 1 [01]; int:8 1 [03]}; c1 2 [02, 03] {int:1 1 [02]; int:2 1 [03]}; e5 2 [01, 02] {int:1 1 [01]; int:2 1 [02]}; e2 5 [04, 01, 05, 02, 03] {int:1 1 [04]; int:5 1 [01]; int:2 1 [05]; int:6 1 [02]; int:7 1 [03]}; e1 6 [01, 02, 03, 04, 05, 06] {int:1 1 [01]; int:2 1 [02]; int:6 1 [03]; int:3 1 [04]; int:9 1 [05]; int:10 1 [06]}; a1 4 [01, 02, 03, 04] {int:1 1 [01]; int:2 1 [02]; int:3 1 [03]; int:6 1 [04]}",
+        ),
+    ),
+    (
+        "{ } | by(nestedSetRight)",
+        "b2 5 [05, 02, 04, 01, 03] {int:3 1 [05]; int:6 1 [02]; int:5 1 [04]; int:10 1 [01]; int:9 1 [03]}; c1 2 [02, 03] {int:5 1 [02]; int:4 1 [03]}; e5 2 [01, 02] {int:0 2 [01, 02]}; e2 5 [04, 01, 05, 02, 03] {int:4 1 [04]; int:0 3 [01, 02, 03]; int:3 1 [05]}; e1 6 [01, 02, 03, 04, 05, 06] {int:8 1 [01]; int:5 1 [02]; int:7 1 [03]; int:4 1 [04]; int:0 2 [05, 06]}; a1 4 [01, 02, 03, 04] {int:8 1 [01]; int:5 1 [02]; int:4 1 [03]; int:7 1 [04]}",
+        Some(
+            "b2 5 [05, 02, 04, 01, 03] {int:3 1 [05]; int:6 1 [02]; int:5 1 [04]; int:10 1 [01]; int:9 1 [03]}; c1 2 [02, 03] {int:4 1 [02]; int:3 1 [03]}; e5 2 [01, 02] {int:4 1 [01]; int:3 1 [02]}; e2 5 [04, 01, 05, 02, 03] {int:4 1 [04]; int:10 1 [01]; int:3 1 [05]; int:9 1 [02]; int:8 1 [03]}; e1 6 [01, 02, 03, 04, 05, 06] {int:8 1 [01]; int:5 1 [02]; int:7 1 [03]; int:4 1 [04]; int:12 1 [05]; int:11 1 [06]}; a1 4 [01, 02, 03, 04] {int:8 1 [01]; int:5 1 [02]; int:4 1 [03]; int:7 1 [04]}",
+        ),
+    ),
+];
+
+/// The newest-slice loop answers a trace-value comparison from its first
+/// slice, each value the whole trace's: `dd`'s and `de`'s extents reach
+/// rows dated the day before and the day after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sliced_search_reads_whole_trace_values() {
+    skip_unless_live!();
+    let e = end595();
+    let (db, client) = seed_both(
+        pulsus_testkit::test_db("pulsus_read_it_t594p3_tvs"),
+        &tl_bodies(e - 120_000_000_000),
+        12,
+        "t594p3-tvs",
+    )
+    .await;
+    let engine = engine_of(&db).await;
+    let query = "{ trace:duration > duration * 3000 }";
+    let plan = plan_of(
+        &engine,
+        &parse_query(query),
+        (e - 10_800_000_000_000, e),
+        2,
+        20,
+    );
+    let t0 = now_ns();
+    let routed = engine.search_routed_explained(&plan).await;
+    let (n, _) = settled_statements(&client, &db, t0).await;
+    let today = engine.search(&plan).await.map(normalise_today);
+    drop_db(&db).await;
+    let stages = match &routed {
+        Ok((_, x)) => x
+            .stages
+            .iter()
+            .map(|s| s.name)
+            .collect::<Vec<_>>()
+            .join(" "),
+        Err(e) => format!("Err({e})"),
+    };
+    let routed = answer_of(&routed.map(|(o, _)| o));
+    let want = ("de 1 [01]; dd 1 [02]", 1, "search_slice");
+    assert_eq!((routed.as_str(), n, stages.as_str()), want);
+    assert_eq!(answer_of(&today), want.0);
+}
+
+/// Fixture XM: trace `91` pushed span by span, `01` and `04` the day
+/// before `m`, a UTC midnight, `02` and `03` after it; the window is the
+/// minute before `m`.
+fn xm_bodies(base_ns: i64) -> Vec<ExportTraceServiceRequest> {
+    const S: i64 = 1_000_000_000;
+    [(1, 0, 30), (4, 1, 40), (2, 1, 70), (3, 1, 80)]
+        .into_iter()
+        .map(|(n, p, at)| by_body("svc", vec![lsp(base_ns, 0x91, n, p, "op", at * S, S)]))
+        .collect()
+}
+
+/// Every key family reads the trace's rows either side of a UTC midnight.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_key_reads_rows_either_side_of_midnight() {
+    skip_unless_live!();
+    const DAY: i64 = 86_400_000_000_000;
+    let m = now_ns() - now_ns().rem_euclid(DAY);
+    let base = m - 60_000_000_000;
+    let wrong = check_levels_by(
+        "xm",
+        &xm_bodies(base),
+        4,
+        base,
+        &[
+            (
+                "{ } | by(trace:duration)",
+                "91 2 [01, 04] {51s 2 [01, 04]}",
+                None,
+            ),
+            (
+                "{ } | by(span:childCount)",
+                "91 2 [01, 04] {int:3 1 [01]; int:0 1 [04]}",
+                None,
+            ),
+            (
+                "{ } | by(nestedSetRight)",
+                "91 2 [01, 04] {int:8 1 [01]; int:3 1 [04]}",
+                Some("91 2 [01, 04] {int:4 1 [01]; int:3 1 [04]}"),
+            ),
+        ],
+        grouped_answer_of,
+    )
+    .await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A child count and a number with the trace's per-trace rows gone: `0`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_count_or_number_without_its_row_is_zero() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let mut wrong = Vec::new();
+    for (label, bodies, spans, gone, query, want) in [
+        (
+            "ccn",
+            cc_bodies(base_ns),
+            13u64,
+            "cccccccccccccccccccccccccccccccc",
+            "{ } | by(span:childCount)",
+            "c3 4 [01, 02, 0b, 0c] {int:1 1 [01]; int:2 1 [02]; int:0 2 [0b, 0c]}; cc 7 [01, 02, 03, 07, 08, 09, 0a] {int:0 7 [01, 02, 03, 07, 08, 09, 0a]}",
+        ),
+        (
+            "nsn",
+            ns_bodies(base_ns),
+            25,
+            "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+            "{ } | by(nestedSetParent)",
+            "b2 5 [05, 02, 04, 01, 03] {int:1 2 [05, 04]; int:-1 2 [02, 01]; int:7 1 [03]}; c1 2 [02, 03] {int:1 1 [02]; int:2 1 [03]}; e5 2 [01, 02] {int:0 2 [01, 02]}; e2 5 [04, 01, 05, 02, 03] {int:-1 1 [04]; int:0 3 [01, 02, 03]; int:1 1 [05]}; e1 6 [01, 02, 03, 04, 05, 06] {int:-1 1 [01]; int:1 2 [02, 03]; int:2 1 [04]; int:0 2 [05, 06]}; a1 4 [01, 02, 03, 04] {int:0 4 [01, 02, 03, 04]}",
+        ),
+    ] {
+        let (db, client) = seed_both(
+            pulsus_testkit::test_db(&format!("pulsus_read_it_t594p3_{label}")),
+            &bodies,
+            spans,
+            &format!("t594p3-{label}"),
+        )
+        .await;
+        client
+            .execute(
+                &format!("ALTER TABLE traces DELETE WHERE trace_id = unhex('{gone}') SETTINGS mutations_sync = 2"),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("delete the per-trace rows");
+        let engine = engine_of(&db).await;
+        let plan = plan_of(
+            &engine,
+            &parse_query(query),
+            (base_ns, base_ns + 60_000_000_000),
+            20,
+            20,
+        );
+        let routed = if covered(&plan) {
+            grouped_answer_of(&engine.search_routed(&plan).await.map(normalise_today))
+        } else {
+            "today's engine's, must be the statement's".to_string()
+        };
+        drop_db(&db).await;
+        if routed != want {
+            wrong.push(format!("{query}\n  want {want}\n  got  {routed}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
