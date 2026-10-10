@@ -141,6 +141,19 @@ impl SpanPredicate {
         &self.sql
     }
 
+    /// This predicate behind `hints` (issue #595 part 2): `h1 AND … AND
+    /// (p)`. Each hint is an `indexHint`, true and never evaluated, so the
+    /// predicate's answer is unchanged.
+    pub(super) fn with_hints(&self, hints: &[String]) -> SpanPredicate {
+        if hints.is_empty() {
+            return self.clone();
+        }
+        SpanPredicate {
+            sql: format!("{} AND ({})", hints.join(" AND "), self.sql),
+            ..self.clone()
+        }
+    }
+
     /// Whether this predicate may sit in a statement bounded by `w`: it
     /// carries no resource subquery, or was compiled for `w`.
     pub(crate) fn composes_with(&self, w: WindowSql) -> bool {
@@ -165,6 +178,9 @@ pub struct PredicateCtx<'a> {
     /// Unqualified in the live suite, `<db>.resources` in production. A
     /// trusted schema name, as `span_membership_sql`'s `spans_table` is.
     pub resources_table: &'a str,
+    /// The operator-named attribute indexes (issue #595 part 2) a search
+    /// filter's hints may reach; empty where none are configured.
+    pub indexed: &'a [super::attr_index::IndexedAttr],
 }
 
 /// Compiles one spanset filter body with no context. A `resource.` field

@@ -952,6 +952,7 @@ impl Ord for HeapEntry {
 pub struct TraceEngine {
     dispatch: super::dispatch::TraceDispatch,
     config: TraceReadConfig,
+    indexed: Vec<super::spans::attr_index::IndexedAttr>,
 }
 
 impl TraceEngine {
@@ -959,6 +960,7 @@ impl TraceEngine {
         Self {
             dispatch: super::dispatch::TraceDispatch::new(client),
             config,
+            indexed: Vec::new(),
         }
     }
 
@@ -2290,11 +2292,12 @@ impl TraceEngine {
             &self.config.traces_table,
             &self.config.resources_table,
             self.config.max_depth,
+            &self.indexed,
         ) else {
             return self.search_inner(plan, explain).await;
         };
-        if let Some(e) = explain.as_mut() {
-            e.push("search_statement", stmt.sql(), None);
+        if let Some(out) = self.newest_first(plan, &stmt, &mut explain).await? {
+            return Ok(out);
         }
         let mut settings = with_final(self.search_settings());
         // Issue #593 part 2: a climb runs `max_depth + 1` levels, the last
@@ -6542,3 +6545,5 @@ mod tests {
         assert!(!req.narrowing().is_empty(), "a well-formed q must narrow");
     }
 }
+
+mod newest_first;

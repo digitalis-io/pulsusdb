@@ -4558,6 +4558,7 @@ async fn a_covered_search_explains_its_one_statement() {
         window,
         spans_table: "spans",
         resources_table: "resources",
+        indexed: &[],
     };
     let want =
         pulsus_read::traces::spans::search::compile_search(&parsed, &ctx, "spans", "traces", 20, 3)

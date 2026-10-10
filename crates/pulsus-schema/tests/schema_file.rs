@@ -9,6 +9,9 @@
 //!   those exact characters (a macro replaced by a constant is accepted by
 //!   the server and silently gives every shard one replica set);
 //! - every replication path names the table of the `CREATE` it sits in;
+//! - the file holds only `CREATE` statements: it is the schema, not a
+//!   script that walks one forward, and `schema/schema.sh` drops the
+//!   database before applying it;
 //! - a statement ends at a line ending in `;` and nowhere else, which is
 //!   what lets the script send one statement per request;
 //! - the script and this crate render the identical text, so the two
@@ -46,17 +49,16 @@ fn repo_root() -> std::path::PathBuf {
         .expect("the crate directory resolves")
 }
 
-/// The inventory, single-node: one database, 26 tables, 21 views each
-/// dropped before it is created. No `Replicated*` engine, no `Distributed`
-/// wrapper, no `ON CLUSTER`.
+/// The inventory, single-node: one database, 26 tables, 21 views, and
+/// nothing else. No `Replicated*` engine, no `Distributed` wrapper, no `ON
+/// CLUSTER`.
 #[test]
 fn the_single_node_render_is_the_whole_inventory_with_every_token_resolved() {
     let stmts = rendered_statements(&single());
-    assert_eq!(stmts.len(), 69, "statement count");
+    assert_eq!(stmts.len(), 48, "statement count");
     assert_eq!(starting_with(&stmts, "CREATE DATABASE"), 1);
     assert_eq!(starting_with(&stmts, "CREATE TABLE"), 26);
     assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 21);
-    assert_eq!(starting_with(&stmts, "DROP VIEW"), 21);
 
     let text = rendered(&single());
     assert!(
@@ -90,7 +92,7 @@ fn the_single_node_render_is_the_whole_inventory_with_every_token_resolved() {
 #[test]
 fn the_clustered_render_adds_the_wrappers_and_keeps_the_server_macros() {
     let stmts = rendered_statements(&clustered());
-    assert_eq!(stmts.len(), 86, "statement count");
+    assert_eq!(stmts.len(), 65, "statement count");
     assert_eq!(
         starting_with(&stmts, "CREATE TABLE"),
         43,
@@ -105,7 +107,7 @@ fn the_clustered_render_adds_the_wrappers_and_keeps_the_server_macros() {
     );
     assert_eq!(
         text.matches("ON CLUSTER 'prod'").count(),
-        86,
+        65,
         "every statement carries ON CLUSTER"
     );
 
@@ -239,28 +241,35 @@ fn the_only_single_brace_names_in_the_file_are_the_two_server_macros() {
     );
 }
 
-/// Every materialized view is dropped before it is created: `CREATE
-/// MATERIALIZED VIEW` carries no `IF NOT EXISTS`, so a second run without
-/// the drop fails on the first view.
+/// The file holds only `CREATE` statements, in both variants. It is the
+/// schema, not a script that walks a database forward: `schema/schema.sh`
+/// drops the database and applies the file to an empty one.
 #[test]
-fn every_view_is_dropped_before_it_is_created() {
+fn the_file_holds_only_create_statements() {
     for ctx in [single(), clustered()] {
-        let stmts = rendered_statements(&ctx);
-        let mut dropped = Vec::new();
-        for s in &stmts {
-            if let Some(rest) = s.trim().strip_prefix("DROP VIEW IF EXISTS ") {
-                dropped.push(rest.split([' ', ';']).next().unwrap().to_string());
-            }
-            if let Some(rest) = s.trim().strip_prefix("CREATE MATERIALIZED VIEW ") {
-                let name = rest.split([' ', '\n']).next().unwrap().to_string();
-                assert!(
-                    dropped.contains(&name),
-                    "{name} is created without being dropped first"
-                );
-            }
-        }
-        assert_eq!(dropped.len(), 21, "every view is dropped");
+        let not_create: Vec<String> = rendered_statements(&ctx)
+            .iter()
+            .map(|s| {
+                s.lines()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty() && !l.starts_with("--"))
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .filter(|first| !first.starts_with("CREATE "))
+            .collect();
+        assert!(
+            not_create.is_empty(),
+            "statements other than CREATE (cluster {:?}): {not_create:?}",
+            ctx.cluster
+        );
     }
+    let drops: Vec<&str> = SCHEMA_SQL
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("-- "))
+        .filter(|l| l.to_ascii_uppercase().contains("DROP "))
+        .collect();
+    assert!(drops.is_empty(), "DROP in schema/schema.sql: {drops:?}");
 }
 
 /// A family's routing wrappers all shard on one expression: a series'
@@ -369,6 +378,7 @@ fn the_configured_values_reach_the_statements() {
         metrics_dedup_window: 21,
         log_dedup_window: 22,
         trace_dedup_window: 23,
+        trace_indexed_attributes: Vec::new(),
         dist_suffix: "_routed".to_string(),
         ..clustered()
     };
@@ -439,6 +449,11 @@ fn the_script_renders_exactly_what_this_crate_renders() {
                 metrics_dedup_window: 21,
                 log_dedup_window: 22,
                 trace_dedup_window: 23,
+                trace_indexed_attributes: vec![
+                    "span.app.request.id".to_string(),
+                    "event.exception.type".to_string(),
+                    "span.http-x.a_b".to_string(),
+                ],
             },
         ),
         (
@@ -487,6 +502,10 @@ fn the_script_renders_exactly_what_this_crate_renders() {
         cmd.env(
             "PULSUS_TRACE_DEDUP_WINDOW",
             ctx.trace_dedup_window.to_string(),
+        );
+        cmd.env(
+            "PULSUS_TRACEQL_INDEXED_ATTRIBUTES",
+            ctx.trace_indexed_attributes.join(","),
         );
         match &ctx.cluster {
             Some(name) => cmd.env("PULSUS_CLUSTER", name),
@@ -1178,5 +1197,105 @@ fn both_sample_tables_keep_the_whole_key_in_memory() {
                 "{table}: {create}"
             );
         }
+    }
+}
+
+/// Issue #595 part 2: the script refuses, with exit status 2, every item
+/// `pulsus_config::parse_indexed_attribute` refuses
+/// (`an_indexed_attribute_is_span_or_event_and_a_plain_dotted_key`), a
+/// repeat, an empty item and a seventeenth item.
+#[test]
+fn the_script_refuses_the_attribute_lists_the_configuration_refuses() {
+    let root = repo_root();
+    let seventeen: Vec<String> = (0..17).map(|i| format!("span.k{i}")).collect();
+    let seventeen = seventeen.join(",");
+    let too_long = format!("span.{}", "a.".repeat(64) + "a");
+    for list in [
+        "resource.k8s.pod.name",
+        "link.x",
+        "instrumentation.x",
+        ".k",
+        "SPAN.k",
+        "span.",
+        "span..a",
+        "span.a.",
+        "span.a..b",
+        "span.a b",
+        "span.a`b",
+        "span.a%b",
+        too_long.as_str(),
+        "span.a,span.a",
+        "span.a,",
+        ",span.a",
+        "span.a,,span.b",
+        seventeen.as_str(),
+    ] {
+        let out = Command::new("sh")
+            .arg(root.join("schema/schema.sh"))
+            .arg("--print")
+            .current_dir(&root)
+            .env_remove("PULSUS_CLUSTER")
+            .env("PULSUS_TRACEQL_INDEXED_ATTRIBUTES", list)
+            .output()
+            .expect("the script runs");
+        assert_eq!(out.status.code(), Some(2), "{list:?} must be refused");
+        if list.starts_with("resource.") {
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                err.contains("resource.k8s.pod.name") && err.contains("resource_id"),
+                "the refusal names the item and the resource_id index: {err}"
+            );
+        }
+    }
+    // A key of exactly 128 bytes renders.
+    let at = format!("span.{}", "a.".repeat(63) + "ab");
+    let out = Command::new("sh")
+        .arg(root.join("schema/schema.sh"))
+        .arg("--print")
+        .current_dir(&root)
+        .env_remove("PULSUS_CLUSTER")
+        .env("PULSUS_TRACEQL_INDEXED_ATTRIBUTES", &at)
+        .output()
+        .expect("the script runs");
+    assert!(out.status.success(), "a 128-byte key is accepted");
+}
+
+/// Issue #595 part 2: a refused list stops the script before it reaches the
+/// server, so it can never drop a database it will not rebuild. The
+/// server named here does not answer: had the script got as far as
+/// waiting for it, it would exit 1, not 2.
+#[test]
+fn a_refused_list_stops_the_script_before_it_touches_the_server() {
+    let root = repo_root();
+    let out = Command::new("sh")
+        .arg(root.join("schema/schema.sh"))
+        .current_dir(&root)
+        .env_remove("PULSUS_CLUSTER")
+        .env("CLICKHOUSE_SERVER", "127.0.0.1")
+        .env("CLICKHOUSE_HTTP_PORT", "1")
+        .env("PULSUS_SCHEMA_WAIT_SECONDS", "1")
+        .env(
+            "PULSUS_TRACEQL_INDEXED_ATTRIBUTES",
+            "span.a,resource.k8s.pod.name",
+        )
+        .output()
+        .expect("the script runs");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(err.contains("PULSUS_TRACEQL_INDEXED_ATTRIBUTES"), "{err}");
+}
+
+/// Issue #595 part 2, D8: `spans` grows each column stream's write buffers
+/// as needed instead of allocating them whole, in both modes. The
+/// clustered statement has no live run, so this is its only check.
+#[test]
+fn the_span_table_writes_with_adaptive_buffers_in_both_modes() {
+    for (mode, ctx) in [("single", single()), ("clustered", clustered())] {
+        let create = create_of(&ctx, "spans");
+        let settings = line_of(&create, "SETTINGS");
+        assert!(
+            settings.contains("min_columns_to_activate_adaptive_write_buffer = 1"),
+            "{mode}: {settings}"
+        );
     }
 }

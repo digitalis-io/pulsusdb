@@ -357,13 +357,16 @@ catalogs. Those two statements are in the suite for that comparison, not as the
 design's tag path.
 
 **The exempt class, measured** (`results/comparison.tsv`,
-`results/g1-new-design-sliced.tsv`): `{}` 62 ms whole-window, **34 ms** with the
-newest-slice-first plan in 2 statements, against the reference's 9 ms; a service
-search 36/31 against 10; `status_code >= 500` 47/32 against 19; `select()` 36/32
-against 12. The one shape where the loop costs more than it saves is the rare
-point filter: `{ span.app.user.id = "u-10013" }` is 44 ms whole-window and 116 ms
-sliced over 6 statements, which is why the compiler uses the loop only when the
-first slice's own match count says the filter is broad.
+`results/g1-new-design-sliced.tsv`, by `measure/search_sliced.py`, a loop that
+continues past an empty slice): `{}` 62 ms whole-window, **34 ms** sliced in 2
+statements, against the reference's 9 ms; a service search 36/31 against 10;
+`status_code >= 500` 47/32 against 19; `select()` 36/32 against 12. The rare
+point filter `{ span.app.user.id = "u-10013" }` is 44 ms whole-window and 116 ms
+sliced over 6 statements. The rule PulsusDB applies is
+`server-implementation.md` §3.5's. g1's corpus window has no span in its newest
+five minutes (`measure/gen_corpus.py:249` places no trace start in the last
+600 s), so under that rule every sliceable g1 search reads one empty slice, then
+the window.
 
 The reference's own answer to `{}` is not the newest twenty, and is not the same
 answer twice: in three consecutive calls it returned **none** of the corpus's
@@ -525,7 +528,7 @@ input and one expected result; none of them leaves a choice to the coder.
 | `T-S4` | load corpus g1 | `sum(data_uncompressed_bytes)/sum(data_compressed_bytes)` on `spans`, **and the amended column list from `system.columns` in the same step**, so the figure cannot be taken over a `spans` that is missing issue #587's columns | ≥ 6 (measured **6.405**), and `end_ns UInt64`, `scope_attrs_other String`, `status_code Int32` present | today 4.53 |
 | `T-S5` | apply the schema | `system.columns.compression_codec` for every column of `spans`, `traces`, `resources`, `tag_names` and `tag_values` — **51** columns, issue #587 having added four to `spans`, two to `traces` and one to `resources`, and issue #589 one to `spans` | none empty | fifteen are empty in the form the design was measured over (`measure/schema.sql`): `resources.day`, `.resource_id`, `.service`, `.attrs`, `.attrs_other`, `.dropped_attrs`, `.schema_url`, `.entity_refs`, `tag_names.scope`, `.key`, `tag_values.scope`, `.key`, `.value`, `.val_type` and `traces.day` |
 | `T-S5b` | apply the schema | `system.columns.compression_codec` per column of those same five tables, ordered by table and declaration position | the declared codec of each, in the server's own spelling: `CODEC(ZSTD(1))` on 47, `CODEC(Delta(8), ZSTD(1))` on `spans.start_ns`, `spans.end_ns` and `traces.last_start_ns`, and `CODEC(T64, ZSTD(1))` on `spans.duration_ns` | the same fifteen report the empty string |
-| `T-S6` | apply the schema twice | the second application | no error, no column re-added | the migration set is new |
+| `T-S6` | apply the schema twice to one database | the second application, and the columns after it | it fails at the first materialized view, and no column moved: the file holds only `CREATE` statements, and `schema/schema.sh` drops the database before applying it | the migration set is new |
 | `T-R1` | load two days, `ALTER TABLE spans DROP PARTITION` the older | elapsed, `system.mutations`, `system.merges`, remaining rows | the day is gone, 0 mutations, 0 merges, the other day intact (measured 0.068 s for 2,000,064 spans) | the table does not exist |
 | `T-R2` | a span on 2106-02-06 | the rendered TTL expression | the clamped form, no overflow past 2106-02-06 | new DDL |
 | `T-R3` | apply the schema with a retention of one day; every second of 2026-10-01 .. 2026-10-07, and one block per minute of 2026-10-04 whose latest span is up to three days later | `(min, max, count)` of the resource row's TTL minus its span's, and of the per-trace row's TTL minus its latest span's, in seconds, from the stored TTL expressions | `(1,86400,604800)` and `(0,0,6220800)` | `(-86399,0,604800)` and `(-345480,0,6220800)` |
@@ -614,7 +617,7 @@ answer; `measure/sql/<file>.sql` is the statement it must compile to.
 | `T-T5` | `k` as int 8080 in one span and string `"8080"` in another | the two entries | two entries, `int` and `string`, same text | **guard**: passes today — the shipped catalog already carries `val_type` per value (`crates/pulsus-schema/src/catalog.rs:862-870`, migration 41) |
 | `T-T6` | names in and outside the window for `/tag/name/values` | the value list | only the in-window names, on the `[start, end)` rule of §4.1 | today the read is day-widened |
 | `T-T7` | `/tag/status/values` | the response and the statement count | the three keywords typed `keyword`, zero statements | **guard**: passes today — the static vocabulary reads nothing, and must keep doing so. `crates/pulsus-server/src/traces_api/tags.rs:134-157` sends every intrinsic but `name` to `TagValueSource::Vocabulary`; `:211-214` answers those from `ValuesSource::Static` without asking the engine at all, which is why the statement count is zero; `crates/pulsus-server/src/traces_api/intrinsics.rs:61-63` produces the list. **The three values are `"ok"`, `"error"` and `"unset"` at `crates/pulsus-traceql/src/ast.rs:858-864`** (`StatusValue::as_str`), gathered into `INTRINSIC_STATUS_VALUES` by the `const` block at `:952-960`, which computes the list from the enum rather than transcribing it. **`keyword` is applied at `crates/pulsus-server/src/traces_api/tags_response.rs:202`**, where a `Static` answer renders every value with `KEYWORD_TYPE` (`intrinsics.rs:34`) |
-| `T-T8` | 10,001 names and 1,001 values | the responses | capped at 10,000 and 1,000, `truncated: true` | **guard**: passes today — the caps are the API's and must not move with the catalogs. `crates/pulsus-read/src/traces/exec.rs:139` is `TAG_NAMES_MAX = 10_000`, read at `:2063` as `LIMIT cap + 1` and truncated with its flag at `:2079-2081`. `:144` is `TAG_VALUES_MAX = 1_000`, read the same way at `:2124`, `:2146` and `:2179`, and truncated in **both** value paths: `:2194-2195` for the span-name values and **`:2222-2223` for the attribute values**, each setting `truncated` from the pre-truncation length |
+| `T-T8` | 10,001 names and 1,001 values | the responses | capped at 10,000 and 1,000, `truncated: true` | **guard**: passes today — the caps are the API's and must not move with the catalogs. `crates/pulsus-read/src/traces/exec.rs:139` is `TAG_NAMES_MAX = 10_000`, read at `:2065` as `LIMIT cap + 1` and truncated with its flag at `:2081-2083`. `:144` is `TAG_VALUES_MAX = 1_000`, read the same way at `:2126`, `:2148` and `:2181`, and truncated in **both** value paths: `:2196-2197` for the span-name values and **`:2224-2225` for the attribute values**, each setting `truncated` from the pre-truncation length |
 | `T-T9` | a scope attribute `otel.scope.build = "release"` | `/tags?scope=instrumentation` and `/tag/instrumentation.otel.scope.build/values` | the name and the value are listed | the catalog write must cover the fifth scope, as `measure/schema.sql` now does |
 
 ### 8.5 The write path

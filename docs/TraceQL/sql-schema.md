@@ -41,8 +41,9 @@ and no offload path here.
        both time-less and without a TTL, which is what docs/api.md 4.3 requires
 ```
 
-No attribute index, no payload blob, no edge ledger, no recency table, no error
-table, no re-sorted projections.
+No attribute-value index, no payload blob, no edge ledger, no recency table, no
+error table, no re-sorted projections. `spans` carries three skip indexes,
+`bloom_filter(0.01)` over `service`, `name` and `resource_id`; §9 prices them.
 
 The DDL is `measure/schema.sql`, which is what every measurement ran against;
 the staging table it builds from is `measure/staging.sql`, loaded by
@@ -395,24 +396,71 @@ nothing there to change.
 
 ### 5.3 Broad searches read the newest slice first
 
-The twenty newest traces are in the newest minutes, so PulsusDB runs the same
-statement with its **first pass bounded to a slice** — 5 minutes, then 10, then
-20, doubling — and stops when twenty traces are in hand. The answer is
-identical: a trace found in a newer slice always outranks one found only in an
-older slice, and the second pass still covers the whole window through the
-per-trace extents.
+A sliceable search (`server-implementation.md` §3.5 says which) runs the §5.2
+statement with its top-K bounded to the newest slice of the window. Against §5.2's statement for the same window,
+exactly three things differ: the top-K's three window clauses name the slice; a
+second scalar `tb` is added, each chosen trace's buckets in the window read from
+`traces`; the detail read's key line concatenates `tb`. The first sliced
+statement of a 7-day `{}`:
 
-| shape | one statement | newest-slice-first |
+```sql
+WITH (SELECT (groupArray(trace_id), groupArray(keys))
+      FROM (SELECT trace_id, max(start_ns) AS last,
+                   groupUniqArray(intDiv(start_ns, 300000000000)) AS keys
+            FROM spans
+            WHERE start_ns >= 1791550342000000000 AND start_ns < 1791550642000000000
+              AND intDiv(start_ns, 300000000000) BETWEEN intDiv(1791550342000000000, 300000000000) AND intDiv(1791550641999999999, 300000000000)
+              AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') >= toDate('2026-10-09') AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') <= toDate('2026-10-09')
+              AND (true)
+            GROUP BY trace_id
+            ORDER BY last DESC, trace_id ASC
+            LIMIT 20)) AS top,
+     (SELECT arrayFlatten(groupArray(arrayMap(k -> (k, trace_id), arrayFilter(k -> k BETWEEN intDiv(1790945842000000000, 300000000000) AND intDiv(1791550641999999999, 300000000000), bk))))
+      FROM (SELECT trace_id, groupUniqArrayArray(buckets) AS bk
+            FROM traces
+            WHERE trace_id IN (SELECT arrayJoin(top.1))
+            GROUP BY trace_id)) AS tb
+SELECT m.trace_id AS trace_id, t.root_service AS root_service, t.root_name AS root_name,
+       t.start_ns AS start_ns, t.end_ns - t.start_ns AS duration_ns,
+       m.last AS last, m.matched AS matched, m.spans AS spans
+FROM (SELECT trace_id, max(start_ns) AS last, count() AS matched,
+             arraySlice(arraySort(x -> (x.2, x.1),
+                        groupArray((span_id, start_ns, duration_ns, service, CAST([], 'Array(Tuple(UInt8, String, String))')))), 1, 3) AS spans
+      FROM spans
+      WHERE (intDiv(start_ns, 300000000000), trace_id) IN
+            (SELECT arrayJoin(arrayConcat(arrayFlatten(arrayMap((t, ks) -> arrayMap(k -> (k, t), ks), top.1, top.2)), tb)))
+        AND start_ns >= 1790945842000000000 AND start_ns < 1791550642000000000
+        AND intDiv(start_ns, 300000000000) BETWEEN intDiv(1790945842000000000, 300000000000) AND intDiv(1791550641999999999, 300000000000)
+        AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') >= toDate('2026-10-02') AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') <= toDate('2026-10-09')
+        AND (true)
+      GROUP BY trace_id) AS m
+LEFT JOIN (SELECT trace_id, min(start_ns) AS start_ns, max(end_ns) AS end_ns,
+                  min(root) AS r, if(r.1 = 0, if(length(r.4) <= 8192, r.4, substringUTF8(r.4, 1, 2048)), '') AS root_service, if(r.1 = 0, if(length(r.5) <= 8192, r.5, substringUTF8(r.5, 1, 2048)), '') AS root_name
+           FROM traces
+           WHERE trace_id IN (SELECT arrayJoin(top.1))
+           GROUP BY trace_id) AS t USING trace_id
+ORDER BY last DESC, trace_id ASC
+```
+
+Measured over 7 days — 112,003,751 spans, 3,943,128 traces, one merged part per
+day, the three skip indexes of §2 on — with `final = 1` and
+`do_not_merge_across_partitions_select_final = 1`; each figure is the median of
+three runs after one discarded, from `system.query_log`, as rows read / MB read /
+MiB peak / ms. Every pair's answer matched byte for byte.
+
+| filter, 7 days | one statement | newest-slice-first |
 |---|---|---|
-| `{}` | 2,045,122 rows, 62 ms | **95,397 rows, 34 ms**, 2 statements |
-| a service | 2,048,194 rows, 36 ms | **98,469 rows, 31 ms**, 2 statements |
-| `status_code >= 500` | 2,040,002 rows, 47 ms | **90,277 rows, 32 ms**, 2 statements |
-| `select()` over errors | 2,045,122 rows, 36 ms | **95,397 rows, 32 ms**, 2 statements |
-| `span.app.user.id = …` (rare) | 2,012,354 rows, **44 ms** | 2,247,021 rows, 116 ms, 6 statements |
+| `{}` | 112,193,428 / 2,704 / 1,318 / 1,150 | 1 statement: 440,144 / 23.3 / 6.9 / 64 |
+| `resource.service.name = "frontend"` | 112,193,428 / 2,928 / 1,314 / 1,358 | 1: 440,144 / 23.5 / 7.1 / 86 |
+| `status = error` | 112,190,121 / 2,709 / 197 / 1,199 | 1: 436,837 / 23.2 / 7.2 / 170 |
+| `span.http.request.method = "GET"` | 112,193,428 / 4,667 / 1,150 / 2,106 | 1: 440,144 / 25.3 / 7.2 / 232 |
+| `resource.k8s.pod.name = "email-7d9f8b-00002"` | 112,184,550 / 4,496 / 139 / 1,214 | 1: 437,136 / 25.0 / 7.7 / 194 |
+| `span.app.request.id` (1 span) | 112,013,993 / 6,384 / 7 / 2,100 | 2: 112,100,622 / 6,389 / 44 / 1,922 |
+| `span.app.user.id = "u-10013"` (2,016 spans) | 112,210,601 / 4,838 / 22 / 1,738 | 2: 112,297,230 / 4,842 / 44 / 1,862 |
+| `resource.service.name = "cron-reaper"` | 1,216,994 / 43 / 44 / 119 | 2: 1,216,997 / 43 / 44 / 151 |
 
-The last row is why the loop is conditional: for a filter matching almost
-nothing the slices are pure overhead. `server-implementation.md` §3.5 states the
-rule the compiler applies and the statement bound.
+`server-implementation.md` §3.5 states which statements are sliced, the rule the
+loop applies after each slice, and the statement bound.
 
 ### 5.4 Trace by id
 
@@ -1071,6 +1119,6 @@ nothing to run against.
 |---|---|---|
 | trace_id before service in the sort key | service-scoped metrics 42 ms instead of 27 | the fetch, the hydration and the structural climb are key reads instead of scans; R10 is measured on the fetch |
 | `final = 1` on every read | 68 ms against 41 while a retried part is unmerged; nothing once merged | a retried push must not be counted twice |
-| no attribute index | an equality on a 50,000-value key is a windowed subcolumn scan: 43 ms against today's 26 ms | that index is 493 B/span, thirteen times the whole new layout |
+| three bloom skip indexes and no attribute-value index | 0.134 B/span and 0.09–0.13 µs/span per part build; an attribute equality still reads the window, 112.0M rows at 7 days | an absent or rare service, name or resource attribute reads 2–2,512,098 rows instead of 112.0M; an attribute-value index needs its key named in advance (1.256 B/span for one key) or costs 8.8–12.8 µs/span per build and reads 50 GB for a common value |
 | a time-less value catalog | 0.846 B/span, and it grows with distinct values | `docs/api.md` §4.3 requires an unnarrowed value lookup to be a catalog read |
 | 5-minute buckets in the key | an hour window may over-read 5 minutes at each end | a trace stays inside one bucket, so per-trace work stays local |

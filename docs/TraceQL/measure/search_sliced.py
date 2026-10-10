@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""The newest-slice-first search loop PulsusDB runs for a spanset filter: one
+"""The disjoint-slice search loop the 2026-09-23 run measured (not the rule
+`server-implementation.md` 3.5 ships) for a spanset filter: one
 statement per slice, newest first, slice widths 5m, 10m, 20m, ... until LIMIT
 traces are found or the window is exhausted. Each statement is the single-
 statement search of sql/s02_service.sql with the FIRST pass bounded to the

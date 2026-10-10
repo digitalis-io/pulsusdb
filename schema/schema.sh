@@ -112,6 +112,57 @@ else
     rollup_suffix="${rollup_ns}ns"
 fi
 
+# Issue #595 part 2: `PULSUS_TRACEQL_INDEXED_ATTRIBUTES`, the trace
+# attributes `spans` carries a bloom-filter index for. The same rule the
+# binary's configuration check applies (`pulsus_config::
+# parse_indexed_attribute`): comma-separated `span.<key>` or `event.<key>`,
+# the key dot-separated segments of letters, digits, `_` and `-`, at most
+# 16, none twice. `{{trace_attr_indexes}}` renders one index per item, as
+# `pulsus_schema`'s renderer does; `the_script_renders_exactly_what_this_
+# crate_renders` holds the two together.
+indexed=${PULSUS_TRACEQL_INDEXED_ATTRIBUTES:-}
+attr_indexes=""
+bad_attr() {
+    echo "schema.sh: PULSUS_TRACEQL_INDEXED_ATTRIBUTES: $1" >&2
+    exit 2
+}
+case "$indexed" in
+    ,* | *, | *,,*) bad_attr "an empty item in '$indexed'" ;;
+esac
+bt='`'
+n=0
+seen=","
+old_ifs=$IFS
+IFS=,
+for item in $indexed; do
+    case "$item" in
+        span.*) key=${item#span.}; root=span ;;
+        event.*) key=${item#event.}; root=event ;;
+        resource.*) bad_attr "$item: a resource attribute is read through resource_id, which the span table already indexes" ;;
+        *) bad_attr "$item: the scope must be span. or event." ;;
+    esac
+    case "$key" in
+        '' | .* | *. | *..* | *[!A-Za-z0-9_.-]*)
+            bad_attr "$item: the key must be dot-separated segments of letters, digits, '_' and '-'" ;;
+    esac
+    [ "${#key}" -le 128 ] || bad_attr "$item: the key is longer than 128 bytes"
+    case "$seen" in
+        *",$item,"*) bad_attr "$item is listed twice" ;;
+    esac
+    seen="$seen$item,"
+    n=$((n + 1))
+    [ "$n" -le 16 ] || bad_attr "names more than 16 attributes"
+    path=$(printf '%s' "$key" | sed 's/\./%2E/g')
+    if [ "$root" = span ]; then
+        expr="arrayMap(x -> ifNull(x, ''), arrayConcat(attrs.$bt$path$bt.:${bt}Array(Nullable(String))$bt, [attrs.$bt$path$bt.:String]))"
+    else
+        expr="arrayMap(x -> ifNull(x, ''), arrayConcat(events.attrs.$bt$path$bt.:String, arrayFlatten(events.attrs.$bt$path$bt.:${bt}Array(Nullable(String))$bt)))"
+    fi
+    attr_indexes="$attr_indexes,
+    INDEX idx_attr_$n $expr TYPE bloom_filter(0.01) GRANULARITY 1"
+done
+IFS=$old_ifs
+
 on_cluster=""
 cluster_token=""
 route_suffix=""
@@ -144,7 +195,12 @@ render() {
             -e "s|{{log_dedup_window}}|$log_dedup|g" \
             -e "s|{{trace_dedup_window}}|$trace_dedup|g" \
             -e "s|{{dedup_window_seconds}}|$dedup_window_seconds|g" \
-            -e "s|{{storage_policy}}|$policy_token|g"
+            -e "s|{{storage_policy}}|$policy_token|g" |
+        TRACE_ATTR_INDEXES=$attr_indexes awk '{
+            i = index($0, "{{trace_attr_indexes}}")
+            if (i) $0 = substr($0, 1, i - 1) ENVIRON["TRACE_ATTR_INDEXES"] substr($0, i + 22)
+            print
+        }'
 }
 
 rendered=$(render)

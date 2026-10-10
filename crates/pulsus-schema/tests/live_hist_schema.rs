@@ -177,12 +177,11 @@ const HIST_SELECT_COLS: &str = "org_id, fingerprint, unix_milli, schema, zero_th
      neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values";
 
 /// Issue #113 (AC): `run_init` on a fresh database creates
-/// `metric_hist_samples` and adds `metric_series.value_type UInt8`; a second
-/// run is a no-op; and the frozen
+/// `metric_hist_samples` and adds `metric_series.value_type UInt8`; and the frozen
 /// `metric_samples`/`metric_series` base CREATEs are untouched (the float read
 /// path stays byte-frozen).
 #[tokio::test]
-async fn native_histogram_migrations_apply_and_are_idempotent() {
+async fn native_histogram_table_is_built_and_the_float_tables_are_untouched() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
     let db = &pulsus_testkit::test_db("pulsus_hist_it_apply");
@@ -212,22 +211,13 @@ async fn native_histogram_migrations_apply_and_are_idempotent() {
         "metric_samples value column stays Float64 (float path byte-frozen)"
     );
 
-    // Second run: idempotent.
-    run_init(&client, &ctx)
-        .await
-        .expect("run_init (second run — ids 23–26 must not drift)");
-    let names_after = table_names(&client, db).await;
-    assert_eq!(names, names_after, "second run must not add/remove objects");
-
     drop_database(&client, db).await;
 }
 
 /// Issue #125 (AC6): migrations 27/28 add `counter_reset_hint` to
 /// `metric_hist_samples` as an additive `UInt8 DEFAULT 0` column — the
-/// id-23 CREATE stays frozen (id-23's checksum is covered by the
-/// idempotency test above), a row inserted WITHOUT the column (the
-/// pre-#125 writer shape) reads back the `DEFAULT` 0 (= Unknown), and a
-/// second `run_init` does not drift.
+/// id-23 CREATE stays frozen, and a row inserted WITHOUT the column (the
+/// pre-#125 writer shape) reads back the `DEFAULT` 0 (= Unknown).
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct HintRow {
     counter_reset_hint: u8,
@@ -303,11 +293,6 @@ async fn counter_reset_hint_column_is_additive_uint8_default_zero() {
         .expect("one row")
         .expect("decode HintRow");
     assert_eq!(row.counter_reset_hint, 0, "the DEFAULT materializes as 0");
-
-    // Idempotency: a second run must not drift on the new ids 27/28.
-    run_init(&client, &ctx)
-        .await
-        .expect("run_init (second run — ids 27/28 must not drift)");
 
     drop_database(&client, db).await;
 }

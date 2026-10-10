@@ -22,10 +22,10 @@ use pulsus_schema::{SchemaError, SchemaParams, rendered_statements};
 /// Creates the whole schema: the database, every table, every routing
 /// wrapper when `params.cluster` is set, and every materialized view.
 ///
-/// Idempotent, like the script: every `CREATE TABLE` carries `IF NOT
-/// EXISTS` and every view is dropped before it is created. Unlike the
-/// script it does **not** drop the database first — a suite that wants a
-/// fresh one drops it itself, by exact name.
+/// **Needs a database that does not hold the schema.** The file holds only
+/// `CREATE` statements, so a second application fails at the first
+/// materialized view. The script drops the database first; this does
+/// **not** — a suite drops it itself, by exact name, before calling this.
 pub async fn run_init(client: &ChClient, params: &SchemaParams) -> Result<(), SchemaError> {
     let version = pulsus_schema::server_version(client).await?;
     pulsus_schema::check_version(&version)?;
