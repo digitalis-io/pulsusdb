@@ -218,7 +218,7 @@ docs/query-to-sql.md	crates/pulsus-schema/src/checks.rs:76	crates/pulsus-schema/
 docs/query-to-sql.md	crates/pulsus-server/src/traces_api/error.rs:303	crates/pulsus-server/src/traces_api/error.rs	303		line	BAD_REQUEST	ApiError::Plan(e) => (StatusCode::BAD_REQUEST, e.to_string()),
 docs/query-to-sql.md	crates/pulsus-server/src/traces_api/search_response.rs:428-430	crates/pulsus-server/src/traces_api/search_response.rs	428	430	line	matched	let mut set = json!({ "matched": group.matched, "spans": spans,
 docs/query-to-sql.md	crates/pulsus-server/src/traces_api/search_response.rs:507-512	crates/pulsus-server/src/traces_api/search_response.rs	507	512	line	span_json	"matched": trace.matched, "spans": trace .spans .iter() .map(|span| span_json(span, report)) .collect::<Vec<_>>(),
-docs/query-to-sql.md	crates/pulsus-server/tests/traces_search_live.rs:1467	crates/pulsus-server/tests/traces_search_live.rs	1467		line	attribute	// string-valued attribute (issue #335 Stage B).
+docs/query-to-sql.md	crates/pulsus-server/tests/traces_search_live.rs:1481	crates/pulsus-server/tests/traces_search_live.rs	1481		line	attribute	// string-valued attribute (issue #335 Stage B).
 docs/query-to-sql.md	crates/pulsus-traceql/src/ast.rs:981	crates/pulsus-traceql/src/ast.rs	981		prose	PipelineStage	PipelineStage
 docs/query-to-sql.md	escape.rs:100	crates/pulsus-read/src/logql/escape.rs	100		line	pattern	other => pattern.push(other),
 docs/query-to-sql.md	escape.rs:154-164	crates/pulsus-read/src/logql/escape.rs	154	164	line	clickhouse_match_strategy	// One `^(?:…)$` template occurrence, whatever the strategy — the // issue #240 anchoring guard counts this site and kee
@@ -240,11 +240,11 @@ docs/query-to-sql.md	labels.rs:66	crates/pulsus-read/src/logql/labels.rs	66		pro
 docs/query-to-sql.md	logql/charge.rs:1326	crates/pulsus-read/src/logql/charge.rs	1326		line	MAX_STREAMS_RESULT_BYTES	pub const MAX_STREAMS_RESULT_BYTES: u64 = 1024 * 1024 * 1024;
 docs/query-to-sql.md	logql/error.rs:819-825	crates/pulsus-read/src/logql/error.rs	819	825	prose	aggregation	400
 docs/query-to-sql.md	logql/error.rs:826-829	crates/pulsus-read/src/logql/error.rs	826	829	prose	intentionally	pipeline
-docs/query-to-sql.md	logql/exec.rs:1891	crates/pulsus-read/src/logql/exec.rs	1891		line	rate_after_sum	let series = match rate_after_sum(mp) {
-docs/query-to-sql.md	logql/exec.rs:2110	crates/pulsus-read/src/logql/exec.rs	2110		line	apply_leaf_aggs	apply_leaf_aggs(mp, result, 0)
-docs/query-to-sql.md	logql/exec.rs:2593	crates/pulsus-read/src/logql/exec.rs	2593		line	apply_leaf_aggs	apply_leaf_aggs(mp, result, folded)
-docs/query-to-sql.md	logql/exec.rs:2776	crates/pulsus-read/src/logql/exec.rs	2776		prose	apply_vector_aggs	vector_aggs
-docs/query-to-sql.md	logql/exec.rs:6658	crates/pulsus-read/src/logql/exec.rs	6658		prose	apply_vector_aggs	vector_aggs
+docs/query-to-sql.md	logql/exec.rs:1895	crates/pulsus-read/src/logql/exec.rs	1895		line	rate_after_sum	let series = match rate_after_sum(mp) {
+docs/query-to-sql.md	logql/exec.rs:2114	crates/pulsus-read/src/logql/exec.rs	2114		line	apply_leaf_aggs	apply_leaf_aggs(mp, result, 0)
+docs/query-to-sql.md	logql/exec.rs:2597	crates/pulsus-read/src/logql/exec.rs	2597		line	apply_leaf_aggs	apply_leaf_aggs(mp, result, folded)
+docs/query-to-sql.md	logql/exec.rs:2780	crates/pulsus-read/src/logql/exec.rs	2780		prose	apply_vector_aggs	vector_aggs
+docs/query-to-sql.md	logql/exec.rs:6662	crates/pulsus-read/src/logql/exec.rs	6662		prose	apply_vector_aggs	vector_aggs
 docs/query-to-sql.md	logql/fold.rs:543	crates/pulsus-read/src/logql/fold.rs	543		line	SelectFold	pub(in crate::logql) struct SelectFold {
 docs/query-to-sql.md	logql/params.rs:121	crates/pulsus-read/src/logql/params.rs	121		line	DEFAULT_MAX_STREAMS	pub const DEFAULT_MAX_STREAMS: usize = 100_000;
 docs/query-to-sql.md	logql/pipeline.rs:1354	crates/pulsus-read/src/logql/pipeline.rs	1354		line	PipelineError	pub fn compile(stages: &[Stage]) -> Result<Self, PipelineError> {

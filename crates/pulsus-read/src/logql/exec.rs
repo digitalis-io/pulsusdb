@@ -1061,6 +1061,10 @@ impl LogQlEngine {
             fingerprints.push(row.fingerprint);
             check_stream_cap(fingerprints.len(), self.config.max_streams)?;
         }
+        // The server returns the rows in no fixed order; sorted, every
+        // statement built from the list has one text, and so does the
+        // explain trace (issue #624, part 3d), as the unscoped read below.
+        fingerprints.sort_unstable();
         Ok(fingerprints)
     }
 

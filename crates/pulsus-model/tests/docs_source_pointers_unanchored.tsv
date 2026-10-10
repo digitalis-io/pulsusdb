@@ -734,7 +734,7 @@ docs/query-to-sql.md	crates/pulsus-read/src/querytext.rs:52	no_name_the_target_f
 docs/query-to-sql.md	crates/pulsus-read/tests/logqltest/corpus/b2_formatters.test:165	no_name_the_target_file_holds
 docs/query-to-sql.md	crates/pulsus-schema/src/checks.rs:29	no_name_the_target_file_holds
 docs/query-to-sql.md	crates/pulsus-server/src/traces_api/error.rs:303	no_name_the_target_file_holds
-docs/query-to-sql.md	crates/pulsus-server/tests/traces_search_live.rs:1467	no_name_the_target_file_holds
+docs/query-to-sql.md	crates/pulsus-server/tests/traces_search_live.rs:1481	no_name_the_target_file_holds
 docs/query-to-sql.md	decisions/0008-sql-composition-for-lowered-pipelines.md:199-203	no_name_the_target_file_holds
 docs/query-to-sql.md	docs/decisions/0008-sql-composition-for-lowered-pipelines.md:201	no_name_the_target_file_holds
 docs/query-to-sql.md	docs/decisions/0008-sql-composition-for-lowered-pipelines.md:53-58	no_name_the_target_file_holds
@@ -791,10 +791,10 @@ docs/query-to-sql.md	fmt.go:32	pinned_to_another_version
 docs/query-to-sql.md	labels.rs:328	ambiguous_basename
 docs/query-to-sql.md	logql/charge.rs:1326	no_name_the_target_file_holds
 docs/query-to-sql.md	logql/error.rs:819-825	no_name_the_target_file_holds
-docs/query-to-sql.md	logql/exec.rs:1891	no_name_the_target_file_holds
-docs/query-to-sql.md	logql/exec.rs:2110	no_name_the_target_file_holds
-docs/query-to-sql.md	logql/exec.rs:2593	no_name_the_target_file_holds
-docs/query-to-sql.md	logql/exec.rs:2776	no_name_the_target_file_holds
+docs/query-to-sql.md	logql/exec.rs:1895	no_name_the_target_file_holds
+docs/query-to-sql.md	logql/exec.rs:2114	no_name_the_target_file_holds
+docs/query-to-sql.md	logql/exec.rs:2597	no_name_the_target_file_holds
+docs/query-to-sql.md	logql/exec.rs:2780	no_name_the_target_file_holds
 docs/query-to-sql.md	logql/fold.rs:543	no_name_the_target_file_holds
 docs/query-to-sql.md	logql/params.rs:121	no_name_the_target_file_holds
 docs/query-to-sql.md	logql/pipeline.rs:1354	no_name_the_target_file_holds
