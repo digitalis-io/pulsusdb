@@ -379,7 +379,7 @@ pub fn register_push_target(port: u16, db: &str) {
 }
 
 /// After a trace push to the server on `port` is acknowledged, waits until
-/// every `(trace_id, span_id)` it carried is in `spans` (issue #624, part
+/// every table its landing block feeds holds the push (issue #624, part
 /// 3d).
 ///
 /// **Why.** A trace push is acknowledged once the old path's tables hold
@@ -391,16 +391,25 @@ pub fn register_push_target(port: u16, db: &str) {
 /// acknowledged is a known, deferred property; a test does not assume
 /// otherwise.
 ///
-/// **Why `spans` stands for every derived table.** The views run inside the
-/// one landing `INSERT`, and their target parts become visible together
-/// when that insert ends: measured on 26.8.21.10 with a source table and
-/// three views, one of them sleeping a second per row, all three targets
-/// went from 0 rows to all rows in the same 200 ms poll, after the insert
-/// returned.
+/// **What it waits for.** Both, in one poll:
 ///
-/// Polls every 200 ms for at most 10 s. A push whose spans never arrive
-/// (the product may drop them) ends the wait at the limit and the test's
-/// own assertions decide; the wait never fails a test by itself.
+/// * every `(trace_id, span_id)` the push carried is in `spans`, so the
+///   landing insert that carries them has started writing; and
+/// * no insert into `trace_landing` is running in the test's database
+///   (`system.processes`), so that insert has ended.
+///
+/// The views run inside the landing `INSERT`, and each view's target
+/// commits its part on its own: measured on 26.8.21.10 with a source
+/// table and two views, the second sleeping a second per row, the first
+/// target held all 3 rows while the second held 0 for three seconds,
+/// with the insert still listed in `system.processes`; in the first poll
+/// after it left the list, both held all 3. So the pairs alone do not
+/// show that the other tables the routes read hold the push; the two
+/// together do, for every table the landing block feeds.
+///
+/// Polls every 200 ms for at most 10 s. A push whose data never arrives
+/// (the product may drop it) ends the wait at the limit and the test's own
+/// assertions decide; the wait never fails a test by itself.
 pub fn settle_pushed_spans(port: u16, keys: &[(Vec<u8>, Vec<u8>)], ctx: &str) {
     let mut pairs: Vec<String> = keys
         .iter()
@@ -419,9 +428,13 @@ pub fn settle_pushed_spans(port: u16, keys: &[(Vec<u8>, Vec<u8>)], ctx: &str) {
         .map(|(_, d)| d.clone())
         .unwrap_or_else(|| panic!("{ctx}: no database registered for port {port}"));
     let want = pairs.len() as u64;
+    // `<pairs in spans>,<landing inserts running>`.
     let sql = format!(
-        "SELECT toString(count()) AS s FROM (SELECT DISTINCT trace_id, span_id FROM {db}.spans \
-         WHERE (hex(trace_id), hex(span_id)) IN ({}))",
+        "SELECT assumeNotNull(concat(toString((SELECT count() FROM (SELECT DISTINCT trace_id, span_id \
+         FROM {db}.spans WHERE (hex(trace_id), hex(span_id)) IN ({})))), ',', \
+         toString((SELECT count() FROM system.processes WHERE query_kind = 'Insert' \
+         AND position(query, 'trace_landing') > 0 \
+         AND (current_database = '{db}' OR position(query, '{db}.') > 0))))) AS s",
         pairs.join(", ")
     );
     let ctx = ctx.to_string();
@@ -436,19 +449,25 @@ pub fn settle_pushed_spans(port: u16, keys: &[(Vec<u8>, Vec<u8>)], ctx: &str) {
                     .expect("connect to the test database");
                 let deadline = std::time::Instant::now() + Duration::from_secs(10);
                 loop {
-                    let got: u64 = client
+                    let answer = client
                         .query_strings(&sql, &QuerySettings::new())
                         .await
                         .unwrap_or_else(|e| panic!("{ctx}: {sql}: {e}"))
                         .into_iter()
                         .next()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(0);
-                    if got >= want {
+                        .unwrap_or_default();
+                    let (got, running) = answer
+                        .split_once(',')
+                        .and_then(|(g, r)| Some((g.parse::<u64>().ok()?, r.parse::<u64>().ok()?)))
+                        .unwrap_or((0, 0));
+                    if got >= want && running == 0 {
                         return;
                     }
                     if std::time::Instant::now() >= deadline {
-                        eprintln!("{ctx}: {got} of {want} pushed spans in `spans` after 10 s");
+                        eprintln!(
+                            "{ctx}: after 10 s, {got} of {want} pushed spans in `spans`, \
+                             {running} landing inserts running"
+                        );
                         return;
                     }
                     tokio::time::sleep(Duration::from_millis(200)).await;
