@@ -77,6 +77,7 @@ pub fn compile_membership_in(
         trace_leaves: Vec::new(),
         child_counts: false,
         numbered: 0,
+        trace_values: Vec::new(),
     };
     let sql = c.member(spanset)?;
     // Every relation and every `&&` reads a window-bounded subquery.
@@ -88,6 +89,7 @@ pub fn compile_membership_in(
             c.trace_leaves,
             c.child_counts,
             c.numbered,
+            c.trace_values,
         ),
         climbs: c.climbs,
     })
@@ -105,6 +107,8 @@ struct Membership<'a, 'b> {
     child_counts: bool,
     /// The filters' numbered nested-set leaves (issue #594 part 2).
     numbered: usize,
+    /// The filters' per-trace operand values, each once (issue #594 part 3).
+    trace_values: Vec<super::tracelevel::TraceValue>,
 }
 
 impl Membership<'_, '_> {
@@ -140,6 +144,11 @@ impl Membership<'_, '_> {
                 }
                 self.child_counts |= p.reads_child_counts();
                 self.numbered += p.numbered_leaves();
+                for v in p.trace_values() {
+                    if !self.trace_values.contains(v) {
+                        self.trace_values.push(*v);
+                    }
+                }
                 Ok(format!("({})", p.sql()))
             }
             SpansetExpr::Binary { op, lhs, rhs } => {
