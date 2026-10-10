@@ -1392,9 +1392,10 @@ async fn candidate_cap_partial_and_boundary_semantics() {
     let res = search(
         port,
         // `coalesce()` would change this case's partial signal, so a
-        // nested-set operand keeps it on today's engine instead (issue
-        // #591 part 3, section 7; #594 part 3 moves it).
-        r#"{ (.x = "1" || .y = "1") && nestedSetLeft = nestedSetLeft }"#,
+        // `by(trace:id)` key, which the statement refuses, keeps it on
+        // today's engine instead (issue #591 part 3, section 7; #594 part
+        // 4 serves nested-set operands).
+        r#"{ .x = "1" || .y = "1" } | by(trace:id)"#,
         base,
         base + 60,
         "&limit=1",

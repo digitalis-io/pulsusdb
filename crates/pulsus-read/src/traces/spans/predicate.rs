@@ -79,7 +79,7 @@ use crate::traces::filter::{
 };
 use crate::traces::window_sql::WindowSql;
 
-use super::numbering::nested_leaf;
+use super::numbering::{SpanValues, nested_leaf, span_values_membership};
 use super::tracelevel::{TraceLeaf, TraceValue, child_leaf, trace_leaf, type_refusal};
 
 /// A ClickHouse boolean over a `spans` row. Private fields, no public
@@ -352,11 +352,12 @@ pub fn span_membership_sql(spans_table: &str, w: WindowSql, p: &SpanPredicate) -
 // the refusals
 // ---------------------------------------------------------------------
 
-/// `span:childCount` and the three nested-set intrinsics as an operand:
-/// refused, so today's engine answers until #594 part 4.
-fn operand_refusal(intrinsic: Intrinsic) -> PlanError {
+/// `span:childCount` or a nested-set intrinsic as an operand compiled with
+/// no context: its values are read from the statement's spans.
+fn operand_needs_window(intrinsic: Intrinsic) -> PlanError {
     PlanError::UnsupportedField(format!(
-        "{intrinsic} as an operand is not supported by the search statement (issue #594)"
+        "{intrinsic} as an operand needs the request window: compile it with \
+         compile_span_predicate_in (issue #594)"
     ))
 }
 
@@ -486,6 +487,9 @@ struct Compiler<'a> {
     numbered: usize,
     /// The per-trace values read as operands, each once (issue #594 part 3).
     trace_values: Vec<TraceValue>,
+    /// The per-span values the current comparison reads (issue #594 part
+    /// 4); saved and reset by each [`Compiler::compare`].
+    span_values: SpanValues,
 }
 
 /// The head of an element loop: `arrayExists` for the predicate; for the
@@ -593,6 +597,7 @@ impl<'a> Compiler<'a> {
             child_counts: false,
             numbered: 0,
             trace_values: Vec::new(),
+            span_values: SpanValues::default(),
         }
     }
 
@@ -1105,10 +1110,23 @@ impl<'a> Compiler<'a> {
         // compiled in the middle of this one's.
         let occurrences = std::mem::take(&mut self.occurrences);
         let presences = std::mem::take(&mut self.presences);
+        let span_values = std::mem::take(&mut self.span_values);
         let compared = self.compare_in_frame(lhs, op, rhs);
+        let read = std::mem::replace(&mut self.span_values, span_values);
         self.occurrences = occurrences;
         self.presences = presences;
-        compared
+        let compared = compared?;
+        if read == SpanValues::default() {
+            return Ok(compared);
+        }
+        // Issue #594 part 4: a comparison reading a child count or a
+        // number is the membership of the read's spans joined to them.
+        let spans = self
+            .ctx
+            .map(|c| c.spans_table)
+            .expect("span_value refuses with no context");
+        self.numbered += 1;
+        Ok(span_values_membership(&compared, read, spans))
     }
 
     /// [`Compiler::compare`] within the comparison's own frame.
@@ -1392,11 +1410,14 @@ impl<'a> Compiler<'a> {
                 | Intrinsic::LinkTraceId => Ok(()),
                 Intrinsic::NestedSetParent
                 | Intrinsic::NestedSetLeft
-                | Intrinsic::NestedSetRight => Err(operand_refusal(*intrinsic)),
+                | Intrinsic::NestedSetRight
+                | Intrinsic::ChildCount => self
+                    .ctx
+                    .map(|_| ())
+                    .ok_or_else(|| operand_needs_window(*intrinsic)),
                 Intrinsic::TraceDuration | Intrinsic::RootName | Intrinsic::RootServiceName => {
                     Ok(())
                 }
-                Intrinsic::ChildCount => Err(operand_refusal(*intrinsic)),
             },
         }
     }
@@ -1721,8 +1742,23 @@ impl<'a> Compiler<'a> {
             Intrinsic::NestedSetParent
             | Intrinsic::NestedSetLeft
             | Intrinsic::NestedSetRight
-            | Intrinsic::ChildCount => Err(operand_refusal(intrinsic)),
+            | Intrinsic::ChildCount => {
+                let col = self.span_value(intrinsic)?;
+                Ok(Some(Tuple {
+                    text: format!("tuple(toInt256({col}), {NULL_FLOAT})"),
+                    dur: false,
+                }))
+            }
         }
+    }
+
+    /// The joined column of a per-span value (issue #594 part 4), noted
+    /// for the comparison's membership.
+    fn span_value(&mut self, intrinsic: Intrinsic) -> Result<&'static str, PlanError> {
+        if self.ctx.is_none() {
+            return Err(operand_needs_window(intrinsic));
+        }
+        Ok(self.span_values.read(intrinsic))
     }
 
     /// The span row's value of `v`, recorded so the statement defines its
@@ -1844,7 +1880,10 @@ impl<'a> Compiler<'a> {
             Intrinsic::NestedSetParent
             | Intrinsic::NestedSetLeft
             | Intrinsic::NestedSetRight
-            | Intrinsic::ChildCount => Err(operand_refusal(intrinsic)),
+            | Intrinsic::ChildCount => Ok(Arms {
+                i: Some(self.span_value(intrinsic)?.to_string()),
+                ..Arms::default()
+            }),
         }
     }
 
@@ -2646,7 +2685,10 @@ fn folds_to_leaf(field: &Field) -> bool {
     match field {
         Field::Attribute { .. } => true,
         Field::Intrinsic(
-            Intrinsic::NestedSetParent | Intrinsic::NestedSetLeft | Intrinsic::NestedSetRight,
+            Intrinsic::NestedSetParent
+            | Intrinsic::NestedSetLeft
+            | Intrinsic::NestedSetRight
+            | Intrinsic::ChildCount,
         ) => true,
         Field::Intrinsic(intrinsic) => is_set_intrinsic(*intrinsic),
     }
