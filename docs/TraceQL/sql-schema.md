@@ -969,10 +969,8 @@ ceiling at 5.04 GiB after 2 m 12 s.
 
 The top read binds `nested_keys` to `trace_keys`: the traces whose span starts
 reach the slice it reads (§5.3), each with all its `traces` rows in those days.
-The detail read binds it to `detail_keys`, the returned traces' pairs. A
-comparison that reads the numbering is served in a one-filter search, once per
-query; elsewhere today's engine answers, as the unsliced statement would number
-every trace of the window. The slice loop keeps doubling for it past the
+The detail read binds it to `detail_keys`, the returned traces' pairs. Every
+statement binds both; an unsliced one numbers the window's traces. The slice loop keeps doubling for it past the
 density stop, until a slice fills or reaches the window. The innermost
 `GROUP BY` carries `max_block_size = 256`: the 2,105 traces of g1's newest
 5-minute slice number in 9.3 MiB, against 17.2 in one block. A
