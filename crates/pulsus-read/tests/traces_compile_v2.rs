@@ -2540,14 +2540,20 @@ fn t_c27_the_field_against_field_refusals() {
         Intrinsic::ChildCount,
     ] {
         let want = PlanError::UnsupportedField(format!(
-            "{intrinsic} as an operand is not supported by the search statement (issue #594)"
+            "{intrinsic} as an operand needs the request window: compile it with \
+             compile_span_predicate_in (issue #594)"
         ));
         let f = Field::Intrinsic(intrinsic);
-        check(
+        for e in [
             field_compare_expr(&f, ComparisonOp::Eq, &span_a),
-            want.clone(),
-        );
-        check(field_compare_expr(&span_a, ComparisonOp::Eq, &f), want);
+            field_compare_expr(&span_a, ComparisonOp::Eq, &f),
+        ] {
+            assert_eq!(refused_bare(&e), want, "{e} with no context");
+            assert!(
+                compile_span_predicate_in(&e, &ctx()).is_ok(),
+                "{e} in a context"
+            );
+        }
     }
 
     // An event set opposite a #594 intrinsic: the intrinsic's own refusal,
@@ -2555,17 +2561,20 @@ fn t_c27_the_field_against_field_refusals() {
     let event_k = scoped(AttrScope::Event, "k");
     let nested_left = Field::Intrinsic(Intrinsic::NestedSetLeft);
     let nested_refusal = PlanError::UnsupportedField(
-        "nestedSetLeft as an operand is not supported by the search statement (issue #594)"
+        "nestedSetLeft as an operand needs the request window: compile it with \
+         compile_span_predicate_in (issue #594)"
             .to_string(),
     );
-    check(
+    for e in [
         field_compare_expr(&event_k, ComparisonOp::Eq, &nested_left),
-        nested_refusal.clone(),
-    );
-    check(
         field_compare_expr(&nested_left, ComparisonOp::Eq, &event_k),
-        nested_refusal,
-    );
+    ] {
+        assert_eq!(refused_bare(&e), nested_refusal, "{e} with no context");
+        assert!(
+            compile_span_predicate_in(&e, &ctx()).is_ok(),
+            "{e} in a context"
+        );
+    }
 
     let span_b = scoped(AttrScope::Span, "b");
     for op in [ComparisonOp::Re, ComparisonOp::Nre] {
@@ -4507,7 +4516,8 @@ fn t_c42_the_limits_and_the_refusals_that_remain() {
     assert_eq!(
         refusal(r#"{ event.a + nestedSetLeft > 1 }"#),
         PlanError::UnsupportedField(
-            "nestedSetLeft as an operand is not supported by the search statement (issue #594)"
+            "nestedSetLeft as an operand needs the request window: compile it with \
+             compile_span_predicate_in (issue #594)"
                 .to_string()
         )
     );
@@ -4778,7 +4788,6 @@ fn compile_search_refuses_what_parts_two_and_three_serve() {
         // second `by()`.
         (r#"{ .a = 1 } | by(trace:id)"#, "#592"),
         (r#"{ .a = 1 } | by(span.a) | by(name)"#, "#592"),
-        (r#"{ nestedSetLeft = nestedSetParent }"#, "#594"),
     ] {
         match compile_search_of(query) {
             Err(PlanError::UnsupportedField(msg)) => assert!(
@@ -4940,15 +4949,6 @@ fn the_fork_routes_by_the_plan() {
         r#"{ .a = 1 } | by(.u)"#,
         r#"{ .a = 1 } | by(span.a) | by(name)"#,
         r#"{ .a = 1 } | by(span.a) | coalesce() | by(name)"#,
-        r#"{ nestedSetLeft = nestedSetParent }"#,
-        r#"{ nestedSetLeft + 1 > 2 }"#,
-        r#"{ nestedSetLeft > 2 } && { nestedSetParent < 0 }"#,
-        r#"{ nestedSetParent < 0 } > { nestedSetLeft > 2 }"#,
-        r#"{ nestedSetLeft > 0 } | by(name)"#,
-        r#"{ } | { nestedSetLeft = 0 } | count() > 1"#,
-        r#"{ nestedSetLeft > 1 && nestedSetRight < 6 }"#,
-        r#"{ span:childCount + 1 > 2 }"#,
-        r#"{ span:childCount = nestedSetLeft }"#,
         r#"{ event.k * event.k > 5 }"#,
         r#"{ .k + 1 > .k }"#,
         r#"{ link.lk - link.lk != 0 }"#,
@@ -5039,6 +5039,19 @@ fn the_fork_routes_by_the_plan() {
         r#"{ } | by(nestedSetParent)"#,
         r#"{ } | by(nestedSetLeft)"#,
         r#"{ name = "a" } | by(nestedSetRight)"#,
+        // Issue #594 part 4: a child count or a number as an operand, a
+        // numbered comparison in any statement, and select() of the seven.
+        r#"{ nestedSetLeft = nestedSetParent }"#,
+        r#"{ nestedSetLeft + 1 > 2 }"#,
+        r#"{ span:childCount + 1 > 2 }"#,
+        r#"{ span:childCount = nestedSetLeft }"#,
+        r#"{ nestedSetLeft > 2 } && { nestedSetParent < 0 }"#,
+        r#"{ nestedSetParent < 0 } > { nestedSetLeft > 2 }"#,
+        r#"{ nestedSetLeft > 0 } | by(name)"#,
+        r#"{ } | { nestedSetLeft = 0 } | count() > 1"#,
+        r#"{ nestedSetLeft > 1 && nestedSetRight < 6 }"#,
+        r#"{ } | select(nestedSetLeft, trace:duration, span:childCount)"#,
+        r#"{ trace:rootName = name } | by(resource.service.name)"#,
     ] {
         if plan_statement(&fork_plan(query), "spans", "traces", "resources", 64, &[]).is_none() {
             wrong.push(format!(
@@ -5150,8 +5163,8 @@ fn a_root_comparison_reads_no_numbering() {
     );
     let s = compile_search_of(r#"{ name = "a" }"#).expect("served");
     assert!(!s.sql().contains("nested_keys"), "{}", s.sql());
-    // Outside a one-filter search the loop does not slice, so a numbered
-    // comparison is today's engine's.
+    // Issue #594 part 4: in every other statement, and twice, each read
+    // binds its own traces' numbering.
     for query in [
         "{ nestedSetLeft > 2 } && { nestedSetParent < 0 }",
         "{ nestedSetParent < 0 } > { nestedSetLeft > 2 }",
@@ -5160,14 +5173,16 @@ fn a_root_comparison_reads_no_numbering() {
         "{ nestedSetLeft > 0 } | count() > 1",
         "{ nestedSetLeft > 1 && nestedSetRight < 6 }",
     ] {
-        match compile_search_of(query) {
-            Err(PlanError::UnsupportedField(m)) => assert_eq!(
-                m,
-                "a nested-set comparison that reads the numbering is served by the search \
-                 statement only once, in a one-filter search (issue #594)",
-                "{query}"
-            ),
-            other => panic!("{query}: {:?}", other.map(|s| s.sql().to_string())),
+        let s = compile_search_of(query).unwrap_or_else(|e| panic!("{query}: {e:?}"));
+        let sql = s.sql();
+        for needle in [
+            "WITH trace_keys AS nested_keys ",
+            "WITH detail_keys AS nested_keys ",
+            " AS trace_keys,",
+            " AS detail_keys,",
+            " AS nested_values",
+        ] {
+            assert_eq!(count(sql, needle), 1, "{query}: {needle} in {sql}");
         }
     }
     // A sliced statement numbers the traces that reach its slice.
@@ -5386,4 +5401,63 @@ fn a_trace_value_reads_the_traces_its_top_k_reads() {
             "{query}: {sql}"
         );
     }
+}
+
+/// Issue #594 part 4: a comparison reading a child count or a number is the
+/// membership of the read's spans joined to them; a literal side folds to
+/// part 1's leaf; `select()` of a number reads the returned traces'.
+#[test]
+fn a_count_or_number_operand_joins_the_read_spans() {
+    let count = |sql: &str, needle: &str| sql.matches(needle).count();
+    let text = |q: &str| {
+        compile_span_predicate_in(&filter_body(q), &ctx())
+            .unwrap_or_else(|e| panic!("{q}: {e:?}"))
+            .sql()
+            .to_string()
+    };
+    let keys = "(intDiv(start_ns, 300000000000), trace_id) IN (SELECT arrayJoin(nested_keys))";
+    let c = text("{ span:childCount + 1 > 2 }");
+    assert!(
+        c.starts_with(&format!(
+            "(trace_id, span_id) IN (SELECT trace_id, span_id FROM spans LEFT JOIN (SELECT \
+             trace_id, parent_span_id AS span_id, count() AS pv_children FROM spans WHERE {keys} \
+             AND parent_span_id != toFixedString('', 8) GROUP BY trace_id, parent_span_id) AS \
+             pv_c USING (trace_id, span_id) WHERE {keys} AND ("
+        )) && count(&c, "pv_n") == 0,
+        "{c}"
+    );
+    let n = text("{ nestedSetLeft = nestedSetParent + 1 }");
+    assert_eq!(
+        (
+            count(&n, ") AS pv_n USING (trace_id, span_id)"),
+            count(&n, "max_block_size = 256"),
+            count(&n, "pv_c")
+        ),
+        (1, 1, 0),
+        "{n}"
+    );
+    let b = text("{ span:childCount = nestedSetLeft }");
+    assert_eq!(
+        (count(&b, ") AS pv_n USING"), count(&b, ") AS pv_c USING")),
+        (1, 1),
+        "{b}"
+    );
+    let f = text("{ span:childCount > 1 + 1 }");
+    assert!(
+        f.contains("HAVING count() > 2") && !f.contains("pv_"),
+        "{f}"
+    );
+    let s = compile_search_of("{ } | select(nestedSetLeft)").expect("served");
+    assert_eq!(
+        (
+            count(s.sql(), " AS detail_keys,"),
+            count(s.sql(), " AS nested_values"),
+            count(s.sql(), "nested_keys")
+        ),
+        (1, 1, 0),
+        "{}",
+        s.sql()
+    );
+    let s = compile_search_of("{ } | select(trace:duration, span:childCount)").expect("served");
+    assert_eq!(count(s.sql(), "nested_values"), 0, "{}", s.sql());
 }

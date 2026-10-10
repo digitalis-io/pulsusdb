@@ -1201,8 +1201,7 @@ cannot be reached by any request:
 | `Aggregate` | a non-finite numeric threshold (`:1050`) | `type mismatch: not a finite number: "999…"` | **yes** — `… \| max(.a) > <310 nines>`. The arm parses the raw literal as `f64` and filters on `is_finite`, so any decimal integer literal above `f64::MAX` reaches it; **measured** at 309, 310 and 320 digits, all three rejected here, while a 320-digit *fraction* is finite and plans. `nan`, `inf`, `1e400` and a leading `-` are refused by the lexer, but they are not the only spelling |
 | `By` | a composite key expression (`:1129`) | `type mismatch: by((.a + .b)) is not a group key this engine can execute: a grouping key must resolve to a single per-span value, so it must be an attribute or an intrinsic` | **yes** — `… \| by(.a + .b) \| count() > 1` |
 | `By` | a span-event / span-link intrinsic key (`:1439`) | `unsupported field: by(event:name): grouping by a span-event / span-link intrinsic is not supported (a span carries a collection of events/links, so there is no single group value)` | **yes** — `… \| by(event:name) \| count() > 1` |
-| `Select` | a nested-set intrinsic (`:2185`) | `type mismatch: select() of a nested-set intrinsic is not supported` | **yes** — `… \| select(nestedSetLeft)` |
-| `Select` | one of the twelve trace-level / scoped / event / link intrinsics (`:2230`) | `type mismatch: select() of this intrinsic is not supported` | **yes** — `… \| select(rootName)` |
+| `Select` | one of the eight scoped / event / link intrinsics (`:2224`) | `type mismatch: select() of this intrinsic is not supported` | **yes** — `… \| select(statusMessage)` |
 | `Filter` | a mid-pipeline spanset OPERATION rather than a single filter | `type mismatch: ({ .b = 2 } && { .c = 3 }) is not executable as a pipeline stage: a ``|`` stage must be a single { ... } filter, not a cross-spanset or structural operation` | **yes** — `{ .a = 1 } \| { .b = 2 } && { .c = 3 }`. The reference's pipeline element is a full spanset expression, so the parser accepts it and the planner decides |
 
 `Coalesce` is zero-arity and has no payload to reject. `Metric`, `MetricSecondStage` and `Compare`
@@ -5514,7 +5513,7 @@ either half of the record.
 ### 12.3 The citations, and the hole that is enumerated rather than papered over
 
 The design record cites source files by line number, and nothing derived those citations until
-part 8: moving `search_plan.rs:2134` to `:3145` in [`query-to-sql.md`](query-to-sql.md) and running
+part 8: moving `search_plan.rs:2134` to `:3139` in [`query-to-sql.md`](query-to-sql.md) and running
 `cargo nextest run --workspace` exited 0 with no failing test. (The two numbers in that sentence
 are themselves citations as far as the dataset below is concerned, so they are kept at whatever
 lines those two pieces of code sit at today; issue #559 moved both.)
@@ -5536,16 +5535,16 @@ The block below, tables and sentences alike, is rendered from the two citation d
 
 | quantity | at this revision |
 |---|---|
-| citation occurrences in the five artefacts | 703 |
-| of those, citing a bare basename | 502 |
-| of those, written as a continuation of a citation earlier in the paragraph | 75 |
-| of those continuations, on a later line than the citation they continue | 32 |
-| `(document, token)` pairs the rule resolves | 378 |
-| occurrences those resolved pairs cover | 509 |
+| citation occurrences in the five artefacts | 701 |
+| of those, citing a bare basename | 500 |
+| of those, written as a continuation of a citation earlier in the paragraph | 74 |
+| of those continuations, on a later line than the citation they continue | 31 |
+| `(document, token)` pairs the rule resolves | 376 |
+| occurrences those resolved pairs cover | 507 |
 | `(document, token)` pairs it cannot resolve | 103 |
 | occurrences those frozen pairs cover | 194 |
 | resolved rows anchored on a token the citing prose prints | 183 |
-| resolved rows anchored on a snapshot of the cited line | 195 |
+| resolved rows anchored on a snapshot of the cited line | 193 |
 
 | reason it cannot be resolved | pairs | what it means |
 |---|---|---|
@@ -5564,7 +5563,7 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | `prose` | a token the citing prose prints, so the claim and its evidence are reviewable side by side |
 | `line` | a snapshot of the cited line, taken because the citing prose prints no such token: it detects the line moving or changing and cannot show the citation means the right thing |
 
-Of the 703 citation occurrences the five artefacts make, 502 name a bare basename and 75 are written as a continuation of a citation earlier on the same line. The rule resolves 378 `(document, token)` pairs covering 509 occurrences, and cannot resolve 103 covering 194. Of the resolved rows, 183 are anchored on a token the citing prose prints and 195 on a snapshot of the cited line.
+Of the 701 citation occurrences the five artefacts make, 500 name a bare basename and 74 are written as a continuation of a citation earlier on the same line. The rule resolves 376 `(document, token)` pairs covering 507 occurrences, and cannot resolve 103 covering 194. Of the resolved rows, 183 are anchored on a token the citing prose prints and 193 on a snapshot of the cited line.
 
 The language fallback and the anchor rule disagree on 5 citations, all of them read one at a time. 4 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
 

@@ -2172,19 +2172,19 @@ fn plan_pipeline(
                             field: field.clone(),
                             value: ProjectionValue::Kind,
                         },
-                        // `select(nestedSet*)` is out of scope for #181
-                        // (filter-only): a clean 400, tracked as a
-                        // follow-up (registry `pipeline.select` stays
-                        // generic, owned by #182).
+                        // Issue #594 part 4: `select()` of the nested-set,
+                        // trace-level and child-count intrinsics is
+                        // accepted so the search statement answers it;
+                        // this engine projects nothing for them.
                         Field::Intrinsic(
                             Intrinsic::NestedSetParent
                             | Intrinsic::NestedSetLeft
-                            | Intrinsic::NestedSetRight,
-                        ) => {
-                            return Err(PlanError::TypeMismatch(
-                                "select() of a nested-set intrinsic is not supported".to_string(),
-                            ));
-                        }
+                            | Intrinsic::NestedSetRight
+                            | Intrinsic::ChildCount
+                            | Intrinsic::TraceDuration
+                            | Intrinsic::RootName
+                            | Intrinsic::RootServiceName,
+                        ) => continue,
                         // Issue #351: `select(span:id)` / `select(trace:id)`
                         // are accepted and project NOTHING — not a
                         // shortcut, the reference's own rule. Its
@@ -2204,21 +2204,15 @@ fn plan_pipeline(
                         // The other five skipped intrinsics need no arm:
                         // `name`/`duration` already project (their
                         // physical arms above emit the envelope's own
-                        // fields), and the trace-level three are still
-                        // rejected below — those are #182's rows, not
-                        // this issue's.
+                        // fields), and the trace-level three take the
+                        // issue #594 part 4 arm above.
                         Field::Intrinsic(Intrinsic::SpanId | Intrinsic::TraceId) => continue,
                         // Issue #184: `select()` projection of the
-                        // trace-level/scoped intrinsics is out of scope
-                        // (filtering only) — a clean 400, mirroring
-                        // nested-set.
+                        // scoped intrinsics is out of scope (filtering
+                        // only) — a clean 400.
                         Field::Intrinsic(
                             Intrinsic::StatusMessage
-                            | Intrinsic::ChildCount
                             | Intrinsic::ParentId
-                            | Intrinsic::TraceDuration
-                            | Intrinsic::RootName
-                            | Intrinsic::RootServiceName
                             | Intrinsic::InstrumentationName
                             | Intrinsic::InstrumentationVersion
                             | Intrinsic::EventName
@@ -3325,7 +3319,10 @@ pub fn plan_search(
                 ctx.max_series,
             )
         })
-        .transpose()?;
+        // Issue #594 part 4: a body the probe's compiler cannot render
+        // plans no probe; the planner compiled it above, and the
+        // distinct-group backstop still holds the cap.
+        .and_then(Result::ok);
 
     // ---- issue #492 part 3: the compiled plan --------------------------
     //
@@ -5006,12 +5003,27 @@ mod tests {
         ));
     }
 
+    /// Issue #594 part 4: `select()` of the nested-set, trace-level and
+    /// child-count intrinsics is planned, projecting nothing here, so the
+    /// fork can give it to the search statement.
     #[test]
-    fn select_of_a_nested_set_intrinsic_is_a_type_mismatch() {
-        let query = parse(r#"{ .k = "v" } | select(nestedSetLeft)"#).expect("parse");
-        match plan_search(&query, &PARAMS, &ctx()) {
-            Err(PlanError::TypeMismatch(msg)) => assert!(msg.contains("nested-set"), "{msg}"),
-            other => panic!("expected TypeMismatch, got {other:?}"),
+    fn select_of_the_seven_plans_and_projects_nothing() {
+        for q in [
+            r#"{ .k = "v" } | select(nestedSetLeft)"#,
+            r#"{ .k = "v" } | select(nestedSetRight)"#,
+            r#"{ .k = "v" } | select(nestedSetParent)"#,
+            r#"{ .k = "v" } | select(traceDuration)"#,
+            r#"{ .k = "v" } | select(rootName)"#,
+            r#"{ .k = "v" } | select(rootServiceName)"#,
+            r#"{ .k = "v" } | select(span:childCount)"#,
+        ] {
+            let query = parse(q).expect("parse");
+            let p = plan_search(&query, &PARAMS, &ctx()).unwrap_or_else(|e| panic!("{q}: {e}"));
+            assert_eq!(
+                p.projected_attr_capacity(),
+                1,
+                "{q}: only `.k = \"v\"` projects"
+            );
         }
     }
 
@@ -5060,10 +5072,6 @@ mod tests {
     fn select_of_a_trace_level_or_scoped_intrinsic_is_a_type_mismatch() {
         for q in [
             r#"{ .k = "v" } | select(statusMessage)"#,
-            r#"{ .k = "v" } | select(traceDuration)"#,
-            r#"{ .k = "v" } | select(rootName)"#,
-            r#"{ .k = "v" } | select(rootServiceName)"#,
-            r#"{ .k = "v" } | select(span:childCount)"#,
             r#"{ .k = "v" } | select(span:parentID)"#,
         ] {
             let query = parse(q).expect("parse");

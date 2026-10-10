@@ -12576,3 +12576,234 @@ async fn a_count_or_number_without_its_row_is_zero() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+const NS4_CASES: &[LevelCase] = &[
+    (
+        "{ nestedSetRight - nestedSetLeft = 1 } && { nestedSetParent < 0 }",
+        "b2 5 [05, 02, 04, 01, 03]; e2 2 [04, 05]; e1 3 [01, 03, 04]; a1 3 [01, 03, 04]",
+        Some(
+            "b2 5 [05, 02, 04, 01, 03]; c1 2 [02, 03]; e5 2 [01, 02]; e2 4 [04, 01, 05, 03]; e1 5 [01, 03, 04, 05, 06]; a1 3 [01, 03, 04]",
+        ),
+    ),
+    (
+        "{ nestedSetParent < 0 } > { nestedSetRight - nestedSetLeft = 1 }",
+        "b2 3 [05, 04, 03]; e2 1 [05]; e1 1 [03]; a1 1 [04]",
+        Some("b2 3 [05, 04, 03]; c1 1 [03]; e5 1 [02]; e2 1 [05]; e1 2 [03, 06]; a1 1 [04]"),
+    ),
+    (
+        "{ nestedSetRight - nestedSetLeft = 1 }",
+        "b2 3 [05, 04, 03]; c1 1 [03]; e2 1 [05]; e1 2 [03, 04]; a1 2 [03, 04]",
+        Some(
+            "b2 3 [05, 04, 03]; c1 1 [03]; e5 1 [02]; e2 2 [05, 03]; e1 3 [03, 04, 06]; a1 2 [03, 04]",
+        ),
+    ),
+    (
+        "{ nestedSetLeft = nestedSetParent + 1 }",
+        "b2 2 [05, 03]; c1 2 [02, 03]; e2 1 [05]; e1 2 [02, 04]; a1 2 [02, 03]",
+        Some(
+            "b2 2 [05, 03]; c1 1 [03]; e5 1 [02]; e2 3 [05, 02, 03]; e1 3 [02, 04, 06]; a1 2 [02, 03]",
+        ),
+    ),
+    (
+        "{ !(nestedSetRight - nestedSetLeft = 1) }",
+        "b2 2 [02, 01]; c1 1 [02]; e5 2 [01, 02]; e2 4 [04, 01, 02, 03]; e1 4 [01, 02, 05, 06]; a1 2 [01, 02]",
+        Some(
+            "b2 2 [02, 01]; c1 1 [02]; e5 1 [01]; e2 3 [04, 01, 02]; e1 3 [01, 02, 05]; a1 2 [01, 02]",
+        ),
+    ),
+    (
+        "{ span:childCount = nestedSetParent }",
+        "c1 1 [02]; e2 1 [03]; e1 2 [02, 06]; a1 1 [02]",
+        Some("e5 1 [02]; e1 1 [02]; a1 1 [02]"),
+    ),
+    (
+        "{ span:childCount * 2 > nestedSetRight - nestedSetLeft }",
+        "e5 2 [01, 02]; e2 2 [01, 02]; e1 1 [05]",
+        Some("e5 1 [02]; e2 1 [02]"),
+    ),
+    (
+        "{ nestedSetLeft > 2 } && { nestedSetParent < 0 }",
+        "b2 4 [02, 04, 01, 03]; e1 3 [01, 03, 04]; a1 3 [01, 03, 04]",
+        Some(
+            "b2 4 [02, 04, 01, 03]; e2 4 [04, 01, 02, 03]; e1 5 [01, 03, 04, 05, 06]; a1 3 [01, 03, 04]",
+        ),
+    ),
+    (
+        "{ nestedSetParent < 0 } > { nestedSetLeft > 2 }",
+        "b2 2 [04, 03]; e1 1 [03]; a1 1 [04]",
+        Some("b2 2 [04, 03]; e2 1 [02]; e1 2 [03, 06]; a1 1 [04]"),
+    ),
+    (
+        "{ } | { nestedSetLeft = 0 }",
+        "e5 2 [01, 02]; e2 3 [01, 02, 03]; e1 2 [05, 06]",
+        Some(""),
+    ),
+    (
+        "{ nestedSetLeft > 0 } | count() > 3",
+        "b2 5 [05, 02, 04, 01, 03]; e1 4 [01, 02, 03, 04]; a1 4 [01, 02, 03, 04]",
+        Some(
+            "b2 5 [05, 02, 04, 01, 03]; e2 5 [04, 01, 05, 02, 03]; e1 6 [01, 02, 03, 04, 05, 06]; a1 4 [01, 02, 03, 04]",
+        ),
+    ),
+    (
+        "{ nestedSetLeft > 1 && nestedSetRight < 6 }",
+        "b2 2 [05, 04]; c1 2 [02, 03]; e2 1 [05]; e1 2 [02, 04]; a1 2 [02, 03]",
+        Some("b2 2 [05, 04]; c1 1 [03]; e5 1 [02]; e2 1 [05]; e1 2 [02, 04]; a1 2 [02, 03]"),
+    ),
+    (
+        "{ nestedSetLeft > 0 } | by(name)",
+        "b2 5 [05, 02, 04, 01, 03]; c1 2 [02, 03]; e2 2 [04, 05]; e1 4 [01, 02, 03, 04]; a1 4 [01, 02, 03, 04]",
+        Some(
+            "b2 5 [05, 02, 04, 01, 03]; c1 2 [02, 03]; e5 2 [01, 02]; e2 5 [04, 01, 05, 02, 03]; e1 6 [01, 02, 03, 04, 05, 06]; a1 4 [01, 02, 03, 04]",
+        ),
+    ),
+];
+
+/// Issue #594 part 4: a child count or a number as an operand, and a
+/// numbered comparison in every statement, over fixture NS.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_number_is_an_operand_in_any_statement() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let wrong = check_levels("n4", &ns_bodies(base_ns), 25, base_ns, NS4_CASES).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Issue #594 part 4: a child count as an operand, beside a span-row
+/// column, over fixture CC.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_child_count_is_an_operand() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let wrong = check_levels(
+        "c4",
+        &cc_bodies(base_ns),
+        13,
+        base_ns,
+        &[
+            (
+                "{ span:childCount + 1 > 2 }",
+                "c3 1 [02]; cc 2 [01, 02]",
+                None,
+            ),
+            (
+                "{ span:childCount * 1s >= duration }",
+                "c3 2 [01, 02]; cc 3 [01, 02, 03]",
+                None,
+            ),
+        ],
+    )
+    .await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Issue #594 part 4: `select()` of the seven: a number projects itself;
+/// the trace-level three and `span:childCount` project nothing, as the
+/// reference's response does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_selected_number_projects_itself() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let wrong = check_levels_by(
+        "s4",
+        &ns_bodies(base_ns),
+        25,
+        base_ns,
+        &[
+            (
+                "{ } | select(nestedSetLeft)",
+                "b2 [05 2, 02 1, 04 4, 01 7, 03 8]; c1 [02 2, 03 3]; e5 [01 0, 02 0]; e2 [04 1, 01 0, 05 2, 02 0, 03 0]; e1 [01 1, 02 2, 03 6, 04 3, 05 0, 06 0]; a1 [01 1, 02 2, 03 3, 04 6]",
+                Some("b2 [05, 02, 04, 01, 03]; c1 [02, 03]; e5 [01, 02]; e2 [04, 01, 05, 02, 03]; e1 [01, 02, 03, 04, 05, 06]; a1 [01, 02, 03, 04]"),
+            ),
+            (
+                "{ } | select(nestedSetRight)",
+                "b2 [05 3, 02 6, 04 5, 01 10, 03 9]; c1 [02 5, 03 4]; e5 [01 0, 02 0]; e2 [04 4, 01 0, 05 3, 02 0, 03 0]; e1 [01 8, 02 5, 03 7, 04 4, 05 0, 06 0]; a1 [01 8, 02 5, 03 4, 04 7]",
+                Some("b2 [05, 02, 04, 01, 03]; c1 [02, 03]; e5 [01, 02]; e2 [04, 01, 05, 02, 03]; e1 [01, 02, 03, 04, 05, 06]; a1 [01, 02, 03, 04]"),
+            ),
+            (
+                "{ } | select(rootName, rootServiceName)",
+                "b2 [05, 02, 04, 01, 03]; c1 [02, 03]; e5 [01, 02]; e2 [04, 01, 05, 02, 03]; e1 [01, 02, 03, 04, 05, 06]; a1 [01, 02, 03, 04]",
+                Some("b2 [05, 02, 04, 01, 03]; c1 [02, 03]; e5 [01, 02]; e2 [04, 01, 05, 02, 03]; e1 [01, 02, 03, 04, 05, 06]; a1 [01, 02, 03, 04]"),
+            ),
+            (
+                r#"{ name = "root" } | select(nestedSetParent, trace:duration, span:childCount)"#,
+                "b2 [02 -1, 01 -1]; e2 [04 -1]; e1 [01 -1]; a1 [01 -1]",
+                Some("b2 [02, 01]; e2 [04]; e1 [01]; a1 [01]"),
+            ),
+        ],
+        numbers_of,
+    )
+    .await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Issue #594 part 4: a filter today's group probe cannot compile, before
+/// `by(resource.service.name)`, is planned without the probe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_service_key_after_an_operand_or_a_trace_value() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let wrong = check_levels_by(
+        "p4",
+        &tl_bodies(base_ns),
+        12,
+        base_ns,
+        &[
+            (
+                "{ name = trace:rootName } | by(resource.service.name)",
+                "de 1 [01] {cart 1 [01]}; d2 1 [01] {cart 1 [01]}; d1 1 [01] {loadgen 1 [01]}",
+                Some("de 1 [01] {cart 1 [01]}; d3 1 [05] {loadgen 1 [05]}; d2 1 [01] {cart 1 [01]}; d1 1 [01] {loadgen 1 [01]}"),
+            ),
+            (
+                "{ trace:duration > 1h } | by(resource.service.name)",
+                "de 1 [01] {cart 1 [01]}; dd 1 [02] {cart 1 [02]}; d2 2 [01, 02] {cart 1 [01]; loadgen 1 [02]}; c5 1 [02] {cart 1 [02]}",
+                None,
+            ),
+        ],
+        grouped_answer_of,
+    )
+    .await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Issue #594 part 4: the newest-slice loop answers an operand on numbers
+/// from its first slice, numbering each trace whole (fixture NSF).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sliced_search_compares_whole_numbers() {
+    skip_unless_live!();
+    let e = end595();
+    let (db, client) = seed_both(
+        pulsus_testkit::test_db("pulsus_read_it_t594p4_nsf"),
+        &nsf_bodies(e),
+        27,
+        "t594p4-nsf",
+    )
+    .await;
+    let engine = engine_of(&db).await;
+    let query = "{ nestedSetLeft = nestedSetParent + 1 }";
+    let plan = plan_of(
+        &engine,
+        &parse_query(query),
+        (e - 10_800_000_000_000, e),
+        2,
+        20,
+    );
+    let t0 = now_ns();
+    let routed = engine.search_routed_explained(&plan).await;
+    let (n, _) = settled_statements(&client, &db, t0).await;
+    drop_db(&db).await;
+    let stages = match &routed {
+        Ok((_, x)) => x
+            .stages
+            .iter()
+            .map(|s| s.name)
+            .collect::<Vec<_>>()
+            .join(" "),
+        Err(e) => format!("Err({e})"),
+    };
+    let routed = answer_of(&routed.map(|(o, _)| o));
+    assert_eq!(
+        (routed.as_str(), n, stages.as_str()),
+        ("f1 1 [02]; b2 2 [05, 03]", 1, "search_slice")
+    );
+}

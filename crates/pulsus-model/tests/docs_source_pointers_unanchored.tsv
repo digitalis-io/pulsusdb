@@ -697,7 +697,7 @@ docs/query-lowering.md	search_plan.rs:1890	no_name_the_target_file_holds
 docs/query-lowering.md	search_plan.rs:1894	no_name_the_target_file_holds
 docs/query-lowering.md	search_plan.rs:1897	no_name_the_target_file_holds
 docs/query-lowering.md	search_plan.rs:2157-2158	no_name_the_target_file_holds
-docs/query-lowering.md	search_plan.rs:3145	no_name_the_target_file_holds
+docs/query-lowering.md	search_plan.rs:3139	no_name_the_target_file_holds
 docs/query-lowering.md	search_plan.rs:456	no_name_the_target_file_holds
 docs/query-lowering.md	search_plan.rs:594	no_name_the_target_file_holds
 docs/query-lowering.md	search_plan.rs:958	no_name_the_target_file_holds
@@ -734,7 +734,7 @@ docs/query-to-sql.md	crates/pulsus-read/src/querytext.rs:52	no_name_the_target_f
 docs/query-to-sql.md	crates/pulsus-read/tests/logqltest/corpus/b2_formatters.test:165	no_name_the_target_file_holds
 docs/query-to-sql.md	crates/pulsus-schema/src/checks.rs:29	no_name_the_target_file_holds
 docs/query-to-sql.md	crates/pulsus-server/src/traces_api/error.rs:303	no_name_the_target_file_holds
-docs/query-to-sql.md	crates/pulsus-server/tests/traces_search_live.rs:1481	no_name_the_target_file_holds
+docs/query-to-sql.md	crates/pulsus-server/tests/traces_search_live.rs:1482	no_name_the_target_file_holds
 docs/query-to-sql.md	decisions/0008-sql-composition-for-lowered-pipelines.md:199-203	no_name_the_target_file_holds
 docs/query-to-sql.md	docs/decisions/0008-sql-composition-for-lowered-pipelines.md:201	no_name_the_target_file_holds
 docs/query-to-sql.md	docs/decisions/0008-sql-composition-for-lowered-pipelines.md:53-58	no_name_the_target_file_holds

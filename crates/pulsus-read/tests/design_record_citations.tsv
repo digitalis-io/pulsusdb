@@ -157,9 +157,8 @@ docs/query-lowering.md	search_plan.rs:2134	crates/pulsus-read/src/traces/search_
 docs/query-lowering.md	search_plan.rs:214-215	crates/pulsus-read/src/traces/search_plan.rs	214	215	line	Neq	Eq, Neq,
 docs/query-lowering.md	search_plan.rs:2141	crates/pulsus-read/src/traces/search_plan.rs	2141		prose	MetricSecondStage	MetricSecondStage
 docs/query-lowering.md	search_plan.rs:2147	crates/pulsus-read/src/traces/search_plan.rs	2147		prose	PipelineStage	Compare { .. }
-docs/query-lowering.md	search_plan.rs:2185	crates/pulsus-read/src/traces/search_plan.rs	2185		line	to_string	"select() of a nested-set intrinsic is not supported".to_string(),
-docs/query-lowering.md	search_plan.rs:2230	crates/pulsus-read/src/traces/search_plan.rs	2230		line	to_string	"select() of this intrinsic is not supported".to_string(),
-docs/query-lowering.md	search_plan.rs:3145	crates/pulsus-read/src/traces/search_plan.rs	3145		line	candidates	// Cross-spanset `{A} op {B}` candidates are the superset union of
+docs/query-lowering.md	search_plan.rs:2224	crates/pulsus-read/src/traces/search_plan.rs	2224		line	to_string	"select() of this intrinsic is not supported".to_string(),
+docs/query-lowering.md	search_plan.rs:3139	crates/pulsus-read/src/traces/search_plan.rs	3139		line	candidates	// Cross-spanset `{A} op {B}` candidates are the superset union of
 docs/query-lowering.md	search_plan.rs:958	crates/pulsus-read/src/traces/search_plan.rs	958		line	count	.count()
 docs/query-lowering.md	search_response.rs:504	crates/pulsus-server/src/traces_api/search_response.rs	504		line	group_json	// one-entry list and is served by `group_json` above, so the
 docs/query-lowering.md	search_sql.rs:678	crates/pulsus-read/src/traces/search_sql.rs	678		line	spans_table	pub fn root_sql(spans_table: &str, trace_ids: &[[u8; 16]]) -> String {
@@ -218,7 +217,7 @@ docs/query-to-sql.md	crates/pulsus-schema/src/checks.rs:76	crates/pulsus-schema/
 docs/query-to-sql.md	crates/pulsus-server/src/traces_api/error.rs:303	crates/pulsus-server/src/traces_api/error.rs	303		line	BAD_REQUEST	ApiError::Plan(e) => (StatusCode::BAD_REQUEST, e.to_string()),
 docs/query-to-sql.md	crates/pulsus-server/src/traces_api/search_response.rs:428-430	crates/pulsus-server/src/traces_api/search_response.rs	428	430	line	matched	let mut set = json!({ "matched": group.matched, "spans": spans,
 docs/query-to-sql.md	crates/pulsus-server/src/traces_api/search_response.rs:507-512	crates/pulsus-server/src/traces_api/search_response.rs	507	512	line	span_json	"matched": trace.matched, "spans": trace .spans .iter() .map(|span| span_json(span, report)) .collect::<Vec<_>>(),
-docs/query-to-sql.md	crates/pulsus-server/tests/traces_search_live.rs:1481	crates/pulsus-server/tests/traces_search_live.rs	1481		line	attribute	// string-valued attribute (issue #335 Stage B).
+docs/query-to-sql.md	crates/pulsus-server/tests/traces_search_live.rs:1482	crates/pulsus-server/tests/traces_search_live.rs	1482		line	attribute	// string-valued attribute (issue #335 Stage B).
 docs/query-to-sql.md	crates/pulsus-traceql/src/ast.rs:981	crates/pulsus-traceql/src/ast.rs	981		prose	PipelineStage	PipelineStage
 docs/query-to-sql.md	escape.rs:100	crates/pulsus-read/src/logql/escape.rs	100		line	pattern	other => pattern.push(other),
 docs/query-to-sql.md	escape.rs:154-164	crates/pulsus-read/src/logql/escape.rs	154	164	line	clickhouse_match_strategy	// One `^(?:…)$` template occurrence, whatever the strategy — the // issue #240 anchoring guard counts this site and kee
@@ -333,8 +332,7 @@ docs/query-to-sql.md	search_plan.rs:1491	crates/pulsus-read/src/traces/search_pl
 docs/query-to-sql.md	search_plan.rs:1713-1714	crates/pulsus-read/src/traces/search_plan.rs	1713	1714	line	reproduces	/// bound the other way round: that function refuses to push unless the /// exact integer is one this `f64` reproduces e
 docs/query-to-sql.md	search_plan.rs:2123	crates/pulsus-read/src/traces/search_plan.rs	2123		line	PlannedAggregate	post_stages.push(SpansetStage::Aggregate(PlannedAggregate {
 docs/query-to-sql.md	search_plan.rs:2134	crates/pulsus-read/src/traces/search_plan.rs	2134		line	PipelineStage	PipelineStage::Metric(stage) => {
-docs/query-to-sql.md	search_plan.rs:2185	crates/pulsus-read/src/traces/search_plan.rs	2185		line	to_string	"select() of a nested-set intrinsic is not supported".to_string(),
-docs/query-to-sql.md	search_plan.rs:2230	crates/pulsus-read/src/traces/search_plan.rs	2230		line	to_string	"select() of this intrinsic is not supported".to_string(),
+docs/query-to-sql.md	search_plan.rs:2224	crates/pulsus-read/src/traces/search_plan.rs	2224		line	to_string	"select() of this intrinsic is not supported".to_string(),
 docs/query-to-sql.md	search_sql.rs:109-111	crates/pulsus-read/src/traces/search_sql.rs	109	111	line	start_closed_end_open	fn bounds(w: TimeWindow) -> WindowSql { WindowSql::start_closed_end_open(w.start_ns, w.end_ns) }
 docs/query-to-sql.md	search_sql.rs:121	crates/pulsus-read/src/traces/search_sql.rs	121		line	time_clause	fn time_clause(w: TimeWindow) -> String {
 docs/query-to-sql.md	search_sql.rs:170	crates/pulsus-read/src/traces/search_sql.rs	170		line	for	for b in id {
