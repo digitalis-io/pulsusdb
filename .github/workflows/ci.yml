@@ -889,7 +889,7 @@ jobs:
         run: ci/test-summary.sh run logs_variants_warnings_live -p pulsus-server --test logs_variants_warnings_live
 
       # Issue #455: the invalid-UTF-8 substitution differential. Spawns
-      # the real `pulsusdb` binary against this job's ClickHouse 26.8 on
+      # the built `pulsusdb` binary against this job's ClickHouse 26.8 on
       # 19123 with PULSUS_COMPAT_ENDPOINTS on, pushes the SAME seed to
       # both stores over /loki/api/v1/push, then compares the
       # `__error_details__` label and the log line at
