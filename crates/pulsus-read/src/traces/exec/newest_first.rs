@@ -31,7 +31,7 @@ impl TraceEngine {
     ) -> Result<Option<SearchOutput>, ReadError> {
         let window_ns = plan.window.end_ns.saturating_sub(plan.window.start_ns);
         let limit = u64::from(plan.limit);
-        let settings = with_final(self.search_settings());
+        let settings = self.statement_settings(stmt);
         let mut budget = ByteBudget::new(HYDRATION_BYTE_BUDGET);
         let mut charged = 0usize;
         let mut len = SLICE_NS;
@@ -88,7 +88,10 @@ impl TraceEngine {
             budget.release(charged);
             charged = 0;
             let k = u64::try_from((window_ns + len - 1) / len).unwrap_or(u64::MAX);
-            if n.saturating_mul(k) < 2 * limit {
+            // Issue #594 part 2: a statement that reads the nested-set
+            // numbering keeps doubling, its whole-window statement numbering
+            // every trace of the window.
+            if n.saturating_mul(k) < 2 * limit && !stmt.reads_numbering() {
                 break;
             }
             len = len.saturating_mul(2);
@@ -100,9 +103,31 @@ impl TraceEngine {
     }
 }
 
-/// Stub for the tests-first commit: the rule lands with the change.
-fn product_mode(settings: QuerySettings, _distributed: bool, _numbered: bool) -> QuerySettings {
-    settings
+impl TraceEngine {
+    /// A search statement's settings: [`with_final`] over the search
+    /// settings, and, clustered, `distributed_product_mode = 'local'` for a
+    /// statement that reads the nested-set numbering (issue #594 part 2).
+    /// That statement nests a read of `spans` and of `traces` inside reads
+    /// of the same tables; clustered, those are `_dist` tables, which
+    /// ClickHouse's default `'deny'` refuses. `'local'` reads each nested
+    /// table on the shard: both are sharded by `cityHash64(trace_id)`, so a
+    /// trace's rows, and so its numbering, are whole on one shard.
+    pub(super) fn statement_settings(&self, stmt: &SearchStatement) -> QuerySettings {
+        product_mode(
+            with_final(self.search_settings()),
+            self.config.distributed,
+            stmt.reads_numbering(),
+        )
+    }
+}
+
+/// [`TraceEngine::statement_settings`]'s rule, on its own.
+fn product_mode(settings: QuerySettings, distributed: bool, numbered: bool) -> QuerySettings {
+    if distributed && numbered {
+        settings.set("distributed_product_mode", "local")
+    } else {
+        settings
+    }
 }
 
 #[cfg(test)]
