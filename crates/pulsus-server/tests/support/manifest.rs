@@ -217,8 +217,10 @@ pub enum Surface {
     /// one row). Errors are the bare
     /// `text/plain` body of [`PlainTextWriter::TempoFrontendResponse`]
     /// (issue #384); a TraceQL parse error's byte offset travels inside
-    /// the message, and the static point-cap rejection is a 422 (the
-    /// adjudicated bounded-response contract).
+    /// the message; on the range route more than 10,000 steps is the
+    /// reference's 400 (issue #596 part 1), and on the instant route the
+    /// static point-cap rejection is a 422 (the bounded-response
+    /// contract).
     TracesMetrics,
     /// `GET /api/traces/v1/service_graph` (issue #173, M7-E1, docs/api.md
     /// §4.5) — success is the documented native envelope
@@ -1433,43 +1435,63 @@ fn traces_metrics_missing_stage(req: &mut Req) {
 }
 
 fn traces_metrics_point_cap(req: &mut Req) {
-    // 1,000,000 one-second buckets >> MAX_METRICS_POINTS (11,000): the
-    // adjudicated static pre-execution 422, never a truncation.
+    // 1,000,000 one-second buckets >> MAX_METRICS_POINTS (11,000). On the
+    // instant route: the static pre-execution 422, never a truncation. On
+    // the range route the reference's step limit answers first (issue
+    // #596 part 1): more than 10,000 steps is its 400, `step of 1s is too
+    // small, minimum step for given range is 1m40s`.
     req.query = "q=%7B%7D%20%7C%20rate()&start=1700000000&end=1701000000&step=1".to_string();
 }
 
-const TRACES_METRICS_CASES: &[CaseClass] = &[
-    CaseClass {
-        name: "malformed_q",
-        build: traces_metrics_malformed_q,
-        expect_status: 400,
-        expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
-    },
-    CaseClass {
-        name: "missing_range",
-        build: traces_metrics_missing_range,
-        expect_status: 400,
-        expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
-    },
-    CaseClass {
-        name: "bad_step",
-        build: traces_metrics_bad_step,
-        expect_status: 400,
-        expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
-    },
-    CaseClass {
-        name: "missing_metric_stage",
-        build: traces_metrics_missing_stage,
-        expect_status: 400,
-        expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
-    },
-    CaseClass {
-        name: "point_cap_static_422",
-        build: traces_metrics_point_cap,
-        expect_status: 422,
-        expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
-    },
-];
+/// The four cases both metrics routes share, then `$last`, the route's own.
+macro_rules! traces_metrics_cases {
+    ($last:expr) => {
+        &[
+            CaseClass {
+                name: "malformed_q",
+                build: traces_metrics_malformed_q,
+                expect_status: 400,
+                expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
+            },
+            CaseClass {
+                name: "missing_range",
+                build: traces_metrics_missing_range,
+                expect_status: 400,
+                expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
+            },
+            CaseClass {
+                name: "bad_step",
+                build: traces_metrics_bad_step,
+                expect_status: 400,
+                expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
+            },
+            CaseClass {
+                name: "missing_metric_stage",
+                build: traces_metrics_missing_stage,
+                expect_status: 400,
+                expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
+            },
+            $last,
+        ]
+    };
+}
+
+/// `query_range`: 1,000,000 steps is refused by the reference's step limit,
+/// `400`.
+const TRACES_METRICS_RANGE_CASES: &[CaseClass] = traces_metrics_cases!(CaseClass {
+    name: "step_too_small_400",
+    build: traces_metrics_point_cap,
+    expect_status: 400,
+    expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
+});
+
+/// `query`: the same request is refused by the static point cap, `422`.
+const TRACES_METRICS_INSTANT_CASES: &[CaseClass] = traces_metrics_cases!(CaseClass {
+    name: "point_cap_static_422",
+    build: traces_metrics_point_cap,
+    expect_status: 422,
+    expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
+});
 
 // -- traces service graph (issue #173, docs/api.md §4.5) ----------------
 
@@ -2442,7 +2464,7 @@ static MANIFEST: &[RouteSpec] = &[
         doc_ref: DocRef::Verbatim,
         success_status: 200,
         base_query: TRACES_METRICS_BASE_QUERY,
-        cases: TRACES_METRICS_CASES,
+        cases: TRACES_METRICS_RANGE_CASES,
     },
     RouteSpec {
         path: "/api/traces/v1/metrics/query",
@@ -2453,7 +2475,7 @@ static MANIFEST: &[RouteSpec] = &[
         doc_ref: DocRef::Verbatim,
         success_status: 200,
         base_query: TRACES_METRICS_BASE_QUERY,
-        cases: TRACES_METRICS_CASES,
+        cases: TRACES_METRICS_INSTANT_CASES,
     },
     // -- Traces service graph (ReaderMode, issue #173, M7-E1) -------------
     // `success_status` is 200: against this suite's empty databases a
@@ -2604,7 +2626,7 @@ static MANIFEST: &[RouteSpec] = &[
         doc_ref: DocRef::Verbatim,
         success_status: 200,
         base_query: TRACES_METRICS_BASE_QUERY,
-        cases: TRACES_METRICS_CASES,
+        cases: TRACES_METRICS_RANGE_CASES,
     },
     RouteSpec {
         path: "/api/metrics/query",
@@ -2615,7 +2637,7 @@ static MANIFEST: &[RouteSpec] = &[
         doc_ref: DocRef::Verbatim,
         success_status: 200,
         base_query: TRACES_METRICS_BASE_QUERY,
-        cases: TRACES_METRICS_CASES,
+        cases: TRACES_METRICS_INSTANT_CASES,
     },
     RouteSpec {
         path: "/tempo/api/metrics/query_range",
@@ -2626,7 +2648,7 @@ static MANIFEST: &[RouteSpec] = &[
         doc_ref: DocRef::Verbatim,
         success_status: 200,
         base_query: TRACES_METRICS_BASE_QUERY,
-        cases: TRACES_METRICS_CASES,
+        cases: TRACES_METRICS_RANGE_CASES,
     },
     RouteSpec {
         path: "/tempo/api/metrics/query",
@@ -2637,7 +2659,7 @@ static MANIFEST: &[RouteSpec] = &[
         doc_ref: DocRef::Verbatim,
         success_status: 200,
         base_query: TRACES_METRICS_BASE_QUERY,
-        cases: TRACES_METRICS_CASES,
+        cases: TRACES_METRICS_INSTANT_CASES,
     },
     // -- Planned (documented, not yet mounted) ---------------------------
     // Representative, not exhaustive (deviation, see issue #36 implementation
