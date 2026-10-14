@@ -26,7 +26,7 @@ use super::charge::{
 };
 use super::client_agg::{RowRoute, check_surviving_error, rate_counter_extrapolate, row_route};
 use super::error::ReadError;
-use super::exec::{MatrixSeries, apply_rate};
+use super::exec::{MatrixSeries, apply_rate, range_fold_off_grid};
 use super::labels::{
     StructuredMetadataCtx, merge_labels_with_structured_metadata_pairs, render_labels_json_sorted,
     series_labels, stream_hash,
@@ -83,7 +83,7 @@ pub(in crate::logql) struct ResolvedReduced {
 ///   and carry the same names of `E`. A metadata name in `E` is kept on the
 ///   streams carrying it as a stream label, where it becomes
 ///   `<name>_extracted`, which the grouping does not remove.
-pub(in crate::logql) fn resolve(
+pub(in crate::logql) fn resolve_reduced(
     value: &ReducedUnwrap,
     meta: &HashMap<Fingerprint, StreamMetaRow>,
 ) -> ResolvedReduced {
@@ -278,13 +278,13 @@ impl ReducedFold {
         let Some((_, _, _, Memo::Series(key))) = &self.memo else {
             return Ok(ReducedPush::Folded);
         };
-        let slot = slot_of(&self.grid, row.bucket_ns)?;
+        let slot = reduced_slot(&self.grid, row.bucket_ns)?;
         let value = self.point_value(row);
         let cell = self
             .series
             .get_mut(key)
             .and_then(|(_, slots)| slots.get_mut(slot))
-            .ok_or_else(|| off_grid(row.bucket_ns))?;
+            .ok_or_else(|| range_fold_off_grid(row.bucket_ns))?;
         *cell = Some(value);
         Ok(ReducedPush::Folded)
     }
@@ -354,7 +354,8 @@ impl ReducedFold {
             self.grid.grid_points,
             self.caps.result_points,
         )?;
-        let width = usize::try_from(self.grid.grid_points).map_err(|_| off_grid(row.bucket_ns))?;
+        let width = usize::try_from(self.grid.grid_points)
+            .map_err(|_| range_fold_off_grid(row.bucket_ns))?;
         self.series.insert(key.clone(), (labels, vec![None; width]));
         Ok(Some(Memo::Series(key)))
     }
@@ -408,21 +409,13 @@ impl ReducedFold {
 
 /// The slot a row inside `[grid_start, end]` folds into; a row there that is
 /// not on the grid is an internal defect of the statement.
-fn slot_of(grid: &ReducedGrid, bucket_ns: i64) -> Result<usize, ReadError> {
+fn reduced_slot(grid: &ReducedGrid, bucket_ns: i64) -> Result<usize, ReadError> {
     let offset = i128::from(bucket_ns) - i128::from(grid.grid_start_ns);
     let step = i128::from(grid.step_ns);
     if step <= 0 || offset % step != 0 {
-        return Err(off_grid(bucket_ns));
+        return Err(range_fold_off_grid(bucket_ns));
     }
-    usize::try_from(offset / step).map_err(|_| off_grid(bucket_ns))
-}
-
-fn off_grid(t: i64) -> ReadError {
-    ReadError::PipelineInvalid {
-        reason: format!(
-            "internal: the reduced range fold received a row at {t} off the query grid"
-        ),
-    }
+    usize::try_from(offset / step).map_err(|_| range_fold_off_grid(bucket_ns))
 }
 
 #[cfg(test)]

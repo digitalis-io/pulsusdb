@@ -187,6 +187,12 @@ fn run_client(
     let client = &client;
     let compiled = CompiledPipeline::compile(&client.pipeline).expect("compile");
     let window = match mp.step_ns {
+        // Issue #624, part 5: an instant query lowered at one grid point is
+        // the instant query it answers.
+        Some(_) if mp.answers_instant() => ClientWindow::Instant {
+            start_ns: mp.start_ns,
+            end_ns: mp.end_ns,
+        },
         Some(step_ns) => ClientWindow::Range {
             grid_start_ns: mp.grid_start_ns,
             end_ns: mp.end_ns,
@@ -3035,7 +3041,14 @@ fn eval_node(
             MetricNode::Scalar(v) => QueryResult::Scalar(*v),
             MetricNode::VectorLit { value, window } => materialize_vector_lit(*value, window)?,
             MetricNode::Leaf(mp) => {
-                let client = mp.client.as_ref().expect("client-aggregated plan");
+                // Issue #624, part 5: a lowered instant carries today's
+                // aggregation on its payload.
+                let client = match (&mp.client, &mp.value) {
+                    (Some(client), _) => client,
+                    (None, pulsus_read::logql::sql::MetricValue::Staged(s)) => &s.todays_route,
+                    (None, pulsus_read::logql::sql::MetricValue::Reduced(r)) => &r.todays_route,
+                    (None, _) => panic!("client-aggregated plan"),
+                };
                 let compiled = CompiledPipeline::compile(&client.pipeline).expect("compile");
                 let result = run_client_agg_rows(
                     rows,
@@ -3043,6 +3056,10 @@ fn eval_node(
                     meta,
                     client,
                     match mp.step_ns {
+                        Some(_) if mp.answers_instant() => ClientWindow::Instant {
+                            start_ns: mp.start_ns,
+                            end_ns: mp.end_ns,
+                        },
                         Some(step_ns) => ClientWindow::Range {
                             grid_start_ns: mp.grid_start_ns,
                             end_ns: mp.end_ns,

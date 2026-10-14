@@ -2271,7 +2271,7 @@ impl LogQlEngine {
         });
         let statement = match (labelled_x, mp.step_ns) {
             (false, Some(step)) => {
-                let resolved = super::reduce::resolve(value, meta);
+                let resolved = super::reduce::resolve_reduced(value, meta);
                 super::sql::metric_range_reduced(
                     &mp.table,
                     value,
@@ -3200,7 +3200,7 @@ impl LogQlEngine {
                             });
                             match (labelled_x || !lowered.metadata_lowered, mp.step_ns) {
                                 (false, Some(step)) => {
-                                    let resolved = super::reduce::resolve(r, &meta);
+                                    let resolved = super::reduce::resolve_reduced(r, &meta);
                                     super::sql::metric_range_reduced(
                                         &mp.table,
                                         r,
@@ -6447,7 +6447,7 @@ impl PushdownRangeGroups {
 /// The internal-invariant breach the bucketed fold reports for a row inside
 /// the emit grid's span but off its points (issue #624), as `fold.rs` does
 /// for its own grid.
-fn range_fold_off_grid(t: i64) -> ReadError {
+pub(in crate::logql) fn range_fold_off_grid(t: i64) -> ReadError {
     ReadError::PipelineInvalid {
         reason: format!(
             "internal: the bucketed range fold received a row at {t} off the query grid"

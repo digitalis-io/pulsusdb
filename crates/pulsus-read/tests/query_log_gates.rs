@@ -16252,6 +16252,9 @@ async fn the_database_conversions_are_todays_routes_where_they_decide() {
                  FROM values('i UInt32, ut String', {list})) \
                  SETTINGS precise_float_parsing = 1"
             );
+            // The client reads `?` as a bound argument; the engine doubles
+            // a literal one (`escape_query_placeholders`), and so does this.
+            let sql = sql.replace('?', "??");
             let mut stream = admin
                 .query_stream::<Decided>(&sql, &settings)
                 .await
@@ -16285,6 +16288,9 @@ async fn the_database_conversions_are_todays_routes_where_they_decide() {
             "{name}: {} texts differ:\n{}",
             wrong.len(),
             wrong.join("\n")
+        );
+        eprintln!(
+            "{name}: the statement decides {decided_generated} of the 20,000 generated texts"
         );
         assert!(
             decided_generated >= 14_000,

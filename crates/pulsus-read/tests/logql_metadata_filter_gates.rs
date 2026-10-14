@@ -67,8 +67,13 @@ fn blob_at(commit: &str, rel: &str) -> String {
 fn the_regenerated_planner_golden_differs_only_by_the_new_field() {
     // Issue #624 moved one route on purpose: the merge base's golden is read
     // with that edit applied, so this walk still measures #544's delta alone.
-    let before = with_the_sliding_route(&blob_at(MERGE_BASE, PLANNER_GOLDEN));
+    // Part 4 of it moved the two `| unwrap` leaves too, which are read from
+    // the tree's golden (less the field this walk counts).
     let after = read(PLANNER_GOLDEN);
+    let before = with_the_reduced_leaves(
+        &with_the_sliding_route(&blob_at(MERGE_BASE, PLANNER_GOLDEN)),
+        &after,
+    );
     let old: Vec<&str> = before.lines().collect();
     let new: Vec<&str> = after.lines().collect();
 
@@ -174,6 +179,58 @@ fn with_the_sliding_route(golden: &str) -> String {
     }
     assert!(!pending, "a moved reason with no client block after it");
     out.join("\n")
+}
+
+/// `golden` with the entries issue #624, part 4 moved on purpose — the two
+/// `quantile_over_time(0.9, {a="b"} | unwrap d [5m]) + 1` leaves, now
+/// reduced in the database — taken from `tree`, less the
+/// `metadata_lowering: None,` lines the walk above counts as #544's delta.
+fn with_the_reduced_leaves(golden: &str, tree: &str) -> String {
+    const MOVED: &str = "quantile_over_time(0.9, {a=\"b\"} | unwrap d [5m]) + 1";
+    let entries = |text: &str| -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for line in text.split('\n') {
+            if line.starts_with("=== ") || out.is_empty() {
+                out.push(String::new());
+            }
+            let last = out.last_mut().expect("an entry");
+            last.push_str(line);
+            last.push('\n');
+        }
+        out
+    };
+    let moved: Vec<String> = entries(tree)
+        .into_iter()
+        .filter(|e| e.starts_with("=== ") && e.lines().next().is_some_and(|h| h.ends_with(MOVED)))
+        .map(|e| {
+            e.lines()
+                .filter(|l| l.trim() != "metadata_lowering: None,")
+                .map(|l| format!("{l}\n"))
+                .collect()
+        })
+        .collect();
+    assert_eq!(moved.len(), 2, "the range and instant entries part 4 moved");
+    let mut replaced = 0usize;
+    let mut out = String::new();
+    for e in entries(golden) {
+        let header = e.lines().next().unwrap_or_default().to_string();
+        match moved
+            .iter()
+            .find(|m| m.lines().next() == Some(header.as_str()))
+        {
+            Some(m) if header.ends_with(MOVED) => {
+                out.push_str(m);
+                replaced += 1;
+            }
+            _ => out.push_str(&e),
+        }
+    }
+    assert_eq!(
+        replaced, 2,
+        "both moved entries are in the merge base's golden"
+    );
+    out.pop();
+    out
 }
 
 /// Does any pipeline in this expression carry a `| name = "v"` stage?

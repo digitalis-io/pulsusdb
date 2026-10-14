@@ -1373,7 +1373,7 @@ fn the_compile_sites_are_enumerated_from_the_callers_of_the_compiler() {
         ),
         (
             "exec.rs",
-            12,
+            13,
             0,
             "streams :1160, metric :1444 (incl. every binary leaf), the bucketed range \
              read's capability-join fallback, the extracted-field group key read, \
@@ -1403,7 +1403,11 @@ fn the_compile_sites_are_enumerated_from_the_callers_of_the_compiler() {
              pipeline the streams read, the client-aggregated metric read and the bucketed \
              fallback would each run, to render the `rx` column of their `regexp` stages. \
              Each is a pipeline one of the executing sites above compiles for the same \
-             query, so any logfmt expression in it is one those sites already compile",
+             query, so any logfmt expression in it is one those sites already compile. \
+             Issue #624 part 4 adds the thirteenth: a reduced plan's today's-route \
+             pipeline, compiled before any read. The planner admits only line filters, \
+             label filters and one `unwrap` there (`reduced_unwrap_route`), so no logfmt \
+             expression reaches it",
         ),
         (
             "plan.rs",
@@ -1413,6 +1417,14 @@ fn the_compile_sites_are_enumerated_from_the_callers_of_the_compiler() {
              (issue #247 round 2, mirroring `evaluator.go:1417 @ v3.7.4`) — the \
              `variants_variant_side` position covers it, and `Refusal::PlanTime` records that \
              it refuses here rather than at a pipeline compile",
+        ),
+        (
+            "reduce.rs",
+            1,
+            0,
+            "the reduced fold (issue #624, part 4) compiles a reduced plan's key stages: its \
+             label filters and `unwrap`, the planner having admitted no parser \
+             (`reduced_unwrap_route`), so no logfmt expression can be in them",
         ),
         (
             "unwrap_group.rs",

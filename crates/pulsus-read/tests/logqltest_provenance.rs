@@ -2086,8 +2086,11 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
     ("pulsus-read/src/logql/predicate.rs", 18),
     // Issue #624, part 3d adds three to `sql.rs`: the `| logfmt` line
     // grammar in its `decided` column, and the out-of-range integer test in
-    // each of the two `| json` key readers.
-    ("pulsus-read/src/logql/sql.rs", 5),
+    // each of the two `| json` key readers. Issue #624, part 4 adds twelve:
+    // the `| unwrap` conversions' grammar tests in
+    // `reduced_conversion_columns`, two for numbers, six for durations and
+    // four for bytes.
+    ("pulsus-read/src/logql/sql.rs", 17),
     ("pulsus-read/src/metrics/dispatch.rs", 5),
     // Issue #623: the counts follow the test expectations of the lookup and
     // activity reads — a regex matcher on the lookup and its probe line on
@@ -2123,7 +2126,7 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
 
 /// The separately-asserted total, so "a file appeared" reads differently
 /// from "a file grew".
-const MATCH_RENDER_TOTAL: usize = 109;
+const MATCH_RENDER_TOTAL: usize = 121;
 
 /// Every string-literal CONTENT in a Rust source: ordinary `"…"`, raw
 /// `r"…"`/`r#"…"#`, byte `b"…"` and byte-raw. Comments are dropped.
