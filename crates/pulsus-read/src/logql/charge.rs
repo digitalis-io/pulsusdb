@@ -2592,6 +2592,12 @@ mod tests {
                 "&mut self.charged",
                 2,
             ),
+            // Issue #624, part 4: `ReducedFold::charged` and
+            // `ReducedFold::points`, one charge each at a new series, as
+            // today's route charges the same series. A further XOR arm of
+            // both caps: the fold is dropped before today's route starts.
+            ("reduce.rs", "charge_group_bytes", "&mut self.charged", 1),
+            ("reduce.rs", "charge_result_points", "&mut self.points", 1),
             // `VariantsAggState::charged` / `VariantArena::charged`.
             ("variants.rs", "charge_fanout_bytes", "&mut charged", 3),
             // The plan-time continuation of the SAME fan-out counter.
@@ -2746,6 +2752,20 @@ mod tests {
                 "group_bytes",
                 2,
                 "KeyRouteFold::charged (issue #507)",
+            ),
+            // Issue #624, part 4: the reduced fold's new-series charges, XOR
+            // with today's route (the fold is dropped before it starts).
+            (
+                "reduce.rs",
+                "group_bytes",
+                1,
+                "ReducedFold::charged (issue #624, part 4)",
+            ),
+            (
+                "reduce.rs",
+                "result_points",
+                1,
+                "ReducedFold::points (issue #624, part 4)",
             ),
             // Issue #249 cost work: 2 -> 3. `fan_out_sample_base`'s HIT
             // path accumulates straight into the cached group and so
@@ -2996,6 +3016,8 @@ mod tests {
             ("template/timefns.rs", include_str!("template/timefns.rs")),
             ("template/value.rs", include_str!("template/value.rs")),
             ("unwrap_group.rs", include_str!("unwrap_group.rs")),
+            // Issue #624, part 4: the lowered `| unwrap` reducers' fold.
+            ("reduce.rs", include_str!("reduce.rs")),
         ];
         assert_source_set_matches_the_directory(SOURCES);
         SOURCES

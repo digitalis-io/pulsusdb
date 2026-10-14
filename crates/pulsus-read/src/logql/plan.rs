@@ -405,7 +405,7 @@ impl MetricPlan {
     /// Whether the plan answers an instant query (issue #624, part 5): an
     /// instant plan, or an instant query lowered at its one grid point.
     pub fn answers_instant(&self) -> bool {
-        self.step_ns.is_none()
+        self.step_ns.is_none() || self.value.instant()
     }
 }
 
@@ -2361,16 +2361,152 @@ fn unwrapped_key_route(
     })
 }
 
+/// The label names a `__error_details__`, `__preserve_error__` or
+/// `__variant__` filter reads: a reduced key runs its stages with none of
+/// them, so a filter naming one stays on today's route (issue #624, part 4).
+const REDUCED_UNKEYED_NAMES: [&str; 3] = [
+    super::pipeline::ERROR_DETAILS_LABEL,
+    PRESERVE_ERROR_LABEL,
+    super::variants::VARIANT_LABEL,
+];
+
 /// Issue #624, part 4: the `| unwrap` reducers the database reduces, as
-/// [`sql::ReducedUnwrap`], or `None` for today's route.
+/// [`sql::ReducedUnwrap`], or `None` for today's route. `grouping` is `G`,
+/// the grouping the reducer's series take: its own `by`/`without`, or the
+/// parent `sum`'s injected into `sum_over_time` and `rate` (F3).
+///
+/// ```text
+/// reducer   the eleven that take | unwrap; quantile_over_time's q not NaN
+/// stages    pushable line filters, then label filters, the | unwrap, label filters
+/// unwrap    x read from structured metadata: not reserved, not ending _extracted
+/// filter    lowered into the statement (#544), or every name it reads is in the
+///           key: by (L): in L or __error__; otherwise: not x, not in without (L)
+/// names     no L name equal to x, reserved, or ending _extracted; no filter
+///           naming __error_details__, __preserve_error__ or __variant__
+/// ```
+///
+/// The key mode follows `G`: `by (L)` (or `by ()`) keeps the names in `L`;
+/// none, or `without (L)`, drops `x` and the names in `L`.
 fn reduced_unwrap_route(
     op: RangeAggOp,
     pipeline: &[Stage],
     grouping: Option<&RangeGrouping>,
     quantile: Option<f64>,
 ) -> Option<sql::ReducedUnwrap> {
-    let _ = (op, pipeline, grouping, quantile);
-    None
+    if !matches!(
+        op,
+        RangeAggOp::SumOverTime
+            | RangeAggOp::AvgOverTime
+            | RangeAggOp::MinOverTime
+            | RangeAggOp::MaxOverTime
+            | RangeAggOp::StddevOverTime
+            | RangeAggOp::StdvarOverTime
+            | RangeAggOp::QuantileOverTime
+            | RangeAggOp::FirstOverTime
+            | RangeAggOp::LastOverTime
+            | RangeAggOp::Rate
+            | RangeAggOp::RateCounter
+    ) {
+        return None;
+    }
+    if op == RangeAggOp::QuantileOverTime && quantile.is_none_or(f64::is_nan) {
+        return None;
+    }
+    let mut at = 0;
+    while let Some(Stage::LineFilter(lf)) = pipeline.get(at) {
+        if !is_pushable_line_filter(lf) {
+            return None;
+        }
+        at += 1;
+    }
+    let mut unwrap = None;
+    let mut filters: Vec<(usize, &LabelFilterExpr)> = Vec::new();
+    for (i, stage) in pipeline.iter().enumerate().skip(at) {
+        match stage {
+            Stage::LabelFilter(expr) => filters.push((i, expr)),
+            Stage::Unwrap(u) if unwrap.is_none() => unwrap = Some(u),
+            _ => return None,
+        }
+    }
+    let unwrap = unwrap?;
+    let conversion = match unwrap.conversion.as_deref() {
+        None => sql::UnwrapConversion::Number,
+        Some("duration") | Some("duration_seconds") => sql::UnwrapConversion::Duration,
+        Some("bytes") => sql::UnwrapConversion::Bytes,
+        Some(_) => return None,
+    };
+    let x = unwrap.label.as_str();
+    if is_reserved_key_name(x) || x.ends_with("_extracted") {
+        return None;
+    }
+    let named = match grouping {
+        Some(RangeGrouping::By(l)) | Some(RangeGrouping::Without(l)) => l.as_slice(),
+        Some(RangeGrouping::Singleton) | None => &[],
+    };
+    if named
+        .iter()
+        .any(|n| n == x || is_reserved_key_name(n) || n.ends_with("_extracted"))
+    {
+        return None;
+    }
+    let mode = match grouping {
+        Some(RangeGrouping::Singleton) => sql::KeyMode::Keep(Vec::new()),
+        Some(RangeGrouping::By(l)) => sql::KeyMode::Keep(l.clone()),
+        None | Some(RangeGrouping::Without(_)) => {
+            let mut e: Vec<String> = named.to_vec();
+            e.push(x.to_string());
+            e.sort_unstable();
+            e.dedup();
+            sql::KeyMode::Drop(e)
+        }
+    };
+    let lowered = metadata_filter_flags(pipeline);
+    for (i, expr) in &filters {
+        let mut names: Vec<&str> = Vec::new();
+        pulsus_logql::for_each_label_filter(expr, |e| match e {
+            LabelFilterExpr::Match(m) => names.push(m.name.as_str()),
+            LabelFilterExpr::Compare { name, .. } | LabelFilterExpr::Ip { name, .. } => {
+                names.push(name.as_str())
+            }
+            LabelFilterExpr::And(..) | LabelFilterExpr::Or(..) => {}
+        });
+        if names.iter().any(|n| REDUCED_UNKEYED_NAMES.contains(n)) {
+            return None;
+        }
+        if lowered[*i] {
+            continue;
+        }
+        let in_key = |n: &str| match &mode {
+            sql::KeyMode::Keep(l) => n == ERROR_LABEL || l.iter().any(|k| k == n),
+            sql::KeyMode::Drop(_) => n != x && !named.iter().any(|k| k == n),
+        };
+        if !names.iter().all(|n| in_key(n)) {
+            return None;
+        }
+    }
+    let key_stages: Vec<Stage> = pipeline
+        .iter()
+        .zip(&lowered)
+        .filter(|(stage, lowered)| !matches!(stage, Stage::LineFilter(_)) && !**lowered)
+        .map(|(stage, _)| stage.clone())
+        .collect();
+    Some(sql::ReducedUnwrap {
+        reducer: op,
+        quantile,
+        label: x.to_string(),
+        conversion,
+        mode,
+        key_stages,
+        todays_route: ClientAgg {
+            pipeline: pipeline.to_vec(),
+            value: ClientValue::Unwrap,
+            range_op: op,
+            param: quantile,
+            absent_labels: Vec::new(),
+            grouping: grouping.map(|g| Box::new(g.clone())),
+        },
+        instant: false,
+    })
 }
 
 /// The range step's rules for one range aggregation (issue #507): what the
@@ -2690,9 +2826,26 @@ fn metric_plan(
     // once here so the per-row projection is not re-deriving it. The
     // parser has already refused it on the seven ops the reference
     // refuses it on, so `Some` implies one of the eight.
-    let grouping = range_grouping
+    let own_grouping = range_grouping
         .as_ref()
         .map(|g| Box::new(RangeGrouping::from_ast(g)));
+    // Issue #624, part 4 (F3): the reference reduces `sum_over_time` and
+    // `rate` over an unwrapped range under a parent `sum` with no grouping of
+    // their own on the sum's merged series (`canInjectVectorGrouping`,
+    // `pkg/logql/syntax/ast.go:1612-1642 @ v3.7.4`), so today's route takes
+    // the parent's grouping as the range aggregation's own.
+    let grouping = match &own_grouping {
+        Some(g) => Some(g.clone()),
+        None if has_unwrap && matches!(op, RangeAggOp::SumOverTime | RangeAggOp::Rate) => {
+            parent_sum_grouping(*op, false, &vector_aggs).map(|g| {
+                Box::new(match g {
+                    None => RangeGrouping::Singleton,
+                    Some(g) => RangeGrouping::from_ast(g),
+                })
+            })
+        }
+        None => None,
+    };
     let quantile = match (op, param) {
         (RangeAggOp::QuantileOverTime, Some(raw)) => {
             Some(parse_plan_number(raw, format_args!("quantile parameter"))?)
@@ -2912,20 +3065,40 @@ fn metric_plan(
     // Issue #624, part 3c (D7): under the reference's no-label hints the
     // `json`, `logfmt`, `pattern` and `unpack` stages do nothing, so the
     // statement counts as part 2's and the fold skips them.
-    let no_label_parsers = is_range
+    //
+    // Issue #624, part 5: an instant query whose plan is client-aggregated is
+    // offered the same lowerings at one grid point — `step = range` and
+    // `grid_start = end = at` — so its window `(at - range, at]` is the
+    // instant's. `lowerable` and `(lower_step, lower_grid_start)` are what
+    // every lowering below tests; W4 (`unwrapped_range`) stays range-only.
+    let lowers_instant = !is_range && !force_client && !empty_domain && client.is_some();
+    let lowerable = is_range || lowers_instant;
+    let (lower_step, lower_grid_start) = if is_range {
+        (step_ns, grid_start_ns)
+    } else {
+        (Some(range_ns), end_ns)
+    };
+    let lower_grid_fits = match lower_step {
+        Some(step) => {
+            let step = step.get();
+            step > 0 && lower_grid_start.checked_sub(step).is_some()
+        }
+        None => false,
+    };
+    let no_label_parsers = lowerable
         && !force_client
         && range_step_rules(*op, pipeline, None, &vector_aggs)
             .hints
             .no_labels
         && no_label_pipeline(pipeline, *op);
-    let regexp = if is_range && !force_client && !no_label_parsers {
+    let regexp = if lowerable && !force_client && !no_label_parsers {
         regexp_count_route(pipeline, *op, &vector_aggs)
     } else {
         None
     };
     // Issue #624, part 3b: a counting reducer after one `| json` stage,
     // whose key labels the statement reads.
-    let json = if is_range && !force_client && regexp.is_none() && !no_label_parsers {
+    let json = if lowerable && !force_client && regexp.is_none() && !no_label_parsers {
         json_count_route(pipeline, *op, &vector_aggs)
     } else {
         None
@@ -2933,12 +3106,12 @@ fn metric_plan(
     // Issue #624, part 3d: a counting reducer after one `| logfmt` stage,
     // whose relevant fields the statement sends.
     let logfmt =
-        if is_range && !force_client && regexp.is_none() && json.is_none() && !no_label_parsers {
+        if lowerable && !force_client && regexp.is_none() && json.is_none() && !no_label_parsers {
             logfmt_count_route(pipeline, *op, &vector_aggs)
         } else {
             None
         };
-    let bucketed_range = is_range
+    let bucketed_range = lowerable
         && !force_client
         && (!has_beyond_line_filter
             || label_only_pipeline(pipeline, *op)
@@ -2967,13 +3140,7 @@ fn metric_plan(
         // read it as the assertion that makes that unreachability a
         // compile-time fact rather than a parser convention.
         && client.as_ref().is_none_or(|c| c.grouping.is_none())
-        && match step_ns {
-            Some(step) => {
-                let step = step.get();
-                step > 0 && grid_start_ns.checked_sub(step).is_some()
-            }
-            None => false,
-        };
+        && lower_grid_fits;
     // Issue #624, part 2: a lowered plan with stages to run per group, or
     // `absent_over_time`, carries today's aggregation for its fold and its
     // fallbacks.
@@ -3012,19 +3179,46 @@ fn metric_plan(
             }
             None => false,
         } {
-        unwrapped_key_route(
-            *op,
-            pipeline,
-            client.as_ref().and_then(|c| c.grouping.as_deref()),
-            &vector_aggs,
-        )
+        unwrapped_key_route(*op, pipeline, own_grouping.as_deref(), &vector_aggs)
     } else {
         None
     };
-    let client = if unwrapped_range.is_some() {
+    // Issue #624, part 4: the eleven `| unwrap` reducers over a pipeline with
+    // no parser, reduced in the database at any range and step (and, part 5,
+    // at an instant's one grid point). Disjoint from W4, which needs a
+    // parser.
+    let reduced = if lowerable
+        && !force_client
+        && unwrapped_range.is_none()
+        && !bucketed_range
+        && has_unwrap
+        && lower_grid_fits
+    {
+        reduced_unwrap_route(
+            *op,
+            pipeline,
+            client.as_ref().and_then(|c| c.grouping.as_deref()),
+            quantile,
+        )
+        .map(|mut r| {
+            r.instant = lowers_instant;
+            r
+        })
+    } else {
+        None
+    };
+    let client = if unwrapped_range.is_some() || reduced.is_some() {
         None
     } else {
         client
+    };
+    // Issue #624, part 5: an instant query that lowered is planned at its one
+    // grid point.
+    let instant_lowered = lowers_instant && (bucketed_range || reduced.is_some());
+    let (step_ns, grid_start_ns) = if instant_lowered {
+        (lower_step, lower_grid_start)
+    } else {
+        (step_ns, grid_start_ns)
     };
     // A line filter constrains which log lines count; the rollup table
     // (`log_metrics_<res>`) has no `body` column to re-filter, so any
@@ -3080,6 +3274,11 @@ fn metric_plan(
                 "raw: extracted-field group key, {} (issue #507)",
                 value.reducer.function()
             ),
+        }
+    } else if reduced.is_some() {
+        RoutingDecision {
+            chosen: RouteChoice::Raw,
+            reason: "raw: unwrapped range aggregation in the database (issue #624)".to_string(),
         }
     } else if bucketed_range {
         // Issue #507 (W2). RAW, not rollup, and the choice is forced
@@ -3178,19 +3377,20 @@ fn metric_plan(
     } else {
         ctx.samples.to_string()
     };
-    let value = match (unwrapped_range, staged) {
-        (Some(value), _) => sql::MetricValue::Unwrapped(Box::new(value)),
-        (None, true) => sql::MetricValue::Staged(Box::new(sql::StagedCount {
+    let value = match (unwrapped_range, reduced, staged) {
+        (Some(value), _, _) => sql::MetricValue::Unwrapped(Box::new(value)),
+        (None, Some(value), _) => sql::MetricValue::Reduced(Box::new(value)),
+        (None, None, true) => sql::MetricValue::Staged(Box::new(sql::StagedCount {
             shape,
             todays_route: client_full
                 .clone()
-                .expect("a range plan always builds today's aggregation"),
+                .expect("a lowered plan always builds today's aggregation"),
             regexp: regexp.clone(),
             json: json.clone(),
             logfmt: logfmt.clone(),
-            instant: false,
+            instant: lowers_instant,
         })),
-        (None, false) => sql::MetricValue::Shaped(shape),
+        (None, None, false) => sql::MetricValue::Shaped(shape),
     };
     // Issue #544: the lowering removed the client stage exactly when the
     // unlowered answer would have kept one and this plan has none. The
@@ -4851,9 +5051,13 @@ mod tests {
                 p(false, false, false),
                 h(true, false, false),
             ),
+            // Issue #624, part 4 (F3): under a parent `sum`, `sum_over_time`
+            // and `rate` over an unwrapped range take the sum's grouping as
+            // their own, as the reference injects it, so no parent sum is
+            // left for the step rules to apply.
             (
                 r#"sum by (service_name) (sum_over_time({a="b"} | json | unwrap latency [5m]))"#,
-                p(false, false, false),
+                None,
                 h(true, false, false),
             ),
             (
@@ -4893,12 +5097,12 @@ mod tests {
             ),
             (
                 r#"sum by (latency) (sum_over_time({a="b"} | json | unwrap latency [5m]))"#,
-                p(false, false, true),
+                None,
                 h(true, false, false),
             ),
             (
                 r#"sum without (service_name) (sum_over_time({a="b"} | json | unwrap latency [5m]))"#,
-                p(true, true, false),
+                None,
                 h(false, false, false),
             ),
             (
@@ -4945,7 +5149,14 @@ mod tests {
                 },
             )
             .expect(query);
-            let client = mp.client.as_ref().expect("client mode");
+            // Issue #624, part 5: an instant that lowered carries today's
+            // aggregation on its payload.
+            let client = match (&mp.client, &mp.value) {
+                (Some(client), _) => client,
+                (None, sql::MetricValue::Staged(s)) => &s.todays_route,
+                (None, sql::MetricValue::Reduced(r)) => &r.todays_route,
+                (None, _) => panic!("{query}: today's aggregation"),
+            };
             let got = range_step_rules(
                 client.range_op,
                 &client.pipeline,
@@ -6936,6 +7147,16 @@ mod tests {
                 );
                 continue;
             }
+            // Issue #624, part 4: an `| unwrap` reducer with no parser is
+            // reduced in the database. It still plans.
+            if matches!(mp.value, sql::MetricValue::Reduced(_)) {
+                assert!(mp.client.is_none(), "{query}");
+                assert!(
+                    query.contains("| unwrap ") && !query.contains("| json"),
+                    "{query}"
+                );
+                continue;
+            }
             let client = mp
                 .client
                 .as_ref()
@@ -8147,20 +8368,22 @@ mod tests {
                 false,
                 "raw: instant query",
             ),
+            // Issue #624, part 5: a filter the statement does not carry is
+            // run per group over an instant's one grid point.
             (
                 r#"count_over_time({service_name="sm"} | trace=~"a.*" [5m])"#,
-                true,
-                "raw: client-side pipeline/unwrap aggregation",
+                false,
+                "raw: range aggregation in the database, label stages over its rows (issue #624)",
             ),
             (
                 r#"count_over_time({service_name="sm"} | n > 15 [5m])"#,
-                true,
-                "raw: client-side pipeline/unwrap aggregation",
+                false,
+                "raw: range aggregation in the database, label stages over its rows (issue #624)",
             ),
             (
                 r#"count_over_time({service_name="sm"} | trace = ip("10.0.0.1") [5m])"#,
-                true,
-                "raw: client-side pipeline/unwrap aggregation",
+                false,
+                "raw: range aggregation in the database, label stages over its rows (issue #624)",
             ),
         ];
         for (query, client_some, reason) in rows {
@@ -9501,15 +9724,22 @@ mod tests {
             r#"bytes_over_time({a="b"} | decolorize [1m])"#,
             "bytes of a rewritten line",
         );
-        // A reducer outside the four, and the one permanent refusal.
-        stays_client(
+        // An `| unwrap` reducer is not counted: since issue #624, part 4 the
+        // statement reduces it in its own form, not this one.
+        for query in [
             r#"sum_over_time({a="b"} | unwrap v [1m])"#,
-            "an f64 accumulator",
-        );
-        stays_client(
             r#"rate({a="b"} | unwrap v [1m])"#,
-            "`rate` over an unwrap sums f64s",
-        );
+        ] {
+            let mp = metric_mp(query, spec).unwrap_or_else(|e| panic!("{query}: {e}"));
+            assert!(
+                matches!(mp.value, sql::MetricValue::Reduced(_)),
+                "{query}: the reduced statement"
+            );
+            assert_ne!(
+                mp.routing.reason, "raw: bucketed range aggregation (issue #507)",
+                "{query}"
+            );
+        }
 
         // `grid_start - step` must be representable. At the bottom of the
         // axis it is not, and the widened scan start saturates with it.
@@ -9863,7 +10093,6 @@ mod tests {
             r#"avg_over_time({a="b"} | x > 1 | unwrap x [5m])"#,
             r#"avg_over_time({a="b"} | unwrap x [5m]) by (x)"#,
             r#"avg_over_time({a="b"} | unwrap a_extracted [5m])"#,
-            r#"quantile_over_time(NaN, {a="b"} | unwrap x [5m])"#,
             r#"absent_over_time({a="b"} | unwrap x [5m])"#,
         ] {
             for spec in [range, instant] {
@@ -9875,6 +10104,28 @@ mod tests {
                 );
             }
         }
+        // `quantile_over_time(NaN, …)`: the query text cannot spell a NaN
+        // parameter (the parser wants a number), so the route is asked
+        // directly.
+        let pipeline = match parse(r#"{a="b"} | unwrap x"#).expect("parse") {
+            Expr::Log(le) => le.pipeline,
+            _ => panic!("a log query"),
+        };
+        assert!(
+            reduced_unwrap_route(
+                RangeAggOp::QuantileOverTime,
+                &pipeline,
+                None,
+                Some(f64::NAN)
+            )
+            .is_none(),
+            "a NaN quantile stays on today's route"
+        );
+        assert!(
+            reduced_unwrap_route(RangeAggOp::QuantileOverTime, &pipeline, None, Some(0.5))
+                .is_some(),
+            "the control"
+        );
         for spec in [range, instant] {
             let query = r#"variants(avg_over_time({a="b"} | unwrap x [5m])) of ({a="b"}[5m])"#;
             let Plan::MetricBinary(node) = plan_at(query, spec).expect("plan") else {

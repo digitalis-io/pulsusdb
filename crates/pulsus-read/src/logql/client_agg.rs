@@ -1522,10 +1522,8 @@ fn win_order(a: &WinSample, b: &WinSample) -> std::cmp::Ordering {
 /// run, buffered until the run closes so it can be ranked by value.
 #[derive(Debug)]
 struct CollMember {
-    /// The raw body bytes, held ONLY for the current group and dropped once
-    /// `tie_rank` is assigned. The rank is by `value` since issue #624,
-    /// part 4 (F1).
-    body: String,
+    /// The sample value, which ranks the member within its group (issue
+    /// #624, part 4, F1: the body is no longer retained).
     value: f64,
     /// Where this member's sample belongs, decided per ROW rather than per
     /// state since issue #249 — a `(fingerprint, timestamp_ns)` group can
@@ -1963,10 +1961,10 @@ pub(in crate::logql) struct RangeSlideState<'q> {
     /// over per-series results.
     grouping: Option<&'q RangeGrouping>,
     /// Whether the reducer is order-DEPENDENT (class C, or first/last) and so
-    /// needs the `tie_rank` order within a collision group. When
-    /// false (count/bytes/rate-no-unwrap, min/max/quantile) the body is never
-    /// retained — no per-row clone, no per-group sort (the alloc-gate path).
-    needs_body_order: bool,
+    /// needs the `tie_rank` order within a collision group. When false
+    /// (count/bytes/rate-no-unwrap, min/max/quantile) no group is sorted
+    /// (the alloc-gate path).
+    needs_value_order: bool,
     absent_labels: LabelSet,
     pub(in crate::logql) base_labels: HashMap<Fingerprint, LabelSet>,
     hashes: HashMap<Fingerprint, u64>,
@@ -2110,7 +2108,7 @@ impl<'q> RangeSlideState<'q> {
         }
         let op = client.range_op;
         let class = reducer_class(op, client.value);
-        let needs_body_order = matches!(class, ReducerClass::CanonicalFold)
+        let needs_value_order = matches!(class, ReducerClass::CanonicalFold)
             || matches!(op, RangeAggOp::FirstOverTime | RangeAggOp::LastOverTime);
         let is_absent = matches!(op, RangeAggOp::AbsentOverTime);
         // Issue #344: a grouping MERGES streams, so it must take the
@@ -2139,7 +2137,7 @@ impl<'q> RangeSlideState<'q> {
             fan_out,
             is_absent,
             grouping: client.grouping.as_deref(),
-            needs_body_order,
+            needs_value_order,
             absent_labels: client.absent_labels.clone(),
             slider_safe: slider_safe_fingerprints(&base_labels),
             base_labels,
@@ -2221,7 +2219,7 @@ impl<'q> RangeSlideState<'q> {
 
     /// Folds one batch of (physical-key-ordered) rows: runs the pipeline,
     /// fails on a surviving `__error__`, and buffers same-`(fingerprint,
-    /// timestamp_ns)` runs for full-body ranking before loading them.
+    /// timestamp_ns)` runs for value ranking before loading them.
     ///
     /// `base_labels` is moved to a LOCAL for the duration so the batch-reused
     /// `scratch` (whose `Cow`s borrow it) does not tie a `self` borrow across
@@ -2433,7 +2431,7 @@ impl<'q> RangeSlideState<'q> {
         // JSON, cloned `LabelSet` — is sized, capped, THEN allocated in
         // one place. No reducer class has a path that stages anything
         // outside it.
-        self.stage_member(row, v, route, base_member, scratch)
+        self.stage_member(v, route, base_member, scratch)
     }
 
     /// **The single staging funnel** — the ONLY place a per-member
@@ -2443,8 +2441,7 @@ impl<'q> RangeSlideState<'q> {
     /// make, (ii) check BOTH caps, (iii) only then allocate. Because the
     /// sizing happens first, the allocation that would breach a cap is never
     /// performed, for **every** reducer class — the previous code sized only
-    /// the body (and only when `needs_body_order`), leaving the fan-out
-    /// `key`/`LabelSet` clones uncharged.
+    /// the body, leaving the fan-out `key`/`LabelSet` clones uncharged.
     ///
     /// The charge is an UPPER BOUND on the heap bytes about to be allocated
     /// (see [`Self::member_stage_bytes`]), so `coll_bytes >= actual staged
@@ -2452,7 +2449,6 @@ impl<'q> RangeSlideState<'q> {
     /// is enforced — hence actual staged bytes are capped too.
     fn stage_member(
         &mut self,
-        row: &MetricScanRow,
         value: f64,
         route: RowRoute,
         base: bool,
@@ -2482,7 +2478,7 @@ impl<'q> RangeSlideState<'q> {
         // (i) size EVERY allocation this member will make. A `base`
         // member's `stages_out` is false, so this is the slot alone — which
         // is exact, because it allocates nothing else.
-        let bytes = self.member_stage_bytes(row, scratch, stages_out);
+        let bytes = self.member_stage_bytes(scratch, stages_out);
         // (ii) both caps, BEFORE any allocation. `saturating_add` cannot mask
         // a breach (saturation only grows the sum) but does keep a
         // pathological charge from overflowing the comparison itself.
@@ -2497,11 +2493,6 @@ impl<'q> RangeSlideState<'q> {
             }));
         }
         // (iii) now — and only now — allocate.
-        let body = if self.needs_body_order {
-            row.body.clone()
-        } else {
-            String::new()
-        };
         let out = if stages_out {
             let key = render_labels_json_sorted(scratch);
             let labels: LabelSet = scratch
@@ -2514,7 +2505,6 @@ impl<'q> RangeSlideState<'q> {
         };
         self.coll_bytes = next_bytes;
         self.coll.push(CollMember {
-            body,
             value,
             route,
             base,
@@ -2547,9 +2537,6 @@ impl<'q> RangeSlideState<'q> {
     ///   [`alloc_block_bytes`] — allocator size-class rounding covered,
     ///   floored at the allocator's minimum block — so a label set of many
     ///   one-byte values cannot cost more than its charge.
-    /// - **body clone** — `String::clone` reserves exactly `row.body.len()`
-    ///   in one allocation; charged through [`alloc_block_bytes`], only when
-    ///   `needs_body_order`.
     /// - **`CollMember` slot in `coll`** — a `Vec` push can DOUBLE capacity
     ///   with the old buffer still live during the realloc, so for `n`
     ///   members the live request is `≤ 2n` slots plus an old buffer of
@@ -2566,7 +2553,6 @@ impl<'q> RangeSlideState<'q> {
     /// the charge larger, which is the safe direction.
     fn member_stage_bytes(
         &self,
-        row: &MetricScanRow,
         scratch: &[(Cow<'_, str>, Cow<'_, str>)],
         stages_out: bool,
     ) -> u64 {
@@ -2576,10 +2562,6 @@ impl<'q> RangeSlideState<'q> {
         const VEC_GROWTH_FACTOR: u64 = 8;
 
         let mut bytes = (size_of::<CollMember>() as u64).saturating_mul(VEC_GROWTH_FACTOR);
-
-        if self.needs_body_order {
-            bytes = bytes.saturating_add(alloc_block_bytes(row.body.len() as u64));
-        }
 
         if stages_out {
             // The rendered JSON, sized exactly, then grown.
@@ -2656,7 +2638,7 @@ impl<'q> RangeSlideState<'q> {
         // `unwrap-same-nanosecond-value-order`); equal values are
         // interchangeable. Skipped entirely for the common
         // order-independent reducers.
-        if self.needs_body_order {
+        if self.needs_value_order {
             members.sort_by(|a, b| a.value.total_cmp(&b.value));
         }
 
@@ -4341,7 +4323,6 @@ mod tests {
         let mut retained = 0u64;
         const TINY_CAP: u64 = 100;
         let member = |v: f64| CollMember {
-            body: String::new(),
             value: v,
             route: RowRoute::Fingerprint,
             base: false,
@@ -4417,7 +4398,6 @@ mod tests {
         let bound = 3 * retention_points_per_sample(RangeAggOp::QuantileOverTime);
         for i in 1..=100i64 {
             let group = [CollMember {
-                body: String::new(),
                 value: i as f64,
                 route: RowRoute::Fingerprint,
                 base: false,
@@ -5579,7 +5559,10 @@ mod tests {
     /// and the staged buffer never exceeds `MAX_TS_COLLISION_GROUP_BYTES`.
     #[test]
     fn collision_group_byte_cap_trips_before_staging_large_bodies() {
-        // An order-DEPENDENT reducer, so bodies are staged for `tie_rank`.
+        // An order-DEPENDENT reducer over a fan-out pipeline, so each member
+        // stages its labels. Issue #624, part 4 (F1) ranks a group by value
+        // and stages no body; a large line's large extracted label is what
+        // the byte cap must stop now.
         let client = ClientAgg {
             pipeline: parse_pipeline(r#"{x="y"} | logfmt | unwrap a"#),
             value: ClientValue::Unwrap,
@@ -5595,12 +5578,12 @@ mod tests {
             RangeSlideState::new(&compiled, &meta, &client, window, None, AggCaps::DEFAULT)
                 .unwrap();
 
-        // 1 MiB bodies at the SAME (fingerprint, ts): only ~8 fit under the
-        // 8 MiB byte cap — far below the 10 000-member cap, so the byte
-        // dimension is what bites.
+        // 1 MiB label values at the SAME (fingerprint, ts): one member's
+        // staged labels already approach the 8 MiB byte cap — far below the
+        // 10 000-member cap, so the byte dimension is what bites.
         let big = "x".repeat(1024 * 1024);
         let rows: Vec<MetricScanRow> = (0..64)
-            .map(|_| scan_row(Fingerprint::from_raw(1), 5, &format!("a=1 {big}")))
+            .map(|_| scan_row(Fingerprint::from_raw(1), 5, &format!("a=1 big={big}")))
             .collect();
         match state.push_rows(&rows) {
             Err(ReadError::QueryTooBroad(TooBroadReason::TsCollisionGroup {
@@ -5792,7 +5775,7 @@ mod tests {
     /// Review round 4, finding 1: the byte cap covers the FAN-OUT staging
     /// (rendered label JSON + cloned `LabelSet`) for a reducer that stages NO
     /// body — the exact hole in the round-3 accounting. Class A
-    /// (`count_over_time`, `needs_body_order == false`) with a label-mutating
+    /// (`count_over_time`, `needs_value_order == false`) with a label-mutating
     /// pipeline extracting huge label values must still trip the byte cap.
     #[test]
     fn collision_group_byte_cap_covers_fan_out_staging_without_bodies() {
@@ -5818,7 +5801,7 @@ mod tests {
             RangeSlideState::new(&compiled, &meta, &client, window, None, AggCaps::DEFAULT)
                 .unwrap();
         assert!(
-            !state.needs_body_order,
+            !state.needs_value_order,
             "the hole was that no body ⇒ nothing was charged"
         );
         // Each line carries a ~1 MiB extracted label VALUE — no body is
@@ -5869,12 +5852,13 @@ mod tests {
         let mut state =
             RangeSlideState::new(&compiled, &meta, &client, window, None, AggCaps::DEFAULT)
                 .unwrap();
-        // ~512 KiB bodies: 5 members charge ~5.3 MiB (the round-7 block
-        // model charges 2× the body clone) — under the 8 MiB cap; the
-        // second chunk's members push the same open group past it.
-        let big = "x".repeat(512 * 1024);
+        // 128 KiB label values: each member's staged labels charge about
+        // 1 MiB (the rendered key grown, the cloned value, each at the
+        // round-7 block model's 2×), so 5 members stay under the 8 MiB cap
+        // and the second chunk's members push the same open group past it.
+        let big = "x".repeat(128 * 1024);
         let chunk: Vec<MetricScanRow> = (0..5)
-            .map(|_| scan_row(Fingerprint::from_raw(1), 5, &format!("a=1 {big}")))
+            .map(|_| scan_row(Fingerprint::from_raw(1), 5, &format!("a=1 big={big}")))
             .collect();
         // First chunk: under the cap, group left OPEN (straddling).
         state.push_rows(&chunk).expect("first chunk under the cap");
@@ -5918,7 +5902,6 @@ mod tests {
         fn staged_capacity(state: &RangeSlideState<'_>) -> u64 {
             let mut n = (state.coll.capacity() * size_of::<CollMember>()) as u64;
             for m in &state.coll {
-                n += m.body.capacity() as u64;
                 if let Some((key, labels)) = &m.out {
                     n += key.capacity() as u64;
                     n += (labels.capacity() * size_of::<(String, String)>()) as u64;
@@ -5985,10 +5968,6 @@ mod tests {
                 m.base && m.out.is_none(),
                 "the fixture must stage a BASE member"
             );
-            assert!(
-                m.body.is_empty() && m.body.capacity() == 0,
-                "a base member retains no body (class A never needs tie_rank order)"
-            );
             let staged = staged_capacity(&st);
             let slot_only = (st.coll.capacity() * size_of::<CollMember>()) as u64;
             assert_eq!(
@@ -6021,14 +6000,12 @@ mod tests {
         let control: String = std::iter::repeat_n('\u{1}', 512).collect();
         struct Fixture {
             name: &'static str,
-            body: String,
             labels: Vec<(String, String)>,
         }
         let fixtures = vec![
             // Worst-case escaping: every value byte renders as six.
             Fixture {
                 name: "all-control-character values",
-                body: "a=1".to_string(),
                 labels: vec![
                     ("k".to_string(), control.clone()),
                     ("kk".to_string(), control.clone()),
@@ -6037,7 +6014,6 @@ mod tests {
             // Minimum-block worst case: 64 one-byte keys and values.
             Fixture {
                 name: "many one-byte labels",
-                body: "a=1".to_string(),
                 labels: (0..64u32)
                     .map(|i| {
                         (
@@ -6047,16 +6023,14 @@ mod tests {
                     })
                     .collect(),
             },
-            // No labels at all (charge must still cover the slot + body).
+            // No labels at all (charge must still cover the slot).
             Fixture {
                 name: "no labels",
-                body: "a=1 ".repeat(300),
                 labels: Vec::new(),
             },
             // Mixed escapes and multi-byte UTF-8.
             Fixture {
                 name: "mixed escapes and multi-byte",
-                body: "a=1".to_string(),
                 labels: vec![
                     ("q\"k".to_string(), "v\\\n\t\u{7}".to_string()),
                     ("日本".to_string(), "🚀".repeat(40)),
@@ -6064,22 +6038,24 @@ mod tests {
             },
         ];
 
-        for Fixture { name, body, labels } in &fixtures {
+        for Fixture { name, labels } in &fixtures {
             let mut state =
                 RangeSlideState::new(&compiled, &meta, &client, window, None, AggCaps::DEFAULT)
                     .unwrap();
-            assert!(state.needs_body_order, "{name}: bodies must be staged");
+            assert!(
+                state.needs_value_order,
+                "{name}: an order-dependent reducer"
+            );
             assert!(state.fan_out, "{name}: label output must be staged");
             // Enough members to force `coll` to grow through several
             // capacity doublings (4 → 8 → 16 → 32).
             for _ in 0..20 {
-                let row = scan_row(Fingerprint::from_raw(1), 5, body);
                 let mut scratch: Vec<(Cow<'_, str>, Cow<'_, str>)> = labels
                     .iter()
                     .map(|(k, v)| (Cow::Borrowed(k.as_str()), Cow::Borrowed(v.as_str())))
                     .collect();
                 state
-                    .stage_member(&row, 1.0, RowRoute::Labels, false, &mut scratch)
+                    .stage_member(1.0, RowRoute::Labels, false, &mut scratch)
                     .expect("staged");
                 assert!(
                     state.coll_bytes >= staged_capacity(&state),
@@ -6127,9 +6103,8 @@ mod tests {
         let window = slide_window(0, 100, 10, 30);
         let state = RangeSlideState::new(&compiled, &meta, &client, window, None, AggCaps::DEFAULT)
             .unwrap();
-        assert!(!state.needs_body_order && !state.fan_out);
-        let row = scan_row(Fingerprint::from_raw(1), 5, "x");
-        let slot_charge = state.member_stage_bytes(&row, &[], false);
+        assert!(!state.needs_value_order && !state.fan_out);
+        let slot_charge = state.member_stage_bytes(&[], false);
 
         let slot = size_of::<CollMember>() as u64;
         let mut cap: u64 = 0;
@@ -6439,7 +6414,6 @@ mod tests {
                 RangeSlideState::new(&compiled, &meta, &client, window, None, AggCaps::DEFAULT)
                     .unwrap();
             assert!(state.fan_out, "{name}: must be the fan-out path");
-            let row = scan_row(Fingerprint::from_raw(1), 5, "a=1");
             let mut scratch: Vec<(Cow<'_, str>, Cow<'_, str>)> = labels
                 .iter()
                 .map(|(k, v)| (Cow::Borrowed(k.as_str()), Cow::Borrowed(v.as_str())))
@@ -6448,7 +6422,7 @@ mod tests {
             state.coll_fp = Fingerprint::from_raw(1);
             state.coll_ts = 5;
             state
-                .stage_member(&row, 1.0, RowRoute::Labels, false, &mut scratch)
+                .stage_member(1.0, RowRoute::Labels, false, &mut scratch)
                 .expect("staged");
             state.flush_collision(&HashMap::new()).expect("flushed");
             assert_eq!(state.groups.len(), 1, "{name}: one retained group");

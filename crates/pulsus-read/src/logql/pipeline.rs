@@ -3435,7 +3435,7 @@ const DURATION_UNITS: &[(&str, f64)] = &[
 /// (`kb`,`kib`,…), the empty suffix (a bare number is a byte count), and
 /// the exa tier (`e`/`eb`=1e18, `ei`/`eib`=2^60). Decimal factors are
 /// powers of 1000; binary factors powers of 1024.
-const BYTES_UNITS: &[(&str, f64)] = &[
+pub(in crate::logql) const BYTES_UNITS: &[(&str, f64)] = &[
     ("", 1.0),
     ("b", 1.0),
     ("k", 1e3),

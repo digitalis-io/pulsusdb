@@ -13,16 +13,27 @@
 //!        kept                            -> the point (bucket_ns, r), finished per reducer
 //! ```
 
-use std::collections::HashMap;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap};
 
-use pulsus_model::Fingerprint;
+use pulsus_logql::RangeAggOp;
+use pulsus_model::{Fingerprint, FpLiteral};
 
 use super::agg::LabelSet;
-use super::charge::AggCaps;
+use super::charge::{
+    AggCaps, MUT_GROUP_SLOT, SERIES_OUT_SLOT, charge_group_bytes, charge_result_points,
+    group_entry_bytes,
+};
+use super::client_agg::{RowRoute, check_surviving_error, rate_counter_extrapolate, row_route};
 use super::error::ReadError;
-use super::exec::MatrixSeries;
-use super::rows::MetricReducedRow;
-use super::sql::ReducedUnwrap;
+use super::exec::{MatrixSeries, apply_rate};
+use super::labels::{
+    StructuredMetadataCtx, merge_labels_with_structured_metadata_pairs, render_labels_json_sorted,
+    series_labels, stream_hash,
+};
+use super::pipeline::{CompiledPipeline, MetricRun, RangeGrouping, RangeStepRules};
+use super::rows::{MetricReducedRow, StreamMetaRow};
+use super::sql::{KeyMode, ReducedKeyColumns, ReducedUnwrap};
 
 /// The grid and divisors one reduced fold emits on (issue #624, part 4).
 #[derive(Debug, Clone, Copy)]
@@ -33,8 +44,8 @@ pub(in crate::logql) struct ReducedGrid {
     pub grid_points: u64,
     /// The `[range]` width, which `rate_counter` extrapolates over.
     pub range_ns: i64,
-    /// The divisor `rate` and `rate_counter` take at the range step: `None`
-    /// for a `rate` under a parent `sum`, which divides after the sum.
+    /// The divisor `rate` takes at the range step: `None` under a parent
+    /// `sum`, which divides after the sum.
     pub rate_window_ns: Option<u64>,
 }
 
@@ -47,9 +58,162 @@ pub(in crate::logql) enum ReducedPush {
     Stop,
 }
 
-/// The lowered `| unwrap` fold (issue #624, part 4).
+/// A resolved stream set's key columns, and the labels each class's keys
+/// start from (issue #624, part 4, §3.2).
+#[derive(Debug)]
+pub(in crate::logql) struct ResolvedReduced {
+    pub columns: ReducedKeyColumns,
+    /// Class id (a fingerprint when every stream is its own class) -> the
+    /// labels a key of that class starts from: in keep mode the class's
+    /// labels on `L`; in drop mode one member's full stream labels.
+    pub class_labels: HashMap<Fingerprint, LabelSet>,
+    /// The hydrated fingerprints, ascending: the statement reads these only.
+    pub fingerprints: Vec<Fingerprint>,
+}
+
+/// Groups the hydrated streams into classes and decides what the statement
+/// reads of each (issue #624, part 4, §3.2).
+///
+/// - Keep mode (`by (L)`): one class per set of stream labels on `L`; a
+///   metadata name in `L` is blanked on the streams carrying it as a stream
+///   label, whose value the answer reads instead.
+/// - Drop mode (no grouping, or `without (L)`, `E` = `x` and `L`): each
+///   fingerprint is its own class unless a stream carries a name in `E`;
+///   then streams are one class when they agree on every label outside `E`
+///   and carry the same names of `E`. A metadata name in `E` is kept on the
+///   streams carrying it as a stream label, where it becomes
+///   `<name>_extracted`, which the grouping does not remove.
+pub(in crate::logql) fn resolve(
+    value: &ReducedUnwrap,
+    meta: &HashMap<Fingerprint, StreamMetaRow>,
+) -> ResolvedReduced {
+    let mut fingerprints: Vec<Fingerprint> = meta.keys().copied().collect();
+    fingerprints.sort_unstable();
+    let stream_labels: HashMap<Fingerprint, LabelSet> =
+        meta.iter().map(|(fp, m)| (*fp, series_labels(m))).collect();
+    let carries = |fp: &Fingerprint, name: &str| stream_labels[fp].iter().any(|(k, _)| k == name);
+    let names: &[String] = match &value.mode {
+        KeyMode::Keep(l) | KeyMode::Drop(l) => l,
+    };
+    let blank: Vec<(String, Vec<FpLiteral>)> = names
+        .iter()
+        .map(|n| {
+            let fps = fingerprints
+                .iter()
+                .filter(|fp| carries(fp, n))
+                .copied()
+                .map(Fingerprint::sql_literal)
+                .collect();
+            (n.clone(), fps)
+        })
+        .collect();
+    let (classes, class_labels) = match &value.mode {
+        KeyMode::Keep(l) => {
+            super::unwrap_group::group_into_classes(&fingerprints, &stream_labels, |k| {
+                l.iter().any(|n| n == k)
+            })
+        }
+        KeyMode::Drop(e)
+            if !fingerprints
+                .iter()
+                .any(|fp| e.iter().any(|n| carries(fp, n))) =>
+        {
+            (None, stream_labels.clone())
+        }
+        KeyMode::Drop(e) => {
+            // The labels outside `E`, and a marker for each name of `E` the
+            // stream carries: a NUL cannot begin a label name, so a marker
+            // never meets a label.
+            let keyed: HashMap<Fingerprint, LabelSet> = stream_labels
+                .iter()
+                .map(|(fp, labels)| {
+                    let mut k: LabelSet = labels
+                        .iter()
+                        .filter(|(n, _)| !e.contains(n))
+                        .cloned()
+                        .collect();
+                    k.extend(
+                        labels
+                            .iter()
+                            .filter(|(n, _)| e.contains(n))
+                            .map(|(n, _)| (format!("\0{n}"), String::new())),
+                    );
+                    k.sort();
+                    (*fp, k)
+                })
+                .collect();
+            let (classes, by_class) =
+                super::unwrap_group::group_into_classes(&fingerprints, &keyed, |_| true);
+            let mut first: BTreeMap<&LabelSet, Fingerprint> = BTreeMap::new();
+            for fp in &fingerprints {
+                first.entry(&keyed[fp]).or_insert(*fp);
+            }
+            let class_labels = by_class
+                .iter()
+                .map(|(id, k)| (*id, stream_labels[&first[k]].clone()))
+                .collect();
+            (classes, class_labels)
+        }
+    };
+    let hashes = if classes
+        .as_ref()
+        .is_some_and(|c| c.iter().any(|members| members.len() > 1))
+    {
+        fingerprints
+            .iter()
+            .map(|fp| (fp.sql_literal(), stream_hash(&stream_labels[fp])))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    ResolvedReduced {
+        columns: ReducedKeyColumns {
+            classes,
+            hashes,
+            blank,
+        },
+        class_labels,
+        fingerprints,
+    }
+}
+
+/// What the stages made of the last key: its rows are skipped, or they are
+/// points of the series under this rendered key.
+enum Memo {
+    Dropped,
+    Series(String),
+}
+
+/// The lowered `| unwrap` fold (issue #624, part 4, §4).
+///
+/// **Today's route, once per key.** Every line of a key `(c, kv, e)` has the
+/// key's labels, so the stages today's route runs per line give each line
+/// of the key the same answer; they run here once, over the key's labels,
+/// the unwrapped label set to `"0"` (or to `"x"`, which fails every
+/// conversion, when the key's values failed). The rows of one key arrive
+/// together, so only the last key's outcome is remembered.
+///
+/// **Charged by today's route's rule** for the same outcome
+/// (`client_agg.rs`'s `row_route`): each new output series is charged its
+/// label bytes and one grid of points before it is created.
 pub(in crate::logql) struct ReducedFold {
+    compiled: CompiledPipeline,
+    grouping: Option<RangeGrouping>,
+    step: RangeStepRules,
+    fan_out: bool,
+    reducer: RangeAggOp,
+    quantile: Option<f64>,
+    label: String,
+    class_labels: HashMap<Fingerprint, LabelSet>,
     grid: ReducedGrid,
+    caps: AggCaps,
+    charged: u64,
+    points: u64,
+    series: HashMap<String, (LabelSet, Vec<Option<f64>>)>,
+    memo: Option<(u128, Vec<(String, String)>, u8, Memo)>,
+    merge_buf: Vec<(String, String)>,
+    pairs: Vec<(String, String)>,
+    sm_ctx: StructuredMetadataCtx,
 }
 
 impl ReducedFold {
@@ -62,22 +226,202 @@ impl ReducedFold {
         grid: ReducedGrid,
         vector_aggs: &[super::plan::VectorAggSpec],
     ) -> Result<Self, ReadError> {
-        let _ = (value, class_labels, caps, vector_aggs);
-        Ok(ReducedFold { grid })
+        let compiled = CompiledPipeline::compile(&value.key_stages)?;
+        let grouping = value.todays_route.grouping.as_deref().cloned();
+        let step = super::plan::range_step_rules(
+            value.todays_route.range_op,
+            &value.todays_route.pipeline,
+            grouping.as_ref(),
+            vector_aggs,
+        );
+        let fan_out = compiled.metric_mutates_labels() || grouping.is_some();
+        Ok(ReducedFold {
+            compiled,
+            grouping,
+            step,
+            fan_out,
+            reducer: value.reducer,
+            quantile: value.quantile,
+            label: value.label.clone(),
+            class_labels,
+            grid,
+            caps,
+            charged: 0,
+            points: 0,
+            series: HashMap::new(),
+            memo: None,
+            merge_buf: Vec::new(),
+            pairs: Vec::new(),
+            sm_ctx: StructuredMetadataCtx::default(),
+        })
     }
 
-    /// Folds one row.
+    /// Folds one row. A row outside the emit grid is no point (the
+    /// statement's scan ends at the query's end, which need not be on the
+    /// grid); a cap is today's route's refusal at the same cap.
     pub(in crate::logql) fn push(
         &mut self,
         row: &MetricReducedRow,
     ) -> Result<ReducedPush, ReadError> {
-        let _ = (row, self.grid);
+        if row.bucket_ns < self.grid.grid_start_ns || row.bucket_ns > self.grid.end_ns {
+            return Ok(ReducedPush::Folded);
+        }
+        let fresh = !matches!(&self.memo, Some((c, kv, e, _))
+            if *c == row.c && *kv == row.kv && *e == row.e);
+        if fresh {
+            let outcome = match self.key_outcome(row)? {
+                Some(outcome) => outcome,
+                None => return Ok(ReducedPush::Stop),
+            };
+            self.memo = Some((row.c, row.kv.clone(), row.e, outcome));
+        }
+        let Some((_, _, _, Memo::Series(key))) = &self.memo else {
+            return Ok(ReducedPush::Folded);
+        };
+        let slot = slot_of(&self.grid, row.bucket_ns)?;
+        let value = self.point_value(row);
+        let cell = self
+            .series
+            .get_mut(key)
+            .and_then(|(_, slots)| slots.get_mut(slot))
+            .ok_or_else(|| off_grid(row.bucket_ns))?;
+        *cell = Some(value);
         Ok(ReducedPush::Folded)
     }
 
-    /// The series, in label order.
+    /// What the stages make of a new key: `Some(Dropped)`, `Some(Series)`
+    /// with the series created and charged, or `None` to stop.
+    fn key_outcome(&mut self, row: &MetricReducedRow) -> Result<Option<Memo>, ReadError> {
+        let ReducedFold {
+            compiled,
+            grouping,
+            step,
+            fan_out,
+            label,
+            class_labels,
+            merge_buf,
+            pairs,
+            sm_ctx,
+            ..
+        } = self;
+        let Some(base) = class_labels.get(&Fingerprint::from_raw(row.c)) else {
+            return Ok(Some(Memo::Dropped));
+        };
+        pairs.clear();
+        pairs.extend(row.kv.iter().filter(|(_, v)| !v.is_empty()).cloned());
+        pairs.push((
+            label.clone(),
+            if row.e == 1 { "x" } else { "0" }.to_string(),
+        ));
+        merge_labels_with_structured_metadata_pairs(base, pairs, merge_buf, sm_ctx);
+        let mut scratch: Vec<(Cow<'_, str>, Cow<'_, str>)> = Vec::new();
+        let run = compiled.run_metric_step_into(
+            "",
+            merge_buf,
+            0,
+            sm_ctx,
+            grouping.as_ref(),
+            step,
+            &mut scratch,
+        )?;
+        if matches!(run, MetricRun::Dropped) {
+            return Ok(Some(Memo::Dropped));
+        }
+        if row.e == 1 || check_surviving_error(&scratch).is_err() {
+            return Ok(None);
+        }
+        let slot = match row_route(*fan_out, false, &scratch, base) {
+            RowRoute::Fingerprint => SERIES_OUT_SLOT,
+            RowRoute::Labels => MUT_GROUP_SLOT,
+        };
+        scratch.sort_unstable();
+        let key = render_labels_json_sorted(&scratch);
+        if self.series.contains_key(&key) {
+            // Another key's samples belong to this series' windows.
+            return Ok(None);
+        }
+        let labels: LabelSet = scratch
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        charge_group_bytes(
+            &mut self.charged,
+            group_entry_bytes(&key, &labels, slot),
+            self.caps.group_bytes,
+        )?;
+        charge_result_points(
+            &mut self.points,
+            self.grid.grid_points,
+            self.caps.result_points,
+        )?;
+        let width = usize::try_from(self.grid.grid_points).map_err(|_| off_grid(row.bucket_ns))?;
+        self.series.insert(key.clone(), (labels, vec![None; width]));
+        Ok(Some(Memo::Series(key)))
+    }
+
+    /// The point a window's row gives, finished per reducer.
+    fn point_value(&self, row: &MetricReducedRow) -> f64 {
+        match self.reducer {
+            RangeAggOp::Rate => apply_rate(row.r, self.grid.rate_window_ns),
+            RangeAggOp::StddevOverTime => row.r.sqrt(),
+            RangeAggOp::QuantileOverTime => match self.quantile {
+                Some(q) if q < 0.0 => f64::NEG_INFINITY,
+                Some(q) if q > 1.0 => f64::INFINITY,
+                _ => row.r,
+            },
+            RangeAggOp::RateCounter => rate_counter_extrapolate(
+                row.n,
+                row.t1,
+                row.v1,
+                row.t2,
+                row.r,
+                row.bucket_ns,
+                u64::try_from(self.grid.range_ns).ok(),
+            ),
+            _ => row.r,
+        }
+    }
+
+    /// The series, in label order, each its points ascending.
     pub(in crate::logql) fn finish(self) -> Vec<MatrixSeries> {
-        Vec::new()
+        let (grid_start_ns, step_ns) = (self.grid.grid_start_ns, self.grid.step_ns);
+        let mut series: Vec<(LabelSet, Vec<Option<f64>>)> = self.series.into_values().collect();
+        series.sort_by(|a, b| a.0.cmp(&b.0));
+        series
+            .into_iter()
+            .map(|(labels, slots)| MatrixSeries {
+                labels,
+                points: slots
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(k, v)| {
+                        Some((
+                            grid_start_ns.saturating_add((k as i64).saturating_mul(step_ns)),
+                            v?,
+                        ))
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+}
+
+/// The slot a row inside `[grid_start, end]` folds into; a row there that is
+/// not on the grid is an internal defect of the statement.
+fn slot_of(grid: &ReducedGrid, bucket_ns: i64) -> Result<usize, ReadError> {
+    let offset = i128::from(bucket_ns) - i128::from(grid.grid_start_ns);
+    let step = i128::from(grid.step_ns);
+    if step <= 0 || offset % step != 0 {
+        return Err(off_grid(bucket_ns));
+    }
+    usize::try_from(offset / step).map_err(|_| off_grid(bucket_ns))
+}
+
+fn off_grid(t: i64) -> ReadError {
+    ReadError::PipelineInvalid {
+        reason: format!(
+            "internal: the reduced range fold received a row at {t} off the query grid"
+        ),
     }
 }
 
