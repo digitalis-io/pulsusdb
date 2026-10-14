@@ -3498,9 +3498,109 @@ pub(crate) fn parse_duration_seconds(raw: &str) -> Option<f64> {
 }
 
 /// Go's `time.ParseDuration` then `Duration.Seconds()`: the reference's
-/// `convertDuration` (issue #624, part 4).
+/// `convertDuration` (issue #624, part 4, F2). The value is an integer count
+/// of nanoseconds, each component's fraction scaled into it as Go scales it,
+/// and the seconds are `whole + remainder / 1e9`, two roundings as Go's.
+/// [`parse_duration_seconds`] stays for query literals and `detected.rs`.
 pub(crate) fn go_duration_seconds(raw: &str) -> Option<f64> {
-    parse_duration_seconds(raw)
+    const UNITS: [(&str, u64); 8] = [
+        ("ns", 1),
+        ("us", 1_000),
+        ("\u{b5}s", 1_000),
+        ("\u{3bc}s", 1_000),
+        ("ms", 1_000_000),
+        ("s", 1_000_000_000),
+        ("m", 60_000_000_000),
+        ("h", 3_600_000_000_000),
+    ];
+    const L: u64 = 1 << 63;
+    let (neg, mut s) = match raw.as_bytes().first() {
+        Some(b'-') => (true, &raw[1..]),
+        Some(b'+') => (false, &raw[1..]),
+        _ => (false, raw),
+    };
+    if s == "0" {
+        return Some(0.0);
+    }
+    if s.is_empty() {
+        return None;
+    }
+    let mut d: u64 = 0;
+    while !s.is_empty() {
+        let b = s.as_bytes();
+        if !(b[0] == b'.' || b[0].is_ascii_digit()) {
+            return None;
+        }
+        let (mut i, mut v) = (0, 0u64);
+        while i < b.len() && b[i].is_ascii_digit() {
+            if v > L / 10 {
+                return None;
+            }
+            v = v * 10 + u64::from(b[i] - b'0');
+            if v > L {
+                return None;
+            }
+            i += 1;
+        }
+        let pre = i > 0;
+        s = &s[i..];
+        let (mut f, mut scale, mut post) = (0u64, 1.0f64, false);
+        if s.starts_with('.') {
+            s = &s[1..];
+            let (b, mut j, mut over) = (s.as_bytes(), 0, false);
+            while j < b.len() && b[j].is_ascii_digit() {
+                if !over {
+                    if f > (L - 1) / 10 {
+                        over = true;
+                    } else {
+                        let y = f * 10 + u64::from(b[j] - b'0');
+                        if y > L {
+                            over = true;
+                        } else {
+                            f = y;
+                            scale *= 10.0;
+                        }
+                    }
+                }
+                j += 1;
+            }
+            post = j > 0;
+            s = &s[j..];
+        }
+        if !pre && !post {
+            return None;
+        }
+        let end = s
+            .find(|c: char| c == '.' || c.is_ascii_digit())
+            .unwrap_or(s.len());
+        if end == 0 {
+            return None;
+        }
+        let unit = UNITS.iter().find(|(n, _)| *n == &s[..end])?.1;
+        s = &s[end..];
+        if v > L / unit {
+            return None;
+        }
+        v *= unit;
+        if f > 0 {
+            v += (f as f64 * (unit as f64 / scale)) as u64;
+            if v > L {
+                return None;
+            }
+        }
+        d += v;
+        if d > L {
+            return None;
+        }
+    }
+    let d = if neg {
+        (d as i64).wrapping_neg()
+    } else if d > L - 1 {
+        return None;
+    } else {
+        d as i64
+    };
+    Some((d / 1_000_000_000) as f64 + (d % 1_000_000_000) as f64 / 1e9)
 }
 
 /// Parses a bytes quantity to f64 bytes — a faithful port of
@@ -3610,7 +3710,9 @@ pub(crate) fn parse_bytes_value(raw: &str) -> Option<f64> {
 fn convert_label_value(kind: UnitKind, value: &str) -> Option<f64> {
     match kind {
         UnitKind::Number => value.parse().ok(),
-        UnitKind::Duration => parse_duration_seconds(value),
+        // Issue #624, part 4 (F2): Go's own parse, so a value converts to
+        // the reference's bits on every route.
+        UnitKind::Duration => go_duration_seconds(value),
         // Route entirely through the humanize port: a bare number is the
         // empty-suffix table entry, so the old `value.parse` short-circuit
         // (which bypassed uint64 truncation for e.g. `1.5`) is dropped

@@ -271,13 +271,20 @@ pub(in crate::logql) struct SimpleAcc {
     /// Welford's mean, feeding `m2` for `stddev`/`stdvar` only.
     w_mean: f64,
     m2: f64,
-    /// The `(timestamp, stream_hash)` key of the current `first`/`last`
-    /// candidate — see [`SimpleAcc::add`] for why `tie_rank` needs no
-    /// field.
-    first_key: (i64, u64),
+    /// The `(timestamp, stream_hash, value)` key of the current
+    /// `first`/`last` candidate, the value as its total-order bits (issue
+    /// #624, part 4, F1) — see [`SimpleAcc::add`].
+    first_key: (i64, u64, i64),
     first_v: f64,
-    last_key: (i64, u64),
+    last_key: (i64, u64, i64),
     last_v: f64,
+}
+
+/// `v`'s position in `f64::total_cmp`'s order, as an `i64` that orders the
+/// same way (issue #624, part 4, F1).
+fn total_order_bits(v: f64) -> i64 {
+    let bits = v.to_bits() as i64;
+    bits ^ ((((bits >> 63) as u64) >> 1) as i64)
 }
 
 impl SimpleAcc {
@@ -297,9 +304,9 @@ impl SimpleAcc {
             avg_mean: 0.0,
             w_mean: 0.0,
             m2: 0.0,
-            first_key: (ts_ns, stream_hash),
+            first_key: (ts_ns, stream_hash, total_order_bits(v)),
             first_v: v,
-            last_key: (ts_ns, stream_hash),
+            last_key: (ts_ns, stream_hash, total_order_bits(v)),
             last_v: v,
         };
         acc.fold(v);
@@ -362,13 +369,12 @@ impl SimpleAcc {
     /// stream labels (`pkg/chunkenc/memchunk.go:1922`) — the same
     /// [`win_order`] the sliding path has folded in since issue #227.
     ///
-    /// **`tie_rank` needs no field here.** It only separates samples of
-    /// the SAME stream at the SAME nanosecond, and `metric_raw_samples`
-    /// delivers those in `ORDER BY timestamp_ns, fingerprint, body` —
-    /// ascending body, which is exactly the group-local `tie_rank` the
-    /// sliding path assigns. So `<` for `first` (keep the earliest
-    /// arrival on an exact key tie) and `>=` for `last` (take the latest)
-    /// reproduce the full three-key order from the scan's own sequence.
+    /// **Samples of the SAME stream at the SAME nanosecond are ordered by
+    /// value** (issue #624, part 4, F1, ledger
+    /// `unwrap-same-nanosecond-value-order`): the value is the key's third
+    /// element, so the order is total and no arrival order can move it.
+    /// `<` for `first` and `>=` for `last` keep one of two equal keys,
+    /// which are the same value.
     ///
     /// The predecessor rule — smallest value at the minimum timestamp,
     /// largest at the maximum — was adopted because the reference's
@@ -378,7 +384,7 @@ impl SimpleAcc {
     /// `last_over_time(…) by (fp)` answers 5 where the value rule gives 7.
     fn add(&mut self, ts_ns: i64, stream_hash: u64, v: f64) {
         self.fold(v);
-        let key = (ts_ns, stream_hash);
+        let key = (ts_ns, stream_hash, total_order_bits(v));
         if key < self.first_key {
             self.first_key = key;
             self.first_v = v;
@@ -472,47 +478,26 @@ impl BucketAcc {
     }
 }
 
-/// `rate_counter` reducer — a bit-exact replica of the pinned reference's
+/// `rate_counter` reducer over one window's samples: the reference's
 /// `extrapolatedRate(samples, selRange, isCounter=true, isRate=true)`
-/// (grafana/loki v3.7.3, `pkg/logql/range_vector.go`), replayed over
-/// PulsusDB's nanosecond timestamps.
+/// (`pkg/logql/range_vector.go:286-353 @ v3.7.4`) with F4's spans (issue
+/// #624, part 4, ledger `rate-counter-window-anchored`) — see
+/// [`rate_counter_extrapolate`].
 ///
-/// Two load-bearing quirks make this diverge from a plain
-/// `reset-aware increase / range.Seconds()`:
-///  1. The reference's window iterators store sample timestamps in
-///     nanoseconds, but `extrapolatedRate` divides every span by `1000`
-///     (`durationMilliseconds`) — treating those ns values as ms. We keep
-///     PulsusDB's ns timestamps and divide by `1000` identically, so the
-///     unit-mix is reproduced rather than corrected.
-///  2. The extrapolation window is anchored on the FIRST sample, not the
-///     query step: `rangeStart = samples[0].T - durationMilliseconds(selRange)`,
-///     `rangeEnd = samples[last].T`. So `durationToEnd == 0` and
-///     `durationToStart == selRange_ms/1000 == 60.0` for a `[1m]` window —
-///     the factor is `1 + 60000/span_ns` (~1.00006), NOT PromQL's ~6x
-///     full-range extrapolation.
-///
-/// Samples are ordered by timestamp with a STABLE sort (no value
-/// tie-break): duplicate-timestamp samples keep their delivered scan order
-/// — the deterministic SQL scan order `ORDER BY timestamp_ns, fingerprint,
-/// body` (`metric_raw_samples`) — matching the reference, which processes
-/// same-timestamp unwrapped samples in storage/scan order rather than
-/// re-sorting them by value (branch-validated: `5, 10, 3, 12` with `10`/`3`
-/// tied at one timestamp yields increase 17 / `0.2833…`, not the 12 / 0.2 an
-/// ascending-value sort would give).
-///
-/// The reset-aware increase is accumulated in the reference's own order
-/// (`resultValue = last - first; for s { if s < lastValue { resultValue +=
-/// lastValue } }`), which is the bit-exact form to match. The reference
-/// EMITS `0.0` for `<2`-point groups (verified against grafana/loki:3.7.3 —
-/// a lone sample returns value `"0"`), so we return `0.0` and let `finish`
-/// surface it as a 0-valued vector element; we do NOT drop the group.
+/// Samples are ordered by timestamp with a STABLE sort: samples at one
+/// timestamp keep the order they arrived in, which both callers make
+/// `(stream_hash, value)` (F1). The reset-aware increase is accumulated in
+/// the reference's own order (`resultValue = last - first; for s { if s <
+/// lastValue { resultValue += lastValue } }`). A window with fewer than
+/// two samples answers `0.0`, as the reference's does; the group is not
+/// dropped.
 fn rate_counter_extrapolated(
     mut pts: Vec<(i64, f64)>,
     rate_window_ns: Option<u64>,
-    _window_end_ns: i64,
+    window_end_ns: i64,
 ) -> f64 {
     pts.sort_by(|(at, _), (bt, _)| at.cmp(bt));
-    rate_counter_over_sorted(pts.len(), |i| pts[i], rate_window_ns)
+    rate_counter_over_sorted(pts.len(), |i| pts[i], rate_window_ns, window_end_ns)
 }
 
 /// [`rate_counter_extrapolated`]'s body over an ALREADY timestamp-sorted
@@ -528,53 +513,81 @@ fn rate_counter_extrapolated(
 /// round 5, finding 2). Values are read straight out of the window instead.
 /// The arithmetic is byte-identical to the owning form; only the storage
 /// differs.
-fn rate_counter_over_sorted<F>(len: usize, at: F, rate_window_ns: Option<u64>) -> f64
+fn rate_counter_over_sorted<F>(
+    len: usize,
+    at: F,
+    rate_window_ns: Option<u64>,
+    window_end_ns: i64,
+) -> f64
 where
     F: Fn(usize) -> (i64, f64),
 {
     if len < 2 {
         return 0.0;
     }
-    let Some(rng_ns) = rate_window_ns.filter(|w| *w > 0) else {
-        return 0.0;
-    };
     let (first_t, first_f) = at(0);
     let (last_t, last_f) = at(len - 1);
-
     // Reset-aware increase in the reference's accumulation order.
-    let mut result_value = last_f - first_f;
+    let mut increase = last_f - first_f;
     let mut last_value = 0.0_f64;
     for i in 0..len {
         let f = at(i).1;
         if f < last_value {
-            result_value += last_value;
+            increase += last_value;
         }
         last_value = f;
     }
+    rate_counter_extrapolate(
+        len as u64,
+        first_t,
+        first_f,
+        last_t,
+        increase,
+        window_end_ns,
+        rate_window_ns,
+    )
+}
 
-    // `durationMilliseconds(selRange)`; window anchored on the first sample.
-    //
-    // Issue #227 review finding 2: every timestamp SPAN is computed in `i128`
-    // before the float conversion. `first_t - sel_range_ms` underflows i64 for
-    // a first sample near `i64::MIN`, and `last_t - first_t` overflows i64 for
-    // a window spanning near-`MIN` to near-`MAX` — both are valid extreme
-    // inputs that would panic in debug / wrap in release. The i128 widening
-    // changes no in-range value (the arithmetic is identical), it only removes
-    // the overflow; the reference's ns-vs-ms unit mix is preserved verbatim.
-    let sel_range_ms: i128 = (rng_ns / 1_000_000) as i128;
-    let range_start = first_t as i128 - sel_range_ms; // ns − ms: the reference's unit mix
-    let mut duration_to_start = (first_t as i128 - range_start) as f64 / 1000.0; // == sel_range_ms/1000
-    let duration_to_end = 0.0_f64; // rangeEnd == last.T ⇒ 0
-    let sampled_interval = (last_t as i128 - first_t as i128) as f64 / 1000.0;
-    let average_duration = sampled_interval / (len - 1) as f64;
-
+/// The extrapolation and division that finish `rate_counter` (issue #624,
+/// part 4, F4, ledger `rate-counter-window-anchored`), shared by today's
+/// route and the lowered statement's fold, which computes `increase`,
+/// `first_t`, `first_f` and `last_t` in the database.
+///
+/// The reference's arithmetic in its order, with every span in seconds,
+/// `(a - b) / 1e9` computed in `i128`, and the window `(window_end - range,
+/// window_end]`: `durationToStart = first_t - (window_end - range)`,
+/// `durationToEnd = window_end - last_t`. The reference divides nanosecond
+/// spans by 1,000 as if they were milliseconds and anchors the window on
+/// its first sample, which docs/reference-defects-we-do-not-copy.md
+/// records (entry 33). Fewer than two samples, or no window, answer `0.0`.
+pub(in crate::logql) fn rate_counter_extrapolate(
+    n: u64,
+    first_t: i64,
+    first_f: f64,
+    last_t: i64,
+    increase: f64,
+    window_end_ns: i64,
+    rate_window_ns: Option<u64>,
+) -> f64 {
+    if n < 2 {
+        return 0.0;
+    }
+    let Some(rng_ns) = rate_window_ns.filter(|w| *w > 0) else {
+        return 0.0;
+    };
+    let seconds = |a: i128, b: i128| (a - b) as f64 / 1e9;
+    let range_start = i128::from(window_end_ns) - i128::from(rng_ns);
+    let mut duration_to_start = seconds(i128::from(first_t), range_start);
+    let duration_to_end = seconds(i128::from(window_end_ns), i128::from(last_t));
+    let sampled_interval = seconds(i128::from(last_t), i128::from(first_t));
+    let average_duration = sampled_interval / (n - 1) as f64;
+    let mut result_value = increase;
     if result_value > 0.0 && first_f >= 0.0 {
         let duration_to_zero = sampled_interval * (first_f / result_value);
         if duration_to_zero < duration_to_start {
             duration_to_start = duration_to_zero;
         }
     }
-
     let threshold = average_duration * 1.1;
     let mut extrapolate_to = sampled_interval;
     extrapolate_to += if duration_to_start < threshold {
@@ -633,6 +646,9 @@ pub(in crate::logql) struct ClientAggState<'q> {
     compiled: &'q super::pipeline::CompiledPipeline,
     client: &'q ClientAgg,
     rate_window_ns: Option<u64>,
+    /// The instant window's end, which `rate_counter` extrapolates to
+    /// (issue #624, part 4, F4).
+    window_end_ns: i64,
     /// Base labels once per fingerprint, in the same shape the SQL
     /// metric path exposes (`series_labels`: canonical JSON labels +
     /// the physical `service` column re-injected as `service_name`,
@@ -717,7 +733,7 @@ impl<'q> ClientAggState<'q> {
         compiled: &'q super::pipeline::CompiledPipeline,
         meta: &HashMap<Fingerprint, StreamMetaRow>,
         client: &'q ClientAgg,
-        _window: InstantWindow,
+        window: InstantWindow,
         rate_window_ns: Option<u64>,
         caps: AggCaps,
     ) -> Result<Self, ReadError> {
@@ -732,6 +748,7 @@ impl<'q> ClientAggState<'q> {
             compiled,
             client,
             rate_window_ns,
+            window_end_ns: window.end_ns(),
             slider_safe: slider_safe_fingerprints(&base_labels),
             base_labels,
             hashes,
@@ -1187,12 +1204,9 @@ impl<'q> ClientAggState<'q> {
 
     /// Folds the staged run in canonical order, then releases it.
     ///
-    /// `sort_by_key` is STABLE, so equal `stream_hash` keeps arrival
-    /// order — and arrival order within one stream is the scan's
-    /// `body`-ascending sequence, which is exactly the group-local
-    /// `tie_rank` the sliding path assigns. Sorting on `stream_hash`
-    /// alone therefore yields the full `(stream_hash, tie_rank)` order
-    /// without storing a rank.
+    /// The order is `(stream_hash, value)` (issue #624, part 4, F1): within
+    /// one stream, samples at one nanosecond fold in ascending value, the
+    /// order the sliding path and the database fold them in.
     fn flush_pending(&mut self, op: RangeAggOp) -> Result<(), ReadError> {
         if self.pending.is_empty() {
             return Ok(());
@@ -1200,7 +1214,11 @@ impl<'q> ClientAggState<'q> {
         let ts = self.pending_ts;
         let mut staged = std::mem::take(&mut self.pending);
         self.pending_bytes = 0;
-        staged.sort_by_key(|p| p.stream_hash);
+        staged.sort_by(|a, b| {
+            a.stream_hash
+                .cmp(&b.stream_hash)
+                .then(a.value.total_cmp(&b.value))
+        });
         let mut result = Ok(());
         for p in staged.drain(..) {
             if result.is_err() {
@@ -1308,13 +1326,14 @@ impl<'q> ClientAggState<'q> {
         );
         let op = self.client.range_op;
         let rate_window_ns = self.rate_window_ns;
+        let window_end_ns = self.window_end_ns;
         let param = self.client.param;
         QueryResult::Vector(
             groups
                 .into_iter()
                 .map(|(labels, acc)| VectorSample {
                     labels,
-                    value: acc.finish(op, rate_window_ns, param, 0),
+                    value: acc.finish(op, rate_window_ns, param, window_end_ns),
                 })
                 .collect(),
         )
@@ -1465,14 +1484,14 @@ pub fn reducer_class(op: RangeAggOp, value: ClientValue) -> ReducerClass {
 }
 
 /// One retained sample in a sliding window. Fixed-width (no body bytes ever
-/// cross into the window — the deterministic full-body order is pre-baked
+/// cross into the window — the deterministic same-stream order is pre-baked
 /// into `tie_rank` at collision-group formation).
 #[derive(Debug, Clone, Copy)]
 pub(in crate::logql) struct WinSample {
     ts: i64,
     stream_hash: u64,
     /// Group-local rank within the same-`(fingerprint, ts)` collision group,
-    /// by ascending full-body bytes (issue #227): the deterministic
+    /// by ascending value (issue #624, part 4, F1): the deterministic
     /// same-stream tiebreak.
     tie_rank: u32,
     value: f64,
@@ -1491,8 +1510,8 @@ const WIN_SAMPLE_MARKER: WinSample = WinSample {
 /// The total order for the class-C fold and first/last argmin/argmax:
 /// `(ts, stream_hash, tie_rank)` — different ts by ts; same ts different
 /// stream by `stream_hash` (Loki-exact cross-stream); same ts same stream
-/// (⇒ one collision group) by `tie_rank` (the ratified deterministic
-/// same-stream divergence).
+/// (⇒ one collision group) by `tie_rank`, ascending value (ledger
+/// `unwrap-same-nanosecond-value-order`).
 fn win_order(a: &WinSample, b: &WinSample) -> std::cmp::Ordering {
     a.ts.cmp(&b.ts)
         .then(a.stream_hash.cmp(&b.stream_hash))
@@ -1500,11 +1519,12 @@ fn win_order(a: &WinSample, b: &WinSample) -> std::cmp::Ordering {
 }
 
 /// One member of a consecutive same-`(fingerprint, timestamp_ns)` collision
-/// run, buffered until the run closes so it can be ranked by full body.
+/// run, buffered until the run closes so it can be ranked by value.
 #[derive(Debug)]
 struct CollMember {
-    /// The raw body bytes — the tiebreak key, held ONLY for the current
-    /// group and dropped once `tie_rank` is assigned.
+    /// The raw body bytes, held ONLY for the current group and dropped once
+    /// `tie_rank` is assigned. The rank is by `value` since issue #624,
+    /// part 4 (F1).
     body: String,
     value: f64,
     /// Where this member's sample belongs, decided per ROW rather than per
@@ -1539,7 +1559,7 @@ fn reduce_window(
     rate_window_ns: Option<u64>,
     run_int: u64,
     ordered: &[WinSample],
-    _window_end_ns: i64,
+    window_end_ns: i64,
 ) -> Option<f64> {
     if ordered.is_empty() {
         return None;
@@ -1578,6 +1598,7 @@ fn reduce_window(
                 ordered.len(),
                 |i| (ordered[i].ts, ordered[i].value),
                 rate_window_ns,
+                window_end_ns,
             ))
         }
         // sum/avg/min/max/stddev/stdvar reuse the instant path's exact
@@ -1942,7 +1963,7 @@ pub(in crate::logql) struct RangeSlideState<'q> {
     /// over per-series results.
     grouping: Option<&'q RangeGrouping>,
     /// Whether the reducer is order-DEPENDENT (class C, or first/last) and so
-    /// needs the full-body `tie_rank` order within a collision group. When
+    /// needs the `tie_rank` order within a collision group. When
     /// false (count/bytes/rate-no-unwrap, min/max/quantile) the body is never
     /// retained — no per-row clone, no per-group sort (the alloc-gate path).
     needs_body_order: bool,
@@ -2578,7 +2599,7 @@ impl<'q> RangeSlideState<'q> {
         bytes
     }
 
-    /// Ranks and dispatches the buffered collision group (full-body order ⇒
+    /// Ranks and dispatches the buffered collision group (value order ⇒
     /// deterministic `tie_rank`), then releases the bodies.
     fn flush_collision(
         &mut self,
@@ -2630,12 +2651,13 @@ impl<'q> RangeSlideState<'q> {
         // staged members, bounded by the collision cap and freed before it
         // returns.
         self.coll_bytes = 0;
-        // A true total order over the group (order-dependent reducers only):
-        // distinct bodies always differ; byte-identical bodies are genuinely
-        // interchangeable. Skipped entirely for the common order-independent
-        // reducers (which never retained a body).
+        // A total order over the group (order-dependent reducers only):
+        // ascending value (issue #624, part 4, F1, ledger
+        // `unwrap-same-nanosecond-value-order`); equal values are
+        // interchangeable. Skipped entirely for the common
+        // order-independent reducers.
         if self.needs_body_order {
-            members.sort_by(|a, b| a.body.as_bytes().cmp(b.body.as_bytes()));
+            members.sort_by(|a, b| a.value.total_cmp(&b.value));
         }
 
         if self.is_absent {
@@ -3507,6 +3529,7 @@ fn instant_leaf_charged_bytes(state: &ClientAggState<'_>) -> u64 {
         reserved_fps: _,
         // Fixed-width scalars — no heap.
         rate_window_ns: _,
+        window_end_ns: _,
         fan_out: _,
         present: _,
         pending_ts: _,
