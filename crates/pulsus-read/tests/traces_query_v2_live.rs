@@ -12807,3 +12807,1159 @@ async fn a_sliced_search_compares_whole_numbers() {
         ("f1 1 [02]; b2 2 [05, 03]", 1, "search_slice")
     );
 }
+
+// =====================================================================
+// Issue #596 part 1 — metrics on `spans`, one statement per request
+// =====================================================================
+
+const MS_NS: i64 = 1_000_000;
+const S_NS: i64 = 1_000_000_000;
+
+/// `L`, in seconds: a whole minute at least five minutes before the test's
+/// `now`, so `spans`' TTL keeps every span the fixtures land.
+fn metrics_l() -> i64 {
+    (now_ns() / S_NS / 60 - 5) * 60
+}
+
+/// One span of a metrics fixture: `(service, span id, start ns, duration
+/// ns)`, all in one trace.
+type MetricSpan = (&'static str, u8, i64, i64);
+
+/// Lands `spans` in one push, one resource per service in order of first
+/// appearance, every span in trace `trace`.
+async fn land_metric_spans(client: &ChClient, trace: u8, spans: &[MetricSpan], tag: &str) {
+    let mut services: Vec<&str> = Vec::new();
+    for (service, ..) in spans {
+        if !services.contains(service) {
+            services.push(service);
+        }
+    }
+    let resource_spans = services
+        .iter()
+        .map(|service| {
+            let of_service = spans
+                .iter()
+                .filter(|(s, ..)| s == service)
+                .map(|(_, id, start, duration)| {
+                    span_of(
+                        vec![trace; 16],
+                        span_id_bytes(*id),
+                        Vec::new(),
+                        "op",
+                        2,
+                        *start,
+                        *duration,
+                        Vec::new(),
+                        0,
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                })
+                .collect();
+            request(service, &format!("{service}-a"), of_service)
+                .resource_spans
+                .into_iter()
+                .next()
+                .expect("one resource")
+        })
+        .collect();
+    let req = ExportTraceServiceRequest { resource_spans };
+    land(client, &req, &format!("{tag}-{}", now_ns())).await;
+}
+
+/// Fixture M: trace `11…11`, six spans in three services.
+fn fixture_m(l: i64) -> Vec<MetricSpan> {
+    let at = |s: i64| (l - 40 + s) * S_NS;
+    vec![
+        ("checkout", 1, at(0), S_NS),
+        ("checkout", 2, at(5), 3 * S_NS),
+        ("checkout", 3, at(10), 2 * S_NS),
+        ("payment", 4, at(15), 4 * S_NS),
+        ("payment", 5, at(20), 5 * S_NS),
+        ("frontend", 6, at(25), 6 * S_NS),
+    ]
+}
+
+/// Fixture K, for ranking: services `a`–`d` with 1 s spans at `t − 30 s`
+/// (a millisecond apart within a bucket) in counts `a 3/1/0/0`, `b
+/// 1/3/0/0`, `c 2/0/0/1`, `d 0/2/0/1` at `t1`–`t4`.
+fn fixture_k(l: i64) -> Vec<MetricSpan> {
+    let t = |i: i64, ms: i64| (l - 240 + 60 * i - 30) * S_NS + ms * MS_NS;
+    vec![
+        ("a", 0x01, t(1, 0), S_NS),
+        ("a", 0x02, t(1, 1), S_NS),
+        ("a", 0x03, t(1, 2), S_NS),
+        ("a", 0x04, t(2, 0), S_NS),
+        ("b", 0x05, t(1, 0), S_NS),
+        ("b", 0x06, t(2, 0), S_NS),
+        ("b", 0x07, t(2, 1), S_NS),
+        ("b", 0x08, t(2, 2), S_NS),
+        ("c", 0x09, t(1, 0), S_NS),
+        ("c", 0x0a, t(1, 1), S_NS),
+        ("c", 0x0b, t(4, 0), S_NS),
+        ("d", 0x0c, t(2, 0), S_NS),
+        ("d", 0x0d, t(2, 1), S_NS),
+        ("d", 0x0e, t(4, 0), S_NS),
+    ]
+}
+
+/// A fresh database holding `spans`, its client, and `L`.
+async fn seed_metrics(
+    test: &str,
+    trace: u8,
+    spans: impl Fn(i64) -> Vec<MetricSpan>,
+) -> (String, ChClient, i64) {
+    let db = pulsus_testkit::test_db(&format!("pulsus_read_it_t596_{test}"));
+    let client = fresh_db(&db).await;
+    let l = metrics_l();
+    land_metric_spans(&client, trace, &spans(l), test).await;
+    (db, client, l)
+}
+
+/// The engine over `db` with series cap `max_series`.
+async fn metrics_engine(db: &str, max_series: u64) -> pulsus_read::TraceEngine {
+    pulsus_read::TraceEngine::new(
+        ChClient::new(client_config(db))
+            .await
+            .expect("connect the engine"),
+        pulsus_read::TraceReadConfig {
+            max_series,
+            ..engine_config()
+        },
+    )
+}
+
+const METRICS_TABLES: pulsus_read::StatementTables<'static> = pulsus_read::StatementTables {
+    spans: "spans",
+    resources: "resources",
+    indexed: &[],
+};
+
+/// The routed plan for `q` over `[start_s, end_s)` at `step_ms`, which must
+/// carry a statement.
+fn routed_plan(
+    engine: &pulsus_read::TraceEngine,
+    q: &str,
+    start_s: i64,
+    end_s: i64,
+    step_ms: i64,
+) -> pulsus_read::RoutedMetricsPlan {
+    let routed = pulsus_read::plan_trace_metrics_routed(
+        &parse_query(q),
+        &pulsus_read::MetricsParams {
+            start_ns: start_s * S_NS,
+            end_ns: end_s * S_NS,
+            step_ms,
+            exemplars: None,
+        },
+        &engine.metrics_ctx(),
+        &METRICS_TABLES,
+    )
+    .unwrap_or_else(|e| panic!("{q}: the routed planner refused: {e}"));
+    assert!(routed.statement().is_some(), "{q}: no statement");
+    routed
+}
+
+type MetricsAnswer = Result<pulsus_read::TraceMetricsResult, pulsus_read::logql::ReadError>;
+
+/// The range answer to `q` over `[start_s, end_s)`, step 60 s.
+async fn range_answer(
+    engine: &pulsus_read::TraceEngine,
+    q: &str,
+    start_s: i64,
+    end_s: i64,
+) -> MetricsAnswer {
+    let routed = routed_plan(engine, q, start_s, end_s, 60_000);
+    engine.metrics_range_routed(&routed).await
+}
+
+/// The instant answer to `q` over `[start_s, end_s)`, step 60 s.
+async fn instant_answer(
+    engine: &pulsus_read::TraceEngine,
+    q: &str,
+    start_s: i64,
+    end_s: i64,
+) -> MetricsAnswer {
+    let routed = routed_plan(engine, q, start_s, end_s, 60_000);
+    engine.metrics_instant_routed(&routed).await
+}
+
+/// A series' labels as `key=value`, joined by `,`.
+fn series_name(s: &pulsus_read::TraceMetricSeries) -> String {
+    s.labels
+        .iter()
+        .map(|l| match &l.value {
+            pulsus_read::MetricLabelValue::Str(v) => format!("{}={v}", l.key),
+            pulsus_read::MetricLabelValue::Double(v) => format!("{}={v}", l.key),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Each series' name and samples, every timestamp in seconds from `L`.
+fn samples_of(out: &MetricsAnswer, l: i64) -> Vec<(String, Vec<(i64, f64)>)> {
+    let out = out
+        .as_ref()
+        .unwrap_or_else(|e| panic!("the metrics read failed: {e}"));
+    out.series
+        .iter()
+        .map(|s| {
+            (
+                series_name(s),
+                s.samples.iter().map(|(t, v)| (t / 1000 - l, *v)).collect(),
+            )
+        })
+        .collect()
+}
+
+/// Each series' name and exemplars: `(trace:id, timestamp ms from L)`.
+fn exemplars_of(out: &MetricsAnswer, l: i64) -> Vec<(String, Vec<(String, i64)>)> {
+    let out = out
+        .as_ref()
+        .unwrap_or_else(|e| panic!("the metrics read failed: {e}"));
+    out.series
+        .iter()
+        .map(|s| {
+            (
+                series_name(s),
+                s.exemplars
+                    .iter()
+                    .map(|e| {
+                        let id = e
+                            .labels
+                            .iter()
+                            .find(|l| l.key == "trace:id")
+                            .map(|l| format!("{:?}", l.value))
+                            .unwrap_or_default();
+                        (id, e.timestamp_ms - l * 1000)
+                    })
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+fn named(rows: &[(&str, &[(i64, f64)])]) -> Vec<(String, Vec<(i64, f64)>)> {
+    rows.iter()
+        .map(|(n, s)| (n.to_string(), s.to_vec()))
+        .collect()
+}
+
+/// The `__bucket` label of a log2 duration bucket, as the engine writes it.
+fn bucket(ns: u64) -> String {
+    format!(
+        "__bucket={}",
+        pulsus_read::traces::log2_histogram::bucket_seconds(ns)
+    )
+}
+
+/// `rate`, `count_over_time` and the four `*_over_time` aggregates over
+/// fixture M.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_five_over_time_aggregates() {
+    skip_unless_live!();
+    let (db, _client, l) = seed_metrics("aggregates", 0x11, fixture_m).await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let mut got = Vec::new();
+    for q in [
+        "{} | rate()",
+        "{} | count_over_time()",
+        "{} | sum_over_time(duration)",
+        "{} | min_over_time(duration)",
+        "{} | max_over_time(duration)",
+        "{} | avg_over_time(duration)",
+    ] {
+        got.push((q, samples_of(&range_answer(&engine, q, l - 60, l).await, l)));
+    }
+    drop_db(&db).await;
+    let want = vec![
+        (
+            "{} | rate()",
+            named(&[("__name__=rate", &[(-60, 0.0), (0, 0.1)])]),
+        ),
+        (
+            "{} | count_over_time()",
+            named(&[("__name__=count_over_time", &[(-60, 0.0), (0, 6.0)])]),
+        ),
+        (
+            "{} | sum_over_time(duration)",
+            named(&[("__name__=sum_over_time", &[(0, 21.0)])]),
+        ),
+        (
+            "{} | min_over_time(duration)",
+            named(&[("__name__=min_over_time", &[(0, 1.0)])]),
+        ),
+        (
+            "{} | max_over_time(duration)",
+            named(&[("__name__=max_over_time", &[(0, 6.0)])]),
+        ),
+        (
+            "{} | avg_over_time(duration)",
+            named(&[("__name__=avg_over_time", &[(0, 3.5)])]),
+        ),
+    ];
+    assert_eq!(got, want);
+}
+
+/// `quantile_over_time`: one series per `p`, in request order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_quantile() {
+    skip_unless_live!();
+    let two_seconds = |l: i64| {
+        fixture_m(l)
+            .into_iter()
+            .map(|(s, id, start, _)| (s, id, start, 2 * S_NS))
+            .collect()
+    };
+    let (db, _client, l) = seed_metrics("quantile_flat", 0x11, two_seconds).await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let flat = samples_of(
+        &range_answer(
+            &engine,
+            "{} | quantile_over_time(duration, 0.5, 0.99)",
+            l - 60,
+            l,
+        )
+        .await,
+        l,
+    );
+    drop_db(&db).await;
+    let (db, _client, l2) = seed_metrics("quantile", 0x11, fixture_m).await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let spread = samples_of(
+        &range_answer(
+            &engine,
+            "{} | quantile_over_time(duration, 0, 1)",
+            l2 - 60,
+            l2,
+        )
+        .await,
+        l2,
+    );
+    drop_db(&db).await;
+    assert_eq!(
+        flat,
+        named(&[
+            ("p=0.5", &[(-60, 0.0), (0, 2.0)]),
+            ("p=0.99", &[(-60, 0.0), (0, 2.0)]),
+        ])
+    );
+    assert_eq!(
+        spread,
+        named(&[
+            ("p=0", &[(-60, 0.0), (0, 1.0)]),
+            ("p=1", &[(-60, 0.0), (0, 6.0)])
+        ])
+    );
+}
+
+/// `histogram_over_time`: one series per occupied power-of-two bucket,
+/// `- 1` keeping 2³¹ ns in its own bucket and `>= 2` dropping 1 ns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_histogram_buckets() {
+    skip_unless_live!();
+    let mh = |l: i64| {
+        let mut spans: Vec<MetricSpan> = fixture_m(l)
+            .into_iter()
+            .map(|(s, id, start, d)| (s, id, start, if id == 3 { 1 << 31 } else { d }))
+            .collect();
+        spans.push(("frontend", 7, (l - 10) * S_NS, 1));
+        spans
+    };
+    let (db, _client, l) = seed_metrics("histogram", 0x11, mh).await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let got = samples_of(
+        &range_answer(&engine, "{} | histogram_over_time(duration)", l - 60, l).await,
+        l,
+    );
+    drop_db(&db).await;
+    let want: Vec<(String, Vec<(i64, f64)>)> = [
+        (1_073_741_824_u64, 1.0),
+        (2_147_483_648, 1.0),
+        (4_294_967_296, 2.0),
+        (8_589_934_592, 2.0),
+    ]
+    .into_iter()
+    .map(|(b, n)| (bucket(b), vec![(-60, 0.0), (0, n)]))
+    .collect();
+    assert_eq!(got, want);
+}
+
+/// The instant forms read the instant window, `[L − 60, L)`: `…08` before
+/// it and `…09` at its end are not counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_instant_forms() {
+    skip_unless_live!();
+    let mi = |l: i64| {
+        let mut spans = fixture_m(l);
+        spans.push(("checkout", 8, (l - 90) * S_NS, S_NS));
+        spans.push(("checkout", 9, l * S_NS, S_NS));
+        spans
+    };
+    let (db, _client, l) = seed_metrics("instant", 0x11, mi).await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let mut got = Vec::new();
+    for q in [
+        "{} | count_over_time()",
+        "{} | avg_over_time(duration) by(resource.service.name)",
+        "{} | quantile_over_time(duration, 0.5, 1)",
+        "{} | histogram_over_time(duration)",
+    ] {
+        got.push(samples_of(&instant_answer(&engine, q, l - 60, l).await, l));
+    }
+    drop_db(&db).await;
+    assert_eq!(got[0], named(&[("__name__=count_over_time", &[(0, 6.0)])]));
+    assert_eq!(
+        got[1],
+        named(&[
+            ("resource.service.name=checkout", &[(0, 2.0)]),
+            ("resource.service.name=frontend", &[(0, 6.0)]),
+            ("resource.service.name=payment", &[(0, 4.5)]),
+        ])
+    );
+    assert_eq!(got[2].len(), 2, "two quantiles: {:?}", got[2]);
+    assert_eq!(got[2][1], ("p=1".to_string(), vec![(0, 6.0)]));
+    let want: Vec<(String, Vec<(i64, f64)>)> = [
+        (1_073_741_824_u64, 1.0),
+        (2_147_483_648, 1.0),
+        (4_294_967_296, 2.0),
+        (8_589_934_592, 2.0),
+    ]
+    .into_iter()
+    .map(|(b, n)| (bucket(b), vec![(0, n)]))
+    .collect();
+    assert_eq!(got[3], want);
+}
+
+/// A window holding no span: an ungrouped count is one series of zeros;
+/// an aggregate, a quantile and a histogram are no series.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_empty_window() {
+    skip_unless_live!();
+    let (db, _client, l) = seed_metrics("empty", 0x11, fixture_m).await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let (start, end) = (l + 600, l + 660);
+    let mut got = Vec::new();
+    for q in [
+        "{} | rate()",
+        "{} | avg_over_time(duration)",
+        "{} | quantile_over_time(duration, 0.5)",
+        "{} | histogram_over_time(duration)",
+    ] {
+        got.push((
+            q,
+            "range",
+            samples_of(&range_answer(&engine, q, start, end).await, l),
+        ));
+    }
+    for q in [
+        "{} | count_over_time()",
+        "{} | sum_over_time(duration)",
+        "{} | avg_over_time(duration)",
+        "{} | quantile_over_time(duration, 0.5, 0.9)",
+    ] {
+        got.push((
+            q,
+            "instant",
+            samples_of(&instant_answer(&engine, q, start, end).await, l),
+        ));
+    }
+    drop_db(&db).await;
+    let want = vec![
+        (
+            "{} | rate()",
+            "range",
+            named(&[("__name__=rate", &[(600, 0.0), (660, 0.0)])]),
+        ),
+        ("{} | avg_over_time(duration)", "range", Vec::new()),
+        (
+            "{} | quantile_over_time(duration, 0.5)",
+            "range",
+            Vec::new(),
+        ),
+        ("{} | histogram_over_time(duration)", "range", Vec::new()),
+        (
+            "{} | count_over_time()",
+            "instant",
+            named(&[("__name__=count_over_time", &[(660, 0.0)])]),
+        ),
+        ("{} | sum_over_time(duration)", "instant", Vec::new()),
+        ("{} | avg_over_time(duration)", "instant", Vec::new()),
+        (
+            "{} | quantile_over_time(duration, 0.5, 0.9)",
+            "instant",
+            Vec::new(),
+        ),
+    ];
+    assert_eq!(got, want);
+}
+
+/// The trailing comparison runs in the statement, and an empty bucket's
+/// `0` passes or fails it as any other value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_trailing_comparison() {
+    skip_unless_live!();
+    let (db, _client, l) = seed_metrics("comparison", 0x11, fixture_m).await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let mut got = Vec::new();
+    for q in [
+        "{} | count_over_time() > 5",
+        "{} | count_over_time() > 6",
+        "{} | count_over_time() < 1",
+        "{} | count_over_time() <= 0",
+    ] {
+        got.push((q, samples_of(&range_answer(&engine, q, l - 60, l).await, l)));
+    }
+    drop_db(&db).await;
+    let want = vec![
+        (
+            "{} | count_over_time() > 5",
+            named(&[("__name__=count_over_time", &[(0, 6.0)])]),
+        ),
+        ("{} | count_over_time() > 6", Vec::new()),
+        (
+            "{} | count_over_time() < 1",
+            named(&[("__name__=count_over_time", &[(-60, 0.0)])]),
+        ),
+        (
+            "{} | count_over_time() <= 0",
+            named(&[("__name__=count_over_time", &[(-60, 0.0)])]),
+        ),
+    ];
+    assert_eq!(got, want);
+}
+
+/// `topk`/`bottomk` rank per timestamp over every series, its empty
+/// buckets included as `0`, after the comparison; ties by label.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ranking_is_per_timestamp_with_zeros() {
+    skip_unless_live!();
+    let (db, _client, l) = seed_metrics("ranking", 0x22, fixture_k).await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let q = "{} | count_over_time() by(resource.service.name)";
+    let mut got = Vec::new();
+    for tail in [" | topk(2)", " | bottomk(2)", " > 0 | bottomk(1)", " > 1"] {
+        let q = format!("{q}{tail}");
+        got.push((
+            tail,
+            samples_of(&range_answer(&engine, &q, l - 240, l).await, l),
+        ));
+    }
+    drop_db(&db).await;
+    let (t0, t1, t2, t3, t4) = (-240, -180, -120, -60, 0);
+    let want = vec![
+        (
+            " | topk(2)",
+            named(&[
+                (
+                    "resource.service.name=a",
+                    &[(t0, 0.0), (t1, 3.0), (t3, 0.0)],
+                ),
+                (
+                    "resource.service.name=b",
+                    &[(t0, 0.0), (t2, 3.0), (t3, 0.0)],
+                ),
+                ("resource.service.name=c", &[(t1, 2.0), (t4, 1.0)]),
+                ("resource.service.name=d", &[(t2, 2.0), (t4, 1.0)]),
+            ]),
+        ),
+        (
+            " | bottomk(2)",
+            named(&[
+                (
+                    "resource.service.name=a",
+                    &[(t0, 0.0), (t2, 1.0), (t3, 0.0), (t4, 0.0)],
+                ),
+                (
+                    "resource.service.name=b",
+                    &[(t0, 0.0), (t1, 1.0), (t3, 0.0), (t4, 0.0)],
+                ),
+                ("resource.service.name=c", &[(t2, 0.0)]),
+                ("resource.service.name=d", &[(t1, 0.0)]),
+            ]),
+        ),
+        (
+            " > 0 | bottomk(1)",
+            named(&[
+                ("resource.service.name=a", &[(t2, 1.0)]),
+                ("resource.service.name=b", &[(t1, 1.0)]),
+                ("resource.service.name=c", &[(t4, 1.0)]),
+            ]),
+        ),
+        (
+            " > 1",
+            named(&[
+                ("resource.service.name=a", &[(t1, 3.0)]),
+                ("resource.service.name=b", &[(t2, 3.0)]),
+                ("resource.service.name=c", &[(t1, 2.0)]),
+                ("resource.service.name=d", &[(t2, 2.0)]),
+            ]),
+        ),
+    ];
+    assert_eq!(got, want);
+}
+
+/// An aggregate is sparse: its ranking sees only the occupied buckets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_aggregate_ranks_occupied_buckets_only() {
+    skip_unless_live!();
+    let (db, _client, l) = seed_metrics("aggregate_rank", 0x22, fixture_k).await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let q = "{} | max_over_time(duration) by(resource.service.name) | topk(1)";
+    let got = samples_of(&range_answer(&engine, q, l - 240, l).await, l);
+    drop_db(&db).await;
+    assert_eq!(
+        got,
+        named(&[
+            ("resource.service.name=a", &[(-180, 1.0), (-120, 1.0)]),
+            ("resource.service.name=c", &[(0, 1.0)]),
+        ])
+    );
+}
+
+fn trace_label(byte: u8) -> String {
+    format!(
+        "{:?}",
+        pulsus_read::MetricLabelValue::Str(format!("{byte:02x}").repeat(16))
+    )
+}
+
+/// `T-A12`: each series' exemplar is its bucket's longest span, the same
+/// on a second run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_exemplar_is_the_longest_span() {
+    skip_unless_live!();
+    let (db, _client, l) = seed_metrics("exemplar", 0x11, fixture_m).await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let q = "{} | rate() by(resource.service.name)";
+    let first = exemplars_of(&range_answer(&engine, q, l - 60, l).await, l);
+    let second = exemplars_of(&range_answer(&engine, q, l - 60, l).await, l);
+    drop_db(&db).await;
+    let t = trace_label(0x11);
+    let want = vec![
+        (
+            "resource.service.name=checkout".to_string(),
+            vec![(t.clone(), -35_000)],
+        ),
+        (
+            "resource.service.name=frontend".to_string(),
+            vec![(t.clone(), -15_000)],
+        ),
+        (
+            "resource.service.name=payment".to_string(),
+            vec![(t.clone(), -20_000)],
+        ),
+    ];
+    assert_eq!(first, want);
+    assert_eq!(second, want, "a second run");
+}
+
+/// Two longest spans of one bucket and series: the larger span id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_span_id_breaks_an_exemplar_tie() {
+    skip_unless_live!();
+    let m2 = |l: i64| {
+        let mut spans = fixture_m(l);
+        spans.push(("frontend", 7, (l - 10) * S_NS, 6 * S_NS));
+        spans
+    };
+    let (db, _client, l) = seed_metrics("exemplar_tie", 0x11, m2).await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let q = "{} | rate() by(resource.service.name)";
+    let got = exemplars_of(&range_answer(&engine, q, l - 60, l).await, l);
+    drop_db(&db).await;
+    let frontend = got
+        .iter()
+        .find(|(n, _)| n == "resource.service.name=frontend")
+        .expect("a frontend series");
+    assert_eq!(frontend.1, vec![(trace_label(0x11), -10_000)]);
+}
+
+/// One exemplar per occupied bucket of an ungrouped count, the bucket's
+/// largest span id; thinned by bucket.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_exemplar_per_occupied_bucket() {
+    skip_unless_live!();
+    let (db, _client, l) = seed_metrics("exemplar_bucket", 0x22, fixture_k).await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let all = exemplars_of(
+        &range_answer(&engine, "{} | count_over_time()", l - 240, l).await,
+        l,
+    );
+    let two = exemplars_of(
+        &range_answer(
+            &engine,
+            "{} | count_over_time() with(exemplars=2)",
+            l - 240,
+            l,
+        )
+        .await,
+        l,
+    );
+    drop_db(&db).await;
+    let t = trace_label(0x22);
+    assert_eq!(
+        all,
+        vec![(
+            "__name__=count_over_time".to_string(),
+            vec![
+                (t.clone(), -209_999),
+                (t.clone(), -149_999),
+                (t.clone(), -30_000)
+            ]
+        )]
+    );
+    assert_eq!(
+        two,
+        vec![(
+            "__name__=count_over_time".to_string(),
+            vec![(t.clone(), -209_999), (t.clone(), -149_999)]
+        )]
+    );
+}
+
+/// The budget is taken over the candidates in bucket order, then series.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exemplars_thin_in_bucket_order() {
+    skip_unless_live!();
+    let (db, _client, l) = seed_metrics("exemplar_order", 0x22, fixture_k).await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let q = "{} | count_over_time() by(resource.service.name) with(exemplars=3)";
+    let got = exemplars_of(&range_answer(&engine, q, l - 240, l).await, l);
+    drop_db(&db).await;
+    let t = trace_label(0x22);
+    assert_eq!(
+        got,
+        vec![
+            (
+                "resource.service.name=a".to_string(),
+                vec![(t.clone(), -209_998)]
+            ),
+            ("resource.service.name=b".to_string(), Vec::new()),
+            (
+                "resource.service.name=c".to_string(),
+                vec![(t.clone(), -209_999)]
+            ),
+            (
+                "resource.service.name=d".to_string(),
+                vec![(t.clone(), -149_999)]
+            ),
+        ]
+    );
+}
+
+/// Fixture G: 120 services, one 1 s span each, in one bucket. The
+/// statement keeps exactly 100 exemplars and drops every sixth from
+/// `s005`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_statement_keeps_one_hundred_of_one_hundred_and_twenty() {
+    skip_unless_live!();
+    let names: Vec<&'static str> = (0..120)
+        .map(|i| &*Box::leak(format!("s{i:03}").into_boxed_str()))
+        .collect();
+    let g = |l: i64| {
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (*s, i as u8 + 1, (l - 30) * S_NS + i as i64 * MS_NS, S_NS))
+            .collect::<Vec<MetricSpan>>()
+    };
+    let (db, _client, l) = seed_metrics("exemplar_budget", 0x33, g).await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let q = "{} | count_over_time() by(resource.service.name)";
+    let got = exemplars_of(&range_answer(&engine, q, l - 60, l).await, l);
+    drop_db(&db).await;
+    let total: usize = got.iter().map(|(_, e)| e.len()).sum();
+    let without: Vec<String> = got
+        .iter()
+        .filter(|(_, e)| e.is_empty())
+        .map(|(n, _)| n.trim_start_matches("resource.service.name=").to_string())
+        .collect();
+    let want: Vec<String> = (0..20).map(|k| format!("s{:03}", 5 + 6 * k)).collect();
+    assert_eq!(got.len(), 120, "120 series");
+    assert_eq!(total, 100, "100 exemplars");
+    assert_eq!(without, want);
+}
+
+/// An exemplar leaves only beside a sample in the answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_exemplar_needs_its_sample() {
+    skip_unless_live!();
+    let (db, _client, l) = seed_metrics("exemplar_sample", 0x22, fixture_k).await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let q = "{} | count_over_time() by(resource.service.name) | topk(2)";
+    let got = exemplars_of(&range_answer(&engine, q, l - 240, l).await, l);
+    drop_db(&db).await;
+    let t = trace_label(0x22);
+    assert_eq!(
+        got,
+        vec![
+            (
+                "resource.service.name=a".to_string(),
+                vec![(t.clone(), -209_998)]
+            ),
+            (
+                "resource.service.name=b".to_string(),
+                vec![(t.clone(), -149_998)]
+            ),
+            (
+                "resource.service.name=c".to_string(),
+                vec![(t.clone(), -209_999), (t.clone(), -30_000)]
+            ),
+            (
+                "resource.service.name=d".to_string(),
+                vec![(t.clone(), -149_999), (t.clone(), -30_000)]
+            ),
+        ]
+    );
+}
+
+/// `by(resource.service.name)` groups by the span's own service.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grouping_by_the_service_name() {
+    skip_unless_live!();
+    let (db, _client, l) = seed_metrics("grouping", 0x11, fixture_m).await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let q = "{} | count_over_time() by(resource.service.name)";
+    let got = samples_of(&range_answer(&engine, q, l - 60, l).await, l);
+    drop_db(&db).await;
+    assert_eq!(
+        got,
+        named(&[
+            ("resource.service.name=checkout", &[(-60, 0.0), (0, 3.0)]),
+            ("resource.service.name=frontend", &[(-60, 0.0), (0, 1.0)]),
+            ("resource.service.name=payment", &[(-60, 0.0), (0, 2.0)]),
+        ])
+    );
+}
+
+/// A second copy of a span collapses by `final = 1`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retried_span_counts_once() {
+    skip_unless_live!();
+    let (db, client, l) = seed_metrics("retried", 0x11, fixture_m).await;
+    client
+        .execute(
+            "INSERT INTO spans SELECT * FROM spans WHERE span_id = unhex('0000000000000002')",
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("the second copy");
+    let rows = {
+        let mut stream = client
+            .query_stream::<CountRow>("SELECT count() AS n FROM spans", &QuerySettings::new())
+            .await
+            .expect("count without final");
+        stream.next().await.expect("one row").expect("decode").n
+    };
+    let engine = metrics_engine(&db, 1_000).await;
+    let got = samples_of(
+        &range_answer(&engine, "{} | count_over_time()", l - 60, l).await,
+        l,
+    );
+    drop_db(&db).await;
+    assert_eq!(rows, 7, "seven rows without final");
+    assert_eq!(
+        got,
+        named(&[("__name__=count_over_time", &[(-60, 0.0), (0, 6.0)])])
+    );
+}
+
+/// The series cap counts the series of the route's own window, before the
+/// comparison; the instant route is capped too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_routed_series_cap() {
+    skip_unless_live!();
+    let kc = |l: i64| {
+        let mut spans = fixture_k(l);
+        spans.push(("e", 0x0f, (l - 270) * S_NS, S_NS));
+        spans
+    };
+    let (db, _client, l) = seed_metrics("series_cap", 0x22, kc).await;
+    let q = "{} | count_over_time() by(resource.service.name)";
+    let shape = |out: &MetricsAnswer| match out {
+        Ok(r) => format!("Ok({} series)", r.series.len()),
+        Err(pulsus_read::logql::ReadError::QueryTooBroad(
+            pulsus_read::logql::error::TooBroadReason::TraceMetricsSeriesCap { count, cap },
+        )) => format!("cap({count}, {cap})"),
+        Err(e) => format!("Err({e})"),
+    };
+    let mut got = Vec::new();
+    let four = metrics_engine(&db, 4).await;
+    got.push(shape(&range_answer(&four, q, l - 240, l).await));
+    got.push(shape(&instant_answer(&four, q, l - 240, l).await));
+    got.push(shape(
+        &range_answer(&four, &format!("{q} > 2"), l - 240, l).await,
+    ));
+    let three = metrics_engine(&db, 3).await;
+    got.push(shape(&instant_answer(&three, q, l - 240, l).await));
+    let five = metrics_engine(&db, 5).await;
+    got.push(shape(&range_answer(&five, q, l - 240, l).await));
+    got.push(shape(&instant_answer(&five, q, l - 240, l).await));
+    drop_db(&db).await;
+    assert_eq!(
+        got,
+        vec![
+            "cap(5, 4)",
+            "Ok(4 series)",
+            "cap(5, 4)",
+            "cap(4, 3)",
+            "Ok(5 series)",
+            "Ok(4 series)"
+        ]
+    );
+}
+
+/// The varint width of a RowBinary length prefix for `n` bytes.
+fn varint_width(n: usize) -> usize {
+    match n {
+        0..=127 => 1,
+        128..=16_383 => 2,
+        16_384..=2_097_151 => 3,
+        _ => 4,
+    }
+}
+
+/// The RowBinary bytes the statement's answer is, summed over its rows.
+async fn body_bytes(client: &ChClient, statement: &str) -> u64 {
+    count(
+        client,
+        &format!(
+            "SELECT sum(length(formatRow('RowBinary', g, points, exemplars, f))) AS n FROM ({}) \
+             SETTINGS final = 1, max_block_size = 4096",
+            statement.replace('?', "??")
+        ),
+    )
+    .await
+}
+
+/// The statement's rows.
+async fn statement_rows(
+    client: &ChClient,
+    statement: &str,
+) -> Vec<pulsus_read::traces::spans::metrics::MetricStatementRow> {
+    let mut stream = client
+        .query_stream::<pulsus_read::traces::spans::metrics::MetricStatementRow>(
+            &statement.replace('?', "??"),
+            &read_settings().set("max_block_size", 4096),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the statement failed: {e}\nSQL:\n{statement}"));
+    let mut out = Vec::new();
+    while let Some(row) = stream.next().await {
+        out.push(row.expect("decode a statement row"));
+    }
+    out
+}
+
+/// D12's bound for `rows`: each row's label, its length prefix and four
+/// framing bytes, 16 bytes a point and 32 an exemplar.
+fn d12_bound(rows: &[pulsus_read::traces::spans::metrics::MetricStatementRow]) -> u64 {
+    rows.iter()
+        .map(|r| {
+            (r.g.len() + varint_width(r.g.len()) + 4 + 16 * r.points.len() + 32 * r.exemplars.len())
+                as u64
+        })
+        .sum()
+}
+
+/// The shapes `T-Q3`'s metrics half reads, `true` for an instant request.
+const T_Q3_SHAPES: [(&str, bool); 7] = [
+    ("{} | rate()", false),
+    ("{} | rate() by(resource.service.name)", false),
+    ("{} | rate() by(resource.service.name) | topk(3)", false),
+    (
+        "{ status = error } | count_over_time() by(resource.service.name)",
+        false,
+    ),
+    ("{} | histogram_over_time(duration)", false),
+    ("{} | quantile_over_time(duration, 0.5, 0.9, 0.99)", false),
+    ("{} | avg_over_time(duration)", true),
+];
+
+/// `q` with exemplars off: `with(exemplars=false)` on its metrics stage.
+fn without_exemplars(q: &str) -> String {
+    match q.split_once(" | topk(") {
+        Some((head, tail)) => format!("{head} with(exemplars=false) | topk({tail}"),
+        None => format!("{q} with(exemplars=false)"),
+    }
+}
+
+/// `T-Q3`'s metrics half: the body is within D12's bound, at most 100
+/// exemplars leave the database, and every shape but a one-series answer
+/// with exemplars is within 24 bytes an answer sample.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_q3_metrics_bodies_are_within_the_bound() {
+    skip_unless_live!();
+    let (db, client, w) = seed_corpus_s(pulsus_testkit::test_db("pulsus_read_it_t596_tq3")).await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let (start_s, end_s) = (
+        w.first_included_ns() / S_NS,
+        (w.last_included_ns() + 1) / S_NS,
+    );
+    let mut wrong = Vec::new();
+    for (q, instant) in T_Q3_SHAPES {
+        for (q, exemplars) in [(q.to_string(), true), (without_exemplars(q), false)] {
+            let routed = routed_plan(&engine, &q, start_s, end_s, 60_000);
+            let statement = routed.statement().expect("checked");
+            let (sql, out) = if instant {
+                (
+                    statement.instant_sql().to_string(),
+                    engine.metrics_instant_routed(&routed).await,
+                )
+            } else {
+                (
+                    statement.range_sql().to_string(),
+                    engine.metrics_range_routed(&routed).await,
+                )
+            };
+            let out = out.unwrap_or_else(|e| panic!("{q}: {e}"));
+            let samples: u64 = out.series.iter().map(|s| s.samples.len() as u64).sum();
+            let rows = statement_rows(&client, &sql).await;
+            let body = body_bytes(&client, &sql).await;
+            let bound = d12_bound(&rows);
+            let sent: usize = rows.iter().map(|r| r.exemplars.len()).sum();
+            if body > bound {
+                wrong.push(format!("{q}: body {body} over the bound {bound}"));
+            }
+            if sent > 100 {
+                wrong.push(format!("{q}: {sent} exemplars"));
+            }
+            let one_series = q.starts_with("{} | rate()") && !q.contains("by(")
+                || q.starts_with("{} | histogram_over_time");
+            if (!exemplars || !one_series) && body > 24 * samples {
+                wrong.push(format!("{q}: body {body} over 24 x {samples} samples"));
+            }
+            eprintln!("{q}: body {body}, bound {bound}, samples {samples}, exemplars {sent}");
+        }
+    }
+    drop_db(&db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Each metrics request is one statement, reading at most 5% more rows
+/// than its window holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_metrics_statement_reads_the_window_once() {
+    skip_unless_live!();
+    let (db, client, w) =
+        seed_corpus_s(pulsus_testkit::test_db("pulsus_read_it_t596_read_once")).await;
+    let (start_s, end_s) = (
+        w.first_included_ns() / S_NS,
+        (w.last_included_ns() + 1) / S_NS,
+    );
+    let mut wrong = Vec::new();
+    for (i, (q, instant)) in T_Q3_SHAPES.into_iter().enumerate() {
+        let prefix = pulsus_testkit::test_ident(&format!("t596_read_once_{i}_{}", now_ns()));
+        let engine = metrics_engine(&db, 1_000)
+            .await
+            .with_statement_prefix(&prefix);
+        let routed = routed_plan(&engine, q, start_s, end_s, 60_000);
+        let plan = routed.plan();
+        let (lo, hi) = if instant {
+            plan.snapped_window_ns()
+        } else {
+            plan.range_window_ns()
+        };
+        let out = if instant {
+            engine.metrics_instant_routed(&routed).await
+        } else {
+            engine.metrics_range_routed(&routed).await
+        };
+        out.unwrap_or_else(|e| panic!("{q}: {e}"));
+        client
+            .execute(
+                "SYSTEM FLUSH LOGS",
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("flush the logs");
+        #[derive(Row, serde::Serialize, serde::Deserialize)]
+        struct Logged {
+            n: u64,
+            rows: u64,
+        }
+        let mut stream = client
+            .query_stream::<Logged>(
+                &format!(
+                    "SELECT count() AS n, sum(read_rows) AS rows FROM system.query_log \
+                     WHERE type = 'QueryFinish' AND startsWith(query_id, '{prefix}-')"
+                ),
+                &QuerySettings::new(),
+            )
+            .await
+            .expect("read the query log");
+        let logged = stream.next().await.expect("one row").expect("decode");
+        let spans = window_spans(&client, WindowSql::start_closed_end_open(lo, hi)).await;
+        if logged.n != 1 {
+            wrong.push(format!("{q}: {} statements", logged.n));
+        }
+        if logged.rows as f64 > 1.05 * spans as f64 {
+            wrong.push(format!(
+                "{q}: {} rows read, the window holds {spans}",
+                logged.rows
+            ));
+        }
+    }
+    drop_db(&db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// D12 on a one-sample answer: the body is 83 bytes for three samples,
+/// and a 16,384-byte label's row is within the bound by one byte.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_one_sample_answer_with_service_labels() {
+    skip_unless_live!();
+    let (db, client, l) = seed_metrics("one_sample", 0x11, fixture_m).await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let q = "{} | count_over_time() by(resource.service.name)";
+    let routed = routed_plan(&engine, q, l - 60, l, 60_000);
+    let sql = routed
+        .statement()
+        .expect("checked")
+        .instant_sql()
+        .to_string();
+    let body = body_bytes(&client, &sql).await;
+    let rows = statement_rows(&client, &sql).await;
+    #[derive(Row, serde::Serialize, serde::Deserialize)]
+    struct RowBytes {
+        g: String,
+        n: u64,
+    }
+    let mut stream = client
+        .query_stream::<RowBytes>(
+            &format!(
+                "SELECT g, length(formatRow('RowBinary', g, points, exemplars, f)) AS n FROM ({sql}) \
+                 SETTINGS final = 1"
+            ),
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("each row's bytes");
+    let mut per_row = Vec::new();
+    while let Some(row) = stream.next().await {
+        let row = row.expect("decode");
+        per_row.push((row.g, row.n));
+    }
+    let long = count(
+        &client,
+        "SELECT length(formatRow('RowBinary', repeat('x', 16384), [(toInt64(0), toFloat64(1))], \
+         CAST([], 'Array(Tuple(FixedString(16), Int64, Float64))'), toUInt8(0))) AS n",
+    )
+    .await;
+    drop_db(&db).await;
+    assert_eq!(
+        per_row,
+        vec![
+            ("checkout".to_string(), 28),
+            ("frontend".to_string(), 28),
+            ("payment".to_string(), 27)
+        ]
+    );
+    assert_eq!(body, 83, "the body");
+    assert_eq!(d12_bound(&rows), 86, "D12's bound");
+    assert_eq!(long, 16_406, "the 16,384-byte label's row");
+    assert_eq!(16_384 + varint_width(16_384) + 4 + 16, 16_407, "its bound");
+}

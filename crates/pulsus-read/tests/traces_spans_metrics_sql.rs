@@ -1,0 +1,148 @@
+//! Issue #596 part 1: the byte-frozen goldens of the metrics statement on
+//! `spans` (`crates/pulsus-read/src/traces/spans/metrics.rs`), its range
+//! and instant forms, in `tests/golden/traces_spans_metrics/`.
+//!
+//! **Do not** edit the committed files by hand: run the `#[ignore]`d
+//! `regenerate_spans_metrics_goldens` test and review the diff.
+
+use pulsus_read::traces::metrics_plan::{MetricsCtx, MetricsParams};
+use pulsus_read::{SpanFilterCtx, StatementTables, plan_trace_metrics_routed};
+
+/// `(stem, query)`: every golden, over `start = 1791400000`, `end =
+/// 1791410800`, `step = 60s`, `max_series = 1000` and the default budget.
+const CASES: [(&str, &str); 12] = [
+    ("rate_match_all", "{} | rate()"),
+    ("rate_by_service", "{} | rate() by(resource.service.name)"),
+    (
+        "rate_by_service_topk",
+        "{} | rate() by(resource.service.name) | topk(3)",
+    ),
+    (
+        "count_compared",
+        "{} | count_over_time() by(resource.service.name) > 5",
+    ),
+    (
+        "count_no_exemplars",
+        "{} | count_over_time() by(resource.service.name) with(exemplars=false)",
+    ),
+    ("avg_unscoped", "{ .a = 1 } | avg_over_time(duration)"),
+    ("sum_errors", "{ status = error } | sum_over_time(duration)"),
+    (
+        "quantile_three",
+        "{} | quantile_over_time(duration, 0.5, 0.9, 0.99)",
+    ),
+    ("histogram", "{} | histogram_over_time(duration)"),
+    (
+        "field_vs_field",
+        "{ span.http.route = span.url.path } | rate()",
+    ),
+    (
+        "arithmetic",
+        "{ duration > span.http.request.body.size * 1000 } | rate()",
+    ),
+    (
+        "explore_root",
+        "{nestedSetParent<0 && true && resource.service.name != nil} | rate() \
+         by(resource.service.name)",
+    ),
+];
+
+fn golden_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("golden")
+        .join("traces_spans_metrics")
+}
+
+/// One golden's text: two comment lines, then the range and the instant
+/// statement, each under its `== ` header.
+fn golden(stem: &str, query: &str) -> String {
+    let parsed =
+        pulsus_traceql::parse(query).unwrap_or_else(|e| panic!("{query} must parse: {e:?}"));
+    let routed = plan_trace_metrics_routed(
+        &parsed,
+        &MetricsParams {
+            start_ns: 1_791_400_000_000_000_000,
+            end_ns: 1_791_410_800_000_000_000,
+            step_ms: 60_000,
+            exemplars: None,
+        },
+        &MetricsCtx {
+            filter: SpanFilterCtx {
+                spans_table: "trace_spans",
+                attrs_table: "trace_attrs_idx",
+            },
+            scan_budget_rows: 50_000_000,
+            max_series: 1_000,
+            distributed: false,
+            skip_unavailable_shards: false,
+        },
+        &StatementTables {
+            spans: "spans",
+            resources: "resources",
+            indexed: &[],
+        },
+    )
+    .unwrap_or_else(|e| panic!("{query} must plan: {e}"));
+    match routed.statement() {
+        Some(s) => format!(
+            "-- case: {stem}\n-- q: {query}\n\n== range ==\n{}\n\n== instant ==\n{}\n",
+            s.range_sql(),
+            s.instant_sql()
+        ),
+        None => format!("-- case: {stem}\n-- q: {query}\n-- no statement\n"),
+    }
+}
+
+/// The twelve goldens, byte for byte, collected and asserted once.
+#[test]
+fn spans_metrics_goldens_match() {
+    let mut missing: Vec<String> = Vec::new();
+    let mut drifted: Vec<String> = Vec::new();
+    for (stem, query) in CASES {
+        let path = golden_dir().join(format!("{stem}.sql"));
+        match std::fs::read_to_string(&path) {
+            Err(e) => missing.push(format!("{stem} ({path:?}: {e})")),
+            Ok(expected) => {
+                if golden(stem, query) != expected {
+                    drifted.push(format!("{stem} ({path:?})"));
+                }
+            }
+        }
+    }
+    assert!(
+        missing.is_empty() && drifted.is_empty(),
+        "{} metrics golden(s) missing:\n{}\n{} drifted:\n{}\nif the change is intentional, run \
+         `cargo test -p pulsus-read --test traces_spans_metrics_sql -- --ignored \
+         regenerate_spans_metrics_goldens` and review the diff",
+        missing.len(),
+        missing.join("\n"),
+        drifted.len(),
+        drifted.join("\n")
+    );
+}
+
+/// Every case is served by the statement.
+#[test]
+fn every_case_has_a_statement() {
+    for (stem, query) in CASES {
+        assert!(
+            !golden(stem, query).contains("-- no statement"),
+            "{stem}: {query} has no statement"
+        );
+    }
+}
+
+/// Regenerates the goldens. `#[ignore]`d: run explicitly after an
+/// intentional change to the statement, review the diff, and say so.
+#[test]
+#[ignore = "regenerates the committed goldens; run explicitly, see doc comment"]
+fn regenerate_spans_metrics_goldens() {
+    let dir = golden_dir();
+    std::fs::create_dir_all(&dir).expect("create golden dir");
+    for (stem, query) in CASES {
+        let path = dir.join(format!("{stem}.sql"));
+        std::fs::write(&path, golden(stem, query))
+            .unwrap_or_else(|e| panic!("write {path:?}: {e}"));
+    }
+}

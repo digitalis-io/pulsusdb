@@ -51,19 +51,22 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// `traces_search` (issue #57), `traces_metrics` (issue #59/#182) and
-/// `traces_spans_search` (issue #590): the three byte-frozen SQL corpora,
-/// with their committed sizes. The count is of EVERY file in the directory
-/// tree, not of `.sql` files — today the two coincide, and a file of any
-/// other kind appearing is precisely the thing the count should report.
+/// `traces_search` (issue #57), `traces_metrics` (issue #59/#182),
+/// `traces_spans_search` (issue #590) and `traces_spans_metrics` (issue
+/// #596 part 1): the four byte-frozen SQL corpora, with their committed
+/// sizes. The count is of EVERY file in the directory tree, not of `.sql`
+/// files — today the two coincide, and a file of any other kind appearing
+/// is precisely the thing the count should report.
 ///
 /// The first two are pinned together by [`PINNED_SQL_CORPUS`]; the third
-/// has its own, [`PINNED_SPANS_SEARCH_CORPUS`], so neither digest moves
-/// when only the other's corpus does.
-const CORPORA: [(&str, usize); 3] = [
+/// has its own, [`PINNED_SPANS_SEARCH_CORPUS`], and the fourth
+/// [`PINNED_SPANS_METRICS_CORPUS`], so no digest moves when only another's
+/// corpus does.
+const CORPORA: [(&str, usize); 4] = [
     ("traces_search", 75),
     ("traces_metrics", 28),
     ("traces_spans_search", 17),
+    ("traces_spans_metrics", 12),
 ];
 
 /// A 64-bit rolling digest over every entry, in sorted path order —
@@ -626,8 +629,8 @@ fn the_sql_golden_corpus_has_exactly_its_committed_membership() {
         total += entries.len();
     }
     assert_eq!(
-        total, 120,
-        "the frozen SQL corpus is 75 + 28 + 17 = 120 entries"
+        total, 132,
+        "the frozen SQL corpus is 75 + 28 + 17 + 12 = 132 entries"
     );
 }
 
@@ -643,6 +646,12 @@ fn the_sql_golden_corpus_has_exactly_its_committed_membership() {
 /// `crates/pulsus-read/src/traces/spans/search.rs`'s `search_sql`, under
 /// [`corpus_digest`]'s encoding.
 const PINNED_SPANS_SEARCH_CORPUS: u64 = 0x31e7_33ad_d79a_8d4e;
+
+/// The metrics statement's twelve goldens (issue #596 part 1), each the
+/// range and instant forms of one request of
+/// `crates/pulsus-read/src/traces/spans/metrics.rs`'s `metrics_statement`,
+/// under [`corpus_digest`]'s encoding.
+const PINNED_SPANS_METRICS_CORPUS: u64 = 0;
 
 #[test]
 fn the_sql_golden_corpus_matches_its_committed_digest() {
@@ -666,6 +675,17 @@ fn the_search_statement_golden_corpus_matches_its_committed_digest() {
         "the 17 search statement goldens changed: `search_sql`'s output moved. If that was \
          deliberate, regenerate them, say which statement changed and why, and update \
          PINNED_SPANS_SEARCH_CORPUS to {h:#x} in the same change"
+    );
+}
+
+#[test]
+fn the_metrics_statement_golden_corpus_matches_its_committed_digest() {
+    let h = corpus_digest(&["traces_spans_metrics"]);
+    assert_eq!(
+        h, PINNED_SPANS_METRICS_CORPUS,
+        "the 12 metrics statement goldens changed: `metrics_statement`'s output moved. If that \
+         was deliberate, regenerate them, say which statement changed and why, and update \
+         PINNED_SPANS_METRICS_CORPUS to {h:#x} in the same change"
     );
 }
 

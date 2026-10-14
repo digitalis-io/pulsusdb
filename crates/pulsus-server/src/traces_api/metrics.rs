@@ -62,6 +62,9 @@ fn now_unix_seconds() -> i64 {
 
 async fn metrics_impl(state: AppState, raw: &str, form: MetricsForm) -> Result<Response, ApiError> {
     let params = params::parse_metrics_params(raw, now_unix_seconds())?;
+    if form == MetricsForm::Range {
+        params::check_range_intervals(&params)?;
+    }
     let query = pulsus_traceql::parse(params.q.as_str()).map_err(ApiError::Query)?;
     // Issue #328: the reference's route-independent semantic validation
     // (`traceql.Validate`), after parse and before planning — the
@@ -241,13 +244,47 @@ mod tests {
 
     #[tokio::test]
     async fn exceeding_the_point_cap_is_a_static_422() {
-        // 1,000,000 seconds at step=1 → 1M buckets >> MAX_METRICS_POINTS,
-        // rejected at plan time — no pool needed, so this no-pool state
-        // proves the rejection is pre-execution.
+        // 1,000,000 seconds at step=1 → 1M buckets: on the range route the
+        // reference's step limit refuses it first (issue #596 part 1), at
+        // plan time — no pool needed, so this no-pool state proves the
+        // rejection is pre-execution.
         let (status, body) =
             run_range(&format!("{RATE_Q}&start=1700000000&end=1701000000&step=1")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body {body}");
+        assert_eq!(
+            body,
+            "step of 1s is too small, minimum step for given range is 1m40s"
+        );
+        // The instant route keeps the static 422 point cap.
+        let (status, body) =
+            run_instant(&format!("{RATE_Q}&start=1700000000&end=1701000000&step=1")).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body {body}");
         assert!(!body.contains("byte "), "body {body}");
+    }
+
+    /// D13: a range of more than 10,000 steps answers `400` in the
+    /// reference's words; exactly 10,000 is served, and the instant route
+    /// keeps its step.
+    #[tokio::test]
+    async fn a_range_over_ten_thousand_intervals_is_the_reference_400() {
+        let window = "start=1700000000&end=1700010800";
+        let (status, body) = run_range(&format!("{RATE_Q}&{window}&step=1s")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body {body}");
+        assert_eq!(
+            body,
+            "step of 1s is too small, minimum step for given range is 1.08s"
+        );
+        let (status, body) = run_range(&format!("{RATE_Q}&{window}&step=1080ms")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body {body}");
+        let (status, body) = run_instant(&format!("{RATE_Q}&{window}&step=1s")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body {body}");
+        let (status, body) =
+            run_range(&format!("{RATE_Q}&start=1700000000&end=1701000000&step=1")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body {body}");
+        assert_eq!(
+            body,
+            "step of 1s is too small, minimum step for given range is 1m40s"
+        );
     }
 
     #[tokio::test]
@@ -275,13 +312,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn extreme_ns_endpoints_are_a_static_422_never_a_panic_or_500() {
-        // Full-i64-range endpoints: the i128 plan math resolves this to
-        // the static point-cap 422 before any pool/SQL work (code review
-        // round 1's overflow class, proven end to end through the
-        // handler).
+    async fn extreme_ns_endpoints_are_a_static_refusal_never_a_panic_or_500() {
+        // Full-i64-range endpoints: the i128 arithmetic resolves this
+        // before any pool/SQL work (code review round 1's overflow class,
+        // proven end to end through the handler) — on the range route the
+        // step limit's 400 (issue #596 part 1), on the instant route the
+        // static point-cap 422.
         let query = format!("{RATE_Q}&start={}&end={}&step=1", i64::MIN, i64::MAX);
         let (status, body) = run_range(&query).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body {body}");
+        let (status, body) = run_instant(&query).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body {body}");
     }
 

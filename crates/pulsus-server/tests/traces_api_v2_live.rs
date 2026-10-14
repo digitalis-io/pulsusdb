@@ -4714,3 +4714,300 @@ async fn a_search_never_returns_a_span_past_retention() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
 }
+
+// ---------------------------------------------------------------------
+// Issue #596 part 1 — metrics on `spans`, one statement per request.
+// ---------------------------------------------------------------------
+
+/// The §6.1 fixture's base for a metrics request: an hour ago, floored to
+/// a minute, plus one second. Every span sits in the bucket after the
+/// minute.
+fn metrics_base_ns() -> i64 {
+    an_hour_ago_ns() / 60_000_000_000 * 60_000_000_000 + 1_000_000_000
+}
+
+/// Pushes the §6.1 fixture over OTLP at `base`, each push settled.
+fn push_fixture_61(port: u16, base: i64) {
+    for (i, body) in fixture_61_bodies(base).into_iter().enumerate() {
+        let res = request(
+            port,
+            "POST",
+            "/v1/traces",
+            Some(("application/x-protobuf", &body.encode_to_vec())),
+            &[],
+        )
+        .unwrap_or_else(|| panic!("push {i} must be reachable"));
+        assert_eq!(
+            res.status,
+            200,
+            "push {i}: {:?}",
+            String::from_utf8_lossy(&res.body)
+        );
+        live_db::settle_pushed_spans(port, &pushed_keys(&body), &format!("push {i}"));
+    }
+}
+
+/// `GET /api/traces/v1/metrics/query_range` for `q` over `[base − 1 s,
+/// base + 10 s)`, step 60 s, answered raw whatever its status.
+fn metrics_range_q(port: u16, q: &str, base: i64, ctx: &str) -> RawResponse {
+    let path = format!(
+        "/api/traces/v1/metrics/query_range?q={}&start={}&end={}&step=60s",
+        enc(q),
+        base / 1_000_000_000 - 1,
+        base / 1_000_000_000 + 10
+    );
+    request(port, "GET", &path, None, &[])
+        .unwrap_or_else(|| panic!("{ctx}: request must be reachable (transport failure)"))
+}
+
+/// Each series' `key` label and its samples, `(timestamp ms, value)`, a
+/// value omitted on the wire read as `0`.
+fn metrics_series(
+    json: &serde_json::Value,
+    key: &str,
+    ctx: &str,
+) -> Vec<(String, Vec<(i64, f64)>)> {
+    json["series"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{ctx}: a series array, got {json}"))
+        .iter()
+        .map(|s| {
+            let samples = s["samples"]
+                .as_array()
+                .map(|samples| {
+                    samples
+                        .iter()
+                        .map(|p| {
+                            (
+                                p["timestampMs"]
+                                    .as_str()
+                                    .and_then(|t| t.parse().ok())
+                                    .unwrap_or_else(|| panic!("{ctx}: a timestamp in {p}")),
+                                p["value"].as_f64().unwrap_or(0.0),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            (series_label(s, key).unwrap_or_default(), samples)
+        })
+        .collect()
+}
+
+/// The series with a sample at `t_ms`, and that sample's value, sorted by
+/// label.
+fn at_label(series: &[(String, Vec<(i64, f64)>)], t_ms: i64) -> Vec<(String, f64)> {
+    let mut out: Vec<(String, f64)> = series
+        .iter()
+        .filter_map(|(name, samples)| {
+            samples
+                .iter()
+                .find(|(t, _)| *t == t_ms)
+                .map(|(_, v)| (name.clone(), *v))
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+fn owned(rows: &[(&str, f64)]) -> Vec<(String, f64)> {
+    rows.iter().map(|(n, v)| (n.to_string(), *v)).collect()
+}
+
+/// A field against a field and arithmetic in a metrics filter (`200`
+/// where `main` answers `400`), `F21`'s count with the retried push
+/// collapsed, and `T-A13`'s ranking in the database, over one push of the
+/// §6.1 fixture.
+#[tokio::test(flavor = "multi_thread")]
+async fn metrics_filters_compare_fields_and_compute() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_660;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db(
+        "pulsus_traces_api_v2_it_t596_metrics",
+    ))
+    .await;
+    let _server = spawn_ready(port, &db);
+    let base = metrics_base_ns();
+    push_fixture_61(port, base);
+    let minute_ms = base / 1_000_000 - 1_000;
+    let m = minute_ms + 60_000;
+    let mut wrong = Vec::new();
+    let mut check = |ctx: &str, q: &str, key: &str, t_ms: i64, want: Vec<(String, f64)>| {
+        let res = metrics_range_q(port, q, base, ctx);
+        if res.status != 200 {
+            wrong.push(format!(
+                "{ctx}: {q}: status {} {}",
+                res.status,
+                String::from_utf8_lossy(&res.body)
+            ));
+            return;
+        }
+        let got = at_label(&metrics_series(&res.json(ctx), key, ctx), t_ms);
+        if got != want {
+            wrong.push(format!(
+                "{ctx}: {q} at {t_ms}\n  want {want:?}\n  got  {got:?}"
+            ));
+        }
+    };
+    let svc = "resource.service.name";
+    check(
+        "arithmetic",
+        "{ duration * 2 > 700ms } | count_over_time() by(resource.service.name)",
+        svc,
+        m,
+        owned(&[("accounting", 1.0), ("checkout", 1.0), ("frontend", 2.0)]),
+    );
+    check(
+        "field vs field",
+        "{ span.app.items.count > span.app.discount.ratio } | count_over_time()",
+        "__name__",
+        m,
+        owned(&[("count_over_time", 1.0)]),
+    );
+    check(
+        "field vs field <",
+        "{ span.app.items.count < span.app.discount.ratio } | count_over_time()",
+        "__name__",
+        m,
+        owned(&[("count_over_time", 0.0)]),
+    );
+    check(
+        "F21",
+        "{} | count_over_time()",
+        "__name__",
+        m,
+        owned(&[("count_over_time", 9.0)]),
+    );
+    let by = "{} | count_over_time() by(resource.service.name)";
+    check(
+        "T-A13 topk",
+        &format!("{by} | topk(3)"),
+        svc,
+        m,
+        owned(&[("accounting", 2.0), ("checkout", 2.0), ("frontend", 3.0)]),
+    );
+    check(
+        "T-A13 topk, the empty label",
+        &format!("{by} | topk(3)"),
+        svc,
+        minute_ms,
+        owned(&[("accounting", 0.0), ("checkout", 0.0), ("frontend", 0.0)]),
+    );
+    check(
+        "T-A13 bottomk",
+        &format!("{by} | bottomk(3)"),
+        svc,
+        m,
+        owned(&[("accounting", 2.0), ("checkout", 2.0), ("payment", 2.0)]),
+    );
+    check(
+        "T-A13 bottomk, the empty label",
+        &format!("{by} | bottomk(3)"),
+        svc,
+        minute_ms,
+        owned(&[("accounting", 0.0), ("checkout", 0.0), ("frontend", 0.0)]),
+    );
+    assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
+}
+
+/// `T-A15`'s metrics rows: a `by()` on another key, two keys, a grouped
+/// quantile or histogram and a non-duration target stay `400` in this
+/// part. **guard**.
+#[tokio::test(flavor = "multi_thread")]
+async fn t_a15_the_metrics_rows_stay_400() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_661;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_traces_api_v2_it_t596_ta15")).await;
+    let _server = spawn_ready(port, &db);
+    let base = metrics_base_ns();
+    for q in [
+        "{} | rate() by(span.http.route)",
+        "{} | rate() by(resource.service.name, span.http.route)",
+        "{} | quantile_over_time(duration, .9) by(span.http.route)",
+        "{} | histogram_over_time(duration) by(span.http.route)",
+        "{} | avg_over_time(span.http.request.body.size)",
+    ] {
+        let res = metrics_range_q(port, q, base, q);
+        assert_eq!(
+            res.status,
+            400,
+            "{q}: {}",
+            String::from_utf8_lossy(&res.body)
+        );
+        let ct = res.headers.get("content-type").cloned().unwrap_or_default();
+        assert!(ct.starts_with("text/plain"), "{q}: content type {ct:?}");
+    }
+}
+
+/// A trace-level field in a metrics filter stays `400` until #594 part 5.
+/// **guard**.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_seven_in_a_filter_still_refuse() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_662;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db(
+        "pulsus_traces_api_v2_it_t596_seven",
+    ))
+    .await;
+    let _server = spawn_ready(port, &db);
+    let base = metrics_base_ns();
+    for q in [
+        "{ trace:duration > 1s } | rate()",
+        "{ duration > trace:duration / 2 } | rate()",
+    ] {
+        let res = metrics_range_q(port, q, base, q);
+        assert_eq!(
+            res.status,
+            400,
+            "{q}: {}",
+            String::from_utf8_lossy(&res.body)
+        );
+    }
+}
+
+/// `T-X4`: the read memory ceiling bounds the metrics statement — `422`
+/// naming the setting at 1 MiB, `200` at the default. **guard**.
+#[tokio::test(flavor = "multi_thread")]
+async fn t_x4_the_memory_ceiling_bounds_a_metrics_read() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let low_port = 31_663;
+    let default_port = 31_664;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_traces_api_v2_it_t596_tx4")).await;
+    let base = metrics_base_ns();
+    let q = "{} | rate() by(resource.service.name)";
+    {
+        let _server = spawn_ready(default_port, &db);
+        push_fixture_61(default_port, base);
+        let res = metrics_range_q(default_port, q, base, "T-X4 default");
+        assert_eq!(
+            res.status,
+            200,
+            "default: {}",
+            String::from_utf8_lossy(&res.body)
+        );
+    }
+    let _server = spawn_ready_with_env(
+        low_port,
+        &db,
+        &[("PULSUS_TRACEQL_READ_MAX_MEMORY_BYTES", "1048576")],
+    );
+    let res = metrics_range_q(low_port, q, base, "T-X4 low");
+    let body = String::from_utf8_lossy(&res.body).to_string();
+    assert_eq!(res.status, 422, "low: {body}");
+    assert!(
+        body.contains("reader.traceql_read_max_memory_bytes"),
+        "low: {body}"
+    );
+}

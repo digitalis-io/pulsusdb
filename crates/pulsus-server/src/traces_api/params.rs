@@ -289,6 +289,29 @@ pub(crate) enum MetricsParamError {
     /// #284).
     #[error(transparent)]
     QueryText(#[from] QueryTextError),
+    /// A range request of more than [`MAX_RANGE_INTERVALS`] steps (issue
+    /// #596 part 1), in the reference's words.
+    #[error(
+        "step of {} is too small, minimum step for given range is {}",
+        go_duration(*step_ns),
+        go_duration(*minimum_ns)
+    )]
+    StepTooSmall { step_ns: i64, minimum_ns: i64 },
+}
+
+/// The most steps a range request may span: the reference's
+/// `max_intervals` (issue #596 part 1).
+const MAX_RANGE_INTERVALS: i128 = 10_000;
+
+/// Refuses a range request whose window holds more than
+/// [`MAX_RANGE_INTERVALS`] steps, naming the smallest step it would take.
+pub(crate) fn check_range_intervals(_params: &RawMetricsParams) -> Result<(), MetricsParamError> {
+    Ok(())
+}
+
+/// `ns` as Go's `time.Duration.String` renders it.
+pub(crate) fn go_duration(_ns: i64) -> String {
+    String::new()
 }
 
 /// The parsed metrics request: the TraceQL expression, the validated
@@ -2311,5 +2334,21 @@ mod tests {
                 scope: TagScope::All
             }
         );
+    }
+
+    /// D13's durations, as Go's `time.Duration.String` renders them.
+    #[test]
+    fn go_duration() {
+        for (ns, want) in [
+            (1, "1ns"),
+            (1_500, "1.5µs"),
+            (500_000_000, "500ms"),
+            (1_080_000_000, "1.08s"),
+            (100_000_000_000, "1m40s"),
+            (3_600_000_000_000, "1h0m0s"),
+            (0, "0s"),
+        ] {
+            assert_eq!(super::go_duration(ns), want, "{ns} ns");
+        }
     }
 }

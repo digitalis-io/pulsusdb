@@ -14,9 +14,10 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use pulsus_read::SpanFilterCtx;
+use pulsus_read::traces::metrics_plan::{MetricsCtx, MetricsParams};
 use pulsus_read::traces::search_plan::{SearchCtx, SearchParams, plan_search};
 use pulsus_read::traces::spans::search::plan_statement;
+use pulsus_read::{SpanFilterCtx, StatementTables, plan_trace_metrics_routed};
 use pulsus_traceql::PipelineStage;
 
 fn corpus_dir(sub: &str) -> PathBuf {
@@ -82,14 +83,40 @@ fn route_of(query: &pulsus_traceql::Query) -> &'static str {
     if metrics { "metrics" } else { "search" }
 }
 
-/// The engine that answers a search: `refused` when the planner refuses
-/// it, `new` when the fork's coverage function gives a statement, else
-/// `old`. A metrics query is today's engine's.
+/// The engine that answers a query: `refused` when the planner refuses
+/// it, `new` when the route's coverage gives a statement, else `old`. A
+/// metrics query is planned by `plan_trace_metrics_routed` (issue #596
+/// part 1) over the search's window, step 60 s.
 fn side_of(query: &pulsus_traceql::Query, route: &str) -> &'static str {
-    if route == "metrics" {
-        return "old";
-    }
     const START: i64 = 1_790_000_000_000_000_000;
+    if route == "metrics" {
+        let params = MetricsParams {
+            start_ns: START,
+            end_ns: START + 3_600_000_000_000,
+            step_ms: 60_000,
+            exemplars: None,
+        };
+        let ctx = MetricsCtx {
+            filter: SpanFilterCtx {
+                spans_table: "trace_spans",
+                attrs_table: "trace_attrs_idx",
+            },
+            scan_budget_rows: 50_000_000,
+            max_series: 1_000,
+            distributed: false,
+            skip_unavailable_shards: false,
+        };
+        let tables = StatementTables {
+            spans: "spans",
+            resources: "resources",
+            indexed: &[],
+        };
+        return match plan_trace_metrics_routed(query, &params, &ctx, &tables) {
+            Err(_) => "refused",
+            Ok(routed) if routed.statement().is_some() => "new",
+            Ok(_) => "old",
+        };
+    }
     let params = SearchParams {
         start_ns: START,
         end_ns: START + 3_600_000_000_000,
@@ -117,11 +144,12 @@ fn side_of(query: &pulsus_traceql::Query, route: &str) -> &'static str {
 }
 
 /// The side a task's queries take: task 9's are the search statement's,
-/// tasks 10 to 15's today's engine's.
+/// task 14's the metrics statement's (issue #596 part 1), tasks 10 to 12
+/// and 15's today's engine's.
 fn side_of_task(task: &str) -> &'static str {
     match task {
-        "9" => "new",
-        "10" | "11" | "12" | "14" | "15" => "old",
+        "9" | "14" => "new",
+        "10" | "11" | "12" | "15" => "old",
         "refused" => "refused",
         other => panic!("an unknown task {other:?}"),
     }
@@ -185,7 +213,7 @@ fn the_inventory_is_complete_and_exact() {
             sides.get("old").copied().unwrap_or(0),
             sides.get("refused").copied().unwrap_or(0)
         ),
-        (119, 19, 3),
+        (135, 3, 3),
         "new, old and refused"
     );
 }
