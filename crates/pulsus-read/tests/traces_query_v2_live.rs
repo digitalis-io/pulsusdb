@@ -7290,7 +7290,8 @@ fn covered(plan: &pulsus_read::SearchPlan) -> bool {
     .is_some()
 }
 
-/// The inventory's `new` rows, by name.
+/// The inventory's `new` search rows, by name: the search statement's.
+/// A `new` metrics row is the metrics statement's (issue #596 part 1).
 fn inventory_new_names() -> Vec<String> {
     let path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/traces_route_inventory.tsv");
@@ -7299,7 +7300,8 @@ fn inventory_new_names() -> Vec<String> {
         .skip(1)
         .filter_map(|line| {
             let cols: Vec<&str> = line.split('\t').collect();
-            (cols.get(2) == Some(&"new")).then(|| cols[0].to_string())
+            (cols.get(1) == Some(&"search") && cols.get(2) == Some(&"new"))
+                .then(|| cols[0].to_string())
         })
         .collect()
 }

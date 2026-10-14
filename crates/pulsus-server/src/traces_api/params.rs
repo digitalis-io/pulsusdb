@@ -305,13 +305,65 @@ const MAX_RANGE_INTERVALS: i128 = 10_000;
 
 /// Refuses a range request whose window holds more than
 /// [`MAX_RANGE_INTERVALS`] steps, naming the smallest step it would take.
-pub(crate) fn check_range_intervals(_params: &RawMetricsParams) -> Result<(), MetricsParamError> {
-    Ok(())
+///
+/// `(end − start) / step > 10,000` is decided exactly, in `i128`; the
+/// smallest step is `(end − start) / 10,000` in whole nanoseconds.
+pub(crate) fn check_range_intervals(params: &RawMetricsParams) -> Result<(), MetricsParamError> {
+    let width = i128::from(params.end_ns) - i128::from(params.start_ns);
+    let step_ns = i128::from(params.step_ms) * NS_PER_MS;
+    if width <= MAX_RANGE_INTERVALS * step_ns {
+        return Ok(());
+    }
+    Err(MetricsParamError::StepTooSmall {
+        step_ns: i64::try_from(step_ns).unwrap_or(i64::MAX),
+        minimum_ns: i64::try_from(width / MAX_RANGE_INTERVALS).unwrap_or(i64::MAX),
+    })
 }
 
-/// `ns` as Go's `time.Duration.String` renders it.
-pub(crate) fn go_duration(_ns: i64) -> String {
-    String::new()
+/// `ns` as Go's `time.Duration.String` renders it: `0s`; under a second
+/// `ns`, `µs` or `ms` with the fraction's trailing zeros dropped; from a
+/// second up `[h][m]s`, every unit below the largest written, `1h0m0s`.
+pub(crate) fn go_duration(ns: i64) -> String {
+    if ns == 0 {
+        return "0s".to_string();
+    }
+    let sign = if ns < 0 { "-" } else { "" };
+    let u = u128::from(ns.unsigned_abs());
+    // The integer part and the fraction of `u / 10^prec`, the fraction's
+    // trailing zeros dropped, and the point with it when it is zero.
+    let split = |u: u128, prec: u32| {
+        let scale = 10u128.pow(prec);
+        let frac = format!("{:0width$}", u % scale, width = prec as usize);
+        let frac = frac.trim_end_matches('0');
+        let frac = if frac.is_empty() {
+            String::new()
+        } else {
+            format!(".{frac}")
+        };
+        (u / scale, frac)
+    };
+    let text = if u < 1_000_000_000 {
+        let (prec, unit) = if u < 1_000 {
+            (0, "ns")
+        } else if u < 1_000_000 {
+            (3, "µs")
+        } else {
+            (6, "ms")
+        };
+        let (whole, frac) = split(u, prec);
+        format!("{whole}{frac}{unit}")
+    } else {
+        let (seconds, frac) = split(u, 9);
+        let (minutes, hours) = (seconds / 60, seconds / 3600);
+        if hours > 0 {
+            format!("{hours}h{}m{}{frac}s", minutes % 60, seconds % 60)
+        } else if minutes > 0 {
+            format!("{minutes}m{}{frac}s", seconds % 60)
+        } else {
+            format!("{seconds}{frac}s")
+        }
+    };
+    format!("{sign}{text}")
 }
 
 /// The parsed metrics request: the TraceQL expression, the validated

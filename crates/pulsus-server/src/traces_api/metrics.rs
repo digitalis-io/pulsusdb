@@ -1,8 +1,9 @@
 //! `GET /api/traces/v1/metrics/{query_range,query}` (issue #59/#182;
 //! docs/api.md §4.4): parse params (`params.rs`) → `pulsus_traceql::parse`
-//! → `pulsus_read::plan_trace_metrics` — all **before** the pool, same
-//! discipline as `search.rs`, so every 400/422-class failure resolves
-//! without ClickHouse — → `TraceEngine::metrics_range`/`metrics_instant`
+//! → `pulsus_read::plan_trace_metrics_routed` — all **before** the pool,
+//! same discipline as `search.rs`, so every 400/422-class failure resolves
+//! without ClickHouse — → `TraceEngine::metrics_range_routed`/
+//! `metrics_instant_routed`
 //! → the Tempo-native metrics encoders (`metrics_response::encode_metrics`
 //! for the range route, `::encode_metrics_instant` for the instant one —
 //! issue #464 wave 2: they are different `tempopb` messages).
@@ -62,6 +63,8 @@ fn now_unix_seconds() -> i64 {
 
 async fn metrics_impl(state: AppState, raw: &str, form: MetricsForm) -> Result<Response, ApiError> {
     let params = params::parse_metrics_params(raw, now_unix_seconds())?;
+    // Issue #596 part 1: the reference's step limit, on the range route
+    // only; the instant route keeps its step.
     if form == MetricsForm::Range {
         params::check_range_intervals(&params)?;
     }
@@ -92,8 +95,18 @@ async fn metrics_impl(state: AppState, raw: &str, form: MetricsForm) -> Result<R
         step_ms: params.step_ms,
         exemplars: params.exemplars,
     };
-    let plan =
-        pulsus_read::plan_trace_metrics(&query, &metrics_params, &ctx).map_err(ApiError::Plan)?;
+    // Issue #596 part 1: the statement on `spans` where it serves the
+    // query, today's planner on the query itself where it does not.
+    let indexed = pulsus_read::traces::spans::attr_index::IndexedAttr::from_config(
+        &state.config.traceql_indexed_attributes,
+    );
+    let tables = pulsus_read::StatementTables {
+        spans: &read_config.spans_v2_table,
+        resources: &read_config.resources_table,
+        indexed: &indexed,
+    };
+    let plan = pulsus_read::plan_trace_metrics_routed(&query, &metrics_params, &ctx, &tables)
+        .map_err(ApiError::Plan)?;
 
     let engine = engine_for(&state).await?;
     // Issue #464 wave 2: the two routes return DIFFERENT proto messages —
@@ -104,11 +117,11 @@ async fn metrics_impl(state: AppState, raw: &str, form: MetricsForm) -> Result<R
     // the datasource's bare `jsonpb.Unmarshal` rejects outright.
     Ok(match form {
         MetricsForm::Range => {
-            let result = engine.metrics_range(&plan).await?;
+            let result = engine.metrics_range_routed(&plan).await?;
             super::metrics_response::encode_metrics(&result)
         }
         MetricsForm::Instant => {
-            let result = engine.metrics_instant(&plan).await?;
+            let result = engine.metrics_instant_routed(&plan).await?;
             super::metrics_response::encode_metrics_instant(&result)
         }
     })
