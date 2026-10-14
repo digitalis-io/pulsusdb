@@ -56,6 +56,11 @@ use crate::corpus::Scale;
 /// `scenarios::RUN_ID_LABEL` / `traces_corpus::RUN_ATTR` precedent).
 pub const RUN_ATTR: &str = "run_id";
 
+/// Margin between the corpus's last record and "now" at generation time,
+/// and between the last record and the instant every metric-instant case
+/// is queried at.
+pub const CORPUS_NOW_MARGIN_NS: i64 = 5_000_000_000;
+
 /// Every committed differential case id, in fixture order —
 /// `test/fixtures/logs/differential.json` `cases[]` must match exactly
 /// (hermetic unit test in `logs.rs`).
@@ -126,12 +131,13 @@ pub const METRIC_CASE_IDS: &[&str] = &[
     // Issue #91 matching runtime errors (both stores fail the query).
     "metric_match_multiple_err",
     "metric_match_duplicate_err",
-    // Issue M8-LQ3 `rate_counter` differential vectors (instant, `[1m]`;
-    // gated). Each rides `run_metric_instant_case` (hard-gating BOTH
-    // pulsus-vs-corpus AND oracle-vs-corpus values), so a wrong reset /
-    // boundary / dup-ts / no-extrapolation rule is RED vs the live
-    // reference. Oracle-confirmed values (v3.7.3): reset 0.5333, sparse
-    // 1.0, boundary 1.0, dup-ts 0.2833.
+    // Issue M8-LQ3 `rate_counter` differential vectors (instant, `[1m]`).
+    // Each rides `run_metric_instant_case`, which gates PulsusDB against
+    // `expected_metric_vector`. Issue #624, part 4 made the four
+    // informational against the reference (ledger
+    // `rate-counter-window-anchored`): we extrapolate in seconds to the
+    // window's edges (F4), the reference divides nanosecond spans by 1,000
+    // and anchors the window on its first sample.
     "metric_rate_counter_reset",
     "metric_rate_counter_sparse",
     "metric_rate_counter_boundary",
@@ -577,18 +583,15 @@ pub fn generate(spec: &LogCorpusSpec) -> LogCorpus {
     records.push(witness(7, SVC_RC_RESET, "c=30"));
     records.push(witness(8, SVC_RC_RESET, "c=5")); // reset: 5 < 30
     records.push(witness(9, SVC_RC_RESET, "c=12"));
-    // Sparse interior (c=200,260, 10s apart): increase 60 over the FULL 60s
-    // window ⇒ 1.0 (a boundary-extrapolated reading would inflate to 6.0).
+    // Sparse interior (c=200,260, one step apart): increase 60.
     records.push(witness(10, SVC_RC_SPARSE, "c=200"));
     records.push(witness(11, SVC_RC_SPARSE, "c=260"));
-    // Boundary span (c=100,160): monotone increase 60 ⇒ 1.0.
+    // Boundary span (c=100,160): monotone increase 60.
     records.push(witness(12, SVC_RC_BOUNDARY, "c=100"));
     records.push(witness(13, SVC_RC_BOUNDARY, "c=160"));
     // Duplicate timestamp: `c=10` and `c=3` share offset 15 (identical ts).
-    // Delivered scan order (ts asc, then body asc — `"c=10" < "c=3"`) is
-    // 5,10,3,12 ⇒ +5, reset +3, +9 = 17 (NOT the 12 an ascending-VALUE
-    // tie-sort would give). Pushed 10-before-3 so the hermetic scan order
-    // matches the live `ORDER BY timestamp_ns, fingerprint, body`.
+    // Value order (issue #624, part 4, F1) folds them as 5,3,10,12 ⇒ reset
+    // +5, increase `12 - 5 + 5 = 12`; the push order no longer matters.
     records.push(witness(14, SVC_RC_DUPTS, "c=5"));
     records.push(witness(15, SVC_RC_DUPTS, "c=10"));
     records.push(witness(15, SVC_RC_DUPTS, "c=3"));
@@ -681,19 +684,16 @@ impl LogCorpus {
     /// feature fields with the same f64 operations the engine performs
     /// (duration ms → seconds is `ms * 1e-3`; sums accumulate in
     /// timestamp order).
-    /// Replays the pinned reference's `extrapolatedRate(samples, [1m],
-    /// isCounter=true, isRate=true)` (grafana/loki:3.7.3,
-    /// `pkg/logql/range_vector.go`) over one `rate_counter` witness
-    /// service's `c=<n>` samples, taken in record push order and
-    /// stable-sorted by timestamp. This is an INDEPENDENT oracle derived
-    /// from the reference's ns-as-ms arithmetic (the window iterators store
-    /// ns but `extrapolatedRate` divides every span by 1000, and the
-    /// extrapolation window is anchored on the first sample) — NOT a copy
-    /// of PulsusDB's reducer. Mirrors `rate_counter_extrapolated` in
-    /// pulsus-read; the hermetic evaluator-agreement test proves they
-    /// coincide, and the nightly `oracle_vs_corpus` leg proves this equals
-    /// the live container.
-    fn rate_counter_ref(&self, service: &str) -> f64 {
+    /// `rate_counter` over one witness service's `c=<n>` samples in the
+    /// window `(eval_ns - 60s, eval_ns]`, `eval_ns` the instant the harness
+    /// queries at: issue #624, part 4's F4 (ledger
+    /// `rate-counter-window-anchored`) — the reference's `extrapolatedRate(
+    /// samples, [1m], isCounter=true, isRate=true)` with every span in
+    /// seconds, extrapolated to the window's edges rather than anchored on
+    /// the first sample. Samples at one timestamp fold in ascending value
+    /// order (F1). Written here independently of PulsusDB's reducer; the
+    /// hermetic evaluator-agreement test proves they coincide.
+    fn rate_counter_ref(&self, service: &str, eval_ns: i64) -> f64 {
         // `[1m]` window in ns; witnesses collapse onto one series.
         const WINDOW_NS: i64 = 60 * 1_000_000_000;
         let mut pts: Vec<(i64, f64)> = self
@@ -710,7 +710,7 @@ impl LogCorpus {
         if pts.len() < 2 {
             return 0.0;
         }
-        pts.sort_by(|(a, _), (b, _)| a.cmp(b));
+        pts.sort_by(|(at, a), (bt, b)| at.cmp(bt).then(a.total_cmp(b)));
         let first_t = pts[0].0;
         let last_t = pts[pts.len() - 1].0;
         let first_f = pts[0].1;
@@ -723,11 +723,10 @@ impl LogCorpus {
             }
             last_value = f;
         }
-        let sel_range_ms: i64 = WINDOW_NS / 1_000_000;
-        let range_start = first_t - sel_range_ms;
-        let mut duration_to_start = (first_t - range_start) as f64 / 1000.0;
-        let duration_to_end = 0.0_f64;
-        let sampled_interval = (last_t - first_t) as f64 / 1000.0;
+        let range_start = eval_ns - WINDOW_NS;
+        let mut duration_to_start = (first_t - range_start) as f64 / 1e9;
+        let duration_to_end = (eval_ns - last_t) as f64 / 1e9;
+        let sampled_interval = (last_t - first_t) as f64 / 1e9;
         let average_duration = sampled_interval / (pts.len() - 1) as f64;
         if result_value > 0.0 && first_f >= 0.0 {
             let duration_to_zero = sampled_interval * (first_f / result_value);
@@ -752,6 +751,8 @@ impl LogCorpus {
     }
 
     pub fn expected_metric_vector(&self, case_id: &str) -> MetricVector {
+        // The instant every metric-instant case is queried at.
+        let eval_ns = self.last_ts_ns + CORPUS_NOW_MARGIN_NS;
         let json_labels = |r: &GeneratedRecord| {
             let mut labels = self.base_labels(r);
             labels.insert("method".to_string(), r.method.to_string());
@@ -883,30 +884,34 @@ impl LogCorpus {
             }
             // Issue M8-LQ3 `rate_counter`: all samples collapse onto the
             // base label set (`logfmt` extracts `c`, `unwrap c` deletes it),
-            // one series, value = the reference's ns/ms `extrapolatedRate`
-            // (isCounter, isRate) over the witness's `c=<n>` samples — the
-            // reset-aware increase scaled by the tiny `1 + 60000/span_ns`
-            // extrapolation factor the ns-as-ms unit mix produces, then
-            // divided by the 60s window. `rate_counter_ref` replays that
-            // arithmetic from the real record timestamps, keeping the corpus
-            // an INDEPENDENT oracle derived from reference semantics
-            // (grafana/loki:3.7.3), not a copy of PulsusDB's reducer. The
-            // hermetic `shipped_metric_expectations_agree_with_the_shipped_evaluator`
+            // one series, value = F4's extrapolated rate (issue #624, part
+            // 4) over the witness's `c=<n>` samples at the instant the
+            // harness queries at. The hermetic
+            // `shipped_metric_expectations_agree_with_the_shipped_evaluator`
             // test cross-checks each derived value against the real reducer.
             "metric_rate_counter_reset" => {
-                out.insert(rc_base(SVC_RC_RESET), self.rate_counter_ref(SVC_RC_RESET));
+                out.insert(
+                    rc_base(SVC_RC_RESET),
+                    self.rate_counter_ref(SVC_RC_RESET, eval_ns),
+                );
             }
             "metric_rate_counter_sparse" => {
-                out.insert(rc_base(SVC_RC_SPARSE), self.rate_counter_ref(SVC_RC_SPARSE));
+                out.insert(
+                    rc_base(SVC_RC_SPARSE),
+                    self.rate_counter_ref(SVC_RC_SPARSE, eval_ns),
+                );
             }
             "metric_rate_counter_boundary" => {
                 out.insert(
                     rc_base(SVC_RC_BOUNDARY),
-                    self.rate_counter_ref(SVC_RC_BOUNDARY),
+                    self.rate_counter_ref(SVC_RC_BOUNDARY, eval_ns),
                 );
             }
             "metric_rate_counter_dup_ts" => {
-                out.insert(rc_base(SVC_RC_DUPTS), self.rate_counter_ref(SVC_RC_DUPTS));
+                out.insert(
+                    rc_base(SVC_RC_DUPTS),
+                    self.rate_counter_ref(SVC_RC_DUPTS, eval_ns),
+                );
             }
             // Issue M8-LQ3 `sort`: `sum by (grp) (count_over_time(...))`
             // reduces to `{grp}` counts {a:5, b:1, c:5}. The set is the

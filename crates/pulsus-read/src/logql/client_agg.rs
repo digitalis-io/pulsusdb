@@ -432,10 +432,18 @@ impl BucketAcc {
     }
 
     /// Finishes the bucket into its reducer value.
-    fn finish(self, op: RangeAggOp, rate_window_ns: Option<u64>, quantile: Option<f64>) -> f64 {
+    fn finish(
+        self,
+        op: RangeAggOp,
+        rate_window_ns: Option<u64>,
+        quantile: Option<f64>,
+        window_end_ns: i64,
+    ) -> f64 {
         match self {
             BucketAcc::Values(mut vals) => quantile_of(&mut vals, quantile.unwrap_or(f64::NAN)),
-            BucketAcc::Counter(pts) => rate_counter_extrapolated(pts, rate_window_ns),
+            BucketAcc::Counter(pts) => {
+                rate_counter_extrapolated(pts, rate_window_ns, window_end_ns)
+            }
             BucketAcc::Simple(acc) => match op {
                 // Oracle-probed: `rate` over an unwrapped range is the
                 // per-second SUM of values (count-shaped inputs
@@ -498,7 +506,11 @@ impl BucketAcc {
 /// EMITS `0.0` for `<2`-point groups (verified against grafana/loki:3.7.3 —
 /// a lone sample returns value `"0"`), so we return `0.0` and let `finish`
 /// surface it as a 0-valued vector element; we do NOT drop the group.
-fn rate_counter_extrapolated(mut pts: Vec<(i64, f64)>, rate_window_ns: Option<u64>) -> f64 {
+fn rate_counter_extrapolated(
+    mut pts: Vec<(i64, f64)>,
+    rate_window_ns: Option<u64>,
+    _window_end_ns: i64,
+) -> f64 {
     pts.sort_by(|(at, _), (bt, _)| at.cmp(bt));
     rate_counter_over_sorted(pts.len(), |i| pts[i], rate_window_ns)
 }
@@ -1302,7 +1314,7 @@ impl<'q> ClientAggState<'q> {
                 .into_iter()
                 .map(|(labels, acc)| VectorSample {
                     labels,
-                    value: acc.finish(op, rate_window_ns, param),
+                    value: acc.finish(op, rate_window_ns, param, 0),
                 })
                 .collect(),
         )
@@ -1527,6 +1539,7 @@ fn reduce_window(
     rate_window_ns: Option<u64>,
     run_int: u64,
     ordered: &[WinSample],
+    _window_end_ns: i64,
 ) -> Option<f64> {
     if ordered.is_empty() {
         return None;
@@ -1715,11 +1728,12 @@ impl FpSlide {
                     rate_window_ns,
                     run_int,
                     std::slice::from_ref(&WIN_SAMPLE_MARKER),
+                    t,
                 )
             }
         } else {
             let window = self.win.make_contiguous();
-            reduce_window(op, class, param, rate_window_ns, run_int, window)
+            reduce_window(op, class, param, rate_window_ns, run_int, window, t)
         };
         if let Some(v) = v {
             self.points.push((t, v));
@@ -3171,6 +3185,7 @@ impl<'q> RangeSlideState<'q> {
                             self.rate_window_ns,
                             0,
                             &samples[lo..hi],
+                            t,
                         ) {
                             points.push((t, v));
                         }
@@ -4399,10 +4414,13 @@ mod tests {
     }
 
     /// AC10: a forced same-`(fingerprint, timestamp_ns)` collision of ≥3 rows
-    /// with DISTINCT bodies resolves an ORDER-DEPENDENT reducer through the
-    /// full-body `tie_rank` order, byte-stable across shuffled input. Uses
+    /// with DISTINCT bodies resolves an ORDER-DEPENDENT reducer through one
+    /// total order, byte-stable across shuffled input. Uses
     /// `last_over_time` (positional in the canonical order) plus a class-C
     /// `sum` — the two shapes the review called out as untested.
+    ///
+    /// Issue #624, part 4 (T10, F1): the order is ascending VALUE, the order
+    /// the database can read without the line, on every route.
     #[test]
     fn sliding_same_stream_tie_rank_orders_class_c_and_first_last_deterministically() {
         let meta = slide_meta(1, r#"{"app":"a"}"#);
@@ -4412,10 +4430,10 @@ mod tests {
         // consumed by the unwrap), chosen so the full-BODY byte order is
         // deliberately DIFFERENT from the value order:
         //   `a="3"` (0x22 after `a=`) < `a=1` (0x31) < `a=2` (0x32)
-        //   ⇒ canonical values in order: 3, 1, 2
-        // So `first` = 3 and `last` = 2. A value-tiebreak (the old instant
-        // rule) would give first=1/last=3, and an arrival-order rule would
-        // flap under shuffling — this case discriminates all three.
+        //   ⇒ body order 3, 1, 2; value order 1, 2, 3
+        // So `first` = 1 and `last` = 3 (F1). The body order would give
+        // first=3/last=2, and an arrival-order rule would flap under
+        // shuffling — this case discriminates all three.
         let bodies = [r#"a="3""#, "a=1", "a=2"];
         let run = |op: RangeAggOp, order: &[usize]| -> Vec<(i64, f64)> {
             let client = ClientAgg {
@@ -4437,19 +4455,97 @@ mod tests {
         };
         // Every input permutation must give the SAME, body-order-determined
         // answer (byte-stable across shuffled runs).
-        for order in [[0, 1, 2], [2, 1, 0], [1, 0, 2], [1, 2, 0], [2, 0, 1]] {
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [2, 1, 0],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+        ] {
             assert_eq!(
                 run(RangeAggOp::FirstOverTime, &order),
-                vec![(10, 3.0)],
-                "first = the min-(ts,stream_hash,tie_rank) sample (body order), input {order:?}"
+                vec![(10, 1.0)],
+                "first = the min-(ts,stream_hash,value) sample (value order), input {order:?}"
             );
             assert_eq!(
                 run(RangeAggOp::LastOverTime, &order),
-                vec![(10, 2.0)],
-                "last = the max-(ts,stream_hash,tie_rank) sample (body order), input {order:?}"
+                vec![(10, 3.0)],
+                "last = the max-(ts,stream_hash,value) sample (value order), input {order:?}"
             );
             // Class C: the fold runs in the same canonical order.
             assert_eq!(run(RangeAggOp::SumOverTime, &order), vec![(10, 6.0)]);
+        }
+    }
+
+    /// **T10 (issue #624, part 4, F1): on the instant route too, samples of
+    /// one stream at one nanosecond fold in ascending value order**, whatever
+    /// order their bodies arrive in.
+    #[test]
+    fn instant_same_stream_ties_fold_in_value_order() {
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = ClientWindow::Instant {
+            start_ns: 0,
+            end_ns: 60,
+        };
+        let bodies = ["v=3", "v=1"];
+        let run = |op: RangeAggOp, order: &[usize]| -> Vec<f64> {
+            let client = ClientAgg {
+                pipeline: parse_pipeline(r#"{x="y"} | logfmt | unwrap v"#),
+                value: ClientValue::Unwrap,
+                range_op: op,
+                param: None,
+                absent_labels: vec![],
+                grouping: None,
+            };
+            let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+            let rows: Vec<MetricScanRow> = order
+                .iter()
+                .map(|&i| scan_row(Fingerprint::from_raw(1), 30, bodies[i]))
+                .collect();
+            let res =
+                run_client_agg_rows(&rows, &compiled, &meta, &client, window, None).expect("eval");
+            let QueryResult::Vector(items) = res else {
+                panic!("expected a vector, got {res:?}");
+            };
+            items.iter().map(|s| s.value).collect()
+        };
+        for order in [[0, 1], [1, 0]] {
+            assert_eq!(
+                run(RangeAggOp::FirstOverTime, &order),
+                vec![1.0],
+                "first, input {order:?}"
+            );
+            assert_eq!(
+                run(RangeAggOp::LastOverTime, &order),
+                vec![3.0],
+                "last, input {order:?}"
+            );
+        }
+    }
+
+    /// **T11 (issue #624, part 4): the quantile keeps the ceiling index on
+    /// both routes.** The reference's `min(n - 1, lower + 1)` differs only
+    /// where the weight is 0 and the next value is infinite; ours answers
+    /// the lower value there, and the statement's form computes the same
+    /// index as [`quantile_of`].
+    #[test]
+    fn the_quantile_keeps_the_ceiling_index() {
+        assert_eq!(quantile_of(&mut [1.0, f64::INFINITY], 0.0), 1.0);
+        // The statement's form, `s[floor(rk) + 1] * (1 - w) + s[ceil(rk) + 1]
+        // * w` over 1-based arrays, transcribed over 0-based ones.
+        let statement = |s: &[f64], q: f64| -> f64 {
+            let rk = q * (s.len() - 1) as f64;
+            let w = rk - rk.floor();
+            s[rk.floor() as usize] * (1.0 - w) + s[rk.ceil() as usize] * w
+        };
+        for q in [0.0, 0.5] {
+            let mut v = [1.0, 2.0];
+            assert_eq!(
+                statement(&[1.0, 2.0], q).to_bits(),
+                quantile_of(&mut v, q).to_bits(),
+                "q = {q}"
+            );
         }
     }
 
@@ -5029,6 +5125,7 @@ mod tests {
                             state.rate_window_ns,
                             0,
                             pts,
+                            state.grid_point(k),
                         ) {
                             points.push((state.grid_point(k), v.to_bits()));
                         }
@@ -5235,11 +5332,18 @@ mod tests {
     /// against `rate_counter_extrapolated`: that now delegates to the very
     /// function under test, so such a comparison would move with the code and
     /// prove nothing.
+    ///
+    /// Issue #624, part 4: the transcription is F4's — spans in seconds, the
+    /// window `(window_end - range, window_end]`, computed in `i128`.
     #[test]
     fn rate_counter_over_a_borrowed_window_is_bit_identical_to_the_owning_form() {
-        /// The pre-refactor owned-`Vec` implementation, transcribed verbatim
-        /// and kept independent of the production code path.
-        fn reference(mut pts: Vec<(i64, f64)>, rate_window_ns: Option<u64>) -> f64 {
+        /// The owned-`Vec` implementation, transcribed and kept independent
+        /// of the production code path.
+        fn reference(
+            mut pts: Vec<(i64, f64)>,
+            rate_window_ns: Option<u64>,
+            window_end_ns: i64,
+        ) -> f64 {
             if pts.len() < 2 {
                 return 0.0;
             }
@@ -5259,11 +5363,10 @@ mod tests {
                 }
                 last_value = f;
             }
-            let sel_range_ms: i128 = (rng_ns / 1_000_000) as i128;
-            let range_start = first_t as i128 - sel_range_ms;
-            let mut duration_to_start = (first_t as i128 - range_start) as f64 / 1000.0;
-            let duration_to_end = 0.0_f64;
-            let sampled_interval = (last_t as i128 - first_t as i128) as f64 / 1000.0;
+            let range_start = window_end_ns as i128 - rng_ns as i128;
+            let mut duration_to_start = (first_t as i128 - range_start) as f64 / 1e9;
+            let duration_to_end = (window_end_ns as i128 - last_t as i128) as f64 / 1e9;
+            let sampled_interval = (last_t as i128 - first_t as i128) as f64 / 1e9;
             let average_duration = sampled_interval / (pts.len() - 1) as f64;
             if result_value > 0.0 && first_f >= 0.0 {
                 let duration_to_zero = sampled_interval * (first_f / result_value);
@@ -5302,6 +5405,8 @@ mod tests {
             vec![(0, 0.0), (1_000_000, 3.3), (5_000_000, 3.3000000000000003)],
         ];
         for pts in &windows {
+            // The window ends 3 ns after its last sample.
+            let window_end_ns = pts.iter().map(|(ts, _)| ts + 3).max().unwrap_or(0);
             let ordered: Vec<WinSample> = pts
                 .iter()
                 .enumerate()
@@ -5324,11 +5429,12 @@ mod tests {
                     rate_window_ns,
                     0,
                     &ordered,
+                    window_end_ns,
                 );
                 let owned = if ordered.is_empty() {
                     None
                 } else {
-                    Some(reference(pts.clone(), rate_window_ns))
+                    Some(reference(pts.clone(), rate_window_ns, window_end_ns))
                 };
                 match (borrowed, owned) {
                     (None, None) => {}
@@ -6573,16 +6679,18 @@ mod tests {
     /// release — the spans are computed in i128 (review finding 2).
     #[test]
     fn rate_counter_extreme_timestamps_do_not_overflow() {
-        // A first sample near i64::MIN underflows `first_t - sel_range_ms`.
+        // A window ending near i64::MIN underflows `window_end - range`.
         let v = rate_counter_extrapolated(
             vec![(i64::MIN + 1, 1.0), (i64::MIN + 1_000, 2.0)],
             Some(60_000_000_000),
+            i64::MIN + 2_000,
         );
         assert!(v.is_finite(), "near-i64::MIN must not overflow, got {v}");
         // A window spanning near-MIN to near-MAX overflows `last_t - first_t`.
         let v = rate_counter_extrapolated(
             vec![(i64::MIN + 1, 1.0), (i64::MAX - 1, 2.0)],
             Some(60_000_000_000),
+            i64::MAX - 1,
         );
         assert!(v.is_finite(), "full-i64-span must not overflow, got {v}");
     }
@@ -6839,16 +6947,17 @@ mod tests {
     /// Code review round 2 (M8-LQ3, finding 1): the `rate_counter`
     /// per-bucket point retention is bounded by [`MAX_COUNTER_VALUES`],
     /// mirroring the quantile bound. Below the cap the reset-aware rate is
-    /// unaffected by the guard (four samples 10,30,5,12 by ts → increase 32,
-    /// span 30e9 ns, scaled by the ns/ms extrapolation factor and divided by
-    /// the 60s window = 0.5333344); charged to the boundary the next sample
-    /// trips the named `CounterValues` too-broad error — complete-or-error,
-    /// never a silently truncated increase.
+    /// unaffected by the guard (four samples 10,30,5,12 at 10–40 s →
+    /// increase 32, extrapolated in seconds to the window `(0, 60s]` (issue
+    /// #624, part 4, F4) and divided by the 60 s window = 0.788888888888889);
+    /// charged to the boundary the next sample trips the named
+    /// `CounterValues` too-broad error — complete-or-error, never a silently
+    /// truncated increase.
     #[test]
     fn rate_counter_point_retention_is_capped_without_changing_values_below_it() {
         let (compiled, client, meta, window) = rate_counter_state_inputs();
-        // Below the cap: the reset-aware value is exactly 32/60, unchanged
-        // by the retention guard.
+        // Below the cap: the reset-aware value, unchanged by the retention
+        // guard.
         let rows = [
             scan_row(Fingerprint::from_raw(1), 10_000_000_000, "c=10"),
             scan_row(Fingerprint::from_raw(1), 20_000_000_000, "c=30"),
@@ -6869,7 +6978,7 @@ mod tests {
             panic!("expected a vector, got {result:?}");
         };
         assert_eq!(items.len(), 1, "one series expected: {items:?}");
-        assert_eq!(items[0].value, 0.5333344);
+        assert_eq!(items[0].value, 0.788888888888889);
 
         // At the boundary: the next retained point trips the named error,
         // exactly as the quantile bound does — driven through the real

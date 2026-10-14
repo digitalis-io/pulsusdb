@@ -51,8 +51,8 @@ use crate::harness::{
     classify_push_send, completeness_poll_timeout, poll_until, query_request_timeout,
 };
 use crate::logs_corpus::{
-    self, ExpectedResult, LogCorpus, LogCorpusSpec, MetricMatrix, MetricVector, OrderedEntries,
-    RangeGrid,
+    self, CORPUS_NOW_MARGIN_NS, ExpectedResult, LogCorpus, LogCorpusSpec, MetricMatrix,
+    MetricVector, OrderedEntries, RangeGrid,
 };
 use crate::logs_sm_corpus;
 use crate::metrics::write_artifact;
@@ -72,10 +72,9 @@ const COMPLETENESS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// flooding CI logs.
 const COMPLETENESS_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(3);
 
-/// Margin between the corpus's last record and "now" at generation time,
-/// and the query-window slack on each side (both stores get identical
-/// nanosecond bounds).
-const CORPUS_NOW_MARGIN_NS: i64 = 5_000_000_000;
+/// The query-window slack on each side (both stores get identical
+/// nanosecond bounds); the margin before "now" is
+/// [`logs_corpus::CORPUS_NOW_MARGIN_NS`], beside the corpus that reads it.
 const WINDOW_SLACK_NS: i64 = 3_600_000_000_000;
 
 /// The `reader.logql_pipeline_scan_factor` the deployed e2e server runs
@@ -2785,7 +2784,12 @@ mod tests {
     /// once an informational case starts matching the oracle) and the rate
     /// case is renamed `metric_rate_sliding`. The ledger entry stays,
     /// marked RESOLVED.
-    const INFORMATIONAL_CASE_IDS: &[&str] = &[];
+    const INFORMATIONAL_CASE_IDS: &[&str] = &[
+        "metric_rate_counter_reset",
+        "metric_rate_counter_sparse",
+        "metric_rate_counter_boundary",
+        "metric_rate_counter_dup_ts",
+    ];
 
     fn shipped_fixture() -> LogsFixture {
         let root = crate::engine::workspace_root();
@@ -3061,6 +3065,12 @@ mod tests {
     /// `[range]` width, never the range-widened scan `start_ns`.
     fn hermetic_window(mp: &pulsus_read::logql::MetricPlan) -> pulsus_read::logql::ClientWindow {
         match mp.step_ns {
+            // Issue #624, part 5: an instant query lowered at its one grid
+            // point is evaluated as the instant query it answers.
+            Some(_) if mp.answers_instant() => pulsus_read::logql::ClientWindow::Instant {
+                start_ns: mp.start_ns,
+                end_ns: mp.end_ns,
+            },
             Some(step_ns) => pulsus_read::logql::ClientWindow::Range {
                 grid_start_ns: mp.grid_start_ns,
                 end_ns: mp.end_ns,
@@ -4572,6 +4582,10 @@ mod tests {
                     // aggregation today's route runs.
                     pulsus_read::logql::sql::MetricValue::Staged(staged) => {
                         staged.todays_route.clone()
+                    }
+                    // Issue #624, part 4: so does a reduced one.
+                    pulsus_read::logql::sql::MetricValue::Reduced(reduced) => {
+                        reduced.todays_route.clone()
                     }
                 };
                 &fallback

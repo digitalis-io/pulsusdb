@@ -398,8 +398,14 @@ impl MetricPlan {
         match &self.value {
             sql::MetricValue::Shaped(shape) => Some(*shape),
             sql::MetricValue::Staged(staged) => Some(staged.shape),
-            sql::MetricValue::Unwrapped(_) => None,
+            sql::MetricValue::Unwrapped(_) | sql::MetricValue::Reduced(_) => None,
         }
+    }
+
+    /// Whether the plan answers an instant query (issue #624, part 5): an
+    /// instant plan, or an instant query lowered at its one grid point.
+    pub fn answers_instant(&self) -> bool {
+        self.step_ns.is_none()
     }
 }
 
@@ -2355,6 +2361,18 @@ fn unwrapped_key_route(
     })
 }
 
+/// Issue #624, part 4: the `| unwrap` reducers the database reduces, as
+/// [`sql::ReducedUnwrap`], or `None` for today's route.
+fn reduced_unwrap_route(
+    op: RangeAggOp,
+    pipeline: &[Stage],
+    grouping: Option<&RangeGrouping>,
+    quantile: Option<f64>,
+) -> Option<sql::ReducedUnwrap> {
+    let _ = (op, pipeline, grouping, quantile);
+    None
+}
+
 /// The range step's rules for one range aggregation (issue #507): what the
 /// reference's sample extractor does to a line's labels beyond the range
 /// aggregation's own grouping. Derived from the plan's existing fields, so no
@@ -3170,6 +3188,7 @@ fn metric_plan(
             regexp: regexp.clone(),
             json: json.clone(),
             logfmt: logfmt.clone(),
+            instant: false,
         })),
         (None, false) => sql::MetricValue::Shaped(shape),
     };
@@ -9721,5 +9740,150 @@ mod tests {
         )
         .expect("plan");
         assert!(matches!(mp.value, sql::MetricValue::Shaped(_)));
+    }
+
+    const REDUCED: &str = "raw: unwrapped range aggregation in the database (issue #624)";
+
+    /// **T1 (issue #624, part 4): the eleven `| unwrap` reducers lower over
+    /// a pipeline with no parser, keyed as §2 decides, range and instant;
+    /// the rest stay on today's route.**
+    #[test]
+    fn unwrap_reducers_lower_and_the_rest_stay() {
+        let range = QuerySpec::Range {
+            start_ns: 600_000_000_000,
+            end_ns: 1_200_000_000_000,
+            step_ns: 60_000_000_000,
+        };
+        let instant = QuerySpec::Instant {
+            at_ns: 1_200_000_000_000,
+        };
+        let keep =
+            |names: &[&str]| sql::KeyMode::Keep(names.iter().map(|n| n.to_string()).collect());
+        let drop =
+            |names: &[&str]| sql::KeyMode::Drop(names.iter().map(|n| n.to_string()).collect());
+        const CONVERSIONS: [(&str, sql::UnwrapConversion); 3] = [
+            ("x", sql::UnwrapConversion::Number),
+            ("duration(x)", sql::UnwrapConversion::Duration),
+            ("bytes(x)", sql::UnwrapConversion::Bytes),
+        ];
+        let mut cases: Vec<(String, sql::KeyMode, RangeAggOp)> = Vec::new();
+        for (op, reducer) in [
+            ("avg_over_time", RangeAggOp::AvgOverTime),
+            ("min_over_time", RangeAggOp::MinOverTime),
+            ("max_over_time", RangeAggOp::MaxOverTime),
+            ("stddev_over_time", RangeAggOp::StddevOverTime),
+            ("stdvar_over_time", RangeAggOp::StdvarOverTime),
+            ("quantile_over_time", RangeAggOp::QuantileOverTime),
+            ("first_over_time", RangeAggOp::FirstOverTime),
+            ("last_over_time", RangeAggOp::LastOverTime),
+        ] {
+            let param = if reducer == RangeAggOp::QuantileOverTime {
+                "0.9, "
+            } else {
+                ""
+            };
+            for (conv, _) in CONVERSIONS {
+                let inner =
+                    format!(r#"{op}({param}{{a="b"}} |= "q" | unwrap {conv} | __error__="" [5m])"#);
+                cases.push((format!("{inner} by (route)"), keep(&["route"]), reducer));
+                cases.push((inner.clone(), drop(&["x"]), reducer));
+                cases.push((
+                    format!("{inner} without (trace_id)"),
+                    drop(&["trace_id", "x"]),
+                    reducer,
+                ));
+            }
+        }
+        for (op, reducer, injected) in [
+            ("sum_over_time", RangeAggOp::SumOverTime, true),
+            ("rate", RangeAggOp::Rate, true),
+            ("rate_counter", RangeAggOp::RateCounter, false),
+        ] {
+            for (conv, _) in CONVERSIONS {
+                let inner = format!(r#"{op}({{a="b"}} | unwrap {conv} | __error__="" [5m])"#);
+                cases.push((inner.clone(), drop(&["x"]), reducer));
+                cases.push((
+                    format!("sum by (route) ({inner})"),
+                    if injected {
+                        keep(&["route"])
+                    } else {
+                        drop(&["x"])
+                    },
+                    reducer,
+                ));
+                cases.push((format!("max by (route) ({inner})"), drop(&["x"]), reducer));
+            }
+        }
+        assert_eq!(cases.len(), 8 * 3 * 3 + 3 * 3 * 3);
+        for (query, mode, reducer) in &cases {
+            let conversion = CONVERSIONS
+                .iter()
+                .find(|(c, _)| query.contains(&format!("unwrap {c} |")))
+                .map(|(_, k)| *k)
+                .expect("a conversion");
+            for spec in [range, instant] {
+                let mp = metric_mp(query, spec).unwrap_or_else(|e| panic!("{query}: {e}"));
+                assert!(mp.client.is_none(), "{query} ({spec:?}): must lower");
+                assert_eq!(mp.routing.reason, REDUCED, "{query} ({spec:?})");
+                let sql::MetricValue::Reduced(r) = &mp.value else {
+                    panic!(
+                        "{query} ({spec:?}): expected a reduced plan, got {:?}",
+                        mp.value
+                    );
+                };
+                assert_eq!(&r.mode, mode, "{query} ({spec:?})");
+                assert_eq!(r.reducer, *reducer, "{query}");
+                assert_eq!(r.label, "x", "{query}");
+                assert_eq!(r.conversion, conversion, "{query}");
+                assert_eq!(
+                    r.quantile,
+                    (*reducer == RangeAggOp::QuantileOverTime).then_some(0.9),
+                    "{query}"
+                );
+                match spec {
+                    QuerySpec::Instant { at_ns } => {
+                        assert!(r.instant, "{query}: an instant payload");
+                        assert!(mp.answers_instant(), "{query}");
+                        assert_eq!(mp.step_ns.map(|s| s.get()), Some(300_000_000_000));
+                        assert_eq!((mp.grid_start_ns, mp.end_ns), (at_ns, at_ns), "{query}");
+                    }
+                    QuerySpec::Range { .. } => {
+                        assert!(!r.instant, "{query}");
+                        assert!(!mp.answers_instant(), "{query}");
+                    }
+                }
+            }
+        }
+
+        // Today's route.
+        for query in [
+            r#"avg_over_time({a="b"} | json | unwrap x [5m])"#,
+            r#"avg_over_time({a="b"} | drop a | unwrap x [5m])"#,
+            r#"avg_over_time({a="b"} | unwrap x | x > 1 [5m])"#,
+            r#"avg_over_time({a="b"} | x > 1 | unwrap x [5m])"#,
+            r#"avg_over_time({a="b"} | unwrap x [5m]) by (x)"#,
+            r#"avg_over_time({a="b"} | unwrap a_extracted [5m])"#,
+            r#"quantile_over_time(NaN, {a="b"} | unwrap x [5m])"#,
+            r#"absent_over_time({a="b"} | unwrap x [5m])"#,
+        ] {
+            for spec in [range, instant] {
+                let mp = metric_mp(query, spec).unwrap_or_else(|e| panic!("{query}: {e}"));
+                assert!(mp.client.is_some(), "{query} ({spec:?}): today's route");
+                assert!(
+                    !matches!(mp.value, sql::MetricValue::Reduced(_)),
+                    "{query} ({spec:?})"
+                );
+            }
+        }
+        for spec in [range, instant] {
+            let query = r#"variants(avg_over_time({a="b"} | unwrap x [5m])) of ({a="b"}[5m])"#;
+            let Plan::MetricBinary(node) = plan_at(query, spec).expect("plan") else {
+                panic!("{query}: a variants node");
+            };
+            let MetricNode::Variants { scan, .. } = &node else {
+                panic!("{query}: a variants node");
+            };
+            assert!(scan.client.is_some(), "{query} ({spec:?}): today's route");
+        }
     }
 }

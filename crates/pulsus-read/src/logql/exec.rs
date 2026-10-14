@@ -2994,6 +2994,9 @@ impl LogQlEngine {
                         super::sql::MetricValue::Shaped(_) | super::sql::MetricValue::Staged(_) => {
                             bucketed_range_sql(mp, &services, &fingerprints, &lowered.predicates)
                         }
+                        super::sql::MetricValue::Reduced(_) => {
+                            Err(BucketGridRefusal::StepNotPositive)
+                        }
                     };
                     match rendered {
                         Ok(sql) => sql,
@@ -6686,6 +6689,10 @@ pub fn bucketed_fallback_client_agg(mp: &MetricPlan) -> ClientAgg {
     // route runs, its stages included.
     if let super::sql::MetricValue::Staged(s) = &mp.value {
         return s.todays_route.clone();
+    }
+    // Issue #624, part 4: so does a reduced one.
+    if let super::sql::MetricValue::Reduced(r) = &mp.value {
+        return r.todays_route.clone();
     }
     ClientAgg {
         pipeline: Vec::new(),

@@ -14918,3 +14918,1377 @@ async fn a_filter_after_a_targeted_parser_returns_what_the_evaluator_returns() {
     );
     drop_db_624(&admin, &db).await;
 }
+
+// ---------------------------------------------------------------------
+// Issue #624, parts 4 and 5: the `| unwrap` reducers, and instant queries
+// with a pipeline, in the database.
+// ---------------------------------------------------------------------
+
+/// The reduced statement: its fan-out of each run to its grid points.
+fn is_reduced_624p4(query: &str) -> bool {
+    query.contains("ARRAY JOIN range(lo, hi + 1) AS k")
+}
+
+/// Today's range read, `metric_raw_samples_sliding`.
+fn is_todays_sliding_624p4(query: &str) -> bool {
+    is_todays_624(query)
+        && query.contains("ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC")
+}
+
+/// Today's instant read, `metric_raw_samples`.
+fn is_todays_instant_624p4(query: &str) -> bool {
+    is_todays_624(query) && query.contains("ORDER BY timestamp_ns ASC")
+}
+
+/// One instant answer: sorted labels and the value's bits, sorted.
+type InstantAnswer624p4 = Vec<(Vec<(String, String)>, u64)>;
+
+/// One instant query at `at_ns` through an engine built for this run.
+async fn run_instant_624p4(
+    db: &str,
+    hooks: pulsus_read::logql::exec::KeyRouteTestHooks,
+    comment: Option<&str>,
+    query: &str,
+    at_ns: i64,
+) -> Result<InstantAnswer624p4, ReadError> {
+    let mut engine = LogQlEngine::new(data_client(db).await, engine_config(db, 64 * 1024 * 1024))
+        .with_key_route_test_hooks(hooks);
+    if let Some(c) = comment {
+        engine = engine.with_query_log_comment(c.to_string());
+    }
+    let params = QueryParams {
+        spec: QuerySpec::Instant { at_ns },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let (result, _warnings) = engine.query(&parse(query).expect("parse"), &params).await?;
+    let QueryResult::Vector(samples) = result else {
+        panic!("{query}: expected a vector, got {result:?}");
+    };
+    let mut out: InstantAnswer624p4 = samples
+        .into_iter()
+        .map(|s| {
+            let mut labels = s.labels;
+            labels.sort();
+            (labels, s.value.to_bits())
+        })
+        .collect();
+    out.sort();
+    Ok(out)
+}
+
+/// The two instant answers agree: equal vectors, or the same pipeline error.
+fn same_instant_outcome_624p4(
+    what: &str,
+    lowered: &Result<InstantAnswer624p4, ReadError>,
+    todays: &Result<InstantAnswer624p4, ReadError>,
+) {
+    match (lowered, todays) {
+        (Ok(a), Ok(b)) => assert_eq!(a, b, "{what}: the lowered answer must be today's"),
+        (
+            Err(ReadError::MetricPipelineError { error_type: a, .. }),
+            Err(ReadError::MetricPipelineError { error_type: b, .. }),
+        ) => assert_eq!(a, b, "{what}: the same pipeline error"),
+        (a, b) => panic!("{what}: lowered {a:?}, today's {b:?}"),
+    }
+}
+
+/// A range query on the 60 s grid over `[start, end]`.
+fn grid_624p4(start_ns: i64, end_ns: i64) -> QueryParams {
+    QueryParams {
+        spec: QuerySpec::Range {
+            start_ns,
+            end_ns,
+            step_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    }
+}
+
+/// The landing table's columns, in the order every seed below lists them.
+const LANDING_624P4: &str = "(received_ms, kind, service, fingerprint, timestamp_ns, severity, \
+     body, structured_metadata, month, labels, updated_ns, pattern, pattern_count)";
+
+/// T4's corpus, in a fresh database: `(admin, db, T)`.
+///
+/// `c624p4`: 20 streams `{inst="<s>", pod="p<s % 5>"}`, one line a second
+/// from `T + 1s` to `T + 600s`, every stream at the same seconds, so lines of
+/// two streams with the same `route` meet at one nanosecond everywhere. Every
+/// 37th second a stream has a second line at the same nanosecond with other
+/// values and the same `level` and `route`. Metadata `dur` (numbers), `lat`
+/// (durations), `size` (bytes), `level`, `route` (one value holding `"` and
+/// `\`), `trace_id`; one line in a hundred fails each conversion (`n/a`,
+/// `abc`, `kb`).
+///
+/// `c624p4lean`: 4 streams `{pod="q<i>"}`, the same seconds, metadata only
+/// `dur`, `lat`, `size` and `route`, each from a short cycle.
+async fn seed_reduced_corpus_624p4() -> (ChClient, String, i64) {
+    let (admin, db) = fresh_db_624(pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_p4_{}",
+        uuid::Uuid::new_v4().simple()
+    )))
+    .await;
+    let t = ((now_ns() - 3_600_000_000_000) / 60_000_000_000) * 60_000_000_000;
+    let month = format!("toStartOfMonth(toDate(fromUnixTimestamp64Nano(toInt64({t}))))");
+    exec_624(
+        &admin,
+        &format!(
+            "INSERT INTO {db}.log_landing {LANDING_624P4} \
+             SELECT toUnixTimestamp64Milli(now64(3)), 1, 'c624p4', toUInt128(6240400 + number), \
+             0, 0, '', '', {month}, concat('{{\"inst\":\"', toString(number), '\",\"pod\":\"p', \
+             toString(number % 5), '\",\"service_name\":\"c624p4\"}}'), 0, '', 0 \
+             FROM numbers(20)"
+        ),
+    )
+    .await;
+    exec_624(
+        &admin,
+        &format!(
+            "INSERT INTO {db}.log_landing {LANDING_624P4} \
+             SELECT toUnixTimestamp64Milli(now64(3)), 1, 'c624p4lean', \
+             toUInt128(6240500 + number), 0, 0, '', '', {month}, concat('{{\"pod\":\"q', \
+             toString(number), '\",\"service_name\":\"c624p4lean\"}}'), 0, '', 0 \
+             FROM numbers(4)"
+        ),
+    )
+    .await;
+    // `s` the stream, `i` the second, `k` the value seed; `tie` adds the
+    // second line of a same-stream tie.
+    let values = |k: &str, fail: &str| {
+        format!(
+            "if({fail} = 0, 'n/a', concat(toString({k} % 997), '.', toString({k} % 10))) AS dur, \
+             if({fail} = 1, 'abc', multiIf({k} % 3 = 0, concat(toString({k} % 900), 'ms'), \
+               {k} % 3 = 1, concat(toString({k} % 50), '.', toString({k} % 7), 's'), \
+               concat(toString({k} % 5), 'm', toString({k} % 60), 's'))) AS lat, \
+             if({fail} = 2, 'kb', multiIf({k} % 3 = 0, concat(toString({k} % 900), 'KB'), \
+               {k} % 3 = 1, concat(toString({k} % 50), ' MiB'), \
+               concat(toString({k} % 10000), 'b'))) AS size"
+        )
+    };
+    for tie in [false, true] {
+        let (k, filter) = if tie {
+            ("(i * 7 + s * 13 + 5)", "WHERE i % 37 = 0")
+        } else {
+            ("(i * 7 + s * 13)", "")
+        };
+        exec_624(
+            &admin,
+            &format!(
+                "INSERT INTO {db}.log_landing {LANDING_624P4} \
+                 SELECT toUnixTimestamp64Milli(now64(3)), 0, 'c624p4', toUInt128(6240400 + s), \
+                 toInt64({t}) + toInt64(i) * 1000000000, 0, concat('x', toString({k})), \
+                 concat('{{\"dur\":', toJSONString(dur), ',\"lat\":', toJSONString(lat), \
+                   ',\"level\":', toJSONString(level), ',\"route\":', toJSONString(route), \
+                   ',\"size\":', toJSONString(size), ',\"trace_id\":', toJSONString(trace), '}}'), \
+                 toDate(0), '', 0, '', 0 \
+                 FROM (SELECT intDiv(number, 600) AS s, number % 600 + 1 AS i, \
+                       {}, ['info', 'warn', 'error'][i % 3 + 1] AS level, \
+                       ['ra', 'rb', 'r\"q\\\\z', 'rd'][(i + s) % 4 + 1] AS route, \
+                       hex({k} * 1000 + s) AS trace \
+                       FROM numbers(20 * 600) {filter})",
+                values(k, "((i + s) % 100)")
+            ),
+        )
+        .await;
+    }
+    exec_624(
+        &admin,
+        &format!(
+            "INSERT INTO {db}.log_landing {LANDING_624P4} \
+             SELECT toUnixTimestamp64Milli(now64(3)), 0, 'c624p4lean', toUInt128(6240500 + s), \
+             toInt64({t}) + toInt64(i) * 1000000000, 0, 'y', \
+             concat('{{\"dur\":', toJSONString(dur), ',\"lat\":', toJSONString(lat), \
+               ',\"route\":', toJSONString(route), ',\"size\":', toJSONString(size), '}}'), \
+             toDate(0), '', 0, '', 0 \
+             FROM (SELECT intDiv(number, 600) AS s, number % 600 + 1 AS i, {}, \
+                   ['ra', 'rb'][(i + s) % 2 + 1] AS route FROM numbers(4 * 600))",
+            values("(i % 5 + s)", "((i + s) % 100)")
+        ),
+    )
+    .await;
+    (admin, db, t)
+}
+
+/// One count off `db`'s lines.
+async fn count_624p4(admin: &ChClient, sql: &str) -> u64 {
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug)]
+    struct N {
+        n: u64,
+    }
+    let mut stream = admin
+        .query_stream::<N>(sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    let n = stream
+        .next()
+        .await
+        .expect("one row")
+        .expect("decode the count")
+        .n;
+    drop(stream);
+    n
+}
+
+/// T4's queries at `range`: `(query, lowers)`.
+fn reduced_queries_624p4(range: &str) -> Vec<String> {
+    let main = r#"{service_name="c624p4"}"#;
+    let lean = r#"{service_name="c624p4lean"}"#;
+    const VALUES: [(&str, &str); 3] = [
+        ("dur", "lat, size"),
+        ("duration(lat)", "dur, size"),
+        ("bytes(size)", "dur, lat"),
+    ];
+    let mut out = Vec::new();
+    for op in [
+        "avg_over_time",
+        "min_over_time",
+        "max_over_time",
+        "stddev_over_time",
+        "stdvar_over_time",
+        "quantile_over_time",
+        "first_over_time",
+        "last_over_time",
+    ] {
+        let param = if op == "quantile_over_time" {
+            "0.9, "
+        } else {
+            ""
+        };
+        for (value, others) in VALUES {
+            let inner = format!(r#"{op}({param}{main} | unwrap {value} | __error__="" [{range}])"#);
+            out.push(format!("{inner} by (route)"));
+            out.push(format!("{inner} without (trace_id, {others})"));
+        }
+    }
+    for op in ["sum_over_time", "rate", "rate_counter"] {
+        for (value, _) in VALUES {
+            let over =
+                |sel: &str| format!(r#"{op}({sel} | unwrap {value} | __error__="" [{range}])"#);
+            out.push(over(lean));
+            if op != "rate_counter" {
+                out.push(format!("sum by (route) ({})", over(main)));
+            }
+            out.push(format!("max by (route) ({})", over(lean)));
+        }
+    }
+    out
+}
+
+/// **T4 (issue #624, part 4): every lowered `| unwrap` reducer answers what
+/// today's route answers, bit for bit**, keyed `by` and `without`, under a
+/// parent `sum` and a parent `max`, at a range equal to, above and below the
+/// step. The query log holds the reduced statement for one run and today's
+/// sliding read for the other.
+#[tokio::test]
+async fn unwrap_reducers_answer_as_todays_route() {
+    skip_unless_live!();
+    let (admin, db, t) = seed_reduced_corpus_624p4().await;
+    // Non-vacuous: both kinds of tie, each between two values.
+    let same_stream = count_624p4(
+        &admin,
+        &format!(
+            "SELECT count() AS n FROM (SELECT fingerprint, timestamp_ns FROM {db}.log_samples \
+             WHERE service = 'c624p4' GROUP BY fingerprint, timestamp_ns \
+             HAVING uniqExact(JSONExtractString(structured_metadata, 'dur')) > 1 \
+             AND uniqExact(JSONExtractString(structured_metadata, 'route')) = 1)"
+        ),
+    )
+    .await;
+    assert!(same_stream >= 100, "same-stream ties: {same_stream}");
+    let cross_stream = count_624p4(
+        &admin,
+        &format!(
+            "SELECT count() AS n FROM (SELECT timestamp_ns FROM {db}.log_samples \
+             WHERE service = 'c624p4' \
+             GROUP BY JSONExtractString(structured_metadata, 'route'), timestamp_ns \
+             HAVING uniqExact(fingerprint) > 1 \
+             AND uniqExact(JSONExtractString(structured_metadata, 'dur')) > 1)"
+        ),
+    )
+    .await;
+    assert!(cross_stream >= 100, "cross-stream ties: {cross_stream}");
+
+    let params = grid_624p4(t, t + 600_000_000_000);
+    let mut comments: Vec<(String, bool)> = Vec::new();
+    let mut nonempty = 0usize;
+    let mut total = 0usize;
+    for range in ["60s", "150s", "30s"] {
+        for query in reduced_queries_624p4(range) {
+            let lowered_comment = format!("c624p4t4-{}", uuid::Uuid::new_v4().simple());
+            let todays_comment = format!("c624p4t4-{}", uuid::Uuid::new_v4().simple());
+            let lowered = run_624(
+                &db,
+                hooks_624(false, None, None),
+                Some(&lowered_comment),
+                &query,
+                &params,
+            )
+            .await;
+            let todays = run_624(
+                &db,
+                hooks_624(true, None, None),
+                Some(&todays_comment),
+                &query,
+                &params,
+            )
+            .await;
+            same_outcome_624(&query, &lowered, &todays);
+            total += 1;
+            if lowered.as_ref().is_ok_and(|a| !a.is_empty()) {
+                nonempty += 1;
+            }
+            comments.push((lowered_comment, true));
+            comments.push((todays_comment, false));
+        }
+    }
+    assert_eq!(total, 3 * (8 * 3 * 2 + 3 * 3 * 3 - 3));
+    assert_eq!(nonempty, total, "every query answers");
+    let all: Vec<String> = comments.iter().map(|(c, _)| c.clone()).collect();
+    let logged = logged_624(&admin, &all).await;
+    for (comment, lowered) in &comments {
+        let rows = logged
+            .get(comment)
+            .unwrap_or_else(|| panic!("{comment}: no statement logged"));
+        if *lowered {
+            assert!(
+                rows.iter()
+                    .any(|r| is_reduced_624p4(&r.query) && r.exception_code == 0),
+                "{comment}: the reduced statement answers: {rows:#?}"
+            );
+            assert!(
+                !rows.iter().any(|r| is_todays_sliding_624p4(&r.query)),
+                "{comment}: no read of today's route: {rows:#?}"
+            );
+        } else {
+            assert!(
+                rows.iter().any(|r| is_todays_sliding_624p4(&r.query)),
+                "{comment}: {rows:#?}"
+            );
+            assert!(
+                !rows.iter().any(|r| is_reduced_624p4(&r.query)),
+                "{comment}: {rows:#?}"
+            );
+        }
+    }
+    drop_db_624(&admin, &db).await;
+}
+
+/// **T8 (issue #624, part 4): a reduced statement that runs out of memory
+/// hands the query to today's route, once**, and the answer is today's.
+#[tokio::test]
+async fn a_reduced_query_out_of_memory_answers_on_todays_route() {
+    skip_unless_live!();
+    let (admin, db, t) = seed_reduced_corpus_624p4().await;
+    let params = grid_624p4(t, t + 600_000_000_000);
+    let query =
+        r#"avg_over_time({service_name="c624p4"} | unwrap dur | __error__="" [150s]) by (route)"#;
+    let comment = format!("c624p4t8-{}", uuid::Uuid::new_v4().simple());
+    let got = run_624(
+        &db,
+        hooks_624(false, None, Some(1)),
+        Some(&comment),
+        query,
+        &params,
+    )
+    .await
+    .expect("today's route answers");
+    let want = run_624(&db, hooks_624(true, None, None), None, query, &params)
+        .await
+        .expect("today's route answers");
+    assert_eq!(got, want);
+    assert!(!got.is_empty());
+    let logged = logged_624(&admin, std::slice::from_ref(&comment)).await;
+    let rows = logged.get(&comment).cloned().unwrap_or_default();
+    let reduced: Vec<&CommentedRow624> =
+        rows.iter().filter(|r| is_reduced_624p4(&r.query)).collect();
+    assert_eq!(reduced.len(), 1, "{rows:#?}");
+    assert_eq!(reduced[0].exception_code, 241, "{rows:#?}");
+    assert_eq!(
+        rows.iter()
+            .filter(|r| is_todays_sliding_624p4(&r.query))
+            .count(),
+        1,
+        "today's route runs once: {rows:#?}"
+    );
+    drop_db_624(&admin, &db).await;
+}
+
+/// The reference's Go code's answers for T5: bits per reducer, at window 1,
+/// window 2 and the instant.
+const T5_EXPECTED_624P4: [(&str, [u64; 3]); 11] = [
+    (
+        "sum_over_time",
+        [0x3ff999999999999a, 0x4020000000000000, 0x4023333333333333],
+    ),
+    (
+        "avg_over_time",
+        [0x3fe0666666666667, 0x4000000000000000, 0x3ff0222222222222],
+    ),
+    (
+        "stdvar_over_time",
+        [0x4673b8b5b5056e16, 0x4023000000000000, 0x466a4b9cf15c92c8],
+    ),
+    (
+        "stddev_over_time",
+        [0x4331c37937e08000, 0x4008a85c24f70659, 0x432d01fe3eaa494c],
+    ),
+    (
+        "min_over_time",
+        [0xc341c37937e08000, 0xc008000000000000, 0xc341c37937e08000],
+    ),
+    (
+        "max_over_time",
+        [0x4341c37937e08000, 0x4014000000000000, 0x4341c37937e08000],
+    ),
+    (
+        "first_over_time",
+        [0x3fc999999999999a, 0x4014000000000000, 0x3fc999999999999a],
+    ),
+    (
+        "last_over_time",
+        [0x3feccccccccccccd, 0x4010000000000000, 0x4010000000000000],
+    ),
+    (
+        "quantile_over_time",
+        [0x432550f7dca6fffd, 0x4012cccccccccccd, 0x401399999999999a],
+    ),
+    (
+        "rate",
+        [0x3f9b4e81b4e81b4f, 0x3fc1111111111111, 0x3fb47ae147ae147b],
+    ),
+    (
+        "rate_counter",
+        [0x42e2f2a36ecd5556, 0x3fb6c16c16c16c16, 0x42d3cf1f39a81f0c],
+    ),
+];
+
+/// **T5 (issue #624, part 4): the eleven reducers answer the reference's
+/// values**, from its Go code fed each window in `(timestamp, stream hash,
+/// value)` order, on both routes. Each tie's larger value has the body that
+/// sorts first, so body order and value order disagree at every tie.
+#[tokio::test]
+async fn unwrap_reducers_answer_the_references_values() {
+    skip_unless_live!();
+    let (admin, db) = fresh_db_624(pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_p4t5_{}",
+        uuid::Uuid::new_v4().simple()
+    )))
+    .await;
+    let t = ((now_ns() - 3_600_000_000_000) / 60_000_000_000) * 60_000_000_000;
+    let sec = 1_000_000_000i64;
+    land_stream_624(
+        &admin,
+        &db,
+        t,
+        6_240_600,
+        "c624p4ref",
+        r#"{"service_name":"c624p4ref"}"#,
+    )
+    .await;
+    for (at, body, v) in [
+        (10, "a", "0.7"),
+        (10, "b", "0.2"),
+        (20, "b", "0.1"),
+        (30, "b", "1e16"),
+        (40, "b", "-1e16"),
+        (50, "b", "0.3"),
+        (60, "a", "0.9"),
+        (60, "b", "0.4"),
+        (70, "b", "5"),
+        (80, "a", "2"),
+        (80, "b", "-3"),
+        (90, "b", "4"),
+    ] {
+        land_line_624(
+            &admin,
+            &db,
+            6_240_600,
+            "c624p4ref",
+            t + at * sec,
+            body,
+            &format!(r#"{{"v":"{v}"}}"#),
+        )
+        .await;
+    }
+    let params = grid_624p4(t + 60 * sec, t + 120 * sec);
+    let mut wrong: Vec<String> = Vec::new();
+    for (op, [w1, w2, instant]) in T5_EXPECTED_624P4 {
+        let param = if op == "quantile_over_time" {
+            "0.9, "
+        } else {
+            ""
+        };
+        for todays in [false, true] {
+            let query = format!(r#"{op}({param}{{service_name="c624p4ref"}} | unwrap v [60s])"#);
+            let got = run_624(&db, hooks_624(todays, None, None), None, &query, &params)
+                .await
+                .unwrap_or_else(|e| panic!("{query}: {e}"));
+            let points: Vec<(i64, u64)> = got.iter().flat_map(|(_, p)| p.clone()).collect();
+            let want = vec![(t + 60 * sec, w1), (t + 120 * sec, w2)];
+            if got.len() != 1 || points != want {
+                wrong.push(format!(
+                    "{query} (today's {todays}): {points:x?}, want {want:x?}"
+                ));
+            }
+            let query = format!(r#"{op}({param}{{service_name="c624p4ref"}} | unwrap v [120s])"#);
+            let got = run_instant_624p4(
+                &db,
+                hooks_624(todays, None, None),
+                None,
+                &query,
+                t + 120 * sec,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{query}: {e}"));
+            let values: Vec<u64> = got.iter().map(|(_, v)| *v).collect();
+            if values != vec![instant] {
+                wrong.push(format!(
+                    "{query} instant (today's {todays}): {values:x?}, want {instant:x}"
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    drop_db_624(&admin, &db).await;
+}
+
+/// **T6 (issue #624, part 4, F3): under a parent `sum`, `sum_over_time` and
+/// `rate` reduce the merged series**, as the reference does, and `rate` is
+/// divided once.
+#[tokio::test]
+async fn a_parent_sum_reduces_the_merged_series() {
+    skip_unless_live!();
+    let (admin, db) = fresh_db_624(pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_p4t6_{}",
+        uuid::Uuid::new_v4().simple()
+    )))
+    .await;
+    let t = ((now_ns() - 3_600_000_000_000) / 60_000_000_000) * 60_000_000_000;
+    let sec = 1_000_000_000i64;
+    for (fp, pod) in [(6_240_610u64, "a"), (6_240_611, "b")] {
+        land_stream_624(
+            &admin,
+            &db,
+            t,
+            fp,
+            "c624p4inj",
+            &format!(r#"{{"pod":"{pod}","service_name":"c624p4inj"}}"#),
+        )
+        .await;
+    }
+    for (fp, at, v) in [
+        (6_240_610u64, 10, "0.1"),
+        (6_240_610, 30, "1.1"),
+        (6_240_611, 20, "0.1"),
+    ] {
+        land_line_624(
+            &admin,
+            &db,
+            fp,
+            "c624p4inj",
+            t + at * sec,
+            "x",
+            &format!(r#"{{"route":"r","v":"{v}"}}"#),
+        )
+        .await;
+    }
+    let params = grid_624p4(t + 60 * sec, t + 60 * sec);
+    for (op, bits) in [
+        ("sum_over_time", 0x3ff4cccccccccccdu64),
+        ("rate", 0x3f962fc962fc9630),
+    ] {
+        let query =
+            format!(r#"sum by (route) ({op}({{service_name="c624p4inj"}} | unwrap v [60s]))"#);
+        for todays in [false, true] {
+            let got = run_624(&db, hooks_624(todays, None, None), None, &query, &params)
+                .await
+                .unwrap_or_else(|e| panic!("{query}: {e}"));
+            assert_eq!(
+                got,
+                vec![(
+                    vec![("route".to_string(), "r".to_string())],
+                    vec![(t + 60 * sec, bits)]
+                )],
+                "{query} (today's {todays})"
+            );
+        }
+    }
+    drop_db_624(&admin, &db).await;
+}
+
+/// **T7 (issue #624, part 4): a value that fails to convert, and one the
+/// statement does not decide.**
+#[tokio::test]
+async fn failed_and_undecided_values() {
+    skip_unless_live!();
+    let (admin, db) = fresh_db_624(pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_p4t7_{}",
+        uuid::Uuid::new_v4().simple()
+    )))
+    .await;
+    let t = ((now_ns() - 3_600_000_000_000) / 60_000_000_000) * 60_000_000_000;
+    let sec = 1_000_000_000i64;
+    // (service, fingerprint, the odd line's second and metadata)
+    for (svc, fp, at, sm) in [
+        (
+            "c624p4fa",
+            6_240_620u64,
+            40,
+            r#"{"lat":"abc","size":"1KB"}"#,
+        ),
+        ("c624p4fc", 6_240_621, 40, r#"{"lat":"5s","size":"1,024"}"#),
+        ("c624p4fd", 6_240_622, 15, r#"{"lat":"abc","size":"1KB"}"#),
+    ] {
+        land_stream_624(
+            &admin,
+            &db,
+            t,
+            fp,
+            svc,
+            &format!(r#"{{"service_name":"{svc}"}}"#),
+        )
+        .await;
+        for s in [50, 110, 170] {
+            land_line_624(
+                &admin,
+                &db,
+                fp,
+                svc,
+                t + s * sec,
+                "x",
+                r#"{"lat":"2s","size":"3KB"}"#,
+            )
+            .await;
+        }
+        land_line_624(&admin, &db, fp, svc, t + at * sec, "y", sm).await;
+    }
+    let params = grid_624p4(t + 60 * sec, t + 180 * sec);
+    // (query, the reduced statement's code, today's route reads, the answer
+    // is an error)
+    let cases: [(&str, i32, bool, bool); 4] = [
+        (
+            r#"max_over_time({service_name="c624p4fa"} | unwrap duration(lat) [30s])"#,
+            0,
+            true,
+            true,
+        ),
+        (
+            r#"max_over_time({service_name="c624p4fa"} | unwrap duration(lat) | __error__="" [30s])"#,
+            0,
+            false,
+            false,
+        ),
+        (
+            r#"max_over_time({service_name="c624p4fc"} | unwrap bytes(size) [30s])"#,
+            395,
+            true,
+            false,
+        ),
+        (
+            r#"max_over_time({service_name="c624p4fd"} | unwrap duration(lat) [30s])"#,
+            0,
+            false,
+            false,
+        ),
+    ];
+    let mut comments = Vec::new();
+    for (query, _, _, error) in cases {
+        let comment = format!("c624p4t7-{}", uuid::Uuid::new_v4().simple());
+        let lowered = run_624(
+            &db,
+            hooks_624(false, None, None),
+            Some(&comment),
+            query,
+            &params,
+        )
+        .await;
+        let todays = run_624(&db, hooks_624(true, None, None), None, query, &params).await;
+        same_outcome_624(query, &lowered, &todays);
+        assert_eq!(lowered.is_err(), error, "{query}: {lowered:?}");
+        comments.push(comment);
+    }
+    let logged = logged_624(&admin, &comments).await;
+    for ((query, code, todays, _), comment) in cases.iter().zip(&comments) {
+        let rows = logged.get(comment).cloned().unwrap_or_default();
+        let reduced: Vec<&CommentedRow624> =
+            rows.iter().filter(|r| is_reduced_624p4(&r.query)).collect();
+        assert_eq!(reduced.len(), 1, "{query}: {rows:#?}");
+        assert_eq!(reduced[0].exception_code, *code, "{query}: {rows:#?}");
+        assert_eq!(
+            rows.iter().any(|r| is_todays_sliding_624p4(&r.query)),
+            *todays,
+            "{query}: today's read: {rows:#?}"
+        );
+    }
+    drop_db_624(&admin, &db).await;
+}
+
+/// **T14 (issue #624, part 4): `without (zone)` keeps the metadata `zone` a
+/// stream label shadows, as `zone_extracted`**, and the reduced statement
+/// answers it alone.
+#[tokio::test]
+async fn without_keeps_the_metadata_name_a_stream_label_shadows() {
+    skip_unless_live!();
+    let (admin, db) = fresh_db_624(pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_p4t14_{}",
+        uuid::Uuid::new_v4().simple()
+    )))
+    .await;
+    let t = ((now_ns() - 3_600_000_000_000) / 60_000_000_000) * 60_000_000_000;
+    let sec = 1_000_000_000i64;
+    land_stream_624(
+        &admin,
+        &db,
+        t,
+        6_240_630,
+        "c624p4zone",
+        r#"{"service_name":"c624p4zone","zone":"a"}"#,
+    )
+    .await;
+    land_stream_624(
+        &admin,
+        &db,
+        t,
+        6_240_631,
+        "c624p4zone",
+        r#"{"service_name":"c624p4zone"}"#,
+    )
+    .await;
+    land_line_624(
+        &admin,
+        &db,
+        6_240_630,
+        "c624p4zone",
+        t + 20 * sec,
+        "x",
+        r#"{"v":"3","zone":"m"}"#,
+    )
+    .await;
+    land_line_624(
+        &admin,
+        &db,
+        6_240_631,
+        "c624p4zone",
+        t + 30 * sec,
+        "x",
+        r#"{"v":"4","zone":"n"}"#,
+    )
+    .await;
+    let params = grid_624p4(t + 60 * sec, t + 60 * sec);
+    let query = r#"max_over_time({service_name="c624p4zone"} | unwrap v [60s]) without (zone)"#;
+    let comment = format!("c624p4t14-{}", uuid::Uuid::new_v4().simple());
+    let got = run_624(
+        &db,
+        hooks_624(false, None, None),
+        Some(&comment),
+        query,
+        &params,
+    )
+    .await
+    .expect("answers");
+    let want = run_624(&db, hooks_624(true, None, None), None, query, &params)
+        .await
+        .expect("answers");
+    assert_eq!(got, want);
+    let svc = ("service_name".to_string(), "c624p4zone".to_string());
+    assert_eq!(
+        got,
+        vec![
+            (vec![svc.clone()], vec![(t + 60 * sec, 4f64.to_bits())]),
+            (
+                vec![svc, ("zone_extracted".to_string(), "m".to_string())],
+                vec![(t + 60 * sec, 3f64.to_bits())]
+            ),
+        ]
+    );
+    let logged = logged_624(&admin, std::slice::from_ref(&comment)).await;
+    let rows = logged.get(&comment).cloned().unwrap_or_default();
+    assert!(
+        rows.iter()
+            .any(|r| is_reduced_624p4(&r.query) && r.exception_code == 0),
+        "{rows:#?}"
+    );
+    assert!(
+        !rows.iter().any(|r| is_todays_sliding_624p4(&r.query)),
+        "the answer is the statement's own: {rows:#?}"
+    );
+    drop_db_624(&admin, &db).await;
+}
+
+/// The eleven reducers, each as `<op>(<param>`.
+const REDUCERS_624P4: [&str; 11] = [
+    "sum_over_time(",
+    "avg_over_time(",
+    "min_over_time(",
+    "max_over_time(",
+    "stddev_over_time(",
+    "stdvar_over_time(",
+    "quantile_over_time(0.5, ",
+    "first_over_time(",
+    "last_over_time(",
+    "rate(",
+    "rate_counter(",
+];
+
+/// **T15 (issue #624, part 4): a window with no sample is no point, for
+/// every reducer**, range and instant, on both routes.
+#[tokio::test]
+async fn an_empty_window_emits_no_point_for_any_reducer() {
+    skip_unless_live!();
+    let (admin, db) = fresh_db_624(pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_p4t15_{}",
+        uuid::Uuid::new_v4().simple()
+    )))
+    .await;
+    let t = ((now_ns() - 3_600_000_000_000) / 60_000_000_000) * 60_000_000_000;
+    let sec = 1_000_000_000i64;
+    land_stream_624(
+        &admin,
+        &db,
+        t,
+        6_240_640,
+        "c624p4gap",
+        r#"{"service_name":"c624p4gap"}"#,
+    )
+    .await;
+    for at in [10, 130] {
+        land_line_624(
+            &admin,
+            &db,
+            6_240_640,
+            "c624p4gap",
+            t + at * sec,
+            "x",
+            r#"{"v":"2"}"#,
+        )
+        .await;
+    }
+    let params = grid_624p4(t + 60 * sec, t + 180 * sec);
+    let mut comments: Vec<String> = Vec::new();
+    for op in REDUCERS_624P4 {
+        let query = format!(r#"{op}{{service_name="c624p4gap"}} | unwrap v [60s])"#);
+        for todays in [false, true] {
+            let comment = (!todays).then(|| format!("c624p4t15-{}", uuid::Uuid::new_v4().simple()));
+            let got = run_624(
+                &db,
+                hooks_624(todays, None, None),
+                comment.as_deref(),
+                &query,
+                &params,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{query}: {e}"));
+            comments.extend(comment);
+            let at: Vec<i64> = got
+                .iter()
+                .flat_map(|(_, p)| p.iter().map(|(ts, _)| *ts))
+                .collect();
+            assert_eq!(
+                at,
+                vec![t + 60 * sec, t + 180 * sec],
+                "{query} (today's {todays})"
+            );
+            let comment = (!todays).then(|| format!("c624p4t15-{}", uuid::Uuid::new_v4().simple()));
+            let got = run_instant_624p4(
+                &db,
+                hooks_624(todays, None, None),
+                comment.as_deref(),
+                &query,
+                t + 120 * sec,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{query}: {e}"));
+            assert!(
+                got.is_empty(),
+                "{query} instant (today's {todays}): {got:?}"
+            );
+            comments.extend(comment);
+        }
+    }
+    let logged = logged_624(&admin, &comments).await;
+    for comment in &comments {
+        let rows = logged.get(comment).cloned().unwrap_or_default();
+        assert!(
+            rows.iter()
+                .any(|r| is_reduced_624p4(&r.query) && r.exception_code == 0)
+                && !rows.iter().any(|r| is_todays_624(&r.query)),
+            "{comment}: the reduced statement answers: {rows:#?}"
+        );
+    }
+    drop_db_624(&admin, &db).await;
+}
+
+/// **T16 (issue #624, part 4, F4): `rate_counter` over one sample is 0, a
+/// point, and over two it is extrapolated in seconds to the window's
+/// edges.**
+#[tokio::test]
+async fn a_single_sample_counter_window_is_zero() {
+    skip_unless_live!();
+    let (admin, db) = fresh_db_624(pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_p4t16_{}",
+        uuid::Uuid::new_v4().simple()
+    )))
+    .await;
+    let t = ((now_ns() - 3_600_000_000_000) / 60_000_000_000) * 60_000_000_000;
+    let sec = 1_000_000_000i64;
+    for (fp, svc, lines) in [
+        (6_240_650u64, "c624p4one", vec![(10, "42")]),
+        (6_240_651, "c624p4two", vec![(25, "200"), (35, "260")]),
+    ] {
+        land_stream_624(
+            &admin,
+            &db,
+            t,
+            fp,
+            svc,
+            &format!(r#"{{"service_name":"{svc}"}}"#),
+        )
+        .await;
+        for (at, c) in lines {
+            land_line_624(
+                &admin,
+                &db,
+                fp,
+                svc,
+                t + at * sec,
+                "x",
+                &format!(r#"{{"c":"{c}"}}"#),
+            )
+            .await;
+        }
+    }
+    let params = grid_624p4(t + 60 * sec, t + 60 * sec);
+    for (svc, want) in [("c624p4one", 0.0f64), ("c624p4two", 2.0)] {
+        let query = format!(r#"rate_counter({{service_name="{svc}"}} | unwrap c [60s])"#);
+        for todays in [false, true] {
+            let got = run_624(&db, hooks_624(todays, None, None), None, &query, &params)
+                .await
+                .unwrap_or_else(|e| panic!("{query}: {e}"));
+            let points: Vec<(i64, u64)> = got.iter().flat_map(|(_, p)| p.clone()).collect();
+            assert_eq!(
+                points,
+                vec![(t + 60 * sec, want.to_bits())],
+                "{query} (today's {todays})"
+            );
+        }
+    }
+    drop_db_624(&admin, &db).await;
+}
+
+/// **T13 (issue #624, part 4): a reduced query answers wherever today's
+/// route answers.** Part 2's T5 harness with metadata `v` on every line: at
+/// today's route's smallest answering cap, the reduced route answers with
+/// today's matrix.
+#[tokio::test]
+async fn a_reduced_query_answers_wherever_todays_route_answers() {
+    skip_unless_live!();
+    let (admin, db) = fresh_db_624(pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_p4t13_{}",
+        uuid::Uuid::new_v4().simple()
+    )))
+    .await;
+    let t = ((now_ns() - 4 * 3_600_000_000_000) / 60_000_000_000) * 60_000_000_000;
+    seed_cap_streams_624(&admin, &db, t, 200).await;
+    exec_624(
+        &admin,
+        &format!(
+            "ALTER TABLE {db}.log_samples UPDATE structured_metadata = \
+             concat('{{\"v\":\"', toString(timestamp_ns % 7), '\"}}') WHERE 1 \
+             SETTINGS mutations_sync = 2"
+        ),
+    )
+    .await;
+    let params = grid_624p4(t, t + 600_000_000_000);
+    let sel = r#"{service_name="c624cap"}"#;
+    for range in ["60s", "150s"] {
+        for query in [
+            format!("sum(sum_over_time({sel} | unwrap v [{range}]))"),
+            format!("max_over_time({sel} | unwrap v [{range}]) by (pod)"),
+        ] {
+            for (cap, hi) in [
+                (Cap624::ResultPoints, 100_000u64),
+                (Cap624::GroupBytes, 256 * 1024 * 1024),
+            ] {
+                let today = min_cap_624(&db, true, cap, &query, &params, hi).await;
+                let want = run_624(
+                    &db,
+                    hooks_624(true, Some((cap, today)), None),
+                    None,
+                    &query,
+                    &params,
+                )
+                .await
+                .expect("today's route answers at its smallest cap");
+                assert!(!want.is_empty(), "{query}");
+                let comment = format!("c624p4t13-{}", uuid::Uuid::new_v4().simple());
+                let got = run_624(
+                    &db,
+                    hooks_624(false, Some((cap, today)), None),
+                    Some(&comment),
+                    &query,
+                    &params,
+                )
+                .await;
+                assert_eq!(
+                    got.as_ref().ok(),
+                    Some(&want),
+                    "{query} at {cap:?} {today}: {got:?}"
+                );
+                let logged = logged_624(&admin, std::slice::from_ref(&comment)).await;
+                let rows = logged.get(&comment).cloned().unwrap_or_default();
+                assert!(
+                    rows.iter().any(|r| is_reduced_624p4(&r.query))
+                        && !rows.iter().any(|r| is_todays_sliding_624p4(&r.query)),
+                    "{query} at {cap:?} {today}: the reduced route answers: {rows:#?}"
+                );
+            }
+        }
+    }
+    drop_db_624(&admin, &db).await;
+}
+
+/// The instants T12 asks at over a corpus: a line's timestamp, a nanosecond
+/// past it, and ten minutes after the last line.
+async fn instants_624p4(admin: &ChClient, db: &str, service: &str) -> [i64; 3] {
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug)]
+    struct Span {
+        lo: i64,
+        hi: i64,
+    }
+    let sql = format!(
+        "SELECT min(timestamp_ns) AS lo, max(timestamp_ns) AS hi FROM {db}.log_samples \
+         WHERE service = '{service}'"
+    );
+    let mut stream = admin
+        .query_stream::<Span>(&sql, &QuerySettings::new())
+        .await
+        .expect("read the corpus span");
+    let span = stream.next().await.expect("one row").expect("decode");
+    drop(stream);
+    assert!(span.lo > 0, "{service}: the corpus has lines");
+    [span.lo, span.lo + 1, span.hi + 600_000_000_000]
+}
+
+/// **T12 (issue #624, part 5): an instant query with a pipeline is answered
+/// in the database**, for each family that lowers — label stages, `regexp`,
+/// `| json`, `| pattern`, `| logfmt`, and the `| unwrap` reducers — at a
+/// line's timestamp, between lines and after the data, at `[60s]` and
+/// `[5m]`. The vector equals today's route's; the query log holds the
+/// lowered statement for one run and today's instant read for the other.
+#[tokio::test]
+async fn instant_queries_with_a_pipeline_are_answered_in_the_database() {
+    skip_unless_live!();
+    // (admin, db, service, queries with `<R>` for the range)
+    let mut corpora: Vec<(ChClient, String, &str, Vec<String>)> = Vec::new();
+    let (admin, db, _) = seed_staged_corpus().await;
+    corpora.push((
+        admin,
+        db,
+        "c507bucket",
+        vec![
+            r#"sum by (lvl) (count_over_time({service_name="c507bucket"} | drop x [<R>]))"#
+                .to_string(),
+        ],
+    ));
+    let (admin, db, _) = seed_regexp_corpus_624p3().await;
+    corpora.push((
+        admin,
+        db,
+        "c507bucket",
+        vec![regexp_lowered_queries_624p3(r#"{service_name="c507bucket"}"#, "<R>")[0].clone()],
+    ));
+    let (admin, db, _) = seed_json_corpus_624p3b().await;
+    corpora.push((
+        admin,
+        db,
+        "p3bj",
+        vec![json_lowered_queries_624p3b(r#"{service_name="p3bj"}"#, "<R>")[0].clone()],
+    ));
+    let (admin, db, _) = seed_pattern_corpus_624p3c().await;
+    corpora.push((
+        admin,
+        db,
+        "c624p3c",
+        vec![pattern_lowered_queries_624p3c(r#"{service_name="c624p3c"}"#, "<R>")[0].clone()],
+    ));
+    {
+        let (admin, db) = fresh_db_624(pulsus_testkit::test_db(&format!(
+            "pulsus_read_it_qlg_p5lf_{}",
+            uuid::Uuid::new_v4().simple()
+        )))
+        .await;
+        let t = ((now_ns() - 3_600_000_000_000) / 60_000_000_000) * 60_000_000_000;
+        land_stream_624(
+            &admin,
+            &db,
+            t,
+            6_240_660,
+            "c624p5lf",
+            r#"{"service_name":"c624p5lf"}"#,
+        )
+        .await;
+        for (i, (body, decided)) in LINES_624P3D.iter().enumerate() {
+            if *decided {
+                land_line_624(
+                    &admin,
+                    &db,
+                    6_240_660,
+                    "c624p5lf",
+                    t + (i as i64 + 1) * 1_000_000_000,
+                    body,
+                    "",
+                )
+                .await;
+            }
+        }
+        corpora.push((
+            admin,
+            db,
+            "c624p5lf",
+            vec![
+                r#"sum by (level) (count_over_time({service_name="c624p5lf"} | logfmt [<R>]))"#
+                    .to_string(),
+            ],
+        ));
+    }
+    let (admin, db, _) = seed_reduced_corpus_624p4().await;
+    corpora.push((
+        admin,
+        db,
+        "c624p4",
+        vec![
+            r#"avg_over_time({service_name="c624p4"} | unwrap dur | __error__="" [<R>]) by (route)"#
+                .to_string(),
+            r#"quantile_over_time(0.9, {service_name="c624p4"} | unwrap duration(lat) | __error__="" [<R>]) by (route)"#
+                .to_string(),
+            r#"max by (route) (rate_counter({service_name="c624p4lean"} | unwrap dur | __error__="" [<R>]))"#
+                .to_string(),
+        ],
+    ));
+    let mut answered = 0usize;
+    for (admin, db, service, queries) in &corpora {
+        let instants = instants_624p4(admin, db, service).await;
+        let mut comments: Vec<(String, bool)> = Vec::new();
+        for template in queries {
+            for range in ["60s", "5m"] {
+                let query = template.replace("<R>", range);
+                for at in instants {
+                    let lowered_comment = format!("c624p5t12-{}", uuid::Uuid::new_v4().simple());
+                    let todays_comment = format!("c624p5t12-{}", uuid::Uuid::new_v4().simple());
+                    let lowered = run_instant_624p4(
+                        db,
+                        hooks_624(false, None, None),
+                        Some(&lowered_comment),
+                        &query,
+                        at,
+                    )
+                    .await;
+                    let todays = run_instant_624p4(
+                        db,
+                        hooks_624(true, None, None),
+                        Some(&todays_comment),
+                        &query,
+                        at,
+                    )
+                    .await;
+                    same_instant_outcome_624p4(&format!("{query} at {at}"), &lowered, &todays);
+                    if lowered.as_ref().is_ok_and(|a| !a.is_empty()) {
+                        answered += 1;
+                    }
+                    comments.push((lowered_comment, true));
+                    comments.push((todays_comment, false));
+                }
+            }
+        }
+        let all: Vec<String> = comments.iter().map(|(c, _)| c.clone()).collect();
+        let logged = logged_624(admin, &all).await;
+        for (comment, lowered) in &comments {
+            let rows = logged.get(comment).cloned().unwrap_or_default();
+            if *lowered {
+                assert!(
+                    rows.iter()
+                        .any(|r| is_lowered_624(&r.query) && r.exception_code == 0),
+                    "{comment}: the lowered statement: {rows:#?}"
+                );
+                assert!(
+                    !rows.iter().any(|r| is_todays_624(&r.query)),
+                    "{comment}: no read of today's route: {rows:#?}"
+                );
+            } else {
+                assert!(
+                    rows.iter().any(|r| is_todays_instant_624p4(&r.query)),
+                    "{comment}: today's instant read: {rows:#?}"
+                );
+                assert!(
+                    !rows.iter().any(|r| is_lowered_624(&r.query)),
+                    "{comment}: {rows:#?}"
+                );
+            }
+        }
+    }
+    assert!(answered >= 12, "the instants answer: {answered}");
+    for (admin, db, _, _) in &corpora {
+        drop_db_624(admin, db).await;
+    }
+}
+
+/// A fixed sequence of texts for T3: each of the eleven templates, filled
+/// from one linear congruential generator.
+fn conversion_texts_624p4(count: usize) -> Vec<String> {
+    const DURATION_UNITS: [&str; 8] = ["ns", "us", "\u{b5}s", "\u{3bc}s", "ms", "s", "m", "h"];
+    const BYTES_UNITS: [&str; 25] = [
+        "b", "k", "kb", "ki", "kib", "m", "mb", "mi", "mib", "g", "gb", "gi", "gib", "t", "tb",
+        "ti", "tib", "p", "pb", "pi", "pib", "e", "eb", "ei", "eib",
+    ];
+    let mut state: u64 = 0x0624_0004;
+    let mut next = move || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        state >> 33
+    };
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let i = next() % 100_000;
+        let f = next() % 1_000;
+        let x = next() % 40;
+        let u = DURATION_UNITS[(next() % 8) as usize];
+        let mut b = BYTES_UNITS[(next() % 25) as usize].to_string();
+        if next() % 2 == 0 {
+            b = b.to_uppercase();
+        }
+        let text = match next() % 11 {
+            0 => format!("{i}"),
+            1 => format!("{i}.{f}"),
+            2 => format!("-{i}.{f}"),
+            3 => format!("{i}e{}", x as i64 - 20),
+            4 => format!(".{f}"),
+            5 => format!("{i}{u}"),
+            6 => format!("{i}.{f}{u}"),
+            7 => format!("{}h{}m{}.{}s", i % 100, f % 60, x, next() % 1000),
+            8 => format!("{i}{b}"),
+            9 => format!("{i} {b}"),
+            _ => format!("{i}.{f}{b}"),
+        };
+        out.push(text);
+    }
+    out
+}
+
+/// **T3 (issue #624, part 4): every value and failure the statement's
+/// conversion decides is today's route's.** 20,000 generated texts, T2's,
+/// and a set of edge cases, through `reduced_conversion_columns` over a
+/// `VALUES` table, per conversion.
+#[tokio::test]
+async fn the_database_conversions_are_todays_routes_where_they_decide() {
+    skip_unless_live!();
+    use pulsus_read::logql::pipeline::unwrap_conversion_probe;
+    use pulsus_read::logql::sql::{UnwrapConversion, reduced_conversion_columns};
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug)]
+    struct Decided {
+        i: u32,
+        ut: String,
+        us: u8,
+        uv: f64,
+    }
+    let admin = ChClient::new(test_config()).await.expect("connect admin");
+    let generated = conversion_texts_624p4(20_000);
+    let mut texts = generated.clone();
+    for extra in [
+        "9ms",
+        "13ms",
+        "300ms",
+        "1.5s",
+        "1.s",
+        ".5s",
+        "-1.5h",
+        "1m.5s",
+        "1\u{b5}s",
+        "1\u{3bc}s",
+        "0",
+        "-0",
+        "9223372036s",
+        "2562047h",
+        "1.0000000000000000001s",
+        "00",
+        "1d",
+        "1w",
+        "1hm",
+        "1msx",
+        ".s",
+        "abc",
+        "9223372037s",
+        "2562048h",
+        "n/a",
+        "-",
+        "1.e5",
+        "1,024",
+        "1_000",
+        "0x1p-2",
+        "inf",
+        "1e400",
+    ] {
+        texts.push(extra.to_string());
+    }
+    let settings = QuerySettings::new().set("max_query_size", 4_194_304u64);
+    for (conversion, name) in [
+        (UnwrapConversion::Number, "number"),
+        (UnwrapConversion::Duration, "duration"),
+        (UnwrapConversion::Bytes, "bytes"),
+    ] {
+        let mut wrong: Vec<String> = Vec::new();
+        let mut decided_generated = 0usize;
+        let columns = reduced_conversion_columns(conversion);
+        let numbered: Vec<(usize, &String)> = texts.iter().enumerate().collect();
+        for chunk in numbered.chunks(2_000) {
+            let list = chunk
+                .iter()
+                .map(|(i, t)| format!("({i}, {})", literal(t).as_sql()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT i, ut, us, uv FROM (SELECT i, ut, {columns} \
+                 FROM values('i UInt32, ut String', {list})) \
+                 SETTINGS precise_float_parsing = 1"
+            );
+            let mut stream = admin
+                .query_stream::<Decided>(&sql, &settings)
+                .await
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            while let Some(row) = stream.next().await {
+                let row = row.unwrap_or_else(|e| panic!("{name}: {e}"));
+                let ours = unwrap_conversion_probe(conversion, &row.ut);
+                match row.us {
+                    0 => {
+                        if ours.map(f64::to_bits) != Some(row.uv.to_bits()) {
+                            wrong.push(format!(
+                                "{:?}: statement {:?}, ours {ours:?}",
+                                row.ut, row.uv
+                            ));
+                        }
+                    }
+                    1 => {
+                        if ours.is_some() {
+                            wrong.push(format!("{:?}: statement fails, ours {ours:?}", row.ut));
+                        }
+                    }
+                    _ => {}
+                }
+                if row.us <= 1 && (row.i as usize) < generated.len() {
+                    decided_generated += 1;
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{name}: {} texts differ:\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        );
+        assert!(
+            decided_generated >= 14_000,
+            "{name}: the statement decides {decided_generated} of the 20,000 generated texts"
+        );
+    }
+}

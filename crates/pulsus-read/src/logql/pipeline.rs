@@ -3497,6 +3497,12 @@ pub(crate) fn parse_duration_seconds(raw: &str) -> Option<f64> {
     matched.then_some(total)
 }
 
+/// Go's `time.ParseDuration` then `Duration.Seconds()`: the reference's
+/// `convertDuration` (issue #624, part 4).
+pub(crate) fn go_duration_seconds(raw: &str) -> Option<f64> {
+    parse_duration_seconds(raw)
+}
+
 /// Parses a bytes quantity to f64 bytes — a faithful port of
 /// `dustin/go-humanize` `ParseBytes` (probed against grafana/loki:3.7.4):
 /// `512b`, `5KB`, `1MiB`, bare `1k`/`1ki`, `1,024`, `3 kB`, exa `1eb`. The
@@ -3611,6 +3617,24 @@ fn convert_label_value(kind: UnitKind, value: &str) -> Option<f64> {
         // (#226).
         UnitKind::Bytes => parse_bytes_value(value),
     }
+}
+
+/// A label value converted as `| unwrap` converts it under `conversion`
+/// (issue #624, part 4): what the lowered statement's conversion columns
+/// are compared against. `None` is a conversion failure.
+#[doc(hidden)]
+pub fn unwrap_conversion_probe(
+    conversion: super::sql::UnwrapConversion,
+    value: &str,
+) -> Option<f64> {
+    convert_label_value(
+        match conversion {
+            super::sql::UnwrapConversion::Number => UnitKind::Number,
+            super::sql::UnwrapConversion::Duration => UnitKind::Duration,
+            super::sql::UnwrapConversion::Bytes => UnitKind::Bytes,
+        },
+        value,
+    )
 }
 
 /// Streams-path `__error_details__` for a failed numeric label-filter
@@ -11350,5 +11374,64 @@ mod tests {
             compiled.rx_patterns().is_empty(),
             "no database stage after a rewrite"
         );
+    }
+
+    /// **T2 (issue #624, part 4): `duration(x)` converts as Go's
+    /// `time.ParseDuration` then `Duration.Seconds()`, the reference's
+    /// `convertDuration`, bit for bit.** Expected bits from the reference's
+    /// Go code; `None` where it fails.
+    #[test]
+    fn duration_values_convert_as_the_reference() {
+        const DECIDED: [(&str, u64); 16] = [
+            ("9ms", 0x3f82_6e97_8d4f_df3b),
+            ("13ms", 0x3f8a_9fbe_76c8_b439),
+            ("300ms", 0x3fd3_3333_3333_3333),
+            ("1.5s", 0x3ff8_0000_0000_0000),
+            ("1.s", 0x3ff0_0000_0000_0000),
+            (".5s", 0x3fe0_0000_0000_0000),
+            ("-1.5h", 0xc0b5_1800_0000_0000),
+            ("1m.5s", 0x404e_4000_0000_0000),
+            ("1\u{b5}s", 0x3eb0_c6f7_a0b5_ed8d),
+            ("1\u{3bc}s", 0x3eb0_c6f7_a0b5_ed8d),
+            ("0", 0),
+            ("-0", 0),
+            ("9223372036s", 0x4201_2e0b_e820_0000),
+            ("2562047h", 0x4201_2e0b_8f80_0000),
+            ("1.0000000000000000001s", 0x3ff0_0000_0000_0000),
+            ("1us", 0x3eb0_c6f7_a0b5_ed8d),
+        ];
+        const FAILED: [&str; 9] = [
+            "00",
+            "1d",
+            "1w",
+            "1hm",
+            "1msx",
+            ".s",
+            "abc",
+            "9223372037s",
+            "2562048h",
+        ];
+        for (text, bits) in DECIDED {
+            let got = go_duration_seconds(text);
+            assert_eq!(
+                got.map(f64::to_bits),
+                Some(bits),
+                "go_duration_seconds({text:?}) = {got:?}"
+            );
+            let via = convert_label_value(UnitKind::Duration, text);
+            assert_eq!(
+                via.map(f64::to_bits),
+                Some(bits),
+                "convert_label_value(Duration, {text:?}) = {via:?}"
+            );
+        }
+        for text in FAILED {
+            assert_eq!(go_duration_seconds(text), None, "{text:?}");
+            assert_eq!(
+                convert_label_value(UnitKind::Duration, text),
+                None,
+                "convert_label_value(Duration, {text:?})"
+            );
+        }
     }
 }

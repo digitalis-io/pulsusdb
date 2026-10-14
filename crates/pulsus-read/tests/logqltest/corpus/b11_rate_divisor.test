@@ -10,7 +10,9 @@
 # Every value below is a BIT-EXACT capture from grafana/loki:3.7.4 (probed
 # 2026-07-26, container `grafana/loki:3.7.4`, instant query at the same
 # window membership / inter-sample deltas as the `eval instant at 60s` grid
-# below — see PROVENANCE.md). Under the one-rounding divisor the `1118ms`
+# below — see PROVENANCE.md), except the two `rate_counter` rows, which
+# carry `divergence(rate-counter-window-anchored)` and a value derived by
+# hand in that entry's arithmetic (issue #624, part 4, F4). Under the one-rounding divisor the `1118ms`
 # / `1235ms` / `1128ms` cases come out 1–2 ULP off and this file reddens.
 #
 # Controls (`2s`, `1500ms`, `2s500ms`-class, `100ms`, `[1m]`) pin the other
@@ -167,18 +169,21 @@ clear
 
 # ===================================================================
 # rate_counter() — the extrapolated increase divided by the same
-# `selRange.Seconds()` (issue #218's ns/ms extrapolation, sub-second range)
+# `selRange.Seconds()`, sub-second range. The extrapolation is F4's (issue
+# #624, part 4; ledger `rate-counter-window-anchored`): in seconds, to the
+# edges of the window `(t - range, t]`.
 # ===================================================================
 
-# Naive divisor gives 31.305942287815544.
+# Naive divisor gives 38.88888888888888.
 load
   {env="prod", service_name="rd_rc1118"}
   59100ms  c=10
   59600ms  c=30
   60s      c=45
 
+# provenance: divergence(rate-counter-window-anchored)
 eval instant at 60s rate_counter({service_name="rd_rc1118", env="prod"} | logfmt | unwrap c [1118ms])
-  {env="prod", service_name="rd_rc1118"} 31.305942287815547
+  {env="prod", service_name="rd_rc1118"} 38.88888888888889
 
 clear
 
@@ -189,7 +194,8 @@ load
   59600ms  c=30
   60s      c=45
 
+# provenance: divergence(rate-counter-window-anchored)
 eval instant at 60s rate_counter({service_name="rd_rc1m", env="prod"} | logfmt | unwrap c [1m])
-  {env="prod", service_name="rd_rc1m"} 0.5833722222222222
+  {env="prod", service_name="rd_rc1m"} 0.7499999999999999
 
 clear

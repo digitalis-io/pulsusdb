@@ -991,7 +991,10 @@ const TOTAL_DIRECTIVES: usize = 1_817;
 /// What the provenance markers ALLOW a replay to compare. Named
 /// `REPLAYABLE` until the live leg existed, which was wrong: most of
 /// these cannot be reached at all. See the module docs.
-const PROVENANCE_PERMITS: usize = 1_311;
+/// Issue #624 moved the `rate_counter` rows of `b3_metric_range.test`,
+/// `b11_rate_divisor.test` and `b6_combinations.test` from permitted to
+/// `pinned-divergence`.
+const PROVENANCE_PERMITS: usize = 1_301;
 
 /// What the live leg can PHYSICALLY compare today. The gap to
 /// `PROVENANCE_PERMITS` is enumerated by
@@ -1057,16 +1060,25 @@ const REACHABLE: usize = 324;
 /// `b25_pattern_expr_reject.test` and `b26_json_expr.test` (issue #388)
 /// need no config delta, so their `eval_fail` rows enlarge
 /// `our-error-text` alone and their `eval` rows are permitted.
+///
+/// Issue #624 moved the `rate_counter` rows of `b3_metric_range.test`,
+/// `b11_rate_divisor.test`, `b6_combinations.test` and
+/// `differential_metric_reducers.test` to `pinned-divergence`; the last
+/// file's rows came from `not a capture claim (ported)`.
 const EXCLUDED_BY_PROVENANCE: &str = "config-delta file=184, not a capture claim (derived)=30, \
-not a capture claim (ported)=27, our-error-text (eval_fail)=175, pinned-divergence=90";
+not a capture claim (ported)=23, our-error-text (eval_fail)=175, pinned-divergence=104";
 
 /// Issue #344: all of `b18_range_agg_grouping.test`'s newly-permitted
 /// rows are metric queries, some of them on a step grid, and this slice
 /// replays log (streams) queries at a single instant — so they enlarge
 /// the ENUMERATED gap rather than the coverage. Both are levers the
 /// module docs already name.
+///
+/// Issue #624 took the permitted `rate_counter` rows of
+/// `b3_metric_range.test`, `b11_rate_divisor.test` and
+/// `b6_combinations.test`, all metric queries, out of this gap.
 const UNREACHABLE_BY_REASON: &str = "absolute-timestamp (template corpus)=689, \
-metric query (slice: streams only)=287, range/matrix eval (slice: instant only)=11";
+metric query (slice: streams only)=277, range/matrix eval (slice: instant only)=11";
 // corpus-counts: end (replay-coverage-constants)
 
 /// **How far back the reference will still SERVE a pushed entry** —
