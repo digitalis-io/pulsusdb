@@ -4572,9 +4572,6 @@ mod tests {
                 // and taking the counting one for it answers the sample
                 // count (review round 2).
                 fallback = match &mp.value {
-                    pulsus_read::logql::sql::MetricValue::Unwrapped(u) => {
-                        pulsus_read::logql::unwrapped_fallback_client_agg(mp, u)
-                    }
                     pulsus_read::logql::sql::MetricValue::Shaped(_) => {
                         pulsus_read::logql::bucketed_fallback_client_agg(mp)
                     }

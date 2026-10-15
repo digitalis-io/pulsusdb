@@ -296,6 +296,12 @@ A line with no readable value for the unwrapped label (absent, empty, or a
 line that is not JSON) contributes no sample and no error, for every range
 aggregation, grouped or not.
 
+A JSON number written with an exponent reads as its value under
+`| unwrap bytes(x)`: `{"x":1e3}` answers 1000, where the reference fails the
+line with `SampleExtractionErr`, because it converts the number's text `1e3`.
+Recorded as `unwrap-bytes-json-exponent` in
+docs/benchmarks/logs-differential-ledger.md.
+
 `rate_counter` extrapolates in seconds from the edges of each window
 `(t - range, t]`; a window with one sample answers 0.
 `rate_counter({…} | logfmt | unwrap c [1m])` at 60 s over `c=200` at 25 s
@@ -323,15 +329,6 @@ character, where the reference replaces it with a space. Both are recorded
 as entries 30 and 31 of docs/reference-defects-we-do-not-copy.md, with
 ledger rows `logfmt-quoted-value-ends-its-token` and
 `logfmt-replacement-character-value`.
-
-A `| json … | unwrap` range query that the extracted-field group key read
-serves is not limited by the raw-scan read's own buffers — the 8 MiB
-same-nanosecond staging buffer, the 4,000,000 retained window points, the
-12,000,000 result point-slots and the 256 MiB of retained inner label bytes
-— so it can answer where the raw-scan read refuses; both reads keep the
-500-series cap, the scan budget, the memory ceiling, the statement timeout
-and every per-line rule. A timeout of the extracted-field group key read is
-returned as a timeout, as for any read (docs/query-to-sql.md).
 
 ### 2.1 `GET|POST /api/logs/v1/query_range`
 

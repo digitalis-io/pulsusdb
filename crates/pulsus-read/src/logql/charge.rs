@@ -2580,18 +2580,6 @@ mod tests {
             // Issue #624 part 2: x4 — the staged mode's two series kinds and
             // `absent_over_time`'s one grid at finish, under the same XOR.
             ("exec.rs", "charge_result_points", "&mut self.points", 4),
-            // Issue #507: `KeyRouteFold::charged`, the extracted-field group
-            // key read's partials (x2, the new-series and new-grid-point
-            // arms). A further XOR arm of the same cap: S1's fold is dropped
-            // before today's route starts, and L's fold starts only after
-            // today's route has refused and dropped its state, so no two of
-            // them are live at once. `LEAF_COUNTERS.group_bytes` stays 2.
-            (
-                "unwrap_group.rs",
-                "charge_group_bytes",
-                "&mut self.charged",
-                2,
-            ),
             // Issue #624, part 4: `ReducedFold::charged` and
             // `ReducedFold::points`, one charge each at a new series, as
             // today's route charges the same series. A further XOR arm of
@@ -2747,12 +2735,6 @@ mod tests {
             // staged mode reads it three times more: its two series kinds
             // and `absent_over_time`'s grid at finish.
             ("exec.rs", "result_points", 4, "PushdownRangeGroups::points"),
-            (
-                "unwrap_group.rs",
-                "group_bytes",
-                2,
-                "KeyRouteFold::charged (issue #507)",
-            ),
             // Issue #624, part 4: the reduced fold's new-series charges, XOR
             // with today's route (the fold is dropped before it starts).
             (
@@ -3015,7 +2997,6 @@ mod tests {
             ("template/retained.rs", include_str!("template/retained.rs")),
             ("template/timefns.rs", include_str!("template/timefns.rs")),
             ("template/value.rs", include_str!("template/value.rs")),
-            ("unwrap_group.rs", include_str!("unwrap_group.rs")),
             // Issue #624, part 4: the lowered `| unwrap` reducers' fold.
             ("reduce.rs", include_str!("reduce.rs")),
         ];

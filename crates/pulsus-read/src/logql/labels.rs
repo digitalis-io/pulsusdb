@@ -349,9 +349,8 @@ pub(in crate::logql) fn merge_labels_with_structured_metadata(
 }
 
 /// [`merge_labels_with_structured_metadata`] over pairs already decoded —
-/// the extracted-field group key read's projected metadata (issue #507),
-/// which arrives as `Array(Tuple(String, String))` rather than as stored
-/// text. The same loop body, so the two merges cannot disagree.
+/// the reduced statement's metadata key (issue #624, part 4), which
+/// arrives as `Array(Tuple(String, String))` rather than as stored text. The same loop body, so the two merges cannot disagree.
 pub(in crate::logql) fn merge_labels_with_structured_metadata_pairs(
     base: &[(String, String)],
     pairs: &[(String, String)],

@@ -1818,7 +1818,7 @@ enum ReviewedVerdict {
 /// found three where the resolver was the one pointing at the wrong
 /// file. So no rate is published. These are the cases, and the note on
 /// each is the reasoning.
-// Issue #507 W4, review round 4: this was `; 10]`. The `sql.rs:996` case
+// Issue #507, review round 4: this was `; 10]`. The `sql.rs:996` case
 // left the table because the two rules now agree on it — a line shift in
 // `logql/sql.rs` moved the anchor the resolver reads, and the resolver's
 // answer became the one the reviewed note already called right

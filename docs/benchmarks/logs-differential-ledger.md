@@ -6430,6 +6430,10 @@ gated by
 
 ### `unwrapped-summation-order-nondeterministic` (issue #507 W4, owner ruling — a deliberate divergence, not a defect)
 
+- **History.** Issue #624, part 4b retired the statement this entry
+  describes: the queries it lowered are reduced by the reduced statement,
+  which sums in timestamp order and answers today's route's bits. The
+  entry is kept for history.
 - **What we do:** on a query that **lowers** — a `json` extraction naming
   one label, an `unwrap` of that label with no conversion, an
   underscore-free name, a range equal to the step, no row whose structured
@@ -6508,8 +6512,8 @@ gated by
   `repeated_executions_agree_bit_for_bit_at_a_fixed_layout`, which fails
   when a source of nondeterminism appears that is neither the thread count
   nor the part layout, and
-  `the_spread_reducers_are_not_lowered_and_answer_the_evaluators_value`,
-  which fails if either of the withdrawn pair comes back.
+  `the_spread_reducers_are_lowered_and_answer_the_evaluators_value`
+  (renamed by issue #624, part 4b, which lowers the pair after a parser).
 
 ### `json-leading-whitespace-and-byte-order-mark` (issue #507, deliberate divergence — the JSON standard's reading)
 
@@ -7072,3 +7076,20 @@ gated by
   of our routes can compute, so the database and today's route answer the
   same.
 - Gated by `differential_metric_reducers.test`.
+
+## Issue #624, part 4b — the `| unwrap` reducers after a parser
+
+### `unwrap-bytes-json-exponent` (issue #624, part 4b, divergence kept)
+
+- **Example.** A JSON number written with an exponent reads as its value
+  under `| unwrap bytes(x)`: `{"x":1e3}` answers 1000, where the reference
+  fails the line with `SampleExtractionErr`, because it converts the
+  number's text `1e3`.
+- **Why.** The JSON parser renders numbers, not their text, on every
+  route, and the reduced statement leaves a JSON float under `bytes(x)`
+  undecided so it cannot answer differently from today's route.
+- **Cases.** T3 of issue #624, part 4b
+  (`query_log_gates.rs`'s `the_value_readers_are_the_references_extraction`):
+  `tests/fixtures/unwrap_parsers/undecided.tsv` holds `14  10` and
+  `15  10` (the line `{"x":1e3, …}`), so the reduced statement hands it to
+  today's route.

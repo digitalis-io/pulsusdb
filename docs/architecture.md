@@ -285,7 +285,7 @@ In-house recursive-descent parser → pipeline planner → SQL generator. A LogQ
 
 Live tail (`/api/logs/v1/tail`) is a WebSocket loop polling the tail of `log_samples` for the resolved fingerprints with monotonic cursor advancement, `limit`/`start` support, and `dropped_entries` reporting under backpressure.
 
-LogQL and TraceQL each have their own compiler, and the two are not to be merged (owner decision, #507). LogQL's compiler is the planner in `crates/pulsus-read/src/logql/plan.rs`: it decides which pipeline stages are compiled into the SQL and which run in the engine, including the extracted-field group key read. TraceQL's compiler is the core in `crates/pulsus-read/src/compile/`, described in [Query lowering](query-lowering.md).
+LogQL and TraceQL each have their own compiler, and the two are not to be merged (owner decision, #507). LogQL's compiler is the planner in `crates/pulsus-read/src/logql/plan.rs`: it decides which pipeline stages are compiled into the SQL and which run in the engine, including the parser before an `| unwrap` that the reduced statement runs. TraceQL's compiler is the core in `crates/pulsus-read/src/compile/`, described in [Query lowering](query-lowering.md).
 
 ### 5.4 TraceQL
 
