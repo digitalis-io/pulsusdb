@@ -379,8 +379,8 @@ fn the_mixed_type_defect_is_indexed_and_explained_in_the_defects_document() {
 }
 
 /// The defects document numbers its entries once each, contiguously from
-/// 1, and holds 32 — the count a merge that renumbered one entry has to
-/// produce (issue #507 added entries 25–32).
+/// 1, and holds 33 — the count a merge that renumbered one entry has to
+/// produce (issue #507 added entries 25–32, issue #624 part 4 entry 33).
 ///
 /// *RED when:* two entries carry the same number, which is exactly what
 /// both branches of this merge wrote (each added its own entry 23), or an
@@ -388,7 +388,7 @@ fn the_mixed_type_defect_is_indexed_and_explained_in_the_defects_document() {
 /// headings and the index rows are checked SEPARATELY and then against
 /// each other: they are two edits, and a merge can leave one behind.
 #[test]
-fn the_defects_document_numbers_its_entries_once_each_and_holds_thirty_two() {
+fn the_defects_document_numbers_its_entries_once_each_and_holds_thirty_three() {
     let doc = read(DEFECTS);
     let numbers = |take: fn(&str) -> Option<&str>| -> Vec<u32> {
         lines_outside_fences(&doc)
@@ -399,16 +399,16 @@ fn the_defects_document_numbers_its_entries_once_each_and_holds_thirty_two() {
     };
     let headings = numbers(|l| l.strip_prefix("## ")?.split('.').next());
     let index_rows = numbers(|l| l.strip_prefix("| [")?.split(']').next());
-    let want: Vec<u32> = (1..=32).collect();
+    let want: Vec<u32> = (1..=33).collect();
     assert_eq!(
         headings, want,
-        "the defects document's `## <n>.` headings must be 1..=32, once each and in order — \
+        "the defects document's `## <n>.` headings must be 1..=33, once each and in order — \
          a duplicated number is what a merge of two branches that each wrote entry 23 \
          produces"
     );
     assert_eq!(
         index_rows, want,
-        "the index table's rows must be 1..=32, once each and in order — the heading and the \
+        "the index table's rows must be 1..=33, once each and in order — the heading and the \
          index row are two separate edits"
     );
 }
