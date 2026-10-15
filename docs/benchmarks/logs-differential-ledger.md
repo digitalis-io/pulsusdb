@@ -7026,7 +7026,7 @@ gated by
 ### `rate-counter-window-anchored` (issue #624, part 4, deliberate divergence — owner decision)
 
 - **What differs.** `rate_counter`'s extrapolation. The reference's
-  `extrapolatedRate` (`pkg/logql/range_vector.go:286-353 @ v3.7.4`) holds
+  `extrapolatedRate` (`pkg/logql/range_vector.go:286-353`) holds
   sample times in nanoseconds and divides every span by 1,000
   (`durationMilliseconds`, `:355`) as if they were milliseconds, and it
   anchors the window on the first sample: `rangeStart = first.T -

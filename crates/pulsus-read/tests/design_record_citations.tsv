@@ -353,6 +353,8 @@ docs/query-to-sql.md	sql.rs:1020	crates/pulsus-read/src/logql/sql.rs	1020		prose
 docs/query-to-sql.md	sql.rs:109	crates/pulsus-read/src/logql/sql.rs	109		prose	RollupBytes	sum(bytes)
 docs/query-to-sql.md	sql.rs:1730	crates/pulsus-read/src/logql/sql.rs	1730		prose	metric_range_bucketed	metric_range_bucketed
 docs/query-to-sql.md	sql.rs:1878	crates/pulsus-read/src/logql/sql.rs	1878		prose	metric_range_sliding	metric_range_sliding
+docs/query-to-sql.md	sql.rs:2029	crates/pulsus-read/src/logql/sql.rs	2029		prose	reduced_conversion_columns	reduced_conversion_columns
+docs/query-to-sql.md	sql.rs:2144	crates/pulsus-read/src/logql/sql.rs	2144		prose	metric_range_reduced	metric_range_reduced
 docs/query-to-sql.md	sql.rs:2620	crates/pulsus-read/src/logql/sql.rs	2620		prose	metric_range_unwrapped	metric_range_unwrapped
 docs/query-to-sql.md	sql.rs:2683	crates/pulsus-read/src/logql/sql.rs	2683		prose	metric_range_unwrapped_rows	metric_range_unwrapped_rows
 docs/query-to-sql.md	sql.rs:339	crates/pulsus-read/src/logql/sql.rs	339		prose	LOGFMT_DECIDED_LINE	LOGFMT_DECIDED_LINE
