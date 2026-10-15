@@ -831,9 +831,9 @@ docs/query-to-sql.md	model.rs:612	no_name_the_target_file_holds
 docs/query-to-sql.md	model.rs:694	no_name_the_target_file_holds
 docs/query-to-sql.md	model.rs:697	no_name_the_target_file_holds
 docs/query-to-sql.md	model.rs:708	no_name_the_target_file_holds
-docs/query-to-sql.md	pipeline.rs:5542	no_name_the_target_file_holds
-docs/query-to-sql.md	pipeline.rs:6769	no_name_the_target_file_holds
-docs/query-to-sql.md	pipeline.rs:6853-6873	no_name_the_target_file_holds
+docs/query-to-sql.md	pipeline.rs:5544	no_name_the_target_file_holds
+docs/query-to-sql.md	pipeline.rs:6771	no_name_the_target_file_holds
+docs/query-to-sql.md	pipeline.rs:6855-6875	no_name_the_target_file_holds
 docs/query-to-sql.md	pkg/logql/log/fmt.go:29	not_in_this_repository
 docs/query-to-sql.md	pkg/logql/log/fmt.go:76	pinned_to_another_version
 docs/query-to-sql.md	pkg/logql/log/ip.go:183-226	not_in_this_repository

@@ -15658,6 +15658,83 @@ async fn failed_and_undecided_values() {
     drop_db_624(&admin, &db).await;
 }
 
+/// **T2's live half (issue #624, part 4, code review round 1): a compound
+/// duration whose sum passes the range fails its conversion** on today's
+/// route, as any out-of-range duration does: no sample, and the line carries
+/// `__error__`, which fails the query unless a filter drops it. The reduced
+/// statement leaves the text undecided (each component has 19 digits), so
+/// the query reaches today's route either way.
+#[tokio::test]
+async fn an_overflowing_compound_duration_fails_its_conversion() {
+    skip_unless_live!();
+    let (admin, db) = fresh_db_624(pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_p4ovf_{}",
+        uuid::Uuid::new_v4().simple()
+    )))
+    .await;
+    let t = ((now_ns() - 3_600_000_000_000) / 60_000_000_000) * 60_000_000_000;
+    let sec = 1_000_000_000i64;
+    for (fp, svc, lat) in [
+        (
+            6_240_670u64,
+            "c624p4ovf",
+            "9223372036854775808ns9223372036854775808ns",
+        ),
+        (
+            6_240_671,
+            "c624p4ovfn",
+            "-9223372036854775808ns9223372036854775808ns",
+        ),
+    ] {
+        land_stream_624(
+            &admin,
+            &db,
+            t,
+            fp,
+            svc,
+            &format!(r#"{{"service_name":"{svc}"}}"#),
+        )
+        .await;
+        land_line_624(&admin, &db, fp, svc, t + 20 * sec, "x", r#"{"lat":"2s"}"#).await;
+        land_line_624(
+            &admin,
+            &db,
+            fp,
+            svc,
+            t + 30 * sec,
+            "y",
+            &format!(r#"{{"lat":"{lat}"}}"#),
+        )
+        .await;
+        let params = grid_624p4(t + 60 * sec, t + 60 * sec);
+        for todays in [false, true] {
+            let query =
+                format!(r#"max_over_time({{service_name="{svc}"}} | unwrap duration(lat) [60s])"#);
+            match run_624(&db, hooks_624(todays, None, None), None, &query, &params).await {
+                Err(ReadError::MetricPipelineError { error_type, .. }) => assert_eq!(
+                    error_type,
+                    pulsus_read::logql::SAMPLE_EXTRACTION_ERROR,
+                    "{query} (today's {todays})"
+                ),
+                other => panic!("{query} (today's {todays}): a conversion failure, got {other:?}"),
+            }
+            let query = format!(
+                r#"max_over_time({{service_name="{svc}"}} | unwrap duration(lat) | __error__="" [60s])"#
+            );
+            let got = run_624(&db, hooks_624(todays, None, None), None, &query, &params)
+                .await
+                .unwrap_or_else(|e| panic!("{query}: {e}"));
+            let points: Vec<(i64, u64)> = got.iter().flat_map(|(_, p)| p.clone()).collect();
+            assert_eq!(
+                points,
+                vec![(t + 60 * sec, 2f64.to_bits())],
+                "{query} (today's {todays}): the overflowing line is no sample"
+            );
+        }
+    }
+    drop_db_624(&admin, &db).await;
+}
+
 /// **T14 (issue #624, part 4): `without (zone)` keeps the metadata `zone` a
 /// stream label shadows, as `zone_extracted`**, and the reduced statement
 /// answers it alone.
@@ -16254,8 +16331,6 @@ async fn the_database_conversions_are_todays_routes_where_they_decide() {
         "abc",
         "9223372037s",
         "2562048h",
-        "9223372036854775808ns9223372036854775808ns",
-        "-9223372036854775808ns9223372036854775808ns",
         "n/a",
         "-",
         "1.e5",
