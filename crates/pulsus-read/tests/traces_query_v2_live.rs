@@ -12934,6 +12934,7 @@ async fn metrics_engine(db: &str, max_series: u64) -> pulsus_read::TraceEngine {
 const METRICS_TABLES: pulsus_read::StatementTables<'static> = pulsus_read::StatementTables {
     spans: "spans",
     resources: "resources",
+    traces: "traces",
     indexed: &[],
 };
 
@@ -12993,6 +12994,8 @@ fn series_name(s: &pulsus_read::TraceMetricSeries) -> String {
         .map(|l| match &l.value {
             pulsus_read::MetricLabelValue::Str(v) => format!("{}={v}", l.key),
             pulsus_read::MetricLabelValue::Double(v) => format!("{}={v}", l.key),
+            pulsus_read::MetricLabelValue::Int(v) => format!("{}={v}", l.key),
+            pulsus_read::MetricLabelValue::Bool(v) => format!("{}={v}", l.key),
         })
         .collect::<Vec<_>>()
         .join(",")
@@ -13728,7 +13731,7 @@ async fn body_bytes(client: &ChClient, statement: &str) -> u64 {
     count(
         client,
         &format!(
-            "SELECT sum(length(formatRow('RowBinary', g, points, exemplars, f))) AS n FROM ({}) \
+            "SELECT sum(length(formatRow('RowBinary', g, o, points, exemplars, f))) AS n FROM ({}) \
              SETTINGS final = 1, max_block_size = 4096",
             statement.replace('?', "??")
         ),
@@ -13755,13 +13758,19 @@ async fn statement_rows(
     out
 }
 
-/// D12's bound for `rows`: each row's label, its length prefix and four
-/// framing bytes, 16 bytes a point and 32 an exemplar.
+/// D12's bound for `rows` (part 2's section 7): each row's key array —
+/// one byte of length, and per key its text, the text's length prefix and
+/// the one-byte type with its prefix — twelve framing bytes (`o`, the
+/// points' and exemplars' prefixes, the flag), 16 bytes a point and 32 an
+/// exemplar.
 fn d12_bound(rows: &[pulsus_read::traces::spans::metrics::MetricStatementRow]) -> u64 {
     rows.iter()
         .map(|r| {
-            (r.g.len() + varint_width(r.g.len()) + 4 + 16 * r.points.len() + 32 * r.exemplars.len())
-                as u64
+            let keys: usize =
+                r.g.iter()
+                    .map(|(t, _)| t.len() + varint_width(t.len()) + 2)
+                    .sum();
+            (1 + keys + 12 + 16 * r.points.len() + 32 * r.exemplars.len()) as u64
         })
         .sum()
 }
@@ -13789,8 +13798,8 @@ fn without_exemplars(q: &str) -> String {
 }
 
 /// `T-Q3`'s metrics half: the body is within D12's bound, at most 100
-/// exemplars leave the database, and every shape but a one-series answer
-/// with exemplars is within 24 bytes an answer sample.
+/// exemplars leave the database, and every range shape but a one-series
+/// answer with exemplars is within 24 bytes an answer sample.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn t_q3_metrics_bodies_are_within_the_bound() {
     skip_unless_live!();
@@ -13830,7 +13839,10 @@ async fn t_q3_metrics_bodies_are_within_the_bound() {
             }
             let one_series = q.starts_with("{} | rate()") && !q.contains("by(")
                 || q.starts_with("{} | histogram_over_time");
-            if (!exemplars || !one_series) && body > 24 * samples {
+            // D12's second class: a single sample per series carries its
+            // row's framing alone — since part 2 a key array and an 8-byte
+            // `o` (28 bytes for an ungrouped instant answer).
+            if !instant && (!exemplars || !one_series) && body > 24 * samples {
                 wrong.push(format!("{q}: body {body} over 24 x {samples} samples"));
             }
             eprintln!("{q}: body {body}, bound {bound}, samples {samples}, exemplars {sent}");
@@ -13909,8 +13921,9 @@ async fn one_metrics_statement_reads_the_window_once() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
-/// D12 on a one-sample answer: the body is 83 bytes for three samples,
-/// and a 16,384-byte label's row is within the bound by one byte.
+/// D12 on a one-sample answer (part 2's section 7, with keys): the body is
+/// 116 bytes for three samples, and a 16,384-byte label's row is within
+/// the bound by one byte.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_one_sample_answer_with_service_labels() {
     skip_unless_live!();
@@ -13927,13 +13940,14 @@ async fn a_one_sample_answer_with_service_labels() {
     let rows = statement_rows(&client, &sql).await;
     #[derive(Row, serde::Serialize, serde::Deserialize)]
     struct RowBytes {
-        g: String,
+        label: String,
         n: u64,
     }
     let mut stream = client
         .query_stream::<RowBytes>(
             &format!(
-                "SELECT g, length(formatRow('RowBinary', g, points, exemplars, f)) AS n FROM ({sql}) \
+                "SELECT toString(g[1].1) AS label, \
+                 length(formatRow('RowBinary', g, o, points, exemplars, f)) AS n FROM ({sql}) \
                  SETTINGS final = 1"
             ),
             &QuerySettings::new(),
@@ -13943,25 +13957,1337 @@ async fn a_one_sample_answer_with_service_labels() {
     let mut per_row = Vec::new();
     while let Some(row) = stream.next().await {
         let row = row.expect("decode");
-        per_row.push((row.g, row.n));
+        per_row.push((row.label, row.n));
     }
     let long = count(
         &client,
-        "SELECT length(formatRow('RowBinary', repeat('x', 16384), [(toInt64(0), toFloat64(1))], \
-         CAST([], 'Array(Tuple(FixedString(16), Int64, Float64))'), toUInt8(0))) AS n",
+        "SELECT length(formatRow('RowBinary', [(repeat('x', 16384), 's')], toUInt64(0), \
+         [(toInt64(0), toFloat64(1))], CAST([], 'Array(Tuple(FixedString(16), Int64, Float64))'), \
+         toUInt8(0))) AS n",
     )
     .await;
     drop_db(&db).await;
     assert_eq!(
         per_row,
         vec![
-            ("checkout".to_string(), 28),
-            ("frontend".to_string(), 28),
-            ("payment".to_string(), 27)
+            ("checkout".to_string(), 39),
+            ("frontend".to_string(), 39),
+            ("payment".to_string(), 38)
         ]
     );
-    assert_eq!(body, 83, "the body");
-    assert_eq!(d12_bound(&rows), 86, "D12's bound");
-    assert_eq!(long, 16_406, "the 16,384-byte label's row");
-    assert_eq!(16_384 + varint_width(16_384) + 4 + 16, 16_407, "its bound");
+    assert_eq!(body, 116, "the body");
+    assert_eq!(d12_bound(&rows), 119, "D12's bound");
+    assert_eq!(long, 16_417, "the 16,384-byte label's row");
+    assert_eq!(
+        1 + 16_384 + varint_width(16_384) + 2 + 12 + 16,
+        16_418,
+        "its bound"
+    );
+}
+
+// =====================================================================
+// Issue #596 part 2 — metrics `by()` on any key, typed labels, attribute
+// targets
+// =====================================================================
+
+use pulsus_read::MetricLabelValue as LV;
+
+/// One RF span. `status` 0 unset, 1 ok, 2 error; the status message is
+/// empty, as section 1's fixture's is.
+#[allow(clippy::too_many_arguments)]
+fn rf_span(
+    trace: u8,
+    id: u8,
+    parent: Option<u8>,
+    name: &str,
+    kind: i32,
+    status: i32,
+    start_ns: i64,
+    duration_ns: i64,
+    attributes: Vec<KeyValue>,
+) -> Span {
+    Span {
+        trace_id: vec![trace; 16],
+        span_id: span_id_bytes(id),
+        parent_span_id: parent.map(span_id_bytes).unwrap_or_default(),
+        trace_state: String::new(),
+        flags: 0,
+        name: name.to_string(),
+        kind,
+        start_time_unix_nano: start_ns as u64,
+        end_time_unix_nano: (start_ns + duration_ns) as u64,
+        attributes,
+        dropped_attributes_count: 0,
+        events: Vec::new(),
+        dropped_events_count: 0,
+        links: Vec::new(),
+        dropped_links_count: 0,
+        status: (status != 0).then(|| Status {
+            message: String::new(),
+            code: status,
+        }),
+    }
+}
+
+/// Fixture RF (part 2's section 1), at `B` seconds: trace `a1…a1` in
+/// resource `svc-a` (scope `lib` `1.0`), spans `…01` to `…03`; trace
+/// `b2…b2` in resource `svc-b` (scope `lib2`), spans `…04` and `…05`;
+/// starts `B` + 1 to 5 s.
+fn fixture_rf(b: i64) -> ExportTraceServiceRequest {
+    let at = |s: i64| (b + s) * S_NS;
+    let mut root = rf_span(
+        0xa1,
+        1,
+        None,
+        "root",
+        2,
+        2,
+        at(1),
+        2 * S_NS,
+        vec![
+            kv("k", str_value("x")),
+            kv("n", int_value(5)),
+            kv("f", double_value(1.5)),
+            kv("b", bool_value(true)),
+            kv("arr", str_array_value(&["a", "b"])),
+        ],
+    );
+    root.events = vec![
+        event_of(
+            b * S_NS + 100 * MS_NS,
+            "e1",
+            vec![kv("ev", str_value("first"))],
+        ),
+        event_of(
+            b * S_NS + 200 * MS_NS,
+            "e2",
+            vec![kv("ev", str_value("second"))],
+        ),
+    ];
+    root.links = vec![link_of(
+        vec![0xb2; 16],
+        span_id_bytes(4),
+        vec![kv("lk", str_value("l1"))],
+    )];
+    let resource = |service: &str, extra: Vec<KeyValue>| {
+        let mut attributes = vec![kv("service.name", str_value(service))];
+        attributes.extend(extra);
+        Some(Resource {
+            attributes,
+            dropped_attributes_count: 0,
+            entity_refs: Vec::new(),
+        })
+    };
+    ExportTraceServiceRequest {
+        resource_spans: vec![
+            ResourceSpans {
+                resource: resource(
+                    "svc-a",
+                    vec![
+                        kv("k8s.pod.name", str_value("pod-1")),
+                        kv("rn", int_value(7)),
+                    ],
+                ),
+                scope_spans: vec![ScopeSpans {
+                    scope: Some(InstrumentationScope {
+                        name: "lib".to_string(),
+                        version: "1.0".to_string(),
+                        attributes: vec![kv("sc", str_value("s"))],
+                        dropped_attributes_count: 0,
+                    }),
+                    spans: vec![
+                        root,
+                        rf_span(
+                            0xa1,
+                            2,
+                            Some(1),
+                            "child",
+                            3,
+                            1,
+                            at(2),
+                            500 * MS_NS,
+                            vec![kv("k", str_value("y")), kv("n", int_value(7))],
+                        ),
+                        rf_span(0xa1, 3, Some(1), "child", 3, 0, at(3), S_NS, Vec::new()),
+                    ],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            },
+            ResourceSpans {
+                resource: resource("svc-b", Vec::new()),
+                scope_spans: vec![ScopeSpans {
+                    scope: Some(InstrumentationScope {
+                        name: "lib2".to_string(),
+                        version: String::new(),
+                        attributes: Vec::new(),
+                        dropped_attributes_count: 0,
+                    }),
+                    spans: vec![
+                        rf_span(
+                            0xb2,
+                            4,
+                            None,
+                            "root2",
+                            1,
+                            0,
+                            at(4),
+                            3 * S_NS,
+                            vec![kv("k", int_value(5))],
+                        ),
+                        rf_span(
+                            0xb2,
+                            5,
+                            Some(4),
+                            "child2",
+                            1,
+                            0,
+                            at(5),
+                            250 * MS_NS,
+                            vec![kv("n", double_value(2.5))],
+                        ),
+                    ],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            },
+        ],
+    }
+}
+
+/// RF's span `id`.
+fn rf_span_mut(req: &mut ExportTraceServiceRequest, id: u8) -> &mut Span {
+    req.resource_spans
+        .iter_mut()
+        .flat_map(|r| r.scope_spans.iter_mut())
+        .flat_map(|s| s.spans.iter_mut())
+        .find(|s| s.span_id == span_id_bytes(id))
+        .expect("an RF span")
+}
+
+/// A fresh database holding RF, changed by `tweak`, and `B`.
+async fn seed_rf(
+    test: &str,
+    tweak: impl FnOnce(&mut ExportTraceServiceRequest, i64),
+) -> (String, ChClient, i64) {
+    let db = pulsus_testkit::test_db(&format!("pulsus_read_it_t596p2_{test}"));
+    let client = fresh_db(&db).await;
+    let b = metrics_l();
+    let mut req = fixture_rf(b);
+    tweak(&mut req, b);
+    land(&client, &req, &format!("{test}-{}", now_ns())).await;
+    (db, client, b)
+}
+
+/// The routed plan for `q` over `[start_s, end_s)`, step 60 s, asserted
+/// `Ok` and carrying a statement.
+fn routed_ok(
+    engine: &pulsus_read::TraceEngine,
+    q: &str,
+    start_s: i64,
+    end_s: i64,
+) -> pulsus_read::RoutedMetricsPlan {
+    let routed = pulsus_read::plan_trace_metrics_routed(
+        &parse_query(q),
+        &pulsus_read::MetricsParams {
+            start_ns: start_s * S_NS,
+            end_ns: end_s * S_NS,
+            step_ms: 60_000,
+            exemplars: None,
+        },
+        &engine.metrics_ctx(),
+        &METRICS_TABLES,
+    );
+    assert!(
+        routed.is_ok(),
+        "{q}: the routed planner refused: {routed:?}"
+    );
+    let routed = routed.expect("checked");
+    assert!(routed.statement().is_some(), "{q}: no statement");
+    routed
+}
+
+/// The instant answer to `q` over `[b, b + 60)`.
+async fn rf_instant(engine: &pulsus_read::TraceEngine, q: &str, b: i64) -> MetricsAnswer {
+    let routed = routed_ok(engine, q, b, b + 60);
+    engine.metrics_instant_routed(&routed).await
+}
+
+/// The range answer to `q` over `[b, b + 60)`, step 60 s.
+async fn rf_range(engine: &pulsus_read::TraceEngine, q: &str, b: i64) -> MetricsAnswer {
+    let routed = routed_ok(engine, q, b, b + 60);
+    engine.metrics_range_routed(&routed).await
+}
+
+/// A label as `key=Value` with the value's arm, `Double(NaN)` and
+/// `Double(inf)` written out.
+fn label_text(key: &str, value: &LV) -> String {
+    format!("{key}={value:?}")
+}
+
+/// Each series as `labels -> samples`, the labels in order, the samples'
+/// timestamps in seconds from `b`; sorted, so the comparison does not
+/// depend on the series order.
+fn series_texts(out: &MetricsAnswer, b: i64) -> Vec<String> {
+    let out = out
+        .as_ref()
+        .unwrap_or_else(|e| panic!("the metrics read failed: {e}"));
+    let mut v: Vec<String> = out
+        .series
+        .iter()
+        .map(|s| {
+            let labels: Vec<String> = s
+                .labels
+                .iter()
+                .map(|l| label_text(&l.key, &l.value))
+                .collect();
+            let samples: Vec<String> = s
+                .samples
+                .iter()
+                .map(|(t, v)| format!("{}:{v:?}", t / 1000 - b))
+                .collect();
+            format!("[{}] -> {}", labels.join(", "), samples.join(" "))
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+/// The expected form of [`series_texts`] for instant answers at `b + 60`:
+/// each series' labels and its one value.
+fn instant_want(rows: &[(&[(&str, LV)], f64)]) -> Vec<String> {
+    let mut v: Vec<String> = rows
+        .iter()
+        .map(|(labels, value)| {
+            let labels: Vec<String> = labels.iter().map(|(k, v)| label_text(k, v)).collect();
+            format!("[{}] -> 60:{value:?}", labels.join(", "))
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+/// One request of a table-driven RF case: the query part, and each
+/// expected series' labels with its value.
+type RfCase<'a> = (&'a str, Vec<(Vec<(&'a str, LV)>, f64)>);
+
+fn s(v: &str) -> LV {
+    LV::Str(v.to_string())
+}
+
+/// `count_over_time() by(X)`, instant over the minute holding RF, for every
+/// key of section 1's table but `span:childCount`, labelled and counted as
+/// the reference labels and counts them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_key_labels_as_the_reference() {
+    skip_unless_live!();
+    let (db, _client, b) = seed_rf("every_key", |_, _| {}).await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let a1 = "a1".repeat(16);
+    let b2 = "b2".repeat(16);
+    let root = |n: u8| format!("{:016x}", n);
+    let cases: Vec<RfCase> = vec![
+        (
+            "span.k",
+            vec![
+                (vec![("span.k", LV::Int(5))], 1.0),
+                (vec![("span.k", s("x"))], 1.0),
+                (vec![("span.k", s("y"))], 1.0),
+                (vec![("span.k", s("nil"))], 2.0),
+            ],
+        ),
+        (
+            "span.n",
+            vec![
+                (vec![("span.n", LV::Double(2.5))], 1.0),
+                (vec![("span.n", LV::Int(5))], 1.0),
+                (vec![("span.n", LV::Int(7))], 1.0),
+                (vec![("span.n", s("nil"))], 2.0),
+            ],
+        ),
+        (
+            "span.f",
+            vec![
+                (vec![("span.f", LV::Double(1.5))], 1.0),
+                (vec![("span.f", s("nil"))], 4.0),
+            ],
+        ),
+        (
+            "span.b",
+            vec![
+                (vec![("span.b", LV::Bool(true))], 1.0),
+                (vec![("span.b", s("nil"))], 4.0),
+            ],
+        ),
+        (
+            ".k",
+            vec![
+                (vec![(".k", LV::Int(5))], 1.0),
+                (vec![(".k", s("x"))], 1.0),
+                (vec![(".k", s("y"))], 1.0),
+                (vec![(".k", s("nil"))], 2.0),
+            ],
+        ),
+        (
+            ".n",
+            vec![
+                (vec![(".n", LV::Double(2.5))], 1.0),
+                (vec![(".n", LV::Int(5))], 1.0),
+                (vec![(".n", LV::Int(7))], 1.0),
+                (vec![(".n", s("nil"))], 2.0),
+            ],
+        ),
+        (
+            ".rn",
+            vec![
+                (vec![(".rn", LV::Int(7))], 3.0),
+                (vec![(".rn", s("nil"))], 2.0),
+            ],
+        ),
+        (
+            "resource.k8s.pod.name",
+            vec![
+                (vec![("resource.k8s.pod.name", s("pod-1"))], 3.0),
+                (vec![("resource.k8s.pod.name", s("nil"))], 2.0),
+            ],
+        ),
+        (
+            "resource.rn",
+            vec![
+                (vec![("resource.rn", LV::Int(7))], 3.0),
+                (vec![("resource.rn", s("nil"))], 2.0),
+            ],
+        ),
+        (
+            "instrumentation.sc",
+            vec![
+                (vec![("instrumentation.sc", s("s"))], 3.0),
+                (vec![("instrumentation.sc", s("nil"))], 2.0),
+            ],
+        ),
+        (
+            "event.ev",
+            vec![
+                (vec![("event.ev", s("first"))], 1.0),
+                (vec![("event.ev", s("nil"))], 4.0),
+            ],
+        ),
+        (
+            "link.lk",
+            vec![
+                (vec![("link.lk", s("l1"))], 1.0),
+                (vec![("link.lk", s("nil"))], 4.0),
+            ],
+        ),
+        (
+            "event:name",
+            vec![
+                (vec![("event:name", s("e1"))], 1.0),
+                (vec![("event:name", s(""))], 4.0),
+            ],
+        ),
+        (
+            "event:timeSinceStart",
+            vec![
+                (vec![("event:timeSinceStart", s("-900ms"))], 1.0),
+                (vec![("event:timeSinceStart", s("0s"))], 4.0),
+            ],
+        ),
+        (
+            "link:traceID",
+            vec![
+                (vec![("link:traceID", s(&b2))], 1.0),
+                (vec![("link:traceID", s(""))], 4.0),
+            ],
+        ),
+        (
+            "link:spanID",
+            vec![
+                (vec![("link:spanID", s(&root(4)))], 1.0),
+                (vec![("link:spanID", s(&root(0)))], 4.0),
+            ],
+        ),
+        (
+            "name",
+            vec![
+                (vec![("name", s("root"))], 1.0),
+                (vec![("name", s("child"))], 2.0),
+                (vec![("name", s("root2"))], 1.0),
+                (vec![("name", s("child2"))], 1.0),
+            ],
+        ),
+        (
+            "status",
+            vec![
+                (vec![("status", s("error"))], 1.0),
+                (vec![("status", s("ok"))], 1.0),
+                (vec![("status", s("unset"))], 3.0),
+            ],
+        ),
+        (
+            "kind",
+            vec![
+                (vec![("kind", s("server"))], 1.0),
+                (vec![("kind", s("client"))], 2.0),
+                (vec![("kind", s("internal"))], 2.0),
+            ],
+        ),
+        ("statusMessage", vec![(vec![("statusMessage", s(""))], 5.0)]),
+        (
+            "duration",
+            vec![
+                (vec![("duration", s("250ms"))], 1.0),
+                (vec![("duration", s("500ms"))], 1.0),
+                (vec![("duration", s("1s"))], 1.0),
+                (vec![("duration", s("2s"))], 1.0),
+                (vec![("duration", s("3s"))], 1.0),
+            ],
+        ),
+        (
+            "span:id",
+            (1..=5)
+                .map(|n| (vec![("span:id", s(&root(n)))], 1.0))
+                .collect(),
+        ),
+        (
+            "span:parentID",
+            vec![
+                (vec![("span:parentID", s(&root(0)))], 2.0),
+                (vec![("span:parentID", s(&root(1)))], 2.0),
+                (vec![("span:parentID", s(&root(4)))], 1.0),
+            ],
+        ),
+        (
+            "trace:id",
+            vec![
+                (vec![("trace:id", s(&a1))], 3.0),
+                (vec![("trace:id", s(&b2))], 2.0),
+            ],
+        ),
+        (
+            "instrumentation:name",
+            vec![
+                (vec![("instrumentation:name", s("lib"))], 3.0),
+                (vec![("instrumentation:name", s("lib2"))], 2.0),
+            ],
+        ),
+        (
+            "instrumentation:version",
+            vec![
+                (vec![("instrumentation:version", s("1.0"))], 3.0),
+                (vec![("instrumentation:version", s(""))], 2.0),
+            ],
+        ),
+        (
+            "trace:duration",
+            vec![(vec![("traceDuration", s("3s"))], 5.0)],
+        ),
+        (
+            "trace:rootName",
+            vec![
+                (vec![("rootName", s("root"))], 3.0),
+                (vec![("rootName", s("root2"))], 2.0),
+            ],
+        ),
+        (
+            "trace:rootService",
+            vec![
+                (vec![("rootServiceName", s("svc-a"))], 3.0),
+                (vec![("rootServiceName", s("svc-b"))], 2.0),
+            ],
+        ),
+        (
+            "nestedSetLeft",
+            vec![
+                (vec![("nestedSetLeft", LV::Int(1))], 2.0),
+                (vec![("nestedSetLeft", LV::Int(2))], 2.0),
+                (vec![("nestedSetLeft", LV::Int(4))], 1.0),
+            ],
+        ),
+        (
+            "nestedSetRight",
+            vec![
+                (vec![("nestedSetRight", LV::Int(3))], 2.0),
+                (vec![("nestedSetRight", LV::Int(4))], 1.0),
+                (vec![("nestedSetRight", LV::Int(5))], 1.0),
+                (vec![("nestedSetRight", LV::Int(6))], 1.0),
+            ],
+        ),
+        (
+            "nestedSetParent",
+            vec![
+                (vec![("nestedSetParent", LV::Int(-1))], 2.0),
+                (vec![("nestedSetParent", LV::Int(1))], 3.0),
+            ],
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (key, want) in &cases {
+        let q = format!("{{}} | count_over_time() by({key})");
+        let got = series_texts(&rf_instant(&engine, &q, b).await, b);
+        let want: Vec<(&[(&str, LV)], f64)> =
+            want.iter().map(|(l, v)| (l.as_slice(), *v)).collect();
+        let want = instant_want(&want);
+        if got != want {
+            wrong.push(format!("{q}\n  want {want:?}\n  got  {got:?}"));
+        }
+    }
+    drop_db(&db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// The reference's rule for a missing value: dropped from the label set,
+/// kept as `nil` for a well-known key, the first key `nil` when nothing is
+/// left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_values_follow_the_reference() {
+    skip_unless_live!();
+    let (db, _client, b) = seed_rf("missing", |_, _| {}).await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let pod = "resource.k8s.pod.name";
+    let method = "span.http.method";
+    let cases: Vec<RfCase> = vec![
+        (
+            "span.k, resource.k8s.pod.name",
+            vec![
+                (vec![(pod, s("nil"))], 1.0),
+                (vec![(pod, s("pod-1"))], 1.0),
+                (vec![("span.k", LV::Int(5)), (pod, s("nil"))], 1.0),
+                (vec![("span.k", s("x")), (pod, s("pod-1"))], 1.0),
+                (vec![("span.k", s("y")), (pod, s("pod-1"))], 1.0),
+            ],
+        ),
+        (
+            "span.b, resource.rn",
+            vec![
+                (vec![("resource.rn", LV::Int(7))], 2.0),
+                (vec![("span.b", s("nil"))], 2.0),
+                (
+                    vec![("span.b", LV::Bool(true)), ("resource.rn", LV::Int(7))],
+                    1.0,
+                ),
+            ],
+        ),
+        (
+            "span.b, span.http.method",
+            vec![
+                (vec![(method, s("nil"))], 4.0),
+                (vec![("span.b", LV::Bool(true)), (method, s("nil"))], 1.0),
+            ],
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (keys, want) in &cases {
+        let q = format!("{{}} | count_over_time() by({keys})");
+        let got = series_texts(&rf_instant(&engine, &q, b).await, b);
+        let want: Vec<(&[(&str, LV)], f64)> =
+            want.iter().map(|(l, v)| (l.as_slice(), *v)).collect();
+        let want = instant_want(&want);
+        if got != want {
+            wrong.push(format!("{q}\n  want {want:?}\n  got  {got:?}"));
+        }
+    }
+    drop_db(&db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// An array value is its own series labelled `nil`, apart from the spans
+/// that lack the key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_array_value_is_its_own_nil_series() {
+    skip_unless_live!();
+    let (db, _client, b) = seed_rf("array", |_, _| {}).await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let got = series_texts(
+        &rf_instant(&engine, "{} | count_over_time() by(span.arr)", b).await,
+        b,
+    );
+    drop_db(&db).await;
+    assert_eq!(
+        got,
+        instant_want(&[
+            (&[("span.arr", s("nil"))], 4.0),
+            (&[("span.arr", s("nil"))], 1.0),
+        ])
+    );
+}
+
+/// `span:childCount` is the span's direct children, those outside the
+/// window included, `0` for a leaf (D5).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn child_counts_are_direct_children() {
+    skip_unless_live!();
+    let (db, _client, b) = seed_rf("children", |req, b| {
+        let late = rf_span(
+            0xb2,
+            6,
+            Some(5),
+            "late",
+            1,
+            0,
+            (b + 70) * S_NS,
+            MS_NS,
+            Vec::new(),
+        );
+        req.resource_spans[1].scope_spans[0].spans.push(late);
+    })
+    .await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let by = series_texts(
+        &rf_instant(&engine, "{} | count_over_time() by(span:childCount)", b).await,
+        b,
+    );
+    let avg = series_texts(
+        &rf_instant(&engine, "{} | avg_over_time(span:childCount)", b).await,
+        b,
+    );
+    let max = series_texts(
+        &rf_instant(&engine, "{} | max_over_time(span:childCount) by(name)", b).await,
+        b,
+    );
+    let query = parse_query("{} | sum_over_time(nestedSetLeft)");
+    let params = pulsus_read::MetricsParams {
+        start_ns: b * S_NS,
+        end_ns: (b + 60) * S_NS,
+        step_ms: 60_000,
+        exemplars: None,
+    };
+    let routed = pulsus_read::plan_trace_metrics_routed(
+        &query,
+        &params,
+        &engine.metrics_ctx(),
+        &METRICS_TABLES,
+    )
+    .map(|_| ());
+    let today = pulsus_read::plan_trace_metrics(&query, &params, &engine.metrics_ctx()).map(|_| ());
+    drop_db(&db).await;
+    assert_eq!(
+        by,
+        instant_want(&[
+            (&[("span:childCount", LV::Int(0))], 2.0),
+            (&[("span:childCount", LV::Int(1))], 2.0),
+            (&[("span:childCount", LV::Int(2))], 1.0),
+        ])
+    );
+    assert_eq!(
+        avg,
+        instant_want(&[(&[("__name__", s("avg_over_time"))], 0.8)])
+    );
+    assert_eq!(
+        max,
+        instant_want(&[
+            (&[("name", s("root"))], 2.0),
+            (&[("name", s("child"))], 0.0),
+            (&[("name", s("root2"))], 1.0),
+            (&[("name", s("child2"))], 1.0),
+        ])
+    );
+    assert!(
+        today.is_err(),
+        "today's planner refuses a nested-set target"
+    );
+    assert_eq!(
+        routed, today,
+        "a nested-set target keeps today's answer (D8)"
+    );
+}
+
+/// A quantile and a histogram keyed by `by()`: the key labels first, then
+/// `p` or `__bucket`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn keyed_quantile_and_histogram() {
+    skip_unless_live!();
+    let (db, _client, b) = seed_rf("keyed_quantile", |_, _| {}).await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let quantile = rf_instant(
+        &engine,
+        "{} | quantile_over_time(duration, .5) by(span.k)",
+        b,
+    )
+    .await;
+    let histogram = rf_range(
+        &engine,
+        "{} | histogram_over_time(duration) by(resource.service.name)",
+        b,
+    )
+    .await;
+    drop_db(&db).await;
+    let q = quantile.expect("the quantile");
+    let labels: Vec<Vec<String>> = {
+        let mut v: Vec<Vec<String>> = q
+            .series
+            .iter()
+            .map(|s| {
+                s.labels
+                    .iter()
+                    .map(|l| label_text(&l.key, &l.value))
+                    .collect()
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let p = label_text("p", &LV::Double(0.5));
+    assert_eq!(
+        labels,
+        {
+            let mut want = vec![
+                vec![p.clone()],
+                vec![label_text("span.k", &LV::Int(5)), p.clone()],
+                vec![label_text("span.k", &s("x")), p.clone()],
+                vec![label_text("span.k", &s("y")), p.clone()],
+            ];
+            want.sort();
+            want
+        },
+        "the key labels, then p"
+    );
+    let value_of = |key: LV| {
+        q.series
+            .iter()
+            .find(|s| s.labels.len() == 2 && s.labels[0].value == key)
+            .map(|s| s.samples[0].1)
+    };
+    assert_eq!(
+        (value_of(LV::Int(5)), value_of(s("x")), value_of(s("y"))),
+        (Some(3.0), Some(2.0), Some(0.5))
+    );
+    let mut want: Vec<String> = [
+        ("svc-a", 536_870_912_u64),
+        ("svc-a", 1_073_741_824),
+        ("svc-a", 2_147_483_648),
+        ("svc-b", 268_435_456),
+        ("svc-b", 4_294_967_296),
+    ]
+    .iter()
+    .map(|(svc, ns)| {
+        format!(
+            "[{}, {}] -> 0:0.0 60:1.0",
+            label_text("resource.service.name", &s(svc)),
+            label_text(
+                "__bucket",
+                &LV::Double(pulsus_read::traces::log2_histogram::bucket_seconds(*ns))
+            )
+        )
+    })
+    .collect();
+    want.sort();
+    assert_eq!(series_texts(&histogram, b), want);
+}
+
+/// A numeric attribute as the target: its `Int64` or `Float64` value,
+/// unscaled; a span with neither not counted; a histogram reading the
+/// integers only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attribute_targets() {
+    skip_unless_live!();
+    let (db, _client, b) = seed_rf("targets", |_, _| {}).await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let mean = 14.5 / 3.0;
+    let cases: Vec<RfCase> = vec![
+        (
+            "{} | avg_over_time(span.n)",
+            vec![(vec![("__name__", s("avg_over_time"))], mean)],
+        ),
+        (
+            "{} | min_over_time(span.n)",
+            vec![(vec![("__name__", s("min_over_time"))], 2.5)],
+        ),
+        (
+            "{} | max_over_time(span.n)",
+            vec![(vec![("__name__", s("max_over_time"))], 7.0)],
+        ),
+        (
+            "{} | sum_over_time(span.n)",
+            vec![(vec![("__name__", s("sum_over_time"))], 14.5)],
+        ),
+        (
+            "{} | avg_over_time(span.k)",
+            vec![(vec![("__name__", s("avg_over_time"))], 5.0)],
+        ),
+        (
+            "{} | avg_over_time(resource.rn)",
+            vec![(vec![("__name__", s("avg_over_time"))], 7.0)],
+        ),
+        (
+            "{} | avg_over_time(.n)",
+            vec![(vec![("__name__", s("avg_over_time"))], mean)],
+        ),
+        (
+            "{} | sum_over_time(span.f) by(name)",
+            vec![(vec![("name", s("root"))], 1.5)],
+        ),
+        (
+            "{} | histogram_over_time(span.n)",
+            vec![(vec![("__bucket", LV::Double(8.0))], 2.0)],
+        ),
+        ("{} | histogram_over_time(span.f)", vec![]),
+        (
+            "{} | quantile_over_time(span.n, 1)",
+            vec![(vec![("p", LV::Double(1.0))], 7.0)],
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (q, want) in &cases {
+        let got = series_texts(&rf_instant(&engine, q, b).await, b);
+        let want: Vec<(&[(&str, LV)], f64)> =
+            want.iter().map(|(l, v)| (l.as_slice(), *v)).collect();
+        let want = instant_want(&want);
+        if got != want {
+            wrong.push(format!("{q}\n  want {want:?}\n  got  {got:?}"));
+        }
+    }
+    drop_db(&db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Five keys are served; a sixth is the validator's refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn five_keys() {
+    skip_unless_live!();
+    let (db, _client, b) = seed_rf("five_keys", |_, _| {}).await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let got = series_texts(
+        &rf_instant(
+            &engine,
+            "{} | count_over_time() by(name, status, kind, span.k, resource.service.name)",
+            b,
+        )
+        .await,
+        b,
+    );
+    let six = pulsus_read::plan_trace_metrics_routed(
+        &parse_query(
+            "{} | count_over_time() by(name, status, kind, span.k, resource.service.name, span.n)",
+        ),
+        &pulsus_read::MetricsParams {
+            start_ns: b * S_NS,
+            end_ns: (b + 60) * S_NS,
+            step_ms: 60_000,
+            exemplars: None,
+        },
+        &engine.metrics_ctx(),
+        &METRICS_TABLES,
+    );
+    drop_db(&db).await;
+    let svc = "resource.service.name";
+    assert_eq!(
+        got,
+        instant_want(&[
+            (
+                &[
+                    ("name", s("root")),
+                    ("status", s("error")),
+                    ("kind", s("server")),
+                    ("span.k", s("x")),
+                    (svc, s("svc-a")),
+                ],
+                1.0
+            ),
+            (
+                &[
+                    ("name", s("child")),
+                    ("status", s("ok")),
+                    ("kind", s("client")),
+                    ("span.k", s("y")),
+                    (svc, s("svc-a")),
+                ],
+                1.0
+            ),
+            (
+                &[
+                    ("name", s("child")),
+                    ("status", s("unset")),
+                    ("kind", s("client")),
+                    (svc, s("svc-a")),
+                ],
+                1.0
+            ),
+            (
+                &[
+                    ("name", s("root2")),
+                    ("status", s("unset")),
+                    ("kind", s("internal")),
+                    ("span.k", LV::Int(5)),
+                    (svc, s("svc-b")),
+                ],
+                1.0
+            ),
+            (
+                &[
+                    ("name", s("child2")),
+                    ("status", s("unset")),
+                    ("kind", s("internal")),
+                    (svc, s("svc-b")),
+                ],
+                1.0
+            ),
+        ])
+    );
+    assert!(six.is_err(), "six keys: {:?}", six.map(|_| ()));
+}
+
+/// A grouped quantile and histogram of an attribute read the target per
+/// group, integers only, the key before `p` or `__bucket`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grouped_attribute_quantile_and_histogram() {
+    skip_unless_live!();
+    let (db, _client, b) = seed_rf("grouped_attr_q", |_, _| {}).await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let q = series_texts(
+        &rf_instant(
+            &engine,
+            "{} | quantile_over_time(span.n, .5, 1) by(resource.service.name)",
+            b,
+        )
+        .await,
+        b,
+    );
+    let h = series_texts(
+        &rf_instant(&engine, "{} | histogram_over_time(span.n) by(span.k)", b).await,
+        b,
+    );
+    drop_db(&db).await;
+    let svc = "resource.service.name";
+    assert_eq!(
+        q,
+        instant_want(&[
+            (&[(svc, s("svc-a")), ("p", LV::Double(0.5))], 5.0),
+            (&[(svc, s("svc-a")), ("p", LV::Double(1.0))], 7.0),
+        ])
+    );
+    assert_eq!(
+        h,
+        instant_want(&[
+            (&[("span.k", s("x")), ("__bucket", LV::Double(8.0))], 1.0),
+            (&[("span.k", s("y")), ("__bucket", LV::Double(8.0))], 1.0),
+        ])
+    );
+}
+
+/// A target in an event, link or instrumentation scope reads that scope:
+/// an event's or link's first element, the scope's value once per span.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scoped_numeric_targets() {
+    skip_unless_live!();
+    let (db, _client, b) = seed_rf("scoped_targets", |req, _| {
+        let root = rf_span_mut(req, 1);
+        root.events[0].attributes.push(kv("en", int_value(3)));
+        root.events[1].attributes.push(kv("en", int_value(9)));
+        root.links[0].attributes.push(kv("ln", double_value(4.5)));
+        req.resource_spans[0].scope_spans[0]
+            .scope
+            .as_mut()
+            .expect("scope lib")
+            .attributes
+            .push(kv("sn", int_value(10)));
+    })
+    .await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let mut got = Vec::new();
+    for q in [
+        "{} | max_over_time(event.en)",
+        "{} | avg_over_time(link.ln)",
+        "{} | quantile_over_time(link.ln, .5)",
+        "{} | sum_over_time(instrumentation.sn) by(resource.service.name)",
+    ] {
+        got.push(series_texts(&rf_instant(&engine, q, b).await, b));
+    }
+    drop_db(&db).await;
+    assert_eq!(
+        got,
+        vec![
+            instant_want(&[(&[("__name__", s("max_over_time"))], 3.0)]),
+            instant_want(&[(&[("__name__", s("avg_over_time"))], 4.5)]),
+            Vec::new(),
+            instant_want(&[(&[("resource.service.name", s("svc-a"))], 30.0)]),
+        ]
+    );
+}
+
+/// The aggregates of an attribute read it per group.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grouped_aggregates_of_an_attribute() {
+    skip_unless_live!();
+    let (db, _client, b) = seed_rf("grouped_aggs", |_, _| {}).await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let mut got = Vec::new();
+    for f in ["min", "max", "avg"] {
+        let q = format!("{{}} | {f}_over_time(span.n) by(resource.service.name)");
+        got.push(series_texts(&rf_instant(&engine, &q, b).await, b));
+    }
+    drop_db(&db).await;
+    let svc = "resource.service.name";
+    let want = |a: f64| instant_want(&[(&[(svc, s("svc-a"))], a), (&[(svc, s("svc-b"))], 2.5)]);
+    assert_eq!(got, vec![want(5.0), want(7.0), want(6.0)]);
+}
+
+/// On the range route an attribute target is sparse, and the range
+/// window's leading bucket holds nothing of RF.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn range_attribute_targets() {
+    skip_unless_live!();
+    let (db, _client, b) = seed_rf("range_targets", |_, _| {}).await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let avg = series_texts(&rf_range(&engine, "{} | avg_over_time(span.n)", b).await, b);
+    let max = series_texts(
+        &rf_range(&engine, "{} | max_over_time(span.n) by(span.k)", b).await,
+        b,
+    );
+    drop_db(&db).await;
+    assert_eq!(
+        avg,
+        instant_want(&[(&[("__name__", s("avg_over_time"))], 14.5 / 3.0)])
+    );
+    assert_eq!(
+        max,
+        instant_want(&[
+            (&[("span.k", s("x"))], 5.0),
+            (&[("span.k", s("y"))], 7.0),
+            (&[("span.k", s("nil"))], 2.5),
+        ])
+    );
+}
+
+/// Non-finite doubles group and aggregate as doubles.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_finite_values() {
+    skip_unless_live!();
+    let (db, _client, b) = seed_rf("non_finite", |req, _| {
+        rf_span_mut(req, 3)
+            .attributes
+            .push(kv("x", double_value(f64::INFINITY)));
+        rf_span_mut(req, 5)
+            .attributes
+            .push(kv("x", double_value(f64::NAN)));
+    })
+    .await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let by = series_texts(
+        &rf_instant(&engine, "{} | count_over_time() by(span.x)", b).await,
+        b,
+    );
+    let min = series_texts(
+        &rf_instant(&engine, "{} | min_over_time(span.x) by(name)", b).await,
+        b,
+    );
+    drop_db(&db).await;
+    assert_eq!(
+        by,
+        instant_want(&[
+            (&[("span.x", LV::Double(f64::INFINITY))], 1.0),
+            (&[("span.x", LV::Double(f64::NAN))], 1.0),
+            (&[("span.x", s("nil"))], 3.0),
+        ])
+    );
+    assert_eq!(
+        min,
+        instant_want(&[
+            (&[("name", s("child"))], f64::INFINITY),
+            (&[("name", s("child2"))], f64::NAN),
+        ])
+    );
+}
+
+/// A target no span holds answers no series; a key no span holds is one
+/// `nil` series.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attribute_no_data() {
+    skip_unless_live!();
+    let (db, _client, b) = seed_rf("no_data", |_, _| {}).await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let mut got = Vec::new();
+    for q in [
+        "{} | avg_over_time(span.nope)",
+        "{} | quantile_over_time(span.nope, .5)",
+    ] {
+        got.push(series_texts(&rf_instant(&engine, q, b).await, b));
+        got.push(series_texts(&rf_range(&engine, q, b).await, b));
+    }
+    let by = series_texts(
+        &rf_instant(&engine, "{} | count_over_time() by(span.nope)", b).await,
+        b,
+    );
+    drop_db(&db).await;
+    assert_eq!(got, vec![Vec::<String>::new(); 4]);
+    assert_eq!(by, instant_want(&[(&[("span.nope", s("nil"))], 5.0)]));
+}
+
+/// A value with no TraceQL type — bytes, a key-value list, an empty one —
+/// is missing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attrs_other_values_are_missing() {
+    skip_unless_live!();
+    let (db, _client, b) = seed_rf("attrs_other", |req, _| {
+        let bytes = AnyValue {
+            value: Some(any_value::Value::BytesValue(vec![1, 2, 3])),
+        };
+        let list = AnyValue {
+            value: Some(any_value::Value::KvlistValue(KeyValueList {
+                values: vec![kv("in", str_value("v"))],
+            })),
+        };
+        let empty = AnyValue {
+            value: Some(any_value::Value::KvlistValue(KeyValueList {
+                values: Vec::new(),
+            })),
+        };
+        let root = rf_span_mut(req, 1);
+        root.attributes.push(kv("bk", bytes));
+        root.attributes.push(kv("kv", list));
+        root.attributes.push(kv("ek", empty));
+        rf_span_mut(req, 2)
+            .attributes
+            .push(kv("bk", str_value("plain")));
+    })
+    .await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let mut got = Vec::new();
+    for key in ["span.bk", "span.kv", "span.ek"] {
+        let q = format!("{{}} | count_over_time() by({key})");
+        got.push(series_texts(&rf_instant(&engine, &q, b).await, b));
+    }
+    drop_db(&db).await;
+    assert_eq!(
+        got,
+        vec![
+            instant_want(&[
+                (&[("span.bk", s("nil"))], 4.0),
+                (&[("span.bk", s("plain"))], 1.0),
+            ]),
+            instant_want(&[(&[("span.kv", s("nil"))], 5.0)]),
+            instant_want(&[(&[("span.ek", s("nil"))], 5.0)]),
+        ]
+    );
+}
+
+/// An attribute quantile's exemplar is placed by its own integer value,
+/// unscaled, and valued at it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attribute_quantile_exemplar() {
+    skip_unless_live!();
+    let (db, _client, b) = seed_rf("quantile_exemplar", |req, _| {
+        rf_span_mut(req, 1).attributes.push(kv("m", int_value(7)));
+        rf_span_mut(req, 2).attributes.push(kv("m", int_value(5)));
+        rf_span_mut(req, 5)
+            .attributes
+            .push(kv("m", double_value(6.5)));
+    })
+    .await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let out = rf_range(&engine, "{} | quantile_over_time(span.m, .5, 1)", b).await;
+    drop_db(&db).await;
+    let out = out.expect("the quantile");
+    let at = |p: f64| {
+        out.series
+            .iter()
+            .find(|s| s.labels == vec![pulsus_read::MetricLabel::double("p", p)])
+            .unwrap_or_else(|| panic!("a p={p} series in {out:?}"))
+    };
+    let half = at(0.5);
+    let one = at(1.0);
+    let at_b60 = |s: &pulsus_read::TraceMetricSeries| {
+        s.samples
+            .iter()
+            .find(|(t, _)| *t == (b + 60) * 1000)
+            .map(|(_, v)| *v)
+    };
+    assert_eq!((at_b60(half), at_b60(one)), (Some(5.0), Some(7.0)));
+    assert!(half.exemplars.is_empty(), "no exemplar on p=0.5: {half:?}");
+    assert_eq!(one.exemplars.len(), 1, "one exemplar on p=1: {one:?}");
+    let e = &one.exemplars[0];
+    assert_eq!(
+        (
+            label_text(&e.labels[0].key, &e.labels[0].value),
+            e.timestamp_ms,
+            e.value
+        ),
+        (
+            label_text("trace:id", &s(&"a1".repeat(16))),
+            (b + 1) * 1000,
+            7.0
+        )
+    );
+}
+
+/// An unscoped key reads the first of five scopes holding it: span,
+/// resource, event, link, instrumentation (D4).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unscoped_keys_follow_the_five_scopes() {
+    skip_unless_live!();
+    let (db, _client, b) = seed_rf("unscoped", |req, _| {
+        rf_span_mut(req, 2)
+            .attributes
+            .extend([kv("p", str_value("span-p")), kv("num", int_value(1))]);
+        let root = rf_span_mut(req, 1);
+        root.events[0].attributes.push(kv("el", str_value("ev-el")));
+        root.links[0]
+            .attributes
+            .extend([kv("el", str_value("lk-el")), kv("ls", str_value("lk-ls"))]);
+        let svc_a = &mut req.resource_spans[0];
+        svc_a
+            .resource
+            .as_mut()
+            .expect("svc-a")
+            .attributes
+            .extend([kv("p", str_value("res-p")), kv("num", int_value(10))]);
+        svc_a.scope_spans[0]
+            .scope
+            .as_mut()
+            .expect("scope lib")
+            .attributes
+            .push(kv("ls", str_value("sc-ls")));
+    })
+    .await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let mut got = Vec::new();
+    for q in [
+        "{} | count_over_time() by(.p)",
+        "{} | count_over_time() by(.el)",
+        "{} | count_over_time() by(.ls)",
+        "{} | avg_over_time(.num)",
+    ] {
+        got.push(series_texts(&rf_instant(&engine, q, b).await, b));
+    }
+    drop_db(&db).await;
+    assert_eq!(
+        got,
+        vec![
+            instant_want(&[
+                (&[(".p", s("span-p"))], 1.0),
+                (&[(".p", s("res-p"))], 2.0),
+                (&[(".p", s("nil"))], 2.0),
+            ]),
+            instant_want(&[(&[(".el", s("ev-el"))], 1.0), (&[(".el", s("nil"))], 4.0),]),
+            instant_want(&[
+                (&[(".ls", s("lk-ls"))], 1.0),
+                (&[(".ls", s("sc-ls"))], 2.0),
+                (&[(".ls", s("nil"))], 2.0),
+            ]),
+            instant_want(&[(&[("__name__", s("avg_over_time"))], 7.0)]),
+        ]
+    );
+}
+
+/// The series cap counts the series of any key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_cap_counts_keyed_series() {
+    skip_unless_live!();
+    let (db, _client, b) = seed_rf("keyed_cap", |_, _| {}).await;
+    let engine = metrics_engine(&db, 4).await;
+    let q = "{} | count_over_time() by(span:id)";
+    let shape = |out: &MetricsAnswer| match out {
+        Ok(r) => format!("Ok({} series)", r.series.len()),
+        Err(pulsus_read::logql::ReadError::QueryTooBroad(
+            pulsus_read::logql::error::TooBroadReason::TraceMetricsSeriesCap { count, cap },
+        )) => format!("cap({count}, {cap})"),
+        Err(e) => format!("Err({e})"),
+    };
+    let range = shape(&rf_range(&engine, q, b).await);
+    let instant = shape(&rf_instant(&engine, q, b).await);
+    drop_db(&db).await;
+    assert_eq!(
+        (range.as_str(), instant.as_str()),
+        ("cap(5, 4)", "cap(5, 4)")
+    );
 }

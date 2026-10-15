@@ -54,7 +54,16 @@ const LONGEST: &str = "argMax((trace_id, start_ns, duration_ns), (duration_ns, s
 pub struct StatementTables<'a> {
     pub spans: &'a str,
     pub resources: &'a str,
+    pub traces: &'a str,
     pub indexed: &'a [IndexedAttr],
+}
+
+/// The unit a target's values are in (part 2's D7). A stub: part 2's
+/// tests commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetUnit {
+    Seconds,
+    Raw,
 }
 
 /// The range and instant forms of one request's statement.
@@ -71,6 +80,16 @@ impl MetricsStatement {
 
     pub fn instant_sql(&self) -> &str {
         &self.instant_sql
+    }
+
+    /// The label names of the query's `by()` keys. A stub: none.
+    pub fn labels(&self) -> &[String] {
+        &[]
+    }
+
+    /// The unit of the query's target. A stub: seconds.
+    pub fn unit(&self) -> TargetUnit {
+        TargetUnit::Seconds
     }
 }
 
@@ -100,7 +119,8 @@ impl RoutedMetricsPlan {
 /// exemplars (trace id, start in nanoseconds, value) and the fill flag.
 #[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
 pub struct MetricStatementRow {
-    pub g: String,
+    pub g: Vec<(String, String)>,
+    pub o: u64,
     pub points: Vec<(i64, f64)>,
     pub exemplars: Vec<([u8; 16], i64, f64)>,
     pub f: u8,
@@ -570,6 +590,7 @@ mod tests {
     const TABLES: StatementTables<'static> = StatementTables {
         spans: "spans",
         resources: "resources",
+        traces: "traces",
         indexed: &[],
     };
 
@@ -628,15 +649,129 @@ mod tests {
         assert!(r.statement().is_none(), "{q}: a statement");
     }
 
-    /// D1: `compare()` and a `by()` on another key stay on today's planner.
+    /// D1: `compare()` stays on today's planner, and so does an intrinsic
+    /// target other than `duration` and `span:childCount` (part 2's D8).
     #[test]
-    fn compare_and_other_keys_stay_on_todays_planner() {
+    fn compare_and_intrinsic_targets_stay_on_todays_planner() {
         let q = "{} | compare({ status = error })";
         let r = routed(q, &PARAMS).unwrap_or_else(|e| panic!("{q}: routed refused: {e}"));
         assert!(r.statement().is_none(), "{q}: a statement");
-        let q = "{} | rate() by(span.http.route)";
-        let want = today(q, &PARAMS).expect_err("today's planner refuses it");
-        assert_eq!(routed(q, &PARAMS).err(), Some(want), "{q}");
+        for q in [
+            "{} | sum_over_time(nestedSetLeft)",
+            "{} | avg_over_time(trace:duration)",
+        ] {
+            let want = today(q, &PARAMS).expect_err("today's planner refuses it");
+            assert_eq!(routed(q, &PARAMS).err(), Some(want), "{q}");
+        }
+    }
+
+    /// Part 2: any key, two keys, a keyed quantile, an attribute target
+    /// and `span:childCount` as a key or a target are served by the
+    /// statement; the child counts read the `ch` join.
+    #[test]
+    fn any_key_routes_to_the_statement() {
+        for q in [
+            "{} | rate() by(span.http.route)",
+            "{} | rate() by(trace:rootService)",
+            "{} | rate() by(nestedSetParent)",
+            "{} | rate() by(resource.service.name, span.http.route)",
+            "{} | quantile_over_time(duration, .9) by(span.http.route)",
+            "{} | avg_over_time(span.http.request.body.size)",
+            "{} | rate() by(span:childCount)",
+            "{} | avg_over_time(span:childCount)",
+        ] {
+            let r = routed(q, &PARAMS);
+            assert!(r.is_ok(), "{q}: routed refused: {r:?}");
+            let r = r.expect("checked");
+            let Some(st) = r.statement() else {
+                panic!("{q}: no statement");
+            };
+            let children = q.contains("span:childCount");
+            for sql in [st.range_sql(), st.instant_sql()] {
+                assert_eq!(sql.contains(") AS ch USING"), children, "{q}: the ch join");
+            }
+        }
+    }
+
+    /// D3: a missing value of each of the twelve well-known keys is typed
+    /// `'N'`, of any other key `'n'`.
+    #[test]
+    fn a_well_known_key_keeps_nil() {
+        let well_known = [
+            "resource.service.name",
+            "resource.cluster",
+            "resource.namespace",
+            "resource.pod",
+            "resource.container",
+            "resource.k8s.cluster.name",
+            "resource.k8s.namespace.name",
+            "resource.k8s.pod.name",
+            "resource.k8s.container.name",
+            "span.http.status_code",
+            "span.http.method",
+            "span.http.url",
+        ];
+        let statement = |key: &str| {
+            let q = format!("{{}} | count_over_time() by({key})");
+            let r = routed(&q, &PARAMS);
+            assert!(r.is_ok(), "{q}: routed refused: {r:?}");
+            r.expect("checked")
+                .statement()
+                .unwrap_or_else(|| panic!("{q}: no statement"))
+                .range_sql()
+                .to_string()
+        };
+        for key in well_known {
+            assert!(statement(key).contains("'N'"), "{key}: no 'N'");
+        }
+        for key in ["resource.foo", "span.foo"] {
+            let sql = statement(key);
+            assert!(sql.contains("'n'"), "{key}: no 'n'");
+            assert!(!sql.contains("'N'"), "{key}: an 'N'");
+        }
+    }
+
+    /// Section 3's `{traces}`, `{spans}` and `{resources}` are the caller's
+    /// tables, never a name written into the SQL.
+    #[test]
+    fn the_tables_come_from_the_caller() {
+        let tables = StatementTables {
+            spans: "sp_t",
+            resources: "rs_t",
+            traces: "tr_t",
+            indexed: &[],
+        };
+        let sql = |q: &str| {
+            let r = plan_trace_metrics_routed(
+                &parse(q).unwrap_or_else(|e| panic!("{q} must parse: {e:?}")),
+                &PARAMS,
+                &ctx(),
+                &tables,
+            );
+            assert!(r.is_ok(), "{q}: routed refused: {r:?}");
+            let r = r.expect("checked");
+            let st = r.statement().unwrap_or_else(|| panic!("{q}: no statement"));
+            [st.range_sql().to_string(), st.instant_sql().to_string()]
+        };
+        for q in [
+            "{} | rate() by(trace:rootService)",
+            "{} | rate() by(nestedSetParent)",
+            "{} | rate() by(span:childCount)",
+        ] {
+            for text in sql(q) {
+                assert!(text.contains("FROM tr_t"), "{q}: no FROM tr_t");
+                assert!(text.contains("FROM sp_t"), "{q}: no FROM sp_t");
+                for written in ["FROM traces", "FROM spans", "FROM resources"] {
+                    assert!(!text.contains(written), "{q}: {written}");
+                }
+            }
+        }
+        for text in sql("{} | rate() by(resource.k8s.pod.name)") {
+            assert!(text.contains("rs_t"), "no rs_t");
+            for written in ["FROM traces", "FROM spans", "FROM resources"] {
+                assert!(!text.contains(written), "{written}");
+            }
+        }
     }
 
     /// D2: a window error is today's, word for word.

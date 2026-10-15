@@ -14,7 +14,9 @@ use crate::traces::metrics_plan::{PlanKind, RangeAxis, TraceMetricsPlan};
 use crate::traces::metrics_result::{
     MetricExemplar, MetricLabel, TraceMetricSeries, TraceMetricsResult,
 };
-use crate::traces::spans::metrics::{MetricStatementRow, RoutedMetricsPlan, SERIES_CAP_MESSAGE};
+use crate::traces::spans::metrics::{
+    MetricStatementRow, MetricsStatement, RoutedMetricsPlan, SERIES_CAP_MESSAGE,
+};
 
 impl TraceEngine {
     /// The range answer to `routed`: its statement's rows, each series'
@@ -28,7 +30,12 @@ impl TraceEngine {
             return self.metrics_range(routed.plan()).await;
         };
         let rows = self.metric_statement_rows(statement.range_sql()).await?;
-        frame(routed.plan(), rows, Some(routed.plan().range_axis()))
+        frame(
+            routed.plan(),
+            statement,
+            rows,
+            Some(routed.plan().range_axis()),
+        )
     }
 
     /// The instant answer to `routed`: its statement's rows as returned;
@@ -42,7 +49,7 @@ impl TraceEngine {
             return self.metrics_instant(routed.plan()).await;
         };
         let rows = self.metric_statement_rows(statement.instant_sql()).await?;
-        frame(routed.plan(), rows, None)
+        frame(routed.plan(), statement, rows, None)
     }
 
     /// Issues `sql` under the metrics settings with `final = 1`.
@@ -85,12 +92,15 @@ impl TraceEngine {
 /// sample is dropped.
 fn frame(
     plan: &TraceMetricsPlan,
+    _statement: &MetricsStatement,
     rows: Vec<MetricStatementRow>,
     axis: Option<RangeAxis>,
 ) -> Result<TraceMetricsResult, ReadError> {
     let mut series = Vec::with_capacity(rows.len());
     for row in rows {
-        let label = label_of(plan, &row.g)?;
+        // A stub: part 1's label from the first key's text.
+        let g = row.g.first().map(|(t, _)| t.clone()).unwrap_or_default();
+        let label = label_of(plan, &g)?;
         let samples = match axis {
             Some(axis) if row.f == 1 => filled(&row.points, axis),
             _ => row.points,
@@ -157,4 +167,75 @@ fn label_of(plan: &TraceMetricsPlan, g: &str) -> Result<MetricLabel, ReadError> 
         },
         PlanKind::Compare => return Err(decode("compare() has no statement".to_string())),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use pulsus_traceql::parse;
+
+    use super::*;
+    use crate::traces::filter::SpanFilterCtx;
+    use crate::traces::metrics_plan::{MetricsCtx, MetricsParams};
+    use crate::traces::metrics_result::MetricLabelValue;
+    use crate::traces::spans::metrics::{StatementTables, plan_trace_metrics_routed};
+
+    /// D13: a histogram's `__bucket` takes its unit from the target the
+    /// query asked, not from the shell's `duration`.
+    #[test]
+    fn a_bucket_label_takes_its_targets_unit() {
+        let ctx = MetricsCtx {
+            filter: SpanFilterCtx {
+                spans_table: "trace_spans",
+                attrs_table: "trace_attrs_idx",
+            },
+            scan_budget_rows: 50_000_000,
+            max_series: 1_000,
+            distributed: false,
+            skip_unavailable_shards: false,
+        };
+        let params = MetricsParams {
+            start_ns: 1_700_000_000_000_000_000,
+            end_ns: 1_700_000_060_000_000_000,
+            step_ms: 60_000,
+            exemplars: None,
+        };
+        let tables = StatementTables {
+            spans: "spans",
+            resources: "resources",
+            traces: "traces",
+            indexed: &[],
+        };
+        let bucket = |q: &str, o: u64| {
+            let routed =
+                plan_trace_metrics_routed(&parse(q).expect("parse"), &params, &ctx, &tables);
+            assert!(routed.is_ok(), "{q}: routed refused: {routed:?}");
+            let routed = routed.expect("checked");
+            let Some(statement) = routed.statement() else {
+                panic!("{q}: no statement");
+            };
+            let row = MetricStatementRow {
+                g: Vec::new(),
+                o,
+                points: vec![(1_700_000_060_000, 1.0)],
+                exemplars: Vec::new(),
+                f: 0,
+            };
+            let out = frame(routed.plan(), statement, vec![row], None).expect("framed");
+            match out.series[0].labels[..] {
+                [
+                    MetricLabel {
+                        ref key,
+                        value: MetricLabelValue::Double(v),
+                    },
+                ] if key == "__bucket" => v,
+                ref other => panic!("{q}: labels {other:?}"),
+            }
+        };
+        assert_eq!(bucket("{} | histogram_over_time(span.n)", 8), 8.0);
+        assert_eq!(bucket("{} | histogram_over_time(duration)", 8), 8e-9);
+        assert_eq!(
+            bucket("{} | histogram_over_time(duration)", 1_073_741_824),
+            1.073741824
+        );
+    }
 }

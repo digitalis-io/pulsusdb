@@ -11,13 +11,20 @@
 //! no exemplar slot).
 
 /// A typed metrics label value — mirrors the OTLP protojson `AnyValue`
-/// subset Tempo emits for metric-series labels (issue #182). By-keys and
-/// `__name__` are `Str`; `p` (quantile) and `__bucket` (histogram le) are
-/// `Double`.
+/// subset the reference emits for metric-series labels (issue #182).
+/// `__name__` is `Str`; `p` (quantile) and `__bucket` (histogram) are
+/// `Double`; a `by()` key's value is the arm of its stored type (issue
+/// #596 part 2).
 #[derive(Debug, Clone, PartialEq)]
 pub enum MetricLabelValue {
     Str(String),
     Double(f64),
+    /// A `by()` key's integer value (issue #596 part 2), `intValue` on the
+    /// wire.
+    Int(i64),
+    /// A `by()` key's boolean value (issue #596 part 2), `boolValue` on
+    /// the wire.
+    Bool(bool),
 }
 
 /// One `(key, value)` label on a metrics series or exemplar.

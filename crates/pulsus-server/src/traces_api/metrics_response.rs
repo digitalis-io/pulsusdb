@@ -130,6 +130,9 @@ fn label(l: &MetricLabel) -> Label {
     let value = match &l.value {
         MetricLabelValue::Str(s) => AnyValue::StringValue(s.clone()),
         MetricLabelValue::Double(d) => AnyValue::DoubleValue(*d),
+        // Stubs: part 2's tests commit.
+        MetricLabelValue::Int(i) => AnyValue::StringValue(i.to_string()),
+        MetricLabelValue::Bool(b) => AnyValue::StringValue(b.to_string()),
     };
     Label {
         key: l.key.clone(),
@@ -909,6 +912,80 @@ mod tests {
              \"metrics\":{\"completedJobs\":1,\"totalJobs\":1}}",
             "the RANGE body keeps its timestamped samples array — the instant encoder is a \
              separate message and changes nothing here"
+        );
+    }
+
+    /// Issue #596 part 2 (D3, D9, D12): a typed key label is the protojson
+    /// arm of its stored type — `intValue` a JSON string, as protojson
+    /// writes an `int64` — and a non-finite double, a label, a sample, an
+    /// instant value or an exemplar's value, is protojson's string, never
+    /// `null`.
+    #[test]
+    fn typed_labels_render_as_protojson() {
+        let typed = TraceMetricsResult {
+            series: vec![TraceMetricSeries {
+                labels: vec![
+                    MetricLabel {
+                        key: "span.n".to_string(),
+                        value: MetricLabelValue::Int(5),
+                    },
+                    MetricLabel {
+                        key: "span.b".to_string(),
+                        value: MetricLabelValue::Bool(true),
+                    },
+                    MetricLabel::double("span.f", 2.5),
+                    MetricLabel::str("span.k", "nil"),
+                ],
+                samples: vec![(1_700_000_000_000, 1.0)],
+                exemplars: vec![],
+            }],
+        };
+        assert_eq!(
+            encode_json(&typed),
+            "{\"series\":[{\"labels\":[{\"key\":\"span.n\",\"value\":{\"intValue\":\"5\"}},\
+             {\"key\":\"span.b\",\"value\":{\"boolValue\":true}},\
+             {\"key\":\"span.f\",\"value\":{\"doubleValue\":2.5}},\
+             {\"key\":\"span.k\",\"value\":{\"stringValue\":\"nil\"}}],\
+             \"samples\":[{\"timestampMs\":\"1700000000000\",\"value\":1.0}]}],\
+             \"metrics\":{\"completedJobs\":1,\"totalJobs\":1}}"
+        );
+        let non_finite = TraceMetricsResult {
+            series: vec![TraceMetricSeries {
+                labels: vec![
+                    MetricLabel::double("a", f64::NAN),
+                    MetricLabel::double("b", f64::INFINITY),
+                    MetricLabel::double("c", f64::NEG_INFINITY),
+                ],
+                samples: vec![(1_700_000_000_000, f64::INFINITY)],
+                exemplars: vec![MetricExemplar {
+                    labels: vec![MetricLabel::str("trace:id", "a1")],
+                    value: f64::NAN,
+                    timestamp_ms: 1_700_000_000_001,
+                }],
+            }],
+        };
+        assert_eq!(
+            encode_json(&non_finite),
+            "{\"series\":[{\"labels\":[{\"key\":\"a\",\"value\":{\"doubleValue\":\"NaN\"}},\
+             {\"key\":\"b\",\"value\":{\"doubleValue\":\"Infinity\"}},\
+             {\"key\":\"c\",\"value\":{\"doubleValue\":\"-Infinity\"}}],\
+             \"samples\":[{\"timestampMs\":\"1700000000000\",\"value\":\"Infinity\"}],\
+             \"exemplars\":[{\"labels\":[{\"key\":\"trace:id\",\"value\":{\"stringValue\":\"a1\"}}],\
+             \"value\":\"NaN\",\"timestampMs\":\"1700000000001\"}]}],\
+             \"metrics\":{\"completedJobs\":1,\"totalJobs\":1}}"
+        );
+        let instant = TraceMetricsResult {
+            series: vec![TraceMetricSeries {
+                labels: vec![MetricLabel::str("__name__", "min_over_time")],
+                samples: vec![(1_700_000_000_000, f64::NAN)],
+                exemplars: vec![],
+            }],
+        };
+        assert_eq!(
+            encode_json_instant(&instant),
+            "{\"series\":[{\"labels\":[{\"key\":\"__name__\",\"value\":\
+             {\"stringValue\":\"min_over_time\"}}],\"value\":\"NaN\"}],\
+             \"metrics\":{\"completedJobs\":1,\"totalJobs\":1}}"
         );
     }
 
