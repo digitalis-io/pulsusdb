@@ -8549,7 +8549,7 @@ async fn seed_one_stream(
 /// ```text
 /// row  data                                                 today's route               key route
 /// R1   6,213 {"latency":1} at one nanosecond                 {} 6213                     {} 6213
-/// R1   6,214 at one nanosecond                              422 same-nanosecond staging {} 6214
+/// R1   6,214 at one nanosecond                              {} 6214 (see below)         {} 6214
 /// R2   4,100,000 {"latency":1} within 50 s                  422 retained window points  {} 4100000
 /// R3   3,400 lines, each its own request_id, one per second 422 result point-slots      one series, 3,400 points of 1
 ///      over an hour, step 1 s
@@ -8557,6 +8557,12 @@ async fn seed_one_stream(
 /// R5   501 values of r under by (r)                         422 series cap              422 series cap
 /// R6   the realistic corpus under a scan budget below it    422 scan budget             422 scan budget, no raw scan
 /// ```
+///
+/// R1's second row answered `422` on today's route until issue #624, part 4
+/// (F3): under a parent `sum`, `sum_over_time` now takes the sum's grouping
+/// as its own, as the reference injects it, so today's route stages each
+/// line under the sum's labels alone and 6,214 of them fit where the full
+/// stream labels did not.
 ///
 /// R9 (the statement text cap) is the hermetic
 /// `plan::tests::a_key_statement_over_the_text_cap_takes_todays_route`, and
@@ -8668,12 +8674,7 @@ async fn every_refusal_lands_as_the_table_says() {
     // R1 and R2: (key-route query, today's control, params, today's answer, key answer)
     for (svc, params, today_want, key_want) in [
         ("checkou1", range(60, 120, 60), "{} 6213.0", "{} 6213.0"),
-        (
-            "checkou2",
-            range(60, 120, 60),
-            "422 TsCollisionGroup",
-            "{} 6214.0",
-        ),
+        ("checkou2", range(60, 120, 60), "{} 6214.0", "{} 6214.0"),
         (
             "r2",
             range(60, 120, 60),
@@ -12215,7 +12216,9 @@ async fn two_regexp_stages_read_two_columns() {
 }
 
 /// **T15 (issue #624, part 3a, D6): an instant `regexp` count reads its
-/// captures from the database**, through `metric_raw_samples`.
+/// captures from the database**, through `metric_raw_samples` on today's
+/// route; since part 5 the query itself is counted at one grid point, and
+/// that statement runs the captures too.
 #[tokio::test]
 async fn an_instant_regexp_count_reads_captures_from_the_database() {
     skip_unless_live!();
@@ -12248,14 +12251,38 @@ async fn an_instant_regexp_count_reads_captures_from_the_database() {
             (vec![("w".to_string(), "x".to_string())], 1.0),
         ]
     );
-    let logged = logged_624(&admin, std::slice::from_ref(&comment)).await;
+    // Today's route for the same instant: the instant read with the
+    // captures column.
+    let todays_comment = format!("c624p3t15-{}", uuid::Uuid::new_v4().simple());
+    let todays = run_instant_624p4(
+        &db,
+        hooks_624(true, None, None),
+        Some(&todays_comment),
+        query,
+        t + 60_000_000_000,
+    )
+    .await
+    .expect("today's route answers");
+    let lowered: InstantAnswer624p4 = got
+        .iter()
+        .map(|(labels, v)| (labels.clone(), v.to_bits()))
+        .collect();
+    assert_eq!(todays, lowered, "today's route answers the same");
+    let logged = logged_624(&admin, &[comment.clone(), todays_comment.clone()]).await;
     assert!(
-        logged[&comment].iter().any(|r| r
+        logged[&comment]
+            .iter()
+            .any(|r| is_lowered_624(&r.query) && r.query.contains("extractGroups")),
+        "the one-point count with the captures: {:#?}",
+        logged[&comment]
+    );
+    assert!(
+        logged[&todays_comment].iter().any(|r| r
             .query
             .contains("ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC")
             && r.query.contains("extractGroups")),
         "metric_raw_samples with the captures column: {:#?}",
-        logged[&comment]
+        logged[&todays_comment]
     );
     drop_db_624(&admin, &db).await;
 }
@@ -12978,8 +13005,9 @@ async fn a_json_count_out_of_memory_answers_on_todays_route() {
 /// reducer (`rate`, `bytes_rate`, the two F1 changes) × parent (`sum`,
 /// `sum by`, `sum without`) × pipeline (none, `| json`, `| drop extra`) ×
 /// route (range lowered and range on today's route at `[60s]` and
-/// `[120s]`; instant, which is the clean statement with no pipeline and
-/// today's route with one). Each cell checks its route in the query log;
+/// `[120s]`; instant, which is the clean statement with no pipeline and,
+/// since issue #624 part 5, the lowered statement at one grid point with a
+/// pipeline whose range form lowers). Each cell checks its route in the query log;
 /// a bare `| json` under `sum without` does not lower (D1), so its range
 /// cells are today's route.
 #[tokio::test]
@@ -13128,6 +13156,9 @@ async fn a_rate_under_a_sum_divides_once_per_group() {
             Route7::Instant if pipeline.is_empty() => {
                 todays_at.is_none() && rows.iter().all(|r| r.exception_code == 0)
             }
+            // Issue #624, part 5: an instant whose range form lowers is
+            // counted at one grid point.
+            Route7::Instant if *lowers => lowered_at(0).is_some() && todays_at.is_none(),
             Route7::Instant => todays_at.is_some(),
         };
         if !ok {

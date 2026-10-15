@@ -728,7 +728,7 @@ docs/query-lowering.md	traces/compile.rs:192	no_name_the_target_file_holds
 docs/query-lowering.md	traces/compile.rs:197	no_name_the_target_file_holds
 docs/query-lowering.md	traces_search_plan_parts.rs:55-61	no_name_the_target_file_holds
 docs/query-to-sql.md	canonical_labels.rs:131-163	no_name_the_target_file_holds
-docs/query-to-sql.md	client_agg.rs:2205	no_name_the_target_file_holds
+docs/query-to-sql.md	client_agg.rs:2207	no_name_the_target_file_holds
 docs/query-to-sql.md	crates/pulsus-config/src/model.rs:702	no_name_the_target_file_holds
 docs/query-to-sql.md	crates/pulsus-logql/src/ast.rs:237	no_name_the_target_file_holds
 docs/query-to-sql.md	crates/pulsus-logql/src/ast.rs:242	no_name_the_target_file_holds

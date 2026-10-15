@@ -180,7 +180,7 @@ docs/query-to-sql.md	ast.rs:2301	crates/pulsus-logql/src/ast.rs	2301		prose	LogR
 docs/query-to-sql.md	ast.rs:939	crates/pulsus-logql/src/ast.rs	939		prose	MetricExpr	MetricExpr
 docs/query-to-sql.md	ast.rs:99	crates/pulsus-traceql/src/ast.rs	99		prose	SpansetExpr	SpansetExpr
 docs/query-to-sql.md	canonical_labels.rs:131-163	crates/pulsus-read/src/canonical_labels.rs	131	163	line	parse_canonical_labels_into	pub(crate) fn parse_canonical_labels_into(json: &str, out: &mut Vec<(String, String)>) { let mut chars = json.chars().pe
-docs/query-to-sql.md	client_agg.rs:2205	crates/pulsus-read/src/logql/client_agg.rs	2205		line	VectorAggSpec	pub(in crate::logql) fn attach_fold(&mut self, spec: &plan::VectorAggSpec) {
+docs/query-to-sql.md	client_agg.rs:2207	crates/pulsus-read/src/logql/client_agg.rs	2207		line	VectorAggSpec	pub(in crate::logql) fn attach_fold(&mut self, spec: &plan::VectorAggSpec) {
 docs/query-to-sql.md	crates/pulsus-config/src/model.rs:702	crates/pulsus-config/src/model.rs	702		line	behaviourally	// so the default is behaviourally unchanged there and merely
 docs/query-to-sql.md	crates/pulsus-logql/src/ast.rs:133	crates/pulsus-logql/src/ast.rs	133		prose	Stage	Stage
 docs/query-to-sql.md	crates/pulsus-logql/src/ast.rs:157-160	crates/pulsus-logql/src/ast.rs	157	160	line	syntactic	/// One element of a `drop`/`keep` label list: a bare label name, or a /// label qualified by a value matcher (`level="i

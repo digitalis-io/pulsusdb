@@ -2867,17 +2867,19 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
         //         -- --ignored zz_print_frame_censuses --nocapture
         //
         // Issue #624, part 4 (F1): 20 branches — UNCHANGED. The group is
-        // ranked by value, not body: `.as_bytes` and `.cmp` give way to
-        // `.total_cmp`, inside the same in-place `.sort_by`. W-MEM
-        // disposition: **NIL** — no allocation on either path — and the
-        // frame stays as it was.
-        // FRAME client_agg.rs RangeSlideState::flush_collision 20 31 :: .any .as_mut .clear .cloned .copied .covering_k .enumerate .expect .fan_out_sample .fan_out_sample_base .get .is_empty .is_none .iter .iter_mut .load_group .rotate_slider .sort_by .take .total_cmp .unwrap_or .unwrap_or_default Ok Some charge_group_bytes charge_result_points grid_slot_count group_entry_bytes matches! new take
+        // ranked by value, then body: `.total_cmp` and `.then_with` join
+        // the `.as_bytes`/`.cmp` body comparison inside the same in-place
+        // `.sort_by`. W-MEM disposition: **NIL** — no allocation on either
+        // path — and the frame stays as it was.
+        // FRAME client_agg.rs RangeSlideState::flush_collision 20 34 :: .any .as_bytes .as_mut .clear .cloned .cmp .copied .covering_k .enumerate .expect .fan_out_sample .fan_out_sample_base .get .is_empty .is_none .iter .iter_mut .load_group .rotate_slider .sort_by .take .then_with .total_cmp .unwrap_or .unwrap_or_default Ok Some charge_group_bytes charge_result_points grid_slot_count group_entry_bytes matches! new take
         branches: 20,
         callees: &[
             ".any",
+            ".as_bytes",
             ".as_mut",
             ".clear",
             ".cloned",
+            ".cmp",
             ".copied",
             ".covering_k",
             ".enumerate",
@@ -2893,6 +2895,7 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
             ".rotate_slider",
             ".sort_by",
             ".take",
+            ".then_with",
             ".total_cmp",
             ".unwrap_or",
             ".unwrap_or_default",
