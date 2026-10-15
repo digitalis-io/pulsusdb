@@ -3435,7 +3435,7 @@ const DURATION_UNITS: &[(&str, f64)] = &[
 /// (`kb`,`kib`,…), the empty suffix (a bare number is a byte count), and
 /// the exa tier (`e`/`eb`=1e18, `ei`/`eib`=2^60). Decimal factors are
 /// powers of 1000; binary factors powers of 1024.
-const BYTES_UNITS: &[(&str, f64)] = &[
+pub(in crate::logql) const BYTES_UNITS: &[(&str, f64)] = &[
     ("", 1.0),
     ("b", 1.0),
     ("k", 1e3),
@@ -3495,6 +3495,114 @@ pub(crate) fn parse_duration_seconds(raw: &str) -> Option<f64> {
         matched = true;
     }
     matched.then_some(total)
+}
+
+/// Go's `time.ParseDuration` then `Duration.Seconds()`: the reference's
+/// `convertDuration` (issue #624, part 4, F2). The value is an integer count
+/// of nanoseconds, each component's fraction scaled into it as Go scales it,
+/// and the seconds are `whole + remainder / 1e9`, two roundings as Go's.
+/// [`parse_duration_seconds`] stays for query literals and `detected.rs`.
+pub(crate) fn go_duration_seconds(raw: &str) -> Option<f64> {
+    const UNITS: [(&str, u64); 8] = [
+        ("ns", 1),
+        ("us", 1_000),
+        ("\u{b5}s", 1_000),
+        ("\u{3bc}s", 1_000),
+        ("ms", 1_000_000),
+        ("s", 1_000_000_000),
+        ("m", 60_000_000_000),
+        ("h", 3_600_000_000_000),
+    ];
+    const L: u64 = 1 << 63;
+    let (neg, mut s) = match raw.as_bytes().first() {
+        Some(b'-') => (true, &raw[1..]),
+        Some(b'+') => (false, &raw[1..]),
+        _ => (false, raw),
+    };
+    if s == "0" {
+        return Some(0.0);
+    }
+    if s.is_empty() {
+        return None;
+    }
+    let mut d: u64 = 0;
+    while !s.is_empty() {
+        let b = s.as_bytes();
+        if !(b[0] == b'.' || b[0].is_ascii_digit()) {
+            return None;
+        }
+        let (mut i, mut v) = (0, 0u64);
+        while i < b.len() && b[i].is_ascii_digit() {
+            if v > L / 10 {
+                return None;
+            }
+            v = v * 10 + u64::from(b[i] - b'0');
+            if v > L {
+                return None;
+            }
+            i += 1;
+        }
+        let pre = i > 0;
+        s = &s[i..];
+        let (mut f, mut scale, mut post) = (0u64, 1.0f64, false);
+        if s.starts_with('.') {
+            s = &s[1..];
+            let (b, mut j, mut over) = (s.as_bytes(), 0, false);
+            while j < b.len() && b[j].is_ascii_digit() {
+                if !over {
+                    if f > (L - 1) / 10 {
+                        over = true;
+                    } else {
+                        let y = f * 10 + u64::from(b[j] - b'0');
+                        if y > L {
+                            over = true;
+                        } else {
+                            f = y;
+                            scale *= 10.0;
+                        }
+                    }
+                }
+                j += 1;
+            }
+            post = j > 0;
+            s = &s[j..];
+        }
+        if !pre && !post {
+            return None;
+        }
+        let end = s
+            .find(|c: char| c == '.' || c.is_ascii_digit())
+            .unwrap_or(s.len());
+        if end == 0 {
+            return None;
+        }
+        let unit = UNITS.iter().find(|(n, _)| *n == &s[..end])?.1;
+        s = &s[end..];
+        if v > L / unit {
+            return None;
+        }
+        v *= unit;
+        if f > 0 {
+            v += (f as f64 * (unit as f64 / scale)) as u64;
+            if v > L {
+                return None;
+            }
+        }
+        // Each component is at most `L`, so two can pass `u64::MAX`: an
+        // overflow is out of range, as Go's `d > 1<<63` rejects it.
+        d = match d.checked_add(v) {
+            Some(d) if d <= L => d,
+            _ => return None,
+        };
+    }
+    let d = if neg {
+        (d as i64).wrapping_neg()
+    } else if d > L - 1 {
+        return None;
+    } else {
+        d as i64
+    };
+    Some((d / 1_000_000_000) as f64 + (d % 1_000_000_000) as f64 / 1e9)
 }
 
 /// Parses a bytes quantity to f64 bytes — a faithful port of
@@ -3604,13 +3712,33 @@ pub(crate) fn parse_bytes_value(raw: &str) -> Option<f64> {
 fn convert_label_value(kind: UnitKind, value: &str) -> Option<f64> {
     match kind {
         UnitKind::Number => value.parse().ok(),
-        UnitKind::Duration => parse_duration_seconds(value),
+        // Issue #624, part 4 (F2): Go's own parse, so a value converts to
+        // the reference's bits on every route.
+        UnitKind::Duration => go_duration_seconds(value),
         // Route entirely through the humanize port: a bare number is the
         // empty-suffix table entry, so the old `value.parse` short-circuit
         // (which bypassed uint64 truncation for e.g. `1.5`) is dropped
         // (#226).
         UnitKind::Bytes => parse_bytes_value(value),
     }
+}
+
+/// A label value converted as `| unwrap` converts it under `conversion`
+/// (issue #624, part 4): what the lowered statement's conversion columns
+/// are compared against. `None` is a conversion failure.
+#[doc(hidden)]
+pub fn unwrap_conversion_probe(
+    conversion: super::sql::UnwrapConversion,
+    value: &str,
+) -> Option<f64> {
+    convert_label_value(
+        match conversion {
+            super::sql::UnwrapConversion::Number => UnitKind::Number,
+            super::sql::UnwrapConversion::Duration => UnitKind::Duration,
+            super::sql::UnwrapConversion::Bytes => UnitKind::Bytes,
+        },
+        value,
+    )
 }
 
 /// Streams-path `__error_details__` for a failed numeric label-filter
@@ -11350,5 +11478,66 @@ mod tests {
             compiled.rx_patterns().is_empty(),
             "no database stage after a rewrite"
         );
+    }
+
+    /// **T2 (issue #624, part 4): `duration(x)` converts as Go's
+    /// `time.ParseDuration` then `Duration.Seconds()`, the reference's
+    /// `convertDuration`, bit for bit.** Expected bits from the reference's
+    /// Go code; `None` where it fails.
+    #[test]
+    fn duration_values_convert_as_the_reference() {
+        const DECIDED: [(&str, u64); 16] = [
+            ("9ms", 0x3f82_6e97_8d4f_df3b),
+            ("13ms", 0x3f8a_9fbe_76c8_b439),
+            ("300ms", 0x3fd3_3333_3333_3333),
+            ("1.5s", 0x3ff8_0000_0000_0000),
+            ("1.s", 0x3ff0_0000_0000_0000),
+            (".5s", 0x3fe0_0000_0000_0000),
+            ("-1.5h", 0xc0b5_1800_0000_0000),
+            ("1m.5s", 0x404e_4000_0000_0000),
+            ("1\u{b5}s", 0x3eb0_c6f7_a0b5_ed8d),
+            ("1\u{3bc}s", 0x3eb0_c6f7_a0b5_ed8d),
+            ("0", 0),
+            ("-0", 0),
+            ("9223372036s", 0x4201_2e0b_e820_0000),
+            ("2562047h", 0x4201_2e0b_8f80_0000),
+            ("1.0000000000000000001s", 0x3ff0_0000_0000_0000),
+            ("1us", 0x3eb0_c6f7_a0b5_ed8d),
+        ];
+        const FAILED: [&str; 11] = [
+            "00",
+            "1d",
+            "1w",
+            "1hm",
+            "1msx",
+            ".s",
+            "abc",
+            "9223372037s",
+            "2562048h",
+            "9223372036854775808ns9223372036854775808ns",
+            "-9223372036854775808ns9223372036854775808ns",
+        ];
+        for (text, bits) in DECIDED {
+            let got = go_duration_seconds(text);
+            assert_eq!(
+                got.map(f64::to_bits),
+                Some(bits),
+                "go_duration_seconds({text:?}) = {got:?}"
+            );
+            let via = convert_label_value(UnitKind::Duration, text);
+            assert_eq!(
+                via.map(f64::to_bits),
+                Some(bits),
+                "convert_label_value(Duration, {text:?}) = {via:?}"
+            );
+        }
+        for text in FAILED {
+            assert_eq!(go_duration_seconds(text), None, "{text:?}");
+            assert_eq!(
+                convert_label_value(UnitKind::Duration, text),
+                None,
+                "convert_label_value(Duration, {text:?})"
+            );
+        }
     }
 }

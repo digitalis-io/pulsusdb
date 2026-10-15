@@ -580,13 +580,17 @@ fn drive(fx: &Fixture) -> Driven {
     else {
         panic!("{}: expected a Metric plan", fx.name);
     };
-    let client = mp
-        .client
-        .as_ref()
-        .unwrap_or_else(|| panic!("{}: fixture must be client-aggregated", fx.name))
-        .clone();
+    // Issue #624, part 5: an instant query whose stages the database can
+    // run is lowered at one grid point, and carries today's route's
+    // aggregation on its payload; this file drives that aggregation.
+    let client = match (&mp.client, &mp.value) {
+        (Some(client), _) => client.clone(),
+        (None, pulsus_read::logql::sql::MetricValue::Staged(s)) => s.todays_route.clone(),
+        (None, pulsus_read::logql::sql::MetricValue::Reduced(r)) => r.todays_route.clone(),
+        (None, _) => panic!("{}: fixture must be client-aggregated", fx.name),
+    };
     assert!(
-        mp.step_ns.is_none(),
+        mp.answers_instant(),
         "{}: fixture must be an INSTANT plan — the range slider is out of this file's scope",
         fx.name
     );
@@ -598,7 +602,7 @@ fn drive(fx: &Fixture) -> Driven {
         compiled,
         client,
         window: ClientWindow::Instant {
-            start_ns: mp.grid_start_ns,
+            start_ns: mp.start_ns,
             end_ns: mp.end_ns,
         },
         rate_window_ns: mp.rate_window_ns,

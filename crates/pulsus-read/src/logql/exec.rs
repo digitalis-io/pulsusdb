@@ -19,9 +19,9 @@ use super::predicate::{BucketGridRefusal, CheckedFragment, CheckedLiteral};
 use super::rows::{
     DetectedLabelRow, LabelNameRow, LabelValueRow, LogStatsRow, MetricInstantRow,
     MetricRangeBucketRow, MetricRangeJsonRow, MetricRangeLogfmtRow, MetricRangeRegexpRow,
-    MetricRangeUnwrappedRow, MetricScanRow, MetricScanRxRow, PatternFetchRow, SampleRow,
-    SampleRxRow, StreamMetaRow, StreamRow, TailSampleRow, TailSampleRxRow, UnwrappedLaneRow,
-    VolumeRow,
+    MetricRangeUnwrappedRow, MetricReducedRow, MetricScanRow, MetricScanRxRow, PatternFetchRow,
+    SampleRow, SampleRxRow, StreamMetaRow, StreamRow, TailSampleRow, TailSampleRxRow,
+    UnwrappedLaneRow, VolumeRow,
 };
 use futures::Stream;
 use futures::StreamExt;
@@ -374,8 +374,8 @@ pub struct KeyRouteTestHooks {
     pub key_statement_test_knobs: Option<super::sql::KeyStatementTestKnobs>,
     /// Test-only: renders a statement-level memory ceiling,
     /// `SETTINGS max_memory_usage = <n>`, into either bucketed range
-    /// statement (issue #624), so a live test can make it fail with the
-    /// server's memory code.
+    /// statement and the reduced `| unwrap` statement (issue #624), so a
+    /// live test can make it fail with the server's memory code.
     pub bucketed_statement_max_memory_bytes: Option<u64>,
     /// Test-only: cap overrides laid over the defaults, applied to the
     /// lowered range fold and to today's route alike (issue #624, part 2).
@@ -549,7 +549,7 @@ impl LogQlEngine {
                 Ok((QueryResult::Streams { items, partial }, warnings, explain))
             }
             Plan::Metric(mp) => {
-                let result_type = if mp.step_ns.is_none() {
+                let result_type = if mp.answers_instant() {
                     "vector"
                 } else {
                     "matrix"
@@ -1676,6 +1676,10 @@ impl LogQlEngine {
             super::sql::MetricValue::Staged(s) => {
                 Some(CompiledPipeline::compile(&s.todays_route.pipeline)?)
             }
+            // Issue #624, part 4: likewise a reduced plan's, today's route's.
+            super::sql::MetricValue::Reduced(r) => {
+                Some(CompiledPipeline::compile(&r.todays_route.pipeline)?)
+            }
             _ => None,
         };
         if let Some(e) = explain.as_mut() {
@@ -1690,6 +1694,9 @@ impl LogQlEngine {
             }
         }
         let is_instant = mp.step_ns.is_none();
+        // Issue #624, part 5: an instant query lowered at its one grid point
+        // still answers a vector.
+        let answers_instant = mp.answers_instant();
         // Issue #343: the offset shift left the representable timestamp
         // axis, so the query answers empty. Returned BEFORE
         // `resolve_fingerprints` — zero ClickHouse round trips, where the
@@ -1701,7 +1708,7 @@ impl LogQlEngine {
         // (`end_ns < grid_start_ns`), so this is the round-trip saving,
         // not the correctness mechanism.
         if mp.empty_domain {
-            return Ok(if is_instant {
+            return Ok(if answers_instant {
                 QueryResult::Vector(Vec::new())
             } else {
                 QueryResult::Matrix(Vec::new())
@@ -1734,11 +1741,11 @@ impl LogQlEngine {
                     compiled,
                     &HashMap::new(),
                     &s.todays_route,
-                    metric_plan_window(mp),
+                    metric_plan_window(&todays_route_plan(mp)),
                     mp.rate_window_ns,
                 );
             }
-            return Ok(if is_instant {
+            return Ok(if answers_instant {
                 QueryResult::Vector(Vec::new())
             } else {
                 QueryResult::Matrix(Vec::new())
@@ -1805,10 +1812,28 @@ impl LogQlEngine {
                 )
                 .await;
         }
-        // Test-only (issue #624, part 2): a staged plan on today's route.
+        // Test-only (issue #624, parts 2 and 4): a staged or reduced plan on
+        // today's route.
         if self.key_route_test.todays_route_only
-            && matches!(mp.value, super::sql::MetricValue::Staged(_))
+            && matches!(
+                mp.value,
+                super::sql::MetricValue::Staged(_) | super::sql::MetricValue::Reduced(_)
+            )
         {
+            return self
+                .run_bucketed_fallback(
+                    mp,
+                    &fingerprints,
+                    &meta,
+                    &services,
+                    &lowered.predicates,
+                    explain,
+                )
+                .await;
+        }
+        // Issue #624, part 4 (§5): a reduced plan whose metadata filter did
+        // not fit the statement runs today's route, which re-runs the filter.
+        if !lowered.metadata_lowered && matches!(mp.value, super::sql::MetricValue::Reduced(_)) {
             return self
                 .run_bucketed_fallback(
                     mp,
@@ -1827,9 +1852,11 @@ impl LogQlEngine {
                 .and_then(|m| m.client_without_lowering.as_ref());
             if let Some(client) = restored {
                 let compiled = CompiledPipeline::compile(&client.pipeline)?;
+                // Issue #624, part 5: an instant lowered at one grid point
+                // runs as the instant it is.
                 return self
                     .run_metric_client(
-                        mp,
+                        &todays_route_plan(mp),
                         client,
                         &compiled,
                         &fingerprints,
@@ -1965,6 +1992,22 @@ impl LogQlEngine {
             if let super::sql::MetricValue::Unwrapped(u) = &mp.value {
                 return self
                     .run_unwrapped_range(mp, u, &services, &fingerprints, &meta, explain)
+                    .await;
+            }
+            // Issue #624, part 4: the `| unwrap` reducers' own statement,
+            // row type and fold.
+            if let super::sql::MetricValue::Reduced(r) = &mp.value {
+                return self
+                    .run_reduced_range(
+                        mp,
+                        r,
+                        &fingerprints,
+                        &meta,
+                        &services,
+                        &lowered.predicates,
+                        grid_points,
+                        explain,
+                    )
                     .await;
             }
             match bucketed_range_sql(mp, &services, &fingerprints, &lowered.predicates) {
@@ -2111,7 +2154,7 @@ impl LogQlEngine {
                             // (issue #343).
                             let result =
                                 shift_emitted_points(QueryResult::Matrix(series), mp.offset_ns);
-                            apply_leaf_aggs(mp, result, 0)
+                            apply_leaf_aggs(mp, one_point_answer(mp, result), 0)
                         }
                         // Issue #624, D4: the statement ran out of memory.
                         // Today's route streams the same query in bounded
@@ -2172,6 +2215,10 @@ impl LogQlEngine {
         predicates: &[CheckedFragment],
         explain: Option<&mut PlanExplain>,
     ) -> Result<QueryResult, ReadError> {
+        // Issue #624, part 5: an instant query lowered at its one grid point
+        // runs today's instant route.
+        let plan = todays_route_plan(mp);
+        let mp: &MetricPlan = &plan;
         let client = bucketed_fallback_client_agg(mp);
         let compiled = CompiledPipeline::compile(&client.pipeline)?;
         // **The lowered predicates, and the metadata fragment in them is
@@ -2191,6 +2238,154 @@ impl LogQlEngine {
             explain,
         )
         .await
+    }
+
+    /// The lowered `| unwrap` reducers (issue #624, part 4): the reduced
+    /// statement and its fold, or today's route once (D8).
+    ///
+    /// ```text
+    /// a selected stream labelled x, a grid the statement cannot render,
+    /// the text over the cap, 241, 395, a fold stop     -> today's route, once
+    /// 159 / the stream deadline                        -> the timeout
+    /// 307                                              -> the scan budget's 422
+    /// a cap in the fold                                -> its 422
+    /// ```
+    #[allow(clippy::too_many_arguments)]
+    async fn run_reduced_range(
+        &self,
+        mp: &MetricPlan,
+        value: &super::sql::ReducedUnwrap,
+        fingerprints: &[Fingerprint],
+        meta: &HashMap<Fingerprint, StreamMetaRow>,
+        services: &[CheckedLiteral],
+        predicates: &[CheckedFragment],
+        grid_points: u64,
+        mut explain: Option<&mut PlanExplain>,
+    ) -> Result<QueryResult, ReadError> {
+        // D10: `x` is read from structured metadata; a stream label `x`
+        // changes the series key, and today's route reads it.
+        let labelled_x = meta.values().any(|m| {
+            super::labels::series_labels(m)
+                .iter()
+                .any(|(k, _)| *k == value.label)
+        });
+        let statement = match (labelled_x, mp.step_ns) {
+            (false, Some(step)) => {
+                let resolved = super::reduce::resolve_reduced(value, meta);
+                super::sql::metric_range_reduced(
+                    &mp.table,
+                    value,
+                    &resolved.columns,
+                    services,
+                    &sql_literals(&resolved.fingerprints),
+                    super::sql::SlidingScan {
+                        window: super::sql::TimeWindow {
+                            start_ns: mp.start_ns,
+                            end_ns: mp.end_ns,
+                        },
+                        lower: mp.scan_lower,
+                        grid_start_ns: mp.grid_start_ns,
+                        step_ns: step.get(),
+                        range_ns: mp.range_ns.get(),
+                    },
+                    predicates,
+                    self.key_route_test.bucketed_statement_max_memory_bytes,
+                )
+                .ok()
+                .map(|sql| (sql, resolved.class_labels))
+            }
+            _ => None,
+        };
+        let Some((sql, class_labels)) = statement else {
+            return self
+                .run_bucketed_fallback(mp, fingerprints, meta, services, predicates, explain)
+                .await;
+        };
+        if let Some(e) = explain.as_mut() {
+            e.push("metric_read", sql.clone(), Some(mp.routing.reason.clone()));
+        }
+        let sql = escape_query_placeholders(&sql);
+        if crate::querytext::ensure_query_text_fits(&sql).is_err() {
+            return self
+                .run_bucketed_fallback(mp, fingerprints, meta, services, predicates, explain)
+                .await;
+        }
+        let mut fold = super::reduce::ReducedFold::new(
+            value,
+            class_labels,
+            self.lowered_caps(),
+            super::reduce::ReducedGrid {
+                grid_start_ns: mp.grid_start_ns,
+                end_ns: mp.end_ns,
+                step_ns: mp.step_ns.map_or(0, |s| s.get()),
+                grid_points,
+                range_ns: mp.range_ns.get(),
+                rate_window_ns: step_rate_window(mp),
+            },
+            &mp.vector_aggs,
+        )?;
+        // Scoped: the row stream holds its pooled connection until dropped,
+        // and today's route issues another query after it.
+        let todays_route = {
+            let mut stream = match self
+                .client
+                .query_stream::<MetricReducedRow>(&sql, &self.budget_settings())
+                .await
+            {
+                Ok(stream) => stream,
+                Err(e) if bucketed_statement_failure_goes_to_todays_route(&e) => {
+                    return self
+                        .run_bucketed_fallback(
+                            mp,
+                            fingerprints,
+                            meta,
+                            services,
+                            predicates,
+                            explain,
+                        )
+                        .await;
+                }
+                Err(e) => {
+                    return Err(map_read_error(
+                        e,
+                        self.config.scan_budget_bytes,
+                        self.config.read_max_memory_bytes,
+                    ));
+                }
+            };
+            let mut todays_route = false;
+            while let Some(row) = stream.next().await {
+                match row {
+                    Ok(row) => {
+                        if fold.push(&row)? == super::reduce::ReducedPush::Stop {
+                            todays_route = true;
+                            break;
+                        }
+                    }
+                    Err(e) if bucketed_statement_failure_goes_to_todays_route(&e) => {
+                        todays_route = true;
+                        break;
+                    }
+                    Err(e) => {
+                        return Err(map_read_error(
+                            e,
+                            self.config.scan_budget_bytes,
+                            self.config.read_max_memory_bytes,
+                        ));
+                    }
+                }
+            }
+            todays_route
+        };
+        if todays_route {
+            // The fold's state is dropped before today's route reads.
+            drop(fold);
+            return self
+                .run_bucketed_fallback(mp, fingerprints, meta, services, predicates, explain)
+                .await;
+        }
+        let result = shift_emitted_points(QueryResult::Matrix(fold.finish()), mp.offset_ns);
+        apply_leaf_aggs(mp, one_point_answer(mp, result), 0)
     }
 
     /// The extracted-field group key read (issue #507).
@@ -2858,7 +3053,7 @@ impl LogQlEngine {
     }
 
     async fn explain_metric(&self, mp: &MetricPlan) -> Result<PlanExplain, ReadError> {
-        let result_type = if mp.step_ns.is_none() {
+        let result_type = if mp.answers_instant() {
             "vector"
         } else {
             "matrix"
@@ -2993,6 +3188,38 @@ impl LogQlEngine {
                         }
                         super::sql::MetricValue::Shaped(_) | super::sql::MetricValue::Staged(_) => {
                             bucketed_range_sql(mp, &services, &fingerprints, &lowered.predicates)
+                        }
+                        // Issue #624, part 4: the reduced statement, unless
+                        // a selected stream is labelled `x` (D10) or the
+                        // metadata filter did not fit (§5).
+                        super::sql::MetricValue::Reduced(r) => {
+                            let labelled_x = meta.values().any(|m| {
+                                super::labels::series_labels(m)
+                                    .iter()
+                                    .any(|(k, _)| *k == r.label)
+                            });
+                            match (labelled_x || !lowered.metadata_lowered, mp.step_ns) {
+                                (false, Some(step)) => {
+                                    let resolved = super::reduce::resolve_reduced(r, &meta);
+                                    super::sql::metric_range_reduced(
+                                        &mp.table,
+                                        r,
+                                        &resolved.columns,
+                                        &services,
+                                        &sql_literals(&resolved.fingerprints),
+                                        super::sql::SlidingScan {
+                                            window,
+                                            lower: mp.scan_lower,
+                                            grid_start_ns: mp.grid_start_ns,
+                                            step_ns: step.get(),
+                                            range_ns: mp.range_ns.get(),
+                                        },
+                                        &lowered.predicates,
+                                        self.key_route_test.bucketed_statement_max_memory_bytes,
+                                    )
+                                }
+                                _ => Err(BucketGridRefusal::StepNotPositive),
+                            }
                         }
                     };
                     match rendered {
@@ -6220,7 +6447,7 @@ impl PushdownRangeGroups {
 /// The internal-invariant breach the bucketed fold reports for a row inside
 /// the emit grid's span but off its points (issue #624), as `fold.rs` does
 /// for its own grid.
-fn range_fold_off_grid(t: i64) -> ReadError {
+pub(in crate::logql) fn range_fold_off_grid(t: i64) -> ReadError {
     ReadError::PipelineInvalid {
         reason: format!(
             "internal: the bucketed range fold received a row at {t} off the query grid"
@@ -6662,6 +6889,45 @@ fn folded_answer(
     apply_vector_aggs(result, &mp.vector_aggs)
 }
 
+/// Today's route's plan for `mp` (issue #624, part 5): an instant query
+/// lowered at its one grid point is the instant query it answers — no step,
+/// and the grid starting at the scan start, as an instant plan's does; any
+/// other plan is itself.
+fn todays_route_plan(mp: &MetricPlan) -> Cow<'_, MetricPlan> {
+    if mp.value.instant() {
+        let mut copy = mp.clone();
+        copy.step_ns = None;
+        copy.grid_start_ns = copy.start_ns;
+        Cow::Owned(copy)
+    } else {
+        Cow::Borrowed(mp)
+    }
+}
+
+/// A lowered plan's one-point matrix as the vector an instant query answers
+/// (issue #624, part 5), one sample per series; any other result unchanged.
+/// Converted before the vector aggregations, which order and select a
+/// vector by value and a matrix by nothing.
+fn one_point_answer(mp: &MetricPlan, result: QueryResult) -> QueryResult {
+    if !mp.value.instant() {
+        return result;
+    }
+    match result {
+        QueryResult::Matrix(series) => QueryResult::Vector(
+            series
+                .into_iter()
+                .filter_map(|s| {
+                    s.points.last().map(|(_, value)| VectorSample {
+                        labels: s.labels,
+                        value: *value,
+                    })
+                })
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
 /// The client aggregation a clean bucketed chain is equivalent to (issue
 /// #507, W2) — what the capability join falls back to when the grid cannot
 /// be rendered.
@@ -6686,6 +6952,10 @@ pub fn bucketed_fallback_client_agg(mp: &MetricPlan) -> ClientAgg {
     // route runs, its stages included.
     if let super::sql::MetricValue::Staged(s) = &mp.value {
         return s.todays_route.clone();
+    }
+    // Issue #624, part 4: so does a reduced one.
+    if let super::sql::MetricValue::Reduced(r) = &mp.value {
+        return r.todays_route.clone();
     }
     ClientAgg {
         pipeline: Vec::new(),
@@ -6726,8 +6996,9 @@ fn client_metric_read_sql(
     // resolved a stream.
     let projection = ScanProjection::WithStructuredMetadata;
     // Issue #624, part 3a (D6): `rx` carries the captures of the `regexp`
-    // stages the database runs over the stored line.
-    if mp.step_ns.is_some() {
+    // stages the database runs over the stored line. Issue #624, part 5: an
+    // instant query lowered at one grid point reads as the instant it is.
+    if !mp.answers_instant() {
         super::sql::metric_raw_samples_sliding_with_rx(
             &mp.table,
             services,

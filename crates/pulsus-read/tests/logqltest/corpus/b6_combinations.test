@@ -3,8 +3,10 @@
 # real user would write: parser × line/label filter × formatter × unwrap ×
 # range-reducer × vector-agg × grouping, plus binops between two multi-stage
 # metric exprs. Instant-eval only; each expected value is a BIT-EXACT capture
-# from grafana/loki:3.7.4 (container `loki-b6` on :3106, WAL + auto-discovery
-# disabled — the #218 exact-fixture discipline; see PROVENANCE.md).
+# from the reference (the #218 exact-fixture discipline; see PROVENANCE.md),
+# except the `rate_counter` row, which carries
+# `divergence(rate-counter-window-anchored)` and a value derived by hand in
+# that entry's arithmetic (issue #624, part 4, F4).
 #
 # These are COMBINATIONS, not single-construct cases (those live in B1–B5).
 # Every metric query carries a parser stage (the raw-scan client-aggregation
@@ -511,7 +513,7 @@ eval instant at 60s sum by (method) (rate({service_name="api-n"} | logfmt | stat
 
 clear
 
-# --- rate_counter under sum by(pod) → topk(1) (extrapolation capture) --
+# --- rate_counter under sum by(pod) → topk(1) (F4's extrapolation) ----
 load
   {service_name="cache-i", app="cache", pod="p1"}
   10s  requests=5
@@ -522,8 +524,9 @@ load
   10s  requests=1
   40s  requests=100
 
+# provenance: divergence(rate-counter-window-anchored)
 eval instant at 60s topk(1, sum by (pod) (rate_counter({service_name="cache-i"} | logfmt | unwrap requests [1m])))
-  {pod="p2"} 1.6500033000000003
+  {pod="p2"} 2.7666666666666666
 
 clear
 

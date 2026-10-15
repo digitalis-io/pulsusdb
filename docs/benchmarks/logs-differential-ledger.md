@@ -7020,3 +7020,55 @@ gated by
   structured metadata differs (the reference's rule compares that too, and
   we do not reach the rule at all).
 
+
+## Issue #624, part 4 — the `| unwrap` reducers in the database
+
+### `rate-counter-window-anchored` (issue #624, part 4, deliberate divergence — owner decision)
+
+- **What differs.** `rate_counter`'s extrapolation. The reference's
+  `extrapolatedRate` (`pkg/logql/range_vector.go:286-353`) holds
+  sample times in nanoseconds and divides every span by 1,000
+  (`durationMilliseconds`, `:355`) as if they were milliseconds, and it
+  anchors the window on the first sample: `rangeStart = first.T -
+  selRange_ms`, `rangeEnd = last.T`. So `durationToStart` is always the
+  range divided by 1,000 and `durationToEnd` is 0. PulsusDB computes every
+  span in seconds, `(a - b) / 1e9`, from the edges of the window `(t -
+  range, t]`: `durationToStart = first.T - (t - range)`, `durationToEnd =
+  t - last.T`, and keeps the rest of the reference's arithmetic in its
+  order. One sample still answers 0.
+- **Example.** `rate_counter({…} | logfmt | unwrap c [1m])` at `t = 60s`
+  over `c=200` at 25 s and `c=260` at 35 s: the reference answers
+  `1.000006` (the 60 s range enters as 0.06 s); PulsusDB answers `2.0`
+  (increase 60; each edge is past 1.1 times the 10 s spacing and extends
+  5 s; `60 * 20 / 10 / 60`).
+- **Why.** The reference's number is a unit error, not a rule: the same
+  arithmetic in its own units gives 2.0. Decided by the owner on #624:
+  the reference is not worth matching here. Recorded in
+  docs/reference-defects-we-do-not-copy.md, entry 33.
+- **Cases.** The e2e differential's `metric_rate_counter_reset`,
+  `metric_rate_counter_sparse`, `metric_rate_counter_boundary` and
+  `metric_rate_counter_dup_ts` are informational against the reference;
+  PulsusDB stays gated against `expected_metric_vector`. The corpus rows
+  that carry this id are the `rate_counter` rows of
+  `b3_metric_range.test`, `b11_rate_divisor.test`, `b6_combinations.test`
+  and `differential_metric_reducers.test`; each value is derived by hand
+  in this arithmetic.
+
+### `unwrap-same-nanosecond-value-order` (issue #624, part 4, deliberate divergence)
+
+- **What differs.** The order in which `| unwrap` samples of ONE stream at
+  ONE nanosecond are folded. The reference folds them in push order,
+  which PulsusDB does not store. Before part 4 PulsusDB folded them in
+  ascending body order; it now folds them in ascending value order
+  (`f64::total_cmp`), on every route, because that is the order the
+  database can read without the line.
+- **Example.** `rate_counter` over `c=5` at 10 s, `c=10` and `c=3` at
+  20 s, `c=12` at 30 s, `[1m]` at 60 s: value order folds 5, 3, 10, 12
+  (a reset of 5, increase 12) where body order folds 5, 10, 3, 12 (a reset
+  of 10, increase 17). The order-dependent reducers are `first_over_time`,
+  `last_over_time`, `avg_over_time`, `stddev_over_time`,
+  `stdvar_over_time`, `sum_over_time` and `rate_counter`.
+- **Why.** Neither order is the reference's; value order is the one both
+  of our routes can compute, so the database and today's route answer the
+  same.
+- Gated by `differential_metric_reducers.test`.

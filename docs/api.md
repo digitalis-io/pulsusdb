@@ -296,6 +296,14 @@ A line with no readable value for the unwrapped label (absent, empty, or a
 line that is not JSON) contributes no sample and no error, for every range
 aggregation, grouped or not.
 
+`rate_counter` extrapolates in seconds from the edges of each window
+`(t - range, t]`; a window with one sample answers 0.
+`rate_counter({…} | logfmt | unwrap c [1m])` at 60 s over `c=200` at 25 s
+and `c=260` at 35 s answers `2`, where the reference, which reads its
+nanosecond spans as milliseconds and anchors the window on the first
+sample, answers `1.000006`: entry 33 of
+docs/reference-defects-we-do-not-copy.md.
+
 A `sum` directly above `count_over_time`, `bytes_over_time`, `rate`,
 `bytes_rate` or `sum_over_time` groups at the range step, so a `__error__`
 label outside its grouping does not fail the query unless the line's own

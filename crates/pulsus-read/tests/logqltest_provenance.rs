@@ -2010,7 +2010,11 @@ fn check_f_quoted_template_corpus_counts_match_the_corpus() {
 /// pinned digest with the shared config, the reserved-name rows on the same
 /// digest with `ci/logql/config-463.yaml`, both at the query text committed
 /// in the file.
-const CAPTURED: usize = 1_665;
+/// Issue #624 moved the `rate_counter` rows of `b3_metric_range.test`,
+/// `b11_rate_divisor.test` and `b6_combinations.test` off their files'
+/// `captured` default onto `divergence(rate-counter-window-anchored)`:
+/// their values are derived from that ledger entry's arithmetic.
+const CAPTURED: usize = 1_655;
 /// Issue #343 added `b19_offset.test`: hand-derived from the semantics
 /// measured on that issue, over a fixture authored here rather than taken
 /// from the container, so they are `derived` and not `captured`. Its
@@ -2035,8 +2039,16 @@ const DERIVED: usize = 32;
 /// file's `ported(...)` default onto `sort-tie-order`: their expected
 /// sequences are OUR tie-break rule (`post_agg::sort_instant`), not a
 /// ported reference order — the reference specifies none.
-const DIVERGENCE: usize = 90;
-const PORTED: usize = 30;
+/// Issue #624 added the `rate_counter` rows of `b3_metric_range.test`,
+/// `b11_rate_divisor.test`, `b6_combinations.test` and
+/// `differential_metric_reducers.test`, under
+/// `rate-counter-window-anchored`, and the last file's duplicate-timestamp
+/// row under `unwrap-same-nanosecond-value-order`.
+const DIVERGENCE: usize = 104;
+/// Issue #624 moved the `rate_counter` rows of
+/// `differential_metric_reducers.test` off that file's `ported(...)`
+/// default onto `divergence(...)`.
+const PORTED: usize = 26;
 /// Issue #249 grew this by `b25_structured_metadata.test`'s rows, issue
 /// #277 by `b21_variant_series_cap.test`'s, issue #400's second stage by
 /// `b25_re2_reject_parity.test`'s, and issue #388 by the rows of
@@ -2074,8 +2086,11 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
     ("pulsus-read/src/logql/predicate.rs", 18),
     // Issue #624, part 3d adds three to `sql.rs`: the `| logfmt` line
     // grammar in its `decided` column, and the out-of-range integer test in
-    // each of the two `| json` key readers.
-    ("pulsus-read/src/logql/sql.rs", 5),
+    // each of the two `| json` key readers. Issue #624, part 4 adds twelve:
+    // the `| unwrap` conversions' grammar tests in
+    // `reduced_conversion_columns`, two for numbers, six for durations and
+    // four for bytes.
+    ("pulsus-read/src/logql/sql.rs", 17),
     ("pulsus-read/src/metrics/dispatch.rs", 5),
     // Issue #623: the counts follow the test expectations of the lookup and
     // activity reads — a regex matcher on the lookup and its probe line on
@@ -2111,7 +2126,7 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
 
 /// The separately-asserted total, so "a file appeared" reads differently
 /// from "a file grew".
-const MATCH_RENDER_TOTAL: usize = 109;
+const MATCH_RENDER_TOTAL: usize = 121;
 
 /// Every string-literal CONTENT in a Rust source: ordinary `"…"`, raw
 /// `r"…"`/`r#"…"#`, byte `b"…"` and byte-raw. Comments are dropped.

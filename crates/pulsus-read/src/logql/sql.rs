@@ -225,6 +225,79 @@ pub enum MetricValue {
     /// the column shape and the aggregation today's route runs, which the
     /// fold and the fallbacks need.
     Staged(Box<StagedCount>),
+    /// One of the eleven `| unwrap` reducers over a pipeline with no
+    /// parser (issue #624, part 4): the statement reduces each window, and
+    /// the stages run once per returned key.
+    Reduced(Box<ReducedUnwrap>),
+}
+
+impl MetricValue {
+    /// Whether this lowered plan answers an instant query at its one grid
+    /// point (issue #624, part 5).
+    pub fn instant(&self) -> bool {
+        match self {
+            MetricValue::Staged(s) => s.instant,
+            MetricValue::Reduced(r) => r.instant,
+            MetricValue::Shaped(_) | MetricValue::Unwrapped(_) => false,
+        }
+    }
+}
+
+/// The conversion of a lowered `| unwrap` (issue #624, part 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnwrapConversion {
+    /// `| unwrap x`.
+    Number,
+    /// `| unwrap duration(x)` and `| unwrap duration_seconds(x)`.
+    Duration,
+    /// `| unwrap bytes(x)`.
+    Bytes,
+}
+
+/// How a lowered `| unwrap` reducer keys its series (issue #624, part 4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyMode {
+    /// `by (L)`: the key is a class of stream labels on `L` and the
+    /// metadata values of `L`.
+    Keep(Vec<String>),
+    /// No grouping, or `without (L)`: every label but the names in `E`, the
+    /// unwrapped label among them.
+    Drop(Vec<String>),
+}
+
+/// [`MetricValue::Reduced`]'s payload (issue #624, part 4).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReducedUnwrap {
+    /// One of the eleven `| unwrap` reducers.
+    pub reducer: pulsus_logql::RangeAggOp,
+    /// `quantile_over_time`'s parameter.
+    pub quantile: Option<f64>,
+    /// The `| unwrap` label, read from structured metadata.
+    pub label: String,
+    pub conversion: UnwrapConversion,
+    pub mode: KeyMode,
+    /// The stages each key runs: the pipeline less its line filters and
+    /// the label filters the statement applied.
+    pub key_stages: Vec<pulsus_logql::Stage>,
+    /// The client aggregation today's route runs for this query.
+    pub todays_route: super::plan::ClientAgg,
+    /// The plan answers an instant query at its one grid point (part 5).
+    pub instant: bool,
+}
+
+/// What a lowered `| unwrap` statement reads of the resolved streams
+/// (issue #624, part 4).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReducedKeyColumns {
+    /// `None`: each fingerprint is its own class. Otherwise the
+    /// fingerprints of each class, by class id.
+    pub classes: Option<Vec<Vec<FpLiteral>>>,
+    /// Each selected stream's hash, when a class holds two or more
+    /// fingerprints; otherwise empty.
+    pub hashes: Vec<(FpLiteral, u64)>,
+    /// Each metadata name the key reads or removes, with the fingerprints
+    /// of the streams carrying it as a stream label.
+    pub blank: Vec<(String, Vec<FpLiteral>)>,
 }
 
 /// [`MetricValue::Staged`]'s payload (issue #624, part 2).
@@ -244,6 +317,9 @@ pub struct StagedCount {
     /// The pipeline's one `| logfmt` stage, when the statement sends its
     /// relevant fields (issue #624, part 3d): they join the group key.
     pub logfmt: Option<LogfmtCount>,
+    /// The plan answers an instant query at its one grid point (issue
+    /// #624, part 5).
+    pub instant: bool,
 }
 
 /// The `| logfmt` stage of a lowered count (issue #624, part 3d): the
@@ -1925,6 +2001,388 @@ pub fn metric_range_sliding_with_regexp(
     ]);
     let sql = lines.join("\n");
     Ok(sql)
+}
+
+/// The duration units the reduced statement decides, and each one's
+/// nanoseconds (issue #624, part 4): Go's `time.ParseDuration` table.
+const REDUCED_DURATION_UNITS: [(&str, u64); 8] = [
+    ("ns", 1),
+    ("us", 1_000),
+    ("\u{b5}s", 1_000),
+    ("\u{3bc}s", 1_000),
+    ("ms", 1_000_000),
+    ("s", 1_000_000_000),
+    ("m", 60_000_000_000),
+    ("h", 3_600_000_000_000),
+];
+
+/// The conversion columns of a lowered `| unwrap` (issue #624, part 4,
+/// D6), over `ut`, the unwrapped label's stored text, in the order the
+/// statement's `WITH` lists them: `us` is 0 for a value, 1 for a failure
+/// and 2 for a text the statement does not decide; `uv` is the value.
+///
+/// Each conversion decides exactly the grammar written here, and its
+/// value is today's route's (`pipeline::convert_label_value`) bit for bit;
+/// a text outside it is undecided and fails the statement (395), which
+/// sends the query to today's route. Rendered under `precise_float_parsing
+/// = 1` ([`UNWRAP_PARSER_SETTING`]).
+pub fn reduced_conversion_columns(conversion: UnwrapConversion) -> String {
+    match conversion {
+        UnwrapConversion::Number => {
+            "match(ut, '^[+-]?([0-9]+[.]?[0-9]*|[.][0-9]+)([eE][+-]?[0-9]+)?$') AS ug, \
+             toFloat64OrNull(ut) AS ux, \
+             toUInt8(multiIf(ug AND ux IS NOT NULL AND isFinite(ux), 0, \
+             NOT ug AND position(ut, '_') = 0 \
+             AND NOT match(lower(ut), '^[+-]?(inf|infinity|nan)$|^[+-]?0x'), 1, 2)) AS us, \
+             if(us = 0, assumeNotNull(ux), 0.) AS uv"
+                .to_string()
+        }
+        UnwrapConversion::Duration => {
+            let units: Vec<String> = REDUCED_DURATION_UNITS
+                .iter()
+                .map(|(u, _)| format!("'{u}'"))
+                .collect();
+            let (u, alt) = (
+                format!("[{}]", units.join(", ")),
+                REDUCED_DURATION_UNITS
+                    .iter()
+                    .map(|(u, _)| *u)
+                    .collect::<Vec<_>>()
+                    .join("|"),
+            );
+            let m = format!(
+                "[{}]",
+                REDUCED_DURATION_UNITS
+                    .iter()
+                    .map(|(_, n)| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            let p = format!(
+                "[{}]",
+                (0..=18)
+                    .map(|i| format!("1e{i}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            format!(
+                "match(ut, '^[+-]?(([0-9]{{1,18}}([.][0-9]{{0,18}})?|[.][0-9]{{1,18}})({alt}))+$') AS ug, \
+                 arraySum(arrayMap(c -> toUInt128(toUInt64OrZero(c[1])) * toUInt128(transform(c[3], {u}, {m}, 0)) \
+                 + toUInt128(if(toUInt64OrZero(c[2]) = 0, 0, \
+                 toUInt64(toFloat64(toUInt64OrZero(c[2])) * (toFloat64(transform(c[3], {u}, {m}, 0)) / {p}[length(c[2]) + 1])))), \
+                 extractAllGroups(ut, '([0-9]*)(?:[.]([0-9]*))?({alt})'))) AS ua, \
+                 toUInt8(multiIf(match(ut, '^[+-]?0$'), 0, ug AND ua <= 9223372036854775807, 0, \
+                 NOT match(ut, '[0-9]') OR NOT match(ut, '^[+-]?[0-9.]') \
+                 OR match(ut, '^[+-]?([0-9]+[.]?[0-9]*|[.][0-9]+)$') \
+                 OR (match(ut, '^[+-]?([0-9]+[.]?[0-9]*|[.][0-9]+)[^0-9.]+$') \
+                 AND regexpExtract(ut, '([^0-9.]+)$', 1) NOT IN {u}), 1, 2)) AS us, \
+                 if(us = 0 AND ug, if(startsWith(ut, '-'), -toInt64(ua), toInt64(ua)), toInt64(0)) AS ud, \
+                 if(us = 0, toFloat64(intDiv(ud, toInt64(1000000000))) \
+                 + toFloat64(ud % toInt64(1000000000)) / 1e9, 0.) AS uv"
+            )
+        }
+        UnwrapConversion::Bytes => {
+            let units = super::pipeline::BYTES_UNITS;
+            let b = format!(
+                "[{}]",
+                units
+                    .iter()
+                    .map(|(u, _)| format!("'{u}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            let f = format!(
+                "[{}]",
+                units
+                    .iter()
+                    .map(|(_, f)| format!("{f:.1}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            let alt = units
+                .iter()
+                .filter(|(u, _)| !u.is_empty())
+                .map(|(u, _)| *u)
+                .collect::<Vec<_>>()
+                .join("|");
+            format!(
+                "lower(ut) AS ul, \
+                 match(ul, '^([0-9]+[.]?[0-9]*|[.][0-9]+) *({alt})? *$') AS ug, \
+                 regexpExtract(ul, '^([0-9]+[.]?[0-9]*|[.][0-9]+)', 1) AS un, \
+                 toFloat64OrNull(un) * transform(trimBoth(substring(ul, length(un) + 1)), {b}, {f}, 0.) AS up, \
+                 toUInt8(multiIf(ug AND up IS NOT NULL AND up < 18446744073709551616., 0, \
+                 NOT match(ut, '[0-9]') OR NOT match(ut, '^[0-9.,]') \
+                 OR match(ul, '^([0-9]+[.]?[0-9]*|[.][0-9]+) *[a-z]+ *$'), 1, 2)) AS us, \
+                 if(us = 0, trunc(assumeNotNull(up)), 0.) AS uv"
+            )
+        }
+    }
+}
+
+/// The lowered `| unwrap` range statement (issue #624, part 4): one row per
+/// `(class, metadata key, failed, grid point)` window that holds a sample,
+/// its reducer computed in the database.
+///
+/// ```text
+/// run grouping   one SELECT over the table: each line's key (c, kv, e) and the
+///                grid indexes lo..hi whose windows hold it; per (key, lo, hi)
+///                the run's partial state. Over a Distributed table each shard
+///                runs this and sends its run states.
+/// fan-out        each run to its grid points, merged per (key, k)
+/// outer          the reducer over the window, in (timestamp, stream hash,
+///                value) order where the order matters
+/// ```
+///
+/// A line with no `x` (`ut = ''`) is no sample; a line no window holds
+/// neither counts nor fails; a text the conversion does not decide, or
+/// stored metadata holding `"__`, fails the statement (395).
+///
+/// # Refusals
+///
+/// Every refusal of [`super::predicate::sliding_cover`].
+#[allow(clippy::too_many_arguments)]
+pub fn metric_range_reduced(
+    table: &str,
+    value: &ReducedUnwrap,
+    keys: &ReducedKeyColumns,
+    services: &[CheckedLiteral],
+    fingerprints: &[FpLiteral],
+    scan: SlidingScan,
+    extra_predicates: &[CheckedFragment],
+    max_memory: Option<u64>,
+) -> Result<String, super::predicate::BucketGridRefusal> {
+    use super::predicate::literal;
+    use pulsus_logql::RangeAggOp as Op;
+    let SlidingScan {
+        window,
+        lower,
+        grid_start_ns,
+        step_ns,
+        range_ns,
+    } = scan;
+    let TimeWindow { start_ns, end_ns } = window;
+    let cover =
+        super::predicate::sliding_cover(start_ns, grid_start_ns, end_ns, step_ns, range_ns)?;
+    let blank = |name: &str| -> &[FpLiteral] {
+        keys.blank
+            .iter()
+            .find(|(n, _)| n == name)
+            .map_or(&[][..], |(_, fps)| fps.as_slice())
+    };
+    let kv = match &value.mode {
+        KeyMode::Keep(names) if names.is_empty() => {
+            "CAST([], 'Array(Tuple(String, String))')".to_string()
+        }
+        KeyMode::Keep(names) => {
+            let mut names = names.clone();
+            names.sort_unstable();
+            let items: Vec<String> = names
+                .iter()
+                .map(|n| {
+                    let lit = literal(n);
+                    let read = format!("JSONExtractString(structured_metadata, {})", lit.as_sql());
+                    let fps = blank(n);
+                    let read = if fps.is_empty() {
+                        read
+                    } else {
+                        format!("if(fingerprint IN ({}), '', {read})", fp_list(fps))
+                    };
+                    format!("({}, {read})", lit.as_sql())
+                })
+                .collect();
+            format!("[{}]", items.join(", "))
+        }
+        KeyMode::Drop(names) => {
+            let terms: Vec<String> = names
+                .iter()
+                .map(|n| {
+                    let fps = blank(n);
+                    let lit = literal(n);
+                    if fps.is_empty() {
+                        format!("p.1 = {}", lit.as_sql())
+                    } else {
+                        format!(
+                            "(p.1 = {} AND fingerprint NOT IN ({}))",
+                            lit.as_sql(),
+                            fp_list(fps)
+                        )
+                    }
+                })
+                .collect();
+            format!(
+                "arrayFilter(p -> NOT ({}), JSONExtractKeysAndValues(structured_metadata, 'String'))",
+                terms.join(" OR ")
+            )
+        }
+    };
+    let has_h = !keys.hashes.is_empty();
+    let h = if has_h {
+        let fps: Vec<FpLiteral> = keys.hashes.iter().map(|(fp, _)| *fp).collect();
+        let hashes: Vec<String> = keys.hashes.iter().map(|(_, h)| h.to_string()).collect();
+        format!(
+            ",\n         transform(fingerprint, [{}], [{}], toUInt64(0)) AS h",
+            fp_list(&fps),
+            hashes.join(", ")
+        )
+    } else {
+        String::new()
+    };
+    let sorted = if has_h {
+        "arraySort((x, a, b) -> (a, b, x), wv, wt, wh)"
+    } else {
+        "arraySort((x, a) -> (a, x), wv, wt)"
+    };
+    let (run, merge) = match value.reducer {
+        Op::QuantileOverTime => (
+            "count() AS rn, groupArray(v) AS rv".to_string(),
+            "sum(rn) AS n, groupArrayArray(rv) AS wv".to_string(),
+        ),
+        Op::MinOverTime | Op::MaxOverTime => {
+            let f = if value.reducer == Op::MinOverTime {
+                "min"
+            } else {
+                "max"
+            };
+            (
+                format!("count() AS rn, {f}(v) AS rm"),
+                format!("sum(rn) AS n, {f}(rm) AS m"),
+            )
+        }
+        Op::FirstOverTime | Op::LastOverTime => {
+            let f = if value.reducer == Op::FirstOverTime {
+                "min"
+            } else {
+                "max"
+            };
+            let tuple = if has_h { "(t, h, v)" } else { "(t, v)" };
+            (
+                format!("count() AS rn, {f}({tuple}) AS rm"),
+                format!("sum(rn) AS n, {f}(rm) AS m"),
+            )
+        }
+        _ => {
+            let (rh, wh) = if has_h {
+                (" groupArray(h) AS rh,", " groupArrayArray(rh) AS wh,")
+            } else {
+                ("", "")
+            };
+            (
+                format!("count() AS rn, groupArray(t) AS rt,{rh} groupArray(v) AS rv"),
+                format!("sum(rn) AS n, groupArrayArray(rt) AS wt,{wh} groupArrayArray(rv) AS wv"),
+            )
+        }
+    };
+    let zero = ("toInt64(0)", "toInt64(0)", "toFloat64(0)");
+    let (r, t1, t2, v1) = match value.reducer {
+        Op::SumOverTime | Op::Rate => {
+            (format!("arrayCumSum({sorted})[-1]"), zero.0, zero.1, zero.2)
+        }
+        Op::AvgOverTime => (
+            format!(
+                "arrayFold((acc, ch) -> arrayFold((a, x) -> (a.1 + 1, if(isInfinite(a.2) \
+                 AND ((isInfinite(x) AND ((a.2 > 0) = (x > 0))) OR isFinite(x)), a.2, \
+                 a.2 + (x / (a.1 + 1) - a.2 / (a.1 + 1)))), ch, acc), \
+                 arraySplit((x, i) -> i % 1024 = 1, ({sorted} AS s), arrayEnumerate(s)), \
+                 (toFloat64(0), toFloat64(0))).2"
+            ),
+            zero.0,
+            zero.1,
+            zero.2,
+        ),
+        Op::StdvarOverTime | Op::StddevOverTime => (
+            format!("arrayReduce('varPopStable', {sorted})"),
+            zero.0,
+            zero.1,
+            zero.2,
+        ),
+        Op::RateCounter => (
+            format!(
+                "arrayCumSum(arrayConcat([({sorted} AS s)[-1] - s[1]], \
+                 arrayFilter((p, x) -> x < p, arrayPushFront(arrayPopBack(s), 0.), s)))[-1]"
+            ),
+            "arrayMin(wt)",
+            "arrayMax(wt)",
+            "s[1]",
+        ),
+        Op::QuantileOverTime => {
+            let q = value.quantile.unwrap_or(0.0).clamp(0.0, 1.0);
+            (
+                format!(
+                    "(arraySort(wv) AS s)[(toUInt64(floor(reinterpretAsFloat64(toUInt64({})) \
+                     * (length(s) - 1) AS rk)) AS lw) + 1] * (1 - (rk - floor(rk))) \
+                     + s[toUInt64(ceil(rk)) + 1] * (rk - floor(rk))",
+                    q.to_bits()
+                ),
+                zero.0,
+                zero.1,
+                zero.2,
+            )
+        }
+        Op::MinOverTime | Op::MaxOverTime => ("m".to_string(), zero.0, zero.1, zero.2),
+        Op::FirstOverTime | Op::LastOverTime => (
+            if has_h { "m.3" } else { "m.2" }.to_string(),
+            zero.0,
+            zero.1,
+            zero.2,
+        ),
+        Op::CountOverTime | Op::BytesOverTime | Op::BytesRate | Op::AbsentOverTime => {
+            return Err(super::predicate::BucketGridRefusal::RollupSource);
+        }
+    };
+    let ut = format!(
+        "JSONExtractString(structured_metadata, {}) AS ut",
+        literal(&value.label).as_sql()
+    );
+    let conversion = reduced_conversion_columns(value.conversion);
+    let class = unwrapped_class_expr(&keys.classes);
+    let (lo, hi) = (cover.lo.as_sql(), cover.hi.as_sql());
+    let lower_op = lower.sql_op();
+    let mut lines: Vec<String> = vec![
+        format!(
+            "SELECT c, kv, e, toInt64({grid_start_ns} + k * {step_ns}) AS bucket_ns, n, {r} AS r, \
+             {t1} AS t1, {t2} AS t2, {v1} AS v1"
+        ),
+        "FROM (".to_string(),
+        format!("  SELECT c, kv, e, k, {merge}"),
+        "  FROM (".to_string(),
+        format!("    WITH {class} AS c, {kv} AS kv,"),
+        format!("         {lo} AS lo, {hi} AS hi, timestamp_ns AS t,"),
+        format!("         {ut},"),
+        format!("         {conversion},"),
+        format!(
+            "         toUInt8(if(position(structured_metadata, '\"__') > 0, 2, us)) AS st, \
+             uv AS v, toUInt8(st = 1) AS e{h}"
+        ),
+        format!("    SELECT c, kv, e, lo, hi, {run}"),
+        format!("    FROM {table}"),
+    ];
+    if !services.is_empty() {
+        lines.push(format!("    PREWHERE {}", service_predicate(services)));
+    }
+    lines.push(format!(
+        "    WHERE fingerprint IN ({}) AND timestamp_ns {lower_op} {start_ns} AND timestamp_ns <= {end_ns}",
+        fp_list(fingerprints)
+    ));
+    for clause in extra_predicates {
+        lines.push(format!("      AND {}", clause.as_sql()));
+    }
+    lines.extend([
+        "      AND ut != '' AND lo <= hi AND throwIf(st = 2 AND ut != '' AND lo <= hi) = 0"
+            .to_string(),
+        "    GROUP BY c, kv, e, lo, hi".to_string(),
+        "  )".to_string(),
+        "  ARRAY JOIN range(lo, hi + 1) AS k".to_string(),
+        "  GROUP BY c, kv, e, k".to_string(),
+        ")".to_string(),
+        "ORDER BY c, kv, e, bucket_ns".to_string(),
+    ]);
+    let mut settings =
+        format!("SETTINGS {UNWRAP_PARSER_SETTING}, query_plan_execute_functions_after_sorting = 0");
+    if let Some(n) = max_memory {
+        settings.push_str(&format!(", max_memory_usage = {n}"));
+    }
+    lines.push(settings);
+    Ok(lines.join("\n"))
 }
 
 /// Test-only knobs rendered into a group key statement (issue #507), so a
@@ -4678,6 +5136,93 @@ mod tests {
                 assert_ne!(want, none, "{name}: the fixture has a FROM line");
                 assert_eq!(build(Some(rx)), want, "{name}");
             }
+        }
+    }
+
+    /// **T17 (issue #624, part 4): the run grouping is the `SELECT` that
+    /// reads the table**, so over a `Distributed` table each shard groups
+    /// its own lines and sends run states. The span from the last `SELECT
+    /// c, kv, e, lo, hi` to `GROUP BY c, kv, e, lo, hi` reads the table
+    /// itself, and the fan-out comes after it.
+    #[test]
+    fn the_run_grouping_is_the_select_that_reads_the_table() {
+        let fps = [
+            Fingerprint::from_raw(11).sql_literal(),
+            Fingerprint::from_raw(12).sql_literal(),
+        ];
+        let services = [literal("checkout")];
+        let pipeline = {
+            let pulsus_logql::Expr::Log(le) =
+                pulsus_logql::parse(r#"{a="b"} | unwrap duration(lat) | __error__="""#)
+                    .expect("parse")
+            else {
+                panic!("a log expression");
+            };
+            le.pipeline
+        };
+        for (mode, keys) in [
+            (
+                KeyMode::Keep(vec!["route".to_string()]),
+                ReducedKeyColumns {
+                    classes: Some(vec![fps.to_vec()]),
+                    hashes: vec![(fps[0], 1), (fps[1], 2)],
+                    blank: vec![("route".to_string(), Vec::new())],
+                },
+            ),
+            (
+                KeyMode::Drop(vec!["lat".to_string(), "trace_id".to_string()]),
+                ReducedKeyColumns::default(),
+            ),
+        ] {
+            let value = ReducedUnwrap {
+                reducer: pulsus_logql::RangeAggOp::QuantileOverTime,
+                quantile: Some(0.9),
+                label: "lat".to_string(),
+                conversion: UnwrapConversion::Duration,
+                mode: mode.clone(),
+                key_stages: pipeline.clone(),
+                todays_route: super::super::plan::ClientAgg {
+                    pipeline: pipeline.clone(),
+                    value: super::super::plan::ClientValue::Unwrap,
+                    range_op: pulsus_logql::RangeAggOp::QuantileOverTime,
+                    param: Some(0.9),
+                    absent_labels: Vec::new(),
+                    grouping: None,
+                },
+                instant: false,
+            };
+            let sql = metric_range_reduced(
+                "log_samples",
+                &value,
+                &keys,
+                &services,
+                &fps,
+                SLIDING_SCAN,
+                &[],
+                None,
+            )
+            .expect("a renderable statement");
+            let start = sql.rfind("SELECT c, kv, e, lo, hi");
+            assert!(start.is_some(), "{mode:?}: no run grouping in\n{sql}");
+            let start = start.unwrap_or_default();
+            let end = sql[start..].find("GROUP BY c, kv, e, lo, hi");
+            assert!(
+                end.is_some(),
+                "{mode:?}: no run grouping's GROUP BY in\n{sql}"
+            );
+            let span = &sql[start..start + end.unwrap_or_default()];
+            assert!(
+                span.contains("FROM log_samples"),
+                "{mode:?}: the run grouping reads the table:\n{span}"
+            );
+            assert!(
+                !span.contains("FROM ("),
+                "{mode:?}: the run grouping reads no subquery:\n{span}"
+            );
+            assert!(
+                !sql[..start].contains("ARRAY JOIN") && sql[start..].contains("ARRAY JOIN"),
+                "{mode:?}: the fan-out follows the run grouping:\n{sql}"
+            );
         }
     }
 }
