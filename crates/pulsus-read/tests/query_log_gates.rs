@@ -8551,18 +8551,19 @@ async fn seed_one_stream(
 /// R1   6,213 {"latency":1} at one nanosecond                 {} 6213                     {} 6213
 /// R1   6,214 at one nanosecond                              {} 6214 (see below)         {} 6214
 /// R2   4,100,000 {"latency":1} within 50 s                  422 retained window points  {} 4100000
-/// R3   3,400 lines, each its own request_id, one per second 422 result point-slots      one series, 3,400 points of 1
+/// R3   3,400 lines, each its own request_id, one per second one series (see below)     one series, 3,400 points of 1
 ///      over an hour, step 1 s
-/// R4   the realistic corpus, 3 minutes                       422 retained label bytes    three points (the plan's figures)
+/// R4   the realistic corpus, 3 minutes                       three points (see below)    three points (the plan's figures)
 /// R5   501 values of r under by (r)                         422 series cap              422 series cap
 /// R6   the realistic corpus under a scan budget below it    422 scan budget             422 scan budget, no raw scan
 /// ```
 ///
-/// R1's second row answered `422` on today's route until issue #624, part 4
-/// (F3): under a parent `sum`, `sum_over_time` now takes the sum's grouping
-/// as its own, as the reference injects it, so today's route stages each
-/// line under the sum's labels alone and 6,214 of them fit where the full
-/// stream labels did not.
+/// R1's second row, R3 and R4 answered `422` on today's route (same-nanosecond
+/// staging, result point-slots and retained label bytes) until issue #624,
+/// part 4 (F3): under a parent `sum`, `sum_over_time` now takes the sum's
+/// grouping as its own, as the reference injects it, so today's route keeps
+/// one series per sum group, each line under the sum's labels alone, and
+/// answers all three as the key route does.
 ///
 /// R9 (the statement text cap) is the hermetic
 /// `plan::tests::a_key_statement_over_the_text_cap_takes_todays_route`, and
@@ -8698,25 +8699,24 @@ async fn every_refusal_lands_as_the_table_says() {
         );
     }
 
-    // R3: one series of 3,400 points, each 1, where today's route runs out of
-    // result point-slots.
+    // R3: one series of 3,400 points, each 1, on both routes.
     {
         let params = range(1, 3600, 1);
         let key_q = sum_by("r3", "", "1s");
         let today_q = sum_by("r3", r#" | zzz="""#, "1s");
         assert!(is_key(&key_q, &params), "R3: the key route");
-        assert_eq!(
-            short(wide.query(&parse(&today_q).expect("parse"), &params).await),
-            "422 MetricResultPoints",
-            "R3: today's route"
-        );
-        match wide.query(&parse(&key_q).expect("parse"), &params).await {
-            Ok((QueryResult::Matrix(m), _)) => {
-                assert_eq!(m.len(), 1, "R3: one series");
-                assert_eq!(m[0].points.len(), 3400, "R3: 3,400 points");
-                assert!(m[0].points.iter().all(|(_, v)| *v == 1.0), "R3: each 1");
+        for (route, q) in [("today's route", &today_q), ("the key route", &key_q)] {
+            match wide.query(&parse(q).expect("parse"), &params).await {
+                Ok((QueryResult::Matrix(m), _)) => {
+                    assert_eq!(m.len(), 1, "R3, {route}: one series");
+                    assert_eq!(m[0].points.len(), 3400, "R3, {route}: 3,400 points");
+                    assert!(
+                        m[0].points.iter().all(|(_, v)| *v == 1.0),
+                        "R3, {route}: each 1"
+                    );
+                }
+                other => panic!("R3: {route} answers: {other:?}"),
             }
-            other => panic!("R3: the key route answers: {other:?}"),
         }
     }
 
@@ -8726,25 +8726,22 @@ async fn every_refusal_lands_as_the_table_says() {
         let key_q = sum_by("checkout", "", "1m");
         let today_q = sum_by("checkout", r#" | zzz="""#, "1m");
         assert!(is_key(&key_q, &params), "R4: the key route");
-        assert_eq!(
-            short(wide.query(&parse(&today_q).expect("parse"), &params).await),
-            "422 MetricGroupLabelBytes",
-            "R4: today's route"
-        );
-        match wide.query(&parse(&key_q).expect("parse"), &params).await {
-            Ok((QueryResult::Matrix(m), _)) => {
-                assert_eq!(m.len(), 1, "R4: one series");
-                let got: Vec<f64> = m[0].points.iter().map(|(_, v)| *v).collect();
-                let want = [14_999_019.46, 14_998_940.27, 15_001_940.27];
-                assert_eq!(got.len(), 3, "R4: three points: {got:?}");
-                for (g, w) in got.iter().zip(want) {
-                    assert!(
-                        (g - w).abs() < 0.005,
-                        "R4: {got:?} against the plan's {want:?}"
-                    );
+        for (route, q) in [("today's route", &today_q), ("the key route", &key_q)] {
+            match wide.query(&parse(q).expect("parse"), &params).await {
+                Ok((QueryResult::Matrix(m), _)) => {
+                    assert_eq!(m.len(), 1, "R4, {route}: one series");
+                    let got: Vec<f64> = m[0].points.iter().map(|(_, v)| *v).collect();
+                    let want = [14_999_019.46, 14_998_940.27, 15_001_940.27];
+                    assert_eq!(got.len(), 3, "R4, {route}: three points: {got:?}");
+                    for (g, w) in got.iter().zip(want) {
+                        assert!(
+                            (g - w).abs() < 0.005,
+                            "R4, {route}: {got:?} against the plan's {want:?}"
+                        );
+                    }
                 }
+                other => panic!("R4: {route} answers: {other:?}"),
             }
-            other => panic!("R4: the key route answers: {other:?}"),
         }
     }
 
