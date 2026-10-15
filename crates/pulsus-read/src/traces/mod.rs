@@ -77,7 +77,7 @@ pub use metrics_result::{
 };
 pub use rows::{GraphEdgeRow, SpanNameRow, TagNameRow, TagValueRow};
 pub use search_eval::{
-    GroupValue, ProjectedAttribute, SpanSetGroup, SpanSummary, StoredType,
+    GroupValue, ProjectedAttribute, SpanSetGroup, SpanSummary, StoredType, go_duration_string,
     non_finite_double_spelling, wire_arm,
 };
 pub use search_plan::{SearchCtx, SearchParams, SearchPlan, WireKey, plan_search};

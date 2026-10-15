@@ -3948,7 +3948,7 @@ fn bucket_label(series: &TraceMetricSeries) -> f64 {
         .find(|l| l.key == "__bucket")
         .and_then(|l| match l.value {
             MetricLabelValue::Double(d) => Some(d),
-            MetricLabelValue::Str(_) => None,
+            MetricLabelValue::Str(_) | MetricLabelValue::Int(_) | MetricLabelValue::Bool(_) => None,
         })
         .unwrap_or(f64::NEG_INFINITY)
 }
@@ -5459,7 +5459,7 @@ mod tests {
             .iter()
             .map(|s| match s.labels[0].value {
                 MetricLabelValue::Double(d) => d,
-                MetricLabelValue::Str(_) => panic!("__bucket is a double"),
+                _ => panic!("__bucket is a double"),
             })
             .collect();
         let want: Vec<f64> = [2u64, 1 << 10, 1 << 14, 1 << 20, 1 << 63]

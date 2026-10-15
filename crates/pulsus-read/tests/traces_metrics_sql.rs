@@ -635,7 +635,7 @@ fn shipped_metrics_shapes_and_limits_are_documented() {
         "`intervals + 1` samples",
         "extra **leading** bucket",
         "`(E − S) / step + 1`",
-        "The `*_over_time(duration)` value aggregations stay **sparse**",
+        "The `*_over_time` value aggregations, of `duration`, an attribute or `span:childCount`, stay **sparse**",
         // Issue #477 (d): the step grammar and the whole-millisecond bound.
         "any positive **whole number of milliseconds**",
         "traceql-metrics-fractional-ms-step-rejected",
