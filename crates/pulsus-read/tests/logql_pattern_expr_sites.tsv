@@ -48,11 +48,11 @@ Site	Literal	crates/pulsus-logql/tests/snapshots.rs:946	-	-	<method> <path> <_> 
 Site	Literal	crates/pulsus-read/src/logql/charge.rs:549	-	-	, 	reject	reject	-	-	-
 Site	Literal	crates/pulsus-read/src/logql/compile.rs:1517	-	-	<a>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/src/logql/compile.rs:1921	-	-	<a>	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:11434	-	-	<w> <v>	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:11473	-	-	<w> <v>	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4447	-	-	, 	reject	reject	-	-	-
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:11436	-	-	<w> <v>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:11475	-	-	<w> <v>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4449	-	-	, 	reject	reject	-	-	-
 Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:736	-	-	. 	reject	reject	-	-	-
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:8084	-	-	<__preserve_error__> <b>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:8086	-	-	<__preserve_error__> <b>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/src/logql/plan.rs:1845	-	-	 lowers as a 	reject	reject	-	-	-
 Site	Literal	crates/pulsus-read/src/logql/plan.rs:7104	-	-	<x> y	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/src/logql/plan.rs:8462	-	-	<a>	accept	accept	-	-	-

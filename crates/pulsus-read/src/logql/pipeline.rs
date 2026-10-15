@@ -3588,10 +3588,12 @@ pub(crate) fn go_duration_seconds(raw: &str) -> Option<f64> {
                 return None;
             }
         }
-        d += v;
-        if d > L {
-            return None;
-        }
+        // Each component is at most `L`, so two can pass `u64::MAX`: an
+        // overflow is out of range, as Go's `d > 1<<63` rejects it.
+        d = match d.checked_add(v) {
+            Some(d) if d <= L => d,
+            _ => return None,
+        };
     }
     let d = if neg {
         (d as i64).wrapping_neg()
@@ -11502,7 +11504,7 @@ mod tests {
             ("1.0000000000000000001s", 0x3ff0_0000_0000_0000),
             ("1us", 0x3eb0_c6f7_a0b5_ed8d),
         ];
-        const FAILED: [&str; 9] = [
+        const FAILED: [&str; 11] = [
             "00",
             "1d",
             "1w",
@@ -11512,6 +11514,8 @@ mod tests {
             "abc",
             "9223372037s",
             "2562048h",
+            "9223372036854775808ns9223372036854775808ns",
+            "-9223372036854775808ns9223372036854775808ns",
         ];
         for (text, bits) in DECIDED {
             let got = go_duration_seconds(text);

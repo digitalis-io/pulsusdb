@@ -16254,6 +16254,8 @@ async fn the_database_conversions_are_todays_routes_where_they_decide() {
         "abc",
         "9223372037s",
         "2562048h",
+        "9223372036854775808ns9223372036854775808ns",
+        "-9223372036854775808ns9223372036854775808ns",
         "n/a",
         "-",
         "1.e5",

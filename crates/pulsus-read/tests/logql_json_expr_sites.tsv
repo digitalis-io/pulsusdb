@@ -86,22 +86,22 @@ Site	LogqlUnparseable	crates/pulsus-logql/tests/string_escapes.rs:365	-	-	\d	-	-
 Site	Literal	crates/pulsus-read/src/logql/error.rs:446	-	-	b.c	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/src/logql/logfmt_expr.rs:168	-	-	b c	accept	reject	-	-	PROSE and FIXTURE about this expression, never a query that must keep working: one of the two #394 glosses that said it was `accepted here` (which this change makes false and rewrites), and b26_json_expr.test's own eval_fail row, which pins the new verdict
 Site	Literal	crates/pulsus-read/src/logql/logfmt_expr.rs:169	-	-	b-c	accept	reject	-	-	the same: the second #394 gloss, this issue's two corpus-file headers, and b26_json_expr.test's eval_fail row pinning the new verdict
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4387	-	-	p	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4387	-	-	q	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:5053	-	-	b.c	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:5366	-	-	p	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:5366	-	-	q	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:5634	-	-	p	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:5634	-	-	q	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:5640	-	-	p	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:5644	-	-	p	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:5644	-	-	p	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:5650	-	-	nosuch	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:5650	-	-	p	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:5651	-	-	nosuch	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:6203	-	-	a.a.a…	accept	reject	-	-	a doc-comment ELISION, not an expression
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:8049	-	-	a	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:8110	-	-	p	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4389	-	-	p	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4389	-	-	q	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:5055	-	-	b.c	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:5368	-	-	p	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:5368	-	-	q	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:5636	-	-	p	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:5636	-	-	q	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:5642	-	-	p	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:5646	-	-	p	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:5646	-	-	p	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:5652	-	-	nosuch	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:5652	-	-	p	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:5653	-	-	nosuch	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:6205	-	-	a.a.a…	accept	reject	-	-	a doc-comment ELISION, not an expression
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:8051	-	-	a	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:8112	-	-	p	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/src/logql/plan.rs:6321	-	-	latency	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/src/logql/plan.rs:9357	-	-	level	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/src/logql/plan.rs:9361	-	-	method	accept	accept	-	-	

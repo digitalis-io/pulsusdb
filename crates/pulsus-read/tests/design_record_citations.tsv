@@ -204,7 +204,7 @@ docs/query-to-sql.md	crates/pulsus-read/src/logql/pipeline.rs:3421	crates/pulsus
 docs/query-to-sql.md	crates/pulsus-read/src/logql/pipeline.rs:3422	crates/pulsus-read/src/logql/pipeline.rs	3422		line	ns	("ns", 1e-9),
 docs/query-to-sql.md	crates/pulsus-read/src/logql/pipeline.rs:3423	crates/pulsus-read/src/logql/pipeline.rs	3423		line	us	("us", 1e-6),
 docs/query-to-sql.md	crates/pulsus-read/src/logql/pipeline.rs:3474	crates/pulsus-read/src/logql/pipeline.rs	3474		line	duration	/// not a duration unit.
-docs/query-to-sql.md	crates/pulsus-read/src/logql/pipeline.rs:6934	crates/pulsus-read/src/logql/pipeline.rs	6934		line	serde_json	serde_json::Value::Number(n) => n.to_string(),
+docs/query-to-sql.md	crates/pulsus-read/src/logql/pipeline.rs:6936	crates/pulsus-read/src/logql/pipeline.rs	6936		line	serde_json	serde_json::Value::Number(n) => n.to_string(),
 docs/query-to-sql.md	crates/pulsus-read/src/logql/sql.rs:1020	crates/pulsus-read/src/logql/sql.rs	1020		line	streams_table	pub fn stage2(streams_table: &str, fingerprints: &[FpLiteral]) -> String {
 docs/query-to-sql.md	crates/pulsus-read/src/logql/sql.rs:1616	crates/pulsus-read/src/logql/sql.rs	1616		line	formation	/// full-body `tie_rank` order is imposed in Rust at group formation. And
 docs/query-to-sql.md	crates/pulsus-read/src/logql/sql.rs:1616-1665	crates/pulsus-read/src/logql/sql.rs	1616	1665	prose	metric_raw_samples_sliding_with_rx	metric_raw_samples_sliding
@@ -274,11 +274,11 @@ docs/query-to-sql.md	model.rs:697	crates/pulsus-config/src/model.rs	697		line	tr
 docs/query-to-sql.md	model.rs:708	crates/pulsus-config/src/model.rs	708		line	tail_poll_interval	tail_poll_interval: HumanDuration(Duration::from_secs(1)),
 docs/query-to-sql.md	pipeline.rs:3407	crates/pulsus-read/src/logql/pipeline.rs	3407		line	PipelineError	Err(PipelineError::BadParserExpr(format!(
 docs/query-to-sql.md	pipeline.rs:3421	crates/pulsus-read/src/logql/pipeline.rs	3421		prose	DURATION_UNITS	DURATION_UNITS
-docs/query-to-sql.md	pipeline.rs:3639	crates/pulsus-read/src/logql/pipeline.rs	3639		line	QUERY_BYTES_SUFFIXES	const QUERY_BYTES_SUFFIXES: &[&str] = &[
+docs/query-to-sql.md	pipeline.rs:3641	crates/pulsus-read/src/logql/pipeline.rs	3641		line	QUERY_BYTES_SUFFIXES	const QUERY_BYTES_SUFFIXES: &[&str] = &[
 docs/query-to-sql.md	pipeline.rs:371	crates/pulsus-read/src/logql/pipeline.rs	371		prose	PipelineError	bad
-docs/query-to-sql.md	pipeline.rs:5542	crates/pulsus-read/src/logql/pipeline.rs	5542		line	malformed	// A non-object top level (or a parse failure) is the malformed class:
-docs/query-to-sql.md	pipeline.rs:6769	crates/pulsus-read/src/logql/pipeline.rs	6769		line	collides_at	let renamed = st.collides_at(&key, at.is_some());
-docs/query-to-sql.md	pipeline.rs:6853-6873	crates/pulsus-read/src/logql/pipeline.rs	6853	6873	line	is_ascii_alphanumeric	fn push_sanitized_part(out: &mut String, prefix: &str, part: &str) { if prefix.is_empty() { if part.as_bytes().first().i
+docs/query-to-sql.md	pipeline.rs:5544	crates/pulsus-read/src/logql/pipeline.rs	5544		line	malformed	// A non-object top level (or a parse failure) is the malformed class:
+docs/query-to-sql.md	pipeline.rs:6771	crates/pulsus-read/src/logql/pipeline.rs	6771		line	collides_at	let renamed = st.collides_at(&key, at.is_some());
+docs/query-to-sql.md	pipeline.rs:6855-6875	crates/pulsus-read/src/logql/pipeline.rs	6855	6875	line	is_ascii_alphanumeric	fn push_sanitized_part(out: &mut String, prefix: &str, part: &str) { if prefix.is_empty() { if part.as_bytes().first().i
 docs/query-to-sql.md	plan.rs:1666	crates/pulsus-read/src/logql/plan.rs	1666		prose	fetch_until_limit	limit
 docs/query-to-sql.md	plan.rs:1695	crates/pulsus-read/src/logql/plan.rs	1695		prose	has_unpushed_dropping_stage	has_unpushed_dropping_stage
 docs/query-to-sql.md	plan.rs:1713	crates/pulsus-read/src/logql/plan.rs	1713		prose	LabelFilter	true
