@@ -67,6 +67,11 @@
 //!   traces sharing span ids, with children inside and outside the window;
 //!   and one resource seen on two days. All three are landed in both
 //!   stores.
+//! * Fixtures K, U and W of issue #602 part 1 — six spans whose `.u` each
+//!   scope of the chain holds, for every key and aggregate scope; four
+//!   spans holding values the reference does not type; and four one-span
+//!   traces whose `service.name` is not a string. All three are landed in
+//!   both stores.
 //!
 //! Each is seeded by building the OTLP request bodies and handing them to
 //! `pulsus_write::parse_trace_landing`, then inserting the rows it
@@ -1815,15 +1820,17 @@ const CASES_R: &[CaseIn] = &[
         query: r#"{ resource.service.name = 12345 }"#,
         want: Want::Ids(&[]),
     },
+    // Issue #602 part 1 (D2): `service.name` is held only as a string,
+    // so `r2`'s int is missing.
     CaseIn {
         name: "RR7",
         query: r#"{ resource.service.name != nil }"#,
-        want: Want::Ids(&["r1", "r2", "r3"]),
+        want: Want::Ids(&["r1", "r3"]),
     },
     CaseIn {
         name: "RR8",
         query: r#"{ resource.service.name = nil }"#,
-        want: Want::Ids(&["r4"]),
+        want: Want::Ids(&["r2", "r4"]),
     },
     CaseIn {
         name: "IS1",
@@ -2128,17 +2135,20 @@ async fn the_service_name_is_compared_only_as_a_string() {
     }
     assert_eq!(cells, 9 * 4, "SX runs every form against every operator");
 
-    // `SX-MISS`: with `s1`'s resource row gone, no form reads it.
+    // `SX-MISS`: with `s1`'s resource row gone, no form reads it. Presence
+    // holds the two string forms only (issue #602 part 1, D2).
     delete_resource_row_of(&client, &ids_n(1)).await;
     let s1 = ids_n(1);
-    let s10 = ids_n(10);
     let but = |x: &String| -> Vec<String> { all.iter().filter(|i| *i != x).cloned().collect() };
     for (query, want) in [
         (r#"{ resource.service.name = "svc" }"#, vec![s1.clone()]),
         (r#"{ resource.service.name != "svc" }"#, but(&s1)),
         (r#"{ resource.service.name =~ "svc" }"#, vec![s1.clone()]),
         (r#"{ resource.service.name !~ "svc" }"#, but(&s1)),
-        (r#"{ resource.service.name != nil }"#, but(&s10)),
+        (
+            r#"{ resource.service.name != nil }"#,
+            vec![s1.clone(), ids_n(2)],
+        ),
     ] {
         let got = answer_in(&client, w, query).await;
         if got.as_ref() != Ok(&want) {
@@ -6463,17 +6473,21 @@ const CATALOGUE_QUERIES: [&str; 42] = [
     r#"{ span.c = 3 } || ({ span.a = 1 } && { span.zzz = 1 })"#,
 ];
 
-/// Section 8.3's eight queries on fixture RZ.
-const RZ_QUERIES: [&str; 8] = [
+/// Section 8.3's queries on fixture RZ, but `{ span.mixed != nil }`, which
+/// [`RZ_MIXED`] answers.
+const RZ_QUERIES: [&str; 7] = [
     "{}",
     r#"{ span.tags != nil }"#,
     r#"{ span.floats != nil }"#,
     r#"{ span.ints != nil }"#,
     r#"{ span.bools != nil }"#,
-    r#"{ span.mixed != nil }"#,
     r#"{ span.f = 2.0 }"#,
     r#"{ span.a * 2 > 5 }"#,
 ];
+
+/// An array mixing element types is missing (issue #602 part 1, D5), so
+/// this matches no span on fixture RZ; today's engine holds it.
+const RZ_MIXED: &str = r#"{ span.mixed != nil }"#;
 
 /// Fixture B's three queries.
 const B_QUERIES: [&str; 3] = ["{}", r#"{ span.s =~ ".+" }"#, r#"{ span.arr != nil }"#];
@@ -6615,14 +6629,22 @@ async fn search_statement_answers_as_today_on_fixture_c() {
             }
         }
     }
+    for (limit, spss) in LIMIT_SPSS {
+        let got = statement(&client_z, &parse_query(RZ_MIXED), window, limit, spss).await;
+        if !got.as_ref().is_ok_and(|o| o.traces.is_empty()) {
+            mismatches.push(format!(
+                "{RZ_MIXED} (limit {limit}, spss {spss})\n  want: no trace\n  statement: {got:?}"
+            ));
+        }
+    }
     for db in [&db_c, &db_z, &db_b, &db_p] {
         drop_db(db).await;
     }
     eprintln!("compared {} queries × 3", cases.len());
     assert_eq!(
         cases.len(),
-        172,
-        "82 corpus, 42 catalogue, 8 RZ, 3 B and 37 P queries"
+        171,
+        "82 corpus, 42 catalogue, 7 RZ, 3 B and 37 P queries"
     );
     assert!(
         mismatches.is_empty(),
@@ -7385,8 +7407,21 @@ async fn search_routed_answers_as_today_on_fixture_c() {
                 wrong.push(format!("{ctx}: not covered"));
                 continue;
             }
-            let today = engine.search(&plan).await.map(normalise_today);
             let routed = engine.search_routed(&plan).await;
+            // Issue #602 part 1 (D2): `d1` has no `service.name`, which the
+            // statement projects nothing for and today's engine projects as
+            // an empty string, so its answer is not compared.
+            if label == "noservice" {
+                let projected = selected_answer_of(&routed);
+                if answer_of(&routed) != literal || projected != NOSERVICE_PROJECTED {
+                    wrong.push(format!(
+                        "{ctx}\n  literal: {literal}; {NOSERVICE_PROJECTED}\n  routed:  {}; {projected}",
+                        answer_of(&routed)
+                    ));
+                }
+                continue;
+            }
+            let today = engine.search(&plan).await.map(normalise_today);
             if format!("{today:?}") != format!("{routed:?}") {
                 wrong.push(format!(
                     "{ctx}\n  today:  {}\n  routed: {}",
@@ -7591,6 +7626,10 @@ fn pipeline_fixtures(base_ns: i64) -> Vec<PipelineFixture> {
         ),
     ]
 }
+
+/// The `noservice` fixture's projection, [`selected_answer_of`]'s: `d1`'s
+/// span carries no `service.name` entry.
+const NOSERVICE_PROJECTED: &str = "d1 [1f ]; d2 [20 service.name=svc]";
 
 /// Issue #592 part 1's pipeline shapes beyond the corpus: later `{…}`
 /// filters and `select()` after a single filter, and part 2's `by()` and
@@ -7906,7 +7945,7 @@ async fn search_routed_answers_a_run_time_demand_on_todays_engine() {
     let demand = "expression (!.a) expected a boolean";
     let cases = [
         (r#"{ !.a = .b }"#, true, Err(demand)),
-        (r#"{ !.a = 1 }"#, false, Err(demand)),
+        (r#"{ !.a = 1 }"#, true, Err(demand)),
         (r#"{ .a }"#, true, Ok(1usize)),
     ];
     let mut wrong = Vec::new();
@@ -8528,21 +8567,22 @@ async fn a_filter_before_or_after_by_keeps_todays_group_order() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
-/// Each kind of stored value groups as today's engine renders it: an
-/// array as its JSON, which the statement answers; a key-value list and
-/// bytes, which it hands to today's engine.
+/// Each kind of stored value groups on the statement, one statement each,
+/// as the reference types it (issue #602 part 1, D5): a typed array as its
+/// JSON; a key-value list and bytes are missing, the `nil` group. Only the
+/// `arr` row, which holds no such value, is compared with today's engine.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn by_keeps_todays_value_kinds() {
+async fn by_reads_typed_values_only() {
     skip_unless_live!();
     let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
     let window = (base_ns, base_ns + BY_WINDOW_NS);
     let (db, client) = seed_by_fixture("values", "values", base_ns).await;
     let engine = engine_of(&db).await;
     let mut wrong = Vec::new();
-    for (query, literal, answered) in [
+    for (query, literal, compared) in [
         (
             r#"{ name = "all" } | by(span.v)"#,
-            r#"90 7 [91, 92, 93, 94, 95, 96, 97] {["x","y"] 1 [91]; {"a":1,"b":"z"} 1 [92]; AQID 1 [93]; [1,2] 1 [94]; x 1 [95]; nil 1 [96]; [] 1 [97]}"#,
+            r#"90 7 [91, 92, 93, 94, 95, 96, 97] {["x","y"] 1 [91]; nil 3 [92, 93, 96]; [1,2] 1 [94]; x 1 [95]; [] 1 [97]}"#,
             false,
         ),
         (
@@ -8552,12 +8592,12 @@ async fn by_keeps_todays_value_kinds() {
         ),
         (
             r#"{ name = "kv" } | by(span.kvx)"#,
-            r#"92 2 [b1, b2] {{"a":1,"b":"z"} 1 [b1]; x 1 [b2]}"#,
+            "92 2 [b1, b2] {nil 1 [b1]; x 1 [b2]}",
             false,
         ),
         (
             r#"{ name = "bytes" } | by(span.bytesx)"#,
-            "93 2 [c1, c2] {AQID 1 [c1]; x 1 [c2]}",
+            "93 2 [c1, c2] {nil 1 [c1]; x 1 [c2]}",
             false,
         ),
     ] {
@@ -8568,12 +8608,16 @@ async fn by_keeps_todays_value_kinds() {
             ));
         }
         let (today, routed, statements) = routed_and_today(&engine, &client, &db, &plan).await;
-        check_grouped(&mut wrong, query, &today, &routed, literal);
-        if (statements == 1) != answered {
+        if compared {
+            check_grouped(&mut wrong, query, &today, &routed, literal);
+        } else if grouped_answer_of(&routed) != literal {
             wrong.push(format!(
-                "{query}: {statements} statements; the statement must {} it",
-                if answered { "answer" } else { "hand over" }
+                "{query}\n  literal: {literal}\n  routed:  {}",
+                grouped_answer_of(&routed)
             ));
+        }
+        if statements != 1 {
+            wrong.push(format!("{query}: {statements} statements, want 1"));
         }
     }
     drop_db(&db).await;
@@ -9113,238 +9157,87 @@ fn off_scope_fixture(base_ns: i64) -> Vec<ExportTraceServiceRequest> {
     bodies
 }
 
-/// How a row of [`OFF_SCOPE_ROWS`] must be answered.
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum Route {
-    /// The statement hands the request to today's engine.
-    HandOver,
-    /// Today's engine answers it before the fork (an aggregate over a
-    /// scope the statement does not serve, section 3.1).
-    Refused,
-    /// The statement answers it, one statement.
-    Statement,
-}
-
-/// `(query, literal answer, route)`. A `select()` row's literal is
+/// `(query, literal answer)`. A `select()` row's literal is
 /// [`selected_answer_of`]'s, an aggregate's [`grouped_answer_of`]'s.
-const OFF_SCOPE_ROWS: &[(&str, &str, Route)] = &[
-    (
-        r#"{ name = "spanb" } | select(span.x)"#,
-        r#"a0 [a0 x=1234]"#,
-        Route::HandOver,
-    ),
-    (
-        r#"{ name = "spanb" } | select(.x)"#,
-        r#"a0 [a0 x=1234]"#,
-        Route::HandOver,
-    ),
-    (
-        r#"{ name = "spanb" } | min(span.x) < 10000"#,
-        r#"a0 1 [a0] {double:1234 1 [a0]}"#,
-        Route::HandOver,
-    ),
-    (
-        r#"{ name = "spanb" } | min(.x) < 10000"#,
-        r#"a0 1 [a0] {double:1234 1 [a0]}"#,
-        Route::HandOver,
-    ),
-    (
-        r#"{ name = "spank" } | select(span.x)"#,
-        r#"a1 [a1 x={"a":1}]"#,
-        Route::HandOver,
-    ),
-    (
-        r#"{ name = "spank" } | select(.x)"#,
-        r#"a1 [a1 x={"a":1}]"#,
-        Route::HandOver,
-    ),
-    (
-        r#"{ name = "spank" } | min(span.x) < 10000"#,
-        r#""#,
-        Route::HandOver,
-    ),
-    (
-        r#"{ name = "spank" } | min(.x) < 10000"#,
-        r#""#,
-        Route::HandOver,
-    ),
+const OFF_SCOPE_ROWS: &[(&str, &str)] = &[
+    (r#"{ name = "spanb" } | select(span.x)"#, r#"a0 [a0 ]"#),
+    (r#"{ name = "spanb" } | select(.x)"#, r#"a0 [a0 ]"#),
+    (r#"{ name = "spanb" } | min(span.x) < 10000"#, r#""#),
+    (r#"{ name = "spanb" } | min(.x) < 10000"#, r#""#),
+    (r#"{ name = "spank" } | select(span.x)"#, r#"a1 [a1 ]"#),
+    (r#"{ name = "spank" } | select(.x)"#, r#"a1 [a1 ]"#),
+    (r#"{ name = "spank" } | min(span.x) < 10000"#, r#""#),
+    (r#"{ name = "spank" } | min(.x) < 10000"#, r#""#),
     (
         r#"{ name = "resourceb" } | select(resource.x)"#,
-        r#"a2 [a2 x=1234]"#,
-        Route::HandOver,
+        r#"a2 [a2 ]"#,
     ),
-    (
-        r#"{ name = "resourceb" } | select(.x)"#,
-        r#"a2 [a2 x=1234]"#,
-        Route::HandOver,
-    ),
-    (
-        r#"{ name = "resourceb" } | min(resource.x) < 10000"#,
-        r#"a2 1 [a2] {double:1234 1 [a2]}"#,
-        Route::Refused,
-    ),
-    (
-        r#"{ name = "resourceb" } | min(.x) < 10000"#,
-        r#"a2 1 [a2] {double:1234 1 [a2]}"#,
-        Route::HandOver,
-    ),
+    (r#"{ name = "resourceb" } | select(.x)"#, r#"a2 [a2 ]"#),
+    (r#"{ name = "resourceb" } | min(resource.x) < 10000"#, r#""#),
+    (r#"{ name = "resourceb" } | min(.x) < 10000"#, r#""#),
     (
         r#"{ name = "resourcek" } | select(resource.x)"#,
-        r#"a3 [a3 x={"a":1}]"#,
-        Route::HandOver,
+        r#"a3 [a3 ]"#,
     ),
-    (
-        r#"{ name = "resourcek" } | select(.x)"#,
-        r#"a3 [a3 x={"a":1}]"#,
-        Route::HandOver,
-    ),
-    (
-        r#"{ name = "resourcek" } | min(resource.x) < 10000"#,
-        r#""#,
-        Route::Refused,
-    ),
-    (
-        r#"{ name = "resourcek" } | min(.x) < 10000"#,
-        r#""#,
-        Route::HandOver,
-    ),
-    (
-        r#"{ name = "eventb" } | select(event.x)"#,
-        r#"a4 [a4 x=1234]"#,
-        Route::HandOver,
-    ),
-    (
-        r#"{ name = "eventb" } | select(.x)"#,
-        r#"a4 [a4 x=1234]"#,
-        Route::HandOver,
-    ),
-    (
-        r#"{ name = "eventb" } | min(event.x) < 10000"#,
-        r#"a4 1 [a4] {double:1234 1 [a4]}"#,
-        Route::Refused,
-    ),
-    (
-        r#"{ name = "eventb" } | min(.x) < 10000"#,
-        r#"a4 1 [a4] {double:1234 1 [a4]}"#,
-        Route::HandOver,
-    ),
-    (
-        r#"{ name = "eventk" } | select(event.x)"#,
-        r#"a5 [a5 x={"a":1}]"#,
-        Route::HandOver,
-    ),
-    (
-        r#"{ name = "eventk" } | select(.x)"#,
-        r#"a5 [a5 x={"a":1}]"#,
-        Route::HandOver,
-    ),
-    (
-        r#"{ name = "eventk" } | min(event.x) < 10000"#,
-        r#""#,
-        Route::Refused,
-    ),
-    (
-        r#"{ name = "eventk" } | min(.x) < 10000"#,
-        r#""#,
-        Route::HandOver,
-    ),
-    (
-        r#"{ name = "linkb" } | select(link.x)"#,
-        r#"a6 [a6 x=1234]"#,
-        Route::HandOver,
-    ),
-    (
-        r#"{ name = "linkb" } | select(.x)"#,
-        r#"a6 [a6 x=1234]"#,
-        Route::HandOver,
-    ),
-    (
-        r#"{ name = "linkb" } | min(link.x) < 10000"#,
-        r#"a6 1 [a6] {double:1234 1 [a6]}"#,
-        Route::Refused,
-    ),
-    (
-        r#"{ name = "linkb" } | min(.x) < 10000"#,
-        r#"a6 1 [a6] {double:1234 1 [a6]}"#,
-        Route::HandOver,
-    ),
-    (
-        r#"{ name = "linkk" } | select(link.x)"#,
-        r#"a7 [a7 x={"a":1}]"#,
-        Route::HandOver,
-    ),
-    (
-        r#"{ name = "linkk" } | select(.x)"#,
-        r#"a7 [a7 x={"a":1}]"#,
-        Route::HandOver,
-    ),
-    (
-        r#"{ name = "linkk" } | min(link.x) < 10000"#,
-        r#""#,
-        Route::Refused,
-    ),
-    (
-        r#"{ name = "linkk" } | min(.x) < 10000"#,
-        r#""#,
-        Route::HandOver,
-    ),
+    (r#"{ name = "resourcek" } | select(.x)"#, r#"a3 [a3 ]"#),
+    (r#"{ name = "resourcek" } | min(resource.x) < 10000"#, r#""#),
+    (r#"{ name = "resourcek" } | min(.x) < 10000"#, r#""#),
+    (r#"{ name = "eventb" } | select(event.x)"#, r#"a4 [a4 ]"#),
+    (r#"{ name = "eventb" } | select(.x)"#, r#"a4 [a4 ]"#),
+    (r#"{ name = "eventb" } | min(event.x) < 10000"#, r#""#),
+    (r#"{ name = "eventb" } | min(.x) < 10000"#, r#""#),
+    (r#"{ name = "eventk" } | select(event.x)"#, r#"a5 [a5 ]"#),
+    (r#"{ name = "eventk" } | select(.x)"#, r#"a5 [a5 ]"#),
+    (r#"{ name = "eventk" } | min(event.x) < 10000"#, r#""#),
+    (r#"{ name = "eventk" } | min(.x) < 10000"#, r#""#),
+    (r#"{ name = "linkb" } | select(link.x)"#, r#"a6 [a6 ]"#),
+    (r#"{ name = "linkb" } | select(.x)"#, r#"a6 [a6 ]"#),
+    (r#"{ name = "linkb" } | min(link.x) < 10000"#, r#""#),
+    (r#"{ name = "linkb" } | min(.x) < 10000"#, r#""#),
+    (r#"{ name = "linkk" } | select(link.x)"#, r#"a7 [a7 ]"#),
+    (r#"{ name = "linkk" } | select(.x)"#, r#"a7 [a7 ]"#),
+    (r#"{ name = "linkk" } | min(link.x) < 10000"#, r#""#),
+    (r#"{ name = "linkk" } | min(.x) < 10000"#, r#""#),
     (
         r#"{ name = "instrumentationb" } | select(instrumentation.x)"#,
-        r#"a8 [a8 x=1234]"#,
-        Route::HandOver,
+        r#"a8 [a8 ]"#,
     ),
     (
         r#"{ name = "instrumentationb" } | select(.x)"#,
-        r#"a8 [a8 x=1234]"#,
-        Route::HandOver,
+        r#"a8 [a8 ]"#,
     ),
     (
         r#"{ name = "instrumentationb" } | min(instrumentation.x) < 10000"#,
-        r#"a8 1 [a8] {double:1234 1 [a8]}"#,
-        Route::Refused,
+        r#""#,
     ),
-    (
-        r#"{ name = "instrumentationb" } | min(.x) < 10000"#,
-        r#"a8 1 [a8] {double:1234 1 [a8]}"#,
-        Route::HandOver,
-    ),
+    (r#"{ name = "instrumentationb" } | min(.x) < 10000"#, r#""#),
     (
         r#"{ name = "instrumentationk" } | select(instrumentation.x)"#,
-        r#"a9 [a9 x={"a":1}]"#,
-        Route::HandOver,
+        r#"a9 [a9 ]"#,
     ),
     (
         r#"{ name = "instrumentationk" } | select(.x)"#,
-        r#"a9 [a9 x={"a":1}]"#,
-        Route::HandOver,
+        r#"a9 [a9 ]"#,
     ),
     (
         r#"{ name = "instrumentationk" } | min(instrumentation.x) < 10000"#,
         r#""#,
-        Route::Refused,
     ),
-    (
-        r#"{ name = "instrumentationk" } | min(.x) < 10000"#,
-        r#""#,
-        Route::HandOver,
-    ),
-    (
-        r#"{ name = "int" } | select(span.x)"#,
-        r#"aa [aa x=int:5]"#,
-        Route::Statement,
-    ),
+    (r#"{ name = "instrumentationk" } | min(.x) < 10000"#, r#""#),
+    (r#"{ name = "int" } | select(span.x)"#, r#"aa [aa x=int:5]"#),
     (
         r#"{ name = "shadow" } | min(.x) < 10000"#,
-        r#""#,
-        Route::HandOver,
+        r#"ab 1 [ab] {int:9 1 [ab]}"#,
     ),
 ];
 
 /// Every scope, scoped and unscoped, bytes and a key-value list, through
-/// an aggregate and `select()`: each answer is today's and its literal,
-/// routed as the row says.
+/// an aggregate and `select()`: each is missing, as the reference reads it
+/// (issue #602 part 1, D5) — `select()` projects nothing and an aggregate
+/// skips it — and each row is the statement's, one statement. Today's
+/// engine renders the value, so its answer is not compared.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_off_path_value_at_any_scope_is_answered_as_today() {
+async fn a_value_the_reference_cannot_type_is_missing() {
     skip_unless_live!();
     let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
     let bodies = off_scope_fixture(base_ns);
@@ -9357,7 +9250,7 @@ async fn an_off_path_value_at_any_scope_is_answered_as_today() {
     .await;
     let engine = engine_of(&db).await;
     let mut wrong = Vec::new();
-    for (query, literal, route) in OFF_SCOPE_ROWS {
+    for (query, literal) in OFF_SCOPE_ROWS {
         let plan = plan_of(
             &engine,
             &parse_query(query),
@@ -9365,34 +9258,27 @@ async fn an_off_path_value_at_any_scope_is_answered_as_today() {
             20,
             3,
         );
-        let (today, routed, n) = routed_and_today(&engine, &client, &db, &plan).await;
-        let answer =
-            |o: &Result<pulsus_read::traces::SearchOutput, pulsus_read::logql::ReadError>| {
-                if query.contains("select(") {
-                    selected_answer_of(o)
-                } else {
-                    grouped_answer_of(o)
-                }
-            };
-        if format!("{today:?}") != format!("{routed:?}") {
+        if !covered(&plan) {
+            wrong.push(format!("{query}: not covered"));
+        }
+        let t0 = now_ns();
+        let routed = engine.search_routed(&plan).await.map(normalise_today);
+        let answer = if query.contains("select(") {
+            selected_answer_of(&routed)
+        } else {
+            grouped_answer_of(&routed)
+        };
+        if answer != *literal {
             wrong.push(format!(
-                "{query}\n  today:  {}\n  routed: {}",
-                answer(&today),
-                answer(&routed)
-            ));
-        } else if answer(&routed) != *literal {
-            wrong.push(format!(
-                "{query}\n  literal: {literal}\n  both:    {}",
-                answer(&routed)
+                "{query}\n  literal: {literal}\n  routed:  {answer}"
             ));
         }
-        let got = match (covered(&plan), n) {
-            (false, _) => Route::Refused,
-            (true, 1) => Route::Statement,
-            (true, _) => Route::HandOver,
-        };
-        if got != *route {
-            wrong.push(format!("{query}: {got:?} ({n} statements), want {route:?}"));
+        if routed.is_err() {
+            continue;
+        }
+        let (n, _) = settled_statements(&client, &db, t0).await;
+        if n != 1 {
+            wrong.push(format!("{query}: {n} statements, want 1"));
         }
     }
     drop_db(&db).await;
@@ -15570,6 +15456,675 @@ async fn the_seven_filter_metrics_shapes() {
                 wrong.push(format!("{q} ({form})\n  want {want:?}\n  got  {got:?}"));
             }
         }
+    }
+    drop_db(&db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+// =====================================================================
+// Issue #602 part 1 — every key, aggregate argument and projected value
+// the previous engine reads, read by the statement
+// =====================================================================
+
+/// Issue #602 part 1's fixture K: trace `d1`, six server spans `01`–`06`
+/// in three pushes, one resource and one scope each. `.u` is `"span"` on
+/// 01 (span), `"res"` on 02 (resource), `3` on 03 (the first event holding
+/// it, not `9`), `true` on 04 (link), `2.5` on 05 (instrumentation) and
+/// missing on 06.
+fn keys_fixture(base_ns: i64) -> Vec<ExportTraceServiceRequest> {
+    const S: i64 = 1_000_000_000;
+    const MS: i64 = 1_000_000;
+    let t = vec![0xd1u8; 16];
+    let id = |n: u8| vec![0, 0, 0, 0, 0, 0, 0, n];
+    #[allow(clippy::too_many_arguments)]
+    let sp = |n: u8,
+              parent: Vec<u8>,
+              at_s: i64,
+              dur_ms: i64,
+              attrs: Vec<KeyValue>,
+              status: Option<(i32, &str)>,
+              events: Vec<span::Event>,
+              links: Vec<span::Link>| {
+        span_with_message(
+            t.clone(),
+            id(n),
+            parent,
+            &format!("k{n}"),
+            2,
+            base_ns + at_s * S,
+            dur_ms * MS,
+            attrs,
+            status,
+            events,
+            links,
+        )
+    };
+    let p1 = group_request(
+        vec![
+            kv("service.name", str_value("svc-k")),
+            kv("u", str_value("res")),
+            kv("rk", int_value(7)),
+        ],
+        scope_named("lib-a", "1.0", vec![kv("sk", str_value("s1"))]),
+        vec![
+            sp(
+                1,
+                Vec::new(),
+                1,
+                100,
+                vec![kv("u", str_value("span")), kv("f", bool_value(false))],
+                Some((2, "boom")),
+                Vec::new(),
+                Vec::new(),
+            ),
+            sp(2, id(1), 2, 100, Vec::new(), None, Vec::new(), Vec::new()),
+        ],
+    );
+    let p2 = group_request(
+        vec![kv("service.name", str_value("svc-k"))],
+        scope_named("lib-b", "2.0", vec![kv("u", double_value(2.5))]),
+        vec![
+            sp(
+                3,
+                id(1),
+                3,
+                200,
+                Vec::new(),
+                Some((2, "boom")),
+                vec![
+                    event_of(base_ns + 3 * S, "ev0", Vec::new()),
+                    event_of(base_ns + 3 * S + MS, "ev1", vec![kv("u", int_value(3))]),
+                    event_of(base_ns + 3 * S + 2 * MS, "ev2", vec![kv("u", int_value(9))]),
+                ],
+                Vec::new(),
+            ),
+            sp(
+                4,
+                id(2),
+                4,
+                200,
+                Vec::new(),
+                None,
+                Vec::new(),
+                vec![link_of(
+                    vec![0x77; 16],
+                    vec![0x77; 8],
+                    vec![kv("u", bool_value(true)), kv("lk", int_value(4))],
+                )],
+            ),
+            sp(
+                5,
+                id(2),
+                5,
+                300,
+                Vec::new(),
+                Some((1, "fine")),
+                Vec::new(),
+                Vec::new(),
+            ),
+        ],
+    );
+    let p3 = group_request(
+        vec![kv("service.name", str_value("svc-k"))],
+        scope_named("lib-c", "", Vec::new()),
+        vec![sp(
+            6,
+            id(3),
+            6,
+            300,
+            Vec::new(),
+            None,
+            Vec::new(),
+            Vec::new(),
+        )],
+    );
+    vec![p1, p2, p3]
+}
+
+/// Section 4.2's cases on fixture K: `(id, query, literal)`. A `K-P` row's
+/// literal is [`selected_answer_of`]'s, any other [`grouped_answer_of`]'s.
+const KEYS_CASES: [(&str, &str, &str); 27] = [
+    (
+        "K-B1",
+        "{ } | by(.u)",
+        "d1 6 [01, 02, 03] {span 1 [01]; res 1 [02]; int:3 1 [03]; bool:true 1 [04]; double:2.5 1 [05]; nil 1 [06]}",
+    ),
+    (
+        "K-B2",
+        "{ } | by(resource.u)",
+        "d1 6 [01, 02, 03] {res 2 [01, 02]; nil 4 [03, 04, 05]}",
+    ),
+    (
+        "K-B3",
+        "{ } | by(resource.rk)",
+        "d1 6 [01, 02, 03] {int:7 2 [01, 02]; nil 4 [03, 04, 05]}",
+    ),
+    (
+        "K-B4",
+        "{ } | by(instrumentation.u)",
+        "d1 6 [01, 02, 03] {nil 3 [01, 02, 06]; double:2.5 3 [03, 04, 05]}",
+    ),
+    (
+        "K-B5",
+        "{ } | by(event.u)",
+        "d1 6 [01, 02, 03] {nil 5 [01, 02, 04]; int:3 1 [03]}",
+    ),
+    (
+        "K-B6",
+        "{ } | by(link.u)",
+        "d1 6 [01, 02, 03] {nil 5 [01, 02, 03]; bool:true 1 [04]}",
+    ),
+    (
+        "K-B7",
+        "{ } | by(duration)",
+        "d1 6 [01, 02, 03] {100ms 2 [01, 02]; 200ms 2 [03, 04]; 300ms 2 [05, 06]}",
+    ),
+    (
+        "K-B8",
+        "{ } | by(statusMessage)",
+        "d1 6 [01, 02, 03] {boom 2 [01, 03];  3 [02, 04, 06]; fine 1 [05]}",
+    ),
+    (
+        "K-B9",
+        "{ } | by(span:parentID)",
+        "d1 6 [01, 02, 03] {0000000000000000 1 [01]; 0000000000000001 2 [02, 03]; 0000000000000002 2 [04, 05]; 0000000000000003 1 [06]}",
+    ),
+    (
+        "K-B10",
+        "{ } | by(span:id)",
+        "d1 6 [01, 02, 03] {0000000000000001 1 [01]; 0000000000000002 1 [02]; 0000000000000003 1 [03]; 0000000000000004 1 [04]; 0000000000000005 1 [05]; 0000000000000006 1 [06]}",
+    ),
+    (
+        "K-B11",
+        "{ } | by(instrumentation:name)",
+        "d1 6 [01, 02, 03] {lib-a 2 [01, 02]; lib-b 3 [03, 04, 05]; lib-c 1 [06]}",
+    ),
+    (
+        "K-B12",
+        "{ } | by(instrumentation:version)",
+        "d1 6 [01, 02, 03] {1.0 2 [01, 02]; 2.0 3 [03, 04, 05];  1 [06]}",
+    ),
+    (
+        "K-B13",
+        "{ } | by(.service.name)",
+        "d1 6 [01, 02, 03] {svc-k 6 [01, 02, 03]}",
+    ),
+    (
+        "K-A1",
+        "{ } | sum(resource.rk) > 0",
+        "d1 6 [01, 02, 03] {int:14 6 [01, 02, 03]}",
+    ),
+    (
+        "K-A2",
+        "{ } | max(instrumentation.u) > 2",
+        "d1 6 [01, 02, 03] {double:2.5 6 [01, 02, 03]}",
+    ),
+    (
+        "K-A3",
+        "{ } | max(event.u) > 0",
+        "d1 6 [01, 02, 03] {int:3 6 [01, 02, 03]}",
+    ),
+    (
+        "K-A4",
+        "{ } | avg(link.lk) > 1",
+        "d1 6 [01, 02, 03] {double:4 6 [01, 02, 03]}",
+    ),
+    ("K-P1", "{ !.f = true }", "d1 [01 ]"),
+    ("K-P2", "{ !span.f = true }", "d1 [01 ]"),
+    ("K-P3", "{ (.u = 3) = true }", "d1 [03 ]"),
+    ("K-P4", r#"{ (span.u = "span") = true }"#, "d1 [01 ]"),
+    ("K-P5", "{ (event.u = 3) = true }", "d1 [03 ]"),
+    (
+        "K-P6",
+        r#"{ (statusMessage = "boom") = true }"#,
+        "d1 [01 , 03 ]",
+    ),
+    (
+        "K-P7",
+        r#"{ !(statusMessage = "boom") = false }"#,
+        "d1 [01 , 03 ]",
+    ),
+    (
+        "K-P8",
+        r#"{ (resource.service.name = "svc-k") = true }"#,
+        "d1 [01 , 02 , 03 ]",
+    ),
+    (
+        "K-P9",
+        r#"{ (instrumentation:name = "lib-a") = true }"#,
+        "d1 [01 , 02 ]",
+    ),
+    ("K-P10", r#"{ (name = "k1") = true }"#, "d1 [01 ]"),
+];
+
+/// Section 4.2: every key, aggregate argument and boolean-valued operand
+/// of fixture K is the statement's — covered, one statement — and answers
+/// as the previous engine does and as its literal says.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_key_and_aggregate_scope_is_the_statements() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let (db, client) = seed_both(
+        pulsus_testkit::test_db("pulsus_read_it_t602p1_keys"),
+        &keys_fixture(base_ns),
+        6,
+        "t602p1-keys",
+    )
+    .await;
+    let engine = engine_of(&db).await;
+    let window = (base_ns, base_ns + 60_000_000_000);
+    let mut wrong = Vec::new();
+    for (id, query, literal) in KEYS_CASES {
+        let plan = plan_of(&engine, &parse_query(query), window, 20, 3);
+        if !covered(&plan) {
+            wrong.push(format!("{id} {query}: not covered"));
+        }
+        let (today, routed, statements) = routed_and_today(&engine, &client, &db, &plan).await;
+        if statements != 1 {
+            wrong.push(format!("{id} {query}: {statements} statements, want 1"));
+        }
+        let answer =
+            |o: &Result<pulsus_read::traces::SearchOutput, pulsus_read::logql::ReadError>| {
+                if id.starts_with("K-P") {
+                    selected_answer_of(o)
+                } else {
+                    grouped_answer_of(o)
+                }
+            };
+        if format!("{today:?}") != format!("{routed:?}") {
+            wrong.push(format!(
+                "{id} {query}\n  previous: {}\n  routed:   {}",
+                answer(&today),
+                answer(&routed)
+            ));
+        }
+        if answer(&routed) != literal {
+            wrong.push(format!(
+                "{id} {query}\n  literal: {literal}\n  routed:  {}",
+                answer(&routed)
+            ));
+        }
+        if id == "K-P10" {
+            let name = routed
+                .as_ref()
+                .ok()
+                .and_then(|o| o.traces.first())
+                .and_then(|t| t.spans.first())
+                .map(|s| s.name().map(str::to_string));
+            if name != Some(None) {
+                wrong.push(format!("{id} {query}: span 01 carries name {name:?}"));
+            }
+        }
+    }
+    drop_db(&db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// An array of `values`, whatever their types.
+fn any_array(values: Vec<AnyValue>) -> AnyValue {
+    AnyValue {
+        value: Some(any_value::Value::ArrayValue(ArrayValue { values })),
+    }
+}
+
+/// Issue #602 part 1's fixture U: trace `e1`, four server spans `01`–`04`,
+/// each pushed in its own resource: values the reference does not type —
+/// an array mixing element types, a key-value list, bytes — beside typed
+/// arrays, and `service.name` sent as a string, an int, a key-value list
+/// and bytes.
+fn untyped_fixture(base_ns: i64) -> Vec<ExportTraceServiceRequest> {
+    const S: i64 = 1_000_000_000;
+    const MS: i64 = 1_000_000;
+    let mixed = || any_array(vec![int_value(1), str_value("x")]);
+    let sp = |n: u8, attrs: Vec<KeyValue>| {
+        span_with_message(
+            vec![0xe1; 16],
+            vec![0, 0, 0, 0, 0, 0, 0, n],
+            Vec::new(),
+            "u",
+            2,
+            base_ns + i64::from(n) * S,
+            100 * MS,
+            attrs,
+            None,
+            Vec::new(),
+            Vec::new(),
+        )
+    };
+    let lib = || scope_named("lib-u", "1.0", Vec::new());
+    vec![
+        group_request(
+            vec![kv("service.name", str_value("svc-u"))],
+            lib(),
+            vec![sp(
+                1,
+                vec![
+                    kv("m", mixed()),
+                    kv("mx", mixed()),
+                    kv("bd", any_array(vec![bool_value(true), bool_value(false)])),
+                    kv("dd", any_array(vec![double_value(1.5), double_value(2.5)])),
+                ],
+            )],
+        ),
+        group_request(
+            vec![kv("service.name", int_value(7))],
+            lib(),
+            vec![sp(2, vec![kv("m", str_value("s"))])],
+        ),
+        group_request(
+            vec![
+                kv("service.name", kvlist_value(vec![kv("a", int_value(1))])),
+                kv("m", int_value(4)),
+            ],
+            lib(),
+            vec![sp(3, Vec::new())],
+        ),
+        group_request(
+            vec![
+                kv("service.name", bytes_value(&[1, 2, 3])),
+                kv("m", int_value(9)),
+            ],
+            lib(),
+            vec![sp(4, vec![kv("m", mixed())])],
+        ),
+    ]
+}
+
+/// Section 4.3's search cases on fixture U: `(id, query, literal,
+/// statements)`. A `by()` or aggregate row's literal is
+/// [`grouped_answer_of`]'s, any other [`selected_answer_of`]'s. U8's second
+/// statement is the series cap's probe, which a `by(resource.service.name)`
+/// search runs first.
+const UNTYPED_CASES: [(&str, &str, &str, u64); 15] = [
+    (
+        "U1",
+        "{ } | by(span.m)",
+        "e1 4 [01, 02, 03, 04] {nil 3 [01, 03, 04]; s 1 [02]}",
+        1,
+    ),
+    (
+        "U2",
+        "{ } | by(.m)",
+        "e1 4 [01, 02, 03, 04] {nil 1 [01]; s 1 [02]; int:4 1 [03]; int:9 1 [04]}",
+        1,
+    ),
+    (
+        "U3",
+        "{ } | select(span.m)",
+        "e1 [01 , 02 m=s, 03 , 04 ]",
+        1,
+    ),
+    ("U4", "{ span.m != nil }", "e1 [02 m=s]", 1),
+    (
+        "U5",
+        "{ } | max(.m) > 0",
+        "e1 4 [01, 02, 03, 04] {int:9 4 [01, 02, 03, 04]}",
+        1,
+    ),
+    (
+        "U6",
+        "{ } | by(span.bd)",
+        "e1 4 [01, 02, 03, 04] {[true,false] 1 [01]; nil 3 [02, 03, 04]}",
+        1,
+    ),
+    (
+        "U7",
+        "{ } | by(span.dd)",
+        "e1 4 [01, 02, 03, 04] {[1.5,2.5] 1 [01]; nil 3 [02, 03, 04]}",
+        1,
+    ),
+    (
+        "U8",
+        "{ } | by(resource.service.name)",
+        "e1 4 [01, 02, 03, 04] {svc-u 1 [01]; nil 3 [02, 03, 04]}",
+        2,
+    ),
+    (
+        "U9",
+        "{ } | by(.service.name)",
+        "e1 4 [01, 02, 03, 04] {svc-u 1 [01]; nil 3 [02, 03, 04]}",
+        1,
+    ),
+    (
+        "U10",
+        "{ } | select(resource.service.name)",
+        "e1 [01 service.name=svc-u, 02 , 03 , 04 ]",
+        1,
+    ),
+    (
+        "U11",
+        "{ resource.service.name != nil }",
+        "e1 [01 service.name=svc-u]",
+        1,
+    ),
+    ("U12", "{ !span.mx }", "", 1),
+    ("U13", "{ !.mx }", "", 1),
+    ("U14", "{ .m = 9 }", "e1 [04 m=int:9]", 1),
+    (
+        "U15",
+        r#"{ resource.service.name != "zz" }"#,
+        "e1 [01 service.name=svc-u, 02 , 03 , 04 ]",
+        1,
+    ),
+];
+
+/// Section 4.3's metrics cases on fixture U: `(id, query, count)`.
+const UNTYPED_METRICS_CASES: [(&str, &str, f64); 3] = [
+    ("M1", "{ span.m != nil } | count_over_time()", 1.0),
+    ("M2", "{ .m = 9 } | count_over_time()", 1.0),
+    (
+        "M3",
+        "{ resource.service.name != nil } | count_over_time()",
+        1.0,
+    ),
+];
+
+/// Section 4.3 (D2, D5): a value is held only at a type the reference
+/// gives it — an array mixing element types, a key-value list and bytes are
+/// missing to every read, and `service.name` is held only as a string — in
+/// a search and in a metrics filter alike.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_value_is_held_only_as_the_reference_types_it() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let (db, client) = seed_both(
+        pulsus_testkit::test_db("pulsus_read_it_t602p1_untyped"),
+        &untyped_fixture(base_ns),
+        4,
+        "t602p1-untyped",
+    )
+    .await;
+    let engine = engine_of(&db).await;
+    let window = (base_ns, base_ns + 60_000_000_000);
+    let mut wrong = Vec::new();
+    for (id, query, literal, want_statements) in UNTYPED_CASES {
+        let plan = plan_of(&engine, &parse_query(query), window, 20, 10);
+        if !covered(&plan) {
+            wrong.push(format!("{id} {query}: not covered"));
+        }
+        let t0 = now_ns();
+        let routed = engine.search_routed(&plan).await.map(normalise_today);
+        let answer = if query.contains("by(") || query.contains(" > ") {
+            grouped_answer_of(&routed)
+        } else {
+            selected_answer_of(&routed)
+        };
+        if answer != literal {
+            wrong.push(format!(
+                "{id} {query}\n  literal: {literal}\n  routed:  {answer}"
+            ));
+        }
+        if routed.is_err() {
+            continue;
+        }
+        let (statements, _) = settled_statements(&client, &db, t0).await;
+        if statements != want_statements {
+            wrong.push(format!(
+                "{id} {query}: {statements} statements, want {want_statements}"
+            ));
+        }
+    }
+    let metrics = metrics_engine(&db, 1_000).await;
+    let s0 = base_ns / 1_000_000_000;
+    for (id, query, want) in UNTYPED_METRICS_CASES {
+        let got = instant_answer(&metrics, query, s0, s0 + 60).await.map(|r| {
+            r.series
+                .iter()
+                .map(|s| s.samples.iter().map(|(_, v)| *v).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        });
+        if got.as_ref().ok() != Some(&vec![vec![want]]) {
+            wrong.push(format!("{id} {query}: want [[{want}]], got {got:?}"));
+        }
+    }
+    drop_db(&db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Issue #602 part 1's fixture W: four one-span traces, each in its own
+/// resource, `service.name` sent as `false` (`f1`/01), `true` (`f1`/02),
+/// `7` (`f2`/03) and `"svc-w"` (`f3`/04), at +1, +2, +31 and +51 s.
+fn service_not_fixture(base_ns: i64) -> Vec<ExportTraceServiceRequest> {
+    const S: i64 = 1_000_000_000;
+    const MS: i64 = 1_000_000;
+    let one = |service: AnyValue, trace: u8, n: u8, at_s: i64| {
+        group_request(
+            vec![kv("service.name", service)],
+            scope_named("lib-w", "1.0", Vec::new()),
+            vec![span_with_message(
+                vec![trace; 16],
+                vec![0, 0, 0, 0, 0, 0, 0, n],
+                Vec::new(),
+                "w",
+                2,
+                base_ns + at_s * S,
+                100 * MS,
+                Vec::new(),
+                None,
+                Vec::new(),
+                Vec::new(),
+            )],
+        )
+    };
+    vec![
+        one(bool_value(false), 0xf1, 1, 1),
+        one(bool_value(true), 0xf1, 2, 2),
+        one(int_value(7), 0xf2, 3, 31),
+        one(str_value("svc-w"), 0xf3, 4, 51),
+    ]
+}
+
+/// Section 4.3 (D2): a `service.name` sent as anything but a string is
+/// missing under `!` — nothing matches and nothing fails — and the
+/// per-trace table holds no root service or service for it; a string under
+/// `!` still fails the query.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_service_name_is_held_only_as_a_string_under_not() {
+    skip_unless_live!();
+    const S: i64 = 1_000_000_000;
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let (db, client) = seed_both(
+        pulsus_testkit::test_db("pulsus_read_it_t602p1_svcnot"),
+        &service_not_fixture(base_ns),
+        4,
+        "t602p1-svcnot",
+    )
+    .await;
+    let engine = engine_of(&db).await;
+    let a = (base_ns, base_ns + 30 * S);
+    let b = (base_ns + 30 * S, base_ns + 50 * S);
+    let c = (base_ns + 50 * S, base_ns + 60 * S);
+    let not_a_boolean = "Err(expression (!resource.service.name) expected a boolean)";
+    let mut wrong = Vec::new();
+    for (id, window, query, literal) in [
+        ("W1", a, "{ !resource.service.name }", ""),
+        ("W2", a, "{ !.service.name }", ""),
+        ("W3", a, "{ (!resource.service.name) = true }", ""),
+        ("W4", b, "{ !resource.service.name }", ""),
+        ("W5", b, "{ !.service.name }", ""),
+        (
+            "W6",
+            b,
+            "{ !resource.service.name = !resource.service.name }",
+            "",
+        ),
+        (
+            "W7",
+            b,
+            "{ } | by(trace:rootService)",
+            "f2 1 [03] { 1 [03]}",
+        ),
+        ("W8", b, "{ }", r#"f2 root="""#),
+        ("W9", c, "{ !resource.service.name }", not_a_boolean),
+        (
+            "W10",
+            a,
+            "{ !resource.service.name = !resource.service.name }",
+            "",
+        ),
+    ] {
+        let plan = plan_of(&engine, &parse_query(query), window, 20, 10);
+        let routed = engine.search_routed(&plan).await.map(normalise_today);
+        let answer = if id == "W8" {
+            match &routed {
+                Err(e) => format!("Err({e})"),
+                Ok(o) => o
+                    .traces
+                    .iter()
+                    .map(|t| format!("{:02x} root={:?}", t.trace_id[15], t.root.service))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            }
+        } else if query.contains("by(") {
+            grouped_answer_of(&routed)
+        } else {
+            selected_answer_of(&routed)
+        };
+        if answer != literal {
+            wrong.push(format!(
+                "{id} {query}\n  literal: {literal}\n  routed:  {answer}"
+            ));
+        }
+    }
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+    struct PerTrace {
+        t: String,
+        services: Vec<String>,
+        root: String,
+    }
+    let mut stream = client
+        .query_stream::<PerTrace>(
+            "SELECT substring(lower(hex(trace_id)), 1, 2) AS t, arraySort(services) AS services, \
+             root.4 AS root FROM traces FINAL ORDER BY t",
+            &read_settings(),
+        )
+        .await
+        .expect("read the per-trace table");
+    let mut per_trace = Vec::new();
+    while let Some(row) = stream.next().await {
+        per_trace.push(row.expect("decode a per-trace row"));
+    }
+    let want = vec![
+        PerTrace {
+            t: "f1".to_string(),
+            services: Vec::new(),
+            root: String::new(),
+        },
+        PerTrace {
+            t: "f2".to_string(),
+            services: Vec::new(),
+            root: String::new(),
+        },
+        PerTrace {
+            t: "f3".to_string(),
+            services: vec!["svc-w".to_string()],
+            root: "svc-w".to_string(),
+        },
+    ];
+    if per_trace != want {
+        wrong.push(format!(
+            "W11 the per-trace table\n  want: {want:?}\n  got:  {per_trace:?}"
+        ));
     }
     drop_db(&db).await;
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));

@@ -4783,7 +4783,6 @@ fn compile_search_refuses_what_parts_two_and_three_serve() {
         (r#"{ link.lk - link.lk != 0 }"#, "two occurrences"),
         (r#"{ .a = 1 } | count() > 1 | count() > 2"#, "#592"),
         (r#"{ .a = 1 } | by(name) | count() > 1"#, "#592"),
-        (r#"{ .a = 1 } | avg(resource.k) > 1"#, "#592"),
         // Issue #592 part 2: a key the statement does not serve, and a
         // second `by()`.
         (r#"{ .a = 1 } | by(trace:id)"#, "#592"),
@@ -4930,30 +4929,19 @@ fn the_fork_routes_by_the_plan() {
     let mut wrong = Vec::new();
     for query in [
         r#"{ .a = 1 } && { .b = 2 } | { .c = 3 }"#,
-        // Issue #592 part 3: an aggregate with `by()`, a second aggregate,
-        // and arguments the statement does not read.
+        // Issue #592 part 3: an aggregate with `by()` and a second
+        // aggregate.
         r#"{ .a = 1 } | by(name) | count() > 1"#,
         r#"{ .a = 1 } | count() > 1 | by(name)"#,
         r#"{ .a = 1 } | count() > 1 | count() > 2"#,
-        r#"{ .a = 1 } | avg(resource.k) > 1"#,
-        r#"{ .a = 1 } | sum(event.e) > 1"#,
-        r#"{ .a = 1 } | max(link.l) > 1"#,
-        r#"{ .a = 1 } | min(instrumentation.i) > 1"#,
-        // Issue #592 part 2: the keys the statement does not serve, a
+        // Issue #592 part 2: the key the statement does not serve, a
         // second `by()`, and a `by()` after `coalesce()`.
         r#"{ .a = 1 } | by(trace:id) | coalesce()"#,
-        r#"{ .a = 1 } | by(event.e)"#,
-        r#"{ .a = 1 } | by(resource.k)"#,
-        r#"{ .a = 1 } | by(link.l)"#,
-        r#"{ .a = 1 } | by(instrumentation.i)"#,
-        r#"{ .a = 1 } | by(.u)"#,
         r#"{ .a = 1 } | by(span.a) | by(name)"#,
         r#"{ .a = 1 } | by(span.a) | coalesce() | by(name)"#,
         r#"{ event.k * event.k > 5 }"#,
         r#"{ .k + 1 > .k }"#,
         r#"{ link.lk - link.lk != 0 }"#,
-        r#"{ (event.k = 1) = true }"#,
-        r#"{ !event.k = false }"#,
     ] {
         if plan_statement(&fork_plan(query), "spans", "traces", "resources", 64, &[]).is_some() {
             wrong.push(format!(
@@ -4966,6 +4954,19 @@ fn the_fork_routes_by_the_plan() {
         r#"{ .k = .k }"#,
         r#"{ span.k = "x" }"#,
         "{}",
+        // Issue #602 part 1: an aggregate over any attribute scope, a key
+        // at any scope, and a field inside a boolean-valued operand.
+        r#"{ .a = 1 } | avg(resource.k) > 1"#,
+        r#"{ .a = 1 } | sum(event.e) > 1"#,
+        r#"{ .a = 1 } | max(link.l) > 1"#,
+        r#"{ .a = 1 } | min(instrumentation.i) > 1"#,
+        r#"{ .a = 1 } | by(event.e)"#,
+        r#"{ .a = 1 } | by(resource.k)"#,
+        r#"{ .a = 1 } | by(link.l)"#,
+        r#"{ .a = 1 } | by(instrumentation.i)"#,
+        r#"{ .a = 1 } | by(.u)"#,
+        r#"{ (event.k = 1) = true }"#,
+        r#"{ !event.k = false }"#,
         // Issue #592 part 1: later `{…}` filters and `select()` after a
         // single filter.
         r#"{ .a = 1 } | { }"#,
@@ -5460,4 +5461,192 @@ fn a_count_or_number_operand_joins_the_read_spans() {
     );
     let s = compile_search_of("{ } | select(trace:duration, span:childCount)").expect("served");
     assert_eq!(count(s.sql(), "nested_values"), 0, "{}", s.sql());
+}
+
+// =====================================================================
+// Issue #602 part 1 — every key, aggregate argument and projected value
+// the previous engine reads, read by the statement
+// =====================================================================
+
+/// The 27 queries of fixture K (issue #602 part 1, section 4.2), which the
+/// live suite answers on the statement.
+const FIXTURE_K_QUERIES: [&str; 27] = [
+    "{ } | by(.u)",
+    "{ } | by(resource.u)",
+    "{ } | by(resource.rk)",
+    "{ } | by(instrumentation.u)",
+    "{ } | by(event.u)",
+    "{ } | by(link.u)",
+    "{ } | by(duration)",
+    "{ } | by(statusMessage)",
+    "{ } | by(span:parentID)",
+    "{ } | by(span:id)",
+    "{ } | by(instrumentation:name)",
+    "{ } | by(instrumentation:version)",
+    "{ } | by(.service.name)",
+    "{ } | sum(resource.rk) > 0",
+    "{ } | max(instrumentation.u) > 2",
+    "{ } | max(event.u) > 0",
+    "{ } | avg(link.lk) > 1",
+    "{ !.f = true }",
+    "{ !span.f = true }",
+    "{ (.u = 3) = true }",
+    r#"{ (span.u = "span") = true }"#,
+    "{ (event.u = 3) = true }",
+    r#"{ (statusMessage = "boom") = true }"#,
+    r#"{ !(statusMessage = "boom") = false }"#,
+    r#"{ (resource.service.name = "svc-k") = true }"#,
+    r#"{ (instrumentation:name = "lib-a") = true }"#,
+    r#"{ (name = "k1") = true }"#,
+];
+
+/// The two queries part 2 serves: each must still be refused here.
+const PART_TWO: [&str; 2] = ["{ !-.a }", "{ -!.a }"];
+
+/// Whether the previous planner accepts `query`, in the context
+/// `accept_surface_wire.rs` plans it in.
+fn previous_planner_accepts(query: &pulsus_traceql::Query) -> bool {
+    plan_search(
+        query,
+        &SearchParams {
+            start_ns: 1_700_000_000_000_000_000,
+            end_ns: 1_700_010_800_000_000_000,
+            limit: 20,
+            spss: 3,
+        },
+        &SearchCtx {
+            filter: SpanFilterCtx {
+                spans_table: "trace_spans",
+                attrs_table: "trace_attrs_idx",
+            },
+            recent_table: "trace_recent",
+            errors_table: "trace_error_spans",
+            max_candidates: 100_000,
+            max_series: 1_000,
+            distributed: false,
+        },
+    )
+    .is_ok()
+}
+
+/// Section 4.4: every query of the accept corpus, the accept-surface
+/// probes and fixture K's 27 that the previous planner accepts, the
+/// statement compiles too — but the two part 2 serves.
+#[test]
+fn the_statement_compiles_what_the_previous_planner_accepts() {
+    #[derive(serde::Deserialize)]
+    struct Matrix {
+        accept_surface_probes: Vec<Probe>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Probe {
+        query: String,
+    }
+    let traceql = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../pulsus-traceql/tests");
+    let mut queries: Vec<String> = Vec::new();
+    let accept = traceql.join("corpus/accept");
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&accept)
+        .unwrap_or_else(|e| panic!("read {accept:?}: {e}"))
+        .map(|e| e.expect("a directory entry").path())
+        .filter(|p| p.extension().is_some_and(|x| x == "traceql"))
+        .collect();
+    files.sort();
+    for path in files {
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+        queries.push(text.trim().to_string());
+    }
+    let matrix_path = traceql.join("accept_surface/matrix.json");
+    let matrix: Matrix = serde_json::from_str(
+        &std::fs::read_to_string(&matrix_path)
+            .unwrap_or_else(|e| panic!("read {matrix_path:?}: {e}")),
+    )
+    .unwrap_or_else(|e| panic!("{matrix_path:?} must parse: {e}"));
+    queries.extend(matrix.accept_surface_probes.into_iter().map(|p| p.query));
+    queries.extend(FIXTURE_K_QUERIES.iter().map(|q| q.to_string()));
+    let mut reached = 0usize;
+    let mut wrong = Vec::new();
+    for text in &queries {
+        let Ok(query) = pulsus_traceql::parse(text) else {
+            continue;
+        };
+        if pulsus_traceql::validate(&query).is_err() || !previous_planner_accepts(&query) {
+            continue;
+        }
+        reached += 1;
+        let compiled = compile_search(&query, &ctx(), "spans", "traces", 20, 3);
+        match (PART_TWO.contains(&text.as_str()), compiled) {
+            (false, Err(e)) => wrong.push(format!("{text}: refused: {e}")),
+            (true, Ok(_)) => wrong.push(format!("{text}: compiled; part 2 serves it")),
+            _ => {}
+        }
+    }
+    assert!(
+        reached >= 250,
+        "only {reached} queries reached compile_search: a source is missing"
+    );
+    assert!(
+        wrong.is_empty(),
+        "{} of {reached}:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
+/// Section 4.4: no statement reads a value off its typed path, and none
+/// carries an off-path demand.
+#[test]
+fn no_statement_reads_a_value_off_its_path() {
+    for query in [
+        "{ } | by(span.a)",
+        "{ } | select(.a)",
+        "{ } | min(.a) < 1",
+        "{ .a != nil }",
+    ] {
+        let statement =
+            compile_search_of(query).unwrap_or_else(|e| panic!("{query} must compile: {e}"));
+        assert!(
+            statement.demands().is_empty(),
+            "{query}: demands {:?}",
+            statement.demands()
+        );
+        let sql = statement.sql();
+        assert!(
+            !sql.contains("attrs_other") && !sql.contains(".^"),
+            "{query} reads a value off its path:\n{sql}"
+        );
+    }
+}
+
+/// Section 4.4 (D4, D9): an event or link intrinsic as a `by()` key is
+/// refused with the previous planner's text, naming its own field;
+/// `by(trace:id)` keeps today's.
+#[test]
+fn an_event_or_link_intrinsic_key_is_refused() {
+    let collection = |field: &str| {
+        format!(
+            "by({field}): grouping by a span-event / span-link intrinsic is not supported \
+             (a span carries a collection of events/links, so there is no single group value)"
+        )
+    };
+    for (query, want) in [
+        ("{ } | by(event:name)", collection("event:name")),
+        (
+            "{ } | by(event:timeSinceStart)",
+            collection("event:timeSinceStart"),
+        ),
+        ("{ } | by(link:spanID)", collection("link:spanID")),
+        ("{ } | by(link:traceID)", collection("link:traceID")),
+        (
+            "{ } | by(trace:id)",
+            "by(trace:id) is not supported by the search statement yet (issue #592)".to_string(),
+        ),
+    ] {
+        match compile_search_of(query) {
+            Err(PlanError::UnsupportedField(msg)) => {
+                assert_eq!(msg, want, "{query}");
+            }
+            Err(other) => panic!("{query}: expected UnsupportedField, got {other:?}"),
+            Ok(s) => panic!("{query}: expected a refusal, compiled to {}", s.sql()),
+        }
+    }
 }
