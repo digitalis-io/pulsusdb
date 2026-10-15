@@ -114,6 +114,7 @@ pub(crate) mod post_agg;
 /// signatures of the `pub` [`sql`] module, and `pulsus-server` passes
 /// fragments through.
 pub mod predicate;
+pub(crate) mod reduce;
 pub mod rows;
 pub mod sql;
 pub mod template;

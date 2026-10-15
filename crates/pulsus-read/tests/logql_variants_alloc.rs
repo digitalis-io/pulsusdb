@@ -2160,9 +2160,16 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
         // Regenerated, never hand-written:
         //     cargo test -p pulsus-read --test logql_variants_alloc \
         //         -- --ignored zz_print_frame_censuses --nocapture
-        // FRAME client_agg.rs ClientAggState::new 2 10 :: .insert .is_some .metric_mutates_labels Ok matches! new reducer_class series_labels slider_safe_fingerprints stream_hash
+        //
+        // Issue #624, part 4: 2 branches — UNCHANGED — and one new callee,
+        // `.end_ns`, which reads the instant window's end out of its
+        // witness into a scalar field for `rate_counter`'s extrapolation
+        // (F4). W-MEM disposition: **NIL** — a `Copy` read of an `i64`,
+        // allocating nothing on either path.
+        // FRAME client_agg.rs ClientAggState::new 2 11 :: .end_ns .insert .is_some .metric_mutates_labels Ok matches! new reducer_class series_labels slider_safe_fingerprints stream_hash
         branches: 2,
         callees: &[
+            ".end_ns",
             ".insert",
             ".is_some",
             ".metric_mutates_labels",
@@ -2580,10 +2587,17 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
         // it performs charge `group_bytes` in the same units the direct
         // arm does, and the buffer's capacity returns to the state so the
         // next run reuses it. Inventory row F-d.
+        //
+        // Issue #624, part 4 (F1): 5 branches — UNCHANGED — and the sort
+        // key becomes `(stream_hash, value)`: `.sort_by_key` gives way to
+        // `.sort_by` with `.cmp`, `.then` and `.total_cmp`. The sort is in
+        // place over the staged buffer. W-MEM disposition: **NIL** for the
+        // four — none allocates — and the frame stays BAND, row F-d.
         branches: 5,
         callees: &[
             ".add",
             ".clear",
+            ".cmp",
             ".drain",
             ".entry",
             ".insert",
@@ -2592,7 +2606,9 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
             ".is_err",
             ".is_ok",
             ".key",
-            ".sort_by_key",
+            ".sort_by",
+            ".then",
+            ".total_cmp",
             ".unwrap_or_default",
             "Ok",
             "charge_group_bytes",
@@ -2849,7 +2865,13 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
         // Regenerated, never hand-written:
         //     cargo test -p pulsus-read --test logql_variants_alloc \
         //         -- --ignored zz_print_frame_censuses --nocapture
-        // FRAME client_agg.rs RangeSlideState::flush_collision 20 32 :: .any .as_bytes .as_mut .clear .cloned .cmp .copied .covering_k .enumerate .expect .fan_out_sample .fan_out_sample_base .get .is_empty .is_none .iter .iter_mut .load_group .rotate_slider .sort_by .take .unwrap_or .unwrap_or_default Ok Some charge_group_bytes charge_result_points grid_slot_count group_entry_bytes matches! new take
+        //
+        // Issue #624, part 4 (F1): 20 branches — UNCHANGED. The group is
+        // ranked by value, then body: `.total_cmp` and `.then_with` join
+        // the `.as_bytes`/`.cmp` body comparison inside the same in-place
+        // `.sort_by`. W-MEM disposition: **NIL** — no allocation on either
+        // path — and the frame stays as it was.
+        // FRAME client_agg.rs RangeSlideState::flush_collision 20 34 :: .any .as_bytes .as_mut .clear .cloned .cmp .copied .covering_k .enumerate .expect .fan_out_sample .fan_out_sample_base .get .is_empty .is_none .iter .iter_mut .load_group .rotate_slider .sort_by .take .then_with .total_cmp .unwrap_or .unwrap_or_default Ok Some charge_group_bytes charge_result_points grid_slot_count group_entry_bytes matches! new take
         branches: 20,
         callees: &[
             ".any",
@@ -2873,6 +2895,8 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
             ".rotate_slider",
             ".sort_by",
             ".take",
+            ".then_with",
+            ".total_cmp",
             ".unwrap_or",
             ".unwrap_or_default",
             "Ok",

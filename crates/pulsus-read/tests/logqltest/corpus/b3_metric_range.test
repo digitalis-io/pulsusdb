@@ -2,13 +2,15 @@
 #
 # Every case is an instant metric eval. Instant metric queries are
 # semantically identical to the reference (docs/features.md:55) — except
-# for the ratified same-nanosecond same-stream `tie_rank` residual, which
-# applies to them too (issue #344) and which no case here contains — so
-# each expected value below is a BIT-EXACT capture from
-# grafana/loki:3.7.4 (the
-# #218 discipline: rate/rate_counter extrapolation factors are captured
-# verbatim, never hand-computed as increase/60). See PROVENANCE.md for the
-# capture procedure.
+# for the same-nanosecond same-stream value order (issue #624, part 4, F1),
+# which no case here contains, and `rate_counter`'s extrapolation (F4) —
+# so each expected value below is a BIT-EXACT capture from
+# grafana/loki:3.7.4 (the #218 discipline: rate extrapolation factors are
+# captured verbatim, never hand-computed as increase/60), except the
+# `rate_counter` rows, which carry `divergence(rate-counter-window-anchored)`
+# and F4's value, derived by hand: the increase extrapolated in seconds to
+# the edges of the window `(t - range, t]`, as the ledger entry of that id
+# says. See PROVENANCE.md for the capture procedure.
 #
 # Datasets are authored so every loaded sample falls inside the query
 # window (t-range, t] and the pipeline (a `| logfmt` parser) forces the
@@ -430,8 +432,9 @@ load
   30s  c=15
   40s  c=20
 
+# provenance: divergence(rate-counter-window-anchored)
 eval instant at 60s rate_counter({service_name="rc_monotone"} | logfmt | unwrap c [1m])
-  {env="prod", service_name="rc_monotone"} 0.2500005
+  {env="prod", service_name="rc_monotone"} 0.375
 
 clear
 
@@ -443,8 +446,9 @@ load
   30s  c=3
   40s  c=8
 
+# provenance: divergence(rate-counter-window-anchored)
 eval instant at 60s rate_counter({service_name="rc_reset1"} | logfmt | unwrap c [1m])
-  {env="prod", service_name="rc_reset1"} 0.3000006
+  {env="prod", service_name="rc_reset1"} 0.45
 
 clear
 
@@ -457,8 +461,9 @@ load
   40s  c=1
   50s  c=6
 
+# provenance: divergence(rate-counter-window-anchored)
 eval instant at 60s rate_counter({service_name="rc_multireset"} | logfmt | unwrap c [1m])
-  {env="prod", service_name="rc_multireset"} 0.250000375
+  {env="prod", service_name="rc_multireset"} 0.375
 
 clear
 
@@ -468,8 +473,9 @@ load
   25s  c=100
   35s  c=160
 
+# provenance: divergence(rate-counter-window-anchored)
 eval instant at 60s rate_counter({service_name="rc_sparse"} | logfmt | unwrap c [1m])
-  {env="prod", service_name="rc_sparse"} 1.000006
+  {env="prod", service_name="rc_sparse"} 2
 
 clear
 
@@ -479,8 +485,9 @@ load
   10s  c=5
   40s  c=65
 
+# provenance: divergence(rate-counter-window-anchored)
 eval instant at 60s rate_counter({service_name="rc_2m"} | logfmt | unwrap c [2m])
-  {env="prod", service_name="rc_2m"} 0.500002
+  {env="prod", service_name="rc_2m"} 0.875
 
 clear
 
@@ -490,8 +497,9 @@ load
   1ns  c=100
   60s  c=200
 
+# provenance: divergence(rate-counter-window-anchored)
 eval instant at 60s rate_counter({service_name="rc_boundary"} | logfmt | unwrap c [1m])
-  {env="prod", service_name="rc_boundary"} 1.6666683333333332
+  {env="prod", service_name="rc_boundary"} 1.6666666666944443
 
 clear
 
@@ -500,6 +508,7 @@ load
   {env="prod", service_name="rc_single"}
   30s  c=5
 
+# provenance: divergence(rate-counter-window-anchored)
 eval instant at 60s rate_counter({service_name="rc_single"} | logfmt | unwrap c [1m])
   {env="prod", service_name="rc_single"} 0
 

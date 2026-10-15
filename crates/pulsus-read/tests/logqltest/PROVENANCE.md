@@ -261,7 +261,9 @@ This is done **once** per case, offline; CI runs only the hermetic runner.
    shortest round-tripping decimal (Rust's `{}` form of the captured `f64`);
    the runner parses it back to the identical bits. Record the container
    digest / date in the `.test` file's header comment if the value is
-   non-obvious (e.g. the `rate_counter` ns/ms extrapolation captures).
+   non-obvious. The `rate_counter` rows are not captures: they carry
+   `divergence(rate-counter-window-anchored)` and a value derived by hand
+   in that ledger entry's arithmetic (issue #624, part 4).
 
 ## `b15_wide_aggregation.test` — the issue #236 high-cardinality capture
 
@@ -326,10 +328,12 @@ results are:
 - **Metric reducer / vector-agg / matching cases** — hand-derived from
   integer counts and exactly-representable durations (`250ms = 0.25s`), so
   every division/sum is a single exact IEEE operation.
-- **`rate_counter` cases** — the bit-exact reference captures already pinned
-  in `logql_metric_agg_golden.rs` (the #218 ns/ms `extrapolatedRate` factor,
-  captured against the container); the datasets and values are ported
-  directly.
+- **`rate_counter` cases** — the datasets are ported; the values are
+  `divergence(rate-counter-window-anchored)`, derived from F4's arithmetic
+  (issue #624, part 4: extrapolated in seconds to the window's edges) in
+  `logql_metric_agg_golden.rs`, not captures. The duplicate-timestamp row
+  is `divergence(unwrap-same-nanosecond-value-order)`: its samples fold in
+  value order.
 
 Instant-eval values are stable 3.4.2 → 3.7.4 (verified: only cosmetic
 range-vector reducer changes), so no re-capture was needed for the seed.

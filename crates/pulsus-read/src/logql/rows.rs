@@ -319,6 +319,29 @@ pub struct MetricRangeBucketRow {
     pub fields: String,
 }
 
+/// One row of the lowered `| unwrap` statement (issue #624, part 4,
+/// [`crate::logql::sql::metric_range_reduced`]): one `(class, metadata,
+/// failed, grid point)` window.
+///
+/// `c` is the class id, or the fingerprint itself when every stream is its
+/// own class; `kv` the metadata pairs the key keeps; `e` is 1 for the
+/// window of a key whose values failed to convert. `n` counts the window's
+/// samples and `r` is the reducer's value; `t1`, `t2` and `v1` are the
+/// first and last sample times and the first value, which `rate_counter`
+/// extrapolates from, and zero for every other reducer.
+#[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
+pub struct MetricReducedRow {
+    pub c: u128,
+    pub kv: Vec<(String, String)>,
+    pub e: u8,
+    pub bucket_ns: i64,
+    pub n: u64,
+    pub r: f64,
+    pub t1: i64,
+    pub t2: i64,
+    pub v1: f64,
+}
+
 /// [`MetricRangeBucketRow`] with the `regexp` stage's two group-key columns
 /// (issue #624, part 3a).
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]

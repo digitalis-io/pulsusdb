@@ -222,25 +222,29 @@ mod instant_window {
     /// without a runtime check nobody re-reads — and it was already true
     /// at every call site, so nothing is newly forbidden.
     ///
-    /// It carries NO bounds, a deliberate difference from plan v14's
-    /// "explicit instant bounds": nothing in an instant state reads
-    /// them. The two former readers — the stepped-grid guard in the
-    /// constructor and the `bucket_grid` walk in `finish` — are both
-    /// deleted by Part D, and a field that exists only to look used is
-    /// worse than none. The witness is also the stronger of the two
-    /// shapes: a pair of `i64` bounds can be hand-derived from a stepped
-    /// window, an unforgeable witness cannot.
+    /// It carries the window's END and nothing else: `rate_counter`
+    /// extrapolates to the window's edges (issue #624, part 4, F4), so the
+    /// end is read; the start is the end less the range, which the state
+    /// already has. The witness is unforgeable, unlike a pair of `i64`
+    /// bounds a caller could hand-derive from a stepped window.
     #[derive(Debug, Clone, Copy)]
-    pub(in crate::logql) struct InstantWindow(());
+    pub(in crate::logql) struct InstantWindow {
+        end_ns: i64,
+    }
 
     impl InstantWindow {
         /// The ONE mint. Refuses a stepped window, so a caller has to say
         /// what it does with one instead of assuming it cannot get one.
         pub(in crate::logql) fn mint(window: ClientWindow) -> Option<Self> {
             match window {
-                ClientWindow::Instant { .. } => Some(InstantWindow(())),
+                ClientWindow::Instant { end_ns, .. } => Some(InstantWindow { end_ns }),
                 ClientWindow::Range { .. } => None,
             }
+        }
+
+        /// The instant window's end, `t` of `(t - range, t]`.
+        pub(in crate::logql) fn end_ns(self) -> i64 {
+            self.end_ns
         }
     }
 }

@@ -235,25 +235,28 @@ fn corpus_is_fully_green_and_exercises_every_directive() {
 
 /// The #218 guard, exercised for real: a deliberately-perturbed expected
 /// value must redden the runner (exact-f64, not tolerance). A one-ULP
-/// change to a captured `rate_counter` value is caught.
+/// change to a `rate_counter` value is caught. The value is F4's (issue
+/// #624, part 4: extrapolated in seconds to the window's edges), derived in
+/// `logql_metric_agg_golden.rs`'s
+/// `rate_counter_reset_counts_the_post_reset_value_from_zero`.
 #[test]
 fn a_perturbed_expected_value_reddens_the_runner() {
     let dataset = "load\n  {env=\"prod\", service_name=\"checkout\"} service=checkout\n\
                    \t10s  c=10\n\t20s  c=30\n\t30s  c=5\n\t40s  c=12\n\n";
-    // Correct capture passes.
+    // The correct value passes.
     let good = format!(
         "{dataset}eval instant at 60s rate_counter({{env=\"prod\"}} | logfmt | unwrap c [1m])\n\
-         \t{{env=\"prod\", service_name=\"checkout\"}} 0.5333344\n"
+         \t{{env=\"prod\", service_name=\"checkout\"}} 0.788888888888889\n"
     );
     let run = run_file("inline/rate_counter_good.test", &good).expect("parse");
     assert!(
         run.cases[0].passed,
-        "correct capture: {}",
+        "the correct value: {}",
         run.cases[0].detail
     );
 
     // A one-ULP perturbation of the expected value must FAIL (exact bits).
-    let perturbed_bits = 0.5333344_f64.to_bits() + 1;
+    let perturbed_bits = 0.788888888888889_f64.to_bits() + 1;
     let perturbed = f64::from_bits(perturbed_bits);
     let bad = format!(
         "{dataset}eval instant at 60s rate_counter({{env=\"prod\"}} | logfmt | unwrap c [1m])\n\

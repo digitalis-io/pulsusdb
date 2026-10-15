@@ -5268,13 +5268,51 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                value: Shaped(
-                    RawCount,
+                value: Reduced(
+                    ReducedUnwrap {
+                        reducer: QuantileOverTime,
+                        quantile: Some(
+                            0.9,
+                        ),
+                        label: "d",
+                        conversion: Number,
+                        mode: Drop(
+                            [
+                                "d",
+                            ],
+                        ),
+                        key_stages: [
+                            Unwrap(
+                                Unwrap {
+                                    label: "d",
+                                    conversion: None,
+                                },
+                            ),
+                        ],
+                        todays_route: ClientAgg {
+                            pipeline: [
+                                Unwrap(
+                                    Unwrap {
+                                        label: "d",
+                                        conversion: None,
+                                    },
+                                ),
+                            ],
+                            value: Unwrap,
+                            range_op: QuantileOverTime,
+                            param: Some(
+                                0.9,
+                            ),
+                            absent_labels: [],
+                            grouping: None,
+                        },
+                        instant: false,
+                    },
                 ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
-                    reason: "raw: client-side pipeline/unwrap aggregation",
+                    reason: "raw: unwrapped range aggregation in the database (issue #624)",
                 },
                 extra_predicates: [],
                 start_ns: 1782906900000000000,
@@ -5294,25 +5332,7 @@ MetricBinary(
                 rate_window_ns: None,
                 op: QuantileOverTime,
                 vector_aggs: [],
-                client: Some(
-                    ClientAgg {
-                        pipeline: [
-                            Unwrap(
-                                Unwrap {
-                                    label: "d",
-                                    conversion: None,
-                                },
-                            ),
-                        ],
-                        value: Unwrap,
-                        range_op: QuantileOverTime,
-                        param: Some(
-                            0.9,
-                        ),
-                        absent_labels: [],
-                        grouping: None,
-                    },
-                ),
+                client: None,
                 probes: [],
                 metadata_lowering: None,
             },
@@ -5334,20 +5354,62 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                value: Shaped(
-                    RawCount,
+                value: Reduced(
+                    ReducedUnwrap {
+                        reducer: QuantileOverTime,
+                        quantile: Some(
+                            0.9,
+                        ),
+                        label: "d",
+                        conversion: Number,
+                        mode: Drop(
+                            [
+                                "d",
+                            ],
+                        ),
+                        key_stages: [
+                            Unwrap(
+                                Unwrap {
+                                    label: "d",
+                                    conversion: None,
+                                },
+                            ),
+                        ],
+                        todays_route: ClientAgg {
+                            pipeline: [
+                                Unwrap(
+                                    Unwrap {
+                                        label: "d",
+                                        conversion: None,
+                                    },
+                                ),
+                            ],
+                            value: Unwrap,
+                            range_op: QuantileOverTime,
+                            param: Some(
+                                0.9,
+                            ),
+                            absent_labels: [],
+                            grouping: None,
+                        },
+                        instant: true,
+                    },
                 ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
-                    reason: "raw: client-side pipeline/unwrap aggregation",
+                    reason: "raw: unwrapped range aggregation in the database (issue #624)",
                 },
                 extra_predicates: [],
                 start_ns: 1782906900000000000,
                 scan_lower: Exclusive,
                 end_ns: 1782907200000000000,
-                step_ns: None,
-                grid_start_ns: 1782906900000000000,
+                step_ns: Some(
+                    ValidatedDuration(
+                        300000000000,
+                    ),
+                ),
+                grid_start_ns: 1782907200000000000,
                 range_ns: ValidatedDuration(
                     300000000000,
                 ),
@@ -5356,25 +5418,7 @@ MetricBinary(
                 rate_window_ns: None,
                 op: QuantileOverTime,
                 vector_aggs: [],
-                client: Some(
-                    ClientAgg {
-                        pipeline: [
-                            Unwrap(
-                                Unwrap {
-                                    label: "d",
-                                    conversion: None,
-                                },
-                            ),
-                        ],
-                        value: Unwrap,
-                        range_op: QuantileOverTime,
-                        param: Some(
-                            0.9,
-                        ),
-                        absent_labels: [],
-                        grouping: None,
-                    },
-                ),
+                client: None,
                 probes: [],
                 metadata_lowering: None,
             },

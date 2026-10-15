@@ -120,9 +120,9 @@ pub(in crate::logql) fn resolve(
     }
 }
 
-type Classes = (Option<Vec<Vec<FpLiteral>>>, HashMap<Fingerprint, LabelSet>);
+pub(in crate::logql) type Classes = (Option<Vec<Vec<FpLiteral>>>, HashMap<Fingerprint, LabelSet>);
 
-fn group_into_classes(
+pub(in crate::logql) fn group_into_classes(
     fingerprints: &[Fingerprint],
     stream_labels: &HashMap<Fingerprint, LabelSet>,
     keeps: impl Fn(&str) -> bool,

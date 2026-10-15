@@ -416,6 +416,7 @@ fn every_planned_range_leaf_that_is_not_a_clean_bucketed_chain_is_client_aggrega
         };
         let mut lowered = 0usize;
         let mut client = 0usize;
+        let mut reduced = 0usize;
         for query in &all_queries() {
             let expr = parse(query).unwrap_or_else(|e| panic!("{query}: {e}"));
             let Ok(p) = plan(&expr, &step_params, &c) else {
@@ -433,6 +434,22 @@ fn every_planned_range_leaf_that_is_not_a_clean_bucketed_chain_is_client_aggrega
                 continue;
             }
             for mp in mps {
+                // Issue #624, part 4: an `| unwrap` reducer over label filters
+                // alone is reduced in the database, under its own reason.
+                if reduced_unwrap(query) {
+                    reduced += 1;
+                    assert!(
+                        mp.client.is_none(),
+                        "`{query}` at step {step_ns} is an `| unwrap` reducer over label \
+                         filters alone, so the database reduces it (issue #624, part 4)"
+                    );
+                    assert_eq!(
+                        mp.routing.reason,
+                        "raw: unwrapped range aggregation in the database (issue #624)",
+                        "{query} at step {step_ns}"
+                    );
+                    continue;
+                }
                 if clean_bucketed(query) {
                     lowered += 1;
                     assert!(
@@ -461,11 +478,59 @@ fn every_planned_range_leaf_that_is_not_a_clean_bucketed_chain_is_client_aggrega
             }
         }
         assert!(
-            lowered >= 4 && client >= 4,
-            "step {step_ns}: the positive half is vacuous: {lowered} lowered / {client} \
-             client-aggregated"
+            lowered >= 4 && client >= 4 && reduced >= 1,
+            "step {step_ns}: the positive half is vacuous: {lowered} lowered / {reduced} \
+             reduced / {client} client-aggregated"
         );
     }
+}
+
+/// Whether a query is one of the eleven `| unwrap` reducers over a pipeline
+/// of string label filters and one `| unwrap` (issue #624, part 4). Read
+/// from the query text, so it shares nothing with the planner.
+fn reduced_unwrap(query: &str) -> bool {
+    const REDUCERS: [&str; 11] = [
+        "sum_over_time(",
+        "avg_over_time(",
+        "min_over_time(",
+        "max_over_time(",
+        "stddev_over_time(",
+        "stdvar_over_time(",
+        "quantile_over_time(",
+        "first_over_time(",
+        "last_over_time(",
+        "rate(",
+        "rate_counter(",
+    ];
+    if query.contains("variants(") || !REDUCERS.iter().any(|r| query.contains(r)) {
+        return false;
+    }
+    let Some(open) = query.find('{') else {
+        return false;
+    };
+    let close = query[open..]
+        .find('[')
+        .map(|i| open + i)
+        .unwrap_or(query.len());
+    let Some(selector_end) = query[open..close].find('}').map(|i| open + i + 1) else {
+        return false;
+    };
+    let mut unwraps = 0usize;
+    for segment in query[selector_end..close].split('|').skip(1) {
+        let segment = segment.trim();
+        if segment.starts_with("unwrap ") {
+            unwraps += 1;
+            continue;
+        }
+        let label_filter = segment.split_once(['=', '!']).is_some_and(|(name, _)| {
+            let name = name.trim();
+            !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }) && segment.contains('"');
+        if !label_filter {
+            return false;
+        }
+    }
+    unwraps == 1
 }
 
 /// The count of label-only stages in a single-reducer query's pipeline, or

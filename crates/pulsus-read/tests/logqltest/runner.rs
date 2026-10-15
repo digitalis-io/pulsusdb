@@ -1364,6 +1364,10 @@ fn eval_leaf(mp: &MetricPlan, store: &Store) -> Result<QueryResult, String> {
                     pulsus_read::logql::sql::MetricValue::Staged(staged) => {
                         staged.todays_route.clone()
                     }
+                    // Issue #624, part 4: so does a reduced one.
+                    pulsus_read::logql::sql::MetricValue::Reduced(reduced) => {
+                        reduced.todays_route.clone()
+                    }
                 },
             };
             &fallback
@@ -1380,6 +1384,12 @@ fn eval_leaf(mp: &MetricPlan, store: &Store) -> Result<QueryResult, String> {
         &store.meta,
         client,
         match mp.step_ns {
+            // Issue #624, part 5: an instant query lowered at its one grid
+            // point is evaluated as the instant query it answers.
+            Some(_) if mp.answers_instant() => ClientWindow::Instant {
+                start_ns: mp.start_ns,
+                end_ns: mp.end_ns,
+            },
             Some(step_ns) => ClientWindow::Range {
                 grid_start_ns: mp.grid_start_ns,
                 end_ns: mp.end_ns,

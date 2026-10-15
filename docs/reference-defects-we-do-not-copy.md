@@ -85,6 +85,7 @@ replaces one.
 | [30](#30-text-inside-a-quoted-logfmt-value-comes-back-as-labels) | Loki | queries | C | A quote inside a logfmt value turns the rest of the value into labels: `msg="user "bob" role=admin now"` answers `role="admin"`. |
 | [31](#31-a-logfmt-value-holding-a-replacement-character-is-changed-to-hold-a-space) | Loki | queries | C | A logfmt value holding U+FFFD comes back with a space in its place. |
 | [32](#32-a-grouped-avg_over_time-fails-on-a-line-its-own-ungrouped-form-ignores) | Loki | queries | A | `avg_over_time … by (a)` fails on a line that is not JSON, where the same average without `by` and the grouped sum ignore it. |
+| [33](#33-rate_counter-reads-nanoseconds-as-milliseconds) | log reference | queries | A | `rate_counter` over a counter that rose by 60 in a one-minute window answers 1.000006 per second instead of 2. |
 
 ---
 
@@ -2067,6 +2068,46 @@ Ledger row `grouped-avg-over-time-unexplained` (the id predates the
 mechanism; b04, b13, b16, b20, b23, a11 and the `54.25` rows). The
 ungrouped recurrence is pinned by the `service_name="avgr"` rows of
 `crates/pulsus-read/tests/logqltest/corpus/b18_range_agg_grouping.test`.
+
+---
+
+## 33. `rate_counter` reads nanoseconds as milliseconds
+
+**The log reference · queries · test A**
+
+### What the reference does
+
+`extrapolatedRate` (`pkg/logql/range_vector.go:286-353`) holds sample
+times in nanoseconds and divides every span by 1,000
+(`durationMilliseconds`, `:355`), as if they were milliseconds. It also
+anchors the window on its first sample: `rangeStart = first.T -
+selRange_ms` and `rangeEnd = last.T`, so the time before the first sample
+is always the range divided by 1,000 and the time after the last is 0.
+
+| query | samples | reference |
+|---|---|---|
+| `rate_counter({…} \| logfmt \| unwrap c [1m])` at 60 s | `c=200` at 25 s, `c=260` at 35 s | `1.000006` |
+
+### Why that is wrong rather than different
+
+The same arithmetic in its own units answers `2.0`: the counter rose by
+60, each edge of the window is more than 1.1 times the 10 s spacing away,
+so each extends half of it, and `60 * 20 / 10 / 60 = 2`. The reference's
+`1.000006` enters the 60 s range as 0.06 s; no rule of its own produces
+it (**A**).
+
+### What PulsusDB does
+
+Measures every span in seconds from the edges of the window `(t - range,
+t]`, and keeps the rest of the reference's arithmetic in its order; one
+sample still answers 0. The row above answers `2.0`.
+
+### Evidence
+
+Ledger row `rate-counter-window-anchored`, which names the corpus rows and
+the four end-to-end cases that carry it. Pinned by
+`crates/pulsus-read/tests/logql_metric_agg_golden.rs`'s `rate_counter`
+tests.
 
 ---
 

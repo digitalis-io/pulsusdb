@@ -1,9 +1,9 @@
 # Ported instant-eval subset of differential.json — client-aggregated
 # metric reducers, vector aggregation, scalar binop, rate_counter, and
 # sort/sort_desc ordering. Every value is EXACT-f64: counts and clean
-# divisions are hand-derived; the rate_counter values are the bit-exact
-# reference captures pinned in logql_metric_agg_golden.rs (grafana/loki:3.7.4,
-# the #218 ns/ms extrapolation-factor semantics). See PROVENANCE.md.
+# divisions are hand-derived; the rate_counter values are F4's (issue #624,
+# part 4; ledger `rate-counter-window-anchored`), derived by hand in
+# logql_metric_agg_golden.rs. See PROVENANCE.md.
 #
 # provenance: ported(test/fixtures/logs/differential.json)
 # (file default; see logqltest/PROVENANCE.md §provenance markers.
@@ -48,9 +48,11 @@ eval instant at 60s sum by (level) (count_over_time({service_name="svc-logfmt"} 
 
 clear
 
-# --- rate_counter: reset-aware increase, ns/ms extrapolation factor ---
-# Each block is a single counter series `c=<n>` (logfmt | unwrap c). Values
-# are span-dependent bit-exact captures (see logql_metric_agg_golden.rs).
+# --- rate_counter: reset-aware increase, F4's extrapolation ----------
+# Each block is a single counter series `c=<n>` (logfmt | unwrap c). Each
+# value is extrapolated in seconds to the edges of the window `(0, 60s]`
+# and derived in logql_metric_agg_golden.rs (ledger
+# `rate-counter-window-anchored`).
 
 # Reset mid-window (10,30,5,12 @ 10s..40s, span 30s): increase 32.
 load
@@ -60,12 +62,14 @@ load
   30s  c=5
   40s  c=12
 
+# provenance: divergence(rate-counter-window-anchored)
 eval instant at 60s rate_counter({env="prod"} | logfmt | unwrap c [1m])
-  {env="prod", service_name="checkout"} 0.5333344
+  {env="prod", service_name="checkout"} 0.788888888888889
 
 clear
 
-# Duplicate-timestamp delivered-scan-order (5,{10,3}@20s,12, span 20s).
+# Duplicate timestamp, value order (5,{10,3}@20s,12 folds as 5,3,10,12;
+# ledger `unwrap-same-nanosecond-value-order`), with F4's extrapolation.
 load
   {env="prod", service_name="checkout"} service=checkout
   10s  c=5
@@ -73,8 +77,9 @@ load
   20s  c=3
   30s  c=12
 
+# provenance: divergence(unwrap-same-nanosecond-value-order)
 eval instant at 60s rate_counter({env="prod"} | logfmt | unwrap c [1m])
-  {env="prod", service_name="checkout"} 0.2833341833333333
+  {env="prod", service_name="checkout"} 0.26666666666666666
 
 clear
 
@@ -84,20 +89,22 @@ load
   1ns  c=100
   60s  c=160
 
+# provenance: divergence(rate-counter-window-anchored)
 eval instant at 60s rate_counter({env="prod"} | logfmt | unwrap c [1m])
-  {env="prod", service_name="checkout"} 1.000001
+  {env="prod", service_name="checkout"} 1.0000000000166667
 
 clear
 
-# Sparse interior samples (200,260 @ 25s,35s, span 10s): NOT full-range
-# extrapolated (stays ~1.0, never ~6.0).
+# Sparse interior samples (200,260 @ 25s,35s, span 10s): extrapolated
+# 5 s to each side.
 load
   {env="prod", service_name="checkout"} service=checkout
   25s  c=200
   35s  c=260
 
+# provenance: divergence(rate-counter-window-anchored)
 eval instant at 60s rate_counter({env="prod"} | logfmt | unwrap c [1m])
-  {env="prod", service_name="checkout"} 1.000006
+  {env="prod", service_name="checkout"} 2
 
 clear
 

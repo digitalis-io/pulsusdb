@@ -12432,7 +12432,9 @@ const NK_CASES: &[LevelCase] = &[
 
 /// The newest-slice loop answers a trace-value comparison from its first
 /// slice, each value the whole trace's: `dd`'s and `de`'s extents reach
-/// rows dated the day before and the day after.
+/// rows dated the day before and the day after. The window is the hour
+/// before `e`, so `dd`'s root row is outside the window at any time of day
+/// and counts only through the trace's extent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_sliced_search_reads_whole_trace_values() {
     skip_unless_live!();
@@ -12449,7 +12451,7 @@ async fn a_sliced_search_reads_whole_trace_values() {
     let plan = plan_of(
         &engine,
         &parse_query(query),
-        (e - 10_800_000_000_000, e),
+        (e - 3_600_000_000_000, e),
         2,
         20,
     );
