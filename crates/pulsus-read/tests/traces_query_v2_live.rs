@@ -15293,3 +15293,284 @@ async fn the_cap_counts_keyed_series() {
         ("cap(5, 4)", "cap(5, 4)")
     );
 }
+
+// =====================================================================
+// Issue #594 part 5 — the seven trace-level and nested-set fields in a
+// metrics filter
+// =====================================================================
+
+/// A resource holding only `service`.
+fn p5_resource(service: &str) -> Option<Resource> {
+    Some(Resource {
+        attributes: vec![kv("service.name", str_value(service))],
+        dropped_attributes_count: 0,
+        entity_refs: Vec::new(),
+    })
+}
+
+/// Fixture P5: RF, plus in trace `a1…a1` the orphan `…06` (parent `…ee`,
+/// not stored) at `B + 6` and its child `…07` `below` at `B + 7` in a
+/// fourth resource, `svc-d`; in `b2…b2` `…0a` `late`, a child of `…05`
+/// at `B − 400`, outside the window; and trace `c3…c3` in a third
+/// resource, `svc-c`: root `…08` `rootc` at `B − 400`, outside the
+/// window, and its child `…09` `childc` at `B + 10`. `B − 400` is in
+/// another five-minute bucket than every span of the window.
+fn tweak_p5(req: &mut ExportTraceServiceRequest, b: i64) {
+    let at = |s: i64| (b + s) * S_NS;
+    req.resource_spans[0].scope_spans[0].spans.push(rf_span(
+        0xa1,
+        6,
+        Some(0xee),
+        "orphan",
+        1,
+        0,
+        at(6),
+        10 * MS_NS,
+        Vec::new(),
+    ));
+    req.resource_spans[1].scope_spans[0].spans.push(rf_span(
+        0xb2,
+        0x0a,
+        Some(5),
+        "late",
+        1,
+        0,
+        at(-400),
+        MS_NS,
+        Vec::new(),
+    ));
+    let mut c = req.resource_spans[1].clone();
+    c.resource = p5_resource("svc-c");
+    c.scope_spans[0].spans = vec![
+        rf_span(0xc3, 8, None, "rootc", 2, 0, at(-400), S_NS, Vec::new()),
+        rf_span(
+            0xc3,
+            9,
+            Some(8),
+            "childc",
+            3,
+            0,
+            at(10),
+            100 * MS_NS,
+            Vec::new(),
+        ),
+    ];
+    req.resource_spans.push(c);
+    let mut d = req.resource_spans[1].clone();
+    d.resource = p5_resource("svc-d");
+    d.scope_spans[0].spans = vec![rf_span(
+        0xa1,
+        7,
+        Some(6),
+        "below",
+        1,
+        0,
+        at(7),
+        10 * MS_NS,
+        Vec::new(),
+    )];
+    req.resource_spans.push(d);
+}
+
+/// Each of the seven in a metrics filter, as a literal comparison and as
+/// an operand, over P5: the values a search reads — the whole trace's
+/// duration and root, direct children outside the window counted, the
+/// reference's numbering (an orphan and its subtree `0`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_seven_filter_metrics() {
+    skip_unless_live!();
+    let (db, _client, b) = seed_rf("p5", tweak_p5).await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let n = |name: &str| vec![("name", s(name))];
+    let cases: Vec<RfCase> = vec![
+        (
+            "{ nestedSetLeft > 0 }",
+            vec![
+                (n("root"), 1.0),
+                (n("child"), 2.0),
+                (n("root2"), 1.0),
+                (n("child2"), 1.0),
+                (n("childc"), 1.0),
+            ],
+        ),
+        (
+            "{ nestedSetParent = 0 }",
+            vec![(n("orphan"), 1.0), (n("below"), 1.0)],
+        ),
+        (
+            "{ nestedSetParent >= 1 }",
+            vec![(n("child"), 2.0), (n("child2"), 1.0), (n("childc"), 1.0)],
+        ),
+        (
+            "{ nestedSetParent != -1 }",
+            vec![
+                (n("child"), 2.0),
+                (n("orphan"), 1.0),
+                (n("below"), 1.0),
+                (n("child2"), 1.0),
+                (n("childc"), 1.0),
+            ],
+        ),
+        (
+            "{ nestedSetRight = 3 }",
+            vec![(n("child"), 1.0), (n("childc"), 1.0)],
+        ),
+        (
+            "{ span:childCount = 1 }",
+            vec![(n("orphan"), 1.0), (n("root2"), 1.0), (n("child2"), 1.0)],
+        ),
+        (
+            "{ span:childCount = 0 }",
+            vec![(n("child"), 2.0), (n("below"), 1.0), (n("childc"), 1.0)],
+        ),
+        (
+            "{ trace:duration > 30s }",
+            vec![(n("root2"), 1.0), (n("child2"), 1.0), (n("childc"), 1.0)],
+        ),
+        (
+            "{ trace:rootService = \"svc-c\" }",
+            vec![(n("childc"), 1.0)],
+        ),
+        ("{ rootName = \"rootc\" }", vec![(n("childc"), 1.0)]),
+        (
+            "{ trace:duration > duration * 20 }",
+            vec![
+                (n("orphan"), 1.0),
+                (n("below"), 1.0),
+                (n("root2"), 1.0),
+                (n("child2"), 1.0),
+                (n("childc"), 1.0),
+            ],
+        ),
+        (
+            "{ nestedSetRight - nestedSetLeft = 1 }",
+            vec![(n("child"), 2.0), (n("childc"), 1.0)],
+        ),
+        (
+            "{ span:childCount > nestedSetParent }",
+            vec![(n("root"), 1.0), (n("orphan"), 1.0), (n("root2"), 1.0)],
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (filter, want) in &cases {
+        let q = format!("{filter} | count_over_time() by(name)");
+        let got = series_texts(&rf_instant(&engine, &q, b).await, b);
+        let want: Vec<(&[(&str, LV)], f64)> =
+            want.iter().map(|(l, v)| (l.as_slice(), *v)).collect();
+        let want = instant_want(&want);
+        if got != want {
+            wrong.push(format!("{q}\n  want {want:?}\n  got  {got:?}"));
+        }
+    }
+    // A filter and a key on the numbering (D5).
+    let q = "{ nestedSetLeft > 0 } | count_over_time() by(nestedSetParent)";
+    let got = series_texts(&rf_instant(&engine, q, b).await, b);
+    let want = instant_want(&[
+        (&[("nestedSetParent", LV::Int(-1))], 2.0),
+        (&[("nestedSetParent", LV::Int(1))], 4.0),
+    ]);
+    if got != want {
+        wrong.push(format!("{q}\n  want {want:?}\n  got  {got:?}"));
+    }
+    let q = "{ nestedSetParent = 0 } | count_over_time()";
+    let range = rf_range(&engine, q, b).await;
+    let total: f64 = range
+        .as_ref()
+        .map(|r| {
+            r.series
+                .iter()
+                .flat_map(|s| s.samples.iter().map(|(_, v)| *v))
+                .sum()
+        })
+        .unwrap_or(f64::NAN);
+    if total != 2.0 {
+        wrong.push(format!(
+            "{q} (range)\n  want a total of 2\n  got  {range:?}"
+        ));
+    }
+    drop_db(&db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// The seven in a filter beside an attribute or `span:childCount`
+/// target, a ranking, a trailing comparison, a `trace:rootName` key, and
+/// the root's name and service as operands, each answered instant and
+/// range over P5.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_seven_filter_metrics_shapes() {
+    skip_unless_live!();
+    let (db, _client, b) = seed_rf("p5s", tweak_p5).await;
+    let engine = metrics_engine(&db, 1_000).await;
+    // `[labels] -> samples`, as `series_texts` writes it.
+    let one = |labels: &[(&str, LV)], samples: &str| {
+        let labels: Vec<String> = labels.iter().map(|(k, v)| label_text(k, v)).collect();
+        format!("[{}] -> {samples}", labels.join(", "))
+    };
+    let sorted = |mut v: Vec<String>| {
+        v.sort();
+        v
+    };
+    let name = |v: &str| [("name", s(v))];
+    let cases: Vec<(&str, Vec<String>, Vec<String>)> = vec![
+        (
+            "{ nestedSetParent >= 1 } | sum_over_time(span.n)",
+            vec![one(&[("__name__", s("sum_over_time"))], "60:9.5")],
+            vec![one(&[("__name__", s("sum_over_time"))], "60:9.5")],
+        ),
+        (
+            "{ trace:rootService = \"svc-a\" } | avg_over_time(span:childCount)",
+            vec![one(&[("__name__", s("avg_over_time"))], "60:0.6")],
+            vec![one(&[("__name__", s("avg_over_time"))], "60:0.6")],
+        ),
+        (
+            "{ nestedSetLeft > 0 } | count_over_time() by(name) | topk(2)",
+            vec![
+                one(&name("child"), "60:2.0"),
+                one(&name("child2"), "60:1.0"),
+            ],
+            vec![
+                one(&name("child"), "0:0.0 60:2.0"),
+                one(&name("child2"), "0:0.0 60:1.0"),
+            ],
+        ),
+        (
+            "{ span:childCount = 0 } | count_over_time() by(trace:rootName) > 1",
+            vec![one(&[("trace:rootName", s("root"))], "60:3.0")],
+            vec![one(&[("trace:rootName", s("root"))], "60:3.0")],
+        ),
+        (
+            "{ name = trace:rootName } | count_over_time() by(name)",
+            vec![one(&name("root"), "60:1.0"), one(&name("root2"), "60:1.0")],
+            vec![
+                one(&name("root"), "0:0.0 60:1.0"),
+                one(&name("root2"), "0:0.0 60:1.0"),
+            ],
+        ),
+        (
+            "{ resource.service.name = trace:rootService } | count_over_time()",
+            vec![one(&[("__name__", s("count_over_time"))], "60:7.0")],
+            vec![one(&[("__name__", s("count_over_time"))], "0:0.0 60:7.0")],
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (q, instant, range) in cases {
+        for (form, got, want) in [
+            (
+                "instant",
+                series_texts(&rf_instant(&engine, q, b).await, b),
+                sorted(instant),
+            ),
+            (
+                "range",
+                series_texts(&rf_range(&engine, q, b).await, b),
+                sorted(range),
+            ),
+        ] {
+            if got != want {
+                wrong.push(format!("{q} ({form})\n  want {want:?}\n  got  {got:?}"));
+            }
+        }
+    }
+    drop_db(&db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

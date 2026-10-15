@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use futures::StreamExt;
 use pulsus_clickhouse::ChError;
 
-use super::{TraceEngine, hex16, map_trace_metrics_error, metrics_settings, with_final};
+use super::{TraceEngine, hex16, map_trace_metrics_error, statement_settings};
 use crate::logql::error::{ReadError, TooBroadReason};
 use crate::traces::log2_histogram;
 use crate::traces::metrics_plan::{PlanKind, RangeAxis, TraceMetricsPlan};
@@ -53,9 +53,9 @@ impl TraceEngine {
         frame(routed.plan(), statement, rows, None)
     }
 
-    /// Issues `sql` under the metrics settings with `final = 1`.
+    /// Issues `sql` under [`statement_settings`].
     async fn metric_statement_rows(&self, sql: &str) -> Result<Vec<MetricStatementRow>, ReadError> {
-        let settings = with_final(metrics_settings(&self.config));
+        let settings = statement_settings(&self.config);
         let mut stream = self
             .dispatch
             .query_stream::<MetricStatementRow, _>(sql, &settings, |e| self.map_statement_error(e))

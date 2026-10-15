@@ -3548,6 +3548,11 @@ fn metrics_settings(config: &TraceReadConfig) -> QuerySettings {
     }
 }
 
+/// The settings the metrics statement runs under (issue #594 part 5).
+fn statement_settings(config: &TraceReadConfig) -> QuerySettings {
+    with_final(metrics_settings(config))
+}
+
 /// The Layer-1 settings the §4.5 service-graph query carries (issue #173):
 /// the full search budget set ([`search_settings`] — `max_rows_to_read =
 /// scan_budget_rows` throw bounds the join's scan + hash-table cost, plus
@@ -5117,6 +5122,28 @@ mod tests {
         assert!(clustered.contains("local"));
     }
 
+    /// Issue #594 part 5 (D3): the metrics statement builds the sets of
+    /// the seven fields under the read memory ceiling, with no set limit;
+    /// clustered, it keeps the local product mode the sets need.
+    #[test]
+    fn the_statement_builds_sets_under_the_memory_ceiling() {
+        let s = statement_settings(&cfg());
+        assert_eq!(s.get("max_rows_in_set"), Some("0"));
+        assert_eq!(s.get("max_bytes_in_set"), Some("0"));
+        assert_eq!(s.get("final"), Some("1"));
+        assert_eq!(
+            s.get("max_memory_usage"),
+            Some(TEST_READ_MEM.to_string().as_str())
+        );
+        assert_eq!(s.get("distributed_product_mode"), None);
+        let mut clustered = cfg();
+        clustered.distributed = true;
+        assert_eq!(
+            statement_settings(&clustered).get("distributed_product_mode"),
+            Some("local")
+        );
+    }
+
     /// Issue #173: `graph_settings` carries the search row/byte budget and
     /// gates `distributed_product_mode='local'` on clustered mode only (so
     /// the `pair_id` join runs shard-local), and never carries the metrics
@@ -5218,6 +5245,7 @@ mod tests {
                 // `fetch_by_id`'s settings object, by construction.
                 ("fetch_by_id (point read)", catalog_settings(&c)),
                 ("metrics_settings", metrics_settings(&c)),
+                ("statement_settings", statement_settings(&c)),
                 ("graph_settings", graph_settings(&c)),
             ] {
                 assert_eq!(

@@ -10,7 +10,7 @@ use pulsus_read::{SpanFilterCtx, StatementTables, plan_trace_metrics_routed};
 
 /// `(stem, query)`: every golden, over `start = 1791400000`, `end =
 /// 1791410800`, `step = 60s`, `max_series = 1000` and the default budget.
-const CASES: [(&str, &str); 20] = [
+const CASES: [(&str, &str); 23] = [
     ("rate_match_all", "{} | rate()"),
     ("rate_by_service", "{} | rate() by(resource.service.name)"),
     (
@@ -66,6 +66,13 @@ const CASES: [(&str, &str); 20] = [
     ("by_root_service", "{} | rate() by(trace:rootService)"),
     ("by_nested_parent", "{} | rate() by(nestedSetParent)"),
     ("by_child_count", "{} | rate() by(span:childCount)"),
+    // Issue #594 part 5: the seven in a filter.
+    ("filter_trace_duration", "{ trace:duration > 1s } | rate()"),
+    ("filter_child_count", "{ span:childCount > 1 } | rate()"),
+    (
+        "filter_nested_left",
+        "{ nestedSetLeft > 0 } | rate() by(resource.service.name)",
+    ),
 ];
 
 fn golden_dir() -> std::path::PathBuf {
@@ -118,7 +125,7 @@ fn golden(stem: &str, query: &str) -> String {
     }
 }
 
-/// The twenty goldens, byte for byte, collected and asserted once.
+/// The twenty-three goldens, byte for byte, collected and asserted once.
 #[test]
 fn spans_metrics_goldens_match() {
     let mut missing: Vec<String> = Vec::new();

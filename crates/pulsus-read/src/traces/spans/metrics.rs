@@ -1096,27 +1096,45 @@ mod tests {
         }
     }
 
-    /// D1: the seven trace-level and nested-set fields, a child count and
-    /// a `!` demand keep today's answer; a numbered comparison today's
-    /// planner serves keeps today's plan, with no statement.
+    /// #594 part 5 (D1, D2): the seven trace-level and nested-set fields
+    /// take the statement, which binds what each reads — the per-trace
+    /// scalar for a trace leaf or a child count, the operand's pairs, the
+    /// numbered traces — in both forms; a `!` demand keeps today's answer.
     #[test]
-    fn the_seven_and_demands_keep_todays_answer() {
-        for q in [
-            "{ trace:duration > 1s } | rate()",
-            "{ duration > trace:duration / 2 } | rate()",
-            "{ nestedSetLeft > 0 } | rate()",
-            "{ span:childCount > 1 } | rate()",
-            "{ !span.a } | rate()",
+    fn the_seven_take_the_statement() {
+        for (q, binding) in [
+            ("{ trace:duration > 1s } | rate()", "AS per_trace"),
+            ("{ rootServiceName = \"a\" } | rate()", "AS per_trace"),
+            ("{ trace:rootName = \"a\" } | rate()", "AS per_trace"),
+            (
+                "{ duration > trace:duration / 2 } | rate()",
+                "AS tv_duration",
+            ),
+            ("{ span:childCount > 1 } | rate()", "AS per_trace"),
+            ("{ nestedSetLeft > 0 } | rate()", "AS nested_keys"),
+            ("{ nestedSetRight < 100 } | rate()", "AS nested_keys"),
+            ("{ nestedSetParent >= 1 } | rate()", "AS nested_keys"),
+            ("{ nestedSetParent != -1 } | rate()", "AS nested_keys"),
+            (
+                "{ nestedSetRight - nestedSetLeft = 1 } | rate()",
+                "AS nested_keys",
+            ),
         ] {
-            let want = today(q, &PARAMS).expect_err("today's planner refuses it");
-            match routed(q, &PARAMS) {
-                Err(got) => assert_eq!(got, want, "{q}"),
-                Ok(r) => panic!("{q}: routed accepted it, statement {:?}", r.statement()),
+            let r = routed(q, &PARAMS).unwrap_or_else(|e| panic!("{q}: routed refused: {e}"));
+            let s = r.statement().unwrap_or_else(|| panic!("{q}: no statement"));
+            for (form, sql) in [("range", s.range_sql()), ("instant", s.instant_sql())] {
+                assert!(
+                    sql.contains(binding),
+                    "{q}: the {form} form lacks {binding}"
+                );
             }
         }
-        let q = "{ nestedSetParent >= 1 } | rate()";
-        let r = routed(q, &PARAMS).unwrap_or_else(|e| panic!("{q}: routed refused: {e}"));
-        assert!(r.statement().is_none(), "{q}: a statement");
+        let q = "{ !span.a } | rate()";
+        let want = today(q, &PARAMS).expect_err("today's planner refuses it");
+        match routed(q, &PARAMS) {
+            Err(got) => assert_eq!(got, want, "{q}"),
+            Ok(r) => panic!("{q}: routed accepted it, statement {:?}", r.statement()),
+        }
     }
 
     /// D1: `compare()` stays on today's planner, and so does an intrinsic
