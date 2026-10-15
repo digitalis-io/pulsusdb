@@ -1577,7 +1577,7 @@ const EXPECTED_CENSUS: [(FrameKey, &str); 16] = [
     // object has to drop. Same single scan, one more `.clear` (the new
     // `sm_over_stream` list) and one more `.push`.
     // Issue #507: the per-pair loop moved into `merge_metadata_pairs`, which
-    // the pairs sibling the extracted-field group key read uses shares, so
+    // the pairs sibling the reduced fold uses shares, so
     // this frame now calls it once in place of the loop's own calls.
     (("labels.rs", None, "merge_labels_with_structured_metadata"),
      ".clearx5 .clonedx1 .drainx1 .extendx1 .iterx1 .lenx1 Somex1 merge_metadata_pairsx1 parse_canonical_labels_intox1"),

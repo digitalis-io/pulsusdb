@@ -1373,11 +1373,10 @@ fn the_compile_sites_are_enumerated_from_the_callers_of_the_compiler() {
         ),
         (
             "exec.rs",
-            13,
+            12,
             0,
             "streams :1160, metric :1444 (incl. every binary leaf), the bucketed range \
-             read's capability-join fallback, the extracted-field group key read, \
-             detected_fields, tail, and — since issue #544 — the restored client stage a \
+             read's capability-join fallback, detected_fields, tail, and — since issue #544 — the restored client stage a \
              metric read swaps in when its structured-metadata fragment exceeds its budget. \
              That seventh site compiles `MetadataLowering::client_without_lowering`, which \
              is the pipeline the planner would have carried, so any logfmt expression in it \
@@ -1390,10 +1389,7 @@ fn the_compile_sites_are_enumerated_from_the_callers_of_the_compiler() {
              sites themselves are not driven by anything here. The bucketed fallback is a \
              fifth site no position needs: it compiles `bucketed_fallback_client_agg`'s \
              pipeline, which is EMPTY by construction, so no user stage of any kind reaches \
-             that compiler. The extracted-field group key read compiles a pipeline this \
-             file's positions never write either: the planner admits only a `json` stage, \
-             label filters and an `unwrap` (issue #507), so no logfmt expression can be in it. \
-             Issue #624 part 2 adds the eighth and ninth: a staged plan's pipeline, compiled \
+             that compiler. Issue #624 part 2 adds the eighth and ninth: a staged plan's pipeline, compiled \
              before any read, and the same pipeline less its line filters, compiled for the \
              fold. Both hold only the stages `label_only_pipeline` admits — line filters, \
              label filters, `drop`, `keep`, `decolorize` — and, since issue #624 part 3a, \
@@ -1404,10 +1400,11 @@ fn the_compile_sites_are_enumerated_from_the_callers_of_the_compiler() {
              fallback would each run, to render the `rx` column of their `regexp` stages. \
              Each is a pipeline one of the executing sites above compiles for the same \
              query, so any logfmt expression in it is one those sites already compile. \
-             Issue #624 part 4 adds the thirteenth: a reduced plan's today's-route \
-             pipeline, compiled before any read. The planner admits only line filters, \
-             label filters and one `unwrap` there (`reduced_unwrap_route`), so no logfmt \
-             expression reaches it",
+             Issue #624 part 4 adds the twelfth: a reduced plan's today's-route \
+             pipeline, compiled before any read. Since part 4b it may hold one `| logfmt` \
+             (`reduced_unwrap_route`); it is the pipeline the metric site at :1444 compiles \
+             for the same query, so any logfmt expression in it is one that site already \
+             compiles",
         ),
         (
             "plan.rs",
@@ -1422,18 +1419,10 @@ fn the_compile_sites_are_enumerated_from_the_callers_of_the_compiler() {
             "reduce.rs",
             1,
             0,
-            "the reduced fold (issue #624, part 4) compiles a reduced plan's key stages: its \
-             label filters and `unwrap`, the planner having admitted no parser \
-             (`reduced_unwrap_route`), so no logfmt expression can be in them",
-        ),
-        (
-            "unwrap_group.rs",
-            1,
-            0,
-            "the test-only group key probe (`group_key_probe`, issue #507) compiles the \
-             pipeline the planner admitted for the extracted-field group key read, for the \
-             agreement measurement; that pipeline is a `json` stage, label filters and an \
-             `unwrap`, so no logfmt expression can be in it, and no position here reaches it",
+            "the reduced fold (issue #624, parts 4 and 4b) compiles a reduced plan's key \
+             stages: its pipeline less the line filters and the filters the statement \
+             applied, so any logfmt expression in them (part 4b's one parser) is one the \
+             metric site in `exec.rs` already compiles for the same query",
         ),
         (
             "variants.rs",
