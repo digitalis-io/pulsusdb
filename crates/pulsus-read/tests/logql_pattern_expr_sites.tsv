@@ -123,7 +123,7 @@ Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:11550	-	-	<p> <_>	accep
 Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:11603	-	-	<a> <_>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:11603	-	-	<a> <_>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:13410	-	-	, 	reject	reject	-	-	-
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:14177	-	-	<_> route=<route> latency=<latency>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:14190	-	-	<_> route=<route> latency=<latency>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-server/tests/categorize_labels_differential.rs:201	-	-	PT <app> <trace_id> end	accept	accept	-	-	-
 Site	Literal	crates/pulsus-server/tests/fixtures/categorize_labels/capture.json:145	-	-	PT <app> <trace_id> end	accept	accept	-	-	-
 Site	Literal	docs/benchmarks/logs-differential-ledger.md:4189	-	-	<a> <a>	accept	reject	-	-	b25_pattern_expr_reject.test's eval_fail rows and the ledger's window-independence table -- THE ISSUE. Added by this change to pin the move, not moved by it
