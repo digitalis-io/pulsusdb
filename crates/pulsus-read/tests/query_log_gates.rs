@@ -4442,9 +4442,9 @@ fn cap_refusal_624(cap: Cap624, e: &ReadError) -> bool {
 /// today's route answers.** For a fingerprint-route and a label-route query,
 /// at a range equal to and above the step, the smallest cap today's route
 /// answers at is the lowered route's: it answers there with today's matrix
-/// and refuses one below. And where today's route reserves a grid for
-/// streams whose lines lie only in the gaps between windows, the lowered
-/// route answers below it.
+/// and refuses one below. And streams whose lines lie only in the gaps
+/// between windows reserve no grid on either route (today's route since
+/// part 6).
 #[tokio::test]
 async fn a_reducing_aggregation_answers_wherever_todays_route_answers() {
     skip_unless_live!();
@@ -4560,8 +4560,8 @@ async fn a_reducing_aggregation_answers_wherever_todays_route_answers() {
     let cap = Cap624::ResultPoints;
     let today = min_cap_624(&db, true, cap, &query, &params, 100_000).await;
     assert_eq!(
-        today, 3_300,
-        "today's route reserves a grid for all 300 fingerprints"
+        today, 2_200,
+        "today's route reserves no grid for a fingerprint whose lines are all in gaps (#624, part 6)"
     );
     let want = run_624(
         &db,
@@ -4581,33 +4581,6 @@ async fn a_reducing_aggregation_answers_wherever_todays_route_answers() {
     )
     .await;
     assert_eq!(got.as_ref().ok(), Some(&want), "{query} at {today}");
-    let at_main = run_624(
-        &db,
-        hooks_624(false, Some((cap, 2_200)), None),
-        None,
-        &query,
-        &params,
-    )
-    .await;
-    assert_eq!(
-        at_main.as_ref().ok(),
-        Some(&want),
-        "the lowered route answers at 2,200"
-    );
-    let todays_at_main = run_624(
-        &db,
-        hooks_624(true, Some((cap, 2_200)), None),
-        None,
-        &query,
-        &params,
-    )
-    .await;
-    assert!(
-        todays_at_main
-            .as_ref()
-            .is_err_and(|e| cap_refusal_624(cap, e)),
-        "today's route refuses at 2,200: {todays_at_main:?}"
-    );
     drop_db_624(&admin, &db).await;
 }
 
@@ -4733,6 +4706,8 @@ async fn fingerprints_that_return_no_group_charge_nothing() {
 /// **T9 (issue #624, part 2): a row no window holds neither fails the query
 /// nor counts, as in the reference.** Stream A carries `n="7"`, a line every
 /// 10 s from `T-60s` to `T+270s`; stream B carries `n="bad"`, one line.
+/// Part 6 adds today's route: forced, and reached by a query that does not
+/// lower (`| label_format`).
 #[tokio::test]
 async fn a_row_no_window_holds_neither_fails_nor_counts() {
     skip_unless_live!();
@@ -4806,6 +4781,56 @@ async fn a_row_no_window_holds_neither_fails_nor_counts() {
                     got.as_ref().ok(),
                     Some(&want),
                     "{range} with B at {b_at}: {got:?}"
+                );
+                // Issue #624, part 6: today's route answers the same, whether
+                // forced or reached by a query that does not lower.
+                let todays = run_624(
+                    &db,
+                    hooks_624(true, None, None),
+                    None,
+                    &query(range),
+                    &params,
+                )
+                .await;
+                assert_eq!(
+                    todays.as_ref().ok(),
+                    Some(&want),
+                    "today's route {range}: {todays:?}"
+                );
+                let lf = format!(
+                    r#"count_over_time({{service_name="c624gap"}} | n > 5 | label_format m="x" [{range}])"#
+                );
+                let lf_comment = format!("c624p6-{}", uuid::Uuid::new_v4().simple());
+                let lf_got = run_624(
+                    &db,
+                    hooks_624(false, None, None),
+                    Some(&lf_comment),
+                    &lf,
+                    &params,
+                )
+                .await;
+                let mut lf_labels = a_labels.clone();
+                lf_labels.push(("m".to_string(), "x".to_string()));
+                lf_labels.sort();
+                let lf_want: Vec<AnswerSeries> = vec![(
+                    lf_labels,
+                    (0..5).map(|k| (t + k * 60 * sec, v.to_bits())).collect(),
+                )];
+                assert_eq!(
+                    lf_got.as_ref().ok(),
+                    Some(&lf_want),
+                    "label_format {range}: {lf_got:?}"
+                );
+                let lf_logged = logged_624(&admin, std::slice::from_ref(&lf_comment)).await;
+                assert!(
+                    lf_logged[&lf_comment]
+                        .iter()
+                        .all(|r| !is_lowered_624(&r.query))
+                        && lf_logged[&lf_comment]
+                            .iter()
+                            .any(|r| is_todays_624(&r.query)),
+                    "label_format stays on today's route: {:#?}",
+                    lf_logged[&lf_comment]
                 );
             }
             None => {
