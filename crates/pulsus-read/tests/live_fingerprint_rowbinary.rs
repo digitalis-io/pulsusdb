@@ -23,15 +23,12 @@
 //!   18446744073709551618   2^64 + 2   its neighbour
 //! ```
 //!
-//! **The inventory.** Twenty-two production `Row` structs carry a
-//! `fingerprint` field — ten in `logql/rows.rs`, four in
+//! **The inventory.** Twenty-one production `Row` structs carry a
+//! `fingerprint` field — nine in `logql/rows.rs`, four in
 //! `metrics/sample_rows.rs`, one in `metrics/rows.rs`, one in
 //! `metrics/exec.rs` and six in `pulsus-write`'s `writer/rows.rs`. One of
 //! them was private, which is why a `pub struct` search once returned one
-//! fewer; it is `pub` now with that reason recorded on it. One more, `MetricRangeUnwrappedRow`, carries no
-//! `fingerprint` field but reads the `class` column, which is the
-//! fingerprint itself when the group-key plan groups per fingerprint — so
-//! it is exercised here too.
+//! fewer; it is `pub` now with that reason recorded on it.
 //!
 //! ```text
 //!   podman: the shared instance, HTTP 18123
@@ -372,7 +369,7 @@ async fn every_fingerprint_row_struct_round_trips_the_uint128_column() {
     seed(&client, &db).await;
     let fps = fp_in_list();
 
-    // --- crates/pulsus-read/src/logql/rows.rs (10) --------------------
+    // --- crates/pulsus-read/src/logql/rows.rs (9) ---------------------
     let rows: Vec<logql_rows::StreamRow> = read_all(
         &client,
         "StreamRow",
@@ -500,49 +497,6 @@ async fn every_fingerprint_row_struct_round_trips_the_uint128_column() {
     assert_the_four_boundary_values(
         "MetricRangeBucketRow",
         rows.into_iter().map(|r| r.fingerprint).collect(),
-    );
-
-    // `UnwrappedLaneRow` carries BOTH a `class` and a `fingerprint`, and
-    // `class` is the fingerprint itself on the per-fingerprint plan — the
-    // shape `unwrapped_class_expr` renders when there is no grouping.
-    let rows: Vec<logql_rows::UnwrappedLaneRow> = read_all(
-        &client,
-        "UnwrappedLaneRow",
-        &format!(
-            "SELECT fingerprint AS class, timestamp_ns AS bucket_ns, toUInt8(1) AS decided, \
-             CAST([], 'Array(Tuple(UInt8, String))') AS keys, toFloat64(7) AS v, \
-             '' AS body, fingerprint, '' AS sm_text, \
-             CAST([], 'Array(Tuple(String, String))') AS sm_kept \
-             FROM log_samples WHERE fingerprint IN ({fps}) ORDER BY fingerprint"
-        ),
-    )
-    .await;
-    assert_the_four_boundary_values(
-        "UnwrappedLaneRow (fingerprint)",
-        rows.iter().map(|r| r.fingerprint).collect(),
-    );
-    assert_the_four_boundary_values(
-        "UnwrappedLaneRow (class)",
-        rows.into_iter().map(|r| r.class).collect(),
-    );
-
-    // The twenty-second: no `fingerprint` field, but its `class` column is
-    // the fingerprint on the per-fingerprint plan.
-    let rows: Vec<logql_rows::MetricRangeUnwrappedRow> = read_all(
-        &client,
-        "MetricRangeUnwrappedRow",
-        &format!(
-            "SELECT fingerprint AS class, timestamp_ns AS bucket_ns, \
-             CAST([], 'Array(Tuple(UInt8, String))') AS keys, toFloat64(7) AS v, \
-             toUInt64(1) AS n_value, toUInt64(0) AS n_missing, toUInt64(0) AS n_undecided, \
-             '' AS sm_text, CAST([], 'Array(Tuple(String, String))') AS sm_kept \
-             FROM log_samples WHERE fingerprint IN ({fps}) ORDER BY class"
-        ),
-    )
-    .await;
-    assert_the_four_boundary_values(
-        "MetricRangeUnwrappedRow (class)",
-        rows.into_iter().map(|r| r.class).collect(),
     );
 
     // --- crates/pulsus-read/src/metrics/sample_rows.rs (4) ------------

@@ -73,7 +73,7 @@ use pulsus_read::logql::{
     MetricNode, MetricPlan, Plan, PlanCtx, QueryParams, QueryResult, QuerySpec, Warnings,
     apply_label_replace, apply_vector_aggs, bucketed_fallback_client_agg, combine_binary,
     ensure_result_series, final_series_gate_applies, materialize_vector_lit, plan,
-    run_client_agg_rows_folded, run_variants_rows, unwrapped_fallback_client_agg,
+    run_client_agg_rows_folded, run_variants_rows,
 };
 
 /// A sorted label set.
@@ -380,11 +380,10 @@ pub enum EvalMode {
     /// byte-exactly (issue #240).
     Fail,
     /// Compare as a set, like [`EvalMode::Value`], but **within the
-    /// tolerance the entry carries** (issue #507 W4): `eval_approx
+    /// tolerance the entry carries** (issue #507): `eval_approx
     /// <tolerance> instant at <T> <query>`.
     ///
-    /// Admitted for the FOUR reducers the database aggregates, and no
-    /// others.
+    /// Admitted for a query the database reduces, and no other.
     ///
     /// A NEW verb rather than a flag on `eval`, so every entry written
     /// before this one parses and compares through exactly the code it
@@ -392,11 +391,9 @@ pub enum EvalMode {
     /// times.
     ///
     /// The tolerance is `2(n−1)·u·Σ|vᵢ|`, the most two evaluation orders
-    /// of the same values can differ by, and it exists because the
-    /// database chooses the summation order for the five unwrapped
-    /// reducers. It is REFUSED on any other query — see
-    /// [`approx_reducer_is_eligible`], which is what stops it being
-    /// reached for to silence an unrelated failure.
+    /// of the same values can differ by; issue #507's statement chose its
+    /// own summation order. It is REFUSED on any other query, which is
+    /// what stops it being reached for to silence an unrelated failure.
     Approx,
 }
 
@@ -435,7 +432,7 @@ pub struct EvalCmd {
     /// `eval_fail` only: the required error assertion (issue #240 —
     /// exactly one per `eval_fail`, enforced at parse time).
     pub fail_msg: Option<FailAssert>,
-    /// `eval_approx` only (issue #507 W4): the per-entry tolerance. `None`
+    /// `eval_approx` only (issue #507): the per-entry tolerance. `None`
     /// for every other verb, and `None` is what selects the `to_bits()`
     /// comparison, so no existing entry can reach the tolerance path.
     pub tolerance: Option<f64>,
@@ -476,7 +473,7 @@ pub struct DirectiveCounts {
     pub eval_value: usize,
     pub eval_ordered: usize,
     pub eval_fail: usize,
-    /// `eval_approx <tolerance>` (issue #507 W4).
+    /// `eval_approx <tolerance>` (issue #507).
     pub eval_approx: usize,
     pub streams_cases: usize,
     pub vector_cases: usize,
@@ -672,19 +669,14 @@ fn strip_eval_prefix(directive: &str) -> Option<(EvalMode, &str)> {
 }
 
 /// **`eval_approx` is admitted only for a query the DATABASE aggregates**
-/// (issue #507 W4, review round 2).
+/// (issue #507, review round 2; since issue #624, part 4b, a reduced plan).
 ///
-/// Round 1 checked the reducer name, which is not the condition: a
-/// `| logfmt | unwrap` chain names one of the four and is evaluated here,
-/// in one order, exactly. The condition is whether the planner lowers the
-/// aggregation, and the only thing that knows is the planner — so this
-/// PLANS the entry's own query at the entry's own window and requires
-/// `MetricValue::Unwrapped`.
+/// The condition is whether the planner lowers the aggregation, and the
+/// only thing that knows is the planner — so this PLANS the entry's own
+/// query at the entry's own window and requires `MetricValue::Reduced`.
 ///
 /// **Asking the planner rather than restating it** is what stops this
-/// drifting from `plan.rs`'s `unwrapped_chain`: the parser, the
-/// conversion, the underscore rule, the range-equals-step rule and the
-/// reducer set are all one answer here, and a change to any of them moves
+/// drifting from `plan.rs`'s `reduced_unwrap_route`: a change to it moves
 /// this check with it.
 ///
 /// A tolerance that could be written on any entry would be reached for
@@ -712,7 +704,7 @@ fn approx_query_lowers(query: &str, spec: QuerySpec) -> Result<(), String> {
     }
     let client_side: Vec<String> = leaves
         .iter()
-        .filter(|mp| !matches!(mp.value, MetricValue::Unwrapped(_)))
+        .filter(|mp| !matches!(mp.value, MetricValue::Reduced(_)))
         .map(|mp| format!("{} ({})", mp.op, mp.routing.reason))
         .collect();
     if !client_side.is_empty() {
@@ -731,7 +723,7 @@ fn parse_eval(
     lines: &[&str],
     directive_idx: usize,
 ) -> Result<(EvalCmd, usize), String> {
-    // Issue #507 W4: `eval_approx` carries its tolerance between the verb
+    // Issue #507: `eval_approx` carries its tolerance between the verb
     // and the window, so it is consumed here and every other verb sees the
     // `rest` it saw before — the whole grammar below is untouched.
     let (tolerance, rest) = if mode == EvalMode::Approx {
@@ -1353,9 +1345,6 @@ fn eval_leaf(mp: &MetricPlan, store: &Store) -> Result<QueryResult, String> {
             {
                 Some(restored) => restored,
                 None => match &mp.value {
-                    pulsus_read::logql::sql::MetricValue::Unwrapped(u) => {
-                        unwrapped_fallback_client_agg(mp, u)
-                    }
                     pulsus_read::logql::sql::MetricValue::Shaped(_) => {
                         bucketed_fallback_client_agg(mp)
                     }
@@ -1842,7 +1831,7 @@ fn parse_expected_matrix(line: &str) -> Result<(Labels, Vec<(i64, f64)>), String
     Ok((labels, points))
 }
 
-/// Whether an expected value and a produced one agree (issue #507 W4).
+/// Whether an expected value and a produced one agree (issue #507).
 ///
 /// `None` — every verb but `eval_approx` — is the `f64::to_bits()`
 /// equality this corpus has always used, reached through the same

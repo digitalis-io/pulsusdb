@@ -2921,7 +2921,7 @@ fn the_regex_compile_sites_are_enumerated_from_the_source() {
         (
             "plan.rs",
             &[
-                ("compile_regex_as_database(", 1),
+                ("compile_regex_as_database(", 2),
                 ("validate_unanchored_regex(", 1),
                 ("compile_user_regex_anchored(", 1),
                 ("re2_rejection_construct(", 1),
@@ -2943,7 +2943,9 @@ fn the_regex_compile_sites_are_enumerated_from_the_source() {
              **Issue #624 part 3a added `compile_regex_as_database(`** in \
              `regexp_count_route`, which compiles a `regexp` count's pattern to read its group \
              names and indexes. It decides no verdict: a pattern it cannot compile only keeps \
-             the query on today's route, whose pipeline compile then answers.",
+             the query on today's route, whose pipeline compile then answers. **Issue #624 \
+             part 4b added the second**, in `reduced_parser`, for the same purpose before an \
+             `| unwrap`.",
         ),
         (
             "template/funcs.rs",

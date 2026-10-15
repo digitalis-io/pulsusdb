@@ -2072,7 +2072,7 @@ const TOTAL: usize = 1_817;
 /// `match(body, '(')` fixture proving `MetricShape`/`source_shape` refuse a
 /// foreign column pair).
 ///
-/// Issue #507: `predicate.rs` gains the extracted-field group key read's
+/// Issue #507: `predicate.rs` gains the JSON readers'
 /// spelling guards (8 -> 15), and `sql.rs` loses the unwrapped statement's
 /// two value-guard renderings and their byte-exact test (6 -> 2), so its
 /// production code renders no `match(` again.
@@ -2089,8 +2089,9 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
     // each of the two `| json` key readers. Issue #624, part 4 adds twelve:
     // the `| unwrap` conversions' grammar tests in
     // `reduced_conversion_columns`, two for numbers, six for durations and
-    // four for bytes.
-    ("pulsus-read/src/logql/sql.rs", 17),
+    // four for bytes. Part 4b removes one: the two `| json` readers are one,
+    // `json_value_reader`.
+    ("pulsus-read/src/logql/sql.rs", 16),
     ("pulsus-read/src/metrics/dispatch.rs", 5),
     // Issue #623: the counts follow the test expectations of the lookup and
     // activity reads — a regex matcher on the lookup and its probe line on
@@ -2126,7 +2127,7 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
 
 /// The separately-asserted total, so "a file appeared" reads differently
 /// from "a file grew".
-const MATCH_RENDER_TOTAL: usize = 121;
+const MATCH_RENDER_TOTAL: usize = 120;
 
 /// Every string-literal CONTENT in a Rust source: ordinary `"…"`, raw
 /// `r"…"`/`r#"…"#`, byte `b"…"` and byte-raw. Comments are dropped.
@@ -2476,10 +2477,10 @@ const PREDICATE_ITEMS: &[&str] = &[
     "const JSON_FLATTEN_KEY_BUDGET: u64 = 64 * 1024 * 1024",
     "#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
     "pub enum ReaderColumns",
-    "pub enum ReaderColumns :: Unwrap,",
     "pub enum ReaderColumns :: Key(usize),",
+    "pub enum ReaderColumns :: X,",
     "impl ReaderColumns",
-    "impl ReaderColumns :: fn prefix(self) -> String",
+    "impl ReaderColumns :: pub(crate) fn prefix(self) -> String",
     "#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
     "pub enum KeyReaderRefusal",
     "pub enum KeyReaderRefusal :: NameNotRenderable,",
@@ -2665,7 +2666,8 @@ const PREDICATE_IMPLS: &[&str] = &[
     // private constant that holds it.
     "impl MetadataTerm",
     // Issue #507: `ReaderColumns` carries no text either — it names which
-    // reader columns (`uw_` or `l<i>_`) a key-route fragment reads.
+    // reader columns (`l<i>_` or, since issue #624 part 4b, `lx_`) a
+    // fragment reads.
     "impl ReaderColumns",
 ];
 
