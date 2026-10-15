@@ -2506,6 +2506,7 @@ fn reduced_unwrap_route(
             grouping: grouping.map(|g| Box::new(g.clone())),
         },
         instant: false,
+        parser: None,
     })
 }
 
@@ -10135,6 +10136,186 @@ mod tests {
                 panic!("{query}: a variants node");
             };
             assert!(scan.client.is_some(), "{query} ({spec:?}): today's route");
+        }
+    }
+
+    /// **T1 (issue #624, part 4b): an `| unwrap` reducer after one parser
+    /// lowers where the key holds the series.** The bare `| json` and
+    /// `| logfmt` lower in keep mode only (D4); the targeted forms,
+    /// `| regexp` and `| pattern` in either mode; two parsers, a stage that
+    /// rewrites the line before the parser, and a `| json` expression that
+    /// is not plain field segments stay on today's route.
+    #[test]
+    fn unwrap_after_a_parser_lowers_where_the_key_holds_the_series() {
+        let range = QuerySpec::Range {
+            start_ns: 600_000_000_000,
+            end_ns: 1_200_000_000_000,
+            step_ns: 60_000_000_000,
+        };
+        let instant = QuerySpec::Instant {
+            at_ns: 1_200_000_000_000,
+        };
+        let strings =
+            |names: &[&str]| -> Vec<String> { names.iter().map(|n| n.to_string()).collect() };
+        let route_key = || {
+            vec![sql::UnwrapKeyLabel {
+                label: "route".to_string(),
+                source: "route".to_string(),
+            }]
+        };
+        // (stage, bare, the parser the plan carries)
+        let parsers: [(&str, bool, sql::ReducedParser); 6] = [
+            (
+                "| json",
+                true,
+                sql::ReducedParser::Json {
+                    form: sql::UnwrapForm::Bare,
+                    keys: route_key(),
+                    x_path: strings(&["latency"]),
+                },
+            ),
+            (
+                r#"| json latency="latency", route="route""#,
+                false,
+                sql::ReducedParser::Json {
+                    form: sql::UnwrapForm::Targeted,
+                    keys: route_key(),
+                    x_path: strings(&["latency"]),
+                },
+            ),
+            (
+                "| logfmt",
+                true,
+                sql::ReducedParser::Logfmt {
+                    names: strings(&["route"]),
+                    x_source: "latency".to_string(),
+                    x_destination: None,
+                },
+            ),
+            (
+                r#"| logfmt latency="latency", route="route""#,
+                false,
+                sql::ReducedParser::Logfmt {
+                    names: strings(&["route"]),
+                    x_source: "latency".to_string(),
+                    x_destination: Some("latency".to_string()),
+                },
+            ),
+            (
+                r#"| regexp "route=(?P<route>\\S+) latency=(?P<latency>\\S+)""#,
+                false,
+                sql::ReducedParser::Capture {
+                    parser: sql::CaptureParser::Regexp,
+                    pattern: r"route=(?P<route>\S+) latency=(?P<latency>\S+)".to_string(),
+                    groups: vec![("route".to_string(), 1)],
+                    x_index: 2,
+                },
+            ),
+            (
+                r#"| pattern "<_> route=<route> latency=<latency>""#,
+                false,
+                sql::ReducedParser::Capture {
+                    parser: sql::CaptureParser::Pattern,
+                    pattern: "<_> route=<route> latency=<latency>".to_string(),
+                    groups: vec![("route".to_string(), 1)],
+                    x_index: 2,
+                },
+            ),
+        ];
+        // (query, keep mode)
+        let shapes = |stage: &str| -> Vec<(String, bool)> {
+            let mut out = Vec::new();
+            for op in [
+                "avg_over_time",
+                "min_over_time",
+                "max_over_time",
+                "stddev_over_time",
+                "stdvar_over_time",
+                "quantile_over_time",
+                "first_over_time",
+                "last_over_time",
+            ] {
+                let param = if op == "quantile_over_time" {
+                    "0.9, "
+                } else {
+                    ""
+                };
+                let inner = format!(r#"{op}({param}{{a="b"}} {stage} | unwrap latency [5m])"#);
+                out.push((format!("{inner} by (route)"), true));
+                out.push((inner.clone(), false));
+                out.push((format!("{inner} without (request_id)"), false));
+            }
+            for (op, injected) in [
+                ("sum_over_time", true),
+                ("rate", true),
+                ("rate_counter", false),
+            ] {
+                let inner = format!(r#"{op}({{a="b"}} {stage} | unwrap latency [5m])"#);
+                out.push((inner.clone(), false));
+                out.push((format!("sum by (route) ({inner})"), injected));
+                out.push((format!("max by (route) ({inner})"), false));
+            }
+            out
+        };
+        let mut lowered = 0usize;
+        for (stage, bare, parser) in &parsers {
+            let cases = shapes(stage);
+            assert_eq!(cases.len(), 8 * 3 + 3 * 3);
+            for (query, keep) in &cases {
+                let lowers = !bare || *keep;
+                for spec in [range, instant] {
+                    let mp = metric_mp(query, spec).unwrap_or_else(|e| panic!("{query}: {e}"));
+                    if !lowers {
+                        assert!(
+                            mp.client.is_some(),
+                            "{query} ({spec:?}): a bare parser in drop mode is today's route"
+                        );
+                        assert!(
+                            !matches!(mp.value, sql::MetricValue::Reduced(_)),
+                            "{query} ({spec:?})"
+                        );
+                        continue;
+                    }
+                    assert!(mp.client.is_none(), "{query} ({spec:?}): must lower");
+                    let sql::MetricValue::Reduced(r) = &mp.value else {
+                        panic!(
+                            "{query} ({spec:?}): expected a reduced plan, got {:?}",
+                            mp.value
+                        );
+                    };
+                    assert_eq!(r.parser.as_ref(), Some(parser), "{query} ({spec:?})");
+                    assert_eq!(r.label, "latency", "{query}");
+                    assert_eq!(
+                        matches!(r.mode, sql::KeyMode::Keep(_)),
+                        *keep,
+                        "{query} ({spec:?}): {:?}",
+                        r.mode
+                    );
+                    assert_eq!(r.instant, matches!(spec, QuerySpec::Instant { .. }));
+                    lowered += 1;
+                }
+            }
+        }
+        // Four parsers in every shape, the two bare ones in the ten keep shapes.
+        assert_eq!(lowered, 2 * (4 * 33 + 2 * 10));
+
+        // Today's route.
+        for query in [
+            r#"avg_over_time({a="b"} | json | logfmt | unwrap latency [5m]) by (route)"#,
+            r#"avg_over_time({a="b"} | logfmt | json | unwrap latency [5m]) by (route)"#,
+            r#"avg_over_time({a="b"} | line_format "{{.a}}" | json | unwrap latency [5m]) by (route)"#,
+            r#"avg_over_time({a="b"} | line_format "{{.a}}" | regexp "(?P<latency>\\S+)" | unwrap latency [5m]) by (route)"#,
+            r#"max_over_time({a="b"} | json x="a[0]" | unwrap x [5m])"#,
+            r#"max_over_time({a="b"} | json x="a[0]", route="route" | unwrap x [5m]) by (route)"#,
+        ] {
+            for spec in [range, instant] {
+                let mp = metric_mp(query, spec).unwrap_or_else(|e| panic!("{query}: {e}"));
+                assert!(mp.client.is_some(), "{query} ({spec:?}): today's route");
+                assert!(
+                    !matches!(mp.value, sql::MetricValue::Reduced(_)),
+                    "{query} ({spec:?})"
+                );
+            }
         }
     }
 }

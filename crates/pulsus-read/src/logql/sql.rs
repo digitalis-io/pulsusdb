@@ -283,6 +283,38 @@ pub struct ReducedUnwrap {
     pub todays_route: super::plan::ClientAgg,
     /// The plan answers an instant query at its one grid point (part 5).
     pub instant: bool,
+    /// The one parser before the `| unwrap`, which the statement runs
+    /// (issue #624, part 4b); `None`: `x` is read from structured metadata.
+    pub parser: Option<ReducedParser>,
+}
+
+/// The parser of a lowered `| unwrap` (issue #624, part 4b): what the
+/// statement's key column `pk` holds, and where it reads `x`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReducedParser {
+    /// `| json`, bare or targeted: `keys` the labels `pk` holds, each with
+    /// its top-level source; `x_path` the field segments to `x`.
+    Json {
+        form: UnwrapForm,
+        keys: Vec<UnwrapKeyLabel>,
+        x_path: Vec<String>,
+    },
+    /// `| logfmt`: `names` the sanitised keys whose fields `pk` holds;
+    /// `x_source` the field key `x` is read from; `x_destination` the
+    /// targeted form's destination for it, `None` on the bare form.
+    Logfmt {
+        names: Vec<String>,
+        x_source: String,
+        x_destination: Option<String>,
+    },
+    /// `| regexp` or `| pattern`: `groups` the named groups `pk` holds,
+    /// `(name, 1-based index)`; `x_index` the index of `x`'s group.
+    Capture {
+        parser: CaptureParser,
+        pattern: String,
+        groups: Vec<(String, usize)>,
+        x_index: usize,
+    },
 }
 
 /// What a lowered `| unwrap` statement reads of the resolved streams
@@ -298,6 +330,14 @@ pub struct ReducedKeyColumns {
     /// Each metadata name the key reads or removes, with the fingerprints
     /// of the streams carrying it as a stream label.
     pub blank: Vec<(String, Vec<FpLiteral>)>,
+    /// The selected streams labelled `x`, each with its value: the
+    /// statement reads `x` from the stream label on these (issue #624,
+    /// part 4b, D3).
+    pub x_values: Vec<(FpLiteral, String)>,
+    /// Each name `pk` holds, with the fingerprints whose streams carry it
+    /// as a stream label: the parser's value is left out of `pk` there
+    /// (keep mode; issue #624, part 4b).
+    pub pk_blank: Vec<(String, Vec<FpLiteral>)>,
 }
 
 /// [`MetricValue::Staged`]'s payload (issue #624, part 2).
@@ -2119,6 +2159,24 @@ pub fn reduced_conversion_columns(conversion: UnwrapConversion) -> String {
     }
 }
 
+/// The `WITH` columns of a lowered `| unwrap` from its parser to `e`
+/// (issue #624, part 4b, §3.1-§3.3), over the stored line: the parser's
+/// readers, `kd`, `pk`, `ut`, `xk`, `conversion`'s columns over `ut`, `pu`,
+/// `st`, `v` and `e`.
+pub fn reduced_parser_columns(
+    value: &ReducedUnwrap,
+    keys: &ReducedKeyColumns,
+    conversion: UnwrapConversion,
+) -> Result<String, KeyStatementRefusal> {
+    let _ = (value, keys);
+    Ok(format!(
+        "toUInt8(0) AS kd, CAST([], 'Array(Tuple(String, String))') AS pk, '' AS ut, \
+         toUInt8(3) AS xk, {}, toUInt8(1) AS pu, toUInt8(2) AS st, toFloat64(0) AS v, \
+         toUInt8(0) AS e",
+        reduced_conversion_columns(conversion)
+    ))
+}
+
 /// The lowered `| unwrap` range statement (issue #624, part 4): one row per
 /// `(class, metadata key, failed, grid point)` window that holds a sample,
 /// its reducer computed in the database.
@@ -2339,13 +2397,15 @@ pub fn metric_range_reduced(
     let lower_op = lower.sql_op();
     let mut lines: Vec<String> = vec![
         format!(
-            "SELECT c, kv, e, toInt64({grid_start_ns} + k * {step_ns}) AS bucket_ns, n, {r} AS r, \
+            "SELECT c, kv, pk, e, toInt64({grid_start_ns} + k * {step_ns}) AS bucket_ns, n, {r} AS r, \
              {t1} AS t1, {t2} AS t2, {v1} AS v1"
         ),
         "FROM (".to_string(),
-        format!("  SELECT c, kv, e, k, {merge}"),
+        format!("  SELECT c, kv, pk, e, k, {merge}"),
         "  FROM (".to_string(),
-        format!("    WITH {class} AS c, {kv} AS kv,"),
+        format!(
+            "    WITH {class} AS c, {kv} AS kv, CAST([], 'Array(Tuple(String, String))') AS pk,"
+        ),
         format!("         {lo} AS lo, {hi} AS hi, timestamp_ns AS t,"),
         format!("         {ut},"),
         format!("         {conversion},"),
@@ -2353,7 +2413,7 @@ pub fn metric_range_reduced(
             "         toUInt8(if(position(structured_metadata, '\"__') > 0, 2, us)) AS st, \
              uv AS v, toUInt8(st = 1) AS e{h}"
         ),
-        format!("    SELECT c, kv, e, lo, hi, {run}"),
+        format!("    SELECT c, kv, pk, e, lo, hi, {run}"),
         format!("    FROM {table}"),
     ];
     if !services.is_empty() {
@@ -2369,12 +2429,12 @@ pub fn metric_range_reduced(
     lines.extend([
         "      AND ut != '' AND lo <= hi AND throwIf(st = 2 AND ut != '' AND lo <= hi) = 0"
             .to_string(),
-        "    GROUP BY c, kv, e, lo, hi".to_string(),
+        "    GROUP BY c, kv, pk, e, lo, hi".to_string(),
         "  )".to_string(),
         "  ARRAY JOIN range(lo, hi + 1) AS k".to_string(),
-        "  GROUP BY c, kv, e, k".to_string(),
+        "  GROUP BY c, kv, pk, e, k".to_string(),
         ")".to_string(),
-        "ORDER BY c, kv, e, bucket_ns".to_string(),
+        "ORDER BY c, kv, pk, e, bucket_ns".to_string(),
     ]);
     let mut settings =
         format!("SETTINGS {UNWRAP_PARSER_SETTING}, query_plan_execute_functions_after_sorting = 0");
@@ -5142,8 +5202,8 @@ mod tests {
     /// **T17 (issue #624, part 4): the run grouping is the `SELECT` that
     /// reads the table**, so over a `Distributed` table each shard groups
     /// its own lines and sends run states. The span from the last `SELECT
-    /// c, kv, e, lo, hi` to `GROUP BY c, kv, e, lo, hi` reads the table
-    /// itself, and the fan-out comes after it.
+    /// c, kv, pk, e, lo, hi` to `GROUP BY c, kv, pk, e, lo, hi` reads the
+    /// table itself, and the fan-out comes after it.
     #[test]
     fn the_run_grouping_is_the_select_that_reads_the_table() {
         let fps = [
@@ -5167,6 +5227,7 @@ mod tests {
                     classes: Some(vec![fps.to_vec()]),
                     hashes: vec![(fps[0], 1), (fps[1], 2)],
                     blank: vec![("route".to_string(), Vec::new())],
+                    ..ReducedKeyColumns::default()
                 },
             ),
             (
@@ -5190,6 +5251,7 @@ mod tests {
                     grouping: None,
                 },
                 instant: false,
+                parser: None,
             };
             let sql = metric_range_reduced(
                 "log_samples",
@@ -5202,10 +5264,10 @@ mod tests {
                 None,
             )
             .expect("a renderable statement");
-            let start = sql.rfind("SELECT c, kv, e, lo, hi");
+            let start = sql.rfind("SELECT c, kv, pk, e, lo, hi");
             assert!(start.is_some(), "{mode:?}: no run grouping in\n{sql}");
             let start = start.unwrap_or_default();
-            let end = sql[start..].find("GROUP BY c, kv, e, lo, hi");
+            let end = sql[start..].find("GROUP BY c, kv, pk, e, lo, hi");
             assert!(
                 end.is_some(),
                 "{mode:?}: no run grouping's GROUP BY in\n{sql}"
@@ -5223,6 +5285,164 @@ mod tests {
                 !sql[..start].contains("ARRAY JOIN") && sql[start..].contains("ARRAY JOIN"),
                 "{mode:?}: the fan-out follows the run grouping:\n{sql}"
             );
+        }
+    }
+
+    /// **T2 (issue #624, part 4b): the parser runs in the `SELECT` that
+    /// reads the table.** For each parser, the level from the `WITH` before
+    /// the last `SELECT c, kv, pk, e, lo, hi` to `GROUP BY c, kv, pk, e, lo,
+    /// hi` reads the table itself, holds the parser's reader, and the
+    /// fan-out comes after it; the `| logfmt` form raises the syntax-tree
+    /// limits.
+    #[test]
+    fn the_parser_runs_in_the_select_that_reads_the_table() {
+        let fps = [
+            Fingerprint::from_raw(11).sql_literal(),
+            Fingerprint::from_raw(12).sql_literal(),
+        ];
+        let services = [literal("checkout")];
+        let route = || {
+            vec![UnwrapKeyLabel {
+                label: "route".to_string(),
+                source: "route".to_string(),
+            }]
+        };
+        // (pipeline, parser, the reader the level must hold)
+        let parsers: [(&str, ReducedParser, &str); 6] = [
+            (
+                r#"{a="b"} | json | unwrap x"#,
+                ReducedParser::Json {
+                    form: UnwrapForm::Bare,
+                    keys: route(),
+                    x_path: vec!["x".to_string()],
+                },
+                "JSONExtractRaw(body, 'x')",
+            ),
+            (
+                r#"{a="b"} | json x="a.b", route="route" | unwrap x"#,
+                ReducedParser::Json {
+                    form: UnwrapForm::Targeted,
+                    keys: route(),
+                    x_path: vec!["a".to_string(), "b".to_string()],
+                },
+                "JSONExtractRaw(body, 'a', 'b')",
+            ),
+            (
+                r#"{a="b"} | logfmt | unwrap x"#,
+                ReducedParser::Logfmt {
+                    names: vec!["route".to_string()],
+                    x_source: "x".to_string(),
+                    x_destination: None,
+                },
+                "extractAll(body, ",
+            ),
+            (
+                r#"{a="b"} | logfmt y="x", route="route" | unwrap y"#,
+                ReducedParser::Logfmt {
+                    names: vec!["route".to_string()],
+                    x_source: "x".to_string(),
+                    x_destination: Some("y".to_string()),
+                },
+                "extractAll(body, ",
+            ),
+            (
+                r#"{a="b"} | regexp "x=(?P<x>\\S*) route=(?P<route>\\S+)" | unwrap x"#,
+                ReducedParser::Capture {
+                    parser: CaptureParser::Regexp,
+                    pattern: r"x=(?P<x>\S*) route=(?P<route>\S+)".to_string(),
+                    groups: vec![("route".to_string(), 2)],
+                    x_index: 1,
+                },
+                "extractGroups(body, ",
+            ),
+            (
+                r#"{a="b"} | pattern "<_> x=<x> route=<route>" | unwrap x"#,
+                ReducedParser::Capture {
+                    parser: CaptureParser::Pattern,
+                    pattern: "<_> x=<x> route=<route>".to_string(),
+                    groups: vec![("route".to_string(), 2)],
+                    x_index: 1,
+                },
+                "arrayFold((acc, l, k) ->",
+            ),
+        ];
+        for (query, parser, reader) in parsers {
+            let pipeline = {
+                let pulsus_logql::Expr::Log(le) = pulsus_logql::parse(query).expect("parse") else {
+                    panic!("a log expression");
+                };
+                le.pipeline
+            };
+            let label = if query.contains("unwrap y") { "y" } else { "x" };
+            let logfmt = matches!(parser, ReducedParser::Logfmt { .. });
+            let value = ReducedUnwrap {
+                reducer: pulsus_logql::RangeAggOp::MaxOverTime,
+                quantile: None,
+                label: label.to_string(),
+                conversion: UnwrapConversion::Number,
+                mode: KeyMode::Keep(vec!["route".to_string()]),
+                key_stages: pipeline.clone(),
+                todays_route: super::super::plan::ClientAgg {
+                    pipeline,
+                    value: super::super::plan::ClientValue::Unwrap,
+                    range_op: pulsus_logql::RangeAggOp::MaxOverTime,
+                    param: None,
+                    absent_labels: Vec::new(),
+                    grouping: None,
+                },
+                instant: false,
+                parser: Some(parser),
+            };
+            let sql = metric_range_reduced(
+                "log_samples",
+                &value,
+                &ReducedKeyColumns::default(),
+                &services,
+                &fps,
+                SLIDING_SCAN,
+                &[],
+                None,
+            )
+            .expect("a renderable statement");
+            let select = sql.rfind("SELECT c, kv, pk, e, lo, hi");
+            assert!(select.is_some(), "{query}: no run grouping in\n{sql}");
+            let select = select.unwrap_or_default();
+            let start = sql[..select].rfind("WITH ");
+            assert!(
+                start.is_some(),
+                "{query}: no WITH before the run grouping in\n{sql}"
+            );
+            let start = start.unwrap_or_default();
+            let end = sql[select..].find("GROUP BY c, kv, pk, e, lo, hi");
+            assert!(
+                end.is_some(),
+                "{query}: no run grouping's GROUP BY in\n{sql}"
+            );
+            let end = select + end.unwrap_or_default();
+            let level = &sql[start..end];
+            assert!(
+                level.contains("FROM log_samples"),
+                "{query}: the run grouping reads the table:\n{level}"
+            );
+            assert!(
+                !level.contains("FROM ("),
+                "{query}: the run grouping reads no subquery:\n{level}"
+            );
+            assert!(
+                level.contains(reader),
+                "{query}: the level runs the parser ({reader}):\n{level}"
+            );
+            assert!(
+                !sql[..start].contains("ARRAY JOIN") && sql[end..].contains("ARRAY JOIN"),
+                "{query}: the fan-out follows the run grouping:\n{sql}"
+            );
+            if logfmt {
+                assert!(
+                    sql.contains("max_ast_elements = 1000000")
+                        && sql.contains("max_expanded_ast_elements = 10000000"),
+                    "{query}: the logfmt form raises the syntax-tree limits:\n{sql}"
+                );
+            }
         }
     }
 }

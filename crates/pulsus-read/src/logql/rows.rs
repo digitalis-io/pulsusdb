@@ -324,7 +324,7 @@ pub struct MetricRangeBucketRow {
 /// failed, grid point)` window.
 ///
 /// `c` is the class id, or the fingerprint itself when every stream is its
-/// own class; `kv` the metadata pairs the key keeps; `e` is 1 for the
+/// own class; `kv` the metadata pairs the key keeps; `pk` the parser's key labels; `e` is 1 for the
 /// window of a key whose values failed to convert. `n` counts the window's
 /// samples and `r` is the reducer's value; `t1`, `t2` and `v1` are the
 /// first and last sample times and the first value, which `rate_counter`
@@ -333,6 +333,9 @@ pub struct MetricRangeBucketRow {
 pub struct MetricReducedRow {
     pub c: u128,
     pub kv: Vec<(String, String)>,
+    /// The parser's key labels (issue #624, part 4b): `(name, text)`, or
+    /// one `('', fields)` pair for `| logfmt`; empty with no parser.
+    pub pk: Vec<(String, String)>,
     pub e: u8,
     pub bucket_ns: i64,
     pub n: u64,

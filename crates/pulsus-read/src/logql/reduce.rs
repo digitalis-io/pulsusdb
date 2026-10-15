@@ -171,6 +171,8 @@ pub(in crate::logql) fn resolve_reduced(
             classes,
             hashes,
             blank,
+            x_values: Vec::new(),
+            pk_blank: Vec::new(),
         },
         class_labels,
         fingerprints,
@@ -454,6 +456,7 @@ mod tests {
                 grouping: grouping.map(Box::new),
             },
             instant: false,
+            parser: None,
         }
     }
 
@@ -473,6 +476,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
+            pk: Vec::new(),
             e,
             bucket_ns: 60,
             n: 1,
@@ -547,5 +551,156 @@ mod tests {
         let series = f.finish();
         assert_eq!(series.len(), 1, "the e = 0 key's series: {series:?}");
         assert_eq!(series[0].points, vec![(60, 1.0)]);
+    }
+
+    /// **T8 (issue #624, part 4b): the key-run parses the key with the
+    /// placeholder.** For each parser, a row's `pk` is what the parser
+    /// reads: under `| unwrap x` an `e = 0` key is a series whose labels
+    /// hold `pk`'s names (a name left out of `pk` is absent) and not `x`,
+    /// and an `e = 1` key is kept with its error, so today's route answers;
+    /// under `| unwrap x | __error__=""` the `e = 1` key is dropped.
+    #[test]
+    fn the_key_run_parses_the_key_with_the_placeholder() {
+        use crate::logql::sql::{CaptureParser, ReducedParser, UnwrapForm, UnwrapKeyLabel};
+        let names = |n: &[&str]| -> Vec<String> { n.iter().map(|s| s.to_string()).collect() };
+        let keys = |n: &[&str]| -> Vec<UnwrapKeyLabel> {
+            n.iter()
+                .map(|s| UnwrapKeyLabel {
+                    label: s.to_string(),
+                    source: s.to_string(),
+                })
+                .collect()
+        };
+        let keep = || {
+            (
+                KeyMode::Keep(names(&["route", "status"])),
+                Some(RangeGrouping::By(names(&["route", "status"]))),
+            )
+        };
+        // (pipeline, unwrapped label, keep mode, parser, pk)
+        let cases: Vec<(&str, &str, bool, ReducedParser, Vec<(&str, &str)>)> = vec![
+            (
+                r#"{a="b"} | json | unwrap x"#,
+                "x",
+                true,
+                ReducedParser::Json {
+                    form: UnwrapForm::Bare,
+                    keys: keys(&["route", "status"]),
+                    x_path: names(&["x"]),
+                },
+                vec![("route", "r1")],
+            ),
+            (
+                r#"{a="b"} | json x="x", route="route" | unwrap x"#,
+                "x",
+                false,
+                ReducedParser::Json {
+                    form: UnwrapForm::Targeted,
+                    keys: keys(&["route"]),
+                    x_path: names(&["x"]),
+                },
+                vec![("route", "r1")],
+            ),
+            (
+                r#"{a="b"} | logfmt | unwrap x"#,
+                "x",
+                true,
+                ReducedParser::Logfmt {
+                    names: names(&["route", "status"]),
+                    x_source: "x".to_string(),
+                    x_destination: None,
+                },
+                vec![("", "route=r1")],
+            ),
+            (
+                r#"{a="b"} | logfmt y="x", route="route" | unwrap y"#,
+                "y",
+                false,
+                ReducedParser::Logfmt {
+                    names: names(&["route"]),
+                    x_source: "x".to_string(),
+                    x_destination: Some("y".to_string()),
+                },
+                vec![("", "route=r1")],
+            ),
+            (
+                r#"{a="b"} | regexp "route=(?P<route>\\S+) x=(?P<x>\\S+)" | unwrap x"#,
+                "x",
+                false,
+                ReducedParser::Capture {
+                    parser: CaptureParser::Regexp,
+                    pattern: r"route=(?P<route>\S+) x=(?P<x>\S+)".to_string(),
+                    groups: vec![("route".to_string(), 1)],
+                    x_index: 2,
+                },
+                vec![("route", "r1")],
+            ),
+            (
+                r#"{a="b"} | pattern "<_> route=<route> x=<x>" | unwrap x"#,
+                "x",
+                false,
+                ReducedParser::Capture {
+                    parser: CaptureParser::Pattern,
+                    pattern: "<_> route=<route> x=<x>".to_string(),
+                    groups: vec![("route".to_string(), 1)],
+                    x_index: 2,
+                },
+                vec![("route", "r1")],
+            ),
+        ];
+        for (query, label, kept, parser, pk) in cases {
+            for filtered in [false, true] {
+                let query = if filtered {
+                    format!(r#"{query} | __error__="""#)
+                } else {
+                    query.to_string()
+                };
+                let (mode, grouping) = if kept {
+                    keep()
+                } else {
+                    (KeyMode::Drop(names(&[label])), None)
+                };
+                let mut v = value(mode, grouping, &query);
+                v.label = label.to_string();
+                v.parser = Some(parser.clone());
+                let mut r = row(0, &[], 0);
+                r.pk = pk
+                    .iter()
+                    .map(|(k, t)| (k.to_string(), t.to_string()))
+                    .collect();
+                if !filtered {
+                    let mut f = fold(&v);
+                    let outcome = f.key_outcome(&r).expect("a key outcome");
+                    let Some(Memo::Series(key)) = outcome else {
+                        panic!("{query}: an e = 0 key is a series");
+                    };
+                    let labels = &f.series[&key].0;
+                    assert!(
+                        labels.iter().any(|(k, v)| k == "route" && v == "r1"),
+                        "{query}: the labels hold pk's route: {labels:?}"
+                    );
+                    assert!(
+                        !labels
+                            .iter()
+                            .any(|(k, _)| k == "status" || k == "x" || k == "y"),
+                        "{query}: no name pk does not hold, and not x: {labels:?}"
+                    );
+                }
+                r.e = 1;
+                let mut f = fold(&v);
+                let outcome = f.key_outcome(&r).expect("a key outcome");
+                if filtered {
+                    assert!(
+                        matches!(outcome, Some(Memo::Dropped)),
+                        "{query}: a failed key under __error__=\"\" is dropped"
+                    );
+                } else {
+                    assert!(
+                        outcome.is_none(),
+                        "{query}: a failed key is kept with its error: today's route"
+                    );
+                }
+            }
+        }
     }
 }
