@@ -15,7 +15,7 @@ FROM spans
 WHERE start_ns >= 1791399900000000001 AND start_ns < 1791410820000000001
   AND intDiv(start_ns, 300000000000) BETWEEN intDiv(1791399900000000001, 300000000000) AND intDiv(1791410820000000000, 300000000000)
   AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') >= toDate('2026-10-07') AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') <= toDate('2026-10-07')
-  AND (((parent_span_id = toFixedString('', 8)) AND (true)) AND (service_type != ''))
+  AND (((parent_span_id = toFixedString('', 8)) AND (true)) AND (service_type = 'string'))
 GROUP BY g, o, p)
 GROUP BY g, o)
 LEFT ARRAY JOIN cells AS c
@@ -30,6 +30,6 @@ FROM spans
 WHERE start_ns >= 1791399960000000000 AND start_ns < 1791410820000000000
   AND intDiv(start_ns, 300000000000) BETWEEN intDiv(1791399960000000000, 300000000000) AND intDiv(1791410819999999999, 300000000000)
   AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') >= toDate('2026-10-07') AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') <= toDate('2026-10-07')
-  AND (((parent_span_id = toFixedString('', 8)) AND (true)) AND (service_type != ''))
+  AND (((parent_span_id = toFixedString('', 8)) AND (true)) AND (service_type = 'string'))
 GROUP BY g, o)) WHERE over = 0)
 ORDER BY g, o

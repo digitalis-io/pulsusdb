@@ -56,7 +56,8 @@
 use std::collections::HashMap;
 
 use pulsus_traceql::{
-    BoolOp, Field, FieldExpr, FieldOp, PipelineStage, Query, SpansetExpr, SpansetFilter, Value,
+    BoolOp, Field, FieldExpr, FieldOp, Intrinsic, PipelineStage, Query, SpansetExpr, SpansetFilter,
+    Value,
 };
 
 use super::numbering::{SCOPE_DETAIL, SCOPE_TOP, after_top_sql, keys_sql, returned_numbers_sql};
@@ -216,7 +217,7 @@ FROM (SELECT trace_id, max(g_last) AS last, sum(g_matched) AS matched,
               AND {time}
               AND {bucket}
               AND {day}
-              AND ({predicate}){demand}
+              AND ({predicate})
             GROUP BY trace_id, grp, grp_type)
       GROUP BY trace_id) AS m
 {trace_read}";
@@ -234,7 +235,7 @@ const SEARCH_AGGREGATED: &str = r"WITH {scalars}(SELECT (groupArray(trace_id), g
             WHERE {time}
               AND {bucket}
               AND {day}
-              AND ({predicate}){demand}
+              AND ({predicate})
             GROUP BY trace_id
             HAVING countIf({before}) > 0 AND ({pass}) AND countIf({later}) > 0
             ORDER BY last DESC, trace_id ASC
@@ -253,26 +254,9 @@ FROM ({scope_detail}SELECT trace_id, max(start_ns) AS last, countIf({later}) AS 
         AND {time}
         AND {bucket}
         AND {day}
-        AND ({predicate}){demand}
+        AND ({predicate})
       GROUP BY trace_id) AS m
 {trace_read}";
-
-/// The message of an aggregate argument's off-path demand (issue #592
-/// part 3).
-pub const AGGREGATE_OFF_PATH_DEMAND: &str =
-    "an aggregate value held off its own path is answered by the old engine (issue #592)";
-
-/// The message of a projected value's off-path demand (issue #592 part
-/// 3): `select(k)` or `{ k != nil }` where a span holds `k` as a key-value
-/// list or bytes, whose JSON or base64 today's engine returns.
-pub const SELECT_OFF_PATH_DEMAND: &str =
-    "a selected value held off its own path is answered by the old engine (issue #592)";
-
-/// The message of a `by()` key's off-path demand (issue #592 part 2): the
-/// statement cannot read a key-value list's or bytes' value as the key's,
-/// so the request goes to today's engine.
-pub const OFF_PATH_DEMAND: &str =
-    "a by() value held off its own path is answered by the old engine (issue #592)";
 
 /// A spanset tree (section 4.3): one flag per filter, a `HAVING` over each
 /// trace's flags, and the detail read keeping each trace's spans by them.
@@ -375,13 +359,12 @@ pub enum SearchFilter {
 
 /// One aggregate stage's SQL over a trace's spans (issue #592 part 3): the
 /// pass, and the response value as `(text, type)` for
-/// [`aggregate_value`]; `off_path` as [`GroupKeySql::off_path`].
+/// [`aggregate_value`].
 #[derive(Debug, Clone)]
 pub struct AggregateSql {
     pub pass: String,
     pub text: String,
     pub value_type: String,
-    pub off_path: Option<String>,
 }
 
 impl SearchFilter {
@@ -695,12 +678,6 @@ pub fn search_sql_at(
                 p.as_ref().map_or("true", |p| p.sql())
             }
             let (pre, later) = (text(before), text(all));
-            let demand = key.off_path.as_ref().map_or_else(String::new, |off| {
-                format!(
-                    "\n              AND throwIf(({pre}) AND ({off}), {}) = 0",
-                    crate::logql::escape::ch_string(OFF_PATH_DEMAND)
-                )
-            });
             let grp_type = key.value_type.as_deref().unwrap_or("''");
             let group_values = key.values.map_or_else(String::new, |k| {
                 group_values_sql(k, w, spans_table, traces_table)
@@ -713,7 +690,6 @@ pub fn search_sql_at(
                 ("later", later),
                 ("grp", key.value.as_str()),
                 ("grp_type", grp_type),
-                ("demand", demand.as_str()),
             ]);
             fill(SEARCH_GROUPED, &values)
         }
@@ -725,12 +701,6 @@ pub fn search_sql_at(
         } => {
             let pre = before.as_ref().map_or("true", |p| p.sql());
             let later = all.as_ref().map_or("true", |p| p.sql());
-            let demand = agg.off_path.as_ref().map_or_else(String::new, |off| {
-                format!(
-                    "\n              AND throwIf(({pre}) AND ({off}), {}) = 0",
-                    crate::logql::escape::ch_string(AGGREGATE_OFF_PATH_DEMAND)
-                )
-            });
             let mut values: Vec<(&str, &str)> = common.to_vec();
             values.extend([
                 ("predicate", selector.sql()),
@@ -739,7 +709,6 @@ pub fn search_sql_at(
                 ("pass", agg.pass.as_str()),
                 ("agg_text", agg.text.as_str()),
                 ("agg_type", agg.value_type.as_str()),
-                ("demand", demand.as_str()),
             ]);
             fill(SEARCH_AGGREGATED, &values)
         }
@@ -837,9 +806,10 @@ struct Pipeline<'a> {
 /// `{…}` filters, `select()`, one `by()` on a key [`group_key_sql`] serves
 /// and `coalesce()` is the statement's; a `coalesce()` with no `by()`
 /// before it changes nothing. A second `by()`, a `by()` after
-/// `coalesce()`, any other key or any other shape is refused naming #592,
-/// an aggregate naming part 3.
-fn pipeline_of(query: &Query) -> Result<Pipeline<'_>, PlanError> {
+/// `coalesce()`, `by(trace:id)` or any other shape is refused naming #592,
+/// an aggregate naming part 3; an event or link intrinsic key with the
+/// previous planner's text (issue #602 part 1, D4).
+fn pipeline_of<'a>(query: &'a Query, ctx: &PredicateCtx<'_>) -> Result<Pipeline<'a>, PlanError> {
     let refused = |what: &str, target: &str| {
         PlanError::UnsupportedField(format!(
             "{what} is not supported by the search statement yet (issue {target})"
@@ -881,7 +851,22 @@ fn pipeline_of(query: &Query) -> Result<Pipeline<'_>, PlanError> {
                 let FieldExpr::Field(field) = key else {
                     return Err(refused("a by() over an expression", "#592"));
                 };
-                let Some(sql) = group_key_sql(field) else {
+                let Some(sql) = group_key_sql(field, ctx)? else {
+                    if matches!(
+                        field,
+                        Field::Intrinsic(
+                            Intrinsic::EventName
+                                | Intrinsic::EventTimeSinceStart
+                                | Intrinsic::LinkSpanId
+                                | Intrinsic::LinkTraceId
+                        )
+                    ) {
+                        return Err(PlanError::UnsupportedField(format!(
+                            "by({field}): grouping by a span-event / span-link intrinsic is not \
+                             supported (a span carries a collection of events/links, so there is \
+                             no single group value)"
+                        )));
+                    }
                     return Err(refused(&format!("by({field})"), "#592"));
                 };
                 out.by = Some((field, sql));
@@ -972,21 +957,18 @@ fn aggregate_sql(
             "{what} is not supported by the search statement (issue #592)"
         ))
     };
-    let out = |scalar: String, contributors: String, text: String, value_type: String, off_path| {
-        AggregateSql {
+    let out =
+        |scalar: String, contributors: String, text: String, value_type: String| AggregateSql {
             pass: format!("{contributors} > 0 AND ({scalar}) {sql_op} {t}"),
             text,
             value_type,
-            off_path,
-        }
-    };
+        };
     Ok(match (op, field) {
         (A::Count, None) => out(
             format!("toFloat64(countIf({cond}))"),
             format!("countIf({cond})"),
             format!("toString(countIf({cond}))"),
             "'Int64'".to_string(),
-            None,
         ),
         (_, Some(FieldExpr::Field(Field::Intrinsic(pulsus_traceql::Intrinsic::Duration)))) => {
             let fsum = ordered_sum("toFloat64(duration_ns)", cond);
@@ -1009,15 +991,9 @@ fn aggregate_sql(
                 ),
                 A::Count => return Err(refuse(format!("{op}(duration)"))),
             };
-            out(
-                scalar,
-                format!("countIf({cond})"),
-                text,
-                ty.to_string(),
-                None,
-            )
+            out(scalar, format!("countIf({cond})"), text, ty.to_string())
         }
-        (_, Some(FieldExpr::Field(f @ Field::Attribute { scope, key }))) => {
+        (_, Some(FieldExpr::Field(f @ Field::Attribute { .. }))) => {
             let Some((text_sql, kind)) = super::projection::aggregate_argument_sql(f, ctx)? else {
                 return Err(refuse(format!("{op}({f})")));
             };
@@ -1056,13 +1032,11 @@ fn aggregate_sql(
                 ),
                 A::Count => return Err(refuse(format!("{op}({f})"))),
             };
-            let off_path = Some(off_path_at(*scope, key, ctx));
             out(
                 scalar.clone(),
                 format!("countIf({contrib})"),
                 format!("toString({scalar})"),
                 ty,
-                off_path,
             )
         }
         _ => {
@@ -1072,56 +1046,6 @@ fn aggregate_sql(
             )));
         }
     })
-}
-
-/// Issue #592 part 3: `key` held off its typed path at `scope` — a
-/// key-value list flattened under the key (its sub-object is not empty) or
-/// a value in that scope's `attrs_other`. The unscoped key tests every
-/// scope of the chain: the span, its resource row, an event, a link, the
-/// instrumentation scope. Today's engine reads the key's holder whatever
-/// its kind, so any such holder hands the request over.
-pub(super) fn off_path_at(
-    scope: pulsus_traceql::AttrScope,
-    key: &str,
-    ctx: &PredicateCtx<'_>,
-) -> String {
-    use pulsus_traceql::AttrScope as S;
-    let lit = crate::logql::escape::ch_string(key);
-    let path = pulsus_clickhouse::json_column::escape_json_path(key);
-    let ident = crate::logql::escape::ch_ident(&path);
-    let one = |root: &str, other: &str| {
-        format!(
-            "(dynamicType({root}.{ident}) = 'None' AND (position({other}, {lit}) > 0 \
-             OR toString({root}.^{ident}) != '{{}}'))"
-        )
-    };
-    let set = |arr: &str| {
-        format!(
-            "arrayExists((d, s, o) -> dynamicType(d) = 'None' AND (position(o, {lit}) > 0 \
-             OR toString(s) != '{{}}'), {arr}.attrs.{ident}, {arr}.attrs.^{ident}, {arr}.attrs_other)"
-        )
-    };
-    let resource = format!(
-        "resource_id IN (SELECT resource_id FROM {} WHERE {} AND {})",
-        ctx.resources_table,
-        ctx.window.resources_day_clause(),
-        one("attrs", "attrs_other"),
-    );
-    match scope {
-        S::Span => one("attrs", "attrs_other"),
-        S::Resource => resource,
-        S::Event => set("events"),
-        S::Link => set("links"),
-        S::Instrumentation => one("scope_attrs", "scope_attrs_other"),
-        S::Unscoped => format!(
-            "({} OR {} OR {} OR {} OR {})",
-            off_path_at(S::Span, key, ctx),
-            off_path_at(S::Resource, key, ctx),
-            off_path_at(S::Event, key, ctx),
-            off_path_at(S::Link, key, ctx),
-            off_path_at(S::Instrumentation, key, ctx),
-        ),
-    }
 }
 
 /// The `f64` sum of `x` over the spans `cond` keeps, added in today's
@@ -1159,8 +1083,8 @@ pub(crate) fn aggregate_value(text: &str, value_type: &str) -> Result<GroupValue
 
 /// Compiles `query` to the search statement. Its `|` stages are
 /// [`pipeline_of`]'s; a structural operator is #593's; a set field projected from a
-/// comparison that holds it twice beside arithmetic, or under `!` or inside
-/// a boolean-valued operand, is refused (`projection.rs`); everything the
+/// comparison that holds it twice beside arithmetic is refused
+/// (`projection.rs`); everything the
 /// predicate compiler refuses is returned as it refused. `query.hints` are
 /// accepted and ignored, as today.
 pub fn compile_search(
@@ -1218,7 +1142,7 @@ pub fn compile_search_sliced(
     max_depth: u32,
     slice: Option<WindowSql>,
 ) -> Result<SearchStatement, PlanError> {
-    let pipeline = pipeline_of(query)?;
+    let pipeline = pipeline_of(query, ctx)?;
     let structural = super::structural::holds_structural(&query.spanset);
     // Issue #593: a spanset holding a structural operator is one
     // membership predicate, the selector of every template.
@@ -1299,19 +1223,6 @@ pub fn compile_search_sliced(
                 demands.push(m.clone());
             }
         }
-    }
-    if let SearchFilter::Grouped { key, .. } = &filter
-        && key.off_path.is_some()
-    {
-        demands.push(OFF_PATH_DEMAND.to_string());
-    }
-    if let SearchFilter::Aggregated { agg, .. } = &filter
-        && agg.off_path.is_some()
-    {
-        demands.push(AGGREGATE_OFF_PATH_DEMAND.to_string());
-    }
-    if projection.has_off_path() {
-        demands.push(SELECT_OFF_PATH_DEMAND.to_string());
     }
     if climb_depth.is_some() {
         demands.push(super::structural::CLIMB_HANDOVER.to_string());

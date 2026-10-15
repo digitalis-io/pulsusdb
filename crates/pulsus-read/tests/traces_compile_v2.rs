@@ -1026,11 +1026,18 @@ fn t_c12_a_resource_leaf_is_the_span_leaf_inside_the_subquery() {
 
     assert_eq!(
         rendered_in(r#"{ resource.k != nil }"#),
-        r_of("dynamicType(attrs.`k`) != 'None'")
+        r_of(
+            "dynamicType(attrs.`k`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))')"
+        )
     );
     assert_eq!(
         rendered_in(r#"{ resource.k = nil }"#),
-        format!("NOT ({})", r_of("dynamicType(attrs.`k`) != 'None'"))
+        format!(
+            "NOT ({})",
+            r_of(
+                "dynamicType(attrs.`k`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))')"
+            )
+        )
     );
 }
 
@@ -1057,11 +1064,11 @@ fn t_c13_an_instrumentation_leaf_is_the_span_leaf_on_scope_attrs() {
 
     assert_eq!(
         rendered(r#"{ instrumentation.k != nil }"#),
-        "dynamicType(scope_attrs.`k`) != 'None'"
+        "(dynamicType(scope_attrs.`k`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'))"
     );
     assert_eq!(
         rendered(r#"{ instrumentation.k = nil }"#),
-        "dynamicType(scope_attrs.`k`) = 'None'"
+        "NOT (dynamicType(scope_attrs.`k`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'))"
     );
 
     // `T-T9`'s compile half.
@@ -1148,11 +1155,11 @@ fn t_c14_the_service_name_reads_the_span_row_gated_on_its_type() {
     assert_eq!(rendered_in(r#"{ resource.service.name }"#), "false");
     assert_eq!(
         rendered_in(r#"{ resource.service.name != nil }"#),
-        "service_type != ''"
+        "service_type = 'string'"
     );
     assert_eq!(
         rendered_in(r#"{ resource.service.name = nil }"#),
-        "NOT (service_type != '')"
+        "NOT (service_type = 'string')"
     );
 }
 
@@ -1250,7 +1257,7 @@ fn t_c17_a_resource_inequality_is_the_negated_equality() {
 /// instrumentation scope.
 fn demand(path: &str, field: &str) -> String {
     format!(
-        "throwIf(dynamicType({path}) != 'None' AND dynamicType({path}) != 'Bool', \
+        "throwIf(dynamicType({path}) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))') AND dynamicType({path}) != 'Bool', \
          'expression (!{field}) expected a boolean')"
     )
 }
@@ -1280,15 +1287,16 @@ fn t_c18_not_over_a_bare_field_demands_a_boolean() {
         rendered_in(r#"{ !resource.k }"#),
         format!(
             "(throwIf({}, 'expression (!resource.k) expected a boolean') + toUInt8({})) = 1",
-            r_of("dynamicType(attrs.`k`) != 'None' AND dynamicType(attrs.`k`) != 'Bool'"),
+            r_of(
+                "dynamicType(attrs.`k`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))') AND dynamicType(attrs.`k`) != 'Bool'"
+            ),
             r_of("coalesce(attrs.`k`.:Bool = false, false)")
         )
     );
     assert_eq!(
         rendered_in(r#"{ !resource.service.name }"#),
-        "(throwIf(service_type != '' AND service_type != 'bool', \
-         'expression (!resource.service.name) expected a boolean') + \
-         toUInt8((service_type = 'bool' AND service = 'false'))) = 1"
+        "(throwIf(service_type = 'string', \
+         'expression (!resource.service.name) expected a boolean') + toUInt8(false)) = 1"
     );
     // `(!f) op lit`: `= b` wants `!b`, `!= b` wants `b`, anything else
     // matches nothing — and the demand stays.
@@ -1475,11 +1483,11 @@ fn t_c20_an_event_or_link_leaf_is_any_match_over_the_typed_array() {
     // Section 3.3's two.
     assert_eq!(
         rendered(r#"{ event.k != nil }"#),
-        "arrayExists(d -> dynamicType(d) != 'None', events.attrs.`k`)"
+        "arrayExists(d -> dynamicType(d) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'), events.attrs.`k`)"
     );
     assert_eq!(
         rendered(r#"{ event.k = nil }"#),
-        "NOT arrayExists(d -> dynamicType(d) != 'None', events.attrs.`k`)"
+        "NOT arrayExists(d -> dynamicType(d) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'), events.attrs.`k`)"
     );
 }
 
@@ -1526,7 +1534,9 @@ fn presence_text(scope: AttrScope, key: &str) -> String {
 fn service_present_resource() -> String {
     format!(
         "(service_type = 'string' OR {})",
-        r_of("dynamicType(attrs.`service%2Ename`) != 'None'")
+        r_of(
+            "dynamicType(attrs.`service%2Ename`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))')"
+        )
     )
 }
 
@@ -1613,20 +1623,20 @@ fn t_c21_the_unscoped_chain_is_built_from_each_scopes_own_text() {
     assert_eq!(
         rendered_in(r#"{ .k != "v" }"#),
         format!(
-            "multiIf(dynamicType(attrs.`k`) != 'None', NOT (coalesce(attrs.`k`.:String = 'v', false) \
+            "multiIf((dynamicType(attrs.`k`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))')), NOT (coalesce(attrs.`k`.:String = 'v', false) \
              OR has(attrs.`k`.:`Array(Nullable(String))`, 'v')), \
              resource_id IN (SELECT resource_id FROM resources WHERE {d} AND \
-             (dynamicType(attrs.`k`) != 'None')), \
+             (dynamicType(attrs.`k`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'))), \
              NOT (resource_id IN (SELECT resource_id FROM resources WHERE {d} AND \
              ((coalesce(attrs.`k`.:String = 'v', false) OR \
              has(attrs.`k`.:`Array(Nullable(String))`, 'v'))))), \
-             arrayExists(d -> dynamicType(d) != 'None', events.attrs.`k`), \
+             arrayExists(d -> dynamicType(d) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'), events.attrs.`k`), \
              NOT arrayExists((s, sa) -> (coalesce(s = 'v', false) OR has(sa, 'v')), \
              events.attrs.`k`.:String, events.attrs.`k`.:`Array(Nullable(String))`), \
-             arrayExists(d -> dynamicType(d) != 'None', links.attrs.`k`), \
+             arrayExists(d -> dynamicType(d) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'), links.attrs.`k`), \
              NOT arrayExists((s, sa) -> (coalesce(s = 'v', false) OR has(sa, 'v')), \
              links.attrs.`k`.:String, links.attrs.`k`.:`Array(Nullable(String))`), \
-             dynamicType(scope_attrs.`k`) != 'None', \
+             (dynamicType(scope_attrs.`k`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))')), \
              NOT (coalesce(scope_attrs.`k`.:String = 'v', false) OR \
              has(scope_attrs.`k`.:`Array(Nullable(String))`, 'v')), \
              true)"
@@ -1647,7 +1657,7 @@ fn t_c21_the_unscoped_chain_is_built_from_each_scopes_own_text() {
     );
     let svc_p = format!(
         "(service_type = 'string' OR resource_id IN (SELECT resource_id FROM resources WHERE {d} \
-         AND (dynamicType(attrs.`service%2Ename`) != 'None')))"
+         AND (dynamicType(attrs.`service%2Ename`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'))))"
     );
     for (query, x_resource) in [
         (r#"{ .service.name = "x" }"#, &svc_x),
@@ -1679,11 +1689,13 @@ fn t_c21_the_unscoped_chain_is_built_from_each_scopes_own_text() {
     // Presence and absence: every scope's presence, ORed in the chain's
     // order, never ANDed.
     let presence = format!(
-        "(dynamicType(attrs.`k`) != 'None') OR ({}) OR \
-         (arrayExists(d -> dynamicType(d) != 'None', events.attrs.`k`)) OR \
-         (arrayExists(d -> dynamicType(d) != 'None', links.attrs.`k`)) OR \
-         (dynamicType(scope_attrs.`k`) != 'None')",
-        r_of("dynamicType(attrs.`k`) != 'None'")
+        "((dynamicType(attrs.`k`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'))) OR ({}) OR \
+         (arrayExists(d -> dynamicType(d) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'), events.attrs.`k`)) OR \
+         (arrayExists(d -> dynamicType(d) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'), links.attrs.`k`)) OR \
+         ((dynamicType(scope_attrs.`k`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))')))",
+        r_of(
+            "dynamicType(attrs.`k`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))')"
+        )
     );
     assert_eq!(rendered_in(r#"{ .k != nil }"#), presence);
     assert_eq!(rendered_in(r#"{ .k = nil }"#), format!("NOT ({presence})"));
@@ -1786,13 +1798,23 @@ fn t_c22_the_event_and_link_intrinsics_are_any_match_over_their_arrays() {
 fn presence_fixed(scope: AttrScope, key: &str) -> String {
     let k = key.replace('.', "%2E");
     match scope {
-        AttrScope::Span => format!("dynamicType(attrs.`{k}`) != 'None'"),
-        AttrScope::Resource => r_of(&format!("dynamicType(attrs.`{k}`) != 'None'")),
+        AttrScope::Span => format!(
+            "(dynamicType(attrs.`{k}`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'))"
+        ),
+        AttrScope::Resource => r_of(&format!(
+            "dynamicType(attrs.`{k}`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))')"
+        )),
         AttrScope::Event => {
-            format!("arrayExists(d -> dynamicType(d) != 'None', events.attrs.`{k}`)")
+            format!(
+                "arrayExists(d -> dynamicType(d) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'), events.attrs.`{k}`)"
+            )
         }
-        AttrScope::Link => format!("arrayExists(d -> dynamicType(d) != 'None', links.attrs.`{k}`)"),
-        AttrScope::Instrumentation => format!("dynamicType(scope_attrs.`{k}`) != 'None'"),
+        AttrScope::Link => format!(
+            "arrayExists(d -> dynamicType(d) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'), links.attrs.`{k}`)"
+        ),
+        AttrScope::Instrumentation => format!(
+            "(dynamicType(scope_attrs.`{k}`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'))"
+        ),
         AttrScope::Unscoped => panic!("the chain has no presence of its own"),
     }
 }
@@ -1803,7 +1825,7 @@ fn not_element_match(e: &str, key: &str, all: bool) -> String {
     let path = format!("{e}.attrs.`{}`", key.replace('.', "%2E"));
     if all {
         format!(
-            "(arrayExists(d -> dynamicType(d) != 'None', {path}) AND NOT arrayExists(b -> \
+            "(arrayExists(d -> dynamicType(d) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'), {path}) AND NOT arrayExists(b -> \
              coalesce(b = true, false), {path}.:Bool))"
         )
     } else {
@@ -1814,7 +1836,7 @@ fn not_element_match(e: &str, key: &str, all: bool) -> String {
 /// `!<e>.key`'s demand condition: some element holds a non-boolean.
 fn not_element_demand(e: &str, key: &str) -> String {
     format!(
-        "arrayExists(d -> dynamicType(d) != 'None' AND dynamicType(d) != 'Bool', {e}.attrs.`{}`)",
+        "arrayExists(d -> dynamicType(d) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))') AND dynamicType(d) != 'Bool', {e}.attrs.`{}`)",
         key.replace('.', "%2E")
     )
 }
@@ -1855,10 +1877,11 @@ fn not_chain_text(key: &str, all: bool) -> String {
 /// `!.key`'s demand condition in [`ctx`]: each scope's, chosen by the
 /// chain. `key` carries no `.`.
 fn not_chain_demand(key: &str) -> String {
-    let c_span =
-        format!("dynamicType(attrs.`{key}`) != 'None' AND dynamicType(attrs.`{key}`) != 'Bool'");
+    let c_span = format!(
+        "dynamicType(attrs.`{key}`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))') AND dynamicType(attrs.`{key}`) != 'Bool'"
+    );
     let c_in = format!(
-        "dynamicType(scope_attrs.`{key}`) != 'None' AND dynamicType(scope_attrs.`{key}`) != 'Bool'"
+        "dynamicType(scope_attrs.`{key}`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))') AND dynamicType(scope_attrs.`{key}`) != 'Bool'"
     );
     let p = |scope: AttrScope| presence_fixed(scope, key);
     format!(
@@ -1886,7 +1909,7 @@ fn t_c23_not_over_an_event_link_or_unscoped_field_demands_a_boolean() {
         (
             format!("arrayExists(b -> coalesce(b = false, false), {e}.attrs.`k`.:Bool)"),
             format!(
-                "arrayExists(d -> dynamicType(d) != 'None' AND dynamicType(d) != 'Bool', \
+                "arrayExists(d -> dynamicType(d) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))') AND dynamicType(d) != 'Bool', \
                  {e}.attrs.`k`)"
             ),
         )
@@ -1918,7 +1941,7 @@ fn t_c23_not_over_an_event_link_or_unscoped_field_demands_a_boolean() {
                 "arrayExists(b -> coalesce(b = false, false), {e}.attrs.`service%2Ename`.:Bool)"
             ),
             format!(
-                "arrayExists(d -> dynamicType(d) != 'None' AND dynamicType(d) != 'Bool', \
+                "arrayExists(d -> dynamicType(d) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))') AND dynamicType(d) != 'Bool', \
                  {e}.attrs.`service%2Ename`)"
             ),
         )
@@ -1927,7 +1950,7 @@ fn t_c23_not_over_an_event_link_or_unscoped_field_demands_a_boolean() {
     let (ts_lk, cs_lk) = elem_s("links");
     let ts = format!(
         "multiIf({}, coalesce({span_path}.:Bool = false, false), {}, \
-         (service_type = 'bool' AND service = 'false'), {}, {ts_ev}, {}, {ts_lk}, {}, \
+         false, {}, {ts_ev}, {}, {ts_lk}, {}, \
          coalesce({in_path}.:Bool = false, false), false)",
         ps(AttrScope::Span),
         service_present_resource(),
@@ -1936,9 +1959,9 @@ fn t_c23_not_over_an_event_link_or_unscoped_field_demands_a_boolean() {
         ps(AttrScope::Instrumentation),
     );
     let cs = format!(
-        "multiIf({}, dynamicType({span_path}) != 'None' AND dynamicType({span_path}) != 'Bool', \
-         {}, service_type != '' AND service_type != 'bool', {}, {cs_ev}, {}, {cs_lk}, {}, \
-         dynamicType({in_path}) != 'None' AND dynamicType({in_path}) != 'Bool', false)",
+        "multiIf({}, dynamicType({span_path}) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))') AND dynamicType({span_path}) != 'Bool', \
+         {}, service_type = 'string', {}, {cs_ev}, {}, {cs_lk}, {}, \
+         dynamicType({in_path}) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))') AND dynamicType({in_path}) != 'Bool', false)",
         ps(AttrScope::Span),
         service_present_resource(),
         ps(AttrScope::Event),
@@ -1982,7 +2005,7 @@ fn t_c24_the_chain_needs_the_window_and_the_element_scopes_do_not() {
     let d = t_b1_window().resources_day_clause();
     let r_present = format!(
         "resource_id IN (SELECT resource_id FROM resources WHERE {d} AND \
-         (dynamicType(attrs.`k`) != 'None'))"
+         (dynamicType(attrs.`k`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))')))"
     );
     let r_true = format!(
         "resource_id IN (SELECT resource_id FROM resources WHERE {d} AND \
@@ -1991,21 +2014,21 @@ fn t_c24_the_chain_needs_the_window_and_the_element_scopes_do_not() {
     assert_eq!(
         rendered_in(r#"{ .k }"#),
         format!(
-            "multiIf(dynamicType(attrs.`k`) != 'None', coalesce(attrs.`k`.:Bool = true, false), \
+            "multiIf((dynamicType(attrs.`k`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))')), coalesce(attrs.`k`.:Bool = true, false), \
              {r_present}, {r_true}, \
-             arrayExists(d -> dynamicType(d) != 'None', events.attrs.`k`), \
+             arrayExists(d -> dynamicType(d) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'), events.attrs.`k`), \
              arrayExists(b -> coalesce(b = true, false), events.attrs.`k`.:Bool), \
-             arrayExists(d -> dynamicType(d) != 'None', links.attrs.`k`), \
+             arrayExists(d -> dynamicType(d) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'), links.attrs.`k`), \
              arrayExists(b -> coalesce(b = true, false), links.attrs.`k`.:Bool), \
-             dynamicType(scope_attrs.`k`) != 'None', coalesce(scope_attrs.`k`.:Bool = true, false), \
+             (dynamicType(scope_attrs.`k`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))')), coalesce(scope_attrs.`k`.:Bool = true, false), \
              false)"
         )
     );
     let presence = format!(
-        "(dynamicType(attrs.`k`) != 'None') OR ({r_present}) OR \
-         (arrayExists(d -> dynamicType(d) != 'None', events.attrs.`k`)) OR \
-         (arrayExists(d -> dynamicType(d) != 'None', links.attrs.`k`)) OR \
-         (dynamicType(scope_attrs.`k`) != 'None')"
+        "((dynamicType(attrs.`k`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'))) OR ({r_present}) OR \
+         (arrayExists(d -> dynamicType(d) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'), events.attrs.`k`)) OR \
+         (arrayExists(d -> dynamicType(d) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'), links.attrs.`k`)) OR \
+         ((dynamicType(scope_attrs.`k`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))')))"
     );
     assert_eq!(rendered_in(r#"{ .k != nil }"#), presence);
     assert_eq!(rendered_in(r#"{ .k = nil }"#), format!("NOT ({presence})"));
@@ -2142,7 +2165,7 @@ fn q_of(path: &str) -> String {
     format!(
         "(SELECT (groupArray(resource_id), groupArray({path}), \
          groupUniqArray(dynamicType({path}))) FROM resources WHERE {} AND \
-         dynamicType({path}) != 'None')",
+         dynamicType({path}) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'))",
         t_b1_window().resources_day_clause()
     )
 }
@@ -2841,7 +2864,7 @@ fn t_c30_the_measured_arithmetic_texts() {
     );
     assert_eq!(
         rendered(r#"{ !span.f = span.g }"#),
-        "(throwIf(dynamicType(attrs.`f`) != 'None' AND dynamicType(attrs.`f`) != 'Bool', \
+        "(throwIf(dynamicType(attrs.`f`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))') AND dynamicType(attrs.`f`) != 'Bool', \
          'expression (!span.f) expected a boolean') + toUInt8((coalesce((NOT attrs.`f`.:Bool) = \
          attrs.`g`.:Bool, false) OR arrayExists(x -> coalesce((NOT attrs.`f`.:Bool) = x, false), \
          attrs.`g`.:`Array(Nullable(Bool))`)))) = 1"
@@ -3186,24 +3209,28 @@ fn chain_c_over(key: &str, rv: &str) -> String {
     );
     let (pr, values, rt) = if key == "service.name" {
         (
-            format!("(service_type = 'string' OR dynamicType({rv}) != 'None')"),
+            format!(
+                "(service_type = 'string' OR dynamicType({rv}) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'))"
+            ),
             format!("[CAST(CAST(service, 'String'), 'Dynamic')], [{rv}]"),
             "[if(service_type = 'string', 2, 9)], [if(service_type = 'string', 9, 2)]".to_string(),
         )
     } else {
         (
-            format!("dynamicType({rv}) != 'None'"),
+            format!(
+                "dynamicType({rv}) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))')"
+            ),
             format!("[{rv}]"),
             "[2]".to_string(),
         )
     };
     let tag = format!(
-        "multiIf(dynamicType({span}) != 'None', 1, {pr}, 2, arrayExists(d -> dynamicType(d) != \
-         'None', {ev}), 3, arrayExists(d -> dynamicType(d) != 'None', {lk}), 4, \
-         dynamicType({sc}) != 'None', 5, 0)"
+        "multiIf(dynamicType({span}) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'), 1, {pr}, 2, arrayExists(d -> dynamicType(d) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'), \
+         {ev}), 3, arrayExists(d -> dynamicType(d) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'), {lk}), 4, \
+         dynamicType({sc}) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'), 5, 0)"
     );
     format!(
-        "arrayFilter((d, g) -> g = {tag} AND dynamicType(d) != 'None', arrayConcat([{span}], {values}, \
+        "arrayFilter((d, g) -> g = {tag} AND dynamicType(d) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'), arrayConcat([{span}], {values}, \
          {ev}, {lk}, [{sc}]), arrayConcat([1], {rt}, arrayMap(d -> 3, {ev}), arrayMap(d -> 4, \
          {lk}), [5]))"
     )
@@ -3231,7 +3258,9 @@ impl SetSpec {
     fn array(&self, n: usize) -> String {
         match self.kind {
             SetKind::Attr(root, key) => {
-                format!("arrayFilter(d -> dynamicType(d) != 'None', {root}.`{key}`)")
+                format!(
+                    "arrayFilter(d -> dynamicType(d) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'), {root}.`{key}`)"
+                )
             }
             SetKind::EventName => "events.name".to_string(),
             SetKind::TimeSinceStart => {
@@ -3273,7 +3302,9 @@ impl SetSpec {
     fn count(&self, n: usize) -> String {
         match self.kind {
             SetKind::Attr(root, key) => {
-                format!("arrayCount(d -> dynamicType(d) != 'None', {root}.`{key}`)")
+                format!(
+                    "arrayCount(d -> dynamicType(d) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'), {root}.`{key}`)"
+                )
             }
             SetKind::EventName => "length(events.name)".to_string(),
             SetKind::TimeSinceStart => "length(events.time_ns)".to_string(),
@@ -3326,21 +3357,27 @@ fn ff_presence(s: &FfOperand, n: usize) -> Option<String> {
         Field::Attribute {
             scope: AttrScope::Span,
             key,
-        } => Some(format!("dynamicType(attrs.`{key}`) != 'None'")),
+        } => Some(format!(
+            "dynamicType(attrs.`{key}`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))')"
+        )),
         Field::Attribute {
             scope: AttrScope::Instrumentation,
             key,
-        } => Some(format!("dynamicType(scope_attrs.`{key}`) != 'None'")),
+        } => Some(format!(
+            "dynamicType(scope_attrs.`{key}`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))')"
+        )),
         Field::Attribute {
             scope: AttrScope::Resource,
             key,
         } if key == "service.name" => Some(format!(
-            "(service_type = 'string' OR dynamicType(r{n}) != 'None')"
+            "(service_type = 'string' OR dynamicType(r{n}) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'))"
         )),
         Field::Attribute {
             scope: AttrScope::Resource,
             ..
-        } => Some(format!("dynamicType(r{n}) != 'None'")),
+        } => Some(format!(
+            "dynamicType(r{n}) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))')"
+        )),
         Field::Intrinsic(_) => None,
         other => panic!("{other} is not one of 3c's scalars"),
     }
@@ -3615,7 +3652,7 @@ fn t_c35_the_set_comparison_texts() {
         rendered(r#"{ event.a = name }"#),
         "arrayExists(e1 -> (coalesce(dynamicElement(e1, 'String') = name, false) OR \
          arrayExists(x -> coalesce(x = name, false), dynamicElement(e1, \
-         'Array(Nullable(String))'))), arrayFilter(d -> dynamicType(d) != 'None', \
+         'Array(Nullable(String))'))), arrayFilter(d -> dynamicType(d) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'), \
          events.attrs.`a`))"
     );
     assert_eq!(
@@ -3623,11 +3660,11 @@ fn t_c35_the_set_comparison_texts() {
         "arrayAll(e1 -> (coalesce(dynamicElement(e1, 'String') != name, false) OR \
          (notEmpty(dynamicElement(e1, 'Array(Nullable(String))')) AND arrayAll(x -> \
          coalesce(x != name, false), dynamicElement(e1, 'Array(Nullable(String))')))), \
-         arrayFilter(d -> dynamicType(d) != 'None', events.attrs.`a`))"
+         arrayFilter(d -> dynamicType(d) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'), events.attrs.`a`))"
     );
     assert_eq!(
         rendered(r#"{ event:name != span.s }"#),
-        "(dynamicType(attrs.`s`) != 'None' AND arrayAll(e1 -> (coalesce(e1 != \
+        "(dynamicType(attrs.`s`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))') AND arrayAll(e1 -> (coalesce(e1 != \
          attrs.`s`.:String, false) OR (notEmpty(attrs.`s`.:`Array(Nullable(String))`) AND \
          arrayAll(x -> coalesce(e1 != x, false), attrs.`s`.:`Array(Nullable(String))`))), \
          events.name))"
@@ -3652,11 +3689,11 @@ fn t_c35_the_set_comparison_texts() {
         "((arraySum(p -> arrayCount(q -> (p != q), arrayMap(h -> lower(hex(h)), \
          links.span_id)), events.name)) = length(events.name) * length(links.span_id))"
     );
-    let c_a = "arrayFilter((d, g) -> g = multiIf(dynamicType(attrs.`a`) != 'None', 1, \
-               dynamicType(r1) != 'None', 2, arrayExists(d -> dynamicType(d) != 'None', \
-               events.attrs.`a`), 3, arrayExists(d -> dynamicType(d) != 'None', \
-               links.attrs.`a`), 4, dynamicType(scope_attrs.`a`) != 'None', 5, 0) AND \
-               dynamicType(d) != 'None', arrayConcat([attrs.`a`], [r1], events.attrs.`a`, \
+    let c_a = "arrayFilter((d, g) -> g = multiIf(dynamicType(attrs.`a`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'), 1, \
+               dynamicType(r1) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'), 2, arrayExists(d -> dynamicType(d) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'), \
+               events.attrs.`a`), 3, arrayExists(d -> dynamicType(d) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'), \
+               links.attrs.`a`), 4, dynamicType(scope_attrs.`a`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'), 5, 0) AND \
+               dynamicType(d) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'), arrayConcat([attrs.`a`], [r1], events.attrs.`a`, \
                links.attrs.`a`, [scope_attrs.`a`]), arrayConcat([1], [2], arrayMap(d -> 3, \
                events.attrs.`a`), arrayMap(d -> 4, links.attrs.`a`), [5]))";
     assert_eq!(
@@ -3839,8 +3876,9 @@ fn t_c38_every_compile_path_for_every_set_operand() {
                 Shape::Expr(shape) => outcome(ex_expected(*shape, set, g, ComparisonOp::Eq)),
                 Shape::Exists { negated } => outcome(match set.kind {
                     SetKind::Attr(root, key) => {
-                        let present =
-                            format!("arrayExists(d -> dynamicType(d) != 'None', {root}.`{key}`)");
+                        let present = format!(
+                            "arrayExists(d -> dynamicType(d) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'), {root}.`{key}`)"
+                        );
                         Ok(if *negated {
                             format!("NOT {present}")
                         } else {
@@ -3891,19 +3929,19 @@ fn t_c38_every_compile_path_for_every_set_operand() {
 fn t_c39_not_over_a_set_and_the_folded_side() {
     assert_eq!(
         rendered(r#"{ !event.f != false }"#),
-        "(throwIf(arrayExists(d -> dynamicType(d) != 'None' AND dynamicType(d) != 'Bool', \
+        "(throwIf(arrayExists(d -> dynamicType(d) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))') AND dynamicType(d) != 'Bool', \
          events.attrs.`f`), 'expression (!event.f) expected a boolean') + \
-         toUInt8((arrayExists(d -> dynamicType(d) != 'None', events.attrs.`f`) AND NOT \
+         toUInt8((arrayExists(d -> dynamicType(d) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'), events.attrs.`f`) AND NOT \
          arrayExists(b -> coalesce(b = true, false), events.attrs.`f`.:Bool)))) = 1"
     );
-    let any = "(throwIf(arrayExists(d -> dynamicType(d) != 'None' AND dynamicType(d) != 'Bool', \
+    let any = "(throwIf(arrayExists(d -> dynamicType(d) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))') AND dynamicType(d) != 'Bool', \
                events.attrs.`f`), 'expression (!event.f) expected a boolean') + \
                toUInt8(arrayExists(b -> coalesce(b = false, false), events.attrs.`f`.:Bool))) = 1";
     assert_eq!(rendered(r#"{ !event.f = true }"#), any);
     assert_eq!(rendered(r#"{ true = !event.f }"#), any);
-    let link_all = "(throwIf(arrayExists(d -> dynamicType(d) != 'None' AND dynamicType(d) != \
+    let link_all = "(throwIf(arrayExists(d -> dynamicType(d) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))') AND dynamicType(d) != \
                     'Bool', links.attrs.`lf`), 'expression (!link.lf) expected a boolean') + \
-                    toUInt8((arrayExists(d -> dynamicType(d) != 'None', links.attrs.`lf`) AND \
+                    toUInt8((arrayExists(d -> dynamicType(d) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'), links.attrs.`lf`) AND \
                     NOT arrayExists(b -> coalesce(b = false, false), links.attrs.`lf`.:Bool)))) \
                     = 1";
     assert_eq!(rendered(r#"{ !link.lf != true }"#), link_all);
@@ -4038,7 +4076,7 @@ impl ExFrame {
     /// A span attribute, lone or in arithmetic: decision 11's presence.
     fn span_attr(&mut self, key: &str) {
         self.scalars
-            .push(format!("dynamicType(attrs.`{key}`) != 'None'"));
+            .push(format!("dynamicType(attrs.`{key}`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))')"));
     }
 
     /// An arithmetic side `n`: its tuple bound to `a<n>`.
@@ -4345,7 +4383,7 @@ fn t_c41_the_set_expression_texts() {
          tuple(if(tupleElement(pl, 1) != 0 AND negate(tupleElement(pl, 1)) = tupleElement(pl, \
          1), NULL, negate(tupleElement(pl, 1))), negate(tupleElement(pl, 2))), \
          [tuple(toInt256(dynamicElement(e1, 'Int64')), dynamicElement(e1, 'Float64'))]), 1)]), \
-         arrayFilter(d -> dynamicType(d) != 'None', events.attrs.`a`))"
+         arrayFilter(d -> dynamicType(d) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'), events.attrs.`a`))"
     );
     assert_eq!(
         rendered(r#"{ event:timeSinceStart / 1ms > 9.5 }"#),
@@ -4359,12 +4397,12 @@ fn t_c41_the_set_expression_texts() {
     );
     assert_eq!(
         rendered(r#"{ !event.f = span.g }"#),
-        "(throwIf(arrayExists(d -> dynamicType(d) != 'None' AND dynamicType(d) != 'Bool', \
+        "(throwIf(arrayExists(d -> dynamicType(d) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))') AND dynamicType(d) != 'Bool', \
          events.attrs.`f`), 'expression (!event.f) expected a boolean') + \
          toUInt8(arrayExists(e1 -> (coalesce((NOT dynamicElement(e1, 'Bool')) = \
          attrs.`g`.:Bool, false) OR arrayExists(x -> coalesce((NOT dynamicElement(e1, 'Bool')) = \
-         x, false), attrs.`g`.:`Array(Nullable(Bool))`)), arrayFilter(d -> dynamicType(d) != \
-         'None', events.attrs.`f`)))) = 1"
+         x, false), attrs.`g`.:`Array(Nullable(Bool))`)), arrayFilter(d -> dynamicType(d) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'), \
+         events.attrs.`f`)))) = 1"
     );
     // A duration divided by a plain number divides as a float: the
     // element's duration flag, not the divisor's, decides it.
@@ -4391,11 +4429,11 @@ fn t_c41_the_set_expression_texts() {
             plus.text
         )
     );
-    let c_a = "arrayFilter((d, g) -> g = multiIf(dynamicType(attrs.`a`) != 'None', 1, \
-               dynamicType(cr1) != 'None', 2, arrayExists(d -> dynamicType(d) != 'None', \
-               events.attrs.`a`), 3, arrayExists(d -> dynamicType(d) != 'None', \
-               links.attrs.`a`), 4, dynamicType(scope_attrs.`a`) != 'None', 5, 0) AND \
-               dynamicType(d) != 'None', arrayConcat([attrs.`a`], [cr1], events.attrs.`a`, \
+    let c_a = "arrayFilter((d, g) -> g = multiIf(dynamicType(attrs.`a`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'), 1, \
+               dynamicType(cr1) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'), 2, arrayExists(d -> dynamicType(d) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'), \
+               events.attrs.`a`), 3, arrayExists(d -> dynamicType(d) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'), \
+               links.attrs.`a`), 4, dynamicType(scope_attrs.`a`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'), 5, 0) AND \
+               dynamicType(d) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'), arrayConcat([attrs.`a`], [cr1], events.attrs.`a`, \
                links.attrs.`a`, [scope_attrs.`a`]), arrayConcat([1], [2], arrayMap(d -> 3, \
                events.attrs.`a`), arrayMap(d -> 4, links.attrs.`a`), [5]))";
     let a1 = FfOperand {
@@ -4428,7 +4466,7 @@ fn t_c41_the_set_expression_texts() {
     assert_eq!(
         rendered_in(r#"{ .a + 1 != span.c }"#),
         format!(
-            "arrayExists(cr1 -> arrayExists(c1 -> (dynamicType(attrs.`c`) != 'None' AND \
+            "arrayExists(cr1 -> arrayExists(c1 -> (dynamicType(attrs.`c`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))') AND \
              notEmpty(c1) AND arrayAll(e1 -> arrayExists(a1 -> {terms}, [{}]), c1)), [{c_a}]), \
              [{}])",
             node.text,

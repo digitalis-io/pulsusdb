@@ -305,6 +305,64 @@ pub(super) fn chain_presence_in(
     c.chain_presence(scope, key)
 }
 
+/// Issue #602 part 1 (D1): the one `Dynamic` value `scope.key` reads —
+/// the value a `by()` key groups by and a metrics key or target reads.
+/// `resource.service.name` is [`SERVICE_VALUE`] (D2); an event's or link's
+/// value is its first element holding the key; the unscoped `.key` is the
+/// first scope of the chain holding it — span, resource, event, link,
+/// instrumentation. Every presence test is [`HELD`] (D5), so a value the
+/// reference does not type is skipped.
+pub(super) fn scope_value(
+    scope: AttrScope,
+    key: &str,
+    ctx: &PredicateCtx<'_>,
+) -> Result<String, PlanError> {
+    let resource = |key: &str| -> Result<String, PlanError> {
+        if key == SERVICE_NAME {
+            Ok(SERVICE_VALUE.to_string())
+        } else {
+            resource_value_in(key, ctx)
+        }
+    };
+    Ok(match scope {
+        AttrScope::Span => attr_path(ATTRS, key),
+        AttrScope::Resource => resource(key)?,
+        AttrScope::Instrumentation => attr_path(SCOPE_ATTRS, key),
+        AttrScope::Event => first_element(EVENT_ATTRS, key),
+        AttrScope::Link => first_element(LINK_ATTRS, key),
+        AttrScope::Unscoped => {
+            let span = attr_path(ATTRS, key);
+            let resource = resource(key)?;
+            format!(
+                "multiIf(dynamicType({span}) {HELD}, {span}, dynamicType({resource}) {HELD}, \
+                 {resource}, {}, {}, {}, {}, {})",
+                any_element_held(EVENT_ATTRS, key),
+                first_element(EVENT_ATTRS, key),
+                any_element_held(LINK_ATTRS, key),
+                first_element(LINK_ATTRS, key),
+                attr_path(SCOPE_ATTRS, key)
+            )
+        }
+    })
+}
+
+/// The first element of an event's or link's attribute `key` that holds
+/// it.
+pub(super) fn first_element(root: &str, key: &str) -> String {
+    format!(
+        "arrayFirst(x -> dynamicType(x) {HELD}, {})",
+        attr_path(root, key)
+    )
+}
+
+/// Whether an element of an event's or link's attribute `key` holds it.
+pub(super) fn any_element_held(root: &str, key: &str) -> String {
+    format!(
+        "arrayExists(x -> dynamicType(x) {HELD}, {})",
+        attr_path(root, key)
+    )
+}
+
 /// The ONE place a window and a predicate compose. The live suite issues
 /// it; `tests/traces_compile_v2.rs`'s `T-C4` freezes its text, so the
 /// frozen text is what ran.
@@ -453,10 +511,25 @@ const LINK_ATTRS: &str = "links.attrs";
 /// it in `spans.service`, with its arm in `spans.service_type`.
 const SERVICE_NAME: &str = "service.name";
 
-/// `Str`: the value was stored as a string, empty or not.
-const SERVICE_IS_STRING: &str = "service_type = 'string'";
-/// `P`: a value was stored, whatever its arm.
-const SERVICE_PRESENT: &str = "service_type != ''";
+/// `Str`: the value was stored as a string, empty or not — the only arm
+/// `service.name` is held at (issue #602 part 1, D2).
+pub(crate) const SERVICE_IS_STRING: &str = "service_type = 'string'";
+
+/// `service.name` as a `Dynamic`: the span row's copy, held only when
+/// stored as a string (D2). The inner `CAST` is required: `toString` of a
+/// `LowCardinality` column stays `LowCardinality`, which the outer one
+/// refuses.
+pub(crate) const SERVICE_VALUE: &str =
+    "if(service_type = 'string', CAST(CAST(service, 'String'), 'Dynamic'), CAST(NULL, 'Dynamic'))";
+
+/// The stored types a value is held at, as the reference types one (issue
+/// #602 part 1, D5): every presence test of the new path is
+/// `dynamicType(X) {HELD}`. Anything else — a key-value list, bytes, an
+/// empty object (all `None`), an array mixing element types
+/// (`Array(Dynamic)`) — is missing.
+pub(crate) const HELD: &str = "IN ('String', 'Int64', 'Float64', 'Bool', \
+     'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', \
+     'Array(Nullable(Bool))')";
 
 /// One compilation: the context, whether a resource subquery was emitted,
 /// and the `!` demands collected so far.
@@ -659,7 +732,7 @@ impl<'a> Compiler<'a> {
         Ok(format!(
             "(SELECT (groupArray(resource_id), groupArray({path}), \
              groupUniqArray(dynamicType({path}))) FROM {} WHERE {} AND \
-             dynamicType({path}) != 'None')",
+             dynamicType({path}) {HELD})",
             ctx.resources_table,
             ctx.window.resources_day_clause()
         ))
@@ -778,15 +851,11 @@ impl<'a> Compiler<'a> {
             AttrScope::Instrumentation => not_attr(SCOPE_ATTRS, key, want),
             AttrScope::Event => not_element(EVENT_ATTRS, key, want, all),
             AttrScope::Link => not_element(LINK_ATTRS, key, want, all),
+            // Held only as a string (D2), and a string is never a boolean:
+            // nothing matches, and only a string demands.
             AttrScope::Resource if key == SERVICE_NAME => {
                 self.ctx.ok_or_else(|| needs_window(AttrScope::Resource))?;
-                (
-                    want.map_or_else(
-                        || "false".to_string(),
-                        |w| format!("(service_type = 'bool' AND service = '{w}')"),
-                    ),
-                    "service_type != '' AND service_type != 'bool'".to_string(),
-                )
+                ("false".to_string(), SERVICE_IS_STRING.to_string())
             }
             AttrScope::Resource => {
                 let (matches, condition) = not_attr(ATTRS, key, want);
@@ -850,14 +919,14 @@ impl<'a> Compiler<'a> {
         key: &str,
         negated: bool,
     ) -> Result<String, PlanError> {
-        let op = if negated { "=" } else { "!=" };
+        let op = if negated { "NOT " } else { "" };
         match scope {
             AttrScope::Span => Ok(format!(
-                "dynamicType({}) {op} 'None'",
+                "{op}(dynamicType({}) {HELD})",
                 attr_path(ATTRS, key)
             )),
             AttrScope::Instrumentation => Ok(format!(
-                "dynamicType({}) {op} 'None'",
+                "{op}(dynamicType({}) {HELD})",
                 attr_path(SCOPE_ATTRS, key)
             )),
             // Any element holds the key. Absence is `NOT` outside, so a span
@@ -875,22 +944,21 @@ impl<'a> Compiler<'a> {
                 self.head.leaf_function(),
             )),
             // Presence reads the arm, never the text: `service` is `''` for
-            // an empty string and for no key alike.
+            // an empty string and for no key alike. Only a string is held
+            // (D2).
             AttrScope::Resource if key == SERVICE_NAME => {
                 self.ctx.ok_or_else(|| needs_window(AttrScope::Resource))?;
                 Ok(if negated {
-                    format!("NOT ({SERVICE_PRESENT})")
+                    format!("NOT ({SERVICE_IS_STRING})")
                 } else {
-                    SERVICE_PRESENT.to_string()
+                    SERVICE_IS_STRING.to_string()
                 })
             }
             // Absence is `NOT` outside the subquery, so a span whose
             // resource row is not visible counts as lacking the key.
             AttrScope::Resource => {
-                let present = self.resource_subquery(&format!(
-                    "dynamicType({}) != 'None'",
-                    attr_path(ATTRS, key)
-                ))?;
+                let present = self
+                    .resource_subquery(&format!("dynamicType({}) {HELD}", attr_path(ATTRS, key)))?;
                 Ok(if negated {
                     format!("NOT ({present})")
                 } else {
@@ -1035,13 +1103,11 @@ impl<'a> Compiler<'a> {
     /// `P_sc`: whether `scope` holds `key`, as the chain tests it.
     ///
     /// At `service.name` the resource scope is present when the span row
-    /// holds a string (the writer moves a non-empty string there, and stores
-    /// every other arm in `resources.attrs`) or the resource row holds any
-    /// value.
+    /// holds a string or the resource row holds a value [`HELD`].
     fn chain_presence(&mut self, scope: AttrScope, key: &str) -> Result<String, PlanError> {
         if scope == AttrScope::Resource && key == SERVICE_NAME {
             let r = self.resource_subquery(&format!(
-                "dynamicType({}) != 'None'",
+                "dynamicType({}) {HELD}",
                 attr_path(ATTRS, SERVICE_NAME)
             ))?;
             return Ok(format!("({SERVICE_IS_STRING} OR {r})"));
@@ -1517,7 +1583,7 @@ impl<'a> Compiler<'a> {
                     SCOPE_ATTRS
                 };
                 self.note_presence(Some(format!(
-                    "dynamicType({}) != 'None'",
+                    "dynamicType({}) {HELD}",
                     attr_path(root, key)
                 )));
                 Arms {
@@ -1530,24 +1596,20 @@ impl<'a> Compiler<'a> {
                     ..Arms::default()
                 }
             }
+            // Held only as a string (D2), which is never a boolean: no
+            // boolean arm, and only a string demands.
             AttrScope::Resource if key == SERVICE_NAME => {
                 self.ctx.ok_or_else(|| needs_window(AttrScope::Resource))?;
-                // Held when the resource row holds the key (decision 11):
-                // a boolean is stored there, not on the span row.
-                let q = self.resource_read(key)?;
-                self.note_presence(Some(format!(
-                    "dynamicType({}) != 'None'",
-                    resource_value(&q)
-                )));
+                self.note_presence(Some(SERVICE_IS_STRING.to_string()));
                 Arms {
-                    b: Some("if(service_type = 'bool', service = 'false', NULL)".to_string()),
+                    b: Some("CAST(NULL, 'Nullable(UInt8)')".to_string()),
                     nullable: true,
                     ..Arms::default()
                 }
             }
             AttrScope::Resource => {
                 let q = self.resource_read(key)?;
-                self.note_presence(Some(format!("dynamicType({var}) != 'None'")));
+                self.note_presence(Some(format!("dynamicType({var}) {HELD}")));
                 Arms {
                     b: Some(format!("(NOT dynamicElement({var}, 'Bool'))")),
                     nullable: true,
@@ -1682,7 +1744,7 @@ impl<'a> Compiler<'a> {
                             SCOPE_ATTRS
                         };
                         self.note_presence(Some(format!(
-                            "dynamicType({}) != 'None'",
+                            "dynamicType({}) {HELD}",
                             attr_path(root, key)
                         )));
                         Ok(attribute(root, key))
@@ -1692,7 +1754,7 @@ impl<'a> Compiler<'a> {
                     AttrScope::Resource => {
                         let q = self.resource_read(key)?;
                         self.note_presence(Some(format!(
-                            "dynamicType({}) != 'None'",
+                            "dynamicType({}) {HELD}",
                             resource_value(&q)
                         )));
                         Ok(Some(Tuple {
@@ -2050,24 +2112,24 @@ impl<'a> Compiler<'a> {
         );
         let (resource_present, resource_values, resource_tags) = if key == SERVICE_NAME {
             (
-                format!("({SERVICE_IS_STRING} OR dynamicType({r}) != 'None')"),
+                format!("({SERVICE_IS_STRING} OR dynamicType({r}) {HELD})"),
                 format!("[CAST(CAST(service, 'String'), 'Dynamic')], [{r}]"),
                 format!("[if({SERVICE_IS_STRING}, 2, 9)], [if({SERVICE_IS_STRING}, 9, 2)]"),
             )
         } else {
             (
-                format!("dynamicType({r}) != 'None'"),
+                format!("dynamicType({r}) {HELD}"),
                 format!("[{r}]"),
                 "[2]".to_string(),
             )
         };
         let tag = format!(
-            "multiIf(dynamicType({span}) != 'None', 1, {resource_present}, 2, arrayExists(d -> \
-             dynamicType(d) != 'None', {events}), 3, arrayExists(d -> dynamicType(d) != 'None', \
-             {links}), 4, dynamicType({scope}) != 'None', 5, 0)"
+            "multiIf(dynamicType({span}) {HELD}, 1, {resource_present}, 2, arrayExists(d -> \
+             dynamicType(d) {HELD}, {events}), 3, arrayExists(d -> dynamicType(d) {HELD}, \
+             {links}), 4, dynamicType({scope}) {HELD}, 5, 0)"
         );
         let chain = format!(
-            "arrayFilter((d, g) -> g = {tag} AND dynamicType(d) != 'None', arrayConcat([{span}], \
+            "arrayFilter((d, g) -> g = {tag} AND dynamicType(d) {HELD}, arrayConcat([{span}], \
              {resource_values}, {events}, {links}, [{scope}]), arrayConcat([1], {resource_tags}, \
              arrayMap(d -> 3, {events}), arrayMap(d -> 4, {links}), [5]))"
         );
@@ -2101,7 +2163,7 @@ pub(super) const CHAIN: [AttrScope; 5] = [
 /// `!<root>.<key>`'s two halves: what matches `want` (`false` with none),
 /// and the demand condition, a present non-boolean.
 ///
-/// **The condition is two `!=`, never `NOT IN ('None', 'Bool')`**: on
+/// **The condition is `HELD` and a `!=`, never `NOT IN ('None', 'Bool')`**: on
 /// 26.3.29.7 the `NOT IN` form threw `Code: 395` over a `LowCardinality`
 /// set on data holding no non-boolean at all (issue #589).
 fn not_attr(root: &str, key: &str, want: Option<bool>) -> (String, String) {
@@ -2111,7 +2173,7 @@ fn not_attr(root: &str, key: &str, want: Option<bool>) -> (String, String) {
             || "false".to_string(),
             |w| format!("coalesce({path}.:Bool = {w}, false)"),
         ),
-        format!("dynamicType({path}) != 'None' AND dynamicType({path}) != 'Bool'"),
+        format!("dynamicType({path}) {HELD} AND dynamicType({path}) != 'Bool'"),
     )
 }
 
@@ -2127,7 +2189,7 @@ fn not_element(root: &str, key: &str, want: Option<bool>, all: bool) -> (String,
             |w| {
                 if all {
                     format!(
-                        "(arrayExists(d -> dynamicType(d) != 'None', {path}) AND NOT \
+                        "(arrayExists(d -> dynamicType(d) {HELD}, {path}) AND NOT \
                          arrayExists(b -> coalesce(b = {}, false), {path}.:Bool))",
                         !w
                     )
@@ -2136,7 +2198,7 @@ fn not_element(root: &str, key: &str, want: Option<bool>, all: bool) -> (String,
                 }
             },
         ),
-        format!("arrayExists(d -> dynamicType(d) != 'None' AND dynamicType(d) != 'Bool', {path})"),
+        format!("arrayExists(d -> dynamicType(d) {HELD} AND dynamicType(d) != 'Bool', {path})"),
     )
 }
 
@@ -2197,7 +2259,7 @@ pub(super) fn attr_path(root: &str, key: &str) -> String {
 /// `arrayFirstIndex` for the search projection's first element holding it.
 fn element_exists(root: &str, key: &str, negated: bool, head: &str) -> String {
     let present = format!(
-        "{head}(d -> dynamicType(d) != 'None', {})",
+        "{head}(d -> dynamicType(d) {HELD}, {})",
         attr_path(root, key)
     );
     if negated {
@@ -2755,10 +2817,10 @@ impl SetOperand {
     fn attribute(root: &str, key: &str, var: String) -> SetOperand {
         let path = attr_path(root, key);
         SetOperand {
-            array: format!("arrayFilter(d -> dynamicType(d) != 'None', {path})"),
+            array: format!("arrayFilter(d -> dynamicType(d) {HELD}, {path})"),
             arms: element_arms(&var),
             var,
-            count: format!("arrayCount(d -> dynamicType(d) != 'None', {path})"),
+            count: format!("arrayCount(d -> dynamicType(d) {HELD}, {path})"),
             lists: dynamic_lists(&path),
             chain: None,
             presence: None,
@@ -2818,15 +2880,15 @@ fn dynamic_lists(array: &str) -> Vec<(Read, String)> {
 fn scalar_presence(field: &Field, var: &str) -> Option<String> {
     match field {
         Field::Attribute { scope, key } => match scope {
-            AttrScope::Span => Some(format!("dynamicType({}) != 'None'", attr_path(ATTRS, key))),
+            AttrScope::Span => Some(format!("dynamicType({}) {HELD}", attr_path(ATTRS, key))),
             AttrScope::Instrumentation => Some(format!(
-                "dynamicType({}) != 'None'",
+                "dynamicType({}) {HELD}",
                 attr_path(SCOPE_ATTRS, key)
             )),
             AttrScope::Resource if key == SERVICE_NAME => Some(format!(
-                "({SERVICE_IS_STRING} OR dynamicType({var}) != 'None')"
+                "({SERVICE_IS_STRING} OR dynamicType({var}) {HELD})"
             )),
-            AttrScope::Resource => Some(format!("dynamicType({var}) != 'None'")),
+            AttrScope::Resource => Some(format!("dynamicType({var}) {HELD}")),
             AttrScope::Event | AttrScope::Link | AttrScope::Unscoped => None,
         },
         Field::Intrinsic(intrinsic) => {

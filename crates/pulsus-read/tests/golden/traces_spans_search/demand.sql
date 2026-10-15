@@ -7,7 +7,7 @@ WITH (SELECT (groupArray(trace_id), groupArray(keys))
             WHERE start_ns >= 1790084801000000000 AND start_ns < 1790095601000000000
               AND intDiv(start_ns, 300000000000) BETWEEN intDiv(1790084801000000000, 300000000000) AND intDiv(1790095600999999999, 300000000000)
               AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') >= toDate('2026-09-22') AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') <= toDate('2026-09-22')
-              AND ((throwIf(dynamicType(attrs.`app%2Ecache%2Ehit`) != 'None' AND dynamicType(attrs.`app%2Ecache%2Ehit`) != 'Bool', 'expression (!span.app.cache.hit) expected a boolean') + toUInt8(coalesce(attrs.`app%2Ecache%2Ehit`.:Bool = false, false))) = 1)
+              AND ((throwIf(dynamicType(attrs.`app%2Ecache%2Ehit`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))') AND dynamicType(attrs.`app%2Ecache%2Ehit`) != 'Bool', 'expression (!span.app.cache.hit) expected a boolean') + toUInt8(coalesce(attrs.`app%2Ecache%2Ehit`.:Bool = false, false))) = 1)
             GROUP BY trace_id
             ORDER BY last DESC, trace_id ASC
             LIMIT 20)) AS top
@@ -23,7 +23,7 @@ FROM (SELECT trace_id, max(start_ns) AS last, count() AS matched,
         AND start_ns >= 1790084801000000000 AND start_ns < 1790095601000000000
         AND intDiv(start_ns, 300000000000) BETWEEN intDiv(1790084801000000000, 300000000000) AND intDiv(1790095600999999999, 300000000000)
         AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') >= toDate('2026-09-22') AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') <= toDate('2026-09-22')
-        AND ((throwIf(dynamicType(attrs.`app%2Ecache%2Ehit`) != 'None' AND dynamicType(attrs.`app%2Ecache%2Ehit`) != 'Bool', 'expression (!span.app.cache.hit) expected a boolean') + toUInt8(coalesce(attrs.`app%2Ecache%2Ehit`.:Bool = false, false))) = 1)
+        AND ((throwIf(dynamicType(attrs.`app%2Ecache%2Ehit`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))') AND dynamicType(attrs.`app%2Ecache%2Ehit`) != 'Bool', 'expression (!span.app.cache.hit) expected a boolean') + toUInt8(coalesce(attrs.`app%2Ecache%2Ehit`.:Bool = false, false))) = 1)
       GROUP BY trace_id) AS m
 LEFT JOIN (SELECT trace_id, min(start_ns) AS start_ns, max(end_ns) AS end_ns,
                   min(root) AS r, if(r.1 = 0, if(length(r.4) <= 8192, r.4, substringUTF8(r.4, 1, 2048)), '') AS root_service, if(r.1 = 0, if(length(r.5) <= 8192, r.5, substringUTF8(r.5, 1, 2048)), '') AS root_name

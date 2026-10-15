@@ -34,8 +34,8 @@ use pulsus_traceql::{
 
 use super::numbering::projected_sql;
 use super::predicate::{
-    CHAIN, PredicateCtx, attr_path, chain_presence_in, compile_span_predicate_in, element_index_in,
-    element_select_in, resource_value_in,
+    CHAIN, HELD, PredicateCtx, SERVICE_IS_STRING, attr_path, chain_presence_in,
+    compile_span_predicate_in, element_index_in, element_select_in, resource_value_in, scope_value,
 };
 use super::rows::SearchProjected;
 use crate::logql::error::ReadError;
@@ -60,9 +60,6 @@ const CUT_CODE_POINTS: usize = 2048;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Projection {
     groups: Vec<Group>,
-    /// Issue #592 part 3: per projected attribute, the condition under
-    /// which a span holds it off its typed path (`search::off_path_at`).
-    off_path: Vec<String>,
 }
 
 /// One projected field.
@@ -122,10 +119,7 @@ enum Projects {
 impl Projection {
     /// The projection of a query that projects nothing.
     pub fn none() -> Projection {
-        Projection {
-            groups: Vec::new(),
-            off_path: Vec::new(),
-        }
+        Projection { groups: Vec::new() }
     }
 
     /// Whether a projected value reads `nested_values` (issue #594 parts 2
@@ -157,23 +151,7 @@ impl Projection {
                 format!("multiIf({})", args.join(", "))
             })
             .collect();
-        let projected = format!("arrayFilter(x -> x.1 != 0, [{}])", groups.join(", "));
-        if self.off_path.is_empty() {
-            return projected;
-        }
-        // Issue #592 part 3: a span holding a projected attribute off its
-        // typed path hands the request to today's engine.
-        format!(
-            "if(throwIf({}, {}) = 0, {projected}, CAST([], 'Array(Tuple(UInt8, String, String))'))",
-            self.off_path.join(" OR "),
-            escape::ch_string(super::search::SELECT_OFF_PATH_DEMAND)
-        )
-    }
-
-    /// Whether a projected attribute can be held off its typed path, so the
-    /// statement carries [`super::search::SELECT_OFF_PATH_DEMAND`].
-    pub(crate) fn has_off_path(&self) -> bool {
-        !self.off_path.is_empty()
+        format!("arrayFilter(x -> x.1 != 0, [{}])", groups.join(", "))
     }
 
     /// The projection of `bodies`, the query's filter bodies in pre-order,
@@ -226,12 +204,6 @@ impl Projection {
                         negated: false,
                     };
                     self.add(field, stored_value(field, ctx)?, &presence, ctx)?;
-                    if let Field::Attribute { scope, key } = field {
-                        let off = super::search::off_path_at(*scope, key, ctx);
-                        if !self.off_path.contains(&off) {
-                            self.off_path.push(off);
-                        }
-                    }
                 }
                 Ok(())
             }
@@ -319,7 +291,8 @@ impl Projection {
     }
 
     /// Adds one source to `field`'s group, creating the group on its first
-    /// source.
+    /// source. A `resource.service.name` source holds only where the span
+    /// row stores it as a string (issue #602 part 1, D2).
     fn add(
         &mut self,
         field: &Field,
@@ -331,7 +304,11 @@ impl Projection {
             Projects::Nothing => return Ok(()),
             Projects::Value { value, kind } => (value, kind),
         };
-        let gate = compile_span_predicate_in(gate, ctx)?.sql().to_string();
+        let mut gate = compile_span_predicate_in(gate, ctx)?.sql().to_string();
+        if matches!(field, Field::Attribute { scope: AttrScope::Resource, key } if key == "service.name")
+        {
+            gate = format!("({gate}) AND {SERVICE_IS_STRING}");
+        }
         let source = Source { gate, value, kind };
         if let Some(group) = self.groups.iter_mut().find(|g| g.field == *field) {
             group.sources.push(source);
@@ -505,39 +482,81 @@ pub struct GroupKeySql {
     /// The key's value as text: a column's keyword text, or a span
     /// attribute's stored text, an array as the JSON of its typed elements.
     pub value: String,
-    /// The value's stored type, for a span attribute; a column key has
-    /// none.
+    /// The value's stored type, for an attribute or `duration`; a column
+    /// key has none.
     pub value_type: Option<String>,
-    /// The condition under which the key's value is held off its own path
-    /// — a key-value list flattened into paths under the key, or bytes in
-    /// `attrs_other` — which the statement cannot read as the key's value.
-    pub off_path: Option<String>,
     /// What the key reads beside the span row (issue #594 part 3): the
     /// grouped statement's `group_values`.
     pub values: Option<super::tracelevel::KeyValues>,
 }
 
-/// The `by()` keys the search statement serves (issue #592 part 2): `name`,
-/// `status`, `kind`, `resource.service.name` and a `span.` attribute; and
-/// (issue #594 part 3) the three per-trace intrinsics, `span:childCount`
-/// and the three nested-set intrinsics, each read from the grouped
-/// statement's `group_values`. `None` for any other key, which today's
-/// engine answers.
-pub fn group_key_sql(field: &Field) -> Option<GroupKeySql> {
+/// The `by()` keys the search statement serves: `name`, `status`, `kind`,
+/// `resource.service.name` and an attribute at every scope (issue #592 part
+/// 2, issue #602 part 1); the six span-row intrinsics `duration`,
+/// `statusMessage`, `span:id`, `span:parentID`, `instrumentation:name` and
+/// `instrumentation:version` (issue #602 part 1, D3); and (issue #594 part
+/// 3) the three per-trace intrinsics, `span:childCount` and the three
+/// nested-set intrinsics, each read from the grouped statement's
+/// `group_values`. `None` for `trace:id` (D9) and the four event and link
+/// intrinsics (D4), which the caller refuses. An attribute reads
+/// [`scope_value`] (D1); a value the reference does not type is `''` typed
+/// `'None'`, the `nil` group (D5). **No wildcard arm**: a new intrinsic
+/// decides here.
+pub fn group_key_sql(
+    field: &Field,
+    ctx: &PredicateCtx<'_>,
+) -> Result<Option<GroupKeySql>, PlanError> {
     use super::tracelevel::{KeyValues, TraceValue};
+    let typed = |x: String| GroupKeySql {
+        value: format!(
+            "if(NOT (dynamicType({x}) {HELD}), '', if(startsWith(dynamicType({x}), 'Array'), \
+             toJSONString(arrayMap(x -> (toString(dynamicType(x)), toString(x)), \
+             CAST({x}, 'Array(Dynamic)'))), toString({x})))"
+        ),
+        value_type: Some(format!(
+            "if(dynamicType({x}) {HELD}, toString(dynamicType({x})), 'None')"
+        )),
+        values: None,
+    };
     let column = |sql: &str| GroupKeySql {
         value: sql.to_string(),
         value_type: None,
-        off_path: None,
         values: None,
     };
     let looked_up = |values: KeyValues, value: String, value_type: String| GroupKeySql {
         value,
         value_type: Some(value_type),
-        off_path: None,
         values: Some(values),
     };
-    match field {
+    Ok(match field {
+        Field::Attribute {
+            scope: AttrScope::Resource,
+            key,
+        } if key == "service.name" => Some(GroupKeySql {
+            value: "if(service_type = 'string', toString(service), '')".to_string(),
+            value_type: Some("if(service_type = 'string', 'String', 'None')".to_string()),
+            values: None,
+        }),
+        Field::Attribute { scope, key } => Some(typed(scope_value(*scope, key, ctx)?)),
+        Field::Intrinsic(Intrinsic::Duration) => Some(GroupKeySql {
+            value: "toString(duration_ns)".to_string(),
+            value_type: Some("'Duration'".to_string()),
+            values: None,
+        }),
+        Field::Intrinsic(Intrinsic::StatusMessage) => Some(column("status_message")),
+        Field::Intrinsic(Intrinsic::SpanId) => Some(column("lower(hex(span_id))")),
+        Field::Intrinsic(Intrinsic::ParentId) => Some(column("lower(hex(parent_span_id))")),
+        Field::Intrinsic(Intrinsic::TraceId) => None,
+        Field::Intrinsic(Intrinsic::InstrumentationName) => Some(column("toString(scope_name)")),
+        Field::Intrinsic(Intrinsic::InstrumentationVersion) => {
+            Some(column("toString(scope_version)"))
+        }
+        Field::Intrinsic(
+            Intrinsic::EventName
+            | Intrinsic::EventTimeSinceStart
+            | Intrinsic::LinkSpanId
+            | Intrinsic::LinkTraceId,
+        ) => None,
         Field::Intrinsic(i @ (Intrinsic::TraceDuration | Intrinsic::RootName | Intrinsic::RootServiceName)) => {
             let v = TraceValue::of(*i).expect("one of the three");
             let x = v.lookup_sql("group_values");
@@ -568,36 +587,7 @@ pub fn group_key_sql(field: &Field) -> Option<GroupKeySql> {
                 _ => None,
             }
         }
-        Field::Attribute {
-            scope: AttrScope::Resource,
-            key,
-        } if key == "service.name" => Some(column("toString(service)")),
-        Field::Attribute {
-            scope: AttrScope::Span,
-            key,
-        } => {
-            let p = attr_path("attrs", key);
-            Some(GroupKeySql {
-                value: format!(
-                    "if(startsWith(dynamicType({p}), 'Array'), toJSONString(arrayMap(x -> \
-                     (toString(dynamicType(x)), toString(x)), CAST({p}, 'Array(Dynamic)'))), \
-                     toString({p}))"
-                ),
-                value_type: Some(format!("toString(dynamicType({p}))")),
-                values: None,
-                off_path: Some(format!(
-                    "dynamicType({p}) = 'None' AND (position(attrs_other, {}) > 0 OR \
-                     arrayExists(x -> startsWith(x, {}), JSONAllPaths(attrs)))",
-                    escape::ch_string(key),
-                    escape::ch_string(&format!(
-                        "{}.",
-                        pulsus_clickhouse::json_column::escape_json_path(key)
-                    ))
-                )),
-            })
-        }
-        _ => None,
-    }
+    })
 }
 
 /// An array's elements, each by its own type, from the statement's
@@ -725,7 +715,8 @@ fn literal(text: &str, kind: &str) -> Projects {
 
 /// `stored(E)`: a `Dynamic` value as stored — an array as the JSON of its
 /// typed elements, which the decode renders and cuts; any other value as
-/// its text, cut; the kind is its stored type.
+/// its text, cut; the kind is its stored type. A value the reference does
+/// not type is `''` typed `'None'` (issue #602 part 1, D5).
 fn stored(e: &str) -> Projects {
     let (value, kind) = stored_parts(e);
     Projects::Value { value, kind }
@@ -735,11 +726,12 @@ fn stored(e: &str) -> Projects {
 fn stored_parts(e: &str) -> (String, String) {
     (
         format!(
-            "if(startsWith(dynamicType({e}), 'Array'), toJSONString(arrayMap(x -> \
-             (toString(dynamicType(x)), toString(x)), CAST({e}, 'Array(Dynamic)'))), {})",
+            "if(NOT (dynamicType({e}) {HELD}), '', if(startsWith(dynamicType({e}), 'Array'), \
+             toJSONString(arrayMap(x -> (toString(dynamicType(x)), toString(x)), \
+             CAST({e}, 'Array(Dynamic)'))), {}))",
             ceiling_sql(&format!("toString({e})"))
         ),
-        format!("toString(dynamicType({e}))"),
+        format!("if(dynamicType({e}) {HELD}, toString(dynamicType({e})), 'None')"),
     )
 }
 
@@ -811,8 +803,9 @@ fn literal_side<'a>(field: &Field, lhs: &'a FieldExpr, rhs: &'a FieldExpr) -> Op
     }
 }
 
-/// A comparison naming `field` alone: a span-row column projects itself
-/// under any condition; any other field projects nothing under `!=` and
+/// A comparison naming `field` alone: nothing when an operand holds a `!`,
+/// a comparison or `&&`/`||` ([`boolean_valued`]); a span-row column
+/// projects itself under any other condition; any other field projects nothing under `!=` and
 /// `!~`, the literal when compared `=` with a string or boolean literal
 /// (a link id's lowercased, as the predicate compares it), and otherwise
 /// its value where the condition read it: an attribute's stored value, a
@@ -825,6 +818,9 @@ fn comparison_value(
     comparison: &FieldExpr,
     ctx: &PredicateCtx<'_>,
 ) -> Result<Projects, PlanError> {
+    if boolean_valued(lhs) || boolean_valued(rhs) {
+        return Ok(Projects::Nothing);
+    }
     let place = place_of(field);
     // Section 3.6's refusal comes before every operator's own rule, `!=`
     // and `!~` included: such a comparison projects nothing, but its
@@ -887,6 +883,24 @@ fn comparison_value(
     }
 }
 
+/// Whether `expr` holds a `!`, a comparison or `&&`/`||` (issue #602 part
+/// 1, D6): a field inside such an operand projects nothing, a span-row
+/// column included.
+fn boolean_valued(expr: &FieldExpr) -> bool {
+    match expr {
+        FieldExpr::Unary {
+            op: UnaryOp::Not, ..
+        }
+        | FieldExpr::Binary {
+            op: FieldOp::Cmp(_) | FieldOp::Bool(_),
+            ..
+        } => true,
+        FieldExpr::Binary { lhs, rhs, .. } => boolean_valued(lhs) || boolean_valued(rhs),
+        FieldExpr::Unary { expr, .. } => boolean_valued(expr),
+        FieldExpr::Field(_) | FieldExpr::Literal(_) | FieldExpr::Exists { .. } => false,
+    }
+}
+
 /// Whether `expr` holds an arithmetic node anywhere.
 fn has_arithmetic(expr: &FieldExpr) -> bool {
     match expr {
@@ -945,9 +959,8 @@ fn arithmetic_only(expr: &FieldExpr) -> bool {
 /// condition holds; once inside arithmetic, the first element the
 /// comparison holds for; compared with itself, the first element carrying
 /// it. Twice in a comparison holding arithmetic was refused before this
-/// ([`refuse_two_occurrences`]); any other shape — the field under `!` or
-/// inside a boolean-valued operand — which the design does not name is
-/// refused here.
+/// ([`refuse_two_occurrences`]); any other shape projects nothing, as the
+/// previous engine projects nothing for it (issue #602 part 1, D6).
 fn set_value(
     field: &Field,
     lhs: &FieldExpr,
@@ -962,7 +975,7 @@ fn set_value(
         if matches!((lhs, rhs), (FieldExpr::Field(_), FieldExpr::Field(_))) {
             return first_carrying(field, ctx);
         }
-        return Err(unnamed_shape(field));
+        return Ok(Projects::Nothing);
     }
     let mut on_left = Vec::new();
     operand_fields(lhs, &mut on_left);
@@ -980,7 +993,7 @@ fn set_value(
             }
             Ok(selected_value(field, &e))
         }
-        _ => Err(unnamed_shape(field)),
+        _ => Ok(Projects::Nothing),
     }
 }
 
@@ -1002,15 +1015,6 @@ fn refuse_two_occurrences(
         )));
     }
     Ok(())
-}
-
-/// A set field in a comparison shape the design does not name: under `!`,
-/// or inside a boolean-valued operand.
-fn unnamed_shape(field: &Field) -> PlanError {
-    PlanError::UnsupportedField(format!(
-        "projecting {field} from a comparison that holds it under `!` or inside a boolean-valued \
-         operand is not supported by the search statement"
-    ))
 }
 
 /// Section 3.2: the first element whose own condition holds, for a
@@ -1168,18 +1172,16 @@ fn selected_value(field: &Field, element: &str) -> Projects {
 }
 
 /// Issue #592 part 3: an aggregate argument's located element, as the
-/// projection reads a field's stored value — a `span.` attribute's own, or
-/// the unscoped `.k` at the first scope of the chain that holds it — as
-/// `(text, stored type)` SQL. `None` for any other field.
+/// projection reads a field's stored value — an attribute's own at any
+/// scope (issue #602 part 1, D7), the unscoped `.k` at the first scope of
+/// the chain that holds it — as `(text, stored type)` SQL. `None` for any
+/// other field.
 pub(crate) fn aggregate_argument_sql(
     field: &Field,
     ctx: &PredicateCtx<'_>,
 ) -> Result<Option<(String, String)>, PlanError> {
     match field {
-        Field::Attribute {
-            scope: AttrScope::Span | AttrScope::Unscoped,
-            ..
-        } => match stored_value(field, ctx)? {
+        Field::Attribute { .. } => match stored_value(field, ctx)? {
             Projects::Value { value, kind } => Ok(Some((value, kind))),
             Projects::Nothing => Ok(None),
         },

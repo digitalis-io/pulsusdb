@@ -4407,8 +4407,8 @@ const TRACES_FROM_SPANS: &str = "INSERT INTO traces SELECT \
      FROM (SELECT trace_id, min(start_ns) AS s, \
      max(toInt64(least(toUInt64(start_ns) + toUInt64(duration_ns), 9223372036854775807))) AS e, \
      min((toUInt8(parent_span_id != toFixedString('', 8)), start_ns, span_id, \
-     toString(service), toString(name))) AS r, \
-     groupUniqArray(toString(service)) AS sv, max(start_ns) AS ls, \
+     if(service_type = 'string', toString(service), ''), toString(name))) AS r, \
+     groupUniqArrayIf(toString(service), service_type = 'string') AS sv, max(start_ns) AS ls, \
      groupUniqArray(4096)(intDiv(start_ns, 300000000000)) AS bk \
      FROM spans GROUP BY trace_id)";
 
