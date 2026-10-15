@@ -8039,4 +8039,234 @@ mod tests {
             );
         }
     }
+
+    /// Issue #624, part 6 (T1): on today's range route a line in no
+    /// window `(g − range, g]` — in a gap, on a window's open lower edge,
+    /// or after the last grid point — neither fails the query nor counts,
+    /// for every range reducer. A line on a window's closed upper edge or
+    /// inside a window still fails it. Every case here fans out: `| n > 5`
+    /// marks the pipeline label-changing.
+    #[test]
+    fn a_row_no_window_covers_neither_fails_nor_counts_on_todays_route() {
+        const S: i64 = 1_000_000_000;
+        let t: i64 = 1_000 * 60 * S;
+        let (a, b) = (Fingerprint::from_raw(1), Fingerprint::from_raw(2));
+        let mut meta = HashMap::new();
+        for (fp, n) in [(a, "7"), (b, "bad")] {
+            meta.insert(
+                fp,
+                StreamMetaRow {
+                    fingerprint: fp,
+                    service: "s".to_string(),
+                    labels: format!(r#"{{"n":"{n}","service_name":"s","v":"2"}}"#),
+                },
+            );
+        }
+        let a_rows: Vec<MetricScanRow> = (-6..=27)
+            .map(|k| scan_row(a, t + k * 10 * S, "a"))
+            .collect();
+        // (B's line, range, end, Some(count per point) | None = fails)
+        let cases: [(&str, i64, i64, i64, Option<f64>); 5] = [
+            ("gap", t + 75 * S, 30, t + 240 * S, Some(3.0)),
+            ("open lower edge", t + 90 * S, 30, t + 240 * S, Some(3.0)),
+            ("tail", t + 250 * S, 60, t + 270 * S, Some(6.0)),
+            ("closed upper edge", t + 60 * S, 30, t + 240 * S, None),
+            ("in window", t + 75 * S, 60, t + 240 * S, None),
+        ];
+        let step = super::super::params::validate_duration_ns(60 * S as u64, "step").unwrap();
+        let mut checked = 0;
+        for op in RangeAggOp::ALL.iter().copied() {
+            let unwrap = !matches!(
+                op,
+                RangeAggOp::CountOverTime
+                    | RangeAggOp::Rate
+                    | RangeAggOp::BytesOverTime
+                    | RangeAggOp::BytesRate
+                    | RangeAggOp::AbsentOverTime
+            );
+            let tail = if unwrap { " | unwrap v" } else { "" };
+            let stages = parse_pipeline(&format!(r#"{{a="b"}} | n > 5{tail}"#));
+            let compiled = CompiledPipeline::compile(&stages).expect("compile");
+            let client = ClientAgg {
+                pipeline: stages.clone(),
+                value: if unwrap {
+                    ClientValue::Unwrap
+                } else if matches!(op, RangeAggOp::BytesOverTime | RangeAggOp::BytesRate) {
+                    ClientValue::Bytes
+                } else {
+                    ClientValue::Count
+                },
+                range_op: op,
+                param: matches!(op, RangeAggOp::QuantileOverTime).then_some(0.5),
+                absent_labels: Vec::new(),
+                grouping: None,
+            };
+            for (name, b_at, range_s, end, per_point) in cases {
+                let range = super::super::params::validate_duration_ns(
+                    (range_s * S) as u64,
+                    "range selector",
+                )
+                .unwrap();
+                let window = ClientWindow::Range {
+                    grid_start_ns: t,
+                    end_ns: end,
+                    step_ns: step,
+                    range_ns: range,
+                    offset_ns: 0,
+                };
+                let mut rows = a_rows.clone();
+                rows.push(scan_row(b, b_at, "b"));
+                let rw = Some((range_s * S) as u64);
+                let got = run_client_agg_rows(&rows, &compiled, &meta, &client, window, rw);
+                match per_point {
+                    None => assert!(
+                        matches!(got, Err(ReadError::MetricPipelineError { .. })),
+                        "{op:?} {name}: {got:?}"
+                    ),
+                    Some(v) => {
+                        let want =
+                            run_client_agg_rows(&a_rows, &compiled, &meta, &client, window, rw)
+                                .expect("A alone answers");
+                        let got = got.unwrap_or_else(|e| panic!("{op:?} {name}: {e:?}"));
+                        assert_eq!(format!("{got:?}"), format!("{want:?}"), "{op:?} {name}");
+                        if op == RangeAggOp::CountOverTime {
+                            let QueryResult::Matrix(m) = &got else {
+                                panic!()
+                            };
+                            assert_eq!(m.len(), 1, "{m:?}");
+                            let pts: Vec<(i64, u64)> = m[0]
+                                .points
+                                .iter()
+                                .map(|(ts, x)| (*ts, x.to_bits()))
+                                .collect();
+                            let exp: Vec<(i64, u64)> =
+                                (0..5).map(|k| (t + k * 60 * S, v.to_bits())).collect();
+                            assert_eq!(pts, exp, "{name}");
+                        }
+                    }
+                }
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 75);
+    }
+
+    /// Issue #624, part 6 (T1b): T1 on the per-fingerprint path. The
+    /// pipeline is empty, so the state does not fan out, and the one error
+    /// this path can meet is a stream label `__error__`.
+    #[test]
+    fn a_row_no_window_covers_neither_fails_nor_counts_on_the_fingerprint_path() {
+        const S: i64 = 1_000_000_000;
+        let t: i64 = 1_000 * 60 * S;
+        let (a, b) = (Fingerprint::from_raw(1), Fingerprint::from_raw(2));
+        let mut meta = HashMap::new();
+        for (fp, labels) in [
+            (a, r#"{"app":"a","env":"e","service_name":"s"}"#),
+            (b, r#"{"__error__":"boom","app":"b","service_name":"s"}"#),
+        ] {
+            meta.insert(
+                fp,
+                StreamMetaRow {
+                    fingerprint: fp,
+                    service: "s".to_string(),
+                    labels: labels.to_string(),
+                },
+            );
+        }
+        let a_rows: Vec<MetricScanRow> = (-6..=27)
+            .map(|k| scan_row(a, t + k * 10 * S, "a"))
+            .collect();
+        let cases: [(&str, i64, i64, i64, Option<f64>); 5] = [
+            ("gap", t + 75 * S, 30, t + 240 * S, Some(3.0)),
+            ("open lower edge", t + 90 * S, 30, t + 240 * S, Some(3.0)),
+            ("tail", t + 250 * S, 60, t + 270 * S, Some(6.0)),
+            ("closed upper edge", t + 60 * S, 30, t + 240 * S, None),
+            ("in window", t + 75 * S, 60, t + 240 * S, None),
+        ];
+        let step = super::super::params::validate_duration_ns(60 * S as u64, "step").unwrap();
+        let stages = parse_pipeline(r#"{a="b"}"#);
+        let compiled = CompiledPipeline::compile(&stages).expect("compile");
+        let mut checked = 0;
+        for op in [
+            RangeAggOp::CountOverTime,
+            RangeAggOp::Rate,
+            RangeAggOp::BytesOverTime,
+            RangeAggOp::BytesRate,
+            RangeAggOp::AbsentOverTime,
+        ] {
+            let client = ClientAgg {
+                pipeline: stages.clone(),
+                value: if matches!(op, RangeAggOp::BytesOverTime | RangeAggOp::BytesRate) {
+                    ClientValue::Bytes
+                } else {
+                    ClientValue::Count
+                },
+                range_op: op,
+                param: None,
+                absent_labels: Vec::new(),
+                grouping: None,
+            };
+            for (name, b_at, range_s, end, per_point) in cases {
+                let range = super::super::params::validate_duration_ns(
+                    (range_s * S) as u64,
+                    "range selector",
+                )
+                .unwrap();
+                let window = ClientWindow::Range {
+                    grid_start_ns: t,
+                    end_ns: end,
+                    step_ns: step,
+                    range_ns: range,
+                    offset_ns: 0,
+                };
+                let probe =
+                    RangeSlideState::new(&compiled, &meta, &client, window, None, AggCaps::DEFAULT)
+                        .unwrap();
+                assert!(!probe.fan_out, "{op:?}");
+                assert!(
+                    probe.slider_safe.contains(&a) && probe.slider_safe.contains(&b),
+                    "{op:?}"
+                );
+                let mut rows = a_rows.clone();
+                rows.push(scan_row(b, b_at, "b"));
+                let rw = Some((range_s * S) as u64);
+                route_counters::reset();
+                let got = run_client_agg_rows(&rows, &compiled, &meta, &client, window, rw);
+                assert_eq!(
+                    route_counters::row_route_calls(),
+                    0,
+                    "{op:?} {name}: every row inert"
+                );
+                match per_point {
+                    None => assert!(
+                        matches!(&got, Err(ReadError::MetricPipelineError { error_type, .. }) if error_type == "boom"),
+                        "{op:?} {name}: {got:?}"
+                    ),
+                    Some(v) => {
+                        let want =
+                            run_client_agg_rows(&a_rows, &compiled, &meta, &client, window, rw)
+                                .expect("A alone answers");
+                        let got = got.unwrap_or_else(|e| panic!("{op:?} {name}: {e:?}"));
+                        assert_eq!(format!("{got:?}"), format!("{want:?}"), "{op:?} {name}");
+                        if op == RangeAggOp::CountOverTime {
+                            let QueryResult::Matrix(m) = &got else {
+                                panic!()
+                            };
+                            assert_eq!(m.len(), 1, "{m:?}");
+                            let pts: Vec<(i64, u64)> = m[0]
+                                .points
+                                .iter()
+                                .map(|(ts, x)| (*ts, x.to_bits()))
+                                .collect();
+                            let exp: Vec<(i64, u64)> =
+                                (0..5).map(|k| (t + k * 60 * S, v.to_bits())).collect();
+                            assert_eq!(pts, exp, "{name}");
+                        }
+                    }
+                }
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 25);
+    }
 }
