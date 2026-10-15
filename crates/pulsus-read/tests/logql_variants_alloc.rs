@@ -3026,10 +3026,14 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
         // `.run_metric_step_into`; `reserved_fps.is_empty()` / `.contains`).
         // W-MEM disposition: **NOT-EXEC, row F-d**.
         // Issue #624, part 3a: as the instant twin, term for term.
-        // FRAME client_agg.rs RangeSlideState::push_one_row 7 13 :: .contains .is_empty .len .run_metric_step_into_with_captures .stage_member .unwrap_or Ok Rows check_surviving_error debug_assert_eq! matches! route_row_counted row_route
-        branches: 7,
+        // Issue #624, part 6: 7 -> 8 branches; `.covering_k` joins the callee
+        // set (the coverage test ahead of the pipeline). W-MEM disposition:
+        // **NOT-EXEC, row F-d**: it allocates nothing.
+        // FRAME client_agg.rs RangeSlideState::push_one_row 8 14 :: .contains .covering_k .is_empty .len .run_metric_step_into_with_captures .stage_member .unwrap_or Ok Rows check_surviving_error debug_assert_eq! matches! route_row_counted row_route
+        branches: 8,
         callees: &[
             ".contains",
+            ".covering_k",
             ".is_empty",
             ".len",
             ".run_metric_step_into_with_captures",

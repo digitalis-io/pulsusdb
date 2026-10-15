@@ -2359,6 +2359,14 @@ impl<'q> RangeSlideState<'q> {
     where
         'q: 'a,
     {
+        // Issue #624, part 6: a row in no window `(t − range, t]` — in a gap
+        // when the range is shorter than the step, or after the last grid
+        // point — is in no sample the reference emits, so it neither fails the
+        // query nor counts (`pkg/logql/evaluator.go:721-735 @ v3.7.4`).
+        let (k_lo, k_hi) = self.covering_k(row.timestamp_ns);
+        if k_lo > k_hi {
+            return Ok(());
+        }
         let compiled = self.compiled;
         let grouping = self.grouping;
         let (line, value) = match compiled.run_metric_step_into_with_captures(
