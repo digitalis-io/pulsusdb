@@ -27,6 +27,7 @@ CREATE DATABASE IF NOT EXISTS {{db}}{{on_cluster}};
 
 CREATE TABLE IF NOT EXISTS {{db}}.log_landing{{on_cluster}}
 (
+    org_id LowCardinality(String),
     event_id UUID DEFAULT generateUUIDv7(),
     received_ms Int64 CODEC(DoubleDelta, ZSTD(1)),
     kind UInt8 CODEC(ZSTD(1)),
@@ -52,6 +53,7 @@ TTL toDateTime(least(intDiv(received_ms, 1000) + ({{log_landing_retention_hours}
 
 CREATE TABLE IF NOT EXISTS {{db}}.log_metrics_{{log_rollup_suffix}}{{on_cluster}}
 (
+    org_id LowCardinality(String),
     fingerprint UInt128,
     bucket_ns Int64,
     count SimpleAggregateFunction(sum, UInt64),
@@ -61,11 +63,12 @@ CREATE TABLE IF NOT EXISTS {{db}}.log_metrics_{{log_rollup_suffix}}{{on_cluster}
 --@cluster ENGINE = ReplicatedAggregatingMergeTree('/clickhouse/tables/{shard}/{{db}}.log_metrics_{{log_rollup_suffix}}', '{replica}')
 PARTITION BY toDate(fromUnixTimestamp64Nano(bucket_ns))
 ORDER BY (fingerprint, bucket_ns)
---@single  SETTINGS index_granularity = 8192, non_replicated_deduplication_window = {{log_dedup_window}}{{storage_policy}};
---@cluster SETTINGS index_granularity = 8192, replicated_deduplication_window = {{log_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
+--@single  SETTINGS allow_dimensions_outside_sorting_key = 1, index_granularity = 8192, non_replicated_deduplication_window = {{log_dedup_window}}{{storage_policy}};
+--@cluster SETTINGS allow_dimensions_outside_sorting_key = 1, index_granularity = 8192, replicated_deduplication_window = {{log_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
 
 CREATE TABLE IF NOT EXISTS {{db}}.log_patterns{{on_cluster}}
 (
+    org_id LowCardinality(String),
     fingerprint UInt128,
     bucket_ns Int64,
     pattern String CODEC(ZSTD(1)),
@@ -76,11 +79,12 @@ CREATE TABLE IF NOT EXISTS {{db}}.log_patterns{{on_cluster}}
 PARTITION BY toDate(fromUnixTimestamp64Nano(bucket_ns))
 ORDER BY (fingerprint, bucket_ns, pattern)
 TTL toDateTime(least(intDiv(bucket_ns, 1000000000) + ({{retention_days}} * 86400), 4294967295))
---@single  SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{log_dedup_window}}{{storage_policy}};
---@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, replicated_deduplication_window = {{log_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
+--@single  SETTINGS allow_dimensions_outside_sorting_key = 1, ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{log_dedup_window}}{{storage_policy}};
+--@cluster SETTINGS allow_dimensions_outside_sorting_key = 1, ttl_only_drop_parts = 1, index_granularity = 8192, replicated_deduplication_window = {{log_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
 
 CREATE TABLE IF NOT EXISTS {{db}}.log_samples{{on_cluster}}
 (
+    org_id LowCardinality(String),
     service LowCardinality(String),
     fingerprint UInt128,
     timestamp_ns Int64 CODEC(DoubleDelta, ZSTD(1)),
@@ -100,6 +104,7 @@ TTL toDateTime(least(intDiv(timestamp_ns, 1000000000) + ({{retention_days}} * 86
 
 CREATE TABLE IF NOT EXISTS {{db}}.log_streams{{on_cluster}}
 (
+    org_id LowCardinality(String),
     month Date,
     fingerprint UInt128,
     service LowCardinality(String),
@@ -115,6 +120,7 @@ ORDER BY fingerprint
 
 CREATE TABLE IF NOT EXISTS {{db}}.log_streams_idx{{on_cluster}}
 (
+    org_id LowCardinality(String),
     month Date,
     key LowCardinality(String),
     val String,
@@ -688,6 +694,7 @@ TTL toDateTime(least(intDiv(last_start_ns, 1000000000) + ({{retention_days}} * 8
 
 CREATE MATERIALIZED VIEW {{db}}.log_metrics_{{log_rollup_suffix}}_mv{{on_cluster}} TO {{db}}.log_metrics_{{log_rollup_suffix}}
 AS SELECT
+    org_id AS org_id,
     fingerprint AS fingerprint,
     intDiv(timestamp_ns, {{log_rollup_ns}}) * {{log_rollup_ns}} AS bucket_ns,
     count() AS count,
@@ -695,11 +702,13 @@ AS SELECT
 FROM {{db}}.log_landing
 WHERE kind = 0
 GROUP BY
+    org_id,
     fingerprint,
     bucket_ns;
 
 CREATE MATERIALIZED VIEW {{db}}.log_patterns_mv{{on_cluster}} TO {{db}}.log_patterns
 AS SELECT
+    org_id AS org_id,
     fingerprint AS fingerprint,
     timestamp_ns AS bucket_ns,
     pattern AS pattern,
@@ -709,6 +718,7 @@ WHERE kind = 2;
 
 CREATE MATERIALIZED VIEW {{db}}.log_samples_mv{{on_cluster}} TO {{db}}.log_samples
 AS SELECT
+    org_id AS org_id,
     service AS service,
     fingerprint AS fingerprint,
     timestamp_ns AS timestamp_ns,
@@ -720,6 +730,7 @@ WHERE kind = 0;
 
 CREATE MATERIALIZED VIEW {{db}}.log_streams_idx_mv{{on_cluster}} TO {{db}}.log_streams_idx
 AS SELECT
+    org_id AS org_id,
     month,
     kv.1 AS key,
     kv.2 AS val,
@@ -730,6 +741,7 @@ WHERE kind = 1;
 
 CREATE MATERIALIZED VIEW {{db}}.log_streams_mv{{on_cluster}} TO {{db}}.log_streams
 AS SELECT
+    org_id AS org_id,
     month AS month,
     fingerprint AS fingerprint,
     service AS service,

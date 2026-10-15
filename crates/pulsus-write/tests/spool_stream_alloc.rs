@@ -586,7 +586,11 @@ async fn peak_over_log_push(push: ParsedLogs, poison: bool) -> Measured {
     );
     let peak = peak_bytes_of(async {
         let wait = writer
-            .admit_flush(push, PushHeaders::default())
+            .admit_flush(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+                push,
+                PushHeaders::default(),
+            )
             .expect("the queue has room");
         let answer = tokio::time::timeout(Duration::from_secs(60), wait)
             .await

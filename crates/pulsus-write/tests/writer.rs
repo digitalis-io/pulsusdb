@@ -163,6 +163,7 @@ async fn concurrent_admit_never_exceeds_the_queue_bytes_limit() {
         let writer = writer.clone();
         tasks.spawn(async move {
             writer.admit(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
                 batch_for(u128::from(i), "svc", T, false),
                 PushHeaders::default(),
             )
@@ -205,7 +206,11 @@ async fn kill_switch_off_lands_no_pattern_rows() {
     );
 
     writer
-        .admit_flush(two_line_batch(), PushHeaders::default())
+        .admit_flush(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            two_line_batch(),
+            PushHeaders::default(),
+        )
         .expect("queue has room")
         .await
         .expect("the block commits");
@@ -236,7 +241,11 @@ async fn kill_switch_on_lands_the_pattern_aggregate() {
     );
 
     writer
-        .admit_flush(two_line_batch(), PushHeaders::default())
+        .admit_flush(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            two_line_batch(),
+            PushHeaders::default(),
+        )
         .expect("queue has room")
         .await
         .expect("the block commits");
@@ -283,7 +292,7 @@ fn the_stream_charge_covers_the_canonical_json_the_row_owns() {
         updated_ns: T,
     };
     let charged = LogLandingRow::est_landing_bytes(LogStreamRow::est_source_bytes(&stream));
-    let row = LogLandingRow::stream(0, &stream);
+    let row = LogLandingRow::stream(&std::sync::Arc::<str>::from(""), 0, &stream);
     // The row's own text, plus the fixed-width columns `LogStreamRow::estimate`
     // prices: month, fingerprint and updated_ns.
     let held = LogLandingRow::est_landing_bytes(

@@ -1636,6 +1636,7 @@ fn streams_plan(
     let normalized = normalize_matchers(&log_expr.selector)?;
     let months = months_overlapping(start_ns, end_ns);
     let stage1_sql = super::sql::stage1(
+        ctx.tenant,
         ctx.streams_idx,
         &months,
         &normalized.positive_branches,
@@ -2990,6 +2991,7 @@ fn metric_plan(
     let normalized = normalize_matchers(&range.selector.selector)?;
     let months = months_overlapping(start_ns, end_ns);
     let stage1_sql = super::sql::stage1(
+        ctx.tenant,
         ctx.streams_idx,
         &months,
         &normalized.positive_branches,
@@ -4185,7 +4187,12 @@ fn build_probes(
         .iter()
         .map(|key| ProbePlan {
             key: key.clone(),
-            sql: super::sql::probe(ctx.streams_idx, months, &super::predicate::literal(key)),
+            sql: super::sql::probe(
+                ctx.tenant,
+                ctx.streams_idx,
+                months,
+                &super::predicate::literal(key),
+            ),
         })
         .collect()
 }
@@ -5003,6 +5010,9 @@ mod tests {
 
     fn test_ctx() -> PlanCtx<'static> {
         PlanCtx {
+            tenant: Box::leak(Box::new(
+                pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            )),
             db: "pulsus",
             streams_idx: "log_streams_idx",
             streams: "log_streams",
@@ -7953,6 +7963,7 @@ mod tests {
     /// through the same builder `client_metric_read_sql` calls.
     fn range_read_sql(mp: &MetricPlan) -> String {
         super::super::sql::metric_raw_samples_sliding(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
             &mp.table,
             &[super::super::predicate::literal("checkout")],
             &[

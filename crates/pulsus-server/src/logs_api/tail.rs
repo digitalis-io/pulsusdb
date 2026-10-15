@@ -1062,6 +1062,7 @@ mod tests {
         assert_eq!(clamped_fetch_limit(u64::from(u32::MAX) + 5, 5_000), 5_000);
 
         let sql = pulsus_read::logql::sql::stage3_keyset(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
             "log_samples",
             &[pulsus_read::logql::predicate::literal("checkout")],
             &[Fingerprint::from_raw(1).sql_literal()],

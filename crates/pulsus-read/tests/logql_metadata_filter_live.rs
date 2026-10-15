@@ -251,7 +251,11 @@ fn window(ts_ns: i64) -> QueryParams {
 /// An engine at the shipped metadata budget, for a control beside a
 /// starved one.
 async fn full_engine(db: &str) -> LogQlEngine {
-    LogQlEngine::new(data_client(db).await, engine_config(db))
+    LogQlEngine::new(
+        data_client(db).await,
+        engine_config(db),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    )
 }
 
 /// The number of entries a log query returns.
@@ -677,7 +681,11 @@ async fn every_lowered_metadata_filter_answers_the_recorded_answer() {
     let client = create_schema(&db).await;
     let ts = now_ns();
     seed(&client, &db, ts, STREAMS, &all_rows()).await;
-    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db));
+    let engine = LogQlEngine::new(
+        data_client(&db).await,
+        engine_config(&db),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    );
     let params = window(ts);
 
     let mut wrong: Vec<String> = Vec::new();
@@ -874,7 +882,11 @@ async fn every_lowered_metadata_filter_executes_one_sample_statement() {
         .collect();
     seed(&client, &db, ts, std::slice::from_ref(&stream), &rows).await;
 
-    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db));
+    let engine = LogQlEngine::new(
+        data_client(&db).await,
+        engine_config(&db),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    );
     // **What this count discriminates, measured in both directions.**
     // With the fragment in the statement the count is 1. With the
     // fragment absent — the route this change replaces — no sample
@@ -929,7 +941,11 @@ async fn the_four_refused_filters_answer_unchanged_on_the_page_loop() {
     let admin = admin_client().await;
     let ts = now_ns();
     seed(&client, &db, ts, STREAMS, &all_rows()).await;
-    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db));
+    let engine = LogQlEngine::new(
+        data_client(&db).await,
+        engine_config(&db),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    );
     // A `limit` of 1 with the shipped scan factor pages one row at a
     // time, so a route that pages issues more than one statement on a
     // corpus of four matching rows.
@@ -1075,7 +1091,11 @@ async fn a_metric_query_over_a_metadata_filter_answers_the_same_from_one_stateme
     let admin = admin_client().await;
     let ts = now_ns();
     seed(&client, &db, ts, STREAMS, &all_rows()).await;
-    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db));
+    let engine = LogQlEngine::new(
+        data_client(&db).await,
+        engine_config(&db),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    );
 
     let since = now_micros(&admin).await;
     // 36: one series, value 1.
@@ -1172,7 +1192,11 @@ async fn every_metric_route_carries_the_fragment_in_its_statement() {
     let admin = admin_client().await;
     let ts = now_ns();
     seed(&client, &db, ts, STREAMS, &all_rows()).await;
-    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db));
+    let engine = LogQlEngine::new(
+        data_client(&db).await,
+        engine_config(&db),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    );
 
     // `[5m]` against a 60s step: the range is not the step, so this is the
     // client-aggregated route — the one that carried no fragment.
@@ -1240,8 +1264,12 @@ async fn an_oversized_fragment_restores_the_client_stage_on_a_bucketed_range_que
     let client = create_schema(&db).await;
     let ts = now_ns();
     seed(&client, &db, ts, STREAMS, &all_rows()).await;
-    let starved = LogQlEngine::new(data_client(&db).await, engine_config(&db))
-        .with_metadata_fragment_budget(1);
+    let starved = LogQlEngine::new(
+        data_client(&db).await,
+        engine_config(&db),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    )
+    .with_metadata_fragment_budget(1);
 
     let ranged =
         format!(r#"count_over_time({{service_name="checkout"}} | trace_id="{TRACE_1}" [1m])"#);
@@ -1298,10 +1326,18 @@ async fn an_oversized_fragment_falls_back_on_every_route_that_can_meet_it() {
     let client = create_schema(&db).await;
     let ts = now_ns();
     seed(&client, &db, ts, STREAMS, &all_rows()).await;
-    let full = LogQlEngine::new(data_client(&db).await, engine_config(&db));
+    let full = LogQlEngine::new(
+        data_client(&db).await,
+        engine_config(&db),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    );
     // One byte: no fragment this corpus can render fits.
-    let starved = LogQlEngine::new(data_client(&db).await, engine_config(&db))
-        .with_metadata_fragment_budget(1);
+    let starved = LogQlEngine::new(
+        data_client(&db).await,
+        engine_config(&db),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    )
+    .with_metadata_fragment_budget(1);
 
     // AC12 — the streams route. The same answer, never a rejection, and
     // **the route proved rather than inferred** (code review round 1).
@@ -1484,6 +1520,7 @@ async fn an_over_cap_activity_set_is_refused_rather_than_truncated() {
             max_streams: 3,
             ..engine_config(&db)
         },
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
     );
     let values = engine
         .label_values("env", None, bounds(ts))
@@ -1506,6 +1543,7 @@ async fn an_over_cap_activity_set_is_refused_rather_than_truncated() {
             max_streams: 2,
             ..engine_config(&db)
         },
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
     );
     match engine.label_values("env", None, bounds(ts)).await {
         Err(ReadError::QueryTooBroad(TooBroadReason::StreamCap { count, cap })) => {
@@ -1551,7 +1589,11 @@ async fn a_no_activity_window_dispatches_no_index_scan() {
     let client = create_schema(&db).await;
     let ts = now_ns();
     seed(&client, &db, ts, &DISCOVERY_STREAMS, &DISCOVERY_SEEDS).await;
-    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db));
+    let engine = LogQlEngine::new(
+        data_client(&db).await,
+        engine_config(&db),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    );
 
     // A window the seeded lines are inside: both stages run.
     let (values, explain) = engine

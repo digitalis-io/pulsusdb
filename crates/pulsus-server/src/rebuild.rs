@@ -261,6 +261,51 @@ async fn distinct_days(
         .map_err(|e| format!("reading the days to delete: {e}"))
 }
 
+/// `pulsusdb rebuild-logs`: replays a window of `log_landing` into one of
+/// the five tables the log materialized views maintain (issue #653).
+#[derive(Args, Debug)]
+pub(crate) struct RebuildLogs {
+    /// Which table to rebuild: `log_samples`, `log_metrics_<res>` (for
+    /// example `log_metrics_5s`), `log_patterns`, `log_streams` or
+    /// `log_streams_idx`.
+    #[arg(long)]
+    target: String,
+
+    /// Replay landed rows stamped at or after this instant, RFC3339.
+    #[arg(long)]
+    from: String,
+
+    /// Replay landed rows stamped strictly before this instant, RFC3339.
+    #[arg(long)]
+    to: String,
+
+    /// Drop the target partitions the replayed rows fall in first, or with
+    /// `--tenant` delete that tenant's rows on those days.
+    #[arg(long)]
+    drop_target_partitions: bool,
+
+    /// Replay one tenant's rows alone.
+    #[arg(long)]
+    tenant: Option<String>,
+}
+
+pub(crate) async fn run_logs(_config: &Config, _args: RebuildLogs) -> ExitCode {
+    eprintln!("pulsusdb: rebuild-logs: not built");
+    ExitCode::FAILURE
+}
+
+/// The statement a log rebuild replays: the view's projection over a
+/// bounded window of `log_landing`.
+pub(crate) fn log_replay_select(
+    projection: &str,
+    _db: &str,
+    _from_ms: i64,
+    _to_ms: i64,
+    _tenant: Option<&Tenant>,
+) -> Result<String, String> {
+    Ok(projection.to_string())
+}
+
 /// `pulsusdb rebuild-traces`: replays a window of `trace_landing` into
 /// **all five** tables the trace materialized views maintain (issue #586).
 ///
@@ -331,4 +376,61 @@ fn parse_rfc3339_millis(text: &str) -> Result<i64, String> {
     chrono::DateTime::parse_from_rfc3339(text)
         .map(|t| t.timestamp_millis())
         .map_err(|e| format!("{text:?} is not an RFC3339 instant: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **T-R5 (issue #653): each log replay reads one tenant's window.** For
+    /// the rendered projection of each of the five log views, the replayed
+    /// statement reads `log_landing` once, through the bounded subquery: the
+    /// window and, with a tenant, that tenant alone. A projection that
+    /// names the landing table twice or never is refused.
+    #[test]
+    fn each_log_replay_reads_one_tenants_window() {
+        let ctx = pulsus_schema::RenderCtx::for_tests("db");
+        let tenant = Tenant::from_header(
+            Some(&axum::http::HeaderValue::from_static("tenant-q")),
+            false,
+        )
+        .expect("a valid tenant");
+        for view in [
+            "log_samples_mv",
+            "log_metrics_{{log_rollup_suffix}}_mv",
+            "log_patterns_mv",
+            "log_streams_mv",
+            "log_streams_idx_mv",
+        ] {
+            let projection = pulsus_schema::mv_projection(view, &ctx)
+                .unwrap_or_else(|| panic!("{view} is in the catalogue"));
+            for (who, scope) in [(Some(&tenant), " AND org_id = 'tenant-q'"), (None, "")] {
+                let sql = log_replay_select(&projection, "db", 1000, 2000, who)
+                    .unwrap_or_else(|e| panic!("{view}: {e}"));
+                let source = format!(
+                    "FROM (SELECT * FROM db.log_landing WHERE received_ms >= 1000 AND \
+                     received_ms < 2000{scope}) AS log_landing"
+                );
+                assert_eq!(
+                    sql.matches(&source).count(),
+                    1,
+                    "{view}, tenant {who:?}: the bounded source once in\n{sql}"
+                );
+                assert!(
+                    !sql.replacen(&source, "", 1).contains("log_landing"),
+                    "{view}, tenant {who:?}: no other read of log_landing in\n{sql}"
+                );
+            }
+            let twice = format!("{projection} UNION ALL {projection}");
+            assert!(
+                log_replay_select(&twice, "db", 1000, 2000, Some(&tenant)).is_err(),
+                "{view}: a projection naming the landing table twice"
+            );
+            let never = projection.replace("FROM db.log_landing", "FROM db.elsewhere");
+            assert!(
+                log_replay_select(&never, "db", 1000, 2000, Some(&tenant)).is_err(),
+                "{view}: a projection never naming the landing table"
+            );
+        }
+    }
 }

@@ -994,6 +994,43 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// **T-W3 (issue #653): a failed log push's audit record names its
+    /// tenant.** Each logs landing row kind, carrying `tenant-a`, is written
+    /// to the spool as a failed block is; the record on disk holds
+    /// `"org_id": "tenant-a"` for each, in the declared shape and the
+    /// streamed one alike.
+    #[tokio::test]
+    async fn every_log_landing_row_kind_records_its_tenant() {
+        let dir = tempdir();
+        for (name, mut row) in log_landing_rows_of_every_kind() {
+            row.org_id = Arc::from("tenant-a");
+            assert_eq!(
+                row.to_spool_value()["org_id"],
+                serde_json::json!("tenant-a"),
+                "the declared {name} shape"
+            );
+            let path = dir.join(format!("{name}.tenant.json"));
+            write_record(
+                &path,
+                "log_landing",
+                "boom",
+                1_700_000_000_123_456_789,
+                &[row],
+            )
+            .await
+            .expect("the document is written");
+            let doc: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).expect("read the document back"))
+                    .expect("the document is JSON");
+            assert_eq!(
+                doc["rows"][0]["org_id"],
+                serde_json::json!("tenant-a"),
+                "the {name} row's audit record: {doc}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// One row of each logs kind, each carrying text long enough that the
     /// string path spills the chunk rather than fitting one piece.
     fn log_landing_rows_of_every_kind() -> Vec<(&'static str, crate::writer::rows::LogLandingRow)> {
@@ -1028,9 +1065,18 @@ mod tests {
             count: 4_242,
         };
         vec![
-            ("kind0-line", LogLandingRow::line(5, &line)),
-            ("kind1-stream", LogLandingRow::stream(5, &stream)),
-            ("kind2-pattern", LogLandingRow::pattern(5, pattern)),
+            (
+                "kind0-line",
+                LogLandingRow::line(&std::sync::Arc::<str>::from(""), 5, &line),
+            ),
+            (
+                "kind1-stream",
+                LogLandingRow::stream(&std::sync::Arc::<str>::from(""), 5, &stream),
+            ),
+            (
+                "kind2-pattern",
+                LogLandingRow::pattern(&std::sync::Arc::<str>::from(""), 5, pattern),
+            ),
         ]
     }
 

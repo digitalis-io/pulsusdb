@@ -207,7 +207,11 @@ async fn series_union_across_disjoint_selectors_trips_the_stream_cap_even_though
     )
     .await;
 
-    let engine = LogQlEngine::new(data_client, engine_config(db, 1));
+    let engine = LogQlEngine::new(
+        data_client,
+        engine_config(db, 1),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    );
     let bounds = TimeBounds {
         start_ns: base_ns - 3_600_000_000_000,
         end_ns: base_ns + 3_600_000_000_000,
@@ -275,7 +279,11 @@ async fn series_union_at_or_under_the_cap_still_succeeds() {
     )
     .await;
 
-    let engine = LogQlEngine::new(data_client, engine_config(db, 2));
+    let engine = LogQlEngine::new(
+        data_client,
+        engine_config(db, 2),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    );
     let bounds = TimeBounds {
         start_ns: base_ns - 3_600_000_000_000,
         end_ns: base_ns + 3_600_000_000_000,
@@ -347,7 +355,11 @@ async fn series_cap_counts_the_pre_window_union() {
     )
     .await;
 
-    let engine = LogQlEngine::new(data_client, engine_config(db, 1));
+    let engine = LogQlEngine::new(
+        data_client,
+        engine_config(db, 1),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    );
     let bounds = TimeBounds {
         start_ns: base_ns - 600_000_000_000,
         end_ns: base_ns + 60_000_000_000,

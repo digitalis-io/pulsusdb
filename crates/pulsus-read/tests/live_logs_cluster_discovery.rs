@@ -382,6 +382,7 @@ async fn the_production_discovery_read_answers_completely_over_split_placement()
             .await
             .expect("connect the engine's client"),
         engine_config(&db),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
     );
     let values = engine
         .label_values("env", None, bounds)

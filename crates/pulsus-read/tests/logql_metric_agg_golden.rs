@@ -32,6 +32,9 @@ fn apply_vector_aggs_ok(
 
 fn ctx() -> PlanCtx<'static> {
     PlanCtx {
+        tenant: Box::leak(Box::new(
+            pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+        )),
         db: "pulsus",
         streams_idx: "log_streams_idx",
         streams: "log_streams",
@@ -2850,6 +2853,7 @@ fn rate_counter_excludes_a_sample_at_exactly_t_minus_range() {
     // bound (`>`), so the `t-range` sample is filtered out server-side. A
     // closed interval would render `>=` and this assertion would fail.
     let sql = pulsus_read::logql::sql::metric_raw_samples(
+        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
         &mp.table,
         &[pulsus_read::logql::predicate::literal("checkout")],
         &[Fingerprint::from_raw(1).sql_literal()],

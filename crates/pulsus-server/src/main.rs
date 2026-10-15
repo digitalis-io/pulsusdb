@@ -163,6 +163,9 @@ enum Command {
     /// Replay a window of the trace landing table into all five tables its
     /// materialized views maintain. See `src/rebuild.rs`.
     RebuildTraces(rebuild::RebuildTraces),
+    /// Replay a window of the log landing table into one of the five
+    /// tables its materialized views maintain. See `src/rebuild.rs`.
+    RebuildLogs(rebuild::RebuildLogs),
 }
 
 #[tokio::main]
@@ -179,6 +182,7 @@ async fn main() -> ExitCode {
             match cli.command {
                 Some(Command::RebuildMetrics(args)) => rebuild::run(&config, args).await,
                 Some(Command::RebuildTraces(args)) => rebuild::run_traces(&config, args).await,
+                Some(Command::RebuildLogs(args)) => rebuild::run_logs(&config, args).await,
                 None => serve::run(config).await,
             }
         }

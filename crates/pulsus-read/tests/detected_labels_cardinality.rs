@@ -767,8 +767,12 @@ fn the_provenance_transcript_and_the_artifact_agree() {
 fn the_detected_labels_aggregate_is_still_an_exact_count() {
     let some_fps = [7, 9].map(|v| Fingerprint::from_raw(v).sql_literal());
     for fingerprints in [&some_fps[..1], &some_fps[..]] {
-        let rendered =
-            sql::detected_labels("log_streams_idx", &[month_literal(2026, 8)], fingerprints);
+        let rendered = sql::detected_labels(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            "log_streams_idx",
+            &[month_literal(2026, 8)],
+            fingerprints,
+        );
         assert!(
             rendered.contains("uniqExact(val) AS cardinality"),
             "the exact aggregate is the contract: {rendered}"

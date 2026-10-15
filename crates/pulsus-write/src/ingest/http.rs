@@ -160,9 +160,11 @@ pub async fn ingest(
         );
     }
     let push = push_headers(&headers);
+    // Tests-first seam: the empty tenant until the header is read.
+    let tenant = pulsus_model::Tenant::from_header(None, false).expect("the empty tenant");
 
     if is_async(&headers) {
-        return match sink.admit(parsed, push) {
+        return match sink.admit(&tenant, parsed, push) {
             Ok(()) if stream_errors.is_empty() => {
                 export_response(StatusCode::ACCEPTED, rejected, rejected_message)
             }
@@ -175,7 +177,7 @@ pub async fn ingest(
         };
     }
 
-    match sink.admit_flush(parsed, push) {
+    match sink.admit_flush(&tenant, parsed, push) {
         Ok(wait) => match wait.await {
             Ok(()) if stream_errors.is_empty() => {
                 export_response(StatusCode::OK, rejected, rejected_message)
@@ -485,16 +487,18 @@ pub async fn ingest_loki_push(
         return loki_stream_errors_response(stream_errors);
     }
     let push = push_headers(&headers);
+    // Tests-first seam: the empty tenant until the header is read.
+    let tenant = pulsus_model::Tenant::from_header(None, false).expect("the empty tenant");
 
     if is_async(&headers) {
-        return match sink.admit(parsed, push) {
+        return match sink.admit(&tenant, parsed, push) {
             Ok(()) if stream_errors.is_empty() => rw_success_response(StatusCode::ACCEPTED),
             Ok(()) => loki_stream_errors_response(stream_errors),
             Err(refusal) => loki_refusal_response(refusal),
         };
     }
 
-    match sink.admit_flush(parsed, push) {
+    match sink.admit_flush(&tenant, parsed, push) {
         Ok(wait) => match wait.await {
             Ok(()) if stream_errors.is_empty() => rw_success_response(StatusCode::NO_CONTENT),
             Ok(()) => loki_stream_errors_response(stream_errors),
@@ -1433,7 +1437,12 @@ mod tests {
     }
 
     impl LogSink for MockSink {
-        fn admit(&self, batch: ParsedLogs, push: PushHeaders) -> Result<(), AdmitRefusal> {
+        fn admit(
+            &self,
+            _tenant: &pulsus_model::Tenant,
+            batch: ParsedLogs,
+            push: PushHeaders,
+        ) -> Result<(), AdmitRefusal> {
             self.admitted.lock().unwrap().push(batch);
             self.pushes.lock().unwrap().push(push);
             match self.outcome.refusal() {
@@ -1444,6 +1453,7 @@ mod tests {
 
         fn admit_flush(
             &self,
+            _tenant: &pulsus_model::Tenant,
             batch: ParsedLogs,
             push: PushHeaders,
         ) -> Result<FlushWait, AdmitRefusal> {

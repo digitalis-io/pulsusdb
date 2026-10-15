@@ -304,7 +304,9 @@ pub(crate) fn trace_writer_tables_from(config: &Config) -> TraceWriterTables {
 pub(crate) fn logql_engine(pool: Arc<ChPool>, config: &Config) -> Result<LogQlEngine, ChError> {
     let client = ChClient::from_shared_pool(pool, config.query_timeout.0)
         .with_consistency(consistency_from(config))?;
-    Ok(LogQlEngine::new(client, engine_config_from(config)))
+    // Tests-first seam: the empty tenant until the header is read.
+    let tenant = pulsus_model::Tenant::from_header(None, false).expect("the empty tenant");
+    Ok(LogQlEngine::new(client, engine_config_from(config), tenant))
 }
 
 /// Maps `Config` to [`pulsus_read::LabelCacheConfig`] (issue #30 architect

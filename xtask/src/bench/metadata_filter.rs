@@ -616,6 +616,7 @@ async fn route_engine(
             pipeline_scan_factor: 10,
             distributed: false,
         },
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
     )
     .with_query_log_comment(tag);
     Ok(match budget {

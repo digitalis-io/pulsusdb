@@ -616,6 +616,9 @@ fn per_row_allocation_bounds_hold() {
     // --- bucket accumulators are per-(group, bucket) — bounded by the
     // --- fixture's 1 stream x few buckets, never by row count.
     let plan_ctx = PlanCtx {
+        tenant: Box::leak(Box::new(
+            pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+        )),
         db: "pulsus",
         streams_idx: "log_streams_idx",
         streams: "log_streams",

@@ -295,6 +295,7 @@ async fn matched_indices(
     })
     .unwrap_or_else(|e| panic!("{op:?} {needle:?} must mint: {e:?}"));
     let sql = sql::stage3(
+        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
         &format!("{db}.log_samples"),
         &[literal("checkout")],
         &[Fingerprint::from_raw(u128::from(FP)).sql_literal()],

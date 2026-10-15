@@ -195,7 +195,11 @@ async fn a_push_lands_one_block_carrying_every_kind() {
 
     let (batch, body_bytes) = fixture();
     writer
-        .admit_flush(batch, PushHeaders::default())
+        .admit_flush(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            batch,
+            PushHeaders::default(),
+        )
         .expect("the queue has room")
         .await
         .expect("the landing block commits");
@@ -332,7 +336,11 @@ async fn the_log_landing_insert_omits_event_id_so_the_server_fills_it() {
 
     let (batch, _) = fixture();
     writer
-        .admit_flush(batch, PushHeaders::default())
+        .admit_flush(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            batch,
+            PushHeaders::default(),
+        )
         .expect("the queue has room")
         .await
         .expect("the landing block commits");

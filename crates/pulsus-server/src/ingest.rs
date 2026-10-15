@@ -88,16 +88,26 @@ impl WriterSink {
 }
 
 impl LogSink for WriterSink {
-    fn admit(&self, batch: ParsedLogs, push: PushHeaders) -> Result<(), AdmitRefusal> {
+    fn admit(
+        &self,
+        tenant: &Tenant,
+        batch: ParsedLogs,
+        push: PushHeaders,
+    ) -> Result<(), AdmitRefusal> {
         match self.slot.get() {
-            Some(writer) => writer.admit(batch, push),
+            Some(writer) => writer.admit(tenant, batch, push),
             None => Err(AdmitRefusal::Backpressure),
         }
     }
 
-    fn admit_flush(&self, batch: ParsedLogs, push: PushHeaders) -> Result<FlushWait, AdmitRefusal> {
+    fn admit_flush(
+        &self,
+        tenant: &Tenant,
+        batch: ParsedLogs,
+        push: PushHeaders,
+    ) -> Result<FlushWait, AdmitRefusal> {
         match self.slot.get() {
-            Some(writer) => writer.admit_flush(batch, push),
+            Some(writer) => writer.admit_flush(tenant, batch, push),
             None => Err(AdmitRefusal::Backpressure),
         }
     }
@@ -388,7 +398,11 @@ mod tests {
     fn admit_is_backpressure_while_the_slot_is_empty() {
         let sink = WriterSink::new(Arc::new(OnceLock::new()));
         assert_eq!(
-            sink.admit(batch(), PushHeaders::default()),
+            sink.admit(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+                batch(),
+                PushHeaders::default()
+            ),
             Err(AdmitRefusal::Backpressure)
         );
     }
@@ -396,7 +410,14 @@ mod tests {
     #[test]
     fn admit_flush_is_backpressure_while_the_slot_is_empty() {
         let sink = WriterSink::new(Arc::new(OnceLock::new()));
-        assert!(sink.admit_flush(batch(), PushHeaders::default()).is_err());
+        assert!(
+            sink.admit_flush(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+                batch(),
+                PushHeaders::default()
+            )
+            .is_err()
+        );
     }
 
     fn metrics_batch() -> ParsedMetrics {

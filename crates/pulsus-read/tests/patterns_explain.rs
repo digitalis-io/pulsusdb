@@ -259,7 +259,13 @@ async fn patterns_read_prunes_at_the_primary_key_time_prefix_within_one_partitio
     };
     let full_raw = explain_raw(
         &dbc,
-        &sql::log_patterns_read(table, &[fp()], full_window, BUCKET_NS as u64),
+        &sql::log_patterns_read(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            table,
+            &[fp()],
+            full_window,
+            BUCKET_NS as u64,
+        ),
     )
     .await;
     let (_full_sel, total_granules) = block_granules(&full_raw, "PrimaryKey")
@@ -276,7 +282,13 @@ async fn patterns_read_prunes_at_the_primary_key_time_prefix_within_one_partitio
     };
     let narrow_raw = explain_raw(
         &dbc,
-        &sql::log_patterns_read(table, &[fp()], narrow_window, BUCKET_NS as u64),
+        &sql::log_patterns_read(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            table,
+            &[fp()],
+            narrow_window,
+            BUCKET_NS as u64,
+        ),
     )
     .await;
     let (narrow_sel, _) = block_granules(&narrow_raw, "PrimaryKey")
@@ -338,7 +350,13 @@ async fn patterns_read_prunes_daily_partitions() {
     };
     let raw = explain_raw(
         &dbc,
-        &sql::log_patterns_read(table, &[fp()], window, BUCKET_NS as u64),
+        &sql::log_patterns_read(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            table,
+            &[fp()],
+            window,
+            BUCKET_NS as u64,
+        ),
     )
     .await;
     let (sel, total) =
@@ -433,7 +451,11 @@ async fn patterns_engine_assembles_ordered_series_with_exact_step_rebucketing() 
     )
     .await;
 
-    let engine = LogQlEngine::new(db_client(&db).await, engine_config(&db));
+    let engine = LogQlEngine::new(
+        db_client(&db).await,
+        engine_config(&db),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    );
     let expr = pulsus_logql::parse(r#"{service_name="checkout"}"#).expect("parse");
     let bounds = TimeBounds {
         start_ns: b0 - 1,

@@ -229,7 +229,11 @@ async fn the_declared_limit_has_three_legs() {
     let writer = writer_with(eager(), samples.clone(), MockInserter::new(Behavior::Ok));
     for _ in 0..2 {
         let wait = writer
-            .admit_flush(batch(1, "checkout failed", T, true), PushHeaders::default())
+            .admit_flush(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+                batch(1, "checkout failed", T, true),
+                PushHeaders::default(),
+            )
             .expect("queue has room");
         wait.await.expect("the flush settles");
     }
@@ -247,7 +251,11 @@ async fn the_declared_limit_has_three_legs() {
     let b = writer_with(eager(), b_samples.clone(), MockInserter::new(Behavior::Ok));
     for writer in [&a, &b] {
         let wait = writer
-            .admit_flush(batch(1, "checkout failed", T, true), PushHeaders::default())
+            .admit_flush(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+                batch(1, "checkout failed", T, true),
+                PushHeaders::default(),
+            )
             .expect("queue has room");
         wait.await.expect("the flush settles");
     }
@@ -272,7 +280,11 @@ async fn the_declared_limit_has_three_legs() {
     assert!(off.dedup().is_none(), "the index is not built at all");
     for _ in 0..2 {
         let wait = off
-            .admit_flush(batch(1, "checkout failed", T, true), PushHeaders::default())
+            .admit_flush(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+                batch(1, "checkout failed", T, true),
+                PushHeaders::default(),
+            )
             .expect("queue has room");
         wait.await.expect("the flush settles");
     }
@@ -311,7 +323,11 @@ async fn eight_concurrent_identical_pushes_admit_exactly_one() {
         let gate = gate.clone();
         tasks.spawn(async move {
             gate.wait().await;
-            writer.admit(batch(2, "concurrent", T, true), PushHeaders::default())
+            writer.admit(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+                batch(2, "concurrent", T, true),
+                PushHeaders::default(),
+            )
         });
     }
     let results: Vec<Result<(), AdmitRefusal>> = tasks.join_all().await;
@@ -351,12 +367,20 @@ async fn a_push_whose_every_target_failed_definitely_is_re_admitted() {
     );
 
     let wait = writer
-        .admit_flush(batch(3, "poisoned", T, false), PushHeaders::default())
+        .admit_flush(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            batch(3, "poisoned", T, false),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
     wait.await.expect_err("a poisoned flush resolves Err");
 
     let wait = writer
-        .admit_flush(batch(3, "poisoned", T, false), PushHeaders::default())
+        .admit_flush(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            batch(3, "poisoned", T, false),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
     wait.await.expect_err("and so does the re-admitted one");
 
@@ -389,7 +413,11 @@ async fn a_push_refused_by_backpressure_leaves_no_claim() {
             MockInserter::new(Behavior::Ok),
         );
         probe
-            .admit(first.clone(), PushHeaders::default())
+            .admit(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+                first.clone(),
+                PushHeaders::default(),
+            )
             .expect("the probe has room");
         let bytes = probe.metrics().queue_bytes;
         probe.shutdown(Duration::from_secs(2)).await;
@@ -409,10 +437,18 @@ async fn a_push_refused_by_backpressure_leaves_no_claim() {
     let writer = writer_with(cfg, samples.clone(), MockInserter::new(Behavior::Ok));
 
     writer
-        .admit(first, PushHeaders::default())
+        .admit(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            first,
+            PushHeaders::default(),
+        )
         .expect("the first push fits");
     let refusal = writer
-        .admit(second.clone(), PushHeaders::default())
+        .admit(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            second.clone(),
+            PushHeaders::default(),
+        )
         .expect_err("the second push does not fit");
     assert_eq!(refusal, AdmitRefusal::Backpressure);
     assert_eq!(
@@ -431,7 +467,11 @@ async fn a_push_refused_by_backpressure_leaves_no_claim() {
     assert_eq!(writer.metrics().queue_bytes, 0, "the queue drained");
 
     writer
-        .admit(second, PushHeaders::default())
+        .admit(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            second,
+            PushHeaders::default(),
+        )
         .expect("with room, the same body is stored");
     assert_eq!(
         writer.metrics().dedup.duplicate_pushes_total,
@@ -459,7 +499,11 @@ async fn a_lone_retry_attempt_header_is_stored() {
     let writer = writer_with(eager(), samples.clone(), MockInserter::new(Behavior::Ok));
 
     let wait = writer
-        .admit_flush(batch(7, "a retry of nothing", T, true), declared)
+        .admit_flush(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            batch(7, "a retry of nothing", T, true),
+            declared,
+        )
         .expect("queue has room");
     wait.await.expect("the flush settles");
 
@@ -494,7 +538,11 @@ async fn two_different_bodies_declaring_a_retry_are_two_pushes() {
 
     for body in ["first line", "second line"] {
         let wait = writer
-            .admit_flush(batch(70, body, T, true), declared())
+            .admit_flush(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+                batch(70, body, T, true),
+                declared(),
+            )
             .expect("queue has room");
         wait.await.expect("the flush settles");
     }
@@ -515,12 +563,17 @@ async fn a_declared_retry_moves_the_declared_dimension_only() {
     let writer = writer_with(eager(), samples.clone(), MockInserter::new(Behavior::Ok));
 
     let wait = writer
-        .admit_flush(batch(8, "declared", T, true), PushHeaders::default())
+        .admit_flush(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            batch(8, "declared", T, true),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
     wait.await.expect("the flush settles");
 
     let wait = writer
         .admit_flush(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
             batch(8, "declared", T, true),
             PushHeaders {
                 idempotency_key: None,
@@ -561,20 +614,32 @@ async fn the_idempotency_key_namespaces_the_identity() {
 
     for k in ["a", "b"] {
         let wait = writer
-            .admit_flush(batch(9, "same body", T, true), key(k))
+            .admit_flush(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+                batch(9, "same body", T, true),
+                key(k),
+            )
             .expect("queue has room");
         wait.await.expect("the flush settles");
     }
     // The same key, the same content: one push.
     let wait = writer
-        .admit_flush(batch(9, "same body", T, true), key("a"))
+        .admit_flush(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            batch(9, "same body", T, true),
+            key("a"),
+        )
         .expect("queue has room");
     wait.await
         .expect("the suppressed caller gets the original's answer");
 
     // The same key, different content: a client error, and nothing stored.
     let refusal = writer
-        .admit_flush(batch(9, "a different body", T, true), key("a"))
+        .admit_flush(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            batch(9, "a different body", T, true),
+            key("a"),
+        )
         .expect_err("a reused key carrying different content is refused");
     assert_eq!(refusal, AdmitRefusal::KeyReused);
     assert_eq!(writer.metrics().dedup.key_reused_total, 1);
@@ -647,14 +712,22 @@ fn a_target_that_settles_before_seal_is_evaluated_at_seal() {
 #[tokio::test]
 async fn a_forced_shutdown_reports_its_generations_claims() {
     let body = batch(10, "in flight at shutdown", T, false);
-    let id = pulsus_write::log_identity(&body, &PushHeaders::default());
+    let id = pulsus_write::log_identity(
+        &body,
+        &PushHeaders::default(),
+        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    );
 
     let samples = MockInserter::new(Behavior::Hang);
     let writer = writer_with(eager(), samples.clone(), MockInserter::new(Behavior::Ok));
     let index = writer.dedup().expect("the index is on").clone();
 
     writer
-        .admit(body, PushHeaders::default())
+        .admit(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            body,
+            PushHeaders::default(),
+        )
         .expect("queue has room");
     // **The block must be provably IN FLIGHT before the deadline**, or the
     // drain settles it as still-queued, which is a different ending: a block
@@ -795,6 +868,7 @@ async fn a_push_after_the_window_elapses_is_stored_again() {
     for _ in 0..2 {
         let wait = writer
             .admit_flush(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
                 batch(80, "inside the window", T, true),
                 PushHeaders::default(),
             )
@@ -814,6 +888,7 @@ async fn a_push_after_the_window_elapses_is_stored_again() {
 
     let wait = writer
         .admit_flush(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
             batch(80, "inside the window", T, true),
             PushHeaders::default(),
         )

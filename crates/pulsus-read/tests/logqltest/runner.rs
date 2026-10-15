@@ -132,6 +132,9 @@ fn compile_for_corpus(stages: &[Stage]) -> Result<CompiledPipeline, String> {
 /// shape the hermetic metric-agg goldens use (`logql_metric_agg_golden.rs`).
 fn ctx() -> PlanCtx<'static> {
     PlanCtx {
+        tenant: Box::leak(Box::new(
+            pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+        )),
         db: "pulsus",
         streams_idx: "log_streams_idx",
         streams: "log_streams",

@@ -14,7 +14,7 @@
 //! deliberately stay `&str`; `predicate.rs`'s module doc records that residual
 //! and why neither candidate mechanism was taken.
 
-use pulsus_model::FpLiteral;
+use pulsus_model::{FpLiteral, Tenant};
 
 use super::params::Direction;
 use super::predicate::{CheckedFragment, CheckedLiteral, MonthLiteral};
@@ -705,6 +705,7 @@ impl<'a> MetricSource<'a> {
 /// load-bearing for that byte-exact requirement; changing its shape breaks
 /// the snapshot contract.
 pub fn stage1(
+    _tenant: &Tenant,
     streams_idx_table: &str,
     months: &[MonthLiteral],
     positive_branches: &[CheckedFragment],
@@ -742,6 +743,7 @@ pub fn stage1(
 /// are point ranges and skip probes entirely (architect plan: "Selectivity
 /// probes").
 pub fn probe(
+    _tenant: &Tenant,
     streams_idx_table: &str,
     months: &[MonthLiteral],
     key_literal: &CheckedLiteral,
@@ -773,6 +775,7 @@ pub fn probe(
 /// (`super::exec::LogQlEngine::run_discovery`), and its length is bounded by
 /// `EngineConfig::max_streams` before it is rendered.
 pub fn label_names(
+    _tenant: &Tenant,
     streams_idx_table: &str,
     months: &[MonthLiteral],
     fingerprints: &[FpLiteral],
@@ -795,6 +798,7 @@ pub fn label_names(
 /// exactly the precondition [`label_names`] documents. The key predicate keeps
 /// its place in the primary-key prefix.
 pub fn label_values(
+    _tenant: &Tenant,
     streams_idx_table: &str,
     months: &[MonthLiteral],
     key_literal: &CheckedLiteral,
@@ -829,6 +833,7 @@ pub fn label_values(
 /// **Issue #399:** before this, the only time bound was `month`, so a
 /// ten-minute request was answered from the whole calendar month.
 pub fn detected_labels(
+    _tenant: &Tenant,
     streams_idx_table: &str,
     months: &[MonthLiteral],
     fingerprints: &[FpLiteral],
@@ -885,6 +890,7 @@ pub fn activity_lower_bucket_ns(start_ns: i64, rollup_res_ns: u64) -> i64 {
 /// The lower bound is [`activity_lower_bucket_ns`], NOT `start_ns` — see
 /// that function for why the obvious `bucket_ns > start_ns` is wrong here.
 pub fn active_fingerprints(
+    _tenant: &Tenant,
     rollup_table: &str,
     fingerprints: Option<&[FpLiteral]>,
     window: TimeWindow,
@@ -931,7 +937,7 @@ fn join_fragments(branches: &[CheckedFragment]) -> String {
 /// Stage 2 — hydration (docs/schemas.md §3.2 line 307), byte-exact to the
 /// canonical shape: `SELECT fingerprint, service, labels FROM log_streams
 /// WHERE fingerprint IN (...)`.
-pub fn stage2(streams_table: &str, fingerprints: &[FpLiteral]) -> String {
+pub fn stage2(_tenant: &Tenant, streams_table: &str, fingerprints: &[FpLiteral]) -> String {
     let fp_list = fp_list(fingerprints);
     format!(
         "SELECT fingerprint, service, labels FROM {streams_table} WHERE fingerprint IN ({fp_list})"
@@ -981,6 +987,7 @@ pub fn stage2(streams_table: &str, fingerprints: &[FpLiteral]) -> String {
 /// `timestamp-tie-order` in docs/benchmarks/logs-differential-ledger.md
 /// with the probe, both sequences, and why matching it is separate work.
 pub fn stage3(
+    tenant: &Tenant,
     samples_table: &str,
     services: &[CheckedLiteral],
     fingerprints: &[FpLiteral],
@@ -990,6 +997,7 @@ pub fn stage3(
     limit: u32,
 ) -> String {
     stage3_with_rx(
+        tenant,
         samples_table,
         services,
         fingerprints,
@@ -1015,6 +1023,7 @@ fn rx_projection(rx: Option<&CheckedFragment>) -> String {
 /// [`stage3`]'s text byte for byte.
 #[allow(clippy::too_many_arguments)]
 pub fn stage3_with_rx(
+    _tenant: &Tenant,
     samples_table: &str,
     services: &[CheckedLiteral],
     fingerprints: &[FpLiteral],
@@ -1108,6 +1117,7 @@ pub enum KeysetLower {
 // limit for the same reason).
 #[allow(clippy::too_many_arguments)]
 pub fn stage3_keyset(
+    tenant: &Tenant,
     samples_table: &str,
     services: &[CheckedLiteral],
     fingerprints: &[FpLiteral],
@@ -1118,6 +1128,7 @@ pub fn stage3_keyset(
     limit: u32,
 ) -> String {
     stage3_keyset_with_rx(
+        tenant,
         samples_table,
         services,
         fingerprints,
@@ -1134,6 +1145,7 @@ pub fn stage3_keyset(
 /// the column list. `None` renders [`stage3_keyset`]'s text byte for byte.
 #[allow(clippy::too_many_arguments)]
 pub fn stage3_keyset_with_rx(
+    _tenant: &Tenant,
     samples_table: &str,
     services: &[CheckedLiteral],
     fingerprints: &[FpLiteral],
@@ -1209,6 +1221,7 @@ pub fn stage3_keyset_with_rx(
 /// date — docs/api.md §2.5). Same half-open bucket predicate as
 /// [`metric_range`].
 pub fn log_stats_rollup(
+    _tenant: &Tenant,
     rollup_table: &str,
     fingerprints: &[FpLiteral],
     window: TimeWindow,
@@ -1227,6 +1240,7 @@ pub fn log_stats_rollup(
 /// `streams`/`chunks` shape as [`log_stats_rollup`]; `entries`/`bytes`
 /// count matching lines exactly.
 pub fn log_stats_raw(
+    _tenant: &Tenant,
     samples_table: &str,
     services: &[CheckedLiteral],
     fingerprints: &[FpLiteral],
@@ -1255,6 +1269,7 @@ pub fn log_stats_raw(
 /// identical MinMax + `(fingerprint, bucket_ns)` primary-key pruning
 /// applies (`tests/explain_indexes.rs`' Tier-1 gate).
 pub fn log_volume_rollup(
+    _tenant: &Tenant,
     rollup_table: &str,
     fingerprints: &[FpLiteral],
     window: TimeWindow,
@@ -1283,6 +1298,7 @@ pub const MAX_PATTERNS: usize = 1000;
 /// top-K + LIMIT all execute in ClickHouse — the client decodes ≤ 1000
 /// already-assembled series. Half-open window `[start, end)` (D4).
 pub fn log_patterns_read(
+    _tenant: &Tenant,
     patterns_table: &str,
     fingerprints: &[FpLiteral],
     window: TimeWindow,
@@ -1319,6 +1335,7 @@ pub fn log_patterns_read(
 /// outside its own snapshot tests. Kept because the rollup range shape is
 /// the one this file documents against docs/schemas.md §3.2.
 pub fn metric_range(
+    _tenant: &Tenant,
     source: MetricSource<'_>,
     services: &[CheckedLiteral],
     fingerprints: &[FpLiteral],
@@ -1368,6 +1385,7 @@ pub fn metric_range(
 /// render a column the named table lacks, rather than resting on that
 /// reachability argument holding forever.
 pub fn metric_instant(
+    _tenant: &Tenant,
     source: MetricSource<'_>,
     services: &[CheckedLiteral],
     fingerprints: &[FpLiteral],
@@ -1467,6 +1485,7 @@ impl ScanProjection {
 /// JSON-extract predicate could prune no granule, and the merge renames a
 /// colliding key to `<k>_extracted` before any filter sees it.
 pub fn metric_raw_samples(
+    tenant: &Tenant,
     samples_table: &str,
     services: &[CheckedLiteral],
     fingerprints: &[FpLiteral],
@@ -1476,6 +1495,7 @@ pub fn metric_raw_samples(
     projection: ScanProjection,
 ) -> String {
     metric_raw_samples_with_rx(
+        tenant,
         samples_table,
         services,
         fingerprints,
@@ -1492,6 +1512,7 @@ pub fn metric_raw_samples(
 /// for byte.
 #[allow(clippy::too_many_arguments)]
 pub fn metric_raw_samples_with_rx(
+    _tenant: &Tenant,
     samples_table: &str,
     services: &[CheckedLiteral],
     fingerprints: &[FpLiteral],
@@ -1542,6 +1563,7 @@ pub fn metric_raw_samples_with_rx(
 /// within one metadata variant still arrive timestamp-ascending because the
 /// existing key order already delivers them that way.
 pub fn metric_raw_samples_sliding(
+    tenant: &Tenant,
     samples_table: &str,
     services: &[CheckedLiteral],
     fingerprints: &[FpLiteral],
@@ -1551,6 +1573,7 @@ pub fn metric_raw_samples_sliding(
     projection: ScanProjection,
 ) -> String {
     metric_raw_samples_sliding_with_rx(
+        tenant,
         samples_table,
         services,
         fingerprints,
@@ -1567,6 +1590,7 @@ pub fn metric_raw_samples_sliding(
 /// [`metric_raw_samples_sliding`]'s text byte for byte.
 #[allow(clippy::too_many_arguments)]
 pub fn metric_raw_samples_sliding_with_rx(
+    _tenant: &Tenant,
     samples_table: &str,
     services: &[CheckedLiteral],
     fingerprints: &[FpLiteral],
@@ -1642,6 +1666,7 @@ pub struct BucketedScan {
 /// projection it needs. The `bucket_col` the grid is computed over is the
 /// shape's own, so the `WHERE` bound and the grid always name one column.
 pub fn metric_range_bucketed(
+    tenant: &Tenant,
     source: MetricSource<'_>,
     services: &[CheckedLiteral],
     fingerprints: &[FpLiteral],
@@ -1650,6 +1675,7 @@ pub fn metric_range_bucketed(
     projection: ScanProjection,
 ) -> Result<String, super::predicate::BucketGridRefusal> {
     metric_range_bucketed_with_regexp(
+        tenant,
         source,
         services,
         fingerprints,
@@ -1665,6 +1691,7 @@ pub fn metric_range_bucketed(
 /// `matched, caps` join `fingerprint, structured_metadata` in the `GROUP
 /// BY`. `None` renders [`metric_range_bucketed`]'s text byte for byte.
 pub fn metric_range_bucketed_with_regexp(
+    _tenant: &Tenant,
     source: MetricSource<'_>,
     services: &[CheckedLiteral],
     fingerprints: &[FpLiteral],
@@ -1790,13 +1817,22 @@ pub struct SlidingScan {
 /// a window edge a line fell — and every refusal of
 /// [`super::predicate::sliding_cover`].
 pub fn metric_range_sliding(
+    tenant: &Tenant,
     source: MetricSource<'_>,
     services: &[CheckedLiteral],
     fingerprints: &[FpLiteral],
     scan: SlidingScan,
     extra_predicates: &[CheckedFragment],
 ) -> Result<String, super::predicate::BucketGridRefusal> {
-    metric_range_sliding_with_regexp(source, services, fingerprints, scan, extra_predicates, None)
+    metric_range_sliding_with_regexp(
+        tenant,
+        source,
+        services,
+        fingerprints,
+        scan,
+        extra_predicates,
+        None,
+    )
 }
 
 /// [`metric_range_sliding`] over a `regexp` stage (issue #624, part 3a,
@@ -1805,6 +1841,7 @@ pub fn metric_range_sliding(
 /// BY` and window partition. `None` renders [`metric_range_sliding`]'s text
 /// byte for byte.
 pub fn metric_range_sliding_with_regexp(
+    _tenant: &Tenant,
     source: MetricSource<'_>,
     services: &[CheckedLiteral],
     fingerprints: &[FpLiteral],
@@ -2357,6 +2394,7 @@ pub fn reduced_parser_columns(
 /// [`reduced_parser_columns`].
 #[allow(clippy::too_many_arguments)]
 pub fn metric_range_reduced(
+    _tenant: &Tenant,
     table: &str,
     value: &ReducedUnwrap,
     keys: &ReducedKeyColumns,
@@ -2818,6 +2856,7 @@ mod tests {
     fn stage2_renders_the_canonical_hydration_shape() {
         assert_eq!(
             stage2(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
                 "log_streams",
                 &[
                     Fingerprint::from_raw(18374).sql_literal(),
@@ -2851,7 +2890,12 @@ mod tests {
     #[test]
     fn label_names_renders_a_distinct_key_scan_for_one_month() {
         assert_eq!(
-            label_names("log_streams_idx", &[month_literal(2026, 7)], &active_two()),
+            label_names(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+                "log_streams_idx",
+                &[month_literal(2026, 7)],
+                &active_two()
+            ),
             format!(
                 "SELECT DISTINCT key AS name\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND fingerprint IN ({ACTIVE_TWO_LIST})\nORDER BY name"
             )
@@ -2861,6 +2905,7 @@ mod tests {
     #[test]
     fn label_names_renders_a_month_in_list_for_a_boundary_spanning_window() {
         let sql = label_names(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
             "log_streams_idx",
             &[month_literal(2026, 7), month_literal(2026, 8)],
             &active_two(),
@@ -2872,6 +2917,7 @@ mod tests {
     fn label_values_renders_a_distinct_value_scan_scoped_to_one_key() {
         assert_eq!(
             label_values(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
                 "log_streams_idx",
                 &[month_literal(2026, 7)],
                 &literal("env"),
@@ -2885,7 +2931,12 @@ mod tests {
 
     #[test]
     fn detected_labels_renders_one_row_per_key_with_the_id_predicate() {
-        let sql = detected_labels("log_streams_idx", &[month_literal(2026, 7)], &active_two());
+        let sql = detected_labels(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            "log_streams_idx",
+            &[month_literal(2026, 7)],
+            &active_two(),
+        );
         assert!(sql.starts_with("SELECT key, uniqExact(val) AS cardinality, countIf(toFloat64OrNull(val) IS NULL AND NOT match(val, "));
         assert!(sql.contains("WHERE month = '2026-07-01'"));
         assert!(sql.contains(&format!("\n  AND fingerprint IN ({ACTIVE_TWO_LIST})\n")));
@@ -2902,15 +2953,31 @@ mod tests {
         for (name, sql) in [
             (
                 "label_names",
-                label_names("log_streams_idx", &months, &active_two()),
+                label_names(
+                    &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+                    "log_streams_idx",
+                    &months,
+                    &active_two(),
+                ),
             ),
             (
                 "label_values",
-                label_values("log_streams_idx", &months, &literal("env"), &active_two()),
+                label_values(
+                    &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+                    "log_streams_idx",
+                    &months,
+                    &literal("env"),
+                    &active_two(),
+                ),
             ),
             (
                 "detected_labels",
-                detected_labels("log_streams_idx", &months, &active_two()),
+                detected_labels(
+                    &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+                    "log_streams_idx",
+                    &months,
+                    &active_two(),
+                ),
             ),
         ] {
             assert_eq!(
@@ -2950,11 +3017,18 @@ mod tests {
     #[test]
     fn active_fingerprints_renders_a_streaming_distinct_over_the_rollup_pk() {
         assert_eq!(
-            active_fingerprints("log_metrics_5s", None, DISCOVERY_WINDOW, RES_5S),
+            active_fingerprints(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+                "log_metrics_5s",
+                None,
+                DISCOVERY_WINDOW,
+                RES_5S
+            ),
             ACTIVE_ALL
         );
         assert_eq!(
             active_fingerprints(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
                 "log_metrics_5s",
                 Some(&[
                     Fingerprint::from_raw(101).sql_literal(),
@@ -2975,6 +3049,7 @@ mod tests {
     fn active_fingerprints_lower_bound_is_the_containing_bucket_not_the_request_start() {
         let b = 1_751_328_000_000_000_000_i64;
         let sql = active_fingerprints(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
             "log_metrics_5s",
             None,
             TimeWindow {
@@ -3038,6 +3113,7 @@ mod tests {
     #[test]
     fn metric_range_omits_prewhere_when_services_is_empty_the_rollup_path() {
         let sql = metric_range(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
             MetricSource::new("log_metrics_5s", MetricShape::RollupCount),
             &[],
             &[
@@ -3058,6 +3134,7 @@ mod tests {
     #[test]
     fn metric_range_renders_singleton_prewhere_for_the_raw_fallback() {
         let sql = metric_range(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
             MetricSource::new("log_samples", MetricShape::RawCount),
             &[literal("checkout")],
             &[
@@ -3078,6 +3155,7 @@ mod tests {
     #[test]
     fn metric_range_renders_in_list_prewhere_for_multiple_services() {
         let sql = metric_range(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
             MetricSource::new("log_samples", MetricShape::RawCount),
             &[literal("checkout"), literal("billing")],
             &[
@@ -3101,6 +3179,7 @@ mod tests {
     #[test]
     fn stage3_keyset_first_page_is_byte_exact_with_the_exclusive_start_bound() {
         let sql = stage3_keyset(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
             "log_samples",
             &[literal("checkout")],
             &[Fingerprint::from_raw(18374).sql_literal()],
@@ -3132,6 +3211,7 @@ mod tests {
     #[test]
     fn stage3_keyset_later_page_is_byte_exact_with_inclusive_tuple_and_offset() {
         let sql = stage3_keyset(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
             "log_samples",
             &[literal("checkout"), literal("billing")],
             &[
@@ -3172,6 +3252,7 @@ mod tests {
     #[test]
     fn stage3_keyset_backward_first_page_is_byte_exact_desc_with_the_window_bounds() {
         let sql = stage3_keyset(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
             "log_samples",
             &[literal("checkout")],
             &[Fingerprint::from_raw(18374).sql_literal()],
@@ -3204,6 +3285,7 @@ mod tests {
     #[test]
     fn stage3_keyset_backward_later_page_is_byte_exact_with_le_tuple_and_offset() {
         let sql = stage3_keyset(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
             "log_samples",
             &[literal("checkout"), literal("billing")],
             &[
@@ -3242,6 +3324,7 @@ mod tests {
     #[test]
     fn stage3_keyset_limit_is_the_callers_clamped_fetch_limit_verbatim() {
         let sql = stage3_keyset(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
             "log_samples",
             &[literal("checkout")],
             &[Fingerprint::from_raw(1).sql_literal()],
@@ -3262,6 +3345,7 @@ mod tests {
     #[test]
     fn log_stats_rollup_is_byte_exact() {
         let sql = log_stats_rollup(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
             "log_metrics_5s",
             &[
                 Fingerprint::from_raw(18374).sql_literal(),
@@ -3288,6 +3372,7 @@ mod tests {
     #[test]
     fn log_patterns_read_is_byte_exact() {
         let sql = log_patterns_read(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
             "log_patterns",
             &[
                 Fingerprint::from_raw(18374).sql_literal(),
@@ -3321,6 +3406,7 @@ mod tests {
     #[test]
     fn log_stats_raw_is_byte_exact_with_line_filter_pushdown() {
         let sql = log_stats_raw(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
             "log_samples",
             &[literal("checkout")],
             &[Fingerprint::from_raw(18374).sql_literal()],
@@ -3344,6 +3430,7 @@ mod tests {
     #[test]
     fn metric_instant_renders_the_same_prewhere_contract() {
         let sql = metric_instant(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
             MetricSource::new("log_samples", MetricShape::RawCount),
             &[literal("checkout")],
             &[Fingerprint::from_raw(1).sql_literal()],
@@ -3373,6 +3460,7 @@ mod tests {
         let raw_source = MetricSource::new("log_samples", MetricShape::RawCount);
         let svc = [literal("checkout")];
         let sliding = metric_raw_samples_sliding(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
             "log_samples",
             &svc,
             &[Fingerprint::from_raw(1).sql_literal()],
@@ -3388,6 +3476,7 @@ mod tests {
             "sliding scan must be lower-inclusive on underflow: {sliding}"
         );
         let instant_raw = metric_raw_samples(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
             "log_samples",
             &svc,
             &[Fingerprint::from_raw(1).sql_literal()],
@@ -3401,6 +3490,7 @@ mod tests {
             "instant raw scan must be lower-inclusive on underflow: {instant_raw}"
         );
         let instant_agg = metric_instant(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
             raw_source,
             &svc,
             &[Fingerprint::from_raw(1).sql_literal()],
@@ -3414,6 +3504,7 @@ mod tests {
             "instant aggregate must be lower-inclusive on underflow: {instant_agg}"
         );
         let range_agg = metric_range(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
             raw_source,
             &svc,
             &[Fingerprint::from_raw(1).sql_literal()],
@@ -3440,6 +3531,7 @@ mod tests {
         };
         let svc = [literal("checkout")];
         let sliding = metric_raw_samples_sliding(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
             "log_samples",
             &svc,
             &[Fingerprint::from_raw(1).sql_literal()],
@@ -4041,6 +4133,7 @@ mod tests {
             .into_iter()
             .map(|(projection, lower, services, predicates)| {
                 metric_raw_samples(
+                    &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
                     "log_samples",
                     services,
                     &f.fingerprints,
@@ -4065,6 +4158,7 @@ mod tests {
             .into_iter()
             .map(|(projection, lower, services, predicates)| {
                 metric_raw_samples_sliding(
+                    &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
                     "log_samples",
                     services,
                     &f.fingerprints,
@@ -4087,7 +4181,12 @@ mod tests {
         let mut rendered = Vec::new();
         for months in [&f.one_month, &f.two_months] {
             for key in [&f.plain_key, &f.escaped_key] {
-                rendered.push(probe("log_streams_idx", months, key));
+                rendered.push(probe(
+                    &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+                    "log_streams_idx",
+                    months,
+                    key,
+                ));
             }
         }
         assert_eq!(rendered.len(), 4);
@@ -4255,6 +4354,8 @@ mod tests {
                     scan.lower = lower;
                     rendered.push(
                         metric_range_bucketed(
+                            &pulsus_model::Tenant::from_header(None, false)
+                                .expect("the empty tenant"),
                             MetricSource::new("log_samples", shape),
                             &f.one_service,
                             &f.fingerprints,
@@ -4274,6 +4375,7 @@ mod tests {
         ] {
             rendered.push(
                 metric_range_bucketed(
+                    &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
                     MetricSource::new("log_samples", MetricShape::RawCount),
                     services,
                     &f.fingerprints,
@@ -4321,6 +4423,7 @@ mod tests {
 
         let render = |lo: i64| {
             metric_range_bucketed(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
                 MetricSource::new("log_samples", MetricShape::RawCount),
                 &f.one_service,
                 &f.fingerprints,
@@ -4405,6 +4508,7 @@ mod tests {
         let render =
             |shape: MetricShape, services: &[CheckedLiteral], predicates: &[CheckedFragment]| {
                 metric_range_sliding(
+                    &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
                     MetricSource::new("log_samples", shape),
                     services,
                     &f.fingerprints,
@@ -4471,6 +4575,7 @@ mod tests {
         let f = W0Fixtures::new();
         let render = |lo_ns: i64, step_ns: i64, start_ns: i64, end_ns: i64| {
             metric_range_bucketed(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
                 MetricSource::new("log_samples", MetricShape::RawCount),
                 &f.one_service,
                 &f.fingerprints,
@@ -4545,6 +4650,7 @@ mod tests {
 
         let f = W0Fixtures::new();
         let sql = metric_range_bucketed(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
             MetricSource::new("log_samples", MetricShape::RawCount),
             &f.one_service,
             &f.fingerprints,
@@ -4628,6 +4734,7 @@ mod tests {
                 "stage3",
                 Box::new(|rx| {
                     stage3_with_rx(
+                        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
                         "log_samples",
                         &f.one_service,
                         &f.fingerprints,
@@ -4643,6 +4750,7 @@ mod tests {
                 "stage3_keyset",
                 Box::new(|rx| {
                     stage3_keyset_with_rx(
+                        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
                         "log_samples",
                         &f.one_service,
                         &f.fingerprints,
@@ -4659,6 +4767,7 @@ mod tests {
                 "metric_raw_samples",
                 Box::new(|rx| {
                     metric_raw_samples_with_rx(
+                        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
                         "log_samples",
                         &f.one_service,
                         &f.fingerprints,
@@ -4674,6 +4783,7 @@ mod tests {
                 "metric_raw_samples_sliding",
                 Box::new(|rx| {
                     metric_raw_samples_sliding_with_rx(
+                        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
                         "log_samples",
                         &f.one_service,
                         &f.fingerprints,
@@ -4688,6 +4798,7 @@ mod tests {
         ];
         let todays = [
             stage3(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
                 "log_samples",
                 &f.one_service,
                 &f.fingerprints,
@@ -4697,6 +4808,7 @@ mod tests {
                 100,
             ),
             stage3_keyset(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
                 "log_samples",
                 &f.one_service,
                 &f.fingerprints,
@@ -4707,6 +4819,7 @@ mod tests {
                 100,
             ),
             metric_raw_samples(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
                 "log_samples",
                 &f.one_service,
                 &f.fingerprints,
@@ -4716,6 +4829,7 @@ mod tests {
                 ScanProjection::WithStructuredMetadata,
             ),
             metric_raw_samples_sliding(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
                 "log_samples",
                 &f.one_service,
                 &f.fingerprints,
@@ -4795,6 +4909,7 @@ mod tests {
                 parser: None,
             };
             let sql = metric_range_reduced(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
                 "log_samples",
                 &value,
                 &keys,
@@ -4935,6 +5050,7 @@ mod tests {
                 parser: Some(parser),
             };
             let sql = metric_range_reduced(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
                 "log_samples",
                 &value,
                 &ReducedKeyColumns::default(),
@@ -4984,6 +5100,390 @@ mod tests {
                     "{query}: the logfmt form raises the syntax-tree limits:\n{sql}"
                 );
             }
+        }
+    }
+
+    /// The text a tenant renders as, and the tenant T-U renders every
+    /// statement with (issue #653).
+    const TENANT_TERM: &str = "org_id = 'tenant-q'";
+
+    /// The `WHERE` (never a `PREWHERE`) at or after byte `from` of `sql`.
+    fn next_where(sql: &str, from: usize) -> Option<usize> {
+        let mut at = from;
+        while let Some(i) = sql[at..].find("WHERE ") {
+            let pos = at + i;
+            if pos < 3 || &sql[pos - 3..pos] != "PRE" {
+                return Some(pos);
+            }
+            at = pos + "WHERE ".len();
+        }
+        None
+    }
+
+    /// **T-U (issue #653).** `sql` reads `table` once, and its one tenant
+    /// term is the first conjunct of the `WHERE` that follows `FROM table`
+    /// (and its optional `PREWHERE`), with no other `FROM` between.
+    fn assert_scoped(name: &str, sql: &str, table: &str) {
+        assert_eq!(
+            sql.matches(TENANT_TERM).count(),
+            1,
+            "{name}: exactly one `{TENANT_TERM}` in\n{sql}"
+        );
+        let from = format!("FROM {table}");
+        let at = sql.match_indices(&from).map(|(i, _)| i).find(|i| {
+            sql[i + from.len()..]
+                .chars()
+                .next()
+                .is_none_or(char::is_whitespace)
+        });
+        let Some(at) = at else {
+            panic!("{name}: no `{from}` in\n{sql}");
+        };
+        let after = at + from.len();
+        let Some(where_at) = next_where(sql, after) else {
+            panic!("{name}: no WHERE after `{from}` in\n{sql}");
+        };
+        let between = sql[after..where_at].trim();
+        assert!(
+            !between.contains("FROM "),
+            "{name}: another FROM between `{from}` and its WHERE in\n{sql}"
+        );
+        assert!(
+            between.is_empty() || between.starts_with("PREWHERE "),
+            "{name}: only a PREWHERE may stand between `{from}` and its WHERE, found \
+             {between:?} in\n{sql}"
+        );
+        assert!(
+            sql[where_at + "WHERE ".len()..].starts_with(TENANT_TERM),
+            "{name}: the tenant is not the WHERE's first conjunct in\n{sql}"
+        );
+    }
+
+    /// **T-U (issue #653): every log-table read carries the tenant.** Each
+    /// of the twenty builders and six wrappers, rendered for `tenant-q`
+    /// with representative arguments, and the bucketed and sliding
+    /// builders over both of their forms.
+    #[test]
+    fn every_log_table_read_carries_the_tenant() {
+        let t = pulsus_model::Tenant::from_header(
+            Some(&http::HeaderValue::from_static("tenant-q")),
+            false,
+        )
+        .expect("a valid tenant");
+        let months = [month_literal(2026, 10)];
+        let pos = [
+            crate::logql::predicate::index_positive_branch("app", Some("api"), &[])
+                .expect("renders"),
+        ];
+        let neg = [crate::logql::predicate::index_neq_branch("zone", "o")];
+        let fps = active_two();
+        let services = [literal("web")];
+        let window = TimeWindow {
+            start_ns: 1_000,
+            end_ns: 2_000,
+        };
+        let filters = [err_line_filter()];
+        let raw = MetricSource::new("log_samples", MetricShape::RawCount);
+        let rollup = MetricSource::new("log_metrics_5s", MetricShape::RollupCount);
+        let rx = crate::logql::predicate::regexp_group_columns(r"(?P<a>x)", &[1]).expect("renders");
+        let after = KeysetLower::After {
+            tuple: (1_500, Fingerprint::from_raw(7).sql_literal(), 3),
+            offset: 1,
+        };
+        let reduced_pipeline = {
+            let pulsus_logql::Expr::Log(le) =
+                pulsus_logql::parse(r#"{a="b"} | unwrap duration(lat)"#).expect("parse")
+            else {
+                panic!("a log expression");
+            };
+            le.pipeline
+        };
+        let reduced = ReducedUnwrap {
+            reducer: pulsus_logql::RangeAggOp::SumOverTime,
+            quantile: None,
+            label: "lat".to_string(),
+            conversion: UnwrapConversion::Duration,
+            mode: KeyMode::Keep(Vec::new()),
+            key_stages: reduced_pipeline.clone(),
+            todays_route: super::super::plan::ClientAgg {
+                pipeline: reduced_pipeline,
+                value: super::super::plan::ClientValue::Unwrap,
+                range_op: pulsus_logql::RangeAggOp::SumOverTime,
+                param: None,
+                absent_labels: Vec::new(),
+                grouping: None,
+            },
+            instant: false,
+            parser: None,
+        };
+        let proj = ScanProjection::WithStructuredMetadata;
+        let lower = ScanLowerBound::Exclusive;
+        let statements: Vec<(&str, &str, String)> = vec![
+            (
+                "stage1",
+                "log_streams_idx",
+                stage1(&t, "log_streams_idx", &months, &pos, &[]),
+            ),
+            (
+                "stage1, a negative branch",
+                "log_streams_idx",
+                stage1(&t, "log_streams_idx", &months, &pos, &neg),
+            ),
+            (
+                "probe",
+                "log_streams_idx",
+                probe(&t, "log_streams_idx", &months, &literal("app")),
+            ),
+            (
+                "label_names",
+                "log_streams_idx",
+                label_names(&t, "log_streams_idx", &months, &fps),
+            ),
+            (
+                "label_values",
+                "log_streams_idx",
+                label_values(&t, "log_streams_idx", &months, &literal("app"), &fps),
+            ),
+            (
+                "detected_labels",
+                "log_streams_idx",
+                detected_labels(&t, "log_streams_idx", &months, &fps),
+            ),
+            (
+                "active_fingerprints, unscoped",
+                "log_metrics_5s",
+                active_fingerprints(&t, "log_metrics_5s", None, window, RES_5S),
+            ),
+            (
+                "active_fingerprints, scoped",
+                "log_metrics_5s",
+                active_fingerprints(&t, "log_metrics_5s", Some(&fps), window, RES_5S),
+            ),
+            ("stage2", "log_streams", stage2(&t, "log_streams", &fps)),
+            (
+                "stage3",
+                "log_samples",
+                stage3(
+                    &t,
+                    "log_samples",
+                    &services,
+                    &fps,
+                    window,
+                    &filters,
+                    Direction::Backward,
+                    100,
+                ),
+            ),
+            (
+                "stage3_with_rx",
+                "log_samples",
+                stage3_with_rx(
+                    &t,
+                    "log_samples",
+                    &services,
+                    &fps,
+                    window,
+                    &filters,
+                    Direction::Backward,
+                    100,
+                    Some(&err_line_filter()),
+                ),
+            ),
+            (
+                "stage3_keyset",
+                "log_samples",
+                stage3_keyset(
+                    &t,
+                    "log_samples",
+                    &services,
+                    &fps,
+                    window,
+                    KeysetLower::First,
+                    Direction::Forward,
+                    &filters,
+                    100,
+                ),
+            ),
+            (
+                "stage3_keyset_with_rx",
+                "log_samples",
+                stage3_keyset_with_rx(
+                    &t,
+                    "log_samples",
+                    &services,
+                    &fps,
+                    window,
+                    after,
+                    Direction::Backward,
+                    &filters,
+                    100,
+                    None,
+                ),
+            ),
+            (
+                "log_stats_rollup",
+                "log_metrics_5s",
+                log_stats_rollup(&t, "log_metrics_5s", &fps, window),
+            ),
+            (
+                "log_stats_raw",
+                "log_samples",
+                log_stats_raw(&t, "log_samples", &services, &fps, window, &filters),
+            ),
+            (
+                "log_volume_rollup",
+                "log_metrics_5s",
+                log_volume_rollup(&t, "log_metrics_5s", &fps, window),
+            ),
+            (
+                "log_patterns_read",
+                "log_patterns",
+                log_patterns_read(&t, "log_patterns", &fps, window, 60_000_000_000),
+            ),
+            (
+                "metric_range, rollup",
+                "log_metrics_5s",
+                metric_range(&t, rollup, &[], &fps, window, lower, 60, &[]),
+            ),
+            (
+                "metric_range, raw",
+                "log_samples",
+                metric_range(&t, raw, &services, &fps, window, lower, 60, &filters),
+            ),
+            (
+                "metric_instant",
+                "log_samples",
+                metric_instant(&t, raw, &services, &fps, window, lower, &filters, proj),
+            ),
+            (
+                "metric_raw_samples",
+                "log_samples",
+                metric_raw_samples(&t, "log_samples", &services, &fps, window, lower, &[], proj),
+            ),
+            (
+                "metric_raw_samples_with_rx",
+                "log_samples",
+                metric_raw_samples_with_rx(
+                    &t,
+                    "log_samples",
+                    &services,
+                    &fps,
+                    window,
+                    lower,
+                    &filters,
+                    proj,
+                    Some(&err_line_filter()),
+                ),
+            ),
+            (
+                "metric_raw_samples_sliding",
+                "log_samples",
+                metric_raw_samples_sliding(
+                    &t,
+                    "log_samples",
+                    &services,
+                    &fps,
+                    window,
+                    lower,
+                    &[],
+                    proj,
+                ),
+            ),
+            (
+                "metric_raw_samples_sliding_with_rx",
+                "log_samples",
+                metric_raw_samples_sliding_with_rx(
+                    &t,
+                    "log_samples",
+                    &services,
+                    &fps,
+                    window,
+                    lower,
+                    &filters,
+                    proj,
+                    None,
+                ),
+            ),
+            (
+                "metric_range_bucketed",
+                "log_metrics_5s",
+                metric_range_bucketed(&t, rollup, &[], &fps, BUCKETED_SCAN, &[], proj)
+                    .expect("renders"),
+            ),
+            (
+                "metric_range_bucketed_with_regexp, no stage",
+                "log_samples",
+                metric_range_bucketed_with_regexp(
+                    &t,
+                    raw,
+                    &services,
+                    &fps,
+                    BUCKETED_SCAN,
+                    &filters,
+                    proj,
+                    None,
+                )
+                .expect("renders"),
+            ),
+            (
+                "metric_range_bucketed_with_regexp, a regexp stage",
+                "log_samples",
+                metric_range_bucketed_with_regexp(
+                    &t,
+                    raw,
+                    &services,
+                    &fps,
+                    BUCKETED_SCAN,
+                    &filters,
+                    proj,
+                    Some(GroupExtraction::Regexp(&rx)),
+                )
+                .expect("renders"),
+            ),
+            (
+                "metric_range_sliding",
+                "log_samples",
+                metric_range_sliding(&t, raw, &services, &fps, SLIDING_SCAN, &[]).expect("renders"),
+            ),
+            (
+                "metric_range_sliding_with_regexp, no stage",
+                "log_samples",
+                metric_range_sliding_with_regexp(&t, raw, &[], &fps, SLIDING_SCAN, &filters, None)
+                    .expect("renders"),
+            ),
+            (
+                "metric_range_sliding_with_regexp, a regexp stage",
+                "log_samples",
+                metric_range_sliding_with_regexp(
+                    &t,
+                    raw,
+                    &services,
+                    &fps,
+                    SLIDING_SCAN,
+                    &filters,
+                    Some(GroupExtraction::Regexp(&rx)),
+                )
+                .expect("renders"),
+            ),
+            (
+                "metric_range_reduced",
+                "log_samples",
+                metric_range_reduced(
+                    &t,
+                    "log_samples",
+                    &reduced,
+                    &ReducedKeyColumns::default(),
+                    &services,
+                    &fps,
+                    SLIDING_SCAN,
+                    &filters,
+                    None,
+                )
+                .expect("renders"),
+            ),
+        ];
+        for (name, table, sql) in &statements {
+            assert_scoped(name, sql, table);
         }
     }
 }

@@ -72,6 +72,9 @@ impl Tables {
 
     pub fn plan_ctx<'a>(&'a self, db: &'a str) -> PlanCtx<'a> {
         PlanCtx {
+            tenant: Box::leak(Box::new(
+                pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            )),
             db,
             streams_idx: &self.streams_idx,
             streams: &self.streams,
@@ -372,7 +375,11 @@ pub async fn run_variant_once(
     let services: Vec<String> = match variant {
         Variant::Eager => {
             let s2_id = format!("{base_id}-hydration_full");
-            let sql2 = sql::stage2(&tables.streams, &sql_literals(&fps));
+            let sql2 = sql::stage2(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+                &tables.streams,
+                &sql_literals(&fps),
+            );
             let s2_settings = settings(&s2_id, &log_comment(variant, breadth, "hydration_full"));
             let mut svcs: Vec<String> = fetch_rows::<StreamMetaRow>(client, &sql2, &s2_settings)
                 .await?
@@ -420,6 +427,7 @@ pub async fn run_variant_once(
     // `correctness_gate`).
     let s3_id = format!("{base_id}-samples");
     let sql3 = sql::stage3(
+        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
         &tables.samples,
         &escaped,
         &sql_literals(&fps),
@@ -438,7 +446,11 @@ pub async fn run_variant_once(
 
     if matches!(variant, Variant::LateIdx | Variant::LateProj) {
         let s2_id = format!("{base_id}-hydration_late");
-        let sql2 = sql::stage2(&tables.streams, &sql_literals(&result_fps));
+        let sql2 = sql::stage2(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            &tables.streams,
+            &sql_literals(&result_fps),
+        );
         let s2_settings = settings(&s2_id, &log_comment(variant, breadth, "hydration_late"));
         fetch_rows::<StreamMetaRow>(client, &sql2, &s2_settings).await?;
         stage_ids.push(("hydration_late", s2_id));
@@ -547,7 +559,11 @@ pub async fn correctness_gate(
     reference_envelope: &mut Option<ResultEnvelope>,
 ) -> anyhow::Result<(Vec<Fingerprint>, u64)> {
     let eager_id = format!("gate-services-eager-{}", summary.breadth);
-    let sql_eager = sql::stage2(&tables.streams, &sql_literals(fps));
+    let sql_eager = sql::stage2(
+        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+        &tables.streams,
+        &sql_literals(fps),
+    );
     let eager_rows = fetch_rows::<StreamMetaRow>(
         client,
         &sql_eager,
@@ -628,6 +644,7 @@ pub async fn correctness_gate(
     ] {
         let escaped: Vec<CheckedLiteral> = services.iter().map(|s| literal(s)).collect();
         let sql3 = sql::stage3(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
             &tables.samples,
             &escaped,
             &sql_literals(fps),
@@ -652,7 +669,11 @@ pub async fn correctness_gate(
         )?;
 
         let path_result_fps: Vec<Fingerprint> = got.into_iter().collect();
-        let hyd_sql = sql::stage2(&tables.streams, &sql_literals(&path_result_fps));
+        let hyd_sql = sql::stage2(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            &tables.streams,
+            &sql_literals(&path_result_fps),
+        );
         let hyd_id = format!("gate-envelope-hydrate-{path_name}-{}", summary.breadth);
         let hyd_rows = fetch_rows::<StreamMetaRow>(
             client,

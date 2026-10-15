@@ -333,7 +333,11 @@ async fn one_logs_push_is_one_insert_into_the_landing_table() {
     let writer = writer_with(&WriterConfig::default(), &root, inserter.clone());
 
     let wait = writer
-        .admit_flush(two_lines_one_stream(1), PushHeaders::default())
+        .admit_flush(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            two_lines_one_stream(1),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
     wait.await.expect("the block commits");
 
@@ -373,7 +377,11 @@ async fn two_logs_pushes_are_two_inserts() {
 
     for fp in [1u128, 2] {
         writer
-            .admit_flush(two_lines_one_stream(fp), PushHeaders::default())
+            .admit_flush(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+                two_lines_one_stream(fp),
+                PushHeaders::default(),
+            )
             .expect("queue has room")
             .await
             .expect("the block commits");
@@ -419,7 +427,7 @@ fn every_landing_column_is_the_value_its_kind_was_built_from() {
         count: 4,
     };
 
-    let k0 = LogLandingRow::line(5, &line);
+    let k0 = LogLandingRow::line(&std::sync::Arc::<str>::from(""), 5, &line);
     assert_eq!(k0.received_ms, 5);
     assert_eq!(k0.kind, LogLandingRow::KIND_LINE);
     assert_eq!(k0.service, line.service);
@@ -434,7 +442,7 @@ fn every_landing_column_is_the_value_its_kind_was_built_from() {
     assert_eq!(k0.pattern, "");
     assert_eq!(k0.pattern_count, 0);
 
-    let k1 = LogLandingRow::stream(5, &stream);
+    let k1 = LogLandingRow::stream(&std::sync::Arc::<str>::from(""), 5, &stream);
     assert_eq!(k1.received_ms, 5);
     assert_eq!(k1.kind, LogLandingRow::KIND_STREAM);
     assert_eq!(k1.service, stream.service);
@@ -449,7 +457,7 @@ fn every_landing_column_is_the_value_its_kind_was_built_from() {
     assert_eq!(k1.pattern, "");
     assert_eq!(k1.pattern_count, 0);
 
-    let k2 = LogLandingRow::pattern(5, pattern.clone());
+    let k2 = LogLandingRow::pattern(&std::sync::Arc::<str>::from(""), 5, pattern.clone());
     assert_eq!(k2.received_ms, 5);
     assert_eq!(k2.kind, LogLandingRow::KIND_PATTERN);
     assert_eq!(k2.service, "");
@@ -509,7 +517,7 @@ fn the_pattern_bound_never_undercharges_the_landed_pattern_rows() {
             .rows
             .into_iter()
             .map(|r| {
-                let row = LogLandingRow::pattern(0, r);
+                let row = LogLandingRow::pattern(&std::sync::Arc::<str>::from(""), 0, r);
                 LogLandingRow::est_landing_bytes(row.pattern.len() as u64)
             })
             .sum();
@@ -569,7 +577,11 @@ async fn a_logs_push_at_a_ceiling_is_refused_whole() {
                 .collect(),
             ..Default::default()
         };
-        let outcome = writer.admit_flush(batch, PushHeaders::default());
+        let outcome = writer.admit_flush(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            batch,
+            PushHeaders::default(),
+        );
         if admitted {
             outcome
                 .expect("{name}: one row under the limit is admitted")
@@ -629,7 +641,11 @@ async fn a_logs_push_at_a_ceiling_is_refused_whole() {
         let inserter = MockInserter::always(Act::Ok);
         let writer = writer_with(&cfg, &root, inserter.clone());
 
-        let outcome = writer.admit_flush(two_lines_one_stream(1), PushHeaders::default());
+        let outcome = writer.admit_flush(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            two_lines_one_stream(1),
+            PushHeaders::default(),
+        );
         if admitted {
             outcome
                 .unwrap_or_else(|e| {
@@ -668,7 +684,11 @@ async fn a_logs_push_at_a_ceiling_is_refused_whole() {
             let inserter2 = MockInserter::always(Act::Ok);
             let writer2 = writer_with(&roomy, &root2, inserter2.clone());
             writer2
-                .admit_flush(two_lines_one_stream(1), PushHeaders::default())
+                .admit_flush(
+                    &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+                    two_lines_one_stream(1),
+                    PushHeaders::default(),
+                )
                 .expect("the retry of an unstored push is admitted")
                 .await
                 .expect("and it commits");
@@ -715,13 +735,21 @@ async fn the_queue_byte_allowance_is_aggregate_across_log_pushes() {
     let writer = writer_with(&cfg, &root, inserter.clone());
 
     let _first = writer
-        .admit_flush(two_lines_one_stream(1), PushHeaders::default())
+        .admit_flush(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            two_lines_one_stream(1),
+            PushHeaders::default(),
+        )
         .expect("the first push fits");
     settle_until(|| writer.metrics().queue_bytes == charge).await;
     assert_eq!(writer.metrics().queue_bytes, charge);
 
     let err = writer
-        .admit_flush(two_lines_one_stream(2), PushHeaders::default())
+        .admit_flush(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            two_lines_one_stream(2),
+            PushHeaders::default(),
+        )
         .expect_err("the sum does not fit");
     assert!(
         matches!(err, AdmitRefusal::Backpressure),
@@ -759,7 +787,11 @@ async fn the_push_too_large_message_names_the_size_and_both_limits() {
         ..Default::default()
     };
     let err = writer
-        .admit_flush(batch, PushHeaders::default())
+        .admit_flush(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            batch,
+            PushHeaders::default(),
+        )
         .expect_err("a push at the row limit is refused");
     let AdmitRefusal::PushTooLarge {
         rows,
@@ -817,7 +849,11 @@ async fn an_empty_logs_push_is_a_success_and_is_charged_for_nothing() {
         let writer = writer_with(&cfg, &root, inserter.clone());
 
         writer
-            .admit_flush(ParsedLogs::default(), PushHeaders::default())
+            .admit_flush(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+                ParsedLogs::default(),
+                PushHeaders::default(),
+            )
             .unwrap_or_else(|e| panic!("{name}: an empty push is a success: {e:?}"))
             .await
             .unwrap_or_else(|e| panic!("{name}: and completes at admission: {e:?}"));
@@ -847,14 +883,22 @@ async fn a_suppressed_logs_push_stores_nothing_and_makes_no_block() {
     let writer = writer_with(&WriterConfig::default(), &root, inserter.clone());
 
     writer
-        .admit_flush(two_lines_one_stream(1), PushHeaders::default())
+        .admit_flush(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            two_lines_one_stream(1),
+            PushHeaders::default(),
+        )
         .expect("the first push is admitted")
         .await
         .expect("and commits");
     assert_eq!(inserter.call_count(), 1);
 
     writer
-        .admit_flush(two_lines_one_stream(1), PushHeaders::default())
+        .admit_flush(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            two_lines_one_stream(1),
+            PushHeaders::default(),
+        )
         .expect("the repeat is answered")
         .await
         .expect("with the original push's outcome");
@@ -887,7 +931,11 @@ async fn the_stream_lru_is_promoted_only_when_the_block_commits() {
     let writer = writer_with(&cfg, &root, inserter.clone());
 
     let _parked = writer
-        .admit_flush(two_lines_one_stream(1), PushHeaders::default())
+        .admit_flush(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            two_lines_one_stream(1),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
     settle_until(|| inserter.call_count() == 1).await;
     assert_eq!(inserter.call_count(), 1, "the first block is in flight");
@@ -912,12 +960,20 @@ async fn the_stream_lru_is_promoted_only_when_the_block_commits() {
     let inserter = MockInserter::always(Act::Ok);
     let writer = writer_with(&cfg, &root, inserter.clone());
     writer
-        .admit_flush(two_lines_one_stream(1), PushHeaders::default())
+        .admit_flush(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            two_lines_one_stream(1),
+            PushHeaders::default(),
+        )
         .expect("queue has room")
         .await
         .expect("commits");
     writer
-        .admit_flush(two_lines_one_stream(1), PushHeaders::default())
+        .admit_flush(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            two_lines_one_stream(1),
+            PushHeaders::default(),
+        )
         .expect("queue has room")
         .await
         .expect("commits");
@@ -954,7 +1010,11 @@ async fn a_failed_log_block_leaves_the_stream_lru_empty_so_the_next_push_re_regi
     let answer = tokio::time::timeout(
         Duration::from_secs(600),
         writer
-            .admit_flush(two_lines_one_stream(1), PushHeaders::default())
+            .admit_flush(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+                two_lines_one_stream(1),
+                PushHeaders::default(),
+            )
             .expect("queue has room"),
     )
     .await
@@ -964,7 +1024,11 @@ async fn a_failed_log_block_leaves_the_stream_lru_empty_so_the_next_push_re_regi
     let second = tokio::time::timeout(
         Duration::from_secs(600),
         writer
-            .admit_flush(two_lines_one_stream(1), PushHeaders::default())
+            .admit_flush(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+                two_lines_one_stream(1),
+                PushHeaders::default(),
+            )
             .expect("queue has room"),
     )
     .await
@@ -1020,7 +1084,11 @@ async fn a_token_is_minted_per_sealed_log_block_and_repeated_on_resend() {
         tokio::time::timeout(
             Duration::from_secs(600),
             writer
-                .admit_flush(two_lines_one_stream(1), PushHeaders::default())
+                .admit_flush(
+                    &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+                    two_lines_one_stream(1),
+                    PushHeaders::default(),
+                )
                 .expect("queue has room"),
         )
         .await
@@ -1048,7 +1116,11 @@ async fn a_token_is_minted_per_sealed_log_block_and_repeated_on_resend() {
     tokio::time::timeout(
         Duration::from_secs(600),
         writer
-            .admit_flush(two_lines_one_stream(1), PushHeaders::default())
+            .admit_flush(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+                two_lines_one_stream(1),
+                PushHeaders::default(),
+            )
             .expect("queue has room"),
     )
     .await
@@ -1157,7 +1229,11 @@ async fn a_logs_block_settles_at_each_ending_the_loop_names() {
         let writer = writer_with(&cfg, &root, inserter.clone());
 
         let wait = writer
-            .admit_flush(two_lines_one_stream(1), PushHeaders::default())
+            .admit_flush(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+                two_lines_one_stream(1),
+                PushHeaders::default(),
+            )
             .expect("queue has room");
         let answer = tokio::time::timeout(Duration::from_secs(600), wait)
             .await
@@ -1199,7 +1275,11 @@ async fn a_logs_block_settles_at_each_ending_the_loop_names() {
             "{}: every ending releases the push's bytes",
             run.name
         );
-        let again = writer.admit_flush(two_lines_one_stream(2), PushHeaders::default());
+        let again = writer.admit_flush(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            two_lines_one_stream(2),
+            PushHeaders::default(),
+        );
         assert!(
             again.is_ok(),
             "{}: a following push of the same size must be admitted, not \
@@ -1235,7 +1315,11 @@ async fn a_logs_blocks_fate_never_walks_back_from_uncertain() {
     let writer = writer_with(&cfg, &root, inserter.clone());
 
     let wait = writer
-        .admit_flush(two_lines_one_stream(1), PushHeaders::default())
+        .admit_flush(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            two_lines_one_stream(1),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
     let err = tokio::time::timeout(Duration::from_secs(600), wait)
         .await
@@ -1294,7 +1378,11 @@ async fn two_blocks_one_inflight_one_queued(
     let writer = Arc::new(writer_with(&cfg, root, inserter.clone()));
 
     let a = writer
-        .admit_flush(two_lines_one_stream(1), PushHeaders::default())
+        .admit_flush(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            two_lines_one_stream(1),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
     inserter
         .entered
@@ -1304,7 +1392,11 @@ async fn two_blocks_one_inflight_one_queued(
         .forget();
     assert_eq!(inserter.call_count(), 1, "A is provably in flight");
     let b = writer
-        .admit_flush(two_lines_one_stream(2), PushHeaders::default())
+        .admit_flush(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            two_lines_one_stream(2),
+            PushHeaders::default(),
+        )
         .expect("queue has room");
     (writer, inserter, a, b)
 }

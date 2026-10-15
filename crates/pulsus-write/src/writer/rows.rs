@@ -251,7 +251,7 @@ impl SpoolEncode for LogPatternRow {
 ///
 /// `kind` says which event the row is; a row sets that kind's columns and
 /// leaves the rest at the type's default. The fields are the landing table's
-/// fourteen columns **less `event_id`**, in the table's own declaration order:
+/// fifteen columns **less `event_id`**, in the table's own declaration order:
 /// the insert's column list is exactly this type's `COLUMN_NAMES`, so leaving
 /// the column out is what makes the server fill it from
 /// `DEFAULT generateUUIDv7()`.
@@ -266,6 +266,8 @@ impl SpoolEncode for LogPatternRow {
 /// field here, so no NaN marker makes a derived equality mislead.
 #[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
 pub struct LogLandingRow {
+    /// Issue #653: the push's tenant, one shared string per push.
+    pub org_id: Arc<str>,
     pub received_ms: i64,
     pub kind: u8,
     pub service: String,
@@ -322,8 +324,9 @@ impl LogLandingRow {
     /// for `''`, and an `ARRAY JOIN` over an empty array emits no row — so the
     /// view is correct whether the server applies its `WHERE kind = 1` before
     /// or after the join.
-    fn of_kind(received_ms: i64, kind: u8) -> Self {
+    fn of_kind(org_id: &Arc<str>, received_ms: i64, kind: u8) -> Self {
         LogLandingRow {
+            org_id: Arc::clone(org_id),
             received_ms,
             kind,
             service: String::new(),
@@ -342,7 +345,7 @@ impl LogLandingRow {
 
     /// A kind-0 row: the columns `log_samples_mv` and `log_metrics_<res>_mv`
     /// read, and no others.
-    pub fn line(received_ms: i64, row: &LogRow) -> Self {
+    pub fn line(org_id: &Arc<str>, received_ms: i64, row: &LogRow) -> Self {
         LogLandingRow {
             service: row.service.clone(),
             fingerprint: row.fingerprint,
@@ -350,13 +353,13 @@ impl LogLandingRow {
             severity: row.severity,
             body: row.body.clone(),
             structured_metadata: row.structured_metadata.clone(),
-            ..Self::of_kind(received_ms, Self::KIND_LINE)
+            ..Self::of_kind(org_id, received_ms, Self::KIND_LINE)
         }
     }
 
     /// A kind-1 row: the columns `log_streams_mv` and `log_streams_idx_mv`
     /// read, and no others.
-    pub fn stream(received_ms: i64, row: &StreamRow) -> Self {
+    pub fn stream(org_id: &Arc<str>, received_ms: i64, row: &StreamRow) -> Self {
         // `to_canonical_json` grows its buffer as it encodes, so it returns
         // with spare capacity — up to its own length again. The queue holds
         // this row until its block is encoded and is charged the encoded bytes
@@ -370,7 +373,7 @@ impl LogLandingRow {
             service: row.service.clone(),
             labels,
             updated_ns: row.updated_ns,
-            ..Self::of_kind(received_ms, Self::KIND_STREAM)
+            ..Self::of_kind(org_id, received_ms, Self::KIND_STREAM)
         }
     }
 
@@ -381,13 +384,13 @@ impl LogLandingRow {
     /// text at once. `timestamp_ns` carries the aggregate's bucket floor, which
     /// is the event's own time floored — the contract the landing table's own
     /// column comment states.
-    pub fn pattern(received_ms: i64, row: LogPatternRow) -> Self {
+    pub fn pattern(org_id: &Arc<str>, received_ms: i64, row: LogPatternRow) -> Self {
         LogLandingRow {
             fingerprint: row.fingerprint,
             timestamp_ns: row.bucket_ns,
             pattern: row.pattern,
             pattern_count: row.count,
-            ..Self::of_kind(received_ms, Self::KIND_PATTERN)
+            ..Self::of_kind(org_id, received_ms, Self::KIND_PATTERN)
         }
     }
 }
@@ -2358,6 +2361,7 @@ mod tests {
     /// rather than read from the catalogue: this crate does not depend on
     /// `pulsus-schema`, and the point of the case below is that the two agree.
     const LOG_LANDING_COLUMNS: &[&str] = &[
+        "org_id",
         "event_id",
         "received_ms",
         "kind",
@@ -2383,7 +2387,7 @@ mod tests {
     #[test]
     fn the_log_insert_omits_event_id_so_the_server_fills_it() {
         let names = <LogLandingRow as pulsus_clickhouse::Row>::COLUMN_NAMES;
-        assert_eq!(names.len(), 13, "the 14 columns less event_id");
+        assert_eq!(names.len(), 14, "the 15 columns less event_id");
         let expected: Vec<&str> = LOG_LANDING_COLUMNS
             .iter()
             .copied()

@@ -14,6 +14,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use pulsus_model::Tenant;
+
 use crate::error::LogsIngestError;
 use crate::protocols::otlp_logs::ParsedLogs;
 
@@ -179,13 +181,26 @@ pub trait LogSink: Send + Sync {
     /// headers (issue #494). `Ok(())` does not promise rows were buffered:
     /// a content-identical push inside the suppression window stores
     /// nothing and is answered exactly as the original was.
-    fn admit(&self, batch: ParsedLogs, push: PushHeaders) -> Result<(), AdmitRefusal>;
+    ///
+    /// `tenant` is the request's `X-Scope-OrgID` (issue #653), validated by
+    /// the handler before anything else it does.
+    fn admit(
+        &self,
+        tenant: &Tenant,
+        batch: ParsedLogs,
+        push: PushHeaders,
+    ) -> Result<(), AdmitRefusal>;
 
     /// Admits `batch` for sync-mode requests (`X-Pulsus-Async` absent or
     /// `0`, the default): the handler `.await`s the returned
     /// [`FlushWait`] and only then responds `200`. For a suppressed push
     /// the returned wait resolves to **the original push's** outcome.
-    fn admit_flush(&self, batch: ParsedLogs, push: PushHeaders) -> Result<FlushWait, AdmitRefusal>;
+    fn admit_flush(
+        &self,
+        tenant: &Tenant,
+        batch: ParsedLogs,
+        push: PushHeaders,
+    ) -> Result<FlushWait, AdmitRefusal>;
 }
 
 #[cfg(test)]

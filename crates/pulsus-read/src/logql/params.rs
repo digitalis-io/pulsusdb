@@ -99,6 +99,9 @@ pub struct PlanCtx<'a> {
     /// dropping stage (see [`super::plan::StreamsPlan::scan_limit`]).
     /// Validated `>= 1` at config load.
     pub pipeline_scan_factor: u32,
+    /// The request's tenant (issue #653): every statement the plan renders
+    /// over a log table carries `org_id = <tenant>`.
+    pub tenant: &'a pulsus_model::Tenant,
 }
 
 /// A `[start_ns, end_ns]` time window for label/series discovery reads

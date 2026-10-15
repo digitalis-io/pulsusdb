@@ -206,10 +206,15 @@ async fn admit_and_drain(db: &str, batch: ParsedLogs) {
         &WriterConfig::default(),
         WriterTables::logs_default(),
     );
-    pulsus_write::LogSink::admit_flush(&writer, batch, PushHeaders::default())
-        .expect("queue has room")
-        .await
-        .expect("the landing block commits");
+    pulsus_write::LogSink::admit_flush(
+        &writer,
+        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+        batch,
+        PushHeaders::default(),
+    )
+    .expect("queue has room")
+    .await
+    .expect("the landing block commits");
     writer.shutdown(Duration::from_secs(10)).await;
 }
 

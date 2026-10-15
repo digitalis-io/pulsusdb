@@ -74,6 +74,9 @@ fn rows_on(fp: u64) -> Vec<MetricScanRow> {
 
 fn client_and_window() -> (ClientAgg, ClientWindow, Option<u64>) {
     let ctx = PlanCtx {
+        tenant: Box::leak(Box::new(
+            pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+        )),
         db: "pulsus",
         streams_idx: "log_streams_idx",
         streams: "log_streams",
@@ -125,6 +128,9 @@ type Arm = (&'static str, Vec<(u64, &'static str)>, u64);
 /// reaches `ClientAggState` rather than the SQL pushdown.
 fn instant_client_and_window() -> (ClientAgg, ClientWindow, Option<u64>) {
     let ctx = PlanCtx {
+        tenant: Box::leak(Box::new(
+            pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+        )),
         db: "pulsus",
         streams_idx: "log_streams_idx",
         streams: "log_streams",
