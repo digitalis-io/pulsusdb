@@ -8625,10 +8625,11 @@ async fn by_reads_typed_values_only() {
 }
 
 /// The distinct-group `422`: on today's engine and on the statement
-/// alike at `max_series = 2`, by the preflight and by the counter; and
-/// `{ } | by(status)` at `limit = 1`, which today's engine refuses
-/// counting the groups of every trace it evaluated, the statement answers,
-/// counting those of the trace it returns.
+/// alike at `max_series = 2`, by today's preflight and by the statement's
+/// counter; and `{ } | by(status)` and `by(resource.service.name)` at
+/// `limit = 1`, which today's engine refuses counting the groups of every
+/// trace it evaluated, the statement answers, counting those of the trace
+/// it returns (issue #602 part 1: the statement runs no preflight).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn search_routed_keeps_the_group_cap() {
     skip_unless_live!();
@@ -8654,7 +8655,12 @@ async fn search_routed_keeps_the_group_cap() {
     let mut wrong = Vec::new();
     for (query, limit, want_today, want_routed) in [
         ("{ } | by(span.a)", 20, cap, cap),
-        ("{ .a = 1 } | by(resource.service.name)", 1, cap, cap),
+        (
+            "{ .a = 1 } | by(resource.service.name)",
+            1,
+            cap,
+            "Ok(1 traces",
+        ),
         ("{ } | by(span.a) | coalesce()", 20, cap, cap),
         (r#"{ } | by(name) | { name = "b" }"#, 20, cap, cap),
         ("{ } | by(status)", 1, cap, "Ok(1 traces"),
@@ -15832,9 +15838,7 @@ fn untyped_fixture(base_ns: i64) -> Vec<ExportTraceServiceRequest> {
 
 /// Section 4.3's search cases on fixture U: `(id, query, literal,
 /// statements)`. A `by()` or aggregate row's literal is
-/// [`grouped_answer_of`]'s, any other [`selected_answer_of`]'s. U8's second
-/// statement is the series cap's probe, which a `by(resource.service.name)`
-/// search runs first.
+/// [`grouped_answer_of`]'s, any other [`selected_answer_of`]'s.
 const UNTYPED_CASES: [(&str, &str, &str, u64); 15] = [
     (
         "U1",
@@ -15877,7 +15881,7 @@ const UNTYPED_CASES: [(&str, &str, &str, u64); 15] = [
         "U8",
         "{ } | by(resource.service.name)",
         "e1 4 [01, 02, 03, 04] {svc-u 1 [01]; nil 3 [02, 03, 04]}",
-        2,
+        1,
     ),
     (
         "U9",
@@ -16125,6 +16129,181 @@ async fn a_service_name_is_held_only_as_a_string_under_not() {
         wrong.push(format!(
             "W11 the per-trace table\n  want: {want:?}\n  got:  {per_trace:?}"
         ));
+    }
+    drop_db(&db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Issue #602 part 1's fixture A: traces `a1` and `a2`, one span `01` and
+/// `02` each, in resources whose `service.name` is the string `"42"` and
+/// the integer `42`.
+fn service_aggregate_fixture(base_ns: i64) -> Vec<ExportTraceServiceRequest> {
+    const S: i64 = 1_000_000_000;
+    let one = |service: AnyValue, n: u8| {
+        group_request(
+            vec![kv("service.name", service)],
+            scope_named("lib-a", "1.0", Vec::new()),
+            vec![span_with_message(
+                vec![0xa0 + n; 16],
+                vec![0, 0, 0, 0, 0, 0, 0, n],
+                Vec::new(),
+                "a",
+                2,
+                base_ns + i64::from(n) * S,
+                S / 10,
+                Vec::new(),
+                None,
+                Vec::new(),
+                Vec::new(),
+            )],
+        )
+    };
+    vec![one(str_value("42"), 1), one(int_value(42), 2)]
+}
+
+/// Issue #602 part 1 (D2): an aggregate over `resource.service.name` reads
+/// it only as a string — the string `"42"` contributes, the integer `42` is
+/// missing — one statement each.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_service_name_aggregate_reads_only_a_string() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let (db, client) = seed_both(
+        pulsus_testkit::test_db("pulsus_read_it_t602p1_svcagg"),
+        &service_aggregate_fixture(base_ns),
+        2,
+        "t602p1-svcagg",
+    )
+    .await;
+    let engine = engine_of(&db).await;
+    let window = (base_ns, base_ns + 60_000_000_000);
+    let mut wrong = Vec::new();
+    for (query, literal) in [
+        (
+            "{ } | max(resource.service.name) > 0",
+            "a1 1 [01] {double:42 1 [01]}",
+        ),
+        (
+            "{ } | sum(resource.service.name) > 0",
+            "a1 1 [01] {double:42 1 [01]}",
+        ),
+    ] {
+        let plan = plan_of(&engine, &parse_query(query), window, 20, 3);
+        if !covered(&plan) {
+            wrong.push(format!("{query}: not covered"));
+        }
+        let t0 = now_ns();
+        let routed = engine.search_routed(&plan).await.map(normalise_today);
+        let answer = grouped_answer_of(&routed);
+        if answer != literal {
+            wrong.push(format!(
+                "{query}\n  literal: {literal}\n  routed:  {answer}"
+            ));
+        }
+        if routed.is_err() {
+            continue;
+        }
+        let (statements, _) = settled_statements(&client, &db, t0).await;
+        if statements != 1 {
+            wrong.push(format!("{query}: {statements} statements, want 1"));
+        }
+    }
+    drop_db(&db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Issue #602 part 1: a grouping the statement serves is capped by the
+/// statement's own group counter, with no preflight — over the cap it
+/// answers the `422` from one statement, which reads `spans` and not
+/// today's `trace_spans`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_covered_grouping_is_capped_by_one_statement() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let bodies: Vec<ExportTraceServiceRequest> = (1..=3u8)
+        .map(|n| {
+            by_body(
+                &format!("svc-{n}"),
+                vec![by_span(
+                    base_ns,
+                    0xc0 + n,
+                    n,
+                    "op",
+                    i64::from(n),
+                    Vec::new(),
+                )],
+            )
+        })
+        .collect();
+    let (db, client) = seed_both(
+        pulsus_testkit::test_db("pulsus_read_it_t602p1_cap"),
+        &bodies,
+        3,
+        "t602p1-cap",
+    )
+    .await;
+    let engine = pulsus_read::TraceEngine::new(
+        ChClient::new(client_config(&db))
+            .await
+            .expect("connect the engine"),
+        pulsus_read::TraceReadConfig {
+            max_series: 2,
+            ..engine_config()
+        },
+    );
+    let mut wrong = Vec::new();
+    let query = "{ } | by(resource.service.name)";
+    let plan = plan_of(
+        &engine,
+        &parse_query(query),
+        (base_ns, base_ns + 60_000_000_000),
+        20,
+        3,
+    );
+    if !covered(&plan) {
+        wrong.push(format!("{query}: not covered"));
+    }
+    let t0 = now_ns();
+    let got = shape(&engine.search_routed(&plan).await);
+    let cap = "Err(QueryTooBroad(TraceSearchSeriesCap { count: 3, cap: 2 }))";
+    if !got.starts_with(cap) {
+        wrong.push(format!("{query}: want {cap}, got {got}"));
+    }
+    client
+        .execute(
+            "SYSTEM FLUSH LOGS",
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("flush the logs");
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+    struct Logged {
+        statements: u64,
+        previous: u64,
+    }
+    let sql = format!(
+        "SELECT count() AS statements, \
+         countIf(has(tables, '{db}.trace_spans') OR has(tables, '{db}.trace_recent')) AS previous \
+         FROM system.query_log WHERE type = 'QueryFinish' AND query_kind = 'Select' \
+         AND has(databases, '{db}') AND event_time_microseconds >= toDateTime64({}, 6)",
+        t0 as f64 / 1e9
+    );
+    let mut stream = client
+        .query_stream::<Logged>(&sql, &QuerySettings::new())
+        .await
+        .expect("read the query log");
+    let logged = stream
+        .next()
+        .await
+        .expect("one row")
+        .expect("decode the query log row");
+    let want = Logged {
+        statements: 1,
+        previous: 0,
+    };
+    if logged != want {
+        wrong.push(format!("{query}: logged {logged:?}, want {want:?}"));
     }
     drop_db(&db).await;
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
