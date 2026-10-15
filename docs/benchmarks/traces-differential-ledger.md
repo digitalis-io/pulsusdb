@@ -748,43 +748,32 @@ when we are asking it to slow down, so we keep `429`; recorded as
   table, so a field against a field, arithmetic and an absence check are
   read from the span's own row.
 
+- **Closed by issue #594 part 5**: `{ nestedSetParent != -1 }`,
+  `{ nestedSetParent < 2 }`, `{ nestedSetParent = 5 }`,
+  `{ nestedSetLeft > 1 }`, `{ nestedSetLeft > 0 }`,
+  `{ nestedSetRight < 100 }` and `{ trace:duration > 1s }`, each
+  `| rate()`, are served: the statement binds the search statement's
+  per-trace scalar, child counts and numbering.
+
 - **The residual, each class with its measured reference status.** Every
   row is `we 400 / the reference 200`:
 
   | class id | witness query | our exact 400 body |
   |---|---|---|
-  | `metrics-filter-field-vs-field-and-arithmetic` | `{ nestedSetParent != -1 } \| rate()` | `type mismatch: field-vs-field and arithmetic comparisons are not supported in metrics filters` |
-  | `metrics-filter-trace-level-intrinsics` | `{ trace:duration > 1s } \| rate()` | `type mismatch: trace-level intrinsics are not supported in metrics filters` |
   | `metrics-filter-field-negation` | `{ !.a } \| rate()` | `type mismatch: field negation is not supported in metrics filters` |
-  | `metrics-filter-nested-set-numbering-range` | `{ nestedSetParent < 2 } \| rate()`, `{ nestedSetParent = 5 } \| rate()` | `type mismatch: nestedSetParent comparisons inside the numbering range are not supported in metrics filters` |
-  | `metrics-filter-nested-set-left-right` | `{ nestedSetLeft > 1 } \| rate()`, `{ nestedSetLeft > 0 } \| rate()`, `{ nestedSetRight < 100 } \| rate()` | `type mismatch: nestedSetLeft and nestedSetRight are not supported in metrics filters` |
   | `metrics-filter-intrinsic-existence-shared-path` | `{ name != nil } \| rate()` | `type mismatch: existence checks are only supported on attributes` |
 
-- **Two of those rows are not what they look like.** `{ nestedSetParent !=
-  -1 }` is **not** a nested-set refusal in the previous planner: a
-  negative literal is not a literal in this grammar, so `-1` parses to
-  `Unary { Neg, Number("1") }` and that planner refuses the query by the
-  operand-shape check one arm earlier, in the field-vs-field/arithmetic
-  class. The statement on the span table does not take it because a span
-  that is not a root is told by the nested-set numbering, which that
-  statement leaves to #594 part 5. Spelling the same predicate without a
-  negative literal — `{ nestedSetParent >= 1 }` — is served.
-  And `metrics-filter-intrinsic-existence-shared-path` is not a
+- **One of those rows is not what it looks like.**
+  `metrics-filter-intrinsic-existence-shared-path` is not a
   metrics-block class at all: `/api/search` refuses `{ name != nil }`
   with the identical body, so the rejection comes from a shared path. It
   is listed because it IS a divergence on this route; it is owned
   elsewhere.
 
 - **Why each remaining class is a design, not a line.**
-  `metrics-filter-field-vs-field-and-arithmetic`'s one remaining witness
-  reads the nested-set numbering;
-  `metrics-filter-trace-level-intrinsics` needs a trace-wide
-  `GROUP BY trace_id … HAVING` semi-join matching `search_sql`'s root
-  selection; `metrics-filter-field-negation`
+  `metrics-filter-field-negation`
   is a value co-load whose non-boolean case is a reference **500**, which
-  SQL cannot produce; the two nested-set classes need the Euler
-  numbering, which is a per-trace tree walk the single-query metrics
-  pushdown does not build.
+  SQL cannot produce.
 
 - **Where it is enforced.** `crates/pulsus-read/tests/fixtures/metrics_filter_accept.json`
   carries one probe per witness with both sides' verdicts and the exact
@@ -837,6 +826,11 @@ when we are asking it to slow down, so we keep `429`; recorded as
 - **Closed on the search route** (issue #594 part 2): the search statement
   answers the measurement's query the reference's way — its root test is
   `parent_span_id` empty — so the split no longer exists for this query.
+
+- **Every other `nestedSetParent` comparison on the metrics route** (issue
+  #594 part 5) reads the numbering: `>= 1`, `= 0` and `!= 0` give an orphan
+  and its subtree `0`, where the previous planner's has-a-parent lowering
+  counted them as non-roots.
 
 ### `traceql-nestedset-sibling-order` (issue #594) — **siblings in start order, not in the reference's stored order**
 
@@ -2576,6 +2570,11 @@ when we are asking it to slow down, so we keep `429`; recorded as
   the window counted, as the search statement counts them: `intValue 0` 2,
   `1` 2, `2` 1 on RF, and `avg_over_time(span:childCount)` 0.8
   (`child_counts_are_direct_children`).
+
+- **A filter** (issue #594 part 5) counts the same way. The reference's
+  default block format refuses a `span:childCount` condition (source read,
+  not run on this route). Entry 34 of
+  `docs/reference-defects-we-do-not-copy.md`.
 
 - **Disposition.** Deliberate: the reference's empty answer is a defect, and
   the owner's standing rule is to fix one rather than copy it.
