@@ -1,0 +1,40 @@
+-- case: quantile_three
+-- q: {} | quantile_over_time(duration, 0.5, 0.9, 0.99)
+
+== range ==
+SELECT g, points, exemplars, 1 AS f
+FROM (SELECT g, any(o) AS o, arraySort(groupArrayIf(((29856666 + p) * 60000, v), NOT none)) AS points,
+             arraySort(e -> e.2, groupArrayIf((ex.1, ex.2, ex.3 / 1000000000), has AND (T <= 100 OR (intDiv(x * 100 + T - 1, T) < 100 AND intDiv(intDiv(x * 100 + T - 1, T) * T, 100) = x)))) AS exemplars
+      FROM (SELECT none, g, o, p, v, ex, ex.2 != 0 AS has,
+       row_number() OVER (PARTITION BY has ORDER BY p, o, g) - 1 AS x,
+       countIf(has) OVER () AS T
+FROM (SELECT g, o, empty(cells) AS none, c.1 AS p, c.2 AS v, if(isNaN(v), CAST((toFixedString('', 16), 0, 0), 'Tuple(FixedString(16), Int64, Int64)'), c.3) AS ex
+FROM (SELECT g, any(o) AS o, groupArray((p, v, ex)) AS cells
+FROM (SELECT toString(qi) AS g, qi AS o, p, q AS v,
+       if(qi = indexOf(arrayMap(x -> abs(x - x0.3 / 1000000000), qq), arrayMin(arrayMap(x -> abs(x - x0.3 / 1000000000), qq))), x0, CAST((toFixedString('', 16), 0, 0), 'Tuple(FixedString(16), Int64, Int64)')) AS ex
+FROM (SELECT intDiv(start_ns - 1, 60000000000) + 1 - 29856666 AS p,
+             arrayMap(x -> if(isFinite(x), x / 1000000000, 0), CAST(quantilesTDigest(0.5, 0.9, 0.99)(duration_ns) AS Array(Float64))) AS qq,
+             argMax((trace_id, start_ns, duration_ns), (duration_ns, span_id)) AS x0
+      FROM spans
+      WHERE start_ns >= 1791399900000000001 AND start_ns < 1791410820000000001
+        AND intDiv(start_ns, 300000000000) BETWEEN intDiv(1791399900000000001, 300000000000) AND intDiv(1791410820000000000, 300000000000)
+        AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') >= toDate('2026-10-07') AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') <= toDate('2026-10-07')
+        AND (true)
+      GROUP BY p)
+ARRAY JOIN qq AS q, arrayEnumerate(qq) AS qi)
+GROUP BY g)
+LEFT ARRAY JOIN cells AS c))
+      GROUP BY g)
+ORDER BY o, g
+
+== instant ==
+SELECT g, [(toInt64(1791410820000), v)] AS points, CAST([], 'Array(Tuple(FixedString(16), Int64, Float64))') AS exemplars, 0 AS f
+FROM (SELECT toString(qi) AS g, qi AS o, q AS v FROM (SELECT arrayMap(x -> if(isFinite(x), x / 1000000000, 0), CAST(quantilesTDigest(0.5, 0.9, 0.99)(duration_ns) AS Array(Float64))) AS qq
+FROM spans
+WHERE start_ns >= 1791399960000000000 AND start_ns < 1791410820000000000
+  AND intDiv(start_ns, 300000000000) BETWEEN intDiv(1791399960000000000, 300000000000) AND intDiv(1791410819999999999, 300000000000)
+  AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') >= toDate('2026-10-07') AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') <= toDate('2026-10-07')
+  AND (true)
+HAVING count() > 0)
+ARRAY JOIN qq AS q, arrayEnumerate(qq) AS qi)
+ORDER BY o, g

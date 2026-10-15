@@ -19,10 +19,13 @@
 //! * [`tracelevel`] — the search statement's trace-level intrinsics and
 //!   `span:childCount` (issue #594 part 1);
 //! * [`numbering`] — the search statement's nested-set intrinsics (issue
-//!   #594 part 2).
+//!   #594 part 2);
+//! * [`metrics`] — the metrics statement (issue #596 part 1): every
+//!   metrics shape but `compare()`, in one statement per request.
 
 pub mod attr_index;
 pub mod fetch;
+pub mod metrics;
 pub mod numbering;
 pub mod predicate;
 pub mod projection;

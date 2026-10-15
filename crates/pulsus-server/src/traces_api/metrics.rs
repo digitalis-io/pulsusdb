@@ -1,8 +1,9 @@
 //! `GET /api/traces/v1/metrics/{query_range,query}` (issue #59/#182;
 //! docs/api.md §4.4): parse params (`params.rs`) → `pulsus_traceql::parse`
-//! → `pulsus_read::plan_trace_metrics` — all **before** the pool, same
-//! discipline as `search.rs`, so every 400/422-class failure resolves
-//! without ClickHouse — → `TraceEngine::metrics_range`/`metrics_instant`
+//! → `pulsus_read::plan_trace_metrics_routed` — all **before** the pool,
+//! same discipline as `search.rs`, so every 400/422-class failure resolves
+//! without ClickHouse — → `TraceEngine::metrics_range_routed`/
+//! `metrics_instant_routed`
 //! → the Tempo-native metrics encoders (`metrics_response::encode_metrics`
 //! for the range route, `::encode_metrics_instant` for the instant one —
 //! issue #464 wave 2: they are different `tempopb` messages).
@@ -62,6 +63,11 @@ fn now_unix_seconds() -> i64 {
 
 async fn metrics_impl(state: AppState, raw: &str, form: MetricsForm) -> Result<Response, ApiError> {
     let params = params::parse_metrics_params(raw, now_unix_seconds())?;
+    // Issue #596 part 1: the reference's step limit, on the range route
+    // only; the instant route keeps its step.
+    if form == MetricsForm::Range {
+        params::check_range_intervals(&params)?;
+    }
     let query = pulsus_traceql::parse(params.q.as_str()).map_err(ApiError::Query)?;
     // Issue #328: the reference's route-independent semantic validation
     // (`traceql.Validate`), after parse and before planning — the
@@ -89,8 +95,18 @@ async fn metrics_impl(state: AppState, raw: &str, form: MetricsForm) -> Result<R
         step_ms: params.step_ms,
         exemplars: params.exemplars,
     };
-    let plan =
-        pulsus_read::plan_trace_metrics(&query, &metrics_params, &ctx).map_err(ApiError::Plan)?;
+    // Issue #596 part 1: the statement on `spans` where it serves the
+    // query, today's planner on the query itself where it does not.
+    let indexed = pulsus_read::traces::spans::attr_index::IndexedAttr::from_config(
+        &state.config.traceql_indexed_attributes,
+    );
+    let tables = pulsus_read::StatementTables {
+        spans: &read_config.spans_v2_table,
+        resources: &read_config.resources_table,
+        indexed: &indexed,
+    };
+    let plan = pulsus_read::plan_trace_metrics_routed(&query, &metrics_params, &ctx, &tables)
+        .map_err(ApiError::Plan)?;
 
     let engine = engine_for(&state).await?;
     // Issue #464 wave 2: the two routes return DIFFERENT proto messages —
@@ -101,11 +117,11 @@ async fn metrics_impl(state: AppState, raw: &str, form: MetricsForm) -> Result<R
     // the datasource's bare `jsonpb.Unmarshal` rejects outright.
     Ok(match form {
         MetricsForm::Range => {
-            let result = engine.metrics_range(&plan).await?;
+            let result = engine.metrics_range_routed(&plan).await?;
             super::metrics_response::encode_metrics(&result)
         }
         MetricsForm::Instant => {
-            let result = engine.metrics_instant(&plan).await?;
+            let result = engine.metrics_instant_routed(&plan).await?;
             super::metrics_response::encode_metrics_instant(&result)
         }
     })
@@ -241,13 +257,47 @@ mod tests {
 
     #[tokio::test]
     async fn exceeding_the_point_cap_is_a_static_422() {
-        // 1,000,000 seconds at step=1 → 1M buckets >> MAX_METRICS_POINTS,
-        // rejected at plan time — no pool needed, so this no-pool state
-        // proves the rejection is pre-execution.
+        // 1,000,000 seconds at step=1 → 1M buckets: on the range route the
+        // reference's step limit refuses it first (issue #596 part 1), at
+        // plan time — no pool needed, so this no-pool state proves the
+        // rejection is pre-execution.
         let (status, body) =
             run_range(&format!("{RATE_Q}&start=1700000000&end=1701000000&step=1")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body {body}");
+        assert_eq!(
+            body,
+            "step of 1s is too small, minimum step for given range is 1m40s"
+        );
+        // The instant route keeps the static 422 point cap.
+        let (status, body) =
+            run_instant(&format!("{RATE_Q}&start=1700000000&end=1701000000&step=1")).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body {body}");
         assert!(!body.contains("byte "), "body {body}");
+    }
+
+    /// D13: a range of more than 10,000 steps answers `400` in the
+    /// reference's words; exactly 10,000 is served, and the instant route
+    /// keeps its step.
+    #[tokio::test]
+    async fn a_range_over_ten_thousand_intervals_is_the_reference_400() {
+        let window = "start=1700000000&end=1700010800";
+        let (status, body) = run_range(&format!("{RATE_Q}&{window}&step=1s")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body {body}");
+        assert_eq!(
+            body,
+            "step of 1s is too small, minimum step for given range is 1.08s"
+        );
+        let (status, body) = run_range(&format!("{RATE_Q}&{window}&step=1080ms")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body {body}");
+        let (status, body) = run_instant(&format!("{RATE_Q}&{window}&step=1s")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body {body}");
+        let (status, body) =
+            run_range(&format!("{RATE_Q}&start=1700000000&end=1701000000&step=1")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body {body}");
+        assert_eq!(
+            body,
+            "step of 1s is too small, minimum step for given range is 1m40s"
+        );
     }
 
     #[tokio::test]
@@ -275,13 +325,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn extreme_ns_endpoints_are_a_static_422_never_a_panic_or_500() {
-        // Full-i64-range endpoints: the i128 plan math resolves this to
-        // the static point-cap 422 before any pool/SQL work (code review
-        // round 1's overflow class, proven end to end through the
-        // handler).
+    async fn extreme_ns_endpoints_are_a_static_refusal_never_a_panic_or_500() {
+        // Full-i64-range endpoints: the i128 arithmetic resolves this
+        // before any pool/SQL work (code review round 1's overflow class,
+        // proven end to end through the handler) — on the range route the
+        // step limit's 400 (issue #596 part 1), on the instant route the
+        // static point-cap 422.
         let query = format!("{RATE_Q}&start={}&end={}&step=1", i64::MIN, i64::MAX);
         let (status, body) = run_range(&query).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body {body}");
+        let (status, body) = run_instant(&query).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body {body}");
     }
 

@@ -7,7 +7,7 @@
 //! Two tests:
 //!
 //! * **hermetic** — re-derives `ours` from the tree under test through
-//!   `parse → validate → plan_trace_metrics`, exactly as
+//!   `parse → validate → plan_trace_metrics_routed`, exactly as
 //!   `traces_api/metrics.rs` composes it, and asserts it equals the
 //!   committed value for every probe. A committed verdict measured
 //!   against any other tree fails in its own PR
@@ -36,8 +36,8 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use pulsus_read::SpanFilterCtx;
-use pulsus_read::traces::metrics_plan::{MetricsCtx, MetricsParams, plan_trace_metrics};
+use pulsus_read::traces::metrics_plan::{MetricsCtx, MetricsParams};
+use pulsus_read::{SpanFilterCtx, StatementTables, plan_trace_metrics_routed};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -89,7 +89,7 @@ fn fixture() -> Fixture {
 }
 
 /// The full metrics route, hermetically: `parse → validate →
-/// plan_trace_metrics`, with the golden suite's fixed deterministic
+/// plan_trace_metrics_routed`, with the golden suite's fixed deterministic
 /// planner inputs. Nothing is read from the fixture being checked.
 fn derive_ours(q: &str) -> Side {
     let reject = |body: String| Side {
@@ -103,7 +103,7 @@ fn derive_ours(q: &str) -> Side {
     if let Err(e) = pulsus_traceql::validate(&query) {
         return reject(e.to_string());
     }
-    match plan_trace_metrics(
+    match plan_trace_metrics_routed(
         &query,
         &MetricsParams {
             start_ns: 1_700_000_000_000_000_000,
@@ -120,6 +120,11 @@ fn derive_ours(q: &str) -> Side {
             max_series: 1_000,
             distributed: false,
             skip_unavailable_shards: false,
+        },
+        &StatementTables {
+            spans: "spans",
+            resources: "resources",
+            indexed: &[],
         },
     ) {
         Ok(_) => Side {

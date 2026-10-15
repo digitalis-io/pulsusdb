@@ -741,26 +741,34 @@ when we are asking it to slow down, so we keep `429`; recorded as
   root/non-root family — the query a live Grafana sent us — and bare
   attribute truthiness.
 
+- **Closed by issue #596 part 1**: five witnesses are served —
+  `{ .a = .b }`, `{ .a + 1 > 2 }`, `{ 2 > .a }`, `{ nestedSetParent = -1 }`
+  and `{ .a = nil }`, each `| rate()`. A metrics filter is now compiled by
+  the span predicate compiler and answered by one statement on the span
+  table, so a field against a field, arithmetic and an absence check are
+  read from the span's own row.
+
 - **The residual, each class with its measured reference status.** Every
   row is `we 400 / the reference 200`:
 
   | class id | witness query | our exact 400 body |
   |---|---|---|
-  | `metrics-filter-field-vs-field-and-arithmetic` | `{ .a = .b } \| rate()`, `{ .a + 1 > 2 } \| rate()`, `{ 2 > .a } \| rate()`, `{ nestedSetParent = -1 } \| rate()`, `{ nestedSetParent != -1 } \| rate()` | `type mismatch: field-vs-field and arithmetic comparisons are not supported in metrics filters` |
+  | `metrics-filter-field-vs-field-and-arithmetic` | `{ nestedSetParent != -1 } \| rate()` | `type mismatch: field-vs-field and arithmetic comparisons are not supported in metrics filters` |
   | `metrics-filter-trace-level-intrinsics` | `{ trace:duration > 1s } \| rate()` | `type mismatch: trace-level intrinsics are not supported in metrics filters` |
-  | `metrics-filter-absence-checks` | `{ .a = nil } \| rate()` | `type mismatch: absence checks are not supported in metrics filters` |
   | `metrics-filter-field-negation` | `{ !.a } \| rate()` | `type mismatch: field negation is not supported in metrics filters` |
   | `metrics-filter-nested-set-numbering-range` | `{ nestedSetParent < 2 } \| rate()`, `{ nestedSetParent = 5 } \| rate()` | `type mismatch: nestedSetParent comparisons inside the numbering range are not supported in metrics filters` |
   | `metrics-filter-nested-set-left-right` | `{ nestedSetLeft > 1 } \| rate()`, `{ nestedSetLeft > 0 } \| rate()`, `{ nestedSetRight < 100 } \| rate()` | `type mismatch: nestedSetLeft and nestedSetRight are not supported in metrics filters` |
   | `metrics-filter-intrinsic-existence-shared-path` | `{ name != nil } \| rate()` | `type mismatch: existence checks are only supported on attributes` |
 
-- **Two of those rows are not what they look like.** `{ nestedSetParent =
-  -1 }` and `{ nestedSetParent != -1 }` are **not** nested-set refusals: a
+- **Two of those rows are not what they look like.** `{ nestedSetParent !=
+  -1 }` is **not** a nested-set refusal in the previous planner: a
   negative literal is not a literal in this grammar, so `-1` parses to
-  `Unary { Neg, Number("1") }` and the query is refused by the
+  `Unary { Neg, Number("1") }` and that planner refuses the query by the
   operand-shape check one arm earlier, in the field-vs-field/arithmetic
-  class. Spelling the same predicates without a negative literal —
-  `{ nestedSetParent < 0 }` and `{ nestedSetParent >= 1 }` — is served.
+  class. The statement on the span table does not take it because a span
+  that is not a root is told by the nested-set numbering, which that
+  statement leaves to #594 part 5. Spelling the same predicate without a
+  negative literal — `{ nestedSetParent >= 1 }` — is served.
   And `metrics-filter-intrinsic-existence-shared-path` is not a
   metrics-block class at all: `/api/search` refuses `{ name != nil }`
   with the identical body, so the rejection comes from a shared path. It
@@ -768,13 +776,11 @@ when we are asking it to slow down, so we keep `429`; recorded as
   elsewhere.
 
 - **Why each remaining class is a design, not a line.**
-  `metrics-filter-field-vs-field-and-arithmetic` needs a
-  `trace_attrs_idx` self-join or a correlated per-span value read;
+  `metrics-filter-field-vs-field-and-arithmetic`'s one remaining witness
+  reads the nested-set numbering;
   `metrics-filter-trace-level-intrinsics` needs a trace-wide
   `GROUP BY trace_id … HAVING` semi-join matching `search_sql`'s root
-  selection; `metrics-filter-absence-checks` is three lines of lowering
-  but our `= nil` **value** semantics already diverge on the search
-  route, so it needs its own entry first; `metrics-filter-field-negation`
+  selection; `metrics-filter-field-negation`
   is a value co-load whose non-boolean case is a reference **500**, which
   SQL cannot produce; the two nested-set classes need the Euler
   numbering, which is a per-trace tree walk the single-query metrics
