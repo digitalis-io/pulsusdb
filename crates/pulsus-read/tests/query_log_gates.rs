@@ -15643,10 +15643,16 @@ async fn failed_and_undecided_values() {
             rows.iter().filter(|r| is_reduced_624p4(&r.query)).collect();
         assert_eq!(reduced.len(), 1, "{query}: {rows:#?}");
         assert_eq!(reduced[0].exception_code, *code, "{query}: {rows:#?}");
+        let reduced_at = rows.iter().position(|r| is_reduced_624p4(&r.query));
+        let todays_at = rows.iter().position(|r| is_todays_sliding_624p4(&r.query));
         assert_eq!(
-            rows.iter().any(|r| is_todays_sliding_624p4(&r.query)),
+            todays_at.is_some(),
             *todays,
             "{query}: today's read: {rows:#?}"
+        );
+        assert!(
+            todays_at.is_none_or(|b| reduced_at.is_some_and(|a| a < b)),
+            "{query}: the reduced statement, then today's read: {rows:#?}"
         );
     }
     drop_db_624(&admin, &db).await;

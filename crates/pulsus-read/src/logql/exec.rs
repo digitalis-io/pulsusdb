@@ -374,8 +374,8 @@ pub struct KeyRouteTestHooks {
     pub key_statement_test_knobs: Option<super::sql::KeyStatementTestKnobs>,
     /// Test-only: renders a statement-level memory ceiling,
     /// `SETTINGS max_memory_usage = <n>`, into either bucketed range
-    /// statement (issue #624), so a live test can make it fail with the
-    /// server's memory code.
+    /// statement and the reduced `| unwrap` statement (issue #624), so a
+    /// live test can make it fail with the server's memory code.
     pub bucketed_statement_max_memory_bytes: Option<u64>,
     /// Test-only: cap overrides laid over the defaults, applied to the
     /// lowered range fold and to today's route alike (issue #624, part 2).
