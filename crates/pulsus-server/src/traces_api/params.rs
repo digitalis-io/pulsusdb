@@ -293,8 +293,8 @@ pub(crate) enum MetricsParamError {
     /// #596 part 1), in the reference's words.
     #[error(
         "step of {} is too small, minimum step for given range is {}",
-        go_duration(*step_ns),
-        go_duration(*minimum_ns)
+        pulsus_read::go_duration_string(*step_ns),
+        pulsus_read::go_duration_string(*minimum_ns)
     )]
     StepTooSmall { step_ns: i64, minimum_ns: i64 },
 }
@@ -318,52 +318,6 @@ pub(crate) fn check_range_intervals(params: &RawMetricsParams) -> Result<(), Met
         step_ns: i64::try_from(step_ns).unwrap_or(i64::MAX),
         minimum_ns: i64::try_from(width / MAX_RANGE_INTERVALS).unwrap_or(i64::MAX),
     })
-}
-
-/// `ns` as Go's `time.Duration.String` renders it: `0s`; under a second
-/// `ns`, `µs` or `ms` with the fraction's trailing zeros dropped; from a
-/// second up `[h][m]s`, every unit below the largest written, `1h0m0s`.
-pub(crate) fn go_duration(ns: i64) -> String {
-    if ns == 0 {
-        return "0s".to_string();
-    }
-    let sign = if ns < 0 { "-" } else { "" };
-    let u = u128::from(ns.unsigned_abs());
-    // The integer part and the fraction of `u / 10^prec`, the fraction's
-    // trailing zeros dropped, and the point with it when it is zero.
-    let split = |u: u128, prec: u32| {
-        let scale = 10u128.pow(prec);
-        let frac = format!("{:0width$}", u % scale, width = prec as usize);
-        let frac = frac.trim_end_matches('0');
-        let frac = if frac.is_empty() {
-            String::new()
-        } else {
-            format!(".{frac}")
-        };
-        (u / scale, frac)
-    };
-    let text = if u < 1_000_000_000 {
-        let (prec, unit) = if u < 1_000 {
-            (0, "ns")
-        } else if u < 1_000_000 {
-            (3, "µs")
-        } else {
-            (6, "ms")
-        };
-        let (whole, frac) = split(u, prec);
-        format!("{whole}{frac}{unit}")
-    } else {
-        let (seconds, frac) = split(u, 9);
-        let (minutes, hours) = (seconds / 60, seconds / 3600);
-        if hours > 0 {
-            format!("{hours}h{}m{}{frac}s", minutes % 60, seconds % 60)
-        } else if minutes > 0 {
-            format!("{minutes}m{}{frac}s", seconds % 60)
-        } else {
-            format!("{seconds}{frac}s")
-        }
-    };
-    format!("{sign}{text}")
 }
 
 /// The parsed metrics request: the TraceQL expression, the validated
@@ -2386,21 +2340,5 @@ mod tests {
                 scope: TagScope::All
             }
         );
-    }
-
-    /// D13's durations, as Go's `time.Duration.String` renders them.
-    #[test]
-    fn go_duration() {
-        for (ns, want) in [
-            (1, "1ns"),
-            (1_500, "1.5µs"),
-            (500_000_000, "500ms"),
-            (1_080_000_000, "1.08s"),
-            (100_000_000_000, "1m40s"),
-            (3_600_000_000_000, "1h0m0s"),
-            (0, "0s"),
-        ] {
-            assert_eq!(super::go_duration(ns), want, "{ns} ns");
-        }
     }
 }

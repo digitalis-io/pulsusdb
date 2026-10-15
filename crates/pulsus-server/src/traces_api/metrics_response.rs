@@ -81,9 +81,16 @@ struct Label {
 /// `{"doubleValue":…}`.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+// The variant names are protojson's field names, `…Value` each.
+#[allow(clippy::enum_variant_names)]
 enum AnyValue {
     StringValue(String),
+    #[serde(serialize_with = "f64_protojson")]
     DoubleValue(f64),
+    /// protojson writes an `int64` as a JSON string.
+    #[serde(serialize_with = "i64_str")]
+    IntValue(i64),
+    BoolValue(bool),
 }
 
 #[derive(Serialize)]
@@ -91,7 +98,7 @@ enum AnyValue {
 struct Sample {
     #[serde(serialize_with = "i64_str")]
     timestamp_ms: i64,
-    #[serde(skip_serializing_if = "f64_is_zero")]
+    #[serde(skip_serializing_if = "f64_is_zero", serialize_with = "f64_protojson")]
     value: f64,
 }
 
@@ -99,6 +106,7 @@ struct Sample {
 #[serde(rename_all = "camelCase")]
 struct Exemplar {
     labels: Vec<Label>,
+    #[serde(serialize_with = "f64_protojson")]
     value: f64,
     #[serde(serialize_with = "i64_str")]
     timestamp_ms: i64,
@@ -122,17 +130,27 @@ struct InstantSeries {
     /// Tempo's protojson default-omission of a zero `value`, the same rule
     /// `Sample` follows. Captured: a `min_over_time` answering `0` comes
     /// back from the pinned container as `{"labels":[…]}`, no `value` key.
-    #[serde(skip_serializing_if = "f64_is_zero")]
+    #[serde(skip_serializing_if = "f64_is_zero", serialize_with = "f64_protojson")]
     value: f64,
+}
+
+/// A double as protojson writes it (issue #596 part 2, D12): a finite one
+/// as a number, a non-finite one as the string `"NaN"`, `"Infinity"` or
+/// `"-Infinity"` — never serde's bare `null`, which a protojson reader
+/// refuses. The search route spells them the same way.
+fn f64_protojson<S: serde::Serializer>(v: &f64, s: S) -> Result<S::Ok, S::Error> {
+    match pulsus_read::non_finite_double_spelling(*v) {
+        Some(spelling) => s.serialize_str(spelling),
+        None => s.serialize_f64(*v),
+    }
 }
 
 fn label(l: &MetricLabel) -> Label {
     let value = match &l.value {
         MetricLabelValue::Str(s) => AnyValue::StringValue(s.clone()),
         MetricLabelValue::Double(d) => AnyValue::DoubleValue(*d),
-        // Stubs: part 2's tests commit.
-        MetricLabelValue::Int(i) => AnyValue::StringValue(i.to_string()),
-        MetricLabelValue::Bool(b) => AnyValue::StringValue(b.to_string()),
+        MetricLabelValue::Int(i) => AnyValue::IntValue(*i),
+        MetricLabelValue::Bool(b) => AnyValue::BoolValue(*b),
     };
     Label {
         key: l.key.clone(),

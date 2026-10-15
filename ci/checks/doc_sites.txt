@@ -34,7 +34,11 @@ rewrite docs/schemas.md:33-33
 # issue, where the body `text` index paragraph names the change and the issue
 # the swap closes; `finding #3` is carried on that paragraph's rewritten first
 # sentence, and #450 on its unchanged `hasToken` sentences.
-rewrite docs/schemas.md:174-174 refs=#25,#559,#560,#603,#16,#171,#498,#2,#57,#584,#586,#587,#5,#63,#75,#478,#555,#26,#623,#125,#315,#472,#549,#7,#579,#635,#500,#172,#183,#593,#235,#3,#450,#624,#412
+# Issue #596 adds #596, its own issue, where the TraceQL metrics section
+# and its value-aggregations bullet say what the statement on the span
+# table reads. #59, #173, #182, #185, #189, #192 and #252 are carried: the
+# two paragraphs already cited them, and the rule reads them as added.
+rewrite docs/schemas.md:174-174 refs=#25,#559,#560,#603,#16,#171,#498,#2,#57,#584,#586,#587,#5,#63,#75,#478,#555,#26,#623,#125,#315,#472,#549,#7,#579,#635,#500,#172,#183,#593,#235,#3,#450,#624,#412,#596,#59,#173,#182,#185,#189,#192,#252
 # `refs=#112` is a NEW reference on this file rather than a carried one. §2.4's
 # writer-contract paragraph gained the reason the read path does not route on
 # `metric_series.value_type`, and that reason is the decision A1's plan v5
@@ -64,7 +68,9 @@ rewrite docs/schemas.md:691-692 refs=#556
 # counts, so the rule reads the paragraph as added.
 # Issue #624 part 3b adds #624, its own issue, where the risk table says the
 # body's `text` index has no false positives to tune.
-rewrite docs/architecture.md:378-378 refs=#560,#549,#579,#635,#544,#624
+# Issue #596 adds #596, its own issue, where the read-path paragraph says
+# the TraceQL metrics routes answer in one statement on the span table.
+rewrite docs/architecture.md:378-378 refs=#560,#549,#579,#635,#544,#624,#596
 rewrite docs/116.md:64-64
 rewrite docs/116.md:75-75
 rewrite crates/pulsus-clickhouse/src/client.rs:156-164 refs=#560
