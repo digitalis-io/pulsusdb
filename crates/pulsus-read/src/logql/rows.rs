@@ -424,50 +424,6 @@ impl From<MetricRangeLogfmtRow> for MetricRangeBucketRow {
     }
 }
 
-/// One row of the extracted-field group key statement, S1 (issue #507,
-/// [`crate::logql::sql::metric_range_unwrapped`]): one (class, grid point,
-/// key labels, projected metadata) group.
-///
-/// `keys` is `(present, text)` per key label, in the plan's key order;
-/// `present = 0` is an absent or blanked key. `v` sums the decided rows'
-/// values; `n_value` counts them, `n_missing` counts the rows dropped for
-/// having no value, and `n_undecided` the rows the database could not
-/// decide (zero whenever the statement throws on them).
-#[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
-pub struct MetricRangeUnwrappedRow {
-    /// The class id, or the fingerprint itself when the plan groups per
-    /// fingerprint — one `UInt128` column either way (issue #498).
-    pub class: Fingerprint,
-    pub bucket_ns: i64,
-    pub keys: Vec<(u8, String)>,
-    pub v: f64,
-    pub n_value: u64,
-    pub n_missing: u64,
-    pub n_undecided: u64,
-    pub sm_text: String,
-    pub sm_kept: Vec<(String, String)>,
-}
-
-/// One row of the one read, L (issue #507,
-/// [`crate::logql::sql::metric_range_unwrapped_rows`]): a decided row with
-/// its key labels and value, or an undecided row with its `body`, its
-/// `fingerprint` and its stored metadata in `sm_text`. A missing row is
-/// never sent.
-#[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
-pub struct UnwrappedLaneRow {
-    /// The class id, or the fingerprint itself when the plan groups per
-    /// fingerprint — one `UInt128` column either way (issue #498).
-    pub class: Fingerprint,
-    pub bucket_ns: i64,
-    pub decided: u8,
-    pub keys: Vec<(u8, String)>,
-    pub v: f64,
-    pub body: String,
-    pub fingerprint: Fingerprint,
-    pub sm_text: String,
-    pub sm_kept: Vec<(String, String)>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

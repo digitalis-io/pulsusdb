@@ -857,22 +857,19 @@ fn only_the_397_section_has_a_wrapped_variant_with_a_pipeline() {
     );
 }
 
-/// Issue #507 W4 — **`eval_approx` is admitted only where the database
+/// Issue #507 — **`eval_approx` is admitted only where the database
 /// AGGREGATES the query, and it is not weaker than `eval` in any dimension
 /// that is not summation order.**
 ///
-/// Round 1 checked the reducer name, which is not the condition: a
-/// `| logfmt | unwrap` chain names one of the four and is evaluated here,
-/// exactly, in one order. The verb now asks the PLANNER whether this
-/// query at this window lowers, so the parser, the conversion, the
-/// underscore rule, the range-equals-step rule and the reducer set are one
-/// answer rather than a restatement of five.
+/// The verb asks the PLANNER whether this query at this window reduces in
+/// the database (since issue #624, part 4b, `MetricValue::Reduced`), so the
+/// answer is the planner's rather than a restatement of it.
 #[test]
 fn eval_approx_is_admitted_only_where_the_aggregation_lowers() {
     use driver::runner::values_agree;
 
-    // JSON bodies and a targeted extraction: the one chain shape whose
-    // aggregation moves to the database.
+    // JSON bodies and a targeted extraction, whose aggregation moves to the
+    // database.
     let dataset = "load\n  {env=\"prod\", service_name=\"checkout\"}\n\
                    \t10s  {\"c\":\"10\"}\n\t20s  {\"c\":\"30\"}\n\
                    \t30s  {\"c\":\"5\"}\n\t40s  {\"c\":\"12\"}\n\n";
@@ -931,9 +928,9 @@ fn eval_approx_is_admitted_only_where_the_aggregation_lowers() {
     let run = run_file("inline/approx_exact.test", &ok).expect("parse");
     assert!(run.cases[0].passed, "{}", run.cases[0].detail);
 
-    // Criterion 12 (issue #507): the bare `| json` forms the extracted-field
-    // group key read serves lower, so the verb admits them. The four values
-    // sum to 57 and average to 14.25, both exact in binary.
+    // Criterion 12 (issue #507): the bare `| json` forms under a key that
+    // holds the series lower, so the verb admits them. The four values sum
+    // to 57 and average to 14.25, both exact in binary.
     for (what, query, value) in [
         (
             "a bare json under a sum",
@@ -954,7 +951,7 @@ fn eval_approx_is_admitted_only_where_the_aggregation_lowers() {
         assert!(run.cases[0].passed, "{what}: {}", run.cases[0].detail);
     }
 
-    // **The control against sprinkling, over every way a query can fail to
+    // **The control against sprinkling, over ways a query can fail to
     // lower** — not only the reducer name, which is what round 1 checked.
     // Each is a GRAMMAR error naming what it saw.
     for (what, directive) in [
@@ -964,12 +961,7 @@ fn eval_approx_is_admitted_only_where_the_aggregation_lowers() {
              count_over_time({service_name=\"checkout\"}[1m])",
         ),
         (
-            "a reducer that never lowers at all",
-            "eval_approx 1e-9 range from 60s to 60s step 1m \
-             rate_counter({service_name=\"checkout\"} | json c=\"c\" | unwrap c [1m])",
-        ),
-        (
-            "a parser with no extractor in the database",
+            "a bare logfmt, whose other keys name the series",
             "eval_approx 1e-9 range from 60s to 60s step 1m \
              sum_over_time({service_name=\"checkout\"} | logfmt | unwrap c [1m])",
         ),
@@ -977,21 +969,6 @@ fn eval_approx_is_admitted_only_where_the_aggregation_lowers() {
             "a bare json, whose other keys name the series",
             "eval_approx 1e-9 range from 60s to 60s step 1m \
              sum_over_time({service_name=\"checkout\"} | json | unwrap c [1m])",
-        ),
-        (
-            "a conversion, which is a grammar",
-            "eval_approx 1e-9 range from 60s to 60s step 1m \
-             sum_over_time({service_name=\"checkout\"} | json c=\"c\" | unwrap duration(c) [1m])",
-        ),
-        (
-            "an instant window, which has no grid",
-            "eval_approx 1e-9 instant at 60s \
-             sum_over_time({service_name=\"checkout\"} | json c=\"c\" | unwrap c [1m])",
-        ),
-        (
-            "a range that is not the step",
-            "eval_approx 1e-9 range from 60s to 120s step 1m \
-             sum_over_time({service_name=\"checkout\"} | json c=\"c\" | unwrap c [2m])",
         ),
         (
             "a bare json averaged without a label, whose other keys name the series",
@@ -1054,7 +1031,7 @@ fn eval_approx_is_admitted_only_where_the_aggregation_lowers() {
     assert!(!values_agree(-0.0, 0.0, None));
 }
 
-/// Issue #507 W4 — **`| unwrap <name>` takes the STRUCTURED METADATA
+/// Issue #507 — **`| unwrap <name>` takes the STRUCTURED METADATA
 /// value when the metadata carries that name, and the parsed one is
 /// renamed away.**
 ///
@@ -1071,7 +1048,7 @@ fn eval_approx_is_admitted_only_where_the_aggregation_lowers() {
 /// collision rule `labels.rs` holds, measured here through the evaluator
 /// rather than read off it.
 ///
-/// **Why this is a W4 gate and not a curiosity.** A lowered
+/// **Why this is a gate and not a curiosity.** A lowered
 /// `sum_over_time` would compute `JSONExtractFloat(body, 'x')` and answer
 /// **7** where the evaluator answers **5** — a different number, not a
 /// rounding difference — and no SQL expression may interpret the metadata
@@ -1112,10 +1089,10 @@ fn unwrap_takes_the_metadata_value_when_the_metadata_carries_the_name() {
     );
 }
 
-/// Issue #507 W4 — **what `| json | unwrap x` does with each kind of JSON
+/// Issue #507 — **what `| json | unwrap x` does with each kind of JSON
 /// value, measured, because a lowered statement has to reproduce it.**
 ///
-/// `JSONExtractFloat(body, 'x')` — the expression W4 would emit — answers
+/// `JSONExtractFloat(body, 'x')` — the expression issue #507 weighed — answers
 /// `0` for every kind the evaluator does not turn into a number, and `0`
 /// is a value, not an absence. The three columns below are what a lowered
 /// aggregate has to agree with:

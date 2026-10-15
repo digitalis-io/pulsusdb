@@ -266,8 +266,8 @@ mod tests {
         ] {
             assert_eq!(log_label_name(input), stored, "{input:?}");
         }
-        // The two names the extracted-field group key read watches keep
-        // their names, so its presence rule is unchanged.
+        // The two reserved names the lowered reads watch keep their names,
+        // so their presence rules are unchanged.
         assert_eq!(log_label_name("__error__"), "__error__");
         assert_eq!(log_label_name("__error_details__"), "__error_details__");
     }

@@ -1448,14 +1448,15 @@ fn regex_predicate(pattern: &str, positive: bool) -> Result<String, PipelineErro
 }
 
 // ---------------------------------------------------------------------
-// Issue #507: the per-row readers of the extracted-field group key read.
+// Issue #507: the per-row JSON readers; since issue #624 the readers of
+// the lowered `| json` count and of the reduced `| unwrap` statement.
 // ---------------------------------------------------------------------
 //
 // Every `match(` and `countMatches(` below is the database deciding
 // whether a body holds a spelling of a name that OUR flatten maps to that
 // name and `JSONExtractRaw` does not read. A row where one does is
 // UNDECIDED: the statement throws on it and our parser reads the line
-// (docs/query-to-sql.md, the extracted-field group key). The spellings
+// (docs/query-to-sql.md, `| json`). The spellings
 // over-approximate; a wrong guess costs the throw, never an answer.
 
 /// JSON whitespace, and every whitespace escape and character our flatten
@@ -1479,19 +1480,20 @@ const MAX_JSON_NESTING: u32 = 127;
 /// `MAX_JSON_FLATTEN_KEY_BYTES`).
 const JSON_FLATTEN_KEY_BUDGET: u64 = 64 * 1024 * 1024;
 
-/// Which reader columns a fragment names: the unwrapped value's (`uw_`) or
-/// the `i`-th key label's (`l<i>_`).
+/// Which reader columns a fragment names: the `i`-th key label's
+/// (`l<i>_`), or a lowered `| unwrap`'s `x` after a `| json` (`lx_`, issue
+/// #624, part 4b).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReaderColumns {
-    Unwrap,
     Key(usize),
+    X,
 }
 
 impl ReaderColumns {
-    fn prefix(self) -> String {
+    pub(crate) fn prefix(self) -> String {
         match self {
-            ReaderColumns::Unwrap => "uw".to_string(),
             ReaderColumns::Key(i) => format!("l{i}"),
+            ReaderColumns::X => "lx".to_string(),
         }
     }
 }

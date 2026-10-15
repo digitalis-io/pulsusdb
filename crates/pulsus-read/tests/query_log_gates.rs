@@ -3552,8 +3552,6 @@ async fn a_bucketed_statement_that_fails_for_memory_is_answered_by_todays_route(
     let comment = format!("c624-memory-{}", uuid::Uuid::new_v4().simple());
     let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024))
         .with_key_route_test_hooks(pulsus_read::logql::exec::KeyRouteTestHooks {
-            todays_route_group_bytes: None,
-            key_statement_test_knobs: None,
             bucketed_statement_max_memory_bytes: Some(1),
             ..Default::default()
         })
@@ -3776,7 +3774,6 @@ fn hooks_624(
         bucketed_statement_max_memory_bytes: memory,
         agg_caps: caps,
         todays_route_only: todays,
-        ..Default::default()
     }
 }
 
@@ -4838,7 +4835,8 @@ async fn a_row_no_window_holds_neither_fails_nor_counts() {
 }
 
 // ---------------------------------------------------------------------
-// W4 (issue #507): does a single-threaded `sum` accumulate in scan order?
+// History (issue #507, the group key read retired by issue #624, part 4b):
+// does a single-threaded `sum` accumulate in scan order?
 // ---------------------------------------------------------------------
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -4905,8 +4903,8 @@ struct SumRow {
     n: u64,
 }
 
-/// **The claim W4's exact comparison rested on, measured — and it is
-/// false** (issue #507 W4 §6).
+/// **The claim the group key read's exact comparison rested on, measured
+/// — and it is false** (issue #507 §6).
 ///
 /// The claim was: at `max_threads = 1` the database's `sum` accumulates a
 /// single fingerprint's rows in `(service, fingerprint, timestamp_ns)`
@@ -5094,7 +5092,7 @@ async fn the_database_sum_is_not_the_evaluators_order_but_stays_inside_the_bound
     }
     // And the non-vacuity of the sentence above: they DO differ, so the
     // bound is doing work rather than passing on equality. If this ever
-    // stops holding, the database has changed its accumulation and W4's
+    // stops holding, the database has changed its accumulation and the
     // comparison can be tightened — which is good news and should not be
     // discovered by a silent pass.
     assert!(
@@ -5107,7 +5105,8 @@ async fn the_database_sum_is_not_the_evaluators_order_but_stays_inside_the_bound
 }
 
 // ---------------------------------------------------------------------
-// W4 (issue #507): the spread gate and the reproducibility gate.
+// History (issue #507, the group key read retired by issue #624, part 4b):
+// the spread gate and the reproducibility gate.
 // ---------------------------------------------------------------------
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -5130,7 +5129,7 @@ struct DbNameRow {
 /// shown to work, fails on purpose. Each such run would leak one database
 /// for good.
 ///
-/// **Why it refuses without a prefix** (issue #507 W4, review round 5).
+/// **Why it refuses without a prefix** (issue #507, review round 5).
 /// The sweep matches every database whose name starts with `stem`. With
 /// `PULSUS_TEST_CH_DATABASE_PREFIX` unset, `pulsus_testkit::test_db` leaves
 /// the name as written, so the stem is the same in every checkout, and one
@@ -5244,7 +5243,7 @@ fn a_sweep_stem_the_prefix_did_not_compose_is_refused() {
     let _ = leftover_stem(Some("wt3"), "sweep_fixture_stem_");
 }
 
-/// The unwrapped-value corpus both W4 gates read: `n` deterministic values
+/// The unwrapped-value corpus both gates read: `n` deterministic values
 /// of mixed magnitude and sign, one fingerprint, one JSON body each.
 ///
 /// Returns the values in timestamp order. **The caller asserts the row
@@ -5280,13 +5279,13 @@ fn unwrap_rows(fp: u64, t0: i64, values: &[f64]) -> Vec<UnwrapSeedRow> {
 }
 
 /// `2(n−1)·u·Σ|vᵢ|` with `u = 2⁻⁵³` — the most two evaluation orders of the
-/// same `n` values can differ by (issue #507 W4 §5).
+/// same `n` values can differ by (issue #507 §5).
 fn summation_spread_bound(values: &[f64]) -> f64 {
     let sum_abs: f64 = values.iter().map(|v| v.abs()).sum();
     2.0 * ((values.len() as f64) - 1.0) * (f64::EPSILON / 2.0) * sum_abs
 }
 
-/// **The gate that would tell us the ruling was wrong** (issue #507 W4 §6).
+/// **The gate that would tell us the decision was wrong** (issue #507 §6).
 ///
 /// The owner accepted that the database chooses the summation order and may
 /// choose differently between two executions. What that ruling assumes is
@@ -5400,7 +5399,7 @@ async fn the_thread_count_spread_stays_inside_the_summation_bound() {
 }
 
 /// **Repeated executions of the same query on unchanged data agree bit for
-/// bit, at `max_threads = 1` and a fixed part layout** (issue #507 W4 §3).
+/// bit, at `max_threads = 1` and a fixed part layout** (issue #507 §3).
 ///
 /// Its failure means a source of nondeterminism exists that is neither the
 /// thread count nor the part count — which is a thing we would want to know
@@ -5573,12 +5572,11 @@ async fn repeated_executions_agree_bit_for_bit_at_a_fixed_layout() {
 }
 
 // ---------------------------------------------------------------------
-// W4 (issue #507): the unwrapped read, end to end, one case per measured
-// class of parser disagreement.
+// Issue #507 and #624, part 4b: the spread reducers after a parser.
 // ---------------------------------------------------------------------
 
 /// **The spread reducers are lowered after a parser, and answer the
-/// evaluator's value on the high-offset corpus** (issue #507 W4, review
+/// evaluator's value on the high-offset corpus** (issue #507, review
 /// rounds 1 and 3; issue #624, parts 4 and 4b).
 ///
 /// Over `{1e16, 1e16+2, +4, +8, +16}` the plain `stddevPop`/`varPop` answer
@@ -5727,7 +5725,8 @@ async fn the_spread_reducers_are_lowered_and_answer_the_evaluators_value() {
 }
 
 // ---------------------------------------------------------------------
-// Issue #507: the extracted-field group key read, end to end.
+// Issue #507's group key cases, answered since issue #624, part 4b by the
+// reduced statement.
 // ---------------------------------------------------------------------
 
 /// One case of `tests/fixtures/group_key/cases.tsv`: one stream, its rows,
@@ -13758,28 +13757,6 @@ fn fixture_rows_624p4b(text: &str) -> Vec<Vec<String>> {
         .collect()
 }
 
-/// A TSV-escaped field: `\\` is a backslash and `\t` a tab.
-fn tsv_unescape_624p4b(field: &str) -> String {
-    let mut out = String::with_capacity(field.len());
-    let mut chars = field.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
-        match chars.next() {
-            Some('t') => out.push('\t'),
-            Some('\\') => out.push('\\'),
-            Some(other) => {
-                out.push('\\');
-                out.push(other);
-            }
-            None => out.push('\\'),
-        }
-    }
-    out
-}
-
 /// The reduced plan's payload for one of `queries.tsv`'s queries, as §2 of
 /// part 4b's plan admits it: the parser and the key each shape takes.
 fn fixture_value_624p4b(query: &str) -> pulsus_read::logql::sql::ReducedUnwrap {
@@ -13915,9 +13892,10 @@ fn reference_route_624p4b(text: &str) -> Option<String> {
 }
 
 /// **T3 (issue #624, part 4b): the value readers are the reference's
-/// extraction.** `lines.tsv` is loaded into a table; for each of the 21
-/// queries of `queries.tsv`, `reduced_parser_columns` is rendered over it
-/// and `st`, `pu`, `ut`, `v` and the route key are read:
+/// extraction.** `lines.tsv` is loaded into a table by the database's TSV
+/// reader; for each of the 21 queries of `queries.tsv`,
+/// `reduced_parser_columns` is rendered over it and `st`, `pu`, `ut`, `v`
+/// and the route key are read:
 ///
 /// ```text
 /// undecided (st = 2 or pu = 1)   the set of (query, line) pairs equals undecided.tsv
@@ -13968,24 +13946,31 @@ async fn the_value_readers_are_the_references_extraction() {
         &format!("CREATE TABLE {db}.lines (id UInt32, body String) ENGINE = MergeTree ORDER BY id"),
     )
     .await;
-    for chunk in lines.chunks(500) {
-        let values = chunk
-            .iter()
-            .map(|f| {
-                format!(
-                    "({}, {})",
-                    f[0],
-                    literal(&tsv_unescape_624p4b(&f[2])).as_sql()
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
+    // The database's own TSV reader loads the lines, as the plan's
+    // measurement loaded them.
+    let raw = unwrap_parsers_fixture_624p4b("lines.tsv");
+    let rows: Vec<&str> = raw
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.is_empty())
+        .collect();
+    for chunk in rows.chunks(500) {
+        let text = format!("{}\n", chunk.join("\n"));
         exec_624(
             &admin,
-            &format!("INSERT INTO {db}.lines (id, body) VALUES {values}").replace('?', "??"),
+            &format!(
+                "INSERT INTO {db}.lines (id, body) SELECT id, body FROM \
+                 format(TabSeparated, 'id UInt32, corpus String, body String', {})",
+                literal(&text).as_sql()
+            )
+            .replace('?', "??"),
         )
         .await;
     }
+    assert_eq!(
+        count_624p4(&admin, &format!("SELECT count() AS n FROM {db}.lines")).await,
+        2_900,
+        "the lines are loaded"
+    );
 
     let logfmt =
         pulsus_read::logql::CompiledPipeline::compile(&match parse(r#"{app="a"} | logfmt"#)
@@ -14101,7 +14086,9 @@ async fn the_value_readers_are_the_references_extraction() {
 /// (`service_name="c624p4bj"`) write JSON lines, 10-19 (`c624p4bl`) logfmt
 /// lines `request_id=… status=… route=… latency=…`. `latency` is an
 /// integer (a JSON number), a decimal, a duration, a byte size or an
-/// integer text by turns; `route` is one of four, so two streams meet at
+/// integer text by turns, each one the three conversions decide (a
+/// compound duration such as `1m30s` is undecided under `bytes(x)`, part
+/// 4's grammar, and would send every `bytes` query to today's route); `route` is one of four, so two streams meet at
 /// one nanosecond with one route (a cross-stream tie). Every 37th second a
 /// stream has a second line at the same nanosecond with another `latency`
 /// and the same `route` (a same-stream tie). The JSON lines also carry
@@ -14151,7 +14138,7 @@ async fn seed_parser_corpus_624p4b() -> (ChClient, String, i64) {
                                kind = 1, concat(toString({k} % 50 + 1), '.', toString({k} % 9 + 1)), \
                                kind = 2, multiIf({k} % 3 = 0, concat(toString({k} % 900 + 1), 'ms'), \
                                                  {k} % 3 = 1, concat(toString({k} % 50 + 1), '.5s'), \
-                                                 concat(toString({k} % 5 + 1), 'm', toString({k} % 60), 's')), \
+                                                 concat(toString({k} % 5 + 1), 'm')), \
                                kind = 3, multiIf({k} % 3 = 0, concat(toString({k} % 900 + 1), 'KB'), \
                                                  {k} % 3 = 1, concat(toString({k} % 50 + 1), 'MiB'), \
                                                  concat(toString({k} % 10000 + 1), 'b')), \
@@ -14655,7 +14642,12 @@ async fn undecided_parser_rows_answer_on_todays_route() {
         }
     }
     // (query, expected statements of the lowered run, the answer when pinned)
-    let cases: [(&str, &[(&str, Option<i32>)], Option<InstantAnswer624p4>); 6] = [
+    type Case<'a> = (
+        &'a str,
+        &'a [(&'a str, Option<i32>)],
+        Option<InstantAnswer624p4>,
+    );
+    let cases: [Case<'_>; 6] = [
         (
             r#"sum by (route) (sum_over_time({service_name="c624p4bt7a"} | json | unwrap x [60s]))"#,
             &[("reduced", Some(395)), ("today", None)],
@@ -14719,7 +14711,7 @@ async fn undecided_parser_rows_answer_on_todays_route() {
     drop_db_624(&admin, &db).await;
 }
 
-/// **T9 (issue #624, part 4b): #507's W4 statement is gone.** For each of
+/// **T9 (issue #624, part 4b): #507's group key statement is gone.** For each of
 /// its five shapes, the statement EXPLAIN reports is the reduced statement
 /// or today's read, and no statement reads `uw_r`.
 #[tokio::test]
@@ -14783,7 +14775,7 @@ async fn the_w4_statement_is_gone() {
         for sql in &reads {
             assert!(
                 !sql.contains("uw_r"),
-                "{q}: the W4 statement is reported:\n{sql}"
+                "{q}: the group key statement is reported:\n{sql}"
             );
         }
         let last = reads[reads.len() - 1];
