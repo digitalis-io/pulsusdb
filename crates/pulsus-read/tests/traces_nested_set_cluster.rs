@@ -491,6 +491,57 @@ async fn a_numbered_search_answers_over_two_shards() {
             wrong.push(format!("{query}\n  want: {want}\n  got:  {got}"));
         }
     }
+    // Issue #594 part 5: the seven in a metrics filter, one statement over
+    // the distributed tables, instant over the minute holding the traces.
+    let tables = pulsus_read::StatementTables {
+        spans: "spans_dist",
+        resources: "resources",
+        traces: "traces_dist",
+        indexed: &[],
+    };
+    for (query, value) in [
+        ("{ nestedSetLeft > 0 } | count_over_time()", 60.0),
+        ("{ nestedSetParent = 0 } | count_over_time()", 20.0),
+        ("{ span:childCount = 1 } | count_over_time()", 40.0),
+        ("{ trace:duration > 100ms } | count_over_time()", 80.0),
+    ] {
+        let routed = pulsus_read::plan_trace_metrics_routed(
+            &pulsus_traceql::parse(query).expect("parses"),
+            &pulsus_read::MetricsParams {
+                start_ns: window.0,
+                end_ns: window.1,
+                step_ms: 60_000,
+                exemplars: None,
+            },
+            &engine.metrics_ctx(),
+            &tables,
+        );
+        let routed = match routed {
+            Ok(r) if r.statement().is_some() => r,
+            Ok(_) => {
+                wrong.push(format!("{query}: no statement"));
+                continue;
+            }
+            Err(e) => {
+                wrong.push(format!("{query}: refused: {e}"));
+                continue;
+            }
+        };
+        let want = format!("[{value:?}]");
+        let got = match engine.metrics_instant_routed(&routed).await {
+            Ok(out) => format!(
+                "{:?}",
+                out.series
+                    .iter()
+                    .flat_map(|s| s.samples.iter().map(|(_, v)| *v))
+                    .collect::<Vec<f64>>()
+            ),
+            Err(e) => format!("Err({e})"),
+        };
+        if got != want {
+            wrong.push(format!("{query}\n  want: {want}\n  got:  {got}"));
+        }
+    }
     exec(
         &bootstrap,
         &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),

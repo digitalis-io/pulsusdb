@@ -4954,10 +4954,10 @@ async fn t_a15_the_metrics_rows_answer() {
     assert_eq!(routes, vec!["/cart", "/health", "nil"]);
 }
 
-/// A trace-level field in a metrics filter stays `400` until #594 part 5.
-/// **guard**.
+/// `T-A15`: the seven trace-level and nested-set fields in a metrics
+/// filter answer (#594 part 5). **guard**.
 #[tokio::test(flavor = "multi_thread")]
-async fn the_seven_in_a_filter_still_refuse() {
+async fn t_a15_the_seven_in_a_filter_answer() {
     if !should_run() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
@@ -4969,15 +4969,24 @@ async fn the_seven_in_a_filter_still_refuse() {
     .await;
     let _server = spawn_ready(port, &db);
     let base = metrics_base_ns();
+    push_fixture_61(port, base);
     for q in [
         "{ trace:duration > 1s } | rate()",
         "{ duration > trace:duration / 2 } | rate()",
+        "{ nestedSetLeft > 0 } | rate()",
+        "{ nestedSetParent = 1 } | rate()",
+        "{ span:childCount > 1 } | rate()",
     ] {
         let res = metrics_range_q(port, q, base, q);
         assert_eq!(
             res.status,
-            400,
+            200,
             "{q}: {}",
+            String::from_utf8_lossy(&res.body)
+        );
+        assert!(
+            res.json(q)["series"].is_array(),
+            "{q}: a series array, got {}",
             String::from_utf8_lossy(&res.body)
         );
     }

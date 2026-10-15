@@ -86,6 +86,7 @@ replaces one.
 | [31](#31-a-logfmt-value-holding-a-replacement-character-is-changed-to-hold-a-space) | Loki | queries | C | A logfmt value holding U+FFFD comes back with a space in its place. |
 | [32](#32-a-grouped-avg_over_time-fails-on-a-line-its-own-ungrouped-form-ignores) | Loki | queries | A | `avg_over_time … by (a)` fails on a line that is not JSON, where the same average without `by` and the grouped sum ignore it. |
 | [33](#33-rate_counter-reads-nanoseconds-as-milliseconds) | log reference | queries | A | `rate_counter` over a counter that rose by 60 in a one-minute window answers 1.000006 per second instead of 2. |
+| [34](#34-spanchildcount-is-accepted-and-answers-nothing) | trace reference | queries | A, D | A query on a span's child count answers "nothing matched", in every position. |
 
 ---
 
@@ -2108,6 +2109,35 @@ Ledger row `rate-counter-window-anchored`, which names the corpus rows and
 the four end-to-end cases that carry it. Pinned by
 `crates/pulsus-read/tests/logql_metric_agg_golden.rs`'s `rate_counter`
 tests.
+
+---
+
+## 34. `span:childCount` is accepted and answers nothing
+
+**The trace reference · queries · tests A, D**
+
+### What the reference does
+
+Its grammar accepts `span:childCount`. Its default block format (`tempodb/encoding/versioned.go:98-100`) refuses any
+condition on it as unsupported (`tempodb/encoding/vparquet4/block_traceql.go:1103-1105`), and a search skips a block
+that answers unsupported (`modules/livestore/instance_search.go:257-259`). Measured: `{ span:childCount > 0 }`
+returns no spans; `{} | count_over_time() by(span:childCount)` and `avg_over_time(span:childCount)` answer no series.
+
+### Why that is wrong rather than different
+
+Its next block format stores the count and serves the same condition (`tempodb/encoding/vparquet5/block_traceql.go:1073`):
+two of its own paths answer one query differently (**A**). A query naming a field the language defines answers "nothing
+matched" with no error (**D**).
+
+### What PulsusDB does
+
+A span's direct children, `0` for a leaf, those outside the window counted — in a search filter, a metrics filter, a
+`by()` key and a target.
+
+### Evidence
+
+Ledger rows `traceql-matched-span-multi-field-leaf-not-projected` and `traceql-metrics-child-count-counted`. Pinned by
+`child_counts_are_direct_children` and `the_seven_filter_metrics` in `crates/pulsus-read/tests/traces_query_v2_live.rs`.
 
 ---
 

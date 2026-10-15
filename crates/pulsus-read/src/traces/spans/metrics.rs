@@ -40,6 +40,7 @@ use crate::traces::window_sql::WindowSql;
 use super::attr_index::{IndexedAttr, index_hints};
 use super::numbering::numbering_sql;
 use super::predicate::{PredicateCtx, attr_path, compile_span_predicate_in, resource_value_in};
+use super::tracelevel::{TraceLeaf, per_trace_sql, trace_values_sql};
 
 /// The `throwIf` message of the series cap. The engine turns a `Code: 395`
 /// carrying it into the series cap's `422`.
@@ -300,9 +301,7 @@ pub fn metrics_statement(
 }
 
 /// The statement for the shell `plan` and what the query asked; `None`
-/// when the plan is `compare()`, or the body does not compile to a
-/// predicate over the span row alone — a trace-level leaf or value, a child
-/// count, a numbered leaf or a `!` demand.
+/// when the plan is `compare()` or the body holds a `!` demand.
 fn statement_for(
     plan: &TraceMetricsPlan,
     asked: &Asked,
@@ -331,26 +330,42 @@ fn fills(plan: &TraceMetricsPlan) -> bool {
     Shape::of(plan, plan.group_label().is_some()).is_some_and(|s| s.fill)
 }
 
-/// The filter body compiled for `window`, behind its index hints; `true`
-/// for `{}`.
-fn predicate(body: Option<&FieldExpr>, ctx: &PredicateCtx<'_>) -> Option<String> {
+/// The filter body compiled for `ctx`'s window, behind its index hints,
+/// and the `WITH` binding what it reads beside the span row (#594 part 5):
+/// the search statement's per-trace scalar, operand pairs and numbered
+/// traces over that window, or nothing. `("true", "")` for `{}`; `None`
+/// for a `!` demand.
+fn predicate(
+    body: Option<&FieldExpr>,
+    ctx: &PredicateCtx<'_>,
+    traces: &str,
+) -> Option<(String, String)> {
     let Some(body) = body else {
-        return Some("true".to_string());
+        return Some(("true".to_string(), String::new()));
     };
     let p = compile_span_predicate_in(body, ctx).ok()?;
-    if !p.demand_messages().is_empty()
-        || !p.trace_leaves().is_empty()
-        || !p.trace_values().is_empty()
-        || p.reads_child_counts()
-        || p.reads_numbering()
-    {
+    if !p.demand_messages().is_empty() {
         return None;
     }
-    Some(
+    let w = ctx.window;
+    let leaves: Vec<&TraceLeaf> = p.trace_leaves().iter().collect();
+    let mut bound = per_trace_sql(&leaves, p.reads_child_counts(), w, traces);
+    bound.push_str(&trace_values_sql(p.trace_values(), w, w, traces));
+    if p.reads_numbering() {
+        bound.push_str(&format!("{} AS nested_keys", trace_keys(traces, w)));
+    }
+    let bound = bound.trim_end().trim_end_matches(',');
+    let with = if bound.is_empty() {
+        String::new()
+    } else {
+        format!("WITH {bound} ")
+    };
+    Some((
         p.with_hints(&index_hints(body, ctx.indexed))
             .sql()
             .to_string(),
-    )
+        with,
+    ))
 }
 
 /// A key's label name: the reference's spelling (part 2's D3).
@@ -369,11 +384,12 @@ struct Joins {
     children: bool,
 }
 
-/// What the statement reads over one window: the `FROM` clause, its joins
-/// and the window's three bounds, the predicate and the target's
-/// condition; the key array `g`; the target's `X` (a double) and `I` (an
-/// integer).
+/// What the statement reads over one window: the `WITH` the predicate
+/// binds; the `FROM` clause, its joins and the window's three bounds, the
+/// predicate and the target's condition; the key array `g`; the target's
+/// `X` (a double) and `I` (an integer).
 struct Read {
+    with: String,
     from: String,
     g: String,
     x: Option<String>,
@@ -394,7 +410,7 @@ impl Read {
             resources_table: tables.resources,
             indexed: tables.indexed,
         };
-        let predicate = predicate(body, &ctx)?;
+        let (predicate, with) = predicate(body, &ctx, tables.traces)?;
         let mut joins = Joins::default();
         let mut texts = Vec::with_capacity(asked.keys.len());
         for key in &asked.keys {
@@ -442,6 +458,7 @@ impl Read {
             _ => String::new(),
         };
         Some(Read {
+            with,
             from: from_clause(tables, joins, window, &predicate, &condition),
             g,
             x,
@@ -862,15 +879,17 @@ fn range_sql(plan: &TraceMetricsPlan, shape: &Shape, read: &Read, max_series: u6
             "SELECT g, toUInt64(qi) AS o, p, q AS v,\n       \
              if(qi = indexOf(arrayMap(x -> abs(x - x0.3{scale}), qq), \
              arrayMin(arrayMap(x -> abs(x - x0.3{scale}), qq))), x0, {EX0}) AS ex\n\
-             FROM (SELECT {g} AS g, {bucket} AS p,\n             {levels} AS qq,\n             \
+             FROM ({with}SELECT {g} AS g, {bucket} AS p,\n             {levels} AS qq,\n             \
              {ex} AS x0\n      {indented}\n      GROUP BY {by})\n\
              ARRAY JOIN qq AS q, arrayEnumerate(qq) AS qi",
+            with = read.with,
             levels = shape.levels(plan, read)
         )
     } else {
         let ex = if budget > 0 { LONGEST } else { EX0 };
         format!(
-            "SELECT {g} AS g, {o} AS o, {bucket} AS p, {v} AS v, {ex} AS ex\n{from}\nGROUP BY {by}",
+            "{with}SELECT {g} AS g, {o} AS o, {bucket} AS p, {v} AS v, {ex} AS ex\n{from}\nGROUP BY {by}",
+            with = read.with,
             o = shape.order(read),
             v = shape.value(read, plan.step_seconds()),
             by = if shape.many { "g, o, p" } else { "p" }
@@ -981,8 +1000,9 @@ fn instant_sql(plan: &TraceMetricsPlan, shape: &Shape, read: &Read, max_series: 
             "\nHAVING count() > 0"
         };
         format!(
-            "SELECT g, toUInt64(qi) AS o, q AS v FROM (SELECT {g} AS g, {levels} AS qq\n\
+            "SELECT g, toUInt64(qi) AS o, q AS v FROM ({with}SELECT {g} AS g, {levels} AS qq\n\
              {from}{tail})\nARRAY JOIN qq AS q, arrayEnumerate(qq) AS qi",
+            with = read.with,
             levels = shape.levels(plan, read)
         )
     } else {
@@ -994,7 +1014,8 @@ fn instant_sql(plan: &TraceMetricsPlan, shape: &Shape, read: &Read, max_series: 
             ""
         };
         format!(
-            "SELECT {g} AS g, {o} AS o, {v} AS v\n{from}{tail}",
+            "{with}SELECT {g} AS g, {o} AS o, {v} AS v\n{from}{tail}",
+            with = read.with,
             o = shape.order(read),
             v = shape.value(read, plan.window_seconds())
         )
@@ -1096,27 +1117,45 @@ mod tests {
         }
     }
 
-    /// D1: the seven trace-level and nested-set fields, a child count and
-    /// a `!` demand keep today's answer; a numbered comparison today's
-    /// planner serves keeps today's plan, with no statement.
+    /// #594 part 5 (D1, D2): the seven trace-level and nested-set fields
+    /// take the statement, which binds what each reads — the per-trace
+    /// scalar for a trace leaf or a child count, the operand's pairs, the
+    /// numbered traces — in both forms; a `!` demand keeps today's answer.
     #[test]
-    fn the_seven_and_demands_keep_todays_answer() {
-        for q in [
-            "{ trace:duration > 1s } | rate()",
-            "{ duration > trace:duration / 2 } | rate()",
-            "{ nestedSetLeft > 0 } | rate()",
-            "{ span:childCount > 1 } | rate()",
-            "{ !span.a } | rate()",
+    fn the_seven_take_the_statement() {
+        for (q, binding) in [
+            ("{ trace:duration > 1s } | rate()", "AS per_trace"),
+            ("{ rootServiceName = \"a\" } | rate()", "AS per_trace"),
+            ("{ trace:rootName = \"a\" } | rate()", "AS per_trace"),
+            (
+                "{ duration > trace:duration / 2 } | rate()",
+                "AS tv_duration",
+            ),
+            ("{ span:childCount > 1 } | rate()", "AS per_trace"),
+            ("{ nestedSetLeft > 0 } | rate()", "AS nested_keys"),
+            ("{ nestedSetRight < 100 } | rate()", "AS nested_keys"),
+            ("{ nestedSetParent >= 1 } | rate()", "AS nested_keys"),
+            ("{ nestedSetParent != -1 } | rate()", "AS nested_keys"),
+            (
+                "{ nestedSetRight - nestedSetLeft = 1 } | rate()",
+                "AS nested_keys",
+            ),
         ] {
-            let want = today(q, &PARAMS).expect_err("today's planner refuses it");
-            match routed(q, &PARAMS) {
-                Err(got) => assert_eq!(got, want, "{q}"),
-                Ok(r) => panic!("{q}: routed accepted it, statement {:?}", r.statement()),
+            let r = routed(q, &PARAMS).unwrap_or_else(|e| panic!("{q}: routed refused: {e}"));
+            let s = r.statement().unwrap_or_else(|| panic!("{q}: no statement"));
+            for (form, sql) in [("range", s.range_sql()), ("instant", s.instant_sql())] {
+                assert!(
+                    sql.contains(binding),
+                    "{q}: the {form} form lacks {binding}"
+                );
             }
         }
-        let q = "{ nestedSetParent >= 1 } | rate()";
-        let r = routed(q, &PARAMS).unwrap_or_else(|e| panic!("{q}: routed refused: {e}"));
-        assert!(r.statement().is_none(), "{q}: a statement");
+        let q = "{ !span.a } | rate()";
+        let want = today(q, &PARAMS).expect_err("today's planner refuses it");
+        match routed(q, &PARAMS) {
+            Err(got) => assert_eq!(got, want, "{q}"),
+            Ok(r) => panic!("{q}: routed accepted it, statement {:?}", r.statement()),
+        }
     }
 
     /// D1: `compare()` stays on today's planner, and so does an intrinsic

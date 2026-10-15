@@ -41,7 +41,10 @@ rewrite docs/schemas.md:33-33
 # Issue #624 part 4b adds #398, carried: the matcher paragraph already cited it
 # for the per-query memory ceiling, and its clause on the retired group key
 # read was rewritten, so the rule reads the line as added.
-rewrite docs/schemas.md:174-174 refs=#25,#559,#560,#603,#16,#171,#498,#2,#57,#584,#586,#587,#5,#63,#75,#478,#555,#26,#623,#125,#315,#472,#549,#7,#579,#635,#500,#172,#183,#593,#235,#3,#450,#624,#412,#596,#59,#173,#182,#185,#189,#192,#252,#398
+# Issue #594 part 5 adds #594, its own issue, where the metrics section's
+# bounded-state and value-aggregations bullets say what a filter on the
+# seven fields binds and that its sets carry no set limit.
+rewrite docs/schemas.md:174-174 refs=#25,#559,#560,#603,#16,#171,#498,#2,#57,#584,#586,#587,#5,#63,#75,#478,#555,#26,#623,#125,#315,#472,#549,#7,#579,#635,#500,#172,#183,#593,#235,#3,#450,#624,#412,#596,#59,#173,#182,#185,#189,#192,#252,#398,#594
 # `refs=#112` is a NEW reference on this file rather than a carried one. §2.4's
 # writer-contract paragraph gained the reason the read path does not route on
 # `metric_series.value_type`, and that reason is the decision A1's plan v5
@@ -76,7 +79,10 @@ rewrite docs/schemas.md:691-692 refs=#556
 # Issue #624 part 4b adds #507, carried: the compilers paragraph already cited
 # it ("owner decision, #507") and its last clause was rewritten when the group
 # key read it named was retired, so the rule reads the line as added.
-rewrite docs/architecture.md:378-378 refs=#560,#549,#579,#635,#544,#624,#596,#507
+# Issue #594 part 5 adds #594, its own issue, where the same paragraph says
+# a filter on a trace-level field, a child count or the numbering takes
+# that statement.
+rewrite docs/architecture.md:378-378 refs=#560,#549,#579,#635,#544,#624,#596,#507,#594
 rewrite docs/116.md:64-64
 rewrite docs/116.md:75-75
 rewrite crates/pulsus-clickhouse/src/client.rs:156-164 refs=#560

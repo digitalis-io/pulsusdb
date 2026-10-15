@@ -1,5 +1,5 @@
 {
-  "DIVERGENCE_COUNT": 9,
+  "DIVERGENCE_COUNT": 2,
   "capture": {
     "reference_image": "grafana/tempo@sha256:aa8df8d069f77b82e978464daf55169bb8d135852ad58700aa96880653c3d8f7",
     "reference_config": "ci/tempo/tempo-compare.yaml (unmodified)",
@@ -66,15 +66,15 @@
     {
       "query": "{ nestedSetParent != -1 } | rate()",
       "ours": {
-        "verdict": "reject",
-        "body": "type mismatch: field-vs-field and arithmetic comparisons are not supported in metrics filters"
+        "verdict": "accept",
+        "body": null
       },
       "reference": {
         "verdict": "accept",
         "body": null
       },
-      "divergence": "metrics-filter-field-vs-field-and-arithmetic",
-      "why": "same operand shape as the row above"
+      "divergence": null,
+      "why": "served by the metrics statement, which binds the search statement's per-trace values and numbering (issue #594 part 5)"
     },
     {
       "query": "{ nestedSetParent >= 1 } | rate()",
@@ -118,67 +118,67 @@
     {
       "query": "{ nestedSetParent < 2 } | rate()",
       "ours": {
-        "verdict": "reject",
-        "body": "type mismatch: nestedSetParent comparisons inside the numbering range are not supported in metrics filters"
+        "verdict": "accept",
+        "body": null
       },
       "reference": {
         "verdict": "accept",
         "body": null
       },
-      "divergence": "metrics-filter-nested-set-numbering-range",
-      "why": "looks decidable and is not \u2014 a span whose parent is the root carries 1 (true) while one two levels down carries 2 (false); the reference answers it because it STORES the number"
+      "divergence": null,
+      "why": "served by the metrics statement, which binds the search statement's per-trace values and numbering (issue #594 part 5)"
     },
     {
       "query": "{ nestedSetParent = 5 } | rate()",
       "ours": {
-        "verdict": "reject",
-        "body": "type mismatch: nestedSetParent comparisons inside the numbering range are not supported in metrics filters"
+        "verdict": "accept",
+        "body": null
       },
       "reference": {
         "verdict": "accept",
         "body": null
       },
-      "divergence": "metrics-filter-nested-set-numbering-range",
-      "why": "well inside the refusing region"
+      "divergence": null,
+      "why": "served by the metrics statement, which binds the search statement's per-trace values and numbering (issue #594 part 5)"
     },
     {
       "query": "{ nestedSetLeft > 1 } | rate()",
       "ours": {
-        "verdict": "reject",
-        "body": "type mismatch: nestedSetLeft and nestedSetRight are not supported in metrics filters"
+        "verdict": "accept",
+        "body": null
       },
       "reference": {
         "verdict": "accept",
         "body": null
       },
-      "divergence": "metrics-filter-nested-set-left-right",
-      "why": "the Euler numbering is a per-trace tree walk with no SQL form"
+      "divergence": null,
+      "why": "served by the metrics statement, which binds the search statement's per-trace values and numbering (issue #594 part 5)"
     },
     {
       "query": "{ nestedSetLeft > 0 } | rate()",
       "ours": {
-        "verdict": "reject",
-        "body": "type mismatch: nestedSetLeft and nestedSetRight are not supported in metrics filters"
+        "verdict": "accept",
+        "body": null
       },
       "reference": {
         "verdict": "accept",
         "body": null
       },
-      "divergence": "metrics-filter-nested-set-left-right",
-      "why": "the adversarial spelling: with the field guard deleted this one PLANS (and answers wrongly, dropping every root) instead of erroring, which > 1 and < 100 do not"
+      "divergence": null,
+      "why": "served by the metrics statement, which binds the search statement's per-trace values and numbering (issue #594 part 5)"
     },
     {
       "query": "{ nestedSetRight < 100 } | rate()",
       "ours": {
-        "verdict": "reject",
-        "body": "type mismatch: nestedSetLeft and nestedSetRight are not supported in metrics filters"
+        "verdict": "accept",
+        "body": null
       },
       "reference": {
         "verdict": "accept",
         "body": null
       },
-      "divergence": "metrics-filter-nested-set-left-right",
-      "why": "same class, the other field"
+      "divergence": null,
+      "why": "served by the metrics statement, which binds the search statement's per-trace values and numbering (issue #594 part 5)"
     },
     {
       "query": "{ .flag } | count_over_time()",
@@ -287,15 +287,15 @@
     {
       "query": "{ trace:duration > 1s } | rate()",
       "ours": {
-        "verdict": "reject",
-        "body": "type mismatch: trace-level intrinsics are not supported in metrics filters"
+        "verdict": "accept",
+        "body": null
       },
       "reference": {
         "verdict": "accept",
         "body": null
       },
-      "divergence": "metrics-filter-trace-level-intrinsics",
-      "why": "needs a trace-wide GROUP BY ... HAVING semi-join matching search_sql's root selection \u2014 wave 2"
+      "divergence": null,
+      "why": "served by the metrics statement, which binds the search statement's per-trace values and numbering (issue #594 part 5)"
     },
     {
       "query": "{ .a = nil } | rate()",

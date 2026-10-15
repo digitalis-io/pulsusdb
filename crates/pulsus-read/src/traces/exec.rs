@@ -203,15 +203,15 @@ const CODE_MEMORY_LIMIT_EXCEEDED: i32 = 241;
 /// `(trace_id, span_id) [NOT] IN (SELECT … FROM trace_attrs_idx …)` and
 /// this code was that set overflowing; measured, 524,288 matching spans
 /// answered and 524,289 did not. The filter is now a predicate over the
-/// span row's own arrays and builds no set, so a metrics query with an
-/// attribute condition cannot raise this any more — its binding limit is
+/// span row's own arrays, so a metrics query with an attribute condition
+/// cannot raise this any more — its binding limit is
 /// `max_rows_to_read = reader.traceql_scan_budget_rows`, code 158.
 ///
-/// The one read that still builds an `IN` set under these settings is the
-/// NARROWED tag-values read (`tags_sql::attr_values_narrowed_sql`), which
-/// keeps the any-element rule deliberately; it is what
-/// `traces_tags_live`'s narrowed-values budget test exercises. The
-/// constant, the mapping and the 422 wording are unchanged.
+/// The metrics statement builds sets only for the seven fields (#594 part
+/// 5) without set limits ([`statement_settings`]); the set limits bind the
+/// previous planner's reads and the NARROWED tag-values read
+/// (`tags_sql::attr_values_narrowed_sql`, any-element rule deliberately,
+/// `traces_tags_live`'s budget test). Constant, mapping, 422 unchanged.
 const CODE_SET_SIZE_LIMIT_EXCEEDED: i32 = 191;
 
 /// The IN-set row budget (`max_rows_in_set`, throw) carried by every read
@@ -221,10 +221,10 @@ const CODE_SET_SIZE_LIMIT_EXCEEDED: i32 = 191;
 /// than an unbounded in-memory set. Documented constant
 /// (docs/schemas.md §4.2; promoted to config only on evidence).
 ///
-/// **Since issue #559 the metrics FILTER builds no such set** — it reads
-/// the span row's attribute arrays — so this bounds the narrowed
-/// tag-values read's `IN` set and nothing on the metrics filter path. The
-/// value does not move; the sentence naming the semi-join did.
+/// **The metrics statement builds sets only for the seven fields (#594
+/// part 5), without set limits** ([`statement_settings`]); this bounds the
+/// previous planner's reads and the narrowed tag-values read's `IN` set.
+/// The value does not move; the sentence naming the semi-join did.
 pub const TRACE_METRICS_MAX_SET_ROWS: u64 = 1_000_000;
 
 /// The metrics IN-set byte budget (`max_bytes_in_set`, throw) — the byte
@@ -3488,20 +3488,20 @@ fn fetch_route_and_second(
 /// IN-set limits (`max_rows_in_set`/`max_bytes_in_set`, throw → code 191
 /// → 422 via the dedicated [`TooBroadReason::TraceMetricsSetRows`]).
 ///
-/// **Which reads those set limits still bind, after issue #559.** The
-/// metrics FILTER no longer builds an `IN` set — an attribute condition
-/// is a predicate over the span row's arrays — so on that path the
-/// binding limit is `max_rows_to_read`. The set limits still bind the
-/// narrowed tag-values read, which carries these same settings and keeps
-/// its own `(trace_id, span_id) IN (…)`.
+/// **Which reads those set limits still bind.** The metrics statement
+/// builds sets only for the seven trace-level and nested-set fields (issue
+/// #594 part 5) and runs without set limits ([`statement_settings`]); the
+/// set limits bind the previous planner's reads and the narrowed
+/// tag-values read, which carries these same settings and keeps its own
+/// `(trace_id, span_id) IN (…)`.
 ///
 /// Clustered mode additionally injects `distributed_product_mode='local'`,
 /// which rewrites an `IN (SELECT … FROM <table>_dist …)` to the **local**
 /// shard table — co-sharding on `cityHash64(trace_id)` makes each shard's
 /// answer exact and kills the `_dist`-inside-`_dist` double-distributed
-/// path. After issue #559 the readers that depend on it are `compare()`'s
-/// attribute enumeration and the narrowed tag-values read; the metrics
-/// filter no longer does. (Honesty note: the time-bucket `GROUP BY`
+/// path. Its readers are `compare()`'s attribute enumeration, the narrowed
+/// tag-values read and the metrics statement's sets (#594 part 5, through
+/// [`statement_settings`]). (Honesty note: the time-bucket `GROUP BY`
 /// itself is *not* shard-local — buckets exist on every shard; the
 /// coordinator merges per-bucket partial states, bounded by the point
 /// cap × shards. Scale evidence routes to #25.)
@@ -3546,6 +3546,16 @@ fn metrics_settings(config: &TraceReadConfig) -> QuerySettings {
     } else {
         base
     }
+}
+
+/// The settings the metrics statement runs under (issue #594 part 5):
+/// [`metrics_settings`] with `final = 1` and no set limit. The statement
+/// builds the sets of the seven trace-level and nested-set fields, bounded
+/// by the read memory ceiling and the scan budget, not by a set limit.
+fn statement_settings(config: &TraceReadConfig) -> QuerySettings {
+    with_final(metrics_settings(config))
+        .set("max_rows_in_set", 0u64)
+        .set("max_bytes_in_set", 0u64)
 }
 
 /// The Layer-1 settings the §4.5 service-graph query carries (issue #173):
@@ -5117,6 +5127,28 @@ mod tests {
         assert!(clustered.contains("local"));
     }
 
+    /// Issue #594 part 5 (D3): the metrics statement builds the sets of
+    /// the seven fields under the read memory ceiling, with no set limit;
+    /// clustered, it keeps the local product mode the sets need.
+    #[test]
+    fn the_statement_builds_sets_under_the_memory_ceiling() {
+        let s = statement_settings(&cfg());
+        assert_eq!(s.get("max_rows_in_set"), Some("0"));
+        assert_eq!(s.get("max_bytes_in_set"), Some("0"));
+        assert_eq!(s.get("final"), Some("1"));
+        assert_eq!(
+            s.get("max_memory_usage"),
+            Some(TEST_READ_MEM.to_string().as_str())
+        );
+        assert_eq!(s.get("distributed_product_mode"), None);
+        let mut clustered = cfg();
+        clustered.distributed = true;
+        assert_eq!(
+            statement_settings(&clustered).get("distributed_product_mode"),
+            Some("local")
+        );
+    }
+
     /// Issue #173: `graph_settings` carries the search row/byte budget and
     /// gates `distributed_product_mode='local'` on clustered mode only (so
     /// the `pair_id` join runs shard-local), and never carries the metrics
@@ -5218,6 +5250,7 @@ mod tests {
                 // `fetch_by_id`'s settings object, by construction.
                 ("fetch_by_id (point read)", catalog_settings(&c)),
                 ("metrics_settings", metrics_settings(&c)),
+                ("statement_settings", statement_settings(&c)),
                 ("graph_settings", graph_settings(&c)),
             ] {
                 assert_eq!(

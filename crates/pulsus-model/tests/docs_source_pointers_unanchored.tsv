@@ -148,8 +148,6 @@ docs/api.md	storage/remote/client.go:274	pinned_to_another_version
 docs/api.md	storage/remote/client.go:321-324	pinned_to_another_version
 docs/api.md	syntax/parse.go:102	not_in_this_repository
 docs/api.md	syntax/parse.go:93	not_in_this_repository
-docs/api.md	tempodb/encoding/vparquet4/nested_set_model.go:11-12	pinned_to_another_version
-docs/api.md	tempodb/encoding/vparquet4/nested_set_model.go:57	pinned_to_another_version
 docs/api.md	validator.go:164-167	not_in_this_repository
 docs/api.md	vendor/github.com/grafana/regexp/syntax/parse.go:1261-1272	pinned_to_another_version
 docs/api.md	vendor/github.com/grafana/regexp/syntax/parse.go:1736-1825	pinned_to_another_version
@@ -934,6 +932,7 @@ docs/reference-defects-we-do-not-copy.md	docs/sources/query/log_queries/_index.m
 docs/reference-defects-we-do-not-copy.md	metrics_to_prw.go:217	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	metrics_to_prw.go:218-233	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	metrics_to_prw.go:235-239	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	modules/livestore/instance_search.go:257-259	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	parser.go:521	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/loghttp/params.go:38-46	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/logql/engine.go:489	not_in_this_repository
@@ -964,8 +963,11 @@ docs/reference-defects-we-do-not-copy.md	pkg/traceql/ast_execute.go:14-55	not_in
 docs/reference-defects-we-do-not-copy.md	pkg/traceql/ast_execute.go:553-627	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/traceql/ast_execute.go:741	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/traceql/engine.go:98-129	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	tempodb/encoding/versioned.go:98-100	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	tempodb/encoding/vparquet4/block_traceql.go:1103-1105	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	tempodb/encoding/vparquet4/block_traceql.go:128-152	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	tempodb/encoding/vparquet4/block_traceql.go:228-246	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	tempodb/encoding/vparquet5/block_traceql.go:1073	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	vendor/github.com/dustin/go-humanize/bytes.go:68-91	pinned_to_another_version
 docs/reference-defects-we-do-not-copy.md	vendor/github.com/grafana/jsonparser/parser.go:1086-1093	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	vendor/github.com/grafana/jsonparser/parser.go:1108-1112	not_in_this_repository

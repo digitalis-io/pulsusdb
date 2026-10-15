@@ -44,6 +44,7 @@ modules/frontend/metrics_query_range_handler.go
 modules/frontend/pipeline/async_query_validator_middleware.go
 modules/frontend/pipeline/responses.go
 modules/frontend/util.go
+modules/livestore/instance_search.go
 modules/querier/http.go
 multi_file_index.go
 number_data_points.go
@@ -140,7 +141,9 @@ storage/remote/write_handler.go
 storage/remote/write_otlp_handler.go
 syntax/extractor.go
 syntax/parse.go
+tempodb/encoding/versioned.go
 tempodb/encoding/vparquet4/block_traceql.go
+tempodb/encoding/vparquet5/block_traceql.go
 tsdb/head_append.go
 tsdb/head_append_v2.go
 utils.go

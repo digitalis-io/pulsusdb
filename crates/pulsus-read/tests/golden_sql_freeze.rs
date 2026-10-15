@@ -63,7 +63,7 @@ const CORPORA: [(&str, usize); 4] = [
     ("traces_search", 75),
     ("traces_metrics", 28),
     ("traces_spans_search", 17),
-    ("traces_spans_metrics", 20),
+    ("traces_spans_metrics", 23),
 ];
 
 /// A 64-bit rolling digest over every entry, in sorted path order —
@@ -626,8 +626,8 @@ fn the_sql_golden_corpus_has_exactly_its_committed_membership() {
         total += entries.len();
     }
     assert_eq!(
-        total, 140,
-        "the frozen SQL corpus is 75 + 28 + 17 + 20 = 140 entries"
+        total, 143,
+        "the frozen SQL corpus is 75 + 28 + 17 + 23 = 143 entries"
     );
 }
 
@@ -644,11 +644,12 @@ fn the_sql_golden_corpus_has_exactly_its_committed_membership() {
 /// [`corpus_digest`]'s encoding.
 const PINNED_SPANS_SEARCH_CORPUS: u64 = 0x31e7_33ad_d79a_8d4e;
 
-/// The metrics statement's twenty goldens (issue #596 parts 1 and 2), each the
+/// The metrics statement's twenty-three goldens (issue #596 parts 1 and 2,
+/// issue #594 part 5), each the
 /// range and instant forms of one request of
 /// `crates/pulsus-read/src/traces/spans/metrics.rs`'s `metrics_statement`,
 /// under [`corpus_digest`]'s encoding.
-const PINNED_SPANS_METRICS_CORPUS: u64 = 0x2129_18db_a72c_f546;
+const PINNED_SPANS_METRICS_CORPUS: u64 = 0x5e8f_6678_6090_a645;
 
 #[test]
 fn the_sql_golden_corpus_matches_its_committed_digest() {
@@ -680,7 +681,7 @@ fn the_metrics_statement_golden_corpus_matches_its_committed_digest() {
     let h = corpus_digest(&["traces_spans_metrics"]);
     assert_eq!(
         h, PINNED_SPANS_METRICS_CORPUS,
-        "the 20 metrics statement goldens changed: `metrics_statement`'s output moved. If that \
+        "the 23 metrics statement goldens changed: `metrics_statement`'s output moved. If that \
          was deliberate, regenerate them, say which statement changed and why, and update \
          PINNED_SPANS_METRICS_CORPUS to {h:#x} in the same change"
     );
@@ -759,7 +760,7 @@ fn golden_root() -> PathBuf {
 /// The six committed goldens that carry a join today, none of which the
 /// compile core plans. The list is asserted as an EQUALITY, not used as
 /// a skip list: a seventh file anywhere in the tree fails this test.
-const JOINS_OUTSIDE_THE_COMPILED_SEARCH_CORPUS: [&str; 44] = [
+const JOINS_OUTSIDE_THE_COMPILED_SEARCH_CORPUS: [&str; 47] = [
     "traces_graph/clustered_local_join.sql",
     "traces_graph/single_node.sql",
     // Issue #559 added this comparison golden; a comparison cross-tab
@@ -775,8 +776,8 @@ const JOINS_OUTSIDE_THE_COMPILED_SEARCH_CORPUS: [&str; 44] = [
     // series' cells, or a bucket's quantiles, into rows — an array of the
     // row itself, not a second table. It is the design's own statement,
     // built by `spans::metrics::metrics_statement`, which the compile core
-    // does not plan; all twenty of its goldens carry one, and part 2's
-    // per-trace, numbering and child-count reads are `LEFT JOIN`s.
+    // does not plan; all twenty-three of its goldens carry one, and part
+    // 2's per-trace, numbering and child-count reads are `LEFT JOIN`s.
     "traces_spans_metrics/arithmetic.sql",
     "traces_spans_metrics/avg_attribute.sql",
     "traces_spans_metrics/avg_unscoped.sql",
@@ -788,6 +789,9 @@ const JOINS_OUTSIDE_THE_COMPILED_SEARCH_CORPUS: [&str; 44] = [
     "traces_spans_metrics/count_no_exemplars.sql",
     "traces_spans_metrics/explore_root.sql",
     "traces_spans_metrics/field_vs_field.sql",
+    "traces_spans_metrics/filter_child_count.sql",
+    "traces_spans_metrics/filter_nested_left.sql",
+    "traces_spans_metrics/filter_trace_duration.sql",
     "traces_spans_metrics/histogram.sql",
     "traces_spans_metrics/histogram_by_service.sql",
     "traces_spans_metrics/quantile_by_route.sql",
@@ -823,9 +827,10 @@ const JOINS_OUTSIDE_THE_COMPILED_SEARCH_CORPUS: [&str; 44] = [
 ];
 
 /// ADR 0008: **no statement the compile core plans may contain a join**,
-/// and the forty-four committed goldens that carry one, pinned by name.
+/// and the forty-seven committed goldens that carry one, pinned by name.
 ///
-/// **Issue #596 part 1 adds twelve, and part 2 eight**: the
+/// **Issue #596 part 1 adds twelve, part 2 eight, and issue #594 part 5
+/// three**: the
 /// `traces_spans_metrics/` goldens, whose `ARRAY JOIN` expands an array of
 /// the row itself and whose `LEFT JOIN`s read the per-trace values, the
 /// numbering and the child counts, built by `spans::metrics`, which the
@@ -962,11 +967,11 @@ fn no_planned_search_statement_contains_a_join() {
     with_a_join.sort();
     assert_eq!(
         with_a_join, JOINS_OUTSIDE_THE_COMPILED_SEARCH_CORPUS,
-        "the joins outside the compiled search corpus are exactly these forty-four; a \
-         forty-fifth means a builder grew one and nobody said so"
+        "the joins outside the compiled search corpus are exactly these forty-seven; a \
+         forty-eighth means a builder grew one and nobody said so"
     );
     assert_eq!(
-        scanned, 167,
+        scanned, 170,
         "every committed SQL golden in the tree is scanned, not only the two frozen corpora"
     );
     assert!(
