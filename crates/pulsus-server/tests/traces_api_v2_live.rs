@@ -4914,10 +4914,11 @@ async fn metrics_filters_compare_fields_and_compute() {
 }
 
 /// `T-A15`'s metrics rows: a `by()` on another key, two keys, a grouped
-/// quantile or histogram and a non-duration target stay `400` in this
-/// part. **guard**.
+/// quantile or histogram and a non-duration target answer `200` (issue
+/// #596 part 2); on the §6.1 fixture `rate() by(span.http.route)` has one
+/// series per route and one `nil` series for the spans without one.
 #[tokio::test(flavor = "multi_thread")]
-async fn t_a15_the_metrics_rows_stay_400() {
+async fn t_a15_the_metrics_rows_answer() {
     if !should_run() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
@@ -4926,6 +4927,8 @@ async fn t_a15_the_metrics_rows_stay_400() {
     let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_traces_api_v2_it_t596_ta15")).await;
     let _server = spawn_ready(port, &db);
     let base = metrics_base_ns();
+    push_fixture_61(port, base);
+    let mut routes = Vec::new();
     for q in [
         "{} | rate() by(span.http.route)",
         "{} | rate() by(resource.service.name, span.http.route)",
@@ -4936,13 +4939,19 @@ async fn t_a15_the_metrics_rows_stay_400() {
         let res = metrics_range_q(port, q, base, q);
         assert_eq!(
             res.status,
-            400,
+            200,
             "{q}: {}",
             String::from_utf8_lossy(&res.body)
         );
-        let ct = res.headers.get("content-type").cloned().unwrap_or_default();
-        assert!(ct.starts_with("text/plain"), "{q}: content type {ct:?}");
+        if routes.is_empty() {
+            routes = metrics_series(&res.json(q), "span.http.route", q)
+                .into_iter()
+                .map(|(label, _)| label)
+                .collect();
+        }
     }
+    routes.sort();
+    assert_eq!(routes, vec!["/cart", "/health", "nil"]);
 }
 
 /// A trace-level field in a metrics filter stays `400` until #594 part 5.

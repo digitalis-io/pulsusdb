@@ -40,8 +40,8 @@ pub use traces::{
     TRACE_METRICS_MAX_SET_ROWS, TRACE_SEARCH_MAX_BLOCK_ROWS, TagNames, TagValue, TagValues,
     TagValuesRequest, TraceContext, TraceEngine, TraceMetricSeries, TraceMetricsPlan,
     TraceMetricsResult, TraceReadConfig, TraceSearchResult, WireKey, compile_span_filter,
-    non_finite_double_spelling, plan_search, plan_trace_metrics, plan_trace_metrics_routed,
-    service_graph_sql, wire_arm,
+    go_duration_string, non_finite_double_spelling, plan_search, plan_trace_metrics,
+    plan_trace_metrics_routed, service_graph_sql, wire_arm,
 };
 
 #[cfg(test)]

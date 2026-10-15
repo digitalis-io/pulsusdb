@@ -109,6 +109,7 @@ fn side_of(query: &pulsus_traceql::Query, route: &str) -> &'static str {
         let tables = StatementTables {
             spans: "spans",
             resources: "resources",
+            traces: "traces",
             indexed: &[],
         };
         return match plan_trace_metrics_routed(query, &params, &ctx, &tables) {

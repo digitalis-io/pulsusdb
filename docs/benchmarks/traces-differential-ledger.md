@@ -1282,6 +1282,15 @@ when we are asking it to slow down, so we keep `429`; recorded as
   discovers a key through the tag API and then filters on it unscoped would
   otherwise find nothing.
 
+- **Issue #596 part 2 extends the chain to metrics `by()` keys and targets.**
+  `{} | count_over_time() by(.ls)`, on a span whose `ls` sits on its link and
+  two spans whose `ls` sits on their scope, answers `lk-ls` 1, `sc-ls` 2 and
+  `nil` for the rest; `{} | avg_over_time(.num)` reads the span's `num`, else
+  its resource's, and so on through the five. The reference, reading two
+  scopes, would label those spans `nil`. Asserted by
+  `unscoped_keys_follow_the_five_scopes`
+  (`crates/pulsus-read/tests/traces_query_v2_live.rs`).
+
 ### `traceql-compare-topn-tie-order` (issue #460) — **a deliberate refinement: our tie order is deterministic where the reference's is arbitrary**
 
 - **What.** `compare(f[, topN[, start, end]])` keeps, per attribute and per
@@ -2473,6 +2482,13 @@ when we are asking it to slow down, so we keep `429`; recorded as
 
 - **Route.** `GET /api/traces/v1/metrics/query_range`.
 
+- **Closed by issue #596 part 2.** We serve every key, up to five, each a
+  typed label with the reference's rule for a missing value; `by(name)`
+  answers one series per name, as the reference does
+  (`every_key_labels_as_the_reference`,
+  `crates/pulsus-read/tests/traces_query_v2_live.rs`). What follows is the
+  record of the restriction, kept rather than deleted.
+
 - **What was measured (2026-09-01, both sides, same corpus shape).** Two
   services with two operation names, four spans, a nine-bucket `10s`
   window. The reference answers `{} | count_over_time() by(name)` with
@@ -2509,6 +2525,60 @@ when we are asking it to slow down, so we keep `429`; recorded as
   `400` to is the exact failure the ledger exists to prevent. When #182
   widens the key set, the two shapes move back into the density row with
   a fresh measurement, and this row is retired rather than deleted.
+  (#596 part 2 widened it; the density row keeps its one measured grouped
+  shape until the two are measured again on both sides.)
+
+### `traceql-metrics-ungrouped-attribute-sum` (issue #596 part 2) — **an ungrouped `sum_over_time` over an attribute answers the sum**
+
+- **Route.** `GET /api/traces/v1/metrics/query` and `query_range`.
+
+- **What was measured (2026-10-15, the pinned reference, fixture RF of
+  the plan for #596 part 2).** Three spans hold `n`: `5` and `7` as
+  integers and `2.5` as a double; one span holds `f = 1.5`. The reference
+  answers ungrouped `{} | sum_over_time(span.n)` with **2.5** and
+  `{} | sum_over_time(span.f)` with **no series**, while its own
+  `avg_over_time(span.n)` is 4.833 over the same three values and its
+  grouped `sum_over_time(span.f) by(name)` is `root` 1.5.
+
+- **Ours.** The sum, **14.5**, and `1.5` for `span.f` — the same values
+  `avg` and the grouped form imply (`attribute_targets`,
+  `crates/pulsus-read/tests/traces_query_v2_live.rs`).
+
+- **Disposition.** Deliberate: the reference's ungrouped sum disagrees with
+  its own grouped sum and average over the same spans.
+
+### `traceql-metrics-intrinsic-target-refused` (issue #596 part 2) — **an intrinsic target other than `duration` and `span:childCount` stays `400`**
+
+- **Route.** `GET /api/traces/v1/metrics/query` and `query_range`.
+
+- **What was measured (2026-10-15, the pinned reference, fixture RF).**
+  The reference answers `{} | sum_over_time(trace:duration)` with
+  `15000000000` — nanoseconds — where
+  `{} | quantile_over_time(trace:duration, .5)` is `3.25…` — seconds.
+
+- **Ours.** `400`, the previous planner's refusal, for every intrinsic
+  target but `duration` and `span:childCount` (`nestedSetLeft`,
+  `trace:duration` and the rest; `child_counts_are_direct_children` and
+  the unit test `compare_and_intrinsic_targets_stay_on_todays_planner`).
+
+- **Disposition.** A documented limit: the reference gives these targets no
+  single unit, so there is no answer of its to match.
+
+### `traceql-metrics-child-count-counted` (issue #596 part 2) — **`span:childCount` as a metrics key or target answers the counts; the reference answers no series**
+
+- **Route.** `GET /api/traces/v1/metrics/query` and `query_range`.
+
+- **What was measured (2026-10-15, the pinned reference, fixture RF).**
+  `{} | count_over_time() by(span:childCount)` and
+  `sum/avg/min/max_over_time(span:childCount)` answer **no series**.
+
+- **Ours.** The span's direct children, `0` for a leaf, children outside
+  the window counted, as the search statement counts them: `intValue 0` 2,
+  `1` 2, `2` 1 on RF, and `avg_over_time(span:childCount)` 0.8
+  (`child_counts_are_direct_children`).
+
+- **Disposition.** Deliberate: the reference's empty answer is a defect, and
+  the owner's standing rule is to fix one rather than copy it.
 
 ### `traceql-metrics-zero-fill-without-a-block` (issue #477) — **INTRODUCED HERE: we zero-fill a no-match range answer even with nothing stored**
 

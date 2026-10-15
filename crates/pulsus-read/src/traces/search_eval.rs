@@ -2663,7 +2663,7 @@ fn go_duration_frac(mut u: u128, prec: u32) -> (String, u128) {
 /// sub-second uses `ns`/`µs`/`ms` with a trimmed fraction, `>= 1s` uses
 /// `[h][m]s` with a trimmed fractional-seconds part (`1.5s`, `1m30s`,
 /// `1h1m1s`, `500µs`, `0s`).
-pub(crate) fn go_duration_string(nanos: i64) -> String {
+pub fn go_duration_string(nanos: i64) -> String {
     if nanos == 0 {
         return "0s".to_string();
     }
@@ -5975,6 +5975,19 @@ mod tests {
         assert_eq!(go_duration_string(90_000_000_000), "1m30s");
         assert_eq!(go_duration_string(3_661_000_000_000), "1h1m1s");
         assert_eq!(go_duration_string(-1_500_000_000), "-1.5s");
+        // Issue #596 part 2: the server's step-limit cases, and the metrics
+        // key labels of `event:timeSinceStart` and `duration`.
+        for (ns, want) in [
+            (1, "1ns"),
+            (500_000_000, "500ms"),
+            (1_080_000_000, "1.08s"),
+            (100_000_000_000, "1m40s"),
+            (3_600_000_000_000, "1h0m0s"),
+            (-900_000_000, "-900ms"),
+            (250_000_000, "250ms"),
+        ] {
+            assert_eq!(go_duration_string(ns), want, "{ns} ns");
+        }
     }
 
     /// Issue #492 part 5 criterion 12: **`by(duration)`'s two readings

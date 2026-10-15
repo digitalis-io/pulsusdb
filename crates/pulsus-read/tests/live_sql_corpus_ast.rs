@@ -233,8 +233,12 @@ const CONTROL: &str = "with_binding_control.txt";
 /// **Issue #596 part 1 moves them 147 -> 159 and 411 -> 435: TWELVE
 /// `traces_spans_metrics` goldens added, each a range and an instant
 /// statement under its own `== ` line.** No item binds a subquery.
-const SQL_FILES: usize = 159;
-const SQL_STATEMENTS: usize = 435;
+///
+/// **Issue #596 part 2 moves them 159 -> 167 and 435 -> 451: EIGHT
+/// `traces_spans_metrics` goldens added, two statements each.** Their
+/// `WITH … AS nested_keys` and `… AS child_keys` items are scalars.
+const SQL_FILES: usize = 167;
+const SQL_STATEMENTS: usize = 451;
 const PROMQL_ENTRIES: usize = 30;
 const PROMQL_STATEMENTS: usize = 55;
 const CONTROL_STATEMENTS: usize = 1;

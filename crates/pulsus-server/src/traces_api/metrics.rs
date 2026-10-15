@@ -103,6 +103,7 @@ async fn metrics_impl(state: AppState, raw: &str, form: MetricsForm) -> Result<R
     let tables = pulsus_read::StatementTables {
         spans: &read_config.spans_v2_table,
         resources: &read_config.resources_table,
+        traces: &read_config.traces_table,
         indexed: &indexed,
     };
     let plan = pulsus_read::plan_trace_metrics_routed(&query, &metrics_params, &ctx, &tables)

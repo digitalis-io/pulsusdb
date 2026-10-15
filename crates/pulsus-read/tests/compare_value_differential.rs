@@ -336,7 +336,9 @@ fn str_label(labels: &[pulsus_read::MetricLabel], key: &str) -> Option<String> {
         .find(|l| l.key == key)
         .and_then(|l| match &l.value {
             MetricLabelValue::Str(v) => Some(v.clone()),
-            MetricLabelValue::Double(_) => None,
+            MetricLabelValue::Double(_) | MetricLabelValue::Int(_) | MetricLabelValue::Bool(_) => {
+                None
+            }
         })
 }
 
