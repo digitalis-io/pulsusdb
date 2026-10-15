@@ -16,7 +16,9 @@
 //! A comparison is `(trace_id, span_id) IN` the spans of the read's traces
 //! whose number satisfies it. The traces are `nested_keys`, which each read
 //! binds: the traces whose span starts reach the slice the top read reads,
-//! or the window when the statement is not sliced (`trace_keys`), the returned traces in the detail read (`detail_keys`). A `nestedSetParent`
+//! or the window when the statement is not sliced (`trace_keys`), the returned traces in the detail read (`detail_keys`),
+//! and in the metrics statement's read the traces reaching its window
+//! (issue #594 part 5). A `nestedSetParent`
 //! comparison that holds for `-1` alone is `parent_span_id` empty, with no
 //! numbering.
 //!
