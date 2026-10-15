@@ -13757,6 +13757,12 @@ fn fixture_rows_624p4b(text: &str) -> Vec<Vec<String>> {
         .collect()
 }
 
+/// A `lines.tsv` body as the reference's extractor read it: `\t` is a
+/// tab, then `\\` a backslash, every other byte itself.
+fn reference_line_624p4b(field: &str) -> String {
+    field.replace("\\t", "\t").replace("\\\\", "\\")
+}
+
 /// The reduced plan's payload for one of `queries.tsv`'s queries, as §2 of
 /// part 4b's plan admits it: the parser and the key each shape takes.
 fn fixture_value_624p4b(query: &str) -> pulsus_read::logql::sql::ReducedUnwrap {
@@ -13892,8 +13898,8 @@ fn reference_route_624p4b(text: &str) -> Option<String> {
 }
 
 /// **T3 (issue #624, part 4b): the value readers are the reference's
-/// extraction.** `lines.tsv` is loaded into a table by the database's TSV
-/// reader; for each of the 21 queries of `queries.tsv`,
+/// extraction.** `lines.tsv` is loaded into a table byte for byte as the
+/// reference read it; for each of the 21 queries of `queries.tsv`,
 /// `reduced_parser_columns` is rendered over it and `st`, `pu`, `ut`, `v`
 /// and the route key are read:
 ///
@@ -13934,7 +13940,7 @@ async fn the_value_readers_are_the_references_extraction() {
     assert_eq!(lines.len(), 2_900, "the fixture's lines");
     assert_eq!(queries.len(), 21, "the fixture's queries");
     assert_eq!(outcomes.len(), 15_600, "the fixture's outcomes");
-    assert_eq!(undecided.len(), 4_612, "the fixture's undecided pairs");
+    assert_eq!(undecided.len(), 4_603, "the fixture's undecided pairs");
 
     let (admin, db) = fresh_db_624(pulsus_testkit::test_db(&format!(
         "pulsus_read_it_qlg_p4b_t3_{}",
@@ -13946,23 +13952,25 @@ async fn the_value_readers_are_the_references_extraction() {
         &format!("CREATE TABLE {db}.lines (id UInt32, body String) ENGINE = MergeTree ORDER BY id"),
     )
     .await;
-    // The database's own TSV reader loads the lines, as the plan's
-    // measurement loaded them.
-    let raw = unwrap_parsers_fixture_624p4b("lines.tsv");
-    let rows: Vec<&str> = raw
-        .lines()
-        .filter(|l| !l.starts_with('#') && !l.is_empty())
-        .collect();
-    for chunk in rows.chunks(500) {
-        let text = format!("{}\n", chunk.join("\n"));
+    // Each body is loaded byte for byte as the reference's extractor read
+    // it: `\t` is a tab and `\\` a backslash; any other byte is itself, a
+    // bare `\"` included. A tab-separated reader would turn that `\"` into
+    // `"` and make 37 nested rows invalid JSON.
+    for chunk in lines.chunks(500) {
+        let values = chunk
+            .iter()
+            .map(|f| {
+                format!(
+                    "({}, {})",
+                    f[0],
+                    literal(&reference_line_624p4b(&f[2])).as_sql()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
         exec_624(
             &admin,
-            &format!(
-                "INSERT INTO {db}.lines (id, body) SELECT id, body FROM \
-                 format(TabSeparated, 'id UInt32, corpus String, body String', {})",
-                literal(&text).as_sql()
-            )
-            .replace('?', "??"),
+            &format!("INSERT INTO {db}.lines (id, body) VALUES {values}").replace('?', "??"),
         )
         .await;
     }
@@ -14076,6 +14084,11 @@ async fn the_value_readers_are_the_references_extraction() {
         wrong[..wrong.len().min(40)].join("\n")
     );
     eprintln!("decided per query: {decided:?}");
+    assert_eq!(
+        decided.values().sum::<usize>(),
+        10_997,
+        "the decided pairs: {decided:?}"
+    );
     drop_db_624(&admin, &db).await;
 }
 
