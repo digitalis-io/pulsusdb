@@ -184,6 +184,9 @@ enum Memo {
     Series(String),
 }
 
+/// The last key `(c, kv, e)` and its outcome.
+type KeyMemo = (u128, Vec<(String, String)>, u8, Memo);
+
 /// The lowered `| unwrap` fold (issue #624, part 4, §4).
 ///
 /// **Today's route, once per key.** Every line of a key `(c, kv, e)` has the
@@ -210,7 +213,7 @@ pub(in crate::logql) struct ReducedFold {
     charged: u64,
     points: u64,
     series: HashMap<String, (LabelSet, Vec<Option<f64>>)>,
-    memo: Option<(u128, Vec<(String, String)>, u8, Memo)>,
+    memo: Option<KeyMemo>,
     merge_buf: Vec<(String, String)>,
     pairs: Vec<(String, String)>,
     sm_ctx: StructuredMetadataCtx,
