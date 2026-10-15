@@ -229,8 +229,12 @@ const CONTROL: &str = "with_binding_control.txt";
 ///
 /// **Issue #591 part 2 moves them 143 -> 147 and 407 -> 411: FOUR
 /// `traces_spans_search` goldens added, one statement each.**
-const SQL_FILES: usize = 147;
-const SQL_STATEMENTS: usize = 411;
+///
+/// **Issue #596 part 1 moves them 147 -> 159 and 411 -> 435: TWELVE
+/// `traces_spans_metrics` goldens added, each a range and an instant
+/// statement under its own `== ` line.** No item binds a subquery.
+const SQL_FILES: usize = 159;
+const SQL_STATEMENTS: usize = 435;
 const PROMQL_ENTRIES: usize = 30;
 const PROMQL_STATEMENTS: usize = 55;
 const CONTROL_STATEMENTS: usize = 1;

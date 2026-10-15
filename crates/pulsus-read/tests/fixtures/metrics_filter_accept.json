@@ -1,5 +1,5 @@
 {
-  "DIVERGENCE_COUNT": 14,
+  "DIVERGENCE_COUNT": 9,
   "capture": {
     "reference_image": "grafana/tempo@sha256:aa8df8d069f77b82e978464daf55169bb8d135852ad58700aa96880653c3d8f7",
     "reference_config": "ci/tempo/tempo-compare.yaml (unmodified)",
@@ -53,15 +53,15 @@
     {
       "query": "{ nestedSetParent = -1 } | rate()",
       "ours": {
-        "verdict": "reject",
-        "body": "type mismatch: field-vs-field and arithmetic comparisons are not supported in metrics filters"
+        "verdict": "accept",
+        "body": null
       },
       "reference": {
         "verdict": "accept",
         "body": null
       },
-      "divergence": "metrics-filter-field-vs-field-and-arithmetic",
-      "why": "a NEGATIVE literal is not a literal in this grammar: -1 parses to Unary{Neg, Number(1)}, so this never reaches the nested-set leaf \u2014 it is the operand-shape refusal, wave 2"
+      "divergence": null,
+      "why": "served by the metrics statement on `spans`, whose filter is the span predicate compiler (issue #596 part 1)"
     },
     {
       "query": "{ nestedSetParent != -1 } | rate()",
@@ -248,41 +248,41 @@
     {
       "query": "{ .a = .b } | rate()",
       "ours": {
-        "verdict": "reject",
-        "body": "type mismatch: field-vs-field and arithmetic comparisons are not supported in metrics filters"
+        "verdict": "accept",
+        "body": null
       },
       "reference": {
         "verdict": "accept",
         "body": null
       },
-      "divergence": "metrics-filter-field-vs-field-and-arithmetic",
-      "why": "needs a trace_attrs_idx self-join or a correlated per-span value read \u2014 wave 2"
+      "divergence": null,
+      "why": "served by the metrics statement on `spans`, whose filter is the span predicate compiler (issue #596 part 1)"
     },
     {
       "query": "{ .a + 1 > 2 } | rate()",
       "ours": {
-        "verdict": "reject",
-        "body": "type mismatch: field-vs-field and arithmetic comparisons are not supported in metrics filters"
+        "verdict": "accept",
+        "body": null
       },
       "reference": {
         "verdict": "accept",
         "body": null
       },
-      "divergence": "metrics-filter-field-vs-field-and-arithmetic",
-      "why": "arithmetic operand, same site"
+      "divergence": null,
+      "why": "served by the metrics statement on `spans`, whose filter is the span predicate compiler (issue #596 part 1)"
     },
     {
       "query": "{ 2 > .a } | rate()",
       "ours": {
-        "verdict": "reject",
-        "body": "type mismatch: field-vs-field and arithmetic comparisons are not supported in metrics filters"
+        "verdict": "accept",
+        "body": null
       },
       "reference": {
         "verdict": "accept",
         "body": null
       },
-      "divergence": "metrics-filter-field-vs-field-and-arithmetic",
-      "why": "literal on the left, same site"
+      "divergence": null,
+      "why": "served by the metrics statement on `spans`, whose filter is the span predicate compiler (issue #596 part 1)"
     },
     {
       "query": "{ trace:duration > 1s } | rate()",
@@ -300,15 +300,15 @@
     {
       "query": "{ .a = nil } | rate()",
       "ours": {
-        "verdict": "reject",
-        "body": "type mismatch: absence checks are not supported in metrics filters"
+        "verdict": "accept",
+        "body": null
       },
       "reference": {
         "verdict": "accept",
         "body": null
       },
-      "divergence": "metrics-filter-absence-checks",
-      "why": "the lowering is three lines, but our `= nil` VALUE semantics already diverge on the search route, so it needs a ledger entry first \u2014 wave 2"
+      "divergence": null,
+      "why": "served by the metrics statement on `spans`, whose filter is the span predicate compiler (issue #596 part 1)"
     },
     {
       "query": "{ !.a } | rate()",

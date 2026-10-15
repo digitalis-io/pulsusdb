@@ -6546,4 +6546,5 @@ mod tests {
     }
 }
 
+mod metrics_statement;
 mod newest_first;

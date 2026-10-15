@@ -81,6 +81,7 @@ pub use search_eval::{
     non_finite_double_spelling, wire_arm,
 };
 pub use search_plan::{SearchCtx, SearchParams, SearchPlan, WireKey, plan_search};
+pub use spans::metrics::{RoutedMetricsPlan, StatementTables, plan_trace_metrics_routed};
 pub use spans::rows::{
     FallbackFetchRow, FetchRoute, FetchWindow, FetchedEventTuple, FetchedLinkTuple,
     FetchedResource, FetchedResourceTuple, FetchedSpan, FetchedSpanTuple, FetchedTrace,
