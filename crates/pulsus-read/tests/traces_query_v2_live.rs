@@ -15535,8 +15535,8 @@ async fn the_seven_filter_metrics_shapes() {
         ),
         (
             "{ span:childCount = 0 } | count_over_time() by(trace:rootName) > 1",
-            vec![one(&[("trace:rootName", s("root"))], "60:3.0")],
-            vec![one(&[("trace:rootName", s("root"))], "60:3.0")],
+            vec![one(&[("rootName", s("root"))], "60:3.0")],
+            vec![one(&[("rootName", s("root"))], "60:3.0")],
         ),
         (
             "{ name = trace:rootName } | count_over_time() by(name)",
