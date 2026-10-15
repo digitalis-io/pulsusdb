@@ -34,7 +34,7 @@ use pulsus_traceql::{
 
 use super::numbering::projected_sql;
 use super::predicate::{
-    CHAIN, HELD, PredicateCtx, SERVICE_IS_STRING, attr_path, chain_presence_in,
+    CHAIN, HELD, PredicateCtx, SERVICE_IS_STRING, SERVICE_VALUE, attr_path, chain_presence_in,
     compile_span_predicate_in, element_index_in, element_select_in, resource_value_in, scope_value,
 };
 use super::rows::SearchProjected;
@@ -1181,6 +1181,12 @@ pub(crate) fn aggregate_argument_sql(
     ctx: &PredicateCtx<'_>,
 ) -> Result<Option<(String, String)>, PlanError> {
     match field {
+        // The span row's copy, held only as a string (D2): `place_of`'s
+        // column reads it whatever its arm, which only `add`'s gate stops.
+        Field::Attribute {
+            scope: AttrScope::Resource,
+            key,
+        } if key == "service.name" => Ok(Some(stored_parts(SERVICE_VALUE))),
         Field::Attribute { .. } => match stored_value(field, ctx)? {
             Projects::Value { value, kind } => Ok(Some((value, kind))),
             Projects::Nothing => Ok(None),
