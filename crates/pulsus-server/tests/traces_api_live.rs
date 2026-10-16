@@ -2528,60 +2528,18 @@ async fn the_range_route_rejects_a_group_the_instant_route_serves() {
     }
 }
 
-/// Issue #502: the incomplete-search signal follows the **candidate
-/// ceiling**, and the request `limit` never raises it.
-///
-/// `docs/schemas.md` described a `partial` response field that issue #464
-/// removed. A query that only narrows `limit` cannot produce the signal
-/// that replaced it, because the request `limit` is none of the three
-/// things that set it (`crates/pulsus-read/src/traces/exec.rs:2259`, read
-/// at this revision):
+/// Issue #502, issue #602 part 2b: **the candidate ceiling does not bound a
+/// search.** The route's only engine is the search statement, which has no
+/// candidate phase, so `PULSUS_TRACEQL_MAX_CANDIDATES` neither truncates
+/// the answer nor marks it incomplete, and the request `limit` alone
+/// decides the trace count:
 ///
 /// ```text
-///   let partial = generator_truncated || ceiling_hit || overflow_partial;
-///
-///   request `limit`      how many traces the response carries
-///   candidate ceiling    how many candidates the engine may consider
-///                        — only this one sets the incomplete signal
-/// ```
-///
-/// So the four requests below differ in ONE input at a time, over one
-/// three-trace store served by three spawns — one per ceiling, since the
-/// ceiling is process configuration:
-///
-/// ```text
-///   ceiling=1     limit=10  ->  1 trace,  {"totalJobs":1}
-///   ceiling=2     limit=10  ->  2 traces, {"totalJobs":1}
+///   ceiling=1     limit=10  ->  3 traces, {"completedJobs":1,"totalJobs":1}
+///   ceiling=2     limit=10  ->  3 traces, {"completedJobs":1,"totalJobs":1}
 ///   ceiling=1000  limit=10  ->  3 traces, {"completedJobs":1,"totalJobs":1}
 ///   ceiling=1000  limit=1   ->  1 trace,  {"completedJobs":1,"totalJobs":1}
 /// ```
-///
-/// **The ceiling=2 row is what makes the count TRACK the ceiling.** With
-/// only 1 and 1000 in the set, an engine that returned one trace whenever
-/// the ceiling was "small" and everything otherwise would satisfy every
-/// other row. Three ceilings, three different trace counts — 1, 2, 3 — is
-/// the difference between reacting to a small ceiling and following it.
-/// The break that establishes this, rather than asserting it: make
-/// `SearchPlan::max_candidates` (`crates/pulsus-read/src/traces/search_plan.rs:676`)
-/// return 1 whenever the configured value is below 10. The four rows fail
-/// on this one's trace count; the three-row version passes.
-///
-/// **The last request stays in the set on purpose.** It is the shape that
-/// made the previous criterion unable to fail: one trace of three comes
-/// back and the answer is still complete. Dropping it once understood
-/// would make the same mistake reachable again.
-///
-/// **All three ceilings this test spawns are legal values**, so no
-/// configuration carve-out is needed. The accepted range is
-/// `1..=TRACEQL_MAX_CANDIDATES_CEILING`, which is `1_000_000`
-/// (`crates/pulsus-config/src/validate.rs:149`): the lower bound is the
-/// positivity check at `:483-486` and the upper bound the ceiling check
-/// at `:487-498`, which carries its own reason and issue reference.
-/// `1`, `2` and `1000` are inside that range. If
-/// a floor above 1 is ever added, this test moves to the next ceiling
-/// that still truncates a three-trace corpus; it does not get deleted.
-/// The variable reaches that field directly
-/// (`crates/pulsus-config/src/env.rs:354-355`).
 ///
 /// Timestamps are FIXED and in the future, the idiom this file already
 /// uses: the corpus spans and the search window are both literals
@@ -2589,7 +2547,7 @@ async fn the_range_route_rejects_a_group_the_instant_route_serves() {
 /// call at all, so there is no second anchor for the first to drift
 /// against.
 #[tokio::test(flavor = "multi_thread")]
-async fn the_incomplete_signal_follows_the_candidate_ceiling_and_not_the_request_limit() {
+async fn the_candidate_ceiling_does_not_bound_a_search() {
     if !should_run() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse");
         return;
@@ -2636,29 +2594,16 @@ async fn the_incomplete_signal_follows_the_candidate_ceiling_and_not_the_request
     );
 
     let complete = serde_json::json!({"completedJobs": 1, "totalJobs": 1});
-    let truncated = serde_json::json!({"totalJobs": 1});
 
     for (name, port, limit, want_traces, want_metrics) in [
-        ("ceiling=1 limit=10", CEILING_ONE_PORT, 10, 1, &truncated),
-        // The row that makes the trace count TRACK the ceiling rather
-        // than merely react to it being small.
-        ("ceiling=2 limit=10", CEILING_TWO_PORT, 10, 2, &truncated),
+        ("ceiling=1 limit=10", CEILING_ONE_PORT, 10, 3, &complete),
+        ("ceiling=2 limit=10", CEILING_TWO_PORT, 10, 3, &complete),
         ("ceiling=1000 limit=10", CEILING_HIGH_PORT, 10, 3, &complete),
-        // The blind case of the criterion this one replaces.
         ("ceiling=1000 limit=1", CEILING_HIGH_PORT, 1, 1, &complete),
     ] {
         let ctx = format!("[#502] {name}");
         let path =
-            // `{} | by(trace:id) | coalesce()`: the candidate ceiling is
-            // today's engine's, and a plain `{}` is the search statement's,
-            // which has no candidate phase (issue #591 part 3, section 7).
-            // One group per trace, merged back, leaves a plain query's
-            // answer unchanged, and the statement does not serve that key,
-            // so it keeps the query on today's engine (issue #592 part 2).
-            format!(
-                "/api/traces/v1/search?q=%7B%7D%20%7C%20by%28trace%3Aid%29%20%7C%20coalesce%28%29&start={START_S}&end={END_S}\
-                 &limit={limit}"
-            );
+            format!("/api/traces/v1/search?q=%7B%7D&start={START_S}&end={END_S}&limit={limit}");
         let res = get(port, &path, &[], &ctx);
         assert_eq!(
             res.status,
@@ -2674,8 +2619,7 @@ async fn the_incomplete_signal_follows_the_candidate_ceiling_and_not_the_request
         );
         assert_eq!(
             json["metrics"], *want_metrics,
-            "{ctx}: a truncated search must omit completedJobs and a complete one must carry it, \
-             body {json}"
+            "{ctx}: the ceiling must not mark the search incomplete, body {json}"
         );
         // Issue #464 retired the invented wire field; no shape of this
         // request may bring it back.

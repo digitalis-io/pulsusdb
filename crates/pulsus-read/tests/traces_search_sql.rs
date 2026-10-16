@@ -1063,7 +1063,8 @@ fn shipped_shapes_and_limits_are_documented() {
         // Issue #57 re-audit: the response string-truncation contract.
         "8192-byte",
         "2048 UTF-8 code points",
-        "PULSUS_TRACEQL_GENERATOR_MAX_MEMORY_BYTES",
+        // Issue #602 part 2b: the generator's memory ceiling left §4.2 with
+        // the previous engine, which no search reaches.
         // Issue #473: the two search-response rules that are values
         // rather than shapes — the empty-root-service marker, and the
         // saturation identity (the same durationMs for two different

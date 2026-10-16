@@ -6,10 +6,11 @@
 #   $T1000   9e0ae95131b5bedbeea2c9eb5234f1ec   (a 1,000-span trace)
 #
 # `statements` is what T-Q1 asserts by counting rows in system.query_log for the
-# request's query_id prefix. Twenty-one requests are allowed more than one, and
-# server-implementation.md 3.5 gives the reason for each. The nineteen at 2 are
-# sliceable searches: the newest five minutes of the corpus window hold no span,
-# so each reads that slice and then the window.
+# request's query_id prefix. Thirty-eight requests are allowed more than one, and
+# server-implementation.md 3.5 gives the reason for each. The thirty-seven
+# searches at 2 read the newest slice first: the newest five minutes of the
+# corpus window hold no span, so each reads that slice and then the window. The
+# seventeen structural searches moved from 1 to 2 with issue #602 part 2b.
 # `route today` says what the shipped API answers for the request, so a test can
 # tell "must keep working" from "must keep refusing".
 statement	method	path	query	statements	route today
@@ -53,28 +54,28 @@ s05_duration_kind	GET	/api/traces/v1/search	q={ duration > 2s && kind = server }
 s06_db_and_name	GET	/api/traces/v1/search	q={ span.db.system.name = "postgresql" && name = "SELECT shop" }&start=$S&end=$E&limit=20	2	200
 s07_route_regex	GET	/api/traces/v1/search	q={ span.http.route =~ "/api/auth/.*" }&start=$S&end=$E&limit=20	2	200
 s08_user_point	GET	/api/traces/v1/search	q={ span.app.user.id = "u-10013" }&start=$S&end=$E&limit=20	2	200
-s09_descendant	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } >> { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	1	200
-s10_child	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } > { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	1	200
+s09_descendant	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } >> { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	2	200
+s10_child	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } > { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	2	200
 s11_event_attr	GET	/api/traces/v1/search	q={ event.exception.type = "java.lang.IllegalStateException" }&start=$S&end=$E&limit=20	2	200
 s12_select	GET	/api/traces/v1/search	q={ status = error } | select(span.http.route, resource.service.name)&start=$S&end=$E&limit=20	2	200
 s13_count_gt	GET	/api/traces/v1/search	q={ resource.service.name = "checkout" } | count() > 5&start=$S&end=$E&limit=20	1	200
 s14_trace_level	GET	/api/traces/v1/search	q={ trace:rootService = "loadgen" && trace:duration > 2s }&start=$S&end=$E&limit=20	2	200
 s15_unscoped_and_resource	GET	/api/traces/v1/search	q={ .app.cache.hit && resource.k8s.pod.name = "cart-7d9f8b-00002" }&start=$S&end=$E&limit=20	2	200
-st01_child_plain	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } > { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	1	200
-st02_child_neg	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } !> { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	1	200
-st03_child_union	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } &> { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	1	200
-st04_parent_plain	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } < { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	1	200
-st05_parent_neg	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } !< { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	1	200
-st06_parent_union	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } &< { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	1	200
-st07_sibling_plain	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } ~ { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	1	200
-st08_sibling_neg	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } !~ { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	1	200
-st09_sibling_union	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } &~ { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	1	200
-st10_descendant_plain	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } >> { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	1	200
-st11_descendant_neg	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } !>> { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	1	200
-st12_descendant_union	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } &>> { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	1	200
-st13_ancestor_plain	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } << { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	1	200
-st14_ancestor_neg	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } !<< { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	1	200
-st15_ancestor_union	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } &<< { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	1	200
+st01_child_plain	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } > { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	2	200
+st02_child_neg	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } !> { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	2	200
+st03_child_union	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } &> { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	2	200
+st04_parent_plain	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } < { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	2	200
+st05_parent_neg	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } !< { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	2	200
+st06_parent_union	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } &< { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	2	200
+st07_sibling_plain	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } ~ { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	2	200
+st08_sibling_neg	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } !~ { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	2	200
+st09_sibling_union	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } &~ { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	2	200
+st10_descendant_plain	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } >> { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	2	200
+st11_descendant_neg	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } !>> { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	2	200
+st12_descendant_union	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } &>> { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	2	200
+st13_ancestor_plain	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } << { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	2	200
+st14_ancestor_neg	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } !<< { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	2	200
+st15_ancestor_union	GET	/api/traces/v1/search	q={ resource.service.name = "frontend" } &<< { resource.service.name = "payment" && status = error }&start=$S&end=$E&limit=20	2	200
 t01_tag_names_span	GET	/api/v2/search/tags	scope=span	1	200
 t02_tag_values_route	GET	/api/v2/search/tag/span.http.route/values		1	200
 t03_tag_values_filtered	GET	/api/v2/search/tag/span.http.route/values	q={ resource.service.name = "checkout" }&start=$S&end=$E	1	200

@@ -1,8 +1,8 @@
 //! The TraceQL search statement (issue #590): `docs/TraceQL/sql-schema.md`
 //! §5.2. One pure builder, `validated inputs -> String`, as
-//! [`super::fetch`]'s are. The route fork (`exec.rs`'s `search_routed`)
-//! issues it for every search [`plan_statement`] covers, and the previous
-//! engine answers the rest. Every `|` stage is [`super::fold`]'s fold
+//! [`super::fetch`]'s are. The route (`exec.rs`'s `search_routed`) issues
+//! it for every search, planned by [`plan_search_request`] (issue #602 part
+//! 2b). Every `|` stage is [`super::fold`]'s fold
 //! (issue #602 part 2a). The newest slice is [`search_sql_at`]'s; the loop
 //! that widens it is `exec/newest_first.rs`'s (issue #595).
 //!
@@ -125,7 +125,7 @@ FROM ({scope_detail}SELECT trace_id, max(start_ns) AS last, count() AS matched,
       GROUP BY trace_id) AS m
 {trace_read}";
 
-/// The newest slice a sliceable statement's top-K reads first, and the
+/// The newest slice a statement's top-K reads first, and the
 /// unit it doubles in (issue #595): the span table's bucket.
 pub const SLICE_NS: i64 = 300_000_000_000;
 
@@ -233,7 +233,16 @@ pub enum SearchFilter {
         holds: String,
         guards: Vec<Option<String>>,
     },
-    /// A selector, `One` or `Tree`, then the `|` stages
+    /// A spanset holding a structural operator (issue #602 part 2b):
+    /// `leaves`, the OR of its filters, picks a slice's candidates, the
+    /// traces with a span they keep in the slice; `member` is its
+    /// membership, every relation reading the candidates' keys when sliced
+    /// and the window when not.
+    Structural {
+        leaves: String,
+        member: SpanPredicate,
+    },
+    /// A selector, `One`, `Tree` or `Structural`, then the `|` stages
     /// [`super::fold`] folds (issue #602 part 2a).
     Pipeline {
         selector: Box<SearchFilter>,
@@ -246,6 +255,7 @@ impl SearchFilter {
         match self {
             SearchFilter::One(p) => vec![p],
             SearchFilter::Tree { filters, .. } => filters.iter().collect(),
+            SearchFilter::Structural { member, .. } => vec![member],
             SearchFilter::Pipeline { selector, fold } => {
                 let mut out = selector.predicates();
                 out.extend(fold.filters.iter());
@@ -487,12 +497,13 @@ pub fn search_sql_at(
             values.push(("keys", keys));
             fill(SEARCH, &values)
         }
-        SearchFilter::Tree { .. } => {
-            unreachable!("a spanset tree is compiled as the fold's selector")
+        SearchFilter::Tree { .. } | SearchFilter::Structural { .. } => {
+            unreachable!("a spanset tree or structural spanset is compiled as the fold's selector")
         }
         SearchFilter::Pipeline { selector, fold } => {
             let tree = matches!(**selector, SearchFilter::Tree { .. });
-            let candidate = tree || fold.filters_traces();
+            let structural = matches!(**selector, SearchFilter::Structural { .. });
+            let candidate = tree || structural || fold.filters_traces();
             let top = slice.unwrap_or(w);
             let (top_time, top_bucket, top_day) = (
                 top.span_time_clause(),
@@ -525,7 +536,17 @@ pub fn search_sql_at(
                         Some((counts.join(", "), member.join(" OR "))),
                     )
                 }
-                SearchFilter::Pipeline { .. } => unreachable!("a selector is One or Tree"),
+                SearchFilter::Structural { member, .. } => {
+                    (member.sql().to_string(), String::new(), None)
+                }
+                SearchFilter::Pipeline { .. } => unreachable!("a selector is not a pipeline"),
+            };
+            // A slice's candidates are the traces with a span the selector
+            // keeps there, or, for a structural spanset, its leaves keep
+            // (issue #602 part 2b).
+            let cand_sel = match &**selector {
+                SearchFilter::Structural { leaves, .. } => leaves.clone(),
+                _ => sel.clone(),
             };
             // The fold's span rows: the span table itself for one filter,
             // so a clustered statement groups on each shard; a tree's flags
@@ -582,7 +603,7 @@ pub fn search_sql_at(
                         ("top_time", &top_time),
                         ("top_bucket", &top_bucket),
                         ("top_day", &top_day),
-                        ("predicate", &sel),
+                        ("predicate", &cand_sel),
                         ("within", &w.bucket_within("k")),
                         ("traces", traces_table),
                         ("days", &w.per_trace_day_clause()),
@@ -690,13 +711,12 @@ pub struct SearchStatement {
     /// #593 part 2): it is issued with `max_recursive_cte_evaluation_depth
     /// = max_depth + 1`.
     climb_depth: Option<u32>,
-    /// Whether the newest-slice-first loop may bound its top-K to a slice
-    /// (issue #595): every statement but a structural one (issue #602 part
-    /// 2a).
-    sliceable: bool,
     /// Whether a predicate reads the nested-set numbering (issue #594 part
     /// 2).
     numbered: bool,
+    /// Whether the selector holds a structural operator, whose relations
+    /// read `spans` inside a read of `spans` (issue #602 part 2b).
+    structural: bool,
 }
 
 /// The response attributes every surviving spanset carries (issue #602
@@ -717,15 +737,16 @@ impl SearchStatement {
         self.climb_depth
     }
 
-    /// Whether the statement's top-K may read a slice (issue #595).
-    pub fn sliceable(&self) -> bool {
-        self.sliceable
-    }
-
     /// Whether a predicate reads the nested-set numbering (issue #594 part
     /// 2): the newest-slice loop keeps doubling for it.
     pub fn reads_numbering(&self) -> bool {
         self.numbered
+    }
+
+    /// Whether the statement reads a table inside a read of the same
+    /// table: the numbering or a structural operator's relations.
+    pub fn nests_reads(&self) -> bool {
+        self.numbered || self.structural
     }
 
     pub fn projection(&self) -> &Projection {
@@ -792,12 +813,6 @@ fn pipeline_of<'a>(query: &'a Query, ctx: &PredicateCtx<'_>) -> Result<Pipeline<
                     )));
                 };
                 let Some(sql) = group_key_sql(field, ctx)? else {
-                    if matches!(field, Field::Intrinsic(Intrinsic::TraceId)) {
-                        return Err(PlanError::UnsupportedField(
-                            "by(trace:id) is not supported by the search statement yet (issue #602 part 2b)"
-                                .to_string(),
-                        ));
-                    }
                     return Err(PlanError::UnsupportedField(format!(
                         "by({field}): grouping by a span-event / span-link intrinsic is not \
                          supported (a span carries a collection of events/links, so there is \
@@ -982,8 +997,7 @@ pub fn compile_search_at_depth(
     )
 }
 
-/// [`compile_search_at_depth`], the top-K of a sliceable statement reading
-/// `slice` (issue #595); a statement that is not sliceable ignores it.
+/// [`compile_search_at_depth`], the top-K reading `slice` (issue #595).
 #[allow(clippy::too_many_arguments)]
 pub fn compile_search_sliced(
     query: &Query,
@@ -998,15 +1012,24 @@ pub fn compile_search_sliced(
     let pipeline = pipeline_of(query, ctx)?;
     let structural = super::structural::holds_structural(&query.spanset);
     // Issue #593: a spanset holding a structural operator is one
-    // membership predicate, the selector of every template.
+    // membership predicate. Issue #602 part 2b: sliced, its relations read
+    // the slice's candidates' keys alone.
     let mut climb_depth = None;
     let selector = if structural {
-        let m =
-            super::structural::compile_membership_in(&query.spanset, ctx, spans_table, max_depth)?;
+        let m = super::structural::compile_membership_in(
+            &query.spanset,
+            ctx,
+            spans_table,
+            max_depth,
+            slice.map(|_| KEYS_CANDIDATES),
+        )?;
         if m.climbs {
             climb_depth = Some(max_depth);
         }
-        SearchFilter::One(m.predicate)
+        SearchFilter::Structural {
+            leaves: m.leaves,
+            member: m.predicate,
+        }
     } else {
         compile_search_filter(&query.spanset, ctx)?
     };
@@ -1017,8 +1040,13 @@ pub fn compile_search_sliced(
     } = pipeline;
     let contributors = fold.contributors();
     // Issue #602 part 2a: a spanset tree is always the fold's selector, so
-    // it reads the newest slice first as every other statement does.
-    let filter = if fold.is_empty() && !matches!(selector, SearchFilter::Tree { .. }) {
+    // it reads the newest slice first as every other statement does; part
+    // 2b: so is a structural spanset.
+    let filter = if fold.is_empty()
+        && !matches!(
+            selector,
+            SearchFilter::Tree { .. } | SearchFilter::Structural { .. }
+        ) {
         selector
     } else {
         SearchFilter::Pipeline {
@@ -1040,12 +1068,6 @@ pub fn compile_search_sliced(
             }
         }
     }
-    if climb_depth.is_some() {
-        demands.push(super::structural::CLIMB_HANDOVER.to_string());
-    }
-    // Issue #602 part 2a: every statement but a structural one reads the
-    // newest slice first.
-    let sliceable = !structural;
     let numbered: usize = filter
         .predicates()
         .iter()
@@ -1055,7 +1077,7 @@ pub fn compile_search_sliced(
         spans_table,
         traces_table,
         ctx.window,
-        if sliceable { slice } else { None },
+        slice,
         &filter,
         &projection,
         limit,
@@ -1067,15 +1089,73 @@ pub fn compile_search_sliced(
         demands,
         grouping,
         climb_depth,
-        sliceable,
         numbered: numbered > 0,
+        structural,
     })
 }
 
-/// Issue #591 part 3's coverage: the search statement for `plan`, when
-/// `compile_search` accepts its spanset and its `|` stages (issue #592
-/// part 1) under its own window, `limit` and `spss`; `None` sends it to
-/// today's engine, which answers it unchanged.
+/// A search the route answers (issue #602 part 2b): its window, `limit`,
+/// `spss` and query, accepted by [`compile_search`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchRequest {
+    pub(crate) start_ns: i64,
+    pub(crate) end_ns: i64,
+    pub(crate) limit: u32,
+    pub(crate) spss: u32,
+    pub(crate) query: Query,
+}
+
+/// The route's planner (issue #602 part 2b): `query` over `params` as a
+/// [`SearchRequest`], refused with [`compile_search`]'s own error. Its
+/// `hints` are accepted and ignored.
+pub fn plan_search_request(
+    query: &Query,
+    params: &crate::traces::search_plan::SearchParams,
+    tables: &super::metrics::StatementTables<'_>,
+    max_depth: u32,
+) -> Result<SearchRequest, PlanError> {
+    let request = SearchRequest {
+        start_ns: params.start_ns,
+        end_ns: params.end_ns,
+        limit: params.limit,
+        spss: params.spss,
+        query: Query {
+            spanset: query.spanset.clone(),
+            pipeline: query.pipeline.clone(),
+            hints: Vec::new(),
+        },
+    };
+    plan_statement_sliced(
+        &request,
+        tables.spans,
+        tables.traces,
+        tables.resources,
+        max_depth,
+        tables.indexed,
+        None,
+    )?;
+    Ok(request)
+}
+
+impl SearchPlan {
+    /// The request this plan's window, caps and query make, unvalidated:
+    /// the previous engine's tests compare the two engines on one plan.
+    pub fn request(&self) -> SearchRequest {
+        SearchRequest {
+            start_ns: self.window.start_ns,
+            end_ns: self.window.end_ns,
+            limit: self.limit,
+            spss: self.spss,
+            query: Query {
+                spanset: self.spanset.clone(),
+                pipeline: self.pipeline.clone(),
+                hints: Vec::new(),
+            },
+        }
+    }
+}
+
+/// The search statement for `plan`, when [`compile_search`] accepts it.
 pub fn plan_statement(
     plan: &SearchPlan,
     spans_table: &str,
@@ -1085,7 +1165,7 @@ pub fn plan_statement(
     indexed: &[super::attr_index::IndexedAttr],
 ) -> Option<SearchStatement> {
     plan_statement_sliced(
-        plan,
+        &plan.request(),
         spans_table,
         traces_table,
         resources_table,
@@ -1093,27 +1173,25 @@ pub fn plan_statement(
         indexed,
         None,
     )
+    .ok()
 }
 
-/// [`plan_statement`], a sliceable statement's top-K reading the newest
-/// `slice_ns` of the window (issue #595).
+/// The search statement for `request`, its top-K reading the newest
+/// `slice_ns` of the window when given (issue #595).
 pub fn plan_statement_sliced(
-    plan: &SearchPlan,
+    request: &SearchRequest,
     spans_table: &str,
     traces_table: &str,
     resources_table: &str,
     max_depth: u32,
     indexed: &[super::attr_index::IndexedAttr],
     slice_ns: Option<i64>,
-) -> Option<SearchStatement> {
-    let window = WindowSql::start_closed_end_open(plan.window.start_ns, plan.window.end_ns);
+) -> Result<SearchStatement, PlanError> {
+    let window = WindowSql::start_closed_end_open(request.start_ns, request.end_ns);
     let slice = slice_ns.map(|len| {
         WindowSql::start_closed_end_open(
-            plan.window
-                .end_ns
-                .saturating_sub(len)
-                .max(plan.window.start_ns),
-            plan.window.end_ns,
+            request.end_ns.saturating_sub(len).max(request.start_ns),
+            request.end_ns,
         )
     });
     let ctx = PredicateCtx {
@@ -1122,22 +1200,16 @@ pub fn plan_statement_sliced(
         resources_table,
         indexed,
     };
-    let query = Query {
-        spanset: plan.spanset.clone(),
-        pipeline: plan.pipeline.clone(),
-        hints: Vec::new(),
-    };
     compile_search_sliced(
-        &query,
+        &request.query,
         &ctx,
         spans_table,
         traces_table,
-        plan.limit,
-        plan.spss,
+        request.limit,
+        request.spss,
         max_depth,
         slice,
     )
-    .ok()
 }
 
 /// [`decode_search`], charging every retained entry against `budget`

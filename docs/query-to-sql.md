@@ -4541,11 +4541,16 @@ One refusal that is **not** a payload rejection, because it happens during evalu
 
 | query | status | body | where |
 |---|---|---|---|
-| `{ !.a = 1 }` against a span whose `a` is present and is not a boolean | `400` | `expression (!.a) expected a boolean` | raised at `search_eval.rs:1227`, mapped at `traces_api/error.rs:385`, pinned character for character by `crates/pulsus-server/tests/traces_search_live.rs:1482` |
+| `{ !.a = 1 }` against a span whose `a` is present and is not a boolean | `400` | `expression (!.a) expected a boolean` | raised at `search_eval.rs:1227`, mapped at `traces_api/error.rs:385`, pinned character for character by `crates/pulsus-server/tests/traces_search_live.rs:1285` |
 
 This one matters most for this work: **it is raised by a stage evaluated after the read, and it must
 stay a `400` regardless of how much of the query became SQL.** Compiling a stage changes which
 process evaluates it, never whether the request is refused.
+
+Since issue #602 part 2b the search route reaches only the search statement, which raises this
+refusal as its own demand (`Code: 395`) and maps it to the same `400` in
+`crates/pulsus-read/src/traces/exec/newest_first.rs` (`statement_error`). `search_eval.rs` and
+`search_plan.rs`, cited in this section, are the previous search engine's, which part 2c deletes.
 
 ---
 

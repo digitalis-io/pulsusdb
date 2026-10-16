@@ -242,8 +242,11 @@ const CONTROL: &str = "with_binding_control.txt";
 /// `traces_spans_metrics` goldens added, two statements each.** Their
 /// `WITH` items (`per_trace` and its aliases, `nested_keys`) are scalars
 /// and aliases, which the parser gives no binding node.
-const SQL_FILES: usize = 170;
-const SQL_STATEMENTS: usize = 457;
+///
+/// **Issue #602 part 2b moves them 170 -> 171 and 457 -> 458: one
+/// `traces_spans_search` golden added, `structural_child`, one statement.**
+const SQL_FILES: usize = 171;
+const SQL_STATEMENTS: usize = 458;
 const PROMQL_ENTRIES: usize = 30;
 const PROMQL_STATEMENTS: usize = 55;
 const CONTROL_STATEMENTS: usize = 1;

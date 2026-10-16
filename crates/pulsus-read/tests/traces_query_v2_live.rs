@@ -7373,7 +7373,7 @@ async fn search_routed_answers_as_today_on_fixture_c() {
                 continue;
             }
             let want = engine.search(&plan).await.map(normalise_today);
-            let got = engine.search_routed(&plan).await;
+            let got = engine.search_routed(&plan.request()).await;
             if let Some((_, at_100)) = NESTED_SET_ON_C.iter().find(|(n, _)| n == name) {
                 let want = cut(at_100, limit, spss);
                 if numbers_of(&got) != want {
@@ -7416,7 +7416,7 @@ async fn search_routed_answers_as_today_on_fixture_c() {
                 wrong.push(format!("{ctx}: not covered"));
                 continue;
             }
-            let routed = engine.search_routed(&plan).await;
+            let routed = engine.search_routed(&plan.request()).await;
             // Issue #602 part 1 (D2): `d1` has no `service.name`, which the
             // statement projects nothing for and today's engine projects as
             // an empty string, so its answer is not compared.
@@ -7832,7 +7832,7 @@ async fn t_q2_a_covered_search_is_one_statement_returning_at_most_limit_rows() {
     let window = (w.first_included_ns(), w.last_included_ns() + 1);
     let plan = plan_of(&engine, &parse_query("{ status = error }"), window, 20, 3);
     let t0 = now_ns();
-    let out = engine.search_routed(&plan).await;
+    let out = engine.search_routed(&plan.request()).await;
     let (n, rows) = settled_statements(&client, &db, t0).await;
     drop_db(&db).await;
     let out = out.expect("the search answers");
@@ -7880,7 +7880,7 @@ async fn search_routed_keeps_the_search_bounds() {
     for (query, limit, spss, want) in cases {
         let plan = plan_of(&engine, &parse_query(query), window, limit, spss);
         let started = std::time::Instant::now();
-        let got = shape(&engine.search_routed(&plan).await);
+        let got = shape(&engine.search_routed(&plan.request()).await);
         eprintln!("{query} ({limit}, {spss}): {got}, {:?}", started.elapsed());
         if !covered(&plan) {
             wrong.push(format!("{query} ({limit}, {spss}): not covered"));
@@ -7895,11 +7895,11 @@ async fn search_routed_keeps_the_search_bounds() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
 }
 
-/// Section 6.9: a run-time demand the statement raises sends the request
-/// to today's engine, whose own answer stands — and the query log shows
-/// the statement was tried first.
+/// Section 6.9, issue #602 part 2b: a run-time demand the statement raises
+/// is the request's error, the same error today's engine gives — and the
+/// query log shows no read of today's tables after the statement's 395.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn search_routed_answers_a_run_time_demand_on_todays_engine() {
+async fn search_routed_answers_a_run_time_demand_itself() {
     skip_unless_live!();
     const MS: i64 = 1_000_000;
     let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
@@ -7971,7 +7971,7 @@ async fn search_routed_answers_a_run_time_demand_on_todays_engine() {
                 covered(&plan)
             ));
         }
-        routed.push(engine.search_routed(&plan).await);
+        routed.push(engine.search_routed(&plan.request()).await);
     }
     client
         .execute(
@@ -8040,9 +8040,9 @@ async fn search_routed_answers_a_run_time_demand_on_todays_engine() {
             "no 395 row for the statement in the query log: {logged:?}"
         )),
         Some(at) => {
-            if !logged.iter().any(|r| r.today == 1 && r.at > at) {
+            if logged.iter().any(|r| r.today == 1 && r.at > at) {
                 wrong.push(format!(
-                    "no read of today's tables after the statement's 395: {logged:?}"
+                    "a read of today's tables after the statement's 395: {logged:?}"
                 ));
             }
         }
@@ -8073,7 +8073,7 @@ async fn search_routed_charges_the_response_it_builds() {
     ] {
         let plan = plan_of(&engine, &parse_query(&query), window, limit, spss);
         let started = std::time::Instant::now();
-        let got = shape(&engine.search_routed(&plan).await);
+        let got = shape(&engine.search_routed(&plan.request()).await);
         eprintln!("({limit}, {spss}): {got}, {:?}", started.elapsed());
         if !covered(&plan) {
             wrong.push(format!("({limit}, {spss}): not covered"));
@@ -8337,7 +8337,10 @@ async fn routed_and_today(
     u64,
 ) {
     let t0 = now_ns();
-    let routed = engine.search_routed(plan).await.map(normalise_today);
+    let routed = engine
+        .search_routed(&plan.request())
+        .await
+        .map(normalise_today);
     let (statements, _) = settled_statements(client, db, t0).await;
     let today = engine.search(plan).await.map(normalise_today);
     (today, routed, statements)
@@ -8424,7 +8427,7 @@ async fn the_integer_and_the_double_do_not_merge() {
     let query = "{ } | by(span.a)";
     let plan = plan_of(&engine, &parse_query(query), window, 20, 3);
     let today = engine.search(&plan).await.map(normalise_today);
-    let routed = engine.search_routed(&plan).await;
+    let routed = engine.search_routed(&plan.request()).await;
     drop_db(&db).await;
     let mut wrong = Vec::new();
     if !covered(&plan) {
@@ -8467,13 +8470,16 @@ async fn coalesce_drops_the_key() {
     let plan = plan_of(&engine, &parse_query(query), window, 20, 3);
     let (today, routed, statements) = routed_and_today(&engine, &client, &db, &plan).await;
     let flat = engine
-        .search_routed(&plan_of(
-            &engine,
-            &parse_query(r#"{ resource.service.name = "checkout" }"#),
-            window,
-            20,
-            3,
-        ))
+        .search_routed(
+            &plan_of(
+                &engine,
+                &parse_query(r#"{ resource.service.name = "checkout" }"#),
+                window,
+                20,
+                3,
+            )
+            .request(),
+        )
         .await;
     drop_db(&db).await;
     let mut wrong = Vec::new();
@@ -8696,7 +8702,7 @@ async fn search_routed_keeps_the_group_cap() {
             ));
         }
         let today = shape(&engine.search(&plan).await);
-        let routed = shape(&engine.search_routed(&plan).await);
+        let routed = shape(&engine.search_routed(&plan.request()).await);
         if !today.starts_with(want_today) {
             wrong.push(format!(
                 "{query} ({limit}) today: want {want_today}, got {today}"
@@ -9293,7 +9299,10 @@ async fn a_value_the_reference_cannot_type_is_missing() {
             wrong.push(format!("{query}: not covered"));
         }
         let t0 = now_ns();
-        let routed = engine.search_routed(&plan).await.map(normalise_today);
+        let routed = engine
+            .search_routed(&plan.request())
+            .await
+            .map(normalise_today);
         let answer = if query.contains("select(") {
             selected_answer_of(&routed)
         } else {
@@ -9602,7 +9611,10 @@ async fn a_refused_condition_under_a_relation_answers_as_today() {
             ));
             continue;
         }
-        let routed = engine.search_routed(&plan).await.map(normalise_today);
+        let routed = engine
+            .search_routed(&plan.request())
+            .await
+            .map(normalise_today);
         let today = engine.search(&plan).await.map(normalise_today);
         let want = "Err(PipelineInvalid { reason: \"expression (!span.x) expected a boolean\" })";
         if format!("{today:?}") != format!("{routed:?}") || format!("{routed:?}") != want {
@@ -9653,7 +9665,10 @@ async fn check_climbing(
             continue;
         }
         let t0 = now_ns();
-        let routed = engine.search_routed(&plan).await.map(normalise_today);
+        let routed = engine
+            .search_routed(&plan.request())
+            .await
+            .map(normalise_today);
         let n = match &routed {
             Ok(_) => settled_statements(&client, &db, t0).await.0,
             Err(_) => 0,
@@ -10012,7 +10027,10 @@ async fn t_a10_t_a11_a_climb_past_the_bound_answers_422() {
                 "{label}: today's engine's, must be the statement's"
             ));
         } else {
-            let routed = engine.search_routed(&plan).await.map(normalise_today);
+            let routed = engine
+                .search_routed(&plan.request())
+                .await
+                .map(normalise_today);
             let today = engine.search(&plan).await.map(normalise_today);
             let (t, r) = (answer_of(&today), answer_of(&routed));
             if t != today_literal || r != routed_literal {
@@ -10059,7 +10077,7 @@ async fn a_configured_bound_counts_parent_links() {
         }
         let engine = pulsus_read::TraceEngine::new(ChClient::new(conn).await.expect("connect"), config);
         let plan = plan_of(&engine, &parse_query(DOWN), (base_ns, base_ns + 60_000_000_000), 20, 20);
-        let routed = answer_of(&engine.search_routed(&plan).await.map(normalise_today));
+        let routed = answer_of(&engine.search_routed(&plan.request()).await.map(normalise_today));
         if routed != want {
             wrong.push(format!("{label}: {routed}, want {want}"));
         }
@@ -10100,7 +10118,10 @@ async fn a_refused_condition_under_a_climb_answers_as_today() {
             ));
             continue;
         }
-        let routed = engine.search_routed(&plan).await.map(normalise_today);
+        let routed = engine
+            .search_routed(&plan.request())
+            .await
+            .map(normalise_today);
         let today = engine.search(&plan).await.map(normalise_today);
         let want = "Err(PipelineInvalid { reason: \"expression (!span.x) expected a boolean\" })";
         if format!("{today:?}") != format!("{routed:?}") || format!("{routed:?}") != want {
@@ -10114,12 +10135,13 @@ async fn a_refused_condition_under_a_climb_answers_as_today() {
 }
 
 /// A climb whose candidate traces cover most of a window of more than 64
-/// granules hands the request to today's engine; a selective one in the
-/// same window stays one statement. 1,000 traces of 140 spans in one
+/// granules is one statement and answers as today's engine does, as a
+/// selective one in the same window is (issue #602 part 2b; it handed the
+/// request to today's engine before). 1,000 traces of 140 spans in one
 /// five-minute bucket: a root, 138 children of it, and an error span under
 /// the last child; trace `000…07` alone has a root named `pick`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_broad_climb_hands_over_to_todays_engine() {
+async fn a_broad_climb_is_one_statement() {
     skip_unless_live!();
     let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
     let mut spans = Vec::new();
@@ -10183,8 +10205,8 @@ async fn a_broad_climb_hands_over_to_todays_engine() {
     let engine = engine_of(&db).await;
     let mut wrong = Vec::new();
     for (query, want) in [
-        (r#"{ status = error } << { }"#, "hand over"),
-        (r#"{ } >> { status = error }"#, "hand over"),
+        (r#"{ status = error } << { }"#, "statement"),
+        (r#"{ } >> { status = error }"#, "statement"),
         (r#"{ name = "pick" } >> { status = error }"#, "statement"),
     ] {
         let plan = plan_of(
@@ -10201,7 +10223,10 @@ async fn a_broad_climb_hands_over_to_todays_engine() {
             continue;
         }
         let t0 = now_ns();
-        let routed = engine.search_routed(&plan).await.map(normalise_today);
+        let routed = engine
+            .search_routed(&plan.request())
+            .await
+            .map(normalise_today);
         let n = match &routed {
             Ok(_) => settled_statements(&client, &db, t0).await.0,
             Err(_) => 0,
@@ -10341,7 +10366,10 @@ async fn check_levels_by(
             continue;
         }
         let t0 = now_ns();
-        let routed = engine.search_routed(&plan).await.map(normalise_today);
+        let routed = engine
+            .search_routed(&plan.request())
+            .await
+            .map(normalise_today);
         if let Err(e) = &routed {
             wrong.push(format!("{query}: routed Err({e})"));
             continue;
@@ -10385,7 +10413,7 @@ async fn check_levels_by(
             20,
             20,
         );
-        let out = engine.search_routed(&plan).await.expect("routed");
+        let out = engine.search_routed(&plan.request()).await.expect("routed");
         let t = out
             .traces
             .iter()
@@ -10896,7 +10924,7 @@ async fn sliced_run(
     );
     let t0 = now_ns();
     let (out, explain) = engine
-        .search_routed_explained(&plan)
+        .search_routed_explained(&plan.request())
         .await
         .unwrap_or_else(|err| panic!("{query}: {err}"));
     let (n, _) = settled_statements(client, db, t0).await;
@@ -10980,12 +11008,14 @@ async fn the_newest_slice_first_plan_answers_fixture_p() {
             3,
             stages595(2, true),
         ),
+        // Issue #602 part 2b: a structural search reads the newest slice
+        // first.
         (
             "{ status = error } >> { status = error }",
             20,
             Vec::new(),
-            1,
-            stages595(0, true),
+            2,
+            stages595(1, true),
         ),
         // Issue #602 part 2a: a spanset tree reads the newest slice first.
         (
@@ -11100,7 +11130,7 @@ async fn a_rare_value_reads_only_its_granules() {
         let plan = plan_of(&engine, &parse_query(query), w, 20, 3);
         let t0 = now_ns();
         let out = engine
-            .search_routed(&plan)
+            .search_routed(&plan.request())
             .await
             .expect("the search answers");
         let rows = read_rows_since(&client, &db, t0).await;
@@ -11195,7 +11225,7 @@ async fn a_slice_the_budget_refuses_falls_back_to_the_window() {
     );
     let st = |slice| {
         pulsus_read::traces::spans::search::plan_statement_sliced(
-            &plan,
+            &plan.request(),
             "spans",
             "traces",
             "resources",
@@ -11221,7 +11251,7 @@ async fn a_slice_the_budget_refuses_falls_back_to_the_window() {
         ChClient::new(client_config(&db)).await.expect("connect"),
         cfg,
     );
-    let out = tight.search_routed_explained(&plan).await;
+    let out = tight.search_routed_explained(&plan.request()).await;
     drop_db(&db).await;
     assert!(
         slice > whole,
@@ -11557,7 +11587,7 @@ async fn the_two_numberings_agree_on_well_formed_traces() {
             wrong.push(format!("{query}: must be the statement's"));
             continue;
         }
-        let routed = numbers_of(&engine.search_routed(&plan).await);
+        let routed = numbers_of(&engine.search_routed(&plan.request()).await);
         let today = numbers_of(&engine.search(&plan).await.map(normalise_today));
         if routed.matches(';').count() != 29 || today != routed {
             wrong.push(format!("{query}\n  today:  {today}\n  routed: {routed}"));
@@ -11632,7 +11662,7 @@ async fn a_sliced_search_numbers_whole_traces() {
             continue;
         }
         let t0 = now_ns();
-        let routed = engine.search_routed_explained(&plan).await;
+        let routed = engine.search_routed_explained(&plan.request()).await;
         let (n, _) = settled_statements(&client, &db, t0).await;
         let today = engine.search(&plan).await.map(normalise_today);
         let stages = match &routed {
@@ -11701,7 +11731,7 @@ async fn a_sliced_search_numbers_a_trace_across_midnight() {
     );
     assert!(covered(&plan), "must be the statement's");
     let t0 = now_ns();
-    let routed = engine.search_routed_explained(&plan).await;
+    let routed = engine.search_routed_explained(&plan.request()).await;
     let (stmts, _) = settled_statements(&client, &db, t0).await;
     drop_db(&db).await;
     let (out, explain) = routed.expect("routed");
@@ -11855,7 +11885,7 @@ async fn a_numbered_search_doubles_past_an_empty_slice() {
     );
     assert!(covered(&plan), "must be the statement's");
     let t0 = now_ns();
-    let routed = engine.search_routed_explained(&plan).await;
+    let routed = engine.search_routed_explained(&plan.request()).await;
     let (stmts, _) = settled_statements(&client, &db, t0).await;
     drop_db(&db).await;
     let (out, explain) = routed.expect("routed");
@@ -11998,7 +12028,7 @@ async fn an_indexed_attribute_reads_only_its_granules_and_answers_as_before() {
             let plan = plan_of(&engine, &parse_query(query), w, 20, 3);
             let t0 = now_ns();
             let out = engine
-                .search_routed(&plan)
+                .search_routed(&plan.request())
                 .await
                 .unwrap_or_else(|e| panic!("{query}: {e}"));
             let rows = read_rows_since(&client, &db, t0).await;
@@ -12234,7 +12264,10 @@ async fn a_trace_without_its_row_has_no_value() {
             ));
             continue;
         }
-        let routed = engine.search_routed(&plan).await.map(normalise_today);
+        let routed = engine
+            .search_routed(&plan.request())
+            .await
+            .map(normalise_today);
         if render(&routed) != want {
             wrong.push(format!(
                 "{query}\n  want {want}\n  got  {}",
@@ -12374,7 +12407,7 @@ async fn a_sliced_search_reads_whole_trace_values() {
         20,
     );
     let t0 = now_ns();
-    let routed = engine.search_routed_explained(&plan).await;
+    let routed = engine.search_routed_explained(&plan.request()).await;
     let (n, _) = settled_statements(&client, &db, t0).await;
     let today = engine.search(&plan).await.map(normalise_today);
     drop_db(&db).await;
@@ -12487,7 +12520,12 @@ async fn a_count_or_number_without_its_row_is_zero() {
             20,
         );
         let routed = if covered(&plan) {
-            grouped_answer_of(&engine.search_routed(&plan).await.map(normalise_today))
+            grouped_answer_of(
+                &engine
+                    .search_routed(&plan.request())
+                    .await
+                    .map(normalise_today),
+            )
         } else {
             "today's engine's, must be the statement's".to_string()
         };
@@ -12711,7 +12749,7 @@ async fn a_sliced_search_compares_whole_numbers() {
         20,
     );
     let t0 = now_ns();
-    let routed = engine.search_routed_explained(&plan).await;
+    let routed = engine.search_routed_explained(&plan.request()).await;
     let (n, _) = settled_statements(&client, &db, t0).await;
     drop_db(&db).await;
     let stages = match &routed {
@@ -15973,7 +16011,10 @@ async fn a_value_is_held_only_as_the_reference_types_it() {
             wrong.push(format!("{id} {query}: not covered"));
         }
         let t0 = now_ns();
-        let routed = engine.search_routed(&plan).await.map(normalise_today);
+        let routed = engine
+            .search_routed(&plan.request())
+            .await
+            .map(normalise_today);
         let answer = if query.contains("by(") || query.contains(" > ") {
             grouped_answer_of(&routed)
         } else {
@@ -16094,7 +16135,10 @@ async fn a_service_name_is_held_only_as_a_string_under_not() {
         ),
     ] {
         let plan = plan_of(&engine, &parse_query(query), window, 20, 10);
-        let routed = engine.search_routed(&plan).await.map(normalise_today);
+        let routed = engine
+            .search_routed(&plan.request())
+            .await
+            .map(normalise_today);
         let answer = if id == "W8" {
             match &routed {
                 Err(e) => format!("Err({e})"),
@@ -16219,7 +16263,10 @@ async fn a_service_name_aggregate_reads_only_a_string() {
             wrong.push(format!("{query}: not covered"));
         }
         let t0 = now_ns();
-        let routed = engine.search_routed(&plan).await.map(normalise_today);
+        let routed = engine
+            .search_routed(&plan.request())
+            .await
+            .map(normalise_today);
         let answer = grouped_answer_of(&routed);
         if answer != literal {
             wrong.push(format!(
@@ -16290,7 +16337,7 @@ async fn a_covered_grouping_is_capped_by_one_statement() {
         wrong.push(format!("{query}: not covered"));
     }
     let t0 = now_ns();
-    let got = shape(&engine.search_routed(&plan).await);
+    let got = shape(&engine.search_routed(&plan.request()).await);
     let cap = "Err(QueryTooBroad(TraceSearchSeriesCap { count: 3, cap: 2 }))";
     if !got.starts_with(cap) {
         wrong.push(format!("{query}: want {cap}, got {got}"));
@@ -16391,7 +16438,10 @@ async fn an_unscoped_service_name_is_held_only_as_a_string() {
             wrong.push(format!("{id} {query}: not covered"));
         }
         let t0 = now_ns();
-        let routed = engine.search_routed(&plan).await.map(normalise_today);
+        let routed = engine
+            .search_routed(&plan.request())
+            .await
+            .map(normalise_today);
         let answer = if query.contains("| by(") || query.contains("| max(") {
             grouped_answer_of(&routed)
         } else {
@@ -16750,7 +16800,7 @@ async fn every_pipeline_shape_is_one_statement_and_answers_as_written() {
     for (q, limit, want, sliced) in &cases {
         let query = parse_query(q);
         let plan = plan_of(&engine, &query, window, *limit, 10);
-        let got = engine.search_routed_explained(&plan).await;
+        let got = engine.search_routed_explained(&plan.request()).await;
         let (text, stages) = match &got {
             Ok((out, explain)) => (
                 p2_written(out),
@@ -16889,6 +16939,292 @@ async fn a_metrics_negation_is_served_and_a_non_boolean_is_400() {
         };
         if got != want {
             wrong.push(format!("{q} to {end}: want {want}, got {got}"));
+        }
+    }
+    drop_db(&db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+// =====================================================================
+// Issue #602 part 2b: fixture S, a structural search sliced, and a
+// demand raised in the newest slice.
+// =====================================================================
+
+/// One trace of fixture S: spans `(parent index or 0, name, ms before
+/// end_ns)`, each 1 ms long, span ids `…01…` in order.
+fn s_trace(
+    id: u8,
+    service: &str,
+    end_ns: i64,
+    spans: &[(u8, &str, i64)],
+) -> ExportTraceServiceRequest {
+    const MS: i64 = 1_000_000;
+    let spans: Vec<Span> = spans
+        .iter()
+        .enumerate()
+        .map(|(i, (parent, name, back_ms))| {
+            span_of(
+                p2_id(id),
+                p2_sid(i as u8 + 1),
+                if *parent == 0 {
+                    Vec::new()
+                } else {
+                    p2_sid(*parent)
+                },
+                name,
+                2,
+                end_ns - back_ms * MS,
+                MS,
+                Vec::new(),
+                0,
+                Vec::new(),
+                Vec::new(),
+            )
+        })
+        .collect();
+    request(service, "pod-1", spans)
+}
+
+fn s_bodies(end_ns: i64) -> Vec<ExportTraceServiceRequest> {
+    const S: i64 = 1_000;
+    const M: i64 = 60_000;
+    const H: i64 = 3_600_000;
+    vec![
+        s_trace(0xd1, "S1", end_ns, &[(0, "p1", 2 * H), (1, "c1", 60 * S)]),
+        s_trace(0xd2, "S2", end_ns, &[(0, "p1", 31 * M), (1, "c1", 30 * M)]),
+        s_trace(
+            0xd3,
+            "S3",
+            end_ns,
+            &[
+                (0, "zz", 101 * S),
+                (1, "gc", 100 * S),
+                (0, "gp", 3 * H),
+                (3, "gc", 3 * H - S),
+            ],
+        ),
+        s_trace(
+            0xd4,
+            "S4",
+            end_ns,
+            &[(0, "gp", 2 * H), (1, "gc", 2 * H - S)],
+        ),
+        s_trace(
+            0xd5,
+            "S5",
+            end_ns,
+            &[(0, "r5", 3 * H), (1, "m5", 2 * H), (2, "leaf5", 30 * S)],
+        ),
+        s_trace(0xd6, "S6", end_ns, &[(0, "np", 2 * H), (1, "nc", 40 * S)]),
+        s_trace(0xd7, "S7", end_ns, &[(0, "nc", H)]),
+        s_trace(0xd8, "S8", end_ns, &[(0, "ua", 50 * S), (1, "ub", 2 * H)]),
+        s_trace(0xd9, "S9", end_ns, &[(0, "ua", 3 * H), (1, "ub", 70 * S)]),
+        s_trace(
+            0xda,
+            "SA",
+            end_ns,
+            &[
+                (0, "p7", 3 * H),
+                (1, "c7", 45 * S),
+                (0, "w7", 3 * H - 5 * S),
+            ],
+        ),
+        s_trace(0xdb, "SB", end_ns, &[(0, "p7", 50 * M), (1, "c7", 49 * M)]),
+    ]
+}
+
+/// Issue #602 part 2b, plan §5.1: a structural search over fixture S
+/// answers as `docs/api.md`'s structural rules say, by the search
+/// statement alone, and the cases marked sliced by the newest slice alone:
+/// its relations read the candidates' keys over the whole window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_structural_search_reads_its_candidates_newest_slice_first() {
+    skip_unless_live!();
+    let end_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let window = (end_ns - 4 * 3_600_000_000_000, end_ns);
+    let (db, _client) = seed_both(
+        pulsus_testkit::test_db("p2b_s"),
+        &s_bodies(end_ns),
+        25,
+        "p2bs",
+    )
+    .await;
+    let engine = engine_of(&db).await;
+    let cases: Vec<(&str, &str, u32, &str, bool)> = vec![
+        (
+            "S1",
+            r#"{ name = "p1" } > { name = "c1" }"#,
+            1,
+            "c0d1(1): 0002",
+            true,
+        ),
+        (
+            "S2",
+            r#"{ name = "p1" } > { name = "c1" }"#,
+            5,
+            "c0d1(1): 0002 ; c0d2(1): 0002",
+            false,
+        ),
+        (
+            "S3",
+            r#"{ name = "gp" } > { name = "gc" }"#,
+            1,
+            "c0d4(1): 0002",
+            false,
+        ),
+        (
+            "S4",
+            r#"{ name = "r5" } >> { name = "leaf5" }"#,
+            1,
+            "c0d5(1): 0003",
+            true,
+        ),
+        (
+            "S5",
+            r#"{ name = "leaf5" } << { name = "r5" }"#,
+            1,
+            "c0d5(1): 0001",
+            false,
+        ),
+        (
+            "S6",
+            r#"{ name = "np" } !> { name = "nc" }"#,
+            1,
+            "c0d7(1): 0001",
+            false,
+        ),
+        (
+            "S7",
+            r#"{ name = "ua" } &> { name = "ub" }"#,
+            1,
+            "c0d8(2): 0002 0001",
+            true,
+        ),
+        (
+            "S8",
+            r#"({ name = "p7" } > { name = "c7" }) && { name = "w7" }"#,
+            1,
+            "c0da(2): 0003 0002",
+            true,
+        ),
+        (
+            "S9",
+            r#"{ name = "c1" } | by(trace:id)"#,
+            1,
+            "c0d1(1): 0002 <[by(trace:id)=Str c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0d1] m1 0002>",
+            true,
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (id, q, limit, want, sliced) in &cases {
+        let query = parse_query(q);
+        let plan = plan_of(&engine, &query, window, *limit, 10);
+        let got = engine.search_routed_explained(&plan.request()).await;
+        let (text, stages) = match &got {
+            Ok((out, explain)) => (
+                p2_written(out),
+                explain
+                    .stages
+                    .iter()
+                    .map(|s| s.name.to_string())
+                    .collect::<Vec<_>>(),
+            ),
+            Err(e) => (format!("ERR {e}"), Vec::new()),
+        };
+        if text != *want {
+            wrong.push(format!("{id} {q}\n  want: {want}\n  got:  {text}"));
+        }
+        if stages
+            .iter()
+            .any(|s| s != "search_slice" && s != "search_statement")
+        {
+            wrong.push(format!(
+                "{id} {q}: answered by {stages:?}, not the statement"
+            ));
+        }
+        if *sliced && stages != vec!["search_slice".to_string()] {
+            wrong.push(format!("{id} {q}: {stages:?}, want the first slice alone"));
+        }
+        let old = today(&db, &query, window, *limit, 10)
+            .await
+            .map(normalise_today);
+        if let Ok(mut o) = old {
+            o.partial = false;
+            if p2_written(&o) != *want {
+                eprintln!("{id}: today's engine answers {}", p2_written(&o));
+            }
+        }
+    }
+    drop_db(&db).await;
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n\n")
+    );
+}
+
+/// Issue #602 part 2b: a `!` demand raised while the newest slice is read
+/// is the request's `400`, carrying the demand's text, with or without a
+/// `by(trace:id)` stage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_demand_in_the_slice_is_the_requests_400() {
+    skip_unless_live!();
+    const MS: i64 = 1_000_000;
+    let end_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let window = (end_ns - 3_600_000_000_000, end_ns);
+    let one = |id: u8, back_s: i64, f: AnyValue| {
+        request(
+            "E",
+            "pod-1",
+            vec![span_of(
+                p2_id(id),
+                p2_sid(1),
+                Vec::new(),
+                "e",
+                2,
+                end_ns - back_s * 1_000 * MS,
+                MS,
+                vec![kv("f", f)],
+                0,
+                Vec::new(),
+                Vec::new(),
+            )],
+        )
+    };
+    // Forty traces whose `f` is false, the newest, then one whose `f` is a
+    // string, all in the newest slice: more than one batch of the previous
+    // engine's candidates (`BATCH_TRACES`, 32) lies before the string.
+    let mut bodies: Vec<ExportTraceServiceRequest> = (0..40u8)
+        .map(|i| one(0x80 + i, 10 + i64::from(i), bool_value(false)))
+        .collect();
+    bodies.push(one(0xe2, 100, str_value("s")));
+    let (db, _client) = seed_both(pulsus_testkit::test_db("p2b_demand"), &bodies, 41, "p2bd").await;
+    let engine = engine_of(&db).await;
+    let mut wrong = Vec::new();
+    for (q, limit, want) in [
+        (
+            "{ !span.f }",
+            1u32,
+            "Err(expression (!span.f) expected a boolean)",
+        ),
+        (
+            "{ !span.f } | by(trace:id)",
+            1,
+            "Err(expression (!span.f) expected a boolean)",
+        ),
+    ] {
+        let query = parse_query(q);
+        let plan = plan_of(&engine, &query, window, limit, 10);
+        let got = match engine.search_routed_explained(&plan.request()).await {
+            Ok((out, _)) => format!("Ok({})", p2_written(&out)),
+            Err(pulsus_read::logql::ReadError::PipelineInvalid { reason }) => {
+                format!("Err({reason})")
+            }
+            Err(e) => format!("Err(other: {e})"),
+        };
+        if got != want {
+            wrong.push(format!("{q}: want {want}, got {got}"));
         }
     }
     drop_db(&db).await;
