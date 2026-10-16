@@ -155,6 +155,9 @@ struct Cli {
     command: Option<Command>,
 }
 
+// The variants name the subcommands (`rebuild-metrics`, `rebuild-logs`,
+// `rebuild-traces`), so their shared prefix is the command line's.
+#[allow(clippy::enum_variant_names)]
 #[derive(clap::Subcommand, Debug)]
 enum Command {
     /// Replay a window of the metrics landing table into one of the four

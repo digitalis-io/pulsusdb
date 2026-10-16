@@ -303,10 +303,10 @@ fn key_digest(key: &str) -> PushDigest {
 /// Resolves a log push's identity — the digest of the `Idempotency-Key`
 /// when the client sent one, else of the request's own content.
 ///
-/// `tenant` is the push's tenant (issue #653).
+/// Issue #653: the push's tenant is in the key, so two tenants' identical
+/// pushes, with or without one `Idempotency-Key`, are two pushes.
 pub fn log_identity(batch: &ParsedLogs, headers: &PushHeaders, tenant: &Tenant) -> PushIdentity {
-    let _ = tenant;
-    identity_from(log_content_digest(batch), headers, None)
+    identity_from(log_content_digest(batch), headers, Some(tenant))
 }
 
 /// Resolves a metric push's identity — see [`log_identity`]. Issue #635
@@ -405,9 +405,9 @@ pub fn trace_identity(batch: &ParsedTraces, headers: &PushHeaders) -> PushIdenti
     identity_from(trace_content_digest(batch), headers, None)
 }
 
-/// `tenant` is `None` for the logs and traces identities, which are
-/// unchanged; a metric push's tenant is hashed into the key on both
-/// branches, the `Idempotency-Key` digest and the content digest.
+/// `tenant` is `None` for the traces identity, which is unchanged; a
+/// metric or log push's tenant (issues #635, #653) is hashed into the key on
+/// both branches, the `Idempotency-Key` digest and the content digest.
 fn identity_from(
     content: PushDigest,
     headers: &PushHeaders,

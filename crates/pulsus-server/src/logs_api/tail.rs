@@ -49,7 +49,7 @@ use crate::app::AppState;
 
 use super::encode;
 use super::error::ApiError;
-use super::handlers::engine_for;
+use super::handlers::{engine_for, tenant_of};
 use super::params::{self, ParamError};
 
 /// Best-effort deadline on the final WebSocket Close frame. Deliberately
@@ -231,12 +231,16 @@ pub(crate) async fn tail(
     RawQuery(raw): RawQuery,
     ws: WebSocketUpgrade,
 ) -> Response {
+    let tenant = match tenant_of(&headers) {
+        Ok(tenant) => tenant,
+        Err(e) => return e.into_response(),
+    };
     let pairs = params::parse_pairs(raw.as_deref().unwrap_or(""));
     let p = match parse_tail_params(&pairs, &state.config) {
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };
-    let engine = match engine_for(&state).await {
+    let engine = match engine_for(&state, tenant).await {
         Ok(engine) => engine,
         Err(e) => return e.into_response(),
     };

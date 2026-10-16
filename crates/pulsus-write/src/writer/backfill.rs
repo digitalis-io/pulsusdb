@@ -419,7 +419,6 @@ fn remove_matching_and_update_gauge<R: BackfillRow>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::writer::registration::StreamKey;
     use crate::writer::rows::{LogStreamRow, TraceAttrRow};
     use pulsus_model::Fingerprint;
 
@@ -433,7 +432,7 @@ mod tests {
         }
     }
 
-    fn keys_of(rows: &[LogStreamRow]) -> Vec<StreamKey> {
+    fn keys_of(rows: &[LogStreamRow]) -> Vec<(pulsus_model::Fingerprint, u16)> {
         rows.iter().map(|r| (r.fingerprint, r.month)).collect()
     }
 

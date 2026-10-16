@@ -9,6 +9,7 @@ use axum::http::{HeaderMap, header};
 use axum::response::{IntoResponse, Response};
 
 use pulsus_logql::{Expr, LogExpr};
+use pulsus_model::Tenant;
 use pulsus_read::{LogQlEngine, QueryParams, QuerySpec, ResponseOptions, TimeBounds};
 
 use crate::app::AppState;
@@ -31,7 +32,7 @@ fn wants_explain(headers: &HeaderMap) -> bool {
 /// pattern: clone the `Option` out from behind the lock, drop the guard
 /// before doing anything else) and builds a `LogQlEngine` over it —
 /// `503 unavailable` before the pool is established, matching `/ready`.
-pub(super) async fn engine_for(state: &AppState) -> Result<LogQlEngine, ApiError> {
+pub(super) async fn engine_for(state: &AppState, tenant: Tenant) -> Result<LogQlEngine, ApiError> {
     let pool = {
         let guard = state.pool.read().await;
         guard.clone()
@@ -40,7 +41,16 @@ pub(super) async fn engine_for(state: &AppState) -> Result<LogQlEngine, ApiError
     // Issue #114: the consistency-config invariant is already enforced at
     // config load, so this is unreachable in the real binary; a failure maps
     // to the existing 503 "not serving" semantics.
-    chconfig::logql_engine(pool, &state.config).map_err(|_| ApiError::PoolUnavailable)
+    chconfig::logql_engine(pool, &state.config, tenant).map_err(|_| ApiError::PoolUnavailable)
+}
+
+/// The request's tenant (issue #653), by the metrics rule
+/// (`pulsus_model::Tenant::from_header`): the first statement of every
+/// public log handler, so an invalid header is the answer whatever else the
+/// request gets wrong, and no engine — so no statement — exists without it.
+pub(super) fn tenant_of(headers: &HeaderMap) -> Result<Tenant, ApiError> {
+    pulsus_model::tenant_from_headers(headers)
+        .map_err(|_| ApiError::Param(ParamError::InvalidTenant))
 }
 
 /// Parses `start`/`end`/`since` (docs/api.md §2.1) and applies the
@@ -328,8 +338,12 @@ pub(crate) async fn query_range(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
+    let tenant = match tenant_of(&headers) {
+        Ok(tenant) => tenant,
+        Err(e) => return e.into_response(),
+    };
     let pairs = params::parse_pairs(raw.as_deref().unwrap_or(""));
-    match query_range_impl(state, &headers, pairs).await {
+    match query_range_impl(state, tenant, &headers, pairs).await {
         Ok(res) => res,
         Err(e) => e.into_response(),
     }
@@ -346,8 +360,12 @@ pub(crate) async fn query_range_post(
     RawQuery(raw): RawQuery,
     body: Body,
 ) -> Response {
+    let tenant = match tenant_of(&headers) {
+        Ok(tenant) => tenant,
+        Err(e) => return e.into_response(),
+    };
     match read_form_pairs(&headers, raw.as_deref(), body).await {
-        Ok(pairs) => match query_range_impl(state, &headers, pairs).await {
+        Ok(pairs) => match query_range_impl(state, tenant, &headers, pairs).await {
             Ok(res) => res,
             Err(e) => e.into_response(),
         },
@@ -357,6 +375,7 @@ pub(crate) async fn query_range_post(
 
 async fn query_range_impl(
     state: AppState,
+    tenant: Tenant,
     headers: &HeaderMap,
     pairs: Vec<(String, String)>,
 ) -> Result<Response, ApiError> {
@@ -380,7 +399,7 @@ async fn query_range_impl(
         direction,
     };
 
-    let engine = engine_for(&state).await?;
+    let engine = engine_for(&state, tenant).await?;
     run_query(
         &engine,
         &expr,
@@ -401,8 +420,12 @@ pub(crate) async fn query(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
+    let tenant = match tenant_of(&headers) {
+        Ok(tenant) => tenant,
+        Err(e) => return e.into_response(),
+    };
     let pairs = params::parse_pairs(raw.as_deref().unwrap_or(""));
-    match query_impl(state, &headers, pairs).await {
+    match query_impl(state, tenant, &headers, pairs).await {
         Ok(res) => res,
         Err(e) => e.into_response(),
     }
@@ -416,8 +439,12 @@ pub(crate) async fn query_post(
     RawQuery(raw): RawQuery,
     body: Body,
 ) -> Response {
+    let tenant = match tenant_of(&headers) {
+        Ok(tenant) => tenant,
+        Err(e) => return e.into_response(),
+    };
     match read_form_pairs(&headers, raw.as_deref(), body).await {
-        Ok(pairs) => match query_impl(state, &headers, pairs).await {
+        Ok(pairs) => match query_impl(state, tenant, &headers, pairs).await {
             Ok(res) => res,
             Err(e) => e.into_response(),
         },
@@ -427,6 +454,7 @@ pub(crate) async fn query_post(
 
 async fn query_impl(
     state: AppState,
+    tenant: Tenant,
     headers: &HeaderMap,
     pairs: Vec<(String, String)>,
 ) -> Result<Response, ApiError> {
@@ -444,7 +472,7 @@ async fn query_impl(
         direction,
     };
 
-    let engine = engine_for(&state).await?;
+    let engine = engine_for(&state, tenant).await?;
     run_query(
         &engine,
         &expr,
@@ -536,8 +564,12 @@ pub(crate) async fn labels_get(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
+    let tenant = match tenant_of(&headers) {
+        Ok(tenant) => tenant,
+        Err(e) => return e.into_response(),
+    };
     let pairs = params::parse_pairs(raw.as_deref().unwrap_or(""));
-    match labels_impl(state, &headers, pairs).await {
+    match labels_impl(state, tenant, &headers, pairs).await {
         Ok(res) => res,
         Err(e) => e.into_response(),
     }
@@ -549,8 +581,12 @@ pub(crate) async fn labels_post(
     RawQuery(raw): RawQuery,
     body: Body,
 ) -> Response {
+    let tenant = match tenant_of(&headers) {
+        Ok(tenant) => tenant,
+        Err(e) => return e.into_response(),
+    };
     match read_form_pairs(&headers, raw.as_deref(), body).await {
-        Ok(pairs) => match labels_impl(state, &headers, pairs).await {
+        Ok(pairs) => match labels_impl(state, tenant, &headers, pairs).await {
             Ok(res) => res,
             Err(e) => e.into_response(),
         },
@@ -560,6 +596,7 @@ pub(crate) async fn labels_post(
 
 async fn labels_impl(
     state: AppState,
+    tenant: Tenant,
     headers: &HeaderMap,
     pairs: Vec<(String, String)>,
 ) -> Result<Response, ApiError> {
@@ -570,7 +607,7 @@ async fn labels_impl(
     let selector = super::parse_optional_selector(&pairs)?;
     let (start_ns, end_ns) = parse_bounds_ordered(&pairs)?;
     let bounds = TimeBounds { start_ns, end_ns };
-    let engine = engine_for(&state).await?;
+    let engine = engine_for(&state, tenant).await?;
     if wants_explain(headers) {
         let (names, explain) = engine
             .label_names_explained(selector.as_ref(), bounds)
@@ -592,8 +629,12 @@ pub(crate) async fn label_values(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
+    let tenant = match tenant_of(&headers) {
+        Ok(tenant) => tenant,
+        Err(e) => return e.into_response(),
+    };
     let pairs = params::parse_pairs(raw.as_deref().unwrap_or(""));
-    match label_values_impl(state, &name, &headers, pairs).await {
+    match label_values_impl(state, tenant, &name, &headers, pairs).await {
         Ok(res) => res,
         Err(e) => e.into_response(),
     }
@@ -614,8 +655,12 @@ pub(crate) async fn label_values_post(
     RawQuery(raw): RawQuery,
     body: Body,
 ) -> Response {
+    let tenant = match tenant_of(&headers) {
+        Ok(tenant) => tenant,
+        Err(e) => return e.into_response(),
+    };
     match read_form_pairs(&headers, raw.as_deref(), body).await {
-        Ok(pairs) => match label_values_impl(state, &name, &headers, pairs).await {
+        Ok(pairs) => match label_values_impl(state, tenant, &name, &headers, pairs).await {
             Ok(res) => res,
             Err(e) => e.into_response(),
         },
@@ -625,6 +670,7 @@ pub(crate) async fn label_values_post(
 
 async fn label_values_impl(
     state: AppState,
+    tenant: Tenant,
     name: &str,
     headers: &HeaderMap,
     pairs: Vec<(String, String)>,
@@ -634,7 +680,7 @@ async fn label_values_impl(
     let selector = super::parse_optional_selector(&pairs)?;
     let (start_ns, end_ns) = parse_bounds_ordered(&pairs)?;
     let bounds = TimeBounds { start_ns, end_ns };
-    let engine = engine_for(&state).await?;
+    let engine = engine_for(&state, tenant).await?;
     if wants_explain(headers) {
         let (values, explain) = engine
             .label_values_explained(name, selector.as_ref(), bounds)
@@ -655,8 +701,12 @@ pub(crate) async fn series_get(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
+    let tenant = match tenant_of(&headers) {
+        Ok(tenant) => tenant,
+        Err(e) => return e.into_response(),
+    };
     let pairs = params::parse_pairs(raw.as_deref().unwrap_or(""));
-    match series_impl(state, &headers, pairs).await {
+    match series_impl(state, tenant, &headers, pairs).await {
         Ok(res) => res,
         Err(e) => e.into_response(),
     }
@@ -668,8 +718,12 @@ pub(crate) async fn series_post(
     RawQuery(raw): RawQuery,
     body: Body,
 ) -> Response {
+    let tenant = match tenant_of(&headers) {
+        Ok(tenant) => tenant,
+        Err(e) => return e.into_response(),
+    };
     match read_form_pairs(&headers, raw.as_deref(), body).await {
-        Ok(pairs) => match series_impl(state, &headers, pairs).await {
+        Ok(pairs) => match series_impl(state, tenant, &headers, pairs).await {
             Ok(res) => res,
             Err(e) => e.into_response(),
         },
@@ -679,6 +733,7 @@ pub(crate) async fn series_post(
 
 async fn series_impl(
     state: AppState,
+    tenant: Tenant,
     headers: &HeaderMap,
     pairs: Vec<(String, String)>,
 ) -> Result<Response, ApiError> {
@@ -698,7 +753,7 @@ async fn series_impl(
     }
     let (start_ns, end_ns) = parse_bounds_ordered(&pairs)?;
     let bounds = TimeBounds { start_ns, end_ns };
-    let engine = engine_for(&state).await?;
+    let engine = engine_for(&state, tenant).await?;
     if wants_explain(headers) {
         let (data, explain) = engine.series_explained(&selectors, bounds).await?;
         Ok(encode::json_array_response(data, Some(explain)))

@@ -16,7 +16,6 @@ use crate::ingest::traces::{
 };
 use crate::protocols::otlp_logs::{LogRow, StreamRow};
 use crate::writer::backfill::BackfillRow;
-use crate::writer::registration::StreamKey;
 use crate::writer::spool::{FiniteOrNull, SpoolEncode, SpoolSink};
 use pulsus_clickhouse::json_column::TraceJson;
 
@@ -150,9 +149,9 @@ impl SpoolEncode for LogStreamRow {
 /// `ReplacingMergeTree(updated_ns)` dedup key — versioned on `updated_ns`
 /// (larger wins, mirroring the merge's winner).
 impl BackfillRow for LogStreamRow {
-    type Key = StreamKey;
+    type Key = (Fingerprint, u16);
 
-    fn backfill_key(&self) -> StreamKey {
+    fn backfill_key(&self) -> (Fingerprint, u16) {
         (self.fingerprint, self.month)
     }
 
@@ -396,12 +395,14 @@ impl LogLandingRow {
 }
 
 impl SpoolEncode for LogLandingRow {
-    /// `kind` and `received_ms`, then exactly the keys that kind's target row
+    /// `org_id` (issue #653, so a failure record names the tenant), `kind`
+    /// and `received_ms`, then exactly the keys that kind's target row
     /// already emits. One encoder emitting every column of the union would put
     /// another kind's fields in a row that does not carry them.
     fn to_spool_value(&self) -> serde_json::Value {
         match self.kind {
             Self::KIND_LINE => serde_json::json!({
+                "org_id": &*self.org_id,
                 "kind": self.kind,
                 "received_ms": self.received_ms,
                 "service": self.service,
@@ -412,6 +413,7 @@ impl SpoolEncode for LogLandingRow {
                 "structured_metadata": self.structured_metadata,
             }),
             Self::KIND_STREAM => serde_json::json!({
+                "org_id": &*self.org_id,
                 "kind": self.kind,
                 "received_ms": self.received_ms,
                 "month": self.month,
@@ -427,6 +429,7 @@ impl SpoolEncode for LogLandingRow {
             // path. The keys are the TARGET's (`bucket_ns`, `count`), not this
             // row type's.
             _ => serde_json::json!({
+                "org_id": &*self.org_id,
                 "kind": self.kind,
                 "received_ms": self.received_ms,
                 "fingerprint": self.fingerprint,
@@ -461,6 +464,7 @@ impl SpoolEncode for LogLandingRow {
                 o.str_field("body", &self.body).await?;
                 o.field("fingerprint", &self.fingerprint).await?;
                 o.field("kind", &self.kind).await?;
+                o.str_field("org_id", &self.org_id).await?;
                 o.field("received_ms", &self.received_ms).await?;
                 o.str_field("service", &self.service).await?;
                 o.field("severity", &self.severity).await?;
@@ -473,6 +477,7 @@ impl SpoolEncode for LogLandingRow {
                 o.field("kind", &self.kind).await?;
                 o.str_field("labels", &self.labels).await?;
                 o.field("month", &self.month).await?;
+                o.str_field("org_id", &self.org_id).await?;
                 o.field("received_ms", &self.received_ms).await?;
                 o.str_field("service", &self.service).await?;
                 o.field("updated_ns", &self.updated_ns).await?;
@@ -484,6 +489,7 @@ impl SpoolEncode for LogLandingRow {
                 o.field("count", &self.pattern_count).await?;
                 o.field("fingerprint", &self.fingerprint).await?;
                 o.field("kind", &self.kind).await?;
+                o.str_field("org_id", &self.org_id).await?;
                 o.str_field("pattern", &self.pattern).await?;
                 o.field("received_ms", &self.received_ms).await?;
             }

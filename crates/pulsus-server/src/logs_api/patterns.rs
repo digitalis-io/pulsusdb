@@ -20,8 +20,9 @@ use crate::app::AppState;
 
 use super::encode;
 use super::error::ApiError;
-use super::handlers::{engine_for, parse_bounds, read_form_pairs};
+use super::handlers::{engine_for, parse_bounds, read_form_pairs, tenant_of};
 use super::params::{self, ParamError};
+use pulsus_model::Tenant;
 
 /// `X-Pulsus-Explain: 1` — same header contract as the query endpoints.
 fn wants_explain(headers: &HeaderMap) -> bool {
@@ -36,8 +37,12 @@ pub(crate) async fn patterns(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
+    let tenant = match tenant_of(&headers) {
+        Ok(tenant) => tenant,
+        Err(e) => return e.into_response(),
+    };
     let pairs = params::parse_pairs(raw.as_deref().unwrap_or(""));
-    match patterns_impl(state, &headers, pairs).await {
+    match patterns_impl(state, tenant, &headers, pairs).await {
         Ok(res) => res,
         Err(e) => e.into_response(),
     }
@@ -53,8 +58,12 @@ pub(crate) async fn patterns_post(
     RawQuery(raw): RawQuery,
     body: Body,
 ) -> Response {
+    let tenant = match tenant_of(&headers) {
+        Ok(tenant) => tenant,
+        Err(e) => return e.into_response(),
+    };
     match read_form_pairs(&headers, raw.as_deref(), body).await {
-        Ok(pairs) => match patterns_impl(state, &headers, pairs).await {
+        Ok(pairs) => match patterns_impl(state, tenant, &headers, pairs).await {
             Ok(res) => res,
             Err(e) => e.into_response(),
         },
@@ -64,6 +73,7 @@ pub(crate) async fn patterns_post(
 
 async fn patterns_impl(
     state: AppState,
+    tenant: Tenant,
     headers: &HeaderMap,
     pairs: Vec<(String, String)>,
 ) -> Result<Response, ApiError> {
@@ -97,7 +107,7 @@ async fn patterns_impl(
         return Ok(encode::patterns_response(Vec::new(), None));
     }
 
-    let engine = engine_for(&state).await?;
+    let engine = engine_for(&state, tenant).await?;
     if wants_explain(headers) {
         let (series, explain) = engine.patterns_explained(&expr, bounds, step_ns).await?;
         Ok(encode::patterns_response(series, Some(explain)))

@@ -32,7 +32,7 @@
 //!
 //! **Registration**: `StreamLru` promotion stays success-only — the LRU is
 //! promoted when the block commits, never at admission — keyed
-//! `(fingerprint, month)`. A registration is a kind-1 row inside the lines'
+//! `(tenant, fingerprint, month)` (issue #653). A registration is a kind-1 row inside the lines'
 //! own block rather than its own insert, so there is no "lines committed,
 //! registration lost" orphan left to heal and **no registration backfill on
 //! this path** (issue #134's mechanism goes with it).
@@ -75,7 +75,7 @@ use crate::writer::landing::{
 };
 use crate::writer::metrics::{WriterMetrics, WriterMetricsSnapshot};
 use crate::writer::push_dedup::{self, Admission, ClaimTicket, PushDedup};
-use crate::writer::registration::StreamLru;
+use crate::writer::registration::{StreamKey, StreamLru};
 use crate::writer::rows::{LogLandingRow, LogSampleRow, LogStreamRow};
 use crate::writer::spool::SpoolWriter;
 use crate::writer::table::{BlockInserter, ChBlockInserter, XorShift64, spawn_dedup_ticker};
@@ -105,15 +105,13 @@ impl WriterTables {
 
 /// The `StreamLru` keys a committed block registers, derived from the block's
 /// own kind-1 rows rather than carried beside them: such a row holds the
-/// fingerprint and the month, which is the whole key. Nothing is retained for
+/// tenant, the fingerprint and the month, which is the whole key. Nothing is retained for
 /// a block that never commits, and what a queued block holds does not grow
 /// with the number of streams a push registers.
-fn promotion_keys(
-    rows: &[LogLandingRow],
-) -> impl Iterator<Item = (pulsus_model::Fingerprint, u16)> {
+fn promotion_keys(rows: &[LogLandingRow]) -> impl Iterator<Item = StreamKey> + '_ {
     rows.iter()
         .filter(|row| row.kind == LogLandingRow::KIND_STREAM)
-        .map(|row| (row.fingerprint, row.month))
+        .map(|row| (Arc::clone(&row.org_id), row.fingerprint, row.month))
 }
 
 struct Shared {
@@ -361,7 +359,11 @@ impl LogWriter {
         {
             let mut lru = self.shared.lru.lock().expect("stream lru mutex poisoned");
             for stream in &batch.streams {
-                let key = (stream.fingerprint, stream.month.days_since_epoch());
+                let key = (
+                    Arc::clone(tenant.as_arc()),
+                    stream.fingerprint,
+                    stream.month.days_since_epoch(),
+                );
                 if lru.contains(&key) {
                     if count {
                         self.shared
@@ -437,8 +439,12 @@ impl LogWriter {
             return Ok(Admitted::Stored(Vec::new()));
         }
 
+        // Issue #653: every row shares the push's one tenant string, whose
+        // bytes are charged once, beside the slot each row's `Arc` occupies.
+        let tenant_bytes = tenant.as_str().len() as u64;
         let total_bytes =
-            landing_charge::<LogLandingRow>(line_bytes + stream_bytes + pattern_bound);
+            landing_charge::<LogLandingRow>(line_bytes + stream_bytes + pattern_bound)
+                + tenant_bytes;
 
         // The two per-push ceilings, counted over all three kinds, and decided
         // **before** either branch below queues anything. At or above the row
@@ -483,8 +489,8 @@ impl LogWriter {
         )
         .map_err(AdmitRefusal::from)?;
 
-        // Tests-first seam: every row carries the empty tenant.
-        let org_id: Arc<str> = Arc::from("");
+        // Issue #653: every row shares the push's one tenant string.
+        let org_id: &Arc<str> = tenant.as_arc();
 
         // Reservation secured: only now materialize the rows — the clone, the
         // label canonicalization and the pattern extraction the gate above
@@ -494,13 +500,13 @@ impl LogWriter {
             batch
                 .rows
                 .iter()
-                .map(|r| LogLandingRow::line(&org_id, received_ms, r)),
+                .map(|r| LogLandingRow::line(org_id, received_ms, r)),
         );
         rows.extend(
             new_streams
                 .iter()
                 .copied()
-                .map(|s| LogLandingRow::stream(&org_id, received_ms, s)),
+                .map(|s| LogLandingRow::stream(org_id, received_ms, s)),
         );
         if patterns_on {
             let agg = aggregate_patterns(&batch.rows);
@@ -513,7 +519,7 @@ impl LogWriter {
             rows.extend(
                 agg.rows
                     .into_iter()
-                    .map(|r| LogLandingRow::pattern(&org_id, received_ms, r)),
+                    .map(|r| LogLandingRow::pattern(org_id, received_ms, r)),
             );
         }
 
@@ -932,13 +938,13 @@ mod tests {
             ),
         ];
 
-        let keys: Vec<(Fingerprint, u16)> = promotion_keys(&rows).collect();
+        let keys: Vec<StreamKey> = promotion_keys(&rows).collect();
 
         assert_eq!(
             keys,
             vec![
-                (Fingerprint::from_raw(7), month),
-                (Fingerprint::from_raw(9), month),
+                (Arc::from(""), Fingerprint::from_raw(7), month),
+                (Arc::from(""), Fingerprint::from_raw(9), month),
             ],
             "one key per kind-1 row and none for any other kind"
         );
@@ -1182,6 +1188,7 @@ mod tests {
         let registered = {
             let mut lru = writer.shared.lru.lock().expect("stream lru mutex poisoned");
             lru.contains(&(
+                Arc::from(""),
                 Fingerprint::from_raw(7),
                 Date::start_of_month_utc(TS)
                     .expect("a representable month")

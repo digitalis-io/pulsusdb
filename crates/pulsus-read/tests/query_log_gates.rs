@@ -162,6 +162,8 @@ fn splitmix64(mut x: u64) -> u64 {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedSampleRow {
+    /// The tenant (issue #653): the empty tenant's rows.
+    org_id: String,
     service: String,
     fingerprint: u128,
     timestamp_ns: i64,
@@ -231,6 +233,7 @@ async fn seed_corpus(db: &str) -> (ChClient, i64) {
             )
         };
         rows.push(SeedSampleRow {
+            org_id: String::new(),
             service: SERVICE.to_string(),
             fingerprint: u128::from(FP_CORPUS),
             timestamp_ns,
@@ -1040,6 +1043,7 @@ async fn setup_detected_corpus(db: &str) -> (ChClient, i64) {
             )
         };
         rows.push(SeedSampleRow {
+            org_id: String::new(),
             service: SERVICE.to_string(),
             fingerprint: u128::from(FP_CORPUS),
             timestamp_ns,
@@ -2767,6 +2771,8 @@ type AnswerSeries = (Vec<(String, String)>, Vec<(i64, u64)>);
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct BucketedSeedRow {
+    /// The tenant (issue #653): the empty tenant's rows.
+    org_id: String,
     service: String,
     fingerprint: u128,
     timestamp_ns: i64,
@@ -2854,6 +2860,7 @@ async fn seed_bucketed_corpus() -> (ChClient, String, i64) {
     }
 
     let row = |fp: u64, ts: i64, body: &str, sm: &str| BucketedSeedRow {
+        org_id: String::new(),
         service: service.to_string(),
         fingerprint: u128::from(fp),
         timestamp_ns: ts,
@@ -3242,6 +3249,7 @@ async fn the_sliding_statement_is_the_window_definition_at_every_range_and_step(
                 "x".repeat(1 + (next() % 40) as usize)
             };
             rows.push(BucketedSeedRow {
+                org_id: String::new(),
                 service: service.to_string(),
                 fingerprint: fps[(next() % 3) as usize],
                 timestamp_ns: point + d,
@@ -3724,6 +3732,7 @@ async fn seed_cap_corpus(streams: u64) -> (ChClient, String, i64) {
     land_seeded_streams(&client, &db).await;
     let rows: Vec<BucketedSeedRow> = (0..streams)
         .map(|i| BucketedSeedRow {
+            org_id: String::new(),
             service: "c624cap".to_string(),
             fingerprint: u128::from(6_240_000 + i),
             timestamp_ns: t + 100_000_000_000,
@@ -4931,6 +4940,8 @@ async fn a_row_no_window_holds_neither_fails_nor_counts() {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct UnwrapSeedRow {
+    /// The tenant (issue #653): the empty tenant's rows.
+    org_id: String,
     service: String,
     fingerprint: u128,
     timestamp_ns: i64,
@@ -4948,6 +4959,8 @@ struct UnwrapSeedRow {
 /// chunk gives `log_samples` one part per chunk, through the view.
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct UnwrapLandingRow {
+    /// The tenant (issue #653): the empty tenant's rows.
+    org_id: String,
     received_ms: i64,
     kind: u8,
     service: String,
@@ -4966,6 +4979,7 @@ struct UnwrapLandingRow {
 fn unwrap_landing_rows(received_ms: i64, rows: &[UnwrapSeedRow]) -> Vec<UnwrapLandingRow> {
     rows.iter()
         .map(|r| UnwrapLandingRow {
+            org_id: String::new(),
             received_ms,
             kind: 0,
             service: r.service.clone(),
@@ -5093,6 +5107,7 @@ async fn the_database_sum_is_not_the_evaluators_order_but_stays_inside_the_bound
             .iter()
             .enumerate()
             .map(|(i, v)| UnwrapSeedRow {
+                org_id: String::new(),
                 service: "w4".to_string(),
                 fingerprint: u128::from(fp),
                 timestamp_ns: t0 + i as i64,
@@ -5358,6 +5373,7 @@ fn unwrap_rows(fp: u64, t0: i64, values: &[f64]) -> Vec<UnwrapSeedRow> {
         .iter()
         .enumerate()
         .map(|(i, v)| UnwrapSeedRow {
+            org_id: String::new(),
             service: "w4".to_string(),
             fingerprint: u128::from(fp),
             timestamp_ns: t0 + i as i64,
@@ -5722,6 +5738,7 @@ async fn the_spread_reducers_are_lowered_and_answer_the_evaluators_value() {
         .iter()
         .enumerate()
         .map(|(i, d)| BucketedSeedRow {
+            org_id: String::new(),
             service: service.to_string(),
             fingerprint: 301,
             timestamp_ns: t - 30_000_000_000 + i as i64,
@@ -5907,6 +5924,7 @@ async fn seed_group_key_cases(
         }
         for (j, (body, sm)) in case.entries.iter().enumerate() {
             rows.push(BucketedSeedRow {
+                org_id: String::new(),
                 service: case.id.clone(),
                 fingerprint: u128::from(fp),
                 timestamp_ns: t - 50_000_000_000 + j as i64,
@@ -6279,6 +6297,7 @@ async fn reserved_names_answer_as_the_reference_on_every_metric_route() {
             .expect("seed log_streams_idx");
         land_seeded_streams(&client, &db).await;
         rows.push(BucketedSeedRow {
+            org_id: String::new(),
             service: service.to_string(),
             fingerprint: u128::from(fp),
             timestamp_ns: t - 10_000_000_000,
@@ -7012,7 +7031,7 @@ const SELECTION_GOLDEN: &str = "crates/pulsus-read/tests/golden/logql_selection_
 /// alone leaves this constant standing and B2 fails, so the author has to
 /// move a source line in the same change and the diff carries both.
 const PINNED_SELECTION_STATEMENTS: &str =
-    "138cac82947c253a716e254afd57ca098ca8704632a5f52370a12d170bb5238a";
+    "6b4ec3bca0f3784f83aebc61448f0f394e3d2568fbdafc94e9371d5fd4380715";
 
 /// One grid point, on a step boundary: 2030-01-01T00:00:00Z.
 ///
@@ -7574,6 +7593,7 @@ async fn seed_selection_corpus() -> (ChClient, String) {
         land_seeded_streams(&client, &db).await;
         for i in 0..count {
             rows.push(BucketedSeedRow {
+                org_id: String::new(),
                 service: service.to_string(),
                 fingerprint: u128::from(fp),
                 // Inside the one window `(T - 60s, T]`, and every body is

@@ -300,12 +300,14 @@ pub(crate) fn trace_writer_tables_from(config: &Config) -> TraceWriterTables {
 /// Builds a [`LogQlEngine`] over `pool` — the same `Arc<ChPool>` `AppState`
 /// already holds (`ChClient::from_shared_pool`, issue #13 resolved open
 /// question #1), so a `/api/logs/v1` request never opens a second
-/// connection pool.
-pub(crate) fn logql_engine(pool: Arc<ChPool>, config: &Config) -> Result<LogQlEngine, ChError> {
+/// connection pool. The engine reads `tenant`'s rows alone (issue #653).
+pub(crate) fn logql_engine(
+    pool: Arc<ChPool>,
+    config: &Config,
+    tenant: pulsus_model::Tenant,
+) -> Result<LogQlEngine, ChError> {
     let client = ChClient::from_shared_pool(pool, config.query_timeout.0)
         .with_consistency(consistency_from(config))?;
-    // Tests-first seam: the empty tenant until the header is read.
-    let tenant = pulsus_model::Tenant::from_header(None, false).expect("the empty tenant");
     Ok(LogQlEngine::new(client, engine_config_from(config), tenant))
 }
 

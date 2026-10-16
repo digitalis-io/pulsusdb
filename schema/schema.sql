@@ -46,7 +46,7 @@ CREATE TABLE IF NOT EXISTS {{db}}.log_landing{{on_cluster}}
 --@single  ENGINE = MergeTree
 --@cluster ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/{{db}}.log_landing', '{replica}')
 PARTITION BY toStartOfHour(fromUnixTimestamp64Milli(received_ms))
-ORDER BY (kind, service, fingerprint, timestamp_ns)
+ORDER BY (org_id, kind, service, fingerprint, timestamp_ns)
 TTL toDateTime(least(intDiv(received_ms, 1000) + ({{log_landing_retention_hours}} * 3600), 4294967295))
 --@single  SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600, index_granularity = 8192, min_columns_to_activate_adaptive_write_buffer = 1, non_replicated_deduplication_window = {{log_dedup_window}}{{storage_policy}};
 --@cluster SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600, index_granularity = 8192, min_columns_to_activate_adaptive_write_buffer = 1, replicated_deduplication_window = {{log_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
@@ -62,9 +62,9 @@ CREATE TABLE IF NOT EXISTS {{db}}.log_metrics_{{log_rollup_suffix}}{{on_cluster}
 --@single  ENGINE = AggregatingMergeTree
 --@cluster ENGINE = ReplicatedAggregatingMergeTree('/clickhouse/tables/{shard}/{{db}}.log_metrics_{{log_rollup_suffix}}', '{replica}')
 PARTITION BY toDate(fromUnixTimestamp64Nano(bucket_ns))
-ORDER BY (fingerprint, bucket_ns)
---@single  SETTINGS allow_dimensions_outside_sorting_key = 1, index_granularity = 8192, non_replicated_deduplication_window = {{log_dedup_window}}{{storage_policy}};
---@cluster SETTINGS allow_dimensions_outside_sorting_key = 1, index_granularity = 8192, replicated_deduplication_window = {{log_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
+ORDER BY (org_id, fingerprint, bucket_ns)
+--@single  SETTINGS index_granularity = 8192, non_replicated_deduplication_window = {{log_dedup_window}}{{storage_policy}};
+--@cluster SETTINGS index_granularity = 8192, replicated_deduplication_window = {{log_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
 
 CREATE TABLE IF NOT EXISTS {{db}}.log_patterns{{on_cluster}}
 (
@@ -77,10 +77,10 @@ CREATE TABLE IF NOT EXISTS {{db}}.log_patterns{{on_cluster}}
 --@single  ENGINE = AggregatingMergeTree
 --@cluster ENGINE = ReplicatedAggregatingMergeTree('/clickhouse/tables/{shard}/{{db}}.log_patterns', '{replica}')
 PARTITION BY toDate(fromUnixTimestamp64Nano(bucket_ns))
-ORDER BY (fingerprint, bucket_ns, pattern)
+ORDER BY (org_id, fingerprint, bucket_ns, pattern)
 TTL toDateTime(least(intDiv(bucket_ns, 1000000000) + ({{retention_days}} * 86400), 4294967295))
---@single  SETTINGS allow_dimensions_outside_sorting_key = 1, ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{log_dedup_window}}{{storage_policy}};
---@cluster SETTINGS allow_dimensions_outside_sorting_key = 1, ttl_only_drop_parts = 1, index_granularity = 8192, replicated_deduplication_window = {{log_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
+--@single  SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{log_dedup_window}}{{storage_policy}};
+--@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, replicated_deduplication_window = {{log_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
 
 CREATE TABLE IF NOT EXISTS {{db}}.log_samples{{on_cluster}}
 (
@@ -97,7 +97,7 @@ CREATE TABLE IF NOT EXISTS {{db}}.log_samples{{on_cluster}}
 --@single  ENGINE = MergeTree
 --@cluster ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/{{db}}.log_samples', '{replica}')
 PARTITION BY toDate(fromUnixTimestamp64Nano(timestamp_ns))
-ORDER BY (service, fingerprint, timestamp_ns)
+ORDER BY (org_id, service, fingerprint, timestamp_ns)
 TTL toDateTime(least(intDiv(timestamp_ns, 1000000000) + ({{retention_days}} * 86400), 4294967295))
 --@single  SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, min_columns_to_activate_adaptive_write_buffer = 1, non_replicated_deduplication_window = {{log_dedup_window}}{{storage_policy}};
 --@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, min_columns_to_activate_adaptive_write_buffer = 1, replicated_deduplication_window = {{log_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
@@ -114,7 +114,7 @@ CREATE TABLE IF NOT EXISTS {{db}}.log_streams{{on_cluster}}
 --@single  ENGINE = ReplacingMergeTree(updated_ns)
 --@cluster ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/{{db}}.log_streams', '{replica}', updated_ns)
 PARTITION BY month
-ORDER BY fingerprint
+ORDER BY (org_id, fingerprint)
 --@single  SETTINGS index_granularity = 8192, non_replicated_deduplication_window = {{log_dedup_window}}{{storage_policy}};
 --@cluster SETTINGS index_granularity = 8192, replicated_deduplication_window = {{log_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
 
@@ -129,7 +129,7 @@ CREATE TABLE IF NOT EXISTS {{db}}.log_streams_idx{{on_cluster}}
 --@single  ENGINE = ReplacingMergeTree
 --@cluster ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/{{db}}.log_streams_idx', '{replica}')
 PARTITION BY month
-ORDER BY (key, val, fingerprint)
+ORDER BY (org_id, key, val, fingerprint)
 --@single  SETTINGS index_granularity = 8192, non_replicated_deduplication_window = {{log_dedup_window}}{{storage_policy}};
 --@cluster SETTINGS index_granularity = 8192, replicated_deduplication_window = {{log_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
 

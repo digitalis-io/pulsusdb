@@ -40,8 +40,9 @@ use crate::app::AppState;
 
 use super::encode;
 use super::error::ApiError;
-use super::handlers::{engine_for, parse_bounds_ordered, read_form_pairs};
+use super::handlers::{engine_for, parse_bounds_ordered, read_form_pairs, tenant_of};
 use super::params::{self, ParamError};
+use pulsus_model::Tenant;
 
 /// `X-Pulsus-Explain: 1` — same header contract as the query endpoints.
 fn wants_explain(headers: &HeaderMap) -> bool {
@@ -60,8 +61,12 @@ pub(crate) async fn detected_labels(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
+    let tenant = match tenant_of(&headers) {
+        Ok(tenant) => tenant,
+        Err(e) => return e.into_response(),
+    };
     let pairs = params::parse_pairs(raw.as_deref().unwrap_or(""));
-    match detected_labels_impl(state, &headers, pairs).await {
+    match detected_labels_impl(state, tenant, &headers, pairs).await {
         Ok(res) => res,
         Err(e) => e.into_response(),
     }
@@ -73,8 +78,12 @@ pub(crate) async fn detected_labels_post(
     RawQuery(raw): RawQuery,
     body: Body,
 ) -> Response {
+    let tenant = match tenant_of(&headers) {
+        Ok(tenant) => tenant,
+        Err(e) => return e.into_response(),
+    };
     match read_form_pairs(&headers, raw.as_deref(), body).await {
-        Ok(pairs) => match detected_labels_impl(state, &headers, pairs).await {
+        Ok(pairs) => match detected_labels_impl(state, tenant, &headers, pairs).await {
             Ok(res) => res,
             Err(e) => e.into_response(),
         },
@@ -84,6 +93,7 @@ pub(crate) async fn detected_labels_post(
 
 async fn detected_labels_impl(
     state: AppState,
+    tenant: Tenant,
     headers: &HeaderMap,
     pairs: Vec<(String, String)>,
 ) -> Result<Response, ApiError> {
@@ -98,7 +108,7 @@ async fn detected_labels_impl(
     let (start_ns, end_ns) = parse_bounds_ordered(&pairs)?;
     let bounds = TimeBounds { start_ns, end_ns };
 
-    let engine = engine_for(&state).await?;
+    let engine = engine_for(&state, tenant).await?;
     if wants_explain(headers) {
         let (labels, explain) = engine
             .detected_labels_explained(selector.as_ref(), bounds)
@@ -119,8 +129,12 @@ pub(crate) async fn detected_fields(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
+    let tenant = match tenant_of(&headers) {
+        Ok(tenant) => tenant,
+        Err(e) => return e.into_response(),
+    };
     let pairs = params::parse_pairs(raw.as_deref().unwrap_or(""));
-    match detected_fields_impl(state, &headers, pairs).await {
+    match detected_fields_impl(state, tenant, &headers, pairs).await {
         Ok(res) => res,
         Err(e) => e.into_response(),
     }
@@ -132,8 +146,12 @@ pub(crate) async fn detected_fields_post(
     RawQuery(raw): RawQuery,
     body: Body,
 ) -> Response {
+    let tenant = match tenant_of(&headers) {
+        Ok(tenant) => tenant,
+        Err(e) => return e.into_response(),
+    };
     match read_form_pairs(&headers, raw.as_deref(), body).await {
-        Ok(pairs) => match detected_fields_impl(state, &headers, pairs).await {
+        Ok(pairs) => match detected_fields_impl(state, tenant, &headers, pairs).await {
             Ok(res) => res,
             Err(e) => e.into_response(),
         },
@@ -143,6 +161,7 @@ pub(crate) async fn detected_fields_post(
 
 async fn detected_fields_impl(
     state: AppState,
+    tenant: Tenant,
     headers: &HeaderMap,
     pairs: Vec<(String, String)>,
 ) -> Result<Response, ApiError> {
@@ -169,7 +188,7 @@ async fn detected_fields_impl(
         params::get(&pairs, "field_limit"),
     )?;
 
-    let engine = engine_for(&state).await?;
+    let engine = engine_for(&state, tenant).await?;
     if wants_explain(headers) {
         let (out, explain) = engine
             .detected_fields_explained(&expr, bounds, line_limit, field_limit)
@@ -200,8 +219,12 @@ pub(crate) async fn detected_field_values(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
+    let tenant = match tenant_of(&headers) {
+        Ok(tenant) => tenant,
+        Err(e) => return e.into_response(),
+    };
     let pairs = params::parse_pairs(raw.as_deref().unwrap_or(""));
-    match detected_field_values_impl(state, &name, &headers, pairs).await {
+    match detected_field_values_impl(state, tenant, &name, &headers, pairs).await {
         Ok(res) => res,
         Err(e) => e.into_response(),
     }
@@ -214,17 +237,24 @@ pub(crate) async fn detected_field_values_post(
     RawQuery(raw): RawQuery,
     body: Body,
 ) -> Response {
+    let tenant = match tenant_of(&headers) {
+        Ok(tenant) => tenant,
+        Err(e) => return e.into_response(),
+    };
     match read_form_pairs(&headers, raw.as_deref(), body).await {
-        Ok(pairs) => match detected_field_values_impl(state, &name, &headers, pairs).await {
-            Ok(res) => res,
-            Err(e) => e.into_response(),
-        },
+        Ok(pairs) => {
+            match detected_field_values_impl(state, tenant, &name, &headers, pairs).await {
+                Ok(res) => res,
+                Err(e) => e.into_response(),
+            }
+        }
         Err(response) => response,
     }
 }
 
 async fn detected_field_values_impl(
     state: AppState,
+    tenant: Tenant,
     name: &str,
     headers: &HeaderMap,
     pairs: Vec<(String, String)>,
@@ -252,7 +282,7 @@ async fn detected_field_values_impl(
         params::get(&pairs, "field_limit"),
     )?;
 
-    let engine = engine_for(&state).await?;
+    let engine = engine_for(&state, tenant).await?;
     if wants_explain(headers) {
         let (out, explain) = engine
             .detected_field_values_explained(name, &expr, bounds, line_limit, value_limit)

@@ -861,9 +861,10 @@ async fn stage1_single_equality_uses_the_key_val_primary_key() {
             "Condition: (month in [#, #])",
             "PrimaryKey",
             "Keys:",
+            "org_id",
             "key",
             "val",
-            "Condition: and((val in ['checkout', 'checkout']), (key in ['service_name', 'service_name']))",
+            "Condition: and(and((val in ['checkout', 'checkout']), (key in ['service_name', 'service_name'])), (org_id in ['', '']))",
         ])
     );
 }
@@ -895,9 +896,10 @@ async fn stage1_multi_equality_uses_the_key_val_primary_key() {
             "Condition: (month in [#, #])",
             "PrimaryKey",
             "Keys:",
+            "org_id",
             "key",
             "val",
-            "Condition: or(and((val in ['prod', 'prod']), (key in ['env', 'env'])), and((val in ['checkout', 'checkout']), (key in ['service_name', 'service_name'])))",
+            "Condition: and(or(and((val in ['prod', 'prod']), (key in ['env', 'env'])), and((val in ['checkout', 'checkout']), (key in ['service_name', 'service_name']))), (org_id in ['', '']))",
         ])
     );
 }
@@ -929,8 +931,9 @@ async fn stage1_regex_matcher_uses_the_key_primary_key_prefix() {
             "Condition: (month in [#, #])",
             "PrimaryKey",
             "Keys:",
+            "org_id",
             "key",
-            "Condition: (key in ['env', 'env'])",
+            "Condition: and((key in ['env', 'env']), (org_id in ['', '']))",
         ])
     );
 }
@@ -962,9 +965,10 @@ async fn stage1_mixed_positive_and_negative_matchers_uses_the_key_val_primary_ke
             "Condition: (month in [#, #])",
             "PrimaryKey",
             "Keys:",
+            "org_id",
             "key",
             "val",
-            "Condition: or(and((val in ['qa', 'qa']), (key in ['team', 'team'])), and((val in ['checkout', 'checkout']), (key in ['service_name', 'service_name'])))",
+            "Condition: and(or(and((val in ['qa', 'qa']), (key in ['team', 'team'])), and((val in ['checkout', 'checkout']), (key in ['service_name', 'service_name']))), (org_id in ['', '']))",
         ])
     );
 }
@@ -997,8 +1001,9 @@ async fn stage2_hydration_uses_the_fingerprint_primary_key() {
             "Condition: true",
             "PrimaryKey",
             "Keys:",
+            "org_id",
             "fingerprint",
-            "Condition: (fingerprint in #-element set)",
+            "Condition: and((fingerprint in #-element set), (org_id in ['', '']))",
         ])
     );
 }
@@ -1143,11 +1148,12 @@ fn expected_stage3_prefix() -> Vec<String> {
         "Condition: true",
         "PrimaryKey",
         "Keys:",
+        "org_id",
         "service",
         "fingerprint",
         "timestamp_ns",
         "Condition: and(and((timestamp_ns in (-Inf, #]), and((timestamp_ns in [#, +Inf)), \
-         (fingerprint in #-element set))), (service in ['checkout', 'checkout']))",
+         and((fingerprint in #-element set), (org_id in ['', ''])))), (service in ['checkout', 'checkout']))",
     ])
 }
 
@@ -1639,8 +1645,9 @@ async fn detected_labels_aggregation_prunes_on_the_month_partition() {
             "Condition: (month in [#, #])",
             "PrimaryKey",
             "Keys:",
+            "org_id",
             "fingerprint",
-            "Condition: (fingerprint in #-element set)",
+            "Condition: and((fingerprint in #-element set), (org_id in ['', '']))",
         ])
     );
 }
@@ -1703,8 +1710,9 @@ async fn detected_labels_activity_subquery_prunes_the_rollup_by_bucket_range() {
             "Condition: true",
             "PrimaryKey",
             "Keys:",
+            "org_id",
             "bucket_ns",
-            "Condition: and((bucket_ns in (-Inf, #]), (bucket_ns in [#, +Inf)))",
+            "Condition: and((bucket_ns in (-Inf, #]), and((bucket_ns in [#, +Inf)), (org_id in ['', ''])))",
         ])
     );
     let (selected, total) = parts_selected(&raw).expect("a MinMax Parts: m/n line");
@@ -1737,9 +1745,10 @@ async fn detected_labels_activity_subquery_prunes_the_rollup_by_bucket_range() {
             "Condition: true",
             "PrimaryKey",
             "Keys:",
+            "org_id",
             "fingerprint",
             "bucket_ns",
-            "Condition: and((bucket_ns in (-Inf, #]), and((bucket_ns in [#, +Inf)), (fingerprint in #-element set)))",
+            "Condition: and((bucket_ns in (-Inf, #]), and((bucket_ns in [#, +Inf)), and((fingerprint in #-element set), (org_id in ['', '']))))",
         ])
     );
 }
@@ -1808,8 +1817,9 @@ async fn series_without_a_selector_prunes_the_rollup_and_hits_the_streams_primar
             "Condition: true",
             "PrimaryKey",
             "Keys:",
+            "org_id",
             "bucket_ns",
-            "Condition: and((bucket_ns in (-Inf, #]), (bucket_ns in [#, +Inf)))",
+            "Condition: and((bucket_ns in (-Inf, #]), and((bucket_ns in [#, +Inf)), (org_id in ['', ''])))",
         ])
     );
     let (selected, total) = parts_selected(&raw).expect("a MinMax Parts: m/n line");
@@ -1842,8 +1852,9 @@ async fn series_without_a_selector_prunes_the_rollup_and_hits_the_streams_primar
             "Condition: true",
             "PrimaryKey",
             "Keys:",
+            "org_id",
             "fingerprint",
-            "Condition: (fingerprint in #-element set)",
+            "Condition: and((fingerprint in #-element set), (org_id in ['', '']))",
         ])
     );
 }
@@ -1903,8 +1914,9 @@ async fn label_discovery_scans_prune_on_the_month_partition_and_the_activity_buc
     expected.extend([
         "PrimaryKey",
         "Keys:",
+        "org_id",
         "fingerprint",
-        "Condition: (fingerprint in #-element set)",
+        "Condition: and((fingerprint in #-element set), (org_id in ['', '']))",
     ]);
     let names_usage = explain(&client, &names_sql).await;
     assert_eq!(names_usage, v(&expected));
@@ -1939,6 +1951,7 @@ async fn label_discovery_scans_prune_on_the_month_partition_and_the_activity_buc
     expected.extend([
         "PrimaryKey",
         "Keys:",
+        "org_id",
         "key",
         "fingerprint",
         // Operand order is ClickHouse's, MEASURED (24.8.14.39), not the
@@ -1947,7 +1960,7 @@ async fn label_discovery_scans_prune_on_the_month_partition_and_the_activity_buc
         // the reverse. The issue #399 plan predicted the written order;
         // the plan was not wrong about WHICH conditions engage the
         // primary key, only about the order the extract prints them in.
-        "Condition: and((fingerprint in #-element set), (key in ['env', 'env']))",
+        "Condition: and((fingerprint in #-element set), and((key in ['env', 'env']), (org_id in ['', ''])))",
     ]);
     let values_usage = explain(&client, &values_sql).await;
     assert_eq!(values_usage, v(&expected));
@@ -1993,9 +2006,10 @@ fn expected_metric_rollup_usage() -> Vec<String> {
         "Condition: true",
         "PrimaryKey",
         "Keys:",
+        "org_id",
         "fingerprint",
         "bucket_ns",
-        "Condition: and((bucket_ns in (-Inf, #]), and((bucket_ns in [#, +Inf)), (fingerprint in #-element set)))",
+        "Condition: and((bucket_ns in (-Inf, #]), and((bucket_ns in [#, +Inf)), and((fingerprint in #-element set), (org_id in ['', '']))))",
     ])
 }
 
@@ -2081,10 +2095,11 @@ fn expected_metric_instant_raw_usage() -> Vec<String> {
         "Condition: true",
         "PrimaryKey",
         "Keys:",
+        "org_id",
         "service",
         "fingerprint",
         "timestamp_ns",
-        "Condition: and(and((timestamp_ns in (-Inf, #]), and((timestamp_ns in [#, +Inf)), (fingerprint in #-element set))), (service in ['checkout', 'checkout']))",
+        "Condition: and(and((timestamp_ns in (-Inf, #]), and((timestamp_ns in [#, +Inf)), and((fingerprint in #-element set), (org_id in ['', ''])))), (service in ['checkout', 'checkout']))",
     ])
 }
 

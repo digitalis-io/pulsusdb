@@ -93,7 +93,7 @@ async fn setup_db(db: &str) -> ChClient {
 
     client
         .execute(
-            "CREATE TABLE log_streams (fingerprint UInt128, service String, labels String) \
+            "CREATE TABLE log_streams (org_id String, fingerprint UInt128, service String, labels String) \
              ENGINE = Memory",
             &QuerySettings::new(),
             Idempotency::Idempotent,

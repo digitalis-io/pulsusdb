@@ -79,7 +79,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -129,7 +129,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -453,7 +453,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -491,7 +491,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -538,7 +538,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -572,7 +572,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -619,7 +619,7 @@ MetricBinary(
             matching: None,
             lhs: Leaf(
                 MetricPlan {
-                    stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                    stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                     streams_table: "log_streams",
                     table: "log_samples",
                     value: Shaped(
@@ -657,7 +657,7 @@ MetricBinary(
             ),
             rhs: Leaf(
                 MetricPlan {
-                    stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                    stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                     streams_table: "log_streams",
                     table: "log_samples",
                     value: Shaped(
@@ -696,7 +696,7 @@ MetricBinary(
         },
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'e' AND val = 'f'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'e' AND val = 'f'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -747,7 +747,7 @@ MetricBinary(
             matching: None,
             lhs: Leaf(
                 MetricPlan {
-                    stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                    stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                     streams_table: "log_streams",
                     table: "log_samples",
                     value: Shaped(
@@ -781,7 +781,7 @@ MetricBinary(
             ),
             rhs: Leaf(
                 MetricPlan {
-                    stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                    stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                     streams_table: "log_streams",
                     table: "log_samples",
                     value: Shaped(
@@ -816,7 +816,7 @@ MetricBinary(
         },
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'e' AND val = 'f'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'e' AND val = 'f'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -859,7 +859,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -897,7 +897,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -944,7 +944,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -978,7 +978,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -1021,7 +1021,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -1059,7 +1059,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -1106,7 +1106,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -1140,7 +1140,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -1191,7 +1191,7 @@ MetricBinary(
         ),
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -1229,7 +1229,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -1284,7 +1284,7 @@ MetricBinary(
         ),
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -1318,7 +1318,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -1367,7 +1367,7 @@ MetricBinary(
         ),
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -1405,7 +1405,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -1458,7 +1458,7 @@ MetricBinary(
         ),
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -1492,7 +1492,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -1544,7 +1544,7 @@ MetricBinary(
         ),
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -1582,7 +1582,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -1638,7 +1638,7 @@ MetricBinary(
         ),
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -1672,7 +1672,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -1729,7 +1729,7 @@ MetricBinary(
         ),
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -1767,7 +1767,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -1828,7 +1828,7 @@ MetricBinary(
         ),
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -1862,7 +1862,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -1919,7 +1919,7 @@ MetricBinary(
         ),
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -1957,7 +1957,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -2018,7 +2018,7 @@ MetricBinary(
         ),
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -2052,7 +2052,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -2107,7 +2107,7 @@ MetricBinary(
         ),
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -2145,7 +2145,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -2204,7 +2204,7 @@ MetricBinary(
         ),
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -2238,7 +2238,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -2293,7 +2293,7 @@ MetricBinary(
         ),
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -2331,7 +2331,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -2390,7 +2390,7 @@ MetricBinary(
         ),
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -2424,7 +2424,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -2475,7 +2475,7 @@ MetricBinary(
         ),
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -2513,7 +2513,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -2568,7 +2568,7 @@ MetricBinary(
         ),
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -2602,7 +2602,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -2645,7 +2645,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -2701,7 +2701,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -2753,7 +2753,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -2814,7 +2814,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -2871,7 +2871,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -2941,7 +2941,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -3015,7 +3015,7 @@ MetricBinary(
             matching: None,
             lhs: Leaf(
                 MetricPlan {
-                    stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                    stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                     streams_table: "log_streams",
                     table: "log_samples",
                     value: Shaped(
@@ -3053,7 +3053,7 @@ MetricBinary(
             ),
             rhs: Leaf(
                 MetricPlan {
-                    stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                    stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                     streams_table: "log_streams",
                     table: "log_samples",
                     value: Shaped(
@@ -3109,7 +3109,7 @@ MetricBinary(
             matching: None,
             lhs: Leaf(
                 MetricPlan {
-                    stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                    stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                     streams_table: "log_streams",
                     table: "log_samples",
                     value: Shaped(
@@ -3143,7 +3143,7 @@ MetricBinary(
             ),
             rhs: Leaf(
                 MetricPlan {
-                    stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                    stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                     streams_table: "log_streams",
                     table: "log_samples",
                     value: Shaped(
@@ -3200,7 +3200,7 @@ MetricBinary(
             matching: None,
             lhs: Leaf(
                 MetricPlan {
-                    stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                    stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                     streams_table: "log_streams",
                     table: "log_samples",
                     value: Shaped(
@@ -3238,7 +3238,7 @@ MetricBinary(
             ),
             rhs: Leaf(
                 MetricPlan {
-                    stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                    stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                     streams_table: "log_streams",
                     table: "log_samples",
                     value: Shaped(
@@ -3299,7 +3299,7 @@ MetricBinary(
             matching: None,
             lhs: Leaf(
                 MetricPlan {
-                    stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                    stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                     streams_table: "log_streams",
                     table: "log_samples",
                     value: Shaped(
@@ -3333,7 +3333,7 @@ MetricBinary(
             ),
             rhs: Leaf(
                 MetricPlan {
-                    stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                    stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                     streams_table: "log_streams",
                     table: "log_samples",
                     value: Shaped(
@@ -3411,7 +3411,7 @@ MetricBinary(
             matching: None,
             lhs: Leaf(
                 MetricPlan {
-                    stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                    stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                     streams_table: "log_streams",
                     table: "log_samples",
                     value: Shaped(
@@ -3496,7 +3496,7 @@ MetricBinary(
             matching: None,
             lhs: Leaf(
                 MetricPlan {
-                    stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                    stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                     streams_table: "log_streams",
                     table: "log_samples",
                     value: Shaped(
@@ -3555,7 +3555,7 @@ MetricBinary(
                 matching: None,
                 lhs: Leaf(
                     MetricPlan {
-                        stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                        stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                         streams_table: "log_streams",
                         table: "log_samples",
                         value: Shaped(
@@ -3593,7 +3593,7 @@ MetricBinary(
                 ),
                 rhs: Leaf(
                     MetricPlan {
-                        stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                        stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                         streams_table: "log_streams",
                         table: "log_samples",
                         value: Shaped(
@@ -3645,7 +3645,7 @@ MetricBinary(
                 matching: None,
                 lhs: Leaf(
                     MetricPlan {
-                        stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'e' AND val = 'f'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                        stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'e' AND val = 'f'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                         streams_table: "log_streams",
                         table: "log_samples",
                         value: Shaped(
@@ -3709,7 +3709,7 @@ MetricBinary(
                 matching: None,
                 lhs: Leaf(
                     MetricPlan {
-                        stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                        stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                         streams_table: "log_streams",
                         table: "log_samples",
                         value: Shaped(
@@ -3743,7 +3743,7 @@ MetricBinary(
                 ),
                 rhs: Leaf(
                     MetricPlan {
-                        stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                        stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                         streams_table: "log_streams",
                         table: "log_samples",
                         value: Shaped(
@@ -3791,7 +3791,7 @@ MetricBinary(
                 matching: None,
                 lhs: Leaf(
                     MetricPlan {
-                        stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'e' AND val = 'f'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                        stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'e' AND val = 'f'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                         streams_table: "log_streams",
                         table: "log_samples",
                         value: Shaped(
@@ -3937,7 +3937,7 @@ MetricBinary(
 MetricBinary(
     Variants {
         scan: MetricPlan {
-            stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+            stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
             streams_table: "log_streams",
             table: "log_samples",
             value: Shaped(
@@ -4016,7 +4016,7 @@ MetricBinary(
 MetricBinary(
     Variants {
         scan: MetricPlan {
-            stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+            stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
             streams_table: "log_streams",
             table: "log_samples",
             value: Shaped(
@@ -4084,7 +4084,7 @@ MetricBinary(
 MetricBinary(
     Variants {
         scan: MetricPlan {
-            stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+            stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
             streams_table: "log_streams",
             table: "log_samples",
             value: Shaped(
@@ -4204,7 +4204,7 @@ MetricBinary(
 MetricBinary(
     Variants {
         scan: MetricPlan {
-            stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+            stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
             streams_table: "log_streams",
             table: "log_samples",
             value: Shaped(
@@ -4310,7 +4310,7 @@ MetricBinary(
         matching: None,
         lhs: Variants {
             scan: MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -4397,7 +4397,7 @@ MetricBinary(
         matching: None,
         lhs: Variants {
             scan: MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -4476,7 +4476,7 @@ MetricBinary(
         ),
         rhs: Variants {
             scan: MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -4563,7 +4563,7 @@ MetricBinary(
         ),
         rhs: Variants {
             scan: MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -4648,7 +4648,7 @@ MetricBinary(
                 matching: None,
                 lhs: Leaf(
                     MetricPlan {
-                        stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                        stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                         streams_table: "log_streams",
                         table: "log_samples",
                         value: Shaped(
@@ -4703,7 +4703,7 @@ MetricBinary(
                 matching: None,
                 lhs: Leaf(
                     MetricPlan {
-                        stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                        stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                         streams_table: "log_streams",
                         table: "log_samples",
                         value: Shaped(
@@ -4767,7 +4767,7 @@ MetricBinary(
                 matching: None,
                 lhs: Leaf(
                     MetricPlan {
-                        stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                        stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                         streams_table: "log_streams",
                         table: "log_samples",
                         value: Shaped(
@@ -4818,7 +4818,7 @@ MetricBinary(
                 matching: None,
                 lhs: Leaf(
                     MetricPlan {
-                        stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                        stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                         streams_table: "log_streams",
                         table: "log_samples",
                         value: Shaped(
@@ -4878,7 +4878,7 @@ MetricBinary(
                 matching: None,
                 lhs: Leaf(
                     MetricPlan {
-                        stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                        stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                         streams_table: "log_streams",
                         table: "log_samples",
                         value: Shaped(
@@ -4921,7 +4921,7 @@ MetricBinary(
         },
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -4986,7 +4986,7 @@ MetricBinary(
                 matching: None,
                 lhs: Leaf(
                     MetricPlan {
-                        stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                        stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                         streams_table: "log_streams",
                         table: "log_samples",
                         value: Shaped(
@@ -5025,7 +5025,7 @@ MetricBinary(
         },
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -5117,7 +5117,7 @@ MetricBinary(
             matching: None,
             lhs: Leaf(
                 MetricPlan {
-                    stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                    stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                     streams_table: "log_streams",
                     table: "log_samples",
                     value: Shaped(
@@ -5182,7 +5182,7 @@ MetricBinary(
             matching: None,
             lhs: Leaf(
                 MetricPlan {
-                    stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                    stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                     streams_table: "log_streams",
                     table: "log_samples",
                     value: Shaped(
@@ -5265,7 +5265,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Reduced(
@@ -5352,7 +5352,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Reduced(
@@ -5445,7 +5445,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -5483,7 +5483,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -5530,7 +5530,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -5564,7 +5564,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -5607,7 +5607,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -5645,7 +5645,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -5692,7 +5692,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -5726,7 +5726,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -5769,7 +5769,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -5807,7 +5807,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -5854,7 +5854,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -5888,7 +5888,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -5931,7 +5931,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -5969,7 +5969,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -6016,7 +6016,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -6050,7 +6050,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -6093,7 +6093,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -6131,7 +6131,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -6178,7 +6178,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -6212,7 +6212,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -6255,7 +6255,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -6293,7 +6293,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -6340,7 +6340,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -6374,7 +6374,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -6417,7 +6417,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -6455,7 +6455,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -6502,7 +6502,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -6536,7 +6536,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -6579,7 +6579,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -6617,7 +6617,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -6664,7 +6664,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -6698,7 +6698,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -6741,7 +6741,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -6779,7 +6779,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -6826,7 +6826,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -6860,7 +6860,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -6903,7 +6903,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -6941,7 +6941,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -6988,7 +6988,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -7022,7 +7022,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -7065,7 +7065,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -7103,7 +7103,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -7150,7 +7150,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -7184,7 +7184,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -7227,7 +7227,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -7265,7 +7265,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -7312,7 +7312,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -7346,7 +7346,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -7389,7 +7389,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -7427,7 +7427,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -7474,7 +7474,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -7508,7 +7508,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -7551,7 +7551,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -7589,7 +7589,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -7636,7 +7636,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -7670,7 +7670,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -7713,7 +7713,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -7751,7 +7751,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -7798,7 +7798,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -7832,7 +7832,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -7875,7 +7875,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -7913,7 +7913,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -7960,7 +7960,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -7994,7 +7994,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -8037,7 +8037,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -8075,7 +8075,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -8122,7 +8122,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -8156,7 +8156,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -8199,7 +8199,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -8237,7 +8237,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -8284,7 +8284,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -8318,7 +8318,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -8361,7 +8361,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -8399,7 +8399,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -8446,7 +8446,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -8480,7 +8480,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -8523,7 +8523,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -8561,7 +8561,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -8608,7 +8608,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -8642,7 +8642,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -8685,7 +8685,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -8723,7 +8723,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -8770,7 +8770,7 @@ MetricBinary(
         matching: None,
         lhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(
@@ -8804,7 +8804,7 @@ MetricBinary(
         ),
         rhs: Leaf(
             MetricPlan {
-                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
+                stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
                 value: Shaped(

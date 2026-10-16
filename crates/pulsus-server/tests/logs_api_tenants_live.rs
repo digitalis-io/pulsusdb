@@ -286,8 +286,11 @@ fn t0_ns() -> i64 {
 // Pushes
 // ---------------------------------------------------------------------
 
+/// One pushed stream: its labels and its `(ns, line)` entries.
+type PushStream<'a> = (&'a [(&'a str, &'a str)], Vec<(i64, &'a str)>);
+
 /// A `/loki/api/v1/push` JSON body: each `(labels, [(ns, line)])` one stream.
-fn loki_body(streams: &[(&[(&str, &str)], Vec<(i64, &str)>)]) -> Vec<u8> {
+fn loki_body(streams: &[PushStream<'_>]) -> Vec<u8> {
     let streams: Vec<serde_json::Value> = streams
         .iter()
         .map(|(labels, values)| {

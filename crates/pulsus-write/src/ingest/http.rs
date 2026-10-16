@@ -118,6 +118,11 @@ pub async fn ingest(
     body: Body,
     settings: LogIngestSettings,
 ) -> Response {
+    // Issue #653: the tenant first; an invalid one stores nothing.
+    let tenant = match pulsus_model::tenant_from_headers(&headers) {
+        Ok(tenant) => tenant,
+        Err(err) => return status_response(StatusCode::BAD_REQUEST, 3, err.to_string()),
+    };
     let now_ns = now_unix_nanos();
 
     let body = match read_capped_body(body, decompress::MAX_DECOMPRESSED_BYTES).await {
@@ -160,8 +165,6 @@ pub async fn ingest(
         );
     }
     let push = push_headers(&headers);
-    // Tests-first seam: the empty tenant until the header is read.
-    let tenant = pulsus_model::Tenant::from_header(None, false).expect("the empty tenant");
 
     if is_async(&headers) {
         return match sink.admit(&tenant, parsed, push) {
@@ -459,6 +462,13 @@ pub async fn ingest_loki_push(
     body: Body,
     settings: LogIngestSettings,
 ) -> Response {
+    // Issue #653: the tenant first; an invalid one stores nothing.
+    let tenant = match pulsus_model::tenant_from_headers(&headers) {
+        Ok(tenant) => tenant,
+        Err(err) => {
+            return loki_plain_text_response(StatusCode::BAD_REQUEST, format!("{err}\n"));
+        }
+    };
     let now_ns = now_unix_nanos();
 
     let body = match read_capped_body(body, decompress::MAX_DECOMPRESSED_BYTES).await {
@@ -487,8 +497,6 @@ pub async fn ingest_loki_push(
         return loki_stream_errors_response(stream_errors);
     }
     let push = push_headers(&headers);
-    // Tests-first seam: the empty tenant until the header is read.
-    let tenant = pulsus_model::Tenant::from_header(None, false).expect("the empty tenant");
 
     if is_async(&headers) {
         return match sink.admit(&tenant, parsed, push) {

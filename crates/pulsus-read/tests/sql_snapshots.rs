@@ -84,7 +84,7 @@ fn pure_positive_selector_is_byte_exact_to_schemas_md_3_2() {
         sp.stage1_sql,
         "SELECT fingerprint\n\
          FROM log_streams_idx\n\
-         WHERE month = '2026-07-01'\n\
+         WHERE org_id = '' AND month = '2026-07-01'\n\
          \x20 AND ((key = 'service_name' AND val = 'checkout') OR (key = 'env' AND val = 'prod'))\n\
          GROUP BY fingerprint\n\
          HAVING uniqExact(key, val) = 2"
@@ -213,7 +213,7 @@ fn mixed_positive_and_negative_matchers_use_conditional_aggregation() {
         sp.stage1_sql,
         "SELECT fingerprint\n\
          FROM log_streams_idx\n\
-         WHERE month = '2026-07-01'\n\
+         WHERE org_id = '' AND month = '2026-07-01'\n\
          \x20 AND ((key = 'service_name' AND val = 'checkout') OR (key = 'env' AND val = 'prod') \
          OR (key = 'team' AND val = 'qa') OR (key = 'app' AND match(val, '^(?:test.*)$')))\n\
          GROUP BY fingerprint\n\
@@ -367,7 +367,7 @@ fn stage3_renders_the_canonical_shape_with_a_single_service() {
         "SELECT fingerprint, timestamp_ns, body, structured_metadata\n\
          FROM log_samples\n\
          PREWHERE service = 'checkout'\n\
-         WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))\n\
+         WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))\n\
          \x20 AND timestamp_ns > 1782907200000000000 AND timestamp_ns <= 1782928800000000000\n\
          \x20 AND body LIKE '%connection refused%'\n\
          ORDER BY timestamp_ns DESC, fingerprint DESC, cityHash64(body) DESC, body DESC\n\
@@ -654,7 +654,7 @@ fn stage2_is_byte_exact_to_schemas_md_3_2() {
             "log_streams",
             &[18374, 99120].map(|v| Fingerprint::from_raw(v).sql_literal())
         ),
-        "SELECT fingerprint, service, labels FROM log_streams WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))"
+        "SELECT fingerprint, service, labels FROM log_streams WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))"
     );
 }
 
@@ -1018,7 +1018,7 @@ fn metric_range_sql_uses_intdiv_bucketing() {
         sql,
         "SELECT fingerprint, intDiv(bucket_ns, 60000000000) * 60000000000 AS step, sum(count) AS n\n\
          FROM log_metrics_5s\n\
-         WHERE fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990')) AND bucket_ns > 1782907200000000000 AND bucket_ns <= 1782928800000000000\n\
+         WHERE org_id = '' AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('990')) AND bucket_ns > 1782907200000000000 AND bucket_ns <= 1782928800000000000\n\
          GROUP BY fingerprint, step"
     );
 }
@@ -1051,7 +1051,7 @@ fn metric_instant_sql_has_no_intdiv_bucket_expression() {
         sql,
         "SELECT fingerprint, sum(count) AS n\n\
          FROM log_metrics_5s\n\
-         WHERE fingerprint IN (toUInt128('101'), toUInt128('205')) AND bucket_ns > 1782907200000000000 AND bucket_ns <= 1782928800000000000\n\
+         WHERE org_id = '' AND fingerprint IN (toUInt128('101'), toUInt128('205')) AND bucket_ns > 1782907200000000000 AND bucket_ns <= 1782928800000000000\n\
          GROUP BY fingerprint"
     );
     assert!(!sql.contains("intDiv"));
@@ -1084,7 +1084,7 @@ fn log_volume_rollup_is_byte_exact() {
         sql,
         "SELECT fingerprint, sum(bytes) AS bytes\n\
          FROM log_metrics_5s\n\
-         WHERE fingerprint IN (toUInt128('101'), toUInt128('205')) AND bucket_ns > 1782907200000000000 AND bucket_ns <= 1782928800000000000\n\
+         WHERE org_id = '' AND fingerprint IN (toUInt128('101'), toUInt128('205')) AND bucket_ns > 1782907200000000000 AND bucket_ns <= 1782928800000000000\n\
          GROUP BY fingerprint"
     );
     assert!(!sql.contains("body"), "zero body reads by construction");
@@ -1120,15 +1120,15 @@ const DISCOVERY_RES_NS: u64 = 5_000_000_000;
 /// The activity scan, unscoped — the statement the engine runs FIRST, on its
 /// own, and whose result it renders into the second.
 const ACTIVE_UNSCOPED: &str = "SELECT DISTINCT fingerprint FROM log_metrics_5s \
-     WHERE bucket_ns >= 1751328000000000000 AND bucket_ns <= 1751331600000000000";
+     WHERE org_id = '' AND bucket_ns >= 1751328000000000000 AND bucket_ns <= 1751331600000000000";
 
 /// The activity scan with the caller's stage-1 fingerprints pushed inside it,
 /// so it reads primary-key point ranges rather than the whole bucket range.
 const ACTIVE_SCOPED_1: &str = "SELECT DISTINCT fingerprint FROM log_metrics_5s \
-     WHERE fingerprint IN (toUInt128('7')) AND bucket_ns >= 1751328000000000000 \
+     WHERE org_id = '' AND fingerprint IN (toUInt128('7')) AND bucket_ns >= 1751328000000000000 \
      AND bucket_ns <= 1751331600000000000";
 const ACTIVE_SCOPED_3: &str = "SELECT DISTINCT fingerprint FROM log_metrics_5s \
-     WHERE fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('4294967296')) AND bucket_ns >= 1751328000000000000 \
+     WHERE org_id = '' AND fingerprint IN (toUInt128('101'), toUInt128('205'), toUInt128('4294967296')) AND bucket_ns >= 1751328000000000000 \
      AND bucket_ns <= 1751331600000000000";
 
 /// The active-fingerprint list the three index scans below render — the
@@ -1139,9 +1139,9 @@ const ACTIVE_LIST: &str = "toUInt128('101'), toUInt128('205'), toUInt128('429496
 /// `{MONTH}`, `{ACTIVE}` and `{UUID_LITERAL}` are substituted with
 /// [`str::replace`] rather than interpolated, so the text stays byte-identical
 /// and no `sql::` call can reach the expected side.
-const STMT_LABEL_NAMES: &str = "SELECT DISTINCT key AS name\nFROM log_streams_idx\nWHERE {MONTH}\n  AND fingerprint IN ({ACTIVE})\nORDER BY name";
-const STMT_LABEL_VALUES: &str = "SELECT DISTINCT val AS value\nFROM log_streams_idx\nWHERE {MONTH} AND key = 'env'\n  AND fingerprint IN ({ACTIVE})\nORDER BY value";
-const STMT_DETECTED_LABELS: &str = "SELECT key, uniqExact(val) AS cardinality, countIf(toFloat64OrNull(val) IS NULL AND NOT match(val, {UUID_LITERAL})) AS non_id_values\nFROM log_streams_idx\nWHERE {MONTH}\n  AND fingerprint IN ({ACTIVE})\nGROUP BY key\nORDER BY key";
+const STMT_LABEL_NAMES: &str = "SELECT DISTINCT key AS name\nFROM log_streams_idx\nWHERE org_id = '' AND {MONTH}\n  AND fingerprint IN ({ACTIVE})\nORDER BY name";
+const STMT_LABEL_VALUES: &str = "SELECT DISTINCT val AS value\nFROM log_streams_idx\nWHERE org_id = '' AND {MONTH} AND key = 'env'\n  AND fingerprint IN ({ACTIVE})\nORDER BY value";
+const STMT_DETECTED_LABELS: &str = "SELECT key, uniqExact(val) AS cardinality, countIf(toFloat64OrNull(val) IS NULL AND NOT match(val, {UUID_LITERAL})) AS non_id_values\nFROM log_streams_idx\nWHERE org_id = '' AND {MONTH}\n  AND fingerprint IN ({ACTIVE})\nGROUP BY key\nORDER BY key";
 
 fn expected_stmt(template: &str, month: &str, active: &str) -> String {
     template
@@ -1516,7 +1516,7 @@ fn an_unwrapped_sum_over_time_renders_a_sliding_raw_scan_with_no_aggregate_and_n
         "SELECT fingerprint, timestamp_ns, body, structured_metadata\n\
          FROM log_samples\n\
          PREWHERE service = 'checkout'\n\
-         WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))\n\
+         WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))\n\
          \x20 AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000\n\
          ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC"
     );

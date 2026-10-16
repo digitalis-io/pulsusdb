@@ -16,6 +16,8 @@
 
 use pulsus_model::{FpLiteral, Tenant};
 
+use crate::metrics::TenantSql;
+
 use super::params::Direction;
 use super::predicate::{CheckedFragment, CheckedLiteral, MonthLiteral};
 
@@ -705,7 +707,7 @@ impl<'a> MetricSource<'a> {
 /// load-bearing for that byte-exact requirement; changing its shape breaks
 /// the snapshot contract.
 pub fn stage1(
-    _tenant: &Tenant,
+    tenant: &Tenant,
     streams_idx_table: &str,
     months: &[MonthLiteral],
     positive_branches: &[CheckedFragment],
@@ -732,7 +734,8 @@ pub fn stage1(
     };
 
     format!(
-        "SELECT fingerprint\nFROM {streams_idx_table}\nWHERE {month_clause}\n  AND ({where_or_list})\nGROUP BY fingerprint\nHAVING {having}"
+        "SELECT fingerprint\nFROM {streams_idx_table}\nWHERE org_id = {} AND {month_clause}\n  AND ({where_or_list})\nGROUP BY fingerprint\nHAVING {having}",
+        tenant.sql_literal()
     )
 }
 
@@ -743,7 +746,7 @@ pub fn stage1(
 /// are point ranges and skip probes entirely (architect plan: "Selectivity
 /// probes").
 pub fn probe(
-    _tenant: &Tenant,
+    tenant: &Tenant,
     streams_idx_table: &str,
     months: &[MonthLiteral],
     key_literal: &CheckedLiteral,
@@ -751,7 +754,8 @@ pub fn probe(
     let month_clause = month_clause(months);
     let key_literal = key_literal.as_sql();
     format!(
-        "SELECT count() AS n\nFROM {streams_idx_table}\nWHERE {month_clause} AND key = {key_literal}"
+        "SELECT count() AS n\nFROM {streams_idx_table}\nWHERE org_id = {} AND {month_clause} AND key = {key_literal}",
+        tenant.sql_literal()
     )
 }
 
@@ -775,13 +779,14 @@ pub fn probe(
 /// (`super::exec::LogQlEngine::run_discovery`), and its length is bounded by
 /// `EngineConfig::max_streams` before it is rendered.
 pub fn label_names(
-    _tenant: &Tenant,
+    tenant: &Tenant,
     streams_idx_table: &str,
     months: &[MonthLiteral],
     fingerprints: &[FpLiteral],
 ) -> String {
     format!(
-        "SELECT DISTINCT key AS name\nFROM {streams_idx_table}\nWHERE {}\n  AND fingerprint IN ({})\nORDER BY name",
+        "SELECT DISTINCT key AS name\nFROM {streams_idx_table}\nWHERE org_id = {} AND {}\n  AND fingerprint IN ({})\nORDER BY name",
+        tenant.sql_literal(),
         month_clause(months),
         fp_list(fingerprints)
     )
@@ -798,7 +803,7 @@ pub fn label_names(
 /// exactly the precondition [`label_names`] documents. The key predicate keeps
 /// its place in the primary-key prefix.
 pub fn label_values(
-    _tenant: &Tenant,
+    tenant: &Tenant,
     streams_idx_table: &str,
     months: &[MonthLiteral],
     key_literal: &CheckedLiteral,
@@ -806,7 +811,8 @@ pub fn label_values(
 ) -> String {
     let key_literal = key_literal.as_sql();
     format!(
-        "SELECT DISTINCT val AS value\nFROM {streams_idx_table}\nWHERE {} AND key = {key_literal}\n  AND fingerprint IN ({})\nORDER BY value",
+        "SELECT DISTINCT val AS value\nFROM {streams_idx_table}\nWHERE org_id = {} AND {} AND key = {key_literal}\n  AND fingerprint IN ({})\nORDER BY value",
+        tenant.sql_literal(),
         month_clause(months),
         fp_list(fingerprints)
     )
@@ -833,7 +839,7 @@ pub fn label_values(
 /// **Issue #399:** before this, the only time bound was `month`, so a
 /// ten-minute request was answered from the whole calendar month.
 pub fn detected_labels(
-    _tenant: &Tenant,
+    tenant: &Tenant,
     streams_idx_table: &str,
     months: &[MonthLiteral],
     fingerprints: &[FpLiteral],
@@ -843,7 +849,8 @@ pub fn detected_labels(
     let non_id_values = non_id_values.as_sql();
     let active = fp_list(fingerprints);
     format!(
-        "SELECT key, uniqExact(val) AS cardinality, {non_id_values} AS non_id_values\nFROM {streams_idx_table}\nWHERE {month_clause}\n  AND fingerprint IN ({active})\nGROUP BY key\nORDER BY key"
+        "SELECT key, uniqExact(val) AS cardinality, {non_id_values} AS non_id_values\nFROM {streams_idx_table}\nWHERE org_id = {} AND {month_clause}\n  AND fingerprint IN ({active})\nGROUP BY key\nORDER BY key",
+        tenant.sql_literal()
     )
 }
 
@@ -890,7 +897,7 @@ pub fn activity_lower_bucket_ns(start_ns: i64, rollup_res_ns: u64) -> i64 {
 /// The lower bound is [`activity_lower_bucket_ns`], NOT `start_ns` — see
 /// that function for why the obvious `bucket_ns > start_ns` is wrong here.
 pub fn active_fingerprints(
-    _tenant: &Tenant,
+    tenant: &Tenant,
     rollup_table: &str,
     fingerprints: Option<&[FpLiteral]>,
     window: TimeWindow,
@@ -898,7 +905,10 @@ pub fn active_fingerprints(
 ) -> String {
     let TimeWindow { start_ns, end_ns } = window;
     let lower = activity_lower_bucket_ns(start_ns, rollup_res_ns);
-    let mut sql = format!("SELECT DISTINCT fingerprint FROM {rollup_table} WHERE ");
+    let mut sql = format!(
+        "SELECT DISTINCT fingerprint FROM {rollup_table} WHERE org_id = {} AND ",
+        tenant.sql_literal()
+    );
     if let Some(fps) = fingerprints {
         sql.push_str(&format!("fingerprint IN ({}) AND ", fp_list(fps)));
     }
@@ -937,10 +947,11 @@ fn join_fragments(branches: &[CheckedFragment]) -> String {
 /// Stage 2 — hydration (docs/schemas.md §3.2 line 307), byte-exact to the
 /// canonical shape: `SELECT fingerprint, service, labels FROM log_streams
 /// WHERE fingerprint IN (...)`.
-pub fn stage2(_tenant: &Tenant, streams_table: &str, fingerprints: &[FpLiteral]) -> String {
+pub fn stage2(tenant: &Tenant, streams_table: &str, fingerprints: &[FpLiteral]) -> String {
     let fp_list = fp_list(fingerprints);
     format!(
-        "SELECT fingerprint, service, labels FROM {streams_table} WHERE fingerprint IN ({fp_list})"
+        "SELECT fingerprint, service, labels FROM {streams_table} WHERE org_id = {} AND fingerprint IN ({fp_list})",
+        tenant.sql_literal()
     )
 }
 
@@ -986,6 +997,7 @@ pub fn stage2(_tenant: &Tenant, streams_table: &str, fingerprints: &[FpLiteral])
 /// means a different subset survives, so it is registered as
 /// `timestamp-tie-order` in docs/benchmarks/logs-differential-ledger.md
 /// with the probe, both sequences, and why matching it is separate work.
+#[allow(clippy::too_many_arguments)]
 pub fn stage3(
     tenant: &Tenant,
     samples_table: &str,
@@ -1023,7 +1035,7 @@ fn rx_projection(rx: Option<&CheckedFragment>) -> String {
 /// [`stage3`]'s text byte for byte.
 #[allow(clippy::too_many_arguments)]
 pub fn stage3_with_rx(
-    _tenant: &Tenant,
+    tenant: &Tenant,
     samples_table: &str,
     services: &[CheckedLiteral],
     fingerprints: &[FpLiteral],
@@ -1033,6 +1045,7 @@ pub fn stage3_with_rx(
     limit: u32,
     rx: Option<&CheckedFragment>,
 ) -> String {
+    let t = tenant.sql_literal();
     let service_pred = service_predicate(services);
     let fp_list = fp_list(fingerprints);
     let order = match direction {
@@ -1043,7 +1056,7 @@ pub fn stage3_with_rx(
     let rx = rx_projection(rx);
 
     let mut sql = format!(
-        "SELECT fingerprint, timestamp_ns, body, structured_metadata{rx}\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE fingerprint IN ({fp_list})\n  AND timestamp_ns > {start_ns} AND timestamp_ns <= {end_ns}"
+        "SELECT fingerprint, timestamp_ns, body, structured_metadata{rx}\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE org_id = {t} AND fingerprint IN ({fp_list})\n  AND timestamp_ns > {start_ns} AND timestamp_ns <= {end_ns}"
     );
     for clause in line_filters {
         sql.push_str("\n  AND ");
@@ -1145,7 +1158,7 @@ pub fn stage3_keyset(
 /// the column list. `None` renders [`stage3_keyset`]'s text byte for byte.
 #[allow(clippy::too_many_arguments)]
 pub fn stage3_keyset_with_rx(
-    _tenant: &Tenant,
+    tenant: &Tenant,
     samples_table: &str,
     services: &[CheckedLiteral],
     fingerprints: &[FpLiteral],
@@ -1156,13 +1169,14 @@ pub fn stage3_keyset_with_rx(
     limit: u32,
     rx: Option<&CheckedFragment>,
 ) -> String {
+    let t = tenant.sql_literal();
     let service_pred = service_predicate(services);
     let fp_list = fp_list(fingerprints);
     let TimeWindow { start_ns, end_ns } = window;
     let rx = rx_projection(rx);
 
     let mut sql = format!(
-        "SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash, structured_metadata{rx}\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE fingerprint IN ({fp_list})"
+        "SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash, structured_metadata{rx}\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE org_id = {t} AND fingerprint IN ({fp_list})"
     );
     match (direction, lower) {
         (_, KeysetLower::First) => {
@@ -1221,15 +1235,16 @@ pub fn stage3_keyset_with_rx(
 /// date — docs/api.md §2.5). Same half-open bucket predicate as
 /// [`metric_range`].
 pub fn log_stats_rollup(
-    _tenant: &Tenant,
+    tenant: &Tenant,
     rollup_table: &str,
     fingerprints: &[FpLiteral],
     window: TimeWindow,
 ) -> String {
+    let t = tenant.sql_literal();
     let fp_list = fp_list(fingerprints);
     let TimeWindow { start_ns, end_ns } = window;
     format!(
-        "SELECT uniqExact(fingerprint) AS streams, uniqExact(toDate(fromUnixTimestamp64Nano(bucket_ns))) AS chunks, sum(count) AS entries, sum(bytes) AS bytes\nFROM {rollup_table}\nWHERE fingerprint IN ({fp_list}) AND bucket_ns > {start_ns} AND bucket_ns <= {end_ns}"
+        "SELECT uniqExact(fingerprint) AS streams, uniqExact(toDate(fromUnixTimestamp64Nano(bucket_ns))) AS chunks, sum(count) AS entries, sum(bytes) AS bytes\nFROM {rollup_table}\nWHERE org_id = {t} AND fingerprint IN ({fp_list}) AND bucket_ns > {start_ns} AND bucket_ns <= {end_ns}"
     )
 }
 
@@ -1240,18 +1255,19 @@ pub fn log_stats_rollup(
 /// `streams`/`chunks` shape as [`log_stats_rollup`]; `entries`/`bytes`
 /// count matching lines exactly.
 pub fn log_stats_raw(
-    _tenant: &Tenant,
+    tenant: &Tenant,
     samples_table: &str,
     services: &[CheckedLiteral],
     fingerprints: &[FpLiteral],
     window: TimeWindow,
     line_filters: &[CheckedFragment],
 ) -> String {
+    let t = tenant.sql_literal();
     let service_pred = service_predicate(services);
     let fp_list = fp_list(fingerprints);
     let TimeWindow { start_ns, end_ns } = window;
     let mut sql = format!(
-        "SELECT uniqExact(fingerprint) AS streams, uniqExact(toDate(fromUnixTimestamp64Nano(timestamp_ns))) AS chunks, count() AS entries, sum(length(body)) AS bytes\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE fingerprint IN ({fp_list})\n  AND timestamp_ns > {start_ns} AND timestamp_ns <= {end_ns}"
+        "SELECT uniqExact(fingerprint) AS streams, uniqExact(toDate(fromUnixTimestamp64Nano(timestamp_ns))) AS chunks, count() AS entries, sum(length(body)) AS bytes\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE org_id = {t} AND fingerprint IN ({fp_list})\n  AND timestamp_ns > {start_ns} AND timestamp_ns <= {end_ns}"
     );
     for clause in line_filters {
         sql.push_str("\n  AND ");
@@ -1269,15 +1285,16 @@ pub fn log_stats_raw(
 /// identical MinMax + `(fingerprint, bucket_ns)` primary-key pruning
 /// applies (`tests/explain_indexes.rs`' Tier-1 gate).
 pub fn log_volume_rollup(
-    _tenant: &Tenant,
+    tenant: &Tenant,
     rollup_table: &str,
     fingerprints: &[FpLiteral],
     window: TimeWindow,
 ) -> String {
+    let t = tenant.sql_literal();
     let fp_list = fp_list(fingerprints);
     let TimeWindow { start_ns, end_ns } = window;
     format!(
-        "SELECT fingerprint, sum(bytes) AS bytes\nFROM {rollup_table}\nWHERE fingerprint IN ({fp_list}) AND bucket_ns > {start_ns} AND bucket_ns <= {end_ns}\nGROUP BY fingerprint"
+        "SELECT fingerprint, sum(bytes) AS bytes\nFROM {rollup_table}\nWHERE org_id = {t} AND fingerprint IN ({fp_list}) AND bucket_ns > {start_ns} AND bucket_ns <= {end_ns}\nGROUP BY fingerprint"
     )
 }
 
@@ -1298,17 +1315,18 @@ pub const MAX_PATTERNS: usize = 1000;
 /// top-K + LIMIT all execute in ClickHouse — the client decodes ≤ 1000
 /// already-assembled series. Half-open window `[start, end)` (D4).
 pub fn log_patterns_read(
-    _tenant: &Tenant,
+    tenant: &Tenant,
     patterns_table: &str,
     fingerprints: &[FpLiteral],
     window: TimeWindow,
     step_ns: u64,
 ) -> String {
+    let t = tenant.sql_literal();
     let fp_list = fp_list(fingerprints);
     let TimeWindow { start_ns, end_ns } = window;
     let limit = MAX_PATTERNS;
     format!(
-        "SELECT pattern, sum(cnt) AS total, arraySort(x -> x.1, groupArray((ts_ns, cnt))) AS samples\nFROM (\n  SELECT pattern, intDiv(bucket_ns, {step_ns}) * {step_ns} AS ts_ns, sum(count) AS cnt\n  FROM {patterns_table}\n  WHERE fingerprint IN ({fp_list}) AND bucket_ns >= {start_ns} AND bucket_ns < {end_ns}\n  GROUP BY pattern, ts_ns\n)\nGROUP BY pattern\nORDER BY total DESC, pattern ASC\nLIMIT {limit}"
+        "SELECT pattern, sum(cnt) AS total, arraySort(x -> x.1, groupArray((ts_ns, cnt))) AS samples\nFROM (\n  SELECT pattern, intDiv(bucket_ns, {step_ns}) * {step_ns} AS ts_ns, sum(count) AS cnt\n  FROM {patterns_table}\n  WHERE org_id = {t} AND fingerprint IN ({fp_list}) AND bucket_ns >= {start_ns} AND bucket_ns < {end_ns}\n  GROUP BY pattern, ts_ns\n)\nGROUP BY pattern\nORDER BY total DESC, pattern ASC\nLIMIT {limit}"
     )
 }
 
@@ -1334,8 +1352,9 @@ pub fn log_patterns_read(
 /// `RouteChoice::Rollup` range arm and no caller reaches this builder
 /// outside its own snapshot tests. Kept because the rollup range shape is
 /// the one this file documents against docs/schemas.md §3.2.
+#[allow(clippy::too_many_arguments)]
 pub fn metric_range(
-    _tenant: &Tenant,
+    tenant: &Tenant,
     source: MetricSource<'_>,
     services: &[CheckedLiteral],
     fingerprints: &[FpLiteral],
@@ -1344,6 +1363,7 @@ pub fn metric_range(
     step_ns: u64,
     extra_predicates: &[CheckedFragment],
 ) -> String {
+    let t = tenant.sql_literal();
     let MetricSource { table, shape } = source;
     let (bucket_col, agg_expr) = (shape.bucket_col(), shape.agg_expr());
     let fp_list = fp_list(fingerprints);
@@ -1351,7 +1371,7 @@ pub fn metric_range(
     let lower_op = lower.sql_op();
     let prewhere = metric_prewhere(services);
     let mut sql = format!(
-        "SELECT fingerprint, intDiv({bucket_col}, {step_ns}) * {step_ns} AS step, {agg_expr} AS n\nFROM {table}\n{prewhere}WHERE fingerprint IN ({fp_list}) AND {bucket_col} {lower_op} {start_ns} AND {bucket_col} <= {end_ns}"
+        "SELECT fingerprint, intDiv({bucket_col}, {step_ns}) * {step_ns} AS step, {agg_expr} AS n\nFROM {table}\n{prewhere}WHERE org_id = {t} AND fingerprint IN ({fp_list}) AND {bucket_col} {lower_op} {start_ns} AND {bucket_col} <= {end_ns}"
     );
     for clause in extra_predicates {
         sql.push_str(" AND ");
@@ -1384,8 +1404,9 @@ pub fn metric_range(
 /// `Raw` over `log_samples`. The parameter exists so the builder CANNOT
 /// render a column the named table lacks, rather than resting on that
 /// reachability argument holding forever.
+#[allow(clippy::too_many_arguments)]
 pub fn metric_instant(
-    _tenant: &Tenant,
+    tenant: &Tenant,
     source: MetricSource<'_>,
     services: &[CheckedLiteral],
     fingerprints: &[FpLiteral],
@@ -1394,6 +1415,7 @@ pub fn metric_instant(
     extra_predicates: &[CheckedFragment],
     projection: ScanProjection,
 ) -> String {
+    let t = tenant.sql_literal();
     let MetricSource { table, shape } = source;
     let (bucket_col, agg_expr) = (shape.bucket_col(), shape.agg_expr());
     let fp_list = fp_list(fingerprints);
@@ -1402,7 +1424,7 @@ pub fn metric_instant(
     let prewhere = metric_prewhere(services);
     let sm = projection.column_suffix();
     let mut sql = format!(
-        "SELECT fingerprint, {agg_expr} AS n{sm}\nFROM {table}\n{prewhere}WHERE fingerprint IN ({fp_list}) AND {bucket_col} {lower_op} {start_ns} AND {bucket_col} <= {end_ns}"
+        "SELECT fingerprint, {agg_expr} AS n{sm}\nFROM {table}\n{prewhere}WHERE org_id = {t} AND fingerprint IN ({fp_list}) AND {bucket_col} {lower_op} {start_ns} AND {bucket_col} <= {end_ns}"
     );
     for clause in extra_predicates {
         sql.push_str(" AND ");
@@ -1484,6 +1506,7 @@ impl ScanProjection {
 /// `DEFAULT ''` and no index (`pulsus-schema/src/catalog.rs`), so a
 /// JSON-extract predicate could prune no granule, and the merge renames a
 /// colliding key to `<k>_extracted` before any filter sees it.
+#[allow(clippy::too_many_arguments)]
 pub fn metric_raw_samples(
     tenant: &Tenant,
     samples_table: &str,
@@ -1512,7 +1535,7 @@ pub fn metric_raw_samples(
 /// for byte.
 #[allow(clippy::too_many_arguments)]
 pub fn metric_raw_samples_with_rx(
-    _tenant: &Tenant,
+    tenant: &Tenant,
     samples_table: &str,
     services: &[CheckedLiteral],
     fingerprints: &[FpLiteral],
@@ -1522,6 +1545,7 @@ pub fn metric_raw_samples_with_rx(
     projection: ScanProjection,
     rx: Option<&CheckedFragment>,
 ) -> String {
+    let t = tenant.sql_literal();
     let service_pred = service_predicate(services);
     let fp_list = fp_list(fingerprints);
     let TimeWindow { start_ns, end_ns } = window;
@@ -1529,7 +1553,7 @@ pub fn metric_raw_samples_with_rx(
     let sm = projection.column_suffix();
     let rx = rx_projection(rx);
     let mut sql = format!(
-        "SELECT fingerprint, timestamp_ns, body{sm}{rx}\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE fingerprint IN ({fp_list})\n  AND timestamp_ns {lower_op} {start_ns} AND timestamp_ns <= {end_ns}"
+        "SELECT fingerprint, timestamp_ns, body{sm}{rx}\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE org_id = {t} AND fingerprint IN ({fp_list})\n  AND timestamp_ns {lower_op} {start_ns} AND timestamp_ns <= {end_ns}"
     );
     for clause in extra_predicates {
         sql.push_str("\n  AND ");
@@ -1562,6 +1586,7 @@ pub fn metric_raw_samples_with_rx(
 /// `MutCells` representation is order-independent by construction, and rows
 /// within one metadata variant still arrive timestamp-ascending because the
 /// existing key order already delivers them that way.
+#[allow(clippy::too_many_arguments)]
 pub fn metric_raw_samples_sliding(
     tenant: &Tenant,
     samples_table: &str,
@@ -1590,7 +1615,7 @@ pub fn metric_raw_samples_sliding(
 /// [`metric_raw_samples_sliding`]'s text byte for byte.
 #[allow(clippy::too_many_arguments)]
 pub fn metric_raw_samples_sliding_with_rx(
-    _tenant: &Tenant,
+    tenant: &Tenant,
     samples_table: &str,
     services: &[CheckedLiteral],
     fingerprints: &[FpLiteral],
@@ -1600,6 +1625,7 @@ pub fn metric_raw_samples_sliding_with_rx(
     projection: ScanProjection,
     rx: Option<&CheckedFragment>,
 ) -> String {
+    let t = tenant.sql_literal();
     let service_pred = service_predicate(services);
     let fp_list = fp_list(fingerprints);
     let TimeWindow { start_ns, end_ns } = window;
@@ -1607,7 +1633,7 @@ pub fn metric_raw_samples_sliding_with_rx(
     let sm = projection.column_suffix();
     let rx = rx_projection(rx);
     let mut sql = format!(
-        "SELECT fingerprint, timestamp_ns, body{sm}{rx}\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE fingerprint IN ({fp_list})\n  AND timestamp_ns {lower_op} {start_ns} AND timestamp_ns <= {end_ns}"
+        "SELECT fingerprint, timestamp_ns, body{sm}{rx}\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE org_id = {t} AND fingerprint IN ({fp_list})\n  AND timestamp_ns {lower_op} {start_ns} AND timestamp_ns <= {end_ns}"
     );
     for clause in extra_predicates {
         sql.push_str("\n  AND ");
@@ -1690,8 +1716,9 @@ pub fn metric_range_bucketed(
 /// D2): the extraction is one level under the statement's `SELECT`, and
 /// `matched, caps` join `fingerprint, structured_metadata` in the `GROUP
 /// BY`. `None` renders [`metric_range_bucketed`]'s text byte for byte.
+#[allow(clippy::too_many_arguments)]
 pub fn metric_range_bucketed_with_regexp(
-    _tenant: &Tenant,
+    tenant: &Tenant,
     source: MetricSource<'_>,
     services: &[CheckedLiteral],
     fingerprints: &[FpLiteral],
@@ -1700,6 +1727,7 @@ pub fn metric_range_bucketed_with_regexp(
     projection: ScanProjection,
     regexp: Option<GroupExtraction<'_>>,
 ) -> Result<String, super::predicate::BucketGridRefusal> {
+    let t = tenant.sql_literal();
     let MetricSource { table, shape } = source;
     let (bucket_col, agg_expr) = (shape.bucket_col(), shape.agg_expr());
     let BucketedScan {
@@ -1737,7 +1765,9 @@ pub fn metric_range_bucketed_with_regexp(
         if !services.is_empty() {
             lines.push(format!("  PREWHERE {}", service_predicate(services)));
         }
-        lines.push(format!("  WHERE fingerprint IN ({fp_list})"));
+        lines.push(format!(
+            "  WHERE org_id = {t} AND fingerprint IN ({fp_list})"
+        ));
         lines.push(format!(
             "    AND {bucket_col} {lower_op} {start_ns} AND {bucket_col} <= {end_ns}"
         ));
@@ -1753,7 +1783,7 @@ pub fn metric_range_bucketed_with_regexp(
         return Ok(lines.join("\n"));
     }
     let mut sql = format!(
-        "SELECT fingerprint, {bucket_sql} AS bucket_ns, {agg_expr} AS n{sm}\nFROM {table}\n{prewhere}WHERE fingerprint IN ({fp_list})\n  AND {bucket_col} {lower_op} {start_ns} AND {bucket_col} <= {end_ns}"
+        "SELECT fingerprint, {bucket_sql} AS bucket_ns, {agg_expr} AS n{sm}\nFROM {table}\n{prewhere}WHERE org_id = {t} AND fingerprint IN ({fp_list})\n  AND {bucket_col} {lower_op} {start_ns} AND {bucket_col} <= {end_ns}"
     );
     for clause in extra_predicates {
         sql.push_str("\n  AND ");
@@ -1841,7 +1871,7 @@ pub fn metric_range_sliding(
 /// BY` and window partition. `None` renders [`metric_range_sliding`]'s text
 /// byte for byte.
 pub fn metric_range_sliding_with_regexp(
-    _tenant: &Tenant,
+    tenant: &Tenant,
     source: MetricSource<'_>,
     services: &[CheckedLiteral],
     fingerprints: &[FpLiteral],
@@ -1849,6 +1879,7 @@ pub fn metric_range_sliding_with_regexp(
     extra_predicates: &[CheckedFragment],
     regexp: Option<GroupExtraction<'_>>,
 ) -> Result<String, super::predicate::BucketGridRefusal> {
+    let t = tenant.sql_literal();
     let MetricSource { table, shape } = source;
     if shape.bucket_col() != "timestamp_ns" {
         return Err(super::predicate::BucketGridRefusal::RollupSource);
@@ -1919,7 +1950,9 @@ pub fn metric_range_sliding_with_regexp(
     if !services.is_empty() {
         lines.push(format!("{inner}PREWHERE {}", service_predicate(services)));
     }
-    lines.push(format!("{inner}WHERE fingerprint IN ({fp_list})"));
+    lines.push(format!(
+        "{inner}WHERE org_id = {t} AND fingerprint IN ({fp_list})"
+    ));
     lines.push(format!(
         "{filter}AND timestamp_ns {lower_op} {start_ns} AND timestamp_ns <= {end_ns}"
     ));
@@ -2394,7 +2427,7 @@ pub fn reduced_parser_columns(
 /// [`reduced_parser_columns`].
 #[allow(clippy::too_many_arguments)]
 pub fn metric_range_reduced(
-    _tenant: &Tenant,
+    tenant: &Tenant,
     table: &str,
     value: &ReducedUnwrap,
     keys: &ReducedKeyColumns,
@@ -2604,7 +2637,8 @@ pub fn metric_range_reduced(
         lines.push(format!("    PREWHERE {}", service_predicate(services)));
     }
     lines.push(format!(
-        "    WHERE fingerprint IN ({}) AND timestamp_ns {lower_op} {start_ns} AND timestamp_ns <= {end_ns}",
+        "    WHERE org_id = {} AND fingerprint IN ({}) AND timestamp_ns {lower_op} {start_ns} AND timestamp_ns <= {end_ns}",
+        tenant.sql_literal(),
         fp_list(fingerprints)
     ));
     for clause in extra_predicates {
@@ -2863,7 +2897,7 @@ mod tests {
                     Fingerprint::from_raw(99120).sql_literal()
                 ]
             ),
-            "SELECT fingerprint, service, labels FROM log_streams WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))"
+            "SELECT fingerprint, service, labels FROM log_streams WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))"
         );
     }
 
@@ -2875,7 +2909,7 @@ mod tests {
         end_ns: 1_751_331_600_000_000_000,
     };
     const RES_5S: u64 = 5_000_000_000;
-    const ACTIVE_ALL: &str = "SELECT DISTINCT fingerprint FROM log_metrics_5s WHERE bucket_ns >= 1751328000000000000 AND bucket_ns <= 1751331600000000000";
+    const ACTIVE_ALL: &str = "SELECT DISTINCT fingerprint FROM log_metrics_5s WHERE org_id = '' AND bucket_ns >= 1751328000000000000 AND bucket_ns <= 1751331600000000000";
 
     /// The active-fingerprint set the caller resolved and renders into a
     /// discovery scan (issue #603): a literal list, never a subquery.
@@ -2897,7 +2931,7 @@ mod tests {
                 &active_two()
             ),
             format!(
-                "SELECT DISTINCT key AS name\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND fingerprint IN ({ACTIVE_TWO_LIST})\nORDER BY name"
+                "SELECT DISTINCT key AS name\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND fingerprint IN ({ACTIVE_TWO_LIST})\nORDER BY name"
             )
         );
     }
@@ -2910,7 +2944,7 @@ mod tests {
             &[month_literal(2026, 7), month_literal(2026, 8)],
             &active_two(),
         );
-        assert!(sql.contains("WHERE month IN ('2026-07-01', '2026-08-01')"));
+        assert!(sql.contains("WHERE org_id = '' AND month IN ('2026-07-01', '2026-08-01')"));
     }
 
     #[test]
@@ -2924,7 +2958,7 @@ mod tests {
                 &active_two()
             ),
             format!(
-                "SELECT DISTINCT val AS value\nFROM log_streams_idx\nWHERE month = '2026-07-01' AND key = 'env'\n  AND fingerprint IN ({ACTIVE_TWO_LIST})\nORDER BY value"
+                "SELECT DISTINCT val AS value\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01' AND key = 'env'\n  AND fingerprint IN ({ACTIVE_TWO_LIST})\nORDER BY value"
             )
         );
     }
@@ -2938,7 +2972,7 @@ mod tests {
             &active_two(),
         );
         assert!(sql.starts_with("SELECT key, uniqExact(val) AS cardinality, countIf(toFloat64OrNull(val) IS NULL AND NOT match(val, "));
-        assert!(sql.contains("WHERE month = '2026-07-01'"));
+        assert!(sql.contains("WHERE org_id = '' AND month = '2026-07-01'"));
         assert!(sql.contains(&format!("\n  AND fingerprint IN ({ACTIVE_TWO_LIST})\n")));
         assert!(sql.ends_with("GROUP BY key\nORDER BY key"));
     }
@@ -3037,7 +3071,7 @@ mod tests {
                 DISCOVERY_WINDOW,
                 RES_5S
             ),
-            "SELECT DISTINCT fingerprint FROM log_metrics_5s WHERE fingerprint IN (toUInt128('101'), toUInt128('205')) \
+            "SELECT DISTINCT fingerprint FROM log_metrics_5s WHERE org_id = '' AND fingerprint IN (toUInt128('101'), toUInt128('205')) \
              AND bucket_ns >= 1751328000000000000 AND bucket_ns <= 1751331600000000000"
         );
     }
@@ -3197,7 +3231,7 @@ mod tests {
             "SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash, structured_metadata\n\
              FROM log_samples\n\
              PREWHERE service = 'checkout'\n\
-             WHERE fingerprint IN (toUInt128('18374'))\n\
+             WHERE org_id = '' AND fingerprint IN (toUInt128('18374'))\n\
              \x20 AND timestamp_ns > 1000 AND timestamp_ns <= 2000\n\
              ORDER BY timestamp_ns ASC, fingerprint ASC, body_hash ASC, body ASC\n\
              LIMIT 500"
@@ -3235,7 +3269,7 @@ mod tests {
             "SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash, structured_metadata\n\
              FROM log_samples\n\
              PREWHERE service IN ('checkout', 'billing')\n\
-             WHERE fingerprint IN (toUInt128('1'), toUInt128('2'))\n\
+             WHERE org_id = '' AND fingerprint IN (toUInt128('1'), toUInt128('2'))\n\
              \x20 AND timestamp_ns >= 1500 AND timestamp_ns <= 2000\n\
              \x20 AND (timestamp_ns, fingerprint, cityHash64(body)) >= (1500, toUInt128('7'), 42)\n\
              \x20 AND body LIKE '%err%'\n\
@@ -3270,7 +3304,7 @@ mod tests {
             "SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash, structured_metadata\n\
              FROM log_samples\n\
              PREWHERE service = 'checkout'\n\
-             WHERE fingerprint IN (toUInt128('18374'))\n\
+             WHERE org_id = '' AND fingerprint IN (toUInt128('18374'))\n\
              \x20 AND timestamp_ns > 1000 AND timestamp_ns <= 2000\n\
              ORDER BY timestamp_ns DESC, fingerprint DESC, body_hash DESC, body DESC\n\
              LIMIT 500"
@@ -3309,7 +3343,7 @@ mod tests {
             "SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash, structured_metadata\n\
              FROM log_samples\n\
              PREWHERE service IN ('checkout', 'billing')\n\
-             WHERE fingerprint IN (toUInt128('1'), toUInt128('2'))\n\
+             WHERE org_id = '' AND fingerprint IN (toUInt128('1'), toUInt128('2'))\n\
              \x20 AND timestamp_ns > 1000 AND timestamp_ns <= 1500\n\
              \x20 AND (timestamp_ns, fingerprint, cityHash64(body)) <= (1500, toUInt128('7'), 42)\n\
              \x20 AND body LIKE '%err%'\n\
@@ -3360,7 +3394,7 @@ mod tests {
             sql,
             "SELECT uniqExact(fingerprint) AS streams, uniqExact(toDate(fromUnixTimestamp64Nano(bucket_ns))) AS chunks, sum(count) AS entries, sum(bytes) AS bytes\n\
              FROM log_metrics_5s\n\
-             WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120')) AND bucket_ns > 1000 AND bucket_ns <= 2000"
+             WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120')) AND bucket_ns > 1000 AND bucket_ns <= 2000"
         );
         assert!(!sql.contains("body"), "rollup stats must never read body");
     }
@@ -3390,7 +3424,7 @@ mod tests {
              FROM (\n  \
                SELECT pattern, intDiv(bucket_ns, 10000000000) * 10000000000 AS ts_ns, sum(count) AS cnt\n  \
                FROM log_patterns\n  \
-               WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120')) AND bucket_ns >= 1000 AND bucket_ns < 2000\n  \
+               WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120')) AND bucket_ns >= 1000 AND bucket_ns < 2000\n  \
                GROUP BY pattern, ts_ns\n\
              )\n\
              GROUP BY pattern\n\
@@ -3421,7 +3455,7 @@ mod tests {
             "SELECT uniqExact(fingerprint) AS streams, uniqExact(toDate(fromUnixTimestamp64Nano(timestamp_ns))) AS chunks, count() AS entries, sum(length(body)) AS bytes\n\
              FROM log_samples\n\
              PREWHERE service = 'checkout'\n\
-             WHERE fingerprint IN (toUInt128('18374'))\n\
+             WHERE org_id = '' AND fingerprint IN (toUInt128('18374'))\n\
              \x20 AND timestamp_ns > 1000 AND timestamp_ns <= 2000\n\
              \x20 AND body LIKE '%err%'"
         );
@@ -3590,7 +3624,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+                r"WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
             ],
@@ -3601,7 +3635,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+                r"WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"  AND body LIKE '%CONN\\_REFUSED%'",
                 r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
@@ -3613,7 +3647,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body",
                 r"FROM log_samples",
                 r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
-                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+                r"WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
             ],
@@ -3624,7 +3658,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body",
                 r"FROM log_samples",
                 r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
-                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+                r"WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"  AND body LIKE '%CONN\\_REFUSED%'",
                 r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
@@ -3636,7 +3670,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+                r"WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
             ],
@@ -3647,7 +3681,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+                r"WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"  AND body LIKE '%CONN\\_REFUSED%'",
                 r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
@@ -3659,7 +3693,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body",
                 r"FROM log_samples",
                 r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
-                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+                r"WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
             ],
@@ -3670,7 +3704,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body",
                 r"FROM log_samples",
                 r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
-                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+                r"WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"  AND body LIKE '%CONN\\_REFUSED%'",
                 r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
@@ -3682,7 +3716,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+                r"WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
             ],
@@ -3693,7 +3727,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+                r"WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"  AND body LIKE '%CONN\\_REFUSED%'",
                 r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
@@ -3705,7 +3739,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
-                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+                r"WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
             ],
@@ -3716,7 +3750,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
-                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+                r"WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"  AND body LIKE '%CONN\\_REFUSED%'",
                 r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
@@ -3728,7 +3762,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+                r"WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
             ],
@@ -3739,7 +3773,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+                r"WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"  AND body LIKE '%CONN\\_REFUSED%'",
                 r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
@@ -3751,7 +3785,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
-                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+                r"WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
             ],
@@ -3762,7 +3796,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
-                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+                r"WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"  AND body LIKE '%CONN\\_REFUSED%'",
                 r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
@@ -3774,7 +3808,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+                r"WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
             ],
@@ -3785,7 +3819,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+                r"WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"  AND body LIKE '%CONN\\_REFUSED%'",
                 r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
@@ -3797,7 +3831,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body",
                 r"FROM log_samples",
                 r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
-                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+                r"WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
             ],
@@ -3808,7 +3842,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body",
                 r"FROM log_samples",
                 r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
-                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+                r"WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"  AND body LIKE '%CONN\\_REFUSED%'",
                 r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
@@ -3820,7 +3854,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+                r"WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
             ],
@@ -3831,7 +3865,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+                r"WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"  AND body LIKE '%CONN\\_REFUSED%'",
                 r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
@@ -3843,7 +3877,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body",
                 r"FROM log_samples",
                 r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
-                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+                r"WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
             ],
@@ -3854,7 +3888,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body",
                 r"FROM log_samples",
                 r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
-                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+                r"WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"  AND body LIKE '%CONN\\_REFUSED%'",
                 r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
@@ -3866,7 +3900,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+                r"WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
             ],
@@ -3877,7 +3911,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+                r"WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"  AND body LIKE '%CONN\\_REFUSED%'",
                 r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
@@ -3889,7 +3923,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
-                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+                r"WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
             ],
@@ -3900,7 +3934,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
-                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+                r"WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"  AND body LIKE '%CONN\\_REFUSED%'",
                 r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
@@ -3912,7 +3946,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+                r"WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
             ],
@@ -3923,7 +3957,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+                r"WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"  AND body LIKE '%CONN\\_REFUSED%'",
                 r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
@@ -3935,7 +3969,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
-                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+                r"WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
             ],
@@ -3946,7 +3980,7 @@ mod tests {
                 r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
-                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+                r"WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
                 r"  AND body LIKE '%CONN\\_REFUSED%'",
                 r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
@@ -3957,7 +3991,7 @@ mod tests {
             &[
                 r"SELECT count() AS n",
                 r"FROM log_streams_idx",
-                r"WHERE month = '2026-07-01' AND key = 'service_name'",
+                r"WHERE org_id = '' AND month = '2026-07-01' AND key = 'service_name'",
             ],
         ),
         (
@@ -3965,7 +3999,7 @@ mod tests {
             &[
                 r"SELECT count() AS n",
                 r"FROM log_streams_idx",
-                r"WHERE month = '2026-07-01' AND key = 'a\'b\\c'",
+                r"WHERE org_id = '' AND month = '2026-07-01' AND key = 'a\'b\\c'",
             ],
         ),
         (
@@ -3973,7 +4007,7 @@ mod tests {
             &[
                 r"SELECT count() AS n",
                 r"FROM log_streams_idx",
-                r"WHERE month IN ('2026-07-01', '2026-08-01') AND key = 'service_name'",
+                r"WHERE org_id = '' AND month IN ('2026-07-01', '2026-08-01') AND key = 'service_name'",
             ],
         ),
         (
@@ -3981,7 +4015,7 @@ mod tests {
             &[
                 r"SELECT count() AS n",
                 r"FROM log_streams_idx",
-                r"WHERE month IN ('2026-07-01', '2026-08-01') AND key = 'a\'b\\c'",
+                r"WHERE org_id = '' AND month IN ('2026-07-01', '2026-08-01') AND key = 'a\'b\\c'",
             ],
         ),
     ];
@@ -4216,7 +4250,7 @@ mod tests {
                 r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, count() AS n",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+                r"WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
                 r"GROUP BY fingerprint, bucket_ns",
             ],
@@ -4227,7 +4261,7 @@ mod tests {
                 r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, count() AS n",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+                r"WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns >= 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
                 r"GROUP BY fingerprint, bucket_ns",
             ],
@@ -4238,7 +4272,7 @@ mod tests {
                 r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, sum(length(body)) AS n",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+                r"WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
                 r"GROUP BY fingerprint, bucket_ns",
             ],
@@ -4249,7 +4283,7 @@ mod tests {
                 r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, sum(length(body)) AS n",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+                r"WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns >= 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
                 r"GROUP BY fingerprint, bucket_ns",
             ],
@@ -4260,7 +4294,7 @@ mod tests {
                 r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, count() AS n, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+                r"WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
                 r"GROUP BY fingerprint, bucket_ns, structured_metadata",
             ],
@@ -4271,7 +4305,7 @@ mod tests {
                 r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, count() AS n, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+                r"WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns >= 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
                 r"GROUP BY fingerprint, bucket_ns, structured_metadata",
             ],
@@ -4282,7 +4316,7 @@ mod tests {
                 r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, sum(length(body)) AS n, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+                r"WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
                 r"GROUP BY fingerprint, bucket_ns, structured_metadata",
             ],
@@ -4293,7 +4327,7 @@ mod tests {
                 r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, sum(length(body)) AS n, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+                r"WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns >= 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
                 r"GROUP BY fingerprint, bucket_ns, structured_metadata",
             ],
@@ -4304,7 +4338,7 @@ mod tests {
                 r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, count() AS n, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
-                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+                r"WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
                 r"GROUP BY fingerprint, bucket_ns, structured_metadata",
             ],
@@ -4315,7 +4349,7 @@ mod tests {
                 r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, count() AS n, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
-                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+                r"WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
                 r"  AND body LIKE '%CONN\\_REFUSED%'",
                 r"GROUP BY fingerprint, bucket_ns, structured_metadata",
@@ -4326,7 +4360,7 @@ mod tests {
             &[
                 r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, count() AS n, structured_metadata",
                 r"FROM log_samples",
-                r"WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+                r"WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
                 r"  AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
                 r"GROUP BY fingerprint, bucket_ns, structured_metadata",
             ],
@@ -4472,7 +4506,7 @@ mod tests {
         "             count() AS m, count() AS c",
         "      FROM log_samples",
         "      PREWHERE service = 'checkout'",
-        "      WHERE fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
+        "      WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120'))",
         "        AND timestamp_ns > 1699999850000000000 AND timestamp_ns <= 1700003600000000000",
         "      GROUP BY fingerprint, structured_metadata, lo, hi",
         "      HAVING lo <= hi",

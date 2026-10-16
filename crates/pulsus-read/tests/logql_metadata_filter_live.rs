@@ -125,6 +125,8 @@ fn now_ns() -> i64 {
 /// rollup the activity scan reads — empty.
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedLandingRow {
+    /// The tenant (issue #653): the empty tenant's rows.
+    org_id: String,
     received_ms: i64,
     kind: u8,
     service: String,
@@ -143,6 +145,7 @@ struct SeedLandingRow {
 impl SeedLandingRow {
     fn of_kind(kind: u8) -> Self {
         SeedLandingRow {
+            org_id: String::new(),
             received_ms: 0,
             kind,
             service: String::new(),

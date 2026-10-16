@@ -271,6 +271,8 @@ async fn seed_activity(client: &ChClient, db: &str, ts_ns: i64, fingerprints: &[
 /// the per-entry structured-metadata column).
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedSampleRow {
+    /// The tenant (issue #653): the empty tenant's rows.
+    org_id: String,
     service: String,
     fingerprint: u128,
     timestamp_ns: i64,
@@ -456,6 +458,7 @@ async fn detected_labels_and_fields_end_to_end() {
     let sparse_base = now - 600_000_000_000; // 10 minutes ago
     let sparse_rows: Vec<SeedSampleRow> = (0..2_600)
         .map(|i| SeedSampleRow {
+            org_id: String::new(),
             service: "sparse-svc".to_string(),
             fingerprint: 9,
             timestamp_ns: sparse_base + (i as i64) * 36_000_000,
@@ -822,6 +825,7 @@ async fn detected_fields_budget_truncation_signals_pulsus_partial() {
     let base = now - 600_000_000_000;
     let rows: Vec<SeedSampleRow> = (0..10_000)
         .map(|i| SeedSampleRow {
+            org_id: String::new(),
             service: "budget-svc".to_string(),
             fingerprint: 1,
             timestamp_ns: base + (i as i64) * 36_000_000,
@@ -1258,6 +1262,7 @@ async fn detected_field_values_end_to_end() {
     let mut rows: Vec<SeedSampleRow> = Vec::new();
     for (i, tag) in ["a", "b", "c"].iter().enumerate() {
         rows.push(SeedSampleRow {
+            org_id: String::new(),
             service: "fieldvals".to_string(),
             fingerprint: 20,
             timestamp_ns: now - (3 - i as i64) * 1_000_000_000,
@@ -1271,6 +1276,7 @@ async fn detected_field_values_end_to_end() {
         .enumerate()
     {
         rows.push(SeedSampleRow {
+            org_id: String::new(),
             service: "fieldvals2".to_string(),
             fingerprint: 21,
             timestamp_ns: now - (3 - i as i64) * 1_000_000_000,
@@ -1464,6 +1470,7 @@ async fn detected_fields_classify_a_line_as_json_exactly_when_json_reads_it() {
         )
         .await;
         rows.push(SeedSampleRow {
+            org_id: String::new(),
             service: svc.to_string(),
             fingerprint: u128::from(fp),
             timestamp_ns: now - 2_000_000_000,

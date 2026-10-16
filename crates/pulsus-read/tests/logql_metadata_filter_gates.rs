@@ -70,8 +70,13 @@ fn the_regenerated_planner_golden_differs_only_by_the_new_field() {
     // Part 4 of it moved the two `| unwrap` leaves too, which are read from
     // the tree's golden (less the field this walk counts).
     let after = read(PLANNER_GOLDEN);
+    // Issue #653 put the tenant first in every stage-1 `WHERE`; that edit is
+    // applied to the merge base's golden the same way.
     let before = with_the_reduced_leaves(
-        &with_the_sliding_route(&blob_at(MERGE_BASE, PLANNER_GOLDEN)),
+        &with_the_tenant_term(&with_the_sliding_route(&blob_at(
+            MERGE_BASE,
+            PLANNER_GOLDEN,
+        ))),
         &after,
     );
     let old: Vec<&str> = before.lines().collect();
@@ -144,6 +149,12 @@ fn the_regenerated_planner_golden_differs_only_by_the_new_field() {
 /// #227's route names the sliding statement's and plans no client
 /// aggregation. The edit is the one `plan_build_differential.txt` received,
 /// and nothing else: every other line is kept as it is.
+/// The merge base's golden with issue #653's one statement edit applied:
+/// every stage-1 statement's `WHERE` leads with the empty tenant's term.
+fn with_the_tenant_term(golden: &str) -> String {
+    golden.replace("\\nWHERE month", "\\nWHERE org_id = '' AND month")
+}
+
 fn with_the_sliding_route(golden: &str) -> String {
     const SLIDING: &str = "reason: \"raw: sliding-window range aggregation (issue #227)\",";
     const LOWERED: &str =

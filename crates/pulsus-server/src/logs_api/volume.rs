@@ -21,8 +21,9 @@ use crate::app::AppState;
 
 use super::encode;
 use super::error::ApiError;
-use super::handlers::{engine_for, parse_bounds_ordered, read_form_pairs};
+use super::handlers::{engine_for, parse_bounds_ordered, read_form_pairs, tenant_of};
 use super::params::{self, ParamError};
+use pulsus_model::Tenant;
 
 /// `X-Pulsus-Explain: 1` — same header contract as the query endpoints.
 fn wants_explain(headers: &HeaderMap) -> bool {
@@ -37,8 +38,12 @@ pub(crate) async fn volume(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
+    let tenant = match tenant_of(&headers) {
+        Ok(tenant) => tenant,
+        Err(e) => return e.into_response(),
+    };
     let pairs = params::parse_pairs(raw.as_deref().unwrap_or(""));
-    match volume_impl(state, &headers, pairs).await {
+    match volume_impl(state, tenant, &headers, pairs).await {
         Ok(res) => res,
         Err(e) => e.into_response(),
     }
@@ -54,8 +59,12 @@ pub(crate) async fn volume_post(
     RawQuery(raw): RawQuery,
     body: Body,
 ) -> Response {
+    let tenant = match tenant_of(&headers) {
+        Ok(tenant) => tenant,
+        Err(e) => return e.into_response(),
+    };
     match read_form_pairs(&headers, raw.as_deref(), body).await {
-        Ok(pairs) => match volume_impl(state, &headers, pairs).await {
+        Ok(pairs) => match volume_impl(state, tenant, &headers, pairs).await {
             Ok(res) => res,
             Err(e) => e.into_response(),
         },
@@ -65,6 +74,7 @@ pub(crate) async fn volume_post(
 
 async fn volume_impl(
     state: AppState,
+    tenant: Tenant,
     headers: &HeaderMap,
     pairs: Vec<(String, String)>,
 ) -> Result<Response, ApiError> {
@@ -87,7 +97,7 @@ async fn volume_impl(
         target_labels,
     };
 
-    let engine = engine_for(&state).await?;
+    let engine = engine_for(&state, tenant).await?;
     if wants_explain(headers) {
         let (entries, explain) = engine.volume_explained(&expr, &q).await?;
         Ok(encode::volume_response(entries, end_ns, Some(explain)))

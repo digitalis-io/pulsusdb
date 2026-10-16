@@ -585,6 +585,8 @@ async fn run_path_b(db: &str, f: &Fixture) {
 /// this path stays independent of the code under test.
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct PathBLandingRow {
+    /// The tenant (issue #653): the empty tenant's rows.
+    org_id: String,
     received_ms: i64,
     kind: u8,
     service: String,
@@ -603,6 +605,7 @@ struct PathBLandingRow {
 impl PathBLandingRow {
     fn empty() -> Self {
         PathBLandingRow {
+            org_id: String::new(),
             received_ms: 0,
             kind: 0,
             service: String::new(),
