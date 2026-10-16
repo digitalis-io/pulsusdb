@@ -755,25 +755,24 @@ when we are asking it to slow down, so we keep `429`; recorded as
   `| rate()`, are served: the statement binds the search statement's
   per-trace scalar, child counts and numbering.
 
+- **Closed by issue #602 part 2a**: `{ !.a } | rate()` is served. The
+  statement carries the negation's demand, so a value it finds that is
+  not a boolean answers `400` with the demand's text, where the reference
+  answers `500`.
+
 - **The residual, each class with its measured reference status.** Every
   row is `we 400 / the reference 200`:
 
   | class id | witness query | our exact 400 body |
   |---|---|---|
-  | `metrics-filter-field-negation` | `{ !.a } \| rate()` | `type mismatch: field negation is not supported in metrics filters` |
   | `metrics-filter-intrinsic-existence-shared-path` | `{ name != nil } \| rate()` | `type mismatch: existence checks are only supported on attributes` |
 
-- **One of those rows is not what it looks like.**
+- **The row is not what it looks like.**
   `metrics-filter-intrinsic-existence-shared-path` is not a
   metrics-block class at all: `/api/search` refuses `{ name != nil }`
   with the identical body, so the rejection comes from a shared path. It
   is listed because it IS a divergence on this route; it is owned
   elsewhere.
-
-- **Why each remaining class is a design, not a line.**
-  `metrics-filter-field-negation`
-  is a value co-load whose non-boolean case is a reference **500**, which
-  SQL cannot produce.
 
 - **Where it is enforced.** `crates/pulsus-read/tests/fixtures/metrics_filter_accept.json`
   carries one probe per witness with both sides' verdicts and the exact
@@ -1451,7 +1450,7 @@ when we are asking it to slow down, so we keep `429`; recorded as
      ungrouped **aggregation** or **quantile** over an empty window we emit
      one series whose zero `value` is protojson-omitted, where the reference
      emits no series. Our `PlanKind::Agg` instant arm folds an absent row to
-     `0.0` (`crates/pulsus-read/src/traces/exec.rs:1812-1825`, "an empty
+     `0.0` (`crates/pulsus-read/src/traces/exec.rs:1814-1827`, "an empty
      aggregate window is a 0-valued sample"), and the reference drops a
      series with no samples
      (`modules/frontend/metrics_query_handler.go:193-196` @ v3.0.2). This is
@@ -2769,6 +2768,14 @@ when we are asking it to slow down, so we keep `429`; recorded as
   `crates/pulsus-read/src/traces/search_eval.rs::tests::nested_by_charges_the_composite_tuple_not_the_stage_local_one`,
   which also asserts that `max_series = 5` still answers `Ok` — so the
   criterion cannot be satisfied by refusing everything.
+
+- **The search statement (issue #602 part 2a).** A search the statement
+  answers counts the distinct `by()` value tuples of the spansets its
+  response carries: the composite tuple of the last segment's keys, and
+  not the prefixes the previous engine also counts. A `by() | coalesce()`
+  carries no spanset attributes and counts nothing, and a group a later
+  stage drops counts nothing. Pinned by
+  `crates/pulsus-read/tests/traces_query_v2_live.rs::search_routed_keeps_the_group_cap`.
 
 - **Why this direction.** The alternative is an unbounded retained set:
   the composite tuples are what the response holds, so charging the last

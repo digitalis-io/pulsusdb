@@ -456,7 +456,7 @@ because the table it reads has no time column.
 
 Open a tag-value dropdown while a service filter is set and the read becomes a
 semi-join between the two tables at **day** grain
-(`crates/pulsus-read/src/traces/tags_sql.rs:282-312`, chosen at `crates/pulsus-read/src/traces/exec.rs:2104-2135`):
+(`crates/pulsus-read/src/traces/tags_sql.rs:282-312`, chosen at `crates/pulsus-read/src/traces/exec.rs:2106-2137`):
 
 ```sql
 SELECT DISTINCT val, val_type
@@ -2319,7 +2319,7 @@ Three aggregate conditions are pushed into the candidate generator today
 Losing a pushdown does not change an answer. The condition is re-evaluated over
 the hydrated spans either way; the pushed form only narrows the candidate list,
 and the plan already keeps a byte-for-byte fallback statement with nothing pushed
-(`crates/pulsus-read/src/traces/search_plan.rs:3084-3104`, used at `crates/pulsus-read/src/traces/exec.rs:2450-2478`). The effect is more
+(`crates/pulsus-read/src/traces/search_plan.rs:3084-3104`, used at `crates/pulsus-read/src/traces/exec.rs:2393-2421`). The effect is more
 candidates, not a different result.
 
 `by()` grouping already refuses to push whenever the generator is not
@@ -4505,7 +4505,7 @@ The image line (`:571`) is shown at today's floor; the source quoted here pinned
   135  pub const TAG_VALUES_MAX: usize = 1_000;
 ```
 
-**`:1825-1866`**  (42 lines in the range; comments and blanks elided, 30 shown)
+**`:1827-1868`**  (42 lines in the range; comments and blanks elided, 30 shown)
 
 ```rust
  1825      pub async fn list_tag_values(
@@ -4540,7 +4540,7 @@ The image line (`:571`) is shown at today's floor; the source quoted here pinned
  1864              )
 ```
 
-**`:2163-2191`**  (29 lines in the range; comments and blanks elided, 14 shown)
+**`:2165-2193`**  (29 lines in the range; comments and blanks elided, 14 shown)
 
 ```rust
  2172              let rows: Vec<CandidateRow> = match attempt {

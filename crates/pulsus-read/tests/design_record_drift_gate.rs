@@ -1869,31 +1869,36 @@ enum ReviewedVerdict {
 // Issue #595 part 2: coordinates and nothing else. The engine's indexed
 // attributes moved `exec.rs:3321` to `:3324` and `exec.rs:3281-3287` to
 // `:3284-3290`. The verdicts are unchanged.
+//
+// Issue #602 part 2a: coordinates and nothing else. The search fork's
+// shorter body moved `exec.rs:3324` to `:3267`, `exec.rs:3284-3290` to
+// `:3227-3233`, and the grouped row charge moved `exec.rs:910` to `:912`.
+// The verdicts are unchanged.
 const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 5] = [
     (
         "docs/query-lowering.md",
-        "exec.rs:3324",
+        "exec.rs:3267",
         0,
         ReviewedVerdict::FallbackWrong,
         "a LogQL section citing the TraceQL search executor's generator settings;          crates/pulsus-read/src/logql/exec.rs has no such thing",
     ),
     (
         "docs/query-lowering.md",
-        "exec.rs:3324",
+        "exec.rs:3267",
         2,
         ReviewedVerdict::FallbackWrong,
         "the same citation again, in the same section, with the same answer",
     ),
     (
         "docs/query-lowering.md",
-        "exec.rs:3284-3290",
+        "exec.rs:3227-3233",
         0,
         ReviewedVerdict::FallbackWrong,
         "the search settings block the same section quotes; it is in traces/exec.rs",
     ),
     (
         "docs/query-lowering.md",
-        "exec.rs:910",
+        "exec.rs:912",
         0,
         ReviewedVerdict::FallbackWrong,
         "a LogQL section citing a line of the TraceQL executor",

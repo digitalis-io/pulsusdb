@@ -4753,44 +4753,6 @@ fn compile_search_of(
     compile_search(&parsed, &ctx(), "spans", "traces", 20, 3)
 }
 
-/// Section 8.2: what part 3 and issues #592–#594 serve is refused, each
-/// naming its target, and part 2's one residual (its section 3.6).
-#[test]
-fn compile_search_refuses_what_parts_two_and_three_serve() {
-    for (query, target) in [
-        // Issue #591 part 2's section 3.6: one set field twice in a
-        // comparison holding arithmetic has no single element to project.
-        (r#"{ event.k * event.k > 5 }"#, "two occurrences"),
-        (r#"{ .k + 1 > .k }"#, "two occurrences"),
-        // The same under `!=`, which projects nothing but must still be
-        // refused: the predicate matches any pair, today's engine each
-        // element against itself (code review round 1 of part 2).
-        (r#"{ event.k * event.k != 5 }"#, "two occurrences"),
-        (r#"{ .k + 1 != .k }"#, "two occurrences"),
-        (r#"{ link.lk - link.lk != 0 }"#, "two occurrences"),
-        (r#"{ .a = 1 } | count() > 1 | count() > 2"#, "#592"),
-        (r#"{ .a = 1 } | by(name) | count() > 1"#, "#592"),
-        // Issue #592 part 2: a key the statement does not serve, and a
-        // second `by()`.
-        (r#"{ .a = 1 } | by(trace:id)"#, "#592"),
-        (r#"{ .a = 1 } | by(span.a) | by(name)"#, "#592"),
-    ] {
-        match compile_search_of(query) {
-            Err(PlanError::UnsupportedField(msg)) => assert!(
-                msg.contains(target),
-                "{query}: the refusal must name {target}, got {msg:?}"
-            ),
-            Err(other) => {
-                panic!("{query}: expected UnsupportedField naming {target}, got {other:?}")
-            }
-            Ok(s) => panic!(
-                "{query}: expected a refusal naming {target}, compiled to {}",
-                s.sql()
-            ),
-        }
-    }
-}
-
 /// Section 8.2: a query whose off-row fields project nothing compiles,
 /// and issue #591 part 2's section 7.1: so does one that projects an
 /// off-row value.
@@ -4915,17 +4877,8 @@ fn the_fork_routes_by_the_plan() {
     use pulsus_read::traces::spans::search::plan_statement;
     let mut wrong = Vec::new();
     for query in [
-        r#"{ .a = 1 } && { .b = 2 } | { .c = 3 }"#,
-        // Issue #592 part 3: an aggregate with `by()` and a second
-        // aggregate.
-        r#"{ .a = 1 } | by(name) | count() > 1"#,
-        r#"{ .a = 1 } | count() > 1 | by(name)"#,
-        r#"{ .a = 1 } | count() > 1 | count() > 2"#,
-        // Issue #592 part 2: the key the statement does not serve, a
-        // second `by()`, and a `by()` after `coalesce()`.
+        // Issue #602 part 2b serves `by(trace:id)`.
         r#"{ .a = 1 } | by(trace:id) | coalesce()"#,
-        r#"{ .a = 1 } | by(span.a) | by(name)"#,
-        r#"{ .a = 1 } | by(span.a) | coalesce() | by(name)"#,
         r#"{ event.k * event.k > 5 }"#,
         r#"{ .k + 1 > .k }"#,
         r#"{ link.lk - link.lk != 0 }"#,
@@ -4978,6 +4931,15 @@ fn the_fork_routes_by_the_plan() {
         r#"{ resource.service.name = "checkout" } | count() > 5 | { status = error }"#,
         r#"{ } | { status = error } | count() > 1"#,
         r#"{ } | count() > 2 | coalesce()"#,
+        // Issue #602 part 2a: a tree with a later filter, an aggregate
+        // with `by()`, two aggregates, two `by()`s, and a `by()` after
+        // `coalesce()`.
+        r#"{ .a = 1 } && { .b = 2 } | { .c = 3 }"#,
+        r#"{ .a = 1 } | by(name) | count() > 1"#,
+        r#"{ .a = 1 } | count() > 1 | by(name)"#,
+        r#"{ .a = 1 } | count() > 1 | count() > 2"#,
+        r#"{ .a = 1 } | by(span.a) | by(name)"#,
+        r#"{ .a = 1 } | by(span.a) | coalesce() | by(name)"#,
         // Issue #593 part 1: the ten inventory rows, and four shapes.
         r#"{ .a = 1 } > { .b = 2 } > { .c = 3 }"#,
         r#"{ .a = 1 } > { .b = 2 }"#,
@@ -5067,8 +5029,10 @@ fn a_float_sum_folds_in_span_order() {
             .to_string();
         assert!(
             sql.contains(
-                "arrayFold((acc, e) -> acc + e.1, arraySort(e -> (e.2, e.3), groupArrayIf("
-            ) && !sql.contains("sumIf(toFloat64(duration_ns)")
+                "arrayFold((acc, e) -> acc + e.1, arraySort(e -> (e.2, e.3), ml0), toFloat64('-0'))"
+            ) && sql.contains(", start_ns, span_id), ")
+                && sql.contains(" AS l0,")
+                && !sql.contains("sumIf(toFloat64(duration_ns)")
                 && !sql.contains("sumIf(assumeNotNull(")
                 && !sql.contains("avgIf("),
             "{query}: the float sum must fold in span order"
@@ -5625,7 +5589,8 @@ fn an_event_or_link_intrinsic_key_is_refused() {
         ("{ } | by(link:traceID)", collection("link:traceID")),
         (
             "{ } | by(trace:id)",
-            "by(trace:id) is not supported by the search statement yet (issue #592)".to_string(),
+            "by(trace:id) is not supported by the search statement yet (issue #602 part 2b)"
+                .to_string(),
         ),
     ] {
         match compile_search_of(query) {
@@ -5636,4 +5601,61 @@ fn an_event_or_link_intrinsic_key_is_refused() {
             Ok(s) => panic!("{query}: expected a refusal, compiled to {}", s.sql()),
         }
     }
+}
+
+/// Issue #602 part 2a, plan §3.5: a shape the search statement cannot
+/// fold is refused with the previous planner's exact text, and
+/// `by(trace:id)` names the part that serves it.
+#[test]
+fn compile_search_refuses_with_the_previous_planners_texts() {
+    let mut wrong = Vec::new();
+    for (query, want) in [
+        (
+            "{ .a = 1 } | by(.b + .c)",
+            "type mismatch: by((.b + .c)) is not a group key this engine can execute: a grouping \
+             key must resolve to a single per-span value, so it must be an attribute or an \
+             intrinsic",
+        ),
+        (
+            "{ .a = 1 } | { .b = 2 } && { .c = 3 }",
+            "type mismatch: ({ .b = 2 } && { .c = 3 }) is not executable as a pipeline stage: a \
+             `|` stage must be a single { ... } filter, not a cross-spanset or structural \
+             operation",
+        ),
+        (
+            "{ } | avg(span:childCount) > 1",
+            "type mismatch: span:childCount is not numerically aggregatable",
+        ),
+        (
+            "{ true } | avg(trace:duration) > 1s",
+            "type mismatch: traceDuration is not numerically aggregatable",
+        ),
+        (
+            "{ true } | avg(.a + 1) > 1",
+            "type mismatch: avg((.a + 1)) is not an executable aggregation source: only a bare \
+             duration or attribute can be aggregated",
+        ),
+        (
+            "{ } | select(event:name)",
+            "type mismatch: select() of this intrinsic is not supported",
+        ),
+        (
+            "{ } | by(event:name)",
+            "unsupported field: by(event:name): grouping by a span-event / span-link intrinsic \
+             is not supported (a span carries a collection of events/links, so there is no \
+             single group value)",
+        ),
+        (
+            "{ } | by(trace:id)",
+            "unsupported field: by(trace:id) is not supported by the search statement yet \
+             (issue #602 part 2b)",
+        ),
+    ] {
+        match compile_search_of(query) {
+            Err(e) if e.to_string() == want => {}
+            Err(e) => wrong.push(format!("{query}\n  want: {want}\n  got:  {e}")),
+            Ok(s) => wrong.push(format!("{query}: compiled to {}", s.sql())),
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }

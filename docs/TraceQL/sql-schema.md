@@ -296,28 +296,42 @@ ORDER BY m.last DESC, m.trace_id ASC
 - **The answer is final**: one row per trace with the root, the extent, the
   matched count and the capped spanset. 3,118 bytes for twenty traces.
 
-**With `| by(<field>)` the detail pass gains a second grouping key** and the
-trace row carries one spanset per group instead of one:
+**Every `|` stage is one fold** (issue #602 part 2a,
+`crates/pulsus-read/src/traces/spans/fold.rs`). With a later filter, a `by()`
+or an aggregate, the detail read, and the top-K when a stage decides survival,
+read the span rows in three levels: **fine groups** by `trace_id` and every key
+the segment writes, each holding its aggregates' partials; the **merged** level,
+where each aggregate is merged over its prefix group (`trace_id` and the keys
+written before it) by a window function, and a group's survival is the AND of
+its passes; and the **trace**, whose `matched` and spans are the union of the
+surviving groups. A `coalesce()` after an aggregate ends a segment: its span rows
+are handed on through `ARRAY JOIN`, each marked with whether its group survived.
+The detail read of `{ } | by(name) | count() > 2`:
 
 ```sql
-FROM (SELECT trace_id, max(last) AS last, sum(matched) AS matched,
+FROM (SELECT trace_id, max(g_last) AS last, sumIf(n_end, alive) AS matched,
+             arraySlice(arraySort(x -> (x.2, x.1), arrayFlatten(groupArrayIf(g_spans, alive))), 1, 3) AS spans,
              arrayMap(x -> (x.2, x.3, x.4), arraySort(x -> x.1,
-                      groupArray((first, grp, grp_type, spans)))) AS groups
-      FROM (SELECT trace_id,
-                   toString(<the group field>) AS grp,       -- an ATTRIBUTE key only:
-                   <its stored type>          AS grp_type,   -- an intrinsic's type is the query's
-                   max(start_ns) AS last, count() AS matched,
-                   min((start_ns, span_id)) AS first,
-                   arraySlice(arraySort(x -> (x.2, x.1),
-                              groupArray((span_id, start_ns, duration_ns))), 1, 3) AS spans
-            FROM spans
-            WHERE <the same three reads> AND <the group key is present>
-            GROUP BY trace_id, grp, grp_type)
+                      groupArrayIf((g_order, g_attrs, n_end, g_spans), alive))) AS groups
+      FROM (SELECT trace_id, g_last, n_end, g_spans, tuple(o0) AS g_order,
+                   [(k0, t0), (toString(mn0), 'Int64')] AS g_attrs,
+                   n_end > 0 AND (mn0 > 0 AND (toFloat64(mn0)) > toFloat64('2.0')) AS alive
+            FROM (SELECT *, n0 AS mn0, fp0 AS o0                          -- merged
+                  FROM (SELECT trace_id, toString(name) AS k0, '' AS t0,  -- fine
+                               countIf(true) AS n_end, countIf(true) AS n0,
+                               maxIf(start_ns, true) AS g_last, countIf(true) AS nb0,
+                               minIf((start_ns, span_id), true) AS fp0,
+                               arraySlice(arraySort(x -> (x.2, x.1),
+                                          groupArrayIf((span_id, start_ns, duration_ns, service, <projection>), true)), 1, 3) AS g_spans
+                        FROM spans
+                        WHERE <the same three reads>
+                        GROUP BY trace_id, k0, t0)))
       GROUP BY trace_id) AS m
 ```
 
-An intrinsic key drops `grp_type` from all three places, and the groups tuple is
-`(grp, spans)`.
+`true` is the condition alive at each stage: the selector ANDed with the
+filters written before it. An intrinsic key's `t<j>` is `''`; an attribute key's
+is its stored type.
 
 ```text
 {} | by(span.a) on the catalogue fixture, trace 1111…
@@ -329,7 +343,7 @@ An intrinsic key drops `grp_type` from all three places, and the groups tuple is
 ```
 
 **`<the group field>` is rendered as TEXT beside its STORED TYPE** —
-`toString(…) AS grp, <the type> AS grp_type`, both in the `GROUP BY`. Two rules
+`toString(…) AS k<j>, <the type> AS t<j>`, both in the `GROUP BY`. Two rules
 meet there:
 
 * An attribute read is a `Dynamic` value and ClickHouse refuses those as
@@ -362,18 +376,17 @@ statements read, not a second measurement.
 
 Three more rules are in that shape, and each is one a simpler statement gets
 wrong: the groups come back in **first-appearance order**, which is
-`min((start_ns, span_id))` per group and not the group value's own order; a span
+`min((start_ns, span_id))` per group, nested under the groups of the keys written before it, and not the group value's own order; a span
 **lacking the key is in the one `nil` group**, as `docs/api.md` §4.2 and today's engine place it; and the top-K
 that chooses the twenty traces is still per trace, not per group, so a trace with
-many groups does not crowd out another trace. `| coalesce()` drops the key again,
-which is the ungrouped statement above.
+many groups does not crowd out another trace. `| coalesce()` drops the keys again.
 
 Five of these are rows of `measure/perturbations.tsv` — first-appearance order,
 the missing-key rule, the label's rendering, the stored type beside it and
 `coalesce()` — each with a query that tells a wrong rule from the right one. The top-K is not a row and cannot be:
-the subquery that chooses the twenty traces is the same one the ungrouped
-statement issues, and the group key does not appear in it at all, so there is
-nothing there to change.
+for a `by()` with no aggregate after it, the subquery that chooses the twenty
+traces is the same one the ungrouped statement issues, and the group key does
+not appear in it at all, so there is nothing there to change.
 
 | search shape | rows read | returned | warm | cold | reference |
 |---|---:|---:|---:|---:|---:|
@@ -418,7 +431,7 @@ WITH (SELECT (groupArray(trace_id), groupArray(keys))
      (SELECT arrayFlatten(groupArray(arrayMap(k -> (k, trace_id), arrayFilter(k -> k BETWEEN intDiv(1790945842000000000, 300000000000) AND intDiv(1791550641999999999, 300000000000), bk))))
       FROM (SELECT trace_id, groupUniqArrayArray(buckets) AS bk
             FROM traces
-            WHERE trace_id IN (SELECT arrayJoin(top.1))
+            WHERE day >= toDate(fromUnixTimestamp64Nano(1790859442000000000), 'UTC') AND day <= toDate(fromUnixTimestamp64Nano(1791637041999999999), 'UTC') AND trace_id IN (SELECT arrayJoin(top.1))
             GROUP BY trace_id)) AS tb
 SELECT m.trace_id AS trace_id, t.root_service AS root_service, t.root_name AS root_name,
        t.start_ns AS start_ns, t.end_ns - t.start_ns AS duration_ns,
@@ -458,6 +471,31 @@ MiB peak / ms. Every pair's answer matched byte for byte.
 | `span.app.request.id` (1 span) | 112,013,993 / 6,384 / 7 / 2,100 | 2: 112,100,622 / 6,389 / 44 / 1,922 |
 | `span.app.user.id = "u-10013"` (2,016 spans) | 112,210,601 / 4,838 / 22 / 1,738 | 2: 112,297,230 / 4,842 / 44 / 1,862 |
 | `resource.service.name = "cron-reaper"` | 1,216,994 / 43 / 44 / 119 | 2: 1,216,997 / 43 / 44 / 151 |
+
+`tb` reads the `traces` days from the day before the window to the day after, as
+the statement's other per-trace reads do (issue #602 part 2a).
+
+**A later filter, an aggregate or a spanset tree reads the slice's candidates**
+(issue #602 part 2a). Whether such a trace survives depends on spans the slice
+may not hold, so the top-K is §5.2's fold over every window span of the
+**candidates**, the traces with a selector span in the slice:
+
+```sql
+(SELECT (groupArray(trace_id), groupArray(keys))
+ FROM (SELECT trace_id, groupUniqArray(intDiv(start_ns, 300000000000)) AS keys
+       FROM spans WHERE <the slice's three clauses> AND (<selector>) GROUP BY trace_id)) AS cand,
+(SELECT arrayFlatten(groupArray(arrayMap(k -> (k, trace_id), arrayFilter(k -> <within the window>, bk))))
+ FROM (SELECT trace_id, groupUniqArrayArray(buckets) AS bk FROM traces
+       WHERE <the days tb reads> AND trace_id IN (SELECT arrayJoin(cand.1)) GROUP BY trace_id)) AS cand_keys,
+```
+
+The fold reads `(intDiv(start_ns, 300000000000), trace_id) IN` the candidates'
+slice buckets and `cand_keys`, and its `HAVING` keeps a survivor only when its
+order key, its newest selector span, lies in the slice (`last >= <the slice's
+first nanosecond>`). Without that bound a candidate whose only slice span is a
+tree leaf under a failed `&&` survives on an older span and ranks ahead of a
+newer trace the slice did not reach. The detail read reads the returned traces'
+window buckets.
 
 `server-implementation.md` §3.5 states which statements are sliced, the rule the
 loop applies after each slice, and the statement bound.
