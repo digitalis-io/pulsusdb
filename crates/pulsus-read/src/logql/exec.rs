@@ -1784,6 +1784,12 @@ impl LogQlEngine {
             );
         }
         let meta = self.hydrate(&mp.streams_table, &fingerprints).await?;
+        // Issue #614, part 2: the rollup plan, or the raw one it falls to.
+        let effective = super::rollup::rollup_or_raw(mp, &meta, &self.config.samples);
+        let mp: &MetricPlan = &effective;
+        if let Some(e) = explain.as_mut() {
+            e.set_routing(mp.routing.clone());
+        }
         // Rollup table has no `service` column (`ORDER BY (fingerprint,
         // bucket_ns)`); the raw fallback needs it re-injected to keep
         // `log_samples`'s `(service, fingerprint, timestamp_ns)` primary-key
@@ -2013,6 +2019,7 @@ impl LogQlEngine {
                 &services,
                 &fingerprints,
                 &lowered.predicates,
+                self.config.rollup_res_ns,
             ) {
                 Ok(sql) => {
                     let sql = match self.key_route_test.bucketed_statement_max_memory_bytes {
@@ -2165,7 +2172,8 @@ impl LogQlEngine {
                         // partial state is already dropped: the variant
                         // carries none.
                         BucketedRows::TodaysRoute => {
-                            self.run_bucketed_fallback(
+                            self.run_lowered_fallback(
+                                super::rollup::RawCause::Memory,
                                 mp,
                                 &fingerprints,
                                 &meta,
@@ -2193,7 +2201,8 @@ impl LogQlEngine {
                     // No `_` arm: a further refusal reason fails to compile
                     // here rather than falling through to a behaviour
                     // nobody chose for it.
-                    self.run_bucketed_fallback(
+                    self.run_lowered_fallback(
+                        super::rollup::RawCause::Refused,
                         mp,
                         &fingerprints,
                         &meta,
@@ -2205,6 +2214,32 @@ impl LogQlEngine {
                 }
             }
         }
+    }
+
+    /// The fallback of either lowered range statement (issue #614, part 2):
+    /// a rollup plan becomes the raw plan, reported with `cause` as its
+    /// route, and reads the lines with the hydrated streams' services; any
+    /// other plan is [`Self::run_bucketed_fallback`]'s unchanged.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_lowered_fallback(
+        &self,
+        cause: super::rollup::RawCause,
+        mp: &MetricPlan,
+        fingerprints: &[Fingerprint],
+        meta: &HashMap<Fingerprint, StreamMetaRow>,
+        services: &[CheckedLiteral],
+        predicates: &[CheckedFragment],
+        mut explain: Option<&mut PlanExplain>,
+    ) -> Result<QueryResult, ReadError> {
+        let raw = super::rollup::raw_route_of(mp, &self.config.samples, cause);
+        if mp.rollup
+            && let Some(e) = explain.as_mut()
+        {
+            e.set_routing(raw.routing.clone());
+        }
+        let services = raw_services(mp, services, meta);
+        self.run_bucketed_fallback(&raw, fingerprints, meta, &services, predicates, explain)
+            .await
     }
 
     /// Today's route for a bucketed range plan (issues #507 and #624): the
@@ -2219,6 +2254,9 @@ impl LogQlEngine {
         predicates: &[CheckedFragment],
         explain: Option<&mut PlanExplain>,
     ) -> Result<QueryResult, ReadError> {
+        // Issue #614, part 2: a rollup plan arrives through
+        // `run_lowered_fallback`, which made it the raw plan.
+        debug_assert!(!mp.rollup, "a rollup plan's fallback is the raw plan");
         // Issue #624, part 5: an instant query lowered at its one grid point
         // runs today's instant route.
         let plan = todays_route_plan(mp);
@@ -2855,6 +2893,10 @@ impl LogQlEngine {
             None,
         );
         let meta = self.hydrate(&mp.streams_table, &fingerprints).await?;
+        let effective = super::rollup::rollup_or_raw(mp, &meta, &self.config.samples);
+        let mp: &MetricPlan = &effective;
+        explain.set_routing(mp.routing.clone());
+        let mut note = mp.routing.reason.clone();
         let services = if mp.rollup {
             Vec::new()
         } else {
@@ -2938,6 +2980,7 @@ impl LogQlEngine {
                                 &services,
                                 &fingerprints,
                                 &lowered.predicates,
+                                self.config.rollup_res_ns,
                             )
                         }
                         // Issue #624, part 4: the reduced statement, unless
@@ -2981,21 +3024,31 @@ impl LogQlEngine {
                             | BucketGridRefusal::RangeNotPositive
                             | BucketGridRefusal::RollupSource
                             | BucketGridRefusal::OffTheRollupGrid,
-                        ) => client_metric_read_sql(
-                            &self.tenant,
-                            mp,
-                            &services,
-                            &fingerprints,
-                            window,
-                            &lowered.predicates,
-                            rx_column_for(
-                                &CompiledPipeline::compile(
-                                    &bucketed_fallback_client_agg(mp).pipeline,
-                                )?,
-                                client_needs_no_labels(mp, &bucketed_fallback_client_agg(mp)),
-                            )?
-                            .as_ref(),
-                        ),
+                        ) => {
+                            // Issue #614, part 2: the route that would run.
+                            let raw = super::rollup::raw_route_of(
+                                mp,
+                                &self.config.samples,
+                                super::rollup::RawCause::Refused,
+                            );
+                            note = raw.routing.reason.clone();
+                            explain.set_routing(raw.routing.clone());
+                            client_metric_read_sql(
+                                &self.tenant,
+                                &raw,
+                                &raw_services(mp, &services, &meta),
+                                &fingerprints,
+                                window,
+                                &lowered.predicates,
+                                rx_column_for(
+                                    &CompiledPipeline::compile(
+                                        &bucketed_fallback_client_agg(mp).pipeline,
+                                    )?,
+                                    client_needs_no_labels(mp, &bucketed_fallback_client_agg(mp)),
+                                )?
+                                .as_ref(),
+                            )
+                        }
                     }
                 }
                 // The shape is read here rather than above the match,
@@ -3015,7 +3068,7 @@ impl LogQlEngine {
                 ),
             }
         };
-        explain.push("metric_read", metric_sql, Some(mp.routing.reason.clone()));
+        explain.push("metric_read", metric_sql, Some(note));
         Ok(())
     }
 }
@@ -6322,6 +6375,7 @@ fn bucketed_range_sql(
     services: &[CheckedLiteral],
     fingerprints: &[Fingerprint],
     predicates: &[CheckedFragment],
+    rollup_res_ns: u64,
 ) -> Result<String, BucketGridRefusal> {
     // A plan with no step has no grid at all. Expressed as a refusal
     // rather than an assertion so the statement cannot be built for one.
@@ -6333,6 +6387,22 @@ fn bucketed_range_sql(
         start_ns: mp.start_ns,
         end_ns: mp.end_ns,
     };
+    // Issue #614, part 2: the rollup statement, at any range.
+    if mp.rollup {
+        return super::sql::metric_range_rollup(
+            tenant,
+            metric_source(mp),
+            &sql_literals(fingerprints),
+            super::sql::SlidingScan {
+                window,
+                lower: mp.scan_lower,
+                grid_start_ns: mp.grid_start_ns,
+                step_ns,
+                range_ns: mp.range_ns.get(),
+            },
+            i64::try_from(rollup_res_ns).map_err(|_| BucketGridRefusal::OffTheRollupGrid)?,
+        );
+    }
     // Issue #624, part 3a (D2): a `regexp` count's captures join the group
     // key. The planner rendered the pattern before it chose this route.
     let regexp = match &mp.value {
@@ -6555,6 +6625,21 @@ fn todays_route_plan(mp: &MetricPlan) -> Cow<'_, MetricPlan> {
         Cow::Owned(copy)
     } else {
         Cow::Borrowed(mp)
+    }
+}
+
+/// The services a raw read of `mp` re-injects: `services` as computed for
+/// `mp`, or, for a rollup plan (which computed none), the hydrated streams'
+/// (issue #614, part 2).
+fn raw_services<'a>(
+    mp: &MetricPlan,
+    services: &'a [CheckedLiteral],
+    meta: &HashMap<Fingerprint, StreamMetaRow>,
+) -> Cow<'a, [CheckedLiteral]> {
+    if mp.rollup {
+        Cow::Owned(distinct_escaped_services(meta))
+    } else {
+        Cow::Borrowed(services)
     }
 }
 
@@ -11130,7 +11215,8 @@ mod tests {
                 &base,
                 &services,
                 &fingerprints,
-                &[]
+                &[],
+                5_000_000_000
             )
             .is_ok()
         );
@@ -11144,7 +11230,8 @@ mod tests {
                 &mp,
                 &services,
                 &fingerprints,
-                &[]
+                &[],
+                5_000_000_000
             ),
             Err(BucketGridRefusal::StepNotPositive)
         );
@@ -11159,7 +11246,8 @@ mod tests {
                 &mp,
                 &services,
                 &fingerprints,
-                &[]
+                &[],
+                5_000_000_000
             ),
             Err(BucketGridRefusal::AnchorAboveScanStart)
         );
@@ -11176,7 +11264,8 @@ mod tests {
                 &mp,
                 &services,
                 &fingerprints,
-                &[]
+                &[],
+                5_000_000_000
             ),
             Err(BucketGridRefusal::WouldOverflow)
         );
@@ -11195,7 +11284,8 @@ mod tests {
                 &mp,
                 &services,
                 &fingerprints,
-                &[]
+                &[],
+                5_000_000_000
             ),
             Err(BucketGridRefusal::WouldOverflow)
         );

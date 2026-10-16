@@ -72,11 +72,16 @@ fn the_regenerated_planner_golden_differs_only_by_the_new_field() {
     let after = read(PLANNER_GOLDEN);
     // Issue #653 put the tenant first in every stage-1 `WHERE`; that edit is
     // applied to the merge base's golden the same way.
-    let before = with_the_reduced_leaves(
-        &with_the_tenant_term(&with_the_sliding_route(&blob_at(
-            MERGE_BASE,
-            PLANNER_GOLDEN,
-        ))),
+    // Issue #614, part 2 moved three range leaves to the rollup; they are
+    // read from the tree's golden the same way.
+    let before = with_the_rollup_leaves(
+        &with_the_reduced_leaves(
+            &with_the_tenant_term(&with_the_sliding_route(&blob_at(
+                MERGE_BASE,
+                PLANNER_GOLDEN,
+            ))),
+            &after,
+        ),
         &after,
     );
     let old: Vec<&str> = before.lines().collect();
@@ -196,20 +201,62 @@ fn with_the_sliding_route(golden: &str) -> String {
 /// `quantile_over_time(0.9, {a="b"} | unwrap d [5m]) + 1` leaves, now
 /// reduced in the database — taken from `tree`, less the
 /// `metadata_lowering: None,` lines the walk above counts as #544's delta.
+/// A golden's entries, each from its `=== ` header to the next (the first
+/// is the preamble).
+fn entries(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in text.split('\n') {
+        if line.starts_with("=== ") || out.is_empty() {
+            out.push(String::new());
+        }
+        let last = out.last_mut().expect("an entry");
+        last.push_str(line);
+        last.push('\n');
+    }
+    out
+}
+
+/// `golden` with the three range entries issue #614 (part 2) moved to the
+/// rollup route replaced by the tree's, less the field this walk counts.
+fn with_the_rollup_leaves(golden: &str, tree: &str) -> String {
+    const MOVED: [&str; 3] = [
+        "=== range | sum(rate({a=\"b\"}[5m])) + 1",
+        "=== range | topk(3, sum by (x) (rate({a=\"b\"}[5m]))) + 1",
+        "=== range | sum(rate({a=\"b\"}[5m]) + 1) + sum(rate({c=\"d\"}[5m]))",
+    ];
+    let header = |e: &str| e.lines().next().unwrap_or_default().to_string();
+    let moved: Vec<String> = entries(tree)
+        .into_iter()
+        .filter(|e| MOVED.contains(&header(e).as_str()))
+        .map(|e| {
+            e.lines()
+                .filter(|l| l.trim() != "metadata_lowering: None,")
+                .map(|l| format!("{l}\n"))
+                .collect()
+        })
+        .collect();
+    assert_eq!(moved.len(), 3, "the three range entries part 2 moved");
+    let mut replaced = 0usize;
+    let mut out = String::new();
+    for e in entries(golden) {
+        match moved.iter().find(|m| header(m) == header(&e)) {
+            Some(m) => {
+                out.push_str(m);
+                replaced += 1;
+            }
+            None => out.push_str(&e),
+        }
+    }
+    assert_eq!(
+        replaced, 3,
+        "the moved entries are in the merge base's golden"
+    );
+    out.pop();
+    out
+}
+
 fn with_the_reduced_leaves(golden: &str, tree: &str) -> String {
     const MOVED: &str = "quantile_over_time(0.9, {a=\"b\"} | unwrap d [5m]) + 1";
-    let entries = |text: &str| -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
-        for line in text.split('\n') {
-            if line.starts_with("=== ") || out.is_empty() {
-                out.push(String::new());
-            }
-            let last = out.last_mut().expect("an entry");
-            last.push_str(line);
-            last.push('\n');
-        }
-        out
-    };
     let moved: Vec<String> = entries(tree)
         .into_iter()
         .filter(|e| e.starts_with("=== ") && e.lines().next().is_some_and(|h| h.ends_with(MOVED)))

@@ -2,29 +2,160 @@
 //! `log_metrics_<res>` answers exactly, and the raw plan a rollup plan falls
 //! back to. The statement is `sql::metric_range_rollup`.
 
-use pulsus_logql::{RangeAggOp, Stage};
+use std::borrow::Cow;
+use std::collections::HashMap;
 
+use pulsus_logql::{GroupingKind, RangeAggOp, Stage};
+use pulsus_model::Fingerprint;
+
+use super::labels::series_labels;
 use super::params::ValidatedDuration;
-use super::plan::VectorAggSpec;
-use super::sql::ScanLowerBound;
+use super::plan::{MetricPlan, RouteChoice, RoutingDecision, VectorAggSpec, parent_sum_grouping};
+use super::rows::StreamMetaRow;
+use super::sql::{MetricShape, MetricValue, ScanLowerBound};
 
-/// Stub: tests first (issue #614, part 2).
-#[allow(dead_code)]
+/// Why a rollup plan reads the lines after all; each names its own routing
+/// reason, so `X-Pulsus-Explain` reports the route that ran and its cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::logql) enum RawCause {
+    /// A `sum by` name is not a stream label of every hydrated stream.
+    Labels,
+    /// The statement builder refused the grid.
+    Refused,
+    /// The statement failed for memory (server code 241).
+    Memory,
+}
+
+impl RawCause {
+    pub(in crate::logql) const fn reason(self) -> &'static str {
+        match self {
+            RawCause::Labels => {
+                "raw: a sum by label is not a stream label of every selected stream (issue #614)"
+            }
+            RawCause::Refused => "raw: the rollup statement cannot render this grid (issue #614)",
+            RawCause::Memory => "raw: the rollup statement exceeded its memory (issue #614)",
+        }
+    }
+}
+
+/// Whether the rollup answers a planned range leaf exactly, and the routing
+/// reason when it does.
+///
+/// ```text
+/// reducer      count_over_time, bytes_over_time, rate, bytes_rate
+/// pipeline     no stage at all (the rollup has no line to filter)
+/// parent       an innermost bare `sum`, or `sum by (L)` with no name in L
+///              starting `__` or ending `_extracted`; [`rollup_or_raw`]
+///              also requires every selected stream to carry every name in L
+/// grid         grid start, step and range multiples of the resolution;
+///              the scan bound exclusive
+/// lowered      the clean bucketed range route, not instant, not empty
+/// ```
+///
+/// Under such a `sum` the reference groups at the range step by the sum's
+/// labels (`canInjectVectorGrouping`, `pkg/logql/syntax/ast.go:1612-1642 @
+/// v3.7.4`), so no line's structured metadata reaches the answer — outside
+/// one documented limit: a non-empty `__error__` in a line's metadata
+/// fails the query on the raw route and is counted here (owner, issue #614).
 pub(in crate::logql) fn rollup_route(
-    _op: RangeAggOp,
-    _pipeline: &[Stage],
-    _vector_aggs: &[VectorAggSpec],
-    _lowered: bool,
-    _res_ns: u64,
-    _grid: (i64, Option<ValidatedDuration>, i64, ScanLowerBound),
+    op: RangeAggOp,
+    pipeline: &[Stage],
+    vector_aggs: &[VectorAggSpec],
+    lowered: bool,
+    res_ns: u64,
+    (grid_start_ns, step_ns, range_ns, scan_lower): (
+        i64,
+        Option<ValidatedDuration>,
+        i64,
+        ScanLowerBound,
+    ),
 ) -> Option<String> {
-    None
+    if !lowered || !pipeline.is_empty() || scan_lower != ScanLowerBound::Exclusive {
+        return None;
+    }
+    if !matches!(
+        op,
+        RangeAggOp::CountOverTime
+            | RangeAggOp::BytesOverTime
+            | RangeAggOp::Rate
+            | RangeAggOp::BytesRate
+    ) {
+        return None;
+    }
+    match parent_sum_grouping(op, false, vector_aggs)? {
+        None => {}
+        Some(g) if g.kind == GroupingKind::By => {
+            if g.labels
+                .iter()
+                .any(|l| l.starts_with("__") || l.ends_with("_extracted"))
+            {
+                return None;
+            }
+        }
+        Some(_) => return None,
+    }
+    let res = i64::try_from(res_ns).ok().filter(|r| *r > 0)?;
+    let step = step_ns?.get();
+    let on_grid = |v: i64| v.rem_euclid(res) == 0;
+    (on_grid(grid_start_ns) && on_grid(step) && on_grid(range_ns))
+        .then(|| format!("rollup: sum over the {res} ns buckets (issue #614)"))
+}
+
+/// `mp` as the raw route plans it, when `mp` is a rollup plan: the samples
+/// table, the raw column shape, the raw routing with `cause`'s reason. Any
+/// other plan is itself.
+pub(in crate::logql) fn raw_route_of<'a>(
+    mp: &'a MetricPlan,
+    samples: &str,
+    cause: RawCause,
+) -> Cow<'a, MetricPlan> {
+    if !mp.rollup {
+        return Cow::Borrowed(mp);
+    }
+    let is_bytes = matches!(mp.value, MetricValue::Shaped(MetricShape::RollupBytes));
+    let mut raw = mp.clone();
+    raw.table = samples.to_string();
+    raw.value = MetricValue::Shaped(MetricShape::raw(is_bytes));
+    raw.rollup = false;
+    raw.routing = RoutingDecision {
+        chosen: RouteChoice::Raw,
+        reason: cause.reason().to_string(),
+    };
+    Cow::Owned(raw)
+}
+
+/// The plan that runs once the streams are hydrated: a rollup plan under
+/// `sum by (L)` reads the lines unless every hydrated stream carries every
+/// name in `L` as a stream label, because a line's structured metadata
+/// supplies a name its stream lacks. Any other plan is itself.
+pub(in crate::logql) fn rollup_or_raw<'a>(
+    mp: &'a MetricPlan,
+    meta: &HashMap<Fingerprint, StreamMetaRow>,
+    samples: &str,
+) -> Cow<'a, MetricPlan> {
+    if !mp.rollup {
+        return Cow::Borrowed(mp);
+    }
+    let names: &[String] = match mp.vector_aggs.last() {
+        Some((_, Some(g), _)) => &g.labels,
+        _ => &[],
+    };
+    let carried = meta.values().all(|m| {
+        let labels = series_labels(m);
+        names.iter().all(|n| labels.iter().any(|(k, _)| k == n))
+    });
+    if carried {
+        Cow::Borrowed(mp)
+    } else {
+        raw_route_of(mp, samples, RawCause::Labels)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::params::{Direction, PlanCtx, QueryParams, QuerySpec};
-    use super::super::plan::{MetricPlan, Plan, RouteChoice, plan};
+    use super::super::plan::{Plan, plan};
+    use super::*;
 
     fn route(query: &str, spec: QuerySpec) -> MetricPlan {
         let ctx = PlanCtx {

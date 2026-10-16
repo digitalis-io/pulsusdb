@@ -1345,13 +1345,13 @@ pub fn log_patterns_read(
 /// `ORDER BY (fingerprint, bucket_ns)`); a non-empty `services` renders the
 /// same singleton/`IN` split [`stage3`] uses.
 ///
-/// **Structurally unreachable today** (recorded while auditing the offset
-/// shift, issue #343 — a note, not a change): `plan.rs`'s `metric_plan`
-/// sets `client = Some(..)` for EVERY `is_range` query (issue #227 retired
-/// the range rollup fast path), so routing can never take the
-/// `RouteChoice::Rollup` range arm and no caller reaches this builder
-/// outside its own snapshot tests. Kept because the rollup range shape is
-/// the one this file documents against docs/schemas.md §3.2.
+/// **No read path calls it** (issue #614). A range read runs the bucketed
+/// statement, the sliding one, or — on the rollup route — the rollup
+/// statement ([`metric_range_rollup`]), whose windows are the reference's
+/// `(t - range, t]`. This floor-grid shape is not: it counts `[t, t +
+/// step)` and buckets an already-bucketed column. It is kept for its
+/// snapshot tests and the benchmark harness, which pin its text, and no
+/// planner route reaches it.
 #[allow(clippy::too_many_arguments)]
 pub fn metric_range(
     tenant: &Tenant,
@@ -1843,8 +1843,8 @@ pub struct SlidingScan {
 /// # Refusals
 ///
 /// `RollupSource` when the shape's grid column is not `timestamp_ns` — the
-/// statement reads lines, and the rollup's buckets cannot say which side of
-/// a window edge a line fell — and every refusal of
+/// statement reads lines, and [`metric_range_rollup`] reads the rollup —
+/// and every refusal of
 /// [`super::predicate::sliding_cover`].
 pub fn metric_range_sliding(
     tenant: &Tenant,
@@ -2773,8 +2773,31 @@ fn service_predicate(services: &[CheckedLiteral]) -> String {
     }
 }
 
-/// Stub: tests first (issue #614, part 2).
-#[allow(unused_variables)]
+/// The rollup range metric read (issue #614, part 2): the sliding
+/// statement's grid arithmetic over `log_metrics_<res>` instead of lines.
+///
+/// Each rollup row splits into two weighted points: the lines exactly on
+/// its bucket start `b` (`count_at`, `bytes_at`) at `b`, and the rest of
+/// the bucket at `b + res`. With the grid start, step and range multiples
+/// of `res`, every window edge is a bucket start, and a line in `(b, b +
+/// res)` is in window `(t - range, t]` exactly when a line at `b + res`
+/// would be — so [`super::predicate::sliding_cover`] and the window
+/// arithmetic of [`metric_range_sliding`] apply unchanged, over the point
+/// the `ARRAY JOIN` names `timestamp_ns`.
+///
+/// No `FINAL`: the rollup's unmerged rows are partial sums, and every
+/// column the statement reads is summed.
+///
+/// `structured_metadata` is the empty string on every row: the rollup does
+/// not store it, and the planner routes here only a query whose answer
+/// cannot depend on it.
+///
+/// # Refusals
+///
+/// `OffTheRollupGrid` for a shape that is not a rollup shape, a resolution
+/// that is not positive, a grid start, step or range that is not a multiple
+/// of it, or an inclusive scan bound; `WouldOverflow` when `end + res` is not
+/// representable; and every refusal of [`super::predicate::sliding_cover`].
 pub fn metric_range_rollup(
     tenant: &Tenant,
     source: MetricSource<'_>,
@@ -2782,7 +2805,84 @@ pub fn metric_range_rollup(
     scan: SlidingScan,
     res_ns: i64,
 ) -> Result<String, super::predicate::BucketGridRefusal> {
-    Err(super::predicate::BucketGridRefusal::StepNotPositive)
+    use super::predicate::BucketGridRefusal;
+    let t = tenant.sql_literal();
+    let MetricSource { table, shape } = source;
+    let m = match shape {
+        MetricShape::RollupCount => "sum(lines)",
+        MetricShape::RollupBytes => "sum(line_bytes)",
+        MetricShape::RawCount | MetricShape::RawBytes => {
+            return Err(BucketGridRefusal::OffTheRollupGrid);
+        }
+    };
+    let SlidingScan {
+        window,
+        lower,
+        grid_start_ns,
+        step_ns,
+        range_ns,
+    } = scan;
+    let TimeWindow { start_ns, end_ns } = window;
+    if res_ns <= 0
+        || grid_start_ns.rem_euclid(res_ns) != 0
+        || step_ns.rem_euclid(res_ns) != 0
+        || range_ns.rem_euclid(res_ns) != 0
+        || lower != ScanLowerBound::Exclusive
+    {
+        return Err(BucketGridRefusal::OffTheRollupGrid);
+    }
+    end_ns
+        .checked_add(res_ns)
+        .ok_or(BucketGridRefusal::WouldOverflow)?;
+    let cover =
+        super::predicate::sliding_cover(start_ns, grid_start_ns, end_ns, step_ns, range_ns)?;
+    let (lo, hi, kend) = (cover.lo.as_sql(), cover.hi.as_sql(), cover.kend);
+    let fp_list = fp_list(fingerprints);
+    let lines: Vec<String> = vec![
+        format!(
+            "SELECT fingerprint, toInt64({grid_start_ns} + k * {step_ns}) AS bucket_ns, \
+             toUInt64(v) AS n, '' AS structured_metadata"
+        ),
+        "FROM (".to_string(),
+        "  SELECT fingerprint, k0,".to_string(),
+        format!(
+            "         sum(dv) OVER cum AS v, sum(dc) OVER cum AS p, \
+             leadInFrame(k0, 1, {kend}) OVER whole AS k1"
+        ),
+        "  FROM (".to_string(),
+        "    SELECT fingerprint, d.1 AS k0, sum(d.2) AS dv, sum(d.3) AS dc".to_string(),
+        "    FROM (".to_string(),
+        "      SELECT fingerprint,".to_string(),
+        format!("             {lo} AS lo,"),
+        format!("             {hi} AS hi,"),
+        format!("             {m} AS m, sum(lines) AS c"),
+        format!("      FROM {table}"),
+        format!("      ARRAY JOIN [bucket_ns + {res_ns}, bucket_ns] AS timestamp_ns,"),
+        "                 [toInt64(count) - toInt64(count_at), toInt64(count_at)] AS lines,"
+            .to_string(),
+        "                 [toInt64(bytes) - toInt64(bytes_at), toInt64(bytes_at)] AS line_bytes"
+            .to_string(),
+        format!("      WHERE org_id = {t} AND fingerprint IN ({fp_list})"),
+        format!("        AND bucket_ns >= {start_ns} AND bucket_ns <= {end_ns}"),
+        format!("        AND lines > 0 AND timestamp_ns > {start_ns} AND timestamp_ns <= {end_ns}"),
+        "      GROUP BY fingerprint, lo, hi".to_string(),
+        "      HAVING lo <= hi".to_string(),
+        "    )".to_string(),
+        "    ARRAY JOIN [(lo, toInt64(m), toInt64(c)), (hi + 1, -toInt64(m), -toInt64(c))] AS d"
+            .to_string(),
+        "    GROUP BY fingerprint, k0".to_string(),
+        "  )".to_string(),
+        "  WINDOW cum AS (PARTITION BY fingerprint ORDER BY k0 ASC \
+         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),"
+            .to_string(),
+        "         whole AS (PARTITION BY fingerprint ORDER BY k0 ASC \
+         ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)"
+            .to_string(),
+        ")".to_string(),
+        format!("ARRAY JOIN range(k0, least(k1, {kend})) AS k"),
+        "WHERE p > 0".to_string(),
+    ];
+    Ok(lines.join("\n"))
 }
 
 #[cfg(test)]

@@ -19,7 +19,7 @@
 
 use std::collections::BTreeSet;
 
-use pulsus_logql::{BinOp, parse};
+use pulsus_logql::{BinOp, VectorAggOp, parse};
 use pulsus_read::logql::{Direction, Plan, PlanCtx, QueryParams, QuerySpec, plan};
 
 const GOLDEN: &str = include_str!("golden/plan_build_differential.txt");
@@ -464,8 +464,16 @@ fn every_planned_range_leaf_that_is_not_a_clean_bucketed_chain_is_client_aggrega
                     // run over the statement's rows, and the reason says so.
                     let staged = staged_stages(query).is_some_and(|n| n > 0)
                         || query.contains("absent_over_time(");
+                    // Issue #614: an innermost `sum` with no stage reads the rollup.
+                    assert!(
+                        !mp.rollup
+                            || (!query.contains('|')
+                                && matches!(mp.vector_aggs.last(), Some((VectorAggOp::Sum, _, _))))
+                    );
                     let want = if staged {
                         "raw: range aggregation in the database, label stages over its rows (issue #624)"
+                    } else if mp.rollup {
+                        "rollup: sum over the 5000000000 ns buckets (issue #614)"
                     } else {
                         reason
                     };

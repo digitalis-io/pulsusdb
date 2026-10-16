@@ -121,8 +121,8 @@ Site	Literal	crates/pulsus-read/src/logql/plan.rs:9902	-	-	a[0]	accept	accept	-	
 Site	Literal	crates/pulsus-read/src/logql/plan.rs:9902	-	-	route	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/src/logql/reduce.rs:789	-	-	route	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/src/logql/reduce.rs:789	-	-	x	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/sql.rs:5012	-	-	a.b	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/sql.rs:5012	-	-	route	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/sql.rs:5124	-	-	a.b	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/sql.rs:5124	-	-	route	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/tests/fixtures/group_key/cases.tsv:10	-	-	level	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/tests/fixtures/group_key/cases.tsv:106	-	-	latency	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/tests/fixtures/group_key/cases.tsv:107	-	-	latency	accept	accept	-	-	

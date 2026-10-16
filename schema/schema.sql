@@ -57,14 +57,18 @@ CREATE TABLE IF NOT EXISTS {{db}}.log_metrics_{{log_rollup_suffix}}{{on_cluster}
     fingerprint UInt128,
     bucket_ns Int64,
     count SimpleAggregateFunction(sum, UInt64),
-    bytes SimpleAggregateFunction(sum, UInt64)
+    bytes SimpleAggregateFunction(sum, UInt64),
+    count_at SimpleAggregateFunction(sum, UInt64),
+    bytes_at SimpleAggregateFunction(sum, UInt64),
+    PROJECTION by_time (SELECT org_id, bucket_ns, fingerprint ORDER BY (org_id, bucket_ns, fingerprint))
 )
 --@single  ENGINE = AggregatingMergeTree
 --@cluster ENGINE = ReplicatedAggregatingMergeTree('/clickhouse/tables/{shard}/{{db}}.log_metrics_{{log_rollup_suffix}}', '{replica}')
 PARTITION BY toDate(fromUnixTimestamp64Nano(bucket_ns))
 ORDER BY (org_id, fingerprint, bucket_ns)
---@single  SETTINGS index_granularity = 8192, non_replicated_deduplication_window = {{log_dedup_window}}{{storage_policy}};
---@cluster SETTINGS index_granularity = 8192, replicated_deduplication_window = {{log_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
+TTL toDateTime(least(intDiv(bucket_ns, 1000000000) + ({{retention_days}} * 86400), 4294967295))
+--@single  SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, deduplicate_merge_projection_mode = 'rebuild', lightweight_mutation_projection_mode = 'rebuild', non_replicated_deduplication_window = {{log_dedup_window}}{{storage_policy}};
+--@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, deduplicate_merge_projection_mode = 'rebuild', lightweight_mutation_projection_mode = 'rebuild', replicated_deduplication_window = {{log_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
 
 CREATE TABLE IF NOT EXISTS {{db}}.log_patterns{{on_cluster}}
 (
@@ -698,7 +702,9 @@ AS SELECT
     fingerprint AS fingerprint,
     intDiv(timestamp_ns, {{log_rollup_ns}}) * {{log_rollup_ns}} AS bucket_ns,
     count() AS count,
-    sum(length(body)) AS bytes
+    sum(length(body)) AS bytes,
+    countIf(timestamp_ns = bucket_ns) AS count_at,
+    sumIf(length(body), timestamp_ns = bucket_ns) AS bytes_at
 FROM {{db}}.log_landing
 WHERE kind = 0
 GROUP BY
