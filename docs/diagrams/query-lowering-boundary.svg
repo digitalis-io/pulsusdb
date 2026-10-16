@@ -102,7 +102,7 @@
   <rect class="panel" x="32" y="908" width="1136" height="158" rx="6"/>
   <text class="sub" x="48" y="930">The enumeration that settled the core's rule: every chain of length 3 over 15 concrete LogQL atoms, parsed with our real parser, compared against a</text>
   <text class="sub" x="48" y="948">TRANSCRIPTION of LogQL's compile_line_filters as an oracle — not the shipped function, and not emitted SQL. An equality on the ORDERED</text>
-  <text class="sub" x="48" y="966">pushed-predicate list, not a count and not a containment. query-lowering.md 11.2 nominates the gates that replace it — wave 1, none at base.</text>
+  <text class="sub" x="48" y="966">pushed-predicate list, not a count and not a containment. query-lowering.md 11.2 nominates the gates that replace it — issue #492 part 1, none at base.</text>
   <text class="mono" x="48" y="992">  model                                                                        chains   oracle pushes &gt;= 1   MISMATCHES</text>
   <text class="mono" x="48" y="1010">  return at the first refusal (this document's first version)                   3,375               1,827          715</text>
   <text class="mono" x="48" y="1028">  skip only a non-lowerable line filter, else return                           3,375               1,827          463</text>

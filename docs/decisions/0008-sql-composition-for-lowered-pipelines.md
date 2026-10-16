@@ -236,7 +236,7 @@ named list (`crates/pulsus-read/tests/golden_sql_freeze.rs`), with the other bui
 
 `Relation` (query-lowering.md §2.2) has **no join slot**, which is what makes this enforceable rather
 than a request: a stage cannot contribute a join without a type change, and a type change is a
-reviewable act. Field selection is therefore **not** in the first implementation wave, and whoever
+reviewable act. Field selection is therefore **not** in the first implementation, issue #492 part 1, and whoever
 adds it amends this ADR first. This is recorded as [query-to-sql.md](../query-to-sql.md)'s open
 question 4 and is settled here only as far as "not without an amendment".
 
