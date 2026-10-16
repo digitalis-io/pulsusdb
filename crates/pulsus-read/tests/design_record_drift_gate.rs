@@ -368,7 +368,8 @@ fn count_sites() -> Vec<CountSite> {
 }
 
 /// The file's text with every run of whitespace collapsed to one space,
-/// and the original line number of each character.
+/// and the original line number of each BYTE of it — the unit `find`
+/// returns, so an offset into the text is an index into the lines.
 fn normalised(raw: &str) -> (String, Vec<u32>) {
     let (mut out, mut lines) = (String::new(), Vec::new());
     let (mut ln, mut prev_ws) = (1u32, true);
@@ -384,7 +385,7 @@ fn normalised(raw: &str) -> (String, Vec<u32>) {
             }
         } else {
             out.push(ch);
-            lines.push(ln);
+            lines.extend(std::iter::repeat_n(ln, ch.len_utf8()));
             prev_ws = false;
         }
     }
