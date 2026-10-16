@@ -4340,9 +4340,8 @@ const F_CASES: [(&str, &str, &[&str]); 20] = [
 ];
 
 /// Section 6.5: the §6.1 fixture pushed over OTLP answers F1–F20 as
-/// `functional-requirements.md`'s PulsusDB column says, through the route
-/// — the fork's new path for the covered ones, today's engine for F12,
-/// F13, F15 and F16.
+/// `functional-requirements.md`'s PulsusDB column says, through the route,
+/// whose only engine is the search statement (issue #602 part 2b).
 #[tokio::test(flavor = "multi_thread")]
 async fn the_route_answers_f1_to_f20_on_the_worked_fixture() {
     if !should_run() {

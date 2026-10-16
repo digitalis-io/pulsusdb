@@ -35,13 +35,13 @@ pub use traces::{
     MetricLabel, MetricLabelValue, MetricsCtx, MetricsParams, PlanError as TracePlanError,
     ProjectedAttribute, RETAINED_ENTRY_OVERHEAD, RootSummary, RoutedMetricsPlan,
     SERVICE_GRAPH_MAX_EDGES, SPAN_NAME_VALUE_TYPE, SearchCtx, SearchOutput, SearchParams,
-    SearchPlan, ServiceGraph, SpanFilterCtx, SpanSetGroup, SpanSummary, StatementTables,
-    StoredType, TAG_NAMES_MAX, TAG_VALUES_MAX, TRACE_METRICS_MAX_SET_BYTES,
+    SearchPlan, SearchRequest, ServiceGraph, SpanFilterCtx, SpanSetGroup, SpanSummary,
+    StatementTables, StoredType, TAG_NAMES_MAX, TAG_VALUES_MAX, TRACE_METRICS_MAX_SET_BYTES,
     TRACE_METRICS_MAX_SET_ROWS, TRACE_SEARCH_MAX_BLOCK_ROWS, TagNames, TagValue, TagValues,
     TagValuesRequest, TraceContext, TraceEngine, TraceMetricSeries, TraceMetricsPlan,
     TraceMetricsResult, TraceReadConfig, TraceSearchResult, WireKey, compile_span_filter,
-    go_duration_string, non_finite_double_spelling, plan_search, plan_trace_metrics,
-    plan_trace_metrics_routed, service_graph_sql, wire_arm,
+    go_duration_string, non_finite_double_spelling, plan_search, plan_search_request,
+    plan_trace_metrics, plan_trace_metrics_routed, service_graph_sql, wire_arm,
 };
 
 #[cfg(test)]

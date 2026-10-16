@@ -8,6 +8,13 @@
 //! reads the other side through a `(trace_id, …) IN (…)` subquery over the
 //! same window, so the result is a predicate on one span row and every
 //! search template serves it as its selector.
+//!
+//! In a sliced statement, every relation, every `&&` and each climb's
+//! per-trace read reads only the `(bucket, trace_id)` pairs of `scope`, the
+//! slice's candidates' keys (issue #602 part 2b). A relation holds within
+//! one trace, so a trace's membership over all its buckets in the window is
+//! its membership over the window. The leaves, `MembershipSql::
+//! leaves`, are the OR of the filters: every member span matches one.
 
 use pulsus_traceql::{BoolOp, FieldExpr, SpansetExpr, StructuralModifier, StructuralOp, Value};
 
@@ -19,9 +26,10 @@ use crate::traces::PlanError;
 const ZERO: &str = "toFixedString('', 8)";
 
 /// A climb's key condition: the `(bucket, trace_id)` prefix of the sort
-/// key over the candidate traces' buckets, as the detail read keys its read.
+/// key over the climb's traces' buckets, as the detail read keys its read.
+/// `climb_cand`, so a statement's own `cand` stays visible to the scope.
 const CAND_KEYS: &str = "(intDiv(start_ns, 300000000000), trace_id) IN \
-     (SELECT arrayJoin(arrayFlatten(arrayMap((t, ks) -> arrayMap(k -> (k, t), ks), cand.1, cand.2))))";
+     (SELECT arrayJoin(arrayFlatten(arrayMap((t, ks) -> arrayMap(k -> (k, t), ks), climb_cand.1, climb_cand.2))))";
 
 /// Whether `spanset` holds a structural operator anywhere.
 pub fn holds_structural(spanset: &SpansetExpr) -> bool {
@@ -43,35 +51,33 @@ pub const DEFAULT_MAX_DEPTH: u32 = 64;
 pub const CLIMB_OVERFLOW: &str =
     "a structural climb has more parent links than PULSUS_TRACEQL_MAX_DEPTH (issue #593)";
 
-/// The message a climb raises when its candidate traces' keys cover more
-/// than half of the granules of a window of more than 64 granules: each
-/// step of the climb would read most of the window, so the request goes to
-/// today's engine, which walks its newest candidates and stops at `limit`.
-pub const CLIMB_HANDOVER: &str =
-    "a structural climb over most of the window is answered by the old engine (issue #593)";
-
-/// The rows of one granule of `spans` (`index_granularity`, `schema.sql`).
-const GRANULE_ROWS: u64 = 2048;
-
-/// A spanset's membership and whether it climbs (`>>`, `<<`).
+/// A spanset's membership, whether it climbs (`>>`, `<<`), and its leaves:
+/// the OR of its filters, which every member span matches.
 pub struct MembershipSql {
     pub predicate: SpanPredicate,
     pub climbs: bool,
+    pub leaves: String,
 }
 
 /// `M(spanset)` for a spanset holding a structural operator, over
-/// `spans_table` in `ctx`'s window; a climb follows at most `max_depth`
-/// parent links.
+/// `spans_table` in `ctx`'s window, every subquery reading only the
+/// `(bucket, trace_id)` pairs of `scope` when one is given; a climb follows
+/// at most `max_depth` parent links.
 pub fn compile_membership_in(
     spanset: &SpansetExpr,
     ctx: &PredicateCtx<'_>,
     spans_table: &str,
     max_depth: u32,
+    scope: Option<&str>,
 ) -> Result<MembershipSql, PlanError> {
     let mut c = Membership {
         ctx,
         spans_table,
         max_depth,
+        scope: scope
+            .map(|keys| format!("(intDiv(start_ns, 300000000000), trace_id) IN {keys} AND "))
+            .unwrap_or_default(),
+        leaves: Vec::new(),
         climbs: false,
         demands: Vec::new(),
         trace_leaves: Vec::new(),
@@ -92,6 +98,7 @@ pub fn compile_membership_in(
             c.trace_values,
         ),
         climbs: c.climbs,
+        leaves: c.leaves.join(" OR "),
     })
 }
 
@@ -99,6 +106,9 @@ struct Membership<'a, 'b> {
     ctx: &'a PredicateCtx<'b>,
     spans_table: &'a str,
     max_depth: u32,
+    /// The scope's key condition, ending in ` AND `, or empty.
+    scope: String,
+    leaves: Vec<String>,
     climbs: bool,
     demands: Vec<String>,
     /// The filters' trace leaves, each once, and whether any reads child
@@ -116,8 +126,9 @@ impl Membership<'_, '_> {
     fn over(&self, cols: &str, m: &str, extra: &str) -> String {
         let w = self.ctx.window;
         format!(
-            "SELECT {cols} FROM {} WHERE {} AND {} AND {} AND ({m}){extra}",
+            "SELECT {cols} FROM {} WHERE {}{} AND {} AND {} AND ({m}){extra}",
             self.spans_table,
+            self.scope,
             w.span_time_clause(),
             w.span_bucket_clause(),
             w.span_day_clause(),
@@ -149,7 +160,9 @@ impl Membership<'_, '_> {
                         self.trace_values.push(*v);
                     }
                 }
-                Ok(format!("({})", p.sql()))
+                let leaf = format!("({})", p.sql());
+                self.leaves.push(leaf.clone());
+                Ok(leaf)
             }
             SpansetExpr::Binary { op, lhs, rhs } => {
                 let l = self.member(lhs)?;
@@ -260,8 +273,9 @@ impl Membership<'_, '_> {
         )
     }
 
-    /// `WITH RECURSIVE cand, climb`. `cand` is, per trace of the window
-    /// holding a span `start` keeps and a span `other` keeps, the
+    /// `WITH RECURSIVE climb_cand, climb`. `climb_cand` is, per trace of
+    /// the window (of the scope, when given) holding a span `start` keeps
+    /// and a span `other` keeps, the
     /// five-minute buckets of its spans, so every read of the climb is a
     /// key read of those traces ([`CAND_KEYS`]). `climb` follows, from
     /// each `start` span, its parent links one at a time, as
@@ -291,14 +305,13 @@ impl Membership<'_, '_> {
             found("x.trace_id", "x.parent_span_id"),
         );
         format!(
-            "WITH RECURSIVE (SELECT (groupArrayIf(trace_id, both), groupArrayIf(keys, both), sum(n)) \
-             FROM (SELECT trace_id, groupUniqArray(intDiv(start_ns, 300000000000)) AS keys, count() AS n, \
+            "WITH RECURSIVE (SELECT (groupArrayIf(trace_id, both), groupArrayIf(keys, both)) \
+             FROM (SELECT trace_id, groupUniqArray(intDiv(start_ns, 300000000000)) AS keys, \
              countIf({start}) > 0 AND countIf({other}) > 0 AS both \
-             FROM {spans} WHERE {window} GROUP BY trace_id)) AS cand, \
+             FROM {spans} WHERE {scope}{window} GROUP BY trace_id)) AS climb_cand, \
              climb AS (\
              SELECT trace_id, span_id AS start, parent_span_id AS cur, toUInt32(1) AS depth, {found_base} AS found, CAST([], 'Array(FixedString(8))') AS path FROM {spans} \
-             WHERE throwIf(cand.3 > {floor} AND arraySum(arrayMap(k -> length(k), cand.2)) * {granule2} > cand.3, '{CLIMB_HANDOVER}') = 0 \
-             AND {CAND_KEYS} AND {window} AND ({start}) AND parent_span_id != {ZERO} AND parent_span_id != span_id \
+             WHERE {CAND_KEYS} AND {window} AND ({start}) AND parent_span_id != {ZERO} AND parent_span_id != span_id \
              UNION ALL \
              SELECT c.trace_id, c.start, x.parent_span_id, c.depth + 1, {found_step}, arrayPushBack(c.path, c.cur) \
              FROM (SELECT trace_id, span_id, parent_span_id FROM {spans} WHERE {CAND_KEYS} AND {window}) AS x \
@@ -308,8 +321,7 @@ impl Membership<'_, '_> {
             spans = self.spans_table,
             window = self.window(),
             d = self.max_depth,
-            granule2 = 2 * GRANULE_ROWS,
-            floor = 64 * GRANULE_ROWS,
+            scope = self.scope,
         )
     }
 }

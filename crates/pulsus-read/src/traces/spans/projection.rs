@@ -496,10 +496,11 @@ pub struct GroupKeySql {
 /// `resource.service.name` and an attribute at every scope (issue #592 part
 /// 2, issue #602 part 1); the six span-row intrinsics `duration`,
 /// `statusMessage`, `span:id`, `span:parentID`, `instrumentation:name` and
-/// `instrumentation:version` (issue #602 part 1, D3); and (issue #594 part
+/// `instrumentation:version` (issue #602 part 1, D3); `trace:id` (issue
+/// #602 part 2b); and (issue #594 part
 /// 3) the three per-trace intrinsics, `span:childCount` and the three
 /// nested-set intrinsics, each read from the grouped statement's
-/// `group_values`. `None` for `trace:id` (D9) and the four event and link
+/// `group_values`. `None` for the four event and link
 /// intrinsics (D4), which the caller refuses. An attribute reads
 /// [`scope_value`] (D1); a value the reference does not type is `''` typed
 /// `'None'`, the `nil` group (D5). **No wildcard arm**: a new intrinsic
@@ -548,7 +549,7 @@ pub fn group_key_sql(
         Field::Intrinsic(Intrinsic::StatusMessage) => Some(column("status_message")),
         Field::Intrinsic(Intrinsic::SpanId) => Some(column("lower(hex(span_id))")),
         Field::Intrinsic(Intrinsic::ParentId) => Some(column("lower(hex(parent_span_id))")),
-        Field::Intrinsic(Intrinsic::TraceId) => None,
+        Field::Intrinsic(Intrinsic::TraceId) => Some(column("lower(hex(trace_id))")),
         Field::Intrinsic(Intrinsic::InstrumentationName) => Some(column("toString(scope_name)")),
         Field::Intrinsic(Intrinsic::InstrumentationVersion) => {
             Some(column("toString(scope_version)"))

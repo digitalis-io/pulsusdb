@@ -87,3 +87,4 @@ pub use spans::rows::{
     FetchedResource, FetchedResourceTuple, FetchedSpan, FetchedSpanTuple, FetchedTrace,
     IndexedFetchRow, WideFetchRow,
 };
+pub use spans::search::{SearchRequest, plan_search_request};

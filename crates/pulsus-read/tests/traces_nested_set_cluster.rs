@@ -418,7 +418,9 @@ async fn a_numbered_search_answers_over_two_shards() {
             "23 [03 2]; 22 [03 2]".to_string(),
         ),
     ] {
-        let got = engine.search_routed(&plan(query, start, end, limit)).await;
+        let got = engine
+            .search_routed(&plan(query, start, end, limit).request())
+            .await;
         let got = match got {
             Ok(out) => numbers_of(&out),
             Err(ReadError::Clickhouse(e)) => format!("Err({e})"),
@@ -448,7 +450,7 @@ async fn a_numbered_search_answers_over_two_shards() {
             .collect::<Vec<_>>()
             .join("; ");
         let got = match engine
-            .search_routed(&plan(query, window.0, window.1, 30))
+            .search_routed(&plan(query, window.0, window.1, 30).request())
             .await
         {
             Ok(out) => groups_of(&out),
@@ -461,6 +463,11 @@ async fn a_numbered_search_answers_over_two_shards() {
     // Issue #594 part 4: a child count or a number as an operand, a
     // numbered comparison before an aggregate, and select() of a number.
     for (query, numbers, each) in [
+        // Issue #602 part 2b: a structural search reads `spans_dist`
+        // inside `spans_dist`, sent shard-local as the numbering is.
+        ("{ } > { }", false, "[02, 03]"),
+        ("{ } >> { }", false, "[02, 03]"),
+        ("{ } << { }", false, "[01, 02]"),
         ("{ nestedSetRight - nestedSetLeft = 1 }", false, "[03]"),
         ("{ span:childCount * 1s > duration }", false, "[01, 02]"),
         (
@@ -480,7 +487,7 @@ async fn a_numbered_search_answers_over_two_shards() {
             .collect::<Vec<_>>()
             .join("; ");
         let got = match engine
-            .search_routed(&plan(query, window.0, window.1, 30))
+            .search_routed(&plan(query, window.0, window.1, 30).request())
             .await
         {
             Ok(out) if numbers => numbers_of(&out),
