@@ -15,8 +15,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use pulsus_read::traces::metrics_plan::{MetricsCtx, MetricsParams};
-use pulsus_read::traces::search_plan::{SearchCtx, SearchParams, plan_search};
-use pulsus_read::traces::spans::search::plan_statement;
+use pulsus_read::{SearchParams, plan_search_request};
 use pulsus_read::{SpanFilterCtx, StatementTables, plan_trace_metrics_routed};
 use pulsus_traceql::PipelineStage;
 
@@ -124,23 +123,15 @@ fn side_of(query: &pulsus_traceql::Query, route: &str) -> &'static str {
         limit: 20,
         spss: 3,
     };
-    let ctx = SearchCtx {
-        filter: SpanFilterCtx {
-            spans_table: "trace_spans",
-            attrs_table: "trace_attrs_idx",
-        },
-        recent_table: "trace_recent",
-        errors_table: "trace_error_spans",
-        max_candidates: 100_000,
-        max_series: 1_000,
-        distributed: false,
+    let tables = StatementTables {
+        spans: "spans",
+        resources: "resources",
+        traces: "traces",
+        indexed: &[],
     };
-    match plan_search(query, &params, &ctx) {
+    match plan_search_request(query, &params, &tables, 64) {
         Err(_) => "refused",
-        Ok(plan) => match plan_statement(&plan, "spans", "traces", "resources", 64, &[]) {
-            Some(_) => "new",
-            None => "old",
-        },
+        Ok(_) => "new",
     }
 }
 

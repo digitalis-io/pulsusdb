@@ -30,8 +30,8 @@ use std::path::PathBuf;
 use serde::Deserialize;
 
 use pulsus_read::{
-    MetricsCtx, MetricsParams, SearchCtx, SearchParams, SpanFilterCtx, TracePlanError, plan_search,
-    plan_trace_metrics,
+    MetricsCtx, MetricsParams, SearchParams, SpanFilterCtx, StatementTables, TracePlanError,
+    plan_search_request, plan_trace_metrics,
 };
 use pulsus_traceql::{parse, validate};
 
@@ -117,13 +117,11 @@ fn every_plan_error_variant_is_witnessed_by_an_accepted_vector() {
     let mut point_cap = 0usize;
 
     let (filter, params) = search_ctx("pulsus.trace_spans", "pulsus.trace_attrs_idx");
-    let ctx = SearchCtx {
-        filter,
-        recent_table: "pulsus.trace_recent",
-        errors_table: "pulsus.trace_error_spans",
-        max_candidates: 1000,
-        max_series: 500,
-        distributed: false,
+    let tables = StatementTables {
+        spans: "pulsus.spans",
+        resources: "pulsus.resources",
+        traces: "pulsus.traces",
+        indexed: &[],
     };
     let mctx = MetricsCtx {
         filter,
@@ -149,7 +147,7 @@ fn every_plan_error_variant_is_witnessed_by_an_accepted_vector() {
             "{}: accept vectors validate",
             v.id
         );
-        match plan_search(&query, &params, &ctx) {
+        match plan_search_request(&query, &params, &tables, 64) {
             Err(TracePlanError::UnsupportedField(_)) => unsupported_field += 1,
             Err(TracePlanError::TypeMismatch(_)) => type_mismatch += 1,
             Err(TracePlanError::MetricsPointCap { .. }) => point_cap += 1,
@@ -174,12 +172,12 @@ fn every_plan_error_variant_is_witnessed_by_an_accepted_vector() {
     assert!(
         unsupported_field >= 1,
         "no accept vector witnesses PlanError::UnsupportedField — expected e.g. \
-         `{{}} | by(event:name)` (reference-accepted, plan_search-rejected)"
+         `{{}} | by(event:name)` (reference-accepted, refused by the search route)"
     );
     assert!(
         type_mismatch >= 1,
         "no accept vector witnesses PlanError::TypeMismatch — expected e.g. `{{}} | rate()` \
-         (reference-accepted, plan_search rejects metrics stages on search)"
+         (reference-accepted, the search route refuses metrics stages)"
     );
     assert!(
         point_cap >= 1,

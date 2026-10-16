@@ -115,7 +115,7 @@ use std::time::Duration;
 
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings};
 use pulsus_config::WriterConfig;
-use pulsus_read::traces::search_plan::{SearchParams, plan_search};
+use pulsus_read::{SearchParams, StatementTables, plan_search_request};
 use pulsus_read::{TraceEngine, TraceReadConfig};
 use pulsus_schema::RenderCtx;
 use pulsus_schema_testkit::run_init;
@@ -306,11 +306,11 @@ impl Projected {
     }
 }
 
-/// Our side: the REAL two-phase executor, read back as span-id hex ->
+/// Our side: the search route's engine, read back as span-id hex ->
 /// projected shape.
 async fn ours(engine: &TraceEngine, q: &str, window: (i64, i64)) -> BTreeMap<String, Projected> {
     let query = pulsus_traceql::parse(q).unwrap_or_else(|e| panic!("parse {q:?}: {e}"));
-    let plan = plan_search(
+    let request = plan_search_request(
         &query,
         &SearchParams {
             start_ns: window.0,
@@ -318,11 +318,17 @@ async fn ours(engine: &TraceEngine, q: &str, window: (i64, i64)) -> BTreeMap<Str
             limit: 100,
             spss: 100,
         },
-        &engine.search_ctx(),
+        &StatementTables {
+            spans: "spans",
+            resources: "resources",
+            traces: "traces",
+            indexed: &[],
+        },
+        64,
     )
     .unwrap_or_else(|e| panic!("plan {q:?}: {e}"));
     let out = engine
-        .search(&plan)
+        .search_routed(&request)
         .await
         .unwrap_or_else(|e| panic!("search {q:?}: {e}"));
     let mut map = BTreeMap::new();
@@ -1054,6 +1060,7 @@ async fn traces_search_projection_differential() {
         .await
         .expect("flush settles")
         .expect("the corpus commits");
+    land_new_store(&client, &req, base, &format!("projdiff-{}", now_ns())).await;
 
     let engine = TraceEngine::new(
         ChClient::new(ch_config(db)).await.expect("connect engine"),
@@ -1178,4 +1185,56 @@ async fn traces_search_projection_differential() {
         diverged.is_empty(),
         "matched-span projection divergence in {diverged:?} (from REAL output on both sides)"
     );
+}
+
+/// Lands `req` in the span, per-trace and resource tables through
+/// `trace_landing`, as `traces_query_v2_live.rs`'s `land` does: the trace
+/// writer above writes only the previous engine's store, and the search
+/// route reads this one (issue #602 part 2c-1).
+async fn land_new_store(
+    client: &ChClient,
+    req: &opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest,
+    received_ns: i64,
+    token: &str,
+) {
+    let parsed = pulsus_write::parse_trace_landing(req, received_ns).expect("the landing decode");
+    let received_ms = received_ns / 1_000_000;
+    let mut rows: Vec<pulsus_write::TraceLandingRow> =
+        Vec::with_capacity(parsed.total_rows() as usize);
+    rows.extend(
+        parsed
+            .spans
+            .iter()
+            .cloned()
+            .map(|s| pulsus_write::TraceLandingRow::span(received_ms, s)),
+    );
+    rows.extend(
+        parsed
+            .resources
+            .iter()
+            .cloned()
+            .map(|r| pulsus_write::TraceLandingRow::resource(received_ms, r)),
+    );
+    rows.extend(
+        parsed
+            .tag_names
+            .iter()
+            .cloned()
+            .map(|t| pulsus_write::TraceLandingRow::tag_name(received_ms, t)),
+    );
+    rows.extend(
+        parsed
+            .tag_values
+            .iter()
+            .cloned()
+            .map(|t| pulsus_write::TraceLandingRow::tag_value(received_ms, t)),
+    );
+    client
+        .insert_block_with(
+            "trace_landing",
+            &rows,
+            &QuerySettings::trace_landing_insert(token, 1_048_576),
+        )
+        .await
+        .expect("the landing insert");
 }

@@ -38,9 +38,10 @@
 //! the second exclusion is structural rather than a carve-out.
 
 use pulsus_read::traces::metrics_plan::{MetricsCtx, MetricsParams, plan_trace_metrics};
-use pulsus_read::traces::search_plan::{SearchCtx, SearchParams, plan_search};
+use pulsus_read::traces::spans::search::plan_statement_sliced;
 use pulsus_read::traces::tags_sql::{DaySpan, span_name_values_sql};
 use pulsus_read::traces::{GraphWindow, SERVICE_GRAPH_MAX_EDGES, service_graph_sql};
+use pulsus_read::{SearchParams, StatementTables, plan_search_request};
 use pulsus_read::{SpanFilterCtx, TAG_VALUES_MAX};
 
 /// The one request window every read below is compiled over:
@@ -58,10 +59,6 @@ const STEP_MS: i64 = 400_000;
 const SPANS_TABLE: &str = "trace_spans";
 const ATTRS_TABLE: &str = "trace_attrs_idx";
 
-const BATCH: [[u8; 16]; 1] = [[
-    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
-]];
-
 fn filter_ctx() -> SpanFilterCtx<'static> {
     SpanFilterCtx {
         spans_table: SPANS_TABLE,
@@ -69,12 +66,10 @@ fn filter_ctx() -> SpanFilterCtx<'static> {
     }
 }
 
-/// The three statements the empty-selector search issues over the window,
-/// in a fixed order: `0` the phase-1 generator (the recency read), `1` the
-/// phase-2 hydration, `2` the winners' root hydration.
+/// The search statement the empty selector compiles to over the window.
 fn search_statements() -> Vec<(&'static str, String)> {
     let query = pulsus_traceql::parse("{}").expect("the empty selector parses");
-    let plan = plan_search(
+    let request = plan_search_request(
         &query,
         &SearchParams {
             start_ns: START_NS,
@@ -82,20 +77,18 @@ fn search_statements() -> Vec<(&'static str, String)> {
             limit: 20,
             spss: 3,
         },
-        &SearchCtx {
-            filter: filter_ctx(),
-            recent_table: "trace_recent",
-            errors_table: "trace_error_spans",
-            max_candidates: 100_000,
-            max_series: 1_000,
-            distributed: false,
+        &StatementTables {
+            spans: "spans",
+            resources: "resources",
+            traces: "traces",
+            indexed: &[],
         },
+        64,
     )
     .expect("the empty selector plans");
-    let mut out = vec![("search phase-1 generator", plan.generator_sqls[0].clone())];
-    out.push(("search phase-2 hydration", plan.hydration_sql_for(&BATCH)));
-    out.push(("search root hydration", plan.root_sql_for(&BATCH)));
-    out
+    let statement = plan_statement_sliced(&request, "spans", "traces", "resources", 64, &[], None)
+        .expect("the empty selector compiles");
+    vec![("search statement", statement.sql().to_string())]
 }
 
 fn metrics_statement() -> String {
@@ -174,7 +167,6 @@ fn timestamp_operators(sql: &str) -> Vec<String> {
 #[test]
 fn every_request_window_renders_the_one_half_open_bound() {
     let row_bound = format!("timestamp_ns >= {START_NS} AND timestamp_ns < {END_NS}");
-    let recency_bound = format!("ts_max >= {START_NS} AND ts_min <= {}", END_NS - 1);
     let mut wrong: Vec<String> = Vec::new();
 
     let search = search_statements();
@@ -198,25 +190,18 @@ fn every_request_window_renders_the_one_half_open_bound() {
     }
 
     // -- the two reads whose bound IS the request's window: its literals.
-    for (label, sql) in [&search[1], &graph] {
-        if !sql.contains(&row_bound) {
-            wrong.push(format!("{label}: expected `{row_bound}`:\n{sql}"));
-        }
+    if !graph.1.contains(&row_bound) {
+        wrong.push(format!("{}: expected `{row_bound}`:\n{}", graph.0, graph.1));
+    }
+    // The search statement bounds `spans.start_ns`, by the same rule.
+    let span_bound = format!("start_ns >= {START_NS} AND start_ns < {END_NS}");
+    let (label, sql) = &search[0];
+    if !sql.contains(&span_bound) {
+        wrong.push(format!("{label}: expected `{span_bound}`:\n{sql}"));
     }
 
-    // -- the recency candidate bound, derived from the same convention:
-    //    the first included nanosecond and the last.
-    let (generator_label, generator) = &search[0];
-    if !generator.contains(&recency_bound) {
-        wrong.push(format!(
-            "{generator_label}: expected `{recency_bound}` — the recency row bound is rendered \
-             from the window's first and last included nanosecond, not written out with its \
-             own operators:\n{generator}"
-        ));
-    }
-
-    // -- the two point reads: no window at all, and neither gains one.
-    for (label, sql) in [("trace fetch", fetch_statement()), search[2].clone()] {
+    // -- the point read: no window at all, and it gains none.
+    for (label, sql) in [("trace fetch", fetch_statement())] {
         if sql.contains("timestamp_ns >") || sql.contains("timestamp_ns <") {
             wrong.push(format!(
                 "{label}: a `trace_id` point read carries no time bound and gains none:\n{sql}"
@@ -4844,14 +4829,12 @@ fn the_projection_is_bounded() {
 // Issue #591 part 3 — the fork routes by the plan
 // =====================================================================
 
-/// The plan today's planner makes for `query` over [`g1_window`], with the
-/// search defaults.
-fn fork_plan(query: &str) -> pulsus_read::SearchPlan {
-    use pulsus_read::SpanFilterCtx;
-    use pulsus_read::traces::search_plan::{SearchCtx, SearchParams, plan_search};
+/// Whether the route plans `query` over [`g1_window`], with the search
+/// defaults.
+fn route_accepts(query: &str) -> bool {
     let parsed =
         pulsus_traceql::parse(query).unwrap_or_else(|e| panic!("{query} must parse: {e:?}"));
-    plan_search(
+    plan_search_request(
         &parsed,
         &SearchParams {
             start_ns: 1_790_084_801_000_000_000,
@@ -4859,19 +4842,15 @@ fn fork_plan(query: &str) -> pulsus_read::SearchPlan {
             limit: 20,
             spss: 3,
         },
-        &SearchCtx {
-            filter: SpanFilterCtx {
-                spans_table: "trace_spans",
-                attrs_table: "trace_attrs_idx",
-            },
-            recent_table: "trace_recent",
-            errors_table: "trace_error_spans",
-            max_candidates: 100_000,
-            max_series: 1_000,
-            distributed: false,
+        &StatementTables {
+            spans: "spans",
+            resources: "resources",
+            traces: "traces",
+            indexed: &[],
         },
+        64,
     )
-    .unwrap_or_else(|e| panic!("{query} must plan: {e:?}"))
+    .is_ok()
 }
 
 /// Section 6.1: `plan_statement` refuses every shape of section 3.1's
@@ -4879,18 +4858,15 @@ fn fork_plan(query: &str) -> pulsus_read::SearchPlan {
 /// nested-set or trace-level intrinsic, part 2's residual set shapes — and
 /// gives a statement for a covered search.
 #[test]
-fn the_fork_routes_by_the_plan() {
-    use pulsus_read::traces::spans::search::plan_statement;
+fn the_route_refuses_and_serves_each_shape() {
     let mut wrong = Vec::new();
     for query in [
         r#"{ event.k * event.k > 5 }"#,
         r#"{ .k + 1 > .k }"#,
         r#"{ link.lk - link.lk != 0 }"#,
     ] {
-        if plan_statement(&fork_plan(query), "spans", "traces", "resources", 64, &[]).is_some() {
-            wrong.push(format!(
-                "{query}: served by the statement, must be today's engine's"
-            ));
+        if route_accepts(query) {
+            wrong.push(format!("{query}: served, must be refused"));
         }
     }
     for query in [
@@ -5009,10 +4985,8 @@ fn the_fork_routes_by_the_plan() {
         // Issue #602 part 2b.
         r#"{ .a = 1 } | by(trace:id) | coalesce()"#,
     ] {
-        if plan_statement(&fork_plan(query), "spans", "traces", "resources", 64, &[]).is_none() {
-            wrong.push(format!(
-                "{query}: today's engine's, must be the statement's"
-            ));
+        if !route_accepts(query) {
+            wrong.push(format!("{query}: refused, must be served"));
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
@@ -5457,96 +5431,25 @@ const FIXTURE_K_QUERIES: [&str; 27] = [
     r#"{ (name = "k1") = true }"#,
 ];
 
-/// The two queries part 2 serves: each must still be refused here.
+/// The two queries the statement refuses as a `400` (issue #602 part 2b).
 const PART_TWO: [&str; 2] = ["{ !-.a }", "{ -!.a }"];
 
-/// Whether the previous planner accepts `query`, in the context
-/// `accept_surface_wire.rs` plans it in.
-fn previous_planner_accepts(query: &pulsus_traceql::Query) -> bool {
-    plan_search(
-        query,
-        &SearchParams {
-            start_ns: 1_700_000_000_000_000_000,
-            end_ns: 1_700_010_800_000_000_000,
-            limit: 20,
-            spss: 3,
-        },
-        &SearchCtx {
-            filter: SpanFilterCtx {
-                spans_table: "trace_spans",
-                attrs_table: "trace_attrs_idx",
-            },
-            recent_table: "trace_recent",
-            errors_table: "trace_error_spans",
-            max_candidates: 100_000,
-            max_series: 1_000,
-            distributed: false,
-        },
-    )
-    .is_ok()
-}
-
-/// Section 4.4: every query of the accept corpus, the accept-surface
-/// probes and fixture K's 27 that the previous planner accepts, the
-/// statement compiles too — but the two part 2 serves.
+/// Section 4.4: the statement compiles fixture K's 27 queries and
+/// refuses the two arithmetic negations part 2b answers `400`.
 #[test]
-fn the_statement_compiles_what_the_previous_planner_accepts() {
-    #[derive(serde::Deserialize)]
-    struct Matrix {
-        accept_surface_probes: Vec<Probe>,
-    }
-    #[derive(serde::Deserialize)]
-    struct Probe {
-        query: String,
-    }
-    let traceql = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../pulsus-traceql/tests");
-    let mut queries: Vec<String> = Vec::new();
-    let accept = traceql.join("corpus/accept");
-    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&accept)
-        .unwrap_or_else(|e| panic!("read {accept:?}: {e}"))
-        .map(|e| e.expect("a directory entry").path())
-        .filter(|p| p.extension().is_some_and(|x| x == "traceql"))
-        .collect();
-    files.sort();
-    for path in files {
-        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
-        queries.push(text.trim().to_string());
-    }
-    let matrix_path = traceql.join("accept_surface/matrix.json");
-    let matrix: Matrix = serde_json::from_str(
-        &std::fs::read_to_string(&matrix_path)
-            .unwrap_or_else(|e| panic!("read {matrix_path:?}: {e}")),
-    )
-    .unwrap_or_else(|e| panic!("{matrix_path:?} must parse: {e}"));
-    queries.extend(matrix.accept_surface_probes.into_iter().map(|p| p.query));
-    queries.extend(FIXTURE_K_QUERIES.iter().map(|q| q.to_string()));
-    let mut reached = 0usize;
+fn the_statement_compiles_fixture_k_and_refuses_the_two_negations() {
     let mut wrong = Vec::new();
-    for text in &queries {
-        let Ok(query) = pulsus_traceql::parse(text) else {
-            continue;
-        };
-        if pulsus_traceql::validate(&query).is_err() || !previous_planner_accepts(&query) {
-            continue;
-        }
-        reached += 1;
-        let compiled = compile_search(&query, &ctx(), "spans", "traces", 20, 3);
-        match (PART_TWO.contains(&text.as_str()), compiled) {
-            (false, Err(e)) => wrong.push(format!("{text}: refused: {e}")),
-            (true, Ok(_)) => wrong.push(format!("{text}: compiled; part 2 serves it")),
-            _ => {}
+    for text in FIXTURE_K_QUERIES {
+        if let Err(e) = compile_search_of(text) {
+            wrong.push(format!("{text}: refused: {e}"));
         }
     }
-    assert!(
-        reached >= 250,
-        "only {reached} queries reached compile_search: a source is missing"
-    );
-    assert!(
-        wrong.is_empty(),
-        "{} of {reached}:\n{}",
-        wrong.len(),
-        wrong.join("\n")
-    );
+    for text in PART_TWO {
+        if compile_search_of(text).is_ok() {
+            wrong.push(format!("{text}: compiled, must be refused"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
 /// Section 4.4: no statement reads a value off its typed path, and none
@@ -5722,6 +5625,56 @@ fn a_sliced_structural_statement_reads_only_its_candidates() {
                  want {:?}",
                 (2 * reads, 0, 0, 2 * reads)
             ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Issue #602 part 2c-1: every one-field nested-set condition projects that
+/// field's own number (`docs/api.md` §4.2), the element of `nested_values`
+/// the field decodes from — the bare field on both sides, arithmetic, and a
+/// negated literal. Measured against the reference: each of these projects
+/// its field there, and the statement projected nothing before the fix.
+#[test]
+fn every_one_field_nested_set_condition_projects_its_number() {
+    let mut wrong = Vec::new();
+    for (query, element) in [
+        ("{ nestedSetLeft = nestedSetLeft }", 2),
+        ("{ nestedSetRight >= nestedSetRight }", 3),
+        ("{ nestedSetLeft + 1 > 2 }", 2),
+        ("{ nestedSetLeft * 2 > 0 }", 2),
+        ("{ nestedSetParent > -2 }", 4),
+        ("{ nestedSetParent + 1 > -1 }", 4),
+    ] {
+        let statement = compile_search_of(query).unwrap_or_else(|e| panic!("{query}: {e}"));
+        let projection = statement.projection();
+        let number = format!(
+            "toString(transform(concat(trace_id, span_id), nested_values.1, nested_values.{element}, toInt64(0)))"
+        );
+        if !(projection.reads_numbers() && projection.sql().contains(&number)) {
+            wrong.push(format!("{query}: does not project `{number}`"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Issue #602 part 2c-1: a root-only parent comparison, a negated literal
+/// included, projects `-1` and reads no numbering — the fast path stays.
+#[test]
+fn a_root_only_parent_comparison_projects_minus_one_without_the_numbering() {
+    let mut wrong = Vec::new();
+    for query in [
+        "{ nestedSetParent = -1 }",
+        "{ nestedSetParent < 0 }",
+        "{ -1 = nestedSetParent }",
+    ] {
+        let statement = compile_search_of(query).unwrap_or_else(|e| panic!("{query}: {e}"));
+        let projection = statement.projection();
+        if projection.reads_numbers()
+            || !projection.sql().contains("'-1'")
+            || statement.sql().contains("nested_keys")
+        {
+            wrong.push(format!("{query}: {}", projection.sql()));
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));

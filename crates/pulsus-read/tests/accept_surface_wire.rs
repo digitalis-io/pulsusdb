@@ -56,7 +56,7 @@ use std::path::PathBuf;
 
 use pulsus_read::SpanFilterCtx;
 use pulsus_read::traces::metrics_plan::{MetricsCtx, MetricsParams, plan_trace_metrics};
-use pulsus_read::traces::search_plan::{SearchCtx, SearchParams, plan_search};
+use pulsus_read::{SearchParams, StatementTables, plan_search_request};
 use serde::Deserialize;
 
 /// The frozen baseline: the two constants and the per-probe dispositions,
@@ -161,7 +161,7 @@ fn wire_accepts(q: &str) -> bool {
         )
         .is_ok()
     } else {
-        plan_search(
+        plan_search_request(
             &query,
             &SearchParams {
                 start_ns: 1_700_000_000_000_000_000,
@@ -169,14 +169,13 @@ fn wire_accepts(q: &str) -> bool {
                 limit: 20,
                 spss: 3,
             },
-            &SearchCtx {
-                filter,
-                recent_table: "trace_recent",
-                errors_table: "trace_error_spans",
-                max_candidates: 100_000,
-                max_series: 1_000,
-                distributed: false,
+            &StatementTables {
+                spans: "spans",
+                resources: "resources",
+                traces: "traces",
+                indexed: &[],
             },
+            64,
         )
         .is_ok()
     }

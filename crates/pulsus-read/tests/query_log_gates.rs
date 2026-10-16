@@ -2039,22 +2039,30 @@ async fn every_trace_engine_query_carries_the_memory_ceiling() {
     let marker = query_log_marker(&admin).await;
     let engine = pulsus_read::TraceEngine::new(engine_client, config);
 
-    // 1. Search — `search_settings` + `generator_settings` (phase 1) and
-    //    the phase-2 hydration read, which since issue #557 carries the
-    //    attribute condition as a predicate column of its own.
-    let query = pulsus_traceql::parse(r#"{ span.http.status_code = "500" }"#).expect("parses");
-    let plan = pulsus_read::traces::search_plan::plan_search(
+    // 1. Search — the route's statement, with the search settings; the
+    //    `spans` rows above hold no attribute, so the query names the span.
+    let query = pulsus_traceql::parse(r#"{ name = "op" }"#).expect("parses");
+    let request = pulsus_read::plan_search_request(
         &query,
-        &pulsus_read::traces::search_plan::SearchParams {
+        &pulsus_read::SearchParams {
             start_ns: ts_ns - 3_600_000_000_000,
             end_ns: ts_ns + 3_600_000_000_000,
             limit: 20,
             spss: 10,
         },
-        &engine.search_ctx(),
+        &pulsus_read::StatementTables {
+            spans: "spans",
+            resources: "resources",
+            traces: "traces",
+            indexed: &[],
+        },
+        64,
     )
     .expect("plans");
-    let found = engine.search(&plan).await.expect("search executes");
+    let found = engine
+        .search_routed(&request)
+        .await
+        .expect("search executes");
     assert!(
         !found.traces.is_empty(),
         "the search fixture must return rows, or the phase-2 reads never dispatch"

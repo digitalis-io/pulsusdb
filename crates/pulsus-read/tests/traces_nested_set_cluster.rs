@@ -28,9 +28,9 @@ use pulsus_clickhouse::{
     ChClient, ChConnConfig, ChError, ChProto, Idempotency, QuerySettings, Row,
 };
 use pulsus_read::logql::error::ReadError;
-use pulsus_read::traces::search_plan::{SearchParams, plan_search};
 use pulsus_read::traces::spans::rows::SearchTraceRow;
-use pulsus_read::traces::spans::search::plan_statement;
+use pulsus_read::traces::spans::search::plan_statement_sliced;
+use pulsus_read::{SearchParams, StatementTables, plan_search_request};
 use pulsus_schema::RenderCtx;
 use pulsus_schema_testkit::run_init;
 use pulsus_write::{TraceLandingRow, parse_trace_landing};
@@ -351,7 +351,7 @@ async fn a_numbered_search_answers_over_two_shards() {
         config(),
     );
     let plan = |query: &str, start: i64, end: i64, limit: u32| {
-        plan_search(
+        plan_search_request(
             &pulsus_traceql::parse(query).expect("parses"),
             &SearchParams {
                 start_ns: start,
@@ -359,7 +359,13 @@ async fn a_numbered_search_answers_over_two_shards() {
                 limit,
                 spss: 10,
             },
-            &engine.search_ctx(),
+            &StatementTables {
+                spans: "spans_dist",
+                resources: "resources",
+                traces: "traces_dist",
+                indexed: &[],
+            },
+            64,
         )
         .expect("plans")
     };
@@ -367,8 +373,8 @@ async fn a_numbered_search_answers_over_two_shards() {
 
     // The negative control: the statement, without the setting, is refused.
     let p = plan("{ nestedSetLeft > 0 }", window.0, window.1, 30);
-    let stmt =
-        plan_statement(&p, "spans_dist", "traces_dist", "resources", 64, &[]).expect("covered");
+    let stmt = plan_statement_sliced(&p, "spans_dist", "traces_dist", "resources", 64, &[], None)
+        .expect("covered");
     let settings = QuerySettings::clustered_reader(false)
         .set("final", 1)
         .set("do_not_merge_across_partitions_select_final", 1);
@@ -418,9 +424,7 @@ async fn a_numbered_search_answers_over_two_shards() {
             "23 [03 2]; 22 [03 2]".to_string(),
         ),
     ] {
-        let got = engine
-            .search_routed(&plan(query, start, end, limit).request())
-            .await;
+        let got = engine.search_routed(&plan(query, start, end, limit)).await;
         let got = match got {
             Ok(out) => numbers_of(&out),
             Err(ReadError::Clickhouse(e)) => format!("Err({e})"),
@@ -450,7 +454,7 @@ async fn a_numbered_search_answers_over_two_shards() {
             .collect::<Vec<_>>()
             .join("; ");
         let got = match engine
-            .search_routed(&plan(query, window.0, window.1, 30).request())
+            .search_routed(&plan(query, window.0, window.1, 30))
             .await
         {
             Ok(out) => groups_of(&out),
@@ -487,7 +491,7 @@ async fn a_numbered_search_answers_over_two_shards() {
             .collect::<Vec<_>>()
             .join("; ");
         let got = match engine
-            .search_routed(&plan(query, window.0, window.1, 30).request())
+            .search_routed(&plan(query, window.0, window.1, 30))
             .await
         {
             Ok(out) if numbers => numbers_of(&out),
