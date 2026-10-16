@@ -15,6 +15,9 @@ use pulsus_read::logql::{Direction, Plan, PlanCtx, QueryParams, QuerySpec};
 
 fn ctx() -> PlanCtx<'static> {
     PlanCtx {
+        tenant: Box::leak(Box::new(
+            pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+        )),
         db: "pulsus",
         streams_idx: "log_streams_idx",
         streams: "log_streams",
@@ -248,6 +251,7 @@ fn stage3_with_an_injection_payload_in_the_line_filter_keeps_the_statement_well_
     })];
     let clauses = compile_line_filters(&filters);
     let sql = sql::stage3(
+        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
         "log_samples",
         &[literal("checkout")],
         &[Fingerprint::from_raw(1).sql_literal()],

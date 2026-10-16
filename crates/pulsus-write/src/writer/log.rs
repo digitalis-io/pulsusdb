@@ -32,7 +32,7 @@
 //!
 //! **Registration**: `StreamLru` promotion stays success-only — the LRU is
 //! promoted when the block commits, never at admission — keyed
-//! `(fingerprint, month)`. A registration is a kind-1 row inside the lines'
+//! `(tenant, fingerprint, month)` (issue #653). A registration is a kind-1 row inside the lines'
 //! own block rather than its own insert, so there is no "lines committed,
 //! registration lost" orphan left to heal and **no registration backfill on
 //! this path** (issue #134's mechanism goes with it).
@@ -56,6 +56,7 @@ use std::time::Duration;
 
 use pulsus_clickhouse::{ChClient, QuerySettings};
 use pulsus_config::WriterConfig;
+use pulsus_model::Tenant;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::LogsIngestError;
@@ -74,7 +75,7 @@ use crate::writer::landing::{
 };
 use crate::writer::metrics::{WriterMetrics, WriterMetricsSnapshot};
 use crate::writer::push_dedup::{self, Admission, ClaimTicket, PushDedup};
-use crate::writer::registration::StreamLru;
+use crate::writer::registration::{StreamKey, StreamLru};
 use crate::writer::rows::{LogLandingRow, LogSampleRow, LogStreamRow};
 use crate::writer::spool::SpoolWriter;
 use crate::writer::table::{BlockInserter, ChBlockInserter, XorShift64, spawn_dedup_ticker};
@@ -104,15 +105,13 @@ impl WriterTables {
 
 /// The `StreamLru` keys a committed block registers, derived from the block's
 /// own kind-1 rows rather than carried beside them: such a row holds the
-/// fingerprint and the month, which is the whole key. Nothing is retained for
+/// tenant, the fingerprint and the month, which is the whole key. Nothing is retained for
 /// a block that never commits, and what a queued block holds does not grow
 /// with the number of streams a push registers.
-fn promotion_keys(
-    rows: &[LogLandingRow],
-) -> impl Iterator<Item = (pulsus_model::Fingerprint, u16)> {
+fn promotion_keys(rows: &[LogLandingRow]) -> impl Iterator<Item = StreamKey> + '_ {
     rows.iter()
         .filter(|row| row.kind == LogLandingRow::KIND_STREAM)
-        .map(|row| (row.fingerprint, row.month))
+        .map(|row| (Arc::clone(&row.org_id), row.fingerprint, row.month))
 }
 
 struct Shared {
@@ -279,6 +278,7 @@ impl LogWriter {
     /// reservation. `mode` selects sync- versus async-mode admission.
     fn admit_batch(
         &self,
+        tenant: &Tenant,
         batch: ParsedLogs,
         mode: AdmitMode,
         push: PushHeaders,
@@ -311,7 +311,7 @@ impl LogWriter {
         let mut suppressed: Option<Suppressed> = None;
         let mut guard = match (&self.shared.dedup, batch.stream_errors.is_empty()) {
             (Some(dedup), true) => {
-                let id = push_dedup::log_identity(&batch, &push);
+                let id = push_dedup::log_identity(&batch, &push, tenant);
                 match dedup.admit(id, mode.wait_mode()) {
                     Admission::Admit(guard) => Some(guard),
                     Admission::SuppressedSettled(outcome) => {
@@ -359,7 +359,11 @@ impl LogWriter {
         {
             let mut lru = self.shared.lru.lock().expect("stream lru mutex poisoned");
             for stream in &batch.streams {
-                let key = (stream.fingerprint, stream.month.days_since_epoch());
+                let key = (
+                    Arc::clone(tenant.as_arc()),
+                    stream.fingerprint,
+                    stream.month.days_since_epoch(),
+                );
                 if lru.contains(&key) {
                     if count {
                         self.shared
@@ -435,8 +439,12 @@ impl LogWriter {
             return Ok(Admitted::Stored(Vec::new()));
         }
 
+        // Issue #653: every row shares the push's one tenant string, whose
+        // bytes are charged once, beside the slot each row's `Arc` occupies.
+        let tenant_bytes = tenant.as_str().len() as u64;
         let total_bytes =
-            landing_charge::<LogLandingRow>(line_bytes + stream_bytes + pattern_bound);
+            landing_charge::<LogLandingRow>(line_bytes + stream_bytes + pattern_bound)
+                + tenant_bytes;
 
         // The two per-push ceilings, counted over all three kinds, and decided
         // **before** either branch below queues anything. At or above the row
@@ -481,6 +489,9 @@ impl LogWriter {
         )
         .map_err(AdmitRefusal::from)?;
 
+        // Issue #653: every row shares the push's one tenant string.
+        let org_id: &Arc<str> = tenant.as_arc();
+
         // Reservation secured: only now materialize the rows — the clone, the
         // label canonicalization and the pattern extraction the gate above
         // exists to admit-or-reject ahead of.
@@ -489,13 +500,13 @@ impl LogWriter {
             batch
                 .rows
                 .iter()
-                .map(|r| LogLandingRow::line(received_ms, r)),
+                .map(|r| LogLandingRow::line(org_id, received_ms, r)),
         );
         rows.extend(
             new_streams
                 .iter()
                 .copied()
-                .map(|s| LogLandingRow::stream(received_ms, s)),
+                .map(|s| LogLandingRow::stream(org_id, received_ms, s)),
         );
         if patterns_on {
             let agg = aggregate_patterns(&batch.rows);
@@ -508,7 +519,7 @@ impl LogWriter {
             rows.extend(
                 agg.rows
                     .into_iter()
-                    .map(|r| LogLandingRow::pattern(received_ms, r)),
+                    .map(|r| LogLandingRow::pattern(org_id, received_ms, r)),
             );
         }
 
@@ -652,12 +663,23 @@ impl LogWriter {
 }
 
 impl LogSink for LogWriter {
-    fn admit(&self, batch: ParsedLogs, push: PushHeaders) -> Result<(), AdmitRefusal> {
-        self.admit_batch(batch, AdmitMode::Async, push).map(|_| ())
+    fn admit(
+        &self,
+        tenant: &Tenant,
+        batch: ParsedLogs,
+        push: PushHeaders,
+    ) -> Result<(), AdmitRefusal> {
+        self.admit_batch(tenant, batch, AdmitMode::Async, push)
+            .map(|_| ())
     }
 
-    fn admit_flush(&self, batch: ParsedLogs, push: PushHeaders) -> Result<FlushWait, AdmitRefusal> {
-        match self.admit_batch(batch, AdmitMode::Sync, push)? {
+    fn admit_flush(
+        &self,
+        tenant: &Tenant,
+        batch: ParsedLogs,
+        push: PushHeaders,
+    ) -> Result<FlushWait, AdmitRefusal> {
+        match self.admit_batch(tenant, batch, AdmitMode::Sync, push)? {
             Admitted::Stored(receivers) => Ok(FlushWait::new(async move {
                 super::join_generations(receivers)
                     .await
@@ -889,9 +911,18 @@ mod tests {
             .expect("a representable month")
             .days_since_epoch();
         let rows = vec![
-            LogLandingRow::line(5, &log_row(7, 1_700_000_000_000_000_000, "hello")),
-            LogLandingRow::stream(5, &stream_row(7, 1_700_000_000_000_000_000)),
+            LogLandingRow::line(
+                &std::sync::Arc::<str>::from(""),
+                5,
+                &log_row(7, 1_700_000_000_000_000_000, "hello"),
+            ),
+            LogLandingRow::stream(
+                &std::sync::Arc::<str>::from(""),
+                5,
+                &stream_row(7, 1_700_000_000_000_000_000),
+            ),
             LogLandingRow::pattern(
+                &std::sync::Arc::<str>::from(""),
                 5,
                 LogPatternRow {
                     fingerprint: Fingerprint::from_raw(7),
@@ -900,16 +931,20 @@ mod tests {
                     count: 1,
                 },
             ),
-            LogLandingRow::stream(5, &stream_row(9, 1_700_000_000_000_000_000)),
+            LogLandingRow::stream(
+                &std::sync::Arc::<str>::from(""),
+                5,
+                &stream_row(9, 1_700_000_000_000_000_000),
+            ),
         ];
 
-        let keys: Vec<(Fingerprint, u16)> = promotion_keys(&rows).collect();
+        let keys: Vec<StreamKey> = promotion_keys(&rows).collect();
 
         assert_eq!(
             keys,
             vec![
-                (Fingerprint::from_raw(7), month),
-                (Fingerprint::from_raw(9), month),
+                (Arc::from(""), Fingerprint::from_raw(7), month),
+                (Arc::from(""), Fingerprint::from_raw(9), month),
             ],
             "one key per kind-1 row and none for any other kind"
         );
@@ -993,13 +1028,23 @@ mod tests {
             let mut rows: Vec<LogLandingRow> = Vec::with_capacity(
                 (shape.rows.len() as u64 + shape.streams.len() as u64 + distinct_cap) as usize,
             );
-            rows.extend(shape.rows.iter().map(|r| LogLandingRow::line(5, r)));
-            rows.extend(shape.streams.iter().map(|s| LogLandingRow::stream(5, s)));
+            rows.extend(
+                shape
+                    .rows
+                    .iter()
+                    .map(|r| LogLandingRow::line(&std::sync::Arc::<str>::from(""), 5, r)),
+            );
+            rows.extend(
+                shape
+                    .streams
+                    .iter()
+                    .map(|s| LogLandingRow::stream(&std::sync::Arc::<str>::from(""), 5, s)),
+            );
             rows.extend(
                 aggregate_patterns(&shape.rows)
                     .rows
                     .into_iter()
-                    .map(|r| LogLandingRow::pattern(5, r)),
+                    .map(|r| LogLandingRow::pattern(&std::sync::Arc::<str>::from(""), 5, r)),
             );
 
             let (tx, _rx) = oneshot::channel();
@@ -1086,7 +1131,11 @@ mod tests {
             ..Default::default()
         };
         writer
-            .admit(batch, PushHeaders::default())
+            .admit(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+                batch,
+                PushHeaders::default(),
+            )
             .expect("the push is admitted");
         let charged = writer.shared.queued_bytes.load(Ordering::SeqCst);
         assert!(charged > 0, "an admitted push holds a reservation");
@@ -1139,6 +1188,7 @@ mod tests {
         let registered = {
             let mut lru = writer.shared.lru.lock().expect("stream lru mutex poisoned");
             lru.contains(&(
+                Arc::from(""),
                 Fingerprint::from_raw(7),
                 Date::start_of_month_utc(TS)
                     .expect("a representable month")
@@ -1202,7 +1252,11 @@ mod tests {
                 ..Default::default()
             };
             let wait = writer
-                .admit_flush(batch, PushHeaders::default())
+                .admit_flush(
+                    &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+                    batch,
+                    PushHeaders::default(),
+                )
                 .expect("queue has room");
             let charged = writer.metrics().queue_bytes;
             assert!(charged > 0, "an admitted push holds a reservation");
@@ -1240,5 +1294,136 @@ mod tests {
             writer.shutdown(Duration::from_secs(2)).await;
             std::fs::remove_dir_all(&root).ok();
         });
+    }
+
+    /// The tenant named `name`, by the header's own rule.
+    fn tenant(name: &str) -> Tenant {
+        Tenant::from_header(
+            Some(&axum::http::HeaderValue::from_str(name).expect("a header value")),
+            false,
+        )
+        .expect("a valid tenant")
+    }
+
+    /// An inserter that records every block it is handed and commits it.
+    struct RecordingInserter {
+        blocks: Mutex<Vec<Vec<LogLandingRow>>>,
+    }
+
+    impl BlockInserter<LogLandingRow> for RecordingInserter {
+        fn insert<'a>(
+            &'a self,
+            _table: &'a str,
+            rows: &'a [LogLandingRow],
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ChError>> + Send + 'a>>
+        {
+            self.blocks
+                .lock()
+                .expect("recorded blocks mutex poisoned")
+                .push(rows.to_vec());
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// **T-W1 (issue #653): two tenants register one stream each.** Tenant
+    /// `tenant-a` pushes a stream and its block commits, which promotes the
+    /// stream into the registration cache; `tenant-b` then pushes the same
+    /// stream in the same month. Its block must carry its own kind-1 row:
+    /// a cache keyed without the tenant would skip it, and `tenant-b`'s
+    /// stage 2 would then find no `log_streams` row for its lines.
+    #[tokio::test]
+    async fn two_tenants_register_one_stream_each() {
+        const TS: i64 = 1_700_000_000_000_000_000;
+        let inserter = Arc::new(RecordingInserter {
+            blocks: Mutex::new(Vec::new()),
+        });
+        let root = spool_root("two-tenants-register");
+        let writer = LogWriter::with_landing_inserter_and_runtime(
+            inserter.clone(),
+            runtime_at(&WriterConfig::default(), &root),
+            WriterTables::logs_default(),
+        );
+        // Two lines, so neither push is the other's repeat: this case is
+        // about the registration cache alone.
+        for (name, line) in [("tenant-a", "hello a"), ("tenant-b", "hello b")] {
+            let batch = ParsedLogs {
+                rows: vec![log_row(7, TS, line)],
+                streams: vec![stream_row(7, TS)],
+                ..Default::default()
+            };
+            writer
+                .admit_flush(&tenant(name), batch, PushHeaders::default())
+                .expect("the push is admitted")
+                .await
+                .expect("the block commits");
+        }
+        let blocks = inserter
+            .blocks
+            .lock()
+            .expect("recorded blocks mutex poisoned")
+            .clone();
+        assert_eq!(blocks.len(), 2, "one block per push");
+        let registrations: Vec<&str> = blocks[1]
+            .iter()
+            .filter(|row| row.kind == LogLandingRow::KIND_STREAM)
+            .map(|row| &*row.org_id)
+            .collect();
+        assert_eq!(
+            registrations,
+            vec!["tenant-b"],
+            "tenant-b's push registers the stream under its own tenant"
+        );
+        writer.shutdown(Duration::from_secs(5)).await;
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **T-W2 (issue #653): a push is charged its tenant's bytes once.**
+    /// The same push, queued by two writers whose insert parks, once as the
+    /// empty tenant and once as a 150-byte tenant: every row shares one
+    /// tenant string, so the two reservations differ by the tenant's 150
+    /// bytes and nothing else.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_log_push_is_charged_its_tenants_bytes_once() {
+        const TS: i64 = 1_700_000_000_000_000_000;
+        let long = "a".repeat(150);
+        let mut charged = Vec::new();
+        for name in [None, Some(long.as_str())] {
+            let inserter = Arc::new(ParkingInserter::new());
+            let root = spool_root("tenant-charge");
+            let writer = LogWriter::with_landing_inserter_and_runtime(
+                inserter.clone(),
+                runtime_at(&WriterConfig::default(), &root),
+                WriterTables::logs_default(),
+            );
+            let who = match name {
+                None => Tenant::from_header(None, false).expect("the empty tenant"),
+                Some(name) => tenant(name),
+            };
+            let batch = ParsedLogs {
+                rows: vec![log_row(7, TS, "hello"), log_row(7, TS + 1, "world")],
+                streams: vec![stream_row(7, TS)],
+                ..Default::default()
+            };
+            writer
+                .admit(&who, batch, PushHeaders::default())
+                .expect("the push is admitted");
+            charged.push(writer.shared.queued_bytes.load(Ordering::SeqCst));
+            inserter
+                .entered
+                .acquire()
+                .await
+                .expect("the entered semaphore is never closed")
+                .forget();
+            inserter.release.add_permits(1);
+            writer.shutdown(Duration::from_secs(5)).await;
+            std::fs::remove_dir_all(&root).ok();
+        }
+        assert_eq!(
+            charged[1].checked_sub(charged[0]),
+            Some(150),
+            "the 150-byte tenant's push is charged {} where the empty tenant's is {}",
+            charged[1],
+            charged[0]
+        );
     }
 }

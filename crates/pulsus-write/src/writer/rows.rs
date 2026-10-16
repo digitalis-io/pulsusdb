@@ -16,7 +16,6 @@ use crate::ingest::traces::{
 };
 use crate::protocols::otlp_logs::{LogRow, StreamRow};
 use crate::writer::backfill::BackfillRow;
-use crate::writer::registration::StreamKey;
 use crate::writer::spool::{FiniteOrNull, SpoolEncode, SpoolSink};
 use pulsus_clickhouse::json_column::TraceJson;
 
@@ -150,9 +149,9 @@ impl SpoolEncode for LogStreamRow {
 /// `ReplacingMergeTree(updated_ns)` dedup key — versioned on `updated_ns`
 /// (larger wins, mirroring the merge's winner).
 impl BackfillRow for LogStreamRow {
-    type Key = StreamKey;
+    type Key = (Fingerprint, u16);
 
-    fn backfill_key(&self) -> StreamKey {
+    fn backfill_key(&self) -> (Fingerprint, u16) {
         (self.fingerprint, self.month)
     }
 
@@ -251,7 +250,7 @@ impl SpoolEncode for LogPatternRow {
 ///
 /// `kind` says which event the row is; a row sets that kind's columns and
 /// leaves the rest at the type's default. The fields are the landing table's
-/// fourteen columns **less `event_id`**, in the table's own declaration order:
+/// fifteen columns **less `event_id`**, in the table's own declaration order:
 /// the insert's column list is exactly this type's `COLUMN_NAMES`, so leaving
 /// the column out is what makes the server fill it from
 /// `DEFAULT generateUUIDv7()`.
@@ -266,6 +265,8 @@ impl SpoolEncode for LogPatternRow {
 /// field here, so no NaN marker makes a derived equality mislead.
 #[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
 pub struct LogLandingRow {
+    /// Issue #653: the push's tenant, one shared string per push.
+    pub org_id: Arc<str>,
     pub received_ms: i64,
     pub kind: u8,
     pub service: String,
@@ -322,8 +323,9 @@ impl LogLandingRow {
     /// for `''`, and an `ARRAY JOIN` over an empty array emits no row — so the
     /// view is correct whether the server applies its `WHERE kind = 1` before
     /// or after the join.
-    fn of_kind(received_ms: i64, kind: u8) -> Self {
+    fn of_kind(org_id: &Arc<str>, received_ms: i64, kind: u8) -> Self {
         LogLandingRow {
+            org_id: Arc::clone(org_id),
             received_ms,
             kind,
             service: String::new(),
@@ -342,7 +344,7 @@ impl LogLandingRow {
 
     /// A kind-0 row: the columns `log_samples_mv` and `log_metrics_<res>_mv`
     /// read, and no others.
-    pub fn line(received_ms: i64, row: &LogRow) -> Self {
+    pub fn line(org_id: &Arc<str>, received_ms: i64, row: &LogRow) -> Self {
         LogLandingRow {
             service: row.service.clone(),
             fingerprint: row.fingerprint,
@@ -350,13 +352,13 @@ impl LogLandingRow {
             severity: row.severity,
             body: row.body.clone(),
             structured_metadata: row.structured_metadata.clone(),
-            ..Self::of_kind(received_ms, Self::KIND_LINE)
+            ..Self::of_kind(org_id, received_ms, Self::KIND_LINE)
         }
     }
 
     /// A kind-1 row: the columns `log_streams_mv` and `log_streams_idx_mv`
     /// read, and no others.
-    pub fn stream(received_ms: i64, row: &StreamRow) -> Self {
+    pub fn stream(org_id: &Arc<str>, received_ms: i64, row: &StreamRow) -> Self {
         // `to_canonical_json` grows its buffer as it encodes, so it returns
         // with spare capacity — up to its own length again. The queue holds
         // this row until its block is encoded and is charged the encoded bytes
@@ -370,7 +372,7 @@ impl LogLandingRow {
             service: row.service.clone(),
             labels,
             updated_ns: row.updated_ns,
-            ..Self::of_kind(received_ms, Self::KIND_STREAM)
+            ..Self::of_kind(org_id, received_ms, Self::KIND_STREAM)
         }
     }
 
@@ -381,24 +383,26 @@ impl LogLandingRow {
     /// text at once. `timestamp_ns` carries the aggregate's bucket floor, which
     /// is the event's own time floored — the contract the landing table's own
     /// column comment states.
-    pub fn pattern(received_ms: i64, row: LogPatternRow) -> Self {
+    pub fn pattern(org_id: &Arc<str>, received_ms: i64, row: LogPatternRow) -> Self {
         LogLandingRow {
             fingerprint: row.fingerprint,
             timestamp_ns: row.bucket_ns,
             pattern: row.pattern,
             pattern_count: row.count,
-            ..Self::of_kind(received_ms, Self::KIND_PATTERN)
+            ..Self::of_kind(org_id, received_ms, Self::KIND_PATTERN)
         }
     }
 }
 
 impl SpoolEncode for LogLandingRow {
-    /// `kind` and `received_ms`, then exactly the keys that kind's target row
+    /// `org_id` (issue #653, so a failure record names the tenant), `kind`
+    /// and `received_ms`, then exactly the keys that kind's target row
     /// already emits. One encoder emitting every column of the union would put
     /// another kind's fields in a row that does not carry them.
     fn to_spool_value(&self) -> serde_json::Value {
         match self.kind {
             Self::KIND_LINE => serde_json::json!({
+                "org_id": &*self.org_id,
                 "kind": self.kind,
                 "received_ms": self.received_ms,
                 "service": self.service,
@@ -409,6 +413,7 @@ impl SpoolEncode for LogLandingRow {
                 "structured_metadata": self.structured_metadata,
             }),
             Self::KIND_STREAM => serde_json::json!({
+                "org_id": &*self.org_id,
                 "kind": self.kind,
                 "received_ms": self.received_ms,
                 "month": self.month,
@@ -424,6 +429,7 @@ impl SpoolEncode for LogLandingRow {
             // path. The keys are the TARGET's (`bucket_ns`, `count`), not this
             // row type's.
             _ => serde_json::json!({
+                "org_id": &*self.org_id,
                 "kind": self.kind,
                 "received_ms": self.received_ms,
                 "fingerprint": self.fingerprint,
@@ -458,6 +464,7 @@ impl SpoolEncode for LogLandingRow {
                 o.str_field("body", &self.body).await?;
                 o.field("fingerprint", &self.fingerprint).await?;
                 o.field("kind", &self.kind).await?;
+                o.str_field("org_id", &self.org_id).await?;
                 o.field("received_ms", &self.received_ms).await?;
                 o.str_field("service", &self.service).await?;
                 o.field("severity", &self.severity).await?;
@@ -470,6 +477,7 @@ impl SpoolEncode for LogLandingRow {
                 o.field("kind", &self.kind).await?;
                 o.str_field("labels", &self.labels).await?;
                 o.field("month", &self.month).await?;
+                o.str_field("org_id", &self.org_id).await?;
                 o.field("received_ms", &self.received_ms).await?;
                 o.str_field("service", &self.service).await?;
                 o.field("updated_ns", &self.updated_ns).await?;
@@ -481,6 +489,7 @@ impl SpoolEncode for LogLandingRow {
                 o.field("count", &self.pattern_count).await?;
                 o.field("fingerprint", &self.fingerprint).await?;
                 o.field("kind", &self.kind).await?;
+                o.str_field("org_id", &self.org_id).await?;
                 o.str_field("pattern", &self.pattern).await?;
                 o.field("received_ms", &self.received_ms).await?;
             }
@@ -2358,6 +2367,7 @@ mod tests {
     /// rather than read from the catalogue: this crate does not depend on
     /// `pulsus-schema`, and the point of the case below is that the two agree.
     const LOG_LANDING_COLUMNS: &[&str] = &[
+        "org_id",
         "event_id",
         "received_ms",
         "kind",
@@ -2383,7 +2393,7 @@ mod tests {
     #[test]
     fn the_log_insert_omits_event_id_so_the_server_fills_it() {
         let names = <LogLandingRow as pulsus_clickhouse::Row>::COLUMN_NAMES;
-        assert_eq!(names.len(), 13, "the 14 columns less event_id");
+        assert_eq!(names.len(), 14, "the 15 columns less event_id");
         let expected: Vec<&str> = LOG_LANDING_COLUMNS
             .iter()
             .copied()

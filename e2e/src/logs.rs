@@ -3011,6 +3011,9 @@ mod tests {
 
     fn hermetic_plan_ctx() -> pulsus_read::logql::PlanCtx<'static> {
         pulsus_read::logql::PlanCtx {
+            tenant: Box::leak(Box::new(
+                pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            )),
             db: "pulsus",
             streams_idx: "log_streams_idx",
             streams: "log_streams",

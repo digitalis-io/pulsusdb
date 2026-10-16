@@ -229,6 +229,8 @@ fn now_ns() -> i64 {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct IdxRow {
+    /// The tenant (issue #653): the empty tenant's rows.
+    org_id: String,
     month: u16,
     key: String,
     val: String,
@@ -237,6 +239,8 @@ struct IdxRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct RollupRow {
+    /// The tenant (issue #653): the empty tenant's rows.
+    org_id: String,
     fingerprint: u128,
     bucket_ns: i64,
     count: u64,
@@ -311,12 +315,14 @@ async fn the_production_discovery_read_answers_completely_over_split_placement()
             "log_streams_idx",
             &[
                 IdxRow {
+                    org_id: String::new(),
                     month,
                     key: "env".to_string(),
                     val: "alpha".to_string(),
                     fingerprint: FP,
                 },
                 IdxRow {
+                    org_id: String::new(),
                     month,
                     key: "service_name".to_string(),
                     val: "split".to_string(),
@@ -330,6 +336,7 @@ async fn the_production_discovery_read_answers_completely_over_split_placement()
         .insert_block(
             "log_metrics_5s",
             &[RollupRow {
+                org_id: String::new(),
                 fingerprint: FP,
                 bucket_ns: (ts / 5_000_000_000) * 5_000_000_000,
                 count: 1,
@@ -382,6 +389,7 @@ async fn the_production_discovery_read_answers_completely_over_split_placement()
             .await
             .expect("connect the engine's client"),
         engine_config(&db),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
     );
     let values = engine
         .label_values("env", None, bounds)

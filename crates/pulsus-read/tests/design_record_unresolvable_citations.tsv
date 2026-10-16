@@ -8,7 +8,6 @@ docs/query-lowering.md	ast.rs:242	ambiguous_basename
 docs/query-lowering.md	ast.rs:248	ambiguous_basename
 docs/query-lowering.md	ast.rs:251	ambiguous_basename
 docs/query-lowering.md	ast.rs:939	ambiguous_basename
-docs/query-lowering.md	crates/pulsus-read/src/logql/plan.rs:1659	blank_target_line
 docs/query-lowering.md	crates/pulsus-read/src/traces/metrics_sql.rs:627	blank_target_line
 docs/query-lowering.md	crates/pulsus-read/src/traces/search_sql.rs:596	ambiguous_basename
 docs/query-lowering.md	exec.rs:125	ambiguous_basename
@@ -51,7 +50,7 @@ docs/query-lowering.md	plan.rs:4084	ambiguous_basename
 docs/query-lowering.md	search_plan.rs:1061	ambiguous_basename
 docs/query-lowering.md	search_plan.rs:1204	blank_target_line
 docs/query-lowering.md	search_plan.rs:1894	blank_target_line
-docs/query-lowering.md	sql.rs:762	ambiguous_basename
+docs/query-lowering.md	sql.rs:768	ambiguous_basename
 docs/query-lowering.md	traces/compile.rs:181	ambiguous_basename
 docs/query-lowering.md	traces/compile.rs:185	ambiguous_basename
 docs/query-to-sql.md	exec.rs:120	ambiguous_basename
@@ -67,7 +66,6 @@ docs/query-to-sql.md	plan.rs:1647	ambiguous_basename
 docs/query-to-sql.md	plan.rs:1648-1650	ambiguous_basename
 docs/query-to-sql.md	plan.rs:1679-1685	ambiguous_basename
 docs/query-to-sql.md	plan.rs:1720	ambiguous_basename
-docs/query-to-sql.md	plan.rs:1741	ambiguous_basename
 docs/query-to-sql.md	plan.rs:1742	ambiguous_basename
 docs/query-to-sql.md	plan.rs:1744	ambiguous_basename
 docs/query-to-sql.md	plan.rs:1745	ambiguous_basename
@@ -87,7 +85,6 @@ docs/query-to-sql.md	query_lowering_doc_gate.rs:545	ambiguous_basename
 docs/query-to-sql.md	search_plan.rs:2140	ambiguous_basename
 docs/query-to-sql.md	search_plan.rs:2146	ambiguous_basename
 docs/query-to-sql.md	sql.rs:105	ambiguous_basename
-docs/query-to-sql.md	sql.rs:111	ambiguous_basename
 docs/query-to-sql.md	sql.rs:1247	ambiguous_basename
 docs/query-to-sql.md	sql.rs:1296	ambiguous_basename
 docs/query-to-sql.md	sql.rs:1317-1322	ambiguous_basename
@@ -97,7 +94,6 @@ docs/query-to-sql.md	sql.rs:1395	ambiguous_basename
 docs/query-to-sql.md	sql.rs:629	ambiguous_basename
 docs/query-to-sql.md	sql.rs:742	ambiguous_basename
 docs/query-to-sql.md	sql.rs:762	ambiguous_basename
-docs/query-to-sql.md	sql.rs:788	ambiguous_basename
 docs/query-to-sql.md	sql.rs:789	ambiguous_basename
 docs/query-to-sql.md	sql.rs:829	ambiguous_basename
 docs/query-to-sql.md	sql.rs:877	ambiguous_basename

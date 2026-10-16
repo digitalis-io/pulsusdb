@@ -129,6 +129,8 @@ struct MetricSampleRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 struct LogSampleRow {
+    /// The tenant (issue #653): the empty tenant's rows.
+    org_id: String,
     service: String,
     fingerprint: u128,
     timestamp_ns: i64,
@@ -151,6 +153,8 @@ struct DescribeRow {
 /// explicit column list reads back the empty-string default).
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 struct LegacyLogSampleRow {
+    /// The tenant (issue #653): the empty tenant's rows.
+    org_id: String,
     service: String,
     fingerprint: u128,
     timestamp_ns: i64,
@@ -245,6 +249,7 @@ async fn run_init_creates_every_m0_table_and_mv() {
         .expect("insert metric_samples");
 
     let log_rows = vec![LogSampleRow {
+        org_id: String::new(),
         service: "checkout".to_string(),
         fingerprint: 12345,
         timestamp_ns,
@@ -270,8 +275,8 @@ async fn run_init_creates_every_m0_table_and_mv() {
     let mut ls = client
         .query_stream::<LogSampleRow>(
             &format!(
-                "SELECT service, fingerprint, timestamp_ns, severity, body, structured_metadata \
-                 FROM {db}.log_samples"
+                "SELECT org_id, service, fingerprint, timestamp_ns, severity, body, \
+                 structured_metadata FROM {db}.log_samples"
             ),
             &QuerySettings::new(),
         )
@@ -357,6 +362,7 @@ async fn structured_metadata_column_is_additive_and_backward_compatible() {
     // list (no structured_metadata) reads back the empty-string default —
     // proving existing/old-writer data needs no migration.
     let legacy = vec![LegacyLogSampleRow {
+        org_id: String::new(),
         service: "legacy".to_string(),
         fingerprint: 111,
         timestamp_ns,
@@ -370,6 +376,7 @@ async fn structured_metadata_column_is_additive_and_backward_compatible() {
 
     // A row WITH structured metadata (the #97 writer shape) round-trips.
     let with_sm = vec![LogSampleRow {
+        org_id: String::new(),
         service: "modern".to_string(),
         fingerprint: 222,
         timestamp_ns,
@@ -385,8 +392,8 @@ async fn structured_metadata_column_is_additive_and_backward_compatible() {
     let mut ls = client
         .query_stream::<LogSampleRow>(
             &format!(
-                "SELECT service, fingerprint, timestamp_ns, severity, body, structured_metadata \
-                 FROM {db}.log_samples ORDER BY fingerprint"
+                "SELECT org_id, service, fingerprint, timestamp_ns, severity, body, \
+                 structured_metadata FROM {db}.log_samples ORDER BY fingerprint"
             ),
             &QuerySettings::new(),
         )
@@ -1583,6 +1590,7 @@ async fn the_lookup_keeps_first_and_last_seen() {
 /// the SERVER's, read back — `Delta(8)` and `Gorilla(8)` carry their byte
 /// width where the DDL writes them bare.
 const LOG_LANDING_COLUMNS: &[(&str, &str, &str)] = &[
+    ("org_id", "LowCardinality(String)", ""),
     ("event_id", "UUID", ""),
     ("received_ms", "Int64", "CODEC(DoubleDelta, ZSTD(1))"),
     ("kind", "UInt8", "CODEC(ZSTD(1))"),
@@ -1636,7 +1644,7 @@ async fn log_landing_and_its_views_exist_after_init() {
         assert_eq!(got.compression_codec, codec, "{name}'s codec");
     }
     assert_eq!(
-        seen[0].default_expression, "generateUUIDv7()",
+        seen[1].default_expression, "generateUUIDv7()",
         "the landed event's identity is the server's, not the writer's"
     );
 
@@ -1644,7 +1652,7 @@ async fn log_landing_and_its_views_exist_after_init() {
     for want in [
         "ENGINE = MergeTree",
         "PARTITION BY toStartOfHour(fromUnixTimestamp64Milli(received_ms))",
-        "ORDER BY (kind, service, fingerprint, timestamp_ns)",
+        "ORDER BY (org_id, kind, service, fingerprint, timestamp_ns)",
         "ttl_only_drop_parts = 1",
         "merge_with_ttl_timeout = 3600",
     ] {
@@ -1696,6 +1704,7 @@ async fn an_existing_log_landing_table_is_adopted_by_a_rerun() {
 
     let create = format!(
         "CREATE TABLE IF NOT EXISTS {db}.log_landing (
+             org_id               LowCardinality(String),
              event_id             UUID DEFAULT generateUUIDv7(),
              received_ms          Int64  CODEC(DoubleDelta, ZSTD(1)),
              kind                 UInt8  CODEC(ZSTD(1)),
@@ -1712,7 +1721,7 @@ async fn an_existing_log_landing_table_is_adopted_by_a_rerun() {
              pattern_count        UInt64  CODEC(T64, ZSTD(1))
          ) ENGINE = MergeTree
          PARTITION BY toStartOfHour(fromUnixTimestamp64Milli(received_ms))
-         ORDER BY (kind, service, fingerprint, timestamp_ns)
+         ORDER BY (org_id, kind, service, fingerprint, timestamp_ns)
          SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600;"
     );
     client

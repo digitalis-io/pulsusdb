@@ -25,9 +25,13 @@ use std::sync::Arc;
 
 use pulsus_model::Fingerprint;
 
-/// `(fingerprint, month-as-days-since-epoch)` — the same key
+/// `(tenant, fingerprint, month-as-days-since-epoch)` — the same key
 /// `docs/schemas.md §3.1`'s monthly `log_streams` partitions dedup on.
-pub type StreamKey = (Fingerprint, u16);
+///
+/// Issue #653: the leading `Arc<str>` is the push's tenant. Without it
+/// tenant B's first registration of a stream tenant A registered this month
+/// would be skipped, and B's stage 2 would then find no row.
+pub type StreamKey = (Arc<str>, Fingerprint, u16);
 /// `LruSet<StreamKey>` — unchanged behavior/name from before issue #26's
 /// generalization; every existing `log_streams` callsite keeps compiling
 /// against this alias.
@@ -304,13 +308,13 @@ mod tests {
 
     #[test]
     fn miss_on_an_empty_cache() {
-        let mut lru: LruSet<StreamKey> = LruSet::new(10);
+        let mut lru: LruSet<(Fingerprint, u16)> = LruSet::new(10);
         assert!(!lru.contains(&(Fingerprint::from_raw(1), 1)));
     }
 
     #[test]
     fn hit_after_insert() {
-        let mut lru: LruSet<StreamKey> = LruSet::new(10);
+        let mut lru: LruSet<(Fingerprint, u16)> = LruSet::new(10);
         lru.insert((Fingerprint::from_raw(1), 1));
         assert!(lru.contains(&(Fingerprint::from_raw(1), 1)));
         assert_eq!(lru.len(), 1);
@@ -318,7 +322,7 @@ mod tests {
 
     #[test]
     fn distinct_months_for_the_same_fingerprint_are_distinct_keys() {
-        let mut lru: LruSet<StreamKey> = LruSet::new(10);
+        let mut lru: LruSet<(Fingerprint, u16)> = LruSet::new(10);
         lru.insert((Fingerprint::from_raw(1), 1));
         assert!(lru.contains(&(Fingerprint::from_raw(1), 1)));
         assert!(!lru.contains(&(Fingerprint::from_raw(1), 2)));
@@ -326,7 +330,7 @@ mod tests {
 
     #[test]
     fn re_inserting_a_known_key_does_not_grow_the_cache() {
-        let mut lru: LruSet<StreamKey> = LruSet::new(10);
+        let mut lru: LruSet<(Fingerprint, u16)> = LruSet::new(10);
         lru.insert((Fingerprint::from_raw(1), 1));
         lru.insert((Fingerprint::from_raw(1), 1));
         assert_eq!(lru.len(), 1);
@@ -334,7 +338,7 @@ mod tests {
 
     #[test]
     fn evicts_the_least_recently_used_entry_at_capacity() {
-        let mut lru: LruSet<StreamKey> = LruSet::new(2);
+        let mut lru: LruSet<(Fingerprint, u16)> = LruSet::new(2);
         lru.insert((Fingerprint::from_raw(1), 1));
         lru.insert((Fingerprint::from_raw(2), 1));
         // Touch (1,1) so (2,1) becomes the LRU victim.
@@ -348,7 +352,7 @@ mod tests {
 
     #[test]
     fn capacity_never_exceeded_across_many_inserts() {
-        let mut lru: LruSet<StreamKey> = LruSet::new(100);
+        let mut lru: LruSet<(Fingerprint, u16)> = LruSet::new(100);
         for i in 0..1_000u64 {
             lru.insert((Fingerprint::from_raw(u128::from(i)), 0));
         }
@@ -357,7 +361,7 @@ mod tests {
 
     #[test]
     fn zero_capacity_is_floored_to_one() {
-        let mut lru: LruSet<StreamKey> = LruSet::new(0);
+        let mut lru: LruSet<(Fingerprint, u16)> = LruSet::new(0);
         lru.insert((Fingerprint::from_raw(1), 1));
         assert!(lru.contains(&(Fingerprint::from_raw(1), 1)));
         assert_eq!(lru.len(), 1);
@@ -390,13 +394,13 @@ mod tests {
 
     #[test]
     fn insert_evicting_reports_no_eviction_under_capacity() {
-        let mut lru: LruSet<StreamKey> = LruSet::new(10);
+        let mut lru: LruSet<(Fingerprint, u16)> = LruSet::new(10);
         assert_eq!(lru.insert_evicting((Fingerprint::from_raw(1), 1)), None);
     }
 
     #[test]
     fn insert_evicting_reports_the_evicted_key_at_capacity() {
-        let mut lru: LruSet<StreamKey> = LruSet::new(1);
+        let mut lru: LruSet<(Fingerprint, u16)> = LruSet::new(1);
         assert_eq!(lru.insert_evicting((Fingerprint::from_raw(1), 1)), None);
         assert_eq!(
             lru.insert_evicting((Fingerprint::from_raw(2), 1)),

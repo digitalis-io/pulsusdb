@@ -56,6 +56,11 @@ const ONE_SECOND_NS: u64 = 1_000_000_000;
 /// reason).
 #[derive(Debug, Error)]
 pub(crate) enum ParamError {
+    /// Issue #653: the `X-Scope-OrgID` header is not a tenant
+    /// (`pulsus_model::Tenant::from_header`'s rule). Read before any
+    /// parameter, so it is the answer whatever else the request gets wrong.
+    #[error("invalid X-Scope-OrgID")]
+    InvalidTenant,
     #[error("missing required parameter 'query'")]
     MissingQuery,
     #[error(

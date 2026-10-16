@@ -106,7 +106,11 @@ const WINDOW: TimeWindow = TimeWindow {
 /// it, so one of them is enough to read its output.
 #[test]
 fn site_1_fp_list_renders_the_exact_call_form() {
-    let sql = sql::stage2("log_streams", &literals());
+    let sql = sql::stage2(
+        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+        "log_streams",
+        &literals(),
+    );
     assert_every_boundary_value_is_an_exact_call("fp_list (through stage2)", &sql);
 }
 
@@ -118,6 +122,7 @@ fn site_1_fp_list_renders_the_exact_call_form() {
 fn site_2_stage3_keyset_renders_the_exact_call_form_in_its_tuple() {
     for value in BOUNDARY {
         let sql = sql::stage3_keyset_with_rx(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
             "log_samples",
             &[predicate::literal("checkout")],
             &literals(),

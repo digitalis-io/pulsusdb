@@ -97,6 +97,9 @@ fn test_ctx(db: &str) -> SchemaParams {
 
 fn plan_ctx(db: &str) -> PlanCtx<'_> {
     PlanCtx {
+        tenant: Box::leak(Box::new(
+            pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+        )),
         db,
         streams_idx: "log_streams_idx",
         streams: "log_streams",
@@ -159,6 +162,8 @@ fn splitmix64(mut x: u64) -> u64 {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedSampleRow {
+    /// The tenant (issue #653): the empty tenant's rows.
+    org_id: String,
     service: String,
     fingerprint: u128,
     timestamp_ns: i64,
@@ -228,6 +233,7 @@ async fn seed_corpus(db: &str) -> (ChClient, i64) {
             )
         };
         rows.push(SeedSampleRow {
+            org_id: String::new(),
             service: SERVICE.to_string(),
             fingerprint: u128::from(FP_CORPUS),
             timestamp_ns,
@@ -496,6 +502,7 @@ async fn stage3_narrow_window_read_rows_are_index_confined_not_a_full_scan() {
     };
     let sp = streams_plan(&format!(r#"{{service_name="{SERVICE}"}}"#), &params, db);
     let sql = sql::stage3(
+        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
         &format!("{db}.log_samples"),
         &[literal(SERVICE)],
         &[Fingerprint::from_raw(u128::from(FP_CORPUS)).sql_literal()],
@@ -556,6 +563,7 @@ async fn body_search_skip_index_prunes_most_granules() {
         db,
     );
     let sql = sql::stage3(
+        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
         &format!("{db}.log_samples"),
         &[literal(SERVICE)],
         &[Fingerprint::from_raw(u128::from(FP_CORPUS)).sql_literal()],
@@ -806,7 +814,11 @@ async fn fetch_until_limit_pages_issue_strictly_decrementing_positive_scan_caps(
     // tie-correct OFFSET, defeat `optimize_read_in_order` so the LIMIT does
     // not short-circuit) fits, but the loop must abort on a LATER page.
     let budget: u64 = 24 * 1024 * 1024;
-    let engine = LogQlEngine::new(data_client(&run_db).await, engine_config(&run_db, budget));
+    let engine = LogQlEngine::new(
+        data_client(&run_db).await,
+        engine_config(&run_db, budget),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    );
 
     // The `read_bytes`-accuracy mechanism the per-page cap accounting below
     // relies on: every keyset PAGE must run with `wait_end_of_query = 1`,
@@ -919,7 +931,11 @@ async fn fetch_until_limit_zero_budget_terminates_partial_without_unlimited_page
     // `spent >= budget` guard deterministically — a mid-paging exact hit is
     // data-dependent and not reproducible).
     let (admin, run_db, ts_ns) = fresh_run_db().await;
-    let engine = LogQlEngine::new(data_client(&run_db).await, engine_config(&run_db, 0));
+    let engine = LogQlEngine::new(
+        data_client(&run_db).await,
+        engine_config(&run_db, 0),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    );
     let params = full_window_params(ts_ns, 5_000);
     let expr = parse(&dropping_query()).expect("parse");
 
@@ -1027,6 +1043,7 @@ async fn setup_detected_corpus(db: &str) -> (ChClient, i64) {
             )
         };
         rows.push(SeedSampleRow {
+            org_id: String::new(),
             service: SERVICE.to_string(),
             fingerprint: u128::from(FP_CORPUS),
             timestamp_ns,
@@ -1062,6 +1079,7 @@ async fn detected_fields_sparse_filter_finds_late_matches_window_exhausted() {
     let engine = LogQlEngine::new(
         data_client(db).await,
         engine_config(db, 50 * 1024 * 1024 * 1024),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
     );
     let expr = parse(&format!(
         r#"{{service_name="{SERVICE}"}} | json | level="rare""#
@@ -1111,7 +1129,11 @@ async fn detected_fields_budget_exhaustion_mid_paging_returns_truncated() {
     // scan — the keyset ORDER BY defeats optimize_read_in_order, so the
     // LIMIT does not short-circuit) fits, but page 2's remaining cap is
     // smaller than its ~whole-remaining-window scan ⇒ mid-paging abort.
-    let engine = LogQlEngine::new(data_client(db).await, engine_config(db, 8 * 1024 * 1024));
+    let engine = LogQlEngine::new(
+        data_client(db).await,
+        engine_config(db, 8 * 1024 * 1024),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    );
     let expr = parse(&format!(
         r#"{{service_name="{SERVICE}"}} | json | level="rare""#
     ))
@@ -1141,7 +1163,11 @@ async fn detected_fields_first_page_over_budget_stays_query_too_broad() {
     let (client, ts_ns) = setup_detected_corpus(db).await;
     drop(client);
 
-    let engine = LogQlEngine::new(data_client(db).await, engine_config(db, 64 * 1024));
+    let engine = LogQlEngine::new(
+        data_client(db).await,
+        engine_config(db, 64 * 1024),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    );
     let expr = parse(&format!(
         r#"{{service_name="{SERVICE}"}} | json | level="rare""#
     ))
@@ -1167,7 +1193,11 @@ async fn fetch_until_limit_first_page_over_budget_stays_query_too_broad() {
     // page overflows the FULL budget ⇒ a genuinely too-broad query ⇒
     // QueryTooBroad (preserved from the pre-#90 single-scan path), never a
     // silent/partial result.
-    let engine = LogQlEngine::new(data_client(db).await, engine_config(db, 64 * 1024));
+    let engine = LogQlEngine::new(
+        data_client(db).await,
+        engine_config(db, 64 * 1024),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    );
     let params = full_window_params(ts_ns, 5_000);
     let expr = parse(&dropping_query()).expect("parse");
 
@@ -1325,6 +1355,7 @@ async fn detected_labels_fan_in_is_one_row_per_key_at_any_cardinality() {
             fingerprint: pulsus_model::Fingerprint,
         }
         let sql = sql::active_fingerprints(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
             rollup,
             None,
             sql::TimeWindow { start_ns, end_ns },
@@ -1350,6 +1381,7 @@ async fn detected_labels_fan_in_is_one_row_per_key_at_any_cardinality() {
         // production issues.
         let active = active_set(&client, &format!("{db}.log_metrics_5s"), start_ns, end_ns).await;
         let sql = sql::detected_labels(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
             &format!("{db}.log_streams_idx"),
             &[month_literal(month_year(month), month_month(month))],
             &active,
@@ -1642,7 +1674,11 @@ async fn every_logql_engine_query_carries_the_memory_ceiling() {
     // engine query can hide behind it.
     let client = data_client(&run_db).await;
     let marker = query_log_marker(&admin).await;
-    let engine = LogQlEngine::new(client, config);
+    let engine = LogQlEngine::new(
+        client,
+        config,
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    );
 
     let bounds = pulsus_read::logql::TimeBounds {
         start_ns: ts_ns - 3_600_000_000_000,
@@ -1757,7 +1793,11 @@ async fn a_no_match_scoped_discovery_request_issues_stage_one_and_no_stage_two()
     let (admin, run_db, ts_ns) = fresh_run_db().await;
     let config = engine_config(&run_db, 50 * 1024 * 1024 * 1024);
     let client = data_client(&run_db).await;
-    let engine = LogQlEngine::new(client, config);
+    let engine = LogQlEngine::new(
+        client,
+        config,
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    );
     let bounds = pulsus_read::logql::TimeBounds {
         start_ns: ts_ns - 3_600_000_000_000,
         end_ns: ts_ns + 3_600_000_000_000,
@@ -2731,6 +2771,8 @@ type AnswerSeries = (Vec<(String, String)>, Vec<(i64, u64)>);
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct BucketedSeedRow {
+    /// The tenant (issue #653): the empty tenant's rows.
+    org_id: String,
     service: String,
     fingerprint: u128,
     timestamp_ns: i64,
@@ -2818,6 +2860,7 @@ async fn seed_bucketed_corpus() -> (ChClient, String, i64) {
     }
 
     let row = |fp: u64, ts: i64, body: &str, sm: &str| BucketedSeedRow {
+        org_id: String::new(),
         service: service.to_string(),
         fingerprint: u128::from(fp),
         timestamp_ns: ts,
@@ -2901,7 +2944,11 @@ async fn a_bucketed_range_read_answers_exactly_what_the_client_path_answers() {
         "the control query must stay on the client path, or this compares one path with itself"
     );
 
-    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+    let engine = LogQlEngine::new(
+        data_client(&db).await,
+        engine_config(&db, 64 * 1024 * 1024),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    );
     let answer = |query: String| {
         let engine = &engine;
         let params = &params;
@@ -2996,7 +3043,11 @@ async fn an_over_cap_grid_is_refused_on_the_bucketed_path_as_on_the_client_path(
         limit: 100,
         direction: Direction::Backward,
     };
-    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+    let engine = LogQlEngine::new(
+        data_client(&db).await,
+        engine_config(&db, 64 * 1024 * 1024),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    );
     for (query, path) in [
         (
             format!(r#"count_over_time({{service_name="{service}"}}[1s])"#),
@@ -3070,7 +3121,11 @@ async fn the_explain_seam_reports_the_bucketed_statement_the_reader_issues() {
         r#"count_over_time({{service_name="{service}"}}[1m])"#
     ))
     .expect("parse");
-    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+    let engine = LogQlEngine::new(
+        data_client(&db).await,
+        engine_config(&db, 64 * 1024 * 1024),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    );
 
     let explained = engine.explain(&expr, &params).await.expect("explain");
     let reported = explained
@@ -3194,6 +3249,7 @@ async fn the_sliding_statement_is_the_window_definition_at_every_range_and_step(
                 "x".repeat(1 + (next() % 40) as usize)
             };
             rows.push(BucketedSeedRow {
+                org_id: String::new(),
                 service: service.to_string(),
                 fingerprint: fps[(next() % 3) as usize],
                 timestamp_ns: point + d,
@@ -3247,6 +3303,7 @@ async fn the_sliding_statement_is_the_window_definition_at_every_range_and_step(
         for shape in [sql::MetricShape::RawCount, sql::MetricShape::RawBytes] {
             let is_bytes = shape == sql::MetricShape::RawBytes;
             let statement = sql::metric_range_sliding(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
                 sql::MetricSource::new("log_samples", shape),
                 &[literal(service)],
                 &fp_literals,
@@ -3460,7 +3517,11 @@ async fn a_range_unequal_to_the_step_is_counted_in_the_database_and_answers_toda
         "the control query must stay on today's route"
     );
 
-    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+    let engine = LogQlEngine::new(
+        data_client(&db).await,
+        engine_config(&db, 64 * 1024 * 1024),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    );
 
     // (ii) every reducer, both ranges: the lowered answer is the control's.
     let mut answers = std::collections::HashMap::new();
@@ -3550,12 +3611,16 @@ async fn a_bucketed_statement_that_fails_for_memory_is_answered_by_todays_route(
     const STEP: i64 = 60_000_000_000;
     let (admin, db, t) = seed_bucketed_corpus().await;
     let comment = format!("c624-memory-{}", uuid::Uuid::new_v4().simple());
-    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024))
-        .with_key_route_test_hooks(pulsus_read::logql::exec::KeyRouteTestHooks {
-            bucketed_statement_max_memory_bytes: Some(1),
-            ..Default::default()
-        })
-        .with_query_log_comment(comment.clone());
+    let engine = LogQlEngine::new(
+        data_client(&db).await,
+        engine_config(&db, 64 * 1024 * 1024),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    )
+    .with_key_route_test_hooks(pulsus_read::logql::exec::KeyRouteTestHooks {
+        bucketed_statement_max_memory_bytes: Some(1),
+        ..Default::default()
+    })
+    .with_query_log_comment(comment.clone());
     let params = QueryParams {
         spec: QuerySpec::Range {
             start_ns: t,
@@ -3667,6 +3732,7 @@ async fn seed_cap_corpus(streams: u64) -> (ChClient, String, i64) {
     land_seeded_streams(&client, &db).await;
     let rows: Vec<BucketedSeedRow> = (0..streams)
         .map(|i| BucketedSeedRow {
+            org_id: String::new(),
             service: "c624cap".to_string(),
             fingerprint: u128::from(6_240_000 + i),
             timestamp_ns: t + 100_000_000_000,
@@ -3706,7 +3772,11 @@ async fn a_reducing_aggregation_over_sparse_series_at_range_equal_to_step_is_ans
         limit: 100,
         direction: Direction::Backward,
     };
-    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+    let engine = LogQlEngine::new(
+        data_client(&db).await,
+        engine_config(&db, 64 * 1024 * 1024),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    );
     let at = t + 100_000_000_000;
     let sel = r#"{service_name=~".+"}"#;
     let by_service = vec![("service_name".to_string(), "c624cap".to_string())];
@@ -3786,8 +3856,12 @@ async fn run_624(
     query: &str,
     params: &QueryParams,
 ) -> Result<Vec<AnswerSeries>, ReadError> {
-    let mut engine = LogQlEngine::new(data_client(db).await, engine_config(db, 64 * 1024 * 1024))
-        .with_key_route_test_hooks(hooks);
+    let mut engine = LogQlEngine::new(
+        data_client(db).await,
+        engine_config(db, 64 * 1024 * 1024),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    )
+    .with_key_route_test_hooks(hooks);
     if let Some(c) = comment {
         engine = engine.with_query_log_comment(c.to_string());
     }
@@ -4866,6 +4940,8 @@ async fn a_row_no_window_holds_neither_fails_nor_counts() {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct UnwrapSeedRow {
+    /// The tenant (issue #653): the empty tenant's rows.
+    org_id: String,
     service: String,
     fingerprint: u128,
     timestamp_ns: i64,
@@ -4883,6 +4959,8 @@ struct UnwrapSeedRow {
 /// chunk gives `log_samples` one part per chunk, through the view.
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct UnwrapLandingRow {
+    /// The tenant (issue #653): the empty tenant's rows.
+    org_id: String,
     received_ms: i64,
     kind: u8,
     service: String,
@@ -4901,6 +4979,7 @@ struct UnwrapLandingRow {
 fn unwrap_landing_rows(received_ms: i64, rows: &[UnwrapSeedRow]) -> Vec<UnwrapLandingRow> {
     rows.iter()
         .map(|r| UnwrapLandingRow {
+            org_id: String::new(),
             received_ms,
             kind: 0,
             service: r.service.clone(),
@@ -5028,6 +5107,7 @@ async fn the_database_sum_is_not_the_evaluators_order_but_stays_inside_the_bound
             .iter()
             .enumerate()
             .map(|(i, v)| UnwrapSeedRow {
+                org_id: String::new(),
                 service: "w4".to_string(),
                 fingerprint: u128::from(fp),
                 timestamp_ns: t0 + i as i64,
@@ -5293,6 +5373,7 @@ fn unwrap_rows(fp: u64, t0: i64, values: &[f64]) -> Vec<UnwrapSeedRow> {
         .iter()
         .enumerate()
         .map(|(i, v)| UnwrapSeedRow {
+            org_id: String::new(),
             service: "w4".to_string(),
             fingerprint: u128::from(fp),
             timestamp_ns: t0 + i as i64,
@@ -5657,6 +5738,7 @@ async fn the_spread_reducers_are_lowered_and_answer_the_evaluators_value() {
         .iter()
         .enumerate()
         .map(|(i, d)| BucketedSeedRow {
+            org_id: String::new(),
             service: service.to_string(),
             fingerprint: 301,
             timestamp_ns: t - 30_000_000_000 + i as i64,
@@ -5690,7 +5772,11 @@ async fn the_spread_reducers_are_lowered_and_answer_the_evaluators_value() {
         limit: 100,
         direction: Direction::Backward,
     };
-    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+    let engine = LogQlEngine::new(
+        data_client(&db).await,
+        engine_config(&db, 64 * 1024 * 1024),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    );
 
     // The evaluator's own answers on this corpus, which are also the
     // reference's: the variance of five values 0, 2, 4, 8, 16 above a
@@ -5838,6 +5924,7 @@ async fn seed_group_key_cases(
         }
         for (j, (body, sm)) in case.entries.iter().enumerate() {
             rows.push(BucketedSeedRow {
+                org_id: String::new(),
                 service: case.id.clone(),
                 fingerprint: u128::from(fp),
                 timestamp_ns: t - 50_000_000_000 + j as i64,
@@ -6001,6 +6088,7 @@ async fn check_group_key_cases(stem: &str, fp_base: u64, cases: &[GroupKeyCase])
     let engine = LogQlEngine::new(
         data_client(&db).await,
         engine_config(&db, 50 * 1024 * 1024 * 1024),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
     );
     let mut wrong = Vec::new();
     let mut planned = 0usize;
@@ -6209,6 +6297,7 @@ async fn reserved_names_answer_as_the_reference_on_every_metric_route() {
             .expect("seed log_streams_idx");
         land_seeded_streams(&client, &db).await;
         rows.push(BucketedSeedRow {
+            org_id: String::new(),
             service: service.to_string(),
             fingerprint: u128::from(fp),
             timestamp_ns: t - 10_000_000_000,
@@ -6253,7 +6342,11 @@ async fn reserved_names_answer_as_the_reference_on_every_metric_route() {
         Plan::Metric(_) => Route::Lowered,
         _ => panic!("{query}: a metric plan"),
     };
-    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+    let engine = LogQlEngine::new(
+        data_client(&db).await,
+        engine_config(&db, 64 * 1024 * 1024),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    );
     let render = |labels: &[(String, String)]| {
         let mut l = labels.to_vec();
         l.sort();
@@ -6717,6 +6810,7 @@ async fn every_refusal_lands_as_the_table_says() {
             LogQlEngine::new(
                 data_client_with_deadline(&db, REFUSAL_TABLE_DEADLINE).await,
                 engine_config(&db, budget),
+                pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
             )
         }
     };
@@ -6937,7 +7031,7 @@ const SELECTION_GOLDEN: &str = "crates/pulsus-read/tests/golden/logql_selection_
 /// alone leaves this constant standing and B2 fails, so the author has to
 /// move a source line in the same change and the diff carries both.
 const PINNED_SELECTION_STATEMENTS: &str =
-    "138cac82947c253a716e254afd57ca098ca8704632a5f52370a12d170bb5238a";
+    "6b4ec3bca0f3784f83aebc61448f0f394e3d2568fbdafc94e9371d5fd4380715";
 
 /// One grid point, on a step boundary: 2030-01-01T00:00:00Z.
 ///
@@ -7499,6 +7593,7 @@ async fn seed_selection_corpus() -> (ChClient, String) {
         land_seeded_streams(&client, &db).await;
         for i in 0..count {
             rows.push(BucketedSeedRow {
+                org_id: String::new(),
                 service: service.to_string(),
                 fingerprint: u128::from(fp),
                 // Inside the one window `(T - 60s, T]`, and every body is
@@ -7543,7 +7638,11 @@ struct SelectionRun {
 /// take its expected value from the engine under test, and a drift
 /// applied to both moves them together.
 async fn observed_selection_blocks(db: &str) -> Vec<(SelectionBlock, Vec<SelectionRun>)> {
-    let engine = LogQlEngine::new(data_client(db).await, engine_config(db, 64 * 1024 * 1024));
+    let engine = LogQlEngine::new(
+        data_client(db).await,
+        engine_config(db, 64 * 1024 * 1024),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    );
     let mut out = Vec::new();
     for (route, base, params, wrappings) in selection_routes() {
         let mut runs: Vec<SelectionRun> = Vec::new();
@@ -7816,7 +7915,11 @@ async fn the_selection_operators_add_no_clause_to_any_statement() {
 
     // The one refusal in the family: `approx_topk` on a RANGE query,
     // before any statement is issued.
-    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+    let engine = LogQlEngine::new(
+        data_client(&db).await,
+        engine_config(&db, 64 * 1024 * 1024),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    );
     let range = QueryParams {
         spec: QuerySpec::Range {
             start_ns: SEL_AT_NS,
@@ -9088,8 +9191,12 @@ async fn a_logql_regex_answers_the_same_on_every_route() {
         let comment = comment.to_string();
         let db = db.clone();
         async move {
-            LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024))
-                .with_query_log_comment(comment)
+            LogQlEngine::new(
+                data_client(&db).await,
+                engine_config(&db, 64 * 1024 * 1024),
+                pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            )
+            .with_query_log_comment(comment)
         }
     };
     let mut database_routes: Vec<(String, &str)> = Vec::new();
@@ -9479,8 +9586,12 @@ async fn two_regexp_stages_read_two_columns() {
     let stages = r#"| regexp "(?P<a>[a-z]+)" | regexp "(?P<b>[0-9]+)""#;
 
     let log_comment = format!("c624p3t14-{}", uuid::Uuid::new_v4().simple());
-    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024))
-        .with_query_log_comment(log_comment.clone());
+    let engine = LogQlEngine::new(
+        data_client(&db).await,
+        engine_config(&db, 64 * 1024 * 1024),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    )
+    .with_query_log_comment(log_comment.clone());
     let logs = QueryParams {
         spec: QuerySpec::Range {
             start_ns: t,
@@ -9570,8 +9681,12 @@ async fn an_instant_regexp_count_reads_captures_from_the_database() {
     skip_unless_live!();
     let (admin, db, t) = seed_u_624p3().await;
     let comment = format!("c624p3t15-{}", uuid::Uuid::new_v4().simple());
-    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024))
-        .with_query_log_comment(comment.clone());
+    let engine = LogQlEngine::new(
+        data_client(&db).await,
+        engine_config(&db, 64 * 1024 * 1024),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    )
+    .with_query_log_comment(comment.clone());
     let params = QueryParams {
         spec: QuerySpec::Instant {
             at_ns: t + 60_000_000_000,
@@ -9743,8 +9858,12 @@ async fn a_brace_pattern_answers_on_every_database_route() {
         let want = vec![literal_text.to_string()];
 
         let comment = format!("c624p3t18-{}", uuid::Uuid::new_v4().simple());
-        let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024))
-            .with_query_log_comment(comment.clone());
+        let engine = LogQlEngine::new(
+            data_client(&db).await,
+            engine_config(&db, 64 * 1024 * 1024),
+            pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+        )
+        .with_query_log_comment(comment.clone());
         let query = format!(r#"{{s="br"}} {stage} | x != """#);
         let (result, _) = engine
             .query(&parse(&query).expect("parse"), &logs)
@@ -9854,6 +9973,7 @@ async fn a_line_filter_leaves_the_next_count_intact() {
     let engine = LogQlEngine::new(
         data_client(&db).await,
         engine_config(&db, 64 * 1024 * 1024 * 1024),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
     );
     let logs = QueryParams {
         spec: QuerySpec::Range {
@@ -9918,6 +10038,7 @@ async fn every_body_predicate_statement_disables_the_text_index_direct_read() {
     let engine = LogQlEngine::new(
         data_client(&db).await,
         engine_config(&db, 64 * 1024 * 1024 * 1024),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
     )
     .with_query_log_comment(comment.clone());
     let range = QueryParams {
@@ -10438,6 +10559,7 @@ async fn a_rate_under_a_sum_divides_once_per_group() {
                     let mut engine = LogQlEngine::new(
                         data_client(&db).await,
                         engine_config(&db, 64 * 1024 * 1024),
+                        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
                     )
                     .with_key_route_test_hooks(hooks);
                     engine = engine.with_query_log_comment(comment.clone());
@@ -11008,8 +11130,12 @@ async fn a_partial_pattern_line_sets_its_prefix_on_every_route() {
         let comment = comment.to_string();
         let db = db.clone();
         async move {
-            LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024))
-                .with_query_log_comment(comment)
+            LogQlEngine::new(
+                data_client(&db).await,
+                engine_config(&db, 64 * 1024 * 1024),
+                pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            )
+            .with_query_log_comment(comment)
         }
     };
     let mut database_routes: Vec<(String, &str)> = Vec::new();
@@ -11278,8 +11404,11 @@ async fn an_absent_pattern_count_extracts_only_what_a_stage_reads() {
             }
         }
         for at in [120i64, 180] {
-            let engine =
-                LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+            let engine = LogQlEngine::new(
+                data_client(&db).await,
+                engine_config(&db, 64 * 1024 * 1024),
+                pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            );
             let instant = QueryParams {
                 spec: QuerySpec::Instant {
                     at_ns: t + at * sec,
@@ -11464,9 +11593,12 @@ async fn a_query_that_needs_no_labels_skips_the_parsers() {
                     Route10::Memory => hooks_624(false, None, Some(1)),
                     _ => hooks_624(false, None, None),
                 };
-                let mut engine =
-                    LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024))
-                        .with_key_route_test_hooks(hooks);
+                let mut engine = LogQlEngine::new(
+                    data_client(&db).await,
+                    engine_config(&db, 64 * 1024 * 1024),
+                    pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+                )
+                .with_key_route_test_hooks(hooks);
                 engine = engine.with_query_log_comment(comment.clone());
                 let params = if route == Route10::Instant {
                     &instant
@@ -11583,9 +11715,13 @@ async fn a_query_that_needs_no_labels_skips_the_parsers() {
             Route10::Memory => hooks_624(false, None, Some(1)),
             _ => hooks_624(false, None, None),
         };
-        let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024))
-            .with_key_route_test_hooks(hooks)
-            .with_query_log_comment(comment.clone());
+        let engine = LogQlEngine::new(
+            data_client(&db).await,
+            engine_config(&db, 64 * 1024 * 1024),
+            pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+        )
+        .with_key_route_test_hooks(hooks)
+        .with_query_log_comment(comment.clone());
         let params = if route == Route10::Instant {
             &instant
         } else {
@@ -11627,7 +11763,11 @@ async fn a_query_that_needs_no_labels_skips_the_parsers() {
     land_line_624(&admin, &db, 971, "t10v", t + 20 * sec, "z", "").await;
     let v_query = r#"variants(sum(bytes_over_time({s="t10v"} | pattern "<a> <_>" [1m])), sum by (a) (bytes_over_time({s="t10v"} | pattern "<a> <_>" [1m]))) of ({s="t10v"} [1m])"#;
     for params in [&range, &instant] {
-        let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+        let engine = LogQlEngine::new(
+            data_client(&db).await,
+            engine_config(&db, 64 * 1024 * 1024),
+            pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+        );
         let (result, _) = engine
             .query(&parse(v_query).expect("parse"), params)
             .await
@@ -11842,6 +11982,7 @@ async fn a_logfmt_count_answers_as_todays_route() {
             let engine = LogQlEngine::new(
                 data_client(db_r).await,
                 engine_config(db_r, 64 * 1024 * 1024),
+                pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
             )
             .with_key_route_test_hooks(hooks)
             .with_query_log_comment(comment.clone());
@@ -11976,9 +12117,13 @@ async fn a_targeted_logfmt_count_groups_only_on_the_fields_it_reads() {
     let mut comment = String::new();
     for todays in [true, false] {
         comment = format!("c624p3dt6-{}", uuid::Uuid::new_v4().simple());
-        let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024))
-            .with_key_route_test_hooks(hooks_624(todays, None, None))
-            .with_query_log_comment(comment.clone());
+        let engine = LogQlEngine::new(
+            data_client(&db).await,
+            engine_config(&db, 64 * 1024 * 1024),
+            pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+        )
+        .with_key_route_test_hooks(hooks_624(todays, None, None))
+        .with_query_log_comment(comment.clone());
         answers.push(answer_624p3d(
             &engine.query(&parse(query).expect("parse"), &range).await,
         ));
@@ -12252,12 +12397,20 @@ async fn a_filter_after_a_targeted_parser_returns_what_the_evaluator_returns() {
     let mut comments: Vec<(String, usize)> = Vec::new();
     for (i, (_, _, pushed, control, want, _)) in cases.iter().enumerate() {
         let comment = format!("c624d33-{}", uuid::Uuid::new_v4().simple());
-        let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024))
-            .with_query_log_comment(comment.clone());
+        let engine = LogQlEngine::new(
+            data_client(&db).await,
+            engine_config(&db, 64 * 1024 * 1024),
+            pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+        )
+        .with_query_log_comment(comment.clone());
         let q = format!(r#"{{s="d33k{i}"}} {pushed}"#);
         let got = lines(engine.query(&parse(&q).expect("parse"), &params).await, &q);
         let cq = format!(r#"{{s="d33k{i}"}} {control}"#);
-        let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+        let engine = LogQlEngine::new(
+            data_client(&db).await,
+            engine_config(&db, 64 * 1024 * 1024),
+            pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+        );
         let not_pushed = lines(
             engine.query(&parse(&cq).expect("parse"), &params).await,
             &cq,
@@ -12328,8 +12481,12 @@ async fn run_instant_624p4(
     query: &str,
     at_ns: i64,
 ) -> Result<InstantAnswer624p4, ReadError> {
-    let mut engine = LogQlEngine::new(data_client(db).await, engine_config(db, 64 * 1024 * 1024))
-        .with_key_route_test_hooks(hooks);
+    let mut engine = LogQlEngine::new(
+        data_client(db).await,
+        engine_config(db, 64 * 1024 * 1024),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    )
+    .with_key_route_test_hooks(hooks);
     if let Some(c) = comment {
         engine = engine.with_query_log_comment(c.to_string());
     }
@@ -14796,7 +14953,11 @@ async fn the_w4_statement_is_gone() {
         format!(r#"sum by (code) (sum_over_time({s} | json | unwrap latency [1m]))"#),
         format!(r#"avg_over_time({s} | json | unwrap latency [1m]) by (code)"#),
     ];
-    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+    let engine = LogQlEngine::new(
+        data_client(&db).await,
+        engine_config(&db, 64 * 1024 * 1024),
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+    );
     let params = grid_624p4(t + 60 * sec, t + 60 * sec);
     for q in &shapes {
         let (_, _, explain) = engine

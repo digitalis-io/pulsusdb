@@ -19,8 +19,9 @@ use crate::app::AppState;
 
 use super::encode;
 use super::error::ApiError;
-use super::handlers::{engine_for, parse_bounds_ordered, read_form_pairs};
+use super::handlers::{engine_for, parse_bounds_ordered, read_form_pairs, tenant_of};
 use super::params::{self, ParamError};
+use pulsus_model::Tenant;
 
 /// `X-Pulsus-Explain: 1` — same header contract as the query endpoints.
 fn wants_explain(headers: &HeaderMap) -> bool {
@@ -35,8 +36,12 @@ pub(crate) async fn stats(
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
+    let tenant = match tenant_of(&headers) {
+        Ok(tenant) => tenant,
+        Err(e) => return e.into_response(),
+    };
     let pairs = params::parse_pairs(raw.as_deref().unwrap_or(""));
-    match stats_impl(state, &headers, pairs).await {
+    match stats_impl(state, tenant, &headers, pairs).await {
         Ok(res) => res,
         Err(e) => e.into_response(),
     }
@@ -53,8 +58,12 @@ pub(crate) async fn stats_post(
     RawQuery(raw): RawQuery,
     body: Body,
 ) -> Response {
+    let tenant = match tenant_of(&headers) {
+        Ok(tenant) => tenant,
+        Err(e) => return e.into_response(),
+    };
     match read_form_pairs(&headers, raw.as_deref(), body).await {
-        Ok(pairs) => match stats_impl(state, &headers, pairs).await {
+        Ok(pairs) => match stats_impl(state, tenant, &headers, pairs).await {
             Ok(res) => res,
             Err(e) => e.into_response(),
         },
@@ -64,6 +73,7 @@ pub(crate) async fn stats_post(
 
 async fn stats_impl(
     state: AppState,
+    tenant: Tenant,
     headers: &HeaderMap,
     pairs: Vec<(String, String)>,
 ) -> Result<Response, ApiError> {
@@ -73,7 +83,7 @@ async fn stats_impl(
     let (start_ns, end_ns) = parse_bounds_ordered(&pairs)?;
     let bounds = TimeBounds { start_ns, end_ns };
 
-    let engine = engine_for(&state).await?;
+    let engine = engine_for(&state, tenant).await?;
     if wants_explain(headers) {
         let (stats, explain) = engine.stats_explained(&expr, bounds).await?;
         Ok(encode::stats_response(stats, Some(explain)))

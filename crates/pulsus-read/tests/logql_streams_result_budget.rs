@@ -269,6 +269,9 @@ fn the_four_refusing_paths_are_the_whole_branch_set() {
         direction: pulsus_read::logql::Direction::Backward,
     };
     let ctx = PlanCtx {
+        tenant: Box::leak(Box::new(
+            pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+        )),
         db: "pulsus",
         streams_idx: "log_streams_idx",
         streams: "log_streams",

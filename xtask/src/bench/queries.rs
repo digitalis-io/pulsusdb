@@ -1035,6 +1035,9 @@ impl Tables {
 
     fn plan_ctx<'a>(&'a self, db: &'a str) -> PlanCtx<'a> {
         PlanCtx {
+            tenant: Box::leak(Box::new(
+                pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            )),
             db,
             streams_idx: &self.streams_idx,
             streams: &self.streams,
@@ -1217,7 +1220,11 @@ async fn run_streams_once(
     }
 
     let s2_id = format!("{base_id}-s2");
-    let stage2_sql = sql::stage2(&tables.streams, &sql_literals(&fingerprints));
+    let stage2_sql = sql::stage2(
+        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+        &tables.streams,
+        &sql_literals(&fingerprints),
+    );
     let meta = hydrate(client, &stage2_sql, &s2_id, dist).await?;
     stages.push(StageRef {
         stage: "hydration",
@@ -1237,6 +1244,7 @@ async fn run_streams_once(
 
     let s3_id = format!("{base_id}-s3");
     let sql3 = sql::stage3(
+        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
         &tables.samples,
         &escaped,
         &sql_literals(&fingerprints),
@@ -1486,6 +1494,7 @@ async fn run_discovery_shape(
     // scan is captured `Flat`. The bench issues the UNSCOPED form — no
     // `query=` — which is the shape this evidence has always measured.
     let activity_sql = sql::active_fingerprints(
+        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
         &tables.rollup,
         None,
         TimeWindow {
@@ -1505,7 +1514,12 @@ async fn run_discovery_shape(
         .into_iter()
         .map(|fp| pulsus_model::Fingerprint::from_raw(fp).sql_literal())
         .collect();
-    let sql = sql::label_names(&tables.streams_idx, &months, &fps);
+    let sql = sql::label_names(
+        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+        &tables.streams_idx,
+        &months,
+        &fps,
+    );
 
     execute_discard::<LabelNameRow>(
         client,
@@ -1675,7 +1689,11 @@ async fn run_metric_shape(
         }
 
         let s2_id = format!("{query_id}-s2");
-        let stage2_sql = sql::stage2(&mp.streams_table, &sql_literals(&fingerprints));
+        let stage2_sql = sql::stage2(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            &mp.streams_table,
+            &sql_literals(&fingerprints),
+        );
         let meta = hydrate(client, &stage2_sql, &s2_id, dist).await?;
         stages.push(StageRef {
             stage: "hydration",
@@ -1702,6 +1720,7 @@ async fn run_metric_shape(
         );
         let s3_id = format!("{query_id}-s3");
         let sql3 = sql::metric_range(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
             source,
             &services,
             &sql_literals(&fingerprints),

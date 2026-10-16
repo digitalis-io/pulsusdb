@@ -832,6 +832,7 @@ async fn query_range_post_explain_is_byte_exact_against_a_computed_golden() {
 
     let months = months_spanned(window_start, window_end);
     let stage1_sql = sql::stage1(
+        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
         "log_streams_idx",
         &months,
         &[
@@ -843,6 +844,7 @@ async fn query_range_post_explain_is_byte_exact_against_a_computed_golden() {
         &[],
     );
     let stage2_sql = sql::stage2(
+        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
         "log_streams",
         &[Fingerprint::from_raw(u128::from(FP_A)).sql_literal()],
     );
@@ -861,6 +863,7 @@ async fn query_range_post_explain_is_byte_exact_against_a_computed_golden() {
     // the SAME builder the engine calls, so the expectation cannot drift
     // from what runs.
     let metric_sql = sql::metric_range_bucketed(
+        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
         MetricSource::new("log_samples", MetricShape::RawCount),
         &[literal("checkout")],
         &[Fingerprint::from_raw(u128::from(FP_A)).sql_literal()],

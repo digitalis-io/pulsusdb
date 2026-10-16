@@ -302,8 +302,11 @@ fn key_digest(key: &str) -> PushDigest {
 
 /// Resolves a log push's identity — the digest of the `Idempotency-Key`
 /// when the client sent one, else of the request's own content.
-pub fn log_identity(batch: &ParsedLogs, headers: &PushHeaders) -> PushIdentity {
-    identity_from(log_content_digest(batch), headers, None)
+///
+/// Issue #653: the push's tenant is in the key, so two tenants' identical
+/// pushes, with or without one `Idempotency-Key`, are two pushes.
+pub fn log_identity(batch: &ParsedLogs, headers: &PushHeaders, tenant: &Tenant) -> PushIdentity {
+    identity_from(log_content_digest(batch), headers, Some(tenant))
 }
 
 /// Resolves a metric push's identity — see [`log_identity`]. Issue #635
@@ -402,9 +405,9 @@ pub fn trace_identity(batch: &ParsedTraces, headers: &PushHeaders) -> PushIdenti
     identity_from(trace_content_digest(batch), headers, None)
 }
 
-/// `tenant` is `None` for the logs and traces identities, which are
-/// unchanged; a metric push's tenant is hashed into the key on both
-/// branches, the `Idempotency-Key` digest and the content digest.
+/// `tenant` is `None` for the traces identity, which is unchanged; a
+/// metric or log push's tenant (issues #635, #653) is hashed into the key on
+/// both branches, the `Idempotency-Key` digest and the content digest.
 fn identity_from(
     content: PushDigest,
     headers: &PushHeaders,
@@ -2178,10 +2181,55 @@ mod tests {
         );
     }
 
+    /// **T-W4 (issue #653): a log push's identity includes its tenant.**
+    /// One batch, (a) under an `Idempotency-Key` and (b) without one: two
+    /// tenants' identities differ on both branches, and one tenant's twice
+    /// are equal.
+    #[test]
+    fn log_identity_includes_the_tenant() {
+        use crate::protocols::otlp_logs::LogRow;
+        let batch = ParsedLogs {
+            rows: vec![LogRow {
+                service: "svc".to_string(),
+                fingerprint: Fingerprint::from_raw(7),
+                timestamp_ns: pulsus_model::UnixNano(1),
+                severity: 0,
+                body: "same line".to_string(),
+                structured_metadata: String::new(),
+            }],
+            ..Default::default()
+        };
+        let tenant = |name: &str| {
+            Tenant::from_header(
+                Some(&axum::http::HeaderValue::from_str(name).expect("a header value")),
+                false,
+            )
+            .expect("a valid tenant")
+        };
+        let keyed = PushHeaders {
+            idempotency_key: Some("k-1".to_string()),
+            declared_retry: false,
+        };
+        for (branch, headers) in [("(a) a key", keyed), ("(b) no key", PushHeaders::default())] {
+            let q = log_identity(&batch, &headers, &tenant("tenant-q")).key;
+            let o = log_identity(&batch, &headers, &tenant("tenant-o")).key;
+            let q_again = log_identity(&batch, &headers, &tenant("tenant-q")).key;
+            assert_ne!(
+                q, o,
+                "{branch}: two tenants' identical pushes are two pushes"
+            );
+            assert_eq!(q, q_again, "{branch}: one tenant's repeat is the same push");
+        }
+    }
+
     #[test]
     fn a_different_key_is_a_different_push_and_the_same_key_is_not() {
         let batch = ParsedMetrics::default();
-        let none = log_identity(&ParsedLogs::default(), &PushHeaders::default());
+        let none = log_identity(
+            &ParsedLogs::default(),
+            &PushHeaders::default(),
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+        );
         let keyed = |k: &str| {
             metric_identity(
                 &batch,
@@ -2205,13 +2253,18 @@ mod tests {
     #[test]
     fn retry_attempt_forms_no_identity() {
         let batch = ParsedLogs::default();
-        let plain = log_identity(&batch, &PushHeaders::default());
+        let plain = log_identity(
+            &batch,
+            &PushHeaders::default(),
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+        );
         let declared = log_identity(
             &batch,
             &PushHeaders {
                 idempotency_key: None,
                 declared_retry: true,
             },
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
         );
         assert_eq!(
             plain.key, declared.key,

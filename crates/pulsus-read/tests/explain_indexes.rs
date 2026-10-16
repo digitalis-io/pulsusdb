@@ -271,8 +271,13 @@ async fn active_set(client: &ChClient, rollup: &str, start_ns: i64, end_ns: i64)
     struct Fp {
         fingerprint: Fingerprint,
     }
-    let sql =
-        sql::active_fingerprints(rollup, None, TimeWindow { start_ns, end_ns }, ROLLUP_RES_NS);
+    let sql = sql::active_fingerprints(
+        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+        rollup,
+        None,
+        TimeWindow { start_ns, end_ns },
+        ROLLUP_RES_NS,
+    );
     let mut stream = client
         .query_stream::<Fp>(&sql, &pulsus_clickhouse::QuerySettings::new())
         .await
@@ -532,6 +537,9 @@ const ROLLUP_RES_NS: u64 = 5_000_000_000;
 
 fn plan_ctx(db: &str) -> PlanCtx<'_> {
     PlanCtx {
+        tenant: Box::leak(Box::new(
+            pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+        )),
         db,
         streams_idx: "log_streams_idx",
         streams: "log_streams",
@@ -853,9 +861,10 @@ async fn stage1_single_equality_uses_the_key_val_primary_key() {
             "Condition: (month in [#, #])",
             "PrimaryKey",
             "Keys:",
+            "org_id",
             "key",
             "val",
-            "Condition: and((val in ['checkout', 'checkout']), (key in ['service_name', 'service_name']))",
+            "Condition: and(and((val in ['checkout', 'checkout']), (key in ['service_name', 'service_name'])), (org_id in ['', '']))",
         ])
     );
 }
@@ -887,9 +896,10 @@ async fn stage1_multi_equality_uses_the_key_val_primary_key() {
             "Condition: (month in [#, #])",
             "PrimaryKey",
             "Keys:",
+            "org_id",
             "key",
             "val",
-            "Condition: or(and((val in ['prod', 'prod']), (key in ['env', 'env'])), and((val in ['checkout', 'checkout']), (key in ['service_name', 'service_name'])))",
+            "Condition: and(or(and((val in ['prod', 'prod']), (key in ['env', 'env'])), and((val in ['checkout', 'checkout']), (key in ['service_name', 'service_name']))), (org_id in ['', '']))",
         ])
     );
 }
@@ -921,8 +931,9 @@ async fn stage1_regex_matcher_uses_the_key_primary_key_prefix() {
             "Condition: (month in [#, #])",
             "PrimaryKey",
             "Keys:",
+            "org_id",
             "key",
-            "Condition: (key in ['env', 'env'])",
+            "Condition: and((key in ['env', 'env']), (org_id in ['', '']))",
         ])
     );
 }
@@ -954,9 +965,10 @@ async fn stage1_mixed_positive_and_negative_matchers_uses_the_key_val_primary_ke
             "Condition: (month in [#, #])",
             "PrimaryKey",
             "Keys:",
+            "org_id",
             "key",
             "val",
-            "Condition: or(and((val in ['qa', 'qa']), (key in ['team', 'team'])), and((val in ['checkout', 'checkout']), (key in ['service_name', 'service_name'])))",
+            "Condition: and(or(and((val in ['qa', 'qa']), (key in ['team', 'team'])), and((val in ['checkout', 'checkout']), (key in ['service_name', 'service_name']))), (org_id in ['', '']))",
         ])
     );
 }
@@ -974,6 +986,7 @@ async fn stage2_hydration_uses_the_fingerprint_primary_key() {
 
     let table = format!("{db}.log_streams");
     let sql = sql::stage2(
+        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
         &table,
         &[Fingerprint::from_raw(u128::from(FP_PROD)).sql_literal()],
     );
@@ -988,8 +1001,9 @@ async fn stage2_hydration_uses_the_fingerprint_primary_key() {
             "Condition: true",
             "PrimaryKey",
             "Keys:",
+            "org_id",
             "fingerprint",
-            "Condition: (fingerprint in #-element set)",
+            "Condition: and((fingerprint in #-element set), (org_id in ['', '']))",
         ])
     );
 }
@@ -1020,6 +1034,7 @@ async fn stage3_sql(db: &str, ts_ns: i64, query: &str) -> String {
     let sp = streams_plan(query, &range_params(ts_ns), db);
     let table = format!("{db}.log_samples");
     sql::stage3(
+        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
         &table,
         &[literal("checkout")],
         &[Fingerprint::from_raw(u128::from(FP_PROD)).sql_literal()],
@@ -1133,11 +1148,12 @@ fn expected_stage3_prefix() -> Vec<String> {
         "Condition: true",
         "PrimaryKey",
         "Keys:",
+        "org_id",
         "service",
         "fingerprint",
         "timestamp_ns",
         "Condition: and(and((timestamp_ns in (-Inf, #]), and((timestamp_ns in [#, +Inf)), \
-         (fingerprint in #-element set))), (service in ['checkout', 'checkout']))",
+         and((fingerprint in #-element set), (org_id in ['', ''])))), (service in ['checkout', 'checkout']))",
     ])
 }
 
@@ -1287,6 +1303,7 @@ async fn keyset_page_usage(
 ) -> Vec<String> {
     let table = format!("{db}.log_samples");
     let sql = sql::stage3_keyset(
+        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
         &table,
         &[literal("checkout")],
         &[Fingerprint::from_raw(u128::from(FP_PROD)).sql_literal()],
@@ -1388,6 +1405,7 @@ async fn metric_range_sliding_statement_prunes_on_the_service_fingerprint_timest
     assert_eq!(mp.table, "log_samples");
     let table = format!("{db}.log_samples");
     let sql = sql::metric_range_sliding(
+        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
         sql::MetricSource::new(&table, sql::MetricShape::RawCount),
         &[literal("checkout")],
         &[Fingerprint::from_raw(u128::from(FP_PROD)).sql_literal()],
@@ -1420,6 +1438,7 @@ async fn a_staged_range_reads_the_lowered_statement() {
 
     let render = |mp: &pulsus_read::logql::MetricPlan| {
         sql::metric_range_sliding(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
             sql::MetricSource::new(
                 &format!("{db}.log_samples"),
                 mp.source_shape().expect("a counting plan"),
@@ -1501,6 +1520,7 @@ async fn a_regexp_count_reads_the_lowered_statement() {
     let columns = pulsus_read::logql::predicate::regexp_group_columns(&regexp.pattern, &indexes)
         .expect("renders");
     let sql = sql::metric_range_sliding_with_regexp(
+        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
         sql::MetricSource::new(
             &format!("{db}.log_samples"),
             panel.source_shape().expect("a counting plan"),
@@ -1544,6 +1564,7 @@ async fn volume_rollup_read_uses_the_fingerprint_bucket_primary_key() {
 
     let table = format!("{db}.log_metrics_5s");
     let sql = sql::log_volume_rollup(
+        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
         &table,
         &[Fingerprint::from_raw(u128::from(FP_PROD)).sql_literal()],
         TimeWindow {
@@ -1590,7 +1611,12 @@ async fn detected_labels_aggregation_prunes_on_the_month_partition() {
     // Issue #603: the activity set reaches the index scan as a literal list
     // the engine resolved from its own statement, never as a subquery.
     let active = active_set(&client, &format!("{db}.log_metrics_5s"), start_ns, end_ns).await;
-    let sql = sql::detected_labels(&table, &months, &active);
+    let sql = sql::detected_labels(
+        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+        &table,
+        &months,
+        &active,
+    );
     assert!(!sql.contains("log_samples"), "never touches log_samples");
 
     let usage = explain(&client, &sql).await;
@@ -1619,8 +1645,9 @@ async fn detected_labels_aggregation_prunes_on_the_month_partition() {
             "Condition: (month in [#, #])",
             "PrimaryKey",
             "Keys:",
+            "org_id",
             "fingerprint",
-            "Condition: (fingerprint in #-element set)",
+            "Condition: and((fingerprint in #-element set), (org_id in ['', '']))",
         ])
     );
 }
@@ -1664,7 +1691,13 @@ async fn detected_labels_activity_subquery_prunes_the_rollup_by_bucket_range() {
         end_ns: ts_ns - DAY_NS + 3_600_000_000_000,
     };
 
-    let unscoped = sql::active_fingerprints(&table, None, window, ROLLUP_RES_NS);
+    let unscoped = sql::active_fingerprints(
+        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+        &table,
+        None,
+        window,
+        ROLLUP_RES_NS,
+    );
     let raw = explain_raw(&client, &unscoped).await;
     assert_eq!(
         index_usage(&raw),
@@ -1677,8 +1710,9 @@ async fn detected_labels_activity_subquery_prunes_the_rollup_by_bucket_range() {
             "Condition: true",
             "PrimaryKey",
             "Keys:",
+            "org_id",
             "bucket_ns",
-            "Condition: and((bucket_ns in (-Inf, #]), (bucket_ns in [#, +Inf)))",
+            "Condition: and((bucket_ns in (-Inf, #]), and((bucket_ns in [#, +Inf)), (org_id in ['', ''])))",
         ])
     );
     let (selected, total) = parts_selected(&raw).expect("a MinMax Parts: m/n line");
@@ -1694,6 +1728,7 @@ async fn detected_labels_activity_subquery_prunes_the_rollup_by_bucket_range() {
     // Scoped: the caller's fingerprint list is pushed inside, so the
     // primary key's LEADING column joins the condition too.
     let scoped = sql::active_fingerprints(
+        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
         &table,
         Some(&[Fingerprint::from_raw(u128::from(FP_PROD)).sql_literal()]),
         window,
@@ -1710,9 +1745,10 @@ async fn detected_labels_activity_subquery_prunes_the_rollup_by_bucket_range() {
             "Condition: true",
             "PrimaryKey",
             "Keys:",
+            "org_id",
             "fingerprint",
             "bucket_ns",
-            "Condition: and((bucket_ns in (-Inf, #]), and((bucket_ns in [#, +Inf)), (fingerprint in #-element set)))",
+            "Condition: and((bucket_ns in (-Inf, #]), and((bucket_ns in [#, +Inf)), and((fingerprint in #-element set), (org_id in ['', '']))))",
         ])
     );
 }
@@ -1762,7 +1798,13 @@ async fn series_without_a_selector_prunes_the_rollup_and_hits_the_streams_primar
 
     // Statement 1 — the UNSCOPED activity scan (`fingerprints: None`),
     // exactly what `all_active_fingerprints` dispatches.
-    let activity = sql::active_fingerprints(&rollup, None, window, ROLLUP_RES_NS);
+    let activity = sql::active_fingerprints(
+        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+        &rollup,
+        None,
+        window,
+        ROLLUP_RES_NS,
+    );
     let raw = explain_raw(&client, &activity).await;
     assert_eq!(
         index_usage(&raw),
@@ -1775,8 +1817,9 @@ async fn series_without_a_selector_prunes_the_rollup_and_hits_the_streams_primar
             "Condition: true",
             "PrimaryKey",
             "Keys:",
+            "org_id",
             "bucket_ns",
-            "Condition: and((bucket_ns in (-Inf, #]), (bucket_ns in [#, +Inf)))",
+            "Condition: and((bucket_ns in (-Inf, #]), and((bucket_ns in [#, +Inf)), (org_id in ['', ''])))",
         ])
     );
     let (selected, total) = parts_selected(&raw).expect("a MinMax Parts: m/n line");
@@ -1796,6 +1839,7 @@ async fn series_without_a_selector_prunes_the_rollup_and_hits_the_streams_primar
         explain(
             &client,
             &sql::stage2(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
                 &streams,
                 &[Fingerprint::from_raw(u128::from(FP_PROD)).sql_literal()]
             )
@@ -1808,8 +1852,9 @@ async fn series_without_a_selector_prunes_the_rollup_and_hits_the_streams_primar
             "Condition: true",
             "PrimaryKey",
             "Keys:",
+            "org_id",
             "fingerprint",
-            "Condition: (fingerprint in #-element set)",
+            "Condition: and((fingerprint in #-element set), (org_id in ['', '']))",
         ])
     );
 }
@@ -1859,13 +1904,19 @@ async fn label_discovery_scans_prune_on_the_month_partition_and_the_activity_buc
     ];
 
     let active = active_set(&client, &rollup, window.start_ns, window.end_ns).await;
-    let names_sql = sql::label_names(&idx, &months, &active);
+    let names_sql = sql::label_names(
+        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+        &idx,
+        &months,
+        &active,
+    );
     let mut expected: Vec<&str> = month_blocks.to_vec();
     expected.extend([
         "PrimaryKey",
         "Keys:",
+        "org_id",
         "fingerprint",
-        "Condition: (fingerprint in #-element set)",
+        "Condition: and((fingerprint in #-element set), (org_id in ['', '']))",
     ]);
     let names_usage = explain(&client, &names_sql).await;
     assert_eq!(names_usage, v(&expected));
@@ -1875,6 +1926,7 @@ async fn label_discovery_scans_prune_on_the_month_partition_and_the_activity_buc
     // unscoped form's: same month MinMax and Partition blocks, same
     // primary-key condition, over a list of its own.
     let scoped_names_sql = sql::label_names(
+        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
         &idx,
         &months,
         &[
@@ -1888,11 +1940,18 @@ async fn label_discovery_scans_prune_on_the_month_partition_and_the_activity_buc
         "the scoped /labels outer scan must analyse exactly as the unscoped one"
     );
 
-    let values_sql = sql::label_values(&idx, &months, &literal("env"), &active);
+    let values_sql = sql::label_values(
+        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+        &idx,
+        &months,
+        &literal("env"),
+        &active,
+    );
     let mut expected: Vec<&str> = month_blocks.to_vec();
     expected.extend([
         "PrimaryKey",
         "Keys:",
+        "org_id",
         "key",
         "fingerprint",
         // Operand order is ClickHouse's, MEASURED (24.8.14.39), not the
@@ -1901,12 +1960,13 @@ async fn label_discovery_scans_prune_on_the_month_partition_and_the_activity_buc
         // the reverse. The issue #399 plan predicted the written order;
         // the plan was not wrong about WHICH conditions engage the
         // primary key, only about the order the extract prints them in.
-        "Condition: and((fingerprint in #-element set), (key in ['env', 'env']))",
+        "Condition: and((fingerprint in #-element set), and((key in ['env', 'env']), (org_id in ['', ''])))",
     ]);
     let values_usage = explain(&client, &values_sql).await;
     assert_eq!(values_usage, v(&expected));
 
     let scoped_values_sql = sql::label_values(
+        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
         &idx,
         &months,
         &literal("env"),
@@ -1946,9 +2006,10 @@ fn expected_metric_rollup_usage() -> Vec<String> {
         "Condition: true",
         "PrimaryKey",
         "Keys:",
+        "org_id",
         "fingerprint",
         "bucket_ns",
-        "Condition: and((bucket_ns in (-Inf, #]), and((bucket_ns in [#, +Inf)), (fingerprint in #-element set)))",
+        "Condition: and((bucket_ns in (-Inf, #]), and((bucket_ns in [#, +Inf)), and((fingerprint in #-element set), (org_id in ['', '']))))",
     ])
 }
 
@@ -1979,6 +2040,7 @@ async fn metric_instant_read_routes_to_raw_and_uses_the_service_fingerprint_time
     assert!(mp.step_ns.is_none());
     let table = format!("{db}.log_samples");
     let sql = sql::metric_instant(
+        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
         sql::MetricSource::new(
             &table,
             mp.source_shape()
@@ -2033,10 +2095,11 @@ fn expected_metric_instant_raw_usage() -> Vec<String> {
         "Condition: true",
         "PrimaryKey",
         "Keys:",
+        "org_id",
         "service",
         "fingerprint",
         "timestamp_ns",
-        "Condition: and(and((timestamp_ns in (-Inf, #]), and((timestamp_ns in [#, +Inf)), (fingerprint in #-element set))), (service in ['checkout', 'checkout']))",
+        "Condition: and(and((timestamp_ns in (-Inf, #]), and((timestamp_ns in [#, +Inf)), and((fingerprint in #-element set), (org_id in ['', ''])))), (service in ['checkout', 'checkout']))",
     ])
 }
 
@@ -2748,6 +2811,7 @@ async fn m6_10_unpiped_count_over_time_range_slides_raw() {
     assert_eq!(mp.table, "log_samples");
     let table = format!("{db}.log_samples");
     let sql = sql::metric_range_sliding(
+        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
         sql::MetricSource::new(&table, sql::MetricShape::RawCount),
         &[literal("checkout")],
         &[Fingerprint::from_raw(u128::from(FP_PROD)).sql_literal()],
@@ -2789,6 +2853,7 @@ async fn m6_10_unwrapped_sum_over_time_reads_log_samples_raw_on_the_primary_key(
     );
     let table = format!("{db}.log_samples");
     let sql = sql::metric_raw_samples(
+        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
         &table,
         &[literal("checkout")],
         &[Fingerprint::from_raw(u128::from(FP_PROD)).sql_literal()],
@@ -2836,6 +2901,7 @@ async fn a_grouped_range_aggregation_plans_the_same_single_raw_scan_as_its_ungro
             "{query}: grouping must not change the routing decision"
         );
         let sql = sql::metric_raw_samples(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
             &table,
             &[literal("checkout")],
             &[Fingerprint::from_raw(u128::from(FP_PROD)).sql_literal()],
@@ -2901,6 +2967,7 @@ async fn metric_raw_fallback_uses_the_service_fingerprint_timestamp_primary_key(
     // Issue #227: a range read with a line filter slides raw
     // (`metric_raw_samples_sliding`), the filter pushed down as a predicate.
     let sql = sql::metric_raw_samples_sliding(
+        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
         &table,
         &[literal("checkout")],
         &[Fingerprint::from_raw(u128::from(FP_PROD)).sql_literal()],

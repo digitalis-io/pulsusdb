@@ -438,6 +438,7 @@ ALTER TABLE metric_hist_samples ADD COLUMN IF NOT EXISTS counter_reset_hint UInt
 -- return before the shards held the rows, either of which ends "one push
 -- is one block" (§7).
 CREATE TABLE log_landing (
+    org_id               LowCardinality(String),              -- the push's tenant (issue #653)
     event_id             UUID DEFAULT generateUUIDv7(),
     received_ms          Int64  CODEC(DoubleDelta, ZSTD(1)),  -- wall clock at admission
     kind                 UInt8  CODEC(ZSTD(1)),               -- 0 line, 1 stream, 2 pattern
@@ -454,7 +455,7 @@ CREATE TABLE log_landing (
     pattern_count        UInt64  CODEC(T64, ZSTD(1))          -- kind 2
 ) ENGINE = MergeTree
 PARTITION BY toStartOfHour(fromUnixTimestamp64Milli(received_ms))
-ORDER BY (kind, service, fingerprint, timestamp_ns)
+ORDER BY (org_id, kind, service, fingerprint, timestamp_ns)
 SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600, min_columns_to_activate_adaptive_write_buffer = 1;
 -- `apply_ttl` issues at init and on every rotation tick:
 --   ALTER TABLE log_landing MODIFY TTL
@@ -469,18 +470,18 @@ SETTINGS ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600, min_columns_to_
 
 ```sql
 CREATE MATERIALIZED VIEW log_samples_mv TO log_samples AS
-SELECT service AS service, fingerprint AS fingerprint,
+SELECT org_id AS org_id, service AS service, fingerprint AS fingerprint,
        timestamp_ns AS timestamp_ns, severity AS severity, body AS body,
        structured_metadata AS structured_metadata
 FROM log_landing WHERE kind = 0;
 
 CREATE MATERIALIZED VIEW log_streams_mv TO log_streams AS
-SELECT month AS month, fingerprint AS fingerprint, service AS service,
+SELECT org_id AS org_id, month AS month, fingerprint AS fingerprint, service AS service,
        labels AS labels, updated_ns AS updated_ns
 FROM log_landing WHERE kind = 1;
 
 CREATE MATERIALIZED VIEW log_streams_idx_mv TO log_streams_idx AS
-SELECT month, kv.1 AS key, kv.2 AS val, fingerprint
+SELECT org_id AS org_id, month, kv.1 AS key, kv.2 AS val, fingerprint
 FROM log_landing
 ARRAY JOIN JSONExtractKeysAndValues(labels, 'String') AS kv
 WHERE kind = 1;
@@ -488,19 +489,19 @@ WHERE kind = 1;
 -- {res_ns} is PULSUS_LOG_ROLLUP_RESOLUTION; the view and its target are
 -- named for it (log_metrics_5s_mv by default).
 CREATE MATERIALIZED VIEW log_metrics_5s_mv TO log_metrics_5s AS
-SELECT fingerprint AS fingerprint,
+SELECT org_id AS org_id, fingerprint AS fingerprint,
        intDiv(timestamp_ns, {res_ns}) * {res_ns} AS bucket_ns,
        count() AS count,
        sum(length(body)) AS bytes
 FROM log_landing WHERE kind = 0
-GROUP BY fingerprint, bucket_ns;
+GROUP BY org_id, fingerprint, bucket_ns;
 
 -- Pattern rows are pre-aggregated in Rust before they land, so this view
 -- copies one landed row per (fingerprint, bucket, template) through and
 -- aliases `pattern_count` back to the target's `count`. `timestamp_ns`
 -- carries the bucket floor on a kind-2 row.
 CREATE MATERIALIZED VIEW log_patterns_mv TO log_patterns AS
-SELECT fingerprint AS fingerprint, timestamp_ns AS bucket_ns,
+SELECT org_id AS org_id, fingerprint AS fingerprint, timestamp_ns AS bucket_ns,
        pattern AS pattern, pattern_count AS count
 FROM log_landing WHERE kind = 2;
 ```
@@ -509,6 +510,7 @@ FROM log_landing WHERE kind = 2;
 
 ```sql
 CREATE TABLE log_streams (
+    org_id       LowCardinality(String),
     month        Date,                          -- toStartOfMonth(first write in month)
     fingerprint  UInt128,
     service      LowCardinality(String),        -- resource service.name ('' if absent)
@@ -516,22 +518,24 @@ CREATE TABLE log_streams (
     updated_ns   Int64
 ) ENGINE = ReplacingMergeTree(updated_ns)
 PARTITION BY month
-ORDER BY fingerprint;
+ORDER BY (org_id, fingerprint);
 
 CREATE TABLE log_streams_idx (
+    org_id       LowCardinality(String),
     month        Date,
     key          LowCardinality(String),
     val          String,
     fingerprint  UInt128
 ) ENGINE = ReplacingMergeTree
 PARTITION BY month
-ORDER BY (key, val, fingerprint);
+ORDER BY (org_id, key, val, fingerprint);
 -- populated by log_streams_idx_mv over log_landing's kind-1 rows:
 --   ARRAY JOIN JSONExtractKeysAndValues(labels, 'String')
 ```
 
 ```sql
 CREATE TABLE log_samples (
+    org_id        LowCardinality(String),
     service       LowCardinality(String),
     fingerprint   UInt128,
     timestamp_ns  Int64   CODEC(DoubleDelta, ZSTD(1)),
@@ -542,7 +546,7 @@ CREATE TABLE log_samples (
     INDEX idx_severity severity TYPE minmax GRANULARITY 4
 ) ENGINE = MergeTree
 PARTITION BY toDate(fromUnixTimestamp64Nano(timestamp_ns))
-ORDER BY (service, fingerprint, timestamp_ns)
+ORDER BY (org_id, service, fingerprint, timestamp_ns)
 TTL toDateTime(fromUnixTimestamp64Nano(timestamp_ns)) + INTERVAL 7 DAY DELETE
 SETTINGS ttl_only_drop_parts = 1, min_columns_to_activate_adaptive_write_buffer = 1;
 ```
@@ -552,13 +556,14 @@ SETTINGS ttl_only_drop_parts = 1, min_columns_to_activate_adaptive_write_buffer 
 -- (default 5s) sets the bucket size; the table is named for it (log_metrics_5s
 -- by default) and the MV bucket expression is rendered from it.
 CREATE TABLE log_metrics_5s (
+    org_id       LowCardinality(String),
     fingerprint  UInt128,
     bucket_ns    Int64,                          -- intDiv(timestamp_ns, {res_ns}) * {res_ns}
     count        SimpleAggregateFunction(sum, UInt64),
     bytes        SimpleAggregateFunction(sum, UInt64)
 ) ENGINE = AggregatingMergeTree
 PARTITION BY toDate(fromUnixTimestamp64Nano(bucket_ns))
-ORDER BY (fingerprint, bucket_ns);
+ORDER BY (org_id, fingerprint, bucket_ns);
 -- populated by log_metrics_5s_mv over log_landing's kind-0 rows
 ```
 
@@ -573,23 +578,24 @@ ORDER BY (fingerprint, bucket_ns);
 -- function of the line, so counts sum correctly across batches, shards,
 -- replicas, and retries. Kill-switch: PULSUS_LOG_PATTERNS (default true).
 CREATE TABLE log_patterns (
+    org_id       LowCardinality(String),
     fingerprint  UInt128,
     bucket_ns    Int64,                          -- intDiv(timestamp_ns, 10s) * 10s
     pattern      String  CODEC(ZSTD(1)),
     count        SimpleAggregateFunction(sum, UInt64)
 ) ENGINE = AggregatingMergeTree
 PARTITION BY toDate(fromUnixTimestamp64Nano(bucket_ns))
-ORDER BY (fingerprint, bucket_ns, pattern)
+ORDER BY (org_id, fingerprint, bucket_ns, pattern)
 TTL toDateTime(fromUnixTimestamp64Nano(bucket_ns)) + INTERVAL 7 DAY DELETE
 SETTINGS ttl_only_drop_parts = 1;
 ```
 
 Raw log timestamps in `log_samples` are stored verbatim at nanosecond precision — the rollup is derived, and only eligible when the query step is a multiple of the configured rollup resolution; otherwise the planner counts raw rows.
 
-- **`log_patterns` primary-key order is `(fingerprint, bucket_ns, pattern)`** (issue #171, `bucket_ns` **before** `pattern`): a `/api/logs/v1/patterns` read is a `fingerprint IN (...)` + bounded `bucket_ns` window, so putting `bucket_ns` second prunes at the PK level inside each fingerprint's key range, not only via daily partitions. The template is a **deterministic, stateless** token-class rendering of the line body (digit/length classification, `key=value`/`key:value` awareness, 1 KiB prefix / 64-token / 512-byte caps, whitespace runs collapse) — NOT a drain-style online clusterer, whose order-dependent per-stream mutable state would emit different templates on different shards/replicas/retries and break both the mergeable `sum` and idempotent re-inserts. Templates are normalized (whitespace-collapsed), documented as "not round-trip matchable". **Count semantics** are exact on the clean ingest path and **best-effort approximate under ingest-failure re-sends**, at parity with `log_metrics` (§2.2's tier caveat): the writer never auto-replays a block that could have committed (an `InsertUncertain` batch is spooled audit-only, never re-inserted), so the only over-count vector is a client-level re-send after a 5xx/timeout ack (steady-state zero), and **there is no under-count vector left from a failing flush** (issue #603): the pattern rows ride the same landed block as the lines they were extracted from, so there is no separate patterns insert to fail, and a push whose block does not land lands no lines either. What remains is the fan-out residual every target of `log_landing` shares — a view that throws while the server processes the insert leaves it unrecorded which targets kept the block's rows (§4.1, "What a failing view leaves behind"). A single request that emits more than 10 000 distinct templates (pathological — the extraction caps make templates low-cardinality by construction) drops the excess from pattern accounting only (log lines untouched, counted via the writer's `patterns_dropped_total`), an under-count event folded into the same approximate semantics; the next batch resumes discovery.
+- **`log_patterns` primary-key order is `(org_id, fingerprint, bucket_ns, pattern)`** (issue #171, `bucket_ns` **before** `pattern`; the tenant leads, issue #653): a `/api/logs/v1/patterns` read is a `fingerprint IN (...)` + bounded `bucket_ns` window, so putting `bucket_ns` second prunes at the PK level inside each fingerprint's key range, not only via daily partitions. The template is a **deterministic, stateless** token-class rendering of the line body (digit/length classification, `key=value`/`key:value` awareness, 1 KiB prefix / 64-token / 512-byte caps, whitespace runs collapse) — NOT a drain-style online clusterer, whose order-dependent per-stream mutable state would emit different templates on different shards/replicas/retries and break both the mergeable `sum` and idempotent re-inserts. Templates are normalized (whitespace-collapsed), documented as "not round-trip matchable". **Count semantics** are exact on the clean ingest path and **best-effort approximate under ingest-failure re-sends**, at parity with `log_metrics` (§2.2's tier caveat): the writer never auto-replays a block that could have committed (an `InsertUncertain` batch is spooled audit-only, never re-inserted), so the only over-count vector is a client-level re-send after a 5xx/timeout ack (steady-state zero), and **there is no under-count vector left from a failing flush** (issue #603): the pattern rows ride the same landed block as the lines they were extracted from, so there is no separate patterns insert to fail, and a push whose block does not land lands no lines either. What remains is the fan-out residual every target of `log_landing` shares — a view that throws while the server processes the insert leaves it unrecorded which targets kept the block's rows (§4.1, "What a failing view leaves behind"). A single request that emits more than 10 000 distinct templates (pathological — the extraction caps make templates low-cardinality by construction) drops the excess from pattern accounting only (log lines untouched, counted via the writer's `patterns_dropped_total`), an under-count event folded into the same approximate semantics; the next batch resumes discovery.
 
 - **`service` leads the samples ordering key.** This is the one label promoted to a physical column (populated from resource `service.name`; user-visible as the `service_name` label per the canonical label model), and it earns it three ways: (a) OpenTelemetry guarantees `service.name` on every resource (the collector defaults it to `unknown_service`), so it is never missing; (b) it is the natural clustering dimension — a service's streams sit contiguously, so service-scoped searches (the human default) read a compact range instead of granules scattered across all tenants of the table; (c) **the planner can always supply it**: stream resolution returns full label sets, so even a query that never mentions `service` gets `service IN (...)` injected from the resolved streams, keeping the primary index engaged. No other label is materialized — finding #9's counter-argument (row width, schema coupling) applies to everything else.
-- **`(service, fingerprint, timestamp_ns)` is fixed** (finding #4). Per-stream time reads are sequential; multi-stream reads within one service are near-sequential.
+- **`(org_id, service, fingerprint, timestamp_ns)` is fixed** (finding #4; the tenant leads it, issue #653). Per-stream time reads are sequential; multi-stream reads within one service are near-sequential.
 - **Body `text` index** (finding #3): one `text(tokenizer = ngrams(4))` index serves substrings and anchored regex literals; it replaced the deprecated `tokenbf_v1`/`ngrambf_v1` pair in #624 part 3b (#235). The planner mints **one** predicate per line filter — `body LIKE '%needle%'` for `|=`/`!=`, `match(body, …)` for `|~`/`!~` — and lets ClickHouse's own index analysis decide which 4-grams it tests. Every LogQL read sends `query_plan_direct_read_from_text_index = 0` (`read_query_settings`): with the direct read on, a statement whose `WHERE` holds a line filter leaves a query-condition-cache entry under its `PREWHERE service = …` condition that makes the next statement with that condition count too few lines (measured on 26.3.29.7); turning it off corrects that and leaves the condition cache and the index analysis on. It mints **no `hasToken` prefilter of its own**: `hasToken()` is an exact whole-token membership test, so ANDing one onto a substring search dropped matching lines, kept excluded ones and failed outright on a needle containing `_` (issue #450). Measured on 26.3.17.110 with the bloom-filter pair, over 10M rows / 1.28 GiB of bodies, needle `wxyze73b62205bc78c841234`: `body LIKE` reads **0.97M rows**, `position(body, …) > 0` reads all **10.0M** (`ngrambf_v1` serves `LIKE` and does not serve `position`), and the old wrong-but-fast `hasToken` conjunction read 8,192. Residual: a needle shorter than the 4-gram length engages no index and reads the full selector/time-bounded range (still PK-bounded, never the table) — scale behaviour of short needles is issue #25's.
 - **Monthly stream/index partitions** (finding #6): one row per stream per month; a 30-day label query touches ≤ 2 partitions.
 - **`structured_metadata` is per-entry, not per-stream** (issue #97): Loki push carries optional per-entry structured metadata (protobuf `EntryAdapter.structuredMetadata` or a JSON `values` third element), stored here as a canonical sorted-key JSON String — the `log_streams.labels` representation, not `Map(String,String)` (§1 rejects Map for label-shaped data). Empty string = none (pre-#97 rows, and OTLP-logs rows without an instrumentation scope). As of #109, an OTLP-logs row's `InstrumentationScope` is stored here rather than as stream labels, matching grafana/loki 3.4.2 (which places scope identity in structured metadata, not indexed labels): the scope name/version under keys `scope_name`/`scope_version` (each emitted only when non-empty), and each other scope attribute under its stored name (`log_label_name`, the reference's label namer, issue #507: a run of characters outside `[A-Za-z0-9]` becomes one `_`, a name of four or more bytes that starts and ends with `__` keeps those affixes, and a leading digit gains `key_` — e.g. `scope.attr.foo` → `scope_attr_foo`, `a..b` → `a_b`, `9s` → `key_9s`, `team` unchanged), with no `scope_` prefix. The whole ordered list — every attribute, then `scope_name`/`scope_version` — is then resolved by `pulsus_model::resolve_structured_metadata`, the one seam every structured-metadata producer funnels through (issues #259, #381). That function **is** Prometheus' `labels.Builder` as Loki's distributor drives it (`pkg/distributor/distributor.go:697-722` @ v3.7.4), and its rule is two-tier rather than positional: *a pair that was `Set` — renamed, or carrying `utf8.RuneError` — beats a pair that was not, wherever either sits in wire order; among pairs `Set` onto one name the last wins; among pairs that were never `Set` the reference keeps them all as duplicate labels*, which this key-unique column collapses keeping the last (what a JSON consumer observes of the reference's duplicate-keyed object). It is **not** last-write-wins in wire order — that cannot explain why both orders of `{a.b="x", a_b="keep"}` store `a_b="x"`. An **empty attribute value is a `Del`, not a kept pair**, and the interaction between the two is the rule copied verbatim from `pulsus_model::resolve_structured_metadata`'s primitive 7 (`tests/copied_rule.rs` asserts the copy): <!-- copied-rule:del-vs-set:start -->**`del` drops BASE entries only, so a `Set` outranks it.** An empty value deletes every pair stored under its name that the builder did not `Set`, and a rename or a U+FFFD rewrite re-adds the name in either wire order, because `add` is emitted whether or not `del` holds that name.<!-- copied-rule:del-vs-set:end --> Identity fields are inside that rule, not beside it: an attribute `scope_name=""` takes a plain `scope_name` with it, and does **not** take one carrying U+FFFD — measured, `{scope_name="", scope_name="N\ufffd"}` stores `scope_name="N "` while the control `{scope_name="", scope_name="N"}` stores nothing. A value containing U+FFFD has every occurrence rewritten to a SPACE, and that rewrite is itself the `Set`. Name and version are additionally suppressed at their own append site when empty (#108). On THIS path the keys reaching the builder are already `log_label_name` fixed points (`log_label_name` is idempotent and both identity names are fixed points), so the rename branch cannot fire and `add` carries the U+FFFD rewrites and nothing else. **When no value carries U+FFFD, `add` is empty** and the rule degenerates to the by-name delete plus keep-last — which is why appending identity last makes it win a non-empty collision with an attribute. When one does, that pair is `Set` and the two-tier rule above is what decides. That is the reference's own shape at the same place: its OTLP translation runs `LabelNamer.Build` over every attribute key before the distributor sees it (`pkg/loghttp/push/otlp.go:602-614` @ v3.7.4), whereas the push transport hands the builder raw names. docs/api.md §8.2 rows 5-6 carry the measured cases, and its residuals are in `docs/benchmarks/logs-differential-ledger.md` under `structured-metadata-collision-resolution`. It is added by **additive ALTER** (migration ids 21/22) rather than by mutating the frozen initial `CREATE`, so upgraded and fresh deployments converge byte-identically; a fresh DB runs `CREATE` (no column) then `ADD COLUMN IF NOT EXISTS`. Structured metadata never enters `stream_fingerprint` (a stream pushed with vs. without it fingerprints identically); on the read path it fans into the response stream label set alongside the base labels (grafana/loki 3.4.2 default, `categorize_labels` off), so an entry carrying distinct metadata forms its own result stream and a `| key="value"` pipeline filter selects on it.
@@ -604,7 +610,7 @@ Stage 1 — stream resolution, a *single pass* over the index (finding #1): each
 ```sql
 SELECT fingerprint
 FROM log_streams_idx
-WHERE month = '2026-07-01'
+WHERE org_id = '' AND month = '2026-07-01'
   AND ((key = 'service_name' AND val = 'checkout') OR (key = 'env' AND val = 'prod'))
 GROUP BY fingerprint
 HAVING uniqExact(key, val) = 2
@@ -612,7 +618,7 @@ HAVING uniqExact(key, val) = 2
 
 Regex/negative matchers (finding #7) resolve within one key's index prefix, e.g. `env=~"prod|staging"` becomes `key = 'env' AND match(val, ...)` — a scan over the distinct *values of that key*, never over samples. The planner orders matchers by selectivity (cheap `count()` probes on index prefixes) and aborts with "query too broad" past `PULSUS_LOGQL_SCAN_BUDGET_BYTES` or past the per-query memory ceiling `PULSUS_LOGQL_READ_MAX_MEMORY_BYTES` (issue #398: `max_memory_usage` + `max_bytes_before_external_group_by=0`, throw-not-spill, on every LogQL read — a memory breach is the same `422` as a byte-budget breach, never a `500`; a lowered metric statement is the one read whose own memory breach is not returned: that query runs again on the raw-scan read under the same ceiling; a timeout of a lowered statement is returned as a timeout, as for any read).
 
-Stage 2 — hydration (needed for response labels anyway): `SELECT fingerprint, service, labels FROM log_streams WHERE fingerprint IN (...)` → also yields the `service` set for stage 3.
+Stage 2 — hydration (needed for response labels anyway): `SELECT fingerprint, service, labels FROM log_streams WHERE org_id = '' AND fingerprint IN (...)` → also yields the `service` set for stage 3.
 
 Stage 3 — samples, primary-index + skip-index served:
 
@@ -620,7 +626,7 @@ Stage 3 — samples, primary-index + skip-index served:
 SELECT fingerprint, timestamp_ns, body
 FROM log_samples
 PREWHERE service = 'checkout'
-WHERE fingerprint IN (18374..., 99120...)
+WHERE org_id = '' AND fingerprint IN (18374..., 99120...)
   AND timestamp_ns >  {now - 6h} AND timestamp_ns <= {now}
   AND body LIKE '%connection refused%'   -- exact, and prunable by the body's text index
 ORDER BY timestamp_ns DESC
@@ -643,7 +649,7 @@ FROM (
              count() AS m, count() AS c
       FROM log_samples
       PREWHERE service IN (...)
-      WHERE fingerprint IN (...)
+      WHERE org_id = '' AND fingerprint IN (...)
         AND timestamp_ns > {start - 300s} AND timestamp_ns <= {end}
       GROUP BY fingerprint, structured_metadata, lo, hi
       HAVING lo <= hi
@@ -777,7 +783,7 @@ SELECT pattern, sum(cnt) AS total,
 FROM (
     SELECT pattern, intDiv(bucket_ns, {step_ns}) * {step_ns} AS ts_ns, sum(count) AS cnt
     FROM log_patterns
-    WHERE fingerprint IN (...) AND bucket_ns >= {start} AND bucket_ns < {end}
+    WHERE org_id = '' AND fingerprint IN (...) AND bucket_ns >= {start} AND bucket_ns < {end}
     GROUP BY pattern, ts_ns
 )
 GROUP BY pattern
@@ -785,7 +791,7 @@ ORDER BY total DESC, pattern ASC
 LIMIT 1000
 ```
 
-`fingerprint IN` engages the `(fingerprint, bucket_ns, pattern)` primary-key prefix (granule pruning), daily partitions prune the window, and the aggregation + top-K + LIMIT all execute in ClickHouse — the client decodes ≤ 1000 already-assembled series. `step` is floored to the 10s ingest bucket; the `(end-start)/step` grid is capped at 11,000 (else 400), and the response is the Loki-interop envelope (docs/api.md §2.6).
+`org_id` and `fingerprint IN` engage the `(org_id, fingerprint, bucket_ns, pattern)` primary-key prefix (granule pruning), daily partitions prune the window, and the aggregation + top-K + LIMIT all execute in ClickHouse — the client decodes ≤ 1000 already-assembled series. `step` is floored to the 10s ingest bucket; the `(end-start)/step` grid is capped at 11,000 (else 400), and the response is the Loki-interop envelope (docs/api.md §2.6).
 
 **Live tail** polls stage 3's shape with a monotonic `timestamp_ns >` cursor; line-filter pushdown identical.
 
@@ -1577,7 +1583,7 @@ The script reads the same environment variables the binary does ([configuration.
 
 **Tokens are double-brace.** `{{db}}`, `{{on_cluster}}`, `{{retention_days}}` and the rest are substituted by the script and, for the two things read at run time, by `pulsus-schema`'s own renderer. ClickHouse's `{shard}` and `{replica}` are the **server's** macros and must reach it as those exact characters: a substitution matching a single brace pair eats them, and the server accepts the result without complaint — every shard then joins one replica set. Nothing in the file may be a single-brace token, and `crates/pulsus-schema/tests/schema_file.rs` holds that, along with the rule that every replication path names the table of its own `CREATE`.
 
-**Two things are read out of the file at run time**, neither of them DDL: a materialized view's own projection, which `rebuild-metrics` and `rebuild-traces` replay a landing window through, and a table's declared column list, from which the trace fetch derives its projection.
+**Two things are read out of the file at run time**, neither of them DDL: a materialized view's own projection, which `rebuild-metrics`, `rebuild-logs` and `rebuild-traces` replay a landing window through, and a table's declared column list, from which the trace fetch derives its projection.
 
 ---
 

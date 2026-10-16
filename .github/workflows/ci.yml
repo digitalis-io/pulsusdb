@@ -1536,6 +1536,15 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-server --test rebuild_live
 
+      # Issue #653: `pulsusdb rebuild-logs`, run as the binary, replays one
+      # tenant's landing window into each log target and leaves every other
+      # tenant's rows as they were.
+      - name: Live logs rebuild
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-server --test rebuild_logs_live
+
       # Issue #270: OTLP/JSON metrics ingest must store the CORRECTLY ROUNDED
       # f64 — POST /v1/metrics (application/json) -> decode_json -> parse ->
       # MetricWriter (sync) -> ClickHouse, read back as
@@ -1685,6 +1694,24 @@ jobs:
           PULSUS_TEST_CLICKHOUSE: "1"
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-server --test prom_api_tenants_live
+
+      # Issue #653: two tenants' log rows on one fingerprint; every engine
+      # read over a log table answers the asking tenant's own rows.
+      - name: Live logs tenants
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-read --test live_logs_tenants
+
+      # Issue #653: `X-Scope-OrgID` on every log route through the
+      # binary — the sorting keys, three tenants' pushes on every route,
+      # the header's rule and its precedence, and push suppression per
+      # tenant.
+      - name: Live logs API tenants
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-server --test logs_api_tenants_live
 
       # Issue #548: the statements the database actually received, read
       # back out of `system.query_log` and compared against text the test

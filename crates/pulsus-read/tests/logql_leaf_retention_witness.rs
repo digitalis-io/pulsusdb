@@ -498,6 +498,9 @@ const FIXTURES: &[Fixture] = &[
 
 fn plan_ctx() -> PlanCtx<'static> {
     PlanCtx {
+        tenant: Box::leak(Box::new(
+            pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+        )),
         db: "pulsus",
         streams_idx: "log_streams_idx",
         streams: "log_streams",

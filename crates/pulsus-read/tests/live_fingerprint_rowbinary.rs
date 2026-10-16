@@ -49,8 +49,8 @@ use pulsus_schema::RenderCtx;
 use pulsus_schema_testkit::run_init;
 use pulsus_write::SeriesRef;
 use pulsus_write::writer::{
-    LogPatternRow, LogSampleRow, LogStreamRow, MetricHistSampleRow, MetricLandingRow,
-    MetricSampleRow, MetricSeriesRow,
+    LogLandingRow, LogPatternRow, LogSampleRow, LogStreamRow, MetricHistSampleRow,
+    MetricLandingRow, MetricSampleRow, MetricSeriesRow,
 };
 
 /// `2^64-1`, `2^64`, `2^64+1`, `2^64+2`.
@@ -158,57 +158,63 @@ async fn drop_database(client: &ChClient, db: &str) {
 
 /// Creates the schema and writes one row per boundary value into every
 /// table that carries a fingerprint, **through the writer's own `Row`
-/// structs** — so the serialize direction is exercised by the same six
-/// structs production inserts with.
+/// structs** — so the serialize direction is exercised by the structs
+/// production inserts with: the two landing rows, and the metric sample
+/// rows.
 async fn seed(client: &ChClient, db: &str) {
     let ts_ns = now_ns();
     let ts_ms = ts_ns / 1_000_000;
-    let streams: Vec<LogStreamRow> = fingerprints()
-        .into_iter()
-        .map(|fingerprint| LogStreamRow {
-            month: pulsus_model::Date::start_of_month_utc(ts_ns)
-                .expect("a month for now")
-                .days_since_epoch(),
-            fingerprint,
-            service: "checkout".to_string(),
-            labels: r#"{"service_name":"checkout"}"#.to_string(),
-            updated_ns: ts_ns,
-        })
-        .collect();
+    // Issue #653: the three log target tables carry a tenant column the
+    // target row types do not, and production writes them through
+    // `log_landing` alone (issue #603), so the log rows are landed through
+    // `LogLandingRow` and the views write the targets. They are still read
+    // back below through the three target structs.
+    let org: std::sync::Arc<str> = std::sync::Arc::from("");
+    let (labels, _) = pulsus_model::LabelSet::from_normalized([(
+        "service_name".to_string(),
+        "checkout".to_string(),
+    )]);
+    let mut landed: Vec<LogLandingRow> = Vec::new();
+    for fingerprint in fingerprints() {
+        landed.push(LogLandingRow::stream(
+            &org,
+            ts_ms,
+            &pulsus_write::StreamRow {
+                month: pulsus_model::Date::start_of_month_utc(ts_ns).expect("a month for now"),
+                fingerprint,
+                service: "checkout".to_string(),
+                labels: labels.clone(),
+                updated_ns: ts_ns,
+            },
+        ));
+        landed.push(LogLandingRow::line(
+            &org,
+            ts_ms,
+            &pulsus_write::LogRow {
+                service: "checkout".to_string(),
+                fingerprint,
+                timestamp_ns: pulsus_model::UnixNano(ts_ns),
+                severity: 0,
+                body: r#"{"latency":7}"#.to_string(),
+                structured_metadata: r#"{"trace_id":"abc"}"#.to_string(),
+            },
+        ));
+        landed.push(LogLandingRow::pattern(
+            &org,
+            ts_ms,
+            LogPatternRow {
+                fingerprint,
+                bucket_ns: ts_ns,
+                pattern: "user <_> login".to_string(),
+                count: 1,
+            },
+        ));
+    }
+    let _ = db;
     client
-        .insert_block("log_streams", &streams)
+        .insert_block("log_landing", &landed)
         .await
-        .expect("insert log_streams through LogStreamRow");
-    land_seeded_streams(client, db).await;
-    let samples: Vec<LogSampleRow> = fingerprints()
-        .into_iter()
-        .map(|fingerprint| LogSampleRow {
-            service: "checkout".to_string(),
-            fingerprint,
-            timestamp_ns: ts_ns,
-            severity: 0,
-            body: r#"{"latency":7}"#.to_string(),
-            structured_metadata: r#"{"trace_id":"abc"}"#.to_string(),
-        })
-        .collect();
-    client
-        .insert_block("log_samples", &samples)
-        .await
-        .expect("insert log_samples through LogSampleRow");
-    land_seeded_lines(client, db).await;
-    let patterns: Vec<LogPatternRow> = fingerprints()
-        .into_iter()
-        .map(|fingerprint| LogPatternRow {
-            fingerprint,
-            bucket_ns: ts_ns,
-            pattern: "user <_> login".to_string(),
-            count: 1,
-        })
-        .collect();
-    client
-        .insert_block("log_patterns", &patterns)
-        .await
-        .expect("insert log_patterns through LogPatternRow");
+        .expect("insert log_landing through LogLandingRow");
 
     // Issue #623: a series is written as a kind-2 landing row, which the two
     // views turn into an activity row and a label row. `metric_series` has
@@ -591,8 +597,9 @@ async fn every_fingerprint_row_struct_round_trips_the_uint128_column() {
     );
 
     // --- crates/pulsus-write/src/writer/rows.rs (6) -------------------
-    // `seed` already wrote through all six; reading back through the same
-    // six closes the round trip in both directions.
+    // `seed` wrote the log rows through `LogLandingRow` and the metric rows
+    // through their own structs; reading back through all six closes the
+    // deserialize direction.
     let rows: Vec<LogStreamRow> = read_all(
         &client,
         "LogStreamRow",
@@ -718,89 +725,4 @@ async fn every_fingerprint_row_struct_round_trips_the_uint128_column() {
     );
 
     drop_database(&bootstrap, &db).await;
-}
-
-/// Re-lands the rows a fixture seeded into `log_streams` through
-/// `log_landing`, so `log_streams` and `log_streams_idx` are both written by
-/// the views that maintain them (issue #603).
-///
-/// **Why the rows are moved rather than copied.** `log_streams_mv` and
-/// `log_streams_idx_mv` both read `log_landing` now, so a fixture that
-/// inserted into `log_streams` directly leaves the index a stage-1 or
-/// discovery read looks at empty. Landing a copy of those rows would leave
-/// two `log_streams` rows per stream, so the seeded rows are staged, the
-/// table is emptied, and the stage is landed as kind-1 rows: what the reads
-/// then see is exactly what the views produce.
-///
-/// **Idempotent**: a second call stages whatever is in `log_streams` at that
-/// point and lands it again, which is the same set.
-async fn land_seeded_streams(client: &ChClient, db: &str) {
-    for sql in [
-        format!(
-            "CREATE TABLE {db}.seed_stage_streams ENGINE = MergeTree ORDER BY tuple() \
-             AS SELECT * FROM {db}.log_streams"
-        ),
-        format!("TRUNCATE TABLE {db}.log_streams"),
-        format!("TRUNCATE TABLE {db}.log_streams_idx"),
-        format!(
-            "INSERT INTO {db}.log_landing \
-             (received_ms, kind, service, fingerprint, timestamp_ns, severity, body, \
-              structured_metadata, month, labels, updated_ns, pattern, pattern_count) \
-             SELECT toUnixTimestamp64Milli(now64(3)), 1, service, fingerprint, 0, 0, '', '', \
-                    month, labels, updated_ns, '', 0 \
-             FROM {db}.seed_stage_streams"
-        ),
-        format!("DROP TABLE {db}.seed_stage_streams"),
-    ] {
-        client
-            .execute(&sql, &QuerySettings::new(), Idempotency::Idempotent)
-            .await
-            .unwrap_or_else(|e| {
-                panic!(
-                    "land seeded streams failed: {e}
-SQL:
-{sql}"
-                )
-            });
-    }
-}
-
-/// Re-lands the rows a fixture seeded into `log_samples` through
-/// `log_landing`, so `log_samples` and `log_metrics_<res>` are both written
-/// by the views that maintain them (issue #603) — the same move
-/// [`land_seeded_streams`] makes, for the line kind.
-///
-/// The rollup is truncated with the samples because its `count`/`bytes` are
-/// `SimpleAggregateFunction(sum, UInt64)`: landing the same lines twice
-/// without emptying it would double every count.
-#[allow(dead_code)]
-async fn land_seeded_lines(client: &ChClient, db: &str) {
-    for sql in [
-        format!(
-            "CREATE TABLE {db}.seed_stage_lines ENGINE = MergeTree ORDER BY tuple() \
-             AS SELECT * FROM {db}.log_samples"
-        ),
-        format!("TRUNCATE TABLE {db}.log_samples"),
-        format!("TRUNCATE TABLE {db}.log_metrics_5s"),
-        format!(
-            "INSERT INTO {db}.log_landing \
-             (received_ms, kind, service, fingerprint, timestamp_ns, severity, body, \
-              structured_metadata, month, labels, updated_ns, pattern, pattern_count) \
-             SELECT toUnixTimestamp64Milli(now64(3)), 0, service, fingerprint, timestamp_ns, \
-                    severity, body, structured_metadata, toDate(0), '', 0, '', 0 \
-             FROM {db}.seed_stage_lines"
-        ),
-        format!("DROP TABLE {db}.seed_stage_lines"),
-    ] {
-        client
-            .execute(&sql, &QuerySettings::new(), Idempotency::Idempotent)
-            .await
-            .unwrap_or_else(|e| {
-                panic!(
-                    "land seeded lines failed: {e}
-SQL:
-{sql}"
-                )
-            });
-    }
 }

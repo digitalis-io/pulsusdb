@@ -603,6 +603,7 @@ fn the_file_still_answers_the_two_run_time_questions() {
     assert_eq!(
         log_samples,
         vec![
+            "org_id",
             "service",
             "fingerprint",
             "timestamp_ns",
@@ -1027,11 +1028,12 @@ fn metric_landing_carries_no_event_id() {
     assert_eq!(columns.len(), 26, "the 26 columns the writer sends");
     // Issue #635 part 4: the tenant leads, as it leads the key.
     assert_eq!(columns.first(), Some(&"org_id"));
-    // The log and trace landing tables keep theirs.
-    for other in ["log_landing", "trace_landing"] {
-        let columns = pulsus_schema::table_column_names(other).expect("in the file");
-        assert_eq!(columns.first(), Some(&"event_id"), "{other}");
-    }
+    // The log and trace landing tables keep theirs: the trace table's
+    // first, the log table's after the tenant (issue #653).
+    let log = pulsus_schema::table_column_names("log_landing").expect("in the file");
+    assert_eq!(&log[..2], &["org_id", "event_id"], "log_landing");
+    let trace = pulsus_schema::table_column_names("trace_landing").expect("in the file");
+    assert_eq!(trace.first(), Some(&"event_id"), "trace_landing");
 }
 
 /// **F7 (issue #623): `metric_series` is one row per series per UTC day**,
@@ -1321,5 +1323,66 @@ fn the_write_path_tables_write_with_adaptive_buffers_in_both_modes() {
                 "{table}, {mode}: {settings}"
             );
         }
+    }
+}
+
+/// **T-S2 (issue #653): the log tables lead with the tenant, in both
+/// forms.** In the single-node and the clustered rendering, each of the six
+/// log tables is created once, keyed with `org_id` first, and neither
+/// aggregating table carries the tests-first seam's
+/// `allow_dimensions_outside_sorting_key`. One assertion per rendering,
+/// naming every table that fails.
+#[test]
+fn the_log_tables_lead_with_the_tenant_in_both_forms() {
+    let keys = [
+        (
+            "log_landing",
+            "(org_id, kind, service, fingerprint, timestamp_ns)",
+        ),
+        ("log_metrics_5s", "(org_id, fingerprint, bucket_ns)"),
+        ("log_patterns", "(org_id, fingerprint, bucket_ns, pattern)"),
+        (
+            "log_samples",
+            "(org_id, service, fingerprint, timestamp_ns)",
+        ),
+        ("log_streams", "(org_id, fingerprint)"),
+        ("log_streams_idx", "(org_id, key, val, fingerprint)"),
+    ];
+    let clustered = RenderCtx {
+        cluster: Some("c1".to_string()),
+        ..RenderCtx::for_tests("pulsus")
+    };
+    for (form, ctx) in [("single-node", single()), ("clustered", clustered)] {
+        let stmts = rendered_statements(&ctx);
+        let mut failures = Vec::new();
+        for (table, key) in keys {
+            let head = format!("CREATE TABLE IF NOT EXISTS pulsus.{table}");
+            let creates: Vec<&String> = stmts
+                .iter()
+                .filter(|s| {
+                    s.trim_start()
+                        .strip_prefix(&head)
+                        .is_some_and(|rest| rest.starts_with([' ', '\n']))
+                })
+                .collect();
+            if creates.len() != 1 {
+                failures.push(format!("{table}: created {} times", creates.len()));
+                continue;
+            }
+            let order: Vec<&str> = creates[0]
+                .lines()
+                .filter(|l| l.trim_start().starts_with("ORDER BY"))
+                .collect();
+            let want = format!("ORDER BY {key}");
+            if order != [want.as_str()] {
+                failures.push(format!("{table}: {order:?}, expected {want:?}"));
+            }
+            if creates[0].contains("allow_dimensions_outside_sorting_key") {
+                failures.push(format!(
+                    "{table}: carries allow_dimensions_outside_sorting_key"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{form}: {failures:#?}");
     }
 }

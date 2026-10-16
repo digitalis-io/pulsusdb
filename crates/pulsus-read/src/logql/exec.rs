@@ -28,7 +28,7 @@ use pulsus_clickhouse::{ChClient, ChError, ChRow, ChRowStream, QuerySettings};
 use pulsus_logql::{
     Expr, LabelFilterExpr, LogExpr, MatchOp, Matcher, RangeAggOp, Stage, StreamSelector,
 };
-use pulsus_model::{Fingerprint, FpLiteral};
+use pulsus_model::{Fingerprint, FpLiteral, Tenant};
 
 use super::charge::{
     MAX_STREAMS_RESULT_BYTES, MUT_GROUP_SLOT, PUSHDOWN_INSTANT_SLOT, PUSHDOWN_RANGE_DENSE_SLOT,
@@ -133,8 +133,9 @@ pub struct EngineConfig {
 }
 
 impl EngineConfig {
-    fn plan_ctx(&self) -> PlanCtx<'_> {
+    fn plan_ctx<'a>(&'a self, tenant: &'a Tenant) -> PlanCtx<'a> {
         PlanCtx {
+            tenant,
             db: &self.db,
             streams_idx: &self.streams_idx,
             streams: &self.streams,
@@ -345,6 +346,8 @@ impl DiscoveryQuery<'_> {
 pub struct LogQlEngine {
     client: ChClient,
     config: EngineConfig,
+    /// The request's tenant (issue #653). An engine exists only for one.
+    tenant: Tenant,
     key_route_test: KeyRouteTestHooks,
     /// Test-only: the statement's structured-metadata fragment budget
     /// (issue #544), lowered so a live test can reach the fallback on
@@ -386,10 +389,11 @@ pub struct AggCapOverrides {
 }
 
 impl LogQlEngine {
-    pub fn new(client: ChClient, config: EngineConfig) -> Self {
+    pub fn new(client: ChClient, config: EngineConfig, tenant: Tenant) -> Self {
         Self {
             client,
             config,
+            tenant,
             key_route_test: KeyRouteTestHooks::default(),
             metadata_fragment_budget: None,
             query_log_comment: None,
@@ -472,7 +476,7 @@ impl LogQlEngine {
         params: &QueryParams,
         opts: ResponseOptions,
     ) -> Result<(QueryResult, Warnings), ReadError> {
-        let ctx = self.config.plan_ctx();
+        let ctx = self.config.plan_ctx(&self.tenant);
         let mut warnings = Warnings::new();
         match plan::plan(expr, params, &ctx)? {
             Plan::Streams(sp) => self
@@ -523,7 +527,7 @@ impl LogQlEngine {
         params: &QueryParams,
         opts: ResponseOptions,
     ) -> Result<(QueryResult, Warnings, PlanExplain), ReadError> {
-        let ctx = self.config.plan_ctx();
+        let ctx = self.config.plan_ctx(&self.tenant);
         let mut warnings = Warnings::new();
         match plan::plan(expr, params, &ctx)? {
             Plan::Streams(sp) => {
@@ -695,7 +699,7 @@ impl LogQlEngine {
         let fingerprints: Option<Vec<Fingerprint>> = match selector {
             None => None,
             Some(expr) => {
-                let ctx = self.config.plan_ctx();
+                let ctx = self.config.plan_ctx(&self.tenant);
                 // `limit`/`direction`/`step` are unused placeholders —
                 // none of these three endpoints reads samples (the stats
                 // idiom).
@@ -743,6 +747,7 @@ impl LogQlEngine {
         let window = self.activity_window(b);
         let stage1_minted = fingerprints.as_deref().map(sql_literals);
         let activity_sql = super::sql::active_fingerprints(
+            &self.tenant,
             &self.config.rollup_table,
             stage1_minted.as_deref(),
             window,
@@ -764,16 +769,17 @@ impl LogQlEngine {
         let fps = sql_literals(&active);
         let sql = match query {
             DiscoveryQuery::LabelNames => {
-                super::sql::label_names(&self.config.streams_idx, &months, &fps)
+                super::sql::label_names(&self.tenant, &self.config.streams_idx, &months, &fps)
             }
             DiscoveryQuery::LabelValues { name } => super::sql::label_values(
+                &self.tenant,
                 &self.config.streams_idx,
                 &months,
                 &super::predicate::literal(name),
                 &fps,
             ),
             DiscoveryQuery::DetectedLabels => {
-                super::sql::detected_labels(&self.config.streams_idx, &months, &fps)
+                super::sql::detected_labels(&self.tenant, &self.config.streams_idx, &months, &fps)
             }
         };
         if let Some(e) = explain.as_mut() {
@@ -843,7 +849,7 @@ impl LogQlEngine {
         b: TimeBounds,
         mut explain: Option<&mut PlanExplain>,
     ) -> Result<Vec<String>, ReadError> {
-        let ctx = self.config.plan_ctx();
+        let ctx = self.config.plan_ctx(&self.tenant);
         // `series` never buckets or filters samples — it only needs stage
         // 1's month-bounded fingerprint resolution — so `limit`/
         // `direction`/`step_ns` are unused placeholders (a nonzero
@@ -875,6 +881,7 @@ impl LogQlEngine {
                 e.push(
                     "series_activity_filter",
                     super::sql::active_fingerprints(
+                        &self.tenant,
                         &self.config.rollup_table,
                         None,
                         window,
@@ -930,6 +937,7 @@ impl LogQlEngine {
                 e.push(
                     "series_activity_filter",
                     super::sql::active_fingerprints(
+                        &self.tenant,
                         &self.config.rollup_table,
                         Some(&sql_literals(&fingerprints)),
                         window,
@@ -946,7 +954,7 @@ impl LogQlEngine {
         if let Some(e) = explain.as_mut() {
             e.push(
                 "stage2_hydration",
-                super::sql::stage2(&streams_table, &sql_literals(&fingerprints)),
+                super::sql::stage2(&self.tenant, &streams_table, &sql_literals(&fingerprints)),
                 None,
             );
         }
@@ -962,7 +970,7 @@ impl LogQlEngine {
         expr: &Expr,
         params: &QueryParams,
     ) -> Result<PlanExplain, ReadError> {
-        let ctx = self.config.plan_ctx();
+        let ctx = self.config.plan_ctx(&self.tenant);
         match plan::plan(expr, params, &ctx)? {
             Plan::Streams(sp) => self.explain_streams(&sp).await,
             Plan::Metric(mp) => self.explain_metric(&mp).await,
@@ -1074,6 +1082,7 @@ impl LogQlEngine {
         window: super::sql::TimeWindow,
     ) -> Result<Vec<Fingerprint>, ReadError> {
         let sql = super::sql::active_fingerprints(
+            &self.tenant,
             &self.config.rollup_table,
             None,
             window,
@@ -1134,7 +1143,7 @@ impl LogQlEngine {
         if fingerprints.is_empty() {
             return Ok(out);
         }
-        let sql = super::sql::stage2(streams_table, &sql_literals(fingerprints));
+        let sql = super::sql::stage2(&self.tenant, streams_table, &sql_literals(fingerprints));
         let mut stream = self
             .query_stream::<StreamMetaRow>(&sql, &self.budget_settings())
             .await?;
@@ -1215,6 +1224,7 @@ impl LogQlEngine {
         window: super::sql::TimeWindow,
     ) -> Result<Vec<Fingerprint>, ReadError> {
         let sql = super::sql::active_fingerprints(
+            &self.tenant,
             &self.config.rollup_table,
             Some(&sql_literals(fingerprints)),
             window,
@@ -1350,7 +1360,11 @@ impl LogQlEngine {
         if let Some(e) = explain.as_mut() {
             e.push(
                 "stage2_hydration",
-                super::sql::stage2(&sp.streams_table, &sql_literals(&fingerprints)),
+                super::sql::stage2(
+                    &self.tenant,
+                    &sp.streams_table,
+                    &sql_literals(&fingerprints),
+                ),
                 None,
             );
         }
@@ -1369,6 +1383,7 @@ impl LogQlEngine {
         // over the stored line.
         let rx = rx_column(&compiled)?;
         let sql = super::sql::stage3_with_rx(
+            &self.tenant,
             &sp.samples_table,
             &services,
             &sql_literals(&fingerprints),
@@ -1583,6 +1598,7 @@ impl LogQlEngine {
                 },
             };
             let sql = super::sql::stage3_keyset_with_rx(
+                &self.tenant,
                 &sp.samples_table,
                 services,
                 &sql_literals(fingerprints),
@@ -1759,7 +1775,11 @@ impl LogQlEngine {
         if let Some(e) = explain.as_mut() {
             e.push(
                 "stage2_hydration",
-                super::sql::stage2(&mp.streams_table, &sql_literals(&fingerprints)),
+                super::sql::stage2(
+                    &self.tenant,
+                    &mp.streams_table,
+                    &sql_literals(&fingerprints),
+                ),
                 None,
             );
         }
@@ -1863,6 +1883,7 @@ impl LogQlEngine {
             // `metric_source`'s `.expect` would be reachable by an
             // ordinary query if this stayed above the branch.
             let sql = super::sql::metric_instant(
+                &self.tenant,
                 metric_source(mp),
                 &services,
                 &sql_literals(&fingerprints),
@@ -1986,7 +2007,13 @@ impl LogQlEngine {
                     )
                     .await;
             }
-            match bucketed_range_sql(mp, &services, &fingerprints, &lowered.predicates) {
+            match bucketed_range_sql(
+                &self.tenant,
+                mp,
+                &services,
+                &fingerprints,
+                &lowered.predicates,
+            ) {
                 Ok(sql) => {
                     let sql = match self.key_route_test.bucketed_statement_max_memory_bytes {
                         Some(n) => format!("{sql}\nSETTINGS max_memory_usage = {n}"),
@@ -2247,6 +2274,7 @@ impl LogQlEngine {
             (false, Some(step)) => {
                 let resolved = super::reduce::resolve_reduced(value, meta);
                 super::sql::metric_range_reduced(
+                    &self.tenant,
                     &mp.table,
                     value,
                     &resolved.columns,
@@ -2396,6 +2424,7 @@ impl LogQlEngine {
         // an instant query keeps the total-timestamp order its reducers pin.
         let rx = rx_column_for(compiled, client_needs_no_labels(mp, client))?;
         let sql = client_metric_read_sql(
+            &self.tenant,
             mp,
             services,
             fingerprints,
@@ -2572,7 +2601,11 @@ impl LogQlEngine {
         if let Some(e) = explain.as_mut() {
             e.push(
                 "stage2_hydration",
-                super::sql::stage2(&scan.streams_table, &sql_literals(&fingerprints)),
+                super::sql::stage2(
+                    &self.tenant,
+                    &scan.streams_table,
+                    &sql_literals(&fingerprints),
+                ),
                 None,
             );
         }
@@ -2600,6 +2633,7 @@ impl LogQlEngine {
             )?)
         };
         let sql = client_metric_read_sql(
+            &self.tenant,
             scan,
             &services,
             &fingerprints,
@@ -2748,7 +2782,11 @@ impl LogQlEngine {
         if fingerprints.is_empty() {
             return Ok(explain);
         }
-        let stage2_sql = super::sql::stage2(&sp.streams_table, &sql_literals(&fingerprints));
+        let stage2_sql = super::sql::stage2(
+            &self.tenant,
+            &sp.streams_table,
+            &sql_literals(&fingerprints),
+        );
         explain.push("stage2_hydration", stage2_sql.clone(), None);
         let meta = self.hydrate(&sp.streams_table, &fingerprints).await?;
         let services = distinct_escaped_services(&meta);
@@ -2756,6 +2794,7 @@ impl LogQlEngine {
         let fetch_until_limit = sp.fetch_until_limit || !lowered.metadata_lowered;
         let rx = rx_column(&CompiledPipeline::compile(&sp.pipeline)?)?;
         let stage3_sql = super::sql::stage3_with_rx(
+            &self.tenant,
             &sp.samples_table,
             &services,
             &sql_literals(&fingerprints),
@@ -2807,7 +2846,11 @@ impl LogQlEngine {
         }
         explain.push(
             "stage2_hydration",
-            super::sql::stage2(&mp.streams_table, &sql_literals(&fingerprints)),
+            super::sql::stage2(
+                &self.tenant,
+                &mp.streams_table,
+                &sql_literals(&fingerprints),
+            ),
             None,
         );
         let meta = self.hydrate(&mp.streams_table, &fingerprints).await?;
@@ -2860,6 +2903,7 @@ impl LogQlEngine {
                 client_needs_no_labels(mp, restored),
             )?;
             client_metric_read_sql(
+                &self.tenant,
                 mp,
                 &services,
                 &fingerprints,
@@ -2887,7 +2931,13 @@ impl LogQlEngine {
                 Some(_) => {
                     let rendered = match &mp.value {
                         super::sql::MetricValue::Shaped(_) | super::sql::MetricValue::Staged(_) => {
-                            bucketed_range_sql(mp, &services, &fingerprints, &lowered.predicates)
+                            bucketed_range_sql(
+                                &self.tenant,
+                                mp,
+                                &services,
+                                &fingerprints,
+                                &lowered.predicates,
+                            )
                         }
                         // Issue #624, part 4: the reduced statement, unless
                         // a selected stream labelled `x` meets a parser in
@@ -2899,6 +2949,7 @@ impl LogQlEngine {
                                 (false, Some(step)) => {
                                     let resolved = super::reduce::resolve_reduced(r, &meta);
                                     super::sql::metric_range_reduced(
+                                        &self.tenant,
                                         &mp.table,
                                         r,
                                         &resolved.columns,
@@ -2929,6 +2980,7 @@ impl LogQlEngine {
                             | BucketGridRefusal::RangeNotPositive
                             | BucketGridRefusal::RollupSource,
                         ) => client_metric_read_sql(
+                            &self.tenant,
                             mp,
                             &services,
                             &fingerprints,
@@ -2947,6 +2999,7 @@ impl LogQlEngine {
                 // The shape is read here rather than above the match,
                 // for the reason `run_metric_inner`'s instant arm gives.
                 None => super::sql::metric_instant(
+                    &self.tenant,
                     metric_source(mp),
                     &services,
                     &sql_literals(&fingerprints),
@@ -3207,7 +3260,7 @@ impl LogQlEngine {
         b: TimeBounds,
         mut explain: Option<&mut PlanExplain>,
     ) -> Result<LogStats, ReadError> {
-        let ctx = self.config.plan_ctx();
+        let ctx = self.config.plan_ctx(&self.tenant);
         // `limit`/`direction`/`step` are unused placeholders — stats
         // never reads samples through stage 3 (same idiom as `series`).
         let qp = QueryParams {
@@ -3258,6 +3311,7 @@ impl LogQlEngine {
         let (sql, routing) = if sp.line_filters.is_empty() {
             (
                 super::sql::log_stats_rollup(
+                    &self.tenant,
                     &self.config.rollup_table,
                     &sql_literals(&fingerprints),
                     window,
@@ -3276,7 +3330,11 @@ impl LogQlEngine {
             if let Some(e) = explain.as_mut() {
                 e.push(
                     "stage2_hydration",
-                    super::sql::stage2(&sp.streams_table, &sql_literals(&fingerprints)),
+                    super::sql::stage2(
+                        &self.tenant,
+                        &sp.streams_table,
+                        &sql_literals(&fingerprints),
+                    ),
                     None,
                 );
             }
@@ -3284,6 +3342,7 @@ impl LogQlEngine {
             let services = distinct_escaped_services(&meta);
             (
                 super::sql::log_stats_raw(
+                    &self.tenant,
                     &sp.samples_table,
                     &services,
                     &sql_literals(&fingerprints),
@@ -3366,7 +3425,7 @@ impl LogQlEngine {
         step_ns: u64,
         mut explain: Option<&mut PlanExplain>,
     ) -> Result<Vec<PatternSeries>, ReadError> {
-        let ctx = self.config.plan_ctx();
+        let ctx = self.config.plan_ctx(&self.tenant);
         // `limit`/`direction`/`step` are unused placeholders — patterns never
         // reads samples through stage 3 (the `stats_inner`/`volume_inner`
         // idiom); its aggregation targets `log_patterns` directly.
@@ -3412,6 +3471,7 @@ impl LogQlEngine {
             end_ns: b.end_ns,
         };
         let sql = super::sql::log_patterns_read(
+            &self.tenant,
             &self.config.patterns_table,
             &sql_literals(&fingerprints),
             window,
@@ -3521,7 +3581,7 @@ impl LogQlEngine {
             &injected
         };
 
-        let ctx = self.config.plan_ctx();
+        let ctx = self.config.plan_ctx(&self.tenant);
         // `limit`/`direction`/`step` are unused placeholders — volume
         // never reads samples through stage 3 (the `stats_inner` idiom).
         let qp = QueryParams {
@@ -3554,7 +3614,11 @@ impl LogQlEngine {
         if let Some(e) = explain.as_mut() {
             e.push(
                 "stage2_hydration",
-                super::sql::stage2(&sp.streams_table, &sql_literals(&fingerprints)),
+                super::sql::stage2(
+                    &self.tenant,
+                    &sp.streams_table,
+                    &sql_literals(&fingerprints),
+                ),
                 None,
             );
         }
@@ -3565,6 +3629,7 @@ impl LogQlEngine {
             end_ns: q.bounds.end_ns,
         };
         let sql = super::sql::log_volume_rollup(
+            &self.tenant,
             &self.config.rollup_table,
             &sql_literals(&fingerprints),
             window,
@@ -3825,7 +3890,7 @@ impl LogQlEngine {
         acc: &mut FieldAccumulator,
         mut explain: Option<&mut PlanExplain>,
     ) -> Result<Option<bool>, ReadError> {
-        let ctx = self.config.plan_ctx();
+        let ctx = self.config.plan_ctx(&self.tenant);
         // `limit = line_limit` drives the plan's scan/result sizing
         // exactly as a `/query_range` with the same limit would
         // (`scan_limit = line_limit × pipeline_scan_factor` on the
@@ -3863,7 +3928,11 @@ impl LogQlEngine {
         if let Some(e) = explain.as_mut() {
             e.push(
                 "stage2_hydration",
-                super::sql::stage2(&sp.streams_table, &sql_literals(&fingerprints)),
+                super::sql::stage2(
+                    &self.tenant,
+                    &sp.streams_table,
+                    &sql_literals(&fingerprints),
+                ),
                 None,
             );
         }
@@ -3891,6 +3960,7 @@ impl LogQlEngine {
             // post-pipeline matches (`scan_limit == line_limit` by
             // construction). Never partial.
             let sql = super::sql::stage3_with_rx(
+                &self.tenant,
                 &sp.samples_table,
                 &services,
                 &sql_literals(&fingerprints),
@@ -3965,6 +4035,7 @@ impl LogQlEngine {
         // matches, window exhaustion, or budget exhaustion.
         if let Some(e) = explain.as_mut() {
             let first_page_sql = super::sql::stage3_keyset_with_rx(
+                &self.tenant,
                 &sp.samples_table,
                 &services,
                 &sql_literals(&fingerprints),
@@ -4098,6 +4169,7 @@ impl LogQlEngine {
                 },
             };
             let sql = super::sql::stage3_keyset_with_rx(
+                &self.tenant,
                 &sp.samples_table,
                 services,
                 &sql_literals(fingerprints),
@@ -4161,7 +4233,7 @@ impl LogQlEngine {
         params: &QueryParams,
         opts: ResponseOptions,
     ) -> Result<TailSetup, ReadError> {
-        let ctx = self.config.plan_ctx();
+        let ctx = self.config.plan_ctx(&self.tenant);
         match plan::plan(expr, params, &ctx)? {
             Plan::Streams(sp) => {
                 let compiled = CompiledPipeline::compile(&sp.pipeline)?;
@@ -4219,7 +4291,7 @@ impl LogQlEngine {
         upper_ns: i64,
         narrow: bool,
     ) -> Result<(), ReadError> {
-        let ctx = self.config.plan_ctx();
+        let ctx = self.config.plan_ctx(&self.tenant);
         refresh_tail_months(&ctx, setup, lower_ns, upper_ns, narrow)
     }
 
@@ -4289,6 +4361,7 @@ impl LogQlEngine {
         // over the stored line.
         let rx = rx_column(&setup.compiled)?;
         let sql = super::sql::stage3_keyset_with_rx(
+            &self.tenant,
             &setup.plan.samples_table,
             &services,
             &sql_literals(fingerprints),
@@ -6242,6 +6315,7 @@ fn client_needs_no_labels(mp: &MetricPlan, client: &ClientAgg) -> bool {
 }
 
 fn bucketed_range_sql(
+    tenant: &Tenant,
     mp: &MetricPlan,
     services: &[CheckedLiteral],
     fingerprints: &[Fingerprint],
@@ -6304,6 +6378,7 @@ fn bucketed_range_sql(
     // smaller and faster there; the sliding statement at every other range.
     if mp.range_ns.get() != step_ns {
         return super::sql::metric_range_sliding_with_regexp(
+            tenant,
             metric_source(mp),
             services,
             &sql_literals(fingerprints),
@@ -6323,6 +6398,7 @@ fn bucketed_range_sql(
         .checked_sub(step_ns)
         .ok_or(BucketGridRefusal::WouldOverflow)?;
     super::sql::metric_range_bucketed_with_regexp(
+        tenant,
         metric_source(mp),
         services,
         &sql_literals(fingerprints),
@@ -6558,6 +6634,7 @@ pub fn bucketed_fallback_client_agg(mp: &MetricPlan) -> ClientAgg {
 /// passed in — one site, so execution and EXPLAIN cannot disagree about
 /// whether `structured_metadata` is read (issue #249).
 fn client_metric_read_sql(
+    tenant: &Tenant,
     mp: &MetricPlan,
     services: &[CheckedLiteral],
     fingerprints: &[Fingerprint],
@@ -6576,6 +6653,7 @@ fn client_metric_read_sql(
     // instant query lowered at one grid point reads as the instant it is.
     if !mp.answers_instant() {
         super::sql::metric_raw_samples_sliding_with_rx(
+            tenant,
             &mp.table,
             services,
             &sql_literals(fingerprints),
@@ -6587,6 +6665,7 @@ fn client_metric_read_sql(
         )
     } else {
         super::sql::metric_raw_samples_with_rx(
+            tenant,
             &mp.table,
             services,
             &sql_literals(fingerprints),
@@ -7460,6 +7539,9 @@ mod tests {
     #[test]
     fn explain_and_execution_share_one_client_read_sql() {
         let ctx = PlanCtx {
+            tenant: Box::leak(Box::new(
+                pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            )),
             db: "pulsus",
             streams_idx: "log_streams_idx",
             streams: "log_streams",
@@ -7495,6 +7577,7 @@ mod tests {
             step_ns: 15_000_000_000,
         });
         let range_sql = client_metric_read_sql(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
             &range_mp,
             &svc,
             &[Fingerprint::from_raw(1)],
@@ -7511,6 +7594,7 @@ mod tests {
             at_ns: 60_000_000_000,
         });
         let instant_sql = client_metric_read_sql(
+            &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
             &instant_mp,
             &svc,
             &[Fingerprint::from_raw(1)],
@@ -8246,7 +8330,7 @@ mod tests {
             super::super::params::DEFAULT_MAX_STREAMS,
         )
         .collect();
-        let sql = super::super::sql::stage2("log_streams", &fps);
+        let sql = super::super::sql::stage2(&longest_tenant(), "log_streams", &fps);
         let bytes = sql.len() as u64;
         assert!(
             bytes > 262_144,
@@ -8258,6 +8342,17 @@ mod tests {
             "worst-case stage2 SQL ({bytes} B) must fit under the {}-byte cap",
             crate::querytext::MAX_QUERY_TEXT_BYTES
         );
+    }
+
+    /// The longest tenant the header admits, 150 bytes (issue #653): the
+    /// worst-case statements below carry it.
+    fn longest_tenant() -> pulsus_model::Tenant {
+        let value = "a".repeat(pulsus_model::MAX_TENANT_BYTES);
+        pulsus_model::Tenant::from_header(
+            Some(&http::HeaderValue::from_str(&value).expect("a header value")),
+            false,
+        )
+        .expect("a valid tenant")
     }
 
     /// The full guaranteed-admitted envelope this issue's plan derives:
@@ -8313,6 +8408,7 @@ mod tests {
     fn stage3_at_the_full_worst_case_envelope_fits_under_the_query_text_cap() {
         let (fps, services, line_filters) = worst_case_envelope();
         let sql = super::super::sql::stage3(
+            &longest_tenant(),
             "log_samples",
             &services,
             &fps,
@@ -8337,6 +8433,7 @@ mod tests {
     fn stage3_keyset_at_the_full_worst_case_envelope_fits_under_the_query_text_cap() {
         let (fps, services, line_filters) = worst_case_envelope();
         let sql = super::super::sql::stage3_keyset(
+            &longest_tenant(),
             "log_samples",
             &services,
             &fps,
@@ -8389,6 +8486,9 @@ mod tests {
 
     fn tail_test_ctx() -> PlanCtx<'static> {
         PlanCtx {
+            tenant: Box::leak(Box::new(
+                pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            )),
             db: "pulsus",
             streams_idx: "log_streams_idx",
             streams: "log_streams",
@@ -9111,6 +9211,9 @@ mod tests {
     fn tail_pipeline_output_is_identical_to_the_query_paths_on_the_same_rows() {
         let expr = pulsus_logql::parse(r#"{app="x"} |= "keep" | logfmt | y="z""#).expect("parse");
         let ctx = PlanCtx {
+            tenant: Box::leak(Box::new(
+                pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            )),
             db: "pulsus",
             streams_idx: "log_streams_idx",
             streams: "log_streams",
@@ -10168,6 +10271,9 @@ mod tests {
             direction: Direction::Backward,
         };
         let ctx = PlanCtx {
+            tenant: Box::leak(Box::new(
+                pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+            )),
             db: "d",
             streams_idx: "log_streams_idx",
             streams: "log_streams",
@@ -10992,6 +11098,9 @@ mod tests {
                 direction: Direction::Backward,
             };
             let ctx = PlanCtx {
+                tenant: Box::leak(Box::new(
+                    pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+                )),
                 db: "pulsus",
                 streams_idx: "log_streams_idx",
                 streams: "log_streams",
@@ -11013,13 +11122,28 @@ mod tests {
         // The control: the planned shape renders.
         let base = planned(r#"count_over_time({a="b"}[1m])"#);
         assert!(base.client.is_none(), "the fixture must be a lowered plan");
-        assert!(bucketed_range_sql(&base, &services, &fingerprints, &[]).is_ok());
+        assert!(
+            bucketed_range_sql(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+                &base,
+                &services,
+                &fingerprints,
+                &[]
+            )
+            .is_ok()
+        );
 
         // No step at all: no grid.
         let mut mp = base.clone();
         mp.step_ns = None;
         assert_eq!(
-            bucketed_range_sql(&mp, &services, &fingerprints, &[]),
+            bucketed_range_sql(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+                &mp,
+                &services,
+                &fingerprints,
+                &[]
+            ),
             Err(BucketGridRefusal::StepNotPositive)
         );
 
@@ -11028,7 +11152,13 @@ mod tests {
         let mut mp = base.clone();
         mp.start_ns = base.grid_start_ns - base.step_ns.expect("a step").get() - 1;
         assert_eq!(
-            bucketed_range_sql(&mp, &services, &fingerprints, &[]),
+            bucketed_range_sql(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+                &mp,
+                &services,
+                &fingerprints,
+                &[]
+            ),
             Err(BucketGridRefusal::AnchorAboveScanStart)
         );
 
@@ -11039,7 +11169,13 @@ mod tests {
         mp.start_ns = i64::MIN;
         mp.end_ns = i64::MAX;
         assert_eq!(
-            bucketed_range_sql(&mp, &services, &fingerprints, &[]),
+            bucketed_range_sql(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+                &mp,
+                &services,
+                &fingerprints,
+                &[]
+            ),
             Err(BucketGridRefusal::WouldOverflow)
         );
 
@@ -11052,7 +11188,13 @@ mod tests {
         mp.grid_start_ns = i64::MIN;
         mp.start_ns = i64::MIN;
         assert_eq!(
-            bucketed_range_sql(&mp, &services, &fingerprints, &[]),
+            bucketed_range_sql(
+                &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+                &mp,
+                &services,
+                &fingerprints,
+                &[]
+            ),
             Err(BucketGridRefusal::WouldOverflow)
         );
 

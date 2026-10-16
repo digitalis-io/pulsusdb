@@ -187,6 +187,8 @@ async fn create_table_query(client: &ChClient, db: &str, name: &str) -> String {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 struct LogSampleRow {
+    /// The tenant (issue #653): the empty tenant's rows.
+    org_id: String,
     service: String,
     fingerprint: u128,
     timestamp_ns: i64,
@@ -381,6 +383,7 @@ async fn run_init_clustered_creates_dist_wrappers_on_every_shard_with_identical_
     )
     .expect("fits i64");
     let row = LogSampleRow {
+        org_id: String::new(),
         service: "checkout".to_string(),
         fingerprint: 0xABCD_EF01_2345_6789,
         timestamp_ns: now_ns,
@@ -401,7 +404,7 @@ async fn run_init_clustered_creates_dist_wrappers_on_every_shard_with_identical_
     // returns — polled with the same retry/tolerance discipline as the
     // bookkeeping-consistency test above, rather than a single racy read.
     let sql = format!(
-        "SELECT service, fingerprint, timestamp_ns, severity, body FROM {TEST_DB_DIST}.log_samples_dist \
+        "SELECT org_id, service, fingerprint, timestamp_ns, severity, body FROM {TEST_DB_DIST}.log_samples_dist \
          WHERE fingerprint = {}",
         row.fingerprint
     );
@@ -1473,6 +1476,7 @@ async fn a_disabling_profile_keeps_repeated_log_and_metric_blocks_and_drops_the_
         .expect("connect as the profile's user");
     let now = cluster_now_ns();
     let log = LogSampleRow {
+        org_id: String::new(),
         service: "checkout".to_string(),
         fingerprint: 0x0560_0560_0560_0560,
         timestamp_ns: now,

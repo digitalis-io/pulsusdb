@@ -84,13 +84,16 @@ struct SeedRow {
     structured_metadata: String,
 }
 
-/// One `log_landing` row, in the table's own column order (issue #603).
+/// One `log_landing` row, in the table's own column order (issue #603),
+/// the tenant first (issue #653).
 /// The corpus is seeded through the landing table because `log_samples`,
 /// `log_streams` and `log_streams_idx` are all maintained by materialized
 /// view off it now, so an insert into a target directly would leave the
 /// index this scenario's stage-1 resolution reads empty.
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedLandingRow {
+    /// The tenant (issue #653): the empty tenant's rows.
+    org_id: String,
     received_ms: i64,
     kind: u8,
     service: String,
@@ -224,6 +227,7 @@ pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
         let landing: Vec<SeedLandingRow> = batch
             .iter()
             .map(|r| SeedLandingRow {
+                org_id: String::new(),
                 received_ms,
                 kind: 0,
                 service: r.service.clone(),
@@ -616,6 +620,7 @@ async fn route_engine(
             pipeline_scan_factor: 10,
             distributed: false,
         },
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
     )
     .with_query_log_comment(tag);
     Ok(match budget {

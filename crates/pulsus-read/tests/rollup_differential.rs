@@ -242,6 +242,9 @@ fn range_params(base_ns: i64, step_ns: u64) -> QueryParams {
 
 fn plan_ctx(db: &str) -> PlanCtx<'_> {
     PlanCtx {
+        tenant: Box::leak(Box::new(
+            pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+        )),
         db,
         streams_idx: "log_streams_idx",
         streams: "log_streams",
@@ -402,6 +405,7 @@ async fn assert_rollup_matches_raw(
     let raw_source = sql::MetricSource::new(&raw_table, MetricShape::raw(is_bytes));
 
     let rollup_sql = sql::metric_range(
+        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
         rollup_source,
         &[],
         fps,
@@ -411,6 +415,7 @@ async fn assert_rollup_matches_raw(
         &mp.extra_predicates,
     );
     let raw_sql = sql::metric_range(
+        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
         raw_source,
         &[literal("checkout")],
         fps,
@@ -601,6 +606,7 @@ async fn engine_query_on_the_rollup_path_matches_independently_computed_raw_coun
             pipeline_scan_factor: 10,
             distributed: false,
         },
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
     );
 
     let expr = parse(r#"count_over_time({env="prod"}[1m])"#).expect("parse");
@@ -686,6 +692,7 @@ async fn engine_query_on_the_client_agg_path_matches_the_sql_aggregated_count() 
             pipeline_scan_factor: 10,
             distributed: false,
         },
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
     );
 
     // The stage below forces the client-aggregated mode (asserted below)
@@ -799,6 +806,7 @@ async fn engine_client_agg_scan_past_the_byte_budget_is_a_named_query_too_broad(
             pipeline_scan_factor: 10,
             distributed: false,
         },
+        pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
     );
 
     let w = window(base_ns);

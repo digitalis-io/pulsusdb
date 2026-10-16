@@ -93,7 +93,7 @@ async fn setup_db(db: &str) -> ChClient {
 
     client
         .execute(
-            "CREATE TABLE log_streams (fingerprint UInt128, service String, labels String) \
+            "CREATE TABLE log_streams (org_id String, fingerprint UInt128, service String, labels String) \
              ENGINE = Memory",
             &QuerySettings::new(),
             Idempotency::Idempotent,
@@ -172,7 +172,11 @@ async fn stage2_oversized_sql_fails_under_ch_defaults_and_succeeds_under_the_rai
     ))
     .await;
     let fps = oversized_fingerprint_set();
-    let sql = sql::stage2("log_streams", &fps);
+    let sql = sql::stage2(
+        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+        "log_streams",
+        &fps,
+    );
     assert!(
         sql.len() > 262_144,
         "fixture SQL is {} bytes, expected > 262,144 to exercise the ClickHouse default",

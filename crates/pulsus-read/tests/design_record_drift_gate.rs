@@ -2895,7 +2895,7 @@ const REBUILD_BLOCK_BEGIN_MARK: &str = "<!-- generated";
 /// ```text
 ///   citing document        cites                 times   the cited line must carry
 ///   --------------------   -------------------   -----   -------------------------
-///   docs/query-to-sql.md   docs/schemas.md:1104      2   never a `UNION ALL`
+///   docs/query-to-sql.md   docs/schemas.md:1110      2   never a `UNION ALL`
 /// ```
 ///
 /// **The count is not decoration, and leaving it out was the same defect
@@ -2914,7 +2914,7 @@ const REBUILD_BLOCK_BEGIN_MARK: &str = "<!-- generated";
 fn every_cross_document_line_citation_names_the_line_it_quotes() {
     const CROSS_DOC_CITATIONS: &[(&str, &str, usize, &str)] = &[(
         "docs/query-to-sql.md",
-        "docs/schemas.md:1104",
+        "docs/schemas.md:1110",
         2,
         "never a `UNION ALL`",
     )];

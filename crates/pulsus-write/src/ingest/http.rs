@@ -118,6 +118,11 @@ pub async fn ingest(
     body: Body,
     settings: LogIngestSettings,
 ) -> Response {
+    // Issue #653: the tenant first; an invalid one stores nothing.
+    let tenant = match pulsus_model::tenant_from_headers(&headers) {
+        Ok(tenant) => tenant,
+        Err(err) => return status_response(StatusCode::BAD_REQUEST, 3, err.to_string()),
+    };
     let now_ns = now_unix_nanos();
 
     let body = match read_capped_body(body, decompress::MAX_DECOMPRESSED_BYTES).await {
@@ -162,7 +167,7 @@ pub async fn ingest(
     let push = push_headers(&headers);
 
     if is_async(&headers) {
-        return match sink.admit(parsed, push) {
+        return match sink.admit(&tenant, parsed, push) {
             Ok(()) if stream_errors.is_empty() => {
                 export_response(StatusCode::ACCEPTED, rejected, rejected_message)
             }
@@ -175,7 +180,7 @@ pub async fn ingest(
         };
     }
 
-    match sink.admit_flush(parsed, push) {
+    match sink.admit_flush(&tenant, parsed, push) {
         Ok(wait) => match wait.await {
             Ok(()) if stream_errors.is_empty() => {
                 export_response(StatusCode::OK, rejected, rejected_message)
@@ -457,6 +462,13 @@ pub async fn ingest_loki_push(
     body: Body,
     settings: LogIngestSettings,
 ) -> Response {
+    // Issue #653: the tenant first; an invalid one stores nothing.
+    let tenant = match pulsus_model::tenant_from_headers(&headers) {
+        Ok(tenant) => tenant,
+        Err(err) => {
+            return loki_plain_text_response(StatusCode::BAD_REQUEST, format!("{err}\n"));
+        }
+    };
     let now_ns = now_unix_nanos();
 
     let body = match read_capped_body(body, decompress::MAX_DECOMPRESSED_BYTES).await {
@@ -487,14 +499,14 @@ pub async fn ingest_loki_push(
     let push = push_headers(&headers);
 
     if is_async(&headers) {
-        return match sink.admit(parsed, push) {
+        return match sink.admit(&tenant, parsed, push) {
             Ok(()) if stream_errors.is_empty() => rw_success_response(StatusCode::ACCEPTED),
             Ok(()) => loki_stream_errors_response(stream_errors),
             Err(refusal) => loki_refusal_response(refusal),
         };
     }
 
-    match sink.admit_flush(parsed, push) {
+    match sink.admit_flush(&tenant, parsed, push) {
         Ok(wait) => match wait.await {
             Ok(()) if stream_errors.is_empty() => rw_success_response(StatusCode::NO_CONTENT),
             Ok(()) => loki_stream_errors_response(stream_errors),
@@ -1433,7 +1445,12 @@ mod tests {
     }
 
     impl LogSink for MockSink {
-        fn admit(&self, batch: ParsedLogs, push: PushHeaders) -> Result<(), AdmitRefusal> {
+        fn admit(
+            &self,
+            _tenant: &pulsus_model::Tenant,
+            batch: ParsedLogs,
+            push: PushHeaders,
+        ) -> Result<(), AdmitRefusal> {
             self.admitted.lock().unwrap().push(batch);
             self.pushes.lock().unwrap().push(push);
             match self.outcome.refusal() {
@@ -1444,6 +1461,7 @@ mod tests {
 
         fn admit_flush(
             &self,
+            _tenant: &pulsus_model::Tenant,
             batch: ParsedLogs,
             push: PushHeaders,
         ) -> Result<FlushWait, AdmitRefusal> {

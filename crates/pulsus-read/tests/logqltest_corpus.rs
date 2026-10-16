@@ -323,6 +323,9 @@ fn every_corpus_log_query_still_plans_ok_under_regex_validation() {
                 direction: Direction::Backward,
             };
             let ctx = pulsus_read::logql::PlanCtx {
+                tenant: Box::leak(Box::new(
+                    pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+                )),
                 db: "pulsus",
                 streams_idx: "log_streams_idx",
                 streams: "log_streams",
@@ -519,6 +522,9 @@ fn pushed_filter_count(query: &str) -> usize {
         direction: Direction::Backward,
     };
     let ctx = PlanCtx {
+        tenant: Box::leak(Box::new(
+            pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+        )),
         db: "pulsus",
         streams_idx: "log_streams_idx",
         streams: "log_streams",
@@ -785,6 +791,9 @@ fn has_a_wrapped_variant_with_a_pipeline(query: &str) -> bool {
         direction: Direction::Backward,
     };
     let ctx = PlanCtx {
+        tenant: Box::leak(Box::new(
+            pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+        )),
         db: "pulsus",
         streams_idx: "log_streams_idx",
         streams: "log_streams",

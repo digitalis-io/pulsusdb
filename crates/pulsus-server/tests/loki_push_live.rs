@@ -3882,39 +3882,42 @@ async fn both_label_rendering_paths_agree_on_a_c0_escaped_value() {
     .await
     .expect("connect to seed");
     let fingerprint = 539_539_539_u64;
+    // Issue #653: landed through `log_landing`, as a push is, so the views
+    // write both targets with their tenant column.
+    let org: std::sync::Arc<str> = std::sync::Arc::from("");
+    let received_ms = base_ns / 1_000_000;
     client
         .insert_block(
-            "log_streams",
-            &[pulsus_write::writer::LogStreamRow {
-                month: pulsus_model::Date::start_of_month_utc(base_ns)
-                    .expect("a month for now")
-                    .days_since_epoch(),
-                fingerprint: Fingerprint::from_raw(u128::from(fingerprint)),
-                service: "s539v".to_string(),
-                labels: labels.to_canonical_json(),
-                updated_ns: base_ns,
-            }],
+            "log_landing",
+            &[
+                pulsus_write::writer::LogLandingRow::stream(
+                    &org,
+                    received_ms,
+                    &pulsus_write::StreamRow {
+                        month: pulsus_model::Date::start_of_month_utc(base_ns)
+                            .expect("a month for now"),
+                        fingerprint: Fingerprint::from_raw(u128::from(fingerprint)),
+                        service: "s539v".to_string(),
+                        labels: labels.clone(),
+                        updated_ns: base_ns,
+                    },
+                ),
+                pulsus_write::writer::LogLandingRow::line(
+                    &org,
+                    received_ms,
+                    &pulsus_write::LogRow {
+                        service: "s539v".to_string(),
+                        fingerprint: Fingerprint::from_raw(u128::from(fingerprint)),
+                        timestamp_ns: pulsus_model::UnixNano(base_ns),
+                        severity: 0,
+                        body: "verbatim vs re-rendered".to_string(),
+                        structured_metadata: String::new(),
+                    },
+                ),
+            ],
         )
         .await
-        .expect("seed log_streams");
-    land_seeded_streams(&client, db).await;
-    client
-        .insert_block(
-            "log_samples",
-            &[pulsus_write::writer::LogSampleRow {
-                service: "s539v".to_string(),
-                fingerprint: Fingerprint::from_raw(u128::from(fingerprint)),
-                timestamp_ns: base_ns,
-                severity: 0,
-                body: "verbatim vs re-rendered".to_string(),
-                structured_metadata: String::new(),
-            }],
-        )
-        .await
-        .expect("seed log_samples");
-    land_seeded_lines(&client, db).await;
-    land_seeded_streams(&client, db).await;
-    land_seeded_lines(&client, db).await;
+        .expect("seed log_landing");
     let verbatim = wait_for_streams(port, r#"{service_name="s539v"}"#, base_ns, 1);
     let re_rendered = wait_for_streams(
         port,
