@@ -223,6 +223,13 @@ fn read_error_parts(e: &ReadError) -> (StatusCode, String) {
         // (the LogQL engine never produces it), matched here for
         // exhaustiveness — mapped like the other 422 declines, mirroring
         // `prom_api::error::read_error_parts`.
+        // Issue #605: the result-series cap answers as the reference
+        // does — 400 and its body verbatim, without the `query too broad:`
+        // prefix (`pkg/util/server/error.go:110-117`, measured 400 in the
+        // #236 ledger entry).
+        ReadError::QueryTooBroad(
+            reason @ pulsus_read::logql::TooBroadReason::MetricSeries { .. },
+        ) => (StatusCode::BAD_REQUEST, reason.to_string()),
         ReadError::QueryTooBroad(_)
         | ReadError::NamelessSelectorUnresolvable { .. }
         | ReadError::HistogramResultUnsupported => {

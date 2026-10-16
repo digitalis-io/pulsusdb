@@ -1856,10 +1856,10 @@ not "fix" us toward the panic.
   `max_query_series_is_read_in_exactly_one_place`). Before #236 PulsusDB
   applied its 500 MID-SCAN, rejecting a broad class of aggregations the
   reference serves (`sum(...)` over 20,505 groups returned `{} 20505`
-  there and a 422 here); that divergence is CLOSED. The remaining
-  difference is the HTTP status — 422 `query_too_broad` where the
-  reference returns 400 — carrying the reference's verbatim body, under
-  the established matching-error-status precedent.
+  there and a 422 here); that divergence is CLOSED. So is the status:
+  since #605 the cap answers `400` with the reference's body verbatim,
+  the status the reference gives it, measured in the table under the
+  #398 paragraph below.
 
   **Issue #398 adds a member to this same status family and opens no new
   row.** A read that exhausts ClickHouse's memory is now refused
@@ -1867,7 +1867,7 @@ not "fix" us toward the panic.
   (`reader.{logql,promql,traceql}_read_max_memory_bytes`, server code 241)
   rather than answering `500` with the raw server exception. That is the
   same "we could not afford this query" class as the result-size cap above
-  and inherits its 400-vs-422 delta against Loki. It needs no ledger row of
+  and keeps `422` where the reference answers `400` (the cap is `400` since #605). It needs no ledger row of
   its own, and — this is the part worth recording — **the other two
   surfaces need no row at all**, because their references agree with us.
   Measured against containers with data in the store while planning #398:

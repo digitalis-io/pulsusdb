@@ -2187,9 +2187,9 @@ they are named so nobody adds them later.
   expression compilation cost, and can be made to exhaust memory. Adding
   a bound where there is none is our choice, not their error.
 - **Status codes we prefer.** We answer `400` where Loki answers `500`
-  for a query-time vector-matching failure, `422` where it answers `400`
-  for a result-size cap, and `429` where Tempo answers `500` for
-  backpressure. These are judgements about which code describes the
+  for a query-time vector-matching failure, and `429` where Tempo answers
+  `500` for backpressure; the result-size cap answers `400` as the reference
+  does since issue #605. These are judgements about which code describes the
   condition better. They are recorded in the ledgers and are not defects
   on the reference's part. Entries 11 and 22 are different: each has a
   self-contradiction or a violated stated intent behind it, not just a

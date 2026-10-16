@@ -91,6 +91,7 @@ docs/api.md	pkg/loghttp/patterns.go:20	not_in_this_repository
 docs/api.md	pkg/loghttp/push/otlp.go:144-146	not_in_this_repository
 docs/api.md	pkg/loghttp/push/otlp.go:174-220	pinned_to_another_version
 docs/api.md	pkg/loghttp/push/otlp.go:193	not_in_this_repository
+docs/api.md	pkg/loghttp/push/otlp.go:404-407	pinned_to_another_version
 docs/api.md	pkg/loghttp/push/otlp.go:488-499	not_in_this_repository
 docs/api.md	pkg/loghttp/push/otlp.go:603-614	pinned_to_another_version
 docs/api.md	pkg/loghttp/push/otlp.go:613	pinned_to_another_version
