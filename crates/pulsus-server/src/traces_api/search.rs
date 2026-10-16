@@ -1,8 +1,9 @@
 //! `GET /api/traces/v1/search` (issue #57; docs/api.md §4.2): parse
 //! params (`params.rs`) → obtain the TraceQL AST (`q` via
 //! `pulsus_traceql::parse`, or the legacy params via `legacy.rs` — one
-//! validation path either way) → plan (`pulsus_read::plan_search`) →
-//! execute (`TraceEngine::search`) → shape the documented JSON
+//! validation path either way) → plan (`pulsus_read::plan_search_request`,
+//! the search statement's compiler, issue #602 part 2b) → execute
+//! (`TraceEngine::search_routed`) → shape the documented JSON
 //! (`search_response.rs`). Thin by design: SQL/execution stays in
 //! `pulsus-read`.
 
@@ -76,16 +77,14 @@ async fn search_impl(
     // plan) resolves without ClickHouse — same discipline as the logs
     // surface's parse-before-engine ordering.
     let read_config = crate::chconfig::trace_read_config_from(&state.config);
-    let ctx = pulsus_read::SearchCtx {
-        filter: pulsus_read::SpanFilterCtx {
-            spans_table: &read_config.spans_table,
-            attrs_table: &read_config.attrs_table,
-        },
-        recent_table: &read_config.recent_table,
-        errors_table: &read_config.errors_table,
-        max_candidates: read_config.max_candidates,
-        max_series: read_config.max_series,
-        distributed: read_config.distributed,
+    let indexed = pulsus_read::traces::spans::attr_index::IndexedAttr::from_config(
+        &state.config.traceql_indexed_attributes,
+    );
+    let tables = pulsus_read::StatementTables {
+        spans: &read_config.spans_v2_table,
+        resources: &read_config.resources_table,
+        traces: &read_config.traces_table,
+        indexed: &indexed,
     };
     // Issue #591 part 3's amendment: the window starts no earlier than the
     // retention cutoff, for both engines, so a span past its retention is
@@ -102,18 +101,18 @@ async fn search_impl(
         limit: params.limit,
         spss: params.spss,
     };
-    let plan = pulsus_read::plan_search(&query, &search_params, &ctx).map_err(ApiError::Plan)?;
+    let request =
+        pulsus_read::plan_search_request(&query, &search_params, &tables, read_config.max_depth)
+            .map_err(ApiError::Plan)?;
 
     let engine = engine_for(&state).await?;
-    // Issue #591 part 3: the route fork. A search the search statement
-    // covers is answered by it; everything else by today's engine.
     if !wants_explain(headers) {
-        let output = engine.search_routed(&plan.request()).await?;
+        let output = engine.search_routed(&request).await?;
         return Ok((StatusCode::OK, Json(search_response::render(&output))).into_response());
     }
     // One execution that also captures the per-stage SQL — the same
     // single-pass contract the logs route has, never a second run.
-    let (output, explain) = engine.search_routed_explained(&plan.request()).await?;
+    let (output, explain) = engine.search_routed_explained(&request).await?;
     let mut body = search_response::render(&output);
     if let Some(obj) = body.as_object_mut() {
         obj.insert(

@@ -2255,68 +2255,63 @@ impl TraceEngine {
         Ok((output, explain))
     }
 
-    /// Executes a [`SearchPlan`] by the route fork (issue #591 part 3): a
-    /// search the search statement covers
-    /// ([`super::spans::search::plan_statement`]) is answered by it, the
-    /// newest slices first where it is sliceable; everything else by
-    /// today's engine, unchanged.
+    /// Answers `request` with the search statement (issue #602 part 2b),
+    /// the newest slices first. It is the route's only engine: the
+    /// statement's error is the request's, a `!` demand as `400`.
     pub async fn search_routed(
         &self,
         request: &super::spans::search::SearchRequest,
     ) -> Result<SearchOutput, ReadError> {
-        self.search_routed_inner(&request.0, None).await
+        self.search_routed_inner(request, None).await
     }
 
-    /// [`Self::search_routed`], with the per-stage SQL: a covered search's
-    /// `search_slice` and `search_statement` stages, and no compiled plan.
+    /// [`Self::search_routed`], with the per-stage SQL: each
+    /// `search_slice` and, when the slices do not answer, the
+    /// `search_statement` stage.
     pub async fn search_routed_explained(
         &self,
         request: &super::spans::search::SearchRequest,
     ) -> Result<(SearchOutput, PlanExplain), ReadError> {
         let mut explain = PlanExplain::new("traces");
         let output = self
-            .search_routed_inner(&request.0, Some(&mut explain))
+            .search_routed_inner(request, Some(&mut explain))
             .await?;
         Ok((output, explain))
     }
 
-    /// The fork's shared body. A covered search is issued with today's
-    /// search settings plus `final = 1`; its rows are collected against the
-    /// request's 256 MiB retention budget, and the decode charges the
-    /// response against the same budget. A run-time demand the statement
-    /// raises (`Code: 395` carrying one of its demand messages) sends the
-    /// request to today's engine, whose own answer stands.
+    /// The shared body: each statement with the search settings plus
+    /// `final = 1`, its rows and decode charged to one 256 MiB budget. A
+    /// request the statement's compiler refuses is a `400` with its text.
     async fn search_routed_inner(
         &self,
-        plan: &SearchPlan,
+        request: &super::spans::search::SearchRequest,
         mut explain: Option<&mut PlanExplain>,
     ) -> Result<SearchOutput, ReadError> {
-        let Some(stmt) = self.search_statement(plan, None) else {
-            return self.search_inner(plan, explain).await;
-        };
-        match self.newest_first(plan, &stmt, &mut explain).await? {
-            newest_first::Next::Answer(out) => return Ok(out),
-            newest_first::Next::Whole => {}
-            newest_first::Next::Handover => return self.search_inner(plan, explain).await,
+        let stmt =
+            self.search_statement(request, None)
+                .map_err(|e| ReadError::PipelineInvalid {
+                    reason: e.to_string(),
+                })?;
+        if let Some(out) = self.newest_first(request, &stmt, &mut explain).await? {
+            return Ok(out);
         }
         let mut budget = ByteBudget::new(HYDRATION_BYTE_BUDGET);
         let mut charged = 0usize;
         match self.statement_rows(&stmt, &mut budget, &mut charged).await {
-            Ok(rows) => rows.decode(&stmt, plan.limit, &mut budget, self.config.max_series),
-            Err(e) if newest_first::demanded(&stmt, &e) => self.search_inner(plan, explain).await,
-            Err(e) => Err(newest_first::read_error(e, &self.config)),
+            Ok(rows) => rows.decode(&stmt, request.limit, &mut budget, self.config.max_series),
+            Err(e) => Err(newest_first::statement_error(&stmt, e, &self.config)),
         }
     }
 
-    /// The statement for `plan`, its top-K reading the newest `slice_ns`
-    /// when given; `None` when the statement does not cover it.
+    /// The statement for `request`, its top-K reading the newest
+    /// `slice_ns` when given.
     pub(super) fn search_statement(
         &self,
-        plan: &SearchPlan,
+        request: &super::spans::search::SearchRequest,
         slice_ns: Option<i64>,
-    ) -> Option<super::spans::search::SearchStatement> {
+    ) -> Result<super::spans::search::SearchStatement, super::PlanError> {
         super::spans::search::plan_statement_sliced(
-            &plan.request(),
+            request,
             &self.config.spans_v2_table,
             &self.config.traces_table,
             &self.config.resources_table,
