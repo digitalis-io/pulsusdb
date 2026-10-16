@@ -6732,7 +6732,8 @@ async fn seed_one_stream(
 /// row  data                                                 today's route               reduced route
 /// R1   6,213 {"latency":1} at one nanosecond                 {} 6213                     {} 6213
 /// R1   6,214 at one nanosecond                              {} 6214 (see below)         {} 6214
-/// R2   4,100,000 {"latency":1} within 50 s                  422 retained window points  {} 4100000
+/// R2   4,100 {"latency":1} within 50 s, under a             422 retained window points  {} 4100
+///      4,000-point retention cap
 /// R3   3,400 lines, each its own request_id, one per second one series (see below)     one series, 3,400 points of 1
 ///      over an hour, step 1 s
 /// R4   the realistic corpus, 3 minutes                       three points (see below)    three points (the plan's figures)
@@ -6747,6 +6748,15 @@ async fn seed_one_stream(
 /// one series per sum group, each line under the sum's labels alone, and
 /// answers all three as the reduced route does.
 ///
+/// R2 runs under a retention cap of 4,000 points rather than the shipped
+/// 4,000,000 (`charge::MAX_RETAINED_WINDOW_POINTS`), on 4,100 samples
+/// rather than 4,100,000: the refusal is the same, and today's route
+/// evaluates each sample in this process before it can refuse. At the
+/// shipped cap that was four million rows through an unoptimised build,
+/// about 38 s of one core on an idle machine, and on a loaded CI runner it
+/// ran past the read's 300 s deadline and answered `timeout: query_stream
+/// exceeded 300s` instead of `422 MetricRetention`.
+///
 /// R9 (the statement text cap) and R10 (the memory ceiling) send the
 /// reduced route to today's route once; R10 is
 /// `a_reduced_query_out_of_memory_answers_on_todays_route`.
@@ -6754,6 +6764,10 @@ async fn seed_one_stream(
 async fn every_refusal_lands_as_the_table_says() {
     skip_unless_live!();
     const MIN: i64 = 60_000_000_000;
+    // R2: the retention cap its engine runs under, and one stream of 100
+    // samples more than it, all inside one window.
+    const R2_RETENTION_CAP: u64 = 4_000;
+    const R2_SAMPLES: u64 = 4_100;
     let (admin, _client, db) = group_key_db("gk_refusals").await;
     let base = ((now_ns() - 7_200_000_000_000) / MIN) * MIN;
     // R1's two streams carry the labels the plan measured them under
@@ -6786,7 +6800,7 @@ async fn every_refusal_lands_as_the_table_says() {
     )
     .await;
     seed_one_stream(&admin, &db, base, 2303, "r2", "",
-        &format!("SELECT {} + intDiv(number * 50000000000, 4100000) AS ts, '{{\"latency\":1}}' AS body FROM numbers(4100000)", base + 1_000_000_000)).await;
+        &format!("SELECT {} + intDiv(number * 50000000000, {R2_SAMPLES}) AS ts, '{{\"latency\":1}}' AS body FROM numbers({R2_SAMPLES})", base + 1_000_000_000)).await;
     seed_one_stream(&admin, &db, base, 2304, "r3", "",
         &format!("SELECT {base} + (number + 1) * 1000000000 AS ts, concat('{{\"request_id\":\"', toString(number), '\",\"latency\":1}}') AS body FROM numbers(3400)")).await;
     seed_one_stream(&admin, &db, base, 2305, "r5", "",
@@ -6794,27 +6808,29 @@ async fn every_refusal_lands_as_the_table_says() {
     // The realistic corpus's first 3 minutes and a little more.
     seed_realistic_corpus(&admin, &db, base, 120_000, false).await;
 
-    // R2's control is the slowest query in this file by a wide margin: the
-    // retention cap is 4,000,000 points (`charge::MAX_RETAINED_WINDOW_POINTS`)
-    // and the row's stream holds 4,100,000 samples, so today's route reads
-    // 4,000,001 of them before it can refuse. The deadline therefore has to
-    // outlast that scan wherever the suite runs. At this file's 60 s it was a
-    // race the machine decided: it passed here and CI answered
-    // `timeout: query_stream exceeded 60s` for that one row instead of
-    // `422 MetricRetention`. Measured here with a deliberately short deadline,
-    // the failure reproduces exactly, and at 300 s the row answers on both.
-    const REFUSAL_TABLE_DEADLINE: Duration = Duration::from_secs(300);
-    let engine = |budget: u64| {
+    let engine = |budget: u64, caps: pulsus_read::logql::exec::AggCapOverrides| {
         let db = db.clone();
         async move {
             LogQlEngine::new(
-                data_client_with_deadline(&db, REFUSAL_TABLE_DEADLINE).await,
+                data_client(&db).await,
                 engine_config(&db, budget),
                 pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
             )
+            .with_key_route_test_hooks(pulsus_read::logql::exec::KeyRouteTestHooks {
+                agg_caps: caps,
+                ..Default::default()
+            })
         }
     };
-    let wide = engine(50 * 1024 * 1024 * 1024).await;
+    let wide = engine(50 * 1024 * 1024 * 1024, Default::default()).await;
+    let r2_capped = engine(
+        50 * 1024 * 1024 * 1024,
+        pulsus_read::logql::exec::AggCapOverrides {
+            retention_points: Some(R2_RETENTION_CAP),
+            ..Default::default()
+        },
+    )
+    .await;
     let range = |start_s: i64, end_s: i64, step: i64| QueryParams {
         spec: QuerySpec::Range {
             start_ns: base + start_s * 1_000_000_000,
@@ -6855,15 +6871,29 @@ async fn every_refusal_lands_as_the_table_says() {
         }
     };
 
-    // R1 and R2: (reduced-route query, today's control, params, today's answer, reduced answer)
-    for (svc, params, today_want, key_want) in [
-        ("checkou1", range(60, 120, 60), "{} 6213.0", "{} 6213.0"),
-        ("checkou2", range(60, 120, 60), "{} 6214.0", "{} 6214.0"),
+    // R1 and R2: (service, engine, params, today's answer, reduced answer)
+    let r2_want = format!("{{}} {R2_SAMPLES}.0");
+    for (svc, eng, params, today_want, key_want) in [
+        (
+            "checkou1",
+            &wide,
+            range(60, 120, 60),
+            "{} 6213.0",
+            "{} 6213.0",
+        ),
+        (
+            "checkou2",
+            &wide,
+            range(60, 120, 60),
+            "{} 6214.0",
+            "{} 6214.0",
+        ),
         (
             "r2",
+            &r2_capped,
             range(60, 120, 60),
             "422 MetricRetention",
-            "{} 4100000.0",
+            r2_want.as_str(),
         ),
     ] {
         let key_q = sum_by(svc, "", "1m");
@@ -6871,12 +6901,12 @@ async fn every_refusal_lands_as_the_table_says() {
         assert!(is_reduced(&key_q, &params), "{key_q}: the reduced route");
         assert!(!is_reduced(&today_q, &params), "{today_q}: today's route");
         assert_eq!(
-            short(wide.query(&parse(&today_q).expect("parse"), &params).await),
+            short(eng.query(&parse(&today_q).expect("parse"), &params).await),
             today_want,
             "{svc}: today's route"
         );
         assert_eq!(
-            short(wide.query(&parse(&key_q).expect("parse"), &params).await),
+            short(eng.query(&parse(&key_q).expect("parse"), &params).await),
             key_want,
             "{svc}: the reduced route"
         );
@@ -6951,7 +6981,7 @@ async fn every_refusal_lands_as_the_table_says() {
     // statement's 307.
     {
         let params = range(60, 180, 60);
-        let tight = engine(1_000_000).await;
+        let tight = engine(1_000_000, Default::default()).await;
         let key_q =
             r#"avg_over_time({service_name="checkout"} | json | unwrap latency [1m]) by (service)"#;
         let today_q = r#"avg_over_time({service_name="checkout"} | json | unwrap latency | zzz="" [1m]) by (service)"#;
