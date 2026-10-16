@@ -1532,12 +1532,7 @@ fn presence_text(scope: AttrScope, key: &str) -> String {
 
 /// Section 5.2's `P_resource` at `service.name`.
 fn service_present_resource() -> String {
-    format!(
-        "(service_type = 'string' OR {})",
-        r_of(
-            "dynamicType(attrs.`service%2Ename`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))')"
-        )
-    )
+    "service_type = 'string'".to_string()
 }
 
 /// The symbol of `pos(op)` (section 4): `!=` to `=`, the others unchanged.
@@ -1555,11 +1550,9 @@ fn pos_symbol(op: ComparisonOp) -> &'static str {
 /// Section 5.2's `X_resource` at `service.name`, built from `p` (the span
 /// leaf's positive text), `R` and `G`.
 fn service_x_resource(span_text: &str, cell: &Option<(ComparisonOp, Value)>) -> String {
-    let (negated, p) = match span_text.strip_prefix("NOT ") {
-        Some(p) => (true, p),
-        None => (false, span_text),
-    };
-    let r = r_of(p);
+    // Issue #602 part 1 (D2): the span row's string alone; a non-string
+    // literal is `false`, or `true` under a negation.
+    let negated = span_text.starts_with("NOT ");
     match cell {
         Some((op, Value::String(s))) => {
             let g = match op {
@@ -1568,16 +1561,10 @@ fn service_x_resource(span_text: &str, cell: &Option<(ComparisonOp, Value)>) -> 
                 }
                 other => format!("service {} '{s}'", pos_symbol(*other)),
             };
-            let x = format!("((service_type = 'string' AND {g}) OR {r})");
+            let x = format!("(service_type = 'string' AND {g})");
             if negated { format!("NOT {x}") } else { x }
         }
-        _ => {
-            if negated {
-                format!("NOT ({r})")
-            } else {
-                r
-            }
-        }
+        _ => (if negated { "true" } else { "false" }).to_string(),
     }
 }
 
@@ -1645,20 +1632,11 @@ fn t_c21_the_unscoped_chain_is_built_from_each_scopes_own_text() {
 
     // Section 5.2's resource branches and `P_resource`, byte for byte, each
     // the second and first argument pair of its chain.
-    let svc_x = format!(
-        "((service_type = 'string' AND service = 'x') OR resource_id IN (SELECT resource_id FROM \
-         resources WHERE {d} AND ((coalesce(attrs.`service%2Ename`.:String = 'x', false) OR \
-         has(attrs.`service%2Ename`.:`Array(Nullable(String))`, 'x')))))"
-    );
-    let svc_n = format!(
-        "resource_id IN (SELECT resource_id FROM resources WHERE {d} AND \
-         ((coalesce(attrs.`service%2Ename`.:Int64 = 12345, false) OR \
-         coalesce(attrs.`service%2Ename`.:Float64 = 12345, false))))"
-    );
-    let svc_p = format!(
-        "(service_type = 'string' OR resource_id IN (SELECT resource_id FROM resources WHERE {d} \
-         AND (dynamicType(attrs.`service%2Ename`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'))))"
-    );
+    // Issue #602 part 1 (D2): the span row's string alone; a non-string
+    // literal is `false`.
+    let svc_x = "(service_type = 'string' AND service = 'x')".to_string();
+    let svc_n = "false".to_string();
+    let svc_p = "service_type = 'string'";
     for (query, x_resource) in [
         (r#"{ .service.name = "x" }"#, &svc_x),
         (r#"{ .service.name = 12345 }"#, &svc_n),
@@ -2259,11 +2237,19 @@ fn ff_operands() -> Vec<FfOperand> {
         ff_intrinsic(Intrinsic::Status, "st", "status_code"),
         ff_intrinsic(Intrinsic::Kind, "kd", "kind"),
         ff_resource("a"),
-        {
-            let mut service = ff_resource("service.name");
-            service.arms[0].1 = "if(service_type = 'string', service, NULL)".to_string();
-            service.s_on_span_row = true;
-            service
+        // Issue #602 part 1 (D2): the span row's string alone, no
+        // resource-row arm.
+        FfOperand {
+            field: scoped(AttrScope::Resource, "service.name"),
+            arms: vec![(
+                "s",
+                "if(service_type = 'string', service, NULL)".to_string(),
+            )],
+            nullable: true,
+            needs_ctx: true,
+            types: None,
+            s_on_span_row: true,
+            bind: false,
         },
     ]
 }
@@ -2458,16 +2444,10 @@ fn t_c26_the_measured_field_against_field_texts() {
     // The part-3b design's section 5.7, with `Q`, `V` and `G` spelled out
     // from `ctx()`.
     let k = "attrs.`k`";
-    let sn = "attrs.`service%2Ename`";
     assert_eq!(
         rendered_in(r#"{ resource.service.name < instrumentation:version }"#),
-        format!(
-            "arrayExists(r1 -> (coalesce(if(service_type = 'string', service, NULL) < \
-             scope_version, false) OR if({}, arrayExists(x -> coalesce(x < scope_version, \
-             false), dynamicElement(r1, 'Array(Nullable(String))')), false)), [{}])",
-            g_of(sn, "Array(Nullable(String))"),
-            v_of(sn)
-        )
+        // Issue #602 part 1 (D2): the span row's string alone.
+        "(coalesce(if(service_type = 'string', service, NULL) < scope_version, false))"
     );
     assert_eq!(
         rendered_in(r#"{ resource.k < name }"#),
@@ -2482,29 +2462,12 @@ fn t_c26_the_measured_field_against_field_texts() {
     );
     assert_eq!(
         rendered_in(r#"{ duration = resource.service.name }"#),
-        format!(
-            "arrayExists(r2 -> (if({}, coalesce(duration_ns = dynamicElement(r2, 'Int64'), \
-             false), false) OR if({}, coalesce(duration_ns = dynamicElement(r2, 'Float64'), \
-             false), false) OR if({}, arrayExists(x -> coalesce(duration_ns = x, false), \
-             dynamicElement(r2, 'Array(Nullable(Int64))')), false) OR if({}, arrayExists(x -> \
-             coalesce(duration_ns = x, false), dynamicElement(r2, \
-             'Array(Nullable(Float64))')), false)), [{}])",
-            g_of(sn, "Int64"),
-            g_of(sn, "Float64"),
-            g_of(sn, "Array(Nullable(Int64))"),
-            g_of(sn, "Array(Nullable(Float64))"),
-            v_of(sn)
-        )
+        // A string never equals a duration, and no other arm is read.
+        "false"
     );
     assert_eq!(
         rendered_in(r#"{ resource.service.name = name }"#),
-        format!(
-            "arrayExists(r1 -> (coalesce(if(service_type = 'string', service, NULL) = name, \
-             false) OR if({}, arrayExists(x -> coalesce(x = name, false), dynamicElement(r1, \
-             'Array(Nullable(String))')), false)), [{}])",
-            g_of(sn, "Array(Nullable(String))"),
-            v_of(sn)
-        )
+        "(coalesce(if(service_type = 'string', service, NULL) = name, false))"
     );
     assert_eq!(rendered_in(r#"{ resource.k = status }"#), "false");
     assert_eq!(
@@ -2616,20 +2579,8 @@ fn t_c27_the_field_against_field_refusals() {
 
 /// `T-C28`: a comparison reading a resource operand carries its window,
 /// so composing it with another window panics, as `T-C15`'s literal leaf
-/// does. `resource.service.name` is one: its non-string arms read the
-/// resource row.
-#[test]
-#[should_panic(expected = "different window")]
-fn t_c28_a_service_name_operand_refuses_another_window() {
-    let p = compile_span_predicate_in(
-        &filter_body(r#"{ span.b = resource.service.name }"#),
-        &ctx(),
-    )
-    .expect("compiles");
-    let other = WindowSql::start_closed_end_open(T_B1_START, T_B1_END + 1);
-    let _ = span_membership_sql("spans", other, &p);
-}
-
+/// does. `resource.service.name` is not one: it is read from the span row
+/// alone (issue #602 part 1, D2).
 #[test]
 #[should_panic(expected = "different window")]
 fn t_c28_a_resource_operand_refuses_another_window() {
@@ -3209,11 +3160,9 @@ fn chain_c_over(key: &str, rv: &str) -> String {
     );
     let (pr, values, rt) = if key == "service.name" {
         (
-            format!(
-                "(service_type = 'string' OR dynamicType({rv}) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'))"
-            ),
-            format!("[CAST(CAST(service, 'String'), 'Dynamic')], [{rv}]"),
-            "[if(service_type = 'string', 2, 9)], [if(service_type = 'string', 9, 2)]".to_string(),
+            "service_type = 'string'".to_string(),
+            "[CAST(CAST(service, 'String'), 'Dynamic')]".to_string(),
+            "[if(service_type = 'string', 2, 9)]".to_string(),
         )
     } else {
         (
@@ -3345,6 +3294,8 @@ impl SetSpec {
     /// The resource value the chain reads, bound to `r<n>`.
     fn bind(&self, n: usize) -> Option<(String, String)> {
         match self.kind {
+            // `service.name` is read from the span row alone (D2).
+            SetKind::Chain("service.name") => None,
             SetKind::Chain(key) => Some((format!("r{n}"), v_of(&ff_resource_path(key)))),
             _ => None,
         }
@@ -3369,9 +3320,7 @@ fn ff_presence(s: &FfOperand, n: usize) -> Option<String> {
         Field::Attribute {
             scope: AttrScope::Resource,
             key,
-        } if key == "service.name" => Some(format!(
-            "(service_type = 'string' OR dynamicType(r{n}) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'))"
-        )),
+        } if key == "service.name" => Some("service_type = 'string'".to_string()),
         Field::Attribute {
             scope: AttrScope::Resource,
             ..

@@ -593,7 +593,9 @@ impl Head {
 struct Occurrence {
     var: String,
     array: String,
-    chain: Option<(String, String, (String, String))>,
+    /// The chain's variable, its text, and the resource value it binds —
+    /// none for `service.name`, read from the span row alone (D2).
+    chain: Option<(String, String, Option<Bind>)>,
     negated: bool,
 }
 
@@ -1102,15 +1104,13 @@ impl<'a> Compiler<'a> {
 
     /// `P_sc`: whether `scope` holds `key`, as the chain tests it.
     ///
-    /// At `service.name` the resource scope is present when the span row
-    /// holds a string or the resource row holds a value [`HELD`].
+    /// At `service.name` the resource scope is present only when the span
+    /// row holds a string (D2): the resource row's non-string copy is never
+    /// read.
     fn chain_presence(&mut self, scope: AttrScope, key: &str) -> Result<String, PlanError> {
         if scope == AttrScope::Resource && key == SERVICE_NAME {
-            let r = self.resource_subquery(&format!(
-                "dynamicType({}) {HELD}",
-                attr_path(ATTRS, SERVICE_NAME)
-            ))?;
-            return Ok(format!("({SERVICE_IS_STRING} OR {r})"));
+            self.ctx.ok_or_else(|| needs_window(AttrScope::Resource))?;
+            return Ok(SERVICE_IS_STRING.to_string());
         }
         self.scoped_exists(scope, key, false)
     }
@@ -1123,10 +1123,12 @@ impl<'a> Compiler<'a> {
         op: ComparisonOp,
         value: &Value,
     ) -> Result<String, PlanError> {
-        let (negated, p) = attr_leaf_parts(ATTRS, SERVICE_NAME, op, value)?;
-        let r = self.resource_subquery(&p)?;
+        let (negated, _) = attr_leaf_parts(ATTRS, SERVICE_NAME, op, value)?;
+        // Reached only where the span row holds a string (`chain_presence`):
+        // a string never equals a non-string literal, so `=` is false and
+        // `!=` true, as the chain's other scopes compare across types.
         let Value::String(s) = value else {
-            return Ok(if negated { format!("NOT ({r})") } else { r });
+            return Ok(if negated { "true" } else { "false" }.to_string());
         };
         let g = match positive_op(op).1 {
             ComparisonOp::Re => format!("match(service, {})", anchored_regex_sql(s)?),
@@ -1136,7 +1138,7 @@ impl<'a> Compiler<'a> {
                 escape::ch_string(s)
             ),
         };
-        let x = format!("(({SERVICE_IS_STRING} AND {g}) OR {r})");
+        let x = format!("({SERVICE_IS_STRING} AND {g})");
         Ok(if negated { format!("NOT {x}") } else { x })
     }
 
@@ -1362,7 +1364,7 @@ impl<'a> Compiler<'a> {
         let chain_values: Vec<(String, String)> = self
             .occurrences
             .iter()
-            .filter_map(|o| o.chain.as_ref().map(|(_, _, value)| value.clone()))
+            .filter_map(|o| o.chain.as_ref().and_then(|(_, _, value)| value.clone()))
             .collect();
         if select {
             select_values(&values, &chain_values, text)
@@ -1392,10 +1394,7 @@ impl<'a> Compiler<'a> {
         self.occurrences.push(Occurrence {
             var: set.var.clone(),
             array: set.array.clone(),
-            chain: set
-                .chain
-                .clone()
-                .map(|(c, chain)| (c, chain, value.expect("a chain reads its resource value"))),
+            chain: set.chain.clone().map(|(c, chain)| (c, chain, value)),
             negated,
         });
         Ok(set)
@@ -1749,8 +1748,16 @@ impl<'a> Compiler<'a> {
                         )));
                         Ok(attribute(root, key))
                     }
-                    // `resource.service.name`'s numeric arms are on the
-                    // resource row, as every other resource key's are.
+                    // `resource.service.name` is held only as a string
+                    // (D2), so it has no numeric arm.
+                    AttrScope::Resource if key == SERVICE_NAME => {
+                        self.ctx.ok_or_else(|| needs_window(AttrScope::Resource))?;
+                        self.note_presence(Some(SERVICE_IS_STRING.to_string()));
+                        Ok(Some(Tuple {
+                            text: format!("tuple({NULL_INT}, {NULL_FLOAT})"),
+                            dur: false,
+                        }))
+                    }
                     AttrScope::Resource => {
                         let q = self.resource_read(key)?;
                         self.note_presence(Some(format!(
@@ -1871,15 +1878,15 @@ impl<'a> Compiler<'a> {
                 return match scope {
                     AttrScope::Span => Ok(Arms::attribute(ATTRS, key)),
                     AttrScope::Instrumentation => Ok(Arms::attribute(SCOPE_ATTRS, key)),
-                    // The writer keeps a non-empty string on the span row
-                    // only, so the string arm is read there; every other
-                    // arm from the resource row.
+                    // Held only as a string (D2): the string arm from the
+                    // span row, and no other arm.
                     AttrScope::Resource if key == SERVICE_NAME => {
-                        let q = self.resource_read(key)?;
+                        self.ctx.ok_or_else(|| needs_window(AttrScope::Resource))?;
                         Ok(Arms {
                             s: Some(format!("if({SERVICE_IS_STRING}, service, NULL)")),
                             s_on_span_row: true,
-                            ..Arms::resource(&var, &q)
+                            nullable: true,
+                            ..Arms::default()
                         })
                     }
                     AttrScope::Resource => {
@@ -2089,9 +2096,9 @@ impl<'a> Compiler<'a> {
     /// scope holding the key, are kept. The engine's direct forms — a
     /// `multiIf` or `if` choosing among `Array(Dynamic)` values — fail on
     /// 26.3.29.7 with `Code: 36 … Variant type should have at least one
-    /// nested type`. At `service.name` a string is taken from the span row
-    /// and every other arm from the resource row, as part 3b's operand
-    /// does; the arm not taken is tagged 9, which `SC(k)` never answers.
+    /// nested type`. At `service.name` only a string is taken, from the
+    /// span row (D2); when it is not a string its arm is tagged 9, which
+    /// `SC(k)` never answers.
     ///
     /// The resource value is bound to `resource_var`: `r<n>` for part 3d's
     /// two lone fields, `cr<k>` for part 3e's occurrence `k`.
@@ -2102,8 +2109,14 @@ impl<'a> Compiler<'a> {
         resource_var: &str,
     ) -> Result<SetOperand, PlanError> {
         self.ctx.ok_or_else(|| needs_window(AttrScope::Unscoped))?;
-        let q = self.resource_read(key)?;
         let r = resource_var.to_string();
+        // `service.name` is read from the span row alone (D2): no resource
+        // lookup is built or bound for it.
+        let binds = if key == SERVICE_NAME {
+            Vec::new()
+        } else {
+            vec![(r.clone(), resource_value(&self.resource_read(key)?))]
+        };
         let (span, events, links, scope) = (
             attr_path(ATTRS, key),
             attr_path(EVENT_ATTRS, key),
@@ -2112,9 +2125,9 @@ impl<'a> Compiler<'a> {
         );
         let (resource_present, resource_values, resource_tags) = if key == SERVICE_NAME {
             (
-                format!("({SERVICE_IS_STRING} OR dynamicType({r}) {HELD})"),
-                format!("[CAST(CAST(service, 'String'), 'Dynamic')], [{r}]"),
-                format!("[if({SERVICE_IS_STRING}, 2, 9)], [if({SERVICE_IS_STRING}, 9, 2)]"),
+                SERVICE_IS_STRING.to_string(),
+                "[CAST(CAST(service, 'String'), 'Dynamic')]".to_string(),
+                format!("[if({SERVICE_IS_STRING}, 2, 9)]"),
             )
         } else {
             (
@@ -2138,7 +2151,7 @@ impl<'a> Compiler<'a> {
         Ok(SetOperand {
             array: c.clone(),
             arms: Arms {
-                binds: vec![(r, resource_value(&q))],
+                binds,
                 ..element_arms(&var)
             },
             var,
@@ -2885,9 +2898,7 @@ fn scalar_presence(field: &Field, var: &str) -> Option<String> {
                 "dynamicType({}) {HELD}",
                 attr_path(SCOPE_ATTRS, key)
             )),
-            AttrScope::Resource if key == SERVICE_NAME => Some(format!(
-                "({SERVICE_IS_STRING} OR dynamicType({var}) {HELD})"
-            )),
+            AttrScope::Resource if key == SERVICE_NAME => Some(SERVICE_IS_STRING.to_string()),
             AttrScope::Resource => Some(format!("dynamicType({var}) {HELD}")),
             AttrScope::Event | AttrScope::Link | AttrScope::Unscoped => None,
         },

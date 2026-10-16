@@ -1079,16 +1079,13 @@ fn chain_value(
         let projects = match scope {
             AttrScope::Span => stored_attribute("attrs", key),
             AttrScope::Instrumentation => stored_attribute("scope_attrs", key),
-            AttrScope::Resource if key == "service.name" => {
-                let (value, kind) = stored_parts(&resource_value_in(key, ctx)?);
-                Projects::Value {
-                    value: format!(
-                        "if(service_type = 'string', {}, {value})",
-                        ceiling_sql("toString(service)")
-                    ),
-                    kind: format!("if(service_type = 'string', 'String', {kind})"),
-                }
-            }
+            AttrScope::Resource if key == "service.name" => Projects::Value {
+                value: format!(
+                    "if(service_type = 'string', {}, '')",
+                    ceiling_sql("toString(service)")
+                ),
+                kind: "if(service_type = 'string', 'String', 'None')".to_string(),
+            },
             AttrScope::Resource => resource_stored(key, ctx)?,
             AttrScope::Event | AttrScope::Link => element(&Field::Attribute {
                 scope,
