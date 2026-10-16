@@ -8671,6 +8671,8 @@ async fn search_routed_keeps_the_group_cap() {
             "Ok(1 traces",
         ),
         ("{ } | by(span.a) | coalesce()", 20, cap, cap),
+        // Issue #602 part 2a: two keys count their value tuples.
+        ("{ } | by(name) | by(span.a)", 20, cap, cap),
         (r#"{ } | by(name) | { name = "b" }"#, 20, cap, cap),
         ("{ } | by(status)", 1, cap, "Ok(1 traces"),
     ] {
@@ -16407,6 +16409,471 @@ async fn an_unscoped_service_name_is_held_only_as_a_string() {
         });
         if got.as_ref().ok() != Some(&vec![vec![want]]) {
             wrong.push(format!("{id} {query}: want [[{want}]], got {got:?}"));
+        }
+    }
+    drop_db(&db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+// =====================================================================
+// Issue #602 part 2a — every search pipeline shape on the statement
+// =====================================================================
+
+/// Fixture P2's trace id `c0…c0<n>`.
+fn p2_id(n: u8) -> Vec<u8> {
+    let mut v = vec![0xc0; 16];
+    v[15] = n;
+    v
+}
+
+/// Fixture P2's span id `…<n>`.
+fn p2_sid(n: u8) -> Vec<u8> {
+    vec![0, 0, 0, 0, 0, 0, 0, n]
+}
+
+/// One trace of one service: spans `(name, kind, ms before end_ns,
+/// status)`, each 1 ms long, with span ids `…01…` in order.
+fn p2_trace(
+    id: u8,
+    service: &str,
+    end_ns: i64,
+    spans: &[(&str, i32, i64, i32)],
+) -> ExportTraceServiceRequest {
+    const MS: i64 = 1_000_000;
+    let spans: Vec<Span> = spans
+        .iter()
+        .enumerate()
+        .map(|(i, (name, kind, back_ms, status))| {
+            span_of(
+                p2_id(id),
+                p2_sid(i as u8 + 1),
+                Vec::new(),
+                name,
+                *kind,
+                end_ns - back_ms * MS,
+                MS,
+                Vec::new(),
+                *status,
+                Vec::new(),
+                Vec::new(),
+            )
+        })
+        .collect();
+    request(service, "pod-1", spans)
+}
+
+/// Fixture P2 (plan §5.1): thirteen traces ending before `end_ns`.
+fn p2_bodies(end_ns: i64) -> Vec<ExportTraceServiceRequest> {
+    const S: i64 = 1_000;
+    const H: i64 = 3_600_000;
+    vec![
+        p2_trace(
+            0xa1,
+            "A",
+            end_ns,
+            &[
+                ("a", 2, 240 * S, 0),
+                ("b", 2, 239 * S, 0),
+                ("a", 2, 238 * S, 0),
+                ("b", 2, 237 * S, 0),
+            ],
+        ),
+        p2_trace(
+            0xa2,
+            "W",
+            end_ns,
+            &[
+                ("a", 2, 230 * S, 0),
+                ("a", 2, 229 * S, 0),
+                ("a", 2, 228 * S, 0),
+                ("b", 2, 227 * S, 0),
+            ],
+        ),
+        p2_trace(
+            0xb1,
+            "S",
+            end_ns,
+            &[
+                ("x", 2, 2 * H, 0),
+                ("x", 2, 90 * 60 * S, 0),
+                ("y", 2, 60 * S, 0),
+            ],
+        ),
+        p2_trace(
+            0xb2,
+            "T",
+            end_ns,
+            &[
+                ("z", 2, 3 * H, 0),
+                ("z", 2, 3 * H - S, 0),
+                ("z", 2, 3 * H - 2 * S, 0),
+                ("z", 2, 30 * S, 0),
+            ],
+        ),
+        p2_trace(0xb3, "U", end_ns, &[("u", 2, 120 * S, 0)]),
+        p2_trace(
+            0xb4,
+            "V",
+            end_ns,
+            &[("p", 2, 20 * S, 0), ("q", 2, 3 * H - 10 * S, 0)],
+        ),
+        p2_trace(
+            0xc1,
+            "N",
+            end_ns,
+            &[
+                ("X", 2, 200 * S, 0),
+                ("Y", 2, 199 * S, 0),
+                ("X", 3, 198 * S, 0),
+            ],
+        ),
+        p2_trace(
+            0xc2,
+            "G",
+            end_ns,
+            &[
+                ("Y", 2, 190 * S, 2),
+                ("X", 3, 189 * S, 0),
+                ("X", 2, 188 * S, 2),
+            ],
+        ),
+        p2_trace(
+            0xc3,
+            "R",
+            end_ns,
+            &[("r", 2, 280 * S, 0), ("s", 2, 240 * S, 0)],
+        ),
+        p2_trace(0xc4, "Q", end_ns, &[("r", 2, 245 * S, 0)]),
+        p2_trace(0xc5, "O", end_ns, &[("p", 2, 50 * S, 0)]),
+        p2_trace(
+            0xc6,
+            "X",
+            end_ns,
+            &[("ga", 2, 290 * S, 0), ("gb", 2, 3 * H - 20 * S, 0)],
+        ),
+        p2_trace(0xc7, "Y", end_ns, &[("gb", 2, 2 * H, 0)]),
+    ]
+}
+
+/// A written answer: per trace `TTTT(m): spans`, then its spansets in
+/// `<…>`, each `[attributes] m<n> spans`; `;` between traces.
+fn p2_written(out: &pulsus_read::traces::SearchOutput) -> String {
+    out.traces
+        .iter()
+        .map(|t| {
+            let spans: Vec<String> = t.spans.iter().map(|s| tail4(&s.span_id)).collect();
+            let mut text = format!("{}({}): {}", tail4(&t.trace_id), t.matched, spans.join(" "));
+            if let Some(groups) = &t.groups {
+                let gs: Vec<String> = groups
+                    .iter()
+                    .map(|g| {
+                        let attrs: Vec<String> = g
+                            .attributes
+                            .iter()
+                            .map(|(k, v)| format!("{k}={}", value_text(v)))
+                            .collect();
+                        let spans: Vec<String> =
+                            g.spans.iter().map(|s| tail4(&s.span_id)).collect();
+                        format!("[{}] m{} {}", attrs.join(", "), g.matched, spans.join(" "))
+                    })
+                    .collect();
+                text.push_str(&format!(" <{}>", gs.join(" | ")));
+            }
+            text
+        })
+        .collect::<Vec<_>>()
+        .join(" ; ")
+}
+
+/// Plan §5.1: each case of fixture P2, at `spss = 10` over the four hours
+/// before `end`, is answered by the statement alone (the first slice alone
+/// where marked), as `docs/api.md` §4.2 writes it, and as today's engine
+/// answers it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_pipeline_shape_is_one_statement_and_answers_as_written() {
+    skip_unless_live!();
+    let end_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let window = (end_ns - 4 * 3_600_000_000_000, end_ns);
+    let bodies = p2_bodies(end_ns);
+    let (db, _client) = seed_both(
+        pulsus_testkit::test_db("pulsus_read_it_t602p2a_shapes"),
+        &bodies,
+        31,
+        "t602p2a-shapes",
+    )
+    .await;
+    let engine = engine_of(&db).await;
+    let a_by_name = "c0a1(4): 0001 0002 0003 0004 <[count()=Int 4, by(name)=Str a] m2 0001 0003 \
+                     | [count()=Int 4, by(name)=Str b] m2 0002 0004>";
+    let a_by_kind = "c0a1(4): 0001 0002 0003 0004 \
+                     <[by(name)=Str a, count()=Int 2, by(kind)=Str server] m2 0001 0003 \
+                     | [by(name)=Str b, count()=Int 2, by(kind)=Str server] m2 0002 0004>";
+    let n_nested = "c0c1(3): 0001 0002 0003 <[by(name)=Str X, by(kind)=Str server] m1 0001 \
+                    | [by(name)=Str X, by(kind)=Str client] m1 0003 \
+                    | [by(name)=Str Y, by(kind)=Str server] m1 0002>";
+    let g_nested = "c0c2(2): 0001 0003 <[by(name)=Str Y, by(kind)=Str server] m1 0001 \
+                    | [by(name)=Str X, by(kind)=Str server] m1 0003>";
+    let p16 = "c0b4(2): 0002 0001 <[count()=Int 2] m2 0002 0001> \
+               ; c0c5(1): 0001 <[count()=Int 1] m1 0001>";
+    let p17 = "c0b2(4): 0001 0002 0003 0004 <[count()=Int 4] m4 0001 0002 0003 0004> \
+               ; c0b1(3): 0001 0002 0003 <[count()=Int 3] m3 0001 0002 0003>";
+    let p19 = "c0b1(3): 0001 0002 0003 <[by(name)=Str x] m2 0001 0002 | [by(name)=Str y] m1 0003>";
+    // (query, limit, written answer, answered by the first slice alone)
+    let cases: Vec<(&str, u32, &str, bool)> = vec![
+        (
+            r#"{ resource.service.name = "A" } | { name = "b" } | count() > 1"#,
+            20,
+            "c0a1(2): 0002 0004 <[count()=Int 2] m2 0002 0004>",
+            false,
+        ),
+        (
+            r#"{ resource.service.name = "A" } | count() > 1 | { name = "b" }"#,
+            20,
+            "c0a1(2): 0002 0004 <[count()=Int 4] m2 0002 0004>",
+            false,
+        ),
+        (
+            r#"{ resource.service.name = "A" } | { name = "b" } | count() > 3"#,
+            20,
+            "",
+            false,
+        ),
+        (
+            r#"{ resource.service.name = "A" } | count() > 3 | { name = "b" }"#,
+            20,
+            "c0a1(2): 0002 0004 <[count()=Int 4] m2 0002 0004>",
+            false,
+        ),
+        (
+            r#"{ resource.service.name = "A" } | { name = "b" } | by(name)"#,
+            20,
+            "c0a1(2): 0002 0004 <[by(name)=Str b] m2 0002 0004>",
+            false,
+        ),
+        (
+            r#"{ resource.service.name = "A" } | by(name) | { name = "b" }"#,
+            20,
+            "c0a1(2): 0002 0004 <[by(name)=Str b] m2 0002 0004>",
+            false,
+        ),
+        (
+            r#"{ resource.service.name = "A" } | by(name) | count() > 3"#,
+            20,
+            "",
+            false,
+        ),
+        (
+            r#"{ resource.service.name = "A" } | count() > 3 | by(name)"#,
+            20,
+            a_by_name,
+            false,
+        ),
+        (
+            r#"{ resource.service.name = "A" } | count() > 1 | count() > 2"#,
+            20,
+            "c0a1(4): 0001 0002 0003 0004 <[count()=Int 4, count()=Int 4] m4 0001 0002 0003 0004>",
+            false,
+        ),
+        (
+            r#"{ resource.service.name = "A" } | by(name) | count() > 0 | by(kind)"#,
+            20,
+            a_by_kind,
+            false,
+        ),
+        (
+            r#"{ resource.service.name = "W" } | by(name) | count() > 2 | coalesce()"#,
+            20,
+            "c0a2(3): 0001 0002 0003",
+            false,
+        ),
+        (
+            r#"{ resource.service.name = "W" } | by(name) | coalesce() | count() > 2"#,
+            20,
+            "c0a2(4): 0001 0002 0003 0004 <[count()=Int 4] m4 0001 0002 0003 0004>",
+            false,
+        ),
+        (
+            r#"{ resource.service.name = "N" } | by(name) | by(kind)"#,
+            20,
+            n_nested,
+            false,
+        ),
+        (
+            r#"{ resource.service.name = "G" } | { status = error } | by(name) | by(kind)"#,
+            20,
+            g_nested,
+            false,
+        ),
+        (
+            r#"{ name = "p" } && { name = "q" } | by(name)"#,
+            20,
+            "c0b4(2): 0002 0001 <[by(name)=Str q] m1 0002 | [by(name)=Str p] m1 0001>",
+            false,
+        ),
+        (r#"{ } | count() < 3"#, 2, p16, true),
+        (r#"{ } | count() > 2"#, 2, p17, true),
+        (
+            r#"{ resource.service.name =~ "R|Q" } | { name = "r" }"#,
+            1,
+            "c0c3(1): 0001",
+            true,
+        ),
+        (
+            r#"{ resource.service.name = "S" } | by(name)"#,
+            1,
+            p19,
+            true,
+        ),
+        (
+            r#"({ name = "ga" } && { name = "gm" }) || { name = "gb" }"#,
+            1,
+            "c0c7(1): 0001",
+            false,
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (q, limit, want, sliced) in &cases {
+        let query = parse_query(q);
+        let plan = plan_of(&engine, &query, window, *limit, 10);
+        let got = engine.search_routed_explained(&plan).await;
+        let (text, stages) = match &got {
+            Ok((out, explain)) => (
+                p2_written(out),
+                explain
+                    .stages
+                    .iter()
+                    .map(|s| s.name.to_string())
+                    .collect::<Vec<_>>(),
+            ),
+            Err(e) => (format!("ERR {e}"), Vec::new()),
+        };
+        if text != *want {
+            wrong.push(format!("{q}\n  want: {want}\n  got:  {text}"));
+        }
+        if stages
+            .iter()
+            .any(|s| s != "search_slice" && s != "search_statement")
+        {
+            wrong.push(format!("{q}: answered by {stages:?}, not the statement"));
+        }
+        if *sliced && stages != vec!["search_slice".to_string()] {
+            wrong.push(format!("{q}: {stages:?}, want the first slice alone"));
+        }
+        let old = today(&db, &query, window, *limit, 10)
+            .await
+            .map(normalise_today);
+        let new = got.map(|(o, _)| o).map_err(|e| e.to_string());
+        if let (Ok(o), Ok(n)) = (&old, &new) {
+            let mut o = o.clone();
+            o.partial = false;
+            if &o != n {
+                wrong.push(format!(
+                    "{q}: differs from today's engine\n  today: {}",
+                    p2_written(&o)
+                ));
+            }
+        }
+    }
+    drop_db(&db).await;
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n\n")
+    );
+}
+
+/// Plan §5.2, fixture M: a metrics filter under `!` is served, and a
+/// non-boolean `span.f` in the window is a `400` carrying the demand.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_metrics_negation_is_served_and_a_non_boolean_is_400() {
+    skip_unless_live!();
+    const MS: i64 = 1_000_000;
+    let base_s = now_ns() / 1_000_000_000 - 3_600;
+    let at = |s: i64| s * 1_000_000_000;
+    let span = |n: u8, t: i64, f: Option<AnyValue>| {
+        span_of(
+            p2_id(0xd0 + n),
+            p2_sid(1),
+            Vec::new(),
+            "m",
+            2,
+            t,
+            MS,
+            f.map(|v| vec![kv("f", v)]).unwrap_or_default(),
+            0,
+            Vec::new(),
+            Vec::new(),
+        )
+    };
+    let body = request(
+        "mb",
+        "pod-1",
+        vec![
+            span(1, at(base_s + 10), Some(bool_value(true))),
+            span(2, at(base_s + 20), Some(bool_value(true))),
+            span(3, at(base_s + 30), Some(bool_value(false))),
+            span(4, at(base_s + 40), None),
+            span(5, at(base_s + 400), Some(str_value("s"))),
+        ],
+    );
+    let (db, _client) = seed_both(
+        pulsus_testkit::test_db("pulsus_read_it_t602p2a_metrics_not"),
+        &[body],
+        5,
+        "t602p2a-metrics-not",
+    )
+    .await;
+    let engine = engine_of(&db).await;
+    let mut wrong = Vec::new();
+    for (q, end, want) in [
+        ("{ !span.f } | count_over_time()", base_s + 300, "Ok(1)"),
+        (
+            "{ !span.f = false } | count_over_time()",
+            base_s + 300,
+            "Ok(2)",
+        ),
+        (
+            "{ !span.f != false } | count_over_time()",
+            base_s + 300,
+            "Ok(1)",
+        ),
+        (
+            "{ !span.f } | count_over_time()",
+            base_s + 600,
+            "Err(expression (!span.f) expected a boolean)",
+        ),
+    ] {
+        let planned = pulsus_read::plan_trace_metrics_routed(
+            &parse_query(q),
+            &pulsus_read::MetricsParams {
+                start_ns: base_s * S_NS,
+                end_ns: end * S_NS,
+                step_ms: 60_000,
+                exemplars: None,
+            },
+            &engine.metrics_ctx(),
+            &METRICS_TABLES,
+        );
+        let got = match planned {
+            Err(e) => format!("PlanError({e})"),
+            Ok(routed) => match engine.metrics_instant_routed(&routed).await {
+                Ok(r) => format!(
+                    "Ok({})",
+                    r.series
+                        .iter()
+                        .flat_map(|s| s.samples.iter().map(|(_, v)| v.to_string()))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+                Err(pulsus_read::logql::ReadError::PipelineInvalid { reason }) => {
+                    format!("Err({reason})")
+                }
+                Err(e) => format!("Err(other: {e})"),
+            },
+        };
+        if got != want {
+            wrong.push(format!("{q} to {end}: want {want}, got {got}"));
         }
     }
     drop_db(&db).await;

@@ -5637,3 +5637,60 @@ fn an_event_or_link_intrinsic_key_is_refused() {
         }
     }
 }
+
+/// Issue #602 part 2a, plan §3.5: a shape the search statement cannot
+/// fold is refused with the previous planner's exact text, and
+/// `by(trace:id)` names the part that serves it.
+#[test]
+fn compile_search_refuses_with_the_previous_planners_texts() {
+    let mut wrong = Vec::new();
+    for (query, want) in [
+        (
+            "{ .a = 1 } | by(.b + .c)",
+            "type mismatch: by((.b + .c)) is not a group key this engine can execute: a grouping \
+             key must resolve to a single per-span value, so it must be an attribute or an \
+             intrinsic",
+        ),
+        (
+            "{ .a = 1 } | { .b = 2 } && { .c = 3 }",
+            "type mismatch: ({ .b = 2 } && { .c = 3 }) is not executable as a pipeline stage: a \
+             `|` stage must be a single { ... } filter, not a cross-spanset or structural \
+             operation",
+        ),
+        (
+            "{ } | avg(span:childCount) > 1",
+            "type mismatch: span:childCount is not numerically aggregatable",
+        ),
+        (
+            "{ true } | avg(trace:duration) > 1s",
+            "type mismatch: traceDuration is not numerically aggregatable",
+        ),
+        (
+            "{ true } | avg(.a + 1) > 1",
+            "type mismatch: avg((.a + 1)) is not an executable aggregation source: only a bare \
+             duration or attribute can be aggregated",
+        ),
+        (
+            "{ } | select(event:name)",
+            "type mismatch: select() of this intrinsic is not supported",
+        ),
+        (
+            "{ } | by(event:name)",
+            "unsupported field: by(event:name): grouping by a span-event / span-link intrinsic \
+             is not supported (a span carries a collection of events/links, so there is no \
+             single group value)",
+        ),
+        (
+            "{ } | by(trace:id)",
+            "unsupported field: by(trace:id) is not supported by the search statement yet \
+             (issue #602 part 2b)",
+        ),
+    ] {
+        match compile_search_of(query) {
+            Err(e) if e.to_string() == want => {}
+            Err(e) => wrong.push(format!("{query}\n  want: {want}\n  got:  {e}")),
+            Ok(s) => wrong.push(format!("{query}: compiled to {}", s.sql())),
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
