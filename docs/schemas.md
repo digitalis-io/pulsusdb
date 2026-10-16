@@ -491,8 +491,8 @@ WHERE kind = 1;
 CREATE MATERIALIZED VIEW log_metrics_5s_mv TO log_metrics_5s AS
 SELECT org_id AS org_id, fingerprint AS fingerprint,
        intDiv(timestamp_ns, {res_ns}) * {res_ns} AS bucket_ns,
-       count() AS count,
-       sum(length(body)) AS bytes
+       count() AS count, countIf(timestamp_ns = bucket_ns) AS count_at,
+       sum(length(body)) AS bytes, sumIf(length(body), timestamp_ns = bucket_ns) AS bytes_at
 FROM log_landing WHERE kind = 0
 GROUP BY org_id, fingerprint, bucket_ns;
 
@@ -552,19 +552,19 @@ SETTINGS ttl_only_drop_parts = 1, min_columns_to_activate_adaptive_write_buffer 
 ```
 
 ```sql
--- Rollup resolution is configuration, not schema: PULSUS_LOG_ROLLUP_RESOLUTION
--- (default 5s) sets the bucket size; the table is named for it (log_metrics_5s
--- by default) and the MV bucket expression is rendered from it.
+-- PULSUS_LOG_ROLLUP_RESOLUTION (default 5s) sets the bucket size and names the table;
+-- the MV bucket expression is rendered from it. count_at/bytes_at: lines exactly on bucket_ns.
 CREATE TABLE log_metrics_5s (
-    org_id       LowCardinality(String),
-    fingerprint  UInt128,
+    org_id LowCardinality(String), fingerprint UInt128,
     bucket_ns    Int64,                          -- intDiv(timestamp_ns, {res_ns}) * {res_ns}
-    count        SimpleAggregateFunction(sum, UInt64),
-    bytes        SimpleAggregateFunction(sum, UInt64)
-) ENGINE = AggregatingMergeTree
-PARTITION BY toDate(fromUnixTimestamp64Nano(bucket_ns))
-ORDER BY (org_id, fingerprint, bucket_ns);
--- populated by log_metrics_5s_mv over log_landing's kind-0 rows
+    count    SimpleAggregateFunction(sum, UInt64), bytes    SimpleAggregateFunction(sum, UInt64),
+    count_at SimpleAggregateFunction(sum, UInt64), bytes_at SimpleAggregateFunction(sum, UInt64),
+    PROJECTION by_time (SELECT org_id, bucket_ns, fingerprint ORDER BY (org_id, bucket_ns, fingerprint))
+) ENGINE = AggregatingMergeTree PARTITION BY toDate(fromUnixTimestamp64Nano(bucket_ns))
+ORDER BY (org_id, fingerprint, bucket_ns)
+TTL toDateTime(fromUnixTimestamp64Nano(bucket_ns)) + INTERVAL 7 DAY DELETE   -- log_samples' retention
+SETTINGS ttl_only_drop_parts = 1, deduplicate_merge_projection_mode = 'rebuild', lightweight_mutation_projection_mode = 'rebuild';
+-- populated by log_metrics_5s_mv over log_landing's kind-0 rows; by_time serves the discovery read
 ```
 
 ```sql
@@ -590,7 +590,7 @@ TTL toDateTime(fromUnixTimestamp64Nano(bucket_ns)) + INTERVAL 7 DAY DELETE
 SETTINGS ttl_only_drop_parts = 1;
 ```
 
-Raw log timestamps in `log_samples` are stored verbatim at nanosecond precision — the rollup is derived, and only eligible when the query step is a multiple of the configured rollup resolution; otherwise the planner counts raw rows.
+Raw log timestamps in `log_samples` are stored verbatim at nanosecond precision; the rollup is derived. A bucket is `[b, b + res)` and a window is `(t − range, t]`, so the rollup answers a window exactly when `t` and `range` are multiples of `res`: the window is the buckets `[t − range, t)`, less the lines exactly on `t − range` (`count_at`), plus those exactly on `t`. The rollup statement reads each row as two points — its `count_at` at `b`, the rest at `b + res` — and runs the sliding statement's grid arithmetic over them (`sql.rs`'s `metric_range_rollup`). Which queries read it, and the one documented limit on that equality (a non-empty `__error__` in a line's structured metadata), is [architecture.md §3.2](architecture.md)'s (issue #614).
 
 - **`log_patterns` primary-key order is `(org_id, fingerprint, bucket_ns, pattern)`** (issue #171, `bucket_ns` **before** `pattern`; the tenant leads, issue #653): a `/api/logs/v1/patterns` read is a `fingerprint IN (...)` + bounded `bucket_ns` window, so putting `bucket_ns` second prunes at the PK level inside each fingerprint's key range, not only via daily partitions. The template is a **deterministic, stateless** token-class rendering of the line body (digit/length classification, `key=value`/`key:value` awareness, 1 KiB prefix / 64-token / 512-byte caps, whitespace runs collapse) — NOT a drain-style online clusterer, whose order-dependent per-stream mutable state would emit different templates on different shards/replicas/retries and break both the mergeable `sum` and idempotent re-inserts. Templates are normalized (whitespace-collapsed), documented as "not round-trip matchable". **Count semantics** are exact on the clean ingest path and **best-effort approximate under ingest-failure re-sends**, at parity with `log_metrics` (§2.2's tier caveat): the writer never auto-replays a block that could have committed (an `InsertUncertain` batch is spooled audit-only, never re-inserted), so the only over-count vector is a client-level re-send after a 5xx/timeout ack (steady-state zero), and **there is no under-count vector left from a failing flush** (issue #603): the pattern rows ride the same landed block as the lines they were extracted from, so there is no separate patterns insert to fail, and a push whose block does not land lands no lines either. What remains is the fan-out residual every target of `log_landing` shares — a view that throws while the server processes the insert leaves it unrecorded which targets kept the block's rows (§4.1, "What a failing view leaves behind"). A single request that emits more than 10 000 distinct templates (pathological — the extraction caps make templates low-cardinality by construction) drops the excess from pattern accounting only (log lines untouched, counted via the writer's `patterns_dropped_total`), an under-count event folded into the same approximate semantics; the next batch resumes discovery.
 

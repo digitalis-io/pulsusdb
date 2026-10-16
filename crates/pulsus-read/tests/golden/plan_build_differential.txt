@@ -2647,14 +2647,14 @@ MetricBinary(
             MetricPlan {
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
-                table: "log_samples",
+                table: "log_metrics_5s",
                 value: Shaped(
-                    RawCount,
+                    RollupCount,
                 ),
-                rollup: false,
+                rollup: true,
                 routing: RoutingDecision {
-                    chosen: Raw,
-                    reason: "raw: sliding range aggregation in the database (issue #624)",
+                    chosen: Rollup,
+                    reason: "rollup: sum over the 5000000000 ns buckets (issue #614)",
                 },
                 extra_predicates: [],
                 start_ns: 1782906900000000000,
@@ -2873,14 +2873,14 @@ MetricBinary(
             MetricPlan {
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
-                table: "log_samples",
+                table: "log_metrics_5s",
                 value: Shaped(
-                    RawCount,
+                    RollupCount,
                 ),
-                rollup: false,
+                rollup: true,
                 routing: RoutingDecision {
-                    chosen: Raw,
-                    reason: "raw: sliding range aggregation in the database (issue #624)",
+                    chosen: Rollup,
+                    reason: "rollup: sum over the 5000000000 ns buckets (issue #614)",
                 },
                 extra_predicates: [],
                 start_ns: 1782906900000000000,
@@ -4923,14 +4923,14 @@ MetricBinary(
             MetricPlan {
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE org_id = '' AND month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
-                table: "log_samples",
+                table: "log_metrics_5s",
                 value: Shaped(
-                    RawCount,
+                    RollupCount,
                 ),
-                rollup: false,
+                rollup: true,
                 routing: RoutingDecision {
-                    chosen: Raw,
-                    reason: "raw: sliding range aggregation in the database (issue #624)",
+                    chosen: Rollup,
+                    reason: "rollup: sum over the 5000000000 ns buckets (issue #614)",
                 },
                 extra_predicates: [],
                 start_ns: 1782906900000000000,

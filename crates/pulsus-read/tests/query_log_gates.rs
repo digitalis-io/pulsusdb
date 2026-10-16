@@ -1254,7 +1254,7 @@ async fn detected_labels_fan_in_is_one_row_per_key_at_any_cardinality() {
         )
         .await
         .expect("drop test database");
-    run_init(&admin, &test_ctx(db)).await.expect("run_init");
+    run_init(&admin, &dated_ctx(db)).await.expect("run_init");
     let client = data_client(db).await;
 
     // The two months are separate partitions, so the same three keys can
@@ -7648,7 +7648,7 @@ struct SelectionRun {
 async fn observed_selection_blocks(db: &str) -> Vec<(SelectionBlock, Vec<SelectionRun>)> {
     let engine = LogQlEngine::new(
         data_client(db).await,
-        engine_config(db, 64 * 1024 * 1024),
+        raw_engine_config(db, 64 * 1024 * 1024),
         pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
     );
     let mut out = Vec::new();
@@ -10566,7 +10566,7 @@ async fn a_rate_under_a_sum_divides_once_per_group() {
                     };
                     let mut engine = LogQlEngine::new(
                         data_client(&db).await,
-                        engine_config(&db, 64 * 1024 * 1024),
+                        raw_engine_config(&db, 64 * 1024 * 1024),
                         pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
                     )
                     .with_key_route_test_hooks(hooks);
@@ -14992,4 +14992,23 @@ async fn the_w4_statement_is_gone() {
         );
     }
     drop_db_624(&admin, &db).await;
+}
+
+/// [`engine_config`] with no rollup resolution (issue #614, part 2): the
+/// cases that pin the raw routes' statements keep them on the raw routes,
+/// where a `sum` on the rollup's grid would otherwise read the rollup.
+fn raw_engine_config(db: &str, scan_budget_bytes: u64) -> EngineConfig {
+    EngineConfig {
+        rollup_res_ns: 0,
+        ..engine_config(db, scan_budget_bytes)
+    }
+}
+
+/// [`test_ctx`] with a retention that keeps a fixture dated months back
+/// (issue #614, part 2: the rollup expires with `log_samples`).
+fn dated_ctx(db: &str) -> SchemaParams {
+    RenderCtx {
+        retention_days: 36_500,
+        ..test_ctx(db)
+    }
 }

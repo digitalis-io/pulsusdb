@@ -245,6 +245,9 @@ struct RollupRow {
     bucket_ns: i64,
     count: u64,
     bytes: u64,
+    /// The lines exactly on `bucket_ns` (issue #614, part 2).
+    count_at: u64,
+    bytes_at: u64,
 }
 
 /// **T39.** The production discovery read answers completely over split
@@ -341,6 +344,8 @@ async fn the_production_discovery_read_answers_completely_over_split_placement()
                 bucket_ns: (ts / 5_000_000_000) * 5_000_000_000,
                 count: 1,
                 bytes: 10,
+                count_at: 0,
+                bytes_at: 0,
             }],
         )
         .await
