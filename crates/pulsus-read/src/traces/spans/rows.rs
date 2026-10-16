@@ -677,27 +677,26 @@ pub struct SearchGroupedRow {
 }
 
 /// One element of [`SearchGroupedRow::groups`], in the tuple's order: the
-/// key's value as text, its stored type (`""` for a column key), the spans
-/// of the group that every filter kept, before the `spss` cap, and its
-/// first `spss` spans.
+/// spanset's response attributes as `(text, type)` in the pipeline's
+/// written order (`""` the type of a column key), the spans of the group
+/// that every stage kept, before the `spss` cap, and its first `spss`
+/// spans.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchGroupTuple {
-    pub value: String,
-    pub value_type: String,
+    pub attrs: Vec<(String, String)>,
     pub matched: u64,
     pub spans: Vec<SearchSpanTuple>,
 }
 
 /// See [`SPAN_TUPLE_ELEMENTS`].
-pub const SEARCH_GROUP_TUPLE_ELEMENTS: usize = 4;
+pub const SEARCH_GROUP_TUPLE_ELEMENTS: usize = 3;
 
 impl Serialize for SearchGroupTuple {
     /// See [`FetchedEventTuple::serialize`].
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeTuple;
         let mut t = s.serialize_tuple(SEARCH_GROUP_TUPLE_ELEMENTS)?;
-        t.serialize_element(self.value.as_str())?;
-        t.serialize_element(self.value_type.as_str())?;
+        t.serialize_element(&self.attrs)?;
         t.serialize_element(&self.matched)?;
         t.serialize_element(&self.spans)?;
         t.end()
@@ -719,8 +718,7 @@ impl<'de> Visitor<'de> for SearchGroupVisitor {
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
         const T: &str = "search group";
         Ok(SearchGroupTuple {
-            value: element(&mut seq, T, "value")?,
-            value_type: element(&mut seq, T, "value_type")?,
+            attrs: element(&mut seq, T, "attrs")?,
             matched: element(&mut seq, T, "matched")?,
             spans: element(&mut seq, T, "spans")?,
         })

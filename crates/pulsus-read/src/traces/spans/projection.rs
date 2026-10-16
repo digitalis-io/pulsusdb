@@ -284,9 +284,11 @@ impl Projection {
                 &FieldExpr::Literal(Value::Bool(true)),
                 ctx,
             ),
-            Field::Intrinsic(_) => Err(PlanError::UnsupportedField(format!(
-                "select({field}) is not supported by the search statement (issue #592)"
-            ))),
+            // The event and link intrinsics: a span carries a collection
+            // of them, and the previous planner's text stands.
+            Field::Intrinsic(_) => Err(PlanError::TypeMismatch(
+                "select() of this intrinsic is not supported".to_string(),
+            )),
         }
     }
 

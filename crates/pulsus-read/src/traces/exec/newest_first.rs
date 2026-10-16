@@ -4,16 +4,15 @@
 use pulsus_clickhouse::{ChError, QuerySettings};
 
 use super::{
-    ByteBudget, HYDRATION_BYTE_BUDGET, SearchOutput, TraceEngine, map_search_statement_error,
-    map_trace_read_error, search_row_bytes, with_final,
+    ByteBudget, GroupCardinalityCounter, HYDRATION_BYTE_BUDGET, SearchOutput, TraceEngine,
+    TraceReadConfig, map_search_statement_error, map_trace_read_error, search_grouped_row_bytes,
+    search_row_bytes, with_final,
 };
 use crate::logql::error::ReadError;
 use crate::logql::explain::PlanExplain;
 use crate::traces::search_plan::SearchPlan;
-use crate::traces::spans::rows::SearchTraceRow;
-use crate::traces::spans::search::{
-    SLICE_NS, SearchStatement, decode_search_charged, plan_statement_sliced,
-};
+use crate::traces::spans::rows::{SearchGroupedRow, SearchTraceRow};
+use crate::traces::spans::search::{SLICE_NS, SearchStatement};
 
 impl TraceEngine {
     /// The attribute indexes this engine's search statements may hint
@@ -30,70 +29,43 @@ impl TraceEngine {
     /// 10, then 20, while the slice holds fewer than `limit` traces and
     /// its density says doubling is cheaper than the window: `n * k >=
     /// 2 * limit`, `k` the slices of the current width the window holds.
-    /// `Some` is the answer, a slice's or today's engine's after a
-    /// demand; `None` means the whole-window statement answers, and its
-    /// `search_statement` stage is pushed.
+    /// [`Next::Answer`] is a slice's answer; [`Next::Whole`] means the
+    /// whole-window statement answers, and its `search_statement` stage is
+    /// pushed; [`Next::Handover`] that a slice raised one of its demands.
     pub(super) async fn newest_first(
         &self,
         plan: &SearchPlan,
         stmt: &SearchStatement,
         explain: &mut Option<&mut PlanExplain>,
-    ) -> Result<Option<SearchOutput>, ReadError> {
+    ) -> Result<Next, ReadError> {
         let window_ns = plan.window.end_ns.saturating_sub(plan.window.start_ns);
         let limit = u64::from(plan.limit);
-        let settings = self.statement_settings(stmt);
         let mut budget = ByteBudget::new(HYDRATION_BYTE_BUDGET);
         let mut charged = 0usize;
         let mut len = SLICE_NS;
         while stmt.sliceable() && len < window_ns {
-            let sliced = plan_statement_sliced(
-                plan,
-                &self.config.spans_v2_table,
-                &self.config.traces_table,
-                &self.config.resources_table,
-                self.config.max_depth,
-                &self.indexed,
-                Some(len),
-            )
-            .expect("a statement that compiled whole compiles sliced");
+            let sliced = self
+                .search_statement(plan, Some(len))
+                .expect("a statement that compiled whole compiles sliced");
             if let Some(e) = explain.as_mut() {
                 e.push("search_slice", sliced.sql(), None);
             }
             let rows = match self
-                .collect_rows_charged::<SearchTraceRow, _>(
-                    sliced.sql(),
-                    &settings,
-                    &mut budget,
-                    &mut charged,
-                    map_search_statement_error,
-                    search_row_bytes,
-                )
+                .statement_rows(&sliced, &mut budget, &mut charged)
                 .await
             {
                 Ok(rows) => rows,
-                Err(ReadError::Clickhouse(ChError::Server { code: 395, message }))
-                    if sliced
-                        .demands()
-                        .iter()
-                        .any(|demand| message.contains(demand.as_str())) =>
-                {
-                    return self
-                        .search_inner(plan, explain.as_deref_mut())
-                        .await
-                        .map(Some);
-                }
-                Err(ReadError::Clickhouse(e)) => {
-                    return Err(map_trace_read_error(e, &self.config));
-                }
+                Err(e) if demanded(&sliced, &e) => return Ok(Next::Handover),
                 // A slice a budget refuses hands the search to the
                 // whole-window statement, whose own refusal, if any, stands.
                 Err(ReadError::QueryTooBroad(_)) => break,
-                Err(other) => return Err(other),
+                Err(e) => return Err(read_error(e, &self.config)),
             };
             let n = rows.len() as u64;
             if n >= limit {
-                return decode_search_charged(rows, sliced.projection(), plan.limit, &mut budget)
-                    .map(Some);
+                return rows
+                    .decode(&sliced, plan.limit, &mut budget, self.config.max_series)
+                    .map(Next::Answer);
             }
             drop(rows);
             budget.release(charged);
@@ -110,7 +82,115 @@ impl TraceEngine {
         if let Some(e) = explain.as_mut() {
             e.push("search_statement", stmt.sql(), None);
         }
-        Ok(None)
+        Ok(Next::Whole)
+    }
+}
+
+/// What [`TraceEngine::newest_first`] leaves the fork.
+pub(super) enum Next {
+    Answer(SearchOutput),
+    Whole,
+    Handover,
+}
+
+/// Whether `e` is `Code: 395` carrying one of `stmt`'s demands.
+pub(super) fn demanded(stmt: &SearchStatement, e: &ReadError) -> bool {
+    matches!(e, ReadError::Clickhouse(ChError::Server { code: 395, message })
+        if stmt.demands().iter().any(|d| message.contains(d.as_str())))
+}
+
+/// A statement's ClickHouse error as the trace read path maps it.
+pub(super) fn read_error(e: ReadError, config: &TraceReadConfig) -> ReadError {
+    match e {
+        ReadError::Clickhouse(e) => map_trace_read_error(e, config),
+        other => other,
+    }
+}
+
+/// A search statement's rows: one per trace, flat or with its spansets.
+pub(super) enum StatementRows {
+    Flat(Vec<SearchTraceRow>),
+    Grouped(Vec<SearchGroupedRow>),
+}
+
+impl StatementRows {
+    pub(super) fn len(&self) -> usize {
+        match self {
+            StatementRows::Flat(r) => r.len(),
+            StatementRows::Grouped(r) => r.len(),
+        }
+    }
+
+    /// The rows as the answer, the groups counted against `max_series`.
+    pub(super) fn decode(
+        self,
+        stmt: &SearchStatement,
+        limit: u32,
+        budget: &mut ByteBudget,
+        max_series: u64,
+    ) -> Result<SearchOutput, ReadError> {
+        match (self, stmt.grouping()) {
+            (StatementRows::Grouped(rows), Some(grouping)) => {
+                let mut counter = GroupCardinalityCounter::new(max_series);
+                crate::traces::spans::search::decode_search_grouped_charged(
+                    rows,
+                    stmt.projection(),
+                    grouping,
+                    limit,
+                    budget,
+                    &mut counter,
+                )
+            }
+            (StatementRows::Flat(rows), None) => {
+                crate::traces::spans::search::decode_search_charged(
+                    rows,
+                    stmt.projection(),
+                    limit,
+                    budget,
+                )
+            }
+            _ => unreachable!("the rows follow the statement's grouping"),
+        }
+    }
+}
+
+impl TraceEngine {
+    /// Issues `stmt` once with the search settings plus `final = 1` (and a
+    /// climb's depth bound), collecting its rows against `budget`. A
+    /// ClickHouse error comes back as it came, for [`demanded`].
+    pub(super) async fn statement_rows(
+        &self,
+        stmt: &SearchStatement,
+        budget: &mut ByteBudget,
+        charged: &mut usize,
+    ) -> Result<StatementRows, ReadError> {
+        let mut settings = self.statement_settings(stmt);
+        if let Some(depth) = stmt.climb_depth() {
+            settings = settings.set("max_recursive_cte_evaluation_depth", u64::from(depth) + 1);
+        }
+        if stmt.grouping().is_some() {
+            self.collect_rows_charged::<SearchGroupedRow, _>(
+                stmt.sql(),
+                &settings,
+                budget,
+                charged,
+                map_search_statement_error,
+                search_grouped_row_bytes,
+            )
+            .await
+            .map(StatementRows::Grouped)
+        } else {
+            self.collect_rows_charged::<SearchTraceRow, _>(
+                stmt.sql(),
+                &settings,
+                budget,
+                charged,
+                map_search_statement_error,
+                search_row_bytes,
+            )
+            .await
+            .map(StatementRows::Flat)
+        }
     }
 }
 
