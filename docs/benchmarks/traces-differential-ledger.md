@@ -716,7 +716,7 @@ when we are asking it to slow down, so we keep `429`; recorded as
   the `reject/by_multi_key` corpus case, and the accept-surface matrix's
   D16 rows. User-facing write-up: docs/api.md §4.2.
 
-### `traceql-metrics-filter-residual-refusals` (issue #458, wave 1) — **a GAP record, not a divergence**
+### `traceql-metrics-filter-residual-refusals` (issue #458, part 1) — **a GAP record, not a divergence**
 
 - **What.** The metrics filter compiler (`render_expr` in
   `crates/pulsus-read/src/traces/metrics_sql.rs`) refuses constructs the
@@ -737,7 +737,7 @@ when we are asking it to slow down, so we keep `429`; recorded as
   second-pass filter. So every refusal below is a **gap**, not a
   divergence in judgement.
 
-- **Closed by wave 1** (this issue, still open): the `nestedSetParent`
+- **Closed by issue #458 part 1** (this issue, still open): the `nestedSetParent`
   root/non-root family — the query a live Grafana sent us — and bare
   attribute truthiness.
 
@@ -1404,7 +1404,7 @@ when we are asking it to slow down, so we keep `429`; recorded as
   `e2e/src/traces.rs` feeds the same two committed blocks to the
   differential's validity gate.
 
-### `traceql-metrics-instant-empty-window-series` (issue #464, wave 2) — **an empty answer, spelled two ways, on `GET /api/metrics/query`**
+### `traceql-metrics-instant-empty-window-series` (issue #464, part 2) — **an empty answer, spelled two ways, on `GET /api/metrics/query`**
 
 - **Route.** `GET /api/metrics/query` (and its `/api/traces/v1/metrics/query`
   and `/tempo/api/metrics/query` spellings) — the **instant** form only. The
@@ -1470,14 +1470,14 @@ when we are asking it to slow down, so we keep `429`; recorded as
   `crates/pulsus-read/tests/traces_metrics_sql.rs`'s
   `shipped_metrics_shapes_and_limits_are_documented` pins that sentence.
 
-- **Disposition.** Recorded, **not fixed**, and pre-existing: before wave 2
-  the same series came back carrying a `samples[]` array, so wave 2 changed
+- **Disposition.** Recorded, **not fixed**, and pre-existing: before issue #464 part 2
+  the same series came back carrying a `samples[]` array, so part 2 changed
   the envelope and nothing about which series exist or what they hold.
   Whether either half becomes an issue is deferred — mechanism 1 should be
   settled as one cross-route change alongside the range route's identical
   `"series":[]`, not on this route alone.
 
-### `traceql-parse-error-body-differs-by-route` (issue #464, wave 2) — **a reference-side fact, recorded so the next comparison uses the right endpoint**
+### `traceql-parse-error-body-differs-by-route` (issue #464, part 2) — **a reference-side fact, recorded so the next comparison uses the right endpoint**
 
 - **Route.** Three of them, which is the entire point of the row.
 
@@ -2263,12 +2263,12 @@ when we are asking it to slow down, so we keep `429`; recorded as
   the span is NOT in the probe's result set, so the value is not in hand:
   supplying it needs a second, key-only value read whose cost was measured
   at 4.3x–70x the membership read's bytes plus one serial round trip per
-  batch per key. The query-performance mandate is why this is a wave and
+  batch per key. The query-performance mandate is why this is deferred to a later change and
   not an omission.
 - **Disposition:** remaining work on issue #479. Our answer (absent) is
   pinned live by
   `crates/pulsus-server/tests/traces_search_live.rs::the_matched_span_projection_follows_the_reference_rule`
-  so a later wave has a diff to move rather than a silent change.
+  so later work has a diff to move rather than a silent change.
 
 ### `traceql-matched-span-multi-field-leaf-not-projected` (issue #479)
 
@@ -2303,7 +2303,7 @@ when we are asking it to slow down, so we keep `429`; recorded as
   rather than only on the spans in the queried window. Recorded because a
   differential whose oracle answers from instance-wide state, not from the
   corpus under test, has no stable pin — and because it was seen once.
-- **Reported once, during the wave-1 code review of this issue.** On ONE
+- **Reported once, during the first round of this issue's code review.** On ONE
   reference instance carrying two corpora pushed by two different legs,
   `{ .a = nil }` answered no spans on an isolated run and, after a second
   corpus introduced the key `a`, answered with the `a`-absent spans
@@ -2332,14 +2332,14 @@ when we are asking it to slow down, so we keep `429`; recorded as
   `cafe000000000001[a={"intValue": "3"}]`). So the non-reproduction is not
   "the key never arrived".
 - **Replaying the original sequence does not reproduce it either, and
-  cannot settle it.** The wave-2 code review rebuilt the wave-1 probe
+  cannot settle it.** The second code review round rebuilt the first round's probe
   harness from that round's transcript — the reconstruction's git blob
   hash matches the original byte for byte — and ran the ORIGINAL suite
   order rather than a controlled isolation: the comparison leg, then the
   projection leg on one instance, then the harness. The case still read
   `NO-SPANS` on the reference. **The replay is not a same-window
   comparison**, and that is the point worth recording: the harness's read
-  modes carry wave-1's HARD-CODED timestamps, while the run that pushes
+  modes carry the first round's HARD-CODED timestamps, while the run that pushes
   the corpus anchors it at `now - 90s`. Those fixed windows no longer
   cover the spans the same invocation just pushed, so the read half
   quietly returns nothing whatever the catalog holds — the mixed-TTL

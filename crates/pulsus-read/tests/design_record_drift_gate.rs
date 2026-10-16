@@ -368,7 +368,8 @@ fn count_sites() -> Vec<CountSite> {
 }
 
 /// The file's text with every run of whitespace collapsed to one space,
-/// and the original line number of each character.
+/// and the original line number of each BYTE of it — the unit `find`
+/// returns, so an offset into the text is an index into the lines.
 fn normalised(raw: &str) -> (String, Vec<u32>) {
     let (mut out, mut lines) = (String::new(), Vec::new());
     let (mut ln, mut prev_ws) = (1u32, true);
@@ -384,7 +385,7 @@ fn normalised(raw: &str) -> (String, Vec<u32>) {
             }
         } else {
             out.push(ch);
-            lines.push(ln);
+            lines.extend(std::iter::repeat_n(ln, ch.len_utf8()));
             prev_ws = false;
         }
     }
@@ -402,8 +403,13 @@ fn normalised(raw: &str) -> (String, Vec<u32>) {
 /// check green, so the two failures name two different defects rather
 /// than one defect twice.
 fn read_site(site: &CountSite) -> Option<(Option<u64>, u32, String)> {
-    let raw = read(&site.path);
-    let (t, lines) = normalised(&raw);
+    site_in(&read(&site.path), site)
+}
+
+/// [`read_site`] over text already in hand, so the line arithmetic can be
+/// tested on a fixture rather than on the record.
+fn site_in(raw: &str, site: &CountSite) -> Option<(Option<u64>, u32, String)> {
+    let (t, lines) = normalised(raw);
     if t.matches(&site.prefix).count() != 1 {
         return None;
     }
@@ -424,6 +430,35 @@ fn read_site(site: &CountSite) -> Option<(Option<u64>, u32, String)> {
         lines[offset.min(lines.len() - 1)],
         between,
     ))
+}
+
+/// **A site's line is the line its number is on, whatever precedes it.**
+///
+/// The text before the site carries multi-byte characters (`§`, `—`,
+/// `×`), as the record does. A line read by indexing a per-character
+/// vector with a byte offset lands one line late per extra byte, so it
+/// reports a later line than the number's own.
+#[test]
+fn a_site_after_multi_byte_text_reports_the_line_its_number_is_on() {
+    let mut raw = String::new();
+    for _ in 0..40 {
+        raw.push_str("§ — × ¶ é ü\n");
+    }
+    raw.push_str("the cut has exactly four variants\n");
+    for _ in 0..40 {
+        raw.push_str("a later line\n");
+    }
+    let site = CountSite {
+        id: "fixture".to_string(),
+        path: "fixture.md".to_string(),
+        prefix: "the cut has exactly".to_string(),
+        suffix: "variants".to_string(),
+        rendering: Rendering::NumberWord,
+        line: 41,
+    };
+    let (value, line, _) = site_in(&raw, &site).expect("the fixture's site resolves");
+    assert_eq!(value, Some(4), "the fixture's number is four");
+    assert_eq!(line, 41, "the number is on line 41 of the fixture");
 }
 
 /// **Every derived count the record states is the one derived.**

@@ -207,7 +207,7 @@ fn the_residual_entry_states_that_it_records_gaps_rather_than_divergences_of_jud
     );
     assert!(
         squash(&ledger).contains(
-            "### `traceql-metrics-filter-residual-refusals` (issue #458, wave 1) — \
+            "### `traceql-metrics-filter-residual-refusals` (issue #458, part 1) — \
              **a GAP record, not a divergence**"
         ),
         "the entry heading must say it is a gap record"

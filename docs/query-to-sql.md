@@ -5718,7 +5718,7 @@ noticed and are not grounds for a new round.
    the three things an amendment owes: which slot a join occupies, what the wrap rule does when a
    later stage needs a slot the join has filled, and whether the join's right side counts against
    D3's two ceilings. `Relation` has no join slot, so the prohibition is a type property rather than
-   a request. **Field selection is therefore not in the first implementation wave**, and this
+   a request. **Field selection is therefore not in the first implementation, issue #492 part 1**, and this
    question stays open until whoever builds it amends the ADR first.
 
    **Measured, and it changes what an amendment has to meet: the whole-request join form does not

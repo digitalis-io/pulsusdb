@@ -1,25 +1,25 @@
 id	path	prefix	suffix	rendering	line
-traceql_pipeline_stage_variants	docs/query-to-sql.md	### 1.5 TraceQL — the	stage kinds, and the selector	word	360
-traceql_pipeline_stage_variants	docs/query-to-sql.md	`PipelineStage` has exactly	variants	word	362
-traceql_pipeline_stage_variants	docs/query-to-sql.md	### 2.4 TraceQL — the	stage kinds, and the selector	word	603
-traceql_pipeline_stage_variants	docs/query-lowering.md	([`crates/pulsus-traceql/src/ast.rs`](../crates/pulsus-traceql/src/ast.rs), line 981) has exactly **	** variants	word	1174
-traceql_pipeline_stage_variants	docs/query-lowering.md	** variants; all	are below	word	1174
-logql_stage_variants	docs/query-to-sql.md	### 1.2 LogQL — the	stage kinds	word	264
+traceql_pipeline_stage_variants	docs/query-to-sql.md	### 1.5 TraceQL — the	stage kinds, and the selector	word	357
+traceql_pipeline_stage_variants	docs/query-to-sql.md	`PipelineStage` has exactly	variants	word	359
+traceql_pipeline_stage_variants	docs/query-to-sql.md	### 2.4 TraceQL — the	stage kinds, and the selector	word	598
+traceql_pipeline_stage_variants	docs/query-lowering.md	([`crates/pulsus-traceql/src/ast.rs`](../crates/pulsus-traceql/src/ast.rs), line 981) has exactly **	** variants	word	1167
+traceql_pipeline_stage_variants	docs/query-lowering.md	** variants; all	are below	word	1167
+logql_stage_variants	docs/query-to-sql.md	### 1.2 LogQL — the	stage kinds	word	262
 logql_stage_variants	docs/query-to-sql.md	`Stage` has exactly	variants	word	264
-logql_stage_variants	docs/query-lowering.md	no validation. #### The	`Stage` variants, each as a `Pipe` link	word	1748
-never_reason_variants	docs/query-lowering.md	`NeverReason` has exactly **	** variants	word	5480
-lql_link_variants	docs/query-lowering.md	`LqlLink` has exactly **	** variants	digits	5299
-cut_variants	docs/query-lowering.md	every continuation naming a cut names one of the	|	word	5321
-logql_stage_variants	docs/query-lowering.md	reason — a `find_map` over the	stage variants	word	51
-tql_link_variants	docs/query-lowering.md	| every `TqlLink` variant — all **	** of them	digits	5297
-tql_link_variants	docs/query-lowering.md	It used to carry rows for 5 of the enum's	variants	digits	1288
-tql_link_variants	docs/query-lowering.md	§3.1 enumerated 5 of `TqlLink`'s	variants	digits	5131
+logql_stage_variants	docs/query-lowering.md	no validation. #### The	`Stage` variants, each as a `Pipe` link	word	1743
+never_reason_variants	docs/query-lowering.md	`NeverReason` has exactly **	** variants	word	5457
+lql_link_variants	docs/query-lowering.md	`LqlLink` has exactly **	** variants	digits	5287
+cut_variants	docs/query-lowering.md	every continuation naming a cut names one of the	|	word	5293
+logql_stage_variants	docs/query-lowering.md	reason — a `find_map` over the	stage variants	word	49
+tql_link_variants	docs/query-lowering.md	| every `TqlLink` variant — all **	** of them	digits	5287
+tql_link_variants	docs/query-lowering.md	It used to carry rows for 5 of the enum's	variants	digits	1275
+tql_link_variants	docs/query-lowering.md	§3.1 enumerated 5 of `TqlLink`'s	variants	digits	5103
 cut_variants	docs/query-lowering.md	§2.7 is the plan object and the	**cuts** that are the only ways	word	19
-section_3_1_effect_rows	docs/query-lowering.md	| §3.1 carries exactly **	** rows with a residual state effect	digits	5305
-section_3_1_effect_rows	docs/query-lowering.md	tables: **	** in §3.1 (`Structural`	digits	5115
-section_3_1_rows_without_effect	docs/query-lowering.md	** rows with a residual state effect and **	** without; §7.1 carries exactly	digits	5305
-section_7_1_effect_rows	docs/query-lowering.md	** without; §7.1 carries exactly **	** and **	digits	5306
-section_7_1_rows_without_effect	docs/query-lowering.md	§7.1 carries exactly **20** and **	** —	digits	5306
-residual_effects_total	docs/query-lowering.md	`LabelReplace`, `Order`, `Limit`, `Emit`) — **	** effects in all	digits	5120
-traceql_residual_effect_gate_rows	docs/query-lowering.md	and the shipped test's **	** is that plus	digits	5137
-traceql_residual_effect_gate_rows	docs/query-lowering.md	`assert_every_residual_state_effect::<Tql>(&rows,	)	digits	5142
+section_3_1_effect_rows	docs/query-lowering.md	| §3.1 carries exactly **	** rows with a residual state effect	digits	5288
+section_3_1_effect_rows	docs/query-lowering.md	tables: **	** in §3.1 (`Structural`	digits	5085
+section_3_1_rows_without_effect	docs/query-lowering.md	** rows with a residual state effect and **	** without; §7.1 carries exactly	digits	5288
+section_7_1_effect_rows	docs/query-lowering.md	** without; §7.1 carries exactly **	** and **	digits	5288
+section_7_1_rows_without_effect	docs/query-lowering.md	§7.1 carries exactly **20** and **	** —	digits	5288
+residual_effects_total	docs/query-lowering.md	`LabelReplace`, `Order`, `Limit`, `Emit`) — **	** effects in all	digits	5089
+traceql_residual_effect_gate_rows	docs/query-lowering.md	and the shipped test's **	** is that plus	digits	5105
+traceql_residual_effect_gate_rows	docs/query-lowering.md	`assert_every_residual_state_effect::<Tql>(&rows,	)	digits	5108

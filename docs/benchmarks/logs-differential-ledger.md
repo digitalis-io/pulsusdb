@@ -1132,7 +1132,7 @@ distinct (`Distinct (Preliminary DISTINCT)` in the measured plan), so the
   (issue #91). These queries are runtime vector-matching failures on both
   stores.
 - **Probed live against `grafana/loki:3.4.2`, re-probed byte-identical
-  at `grafana/loki:3.7.4` (issue #240 wave0):**
+  at `grafana/loki:3.7.4` (issue #240, its first capture round):**
   - many-to-one without a grouping modifier → HTTP **500**, body
     `multiple matches for labels: many-to-one matching must be explicit
     (group_left/group_right)` — PulsusDB's WHOLE wire body matches it
