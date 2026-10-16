@@ -185,7 +185,7 @@ impl IntoResponse for ApiError {
 /// | source | HTTP |
 /// |---|---|
 /// | `Parse`/`EmptyMatcherSet`/`ContradictoryMatchers`/`InvalidStep` | 400 |
-/// | `QueryTooBroad` | 422 |
+/// | `QueryTooBroad`, except the series cap `MetricSeries`: 400, bare reason (#605) | 422 |
 /// | `Clickhouse(Timeout)` | 504 |
 /// | `Clickhouse(_)` | 500 |
 fn read_error_parts(e: &ReadError) -> (StatusCode, String) {
