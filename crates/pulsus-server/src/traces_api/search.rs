@@ -108,12 +108,12 @@ async fn search_impl(
     // Issue #591 part 3: the route fork. A search the search statement
     // covers is answered by it; everything else by today's engine.
     if !wants_explain(headers) {
-        let output = engine.search_routed(&plan).await?;
+        let output = engine.search_routed(&plan.request()).await?;
         return Ok((StatusCode::OK, Json(search_response::render(&output))).into_response());
     }
     // One execution that also captures the per-stage SQL — the same
     // single-pass contract the logs route has, never a second run.
-    let (output, explain) = engine.search_routed_explained(&plan).await?;
+    let (output, explain) = engine.search_routed_explained(&plan.request()).await?;
     let mut body = search_response::render(&output);
     if let Some(obj) = body.as_object_mut() {
         obj.insert(
@@ -223,16 +223,30 @@ mod tests {
 
     #[tokio::test]
     async fn a_planner_type_mismatch_is_400() {
-        // `name > "x"` parses but the planner rejects ordering on strings.
-        let (status, _) = run("q=%7B%20name%20%3E%20%22x%22%20%7D&start=1&end=2").await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // `{ !-.a }` parses, and the search statement's compiler refuses
+        // it: a 400 before the pool is consulted (issue #602 part 2b).
+        let (status, body) = run("q=%7B%20%21-.a%20%7D&start=1&end=2").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body {body}");
+        assert_eq!(
+            body,
+            "type mismatch: an arithmetic expression is not a predicate"
+        );
+    }
+
+    /// Issue #602 part 2b: the route plans with the search statement's
+    /// compiler, which orders strings; the previous planner refused
+    /// `name > "x"` with a 400. A planned request without a pool is 503.
+    #[tokio::test]
+    async fn a_string_ordering_is_planned_by_the_statement() {
+        let (status, body) = run("q=%7B%20name%20%3E%20%22x%22%20%7D&start=1&end=2").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body {body}");
     }
 
     #[tokio::test]
     async fn a_metrics_stage_on_search_is_400_without_a_byte_offset() {
         // Issue #59 error-shape shift: `q={}|rate()` used to be a
         // positioned NotYetSupported parse error; it now PARSES and
-        // fails in plan_search — still 400, but with no byte offset (a
+        // fails in the planner — still 400, but with no byte offset (a
         // plan error, not a parse error).
         let (status, body) = run("q=%7B%7D%20%7C%20rate()&start=1&end=2").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);

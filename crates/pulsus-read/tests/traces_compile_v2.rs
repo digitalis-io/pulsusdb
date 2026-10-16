@@ -4570,7 +4570,7 @@ fn g1_window() -> WindowSql {
 /// renders through `compile_search`, its projection included: issue #591
 /// part 2 serves the off-row projections `resource_attribute` and
 /// `event_intrinsic` waited for, and adds the four after `instrumentation`.
-const SEARCH_GOLDENS: [(&str, &str, u32, u32); 17] = [
+const SEARCH_GOLDENS: [(&str, &str, u32, u32); 18] = [
     ("match_all", "{}", 20, 3),
     (
         "service",
@@ -4648,6 +4648,12 @@ const SEARCH_GOLDENS: [(&str, &str, u32, u32); 17] = [
         20,
         3,
     ),
+    (
+        "structural_child",
+        r#"{ resource.service.name = "frontend" } > { status = error }"#,
+        20,
+        3,
+    ),
 ];
 
 fn search_golden_dir() -> std::path::PathBuf {
@@ -4676,7 +4682,7 @@ fn search_golden(stem: &str, query: &str, limit: u32, spss: u32) -> String {
     )
 }
 
-/// The seventeen goldens of `golden/traces_spans_search/`, byte for byte,
+/// The eighteen goldens of `golden/traces_spans_search/`, byte for byte,
 /// collected and asserted once.
 #[test]
 fn search_statement_goldens_match() {
@@ -4877,8 +4883,6 @@ fn the_fork_routes_by_the_plan() {
     use pulsus_read::traces::spans::search::plan_statement;
     let mut wrong = Vec::new();
     for query in [
-        // Issue #602 part 2b serves `by(trace:id)`.
-        r#"{ .a = 1 } | by(trace:id) | coalesce()"#,
         r#"{ event.k * event.k > 5 }"#,
         r#"{ .k + 1 > .k }"#,
         r#"{ link.lk - link.lk != 0 }"#,
@@ -5002,6 +5006,8 @@ fn the_fork_routes_by_the_plan() {
         r#"{ nestedSetLeft > 1 && nestedSetRight < 6 }"#,
         r#"{ } | select(nestedSetLeft, trace:duration, span:childCount)"#,
         r#"{ trace:rootName = name } | by(resource.service.name)"#,
+        // Issue #602 part 2b.
+        r#"{ .a = 1 } | by(trace:id) | coalesce()"#,
     ] {
         if plan_statement(&fork_plan(query), "spans", "traces", "resources", 64, &[]).is_none() {
             wrong.push(format!(
@@ -5570,7 +5576,7 @@ fn no_statement_reads_a_value_off_its_path() {
 
 /// Section 4.4 (D4, D9): an event or link intrinsic as a `by()` key is
 /// refused with the previous planner's text, naming its own field;
-/// `by(trace:id)` keeps today's.
+/// `by(trace:id)` is served (issue #602 part 2b).
 #[test]
 fn an_event_or_link_intrinsic_key_is_refused() {
     let collection = |field: &str| {
@@ -5587,11 +5593,6 @@ fn an_event_or_link_intrinsic_key_is_refused() {
         ),
         ("{ } | by(link:spanID)", collection("link:spanID")),
         ("{ } | by(link:traceID)", collection("link:traceID")),
-        (
-            "{ } | by(trace:id)",
-            "by(trace:id) is not supported by the search statement yet (issue #602 part 2b)"
-                .to_string(),
-        ),
     ] {
         match compile_search_of(query) {
             Err(PlanError::UnsupportedField(msg)) => {
@@ -5604,8 +5605,7 @@ fn an_event_or_link_intrinsic_key_is_refused() {
 }
 
 /// Issue #602 part 2a, plan §3.5: a shape the search statement cannot
-/// fold is refused with the previous planner's exact text, and
-/// `by(trace:id)` names the part that serves it.
+/// fold is refused with the previous planner's exact text.
 #[test]
 fn compile_search_refuses_with_the_previous_planners_texts() {
     let mut wrong = Vec::new();
@@ -5645,16 +5645,83 @@ fn compile_search_refuses_with_the_previous_planners_texts() {
              is not supported (a span carries a collection of events/links, so there is no \
              single group value)",
         ),
-        (
-            "{ } | by(trace:id)",
-            "unsupported field: by(trace:id) is not supported by the search statement yet \
-             (issue #602 part 2b)",
-        ),
     ] {
         match compile_search_of(query) {
             Err(e) if e.to_string() == want => {}
             Err(e) => wrong.push(format!("{query}\n  want: {want}\n  got:  {e}")),
             Ok(s) => wrong.push(format!("{query}: compiled to {}", s.sql())),
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Issue #602 part 2b: a statement reads a table inside a read of it when
+/// it holds a structural operator or reads the numbering, and is then sent
+/// shard-local clustered.
+#[test]
+fn a_structural_statement_nests_its_reads() {
+    let mut wrong = Vec::new();
+    for (query, want) in [
+        (r#"{ .a = 1 } > { .b = 2 }"#, true),
+        (r#"{ .a = 1 } >> { .b = 2 } | by(name)"#, true),
+        (r#"{ .a = 1 } && { .b = 2 }"#, false),
+        ("{ nestedSetLeft > 0 }", true),
+        (r#"{ .a = 1 }"#, false),
+    ] {
+        let s = compile_search_of(query).unwrap_or_else(|e| panic!("{query}: {e}"));
+        if s.nests_reads() != want {
+            wrong.push(format!(
+                "{query}: nests_reads {}, want {want}",
+                s.nests_reads()
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Issue #602 part 2b: sliced, every read inside a structural membership
+/// is keyed on the slice's candidates; whole, each reads the window.
+#[test]
+fn a_sliced_structural_statement_reads_only_its_candidates() {
+    let unscoped = "FROM spans WHERE start_ns >= ";
+    let scoped = "FROM spans WHERE (intDiv(start_ns, 300000000000), trace_id) IN \
+                  (SELECT arrayJoin(arrayConcat(arrayFlatten(arrayMap((t, ks) -> arrayMap(k -> (k, t), ks), \
+                  cand.1, cand.2)), cand_keys)))";
+    let slice = WindowSql::start_closed_end_open(T_B1_END - 300_000_000_000, T_B1_END);
+    let mut wrong = Vec::new();
+    for (query, reads) in [
+        (r#"{ .a = 1 } > { .b = 2 }"#, 1),
+        (r#"{ .a = 1 } ~ { .b = 2 }"#, 2),
+        (r#"{ .a = 1 } >> { .b = 2 }"#, 1),
+        (r#"({ .a = 1 } > { .b = 2 }) && { .c = 3 }"#, 4),
+    ] {
+        let parsed = pulsus_traceql::parse(query).expect("parses");
+        let sliced = pulsus_read::traces::spans::search::compile_search_sliced(
+            &parsed,
+            &ctx(),
+            "spans",
+            "traces",
+            20,
+            3,
+            64,
+            Some(slice),
+        )
+        .expect("served");
+        let whole = compile_search_of(query).expect("served");
+        // Each membership read appears once in the top-K and once in the
+        // detail.
+        let got = (
+            sliced.sql().matches(scoped).count(),
+            sliced.sql().matches(unscoped).count(),
+            whole.sql().matches(scoped).count(),
+            whole.sql().matches(unscoped).count(),
+        );
+        if got != (2 * reads, 0, 0, 2 * reads) {
+            wrong.push(format!(
+                "{query}: (sliced scoped, sliced window, whole scoped, whole window) {got:?}, \
+                 want {:?}",
+                (2 * reads, 0, 0, 2 * reads)
+            ));
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));

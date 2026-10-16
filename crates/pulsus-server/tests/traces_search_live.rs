@@ -1235,203 +1235,6 @@ async fn search_semantics_against_real_clickhouse() {
 // Spawn B: AC5 — cap, partial flag, exact global top-K, boundary.
 // ---------------------------------------------------------------------
 
-#[tokio::test(flavor = "multi_thread")]
-async fn candidate_cap_partial_and_boundary_semantics() {
-    if !should_run() {
-        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
-        return;
-    }
-    let port = 31_132;
-    let db = &pulsus_testkit::test_db("pulsus_traces_search_it_b");
-    drop_db(db).await;
-    let _guard = spawn_ready(port, db, &[("PULSUS_TRACEQL_MAX_CANDIDATES", "3")]);
-
-    let base = now_s() - 3_600;
-    for n in 1..=5u8 {
-        ingest(
-            port,
-            vec![span(
-                tid(100 + n),
-                sid(1),
-                None,
-                "cap",
-                ts(base, n as i64),
-                10 * MS,
-                vec![],
-            )],
-            checkout_resource(),
-            "seed cap trace",
-        );
-    }
-    // A newer FALSE POSITIVE for the conjunction case: name matches, the
-    // attr does not.
-    ingest(
-        port,
-        vec![span(
-            tid(110),
-            sid(1),
-            None,
-            "cap",
-            ts(base, 8),
-            10 * MS,
-            vec![],
-        )],
-        checkout_resource(),
-        "seed false positive",
-    );
-    for n in 1..=5u8 {
-        // Give the five true traces the attr the false positive lacks.
-        ingest(
-            port,
-            vec![span(
-                tid(100 + n),
-                sid(2),
-                None,
-                "cap",
-                ts(base, n as i64),
-                10 * MS,
-                vec![kv_str("marked", "yes")],
-            )],
-            checkout_resource(),
-            "seed marked span",
-        );
-    }
-
-    // Issue #591 part 3, section 7: this test pins today's engine's own
-    // mechanics, which a covered query no longer reaches, so each query is
-    // kept on today's engine with ` | by(trace:id) | coalesce()`, which leaves a plain
-    // query's answer unchanged.
-    // Over-cap: 6 name-matching traces against a cap of 3 → partial, and
-    // the returned set is the exact newest-3 by the public order.
-    let ctx = "over-cap";
-    let res = search(
-        port,
-        r#"{ name = "cap" } | by(trace:id) | coalesce()"#,
-        base,
-        base + 60,
-        "",
-        ctx,
-    );
-    let json = res.json(ctx);
-    assert_metrics_block(&json, "partial", ctx);
-    assert_eq!(
-        trace_order(&json),
-        vec![hex(&tid(110)), hex(&tid(105)), hex(&tid(104))],
-        "{ctx}: exact global-recency membership, body {json}"
-    );
-
-    // A newer false positive must not evict true matches. The
-    // cross-spanset form keeps BOTH generators (superset union), so the
-    // ranked candidates start with 110 — which fails the exact `&&`
-    // evaluation (no marked span) — followed by the true matches 105 and
-    // 104; the exact true top-2 is returned, short page + partial.
-    let ctx = "false-positive-newer";
-    let res = search(
-        port,
-        r#"{ name = "cap" } && { span.marked = "yes" } | by(trace:id) | coalesce()"#,
-        base,
-        base + 60,
-        "",
-        ctx,
-    );
-    let json = res.json(ctx);
-    assert_metrics_block(&json, "partial", ctx);
-    assert_eq!(
-        trace_order(&json),
-        vec![hex(&tid(105)), hex(&tid(104))],
-        "{ctx}: the false positive consumes budget but never displaces a true match"
-    );
-
-    // Sub-cap: a window holding 2 matching traces → complete.
-    let ctx = "sub-cap";
-    let res = search(
-        port,
-        r#"{ name = "cap" } | by(trace:id) | coalesce()"#,
-        base + 4,
-        base + 6,
-        "",
-        ctx,
-    );
-    let json = res.json(ctx);
-    assert_metrics_block(&json, "complete", ctx);
-    assert_eq!(trace_set(&json), ids(&[104, 105]), "{ctx}");
-
-    // Exactly-at-cap boundary: a window holding exactly 3 matching
-    // traces — the generator returns 3 (< cap+1), the merged stream
-    // exhausts at the ceiling with no lookahead row: NOT partial (the
-    // round-3 false-positive-partial gap).
-    let ctx = "exactly-at-cap";
-    let res = search(
-        port,
-        r#"{ name = "cap" } | by(trace:id) | coalesce()"#,
-        base + 3,
-        base + 6,
-        "",
-        ctx,
-    );
-    let json = res.json(ctx);
-    // Exhausting exactly at the cap is not partial: the complete block.
-    assert_metrics_block(&json, "complete", ctx);
-    assert_eq!(trace_set(&json), ids(&[103, 104, 105]), "{ctx}");
-
-    // Ceiling and threshold engaging in the SAME iteration (code review
-    // round 1): a multi-generator union (two attr-eq generators, 2 rows
-    // each — NEITHER truncated) merges 4 candidates against the cap of
-    // 3, with limit=1 so the heap is already full and the lookahead
-    // candidate's bound is below the held sort key. The engaged ceiling
-    // must be recorded — partial=true, never masked by threshold
-    // termination.
-    for (n, key, off) in [
-        (120u8, "x", 20i64),
-        (121, "x", 21),
-        (122, "y", 22),
-        (123, "y", 23),
-    ] {
-        ingest(
-            port,
-            vec![span(
-                tid(n),
-                sid(1),
-                None,
-                "both",
-                ts(base, off),
-                10 * MS,
-                vec![kv_str(key, "1")],
-            )],
-            checkout_resource(),
-            "seed both-engage trace",
-        );
-    }
-    let ctx = "ceiling-and-threshold-same-iteration";
-    let res = search(
-        port,
-        // `coalesce()` would change this case's partial signal, so a
-        // `by(trace:id)` key, which the statement refuses, keeps it on
-        // today's engine instead (issue #591 part 3, section 7; #594 part
-        // 4 serves nested-set operands).
-        r#"{ .x = "1" || .y = "1" } | by(trace:id)"#,
-        base,
-        base + 60,
-        "&limit=1",
-        ctx,
-    );
-    let json = res.json(ctx);
-    // The consumption ceiling engaged with a lookahead candidate
-    // present — threshold eligibility must not mask it.
-    assert_metrics_block(&json, "partial", ctx);
-    assert_eq!(
-        trace_order(&json),
-        vec![hex(&tid(123))],
-        "{ctx}: the newest true match is still the returned page"
-    );
-
-    // The database this spawn created, dropped on the way out as well as
-    // on the way in: a suite that passes and leaves its database behind
-    // makes the next run read its own residue (issue #492, code review
-    // round 19 — six prefixed databases survived a green run).
-    drop_db(db).await;
-}
-
 // ---------------------------------------------------------------------
 // Spawn C: the scan budget fails loud (422), never silently slow.
 // ---------------------------------------------------------------------
@@ -1839,34 +1642,13 @@ async fn event_and_link_comparisons_match_any_event_over_real_clickhouse() {
 // review of the first cut).
 // ---------------------------------------------------------------------
 
-/// Issue #351 review: one span carrying many distinct event values must
-/// hit the read budget and come back `422 query_too_broad` — never a
-/// silently materialized unbounded per-span array.
-///
-/// **Why this cannot be a hermetic test.** The read happens in the
-/// database, and so did the growth this test exists to refuse: the first
-/// cut read `groupUniqArray(...) GROUP BY`, whose array was built
-/// server-side, so no in-process test could observe either the aggregate
-/// state or the size of the row that came back. The read is now one row
-/// per value (`search_sql::event_set_sql`), and it is still only against
-/// a live ClickHouse that the row budget, the streaming charge and the
-/// refusal are real at once.
-///
-/// **Scale-invariant, per the standing rule:** the budget is lowered
-/// rather than the fixture inflated (the `scan_budget_breach_is_422…`
-/// precedent above), so this never becomes a wall-time or memory race.
-///
-/// The pair is what makes it evidence:
-///
-/// * `{ name != event:name }` — the scalar side is a PHYSICAL intrinsic,
-///   so the event value read is the ONLY `trace_attrs_idx` read in the
-///   whole query; blowing the row budget can therefore only be that read.
-/// * `{ name = "ev-bulk" }` over the same store and the same budget
-///   answers `200`. Without this control, a 422 would equally well be
-///   explained by an unrelated read, and the test would prove nothing
-///   about the event path.
+/// Issue #602 part 2b: a search comparing a field with an event intrinsic
+/// is answered by the search statement, which compares the event values in
+/// the database, so `PULSUS_TRACEQL_EVENT_SET_MAX_VALUES` does not refuse
+/// it: one span carrying 400 event names answers under a 50-value budget
+/// and a 50-row scan budget, as the `{ name = "ev-bulk" }` control does.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_wide_event_set_is_refused_by_the_budget_not_materialized() {
+async fn a_wide_event_set_is_answered_in_the_database() {
     if !should_run() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
@@ -1878,11 +1660,9 @@ async fn a_wide_event_set_is_refused_by_the_budget_not_materialized() {
         port,
         db,
         &[
+            // Both budgets below the 400 event names, so a refusal by
+            // either would show.
             ("PULSUS_TRACEQL_SCAN_BUDGET_ROWS", "50"),
-            // Issue #558: the VALUE count is what the refusal is about
-            // now. The row budget stays at 50 because the
-            // `{ name = "ev-bulk" }` control below exists to show the
-            // budget is not already exhausted without the event read.
             ("PULSUS_TRACEQL_EVENT_SET_MAX_VALUES", "50"),
         ],
     );
@@ -1890,9 +1670,7 @@ async fn a_wide_event_set_is_refused_by_the_budget_not_materialized() {
     let base = now_s() - 3_600;
     let (w0, w1) = (base, base + 600);
 
-    // ONE span carrying 400 distinct event names — the shape the review
-    // was about: a single span whose event cardinality, not the trace
-    // count, drives the read.
+    // ONE span carrying 400 distinct event names.
     let start = ts(base, 1);
     let mut s = span(tid(1), sid(1), None, "ev-bulk", start, MS, vec![]);
     s.events = (0..400u32)
@@ -1915,113 +1693,14 @@ async fn a_wide_event_set_is_refused_by_the_budget_not_materialized() {
         "{ctx}: the budget must not already be exhausted without the event read"
     );
 
-    // The 400 event values exceed the 50-value budget: a clean 422, never
-    // an unbounded materialization.
-    //
-    // **Issue #558 changed which quantity is compared, and the message
-    // says so.** Before, the refusal was `max_rows_to_read` on the index
-    // read — the body read
-    // `query too broad: trace scan budget of 50 rows exceeded`. Now the
-    // reader sums the per-span widths the hydration statement projected
-    // and refuses BEFORE the value statement exists, so the body names
-    // the value budget and the count. Both bodies contain "budget", which
-    // is why this assertion does not move.
-    let ctx = "wide-event-set-is-422";
-    // Issue #591 part 3, section 7: this test pins today's engine's own
-    // mechanics, which a covered query no longer reaches, so each query is
-    // kept on today's engine with ` | by(trace:id) | coalesce()`, which leaves a plain
-    // query's answer unchanged.
-    let wide_query = "{ name != event:name } | by(trace:id) | coalesce()";
-    let path = format!(
-        "/api/traces/v1/search?q={}&start={w0}&end={w1}",
-        enc(wide_query)
-    );
-    // The mark for the query-log reading below, taken on the DATABASE's
-    // own clock just before the request. `system.query_log` outlives
-    // databases, so a filter on the database name alone would count this
-    // test's previous runs — which it did, and read two expansions from a
-    // run before the bound existed.
-    let mark = pulsus_testkit::clickhouse_query("SELECT toString(now64(6)) FORMAT TSV")
-        .trim()
-        .to_string();
-    let res = get(port, &path, ctx);
-    let body = assert_error_body(&res, 422, ctx);
-    assert!(
-        body.contains("budget"),
-        "{ctx}: a wide event set must be refused, {body:?}"
-    );
-    assert!(
-        body.contains("value budget of 50 values") && body.contains("400 values in this batch"),
-        "{ctx}: the refusal must name the VALUE budget and the count it measured, so a reader          can tell a pre-expansion refusal from the row budget firing: {body:?}"
-    );
-
-    // **The distinction the message alone cannot make**: that no set was
-    // expanded. `system.query_log` for this database must carry the batch
-    // hydration statement — the one that returned the widths — and NO
-    // statement expanding a span's array. Before issue #558 the refusal
-    // came from the read the expansion was already inside, so a body
-    // saying "422" could not tell a pre-expansion refusal from one
-    // expanded block of 400.
-    //
-    // The reader's pool connects with this run's own database, so
-    // `current_database` is one half of the filter and the mark taken
-    // above is the other: the database name is unique to this PREFIX, not
-    // to this RUN, and `system.query_log` outlives the database. The
-    // reading itself runs against `default`, so it is outside its own
-    // filter. The count settles rather than being read once:
-    // `SYSTEM FLUSH LOGS` is not a barrier.
-    let ctx = "no-arrayjoin-statement-for-the-refused-request";
-    let counts = pulsus_testkit::settle_by(
-        Instant::now() + Duration::from_secs(60),
-        Duration::from_millis(500),
-        ctx,
-        || {
-            pulsus_testkit::clickhouse_query("SYSTEM FLUSH LOGS");
-            let row = pulsus_testkit::clickhouse_query(&format!(
-                "SELECT countIf(query LIKE '%attr_slot%') AS hydrations, \
-                        countIf(query LIKE '%arrayJoin%') AS expansions \
-                 FROM system.query_log \
-                 WHERE type = 'QueryStart' AND current_database = '{db}' \
-                   AND event_time_microseconds >= toDateTime64('{mark}', 6) \
-                 FORMAT TSV"
-            ));
-            let cells: Vec<String> = row.trim().split('\t').map(str::to_string).collect();
-            match cells.as_slice() {
-                [h, _] if h != "0" => Some(cells.clone()),
-                _ => None,
-            }
-        },
-    );
-    assert_eq!(
-        counts[1], "0",
-        "{ctx}: the reader refused from the widths the hydration statement returned, so no \
-         statement expanding a span's event array may have been sent. Counts \
-         (hydration-shaped, arrayJoin-shaped): {counts:?}"
-    );
-
-    // The SUCCESS control, on a second server over the SAME database with
-    // a normal budget (review 2's second test gap). Without it, a 422
-    // could equally mean the query is permanently broken — and it also
-    // exercises the co-load at 400 values through the real route, which
-    // is the widest set anything runs against a live ClickHouse.
-    //
-    // `{ name != event:name }` is ALL-match: none of the 400 event names
-    // is `ev-bulk`, so every element satisfies the inequality and the
-    // span matches.
-    let wide_port = 31_137;
-    let _wide_guard = spawn_ready(wide_port, db, &[]);
-    let ctx = "wide-event-set-succeeds-under-a-normal-budget";
-    let res = search(wide_port, wide_query, w0, w1, "", ctx);
+    let ctx = "wide-event-set-is-answered";
+    let res = search(port, "{ name != event:name }", w0, w1, "", ctx);
     assert_eq!(
         trace_set(&res.json(ctx)),
         BTreeSet::from([hex(&tid(1))]),
-        "{ctx}: the 422 above must be the BUDGET, not a permanently failing query"
+        "{ctx}: the statement compares the event names in the database"
     );
 
-    // The database this spawn created, dropped on the way out as well as
-    // on the way in: a suite that passes and leaves its database behind
-    // makes the next run read its own residue (issue #492, code review
-    // round 19 — six prefixed databases survived a green run).
     drop_db(db).await;
 }
 
@@ -2518,52 +2197,10 @@ async fn a_regex_leaf_loses_a_candidate_in_the_database_before_the_evaluator_see
     drop_db(db).await;
 }
 
-/// The JSON paths on which two values differ, in dotted/indexed form —
-/// `links[0].fidelity`, `parts[1].yields`.
-///
-/// A path is reported when the two sides disagree at it and neither side
-/// descends further: a whole object present on one side and absent on
-/// the other is reported at the parent path, not enumerated.
-fn differing_paths(a: &serde_json::Value, b: &serde_json::Value, at: &str) -> Vec<String> {
-    use serde_json::Value;
-    match (a, b) {
-        (Value::Object(x), Value::Object(y)) => {
-            let mut keys: Vec<&String> = x.keys().chain(y.keys()).collect();
-            keys.sort();
-            keys.dedup();
-            keys.into_iter()
-                .flat_map(|k| {
-                    let path = if at.is_empty() {
-                        k.clone()
-                    } else {
-                        format!("{at}.{k}")
-                    };
-                    match (x.get(k), y.get(k)) {
-                        (Some(l), Some(r)) => differing_paths(l, r, &path),
-                        _ => vec![path],
-                    }
-                })
-                .collect()
-        }
-        (Value::Array(x), Value::Array(y)) if x.len() == y.len() => x
-            .iter()
-            .zip(y)
-            .enumerate()
-            .flat_map(|(i, (l, r))| differing_paths(l, r, &format!("{at}[{i}]")))
-            .collect(),
-        _ if a == b => Vec::new(),
-        _ => vec![at.to_string()],
-    }
-}
-
 /// Issue #492 acceptance criterion 8: **the traces search route answers
-/// the explain header.**
-///
-/// Before this change the route had no explain surface a user could
-/// reach: the engine entry point existed, built the trace, and was called
-/// only by a test — so the language whose plan changes most was the one
-/// nobody could see. Without the header the response is byte-identical to
-/// before; with it the body gains one sibling key.
+/// the explain header.** Without the header the response is
+/// byte-identical; with it the body gains one sibling key, carrying the
+/// statements the request sent (issue #602 part 2b: and no compiled plan).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_traces_search_route_answers_the_explain_header() {
     if !should_run() {
@@ -2592,10 +2229,7 @@ async fn the_traces_search_route_answers_the_explain_header() {
         "seed #492 explain corpus",
     );
 
-    // Issue #591 part 3, section 7: the compiled plan is today's
-    // engine's, so the query is kept on it with ` | by(trace:id) | coalesce()`, which
-    // leaves a plain query's answer unchanged and adds its one link.
-    let q = r#"{ resource.service.name = "explain-checkout" } | by(trace:id) | coalesce()"#;
+    let q = r#"{ resource.service.name = "explain-checkout" }"#;
     let path = format!("/api/traces/v1/search?q={}&start={w0}&end={w1}", enc(q));
 
     // Without the header: no `explain` key at all.
@@ -2640,207 +2274,15 @@ async fn the_traces_search_route_answers_the_explain_header() {
             .all(|s| s["sql"].as_str().is_some_and(|q| q.contains("SELECT"))),
         "every stage carries its statement: {with}"
     );
-    // The plan key is additive and ABSENT today: no read path calls the
-    // compile core yet, so wave 1 adds a field and no byte of response.
-    // The plan key, and its CONTENT (issue #492 part 3). This assertion
-    // used to say the key was absent "until a read path compiles a plan";
-    // this part is that read path, so the same sentence now has the
-    // opposite answer and the test asserts what the plan says rather than
-    // that something is there.
-    //
-    // The whole object, not a probe of it: an existence check would pass
-    // on a renderer that emitted `{}`, and every earlier defect in this
-    // part was a plan that was PRESENT and wrong — a part named for the
-    // seed's table, a chunk of 24,998, a page loop on a statement issued
-    // once, a seed crediting one of two generators. Each of those would
-    // sit inside this key and satisfy a presence test.
-    //
-    // Reading it: `{ resource.service.name = "explain-checkout" }` is a
-    // service-equality selector, so one generator reads `trace_spans` and
-    // the request sends three statements — that generator, the batch
-    // hydration seeded from it, and the winners' root read — with the
-    // pipeline's own work between the last two. `bound.value` is this
-    // suite's configured `reader.traceql_max_candidates`, and it belongs
-    // in the assertion: the plan REPORTS the ceiling, so a config change
-    // must move it.
-    //
-    // **Issue #492 part 5 criterion 33: three fields of this object
-    // move, and this file is one no hermetic sweep can redden.** The
-    // suite is `skip_unless_live!`-gated, so a `cargo test --workspace`
-    // run SELECTS this test and it self-skips green. It was updated by
-    // inspection and run under `PULSUS_TEST_CLICKHOUSE=1`.
-    //
-    // The selector is a bare `resource.service.name` equality, which
-    // part 5 makes the second exact generator family. So the seed link
-    // stops being a superset:
-    //
-    //   links[0].fidelity   "wider"      -> "equivalent"
-    //   links[2].why        "not_exact"  -> "not_yet_lowered"
-    //   parts[*].yields     "candidates" -> "exact"   (all three SQL parts)
-    //
-    // `links[2]` is `Order`, whose precondition is exactness: it used to
-    // refuse because the relation was not exact and now refuses because
-    // no SQL form has been written for it. `yields` renders
-    // `BoundaryOutput`, whose `Exact` arm means "the evaluator must not
-    // re-filter" — true of this query, which carries no pipeline at all.
-    let expected_plan = serde_json::json!({
-        "parts": [
-            {"kind": "sql", "name": "trace_spans", "issue": "once",
-             "cut": null, "seed": null, "yields": "exact"},
-            {"kind": "sql", "name": "trace_spans:hydration", "issue": "per_seed:chunks",
-             "cut": {"why": "handoff_exceeds_bound",
-                     "cost": {"text_bytes": 4_300_048u64, "ast_elements": 200_004u64}},
-             "seed": {"from": [0],
-                      "bound": {"kind": "config",
-                                "name": "reader.traceql_max_candidates",
-                                "value": 100_000u64}},
-             "yields": "exact"},
-            {"kind": "engine", "links": [2, 3, 4, 5]},
-            {"kind": "sql", "name": "trace_spans:root", "issue": "once",
-             "cut": {"why": "source_handoff", "source": "trace_spans:root", "key": "trace_id"},
-             "seed": {"from": [1], "bound": {"kind": "request_limit", "value": 20u64}},
-             "yields": "exact"},
-        ],
-        "links": [
-            {"i": 0, "part": 0, "stage": "Source",     "how": "lowered",  "fidelity": "equivalent"},
-            {"i": 1, "part": 1, "stage": "Hydrate",    "how": "residual", "why": "not_yet_lowered"},
-            // Issue #591 part 3: the ` | coalesce()` that kept this query
-            // on today's engine, lowered into the first part; issue #592
-            // part 2: the search statement serves `coalesce()`, so the
-            // query carries ` | by(trace:id)` before it, which the
-            // statement does not serve, residual in the engine part. Each
-            // added link moves the links after it on by one.
-            {"i": 2, "part": 2, "stage": "Pipe(By)", "how": "residual",
-             "why": "not_yet_lowered"},
-            {"i": 3, "part": 0, "stage": "Pipe(Coalesce)", "how": "lowered",
-             "fidelity": "equivalent"},
-            {"i": 4, "part": 2, "stage": "Order",      "how": "residual", "why": "not_yet_lowered"},
-            {"i": 5, "part": 2, "stage": "Limit(20)",  "how": "residual",
-             "why": "ordering_not_established"},
-            {"i": 6, "part": 3, "stage": "Emit",       "how": "residual",
-             "why": "needs_unwindowed_root_read"},
-        ],
-    });
-    assert_eq!(
-        explain.get("plan"),
-        Some(&expected_plan),
-        "the compiled plan this route now carries: {with}"
-    );
-
-    // Issue #492 part 5 criterion 37: **the object moved on exactly
-    // these paths and no others.**
-    //
-    // The assertion above is satisfied by any update, including one that
-    // moved a fourth field by accident. Its operands are the response
-    // and one expectation, so it cannot say what CHANGED. This keeps the
-    // pre-part-5 object beside the new one and compares the two
-    // expectations, which is a question about the edit rather than about
-    // the response.
-    //
-    // Every path in the list must also appear verbatim inside a backtick
-    // span of `CRITERION_33`, so the list cannot silently grow past the
-    // sentence.
-    const CRITERION_33: &str = "Criterion 33: the frozen plan object for a bare service \
-        selector moves on exactly three fields — `links[0].fidelity` becomes \"equivalent\", \
-        `links[4].why` (the `Order` link, `links[2]` before issue #591 part 3 added the \
-        coalesce link ahead of it and `links[3]` before issue #592 part 2 added the by link) \
-        becomes \"not_yet_lowered\", and `parts[0].yields`, \
-        `parts[1].yields` \
-        and `parts[3].yields` become \"exact\".";
-    let before_part_5 = {
-        let mut o = expected_plan.clone();
-        o["parts"][0]["yields"] = serde_json::json!("candidates");
-        o["parts"][1]["yields"] = serde_json::json!("candidates");
-        o["parts"][3]["yields"] = serde_json::json!("candidates");
-        o["links"][0]["fidelity"] = serde_json::json!("wider");
-        o["links"][4]["why"] = serde_json::json!("not_exact");
-        o
-    };
-    let mut differing = differing_paths(&before_part_5, &expected_plan, "");
-    differing.sort();
-    let expected_paths = [
-        "links[0].fidelity",
-        "links[4].why",
-        "parts[0].yields",
-        "parts[1].yields",
-        "parts[3].yields",
-    ];
-    assert_eq!(
-        differing, expected_paths,
-        "the part-5 edit moved a path its criterion does not name"
-    );
-    for path in expected_paths {
-        assert!(
-            CRITERION_33
-                .split('`')
-                .skip(1)
-                .step_by(2)
-                .any(|span| span == path),
-            "{path} is asserted and is not named in the criterion's own sentence"
-        );
-    }
-
-    // A SECOND request, disjoint across the two tables, because the one
-    // above cannot see two of the defects this part fixed: it has one
-    // generator, so a seed naming only its last contributing part is
-    // indistinguishable from one naming all of them. This query opens the
-    // plan with TWO statements — the service column lives in
-    // `trace_spans` and an attribute lives in `trace_attrs_idx`, and one
-    // `WHERE` cannot hold both — so `seed.from` is `[0, 1]` and the
-    // second generator carries the cut that says why.
-    //
-    // `span.zzz` matches nothing on purpose: the plan's shape is decided
-    // at plan time and does not depend on what the data holds, so the
-    // answer beside it is the same two traces as above.
-    let or_q = r#"{ resource.service.name = "explain-checkout" || span.zzz = "no-such" } | by(trace:id) | coalesce()"#;
-    let or_path = format!("/api/traces/v1/search?q={}&start={w0}&end={w1}", enc(or_q));
-    let or_raw = request_with_headers(port, "GET", &or_path, None, &[("X-Pulsus-Explain", "1")])
-        .expect("explain: the disjunctive request must be reachable");
-    assert_eq!(
-        or_raw.status,
-        200,
-        "body {:?}",
-        String::from_utf8_lossy(&or_raw.body)
-    );
-    let or_body: serde_json::Value =
-        serde_json::from_slice(&or_raw.body).expect("explain response parses");
-    let or_plan = &or_body["explain"]["plan"];
-    let or_parts = or_plan["parts"]
-        .as_array()
-        .unwrap_or_else(|| panic!("no parts in {or_body}"));
-    assert_eq!(
-        or_parts
+    // Issue #602 part 2b: the route compiles no plan, so no `plan` key;
+    // each stage is a statement the request sent.
+    assert_eq!(explain.get("plan"), None, "no compiled plan: {with}");
+    let names: Vec<&str> = stages.iter().filter_map(|s| s["name"].as_str()).collect();
+    assert!(
+        names
             .iter()
-            .map(|p| p["name"].as_str().unwrap_or("engine"))
-            .collect::<Vec<_>>(),
-        vec![
-            "trace_spans",
-            "trace_attrs_idx",
-            "trace_spans:hydration",
-            "engine",
-            "trace_spans:root",
-        ],
-        "two sources open the plan, and the attribute leaf adds NO statement — since issue \
-         #557 its condition is a predicate column on the hydration read: {or_body}"
-    );
-    assert_eq!(
-        or_parts[1]["cut"],
-        serde_json::json!({
-            "why": "disjoint_sources",
-            "sources": ["trace_spans", "trace_attrs_idx"],
-        }),
-        "the second generator says why it is its own statement: {or_body}"
-    );
-    assert_eq!(
-        or_parts[0]["seed"],
-        serde_json::Value::Null,
-        "both generator statements open the plan and consume nothing: {or_body}"
-    );
-    assert_eq!(or_parts[1]["seed"], serde_json::Value::Null, "{or_body}");
-    assert_eq!(
-        or_parts[2]["seed"]["from"],
-        serde_json::json!([0, 1]),
-        "the hydration read is seeded by the MERGE of both generators, and names both: {or_body}"
+            .all(|n| *n == "search_slice" || *n == "search_statement"),
+        "only the search statement's stages: {names:?}"
     );
 
     drop_db(db).await;
@@ -3225,25 +2667,17 @@ async fn an_event_or_link_condition_matches_any_element_in_both_directions() {
     drop_db(db).await;
 }
 
-/// Issue #557 criterion 5 — **one request with one attribute condition
-/// over one batch sends exactly THREE statements, and with two conditions
-/// still three.**
+/// Issue #557 criterion 5, issue #602 part 2b: **one request with an
+/// attribute condition, a `select()` field or an aggregate argument sends
+/// the search statement's slice and its whole-window statement, and no
+/// other.** The window's newest 5 minutes hold no span, so the slice
+/// answers nothing and the whole window follows.
 ///
-/// Two instruments over the same spawn, because one of them is not
-/// discriminating on its own:
-///
-/// * the product's own census — `X-Pulsus-Explain: 1` returns the stages
-///   the request pushed, and the assertion is on the exact MULTISET, so a
-///   statement added under any name fails;
-/// * `system.query_log` — what the database finished, counted over the
-///   window the request occupies.
-///
-/// **Two queries, because one count cannot tell the builds apart.** A
-/// build still issuing a membership read per probe would count 4 and 5; a
-/// build issuing one for the second condition only would count 3 and 4.
-/// Three and three is the only pair this change produces.
+/// Two instruments over the same spawn: `X-Pulsus-Explain: 1`'s stages,
+/// asserted as an exact multiset, and `system.query_log`, counted over the
+/// window the request occupies.
 #[tokio::test]
-async fn one_request_with_an_attribute_condition_sends_three_statements() {
+async fn one_request_with_an_attribute_condition_sends_the_statement_alone() {
     if !should_run() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
@@ -3310,7 +2744,7 @@ async fn one_request_with_an_attribute_condition_sends_three_statements() {
              WHERE type = 'QueryFinish' \
                AND query_kind = 'Select' \
                AND toUInt64(toUnixTimestamp64Micro(event_time_microseconds)) >= {since_us} \
-               AND (has(tables, '{db}.trace_spans') OR has(tables, '{db}.trace_attrs_idx')) \
+               AND has(tables, '{db}.spans') \
                AND NOT has(tables, 'system.query_log')"
         );
         let mut stream = admin
@@ -3363,23 +2797,17 @@ async fn one_request_with_an_attribute_condition_sends_three_statements() {
         .expect("micros fit an i64")
     }
 
-    // `(query, how many statements a build that had not moved the reads
-    // onto the hydration statement would send beyond the three)`.
+    // `(query, how many statements a build reading each condition, field
+    // or argument on its own would send beyond the two)`.
     for (q, extra) in [
-        // Issue #591 part 3, section 7: today's three stages are today's
-        // engine's, so each query is kept on it with ` | by(trace:id) | coalesce()`,
-        // which leaves a plain query's answer unchanged.
-        (r#"{ span.k = "x" } | by(trace:id) | coalesce()"#, 1usize),
-        (
-            r#"{ span.k = "x" && span.j = "x" } | by(trace:id) | coalesce()"#,
-            2usize,
-        ),
+        (r#"{ span.k = "x" }"#, 1usize),
+        (r#"{ span.k = "x" && span.j = "x" }"#, 2usize),
         // Issue #558 criterion 10: no attribute CONDITION at all —
         // `resource.service.name` is a physical column — and two value
         // reads, one `select()` field and one aggregate argument. Before,
         // this query sent five statements.
         (
-            r#"{ resource.service.name = "checkout" } | avg(span.retries) > 1 | select(span.foo) | by(trace:id) | coalesce()"#,
+            r#"{ resource.service.name = "checkout" } | avg(span.retries) > 1 | select(span.foo)"#,
             2usize,
         ),
     ] {
@@ -3405,14 +2833,8 @@ async fn one_request_with_an_attribute_condition_sends_three_statements() {
         stages.sort();
         assert_eq!(
             stages,
-            vec![
-                "phase1_candidate_generator".to_string(),
-                "phase2_hydration".to_string(),
-                "root_hydration".to_string(),
-            ],
-            "{ctx}: {q} must push exactly three stages — an attribute condition adds none, \
-             and since issue #558 nor does a `select()` field or an aggregate argument: \
-             {body}"
+            vec!["search_slice".to_string(), "search_statement".to_string()],
+            "{ctx}: {q} must push the slice and the whole-window statement alone: {body}"
         );
 
         // (c) what the database finished. The window opens just before
@@ -3428,11 +2850,10 @@ async fn one_request_with_an_attribute_condition_sends_three_statements() {
         );
         assert_eq!(
             settled(&admin, db, since).await,
-            3,
-            "{ctx}: {q} — one generator, one hydration read, one root read. A build still \
-             issuing a membership read per probe, or a value read per projected field, would \
-             count {}",
-            3 + extra
+            2,
+            "{ctx}: {q} — the slice and the whole-window statement. A build reading each \
+             condition, field or argument on its own would count {}",
+            2 + extra
         );
     }
 
@@ -3990,106 +3411,6 @@ async fn a_mixed_projection_reads_every_field_from_its_own_element() {
     drop_db(db).await;
 }
 
-/// Issue #558 criterion 5 — **the boundary of the value budget, on both
-/// sides.**
-///
-/// Two spans in two traces, one carrying exactly 50 event names and one
-/// carrying 51, under `PULSUS_TRACEQL_EVENT_SET_MAX_VALUES=50`. Neither
-/// number is a dramatic value, and the pair is what shows the bound is
-/// the configured budget rather than a block size or a row cap.
-///
-/// **One boundary answer moves, in the permissive direction, and it is
-/// not a regression.** At the base BOTH answered `422` with the row
-/// budget at 50, because `max_rows_to_read` counted every row the index
-/// statement read and N values are at least N rows. The comparison is
-/// now `values > budget`, so 50 answers `200` and 51 still answers `422`.
-/// The quantity a user can predict from their own data is what is
-/// bounded.
-///
-/// The row budget is left at its default here so that nothing but the
-/// value budget can produce the refusal.
-#[tokio::test(flavor = "multi_thread")]
-async fn the_event_set_budget_admits_exactly_its_own_count_and_refuses_one_more() {
-    if !should_run() {
-        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
-        return;
-    }
-    let port = 31_244;
-    let db = &pulsus_testkit::test_db("pulsus_traces_search_it_p");
-    drop_db(db).await;
-    let _guard = spawn_ready(port, db, &[("PULSUS_TRACEQL_EVENT_SET_MAX_VALUES", "50")]);
-
-    let base = now_s() - 3_600;
-
-    for (n, count) in [(1u8, 50u32), (2u8, 51u32)] {
-        let start = ts(base, n as i64);
-        let mut sp = span(
-            tid(n),
-            sid(1),
-            None,
-            &format!("ev-{count}"),
-            start,
-            MS,
-            vec![],
-        );
-        sp.events = (0..count)
-            .map(|i| opentelemetry_proto::tonic::trace::v1::span::Event {
-                time_unix_nano: start + u64::from(i) + 1,
-                name: format!("e{n}-{i:04}"),
-                attributes: vec![],
-                dropped_attributes_count: 0,
-            })
-            .collect();
-        ingest(port, vec![sp], checkout_resource(), "boundary span");
-    }
-
-    pulsus_testkit::assert_stores_agree(db);
-
-    // Exactly the budget: served. The window is narrowed to the one
-    // trace, because the bound is over the whole BATCH's widths and both
-    // spans in one batch would sum to 101. `ts` puts a span half a second
-    // past its whole-second offset, so each window is the second AFTER
-    // the offset the span was seeded at.
-    // Issue #591 part 3, section 7: this test pins today's engine's own
-    // mechanics, which a covered query no longer reaches, so each query is
-    // kept on today's engine with ` | by(trace:id) | coalesce()`, which leaves a plain
-    // query's answer unchanged.
-    let ctx = "exactly-the-budget-is-200";
-    let (a0, a1) = (base, base + 2);
-    let res = search(
-        port,
-        "{ name != event:name } | by(trace:id) | coalesce()",
-        a0,
-        a1,
-        "",
-        ctx,
-    );
-    assert_eq!(res.status, 200, "{ctx}");
-    assert_eq!(
-        trace_set(&res.json(ctx)),
-        ids(&[1]),
-        "{ctx}: 50 values against a budget of 50 is not over it — the comparison is \
-         `values > budget`"
-    );
-
-    // One more: refused, and the message names the count.
-    let ctx = "one-past-the-budget-is-422";
-    let (b0, b1) = (base + 2, base + 3);
-    let path = format!(
-        "/api/traces/v1/search?q={}&start={b0}&end={b1}",
-        enc("{ name != event:name } | by(trace:id) | coalesce()")
-    );
-    let res = get(port, &path, ctx);
-    let body = assert_error_body(&res, 422, ctx);
-    assert!(
-        body.contains("value budget of 50 values") && body.contains("51 values in this batch"),
-        "{ctx}: 51 values against a budget of 50 is over it, and the refusal names both \
-         numbers: {body:?}"
-    );
-
-    drop_db(db).await;
-}
-
 // ---------------------------------------------------------------------
 // Issue #559: the METRICS routes answer an attribute condition the way a
 // SEARCH does.
@@ -4584,40 +3905,7 @@ fn twelve_trace_fixture(base_s: i64) -> Vec<Span> {
     ]
 }
 
-/// The phase-1 generator statement a search ran, read from the same
-/// request sent with `X-Pulsus-Explain: 1`: the one stage whose SQL
-/// carries `AS bound_ts`.
-fn generator_sql_of(port: u16, q: &str, start_s: i64, end_s: i64) -> Result<String, String> {
-    let path = format!(
-        "/api/traces/v1/search?q={}&start={start_s}&end={end_s}&limit=20",
-        enc(q)
-    );
-    let raw = request_with_headers(port, "GET", &path, None, &[("X-Pulsus-Explain", "1")])
-        .ok_or_else(|| format!("{q}: explain request unreachable"))?;
-    let json: serde_json::Value = serde_json::from_slice(&raw.body)
-        .map_err(|e| format!("{q}: explain body is not JSON: {e}"))?;
-    let sqls: Vec<String> = json["explain"]["stages"]
-        .as_array()
-        .map(|stages| {
-            stages
-                .iter()
-                .filter_map(|s| s["sql"].as_str())
-                .filter(|sql| sql.contains("AS bound_ts"))
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
-    match sqls.as_slice() {
-        [one] => Ok(one.clone()),
-        other => Err(format!(
-            "{q}: expected one generator stage, found {}: {json}",
-            other.len()
-        )),
-    }
-}
-
-/// One of the issue #560 queries: its window, the expected answer, and
-/// the fragments its generator statement must (and must not) carry.
+/// One of the issue #560 queries: its window and the expected answer.
 struct RecencyCase {
     label: &'static str,
     q: &'static str,
@@ -4628,8 +3916,6 @@ struct RecencyCase {
     ordered: bool,
     /// The committed `metrics` branch the response must carry, if asserted.
     metrics: Option<&'static str>,
-    sql_has: Vec<&'static str>,
-    sql_lacks: Vec<&'static str>,
 }
 
 fn check_recency_case(port: u16, c: &RecencyCase, wrong: &mut Vec<String>) {
@@ -4674,38 +3960,12 @@ fn check_recency_case(port: u16, c: &RecencyCase, wrong: &mut Vec<String>) {
             c.label, json["metrics"]
         ));
     }
-    if c.sql_has.is_empty() && c.sql_lacks.is_empty() {
-        return;
-    }
-    match generator_sql_of(port, c.q, c.start_s, c.end_s) {
-        Err(e) => wrong.push(format!("{}: {e}", c.label)),
-        Ok(sql) => {
-            for needle in &c.sql_has {
-                if !sql.contains(needle) {
-                    wrong.push(format!(
-                        "{}: the generator lacks {needle:?}:\n{sql}",
-                        c.label
-                    ));
-                }
-            }
-            for needle in &c.sql_lacks {
-                if sql.contains(needle) {
-                    wrong.push(format!(
-                        "{}: the generator carries {needle:?}:\n{sql}",
-                        c.label
-                    ));
-                }
-            }
-        }
-    }
 }
 
 /// Issue #560 criterion 12, Q1–Q7: the queries a search form sends, with
-/// the answers they must give and the generator statements they must run.
-/// The answer sets are the span scan's by design; the generator
-/// fragments are what moves.
+/// the answers they must give, which are the span scan's by design.
 #[tokio::test(flavor = "multi_thread")]
-async fn the_empty_search_and_the_error_field_answer_from_the_derived_tables() {
+async fn the_empty_search_and_the_error_field_answer() {
     if !should_run() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
@@ -4723,79 +3983,60 @@ async fn the_empty_search_and_the_error_field_answer_from_the_derived_tables() {
     );
     let (s, e) = (base - 600, base + 110);
     let all = vec![1, 3, 6, 7, 8, 9, 10, 11];
-    // Issue #591 part 3, section 7: this test pins today's engine's own
-    // mechanics, which a covered query no longer reaches, so each query is
-    // kept on today's engine with ` | by(trace:id) | coalesce()`, which leaves a plain
-    // query's answer unchanged.
     let cases = vec![
         RecencyCase {
             label: "Q1 {}",
-            q: "{} | by(trace:id) | coalesce()",
+            q: "{}",
             start_s: s,
             end_s: e,
             traces: vec![8, 10, 9, 3, 7, 6, 1, 11],
             ordered: true,
             metrics: Some("complete"),
-            sql_has: vec!["FROM trace_recent", "ts_min <="],
-            sql_lacks: vec![],
         },
         RecencyCase {
             label: "Q2 {} inside one bucket",
-            q: "{} | by(trace:id) | coalesce()",
+            q: "{}",
             start_s: base + 60,
             end_s: base + 90,
             traces: vec![9, 10],
             ordered: false,
             metrics: Some("complete"),
-            sql_has: vec!["FROM trace_recent"],
-            sql_lacks: vec![],
         },
         RecencyCase {
             label: "Q3 { status = error }",
-            q: "{ status = error } | by(trace:id) | coalesce()",
+            q: "{ status = error }",
             start_s: s,
             end_s: e,
             traces: vec![6],
             ordered: false,
             metrics: Some("complete"),
-            sql_has: vec!["FROM trace_error_spans"],
-            sql_lacks: vec!["status_code"],
         },
         RecencyCase {
             label: "Q4 { status != error }",
-            q: "{ status != error } | by(trace:id) | coalesce()",
+            q: "{ status != error }",
             start_s: s,
             end_s: e,
             traces: all.clone(),
             ordered: false,
             metrics: None,
-            sql_has: vec!["FROM trace_spans", "AND (status_code != 2)"],
-            sql_lacks: vec![],
         },
         RecencyCase {
             label: "Q5 { status = ok }",
-            q: "{ status = ok } | by(trace:id) | coalesce()",
+            q: "{ status = ok }",
             start_s: s,
             end_s: e,
             traces: vec![6],
             ordered: false,
             metrics: None,
-            sql_has: vec!["FROM trace_spans", "AND (status_code = 1)"],
-            sql_lacks: vec![],
         },
         RecencyCase {
             label: "Q6 {} before the epoch",
-            q: "{} | by(trace:id) | coalesce()",
+            q: "{}",
             start_s: -2_000,
             end_s: -1_000,
             traces: vec![],
             ordered: false,
             metrics: Some("complete"),
-            // Issue #591 part 3's amendment: the window starts at the
-            // retention cutoff, so `[-2000 s, -1000 s)` clamps to
-            // `[-1000 s, -1000 s)`.
-            sql_has: vec!["bucket >= -4 AND bucket <= -4"],
-            sql_lacks: vec![],
         },
     ];
     let mut wrong: Vec<String> = Vec::new();
@@ -4816,75 +4057,6 @@ async fn the_empty_search_and_the_error_field_answer_from_the_derived_tables() {
             "Q7: expected 400 with the range message, got {} {body:?}",
             res.status
         ));
-    }
-    drop(guard);
-    drop_db(db).await;
-    assert!(
-        wrong.is_empty(),
-        "{} mismatch(es):\n{}",
-        wrong.len(),
-        wrong.join("\n")
-    );
-}
-
-/// Issue #560 criterion 12, Q8 and Q2c, at a candidate ceiling of 2. Q8
-/// is what makes `ts_min` load-bearing: without it trace 5 (bucket k's
-/// tail, wholly after `E`) is the second candidate consumed and the answer
-/// is `{9}`. Q2c is the gap shape reaching the ceiling: marked partial,
-/// never a wrong trace.
-///
-/// ```text
-///   Q8 candidates by bound_ts   9 (BASE+200)  8 (BASE+100)  10 (BASE+70) ...
-///   Q2c candidates              9 (BASE+200)  8 (BASE+100)  10 (BASE+70) <- lookahead
-/// ```
-#[tokio::test(flavor = "multi_thread")]
-async fn the_candidate_ceiling_with_tail_and_gap_candidates() {
-    if !should_run() {
-        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
-        return;
-    }
-    let port = 31_250;
-    let db = &pulsus_testkit::test_db("pulsus_traces_search_it_recency_ceiling");
-    drop_db(db).await;
-    let guard = spawn_ready(port, db, &[("PULSUS_TRACEQL_MAX_CANDIDATES", "2")]);
-    let base = recency_base_s();
-    ingest(
-        port,
-        twelve_trace_fixture(base),
-        checkout_resource(),
-        "seed the twelve-trace fixture",
-    );
-    // Issue #591 part 3, section 7: this test pins today's engine's own
-    // mechanics, which a covered query no longer reaches, so each query is
-    // kept on today's engine with ` | by(trace:id) | coalesce()`, which leaves a plain
-    // query's answer unchanged.
-    let cases = vec![
-        RecencyCase {
-            label: "Q8 {} at a ceiling of 2",
-            q: "{} | by(trace:id) | coalesce()",
-            start_s: base - 600,
-            end_s: base + 110,
-            traces: vec![9, 8],
-            ordered: false,
-            metrics: Some("partial"),
-            sql_has: vec![],
-            sql_lacks: vec![],
-        },
-        RecencyCase {
-            label: "Q2c {} inside one bucket at a ceiling of 2",
-            q: "{} | by(trace:id) | coalesce()",
-            start_s: base + 60,
-            end_s: base + 90,
-            traces: vec![9],
-            ordered: false,
-            metrics: Some("partial"),
-            sql_has: vec![],
-            sql_lacks: vec![],
-        },
-    ];
-    let mut wrong: Vec<String> = Vec::new();
-    for c in &cases {
-        check_recency_case(port, c, &mut wrong);
     }
     drop(guard);
     drop_db(db).await;

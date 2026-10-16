@@ -2260,18 +2260,23 @@ impl TraceEngine {
     /// ([`super::spans::search::plan_statement`]) is answered by it, the
     /// newest slices first where it is sliceable; everything else by
     /// today's engine, unchanged.
-    pub async fn search_routed(&self, plan: &SearchPlan) -> Result<SearchOutput, ReadError> {
-        self.search_routed_inner(plan, None).await
+    pub async fn search_routed(
+        &self,
+        request: &super::spans::search::SearchRequest,
+    ) -> Result<SearchOutput, ReadError> {
+        self.search_routed_inner(&request.0, None).await
     }
 
     /// [`Self::search_routed`], with the per-stage SQL: a covered search's
     /// `search_slice` and `search_statement` stages, and no compiled plan.
     pub async fn search_routed_explained(
         &self,
-        plan: &SearchPlan,
+        request: &super::spans::search::SearchRequest,
     ) -> Result<(SearchOutput, PlanExplain), ReadError> {
         let mut explain = PlanExplain::new("traces");
-        let output = self.search_routed_inner(plan, Some(&mut explain)).await?;
+        let output = self
+            .search_routed_inner(&request.0, Some(&mut explain))
+            .await?;
         Ok((output, explain))
     }
 
@@ -2311,7 +2316,7 @@ impl TraceEngine {
         slice_ns: Option<i64>,
     ) -> Option<super::spans::search::SearchStatement> {
         super::spans::search::plan_statement_sliced(
-            plan,
+            &plan.request(),
             &self.config.spans_v2_table,
             &self.config.traces_table,
             &self.config.resources_table,

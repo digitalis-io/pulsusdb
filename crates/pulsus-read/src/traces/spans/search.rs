@@ -728,6 +728,12 @@ impl SearchStatement {
         self.numbered
     }
 
+    /// Whether the statement reads a table inside a read of the same
+    /// table (issue #602 part 2b). Stub: the numbering alone.
+    pub fn nests_reads(&self) -> bool {
+        self.numbered
+    }
+
     pub fn projection(&self) -> &Projection {
         &self.projection
     }
@@ -1085,7 +1091,7 @@ pub fn plan_statement(
     indexed: &[super::attr_index::IndexedAttr],
 ) -> Option<SearchStatement> {
     plan_statement_sliced(
-        plan,
+        &plan.request(),
         spans_table,
         traces_table,
         resources_table,
@@ -1098,7 +1104,7 @@ pub fn plan_statement(
 /// [`plan_statement`], a sliceable statement's top-K reading the newest
 /// `slice_ns` of the window (issue #595).
 pub fn plan_statement_sliced(
-    plan: &SearchPlan,
+    request: &SearchRequest,
     spans_table: &str,
     traces_table: &str,
     resources_table: &str,
@@ -1106,6 +1112,7 @@ pub fn plan_statement_sliced(
     indexed: &[super::attr_index::IndexedAttr],
     slice_ns: Option<i64>,
 ) -> Option<SearchStatement> {
+    let plan = &request.0;
     let window = WindowSql::start_closed_end_open(plan.window.start_ns, plan.window.end_ns);
     let slice = slice_ns.map(|len| {
         WindowSql::start_closed_end_open(
@@ -1138,6 +1145,18 @@ pub fn plan_statement_sliced(
         slice,
     )
     .ok()
+}
+
+/// A search the route answers (issue #602 part 2b). Stub until part 2b
+/// lands: it carries the plan.
+#[derive(Debug, Clone)]
+pub struct SearchRequest(pub(crate) SearchPlan);
+
+impl SearchPlan {
+    /// The request this plan makes (issue #602 part 2b). Stub.
+    pub fn request(&self) -> SearchRequest {
+        SearchRequest(self.clone())
+    }
 }
 
 /// [`decode_search`], charging every retained entry against `budget`
