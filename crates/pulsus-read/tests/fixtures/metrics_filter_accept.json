@@ -1,5 +1,5 @@
 {
-  "DIVERGENCE_COUNT": 2,
+  "DIVERGENCE_COUNT": 1,
   "capture": {
     "reference_image": "grafana/tempo@sha256:aa8df8d069f77b82e978464daf55169bb8d135852ad58700aa96880653c3d8f7",
     "reference_config": "ci/tempo/tempo-compare.yaml (unmodified)",
@@ -313,15 +313,15 @@
     {
       "query": "{ !.a } | rate()",
       "ours": {
-        "verdict": "reject",
-        "body": "type mismatch: field negation is not supported in metrics filters"
+        "verdict": "accept",
+        "body": null
       },
       "reference": {
         "verdict": "accept",
         "body": null
       },
-      "divergence": "metrics-filter-field-negation",
-      "why": "a value co-load whose non-boolean case is a reference 500, which SQL cannot produce \u2014 wave 2"
+      "divergence": null,
+      "why": "served by the metrics statement, which carries the negation's demand: a non-boolean value is a 400 (issue #602 part 2a)"
     },
     {
       "query": "{ name != nil } | rate()",

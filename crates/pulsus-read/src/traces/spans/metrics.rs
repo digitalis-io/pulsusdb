@@ -103,9 +103,16 @@ pub struct MetricsStatement {
     instant_sql: String,
     labels: Vec<String>,
     unit: TargetUnit,
+    demands: Vec<String>,
 }
 
 impl MetricsStatement {
+    /// The messages the filter's `!` demands raise (issue #602 part 2a): a
+    /// `Code: 395` carrying one is the request's `400`.
+    pub fn demands(&self) -> &[String] {
+        &self.demands
+    }
+
     pub fn range_sql(&self) -> &str {
         &self.range_sql
     }
@@ -304,7 +311,7 @@ pub fn metrics_statement(
 }
 
 /// The statement for the shell `plan` and what the query asked; `None`
-/// when the plan is `compare()` or the body holds a `!` demand.
+/// when the plan is `compare()`.
 fn statement_for(
     plan: &TraceMetricsPlan,
     asked: &Asked,
@@ -324,6 +331,7 @@ fn statement_for(
         instant_sql: instant_sql(plan, &shape, &instant, max_series),
         labels: asked.keys.iter().map(label_of_key).collect(),
         unit: asked.target.unit(),
+        demands: demands_of(body, range_window, tables),
     })
 }
 
@@ -347,9 +355,6 @@ fn predicate(
         return Some(("true".to_string(), String::new()));
     };
     let p = compile_span_predicate_in(body, ctx).ok()?;
-    if !p.demand_messages().is_empty() {
-        return None;
-    }
     let w = ctx.window;
     let leaves: Vec<&TraceLeaf> = p.trace_leaves().iter().collect();
     let mut bound = per_trace_sql(&leaves, p.reads_child_counts(), w, traces);
@@ -369,6 +374,23 @@ fn predicate(
             .to_string(),
         with,
     ))
+}
+
+/// The `!` demands of `body`'s predicate over `window`.
+fn demands_of(
+    body: Option<&FieldExpr>,
+    window: WindowSql,
+    tables: &StatementTables<'_>,
+) -> Vec<String> {
+    let ctx = PredicateCtx {
+        window,
+        spans_table: tables.spans,
+        resources_table: tables.resources,
+        indexed: tables.indexed,
+    };
+    body.and_then(|b| compile_span_predicate_in(b, &ctx).ok())
+        .map(|p| p.demand_messages().to_vec())
+        .unwrap_or_default()
 }
 
 /// A key's label name: the reference's spelling (part 2's D3).
@@ -1081,7 +1103,7 @@ mod tests {
     /// #594 part 5 (D1, D2): the seven trace-level and nested-set fields
     /// take the statement, which binds what each reads — the per-trace
     /// scalar for a trace leaf or a child count, the operand's pairs, the
-    /// numbered traces — in both forms; a `!` demand keeps today's answer.
+    /// numbered traces — in both forms; so does a `!` demand.
     #[test]
     fn the_seven_take_the_statement() {
         for (q, binding) in [
@@ -1111,12 +1133,15 @@ mod tests {
                 );
             }
         }
+        // Issue #602 part 2a: a `!` demand takes the statement too, which
+        // carries the demand for its `400`.
         let q = "{ !span.a } | rate()";
-        let want = today(q, &PARAMS).expect_err("today's planner refuses it");
-        match routed(q, &PARAMS) {
-            Err(got) => assert_eq!(got, want, "{q}"),
-            Ok(r) => panic!("{q}: routed accepted it, statement {:?}", r.statement()),
-        }
+        let r = routed(q, &PARAMS).unwrap_or_else(|e| panic!("{q}: routed refused: {e}"));
+        let s = r.statement().unwrap_or_else(|| panic!("{q}: no statement"));
+        assert!(
+            !s.demands().is_empty(),
+            "{q}: the statement carries no demand"
+        );
     }
 
     /// D1: `compare()` stays on today's planner, and so does an intrinsic

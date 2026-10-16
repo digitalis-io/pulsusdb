@@ -8670,10 +8670,23 @@ async fn search_routed_keeps_the_group_cap() {
             cap,
             "Ok(1 traces",
         ),
-        ("{ } | by(span.a) | coalesce()", 20, cap, cap),
-        // Issue #602 part 2a: two keys count their value tuples.
+        // Issue #602 part 2a: the statement counts the by() tuples of the
+        // spansets its response carries; `coalesce()` carries none, and
+        // the later filter drops all but one group.
+        (
+            "{ } | by(span.a) | coalesce()",
+            20,
+            cap,
+            "Ok(6 traces, 16 spans)",
+        ),
+        // Two keys count their value tuples.
         ("{ } | by(name) | by(span.a)", 20, cap, cap),
-        (r#"{ } | by(name) | { name = "b" }"#, 20, cap, cap),
+        (
+            r#"{ } | by(name) | { name = "b" }"#,
+            20,
+            cap,
+            "Ok(2 traces, 2 spans)",
+        ),
         ("{ } | by(status)", 1, cap, "Ok(1 traces"),
     ] {
         let plan = plan_of(&engine, &parse_query(query), window, limit, 3);
@@ -8880,7 +8893,7 @@ async fn seed_agg_fixture(label: &str, test: &str, base_ns: i64) -> (String, ChC
 /// Runs `cases` — query, literal answer, statements — over fixture
 /// `label`: each must be the statement's, equal today's answer and its
 /// literal, and issue the statements listed (1: the statement answered;
-/// more: it handed the request to today's engine).
+/// two: the newest slice, then the whole window).
 async fn check_agg_cases(label: &str, test: &str, cases: &[(&str, &str, Option<u64>)]) {
     let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
     let (db, client) = seed_agg_fixture(label, test, base_ns).await;
@@ -8913,7 +8926,8 @@ async fn check_agg_cases(label: &str, test: &str, cases: &[(&str, &str, Option<u
 
 /// `T-A19`: the aggregate counts the spans that reach it, the later filter
 /// keeps the error spans, and the trace is ranked by its newest checkout
-/// span; one statement.
+/// span; the statement answers it, the newest slice and then the whole
+/// window (issue #602 part 2a).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn t_a19_an_aggregate_then_a_later_filter_is_one_statement() {
     skip_unless_live!();
@@ -8923,7 +8937,7 @@ async fn t_a19_an_aggregate_then_a_later_filter_is_one_statement() {
         &[(
             r#"{ resource.service.name = "checkout" } | count() > 5 | { status = error }"#,
             "a1 2 [02, 05] {int:6 2 [02, 05]}; a4 4 [31, 33, 35] {int:7 4 [31, 33, 35]}",
-            Some(1),
+            Some(2),
         )],
     )
     .await;
@@ -8935,20 +8949,20 @@ async fn an_aggregate_keeps_todays_value_and_type() {
     skip_unless_live!();
     check_agg_cases("types", "types", &[
         (r#"{ name = "types" } | sum(span.n) > 0"#,
-         "b7 6 [4d, 4e, 4f] {double:110 6 [4d, 4e, 4f]}; b5 2 [4a, 4b] {double:14 2 [4a, 4b]}; b4 2 [48, 49] {double:14 2 [48, 49]}; b3 3 [45, 46, 47] {double:5 3 [45, 46, 47]}; b2 2 [43, 44] {double:3.5 2 [43, 44]}; b1 2 [41, 42] {int:3 2 [41, 42]}", Some(1)),
+         "b7 6 [4d, 4e, 4f] {double:110 6 [4d, 4e, 4f]}; b5 2 [4a, 4b] {double:14 2 [4a, 4b]}; b4 2 [48, 49] {double:14 2 [48, 49]}; b3 3 [45, 46, 47] {double:5 3 [45, 46, 47]}; b2 2 [43, 44] {double:3.5 2 [43, 44]}; b1 2 [41, 42] {int:3 2 [41, 42]}", Some(2)),
         (r#"{ name = "types" } | min(span.n) > 0"#,
-         "b7 6 [4d, 4e, 4f] {double:5 6 [4d, 4e, 4f]}; b5 2 [4a, 4b] {double:7 2 [4a, 4b]}; b4 2 [48, 49] {int:7 2 [48, 49]}; b3 3 [45, 46, 47] {double:5 3 [45, 46, 47]}; b2 2 [43, 44] {int:1 2 [43, 44]}; b1 2 [41, 42] {int:1 2 [41, 42]}", Some(1)),
+         "b7 6 [4d, 4e, 4f] {double:5 6 [4d, 4e, 4f]}; b5 2 [4a, 4b] {double:7 2 [4a, 4b]}; b4 2 [48, 49] {int:7 2 [48, 49]}; b3 3 [45, 46, 47] {double:5 3 [45, 46, 47]}; b2 2 [43, 44] {int:1 2 [43, 44]}; b1 2 [41, 42] {int:1 2 [41, 42]}", Some(2)),
         (r#"{ name = "types" } | max(span.n) > 0"#,
-         "b7 6 [4d, 4e, 4f] {double:100 6 [4d, 4e, 4f]}; b5 2 [4a, 4b] {double:7 2 [4a, 4b]}; b4 2 [48, 49] {int:7 2 [48, 49]}; b3 3 [45, 46, 47] {double:5 3 [45, 46, 47]}; b2 2 [43, 44] {double:2.5 2 [43, 44]}; b1 2 [41, 42] {int:2 2 [41, 42]}", Some(1)),
+         "b7 6 [4d, 4e, 4f] {double:100 6 [4d, 4e, 4f]}; b5 2 [4a, 4b] {double:7 2 [4a, 4b]}; b4 2 [48, 49] {int:7 2 [48, 49]}; b3 3 [45, 46, 47] {double:5 3 [45, 46, 47]}; b2 2 [43, 44] {double:2.5 2 [43, 44]}; b1 2 [41, 42] {int:2 2 [41, 42]}", Some(2)),
         (r#"{ name = "types" } | avg(span.n) > 0"#,
-         "b7 6 [4d, 4e, 4f] {double:36.666666666666664 6 [4d, 4e, 4f]}; b5 2 [4a, 4b] {double:7 2 [4a, 4b]}; b4 2 [48, 49] {double:7 2 [48, 49]}; b3 3 [45, 46, 47] {double:5 3 [45, 46, 47]}; b2 2 [43, 44] {double:1.75 2 [43, 44]}; b1 2 [41, 42] {double:1.5 2 [41, 42]}", Some(1)),
-        (r#"{ name = "types" } | sum(span.n) < 1"#, "", Some(1)),
+         "b7 6 [4d, 4e, 4f] {double:36.666666666666664 6 [4d, 4e, 4f]}; b5 2 [4a, 4b] {double:7 2 [4a, 4b]}; b4 2 [48, 49] {double:7 2 [48, 49]}; b3 3 [45, 46, 47] {double:5 3 [45, 46, 47]}; b2 2 [43, 44] {double:1.75 2 [43, 44]}; b1 2 [41, 42] {double:1.5 2 [41, 42]}", Some(2)),
+        (r#"{ name = "types" } | sum(span.n) < 1"#, "", Some(2)),
         (r#"{ name = "types" } | count() = 2"#,
-         "b5 2 [4a, 4b] {int:2 2 [4a, 4b]}; b4 2 [48, 49] {int:2 2 [48, 49]}; b2 2 [43, 44] {int:2 2 [43, 44]}; b1 2 [41, 42] {int:2 2 [41, 42]}", Some(1)),
+         "b5 2 [4a, 4b] {int:2 2 [4a, 4b]}; b4 2 [48, 49] {int:2 2 [48, 49]}; b2 2 [43, 44] {int:2 2 [43, 44]}; b1 2 [41, 42] {int:2 2 [41, 42]}", Some(2)),
         (r#"{ name = "types" } | count() != 2"#,
-         "b7 6 [4d, 4e, 4f] {int:6 6 [4d, 4e, 4f]}; b6 1 [4c] {int:1 1 [4c]}; b3 3 [45, 46, 47] {int:3 3 [45, 46, 47]}", Some(1)),
+         "b7 6 [4d, 4e, 4f] {int:6 6 [4d, 4e, 4f]}; b6 1 [4c] {int:1 1 [4c]}; b3 3 [45, 46, 47] {int:3 3 [45, 46, 47]}", Some(2)),
         (r#"{ name = "types" } | coalesce() | sum(span.n) > 0"#,
-         "b7 6 [4d, 4e, 4f] {double:110 6 [4d, 4e, 4f]}; b5 2 [4a, 4b] {double:14 2 [4a, 4b]}; b4 2 [48, 49] {double:14 2 [48, 49]}; b3 3 [45, 46, 47] {double:5 3 [45, 46, 47]}; b2 2 [43, 44] {double:3.5 2 [43, 44]}; b1 2 [41, 42] {int:3 2 [41, 42]}", Some(1)),
+         "b7 6 [4d, 4e, 4f] {double:110 6 [4d, 4e, 4f]}; b5 2 [4a, 4b] {double:14 2 [4a, 4b]}; b4 2 [48, 49] {double:14 2 [48, 49]}; b3 3 [45, 46, 47] {double:5 3 [45, 46, 47]}; b2 2 [43, 44] {double:3.5 2 [43, 44]}; b1 2 [41, 42] {int:3 2 [41, 42]}", Some(2)),
 
     ]).await;
     check_agg_cases(
@@ -8958,22 +8972,22 @@ async fn an_aggregate_keeps_todays_value_and_type() {
             (
                 r#"{ name = "dur" } | avg(duration) > 0ms"#,
                 "c2 2 [64, 65] {2ns 2 [64, 65]}; c1 3 [61, 62, 63] {2.166666666s 3 [61, 62, 63]}",
-                Some(1),
+                Some(2),
             ),
             (
                 r#"{ name = "dur" } | sum(duration) > 0ms"#,
                 "c2 2 [64, 65] {4ns 2 [64, 65]}; c1 3 [61, 62, 63] {6.5s 3 [61, 62, 63]}",
-                Some(1),
+                Some(2),
             ),
             (
                 r#"{ name = "dur" } | min(duration) > 0ms"#,
                 "c2 2 [64, 65] {1ns 2 [64, 65]}; c1 3 [61, 62, 63] {2s 3 [61, 62, 63]}",
-                Some(1),
+                Some(2),
             ),
             (
                 r#"{ name = "dur" } | max(duration) > 0ms"#,
                 "c2 2 [64, 65] {3ns 2 [64, 65]}; c1 3 [61, 62, 63] {2.5s 3 [61, 62, 63]}",
-                Some(1),
+                Some(2),
             ),
         ],
     )
@@ -8984,7 +8998,7 @@ async fn an_aggregate_keeps_todays_value_and_type() {
         &[(
             r#"{ name = "unsc" } | min(.n) < 1000"#,
             "d2 1 [72] {int:3 1 [72]}; d1 1 [71] {int:4 1 [71]}",
-            Some(1),
+            Some(2),
         )],
     )
     .await;
@@ -8997,9 +9011,9 @@ async fn a_non_count_aggregate_before_and_after_a_later_filter() {
     skip_unless_live!();
     check_agg_cases("ta19", "ta19_sum", &[
         (r#"{ resource.service.name = "checkout" } | sum(duration) > 0ms | { status = error }"#,
-         "a1 2 [02, 05] {600ms 2 [02, 05]}; a4 4 [31, 33, 35] {700ms 4 [31, 33, 35]}; a3 1 [23] {500ms 1 [23]}", Some(1)),
+         "a1 2 [02, 05] {600ms 2 [02, 05]}; a4 4 [31, 33, 35] {700ms 4 [31, 33, 35]}; a3 1 [23] {500ms 1 [23]}", Some(2)),
         (r#"{ resource.service.name = "checkout" } | { status = error } | sum(duration) > 0ms"#,
-         "a1 2 [02, 05] {200ms 2 [02, 05]}; a4 4 [31, 33, 35] {400ms 4 [31, 33, 35]}; a3 1 [23] {100ms 1 [23]}", Some(1)),
+         "a1 2 [02, 05] {200ms 2 [02, 05]}; a4 4 [31, 33, 35] {400ms 4 [31, 33, 35]}; a3 1 [23] {100ms 1 [23]}", Some(2)),
     ]).await;
 }
 
@@ -9015,12 +9029,12 @@ async fn a_float_sum_adds_in_todays_order() {
             (
                 r#"{ name = "fold" } | sum(span.n) > 0"#,
                 "b8 4 [53, 54, 55] {int:1 4 [53, 54, 55]}",
-                Some(1),
+                Some(2),
             ),
             (
                 r#"{ name = "fold" } | avg(span.n) > 0"#,
                 "b8 4 [53, 54, 55] {double:0.25 4 [53, 54, 55]}",
-                Some(1),
+                Some(2),
             ),
         ],
     )
@@ -10973,12 +10987,13 @@ async fn the_newest_slice_first_plan_answers_fixture_p() {
             1,
             stages595(0, true),
         ),
+        // Issue #602 part 2a: a spanset tree reads the newest slice first.
         (
             "{ span.app.old } && { span.app.slice.probe }",
             20,
             vec!["…2a×2".to_string()],
-            1,
-            stages595(0, true),
+            2,
+            stages595(1, true),
         ),
     ] {
         let (got, n, seen, partial) = sliced_run(&engine, &client, &db, e, query, limit).await;

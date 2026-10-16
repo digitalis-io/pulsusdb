@@ -825,8 +825,10 @@ fn search_grouped_row_bytes(row: &SearchGroupedRow) -> usize {
             .iter()
             .map(|g| {
                 std::mem::size_of::<SearchGroupTuple>()
-                    + g.value.len()
-                    + g.value_type.len()
+                    + g.attrs
+                        .iter()
+                        .map(|(v, t)| std::mem::size_of::<(String, String)>() + v.len() + t.len())
+                        .sum::<usize>()
                     + search_spans_bytes(&g.spans)
             })
             .sum::<usize>()
@@ -2255,14 +2257,15 @@ impl TraceEngine {
 
     /// Executes a [`SearchPlan`] by the route fork (issue #591 part 3): a
     /// search the search statement covers
-    /// ([`super::spans::search::plan_statement`]) is answered by that one
-    /// statement, everything else by today's engine, unchanged.
+    /// ([`super::spans::search::plan_statement`]) is answered by it, the
+    /// newest slices first where it is sliceable; everything else by
+    /// today's engine, unchanged.
     pub async fn search_routed(&self, plan: &SearchPlan) -> Result<SearchOutput, ReadError> {
         self.search_routed_inner(plan, None).await
     }
 
     /// [`Self::search_routed`], with the per-stage SQL: a covered search's
-    /// one `search_statement` stage, and no compiled plan.
+    /// `search_slice` and `search_statement` stages, and no compiled plan.
     pub async fn search_routed_explained(
         &self,
         plan: &SearchPlan,
@@ -2272,11 +2275,8 @@ impl TraceEngine {
         Ok((output, explain))
     }
 
-    /// The fork's shared body (section 3.2 of the part-3 design).
-    ///
-    /// A covered search is issued once with today's search settings plus
-    /// `final = 1`, so it carries the read budgets, the 64 MiB result
-    /// ceiling and the memory ceiling; its rows are collected against the
+    /// The fork's shared body. A covered search is issued with today's
+    /// search settings plus `final = 1`; its rows are collected against the
     /// request's 256 MiB retention budget, and the decode charges the
     /// response against the same budget. A run-time demand the statement
     /// raises (`Code: 395` carrying one of its demand messages) sends the
@@ -2286,95 +2286,38 @@ impl TraceEngine {
         plan: &SearchPlan,
         mut explain: Option<&mut PlanExplain>,
     ) -> Result<SearchOutput, ReadError> {
-        let Some(stmt) = super::spans::search::plan_statement(
+        let Some(stmt) = self.search_statement(plan, None) else {
+            return self.search_inner(plan, explain).await;
+        };
+        match self.newest_first(plan, &stmt, &mut explain).await? {
+            newest_first::Next::Answer(out) => return Ok(out),
+            newest_first::Next::Whole => {}
+            newest_first::Next::Handover => return self.search_inner(plan, explain).await,
+        }
+        let mut budget = ByteBudget::new(HYDRATION_BYTE_BUDGET);
+        let mut charged = 0usize;
+        match self.statement_rows(&stmt, &mut budget, &mut charged).await {
+            Ok(rows) => rows.decode(&stmt, plan.limit, &mut budget, self.config.max_series),
+            Err(e) if newest_first::demanded(&stmt, &e) => self.search_inner(plan, explain).await,
+            Err(e) => Err(newest_first::read_error(e, &self.config)),
+        }
+    }
+
+    /// The statement for `plan`, its top-K reading the newest `slice_ns`
+    /// when given; `None` when the statement does not cover it.
+    pub(super) fn search_statement(
+        &self,
+        plan: &SearchPlan,
+        slice_ns: Option<i64>,
+    ) -> Option<super::spans::search::SearchStatement> {
+        super::spans::search::plan_statement_sliced(
             plan,
             &self.config.spans_v2_table,
             &self.config.traces_table,
             &self.config.resources_table,
             self.config.max_depth,
             &self.indexed,
-        ) else {
-            return self.search_inner(plan, explain).await;
-        };
-        if let Some(out) = self.newest_first(plan, &stmt, &mut explain).await? {
-            return Ok(out);
-        }
-        let mut settings = self.statement_settings(&stmt);
-        // Issue #593 part 2: a climb runs `max_depth + 1` levels, the last
-        // only to see whether a parent was left; the server's own bound
-        // must not end it first.
-        if let Some(depth) = stmt.climb_depth() {
-            settings = settings.set("max_recursive_cte_evaluation_depth", u64::from(depth) + 1);
-        }
-        let mut budget = ByteBudget::new(HYDRATION_BYTE_BUDGET);
-        let mut charged = 0usize;
-        // Issue #592 part 2: a grouped statement's decode counts the
-        // groups it returns against the series cap. Issue #602 part 1: no
-        // preflight runs first, so the search is one statement.
-        if let Some(grouping) = stmt.grouping() {
-            let rows = match self
-                .collect_rows_charged::<SearchGroupedRow, _>(
-                    stmt.sql(),
-                    &settings,
-                    &mut budget,
-                    &mut charged,
-                    map_search_statement_error,
-                    search_grouped_row_bytes,
-                )
-                .await
-            {
-                Ok(rows) => rows,
-                Err(ReadError::Clickhouse(ChError::Server { code: 395, message }))
-                    if stmt
-                        .demands()
-                        .iter()
-                        .any(|demand| message.contains(demand.as_str())) =>
-                {
-                    return self.search_inner(plan, explain).await;
-                }
-                Err(ReadError::Clickhouse(e)) => {
-                    return Err(map_trace_read_error(e, &self.config));
-                }
-                Err(other) => return Err(other),
-            };
-            let mut counter = GroupCardinalityCounter::new(self.config.max_series);
-            return super::spans::search::decode_search_grouped_charged(
-                rows,
-                stmt.projection(),
-                grouping,
-                plan.limit,
-                &mut budget,
-                &mut counter,
-            );
-        }
-        let rows = match self
-            .collect_rows_charged::<SearchTraceRow, _>(
-                stmt.sql(),
-                &settings,
-                &mut budget,
-                &mut charged,
-                map_search_statement_error,
-                search_row_bytes,
-            )
-            .await
-        {
-            Ok(rows) => rows,
-            Err(ReadError::Clickhouse(ChError::Server { code: 395, message }))
-                if stmt
-                    .demands()
-                    .iter()
-                    .any(|demand| message.contains(demand.as_str())) =>
-            {
-                return self.search_inner(plan, explain).await;
-            }
-            Err(ReadError::Clickhouse(e)) => return Err(map_trace_read_error(e, &self.config)),
-            Err(other) => return Err(other),
-        };
-        super::spans::search::decode_search_charged(
-            rows,
-            stmt.projection(),
-            plan.limit,
-            &mut budget,
+            slice_ns,
         )
     }
 

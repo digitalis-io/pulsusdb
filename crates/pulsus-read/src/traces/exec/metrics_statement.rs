@@ -30,7 +30,9 @@ impl TraceEngine {
         let Some(statement) = routed.statement() else {
             return self.metrics_range(routed.plan()).await;
         };
-        let rows = self.metric_statement_rows(statement.range_sql()).await?;
+        let rows = self
+            .metric_statement_rows(statement.range_sql(), statement.demands())
+            .await?;
         frame(
             routed.plan(),
             statement,
@@ -49,20 +51,28 @@ impl TraceEngine {
         let Some(statement) = routed.statement() else {
             return self.metrics_instant(routed.plan()).await;
         };
-        let rows = self.metric_statement_rows(statement.instant_sql()).await?;
+        let rows = self
+            .metric_statement_rows(statement.instant_sql(), statement.demands())
+            .await?;
         frame(routed.plan(), statement, rows, None)
     }
 
     /// Issues `sql` under [`statement_settings`].
-    async fn metric_statement_rows(&self, sql: &str) -> Result<Vec<MetricStatementRow>, ReadError> {
+    async fn metric_statement_rows(
+        &self,
+        sql: &str,
+        demands: &[String],
+    ) -> Result<Vec<MetricStatementRow>, ReadError> {
         let settings = statement_settings(&self.config);
         let mut stream = self
             .dispatch
-            .query_stream::<MetricStatementRow, _>(sql, &settings, |e| self.map_statement_error(e))
+            .query_stream::<MetricStatementRow, _>(sql, &settings, |e| {
+                self.map_statement_error(e, demands)
+            })
             .await?;
         let mut rows = Vec::new();
         while let Some(row) = stream.next().await {
-            rows.push(row.map_err(|e| self.map_statement_error(e))?);
+            rows.push(row.map_err(|e| self.map_statement_error(e, demands))?);
         }
         Ok(rows)
     }
@@ -70,7 +80,14 @@ impl TraceEngine {
     /// The series cap's `throwIf` is the series cap's `422`, its count
     /// the cap plus one as today's probe reported it; any other error is
     /// the metrics path's.
-    fn map_statement_error(&self, e: ChError) -> ReadError {
+    fn map_statement_error(&self, e: ChError, demands: &[String]) -> ReadError {
+        // Issue #602 part 2a: a `!` demand the filter raised is the
+        // request's `400`, carrying the demand's text.
+        if let ChError::Server { code: 395, message } = &e
+            && let Some(d) = demands.iter().find(|d| message.contains(d.as_str()))
+        {
+            return ReadError::PipelineInvalid { reason: d.clone() };
+        }
         match e {
             ChError::Server {
                 code: 395,

@@ -25,6 +25,7 @@
 
 pub mod attr_index;
 pub mod fetch;
+pub mod fold;
 pub mod metrics;
 pub mod numbering;
 pub mod predicate;
