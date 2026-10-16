@@ -3117,9 +3117,7 @@ fn fixture_v_bodies(base_ns: i64) -> Vec<ExportTraceServiceRequest> {
 
 const ALL_V: &[&str] = &["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8"];
 const ALL_V_BUT_V5: &[&str] = &["v1", "v2", "v3", "v4", "v6", "v7", "v8"];
-const ALL_V_BUT_V6: &[&str] = &["v1", "v2", "v3", "v4", "v5", "v7", "v8"];
 const ALL_V_BUT_V7: &[&str] = &["v1", "v2", "v3", "v4", "v5", "v6", "v8"];
-const ALL_V_BUT_V8: &[&str] = &["v1", "v2", "v3", "v4", "v5", "v6", "v7"];
 const V_SVC_STRING: &[&str] = &["v1", "v2", "v4", "v5", "v7"];
 
 const CASES_V: &[CaseIn] = &[
@@ -3173,25 +3171,27 @@ const CASES_V: &[CaseIn] = &[
         query: r#"{ .service.name < "u" }"#,
         want: Want::Ids(&[]),
     },
+    // Issue #602 part 1 (D2): a `service.name` sent as anything but a
+    // string is missing, scoped or unscoped.
     CaseIn {
         name: "SV2 =",
         query: r#"{ .service.name = 12345 }"#,
-        want: Want::Ids(&["v6"]),
+        want: Want::Ids(&[]),
     },
     CaseIn {
         name: "SV2 !=",
         query: r#"{ .service.name != 12345 }"#,
-        want: Want::Ids(ALL_V_BUT_V6),
+        want: Want::Ids(ALL_V),
     },
     CaseIn {
         name: "SVD =",
         query: r#"{ .service.name = 1.461413291919332 }"#,
-        want: Want::Ids(&["v3"]),
+        want: Want::Ids(&[]),
     },
     CaseIn {
         name: "SVD >",
         query: r#"{ .service.name > 1.4 }"#,
-        want: Want::Ids(&["v3", "v6"]),
+        want: Want::Ids(&[]),
     },
     CaseIn {
         name: "SV3 =",
@@ -3203,15 +3203,17 @@ const CASES_V: &[CaseIn] = &[
         query: r#"{ .service.name =~ "1.*" }"#,
         want: Want::Ids(&[]),
     },
+    // Issue #602 part 1 (D2): a `service.name` sent as anything but a
+    // string is missing, scoped or unscoped.
     CaseIn {
         name: "SV4 =",
         query: r#"{ .service.name = "x" }"#,
-        want: Want::Ids(&["v8"]),
+        want: Want::Ids(&[]),
     },
     CaseIn {
         name: "SV4 !=",
         query: r#"{ .service.name != "x" }"#,
-        want: Want::Ids(ALL_V_BUT_V8),
+        want: Want::Ids(ALL_V),
     },
     CaseIn {
         name: "EV1",
@@ -3704,10 +3706,12 @@ const CASES_W: &[CaseIn] = &[
         query: r#"{ span:id = span.sid }"#,
         want: Want::Ids(&["w16"]),
     },
+    // Issue #602 part 1 (D2): a `service.name` sent as anything but a
+    // string is missing, scoped or unscoped.
     CaseIn {
         name: "SVC",
         query: r#"{ resource.service.name = span.svc }"#,
-        want: Want::Ids(&["w21", "w23"]),
+        want: Want::Ids(&["w21"]),
     },
     CaseIn {
         name: "IN",
@@ -3937,20 +3941,24 @@ const CASES_X: &[CaseIn] = &[
         query: r#"{ resource.a != resource.c }"#,
         want: Want::Ids(&["x14"]),
     },
+    // Issue #602 part 1 (D2): a `service.name` sent as anything but a
+    // string is missing, scoped or unscoped.
     CaseIn {
         name: "SN1",
         query: r#"{ resource.service.name = span.b }"#,
-        want: Want::Ids(&["x16"]),
+        want: Want::Ids(&[]),
     },
     CaseIn {
         name: "SN2",
         query: r#"{ resource.service.name = span.bs }"#,
         want: Want::Ids(&["x17", "x19"]),
     },
+    // Issue #602 part 1 (D2): a `service.name` sent as anything but a
+    // string is missing, scoped or unscoped.
     CaseIn {
         name: "SN3",
         query: r#"{ resource.service.name != span.b }"#,
-        want: Want::Ids(&["x18"]),
+        want: Want::Ids(&[]),
     },
 ];
 
@@ -4863,7 +4871,8 @@ const CASES_Z: &[CaseIn] = &[
     CaseIn {
         name: "SN-INT",
         query: r#"{ .service.name = span.n }"#,
-        want: Want::Ids(&["z28"]),
+        // Issue #602 part 1 (D2): `z28`'s int service name is missing.
+        want: Want::Ids(&[]),
     },
     CaseIn {
         name: "SN-STR",
@@ -16304,6 +16313,101 @@ async fn a_covered_grouping_is_capped_by_one_statement() {
     };
     if logged != want {
         wrong.push(format!("{query}: logged {logged:?}, want {want:?}"));
+    }
+    drop_db(&db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Issue #602 part 1 (D2): on fixture A, the unscoped `.service.name` and
+/// an arithmetic `resource.service.name` read the service name only as a
+/// string — the integer `42` is missing to every comparison, presence,
+/// projection, aggregate and metrics filter — one statement each.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unscoped_service_name_is_held_only_as_a_string() {
+    skip_unless_live!();
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let (db, client) = seed_both(
+        pulsus_testkit::test_db("pulsus_read_it_t602p1_svcchain"),
+        &service_aggregate_fixture(base_ns),
+        2,
+        "t602p1-svcchain",
+    )
+    .await;
+    let engine = engine_of(&db).await;
+    let window = (base_ns, base_ns + 60_000_000_000);
+    let mut wrong = Vec::new();
+    for (id, query, literal) in [
+        ("A1", "{ .service.name = 42 }", ""),
+        ("A2", "{ .service.name > 40 }", ""),
+        ("A3", "{ .service.name != nil }", "a1 [01 service.name=42]"),
+        (
+            "A4",
+            "{ } | max(.service.name) > 0",
+            "a1 1 [01] {double:42 1 [01]}",
+        ),
+        (
+            "A5",
+            r#"{ .service.name = "42" }"#,
+            "a1 [01 service.name=42]",
+        ),
+        (
+            "A6",
+            "{ } | select(.service.name)",
+            "a2 [02 ]; a1 [01 service.name=42]",
+        ),
+        ("A7", "{ .service.name + 0 = 42 }", ""),
+        ("A8", "{ resource.service.name + 0 = 42 }", ""),
+        (
+            "A9",
+            "{ .service.name = .service.name }",
+            "a1 [01 service.name=42]",
+        ),
+        ("A10", "{ .service.name = nil }", "a2 [02 ]"),
+        (
+            "A11",
+            "{ } | by(.service.name)",
+            "a2 1 [02] {nil 1 [02]}; a1 1 [01] {42 1 [01]}",
+        ),
+    ] {
+        let plan = plan_of(&engine, &parse_query(query), window, 20, 3);
+        if !covered(&plan) {
+            wrong.push(format!("{id} {query}: not covered"));
+        }
+        let t0 = now_ns();
+        let routed = engine.search_routed(&plan).await.map(normalise_today);
+        let answer = if query.contains("| by(") || query.contains("| max(") {
+            grouped_answer_of(&routed)
+        } else {
+            selected_answer_of(&routed)
+        };
+        if answer != literal {
+            wrong.push(format!(
+                "{id} {query}\n  literal: {literal}\n  routed:  {answer}"
+            ));
+        }
+        if routed.is_err() {
+            continue;
+        }
+        let (statements, _) = settled_statements(&client, &db, t0).await;
+        if statements != 1 {
+            wrong.push(format!("{id} {query}: {statements} statements, want 1"));
+        }
+    }
+    let metrics = metrics_engine(&db, 1_000).await;
+    let s0 = base_ns / 1_000_000_000;
+    for (id, query, want) in [
+        ("M1", "{ .service.name = 42 } | count_over_time()", 0.0),
+        ("M2", "{ .service.name != nil } | count_over_time()", 1.0),
+    ] {
+        let got = instant_answer(&metrics, query, s0, s0 + 60).await.map(|r| {
+            r.series
+                .iter()
+                .map(|s| s.samples.iter().map(|(_, v)| *v).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        });
+        if got.as_ref().ok() != Some(&vec![vec![want]]) {
+            wrong.push(format!("{id} {query}: want [[{want}]], got {got:?}"));
+        }
     }
     drop_db(&db).await;
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
