@@ -4791,7 +4791,7 @@ example passes"* exited **0** on evidence about a different subject in the same 
 `skip_block_conditions_are_captured_and_blocks_do_not_swallow_each_other` each print `Starting 1 test`.
 
 ```gate-evidence-patterns
-WAVE_EV=#492 part 1|Starting 0 tests|exits? 4|exits? 101|does not exist|do not exist|not exist|no such target|has not been written|nothing at base|neither exists|none of them exists|none of the three exists|nothing asserts them today
+PART_EV=#492 part 1|Starting 0 tests|exits? 4|exits? 101|does not exist|do not exist|not exist|no such target|has not been written|nothing at base|neither exists|none of them exists|none of the three exists|nothing asserts them today
 MEAS_EV=Starting \d+ tests?|exits? 0
 ```
 
