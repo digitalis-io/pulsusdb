@@ -132,7 +132,7 @@ Decisions and their reasons:
 
 - **JSON labels, not `Map`.** `JSONExtractString(labels, k)` outperforms `Map` access in ClickHouse, and the reader rarely extracts labels in SQL anyway (see label cache, §5.2).
 - **Activity folds on merge, and reads need no `FINAL`.** `metric_series` is an `AggregatingMergeTree` whose `hours` OR together; a read tests each unmerged row's mask against the window's hours, so a series is found whether or not its rows have merged.
-- **Labels stored once per series.** `metric_labels` holds one row per series, keyed `(metric_name, fingerprint)`, and is kept with no TTL; `metric_series` keeps only activity, in daily partitions that expire with the samples. A metric's lookup rows are one key range, so a matcher with the name reads that metric's rows alone. No read joins: a read takes IDs from the lookup and the window from activity, and each answered series carries its own lookup row.
+- **Labels stored once per series.** `metric_labels` holds one row per series, keyed `(org_id, metric_name, fingerprint)`, and is kept with no TTL; `metric_series` keeps only activity, in daily partitions that expire with the samples. A metric's lookup rows are one key range, so a matcher with the name reads that metric's rows alone. No read joins: a read takes IDs from the lookup and the window from activity, and each answered series carries its own lookup row.
 
 #### 3.1.1 Downsampling tiers
 
