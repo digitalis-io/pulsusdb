@@ -29,6 +29,12 @@ Conventions:
 | `Retry-Attempt` | log, metric and trace ingest | issue #494, extended to the trace push by issue #586. The attempt number, `1` upward. **Never a suppression key** — there is nothing stored to match a bare marker against, and suppressing on one would drop a push with no record of having accepted it. It sets the `declared` label on `pulsus_ingest_duplicate_pushes_total` and nothing else |
 | `Authorization` | all | Basic auth when `PULSUS_AUTH_USER` is set |
 
+## Response headers
+
+| Header | Sent by | Meaning |
+|--------|---------|---------|
+| `X-Pulsus-Query-Id` | every route but `/ready` and `/metrics`, and not on a CORS preflight (`OPTIONS`), which the CORS layer answers before any route runs; none of the three runs a statement (issues #587, #614) | 32 lowercase hex characters, one per request, on every response, errors included — the authentication layer's `401` and the request deadline's `503` or `408` as well. Every statement a PromQL (§3), LogQL (§2, the tail included) or TraceQL (§4) read issues carries it as `log_comment`, so `system.query_log` filtered on it returns that request's statements and no other's; TraceQL statements are also numbered `<id>-1`, `<id>-2`, … as their `query_id`. A route that reads nothing (`/api/v1/query_exemplars`, the `/api/v1/status/*` routes, `/config`, `/buildinfo`) names an empty set, and so does a write route: its statements carry no request's id |
+
 ---
 
 ## 1. Ingestion
@@ -992,7 +998,7 @@ GET /api/traces/v1/trace/{traceId}/json    → force JSON
 | ClickHouse read timed out | `504` |
 | Unclassified ClickHouse/internal failure (incl. a stored attribute column the reader cannot decode) | `500` |
 
-**Response headers (issue #587).** Every response from the fetch routes — the two native ones, their three compat aliases and the `/api/v2/traces/{traceId}` alias — carries `X-Pulsus-Query-Id`: **32 lowercase hex characters**, one per request, and the prefix of the `query_id` every ClickHouse statement that request issued was stamped with. The statements are `<prefix>-1`, `<prefix>-2`, … in issue order, so an operator (or a test) reads one header and then reads that request's own rows out of `system.query_log` rather than guessing which rows were its. It is additive and no client reads it.
+**Response headers (issue #587).** Every response from the fetch routes — the two native ones, their three compat aliases and the `/api/v2/traces/{traceId}` alias — carries `X-Pulsus-Query-Id`, and the statements it names are numbered in issue order (see "Response headers" above).
 
 **Request parameters (issue #587).** `start` and `end` are accepted on the fetch routes, in the §1 trace-surface timestamp grammar, and are read **only** by the fallback statement — the one that answers a trace the per-trace table has not indexed. The indexed statement never reads them, so the property that made ignoring them safe is preserved: a window can only ADD an answer and can never narrow one. Both bounds or neither; a bound present but unparseable is `400`, and an empty or inverted window is treated as none. Every other query parameter is still accepted and ignored.
 

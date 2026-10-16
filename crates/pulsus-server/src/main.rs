@@ -20,6 +20,7 @@ mod modes;
 mod ops;
 mod prom_api;
 mod rebuild;
+mod request_id;
 mod serve;
 mod subsystems;
 mod tls;

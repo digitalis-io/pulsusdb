@@ -117,8 +117,10 @@ impl TraceDispatch {
             .map_err(map_err)
     }
 
-    /// The caller's settings with this statement's own `query_id` added
-    /// when a prefix is set, and untouched when none is.
+    /// The caller's settings with this statement's own `query_id`, and
+    /// the prefix as `log_comment` (issue #614: the one rule every route
+    /// that returns `X-Pulsus-Query-Id` keeps), added when a prefix is
+    /// set, and untouched when none is.
     ///
     /// The counter is read with `fetch_add`, so two concurrent reads
     /// through one engine get two ids; the suffix counts from 1, which is
@@ -131,7 +133,10 @@ impl TraceDispatch {
             .statement_seq
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
-        settings.clone().set("query_id", format!("{prefix}-{n}"))
+        settings
+            .clone()
+            .set("query_id", format!("{prefix}-{n}"))
+            .set("log_comment", prefix.as_str())
     }
 }
 

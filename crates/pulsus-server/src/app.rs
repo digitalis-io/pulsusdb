@@ -164,6 +164,10 @@ pub(crate) fn build_router(state: AppState, config: &Config) -> Result<Router, S
         authed = authed.layer(auth);
     }
 
+    // Issue #614: outside the deadline and the authentication layer, so
+    // their `503`, `408` and `401` carry the request's id as well.
+    authed = authed.layer(axum::middleware::from_fn(crate::request_id::stamp));
+
     let router = ops::ops_public_router().merge(authed);
 
     let router = router
@@ -307,6 +311,99 @@ mod tests {
             status(&router, "/buildinfo", Some(&valid)).await,
             StatusCode::OK
         );
+    }
+
+    /// One read route per signal: PromQL, LogQL, TraceQL search (issue
+    /// #614), each with parameters it accepts, the search over the last
+    /// ten minutes.
+    fn one_route_per_signal() -> [String; 3] {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after 1970")
+            .as_secs();
+        [
+            "/api/v1/query?query=up".to_string(),
+            "/api/logs/v1/query_range?query=%7Bapp%3D%22a%22%7D".to_string(),
+            format!(
+                "/api/traces/v1/search?q=%7B%20.a%20%3D%20%22b%22%20%7D&start={}&end={now}",
+                now - 600
+            ),
+        ]
+    }
+
+    /// The routes whose response lacks a 32-lowercase-hex
+    /// `X-Pulsus-Query-Id`, so a failure names every signal at once.
+    fn without_request_id(seen: &[(String, axum::http::HeaderMap)]) -> Vec<String> {
+        seen.iter()
+            .filter(|(_, headers)| {
+                !headers
+                    .get(crate::request_id::QUERY_ID_HEADER)
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|id| {
+                        id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+                    })
+            })
+            .map(|(path, _)| path.clone())
+            .collect()
+    }
+
+    /// **Issue #614: the authentication layer's `401` names its request**
+    /// on every signal — the layer that mints the id wraps it.
+    #[tokio::test]
+    async fn an_authentication_refusal_carries_the_request_id_on_every_signal() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use pulsus_config::Secret;
+        use tower::ServiceExt;
+
+        let cfg = Config {
+            auth_user: Some("alice".to_string()),
+            auth_password: Some(Secret::new("hunter2")),
+            ..Config::default()
+        };
+        let router = build_router(test_state(), &cfg).expect("router builds");
+        let mut seen = Vec::new();
+        for path in one_route_per_signal() {
+            let request = Request::builder().uri(&path).body(Body::empty()).unwrap();
+            let res = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{path}");
+            seen.push((path, res.headers().clone()));
+        }
+        assert_eq!(without_request_id(&seen), Vec::<String>::new());
+    }
+
+    /// **Issue #614: the request deadline's answer names its request** on
+    /// every signal: `503` and the error envelope on PromQL, the bare `408`
+    /// on logs and traces. The test holds the pool's write lock, so every
+    /// handler waits at its first step, the pool read, until the 50 ms
+    /// deadline answers instead.
+    #[tokio::test]
+    async fn a_request_deadline_answer_carries_the_request_id_on_every_signal() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use std::time::Duration;
+        use tower::ServiceExt;
+
+        let cfg = Config {
+            query_timeout: pulsus_config::HumanDuration(Duration::from_millis(50)),
+            ..Config::default()
+        };
+        let state = test_state();
+        let pool = state.pool.clone();
+        let router = build_router(state, &cfg).expect("router builds");
+        let _held = pool.write().await;
+        let mut seen = Vec::new();
+        for (path, want) in one_route_per_signal().into_iter().zip([
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::REQUEST_TIMEOUT,
+            StatusCode::REQUEST_TIMEOUT,
+        ]) {
+            let request = Request::builder().uri(&path).body(Body::empty()).unwrap();
+            let res = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(res.status(), want, "{path}");
+            seen.push((path, res.headers().clone()));
+        }
+        assert_eq!(without_request_id(&seen), Vec::<String>::new());
     }
 
     /// With no `PULSUS_AUTH_USER`/`PULSUS_AUTH_PASSWORD` configured, every

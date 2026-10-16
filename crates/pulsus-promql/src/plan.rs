@@ -681,17 +681,17 @@ pub enum PlanExpr {
         call_pos: usize,
     },
     /// Issue #68 (M6-05): `label_replace(v, dst, replacement, src,
-    /// regex)`. `regex` is validated at plan time (compiled with
-    /// upstream's exact `^(?s:…)$` dot-all anchoring) and recompiled per
-    /// evaluation step; `dst` name validity is checked at plan time too
-    /// (both mirror upstream funcLabelReplace's before-the-loop checks,
-    /// so they error even over an empty selection).
+    /// regex)`. `regex` is compiled once, at plan time, with upstream's
+    /// exact `^(?s:…)$` dot-all anchoring, and every evaluation step uses
+    /// that compiled pattern (issue #614); `dst` name validity is checked
+    /// at plan time too (both mirror upstream funcLabelReplace's
+    /// before-the-loop checks, so they error even over an empty selection).
     LabelReplace {
         arg: Box<PlanExpr>,
         dst: String,
         replacement: String,
         src: String,
-        regex: String,
+        regex: crate::eval::labels::LabelReplaceRegex,
     },
     /// Issue #68 (M6-05): `label_join(v, dst, separator, src…)`. `dst`
     /// and every `src` name are validated at plan time (upstream
@@ -2224,9 +2224,9 @@ fn plan_call(planner: &mut Planner, call: &Call) -> Result<PlanExpr, PromqlError
         let replacement = plan_string_arg(name, replacement_arg)?;
         let src = plan_string_arg(name, src_arg)?;
         let regex = plan_string_arg(name, regex_arg)?;
-        // Plan v2 Δ1: upstream's exact `^(?s:regex)$` dot-all anchoring —
-        // the same construction the eval arm recompiles per step.
-        crate::eval::labels::compile_label_replace_regex(&regex)?;
+        // Plan v2 Δ1: upstream's exact `^(?s:regex)$` dot-all anchoring,
+        // compiled here once and carried to every step (issue #614).
+        let regex = crate::eval::labels::LabelReplaceRegex::compile(regex)?;
         if !crate::eval::labels::is_valid_label_name(&dst) {
             return Err(PromqlError::LabelSet {
                 detail: format!("invalid destination label name in label_replace(): {dst}"),
@@ -6100,7 +6100,7 @@ mod tests {
                 assert_eq!(dst, "dst");
                 assert_eq!(replacement, "value-$1");
                 assert_eq!(src, "src");
-                assert_eq!(regex, "re");
+                assert_eq!(regex.as_str(), "re");
             }
             other => panic!("expected LabelReplace, got {other:?}"),
         }

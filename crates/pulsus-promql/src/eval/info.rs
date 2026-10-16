@@ -109,8 +109,9 @@ pub(crate) struct InfoSeriesAtStep {
 
 /// Compiled-regex memo for one evaluation scope (a `combine` call or one
 /// `prepare_info` horizon walk): each distinct `Re`/`Nre` pattern
-/// compiles once, never per series. The `label_replace` per-step
-/// recompilation precedent, bounded by the query's own matcher count.
+/// compiles once, never per series, bounded by the query's own matcher
+/// count (`label_replace` compiles its one pattern at plan time, issue
+/// #614).
 #[derive(Debug, Default)]
 pub(crate) struct MatcherCache {
     compiled: HashMap<String, regex::Regex>,

@@ -355,10 +355,10 @@ pub struct LogQlEngine {
     /// [`super::predicate::MAX_METADATA_FRAGMENT_BYTES`]. `None` is the
     /// shipped constant; production never sets it.
     metadata_fragment_budget: Option<usize>,
-    /// Measurement-only: a `log_comment` every read this engine issues
-    /// carries, so `system.query_log` can attribute a statement to the
-    /// request that made it (issue #544 code review round 1). `None` is
-    /// production, and then nothing is sent.
+    /// The `log_comment` every read this engine issues carries, so
+    /// `system.query_log` can attribute a statement to the request that
+    /// made it: the server sets the request's id (issue #614), a test its
+    /// own tag (issue #544). `None` sends nothing.
     query_log_comment: Option<String>,
 }
 
@@ -403,12 +403,12 @@ impl LogQlEngine {
     /// Tags every read this engine issues with `comment`, recorded by the
     /// database as `log_comment` (issue #544 code review round 1).
     ///
-    /// **For measurement, not for production.** The benchmark needs to
-    /// attribute each statement to the request that made it, and the
-    /// alternative — matching the statement TEXT for a predicate literal —
-    /// attributes nothing on a route whose predicate never reaches SQL,
-    /// which is precisely the route being compared.
-    #[doc(hidden)]
+    /// **The server sets the request's id (issue #614).** A benchmark sets
+    /// its own tag to attribute each statement to the request that made
+    /// it, and the alternative — matching the statement TEXT for a
+    /// predicate literal — attributes nothing on a route whose predicate
+    /// never reaches SQL, which is precisely the route being compared.
+    /// Every PromQL and LogQL response names the id (docs/api.md).
     pub fn with_query_log_comment(mut self, comment: impl Into<String>) -> Self {
         self.query_log_comment = Some(comment.into());
         self
@@ -1170,14 +1170,14 @@ impl LogQlEngine {
         ))
     }
 
-    /// Applies the measurement tag, when one is set (issue #544 code
-    /// review round 1).
+    /// Applies the `log_comment` tag, when one is set (issues #544 and
+    /// #614).
     ///
-    /// **The one place it is applied**, so no read path can be measured
-    /// and no read path can be missed. Production never sets the tag and
-    /// this is then the identity — `system.query_log` records a setting
-    /// only when the client sent it, so an untagged read's `log_comment`
-    /// stays empty and nothing about the shipped statements moves.
+    /// **The one place it is applied**: every LogQL settings object is
+    /// built through it, so no read path can be missed. Without a tag this
+    /// is the identity — `system.query_log` records a setting only when
+    /// the client sent it, so an untagged read's `log_comment` stays empty
+    /// and nothing about the statements themselves moves.
     fn tagged(&self, settings: QuerySettings) -> QuerySettings {
         match &self.query_log_comment {
             Some(tag) => settings.set("log_comment", tag.as_str()),

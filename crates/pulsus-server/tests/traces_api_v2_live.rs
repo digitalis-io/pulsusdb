@@ -1462,6 +1462,28 @@ async fn statement_ids(admin: &ChClient, db: &str, prefix: &str) -> BTreeSet<Str
     while let Some(row) = stream.next().await {
         out.insert(row.expect("decode a query_log row").s);
     }
+    // The first read's stream holds the admin client's connection until it
+    // is dropped; shadowing it would not.
+    drop(stream);
+    // Issue #614: the same statements carry the prefix as `log_comment`,
+    // the one rule every route returning `X-Pulsus-Query-Id` keeps.
+    let sql = format!(
+        "SELECT query_id AS s FROM system.query_log \
+         WHERE log_comment = '{prefix}' AND type = 'QueryFinish' \
+           AND current_database = '{db}'"
+    );
+    let mut stream = admin
+        .query_stream::<ChText>(&sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("query_log read failed: {e}"));
+    let mut named = BTreeSet::new();
+    while let Some(row) = stream.next().await {
+        named.insert(row.expect("decode a query_log row").s);
+    }
+    assert_eq!(
+        named, out,
+        "every statement of {prefix} carries it as log_comment"
+    );
     out
 }
 

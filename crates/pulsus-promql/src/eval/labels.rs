@@ -19,11 +19,13 @@ use crate::value::{InstantSample, Labels};
 
 /// Compiles `label_replace`'s regex with upstream's exact anchoring —
 /// `^(?s:regex)$` (`promql/functions.go:2464`, full-string match with the
-/// dot-all flag so `.` matches embedded newlines; plan v2 Δ1). Called at
-/// plan time (validation — an invalid pattern is a query error before any
-/// fetch) and again per evaluation step (the eval arm recompiles; a rare
-/// rewrite, not an aggregation hot path — plan edge case 5).
+/// dot-all flag so `.` matches embedded newlines; plan v2 Δ1). Called once,
+/// at plan time (issue #614): an invalid pattern is a query error before
+/// any fetch, and the compiled pattern rides on the plan node
+/// ([`LabelReplaceRegex`]) to every evaluation step.
 pub fn compile_label_replace_regex(regex: &str) -> Result<regex::Regex, PromqlError> {
+    #[cfg(test)]
+    LABEL_REPLACE_COMPILES.with(|c| c.set(c.get() + 1));
     let translated = re2_pattern_to_rust(regex);
     // Issue #291: through the shared compile budget, on the EXACT string
     // that gets compiled — upstream's `^(?s:…)$` wrapper, not the
@@ -33,6 +35,59 @@ pub fn compile_label_replace_regex(regex: &str) -> Result<regex::Regex, PromqlEr
             detail: format!("invalid regular expression in label_replace(): {regex}"),
         }
     })
+}
+
+/// `label_replace`'s pattern as the user wrote it, and its compiled form
+/// (issue #614). Compiled once, by [`LabelReplaceRegex::compile`] at plan
+/// time; equality and `Debug` are the source text's, because the compiled
+/// form is a deterministic function of it.
+#[derive(Clone)]
+pub struct LabelReplaceRegex {
+    source: String,
+    re: regex::Regex,
+}
+
+impl LabelReplaceRegex {
+    /// Compiles `source` through [`compile_label_replace_regex`]; its
+    /// error is the query's error.
+    pub fn compile(source: String) -> Result<Self, PromqlError> {
+        let re = crate::eval::labels::compile_label_replace_regex(&source)?;
+        Ok(LabelReplaceRegex { source, re })
+    }
+
+    /// The pattern as written.
+    pub fn as_str(&self) -> &str {
+        &self.source
+    }
+
+    /// The compiled, anchored pattern.
+    pub fn regex(&self) -> &regex::Regex {
+        &self.re
+    }
+}
+
+impl PartialEq for LabelReplaceRegex {
+    fn eq(&self, other: &Self) -> bool {
+        self.source == other.source
+    }
+}
+
+impl std::fmt::Debug for LabelReplaceRegex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.source, f)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Calls of [`compile_label_replace_regex`] on this thread (issue #614).
+    static LABEL_REPLACE_COMPILES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// [`compile_label_replace_regex`] calls on this thread so far.
+#[cfg(test)]
+pub(crate) fn label_replace_compiles() -> u64 {
+    LABEL_REPLACE_COMPILES.with(std::cell::Cell::get)
 }
 
 /// Upstream `model.LabelName.IsValid()` under v3.13's default UTF-8
@@ -331,16 +386,15 @@ fn check_unique_labelsets(v: &[InstantSample]) -> Result<(), PromqlError> {
 /// `src` reads as `""`; a matched-but-empty `src` still relabels); on
 /// match, `replacement` expands `$1`/`${name}` capture references and
 /// sets/deletes `dst`; no match leaves the series untouched. `dst`/`src`
-/// may be `__name__`. The regex/`dst` were validated at plan time; the
+/// may be `__name__`. `re` was compiled once at plan time; the
 /// duplicate-identity check runs per step over the rewritten vector.
 pub fn label_replace_vector(
     v: Vec<InstantSample>,
     dst: &str,
     replacement: &str,
     src: &str,
-    regex: &str,
+    re: &regex::Regex,
 ) -> Result<Vec<InstantSample>, PromqlError> {
-    let re = compile_label_replace_regex(regex)?;
     let mut out = Vec::with_capacity(v.len());
     for mut s in v {
         // Scoped so the captures' borrow of `s` ends before the mutation.
@@ -638,7 +692,14 @@ mod tests {
         // unset). Inexpressible in the `.test` series grammar — pinned
         // here instead.
         let v = vec![sample(Some("m"), &[("src", "a\nb")], 1.0)];
-        let out = label_replace_vector(v, "dst", "$1", "src", "(a.b)").unwrap();
+        let out = label_replace_vector(
+            v,
+            "dst",
+            "$1",
+            "src",
+            &compile_label_replace_regex("(a.b)").unwrap(),
+        )
+        .unwrap();
         assert_eq!(out[0].labels.get("dst"), Some("a\nb"));
     }
 
@@ -646,7 +707,14 @@ mod tests {
     fn label_replace_expands_named_capture_groups() {
         // Plan v2 Δ4: `${name}` expansion parity with Go's Expand.
         let v = vec![sample(Some("m"), &[("src", "source-value-10")], 1.0)];
-        let out = label_replace_vector(v, "dst", "${x}", "src", "(?P<x>.*)").unwrap();
+        let out = label_replace_vector(
+            v,
+            "dst",
+            "${x}",
+            "src",
+            &compile_label_replace_regex("(?P<x>.*)").unwrap(),
+        )
+        .unwrap();
         assert_eq!(out[0].labels.get("dst"), Some("source-value-10"));
     }
 
@@ -655,9 +723,23 @@ mod tests {
         // src = __name__ reads metric_name; dst = __name__ writes it; an
         // empty expansion deletes it.
         let v = vec![sample(Some("old"), &[("k", "v")], 1.0)];
-        let out = label_replace_vector(v, "__name__", "$1-new", "__name__", "(.*)").unwrap();
+        let out = label_replace_vector(
+            v,
+            "__name__",
+            "$1-new",
+            "__name__",
+            &compile_label_replace_regex("(.*)").unwrap(),
+        )
+        .unwrap();
         assert_eq!(out[0].metric_name.as_deref(), Some("old-new"));
-        let out = label_replace_vector(out, "__name__", "", "__name__", ".*").unwrap();
+        let out = label_replace_vector(
+            out,
+            "__name__",
+            "",
+            "__name__",
+            &compile_label_replace_regex(".*").unwrap(),
+        )
+        .unwrap();
         assert_eq!(out[0].metric_name, None);
     }
 
@@ -678,7 +760,14 @@ mod tests {
             sample(Some("m"), &[("src", "a"), ("keep", "x")], 1.0),
             sample(Some("m"), &[("src", "b"), ("keep", "x")], 2.0),
         ];
-        let err = label_replace_vector(v, "src", "", "src", ".*").unwrap_err();
+        let err = label_replace_vector(
+            v,
+            "src",
+            "",
+            "src",
+            &compile_label_replace_regex(".*").unwrap(),
+        )
+        .unwrap_err();
         assert!(matches!(err, PromqlError::LabelSet { .. }), "{err:?}");
         assert_eq!(
             err.to_string(),
@@ -694,7 +783,14 @@ mod tests {
             sample(Some("foo"), &[("src", "a")], 1.0),
             sample(Some("bar"), &[("src", "a")], 2.0),
         ];
-        let out = label_replace_vector(v, "dst", "same", "src", ".*").unwrap();
+        let out = label_replace_vector(
+            v,
+            "dst",
+            "same",
+            "src",
+            &compile_label_replace_regex(".*").unwrap(),
+        )
+        .unwrap();
         assert_eq!(out.len(), 2);
     }
 

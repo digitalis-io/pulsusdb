@@ -58,6 +58,7 @@ async fn engine_for(state: &AppState) -> Result<MetricsEngine, ApiError> {
     // config load, so this is unreachable in the real binary; a failure maps
     // to the existing 503 "not serving" semantics.
     chconfig::metrics_engine(pool, label_cache, &state.config, state.eval_gate.clone())
+        .map(crate::request_id::tag)
         .map_err(|_| ApiError::Unavailable)
 }
 

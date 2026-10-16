@@ -41,7 +41,9 @@ pub(super) async fn engine_for(state: &AppState, tenant: Tenant) -> Result<LogQl
     // Issue #114: the consistency-config invariant is already enforced at
     // config load, so this is unreachable in the real binary; a failure maps
     // to the existing 503 "not serving" semantics.
-    chconfig::logql_engine(pool, &state.config, tenant).map_err(|_| ApiError::PoolUnavailable)
+    chconfig::logql_engine(pool, &state.config, tenant)
+        .map(crate::request_id::tag)
+        .map_err(|_| ApiError::PoolUnavailable)
 }
 
 /// The request's tenant (issue #653), by the metrics rule

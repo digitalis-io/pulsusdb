@@ -24,10 +24,12 @@
 //! the v1 handlers answer `404`.
 
 use axum::extract::{Path, RawQuery, State};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
 use pulsus_read::{FetchRoute, TraceEngine};
+
+use crate::request_id::{QUERY_ID_HEADER, current_or_new};
 
 use crate::app::AppState;
 use crate::chconfig;
@@ -52,7 +54,9 @@ pub(super) async fn engine_for(state: &AppState) -> Result<TraceEngine, ApiError
     // Issue #114: the consistency-config invariant is already enforced at
     // config load, so this is unreachable in the real binary; a failure maps
     // to the existing 503 "not serving" semantics.
-    chconfig::trace_engine(pool, &state.config).map_err(|_| ApiError::PoolUnavailable)
+    chconfig::trace_engine(pool, &state.config)
+        .map(crate::request_id::tag)
+        .map_err(|_| ApiError::PoolUnavailable)
 }
 
 /// `GET /api/traces/v1/trace/{traceId}` — representation by `Accept`
@@ -68,7 +72,7 @@ pub(crate) async fn trace_by_id(
     RawQuery(query): RawQuery,
     headers: HeaderMap,
 ) -> Response {
-    let stmt_prefix = new_statement_prefix();
+    let stmt_prefix = current_or_new();
     let mut res = match trace_by_id_impl(
         state,
         &trace_id,
@@ -95,7 +99,7 @@ pub(crate) async fn trace_by_id_json(
     RawQuery(query): RawQuery,
     _headers: HeaderMap,
 ) -> Response {
-    let stmt_prefix = new_statement_prefix();
+    let stmt_prefix = current_or_new();
     let mut res =
         match trace_by_id_impl(state, &trace_id, query.as_deref(), None, &stmt_prefix).await {
             Ok(res) => res,
@@ -152,11 +156,6 @@ async fn trace_by_id_impl(
         .into_response())
 }
 
-/// The response header carrying a request's statement-id prefix: the
-/// statements the request issued are `<prefix>-1`, `<prefix>-2`, … in
-/// issue order.
-pub(super) const QUERY_ID_HEADER: HeaderName = HeaderName::from_static("x-pulsus-query-id");
-
 /// Attaches the prefix to whatever the fetch path produced — the `200`
 /// and **every error alike** (docs/api.md §4.1: *"every response from the
 /// fetch routes"*).
@@ -172,32 +171,6 @@ pub(super) const QUERY_ID_HEADER: HeaderName = HeaderName::from_static("x-pulsus
 fn attach_query_id(res: &mut Response, prefix: &str) {
     let value = HeaderValue::from_str(prefix).expect("the prefix is 32 hex characters");
     res.headers_mut().insert(QUERY_ID_HEADER, value);
-}
-
-/// One prefix per request: **32 hex chars** of operating-system
-/// randomness, so it is a legal `query_id` and two concurrent requests
-/// cannot be given one.
-///
-/// **`getrandom` rather than `uuid`**, for the reason the workspace's own
-/// entry gives: one opaque string per request is the same shape the write
-/// path's token mint already declines `uuid` for, and `getrandom` adds no
-/// crate to this binary's graph. A failure to read randomness falls back
-/// to the monotonic clock plus a process-local counter, which is still
-/// unique within a process and is the only thing left when the kernel's
-/// own source is unavailable.
-fn new_statement_prefix() -> String {
-    match (getrandom::u64(), getrandom::u64()) {
-        (Ok(hi), Ok(lo)) => format!("{hi:016x}{lo:016x}"),
-        _ => {
-            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64;
-            format!("{nanos:016x}{n:016x}")
-        }
-    }
 }
 
 /// The validated 32-char hex id as the 16 bytes every rebuilt span's
@@ -267,7 +240,7 @@ pub(crate) async fn trace_by_id_v2(
     RawQuery(query): RawQuery,
     headers: HeaderMap,
 ) -> Response {
-    let stmt_prefix = new_statement_prefix();
+    let stmt_prefix = current_or_new();
     let mut res =
         match trace_by_id_v2_impl(state, &trace_id, query.as_deref(), &headers, &stmt_prefix).await
         {
