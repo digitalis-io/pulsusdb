@@ -1,8 +1,10 @@
 //! The TraceQL search statement (issue #590): `docs/TraceQL/sql-schema.md`
-//! §5.2, without `by()`. The newest slice is [`search_sql_at`]'s; the loop
-//! that widens it is `exec/newest_first.rs`'s (issue #595). One pure
-//! builder, `validated inputs -> String`, as [`super::fetch`]'s are; no
-//! route calls it yet.
+//! §5.2. One pure builder, `validated inputs -> String`, as
+//! [`super::fetch`]'s are. The route fork (`exec.rs`'s `search_routed`)
+//! issues it for every search [`plan_statement`] covers, and the previous
+//! engine answers the rest. Every `|` stage is [`super::fold`]'s fold
+//! (issue #602 part 2a). The newest slice is [`search_sql_at`]'s; the loop
+//! that widens it is `exec/newest_first.rs`'s (issue #595).
 //!
 //! ## The three reads, in one statement
 //!
@@ -39,13 +41,16 @@
 //!
 //! ## `&&` and `||` across spansets (issue #591 part 1)
 //!
-//! A spanset tree is one window read with one flag per filter and a
-//! `HAVING` over each trace's flags, then the detail read keeps each
-//! trace's spans by the same flags (section 4.3): `&&` is "both sides
-//! non-empty, the union of their spans", `||` the union (`docs/api.md`
-//! §4.2). Measured on g1, 2,034,612 rows and 50 ms, against 10,034,868
-//! rows and 130 ms for the design's catalogue form, which builds a
-//! `trace_id IN` set per filter in each of the two reads.
+//! A spanset tree reads its spans once with one flag per filter, takes each
+//! flag's maximum over the trace by a window function, and marks a span a
+//! member when its flag and its `&&` guards hold (section 4.3): `&&` is
+//! "both sides non-empty, the union of their spans", `||` the union
+//! (`docs/api.md` §4.2). Since issue #602 part 2a that relation is the
+//! fold's selector, so a tree reads the newest slice first and takes any
+//! `|` stage. The earlier form, a `HAVING` over each trace's flags,
+//! measured 2,034,612 rows and 50 ms on g1, against 10,034,868 rows and
+//! 130 ms for the design's catalogue form, which builds a `trace_id IN` set
+//! per filter in each of the two reads.
 //!
 //! ## The projection
 //!
@@ -686,8 +691,8 @@ pub struct SearchStatement {
     /// = max_depth + 1`.
     climb_depth: Option<u32>,
     /// Whether the newest-slice-first loop may bound its top-K to a slice
-    /// (issue #595): one filter, no `|` stage but `select()`, no structural
-    /// operator.
+    /// (issue #595): every statement but a structural one (issue #602 part
+    /// 2a).
     sliceable: bool,
     /// Whether a predicate reads the nested-set numbering (issue #594 part
     /// 2).

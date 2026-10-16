@@ -345,7 +345,8 @@ fn fills(plan: &TraceMetricsPlan) -> bool {
 /// and the `WITH` binding what it reads beside the span row (#594 part 5):
 /// the search statement's per-trace scalar, operand pairs and numbered
 /// traces over that window, or nothing. `("true", "")` for `{}`; `None`
-/// for a `!` demand.
+/// when the body does not compile. A `!` demand is kept in the predicate
+/// and carried as the statement's demands (issue #602 part 2a).
 fn predicate(
     body: Option<&FieldExpr>,
     ctx: &PredicateCtx<'_>,
