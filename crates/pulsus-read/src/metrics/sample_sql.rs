@@ -10,7 +10,7 @@
 //! (`tests/metrics_sql_snapshots.rs`).
 //!
 //! **No metric name reaches a sample statement** (issue #623): the sample
-//! tables are keyed by the series ID alone, `(fingerprint, unix_milli)`,
+//! tables are keyed `(org_id, fingerprint, unix_milli)`, no name in it,
 //! so every read is an exact ID list (or the fallback's ID sub-query) and
 //! a time range. The one string literal here is [`names_predicate`]'s, for
 //! the explained read. Fingerprints enter as [`FpLiteral`]s and render as
@@ -124,7 +124,7 @@ pub fn sample_fetch_subquery(
 
 /// The issue #85 (M6-08c) multi-metric fan-out fetch: ONE query for a
 /// name-less/regex-`__name__` selector's whole resolved ID set,
-/// `fingerprint IN (<matched IDs>)` — the leading primary-key component,
+/// `fingerprint IN (<matched IDs>)` — the key column after the tenant,
 /// never a global unfiltered sample scan. An ID names one series (issue
 /// #623), so rows group by ID ([`super::sample_rows::MultiSampleRow`]) and
 /// take their names from the resolution.
@@ -601,7 +601,7 @@ mod tests {
     }
 
     /// **F9 (issue #623): no sample statement names a metric.** The sample
-    /// tables are keyed by the series ID alone, so every sample builder
+    /// tables are keyed by the tenant and series ID, so every builder
     /// reads an exact ID list (or the fallback's ID sub-query) and a time
     /// range, and never mentions `metric_name`.
     #[test]

@@ -557,6 +557,14 @@ impl MetricsEngine {
         }
     }
 
+    /// Issue #614: every statement this engine sends carries
+    /// `log_comment = comment` — the server passes the request's id, so
+    /// `system.query_log` attributes each statement to its request.
+    pub fn with_query_log_comment(mut self, comment: impl Into<String>) -> Self {
+        self.dispatch = self.dispatch.with_log_comment(comment.into());
+        self
+    }
+
     /// Issue #499: the request's `lookback_delta`, in milliseconds, as the
     /// staleness lookback every plan of this engine uses.
     pub fn with_lookback_ms(mut self, lookback_ms: i64) -> Self {

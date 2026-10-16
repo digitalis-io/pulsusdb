@@ -164,6 +164,10 @@ pub(crate) fn build_router(state: AppState, config: &Config) -> Result<Router, S
         authed = authed.layer(auth);
     }
 
+    // Issue #614: outside the deadline and the authentication layer, so
+    // their `503`, `408` and `401` carry the request's id as well.
+    authed = authed.layer(axum::middleware::from_fn(crate::request_id::stamp));
+
     let router = ops::ops_public_router().merge(authed);
 
     let router = router

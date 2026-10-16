@@ -3302,7 +3302,7 @@ fn eval_step(
                 dst,
                 replacement,
                 src,
-                regex,
+                regex.regex(),
             )?))
         }
         PlanExpr::LabelJoin {

@@ -2161,9 +2161,9 @@ fn promql_sample_fetch_sql(query: &str, params: pulsus_promql::PlanParams, db: &
     )
 }
 
-/// The `(fingerprint, unix_milli)` primary key on `metric_samples` (issue
+/// The `(org_id, fingerprint, unix_milli)` key on `metric_samples` (issue
 /// #623) — the shared raw-fetch expectation both PromQL cases below assert
-/// against: the full two-column key condition plus MinMax
+/// against: the full three-column key condition plus MinMax
 /// time pruning (the `toDate(...)` partition analysis reports
 /// `Condition: true` here — time-range partition pruning surfaces through
 /// the MinMax block instead).
