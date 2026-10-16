@@ -167,7 +167,8 @@ struct SeedSampleRow {
     body: String,
 }
 
-/// One `log_landing` row, in the table's own column order (issue #603).
+/// One `log_landing` row, in the table's own column order (issue #603),
+/// the tenant first (issue #653).
 ///
 /// **The corpus is seeded into the LANDING table, not into the targets.**
 /// `log_samples`, `log_streams`, `log_streams_idx`, `log_metrics_<res>` and
@@ -185,6 +186,8 @@ struct SeedSampleRow {
 /// and is now also what carries the rows across the wrapper.
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct SeedLandingRow {
+    /// The tenant (issue #653): the empty tenant's rows.
+    org_id: String,
     received_ms: i64,
     kind: u8,
     service: String,
@@ -221,6 +224,7 @@ async fn insert_lines(
 impl SeedLandingRow {
     fn of_kind(kind: u8, received_ms: i64) -> Self {
         SeedLandingRow {
+            org_id: String::new(),
             received_ms,
             kind,
             service: String::new(),
