@@ -453,6 +453,9 @@ impl LogQlEngine {
         AggCaps {
             group_bytes: o.group_bytes.unwrap_or(AggCaps::DEFAULT.group_bytes),
             result_points: o.result_points.unwrap_or(AggCaps::DEFAULT.result_points),
+            retention_points: o
+                .retention_points
+                .unwrap_or(AggCaps::DEFAULT.retention_points),
             ..AggCaps::DEFAULT
         }
     }
