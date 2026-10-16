@@ -806,6 +806,28 @@ fn literal_side<'a>(field: &Field, lhs: &'a FieldExpr, rhs: &'a FieldExpr) -> Op
     }
 }
 
+/// The number constant one side of a comparison holds against the bare
+/// `field` on the other — a literal, or a negated literal (`-1`, which the
+/// parser keeps as `Neg(1)`) — and whether the field is on the left.
+fn numeric_constant_side(field: &Field, lhs: &FieldExpr, rhs: &FieldExpr) -> Option<(Value, bool)> {
+    let constant = |e: &FieldExpr| match e {
+        FieldExpr::Literal(v @ Value::Number(_)) => Some(v.clone()),
+        FieldExpr::Unary {
+            op: UnaryOp::Neg,
+            expr,
+        } => match expr.as_ref() {
+            FieldExpr::Literal(Value::Number(raw)) => Some(Value::Number(format!("-{raw}"))),
+            _ => None,
+        },
+        _ => None,
+    };
+    match (lhs, rhs) {
+        (FieldExpr::Field(f), other) if f == field => constant(other).map(|v| (v, true)),
+        (other, FieldExpr::Field(f)) if f == field => constant(other).map(|v| (v, false)),
+        _ => None,
+    }
+}
+
 /// A comparison naming `field` alone: nothing when an operand holds a `!`,
 /// a comparison or `&&`/`||` ([`boolean_valued`]); a span-row column
 /// projects itself under any other condition; any other field projects nothing under `!=` and
@@ -835,23 +857,25 @@ fn comparison_value(
     match place {
         Place::Column(sql) => return Ok(column(sql)),
         Place::Envelope => return Ok(Projects::Nothing),
-        // A number literal on either side; the operator as the predicate
-        // reads it, field first.
+        // A one-field nested-set condition projects that field's number,
+        // whatever else the condition holds (docs/api.md §4.2; measured
+        // against the reference, issue #602 part 2c-1). A number constant on
+        // one side — a literal, or a negated one, `-1` — is read as the
+        // predicate reads it, field first, so a root-only parent comparison
+        // keeps its `-1` and reads no numbering; any other condition (the
+        // bare field on both sides, arithmetic) projects the span's number.
         Place::Numbered(intrinsic) => {
-            return Ok(match literal_side(field, lhs, rhs) {
-                Some(v) => Projects::Value {
-                    value: projected_sql(
-                        intrinsic,
-                        if matches!(lhs, FieldExpr::Field(_)) {
-                            op
-                        } else {
-                            flip_comparison(op)
-                        },
-                        v,
-                    ),
-                    kind: "'Int64'".to_string(),
-                },
-                None => Projects::Nothing,
+            let value = match numeric_constant_side(field, lhs, rhs) {
+                Some((v, field_first)) => projected_sql(
+                    intrinsic,
+                    if field_first { op } else { flip_comparison(op) },
+                    &v,
+                ),
+                None => super::numbering::selected_sql(intrinsic),
+            };
+            return Ok(Projects::Value {
+                value,
+                kind: "'Int64'".to_string(),
             });
         }
         Place::Attribute(_) | Place::Resource | Place::Set
