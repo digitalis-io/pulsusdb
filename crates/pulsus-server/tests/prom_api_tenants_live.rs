@@ -9,6 +9,7 @@
 //!   T11  push suppression                                  two tenants, two pushes
 //!   T13  every /api/v1 route, seeded rows                  tenant-q sees none of tenant-o
 //!   T14  discovery with no range                           every day of the asking tenant, none of the other's
+//!   T15  every read route (issue #614)                     its id in the header and in each statement
 //! ```
 //!
 //! Gated behind `PULSUS_TEST_CLICKHOUSE=1`:
@@ -42,6 +43,7 @@ const DEDUP_PORT: u16 = 31_802;
 const ROUTES_PORT: u16 = 31_803;
 const DISCOVERY_PORT: u16 = 31_804;
 const NO_RANGE_PORT: u16 = 31_805;
+const REQUEST_ID_PORT: u16 = 31_806;
 
 const MINUTE_MS: i64 = 60_000;
 const DAY_MS: i64 = 86_400_000;
@@ -65,6 +67,7 @@ macro_rules! skip_unless_live {
 
 struct HttpResponse {
     status: u16,
+    headers: HashMap<String, String>,
     body: String,
 }
 
@@ -154,6 +157,7 @@ fn request(
     };
     HttpResponse {
         status,
+        headers,
         body: String::from_utf8_lossy(&body).into_owned(),
     }
 }
@@ -200,13 +204,18 @@ fn assert_port_free(port: u16) {
 }
 
 fn spawn_ready(port: u16, db: &ScopedDb) -> ChildGuard {
+    spawn_ready_with(port, db, "1s")
+}
+
+/// [`spawn_ready`] with the label cache refreshed every `cache_ttl`.
+fn spawn_ready_with(port: u16, db: &ScopedDb, cache_ttl: &str) -> ChildGuard {
     live_db::build_schema_blocking(db.name());
     assert_port_free(port);
     let mut command = Command::new(env!("CARGO_BIN_EXE_pulsusdb"));
     command
         .env("PULSUS_HOST", "127.0.0.1")
         .env("PULSUS_PORT", port.to_string())
-        .env("PULSUS_CACHE_TTL", "1s")
+        .env("PULSUS_CACHE_TTL", cache_ttl)
         .env("CLICKHOUSE_SERVER", live_db::ch_host())
         .env("CLICKHOUSE_HTTP_PORT", live_db::ch_http_port().to_string())
         .env("CLICKHOUSE_DB", db.name());
@@ -1226,4 +1235,134 @@ async fn discovery_with_no_range_reads_every_day_of_the_asking_tenant() {
         serde_json::json!(["__name__"]),
         "T14 /labels with no tenant"
     );
+}
+
+/// The server's clock, microseconds, read by a statement tagged so the
+/// T15 window never counts it.
+async fn server_now(client: &ChClient) -> String {
+    client
+        .query_strings(
+            "SELECT toString(now64(6)) AS s",
+            &QuerySettings::new().set("log_comment", "t15-marker"),
+        )
+        .await
+        .expect("the server clock")
+        .remove(0)
+}
+
+/// **T15 (issue #614): every read route names its statements.** Each read
+/// route of [`every_route`], and the four other status routes, answers with an `X-Pulsus-Query-Id` of 32
+/// lowercase hex characters, a different one per request; every route but
+/// `query_exemplars` and the five status routes (which read nothing) has at least
+/// one finished statement whose `log_comment` is that id; and no SELECT on
+/// this database between the first request and the last went out without
+/// one. The label cache refreshes hourly here, so its sweep is not in the
+/// window; the pool's `SELECT 1` liveness probe belongs to no request.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_read_route_names_its_statements_with_the_request_id() {
+    skip_unless_live!();
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_tenants_it_reqid")).await;
+    let _server = spawn_ready_with(REQUEST_ID_PORT, &db, "1h");
+    let client = client_for(db.name()).await;
+    let from = server_now(&client).await;
+    let mut seen: Vec<(String, String)> = Vec::new();
+    // The four status routes `every_route` does not list read nothing.
+    let status: Vec<(&str, String, Option<&str>, Vec<u8>)> =
+        ["buildinfo", "config", "flags", "runtimeinfo"]
+            .into_iter()
+            .map(|s| ("GET", format!("/api/v1/status/{s}"), None, Vec::new()))
+            .collect();
+    for (method, path, content_type, body) in every_route(now_ms())
+        .into_iter()
+        .filter(|(_, path, _, _)| path.starts_with("/api/v1/") && path != "/api/v1/write")
+        .chain(status)
+    {
+        let res = request(
+            REQUEST_ID_PORT,
+            method,
+            &path,
+            content_type,
+            &org(Some("tenant-q")),
+            &body,
+        );
+        let id = res
+            .headers
+            .get("x-pulsus-query-id")
+            .unwrap_or_else(|| panic!("T15: {method} {path}: no X-Pulsus-Query-Id"))
+            .clone();
+        assert!(
+            id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+            "T15: {method} {path}: {id:?}"
+        );
+        assert!(
+            seen.iter().all(|(_, other)| *other != id),
+            "T15: {method} {path} repeats an id: {id}"
+        );
+        seen.push((format!("{method} {path}"), id));
+    }
+    // A refused query names its request too.
+    let refused = get(REQUEST_ID_PORT, "/api/v1/query?query=%28", Some("tenant-q"));
+    assert_eq!(
+        refused.status, 400,
+        "T15: the refused query: {}",
+        refused.body
+    );
+    assert!(
+        refused.headers.contains_key("x-pulsus-query-id"),
+        "T15: the 400 carries no X-Pulsus-Query-Id"
+    );
+    // A CORS preflight is answered by the CORS layer outside the stamped
+    // router, runs no statement and carries no id.
+    let preflight = request(
+        REQUEST_ID_PORT,
+        "OPTIONS",
+        "/api/v1/query",
+        None,
+        &[
+            ("Origin", b"https://dash.example".as_slice()),
+            ("Access-Control-Request-Method", b"GET".as_slice()),
+        ],
+        &[],
+    );
+    assert_eq!(
+        preflight.status, 200,
+        "T15: the preflight: {}",
+        preflight.body
+    );
+    assert!(
+        !preflight.headers.contains_key("x-pulsus-query-id"),
+        "T15: a preflight carries no id"
+    );
+    let to = server_now(&client).await;
+    exec(&client, "SYSTEM FLUSH LOGS").await;
+    for (route, id) in &seen {
+        let n = number(
+            &client,
+            &format!(
+                "SELECT count() AS n FROM system.query_log \
+                 WHERE type = 'QueryFinish' AND log_comment = '{id}'"
+            ),
+        )
+        .await;
+        // `query_exemplars` and the status routes read nothing;
+        // `status/tsdb` answers from the label cache.
+        if route.contains("query_exemplars") || route.contains("/api/v1/status/") {
+            assert_eq!(n, 0, "T15: {route} reads nothing");
+        } else {
+            assert!(n >= 1, "T15: {route}: no statement carries {id}");
+        }
+    }
+    let unnamed = number(
+        &client,
+        &format!(
+            "SELECT count() AS n FROM system.query_log \
+             WHERE type = 'QueryFinish' AND query_kind = 'Select' AND is_initial_query \
+               AND current_database = '{db}' AND log_comment = '' AND query != 'SELECT 1' \
+               AND query_start_time_microseconds > toDateTime64('{from}', 6) \
+               AND query_start_time_microseconds < toDateTime64('{to}', 6)",
+            db = db.name()
+        ),
+    )
+    .await;
+    assert_eq!(unnamed, 0, "T15: a read went out without the request's id");
 }

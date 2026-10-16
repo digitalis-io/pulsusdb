@@ -7,6 +7,7 @@
 //!   T-H  the header on every log route                           '' / valid / 400
 //!   T-P  an invalid header beside an invalid parameter           the header's 400, every handler
 //!   T-D  two tenants' byte-identical pushes                      two pushes
+//!   T-I  every read route and the tail (issue #614)              its id in the header and each statement
 //! ```
 //!
 //! The pushes are the design's §9.3: three tenants on one stream `A`,
@@ -38,6 +39,7 @@ const ROUTES_PORT: u16 = 31_861;
 const HEADER_PORT: u16 = 31_862;
 const PRECEDENCE_PORT: u16 = 31_863;
 const DEDUP_PORT: u16 = 31_864;
+const REQUEST_ID_PORT: u16 = 31_865;
 
 const SECOND_NS: i64 = 1_000_000_000;
 const MINUTE_NS: i64 = 60 * SECOND_NS;
@@ -69,6 +71,7 @@ macro_rules! skip_unless_live {
 
 struct HttpResponse {
     status: u16,
+    headers: HashMap<String, String>,
     body: String,
 }
 
@@ -164,6 +167,7 @@ fn request(
     };
     HttpResponse {
         status,
+        headers,
         body: String::from_utf8_lossy(&body).into_owned(),
     }
 }
@@ -478,6 +482,12 @@ fn len_sum(lines: &[&str]) -> u64 {
 
 /// Opens the tail socket as `tenant`.
 fn tail_connect(port: u16, target: &str, tenant: Option<&str>) -> (TcpStream, Vec<u8>) {
+    let (stream, _, rest) = tail_handshake(port, target, tenant);
+    (stream, rest)
+}
+
+/// [`tail_connect`], with the `101` response's head text.
+fn tail_handshake(port: u16, target: &str, tenant: Option<&str>) -> (TcpStream, String, Vec<u8>) {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
     stream
         .set_read_timeout(Some(Duration::from_millis(200)))
@@ -513,7 +523,7 @@ fn tail_connect(port: u16, target: &str, tenant: Option<&str>) -> (TcpStream, Ve
         head_text.starts_with("HTTP/1.1 101"),
         "the tail upgrades: {head_text}"
     );
-    (stream, buf[split_at + 4..].to_vec())
+    (stream, head_text, buf[split_at + 4..].to_vec())
 }
 
 /// Every line the tail delivers within `wait`.
@@ -1295,4 +1305,159 @@ async fn two_tenants_identical_pushes_are_two_pushes() {
             "{tenant} reads each line once"
         );
     }
+}
+
+/// The server's clock, microseconds, read by a statement tagged so the
+/// T-I window never counts it.
+async fn server_now(client: &ChClient) -> String {
+    client
+        .query_strings(
+            "SELECT toString(now64(6)) AS s",
+            &QuerySettings::new().set("log_comment", "t-i-marker"),
+        )
+        .await
+        .expect("the server clock")
+        .remove(0)
+}
+
+/// Finished statements whose `log_comment` is `id`.
+async fn statements_named(client: &ChClient, id: &str) -> u64 {
+    strings(
+        client,
+        &format!(
+            "SELECT toString(count()) AS s FROM system.query_log \
+             WHERE type = 'QueryFinish' AND log_comment = '{id}'"
+        ),
+    )
+    .await[0]
+        .parse()
+        .expect("a count")
+}
+
+/// The 32-lowercase-hex `X-Pulsus-Query-Id` of `headers`, or a panic
+/// naming `what`.
+fn request_id(headers: &HashMap<String, String>, what: &str) -> String {
+    let id = headers
+        .get("x-pulsus-query-id")
+        .unwrap_or_else(|| panic!("T-I: {what}: no X-Pulsus-Query-Id"))
+        .clone();
+    assert!(
+        id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+        "T-I: {what}: {id:?}"
+    );
+    id
+}
+
+/// **T-I (issue #614): every read route and the tail name their
+/// statements.** Each of the eleven read routes, by GET and POST on both
+/// surfaces, and the tail answer with an `X-Pulsus-Query-Id`, a different
+/// one per request; each has at least one finished statement whose
+/// `log_comment` is that id; and no SELECT on this database between the
+/// first request and the last went out without one (the pool's `SELECT 1`
+/// liveness probe belongs to no request).
+#[tokio::test(flavor = "multi_thread")]
+async fn every_read_route_names_its_statements_with_the_request_id() {
+    skip_unless_live!();
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_log_tenants_it_reqid")).await;
+    live_db::build_schema(db.name()).await;
+    let _server = spawn_ready(REQUEST_ID_PORT, &db);
+    let client = client_for(db.name()).await;
+    let t0 = t0_ns();
+    push_all(REQUEST_ID_PORT, t0);
+    let from = server_now(&client).await;
+    let mut seen: Vec<(String, String)> = Vec::new();
+    for (method, path, content_type, body) in every_route(t0, "unused")
+        .into_iter()
+        .filter(|(_, path, _, _)| path != "/loki/api/v1/push" && path != "/v1/logs")
+    {
+        let what = format!("{method} {path}");
+        let res = request(
+            REQUEST_ID_PORT,
+            method,
+            &path,
+            content_type,
+            &org(Some("tenant-q")),
+            &body,
+        );
+        assert_eq!(res.status, 200, "T-I: {what}: {}", res.body);
+        let id = request_id(&res.headers, &what);
+        assert!(
+            seen.iter().all(|(_, other)| *other != id),
+            "T-I: {what} repeats an id: {id}"
+        );
+        seen.push((what, id));
+    }
+    // A line filter after `line_format` drops lines in the engine, so this
+    // read pages (`LogQlEngine::run_streams_paged`), the one statement
+    // shape the routes above do not send.
+    let paged = format!(
+        "/api/logs/v1/query_range?query={}&start={}&end={}",
+        urlencode(r#"{app="api"} | line_format "{{.app}} x" |= "api x""#),
+        t0 - MINUTE_NS,
+        t0 + 2 * MINUTE_NS
+    );
+    let res = request(
+        REQUEST_ID_PORT,
+        "GET",
+        &paged,
+        None,
+        &org(Some("tenant-q")),
+        &[],
+    );
+    assert_eq!(res.status, 200, "T-I: the paged read: {}", res.body);
+    seen.push((
+        "the paged read".to_string(),
+        request_id(&res.headers, "the paged read"),
+    ));
+    // A refused query names its request too.
+    let refused = get(
+        REQUEST_ID_PORT,
+        "/api/logs/v1/query_range?query=%7Bapp%3D",
+        Some("tenant-q"),
+    );
+    assert_eq!(
+        refused.status, 400,
+        "T-I: the refused query: {}",
+        refused.body
+    );
+    request_id(&refused.headers, "the refused query");
+    let target = format!(
+        "/api/logs/v1/tail?query={}&start={}",
+        urlencode(r#"{app="api"}"#),
+        t0 - MINUTE_NS
+    );
+    let (stream, head, _) = tail_handshake(REQUEST_ID_PORT, &target, Some("tenant-q"));
+    let headers: HashMap<String, String> = head
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let (k, v) = line.split_once(": ")?;
+            Some((k.to_ascii_lowercase(), v.to_string()))
+        })
+        .collect();
+    let tail_id = request_id(&headers, "the tail");
+    std::thread::sleep(Duration::from_secs(2));
+    drop(stream);
+    seen.push(("the tail".to_string(), tail_id));
+    let to = server_now(&client).await;
+    exec(&client, "SYSTEM FLUSH LOGS").await;
+    for (what, id) in &seen {
+        let n = statements_named(&client, id).await;
+        assert!(n >= 1, "T-I: {what}: no statement carries {id}");
+    }
+    let unnamed: u64 = strings(
+        &client,
+        &format!(
+            "SELECT toString(count()) AS s FROM system.query_log \
+             WHERE type = 'QueryFinish' AND query_kind = 'Select' AND is_initial_query \
+               AND current_database = '{db}' AND log_comment = '' AND query != 'SELECT 1' \
+               AND query_start_time_microseconds > toDateTime64('{from}', 6) \
+               AND query_start_time_microseconds < toDateTime64('{to}', 6)",
+            db = db.name()
+        ),
+    )
+    .await[0]
+        .parse()
+        .expect("a count");
+    assert_eq!(unnamed, 0, "T-I: a read went out without the request's id");
 }

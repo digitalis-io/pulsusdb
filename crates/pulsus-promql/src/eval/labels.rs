@@ -24,6 +24,8 @@ use crate::value::{InstantSample, Labels};
 /// fetch) and again per evaluation step (the eval arm recompiles; a rare
 /// rewrite, not an aggregation hot path — plan edge case 5).
 pub fn compile_label_replace_regex(regex: &str) -> Result<regex::Regex, PromqlError> {
+    #[cfg(test)]
+    LABEL_REPLACE_COMPILES.with(|c| c.set(c.get() + 1));
     let translated = re2_pattern_to_rust(regex);
     // Issue #291: through the shared compile budget, on the EXACT string
     // that gets compiled — upstream's `^(?s:…)$` wrapper, not the
@@ -33,6 +35,18 @@ pub fn compile_label_replace_regex(regex: &str) -> Result<regex::Regex, PromqlEr
             detail: format!("invalid regular expression in label_replace(): {regex}"),
         }
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Calls of [`compile_label_replace_regex`] on this thread (issue #614).
+    static LABEL_REPLACE_COMPILES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// [`compile_label_replace_regex`] calls on this thread so far.
+#[cfg(test)]
+pub(crate) fn label_replace_compiles() -> u64 {
+    LABEL_REPLACE_COMPILES.with(std::cell::Cell::get)
 }
 
 /// Upstream `model.LabelName.IsValid()` under v3.13's default UTF-8
