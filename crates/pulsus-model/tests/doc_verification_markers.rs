@@ -264,7 +264,7 @@ const MARKERS: &[Marker] = &[
     },
     Marker {
         file: "docs/features.md",
-        key: "vector-matching modifiers, semantics oracle-verified against `grafana/loki:3.4.2`",
+        key: "vector-matching modifiers, semantics verified against the reference's 3.4.2 image",
         subject: Subject::Reference,
         evidence: Evidence::FromOurTree(
             "crates/pulsus-read/tests/logqltest/corpus/differential_vector_matching.test",
