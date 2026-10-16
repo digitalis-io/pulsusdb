@@ -1235,10 +1235,10 @@ pub enum BucketGridRefusal {
     /// The selector's range is zero or negative, so no window holds a row
     /// (issue #624).
     RangeNotPositive,
-    /// The shape's grid column is not `timestamp_ns`: the sliding statement
-    /// reads lines, and the rollup's buckets have lost the timestamp that
-    /// decides which side of a window edge a line falls (issue #624).
+    /// The shape's grid column is not `timestamp_ns` (issue #624).
     RollupSource,
+    /// The rollup cannot answer this grid exactly (issue #614).
+    OffTheRollupGrid,
 }
 
 /// The anchored bucket expression: the grid point a row belongs to under a
@@ -1339,8 +1339,8 @@ pub struct SlidingCover {
 /// numerator. `hi` uses `a - range` the same way. Every symbol is computed in
 /// `i128` and rendered as `i64`.
 ///
-/// The column is always `timestamp_ns`: the statement reads lines, and the
-/// caller refuses a rollup shape before it gets here.
+/// The column is always `timestamp_ns`: a line's, or the rollup statement's
+/// point of that name (issue #614).
 ///
 /// # Refusals
 ///

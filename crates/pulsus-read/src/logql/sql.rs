@@ -2773,6 +2773,18 @@ fn service_predicate(services: &[CheckedLiteral]) -> String {
     }
 }
 
+/// Stub: tests first (issue #614, part 2).
+#[allow(unused_variables)]
+pub fn metric_range_rollup(
+    tenant: &Tenant,
+    source: MetricSource<'_>,
+    fingerprints: &[FpLiteral],
+    scan: SlidingScan,
+    res_ns: i64,
+) -> Result<String, super::predicate::BucketGridRefusal> {
+    Err(super::predicate::BucketGridRefusal::StepNotPositive)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5520,4 +5532,124 @@ mod tests {
             assert_scoped(name, sql, table);
         }
     }
+
+    /// Issue #614, part 2: the rollup statement reads each bucket as two
+    /// points, its start and its end, and refuses a grid off the buckets.
+    #[test]
+    fn the_rollup_statement_reads_each_bucket_as_two_points() {
+        use crate::logql::predicate::BucketGridRefusal;
+        use pulsus_model::Fingerprint;
+        let header = http::HeaderValue::from_static("t1");
+        let t = Tenant::from_header(Some(&header), false).expect("tenant");
+        let fps = [Fingerprint::from_raw(7).sql_literal()];
+        let scan = |grid_start_ns: i64, step_ns: i64, range_ns: i64, lower| SlidingScan {
+            window: TimeWindow {
+                start_ns: grid_start_ns - range_ns,
+                end_ns: grid_start_ns + 120_000_000_000,
+            },
+            lower,
+            grid_start_ns,
+            step_ns,
+            range_ns,
+        };
+        let ok = scan(
+            600_000_000_000,
+            15_000_000_000,
+            60_000_000_000,
+            ScanLowerBound::Exclusive,
+        );
+        let count = MetricSource::new("log_metrics_5s", MetricShape::RollupCount);
+        let bytes = MetricSource::new("log_metrics_5s", MetricShape::RollupBytes);
+        let sql = metric_range_rollup(&t, count, &fps, ok, 5_000_000_000).expect("renders");
+        assert_eq!(sql, ROLLUP_COUNT_STATEMENT.join("\n"));
+        let sql = metric_range_rollup(&t, bytes, &fps, ok, 5_000_000_000).expect("renders");
+        assert_eq!(
+            sql,
+            ROLLUP_COUNT_STATEMENT
+                .join("\n")
+                .replace("sum(lines) AS m", "sum(line_bytes) AS m")
+        );
+        let raw = MetricSource::new("log_samples", MetricShape::RawCount);
+        for (what, source, scan) in [
+            ("raw shape", raw, ok),
+            (
+                "grid start",
+                count,
+                scan(
+                    600_000_000_001,
+                    15_000_000_000,
+                    60_000_000_000,
+                    ScanLowerBound::Exclusive,
+                ),
+            ),
+            (
+                "step",
+                count,
+                scan(
+                    600_000_000_000,
+                    3_000_000_000,
+                    60_000_000_000,
+                    ScanLowerBound::Exclusive,
+                ),
+            ),
+            (
+                "range",
+                count,
+                scan(
+                    600_000_000_000,
+                    15_000_000_000,
+                    62_000_000_000,
+                    ScanLowerBound::Exclusive,
+                ),
+            ),
+            (
+                "inclusive",
+                count,
+                scan(
+                    600_000_000_000,
+                    15_000_000_000,
+                    60_000_000_000,
+                    ScanLowerBound::Inclusive,
+                ),
+            ),
+        ] {
+            assert_eq!(
+                metric_range_rollup(&t, source, &fps, scan, 5_000_000_000),
+                Err(BucketGridRefusal::OffTheRollupGrid),
+                "{what}"
+            );
+        }
+    }
+
+    const ROLLUP_COUNT_STATEMENT: &[&str] = &[
+        "SELECT fingerprint, toInt64(600000000000 + k * 15000000000) AS bucket_ns, toUInt64(v) AS n, '' AS structured_metadata",
+        "FROM (",
+        "  SELECT fingerprint, k0,",
+        "         sum(dv) OVER cum AS v, sum(dc) OVER cum AS p, leadInFrame(k0, 1, 9) OVER whole AS k1",
+        "  FROM (",
+        "    SELECT fingerprint, d.1 AS k0, sum(d.2) AS dv, sum(d.3) AS dc",
+        "    FROM (",
+        "      SELECT fingerprint,",
+        "             greatest(intDiv(timestamp_ns - 540000000000 + 14999999999, 15000000000) - 4, 0) AS lo,",
+        "             least(intDiv(timestamp_ns - 480000000000 + 14999999999, 15000000000) - 5, 8) AS hi,",
+        "             sum(lines) AS m, sum(lines) AS c",
+        "      FROM log_metrics_5s",
+        "      ARRAY JOIN [bucket_ns + 5000000000, bucket_ns] AS timestamp_ns,",
+        "                 [toInt64(count) - toInt64(count_at), toInt64(count_at)] AS lines,",
+        "                 [toInt64(bytes) - toInt64(bytes_at), toInt64(bytes_at)] AS line_bytes",
+        "      WHERE org_id = 't1' AND fingerprint IN (toUInt128('7'))",
+        "        AND bucket_ns >= 540000000000 AND bucket_ns <= 720000000000",
+        "        AND lines > 0 AND timestamp_ns > 540000000000 AND timestamp_ns <= 720000000000",
+        "      GROUP BY fingerprint, lo, hi",
+        "      HAVING lo <= hi",
+        "    )",
+        "    ARRAY JOIN [(lo, toInt64(m), toInt64(c)), (hi + 1, -toInt64(m), -toInt64(c))] AS d",
+        "    GROUP BY fingerprint, k0",
+        "  )",
+        "  WINDOW cum AS (PARTITION BY fingerprint ORDER BY k0 ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),",
+        "         whole AS (PARTITION BY fingerprint ORDER BY k0 ASC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)",
+        ")",
+        "ARRAY JOIN range(k0, least(k1, 9)) AS k",
+        "WHERE p > 0",
+    ];
 }

@@ -2187,7 +2187,8 @@ impl LogQlEngine {
                     | BucketGridRefusal::AnchorAboveScanStart
                     | BucketGridRefusal::WouldOverflow
                     | BucketGridRefusal::RangeNotPositive
-                    | BucketGridRefusal::RollupSource,
+                    | BucketGridRefusal::RollupSource
+                    | BucketGridRefusal::OffTheRollupGrid,
                 ) => {
                     // No `_` arm: a further refusal reason fails to compile
                     // here rather than falling through to a behaviour
@@ -2978,7 +2979,8 @@ impl LogQlEngine {
                             | BucketGridRefusal::AnchorAboveScanStart
                             | BucketGridRefusal::WouldOverflow
                             | BucketGridRefusal::RangeNotPositive
-                            | BucketGridRefusal::RollupSource,
+                            | BucketGridRefusal::RollupSource
+                            | BucketGridRefusal::OffTheRollupGrid,
                         ) => client_metric_read_sql(
                             &self.tenant,
                             mp,

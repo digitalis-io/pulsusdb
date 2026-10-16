@@ -2459,6 +2459,7 @@ const PREDICATE_ITEMS: &[&str] = &[
     "pub enum BucketGridRefusal :: WouldOverflow,",
     "pub enum BucketGridRefusal :: RangeNotPositive,",
     "pub enum BucketGridRefusal :: RollupSource,",
+    "pub enum BucketGridRefusal :: OffTheRollupGrid,",
     "pub fn bucket_expr(bucket_col: &'static str, lo_ns: i64, step_ns: i64, scan_start_ns: i64, scan_end_ns: i64) -> Result<CheckedFragment, BucketGridRefusal>",
     "#[derive(Debug, Clone, PartialEq, Eq)]",
     "pub struct SlidingCover",

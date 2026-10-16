@@ -115,6 +115,7 @@ pub(crate) mod post_agg;
 /// fragments through.
 pub mod predicate;
 pub(crate) mod reduce;
+pub(crate) mod rollup;
 pub mod rows;
 pub mod sql;
 pub mod template;
