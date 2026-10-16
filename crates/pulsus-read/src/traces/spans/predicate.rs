@@ -15,8 +15,8 @@
 //! intrinsics `name`, `statusMessage`, `span:id`, `span:parentID`,
 //! `trace:id`, `instrumentation:name`, `instrumentation:version`,
 //! `duration`, `status` and `kind`, resource attributes, and
-//! `resource.service.name` — its string from the span row, every other arm
-//! from the resource row ([`field_terms`]); event and link attributes, the
+//! `resource.service.name` — its string from the span row and no other arm
+//! (issue #602 part 1) ([`field_terms`]); event and link attributes, the
 //! four event and link intrinsics and the unscoped `.k` — as sets, any
 //! element, `!=` every element ([`Compiler::set_compare`]); event, link and
 //! unscoped operands inside arithmetic and opposite any side, over every
@@ -1115,9 +1115,10 @@ impl<'a> Compiler<'a> {
         self.scoped_exists(scope, key, false)
     }
 
-    /// `X_resource` at `service.name` in the chain: a string is compared on
-    /// the span row, gated on its arm, OR in the resource row; every other
-    /// operand in the resource row alone. A negation goes outside both.
+    /// `X_resource` at `service.name` in the chain: a string literal is
+    /// compared on the span row, gated on its arm; a non-string literal is
+    /// `false`, or `true` under a negation. The resource row is never read
+    /// (issue #602 part 1). A negation goes outside the gate.
     fn service_name_in_chain(
         &mut self,
         op: ComparisonOp,
@@ -2101,7 +2102,8 @@ impl<'a> Compiler<'a> {
     /// `SC(k)` never answers.
     ///
     /// The resource value is bound to `resource_var`: `r<n>` for part 3d's
-    /// two lone fields, `cr<k>` for part 3e's occurrence `k`.
+    /// two lone fields, `cr<k>` for part 3e's occurrence `k`. At
+    /// `service.name` there is no resource value and nothing is bound.
     fn chain_set(
         &mut self,
         key: &str,
@@ -2810,7 +2812,8 @@ const ELEMENT_READS: [Read; 8] = [
 /// One set operand of the part-3d design's section 5.1.
 ///
 /// `array` is `S`, iterated by `var`, `e<n>`; `arms` are the element's
-/// typed reads, with a chain's resource value in `binds`; `count` is
+/// typed reads, with a chain's resource value in `binds` (none at
+/// `service.name`, which is read from the span row alone); `count` is
 /// `|S|` and `lists` its elements by type (section 5.3); `chain` is a
 /// chain's variable `c<n>` and `C(k)`; `presence` the chain's own
 /// `notEmpty(c<n>)`. An event, link or intrinsic set has no presence: an
