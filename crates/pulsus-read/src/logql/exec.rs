@@ -386,6 +386,9 @@ pub struct KeyRouteTestHooks {
 pub struct AggCapOverrides {
     pub group_bytes: Option<u64>,
     pub result_points: Option<u64>,
+    /// The retained-window point cap, so a live test can trip it on a few
+    /// thousand samples rather than the four million the default takes.
+    pub retention_points: Option<u64>,
 }
 
 impl LogQlEngine {
@@ -450,6 +453,9 @@ impl LogQlEngine {
         AggCaps {
             group_bytes: o.group_bytes.unwrap_or(AggCaps::DEFAULT.group_bytes),
             result_points: o.result_points.unwrap_or(AggCaps::DEFAULT.result_points),
+            retention_points: o
+                .retention_points
+                .unwrap_or(AggCaps::DEFAULT.retention_points),
             ..AggCaps::DEFAULT
         }
     }
