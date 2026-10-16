@@ -16,7 +16,7 @@ SELECT m.trace_id AS trace_id, t.root_service AS root_service, t.root_name AS ro
        m.last AS last, m.matched AS matched, m.spans AS spans
 FROM (SELECT trace_id, max(start_ns) AS last, count() AS matched,
              arraySlice(arraySort(x -> (x.2, x.1),
-                        groupArray((span_id, start_ns, duration_ns, service, arrayFilter(x -> x.1 != 0, [multiIf((service_type = 'string' AND service = 'checkout'), (1, if(length(toString(service)) <= 8192, toString(service), substringUTF8(toString(service), 1, 2048)), 'String'), (0, '', ''))])))), 1, 3) AS spans
+                        groupArray((span_id, start_ns, duration_ns, service, arrayFilter(x -> x.1 != 0, [multiIf(((service_type = 'string' AND service = 'checkout')) AND service_type = 'string', (1, if(length(toString(service)) <= 8192, toString(service), substringUTF8(toString(service), 1, 2048)), 'String'), (0, '', ''))])))), 1, 3) AS spans
       FROM spans
       WHERE (intDiv(start_ns, 300000000000), trace_id) IN
             (SELECT arrayJoin(arrayFlatten(arrayMap((t, ks) -> arrayMap(k -> (k, t), ks), top.1, top.2))))

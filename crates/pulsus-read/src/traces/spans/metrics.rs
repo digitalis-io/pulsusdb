@@ -39,7 +39,10 @@ use crate::traces::window_sql::WindowSql;
 
 use super::attr_index::{IndexedAttr, index_hints};
 use super::numbering::numbering_sql;
-use super::predicate::{PredicateCtx, attr_path, compile_span_predicate_in, resource_value_in};
+use super::predicate::{
+    HELD, PredicateCtx, any_element_held, attr_path, compile_span_predicate_in, first_element,
+    resource_value_in, scope_value,
+};
 use super::tracelevel::{TraceLeaf, per_trace_sql, trace_values_sql};
 
 /// The `throwIf` message of the series cap. The engine turns a `Code: 395`
@@ -431,7 +434,7 @@ impl Read {
                 )
             }
             Target::Attribute(Field::Attribute { scope, key }) => {
-                let a = value_read(*scope, key, &ctx).ok()?;
+                let a = scope_value(*scope, key, &ctx).ok()?;
                 (
                     Some(format!(
                         "if(dynamicType({a}) = 'Int64', toFloat64(dynamicElement({a}, 'Int64')), \
@@ -489,24 +492,7 @@ fn dynamic_key(x: &str, missing: char) -> String {
     format!(
         "(toString({x}), multiIf(dynamicType({x}) = 'Int64', 'i', dynamicType({x}) = 'Float64', \
          'd', dynamicType({x}) = 'Bool', 'b', dynamicType({x}) = 'String', 's', \
-         dynamicType({x}) = 'None', '{missing}', 'a'))"
-    )
-}
-
-/// The first element of an event's or link's attribute `key` that holds
-/// it.
-fn first_element(root: &str, key: &str) -> String {
-    format!(
-        "arrayFirst(x -> dynamicType(x) != 'None', {})",
-        attr_path(root, key)
-    )
-}
-
-/// Whether an element of an event's or link's attribute `key` holds it.
-fn any_element(root: &str, key: &str) -> String {
-    format!(
-        "arrayExists(x -> dynamicType(x) != 'None', {})",
-        attr_path(root, key)
+         NOT (dynamicType({x}) {HELD}), '{missing}', 'a'))"
     )
 }
 
@@ -520,31 +506,6 @@ fn well_known(scope: AttrScope, key: &str) -> bool {
         AttrScope::Unscoped => resource || span,
         AttrScope::Instrumentation | AttrScope::Event | AttrScope::Link => false,
     }
-}
-
-/// An attribute target's `Dynamic` read in `scope` (section 3): the first
-/// scope holding it, for an unscoped key.
-fn value_read(scope: AttrScope, key: &str, ctx: &PredicateCtx<'_>) -> Result<String, PlanError> {
-    Ok(match scope {
-        AttrScope::Span => attr_path("attrs", key),
-        AttrScope::Resource => resource_value_in(key, ctx)?,
-        AttrScope::Instrumentation => attr_path("scope_attrs", key),
-        AttrScope::Event => first_element("events.attrs", key),
-        AttrScope::Link => first_element("links.attrs", key),
-        AttrScope::Unscoped => {
-            let span = attr_path("attrs", key);
-            let resource = resource_value_in(key, ctx)?;
-            format!(
-                "multiIf(dynamicType({span}) != 'None', {span}, dynamicType({resource}) != 'None', \
-                 {resource}, {}, {}, {}, {}, {})",
-                any_element("events.attrs", key),
-                first_element("events.attrs", key),
-                any_element("links.attrs", key),
-                first_element("links.attrs", key),
-                attr_path("scope_attrs", key)
-            )
-        }
-    })
 }
 
 /// A key's `(text, type)` (section 3's table), and the joins it reads.
@@ -570,17 +531,17 @@ fn key_text(field: &Field, ctx: &PredicateCtx<'_>, joins: &mut Joins) -> Result<
                     } else {
                         let resource = resource_value_in(key, ctx)?;
                         format!(
-                            "dynamicType({resource}) != 'None', {}",
+                            "dynamicType({resource}) {HELD}, {}",
                             dynamic_key(&resource, missing)
                         )
                     };
                     format!(
-                        "multiIf(dynamicType({span}) != 'None', {}, {resource_arm}, {}, {}, {}, \
+                        "multiIf(dynamicType({span}) {HELD}, {}, {resource_arm}, {}, {}, {}, \
                          {}, {})",
                         dynamic_key(&span, missing),
-                        any_element("events.attrs", key),
+                        any_element_held("events.attrs", key),
                         dynamic_key(&first_element("events.attrs", key), missing),
-                        any_element("links.attrs", key),
+                        any_element_held("links.attrs", key),
                         dynamic_key(&first_element("links.attrs", key), missing),
                         dynamic_key(&attr_path("scope_attrs", key), missing)
                     )

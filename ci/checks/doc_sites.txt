@@ -85,9 +85,13 @@ rewrite docs/schemas.md:691-692 refs=#556
 # Issue #594 part 5 adds #594, its own issue, where the same paragraph says
 # a filter on a trace-level field, a child count or the numbering takes
 # that statement.
+# Issue #602 part 1 adds #602, its own issue, and #592, where the pipeline
+# stages paragraph says which stages the search statement compiles; #492 is
+# carried: the same paragraph already cited it for the phase-1 `HAVING`,
+# and was rewritten around it, so the rule reads the line as added.
 # Issue #653 adds #653, its own issue, where the tenancy section says logs
 # are tenant-scoped beside metrics.
-rewrite docs/architecture.md:378-378 refs=#560,#549,#579,#635,#544,#624,#596,#507,#594,#653
+rewrite docs/architecture.md:378-378 refs=#560,#549,#579,#635,#544,#624,#596,#507,#594,#602,#592,#492,#653
 rewrite docs/116.md:64-64
 rewrite docs/116.md:75-75
 rewrite crates/pulsus-clickhouse/src/client.rs:156-164 refs=#560

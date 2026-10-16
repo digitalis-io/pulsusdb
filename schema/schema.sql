@@ -958,8 +958,8 @@ FROM
         trace_id,
         min(start_ns) AS s,
         max(toInt64(least(toUInt64(start_ns) + toUInt64(duration_ns), 9223372036854775807))) AS e,
-        min((toUInt8(parent_span_id != toFixedString('', 8)), start_ns, span_id, toString(service), toString(name))) AS r,
-        groupUniqArray(toString(service)) AS sv,
+        min((toUInt8(parent_span_id != toFixedString('', 8)), start_ns, span_id, if(service_type = 'string', toString(service), ''), toString(name))) AS r,
+        groupUniqArrayIf(toString(service), service_type = 'string') AS sv,
         max(start_ns) AS ls,
         groupUniqArray(4096)(intDiv(start_ns, 300000000000)) AS bk
     FROM {{db}}.trace_landing

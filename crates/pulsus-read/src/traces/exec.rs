@@ -2308,10 +2308,10 @@ impl TraceEngine {
         }
         let mut budget = ByteBudget::new(HYDRATION_BYTE_BUDGET);
         let mut charged = 0usize;
-        // Issue #592 part 2: a grouped statement runs today's distinct-group
-        // preflight first, and its decode counts the groups it returns.
+        // Issue #592 part 2: a grouped statement's decode counts the
+        // groups it returns against the series cap. Issue #602 part 1: no
+        // preflight runs first, so the search is one statement.
         if let Some(grouping) = stmt.grouping() {
-            self.enforce_search_series_cap(plan).await?;
             let rows = match self
                 .collect_rows_charged::<SearchGroupedRow, _>(
                     stmt.sql(),
