@@ -47,7 +47,7 @@ rewrite docs/schemas.md:33-33
 # Issue #653 adds #653, its own issue, where the log DDL, the two key
 # bullets and the read statements carry the tenant. `finding #4` and #171
 # are carried on the two key bullets it rewrote.
-rewrite docs/schemas.md:174-174 refs=#25,#559,#560,#603,#16,#171,#498,#2,#57,#584,#586,#587,#5,#63,#75,#478,#555,#26,#623,#125,#315,#472,#549,#7,#579,#635,#500,#172,#183,#593,#235,#3,#450,#624,#412,#596,#59,#173,#182,#185,#189,#192,#252,#398,#594,#653,#4
+rewrite docs/schemas.md:174-174 refs=#25,#559,#560,#603,#16,#171,#498,#2,#57,#584,#586,#587,#5,#63,#75,#478,#555,#26,#623,#125,#315,#472,#549,#7,#579,#635,#500,#172,#183,#593,#235,#3,#450,#624,#412,#596,#59,#173,#182,#185,#189,#192,#252,#398,#594,#653,#4,#614
 # `refs=#112` is a NEW reference on this file rather than a carried one. §2.4's
 # writer-contract paragraph gained the reason the read path does not route on
 # `metric_series.value_type`, and that reason is the decision A1's plan v5
@@ -91,7 +91,7 @@ rewrite docs/schemas.md:691-692 refs=#556
 # and was rewritten around it, so the rule reads the line as added.
 # Issue #653 adds #653, its own issue, where the tenancy section says logs
 # are tenant-scoped beside metrics.
-rewrite docs/architecture.md:378-378 refs=#560,#549,#579,#635,#544,#624,#596,#507,#594,#602,#592,#492,#653
+rewrite docs/architecture.md:378-378 refs=#560,#549,#579,#635,#544,#624,#596,#507,#594,#602,#592,#492,#653,#614
 rewrite docs/116.md:64-64
 rewrite docs/116.md:75-75
 rewrite crates/pulsus-clickhouse/src/client.rs:156-164 refs=#560
@@ -109,7 +109,7 @@ rewrite docs/decisions/0006-log-pattern-extraction.md:52-62 refs=#603
 # statement's route and its tests assert it; and #544, carried: the comments
 # beside the lowered structured-metadata filter that already cited it were
 # rewritten when that filter's range read moved into the database.
-rewrite crates/pulsus-read/src/logql/plan.rs:5573-5581 refs=#507,#544,#624
+rewrite crates/pulsus-read/src/logql/plan.rs:5573-5581 refs=#507,#544,#624,#12,#614
 leave docs/116.md:76-76
 leave docs/traceql-schema-migration.md:2289-2289
 # #478 and #555 join this column for the same reason as `docs/schemas.md`'s:
