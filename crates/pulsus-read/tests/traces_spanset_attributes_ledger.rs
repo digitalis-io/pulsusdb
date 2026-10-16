@@ -467,7 +467,9 @@ fn the_api_section_states_the_measured_rules_and_not_the_retired_ones() {
         // which no test on either branch could see: reverting either one
         // to main's paragraph passed a full hermetic workspace run
         "The pipeline is one ordered fold, and every stage's written position decides what it sees",
-        "The backstop counts the ACCUMULATED key tuple",
+        // Issue #602 part 2b: the search statement's cap, the previous
+        // engine's backstop gone from the route.
+        "The cap counts the ACCUMULATED key tuple",
         // the aggregate attribute
         "Every aggregate stage contributes one `attributes` entry too",
         "The entry is per STAGE, not per aggregate",
@@ -485,7 +487,7 @@ fn the_api_section_states_the_measured_rules_and_not_the_retired_ones() {
         // §4.6's cap paragraph. Asserting §4.2 for that one would move a
         // sentence away from the rule it belongs to just to satisfy a
         // check.
-        if stated != "The backstop counts the ACCUMULATED key tuple" {
+        if stated != "The cap counts the ACCUMULATED key tuple" {
             assert_eq!(
                 count(&section, stated),
                 1,

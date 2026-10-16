@@ -409,7 +409,7 @@ not appear in it at all, so there is nothing there to change.
 
 ### 5.3 Broad searches read the newest slice first
 
-A sliceable search (`server-implementation.md` §3.5 says which) runs the §5.2
+A search over a window longer than 5 minutes (`server-implementation.md` §3.5) runs the §5.2
 statement with its top-K bounded to the newest slice of the window. Against §5.2's statement for the same window,
 exactly three things differ: the top-K's three window clauses name the slice; a
 second scalar `tb` is added, each chosen trace's buckets in the window read from
@@ -844,6 +844,17 @@ form the compiler emits for a search — it carries the spanset projection and t
 per-trace header — and runs in **396 ms** against `st10`'s 994, because it
 climbs from the B spans only and reads each candidate trace once more, rather
 than materialising the pair set.
+
+**Sliced, a structural search reads only its candidates' keys** (issue #602
+part 2b). The OR of its filters picks the newest slice's candidates, and every
+relation, `&&` and climb inside the membership reads only the
+`(intDiv(start_ns, 300000000000), trace_id)` keys those candidates hold in the
+window (§5.3), so a trace's membership is decided over all its spans in the
+window. Unsliced, the whole-window statement reads the window. On g1 at
+`limit = 20`, `{ status = error } << { }` is answered by its first slice in one
+statement reading 2,875,068 rows at a 26.7 MiB peak; the same climb over the
+whole window reads 68,017,801 rows, because it re-reads its traces' spans at
+every parent link.
 
 **The literal answers of all fifteen forms on the worked fixture** are produced
 by `measure/fixture/structural_answers.py` and committed at

@@ -3476,6 +3476,10 @@ when we are asking it to slow down, so we keep `429`; recorded as
 
 ### `traceql-pushed-aggregate-reaches-older-traces` (issue #492 part 4) — **a spanset aggregate compiled into the generator changes which traces a truncated search returns, and whether it says it was truncated**
 
+- **No request reaches this since issue #602 part 2b**: the route's only engine is the search
+  statement, which has no generator. The entry describes the previous search engine, which part 2c
+  deletes.
+
 - **Route.** `GET /api/traces/v1/search` (and its `/api/search` alias), for a
   query whose pipeline is a single spanset aggregate — `min(duration)`,
   `max(duration)` or `count()` — over a selector that is exactly one
@@ -3672,6 +3676,10 @@ when we are asking it to slow down, so we keep `429`; recorded as
   §2.7 (the clause table).
 
 ### `traceql-pushed-aggregate-generator-memory` (issue #492 part 4) — **the pushdown enlarges the phase-1 grouping state, so the ceiling that already bounds it bites on smaller selectors**
+
+- **No request reaches this since issue #602 part 2b**: the route's only engine is the search
+  statement, which has no generator. The entry describes the previous search engine, which part 2c
+  deletes.
 
 - **Route.** `GET /api/traces/v1/search` (and its `/api/search` alias), same
   shape as the row above.
@@ -3997,3 +4005,20 @@ Applies to the span-scope predicate compiler (`crates/pulsus-read/src/traces/spa
   has no such limit.
 
 Read from the reference's source, not measured against it.
+
+### `traceql-search-statement-refusals` (issue #602 part 2b) — **three query shapes the previous engine answered are now `400`, and one refusal reads differently**
+
+Applies to `GET /api/traces/v1/search` and its alias, which plan with the search statement's compiler alone
+since issue #602 part 2b.
+
+- **`{ !-.a }` and `{ -!.a }`** answer `400 type mismatch: an arithmetic expression is not a predicate`. The
+  previous engine answered `200`.
+- **A comparison holding one event, link or unscoped field twice beside arithmetic** — `{ .k + 1 > .k }`,
+  `{ event.k * event.k > 5 }`, `{ link.lk - link.lk != 0 }` — answers `400 unsupported field: projecting .k
+  from two occurrences of an event, link or unscoped field in one comparison is not supported by the search
+  statement`, naming its own field. The previous engine answered `200`.
+- **`{ !instrumentation:name }` and `{ !instrumentation:version }`** stay `400`; the text is now
+  `type mismatch: expression (!instrumentation:name) expected a boolean`, where it was `type mismatch:
+  existence checks are only supported on attributes`.
+
+Measured by planning every search query of the acceptance surface and the census grid with both planners.
