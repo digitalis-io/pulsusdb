@@ -3145,32 +3145,25 @@ fn metric_plan(
     } else {
         (step_ns, grid_start_ns)
     };
-    // A line filter constrains which log lines count; the rollup table
-    // (`log_metrics_<res>`) has no `body` column to re-filter, so any
-    // pipeline stage forces the raw fallback (docs/schemas.md §3.2: metric
-    // reads "never touch samples for count-only rollup shapes" — that
-    // guarantee only holds when there is nothing left for `log_samples` to
-    // filter).
+    // Any pipeline stage forces the raw route: the rollup table
+    // (`log_metrics_<res>`) has no `body` to re-filter and no
+    // `structured_metadata`. A plan whose `client` is set is client-
+    // aggregated and always raw, under its own named reason (issue M6-10).
     //
-    // Rollup eligibility is additionally gated on `client.is_none()`
-    // (issue M6-10, removing the former guard-comment TODO): every
-    // non-count op and every beyond-line-filter pipeline is client-
-    // aggregated, always routed raw with its own named reason — the
-    // rollup table can neither re-filter bodies nor produce unwrapped
-    // values. `client.is_none()` count/bytes ops keep the pre-M6-10
-    // routing and reasons byte-identically (the perf regression gate).
-    // `Instant` is matched *first*, ahead of the line-filter/resolution
-    // checks below: an instant window ([at - range, at]) has no step to
-    // test against the resolution regardless of what else is true about
-    // the query, so its reason must always be exactly "raw: instant query"
-    // — never shadowed by an unrelated raw-fallback reason an instant query
-    // also happens to satisfy (code review fix, issue #12: an instant query
-    // that also carries a line filter, or runs with `rollup_res_ns == 0`,
-    // must still report "raw: instant query", not "raw: line filter
-    // present"/"raw: rollup resolution not configured"). schemas.md §3.2
-    // ties eligibility strictly to "the query step is a multiple of the
-    // resolution", and an unaligned window would silently diverge from raw
-    // at bucket edges (task-manager resolution #1 on issue #12).
+    // A range read reaches the rollup only through
+    // [`super::rollup::rollup_route`] (issue #614), whose rule is exactness:
+    // every range plan that reaches the last `match` below has `client`
+    // set, so that match's range arms are unreachable. Why the buckets
+    // answer exactly is `sql::metric_range_rollup`'s doc, and which
+    // shapes they answer is `rollup_route`'s.
+    //
+    // `Instant` is matched *first* in that `match`, ahead of the
+    // line-filter/resolution checks: an instant query's reason must always
+    // be exactly "raw: instant query", never shadowed by another raw reason
+    // it also satisfies (code review fix, issue #12: an instant query that
+    // also carries a line filter, or runs with `rollup_res_ns == 0`, must
+    // still report "raw: instant query", not "raw: line filter present" or
+    // "raw: rollup resolution not configured").
     let routing = if force_client {
         RoutingDecision {
             chosen: RouteChoice::Raw,
@@ -3194,15 +3187,22 @@ fn metric_plan(
             chosen: RouteChoice::Raw,
             reason: "raw: unwrapped range aggregation in the database (issue #624)".to_string(),
         }
+    } else if let Some(reason) = super::rollup::rollup_route(
+        *op,
+        pipeline,
+        &vector_aggs,
+        bucketed_range && is_range && reduced.is_none() && !staged && !empty_domain,
+        ctx.rollup_res_ns,
+        (grid_start_ns, step_ns, range_ns.get(), scan_lower),
+    ) {
+        RoutingDecision {
+            chosen: RouteChoice::Rollup,
+            reason,
+        }
     } else if bucketed_range {
-        // Issue #507 (W2). RAW, not rollup, and the choice is forced
-        // rather than preferred: the rollup table has no
-        // `structured_metadata` column, which is part of the output
-        // series identity on this path, and its 5 s buckets cannot
-        // express a window that is open below and closed above. Without
-        // this branch a bucketed plan would fall into the rollup
-        // eligibility test below, whose only input is whether the step
-        // divides the resolution.
+        // Issue #507 (W2). RAW: the rollup has no `structured_metadata`,
+        // which is part of the output series identity unless
+        // `rollup_route` admitted the plan above (issue #614).
         //
         // Issue #624: named by the statement that runs — #507's when the
         // range equals the step, the sliding statement otherwise.
@@ -6069,22 +6069,22 @@ mod tests {
     /// Every plan shape this crate can actually produce carries a renderable
     /// column pair.
     ///
-    /// **Both reachable routes are covered, and the third is unreachable by
-    /// construction, not by omission:** no plan shape reaches
-    /// `RouteChoice::Rollup` — and with it `MetricShape::Rollup*` — today.
-    /// The reason is not one rule but three, and the first of them used to
-    /// be stated here alone, which was stale: issue #227 retired the range
-    /// rollup fast path, and issues #507 and #624 then added two branches
-    /// that take their own forced-raw route BEFORE the rollup eligibility
-    /// test is reached — a bucketed range and a reduced one. Each clears `client` and returns `RouteChoice::Raw` regardless of
-    /// whether the step divides the resolution. `sql.rs`'s `metric_range`
-    /// records the same unreachability. The rollup half of the inverse is
-    /// covered by
+    /// Every route is covered: the raw range, the raw instant and, since
+    /// issue #614, the rollup range, whose shapes are the rollup ones.
+    /// The inverse is covered by
     /// `sql::tests::metric_shape_round_trips_through_from_columns_for_every_variant`,
     /// which iterates `MetricShape::ALL`.
     #[test]
     fn source_shape_is_total_for_every_plan_metric_plan_builds() {
         for (query, spec) in [
+            (
+                r#"sum(bytes_rate({env="prod"}[5m]))"#,
+                QuerySpec::Range {
+                    start_ns: 0,
+                    end_ns: 1_000_000_000_000,
+                    step_ns: 60_000_000_000,
+                },
+            ),
             (
                 r#"rate({env="prod"}[5m])"#,
                 QuerySpec::Range {
@@ -6144,14 +6144,14 @@ mod tests {
 
     /// Issue #425: changing the DERIVED `step` selects no storage path.
     ///
-    /// `metric_plan` forces `client = Some(..)` for every `QuerySpec::Range`
-    /// (`|| is_range`), and the `client.is_some()` arm of the routing match
-    /// is taken before `p.spec` is inspected — so the one place `step_ns`
-    /// could influence a route (`step_ns.is_multiple_of(ctx.rollup_res_ns)`)
-    /// is unreachable for a range query. This is the mechanical form of
-    /// that claim: two plans differing ONLY in the step agree on the route,
-    /// the reason string and the table. It fails if that rollup arm ever
-    /// becomes reachable for a range.
+    /// A range aggregation with no parent `sum` never reads the rollup
+    /// (`rollup::rollup_route`, issue #614), so the step decides no storage
+    /// path for it: two plans differing ONLY in the step agree on the route,
+    /// the reason string and the table. It fails if the step ever selects a
+    /// table for such a query. The rollup route itself does test the step,
+    /// against the rollup resolution, and only under a parent `sum`;
+    /// that rule's own cases are in `rollup::tests` (issue #614,
+    /// part 2).
     ///
     /// The two steps are the old derived value for a 501 s window
     /// (`2.004 s`, not a multiple of the 5 s rollup resolution) and the new
@@ -9488,7 +9488,7 @@ mod tests {
         );
         // A vector aggregation is finished over the returned series and
         // does not block the leaf.
-        lowers(r#"sum(count_over_time({a="b"}[1m]))"#);
+        // Its `sum` reads the rollup on this grid: `rollup::tests` (issue #614).
 
         // Issue #624: a range WIDER or SHORTER than the step lowers too, to
         // the sliding statement, which gives an entry every window that

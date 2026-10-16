@@ -3607,3 +3607,50 @@ async fn a_window_inside_one_day_prunes_the_other_days_part() {
     assert_eq!(got, 60, "the hour's rows");
     drop_database(&client, db).await;
 }
+
+/// Issue #614, part 2: the unscoped stream-discovery read selects the
+/// granules of its window, not of the day. 600 streams, a rollup row every
+/// 30 s for a day, one merged part: the window holds 18,000 rows (3 granules
+/// of 8,192), the day 1,728,000 (211 granules).
+#[tokio::test]
+async fn an_unscoped_discovery_read_selects_only_its_windows_granules() {
+    skip_unless_live!();
+    let db = &pulsus_testkit::test_db("pulsus_read_it_discovery_window");
+    let admin = ChClient::new(test_config()).await.expect("connect");
+    drop_database(&admin, db).await;
+    run_init(&admin, &test_ctx(db)).await.expect("run_init");
+    let day = now_ns().div_euclid(86_400_000_000_000) * 86_400_000_000_000 - 86_400_000_000_000;
+    for sql in [
+        format!(
+            "INSERT INTO {db}.log_metrics_5s (org_id, fingerprint, bucket_ns, count, bytes) \
+             SELECT '', toUInt128(cityHash64(number % 600)), {day} + intDiv(number, 600) * 30000000000, 1, 1 \
+             FROM numbers(600 * 2880)"
+        ),
+        format!("OPTIMIZE TABLE {db}.log_metrics_5s FINAL"),
+    ] {
+        admin
+            .execute(
+                &sql,
+                &QuerySettings::new(),
+                pulsus_clickhouse::Idempotency::Idempotent,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    }
+    let start_ns = day + 43_200_000_000_000;
+    let end_ns = start_ns + 900_000_000_000 - 1;
+    let statement = sql::active_fingerprints(
+        &pulsus_model::Tenant::from_header(None, false).expect("the empty tenant"),
+        &format!("{db}.log_metrics_5s"),
+        None,
+        TimeWindow { start_ns, end_ns },
+        ROLLUP_RES_NS,
+    );
+    let raw = explain_raw(&admin, &statement).await;
+    let granules = last_granules(&raw);
+    drop_database(&admin, db).await;
+    assert!(
+        matches!(granules, Some((1..=4, 211..))),
+        "granules {granules:?}\n{raw}"
+    );
+}

@@ -2999,6 +2999,8 @@ mod tests {
             ("template/value.rs", include_str!("template/value.rs")),
             // Issue #624, part 4: the lowered `| unwrap` reducers' fold.
             ("reduce.rs", include_str!("reduce.rs")),
+            // Issue #614, part 2: the rollup route.
+            ("rollup.rs", include_str!("rollup.rs")),
         ];
         assert_source_set_matches_the_directory(SOURCES);
         SOURCES

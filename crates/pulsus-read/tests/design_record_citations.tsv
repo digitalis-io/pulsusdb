@@ -240,10 +240,10 @@ docs/query-to-sql.md	labels.rs:66	crates/pulsus-read/src/logql/labels.rs	66		pro
 docs/query-to-sql.md	logql/charge.rs:1326	crates/pulsus-read/src/logql/charge.rs	1326		line	MAX_STREAMS_RESULT_BYTES	pub const MAX_STREAMS_RESULT_BYTES: u64 = 1024 * 1024 * 1024;
 docs/query-to-sql.md	logql/error.rs:819-825	crates/pulsus-read/src/logql/error.rs	819	825	prose	aggregation	400
 docs/query-to-sql.md	logql/error.rs:826-829	crates/pulsus-read/src/logql/error.rs	826	829	prose	intentionally	pipeline
-docs/query-to-sql.md	logql/exec.rs:1928	crates/pulsus-read/src/logql/exec.rs	1928		line	rate_after_sum	let series = match rate_after_sum(mp) {
-docs/query-to-sql.md	logql/exec.rs:2160	crates/pulsus-read/src/logql/exec.rs	2160		line	one_point_answer	apply_leaf_aggs(mp, one_point_answer(mp, result), 0)
-docs/query-to-sql.md	logql/exec.rs:2541	crates/pulsus-read/src/logql/exec.rs	2541		line	apply_leaf_aggs	apply_leaf_aggs(mp, result, folded)
-docs/query-to-sql.md	logql/exec.rs:2729	crates/pulsus-read/src/logql/exec.rs	2729		prose	apply_vector_aggs	vector_aggs
+docs/query-to-sql.md	logql/exec.rs:1934	crates/pulsus-read/src/logql/exec.rs	1934		line	rate_after_sum	let series = match rate_after_sum(mp) {
+docs/query-to-sql.md	logql/exec.rs:2167	crates/pulsus-read/src/logql/exec.rs	2167		line	one_point_answer	apply_leaf_aggs(mp, one_point_answer(mp, result), 0)
+docs/query-to-sql.md	logql/exec.rs:2580	crates/pulsus-read/src/logql/exec.rs	2580		line	apply_leaf_aggs	apply_leaf_aggs(mp, result, folded)
+docs/query-to-sql.md	logql/exec.rs:2768	crates/pulsus-read/src/logql/exec.rs	2768		prose	apply_vector_aggs	vector_aggs
 docs/query-to-sql.md	logql/fold.rs:543	crates/pulsus-read/src/logql/fold.rs	543		line	SelectFold	pub(in crate::logql) struct SelectFold {
 docs/query-to-sql.md	logql/params.rs:124	crates/pulsus-read/src/logql/params.rs	124		line	DEFAULT_MAX_STREAMS	pub const DEFAULT_MAX_STREAMS: usize = 100_000;
 docs/query-to-sql.md	logql/pipeline.rs:1354	crates/pulsus-read/src/logql/pipeline.rs	1354		line	PipelineError	pub fn compile(stages: &[Stage]) -> Result<Self, PipelineError> {
@@ -299,7 +299,8 @@ docs/query-to-sql.md	plan.rs:2888-2893	crates/pulsus-read/src/logql/plan.rs	2888
 docs/query-to-sql.md	plan.rs:2890	crates/pulsus-read/src/logql/plan.rs	2890		prose	has_unwrap	has_unwrap
 docs/query-to-sql.md	plan.rs:2893	crates/pulsus-read/src/logql/plan.rs	2893		prose	has_grouping	has_grouping
 docs/query-to-sql.md	plan.rs:3084	crates/pulsus-read/src/logql/plan.rs	3084		prose	bucketed_range	bucketed_range
-docs/query-to-sql.md	plan.rs:3197	crates/pulsus-read/src/logql/plan.rs	3197		prose	bucketed_range	else if bucketed_range
+docs/query-to-sql.md	plan.rs:3190	crates/pulsus-read/src/logql/plan.rs	3190		prose	rollup_route	rollup::rollup_route
+docs/query-to-sql.md	plan.rs:3202	crates/pulsus-read/src/logql/plan.rs	3202		prose	bucketed_range	else if bucketed_range
 docs/query-to-sql.md	plan.rs:3253	crates/pulsus-read/src/logql/plan.rs	3253		prose	RouteChoice	RouteChoice::Rollup
 docs/query-to-sql.md	plan.rs:362	crates/pulsus-read/src/logql/plan.rs	362		prose	VectorAggSpec	vector_aggs
 docs/query-to-sql.md	plan.rs:4323	crates/pulsus-read/src/logql/plan.rs	4323		prose	compile_line_filters	compile_line_filters
@@ -348,11 +349,12 @@ docs/query-to-sql.md	search_sql.rs:678	crates/pulsus-read/src/traces/search_sql.
 docs/query-to-sql.md	search_sql.rs:702-704	crates/pulsus-read/src/traces/search_sql.rs	702	704	line	root_ordering_tuple	pub(crate) fn root_ordering_tuple() -> String { format!("(toUInt8(parent_id != {ZERO_PARENT_SQL}), timestamp_ns, span_id
 docs/query-to-sql.md	search_sql.rs:718	crates/pulsus-read/src/traces/search_sql.rs	718		prose	trace_ctx_sql	trace_ctx_sql
 docs/query-to-sql.md	search_sql.rs:742	crates/pulsus-read/src/traces/search_sql.rs	742		prose	child_count_sql	child_count_sql
-docs/query-to-sql.md	sql.rs:111	crates/pulsus-read/src/logql/sql.rs	111		prose	RollupBytes	sum(bytes)
+docs/query-to-sql.md	sql.rs:111	crates/pulsus-read/src/logql/sql.rs	111		prose	RollupBytes	sum
 docs/query-to-sql.md	sql.rs:1694	crates/pulsus-read/src/logql/sql.rs	1694		prose	metric_range_bucketed	metric_range_bucketed
 docs/query-to-sql.md	sql.rs:1849	crates/pulsus-read/src/logql/sql.rs	1849		prose	metric_range_sliding	metric_range_sliding
 docs/query-to-sql.md	sql.rs:2013	crates/pulsus-read/src/logql/sql.rs	2013		prose	reduced_conversion_columns	reduced_conversion_columns
 docs/query-to-sql.md	sql.rs:2429	crates/pulsus-read/src/logql/sql.rs	2429		prose	metric_range_reduced	metric_range_reduced
+docs/query-to-sql.md	sql.rs:2801	crates/pulsus-read/src/logql/sql.rs	2801		prose	metric_range_rollup	metric_range_rollup
 docs/query-to-sql.md	sql.rs:322	crates/pulsus-read/src/logql/sql.rs	322		prose	LOGFMT_DECIDED_LINE	LOGFMT_DECIDED_LINE
 docs/query-to-sql.md	sql.rs:336	crates/pulsus-read/src/logql/sql.rs	336		prose	logfmt_count_columns	logfmt_count_columns
 docs/query-to-sql.md	sql.rs:748	crates/pulsus-read/src/logql/sql.rs	748		prose	probe	probe

@@ -1305,6 +1305,14 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-read --test rollup_differential
 
+      # Issue #614, part 2: the rollup route's answers against the line
+      # count and the raw route.
+      - name: Rollup route suite
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-read --test rollup_route_live
+
       # Issue #450: every `|=`/`!=` needle generated from the suite's own
       # committed bodies must return exactly what Loki's `bytes.Contains`
       # returns. The corpus runner evaluates line filters in Rust and never

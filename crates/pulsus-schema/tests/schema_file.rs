@@ -1386,3 +1386,33 @@ fn the_log_tables_lead_with_the_tenant_in_both_forms() {
         assert!(failures.is_empty(), "{form}: {failures:#?}");
     }
 }
+
+/// Issue #614, part 2: the rollup keeps a bucket exactly as long as
+/// `log_samples` keeps the lines it counts, so a window past retention
+/// answers alike on the rollup route and the raw route.
+#[test]
+fn the_rollup_is_kept_as_long_as_the_lines_it_counts() {
+    let stmts = rendered_statements(&single());
+    let create = |table: &str| {
+        stmts
+            .iter()
+            .find(|s| s.contains(&format!("CREATE TABLE IF NOT EXISTS pulsus.{table}\n")))
+            .unwrap_or_else(|| panic!("no CREATE for {table}"))
+            .clone()
+    };
+    let ttl = |stmt: &str| {
+        stmt.lines()
+            .find(|l| l.starts_with("TTL "))
+            .map(str::to_string)
+    };
+    let samples = create("log_samples");
+    let rollup = create("log_metrics_5s");
+    assert_eq!(
+        ttl(&rollup),
+        ttl(&samples).map(|l| l.replace("timestamp_ns", "bucket_ns")),
+        "the rollup's TTL is log_samples' over bucket_ns"
+    );
+    for stmt in [&samples, &rollup] {
+        assert!(stmt.contains("ttl_only_drop_parts = 1"), "{stmt}");
+    }
+}

@@ -1434,12 +1434,12 @@ fn vector_agg_sum_by_captures_the_grouping_labels() {
     let grouping = grouping.as_ref().expect("by grouping");
     assert_eq!(grouping.kind, pulsus_logql::GroupingKind::By);
     assert_eq!(grouping.labels, vec!["service_name"]);
-    // `unwrap_vector_aggs` strips the `sum by (...)` wrapper before the
-    // routing decision is made, so a vector-agg-wrapped range agg routes
-    // identically to the bare `rate(...)` it wraps — counted in the
-    // database (issue #624).
-    assert!(!mp.rollup);
-    assert_eq!(mp.routing.reason, expected_sliding_reason());
+    // Issue #614, part 2: a `sum` on the rollup's grid reads the rollup,
+    // where the bare `rate(...)` it wraps is counted from the lines (issue
+    // #624). A `sum by` reads it only when every selected stream carries
+    // the `by` labels as stream labels, which the executor checks after
+    // hydration (`rollup::rollup_or_raw`).
+    assert!(mp.rollup && mp.routing.reason.starts_with("rollup: sum over"));
 }
 
 #[test]
