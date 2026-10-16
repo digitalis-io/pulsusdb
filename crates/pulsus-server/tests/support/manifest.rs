@@ -2840,7 +2840,7 @@ static PINNED_FUNCTION_BODIES: &[PinnedFunctionBody] = &[
     PinnedFunctionBody {
         file: "crates/pulsus-server/src/app.rs",
         function: "build_router",
-        body: "let mut authed = ops::ops_authed_router().merge(modes::mount_subsystems(Router::new(), config)); authed = compat::apply_aliases(authed, config); authed = authed.layer(middleware::timeout_layer(config)); if let Some(auth) = middleware::auth_layer(config) {authed = authed.layer(auth);} let router = ops::ops_public_router().merge(authed); let router = router.layer(middleware::trace_layer()).layer(middleware::compression_layer()).layer(middleware::cors_layer(config)?); Ok(router.with_state(state))",
+        body: "let mut authed = ops::ops_authed_router().merge(modes::mount_subsystems(Router::new(), config)); authed = compat::apply_aliases(authed, config); authed = authed.layer(middleware::timeout_layer(config)); if let Some(auth) = middleware::auth_layer(config) {authed = authed.layer(auth);} authed = authed.layer(axum::middleware::from_fn(crate::request_id::stamp)); let router = ops::ops_public_router().merge(authed); let router = router.layer(middleware::trace_layer()).layer(middleware::compression_layer()).layer(middleware::cors_layer(config)?); Ok(router.with_state(state))",
     },
     PinnedFunctionBody {
         file: "crates/pulsus-server/src/modes.rs",

@@ -111,6 +111,8 @@ const CAP_PROBE_PORT: u16 = 31_221;
 const CEILING_HIGH_PORT: u16 = 31_225;
 const CEILING_ONE_PORT: u16 = 31_226;
 const CEILING_TWO_PORT: u16 = 31_227;
+/// Issue #614: T10, every trace read names its statements.
+const REQUEST_ID_PORT: u16 = 31_265;
 
 /// Retention for the issue #474 spawn only. The fixture's timestamps are
 /// FROZEN at 2023-11-14 so its captured bytes can be committed, and the
@@ -2687,4 +2689,100 @@ async fn the_incomplete_signal_follows_the_candidate_ceiling_and_not_the_request
     drop(two);
     drop(one);
     drop(high);
+}
+
+/// Finished statements in `system.query_log` matching `cond`.
+async fn finished(client: &ChClient, cond: &str) -> u64 {
+    let mut stream = client
+        .query_stream::<SpanCountRow>(
+            &format!(
+                "SELECT count() AS n FROM system.query_log WHERE type = 'QueryFinish' AND {cond}"
+            ),
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("read query_log");
+    let mut n = 0;
+    while let Some(row) = stream.next().await {
+        n = row.expect("decode count row").n;
+    }
+    n
+}
+
+/// **T10 (issue #614): every trace read names its statements.** One span
+/// seeded now; search, tags, tag values, a metrics range and the service
+/// graph over the last ten minutes each answer `200` with an
+/// `X-Pulsus-Query-Id` of their own, at least one finished statement
+/// carries that id as `log_comment`, and exactly those statements are the
+/// ones numbered `<id>-<n>`.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_trace_read_route_names_its_statements_with_the_request_id() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse");
+        return;
+    }
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_traces_api_it_reqid")).await;
+    let _server = spawn_ready(REQUEST_ID_PORT, &db);
+    let now_s = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after 1970")
+        .as_secs();
+    ingest(
+        REQUEST_ID_PORT,
+        vec![span(
+            [0x61; 16],
+            [0x62; 8],
+            "op",
+            (now_s - 60) * 1_000_000_000,
+        )],
+        "T10 seed",
+    );
+    let (start, end) = (now_s - 600, now_s + 60);
+    let paths = [
+        format!(
+            "/api/traces/v1/search?q=%7B%20resource.service.name%20%3D%20%22checkout%22%20%7D\
+             &start={start}&end={end}"
+        ),
+        format!("/api/traces/v1/tags?start={start}&end={end}"),
+        format!("/api/traces/v1/tag/service.name/values?start={start}&end={end}"),
+        format!(
+            "/api/traces/v1/metrics/query_range?q=%7B%7D%20%7C%20rate%28%29\
+             &start={start}&end={end}&step=60s"
+        ),
+        format!("/api/traces/v1/service_graph?start={start}&end={end}"),
+    ];
+    let mut seen: Vec<(String, String)> = Vec::new();
+    for path in paths {
+        let res = get(REQUEST_ID_PORT, &path, &[], &path);
+        assert_eq!(
+            res.status,
+            200,
+            "T10: {path}: {}",
+            String::from_utf8_lossy(&res.body)
+        );
+        assert_query_id(&res, &path);
+        let id = res.headers["x-pulsus-query-id"].clone();
+        assert!(
+            seen.iter().all(|(_, o)| *o != id),
+            "T10: {path} repeats {id}"
+        );
+        seen.push((path, id));
+    }
+    let client = ChClient::new(live_db::conn_config(&db))
+        .await
+        .expect("connect");
+    client
+        .execute(
+            "SYSTEM FLUSH LOGS",
+            &QuerySettings::new(),
+            pulsus_clickhouse::Idempotency::Idempotent,
+        )
+        .await
+        .expect("flush logs");
+    for (path, id) in &seen {
+        let named = finished(&client, &format!("log_comment = '{id}'")).await;
+        let numbered = finished(&client, &format!("query_id LIKE '{id}-%'")).await;
+        assert!(named >= 1, "T10: {path}: no statement carries {id}");
+        assert_eq!(named, numbered, "T10: {path}: named and numbered differ");
+    }
 }

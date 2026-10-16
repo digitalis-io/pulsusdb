@@ -2161,9 +2161,9 @@ fn promql_sample_fetch_sql(query: &str, params: pulsus_promql::PlanParams, db: &
     )
 }
 
-/// The `(fingerprint, unix_milli)` primary key on `metric_samples` (issue
+/// The `(org_id, fingerprint, unix_milli)` key on `metric_samples` (issue
 /// #623) — the shared raw-fetch expectation both PromQL cases below assert
-/// against: the full two-column key condition plus MinMax
+/// against: the full three-column key condition plus MinMax
 /// time pruning (the `toDate(...)` partition analysis reports
 /// `Condition: true` here — time-range partition pruning surfaces through
 /// the MinMax block instead).
@@ -3334,4 +3334,276 @@ SQL:
 #[allow(dead_code)]
 fn no_tenant() -> pulsus_model::Tenant {
     pulsus_model::Tenant::from_header(None, false).expect("no header is the empty tenant")
+}
+
+// =====================================================================
+// Issue #614 — the sample tables prune on the shipped schema
+// =====================================================================
+
+const F614_DAY_MS: i64 = 86_400_000;
+/// Rows per granule in both sample tables' `CREATE`.
+const F614_GRANULE: u64 = 8_192;
+/// Series that fill one granule each: the shape of a deployment with many
+/// low-volume series, where the series ID changes at nearly every mark.
+const F614_LOW_SERIES: u64 = 100;
+/// The low series' IDs are `F614_LOW_BASE + 2 * s`.
+const F614_LOW_BASE: u128 = 1_000;
+/// One high-volume series, ten granules over the day, its ID sorting
+/// between two low series.
+const F614_HIGH_FP: u128 = 1_101;
+const F614_HIGH_ROWS: i64 = 81_920;
+
+/// 00:00 UTC yesterday, ms — inside retention and wholly in the past.
+fn f614_day0_ms() -> i64 {
+    (now_ns() / 1_000_000 / F614_DAY_MS - 1) * F614_DAY_MS
+}
+
+/// The high series' sample times: `day0 + floor(i * 86_400_000 / 81_920)`.
+fn f614_high_t(day0: i64, i: i64) -> i64 {
+    day0 + i * F614_DAY_MS / F614_HIGH_ROWS
+}
+
+/// A database with the shipped schema; returns the data client.
+async fn f614_setup(db: &str) -> ChClient {
+    let client = ChClient::new(test_config()).await.expect("connect");
+    drop_database(&client, db).await;
+    run_init(&client, &test_ctx(db)).await.expect("run_init");
+    let mut cfg = test_config();
+    cfg.database = db.to_string();
+    ChClient::new(cfg).await.expect("connect (data client)")
+}
+
+async fn f614_exec(client: &ChClient, sql: &str) {
+    client
+        .execute(sql, &QuerySettings::new(), Idempotency::NonIdempotent)
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+}
+
+async fn f614_number(client: &ChClient, sql: &str) -> u64 {
+    #[derive(Row, serde::Serialize, serde::Deserialize)]
+    struct N {
+        n: u64,
+    }
+    let mut stream = client
+        .query_stream::<N>(sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    stream
+        .next()
+        .await
+        .expect("one row")
+        .unwrap_or_else(|e| panic!("{e}\n{sql}"))
+        .n
+}
+
+/// The low series and the high series into `table`, merged to one part.
+async fn f614_seed(client: &ChClient, table: &str, day0: i64) {
+    let step = F614_DAY_MS / F614_GRANULE as i64;
+    f614_exec(
+        client,
+        &format!(
+            "INSERT INTO {table} (org_id, fingerprint, unix_milli) \
+             SELECT '', toUInt128({F614_LOW_BASE} + 2 * intDiv(number, {F614_GRANULE})), \
+                    {day0} + (number % {F614_GRANULE}) * {step} \
+             FROM numbers({})",
+            F614_LOW_SERIES * F614_GRANULE
+        ),
+    )
+    .await;
+    f614_exec(
+        client,
+        &format!(
+            "INSERT INTO {table} (org_id, fingerprint, unix_milli) \
+             SELECT '', toUInt128({F614_HIGH_FP}), \
+                    {day0} + intDiv(number * {F614_DAY_MS}, {F614_HIGH_ROWS}) \
+             FROM numbers({F614_HIGH_ROWS})"
+        ),
+    )
+    .await;
+    f614_exec(client, &format!("OPTIMIZE TABLE {table} FINAL")).await;
+}
+
+/// The production fetch for `table`: the float builder or the histogram one.
+fn f614_fetch(table: &str, fps: &[FpLiteral], lo: i64, hi: i64) -> String {
+    use pulsus_read::metrics::sample_sql::{hist_sample_fetch, sample_fetch};
+    match table {
+        "metric_hist_samples" => hist_sample_fetch(&no_tenant(), table, fps, lo, hi),
+        _ => sample_fetch(&no_tenant(), table, fps, lo, hi),
+    }
+}
+
+/// The `Granules: m/n` line of the `PrimaryKey` block.
+fn f614_pk_granules(raw: &str) -> (u64, u64) {
+    primary_key_granules(raw).unwrap_or_else(|| panic!("no PrimaryKey Granules: line in:\n{raw}"))
+}
+
+/// **Issue #614, finding 1: a one-series window prunes granules on a part
+/// where the series ID changes at nearly every mark.** That shape is the
+/// one where the engine's default ratio (0.9) keeps `unix_milli` out of
+/// the in-memory index, and both sample tables set it to 1. Asserted
+/// first: one active part, and the ID changes at more than 90% of marks.
+/// Then: no mark's `unix_milli` reads 0 (the column is loaded); the high
+/// series' five-minute window selects at most 2 of the part's granules
+/// and returns the rows the fixture puts there; one low series' whole day
+/// selects at most 2.
+#[tokio::test]
+async fn a_one_series_window_prunes_granules_where_most_marks_change_series() {
+    skip_unless_live!();
+    let db = &pulsus_testkit::test_db("pulsus_read_it_f614_ratio");
+    let client = f614_setup(db).await;
+    let day0 = f614_day0_ms();
+    let hi = day0 + F614_DAY_MS / 2;
+    let lo = hi - 300_000;
+    for table in ["metric_samples", "metric_hist_samples"] {
+        f614_seed(&client, table, day0).await;
+        let parts = f614_number(
+            &client,
+            &format!(
+                "SELECT count() AS n FROM system.parts \
+                 WHERE database = '{db}' AND table = '{table}' AND active"
+            ),
+        )
+        .await;
+        assert_eq!(parts, 1, "{table}: the optimize leaves one part");
+        let marks = f614_number(
+            &client,
+            &format!("SELECT count() AS n FROM mergeTreeIndex('{db}', '{table}')"),
+        )
+        .await;
+        let changes = f614_number(
+            &client,
+            &format!(
+                "SELECT countIf(fingerprint != prev) AS n FROM (\
+                   SELECT fingerprint, lagInFrame(fingerprint, 1, toUInt128(0)) \
+                     OVER (ORDER BY mark_number ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prev \
+                   FROM mergeTreeIndex('{db}', '{table}'))"
+            ),
+        )
+        .await;
+        assert!(
+            changes * 10 > marks * 9,
+            "{table}: the ID must change at more than 90% of marks, or the default ratio \
+             would load the whole key anyway: {changes}/{marks}"
+        );
+        let unloaded = f614_number(
+            &client,
+            &format!("SELECT countIf(unix_milli = 0) AS n FROM mergeTreeIndex('{db}', '{table}')"),
+        )
+        .await;
+        assert_eq!(
+            unloaded, 0,
+            "{table}: unix_milli is missing from the in-memory index"
+        );
+
+        let high = [Fingerprint::from_raw(F614_HIGH_FP).sql_literal()];
+        let sql = f614_fetch(table, &high, lo, hi);
+        let (selected, total) = f614_pk_granules(&explain_raw(&client, &sql).await);
+        assert_eq!(
+            total,
+            F614_LOW_SERIES + 10,
+            "{table}: the fixture's granules"
+        );
+        assert!(
+            selected <= 2,
+            "{table}: five minutes of one series read {selected}/{total}"
+        );
+        let want = (0..F614_HIGH_ROWS)
+            .map(|i| f614_high_t(day0, i))
+            .filter(|t| *t > lo && *t <= hi)
+            .count() as u64;
+        let got = f614_number(&client, &format!("SELECT count() AS n FROM ({sql})")).await;
+        assert_eq!(got, want, "{table}: the window's rows");
+
+        let low = [Fingerprint::from_raw(F614_LOW_BASE + 2 * 7).sql_literal()];
+        let sql = f614_fetch(table, &low, day0 - 1, day0 + F614_DAY_MS - 1);
+        let (selected, _) = f614_pk_granules(&explain_raw(&client, &sql).await);
+        assert!(
+            selected <= 2,
+            "{table}: one low series' day read {selected} granules"
+        );
+    }
+    drop_database(&client, db).await;
+}
+
+/// **Issue #614, finding 1 — CHARACTERISATION, not a gate.** Passes today
+/// and pins today's behaviour so a change to the sample key shows here: the
+/// series ID leads the key, so for series under one granule a day a time
+/// window prunes nothing inside a day. All 100 low series over 5 minutes
+/// and over an hour select the same granules.
+#[tokio::test]
+async fn characterisation_a_many_series_window_prunes_no_granules_inside_a_day() {
+    skip_unless_live!();
+    let db = &pulsus_testkit::test_db("pulsus_read_it_f614_window");
+    let client = f614_setup(db).await;
+    let day0 = f614_day0_ms();
+    f614_seed(&client, "metric_samples", day0).await;
+    let low: Vec<FpLiteral> = (0..F614_LOW_SERIES as u128)
+        .map(|s| Fingerprint::from_raw(F614_LOW_BASE + 2 * s).sql_literal())
+        .collect();
+    let hi = day0 + F614_DAY_MS / 2;
+    let mut seen = Vec::new();
+    for window in [300_000, 3_600_000] {
+        let sql = pulsus_read::metrics::sample_sql::sample_fetch(
+            &no_tenant(),
+            "metric_samples",
+            &low,
+            hi - window,
+            hi,
+        );
+        seen.push(f614_pk_granules(&explain_raw(&client, &sql).await));
+    }
+    assert_eq!(seen[0], seen[1], "5 minutes and an hour: {seen:?}");
+    assert_eq!(
+        seen[0].0, F614_LOW_SERIES,
+        "each low series' granule: {seen:?}"
+    );
+    drop_database(&client, db).await;
+}
+
+/// **Issue #614, finding 1: a window inside one day reads one day's part.**
+/// One series, a sample a minute on two consecutive days, so two daily
+/// partitions; a one-hour window on the second day selects one part of
+/// two and returns its 60 rows.
+#[tokio::test]
+async fn a_window_inside_one_day_prunes_the_other_days_part() {
+    skip_unless_live!();
+    let db = &pulsus_testkit::test_db("pulsus_read_it_f614_days");
+    let client = f614_setup(db).await;
+    let day1 = f614_day0_ms();
+    let day0 = day1 - F614_DAY_MS;
+    f614_exec(
+        &client,
+        &format!(
+            "INSERT INTO metric_samples (org_id, fingerprint, unix_milli) \
+             SELECT '', toUInt128({F614_HIGH_FP}), {day0} + number * 60000 FROM numbers(2880)"
+        ),
+    )
+    .await;
+    let parts = f614_number(
+        &client,
+        &format!(
+            "SELECT uniqExact(partition) AS n FROM system.parts \
+             WHERE database = '{db}' AND table = 'metric_samples' AND active"
+        ),
+    )
+    .await;
+    assert_eq!(parts, 2, "the fixture spans two daily partitions");
+    let hi = day1 + 12 * 3_600_000;
+    let sql = pulsus_read::metrics::sample_sql::sample_fetch(
+        &no_tenant(),
+        "metric_samples",
+        &[Fingerprint::from_raw(F614_HIGH_FP).sql_literal()],
+        hi - 3_600_000,
+        hi,
+    );
+    let raw = explain_raw(&client, &sql).await;
+    assert_eq!(
+        parts_selected(&raw),
+        Some((1, 2)),
+        "the other day's part is read:\n{raw}"
+    );
+    let got = f614_number(&client, &format!("SELECT count() AS n FROM ({sql})")).await;
+    assert_eq!(got, 60, "the hour's rows");
+    drop_database(&client, db).await;
 }

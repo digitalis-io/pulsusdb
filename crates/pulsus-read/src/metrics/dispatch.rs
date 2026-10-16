@@ -223,6 +223,10 @@ mod leaf {
         /// constructor argument and its single read inside
         /// `fetch_rows_with`'s error mapping are all it can ever do.
         read_max_memory_bytes: u64,
+        /// Issue #614: the `log_comment` every statement carries — the
+        /// request's id on the server, `None` otherwise. Like the budget
+        /// above, a constructor-set value that cannot dispatch.
+        log_comment: Option<String>,
     }
 
     impl MetricsDispatch {
@@ -230,7 +234,15 @@ mod leaf {
             MetricsDispatch {
                 client,
                 read_max_memory_bytes,
+                log_comment: None,
             }
+        }
+
+        /// Issue #614: every statement this dispatch sends carries
+        /// `log_comment = comment`.
+        pub(crate) fn with_log_comment(mut self, comment: String) -> Self {
+            self.log_comment = Some(comment);
+            self
         }
 
         /// Wraps [`ChClient::query_stream`] with the placeholder-escaping
@@ -281,6 +293,14 @@ mod leaf {
             if let Err(reason) = crate::querytext::ensure_query_text_fits(&sql) {
                 return Err(ReadError::QueryTooBroad(reason));
             }
+            let tagged;
+            let settings = match &self.log_comment {
+                Some(c) => {
+                    tagged = settings.clone().set("log_comment", c.as_str());
+                    &tagged
+                }
+                None => settings,
+            };
             let stream: ChRowStream<'_, R> = self
                 .client
                 .query_stream::<R>(&sql, settings)

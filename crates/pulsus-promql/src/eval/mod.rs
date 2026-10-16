@@ -3302,7 +3302,7 @@ fn eval_step(
                 dst,
                 replacement,
                 src,
-                regex,
+                regex.regex(),
             )?))
         }
         PlanExpr::LabelJoin {
@@ -8509,6 +8509,44 @@ mod tests {
         assert!(
             live.windows(2).all(|w| w[0] < w[1]),
             "no duplicate may ever enter the output buffer"
+        );
+    }
+
+    /// Issue #614: `label_replace` compiles its pattern once per query,
+    /// at plan time, and never per evaluation step. Over 241 steps the
+    /// per-step compile counted 242; the answer is the anchored rewrite
+    /// at every step either way, so the count is the gate.
+    #[test]
+    fn label_replace_compiles_its_pattern_once_over_a_241_step_range() {
+        let before = labels::label_replace_compiles();
+        let expr =
+            crate::parser::parse(r#"label_replace(m{job="a"}, "sensor", "$1", "chip", "(.*)-x")"#)
+                .unwrap();
+        let p = plan(&expr, params(0, 3_600_000, 15_000)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![series(
+                1,
+                &[("chip", "core-x"), ("job", "a")],
+                (0..=240).map(|i| s(i * 15_000, i as f64)).collect(),
+            )],
+        );
+        let (value, _counts, _annotations) = evaluate_counted(&p, &data).unwrap();
+        assert_eq!(
+            labels::label_replace_compiles() - before,
+            1,
+            "one compile at plan time, none per step"
+        );
+        let QueryValue::Matrix(m) = value else {
+            panic!("expected Matrix");
+        };
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].points.len(), 241);
+        assert_eq!(
+            m[0].labels.get("sensor"),
+            Some("core"),
+            "the anchored pattern rewrites the full value"
         );
     }
 
