@@ -5679,3 +5679,26 @@ fn a_root_only_parent_comparison_projects_minus_one_without_the_numbering() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+/// Issue #602 part 2c-2a: a condition naming more than one field projects
+/// nothing on the search statement (ledger
+/// `traceql-matched-span-multi-field-leaf-not-projected`).
+#[test]
+fn a_multi_field_condition_projects_nothing_on_the_statement() {
+    let nothing = "CAST([], 'Array(Tuple(UInt8, String, String))')";
+    let mut wrong = Vec::new();
+    for query in [
+        "{ .a = .b }",
+        "{ .a + .b > 5 }",
+        "{ .a = event:name }",
+        "{ traceDuration > 1s }",
+        "{ span:childCount > 0 }",
+    ] {
+        let statement = compile_search_of(query).unwrap_or_else(|e| panic!("{query}: {e}"));
+        let sql = statement.projection().sql();
+        if sql != nothing {
+            wrong.push(format!("{query}: projects {sql}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
