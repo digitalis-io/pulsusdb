@@ -8,8 +8,8 @@
 //!   * **PulsusDB side** — the corpus bytes go through OUR OWN ingest
 //!     parser (`pulsus_write::protocols::otlp_traces::decode_json` +
 //!     `parse_traces`) into the real trace writer against a throwaway
-//!     ClickHouse database, and the answer comes from this crate's REAL
-//!     two-phase search executor ([`TraceEngine::search`]). A differential
+//!     ClickHouse database, and the answer comes from the search route's
+//!     own engine ([`TraceEngine::search_routed`]). A differential
 //!     whose two sides are written separately compares two authors, not
 //!     two systems — and here the STORED TYPE is the thing under test, so
 //!     hand-writing `trace_attrs_idx` rows would let the fixture choose
@@ -128,8 +128,8 @@ use std::time::Duration;
 
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings};
 use pulsus_config::WriterConfig;
-use pulsus_read::traces::search_plan::{SearchParams, plan_search};
 use pulsus_read::{GroupValue, TraceEngine, TraceReadConfig, wire_arm};
+use pulsus_read::{SearchParams, StatementTables, plan_search_request};
 use pulsus_schema::RenderCtx;
 use pulsus_schema_testkit::run_init;
 use pulsus_write::writer::{ChBlockInserter, TraceWriter, TraceWriterTables};
@@ -934,7 +934,7 @@ async fn ours(
     span_attrs: bool,
 ) -> BTreeSet<SetShape> {
     let query = pulsus_traceql::parse(q).unwrap_or_else(|e| panic!("parse {q:?}: {e}"));
-    let plan = plan_search(
+    let request = plan_search_request(
         &query,
         &SearchParams {
             start_ns: window.0,
@@ -942,11 +942,17 @@ async fn ours(
             limit: 100,
             spss: 100,
         },
-        &engine.search_ctx(),
+        &StatementTables {
+            spans: "spans",
+            resources: "resources",
+            traces: "traces",
+            indexed: &[],
+        },
+        64,
     )
     .unwrap_or_else(|e| panic!("plan {q:?}: {e}"));
     let out = engine
-        .search(&plan)
+        .search_routed(&request)
         .await
         .unwrap_or_else(|e| panic!("search {q:?}: {e}"));
     let mut shapes = BTreeSet::new();
@@ -1313,6 +1319,13 @@ async fn traces_search_grouping_differential() {
             .await
             .expect("flush settles")
             .expect("the corpus commits");
+        land_new_store(
+            &client,
+            &req,
+            base,
+            &format!("grpdiff-{}-{}", corpus.service, now_ns()),
+        )
+        .await;
     }
 
     let engine = TraceEngine::new(
@@ -1669,4 +1682,56 @@ fn every_fixture_is_scoped_to_a_corpus_that_exists() {
         );
         pulsus_traceql::parse(&q).unwrap_or_else(|e| panic!("[{}] {q:?} must parse: {e}", fx.name));
     }
+}
+
+/// Lands `req` in the span, per-trace and resource tables through
+/// `trace_landing`, as `traces_query_v2_live.rs`'s `land` does: the trace
+/// writer above writes only the previous engine's store, and the search
+/// route reads this one (issue #602 part 2c-1).
+async fn land_new_store(
+    client: &ChClient,
+    req: &opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest,
+    received_ns: i64,
+    token: &str,
+) {
+    let parsed = pulsus_write::parse_trace_landing(req, received_ns).expect("the landing decode");
+    let received_ms = received_ns / 1_000_000;
+    let mut rows: Vec<pulsus_write::TraceLandingRow> =
+        Vec::with_capacity(parsed.total_rows() as usize);
+    rows.extend(
+        parsed
+            .spans
+            .iter()
+            .cloned()
+            .map(|s| pulsus_write::TraceLandingRow::span(received_ms, s)),
+    );
+    rows.extend(
+        parsed
+            .resources
+            .iter()
+            .cloned()
+            .map(|r| pulsus_write::TraceLandingRow::resource(received_ms, r)),
+    );
+    rows.extend(
+        parsed
+            .tag_names
+            .iter()
+            .cloned()
+            .map(|t| pulsus_write::TraceLandingRow::tag_name(received_ms, t)),
+    );
+    rows.extend(
+        parsed
+            .tag_values
+            .iter()
+            .cloned()
+            .map(|t| pulsus_write::TraceLandingRow::tag_value(received_ms, t)),
+    );
+    client
+        .insert_block_with(
+            "trace_landing",
+            &rows,
+            &QuerySettings::trace_landing_insert(token, 1_048_576),
+        )
+        .await
+        .expect("the landing insert");
 }

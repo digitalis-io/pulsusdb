@@ -1,0 +1,694 @@
+fixture	query	limit	spss	answer
+c	"({ .a = 1 } && { .b = 2 }) > { .c = 3 }\n"	100	100	ff8890693b837f5f
+c	"({ .a = 1 } && { .b = 2 }) > { .c = 3 }\n"	20	3	df81e9f4513c2ef0
+c	"({ .a = 1 } && { .b = 2 }) > { .c = 3 }\n"	2	1	be4747e47efb8b98
+c	"({ .a = 1 } || { .b = 2 }) && { .c = 3 }\n"	100	100	ea42736994bec62d
+c	"({ .a = 1 } || { .b = 2 }) && { .c = 3 }\n"	20	3	49861ec4d22d8a36
+c	"({ .a = 1 } || { .b = 2 }) && { .c = 3 }\n"	2	1	986bd8226ab4deb5
+c	"({ span.a = 1 } || { span.b = 2 }) && { span.c = 3 }"	100	100	ea42736994bec62d
+c	"({ span.a = 1 } || { span.b = 2 }) && { span.c = 3 }"	20	3	49861ec4d22d8a36
+c	"({ span.a = 1 } || { span.b = 2 }) && { span.c = 3 }"	2	1	986bd8226ab4deb5
+c	"{ !(.a = 1) }\n"	100	100	b25fbf71b2d1cb07
+c	"{ !(.a = 1) }\n"	20	3	0d40a5f70f475e4e
+c	"{ !(.a = 1) }\n"	2	1	3b81fdc3b1165d16
+c	"{ !(span.a = 1) }"	100	100	b25fbf71b2d1cb07
+c	"{ !(span.a = 1) }"	20	3	0d40a5f70f475e4e
+c	"{ !(span.a = 1) }"	2	1	3b81fdc3b1165d16
+c	"{ !span.success }"	100	100	9d9dde9628ea9352
+c	"{ !span.success }"	20	3	5a135e882282cd6f
+c	"{ !span.success }"	2	1	4b3a1c584f9bb4a9
+c	"{ (.a = 1 || .b = 2) && .c = 3 }\n"	100	100	60e42c833962d7ec
+c	"{ (.a = 1 || .b = 2) && .c = 3 }\n"	20	3	3a8b150892e67701
+c	"{ (.a = 1 || .b = 2) && .c = 3 }\n"	2	1	531fd6b08e2449d3
+c	"{ .a != nil }\n"	100	100	95b69db51bd5ef31
+c	"{ .a != nil }\n"	20	3	7585d6ef55758e6e
+c	"{ .a != nil }\n"	2	1	58dedd90c94e4db4
+c	"{ .a < maxInt }\n"	100	100	95b69db51bd5ef31
+c	"{ .a < maxInt }\n"	20	3	7585d6ef55758e6e
+c	"{ .a < maxInt }\n"	2	1	58dedd90c94e4db4
+c	"{ .a = -1 }\n"	100	100	f79bf2c6309aac73
+c	"{ .a = -1 }\n"	20	3	9f6fa0481e0cde6c
+c	"{ .a = -1 }\n"	2	1	d19c17412f277298
+c	"{ .a = .b }\n"	100	100	2696fc26d0e8c835
+c	"{ .a = .b }\n"	20	3	40f5b3634047672e
+c	"{ .a = .b }\n"	2	1	8aa039e0bcbf9d76
+c	"{ .a = 1 + 2 }\n"	100	100	7775096368b69358
+c	"{ .a = 1 + 2 }\n"	20	3	b06fc29d86733445
+c	"{ .a = 1 + 2 }\n"	2	1	e5f2cfd359e3fefb
+c	"{ .a = 1 || .b = 2 && .c = 3 }\n"	100	100	60e42c833962d7ec
+c	"{ .a = 1 || .b = 2 && .c = 3 }\n"	20	3	3a8b150892e67701
+c	"{ .a = 1 || .b = 2 && .c = 3 }\n"	2	1	531fd6b08e2449d3
+c	"{ .a = 1 || .b = 2 }\n"	100	100	abdfd7fe9fe26753
+c	"{ .a = 1 || .b = 2 }\n"	20	3	cedc7e9118e5c696
+c	"{ .a = 1 || .b = 2 }\n"	2	1	06d608e6b24e92bc
+c	"{ .a = 1 } !> { .b = 2 }\n"	100	100	5875ee08ed6762dc
+c	"{ .a = 1 } !> { .b = 2 }\n"	20	3	67bb1001358fe44d
+c	"{ .a = 1 } !> { .b = 2 }\n"	2	1	7dba53d137d077a8
+c	"{ .a = 1 } !~ { .b = 2 }\n"	100	100	75a794c94c19b2ee
+c	"{ .a = 1 } !~ { .b = 2 }\n"	20	3	542a69856b451253
+c	"{ .a = 1 } !~ { .b = 2 }\n"	2	1	37c70920579309aa
+c	"{ .a = 1 } && { .b = 2 }\n"	100	100	abdfd7fe9fe26753
+c	"{ .a = 1 } && { .b = 2 }\n"	20	3	cedc7e9118e5c696
+c	"{ .a = 1 } && { .b = 2 }\n"	2	1	06d608e6b24e92bc
+c	"{ .a = 1 } && { .b = 2 } >> { .c = 3 } || { .d = 4 }\n"	100	100	9445b4603758afb7
+c	"{ .a = 1 } && { .b = 2 } >> { .c = 3 } || { .d = 4 }\n"	20	3	69275f2ff6386f78
+c	"{ .a = 1 } && { .b = 2 } >> { .c = 3 } || { .d = 4 }\n"	2	1	7248b6855e19e15e
+c	"{ .a = 1 } &> { .b = 2 }\n"	100	100	c4a2c6b16daa95e3
+c	"{ .a = 1 } &> { .b = 2 }\n"	20	3	1a12bfc5fc8cfd5c
+c	"{ .a = 1 } &> { .b = 2 }\n"	2	1	ef3891bdb7714592
+c	"{ .a = 1 } &~ { .b = 2 }\n"	100	100	8fe166fb34f8716f
+c	"{ .a = 1 } &~ { .b = 2 }\n"	20	3	039667bd80eaf300
+c	"{ .a = 1 } &~ { .b = 2 }\n"	2	1	3b2efffe12689ee6
+c	"{ .a = 1 } < { .b = 2 }\n"	100	100	6ed61ef7efef9b3b
+c	"{ .a = 1 } < { .b = 2 }\n"	20	3	938d7e3ab5551364
+c	"{ .a = 1 } < { .b = 2 }\n"	2	1	2d6e4bdc0d16aaf0
+c	"{ .a = 1 } << { .b = 2 }\n"	100	100	87e5d3ddf3543f60
+c	"{ .a = 1 } << { .b = 2 }\n"	20	3	31e58ff5e67b147d
+c	"{ .a = 1 } << { .b = 2 }\n"	2	1	2d6e4bdc0d16aaf0
+c	"{ .a = 1 } > { .b = 2 }\n"	100	100	5828f1b0e4f89a92
+c	"{ .a = 1 } > { .b = 2 }\n"	20	3	9b7e5f04606af72f
+c	"{ .a = 1 } > { .b = 2 }\n"	2	1	2d6e4bdc0d16aaf0
+c	"{ .a = 1 } > { .b = 2 } > { .c = 3 }\n"	100	100	8391963003b2eb01
+c	"{ .a = 1 } > { .b = 2 } > { .c = 3 }\n"	20	3	2664a7b9cf21b492
+c	"{ .a = 1 } > { .b = 2 } > { .c = 3 }\n"	2	1	f9791646c3834032
+c	"{ .a = 1 } >> { .b = 2 }\n"	100	100	b2e26bff2712c3ab
+c	"{ .a = 1 } >> { .b = 2 }\n"	20	3	d4dbfa7192e5ced4
+c	"{ .a = 1 } >> { .b = 2 }\n"	2	1	59796a6fd5e7fcbb
+c	"{ .a = 1 } with(a=1) with(b=2)\n"	100	100	a20c6302284e04ba
+c	"{ .a = 1 } with(a=1) with(b=2)\n"	20	3	2a6e7a059affd522
+c	"{ .a = 1 } with(a=1) with(b=2)\n"	2	1	5346981aa7a01eea
+c	"{ .a = 1 } with(most_recent=true)\n"	100	100	a20c6302284e04ba
+c	"{ .a = 1 } with(most_recent=true)\n"	20	3	2a6e7a059affd522
+c	"{ .a = 1 } with(most_recent=true)\n"	2	1	5346981aa7a01eea
+c	"{ .a = 1 } | ({ name = \"b\" })\n"	100	100	c4b53ee1746724bf
+c	"{ .a = 1 } | ({ name = \"b\" })\n"	20	3	1244376ccc6d6150
+c	"{ .a = 1 } | ({ name = \"b\" })\n"	2	1	b5d37d1364cc2e44
+c	"{ .a = 1 } | by(name) | { name = \"b\" }\n"	100	100	efeb382447153106
+c	"{ .a = 1 } | by(name) | { name = \"b\" }\n"	20	3	b2f12820131234fb
+c	"{ .a = 1 } | by(name) | { name = \"b\" }\n"	2	1	8e6111869009cdcd
+c	"{ .a = 1 } | by(resource.service.name)\n"	100	100	7bc37303b3baa693
+c	"{ .a = 1 } | by(resource.service.name)\n"	20	3	6a2ec5a12f59f9cc
+c	"{ .a = 1 } | by(resource.service.name)\n"	2	1	6daa31fe0d9d84c9
+c	"{ .a = 1 } | coalesce()\n"	100	100	a20c6302284e04ba
+c	"{ .a = 1 } | coalesce()\n"	20	3	2a6e7a059affd522
+c	"{ .a = 1 } | coalesce()\n"	2	1	5346981aa7a01eea
+c	"{ .a = 1 } | count() > 2 | select(duration)\n"	100	100	4d5453701bba70c5
+c	"{ .a = 1 } | count() > 2 | select(duration)\n"	20	3	51ace11f00bbb672
+c	"{ .a = 1 } | count() > 2 | select(duration)\n"	2	1	19420096a444c566
+c	"{ .a = 1 } | select(.a) | { }"	100	100	a20c6302284e04ba
+c	"{ .a = 1 } | select(.a) | { }"	20	3	2a6e7a059affd522
+c	"{ .a = 1 } | select(.a) | { }"	2	1	5346981aa7a01eea
+c	"{ .a = 1 } | select(name)\n"	100	100	f689f678574e04d9
+c	"{ .a = 1 } | select(name)\n"	20	3	a8e8d780b4331c71
+c	"{ .a = 1 } | select(name)\n"	2	1	eec3f1294ef990bb
+c	"{ .a = 1 } | { name = \"b\" } | by(name)\n"	100	100	efeb382447153106
+c	"{ .a = 1 } | { name = \"b\" } | by(name)\n"	20	3	b2f12820131234fb
+c	"{ .a = 1 } | { name = \"b\" } | by(name)\n"	2	1	8e6111869009cdcd
+c	"{ .a = 1 } | { }\n"	100	100	a20c6302284e04ba
+c	"{ .a = 1 } | { }\n"	20	3	2a6e7a059affd522
+c	"{ .a = 1 } | { }\n"	2	1	5346981aa7a01eea
+c	"{ .a = 1 } || { .b = 2 } && { .c = 3 }\n"	100	100	ea42736994bec62d
+c	"{ .a = 1 } || { .b = 2 } && { .c = 3 }\n"	20	3	49861ec4d22d8a36
+c	"{ .a = 1 } || { .b = 2 } && { .c = 3 }\n"	2	1	986bd8226ab4deb5
+c	"{ .a = 1 } ~ { .b = 2 }\n"	100	100	eda2fe572555596f
+c	"{ .a = 1 } ~ { .b = 2 }\n"	20	3	b06df7af00966b00
+c	"{ .a = 1 } ~ { .b = 2 }\n"	2	1	94e95a079f120986
+c	"{ .a = 1 } ~ { .b = 2 } | count() > 1\n"	100	100	98c1a018e11d97fd
+c	"{ .a = 1 } ~ { .b = 2 } | count() > 1\n"	20	3	e30e24d8393cc506
+c	"{ .a = 1 } ~ { .b = 2 } | count() > 1\n"	2	1	082978f56e595540
+c	"{ .a = 2 * 3 }\n"	100	100	5b2e4a59a11fcf73
+c	"{ .a = 2 * 3 }\n"	20	3	ef808c794d63af6c
+c	"{ .a = 2 * 3 }\n"	2	1	67a710bc4b82dd98
+c	"{ .a = 2 - 1 }\n"	100	100	a20c6302284e04ba
+c	"{ .a = 2 - 1 }\n"	20	3	2a6e7a059affd522
+c	"{ .a = 2 - 1 }\n"	2	1	5346981aa7a01eea
+c	"{ .a = 2 ^ 3 }\n"	100	100	56645136281d2105
+c	"{ .a = 2 ^ 3 }\n"	20	3	9e928338fecb8cfe
+c	"{ .a = 2 ^ 3 }\n"	2	1	4439bffc5150a446
+c	"{ .a = 4 / 2 }\n"	100	100	0d3738f23992ef7b
+c	"{ .a = 4 / 2 }\n"	20	3	2bd031a2dae71324
+c	"{ .a = 4 / 2 }\n"	2	1	93786c05f998a120
+c	"{ .a = 5 % 2 }\n"	100	100	a20c6302284e04ba
+c	"{ .a = 5 % 2 }\n"	20	3	2a6e7a059affd522
+c	"{ .a = 5 % 2 }\n"	2	1	5346981aa7a01eea
+c	"{ .a = minInt }\n"	100	100	064e5a02030cf5f1
+c	"{ .a = minInt }\n"	20	3	ec731ccedd077b82
+c	"{ .a = minInt }\n"	2	1	9744a1d5cc6915e2
+c	"{ .a = nil }\n"	100	100	8bfc0b0c60519d3d
+c	"{ .a = nil }\n"	20	3	bb491fabdd707207
+c	"{ .a = nil }\n"	2	1	b8614f8dc3fae2f7
+c	"{ .env != \"prod\" }\n"	100	100	4d001e4a261765c7
+c	"{ .env != \"prod\" }\n"	20	3	8ac808933c96fa28
+c	"{ .env != \"prod\" }\n"	2	1	a877fd5be5b389a4
+c	"{ .foo }\n"	100	100	a265a7293cecfd51
+c	"{ .foo }\n"	20	3	b3dbc31dacc858e2
+c	"{ .foo }\n"	2	1	d5121ee8392c5342
+c	"{ .http.status_code = 200 }\n"	100	100	49f97472eef98a2e
+c	"{ .http.status_code = 200 }\n"	20	3	d091c9d08e0c2c13
+c	"{ .http.status_code = 200 }\n"	2	1	37255e295ed4f995
+c	"{ .success = true }\n"	100	100	1d3cdc7dd25f8f01
+c	"{ .success = true }\n"	20	3	b29312682f888092
+c	"{ .success = true }\n"	2	1	7a041266f1a34432
+c	"{ duration < .5s }\n"	100	100	5e8757ac7e4d1311
+c	"{ duration < .5s }\n"	20	3	86d95cae27a91e22
+c	"{ duration < .5s }\n"	2	1	763fa1a60ce6e108
+c	"{ duration < 1h }\n"	100	100	55c1ea9f8ffee330
+c	"{ duration < 1h }\n"	20	3	a3de190ff18706ad
+c	"{ duration < 1h }\n"	2	1	a877fd5be5b389a4
+c	"{ duration <= 1.5s }\n"	100	100	94c40cc1f71eb66b
+c	"{ duration <= 1.5s }\n"	20	3	d0046e4d9649300c
+c	"{ duration <= 1.5s }\n"	2	1	a877fd5be5b389a4
+c	"{ duration = 0.000000001s }\n"	100	100	d3a5b60fdfc03a1d
+c	"{ duration = 0.000000001s }\n"	20	3	aa7beab271ef8926
+c	"{ duration = 0.000000001s }\n"	2	1	873376e5a06dcede
+c	"{ duration > -2s }\n"	100	100	55c1ea9f8ffee330
+c	"{ duration > -2s }\n"	20	3	a3de190ff18706ad
+c	"{ duration > -2s }\n"	2	1	a877fd5be5b389a4
+c	"{ duration > 0.5s }\n"	100	100	c36cc9529d245939
+c	"{ duration > 0.5s }\n"	20	3	daf0555a323659ee
+c	"{ duration > 0.5s }\n"	2	1	433e277df993dd57
+c	"{ duration > 2s }\n"	100	100	12799a053bef00b6
+c	"{ duration > 2s }\n"	20	3	d90c20d1375d532b
+c	"{ duration > 2s }\n"	2	1	fc209efda393fef5
+c	"{ duration >= 100ms }\n"	100	100	654f0ef00a757880
+c	"{ duration >= 100ms }\n"	20	3	489d7d0be5869a49
+c	"{ duration >= 100ms }\n"	2	1	433e277df993dd57
+c	"{ duration >= 500µs }\n"	100	100	8cbbbfebc00783d7
+c	"{ duration >= 500µs }\n"	20	3	98f7e2ec12058d9c
+c	"{ duration >= 500µs }\n"	2	1	433e277df993dd57
+c	"{ event.exception.type = \"IOError\" }\n"	100	100	539acdb84e521cdd
+c	"{ event.exception.type = \"IOError\" }\n"	20	3	30afda6b9e0ecd66
+c	"{ event.exception.type = \"IOError\" }\n"	2	1	6d89e2ff5a3c1e9e
+c	"{ event:name = \"exception\" }\n"	100	100	2e5e6d0b36457634
+c	"{ event:name = \"exception\" }\n"	20	3	583b17282c253bd9
+c	"{ event:name = \"exception\" }\n"	2	1	46a5286e6bf794b7
+c	"{ event:timeSinceStart > 1ms }\n"	100	100	a3c7de94fb7019eb
+c	"{ event:timeSinceStart > 1ms }\n"	20	3	08cfec6f91e23a94
+c	"{ event:timeSinceStart > 1ms }\n"	2	1	df413f3eebeca150
+c	"{ instrumentation.name = \"otel\" }\n"	100	100	0120a7b2c1c7c9bb
+c	"{ instrumentation.name = \"otel\" }\n"	20	3	75ea27268a43eae4
+c	"{ instrumentation.name = \"otel\" }\n"	2	1	c36dd44fd8b7c560
+c	"{ instrumentation.name =~ \"o.*\" }"	100	100	0120a7b2c1c7c9bb
+c	"{ instrumentation.name =~ \"o.*\" }"	20	3	75ea27268a43eae4
+c	"{ instrumentation.name =~ \"o.*\" }"	2	1	c36dd44fd8b7c560
+c	"{ instrumentation.otel.scope.build = \"release\" }"	100	100	b1bb478109114bf3
+c	"{ instrumentation.otel.scope.build = \"release\" }"	20	3	857b6390eee100ec
+c	"{ instrumentation.otel.scope.build = \"release\" }"	2	1	1a85b5b7a4288618
+c	"{ instrumentation:name = \"otel\" && instrumentation:version = \"1.0\" }"	100	100	24f44e765eab9ef4
+c	"{ instrumentation:name = \"otel\" && instrumentation:version = \"1.0\" }"	20	3	f249c56e7201d519
+c	"{ instrumentation:name = \"otel\" && instrumentation:version = \"1.0\" }"	2	1	48f039bbc0f9e7e0
+c	"{ instrumentation:name = \"otel\" }\n"	100	100	4e862119ad3e3ff0
+c	"{ instrumentation:name = \"otel\" }\n"	20	3	8cd381381cae5e0d
+c	"{ instrumentation:name = \"otel\" }\n"	2	1	801895d85d8fd7b6
+c	"{ instrumentation:version = \"1.0\" }\n"	100	100	41fa8bd1edb7258e
+c	"{ instrumentation:version = \"1.0\" }\n"	20	3	75c37f9a95f4e673
+c	"{ instrumentation:version = \"1.0\" }\n"	2	1	fcf1c454ce4f8888
+c	"{ kind != producer }\n"	100	100	8f17c4d15e4cf18e
+c	"{ kind != producer }\n"	20	3	74be5c0f53a63d39
+c	"{ kind != producer }\n"	2	1	e20d136782089ab2
+c	"{ kind = client }\n"	100	100	4ee9cd85cc416788
+c	"{ kind = client }\n"	20	3	3ca3add7412303f5
+c	"{ kind = client }\n"	2	1	990f56f2a601c7ab
+c	"{ kind = consumer }\n"	100	100	096a9d3621f47469
+c	"{ kind = consumer }\n"	20	3	ae296450bd68726a
+c	"{ kind = consumer }\n"	2	1	3f4083a3821aa01a
+c	"{ kind = internal }\n"	100	100	ad8c7e6890bba8a8
+c	"{ kind = internal }\n"	20	3	f53af4ac8c2ba223
+c	"{ kind = internal }\n"	2	1	eb9bd72c9bc8d1cf
+c	"{ kind = server }\n"	100	100	ecb318af8b91b8d4
+c	"{ kind = server }\n"	20	3	f7306dcad572eff9
+c	"{ kind = server }\n"	2	1	2faf232f98b57bcd
+c	"{ kind = unspecified }\n"	100	100	f69caf4abb0ad6bb
+c	"{ kind = unspecified }\n"	20	3	10350890d20c29e4
+c	"{ kind = unspecified }\n"	2	1	a08b44a56c990a60
+c	"{ link.relation = \"child_of\" }"	100	100	894131794bf2b376
+c	"{ link.relation = \"child_of\" }"	20	3	cde29ce6161eb06b
+c	"{ link.relation = \"child_of\" }"	2	1	e98c15dfdb2401fd
+c	"{ link:spanID = \"0a1b2c3d4e5f6071\" }"	100	100	867a098d6f99aeab
+c	"{ link:spanID = \"0a1b2c3d4e5f6071\" }"	20	3	e900474fc47fb7d4
+c	"{ link:spanID = \"0a1b2c3d4e5f6071\" }"	2	1	9de2c322018d5410
+c	"{ link:traceID = \"000102030405060708090a0b0c0d0e0f\" }"	100	100	9b0e2b65b5732440
+c	"{ link:traceID = \"000102030405060708090a0b0c0d0e0f\" }"	20	3	c6a7127135c96c5d
+c	"{ link:traceID = \"000102030405060708090a0b0c0d0e0f\" }"	2	1	e3175cf0151fb743
+c	"{ name = \"GET /api/orders\" }\n"	100	100	a4dc29e6ec9f8ab9
+c	"{ name = \"GET /api/orders\" }\n"	20	3	6084f13b8cddd2fa
+c	"{ name = \"GET /api/orders\" }\n"	2	1	b4b10bf11cfdc0ea
+c	"{ name = \"\\101\\012\" }\n"	100	100	a0a48b52d8c981a1
+c	"{ name = \"\\101\\012\" }\n"	20	3	047a165d5988eb32
+c	"{ name = \"\\101\\012\" }\n"	2	1	51870c4e35180d52
+c	"{ name = \"\\u00e9\\u65e5\\U0001F600\" }\n"	100	100	b644db24fcdb3d3d
+c	"{ name = \"\\u00e9\\u65e5\\U0001F600\" }\n"	20	3	7d5d84c27b7bd8c6
+c	"{ name = \"\\u00e9\\u65e5\\U0001F600\" }\n"	2	1	a7d1f8cbc37e9bfe
+c	"{ name = \"\\x41\\x7a\" }\n"	100	100	b7a1a0dda2cfc7af
+c	"{ name = \"\\x41\\x7a\" }\n"	20	3	11a392193f855ec0
+c	"{ name = \"\\x41\\x7a\" }\n"	2	1	109f8d4821ede6f4
+c	"{ name = \"b\" || span.b = 2 }"	100	100	28e334201b7fbf3c
+c	"{ name = \"b\" || span.b = 2 }"	20	3	612c4bf6df0ab9a1
+c	"{ name = \"b\" || span.b = 2 }"	2	1	64b7e0d808b29e2b
+c	"{ name = \"b\" }"	100	100	a181a6a88ef68286
+c	"{ name = \"b\" }"	20	3	ccd60b3f91c3dd7b
+c	"{ name = \"b\" }"	2	1	4d72facd4178434d
+c	"{ name = \"b\" } && { span.a = 1 }"	100	100	54e15afe89f1f019
+c	"{ name = \"b\" } && { span.a = 1 }"	20	3	ce9dba3cabd2e9da
+c	"{ name = \"b\" } && { span.a = 1 }"	2	1	58e04d8bc203d19d
+c	"{ name = \"col1\\tcol2\\n\\\"quoted\\\" \\\\ bell\\a vt\\v bs\\b ff\\f cr\\r\" }\n"	100	100	2d2346632d439d9a
+c	"{ name = \"col1\\tcol2\\n\\\"quoted\\\" \\\\ bell\\a vt\\v bs\\b ff\\f cr\\r\" }\n"	20	3	0a41b87f347f5ca7
+c	"{ name = \"col1\\tcol2\\n\\\"quoted\\\" \\\\ bell\\a vt\\v bs\\b ff\\f cr\\r\" }\n"	2	1	346cfe263eaade91
+c	"{ name =~ \"GET.*\" }\n"	100	100	4eb61024e049b01e
+c	"{ name =~ \"GET.*\" }\n"	20	3	f1f1771e9e955bc3
+c	"{ name =~ \"GET.*\" }\n"	2	1	a6c157f9bb2879fb
+c	"{ nestedSetLeft > 0 }\n"	100	100	2be62de928149590
+c	"{ nestedSetLeft > 0 }\n"	20	3	fb480f4dbc0874a2
+c	"{ nestedSetLeft > 0 }\n"	2	1	e1f0d0607e48b3c4
+c	"{ nestedSetParent < 0 }\n"	100	100	c06edb16377e04f3
+c	"{ nestedSetParent < 0 }\n"	20	3	0d82ee344acae3ec
+c	"{ nestedSetParent < 0 }\n"	2	1	2493285b555557fa
+c	"{ nestedSetRight >= 1 }\n"	100	100	cbcb79e9d5367106
+c	"{ nestedSetRight >= 1 }\n"	20	3	a582a12b27a851cc
+c	"{ nestedSetRight >= 1 }\n"	2	1	ea1e2c48975076b2
+c	"{ resource.deployment.environment !~ \"dev|test\" }\n"	100	100	acca7d3bbc939b38
+c	"{ resource.deployment.environment !~ \"dev|test\" }\n"	20	3	f0baa1d8c7d10e05
+c	"{ resource.deployment.environment !~ \"dev|test\" }\n"	2	1	a877fd5be5b389a4
+c	"{ resource.service.name = \"checkout\" && span.http.status_code >= 500 && duration > 2s }\n"	100	100	2f8fc22eaca1ed77
+c	"{ resource.service.name = \"checkout\" && span.http.status_code >= 500 && duration > 2s }\n"	20	3	f2536d7d86676cb8
+c	"{ resource.service.name = \"checkout\" && span.http.status_code >= 500 && duration > 2s }\n"	2	1	39c3b7c5b7872f9c
+c	"{ resource.service.name = \"checkout\" && span.retries > 0 }"	100	100	dd9b5289f762c6b4
+c	"{ resource.service.name = \"checkout\" && span.retries > 0 }"	20	3	1eff1927e0156959
+c	"{ resource.service.name = \"checkout\" && span.retries > 0 }"	2	1	4673cc90f8c94aad
+c	"{ resource.service.name = \"checkout\" }\n"	100	100	cb55b67e3c3b6366
+c	"{ resource.service.name = \"checkout\" }\n"	20	3	5b6c8af9b04d7bdb
+c	"{ resource.service.name = \"checkout\" }\n"	2	1	6dda06dc00b37d26
+c	"{ resource.service.name = \"checkout\" } | avg(duration) > 100ms\n"	100	100	2c1ecb51b5f62a84
+c	"{ resource.service.name = \"checkout\" } | avg(duration) > 100ms\n"	20	3	c01ced6ed65d7029
+c	"{ resource.service.name = \"checkout\" } | avg(duration) > 100ms\n"	2	1	c0d705d073e5e8d3
+c	"{ rootName = \"GET /\" }\n"	100	100	3e5fc7d31b4ed27e
+c	"{ rootName = \"GET /\" }\n"	20	3	3529083b2b4e9123
+c	"{ rootName = \"GET /\" }\n"	2	1	c540763564e90a8a
+c	"{ rootServiceName = \"gw\" }\n"	100	100	3e5fc7d31b4ed27e
+c	"{ rootServiceName = \"gw\" }\n"	20	3	3529083b2b4e9123
+c	"{ rootServiceName = \"gw\" }\n"	2	1	c540763564e90a8a
+c	"{ span.\"attr with spaces\" = 1 }\n"	100	100	83920394372c5ce2
+c	"{ span.\"attr with spaces\" = 1 }\n"	20	3	76906aaaae9595ff
+c	"{ span.\"attr with spaces\" = 1 }\n"	2	1	d225668f186170f9
+c	"{ span.[\"foo bar\"] = \"x\" }\n"	100	100	60eb0e4e4f3edb24
+c	"{ span.[\"foo bar\"] = \"x\" }\n"	20	3	196824fae4d76d49
+c	"{ span.[\"foo bar\"] = \"x\" }\n"	2	1	4806ca4490c98ae7
+c	"{ span.a != 1 }"	100	100	b25fbf71b2d1cb07
+c	"{ span.a != 1 }"	20	3	0d40a5f70f475e4e
+c	"{ span.a != 1 }"	2	1	3b81fdc3b1165d16
+c	"{ span.a != nil }"	100	100	95b69db51bd5ef31
+c	"{ span.a != nil }"	20	3	7585d6ef55758e6e
+c	"{ span.a != nil }"	2	1	58dedd90c94e4db4
+c	"{ span.a * 2 > 5 }"	100	100	62b89ffe85088c74
+c	"{ span.a * 2 > 5 }"	20	3	8aec4a53afe37199
+c	"{ span.a * 2 > 5 }"	2	1	2f45abf5238d3a1d
+c	"{ span.a < 0 }"	100	100	e9cb8500cb56c9da
+c	"{ span.a < 0 }"	20	3	ab9a16a797694d67
+c	"{ span.a < 0 }"	2	1	6fd53eb8307780f5
+c	"{ span.a = 1 && span.a = 1 }"	100	100	a20c6302284e04ba
+c	"{ span.a = 1 && span.a = 1 }"	20	3	2a6e7a059affd522
+c	"{ span.a = 1 && span.a = 1 }"	2	1	5346981aa7a01eea
+c	"{ span.a = 1 || span.a > 5 }"	100	100	38141e5c7749e62e
+c	"{ span.a = 1 || span.a > 5 }"	20	3	f5bdfe99d566dc8e
+c	"{ span.a = 1 || span.a > 5 }"	2	1	06f8f91db3db19b5
+c	"{ span.a = 1 }"	100	100	a20c6302284e04ba
+c	"{ span.a = 1 }"	20	3	2a6e7a059affd522
+c	"{ span.a = 1 }"	2	1	5346981aa7a01eea
+c	"{ span.a = 1 } && { name = \"c\" } || { span.retries >= 5 }"	100	100	418fcfeb1771c1e4
+c	"{ span.a = 1 } && { name = \"c\" } || { span.retries >= 5 }"	20	3	caf983bbb0a79d89
+c	"{ span.a = 1 } && { name = \"c\" } || { span.retries >= 5 }"	2	1	d1f37e1e8da8ba80
+c	"{ span.a = 1 } && { span.a = 1 }"	100	100	a20c6302284e04ba
+c	"{ span.a = 1 } && { span.a = 1 }"	20	3	2a6e7a059affd522
+c	"{ span.a = 1 } && { span.a = 1 }"	2	1	5346981aa7a01eea
+c	"{ span.a = 1 } && { span.b = 2 }"	100	100	abdfd7fe9fe26753
+c	"{ span.a = 1 } && { span.b = 2 }"	20	3	cedc7e9118e5c696
+c	"{ span.a = 1 } && { span.b = 2 }"	2	1	06d608e6b24e92bc
+c	"{ span.a = 1 } && { span.zzz = 1 }"	100	100	375ceb3a98142162
+c	"{ span.a = 1 } && { span.zzz = 1 }"	20	3	c72ce38c764f7f7f
+c	"{ span.a = 1 } && { span.zzz = 1 }"	2	1	ea53420e249c2179
+c	"{ span.a = 1 } || { name = \"bare\" }"	100	100	a72418e7bc7b102c
+c	"{ span.a = 1 } || { name = \"bare\" }"	20	3	ea1bb4c6c85099ca
+c	"{ span.a = 1 } || { name = \"bare\" }"	2	1	5346981aa7a01eea
+c	"{ span.a = 1 } || { span.a = 1 }"	100	100	a20c6302284e04ba
+c	"{ span.a = 1 } || { span.a = 1 }"	20	3	2a6e7a059affd522
+c	"{ span.a = 1 } || { span.a = 1 }"	2	1	5346981aa7a01eea
+c	"{ span.a = 1 } || { span.b = 2 } && { span.c = 3 }"	100	100	ea42736994bec62d
+c	"{ span.a = 1 } || { span.b = 2 } && { span.c = 3 }"	20	3	49861ec4d22d8a36
+c	"{ span.a = 1 } || { span.b = 2 } && { span.c = 3 }"	2	1	986bd8226ab4deb5
+c	"{ span.a = 4 / 2 }"	100	100	0d3738f23992ef7b
+c	"{ span.a = 4 / 2 }"	20	3	2bd031a2dae71324
+c	"{ span.a = 4 / 2 }"	2	1	93786c05f998a120
+c	"{ span.a = minInt }"	100	100	064e5a02030cf5f1
+c	"{ span.a = minInt }"	20	3	ec731ccedd077b82
+c	"{ span.a = minInt }"	2	1	9744a1d5cc6915e2
+c	"{ span.a = span.a }"	100	100	95b69db51bd5ef31
+c	"{ span.a = span.a }"	20	3	7585d6ef55758e6e
+c	"{ span.a = span.a }"	2	1	58dedd90c94e4db4
+c	"{ span.a > 2 }"	100	100	5f3cc0295b5f4cc6
+c	"{ span.a > 2 }"	20	3	a3168dcee0c5053b
+c	"{ span.a > 2 }"	2	1	658fdde9efe24917
+c	"{ span.a >= 1.0 }"	100	100	7d2252b83b5cdb45
+c	"{ span.a >= 1.0 }"	20	3	4827157b65e3fa34
+c	"{ span.a >= 1.0 }"	2	1	3e2af476a164935e
+c	"{ span.bytes >= 900 }"	100	100	032be249fbcae23f
+c	"{ span.bytes >= 900 }"	20	3	d47d40557fa4edd0
+c	"{ span.bytes >= 900 }"	2	1	8eaaa8ea64b26b1c
+c	"{ span.c = 3 } || ({ span.a = 1 } && { span.zzz = 1 })"	100	100	cf103354f09a9e3a
+c	"{ span.c = 3 } || ({ span.a = 1 } && { span.zzz = 1 })"	20	3	6166b0ecc8b9a6c7
+c	"{ span.c = 3 } || ({ span.a = 1 } && { span.zzz = 1 })"	2	1	82a660e021d623db
+c	"{ span.client.timeout = 5s }"	100	100	42141f66aedcf05a
+c	"{ span.client.timeout = 5s }"	20	3	2a69ffc37c464ce7
+c	"{ span.client.timeout = 5s }"	2	1	156c16e221231f51
+c	"{ span.client.timeout = 5s }\n"	100	100	42141f66aedcf05a
+c	"{ span.client.timeout = 5s }\n"	20	3	2a69ffc37c464ce7
+c	"{ span.client.timeout = 5s }\n"	2	1	156c16e221231f51
+c	"{ span.foo != nil }"	100	100	2213f6f0ff73a69a
+c	"{ span.foo != nil }"	20	3	22c2f748ccd0afa7
+c	"{ span.foo != nil }"	2	1	287ca98c850cbf91
+c	"{ span.foo = \"f\" }"	100	100	415c764cf3443133
+c	"{ span.foo = \"f\" }"	20	3	05f2cf391ed2abac
+c	"{ span.foo = \"f\" }"	2	1	1d3e20a1a8b69558
+c	"{ span.http.method = \"POST\" }\n"	100	100	49c0df425e96f3f6
+c	"{ span.http.method = \"POST\" }\n"	20	3	835141c91f942deb
+c	"{ span.http.method = \"POST\" }\n"	2	1	987581a7e1a2ce7d
+c	"{ span.http.method =~ \"P.*\" }"	100	100	49c0df425e96f3f6
+c	"{ span.http.method =~ \"P.*\" }"	20	3	835141c91f942deb
+c	"{ span.http.method =~ \"P.*\" }"	2	1	987581a7e1a2ce7d
+c	"{ span.http.route =~ `/api/v\\d+/.*` }\n"	100	100	8465ee5fb20fef45
+c	"{ span.http.route =~ `/api/v\\d+/.*` }\n"	20	3	2ecf5588888f2abe
+c	"{ span.http.route =~ `/api/v\\d+/.*` }\n"	2	1	4f0a4e72322d7486
+c	"{ span.http.status_code = 500 } || { status = ok }"	100	100	5ee6eda3151e38df
+c	"{ span.http.status_code = 500 } || { status = ok }"	20	3	be004a63ad8acf70
+c	"{ span.http.status_code = 500 } || { status = ok }"	2	1	9dca0c71e29532fa
+c	"{ span.http.status_code >= 500 }\n"	100	100	0a122e43cf2cd8ef
+c	"{ span.http.status_code >= 500 }\n"	20	3	ab5896fc0d562d80
+c	"{ span.http.status_code >= 500 }\n"	2	1	dbda2f477b896b34
+c	"{ span.http.url =~ \"/api/.*\" }\n"	100	100	905ea9501ffec7af
+c	"{ span.http.url =~ \"/api/.*\" }\n"	20	3	d6f1b021c01a5ec0
+c	"{ span.http.url =~ \"/api/.*\" }\n"	2	1	43575862a284e6f4
+c	"{ span.retried != false }\n"	100	100	55c1ea9f8ffee330
+c	"{ span.retried != false }\n"	20	3	a3de190ff18706ad
+c	"{ span.retried != false }\n"	2	1	a877fd5be5b389a4
+c	"{ span.success != nil }"	100	100	d4d87da0eeca5bff
+c	"{ span.success != nil }"	20	3	fe2b84842f507210
+c	"{ span.success != nil }"	2	1	9e1a93c367b43f84
+c	"{ span.success = true }"	100	100	1d3cdc7dd25f8f01
+c	"{ span.success = true }"	20	3	b29312682f888092
+c	"{ span.success = true }"	2	1	7a041266f1a34432
+c	"{ span.success }"	100	100	1d3cdc7dd25f8f01
+c	"{ span.success }"	20	3	b29312682f888092
+c	"{ span.success }"	2	1	7a041266f1a34432
+c	"{ span: id = \"0a1b\" }\n"	100	100	375ceb3a98142162
+c	"{ span: id = \"0a1b\" }\n"	20	3	c72ce38c764f7f7f
+c	"{ span: id = \"0a1b\" }\n"	2	1	ea53420e249c2179
+c	"{ span:childCount > 2 }\n"	100	100	79790b090e2435f9
+c	"{ span:childCount > 2 }\n"	20	3	320a93712d55ecba
+c	"{ span:childCount > 2 }\n"	2	1	ce9ec2fa5a0fc5b2
+c	"{ span:duration > 100ms }\n"	100	100	8e98b24d3ed3e151
+c	"{ span:duration > 100ms }\n"	20	3	51df3adad4953dce
+c	"{ span:duration > 100ms }\n"	2	1	433e277df993dd57
+c	"{ span:id = \"0a1b\" }\n"	100	100	375ceb3a98142162
+c	"{ span:id = \"0a1b\" }\n"	20	3	c72ce38c764f7f7f
+c	"{ span:id = \"0a1b\" }\n"	2	1	ea53420e249c2179
+c	"{ span:kind = server }\n"	100	100	ecb318af8b91b8d4
+c	"{ span:kind = server }\n"	20	3	f7306dcad572eff9
+c	"{ span:kind = server }\n"	2	1	2faf232f98b57bcd
+c	"{ span:name = \"checkout\" }\n"	100	100	d572c5c68045b476
+c	"{ span:name = \"checkout\" }\n"	20	3	dc8029e47f952b6b
+c	"{ span:name = \"checkout\" }\n"	2	1	f8940a6daea81afd
+c	"{ span:parentID = \"0000000000000001\" }"	100	100	9cf4f11837bc8182
+c	"{ span:parentID = \"0000000000000001\" }"	20	3	2616678285c7709f
+c	"{ span:parentID = \"0000000000000001\" }"	2	1	3583ad3ef5e30719
+c	"{ span:parentID = \"0a1b\" }\n"	100	100	375ceb3a98142162
+c	"{ span:parentID = \"0a1b\" }\n"	20	3	c72ce38c764f7f7f
+c	"{ span:parentID = \"0a1b\" }\n"	2	1	ea53420e249c2179
+c	"{ span:status = error }\n"	100	100	52a1243ee8a50deb
+c	"{ span:status = error }\n"	20	3	816dabc0941ad5c5
+c	"{ span:status = error }\n"	2	1	b1cfeca16d43d663
+c	"{ span:statusMessage = \"boom\" }\n"	100	100	1e0313547096c047
+c	"{ span:statusMessage = \"boom\" }\n"	20	3	2c54f3bd17867448
+c	"{ span:statusMessage = \"boom\" }\n"	2	1	d8d0f3b4d2937fac
+c	"{ status != ok }\n"	100	100	32e316024c1a7674
+c	"{ status != ok }\n"	20	3	6f373724914f0fc9
+c	"{ status != ok }\n"	2	1	aae41e4484c4e30c
+c	"{ status = error }\n"	100	100	52a1243ee8a50deb
+c	"{ status = error }\n"	20	3	816dabc0941ad5c5
+c	"{ status = error }\n"	2	1	b1cfeca16d43d663
+c	"{ status = error } && { kind = client }"	100	100	b296aa386aff1047
+c	"{ status = error } && { kind = client }"	20	3	dfc442f1fe34e448
+c	"{ status = error } && { kind = client }"	2	1	6e773d4e271aec47
+c	"{ status = error } | count() > 3\n"	100	100	1e2a4386b014daf5
+c	"{ status = error } | count() > 3\n"	20	3	c7ad9015a3a1f164
+c	"{ status = error } | count() > 3\n"	2	1	ca7a6bfd9fa30c90
+c	"{ status = error } | select(span.http.status_code, .foo, resource.service.name)\n"	100	100	e187599e24c7c3b5
+c	"{ status = error } | select(span.http.status_code, .foo, resource.service.name)\n"	20	3	287c9b626ebcc6ee
+c	"{ status = error } | select(span.http.status_code, .foo, resource.service.name)\n"	2	1	e5dfcada60d929a2
+c	"{ status = error } | select(status)"	100	100	52a1243ee8a50deb
+c	"{ status = error } | select(status)"	20	3	816dabc0941ad5c5
+c	"{ status = error } | select(status)"	2	1	b1cfeca16d43d663
+c	"{ status = error } || { duration > 1s }\n"	100	100	4b79a4a40685e598
+c	"{ status = error } || { duration > 1s }\n"	20	3	cdd4f9d5336b91a2
+c	"{ status = error } || { duration > 1s }\n"	2	1	77de8e0ff732f2c2
+c	"{ status = unset }\n"	100	100	0f279eb50919b47d
+c	"{ status = unset }\n"	20	3	8fd92ee5f731867c
+c	"{ status = unset }\n"	2	1	b7ebcfbd76fedb15
+c	"{ statusMessage = \"boom\" && kind = server }"	100	100	0e85ad833cc8786b
+c	"{ statusMessage = \"boom\" && kind = server }"	20	3	b4a155f5b5582214
+c	"{ statusMessage = \"boom\" && kind = server }"	2	1	f2d75e628a505bd0
+c	"{ statusMessage = \"boom\" }\n"	100	100	1e0313547096c047
+c	"{ statusMessage = \"boom\" }\n"	20	3	2c54f3bd17867448
+c	"{ statusMessage = \"boom\" }\n"	2	1	d8d0f3b4d2937fac
+c	"{ trace:duration > 1s }\n"	100	100	dc6a9d3b5069ae2e
+c	"{ trace:duration > 1s }\n"	20	3	c66a429ca7fe4fb3
+c	"{ trace:duration > 1s }\n"	2	1	a877fd5be5b389a4
+c	"{ trace:id = \"0a1b\" }\n"	100	100	375ceb3a98142162
+c	"{ trace:id = \"0a1b\" }\n"	20	3	c72ce38c764f7f7f
+c	"{ trace:id = \"0a1b\" }\n"	2	1	ea53420e249c2179
+c	"{ trace:rootName = \"GET /\" }\n"	100	100	3e5fc7d31b4ed27e
+c	"{ trace:rootName = \"GET /\" }\n"	20	3	3529083b2b4e9123
+c	"{ trace:rootName = \"GET /\" }\n"	2	1	c540763564e90a8a
+c	"{ trace:rootService = \"gw\" }\n"	100	100	3e5fc7d31b4ed27e
+c	"{ trace:rootService = \"gw\" }\n"	20	3	3529083b2b4e9123
+c	"{ trace:rootService = \"gw\" }\n"	2	1	c540763564e90a8a
+c	"{ traceDuration > 1s }\n"	100	100	dc6a9d3b5069ae2e
+c	"{ traceDuration > 1s }\n"	20	3	c66a429ca7fe4fb3
+c	"{ traceDuration > 1s }\n"	2	1	a877fd5be5b389a4
+c	"{ true }\n"	100	100	55c1ea9f8ffee330
+c	"{ true }\n"	20	3	a3de190ff18706ad
+c	"{ true }\n"	2	1	a877fd5be5b389a4
+c	"{ } | avg(duration) > 1ms"	100	100	737cfd374463cc97
+c	"{ } | avg(duration) > 1ms"	20	3	5cac0abaf000d490
+c	"{ } | avg(duration) > 1ms"	2	1	5407685654abd9fe
+c	"{ } | avg(span.a) > 0"	100	100	83c45c5af993d3ee
+c	"{ } | avg(span.a) > 0"	20	3	440d1edc2a6a7543
+c	"{ } | avg(span.a) > 0"	2	1	257b7b23b88368d0
+c	"{ } | by(kind) | select(span.a)"	100	100	7ae8c7554d170943
+c	"{ } | by(kind) | select(span.a)"	20	3	bf39d22b767ac3f1
+c	"{ } | by(kind) | select(span.a)"	2	1	0cf9b429c6b1337d
+c	"{ } | by(name)"	100	100	7961645d1696b1b1
+c	"{ } | by(name)"	20	3	76b14bfd0d2f1422
+c	"{ } | by(name)"	2	1	c3ebd8da1230ab24
+c	"{ } | by(span.a)"	100	100	a482d35245695431
+c	"{ } | by(span.a)"	20	3	fa8c701740e67439
+c	"{ } | by(span.a)"	2	1	1c7309321b942a04
+c	"{ } | by(span.a) | coalesce()"	100	100	55c1ea9f8ffee330
+c	"{ } | by(span.a) | coalesce()"	20	3	a3de190ff18706ad
+c	"{ } | by(span.a) | coalesce()"	2	1	a877fd5be5b389a4
+c	"{ } | by(span.a) | coalesce() | { name = \"b\" }"	100	100	a181a6a88ef68286
+c	"{ } | by(span.a) | coalesce() | { name = \"b\" }"	20	3	ccd60b3f91c3dd7b
+c	"{ } | by(span.a) | coalesce() | { name = \"b\" }"	2	1	4d72facd4178434d
+c	"{ } | by(span.success)"	100	100	e1dc4c67d5e79449
+c	"{ } | by(span.success)"	20	3	2300a876642f71ee
+c	"{ } | by(span.success)"	2	1	bab0daecfeb64124
+c	"{ } | by(status) | { .a = 1 }"	100	100	ac2b17c196b04cf6
+c	"{ } | by(status) | { .a = 1 }"	20	3	40ba12428b5e955f
+c	"{ } | by(status) | { .a = 1 }"	2	1	94a3fd614e6ce7c4
+c	"{ } | count() > 2 | coalesce()"	100	100	101d72f5da3883ef
+c	"{ } | count() > 2 | coalesce()"	20	3	36356badbb3a679c
+c	"{ } | count() > 2 | coalesce()"	2	1	057fd2d13dc75475
+c	"{ } | max(span.a) > 0"	100	100	ee4e3f4e51523e2d
+c	"{ } | max(span.a) > 0"	20	3	a56d856b31ee9dce
+c	"{ } | max(span.a) > 0"	2	1	279146f6d3d04641
+c	"{ } | min(.a) < 10"	100	100	5bb5f79e4a863719
+c	"{ } | min(.a) < 10"	20	3	0054efa861261cd2
+c	"{ } | min(.a) < 10"	2	1	f3b2f5078da0a509
+c	"{ } | min(span.a) < 100"	100	100	e7c3f4cf0f930729
+c	"{ } | min(span.a) < 100"	20	3	2cb0cd0d75f1780a
+c	"{ } | min(span.a) < 100"	2	1	9296b2d3865f6875
+c	"{ } | select(.a, span.a, resource.service.name)"	100	100	db72711ed4168586
+c	"{ } | select(.a, span.a, resource.service.name)"	20	3	52fd61394bdad704
+c	"{ } | select(.a, span.a, resource.service.name)"	2	1	58ef7e229c81cfcb
+c	"{ } | select(event.exception.type, link.relation, resource.k8s.pod.name, instrumentation.otel.scope.build)"	100	100	ea10cad13fd168c7
+c	"{ } | select(event.exception.type, link.relation, resource.k8s.pod.name, instrumentation.otel.scope.build)"	20	3	8d8d07f35b42aba5
+c	"{ } | select(event.exception.type, link.relation, resource.k8s.pod.name, instrumentation.otel.scope.build)"	2	1	3d828b80992fc7ff
+c	"{ } | select(status, kind, duration, span:id, trace:id)"	100	100	fd0141b42a8e7e24
+c	"{ } | select(status, kind, duration, span:id, trace:id)"	20	3	f1025d70e3129f4d
+c	"{ } | select(status, kind, duration, span:id, trace:id)"	2	1	06ff89e9aa6a8982
+c	"{ } | sum(span.a) > 0"	100	100	8296afb70564b231
+c	"{ } | sum(span.a) > 0"	20	3	e38b28ed77fdb7d2
+c	"{ } | sum(span.a) > 0"	2	1	6fcb8cdc019da719
+c	"{ } | { .a = 1 } | { name = \"b\" }"	100	100	c4b53ee1746724bf
+c	"{ } | { .a = 1 } | { name = \"b\" }"	20	3	1244376ccc6d6150
+c	"{ } | { .a = 1 } | { name = \"b\" }"	2	1	b5d37d1364cc2e44
+c	"{ } | { name = \"b\" }"	100	100	a181a6a88ef68286
+c	"{ } | { name = \"b\" }"	20	3	ccd60b3f91c3dd7b
+c	"{ } | { name = \"b\" }"	2	1	4d72facd4178434d
+c	"{ } | { status = error } | count() > 1 | select(span.a)"	100	100	e88435ce11e3ca45
+c	"{ } | { status = error } | count() > 1 | select(span.a)"	20	3	8f294cef78b43262
+c	"{ } | { status = error } | count() > 1 | select(span.a)"	2	1	9f4e64ce195bc632
+c	"{}\n"	100	100	55c1ea9f8ffee330
+c	"{}\n"	20	3	a3de190ff18706ad
+c	"{}\n"	2	1	a877fd5be5b389a4
+c	"{} | max(duration) <= 5s\n"	100	100	c33d3159665836b3
+c	"{} | max(duration) <= 5s\n"	20	3	eb73dee57592fcbc
+c	"{} | max(duration) <= 5s\n"	2	1	0ebbfa5ede409f90
+c	"{} | min(.retries) < 2\n"	100	100	8620a6f230a9ab3c
+c	"{} | min(.retries) < 2\n"	20	3	173d1b22d74f1951
+c	"{} | min(.retries) < 2\n"	2	1	7d08a841f8a7b88b
+c	"{} | sum(span.bytes) >= 1000\n"	100	100	758f983d84c65c09
+c	"{} | sum(span.bytes) >= 1000\n"	20	3	15e37bf775944e0a
+c	"{} | sum(span.bytes) >= 1000\n"	2	1	1844be8b263e2a60
+rz	"{}"	100	100	322454758b3ca416
+rz	"{}"	20	3	8c7264043c50b60b
+rz	"{}"	2	1	d95b16df1431d3d5
+rz	"{ span.tags != nil }"	100	100	8b26044bc6adea3a
+rz	"{ span.tags != nil }"	20	3	4c597d9de73b2ac7
+rz	"{ span.tags != nil }"	2	1	268ac12d5f2c40b1
+rz	"{ span.floats != nil }"	100	100	64a76452c39ffb16
+rz	"{ span.floats != nil }"	20	3	c0b96e0ebfae830b
+rz	"{ span.floats != nil }"	2	1	213b94a9cd249a1d
+rz	"{ span.ints != nil }"	100	100	5c02e43100dff79c
+rz	"{ span.ints != nil }"	20	3	1082ba58653a8931
+rz	"{ span.ints != nil }"	2	1	7a2a5512b9998cff
+rz	"{ span.bools != nil }"	100	100	b575098cb1eeff8f
+rz	"{ span.bools != nil }"	20	3	36529e547ed902a0
+rz	"{ span.bools != nil }"	2	1	c3a82220d8317154
+rz	"{ span.f = 2.0 }"	100	100	5d403131accb5142
+rz	"{ span.f = 2.0 }"	20	3	fb2fbb5f46c0bcdf
+rz	"{ span.f = 2.0 }"	2	1	8049b90fcdfca4d9
+rz	"{ span.a * 2 > 5 }"	100	100	163e524456f35d49
+rz	"{ span.a * 2 > 5 }"	20	3	1fd37d6c94fbb9ca
+rz	"{ span.a * 2 > 5 }"	2	1	6c4ba618bad0efbd
+b	"{}"	100	100	fdf97fd5522d7700
+b	"{}"	20	3	2d3d3326b888339d
+b	"{}"	2	1	21af870996c3e35e
+b	"{ span.s =~ \".+\" }"	100	100	443c66267a65f54d
+b	"{ span.s =~ \".+\" }"	20	3	b14b3118478dc156
+b	"{ span.s =~ \".+\" }"	2	1	5d2a55ebc379a98e
+b	"{ span.arr != nil }"	100	100	a37e0d176d3ad746
+b	"{ span.arr != nil }"	20	3	ef1b62bad3dd10bb
+b	"{ span.arr != nil }"	2	1	4fb0697eac75b50d
+p	"{ resource.rk_s =~ \"r.*\" }"	100	100	5926c34181fa0d0b
+p	"{ resource.rk_s =~ \"r.*\" }"	20	3	1e2aeb44fffaf034
+p	"{ resource.rk_s =~ \"r.*\" }"	2	1	2cdb522619d07070
+p	"{ resource.rk_i > 5 }"	100	100	b8ee8d93366aa276
+p	"{ resource.rk_i > 5 }"	20	3	086a777235d9856b
+p	"{ resource.rk_i > 5 }"	2	1	e06b3dce85e158fd
+p	"{ resource.rk_d > 1 }"	100	100	34f8e57f1ab4169f
+p	"{ resource.rk_d > 1 }"	20	3	ce921d33ee8f88b0
+p	"{ resource.rk_d > 1 }"	2	1	0870d1fb1f7bf724
+p	"{ resource.rk_b != nil }"	100	100	b4f396690ec183e7
+p	"{ resource.rk_b != nil }"	20	3	3f991ebb3db44be8
+p	"{ resource.rk_b != nil }"	2	1	389ed5dd6cd8864c
+p	"{ resource.rk_arr != nil }"	100	100	d3e7e4592390fa40
+p	"{ resource.rk_arr != nil }"	20	3	151e8e741fad3e5d
+p	"{ resource.rk_arr != nil }"	2	1	04697ff1dacf9d43
+p	"{ resource.rk_s = \"rv\" }"	100	100	5926c34181fa0d0b
+p	"{ resource.rk_s = \"rv\" }"	20	3	1e2aeb44fffaf034
+p	"{ resource.rk_s = \"rv\" }"	2	1	2cdb522619d07070
+p	"{ event.k > 3 }"	100	100	6e7b8f6d6329f705
+p	"{ event.k > 3 }"	20	3	bba0cbc07a845efe
+p	"{ event.k > 3 }"	2	1	b3810d3f21578a46
+p	"{ event.k >= 1 }"	100	100	ae689c43f09f26a0
+p	"{ event.k >= 1 }"	20	3	960ce632281fb53d
+p	"{ event.k >= 1 }"	2	1	2ab46ae938bccb07
+p	"{ event.t =~ \"b\" }"	100	100	d07a7590974cd828
+p	"{ event.t =~ \"b\" }"	20	3	30b1689285ee9615
+p	"{ event.t =~ \"b\" }"	2	1	ac9dfb597c0f31cb
+p	"{ event.k != nil }"	100	100	ae689c43f09f26a0
+p	"{ event.k != nil }"	20	3	960ce632281fb53d
+p	"{ event.k != nil }"	2	1	2ab46ae938bccb07
+p	"{ event:name =~ \"b.*\" }"	100	100	a06a3873e702b8ef
+p	"{ event:name =~ \"b.*\" }"	20	3	ffc4b59c3c78cd80
+p	"{ event:name =~ \"b.*\" }"	2	1	de8a7853084c4b34
+p	"{ event:name = \"gamma\" }"	100	100	429022c37fe364fc
+p	"{ event:name = \"gamma\" }"	20	3	e305a3834118d391
+p	"{ event:name = \"gamma\" }"	2	1	31fed1b5d862bd5f
+p	"{ event:timeSinceStart > 1500us }"	100	100	9ac34d7fa98efe73
+p	"{ event:timeSinceStart > 1500us }"	20	3	63b747a03b2a446c
+p	"{ event:timeSinceStart > 1500us }"	2	1	b7e084834ca57498
+p	"{ link.lk > 5 }"	100	100	a7d1b44f59dd70f3
+p	"{ link.lk > 5 }"	20	3	5603842f207fc7ec
+p	"{ link.lk > 5 }"	2	1	17fe4e371f452318
+p	"{ link:spanID =~ \"0b.*\" }"	100	100	2386630ae28e8191
+p	"{ link:spanID =~ \"0b.*\" }"	20	3	5603624c1769b5a2
+p	"{ link:spanID =~ \"0b.*\" }"	2	1	ffe068fbbebee882
+p	"{ link.lk != nil }"	100	100	c1683feb1bd4b497
+p	"{ link.lk != nil }"	20	3	6a1b4087467363d8
+p	"{ link.lk != nil }"	2	1	184c7f8a4cdc8c3c
+p	"{ .q =~ \".*q\" }"	100	100	c785d8d81c9e7673
+p	"{ .q =~ \".*q\" }"	20	3	bdb2a1fcd470ec6c
+p	"{ .q =~ \".*q\" }"	2	1	fc8282f481602c98
+p	"{ .p != nil }"	100	100	cd20e7147299203e
+p	"{ .p != nil }"	20	3	d959ad3b53351a63
+p	"{ .p != nil }"	2	1	e461071a1f19afd7
+p	"{ .r =~ \"ev-r.*\" }"	100	100	38c5cdf8d099c4ad
+p	"{ .r =~ \"ev-r.*\" }"	20	3	4bdab557198651b6
+p	"{ .r =~ \"ev-r.*\" }"	2	1	0ed4b07cae2e0dee
+p	"{ .s =~ \"link.*\" }"	100	100	2aa2a6614ee721f2
+p	"{ .s =~ \"link.*\" }"	20	3	eb5ab4a4b6329a0f
+p	"{ .s =~ \"link.*\" }"	2	1	ac79c03898ea7249
+p	"{ .u != nil }"	100	100	a7c5ba067b136c65
+p	"{ .u != nil }"	20	3	ccb64f3fb464b95e
+p	"{ .u != nil }"	2	1	c0a17a0dfe6d9126
+p	"{ .k > 2 }"	100	100	4d53e82a6fdcef0b
+p	"{ .k > 2 }"	20	3	9384b82785878634
+p	"{ .k > 2 }"	2	1	c3df04593baa8270
+p	"{ .k != nil }"	100	100	d916df3affaec24f
+p	"{ .k != nil }"	20	3	fa5237fadc47c2e0
+p	"{ .k != nil }"	2	1	fed2ae326048f60d
+p	"{ .r = \"ev-r2\" }"	100	100	d7964012c0772ff2
+p	"{ .r = \"ev-r2\" }"	20	3	9a532ffe928f540f
+p	"{ .r = \"ev-r2\" }"	2	1	2d48abe82db9d049
+p	"{ event.k > 3 && .p != nil }"	100	100	ae11b7d0f9dd78f9
+p	"{ event.k > 3 && .p != nil }"	20	3	491be185a5581dba
+p	"{ event.k > 3 && .p != nil }"	2	1	b41fa5a72333d92a
+p	"{ resource.rk_i > 5 } || { event:name = \"delta\" }"	100	100	e615736514a00ebe
+p	"{ resource.rk_i > 5 } || { event:name = \"delta\" }"	20	3	1aa58379e45a31e3
+p	"{ resource.rk_i > 5 } || { event:name = \"delta\" }"	2	1	9baed24284d27ec2
+p	"{ link:spanID = \"0B00000000000002\" }"	100	100	2386630ae28e8191
+p	"{ link:spanID = \"0B00000000000002\" }"	20	3	5603624c1769b5a2
+p	"{ link:spanID = \"0B00000000000002\" }"	2	1	ffe068fbbebee882
+p	"{ event.t != nil }"	100	100	5cc7ac6502bb5017
+p	"{ event.t != nil }"	20	3	d309b0e35cc19a58
+p	"{ event.t != nil }"	2	1	2a9b80ae69293bbc
+p	"{ .t != nil }"	100	100	5cc7ac6502bb5017
+p	"{ .t != nil }"	20	3	d309b0e35cc19a58
+p	"{ .t != nil }"	2	1	2a9b80ae69293bbc
+p	"{ resource.p = 42 }"	100	100	c706a0bfb1c60c68
+p	"{ resource.p = 42 }"	20	3	e8da1f8cbda182d5
+p	"{ resource.p = 42 }"	2	1	c9ca530421e1f70b
+p	"{ event.k * 2 > 5 }"	100	100	ef120cb80c371614
+p	"{ event.k * 2 > 5 }"	20	3	36187b273e3a8fb9
+p	"{ event.k * 2 > 5 }"	2	1	a39ef32386fe6c53
+p	"{ .k * 2 > 5 }"	100	100	6f7d60bb6389c6ca
+p	"{ .k * 2 > 5 }"	20	3	07ad955ae6633a97
+p	"{ .k * 2 > 5 }"	2	1	0ffe5c7d472469c1
+p	"{ event.k = event.k }"	100	100	ae689c43f09f26a0
+p	"{ event.k = event.k }"	20	3	960ce632281fb53d
+p	"{ event.k = event.k }"	2	1	2ab46ae938bccb07
+p	"{ link.lk - 1 > 4 }"	100	100	a7d1b44f59dd70f3
+p	"{ link.lk - 1 > 4 }"	20	3	5603842f207fc7ec
+p	"{ link.lk - 1 > 4 }"	2	1	17fe4e371f452318
+p	"{ .k = .k }"	100	100	d916df3affaec24f
+p	"{ .k = .k }"	20	3	fa5237fadc47c2e0
+p	"{ .k = .k }"	2	1	fed2ae326048f60d
+p	"{ link.lk = link.lk }"	100	100	c1683feb1bd4b497
+p	"{ link.lk = link.lk }"	20	3	6a1b4087467363d8
+p	"{ link.lk = link.lk }"	2	1	184c7f8a4cdc8c3c
+p	"{ .p * 2 > 50 }"	100	100	c706a0bfb1c60c68
+p	"{ .p * 2 > 50 }"	20	3	e8da1f8cbda182d5
+p	"{ .p * 2 > 50 }"	2	1	c9ca530421e1f70b
+nw	"{ nestedSetLeft > 0 }"	100	100	5ca6ab3af6217944
+nw	"{ nestedSetRight > 0 }"	100	100	4914abf9b872d910
+nw	"{ nestedSetParent > 0 }"	100	100	91d9e009872007e6

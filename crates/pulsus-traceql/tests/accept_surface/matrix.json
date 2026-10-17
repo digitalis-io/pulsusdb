@@ -433,7 +433,8 @@
       "pulsus": "accept",
       "verdict": "agree",
       "closed_by": 335,
-      "closed_class": "D3"
+      "closed_class": "D3",
+      "owning_issue": 602
     },
     {
       "query": "{ -!.a }",
@@ -441,7 +442,8 @@
       "pulsus": "accept",
       "verdict": "agree",
       "closed_by": 335,
-      "closed_class": "D3"
+      "closed_class": "D3",
+      "owning_issue": 602
     },
     {
       "query": "{ !.a && .b = 1 }",
