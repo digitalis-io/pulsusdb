@@ -1,6 +1,6 @@
 # ADR 0008: SQL composition for lowered query pipelines
 
-Status: **Accepted** (2026-09-01), extended 2026-09-02 — **Parts of this document describe the previous trace search engine, which no search request reaches since issue #602 part 2b; #602 part 2c-2b-1 deleted its test binaries, goldens and benches, and #602 part 2c-2b-2 deletes its code and the unit tests inside it; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.**
+Status: **Accepted** (2026-09-01), extended 2026-09-02 — **Parts of this document describe the previous trace search engine, which issue #602 part 2c-2b deleted — its test binaries, goldens and benches in part 2c-2b-1, its code and the unit tests inside it in part 2c-2b-2; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.**
 Issue: [#492](https://github.com/digitalis-io/pulsusdb/issues/492) (compile pipeline stages to SQL instead of evaluating them after transport)
 
 **What the 2026-09-02 extension added, and what it did not.** D1, D2 and D3 are unchanged, and every
@@ -56,7 +56,7 @@ performance regression nobody could see in the emitted SQL.
 Measured against corpus **C1**, described in [query-lowering.md §9](../query-lowering.md), on
 ClickHouse `26.3.17.110` in a container started for this work. Every figure is one
 `system.query_log` row per `query_id`, with the trace read path's own settings
-([`search_settings`](../../crates/pulsus-read/src/traces/exec.rs), line 2459) plus
+([`search_settings`](../../crates/pulsus-read/src/traces/exec.rs), line 2095) plus
 `use_query_condition_cache = 0` — see [query-lowering.md §9](../query-lowering.md) for why that
 setting is mandatory for any granule measurement on ClickHouse 26.3.
 

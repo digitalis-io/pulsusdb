@@ -1,6 +1,6 @@
 # PulsusDB Features & Compatibility Matrix
 
-**Parts of this document describe the previous trace search engine, which no search request reaches since issue #602 part 2b; #602 part 2c-2b-1 deleted its test binaries, goldens and benches, and #602 part 2c-2b-2 deletes its code and the unit tests inside it; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** This document enumerates every feature PulsusDB commits to and the milestone in which it lands. It is the source of truth for scoping GitHub issues — every row here should trace to one or more issues.
+**Parts of this document describe the previous trace search engine, which issue #602 part 2c-2b deleted — its test binaries, goldens and benches in part 2c-2b-1, its code and the unit tests inside it in part 2c-2b-2; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** This document enumerates every feature PulsusDB commits to and the milestone in which it lands. It is the source of truth for scoping GitHub issues — every row here should trace to one or more issues.
 
 Two product decisions frame the matrix:
 

@@ -1,6 +1,6 @@
 # The TraceQL query catalogue: the 50 refused queries
 
-**Parts of this document describe the previous trace search engine, which no search request reaches since issue #602 part 2b; #602 part 2c-2b-1 deleted its test binaries, goldens and benches, and #602 part 2c-2b-2 deletes its code and the unit tests inside it; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** The response is `docs/api.md` §4's envelope in every case — **`400`**,
+**Parts of this document describe the previous trace search engine, which issue #602 part 2c-2b deleted — its test binaries, goldens and benches in part 2c-2b-1, its code and the unit tests inside it in part 2c-2b-2; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** The response is `docs/api.md` §4's envelope in every case — **`400`**,
 `text/plain`, the message and nothing else — and this design changes neither the
 parser, the validator nor the planner, so it changes no refusal.
 

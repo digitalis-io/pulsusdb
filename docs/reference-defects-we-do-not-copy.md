@@ -1,6 +1,6 @@
 # Where the reference implementations are wrong, and what we do instead
 
-**Parts of this document describe the previous trace search engine, which no search request reaches since issue #602 part 2b; #602 part 2c-2b-1 deleted its test binaries, goldens and benches, and #602 part 2c-2b-2 deletes its code and the unit tests inside it; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** PulsusDB is built to answer LogQL, PromQL and TraceQL queries the way
+**Parts of this document describe the previous trace search engine, which issue #602 part 2c-2b deleted — its test binaries, goldens and benches in part 2c-2b-1, its code and the unit tests inside it in part 2c-2b-2; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** PulsusDB is built to answer LogQL, PromQL and TraceQL queries the way
 Grafana Loki, Prometheus and Grafana Tempo answer them. The standing rule
 is parity **except where the reference is wrong**. This file is the list
 of those exceptions: every place we found the reference behaving
