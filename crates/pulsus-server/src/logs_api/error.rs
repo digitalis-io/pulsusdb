@@ -185,7 +185,7 @@ impl IntoResponse for ApiError {
 /// | source | HTTP |
 /// |---|---|
 /// | `Parse`/`EmptyMatcherSet`/`ContradictoryMatchers`/`InvalidStep` | 400 |
-/// | `QueryTooBroad` | 422 |
+/// | `QueryTooBroad`, except the series cap `MetricSeries`: 400, bare reason (#605) | 422 |
 /// | `Clickhouse(Timeout)` | 504 |
 /// | `Clickhouse(_)` | 500 |
 fn read_error_parts(e: &ReadError) -> (StatusCode, String) {
@@ -223,6 +223,13 @@ fn read_error_parts(e: &ReadError) -> (StatusCode, String) {
         // (the LogQL engine never produces it), matched here for
         // exhaustiveness — mapped like the other 422 declines, mirroring
         // `prom_api::error::read_error_parts`.
+        // Issue #605: the result-series cap answers as the reference
+        // does — 400 and its body verbatim, without the `query too broad:`
+        // prefix (`pkg/util/server/error.go:110-117`, measured 400 in the
+        // #236 ledger entry).
+        ReadError::QueryTooBroad(
+            reason @ pulsus_read::logql::TooBroadReason::MetricSeries { .. },
+        ) => (StatusCode::BAD_REQUEST, reason.to_string()),
         ReadError::QueryTooBroad(_)
         | ReadError::NamelessSelectorUnresolvable { .. }
         | ReadError::HistogramResultUnsupported => {
