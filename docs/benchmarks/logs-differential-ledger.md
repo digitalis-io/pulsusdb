@@ -7093,3 +7093,30 @@ gated by
   `tests/fixtures/unwrap_parsers/undecided.tsv` holds `14  10` and
   `15  10` (the line `{"x":1e3, …}`), so the reduced statement hands it to
   today's route.
+
+## Issue #605 — partial results at the series cap for the drilldown app
+
+- **`logql-drilldown-partial-series`.** *Reference:* a request whose
+  `X-Query-Tags` carries `Source=grafana-lokiexplore-app` is served
+  partially at the series cap, at `200`, with the warning `maximum number
+  of series (500) reached for a single query; returning partial results`
+  (`pkg/logql/engine.go:536-591` @ v3.7.4). Its 500 are the first step's
+  vector cut to 500, or series admitted in step order until a new one
+  would pass the cap, where the walk stops; past that point a new series'
+  point lands in a series with no labels (`pkg/logql/engine.go:452-469`).
+  Its frontend splits a range query by hour and merges the parts. Read
+  from the source; not measured. *PulsusDB:* 500 series and the same
+  warning: the reference's 500 where its sort defines them (an instant
+  query ending in `sort`/`sort_desc`; a range query whose root is an
+  ungrouped one, by first step and then by value), otherwise the first
+  500 by first step and label set. Each kept series ends at the step
+  where the reference stops. No series without labels. Documented
+  limits, for queries the drilldown app does not send: `sort_desc(…) * 1`
+  at range keeps the first 500 by step and label set, not each step's
+  sorted order; and a range `label_replace` mapping 600 of one step's
+  series onto one label set answers that series whole with no warning, where the
+  reference cuts the 600 samples to 500 before they merge and answers 500
+  points with the warning (`pkg/logql/engine.go:536-548`). Pinned by
+  `the_series_cap_answers_as_the_reference`,
+  `a_partial_range_result_stops_at_the_step_where_the_cap_is_reached` and
+  `over_the_cap_a_partial_request_keeps_the_first_500_by_its_order`.
