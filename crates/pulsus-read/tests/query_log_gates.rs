@@ -1962,8 +1962,9 @@ async fn every_trace_engine_query_carries_the_memory_ceiling() {
              FROM numbers(64)"
         ),
         format!(
-            "INSERT INTO {run_db}.trace_tag_catalog (scope, key, val) \
-             SELECT 'span', 'http.status_code', concat('v', toString(number)) FROM numbers(64)"
+            "INSERT INTO {run_db}.tag_values (scope, key, value, val_type) \
+             SELECT 'span', 'http.status_code', concat('v', toString(number)), 'string' \
+             FROM numbers(64)"
         ),
         // Issue #587: the fetch moved to the span, per-trace and resource
         // tables, so this fixture has to seed those too — otherwise the
