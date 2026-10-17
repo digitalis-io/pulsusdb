@@ -39,10 +39,9 @@ use pulsus_read::SpanFilterCtx;
 use pulsus_read::logql::escape::ch_string;
 use pulsus_read::logql::{ReadError, TooBroadReason};
 use pulsus_read::traces::rows::{TagNameRow, TagValueRow};
+use pulsus_read::traces::spans::tags::{tag_names_sql, tag_values_sql};
 use pulsus_read::traces::tag_narrow::narrowing_from_query;
-use pulsus_read::traces::tags_sql::{
-    DaySpan, attr_values_narrowed_sql, span_name_values_sql, tag_names_sql, tag_values_sql,
-};
+use pulsus_read::traces::tags_sql::{DaySpan, attr_values_narrowed_sql, span_name_values_sql};
 use pulsus_read::{TAG_NAMES_MAX, TAG_VALUES_MAX, TraceEngine, TraceReadConfig};
 use pulsus_schema::{RenderCtx, SchemaParams};
 use pulsus_schema_testkit::run_init;
@@ -93,11 +92,6 @@ const ATTR_SCOPE_ROWS: u64 = 2 * KEYS_PER_SCOPE * VALS_PER_KEY;
 /// slightly.
 const RESERVED_SCOPE_ROWS: u64 = 2 * KEYS_PER_SCOPE * VALS_PER_KEY;
 const TOTAL_ROWS: u64 = ATTR_SCOPE_ROWS + RESERVED_SCOPE_ROWS;
-/// One ClickHouse granule. `index_granularity` is unset in the catalog's
-/// DDL (`crates/pulsus-schema/src/catalog.rs`), so the default 8192
-/// applies; the unscoped read may cross ONE boundary between the
-/// contiguous reserved range and the attribute range.
-const GRANULE_ROWS: u64 = 8_192;
 
 async fn exec(client: &ChClient, sql: &str) {
     client
@@ -125,16 +119,21 @@ async fn seed_catalog(client: &ChClient, db: &str) {
         exec(
             client,
             &format!(
-                "INSERT INTO {db}.trace_tag_catalog (scope, key, val) \
+                "INSERT INTO {db}.tag_values (scope, key, value, val_type) \
                  SELECT '{scope}', \
                         concat('k', toString(number % {KEYS_PER_SCOPE})), \
-                        concat('{prefix}', leftPad(toString(intDiv(number, {KEYS_PER_SCOPE})), 7, '0')) \
+                        concat('{prefix}', leftPad(toString(intDiv(number, {KEYS_PER_SCOPE})), 7, '0')), 'string' \
                  FROM numbers({})",
                 KEYS_PER_SCOPE * VALS_PER_KEY
             ),
         )
         .await;
     }
+    exec(
+        client,
+        &format!("INSERT INTO {db}.tag_names SELECT DISTINCT scope, key FROM {db}.tag_values"),
+    )
+    .await;
 }
 
 /// `system.tables`'s two key columns (issue #476 AC6).
@@ -237,7 +236,7 @@ struct CountRow {
 async fn catalog_count(client: &ChClient) -> u64 {
     let mut stream = client
         .query_stream::<CountRow>(
-            "SELECT toUInt64(count()) AS n FROM trace_tag_catalog",
+            "SELECT toUInt64(count()) AS n FROM tag_values",
             &QuerySettings::new(),
         )
         .await
@@ -328,7 +327,7 @@ async fn tag_discovery_prunes_scoped_shapes_and_records_the_degraded_paths() {
         .query_stream::<KeysRow>(
             &format!(
                 "SELECT primary_key, sorting_key FROM system.tables \
-                 WHERE database = '{DB}' AND name = 'trace_tag_catalog'"
+                 WHERE database = '{DB}' AND name = 'tag_values'"
             ),
             &QuerySettings::default(),
         )
@@ -340,14 +339,8 @@ async fn tag_discovery_prunes_scoped_shapes_and_records_the_degraded_paths() {
         .expect("trace_tag_catalog must exist")
         .expect("decode system.tables row");
     drop(stream);
-    assert_eq!(
-        keys.primary_key, "scope, key, val",
-        "migration 41 must leave the primary key alone — it is what prunes every tag read"
-    );
-    assert_eq!(
-        keys.sorting_key, "scope, key, val, val_type",
-        "migration 41 must APPEND val_type to the sorting key"
-    );
+    assert_eq!(keys.primary_key, "scope, key, value, val_type");
+    assert_eq!(keys.sorting_key, "scope, key, value, val_type");
 
     let resource = ch_string("resource");
     let key = ch_string("k3");
@@ -355,16 +348,6 @@ async fn tag_discovery_prunes_scoped_shapes_and_records_the_degraded_paths() {
     let unscoped_names = tag_names_sql(None, TAG_NAMES_MAX + 1);
     let scoped_values = tag_values_sql(&key, Some(&resource), TAG_VALUES_MAX + 1);
     let unscoped_values = tag_values_sql(&key, None, TAG_VALUES_MAX + 1);
-
-    // ---- Gate 1 (strict): scoped tag-names prune on the (scope) PK
-    // prefix — selected strictly below the catalog total. ----------------
-    let raw = explain_raw(&client, &scoped_names).await;
-    let (names_sel, names_total) = primary_key_granules(&raw);
-    assert!(
-        names_sel > 0 && names_sel < names_total,
-        "scoped tag-names must engage and strictly prune the (scope) prefix \
-         ({names_sel}/{names_total}):\n{raw}"
-    );
 
     // ---- Gate 2 (strict): scoped values prune on the (scope, key)
     // prefix — strictly fewer granules than the scoped-names shape, which
@@ -375,11 +358,6 @@ async fn tag_discovery_prunes_scoped_shapes_and_records_the_degraded_paths() {
         values_sel > 0 && values_sel < values_total,
         "scoped values must engage and strictly prune the (scope, key) prefix \
          ({values_sel}/{values_total}):\n{raw}"
-    );
-    assert!(
-        values_sel < names_sel,
-        "fixing (scope, key) must prune strictly deeper than fixing (scope) alone \
-         (values {values_sel} vs names {names_sel} of {names_total})"
     );
 
     // ---- Gate 3 (two-shape + query_log, the #53 AC3b idiom): the scoped
@@ -428,17 +406,22 @@ async fn tag_discovery_prunes_scoped_shapes_and_records_the_degraded_paths() {
     );
     exec(&client, "SYSTEM FLUSH LOGS").await;
 
-    let scoped_names_rows = read_rows_by_id(&client, "tags-scoped-names").await;
     let baseline_rows = read_rows_by_id(&client, "tags-unscoped-names").await;
     let scoped_values_rows = read_rows_by_id(&client, "tags-scoped-values").await;
     let unscoped_values_rows = read_rows_by_id(&client, "tags-unscoped-values").await;
+    let mut stream = client
+        .query_stream::<CountRow>(
+            "SELECT toUInt64(count()) AS n FROM tag_names",
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("names count");
+    let names_rows = stream.next().await.expect("one row").expect("decode").n;
+    drop(stream);
+    assert_eq!(names_rows, 40);
+    assert!(baseline_rows <= names_rows, "{baseline_rows}");
     assert!(
-        scoped_names_rows < baseline_rows,
-        "the scoped tag-names read must touch strictly fewer rows than the full-catalog \
-         baseline (scoped {scoped_names_rows} vs baseline {baseline_rows})"
-    );
-    assert!(
-        scoped_values_rows < baseline_rows,
+        scoped_values_rows < TOTAL_ROWS,
         "the scoped values read must touch strictly fewer rows than the full-catalog \
          baseline (scoped {scoped_values_rows} vs baseline {baseline_rows})"
     );
@@ -457,17 +440,6 @@ async fn tag_discovery_prunes_scoped_shapes_and_records_the_degraded_paths() {
     // rows". The contract stays "treat it as a full (small) catalog
     // scan" — the opportunistic exclusion is layout-dependent, not a
     // guarantee. Granule ratio + read_rows RECORDED (eprintln below). ----
-    assert!(
-        (ATTR_SCOPE_ROWS..=ATTR_SCOPE_ROWS + GRANULE_ROWS).contains(&baseline_rows),
-        "the unscoped tag-names read prunes to the attribute scopes: it must read their \
-         rows and at most one granule more, never the whole catalog \
-         (read {baseline_rows}, attribute half {ATTR_SCOPE_ROWS}, catalog {TOTAL_ROWS})"
-    );
-    assert!(
-        baseline_rows < TOTAL_ROWS,
-        "the unscoped tag-names read must not be a full catalog scan \
-         (read {baseline_rows} of {TOTAL_ROWS})"
-    );
     let raw = explain_raw(&client, &unscoped_values).await;
     let (unscoped_sel, unscoped_total) = primary_key_granules(&raw);
     eprintln!(
@@ -532,16 +504,21 @@ async fn seed_budget_catalog(client: &ChClient, db: &str) {
         exec(
             client,
             &format!(
-                "INSERT INTO {db}.trace_tag_catalog (scope, key, val) \
+                "INSERT INTO {db}.tag_values (scope, key, value, val_type) \
                  SELECT '{scope}', \
                         concat('k', toString(number % {BUDGET_KEYS_PER_SCOPE})), \
-                        concat('v', leftPad(toString(intDiv(number, {BUDGET_KEYS_PER_SCOPE})), 7, '0')) \
+                        concat('v', leftPad(toString(intDiv(number, {BUDGET_KEYS_PER_SCOPE})), 7, '0')), 'string' \
                  FROM numbers({})",
                 BUDGET_KEYS_PER_SCOPE * vals_per_key
             ),
         )
         .await;
     }
+    exec(
+        client,
+        &format!("INSERT INTO {db}.tag_names SELECT DISTINCT scope, key FROM {db}.tag_values"),
+    )
+    .await;
 }
 
 fn tight_budget_config() -> TraceReadConfig {
@@ -665,6 +642,7 @@ async fn tag_discovery_bounds_unscoped_scans_at_the_read_budget() {
 
     let seed_client = budget_data_client(budget_db).await;
     seed_budget_catalog(&seed_client, budget_db).await;
+    exec(&seed_client, &format!("INSERT INTO {budget_db}.tag_names SELECT 'span', concat('n', toString(number)) FROM numbers({BUDGET_TOTAL_ROWS})")).await;
 
     let engine = TraceEngine::new(budget_data_client(budget_db).await, tight_budget_config());
 
@@ -747,18 +725,20 @@ async fn tag_discovery_bounds_unscoped_scans_at_the_read_budget() {
         unscoped_names.read_rows, unscoped_values.read_rows
     );
 
-    // Both scoped shapes prune to the `scope = 'resource'` partition
+    // Both scoped shapes finish far under budget. The values shape prunes
+    // to the `scope = 'resource'` partition of `tag_values`
     // (`BUDGET_KEYS_PER_SCOPE * RESOURCE_VALS_PER_KEY` rows, one granule)
-    // and physically read exactly that partition — the `key = 'k3'`
-    // filter on the values shape is applied AFTER the granule read, so
-    // it does not shrink `read_rows` further; both are far under budget.
+    // and reads exactly that partition — the `key = 'k3'` filter is
+    // applied after the granule read (issue #598 part 1: the names shape
+    // reads `tag_names`, a separate table).
     let resource_partition_rows = BUDGET_KEYS_PER_SCOPE * RESOURCE_VALS_PER_KEY;
+    let scoped_values_rows = scoped_values.read_rows;
     for finished in [scoped_names, scoped_values] {
         assert_eq!(finished.kind, "QueryFinish", "{finished:?}");
         assert_eq!(finished.exception_code, 0, "{finished:?}");
-        assert_eq!(finished.read_rows, resource_partition_rows, "{finished:?}");
         assert!(finished.read_rows <= TIGHT_BUDGET_ROWS);
     }
+    assert_eq!(scoped_values_rows, resource_partition_rows);
 }
 
 /// Issue #478 added a request argument to `list_tag_values`. With no `q`
@@ -1243,10 +1223,10 @@ async fn seed_qm_catalog(client: &ChClient, db: &str) {
         exec(
             client,
             &format!(
-                "INSERT INTO {db}.trace_tag_catalog (scope, key, val) \
+                "INSERT INTO {db}.tag_values (scope, key, value, val_type) \
                  SELECT '{scope}', \
                         concat('k', toString(number % {QM_KEYS_PER_SCOPE})), \
-                        concat('v', leftPad(toString(intDiv(number, {QM_KEYS_PER_SCOPE})), 7, '0')) \
+                        concat('v', leftPad(toString(intDiv(number, {QM_KEYS_PER_SCOPE})), 7, '0')), 'string' \
                  FROM numbers({})",
                 QM_KEYS_PER_SCOPE * QM_VALS_PER_KEY
             ),
@@ -1263,15 +1243,20 @@ async fn seed_qm_catalog(client: &ChClient, db: &str) {
         exec(
             client,
             &format!(
-                "INSERT INTO {db}.trace_tag_catalog (scope, key, val) \
+                "INSERT INTO {db}.tag_values (scope, key, value, val_type) \
                  SELECT '{scope}', '{QM_KEY}', \
-                        concat('{prefix}', leftPad(toString(number), 7, '0')) \
+                        concat('{prefix}', leftPad(toString(number), 7, '0')), 'string' \
                  FROM numbers({QM_VALS_PER_KEY})"
             )
             .replace('?', "??"),
         )
         .await;
     }
+    exec(
+        client,
+        &format!("INSERT INTO {db}.tag_names SELECT DISTINCT scope, key FROM {db}.tag_values"),
+    )
+    .await;
 }
 
 fn qm_config() -> TraceReadConfig {

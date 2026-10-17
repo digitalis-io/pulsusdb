@@ -5050,3 +5050,307 @@ async fn t_x4_the_memory_ceiling_bounds_a_metrics_read() {
         "low: {body}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unnarrowed_value_list_reads_tag_values_alone() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_266;
+    // Nonce'd: `system.query_log` outlives the database, so a fixed name
+    // would find an earlier run's Select.
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis();
+    let db = ScopedDb::fresh(pulsus_testkit::test_db(&format!(
+        "pulsus_traces_api_v2_it_tt3_{nonce}"
+    )))
+    .await;
+    let _server = spawn_ready(port, &db);
+    let base = day_start_ns() + 3_600_000_000_000;
+    let spans: Vec<Span> = (0..1_000i64)
+        .map(|i| Span {
+            trace_id: vec![0xd3; 16],
+            span_id: (i as u64 + 1).to_be_bytes().to_vec(),
+            name: "op".to_string(),
+            kind: SpanKind::Server as i32,
+            start_time_unix_nano: (base + i) as u64,
+            end_time_unix_nano: (base + i + 1_000) as u64,
+            attributes: vec![kv_str("k", &format!("v{i:04}"))],
+            ..Default::default()
+        })
+        .collect();
+    ingest(port, "cart", spans, "T-T3");
+    let got = get(port, "/api/traces/v1/tag/span.k/values", "T-T3").json("T-T3");
+    let want = serde_json::json!({
+        "tagValues": (0..1_000).map(|i| serde_json::json!({"type": "string", "value": format!("v{i:04}")})).collect::<Vec<_>>(),
+        "truncated": false,
+    });
+    assert_eq!(got, want);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let name = db.to_string();
+    let admin = ChClient::new(live_db::conn_config(&name))
+        .await
+        .expect("connect");
+    loop {
+        admin
+            .execute(
+                "SYSTEM FLUSH LOGS",
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("flush logs");
+        let tables = scalar_of(
+            &name,
+            &format!(
+                "SELECT toString(groupArray(arraySort(arrayMap(x -> toString(x), tables)))) AS s \
+                 FROM system.query_log WHERE type = 'QueryFinish' AND query_kind = 'Select' \
+                 AND current_database = '{name}' \
+                 AND startsWith(query, 'SELECT DISTINCT value AS val, val_type')"
+            ),
+        )
+        .await;
+        if tables != "[]" {
+            assert_eq!(tables, format!("[['{name}.tag_values']]"));
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "T-T3: no tag-values Select logged"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// T-T9's read half and D10 (issue #598 part 1): an instrumentation-scope
+/// attribute is a name and a value; an array whose elements are all
+/// strings lists each element; a key/value list is a name with no value
+/// and its nested keys are not listed.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_scope_attribute_and_composite_values_are_listed() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_267;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_traces_api_v2_it_tt9")).await;
+    let _server = spawn_ready(port, &db);
+    let strs = |xs: &[&str]| {
+        Value::ArrayValue(ArrayValue {
+            values: xs
+                .iter()
+                .map(|x| AnyValue {
+                    value: Some(Value::StringValue(x.to_string())),
+                })
+                .collect(),
+        })
+    };
+    let kvlist = |key: &str, value: Value| {
+        Value::KvlistValue(KeyValueList {
+            values: vec![kv_any(key, value)],
+        })
+    };
+    let one = Span {
+        trace_id: vec![0xe9; 16],
+        span_id: vec![0x91; 8],
+        name: "op".to_string(),
+        kind: SpanKind::Server as i32,
+        start_time_unix_nano: (day_start_ns() + 3_600_000_000_000) as u64,
+        end_time_unix_nano: (day_start_ns() + 3_600_000_001_000) as u64,
+        attributes: vec![
+            kv_any("tags", strs(&["x", "y"])),
+            kv_any("composite", kvlist("a", kvlist("b", Value::IntValue(1)))),
+        ],
+        ..Default::default()
+    };
+    push(
+        port,
+        vec![ResourceSpans {
+            resource: Some(Resource {
+                attributes: vec![kv_str("service.name", "cart")],
+                ..Default::default()
+            }),
+            scope_spans: vec![ScopeSpans {
+                scope: Some(InstrumentationScope {
+                    name: "lib".to_string(),
+                    attributes: vec![kv_str("otel.scope.build", "release")],
+                    ..Default::default()
+                }),
+                spans: vec![one],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+        "T-T9",
+    );
+    for (path, want) in [
+        (
+            "/api/v2/search/tags?scope=instrumentation",
+            serde_json::json!({"scopes":[{"name":"instrumentation","tags":["otel.scope.build"]}]}),
+        ),
+        (
+            "/api/v2/search/tag/instrumentation.otel.scope.build/values",
+            serde_json::json!({"tagValues":[{"type":"string","value":"release"}]}),
+        ),
+        (
+            "/api/v2/search/tags?scope=span",
+            serde_json::json!({"scopes":[{"name":"span","tags":["composite","tags"]}]}),
+        ),
+        (
+            "/api/v2/search/tag/span.tags/values",
+            serde_json::json!({"tagValues":[
+                {"type":"string","value":"x"},
+                {"type":"string","value":"y"}
+            ]}),
+        ),
+        (
+            "/api/v2/search/tag/span.composite/values",
+            serde_json::json!({"tagValues":[]}),
+        ),
+    ] {
+        assert_eq!(get(port, path, "T-T9").json("T-T9"), want, "T-T9: {path}");
+    }
+}
+
+/// T-Q3 (issue #598 part 1): the g1 tag shapes the benchmark records
+/// (`fixtures/g1-tag-shapes.json`: its 48 names, 17 `resource.service.name`
+/// and 58 `span.http.route` values) answer within 4 KiB on every route that
+/// serves them.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_benchmark_tag_shapes_answer_within_4_kib() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/g1-tag-shapes.json"))
+            .expect("the fixture parses");
+    let strings = |key: &str| -> Vec<String> {
+        fixture[key]
+            .as_array()
+            .expect("a list")
+            .iter()
+            .map(|v| v.as_str().expect("a string").to_string())
+            .collect()
+    };
+    let services = strings("resource.service.name");
+    let routes = strings("span.http.route");
+    let names: Vec<(String, String)> = fixture["names"]
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(|p| {
+            (
+                p[0].as_str().expect("a scope").to_string(),
+                p[1].as_str().expect("a key").to_string(),
+            )
+        })
+        .collect();
+    assert_eq!((names.len(), services.len(), routes.len()), (48, 17, 58));
+    let others = |scope: &str, skip: &str| -> Vec<KeyValue> {
+        names
+            .iter()
+            .filter(|(s, k)| s == scope && k != skip)
+            .map(|(_, k)| kv_str(k, "x"))
+            .collect()
+    };
+    let port = 31_268;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_traces_api_v2_it_tq3")).await;
+    let _server = spawn_ready(port, &db);
+    let base = day_start_ns() + 3_600_000_000_000;
+    let mut resource_spans: Vec<ResourceSpans> = services
+        .iter()
+        .map(|service| {
+            let mut attributes = vec![kv_str("service.name", service)];
+            attributes.extend(others("resource", "service.name"));
+            ResourceSpans {
+                resource: Some(Resource {
+                    attributes,
+                    ..Default::default()
+                }),
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans: Vec::new(),
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }
+        })
+        .collect();
+    for (i, route) in routes.iter().enumerate() {
+        let mut attributes = vec![kv_str("http.route", route)];
+        attributes.extend(others("span", "http.route"));
+        let start = base + i as i64;
+        let mut s = Span {
+            trace_id: vec![0xe3; 16],
+            span_id: (i as u64 + 1).to_be_bytes().to_vec(),
+            name: "op".to_string(),
+            kind: SpanKind::Server as i32,
+            start_time_unix_nano: start as u64,
+            end_time_unix_nano: (start + 1_000) as u64,
+            attributes,
+            ..Default::default()
+        };
+        if i == 0 {
+            s.events = vec![Event {
+                time_unix_nano: start as u64,
+                name: "e".to_string(),
+                attributes: others("event", ""),
+                dropped_attributes_count: 0,
+            }];
+            s.links = vec![Link {
+                trace_id: vec![0x11; 16],
+                span_id: vec![0x22; 8],
+                attributes: others("link", ""),
+                ..Default::default()
+            }];
+        }
+        resource_spans[i % 17].scope_spans[0].spans.push(s);
+    }
+    push(port, resource_spans, "T-Q3");
+
+    let catalog_names = |body: &serde_json::Value| -> usize {
+        body["scopes"]
+            .as_array()
+            .expect("scopes")
+            .iter()
+            .filter(|s| s["name"] != "intrinsic")
+            .map(|s| s["tags"].as_array().expect("tags").len())
+            .sum()
+    };
+    for path in [
+        "/api/v2/search/tags",
+        "/api/traces/v1/tags",
+        "/api/v2/search/tags?scope=resource",
+        "/api/v2/search/tag/resource.service.name/values",
+        "/api/traces/v1/tag/resource.service.name/values",
+        "/api/v2/search/tag/span.http.route/values",
+        "/api/traces/v1/tag/span.http.route/values",
+    ] {
+        let res = get(port, path, "T-Q3");
+        assert_eq!(res.status, 200, "T-Q3: {path}");
+        assert!(
+            res.body.len() <= 4_096,
+            "T-Q3: {path} answered {} bytes, over 4 KiB",
+            res.body.len()
+        );
+        let body = res.json("T-Q3");
+        match path {
+            "/api/v2/search/tags" => assert_eq!(catalog_names(&body), 48, "T-Q3: {path}"),
+            "/api/v2/search/tag/resource.service.name/values" => assert_eq!(
+                body["tagValues"].as_array().expect("values").len(),
+                17,
+                "T-Q3: {path}"
+            ),
+            "/api/v2/search/tag/span.http.route/values" => assert_eq!(
+                body["tagValues"].as_array().expect("values").len(),
+                58,
+                "T-Q3: {path}"
+            ),
+            _ => {}
+        }
+    }
+}

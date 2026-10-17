@@ -286,6 +286,7 @@ fn spawn_ready_env(port: u16, db: &str, extra_env: &[(&str, &str)]) -> ChildGuar
     // does not exist: build it with `schema/schema.sh`" and `/ready` never
     // reaches 200. Idempotent, so repeated spawns cost one no-op render.
     live_db::build_schema_blocking(db);
+    live_db::register_push_target(port, db);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_pulsusdb"));
     cmd.env("PULSUS_HOST", "127.0.0.1")
         .env("PULSUS_PORT", port.to_string())
@@ -387,6 +388,17 @@ fn ingest(port: u16, spans: Vec<Span>, resource_attrs: Vec<KeyValue>, ctx: &str)
         "{ctx}: sync ingest must succeed, body {:?}",
         String::from_utf8_lossy(&res.body)
     );
+    live_db::settle_pushed_spans(port, &pushed_keys(&req), ctx);
+}
+
+/// The `(trace_id, span_id)` of every span `req` carries.
+fn pushed_keys(req: &ExportTraceServiceRequest) -> Vec<(Vec<u8>, Vec<u8>)> {
+    req.resource_spans
+        .iter()
+        .flat_map(|r| r.scope_spans.iter())
+        .flat_map(|s| s.spans.iter())
+        .map(|s| (s.trace_id.clone(), s.span_id.clone()))
+        .collect()
 }
 
 // ---------------------------------------------------------------------
@@ -575,6 +587,38 @@ async fn tag_discovery_against_real_clickhouse() {
         "{ctx}: deduped scoped tag names in (scope, key) order, body {json}"
     );
     assert_eq!(json["truncated"], false, "{ctx}: body {json}");
+    let full_scopes = scopes;
+
+    // -- T-T2 (issue #598 part 1): the names answer does not come from
+    // the span tables — emptied, it is unchanged. -----------------------
+    let ctx = "tags with the span tables emptied";
+    let truncate = ChClient::new(ch_config()).await.expect("connect admin");
+    for table in ["spans", "resources"] {
+        truncate
+            .execute(
+                &format!("TRUNCATE TABLE {db}.{table}"),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{ctx}: truncate {table}: {e}"));
+    }
+    let mut stream = truncate
+        .query_stream::<CountRow>(
+            &format!("SELECT count() AS n FROM {db}.spans"),
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("count spans");
+    let left = stream.next().await.expect("one row").expect("decode").n;
+    drop(stream);
+    assert_eq!(left, 0, "{ctx}: spans is empty");
+    let json = get_json(port, NAMES_URL, ctx, &mut discovered);
+    assert_eq!(
+        scopes_of(&json, ctx),
+        full_scopes,
+        "{ctx}: the same names as with the span tables full, body {json}"
+    );
 
     // -- scope= filters; start/end are accepted and IGNORED (the catalog
     // is time-less — a window excluding every span changes nothing). -----
@@ -601,11 +645,18 @@ async fn tag_discovery_against_real_clickhouse() {
         &mut discovered,
     );
     assert_eq!(
-        scopes_of(&json, ctx).len(),
-        1,
+        scopes_of(&json, ctx),
+        vec![(
+            "span".to_string(),
+            vec![
+                "bulk.id".to_string(),
+                "cache.hit".to_string(),
+                "http.status_code".to_string(),
+                "latency.bucket".to_string(),
+            ],
+        )],
         "{ctx}: span scope only, body {json}"
     );
-    assert_eq!(scopes_of(&json, ctx)[0].0, "span", "{ctx}");
 
     // -- scope=bogus is an explicit 400, never widened. ------------------
     let ctx = "tags scope=bogus";
@@ -969,25 +1020,25 @@ async fn tag_discovery_against_real_clickhouse() {
         )
         .await
         .expect("flush logs");
-    let sql = format!(
-        "SELECT arraySort(tables) AS tables FROM system.query_log \
-         WHERE type = 'QueryFinish' AND query_kind = 'Select' \
-           AND current_database = '{db}' \
-           AND (query LIKE 'SELECT DISTINCT scope, key%' OR query LIKE 'SELECT DISTINCT val%')"
-    );
-    let mut stream = admin
-        .query_stream::<TablesRow>(&sql, &QuerySettings::new())
-        .await
-        .expect("query_log read");
     let mut rows = 0usize;
-    while let Some(row) = stream.next().await {
-        let row = row.expect("decode query_log row");
-        rows += 1;
-        assert_eq!(
-            row.tables,
-            vec![format!("{db}.trace_tag_catalog")],
-            "a tag-discovery query must read exactly the catalog — no span/attr tables"
+    for (shape, table) in [
+        ("SELECT DISTINCT scope, key%", "tag_names"),
+        ("SELECT DISTINCT val%", "tag_values"),
+    ] {
+        let sql = format!(
+            "SELECT arraySort(tables) AS tables FROM system.query_log \
+             WHERE type = 'QueryFinish' AND query_kind = 'Select' \
+               AND current_database = '{db}' AND query LIKE '{shape}'"
         );
+        let mut stream = admin
+            .query_stream::<TablesRow>(&sql, &QuerySettings::new())
+            .await
+            .expect("query_log read");
+        while let Some(row) = stream.next().await {
+            let row = row.expect("decode query_log row");
+            rows += 1;
+            assert_eq!(row.tables, vec![format!("{db}.{table}")], "{shape}");
+        }
     }
     assert_eq!(
         rows, discovered,
@@ -1156,7 +1207,7 @@ async fn flush_and_count_trace_reads(admin: &ChClient, db: &str) -> u64 {
     let sql = format!(
         "SELECT toUInt64(count()) AS n FROM system.query_log \
          WHERE type = 'QueryFinish' AND query_kind = 'Select' \
-           AND arrayExists(t -> startsWith(t, '{db}.trace_'), arrayMap(x -> toString(x), tables))"
+           AND arrayExists(t -> startsWith(t, '{db}.trace_') OR t IN ('{db}.tag_names', '{db}.tag_values', '{db}.spans', '{db}.resources', '{db}.traces'), arrayMap(x -> toString(x), tables))"
     );
     let mut stream = admin
         .query_stream::<CountRow>(&sql, &QuerySettings::new())
@@ -1212,7 +1263,7 @@ async fn trace_read_rows(admin: &ChClient, db: &str) -> Vec<(String, Vec<String>
         "SELECT query, arraySort(arrayMap(x -> toString(x), tables)) AS tables \
          FROM system.query_log \
          WHERE type = 'QueryFinish' AND query_kind = 'Select' \
-           AND arrayExists(t -> startsWith(t, '{db}.trace_'), arrayMap(x -> toString(x), tables))"
+           AND arrayExists(t -> startsWith(t, '{db}.trace_') OR t IN ('{db}.tag_names', '{db}.tag_values', '{db}.spans', '{db}.resources', '{db}.traces'), arrayMap(x -> toString(x), tables))"
     );
     let mut stream = admin
         .query_stream::<QueryTablesRow>(&sql, &QuerySettings::new())
@@ -1229,7 +1280,7 @@ async fn trace_read_rows(admin: &ChClient, db: &str) -> Vec<(String, Vec<String>
 /// The catalog rows the colliding corpus produced, ascending.
 async fn catalog_rows(admin: &ChClient, db: &str) -> Vec<(String, String, String)> {
     let sql = format!(
-        "SELECT DISTINCT scope, key, val FROM {db}.trace_tag_catalog ORDER BY scope, key, val"
+        "SELECT DISTINCT scope, key, value AS val FROM {db}.tag_values ORDER BY scope, key, val"
     );
     let mut stream = admin
         .query_stream::<CatalogRow>(&sql, &QuerySettings::new())
@@ -1313,6 +1364,7 @@ fn ingest_colliding_corpus(port: u16, base_ns: u64) {
         "colliding corpus: sync ingest must succeed, body {:?}",
         String::from_utf8_lossy(&res.body)
     );
+    live_db::settle_pushed_spans(port, &pushed_keys(&req), "colliding corpus");
 }
 
 /// Issue #475: the intrinsic scope, the static `status`/`kind` values,
@@ -1367,16 +1419,6 @@ async fn intrinsic_discovery_answers_from_the_vocabulary_and_reads_no_trace_tabl
         vec![
             ("event".to_string(), "kind".to_string(), "retry".to_string()),
             (
-                "event:intrinsic".to_string(),
-                "name".to_string(),
-                "exception".to_string()
-            ),
-            (
-                "event:intrinsic".to_string(),
-                "timeSinceStart".to_string(),
-                "5000000".to_string()
-            ),
-            (
                 "instrumentation".to_string(),
                 "sdk".to_string(),
                 "rust".to_string()
@@ -1385,16 +1427,6 @@ async fn intrinsic_discovery_answers_from_the_vocabulary_and_reads_no_trace_tabl
                 "link".to_string(),
                 "spanID".to_string(),
                 "from-attribute".to_string()
-            ),
-            (
-                "link:intrinsic".to_string(),
-                "spanID".to_string(),
-                "0000000000000063".to_string()
-            ),
-            (
-                "link:intrinsic".to_string(),
-                "traceID".to_string(),
-                "00000000000000000000000000000007".to_string()
             ),
             (
                 "resource".to_string(),
@@ -1932,8 +1964,8 @@ async fn trace_tag_values_memory_breach_is_422() {
     client
         .execute(
             &format!(
-                "INSERT INTO {db}.trace_tag_catalog (scope, key, val) \
-                 SELECT 'span', 'bulk.id', concat('v', leftPad(toString(number), 9, '0')) \
+                "INSERT INTO {db}.tag_values (scope, key, value, val_type) \
+                 SELECT 'span', 'bulk.id', concat('v', leftPad(toString(number), 9, '0')), 'string' \
                  FROM numbers({MEM_CATALOG_ROWS})"
             ),
             &QuerySettings::new(),
@@ -1996,8 +2028,8 @@ async fn the_default_trace_memory_ceiling_does_not_refuse_a_catalog_read() {
     client
         .execute(
             &format!(
-                "INSERT INTO {db}.trace_tag_catalog (scope, key, val) \
-                 SELECT 'span', 'bulk.id', concat('v', leftPad(toString(number), 9, '0')) \
+                "INSERT INTO {db}.tag_values (scope, key, value, val_type) \
+                 SELECT 'span', 'bulk.id', concat('v', leftPad(toString(number), 9, '0')), 'string' \
                  FROM numbers({MEM_CATALOG_ROWS})"
             ),
             &QuerySettings::new(),
@@ -2164,6 +2196,7 @@ fn ac_ingest(port: u16, span: AcSpan, ctx: &str) {
         "{ctx}: sync ingest must succeed, body {:?}",
         String::from_utf8_lossy(&res.body)
     );
+    live_db::settle_pushed_spans(port, &pushed_keys(&req), ctx);
 }
 
 /// The returned trace-id set of a `/api/traces/v1/search` response.
@@ -2339,7 +2372,7 @@ async fn the_stored_attribute_type_reaches_the_wire_and_its_query_returns_the_tr
     let client = ChClient::new(cfg).await.expect("connect data client");
     client
         .execute(
-            "OPTIMIZE TABLE trace_tag_catalog FINAL",
+            "OPTIMIZE TABLE tag_values FINAL",
             &QuerySettings::default(),
             Idempotency::Idempotent,
         )
@@ -2621,7 +2654,7 @@ async fn the_stored_attribute_type_reaches_the_wire_and_its_query_returns_the_tr
     // =================================================================
     client
         .execute(
-            "INSERT INTO trace_tag_catalog (scope, key, val, val_type) VALUES \
+            "INSERT INTO tag_values (scope, key, value, val_type) VALUES \
              ('span', 'legacy_numeric_text', '1.5', ''), \
              ('span', 'legacy_plain', 'alpha', ''), \
              ('span', 'legacy_upgrade', '500', ''), \
@@ -2633,7 +2666,7 @@ async fn the_stored_attribute_type_reaches_the_wire_and_its_query_returns_the_tr
         .expect("seed legacy catalog rows");
     client
         .execute(
-            "OPTIMIZE TABLE trace_tag_catalog FINAL",
+            "OPTIMIZE TABLE tag_values FINAL",
             &QuerySettings::default(),
             Idempotency::Idempotent,
         )
@@ -2718,7 +2751,7 @@ async fn the_stored_attribute_type_reaches_the_wire_and_its_query_returns_the_tr
         .query_stream::<KeysRow>(
             &format!(
                 "SELECT primary_key, sorting_key FROM system.tables \
-                 WHERE database = '{db}' AND name = 'trace_tag_catalog'"
+                 WHERE database = '{db}' AND name = 'tag_values'"
             ),
             &QuerySettings::default(),
         )
@@ -2731,12 +2764,12 @@ async fn the_stored_attribute_type_reaches_the_wire_and_its_query_returns_the_tr
         .expect("decode system.tables row");
     drop(stream);
     assert_eq!(
-        keys.primary_key, "scope, key, val",
+        keys.primary_key, "scope, key, value, val_type",
         "the primary key must be UNCHANGED by migration 41 — it is what prunes every \
          tag-values read"
     );
     assert_eq!(
-        keys.sorting_key, "scope, key, val, val_type",
+        keys.sorting_key, "scope, key, value, val_type",
         "the sorting key must APPEND val_type — without it the ReplacingMergeTree collapses \
          a string and an int sharing the same text"
     );
@@ -2766,7 +2799,7 @@ async fn the_stored_attribute_type_reaches_the_wire_and_its_query_returns_the_tr
 /// as its SELECT list, which is what separates the two `val, val_type`
 /// reads.
 const SHAPE_NAMES: &str = "SELECT DISTINCT scope, key";
-const SHAPE_CATALOG_VALUES: &str = "SELECT DISTINCT val, val_type\nFROM trace_tag_catalog";
+const SHAPE_CATALOG_VALUES: &str = "SELECT DISTINCT value AS val, val_type\nFROM tag_values";
 const SHAPE_NARROWED_VALUES: &str = "SELECT DISTINCT val, val_type\nFROM trace_attrs_idx";
 const SHAPE_SPAN_NAMES: &str = "SELECT DISTINCT if(length(name)";
 
@@ -2887,14 +2920,15 @@ async fn six_request_classes_read_exactly_these_tables() {
         .await
         .expect("flush logs");
 
-    let catalog = vec![format!("{db}.trace_tag_catalog")];
+    let names = vec![format!("{db}.tag_names")];
+    let catalog = vec![format!("{db}.tag_values")];
     let spans = vec![format!("{db}.trace_spans")];
     let both = vec![format!("{db}.trace_attrs_idx"), format!("{db}.trace_spans")];
 
     // Classes 1, 2a and 2b — three name reads, catalog only.
     assert_eq!(
         shape_rows(&admin, db, SHAPE_NAMES).await,
-        vec![catalog.clone(), catalog.clone(), catalog.clone()],
+        vec![names.clone(), names.clone(), names.clone()],
         "the three tag-names classes read exactly the catalog, one Select each"
     );
     // Class 3 — the unnarrowed attribute values read, unchanged.
@@ -2944,9 +2978,11 @@ async fn six_request_classes_read_exactly_these_tables() {
     for shape in [SHAPE_NAMES, SHAPE_CATALOG_VALUES] {
         for tables in shape_rows(&admin, db, shape).await {
             assert!(
-                !tables
-                    .iter()
-                    .any(|t| t.ends_with(".trace_spans") || t.ends_with(".trace_attrs_idx")),
+                !tables.iter().any(|t| t.ends_with(".trace_spans")
+                    || t.ends_with(".trace_attrs_idx")
+                    || t.ends_with(".spans")
+                    || t.ends_with(".resources")
+                    || t.ends_with(".traces")),
                 "a catalog-backed class touched a span table: {tables:?}"
             );
         }

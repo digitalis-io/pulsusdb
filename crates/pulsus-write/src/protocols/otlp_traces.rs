@@ -4109,9 +4109,8 @@ mod landing_tests {
     ///
     /// A kind-2 row is emitted for every key the push carries in any scope,
     /// including a key whose value went to `attrs_other` and a key whose
-    /// value is a kvlist, whose stored leaf paths also each get their own
-    /// row under their full dotted key. A kind-3 row is emitted for a scalar
-    /// and for each element of a scalar array, and for nothing else.
+    /// value is a kvlist. A kind-3 row is emitted for a scalar and for each
+    /// element of a scalar array, and for nothing else.
     #[test]
     fn the_catalogs_list_every_key_and_only_the_scalar_values() {
         let req = request_of(
@@ -4124,6 +4123,15 @@ mod landing_tests {
                 kv(
                     "composite",
                     kvlist_value(vec![("a", kvlist_value(vec![("b", int_value(1))]))]),
+                ),
+                kv("ints", array_value(vec![int_value(7), int_value(8)])),
+                kv(
+                    "doubles",
+                    array_value(vec![double_value(1.5), double_value(2.5)]),
+                ),
+                kv(
+                    "bools",
+                    array_value(vec![bool_value(true), bool_value(false)]),
                 ),
             ])],
         );
@@ -4138,14 +4146,16 @@ mod landing_tests {
         assert_eq!(
             span_names,
             vec![
+                "bools",
                 "composite",
-                "composite.a.b",
+                "doubles",
+                "ints",
                 "mixed",
                 "opaque",
                 "plain",
                 "tags",
             ],
-            "every key the push carried is named, the composite's leaf included"
+            "every top-level key the push carried is named, and no composite leaf"
         );
 
         let span_values: Vec<String> = parsed
@@ -4157,6 +4167,12 @@ mod landing_tests {
         assert_eq!(
             span_values,
             vec![
+                "bools=false:bool".to_string(),
+                "bools=true:bool".to_string(),
+                "doubles=1.5:float".to_string(),
+                "doubles=2.5:float".to_string(),
+                "ints=7:int".to_string(),
+                "ints=8:int".to_string(),
                 "plain=v:string".to_string(),
                 "tags=x:string".to_string(),
                 "tags=y:string".to_string(),
@@ -4165,15 +4181,26 @@ mod landing_tests {
              for a mixed array, a kvlist or a value in attrs_other"
         );
 
-        // The resource's own `service.name` is neither named nor valued: the
-        // span row carries it as a column.
+        // The resource's own string `service.name` is named and valued like
+        // any resource key (issue #598 part 1).
         assert!(
-            !parsed
+            parsed
                 .tag_names
                 .iter()
                 .any(|t| t.scope == TagScope::Resource && t.key == "service.name"),
-            "service.name is a column, not a catalog entry: {:?}",
+            "service.name is a catalog name: {:?}",
             parsed.tag_names
+        );
+        let resource_values: Vec<String> = parsed
+            .tag_values
+            .iter()
+            .filter(|t| t.scope == TagScope::Resource)
+            .map(|t| format!("{}={}:{}", t.key, t.value, t.val_type))
+            .collect();
+        assert_eq!(
+            resource_values,
+            vec!["service.name=checkout:string".to_string()],
+            "its string value is one `string` value row"
         );
     }
 
@@ -4294,7 +4321,7 @@ mod landing_tests {
         );
         assert_eq!(
             parsed.total_rows(),
-            3 + 1 + 1 + 2,
+            3 + 1 + 2 + 3,
             "the per-push row ceiling counts all four kinds"
         );
 
@@ -4820,6 +4847,7 @@ mod landing_tests {
             vec![
                 "span:kept.key".to_string(),
                 "resource:host.name".to_string(),
+                "resource:service.name".to_string(),
                 "instrumentation:scope.key".to_string(),
             ],
             "the refused span's own, its event's and its link's keys are absent"
@@ -4834,6 +4862,7 @@ mod landing_tests {
             vec![
                 "span:kept-value".to_string(),
                 "resource:node-a".to_string(),
+                "resource:checkout".to_string(),
                 "instrumentation:scope-value".to_string(),
             ],
             "and so are their values"
