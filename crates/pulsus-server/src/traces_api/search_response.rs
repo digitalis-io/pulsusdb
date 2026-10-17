@@ -1579,8 +1579,8 @@ mod tests {
     /// DERIVED from [`render`] over both partiality branches, never
     /// restated. That sentence is the public contract for
     /// `/api/traces/v1/search` and its `/api/search` alias, and the
-    /// hermetic docs pin in `crates/pulsus-read/tests/traces_search_sql.rs`
-    /// compares the document against a *constant*; this is the half that
+    /// hermetic docs pin [`the_search_contracts_are_documented`] (moved from
+    /// `traces_search_sql.rs`) compares the document against a *constant*; this is the half that
     /// compares it against the code.
     ///
     /// **What it couples:** the union of the `metrics` key sets across
@@ -2505,6 +2505,37 @@ mod tests {
         let attrs = &v["traces"][0]["spanSets"][0]["spans"][0]["attributes"];
         for (i, (_, want)) in cases.iter().enumerate() {
             assert_eq!(attrs[i]["value"], *want, "case {i}");
+        }
+    }
+
+    /// The `docs/api.md` §4.2 half of `traces_search_sql.rs`'s
+    /// `shipped_shapes_and_limits_are_documented`, moved here unchanged when
+    /// #602 part 2c-2b-1 deleted that file with the previous search engine's
+    /// tests: the public contracts of `/api/traces/v1/search` the document
+    /// must state. Its `docs/schemas.md` halves described that engine and
+    /// were not moved.
+    #[test]
+    fn the_search_contracts_are_documented() {
+        let api = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/api.md"),
+        )
+        .expect("read docs/api.md");
+        for needle in [
+            "\"completedJobs\":<n>,\"totalJobs\":<n>",
+            "**Ordering contract:**",
+            "trace_id` ascending as the tiebreak",
+            "too broad to bound, never silently slow or quietly incomplete | `422` |",
+            "mutually exclusive",
+            "logfmt",
+            "8192-byte",
+            "2048 UTF-8 code points",
+            "<root span not yet received>",
+            "the same number for two different inputs",
+        ] {
+            assert!(
+                api.contains(needle),
+                "docs/api.md §4.2 must document {needle:?}"
+            );
         }
     }
 }
