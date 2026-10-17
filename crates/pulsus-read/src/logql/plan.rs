@@ -7826,8 +7826,8 @@ mod tests {
     }
 
     /// AC 32/59-style censuses over plan.rs production text (before the
-    /// column-0 `#[cfg(test)]`, `//` text stripped — the `search_sql.rs`
-    /// precedent).
+    /// column-0 `#[cfg(test)]`, `//` text stripped — the precedent of the
+    /// previous search engine's `search_sql.rs`).
     #[test]
     fn variants_plan_census() {
         let src = include_str!("plan.rs");

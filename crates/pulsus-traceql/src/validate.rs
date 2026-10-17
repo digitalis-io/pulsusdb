@@ -10,7 +10,7 @@
 //! **Route independence is structural, not conventional.** This crate
 //! cannot name `pulsus_read` (the reverse dependency edge is a cargo
 //! cycle: `pulsus-read` depends on `pulsus-traceql`), so the planner's
-//! context types (`PlanError`, `plan_search`, `SearchCtx`) are
+//! context types (`PlanError`, `plan_search_request`) are
 //! unnameable here, and [`validate`]'s signature carries no route, no
 //! parameter name and no request context to branch on. The planner is
 //! stricter than the reference's validator in places (`{} | rate()` on

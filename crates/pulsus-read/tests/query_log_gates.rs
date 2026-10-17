@@ -2016,12 +2016,9 @@ async fn every_trace_engine_query_carries_the_memory_ceiling() {
         spans_v2_table: "spans".to_string(),
         traces_table: "traces".to_string(),
         resources_table: "resources".to_string(),
-        max_candidates: 100_000,
         scan_budget_rows: 50_000_000,
-        event_set_max_values: 1_000_000,
         max_depth: 64,
         max_series: 1_000,
-        generator_max_memory_bytes: MEM_CEILING,
         // The surface-wide ceiling under test. Set equal to the generator's
         // so the single sweep predicate below covers both — the generator
         // deliberately overrides `max_memory_usage` with its own (tighter

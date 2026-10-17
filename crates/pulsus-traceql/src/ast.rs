@@ -884,7 +884,7 @@ impl fmt::Display for StatusValue {
 /// **This one is not a grammar corner: our own product emits it and could
 /// not read it back.** `pulsus-read` renders `unspecified` into a
 /// `by(kind)` group value and a `select(kind)` projection
-/// (`traces/search_eval.rs`'s `kind_keyword`) and into the `by(kind)`
+/// (the search statement's decode) and into the `by(kind)`
 /// series label of served SQL (`traces/metrics_sql.rs`'s `KIND_MAP`, which
 /// maps code 0 to `'unspecified'`). The reference offers the same word
 /// back from `/api/v2/search/tag/kind/values`, and the Grafana datasource

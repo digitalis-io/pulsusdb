@@ -43,8 +43,7 @@ use crate::logql::escape;
 use crate::traces::PlanError;
 use crate::traces::exec::ByteBudget;
 use crate::traces::filter::flip_comparison;
-use crate::traces::search_eval::{GroupValue, ProjectedAttribute};
-use crate::traces::search_plan::WireKey;
+use crate::traces::values::{GroupValue, ProjectedAttribute, WireKey};
 use pulsus_clickhouse::ChError;
 
 /// The most groups one search projects: the group index travels as a
@@ -177,7 +176,8 @@ impl Projection {
         Ok(projection)
     }
 
-    /// Today's `collect_projection_leaves` walk (`search_plan.rs`), adding
+    /// The walk the previous search engine's `collect_projection_leaves`
+    /// made (deleted by #602 part 2c-2b-2), adding
     /// each projecting condition as a source. `neg` is whether an odd
     /// number of `!` sits above the node.
     fn walk(

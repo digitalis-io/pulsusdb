@@ -3,7 +3,7 @@
 //! # Two claimed domains, not one
 //!
 //! **(a) Criteria 1–3** read the PARSED SOURCE TEXT of ONE file in this
-//! crate — `src/traces/search_eval.rs` — and say nothing about what that
+//! crate — `src/traces/values.rs` — and say nothing about what that
 //! text expands to. They pin the `SpanSummary` declaration: `name` is
 //! private and `Option<String>`, the item's complete attribute list is
 //! exactly the committed derive, and the file holds exactly one such
@@ -78,8 +78,9 @@ const PINNED_NAME_TYPE: &str = "Option<String>";
 ///
 /// Any item macro can emit a struct AFTER expansion, which no walk over
 /// explicit items can see, so the default is REJECT and the exception is
-/// this committed list.
-const PINNED_ITEM_MACROS: &[&str] = &["clone_probe::thread_local!"];
+/// this committed list. `values.rs` holds none; the one `search_eval.rs`
+/// held (`clone_probe::thread_local!`) went with that file, #602 part 2c-2b-2.
+const PINNED_ITEM_MACROS: &[&str] = &[];
 
 /// The `pulsus_read` types criterion 4 probes. Criterion 4 asserts this
 /// equals the set DERIVED from the renderer's own production names, so it
@@ -287,7 +288,7 @@ fn collect(
 
 /// The one scanned declaration, plus the file's complete item-macro list.
 fn span_summary_decl() -> (Vec<syn::ItemStruct>, Vec<String>) {
-    let file = parse("src/traces/search_eval.rs");
+    let file = parse("src/traces/values.rs");
     let mut structs = Vec::new();
     let mut macros = Vec::new();
     collect(&file.items, "", &mut structs, &mut macros);

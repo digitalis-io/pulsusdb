@@ -435,7 +435,7 @@ pub(crate) fn metrics_engine(
 /// and flips `distributed` so the search engine injects the
 /// docs/schemas.md §7 clustered-reader settings; an unclustered
 /// deployment reads the base tables directly. Search budgets/caps map
-/// from `reader.traceql_max_candidates` / `reader.traceql_scan_budget_rows`.
+/// from `reader.traceql_scan_budget_rows`.
 pub(crate) fn trace_read_config_from(config: &Config) -> TraceReadConfig {
     let dist = if config.cluster.is_some() {
         config.dist_suffix.as_str()
@@ -464,12 +464,9 @@ pub(crate) fn trace_read_config_from(config: &Config) -> TraceReadConfig {
         spans_v2_table: format!("spans{dist}"),
         traces_table: format!("traces{dist}"),
         resources_table: "resources".to_string(),
-        max_candidates: config.reader.traceql_max_candidates,
         scan_budget_rows: config.reader.traceql_scan_budget_rows,
-        event_set_max_values: config.reader.traceql_event_set_max_values,
         max_depth: config.reader.traceql_max_depth,
         max_series: config.reader.traceql_max_series,
-        generator_max_memory_bytes: config.reader.traceql_generator_max_memory_bytes,
         // Issue #398: the TraceQL per-query ClickHouse memory ceiling's
         // production carrier — `ReaderConfig -> TraceReadConfig ->
         // traces::exec::{search_settings, catalog_settings}` (and, through
@@ -1000,12 +997,7 @@ mod tests {
     fn trace_read_config_from_maps_the_search_budgets() {
         let config = Config::default();
         let cfg = trace_read_config_from(&config);
-        assert_eq!(cfg.max_candidates, config.reader.traceql_max_candidates);
         assert_eq!(cfg.scan_budget_rows, config.reader.traceql_scan_budget_rows);
-        assert_eq!(
-            cfg.generator_max_memory_bytes,
-            config.reader.traceql_generator_max_memory_bytes
-        );
         assert_eq!(cfg.skip_unavailable_shards, config.skip_unavailable_shards);
     }
 

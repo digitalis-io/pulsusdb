@@ -1512,8 +1512,8 @@ mod tests {
     /// site (the arena), and `VariantArena::build`'s body materializes no
     /// `common ++ tail` (no `.concat(`/`.to_vec()`/`chain(`): the dedup
     /// key is the tail slice alone. Production text = everything before
-    /// the column-0 `#[cfg(test)]`, `//` comment text stripped (the
-    /// `search_sql.rs` census precedent).
+    /// the column-0 `#[cfg(test)]`, `//` comment text stripped (the census
+    /// precedent of the previous search engine's `search_sql.rs`).
     #[test]
     fn variants_exec_census() {
         let src = include_str!("variants.rs");

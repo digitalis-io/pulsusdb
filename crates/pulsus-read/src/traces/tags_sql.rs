@@ -47,8 +47,9 @@
 //! into their `FROM` clause.
 
 use super::filter::SpanFilterCtx;
-use super::search_sql::{byte_cap_expr, date_literal};
+use super::filter::byte_cap_expr;
 use super::tag_narrow::NarrowTerm;
+use super::window_sql::date_literal;
 
 /// The one table both CATALOG tag-discovery reads target. NEVER `_dist`-suffixed:
 /// migration 18 is `Replication::Global, family: None`, so no `_dist`

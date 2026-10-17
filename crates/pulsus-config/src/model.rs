@@ -541,25 +541,7 @@ pub struct ReaderConfig {
     /// `template-timezone-configured`). An unknown zone name is rejected
     /// at config load.
     pub template_timezone: TemplateTimezone,
-    pub traceql_max_candidates: u64,
     pub traceql_scan_budget_rows: u64,
-    /// `PULSUS_TRACEQL_EVENT_SET_MAX_VALUES` (issue #558, default
-    /// 1,000,000): how many values one batch's event/link value set may
-    /// expand to.
-    ///
-    /// The reader sums the per-span widths the hydration statement
-    /// projected and refuses at `422 query_too_broad` BEFORE issuing the
-    /// value statement, so an over-budget set is never materialised.
-    ///
-    /// **Not [`Self::traceql_scan_budget_rows`].** That one is
-    /// `max_rows_to_read` on every trace-search read and bounds physical
-    /// rows a statement reads; this bounds the values one set holds. The
-    /// two coincided only while the set came from an index storing one
-    /// value per row, and issue #558 is what ended that.
-    ///
-    /// **The number is CHOSEN, not derived.** See
-    /// `crate::validate::TRACEQL_EVENT_SET_MAX_VALUES_CEILING`.
-    pub traceql_event_set_max_values: u64,
     /// Issue #593 part 2: the most parent links one climb of the `>>` and
     /// `<<` structural operators follows (`PULSUS_TRACEQL_MAX_DEPTH`). A
     /// span with a parent left past it — a deeper chain — answers
@@ -588,16 +570,6 @@ pub struct ReaderConfig {
     /// bound; ungrouped queries skip the probe. Default 1000; operator
     /// scale-tuning routes to issue #25.
     pub traceql_max_series: u64,
-    /// Issue #57 re-audit (sub-problem B): the trace-search phase-1
-    /// candidate-generator query's `max_memory_usage` ceiling (throw) —
-    /// bounds a dense common-value prefix's `GROUP BY trace_id`
-    /// aggregation state; exceeding it is a `422 query_too_broad`
-    /// (server code 241 `MEMORY_LIMIT_EXCEEDED`), never an OOM. Applied
-    /// only to the generator read, never phase-2 hydration/value/root
-    /// reads. Default 512 MiB — well above the ~21 MB
-    /// measured for a 500k-row/500k-key aggregation, well below the
-    /// server's 10 GiB default.
-    pub traceql_generator_max_memory_bytes: u64,
     /// Issue #398: the per-query ClickHouse memory ceiling every **LogQL**
     /// read carries (`max_memory_usage` + `max_bytes_before_external_group_by
     /// = 0`, throw-not-spill). A breach is server code 241
@@ -616,9 +588,7 @@ pub struct ReaderConfig {
     /// Issue #398: the same per-query memory ceiling on every **TraceQL**
     /// read — search, catalog discovery and the trace-by-id point read.
     /// Breach → `422 query_too_broad` (`TooBroadReason::TraceReadMemory`).
-    /// The phase-1 candidate generator layers its own, TIGHTER
-    /// `reader.traceql_generator_max_memory_bytes` on top and keeps its own
-    /// `TooBroadReason::TraceGeneratorMemory`. Per query per server; must
+    /// Per query per server; must
     /// be >= 1. Default 8 GiB.
     pub traceql_read_max_memory_bytes: u64,
     /// Issue #101: process-wide bound on concurrent CPU-bound PromQL
@@ -689,13 +659,10 @@ impl Default for ReaderConfig {
             logql_scan_budget_bytes: ByteSize(50u64 * 1024 * 1024 * 1024),
             logql_pipeline_scan_factor: 10,
             template_timezone: TemplateTimezone::UTC,
-            traceql_max_candidates: 100_000,
             traceql_scan_budget_rows: 50_000_000,
-            traceql_event_set_max_values: 1_000_000,
             traceql_max_depth: 64,
             traceql_tag_lookback: HumanDuration(Duration::from_secs(24 * 3_600)),
             traceql_max_series: 1_000,
-            traceql_generator_max_memory_bytes: 536_870_912,
             // Issue #398: 8 GiB on each of the three read surfaces — the
             // value the LogQL sliding range read's own hard-coded
             // `max_memory_usage` override already shipped (issue #227),

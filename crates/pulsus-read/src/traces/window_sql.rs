@@ -83,11 +83,10 @@
 //!
 //! | caller | convention | why |
 //! |---|---|---|
-//! | [`super::search_sql`] | `StartClosedEndOpen` | R9, docs/api.md §4.2 `[start, end)` |
+//! | [`super::spans`] statements | `StartClosedEndOpen` | R9, docs/api.md §4.2 `[start, end)` |
 //! | [`super::graph_sql`] | `StartClosedEndOpen` | docs/api.md §4.5 `[start, end)` |
 //! | [`super::metrics_sql`] evaluation window | `StartClosedEndOpen` | `metrics_plan`'s snapped `[start, end)` |
 //! | [`super::metrics_sql`] `compare()` selection window | `StartOpenEndClosed` | the reference's `spanStartTime > start && spanStartTime <= end` (Tempo `pkg/traceql/engine_metrics_compare.go:98-110` @ v3.0.2) — a query operand, not a request window |
-//! | [`super::search_sql`] `trace_recent` bucket clause ([`WindowSql::bucket_clause`], issue #560) | `StartClosedEndOpen` | the same search bound, read at bucket grain |
 //!
 //! [`super::tags_sql::DaySpan`] is deliberately NOT expressed here. The
 //! tag-discovery reads carry a day bound and no `timestamp_ns` bound at
@@ -95,8 +94,6 @@
 //! the `span_name_day` projection — see that type's own doc), so they
 //! have no row bound for a day bound to agree with, and resolving their
 //! window inclusively at both ends is the deliberately wider read.
-
-use super::search_sql::date_literal;
 
 /// The resource table's `day` partition bound, from two nanosecond
 /// EXPRESSIONS — a window's own literals, or the bound names a statement
@@ -199,12 +196,12 @@ impl WindowSql {
     /// [`WindowSql::last_included_ns`], for a clause whose operators are
     /// written out rather than rendered by [`WindowSql::time_clause`].
     ///
-    /// [`super::search_sql`]'s `trace_recent` row bound is the one such
-    /// clause: `ts_max >= <this> AND ts_min <= <last included>`. Taking
-    /// `start_ns` there instead would leave that clause on whichever
-    /// convention it was written under while every other rendering
-    /// followed the constructor, which is the shape that drops a trace
-    /// whose newest span sits exactly on `start_ns`.
+    /// The search and metrics statements' slice and numbering bounds are
+    /// such clauses (`spans/search.rs`, `spans/tracelevel.rs`,
+    /// `spans/numbering.rs`). Taking `start_ns` there instead would leave a
+    /// clause on whichever convention it was written under while every
+    /// other rendering followed the constructor, which is the shape that
+    /// drops a trace whose newest span sits exactly on `start_ns`.
     pub fn first_included_ns(self) -> i64 {
         match self.bounds {
             WindowBounds::StartOpenEndClosed => self.start_ns + 1,
@@ -361,36 +358,25 @@ impl WindowSql {
             date_literal(end_days)
         )
     }
+}
 
-    /// `bucket >= <lo> AND bucket <= <hi>` over `trace_recent`'s leading
-    /// sort-key column (issue #560). `lo` from `start_ns`, `hi` from
-    /// [`WindowSql::last_included_ns`], both by `div_euclid` — the floor
-    /// [`WindowSql::date_clause`] uses — and rendered SIGNED with no
-    /// clamp.
-    ///
-    /// ```text
-    ///   reader   ns.div_euclid(300_000_000_000)          floor
-    ///   writer   toUInt32(intDiv(timestamp_ns, 3e11))    truncate
-    ///   the two agree for every ns >= 0; the first disagreement is at
-    ///   ns = -1 (reader -1, writer 0), which no stored row reaches:
-    ///   ingest refuses a span before 1970-01-01
-    /// ```
-    ///
-    /// No clamp, and that is a decision: a `UInt32` column compared with
-    /// a negative literal is promoted to a signed comparison and answers
-    /// correctly (measured on 26.3: `bucket >= -7` and `bucket >= 0`
-    /// select the same stored rows). The largest bucket any `i64`
-    /// produces is 30,744,573, 0.7% of the `UInt32` ceiling, so neither
-    /// side can overflow. The clause selects a superset of the rows the
-    /// row-level `ts_max`/`ts_min` bound admits, for every window the
-    /// request parser accepts.
-    pub fn bucket_clause(self) -> String {
-        format!(
-            "bucket >= {} AND bucket <= {}",
-            self.start_ns.div_euclid(RECENT_BUCKET_NS),
-            self.last_included_ns().div_euclid(RECENT_BUCKET_NS)
-        )
-    }
+/// Renders `days`-since-epoch as a `toDate('YYYY-MM-DD')` literal —
+/// civil-date conversion (proleptic Gregorian), pure integer math.
+/// `pub(crate)`: [`super::metrics_sql`] reuses it for the metrics
+/// semi-joins' daily-partition pruning.
+pub(crate) fn date_literal(days: i64) -> String {
+    // Howard Hinnant's days-to-civil algorithm.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("toDate('{y:04}-{m:02}-{d:02}')")
 }
 
 #[cfg(test)]
@@ -582,5 +568,14 @@ mod tests {
             "day >= toDate(fromUnixTimestamp64Nano(ext_lo), 'UTC') \
              AND day <= toDate(fromUnixTimestamp64Nano(ext_hi), 'UTC')"
         );
+    }
+
+    /// `date_literal` renders the epoch and a modern date. (Moved here
+    /// from the deleted `search_sql.rs`, #602 part 2c-2b-2.)
+    #[test]
+    fn date_literal_renders_the_unix_epoch_and_a_modern_date() {
+        assert_eq!(date_literal(0), "toDate('1970-01-01')");
+        // 1_700_000_000s / 86_400 = 19_675 days → 2023-11-14.
+        assert_eq!(date_literal(19_675), "toDate('2023-11-14')");
     }
 }

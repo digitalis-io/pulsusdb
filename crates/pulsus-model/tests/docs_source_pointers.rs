@@ -396,7 +396,8 @@ fn pointers_in(doc: &str, text: &str) -> Vec<Pointer> {
 
         // Every file this line names, by offset, so a continuation can
         // take the nearest one before it.
-        let written = written_out(line);
+        let next = lines.get(idx + 1).copied().unwrap_or("");
+        let written = written_out(line, next);
         let links = markdown_links(line);
         let mut named: Vec<(usize, String, BTreeSet<String>)> = Vec::new();
         named.extend(
@@ -474,7 +475,7 @@ fn pointers_in(doc: &str, text: &str) -> Vec<Pointer> {
             }
         }
         // Form C.
-        for (at, end, first, last, pinned) in continuations(line) {
+        for (at, end, first, last, pinned) in continuations(line, next) {
             let (path, _) = antecedent(at).unwrap_or_default();
             found.push((
                 (at, end),
@@ -638,11 +639,57 @@ fn bare_paths(line: &str) -> Vec<(usize, String)> {
 /// the reference. The file is not this tree's, even where a file of the
 /// same name is — `de.rs` matched `vendor/clickhouse/src/rowbinary/de.rs`
 /// and was reported as a citation past its end.
-fn pinned_after(line: &str, j: usize) -> bool {
-    line[j.min(line.len())..]
+fn pinned_after(line: &str, j: usize, next: &str) -> bool {
+    let rest = line[j.min(line.len())..]
         .trim_start_matches('`')
-        .trim_start()
-        .starts_with('@')
+        .trim_start();
+    let Some(after) = rest.strip_prefix('@') else {
+        return false;
+    };
+    pin_names_a_version(after, next)
+}
+
+/// The trees a pin may name before its version: the six the documents
+/// already pin. A pin naming another tree fails until it is added here.
+const PIN_TREES: [&str; 6] = [
+    "grafana/loki",
+    "grafana/tempo",
+    "tempo",
+    "Tempo",
+    "jsoniter",
+    "client_golang/exp",
+];
+
+/// A hex commit of 7 to 40 digits, or a version (`v3.0.2`, `1.0.150`,
+/// `v13.1.5-11-g3c7375b`), with surrounding punctuation stripped.
+fn pin_version_word(w: &str) -> bool {
+    let w = w.trim_matches(|c: char| matches!(c, '`' | '(' | ')' | ',' | ';' | '.' | ':'));
+    let hex = w.len() >= 7 && w.len() <= 40 && w.chars().all(|c| c.is_ascii_hexdigit());
+    let v = w.strip_prefix('v').unwrap_or(w);
+    let mut parts = v.split(['-', '+']).next().unwrap_or("").split('.');
+    let version =
+        v.contains('.') && parts.all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
+    hex || version
+}
+
+/// Whether the words after an `@` pin a pointer: the version (or commit)
+/// right after the `@`, or right after one of [`PIN_TREES`]. `next` is the
+/// following line, read only when this one ends before the version: one
+/// step may cross a line break, no more. Issue #602 part 2c-2b-2.
+fn pin_names_a_version(after: &str, next: &str) -> bool {
+    let words: Vec<&str> = after
+        .split_whitespace()
+        .chain(next.split_whitespace())
+        .collect();
+    let tree =
+        |w: &str| PIN_TREES.contains(&w.trim_matches(|c: char| matches!(c, '`' | '(' | ')')));
+    match (words.first(), words.get(1)) {
+        (Some(w0), _) if pin_version_word(w0) => true,
+        // `@ <tree> <version>`: the two words come from this line and the
+        // next at most, so at most one step crosses the break.
+        (Some(w0), Some(w1)) => tree(w0) && pin_version_word(w1),
+        _ => false,
+    }
 }
 
 /// `(paragraph index of each line, names each paragraph prints)`. A
@@ -691,7 +738,7 @@ struct Written {
     pinned: bool,
 }
 
-fn written_out(line: &str) -> Vec<Written> {
+fn written_out(line: &str, next: &str) -> Vec<Written> {
     let bytes = line.as_bytes();
     let mut out = Vec::new();
     let mut i = 0usize;
@@ -740,7 +787,7 @@ fn written_out(line: &str) -> Vec<Written> {
             first: first.parse().expect("digits"),
             last: last.parse().expect("digits"),
             also,
-            pinned: pinned_after(line, j),
+            pinned: pinned_after(line, j, next),
         });
         i = j;
     }
@@ -832,7 +879,7 @@ fn parenthesised(line: &str) -> Vec<(usize, usize, u32, u32)> {
 ///
 /// The backticks are part of the form: a bare `:825` in prose is an
 /// ordinary colon before a number.
-fn continuations(line: &str) -> Vec<(usize, usize, u32, u32, bool)> {
+fn continuations(line: &str, next: &str) -> Vec<(usize, usize, u32, u32, bool)> {
     let bytes = line.as_bytes();
     let mut out = Vec::new();
     let mut at = 0usize;
@@ -858,7 +905,7 @@ fn continuations(line: &str) -> Vec<(usize, usize, u32, u32, bool)> {
                 j,
                 first.parse().expect("digits"),
                 last.parse().expect("digits"),
-                pinned_after(line, j),
+                pinned_after(line, j, next),
             ));
         }
     }

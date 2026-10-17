@@ -6,7 +6,7 @@ every_cut_variant_has_a_row_in_the_design_record	pulsus-read	crates/pulsus-read/
 every_join_in_the_golden_corpus_is_named	pulsus-read	crates/pulsus-read/tests/golden_sql_freeze.rs	exists
 every_logql_stage_variant_has_a_row_in_the_lowering_document	pulsus-read	crates/pulsus-read/tests/query_lowering_doc_gate.rs	exists
 every_lql_link_variant_has_a_row_in_the_lowering_document	pulsus-read	crates/pulsus-read/tests/query_lowering_doc_gate.rs	exists
-every_traceql_chain_link_has_a_row_in_the_lowering_document	pulsus-read	crates/pulsus-read/tests/query_lowering_doc_gate.rs	exists
+every_traceql_chain_link_has_a_row_in_the_lowering_document	pulsus-read	crates/pulsus-read/tests/query_lowering_doc_gate.rs	deleted
 every_traceql_pipeline_stage_variant_has_a_row_in_the_lowering_document	pulsus-read	crates/pulsus-read/tests/query_lowering_doc_gate.rs	exists
 logql::compile::tests::drop_and_keep_dispatch_differently_on_the_same_payload_type	pulsus-read	crates/pulsus-read/src/logql/compile.rs	exists
 logql::compile::tests::every_residual_state_effect_is_the_one_the_document_states	pulsus-read	crates/pulsus-read/src/logql/compile.rs	exists
@@ -25,5 +25,5 @@ the_hops_diagram_and_the_document_agree_on_the_lowered_request	pulsus-read	crate
 the_plan_shape_json_keys_match_the_api_document	pulsus-read	crates/pulsus-read/tests/query_lowering_doc_gate.rs	exists
 the_sql_golden_corpus_has_exactly_its_committed_membership	pulsus-read	crates/pulsus-read/tests/golden_sql_freeze.rs	exists
 the_sql_golden_corpus_matches_its_committed_digest	pulsus-read	crates/pulsus-read/tests/golden_sql_freeze.rs	exists
-traces::compile::tests::every_residual_state_effect_is_the_one_the_document_states	pulsus-read	crates/pulsus-read/src/traces/compile.rs	exists
+traces::compile::tests::every_residual_state_effect_is_the_one_the_document_states	pulsus-read	crates/pulsus-read/src/traces/compile.rs	deleted
 traces::exec::tests::search_settings_pin_the_layer_1_budget_contract	pulsus-read	crates/pulsus-read/src/traces/exec.rs	exists

@@ -17,8 +17,8 @@
 //! all `intValue`) are KEY-compared only, because value typing is a
 //! separate issue and a wrong number rendering would pass this leg. That
 //! limit is stated rather than implied:
-//! `pulsus_read::traces::search_plan::tests::the_live_differential_registry_is_well_formed`
-//! holds the same four names as data and fails if the registry's
+//! `the_live_differential_registry_is_well_formed`, at the end of this
+//! file, holds the same four names as data and fails if the registry's
 //! keys-only set stops being them.
 //!
 //! **The validity gate is direction-neutral and runs BEFORE the
@@ -67,26 +67,20 @@
 //! classes we knowingly answer differently from the reference (a negated
 //! attribute leaf, the genuine multi-field conditions) are deliberately
 //! ABSENT — they are pinned by
-//! `pulsus_read::traces::search_plan::tests::wave_two_shapes_project_nothing`
+//! `traces_compile_v2.rs`'s `a_multi_field_condition_projects_nothing_on_the_statement`
 //! and carry ledger rows, and putting them here would assert an agreement
 //! that does not exist.
 //!
 //! A reader tells a shape is missing by RUNNING
-//! `pulsus_read::traces::search_plan::tests::the_live_differential_registry_covers_every_projection_shape`,
-//! which holds the required PAIR set — `REQUIRED_SHAPE_PAIRS`, stated in
-//! `crates/pulsus-read/src/traces/search_plan.rs`, where this registry
-//! cannot reach it — checks each pair's witness query really produces
-//! that pair, and then fails naming every pair no case's `q` is EQUAL to.
-//! The two AXES are still closed against the planner's own enums (both
-//! label matches are exhaustive, so a new variant fails to compile, and
-//! every label must appear in some required pair); the cross product is
-//! not, which that constant states as its own limit. That test is why
-//! cases 31–35 exist: the 30-case registry contained no same-field
-//! `FieldCompare` and nothing reaching `instrumentation:version`, and
-//! reading it could not show that. It reads `projection_cases::CASES` as
-//! typed data, which this file `mod`s and that test `include!`s; it used
-//! to read this file as TEXT, and a witness query written in a case NAME
-//! satisfied it while the case exercised nothing (code review wave 2).
+//! `every_witness_query_is_exactly_one_case`, at the end of this file: it
+//! holds the witness queries the previous search engine's coverage check
+//! demanded, one per value source and leaf class, and fails naming every
+//! witness no case's `q` is EQUAL to. That check also planned each
+//! witness to prove it produced its pair, and closed the two axes against
+//! that engine's enums; both halves needed the deleted planner and went
+//! with it (#602 part 2c-2b-2). That check is why cases 31–35 exist: the
+//! 30-case registry contained no same-field `FieldCompare` and nothing
+//! reaching `instrumentation:version`.
 //!
 //! **Instance isolation.** This suite requires a reference instance that
 //! holds NO other suite's corpus, and asserts it below before pushing:
@@ -263,12 +257,9 @@ fn engine_config() -> TraceReadConfig {
         spans_v2_table: "spans".to_string(),
         traces_table: "traces".to_string(),
         resources_table: "resources".to_string(),
-        max_candidates: 100_000,
         scan_budget_rows: 50_000_000,
-        event_set_max_values: 1_000_000,
         max_depth: 64,
         max_series: 1_000,
-        generator_max_memory_bytes: 536_870_912,
         distributed: false,
         skip_unavailable_shards: false,
     }
@@ -1237,4 +1228,106 @@ async fn land_new_store(
         )
         .await
         .expect("the landing insert");
+}
+
+/// The registry is WELL FORMED: every case is uniquely named, its name
+/// carries its own 1-based position, the cases compared by KEY only are
+/// exactly the four this file's module doc names, and the one `nil` case
+/// is a presence test. Moved here unchanged from the previous search
+/// engine's unit tests when #602 part 2c-2b-2 deleted that engine; it
+/// needs no planner.
+///
+/// *RED when:* two cases share a name, a case's ordinal prefix stops
+/// matching its index, the keys-only set changes without this list, or a
+/// `nil` case other than the presence test is added.
+#[test]
+fn the_live_differential_registry_is_well_formed() {
+    const KEYS_ONLY_CASES: [&str; 4] = [
+        "10_status_code_num",
+        "25_nested_set_left",
+        "27_single_field_arithmetic",
+        "33_same_field_nested_set",
+    ];
+    let names: std::collections::BTreeSet<&str> = CASES.iter().map(|c| c.name).collect();
+    assert_eq!(
+        names.len(),
+        CASES.len(),
+        "two differential cases share a name; the registry's names are its identities"
+    );
+    for (i, case) in CASES.iter().enumerate() {
+        let want = format!("{:02}_", i + 1);
+        assert!(
+            case.name.starts_with(&want),
+            "case {} sits at position {}; the ordinal is part of the name",
+            case.name,
+            i + 1
+        );
+        assert!(
+            !case.q.is_empty(),
+            "case {} carries no query at all",
+            case.name
+        );
+    }
+    let keys_only: Vec<&str> = CASES
+        .iter()
+        .filter(|c| !c.compare_values)
+        .map(|c| c.name)
+        .collect();
+    assert_eq!(
+        keys_only,
+        KEYS_ONLY_CASES.to_vec(),
+        "the cases compared by KEY only are not the ones the module doc declares"
+    );
+    let nil_cases: Vec<&str> = CASES
+        .iter()
+        .filter(|c| c.q.contains("nil"))
+        .map(|c| c.q)
+        .collect();
+    assert_eq!(
+        nil_cases,
+        vec![r#"{ span.http.method != nil }"#],
+        "an ABSENCE case is answered from the reference's key catalog, not from this corpus"
+    );
+}
+
+/// The registry holds exactly one case for each witness query the
+/// previous search engine's coverage check demanded (its
+/// `REQUIRED_SHAPE_PAIRS`, one witness per value source and leaf class).
+/// That check also planned each witness to prove it produced its pair;
+/// that half needed the deleted planner and went with it (#602 part
+/// 2c-2b-2). This half keeps a deleted or rewritten case from going
+/// unnoticed.
+///
+/// *RED when:* a witness query is carried by no case, or by two.
+#[test]
+fn every_witness_query_is_exactly_one_case() {
+    const WITNESSES: [&str; 17] = [
+        r#"{ name = "GET /pay" }"#,
+        r#"{ resource.service.name = "proj-checkout" }"#,
+        "{ status = error }",
+        "{ kind = client }",
+        r#"{ statusMessage = "boom" }"#,
+        r#"{ span:parentID = "a479000000000001" }"#,
+        r#"{ instrumentation:name = "proj-scope" }"#,
+        r#"{ instrumentation:version = "1.2.3" }"#,
+        r#"{ span.http.method = "GET" }"#,
+        r#"{ span.http.method =~ "GE.*" }"#,
+        "{} | select(span.http.method)",
+        "{} | select(name)",
+        "{ nestedSetLeft > 0 }",
+        r#"{ span.http.method = span.http.method }"#,
+        "{ name = name }",
+        "{ nestedSetLeft = nestedSetLeft }",
+        r#"{ resource.service.name = resource.service.name }"#,
+    ];
+    let wrong: Vec<(&str, usize)> = WITNESSES
+        .iter()
+        .map(|q| (*q, CASES.iter().filter(|c| c.q == *q).count()))
+        .filter(|(_, n)| *n != 1)
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "(witness, cases carrying it) = {wrong:?}; a count of 0 is a shape no longer tested \
+         against the reference. Edit crates/pulsus-read/tests/projection_cases/mod.rs"
+    );
 }

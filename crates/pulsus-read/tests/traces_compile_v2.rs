@@ -16,7 +16,7 @@
 //!   derived from the same convention rather than written out;
 //! * the trace fetch and the winners' root hydration carry **no**
 //!   `timestamp_ns` bound at all — both are `trace_id` point reads
-//!   (`traces/sql.rs`, `search_sql::root_sql`);
+//!   (`traces/sql.rs`, and the per-trace read of `spans/search.rs`);
 //! * the tag-value read carries **no** `timestamp_ns` bound either, and
 //!   its day clause is the day span the request touches. That is deferred
 //!   work owned by issue #598, not an oversight: the read is day-granular

@@ -123,11 +123,11 @@ pub struct PlanConfig {
     /// means the ceilings decide, which is what every language did
     /// before.
     ///
-    /// TraceQL passes `Some(BATCH_TRACES)`: its phase-2 batch is an
-    /// operational choice at 32, not the 24,998 the ceilings permit
-    /// (issue #492 part 3, D2). Reporting the ceiling would have put a
-    /// number on the explain surface that no statement this tree sends
-    /// has ever used.
+    /// The previous search engine passed `Some(32)`, its batch size (issue
+    /// #492 part 3, D2); nothing passes it since #602 part 2c-2b-2 deleted
+    /// that engine. Reporting the ceiling would have put a number on the
+    /// explain surface that no statement this tree sends has ever used.
+    ///
     pub seed_chunk_rows: Option<u32>,
     /// The plan-time upper bound on a seed a language draws from its own
     /// EARLIER statement, when the language has one and the bound is a
@@ -135,11 +135,11 @@ pub struct PlanConfig {
     /// named constant. `None` — the default — means no such seed exists
     /// and a link that would need one gets no cut.
     ///
-    /// TraceQL passes `Some(reader.traceql_max_candidates)`: every
-    /// phase-2 read is seeded from the phase-1 candidate list, whose size
-    /// that config bounds. The core carries the NUMBER only; the language
-    /// names it, because `reader.traceql_max_candidates` is TraceQL's own
-    /// config key and the core has no business spelling it.
+    /// The previous search engine passed its candidate cap here; nothing
+    /// passes it since #602 part 2c-2b-2. The core carries the NUMBER
+    /// only; a language names it, because the config key is the
+    /// language's own and the core has no business spelling it.
+    ///
     pub seed_bound_rows: Option<u64>,
 }
 
@@ -478,7 +478,7 @@ pub fn plan_of<L: Lang + ?Sized + 'static>(
     //
     // A disjunction whose sides resolve against different sources is one
     // statement per source, merged in our process — which is what the
-    // shipped TraceQL planner's `generator_sqls` vector already does.
+    // previous TraceQL search planner's generator list did.
     let branches = rel.predicate.disjoint_or_branches();
     match &branches {
         Some(bs) if bs.len() > 1 => {

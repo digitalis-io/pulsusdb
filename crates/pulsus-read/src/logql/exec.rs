@@ -6811,8 +6811,8 @@ fn metric_plan_window(mp: &MetricPlan) -> ClientWindow {
 /// `reader.logql_read_max_memory_bytes`) plus
 /// `max_bytes_before_external_group_by = 0`, i.e. **throw, not spill**: a
 /// spilled aggregation is the silently-slow outcome this repo rejects, and
-/// the shipped traces precedent (`traces::exec::generator_settings`, issue
-/// #57) sets exactly the same pair. Because every LogQL settings object is
+/// the traces precedent (the previous search engine's generator settings,
+/// issue #57) set exactly the same pair. Because every LogQL settings object is
 /// built here, one edit reaches all eighteen dispatch sites including the
 /// shared stage-1 stream resolution several endpoints run — a breach is
 /// server code 241 → [`TooBroadReason::LogqlReadMemory`] → `422`, never
@@ -8307,9 +8307,9 @@ mod tests {
     /// ceiling and refuses to SPILL. `max_bytes_before_external_group_by =
     /// 0` is the throw-not-spill half — with spilling enabled a wide
     /// aggregation would grind through disk instead of failing loud, which
-    /// is the silently-slow outcome this repo rejects (the shipped
-    /// `traces::exec::generator_settings` precedent, issue #57, sets the
-    /// identical pair).
+    /// is the silently-slow outcome this repo rejects (the traces
+    /// precedent, the previous search engine's generator settings, issue
+    /// #57, set the identical pair).
     ///
     /// The three pre-existing keys must survive untouched: the whole point
     /// of putting the ceiling in this one function is that it ADDS to the

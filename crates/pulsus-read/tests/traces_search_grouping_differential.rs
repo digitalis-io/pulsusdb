@@ -67,15 +67,11 @@
 //! ## The hermetic half of the issue #492 item 9 fixtures
 //!
 //! The four `midpipe_*` fixtures below run only with the reference
-//! endpoints set. Their hermetic twins drive the evaluator itself and run
-//! unconditionally, in `crates/pulsus-read/src/traces/search_eval.rs`:
-//! `both_spellings_of_a_mid_pipeline_filter_answer_the_same_one_spanset`,
-//! `a_mid_pipeline_filter_acts_at_its_written_position` and
-//! `the_mid_pipeline_filter_composes_with_every_neighbouring_stage`, over
-//! the same four-span `a b a b` corpus. They live there because the
-//! evaluator's entry point is crate-private; neither half replaces the
-//! other — the hermetic one says our engine computes the answer, this one
-//! says the answer is the reference's.
+//! endpoints set. Their hermetic twins drove the previous search engine's
+//! evaluator and went with it (#602 part 2c-2b-2); on the route, the
+//! mid-pipeline shapes are among the answers `traces_query_v2_live.rs`
+//! compares against `tests/fixtures/search_answers_recorded.tsv`, and
+//! this file says the answer is the reference's.
 //!
 //! ## Corpus isolation on a shared oracle
 //!
@@ -167,12 +163,9 @@ fn engine_config() -> TraceReadConfig {
         spans_v2_table: "spans".to_string(),
         traces_table: "traces".to_string(),
         resources_table: "resources".to_string(),
-        max_candidates: 100_000,
         scan_budget_rows: 50_000_000,
-        event_set_max_values: 1_000_000,
         max_depth: 64,
         max_series: 1_000,
-        generator_max_memory_bytes: 536_870_912,
         distributed: false,
         skip_unavailable_shards: false,
     }
@@ -868,7 +861,7 @@ impl SetShape {
     /// not a specification on the reference side: measured, one
     /// `coalesce()`d span set came back `03,01,02` on one read and
     /// `01,02,03` on another over the same corpus. Ours is deterministic
-    /// (ascending `(timestamp_ns, span_id)`, `search_eval.rs`); asserting
+    /// (ascending `(timestamp_ns, span_id)`, the search statement's); asserting
     /// the reference's would be asserting an artefact, and it reddened a
     /// break test for a reason unrelated to the break.
     ///

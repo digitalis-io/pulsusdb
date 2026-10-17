@@ -140,9 +140,8 @@ pub const PROMQL_MAX_METRIC_FANOUT_CEILING: u64 = 1_000_000;
 // setting fed an absurd value stops being a guard without ever failing.
 // Policy multipliers: 1000x the documented default for counts / permits /
 // milliseconds, the 1024x power-of-two analogue for byte quantities, with
-// two derived exceptions documented on their consts
-// (`TRACEQL_MAX_CANDIDATES_CEILING`, budget-derived, and the generator
-// memory ceiling's 512 GiB byte analogue). Scale tuning routes to #25.
+// the read memory ceilings' 512 GiB byte analogue documented on their
+// consts. Scale tuning routes to #25.
 // ---------------------------------------------------------------------
 
 /// `clickhouse.pool_size` — feeds `Semaphore::new(pool_size as usize)`
@@ -366,67 +365,21 @@ pub const PROMQL_MAX_INFO_SERIES_CEILING: u64 = 100_000_000;
 /// scan could trip it. 1024x the 50 GiB default.
 pub const LOGQL_SCAN_BUDGET_BYTES_CEILING: u64 = 50 * 1024 * 1024 * 1024 * 1024;
 
-/// `reader.traceql_max_candidates` — per-generator top-K depth and the
-/// merged consumption ceiling. NOT the 1000x policy multiplier:
-/// budget-derived — `2 x (cap + 1) x CANDIDATE_TUPLE_BYTES` (88 B) at
-/// this cap is ~176 MB, fitting the 256 MiB `HYDRATION_BYTE_BUDGET` for
-/// a single generator, where a 1000x-default cap would make every
-/// cap-reaching search fail the byte budget and bloat ClickHouse
-/// `ORDER BY .. LIMIT` top-K state. The ceiling also keeps the rendered
-/// `LIMIT {cap + 1}` overflow-free for every accepted value.
-pub const TRACEQL_MAX_CANDIDATES_CEILING: u64 = 1_000_000;
-
 /// `reader.traceql_scan_budget_rows` — `max_rows_to_read` (throw) on
 /// every trace search/catalog query. ClickHouse treats `0` as
 /// *unlimited*, so zero is rejected too (the floor check below). 1000x
 /// the default of 50_000_000.
 pub const TRACEQL_SCAN_BUDGET_ROWS_CEILING: u64 = 50_000_000_000;
 
-/// `reader.traceql_event_set_max_values` (issue #558) — how many values
-/// one batch's event/link value set may expand to.
-///
-/// **This number and the 1,000,000 default are CHOSEN, and that is the
-/// whole claim.** The default is the same order as the Layer-2 retention
-/// budget (`traces::exec::HYDRATION_BYTE_BUDGET`, 256 MiB), so the two
-/// bounds sit near each other rather than one being decorative; the
-/// ceiling is an order of magnitude above it and bounds what an operator
-/// can configure. Neither is derived from the byte budget: which of the
-/// two bounds fires first depends on the payload lengths and on what the
-/// request has already charged, and three attempts to derive a number
-/// from `HYDRATION_BYTE_BUDGET / EVENT_VALUE_ENTRY_BYTES` were each
-/// refuted by measurement.
-///
-/// **The ceiling is not a claim about what happens above it.** The width
-/// is compared before the set is expanded, so a set wider than whatever
-/// value is configured is refused by this knob and the retention budget
-/// never comes into it — measured at `configured=1242757 values=1242758`,
-/// where the width refused.
-///
-/// `0` is rejected, and NOT because it means unlimited. Its siblings read
-/// `0` that way because they are ClickHouse SERVER settings
-/// (`max_rows_to_read`, `max_memory_usage`), where ClickHouse gives it
-/// that meaning. This comparison is `values > budget` in our own process,
-/// so a budget of zero would refuse every event/link set comparison
-/// outright.
-pub const TRACEQL_EVENT_SET_MAX_VALUES_CEILING: u64 = 10_000_000;
-
-/// `reader.traceql_max_depth` (issue #593 part 2): a climb never needs more
-/// links than the 10,000 spans one trace is hydrated to
-/// (`MAX_SPANS_PER_TRACE`).
+/// `reader.traceql_max_depth` (issue #593 part 2): its ceiling, 10,000
+/// links, was the per-trace span cap of the previous search engine,
+/// deleted by #602 part 2c-2b-2.
 pub const TRACEQL_MAX_DEPTH_CEILING: u64 = 10_000;
-
-/// `reader.traceql_generator_max_memory_bytes` — the phase-1 candidate
-/// generator's `max_memory_usage` (throw-not-OOM) ceiling. ClickHouse
-/// treats `0` as *unlimited*, so zero is rejected too. 1024x the
-/// 512 MiB default (512 GiB, the power-of-two byte analogue).
-pub const TRACEQL_GENERATOR_MAX_MEMORY_BYTES_CEILING: u64 = 512 * 1024 * 1024 * 1024;
 
 /// `reader.logql_read_max_memory_bytes` (issue #398) — the per-query
 /// `max_memory_usage` (throw-not-OOM) ceiling every LogQL read carries.
 /// ClickHouse treats `0` as *unlimited*, so zero is rejected too. 64x the
-/// 8 GiB default (512 GiB, matching
-/// [`TRACEQL_GENERATOR_MAX_MEMORY_BYTES_CEILING`]'s power-of-two byte
-/// analogue).
+/// 8 GiB default (512 GiB, the power-of-two byte analogue).
 pub const LOGQL_READ_MAX_MEMORY_BYTES_CEILING: u64 = 512 * 1024 * 1024 * 1024;
 
 /// `reader.promql_read_max_memory_bytes` (issue #398) — the PromQL
@@ -436,9 +389,7 @@ pub const PROMQL_READ_MAX_MEMORY_BYTES_CEILING: u64 = 512 * 1024 * 1024 * 1024;
 
 /// `reader.traceql_read_max_memory_bytes` (issue #398) — the TraceQL
 /// surface's twin of [`LOGQL_READ_MAX_MEMORY_BYTES_CEILING`], same value
-/// and the same zero-is-unlimited rejection. Independent of
-/// [`TRACEQL_GENERATOR_MAX_MEMORY_BYTES_CEILING`], which bounds only the
-/// phase-1 generator's tighter layered ceiling.
+/// and the same zero-is-unlimited rejection.
 pub const TRACEQL_READ_MAX_MEMORY_BYTES_CEILING: u64 = 512 * 1024 * 1024 * 1024;
 
 /// `reader.traceql_max_series` (issue #182) — the metrics `by(...)`
@@ -948,22 +899,6 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
         "reader.logql_pipeline_scan_factor",
         u64::from(cfg.reader.logql_pipeline_scan_factor),
     )?;
-    positive_u64(
-        "reader.traceql_max_candidates",
-        cfg.reader.traceql_max_candidates,
-    )?;
-    // Issue #133: past the ceiling the consumption guard is unreachable
-    // and the rendered `LIMIT {cap + 1}` could wrap at u64::MAX; the
-    // budget-derived ceiling keeps `cap + 1` overflow-free for every
-    // accepted value.
-    if cfg.reader.traceql_max_candidates > TRACEQL_MAX_CANDIDATES_CEILING {
-        return Err(ceiling_err(
-            "reader.traceql_max_candidates",
-            TRACEQL_MAX_CANDIDATES_CEILING,
-            1,
-            "the candidate consumption ceiling (and overflows the LIMIT probe)",
-        ));
-    }
     // Issue #133: previously unvalidated. ClickHouse treats
     // `max_rows_to_read = 0` as UNLIMITED, so zero would silently disable
     // the trace scan budget — floor and ceiling both enforced.
@@ -979,39 +914,7 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
             "the trace row scan budget",
         ));
     }
-    // Issue #558: a budget of zero would refuse every event/link set
-    // comparison outright — the comparison is `values > budget` in our
-    // own process, so zero is not an unlimited sentinel here.
-    positive_u64(
-        "reader.traceql_event_set_max_values",
-        cfg.reader.traceql_event_set_max_values,
-    )?;
-    if cfg.reader.traceql_event_set_max_values > TRACEQL_EVENT_SET_MAX_VALUES_CEILING {
-        return Err(ceiling_err(
-            "reader.traceql_event_set_max_values",
-            TRACEQL_EVENT_SET_MAX_VALUES_CEILING,
-            1,
-            "the event/link value-set budget",
-        ));
-    }
-    // Issue #133: previously unvalidated. ClickHouse treats
-    // `max_memory_usage = 0` as UNLIMITED, so zero would silently disable
-    // the generator throw-not-OOM memory guard — floor and ceiling both
-    // enforced.
-    positive_u64(
-        "reader.traceql_generator_max_memory_bytes",
-        cfg.reader.traceql_generator_max_memory_bytes,
-    )?;
-    if cfg.reader.traceql_generator_max_memory_bytes > TRACEQL_GENERATOR_MAX_MEMORY_BYTES_CEILING {
-        return Err(ceiling_err(
-            "reader.traceql_generator_max_memory_bytes",
-            TRACEQL_GENERATOR_MAX_MEMORY_BYTES_CEILING,
-            1,
-            "the generator memory guard",
-        ));
-    }
-    // Issue #398: the three per-surface read memory ceilings. Same trap as
-    // the generator guard directly above — ClickHouse reads
+    // Issue #398: the three per-surface read memory ceilings. ClickHouse reads
     // `max_memory_usage = 0` as UNLIMITED, so zero would silently remove
     // the bound this issue exists to add and put the surface back on the
     // 500 path. Floor and ceiling enforced on all three.
@@ -2020,16 +1923,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn traceql_max_candidates_ceiling_rejects_absurd_and_accepts_the_max() {
-        assert_ceiling_boundary(
-            "reader.traceql_max_candidates",
-            |c, v| c.reader.traceql_max_candidates = v,
-            u64::MAX,
-            TRACEQL_MAX_CANDIDATES_CEILING,
-        );
-    }
-
     /// Issue #133 AC2: `traceql_scan_budget_rows` was previously
     /// UNVALIDATED — `0` loaded fine and flowed verbatim into ClickHouse
     /// `max_rows_to_read`, whose `0` means *unlimited* (a silently
@@ -2049,33 +1942,6 @@ mod tests {
             |c, v| c.reader.traceql_scan_budget_rows = v,
             u64::MAX,
             TRACEQL_SCAN_BUDGET_ROWS_CEILING,
-        );
-    }
-
-    /// Issue #558: the event/link value-set budget. `0` is rejected for a
-    /// DIFFERENT reason from its siblings — it never reaches ClickHouse,
-    /// so "unlimited" is not what it would mean; the comparison is
-    /// `values > budget` in our own process, so a budget of zero refuses
-    /// every event/link set comparison outright.
-    #[test]
-    fn traceql_event_set_max_values_rejects_zero_and_the_absurd_and_accepts_the_max() {
-        let mut cfg = Config::default();
-        cfg.reader.traceql_event_set_max_values = 0;
-        match validate(&cfg) {
-            Err(ConfigError::Value { field, .. }) => {
-                assert_eq!(field, "reader.traceql_event_set_max_values");
-            }
-            other => panic!("expected a Value error for zero, got {other:?}"),
-        }
-        // The accepted floor is 1, one above the rejected zero.
-        let mut cfg = Config::default();
-        cfg.reader.traceql_event_set_max_values = 1;
-        assert!(validate(&cfg).is_ok(), "1 is the accepted floor");
-        assert_ceiling_boundary(
-            "reader.traceql_event_set_max_values",
-            |c, v| c.reader.traceql_event_set_max_values = v,
-            u64::MAX,
-            TRACEQL_EVENT_SET_MAX_VALUES_CEILING,
         );
     }
 
@@ -2099,27 +1965,6 @@ mod tests {
             |c, v| c.reader.traceql_max_depth = u32::try_from(v).expect("fits"),
             u64::from(u32::MAX),
             TRACEQL_MAX_DEPTH_CEILING,
-        );
-    }
-
-    /// Issue #133 AC9: same shape as the row budget —
-    /// `max_memory_usage = 0` is ClickHouse-unlimited, so zero is a
-    /// silently disabled generator memory guard.
-    #[test]
-    fn traceql_generator_max_memory_bytes_rejects_zero_and_the_absurd_and_accepts_the_max() {
-        let mut cfg = Config::default();
-        cfg.reader.traceql_generator_max_memory_bytes = 0;
-        match validate(&cfg) {
-            Err(ConfigError::Value { field, .. }) => {
-                assert_eq!(field, "reader.traceql_generator_max_memory_bytes");
-            }
-            other => panic!("expected a Value error for zero, got {other:?}"),
-        }
-        assert_ceiling_boundary(
-            "reader.traceql_generator_max_memory_bytes",
-            |c, v| c.reader.traceql_generator_max_memory_bytes = v,
-            u64::MAX,
-            TRACEQL_GENERATOR_MAX_MEMORY_BYTES_CEILING,
         );
     }
 

@@ -23,8 +23,8 @@ pulsus-promql = { path = "../pulsus-promql" }
 # pulsus-re2 crate; `metrics::re2_authority` keeps the matcher-facing
 # wrappers and delegates the pattern scan.
 pulsus-re2 = { path = "../pulsus-re2" }
-# The TraceQL AST (issue #57): `traces::search_plan`/`traces::filter` lower
-# `pulsus_traceql::Query` into the two-phase search plan — mirrors
+# The TraceQL AST (issue #57): `traces::spans` and `traces::filter` compile
+# `pulsus_traceql::Query` into the search and metrics statements — mirrors
 # `pulsus-logql`'s role on the logs read path (parsing itself stays
 # server-side; this crate consumes the AST only).
 pulsus-traceql = { path = "../pulsus-traceql" }

@@ -5880,12 +5880,9 @@ fn engine_config() -> pulsus_read::TraceReadConfig {
         spans_v2_table: "spans".to_string(),
         traces_table: "traces".to_string(),
         resources_table: "resources".to_string(),
-        max_candidates: 100_000,
         scan_budget_rows: 50_000_000,
-        event_set_max_values: 1_000_000,
         max_depth: 64,
         max_series: 1_000,
-        generator_max_memory_bytes: 536_870_912,
         distributed: false,
         skip_unavailable_shards: false,
     }
@@ -8585,7 +8582,7 @@ async fn by_reads_typed_values_only() {
 /// The distinct-group `422` at `max_series = 2`, by the statement's
 /// counter; and `{ } | by(status)` and `by(resource.service.name)` at
 /// `limit = 1` the statement answers, counting the groups of the trace it
-/// returns (issue #602 part 1: the statement runs no preflight).
+/// returns (issue #602 part 1: the statement runs no preflight). Owns `traceql-nested-by-composite-series-cap`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn search_routed_keeps_the_group_cap() {
     skip_unless_live!();

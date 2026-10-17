@@ -14,10 +14,10 @@ use crate::traces::metrics_plan::{PlanKind, RangeAxis, TraceMetricsPlan};
 use crate::traces::metrics_result::{
     MetricExemplar, MetricLabel, MetricLabelValue, TraceMetricSeries, TraceMetricsResult,
 };
-use crate::traces::search_eval::go_duration_string;
 use crate::traces::spans::metrics::{
     MetricStatementRow, MetricsStatement, RoutedMetricsPlan, SERIES_CAP_MESSAGE, TargetUnit,
 };
+use crate::traces::values::go_duration_string;
 
 impl TraceEngine {
     /// The range answer to `routed`: its statement's rows, each series'

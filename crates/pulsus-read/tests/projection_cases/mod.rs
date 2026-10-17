@@ -2,25 +2,13 @@
 // as typed data shared by the two checks that must not drift apart.
 //
 // `crates/pulsus-read/tests/traces_search_projection_differential.rs`
-// runs these cases against the reference; the library test
-// `pulsus_read::traces::search_plan::tests::the_live_differential_registry_covers_every_projection_shape`
-// asserts the registry covers every projection shape the planner can
-// produce. The library test used to read this array as TEXT, so a
-// witness query appearing anywhere in the array — in a case NAME, for
-// instance — satisfied the coverage check while exercising nothing
-// (code review wave 2). Both sides now bind the same `const CASES`:
-// the library test `include!`s this file, the differential `mod`s it,
-// and coverage is decided by comparing `ProjectionCase::q` values.
-//
-// THE REQUIRED SET IS NOT IN THIS FILE, on purpose. It is
-// `REQUIRED_SHAPE_PAIRS` in `crates/pulsus-read/src/traces/search_plan.rs`,
-// which nothing here can edit — a registry cannot report its own
-// absences. Code review wave 3 removed the mandated same-field
-// physical-column case (34) and both registry guards stayed green,
-// because the demand was then one witness per LABEL and both of that
-// case's labels were supplied by other cases. Removing or rewriting any
-// case that carries a required pair's witness query now fails that test,
-// naming the pair.
+// runs these cases against the reference and, hermetically, holds the
+// two guards over them: `the_live_differential_registry_is_well_formed`
+// and `every_witness_query_is_exactly_one_case`. The required witness
+// queries are stated THERE, not here — a registry cannot report its own
+// absences — so removing or rewriting a case that carries one fails that
+// test, naming the witness. (Both guards were unit tests of the previous
+// search engine until #602 part 2c-2b-2 deleted it.)
 //
 // Not a top-level `tests/*.rs` file on purpose: Cargo would build it as
 // its own integration-test target, which would select no tests and exit

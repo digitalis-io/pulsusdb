@@ -103,7 +103,7 @@ impl RangeAxis {
     }
 }
 
-/// Engine-derived planning context — mirrors [`super::search_plan::SearchCtx`].
+/// Engine-derived planning context.
 #[derive(Debug, Clone, Copy)]
 pub struct MetricsCtx<'a> {
     pub filter: SpanFilterCtx<'a>,
@@ -346,8 +346,7 @@ impl TraceMetricsPlan {
         self.step_ms
     }
 
-    /// Whether the plan was built against `_dist` tables (mirrors
-    /// [`super::search_plan::SearchPlan::distributed`]).
+    /// Whether the plan was built against `_dist` tables.
     pub fn distributed(&self) -> bool {
         self.distributed
     }

@@ -86,7 +86,7 @@ pub fn child_leaf(
     let (Value::Number(raw), Some(sym)) = (value, sql_op(op)) else {
         return Err(type_refusal(Intrinsic::ChildCount, op, value));
     };
-    let zero_holds = crate::traces::search_eval::cmp_f64(op, 0.0, parse_num(raw)?);
+    let zero_holds = crate::traces::values::cmp_f64(op, 0.0, parse_num(raw)?);
     let (not, cond) = if zero_holds {
         ("NOT ", format!("NOT (count() {sym} {rendered})"))
     } else {

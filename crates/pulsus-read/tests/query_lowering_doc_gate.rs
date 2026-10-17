@@ -2143,22 +2143,13 @@ fn leading_backtick(cell: &str) -> Option<String> {
 /// with the reason. **Every alias is asserted to be USED**, so an entry
 /// that stops applying is an error rather than a silent widening of what
 /// counts as covered.
-const LINK_ALIASES: [(&str, &str, &str); 2] = [
-    (
-        "TqlLink",
-        "Pipe",
-        "the `Pipe` arm carries `PipelineStage`, whose eight variants have eight rows of their own; \
-         `every_traceql_pipeline_stage_variant_has_a_row_in_the_lowering_document` is the check \
-         over those",
-    ),
-    (
-        "LqlLink",
-        "Pipe",
-        "the `Pipe` arm carries `pulsus_logql::Stage`, whose ten variants have thirteen rows of \
+const LINK_ALIASES: [(&str, &str, &str); 1] = [(
+    "LqlLink",
+    "Pipe",
+    "the `Pipe` arm carries `pulsus_logql::Stage`, whose ten variants have thirteen rows of \
          their own (`Parser` has four forms); \
          `every_logql_stage_variant_has_a_row_in_the_lowering_document` is the check over those",
-    ),
-];
+)];
 
 fn assert_every_variant_has_a_row(
     enum_name: &str,
@@ -2263,22 +2254,6 @@ fn every_promql_node_kind_has_a_row_in_the_lowering_document() {
     let variants = enum_variants("crates/pulsus-read/src/metrics/compile.rs", "NodeKind");
     assert_eq!(variants.len(), 24, "NodeKind: {variants:?}");
     assert_every_variant_has_a_row("NodeKind", &variants, &link_row_labels(s131), "§13.1");
-}
-
-/// Every `TqlLink` variant has a row in §3.1.
-///
-/// **Ten of the fifteen had none until part 8**, and three of the ten —
-/// `Hydrate`, `Membership(n)` and `SelectValues(n)` — appear in every
-/// rendered plan on the search route. The gate the record originally
-/// nominated was a hand list of twelve names, which would have passed
-/// over exactly that table.
-#[test]
-fn every_traceql_chain_link_has_a_row_in_the_lowering_document() {
-    let md = repo_file(QUERY_LOWERING);
-    let s31 = section(&md, S31_HEADING, S32_HEADING);
-    let variants = enum_variants("crates/pulsus-read/src/traces/compile.rs", "TqlLink");
-    assert_eq!(variants.len(), 15, "TqlLink: {variants:?}");
-    assert_every_variant_has_a_row("TqlLink", &variants, &link_row_labels(s31), "§3.1");
 }
 
 /// The residual-state-effect group a link row states, read off the row's
@@ -2415,27 +2390,9 @@ fn the_document_states_the_residual_effect_counts_the_gates_assert() {
         t_stated + l_stated
     );
 
-    // The shipped TraceQL gate's row count, read from the call that
-    // asserts it rather than from a sentence.
-    let src = repo_file("crates/pulsus-read/src/traces/compile.rs");
-    let shipped: u64 = src
-        .split_once("assert_every_residual_state_effect::<Tql>(&rows, ")
-        .expect("traces/compile.rs must assert its residual-effect row count")
-        .1
-        .split(')')
-        .next()
-        .expect("the call is closed")
-        .trim()
-        .parse()
-        .expect("the row count is a number");
-    let derived = (t_stated + t_identity) as u64;
-    assert_eq!(
-        shipped,
-        derived + 1,
-        "§3.1 derives {derived} residual-effect rows and the shipped gate asserts {shipped}; the \
-         difference must be exactly the one extra `By` row the shipped gate carries, one per key \
-         branch"
-    );
+    // The shipped TraceQL gate this compared against was
+    // `traces/compile.rs`'s residual-effect assertion, deleted with the
+    // previous search engine (#602 part 2c-2b-2).
 }
 
 /// **The boundary diagram names only links this document defines.**

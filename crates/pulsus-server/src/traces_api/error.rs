@@ -1164,22 +1164,4 @@ mod tests {
         let (status, _) = rendered(err).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     }
-
-    /// Issue #57 re-audit AC-conformance: the generator-memory reason is
-    /// covered by `ApiError::Read`'s `QueryTooBroad(_)` arm — no dedicated
-    /// match arm was needed — and names its reason in the body.
-    #[tokio::test]
-    async fn the_generator_memory_reason_maps_to_422() {
-        let err = ApiError::Read(ReadError::QueryTooBroad(
-            pulsus_read::logql::TooBroadReason::TraceGeneratorMemory {
-                budget_bytes: 1_048_576,
-            },
-        ));
-        let (status, body) = rendered(err).await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert!(
-            body.contains("generator memory"),
-            "message must name the reason, got {body}"
-        );
-    }
 }
