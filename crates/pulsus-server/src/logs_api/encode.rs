@@ -1202,11 +1202,11 @@ fn push_json_string_array<S: AsRef<str>>(out: &mut String, items: &[S], empty: J
 
 /// Encodes a `/api/logs/v1/patterns` result (M7-C3, issue #171, docs/api.md
 /// §2.6): the Loki-interop envelope `{"status":"success","data":[{"pattern":
-/// "<_> ...","samples":[[<unix_seconds>,<count>],...]}]}`. `data` is
+/// "<_> ...","level":"<level>","samples":[[<unix_seconds>,<count>],...]}]}`. `data` is
 /// **order-preserving** — the engine returns series already ordered
-/// total-count-desc then pattern-asc (the pushed-down top-1000), and that
+/// total desc, pattern asc, level asc (the pushed-down top-1000), and that
 /// presentation IS the contract, so this deliberately does NOT re-sort.
-/// `samples` are ascending by second, zero-count steps already omitted; both
+/// `samples` are ascending by second, zeros only where the statement filled them; both
 /// elements are bare JSON integers. `explain` joins as a sibling of `data`
 /// when requested.
 pub(crate) fn patterns_response(
@@ -1228,8 +1228,9 @@ pub(crate) fn patterns_response(
                 samples.push_str(&format!("[{secs},{count}]"));
             }
             format!(
-                "{{\"pattern\":{},\"samples\":[{samples}]}}",
-                json_string(&s.pattern)
+                "{{\"pattern\":{},\"level\":{},\"samples\":[{samples}]}}",
+                json_string(&s.pattern),
+                json_string(&s.level)
             )
             .into_bytes()
         },
@@ -1638,6 +1639,32 @@ mod tests {
     async fn body_string(res: Response) -> String {
         let bytes = to_bytes(res.into_body(), usize::MAX).await.expect("body");
         String::from_utf8(bytes.to_vec()).expect("utf8")
+    }
+
+    /// Issue #605: each pattern series carries its level, between `pattern`
+    /// and `samples`, the reference's key order
+    /// (`pkg/util/marshal/marshal.go:205-213` @ v3.7.4).
+    #[tokio::test]
+    async fn a_pattern_series_carries_its_level_between_pattern_and_samples() {
+        let res = patterns_response(
+            vec![
+                PatternSeries {
+                    pattern: "request <_> done".to_string(),
+                    level: "error".to_string(),
+                    samples: vec![(10, 3), (20, 1)],
+                },
+                PatternSeries {
+                    pattern: "request <_> done".to_string(),
+                    level: "info".to_string(),
+                    samples: vec![(10, 2)],
+                },
+            ],
+            None,
+        );
+        assert_eq!(
+            body_string(res).await,
+            r#"{"status":"success","data":[{"pattern":"request <_> done","level":"error","samples":[[10,3],[20,1]]},{"pattern":"request <_> done","level":"info","samples":[[10,2]]}]}"#
+        );
     }
 
     fn stream(fp: u64, labels_json: &str, entries: Vec<(i64, &str)>) -> StreamResult {

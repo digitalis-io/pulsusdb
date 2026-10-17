@@ -107,6 +107,7 @@ struct SeedLandingRow {
     updated_ns: i64,
     pattern: String,
     pattern_count: u64,
+    pattern_level: String,
 }
 
 /// One route's totals, summed over every statement it issued. **A
@@ -241,6 +242,7 @@ pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
                 updated_ns: 0,
                 pattern: String::new(),
                 pattern_count: 0,
+                pattern_level: String::new(),
             })
             .collect();
         client.insert_block("log_landing", &landing).await?;

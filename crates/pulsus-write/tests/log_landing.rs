@@ -424,6 +424,7 @@ fn every_landing_column_is_the_value_its_kind_was_built_from() {
         fingerprint: Fingerprint::from_raw(9),
         bucket_ns: TS - 3,
         pattern: "request <_> completed".to_string(),
+        level: pulsus_write::patterns::PatternLevel("warn"),
         count: 4,
     };
 
@@ -441,6 +442,7 @@ fn every_landing_column_is_the_value_its_kind_was_built_from() {
     assert_eq!(k0.updated_ns, 0);
     assert_eq!(k0.pattern, "");
     assert_eq!(k0.pattern_count, 0);
+    assert_eq!(k0.pattern_level.0, "");
 
     let k1 = LogLandingRow::stream(&std::sync::Arc::<str>::from(""), 5, &stream);
     assert_eq!(k1.received_ms, 5);
@@ -456,6 +458,7 @@ fn every_landing_column_is_the_value_its_kind_was_built_from() {
     assert_eq!(k1.updated_ns, stream.updated_ns);
     assert_eq!(k1.pattern, "");
     assert_eq!(k1.pattern_count, 0);
+    assert_eq!(k1.pattern_level.0, "");
 
     let k2 = LogLandingRow::pattern(&std::sync::Arc::<str>::from(""), 5, pattern.clone());
     assert_eq!(k2.received_ms, 5);
@@ -474,6 +477,7 @@ fn every_landing_column_is_the_value_its_kind_was_built_from() {
     assert_eq!(k2.updated_ns, 0);
     assert_eq!(k2.pattern, pattern.pattern);
     assert_eq!(k2.pattern_count, pattern.count);
+    assert_eq!(k2.pattern_level, pattern.level);
 }
 
 /// **T7.** The pattern bound never undercharges the landed pattern rows: for

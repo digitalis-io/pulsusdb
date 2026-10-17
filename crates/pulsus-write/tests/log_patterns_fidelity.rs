@@ -1,6 +1,6 @@
 //! Log-pattern ingest fidelity gate (M7-C3, issue #171). Proves that the SAME
 //! logical log lines produce byte-identical `log_patterns`
-//! `(fingerprint, bucket_ns, pattern, count)` rows whether they arrive via
+//! `(fingerprint, bucket_ns, pattern, level, count)` rows whether they arrive via
 //! **OTLP** (`otlp_logs::parse`) or the **Loki push** transport
 //! (`loki_push::parse_json`) — both asserted against a third, independent
 //! **hand-derived golden**, not `A == B` (which could mask a shared bug). The
@@ -159,7 +159,7 @@ fn otlp_request(ts_ns: i64) -> ExportLogsServiceRequest {
     let record = |body: &str| LogRecord {
         time_unix_nano: ts_ns as u64,
         observed_time_unix_nano: ts_ns as u64,
-        severity_number: 9,
+        severity_number: 13, // the WARN band: `warn` (issue #605)
         body: Some(AnyValue {
             value: Some(Value::StringValue(body.to_string())),
         }),
@@ -183,7 +183,8 @@ fn otlp_request(ts_ns: i64) -> ExportLogsServiceRequest {
 }
 
 fn loki_push_json(ts_ns: i64) -> Vec<u8> {
-    let val = |line: &str| format!(r#"["{ts_ns}","{line}"]"#);
+    // The stored `detected_level`, spelled as a client might (issue #605).
+    let val = |line: &str| format!(r#"["{ts_ns}","{line}",{{"detected_level":"WARN"}}]"#);
     format!(
         r#"{{"streams":[{{"stream":{{"service_name":"{SERVICE}"}},"values":[{},{},{}]}}]}}"#,
         val(LINE_A1),
@@ -223,13 +224,14 @@ struct PatternRow {
     fingerprint: u128,
     bucket_ns: i64,
     pattern: String,
+    level: String,
     count: u64,
 }
 
 async fn read_patterns(client: &ChClient, db: &str) -> Vec<PatternRow> {
     let sql = format!(
-        "SELECT fingerprint, bucket_ns, pattern, sum(count) AS count FROM {db}.log_patterns \
-         GROUP BY fingerprint, bucket_ns, pattern ORDER BY pattern"
+        "SELECT fingerprint, bucket_ns, pattern, toString(level) AS level, sum(count) AS count \
+         FROM {db}.log_patterns GROUP BY fingerprint, bucket_ns, pattern, level ORDER BY pattern, level"
     );
     let mut stream = client
         .query_stream::<PatternRow>(&sql, &QuerySettings::new())
@@ -306,12 +308,14 @@ async fn otlp_and_loki_push_land_identical_hand_derived_pattern_rows() {
             fingerprint: fp,
             bucket_ns,
             pattern: TEMPLATE_B.to_string(),
+            level: "warn".to_string(),
             count: 1,
         },
         PatternRow {
             fingerprint: fp,
             bucket_ns,
             pattern: TEMPLATE_A.to_string(),
+            level: "warn".to_string(),
             count: 2, // LINE_A1 + LINE_A2 share a template
         },
     ];

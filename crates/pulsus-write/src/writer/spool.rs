@@ -1062,6 +1062,7 @@ mod tests {
             fingerprint: Fingerprint::from_raw(11),
             bucket_ns: TS - 7,
             pattern: "y".repeat(STRING_PAST_CHUNK),
+            level: crate::patterns::PatternLevel("unknown"),
             count: 4_242,
         };
         vec![

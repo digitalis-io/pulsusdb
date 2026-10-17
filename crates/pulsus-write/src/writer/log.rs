@@ -928,6 +928,7 @@ mod tests {
                     fingerprint: Fingerprint::from_raw(7),
                     bucket_ns: 1_700_000_000_000_000_000,
                     pattern: "hello".to_string(),
+                    level: crate::patterns::PatternLevel("unknown"),
                     count: 1,
                 },
             ),

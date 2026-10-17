@@ -98,9 +98,16 @@ pkg/logql/syntax/parser.go
 pkg/logql/syntax/query_scanner.go
 pkg/logql/syntax/syntax.y
 pkg/logql/vector.go
+pkg/pattern/drain/chunk.go
+pkg/pattern/ingester.go
+pkg/pattern/ingester_querier.go
+pkg/pattern/iter/batch.go
+pkg/pattern/iter/merge.go
+pkg/pattern/stream.go
 pkg/push/push.pb.go
 pkg/querier/intervals.go
 pkg/querier/limits/validation.go
+pkg/querier/pattern/querier.go
 pkg/querier/querier.go
 pkg/querier/queryrange/codec.go
 pkg/querier/queryrange/detected_fields.go
