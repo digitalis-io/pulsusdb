@@ -5366,7 +5366,7 @@ statements into the corpus (ADR 0008 D1), and this document does not count it be
 compile core plans contains a join today, and none can: `Relation` has no join slot
 (`compile/fold.rs:626`), so a stage cannot contribute one without a type change. Over the
 `traces_search/` corpus, deleted with this half by #602 part 2c-2b-1, the assertion was green over a population holding none of the case
-it existed for, exactly as the `WITH` row says of itself, and it became an enforced check only if
+it existed for, exactly as the `WITH` row says of itself, and it became a non-vacuous check only if
 something wrote a join. What it is **not** vacuous about, and all it checks now, is the other half: the
 committed goldens outside that corpus which carry a join today are pinned as an EQUALITY, so a
 join in any other file of the golden tree fails it. That half is why the gate walks the golden root rather
