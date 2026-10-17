@@ -140,6 +140,7 @@ struct SeedLandingRow {
     updated_ns: i64,
     pattern: String,
     pattern_count: u64,
+    pattern_level: String,
 }
 
 impl SeedLandingRow {
@@ -159,6 +160,7 @@ impl SeedLandingRow {
             updated_ns: 0,
             pattern: String::new(),
             pattern_count: 0,
+            pattern_level: String::new(),
         }
     }
 }

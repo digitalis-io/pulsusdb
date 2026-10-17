@@ -206,6 +206,7 @@ async fn seed(client: &ChClient, db: &str) {
                 fingerprint,
                 bucket_ns: ts_ns,
                 pattern: "user <_> login".to_string(),
+                level: pulsus_write::patterns::PatternLevel("unknown"),
                 count: 1,
             },
         ));
@@ -632,7 +633,7 @@ async fn every_fingerprint_row_struct_round_trips_the_uint128_column() {
         &client,
         "LogPatternRow",
         &format!(
-            "SELECT fingerprint, bucket_ns, pattern, count FROM log_patterns \
+            "SELECT fingerprint, bucket_ns, pattern, level, count FROM log_patterns \
              WHERE fingerprint IN ({fps}) ORDER BY fingerprint"
         ),
     )

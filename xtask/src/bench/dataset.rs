@@ -201,6 +201,7 @@ struct SeedLandingRow {
     updated_ns: i64,
     pattern: String,
     pattern_count: u64,
+    pattern_level: String,
 }
 
 /// The landing table every logs corpus is seeded through. Not a `--dist`
@@ -238,6 +239,7 @@ impl SeedLandingRow {
             updated_ns: 0,
             pattern: String::new(),
             pattern_count: 0,
+            pattern_level: String::new(),
         }
     }
 

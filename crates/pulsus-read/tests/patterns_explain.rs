@@ -8,13 +8,13 @@
 //!     seeded across a wide `bucket_ns` span inside a SINGLE partition day; a
 //!     narrow-window `EXPLAIN indexes = 1` selects strictly FEWER PrimaryKey
 //!     granules than the fingerprint's full-window total — proving the
-//!     `(fingerprint, bucket_ns, pattern)` order (bucket_ns before pattern)
+//!     `(fingerprint, bucket_ns, pattern, level)` order (bucket_ns before pattern)
 //!     prunes at the PK level within a partition.
 //!  2. **Partition pruning**: a second day is seeded; a one-day query selects
 //!     fewer parts than the two-day span (the daily `PARTITION BY`).
 //!
 //! Plus an end-to-end engine assertion: seeded `log_patterns` rows assemble
-//! into `PatternSeries` with the pinned ordering (total desc, pattern asc) and
+//! into `PatternSeries` with the pinned ordering (total desc, pattern, level) and
 //! exact `step_ns` re-bucketing.
 //!
 //! Run locally:
@@ -115,6 +115,7 @@ struct PatSeedRow {
     fingerprint: Fingerprint,
     bucket_ns: i64,
     pattern: String,
+    level: String,
     count: u64,
 }
 
@@ -249,6 +250,7 @@ async fn patterns_read_prunes_at_the_primary_key_time_prefix_within_one_partitio
             fingerprint: Fingerprint::from_raw(FP_RAW),
             bucket_ns: base + i * SECOND_NS,
             pattern: format!("pattern alpha {i}"),
+            level: "unknown".to_string(),
             count: 1,
         })
         .collect();
@@ -329,6 +331,7 @@ async fn patterns_read_prunes_daily_partitions() {
                 fingerprint: Fingerprint::from_raw(FP_RAW),
                 bucket_ns: day_a,
                 pattern: "pattern one".to_string(),
+                level: "unknown".to_string(),
                 count: 1,
             },
             PatSeedRow {
@@ -336,6 +339,7 @@ async fn patterns_read_prunes_daily_partitions() {
                 fingerprint: Fingerprint::from_raw(FP_RAW),
                 bucket_ns: day_b,
                 pattern: "pattern two".to_string(),
+                level: "unknown".to_string(),
                 count: 1,
             },
         ],
@@ -439,6 +443,7 @@ async fn patterns_engine_assembles_ordered_series_with_exact_step_rebucketing() 
                 fingerprint: Fingerprint::from_raw(FP_RAW),
                 bucket_ns: b0,
                 pattern: "pattern b".to_string(),
+                level: "unknown".to_string(),
                 count: 1,
             },
             PatSeedRow {
@@ -446,6 +451,7 @@ async fn patterns_engine_assembles_ordered_series_with_exact_step_rebucketing() 
                 fingerprint: Fingerprint::from_raw(FP_RAW),
                 bucket_ns: b1,
                 pattern: "pattern b".to_string(),
+                level: "unknown".to_string(),
                 count: 2,
             },
             PatSeedRow {
@@ -453,6 +459,7 @@ async fn patterns_engine_assembles_ordered_series_with_exact_step_rebucketing() 
                 fingerprint: Fingerprint::from_raw(FP_RAW),
                 bucket_ns: b2,
                 pattern: "pattern a".to_string(),
+                level: "unknown".to_string(),
                 count: 2,
             },
         ],

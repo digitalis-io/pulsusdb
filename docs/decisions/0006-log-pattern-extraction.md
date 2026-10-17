@@ -1,6 +1,6 @@
 # ADR 0006: Log-pattern extraction (deterministic token-class templating)
 
-Status: **Accepted** (2026-07-22)
+Status: **Accepted** (2026-07-22). Since `/patterns` answers by level, a pattern is also keyed by its line's level, which this record predates; `docs/api.md` §2.6.4 is current.
 Issue: [#171](https://github.com/digitalis-io/pulsusdb/issues/171)
 
 ## Context

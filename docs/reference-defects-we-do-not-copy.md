@@ -88,6 +88,7 @@ replaces one.
 | [33](#33-rate_counter-reads-nanoseconds-as-milliseconds) | log reference | queries | A | `rate_counter` over a counter that rose by 60 in a one-minute window answers 1.000006 per second instead of 2. |
 | [34](#34-spanchildcount-is-accepted-and-answers-nothing) | trace reference | queries | A, D | A query on a span's child count answers "nothing matched", in every position. |
 | [35](#35-past-the-series-limit-a-drilldown-answer-gains-series-with-no-labels) | log reference | queries | C | A partial answer past the series limit can carry extra series with no labels, holding points of series it was dropping. |
+| [36](#36-one-pattern-series-can-carry-two-samples-at-one-timestamp) | log reference | queries | A | A `/patterns` series can answer `[[t,1],[t,1]]` where it means `[[t,2]]`. |
 
 ---
 
@@ -2167,6 +2168,38 @@ warning.
 
 Ledger row `logql-drilldown-partial-series`. Pinned by `the_series_cap_answers_as_the_reference` in
 `crates/pulsus-server/tests/loki_push_live.rs`.
+
+---
+
+## 36. One pattern series can carry two samples at one timestamp
+
+**The log reference · queries · test A**
+
+### What the reference does
+
+`/patterns` merges its per-stream, per-level iterators in a tree ordered by timestamp, then pattern
+(`pkg/pattern/iter/merge.go:30-48`), and sums two samples only when they arrive one after the other with equal
+timestamp, pattern **and level** (`pkg/pattern/iter/merge.go:50-78`). Among iterators with equal timestamp and
+pattern the order is not defined; a stream's level iterators come from a map walk (`pkg/pattern/stream.go:133`).
+So when streams hold one pattern at two levels in one step, a level's samples can arrive with the other level's
+between them and stay unsummed, and the series, filed by level and pattern with every sample appended
+(`pkg/pattern/iter/batch.go:9-38`), carries two samples at one timestamp. Which samples are summed can change from
+one request to the next. The querier merges the ingesters' answers again under the same order
+(`pkg/pattern/ingester_querier.go:68`), which can sum some of these and leave others.
+
+### Why that is wrong rather than different
+
+It sums samples that share a key, ordered by part of the key, so whether two are summed depends on what sorts
+between them (**A**). Read from the source; not measured.
+
+### What PulsusDB does
+
+One sample per timestamp in each series, the sum over streams.
+
+### Evidence
+
+Ledger row `logql-patterns-step-fill`. Pinned by
+`patterns_fill_empty_steps_within_a_stream_as_the_reference_does` in `crates/pulsus-server/tests/loki_push_live.rs`.
 
 ---
 

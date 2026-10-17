@@ -1304,10 +1304,10 @@ pub const MAX_PATTERNS: usize = 1000;
 
 /// The `/api/logs/v1/patterns` aggregation (M7-C3, issue #171, docs/schemas.md
 /// §3.2): stage-1 fingerprints → ONE pushed-down aggregate over `log_patterns`
-/// with no hydration (the response carries no labels). The inner query
-/// re-buckets `bucket_ns` to `step_ns` and sums per `(pattern, ts_ns)`; the
-/// outer sums per pattern and emits the ascending `(ts_ns, cnt)` samples array,
-/// ordered total-count desc then pattern asc, top-[`MAX_PATTERNS`].
+/// with no hydration (the response carries no labels). Per `(fingerprint, pattern, level)` it pairs
+/// consecutive rows; at a step other than 10s a pair under an hour apart marks the empty steps
+/// between them (issue #605, the reference's chunk fill). It sums per `(pattern, level, ts_ns)`,
+/// takes the top-[`MAX_PATTERNS`] by total, pattern, level, and only then writes their zeros.
 ///
 /// **Pushdown/pruning:** `fingerprint IN` engages the `(fingerprint, bucket_ns,
 /// pattern)` primary-key prefix (granule pruning), daily partitions prune the
@@ -1326,7 +1326,7 @@ pub fn log_patterns_read(
     let TimeWindow { start_ns, end_ns } = window;
     let limit = MAX_PATTERNS;
     format!(
-        "SELECT pattern, sum(cnt) AS total, arraySort(x -> x.1, groupArray((ts_ns, cnt))) AS samples\nFROM (\n  SELECT pattern, intDiv(bucket_ns, {step_ns}) * {step_ns} AS ts_ns, sum(count) AS cnt\n  FROM {patterns_table}\n  WHERE org_id = {t} AND fingerprint IN ({fp_list}) AND bucket_ns >= {start_ns} AND bucket_ns < {end_ns}\n  GROUP BY pattern, ts_ns\n)\nGROUP BY pattern\nORDER BY total DESC, pattern ASC\nLIMIT {limit}"
+        "SELECT pattern, level, total, arrayFlatten(arrayMap((p, c, n) -> arrayConcat(if(p.2 > 0 OR c > 0, [(p.1, p.2)], []), if(c > 0, arrayMap(z -> (toInt64(z), toUInt64(0)), range(p.1 + {step_ns}, n, {step_ns})), [])), pts, arrayCumSum(arrayMap(p -> p.3, pts)), arrayPushBack(arrayPopFront(arrayMap(p -> p.1, pts)), 0))) AS samples\nFROM (\n  SELECT pattern, level, sum(cnt) AS total, arraySort(groupArray((ts_ns, cnt, delta))) AS pts\n  FROM (\n    SELECT pattern, level, point.1 AS ts_ns, sum(point.2) AS cnt, sum(point.3) AS delta\n    FROM (\n      SELECT pattern, level, arraySort(groupArray((bucket_ns, toUInt64(count)))) AS rows\n      FROM {patterns_table}\n      WHERE org_id = {t} AND fingerprint IN ({fp_list}) AND bucket_ns >= {start_ns} AND bucket_ns < {end_ns}\n      GROUP BY fingerprint, pattern, level\n    )\n    ARRAY JOIN arrayConcat(arrayMap(r -> (intDiv(r.1, {step_ns}) * {step_ns}, r.2, toInt64(0)), rows), arrayFlatten(arrayMap((a, b) -> if(b.1 - a.1 < if({step_ns} = 10000000000, 0, 3600000000000) AND intDiv(a.1, {step_ns}) * {step_ns} + {step_ns} < intDiv(b.1, {step_ns}) * {step_ns}, [(intDiv(a.1, {step_ns}) * {step_ns} + {step_ns}, toUInt64(0), toInt64(1)), (intDiv(b.1, {step_ns}) * {step_ns}, toUInt64(0), toInt64(-1))], []), arrayPopBack(rows), arrayPopFront(rows)))) AS point\n    GROUP BY pattern, level, ts_ns\n  )\n  GROUP BY pattern, level\n  ORDER BY total DESC, pattern ASC, level ASC\n  LIMIT {limit}\n)\nORDER BY total DESC, pattern ASC, level ASC"
     )
 }
 
@@ -3532,16 +3532,25 @@ mod tests {
         );
         assert_eq!(
             sql,
-            "SELECT pattern, sum(cnt) AS total, arraySort(x -> x.1, groupArray((ts_ns, cnt))) AS samples\n\
+            "SELECT pattern, level, total, arrayFlatten(arrayMap((p, c, n) -> arrayConcat(if(p.2 > 0 OR c > 0, [(p.1, p.2)], []), if(c > 0, arrayMap(z -> (toInt64(z), toUInt64(0)), range(p.1 + 10000000000, n, 10000000000)), [])), pts, arrayCumSum(arrayMap(p -> p.3, pts)), arrayPushBack(arrayPopFront(arrayMap(p -> p.1, pts)), 0))) AS samples\n\
              FROM (\n  \
-               SELECT pattern, intDiv(bucket_ns, 10000000000) * 10000000000 AS ts_ns, sum(count) AS cnt\n  \
-               FROM log_patterns\n  \
-               WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120')) AND bucket_ns >= 1000 AND bucket_ns < 2000\n  \
-               GROUP BY pattern, ts_ns\n\
+             SELECT pattern, level, sum(cnt) AS total, arraySort(groupArray((ts_ns, cnt, delta))) AS pts\n  \
+             FROM (\n    \
+             SELECT pattern, level, point.1 AS ts_ns, sum(point.2) AS cnt, sum(point.3) AS delta\n    \
+             FROM (\n      \
+             SELECT pattern, level, arraySort(groupArray((bucket_ns, toUInt64(count)))) AS rows\n      \
+             FROM log_patterns\n      \
+             WHERE org_id = '' AND fingerprint IN (toUInt128('18374'), toUInt128('99120')) AND bucket_ns >= 1000 AND bucket_ns < 2000\n      \
+             GROUP BY fingerprint, pattern, level\n    \
+             )\n    \
+             ARRAY JOIN arrayConcat(arrayMap(r -> (intDiv(r.1, 10000000000) * 10000000000, r.2, toInt64(0)), rows), arrayFlatten(arrayMap((a, b) -> if(b.1 - a.1 < if(10000000000 = 10000000000, 0, 3600000000000) AND intDiv(a.1, 10000000000) * 10000000000 + 10000000000 < intDiv(b.1, 10000000000) * 10000000000, [(intDiv(a.1, 10000000000) * 10000000000 + 10000000000, toUInt64(0), toInt64(1)), (intDiv(b.1, 10000000000) * 10000000000, toUInt64(0), toInt64(-1))], []), arrayPopBack(rows), arrayPopFront(rows)))) AS point\n    \
+             GROUP BY pattern, level, ts_ns\n  \
+             )\n  \
+             GROUP BY pattern, level\n  \
+             ORDER BY total DESC, pattern ASC, level ASC\n  \
+             LIMIT 1000\n\
              )\n\
-             GROUP BY pattern\n\
-             ORDER BY total DESC, pattern ASC\n\
-             LIMIT 1000"
+             ORDER BY total DESC, pattern ASC, level ASC"
         );
         assert!(!sql.contains("body"), "patterns must never read body");
     }

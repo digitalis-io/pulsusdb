@@ -118,6 +118,9 @@ docs/api.md	pkg/loki/modules.go:1368	pinned_to_another_version
 docs/api.md	pkg/loki/modules.go:687	pinned_to_another_version
 docs/api.md	pkg/loki/modules.go:690	pinned_to_another_version
 docs/api.md	pkg/loki/modules.go:691	pinned_to_another_version
+docs/api.md	pkg/pattern/drain/chunk.go:35-41	pinned_to_another_version
+docs/api.md	pkg/pattern/drain/chunk.go:47-99	not_in_this_repository
+docs/api.md	pkg/pattern/stream.go:108-121	pinned_to_another_version
 docs/api.md	pkg/querier/queryrange/roundtrip.go:347-370	not_in_this_repository
 docs/api.md	pkg/querier/queryrange/roundtrip.go:365	not_in_this_repository
 docs/api.md	pkg/querier/queryrange/splitters.go:236	pinned_to_another_version
@@ -353,10 +356,17 @@ docs/benchmarks/logs-differential-ledger.md	pkg/logql/syntax/syntax.y:114-121	no
 docs/benchmarks/logs-differential-ledger.md	pkg/logql/syntax/syntax.y:176-184	not_in_this_repository
 docs/benchmarks/logs-differential-ledger.md	pkg/logql/vector.go:16-21	not_in_this_repository
 docs/benchmarks/logs-differential-ledger.md	pkg/logql/vector.go:45-50	not_in_this_repository
+docs/benchmarks/logs-differential-ledger.md	pkg/pattern/drain/chunk.go:35-41	not_in_this_repository
+docs/benchmarks/logs-differential-ledger.md	pkg/pattern/drain/chunk.go:47-99	pinned_to_another_version
+docs/benchmarks/logs-differential-ledger.md	pkg/pattern/ingester.go:113-124	not_in_this_repository
+docs/benchmarks/logs-differential-ledger.md	pkg/pattern/ingester_querier.go:22-23	not_in_this_repository
+docs/benchmarks/logs-differential-ledger.md	pkg/pattern/iter/batch.go:9-38	not_in_this_repository
+docs/benchmarks/logs-differential-ledger.md	pkg/pattern/stream.go:108-121	not_in_this_repository
 docs/benchmarks/logs-differential-ledger.md	pkg/push/push.pb.go:493-500	not_in_this_repository
 docs/benchmarks/logs-differential-ledger.md	pkg/querier/intervals.go:32-38	pinned_to_another_version
 docs/benchmarks/logs-differential-ledger.md	pkg/querier/limits/validation.go:88-91	not_in_this_repository
 docs/benchmarks/logs-differential-ledger.md	pkg/querier/limits/validation.go:92-94	not_in_this_repository
+docs/benchmarks/logs-differential-ledger.md	pkg/querier/pattern/querier.go:14-52	not_in_this_repository
 docs/benchmarks/logs-differential-ledger.md	pkg/querier/querier.go:1035	pinned_to_another_version
 docs/benchmarks/logs-differential-ledger.md	pkg/querier/querier.go:277-287	not_in_this_repository
 docs/benchmarks/logs-differential-ledger.md	pkg/querier/querier.go:535	not_in_this_repository
@@ -384,6 +394,7 @@ docs/benchmarks/logs-differential-ledger.md	pkg/storage/stores/shipper/indexship
 docs/benchmarks/logs-differential-ledger.md	pkg/util/errors.go:105-131	pinned_to_another_version
 docs/benchmarks/logs-differential-ledger.md	pkg/util/httpreq/tags.go:108-128	not_in_this_repository
 docs/benchmarks/logs-differential-ledger.md	pkg/util/marshal/marshal.go:182-188	not_in_this_repository
+docs/benchmarks/logs-differential-ledger.md	pkg/util/marshal/marshal.go:205-213	not_in_this_repository
 docs/benchmarks/logs-differential-ledger.md	pkg/util/marshal/query.go:25-32	pinned_to_another_version
 docs/benchmarks/logs-differential-ledger.md	pkg/util/marshal/query.go:416	pinned_to_another_version
 docs/benchmarks/logs-differential-ledger.md	pkg/util/marshal/query.go:87-100	not_in_this_repository
@@ -951,6 +962,11 @@ docs/reference-defects-we-do-not-copy.md	pkg/logql/range_vector.go:195	not_in_th
 docs/reference-defects-we-do-not-copy.md	pkg/logql/range_vector.go:286-353	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/logql/range_vector.go:355	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/logql/shardmapper.go:476-534	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	pkg/pattern/ingester_querier.go:68	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	pkg/pattern/iter/batch.go:9-38	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	pkg/pattern/iter/merge.go:30-48	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	pkg/pattern/iter/merge.go:50-78	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	pkg/pattern/stream.go:133	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/querier/intervals.go:32-40	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/querier/queryrange/shard_resolver.go:268	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/querier/queryrange/shard_resolver.go:275	not_in_this_repository

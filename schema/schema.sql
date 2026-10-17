@@ -41,7 +41,7 @@ CREATE TABLE IF NOT EXISTS {{db}}.log_landing{{on_cluster}}
     labels String CODEC(ZSTD(5)),
     updated_ns Int64 CODEC(DoubleDelta, ZSTD(1)),
     pattern String CODEC(ZSTD(1)),
-    pattern_count UInt64 CODEC(T64, ZSTD(1))
+    pattern_count UInt64 CODEC(T64, ZSTD(1)), pattern_level LowCardinality(String)
 )
 --@single  ENGINE = MergeTree
 --@cluster ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/{{db}}.log_landing', '{replica}')
@@ -75,13 +75,13 @@ CREATE TABLE IF NOT EXISTS {{db}}.log_patterns{{on_cluster}}
     org_id LowCardinality(String),
     fingerprint UInt128,
     bucket_ns Int64,
-    pattern String CODEC(ZSTD(1)),
+    pattern String CODEC(ZSTD(1)), level LowCardinality(String),
     count SimpleAggregateFunction(sum, UInt64)
 )
 --@single  ENGINE = AggregatingMergeTree
 --@cluster ENGINE = ReplicatedAggregatingMergeTree('/clickhouse/tables/{shard}/{{db}}.log_patterns', '{replica}')
 PARTITION BY toDate(fromUnixTimestamp64Nano(bucket_ns))
-ORDER BY (org_id, fingerprint, bucket_ns, pattern)
+ORDER BY (org_id, fingerprint, bucket_ns, pattern, level)
 TTL toDateTime(least(intDiv(bucket_ns, 1000000000) + ({{retention_days}} * 86400), 4294967295))
 --@single  SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{log_dedup_window}}{{storage_policy}};
 --@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, replicated_deduplication_window = {{log_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
@@ -717,7 +717,7 @@ AS SELECT
     org_id AS org_id,
     fingerprint AS fingerprint,
     timestamp_ns AS bucket_ns,
-    pattern AS pattern,
+    pattern AS pattern, pattern_level AS level,
     pattern_count AS count
 FROM {{db}}.log_landing
 WHERE kind = 2;

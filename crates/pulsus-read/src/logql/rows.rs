@@ -214,6 +214,8 @@ pub struct DetectedLabelRow {
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct PatternFetchRow {
     pub pattern: String,
+    /// The pattern's level (issue #605), one of the reference's eight.
+    pub level: String,
     pub total: u64,
     pub samples: Vec<(i64, u64)>,
 }

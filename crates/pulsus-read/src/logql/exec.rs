@@ -3097,13 +3097,15 @@ pub struct LogStats {
 
 /// One `/api/logs/v1/patterns` series (M7-C3, issue #171): a distinct log
 /// template and its per-step counts, `(unix_seconds, count)` ascending
-/// (zero-count steps omitted). The engine preserves ClickHouse's
-/// total-count-desc-then-pattern-asc order (the pushed-down `ORDER BY`), so
+/// (a zero only where the reference's chunk fill puts one, issue #605). The engine preserves ClickHouse's
+/// total desc, pattern asc, level asc order (the pushed-down `ORDER BY`), so
 /// the top-1000 presentation IS the contract — the response encoder must not
 /// re-sort.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PatternSeries {
     pub pattern: String,
+    /// The pattern's level (issue #605): one series per `(pattern, level)`.
+    pub level: String,
     pub samples: Vec<(i64, u64)>,
 }
 
@@ -3557,7 +3559,7 @@ impl LogQlEngine {
                         self.config.read_max_memory_bytes,
                     )
                 })?;
-                // ClickHouse already ordered by (total desc, pattern asc) and
+                // ClickHouse already ordered by (total desc, pattern, level) and
                 // arraySorted the samples ascending by ts_ns; each ts_ns is a
                 // multiple of step_ns (≥ 10s), so ns→unix-seconds is exact.
                 let samples = row
@@ -3567,6 +3569,7 @@ impl LogQlEngine {
                     .collect();
                 series.push(PatternSeries {
                     pattern: row.pattern,
+                    level: row.level,
                     samples,
                 });
             }
