@@ -4420,3 +4420,144 @@ SQL:
             });
     }
 }
+
+/// Issue #605: `/patterns` answers one series per (pattern, level), each
+/// carrying `level`, as the reference does (`pkg/pattern/iter/batch.go:9-38`,
+/// `pkg/pattern/stream.go:108-121` @ v3.7.4). One line is sent eight times:
+/// three stored `error`, two `info`, one `systemd` (a value outside the eight
+/// names), and twice with no metadata, which the line scan stores as
+/// `unknown`. The answer is three series of the one pattern: `error` 3 and
+/// `unknown` 3, tied and so in level order, then `info` 2. On main it is one
+/// series of 8 with no `level`.
+#[tokio::test(flavor = "multi_thread")]
+async fn patterns_are_one_series_per_pattern_and_level() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_705;
+    let db = &pulsus_testkit::test_db("pulsus_loki_push_pattern_levels_it");
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
+    const MIN: i64 = 60_000_000_000;
+    let base = (now_ns() / MIN) * MIN - 10 * MIN;
+    let mut ts = base;
+    for (level, n) in [("error", 3), ("info", 2), ("systemd", 1)] {
+        for _ in 0..n {
+            let body = json_body_with_sm("pl-a", ts, "request done", &[("detected_level", level)]);
+            let res = push(port, "application/json", body.as_bytes());
+            assert_eq!(res.status, 204, "push {level} (body {})", res.body);
+            ts += 1;
+        }
+    }
+    for _ in 0..2 {
+        let res = push(
+            port,
+            "application/json",
+            json_body("pl-a", ts, "request done").as_bytes(),
+        );
+        assert_eq!(res.status, 204, "push without metadata (body {})", res.body);
+        ts += 1;
+    }
+    let landed = format!("SELECT sum(count) AS c FROM {db}.log_patterns WHERE org_id = ''");
+    assert_eq!(wait_for_count(db, &landed, 8).await, 8);
+
+    let path = format!(
+        "/api/logs/v1/patterns?query={}&start={base}&end={}&step=60",
+        urlencode(r#"{service_name="pl-a"}"#),
+        base + MIN
+    );
+    let res = http_get(port, &path).expect("patterns reachable");
+    assert_eq!(res.status, 200, "body {}", res.body);
+    let secs = base / 1_000_000_000;
+    assert_eq!(
+        res.body,
+        format!(
+            r#"{{"status":"success","data":[{{"pattern":"request done","level":"error","samples":[[{secs},3]]}},{{"pattern":"request done","level":"unknown","samples":[[{secs},3]]}},{{"pattern":"request done","level":"info","samples":[[{secs},2]]}}]}}"#
+        )
+    );
+}
+
+/// Issue #605: at a step other than 10s, `/patterns` puts a zero at each empty
+/// step between two of one stream's steps for a pattern and level, as the
+/// reference's chunk does (`pkg/pattern/drain/chunk.go:47-99` @ v3.7.4), and
+/// none across a gap of an hour or more, where the reference has started a new
+/// chunk (`:35-41`, `:104-128`; one hour by default, `pkg/pattern/ingester.go:113-124`).
+/// At 10s it returns the stored steps alone (`chunk.go:73-75`). Streams are summed per
+/// step, zeros included, one sample each.
+///
+/// `pz-a`: `error` at minutes 0 and 3, `info` at 0 and 60. `pz-b`: `error` at
+/// 0 and 5, `info` at 30. At step 60, `error` is 2, 0, 0, 1, 0, 1 over minutes
+/// 0-5: `pz-a` fills two steps in a row, `pz-b` four; `info` gets no zero,
+/// because `pz-a`'s gap is exactly an hour and `pz-b` has one step.
+#[tokio::test(flavor = "multi_thread")]
+async fn patterns_fill_empty_steps_within_a_stream_as_the_reference_does() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_706;
+    let db = &pulsus_testkit::test_db("pulsus_loki_push_pattern_fill_it");
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
+    const MIN: i64 = 60_000_000_000;
+    let base = (now_ns() / MIN) * MIN - 70 * MIN;
+    let lines = [
+        ("pz-a", 0, "error"),
+        ("pz-a", 3, "error"),
+        ("pz-a", 0, "info"),
+        ("pz-a", 60, "info"),
+        ("pz-b", 0, "error"),
+        ("pz-b", 5, "error"),
+        ("pz-b", 30, "info"),
+    ];
+    for (i, (service, minute, level)) in lines.into_iter().enumerate() {
+        let ts = base + minute * MIN + i as i64;
+        let body = json_body_with_sm(service, ts, "job ran", &[("detected_level", level)]);
+        let res = push(port, "application/json", body.as_bytes());
+        assert_eq!(
+            res.status, 204,
+            "push {service} {minute} (body {})",
+            res.body
+        );
+    }
+    let landed = format!("SELECT sum(count) AS c FROM {db}.log_patterns WHERE org_id = ''");
+    assert_eq!(wait_for_count(db, &landed, 7).await, 7);
+
+    let m = |minute: i64| (base + minute * MIN) / 1_000_000_000;
+    for (step, error, info) in [
+        (
+            "60",
+            format!(
+                "[[{},2],[{},0],[{},0],[{},1],[{},0],[{},1]]",
+                m(0),
+                m(1),
+                m(2),
+                m(3),
+                m(4),
+                m(5)
+            ),
+            format!("[[{},1],[{},1],[{},1]]", m(0), m(30), m(60)),
+        ),
+        (
+            "10",
+            format!("[[{},2],[{},1],[{},1]]", m(0), m(3), m(5)),
+            format!("[[{},1],[{},1],[{},1]]", m(0), m(30), m(60)),
+        ),
+    ] {
+        let path = format!(
+            "/api/logs/v1/patterns?query={}&start={base}&end={}&step={step}",
+            urlencode(r#"{service_name=~"pz-.*"}"#),
+            base + 61 * MIN
+        );
+        let res = http_get(port, &path).expect("patterns reachable");
+        assert_eq!(res.status, 200, "step {step}: body {}", res.body);
+        assert_eq!(
+            res.body,
+            format!(
+                r#"{{"status":"success","data":[{{"pattern":"job ran","level":"error","samples":{error}}},{{"pattern":"job ran","level":"info","samples":{info}}}]}}"#
+            ),
+            "step {step}"
+        );
+    }
+}

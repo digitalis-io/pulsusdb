@@ -221,6 +221,8 @@ pub struct LogPatternRow {
     pub fingerprint: Fingerprint,
     pub bucket_ns: i64,
     pub pattern: String,
+    /// Issue #605 stub.
+    pub level: crate::patterns::PatternLevel,
     pub count: u64,
 }
 

@@ -1640,6 +1640,32 @@ mod tests {
         String::from_utf8(bytes.to_vec()).expect("utf8")
     }
 
+    /// Issue #605: each pattern series carries its level, between `pattern`
+    /// and `samples`, the reference's key order
+    /// (`pkg/util/marshal/marshal.go:205-213` @ v3.7.4).
+    #[tokio::test]
+    async fn a_pattern_series_carries_its_level_between_pattern_and_samples() {
+        let res = patterns_response(
+            vec![
+                PatternSeries {
+                    pattern: "request <_> done".to_string(),
+                    level: "error".to_string(),
+                    samples: vec![(10, 3), (20, 1)],
+                },
+                PatternSeries {
+                    pattern: "request <_> done".to_string(),
+                    level: "info".to_string(),
+                    samples: vec![(10, 2)],
+                },
+            ],
+            None,
+        );
+        assert_eq!(
+            body_string(res).await,
+            r#"{"status":"success","data":[{"pattern":"request <_> done","level":"error","samples":[[10,3],[20,1]]},{"pattern":"request <_> done","level":"info","samples":[[10,2]]}]}"#
+        );
+    }
+
     fn stream(fp: u64, labels_json: &str, entries: Vec<(i64, &str)>) -> StreamResult {
         StreamResult {
             fingerprint: Fingerprint::from_raw(u128::from(fp)),

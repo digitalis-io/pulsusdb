@@ -424,6 +424,7 @@ fn every_landing_column_is_the_value_its_kind_was_built_from() {
         fingerprint: Fingerprint::from_raw(9),
         bucket_ns: TS - 3,
         pattern: "request <_> completed".to_string(),
+        level: pulsus_write::patterns::PatternLevel("warn"),
         count: 4,
     };
 

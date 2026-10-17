@@ -206,6 +206,7 @@ async fn seed(client: &ChClient, db: &str) {
                 fingerprint,
                 bucket_ns: ts_ns,
                 pattern: "user <_> login".to_string(),
+                level: pulsus_write::patterns::PatternLevel("unknown"),
                 count: 1,
             },
         ));

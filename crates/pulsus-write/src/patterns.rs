@@ -279,6 +279,31 @@ pub fn est_template_bound(row: &LogRow) -> u64 {
     (2 * examined + 8).min(PATTERN_MAX_TEMPLATE_BYTES as u64)
 }
 
+/// Issue #605 stub: every row is `unknown`.
+pub fn pattern_level(structured_metadata: &str) -> PatternLevel {
+    let _ = structured_metadata;
+    PatternLevel("unknown")
+}
+
+/// A pattern row's level: one of the eight level names, or empty on a landing
+/// row of another kind. `Copy` and static, so a pattern row allocates
+/// nothing for it; it travels as a string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub struct PatternLevel(pub &'static str);
+
+impl serde::Serialize for PatternLevel {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.0)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for PatternLevel {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let _ = <String as serde::Deserialize>::deserialize(d)?;
+        Ok(PatternLevel(""))
+    }
+}
+
 /// Aggregates one request batch's rows into `(fingerprint, bucket_ns, pattern)
 /// -> count` `log_patterns` rows (D2). Runs only after the reservation
 /// succeeds (`writer::LogWriter::admit_batch`). Empty-body rows produce no
@@ -315,6 +340,7 @@ pub fn aggregate_patterns(rows: &[LogRow]) -> PatternAggregation {
             fingerprint,
             bucket_ns,
             pattern,
+            level: PatternLevel("unknown"),
             count,
         });
     }
@@ -333,6 +359,64 @@ mod tests {
     use pulsus_model::UnixNano;
 
     use super::*;
+
+    /// Issue #605: the stored `detected_level` mapped to the reference's
+    /// eight pattern levels: all eight names, six of them in another case,
+    /// then values outside them. A literal `unknown` and the fallback
+    /// give one answer, so each has its own case. Each verdict is derived by
+    /// hand from `pkg/pattern/stream.go:108-121` @ v3.7.4.
+    #[test]
+    fn a_rows_pattern_level_is_its_stored_level_or_unknown() {
+        for (metadata, want) in [
+            (r#"{"detected_level":"info"}"#, "info"),
+            (r#"{"a":"1","detected_level":"WARN"}"#, "warn"),
+            (r#"{"detected_level":"critical"}"#, "critical"),
+            (r#"{"detected_level":"DEBUG"}"#, "debug"),
+            (r#"{"detected_level":"Error"}"#, "error"),
+            (r#"{"detected_level":"FATAL"}"#, "fatal"),
+            (r#"{"detected_level":"Trace"}"#, "trace"),
+            (r#"{"detected_level":"UNKNOWN"}"#, "unknown"),
+            (r#"{"detected_level":"systemd"}"#, "unknown"),
+            (r#"{"detected_level":"Warning"}"#, "unknown"),
+            (r#"{"detected_level":"\u0069nfo"}"#, "info"),
+            (
+                r#"{"a":"\"detected_level\":\"error\"","detected_level":"debug"}"#,
+                "debug",
+            ),
+            ("{\"detected_level\":\"\u{130}NFO\"}", "info"),
+            (r#"{"level":"error"}"#, "unknown"),
+            ("", "unknown"),
+        ] {
+            assert_eq!(pattern_level(metadata).0, want, "{metadata}");
+        }
+    }
+
+    /// Issue #605: one template seen at three levels in one bucket is three
+    /// pattern rows, each counting its own lines.
+    #[test]
+    fn one_template_at_three_levels_is_three_pattern_rows() {
+        let row = |metadata: &str| LogRow {
+            service: "svc".to_string(),
+            fingerprint: Fingerprint::from_raw(7),
+            timestamp_ns: UnixNano(1_000),
+            severity: 0,
+            body: "request done".to_string(),
+            structured_metadata: metadata.to_string(),
+        };
+        let rows = vec![
+            row(r#"{"detected_level":"error"}"#),
+            row(r#"{"detected_level":"info"}"#),
+            row(r#"{"detected_level":"error"}"#),
+            row(r#"{"detected_level":"systemd"}"#),
+            row(""),
+        ];
+        let got: Vec<(&str, u64)> = aggregate_patterns(&rows)
+            .rows
+            .iter()
+            .map(|r| (r.level.0, r.count))
+            .collect();
+        assert_eq!(got, vec![("error", 2), ("info", 1), ("unknown", 2)]);
+    }
 
     /// A `Fingerprint` from a small decimal, so these tests keep reading as
     /// `log_row(7, ...)` after the identity widened (issue #498).

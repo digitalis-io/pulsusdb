@@ -3104,6 +3104,8 @@ pub struct LogStats {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PatternSeries {
     pub pattern: String,
+    /// Issue #605 stub.
+    pub level: String,
     pub samples: Vec<(i64, u64)>,
 }
 
@@ -3567,6 +3569,7 @@ impl LogQlEngine {
                     .collect();
                 series.push(PatternSeries {
                     pattern: row.pattern,
+                    level: String::new(),
                     samples,
                 });
             }
