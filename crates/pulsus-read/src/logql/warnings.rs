@@ -59,6 +59,12 @@ impl Warnings {
     }
 }
 
+/// Issue #605 stub.
+pub fn series_cap_partial_warning(cap: u64) -> String {
+    let _ = cap;
+    String::new()
+}
+
 /// `maximum of series ({cap}) reached for variant ({index})` — the
 /// reference's format verbatim (`pkg/logql/engine.go:506 @ grafana/loki
 /// v3.7.4 b318f2829f0ae2094ab3a1e90780450e9e4b03be`; duplicated for the

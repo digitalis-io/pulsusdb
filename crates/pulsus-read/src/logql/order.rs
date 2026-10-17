@@ -228,6 +228,13 @@ fn verdict(node: MeNode<'_>, kids: &[Verdict]) -> Verdict {
     }
 }
 
+/// A terminal sort's direction (issue #605 stub).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortDir {
+    Asc,
+    Desc,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

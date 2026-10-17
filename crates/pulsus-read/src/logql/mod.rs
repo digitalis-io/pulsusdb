@@ -142,8 +142,9 @@ pub(crate) mod window;
 
 pub use charge::{
     MAX_CLIENT_AGG_GROUP_BYTES, MAX_LEAF_RETAINED_BYTES, MAX_METRIC_RESULT_POINTS,
-    MAX_QUERY_RETAINED_BYTES, MAX_STREAMS_RESULT_BYTES, RESULT_BUDGETS, ResultBudgets,
-    StreamsResultBudget, ensure_result_series, result_series_breach,
+    MAX_QUERY_RETAINED_BYTES, MAX_STREAMS_RESULT_BYTES, PartialOrder, RESULT_BUDGETS,
+    ResultBudgets, StreamsResultBudget, ensure_result_series, result_series_breach,
+    truncate_or_refuse,
 };
 /// Issue #241 wave 2: the instant leaf's retained-byte seam, exported so
 /// `tests/logql_leaf_retention_witness.rs` measures the shipped path
@@ -192,7 +193,7 @@ pub use labels::{EMPTY_STRUCTURED_METADATA, StructuredMetadataCtx};
 /// vector binary operand, where both engines carry it through. See
 /// [`order`]'s module doc for the rule we implement instead and the
 /// `nested-sort-order` ledger entry for what we deliberately do not.
-pub use order::sorted_order_reaches_the_wire;
+pub use order::{SortDir, sorted_order_reaches_the_wire};
 pub use params::{
     DEFAULT_MAX_STREAMS, Direction, MAX_DURATION_NS, PlanCtx, QueryParams, QuerySpec,
     ResponseOptions, TimeBounds, ValidatedDuration, validate_duration_ns,
