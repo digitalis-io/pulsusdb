@@ -1,19 +1,64 @@
-//! The two catalog reads of tag discovery (issue #598 part 1).
-//! Tests-first stub: the builders render nothing yet.
+//! The two catalog reads of tag discovery (issue #598 part 1): tag names
+//! from `tag_names`, unnarrowed tag values from `tag_values`.
+//!
+//! Pure SQL builders: pre-escaped fragments → `String`, no `ChClient`, no
+//! I/O. Callers pre-escape `scope_literal`/`key_literal` via
+//! [`crate::logql::escape::ch_string`] (quotes included); that is the
+//! injection boundary, not this module.
+//!
+//! The table names are private constants of this module, not inputs, so
+//! no caller can put a table, an alias or a subquery into the `FROM`
+//! clause. Both catalogs are replicated to every node, so there is no
+//! `_dist` table to name. `DISTINCT` collapses a not-yet-merged duplicate
+//! (both tables are ordered by their whole row, so the duplicate is
+//! byte-identical), never `FINAL`. The `LIMIT` is the caller's cap + 1,
+//! the truncation probe.
 
-pub use super::super::tags_sql::ATTR_SCOPES;
+/// The five scopes the writer catalogues for sender-supplied ATTRIBUTES,
+/// ascending (issue #475). This constant is the single source of truth
+/// for the whole scope surface: the SQL `IN` list below, the `scope=`
+/// accept list (`traces_api::params::parse_tags_params`) and the `{tag}`
+/// prefix set (`parse_tag_lookup`) all derive from it.
+pub const ATTR_SCOPES: [&str; 5] = ["event", "instrumentation", "link", "resource", "span"];
 
-/// Tests-first stub.
-pub(crate) const ATTR_SCOPES_IN: &str = "";
+/// The rendered SQL `IN` list for [`ATTR_SCOPES`]. A literal, so the
+/// builders stay pure concatenation; pinned against the constant by
+/// `attr_scopes_in_list_matches_the_constant`.
+pub(crate) const ATTR_SCOPES_IN: &str = "('event', 'instrumentation', 'link', 'resource', 'span')";
 
-/// Tests-first stub.
-pub fn tag_names_sql(_scope_literal: Option<&str>, _limit: usize) -> String {
-    String::new()
+const TAG_NAMES_TABLE: &str = "tag_names";
+const TAG_VALUES_TABLE: &str = "tag_values";
+
+/// The `GET /api/traces/v1/tags` read: distinct `(scope, key)` pairs from
+/// `tag_names`, confined to one scope (a `(scope)` primary-key prefix) or
+/// to [`ATTR_SCOPES`] (an `IN` list on the same leading column).
+pub fn tag_names_sql(scope_literal: Option<&str>, limit: usize) -> String {
+    let mut sql = format!("SELECT DISTINCT scope, key\nFROM {TAG_NAMES_TABLE}\n");
+    match scope_literal {
+        Some(scope) => sql.push_str(&format!("WHERE scope = {scope}\n")),
+        None => sql.push_str(&format!("WHERE scope IN {ATTR_SCOPES_IN}\n")),
+    }
+    sql.push_str(&format!("ORDER BY scope, key\nLIMIT {limit}"));
+    sql
 }
 
-/// Tests-first stub.
-pub fn tag_values_sql(_key_literal: &str, _scope_literal: Option<&str>, _limit: usize) -> String {
-    String::new()
+/// The unnarrowed `GET /api/traces/v1/tag/{tag}/values` read: distinct
+/// `(value, val_type)` pairs for one key from `tag_values`, confined to
+/// one scope (a `(scope, key)` prefix) or to [`ATTR_SCOPES`]. `value` is
+/// projected as `val`, the field every caller decodes. The pair, not the
+/// value alone (issue #476): one key can hold a string `'8080'` and an
+/// int `8080`, which the wire reports as two entries, and the `LIMIT`
+/// probe counts pairs.
+pub fn tag_values_sql(key_literal: &str, scope_literal: Option<&str>, limit: usize) -> String {
+    let mut sql = format!(
+        "SELECT DISTINCT value AS val, val_type\nFROM {TAG_VALUES_TABLE}\nWHERE key = {key_literal}"
+    );
+    match scope_literal {
+        Some(scope) => sql.push_str(&format!(" AND scope = {scope}")),
+        None => sql.push_str(&format!(" AND scope IN {ATTR_SCOPES_IN}")),
+    }
+    sql.push_str(&format!("\nORDER BY val, val_type\nLIMIT {limit}"));
+    sql
 }
 
 #[cfg(test)]

@@ -3150,18 +3150,14 @@ impl TagStage {
 /// attributes belong to, merged into the accepted sets only once a span
 /// under them lands.
 ///
-/// **`skip_key` is TWO decisions, not one** (issue #587 row 6). The caller
-/// passes `service.name` because `spans.service` already carries it — but
-/// `spans.service` carries it losslessly for exactly one `AnyValue` arm, a
-/// non-empty `StringValue`. For every other arm `any_value_to_string`
-/// flattens the value to text and the typed value is gone, so:
-///
-/// - the **catalog** skip is unconditional at every arm —
-///   `service.name` is a column and not a catalog entry, which
-///   `sql-schema.md` §4.3's tag contract requires;
-/// - the **`attrs`** skip applies only to a non-empty `StringValue`, so an
-///   empty string stays as an empty-string path and an integer stays as an
-///   integer path.
+/// **`skip_key` keeps one value out of `attrs`** (issue #587 row 6). The
+/// caller passes `service.name` because `spans.service` already carries
+/// it — losslessly for exactly one `AnyValue` arm, a non-empty
+/// `StringValue`. That arm is dropped from the stored attributes; every
+/// other arm stays as the typed path it was. The catalogs see the key as
+/// they see any other (issue #598 part 1): a string value, empty or not,
+/// is one name row and one `string` value row, and the tag list has to
+/// offer `resource.service.name` because the catalogs are what it reads.
 ///
 /// The value is stored once either way, in one place or the other, never
 /// both.
@@ -3185,29 +3181,6 @@ fn land_attrs(
         if !seen.insert(kv.key.as_str()) {
             continue;
         }
-        if Some(kv.key.as_str()) == skip_key {
-            // The catalog skip, unconditional: no `tag_names` row and no
-            // `tag_values` row for this key, at any arm.
-            if value_is_non_empty_string(kv.value.as_ref()) {
-                // And the `attrs` skip, for the one arm the column
-                // carries losslessly.
-                continue;
-            }
-            match land_value(&kv.key, kv.value.as_ref()) {
-                LandedValue::One(value) => entries.push(TraceJsonEntry {
-                    path: pulsus_clickhouse::json_column::escape_json_path(&kv.key),
-                    value,
-                }),
-                LandedValue::Leaves(leaves) => {
-                    for (path, _original, value) in leaves {
-                        entries.push(TraceJsonEntry { path, value });
-                    }
-                }
-                LandedValue::Other => other.push(kv.clone()),
-                LandedValue::Absent => {}
-            }
-            continue;
-        }
         // **The classifying runs BEFORE the name is listed** (issue #586),
         // because one arm's key is not listed at all: a profiling string
         // reference lands nowhere, catalogs included. One function still
@@ -3226,20 +3199,22 @@ fn land_attrs(
         match landed {
             LandedValue::One(value) => {
                 record_values(scope, &kv.key, &value, values);
+                if Some(kv.key.as_str()) == skip_key && value_is_non_empty_string(kv.value.as_ref())
+                {
+                    continue;
+                }
                 entries.push(TraceJsonEntry {
                     path: pulsus_clickhouse::json_column::escape_json_path(&kv.key),
                     value,
                 });
             }
             LandedValue::Leaves(leaves) => {
-                // The leaf paths each get their own kind-2 row under their
-                // full dotted key, and **no** kind-3 row: a kvlist has no
-                // scalar text and no `tag_type`.
-                for (path, original, value) in leaves {
-                    names.insert(LandingTagName {
-                        scope,
-                        key: original,
-                    });
+                // No kind-2 row for a leaf path (issue #598 part 1): TraceQL's
+                // `span.k.a.b` names the dotted key `k.a.b`, not this nested
+                // path, so a listed leaf would be a name no query matches,
+                // and the reference lists the top-level key alone. And no
+                // kind-3 row: a kvlist has no scalar text and no `tag_type`.
+                for (path, _original, value) in leaves {
                     entries.push(TraceJsonEntry { path, value });
                 }
             }
