@@ -5258,7 +5258,7 @@ async fn the_benchmark_tag_shapes_answer_within_4_kib() {
             .collect()
     };
     let port = 31_268;
-    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_traces_api_v2_it_tq3")).await;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_traces_api_v2_it_tq3_tags")).await;
     let _server = spawn_ready(port, &db);
     let base = day_start_ns() + 3_600_000_000_000;
     let mut resource_spans: Vec<ResourceSpans> = services
