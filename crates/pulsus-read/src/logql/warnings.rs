@@ -15,6 +15,11 @@
 //! the accumulated bytes are a function of the QUERY SHAPE and never of
 //! the rows scanned. `warnings_retention_is_bounded_by_the_variant_count`
 //! is the executable form of that sentence.
+//!
+//! Since issue #605 there is a second message: a request tagged as the logs
+//! drilldown app's whose result passes the series cap is served cut to the
+//! cap, with [`series_cap_partial_warning`]. It is added once per query,
+//! so the bound above gains one fixed message.
 
 use std::collections::BTreeSet;
 
@@ -57,6 +62,15 @@ impl Warnings {
     pub fn as_strings(&self) -> Vec<String> {
         self.set.iter().cloned().collect()
     }
+}
+
+/// The warning a drilldown request carries when its metric result was cut
+/// to the series cap (issue #605). The reference's text, verbatim
+/// (`pkg/logql/engine.go:542` @ v3.7.4).
+pub fn series_cap_partial_warning(cap: u64) -> String {
+    format!(
+        "maximum number of series ({cap}) reached for a single query; returning partial results"
+    )
 }
 
 /// `maximum of series ({cap}) reached for variant ({index})` — the

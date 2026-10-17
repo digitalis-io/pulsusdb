@@ -1181,6 +1181,30 @@ pub(crate) fn encoding_flags(headers: &axum::http::HeaderMap) -> Vec<String> {
     out
 }
 
+/// The logs drilldown app's identifier in `X-Query-Tags`
+/// (`pkg/util/constants/internal_streams.go:9` @ v3.7.4).
+const LOGS_DRILLDOWN_APP: &str = "grafana-lokiexplore-app";
+
+/// Whether `X-Query-Tags` marks the request as the logs drilldown app's
+/// (issue #605), by the reference's parse (`pkg/util/httpreq/tags.go:41-129`
+/// @ v3.7.4): the value splits on `,` and each piece on `=`, empty fields
+/// dropped; a piece with exactly two fields whose lowercased key is
+/// `source` and whose value equals the app id ignoring case is a match.
+/// The reference first replaces every byte outside `[a-zA-Z0-9-=.@, ]`
+/// with `_`; that cannot change this answer (an `_` matches neither the
+/// key nor the id), so it is not repeated here.
+pub(crate) fn is_logs_drilldown(headers: &axum::http::HeaderMap) -> bool {
+    let Some(raw) = headers.get("x-query-tags").and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    raw.split(',').any(|tok| {
+        let fields: Vec<&str> = tok.split('=').filter(|f| !f.is_empty()).collect();
+        fields.len() == 2
+            && fields[0].eq_ignore_ascii_case("source")
+            && fields[1].eq_ignore_ascii_case(LOGS_DRILLDOWN_APP)
+    })
+}
+
 /// Whether the parsed flag list carries the exact `categorize-labels`
 /// token. Separate from [`encoding_flags`] because the ECHO and the
 /// DECISION are two outputs: an unknown flag is echoed verbatim while
@@ -1192,6 +1216,33 @@ pub(crate) fn wants_categorize_labels(flags: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #605: `X-Query-Tags` read as the reference reads it
+    /// (`pkg/util/httpreq/tags.go:41-129` @ v3.7.4). Each row's verdict is
+    /// derived by hand from that parse.
+    #[test]
+    fn x_query_tags_marks_a_drilldown_request_by_the_references_parse() {
+        for (value, want) in [
+            (Some("Source=grafana-lokiexplore-app"), true),
+            (Some("source=Grafana-LokiExplore-App"), true),
+            (Some("foo=bar,Source=grafana-lokiexplore-app"), true),
+            (Some("Source==grafana-lokiexplore-app"), true),
+            (Some(",,Source=grafana-lokiexplore-app,"), true),
+            (Some("Source=grafana"), false),
+            (Some(" Source=grafana-lokiexplore-app"), false),
+            (Some("Source=grafana-lokiexplore-app;x"), false),
+            (Some("Source=grafana-lokiexplore-app=x"), false),
+            (Some("app=grafana-lokiexplore-app"), false),
+            (Some(""), false),
+            (None, false),
+        ] {
+            let mut headers = axum::http::HeaderMap::new();
+            if let Some(v) = value {
+                headers.insert("x-query-tags", v.parse().expect("header value"));
+            }
+            assert_eq!(is_logs_drilldown(&headers), want, "{value:?}");
+        }
+    }
 
     // -- Issue #406 Part D: the reference's length + fraction rules ------
 

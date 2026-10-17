@@ -40,11 +40,11 @@
 //! issue #463 changes nothing in; `status` and the HTTP status code are
 //! constant across a double run by construction; response headers are
 //! asserted by the conformance suite; drop accounting is a function of
-//! consumer scheduling. **`warnings` is absent from the probe set by
-//! construction** — it is emitted only for a `variants(...)` query that
-//! skipped a variant, and no probe here is one, asserted by
-//! [`no_probe_is_a_variants_query`]. That exclusion is therefore never
-//! exercised, which is recorded rather than presented as coverage.
+//! consumer scheduling. **`warnings` is absent from the probe set by construction**: it
+//! is emitted for a `variants(...)` query that skipped a variant or a drilldown-tagged
+//! request over the series cap (issue #605). No probe is a variants query, asserted by
+//! [`no_probe_is_a_variants_query`], and none sends `X-Query-Tags` (its one header is the
+//! encoding flags). That exclusion is therefore never exercised: recorded, not coverage.
 //!
 //! ## Normalisation, and the rule it follows
 //!

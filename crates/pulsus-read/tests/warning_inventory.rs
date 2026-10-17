@@ -1,13 +1,13 @@
 //! Issue #277 AC 17 — **the scoping decision is pinned; the reference
 //! inventory is a read.**
 //!
-//! PulsusDB emits exactly one of the reference's three warning message
-//! families. This suite commits the eleven `AddWarning`/`AddWarnings` call
-//! sites that inventory rests on as DATA, asserts our implemented family is
-//! family 1 and nothing else, and asserts that families 2 and 3 are
-//! recorded as measured non-emissions in the differential ledger's entry
-//! `(d)` — parsed out of that entry, not substring-matched against the
-//! whole document.
+//! PulsusDB emits two of the reference's three warning message families:
+//! family 1 since issue #277, family 2 since issue #605. This suite commits
+//! the eleven `AddWarning`/`AddWarnings` call sites that inventory rests on
+//! as DATA, asserts our two formatters produce families 1 and 2, and asserts
+//! that entry `(d)` of the differential ledger records family 2 as
+//! implemented and family 3 as a measured non-emission — parsed out of that
+//! entry, not substring-matched against the whole document.
 //!
 //! # What this pins, and what it does not
 //!
@@ -136,9 +136,9 @@ fn the_reference_warning_inventory_is_three_families() {
         "the propagation sites forward an upstream array and mint nothing"
     );
 
-    // OUR implemented family is family 1, and exactly family 1. The
-    // formatter is the single production source of the text, so this
-    // compares against what actually ships.
+    // OUR implemented families are 1 and 2. Each formatter is the single
+    // production source of its text, so this compares against what
+    // actually ships.
     let ours = pulsus_read::logql::variant_series_warning(500, 0);
     assert_eq!(ours, "maximum of series (500) reached for variant (0)");
     let family1 = FAMILIES
@@ -158,48 +158,85 @@ fn the_reference_warning_inventory_is_three_families() {
         "family 1 is `maximum of series`, family 2 is `maximum number of series`"
     );
 
-    // Families 2 and 3 are recorded as measured NON-EMISSIONS in ledger
-    // entry (d) — parsed out of that entry, not found anywhere in the file.
+    // Family 2 (issue #605): the drilldown partial-results warning.
+    let ours2 = pulsus_read::logql::warnings::series_cap_partial_warning(500);
+    let family2 = FAMILIES
+        .iter()
+        .find(|(f, _)| *f == 2)
+        .map(|(_, m)| *m)
+        .expect("family 2");
+    assert_eq!(ours2, family2.replace("(%d)", "(500)"));
+
+    // Each family's numbered record in ledger entry (d) carries its own
+    // name and its own status: family 1 implemented by #277, family 2 by
+    // #605, family 3 a measured NON-EMISSION. Each record is sliced out on
+    // its own, so a status written against the wrong family fails.
     let d = ledger_entry_d();
-    for (family, key) in [
+    let flat = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    for (family, key, status, not) in [
         (
-            2u8,
+            1u8,
+            "maximum of series (%d) reached for variant (%s)",
+            "**implemented**",
+            "NOT emitted",
+        ),
+        (
+            2,
             "maximum number of series (%d) reached for a single query;",
+            "**implemented by #605.**",
+            "NOT emitted",
         ),
         (
             3,
             "Query was executed using the new experimental query engine",
+            "**NOT emitted.**",
+            "implemented",
         ),
     ] {
+        let record = flat(ledger_record(&d, family));
         assert!(
-            d.contains(key),
-            "ledger entry (d) no longer names family {family}"
+            record.contains(&flat(key)),
+            "record {family} of entry (d) no longer names family {family}"
+        );
+        assert!(
+            record.contains(status),
+            "record {family} of entry (d) must say {status}"
+        );
+        assert!(
+            !record.contains(not),
+            "record {family} of entry (d) must not say {not}"
         );
     }
+    let family2 = ledger_record(&d, 2);
+    // The gating header for family 2.
     assert!(
-        d.contains("NOT emitted"),
-        "entry (d) must record the non-emissions as such"
+        family2.contains("X-Query-Tags") && family2.contains("grafana-lokiexplore-app"),
+        "record 2 must record what gates family 2"
     );
-    // The gating header for family 2 — the reason it is not implementable
-    // rather than merely not implemented.
-    assert!(
-        d.contains("X-Query-Tags") && d.contains("grafana-lokiexplore-app"),
-        "entry (d) must record what gates family 2"
-    );
-    // The evidence that there is no stable rule to match: the dropped ids
-    // differed run to run.
+    // The evidence that the reference keeps no stable 500 where no sort
+    // defines them: the dropped ids differed run to run.
     for id in ["184", "396", "370", "42", "303"] {
         assert!(
-            d.contains(id),
-            "entry (d) must keep the measured dropped ids ({id} missing) — a future \
+            family2.contains(id),
+            "record 2 must keep the measured dropped ids ({id} missing) — a future \
              reader who sees only \"not implemented\" will otherwise re-derive them"
         );
     }
-    // And family 1 is recorded as the one we DO implement.
-    assert!(
-        d.contains("**implemented**"),
-        "entry (d) must say which family PulsusDB emits"
-    );
+}
+
+/// Record `n` of entry (d)'s numbered family list: from its `  <n>. `
+/// line up to the next record, or to the paragraph after the last one.
+fn ledger_record(d: &str, n: u8) -> &str {
+    let start = d
+        .find(&format!("\n  {n}. `"))
+        .unwrap_or_else(|| panic!("entry (d) has no record {n}"));
+    let rest = &d[start + 1..];
+    let end = rest[1..]
+        .find(&format!("\n  {}. `", n + 1))
+        .or_else(|| rest.find("\n\n"))
+        .map(|i| i + 1)
+        .unwrap_or(rest.len());
+    &rest[..end]
 }
 
 /// The inventory is only meaningful if the ledger entry it points at is

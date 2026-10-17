@@ -1410,8 +1410,8 @@ not "fix" us toward the panic.
   (`crates/pulsus-read/src/logql/variants.rs`) reddens if our gate moves
   to `>= 500`.
 
-  **The warnings PulsusDB does not emit — measured non-emissions, not
-  omissions.** The reference's whole emission inventory is three message
+  **The warnings PulsusDB emits, and the one it does not — measured,
+  not assumed.** The reference's whole emission inventory is three message
   families (every `AddWarning`/`AddWarnings` call site under `pkg/`,
   tests and generated files excluded, is one of them; the wire array has
   no other source, because `metadata.Context`'s `warnings
@@ -1423,8 +1423,8 @@ not "fix" us toward the panic.
      above.
   2. `maximum number of series (%d) reached for a single query;
      returning partial results` (`engine.go:542`, `:582`,
-     `limits.go:512`) — **NOT emitted, and not implementable.** It is
-     gated on the request header `X-Query-Tags:
+     `limits.go:512`) — **implemented by #605.** It is gated on the
+     request header `X-Query-Tags:
      source=grafana-lokiexplore-app` (`pkg/util/httpreq/tags.go:108-128`,
      `constants.LogsDrilldownAppName`). Measured five times with that
      header over the 501-group dataset, it returned a DIFFERENT
@@ -1432,9 +1432,9 @@ not "fix" us toward the panic.
      and 303 — because `engine.go:541` truncates `vec[:maxSeries]`
      before any sort. (The #277 plan's own five runs, on a separate
      container from the same digest, dropped 461, 265, 387, 450 and 486:
-     ten runs, ten different ids.) There is no stable rule there to
-     match, only an unstable one to imitate. PulsusDB rejects that case
-     with its existing `maximum number of series (500) …` error instead.
+     ten runs, ten different ids.) So PulsusDB keeps its own 500 where no
+     sort defines them, and the reference's where one does; the rule is
+     the series-cap row of `docs/api.md`'s status table (issue #605).
   3. `Query was executed using the new experimental query engine[ and
      dataobj storage.]` (`pkg/engine/basic_engine.go:265`,
      `pkg/engine/engine.go:298`, `pkg/engine/handler.go:532`) — **NOT
@@ -1444,7 +1444,7 @@ not "fix" us toward the panic.
 
   `the_reference_warning_inventory_is_three_families`
   (`crates/pulsus-read/tests/warning_inventory.rs`) pins this decision
-  and parses these two non-emission records out of this entry, so
+  and parses the family-2 and family-3 records out of this entry, so
   deleting them reddens.
 
 ### `label-replace-scalar-operand-status` (issue #276)
@@ -1851,15 +1851,15 @@ not "fix" us toward the panic.
   query RETURNS, enforced on the final result (`pkg/logql/engine.go:538`
   instant, `:588` accumulated across steps); nothing anywhere caps scanned
   or inner-aggregation groups. *PulsusDB:* identical semantics, threshold
-  and `> cap` test, enforced by `ensure_result_series` on the whole
+  and `> cap` test, enforced by `cap_result_series` on the whole
   expression's output and read in exactly one place (gated by
   `max_query_series_is_read_in_exactly_one_place`). Before #236 PulsusDB
   applied its 500 MID-SCAN, rejecting a broad class of aggregations the
   reference serves (`sum(...)` over 20,505 groups returned `{} 20505`
   there and a 422 here); that divergence is CLOSED. So is the status:
-  since #605 the cap answers `400` with the reference's body verbatim,
-  the status the reference gives it, measured in the table under the
-  #398 paragraph below.
+  since #605 the cap answers `400` with the reference's body verbatim, and a
+  drilldown-tagged request gets 500 series with the partial-results warning:
+  the reference's 500 where its sort defines them, else by step and label.
 
   **Issue #398 adds a member to this same status family and opens no new
   row.** A read that exhausts ClickHouse's memory is now refused

@@ -795,9 +795,9 @@ async fn variant_skips_agree_with_the_pinned_reference() {
         "ledger (d): PulsusDB keeps variant 0 at range-500"
     );
 
-    // Corpus case 10 — the ROOT-ONLY rule: the same expression `+ 1`
-    // takes the plain concatenation cap on both sides, with the same
-    // status (400 since issue #605).
+    // Corpus case 10 — the ROOT-ONLY rule: the same expression `+ 1`,
+    // untagged, takes the plain concatenation cap on both sides, with the
+    // same status (400 since issue #605).
     let plus_one = format!("{} + 1", cap_query(500));
     let ours10 = http_get(
         port,
@@ -814,7 +814,7 @@ async fn variant_skips_agree_with_the_pinned_reference() {
     assert_eq!(
         (ours10.status, their_status),
         (400, 400),
-        "case 10: a non-variants root takes the plain cap on both sides: {}",
+        "case 10: an untagged non-variants root takes the plain cap on both sides: {}",
         ours10.body
     );
     for body in [&ours10.body, &their_body] {

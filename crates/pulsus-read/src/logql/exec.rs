@@ -42,7 +42,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use super::agg::{InstantSeries, LabelSet};
-use super::charge::{AggCaps, ensure_result_series};
+use super::charge::{AggCaps, cap_result_series};
 use super::client_agg::{
     CLIENT_AGG_CHUNK_ROWS, ClientAggState, MetricAggState, RangeSlideState, run_client_agg_rows,
     shift_emitted_points,
@@ -461,9 +461,9 @@ impl LogQlEngine {
     }
 
     /// Returns the result alongside the [`Warnings`] the evaluation
-    /// accumulated (issue #277) — empty for every query but a
-    /// `variants(...)` one that skipped a variant, and an empty
-    /// accumulator renders zero bytes on the wire.
+    /// accumulated (issue #277) — empty unless a `variants(...)` query
+    /// skipped a variant or a drilldown request was cut to the series cap
+    /// (issue #605); an empty accumulator renders zero bytes on the wire.
     pub async fn query(
         &self,
         expr: &Expr,
@@ -496,13 +496,13 @@ impl LogQlEngine {
             // intermediate groups the reference never counts.
             Plan::Metric(mp) => {
                 let result = self.run_metric_inner(&mp, None).await?;
-                ensure_result_series(&result)?;
+                let result = cap_result_series(result, opts, expr, params, &mut warnings)?;
                 Ok((result, warnings))
             }
             Plan::MetricBinary(node) => {
-                let result = self.run_metric_node(&node, None, &mut warnings).await?;
+                let mut result = self.run_metric_node(&node, None, &mut warnings).await?;
                 if final_series_gate_applies(&node) {
-                    ensure_result_series(&result)?;
+                    result = cap_result_series(result, opts, expr, params, &mut warnings)?;
                 }
                 Ok((result, warnings))
             }
@@ -551,16 +551,16 @@ impl LogQlEngine {
                 };
                 let mut explain = PlanExplain::new(result_type);
                 let result = self.run_metric_inner(&mp, Some(&mut explain)).await?;
-                ensure_result_series(&result)?;
+                let result = cap_result_series(result, opts, expr, params, &mut warnings)?;
                 Ok((result, warnings, explain))
             }
             Plan::MetricBinary(node) => {
                 let mut explain = PlanExplain::new(binary_result_type(&node, params));
-                let result = self
+                let mut result = self
                     .run_metric_node(&node, Some(&mut explain), &mut warnings)
                     .await?;
                 if final_series_gate_applies(&node) {
-                    ensure_result_series(&result)?;
+                    result = cap_result_series(result, opts, expr, params, &mut warnings)?;
                 }
                 Ok((result, warnings, explain))
             }

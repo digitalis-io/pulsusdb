@@ -228,6 +228,48 @@ fn verdict(node: MeNode<'_>, kids: &[Verdict]) -> Verdict {
     }
 }
 
+/// The direction of a range result's per-step order, when the reference
+/// defines one (issue #605): the root is an ungrouped `sort` or
+/// `sort_desc`, reached through `label_replace` only, which rewrites labels
+/// in place. Its step vector is then one heap, value-ordered
+/// (`pkg/logql/evaluator.go:598-620` @ v3.7.4). A grouped sort
+/// concatenates its groups in map order, and an arithmetic or set operator
+/// above the sort orders by a value that is not the output's, so neither
+/// has an order this can reproduce: `None`.
+pub(crate) fn range_step_order(expr: &Expr) -> Option<SortDir> {
+    let Expr::Metric(root) = expr else {
+        return None;
+    };
+    // Post-order puts the root last, and a one-child node's child
+    // immediately before it.
+    let mut nodes: Vec<MeNode<'_>> = Vec::new();
+    walk::postorder_into::<MetricScc>(MeNode::Expr(root), &mut nodes);
+    for node in nodes.iter().rev() {
+        match node {
+            MeNode::Expr(MetricExpr::LabelReplace { .. }) => continue,
+            MeNode::Expr(MetricExpr::Vector {
+                op: VectorAggOp::Sort,
+                grouping: None,
+                ..
+            }) => return Some(SortDir::Asc),
+            MeNode::Expr(MetricExpr::Vector {
+                op: VectorAggOp::SortDesc,
+                grouping: None,
+                ..
+            }) => return Some(SortDir::Desc),
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// A terminal sort's direction ([`range_step_order`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortDir {
+    Asc,
+    Desc,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -123,12 +123,28 @@ fn http_request(
     content_type: Option<&str>,
     body: &[u8],
 ) -> Option<HttpResponse> {
+    http_request_with(port, method, path, content_type, &[], body)
+}
+
+/// [`http_request`] with extra request headers (issue #605's
+/// `X-Query-Tags`).
+fn http_request_with(
+    port: u16,
+    method: &str,
+    path: &str,
+    content_type: Option<&str>,
+    extra_headers: &[(&str, &str)],
+    body: &[u8],
+) -> Option<HttpResponse> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(15))).ok();
 
     let mut head = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n");
     if let Some(ct) = content_type {
         head.push_str(&format!("Content-Type: {ct}\r\n"));
+    }
+    for (name, value) in extra_headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
     }
     if method != "GET" {
         head.push_str(&format!("Content-Length: {}\r\n", body.len()));
@@ -3219,9 +3235,11 @@ async fn distinct_lines_with_no_level_field_give_the_volume_query_one_group() {
 
 /// Issue #605: the series cap answers as the reference does. 600 OTLP
 /// records, each with its own severity text, give the volume query 600
-/// groups. The query is refused `400` with the reference's body verbatim
-/// (`pkg/logqlmodel/error.go:96`, `pkg/util/server/error.go:110-117`
-/// @ v3.7.4), at range and at instant, sorted or not.
+/// groups. A plain request is refused `400` with the reference's body
+/// verbatim (`pkg/logqlmodel/error.go:96`, `pkg/util/server/error.go:110-117`
+/// @ v3.7.4). A request tagged as the logs drilldown app's gets `200`, the
+/// first 500 series in label order, and the reference's partial-results
+/// warning (`pkg/logql/engine.go:536-591`).
 #[tokio::test(flavor = "multi_thread")]
 async fn the_series_cap_answers_as_the_reference() {
     if !should_run() {
@@ -3267,23 +3285,206 @@ async fn the_series_cap_answers_as_the_reference() {
         "/api/logs/v1/query?query={}&time={end}",
         urlencode(instant_q)
     );
+    // Bytes differ per series (`t{i}` carries `i + 1`), so `sort_desc`
+    // has one order and its first 500 are `t0599` down to `t0100`.
     let sorted_q =
         r#"sort_desc(sum by (detected_level) (bytes_over_time({service_name="cap-a"}[2h])))"#;
     let sorted = format!(
         "/api/logs/v1/query?query={}&time={end}",
         urlencode(sorted_q)
     );
+    // The same `sort_desc` as a range query. Its one step with data holds
+    // every series, so the reference's per-step order keeps `t0599` down
+    // to `t0100`; the matrix renders them in label order.
     let sorted_range = format!(
         "/api/logs/v1/query_range?query={}&start={start}&end={end}&step=7200",
         urlencode(sorted_q)
     );
+    let get = |path: &str, tags: Option<&str>| {
+        let headers: Vec<(&str, &str)> = tags.map(|t| ("X-Query-Tags", t)).into_iter().collect();
+        http_request_with(port, "GET", path, None, &headers, &[]).expect("query reachable")
+    };
     const REFUSED: &str = "maximum number of series (500) reached for a single query; consider \
         reducing query cardinality by adding more specific stream selectors, reducing the time \
         range, or aggregating results with functions like sum(), count() or topk()";
-    for path in [&range, &instant, &sorted, &sorted_range] {
-        let res = http_get(port, path).expect("query reachable");
-        assert_eq!((res.status, res.body.as_str()), (400, REFUSED), "{path}");
+    for (path, tags) in [
+        (&range, None),
+        (&range, Some("Source=grafana")),
+        (&range, Some("Source=grafana-lokiexplore-app;x")),
+        (&instant, None),
+        (&sorted, None),
+        (&sorted_range, None),
+    ] {
+        let res = get(path, tags);
+        assert_eq!(
+            (res.status, res.body.as_str()),
+            (400, REFUSED),
+            "{path} tags {tags:?}"
+        );
     }
+
+    let by_label: Vec<serde_json::Value> = (0..500)
+        .map(|i| serde_json::json!({"detected_level": text(i)}))
+        .collect();
+    let by_bytes: Vec<serde_json::Value> = (100..600)
+        .rev()
+        .map(|i| serde_json::json!({"detected_level": text(i)}))
+        .collect();
+    let by_bytes_labelled: Vec<serde_json::Value> = (100..600)
+        .map(|i| serde_json::json!({"detected_level": text(i)}))
+        .collect();
+    for (path, tags, kind, want) in [
+        (
+            &range,
+            "Source=grafana-lokiexplore-app",
+            "matrix",
+            &by_label,
+        ),
+        (
+            &range,
+            "foo=bar,source=Grafana-LokiExplore-App",
+            "matrix",
+            &by_label,
+        ),
+        (
+            &instant,
+            "Source=grafana-lokiexplore-app",
+            "vector",
+            &by_label,
+        ),
+        (
+            &sorted,
+            "Source=grafana-lokiexplore-app",
+            "vector",
+            &by_bytes,
+        ),
+        (
+            &sorted_range,
+            "Source=grafana-lokiexplore-app",
+            "matrix",
+            &by_bytes_labelled,
+        ),
+    ] {
+        let res = get(path, Some(tags));
+        assert_eq!(res.status, 200, "{path} tags {tags} (body {})", res.body);
+        let json: serde_json::Value = serde_json::from_str(&res.body).expect("JSON");
+        assert_eq!(json["data"]["resultType"].as_str(), Some(kind));
+        let got: Vec<serde_json::Value> = json["data"]["result"]
+            .as_array()
+            .expect("result")
+            .iter()
+            .map(|s| s["metric"].clone())
+            .collect();
+        assert_eq!(
+            &got, want,
+            "{path} tags {tags}: the first 500 series in response order"
+        );
+        assert_eq!(
+            json["warnings"],
+            serde_json::json!([
+                "maximum number of series (500) reached for a single query; returning partial results"
+            ]),
+            "{path} tags {tags}"
+        );
+    }
+}
+
+/// Issue #605: a partial range result stops where the reference stops.
+/// Series `t{i}` has one line in step `i % 3`, and every series has one
+/// more in step 3. Steps 0 and 1 admit 400 series; step 2 brings 200 more,
+/// so the cap is reached there: the reference admits 100 of them, keeps
+/// that step's points and evaluates no later step
+/// (`pkg/logql/engine.go:575-591` @ v3.7.4). So the answer holds every
+/// series of steps 0 and 1, the first 100 by label of step 2, and one point
+/// per series, at its own step; nothing at step 3.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_partial_range_result_stops_at_the_step_where_the_cap_is_reached() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_704;
+    let db = &pulsus_testkit::test_db("pulsus_loki_push_partial_points_it");
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[]);
+    const MIN: i64 = 60_000_000_000;
+    let t0 = (now_ns() / MIN) * MIN - 10 * MIN;
+    let text = |i: usize| format!("t{i:04}");
+    let mut records: Vec<serde_json::Value> = Vec::new();
+    for i in 0..600usize {
+        for step in [(i % 3) as i64, 3] {
+            records.push(serde_json::json!({
+                "timeUnixNano": (t0 + step * MIN - MIN / 2 + i as i64).to_string(),
+                "severityText": text(i),
+                "body": {"stringValue": "x"},
+            }));
+        }
+    }
+    let body = serde_json::json!({"resourceLogs": [{
+        "resource": {"attributes": [{"key": "service.name", "value": {"stringValue": "pp-a"}}]},
+        "scopeLogs": [{"logRecords": records}],
+    }]});
+    let res = otlp_push(port, &serde_json::to_vec(&body).expect("otlp body"));
+    assert_eq!(res.status, 200, "otlp push (body {})", res.body);
+    let rows =
+        format!("SELECT count() AS c FROM {db}.log_samples WHERE org_id = '' AND service = 'pp-a'");
+    assert_eq!(wait_for_count(db, &rows, 1200).await, 1200);
+
+    let q = r#"sum by (detected_level) (count_over_time({service_name="pp-a"}[1m]))"#;
+    let path = format!(
+        "/api/logs/v1/query_range?query={}&start={t0}&end={}&step=60",
+        urlencode(q),
+        t0 + 3 * MIN
+    );
+    let res = http_request_with(
+        port,
+        "GET",
+        &path,
+        None,
+        &[("X-Query-Tags", "Source=grafana-lokiexplore-app")],
+        &[],
+    )
+    .expect("query reachable");
+    assert_eq!(res.status, 200, "body {}", res.body);
+    let json: serde_json::Value = serde_json::from_str(&res.body).expect("JSON");
+    let got: Vec<(String, Vec<i64>)> = json["data"]["result"]
+        .as_array()
+        .expect("result")
+        .iter()
+        .map(|s| {
+            let level = s["metric"]["detected_level"]
+                .as_str()
+                .expect("level")
+                .to_string();
+            let steps = s["values"]
+                .as_array()
+                .expect("values")
+                .iter()
+                .map(|v| {
+                    let secs = v[0].as_f64().expect("timestamp");
+                    ((secs * 1e9).round() as i64 - t0) / MIN
+                })
+                .collect();
+            (level, steps)
+        })
+        .collect();
+    let mut kept: Vec<usize> = (0..600).filter(|i| i % 3 != 2).collect();
+    kept.extend((0..600).filter(|i| i % 3 == 2).take(100));
+    kept.sort();
+    let want: Vec<(String, Vec<i64>)> = kept
+        .into_iter()
+        .map(|i| (text(i), vec![(i % 3) as i64]))
+        .collect();
+    assert_eq!(
+        got, want,
+        "500 series, each with its first step's point only"
+    );
+    assert_eq!(
+        json["warnings"],
+        serde_json::json!([
+            "maximum number of series (500) reached for a single query; returning partial results"
+        ])
+    );
 }
 
 // ---------------------------------------------------------------------

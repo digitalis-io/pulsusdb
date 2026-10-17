@@ -622,7 +622,7 @@ async fn engine_query_on_the_rollup_path_matches_independently_computed_raw_coun
     let (result, warnings) = engine.query(&expr, &params).await.expect("engine query");
     assert!(
         warnings.is_empty(),
-        "a non-variants query emits no warnings"
+        "a non-variants query without the drilldown tag emits no warnings"
     );
     let QueryResult::Matrix(series) = result else {
         panic!("expected a Matrix result");
@@ -733,7 +733,7 @@ async fn engine_query_on_the_client_agg_path_matches_the_sql_aggregated_count() 
     let (result, warnings) = engine.query(&expr, &params).await.expect("engine query");
     assert!(
         warnings.is_empty(),
-        "a non-variants query emits no warnings"
+        "a non-variants query without the drilldown tag emits no warnings"
     );
     let QueryResult::Matrix(series) = result else {
         panic!("expected a Matrix result");

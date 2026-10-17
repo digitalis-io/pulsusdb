@@ -91,7 +91,7 @@ pub const MAX_COUNTER_VALUES: u64 = 4_000_000;
 /// result only and therefore SERVES the non-shardable ones — an
 /// over-acceptance registered as ledger entry `#236 (f)`, in the
 /// direction that matters: PulsusDB rejects nothing the reference
-/// serves. Exactly 500 served, 501 rejected, on both sides.
+/// serves. Exactly 500 served; 501 refused untagged, cut to 500 if tagged.
 ///
 /// **Read by [`result_series_breach`] and by nothing else** (issue #236's
 /// normative property; the reader moved there from `ensure_result_series`
@@ -141,8 +141,8 @@ pub fn result_series_breach(result: &QueryResult) -> Option<u64> {
     }
 }
 
-/// Enforces [`MAX_QUERY_SERIES`] on a metric query's **final** result —
-/// [`result_series_breach`] as an error.
+/// The untagged refusal of a **final** result over [`MAX_QUERY_SERIES`]:
+/// [`result_series_breach`] as an error. The engine calls `cap_result_series`.
 ///
 /// `pub` so the conformance runner (`tests/logqltest/runner.rs`) applies
 /// the identical gate on its own `Expr::Metric` arm and corpus
@@ -1544,6 +1544,152 @@ const fn result_retained_bytes() -> u64 {
     metric_leaf + streams_result
 }
 
+/// [`ensure_result_series`] for a request that may be served partially
+/// (issue #605). `opts.partial_at_series_cap` is set for a request tagged
+/// as the logs drilldown app's; [`PartialOrder`] says which series it
+/// keeps.
+pub(crate) fn cap_result_series(
+    result: QueryResult,
+    opts: super::params::ResponseOptions,
+    expr: &pulsus_logql::Expr,
+    params: &super::params::QueryParams,
+    warnings: &mut super::warnings::Warnings,
+) -> Result<QueryResult, ReadError> {
+    let order = if matches!(params.spec, super::params::QuerySpec::Instant { .. }) {
+        if super::order::sorted_order_reaches_the_wire(expr) {
+            PartialOrder::AsGiven
+        } else {
+            PartialOrder::Labels
+        }
+    } else {
+        match super::order::range_step_order(expr) {
+            Some(dir) => PartialOrder::StepMajor(dir),
+            None => PartialOrder::Labels,
+        }
+    };
+    truncate_or_refuse(result, opts.partial_at_series_cap, order, warnings)
+}
+
+/// Which [`MAX_QUERY_SERIES`] series a partial result keeps (issue #605).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartialOrder {
+    /// No order is defined. A vector keeps its first by label set. A
+    /// matrix admits series by the first step each has a point at, as the
+    /// reference does, and by label set within a step, where the
+    /// reference's order is a map walk.
+    Labels,
+    /// The first as given: an instant vector whose order a terminal sort
+    /// set, which the response keeps.
+    AsGiven,
+    /// The reference's admission order for a range result under an
+    /// ungrouped root sort: by the first step a series has a point at, then
+    /// by its value there in the sort's direction, NaN last, then by label
+    /// set — `post_agg::sort_instant`'s order within one step
+    /// (`pkg/logql/engine.go:575-584` @ v3.7.4).
+    StepMajor(super::order::SortDir),
+}
+
+/// Below the cap, or when `partial` is false, exactly
+/// [`ensure_result_series`]. Over the cap with `partial` set, the first
+/// [`MAX_QUERY_SERIES`] series by `order`, and the reference's
+/// partial-results warning.
+///
+/// **A matrix stops where the reference stops.** The reference walks the
+/// steps admitting new series; at the first step where a new series would
+/// pass the cap it keeps that step's points for the series it holds and
+/// evaluates no later step (`pkg/logql/engine.go:536-591` @ v3.7.4). That
+/// step is the first step of the first series left out, so every kept
+/// series is cut after it.
+///
+/// **Allocates nothing.** The selection is `select_nth_unstable_by`, which
+/// works in place, followed by `truncate`. The result is already held,
+/// and the cap check has already counted it, so there is no new
+/// input-scaled allocation to charge (`docs/architecture.md` §5.6). The
+/// encoder's own label sort then runs over at most the cap.
+pub fn truncate_or_refuse(
+    result: QueryResult,
+    partial: bool,
+    order: PartialOrder,
+    warnings: &mut super::warnings::Warnings,
+) -> Result<QueryResult, ReadError> {
+    let Some(cap) = result_series_breach(&result) else {
+        return Ok(result);
+    };
+    let refuse = || {
+        Err(ReadError::QueryTooBroad(TooBroadReason::MetricSeries {
+            cap,
+        }))
+    };
+    if !partial {
+        return refuse();
+    }
+    let keep = cap as usize;
+    let result = match result {
+        QueryResult::Vector(mut v) => {
+            if order != PartialOrder::AsGiven {
+                v.select_nth_unstable_by(keep, |a, b| a.labels.cmp(&b.labels));
+            }
+            v.truncate(keep);
+            QueryResult::Vector(v)
+        }
+        QueryResult::Matrix(mut m) => {
+            let dir = match order {
+                PartialOrder::StepMajor(dir) => Some(dir),
+                PartialOrder::Labels | PartialOrder::AsGiven => None,
+            };
+            m.select_nth_unstable_by(keep, |a, b| step_major_cmp(a, b, dir));
+            // `m[keep]` is the least series left out: its first step is
+            // where the reference stops.
+            let stop = m[keep].points.first().map(|&(t, _)| t);
+            m.truncate(keep);
+            if let Some(stop) = stop {
+                for series in &mut m {
+                    let n = series.points.partition_point(|&(t, _)| t <= stop);
+                    series.points.truncate(n);
+                }
+            }
+            QueryResult::Matrix(m)
+        }
+        // Histogram shapes are metrics-only; the LogQL engine never
+        // produces them.
+        _ => return refuse(),
+    };
+    warnings.add(super::warnings::series_cap_partial_warning(cap));
+    Ok(result)
+}
+
+/// A matrix's admission order: by first step, then, under a sort
+/// (`Some(dir)`), by value there in its direction with NaN last, then by
+/// label set. A series with no point sorts last.
+fn step_major_cmp(
+    a: &MatrixSeries,
+    b: &MatrixSeries,
+    dir: Option<super::order::SortDir>,
+) -> std::cmp::Ordering {
+    let first = |s: &MatrixSeries| s.points.first().copied();
+    match (first(a), first(b)) {
+        (None, None) => a.labels.cmp(&b.labels),
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (Some((ta, va)), Some((tb, vb))) => ta
+            .cmp(&tb)
+            .then_with(|| match dir {
+                None => std::cmp::Ordering::Equal,
+                Some(_) => va.is_nan().cmp(&vb.is_nan()),
+            })
+            .then_with(|| {
+                if dir.is_none() || va.is_nan() {
+                    std::cmp::Ordering::Equal
+                } else if dir == Some(super::order::SortDir::Desc) {
+                    vb.total_cmp(&va)
+                } else {
+                    va.total_cmp(&vb)
+                }
+            })
+            .then_with(|| a.labels.cmp(&b.labels)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1553,6 +1699,7 @@ mod tests {
 
     use super::super::agg::InstantSeries;
     use super::super::exec::VectorSample;
+    use super::super::warnings::Warnings;
 
     /// Issue #227 review round 7, finding 2: the per-allocation charge is
     /// a PROVABLE upper bound on the block a real allocator retains, not
@@ -1828,6 +1975,147 @@ mod tests {
         ] {
             ensure_result_series(&other).expect("non-metric shapes carry no series axis");
         }
+    }
+
+    /// Issue #605: over the cap, a drilldown request keeps the first 500
+    /// series by its [`PartialOrder`] and gains the reference's warning;
+    /// any other request is refused as before.
+    #[test]
+    fn over_the_cap_a_partial_request_keeps_the_first_500_by_its_order() {
+        use super::super::order::SortDir;
+        let warning = vec![
+            "maximum number of series (500) reached for a single query; returning partial results"
+                .to_string(),
+        ];
+        let ids = |r: &QueryResult| -> Vec<String> {
+            let mut v: Vec<String> = match r {
+                QueryResult::Vector(v) => v.iter().map(|s| s.labels[0].1.clone()).collect(),
+                QueryResult::Matrix(m) => m.iter().map(|s| s.labels[0].1.clone()).collect(),
+                other => panic!("unexpected {other:?}"),
+            };
+            v.sort();
+            v
+        };
+        let as_given = |r: &QueryResult| -> Vec<String> {
+            match r {
+                QueryResult::Vector(v) => v.iter().map(|s| s.labels[0].1.clone()).collect(),
+                other => panic!("unexpected {other:?}"),
+            }
+        };
+        let reversed = |r: QueryResult| match r {
+            QueryResult::Vector(mut v) => {
+                v.reverse();
+                QueryResult::Vector(v)
+            }
+            QueryResult::Matrix(mut m) => {
+                m.reverse();
+                QueryResult::Matrix(m)
+            }
+            other => other,
+        };
+        let sorted = |mut v: Vec<String>| {
+            v.sort();
+            v
+        };
+        let by_label =
+            sorted((0..501).map(|i: usize| i.to_string()).collect::<Vec<_>>())[..500].to_vec();
+
+        // At the cap: unchanged, no warning, partial or not.
+        let mut w = Warnings::new();
+        let at =
+            truncate_or_refuse(n_vector(500), true, PartialOrder::Labels, &mut w).expect("served");
+        assert_eq!(at, n_vector(500));
+        assert!(w.is_empty());
+
+        // Over the cap, not partial: refused exactly as before.
+        let mut w = Warnings::new();
+        match truncate_or_refuse(n_matrix(501), false, PartialOrder::Labels, &mut w) {
+            Err(ReadError::QueryTooBroad(TooBroadReason::MetricSeries { cap: 500 })) => {}
+            other => panic!("expected MetricSeries, got {other:?}"),
+        }
+        assert!(w.is_empty());
+
+        // Label order, vector and matrix.
+        for input in [reversed(n_vector(501)), reversed(n_matrix(501))] {
+            let mut w = Warnings::new();
+            let got =
+                truncate_or_refuse(input, true, PartialOrder::Labels, &mut w).expect("partial");
+            assert_eq!(ids(&got), by_label);
+            assert_eq!(w.as_strings(), warning);
+            // Every matrix series starts at step 0, so the reference stops
+            // there: step 1's points go.
+            if let QueryResult::Matrix(m) = &got {
+                assert!(m.iter().all(|s| s.points.len() == 1 && s.points[0].0 == 0));
+            }
+        }
+
+        // As given: the first 500 of the vector, in its own order.
+        let mut w = Warnings::new();
+        let got = truncate_or_refuse(reversed(n_vector(501)), true, PartialOrder::AsGiven, &mut w)
+            .expect("partial");
+        assert_eq!(
+            as_given(&got),
+            (1..501)
+                .rev()
+                .map(|i: usize| i.to_string())
+                .collect::<Vec<_>>()
+        );
+
+        // Step-major: series `i` first appears at step `i % 3` with value
+        // `i`; series 600-602 first appear at step 2 with NaN. Steps 0 and 1
+        // fill 400; step 2 fills the last 100 in the sort's direction, NaN
+        // last, so no NaN series is kept.
+        let m = |n: usize| {
+            let mut v: Vec<MatrixSeries> = (0..n)
+                .map(|i| MatrixSeries {
+                    labels: vec![("id".to_string(), format!("{i:04}"))],
+                    points: vec![((i % 3) as i64, i as f64), (9, 0.0)],
+                })
+                .collect();
+            for i in 600..603 {
+                v.push(MatrixSeries {
+                    labels: vec![("id".to_string(), format!("{i:04}"))],
+                    points: vec![(2, f64::NAN)],
+                });
+            }
+            QueryResult::Matrix(v)
+        };
+        let step = |k: usize| -> Vec<usize> { (0..600).filter(|i| i % 3 == k).collect() };
+        let fmt = |v: Vec<usize>| v.into_iter().map(|i| format!("{i:04}")).collect::<Vec<_>>();
+        let mut want_desc: Vec<usize> = step(0);
+        want_desc.extend(step(1));
+        let mut want_asc = want_desc.clone();
+        want_desc.extend(step(2).iter().rev().take(100));
+        want_asc.extend(step(2).iter().take(100));
+        for (dir, want) in [(SortDir::Desc, want_desc), (SortDir::Asc, want_asc)] {
+            let mut w = Warnings::new();
+            let got = truncate_or_refuse(m(600), true, PartialOrder::StepMajor(dir), &mut w)
+                .expect("partial");
+            assert_eq!(ids(&got), sorted(fmt(want)), "{dir:?}");
+            assert_eq!(w.as_strings(), warning);
+            // The walk stops at step 2, so the step-9 point of every kept
+            // series goes and its first point stays.
+            let QueryResult::Matrix(kept) = &got else {
+                panic!("a matrix");
+            };
+            for s in kept {
+                let i: usize = s.labels[0].1.parse().expect("id");
+                assert_eq!(s.points, vec![((i % 3) as i64, i as f64)], "{dir:?} {i}");
+            }
+        }
+
+        // Without a sort, a matrix still admits by first step: 400 series of
+        // steps 0 and 1, then step 2's first 100 by label set.
+        let mut w = Warnings::new();
+        let got = truncate_or_refuse(m(600), true, PartialOrder::Labels, &mut w).expect("partial");
+        let mut want: Vec<usize> = step(0);
+        want.extend(step(1));
+        let mut third: Vec<String> = step(2).into_iter().map(|i| format!("{i:04}")).collect();
+        third.extend((600..603).map(|i| format!("{i:04}")));
+        third.sort();
+        let mut want = fmt(want);
+        want.extend(third.into_iter().take(100));
+        assert_eq!(ids(&got), sorted(want));
     }
 
     /// AC 11's static companion, as an executable check rather than a
