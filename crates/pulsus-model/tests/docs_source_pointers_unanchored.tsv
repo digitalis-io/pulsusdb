@@ -275,7 +275,10 @@ docs/benchmarks/logs-differential-ledger.md	pkg/loghttp/query.go:99	pinned_to_an
 docs/benchmarks/logs-differential-ledger.md	pkg/logql/engine.go:321-322	pinned_to_another_version
 docs/benchmarks/logs-differential-ledger.md	pkg/logql/engine.go:388-395	not_in_this_repository
 docs/benchmarks/logs-differential-ledger.md	pkg/logql/engine.go:440-471	not_in_this_repository
+docs/benchmarks/logs-differential-ledger.md	pkg/logql/engine.go:452-469	not_in_this_repository
 docs/benchmarks/logs-differential-ledger.md	pkg/logql/engine.go:473-508	pinned_to_another_version
+docs/benchmarks/logs-differential-ledger.md	pkg/logql/engine.go:536-548	not_in_this_repository
+docs/benchmarks/logs-differential-ledger.md	pkg/logql/engine.go:536-591	pinned_to_another_version
 docs/benchmarks/logs-differential-ledger.md	pkg/logql/engine.go:538	not_in_this_repository
 docs/benchmarks/logs-differential-ledger.md	pkg/logql/engine.go:564	not_in_this_repository
 docs/benchmarks/logs-differential-ledger.md	pkg/logql/engine.go:569	not_in_this_repository
@@ -926,7 +929,9 @@ docs/reference-defects-we-do-not-copy.md	metrics_to_prw.go:235-239	not_in_this_r
 docs/reference-defects-we-do-not-copy.md	modules/livestore/instance_search.go:257-259	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	parser.go:521	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/loghttp/params.go:38-46	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	pkg/logql/engine.go:452-469	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/logql/engine.go:489	not_in_this_repository
+docs/reference-defects-we-do-not-copy.md	pkg/logql/engine.go:536-591	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/logql/log/label_filter.go:190-202	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/logql/log/labels.go:378-386	not_in_this_repository
 docs/reference-defects-we-do-not-copy.md	pkg/logql/log/logfmt/decode.go:140-149	not_in_this_repository

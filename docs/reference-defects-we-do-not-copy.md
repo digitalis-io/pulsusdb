@@ -87,6 +87,7 @@ replaces one.
 | [32](#32-a-grouped-avg_over_time-fails-on-a-line-its-own-ungrouped-form-ignores) | Loki | queries | A | `avg_over_time … by (a)` fails on a line that is not JSON, where the same average without `by` and the grouped sum ignore it. |
 | [33](#33-rate_counter-reads-nanoseconds-as-milliseconds) | log reference | queries | A | `rate_counter` over a counter that rose by 60 in a one-minute window answers 1.000006 per second instead of 2. |
 | [34](#34-spanchildcount-is-accepted-and-answers-nothing) | trace reference | queries | A, D | A query on a span's child count answers "nothing matched", in every position. |
+| [35](#35-past-the-series-limit-a-drilldown-answer-gains-series-with-no-labels) | log reference | queries | C | A partial answer past the series limit can carry extra series with no labels, holding points of series it was dropping. |
 
 ---
 
@@ -2138,6 +2139,34 @@ A span's direct children, `0` for a leaf, those outside the window counted — i
 
 Ledger rows `traceql-matched-span-multi-field-leaf-not-projected` and `traceql-metrics-child-count-counted`. Pinned by
 `child_counts_are_direct_children` and `the_seven_filter_metrics` in `crates/pulsus-read/tests/traces_query_v2_live.rs`.
+
+---
+
+## 35. Past the series limit, a drilldown answer gains series with no labels
+
+**The log reference · queries · test C**
+
+### What the reference does
+
+A range query from the logs drilldown app that reaches the series limit is served partially
+(`pkg/logql/engine.go:536-591`). On the step where the limit is reached, the first new series is skipped. Each further
+new series in that step skips creation too, so its point is appended to an empty series and stored under its own hash
+(`pkg/logql/engine.go:452-469`). The answer carries those as series with an empty label set.
+
+### Why that is wrong rather than different
+
+It returns points under a label set nobody sent, for series it had decided to drop (**C**). Read from the source; not
+measured.
+
+### What PulsusDB does
+
+Exactly 500 series, each with its own labels and its points up to the step where the walk stops, and the reference's
+warning.
+
+### Evidence
+
+Ledger row `logql-drilldown-partial-series`. Pinned by `the_series_cap_answers_as_the_reference` in
+`crates/pulsus-server/tests/loki_push_live.rs`.
 
 ---
 
