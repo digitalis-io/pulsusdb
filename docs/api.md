@@ -1073,7 +1073,7 @@ GET /api/traces/v1/tags                   ?scope=&start=&end=      (scoped respo
 GET /api/traces/v1/tag/{tag}/values       ?q=&start=&end=          (typed values)
 ```
 
-Tag **names** are served exclusively from `tag_names` (bounded, deduplicated) — never by scanning span payloads or the attribute index. Tag **values** are served from one of three places, and which one is decided by the `{tag}` and by whether `q` narrows (issue #478):
+Attribute tag **names** are served exclusively from `tag_names` (bounded, deduplicated) — never by scanning span payloads or the attribute index; the `intrinsic` scope's names come from the static vocabulary described below, read from no table. Tag **values** are served from one of three places, and which one is decided by the `{tag}` and by whether `q` narrows (issue #478):
 
 | lookup | read |
 |---|---|
@@ -1101,7 +1101,7 @@ Response shapes (native; the §8.1 Tempo aliases are projections of these):
 
 The third body is a static answer (`{tag}` = `status`). Static values carry the type `keyword`, not `string`: a client quotes a value only when its type is `string`, and `{status=error}` is what parses, where `{status="error"}` does not. A static answer is never `truncated` — that flag continues to mean "the catalog read hit its cap" and nothing else. An **empty** value omits the `value` key entirely (`{"type":"string"}`), the canonical protobuf JSON mapping for a default-valued scalar; the §8.1 v1 flat projection is unchanged and still emits the empty string as an element.
 
-The `intrinsic` scope, when present, leads the `scopes` array; the catalog scopes follow, ordered `(scope, key)` ascending, and values are ordered ascending. Intrinsic names and static values are served in a fixed order (names ascending; `status`/`kind` in grammar order). Responses are capped at **10 000** tag names / **1 000** values per request (documented constants `TAG_NAMES_MAX`/`TAG_VALUES_MAX`); a capped response sets the top-level `"truncated": true` — never an indistinguishable silent subset.
+The `intrinsic` scope, when present, leads the `scopes` array; the catalog scopes follow, ordered `(scope, key)` ascending, and values are ordered ascending. Intrinsic names and static values are served in a fixed order (names ascending; `status`/`kind` in grammar order). Responses are capped at **10 000** catalog tag names, with the `intrinsic` scope's static names served beside them, and **1 000** values per request (documented constants `TAG_NAMES_MAX`/`TAG_VALUES_MAX`); a capped response sets the top-level `"truncated": true` — never an indistinguishable silent subset.
 
 **The `type` is the STORED type, not a reading of the value's text** (issue #476). `tag_values.val_type` — and, on a `q`-narrowed read, `trace_attrs_idx.val_type` — carries the OTLP kind the sender sent, written at ingest, and the wire `type` is that column: `string`, `int`, `float` or `bool` (plus `keyword` for a static answer). A string attribute whose text reads as a number, a duration or a boolean therefore reports `string`, which is what a client needs in order to quote it. This **replaces** the earlier best-effort inference over `val`'s characters, and `duration` is no longer in the domain a catalog answer can carry — the reference never emits it for an attribute either.
 
