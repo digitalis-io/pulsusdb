@@ -3104,6 +3104,188 @@ async fn each_ingest_transport_supplies_its_own_detected_level_series() {
     );
 }
 
+/// Issue #605: the volume panel's group count is bounded by the level rule,
+/// not by the corpus. 1,000 distinct audit lines with no level field, sent
+/// on JSON push and on OTLP with no severity text, store one level and give
+/// the volume query one series. The same 1,000 lines sent with a per-line
+/// OTLP severity text store 1,000 levels, which is what the reference
+/// stores for that sender (captured case o13).
+#[tokio::test(flavor = "multi_thread")]
+async fn distinct_lines_with_no_level_field_give_the_volume_query_one_group() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_702;
+    let db = &pulsus_testkit::test_db("pulsus_loki_push_level_bound_it");
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
+    let base_ns = now_ns();
+    let line = |i: usize| {
+        format!(
+            "kernel: audit: type=1400 audit(1790322158.977:{i}): apparmor=\"DENIED\" operation=\"capable\" pid={i} capname=\"setuid\""
+        )
+    };
+    let n = 1000usize;
+    let values: Vec<serde_json::Value> = (0..n)
+        .map(|i| serde_json::json!([(base_ns + i as i64).to_string(), line(i)]))
+        .collect();
+    let json =
+        serde_json::json!({"streams": [{"stream": {"service_name": "lb-a"}, "values": values}]});
+    let res = push(port, "application/json", json.to_string().as_bytes());
+    assert_eq!(res.status, 204, "json push (body {})", res.body);
+    let records = |text: bool| -> Vec<serde_json::Value> {
+        (0..n)
+            .map(|i| {
+                let mut r = serde_json::json!({
+                    "timeUnixNano": (base_ns + (n + i) as i64).to_string(),
+                    "body": {"stringValue": line(i)},
+                });
+                if text {
+                    r["severityText"] = serde_json::Value::String(line(i));
+                }
+                r
+            })
+            .collect()
+    };
+    for (service, text) in [("lb-a", false), ("lb-b", true)] {
+        let body = serde_json::json!({"resourceLogs": [{
+            "resource": {"attributes": [{"key": "service.name", "value": {"stringValue": service}}]},
+            "scopeLogs": [{"logRecords": records(text)}],
+        }]});
+        let res = otlp_push(port, &serde_json::to_vec(&body).expect("otlp body"));
+        assert_eq!(res.status, 200, "otlp push {service} (body {})", res.body);
+    }
+    let stored = |service: &str| {
+        format!(
+            "SELECT uniqExact(JSONExtractString(structured_metadata, 'detected_level')) AS c \
+             FROM {db}.log_samples WHERE org_id = '' AND service = '{service}'"
+        )
+    };
+    let rows = |service: &str| {
+        format!(
+            "SELECT count() AS c FROM {db}.log_samples WHERE org_id = '' AND service = '{service}'"
+        )
+    };
+    assert_eq!(wait_for_count(db, &rows("lb-a"), 2000).await, 2000);
+    assert_eq!(wait_for_count(db, &rows("lb-b"), 1000).await, 1000);
+    assert_eq!(
+        ch_count(db, &stored("lb-a")).await,
+        1,
+        "lb-a stores one level"
+    );
+    assert_eq!(
+        ch_count(db, &stored("lb-b")).await,
+        1000,
+        "lb-b stores each severity text"
+    );
+
+    let start = base_ns - 3_600_000_000_000;
+    let end = base_ns + 3_600_000_000_000;
+    let volume = |service: &str| {
+        let q = format!(
+            r#"sum by (level, detected_level) (count_over_time({{service_name="{service}"}} | drop __error__[2h]))"#
+        );
+        http_get(
+            port,
+            &format!(
+                "/api/logs/v1/query_range?query={}&start={start}&end={end}&step=7200",
+                urlencode(&q)
+            ),
+        )
+        .expect("volume query reachable")
+    };
+    let res = volume("lb-a");
+    assert_eq!(res.status, 200, "lb-a volume (body {})", res.body);
+    let json: serde_json::Value = serde_json::from_str(&res.body).expect("volume JSON");
+    let series = json["data"]["result"].as_array().expect("result");
+    let metrics: Vec<&serde_json::Value> = series.iter().map(|s| &s["metric"]).collect();
+    assert_eq!(
+        metrics,
+        vec![&serde_json::json!({"detected_level": "unknown"})],
+        "{}",
+        res.body
+    );
+    let total: u64 = series[0]["values"]
+        .as_array()
+        .expect("values")
+        .iter()
+        .map(|v| v[1].as_str().expect("value").parse::<u64>().expect("count"))
+        .sum();
+    assert_eq!(total, 2000, "{}", res.body);
+    // `lb-b`'s 1,000 groups pass the series cap; what the query answers
+    // there is `the_series_cap_answers_as_the_reference`'s to pin.
+}
+
+/// Issue #605: the series cap answers as the reference does. 600 OTLP
+/// records, each with its own severity text, give the volume query 600
+/// groups. The query is refused `400` with the reference's body verbatim
+/// (`pkg/logqlmodel/error.go:96`, `pkg/util/server/error.go:110-117`
+/// @ v3.7.4), at range and at instant, sorted or not.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_series_cap_answers_as_the_reference() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_703;
+    let db = &pulsus_testkit::test_db("pulsus_loki_push_series_cap_it");
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[]);
+    let base_ns = now_ns();
+    let n = 600usize;
+    let text = |i: usize| format!("t{i:04}");
+    let records: Vec<serde_json::Value> = (0..n)
+        .map(|i| {
+            serde_json::json!({
+                "timeUnixNano": (base_ns + i as i64).to_string(),
+                "severityText": text(i),
+                "body": {"stringValue": "x".repeat(i + 1)},
+            })
+        })
+        .collect();
+    let body = serde_json::json!({"resourceLogs": [{
+        "resource": {"attributes": [{"key": "service.name", "value": {"stringValue": "cap-a"}}]},
+        "scopeLogs": [{"logRecords": records}],
+    }]});
+    let res = otlp_push(port, &serde_json::to_vec(&body).expect("otlp body"));
+    assert_eq!(res.status, 200, "otlp push (body {})", res.body);
+    let rows = format!(
+        "SELECT count() AS c FROM {db}.log_samples WHERE org_id = '' AND service = 'cap-a'"
+    );
+    assert_eq!(wait_for_count(db, &rows, n as u64).await, n as u64);
+
+    let start = base_ns - 3_600_000_000_000;
+    let end = base_ns + 3_600_000_000_000;
+    let q = r#"sum by (level, detected_level) (count_over_time({service_name="cap-a"} | drop __error__[2h]))"#;
+    let range = format!(
+        "/api/logs/v1/query_range?query={}&start={start}&end={end}&step=7200",
+        urlencode(q)
+    );
+    let instant_q = r#"sum by (detected_level) (count_over_time({service_name="cap-a"}[2h]))"#;
+    let instant = format!(
+        "/api/logs/v1/query?query={}&time={end}",
+        urlencode(instant_q)
+    );
+    let sorted_q =
+        r#"sort_desc(sum by (detected_level) (bytes_over_time({service_name="cap-a"}[2h])))"#;
+    let sorted = format!(
+        "/api/logs/v1/query?query={}&time={end}",
+        urlencode(sorted_q)
+    );
+    let sorted_range = format!(
+        "/api/logs/v1/query_range?query={}&start={start}&end={end}&step=7200",
+        urlencode(sorted_q)
+    );
+    const REFUSED: &str = "maximum number of series (500) reached for a single query; consider \
+        reducing query cardinality by adding more specific stream selectors, reducing the time \
+        range, or aggregating results with functions like sum(), count() or topk()";
+    for path in [&range, &instant, &sorted, &sorted_range] {
+        let res = http_get(port, path).expect("query reachable");
+        assert_eq!((res.status, res.body.as_str()), (400, REFUSED), "{path}");
+    }
+}
+
 // ---------------------------------------------------------------------
 // Issue #507 option A: a stored name is the reference's label name.
 // ---------------------------------------------------------------------

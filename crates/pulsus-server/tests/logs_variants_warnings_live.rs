@@ -796,9 +796,8 @@ async fn variant_skips_agree_with_the_pinned_reference() {
     );
 
     // Corpus case 10 — the ROOT-ONLY rule: the same expression `+ 1`
-    // takes the plain concatenation cap on both sides. The STATUS differs
-    // (the reference's 400 versus our 422) — a pre-existing, separately
-    // ledgered divergence — so only the rejection itself is compared.
+    // takes the plain concatenation cap on both sides, with the same
+    // status (400 since issue #605).
     let plus_one = format!("{} + 1", cap_query(500));
     let ours10 = http_get(
         port,
@@ -812,13 +811,12 @@ async fn variant_skips_agree_with_the_pinned_reference() {
         "/loki/api/v1/query",
         &[("query", &plus_one), ("time", &at_ns.to_string())],
     );
-    assert!(
-        (400..500).contains(&ours10.status),
-        "case 10: a non-variants root takes the plain cap, got {}: {}",
-        ours10.status,
+    assert_eq!(
+        (ours10.status, their_status),
+        (400, 400),
+        "case 10: a non-variants root takes the plain cap on both sides: {}",
         ours10.body
     );
-    assert_eq!(their_status, 400, "case 10: the reference rejects it too");
     for body in [&ours10.body, &their_body] {
         assert!(
             body.contains("maximum number of series (500)"),
