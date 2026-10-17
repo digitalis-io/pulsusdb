@@ -4481,31 +4481,31 @@ The image line (`:571`) is shown at today's floor; the source quoted here pinned
 
 ### `crates/pulsus-read/src/traces/exec.rs`
 
-**`:117-117` @ 1cdb3e5e**
+**`:126-126` @ 1cdb3e5e, before #602 part 2c-2b-2 deleted it**
 
 ```rust
   117  pub const BATCH_TRACES: usize = 32;
 ```
 
-**`:68-68`**
+**`:131-131` @ 1cdb3e5e, before #602 part 2c-2b-2 deleted it**
 
 ```rust
   122  pub const MAX_SPANS_PER_TRACE: usize = 10_000;
 ```
 
-**`:130-130` @ 1cdb3e5e**
+**`:76-76`**
 
 ```rust
   130  pub const TAG_NAMES_MAX: usize = 10_000;
 ```
 
-**`:72-72`**
+**`:81-81`**
 
 ```rust
   135  pub const TAG_VALUES_MAX: usize = 1_000;
 ```
 
-**`:1508-1549`**  (42 lines in the range; comments and blanks elided, 30 shown)
+**`:1795-1836`**  (42 lines in the range; comments and blanks elided, 30 shown)
 
 ```rust
  1825      pub async fn list_tag_values(
@@ -4540,7 +4540,7 @@ The image line (`:571`) is shown at today's floor; the source quoted here pinned
  1864              )
 ```
 
-**`:1846-1874`**  (29 lines in the range; comments and blanks elided, 14 shown)
+**`:2520-2548` @ 1cdb3e5e, before #602 part 2c-2b-2 deleted it**  (29 lines in the range; comments and blanks elided, 14 shown)
 
 ```rust
  2172              let rows: Vec<CandidateRow> = match attempt {
