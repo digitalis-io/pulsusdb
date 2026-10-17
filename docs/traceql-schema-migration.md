@@ -1,6 +1,6 @@
 # Changing the trace tables
 
-**What this is.** The design for the ClickHouse tables that hold traces: what we
+**Parts of this document describe the previous trace search engine, which no search request reaches since issue #602 part 2b and which #602 part 2c-2b deletes; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** **What this is.** The design for the ClickHouse tables that hold traces: what we
 store today, what is wrong with it in numbers, what we would store instead, and
 what each query costs before and after.
 

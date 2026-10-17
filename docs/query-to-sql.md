@@ -1,6 +1,6 @@
 # Query to SQL
 
-This document has four parts, in this order:
+**Parts of this document describe the previous trace search engine, which no search request reaches since issue #602 part 2b and which #602 part 2c-2b deletes; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** This document has four parts, in this order:
 
 1. **[The SQL we send today](#1-the-sql-we-send-today)** — every stage of both query languages, and
    the exact statement text our shipped code produces for it now.

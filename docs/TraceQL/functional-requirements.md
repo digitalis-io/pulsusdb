@@ -1,6 +1,6 @@
 # TraceQL storage and query: functional requirements
 
-This document says what the trace store must do, in numbers a review can check.
+**Parts of this document describe the previous trace search engine, which no search request reaches since issue #602 part 2b and which #602 part 2c-2b deletes; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** This document says what the trace store must do, in numbers a review can check.
 It is the first of the 7 documents under `docs/TraceQL/`:
 
 | document | subject |

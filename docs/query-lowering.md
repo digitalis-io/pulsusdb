@@ -1,6 +1,6 @@
 # Query lowering: compiling pipeline stages to SQL
 
-A LogQL or TraceQL query is a **selector** followed by a **pipeline of stages**. Every stage can
+**Parts of this document describe the previous trace search engine, which no search request reaches since issue #602 part 2b and which #602 part 2c-2b deletes; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** A LogQL or TraceQL query is a **selector** followed by a **pipeline of stages**. Every stage can
 be evaluated in `pulsus-server` over rows ClickHouse has already sent, and some can instead be
 compiled into the SQL we send, so ClickHouse does the work next to the data and returns less.
 This document describes the mechanism that decides which — the lowering core TraceQL's compiler is built on — and reads LogQL's stages against the same questions. LogQL keeps its own compiler; the two are not to be merged (§6).

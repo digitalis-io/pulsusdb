@@ -1,6 +1,6 @@
 # Traces differential divergence ledger
 
-The M4 traces differential (`e2e/src/traces.rs`, issue #60) gates every
+**Parts of this document describe the previous trace search engine, which no search request reaches since issue #602 part 2b and which #602 part 2c-2b deletes; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** The M4 traces differential (`e2e/src/traces.rs`, issue #60) gates every
 corpus-computable TraceQL case in
 `test/fixtures/traces/differential.json` against both the corpus's
 by-construction expectation and the pinned reference Tempo
@@ -411,7 +411,7 @@ re-decide from the evidence rather than re-derive it.
   (the fixture table above, span for span), and the live
   `event_and_link_comparisons_match_any_event_over_real_clickhouse`,
   which runs the co-load against a real ClickHouse — the hermetic tests
-  cannot execute the per-batch value read the semantics depend on.
+  cannot execute the per-batch value read the semantics depend on. On the search route since issue #602 part 2b the rule is the search statement's (`crates/pulsus-read/src/traces/spans/predicate.rs`), pinned on the route by the live test above and by `traces_query_v2_live.rs`'s `the_ledger_search_claims_hold_on_the_route`.
 
 - **Accept-surface effect:** the six probes move `reject → accept` on
   the wire axis. The reference's own verdict is unchanged (it always
@@ -2293,7 +2293,7 @@ when we are asking it to slow down, so we keep `429`; recorded as
 - **Disposition:** remaining work on issue #479. Pinned hermetically by
   `pulsus_read::traces::search_plan::tests::wave_two_shapes_project_nothing`,
   which asserts the planner builds no projection source for each shape and
-  carries a positive control so "nothing" is the shape's doing.
+  carries a positive control so "nothing" is the shape's doing. On the search route since issue #602 part 2b: `traces_compile_v2.rs`'s `a_multi_field_condition_projects_nothing_on_the_statement`.
 
 ### `traceql-matched-span-nil-condition-instance-state` (issue #479)
 
@@ -2949,7 +2949,7 @@ when we are asking it to slow down, so we keep `429`; recorded as
   a cross-spanset algebra per surviving spanSet at each pipeline
   position, which is a second evaluator, not a wider filter. Pinned by
   `traces::search_plan::tests::a_mid_pipeline_spanset_operation_is_a_clean_400`,
-  which asserts this body byte for byte.
+  which asserts this body byte for byte. On the search route since issue #602 part 2b the same body comes from the search statement's compiler, pinned by `traces_compile_v2.rs`'s `compile_search_refuses_with_the_previous_planners_texts`.
 
 - **Disposition.** Refused cleanly, never silently answered from the left
   operand alone. Closing it is separate work.
@@ -3013,7 +3013,7 @@ when we are asking it to slow down, so we keep `429`; recorded as
 
 - **Ours**, for the first spelling: `200`, one spanSet, spans `02 04`.
   Pinned hermetically in
-  `traces::search_eval::tests::the_mid_pipeline_filter_composes_with_every_neighbouring_stage`.
+  `traces::search_eval::tests::the_mid_pipeline_filter_composes_with_every_neighbouring_stage`. On the search route since issue #602 part 2b: `traces_query_v2_live.rs`'s `the_ledger_search_claims_hold_on_the_route`, which answers spans `02 04` for the first two spellings.
 
 - **What the six rule out.** That `select()` always empties (row 4
   answers); that it depends on which field is selected (rows 1 and 2 both
@@ -4022,3 +4022,20 @@ since issue #602 part 2b.
   existence checks are only supported on attributes`.
 
 Measured by planning every search query of the acceptance surface and the census grid with both planners.
+
+### `traceql-literal-first-parent-comparison-answers-nothing-there` (issue #602 part 2c-2a) — **the reference answers `{ -1 < nestedSetParent }` with no span; we answer every non-root span**
+
+Applies to `GET /api/traces/v1/search` and its alias.
+
+- **What.** `{ -1 < nestedSetParent }` means `nestedSetParent > -1`, which every span with a parent satisfies. On
+  the matched-span projection differential's corpus (four spans, one root), the reference returned no span and
+  PulsusDB returned the three non-root spans. In the same run the reference answered
+  `{ -1 = nestedSetParent }` with the root, as PulsusDB does, so the literal on the left is read there for `=`.
+- **Measured** on 2026-10-17 against an instance of the pinned reference build started for this work, with the
+  projection differential's corpus and a temporary registry row; our side at `915d310e` plus #602 part 2c-1's
+  projection change.
+- **Ours** is pinned by `traces_query_v2_live.rs`'s `the_ledger_search_claims_hold_on_the_route`, which answers
+  `{ resource.service.name = "grp492" && -1 < nestedSetParent }` with spans `02 03 04` of its four.
+- **Not established:** the reference's mechanism. The comparison was not located in its source, so this is a
+  recorded observation and not an entry of `docs/reference-defects-we-do-not-copy.md`, which lists it under the
+  claims it deliberately does not make.

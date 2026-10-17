@@ -1,6 +1,6 @@
 # Reproducing the numbers in docs/TraceQL/
 
-Every figure in the TraceQL documents comes from one of these scripts.
+**Parts of this document describe the previous trace search engine, which no search request reaches since issue #602 part 2b and which #602 part 2c-2b deletes; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** Every figure in the TraceQL documents comes from one of these scripts.
 They take hosts, ports and directories as arguments; nothing is hard-coded.
 `run_all.sh` goes from a clean checkout to `results/` in one command.
 
