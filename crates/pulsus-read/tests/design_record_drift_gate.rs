@@ -1496,6 +1496,8 @@ enum GateState {
     /// its own negative control, which is what makes a finder that
     /// reports everything present detectable.
     Absent,
+    /// Tests-first stub (#602 part 2c-2b-2).
+    Deleted,
 }
 
 #[derive(Debug, Clone)]
@@ -1628,6 +1630,7 @@ fn every_gate_the_record_names_exists_or_is_marked_absent() {
                     row.selector
                 );
             }
+            GateState::Deleted => {}
         }
     }
     assert_eq!(
@@ -3088,4 +3091,65 @@ fn audit_citation_forms() {
     for s in &contentless {
         println!("  CONTENTLESS {s}");
     }
+}
+
+/// A citation is pinned to another tree only when `@` is followed by a
+/// hex commit of at least seven digits (`@ 1cdb3e5e`, the form #602 part
+/// 2c-2b-2 writes) or a version (`@ \`v3.7.4\``). A bare `@`, a word, or
+/// a commit too short to name one leaves the citation in this tree's
+/// check, so it cannot hide a stale one.
+#[test]
+fn a_citation_is_pinned_only_by_a_commit_or_a_version() {
+    for (rest, want) in [
+        ("` @ 1cdb3e5e) and", true),
+        (" @ 1cdb3e5eabcdef0123", true),
+        ("` @ `v3.7.4`), so", true),
+        ("` @ grafana/loki v3.7.4", true),
+        ("` @", false),
+        ("` @ ", false),
+        ("` @ main", false),
+        ("` @ abc12", false),
+        ("` @ some words here", false),
+        ("` @ notes 1.2.3", false),
+        ("` @ grafana/loki notes v3.7.4", false),
+        ("` and more", false),
+    ] {
+        assert_eq!(pinned_to_a_commit(rest), want, "{rest:?}");
+    }
+}
+
+/// The `deleted` state is bounded: the rows carrying it are exactly
+/// [`DELETED_GATES`], so marking another gate deleted fails rather than
+/// excusing it. Issue #602 part 2c-2b-2.
+#[test]
+fn an_extra_deleted_row_fails() {
+    let row = |selector: &str| GateRow {
+        selector: selector.to_string(),
+        krate: "pulsus-read".to_string(),
+        file: "crates/pulsus-read/tests/x.rs".to_string(),
+        state: GateState::Deleted,
+    };
+    let exact: Vec<GateRow> = DELETED_GATES.iter().map(|s| row(s)).collect();
+    assert!(deleted_rows_are_the_named_ones(&exact).is_ok());
+    let mut extra = exact.clone();
+    extra.push(row("some_other_gate"));
+    assert!(deleted_rows_are_the_named_ones(&extra).is_err());
+    assert!(deleted_rows_are_the_named_ones(&exact[..1]).is_err());
+}
+
+/// Tests-first stub (#602 part 2c-2b-2): the base's inline check, a pin
+/// being any `@` after the citation.
+fn pinned_to_a_commit(rest: &str) -> bool {
+    rest.trim_start_matches('`').trim_start().starts_with('@')
+}
+
+/// Tests-first stub (#602 part 2c-2b-2): the gates this part deletes.
+const DELETED_GATES: [&str; 2] = [
+    "every_traceql_chain_link_has_a_row_in_the_lowering_document",
+    "traces::compile::tests::every_residual_state_effect_is_the_one_the_document_states",
+];
+
+/// Tests-first stub (#602 part 2c-2b-2): no bound on the `deleted` rows.
+fn deleted_rows_are_the_named_ones(_rows: &[GateRow]) -> Result<(), String> {
+    Ok(())
 }

@@ -209,6 +209,50 @@ fn zero_logql_pipeline_scan_factor_is_rejected_from_yaml_and_env() {
     support::clear_all();
 }
 
+/// Issue #602 part 2c-2: the three settings only the deleted search
+/// engine read are gone, and `deny_unknown_fields` makes a YAML that still
+/// names one fail to load, naming the key.
+#[test]
+fn the_three_removed_traceql_settings_are_refused_in_yaml() {
+    let _guard = support::lock_env();
+    support::clear_all();
+    for key in [
+        "traceql_max_candidates",
+        "traceql_event_set_max_values",
+        "traceql_generator_max_memory_bytes",
+    ] {
+        let path =
+            support::write_temp_yaml(&format!("removed-{key}"), &format!("reader:\n  {key}: 1\n"));
+        let err =
+            pulsus_config::load(Some(&path), None).expect_err("a removed reader key must not load");
+        assert!(err.to_string().contains(key), "{key}: {err}");
+        let _ = std::fs::remove_file(&path);
+    }
+    support::clear_all();
+}
+
+/// Issue #602 part 2c-2b-2: the three settings' environment variables are
+/// no longer read. Each is set to `0`, which their range checks refused
+/// (`>= 1`), so before the removal every one failed `load`; now the
+/// configuration loads and the value goes nowhere.
+#[test]
+fn the_three_removed_traceql_environment_variables_are_ignored() {
+    let _guard = support::lock_env();
+    support::clear_all();
+    for var in [
+        "PULSUS_TRACEQL_MAX_CANDIDATES",
+        "PULSUS_TRACEQL_EVENT_SET_MAX_VALUES",
+        "PULSUS_TRACEQL_GENERATOR_MAX_MEMORY_BYTES",
+    ] {
+        support::set(var, "0");
+        let loaded = pulsus_config::load(None, None);
+        // SAFETY: see `support::clear_all`; the guard is held.
+        unsafe { std::env::remove_var(var) };
+        loaded.unwrap_or_else(|e| panic!("{var}=0 must be ignored, not refused: {e}"));
+    }
+    support::clear_all();
+}
+
 /// Issue #311: an unknown `reader.template_timezone` — from YAML or from
 /// `PULSUS_TEMPLATE_TIMEZONE` — fails config load naming the offending
 /// value. There is deliberately NO fallback: a server that silently

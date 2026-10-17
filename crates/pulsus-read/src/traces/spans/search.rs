@@ -1445,7 +1445,6 @@ pub fn decode_search(
 mod charge_tests {
     use super::*;
     use crate::traces::exec::{ByteBudget, RETAINED_ENTRY_OVERHEAD, output_reserve_bytes};
-    use crate::traces::search_eval::TraceMatch;
     use crate::traces::spans::rows::{SearchProjected, SearchSpanTuple};
 
     /// Section 6.1's four groups: a string, an int, `name` and an array.
@@ -1523,17 +1522,18 @@ mod charge_tests {
         ]
     }
 
-    /// Everything today's engine charges for the same response: the trace
-    /// buffer, then per trace `TraceMatch::retained_bytes` and the root
-    /// strings.
+    /// The expected charge for the response: the trace buffer, then per
+    /// trace an entry's overhead, the summaries buffer and its payload, and
+    /// the root strings. (The previous search engine also charged each
+    /// trace's own match struct here; #602 part 2c-2b-2 dropped it with that
+    /// engine, the trace's slot being charged with the output buffer.)
     fn todays_charge(out: &SearchOutput) -> usize {
         output_reserve_bytes(out.traces.len())
             + out
                 .traces
                 .iter()
                 .map(|t| {
-                    std::mem::size_of::<TraceMatch>()
-                        + RETAINED_ENTRY_OVERHEAD
+                    RETAINED_ENTRY_OVERHEAD
                         + t.spans.capacity() * std::mem::size_of::<SpanSummary>()
                         + t.spans
                             .iter()
@@ -1545,9 +1545,10 @@ mod charge_tests {
                 .sum::<usize>()
     }
 
-    /// Section 6.1: the decode charges exactly what today's engine charges
-    /// for the response it builds; a budget of exactly that decodes, and
-    /// one byte less is refused.
+    /// Section 6.1: the decode charges exactly the expected charge
+    /// ([`todays_charge`]) for the response it builds, the previous search
+    /// engine's extra struct charge gone with that engine; a budget of
+    /// exactly that decodes, and one byte less is refused.
     #[test]
     fn the_decode_charges_what_todays_engine_charges() {
         let s = statement();
@@ -1621,9 +1622,10 @@ mod charge_tests {
         }]
     }
 
-    /// Issue #592 part 2, section 7.1: the grouped decode charges what
-    /// today's engine charges for the same response, its groups included
-    /// (`TraceMatch::retained_bytes` with `groups_retained_bytes`); it
+    /// Issue #592 part 2, section 7.1: the grouped decode charges the
+    /// expected charge for the same response, its groups included
+    /// ([`todays_charge`] with `groups_retained_bytes`, the previous search
+    /// engine's extra struct charge gone with that engine); it
     /// fits a budget of that plus the distinct group tuples the cap's
     /// counter holds while it runs, and one byte less is refused.
     #[test]
@@ -1679,10 +1681,10 @@ mod charge_tests {
         );
     }
 
-    /// Issue #592 part 3: an aggregate's one group charges what today's
-    /// engine charges — `TraceMatch::retained_bytes` with
-    /// `groups_retained_bytes` — and no distinct-group tuple: one byte less
-    /// than that is refused.
+    /// Issue #592 part 3: an aggregate's one group charges the expected
+    /// amount — [`todays_charge`] with `groups_retained_bytes`, the previous
+    /// search engine's extra struct charge gone with that engine — and no
+    /// distinct-group tuple: one byte less than that is refused.
     #[test]
     fn the_aggregated_decode_charges_what_todays_engine_charges() {
         use crate::traces::search_eval::groups_retained_bytes;

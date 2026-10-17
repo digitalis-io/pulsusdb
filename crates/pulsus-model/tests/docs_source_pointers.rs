@@ -1602,3 +1602,41 @@ fn regenerate_the_frozen_datasets() {
     }
     std::fs::write(repo_root().join(FOREIGN_TSV), out).expect("write the foreign dataset");
 }
+
+/// A pin (`@` after a pointer) counts only when a version or a commit
+/// follows it: a hex commit of at least seven digits, or a version such as
+/// `v3.0.2` or `1.0.150`, after at most two words (`grafana/loki`, `tempo`).
+/// A bare `@`, a word, or a commit too short to name one does not, so it
+/// cannot hide a stale pointer. A pin the line breaks after reads on into
+/// the next line. Issue #602 part 2c-2b-2.
+#[test]
+fn a_pin_needs_a_version_or_a_commit_after_it() {
+    let doc = "docs/x.md";
+    let cases: [(&str, bool); 14] = [
+        ("see `a.rs:12` @ 1cdb3e5e here\n", true),
+        ("see `a.rs:12` @ v3.0.2\n", true),
+        ("see `a.rs:12` @ grafana/loki v3.7.4 b318f282\n", true),
+        ("see `a.rs:12` @\ngrafana/loki v3.7.4\n", true),
+        ("see `a.rs:12` @ grafana/loki\nv3.7.4 b318f282\n", true),
+        ("see `a.rs:12` @ 1.0.150`)\n", true),
+        ("see `a.rs:12` @\n\n", false),
+        ("see `a.rs:12` @ main\n", false),
+        ("see `a.rs:12` @ abc12\n", false),
+        ("see `a.rs:12` @ some words here\n", false),
+        // An unknown word before a version, on one line or across the
+        // break, is prose, not a tree.
+        ("see `a.rs:12` @ notes 1.2.3\n", false),
+        ("see `a.rs:12` @ notes\n1.2.3 and on\n", false),
+        ("see `a.rs:12` @\nnotes 1.2.3\n", false),
+        // A known tree, then a word, then a version: two steps, not one.
+        ("see `a.rs:12` @ grafana/loki notes v3.7.4\n", false),
+    ];
+    for (text, want) in cases {
+        let ps = pointers_in(doc, text);
+        let p = ps
+            .iter()
+            .find(|p| p.path_text == "a.rs")
+            .unwrap_or_else(|| panic!("no pointer read from {text:?}"));
+        assert_eq!(p.pinned, want, "{text:?}");
+    }
+}
