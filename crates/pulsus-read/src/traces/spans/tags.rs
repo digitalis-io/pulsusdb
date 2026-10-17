@@ -14,7 +14,12 @@
 //! byte-identical), never `FINAL`. The `LIMIT` is the caller's cap + 1,
 //! the truncation probe.
 
-use super::predicate::{PredicateCtx, SpanPredicate};
+use pulsus_traceql::{BoolOp, FieldExpr, FieldOp, SpansetExpr, SpansetFilter, parse, validate};
+
+use super::predicate::{PredicateCtx, SpanPredicate, attr_path, compile_span_predicate_in};
+use super::projection::ceiling_sql;
+use super::tracelevel::TraceLeaf;
+use crate::traces::filter::byte_cap_expr;
 use crate::traces::window_sql::WindowSql;
 
 /// The five scopes the writer catalogues for sender-supplied ATTRIBUTES,
@@ -65,21 +70,66 @@ pub fn tag_values_sql(key_literal: &str, scope_literal: Option<&str>, limit: usi
 }
 
 // ---------------------------------------------------------------------
-// Issue #598 part 2a. Tests-first stubs: no narrowing, no statements.
+// Issue #598 part 2: narrowed values and span names from the span store
 // ---------------------------------------------------------------------
 
-/// Tests-first stub.
+/// At most this many conjuncts of a `q` are kept; later ones are
+/// dropped, which can only widen the answer. The first ones in pre-order.
 pub const TAG_NARROW_MAX_TERMS: usize = 8;
 
-/// Tests-first stub.
+/// The ceiling on `R`, the number of newest spans a span-name or
+/// narrowed-values read reaches back to (D12): the engine's default.
 pub const TAG_STORE_READ_ROWS: u64 = 10_000_000;
 
-/// Tests-first stub.
-pub fn cut_rows(_ceiling: u64, _scan_budget_rows: u64, _table_reads: u64) -> u64 {
-    0
+/// `R` for a statement making `table_reads` reads of `spans` and
+/// `traces`: max(1, min(`ceiling`, `scan_budget_rows` / (2 × `table_reads`))),
+/// so every read taking about `R` rows plus a share of one bucket stays
+/// inside the scan budget.
+pub fn cut_rows(ceiling: u64, scan_budget_rows: u64, table_reads: u64) -> u64 {
+    let per_read = scan_budget_rows / (2 * table_reads.max(1));
+    ceiling.min(per_read).max(1)
 }
 
-/// Tests-first stub.
+/// What a store read lists: span names, or one key's values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagShape {
+    Names,
+    Values(ValueScope),
+}
+
+/// The statement's reads of `spans` and `traces`, the cut included (the
+/// `resources` read is not counted): 2 for span names and every scoped
+/// value read, 3 for an unscoped key, and 2 more when the predicate reads
+/// a trace-level leaf.
+pub fn table_reads(shape: TagShape, n: &TagNarrowing) -> u64 {
+    let base = match shape {
+        TagShape::Values(ValueScope::Unscoped) => 3,
+        _ => 2,
+    };
+    let trace = n.predicate().is_some_and(|p| !p.trace_leaves().is_empty());
+    base + if trace { 2 } else { 0 }
+}
+
+/// The 5-minute bucket that holds the window's `r`-th newest span: an
+/// ordered read of `start_ns` alone.
+fn cut_sql(spans: &str, w: WindowSql, r: u64) -> String {
+    format!(
+        "(SELECT min(b) FROM (SELECT intDiv(start_ns, 300000000000) AS b FROM {spans} WHERE {} AND {} AND {} ORDER BY b DESC LIMIT {r})) AS cut",
+        w.span_time_clause(),
+        w.span_bucket_clause(),
+        w.span_day_clause()
+    )
+}
+
+/// A span is in the buckets from the cut on.
+const NEWER: &str = "intDiv(start_ns, 300000000000) >= cut";
+
+/// The narrowing one `q` contributes to a store read.
+///
+/// `has_body` says whether `q` parsed and validated to a root filter with
+/// a body: such a `q` takes the windowed store read, with no predicate if
+/// every conjunct dropped. Without one, a values read is part 1's catalog
+/// read.
 #[derive(Debug, Clone, Default)]
 pub struct TagNarrowing {
     has_body: bool,
@@ -89,26 +139,117 @@ pub struct TagNarrowing {
 }
 
 impl TagNarrowing {
+    /// Whether `q` was a root filter with a body.
     pub fn has_body(&self) -> bool {
         self.has_body
     }
+
+    /// The one predicate the statement carries: the `&&` of the kept
+    /// conjuncts.
     pub fn predicate(&self) -> Option<&SpanPredicate> {
         self.pred.as_ref()
     }
+
+    /// The `&&` of the kept conjuncts that read no trace-level leaf, when
+    /// some kept conjunct does: what the trace-level prefix restricts its
+    /// trace ids by.
     pub fn span_predicate(&self) -> Option<&SpanPredicate> {
         self.span_pred.as_ref()
     }
+
+    /// How many conjuncts were kept.
     pub fn terms(&self) -> usize {
         self.terms
     }
 }
 
-/// Tests-first stub.
-pub fn narrowing_from_query(_raw_q: &str, _ctx: &PredicateCtx<'_>) -> TagNarrowing {
-    TagNarrowing::default()
+/// Lowers a raw `q`. **Total**: every input, the empty string and a
+/// half-typed query included, gives a narrowing, never an error.
+///
+/// Each conjunct of the root filter's `&&` spine — any subtree, `||` and
+/// `!` included — is compiled on its own to decide whether it is kept:
+/// kept when it compiles and reads neither the nested-set numbering,
+/// `span:childCount` nor a per-trace operand value. Trace-level leaves
+/// are kept. At most [`TAG_NARROW_MAX_TERMS`], in pre-order. The kept
+/// conjuncts are then compiled together, once, so every `!` demand sits in
+/// front of the whole expression. Every drop is a conjunct of a
+/// conjunction, so it widens inside the window and never outside it.
+pub fn narrowing_from_query(raw_q: &str, ctx: &PredicateCtx<'_>) -> TagNarrowing {
+    let Ok(query) = parse(raw_q) else {
+        return TagNarrowing::default();
+    };
+    if validate(&query).is_err() {
+        return TagNarrowing::default();
+    }
+    let SpansetExpr::Filter(SpansetFilter { body: Some(body) }) = &query.spanset else {
+        return TagNarrowing::default();
+    };
+    let mut conjuncts: Vec<&FieldExpr> = Vec::new();
+    spine(body, &mut conjuncts);
+    let mut kept: Vec<(&FieldExpr, bool)> = Vec::new();
+    for c in conjuncts {
+        if kept.len() >= TAG_NARROW_MAX_TERMS {
+            break;
+        }
+        let Ok(p) = compile_span_predicate_in(c, ctx) else {
+            continue;
+        };
+        if p.reads_numbering() || p.reads_child_counts() || !p.trace_values().is_empty() {
+            continue;
+        }
+        kept.push((c, !p.trace_leaves().is_empty()));
+    }
+    let compile_all = |exprs: &[&FieldExpr]| -> Option<SpanPredicate> {
+        let joined = and_of(exprs)?;
+        compile_span_predicate_in(&joined, ctx).ok()
+    };
+    let all: Vec<&FieldExpr> = kept.iter().map(|(e, _)| *e).collect();
+    let pred = compile_all(&all);
+    let span_pred = if kept.iter().any(|(_, trace)| *trace) {
+        let span_only: Vec<&FieldExpr> = kept
+            .iter()
+            .filter(|(_, trace)| !*trace)
+            .map(|(e, _)| *e)
+            .collect();
+        compile_all(&span_only)
+    } else {
+        None
+    };
+    TagNarrowing {
+        has_body: true,
+        terms: if pred.is_some() { kept.len() } else { 0 },
+        pred,
+        span_pred,
+    }
 }
 
-/// Tests-first stub.
+/// The `&&` spine's conjuncts, in pre-order.
+fn spine<'a>(expr: &'a FieldExpr, out: &mut Vec<&'a FieldExpr>) {
+    match expr {
+        FieldExpr::Binary {
+            op: FieldOp::Bool(BoolOp::And),
+            lhs,
+            rhs,
+        } => {
+            spine(lhs, out);
+            spine(rhs, out);
+        }
+        other => out.push(other),
+    }
+}
+
+/// `a && b && …`, left-folded; `None` for no operand.
+fn and_of(exprs: &[&FieldExpr]) -> Option<FieldExpr> {
+    let mut it = exprs.iter();
+    let first = (*it.next()?).clone();
+    Some(it.fold(first, |acc, e| FieldExpr::Binary {
+        op: FieldOp::Bool(BoolOp::And),
+        lhs: Box::new(acc),
+        rhs: Box::new((*e).clone()),
+    }))
+}
+
+/// Where a values read takes its values from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueScope {
     Span,
@@ -120,55 +261,195 @@ pub enum ValueScope {
 }
 
 impl ValueScope {
-    pub fn from_attr_scope(_scope: Option<&str>) -> Self {
-        Self::Unscoped
+    /// The scope of a `{tag}` prefix; `None` is a bare key.
+    pub fn from_attr_scope(scope: Option<&str>) -> Self {
+        match scope {
+            Some("span") => Self::Span,
+            Some("resource") => Self::Resource,
+            Some("instrumentation") => Self::Instrumentation,
+            Some("event") => Self::Event,
+            Some("link") => Self::Link,
+            _ => Self::Unscoped,
+        }
     }
 }
 
-/// Tests-first stub.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TagShape {
-    Names,
-    Values(ValueScope),
+/// Every `(text, type)` a stored attribute value lists, as an array: a
+/// scalar is one element, an all-string array each string, an all-int,
+/// all-double or all-bool array each element typed by its arm; anything
+/// else nothing. `d` is substituted textually.
+fn elems(d: &str) -> String {
+    format!(
+        "multiIf(dynamicType({d}) = 'String', [(assumeNotNull(dynamicElement({d}, 'String')), 'string')], \
+dynamicType({d}) = 'Int64', [(toString(assumeNotNull(dynamicElement({d}, 'Int64'))), 'int')], \
+dynamicType({d}) = 'Float64', [(toString(assumeNotNull(dynamicElement({d}, 'Float64'))), 'float')], \
+dynamicType({d}) = 'Bool', [(toString(assumeNotNull(dynamicElement({d}, 'Bool'))), 'bool')], \
+dynamicType({d}) = 'Array(Nullable(String))', arrayMap(x -> (assumeNotNull(x), 'string'), dynamicElement({d}, 'Array(Nullable(String))')), \
+dynamicType({d}) = 'Array(Nullable(Int64))', arrayMap(x -> (toString(assumeNotNull(x)), 'int'), dynamicElement({d}, 'Array(Nullable(Int64))')), \
+dynamicType({d}) = 'Array(Nullable(Float64))', arrayMap(x -> (toString(assumeNotNull(x)), 'float'), dynamicElement({d}, 'Array(Nullable(Float64))')), \
+dynamicType({d}) = 'Array(Nullable(Bool))', arrayMap(x -> (toString(assumeNotNull(x)), 'bool'), dynamicElement({d}, 'Array(Nullable(Bool))')), \
+CAST([], 'Array(Tuple(String, String))'))"
+    )
 }
 
-/// Tests-first stub.
-pub fn table_reads(_shape: TagShape, _n: &TagNarrowing) -> u64 {
-    0
+/// The span's `service.name`, when it is stored as a string.
+const SERVICE_ARR: &str = "if(service_type = 'string', [(CAST(service, 'String'), 'string')], CAST([], 'Array(Tuple(String, String))'))";
+
+/// The `AND (pred)` line of a read, or nothing.
+fn pred_line(n: &TagNarrowing, indent: &str) -> String {
+    match n.predicate() {
+        Some(p) => format!("\n{indent}AND ({})", p.sql()),
+        None => String::new(),
+    }
 }
 
-/// Tests-first stub.
-#[cfg(test)]
-fn trace_prefix(_traces: &str, _spans: &str, _w: WindowSql, _n: &TagNarrowing, _r: u64) -> String {
-    String::new()
+/// The statement's `WITH`: the cut alone, or with the trace-level prefix.
+fn with_clause(traces: &str, spans: &str, w: WindowSql, n: &TagNarrowing, r: u64) -> String {
+    let tl = trace_prefix(traces, spans, w, n, r);
+    if tl.is_empty() {
+        format!("WITH {}\n", cut_sql(spans, w, r))
+    } else {
+        tl
+    }
 }
 
-/// Tests-first stub.
+/// The `AND (pred)` of a one-line subquery, or nothing.
+fn pred_inline(n: &TagNarrowing) -> String {
+    match n.predicate() {
+        Some(p) => format!(" AND ({})", p.sql()),
+        None => String::new(),
+    }
+}
+
+/// The trace-level prefix (`TL`): each trace leaf's trace set, built from
+/// `traces` over the window's days ±1 and restricted to the trace ids of
+/// the spans the read covers, the span conjuncts applied. Empty when the
+/// predicate reads no trace leaf.
+fn trace_prefix(traces: &str, spans: &str, w: WindowSql, n: &TagNarrowing, r: u64) -> String {
+    let Some(p) = n.predicate() else {
+        return String::new();
+    };
+    let mut leaves: Vec<&TraceLeaf> = Vec::new();
+    for l in p.trace_leaves() {
+        if !leaves.iter().any(|x| x.alias == l.alias) {
+            leaves.push(l);
+        }
+    }
+    if leaves.is_empty() {
+        return String::new();
+    }
+    let elements = leaves
+        .iter()
+        .map(|l| format!("groupArrayIf(trace_id, {})", l.cond))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let aliases = leaves
+        .iter()
+        .enumerate()
+        .map(|(i, l)| format!("per_trace.{} AS {}", i + 1, l.alias))
+        .collect::<Vec<_>>()
+        .join(",\n     ");
+    let spred = n.span_predicate().map_or("1", |p| p.sql());
+    format!(
+        "WITH {cut},\n     (SELECT tuple({elements})\n      FROM (SELECT trace_id, max(end_ns) - min(start_ns) AS duration, min(root) AS r,\n                   if(r.1 = 0, {service}, '') AS root_service, if(r.1 = 0, {name}, '') AS root_name\n            FROM {traces}\n            WHERE {tdays}\n              AND trace_id GLOBAL IN (SELECT trace_id FROM {spans} WHERE {time} AND {bucket} AND {day} AND {NEWER} AND ({spred}))\n            GROUP BY trace_id)) AS per_trace,\n     {aliases}\n",
+        cut = cut_sql(spans, w, r),
+        service = ceiling_sql("r.4"),
+        name = ceiling_sql("r.5"),
+        tdays = w.per_trace_day_clause(),
+        time = w.span_time_clause(),
+        bucket = w.span_bucket_clause(),
+        day = w.span_day_clause(),
+    )
+}
+
+/// The span-name read (N): the capped names of the spans starting in the
+/// window, newest bucket first, narrowed by `n`'s predicate.
 pub fn name_values_sql(
-    _spans: &str,
-    _traces: &str,
-    _w: WindowSql,
-    _n: &TagNarrowing,
-    _r: u64,
-    _limit: usize,
+    spans: &str,
+    traces: &str,
+    w: WindowSql,
+    n: &TagNarrowing,
+    r: u64,
+    limit: usize,
 ) -> String {
-    String::new()
+    format!(
+        "{with}SELECT DISTINCT {cap} AS val\nFROM {spans}\nWHERE {time}\n  AND {bucket}\n  AND {day}\n  AND {NEWER}{pred}\nORDER BY val\nLIMIT {limit}",
+        with = with_clause(traces, spans, w, n, r),
+        cap = byte_cap_expr("name"),
+        time = w.span_time_clause(),
+        bucket = w.span_bucket_clause(),
+        day = w.span_day_clause(),
+        pred = pred_line(n, "  "),
+    )
 }
 
-/// Tests-first stub.
+/// The narrowed values read for one attribute key (V-S, V-R, V-U): the
+/// values on the spans the query matches in the window, newest bucket
+/// first. `key` is raw; it is escaped here, into a JSON path identifier.
 #[allow(clippy::too_many_arguments)]
 pub fn narrowed_values_sql(
-    _spans: &str,
-    _resources: &str,
-    _traces: &str,
-    _scope: ValueScope,
-    _key: &str,
-    _w: WindowSql,
-    _n: &TagNarrowing,
-    _r: u64,
-    _limit: usize,
+    spans: &str,
+    resources: &str,
+    traces: &str,
+    scope: ValueScope,
+    key: &str,
+    w: WindowSql,
+    n: &TagNarrowing,
+    r: u64,
+    limit: usize,
 ) -> String {
-    String::new()
+    let prefix = with_clause(traces, spans, w, n, r);
+    let time = w.span_time_clause();
+    let bucket = w.span_bucket_clause();
+    let day = w.span_day_clause();
+    let span_arr = |root: &str| elems(&attr_path(root, key));
+    let set_arr = |root: &str| {
+        format!(
+            "arrayFlatten(arrayMap(d -> {}, {}))",
+            elems("d"),
+            attr_path(root, key)
+        )
+    };
+    let resource_ids = format!(
+        "(service, resource_id) IN (SELECT service, resource_id FROM {spans} WHERE {time} AND {bucket} AND {day} AND {NEWER}{})",
+        pred_inline(n)
+    );
+    let from_spans = |arr: String| {
+        format!(
+            "{prefix}SELECT DISTINCT val, val_type\nFROM (SELECT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type\n  FROM {spans}\n  ARRAY JOIN {arr} AS e\n  WHERE {time}\n    AND {bucket}\n    AND {day}\n    AND {NEWER}{pred})\nORDER BY val, val_type\nLIMIT {limit}",
+            pred = pred_line(n, "    "),
+        )
+    };
+    match scope {
+        ValueScope::Span => from_spans(span_arr("attrs")),
+        ValueScope::Instrumentation => from_spans(span_arr("scope_attrs")),
+        ValueScope::Event => from_spans(set_arr("events.attrs")),
+        ValueScope::Link => from_spans(set_arr("links.attrs")),
+        ValueScope::Resource if key == "service.name" => from_spans(SERVICE_ARR.to_string()),
+        ValueScope::Resource => format!(
+            "{prefix}SELECT DISTINCT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type\nFROM {resources}\nARRAY JOIN {arr} AS e\nWHERE {rday}\n  AND {resource_ids}\nORDER BY val, val_type\nLIMIT {limit}",
+            arr = elems(&attr_path("attrs", key)),
+            rday = w.resources_day_clause(),
+        ),
+        ValueScope::Unscoped => {
+            let mut parts = vec![
+                span_arr("attrs"),
+                span_arr("scope_attrs"),
+                set_arr("events.attrs"),
+                set_arr("links.attrs"),
+            ];
+            if key == "service.name" {
+                parts.push(SERVICE_ARR.to_string());
+            }
+            format!(
+                "{prefix}SELECT DISTINCT val, val_type\nFROM (SELECT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type\n  FROM {spans}\n  ARRAY JOIN arrayConcat({all}) AS e\n  WHERE {time} AND {bucket} AND {day} AND {NEWER}{pred}\n  UNION ALL\n  SELECT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type\n  FROM {resources}\n  ARRAY JOIN {rarr} AS e\n  WHERE {rday} AND {resource_ids})\nORDER BY val, val_type\nLIMIT {limit}",
+                all = parts.join(", "),
+                pred = pred_inline(n),
+                rarr = elems(&attr_path("attrs", key)),
+                rday = w.resources_day_clause(),
+            )
+        }
+    }
 }
 
 #[cfg(test)]

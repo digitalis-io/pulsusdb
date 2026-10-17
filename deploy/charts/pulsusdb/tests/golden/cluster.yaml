@@ -248,7 +248,7 @@ data:
       logql_scan_budget_bytes: 50GiB
       promql_lookback: 5m
       promql_max_samples: 50000000
-      traceql_tag_lookback: 24h
+      traceql_tag_lookback: 20m
     retention_days: 7
     ruler:
       enabled: false
@@ -475,7 +475,7 @@ spec:
         app.kubernetes.io/managed-by: Helm
         app.kubernetes.io/component: all
       annotations:
-        checksum/config: 7d041a9db08a34c7d7cf6d541637577776e6ce124e30cbf13fe58f21e32c2daf
+        checksum/config: 370dd7a16b3aed181a2d0a5f72f444097a18d0a2abe5cc2bfca1af670d2a426f
         checksum/secret: 01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b
     spec:
       serviceAccountName: pulsusdb
@@ -1161,7 +1161,7 @@ spec:
         app.kubernetes.io/managed-by: Helm
         app.kubernetes.io/component: init
       annotations:
-        checksum/config: 7d041a9db08a34c7d7cf6d541637577776e6ce124e30cbf13fe58f21e32c2daf
+        checksum/config: 370dd7a16b3aed181a2d0a5f72f444097a18d0a2abe5cc2bfca1af670d2a426f
         checksum/secret: 01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b
     spec:
       restartPolicy: Never

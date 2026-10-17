@@ -281,7 +281,7 @@ reader:
   template_timezone: UTC          # IANA zone for LogQL template time functions; never the host's
   traceql_scan_budget_rows: 50000000
   traceql_max_series: 1000
-  traceql_tag_lookback: 24h
+  traceql_tag_lookback: 20m
   query_eval_concurrency: 256
   tail_poll_interval: 1s
   tail_max_delay: 5s
