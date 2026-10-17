@@ -9,19 +9,6 @@
 //!   plus the §9-mandated label/series discovery shape, captures per-query
 //!   `system.query_log` evidence and `EXPLAIN indexes = 1`, and emits JSON
 //!   (+ optionally a markdown table body) evidence.
-//! - `traces-read` (issue #57 AC4) — the M4 traces read-path
-//!   shard-locality evidence harness on the 2-shard
-//!   `ci/clickhouse-cluster` fixture: per-stage per-shard
-//!   `system.query_log` evidence for the two-phase TraceQL search +
-//!   trace-by-ID, verdicted (hard errors) against a client-computed
-//!   `cityHash64(trace_id) % total_weight` roster. See [`traces_read`].
-//! - `traces-lowering` (issue #492 part 8) — the `docs/query-lowering.md`
-//!   §9.2 re-measurement: builds §9.1's corpus C1 from a deterministic
-//!   generator, drives one TraceQL request in both its unlowered and its
-//!   lowered form through the product planner's own SQL, and retains one
-//!   `system.query_log` row per statement so §9.2's figures can be
-//!   checked against the rows they were computed from. See
-//!   [`traces_lowering`].
 //! - `match-flag-head` (issue #331) — the ClickHouse `match()`
 //!   flag-group-head remedy benchmark, committed so the
 //!   rewrite-vs-defeat comparison is reproducible on any machine
@@ -53,8 +40,6 @@ pub mod metadata_filter;
 pub mod queries;
 mod query_log;
 pub mod report;
-pub mod traces_lowering;
-pub mod traces_read;
 
 use std::time::Duration;
 
@@ -141,21 +126,18 @@ pub enum Profile {
 }
 
 /// Dispatches on `args.scenario` — `"logs-read"` (issue #16),
-/// `"logs-hydration"` (issue #35),
-/// `"traces-read"` (issue #57) or `"traces-lowering"` (issue #492
-/// part 8); any other value is a hard error.
+/// `"logs-hydration"` (issue #35), `"match-flag-head"` (issue #331) or
+/// `"logql-metadata-filter"`; any other value is a hard error.
 pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
     match args.scenario.as_str() {
         "logs-read" => run_logs_read(args).await,
         "logs-hydration" => logs_hydration::run(args).await,
-        "traces-read" => traces_read::run(args).await,
-        "traces-lowering" => traces_lowering::run(args).await,
         "match-flag-head" => match_flag_head::run(args).await,
         "logql-metadata-filter" => metadata_filter::run(args).await,
         other => anyhow::bail!(
             "unknown bench scenario {other:?} (expected \"logs-read\", \
-             \"logs-hydration\", \"traces-read\", \"traces-lowering\", or \
-             \"match-flag-head\")"
+             \"logs-hydration\", \"match-flag-head\" or \
+             \"logql-metadata-filter\")"
         ),
     }
 }

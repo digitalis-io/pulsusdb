@@ -5936,38 +5936,6 @@ async fn land_both(client: &ChClient, db: &str, reqs: &[ExportTraceServiceReques
     }
 }
 
-/// Today's answer to `query` over the window.
-async fn today(
-    db: &str,
-    query: &pulsus_traceql::Query,
-    w: (i64, i64),
-    limit: u32,
-    spss: u32,
-) -> Result<pulsus_read::traces::SearchOutput, String> {
-    use pulsus_read::traces::search_plan::{SearchParams, plan_search};
-    let engine = pulsus_read::TraceEngine::new(
-        ChClient::new(client_config(db))
-            .await
-            .expect("connect the engine"),
-        engine_config(),
-    );
-    let plan = plan_search(
-        query,
-        &SearchParams {
-            start_ns: w.0,
-            end_ns: w.1,
-            limit,
-            spss,
-        },
-        &engine.search_ctx(),
-    )
-    .map_err(|e| format!("today's planner refused: {e}"))?;
-    engine
-        .search(&plan)
-        .await
-        .map_err(|e| format!("today's engine failed: {e}"))
-}
-
 /// The search statement's answer to `query` over the window, decoded.
 async fn statement(
     client: &ChClient,
@@ -6567,8 +6535,9 @@ async fn seed_both(
 }
 
 /// The previous search engine's answers on fixtures C, RZ, B, P and NW,
-/// recorded by [`record_the_previous_engines_answers`] while that engine
-/// existed (issue #602 part 2c-1). Columns: fixture, the query as a Rust
+/// recorded by `record_the_previous_engines_answers` while that engine
+/// existed (issue #602 part 2c-1; the recorder is at `7c05da64` and
+/// part 2c-2b-1 deleted it). Columns: fixture, the query as a Rust
 /// string literal, `limit`, `spss`, and the [`answer_digest`] of the
 /// answer: 693 answers average 1.9 KB as text, so the file holds the
 /// digest, and a mismatch prints the answer read now.
@@ -6660,120 +6629,6 @@ const NW_QUERIES: [&str; 3] = [
     "{ nestedSetRight > 0 }",
     "{ nestedSetParent > 0 }",
 ];
-
-/// Writes [`RECORDED_ANSWERS`] from the previous search engine. It ran
-/// once, on `main` at the commit part 2c-1 starts from; part 2c-2 deletes
-/// it with that engine.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "records the previous engine's answers; run by hand"]
-async fn record_the_previous_engines_answers() {
-    skip_unless_live!();
-    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
-    let window = (base_ns, base_ns + CATALOGUE_WINDOW_NS);
-    type Fixture = (&'static str, String, Vec<String>, Vec<(u32, u32)>);
-    let mut fixtures: Vec<Fixture> = Vec::new();
-    let (db_c, _) = seed_both(
-        pulsus_testkit::test_db("pulsus_read_it_t602_record_c"),
-        &fixture_catalogue_bodies(base_ns),
-        34,
-        "t602-record-c",
-    )
-    .await;
-    let mut c: Vec<String> = CORPUS_QUERIES.iter().map(|n| corpus_query(n)).collect();
-    c.extend(CATALOGUE_QUERIES.iter().map(|q| q.to_string()));
-    c.extend(inventory_new_names().iter().map(|n| corpus_query(n)));
-    c.extend(
-        PIPELINE_SHAPES_BEYOND_THE_CORPUS
-            .iter()
-            .map(|q| q.to_string()),
-    );
-    c.sort();
-    c.dedup();
-    fixtures.push(("c", db_c, c, LIMIT_SPSS.to_vec()));
-    let (db_z, _) = seed_both(
-        pulsus_testkit::test_db("pulsus_read_it_t602_record_rz"),
-        &[fixture_rz_body(base_ns)],
-        6,
-        "t602-record-rz",
-    )
-    .await;
-    fixtures.push((
-        "rz",
-        db_z,
-        RZ_QUERIES.iter().map(|q| q.to_string()).collect(),
-        LIMIT_SPSS.to_vec(),
-    ));
-    let (db_b, _) = seed_both(
-        pulsus_testkit::test_db("pulsus_read_it_t602_record_b"),
-        &fixture_b_bodies(base_ns),
-        8,
-        "t602-record-b",
-    )
-    .await;
-    fixtures.push((
-        "b",
-        db_b,
-        B_QUERIES.iter().map(|q| q.to_string()).collect(),
-        LIMIT_SPSS.to_vec(),
-    ));
-    let (db_p, _) = seed_both(
-        pulsus_testkit::test_db("pulsus_read_it_t602_record_p"),
-        &[fixture_p_body(base_ns)],
-        3,
-        "t602-record-p",
-    )
-    .await;
-    fixtures.push((
-        "p",
-        db_p,
-        P_QUERIES.iter().map(|q| q.to_string()).collect(),
-        LIMIT_SPSS.to_vec(),
-    ));
-    let mut lines = vec!["fixture\tquery\tlimit\tspss\tanswer".to_string()];
-    for (fixture, db, queries, pairs) in &fixtures {
-        for q in queries {
-            for (limit, spss) in pairs {
-                let out = today(db, &parse_query(q), window, *limit, *spss)
-                    .await
-                    .map(normalise_today);
-                lines.push(format!(
-                    "{fixture}\t{q:?}\t{limit}\t{spss}\t{}",
-                    answer_digest(&relative_answer(&out, base_ns))
-                ));
-            }
-        }
-        drop_db(db).await;
-    }
-    let (bodies, spans) = nw_bodies(base_ns);
-    let (db_nw, _) = seed_both(
-        pulsus_testkit::test_db("pulsus_read_it_t602_record_nw"),
-        &bodies,
-        spans,
-        "t602-record-nw",
-    )
-    .await;
-    for q in NW_QUERIES {
-        let out = today(
-            &db_nw,
-            &parse_query(q),
-            (base_ns, base_ns + 60_000_000_000),
-            100,
-            100,
-        )
-        .await
-        .map(normalise_today)
-        .map_err(|e| pulsus_read::logql::ReadError::PipelineInvalid { reason: e });
-        lines.push(format!(
-            "nw\t{q:?}\t100\t100\t{}",
-            answer_digest(&numbers_of(&out))
-        ));
-    }
-    drop_db(&db_nw).await;
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(RECORDED_ANSWERS);
-    std::fs::write(&path, lines.join("\n") + "\n")
-        .unwrap_or_else(|e| panic!("write {path:?}: {e}"));
-    eprintln!("recorded {} answers", lines.len() - 1);
-}
 
 /// Section 8.3: the search statement answers as the previous engine did,
 /// as [`RECORDED_ANSWERS`] holds it.
