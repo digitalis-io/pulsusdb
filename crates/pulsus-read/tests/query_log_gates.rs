@@ -4982,6 +4982,7 @@ struct UnwrapLandingRow {
     updated_ns: i64,
     pattern: String,
     pattern_count: u64,
+    pattern_level: String,
 }
 
 fn unwrap_landing_rows(received_ms: i64, rows: &[UnwrapSeedRow]) -> Vec<UnwrapLandingRow> {
@@ -5001,6 +5002,7 @@ fn unwrap_landing_rows(received_ms: i64, rows: &[UnwrapSeedRow]) -> Vec<UnwrapLa
             updated_ns: 0,
             pattern: String::new(),
             pattern_count: 0,
+            pattern_level: String::new(),
         })
         .collect()
 }
