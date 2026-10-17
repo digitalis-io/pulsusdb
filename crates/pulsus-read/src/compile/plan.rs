@@ -18,8 +18,8 @@
 //! per part and index the repeated ones — `== phase1 generator[0] ==`,
 //! `== phase2 hydration (sample batch) ==`,
 //! `== root hydration (sample winners) ==` in
-//! `crates/pulsus-read/tests/golden/traces_search/worked_example.sql`.
-//! That file is this type drawn by hand, one case at a time.
+//! `crates/pulsus-read/tests/golden/traces_search/worked_example.sql`, which
+//! #602 part 2c-2b-1 deleted. That file was this type drawn by hand.
 
 use serde::Serialize;
 

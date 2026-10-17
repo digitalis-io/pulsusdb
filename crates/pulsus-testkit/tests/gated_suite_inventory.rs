@@ -234,11 +234,6 @@ const DELIBERATELY_UNWIRED: &[(&str, &str)] = &[
          covered by pulsus-server/tests/tls_live.rs, which does have a step.",
     ),
     (
-        "nestedset_value_differential",
-        "needs a live ClickHouse AND a pinned grafana/tempo:3.0.2 in the same job; no job \
-         runs both. It is the #185 closeout hook and runs by hand against that pair.",
-    ),
-    (
         "re2_reject_classes",
         "MIXED, and the reason is the unit rather than the suite: its four hermetic tests do \
          run, in the workspace lane, and only its one PULSUSDB_LOGQL_DIFF_URL probe does not. \

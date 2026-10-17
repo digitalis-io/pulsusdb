@@ -245,8 +245,12 @@ const CONTROL: &str = "with_binding_control.txt";
 ///
 /// **Issue #602 part 2b moves them 170 -> 171 and 457 -> 458: one
 /// `traces_spans_search` golden added, `structural_child`, one statement.**
-const SQL_FILES: usize = 171;
-const SQL_STATEMENTS: usize = 458;
+///
+/// **Issue #602 part 2c-2b-1 moves them 171 -> 96 and 458 -> 214: the 75
+/// `traces_search` goldens and their 244 statements deleted with the
+/// previous search engine's tests.**
+const SQL_FILES: usize = 96;
+const SQL_STATEMENTS: usize = 214;
 const PROMQL_ENTRIES: usize = 30;
 const PROMQL_STATEMENTS: usize = 55;
 const CONTROL_STATEMENTS: usize = 1;

@@ -2303,8 +2303,9 @@ fn reason_meaning(reason: &str) -> &'static str {
              differently for two of those occurrences"
         }
         "not_a_tracked_file" => {
-            "the citation names a throwaway probe that was never committed, which §10 records \
-             deliberately"
+            "the citation names a file the tree does not hold: a throwaway probe that was never \
+             committed, which §10 records deliberately, or a file of the previous search engine \
+             that #602 part 2c-2b deleted"
         }
         other => panic!(
             "the frozen dataset holds the reason {other:?}, which this renderer cannot explain; a \

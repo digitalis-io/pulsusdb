@@ -348,21 +348,6 @@ impl ClusterTopology {
     pub(crate) fn all_shards(&self) -> std::collections::BTreeSet<u32> {
         self.shards.clone()
     }
-
-    /// The cumulative-weight modulus of the sharding-slot map — exposed
-    /// for `traces-read`'s `cityHash64(trace_id) % total_weight` pruning
-    /// derivation strings (issue #57 AC4; same slot model, hash-valued
-    /// key).
-    pub(crate) fn total_weight(&self) -> u64 {
-        self.total_weight
-    }
-
-    /// Resolves a `system.query_log` row's hostname to its shard_num —
-    /// exposed for `traces-read`'s per-shard evidence attribution
-    /// (issue #57 AC4).
-    pub(crate) fn shard_of_hostname(&self, hostname: &str) -> Option<u32> {
-        self.hostname_to_shard.get(hostname).copied()
-    }
 }
 
 /// Validates that `macro_rows` (`(hostname, {shard} macro value)` pairs)

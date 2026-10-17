@@ -76,7 +76,7 @@ static DB: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_traces_m
 const CORPUS_SPANS: u64 = 120_000;
 /// The default MergeTree index granularity: reads quantize to whole
 /// granules of this many rows per part, so `read_rows` bounds must
-/// budget in granule multiples (issue #60 CI flake on the sibling
+/// budget in granule multiples (issue #60 CI flake on the former sibling
 /// `traces_search_explain` suite — see the gate-1 comment below).
 const GRANULE_ROWS: u64 = 8_192;
 /// The whole corpus spans 47h ending "now".

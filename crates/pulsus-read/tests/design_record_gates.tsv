@@ -1,7 +1,9 @@
 selector	krate	file	state
 every_boundary_diagram_pipeline_carries_the_three_synthesised_links	pulsus-read	crates/pulsus-read/tests/query_lowering_doc_gate.rs	exists
 every_chain_link_row_states_a_continuation	pulsus-read	crates/pulsus-read/tests/query_lowering_doc_gate.rs	exists
+every_committed_statement_binds_no_relational_cte	pulsus-read	crates/pulsus-read/tests/live_sql_corpus_ast.rs	exists
 every_cut_variant_has_a_row_in_the_design_record	pulsus-read	crates/pulsus-read/tests/query_lowering_doc_gate.rs	exists
+every_join_in_the_golden_corpus_is_named	pulsus-read	crates/pulsus-read/tests/golden_sql_freeze.rs	exists
 every_logql_stage_variant_has_a_row_in_the_lowering_document	pulsus-read	crates/pulsus-read/tests/query_lowering_doc_gate.rs	exists
 every_lql_link_variant_has_a_row_in_the_lowering_document	pulsus-read	crates/pulsus-read/tests/query_lowering_doc_gate.rs	exists
 every_traceql_chain_link_has_a_row_in_the_lowering_document	pulsus-read	crates/pulsus-read/tests/query_lowering_doc_gate.rs	exists
@@ -14,13 +16,11 @@ logql::plan::tests::exact_after_the_fold_agrees_with_has_unpushed_dropping_stage
 logql::plan::tests::the_first_residual_pipe_link_agrees_with_metric_pipeline_construct	pulsus-read	crates/pulsus-read/src/logql/plan.rs	exists
 logql::plan::tests::the_model_reproduces_compile_line_filters_ordered_predicate_list	pulsus-read	crates/pulsus-read/src/logql/plan.rs	exists
 logql::plan::tests::the_pushability_rule_matches_a_hand_written_table	pulsus-read	crates/pulsus-read/src/logql/plan.rs	exists
-no_planned_search_statement_contains_a_join	pulsus-read	crates/pulsus-read/tests/golden_sql_freeze.rs	exists
 no_such_test_name_at_all_zzz			absent
 search_settings_pin_the_layer_1_budget_contract	pulsus-read	crates/pulsus-read/src/traces/exec.rs	exists
 skip_block_conditions_are_captured_and_blocks_do_not_swallow_each_other	pulsus-read	crates/pulsus-read/tests/explain_indexes.rs	exists
 the_boundary_diagram_names_only_links_the_document_defines	pulsus-read	crates/pulsus-read/tests/query_lowering_doc_gate.rs	exists
 the_document_states_the_residual_effect_counts_the_gates_assert	pulsus-read	crates/pulsus-read/tests/query_lowering_doc_gate.rs	exists
-every_committed_statement_binds_no_relational_cte	pulsus-read	crates/pulsus-read/tests/live_sql_corpus_ast.rs	exists
 the_hops_diagram_and_the_document_agree_on_the_lowered_request	pulsus-read	crates/pulsus-read/tests/query_lowering_doc_gate.rs	exists
 the_plan_shape_json_keys_match_the_api_document	pulsus-read	crates/pulsus-read/tests/query_lowering_doc_gate.rs	exists
 the_sql_golden_corpus_has_exactly_its_committed_membership	pulsus-read	crates/pulsus-read/tests/golden_sql_freeze.rs	exists

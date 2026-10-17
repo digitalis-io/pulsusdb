@@ -242,9 +242,9 @@ pub const TRACE_METRICS_MAX_SET_BYTES: u64 = 64 * 1024 * 1024;
 /// grows without a corresponding live charge**, so every charge below is
 /// `size_of::<entry>() + RETAINED_ENTRY_OVERHEAD (+ string payloads)`.
 /// `pub` (issue #57 re-audit, visibility-only): the retention-gate drift
-/// guard in `tests/traces_search_explain.rs` derives its pre-hydration
-/// charge bound from this and [`CANDIDATE_TUPLE_BYTES`] rather than
-/// re-hardcoding them.
+/// guard in `tests/traces_search_explain.rs`, deleted by #602 part
+/// 2c-2b-1, derived its pre-hydration charge bound from this and
+/// [`CANDIDATE_TUPLE_BYTES`].
 pub const RETAINED_ENTRY_OVERHEAD: usize = 64;
 
 /// Retention charge for one merged `(trace_id, bound_ts)` tuple — the
@@ -5691,8 +5691,8 @@ mod tests {
     /// impersonating another), and the two byte-budget constants that
     /// share `ScanBudgetBytes` are provably distinct from the Layer-2
     /// retention budget, so a Layer-1 byte preempt can never impersonate
-    /// the retention-counter trip the `traces_search_explain.rs`
-    /// AC-A3 gate asserts on.
+    /// the retention-counter trip the deleted `traces_search_explain.rs`
+    /// AC-A3 gate asserted on.
     #[test]
     fn m1_every_overflow_code_maps_to_its_own_reason_and_the_budgets_are_distinct() {
         let server = |code| ChError::Server {
