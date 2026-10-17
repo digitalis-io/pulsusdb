@@ -557,3 +557,288 @@ async fn a_numbered_search_answers_over_two_shards() {
     .await;
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+/// One span of service `svc` carrying `http.route`.
+fn routed_request(
+    svc: &str,
+    trace: u8,
+    spans: Vec<(u8, u8, &str, i64, i64)>,
+    route: &str,
+) -> ExportTraceServiceRequest {
+    let kv = |k: &str, v: &str| KeyValue {
+        key: k.to_string(),
+        value: Some(AnyValue {
+            value: Some(any_value::Value::StringValue(v.to_string())),
+        }),
+        ..KeyValue::default()
+    };
+    ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: Some(Resource {
+                attributes: vec![kv("service.name", svc)],
+                dropped_attributes_count: 0,
+                entity_refs: Vec::new(),
+            }),
+            scope_spans: vec![ScopeSpans {
+                scope: Some(InstrumentationScope::default()),
+                spans: spans
+                    .into_iter()
+                    .map(|(n, parent, name, at, dur)| Span {
+                        trace_id: vec![trace; 16],
+                        span_id: id(n),
+                        parent_span_id: if parent == 0 { Vec::new() } else { id(parent) },
+                        name: name.to_string(),
+                        kind: 2,
+                        start_time_unix_nano: at as u64,
+                        end_time_unix_nano: (at + dur) as u64,
+                        attributes: vec![kv("http.route", route)],
+                        ..Span::default()
+                    })
+                    .collect(),
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    }
+}
+
+/// R14 (issue #598 part 2): over the two shards, each shard's stopped
+/// read is its newest one, and a trace-level condition reads the per-trace
+/// set across the shards (`GLOBAL IN`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stopped_tag_read_is_the_newest_on_every_shard() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db(&format!("pulsus_read_it_t598p2_cluster_{}", now_ns()));
+    let bootstrap = ChClient::new(shard1_config("default"))
+        .await
+        .expect("connect shard1");
+    exec(
+        &bootstrap,
+        &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
+    )
+    .await;
+    run_init(&bootstrap, &cluster_ctx(&db))
+        .await
+        .expect("run_init");
+    let shard1 = ChClient::new(shard1_config(&db))
+        .await
+        .expect("connect shard1");
+    let shard2 = ChClient::new(shard2_config(&db))
+        .await
+        .expect("connect shard2");
+    let now = now_ns();
+    const MIN: i64 = 60 * S;
+    for (client, svc) in [(&shard1, "a"), (&shard2, "b")] {
+        for (age, label, from, spread) in [
+            ("old", 0, now - 120 * MIN, MIN),
+            ("new", 1, now - 2 * MIN, 2 * MIN - 1),
+        ] {
+            exec(
+                client,
+                &format!(
+                    "INSERT INTO spans (trace_id, span_id, start_ns, duration_ns, service, name, \
+                     kind, attrs, end_ns, service_type) \
+                     SELECT sipHash128(number, '{svc}{label}'), \
+                     reinterpretAsFixedString(cityHash64(number, '{svc}{label}')), \
+                     {from} + intDiv(toInt64(number) * {spread}, 100000), 1000, '{svc}', \
+                     'op.{age}-{svc}', 2, \
+                     CAST('{{\"http%2Eroute\":\"/{age}-{svc}\"}}', 'JSON'), \
+                     toUInt64({from} + intDiv(toInt64(number) * {spread}, 100000) + 1000), 'string' \
+                     FROM numbers(100000)"
+                ),
+            )
+            .await;
+        }
+    }
+    let req = pulsus_read::TagValuesRequest {
+        q: Some(r#"{resource.service.name="a" || resource.service.name="b"}"#),
+        start_ns: now - 180 * MIN,
+        end_ns: now,
+    };
+    let prefix = pulsus_testkit::test_ident(&format!("t598p2_cluster_{}", now_ns()));
+    let engine = pulsus_read::TraceEngine::new(
+        ChClient::new(shard1_config(&db))
+            .await
+            .expect("connect the engine"),
+        config(),
+    )
+    .with_tag_read_rows(10_000)
+    .with_statement_prefix(&prefix);
+    let values = engine
+        .list_tag_values("http.route", Some("span"), req)
+        .await
+        .expect("the values read answers");
+    assert_eq!(
+        values
+            .values
+            .iter()
+            .map(|v| v.val.as_str())
+            .collect::<Vec<_>>(),
+        ["/new-a", "/new-b"]
+    );
+    let names = engine
+        .list_span_name_values(req)
+        .await
+        .expect("the names read answers");
+    assert_eq!(
+        names
+            .values
+            .iter()
+            .map(|v| v.val.as_str())
+            .collect::<Vec<_>>(),
+        ["op.new-a", "op.new-b"]
+    );
+    for shard in [&shard1, &shard2] {
+        exec(shard, "SYSTEM FLUSH LOGS").await;
+        let remote = count(
+            shard,
+            &format!(
+                "SELECT count() AS n FROM system.query_log WHERE type = 'QueryFinish' \
+                 AND is_initial_query = 0 AND startsWith(initial_query_id, '{prefix}-')"
+            ),
+        )
+        .await;
+        assert!(remote > 0, "every shard read its own part: {remote}");
+    }
+
+    // The trace-level condition, over the per-trace table of both shards.
+    land(
+        &shard1,
+        &routed_request(
+            "a",
+            0x5a,
+            vec![
+                (1, 0, "slow.root", now - MIN, S / 1000),
+                (2, 1, "slow.child", now - MIN + 2 * S, S / 1000),
+            ],
+            "/slow-a",
+        ),
+        "t598p2-slow",
+    )
+    .await;
+    land(
+        &shard1,
+        &routed_request(
+            "b",
+            0x5b,
+            vec![(1, 0, "fast.root", now - MIN, S / 100)],
+            "/fast-b",
+        ),
+        "t598p2-fast",
+    )
+    .await;
+    for t in ["spans_dist", "traces_dist"] {
+        exec(&shard1, &format!("SYSTEM FLUSH DISTRIBUTED {db}.{t}")).await;
+    }
+    let engine = pulsus_read::TraceEngine::new(
+        ChClient::new(shard1_config(&db))
+            .await
+            .expect("connect the engine"),
+        config(),
+    );
+    let slow = engine
+        .list_tag_values(
+            "http.route",
+            Some("span"),
+            pulsus_read::TagValuesRequest {
+                q: Some("{traceDuration > 1s}"),
+                start_ns: now - 180 * MIN,
+                end_ns: now_ns() + MIN,
+            },
+        )
+        .await
+        .expect("the trace-level read answers");
+    assert_eq!(
+        slow.values
+            .iter()
+            .map(|v| v.val.as_str())
+            .collect::<Vec<_>>(),
+        ["/slow-a"]
+    );
+    exec(
+        &bootstrap,
+        &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
+    )
+    .await;
+}
+
+/// R14's uneven case (issue #598 part 2a): one cut for the whole
+/// statement, not one per shard. Shard `a` holds only new spans and shard
+/// `b` only old ones; a cut taken per shard would list `/old-b`, shard
+/// `b`'s own newest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_cut_holds_for_every_shard() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db(&format!("pulsus_read_it_t598p2a_uneven_{}", now_ns()));
+    let bootstrap = ChClient::new(shard1_config("default"))
+        .await
+        .expect("connect shard1");
+    exec(
+        &bootstrap,
+        &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
+    )
+    .await;
+    run_init(&bootstrap, &cluster_ctx(&db))
+        .await
+        .expect("run_init");
+    let shard1 = ChClient::new(shard1_config(&db))
+        .await
+        .expect("connect shard1");
+    let shard2 = ChClient::new(shard2_config(&db))
+        .await
+        .expect("connect shard2");
+    let now = now_ns();
+    const MIN: i64 = 60 * S;
+    for (client, svc, age, from, spread) in [
+        (&shard1, "a", "new", now - 2 * MIN, 2 * MIN - 1),
+        (&shard2, "b", "old", now - 60 * MIN, MIN),
+    ] {
+        exec(
+            client,
+            &format!(
+                "INSERT INTO spans (trace_id, span_id, start_ns, duration_ns, service, name, \
+                 kind, attrs, end_ns, service_type) \
+                 SELECT sipHash128(number, '{svc}'), \
+                 reinterpretAsFixedString(cityHash64(number, '{svc}')), \
+                 {from} + intDiv(toInt64(number) * {spread}, 100000), 1000, '{svc}', \
+                 'op.{age}-{svc}', 2, \
+                 CAST('{{\"http%2Eroute\":\"/{age}-{svc}\"}}', 'JSON'), \
+                 toUInt64({from} + intDiv(toInt64(number) * {spread}, 100000) + 1000), 'string' \
+                 FROM numbers(100000)"
+            ),
+        )
+        .await;
+    }
+    let engine = pulsus_read::TraceEngine::new(
+        ChClient::new(shard1_config(&db))
+            .await
+            .expect("connect the engine"),
+        config(),
+    )
+    .with_tag_read_rows(10_000);
+    let values = engine
+        .list_tag_values(
+            "http.route",
+            Some("span"),
+            pulsus_read::TagValuesRequest {
+                q: Some(r#"{resource.service.name="a" || resource.service.name="b"}"#),
+                start_ns: now - 180 * MIN,
+                end_ns: now,
+            },
+        )
+        .await
+        .expect("the values read answers");
+    assert_eq!(
+        values
+            .values
+            .iter()
+            .map(|v| v.val.as_str())
+            .collect::<Vec<_>>(),
+        ["/new-a"]
+    );
+    exec(
+        &bootstrap,
+        &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
+    )
+    .await;
+}

@@ -212,12 +212,10 @@ fn differs(case: &Case) -> bool {
 
 /// Every ledger id THIS PLAN introduces or extends. A literal, so a row
 /// that stops being referenced fails rather than quietly rotting.
-const PLAN_LEDGER_IDS: [&str; 9] = [
+const PLAN_LEDGER_IDS: [&str; 7] = [
     "traceql-tag-values-q-lenient-parse-not-reproduced",
-    "traceql-tag-values-q-partial-pushdown",
     "traceql-tag-values-unscoped-attr-narrows-here",
     "traceql-tag-values-requested-tag-condition-applied",
-    "traceql-tag-values-window-is-day-granular",
     "traceql-tag-values-span-name-byte-cap",
     "traceql-tag-values-range-error-text",
     "traceql-tag-values-narrowed-set-complete-here",

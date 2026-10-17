@@ -1535,3 +1535,270 @@ async fn the_narrowed_tag_values_read_still_refuses_an_oversized_in_set() {
 
     exec(&admin, &format!("DROP DATABASE IF EXISTS {SET_DB}")).await;
 }
+// ============================================================================
+// Issue #598 part 2a: the span-store reads test the newest whole buckets
+// holding the window's newest `R` spans (R10, R11).
+// ============================================================================
+
+/// Now, in nanoseconds.
+fn now_ns() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos(),
+    )
+    .expect("fits i64")
+}
+
+/// A fresh database for one store-read test, its name timestamped
+/// (`system.query_log` outlives a database).
+async fn store_db(label: &str) -> (ChClient, String, ChClient) {
+    let db = pulsus_testkit::test_db(&format!("pulsus_traces_tags_store_it_{label}_{}", now_ns()));
+    let admin = ChClient::new(test_config()).await.expect("connect");
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {db}")).await;
+    run_init(&admin, &test_ctx(&db)).await.expect("run_init");
+    let client = store_client(&db).await;
+    (admin, db, client)
+}
+
+/// A client whose default database is `db`.
+async fn store_client(db: &str) -> ChClient {
+    let mut cfg = test_config();
+    cfg.database = db.to_string();
+    ChClient::new(cfg).await.expect("connect data client")
+}
+
+/// `count` spans of service `s1` named `name`, each with `http.route`
+/// taken from `route` (an SQL expression over `number`), starting from
+/// `from_ns` and spread across `spread_ns`.
+#[allow(clippy::too_many_arguments)]
+async fn seed_store_spans(
+    client: &ChClient,
+    db: &str,
+    tag: &str,
+    count: u64,
+    from_ns: i64,
+    spread_ns: i64,
+    name: &str,
+    route: &str,
+) {
+    exec(
+        client,
+        &format!(
+            "INSERT INTO {db}.spans (trace_id, span_id, start_ns, duration_ns, service, name, \
+             kind, attrs, end_ns, service_type) \
+             SELECT sipHash128(number, '{tag}'), reinterpretAsFixedString(cityHash64(number, '{tag}')), \
+             {from_ns} + intDiv(toInt64(number) * {spread_ns}, {count}), 1000, 's1', '{name}', 2, \
+             CAST(concat('{{\"http%2Eroute\":\"', {route}, '\"}}'), 'JSON'), \
+             toUInt64({from_ns} + intDiv(toInt64(number) * {spread_ns}, {count}) + 1000), 'string' \
+             FROM numbers({count})"
+        ),
+    )
+    .await;
+}
+
+fn store_config() -> TraceReadConfig {
+    TraceReadConfig {
+        scan_budget_rows: 50_000_000,
+        ..tight_budget_config()
+    }
+}
+
+fn store_request(start_ns: i64, end_ns: i64) -> pulsus_read::TagValuesRequest<'static> {
+    pulsus_read::TagValuesRequest {
+        q: Some(r#"{resource.service.name="s1"}"#),
+        start_ns,
+        end_ns,
+    }
+}
+
+/// R10: the read tests the newest whole buckets holding the window's
+/// newest `R` spans, across every part: the newest 100,000 spans hold every
+/// value it lists.
+#[tokio::test]
+async fn a_stopped_read_is_the_newest_one() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    const MIN: i64 = 60_000_000_000;
+    let (admin, db, client) = store_db("newest").await;
+    let now = now_ns();
+    seed_store_spans(
+        &client,
+        &db,
+        "old",
+        100_000,
+        now - 120 * MIN,
+        MIN,
+        "op.old",
+        "'/old'",
+    )
+    .await;
+    seed_store_spans(
+        &client,
+        &db,
+        "new",
+        100_000,
+        now - 2 * MIN,
+        MIN,
+        "op.new",
+        "'/new'",
+    )
+    .await;
+    let req = store_request(now - 180 * MIN, now);
+    for (rows, routes, names) in [
+        (10_000u64, vec!["/new"], vec!["op.new"]),
+        (1_000_000, vec!["/new", "/old"], vec!["op.new", "op.old"]),
+    ] {
+        let engine =
+            TraceEngine::new(store_client(&db).await, store_config()).with_tag_read_rows(rows);
+        let values = engine
+            .list_tag_values("http.route", Some("span"), req)
+            .await
+            .expect("the values read answers");
+        assert_eq!(
+            values
+                .values
+                .iter()
+                .map(|v| v.val.as_str())
+                .collect::<Vec<_>>(),
+            routes,
+            "values at a ceiling of {rows}"
+        );
+        assert!(!values.truncated, "a stopped read is not flagged");
+        let names_read = engine
+            .list_span_name_values(req)
+            .await
+            .expect("the names read answers");
+        assert_eq!(
+            names_read
+                .values
+                .iter()
+                .map(|v| v.val.as_str())
+                .collect::<Vec<_>>(),
+            names,
+            "names at a ceiling of {rows}"
+        );
+        assert!(!names_read.truncated, "a stopped read is not flagged");
+    }
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {db}")).await;
+
+    // The same across twelve parts, merges stopped: eleven parts of old
+    // spans an hour apart, then one part of new ones.
+    let (admin, db, client) = store_db("parts").await;
+    exec(&admin, &format!("SYSTEM STOP MERGES {db}.spans")).await;
+    let now = now_ns();
+    for i in 0..11i64 {
+        seed_store_spans(
+            &client,
+            &db,
+            &format!("old{i}"),
+            10_000,
+            now - (13 - i) * 60 * MIN,
+            MIN,
+            "op.old",
+            "'/old'",
+        )
+        .await;
+    }
+    seed_store_spans(
+        &client,
+        &db,
+        "new",
+        100_000,
+        now - 2 * MIN,
+        MIN,
+        "op.new",
+        "'/new'",
+    )
+    .await;
+    let engine =
+        TraceEngine::new(store_client(&db).await, store_config()).with_tag_read_rows(10_000);
+    let req = store_request(now - 14 * 60 * MIN, now);
+    let values = engine
+        .list_tag_values("http.route", Some("span"), req)
+        .await
+        .expect("the values read answers");
+    assert_eq!(
+        values
+            .values
+            .iter()
+            .map(|v| v.val.as_str())
+            .collect::<Vec<_>>(),
+        ["/new"],
+        "twelve parts"
+    );
+    let names_read = engine
+        .list_span_name_values(req)
+        .await
+        .expect("the names read answers");
+    assert_eq!(
+        names_read
+            .values
+            .iter()
+            .map(|v| v.val.as_str())
+            .collect::<Vec<_>>(),
+        ["op.new"],
+        "twelve parts"
+    );
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {db}")).await;
+}
+
+/// R11: the cut reads the newest buckets only. Three buckets ten minutes
+/// apart hold 50,000 spans each; at a ceiling of 10,000 the read lists
+/// the newest bucket's route and reads well below all three.
+#[tokio::test]
+async fn the_cut_reads_the_newest_buckets() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    const MIN: i64 = 60_000_000_000;
+    const BUCKET: i64 = 300_000_000_000;
+    let (admin, db, client) = store_db("buckets").await;
+    let now = now_ns();
+    let b0 = (now - 6 * MIN).div_euclid(BUCKET) * BUCKET;
+    for (i, route) in ["'/b0'", "'/b1'", "'/b2'"].into_iter().enumerate() {
+        seed_store_spans(
+            &client,
+            &db,
+            &format!("b{i}"),
+            50_000,
+            b0 - i as i64 * 10 * MIN,
+            MIN,
+            "op",
+            route,
+        )
+        .await;
+    }
+    let prefix = pulsus_testkit::test_ident(&format!("t598p2a_cut_{}", now_ns()));
+    let engine = TraceEngine::new(store_client(&db).await, store_config())
+        .with_tag_read_rows(10_000)
+        .with_statement_prefix(&prefix);
+    let values = engine
+        .list_tag_values(
+            "http.route",
+            Some("span"),
+            store_request(now - 3 * 60 * MIN, now),
+        )
+        .await
+        .expect("the values read answers");
+    assert_eq!(
+        values
+            .values
+            .iter()
+            .map(|v| v.val.as_str())
+            .collect::<Vec<_>>(),
+        ["/b0"]
+    );
+    assert!(!values.truncated, "a stopped read is not flagged");
+    exec(&admin, "SYSTEM FLUSH LOGS").await;
+    let read = read_rows_by_id(&admin, &format!("{prefix}-1")).await;
+    assert!(
+        read < 150_000,
+        "the cut read below all three buckets: {read} rows read"
+    );
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {db}")).await;
+}

@@ -39,7 +39,7 @@
 
 use pulsus_read::traces::metrics_plan::{MetricsCtx, MetricsParams, plan_trace_metrics};
 use pulsus_read::traces::spans::search::plan_statement_sliced;
-use pulsus_read::traces::tags_sql::{DaySpan, span_name_values_sql};
+use pulsus_read::traces::spans::tags::{TagNarrowing, name_values_sql, narrowing_from_query};
 use pulsus_read::traces::{GraphWindow, SERVICE_GRAPH_MAX_EDGES, service_graph_sql};
 use pulsus_read::{SearchParams, StatementTables, plan_search_request};
 use pulsus_read::{SpanFilterCtx, TAG_VALUES_MAX};
@@ -134,10 +134,22 @@ fn fetch_statement() -> String {
 }
 
 fn tag_values_statement() -> String {
-    span_name_values_sql(
-        filter_ctx(),
-        DaySpan::from_window(START_NS, END_NS),
-        &[],
+    let w = pulsus_read::traces::window_sql::WindowSql::start_closed_end_open(START_NS, END_NS);
+    let narrowing_with_one_term: TagNarrowing = narrowing_from_query(
+        r#"{span.a="x"}"#,
+        &pulsus_read::traces::spans::predicate::PredicateCtx {
+            window: w,
+            spans_table: "spans",
+            resources_table: "resources",
+            indexed: &[],
+        },
+    );
+    name_values_sql(
+        "spans",
+        "traces",
+        w,
+        &narrowing_with_one_term,
+        10_000,
         TAG_VALUES_MAX + 1,
     )
 }
@@ -209,23 +221,17 @@ fn every_request_window_renders_the_one_half_open_bound() {
         }
     }
 
-    // -- the tag-value read: no row bound, and the day span the request
-    //    touches. Deferred to issue #598, which gives it the row bound
-    //    against the statement whose cost is measured.
+    // -- the tag-value read (issue #598 part 2): the window's own
+    //    half-open bound on `spans.start_ns`, and no `timestamp_ns`.
     let tag_values = tag_values_statement();
-    if tag_values.contains("timestamp_ns >") || tag_values.contains("timestamp_ns <") {
+    if !tag_values.contains(&span_bound) {
         wrong.push(format!(
-            "tag-value read: the store-backed read is day-granular until issue #598; a row \
-             bound here is that task's, and it moves this case rather than editing it:\n\
-             {tag_values}"
+            "tag-value read: expected `{span_bound}`:\n{tag_values}"
         ));
     }
-    let day_span = "toDate(fromUnixTimestamp64Nano(timestamp_ns)) >= toDate('2023-11-14') \
-                    AND toDate(fromUnixTimestamp64Nano(timestamp_ns)) <= toDate('2023-11-15')";
-    if !tag_values.contains(day_span) {
+    if tag_values.contains("timestamp_ns") {
         wrong.push(format!(
-            "tag-value read: expected the day span the window touches, `{day_span}`:\n\
-             {tag_values}"
+            "tag-value read: the span-store read names no `timestamp_ns`:\n{tag_values}"
         ));
     }
 

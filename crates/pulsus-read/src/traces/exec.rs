@@ -663,6 +663,11 @@ impl TraceEngine {
         }
     }
 
+    /// Tests-first stub (issue #598 part 2a).
+    pub fn with_tag_read_rows(self, _rows: u64) -> Self {
+        self
+    }
+
     /// Stamps every statement this engine issues with
     /// `<prefix>-<n>`, `n` counting from 1 in issue order (issue #587).
     ///
@@ -2130,6 +2135,36 @@ fn search_settings(config: &TraceReadConfig) -> QuerySettings {
 /// lookup with no scope) aborts loud at `422` rather than serving a slow
 /// unbounded scan; scoped reads that prune to a small partition stay
 /// under budget and return `200` as before.
+/// Tests-first stub (issue #598 part 2a).
+#[cfg(test)]
+fn tag_store_settings(_config: &TraceReadConfig) -> QuerySettings {
+    QuerySettings::new()
+}
+
+/// Tests-first stub (issue #598 part 2a).
+#[cfg(test)]
+fn tag_values_statement(
+    _config: &TraceReadConfig,
+    _ceiling: u64,
+    _scope: Option<&str>,
+    _key: &str,
+    _w: super::window_sql::WindowSql,
+    _n: &super::spans::tags::TagNarrowing,
+) -> String {
+    String::new()
+}
+
+/// Tests-first stub (issue #598 part 2a).
+#[cfg(test)]
+fn span_names_statement(
+    _config: &TraceReadConfig,
+    _ceiling: u64,
+    _w: super::window_sql::WindowSql,
+    _n: &super::spans::tags::TagNarrowing,
+) -> String {
+    String::new()
+}
+
 fn catalog_settings(config: &TraceReadConfig) -> QuerySettings {
     QuerySettings::new()
         .set("max_rows_to_read", config.scan_budget_rows)
@@ -3874,6 +3909,108 @@ mod tests {
             !rendered.contains("optimize_skip_unused_shards"),
             "unclustered engines must not carry the §7 settings"
         );
+    }
+
+    fn tag_narrowing(
+        q: &str,
+        w: super::super::window_sql::WindowSql,
+    ) -> super::super::spans::tags::TagNarrowing {
+        super::super::spans::tags::narrowing_from_query(
+            q,
+            &super::super::spans::predicate::PredicateCtx {
+                window: w,
+                spans_table: "spans",
+                resources_table: "resources",
+                indexed: &[],
+            },
+        )
+    }
+
+    /// U6 (issue #598 part 2a): `R` is sized from the budget and the
+    /// statement's table reads, and the store reads keep the scan budget's
+    /// `throw` as a backstop, bound memory by a distinct cap, and pin
+    /// `max_threads`.
+    #[test]
+    fn tag_store_settings_bound_rows_and_memory() {
+        use crate::traces::spans::tags::{TagShape, ValueScope, cut_rows, table_reads};
+        for (k, want) in [
+            (2, 10_000_000),
+            (3, 8_333_333),
+            (4, 6_250_000),
+            (5, 5_000_000),
+        ] {
+            assert_eq!(cut_rows(10_000_000, 50_000_000, k), want, "k = {k}");
+        }
+        assert_eq!(cut_rows(10_000_000, 1, 2), 1);
+        assert_eq!(cut_rows(10_000, 50_000_000, 2), 10_000);
+        let w = super::super::window_sql::WindowSql::start_closed_end_open(
+            1_700_000_000_000_000_000,
+            1_700_003_600_000_000_000,
+        );
+        let none = tag_narrowing(r#"{span.a="x"}"#, w);
+        let trace = tag_narrowing("{traceDuration > 1s}", w);
+        assert_eq!(table_reads(TagShape::Names, &none), 2);
+        assert_eq!(table_reads(TagShape::Values(ValueScope::Span), &none), 2);
+        assert_eq!(
+            table_reads(TagShape::Values(ValueScope::Resource), &none),
+            2
+        );
+        assert_eq!(
+            table_reads(TagShape::Values(ValueScope::Unscoped), &none),
+            3
+        );
+        assert_eq!(table_reads(TagShape::Values(ValueScope::Span), &trace), 4);
+        assert_eq!(
+            table_reads(TagShape::Values(ValueScope::Unscoped), &trace),
+            5
+        );
+        let config = cfg();
+        let s = tag_store_settings(&config);
+        assert_eq!(
+            s.get("max_rows_to_read"),
+            Some(config.scan_budget_rows.to_string().as_str())
+        );
+        assert_eq!(s.get("read_overflow_mode"), Some("throw"));
+        assert_eq!(s.get("max_rows_in_distinct"), Some("10000"));
+        assert_eq!(s.get("distinct_overflow_mode"), Some("break"));
+        assert_eq!(s.get("max_threads"), Some("4"));
+        assert_eq!(s.get("distributed_product_mode"), None);
+    }
+
+    /// U8 (issue #598 part 2a): the cut size the statement functions
+    /// compute reaches the statement.
+    #[test]
+    fn the_cut_size_reaches_the_statement() {
+        let w = super::super::window_sql::WindowSql::start_closed_end_open(
+            1_700_000_000_000_000_000,
+            1_700_003_600_000_000_000,
+        );
+        let mut config = cfg();
+        config.scan_budget_rows = 1_200_000;
+        let ceiling = crate::traces::spans::tags::TAG_STORE_READ_ROWS;
+        let span_a = tag_narrowing(r#"{span.a="x"}"#, w);
+        let mixed = tag_narrowing(r#"{traceDuration > 1s && span.a="x"}"#, w);
+        let cases = [
+            (
+                span_names_statement(&config, ceiling, w, &span_a),
+                "LIMIT 300000)) AS cut",
+            ),
+            (
+                tag_values_statement(&config, ceiling, None, "http.route", w, &span_a),
+                "LIMIT 200000)) AS cut",
+            ),
+            (
+                tag_values_statement(&config, ceiling, Some("span"), "http.route", w, &mixed),
+                "LIMIT 150000)) AS cut",
+            ),
+        ];
+        let mut wide = cfg();
+        wide.scan_budget_rows = 50_000_000;
+        let last = span_names_statement(&wide, 10_000, w, &span_a);
+        for (sql, want) in cases.iter().chain([(last, "LIMIT 10000)) AS cut")].iter()) {
+            assert!(sql.contains(want), "want {want}: {sql}");
+            assert!(!sql.contains("LIMIT 10000000)"), "a fixed R: {sql}");
+        }
     }
 
     #[test]

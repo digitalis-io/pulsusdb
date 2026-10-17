@@ -5354,3 +5354,555 @@ async fn the_benchmark_tag_shapes_answer_within_4_kib() {
         }
     }
 }
+
+// ---------------------------------------------------------------------
+// Issue #598 part 2: narrowed values and span names from the span store.
+// ---------------------------------------------------------------------
+
+/// The values a tag-values route answers, in order.
+fn values_at(port: u16, path: &str, ctx: &str) -> Vec<String> {
+    let res = get(port, path, ctx);
+    assert_eq!(
+        res.status,
+        200,
+        "{ctx}: {path} body {:?}",
+        String::from_utf8_lossy(&res.body)
+    );
+    res.json(ctx)["tagValues"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{ctx}: {path} has no tagValues"))
+        .iter()
+        .map(|v| v["value"].as_str().expect("a value").to_string())
+        .collect()
+}
+
+/// `(type, value)` of each value a tag-values route answers.
+fn typed_values_at(port: u16, path: &str, ctx: &str) -> Vec<(String, String)> {
+    let res = get(port, path, ctx);
+    assert_eq!(res.status, 200, "{ctx}: {path}");
+    res.json(ctx)["tagValues"]
+        .as_array()
+        .expect("tagValues")
+        .iter()
+        .map(|v| {
+            (
+                v["type"].as_str().expect("a type").to_string(),
+                v["value"].as_str().expect("a value").to_string(),
+            )
+        })
+        .collect()
+}
+
+fn strs(xs: &[&str]) -> Vec<String> {
+    xs.iter().map(|x| x.to_string()).collect()
+}
+
+/// One attribute holding `value`.
+fn kv_val(key: &str, value: Value) -> KeyValue {
+    KeyValue {
+        key: key.to_string(),
+        value: Some(AnyValue { value: Some(value) }),
+        key_strindex: 0,
+    }
+}
+
+/// R1 (T-T6): the span-name list keeps `[start, end)` exactly.
+#[tokio::test(flavor = "multi_thread")]
+async fn name_values_keep_the_window_at_every_edge() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_269;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_traces_api_v2_it_tt6")).await;
+    let _server = spawn_ready(port, &db);
+    let d = seed_fixture_b(port) / 1_000_000_000;
+    for (start, end, want) in [
+        (
+            d + 3_600,
+            d + 86_400,
+            strs(&["gw.call", "op.b1", "op.b2", "op.b4"]),
+        ),
+        (d + 3_601, d + 59_647, strs(&["gw.call", "op.b1"])),
+        (d + 59_646, d + 59_647, strs(&["gw.call", "op.b1"])),
+        (d + 59_647, d + 59_648, Vec::new()),
+    ] {
+        let path = format!("/api/v2/search/tag/name/values?start={start}&end={end}");
+        assert_eq!(values_at(port, &path, "T-T6"), want, "T-T6: {path}");
+    }
+}
+
+/// R2 (T-B7): a narrowed value list keeps the window.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_narrowed_value_list_keeps_the_window() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_270;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_traces_api_v2_it_tb7")).await;
+    let _server = spawn_ready(port, &db);
+    let d = seed_fixture_b(port) / 1_000_000_000;
+    let path = format!(
+        "/api/v2/search/tag/span.http.route/values?q={}&start={}&end={}",
+        enc(r#"{span.tenant="t1"}"#),
+        d + 3_600,
+        d + 86_400
+    );
+    assert_eq!(values_at(port, &path, "T-B7"), strs(&["/inside"]));
+}
+
+/// R3 and R12: every scope's values from the store, narrowed by any
+/// conjunct the search route compiles, `||` and `!` included.
+#[tokio::test(flavor = "multi_thread")]
+async fn narrowed_values_read_every_scope_from_the_store() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_271;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_traces_api_v2_it_scopes")).await;
+    let _server = spawn_ready(port, &db);
+    let t = day_start_ns() + 3_600_000_000_000;
+    let one = |svc: &str, region: Option<&str>, build: Option<&str>, span: Span| {
+        let mut attributes = vec![kv_str("service.name", svc)];
+        if let Some(r) = region {
+            attributes.push(kv_str("region", r));
+        }
+        ResourceSpans {
+            resource: Some(Resource {
+                attributes,
+                ..Default::default()
+            }),
+            scope_spans: vec![ScopeSpans {
+                scope: Some(InstrumentationScope {
+                    name: "lib".to_string(),
+                    attributes: build
+                        .map(|b| vec![kv_str("lib.build", b)])
+                        .unwrap_or_default(),
+                    ..Default::default()
+                }),
+                spans: vec![span],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }
+    };
+    let full = |trace: u8,
+                name: &str,
+                route: &str,
+                tags: &[&str],
+                code: i64,
+                exc: &str,
+                peer: &str,
+                flag: bool| Span {
+        trace_id: vec![trace; 16],
+        span_id: vec![trace; 8],
+        name: name.to_string(),
+        kind: SpanKind::Server as i32,
+        start_time_unix_nano: t as u64,
+        end_time_unix_nano: (t + 1_000_000) as u64,
+        attributes: vec![
+            kv_str("http.route", route),
+            kv_val(
+                "tags",
+                Value::ArrayValue(ArrayValue {
+                    values: tags
+                        .iter()
+                        .map(|x| AnyValue {
+                            value: Some(Value::StringValue(x.to_string())),
+                        })
+                        .collect(),
+                }),
+            ),
+            kv_val("code", Value::IntValue(code)),
+            kv_val("flag", Value::BoolValue(flag)),
+        ],
+        events: vec![Event {
+            time_unix_nano: t as u64,
+            name: "exception".to_string(),
+            attributes: vec![kv_str("exception.type", exc)],
+            dropped_attributes_count: 0,
+        }],
+        links: vec![Link {
+            trace_id: vec![0x11; 16],
+            span_id: vec![0x22; 8],
+            attributes: vec![kv_str("peer", peer)],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let auth = Span {
+        trace_id: vec![0xe3; 16],
+        span_id: vec![0xe3; 8],
+        name: "op.auth".to_string(),
+        kind: SpanKind::Server as i32,
+        start_time_unix_nano: t as u64,
+        end_time_unix_nano: (t + 1_000_000) as u64,
+        attributes: vec![kv_str("http.route", "/c")],
+        ..Default::default()
+    };
+    push(
+        port,
+        vec![
+            one(
+                "cart",
+                Some("eu"),
+                Some("r1"),
+                full(0xe1, "op.cart", "/a", &["x", "y"], 7, "E1", "p1", true),
+            ),
+            one(
+                "pay",
+                Some("us"),
+                Some("r2"),
+                full(0xe2, "op.pay", "/b", &["z"], 8, "E2", "p2", false),
+            ),
+            one("auth", None, None, auth),
+        ],
+        "scopes",
+    );
+    let range = format!(
+        "&start={}&end={}",
+        t / 1_000_000_000 - 60,
+        t / 1_000_000_000 + 60
+    );
+    let at = |tag: &str, q: &str| {
+        values_at(
+            port,
+            &format!("/api/v2/search/tag/{tag}/values?q={}{range}", enc(q)),
+            &format!("scopes {tag} {q}"),
+        )
+    };
+    let cart = r#"{resource.service.name="cart"}"#;
+    // Guards.
+    assert_eq!(at("span.http.route", cart), strs(&["/a"]));
+    assert_eq!(
+        typed_values_at(
+            port,
+            &format!("/api/v2/search/tag/span.code/values?q={}{range}", enc(cart)),
+            "scopes span.code"
+        ),
+        vec![("int".to_string(), "7".to_string())]
+    );
+    assert_eq!(at("instrumentation.lib.build", cart), strs(&["r1"]));
+    assert_eq!(at("event.exception.type", cart), strs(&["E1"]));
+    assert_eq!(at("link.peer", cart), strs(&["p1"]));
+    assert_eq!(at("resource.region", cart), strs(&["eu"]));
+    assert_eq!(at("http.route", cart), strs(&["/a"]));
+    assert_eq!(
+        at("resource.service.name", r#"{span.http.route="/b"}"#),
+        strs(&["pay"])
+    );
+    assert_eq!(
+        at("name", r#"{resource.service.name="pay"}"#),
+        strs(&["op.pay"])
+    );
+    assert_eq!(
+        at("span.http.route", r#"{resource.region="us"}"#),
+        strs(&["/b"])
+    );
+    assert_eq!(
+        at(
+            "span.http.route",
+            r#"{resource.service.name="cart" && span:childCount > 0}"#
+        ),
+        strs(&["/a"])
+    );
+    // Red on main.
+    assert_eq!(at("span.tags", cart), strs(&["x", "y"]));
+    assert_eq!(
+        at(
+            "span.http.route",
+            r#"{resource.service.name="cart" || resource.service.name="pay"}"#
+        ),
+        strs(&["/a", "/b"])
+    );
+    assert_eq!(
+        at("span.http.route", r#"{span.http.route!="/a"}"#),
+        strs(&["/b", "/c"])
+    );
+    // R12: `!`, and the demand of a `!` over a value that is not a boolean.
+    assert_eq!(at("span.http.route", r#"{!span.flag}"#), strs(&["/b"]));
+    for q in [
+        r#"{!span.http.route}"#,
+        r#"{span.http.route="/zzz" && !span.http.route}"#,
+    ] {
+        let res = request(
+            port,
+            "GET",
+            &format!(
+                "/api/v2/search/tag/span.http.route/values?q={}{range}",
+                enc(q)
+            ),
+            None,
+            &[],
+        )
+        .expect("R12: reachable");
+        let body = String::from_utf8_lossy(&res.body).to_string();
+        assert_eq!(res.status, 400, "R12 {q}: {body}");
+        assert!(
+            body.contains("expression (!span.http.route) expected a boolean"),
+            "R12 {q}: {body}"
+        );
+    }
+}
+
+/// R13: with no range, the reads cover the last 20 minutes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_without_a_range_reads_the_last_twenty_minutes() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_272;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_traces_api_v2_it_lookback")).await;
+    let _server = spawn_ready(port, &db);
+    let now = now_ns();
+    const MIN: i64 = 60_000_000_000;
+    let at = |id: u8, name: &str, route: &str, ago: i64| Span {
+        trace_id: vec![id; 16],
+        span_id: vec![id; 8],
+        name: name.to_string(),
+        kind: SpanKind::Server as i32,
+        start_time_unix_nano: (now - ago) as u64,
+        end_time_unix_nano: (now - ago + 1_000_000) as u64,
+        attributes: vec![kv_str("http.route", route)],
+        ..Default::default()
+    };
+    ingest(
+        port,
+        "cart",
+        vec![
+            at(0xa1, "op.older", "/older", 30 * MIN),
+            at(0xa2, "op.mid", "/mid", 17 * MIN),
+            at(0xa3, "op.recent", "/recent", MIN),
+        ],
+        "lookback",
+    );
+    let cart = enc(r#"{resource.service.name="cart"}"#);
+    assert_eq!(
+        values_at(port, "/api/v2/search/tag/name/values", "lookback"),
+        strs(&["op.mid", "op.recent"])
+    );
+    assert_eq!(
+        values_at(
+            port,
+            &format!("/api/v2/search/tag/span.http.route/values?q={cart}"),
+            "lookback"
+        ),
+        strs(&["/mid", "/recent"])
+    );
+    let range = format!(
+        "start={}&end={}",
+        (now - 60 * MIN) / 1_000_000_000,
+        (now + MIN) / 1_000_000_000
+    );
+    assert_eq!(
+        values_at(
+            port,
+            &format!("/api/v2/search/tag/name/values?{range}"),
+            "lookback"
+        ),
+        strs(&["op.mid", "op.older", "op.recent"])
+    );
+    assert_eq!(
+        values_at(
+            port,
+            &format!("/api/v2/search/tag/span.http.route/values?q={cart}&{range}"),
+            "lookback"
+        ),
+        strs(&["/mid", "/older", "/recent"])
+    );
+}
+
+/// R15: a body whose conjuncts all drop still keeps the window.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_conjunct_keeps_the_window() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_273;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_traces_api_v2_it_dropped")).await;
+    let _server = spawn_ready(port, &db);
+    let d = seed_fixture_b(port) / 1_000_000_000;
+    let q = enc(r#"{span:childCount > 0}"#);
+    let range = format!("start={}&end={}", d + 3_600, d + 86_400);
+    assert_eq!(
+        values_at(
+            port,
+            &format!("/api/v2/search/tag/span.http.route/values?q={q}&{range}"),
+            "dropped"
+        ),
+        strs(&["/inside"])
+    );
+    assert_eq!(
+        values_at(
+            port,
+            &format!("/api/v2/search/tag/name/values?q={q}&{range}"),
+            "dropped"
+        ),
+        strs(&["gw.call", "op.b1", "op.b2", "op.b4"])
+    );
+}
+
+/// R16: a trace-level condition narrows, through the per-trace table, the
+/// whole trace's duration even across a UTC midnight.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_trace_duration_condition_narrows() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_274;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db(
+        "pulsus_traces_api_v2_it_tracelevel",
+    ))
+    .await;
+    let _server = spawn_ready(port, &db);
+    const S: i64 = 1_000_000_000;
+    let now = now_ns();
+    let t = now - 120 * S;
+    let mut b = now.div_euclid(NS_PER_DAY) * NS_PER_DAY;
+    if now - b < 60 * S {
+        b -= NS_PER_DAY;
+    }
+    let sp = |trace: u8,
+              id: u8,
+              parent: Option<u8>,
+              name: &str,
+              start: i64,
+              dur: i64,
+              route: Option<&str>| Span {
+        trace_id: vec![trace; 16],
+        span_id: vec![id; 8],
+        parent_span_id: parent.map(|p| vec![p; 8]).unwrap_or_default(),
+        name: name.to_string(),
+        kind: SpanKind::Server as i32,
+        start_time_unix_nano: start as u64,
+        end_time_unix_nano: (start + dur) as u64,
+        attributes: route
+            .map(|r| vec![kv_str("http.route", r)])
+            .unwrap_or_default(),
+        ..Default::default()
+    };
+    ingest(
+        port,
+        "checkout",
+        vec![
+            sp(0xf1, 1, None, "slow.root", t, 1_000_000, Some("/slow")),
+            sp(
+                0xf1,
+                2,
+                Some(1),
+                "slow.child",
+                t + 2 * S,
+                1_000_000,
+                Some("/slow"),
+            ),
+        ],
+        "f1",
+    );
+    ingest(
+        port,
+        "cart",
+        vec![sp(0xf2, 1, None, "fast.root", t, 10_000_000, Some("/fast"))],
+        "f2",
+    );
+    ingest(
+        port,
+        "checkout",
+        vec![
+            sp(
+                0xf3,
+                1,
+                None,
+                "old.root",
+                now - 25 * 3_600 * S,
+                1_000_000,
+                Some("/stale"),
+            ),
+            sp(
+                0xf3,
+                2,
+                Some(1),
+                "old.child",
+                now - 25 * 3_600 * S + 3 * S,
+                1_000_000,
+                Some("/stale"),
+            ),
+        ],
+        "f3",
+    );
+    ingest(
+        port,
+        "checkout",
+        vec![sp(0xf4, 1, None, "edge.root", b - S, 1_000_000, None)],
+        "f4 root",
+    );
+    ingest(
+        port,
+        "checkout",
+        vec![sp(
+            0xf4,
+            2,
+            Some(1),
+            "edge.child",
+            b + S,
+            1_000_000,
+            Some("/edge"),
+        )],
+        "f4 child",
+    );
+    // The precondition: two per-trace rows, one per day.
+    let name = db.to_string();
+    let days = scalar_of(
+        &name,
+        &format!(
+            "SELECT toString(groupArray(d)) AS s FROM (SELECT toString(day) AS d FROM {name}.traces \
+             WHERE trace_id = unhex('{}') GROUP BY day ORDER BY day)",
+            "f4".repeat(16)
+        ),
+    )
+    .await;
+    let date = |ns: i64| {
+        chrono::DateTime::from_timestamp(ns.div_euclid(S), 0)
+            .expect("a date")
+            .format("%Y-%m-%d")
+            .to_string()
+    };
+    assert_eq!(days, format!("['{}','{}']", date(b - NS_PER_DAY), date(b)));
+    let at = |tag: &str, q: &str, range: &str| {
+        values_at(
+            port,
+            &format!("/api/v2/search/tag/{tag}/values?q={}{range}", enc(q)),
+            &format!("tracelevel {tag} {q} {range}"),
+        )
+    };
+    let route = "span.http.route";
+    assert_eq!(at(route, "{traceDuration > 1s}", ""), strs(&["/slow"]));
+    assert_eq!(at(route, "{traceDuration < 1s}", ""), strs(&["/fast"]));
+    assert_eq!(
+        at(route, r#"{rootName = "slow.root"}"#, ""),
+        strs(&["/slow"])
+    );
+    assert_eq!(
+        at(route, r#"{rootServiceName = "checkout"}"#, ""),
+        strs(&["/slow"])
+    );
+    let recent = format!("&start={}&end={}", (now - 600 * S) / S, (now + 60 * S) / S);
+    assert_eq!(at(route, "{traceDuration > 1s}", &recent), strs(&["/slow"]));
+    let since_b = format!("&start={}&end={}", b / S, (now + 60 * S) / S);
+    assert_eq!(
+        at(route, "{traceDuration > 1s}", &since_b),
+        strs(&["/edge", "/slow"])
+    );
+    assert_eq!(
+        at(route, "{traceDuration < 1s}", &since_b),
+        strs(&["/fast"])
+    );
+    assert_eq!(
+        at("name", "{traceDuration > 1s}", ""),
+        strs(&["slow.child", "slow.root"])
+    );
+}

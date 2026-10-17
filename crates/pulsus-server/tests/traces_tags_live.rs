@@ -2800,7 +2800,8 @@ async fn the_stored_attribute_type_reaches_the_wire_and_its_query_returns_the_tr
 /// reads.
 const SHAPE_NAMES: &str = "SELECT DISTINCT scope, key";
 const SHAPE_CATALOG_VALUES: &str = "SELECT DISTINCT value AS val, val_type\nFROM tag_values";
-const SHAPE_NARROWED_VALUES: &str = "SELECT DISTINCT val, val_type\nFROM trace_attrs_idx";
+const SHAPE_NARROWED_VALUES: &str =
+    "SELECT DISTINCT val, val_type\nFROM (SELECT tupleElement(e, 1)";
 const SHAPE_SPAN_NAMES: &str = "SELECT DISTINCT if(length(name)";
 
 /// Every finished Select in `db` whose text starts with `prefix`, as its
@@ -2812,7 +2813,7 @@ async fn shape_rows(admin: &ChClient, db: &str, prefix: &str) -> Vec<Vec<String>
          FROM system.query_log \
          WHERE type = 'QueryFinish' AND query_kind = 'Select' \
            AND current_database = '{db}' \
-           AND startsWith(query, '{escaped}')"
+           AND position(query, '{escaped}') > 0"
     );
     let mut stream = admin
         .query_stream::<TablesRow>(&sql, &QuerySettings::new())
@@ -2922,8 +2923,7 @@ async fn six_request_classes_read_exactly_these_tables() {
 
     let names = vec![format!("{db}.tag_names")];
     let catalog = vec![format!("{db}.tag_values")];
-    let spans = vec![format!("{db}.trace_spans")];
-    let both = vec![format!("{db}.trace_attrs_idx"), format!("{db}.trace_spans")];
+    let spans = vec![format!("{db}.spans")];
 
     // Classes 1, 2a and 2b — three name reads, catalog only.
     assert_eq!(
@@ -2937,22 +2937,19 @@ async fn six_request_classes_read_exactly_these_tables() {
         vec![catalog.clone()],
         "an unnarrowed attribute-values read is still exactly the catalog read"
     );
-    // Class 4 — narrowed attribute values: the index intersected with the
-    // matching span set.
+    // Class 4 — narrowed attribute values (issue #598 part 2): the values
+    // on the matching spans, read from the span store.
     assert_eq!(
         shape_rows(&admin, db, SHAPE_NARROWED_VALUES).await,
-        vec![both.clone()],
-        "a narrowed attribute-values read reads the index and the span table"
+        vec![spans.clone()],
+        "a narrowed attribute-values read reads the span store"
     );
-    // Classes 5 and 6 — span names, unnarrowed and narrowed. Two Selects
-    // of the same shape, distinguished by their `tables`.
-    let mut span_name_rows = shape_rows(&admin, db, SHAPE_SPAN_NAMES).await;
-    span_name_rows.sort();
-    let mut want = vec![both.clone(), spans.clone()];
-    want.sort();
+    // Classes 5 and 6 — span names, unnarrowed and narrowed: the span
+    // store both times.
     assert_eq!(
-        span_name_rows, want,
-        "the unnarrowed span-name read is the span table alone; the narrowed one adds the index"
+        shape_rows(&admin, db, SHAPE_SPAN_NAMES).await,
+        vec![spans.clone(), spans.clone()],
+        "both span-name reads read the span store alone"
     );
 
     // 4a — one Select per request across the six classes, and the total
