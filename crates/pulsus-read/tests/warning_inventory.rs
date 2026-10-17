@@ -306,7 +306,7 @@ fn traces_coverage_paragraph() -> String {
 }
 
 /// Issue #278 AC11: the sentence `docs/features.md` gained about
-/// answer-level traces comparison names three real suites, and its
+/// answer-level traces comparison names three existing suites, and its
 /// **wiring** claim is true of the tree (the nested-set differential and
 /// its two gate-variable checks went with that suite, #602 part 2c-2b-1).
 ///
