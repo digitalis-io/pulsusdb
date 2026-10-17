@@ -59,8 +59,8 @@ pub const AGG_BASE_OVERHEAD: u64 = 1024;
 /// worst mid-rehash transient is 24/7 slots/entry × 49 B ≈ 168 B plus the
 /// 48 B exact-capacity output-row slot = 216 B, rounded up.
 pub const PATTERN_ROW_OVERHEAD: u64 = 256;
-/// Hard cap on distinct templates per request batch (v4). Once at cap, a row
-/// whose template is not already present is dropped from pattern accounting
+/// Hard cap on distinct (stream, 10s bucket, template, level) aggregates per request batch
+/// (v4). At cap, a row whose aggregate is not already present is dropped from pattern accounting
 /// only (the log line itself is untouched) and counted via the writer's
 /// `patterns_dropped_total` — making the aggregation buffer a FIXED ceiling
 /// (`AGG_BASE_OVERHEAD + CAP × PATTERN_ROW_OVERHEAD ≈ 2.44 MiB/request`),
@@ -279,13 +279,30 @@ pub fn est_template_bound(row: &LogRow) -> u64 {
     (2 * examined + 8).min(PATTERN_MAX_TEMPLATE_BYTES as u64)
 }
 
-/// Issue #605 stub: every row is `unknown`.
+/// The reference's eight pattern levels (`constants.LogLevels`,
+/// `pkg/util/constants/levels.go:15-24` @ v3.7.4).
+const PATTERN_LEVELS: [&str; 8] = [
+    "unknown", "debug", "info", "warn", "error", "fatal", "critical", "trace",
+];
+
+/// A row's pattern level (issue #605): its stored `detected_level`,
+/// lowercased, when that is one of the eight names; `unknown` otherwise,
+/// including when the row stores none. This is the reference's rule
+/// (`pkg/pattern/stream.go:108-121` @ v3.7.4: `strings.ToLower` of the
+/// entry's `detected_level`, and a level outside its eight trains the
+/// `unknown` pattern set). The fold is Go's simple lowercase: ASCII, plus the
+/// two non-ASCII runes that lower to an ASCII letter, `U+0130` → `i` and `U+212A` → `k`
+/// (`crates/pulsus-logql/src/unicode_ident.rs`, `fold_keyword_char`).
+///
+/// `structured_metadata` is the stored canonical JSON object, whose keys
+/// are unique and whose string values escape `"`, so the byte sequence
+/// `"detected_level":"` can only be that key. A value holding a `\`
+/// escape is decoded before it is compared.
 pub fn pattern_level(structured_metadata: &str) -> PatternLevel {
-    let _ = structured_metadata;
-    PatternLevel("unknown")
+    PatternLevel(pattern_level_name(structured_metadata))
 }
 
-/// A pattern row's level: one of the eight level names, or empty on a landing
+/// A pattern row's level: one of [`PATTERN_LEVELS`], or empty on a landing
 /// row of another kind. `Copy` and static, so a pattern row allocates
 /// nothing for it; it travels as a string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
@@ -299,19 +316,65 @@ impl serde::Serialize for PatternLevel {
 
 impl<'de> serde::Deserialize<'de> for PatternLevel {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let _ = <String as serde::Deserialize>::deserialize(d)?;
-        Ok(PatternLevel(""))
+        let name = <String as serde::Deserialize>::deserialize(d)?;
+        Ok(PatternLevel(
+            PATTERN_LEVELS
+                .iter()
+                .find(|level| **level == name)
+                .copied()
+                .unwrap_or(""),
+        ))
     }
 }
 
-/// Aggregates one request batch's rows into `(fingerprint, bucket_ns, pattern)
-/// -> count` `log_patterns` rows (D2). Runs only after the reservation
+fn go_simple_lower(c: char) -> char {
+    match c {
+        '\u{130}' => 'i',
+        '\u{212A}' => 'k',
+        _ => c.to_ascii_lowercase(),
+    }
+}
+
+fn pattern_level_name(structured_metadata: &str) -> &'static str {
+    const KEY: &str = "\"detected_level\":\"";
+    let Some(at) = structured_metadata.find(KEY) else {
+        return PATTERN_LEVELS[0];
+    };
+    let rest = &structured_metadata[at + KEY.len()..];
+    let Some(end) = rest.find('"') else {
+        return PATTERN_LEVELS[0];
+    };
+    let raw = &rest[..end];
+    let decoded;
+    let value = if raw.contains('\\') {
+        // Re-read the whole JSON string, escapes and all.
+        let quoted = &structured_metadata[at + KEY.len() - 1..];
+        let mut de = serde_json::Deserializer::from_str(quoted);
+        match <String as serde::Deserialize>::deserialize(&mut de) {
+            Ok(v) => {
+                decoded = v;
+                decoded.as_str()
+            }
+            Err(_) => return PATTERN_LEVELS[0],
+        }
+    } else {
+        raw
+    };
+    PATTERN_LEVELS
+        .iter()
+        .find(|level| value.chars().map(go_simple_lower).eq(level.chars()))
+        .copied()
+        .unwrap_or(PATTERN_LEVELS[0])
+}
+
+/// Aggregates one request batch's rows into `(fingerprint, bucket_ns, pattern,
+/// level) -> count` `log_patterns` rows (D2; the level since issue #605). Runs only after the reservation
 /// succeeds (`writer::LogWriter::admit_batch`). Empty-body rows produce no
 /// template. At the [`MAX_DISTINCT_PATTERNS_PER_BATCH`] cap, a row with an
 /// unseen template is dropped from pattern accounting only (counted in
 /// `dropped`), in the batch's deterministic parse order.
 pub fn aggregate_patterns(rows: &[LogRow]) -> PatternAggregation {
-    let mut map: HashMap<(Fingerprint, i64, String), u64> = HashMap::new();
+    let mut map: HashMap<(Fingerprint, i64, String, PatternLevel), u64> = HashMap::new();
     let mut dropped = 0u64;
 
     for row in rows {
@@ -319,7 +382,12 @@ pub fn aggregate_patterns(rows: &[LogRow]) -> PatternAggregation {
             continue;
         };
         let bucket_ns = row.timestamp_ns.0.div_euclid(PATTERN_BUCKET_NS) * PATTERN_BUCKET_NS;
-        let key = (row.fingerprint, bucket_ns, template);
+        let key = (
+            row.fingerprint,
+            bucket_ns,
+            template,
+            pattern_level(&row.structured_metadata),
+        );
         if let Some(count) = map.get_mut(&key) {
             *count += 1;
         } else if map.len() < MAX_DISTINCT_PATTERNS_PER_BATCH {
@@ -335,12 +403,12 @@ pub fn aggregate_patterns(rows: &[LogRow]) -> PatternAggregation {
     // Preallocated EXACTLY at map.len() (v3 derivation — the per-entry overhead
     // constant is sized for growth-based map sizing, not a rows-wide table).
     let mut out: Vec<LogPatternRow> = Vec::with_capacity(map.len());
-    for ((fingerprint, bucket_ns, pattern), count) in map {
+    for ((fingerprint, bucket_ns, pattern, level), count) in map {
         out.push(LogPatternRow {
             fingerprint,
             bucket_ns,
             pattern,
-            level: PatternLevel("unknown"),
+            level,
             count,
         });
     }
@@ -348,7 +416,12 @@ pub fn aggregate_patterns(rows: &[LogRow]) -> PatternAggregation {
     // keeps fidelity/golden assertions stable). Sorting is in place — no
     // reallocation past the exact-capacity Vec above.
     out.sort_by(|a, b| {
-        (a.fingerprint, a.bucket_ns, &a.pattern).cmp(&(b.fingerprint, b.bucket_ns, &b.pattern))
+        (a.fingerprint, a.bucket_ns, &a.pattern, a.level).cmp(&(
+            b.fingerprint,
+            b.bucket_ns,
+            &b.pattern,
+            b.level,
+        ))
     });
 
     PatternAggregation { rows: out, dropped }

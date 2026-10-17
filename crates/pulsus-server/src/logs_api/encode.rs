@@ -1202,11 +1202,11 @@ fn push_json_string_array<S: AsRef<str>>(out: &mut String, items: &[S], empty: J
 
 /// Encodes a `/api/logs/v1/patterns` result (M7-C3, issue #171, docs/api.md
 /// §2.6): the Loki-interop envelope `{"status":"success","data":[{"pattern":
-/// "<_> ...","samples":[[<unix_seconds>,<count>],...]}]}`. `data` is
+/// "<_> ...","level":"<level>","samples":[[<unix_seconds>,<count>],...]}]}`. `data` is
 /// **order-preserving** — the engine returns series already ordered
-/// total-count-desc then pattern-asc (the pushed-down top-1000), and that
+/// total desc, pattern asc, level asc (the pushed-down top-1000), and that
 /// presentation IS the contract, so this deliberately does NOT re-sort.
-/// `samples` are ascending by second, zero-count steps already omitted; both
+/// `samples` are ascending by second, zeros only where the statement filled them; both
 /// elements are bare JSON integers. `explain` joins as a sibling of `data`
 /// when requested.
 pub(crate) fn patterns_response(
@@ -1228,8 +1228,9 @@ pub(crate) fn patterns_response(
                 samples.push_str(&format!("[{secs},{count}]"));
             }
             format!(
-                "{{\"pattern\":{},\"samples\":[{samples}]}}",
-                json_string(&s.pattern)
+                "{{\"pattern\":{},\"level\":{},\"samples\":[{samples}]}}",
+                json_string(&s.pattern),
+                json_string(&s.level)
             )
             .into_bytes()
         },

@@ -1605,6 +1605,7 @@ const LOG_LANDING_COLUMNS: &[(&str, &str, &str)] = &[
     ("updated_ns", "Int64", "CODEC(DoubleDelta, ZSTD(1))"),
     ("pattern", "String", "CODEC(ZSTD(1))"),
     ("pattern_count", "UInt64", "CODEC(T64, ZSTD(1))"),
+    ("pattern_level", "LowCardinality(String)", ""),
 ];
 
 /// **T44.** A fresh `run_init` creates `log_landing` with exactly the declared
@@ -1718,7 +1719,8 @@ async fn an_existing_log_landing_table_is_adopted_by_a_rerun() {
              labels               String  CODEC(ZSTD(5)),
              updated_ns           Int64  CODEC(DoubleDelta, ZSTD(1)),
              pattern              String  CODEC(ZSTD(1)),
-             pattern_count        UInt64  CODEC(T64, ZSTD(1))
+             pattern_count        UInt64  CODEC(T64, ZSTD(1)),
+             pattern_level        LowCardinality(String)
          ) ENGINE = MergeTree
          PARTITION BY toStartOfHour(fromUnixTimestamp64Milli(received_ms))
          ORDER BY (org_id, kind, service, fingerprint, timestamp_ns)

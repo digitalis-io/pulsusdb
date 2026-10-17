@@ -633,7 +633,7 @@ async fn every_fingerprint_row_struct_round_trips_the_uint128_column() {
         &client,
         "LogPatternRow",
         &format!(
-            "SELECT fingerprint, bucket_ns, pattern, count FROM log_patterns \
+            "SELECT fingerprint, bucket_ns, pattern, level, count FROM log_patterns \
              WHERE fingerprint IN ({fps}) ORDER BY fingerprint"
         ),
     )

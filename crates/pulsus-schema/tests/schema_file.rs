@@ -1340,7 +1340,10 @@ fn the_log_tables_lead_with_the_tenant_in_both_forms() {
             "(org_id, kind, service, fingerprint, timestamp_ns)",
         ),
         ("log_metrics_5s", "(org_id, fingerprint, bucket_ns)"),
-        ("log_patterns", "(org_id, fingerprint, bucket_ns, pattern)"),
+        (
+            "log_patterns",
+            "(org_id, fingerprint, bucket_ns, pattern, level)",
+        ),
         (
             "log_samples",
             "(org_id, service, fingerprint, timestamp_ns)",

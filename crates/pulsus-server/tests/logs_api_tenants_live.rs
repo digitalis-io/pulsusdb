@@ -822,7 +822,7 @@ async fn the_log_tables_lead_with_the_tenant() {
     let want: Vec<String> = [
         "log_landing: org_id, kind, service, fingerprint, timestamp_ns",
         "log_metrics_5s: org_id, fingerprint, bucket_ns",
-        "log_patterns: org_id, fingerprint, bucket_ns, pattern",
+        "log_patterns: org_id, fingerprint, bucket_ns, pattern, level",
         "log_samples: org_id, service, fingerprint, timestamp_ns",
         "log_streams: org_id, fingerprint",
         "log_streams_idx: org_id, key, val, fingerprint",

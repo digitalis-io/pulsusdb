@@ -64,7 +64,7 @@ Site	Literal	crates/pulsus-read/src/logql/plan.rs:9808	-	-	<_> route=<route> lat
 Site	Literal	crates/pulsus-read/src/logql/predicate.rs:2498	-	-	{}	reject	reject	-	-	-
 Site	Literal	crates/pulsus-read/src/logql/reduce.rs:834	-	-	<_> route=<route> x=<x>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/src/logql/sql.rs:253	-	-	: 	reject	reject	-	-	-
-Site	Literal	crates/pulsus-read/src/logql/sql.rs:5161	-	-	<_> x=<x> route=<route>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/src/logql/sql.rs:5170	-	-	<_> x=<x> route=<route>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/tests/fixtures/group_key/cases.tsv:213	-	-	latency=<latency>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/tests/fixtures/group_key/cases.tsv:269	-	-	<__error__> <__error___extracted>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/tests/fixtures/group_key/cases.tsv:270	-	-	<__error___extracted> <__error__>	accept	accept	-	-	-

@@ -213,7 +213,7 @@ fn escaped_json_content_len(s: &str) -> usize {
 /// names/order match the DDL column list exactly (`fingerprint`, `bucket_ns`,
 /// `pattern`, `count`). Produced by [`crate::patterns::aggregate_patterns`]
 /// (batch pre-aggregation), never from a per-line `From` — one row is already
-/// a `(fingerprint, bucket_ns, template) -> count` aggregate over the batch.
+/// a `(fingerprint, bucket_ns, template, level) -> count` aggregate over the batch.
 /// `count` inserts as a plain `UInt64` into the table's
 /// `SimpleAggregateFunction(sum, UInt64)` column (the `log_metrics` idiom).
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
@@ -221,7 +221,8 @@ pub struct LogPatternRow {
     pub fingerprint: Fingerprint,
     pub bucket_ns: i64,
     pub pattern: String,
-    /// Issue #605 stub.
+    /// One of the eight level names (issue #605,
+    /// [`crate::patterns::pattern_level`]); static, so no allocation.
     pub level: crate::patterns::PatternLevel,
     pub count: u64,
 }
@@ -252,7 +253,7 @@ impl SpoolEncode for LogPatternRow {
 ///
 /// `kind` says which event the row is; a row sets that kind's columns and
 /// leaves the rest at the type's default. The fields are the landing table's
-/// fifteen columns **less `event_id`**, in the table's own declaration order:
+/// sixteen columns **less `event_id`**, in the table's own declaration order:
 /// the insert's column list is exactly this type's `COLUMN_NAMES`, so leaving
 /// the column out is what makes the server fill it from
 /// `DEFAULT generateUUIDv7()`.
@@ -284,6 +285,8 @@ pub struct LogLandingRow {
     pub updated_ns: i64,
     pub pattern: String,
     pub pattern_count: u64,
+    /// A kind-2 row's level (issue #605); empty on every other kind.
+    pub pattern_level: crate::patterns::PatternLevel,
 }
 
 /// One logs landing row's own inline footprint, in the shape the WRITER QUEUE
@@ -341,6 +344,7 @@ impl LogLandingRow {
             updated_ns: 0,
             pattern: String::new(),
             pattern_count: 0,
+            pattern_level: crate::patterns::PatternLevel(""),
         }
     }
 
@@ -391,6 +395,7 @@ impl LogLandingRow {
             timestamp_ns: row.bucket_ns,
             pattern: row.pattern,
             pattern_count: row.count,
+            pattern_level: row.level,
             ..Self::of_kind(org_id, received_ms, Self::KIND_PATTERN)
         }
     }
@@ -437,6 +442,7 @@ impl SpoolEncode for LogLandingRow {
                 "fingerprint": self.fingerprint,
                 "bucket_ns": self.timestamp_ns,
                 "pattern": self.pattern,
+                "level": self.pattern_level,
                 "count": self.pattern_count,
             }),
         }
@@ -491,6 +497,7 @@ impl SpoolEncode for LogLandingRow {
                 o.field("count", &self.pattern_count).await?;
                 o.field("fingerprint", &self.fingerprint).await?;
                 o.field("kind", &self.kind).await?;
+                o.str_field("level", self.pattern_level.0).await?;
                 o.str_field("org_id", &self.org_id).await?;
                 o.str_field("pattern", &self.pattern).await?;
                 o.field("received_ms", &self.received_ms).await?;
@@ -2384,6 +2391,7 @@ mod tests {
         "updated_ns",
         "pattern",
         "pattern_count",
+        "pattern_level",
     ];
 
     /// **T4.** The insert's column list is exactly the row type's
@@ -2395,7 +2403,7 @@ mod tests {
     #[test]
     fn the_log_insert_omits_event_id_so_the_server_fills_it() {
         let names = <LogLandingRow as pulsus_clickhouse::Row>::COLUMN_NAMES;
-        assert_eq!(names.len(), 14, "the 15 columns less event_id");
+        assert_eq!(names.len(), 15, "the 16 columns less event_id");
         let expected: Vec<&str> = LOG_LANDING_COLUMNS
             .iter()
             .copied()

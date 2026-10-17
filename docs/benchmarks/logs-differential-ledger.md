@@ -7120,3 +7120,43 @@ gated by
   `the_series_cap_answers_as_the_reference`,
   `a_partial_range_result_stops_at_the_step_where_the_cap_is_reached` and
   `over_the_cap_a_partial_request_keeps_the_first_500_by_its_order`.
+
+## Issue #605 part 3 — `/patterns` by level
+
+- **`logql-patterns-by-level`.** *Reference:* `/patterns` answers one series
+  per `(pattern, level)` and writes `level` on each
+  (`pkg/pattern/iter/batch.go:9-38`, `pkg/util/marshal/marshal.go:205-213`
+  @ v3.7.4). The level is the entry's `detected_level`, lowercased; a value
+  outside its eight names trains the `unknown` set
+  (`pkg/pattern/stream.go:108-121`). The logs drilldown app joins one
+  pattern's series into a row listing its levels and filters patterns by the
+  selected level; with no `level` on any series it shows no level column and
+  ignores the filter. Read from the source; not measured. *PulsusDB:* the
+  same split and the same rule, from each line's stored `detected_level`, in
+  `log_patterns.level`. *Not copied:* when an answer spans the pattern
+  ingester's window and the store, which needs the non-default
+  `pattern_persistence_enabled`, the reference merges the two by pattern alone
+  (`pkg/querier/pattern/querier.go:14-52`), so one level's samples are filed
+  under another's. *Unchanged here, and recorded in ADR 0006:* the templates
+  differ from the reference's clusters, and the reference keeps only patterns
+  with a total of at least 30, at most 300 of them
+  (`pkg/pattern/ingester_querier.go:22-23`), where PulsusDB keeps the top 1000
+  series. Pinned by `patterns_are_one_series_per_pattern_and_level`,
+  `a_rows_pattern_level_is_its_stored_level_or_unknown`,
+  `one_template_at_three_levels_is_three_pattern_rows` and
+  `otlp_and_loki_push_land_identical_hand_derived_pattern_rows`.
+- **`logql-patterns-step-fill`.** *Reference:* at a step other than its 10s
+  sample interval, each chunk of one stream's pattern at one level re-buckets
+  its samples to the step and answers `0` for each empty step between its
+  first and last (`pkg/pattern/drain/chunk.go:47-99` @ v3.7.4). A chunk spans
+  under an hour from its first sample (`pkg/pattern/drain/chunk.go:35-41`,
+  `pkg/pattern/ingester.go:113-124`), so samples an hour or more apart get no
+  zero between them. At 10s the samples are answered alone. The logs
+  drilldown app sends its panel interval as `step` and draws the samples as a
+  line. Read from the source; not measured. *PulsusDB:* the same fill per
+  stream, pattern and level from the stored 10s rows, between two steps whose
+  rows are under an hour apart, summed over streams. *Not reproducible:* a gap
+  under an hour that holds one of the reference's chunk starts gets no zero
+  there; the start depends on when its pattern ingester first saw the
+  pattern. *Not copied:* two samples at one timestamp in one series (defect
+  36). Pinned by `patterns_fill_empty_steps_within_a_stream_as_the_reference_does`.
