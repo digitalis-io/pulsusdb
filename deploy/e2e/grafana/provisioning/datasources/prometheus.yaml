@@ -1,0 +1,16 @@
+# Provisions Grafana's Prometheus datasource against pulsusdb's native
+# Prometheus HTTP API (docs/api.md §3: `/api/v1/query`, `/query_range`,
+# `/labels`, `/label/{name}/values`, ...) for the local `grafana` overlay
+# (deploy/e2e/compose.grafana.yaml). This is pulsusdb's native metrics
+# surface, not a compat alias — no `PULSUS_COMPAT_ENDPOINTS` flag needed.
+# `url` uses pulsusdb's static ipv4_address (172.29.0.11), matching this
+# directory's `loki.yaml`/`tempo.yaml` datasource convention.
+apiVersion: 1
+
+datasources:
+  - name: PulsusDB (Prometheus)
+    uid: pulsus-prometheus
+    type: prometheus
+    access: proxy
+    url: http://172.29.0.11:3100
+    editable: false
