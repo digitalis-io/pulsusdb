@@ -1,6 +1,6 @@
 # ADR 0008: SQL composition for lowered query pipelines
 
-Status: **Accepted** (2026-09-01), extended 2026-09-02
+Status: **Accepted** (2026-09-01), extended 2026-09-02 — **Parts of this document describe the previous trace search engine, which no search request reaches since issue #602 part 2b and which #602 part 2c-2b deletes; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.**
 Issue: [#492](https://github.com/digitalis-io/pulsusdb/issues/492) (compile pipeline stages to SQL instead of evaluating them after transport)
 
 **What the 2026-09-02 extension added, and what it did not.** D1, D2 and D3 are unchanged, and every

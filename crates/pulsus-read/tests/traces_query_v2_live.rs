@@ -16873,3 +16873,138 @@ async fn a_demand_in_the_slice_is_the_requests_400() {
     drop_db(&db).await;
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+/// The traces ledger's search claims, on the search route (issue #602 part
+/// 2c-2a): an event operand matches any event, not the first
+/// (`traceql-event-link-operand-any-match`); a root is decided by the
+/// stored parent, not by the window; `select()` before a mid-pipeline
+/// filter answers the filter's spans (`traceql-select-before-midpipeline-filter-empty`);
+/// `-1 < nestedSetParent` is `nestedSetParent > -1`
+/// (`traceql-literal-first-parent-comparison-answers-nothing-there`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_ledger_search_claims_hold_on_the_route() {
+    skip_unless_live!();
+    const S: i64 = 1_000_000_000;
+    let base_ns = (now_ns() / 1_000_000_000) * 1_000_000_000;
+    let with = |t: u8, n: u8, parent: u8, name: &str, at: i64, attrs, events| {
+        span_of(
+            vec![t; 16],
+            span_id_bytes(n),
+            if parent == 0 {
+                Vec::new()
+            } else {
+                span_id_bytes(parent)
+            },
+            name,
+            2,
+            base_ns + at,
+            S / 10,
+            attrs,
+            0,
+            events,
+            Vec::new(),
+        )
+    };
+    let a_y = || vec![kv("a", str_value("y"))];
+    let tag = || vec![kv("tag", str_value("t"))];
+    let bodies = vec![
+        by_body(
+            "evt602",
+            vec![
+                with(
+                    0xe1,
+                    1,
+                    0,
+                    "op",
+                    S,
+                    a_y(),
+                    vec![
+                        event_of(base_ns + S, "x", Vec::new()),
+                        event_of(base_ns + S, "y", Vec::new()),
+                    ],
+                ),
+                with(
+                    0xe1,
+                    2,
+                    1,
+                    "op",
+                    2 * S,
+                    a_y(),
+                    vec![event_of(base_ns + 2 * S, "x", Vec::new())],
+                ),
+                with(0xe1, 3, 1, "op", 3 * S, a_y(), Vec::new()),
+            ],
+        ),
+        by_body(
+            "orphan",
+            vec![
+                with(0xcc, 1, 0, "root", 0, Vec::new(), Vec::new()),
+                with(0xcc, 2, 1, "child", 300 * S, Vec::new(), Vec::new()),
+            ],
+        ),
+        by_body(
+            "grp492",
+            vec![
+                with(0xab, 1, 0, "a", S, tag(), Vec::new()),
+                with(0xab, 2, 1, "b", 2 * S, tag(), Vec::new()),
+                with(0xab, 3, 1, "a", 3 * S, tag(), Vec::new()),
+                with(0xab, 4, 1, "b", 4 * S, tag(), Vec::new()),
+            ],
+        ),
+    ];
+    let (db, _client) = seed_both(
+        pulsus_testkit::test_db("pulsus_read_it_t602p2c2a_ledger"),
+        &bodies,
+        9,
+        "t602p2c2a-ledger",
+    )
+    .await;
+    let engine = engine_of(&db).await;
+    let whole = (base_ns, base_ns + 400 * S);
+    let mut wrong = Vec::new();
+    for (query, window, want) in [
+        (
+            r#"{ resource.service.name = "evt602" && .a = event:name }"#,
+            whole,
+            "e1 1 [01]",
+        ),
+        (
+            r#"{ resource.service.name = "evt602" && event:name = .a }"#,
+            whole,
+            "e1 1 [01]",
+        ),
+        (
+            r#"{ resource.service.name = "evt602" && .a != event:name }"#,
+            whole,
+            "e1 2 [02, 03]",
+        ),
+        (
+            r#"{ nestedSetParent < 0 && resource.service.name = "orphan" }"#,
+            (base_ns + 100 * S, base_ns + 400 * S),
+            "",
+        ),
+        (
+            r#"{ resource.service.name = "grp492" } | select(.tag) | { name = "b" }"#,
+            whole,
+            "ab 2 [02, 04]",
+        ),
+        (
+            r#"{ resource.service.name = "grp492" } | { name = "b" } | select(.tag) | { name = "b" }"#,
+            whole,
+            "ab 2 [02, 04]",
+        ),
+        (
+            r#"{ resource.service.name = "grp492" && -1 < nestedSetParent }"#,
+            whole,
+            "ab 3 [02, 03, 04]",
+        ),
+    ] {
+        let plan = plan_of(&engine, &parse_query(query), window, 20, 20);
+        let got = answer_of(&engine.search_routed(&plan).await.map(normalise_today));
+        if got != want {
+            wrong.push(format!("{query}\n  want: {want}\n  got:  {got}"));
+        }
+    }
+    drop_db(&db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

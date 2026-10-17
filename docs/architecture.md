@@ -1,6 +1,6 @@
 # PulsusDB Architecture
 
-This document specifies the architecture of PulsusDB: process model, storage schemas, ingestion pipeline, query engines, and clustering. It is the authoritative design reference — implementation issues are scoped against this document.
+**Parts of this document describe the previous trace search engine, which no search request reaches since issue #602 part 2b and which #602 part 2c-2b deletes; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** This document specifies the architecture of PulsusDB: process model, storage schemas, ingestion pipeline, query engines, and clustering. It is the authoritative design reference — implementation issues are scoped against this document.
 
 **Design mandate:** PulsusDB is read-path first. Every schema and planner decision is justified by the queries it must serve (dashboard panels, log search, trace search, profile rendering), not by ingestion convenience. Where ingestion flexibility and read performance conflict, reads win.
 
@@ -38,7 +38,7 @@ pulsusdb/
 │   ├── pulsus-read/           # query HTTP APIs, response encoders, live tail
 │   ├── pulsus-logql/          # LogQL parser + planner + SQL generator
 │   ├── pulsus-promql/         # PromQL planner + hybrid evaluation engine
-│   ├── pulsus-traceql/        # TraceQL parser + planner + SQL generator
+│   ├── pulsus-traceql/        # TraceQL lexer, parser and validator
 │   └── pulsus-ruler/          # rule storage, evaluation loop, write-back
 └── docs/
 ```

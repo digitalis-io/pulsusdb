@@ -1,6 +1,6 @@
 # The TraceQL query catalogue
 
-Every query in the repository's TraceQL corpus, with the SQL it compiles to
+**Parts of this document describe the previous trace search engine, which no search request reaches since issue #602 part 2b and which #602 part 2c-2b deletes; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** Every query in the repository's TraceQL corpus, with the SQL it compiles to
 against the schema of `docs/TraceQL/sql-schema.md` and the literal answer it
 gives, or — where the query is refused — the status and the reason.
 

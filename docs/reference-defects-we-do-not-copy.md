@@ -1,6 +1,6 @@
 # Where the reference implementations are wrong, and what we do instead
 
-PulsusDB is built to answer LogQL, PromQL and TraceQL queries the way
+**Parts of this document describe the previous trace search engine, which no search request reaches since issue #602 part 2b and which #602 part 2c-2b deletes; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** PulsusDB is built to answer LogQL, PromQL and TraceQL queries the way
 Grafana Loki, Prometheus and Grafana Tempo answer them. The standing rule
 is parity **except where the reference is wrong**. This file is the list
 of those exceptions: every place we found the reference behaving
@@ -2258,3 +2258,7 @@ entry 32.)
   list. Reproduced on two independent container runs. The ledger states
   that the mechanism was not established. Row:
   `traceql-tag-values-narrowed-set-complete-here` in the traces ledger.
+- **The reference answers `{ -1 < nestedSetParent }` with no span.** Measured once, on the matched-span projection
+  corpus, where the same instance answered `{ -1 = nestedSetParent }` with the root; the comparison was not
+  located in the reference's source. Row: `traceql-literal-first-parent-comparison-answers-nothing-there` in the
+  traces ledger.
