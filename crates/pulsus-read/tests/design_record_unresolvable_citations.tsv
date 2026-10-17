@@ -53,6 +53,7 @@ docs/query-lowering.md	search_plan.rs:1894	blank_target_line
 docs/query-lowering.md	sql.rs:768	ambiguous_basename
 docs/query-lowering.md	traces/compile.rs:181	ambiguous_basename
 docs/query-lowering.md	traces/compile.rs:185	ambiguous_basename
+docs/query-lowering.md	traces_search_plan_parts.rs:55-61	not_a_tracked_file
 docs/query-to-sql.md	exec.rs:120	ambiguous_basename
 docs/query-to-sql.md	exec.rs:125	ambiguous_basename
 docs/query-to-sql.md	exec.rs:126	ambiguous_basename

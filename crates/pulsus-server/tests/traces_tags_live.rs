@@ -472,7 +472,7 @@ async fn tag_discovery_against_real_clickhouse() {
         return;
     }
     let port = 31_138;
-    // Per-run nonce'd database (the traces-read bench's nonce rationale):
+    // Per-run nonce'd database (the deleted traces-read bench's rationale):
     // `system.query_log` outlives databases, so a fixed name would
     // aggregate rows across local re-runs and break the EXACT-count
     // zero-payload proof below — `current_database = <nonce'd db>` is the

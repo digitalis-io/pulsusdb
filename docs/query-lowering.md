@@ -1,6 +1,6 @@
 # Query lowering: compiling pipeline stages to SQL
 
-**Parts of this document describe the previous trace search engine, which no search request reaches since issue #602 part 2b and which #602 part 2c-2b deletes; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** A LogQL or TraceQL query is a **selector** followed by a **pipeline of stages**. Every stage can
+**Parts of this document describe the previous trace search engine, which no search request reaches since issue #602 part 2b; #602 part 2c-2b-1 deleted its test binaries, goldens and benches, and #602 part 2c-2b-2 deletes its code and the unit tests inside it; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** A LogQL or TraceQL query is a **selector** followed by a **pipeline of stages**. Every stage can
 be evaluated in `pulsus-server` over rows ClickHouse has already sent, and some can instead be
 compiled into the SQL we send, so ClickHouse does the work next to the data and returns less.
 This document describes the mechanism that decides which — the lowering core TraceQL's compiler is built on — and reads LogQL's stages against the same questions. LogQL keeps its own compiler; the two are not to be merged (§6).
@@ -4046,7 +4046,7 @@ ADR 0008 is titled "SQL composition for lowered query pipelines" and its three r
 lowered pipeline composes. The rule added on 2026-09-02 is written without that qualifier — "no
 emitted SQL may contain a join until this ADR is amended to name the clause"
 (`docs/decisions/0008-sql-composition-for-lowered-pipelines.md:201`, the same claim in the summary
-at line 11). Seven committed goldens carry a join today and **none is planned by the compile core**:
+at line 11). The committed goldens below carry a join and **none is planned by the compile core**:
 
 - `traces_graph/clustered_local_join.sql` and `traces_graph/single_node.sql`, one join line each,
   from `service_graph_sql` (`crates/pulsus-read/src/traces/graph_sql.rs:92`, `INNER JOIN` at 109),
@@ -4073,13 +4073,13 @@ at line 11). Seven committed goldens carry a join today and **none is planned by
   those two tests' domain. `traces_metrics_base/` is not in `golden_sql_freeze`'s `CORPORA` either,
   so nothing pins their bytes; this list is the record that they exist and why.
 
-All seven come from hand-written builders on routes the compile core classifies `Never` —
+All of them come from hand-written builders on routes the compile core classifies `Never` —
 `NotASearchLinkLower::capability`, `crates/pulsus-read/src/traces/compile.rs:1396-1404` — so they
 are not lowered pipelines and the decision never reached them. The sentence reaches further than the
 decision it records: a drafting fault in the record, not shipped code breaking a rule. **The wording
-belongs to the amendment round ADR 0008 already reserves.** This part records the fact, scopes its
-gate to the compiled route's corpus, and pins the six by name so a seventh anywhere in the tree
-fails — `no_planned_search_statement_contains_a_join`,
+belongs to the amendment round ADR 0008 already reserves.** This part records the fact; its
+gate now checks only the named inventory of join files, so a join in any other file in the tree
+fails — `every_join_in_the_golden_corpus_is_named`,
 `crates/pulsus-read/tests/golden_sql_freeze.rs`, whose doc comment carries this same record beside
 the list.
 
@@ -4660,7 +4660,7 @@ new spelling and a new patch to the list.
 
 **So the audit keys on the gate's own identifier, because the identifiers are enumerable and the
 ways English can qualify a noun are not.** The inventory holds exactly **25** rows — four that
-exist and twenty-one that are **#492 part 1** — and the six tables in §§11.1–11.4 derive them. **§11.4 carries one further row that is not one of the 25**: `no_planned_search_statement_contains_a_join`, added by issue #492 part 7, which exists and prints `Starting 1 test` on this tree. It is marked as such where it stands, and every count in this section and in §11.0b is of the 25. **It held
+exist and twenty-one that are **#492 part 1** — and the six tables in §§11.1–11.4 derive them. **§11.4 carries one further row that is not one of the 25**: `every_join_in_the_golden_corpus_is_named`, added by issue #492 part 7, which exists and prints `Starting 1 test` on this tree. It is marked as such where it stands, and every count in this section and in §11.0b is of the 25. **It held
 22 when the checker below was last run**, and the three added since are §11.3's
 `every_cut_variant_has_a_row_in_the_design_record`, `every_chain_link_row_states_a_continuation`
 and `the_plan_shape_json_keys_match_the_api_document`, all **#492 part 1** and none of them at base.
@@ -4976,7 +4976,7 @@ the two tables are a cross-check on each other rather than one table quoted twic
 
 Issue #492 part 1 emits no SQL, so the first two must stay green **unchanged** — measured green today,
 `Starting 1 test` each, exit 0 (§11.0). When the fold is wired, the
-goldens and `PINNED_SQL_CORPUS` (`crates/pulsus-read/tests/golden_sql_freeze.rs:496`) move in the
+goldens and `PINNED_SQL_CORPUS` (`crates/pulsus-read/tests/golden_sql_freeze.rs:500`) move in the
 same commit.
 
 ### 11.2 The gates that reproduce each hand-written walk — all **#492 part 1** at base, none of them there then; all six exist today
@@ -5347,7 +5347,7 @@ synthesised links, and none of the six is any of those.
 |---|---|---|---|---|
 | no emitted SQL binds a relational subquery through a common table expression (ADR 0008 D2, as amended by issue #549) | `test(=every_committed_statement_binds_no_relational_cte)` | `crates/pulsus-read/tests/live_sql_corpus_ast.rs` | `Starting 0 tests`, exit 4 before #549 | **exists** |
 | the `query_log` half of the same rule, and the round-trip and metered-byte ratios | — | `crates/pulsus-read/tests/query_log_gates.rs` | `Starting 14 tests`, 14 passed, exit 0 — **exists**, but see below | — |
-| no statement the compile core plans contains a join (ADR 0008's added rule, scoped to the compiled route's corpus) — **added by issue #492 part 7, not one of §11.0's 25** | `test(=no_planned_search_statement_contains_a_join)` | `crates/pulsus-read/tests/golden_sql_freeze.rs` | **exists**, `Starting 1 test across 1 binary (3 tests skipped)`, 1 passed, exit 0 | **exists** |
+| every golden file holding a join is one the inventory names (the compiled route's no-join half went with its corpus, #602 part 2c-2b-1) — **added by issue #492 part 7, not one of §11.0's 25** | `test(=every_join_in_the_golden_corpus_is_named)` | `crates/pulsus-read/tests/golden_sql_freeze.rs` | **exists**, `Starting 1 test across 1 binary (3 tests skipped)`, 1 passed, exit 0 | **exists** |
 
 The second binary exists and is **env-gated**, which is exactly the trap: run here at `acf44c49`
 with `PULSUS_TEST_CLICKHOUSE` unset it printed `Starting 14 tests across 1 binary` and
@@ -5365,13 +5365,13 @@ statements into the corpus (ADR 0008 D1), and this document does not count it be
 **The third is vacuous in the same direction, and says so on its own face.** No statement the
 compile core plans contains a join today, and none can: `Relation` has no join slot
 (`compile/fold.rs:626`), so a stage cannot contribute one without a type change. Over the
-`traces_search/` corpus the assertion is therefore green over a population holding none of the case
-it exists for, exactly as the `WITH` row says of itself, and it becomes a real check only if
-something writes a join. What it is **not** vacuous about is the other half of its body: the six
+`traces_search/` corpus, deleted with this half by #602 part 2c-2b-1, the assertion was green over a population holding none of the case
+it existed for, exactly as the `WITH` row says of itself, and it became a real check only if
+something wrote a join. What it is **not** vacuous about, and all it checks now, is the other half: the
 committed goldens outside that corpus which carry a join today are pinned as an EQUALITY, so a
-seventh anywhere in the golden tree fails it. That half is why the gate walks the golden root rather
-than `CORPORA` — two of the six sit in `traces_metrics_base/`, which `CORPORA` does not contain, so
-the digest gate above cannot see them either. §9.8 carries the record of all six.
+join in any other file of the golden tree fails it. That half is why the gate walks the golden root rather
+than `CORPORA` — two of them sit in `traces_metrics_base/`, which `CORPORA` does not contain, so
+the digest gate above cannot see them either. §9.8 carries the record of them.
 
 ### 11.5 Adding a link variant is to be a build failure — #492 part 1 made it one
 
@@ -5539,18 +5539,18 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | of those, citing a bare basename | 492 |
 | of those, written as a continuation of a citation earlier in the paragraph | 74 |
 | of those continuations, on a later line than the citation they continue | 31 |
-| `(document, token)` pairs the rule resolves | 377 |
-| occurrences those resolved pairs cover | 505 |
-| `(document, token)` pairs it cannot resolve | 98 |
-| occurrences those frozen pairs cover | 187 |
-| resolved rows anchored on a token the citing prose prints | 181 |
+| `(document, token)` pairs the rule resolves | 376 |
+| occurrences those resolved pairs cover | 504 |
+| `(document, token)` pairs it cannot resolve | 99 |
+| occurrences those frozen pairs cover | 188 |
+| resolved rows anchored on a token the citing prose prints | 180 |
 | resolved rows anchored on a snapshot of the cited line | 196 |
 
 | reason it cannot be resolved | pairs | what it means |
 |---|---|---|
 | `ambiguous_basename` | 91 | the basename matches several tracked files and the citing line prints no identifier that separates them |
 | `blank_target_line` | 5 | the cited line exists and is **empty**, so there is nothing to anchor on |
-| `not_a_tracked_file` | 2 | the citation names a throwaway probe that was never committed, which §10 records deliberately |
+| `not_a_tracked_file` | 3 | the citation names a file the tree does not hold: a throwaway probe that was never committed, which §10 records deliberately, or a file of the previous search engine that #602 part 2c-2b deleted |
 
 | the reviewed verdict on a fallback disagreement | cases |
 |---|---|
@@ -5563,7 +5563,7 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | `prose` | a token the citing prose prints, so the claim and its evidence are reviewable side by side |
 | `line` | a snapshot of the cited line, taken because the citing prose prints no such token: it detects the line moving or changing and cannot show the citation means the right thing |
 
-Of the 692 citation occurrences the five artefacts make, 492 name a bare basename and 74 are written as a continuation of a citation earlier on the same line. The rule resolves 377 `(document, token)` pairs covering 505 occurrences, and cannot resolve 98 covering 187. Of the resolved rows, 181 are anchored on a token the citing prose prints and 196 on a snapshot of the cited line.
+Of the 692 citation occurrences the five artefacts make, 492 name a bare basename and 74 are written as a continuation of a citation earlier on the same line. The rule resolves 376 `(document, token)` pairs covering 504 occurrences, and cannot resolve 99 covering 188. Of the resolved rows, 180 are anchored on a token the citing prose prints and 196 on a snapshot of the cited line.
 
 The language fallback and the anchor rule disagree on 5 citations, all of them read one at a time. 4 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
 

@@ -161,9 +161,9 @@ async fn insert_block_then_query_stream_round_trips_rows() {
 /// (`vendor/clickhouse/PATCHES.md`), which is what makes the code readable
 /// at all on this path: it puts the `X-ClickHouse-Exception-Code` value at
 /// byte 0 of the `BadResponse` message. Revert that patch and this test
-/// fails with `code: 0` on 26.3. It is not the only gate on the vendored
-/// change — `pulsus-read`'s `traces_search_explain` catches the same revert
-/// on 26.3 — but it is the cheapest, and the only one in this suite.
+/// fails with `code: 0` on 26.3. It was not the only gate on the vendored
+/// change — `pulsus-read`'s `traces_search_explain` caught the same revert on
+/// 26.3 until #602 part 2c-2b-1 deleted it — and it is the only one in this suite.
 ///
 /// **It is a regression gate, on the only version we run** (issue #376).
 /// On **26.3.17.110** the server keeps the already-written output, the

@@ -167,7 +167,7 @@ async fn explain_raw(client: &ChClient, sql: &str) -> String {
 }
 
 /// The `PrimaryKey` block's `Granules: k/N` ratio (panics with the raw
-/// text when absent — the `traces_search_explain.rs` idiom).
+/// text when absent — the idiom of the former `traces_search_explain.rs`).
 fn primary_key_granules(raw: &str) -> (u64, u64) {
     const BLOCK_TITLES: &[&str] = &["Min-Max", "Partition", "Statistics", "PrimaryKey", "Skip"];
     let mut in_pk = false;

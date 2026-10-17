@@ -1,6 +1,6 @@
 # ADR 0007: vendor-and-patch `clickhouse` to keep the exception code off the wire text
 
-Status: **Accepted** (2026-08-09) — **Parts of this document describe the previous trace search engine, which no search request reaches since issue #602 part 2b and which #602 part 2c-2b deletes; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.**
+Status: **Accepted** (2026-08-09) — **Parts of this document describe the previous trace search engine, which no search request reaches since issue #602 part 2b; #602 part 2c-2b-1 deleted its test binaries, goldens and benches, and #602 part 2c-2b-2 deletes its code and the unit tests inside it; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.**
 Issue: [#382](https://github.com/digitalis-io/pulsusdb/issues/382) (a ClickHouse error after the first flush is parsed as code 0)
 Related: [ADR 0003](0003-promql-parser-vendor-patch.md) and [ADR 0004](0004-opentelemetry-proto-vendor-patch.md) establish the vendor+patch discipline this ADR reuses; [ADR 0001](0001-clickhouse-client.md) selected the client; [ADR 0009](0009-clickhouse-types-vendor-patch.md) decides §§3-4 of this same vendored crate's `PATCHES.md` and vendors a second crate from the same upstream.
 Depends on: [#376](https://github.com/digitalis-io/pulsusdb/issues/376) (ClickHouse LTS move) — see "What this does not decide".

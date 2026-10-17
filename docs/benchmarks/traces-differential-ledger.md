@@ -1,6 +1,6 @@
 # Traces differential divergence ledger
 
-**Parts of this document describe the previous trace search engine, which no search request reaches since issue #602 part 2b and which #602 part 2c-2b deletes; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** The M4 traces differential (`e2e/src/traces.rs`, issue #60) gates every
+**Parts of this document describe the previous trace search engine, which no search request reaches since issue #602 part 2b; #602 part 2c-2b-1 deleted its test binaries, goldens and benches, and #602 part 2c-2b-2 deletes its code and the unit tests inside it; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** The M4 traces differential (`e2e/src/traces.rs`, issue #60) gates every
 corpus-computable TraceQL case in
 `test/fixtures/traces/differential.json` against both the corpus's
 by-construction expectation and the pinned reference Tempo

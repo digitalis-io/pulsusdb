@@ -84,9 +84,9 @@ pulsus-schema-testkit = { path = "../pulsus-schema-testkit" }
 pulsus-testkit = { path = "../pulsus-testkit" }
 pulsus-schema = { path = "../pulsus-schema" }
 # DEV-ONLY, and must stay dev-only (issue #167): the deferred #139 L-T1
-# executor proof (`tests/traces_search_heal_live.rs`) drives the real
-# `TraceWriter` + registration backfill against a live ClickHouse and
-# then searches through this crate's own executor. pulsus-write's normal
+# executor proof (`tests/traces_search_heal_live.rs`, deleted by #602 part
+# 2c-2b-1) drove the real `TraceWriter`; the live suites named below still
+# seed through the writer. pulsus-write's normal
 # dependencies contain no pulsus-read, so the production graph stays
 # unchanged and acyclic — `cargo tree -p pulsus-read -e normal` must
 # never show pulsus-write.

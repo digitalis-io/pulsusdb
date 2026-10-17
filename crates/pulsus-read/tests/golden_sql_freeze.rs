@@ -3,23 +3,23 @@
 //! reviewer can check **from the diff**, instead of a claim to be taken on
 //! trust.
 //!
-//! **The problem it solves.** `golden/traces_search/*.sql` (49) and
-//! `golden/traces_metrics/*.sql` (17) are the semantic witness every
-//! TraceQL grammar change is measured against: they live in another crate
-//! from `Display`, so they catch a meaning change our own rendering
-//! cannot see. Every such change therefore reports "the 66 SQL goldens
-//! take zero edits" — and until now that sentence was verifiable only by
-//! trusting the author's `git status`, or by re-listing 66 paths by hand.
-//! A reviewer working from a patch had no single artefact to look at.
+//! **The problem it solves.** `golden/traces_metrics/*.sql` is the semantic
+//! witness every TraceQL metrics grammar change is measured against; the
+//! `golden/traces_search/` corpus this digest also covered went with #602
+//! part 2c-2b-1. The goldens live in another crate from `Display`, so they
+//! catch a meaning change our own rendering cannot see. Every such change
+//! therefore reports "the SQL goldens take zero edits" — and until now that
+//! sentence was verifiable only by trusting the author's `git status`, or by
+//! re-listing the paths by hand; a reviewer working from a patch had none.
 //!
-//! **The mechanism.** One digest over the whole corpus — every file's
-//! relative path AND bytes, in sorted path order — pinned as a constant
-//! in THIS SOURCE FILE, deliberately not beside the data (the
+//! **The mechanism.** One digest over the `traces_metrics` corpus — every
+//! file's relative path AND bytes, in sorted path order — pinned as a
+//! constant in THIS SOURCE FILE, deliberately not beside the data (the
 //! `accept_surface.rs::the_reference_column_is_frozen_against_silent_re_pinning`
 //! posture): a data-only edit fails here, so any golden movement forces a
 //! visible source-line change in the same diff. `PINNED_SQL_CORPUS`
-//! unchanged in a diff therefore MEANS all 66 files are byte-identical —
-//! one line to look at rather than 66.
+//! unchanged in a diff therefore MEANS all 28 files are byte-identical —
+//! one line to look at rather than 28.
 //!
 //! The count is asserted separately from the digest so the failure says
 //! which happened: a file added or removed reads differently from a file
@@ -51,16 +51,14 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// `traces_search` (#57), `traces_metrics` (#59/#182), `traces_spans_search`
-/// (#590) and `traces_spans_metrics` (#596 part 1): the four byte-frozen SQL
-/// corpora, with their committed sizes. The count is of EVERY file in the
+/// `traces_metrics` (#59/#182), `traces_spans_search` (#590) and
+/// `traces_spans_metrics` (#596 part 1): the three byte-frozen SQL corpora, with their committed sizes. The count is of EVERY file in the
 /// directory tree, not of `.sql` files — today the two coincide, and a file
 /// of any other kind appearing is precisely the thing the count should report.
 ///
-/// The first two are pinned together by [`PINNED_SQL_CORPUS`]; the third and
-/// fourth each by their own, so no digest moves when only another's does.
-const CORPORA: [(&str, usize); 4] = [
-    ("traces_search", 75),
+/// The first is pinned by [`PINNED_SQL_CORPUS`]; the second and third each by
+/// their own, so no digest moves when only another's does.
+const CORPORA: [(&str, usize); 3] = [
     ("traces_metrics", 28),
     ("traces_spans_search", 18),
     ("traces_spans_metrics", 23),
@@ -493,7 +491,13 @@ const CORPORA: [(&str, usize); 4] = [
 /// keeps the reference's `(start, end]`, which is why
 /// `traces_metrics/compare_status_window.sql` is unchanged and the
 /// `traces_metrics` corpus contributes nothing to this value.
-const PINNED_SQL_CORPUS: u64 = 0x4eff_8ddc_344c_0ce4;
+///
+/// **Moved on issue #602 part 2c-2b-1: 103 -> 28 entries, 75 `traces_search`
+/// files and nothing else removed.** That corpus was the previous search
+/// engine's, deleted with its tests; the digest now covers `traces_metrics`
+/// alone, and no `traces_metrics` file moved. The suites the entries above
+/// name as gates over that corpus went with it.
+const PINNED_SQL_CORPUS: u64 = 0xc6f0_52ca_842d_d404;
 
 fn golden_dir(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -626,8 +630,8 @@ fn the_sql_golden_corpus_has_exactly_its_committed_membership() {
         total += entries.len();
     }
     assert_eq!(
-        total, 144,
-        "the frozen SQL corpus is 75 + 28 + 18 + 23 = 144 entries"
+        total, 69,
+        "the frozen SQL corpus is 28 + 18 + 23 = 69 entries"
     );
 }
 
@@ -658,10 +662,10 @@ const PINNED_SPANS_METRICS_CORPUS: u64 = 0x1d26_0957_b2f9_bd44;
 
 #[test]
 fn the_sql_golden_corpus_matches_its_committed_digest() {
-    let h = corpus_digest(&["traces_search", "traces_metrics"]);
+    let h = corpus_digest(&["traces_metrics"]);
     assert_eq!(
         h, PINNED_SQL_CORPUS,
-        "the 103 frozen SQL corpus entries — 102 SQL files and one JSON file — changed. This is \
+        "the 28 frozen `traces_metrics` SQL goldens changed. This is \
          not a constant to refresh: it means the \
          planner's or the SQL builders' output moved. If that was deliberate, regenerate the \
          goldens, say in the notes which query's SQL changed and why, and update \
@@ -762,9 +766,9 @@ fn golden_root() -> PathBuf {
         .join("golden")
 }
 
-/// The six committed goldens that carry a join today, none of which the
+/// The committed goldens that carry a join today, none of which the
 /// compile core plans. The list is asserted as an EQUALITY, not used as
-/// a skip list: a seventh file anywhere in the tree fails this test.
+/// a skip list: a join in any file it does not name fails this test.
 const JOINS_OUTSIDE_THE_COMPILED_SEARCH_CORPUS: [&str; 48] = [
     "traces_graph/clustered_local_join.sql",
     "traces_graph/single_node.sql",
@@ -781,7 +785,7 @@ const JOINS_OUTSIDE_THE_COMPILED_SEARCH_CORPUS: [&str; 48] = [
     // series' cells, or a bucket's quantiles, into rows — an array of the
     // row itself, not a second table. It is the design's own statement,
     // built by `spans::metrics::metrics_statement`, which the compile core
-    // does not plan; all twenty-three of its goldens carry one, and part
+    // does not plan; every one of its goldens carries one, and part
     // 2's per-trace, numbering and child-count reads are `LEFT JOIN`s.
     "traces_spans_metrics/arithmetic.sql",
     "traces_spans_metrics/avg_attribute.sql",
@@ -833,7 +837,7 @@ const JOINS_OUTSIDE_THE_COMPILED_SEARCH_CORPUS: [&str; 48] = [
 ];
 
 /// ADR 0008: **no statement the compile core plans may contain a join**,
-/// and the forty-eight committed goldens that carry one, pinned by name.
+/// and the committed goldens that carry one, pinned by name.
 ///
 /// **Issue #596 part 1 adds twelve, part 2 eight, and issue #594 part 5
 /// three**: the
@@ -855,8 +859,8 @@ const JOINS_OUTSIDE_THE_COMPILED_SEARCH_CORPUS: [&str; 48] = [
 /// added on 2026-09-02 is written without that qualifier — "no emitted
 /// SQL may contain a join until this ADR is amended to name the clause"
 /// (`docs/decisions/0008-sql-composition-for-lowered-pipelines.md:201`,
-/// the same claim in the summary at line 11). Seven committed goldens
-/// carry a join today and **none is planned by the compile core**:
+/// the same claim in the summary at line 11). The committed goldens in the
+/// table below carry a join and **none is planned by the compile core**:
 ///
 /// ```text
 /// file                                           emitted by                        current?
@@ -894,7 +898,7 @@ const JOINS_OUTSIDE_THE_COMPILED_SEARCH_CORPUS: [&str; 48] = [
 /// not reach it either: **nothing pins those two files' bytes**, and this
 /// list is the record that they exist and why.
 ///
-/// All seven come from hand-written builders on routes the compile core
+/// All of them come from hand-written builders on routes the compile core
 /// classifies `Never` — `NotASearchLinkLower::capability`
 /// (`crates/pulsus-read/src/traces/compile.rs:1369-1376`) — so they are
 /// not lowered pipelines and the decision never reached them.
@@ -903,16 +907,16 @@ const JOINS_OUTSIDE_THE_COMPILED_SEARCH_CORPUS: [&str; 48] = [
 /// only at `traces/metrics_plan.rs:627/639/651/666`. The sentence
 /// reaches further than the decision it records: a drafting fault in the
 /// record, not shipped code breaking a rule. **The wording belongs to
-/// the amendment round ADR 0008 already reserves.** This test enforces
-/// the rule the ADR can mean — zero joins in the corpus the compiled
-/// search route freezes — and pins the seven by name so an eighth
-/// anywhere in the tree fails. `docs/query-lowering.md` §9.8 carries the
-/// same record.
+/// the amendment round ADR 0008 already reserves.** This test enforced
+/// the rule the ADR can mean — zero joins in the compiled search corpus —
+/// until #602 part 2c-2b-1 deleted that corpus; it now pins the join files
+/// by name, so a join in any other file fails; `docs/query-lowering.md`
+/// §9.8 carries the same record.
 ///
 /// # Why this walks the golden root and not `CORPORA`
 ///
 /// Written over `CORPORA` this gate would be red on day one:
-/// `traces_metrics/` holds three of the seven. And two more sit in
+/// `traces_metrics/` holds some of the join files, and others sit in
 /// `traces_metrics_base/`, which is not in `CORPORA` at all, so the
 /// digest gate above cannot see them either.
 ///
@@ -921,10 +925,9 @@ const JOINS_OUTSIDE_THE_COMPILED_SEARCH_CORPUS: [&str; 48] = [
 /// It freezes the CORPUS, not the builders. A builder could emit a join
 /// on an input no golden covers, and nothing here would see it.
 #[test]
-fn no_planned_search_statement_contains_a_join() {
+fn every_join_in_the_golden_corpus_is_named() {
     let root = golden_root();
     let mut scanned = 0usize;
-    let mut search_statements = 0usize;
     let mut with_a_join: Vec<String> = Vec::new();
 
     for entry in corpus_entries(&root) {
@@ -935,20 +938,15 @@ fn no_planned_search_statement_contains_a_join() {
             continue;
         }
         scanned += 1;
-        let in_search = rel.starts_with("traces_search/");
         let text =
             fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         let mut this_file_joins = false;
-        for (i, line) in text.lines().enumerate() {
+        for line in text.lines() {
             // The two header lines carry the case name and the query
             // text, not SQL — and one case is literally named
             // `attr_semi_join`, whose body renders `IN (SELECT …)` and
             // holds no join at all.
             if line.starts_with("-- ") {
-                continue;
-            }
-            if in_search && line.starts_with("== ") {
-                search_statements += 1;
                 continue;
             }
             let has_join = line
@@ -957,12 +955,6 @@ fn no_planned_search_statement_contains_a_join() {
             if !has_join {
                 continue;
             }
-            assert!(
-                !in_search,
-                "{rel}:{}: ADR 0008 names no join clause, so no statement the compile core plans \
-                 may contain one. Line: {line}",
-                i + 1
-            );
             this_file_joins = true;
         }
         if this_file_joins {
@@ -973,15 +965,11 @@ fn no_planned_search_statement_contains_a_join() {
     with_a_join.sort();
     assert_eq!(
         with_a_join, JOINS_OUTSIDE_THE_COMPILED_SEARCH_CORPUS,
-        "the joins outside the compiled search corpus are exactly these forty-eight; a \
-         forty-ninth means a builder grew one and nobody said so"
+        "the joins outside the compiled search corpus are exactly these; a join in \
+         any other file means a builder grew one and nobody said so"
     );
     assert_eq!(
-        scanned, 171,
+        scanned, 96,
         "every committed SQL golden in the tree is scanned, not only the two frozen corpora"
-    );
-    assert!(
-        search_statements > 100,
-        "the search corpus holds the statements this rule is about: {search_statements}"
     );
 }

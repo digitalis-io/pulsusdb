@@ -49,7 +49,7 @@
 //! the fixtures are read across crates from
 //! `pulsus-traceql/tests/accept_surface/`. The planner inputs are the
 //! fixed deterministic shapes the golden suites pin
-//! (`traces_search_sql.rs` / `traces_metrics_sql.rs`), so the derivation
+//! (`traces_metrics_sql.rs`; `traces_search_sql.rs` until #602 part 2c-2b-1), so the derivation
 //! is hermetic and reproducible; only the query varies per probe.
 
 use std::path::PathBuf;

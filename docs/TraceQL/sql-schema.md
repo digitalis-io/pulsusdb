@@ -1,6 +1,6 @@
 # TraceQL storage: the tables, the SQL, and what each costs
 
-**Where this document compares with *today's* engine, it means the previous trace search engine, which no search request reaches since issue #602 part 2b and which #602 part 2c-2b deletes; §5.2–§5.3 are the search route's design.** Companion to `docs/TraceQL/functional-requirements.md` (requirements, data,
+**Where this document compares with *today's* engine, it means the previous trace search engine, which no search request reaches since issue #602 part 2b; #602 part 2c-2b-1 deleted its test binaries, goldens and benches, and #602 part 2c-2b-2 deletes its code and the unit tests inside it; §5.2–§5.3 are the search route's design.** Companion to `docs/TraceQL/functional-requirements.md` (requirements, data,
 benchmark, test cases) and `docs/TraceQL/server-implementation.md` (write path
 and compiler). Every number was produced by a script in `docs/TraceQL/measure/`
 on ClickHouse 26.3.29.7 limited to 4 CPUs and 6 GB, over corpus g1 — 2,000,064

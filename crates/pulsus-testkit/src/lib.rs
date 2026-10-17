@@ -1050,12 +1050,12 @@ pub fn assert_reference_instance_is_free_of(api_base: &str, trace_hex: &str, own
 /// `traces_metrics_nested_set_live::nested_set_and_bare_truthiness_answers_match_the_seeded_corpus`
 /// returned `0.0` against `300.0`.
 ///
-/// **The uncovered classes are now three**: the trace-tags fixtures
-/// (`traces_tags_explain.rs`), the schema live suite
-/// (`pulsus-schema/tests/live_traces.rs`) and the two benchmark modules
-/// (`xtask/src/bench/traces_lowering.rs` reads the index alone;
-/// `traces_read.rs` writes span arrays already). A fixture author on any
-/// of those paths gets no help from this helper.
+/// **The uncovered classes are now two**: the trace-tags fixtures
+/// (`traces_tags_explain.rs`) and the schema live suite
+/// (`pulsus-schema/tests/live_traces.rs`); the two benchmark modules and
+/// the two search fixtures above were deleted by #602 part 2c-2b-1. A
+/// fixture author on either remaining path gets no help from this
+/// helper.
 ///
 /// # What it checks
 ///

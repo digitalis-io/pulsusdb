@@ -1,6 +1,6 @@
 //! Env-gated `compare()` VALUE differential (issue #189; the #185
 //! closeout hook) — a REAL two-system differential, structured exactly
-//! like [`nestedset_value_differential`].
+//! like `nestedset_value_differential`, which #602 part 2c-2b-1 deleted.
 //!
 //! #189 wires `compare()` to emit real per-value baseline/selection counts
 //! for three schema-unblocked well-known keys — `statusMessage`,
