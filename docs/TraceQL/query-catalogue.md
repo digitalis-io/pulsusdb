@@ -1,6 +1,6 @@
 # The TraceQL query catalogue
 
-**Parts of this document describe the previous trace search engine, which no search request reaches since issue #602 part 2b; #602 part 2c-2b-1 deleted its test binaries, goldens and benches, and #602 part 2c-2b-2 deletes its code and the unit tests inside it; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** Every query in the repository's TraceQL corpus, with the SQL it compiles to
+**Parts of this document describe the previous trace search engine, which issue #602 part 2c-2b deleted — its test binaries, goldens and benches in part 2c-2b-1, its code and the unit tests inside it in part 2c-2b-2; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** Every query in the repository's TraceQL corpus, with the SQL it compiles to
 against the schema of `docs/TraceQL/sql-schema.md` and the literal answer it
 gives, or — where the query is refused — the status and the reason.
 
@@ -245,7 +245,7 @@ design rather than of a query:
    and `<name>.sql` shows that shape. The catalogue's answer column is
    membership, so those queries share their answer with the filter they wrap.
    `with(sample=true)` changes no read at all — the shipped planner accepts it
-   and returns the exact superset (`metrics_plan.rs:1093`).
+   and returns the exact superset (`metrics_plan.rs:1092`).
 4. **The transitive structural operators run bounded.** Every `>>`/`<<` statement
    carries `depth < PULSUS_TRACEQL_MAX_DEPTH` and reports what it could not
    resolve, as `sql-schema.md` §5.8 describes.

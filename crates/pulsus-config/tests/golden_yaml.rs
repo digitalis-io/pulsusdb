@@ -70,7 +70,6 @@ reader:
   promql_grouped_push: true
   logql_scan_budget_bytes: 50GiB
   logql_pipeline_scan_factor: 10
-  traceql_max_candidates: 100000
   traceql_scan_budget_rows: 50000000
   traceql_tag_lookback: 24h
 

@@ -3,8 +3,8 @@
 //! any spanset operands, as one per-span membership predicate.
 //!
 //! A spanset holding a structural operator compiles to `M(s)`: whether a
-//! span `s` of the window is in the spanset's result, as today's
-//! `eval_spanset` (`search_eval.rs`) decides it per trace. Each relation
+//! span `s` of the window is in the spanset's result, as the previous
+//! search engine's `eval_spanset` decided it per trace. Each relation
 //! reads the other side through a `(trace_id, …) IN (…)` subquery over the
 //! same window, so the result is a predicate on one span row and every
 //! search template serves it as its selector.
@@ -197,9 +197,9 @@ impl Membership<'_, '_> {
         }
     }
 
-    /// Whether the span holds `op` with some span of `seed`, as today's
-    /// `rel_children` / `rel_parents` / `rel_siblings` (`search_eval.rs`)
-    /// decide it with `seed` as the seed set — the candidate's own
+    /// Whether the span holds `op` with some span of `seed`, as the previous
+    /// search engine's `rel_children` / `rel_parents` / `rel_siblings`
+    /// decided it with `seed` as the seed set — the candidate's own
     /// membership is the caller's.
     fn relation(&mut self, op: StructuralOp, seed: &str, cand: &str) -> Result<String, PlanError> {
         Ok(match op {

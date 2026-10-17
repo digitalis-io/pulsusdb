@@ -411,22 +411,9 @@ const ROWS: &[Row] = &[
         check: |c| c.reader.template_timezone.name() == "Europe/London",
     },
     Row {
-        var: "PULSUS_TRACEQL_MAX_CANDIDATES",
-        value: "77",
-        check: |c| c.reader.traceql_max_candidates == 77,
-    },
-    Row {
         var: "PULSUS_TRACEQL_SCAN_BUDGET_ROWS",
         value: "12345",
         check: |c| c.reader.traceql_scan_budget_rows == 12_345,
-    },
-    // Issue #558: the event/link value-set budget. Its boundary cases
-    // are the accepted floor and the accepted ceiling — `1` and
-    // 10,000,000 — and `validate.rs` rejects `0` and anything above.
-    Row {
-        var: "PULSUS_TRACEQL_EVENT_SET_MAX_VALUES",
-        value: "2500",
-        check: |c| c.reader.traceql_event_set_max_values == 2_500,
     },
     Row {
         var: "PULSUS_TRACEQL_MAX_DEPTH",
@@ -442,11 +429,6 @@ const ROWS: &[Row] = &[
         var: "PULSUS_TRACEQL_TAG_LOOKBACK",
         value: "6h",
         check: |c| c.reader.traceql_tag_lookback.0 == Duration::from_secs(6 * 3_600),
-    },
-    Row {
-        var: "PULSUS_TRACEQL_GENERATOR_MAX_MEMORY_BYTES",
-        value: "1048576",
-        check: |c| c.reader.traceql_generator_max_memory_bytes == 1_048_576,
     },
     Row {
         var: "PULSUS_LOGQL_READ_MAX_MEMORY_BYTES",
@@ -543,8 +525,8 @@ fn matrix_rows_exactly_match_all_env_vars() {
     );
     assert_eq!(
         declared.len(),
-        97,
-        "docs/configuration.md §§1-8 document exactly 97 variables"
+        94,
+        "docs/configuration.md §§1-8 document exactly 94 variables"
     );
 
     let mut canonical: Vec<&str> = pulsus_config::ALL_ENV_VARS.to_vec();

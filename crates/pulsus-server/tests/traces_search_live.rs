@@ -2690,8 +2690,7 @@ async fn one_request_with_an_attribute_condition_sends_the_statement_alone() {
     let base = now_s() - 3_600;
     let (w0, w1) = (base, base + 600);
 
-    // Six traces, one span each — one batch by construction
-    // (`exec::BATCH_TRACES` is 32).
+    // Six traces, one span each.
     for n in 1..=6u8 {
         let s = span(
             tid(n),

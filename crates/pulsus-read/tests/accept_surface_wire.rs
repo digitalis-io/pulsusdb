@@ -10,7 +10,7 @@
 //! 2xx. The wire disposition is therefore the full route's 400-surface,
 //! `parse → validate → plan`, exactly as the server handlers compose it
 //! (`traces_api/search.rs`: parse, `querytext::validate_semantics`,
-//! `pulsus_read::plan_search`; `traces_api/metrics.rs`: the same shape
+//! `pulsus_read::plan_search_request`; `traces_api/metrics.rs`: the same shape
 //! into `plan_trace_metrics`), with a probe routed to the planner of the
 //! endpoint its reference verdict was captured against. Execution is not
 //! part of the accept surface — a plan that renders is an accept.

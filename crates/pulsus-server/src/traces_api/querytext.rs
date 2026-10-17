@@ -82,7 +82,7 @@
 //! semantic validation, `pkg/traceql/validate.go` → `RootExpr.validate`
 //! in `pkg/traceql/ast_validate.go`. It is reproduced by
 //! [`pulsus_traceql::validate`] — a ROUTE-INDEPENDENT pass, deliberately
-//! separate from the planner: `pulsus_read::plan_search` is stricter in
+//! separate from the planner: `pulsus_read::plan_search_request` is stricter in
 //! places the reference's validator is not (`{} | rate()` plans only on
 //! the metrics routes but VALIDATES everywhere), so planning the shadow
 //! parameter would manufacture a 400 the reference does not have. The

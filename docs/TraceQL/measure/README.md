@@ -1,6 +1,6 @@
 # Reproducing the numbers in docs/TraceQL/
 
-**Parts of this document describe the previous trace search engine, which no search request reaches since issue #602 part 2b; #602 part 2c-2b-1 deleted its test binaries, goldens and benches, and #602 part 2c-2b-2 deletes its code and the unit tests inside it; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** Every figure in the TraceQL documents comes from one of these scripts.
+**Parts of this document describe the previous trace search engine, which issue #602 part 2c-2b deleted — its test binaries, goldens and benches in part 2c-2b-1, its code and the unit tests inside it in part 2c-2b-2; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** Every figure in the TraceQL documents comes from one of these scripts.
 They take hosts, ports and directories as arguments; nothing is hard-coded.
 `run_all.sh` goes from a clean checkout to `results/` in one command.
 

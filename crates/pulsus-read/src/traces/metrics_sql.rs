@@ -71,7 +71,7 @@ use crate::logql::escape;
 use super::filter::{
     self, AttrProbe, CompiledLeaf, LeafEval, NestedSetField, PlanError, ValuePred,
 };
-use super::search_sql::{byte_cap_expr, root_ordering_tuple};
+use super::filter::{ZERO_PARENT_SQL, byte_cap_expr};
 use super::window_sql::WindowSql;
 
 /// The snapped, left-closed/right-open metrics evaluation window
@@ -643,7 +643,7 @@ fn nested_set_metrics_sql(
             "nestedSetLeft and nestedSetRight are not supported in metrics filters".to_string(),
         ));
     }
-    let root_true = super::search_eval::cmp_f64(op, -1.0, value);
+    let root_true = super::values::cmp_f64(op, -1.0, value);
     let Some(nonroot_true) = nonroot_constant(op, value) else {
         return Err(PlanError::TypeMismatch(
             "nestedSetParent comparisons inside the numbering range are not supported in \
@@ -1250,37 +1250,6 @@ pub fn metrics_series_probe_sql(
     format!("SELECT count() AS n FROM (\n  {inner}\n)")
 }
 
-/// The spanset-level search `| by(...)` cardinality pre-flight probe
-/// (issue #185): the SAME distinct-by-key `GROUP BY <keys> LIMIT cap+1`
-/// mechanism as the metric `by()` cap, over the search filter + window.
-/// `group_col` is the grouping column expression (currently `service` for
-/// `resource.service.name`). The engine counts its rows; `cap+1` is a
-/// static `422 query_too_broad` before the main search runs.
-pub fn search_by_probe_sql(
-    spans_table: &str,
-    attrs_table: &str,
-    body: Option<&FieldExpr>,
-    window: SnappedWindow,
-    group_col: &str,
-    cap: u64,
-) -> Result<String, PlanError> {
-    // `trace_spans` prunes on `timestamp_ns` only (no `date` column —
-    // that partition column lives on `trace_attrs_idx`, which since issue
-    // #559 this statement does not read at all: the attribute leaves are
-    // answered on the span row, by the same rule the search this preflight
-    // guards applies).
-    let filter_bool = compile_filter_bool(body, attrs_table, window, "")?;
-    let with = with_clause(&filter_bool.with_items, "  ");
-    let expr = &filter_bool.expr;
-    let inner = format!(
-        "{with}SELECT {group_col} AS g0\n  FROM {spans_table}\n  WHERE {} AND ({expr})\
-         \n  GROUP BY g0\n  LIMIT {}",
-        time_clause(window),
-        cap + 1
-    );
-    Ok(format!("SELECT count() AS n FROM (\n  {inner}\n)"))
-}
-
 /// The three SQL forms `compare()` needs (issue #182 P6b): the
 /// per-`(bucket, attr_key, attr_value)` baseline/selection cross-tab, the
 /// per-bucket totals (the `*_total` denominators + the `key=nil`
@@ -1608,10 +1577,10 @@ pub fn metrics_compare_exemplar_range_sql(input: &CompareExemplarSqlInput<'_>) -
 /// `spans_table`, restricted to the in-window `SELECT DISTINCT trace_id
 /// FROM base` IN-set but carrying **no date/time predicate** — the whole
 /// point of the trace-wide contract (docs/schemas.md §Phase-2
-/// trace-context co-load; [`super::search_sql::trace_ctx_sql`]). Both
-/// projections reuse the search path's [`byte_cap_expr`] and its
-/// [`root_ordering_tuple`], so `rootName`/`rootServiceName` here are
-/// byte-identical to what search returns. Bounded by the metrics IN-set
+/// trace-context co-load, the previous search engine's). Both
+/// projections use the shared [`byte_cap_expr`] and
+/// [`root_ordering_tuple`], whose root choice the three
+/// `compare_roots_*` tests pin. Bounded by the metrics IN-set
 /// (`max_rows_in_set`) and scan (`max_rows_to_read`) throw budgets; scale
 /// routes to #25.
 fn compare_roots_cte(spans_table: &str, base: &str) -> String {
@@ -1681,6 +1650,23 @@ fn push_prewhere_where_indented(sql: &mut String, filter: &FilterSql, window: Sn
     if let Some(where_expr) = &filter.where_expr {
         sql.push_str(&format!("\n    AND {where_expr}"));
     }
+}
+
+/// The `pick_roots` ordering tuple rendered in SQL (issue #184 plan v3):
+/// `argMin` over `(toUInt8(parent_id != <zero>), timestamp_ns, span_id)`
+/// minimizes the exact lexicographic key `exec::pick_roots` minimizes —
+/// a true zero-parent root (`0`) beats every non-root (`1`), and within a
+/// class the earliest `(timestamp_ns, span_id)` wins — so the co-load's
+/// winning span is term-for-term the span `pick_roots` would pick from
+/// the same (trace-wide) rows.
+///
+/// `pub(crate)` for one out-of-module consumer (issue #189): the
+/// `compare()` cross-tab's window-free per-trace roots read
+/// ([`super::metrics_sql::metrics_compare_sql`]) reuses this exact
+/// ordering tuple so its `rootName`/`rootServiceName` selection is
+/// byte-identical to this search path's.
+pub(crate) fn root_ordering_tuple() -> String {
+    format!("(toUInt8(parent_id != {ZERO_PARENT_SQL}), timestamp_ns, span_id)")
 }
 
 #[cfg(test)]
@@ -2360,5 +2346,104 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{name} must lower on the metrics route: {e}"));
             assert_eq!(sql, "0", "{name} must lower to the match-nothing constant");
         }
+    }
+
+    /// Issue #184 AC-Δ1c, adapted from the deleted `search_sql.rs` test of
+    /// the previous engine's trace-context co-load (#602 part 2c-2b-2):
+    /// `compare()`'s roots read projects `root_name`/`root_service` as the
+    /// shared [`byte_cap_expr`] render inside `argMin`, and every cap token
+    /// in it comes from those two renders — an inline copy of the cap
+    /// pushes a count to 3.
+    #[test]
+    fn compare_roots_cap_root_strings_via_the_shared_helper_only() {
+        let sql = compare_roots_cte("trace_spans", "SELECT trace_id FROM base");
+        for col in ["name", "service"] {
+            assert!(
+                sql.contains(&format!(
+                    "argMin({}, (toUInt8(parent_id != ",
+                    byte_cap_expr(col)
+                )),
+                "root {col} argMin must wrap byte_cap_expr({col}): {sql}"
+            );
+        }
+        assert_eq!(
+            sql.matches("substringUTF8").count(),
+            2,
+            "two capped strings: {sql}"
+        );
+        assert_eq!(
+            sql.matches("8192").count(),
+            2,
+            "cap literal only from the helper: {sql}"
+        );
+        assert_eq!(
+            sql.matches("2048").count(),
+            2,
+            "fallback only from the helper: {sql}"
+        );
+    }
+
+    /// Issue #184 AC-Δ1c (ordering), adapted the same way: both `argMin`s
+    /// share ONE ordering tuple on the RAW columns, so the cap never
+    /// perturbs root selection and both values come from the same span.
+    #[test]
+    fn compare_roots_order_both_argmins_by_the_raw_root_tuple() {
+        let sql = compare_roots_cte("trace_spans", "SELECT trace_id FROM base");
+        let tuple = root_ordering_tuple();
+        assert_eq!(
+            sql.matches(&tuple).count(),
+            2,
+            "both argMins share the tuple: {sql}"
+        );
+        assert!(
+            tuple.contains("toFixedString(unhex('0000000000000000'), 8)"),
+            "the zero-parent sentinel spelling: {tuple}"
+        );
+        assert!(
+            !tuple.contains("substringUTF8") && !tuple.contains("8192"),
+            "the ordering tuple stays on raw columns: {tuple}"
+        );
+    }
+
+    /// Issue #184 AC-Δ1e, adapted the same way: the roots read INVOKES the
+    /// shared helper by name for both projections, so no hand-written copy
+    /// of the cap can stand in for it.
+    #[test]
+    fn compare_roots_invoke_the_shared_cap_helper_by_name() {
+        let src = include_str!("metrics_sql.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap();
+        let body = &prod[prod
+            .find("fn compare_roots_cte")
+            .expect("the roots builder")..];
+        let body = &body[..body.find("\n}\n").expect("its end")];
+        for col in ["name", "service"] {
+            assert!(
+                body.contains(&format!("byte_cap_expr(\"{col}\")")),
+                "compare_roots_cte must call byte_cap_expr(\"{col}\")"
+            );
+        }
+    }
+
+    /// Issue #184 AC-Δ1b, adapted from the deleted `search_sql.rs` test of
+    /// the previous engine's trace-wide co-loads (#602 part 2c-2b-2): the
+    /// roots read carries NO time predicate and no row cap of its own —
+    /// a `trace_id IN` restriction to the base's traces only — so the root
+    /// it picks is the whole trace's, whatever the window.
+    #[test]
+    fn compare_roots_read_the_whole_trace_with_no_time_predicate_or_row_cap() {
+        let sql = compare_roots_cte("trace_spans", "BASE");
+        for op in [" >", " <", " ="] {
+            assert!(
+                !sql.contains(&format!("timestamp_ns{op}")),
+                "trace-wide read: {sql}"
+            );
+        }
+        assert!(!sql.contains(" date "), "no day bound: {sql}");
+        assert!(!sql.contains("LIMIT"), "no row cap: {sql}");
+        assert!(
+            sql.contains("WHERE trace_id IN (SELECT DISTINCT trace_id FROM (\n  BASE\n  ))"),
+            "the base's traces only: {sql}"
+        );
+        assert!(sql.contains("GROUP BY trace_id"), "per-trace groups: {sql}");
     }
 }

@@ -1,6 +1,6 @@
 # Changing the trace tables
 
-**Parts of this document describe the previous trace search engine, which no search request reaches since issue #602 part 2b; #602 part 2c-2b-1 deleted its test binaries, goldens and benches, and #602 part 2c-2b-2 deletes its code and the unit tests inside it; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** **What this is.** The design for the ClickHouse tables that hold traces: what we
+**Parts of this document describe the previous trace search engine, which issue #602 part 2c-2b deleted — its test binaries, goldens and benches in part 2c-2b-1, its code and the unit tests inside it in part 2c-2b-2; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** **What this is.** The design for the ClickHouse tables that hold traces: what we
 store today, what is wrong with it in numbers, what we would store instead, and
 what each query costs before and after.
 
@@ -409,7 +409,7 @@ it.
 ### 2.2 Four of the nine query shapes have no sorted path
 
 A ClickHouse table has one sort order. Our eight shapes want six. Ranked by our
-own planner, lower is better (`crates/pulsus-read/src/traces/filter.rs:89-103`):
+own planner, lower is better (`crates/pulsus-read/src/traces/filter.rs:84-98`):
 
 | rank | class | what reaches it | rows read in a 1-hour window |
 |---|---|---|---|
@@ -448,15 +448,15 @@ that costs 75% of the storage.**
 
 And the request that reads it already computes a window and throws it away. The
 values route parses `start`/`end`, defaulting to `traceql_tag_lookback` = 24 h
-(`crates/pulsus-config/src/model.rs:571`, `crates/pulsus-server/src/traces_api/tags.rs:161-164`), then calls
-`tag_values_sql` (`crates/pulsus-read/src/traces/tags_sql.rs:118-127`), which emits no time predicate at all —
+(`crates/pulsus-config/src/model.rs:553`, `crates/pulsus-server/src/traces_api/tags.rs:161-164`), then calls
+`tag_values_sql` (`crates/pulsus-read/src/traces/tags_sql.rs:119-128`), which emits no time predicate at all —
 because the table it reads has no time column.
 
 ### 2.4 The narrowed dropdown is a join over the window
 
 Open a tag-value dropdown while a service filter is set and the read becomes a
 semi-join between the two tables at **day** grain
-(`crates/pulsus-read/src/traces/tags_sql.rs:282-312`, chosen at `crates/pulsus-read/src/traces/exec.rs:2106-2137`):
+(`crates/pulsus-read/src/traces/tags_sql.rs:283-313`, chosen at `crates/pulsus-read/src/traces/exec.rs:1787-1818`):
 
 ```sql
 SELECT DISTINCT val, val_type
@@ -1193,7 +1193,7 @@ WHERE timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000
 GROUP BY trace_id ORDER BY bound_ts DESC, trace_id ASC LIMIT 100001
 ```
 
-Phase 2 takes 32 candidates at a time (`crates/pulsus-read/src/traces/exec.rs:126`). **Today that is two
+Phase 2 takes 32 candidates at a time (`crates/pulsus-read/src/traces/exec.rs:126` @ 1cdb3e5e). **Today that is two
 statements per batch** — one to fetch the spans, one to ask the index which of
 them carry the attribute:
 
@@ -1712,7 +1712,7 @@ Partition blocks.**
 ### Q4 — the tag dropdown
 
 ```sql
--- Q4a values for one key, today   (crates/pulsus-read/src/traces/tags_sql.rs:118-127) - no time bound at all
+-- Q4a values for one key, today   (crates/pulsus-read/src/traces/tags_sql.rs:119-128) - no time bound at all
 SELECT DISTINCT val, val_type FROM trace_tag_catalog
 WHERE key = 'http.status_code' AND scope = 'span'
 ORDER BY val, val_type LIMIT 1001
@@ -1723,7 +1723,7 @@ WHERE key = 'http.status_code' AND scope = 'span'
   AND date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
 ORDER BY val, val_type LIMIT 1001
 
--- Q4c values narrowed by a service, today (crates/pulsus-read/src/traces/tags_sql.rs:282-312): the semi-join
+-- Q4c values narrowed by a service, today (crates/pulsus-read/src/traces/tags_sql.rs:283-313): the semi-join
 --    of §2.4 - measured 2,129,920 rows / 260 marks on C1 with service_time present;
 --    4,015,232 / 494 without it.  §2.4 carries both and the instrument
 -- Q4c values narrowed by a service, new: a primary-key seek, no join
@@ -2289,7 +2289,7 @@ first-written shape had 1,543 extra.
 
 **Two places where "more candidates" is not free.** Both need a test.
 
-1. `traceql_max_candidates = 100_000` (`crates/pulsus-config/src/model.rs:569`). A query sitting
+1. `traceql_max_candidates = 100_000` (`crates/pulsus-config/src/model.rs:551`). A query sitting
    just under the ceiling today can now hit it, and hitting it is reported as a
    partial result. The test uses a corpus of exactly 100,000 candidate traces for
    one value, one query at `W = B` and one at `W = B/2`, and asserts the returned
@@ -2319,7 +2319,7 @@ Three aggregate conditions are pushed into the candidate generator today
 Losing a pushdown does not change an answer. The condition is re-evaluated over
 the hydrated spans either way; the pushed form only narrows the candidate list,
 and the plan already keeps a byte-for-byte fallback statement with nothing pushed
-(`crates/pulsus-read/src/traces/search_plan.rs:3084-3104`, used at `crates/pulsus-read/src/traces/exec.rs:2393-2421`). The effect is more
+(`crates/pulsus-read/src/traces/search_plan.rs:3084-3104`, used at `crates/pulsus-read/src/traces/exec.rs:2051-2079`). The effect is more
 candidates, not a different result.
 
 `by()` grouping already refuses to push whenever the generator is not
@@ -2987,9 +2987,9 @@ a row built from it is 1970-dated and dropped in the same way, silently.
 Every column, type, codec, sort key, partition key, projection column list and
 materialized view in §1 (`crates/pulsus-schema/src/catalog.rs:227-234, 244-256, 266-281, 335-407,
 648-936, 934-1000`); every statement and its `SELECT` list (`crates/pulsus-read/src/traces/search_sql.rs:231,
-230, 286, 325, 397, 428, 468, 492`; `crates/pulsus-read/src/traces/tags_sql.rs:89, 118, 253, 282`;
-`crates/pulsus-read/src/traces/sql.rs:16-26`; and the committed goldens); the batch arithmetic (`crates/pulsus-read/src/traces/exec.rs:126`,
-`crates/pulsus-config/src/model.rs:569-571`); which aggregates push down and what they read
+230, 286, 325, 397, 428, 468, 492`; `crates/pulsus-read/src/traces/tags_sql.rs:90, 118, 253, 282`;
+`crates/pulsus-read/src/traces/sql.rs:16-26`; and the committed goldens); the batch arithmetic (`crates/pulsus-read/src/traces/exec.rs:126` @ 1cdb3e5e,
+`crates/pulsus-config/src/model.rs:551-553`); which aggregates push down and what they read
 (`crates/pulsus-read/src/traces/compile.rs:439-489, 560-562`); the write path's failure modes
 (`crates/pulsus-write/src/writer/trace.rs:9-19, 137-185, 172`; `crates/pulsus-write/src/writer/table.rs:375-442`;
 `crates/pulsus-write/src/writer/backfill.rs:23-28, 189-201, 214-220`); the wire framing
@@ -3160,12 +3160,12 @@ from its source; the pointer is not reproduced here.
 
 | what | value | where |
 |---|---|---|
-| phase-2 batch | 32 candidate traces | `crates/pulsus-read/src/traces/exec.rs:126` |
-| candidate ceiling | 100,000 | `crates/pulsus-config/src/model.rs:569` |
-| scan budget | 50,000,000 rows | `crates/pulsus-config/src/model.rs:570` |
-| tag lookback default | 24 hours | `crates/pulsus-config/src/model.rs:571` |
-| spans per trace cap | `LIMIT 10001 BY trace_id` | `crates/pulsus-read/src/traces/exec.rs:131` |
-| tag name / value caps | 10,000 / 1,000 | `crates/pulsus-read/src/traces/exec.rs:131, 135` |
+| phase-2 batch | 32 candidate traces | `crates/pulsus-read/src/traces/exec.rs:126` @ 1cdb3e5e |
+| candidate ceiling | 100,000 | `crates/pulsus-config/src/model.rs:551` |
+| scan budget | 50,000,000 rows | `crates/pulsus-config/src/model.rs:552` |
+| tag lookback default | 24 hours | `crates/pulsus-config/src/model.rs:553` |
+| spans per trace cap | `LIMIT 10001 BY trace_id` | `crates/pulsus-read/src/traces/exec.rs:131` @ 1cdb3e5e |
+| tag name / value caps | 10,000 / 1,000 | `crates/pulsus-read/src/traces/exec.rs:131 @ 1cdb3e5e, 135` |
 | storage → reader wire format | RowBinary, LZ4-framed | `crates/pulsus-clickhouse/src/pool.rs:695` → `vendor/clickhouse/Cargo.toml:49` → `vendor/clickhouse/src/query.rs:221-231` |
 | shard key | `cityHash64(trace_id)` | `crates/pulsus-schema/src/render.rs:55-57` |
 | pushed aggregates | `uniqExact(span_id)`, `max(duration_ns)`, `min(duration_ns)` | `crates/pulsus-read/src/traces/compile.rs:478-489` |
@@ -4330,7 +4330,7 @@ The image line (`:571`) is shown at today's floor; the source quoted here pinned
 
 ### `crates/pulsus-read/src/traces/filter.rs`
 
-**`:89-103`**
+**`:84-98`**
 
 ```rust
    89  pub enum GenClass {
@@ -4405,19 +4405,19 @@ The image line (`:571`) is shown at today's floor; the source quoted here pinned
 
 ### `crates/pulsus-read/src/traces/tags_sql.rs`
 
-**`:89-89`**
+**`:90-90`**
 
 ```rust
    89  pub fn tag_names_sql(scope_literal: Option<&str>, limit: usize) -> String {
 ```
 
-**`:118-118`**
+**`:119-119`**
 
 ```rust
   118  pub fn tag_values_sql(key_literal: &str, scope_literal: Option<&str>, limit: usize) -> String {
 ```
 
-**`:118-127`**
+**`:119-128`**
 
 ```rust
   118  pub fn tag_values_sql(key_literal: &str, scope_literal: Option<&str>, limit: usize) -> String {
@@ -4432,19 +4432,19 @@ The image line (`:571`) is shown at today's floor; the source quoted here pinned
   127  }
 ```
 
-**`:253-253`**
+**`:254-254`**
 
 ```rust
   253  pub fn span_name_values_sql(
 ```
 
-**`:282-282`**
+**`:283-283`**
 
 ```rust
   282  pub fn attr_values_narrowed_sql(
 ```
 
-**`:282-312`**  (31 lines in the range; comments and blanks elided, 30 shown)
+**`:283-313`**  (31 lines in the range; comments and blanks elided, 30 shown)
 
 ```rust
   282  pub fn attr_values_narrowed_sql(
@@ -4481,31 +4481,31 @@ The image line (`:571`) is shown at today's floor; the source quoted here pinned
 
 ### `crates/pulsus-read/src/traces/exec.rs`
 
-**`:117-117`**
+**`:126-126` @ 1cdb3e5e, before #602 part 2c-2b-2 deleted it**
 
 ```rust
   117  pub const BATCH_TRACES: usize = 32;
 ```
 
-**`:122-122`**
+**`:131-131` @ 1cdb3e5e, before #602 part 2c-2b-2 deleted it**
 
 ```rust
   122  pub const MAX_SPANS_PER_TRACE: usize = 10_000;
 ```
 
-**`:130-130`**
+**`:76-76`**
 
 ```rust
   130  pub const TAG_NAMES_MAX: usize = 10_000;
 ```
 
-**`:135-135`**
+**`:81-81`**
 
 ```rust
   135  pub const TAG_VALUES_MAX: usize = 1_000;
 ```
 
-**`:1827-1868`**  (42 lines in the range; comments and blanks elided, 30 shown)
+**`:1795-1836`**  (42 lines in the range; comments and blanks elided, 30 shown)
 
 ```rust
  1825      pub async fn list_tag_values(
@@ -4540,7 +4540,7 @@ The image line (`:571`) is shown at today's floor; the source quoted here pinned
  1864              )
 ```
 
-**`:2165-2193`**  (29 lines in the range; comments and blanks elided, 14 shown)
+**`:2520-2548` @ 1cdb3e5e, before #602 part 2c-2b-2 deleted it**  (29 lines in the range; comments and blanks elided, 14 shown)
 
 ```rust
  2172              let rows: Vec<CandidateRow> = match attempt {

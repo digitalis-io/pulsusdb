@@ -77,11 +77,10 @@ use crate::traces::PlanError;
 use crate::traces::exec::{
     ByteBudget, RootSummary, SearchOutput, TraceSearchResult, output_reserve_bytes,
 };
-use crate::traces::search_eval::{
+use crate::traces::values::{
     GroupCardinalityCounter, GroupValue, SpanSetGroup, SpanSummary, group_double_bits,
     group_reserve_bytes, groups_reserve_bytes, match_reserve_bytes, summary_reserve_bytes,
 };
-use crate::traces::search_plan::SearchPlan;
 use crate::traces::window_sql::WindowSql;
 use pulsus_clickhouse::ChError;
 
@@ -914,7 +913,7 @@ fn agg_of(
             )));
         }
     };
-    let threshold = crate::traces::search_plan::aggregate_threshold(op, &field.cloned(), value)?;
+    let threshold = aggregate_threshold(op, &field.cloned(), value)?;
     Ok(Agg {
         display: match field {
             Some(FieldExpr::Field(f)) => format!("{op}({f})"),
@@ -940,11 +939,11 @@ pub(crate) fn aggregate_value(text: &str, value_type: &str) -> Result<GroupValue
         "Int64" => GroupValue::Int(text.parse().map_err(|e| format!("count {text:?}: {e}"))?),
         "AggInt" => GroupValue::Int(f()? as i64),
         "AggDouble" => GroupValue::Double(f()?.to_bits()),
-        "DurationI" => GroupValue::Str(crate::traces::search_eval::go_duration_string(
+        "DurationI" => GroupValue::Str(crate::traces::values::go_duration_string(
             text.parse()
                 .map_err(|e| format!("duration {text:?}: {e}"))?,
         )),
-        "DurationF" => GroupValue::Str(crate::traces::search_eval::go_duration_string(f()? as i64)),
+        "DurationF" => GroupValue::Str(crate::traces::values::go_duration_string(f()? as i64)),
         other => return Err(format!("an aggregate value of type {other} is not decoded")),
     })
 }
@@ -1094,6 +1093,17 @@ pub fn compile_search_sliced(
     })
 }
 
+/// The caller-validated request window and response caps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchParams {
+    pub start_ns: i64,
+    pub end_ns: i64,
+    /// Result cap (`limit` param, docs/api.md §4.2).
+    pub limit: u32,
+    /// Spans-per-spanset cap (`spss` param).
+    pub spss: u32,
+}
+
 /// A search the route answers (issue #602 part 2b): its window, `limit`,
 /// `spss` and query, accepted by [`compile_search`].
 #[derive(Debug, Clone, PartialEq)]
@@ -1110,7 +1120,7 @@ pub struct SearchRequest {
 /// `hints` are accepted and ignored.
 pub fn plan_search_request(
     query: &Query,
-    params: &crate::traces::search_plan::SearchParams,
+    params: &SearchParams,
     tables: &super::metrics::StatementTables<'_>,
     max_depth: u32,
 ) -> Result<SearchRequest, PlanError> {
@@ -1135,45 +1145,6 @@ pub fn plan_search_request(
         None,
     )?;
     Ok(request)
-}
-
-impl SearchPlan {
-    /// The request this plan's window, caps and query make, unvalidated:
-    /// the previous engine's tests compare the two engines on one plan.
-    pub fn request(&self) -> SearchRequest {
-        SearchRequest {
-            start_ns: self.window.start_ns,
-            end_ns: self.window.end_ns,
-            limit: self.limit,
-            spss: self.spss,
-            query: Query {
-                spanset: self.spanset.clone(),
-                pipeline: self.pipeline.clone(),
-                hints: Vec::new(),
-            },
-        }
-    }
-}
-
-/// The search statement for `plan`, when [`compile_search`] accepts it.
-pub fn plan_statement(
-    plan: &SearchPlan,
-    spans_table: &str,
-    traces_table: &str,
-    resources_table: &str,
-    max_depth: u32,
-    indexed: &[super::attr_index::IndexedAttr],
-) -> Option<SearchStatement> {
-    plan_statement_sliced(
-        &plan.request(),
-        spans_table,
-        traces_table,
-        resources_table,
-        max_depth,
-        indexed,
-        None,
-    )
-    .ok()
 }
 
 /// The search statement for `request`, its top-K reading the newest
@@ -1289,7 +1260,7 @@ pub(crate) fn group_value(text: &str, value_type: &str) -> Result<GroupValue, St
         )),
         "Bool" => GroupValue::Bool(text == "true"),
         "None" => GroupValue::Nil,
-        "Duration" => GroupValue::Str(crate::traces::search_eval::go_duration_string(
+        "Duration" => GroupValue::Str(crate::traces::values::go_duration_string(
             text.parse::<i64>()
                 .map_err(|e| format!("a by() duration {text:?}: {e}"))?,
         )),
@@ -1441,11 +1412,44 @@ pub fn decode_search(
         .map_err(|e| SearchDecodeError(e.to_string()))
 }
 
+/// The numeric threshold one aggregate stage compares against: the
+/// stage's literal as an `f64`, which [`agg_of`] renders into the
+/// statement as `toFloat64('…')`. A duration literal is a threshold only
+/// for a duration aggregate other than `count()`. Moved here from the
+/// previous search engine's planner when #602 part 2c-2b-2 deleted it.
+fn aggregate_threshold(
+    op: pulsus_traceql::AggregateOp,
+    field: &Option<FieldExpr>,
+    value: &Value,
+) -> Result<f64, PlanError> {
+    match value {
+        Value::Number(raw) => raw
+            .parse::<f64>()
+            .ok()
+            .filter(|n| n.is_finite())
+            .ok_or_else(|| PlanError::TypeMismatch(format!("not a finite number: {raw:?}"))),
+        // A duration threshold is meaningful only against a duration
+        // aggregate (nanosecond scale).
+        Value::Duration(d)
+            if matches!(
+                field,
+                Some(FieldExpr::Field(Field::Intrinsic(Intrinsic::Duration)))
+            ) && op != pulsus_traceql::AggregateOp::Count =>
+        {
+            Ok(d.as_nanos() as f64)
+        }
+        _ => Err(PlanError::TypeMismatch(
+            "aggregate comparisons require a numeric (or duration, for duration aggregates) \
+             threshold"
+                .to_string(),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod charge_tests {
     use super::*;
     use crate::traces::exec::{ByteBudget, RETAINED_ENTRY_OVERHEAD, output_reserve_bytes};
-    use crate::traces::search_eval::TraceMatch;
     use crate::traces::spans::rows::{SearchProjected, SearchSpanTuple};
 
     /// Section 6.1's four groups: a string, an int, `name` and an array.
@@ -1523,17 +1527,18 @@ mod charge_tests {
         ]
     }
 
-    /// Everything today's engine charges for the same response: the trace
-    /// buffer, then per trace `TraceMatch::retained_bytes` and the root
-    /// strings.
+    /// The expected charge for the response: the trace buffer, then per
+    /// trace an entry's overhead, the summaries buffer and its payload, and
+    /// the root strings. (The previous search engine also charged each
+    /// trace's own match struct here; #602 part 2c-2b-2 dropped it with that
+    /// engine, the trace's slot being charged with the output buffer.)
     fn todays_charge(out: &SearchOutput) -> usize {
         output_reserve_bytes(out.traces.len())
             + out
                 .traces
                 .iter()
                 .map(|t| {
-                    std::mem::size_of::<TraceMatch>()
-                        + RETAINED_ENTRY_OVERHEAD
+                    RETAINED_ENTRY_OVERHEAD
                         + t.spans.capacity() * std::mem::size_of::<SpanSummary>()
                         + t.spans
                             .iter()
@@ -1545,9 +1550,10 @@ mod charge_tests {
                 .sum::<usize>()
     }
 
-    /// Section 6.1: the decode charges exactly what today's engine charges
-    /// for the response it builds; a budget of exactly that decodes, and
-    /// one byte less is refused.
+    /// Section 6.1: the decode charges exactly the expected charge
+    /// ([`todays_charge`]) for the response it builds, the previous search
+    /// engine's extra struct charge gone with that engine; a budget of
+    /// exactly that decodes, and one byte less is refused.
     #[test]
     fn the_decode_charges_what_todays_engine_charges() {
         let s = statement();
@@ -1621,14 +1627,15 @@ mod charge_tests {
         }]
     }
 
-    /// Issue #592 part 2, section 7.1: the grouped decode charges what
-    /// today's engine charges for the same response, its groups included
-    /// (`TraceMatch::retained_bytes` with `groups_retained_bytes`); it
+    /// Issue #592 part 2, section 7.1: the grouped decode charges the
+    /// expected charge for the same response, its groups included
+    /// ([`todays_charge`] with `groups_retained_bytes`, the previous search
+    /// engine's extra struct charge gone with that engine); it
     /// fits a budget of that plus the distinct group tuples the cap's
     /// counter holds while it runs, and one byte less is refused.
     #[test]
     fn the_grouped_decode_charges_what_todays_engine_charges() {
-        use crate::traces::search_eval::{GroupValue, group_tuple_bytes, groups_retained_bytes};
+        use crate::traces::values::{GroupValue, group_tuple_bytes, groups_retained_bytes};
         let q = pulsus_traceql::parse(r#"{ span.foo = "bar" } | by(span.k)"#).expect("parses");
         let w = WindowSql::start_closed_end_open(1_000_000_000_000, 2_000_000_000_000);
         let ctx = PredicateCtx {
@@ -1679,13 +1686,13 @@ mod charge_tests {
         );
     }
 
-    /// Issue #592 part 3: an aggregate's one group charges what today's
-    /// engine charges — `TraceMatch::retained_bytes` with
-    /// `groups_retained_bytes` — and no distinct-group tuple: one byte less
-    /// than that is refused.
+    /// Issue #592 part 3: an aggregate's one group charges the expected
+    /// amount — [`todays_charge`] with `groups_retained_bytes`, the previous
+    /// search engine's extra struct charge gone with that engine — and no
+    /// distinct-group tuple: one byte less than that is refused.
     #[test]
     fn the_aggregated_decode_charges_what_todays_engine_charges() {
-        use crate::traces::search_eval::groups_retained_bytes;
+        use crate::traces::values::groups_retained_bytes;
         let q =
             pulsus_traceql::parse(r#"{ span.foo = "bar" } | avg(duration) > 1ms"#).expect("parses");
         let w = WindowSql::start_closed_end_open(1_000_000_000_000, 2_000_000_000_000);

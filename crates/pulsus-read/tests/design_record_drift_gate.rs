@@ -34,7 +34,7 @@ const COUNTS_TSV: &str = "crates/pulsus-read/tests/design_record_counts.tsv";
 /// enumeration to publish rather than a figure the plan could derive: it
 /// required `>= 19`, and the enumeration came to 24 across 12 derived
 /// counts.
-const RECORDED_COUNT_SITES: usize = 24;
+const RECORDED_COUNT_SITES: usize = 19;
 
 fn repo_root() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -114,14 +114,11 @@ enum Derivation {
     },
     /// The sum of two other derived counts.
     Sum(&'static str, &'static str),
-    /// The row count the shipped residual-effect gate asserts, read from
-    /// the call that asserts it.
-    ShippedResidualEffectRows,
 }
 
 /// Every derived count the record states, and where its value comes from.
 /// The `id` column of the dataset resolves through this list.
-const DERIVATIONS: [(&str, Derivation); 12] = [
+const DERIVATIONS: [(&str, Derivation); 10] = [
     (
         "traceql_pipeline_stage_variants",
         Derivation::EnumVariants {
@@ -134,13 +131,6 @@ const DERIVATIONS: [(&str, Derivation); 12] = [
         Derivation::EnumVariants {
             path: "crates/pulsus-logql/src/ast.rs",
             ident: "Stage",
-        },
-    ),
-    (
-        "tql_link_variants",
-        Derivation::EnumVariants {
-            path: "crates/pulsus-read/src/traces/compile.rs",
-            ident: "TqlLink",
         },
     ),
     (
@@ -196,10 +186,6 @@ const DERIVATIONS: [(&str, Derivation); 12] = [
         "residual_effects_total",
         Derivation::Sum("section_3_1_effect_rows", "section_7_1_effect_rows"),
     ),
-    (
-        "traceql_residual_effect_gate_rows",
-        Derivation::ShippedResidualEffectRows,
-    ),
 ];
 
 const QUERY_LOWERING: &str = "docs/query-lowering.md";
@@ -226,18 +212,6 @@ fn derive(id: &str) -> u64 {
             without
         }
         Derivation::Sum(a, b) => derive(a) + derive(b),
-        Derivation::ShippedResidualEffectRows => {
-            let src = read("crates/pulsus-read/src/traces/compile.rs");
-            src.split_once("assert_every_residual_state_effect::<Tql>(&rows, ")
-                .expect("traces/compile.rs must assert its residual-effect row count")
-                .1
-                .split(')')
-                .next()
-                .expect("the call is closed")
-                .trim()
-                .parse()
-                .expect("the row count is a number")
-        }
     }
 }
 
@@ -883,7 +857,11 @@ fn citation_occurrences() -> Vec<Occurrence> {
                         j += 1 + second.len();
                     }
                 }
-                if !first.is_empty() && start < dot {
+                // A citation followed by `@ <commit>` names a line in another
+                // tree at that commit (#602 part 2c-2b-2 pins the citations
+                // into code it deleted): it is not this tree's to check.
+                let pinned = pinned_to_a_commit(&line[j..]);
+                if !first.is_empty() && start < dot && !pinned {
                     written_out.push((start, line[start..dot + 3].to_string()));
                     out.push(Occurrence {
                         doc: doc.to_string(),
@@ -968,7 +946,10 @@ fn continuations(line: &str) -> Vec<(usize, u32, u32)> {
                 j += 1 + second.len();
             }
         }
-        if !first.is_empty() && bytes.get(j) == Some(&b'`') {
+        // Pinned to another tree (`@ <commit>`), as a written-out
+        // citation can be: skipped the same way.
+        let pinned = pinned_to_a_commit(&line[(j + 1).min(line.len())..]);
+        if !first.is_empty() && bytes.get(j) == Some(&b'`') && !pinned {
             out.push((
                 open,
                 first.parse().expect("digits"),
@@ -978,6 +959,60 @@ fn continuations(line: &str) -> Vec<(usize, u32, u32)> {
         at = open + 2;
     }
     out
+}
+
+/// Whether the text after a citation pins it to another tree, by the rule
+/// `docs_source_pointers` applies to its pins (a citation here is read one
+/// line at a time, so the next line is not consulted). See
+/// [`a_citation_is_pinned_only_by_a_commit_or_a_version`].
+fn pinned_to_a_commit(rest: &str) -> bool {
+    let Some(after) = rest.trim_start_matches('`').trim_start().strip_prefix('@') else {
+        return false;
+    };
+    pin_names_a_version(after, "")
+}
+
+/// The trees a pin may name before its version: the six the documents
+/// already pin. A pin naming another tree fails until it is added here.
+const PIN_TREES: [&str; 6] = [
+    "grafana/loki",
+    "grafana/tempo",
+    "tempo",
+    "Tempo",
+    "jsoniter",
+    "client_golang/exp",
+];
+
+/// A hex commit of 7 to 40 digits, or a version (`v3.0.2`, `1.0.150`,
+/// `v13.1.5-11-g3c7375b`), with surrounding punctuation stripped.
+fn pin_version_word(w: &str) -> bool {
+    let w = w.trim_matches(|c: char| matches!(c, '`' | '(' | ')' | ',' | ';' | '.' | ':'));
+    let hex = w.len() >= 7 && w.len() <= 40 && w.chars().all(|c| c.is_ascii_hexdigit());
+    let v = w.strip_prefix('v').unwrap_or(w);
+    let mut parts = v.split(['-', '+']).next().unwrap_or("").split('.');
+    let version =
+        v.contains('.') && parts.all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
+    hex || version
+}
+
+/// Whether the words after an `@` pin a pointer: the version (or commit)
+/// right after the `@`, or right after one of [`PIN_TREES`]. `next` is the
+/// following line, read only when this one ends before the version: one
+/// step may cross a line break, no more. Issue #602 part 2c-2b-2.
+fn pin_names_a_version(after: &str, next: &str) -> bool {
+    let words: Vec<&str> = after
+        .split_whitespace()
+        .chain(next.split_whitespace())
+        .collect();
+    let tree =
+        |w: &str| PIN_TREES.contains(&w.trim_matches(|c: char| matches!(c, '`' | '(' | ')')));
+    match (words.first(), words.get(1)) {
+        (Some(w0), _) if pin_version_word(w0) => true,
+        // `@ <tree> <version>`: the two words come from this line and the
+        // next at most, so at most one step crosses the break.
+        (Some(w0), Some(w1)) => tree(w0) && pin_version_word(w1),
+        _ => false,
+    }
 }
 
 /// What a citation resolves to, and when it does not, why not.
@@ -1480,8 +1515,8 @@ fn no_citation_row_is_unused() {
 //
 // **Resolution is by FILE, not by last path segment.** Two of the
 // selectors share a final segment —
-// `every_residual_state_effect_is_the_one_the_document_states` is
-// defined in `logql/compile.rs` and in `traces/compile.rs` — and 308
+// `every_residual_state_effect_is_the_one_the_document_states` was
+// defined in `logql/compile.rs` and in the since-deleted `traces/compile.rs` — and 308
 // integration-test function names in this workspace are defined in more
 // than one binary. A check resolving on the last segment would answer
 // "present" for a gate that exists somewhere else entirely.
@@ -1496,6 +1531,10 @@ enum GateState {
     /// its own negative control, which is what makes a finder that
     /// reports everything present detectable.
     Absent,
+    /// A gate the record names that #602 part 2c-2b-2 deleted with the
+    /// previous search engine: the row's file no longer defines it (or is
+    /// no longer tracked). Not counted as the negative control.
+    Deleted,
 }
 
 #[derive(Debug, Clone)]
@@ -1504,6 +1543,31 @@ struct GateRow {
     krate: String,
     file: String,
     state: GateState,
+}
+
+/// The record's gates #602 part 2c-2b-2 deleted with the previous search
+/// engine — the only rows `design_record_gates.tsv` may mark `deleted`.
+const DELETED_GATES: [&str; 2] = [
+    "every_traceql_chain_link_has_a_row_in_the_lowering_document",
+    "traces::compile::tests::every_residual_state_effect_is_the_one_the_document_states",
+];
+
+/// `Ok` when the rows marked `deleted` are exactly [`DELETED_GATES`].
+fn deleted_rows_are_the_named_ones(rows: &[GateRow]) -> Result<(), String> {
+    let marked: BTreeSet<&str> = rows
+        .iter()
+        .filter(|r| r.state == GateState::Deleted)
+        .map(|r| r.selector.as_str())
+        .collect();
+    let named: BTreeSet<&str> = DELETED_GATES.into_iter().collect();
+    if marked == named {
+        Ok(())
+    } else {
+        Err(format!(
+            "{GATES_TSV} marks {marked:?} deleted; only {named:?} may be, the gates #602 part \
+             2c-2b-2 deleted"
+        ))
+    }
 }
 
 fn gate_rows() -> Vec<GateRow> {
@@ -1526,6 +1590,7 @@ fn gate_rows() -> Vec<GateRow> {
             state: match f[3] {
                 "exists" => GateState::Exists,
                 "absent" => GateState::Absent,
+                "deleted" => GateState::Deleted,
                 other => panic!("{GATES_TSV}:{}: unknown state {other:?}", n + 1),
             },
         });
@@ -1628,8 +1693,17 @@ fn every_gate_the_record_names_exists_or_is_marked_absent() {
                     row.selector
                 );
             }
+            GateState::Deleted => {
+                assert!(
+                    !tracked.contains(&row.file) || !read(&row.file).contains(&needle),
+                    "{GATES_TSV} calls {} deleted, but {} still defines it",
+                    row.selector,
+                    row.file
+                );
+            }
         }
     }
+    deleted_rows_are_the_named_ones(&rows).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(
         absent_rows, 1,
         "the record carries exactly one deliberately absent gate — its own negative control. \
@@ -1644,7 +1718,7 @@ fn every_gate_the_record_names_exists_or_is_marked_absent() {
         }
         let cells: Vec<&str> = line.trim_matches('|').split(" | ").map(str::trim).collect();
         let Some(today) = cells.last() else { continue };
-        if !today.contains("exists") && !today.contains("absent") {
+        if !today.contains("exists") && !today.contains("absent") && !today.contains("deleted") {
             continue;
         }
         let row = rows
@@ -1655,6 +1729,12 @@ fn every_gate_the_record_names_exists_or_is_marked_absent() {
         assert_eq!(
             says_exists,
             row.state == GateState::Exists,
+            "docs/query-lowering.md calls {selector} {today:?}, and the tree says {:?}",
+            row.state
+        );
+        assert_eq!(
+            today.contains("deleted"),
+            row.state == GateState::Deleted,
             "docs/query-lowering.md calls {selector} {today:?}, and the tree says {:?}",
             row.state
         );
@@ -1909,34 +1989,14 @@ enum ReviewedVerdict {
 // shorter body moved `exec.rs:3324` to `:3267`, `exec.rs:3284-3290` to
 // `:3227-3233`, and the grouped row charge moved `exec.rs:910` to `:912`.
 // The verdicts are unchanged.
-const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 5] = [
+const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 2] = [
     (
         "docs/query-lowering.md",
-        "exec.rs:3267",
+        "exec.rs:2100-2106",
         0,
         ReviewedVerdict::FallbackWrong,
-        "a LogQL section citing the TraceQL search executor's generator settings;          crates/pulsus-read/src/logql/exec.rs has no such thing",
-    ),
-    (
-        "docs/query-lowering.md",
-        "exec.rs:3267",
-        2,
-        ReviewedVerdict::FallbackWrong,
-        "the same citation again, in the same section, with the same answer",
-    ),
-    (
-        "docs/query-lowering.md",
-        "exec.rs:3227-3233",
-        0,
-        ReviewedVerdict::FallbackWrong,
-        "the search settings block the same section quotes; it is in traces/exec.rs",
-    ),
-    (
-        "docs/query-lowering.md",
-        "exec.rs:912",
-        0,
-        ReviewedVerdict::FallbackWrong,
-        "a LogQL section citing a line of the TraceQL executor",
+        "the search settings block the same section quotes; it is in traces/exec.rs \
+         (`exec.rs:3227-3233` before #602 part 2c-2b-2 renumbered it)",
     ),
     (
         "docs/query-to-sql.md",
@@ -2093,7 +2153,12 @@ fn the_language_fallback_disagrees_with_the_anchor_rule_only_where_a_person_has_
         // there the anchor rule is the one that points elsewhere. §12.3's
         // decision stands — the fallback still answers four reviewed
         // citations wrongly, so it is still not applied.
-        (4, 1, 0),
+        //
+        // Issue #602 part 2c-2b-2 pins three of those four to `1cdb3e5e`:
+        // they cite code that part deleted, so neither rule reads them.
+        // The fourth was renumbered and keeps its verdict; the fallback
+        // still answers it wrongly, so §12.3's decision still stands.
+        (1, 1, 0),
         "the reviewed verdicts moved; re-read §12.3's decision against them"
     );
 }
@@ -3088,4 +3153,48 @@ fn audit_citation_forms() {
     for s in &contentless {
         println!("  CONTENTLESS {s}");
     }
+}
+
+/// A citation is pinned to another tree only when `@` is followed by a
+/// hex commit of at least seven digits (`@ 1cdb3e5e`, the form #602 part
+/// 2c-2b-2 writes) or a version (`@ \`v3.7.4\``). A bare `@`, a word, or
+/// a commit too short to name one leaves the citation in this tree's
+/// check, so it cannot hide a stale one.
+#[test]
+fn a_citation_is_pinned_only_by_a_commit_or_a_version() {
+    for (rest, want) in [
+        ("` @ 1cdb3e5e) and", true),
+        (" @ 1cdb3e5eabcdef0123", true),
+        ("` @ `v3.7.4`), so", true),
+        ("` @ grafana/loki v3.7.4", true),
+        ("` @", false),
+        ("` @ ", false),
+        ("` @ main", false),
+        ("` @ abc12", false),
+        ("` @ some words here", false),
+        ("` @ notes 1.2.3", false),
+        ("` @ grafana/loki notes v3.7.4", false),
+        ("` and more", false),
+    ] {
+        assert_eq!(pinned_to_a_commit(rest), want, "{rest:?}");
+    }
+}
+
+/// The `deleted` state is bounded: the rows carrying it are exactly
+/// [`DELETED_GATES`], so marking another gate deleted fails rather than
+/// excusing it. Issue #602 part 2c-2b-2.
+#[test]
+fn an_extra_deleted_row_fails() {
+    let row = |selector: &str| GateRow {
+        selector: selector.to_string(),
+        krate: "pulsus-read".to_string(),
+        file: "crates/pulsus-read/tests/x.rs".to_string(),
+        state: GateState::Deleted,
+    };
+    let exact: Vec<GateRow> = DELETED_GATES.iter().map(|s| row(s)).collect();
+    assert!(deleted_rows_are_the_named_ones(&exact).is_ok());
+    let mut extra = exact.clone();
+    extra.push(row("some_other_gate"));
+    assert!(deleted_rows_are_the_named_ones(&extra).is_err());
+    assert!(deleted_rows_are_the_named_ones(&exact[..1]).is_err());
 }

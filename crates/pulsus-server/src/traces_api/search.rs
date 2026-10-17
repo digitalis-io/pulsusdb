@@ -20,8 +20,8 @@ use super::{legacy, params, search_response};
 
 /// `X-Pulsus-Explain: 1` (docs/api.md "Request headers"), issue #492.
 ///
-/// The search route had no explain surface at all: `TraceEngine::search_explained`
-/// existed, built a `PlanExplain`, and was reached only by a test, so the
+/// The search route had no explain surface at all: the previous engine's
+/// explained search built a `PlanExplain` and was reached only by a test, so the
 /// language whose plan changes most was the one a user could not see.
 /// The contract is the same as the logs and metrics routes': without the
 /// header nothing changes, and with it the response gains one sibling

@@ -5753,6 +5753,7 @@ async fn window_spans(client: &ChClient, w: WindowSql) -> u64 {
 /// `read_rows`.
 async fn logged_search(
     client: &ChClient,
+    db: &str,
     w: WindowSql,
     comment: String,
 ) -> (Vec<SearchTraceRow>, u64) {
@@ -5760,15 +5761,11 @@ async fn logged_search(
         .set("max_threads", 4)
         .set("max_memory_usage", 4_000_000_000_u64)
         .set("log_comment", &comment);
+    let t0 = now_ns();
     let rows = search_rows(client, w, "{}", 20, 3, settings).await;
-    client
-        .execute(
-            "SYSTEM FLUSH LOGS",
-            &QuerySettings::new(),
-            Idempotency::Idempotent,
-        )
-        .await
-        .expect("flush the logs");
+    // The query log is read once it has settled, not straight after a
+    // flush, which can return before the statement's row is visible.
+    settled_statements(client, db, t0).await;
     let read_rows = count(
         client,
         &format!(
@@ -5791,7 +5788,7 @@ async fn the_top_k_runs_once() {
         seed_corpus_s(pulsus_testkit::test_db("pulsus_read_it_t590_corpus_s_topk")).await;
     let window = window_spans(&client, w).await;
     let (rows, read_rows) =
-        logged_search(&client, w, pulsus_testkit::test_ident("t590_topk")).await;
+        logged_search(&client, &db, w, pulsus_testkit::test_ident("t590_topk")).await;
     drop_db(&db).await;
     assert_eq!(rows.len(), 20, "twenty traces");
     assert!(
@@ -5812,7 +5809,7 @@ async fn the_detail_read_does_not_re_scan_the_window() {
     .await;
     let window = window_spans(&client, w).await;
     let (rows, read_rows) =
-        logged_search(&client, w, pulsus_testkit::test_ident("t590_detail")).await;
+        logged_search(&client, &db, w, pulsus_testkit::test_ident("t590_detail")).await;
     let clauses = format!(
         "{} AND {} AND {}",
         w.span_time_clause(),
@@ -5880,12 +5877,9 @@ fn engine_config() -> pulsus_read::TraceReadConfig {
         spans_v2_table: "spans".to_string(),
         traces_table: "traces".to_string(),
         resources_table: "resources".to_string(),
-        max_candidates: 100_000,
         scan_budget_rows: 50_000_000,
-        event_set_max_values: 1_000_000,
         max_depth: 64,
         max_series: 1_000,
-        generator_max_memory_bytes: 536_870_912,
         distributed: false,
         skip_unavailable_shards: false,
     }
@@ -8010,14 +8004,9 @@ async fn search_routed_answers_a_run_time_demand_itself() {
         let plan = plan_of(&engine, &parse_query(query), window, 20, 3);
         routed.push(engine.search_routed(&plan).await);
     }
-    client
-        .execute(
-            "SYSTEM FLUSH LOGS",
-            &QuerySettings::new(),
-            Idempotency::Idempotent,
-        )
-        .await
-        .expect("flush the logs");
+    // Read once the query log has settled (the `{ .a }` case finishes),
+    // not straight after a flush.
+    settled_statements(&client, &db, t0).await;
     #[derive(Row, serde::Serialize, serde::Deserialize, Debug)]
     struct Logged {
         at: i64,
@@ -8585,7 +8574,7 @@ async fn by_reads_typed_values_only() {
 /// The distinct-group `422` at `max_series = 2`, by the statement's
 /// counter; and `{ } | by(status)` and `by(resource.service.name)` at
 /// `limit = 1` the statement answers, counting the groups of the trace it
-/// returns (issue #602 part 1: the statement runs no preflight).
+/// returns (issue #602 part 1: the statement runs no preflight). Owns `traceql-nested-by-composite-series-cap`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn search_routed_keeps_the_group_cap() {
     skip_unless_live!();
@@ -13389,20 +13378,15 @@ async fn one_metrics_statement_reads_the_window_once() {
         } else {
             plan.range_window_ns()
         };
+        let t0 = now_ns();
         let out = if instant {
             engine.metrics_instant_routed(&routed).await
         } else {
             engine.metrics_range_routed(&routed).await
         };
         out.unwrap_or_else(|e| panic!("{q}: {e}"));
-        client
-            .execute(
-                "SYSTEM FLUSH LOGS",
-                &QuerySettings::new(),
-                Idempotency::Idempotent,
-            )
-            .await
-            .expect("flush the logs");
+        // Read once the query log has settled, not straight after a flush.
+        settled_statements(&client, &db, t0).await;
         #[derive(Row, serde::Serialize, serde::Deserialize)]
         struct Logged {
             n: u64,
@@ -15869,35 +15853,38 @@ async fn a_covered_grouping_is_capped_by_one_statement() {
     if !got.starts_with(cap) {
         wrong.push(format!("{query}: want {cap}, got {got}"));
     }
-    client
-        .execute(
-            "SYSTEM FLUSH LOGS",
-            &QuerySettings::new(),
-            Idempotency::Idempotent,
-        )
-        .await
-        .expect("flush the logs");
+    // The statement count is read once the query log has settled, not
+    // straight after a flush, which can return before the row is visible.
+    let (statements, _) = settled_statements(&client, &db, t0).await;
     #[derive(Row, serde::Serialize, serde::Deserialize, Debug, PartialEq)]
     struct Logged {
         statements: u64,
         previous: u64,
     }
+    #[derive(Row, serde::Serialize, serde::Deserialize)]
+    struct Previous {
+        previous: u64,
+    }
     let sql = format!(
-        "SELECT count() AS statements, \
-         countIf(has(tables, '{db}.trace_spans') OR has(tables, '{db}.trace_recent')) AS previous \
+        "SELECT countIf(has(tables, '{db}.trace_spans') OR has(tables, '{db}.trace_recent')) AS previous \
          FROM system.query_log WHERE type = 'QueryFinish' AND query_kind = 'Select' \
          AND has(databases, '{db}') AND event_time_microseconds >= toDateTime64({}, 6)",
         t0 as f64 / 1e9
     );
     let mut stream = client
-        .query_stream::<Logged>(&sql, &QuerySettings::new())
+        .query_stream::<Previous>(&sql, &QuerySettings::new())
         .await
         .expect("read the query log");
-    let logged = stream
+    let previous = stream
         .next()
         .await
         .expect("one row")
-        .expect("decode the query log row");
+        .expect("decode the query log row")
+        .previous;
+    let logged = Logged {
+        statements,
+        previous,
+    };
     let want = Logged {
         statements: 1,
         previous: 0,

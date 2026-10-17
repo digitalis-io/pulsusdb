@@ -222,12 +222,9 @@ fn config() -> pulsus_read::TraceReadConfig {
         spans_v2_table: "spans_dist".to_string(),
         traces_table: "traces_dist".to_string(),
         resources_table: "resources".to_string(),
-        max_candidates: 100_000,
         scan_budget_rows: 50_000_000,
-        event_set_max_values: 1_000_000,
         max_depth: 64,
         max_series: 1_000,
-        generator_max_memory_bytes: 536_870_912,
         distributed: true,
         skip_unavailable_shards: false,
     }

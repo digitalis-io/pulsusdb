@@ -89,13 +89,10 @@ pub const ALL_ENV_VARS: &[&str] = &[
     "PULSUS_LOGQL_SCAN_BUDGET_BYTES",
     "PULSUS_LOGQL_PIPELINE_SCAN_FACTOR",
     "PULSUS_TEMPLATE_TIMEZONE",
-    "PULSUS_TRACEQL_MAX_CANDIDATES",
     "PULSUS_TRACEQL_SCAN_BUDGET_ROWS",
-    "PULSUS_TRACEQL_EVENT_SET_MAX_VALUES",
     "PULSUS_TRACEQL_MAX_DEPTH",
     "PULSUS_TRACEQL_MAX_SERIES",
     "PULSUS_TRACEQL_TAG_LOOKBACK",
-    "PULSUS_TRACEQL_GENERATOR_MAX_MEMORY_BYTES",
     "PULSUS_LOGQL_READ_MAX_MEMORY_BYTES",
     "PULSUS_PROMQL_READ_MAX_MEMORY_BYTES",
     "PULSUS_TRACEQL_READ_MAX_MEMORY_BYTES",
@@ -430,15 +427,8 @@ pub fn apply_env(cfg: &mut Config) -> Result<(), ConfigError> {
     if let Some(v) = read("PULSUS_TEMPLATE_TIMEZONE") {
         cfg.reader.template_timezone = parse_tz("PULSUS_TEMPLATE_TIMEZONE", &v)?;
     }
-    if let Some(v) = read("PULSUS_TRACEQL_MAX_CANDIDATES") {
-        cfg.reader.traceql_max_candidates = parse_int("PULSUS_TRACEQL_MAX_CANDIDATES", &v)?;
-    }
     if let Some(v) = read("PULSUS_TRACEQL_SCAN_BUDGET_ROWS") {
         cfg.reader.traceql_scan_budget_rows = parse_int("PULSUS_TRACEQL_SCAN_BUDGET_ROWS", &v)?;
-    }
-    if let Some(v) = read("PULSUS_TRACEQL_EVENT_SET_MAX_VALUES") {
-        cfg.reader.traceql_event_set_max_values =
-            parse_int("PULSUS_TRACEQL_EVENT_SET_MAX_VALUES", &v)?;
     }
     if let Some(v) = read("PULSUS_TRACEQL_MAX_DEPTH") {
         cfg.reader.traceql_max_depth = parse_int("PULSUS_TRACEQL_MAX_DEPTH", &v)?;
@@ -449,13 +439,8 @@ pub fn apply_env(cfg: &mut Config) -> Result<(), ConfigError> {
     if let Some(v) = read("PULSUS_TRACEQL_TAG_LOOKBACK") {
         cfg.reader.traceql_tag_lookback = parse_dur("PULSUS_TRACEQL_TAG_LOOKBACK", &v)?;
     }
-    if let Some(v) = read("PULSUS_TRACEQL_GENERATOR_MAX_MEMORY_BYTES") {
-        cfg.reader.traceql_generator_max_memory_bytes =
-            parse_int("PULSUS_TRACEQL_GENERATOR_MAX_MEMORY_BYTES", &v)?;
-    }
     // Issue #398: the three per-surface read memory ceilings. Plain
-    // integers (bytes), mirroring `PULSUS_TRACEQL_GENERATOR_MAX_MEMORY_BYTES`
-    // rather than the `ByteSize`-parsed `PULSUS_LOGQL_SCAN_BUDGET_BYTES`.
+    // integers (bytes), rather than the `ByteSize`-parsed `PULSUS_LOGQL_SCAN_BUDGET_BYTES`.
     if let Some(v) = read("PULSUS_LOGQL_READ_MAX_MEMORY_BYTES") {
         cfg.reader.logql_read_max_memory_bytes =
             parse_int("PULSUS_LOGQL_READ_MAX_MEMORY_BYTES", &v)?;
@@ -524,8 +509,8 @@ mod tests {
         assert_eq!(sorted, deduped, "ALL_ENV_VARS must not contain duplicates");
         assert_eq!(
             ALL_ENV_VARS.len(),
-            97,
-            "docs/configuration.md §§1-8 document exactly 97 variables"
+            94,
+            "docs/configuration.md §§1-8 document exactly 94 variables"
         );
     }
 

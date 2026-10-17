@@ -509,11 +509,11 @@ fn every_ledger_row_is_referenced_from_the_artefact_that_owns_it() {
     const OWNERS: [(&str, &str); 11] = [
         (
             "traceql-spanset-aggregate-double-lexical-form",
-            "crates/pulsus-read/src/traces/search_eval.rs",
+            "crates/pulsus-read/src/traces/values.rs",
         ),
         (
             "traceql-spanset-aggregate-mixed-type-attribute",
-            "crates/pulsus-read/src/traces/search_eval.rs",
+            "crates/pulsus-read/tests/traces_search_grouping_differential.rs",
         ),
         (
             "traceql-spanset-aggregate-string-attribute-contributes",
@@ -525,7 +525,7 @@ fn every_ledger_row_is_referenced_from_the_artefact_that_owns_it() {
         ),
         (
             "traceql-nested-by-composite-series-cap",
-            "crates/pulsus-read/src/traces/search_eval.rs",
+            "crates/pulsus-read/tests/traces_query_v2_live.rs",
         ),
         (
             "traceql-select-before-by-nil-group-key",
@@ -533,11 +533,11 @@ fn every_ledger_row_is_referenced_from_the_artefact_that_owns_it() {
         ),
         (
             "traceql-midpipeline-spanset-operation-unsupported",
-            "crates/pulsus-read/src/traces/search_plan.rs",
+            "crates/pulsus-traceql/src/ast.rs",
         ),
         (
             "traceql-select-before-midpipeline-filter-empty",
-            "crates/pulsus-read/src/traces/search_eval.rs",
+            "crates/pulsus-read/tests/traces_query_v2_live.rs",
         ),
         (
             "traceql-error-body-unary-not-parenthesises-its-operand",

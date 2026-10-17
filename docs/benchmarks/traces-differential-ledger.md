@@ -1,6 +1,6 @@
 # Traces differential divergence ledger
 
-**Parts of this document describe the previous trace search engine, which no search request reaches since issue #602 part 2b; #602 part 2c-2b-1 deleted its test binaries, goldens and benches, and #602 part 2c-2b-2 deletes its code and the unit tests inside it; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** The M4 traces differential (`e2e/src/traces.rs`, issue #60) gates every
+**Parts of this document describe the previous trace search engine, which issue #602 part 2c-2b deleted — its test binaries, goldens and benches in part 2c-2b-1, its code and the unit tests inside it in part 2c-2b-2; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** The M4 traces differential (`e2e/src/traces.rs`, issue #60) gates every
 corpus-computable TraceQL case in
 `test/fixtures/traces/differential.json` against both the corpus's
 by-construction expectation and the pinned reference Tempo
@@ -1450,7 +1450,7 @@ when we are asking it to slow down, so we keep `429`; recorded as
      ungrouped **aggregation** or **quantile** over an empty window we emit
      one series whose zero `value` is protojson-omitted, where the reference
      emits no series. Our `PlanKind::Agg` instant arm folds an absent row to
-     `0.0` (`crates/pulsus-read/src/traces/exec.rs:1814-1827`, "an empty
+     `0.0` (`crates/pulsus-read/src/traces/exec.rs:1495-1508`, "an empty
      aggregate window is a 0-valued sample"), and the reference drops a
      series with no samples
      (`modules/frontend/metrics_query_handler.go:193-196` @ v3.0.2). This is
@@ -2291,7 +2291,7 @@ when we are asking it to slow down, so we keep `429`; recorded as
   trace-context one. There is no single field to key an entry by when a
   leaf names two, and picking one would be an invention.
 - **Disposition:** remaining work on issue #479. Pinned hermetically by
-  `pulsus_read::traces::search_plan::tests::wave_two_shapes_project_nothing`,
+  a unit test of the previous search engine, deleted with it by #602 part 2c-2b-2,
   which asserts the planner builds no projection source for each shape and
   carries a positive control so "nothing" is the shape's doing. On the search route since issue #602 part 2b: `traces_compile_v2.rs`'s `a_multi_field_condition_projects_nothing_on_the_statement`.
 

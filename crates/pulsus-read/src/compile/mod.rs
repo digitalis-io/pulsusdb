@@ -20,7 +20,7 @@
 //!   [`fold::Lang`].
 //!
 //! **Wave 1 emits no new SQL and moves none.** Neither read path calls
-//! this module: `logql::plan` and `traces::search_plan` are untouched, so
+//! this module: `logql::plan` and the TraceQL planner were untouched, so
 //! every statement the tree sends is byte-identical to the statement it
 //! sent before. What lands here is the core, the two per-language
 //! [`fold::Lang`] impls, and the gates that hold them to the design.

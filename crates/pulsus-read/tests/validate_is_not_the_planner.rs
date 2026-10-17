@@ -2,7 +2,7 @@
 //! separation claim.
 //!
 //! The cargo cycle proves ISOLATION — `pulsus-traceql` cannot name
-//! `PlanError`/`plan_search`/`SearchCtx`, so the validator cannot call
+//! `PlanError`/`plan_search_request`, so the validator cannot call
 //! or branch on the planner. What the cycle cannot prove is SEPARATION:
 //! a planner-only rule could still be re-implemented by hand inside
 //! `validate`. This suite (hermetic — `pulsus-read` can name both

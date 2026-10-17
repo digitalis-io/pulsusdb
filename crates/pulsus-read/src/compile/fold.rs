@@ -646,8 +646,8 @@ pub struct Relation<L: Lang + ?Sized> {
     /// The emitter renders these after `GROUP BY` and before `ORDER BY`;
     /// until an emitter exists, this is what a language reads back to
     /// put the same text into the statement it renders itself
-    /// (issue #492 part 4 — `traces::search_plan::plan_search` reads it
-    /// and re-renders the generator statement with the same fragment).
+    /// (issue #492 part 4 — the previous search engine read it, until
+    /// #602 part 2c-2b-2 deleted that engine).
     pub having: Vec<L::ColExpr>,
 }
 

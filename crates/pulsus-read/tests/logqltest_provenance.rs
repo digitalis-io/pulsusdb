@@ -2102,7 +2102,7 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
     ("pulsus-read/src/metrics/series_where.rs", 26),
     ("pulsus-read/src/metrics/sql.rs", 24),
     ("pulsus-read/src/traces/filter.rs", 12),
-    ("pulsus-read/src/traces/search_plan.rs", 2),
+    // Issue #602 part 2c-2b-2 removes `traces/search_plan.rs` and its two.
     // Issues #588 and #589. The span-scope predicate compiler: four render
     // sites, each spelled once for `=~` and once for `!~` — an attribute's
     // `:String` read, the `name`/`statusMessage` columns, the two
@@ -2127,7 +2127,7 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
 
 /// The separately-asserted total, so "a file appeared" reads differently
 /// from "a file grew".
-const MATCH_RENDER_TOTAL: usize = 120;
+const MATCH_RENDER_TOTAL: usize = 118;
 
 /// Every string-literal CONTENT in a Rust source: ordinary `"…"`, raw
 /// `r"…"`/`r#"…"#`, byte `b"…"` and byte-raw. Comments are dropped.

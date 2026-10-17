@@ -1,6 +1,6 @@
 //! The trace fetch's three pure SQL builders (issue #587):
 //! `validated inputs -> String`, no `ChClient`, no I/O — the same
-//! convention as [`crate::traces::search_sql`], and the surface
+//! convention as [`crate::traces::tags_sql`], and the surface
 //! `tests`-level snapshots freeze.
 //!
 //! Callers validate `hex32` before it reaches these builders — that is the

@@ -868,13 +868,13 @@ const JOINS_OUTSIDE_THE_COMPILED_SEARCH_CORPUS: [&str; 48] = [
 /// traces_graph/single_node.sql                   (graph_sql.rs:92, INNER JOIN
 ///                                                at 109) — one join line each
 /// traces_metrics/compare_outer_attr.sql          metrics_compare_sql               current
-/// traces_metrics/compare_status.sql              (metrics_sql.rs:1337, LEFT JOIN
-/// traces_metrics/compare_status_window.sql       at 1406 and INNER JOIN at 1410)
+/// traces_metrics/compare_status.sql              (metrics_sql.rs:1313, LEFT JOIN
+/// traces_metrics/compare_status_window.sql       at 1385 and INNER JOIN at 1389)
 ///                                                for six of the seven join lines
 ///                                                in each file, and
 ///                                                metrics_compare_exemplar_range_
-///                                                sql (metrics_sql.rs:1533, INNER
-///                                                JOIN at 1583) for the seventh
+///                                                sql (metrics_sql.rs:1512, INNER
+///                                                JOIN at 1562) for the seventh
 /// traces_metrics_base/compare_status.sql         metrics_compare_sql AS IT STOOD   HISTORIC
 /// traces_metrics_base/compare_status_window.sql  AT 2f78c53 — four join lines,
 ///                                                no exemplars section, so the
@@ -900,11 +900,11 @@ const JOINS_OUTSIDE_THE_COMPILED_SEARCH_CORPUS: [&str; 48] = [
 ///
 /// All of them come from hand-written builders on routes the compile core
 /// classifies `Never` — `NotASearchLinkLower::capability`
-/// (`crates/pulsus-read/src/traces/compile.rs:1369-1376`) — so they are
+/// (in the previous search engine's `traces/compile.rs`, deleted by #602 part 2c-2b-2) — so they are
 /// not lowered pipelines and the decision never reached them.
-/// `service_graph_sql` is called at `traces/exec.rs:1774` and nowhere
+/// `service_graph_sql` is called at `traces/exec.rs:1601` and nowhere
 /// else; `metrics_compare_sql` and `metrics_compare_exemplar_range_sql`
-/// only at `traces/metrics_plan.rs:627/639/651/666`. The sentence
+/// only at `traces/metrics_plan.rs:626/638/650/665`. The sentence
 /// reaches further than the decision it records: a drafting fault in the
 /// record, not shipped code breaking a rule. **The wording belongs to
 /// the amendment round ADR 0008 already reserves.** This test enforced

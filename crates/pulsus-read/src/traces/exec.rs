@@ -1,94 +1,46 @@
-//! `TraceEngine` — executes the §4.2 trace-by-ID point read and the
-//! issue #57 two-phase TraceQL search against ClickHouse via `ChClient`.
-//! Deliberately OTLP-agnostic (see [`super`]'s module doc): payload
-//! decoding/dedup/assembly is `pulsus-server`'s job; search never reads
-//! payloads at all.
+//! `TraceEngine` — executes the §4.2 trace-by-ID point read, the TraceQL
+//! search, metrics, tag and service-graph reads against ClickHouse via
+//! `ChClient`. Deliberately OTLP-agnostic (see [`super`]'s module doc):
+//! payload decoding/dedup/assembly is `pulsus-server`'s job; search never
+//! reads payloads at all.
 //!
-//! **Search execution model (plan v7 as amended):**
+//! **Search** ([`TraceEngine::search_routed`]) runs the search statement
+//! (`spans::search`, `docs/TraceQL/sql-schema.md` §5.2–§5.3): newest slice
+//! first (`exec/newest_first.rs`), then the whole window, and decodes the
+//! rows it returns. The previous two-phase engine this module once drove
+//! (generators, hydration batches, a result heap) was deleted by #602 part
+//! 2c-2b-2.
 //!
-//! - **Phase 1:** every generator in [`SearchPlan::generator_sqls`] runs
-//!   as its own bounded, index-served ranked top-K query
-//!   (`LIMIT gen_cap + 1`); the engine merges the `(trace_id, bound_ts)`
-//!   tuples in Rust (`max` per trace — [`merge_candidates`]) into one
-//!   ranked candidate list (`bound_ts DESC, trace_id ASC`).
-//! - **Phase 2:** candidates are consumed newest-bound-first in batches
-//!   of [`BATCH_TRACES`]; each batch is hydrated by primary key
-//!   (`LIMIT MAX_SPANS_PER_TRACE + 1 BY trace_id` — the `+1` is the
-//!   per-trace overflow probe), deduped by `span_id`, and evaluated
-//!   **exactly**. Since issue #557 each attribute condition arrives as
-//!   ONE PREDICATE COLUMN on that same hydration statement and fills its
-//!   probe's membership set there; only the attribute VALUE reads are
-//!   still joined from statements of their own
-//!   (`search_eval`). Matches enter a `limit`-size heap of response
-//!   summaries only; consumption stops at the threshold rule (heap full
-//!   AND next `bound_ts` strictly below the k-th held sort key — sound
-//!   because `bound_ts` upper-bounds the public sort key, docs/api.md
-//!   §4.2 ordering contract), at stream exhaustion, or at the
-//!   `max_candidates` ceiling.
 //! - **Memory contract (issue #57 re-audit):** Layer 1 — every query
 //!   carries `max_bytes_to_read`/`read_overflow_mode='throw'`,
 //!   `max_result_bytes`/`result_overflow_mode='throw'`, the row scan
 //!   budget, and [`TRACE_SEARCH_MAX_BLOCK_ROWS`] (`max_block_size`);
-//!   breach → 422. The accepted residual is one transiently-buffered
-//!   block, now HARD-bounded: at most `TRACE_SEARCH_MAX_BLOCK_ROWS` rows
-//!   × (fixed-width columns + string columns each capped at
-//!   [`crate::traces::search_sql::TRACE_STR_COL_CAP`] bytes at the
-//!   source) — never a-priori row-unbounded (docs/schemas.md §7). Phase-1
-//!   generator reads additionally carry `max_memory_usage`
-//!   (`config.generator_max_memory_bytes`) +
-//!   `max_bytes_before_external_group_by=0`, bounding a dense
-//!   common-value prefix's `GROUP BY` aggregation state; breach → code
-//!   241 → [`TooBroadReason::TraceGeneratorMemory`] → 422. Issue #398
-//!   extends `max_memory_usage` + `max_bytes_before_external_group_by=0`
-//!   to EVERY trace read at all three of this module's settings origins —
-//!   [`search_settings`], the independent [`catalog_settings`], and the
-//!   §4.2 point read ([`TraceEngine::fetch_by_id`], which carried no
-//!   settings at all and bypassed [`map_trace_read_error`]) — from
-//!   `config.read_max_memory_bytes`; breach → code 241 →
-//!   [`TooBroadReason::TraceReadMemory`] → 422. The generator's tighter
-//!   ceiling layers on top and keeps its own reason. Layer 2 — a
+//!   breach → 422. Issue #398 adds `max_memory_usage` +
+//!   `max_bytes_before_external_group_by=0` to EVERY trace read at all
+//!   three of this module's settings origins — [`search_settings`], the
+//!   independent [`catalog_settings`], and the §4.2 point read
+//!   ([`fetch_settings`]) — from `config.read_max_memory_bytes`; breach →
+//!   code 241 → [`TooBroadReason::TraceReadMemory`] → 422. Layer 2 — a
 //!   single request-scoped byte counter ([`HYDRATION_BYTE_BUDGET`])
-//!   charges every retained byte (merge tuples, batch rows, membership
-//!   sets, heap summaries); breach → 422.
-//! - **Partiality (exhaustive conservative rule, plan v7 delta 2):**
-//!   `partial = true` iff a generator returned `gen_cap + 1` rows, the
-//!   consumption ceiling was reached with a lookahead candidate present,
-//!   or a per-trace span overflow occurred. Budget breaches are hard
-//!   `422`s, never silent partial results.
+//!   charges every retained byte of a search's decode; breach → 422.
 //!
 //! ## Allocation-charge audit (code review round 3) — engine side
 //!
 //! Invariant: **no retained or intermediate collection exists
-//! uncharged**. Site → charge (always before/as the allocation):
-//!
-//! | Allocation site | Charge |
-//! |---|---|
-//! | per-generator candidate row Vecs | per row during streaming (`collect_rows_charged`, `CANDIDATE_TUPLE_BYTES`) |
-//! | merge map + ranked candidate list | one more `rows × CANDIDATE_TUPLE_BYTES` pre-charged before [`merge_candidates`]; input-side charge released after the per-generator Vecs drop, then reconciled down to the surviving deduped list (round 4) |
-//! | batch id list | `id_list_charge` before the collect (released with the batch) |
-//! | hydration row Vec | per row during streaming (`size_of::<HydrationRow>` + overhead + strings) |
-//! | grouped `HydratedSpan` slots + `span_id` dedup-set entries | [`group_hydrated_rows`] (pure, unit-tested exact accounting): first-push initial reservations (`VEC_INITIAL_RESERVATION_SLOTS`) + per-group 2× outer slot + overhead + inner initial reservation + per-UNIQUE-span 2× inner slot + set entry at the standard hash cost (`[u8;8]` + overhead); replays are contains-checked first and charge nothing (round 5) |
-//! | membership sets / numeric maps / select-value maps | per row during streaming (entry costs incl. overhead; string values by length) |
-//! | trace-context / child-count co-load maps (issue #184) | per row during streaming (`size_of::<TraceCtxRow>` + overhead + root strings; `CHILD_COUNT_ENTRY_BYTES`) — issued only when the plan's `needs_trace_ctx()`/`needs_child_counts()` flags demand them, released with the batch |
-//! | root row Vec | per row during streaming; charge transferred to the retained `roots` map ([`roots_retained_bytes`]) before the row charge is released |
-//! | winner id list | charged before the collect; released when the list dies after the root read (round 4) |
-//! | result heap entries | charged inside `evaluate_batch` (see `search_eval`'s audit); evict releases `retained_bytes` (the identical cost model) |
-//! | heap→winners Vec + output slots + root-summary clones | COMPLETE output-slot capacity pre-charged before `Vec::with_capacity` (round 4); each root clone's string bytes charged before that clone |
-//! | `PlanExplain` stage SQL/note clones (explained mode) | [`charge_explain`] before every clone/format (retained for the request) |
-//! | per-query SQL text `String`s | stated residual: bounded by construction (template + ≤ 48 B × batch ids ≈ ≤ 2 KB per read at `BATCH_TRACES` = 32), same class as the driver's one-block transient |
-//! | the trace FETCH's one row ([`TraceEngine::fetch_by_id`], issue #587) | **no charge, and no allocation site of its own**: each of the three statements aggregates its span read into one scalar and returns exactly ONE row, so there is no stream to collect and no per-row cost to charge. What bounds it is the engine's own `max_memory_usage` from [`fetch_settings`], applied server-side: a trace too large for it answers `422` where the old path streamed, and this part predicts no span count for where that bites. The `Vec`s the row holds are the driver's, built inside the row's own deserializer |
-//!
-//! This table (and `search_eval`'s) is enforced MECHANICALLY by
-//! `tests/traces_alloc_audit.rs` (round 4): any new collection-allocation
-//! token in these two files fails that guard until it is allowlisted with
-//! its charge site documented.
+//! uncharged**. The sites this file still holds, and each one's charge,
+//! are the allowlist of `tests/traces_alloc_audit.rs`, which fails on any
+//! new collection-allocation token in this file and in `values.rs` until
+//! it is allowlisted with its charge site documented. The trace FETCH's
+//! one row ([`TraceEngine::fetch_by_id`], issue #587) has no allocation
+//! site of its own: each of its statements returns exactly ONE row, and
+//! what bounds it is [`fetch_settings`]' `max_memory_usage`, applied
+//! server-side.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChError, ChRow, QuerySettings};
 
-use super::compile::TqlLink;
 use super::graph_sql::{self, GraphWindow};
 use super::log2_histogram;
 use super::metrics_plan::{ExemplarSeriesKey, MetricsCtx, PlanKind, TraceMetricsPlan};
@@ -102,33 +54,18 @@ use super::spans::rows::{
 };
 
 use super::rows::{
-    CandidateRow, ChildCountRow, CompareCrossTabRow, CompareTotalsRow, GraphEdgeRow,
-    HydrationProbeRow, HydrationProbeValueRow, HydrationRow, MetricAggGroupInstantRow,
+    CompareCrossTabRow, CompareTotalsRow, GraphEdgeRow, MetricAggGroupInstantRow,
     MetricAggGroupRow, MetricAggInstantRow, MetricAggRow, MetricBucketRow,
     MetricCompareExemplarRow, MetricCountRow, MetricExemplarRow, MetricGroupCountInstantRow,
     MetricGroupCountRow, MetricGroupExemplarRow, MetricLog2BucketInstantRow, MetricLog2BucketRow,
     MetricLog2ExemplarRow, MetricQuantileExemplarRow, MetricQuantileInstantRow, MetricQuantileRow,
-    NumValueRow, RootRow, SpanNameRow, StrValueRow, TagNameRow, TagValueRow, TraceCtxRow,
+    SpanNameRow, TagNameRow, TagValueRow,
 };
-use super::search_eval::{
-    self, BatchAttrs, EventValues, GroupCardinalityCounter, HydratedSpan, ProbeMembership, SpanKey,
-    SpanSetGroup, SpanSummary, StoredType, TraceCtxInfo, TraceMatch, TraceSpans,
-};
-use super::search_plan::{HydrationShape, SearchCtx, SearchPlan, SlotLayout};
 use super::tag_narrow::{TagNarrowing, narrowing_from_query};
 use super::tags_sql::DaySpan;
-use crate::compile::plan::{Cut, LinkShape, Part, PartShape};
+use super::values::{GroupCardinalityCounter, SpanSetGroup, SpanSummary};
 use crate::logql::error::{ReadError, TooBroadReason};
 use crate::logql::explain::PlanExplain;
-
-/// Phase-2 batch width: candidates hydrated/evaluated per round trip.
-/// Documented constant (promote to config only on benchmark evidence).
-pub const BATCH_TRACES: usize = 32;
-
-/// Per-trace hydration span cap; the `+1` probe detects overflow, which
-/// truncates that trace's evaluation set and marks the response partial
-/// (a truncated trace is never silently reported complete).
-pub const MAX_SPANS_PER_TRACE: usize = 10_000;
 
 /// Response cap for the §4.3 tag-names read (`GET /api/traces/v1/tags`,
 /// issue #58) — a documented constant (docs/api.md §4.3; promoted to
@@ -143,16 +80,11 @@ pub const TAG_NAMES_MAX: usize = 10_000;
 /// [`TAG_NAMES_MAX`].
 pub const TAG_VALUES_MAX: usize = 1_000;
 
-/// Layer 2 — the single request-scoped retention budget: every byte the
-/// search accumulates (merge tuples, in-flight batch rows, membership
-/// sets, heap-held response summaries) is charged against this counter;
-/// a breach is a `422 query_too_broad`, never an OOM. With Layer 1's
-/// [`TRACE_MAX_RESULT_BYTES`] now effective per hydration batch (issue
-/// #57 re-audit v7), this counter's distinct, load-bearing role is
-/// **cross-batch retained accumulation** — heap-held response summaries
-/// (and merge tuples / root summaries) survive the per-batch charge
-/// release and grow across batches, where no per-query server setting
-/// can see them.
+/// Layer 2 — the single request-scoped retention budget: every byte a
+/// search's statement rows and decoded response retain is charged against
+/// this counter; a breach is a `422 query_too_broad`, never an OOM. Its
+/// load-bearing role is what no per-query server setting can see: the
+/// rows and response held across the slices of one request.
 pub const HYDRATION_BYTE_BUDGET: usize = 256 * 1024 * 1024;
 
 /// Layer 1 read-side byte budget (`max_bytes_to_read`, throw) applied to
@@ -162,21 +94,16 @@ pub const TRACE_READ_BYTES_BUDGET: u64 = 50 * 1024 * 1024 * 1024;
 
 /// Layer 1 result-side byte ceiling (`max_result_bytes`, throw) applied
 /// to every search query — bounds any single result set independent of
-/// string payload lengths. Issue #57 re-audit v7: the sub-A
-/// source-truncation projection makes this setting's accounting
-/// **effective on the hydration/root/value reads** (live-verified —
-/// unwrapped passthrough columns were never accounted), a deliberate
-/// hardening: this is now the practical **per-batch** byte bound, firing
-/// server-side before the driver materializes anything; the
-/// [`HYDRATION_BYTE_BUDGET`] retention counter remains the binding bound
-/// on cross-batch retained accumulation.
+/// string payload lengths, firing server-side before the driver
+/// materializes anything; the [`HYDRATION_BYTE_BUDGET`] retention counter
+/// remains the binding bound on what one request retains.
 pub const TRACE_MAX_RESULT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Layer 1 block-row cap (`max_block_size`) applied to every search
 /// query (issue #57 re-audit, sub-problem A): bounds the row width of
 /// any single transiently-buffered result block, so the driver's
 /// documented one-block residual is a hard product with
-/// [`crate::traces::search_sql::TRACE_STR_COL_CAP`] rather than
+/// [`crate::traces::filter::TRACE_STR_COL_CAP`] rather than
 /// a-priori row-unbounded — see the module doc's memory-contract
 /// paragraph.
 pub const TRACE_SEARCH_MAX_BLOCK_ROWS: u64 = 4096;
@@ -185,12 +112,10 @@ pub const TRACE_SEARCH_MAX_BLOCK_ROWS: u64 = 4096;
 const CODE_TOO_MANY_ROWS: i32 = 158;
 const CODE_TOO_MANY_BYTES: i32 = 307;
 const CODE_TOO_MANY_ROWS_OR_BYTES: i32 = 396;
-/// `MEMORY_LIMIT_EXCEEDED` — raised only by the phase-1 candidate-
-/// generator memory ceiling ([`generator_settings`]'s `max_memory_usage`
-/// and `max_bytes_before_external_group_by = 0`, throw-not-spill); maps
-/// exclusively to [`TooBroadReason::TraceGeneratorMemory`] via
-/// [`map_trace_generator_error`], applied only to phase-1 generator
-/// reads (issue #57 re-audit, sub-problem B).
+/// `MEMORY_LIMIT_EXCEEDED` — raised by the surface-wide memory ceiling
+/// every trace read carries (issue #398, `max_memory_usage` and
+/// `max_bytes_before_external_group_by = 0`, throw-not-spill); maps to
+/// [`TooBroadReason::TraceReadMemory`] in [`map_trace_read_error`].
 const CODE_MEMORY_LIMIT_EXCEEDED: i32 = 241;
 /// `SET_SIZE_LIMIT_EXCEEDED` — raised by an `IN (SELECT …)` set built
 /// under [`TRACE_METRICS_MAX_SET_ROWS`]/[`TRACE_METRICS_MAX_SET_BYTES`]
@@ -241,59 +166,9 @@ pub const TRACE_METRICS_MAX_SET_BYTES: u64 = 64 * 1024 * 1024;
 /// both — the review-round invariant is that **no retained collection
 /// grows without a corresponding live charge**, so every charge below is
 /// `size_of::<entry>() + RETAINED_ENTRY_OVERHEAD (+ string payloads)`.
-/// `pub` (issue #57 re-audit, visibility-only): the retention-gate drift
-/// guard in `tests/traces_search_explain.rs`, deleted by #602 part
-/// 2c-2b-1, derived its pre-hydration charge bound from this and
-/// [`CANDIDATE_TUPLE_BYTES`].
+/// `pub`: the statement's decode and its tests charge with it
+/// (`values.rs`, `spans/search.rs`).
 pub const RETAINED_ENTRY_OVERHEAD: usize = 64;
-
-/// Retention charge for one merged `(trace_id, bound_ts)` tuple — the
-/// per-generator row is charged at the merged-map entry's full cost
-/// (rows ≥ merged entries, so this upper-bounds the map, including when
-/// generators overlap on a trace). `pub` for the same reason as
-/// [`RETAINED_ENTRY_OVERHEAD`].
-pub const CANDIDATE_TUPLE_BYTES: usize =
-    std::mem::size_of::<([u8; 16], i64)>() + RETAINED_ENTRY_OVERHEAD;
-/// Retention charge for one membership set entry.
-const MEMBERSHIP_ENTRY_BYTES: usize =
-    std::mem::size_of::<([u8; 16], [u8; 8])>() + RETAINED_ENTRY_OVERHEAD;
-/// Retention charge for one numeric attribute value entry.
-const NUM_VALUE_ENTRY_BYTES: usize =
-    std::mem::size_of::<(([u8; 16], [u8; 8]), f64)>() + RETAINED_ENTRY_OVERHEAD;
-/// The request's byte budget and the running total THIS BATCH has
-/// charged against it — one datum in two halves, which never travel
-/// apart.
-///
-/// Bundled so [`TraceEngine::batch_attrs`] can take the probe
-/// memberships issue #557 fills on the hydration row without growing an
-/// eighth parameter. It is destructured on entry, so the body reads the
-/// same two bindings it always did.
-struct BatchCharge<'a> {
-    budget: &'a mut ByteBudget,
-    charged: &'a mut usize,
-}
-
-/// Everything one batch's hydration statement answered besides the spans
-/// (issue #557 for the memberships, #558 for the rest).
-///
-/// Every vector is index-aligned with the plan vector its slot class came
-/// from — `membership[i]` answers `plan.probes[i]`, `select_values[j]`
-/// answers `plan.select_attrs[j]`, and so on — because
-/// `group_hydrated_rows` fills each through the `SlotLayout`'s own
-/// accessor rather than through an index it computed.
-#[derive(Debug, Default)]
-pub(super) struct BatchSlots {
-    pub membership: Vec<ProbeMembership>,
-    pub select_values: Vec<HashMap<SpanKey, String>>,
-    pub select_types: Vec<HashMap<SpanKey, StoredType>>,
-    pub agg_values: Vec<HashMap<SpanKey, f64>>,
-    pub agg_types: Vec<HashMap<SpanKey, StoredType>>,
-    /// Per event set, how many values this batch's hydrated spans hold —
-    /// summed as the rows are walked. The `EventSet` arm refuses on it
-    /// BEFORE issuing a statement, so an over-budget set is never
-    /// expanded.
-    pub set_widths: Vec<u64>,
-}
 
 /// A destination for streamed rows that can PRICE a row before accepting
 /// it (issue #351 review 2).
@@ -329,36 +204,6 @@ impl<R, C: FnMut(&R) -> usize, A: FnMut(R)> ChargedRowSink<R> for FnRowSink<C, A
     }
 }
 
-/// Retention charge for ONE co-loaded event/link value (issue #351,
-/// review 2), covering every structure that holds it at the peak:
-///
-/// * its slot in the span's `Vec<String>`/`Vec<f64>`, charged at
-///   [`VEC_INITIAL_RESERVATION_SLOTS`] slots per value. **Not 2×**
-///   (review 3, `[high]`): a fresh `Vec`'s FIRST push reserves 4 slots,
-///   so a 2× charge under-charges the first value of every span by half.
-///   Charging 4 slots per value upper-bounds the capacity at every
-///   length, since a `Vec` holding `n` values has capacity
-///   `max(4, 2^ceil(log2 n)) ≤ max(4, 2n) ≤ 4n` for `n ≥ 1` — the
-///   initial reservation is covered by the first value's own charge, and
-///   the doubling by every value's. `size_of::<String>()` (24 B)
-///   upper-bounds the `f64` slot (8 B), so one constant serves both
-///   branches;
-/// * a WHOLE map entry plus the hash-table envelope. The map holds one
-///   entry per SPAN, not per value, so charging one per value
-///   over-charges — the direction a budget must err in.
-///
-/// The value's own bytes are added by the caller on the text branch. The
-/// string payload is MOVED out of the decoded row into the vec, so it is
-/// charged once and exists once.
-const EVENT_VALUE_ENTRY_BYTES: usize = VEC_INITIAL_RESERVATION_SLOTS
-    * std::mem::size_of::<String>()
-    + std::mem::size_of::<(SpanKey, EventValues)>()
-    + RETAINED_ENTRY_OVERHEAD;
-/// Retention charge for one direct-child-count co-load entry (issue
-/// #184): the `(trace_id, parent span_id) → count` map entry.
-const CHILD_COUNT_ENTRY_BYTES: usize =
-    std::mem::size_of::<(([u8; 16], [u8; 8]), u64)>() + RETAINED_ENTRY_OVERHEAD;
-
 /// Owned table/budget configuration a [`TraceEngine`] reads against —
 /// mirrors [`crate::logql::EngineConfig`]'s "owned `String`, no borrowed
 /// lifetime on the engine itself" shape. The point read uses only
@@ -368,23 +213,20 @@ pub struct TraceReadConfig {
     /// `trace_spans` (or `trace_spans_dist` when clustered — the caller
     /// applies the same `_dist` rule as every other read engine's config).
     pub spans_table: String,
-    /// `trace_attrs_idx{_dist}` — the index the phase-1 search
-    /// generators target. The phase-2 attribute CONDITION stopped reading
-    /// it in issue #557 and the aggregate / `select()` / `by()` value
-    /// reads and the event/link value sets stopped in issue #558, so on
-    /// the search route no phase-2 statement reads it at all.
+    /// `trace_attrs_idx{_dist}` — the attribute index the metrics and tag
+    /// reads still use; no search reads it.
     pub attrs_table: String,
     /// `trace_edges{_dist}` — the service-graph half-row ledger the
     /// `service_graph` read targets (issue #173). `_dist`-suffixed when
     /// clustered exactly like `spans_table`/`attrs_table` (halves co-shard
     /// on `cityHash64(trace_id)`, so the query-time join is shard-local).
     pub edges_table: String,
-    /// `trace_recent{_dist}` — the time-range generator's source (issue
-    /// #560). Same `_dist` rule as every trace table; co-shards on
-    /// `cityHash64(trace_id)`, so the recency read stays shard-local.
+    /// `trace_recent{_dist}` — the previous search engine's time-range
+    /// source (issue #560); no read uses it since #602 part 2c-2b-2, and
+    /// the table and this field go with #602 part 3.
     pub recent_table: String,
-    /// `trace_error_spans{_dist}` — the `{ status = error }` generator's
-    /// source (issue #560). Same rule.
+    /// `trace_error_spans{_dist}` — the previous search engine's
+    /// `{ status = error }` source (issue #560); unread the same way.
     pub errors_table: String,
     /// `spans{_dist}` — the trace fetch's span table (issue #587).
     ///
@@ -403,26 +245,10 @@ pub struct TraceReadConfig {
     /// carve-out the tag catalog has. A `_dist` wrapper here would fan a
     /// read out to every shard for rows every shard already holds.
     pub resources_table: String,
-    /// `reader.traceql_max_candidates` — per-generator top-K depth and
-    /// the merged consumption ceiling.
-    pub max_candidates: u64,
     /// `reader.traceql_scan_budget_rows` — `max_rows_to_read` (throw) on
     /// every search query; breach → 422 (code 158 →
     /// [`TooBroadReason::TraceScanBudgetRows`]).
     pub scan_budget_rows: u64,
-    /// `reader.traceql_event_set_max_values` — how many values one
-    /// batch's event/link value set may expand to (issue #558). Compared
-    /// against the widths the hydration statement returned, BEFORE the
-    /// value statement is issued, so an over-budget set is refused rather
-    /// than materialised; breach → 422
-    /// ([`TooBroadReason::TraceEventSetValues`]).
-    ///
-    /// **Not [`Self::scan_budget_rows`], and the two bound different
-    /// quantities.** The row budget is `max_rows_to_read` on every
-    /// trace-search read and counts physical rows a statement reads; this
-    /// counts the values one batch's set will hold. They coincided only
-    /// while the set came from an index storing one value per row.
-    pub event_set_max_values: u64,
     /// `reader.traceql_max_depth` (`PULSUS_TRACEQL_MAX_DEPTH`, issue #593
     /// part 2): the most parent links one climb of `>>` or `<<` follows.
     /// A span with a parent left to follow past it answers `422`
@@ -432,14 +258,6 @@ pub struct TraceReadConfig {
     /// distinct-series cap; the `LIMIT cap+1` probe breach → 422
     /// ([`TooBroadReason::TraceMetricsSeriesCap`]).
     pub max_series: u64,
-    /// `reader.traceql_generator_max_memory_bytes` — the phase-1
-    /// candidate-generator query's `max_memory_usage` ceiling (issue #57
-    /// re-audit, sub-problem B): bounds a dense common-value prefix's
-    /// `GROUP BY trace_id` aggregation state; breach → 422 (code 241 →
-    /// [`TooBroadReason::TraceGeneratorMemory`]). Never applied to
-    /// phase-2 reads (hydration/value/root), which set no memory limit
-    /// of their own.
-    pub generator_max_memory_bytes: u64,
     /// Issue #398: `reader.traceql_read_max_memory_bytes` — the
     /// `max_memory_usage` ceiling (throw-not-spill) carried by EVERY trace
     /// read, at all three of this module's settings origins:
@@ -447,10 +265,7 @@ pub struct TraceReadConfig {
     /// ([`TraceEngine::fetch_by_id`], which sent a bare
     /// `QuerySettings::new()` and mapped errors around
     /// [`map_trace_read_error`] entirely before #398). Breach → server code
-    /// 241 → [`TooBroadReason::TraceReadMemory`] → `422`. Phase-1
-    /// generator reads layer the TIGHTER
-    /// [`Self::generator_max_memory_bytes`] on top and keep their own
-    /// reason.
+    /// 241 → [`TooBroadReason::TraceReadMemory`] → `422`.
     pub read_max_memory_bytes: u64,
     /// Clustered mode: inject the docs/schemas.md §7 clustered-reader
     /// settings on every search query (both phases are shard-local by
@@ -460,29 +275,14 @@ pub struct TraceReadConfig {
     pub skip_unavailable_shards: bool,
 }
 
-/// The final winners' root metadata (root span = `parent_id` all-zero,
-/// else timestamp-earliest of the **full** trace — root hydration is
-/// trace-wide, not window-bounded, plan v4 delta 4).
+/// A returned trace's root metadata, from the trace-wide per-trace read
+/// of the search statement (`spans/search.rs`'s `TRACE_READ`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RootSummary {
     pub service: String,
     pub name: String,
     pub start_ns: i64,
     pub duration_ns: i64,
-}
-
-/// A winner trace's root-span summary plus its trace-wide time envelope
-/// (issue #464), both derived in ONE pass over the same trace-wide,
-/// window-free, uncapped `root_sql` rows — so the envelope is
-/// full-trace-exact for the same reason the root is, and costs no extra
-/// query, no extra round trip and no second walk.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TraceContext {
-    pub root: RootSummary,
-    /// `min(timestamp_ns)` over every span of the trace.
-    pub trace_start_ns: i64,
-    /// `max(timestamp_ns + duration_ns) - min(timestamp_ns)`.
-    pub trace_duration_ns: i64,
 }
 
 /// One returned trace: root metadata + the trace-wide envelope + the
@@ -709,25 +509,6 @@ impl ByteBudget {
     }
 }
 
-/// Pure Rust-side merge of the per-generator candidate outputs: `max`
-/// `bound_ts` per trace (an explicit max — anything less could
-/// under-bound and break threshold termination, plan v5 delta 1), ranked
-/// `(bound_ts DESC, trace_id ASC)`.
-pub(crate) fn merge_candidates(per_generator: &[Vec<([u8; 16], i64)>]) -> Vec<([u8; 16], i64)> {
-    let mut merged: HashMap<[u8; 16], i64> = HashMap::new();
-    for rows in per_generator {
-        for (trace_id, bound_ts) in rows {
-            merged
-                .entry(*trace_id)
-                .and_modify(|existing| *existing = (*existing).max(*bound_ts))
-                .or_insert(*bound_ts);
-        }
-    }
-    let mut out: Vec<([u8; 16], i64)> = merged.into_iter().collect();
-    out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    out
-}
-
 /// Maps a ClickHouse error on the **trace metrics** path (issue #59):
 /// code 191 (`SET_SIZE_LIMIT_EXCEEDED`) — raised only by the metrics
 /// semi-join IN-set limits — maps to the dedicated, never-conflated
@@ -838,10 +619,7 @@ fn map_trace_read_error(e: ChError, config: &TraceReadConfig) -> ReadError {
     if let ChError::Server { code, .. } = &e {
         match *code {
             // Issue #398: the surface-wide memory ceiling
-            // `search_settings`/`catalog_settings` now carry. Generator
-            // reads never reach this arm — `map_trace_generator_error`
-            // classifies 241 as the tighter, more specific
-            // `TraceGeneratorMemory` first and only delegates the rest.
+            // `search_settings`/`catalog_settings` carry.
             CODE_MEMORY_LIMIT_EXCEEDED => {
                 return ReadError::QueryTooBroad(TooBroadReason::TraceReadMemory {
                     budget_bytes: config.read_max_memory_bytes,
@@ -868,87 +646,6 @@ fn map_trace_read_error(e: ChError, config: &TraceReadConfig) -> ReadError {
         }
     }
     ReadError::Clickhouse(e)
-}
-
-/// Maps a ClickHouse error on the **event/link value statement** only
-/// (issue #558): code 396 on THAT statement is its own result bound,
-/// which the code cannot attribute to rows or bytes, so it reports the
-/// value budget without a count. Everything else delegates to
-/// [`map_trace_read_error`], so the row scan budget, the read-byte
-/// ceiling and the memory ceiling keep reporting their own reasons.
-fn map_trace_event_set_error(e: ChError, config: &TraceReadConfig) -> ReadError {
-    if let ChError::Server {
-        code: CODE_TOO_MANY_ROWS_OR_BYTES,
-        ..
-    } = &e
-    {
-        return ReadError::QueryTooBroad(TooBroadReason::TraceEventSetValues {
-            values: None,
-            budget_values: config.event_set_max_values,
-        });
-    }
-    map_trace_read_error(e, config)
-}
-
-/// Moves one slot map out of the batch's answers, leaving an empty map
-/// behind (issue #558) — the `select_values` "moved, never copied"
-/// precedent, applied to the maps the hydration statement filled.
-fn take_slot_map<K, V>(slot: Option<&mut HashMap<K, V>>) -> HashMap<K, V> {
-    slot.map(std::mem::take).unwrap_or_default()
-}
-
-/// Maps a ClickHouse error on the **phase-1 candidate-generator** read
-/// path only (issue #57 re-audit, sub-problem B): code 241
-/// (`MEMORY_LIMIT_EXCEEDED`) — raised only by [`generator_settings`]'s
-/// memory ceiling — maps to the dedicated, never-conflated
-/// [`TooBroadReason::TraceGeneratorMemory`]; everything else delegates
-/// to the shared trace mapper ([`map_trace_read_error`]).
-///
-/// Issue #398: [`map_trace_read_error`] DOES map 241 now, to the
-/// surface-wide [`TooBroadReason::TraceReadMemory`]. The order below is
-/// therefore load-bearing rather than incidental — this mapper runs first
-/// on generator reads and returns before delegating, so the generator's
-/// tighter ceiling keeps reporting its own reason and the two never mix.
-fn map_trace_generator_error(e: ChError, config: &TraceReadConfig) -> ReadError {
-    if let ChError::Server {
-        code: CODE_MEMORY_LIMIT_EXCEEDED,
-        ..
-    } = &e
-    {
-        return ReadError::QueryTooBroad(TooBroadReason::TraceGeneratorMemory {
-            budget_bytes: config.generator_max_memory_bytes,
-        });
-    }
-    map_trace_read_error(e, config)
-}
-
-/// Worst-first heap ordering: the max-heap "greatest" entry is the WORST
-/// result under the public contract (smallest sort key; among ties the
-/// LARGEST trace id, since ascending trace id wins).
-#[derive(Debug)]
-struct HeapEntry(TraceMatch);
-
-impl PartialEq for HeapEntry {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.sort_key == other.0.sort_key && self.0.trace_id == other.0.trace_id
-    }
-}
-impl Eq for HeapEntry {}
-impl PartialOrd for HeapEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for HeapEntry {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Reverse sort_key (smaller = "greater" = worse), then trace_id
-        // (larger = worse).
-        other
-            .0
-            .sort_key
-            .cmp(&self.0.sort_key)
-            .then(self.0.trace_id.cmp(&other.0.trace_id))
-    }
 }
 
 pub struct TraceEngine {
@@ -978,25 +675,9 @@ impl TraceEngine {
         self
     }
 
-    /// The planning context this engine's configuration implies —
-    /// callers feed it to [`super::search_plan::plan_search`].
-    pub fn search_ctx(&self) -> SearchCtx<'_> {
-        SearchCtx {
-            filter: super::filter::SpanFilterCtx {
-                spans_table: &self.config.spans_table,
-                attrs_table: &self.config.attrs_table,
-            },
-            recent_table: &self.config.recent_table,
-            errors_table: &self.config.errors_table,
-            max_candidates: self.config.max_candidates,
-            max_series: self.config.max_series,
-            distributed: self.config.distributed,
-        }
-    }
-
     /// The metrics planning context this engine's configuration implies —
     /// callers feed it to [`super::metrics_plan::plan_trace_metrics`]
-    /// (issue #59), mirroring [`Self::search_ctx`].
+    /// (issue #59).
     pub fn metrics_ctx(&self) -> MetricsCtx<'_> {
         MetricsCtx {
             filter: super::filter::SpanFilterCtx {
@@ -2238,23 +1919,6 @@ impl TraceEngine {
         }
     }
 
-    /// Executes a [`SearchPlan`] end to end (module doc for the model).
-    pub async fn search(&self, plan: &SearchPlan) -> Result<SearchOutput, ReadError> {
-        self.search_inner(plan, None).await
-    }
-
-    /// One execution that also captures the per-stage SQL trace — same
-    /// single-pass contract as `LogQlEngine::query_explained` (no double
-    /// execution).
-    pub async fn search_explained(
-        &self,
-        plan: &SearchPlan,
-    ) -> Result<(SearchOutput, PlanExplain), ReadError> {
-        let mut explain = PlanExplain::new("traces");
-        let output = self.search_inner(plan, Some(&mut explain)).await?;
-        Ok((output, explain))
-    }
-
     /// Answers `request` with the search statement (issue #602 part 2b),
     /// the newest slices first. It is the route's only engine: the
     /// statement's error is the request's, a `!` demand as `400`.
@@ -2333,12 +1997,9 @@ impl TraceEngine {
     /// documented Layer-1 residual). `charged` accumulates what the
     /// caller must release when it discards the rows.
     ///
-    /// **Issue #35: the single choke point for every search-phase
-    /// CHARGE.** Every phase-1 generator, phase-2 hydration and
-    /// attribute-value batch, and the root-hydration read route through
-    /// this one function, so the byte budget is priced, charged and
-    /// accepted in one place rather than at each of the half-dozen call
-    /// sites.
+    /// **Issue #35: the single choke point for every search CHARGE.**
+    /// The search statement's rows route through this one function, so
+    /// the byte budget is priced, charged and accepted in one place.
     ///
     /// **Issue #509: it is no longer the choke point for query TEXT.**
     /// The `?`-doubling and
@@ -2348,11 +2009,8 @@ impl TraceEngine {
     /// twenty-seven did not. Both now run in `traces::dispatch`, once,
     /// for every read this module issues.
     ///
-    /// **Issue #57 re-audit:** `mapper` lets phase-1 generator reads route
-    /// through [`map_trace_generator_error`] (which alone maps code 241 →
-    /// [`TooBroadReason::TraceGeneratorMemory`]) while every other call
-    /// site keeps [`map_trace_read_error`] — a single choke point, two
-    /// error taxonomies, never conflated.
+    /// **Issue #57 re-audit:** `mapper` is the caller's error mapping; the
+    /// search statement passes [`map_search_statement_error`].
     ///
     /// **If the returned `Vec` is NOT your retained form, use
     /// [`Self::stream_rows_charged`] instead** (issue #351 review 2). A
@@ -2421,791 +2079,6 @@ impl TraceEngine {
         }
         Ok(())
     }
-
-    /// Runs the spanset `| by(...)` distinct-by-key cardinality probe
-    /// (issue #185) before the main search: a `cap+1` result is a static
-    /// `422 query_too_broad` ([`TooBroadReason::TraceSearchSeriesCap`]) —
-    /// the SAME `reader.traceql_max_series` cap and mechanism as the metric
-    /// `by()` cap ([`Self::enforce_series_cap`]). Plans with no probe (no
-    /// `by()`, an unsupported by-key, or a composite spanset) return
-    /// immediately.
-    async fn enforce_search_series_cap(&self, plan: &SearchPlan) -> Result<(), ReadError> {
-        let Some(probe) = plan.by_probe_sql() else {
-            return Ok(());
-        };
-        let cap = self.config.max_series;
-        let settings = self.search_settings();
-        let mut count: u64 = 0;
-        // Scoped stream: the probe returns exactly one `count()` row.
-        let mut stream = self
-            .dispatch
-            .query_stream::<MetricCountRow, _>(probe, &settings, |e| {
-                map_trace_read_error(e, &self.config)
-            })
-            .await?;
-        while let Some(row) = stream.next().await {
-            count = row.map_err(|e| map_trace_read_error(e, &self.config))?.n;
-        }
-        if count > cap {
-            return Err(ReadError::QueryTooBroad(
-                TooBroadReason::TraceSearchSeriesCap { count, cap },
-            ));
-        }
-        Ok(())
-    }
-
-    async fn search_inner(
-        &self,
-        plan: &SearchPlan,
-        mut explain: Option<&mut PlanExplain>,
-    ) -> Result<SearchOutput, ReadError> {
-        let settings = self.search_settings();
-        let gen_settings = generator_settings(&self.config);
-        let mut budget = ByteBudget::new(HYDRATION_BYTE_BUDGET);
-
-        // Issue #492 part 3: the compiled plan's shape, in explained mode
-        // only. It is recorded first because it describes what the
-        // request WILL send — a plan is a plan-time answer, and the
-        // executor may send fewer statements than it names when the data
-        // runs out (a search with no winners issues no root read at all).
-        // Charged before it is rendered, like every other retention here.
-        // It lives in this function and not in `search_explained` because
-        // this is where the byte budget is.
-        charge_explain_plan(&mut explain, &mut budget, plan)?;
-
-        // The spanset `by()` cardinality cap runs before any main-query
-        // work (issue #185) — a static `422 query_too_broad` on breach.
-        self.enforce_search_series_cap(plan).await?;
-
-        // ---- Phase 1: per-generator bounded ranked queries + merge ----
-        // Every pre-hydration Layer-2 charge in this phase is enumerated
-        // and bounded by the `traces_search_explain.rs` retention-gate
-        // drift guard's P10 formula: `2 * generator_sqls.len() *
-        // (plan.max_candidates() + 1) * CANDIDATE_TUPLE_BYTES +
-        // BATCH_TRACES * size_of::<[u8; 16]>() + RETAINED_ENTRY_OVERHEAD`
-        // — a new pre-hydration charge site must be added to that
-        // formula's site inventory, not just this function.
-        let gen_probe = plan.max_candidates() + 1;
-        let mut generator_truncated = false;
-        let mut per_generator: Vec<Vec<([u8; 16], i64)>> = Vec::new();
-        let mut phase1_charged = 0usize;
-        for (gen_idx, sql) in plan.generator_sqls.iter().enumerate() {
-            charge_explain(
-                &mut explain,
-                &mut budget,
-                "phase1_candidate_generator",
-                sql,
-                None,
-            )?;
-            let before_attempt = phase1_charged;
-            let attempt: Result<Vec<CandidateRow>, ReadError> = self
-                .collect_rows_charged(
-                    sql,
-                    &gen_settings,
-                    &mut budget,
-                    &mut phase1_charged,
-                    map_trace_generator_error,
-                    |_| CANDIDATE_TUPLE_BYTES,
-                )
-                .await;
-            // Issue #492 part 5: the pushed `HAVING` holds one
-            // aggregation state per (trace x group) where the bare
-            // statement holds one per trace, so a query that answers
-            // `200` at the ceiling without the pushdown could answer
-            // `422` with it. It must not: the fallback re-runs the SAME
-            // read with no `HAVING` — the statement this query sends
-            // when nothing is pushed, byte for byte
-            // (`SearchPlan::generator_fallback_sql`) — so the refusal
-            // point is where it was.
-            //
-            // Only generator index 0 carries a fragment
-            // (`plan_search` re-renders `generator_sqls[0]` and only
-            // when there is exactly one generator), and only code 241
-            // takes this branch: `map_trace_generator_error` maps that
-            // alone to `TraceGeneratorMemory` and delegates everything
-            // else.
-            let rows: Vec<CandidateRow> = match attempt {
-                Ok(rows) => rows,
-                Err(ReadError::QueryTooBroad(TooBroadReason::TraceGeneratorMemory { .. }))
-                    if gen_idx == 0 && plan.generator_fallback_sql().is_some() =>
-                {
-                    let fallback = plan
-                        .generator_fallback_sql()
-                        .expect("checked by the guard above");
-                    // Release the failed attempt's charge before
-                    // re-running. A 241 raised in `AggregatingTransform`
-                    // delivers no row, so the delta is expected to be
-                    // zero — this releases the difference regardless
-                    // rather than relying on that, because
-                    // `stream_rows_charged` does not roll back on error.
-                    budget.release(phase1_charged - before_attempt);
-                    phase1_charged = before_attempt;
-                    charge_explain(
-                        &mut explain,
-                        &mut budget,
-                        "phase1_candidate_generator_fallback",
-                        fallback,
-                        Some(("reason", "generator memory ceiling")),
-                    )?;
-                    self.collect_rows_charged(
-                        fallback,
-                        &gen_settings,
-                        &mut budget,
-                        &mut phase1_charged,
-                        map_trace_generator_error,
-                        |_| CANDIDATE_TUPLE_BYTES,
-                    )
-                    .await?
-                }
-                Err(e) => return Err(e),
-            };
-            if rows.len() as u64 == gen_probe {
-                generator_truncated = true;
-            }
-            per_generator.push(rows.into_iter().map(|r| (r.trace_id, r.bound_ts)).collect());
-        }
-        // The merge's map + ranked output are charged BEFORE they are
-        // built (round-3 audit): the merged entry count is bounded by the
-        // charged input rows, so one more `rows × tuple-cost` covers the
-        // map-and-output side while both coexist with the inputs; the
-        // input-side charge is released once the per-generator Vecs drop,
-        // leaving the ranked candidate list charged (at its upper bound)
-        // for the rest of the request.
-        let total_rows: usize = per_generator.iter().map(Vec::len).sum();
-        budget.charge(total_rows * CANDIDATE_TUPLE_BYTES)?;
-        let candidates = merge_candidates(&per_generator);
-        drop(per_generator);
-        budget.release(phase1_charged);
-        // Reconcile to the survivor (round-4): the merge map is dead —
-        // release the dedup'd difference so only the ranked candidate
-        // list's actual entries stay charged.
-        budget.release((total_rows - candidates.len()) * CANDIDATE_TUPLE_BYTES);
-
-        // ---- Phase 2: streaming batched exact evaluation --------------
-        let limit = plan.limit() as usize;
-        // The issue #193 distinct-group cardinality cap: a cross-batch
-        // running accumulator enforced INSIDE `by()` grouping at
-        // production time (before any `coalesce()` collapse and before
-        // winner eviction), so every regrouped form is bounded by the
-        // SAME static `422 TraceSearchSeriesCap` as the #185 pre-flight.
-        // Inert (no charge, no work) for non-`by()` queries.
-        let mut group_counter = GroupCardinalityCounter::new(self.config.max_series);
-        let mut heap: std::collections::BinaryHeap<HeapEntry> = std::collections::BinaryHeap::new();
-        let mut consumed: u64 = 0;
-        let mut ceiling_hit = false;
-        let mut overflow_partial = false;
-        let mut idx = 0usize;
-        while idx < candidates.len() {
-            // The consumption ceiling is checked and recorded FIRST (code
-            // review round 1: an engaged ceiling with a lookahead
-            // candidate present is a partiality source under the
-            // exhaustive conservative rule, even when threshold
-            // termination is simultaneously eligible — the threshold
-            // check must never mask it).
-            if consumed >= plan.max_candidates() {
-                ceiling_hit = true;
-                break;
-            }
-            // Threshold termination (checked against the NEXT candidate
-            // before deciding EOF vs ceiling-stop — the one-row
-            // lookahead): no unseen candidate can beat the k-th held
-            // match, because bound_ts upper-bounds the public sort key.
-            if heap.len() == limit
-                && heap
-                    .peek()
-                    .is_some_and(|worst| candidates[idx].1 < worst.0.sort_key)
-            {
-                break;
-            }
-            let remaining = usize::try_from(plan.max_candidates() - consumed).unwrap_or(usize::MAX);
-            let take = BATCH_TRACES.min(candidates.len() - idx).min(remaining);
-            let mut batch_charged = 0usize;
-            // The batch id list is charged before it is collected
-            // (round-3 audit; released with the rest of the batch).
-            let id_list_charge = take * std::mem::size_of::<[u8; 16]>() + RETAINED_ENTRY_OVERHEAD;
-            budget.charge(id_list_charge)?;
-            batch_charged += id_list_charge;
-            let batch_ids: Vec<[u8; 16]> =
-                candidates[idx..idx + take].iter().map(|c| c.0).collect();
-            let (traces, overflowed, mut membership) = self
-                .hydrate_batch(
-                    plan,
-                    &batch_ids,
-                    &settings,
-                    &mut budget,
-                    &mut batch_charged,
-                    &mut explain,
-                )
-                .await?;
-            if overflowed {
-                overflow_partial = true;
-            }
-            let attrs = self
-                .batch_attrs(
-                    plan,
-                    &batch_ids,
-                    &settings,
-                    &mut membership,
-                    BatchCharge {
-                        budget: &mut budget,
-                        charged: &mut batch_charged,
-                    },
-                    &mut explain,
-                )
-                .await?;
-
-            // Matches arrive ALREADY charged — `evaluate_batch` charges
-            // every retained byte before allocating it (round-2 finding:
-            // charge must never trail materialization); the heap-evict
-            // release below returns exactly what was charged
-            // (`retained_bytes` is the same capacity-based cost model).
-            for m in
-                search_eval::evaluate_batch(plan, &traces, &attrs, &mut group_counter, &mut budget)?
-            {
-                heap.push(HeapEntry(m));
-                if heap.len() > limit
-                    && let Some(worst) = heap.pop()
-                {
-                    budget.release(worst.0.retained_bytes());
-                }
-            }
-            // The batch's hydrated rows / membership sets are discarded
-            // here — only the heap summaries survive (plan v6 delta 2).
-            // The sets are still here to discard: since issue #557
-            // `group_hydrated_rows` FILLS them from the hydration rows
-            // rather than decoding them from a read of their own, and
-            // `drop(attrs)` below is what releases them.
-            budget.release(batch_charged);
-            drop(traces);
-            drop(attrs);
-
-            consumed += take as u64;
-            idx += take;
-        }
-
-        let partial = generator_truncated || ceiling_hit || overflow_partial;
-
-        // The group-cardinality accumulator has done its enforcement job;
-        // release its retained charge (its bytes live in the winners'
-        // `retained_bytes` via each `TraceMatch.groups`, released on the
-        // usual heap-evict / return path). Success-path only — an error
-        // above dropped the whole budget with the request.
-        group_counter.release(&mut budget);
-
-        // ---- Winners: rank + trace-wide root hydration -----------------
-        let mut winners: Vec<TraceMatch> = heap.into_iter().map(|e| e.0).collect();
-        winners.sort_by(|a, b| {
-            b.sort_key
-                .cmp(&a.sort_key)
-                .then(a.trace_id.cmp(&b.trace_id))
-        });
-
-        let roots = if winners.is_empty() {
-            HashMap::new()
-        } else {
-            // The winner id list is charged before it is collected and
-            // released when it dies with this block (round-4
-            // reconciliation).
-            let winner_ids_charge =
-                winners.len() * std::mem::size_of::<[u8; 16]>() + RETAINED_ENTRY_OVERHEAD;
-            budget.charge(winner_ids_charge)?;
-            let ids: Vec<[u8; 16]> = winners.iter().map(|w| w.trace_id).collect();
-            let sql = plan.root_sql_for(&ids);
-            charge_explain(&mut explain, &mut budget, "root_hydration", &sql, None)?;
-            let mut root_rows_charged = 0usize;
-            let rows: Vec<RootRow> = self
-                .collect_rows_charged(
-                    &sql,
-                    &settings,
-                    &mut budget,
-                    &mut root_rows_charged,
-                    map_trace_read_error,
-                    |row: &RootRow| {
-                        std::mem::size_of::<RootRow>()
-                            + RETAINED_ENTRY_OVERHEAD
-                            + row.service.len()
-                            + row.name.len()
-                    },
-                )
-                .await?;
-            // Transfer the charge with ownership (code review round 1):
-            // the transient row Vec is released only AFTER the retained
-            // `roots` map has been charged — the map (and the output rows
-            // its summaries move into) stays charged for as long as it
-            // lives, i.e. until this request returns.
-            let roots = pick_roots(rows);
-            budget.charge(roots_retained_bytes(&roots))?;
-            budget.release(root_rows_charged);
-            budget.release(winner_ids_charge);
-            roots
-        };
-
-        // Output assembly (rounds 3-4): the COMPLETE slot capacity is
-        // charged before `Vec::with_capacity` reserves it (round-4: the
-        // reservation materializes every slot up front), then each
-        // root-summary CLONE's string bytes (the map entry stays live
-        // alongside the clone) are charged before that clone is made.
-        budget.charge(output_reserve_bytes(winners.len()))?;
-        let mut traces: Vec<TraceSearchResult> = Vec::with_capacity(winners.len());
-        for w in winners {
-            // Charge-before-materialize in BOTH branches (the module's
-            // standing invariant), which is why only the fallback's
-            // CONSTRUCTION moved into a function, not the branch itself.
-            let ctx = match roots.get(&w.trace_id) {
-                Some(ctx) => {
-                    budget.charge(ctx.root.service.len() + ctx.root.name.len())?;
-                    ctx.clone()
-                }
-                // A winner whose root read returned nothing (TTL race —
-                // pathological) falls back to its matched-span metadata
-                // rather than being silently dropped.
-                None => {
-                    let name_len = w
-                        .spans
-                        .first()
-                        .and_then(SpanSummary::name)
-                        .map_or(0, str::len);
-                    budget.charge(name_len)?;
-                    fallback_trace_context(&w.spans, w.sort_key)
-                }
-            };
-            traces.push(TraceSearchResult {
-                trace_id: w.trace_id,
-                root: ctx.root,
-                trace_start_ns: ctx.trace_start_ns,
-                trace_duration_ns: ctx.trace_duration_ns,
-                matched: w.matched,
-                spans: w.spans,
-                groups: w.groups,
-            });
-        }
-
-        let returned = traces.len() as u32;
-        Ok(SearchOutput {
-            traces,
-            partial,
-            returned,
-            limit: plan.limit(),
-        })
-    }
-
-    /// Hydrates one batch's spans, groups them per trace, dedups by
-    /// `span_id`, detects per-trace overflow via the `+1` probe, and
-    /// fills every slot the statement answered: the probe memberships
-    /// (issue #557), the `select()` and aggregate values with their
-    /// stored kinds, and the event/link set widths (issue #558).
-    ///
-    /// The statement's shape comes from `SearchPlan::hydration_shape()`,
-    /// which is also what rendered it, so the row type this decodes into
-    /// and the SELECT list are one decision.
-    async fn hydrate_batch(
-        &self,
-        plan: &SearchPlan,
-        batch_ids: &[[u8; 16]],
-        settings: &QuerySettings,
-        budget: &mut ByteBudget,
-        batch_charged: &mut usize,
-        explain: &mut Option<&mut PlanExplain>,
-    ) -> Result<(Vec<TraceSpans>, bool, BatchSlots), ReadError> {
-        let sql = plan.hydration_sql_for(batch_ids);
-        charge_explain(explain, budget, "phase2_hydration", &sql, None)?;
-        // Issue #479's two shapes, decided by the plan and not here: a
-        // probe whose matched value a projection needs collects a map,
-        // every other probe a bare key set. Both are filled below from
-        // the SAME rows.
-        let fuses: Vec<bool> = (0..plan.probes_len())
-            .map(|i| plan.probe_fuses_value(i))
-            .collect();
-        let layout = plan.slots();
-        let mut slots = BatchSlots {
-            membership: fuses
-                .iter()
-                .map(|&f| {
-                    if f {
-                        ProbeMembership::Values(HashMap::new())
-                    } else {
-                        ProbeMembership::Keys(HashSet::new())
-                    }
-                })
-                .collect(),
-            select_values: vec![HashMap::new(); plan.select_attrs_len()],
-            select_types: vec![HashMap::new(); plan.select_attrs_len()],
-            agg_values: vec![HashMap::new(); plan.agg_fields_len()],
-            agg_types: vec![HashMap::new(); plan.agg_fields_len()],
-            set_widths: vec![0u64; plan.event_sets_len()],
-        };
-        // Charged per row DURING streaming (unbounded String columns are
-        // exactly what the Layer-2 counter must bind — `max_result_bytes`
-        // does not throw on streamed SELECT shapes).
-        let (traces, overflowed) = match plan.hydration_shape() {
-            HydrationShape::Plain => {
-                let rows: Vec<HydrationRow> = self
-                    .collect_rows_charged(
-                        &sql,
-                        settings,
-                        budget,
-                        batch_charged,
-                        map_trace_read_error,
-                        |row: &HydrationRow| {
-                            std::mem::size_of::<HydrationRow>()
-                                + RETAINED_ENTRY_OVERHEAD
-                                + row.service.len()
-                                + row.name.len()
-                        },
-                    )
-                    .await?;
-                group_hydrated_rows(rows, &fuses, layout, &mut slots, budget, batch_charged)?
-            }
-            HydrationShape::Probes => {
-                let rows: Vec<HydrationProbeRow> = self
-                    .collect_rows_charged(
-                        &sql,
-                        settings,
-                        budget,
-                        batch_charged,
-                        map_trace_read_error,
-                        |row: &HydrationProbeRow| {
-                            std::mem::size_of::<HydrationProbeRow>()
-                                + RETAINED_ENTRY_OVERHEAD
-                                + row.service.len()
-                                + row.name.len()
-                                + row.attr_slot.len()
-                        },
-                    )
-                    .await?;
-                group_hydrated_rows(rows, &fuses, layout, &mut slots, budget, batch_charged)?
-            }
-            HydrationShape::ProbesAndValues => {
-                let rows: Vec<HydrationProbeValueRow> = self
-                    .collect_rows_charged(
-                        &sql,
-                        settings,
-                        budget,
-                        batch_charged,
-                        map_trace_read_error,
-                        |row: &HydrationProbeValueRow| {
-                            std::mem::size_of::<HydrationProbeValueRow>()
-                                + RETAINED_ENTRY_OVERHEAD
-                                + row.service.len()
-                                + row.name.len()
-                                + row.attr_slot.len()
-                                + row.attr_slot_val.iter().map(String::len).sum::<usize>()
-                                + row.attr_slot_type.iter().map(String::len).sum::<usize>()
-                                + row.attr_slot_num.len() * std::mem::size_of::<Option<f64>>()
-                        },
-                    )
-                    .await?;
-                group_hydrated_rows(rows, &fuses, layout, &mut slots, budget, batch_charged)?
-            }
-        };
-        Ok((traces, overflowed, slots))
-    }
-
-    /// Places everything the hydration statement already answered — the
-    /// probe memberships (issue #557), the `select()` and aggregate
-    /// values with their kinds, and the event/link set widths (issue
-    /// #558) — and runs the one phase-2 attribute statement left, the
-    /// event/link value sets, only when their widths are within budget.
-    async fn batch_attrs(
-        &self,
-        plan: &SearchPlan,
-        batch_ids: &[[u8; 16]],
-        settings: &QuerySettings,
-        slots: &mut BatchSlots,
-        charge: BatchCharge<'_>,
-        explain: &mut Option<&mut PlanExplain>,
-    ) -> Result<BatchAttrs, ReadError> {
-        let BatchCharge {
-            budget,
-            charged: batch_charged,
-        } = charge;
-        let mut attrs = BatchAttrs::default();
-        // Issue #492 part 3: ONE walk over the compiled chain, in the
-        // order the plan says the statements are issued, replacing six
-        // hand-written index loops.
-        //
-        // **The alignment is the reason, not the tidiness.** Every
-        // `BatchAttrs` vector is index-aligned with the plan vector it
-        // came from — `attrs.membership[i]` answers `plan.probes[i]` —
-        // and six `for i in 0..n` loops guaranteed that by construction.
-        // Since issue #558 the memberships, the `select()` values and the
-        // aggregate values all arrive from the hydration statement's own
-        // slot space, which `group_hydrated_rows` fills through the
-        // `SlotLayout`'s accessors. The chain guarantees the walk: it
-        // carries
-        // `Membership(0..probes)`, `AggValues(0..agg_fields)` and so on
-        // in exactly that order, and each arm pushes in walk order. A
-        // chain that dropped one link would misalign the vectors and
-        // produce WRONG MATCHES rather than an error, which is why the
-        // link's own part is asserted below and why the corpus gate
-        // compares the whole part SEQUENCE rather than a count.
-        for (i, link) in plan.chain().iter().enumerate() {
-            debug_assert!(
-                !is_phase_two_read(link)
-                    || matches!(
-                        plan.compiled()
-                            .links
-                            .get(i)
-                            .and_then(|l| plan.compiled().parts.get(l.part)),
-                        Some(Part::Sql(_))
-                    ),
-                "chain link {i} ({link:?}) issues a statement, so the plan must give it an \
-                 SQL part"
-            );
-            match link {
-                // Issue #557: the probe's answer arrived on the
-                // hydration row, so this link issues NO statement. The
-                // set `group_hydrated_rows` filled is MOVED into place
-                // here, in the same walk order the reads used to be
-                // issued in, which is what keeps
-                // `attrs.membership[i]` answering `plan.probes[i]`.
-                TqlLink::Membership(probe_idx) => {
-                    let empty = ProbeMembership::Keys(HashSet::new());
-                    let filled = match slots.membership.get_mut(*probe_idx) {
-                        Some(slot) => std::mem::replace(slot, empty),
-                        None => empty,
-                    };
-                    attrs.membership.push(filled);
-                }
-                // Issue #558: the field's value, its numeric reading and
-                // its stored kind all arrived on the hydration row, read
-                // at ONE located element, so this link issues NO
-                // statement. The maps `group_hydrated_rows` filled are
-                // MOVED into place here, in the same walk order the reads
-                // used to be issued in, which is what keeps
-                // `attrs.agg_values[k]` answering `plan.agg_fields[k]`.
-                TqlLink::AggValues(field_idx) => {
-                    let field_idx = *field_idx;
-                    attrs
-                        .agg_values
-                        .push(take_slot_map(slots.agg_values.get_mut(field_idx)));
-                    attrs
-                        .agg_types
-                        .push(take_slot_map(slots.agg_types.get_mut(field_idx)));
-                }
-                TqlLink::SelectValues(field_idx) => {
-                    let field_idx = *field_idx;
-                    attrs
-                        .select_values
-                        .push(take_slot_map(slots.select_values.get_mut(field_idx)));
-                    attrs
-                        .select_types
-                        .push(take_slot_map(slots.select_types.get_mut(field_idx)));
-                }
-                // Issue #351: the MULTI-VALUED event/link values — ONE ROW PER
-                // VALUE, on the same `(key, scope)` index prefix the literal form
-                // probes. Issued only when a leaf compares one against another
-                // field (`needs_event_sets()`), so every other query pays
-                // nothing.
-                //
-                // **Row-per-value is the memory contract.** The first cut read
-                // `groupUniqArray(...) GROUP BY trace_id, span_id`, which broke
-                // this module's own Layer-1 residual bound — "never a-priori
-                // row-unbounded", above — because an array column is an
-                // unbounded number of capped strings in ONE row: the server-side
-                // aggregate state AND the client's decoded row both grew with a
-                // span's distinct event count before any charge could run, and
-                // phase-2 reads carry no `max_memory_usage`, so a server-side
-                // blow-up would have been a 500 rather than the required 422.
-                //
-                // Now every row is fixed-width columns plus one byte-capped
-                // string — the documented block shape. Duplicate rows from
-                // at-least-once replays need no `DISTINCT`: ANY-match is
-                // unaffected by a repeat and ALL-match compares
-                // `matchCount == elemCount`, which a repeat increments on both
-                // sides.
-                //
-                // **The PEAK LIVE SET, stated as a set of structures rather than
-                // as what each charge covers** (the second review's point: the
-                // first row-per-value cut charged once and held twice — a
-                // `Vec<StrValueRow>` of every row AND the per-span map built from
-                // it, both live at the same instant). Streaming into the map
-                // through [`Self::stream_rows_charged`] means that at any moment
-                // the live structures holding a co-loaded value are exactly:
-                //
-                //   1. the per-span `Vec<String>`/`Vec<f64>` inside `map` — its
-                //      capacity, which is the initial 4-slot reservation and then
-                //      the doubling slack;
-                //   2. `map`'s own entry for that span — ONE per span, not per
-                //      value;
-                //   3. the string payload itself, which is MOVED out of the row
-                //      into (1) and so exists once, never copied;
-                //   4. the driver's transiently buffered BLOCK — up to
-                //      `max_block_size` (`TRACE_SEARCH_MAX_BLOCK_ROWS`, 4096)
-                //      decoded rows, not a single row (review 3's correction).
-                //      It is bounded: each row here is fixed-width columns plus
-                //      ONE `TRACE_STR_COL_CAP`-capped string, which is exactly
-                //      the Layer-1 residual shape this module's contract states,
-                //      and `max_result_bytes` (64 MiB, throw) bounds it besides.
-                //
-                // [`EVENT_VALUE_ENTRY_BYTES`] + the payload length upper-bounds
-                // (1)+(2)+(3) per value — see that constant for why the slot is
-                // charged at the 4-slot reservation rather than 2× — and (4) is
-                // the documented Layer-1 block residual. No second collection
-                // exists to hold anything a second time.
-                TqlLink::EventSet(set_idx) => {
-                    let set_idx = *set_idx;
-                    // Issue #558: the bound fires HERE, before the
-                    // statement exists, from the widths the hydration
-                    // statement returned. `max_result_rows` cannot do
-                    // this: it is checked per BLOCK and `arrayJoin` emits
-                    // one span's whole set as one block, so a span with
-                    // 400 values produced `current rows: 400.00` under a
-                    // 50-row cap — a refusal only after the expansion it
-                    // was meant to prevent.
-                    let values = slots.set_widths.get(set_idx).copied().unwrap_or(0);
-                    let budget_values = self.config.event_set_max_values;
-                    if values > budget_values {
-                        return Err(ReadError::QueryTooBroad(
-                            TooBroadReason::TraceEventSetValues {
-                                values: Some(values),
-                                budget_values,
-                            },
-                        ));
-                    }
-                    let sql = plan.event_set_sql_for(set_idx, batch_ids);
-                    charge_explain(
-                        explain,
-                        budget,
-                        "phase2_event_sets",
-                        &sql,
-                        Some(("event/link set = ", plan.event_sets[set_idx].display())),
-                    )?;
-                    // The value statement carries its own result bound as
-                    // a backstop against a row arriving between the two
-                    // statements. It is set on THIS statement alone, by
-                    // cloning what `search_settings` built and overriding
-                    // one key, so no other read's settings move.
-                    let set_settings = settings
-                        .clone()
-                        .set("max_result_rows", self.config.scan_budget_rows);
-                    let settings = &set_settings;
-                    let mut map: HashMap<SpanKey, EventValues> = HashMap::new();
-                    if plan.event_sets[set_idx].is_numeric() {
-                        let mut sink = FnRowSink {
-                            cost: |_: &NumValueRow| EVENT_VALUE_ENTRY_BYTES,
-                            accept: |row: NumValueRow| {
-                                let Some(v) = row.v else { return };
-                                match map
-                                    .entry((row.trace_id, row.span_id))
-                                    .or_insert_with(|| EventValues::Num(Vec::new()))
-                                {
-                                    EventValues::Num(values) => values.push(v),
-                                    EventValues::Text(_) => {
-                                        unreachable!("a numeric set never decodes text values")
-                                    }
-                                }
-                            },
-                        };
-                        self.stream_rows_charged(
-                            &sql,
-                            settings,
-                            budget,
-                            batch_charged,
-                            map_trace_event_set_error,
-                            &mut sink,
-                        )
-                        .await?;
-                    } else {
-                        let mut sink = FnRowSink {
-                            cost: |row: &StrValueRow| EVENT_VALUE_ENTRY_BYTES + row.v.len(),
-                            accept: |row: StrValueRow| match map
-                                .entry((row.trace_id, row.span_id))
-                                .or_insert_with(|| EventValues::Text(Vec::new()))
-                            {
-                                EventValues::Text(values) => values.push(row.v),
-                                EventValues::Num(_) => {
-                                    unreachable!("a text set never decodes numeric values")
-                                }
-                            },
-                        };
-                        self.stream_rows_charged(
-                            &sql,
-                            settings,
-                            budget,
-                            batch_charged,
-                            map_trace_event_set_error,
-                            &mut sink,
-                        )
-                        .await?;
-                    }
-                    attrs.event_sets.push(map);
-                }
-                // Issue #184: the trace-wide co-loads — deliberately WINDOW-FREE
-                // `trace_id IN` PK reads (the `root_sql` precedent generalized to
-                // the filter phase), so the trace-level intrinsics evaluate
-                // full-trace-exact regardless of the search window or the
-                // per-trace hydration cap. Issued only when the plan uses the
-                // corresponding intrinsics — every other query pays nothing.
-                TqlLink::TraceCtx => {
-                    let sql = plan.trace_ctx_sql_for(batch_ids);
-                    charge_explain(explain, budget, "phase2_trace_context", &sql, None)?;
-                    let rows: Vec<TraceCtxRow> = self
-                        .collect_rows_charged(
-                            &sql,
-                            settings,
-                            budget,
-                            batch_charged,
-                            map_trace_read_error,
-                            |row: &TraceCtxRow| {
-                                std::mem::size_of::<TraceCtxRow>()
-                                    + RETAINED_ENTRY_OVERHEAD
-                                    + row.root_name.len()
-                                    + row.root_service.len()
-                            },
-                        )
-                        .await?;
-                    let mut map = HashMap::with_capacity(rows.len());
-                    for row in rows {
-                        map.insert(
-                            row.trace_id,
-                            TraceCtxInfo {
-                                trace_start_ns: row.trace_start_ns,
-                                trace_end_ns: row.trace_end_ns,
-                                root_name: row.root_name,
-                                root_service: row.root_service,
-                            },
-                        );
-                    }
-                    attrs.trace_ctx = map;
-                }
-                TqlLink::ChildCount => {
-                    let sql = plan.child_count_sql_for(batch_ids);
-                    charge_explain(explain, budget, "phase2_child_counts", &sql, None)?;
-                    let rows: Vec<ChildCountRow> = self
-                        .collect_rows_charged(
-                            &sql,
-                            settings,
-                            budget,
-                            batch_charged,
-                            map_trace_read_error,
-                            |_| CHILD_COUNT_ENTRY_BYTES,
-                        )
-                        .await?;
-                    attrs.child_counts = rows
-                        .into_iter()
-                        .map(|r| ((r.trace_id, r.parent_id), r.child_count))
-                        .collect();
-                }
-                // The seed statement, the hydration read (issued by
-                // `hydrate_batch` before this call) and the engine links
-                // are not this walk's work. Listed rather than
-                // wildcarded so a new link variant fails to compile here
-                // instead of being silently skipped.
-                TqlLink::Source { .. }
-                | TqlLink::Hydrate
-                | TqlLink::Structural
-                | TqlLink::NestedSet
-                | TqlLink::BoolTruth
-                | TqlLink::Pipe(_)
-                | TqlLink::Order
-                | TqlLink::Limit(_)
-                | TqlLink::Emit => {}
-            }
-        }
-
-        Ok(attrs)
-    }
 }
 
 /// The Layer-1 budget settings every search query carries (issue #57
@@ -3216,7 +2089,7 @@ impl TraceEngine {
 /// clustered-reader settings first. The accepted, documented residual is
 /// block-granular enforcement — the driver may transiently hold at most
 /// one block, now hard-bounded by `max_block_size` rows ×
-/// [`crate::traces::search_sql::TRACE_STR_COL_CAP`]-capped string columns
+/// [`crate::traces::filter::TRACE_STR_COL_CAP`]-capped string columns
 /// (never a-priori row-unbounded); the Layer-2 retention counter is the
 /// binding bound on accumulated state across the whole request.
 fn search_settings(config: &TraceReadConfig) -> QuerySettings {
@@ -3232,41 +2105,12 @@ fn search_settings(config: &TraceReadConfig) -> QuerySettings {
         .set("result_overflow_mode", "throw")
         .set("max_block_size", TRACE_SEARCH_MAX_BLOCK_ROWS)
         // Issue #35: the raised `max_query_size` parse-buffer cap — every
-        // search-phase read (generators, hydration, attribute-value
-        // batches, root hydration) routes through `collect_rows_charged`,
-        // which carries this settings object.
+        // search statement routes through `collect_rows_charged`, which
+        // carries this settings object.
         .set("max_query_size", crate::querytext::MAX_QUERY_TEXT_BYTES)
         // Issue #398: the surface-wide per-query memory ceiling
-        // (`reader.traceql_read_max_memory_bytes`), throw-not-spill. Every
-        // phase-2 read as they then were (hydration/membership/value/root)
-        // previously set no memory limit at all, so a memory breach there
-        // was a `500`.
-        // Phase-1 generator reads override this with their own tighter
-        // ceiling in `generator_settings`.
+        // (`reader.traceql_read_max_memory_bytes`), throw-not-spill.
         .set("max_memory_usage", config.read_max_memory_bytes)
-        .set("max_bytes_before_external_group_by", 0u64)
-}
-
-/// The phase-1 candidate-generator query settings (issue #57 re-audit,
-/// sub-problem B): [`search_settings`] plus the generator memory ceiling
-/// — `max_memory_usage` (from `config.generator_max_memory_bytes`) and
-/// `max_bytes_before_external_group_by = 0` (throw-not-spill: a spilled
-/// aggregation would silently slow rather than fail loud). Bounds a
-/// dense common-value prefix's `GROUP BY trace_id` aggregation state;
-/// breach → server code 241 → [`map_trace_generator_error`].
-///
-/// **Issue #398: this OVERRIDES [`search_settings`]' surface-wide ceiling
-/// with a tighter one (512 MiB by default vs 8 GiB), and that is not a
-/// carve-out.** A carve-out leaves a path *unbounded*; this path ends up
-/// bounded more strictly, not less — and it keeps its own, more specific
-/// [`TooBroadReason::TraceGeneratorMemory`] via [`map_trace_generator_error`],
-/// which runs before the shared mapper. Removing it would LOOSEN a
-/// shipped guarantee. The `.set` calls below are ordinary overrides
-/// (`QuerySettings::set` replaces rather than duplicates), so a generator
-/// read carries exactly one `max_memory_usage`, the generator's.
-fn generator_settings(config: &TraceReadConfig) -> QuerySettings {
-    search_settings(config)
-        .set("max_memory_usage", config.generator_max_memory_bytes)
         .set("max_bytes_before_external_group_by", 0u64)
 }
 
@@ -4007,544 +2851,6 @@ fn apply_series_reduce(reduce: super::metrics_plan::SeriesReduce, result: &mut T
     result.series.retain(|s| !s.samples.is_empty());
 }
 
-/// A fresh `Vec`'s initial reservation, in element slots: `std`'s
-/// `RawVec` first non-zero allocation reserves 4 slots for element types
-/// ≤ 1024 bytes (8 for 1-byte elements — every element type here is far
-/// larger than 1 B and far smaller than 1 KiB, so 4 is the exact bound).
-/// Charged when a fresh per-group Vec (or the batch's outer Vec) is
-/// about to make its first push (code review round 5).
-const VEC_INITIAL_RESERVATION_SLOTS: usize = 4;
-
-/// The parts [`group_hydrated_rows`] consumes from one decoded hydration
-/// row, whichever of the three shapes it is (issue #557).
-///
-/// One function over three row types rather than three copies of the
-/// grouping: the dedupe, the overflow probe and the charge model are the
-/// same whatever the statement projected, and the only thing that varies
-/// is whether the row carries probe bits and a fused value.
-pub(super) trait HydrationRowParts {
-    fn trace_id(&self) -> [u8; 16];
-    fn span_id(&self) -> [u8; 8];
-    /// `&[]` for `HydrationShape::Plain`.
-    fn probe_bits(&self) -> &[u8];
-    /// Moved out, never copied — the `select_values` precedent.
-    fn take_probe_value(&mut self, i: usize) -> Option<(String, StoredType)>;
-    /// The slot's numeric reading (issue #558). `None` for a slot the
-    /// statement rendered `NULL` into, and for a span carrying no element
-    /// there.
-    fn slot_num(&self, i: usize) -> Option<f64>;
-    fn into_span(self) -> HydratedSpan;
-}
-
-impl HydrationRowParts for HydrationRow {
-    fn trace_id(&self) -> [u8; 16] {
-        self.trace_id
-    }
-    fn span_id(&self) -> [u8; 8] {
-        self.span_id
-    }
-    fn probe_bits(&self) -> &[u8] {
-        &[]
-    }
-    fn take_probe_value(&mut self, _i: usize) -> Option<(String, StoredType)> {
-        None
-    }
-    fn slot_num(&self, _i: usize) -> Option<f64> {
-        None
-    }
-    fn into_span(self) -> HydratedSpan {
-        HydratedSpan {
-            span_id: self.span_id,
-            parent_id: self.parent_id,
-            service: self.service,
-            name: self.name,
-            timestamp_ns: self.timestamp_ns,
-            duration_ns: self.duration_ns,
-            status_code: self.status_code,
-            status_message: self.status_message,
-            kind: self.kind,
-            scope_name: self.scope_name,
-            scope_version: self.scope_version,
-        }
-    }
-}
-
-impl HydrationRowParts for HydrationProbeRow {
-    fn trace_id(&self) -> [u8; 16] {
-        self.trace_id
-    }
-    fn span_id(&self) -> [u8; 8] {
-        self.span_id
-    }
-    fn probe_bits(&self) -> &[u8] {
-        &self.attr_slot
-    }
-    fn take_probe_value(&mut self, _i: usize) -> Option<(String, StoredType)> {
-        None
-    }
-    fn slot_num(&self, _i: usize) -> Option<f64> {
-        None
-    }
-    fn into_span(self) -> HydratedSpan {
-        HydratedSpan {
-            span_id: self.span_id,
-            parent_id: self.parent_id,
-            service: self.service,
-            name: self.name,
-            timestamp_ns: self.timestamp_ns,
-            duration_ns: self.duration_ns,
-            status_code: self.status_code,
-            status_message: self.status_message,
-            kind: self.kind,
-            scope_name: self.scope_name,
-            scope_version: self.scope_version,
-        }
-    }
-}
-
-impl HydrationRowParts for HydrationProbeValueRow {
-    fn trace_id(&self) -> [u8; 16] {
-        self.trace_id
-    }
-    fn span_id(&self) -> [u8; 8] {
-        self.span_id
-    }
-    fn probe_bits(&self) -> &[u8] {
-        &self.attr_slot
-    }
-    fn take_probe_value(&mut self, i: usize) -> Option<(String, StoredType)> {
-        let value = std::mem::take(self.attr_slot_val.get_mut(i)?);
-        let kind = self.attr_slot_type.get(i).map(String::as_str).unwrap_or("");
-        Some((value, StoredType::from_stored(kind)))
-    }
-    fn slot_num(&self, i: usize) -> Option<f64> {
-        self.attr_slot_num.get(i).copied().flatten()
-    }
-    fn into_span(self) -> HydratedSpan {
-        HydratedSpan {
-            span_id: self.span_id,
-            parent_id: self.parent_id,
-            service: self.service,
-            name: self.name,
-            timestamp_ns: self.timestamp_ns,
-            duration_ns: self.duration_ns,
-            status_code: self.status_code,
-            status_message: self.status_message,
-            kind: self.kind,
-            scope_name: self.scope_name,
-            scope_version: self.scope_version,
-        }
-    }
-}
-
-/// Groups a batch's (already per-row-charged) hydration rows into
-/// per-trace span lists, deduping `span_id` replays, detecting the
-/// per-trace overflow probe, AND filling every slot the statement
-/// answered — the probe memberships (issue #557), the projected field
-/// values with their kinds, and the event/link set widths (issue #558).
-/// Pure, so the accounting is unit-testable (code review round 5).
-///
-/// Charge model (all BEFORE the allocation they cover):
-/// - first group: the outer Vec's initial reservation
-///   (`VEC_INITIAL_RESERVATION_SLOTS × size_of::<TraceSpans>()`);
-/// - per group: 2× the outer `TraceSpans` slot (doubling slack) +
-///   overhead envelope + the fresh inner Vec's initial reservation
-///   (`VEC_INITIAL_RESERVATION_SLOTS × size_of::<HydratedSpan>()`);
-/// - per UNIQUE span: 2× the inner slot (doubling slack past the initial
-///   reservation) + the dedup-set entry at the standard hash-container
-///   cost (`[u8; 8]` + `RETAINED_ENTRY_OVERHEAD` — the same envelope as
-///   every other set/map site; it also covers the set's own initial
-///   bucket group). Replayed rows are checked with `contains` FIRST and
-///   are accounting no-ops (round-5 medium: duplicates allocate nothing,
-///   so they charge nothing);
-/// - per MEMBERSHIP ENTRY: [`MEMBERSHIP_ENTRY_BYTES`] (+ the fused
-///   value's length), charged before the insert — the same bytes the
-///   membership read charged before issue #557 moved the test onto this
-///   statement, so the Layer-2 counter sees what it saw before;
-/// - per SELECT-VALUE entry: [`MEMBERSHIP_ENTRY_BYTES`] + the value's
-///   length, and per AGGREGATE-VALUE entry [`NUM_VALUE_ENTRY_BYTES`] —
-///   exactly what the two value reads charged before issue #558 moved
-///   them onto this statement, for the same reason;
-/// - per WIDTH: nothing. A width adds a `u64` to a fixed-length vector
-///   and allocates nothing.
-///
-/// **A width is summed AFTER the overflow-probe skip and BEFORE the
-/// `span_id` dedup skip**, and both halves are load-bearing. The value
-/// statement expands the rows the reader retained — the same `ORDER BY`
-/// and per-trace cap without the `+ 1` probe row — so the probe row's
-/// values are not in it, and a replayed row's values ARE, because
-/// `trace_spans` is a plain MergeTree and the replay occupies a slot
-/// inside the cap. Summed in that position the widths equal the value
-/// statement's physical row count exactly, which is what makes the
-/// pre-expansion bound exact rather than approximate.
-///
-/// **Only a span whose `attr_slot[i]` is 1 enters `membership[i]`.** The
-/// projected columns carry a value for EVERY span, including one the
-/// probe did not match; inserting that span would make the attribute leaf
-/// match it, because the evaluator asks the set (`search_eval`'s
-/// `PlannedLeafEval::Attr` arm calls `contains`, and
-/// `ProbeMembership::Values::contains` is `map.contains_key`).
-///
-/// `pub(super)` so the sibling evaluator's
-/// `count_matches_the_deduped_span_set` (issue #492 item 2) can prove the
-/// dedupe through THIS function rather than through a hand-deduped
-/// fixture — `count()` now counts a spanset's members, and that equals
-/// the old matched-id-set size only because the rows arriving here are
-/// deduped by `span_id`.
-pub(super) fn group_hydrated_rows<R: HydrationRowParts>(
-    rows: Vec<R>,
-    probe_fuses_value: &[bool],
-    layout: &SlotLayout,
-    slots: &mut BatchSlots,
-    budget: &mut ByteBudget,
-    batch_charged: &mut usize,
-) -> Result<(Vec<TraceSpans>, bool), ReadError> {
-    let mut overflowed = false;
-    let mut traces: Vec<TraceSpans> = Vec::new();
-    let mut raw_count = 0usize;
-    let mut seen: HashSet<[u8; 8]> = HashSet::new();
-    for mut row in rows {
-        let (trace_id, span_id) = (row.trace_id(), row.span_id());
-        let start_new = traces.last().is_none_or(|t| t.trace_id != trace_id);
-        if start_new {
-            let mut outer_charge = 2 * std::mem::size_of::<TraceSpans>()
-                + RETAINED_ENTRY_OVERHEAD
-                + VEC_INITIAL_RESERVATION_SLOTS * std::mem::size_of::<HydratedSpan>();
-            if traces.is_empty() {
-                outer_charge += VEC_INITIAL_RESERVATION_SLOTS * std::mem::size_of::<TraceSpans>();
-            }
-            budget.charge(outer_charge)?;
-            *batch_charged += outer_charge;
-            traces.push(TraceSpans {
-                trace_id,
-                spans: Vec::new(),
-            });
-            raw_count = 0;
-            seen.clear();
-        }
-        raw_count += 1;
-        if raw_count == MAX_SPANS_PER_TRACE + 1 {
-            // The overflow probe row: this trace was truncated at
-            // hydration — evaluate the truncated set, mark partial. The
-            // value statement does not return this row, so its widths are
-            // not counted either.
-            overflowed = true;
-            continue;
-        }
-        // The event/link set widths, summed BEFORE the dedup skip: the
-        // value statement expands `trace_spans`, a plain MergeTree, so a
-        // replayed row contributes its values to that statement too.
-        for (e, width) in slots.set_widths.iter_mut().enumerate() {
-            let n = row.slot_num(layout.width(e).index()).unwrap_or(0.0);
-            *width = width.saturating_add(n as u64);
-        }
-        if seen.contains(&span_id) {
-            continue; // at-least-once replay — no allocation, no charge
-        }
-        let group_charge = 2 * std::mem::size_of::<HydratedSpan>()
-            + std::mem::size_of::<[u8; 8]>()
-            + RETAINED_ENTRY_OVERHEAD;
-        budget.charge(group_charge)?;
-        *batch_charged += group_charge;
-        seen.insert(span_id);
-        // The probe bits, before the row is consumed. A `0` bit inserts
-        // nothing at all — not the key, and not the value the column
-        // carries for it.
-        for (i, membership) in slots.membership.iter_mut().enumerate() {
-            let slot = layout.probe(i).index();
-            if row.probe_bits().get(slot).copied().unwrap_or(0) == 0 {
-                continue;
-            }
-            let value = if probe_fuses_value.get(i).copied().unwrap_or(false) {
-                row.take_probe_value(slot)
-            } else {
-                None
-            };
-            let charge = MEMBERSHIP_ENTRY_BYTES + value.as_ref().map_or(0, |(v, _)| v.len());
-            budget.charge(charge)?;
-            *batch_charged += charge;
-            match (membership, value) {
-                (ProbeMembership::Keys(set), _) => {
-                    set.insert((trace_id, span_id));
-                }
-                (ProbeMembership::Values(map), Some(value)) => {
-                    map.insert((trace_id, span_id), value);
-                }
-                (ProbeMembership::Values(map), None) => {
-                    map.insert((trace_id, span_id), (String::new(), StoredType::Unknown));
-                }
-            }
-        }
-        // Issue #558: a `select()` field's text and its kind, both read at
-        // the ONE element the locator landed on. A `0` bit is the field
-        // having no value at all — the span carries no such key at any
-        // scope the chain reaches — and inserts nothing.
-        for j in 0..slots.select_values.len() {
-            let slot = layout.select(j).index();
-            if row.probe_bits().get(slot).copied().unwrap_or(0) == 0 {
-                continue;
-            }
-            let Some((value, kind)) = row.take_probe_value(slot) else {
-                continue;
-            };
-            let charge = MEMBERSHIP_ENTRY_BYTES + value.len();
-            budget.charge(charge)?;
-            *batch_charged += charge;
-            slots.select_types[j].insert((trace_id, span_id), kind);
-            slots.select_values[j].insert((trace_id, span_id), value);
-        }
-        // Issue #558: an aggregate argument's number and its kind, from
-        // the same element. A located element whose `attr_num` is NULL
-        // has NO numeric value — the case a span storing `span.n = "abc"`
-        // before `span.n = 5` produces — so neither map gains an entry,
-        // exactly as the old read's `isNotNull(val_num)` filter meant.
-        for k in 0..slots.agg_values.len() {
-            let slot = layout.agg(k).index();
-            if row.probe_bits().get(slot).copied().unwrap_or(0) == 0 {
-                continue;
-            }
-            let Some(v) = row.slot_num(slot) else {
-                continue;
-            };
-            let kind = row
-                .take_probe_value(slot)
-                .map_or(StoredType::Unknown, |(_, t)| t);
-            budget.charge(NUM_VALUE_ENTRY_BYTES)?;
-            *batch_charged += NUM_VALUE_ENTRY_BYTES;
-            slots.agg_values[k].insert((trace_id, span_id), v);
-            slots.agg_types[k].insert((trace_id, span_id), kind);
-        }
-        traces
-            .last_mut()
-            .expect("a trace group was just pushed")
-            .spans
-            .push(row.into_span());
-    }
-    Ok((traces, overflowed))
-}
-
-/// Whether this chain link issues one of the per-batch phase-2
-/// statements [`TraceEngine::batch_attrs`] sends (issue #492 part 3).
-/// The seed statement, the hydration read and the winners' root read are
-/// issued elsewhere, and the engine links issue nothing.
-///
-/// Issue #557 removed `Membership` from this set and issue #558 removed
-/// `AggValues` and `SelectValues`: the attribute condition and every
-/// projected field value are columns on the hydration statement, so those
-/// links stay in the chain and send nothing of their own.
-fn is_phase_two_read(link: &TqlLink) -> bool {
-    matches!(
-        link,
-        TqlLink::EventSet(_) | TqlLink::TraceCtx | TqlLink::ChildCount
-    )
-}
-
-/// Charges and records the compiled plan's rendered shape (issue #492
-/// part 3), which the explained response retains for the whole request —
-/// the same class as [`charge_explain`]'s per-stage SQL clones and
-/// charged the same way, BEFORE the render.
-///
-/// **Priced without rendering.** Every string the renderer emits is
-/// either a `&'static` source or cut name already on the plan, or a stage
-/// name already held on it, so the payload is the sum of lengths this
-/// walk can take before a single `PlanShape` value exists.
-fn charge_explain_plan(
-    explain: &mut Option<&mut PlanExplain>,
-    budget: &mut ByteBudget,
-    plan: &SearchPlan,
-) -> Result<(), ReadError> {
-    if let Some(e) = explain.as_mut() {
-        let compiled = plan.compiled();
-        let mut bytes = RETAINED_ENTRY_OVERHEAD
-            + compiled.parts.len() * (std::mem::size_of::<PartShape>() + RETAINED_ENTRY_OVERHEAD)
-            + compiled.links.len() * (std::mem::size_of::<LinkShape>() + RETAINED_ENTRY_OVERHEAD);
-        for part in &compiled.parts {
-            match part {
-                Part::Sql(p) => {
-                    bytes += p.rel.source_ref().as_str().len();
-                    match &p.cut {
-                        Some(Cut::SourceHandoff { source, key }) => {
-                            bytes += source.as_str().len() + key.as_str().len();
-                        }
-                        Some(Cut::DisjointSources { sources }) => {
-                            bytes += sources.iter().map(|s| s.as_str().len()).sum::<usize>();
-                        }
-                        Some(Cut::HandoffExceedsBound { .. }) | Some(Cut::InexactLimit) | None => {}
-                    }
-                }
-                Part::Engine { links } => {
-                    bytes += links.len() * std::mem::size_of::<usize>();
-                }
-            }
-        }
-        bytes += plan.stage_names.iter().map(String::len).sum::<usize>();
-        budget.charge(bytes)?;
-        e.set_plan(plan.plan_shape());
-    }
-    Ok(())
-}
-
-/// Charges and records one explain stage (round-3 audit: `PlanExplain`
-/// retains an SQL clone (+ note) per stage for the whole request — that
-/// growth is budgeted like any other retained state, charged BEFORE the
-/// clone/format is made). `note` is `(prefix, value)` rendered as
-/// `"{prefix}{value}"` so its length is known pre-allocation.
-fn charge_explain(
-    explain: &mut Option<&mut PlanExplain>,
-    budget: &mut ByteBudget,
-    name: &'static str,
-    sql: &str,
-    note: Option<(&str, &str)>,
-) -> Result<(), ReadError> {
-    if let Some(e) = explain.as_mut() {
-        let note_len = note
-            .map(|(prefix, value)| prefix.len() + value.len())
-            .unwrap_or(0);
-        budget.charge(sql.len() + note_len + RETAINED_ENTRY_OVERHEAD)?;
-        e.push(
-            name,
-            sql.to_string(),
-            note.map(|(prefix, value)| format!("{prefix}{value}")),
-        );
-    }
-    Ok(())
-}
-
-/// The retained cost of the winners' context map — per entry the map key,
-/// the [`TraceContext`] struct (the root summary PLUS the two envelope
-/// `i64`s, issue #464), its string payloads, and the container-overhead
-/// envelope. Charged after [`pick_roots`] and held for the rest of the
-/// request (the contexts move into the returned [`TraceSearchResult`]s).
-fn roots_retained_bytes(roots: &HashMap<[u8; 16], TraceContext>) -> usize {
-    roots
-        .values()
-        .map(|ctx| {
-            std::mem::size_of::<[u8; 16]>()
-                + std::mem::size_of::<TraceContext>()
-                + RETAINED_ENTRY_OVERHEAD
-                + ctx.root.service.len()
-                + ctx.root.name.len()
-        })
-        .sum()
-}
-
-/// Picks each trace's root from its trace-wide root-hydration rows —
-/// `parent_id` all-zero (earliest such span under `(ts, span_id)`), else
-/// the timestamp-earliest span of the full trace — and folds the trace's
-/// time envelope over the SAME rows in the SAME pass (issue #464).
-///
-/// The envelope folds over **every** row, whether or not that row wins the
-/// root contest: `min(timestamp_ns)` and `max(timestamp_ns + duration_ns)`
-/// over the whole trace, emitted as a WIDTH (`end - start`), because the
-/// reference's `Spanset.DurationNanos` is `traceEnd - traceStart`
-/// (`tempodb/encoding/vparquet4/schema.go:558-560` @ v3.0.2) and not an
-/// end instant. Root selection is unchanged, term for term.
-fn pick_roots(rows: Vec<RootRow>) -> HashMap<[u8; 16], TraceContext> {
-    /// [`pick_roots`]' per-trace accumulator: the root contest's running
-    /// winner, plus the envelope's running `(start, end)`.
-    struct RootPick {
-        is_root: bool,
-        start_ns: i64,
-        span_id: [u8; 8],
-        summary: RootSummary,
-        envelope_start_ns: i64,
-        envelope_end_ns: i64,
-    }
-
-    let mut best: HashMap<[u8; 16], RootPick> = HashMap::new();
-    for row in rows {
-        let is_root = row.parent_id == [0u8; 8];
-        let span_start = row.timestamp_ns;
-        // `saturating_add` rather than `+`: a stored width is
-        // non-negative by ingest construction, but a corrupt row must not
-        // panic a read.
-        let span_end = row.timestamp_ns.saturating_add(row.duration_ns);
-        let candidate = RootPick {
-            is_root,
-            start_ns: row.timestamp_ns,
-            span_id: row.span_id,
-            summary: RootSummary {
-                service: row.service,
-                name: row.name,
-                start_ns: row.timestamp_ns,
-                duration_ns: row.duration_ns,
-            },
-            envelope_start_ns: span_start,
-            envelope_end_ns: span_end,
-        };
-        match best.get_mut(&row.trace_id) {
-            None => {
-                best.insert(row.trace_id, candidate);
-            }
-            Some(current) => {
-                // The envelope sees EVERY span; the root contest is
-                // decided separately and does not gate it.
-                current.envelope_start_ns = current.envelope_start_ns.min(span_start);
-                current.envelope_end_ns = current.envelope_end_ns.max(span_end);
-                // A true root always beats a non-root; within the same
-                // class, earlier (ts, span_id) wins.
-                let better = (candidate.is_root && !current.is_root)
-                    || (candidate.is_root == current.is_root
-                        && (candidate.start_ns, candidate.span_id)
-                            < (current.start_ns, current.span_id));
-                if better {
-                    current.is_root = candidate.is_root;
-                    current.start_ns = candidate.start_ns;
-                    current.span_id = candidate.span_id;
-                    current.summary = candidate.summary;
-                }
-            }
-        }
-    }
-    best.into_iter()
-        .map(|(trace_id, pick)| {
-            (
-                trace_id,
-                TraceContext {
-                    root: pick.summary,
-                    trace_start_ns: pick.envelope_start_ns,
-                    trace_duration_ns: pick.envelope_end_ns.saturating_sub(pick.envelope_start_ns),
-                },
-            )
-        })
-        .collect()
-}
-
-/// The context for a winner whose trace-wide root read returned NOTHING (a
-/// TTL race — pathological): its matched-span metadata rather than a
-/// silently dropped trace.
-///
-/// **Pure and separate from the assembly loop so both fallback fields are
-/// unit-testable without an engine** — the assembly branch is reachable
-/// only from a live read that loses its rows between phases, so without
-/// this split nothing in the suite pins the values (issue #464).
-///
-/// The width is **zero**, never the matched span's own: no row survives to
-/// tell us the trace's extent, and a non-zero width here would be
-/// invented.
-fn fallback_trace_context(spans: &[SpanSummary], sort_key: i64) -> TraceContext {
-    let start_ns = spans.first().map(|s| s.start_ns).unwrap_or(sort_key);
-    TraceContext {
-        root: RootSummary {
-            service: String::new(),
-            // Issue #479: the matched span carries a name only when the
-            // query collected one, and the first matched span's name is
-            // not the root's name in any case. An uncollected name
-            // becomes the empty string here, which is consistent with
-            // the two fields this path already refuses to invent.
-            name: spans
-                .first()
-                .and_then(SpanSummary::name)
-                .unwrap_or_default()
-                .to_string(),
-            start_ns,
-            duration_ns: 0,
-        },
-        trace_start_ns: start_ns,
-        trace_duration_ns: 0,
-    }
-}
-
 #[cfg(test)]
 mod wire_literal {
     /// A reference-captured wire rendering (issue #237). Nothing textual
@@ -4602,9 +2908,8 @@ mod tests {
 
     /// Issue #398: a distinctive, non-default
     /// `reader.traceql_read_max_memory_bytes` for these tests —
-    /// deliberately unequal to `generator_max_memory_bytes` above, so the
-    /// surface-wide ceiling and the generator's tighter one can never be
-    /// confused for one another in an assertion.
+    /// deliberately unequal to every other byte setting in the config
+    /// below, so it cannot be confused for one in an assertion.
     const TEST_READ_MEM: u64 = 7_654_321;
 
     /// Issue #477 wave 2: the in-flight exemplar list stays under its
@@ -4708,12 +3013,9 @@ mod tests {
             spans_v2_table: "spans".to_string(),
             traces_table: "traces".to_string(),
             resources_table: "resources".to_string(),
-            max_candidates: 100_000,
             scan_budget_rows: 50_000_000,
-            event_set_max_values: 1_000_000,
             max_depth: 64,
             max_series: 1_000,
-            generator_max_memory_bytes: 536_870_912,
             read_max_memory_bytes: TEST_READ_MEM,
             distributed: false,
             skip_unavailable_shards: false,
@@ -4734,12 +3036,9 @@ mod tests {
             spans_v2_table: "spans".to_string(),
             traces_table: "traces".to_string(),
             resources_table: "resources".to_string(),
-            max_candidates: 100,
             scan_budget_rows: 1_000,
-            event_set_max_values: 1_000_000,
             max_depth: 64,
             max_series: 1_000,
-            generator_max_memory_bytes: 536_870_912,
             read_max_memory_bytes: TEST_READ_MEM,
             distributed: false,
             skip_unavailable_shards: false,
@@ -5140,128 +3439,6 @@ mod tests {
         }
     }
 
-    /// Issue #133 AC9: `generator_settings` carries `max_memory_usage`
-    /// VERBATIM at the accepted minimum (1) and at the maximum
-    /// config-accepted `reader.traceql_generator_max_memory_bytes` —
-    /// never `0` (ClickHouse-unlimited, a silently disabled
-    /// throw-not-OOM guard).
-    #[test]
-    fn generator_memory_passes_through_verbatim_at_the_accepted_min_and_ceiling() {
-        for bytes in [
-            1u64,
-            pulsus_config::TRACEQL_GENERATOR_MAX_MEMORY_BYTES_CEILING,
-        ] {
-            let mut c = cfg();
-            c.generator_max_memory_bytes = bytes;
-            let s = generator_settings(&c);
-            assert_eq!(
-                s.get("max_memory_usage"),
-                Some(bytes.to_string().as_str()),
-                "the generator memory ceiling must pass through verbatim"
-            );
-            assert_ne!(s.get("max_memory_usage"), Some("0"));
-        }
-    }
-
-    /// Issue #398 AC T1: **all three** of this module's settings origins
-    /// carry the surface-wide memory ceiling and throw rather than spill.
-    ///
-    /// Three, not one. `search_settings` is the obvious root;
-    /// `catalog_settings` is a DELIBERATELY INDEPENDENT root (it omits the
-    /// clustered-reader block on purpose) and is the one whose unbounded
-    /// `/api/search/tag/{tag}/values` read produced the measured 500 that
-    /// opened this issue; and the §4.2 point read
-    /// (`TraceEngine::fetch_by_id`) sent a bare `QuerySettings::new()`
-    /// while mapping errors around `map_trace_read_error` entirely. The
-    /// point read is included here by asserting the settings object it now
-    /// dispatches with — `catalog_settings(&self.config)`, its whole body.
-    ///
-    /// This unit test alone is NOT the completeness proof: it can only
-    /// check the origins someone remembered to list. That is what
-    /// `every_trace_engine_query_carries_the_memory_ceiling` in
-    /// `tests/query_log_gates.rs` is for — a `system.query_log` sweep sees
-    /// a dispatch site no enumeration mentions.
-    #[test]
-    fn trace_catalog_settings_carry_the_memory_ceiling() {
-        for bytes in [1u64, pulsus_config::TRACEQL_READ_MAX_MEMORY_BYTES_CEILING] {
-            let mut c = cfg();
-            c.read_max_memory_bytes = bytes;
-            let expected = bytes.to_string();
-            for (name, s) in [
-                ("search_settings", search_settings(&c)),
-                ("catalog_settings", catalog_settings(&c)),
-                // `fetch_by_id`'s settings object, by construction.
-                ("fetch_by_id (point read)", catalog_settings(&c)),
-                ("metrics_settings", metrics_settings(&c)),
-                ("statement_settings", statement_settings(&c)),
-                ("graph_settings", graph_settings(&c)),
-            ] {
-                assert_eq!(
-                    s.get("max_memory_usage"),
-                    Some(expected.as_str()),
-                    "{name} must carry the surface-wide memory ceiling verbatim"
-                );
-                assert_ne!(
-                    s.get("max_memory_usage"),
-                    Some("0"),
-                    "{name} must never send ClickHouse's unlimited sentinel"
-                );
-                assert_eq!(
-                    s.get("max_bytes_before_external_group_by"),
-                    Some("0"),
-                    "{name} must throw rather than spill"
-                );
-            }
-            // The generator layers its own TIGHTER ceiling on top and wins.
-            // Not a carve-out: this path ends up bounded more strictly.
-            let g = generator_settings(&c);
-            assert_eq!(
-                g.get("max_memory_usage"),
-                Some(c.generator_max_memory_bytes.to_string().as_str()),
-                "the generator's own ceiling must override the surface-wide one"
-            );
-        }
-    }
-
-    /// Issue #133 AC12 (plan v3 delta 3): both sides of the
-    /// budget-derived `TRACEQL_MAX_CANDIDATES_CEILING`, via the committed
-    /// P10 pre-hydration charge formula
-    /// (`2 x generators x (cap + 1) x CANDIDATE_TUPLE_BYTES`): a
-    /// single-generator search at the ceiling cap FITS
-    /// [`HYDRATION_BYTE_BUDGET`] (a cap-reaching search can complete),
-    /// while two generators at the ceiling EXCEED it — and that
-    /// aggregate retention fails LOUDLY through [`ByteBudget::charge`]
-    /// (the mapped 422 `query_too_broad` path), never by silent
-    /// truncation or OOM. Arithmetic identity + charge counters only —
-    /// no O(ceiling) allocation.
-    #[test]
-    fn multi_generator_retention_at_the_candidates_ceiling_fails_loud_through_the_byte_budget() {
-        let cap = usize::try_from(pulsus_config::TRACEQL_MAX_CANDIDATES_CEILING)
-            .expect("the candidates ceiling fits usize");
-        let one_generator = 2 * (cap + 1) * CANDIDATE_TUPLE_BYTES;
-        assert!(
-            one_generator <= HYDRATION_BYTE_BUDGET,
-            "a single generator at the ceiling cap must fit the retention budget \
-             ({one_generator} B vs {HYDRATION_BYTE_BUDGET} B)"
-        );
-        let two_generators = 2 * 2 * (cap + 1) * CANDIDATE_TUPLE_BYTES;
-        assert!(
-            two_generators > HYDRATION_BYTE_BUDGET,
-            "two generators at the ceiling cap must exceed the retention budget \
-             ({two_generators} B vs {HYDRATION_BYTE_BUDGET} B)"
-        );
-
-        let mut budget = ByteBudget::new(HYDRATION_BYTE_BUDGET);
-        match budget.charge(two_generators) {
-            Err(ReadError::QueryTooBroad(TooBroadReason::ScanBudgetBytes { .. })) => {}
-            other => panic!("expected a loud ScanBudgetBytes rejection, got {other:?}"),
-        }
-        // A failed charge never mutates the counter, and the fitting
-        // single-generator charge still admits.
-        assert_eq!(budget.used(), 0);
-        assert!(budget.charge(one_generator).is_ok());
-    }
-
     #[test]
     fn metric_values_convert_at_the_encode_boundary() {
         assert_eq!(count_value(true, 120, 60.0), 2.0);
@@ -5639,119 +3816,6 @@ mod tests {
     }
 
     #[test]
-    fn code_241_maps_to_the_generator_memory_reason_on_generator_reads_only() {
-        let e = || ChError::Server {
-            code: 241,
-            message: "Memory limit (for query) exceeded".to_string(),
-        };
-        match map_trace_generator_error(e(), &cfg()) {
-            ReadError::QueryTooBroad(TooBroadReason::TraceGeneratorMemory { budget_bytes }) => {
-                assert_eq!(budget_bytes, cfg().generator_max_memory_bytes);
-            }
-            other => panic!("expected TraceGeneratorMemory, got {other:?}"),
-        }
-        // Issue #398: the shared trace mapper DOES map 241 now — every
-        // trace read carries the surface-wide ceiling — but to its own,
-        // separate reason carrying its own, separate budget. The two stay
-        // unconflated, which is what this test has always been for, and
-        // the generator's mapper returning FIRST is what keeps the tighter
-        // ceiling reporting as `TraceGeneratorMemory`.
-        match map_trace_read_error(e(), &cfg()) {
-            ReadError::QueryTooBroad(TooBroadReason::TraceReadMemory { budget_bytes }) => {
-                assert_eq!(budget_bytes, cfg().read_max_memory_bytes);
-                assert_ne!(
-                    budget_bytes,
-                    cfg().generator_max_memory_bytes,
-                    "the two memory budgets must be distinguishable in the message"
-                );
-            }
-            other => panic!("expected TraceReadMemory, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn the_generator_mapper_delegates_everything_else_to_the_shared_mapper() {
-        let e = ChError::Server {
-            code: 158,
-            message: "Limit for rows to read exceeded".to_string(),
-        };
-        assert!(matches!(
-            map_trace_generator_error(e, &cfg()),
-            ReadError::QueryTooBroad(TooBroadReason::TraceScanBudgetRows { budget_rows: 1_000 })
-        ));
-        let t = ChError::Timeout("deadline".to_string());
-        assert!(matches!(
-            map_trace_generator_error(t, &cfg()),
-            ReadError::Clickhouse(_)
-        ));
-    }
-
-    /// M1 (issue #57 re-audit round-4/5 finding): the hermetic mapper pin
-    /// — every trace-search overflow code routes to ITS OWN reason (never
-    /// impersonating another), and the two byte-budget constants that
-    /// share `ScanBudgetBytes` are provably distinct from the Layer-2
-    /// retention budget, so a Layer-1 byte preempt can never impersonate
-    /// the retention-counter trip the deleted `traces_search_explain.rs`
-    /// AC-A3 gate asserted on.
-    #[test]
-    fn m1_every_overflow_code_maps_to_its_own_reason_and_the_budgets_are_distinct() {
-        let server = |code| ChError::Server {
-            code,
-            message: "overflow".to_string(),
-        };
-        match map_trace_read_error(server(307), &cfg()) {
-            ReadError::QueryTooBroad(TooBroadReason::ScanBudgetBytes { budget_bytes, .. }) => {
-                assert_eq!(budget_bytes, TRACE_READ_BYTES_BUDGET);
-            }
-            other => panic!("expected ScanBudgetBytes(TRACE_READ_BYTES_BUDGET), got {other:?}"),
-        }
-        match map_trace_read_error(server(396), &cfg()) {
-            ReadError::QueryTooBroad(TooBroadReason::ScanBudgetBytes { budget_bytes, .. }) => {
-                assert_eq!(budget_bytes, TRACE_MAX_RESULT_BYTES);
-            }
-            other => panic!("expected ScanBudgetBytes(TRACE_MAX_RESULT_BYTES), got {other:?}"),
-        }
-        assert!(matches!(
-            map_trace_read_error(server(158), &cfg()),
-            ReadError::QueryTooBroad(TooBroadReason::TraceScanBudgetRows { .. })
-        ));
-        assert!(matches!(
-            map_trace_generator_error(server(241), &cfg()),
-            ReadError::QueryTooBroad(TooBroadReason::TraceGeneratorMemory { .. })
-        ));
-        // Distinctness: neither Layer-1 byte-budget constant equals the
-        // Layer-2 retention budget, so `budget_bytes` equality is a
-        // sound discriminator between a Layer-1 preempt and the
-        // retention-counter trip.
-        assert_ne!(TRACE_READ_BYTES_BUDGET, HYDRATION_BYTE_BUDGET as u64);
-        assert_ne!(TRACE_MAX_RESULT_BYTES, HYDRATION_BYTE_BUDGET as u64);
-    }
-
-    fn tid(n: u8) -> [u8; 16] {
-        let mut id = [0u8; 16];
-        id[15] = n;
-        id
-    }
-
-    #[test]
-    fn merge_takes_the_max_bound_when_generators_disagree() {
-        // Round-4 finding 1: a trace emitted by multiple generators with
-        // different bounds must keep the LARGER bound — anything less
-        // could under-bound and drop a winner at threshold termination.
-        let merged = merge_candidates(&[
-            vec![(tid(1), 100), (tid(2), 90)],
-            vec![(tid(1), 250), (tid(3), 80)],
-        ]);
-        assert_eq!(merged, vec![(tid(1), 250), (tid(2), 90), (tid(3), 80)]);
-    }
-
-    #[test]
-    fn merge_ranks_by_bound_desc_then_trace_id_asc() {
-        let merged = merge_candidates(&[vec![(tid(9), 100), (tid(2), 100), (tid(5), 200)]]);
-        assert_eq!(merged, vec![(tid(5), 200), (tid(2), 100), (tid(9), 100)]);
-    }
-
-    #[test]
     fn byte_budget_trips_only_past_the_cap_and_releases_restore_headroom() {
         let mut budget = ByteBudget::new(100);
         assert!(budget.charge(60).is_ok());
@@ -5783,453 +3847,6 @@ mod tests {
         assert!(budget.charge(1).is_err());
     }
 
-    /// Code review round 1 (container overhead): every retained-entry
-    /// charge constant covers its `size_of` payload PLUS the documented
-    /// overhead envelope — no retained collection grows without a
-    /// corresponding live charge.
-    #[test]
-    fn retained_entry_charges_cover_size_of_plus_the_overhead_envelope() {
-        assert_eq!(
-            CANDIDATE_TUPLE_BYTES,
-            std::mem::size_of::<([u8; 16], i64)>() + RETAINED_ENTRY_OVERHEAD
-        );
-        assert_eq!(
-            MEMBERSHIP_ENTRY_BYTES,
-            std::mem::size_of::<([u8; 16], [u8; 8])>() + RETAINED_ENTRY_OVERHEAD
-        );
-        assert_eq!(
-            NUM_VALUE_ENTRY_BYTES,
-            std::mem::size_of::<(([u8; 16], [u8; 8]), f64)>() + RETAINED_ENTRY_OVERHEAD
-        );
-        // Heap summaries: the retained cost is size_of-based + overhead +
-        // string payloads (never a bare fixed constant).
-        let m = TraceMatch {
-            trace_id: tid(1),
-            sort_key: 1,
-            matched: 1,
-            spans: vec![SpanSummary::new(
-                [1; 8],
-                Some("n".repeat(10)),
-                1,
-                1,
-                vec![search_eval::ProjectedAttribute::new(
-                    &pulsus_traceql::Field::Attribute {
-                        scope: pulsus_traceql::AttrScope::Span,
-                        key: "k".to_string(),
-                    },
-                    super::search_eval::GroupValue::Str("v".to_string()),
-                )],
-            )],
-            groups: None,
-        };
-        assert!(
-            m.retained_bytes()
-                >= std::mem::size_of::<TraceMatch>()
-                    + std::mem::size_of::<SpanSummary>()
-                    + 2 * RETAINED_ENTRY_OVERHEAD
-                    + 10
-                    + 2,
-            "heap-entry charge must cover struct sizes, overhead, and strings (got {})",
-            m.retained_bytes()
-        );
-    }
-
-    /// Code review round 1 (merge overlap): the per-generator row charge
-    /// upper-bounds the merged map even when generators overlap — the
-    /// merged entry count never exceeds the charged row count.
-    #[test]
-    fn merge_overlap_never_exceeds_the_charged_row_count() {
-        let per_generator = vec![
-            vec![(tid(1), 100), (tid(2), 90)],
-            vec![(tid(1), 250), (tid(2), 80), (tid(3), 70)],
-        ];
-        let charged_rows: usize = per_generator.iter().map(Vec::len).sum();
-        let merged = merge_candidates(&per_generator);
-        assert!(merged.len() <= charged_rows);
-        // And the charge itself covers the merged-map entry cost.
-        let mut budget = ByteBudget::new(charged_rows * CANDIDATE_TUPLE_BYTES);
-        assert!(budget.charge(charged_rows * CANDIDATE_TUPLE_BYTES).is_ok());
-        assert!(
-            merged.len() * (std::mem::size_of::<([u8; 16], i64)>() + RETAINED_ENTRY_OVERHEAD)
-                <= charged_rows * CANDIDATE_TUPLE_BYTES
-        );
-    }
-
-    /// Code review round 1 (roots retention): the transient root-row
-    /// charge is released only AFTER the retained `roots` map has been
-    /// charged, and the retained charge stays live — the transfer never
-    /// leaves the map uncharged.
-    #[test]
-    fn root_charges_transfer_to_the_retained_map_not_released_with_the_rows() {
-        let row = |name: &str| RootRow {
-            trace_id: tid(1),
-            span_id: [1; 8],
-            parent_id: [0; 8],
-            service: "svc".to_string(),
-            name: name.to_string(),
-            timestamp_ns: 1,
-            duration_ns: 1,
-        };
-        let rows = vec![row("root-name"), row("other")];
-        let row_cost = |r: &RootRow| {
-            std::mem::size_of::<RootRow>()
-                + RETAINED_ENTRY_OVERHEAD
-                + r.service.len()
-                + r.name.len()
-        };
-        let transient: usize = rows.iter().map(row_cost).sum();
-
-        // Replay the exec flow's accounting exactly: charge rows while
-        // streaming, charge the retained map, THEN release the rows.
-        let mut budget = ByteBudget::new(HYDRATION_BYTE_BUDGET);
-        budget.charge(transient).expect("transient rows charge");
-        let roots = pick_roots(rows);
-        let retained = roots_retained_bytes(&roots);
-        assert!(retained > 0, "a live roots map must carry a live charge");
-        budget.charge(retained).expect("retained roots charge");
-        budget.release(transient);
-        assert_eq!(
-            budget.used(),
-            retained,
-            "after the transfer, exactly the retained roots bytes stay charged"
-        );
-        // The retained charge is EXACTLY the per-entry map key +
-        // `TraceContext` struct + string payloads + container overhead,
-        // summed over the map — issue #464 replaced a `>=` bound that
-        // could not see an undercharge, because a bound computed from the
-        // same `size_of` the accounting used moved with it.
-        assert!(
-            std::mem::size_of::<TraceContext>()
-                >= std::mem::size_of::<RootSummary>() + 2 * std::mem::size_of::<i64>(),
-            "TraceContext is the root summary PLUS the two envelope i64s"
-        );
-        let expected: usize = roots
-            .values()
-            .map(|ctx| {
-                std::mem::size_of::<[u8; 16]>()
-                    + std::mem::size_of::<TraceContext>()
-                    + RETAINED_ENTRY_OVERHEAD
-                    + ctx.root.service.len()
-                    + ctx.root.name.len()
-            })
-            .sum();
-        assert_eq!(
-            retained, expected,
-            "the retained charge must be computed from TraceContext (root summary PLUS the two envelope i64s), not from RootSummary"
-        );
-    }
-
-    #[test]
-    fn heap_entry_ordering_evicts_the_oldest_then_largest_trace_id() {
-        let entry = |ts: i64, id: u8| {
-            HeapEntry(TraceMatch {
-                trace_id: tid(id),
-                sort_key: ts,
-                matched: 1,
-                spans: Vec::new(),
-                groups: None,
-            })
-        };
-        let mut heap = std::collections::BinaryHeap::new();
-        heap.push(entry(100, 1));
-        heap.push(entry(50, 2));
-        heap.push(entry(50, 3));
-        // Worst = smallest ts; among ties the larger trace id.
-        assert_eq!(heap.pop().unwrap().0.trace_id, tid(3));
-        assert_eq!(heap.pop().unwrap().0.trace_id, tid(2));
-        assert_eq!(heap.pop().unwrap().0.trace_id, tid(1));
-    }
-
-    #[test]
-    fn pick_roots_prefers_an_all_zero_parent_over_an_earlier_child() {
-        let row = |ts: i64, span: u8, parent: u8, name: &str| RootRow {
-            trace_id: tid(1),
-            span_id: {
-                let mut id = [0u8; 8];
-                id[7] = span;
-                id
-            },
-            parent_id: {
-                let mut id = [0u8; 8];
-                id[7] = parent;
-                id
-            },
-            service: "svc".to_string(),
-            name: name.to_string(),
-            timestamp_ns: ts,
-            duration_ns: 5,
-        };
-        let roots = pick_roots(vec![row(10, 2, 9, "early-child"), row(20, 1, 0, "root")]);
-        assert_eq!(roots[&tid(1)].root.name, "root");
-    }
-
-    #[test]
-    fn pick_roots_falls_back_to_the_earliest_span_when_no_root_is_stored() {
-        let row = |ts: i64, span: u8, name: &str| RootRow {
-            trace_id: tid(1),
-            span_id: {
-                let mut id = [0u8; 8];
-                id[7] = span;
-                id
-            },
-            parent_id: [9u8; 8],
-            service: "svc".to_string(),
-            name: name.to_string(),
-            timestamp_ns: ts,
-            duration_ns: 5,
-        };
-        let roots = pick_roots(vec![row(20, 2, "later"), row(10, 1, "earliest")]);
-        assert_eq!(roots[&tid(1)].root.name, "earliest");
-    }
-
-    /// Issue #464: the trace-level envelope is folded over EVERY span of
-    /// the trace-wide root read, in the same pass that picks the root, and
-    /// it is a WIDTH.
-    ///
-    /// The base instant is deliberately non-zero, so reporting the
-    /// envelope's END instead of its width is distinguishable from
-    /// reporting the width; with `B == 0` the two are the same number and
-    /// this test could not tell them apart.
-    ///
-    /// The root here is neither the earliest span nor the widest, so the
-    /// envelope cannot be satisfied by the root's own window: the root
-    /// starts 1_000 ns after the trace does and is 42 ns wide, while the
-    /// trace runs from `B` to `B + 10_000`.
-    #[test]
-    fn pick_roots_folds_the_trace_envelope_over_every_span_as_a_width() {
-        const B: i64 = 1_700_000_000_000_000_000;
-        let row = |ts: i64, dur: i64, span: u8, parent: u8, name: &str| RootRow {
-            trace_id: tid(1),
-            span_id: {
-                let mut id = [0u8; 8];
-                id[7] = span;
-                id
-            },
-            parent_id: {
-                let mut id = [0u8; 8];
-                id[7] = parent;
-                id
-            },
-            service: "svc".to_string(),
-            name: name.to_string(),
-            timestamp_ns: ts,
-            duration_ns: dur,
-        };
-        let roots = pick_roots(vec![
-            row(B + 1_000, 42, 1, 0, "root"),
-            row(B, 0, 2, 1, "earliest-child"),
-            row(B + 1_000, 9_000, 3, 1, "latest-ending-child"),
-        ]);
-        let ctx = &roots[&tid(1)];
-        assert_eq!(
-            ctx.trace_start_ns, B,
-            "the envelope starts at the EARLIEST span, not the root"
-        );
-        assert_eq!(
-            ctx.trace_duration_ns, 10_000,
-            "the envelope is a WIDTH: (B + 1_000 + 9_000) - B, not the root's 42 and not the \
-             envelope's end"
-        );
-        // Root selection is untouched: the all-zero parent still wins, and
-        // its OWN window is still the root span's.
-        assert_eq!(ctx.root.name, "root");
-        assert_eq!(ctx.root.start_ns, B + 1_000);
-        assert_eq!(ctx.root.duration_ns, 42);
-    }
-
-    /// Issue #464, the single-span control: the root IS the trace, so the
-    /// trace-level rule and the root-span rule agree. It cannot
-    /// discriminate the two — that is
-    /// [`pick_roots_folds_the_trace_envelope_over_every_span_as_a_width`]'s
-    /// job — and it is kept so the width formula is pinned where there is
-    /// nothing to fold. The base is non-zero here too, so reporting the
-    /// envelope's END instead of its width still fails.
-    #[test]
-    fn pick_roots_reports_a_single_span_trace_as_that_span_s_own_window() {
-        const B: i64 = 1_700_000_000_000_000_000;
-        let only = pick_roots(vec![RootRow {
-            trace_id: tid(1),
-            span_id: [1u8; 8],
-            parent_id: [0u8; 8],
-            service: "svc".to_string(),
-            name: "alone".to_string(),
-            timestamp_ns: B + 5,
-            duration_ns: 7,
-        }]);
-        let ctx = &only[&tid(1)];
-        assert_eq!(ctx.root.name, "alone");
-        assert_eq!(ctx.trace_start_ns, B + 5);
-        assert_eq!(
-            ctx.trace_duration_ns, 7,
-            "the envelope is a WIDTH: (B + 5 + 7) - (B + 5), not the envelope's end"
-        );
-    }
-
-    /// Issue #464: the TTL-race fallback — a winner whose trace-wide root
-    /// read returned nothing. The assembly branch it serves is reachable
-    /// only from a live read that loses its rows between phases, so the
-    /// construction is a pure function precisely so both envelope fields
-    /// can be pinned here without an engine.
-    #[test]
-    fn the_ttl_race_fallback_reports_the_matched_span_start_and_a_zero_width() {
-        let matched = SpanSummary::new(
-            [7u8; 8],
-            Some("matched".to_string()),
-            1_700_000_000_000_000_000,
-            7_777,
-            vec![],
-        );
-        let ctx = fallback_trace_context(std::slice::from_ref(&matched), 42);
-        assert_eq!(ctx.root.service, "");
-        assert_eq!(ctx.root.name, "matched");
-        assert_eq!(ctx.root.start_ns, matched.start_ns);
-        assert_eq!(ctx.root.duration_ns, 0);
-        assert_eq!(
-            ctx.trace_start_ns, matched.start_ns,
-            "with no root row, the matched span's own start is the only instant we have"
-        );
-        assert_eq!(
-            ctx.trace_duration_ns, 0,
-            "and to a ZERO width — a non-zero fallback width would be invented, and the span's \
-             own 7_777 ns is NOT the trace's"
-        );
-
-        // No matched spans at all: the heap sort key is the only instant
-        // left, and the width is still zero.
-        let empty = fallback_trace_context(&[], 99);
-        assert_eq!(empty.root.service, "");
-        assert_eq!(empty.root.name, "");
-        assert_eq!(empty.root.start_ns, 99);
-        assert_eq!(empty.root.duration_ns, 0);
-        assert_eq!(empty.trace_start_ns, 99);
-        assert_eq!(empty.trace_duration_ns, 0);
-    }
-
-    fn hyd_row(trace: u8, span: u8) -> HydrationRow {
-        HydrationRow {
-            trace_id: tid(trace),
-            span_id: {
-                let mut id = [0u8; 8];
-                id[7] = span;
-                id
-            },
-            parent_id: [0u8; 8],
-            service: "svc".to_string(),
-            name: "op".to_string(),
-            timestamp_ns: span as i64,
-            duration_ns: 1,
-            status_code: 0,
-            status_message: String::new(),
-            kind: 1,
-            scope_name: String::new(),
-            scope_version: String::new(),
-        }
-    }
-
-    /// The exact per-group / per-unique-span charge formulas
-    /// [`group_hydrated_rows`] applies (kept in one place so the tests
-    /// below validate the REAL formulas, not re-derivations).
-    fn expected_group_cost(groups: usize, unique_spans: usize) -> usize {
-        let first_outer = VEC_INITIAL_RESERVATION_SLOTS * std::mem::size_of::<TraceSpans>();
-        let per_group = 2 * std::mem::size_of::<TraceSpans>()
-            + RETAINED_ENTRY_OVERHEAD
-            + VEC_INITIAL_RESERVATION_SLOTS * std::mem::size_of::<HydratedSpan>();
-        let per_span = 2 * std::mem::size_of::<HydratedSpan>()
-            + std::mem::size_of::<[u8; 8]>()
-            + RETAINED_ENTRY_OVERHEAD;
-        first_outer + groups * per_group + unique_spans * per_span
-    }
-
-    /// Round-5 medium: replayed rows are accounting no-ops — a
-    /// replay-heavy batch (every row duplicated) ends with exactly the
-    /// deduped groups' charge, never a phantom per-duplicate charge.
-    #[test]
-    fn replayed_rows_charge_exactly_the_deduped_retained_bytes() {
-        let mut rows = Vec::new();
-        for trace in 1..=3u8 {
-            for span in 1..=5u8 {
-                rows.push(hyd_row(trace, span));
-                rows.push(hyd_row(trace, span)); // every row replayed
-            }
-        }
-        let mut budget = ByteBudget::new(usize::MAX);
-        let mut charged = 0usize;
-        let (traces, overflowed) = group_hydrated_rows(
-            rows,
-            &[],
-            &SlotLayout::default(),
-            &mut BatchSlots::default(),
-            &mut budget,
-            &mut charged,
-        )
-        .expect("in budget");
-        assert!(!overflowed);
-        assert_eq!(traces.len(), 3);
-        assert!(traces.iter().all(|t| t.spans.len() == 5), "deduped");
-        assert_eq!(
-            charged,
-            expected_group_cost(3, 15),
-            "duplicates must not accumulate phantom charges"
-        );
-        assert_eq!(budget.used(), charged);
-    }
-
-    /// Round-5 high: the growth/initial-reservation formulas are exact —
-    /// covering the fresh outer/inner Vec initial reservations
-    /// (`VEC_INITIAL_RESERVATION_SLOTS`) and the standard hash-container
-    /// entry cost for the dedup set — and the charges cover the real
-    /// reserved capacities.
-    #[test]
-    fn group_charges_cover_initial_reservations_and_real_capacities() {
-        // One group, one span: the smallest shape exercises both initial
-        // reservations.
-        let mut budget = ByteBudget::new(usize::MAX);
-        let mut charged = 0usize;
-        let (traces, _) = group_hydrated_rows(
-            vec![hyd_row(1, 1)],
-            &[],
-            &SlotLayout::default(),
-            &mut BatchSlots::default(),
-            &mut budget,
-            &mut charged,
-        )
-        .expect("fits");
-        assert_eq!(charged, expected_group_cost(1, 1));
-        // The charge covers what was actually reserved.
-        assert!(
-            charged
-                >= traces.capacity() * std::mem::size_of::<TraceSpans>()
-                    + traces[0].spans.capacity() * std::mem::size_of::<HydratedSpan>(),
-            "charge {} must cover outer cap {} + inner cap {}",
-            charged,
-            traces.capacity(),
-            traces[0].spans.capacity()
-        );
-
-        // Many spans across several doublings: still covered.
-        let rows: Vec<HydrationRow> = (0..200u8).map(|n| hyd_row(1, n)).collect();
-        let mut budget = ByteBudget::new(usize::MAX);
-        let mut charged = 0usize;
-        let (traces, _) = group_hydrated_rows(
-            rows,
-            &[],
-            &SlotLayout::default(),
-            &mut BatchSlots::default(),
-            &mut budget,
-            &mut charged,
-        )
-        .expect("fits");
-        assert_eq!(charged, expected_group_cost(1, 200));
-        assert!(
-            charged
-                >= traces.capacity() * std::mem::size_of::<TraceSpans>()
-                    + traces[0].spans.capacity() * std::mem::size_of::<HydratedSpan>()
-                    + 200 * std::mem::size_of::<[u8; 8]>(),
-            "growth stays within the doubling-slack model"
-        );
-        assert!(!traces.is_empty());
-    }
-
     /// `QuerySettings` has no public getters; its `Debug` rendering is
     /// the stable introspection surface for pinning the Layer-1 budget
     /// contract (final amendment).
@@ -6256,56 +3873,6 @@ mod tests {
         assert!(
             !rendered.contains("optimize_skip_unused_shards"),
             "unclustered engines must not carry the §7 settings"
-        );
-    }
-
-    /// Issue #57 re-audit AC-A1: the phase-1 generator settings pin —
-    /// `search_settings` plus the memory ceiling, throw-not-spill.
-    ///
-    /// **Issue #492 part 4 asserts the VALUE of
-    /// `max_bytes_before_external_group_by`, not just that the key is
-    /// there**, and that is the whole of the change to this test.
-    ///
-    /// The presence check was not a check of the thing it names. Setting
-    /// `exec.rs`'s `0u64` to `8_388_608u64` left all 1,260
-    /// `pulsus-read --lib` tests green, and left the live sweep
-    /// `query_log_gates.rs`'s
-    /// `every_trace_engine_query_carries_the_memory_ceiling` green too,
-    /// because that sweep selects `Settings['max_memory_usage']` and
-    /// nothing else. Under the same edit the statement's BEHAVIOUR flips:
-    /// on a 1,000,000-group corpus at a 320 MiB ceiling, the pushed
-    /// generator answers `Code: 241` with `0` and `200` with 1,001 rows
-    /// with 8 MiB, measured at 2, 4 and 16 threads.
-    ///
-    /// That matters more since part 4: a spanset aggregate now compiles
-    /// into this statement's `HAVING`, which enlarges the per-group
-    /// aggregation state, and the memory ceiling is the ONE mechanism
-    /// that refuses when the grouping outgrows the budget. A non-zero
-    /// value turns that refusal into a slow `200` — the silent widening
-    /// this settings block exists to prevent.
-    #[test]
-    fn generator_settings_pin_the_memory_ceiling_and_throw_not_spill() {
-        let settings = generator_settings(&cfg());
-        let rendered = format!("{settings:?}");
-        for expected in [
-            "max_memory_usage",
-            "536870912",
-            "max_bytes_before_external_group_by",
-            // The search settings must still be present underneath.
-            "max_rows_to_read",
-            "max_block_size",
-        ] {
-            assert!(
-                rendered.contains(expected),
-                "missing {expected} in {rendered}"
-            );
-        }
-        assert_eq!(
-            settings.get("max_bytes_before_external_group_by"),
-            Some("0"),
-            "the generator read must THROW rather than spill: a non-zero \
-             max_bytes_before_external_group_by turns the memory ceiling from a refusal into a \
-             slow 200"
         );
     }
 
@@ -6428,33 +3995,6 @@ mod tests {
         }
     }
 
-    /// The batch hydration read at the `BATCH_TRACES` batch size — the
-    /// module's own documented residual (≤ 48 B × 32 ≈ ≤ 2 KB, module
-    /// doc) — stays well under the guard's cap. Pinned so a future
-    /// `BATCH_TRACES` increase that breaks the assumption is caught here,
-    /// not live.
-    #[test]
-    fn hydration_sql_at_batch_traces_batch_size_stays_under_4kib() {
-        let trace_ids: Vec<[u8; 16]> = (0..BATCH_TRACES as u8).map(|i| [i; 16]).collect();
-        let sql = crate::traces::search_sql::hydration_sql(
-            "trace_spans",
-            &trace_ids,
-            crate::logql::sql::TimeWindow {
-                start_ns: 0,
-                end_ns: i64::MAX,
-            },
-            MAX_SPANS_PER_TRACE,
-            crate::traces::search_plan::HydrationShape::Plain,
-            &[],
-        );
-        assert!(
-            sql.len() < 4096,
-            "hydration SQL at the BATCH_TRACES={} batch size is {} bytes, expected < 4 KiB",
-            BATCH_TRACES,
-            sql.len()
-        );
-    }
-
     /// Issue #478, criterion 5a (hermetic half). **Every span name is
     /// typed `string` EXPLICITLY, never left empty.**
     ///
@@ -6465,6 +4005,95 @@ mod tests {
     /// `tags_response::entry_type("")` also renders `string`, so a read
     /// that set no type at all would be invisible on the wire — the
     /// assertion is on `val_type` itself, not on the rendering.
+    /// Issue #398 AC T1: **all three** of this module's settings origins
+    /// carry the surface-wide memory ceiling and throw rather than spill.
+    ///
+    /// Three, not one. `search_settings` is the obvious root;
+    /// `catalog_settings` is a DELIBERATELY INDEPENDENT root (it omits the
+    /// clustered-reader block on purpose) and is the one whose unbounded
+    /// `/api/search/tag/{tag}/values` read produced the measured 500 that
+    /// opened this issue; and the §4.2 point read
+    /// (`TraceEngine::fetch_by_id`) sent a bare `QuerySettings::new()`
+    /// while mapping errors around `map_trace_read_error` entirely. The
+    /// point read is included here by asserting the settings object it now
+    /// dispatches with — `catalog_settings(&self.config)`, its whole body.
+    ///
+    /// This unit test alone is NOT the completeness proof: it can only
+    /// check the origins someone remembered to list. That is what
+    /// `every_trace_engine_query_carries_the_memory_ceiling` in
+    /// `tests/query_log_gates.rs` is for — a `system.query_log` sweep sees
+    /// a dispatch site no enumeration mentions.
+    #[test]
+    fn trace_catalog_settings_carry_the_memory_ceiling() {
+        for bytes in [1u64, pulsus_config::TRACEQL_READ_MAX_MEMORY_BYTES_CEILING] {
+            let mut c = cfg();
+            c.read_max_memory_bytes = bytes;
+            let expected = bytes.to_string();
+            for (name, s) in [
+                ("search_settings", search_settings(&c)),
+                ("catalog_settings", catalog_settings(&c)),
+                // `fetch_by_id`'s settings object, by construction.
+                ("fetch_by_id (point read)", catalog_settings(&c)),
+                ("metrics_settings", metrics_settings(&c)),
+                ("statement_settings", statement_settings(&c)),
+                ("graph_settings", graph_settings(&c)),
+            ] {
+                assert_eq!(
+                    s.get("max_memory_usage"),
+                    Some(expected.as_str()),
+                    "{name} must carry the surface-wide memory ceiling verbatim"
+                );
+                assert_ne!(
+                    s.get("max_memory_usage"),
+                    Some("0"),
+                    "{name} must never send ClickHouse's unlimited sentinel"
+                );
+                assert_eq!(
+                    s.get("max_bytes_before_external_group_by"),
+                    Some("0"),
+                    "{name} must throw rather than spill"
+                );
+            }
+        }
+    }
+
+    /// M1 (issue #57 re-audit round-4/5 finding): the hermetic mapper pin
+    /// — every trace-search overflow code routes to ITS OWN reason (never
+    /// impersonating another), and the two byte-budget constants that
+    /// share `ScanBudgetBytes` are provably distinct from the Layer-2
+    /// retention budget, so a Layer-1 byte preempt can never impersonate
+    /// the retention-counter trip the `traces_search_explain.rs`
+    /// AC-A3 gate asserts on.
+    #[test]
+    fn m1_every_overflow_code_maps_to_its_own_reason_and_the_budgets_are_distinct() {
+        let server = |code| ChError::Server {
+            code,
+            message: "overflow".to_string(),
+        };
+        match map_trace_read_error(server(307), &cfg()) {
+            ReadError::QueryTooBroad(TooBroadReason::ScanBudgetBytes { budget_bytes, .. }) => {
+                assert_eq!(budget_bytes, TRACE_READ_BYTES_BUDGET);
+            }
+            other => panic!("expected ScanBudgetBytes(TRACE_READ_BYTES_BUDGET), got {other:?}"),
+        }
+        match map_trace_read_error(server(396), &cfg()) {
+            ReadError::QueryTooBroad(TooBroadReason::ScanBudgetBytes { budget_bytes, .. }) => {
+                assert_eq!(budget_bytes, TRACE_MAX_RESULT_BYTES);
+            }
+            other => panic!("expected ScanBudgetBytes(TRACE_MAX_RESULT_BYTES), got {other:?}"),
+        }
+        assert!(matches!(
+            map_trace_read_error(server(158), &cfg()),
+            ReadError::QueryTooBroad(TooBroadReason::TraceScanBudgetRows { .. })
+        ));
+        // Distinctness: neither Layer-1 byte-budget constant equals the
+        // Layer-2 retention budget, so `budget_bytes` equality is a
+        // sound discriminator between a Layer-1 preempt and the
+        // retention-counter trip.
+        assert_ne!(TRACE_READ_BYTES_BUDGET, HYDRATION_BYTE_BUDGET as u64);
+        assert_ne!(TRACE_MAX_RESULT_BYTES, HYDRATION_BYTE_BUDGET as u64);
+    }
+
     #[test]
     fn a_span_name_value_carries_an_explicit_string_type() {
         for name in ["500", "1.5", "true", "1.5s", "-3", "checkout", ""] {

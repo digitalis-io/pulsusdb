@@ -56,11 +56,6 @@ use pulsus_traceql::{
 use crate::logql::escape;
 use crate::logql::pipeline::PipelineError;
 
-use super::search_sql::{
-    ProbeColumn, byte_cap_expr, locate_item, locate_matching_item, probe_chain, probe_test,
-    probe_value_exprs,
-};
-
 /// Table-name context for one compilation — `trace_spans{_dist}` /
 /// `trace_attrs_idx{_dist}` exactly as `chconfig` derives them.
 #[derive(Debug, Clone, Copy)]
@@ -2926,6 +2921,170 @@ pub(crate) fn gen_set_score(set: &[LeafGenerator]) -> (GenClass, usize) {
     (worst, set.len())
 }
 
+/// Hard **byte** ceiling on every string value the search response
+/// returns (`name`/`service`/`select()`-projected attribute values) —
+/// owner-approved response truncation (issue #57 re-audit, comment
+/// 5028629688/5028693510). ClickHouse's `length()` counts bytes, so
+/// [`byte_capped`]'s `length(col) <= TRACE_STR_COL_CAP` branch is
+/// byte-identical passthrough for every string at or under the cap; the
+/// fallback branch cuts at [`TRACE_STR_COL_CP_FALLBACK`] UTF-8 code
+/// points instead of bytes, but a code point is at most 4 bytes, so the
+/// fallback output itself never exceeds this same byte ceiling either —
+/// documented in docs/api.md §4.2.
+pub const TRACE_STR_COL_CAP: u64 = 8192;
+
+/// The truncation fallback's code-point cut: `TRACE_STR_COL_CAP / 4` — a
+/// UTF-8 sequence is at most 4 bytes per code point, so
+/// `TRACE_STR_COL_CP_FALLBACK` code points can never exceed
+/// `TRACE_STR_COL_CAP` bytes even at the worst-case 4-byte width.
+///
+/// `pub(crate)` since issue #492 part 5, for one further consumer:
+/// [`super::search_plan::generator_exactness`] refuses a
+/// `resource.service.name` literal of this many code points or more,
+/// because that is exactly where a capped reading and a raw one can
+/// first agree on a value they should not. Measured on ClickHouse 26.3:
+/// with a stored `service` of `'\u{1D11E}' x 2048 + '0'` (8193 bytes,
+/// 2049 code points) and a literal of `'\u{1D11E}' x 2048` (2048 code
+/// points), `stored = literal` is `0` and `cap(stored) = literal` is
+/// `1` — the generator's `PREWHERE` compares the raw column and the
+/// evaluator the capped one, so below 2048 code points they cannot
+/// disagree and at 2048 they can.
+pub(crate) const TRACE_STR_COL_CP_FALLBACK: u64 = TRACE_STR_COL_CAP / 4;
+
+/// The unaliased, unwrapped byte-bound truncation expression — the ONE
+/// definition of the cap (issue #184 plan v4: `byte_capped`,
+/// and the [`trace_ctx_sql`] co-load's `argMin` value
+/// projections all build on this single helper, so the cap length and
+/// fallback can never diverge between the displayed-root path and the
+/// trace-context co-load; the in-module AC-Δ1c/Δ1d/Δ1e tests pin the
+/// construction). `pub(crate)` for exactly one out-of-module consumer
+/// (issue #184 code review): the Phase-1 `statusMessage` generator
+/// predicate (`super::filter::physical_sql`) compares this same capped
+/// expression, so candidate selection agrees byte-for-byte with the
+/// capped `status_message` Phase 2 hydrates and evaluates.
+pub(crate) fn byte_cap_expr(col: &str) -> String {
+    format!(
+        "if(length({col}) <= {TRACE_STR_COL_CAP}, {col}, \
+         substringUTF8({col}, 1, {TRACE_STR_COL_CP_FALLBACK}))"
+    )
+}
+
+/// One attribute SLOT's span-row columns (issue #557, widened by #558).
+///
+/// A slot is a CONDITION's probe, a PROJECTED FIELD's locator, or an
+/// event/link set's WIDTH. The four rendered arrays share one index
+/// space, which [`super::search_plan::SlotLayout`] owns.
+///
+/// The parts are already-rendered fragments: this module assembles them
+/// into a statement and never decides what a value test says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeColumn {
+    /// `WITH` items, each already `<expr> AS <alias>`, in render order.
+    pub with_items: Vec<String>,
+    /// The positive `UInt8` test. Never negated — the reader inverts.
+    pub test: String,
+    /// `(value, numeric, kind)` when something projects this slot's
+    /// value (issue #479 for the fused matched value, #558 for the
+    /// projected field and the set width), all three read at the element
+    /// `test` landed on.
+    pub value: Option<(String, String, String)>,
+}
+
+/// `arrayFirstIndex((k, s) -> k = <key> AND s = <scope>, attr_key, attr_scope) AS <alias>`
+/// (issue #557) — the position of the element a span's attribute
+/// RESOLVES to at one scope, or `0` when the span carries no such
+/// element.
+///
+/// `0` is not an error on a computed subscript: ClickHouse returns the
+/// element type's default (`''` for `String`, `NULL` for
+/// `Nullable(Float64)`), measured on 26.3.29.7. It IS an error as a
+/// constant subscript (`Code: 135 ZERO_ARRAY_OR_TUPLE_INDEX`), which is
+/// why every subscript this module renders is an alias.
+pub fn locate_item(alias: &str, key_literal: &str, scope_literal: &str) -> String {
+    format!(
+        "arrayFirstIndex((k, s) -> k = {key_literal} AND s = {scope_literal}, \
+         attr_key, attr_scope) AS {alias}"
+    )
+}
+
+/// The same locate with a pre-rendered value test folded into the lambda
+/// — the multi-valued arm (issue #557). It yields the first MATCHING
+/// element, so the same alias serves the fused value.
+///
+/// `test` must have been rendered against the lambda's own parameter
+/// names, which are `v` (text) and `n` (numeric); `numeric` says which of
+/// the two arrays the lambda takes.
+///
+/// Inside the lambda a `NULL` result is false and the function still
+/// returns `UInt32`, so no `ifNull` wrapper belongs here — the wrapper is
+/// the PROJECTED single-valued arm's (measured on 26.3.29.7).
+pub fn locate_matching_item(
+    alias: &str,
+    key_literal: &str,
+    scope_literal: &str,
+    test: &str,
+    numeric: bool,
+) -> String {
+    let (param, array) = if numeric {
+        ("n", "attr_num")
+    } else {
+        ("v", "attr_val")
+    };
+    format!(
+        "arrayFirstIndex((k, s, {param}) -> k = {key_literal} AND s = {scope_literal} AND {test}, \
+         attr_key, attr_scope, {array}) AS {alias}"
+    )
+}
+
+/// `(<alias> != 0) AND <test>` for a single-valued scope; `<alias> != 0`
+/// for a multi-valued one, whose locate already carries the test
+/// (issue #557).
+///
+/// **The `!= 0` conjunct is required for correctness, not to avoid an
+/// error.** Element `0` of a `String` array reads `''`, so without it
+/// `{ span.k = "" }` would match every span that carries no `k` at all.
+pub fn probe_test(alias: &str, test: Option<&str>) -> String {
+    match test {
+        Some(test) => format!("({alias} != 0) AND {test}"),
+        None => format!("{alias} != 0"),
+    }
+}
+
+/// The nested `if` over `(present, expr)` pairs in chain order, ending in
+/// `fallback` — the unscoped form (issue #557).
+///
+/// Used three times over the SAME arms — the test (fallback `0`), the
+/// fused value (fallback `''`) and the stored kind (fallback `''`) — so a
+/// value can never be read from a scope the test did not resolve to.
+pub fn probe_chain(arms: &[(String, String)], fallback: &str) -> String {
+    match arms.split_first() {
+        None => fallback.to_string(),
+        Some(((present, expr), rest)) => {
+            format!("if({present}, {expr}, {})", probe_chain(rest, fallback))
+        }
+    }
+}
+
+/// The byte-capped value, the numeric reading and the stored kind, all
+/// three subscripted at `alias` (issue #557; issue #558 adds the middle
+/// one). The cap is [`byte_cap_expr`], the same one [`hydration_sql`]
+/// applies to `service`/`name`, so a projected attribute value obeys the
+/// same 8192-byte source truncation as every other projected string.
+///
+/// **The number is READ, never derived from the text.** `attr_num` is
+/// the reading the writer stored, decided from the whole of
+/// `(scope, key, value)` — a link's `spanID` of `0000000000000001`
+/// stores `NULL` although the text parses as `1.0`
+/// (`crates/pulsus-write/src/protocols/otlp_traces.rs:748`). Computing
+/// the number from `attr_val` here would answer `1.0` there.
+pub fn probe_value_exprs(alias: &str) -> (String, String, String) {
+    (
+        byte_cap_expr(&format!("attr_val[{alias}]")),
+        format!("attr_num[{alias}]"),
+        format!("attr_type[{alias}]"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use pulsus_traceql::parse;
@@ -4399,5 +4558,37 @@ mod tests {
                 "{scope:?} maps to the wrong index scope"
             );
         }
+    }
+
+    /// Issue #57 re-audit AC-A1: the fallback code-point cut is exactly
+    /// one quarter of the byte ceiling — a worst-case 4-byte UTF-8 code
+    /// point at that cut still lands exactly at the byte ceiling, never
+    /// past it. (Moved here with the constants from the deleted
+    /// `search_sql.rs`, #602 part 2c-2b-2.)
+    #[test]
+    fn cp_fallback_is_exactly_one_quarter_of_the_byte_cap() {
+        assert_eq!(TRACE_STR_COL_CP_FALLBACK, TRACE_STR_COL_CAP / 4);
+        assert_eq!(TRACE_STR_COL_CAP, 8192);
+        assert_eq!(TRACE_STR_COL_CP_FALLBACK, 2048);
+    }
+
+    /// Issue #184 AC-Δ1d: the cap expression has a SINGLE source of
+    /// truth — `substringUTF8` appears in this module's production,
+    /// non-comment code exactly once, inside `byte_cap_expr`. (Moved
+    /// with the helper from the deleted `search_sql.rs`.)
+    #[test]
+    fn the_cap_expression_has_a_single_source_of_truth() {
+        let src = include_str!("filter.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap();
+        let code_only: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            code_only.matches("substringUTF8").count(),
+            1,
+            "cap logic must have one definition (byte_cap_expr) — found an inline duplicate"
+        );
     }
 }

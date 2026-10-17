@@ -33,26 +33,11 @@ use thiserror::Error;
 ///   error code.
 /// - [`TooBroadReason::TraceScanBudgetRows`] — `max_rows_to_read` (code
 ///   158) on the traces read paths only; LogQL never sets that setting.
-/// - [`TooBroadReason::TraceEventSetValues`] — the event/link value-set
-///   bound (issue #558). Its pre-expansion form is a Rust-side check
-///   against the widths the hydration statement returned, never a
-///   ClickHouse code; its `values: None` form maps code 396 on the value
-///   statement alone.
 /// - [`TooBroadReason::TraceMetricsSetRows`] — the trace-metrics
 ///   semi-join IN-set limits (`max_rows_in_set`/`max_bytes_in_set`,
 ///   throw — code 191) set **only** by `traces::exec`'s metrics query
 ///   settings; no other path sets a set limit, and no other code maps
 ///   code 191.
-/// - [`TooBroadReason::TraceGeneratorMemory`] — issue #57 re-audit: the
-///   traces phase-1 candidate-generator's memory ceiling
-///   (`max_memory_usage` + `max_bytes_before_external_group_by = 0`,
-///   throw — code 241) set **only** on generator reads, and mapped
-///   **only** by `traces::exec::map_trace_generator_error`. Issue #398
-///   ended this reason's exclusive claim on code 241: all three read
-///   surfaces now carry a memory ceiling, so code 241 is mapped by four
-///   mappers in total. The generator's mapper runs FIRST on generator
-///   reads and delegates the rest, so the more specific (and tighter)
-///   generator reason still wins there and the four never mix.
 /// - [`TooBroadReason::LogqlReadMemory`] / [`TooBroadReason::PromqlReadMemory`]
 ///   / [`TooBroadReason::TraceReadMemory`] — issue #398: the per-surface
 ///   read memory ceilings (`reader.{logql,promql,traceql}_read_max_memory_bytes`,
@@ -104,22 +89,6 @@ pub enum TooBroadReason {
     /// **only** by `traces::exec`'s own error mapper; LogQL's
     /// `map_read_error` never produces it.
     TraceScanBudgetRows { budget_rows: u64 },
-    /// The event/link value-set bound (issue #558,
-    /// `reader.traceql_event_set_max_values`).
-    ///
-    /// `values` is `Some` when the reader refused BEFORE issuing the
-    /// value statement, from the widths the hydration statement returned;
-    /// `None` when the value statement's own result bound fired, which
-    /// code 396 cannot attribute to rows or bytes.
-    ///
-    /// `budget_values` is `reader.traceql_event_set_max_values`, **not**
-    /// the row scan budget: the two bound different quantities and say
-    /// so. Set **only** by `traces::exec`'s own event-set error mapper
-    /// and its pre-expansion check.
-    TraceEventSetValues {
-        values: Option<u64>,
-        budget_values: u64,
-    },
     /// A TraceQL metrics attribute-filter semi-join's IN-set exceeded its
     /// budget (`max_rows_in_set`/`max_bytes_in_set` +
     /// `set_overflow_mode='throw'` — server code 191, issue #59 plan v2
@@ -143,29 +112,12 @@ pub enum TooBroadReason {
     TraceMetricsSeriesCap { count: u64, cap: u64 },
     /// Issue #185: a TraceQL SEARCH `| by(...)` spanset-grouping stage
     /// resolved more distinct groups than `reader.traceql_max_series` — the
-    /// SAME cap and the SAME distinct-by-key `GROUP BY <keys> LIMIT cap+1`
-    /// pre-flight probe as the metric `by(...)` cap
-    /// ([`TooBroadReason::TraceMetricsSeriesCap`]), applied before the main
-    /// search runs. A breach is a static `422 query_too_broad`, never a
+    /// SAME cap as the metric `by(...)` cap
+    /// ([`TooBroadReason::TraceMetricsSeriesCap`]), counted by the search
+    /// statement's decode over the spansets its response carries (issue
+    /// #602 part 2a). A breach is a static `422 query_too_broad`, never a
     /// silent subset. Operator scale tuning routes to issue #25.
     TraceSearchSeriesCap { count: u64, cap: u64 },
-    /// Issue #57 re-audit (sub-problem B): the traces phase-1 candidate-
-    /// generator read's memory ceiling (`max_memory_usage` +
-    /// `max_bytes_before_external_group_by = 0`, throw — server code 241
-    /// `MEMORY_LIMIT_EXCEEDED`) was exceeded — a dense common-value
-    /// prefix's `GROUP BY trace_id` aggregation state grew past the
-    /// budget. Set **only** by `traces::exec`'s generator error mapper
-    /// (`map_trace_generator_error`); never conflated with the row/byte
-    /// scan budgets or the trace-metrics set budget.
-    ///
-    /// Issue #398: `generator_settings` keeps this TIGHTER 512 MiB ceiling
-    /// layered on top of the surface-wide
-    /// `reader.traceql_read_max_memory_bytes`, so a generator read is
-    /// bounded by the smaller of the two and still reports through this
-    /// reason. That is deliberately **not** a carve-out from #398's
-    /// bound-every-read rule: a carve-out leaves a path *unbounded*, and
-    /// this path ends up bounded more strictly, not less.
-    TraceGeneratorMemory { budget_bytes: u64 },
     /// Issue #398: a **LogQL** read exceeded
     /// `reader.logql_read_max_memory_bytes` (`max_memory_usage` +
     /// `max_bytes_before_external_group_by = 0`, throw-not-spill — server
@@ -173,8 +125,7 @@ pub enum TooBroadReason {
     /// `logql::exec::map_read_error`. The sibling surfaces map the same
     /// server code from their own mappers to their own reasons
     /// ([`TooBroadReason::PromqlReadMemory`],
-    /// [`TooBroadReason::TraceReadMemory`],
-    /// [`TooBroadReason::TraceGeneratorMemory`]) and the four never mix —
+    /// [`TooBroadReason::TraceReadMemory`]) and the three never mix —
     /// each mapper only ever sees its own surface's errors.
     LogqlReadMemory { budget_bytes: u64 },
     /// Issue #398: a **PromQL** read exceeded
@@ -189,10 +140,7 @@ pub enum TooBroadReason {
     /// Issue #398: a **TraceQL** read — search, catalog discovery, or the
     /// trace-by-id point read — exceeded
     /// `reader.traceql_read_max_memory_bytes`. Produced **ONLY** by
-    /// `traces::exec::map_trace_read_error`. Phase-1 generator reads are
-    /// classified by `map_trace_generator_error` FIRST, so their tighter
-    /// ceiling reports as [`TooBroadReason::TraceGeneratorMemory`] and
-    /// never as this.
+    /// `traces::exec::map_trace_read_error`.
     TraceReadMemory { budget_bytes: u64 },
     /// Issue #85 (M6-08c): a name-less/regex-`__name__` PromQL selector
     /// matched more metric names than the configured fan-out cap
@@ -481,19 +429,6 @@ impl fmt::Display for TooBroadReason {
             TooBroadReason::TraceScanBudgetRows { budget_rows } => {
                 write!(f, "trace scan budget of {budget_rows} rows exceeded")
             }
-            TooBroadReason::TraceEventSetValues {
-                values,
-                budget_values,
-            } => {
-                write!(
-                    f,
-                    "event/link value set exceeds the value budget of {budget_values} values"
-                )?;
-                match values {
-                    Some(values) => write!(f, " ({values} values in this batch)"),
-                    None => Ok(()),
-                }
-            }
             TooBroadReason::TraceStructuralDepth { max_depth } => write!(
                 f,
                 "a structural operator (>> or <<) found a chain of parent spans deeper than \
@@ -517,12 +452,6 @@ impl fmt::Display for TooBroadReason {
                     f,
                     "trace search by() resolved at least {count} groups, exceeding the \
                      {cap}-series cap"
-                )
-            }
-            TooBroadReason::TraceGeneratorMemory { budget_bytes } => {
-                write!(
-                    f,
-                    "trace search generator memory budget of {budget_bytes} bytes exceeded"
                 )
             }
             // Issue #398: PulsusDB's own wording on all three. The
@@ -1087,17 +1016,6 @@ mod tests {
         let msg = reason.to_string();
         assert!(msg.contains("1000000"));
         assert!(msg.contains("attribute-set"));
-    }
-
-    /// Issue #57 re-audit: the generator memory reason names the budget.
-    #[test]
-    fn trace_generator_memory_display_names_the_memory_budget() {
-        let reason = TooBroadReason::TraceGeneratorMemory {
-            budget_bytes: 1_048_576,
-        };
-        let msg = reason.to_string();
-        assert!(msg.contains("1048576"), "{msg}");
-        assert!(msg.contains("generator memory"), "{msg}");
     }
 
     /// Issue #138 AC1: the sample-budget breach message names the knob
