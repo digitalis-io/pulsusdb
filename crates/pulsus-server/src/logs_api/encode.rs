@@ -1391,8 +1391,8 @@ fn explain_suffix(mut suffix: String, explain: Option<&PlanExplain>) -> String {
 /// {"status":"success","data":{…},"warnings":["maximum of series (500) reached for variant (0)"]}
 /// ```
 ///
-/// Empty ⇒ zero bytes (`omitempty`), so every non-variants response stays
-/// byte-identical.
+/// Empty ⇒ zero bytes (`omitempty`), so every response with no warning
+/// stays byte-identical.
 fn warnings_suffix(warnings: &Warnings) -> String {
     if warnings.is_empty() {
         return String::new();
@@ -1449,8 +1449,8 @@ pub(crate) fn query_response(
 /// matrix with no per-series value order, so no HashMap nondeterminism
 /// reaches the wire).
 ///
-/// `warnings` renders zero bytes when empty, so every non-variants
-/// response is byte-identical to the pre-#277 encoder.
+/// `warnings` renders zero bytes when empty, so every response with no
+/// warning is byte-identical to the pre-#277 encoder.
 pub(crate) fn query_response_warned(
     result: QueryResult,
     explain: Option<PlanExplain>,

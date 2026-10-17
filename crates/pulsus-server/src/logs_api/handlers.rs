@@ -409,6 +409,7 @@ async fn query_range_impl(
         wants_explain(headers),
         end_ns,
         &params::encoding_flags(headers),
+        params::is_logs_drilldown(headers),
     )
     .await
 }
@@ -482,6 +483,7 @@ async fn query_impl(
         wants_explain(headers),
         at_ns,
         &params::encoding_flags(headers),
+        params::is_logs_drilldown(headers),
     )
     .await
 }
@@ -496,6 +498,7 @@ async fn run_query(
     explain: bool,
     at_ns: i64,
     encoding_flags: &[String],
+    logs_drilldown: bool,
 ) -> Result<Response, ApiError> {
     let preserve_vector_order = preserve_vector_order(&query_params.spec, expr);
     // Issue #463: the header decides the response SHAPE, so it has to
@@ -503,6 +506,7 @@ async fn run_query(
     // the encoder (which advertises and renders them) from one read.
     let opts = ResponseOptions {
         categorize_labels: params::wants_categorize_labels(encoding_flags),
+        partial_at_series_cap: logs_drilldown,
     };
     if explain {
         // Issue #277: `explain` lives INSIDE `data`, `warnings` outside

@@ -211,6 +211,11 @@ pub struct ResponseOptions {
     /// structured-metadata and parsed labels are carried out of the
     /// stream's label set and onto the entry.
     pub categorize_labels: bool,
+    /// The request came from the logs drilldown app (issue #605): a metric
+    /// result over the series cap is served truncated, with a warning,
+    /// instead of refused — the reference's `IsLogsDrilldownRequest`
+    /// branch (`pkg/logql/engine.go:536-591` @ v3.7.4).
+    pub partial_at_series_cap: bool,
 }
 
 #[cfg(test)]

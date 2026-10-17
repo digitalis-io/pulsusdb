@@ -1107,7 +1107,7 @@ fn meta_n(n: usize) -> HashMap<Fingerprint, StreamMetaRow> {
 /// Issue #236, rewritten cap golden (AC 16). Before #236 this asserted a
 /// mid-scan `MetricSeries` 422 at the 501st fan-out group. That rejection
 /// is DELETED: `MAX_QUERY_SERIES` is a final-RESULT cap, so the leaf must
-/// now serve every group it scans and let `ensure_result_series` judge the
+/// now serve every group it scans and let `cap_result_series` judge the
 /// finished result at the engine boundary.
 ///
 /// `logfmt` is a parser -> `mutates_labels` -> fan-out. Every row carries a

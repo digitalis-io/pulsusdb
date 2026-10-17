@@ -1272,8 +1272,8 @@ fn evaluate(store: &Store, query: &str, spec: QuerySpec) -> Result<Outcome, Stri
                 direction: Direction::Backward,
             };
             let mut warnings = Warnings::new();
-            // Issue #236: the SAME final-result series gate the engine
-            // applies on its `Plan::Metric`/`Plan::MetricBinary` arms, so
+            // Issue #236: the final-result series gate the engine applies
+            // to an untagged request on its `Plan::Metric`/`Plan::MetricBinary` arms, so
             // corpus `eval_fail` cases can pin the reference's verbatim
             // `maximum number of series (500) …` body. Applied here and
             // never inside `eval_leaf`/`eval_node`, mirroring the engine:

@@ -91,7 +91,7 @@ pub const MAX_COUNTER_VALUES: u64 = 4_000_000;
 /// result only and therefore SERVES the non-shardable ones — an
 /// over-acceptance registered as ledger entry `#236 (f)`, in the
 /// direction that matters: PulsusDB rejects nothing the reference
-/// serves. Exactly 500 served, 501 rejected, on both sides.
+/// serves. Exactly 500 served; 501 refused untagged, cut to 500 if tagged.
 ///
 /// **Read by [`result_series_breach`] and by nothing else** (issue #236's
 /// normative property; the reader moved there from `ensure_result_series`
@@ -141,8 +141,8 @@ pub fn result_series_breach(result: &QueryResult) -> Option<u64> {
     }
 }
 
-/// Enforces [`MAX_QUERY_SERIES`] on a metric query's **final** result —
-/// [`result_series_breach`] as an error.
+/// The untagged refusal of a **final** result over [`MAX_QUERY_SERIES`]:
+/// [`result_series_breach`] as an error. The engine calls `cap_result_series`.
 ///
 /// `pub` so the conformance runner (`tests/logqltest/runner.rs`) applies
 /// the identical gate on its own `Expr::Metric` arm and corpus
@@ -1544,6 +1544,32 @@ const fn result_retained_bytes() -> u64 {
     metric_leaf + streams_result
 }
 
+/// [`ensure_result_series`] for a request that may be served partially
+/// (issue #605). `opts.partial_at_series_cap` is set for a request tagged
+/// as the logs drilldown app's; [`PartialOrder`] says which series it
+/// keeps.
+pub(crate) fn cap_result_series(
+    result: QueryResult,
+    opts: super::params::ResponseOptions,
+    expr: &pulsus_logql::Expr,
+    params: &super::params::QueryParams,
+    warnings: &mut super::warnings::Warnings,
+) -> Result<QueryResult, ReadError> {
+    let order = if matches!(params.spec, super::params::QuerySpec::Instant { .. }) {
+        if super::order::sorted_order_reaches_the_wire(expr) {
+            PartialOrder::AsGiven
+        } else {
+            PartialOrder::Labels
+        }
+    } else {
+        match super::order::range_step_order(expr) {
+            Some(dir) => PartialOrder::StepMajor(dir),
+            None => PartialOrder::Labels,
+        }
+    };
+    truncate_or_refuse(result, opts.partial_at_series_cap, order, warnings)
+}
+
 /// Which [`MAX_QUERY_SERIES`] series a partial result keeps (issue #605).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PartialOrder {
@@ -1563,16 +1589,105 @@ pub enum PartialOrder {
     StepMajor(super::order::SortDir),
 }
 
-/// Issue #605 stub: refuses over the cap whatever `partial` says.
+/// Below the cap, or when `partial` is false, exactly
+/// [`ensure_result_series`]. Over the cap with `partial` set, the first
+/// [`MAX_QUERY_SERIES`] series by `order`, and the reference's
+/// partial-results warning.
+///
+/// **A matrix stops where the reference stops.** The reference walks the
+/// steps admitting new series; at the first step where a new series would
+/// pass the cap it keeps that step's points for the series it holds and
+/// evaluates no later step (`pkg/logql/engine.go:536-591` @ v3.7.4). That
+/// step is the first step of the first series left out, so every kept
+/// series is cut after it.
+///
+/// **Allocates nothing.** The selection is `select_nth_unstable_by`, which
+/// works in place, followed by `truncate`. The result is already held,
+/// and the cap check has already counted it, so there is no new
+/// input-scaled allocation to charge (`docs/architecture.md` §5.6). The
+/// encoder's own label sort then runs over at most the cap.
 pub fn truncate_or_refuse(
     result: QueryResult,
     partial: bool,
     order: PartialOrder,
     warnings: &mut super::warnings::Warnings,
 ) -> Result<QueryResult, ReadError> {
-    let _ = (partial, order, warnings);
-    ensure_result_series(&result)?;
+    let Some(cap) = result_series_breach(&result) else {
+        return Ok(result);
+    };
+    let refuse = || {
+        Err(ReadError::QueryTooBroad(TooBroadReason::MetricSeries {
+            cap,
+        }))
+    };
+    if !partial {
+        return refuse();
+    }
+    let keep = cap as usize;
+    let result = match result {
+        QueryResult::Vector(mut v) => {
+            if order != PartialOrder::AsGiven {
+                v.select_nth_unstable_by(keep, |a, b| a.labels.cmp(&b.labels));
+            }
+            v.truncate(keep);
+            QueryResult::Vector(v)
+        }
+        QueryResult::Matrix(mut m) => {
+            let dir = match order {
+                PartialOrder::StepMajor(dir) => Some(dir),
+                PartialOrder::Labels | PartialOrder::AsGiven => None,
+            };
+            m.select_nth_unstable_by(keep, |a, b| step_major_cmp(a, b, dir));
+            // `m[keep]` is the least series left out: its first step is
+            // where the reference stops.
+            let stop = m[keep].points.first().map(|&(t, _)| t);
+            m.truncate(keep);
+            if let Some(stop) = stop {
+                for series in &mut m {
+                    let n = series.points.partition_point(|&(t, _)| t <= stop);
+                    series.points.truncate(n);
+                }
+            }
+            QueryResult::Matrix(m)
+        }
+        // Histogram shapes are metrics-only; the LogQL engine never
+        // produces them.
+        _ => return refuse(),
+    };
+    warnings.add(super::warnings::series_cap_partial_warning(cap));
     Ok(result)
+}
+
+/// A matrix's admission order: by first step, then, under a sort
+/// (`Some(dir)`), by value there in its direction with NaN last, then by
+/// label set. A series with no point sorts last.
+fn step_major_cmp(
+    a: &MatrixSeries,
+    b: &MatrixSeries,
+    dir: Option<super::order::SortDir>,
+) -> std::cmp::Ordering {
+    let first = |s: &MatrixSeries| s.points.first().copied();
+    match (first(a), first(b)) {
+        (None, None) => a.labels.cmp(&b.labels),
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (Some((ta, va)), Some((tb, vb))) => ta
+            .cmp(&tb)
+            .then_with(|| match dir {
+                None => std::cmp::Ordering::Equal,
+                Some(_) => va.is_nan().cmp(&vb.is_nan()),
+            })
+            .then_with(|| {
+                if dir.is_none() || va.is_nan() {
+                    std::cmp::Ordering::Equal
+                } else if dir == Some(super::order::SortDir::Desc) {
+                    vb.total_cmp(&va)
+                } else {
+                    va.total_cmp(&vb)
+                }
+            })
+            .then_with(|| a.labels.cmp(&b.labels)),
+    }
 }
 
 #[cfg(test)]

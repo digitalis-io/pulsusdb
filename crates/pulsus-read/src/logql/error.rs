@@ -228,7 +228,7 @@ pub enum TooBroadReason {
     /// RETAINED points; the computed reset-aware rate is unaffected below
     /// the cap.
     CounterValues { count: u64, cap: u64 },
-    /// A LogQL metric query's **FINAL result** carried more distinct
+    /// An untagged LogQL metric query's **FINAL result** carried more distinct
     /// series than [`crate::logql::charge::MAX_QUERY_SERIES`] — the
     /// reference's `querier.max-query-series` (grafana/loki v3.7.4,
     /// `pkg/validation/limits.go:373`, default 500), enforced on the whole

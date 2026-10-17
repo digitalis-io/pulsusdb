@@ -262,6 +262,7 @@ pub(crate) async fn tail(
     let encoding_flags: Arc<[String]> = params::encoding_flags(&headers).into();
     let opts = ResponseOptions {
         categorize_labels: params::wants_categorize_labels(&encoding_flags),
+        partial_at_series_cap: false,
     };
     let setup = match engine.tail_setup_with(&p.expr, &qp, opts) {
         Ok(setup) => setup,
