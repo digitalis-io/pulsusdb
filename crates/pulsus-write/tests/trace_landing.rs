@@ -2170,14 +2170,13 @@ fn resource_spans_of(resource: Resource, spans: Vec<Span>) -> ResourceSpans {
 
 /// **W-4 (issue #587 row 6).** A `service.name` that is present-but-empty,
 /// or not a string, round-trips: it stays in `resources.attrs` as the typed
-/// value it was, and it is still **never** a catalog entry.
+/// value it was.
 ///
-/// §3.3's one `continue` becomes two decisions. The `attrs` skip applies
-/// only to a non-empty `StringValue` — the one arm `spans.service` carries
-/// losslessly — and the catalog skip stays **unconditional** at every arm,
-/// which `sql-schema.md` §4.3's tag contract and
-/// `otlp_traces.rs`'s own assertion that `service.name` is *"a column, not
-/// a catalog entry"* both require.
+/// The `attrs` skip applies only to a non-empty `StringValue` — the one arm
+/// `spans.service` carries losslessly. A string `service.name`, empty or
+/// not, is catalogued like any other resource key (issue #598 part 1): one
+/// name row and one `string` value row per distinct value. The catalog rows
+/// of the integer arm are not asserted (the plan's L5).
 ///
 /// **Three values are three resource identities**, so this push stores
 /// three `resources` rows: `service.name` is in the identity buffer and the
@@ -2305,26 +2304,28 @@ async fn w4_a_service_name_that_is_not_a_non_empty_string_round_trips() {
         "the integer arm keeps its integer value"
     );
 
-    // The catalog skip is unconditional: no arm produces a tag row.
+    // A string `service.name` is catalogued: one name row, and one
+    // `string` value row per distinct value, the empty one included.
     assert_eq!(
         live_count(
             &client,
-            "SELECT count() AS n FROM tag_names \
+            "SELECT count() AS n FROM tag_names FINAL \
              WHERE scope = 'resource' AND key = 'service.name'"
         )
         .await,
-        0,
-        "`service.name` is a column, not a catalog entry, at every arm"
+        1,
+        "`service.name` is one catalog name"
     );
     assert_eq!(
-        live_count(
+        live_texts(
             &client,
-            "SELECT count() AS n FROM tag_values \
-             WHERE scope = 'resource' AND key = 'service.name'"
+            "SELECT concat(value, '|', val_type) AS s FROM tag_values FINAL \
+             WHERE scope = 'resource' AND key = 'service.name' AND val_type = 'string' \
+             ORDER BY value"
         )
         .await,
-        0,
-        "and it has no catalog value either"
+        vec!["|string".to_string(), "checkout|string".to_string()],
+        "its two string values are catalogued, typed `string`"
     );
 
     drop_live_db(&db).await;

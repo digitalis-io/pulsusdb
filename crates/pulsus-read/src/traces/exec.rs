@@ -1728,7 +1728,7 @@ impl TraceEngine {
 
     /// Streams the §4.3 tag-names read (issue #58): distinct
     /// `(scope, key)` pairs from the Global tag catalog — only ever
-    /// [`tags_sql::CATALOG_TABLE`](super::tags_sql) (`trace_tag_catalog`,
+    /// [`spans::tags`](super::spans::tags) (`tag_names`,
     /// never `_dist`, never a span/attr table: discovery never scans
     /// payloads, epic #19 AC1).
     /// `scope` is escaped HERE (`ch_string`) before it reaches the pure
@@ -1745,7 +1745,7 @@ impl TraceEngine {
     /// running unbounded.
     pub async fn list_tag_names(&self, scope: Option<&str>) -> Result<TagNames, ReadError> {
         let scope_literal = scope.map(crate::logql::escape::ch_string);
-        let sql = super::tags_sql::tag_names_sql(scope_literal.as_deref(), TAG_NAMES_MAX + 1);
+        let sql = super::spans::tags::tag_names_sql(scope_literal.as_deref(), TAG_NAMES_MAX + 1);
         let settings = catalog_settings(&self.config);
         let mut names = Vec::new();
         // Scoped stream (module convention): the pooled-connection lease
@@ -1803,7 +1803,7 @@ impl TraceEngine {
         let narrowing = req.narrowing();
         let (sql, settings) = if narrowing.is_empty() {
             (
-                super::tags_sql::tag_values_sql(
+                super::spans::tags::tag_values_sql(
                     &key_literal,
                     scope_literal.as_deref(),
                     TAG_VALUES_MAX + 1,

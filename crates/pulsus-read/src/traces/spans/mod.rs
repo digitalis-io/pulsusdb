@@ -21,7 +21,9 @@
 //! * [`numbering`] — the search statement's nested-set intrinsics (issue
 //!   #594 part 2);
 //! * [`metrics`] — the metrics statement (issue #596 part 1): every
-//!   metrics shape but `compare()`, in one statement per request.
+//!   metrics shape but `compare()`, in one statement per request;
+//! * [`tags`] — the two catalog reads of tag discovery (issue #598 part
+//!   1): tag names from `tag_names`, unnarrowed values from `tag_values`.
 
 pub mod attr_index;
 pub mod fetch;
@@ -33,4 +35,5 @@ pub mod projection;
 pub mod rows;
 pub mod search;
 pub mod structural;
+pub mod tags;
 pub mod tracelevel;

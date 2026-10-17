@@ -234,6 +234,7 @@ fn spawn_ready(port: u16, db: &str) -> ChildGuard {
     // does not exist: build it with `schema/schema.sh`" and `/ready` never
     // reaches 200. Idempotent, so repeated spawns cost one no-op render.
     live_db::build_schema_blocking(db);
+    live_db::register_push_target(port, db);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_pulsusdb"));
     cmd.env("PULSUS_HOST", "127.0.0.1")
         .env("PULSUS_PORT", port.to_string())
@@ -271,6 +272,14 @@ fn push(
     )
     .unwrap_or_else(|| panic!("{ctx}: ingest must be reachable"));
     assert_eq!(res.status, 200, "{ctx}: ingest, body {}", res.text());
+    let keys: Vec<(Vec<u8>, Vec<u8>)> = req
+        .resource_spans
+        .iter()
+        .flat_map(|r| r.scope_spans.iter())
+        .flat_map(|s| s.spans.iter())
+        .map(|s| (s.trace_id.clone(), s.span_id.clone()))
+        .collect();
+    live_db::settle_pushed_spans(port, &keys, ctx);
 }
 
 // ---------------------------------------------------------------------
@@ -709,7 +718,7 @@ async fn our_answers_match_the_committed_fixture() {
         &format!(
             "SELECT DISTINCT extract(query, 'key = ''[^'']*''') AS s FROM system.query_log \
              WHERE type = 'QueryFinish' AND current_database = '{db}' \
-               AND query LIKE '%trace_tag_catalog%' \
+               AND query LIKE '%FROM tag_values%' \
                AND event_time_microseconds >= toDateTime64('{since}', 6)"
         ),
     )

@@ -449,7 +449,7 @@ that costs 75% of the storage.**
 And the request that reads it already computes a window and throws it away. The
 values route parses `start`/`end`, defaulting to `traceql_tag_lookback` = 24 h
 (`crates/pulsus-config/src/model.rs:553`, `crates/pulsus-server/src/traces_api/tags.rs:161-164`), then calls
-`tag_values_sql` (`crates/pulsus-read/src/traces/tags_sql.rs:119-128`), which emits no time predicate at all —
+`tag_values_sql` (`crates/pulsus-read/src/traces/spans/tags.rs:52-62`), which emits no time predicate at all —
 because the table it reads has no time column.
 
 ### 2.4 The narrowed dropdown is a join over the window

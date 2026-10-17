@@ -1583,8 +1583,7 @@ async fn the_insert_omits_event_id_so_the_server_fills_it() {
 }
 
 /// A key whose value no JSON path can hold is listed in `tag_names` and has
-/// no value in `tag_values`, and a composite key's leaf paths each get their
-/// own name row.
+/// no value in `tag_values`.
 ///
 /// That is the disagreement `docs/api.md` §4.3's two halves carry for a
 /// composite key: the name is listed, the value is not.
@@ -1622,11 +1621,10 @@ async fn a_composite_key_is_named_and_its_value_is_not() {
         named,
         vec![
             "composite".to_string(),
-            "composite.a.b".to_string(),
             "opaque".to_string(),
             "plain".to_string(),
         ],
-        "every key the push carried is named, the composite's leaf included"
+        "every top-level key the push carried is named, and no composite leaf"
     );
 
     let valued = texts(
@@ -3222,6 +3220,86 @@ async fn w3_a_kvlist_with_an_unstorable_leaf_at_any_depth_moves_whole() {
         .await,
         vec!["k".to_string(), "k.a.deep".to_string()],
         "two keys: the attribute's own and the separate flat one"
+    );
+
+    drop_db(&db).await;
+}
+
+/// Issue #598 part 1: one push names a key in each of the five attribute
+/// scopes, and the resource's string `service.name` is catalogued like any
+/// other resource key: one name row and one `string` value row.
+#[tokio::test]
+async fn the_catalogs_carry_all_five_scopes_and_the_service_name() {
+    skip_unless_live!();
+    let (client, db) = fresh_db(pulsus_testkit::test_db("pulsus_trace_rows_it_five_scopes")).await;
+
+    let scope = InstrumentationScope {
+        name: "lib".to_string(),
+        version: String::new(),
+        attributes: vec![kv("otel.scope.build", str_value("release"))],
+        dropped_attributes_count: 0,
+    };
+    let mut span = span_with(0x95, 0x95, vec![kv("k", str_value("s"))]);
+    span.events = vec![span::Event {
+        time_unix_nano: span.start_time_unix_nano,
+        name: "e".to_string(),
+        attributes: vec![kv("e", str_value("x"))],
+        dropped_attributes_count: 0,
+    }];
+    span.links = vec![span::Link {
+        trace_id: vec![0x11; 16],
+        span_id: vec![0x22; 8],
+        trace_state: String::new(),
+        attributes: vec![kv("l", str_value("y"))],
+        dropped_attributes_count: 0,
+        flags: 0,
+    }];
+    land(
+        &client,
+        &request_with(
+            "checkout",
+            vec![kv("host.name", str_value("a"))],
+            vec![span],
+            Some(scope),
+            "",
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        texts(
+            &client,
+            "SELECT scope AS s FROM tag_names FINAL GROUP BY scope ORDER BY scope",
+        )
+        .await,
+        vec![
+            "event".to_string(),
+            "instrumentation".to_string(),
+            "link".to_string(),
+            "resource".to_string(),
+            "span".to_string(),
+        ],
+        "every attribute scope is named"
+    );
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count() AS n FROM tag_names FINAL \
+             WHERE scope = 'resource' AND key = 'service.name'",
+        )
+        .await,
+        1,
+        "the string service.name is one catalog name"
+    );
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count() AS n FROM tag_values FINAL WHERE scope = 'resource' \
+             AND key = 'service.name' AND value = 'checkout' AND val_type = 'string'",
+        )
+        .await,
+        1,
+        "and its value one `string` value row"
     );
 
     drop_db(&db).await;
