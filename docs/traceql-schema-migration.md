@@ -449,14 +449,14 @@ that costs 75% of the storage.**
 And the request that reads it already computes a window and throws it away. The
 values route parses `start`/`end`, defaulting to `traceql_tag_lookback` = 24 h
 (`crates/pulsus-config/src/model.rs:553`, `crates/pulsus-server/src/traces_api/tags.rs:161-164`), then calls
-`tag_values_sql` (`crates/pulsus-read/src/traces/spans/tags.rs:52-62`), which emits no time predicate at all —
+`tag_values_sql` (`crates/pulsus-read/src/traces/spans/tags.rs:60-70`), which emits no time predicate at all —
 because the table it reads has no time column.
 
 ### 2.4 The narrowed dropdown is a join over the window
 
 Open a tag-value dropdown while a service filter is set and the read becomes a
 semi-join between the two tables at **day** grain
-(`crates/pulsus-read/src/traces/tags_sql.rs:283-313`, chosen at `crates/pulsus-read/src/traces/exec.rs:1787-1818`):
+(`crates/pulsus-read/src/traces/tags_sql.rs:283-313`, chosen at `crates/pulsus-read/src/traces/exec.rs:1787-1818` @ d7af710e):
 
 ```sql
 SELECT DISTINCT val, val_type
@@ -2319,7 +2319,7 @@ Three aggregate conditions are pushed into the candidate generator today
 Losing a pushdown does not change an answer. The condition is re-evaluated over
 the hydrated spans either way; the pushed form only narrows the candidate list,
 and the plan already keeps a byte-for-byte fallback statement with nothing pushed
-(`crates/pulsus-read/src/traces/search_plan.rs:3084-3104`, used at `crates/pulsus-read/src/traces/exec.rs:2051-2079`). The effect is more
+(`crates/pulsus-read/src/traces/search_plan.rs:3084-3104`, used at `crates/pulsus-read/src/traces/exec.rs:2049-2077`). The effect is more
 candidates, not a different result.
 
 `by()` grouping already refuses to push whenever the generator is not
@@ -4493,19 +4493,19 @@ The image line (`:571`) is shown at today's floor; the source quoted here pinned
   122  pub const MAX_SPANS_PER_TRACE: usize = 10_000;
 ```
 
-**`:76-76`**
+**`:80-80`**
 
 ```rust
   130  pub const TAG_NAMES_MAX: usize = 10_000;
 ```
 
-**`:81-81`**
+**`:85-85`**
 
 ```rust
   135  pub const TAG_VALUES_MAX: usize = 1_000;
 ```
 
-**`:1795-1836`**  (42 lines in the range; comments and blanks elided, 30 shown)
+**`:1795-1836` @ d7af710e**  (42 lines in the range; comments and blanks elided, 30 shown)
 
 ```rust
  1825      pub async fn list_tag_values(
