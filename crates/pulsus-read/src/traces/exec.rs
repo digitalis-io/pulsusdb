@@ -2655,6 +2655,138 @@ fn compare_total_series_key(series: &TraceMetricSeries) -> Option<(&str, &str)> 
     Some((kind, key.key.as_str()))
 }
 
+/// Frames the `compare()` statement's rows (issue #597): the kept values,
+/// typed by their stored type; per key and side the denominators (D9) — for
+/// a key of [`WELL_KNOWN_COMPARE_KEYS`] `<side>_total` the side's
+/// population and `key=nil` the spans without the key, for any other key
+/// `<side>_total` the key's untrimmed sum and no `key=nil`; a well-known key
+/// no span carries as `nil` and total the population. All-zero series are
+/// dropped and, on a range, every series densified to the axis; then each
+/// key's exemplars go onto its side's total at their bucket, thinned to the
+/// budget over the whole answer.
+///
+/// [`WELL_KNOWN_COMPARE_KEYS`]: super::metrics_plan::WELL_KNOWN_COMPARE_KEYS
+fn frame_compare_rows(
+    plan: &TraceMetricsPlan,
+    rows: Vec<super::spans::metrics::CompareStatementRow>,
+    axis: Option<super::metrics_plan::RangeAxis>,
+) -> Result<TraceMetricsResult, ReadError> {
+    const SIDES: [&str; 2] = ["baseline", "selection"];
+    const TOTALS: [&str; 2] = ["baseline_total", "selection_total"];
+    let side = |s: u8| usize::from(s.min(1));
+    // Per side: the population and each key's untrimmed sums, per bucket.
+    let mut population: [BTreeMap<i64, u64>; 2] = [BTreeMap::new(), BTreeMap::new()];
+    let mut sums: BTreeMap<String, [BTreeMap<i64, u64>; 2]> = BTreeMap::new();
+    let mut exemplars: Vec<(usize, String, Vec<(i64, ([u8; 16], i64))>)> = Vec::new();
+    let mut values: BTreeMap<String, Vec<TraceMetricSeries>> = BTreeMap::new();
+    for row in rows {
+        let at = side(row.s);
+        if row.g == 1 && row.k.is_empty() {
+            population[at].extend(row.pts.iter().copied());
+        } else if row.g == 1 {
+            sums.entry(row.k.clone()).or_default()[at].extend(row.pts.iter().copied());
+            if !row.ex.is_empty() {
+                exemplars.push((at, row.k, row.ex));
+            }
+        } else {
+            let value = metrics_statement::typed_value(&row.v, &row.y)?;
+            values
+                .entry(row.k.clone())
+                .or_default()
+                .push(TraceMetricSeries {
+                    labels: vec![
+                        MetricLabel::str("__meta_type", SIDES[at]),
+                        MetricLabel { key: row.k, value },
+                    ],
+                    samples: row.pts.iter().map(|&(t, n)| (t, n as f64)).collect(),
+                    exemplars: Vec::new(),
+                });
+        }
+    }
+    let well_known = super::metrics_plan::WELL_KNOWN_COMPARE_KEYS;
+    let mut keys: BTreeSet<String> = sums.keys().cloned().collect();
+    keys.extend(well_known.iter().map(|k| k.to_string()));
+    let empty: [BTreeMap<i64, u64>; 2] = [BTreeMap::new(), BTreeMap::new()];
+    let mut series: Vec<TraceMetricSeries> = Vec::new();
+    for key in &keys {
+        series.extend(values.remove(key).unwrap_or_default());
+        let of_key = sums.get(key).unwrap_or(&empty);
+        let nil_label = |meta: &str| {
+            vec![
+                MetricLabel::str("__meta_type", meta),
+                MetricLabel::str(key.clone(), "nil"),
+            ]
+        };
+        let known = well_known.contains(&key.as_str());
+        if known {
+            for at in 0..2 {
+                series.push(TraceMetricSeries {
+                    labels: nil_label(SIDES[at]),
+                    samples: population[at]
+                        .iter()
+                        .map(|(&t, &n)| {
+                            let carried = of_key[at].get(&t).copied().unwrap_or(0);
+                            (t, n.saturating_sub(carried) as f64)
+                        })
+                        .collect(),
+                    exemplars: Vec::new(),
+                });
+            }
+        }
+        for at in 0..2 {
+            let total = if known { &population[at] } else { &of_key[at] };
+            series.push(TraceMetricSeries {
+                labels: nil_label(TOTALS[at]),
+                samples: total.iter().map(|(&t, &n)| (t, n as f64)).collect(),
+                exemplars: Vec::new(),
+            });
+        }
+    }
+    series.retain(|s| s.samples.iter().any(|(_, v)| *v != 0.0));
+    let mut result = TraceMetricsResult { series };
+    let Some(axis) = axis else {
+        return Ok(result);
+    };
+    for s in &mut result.series {
+        densify(s, axis);
+    }
+    if plan.exemplar_budget() == 0 || exemplars.is_empty() {
+        return Ok(result);
+    }
+    let value_at: Vec<BTreeMap<i64, f64>> = result
+        .series
+        .iter()
+        .map(|s| s.samples.iter().copied().collect())
+        .collect();
+    let index: HashMap<(&str, &str), usize> = result
+        .series
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| compare_total_series_key(s).map(|k| (k, i)))
+        .collect();
+    let mut collected: Vec<(usize, MetricExemplar)> = Vec::new();
+    for (at, key, ex) in &exemplars {
+        let Some(&i) = index.get(&(TOTALS[*at], key.as_str())) else {
+            continue;
+        };
+        for &(t, (trace_id, start_ns)) in ex {
+            push_bucket_exemplars(
+                &mut collected,
+                i,
+                &value_at[i],
+                t,
+                vec![(trace_id, start_ns)],
+            );
+            decimate_if_full(&mut collected);
+        }
+    }
+    thin_collected_exemplars(&mut collected, plan.exemplar_budget());
+    for (i, ex) in collected {
+        result.series[i].exemplars.push(ex);
+    }
+    Ok(result)
+}
+
 /// The ceiling on the IN-FLIGHT exemplar list, before the final thinning
 /// (issue #477 wave 2).
 ///
