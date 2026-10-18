@@ -688,18 +688,17 @@ async fn a_stopped_tag_read_is_the_newest_on_every_shard() {
             .collect::<Vec<_>>(),
         ["op.new-a", "op.new-b"]
     );
-    for shard in [&shard1, &shard2] {
-        exec(shard, "SYSTEM FLUSH LOGS").await;
-        let remote = count(
-            shard,
-            &format!(
-                "SELECT count() AS n FROM system.query_log WHERE type = 'QueryFinish' \
-                 AND is_initial_query = 0 AND startsWith(initial_query_id, '{prefix}-')"
-            ),
-        )
-        .await;
-        assert!(remote > 0, "every shard read its own part: {remote}");
-    }
+    // Shard1's read is proven by the answer: `/new-a` and `op.new-a` are stored only there.
+    exec(&shard2, "SYSTEM FLUSH LOGS").await;
+    let remote = count(
+        &shard2,
+        &format!(
+            "SELECT count() AS n FROM system.query_log WHERE type = 'QueryFinish' \
+             AND is_initial_query = 0 AND startsWith(initial_query_id, '{prefix}-')"
+        ),
+    )
+    .await;
+    assert!(remote > 0, "the read reached shard2: {remote}");
 
     // The trace-level condition, over the per-trace table of both shards.
     land(
