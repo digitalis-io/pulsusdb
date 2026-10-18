@@ -16,6 +16,7 @@ crates/pulsus-read/src/traces/search_eval.rs
 crates/pulsus-read/src/traces/search_plan.rs
 crates/pulsus-read/src/traces/search_sql.rs
 crates/pulsus-read/src/traces/sql.rs
+crates/pulsus-read/src/traces/tags_sql.rs
 crates/pulsus-read/tests/golden/traces_search/existence_absent.sql
 crates/pulsus-read/tests/golden/traces_search/status_only.sql
 crates/pulsus-read/tests/golden/traces_search/val_num_range.sql
