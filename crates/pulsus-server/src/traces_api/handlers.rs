@@ -54,7 +54,7 @@ pub(super) async fn engine_for(state: &AppState) -> Result<TraceEngine, ApiError
     // Issue #114: the consistency-config invariant is already enforced at
     // config load, so this is unreachable in the real binary; a failure maps
     // to the existing 503 "not serving" semantics.
-    chconfig::trace_engine(pool, &state.config)
+    chconfig::trace_engine(pool, &state.config, state.graph_target.clone())
         .map(crate::request_id::tag)
         .map_err(|_| ApiError::PoolUnavailable)
 }
@@ -313,6 +313,7 @@ mod tests {
             metric_writer: Arc::new(MetricWriterSink::new(Arc::new(std::sync::OnceLock::new()))),
             trace_writer: Arc::new(TraceWriterSink::new(Arc::new(std::sync::OnceLock::new()))),
             label_cache: Arc::new(std::sync::OnceLock::new()),
+            graph_target: pulsus_read::GraphTargetCache::default(),
             eval_gate: Arc::new(pulsus_read::EvalGate::new(
                 pulsus_config::Config::default()
                     .reader

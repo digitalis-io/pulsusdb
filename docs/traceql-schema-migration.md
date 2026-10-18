@@ -2319,7 +2319,7 @@ Three aggregate conditions are pushed into the candidate generator today
 Losing a pushdown does not change an answer. The condition is re-evaluated over
 the hydrated spans either way; the pushed form only narrows the candidate list,
 and the plan already keeps a byte-for-byte fallback statement with nothing pushed
-(`crates/pulsus-read/src/traces/search_plan.rs:3084-3104`, used at `crates/pulsus-read/src/traces/exec.rs:2049-2077`). The effect is more
+(`crates/pulsus-read/src/traces/search_plan.rs:3084-3104`, used at `crates/pulsus-read/src/traces/exec.rs:2153-2181`). The effect is more
 candidates, not a different result.
 
 `by()` grouping already refuses to push whenever the generator is not

@@ -243,6 +243,13 @@ pub struct GraphEdgeRow {
     pub quantiles_ns: Vec<f64>,
 }
 
+/// The routing table's definition, the one column of
+/// [`crate::traces::spans::graph::graph_target_sql`] (issue #599).
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct GraphTargetRow {
+    pub engine_full: String,
+}
+
 /// One `trace_tag_catalog` row of the §4.3 tag-names read
 /// (`tags_sql::tag_names_sql` — `SELECT DISTINCT scope, key`, issue #58).
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]

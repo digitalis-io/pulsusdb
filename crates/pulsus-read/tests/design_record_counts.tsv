@@ -7,14 +7,14 @@ traceql_pipeline_stage_variants	docs/query-lowering.md	** variants; all	are belo
 logql_stage_variants	docs/query-to-sql.md	### 1.2 LogQL — the	stage kinds	word	264
 logql_stage_variants	docs/query-to-sql.md	`Stage` has exactly	variants	word	266
 logql_stage_variants	docs/query-lowering.md	no validation. #### The	`Stage` variants, each as a `Pipe` link	word	1743
-never_reason_variants	docs/query-lowering.md	`NeverReason` has exactly **	** variants	word	5457
-lql_link_variants	docs/query-lowering.md	`LqlLink` has exactly **	** variants	digits	5287
-cut_variants	docs/query-lowering.md	every continuation naming a cut names one of the	|	word	5293
+never_reason_variants	docs/query-lowering.md	`NeverReason` has exactly **	** variants	word	5461
+lql_link_variants	docs/query-lowering.md	`LqlLink` has exactly **	** variants	digits	5291
+cut_variants	docs/query-lowering.md	every continuation naming a cut names one of the	|	word	5297
 logql_stage_variants	docs/query-lowering.md	reason — a `find_map` over the	stage variants	word	49
 cut_variants	docs/query-lowering.md	§2.7 is the plan object and the	**cuts** that are the only ways	word	19
-section_3_1_effect_rows	docs/query-lowering.md	| §3.1 carries exactly **	** rows with a residual state effect	digits	5288
-section_3_1_effect_rows	docs/query-lowering.md	tables: **	** in §3.1 (`Structural`	digits	5085
-section_3_1_rows_without_effect	docs/query-lowering.md	** rows with a residual state effect and **	** without; §7.1 carries exactly	digits	5288
-section_7_1_effect_rows	docs/query-lowering.md	** without; §7.1 carries exactly **	** and **	digits	5288
-section_7_1_rows_without_effect	docs/query-lowering.md	§7.1 carries exactly **20** and **	** —	digits	5288
-residual_effects_total	docs/query-lowering.md	`LabelReplace`, `Order`, `Limit`, `Emit`) — **	** effects in all	digits	5089
+section_3_1_effect_rows	docs/query-lowering.md	| §3.1 carries exactly **	** rows with a residual state effect	digits	5292
+section_3_1_effect_rows	docs/query-lowering.md	tables: **	** in §3.1 (`Structural`	digits	5089
+section_3_1_rows_without_effect	docs/query-lowering.md	** rows with a residual state effect and **	** without; §7.1 carries exactly	digits	5292
+section_7_1_effect_rows	docs/query-lowering.md	** without; §7.1 carries exactly **	** and **	digits	5292
+section_7_1_rows_without_effect	docs/query-lowering.md	§7.1 carries exactly **20** and **	** —	digits	5292
+residual_effects_total	docs/query-lowering.md	`LabelReplace`, `Order`, `Limit`, `Emit`) — **	** effects in all	digits	5093

@@ -54,7 +54,7 @@ use super::spans::rows::{
 };
 
 use super::rows::{
-    CompareCrossTabRow, CompareTotalsRow, GraphEdgeRow, MetricAggGroupInstantRow,
+    CompareCrossTabRow, CompareTotalsRow, GraphEdgeRow, GraphTargetRow, MetricAggGroupInstantRow,
     MetricAggGroupRow, MetricAggInstantRow, MetricAggRow, MetricBucketRow,
     MetricCompareExemplarRow, MetricCountRow, MetricExemplarRow, MetricGroupCountInstantRow,
     MetricGroupCountRow, MetricGroupExemplarRow, MetricLog2BucketInstantRow, MetricLog2BucketRow,
@@ -365,7 +365,35 @@ pub struct GraphTarget {
 /// The [`GraphTarget`] a routing table's `system.tables.engine_full`
 /// names: `Distributed('<cluster>', '<database>', …)`, both arguments
 /// quoted, as the server writes them. `None` for anything else.
-pub fn graph_target_from_engine(_engine_full: &str) -> Option<GraphTarget> {
+pub fn graph_target_from_engine(engine_full: &str) -> Option<GraphTarget> {
+    let rest = engine_full.strip_prefix("Distributed(")?;
+    let (cluster, rest) = quoted_argument(rest)?;
+    let rest = rest.strip_prefix(", ")?;
+    let (database, rest) = quoted_argument(rest)?;
+    if !(rest.starts_with(',') || rest.starts_with(')')) {
+        return None;
+    }
+    Some(GraphTarget { cluster, database })
+}
+
+/// The single-quoted literal `s` starts with, unescaped, and what follows
+/// it; `None` when `s` does not start with one or it is empty.
+fn quoted_argument(s: &str) -> Option<(String, &str)> {
+    let body = s.strip_prefix('\'')?;
+    let mut out = String::new();
+    let mut chars = body.char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\\' => out.push(chars.next()?.1),
+            '\'' => {
+                if out.is_empty() {
+                    return None;
+                }
+                return Some((out, &body[i + 1..]));
+            }
+            other => out.push(other),
+        }
+    }
     None
 }
 
@@ -1651,8 +1679,13 @@ impl TraceEngine {
     /// `OPTIMIZE ... FINAL`.
     pub async fn service_graph(&self, window: GraphWindow) -> Result<ServiceGraph, ReadError> {
         let cap = graph_sql::SERVICE_GRAPH_MAX_EDGES;
-        let sql = graph_sql::service_graph_sql(window, &self.config.edges_table, cap);
         let settings = graph_settings(&self.config);
+        let target = if self.config.distributed {
+            Some(self.graph_target(&settings).await?)
+        } else {
+            None
+        };
+        let sql = super::spans::graph::spans_graph_sql(window, target, cap);
         let mut edges: Vec<GraphEdgeRow> = Vec::new();
         // Scoped stream (module convention): the pooled-connection lease
         // drops at return, after full consumption (≤ cap + 1 rows by the SQL
@@ -1669,6 +1702,41 @@ impl TraceEngine {
         let truncated = edges.len() as u64 > cap;
         edges.truncate(cap as usize);
         Ok(ServiceGraph { edges, truncated })
+    }
+
+    /// The clustered service graph's [`GraphTarget`] (issue #599): read
+    /// from the routing table's definition on the first call in the
+    /// process, under the request's id and settings, and kept in the
+    /// shared [`GraphTargetCache`]. A definition that names no target fails
+    /// the request and keeps nothing, so the next call reads it again.
+    async fn graph_target(&self, settings: &QuerySettings) -> Result<&GraphTarget, ReadError> {
+        self.graph_target
+            .0
+            .get_or_try_init(|| async {
+                let table = &self.config.spans_v2_table;
+                let sql = super::spans::graph::graph_target_sql(table);
+                let mut stream = self
+                    .dispatch
+                    .query_stream::<GraphTargetRow, _>(&sql, settings, |e| {
+                        map_trace_read_error(e, &self.config)
+                    })
+                    .await?;
+                let mut definition = None;
+                while let Some(row) = stream.next().await {
+                    let row = row.map_err(|e| map_trace_read_error(e, &self.config))?;
+                    definition.get_or_insert(row.engine_full);
+                }
+                definition
+                    .as_deref()
+                    .and_then(graph_target_from_engine)
+                    .ok_or_else(|| {
+                        ReadError::Clickhouse(super::spans::graph::no_graph_target(
+                            table,
+                            definition.as_deref(),
+                        ))
+                    })
+            })
+            .await
     }
 
     /// Fetches one trace from the span, per-trace and resource tables

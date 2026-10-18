@@ -147,6 +147,7 @@ pub async fn run(config: Config) -> ExitCode {
         metric_writer: Arc::new(MetricWriterSink::new(Arc::clone(&metric_writer_slot))),
         trace_writer: Arc::new(TraceWriterSink::new(Arc::clone(&trace_writer_slot))),
         label_cache: Arc::clone(&label_cache_slot),
+        graph_target: pulsus_read::GraphTargetCache::default(),
         eval_gate: Arc::new(pulsus_read::EvalGate::new(
             config.reader.query_eval_concurrency,
         )),
@@ -905,6 +906,7 @@ mod tests {
             metric_writer: Arc::new(MetricWriterSink::new(Arc::new(OnceLock::new()))),
             trace_writer: Arc::new(TraceWriterSink::new(Arc::new(OnceLock::new()))),
             label_cache: Arc::new(OnceLock::new()),
+            graph_target: pulsus_read::GraphTargetCache::default(),
             eval_gate: Arc::new(pulsus_read::EvalGate::new(
                 config.reader.query_eval_concurrency,
             )),

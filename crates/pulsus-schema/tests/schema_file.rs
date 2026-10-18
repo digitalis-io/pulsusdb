@@ -49,16 +49,16 @@ fn repo_root() -> std::path::PathBuf {
         .expect("the crate directory resolves")
 }
 
-/// The inventory, single-node: one database, 26 tables, 21 views, and
+/// The inventory, single-node: one database, 27 tables, 22 views, and
 /// nothing else. No `Replicated*` engine, no `Distributed` wrapper, no `ON
 /// CLUSTER`.
 #[test]
 fn the_single_node_render_is_the_whole_inventory_with_every_token_resolved() {
     let stmts = rendered_statements(&single());
-    assert_eq!(stmts.len(), 48, "statement count");
+    assert_eq!(stmts.len(), 50, "statement count");
     assert_eq!(starting_with(&stmts, "CREATE DATABASE"), 1);
-    assert_eq!(starting_with(&stmts, "CREATE TABLE"), 26);
-    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 21);
+    assert_eq!(starting_with(&stmts, "CREATE TABLE"), 27);
+    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 22);
 
     let text = rendered(&single());
     assert!(
@@ -92,13 +92,13 @@ fn the_single_node_render_is_the_whole_inventory_with_every_token_resolved() {
 #[test]
 fn the_clustered_render_adds_the_wrappers_and_keeps_the_server_macros() {
     let stmts = rendered_statements(&clustered());
-    assert_eq!(stmts.len(), 65, "statement count");
+    assert_eq!(stmts.len(), 67, "statement count");
     assert_eq!(
         starting_with(&stmts, "CREATE TABLE"),
-        43,
-        "26 tables + 17 wrappers"
+        44,
+        "27 tables + 17 wrappers"
     );
-    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 21);
+    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 22);
 
     let text = rendered(&clustered());
     assert!(
@@ -107,19 +107,19 @@ fn the_clustered_render_adds_the_wrappers_and_keeps_the_server_macros() {
     );
     assert_eq!(
         text.matches("ON CLUSTER 'prod'").count(),
-        65,
+        67,
         "every statement carries ON CLUSTER"
     );
 
     // `{shard}` and `{replica}` are the server's own macros and must arrive
-    // literally. 21 tables take a per-shard replica set and 5 take the
-    // cluster-wide one, so 26 paths name `{replica}` and 21 name `{shard}`.
+    // literally. 22 tables take a per-shard replica set and 5 take the
+    // cluster-wide one, so 27 paths name `{replica}` and 22 name `{shard}`.
     assert_eq!(
         text.matches("{shard}").count(),
-        21,
+        22,
         "per-shard replica sets"
     );
-    assert_eq!(text.matches("{replica}").count(), 26, "replicated tables");
+    assert_eq!(text.matches("{replica}").count(), 27, "replicated tables");
     assert_eq!(
         text.matches("/clickhouse/tables/all/").count(),
         5,
@@ -178,7 +178,7 @@ fn every_replication_path_names_the_table_of_its_own_create() {
             checked += 1;
         }
     }
-    assert_eq!(checked, 26, "every replicated table's path was checked");
+    assert_eq!(checked, 27, "every replicated table's path was checked");
 }
 
 /// The splitter the script relies on: a statement ends at a line whose last
@@ -357,7 +357,7 @@ fn the_storage_policy_renders_into_every_table_and_no_wrapper_or_view() {
             assert!(!has, "the storage policy reached a wrapper or a view: {s}");
         }
     }
-    assert_eq!(on_tables, 26);
+    assert_eq!(on_tables, 27);
 
     assert!(
         !rendered(&clustered()).contains("storage_policy"),
@@ -737,8 +737,9 @@ fn the_wrapper_sentences_name_every_table_without_a_routing_sibling() {
     let no_wrapper = tables_without_a_wrapper();
     assert_eq!(
         no_wrapper.len(),
-        9,
-        "three landing tables, the label values and five cluster-wide ones: {no_wrapper:?}"
+        10,
+        "three landing tables, the label values, `service_edges` and five cluster-wide ones: \
+         {no_wrapper:?}"
     );
     let all = tables();
     let wrapped: Vec<&String> = all.iter().filter(|t| t.wrapper).map(|t| &t.name).collect();
@@ -808,14 +809,18 @@ fn the_trace_sharding_key_passage_names_every_routed_trace_table() {
     }
 }
 
-/// **The three landing tables and `metric_label_values` are the only
-/// per-shard tables with no routing wrapper.** The label values are named
-/// locally inside every statement that reads them (issue #635). Four passages across three documents restrict their claim to
+/// **The three landing tables, `metric_label_values` and `service_edges`
+/// are the only per-shard tables with no routing wrapper.** The label
+/// values are named locally inside every statement that reads them (issue
+/// #635); `service_edges` is read only per shard, through `cluster(…,
+/// view(…))`, by the one statement that also pairs that shard's spans
+/// (issue #599, part A D9). Four passages across three documents restrict their claim to
 /// per-shard tables, and this is the fact that restriction rests on: a
 /// per-shard table added without a wrapper makes all four false at once,
 /// and reddens here rather than in a document nobody reads.
 #[test]
-fn only_the_landing_tables_and_the_label_values_are_per_shard_without_a_wrapper() {
+fn only_the_landing_tables_the_label_values_and_the_service_edges_are_per_shard_without_a_wrapper()
+{
     let cluster_wide: Vec<String> = tables()
         .into_iter()
         .filter(|t| t.cluster_wide)
@@ -832,10 +837,12 @@ fn only_the_landing_tables_and_the_label_values_are_per_shard_without_a_wrapper(
             "log_landing",
             "metric_label_values",
             "metric_landing",
+            "service_edges",
             "trace_landing"
         ],
         "a per-shard table with no routing wrapper that is not a landing \
-         table or the label values falsifies the clustering claim in docs/architecture.md §7, \
+         table, the label values or `service_edges` (read only per shard, issue #599 part A \
+         D9) falsifies the clustering claim in docs/architecture.md §7, \
          docs/schemas.md §7, docs/schemas.md's conventions preamble and \
          docs/features.md's clustering row"
     );

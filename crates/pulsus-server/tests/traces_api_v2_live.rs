@@ -6858,19 +6858,35 @@ async fn the_edge_job_covers_every_bucket_once() {
     let markers = markers(&client).await;
     assert_markers_every_bucket(&markers, l - 36 * MINUTE, newest, "M1");
     ch_exec(&client, "SYSTEM FLUSH LOGS").await;
+    // `TRUNCATE` logs empty covering parts as `NewPart` too; a run's part
+    // always holds at least its marker.
     let parts = ch_count(
         &client,
         &format!(
             "SELECT count() AS n FROM system.part_log WHERE database = currentDatabase() \
-             AND table = 'service_edges' AND event_type = 'NewPart' \
+             AND table = 'service_edges' AND event_type = 'NewPart' AND rows > 0 \
              AND event_time_microseconds >= toDateTime64('{since}', 6)"
         ),
     )
     .await;
+    let log = client
+        .query_strings(
+            &format!(
+                "SELECT concat(toString(event_time_microseconds), ' ', part_name, ' ', \
+                 toString(rows)) AS s FROM system.part_log WHERE database = currentDatabase() \
+                 AND table = 'service_edges' AND event_type = 'NewPart' AND rows > 0 \
+                 AND event_time_microseconds >= toDateTime64('{since}', 6) \
+                 ORDER BY event_time_microseconds"
+            ),
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("read part_log");
     assert_eq!(
         parts,
         markers.len() as u64,
-        "M1: one new part per marker (the test's own marker and one per run): {markers:?}"
+        "M1: one new part per marker (the test's own marker and one per run): {markers:?}, \
+         parts since {since}: {log:?}"
     );
     assert_no_key_twice(&client, "M1").await;
     drop_the_spans(&client).await;
@@ -7383,7 +7399,7 @@ async fn the_job_pairs_a_missing_bucket_first() {
         &client,
         &format!(
             "SELECT part_name AS s FROM system.part_log WHERE database = currentDatabase() \
-             AND table = 'service_edges' AND event_type = 'NewPart' \
+             AND table = 'service_edges' AND event_type = 'NewPart' AND rows > 0 \
              AND event_time_microseconds >= toDateTime64('{since}', 6) \
              ORDER BY event_time_microseconds LIMIT 1"
         ),
