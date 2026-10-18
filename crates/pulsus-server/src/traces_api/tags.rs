@@ -386,7 +386,7 @@ mod tests {
     #[test]
     fn the_lookback_is_read_from_the_configuration() {
         let state = test_state();
-        assert_eq!(tag_lookback_ns(&state), 24 * 3_600 * 1_000_000_000);
+        assert_eq!(tag_lookback_ns(&state), 20 * 60 * 1_000_000_000);
     }
 
     // ---- criterion 12: every range fault rejects on every §4.3 route --

@@ -1450,7 +1450,7 @@ when we are asking it to slow down, so we keep `429`; recorded as
      ungrouped **aggregation** or **quantile** over an empty window we emit
      one series whose zero `value` is protojson-omitted, where the reference
      emits no series. Our `PlanKind::Agg` instant arm folds an absent row to
-     `0.0` (`crates/pulsus-read/src/traces/exec.rs:1495-1508`, "an empty
+     `0.0` (`crates/pulsus-read/src/traces/exec.rs:1512-1525`, "an empty
      aggregate window is a 0-valued sample"), and the reference drops a
      series with no samples
      (`modules/frontend/metrics_query_handler.go:193-196` @ v3.0.2). This is
@@ -2037,7 +2037,7 @@ when we are asking it to slow down, so we keep `429`; recorded as
   layer, by the HTTP transport, and neither is a shape an editor emits:
   raw invalid UTF-8 in the request target is `400`, and a `q` past the
   64 KiB request-target bound is refused `414`/`431`. Both are bounded and measured in
-  `crates/pulsus-read/src/traces/tag_narrow.rs`'s module doc and pinned
+  `crates/pulsus-read/src/traces/spans/tags.rs`' module doc and pinned
   by `the_q_tolerance_stops_at_input_that_is_not_well_formed`; the
   reference was not probed for either, so no parity claim is made about
   them.) What differs is the ANSWER. We drop the
@@ -2061,25 +2061,27 @@ when we are asking it to slow down, so we keep `429`; recorded as
   (the oracle leg replays the reference side) and
   `crates/pulsus-server/tests/traces_tag_values_narrow_live.rs` (ours).
 
-### `traceql-tag-values-q-partial-pushdown` (issue #478) — **we push the `&&` spine only, so an `||` widens**
+### `traceql-tag-values-q-partial-pushdown` (issue #478) — **conjuncts are compiled whole; only those not testable on one span drop**
 
 - **Route.** `GET /api/traces/v1/tag/{tag}/values` and
   `GET /api/v2/search/tag/{tag}/values`.
 
-- **What.** Only positive conjuncts on the root filter's `&&` spine are
-  pushed into the value read. A `||` subtree, a `!`, a negated attribute
-  condition, a structural root (`{a} >> {b}`), a pipeline stage and
-  anything past the eighth term are DROPPED — every drop widens, because
-  a conjunction with a conjunct removed matches a superset. The reference
-  narrows on the `||` case; we return the full list.
+- **What.** Each conjunct on the root filter's `&&` spine is compiled
+  whole, so a `||` subtree, a `!` and a negated condition narrow the
+  value read. A trace-level condition (`traceDuration`, `rootName`,
+  `rootServiceName`) narrows through the per-trace table. Dropped are a
+  structural root (`{a} >> {b}`), a pipeline stage, a conjunct on
+  `span:childCount`, the nested-set numbering or a per-trace operand
+  value, and conjuncts past the eighth — every drop widens, because a
+  conjunction with a conjunct removed matches a superset.
 
-- **Cases.** `Q-W`.
+- **Cases.** none: `Q-W` now agrees.
 
 - **Disposition.** Ratify-documented-difference, with room to close. The
   rule that makes it safe is structural rather than case-by-case: a term
   is only ever taken from the `&&` spine, so no drop can narrow.
 
-- **Gated by.** `crates/pulsus-read/src/traces/tag_narrow.rs`'s own unit
+- **Gated by.** `crates/pulsus-read/src/traces/spans/tags.rs`' unit
   tests for the drop rules, plus the two legs above.
 
 ### `traceql-tag-values-unscoped-attr-narrows-here` (issue #478) — **the unscoped `.attr` form narrows for us and does not there**
@@ -2118,7 +2120,9 @@ when we are asking it to slow down, so we keep `429`; recorded as
 - **Disposition.** Ratify-documented-difference. Offering a value no span
   carries is a dropdown entry that matches nothing when picked.
 
-### `traceql-tag-values-window-is-day-granular` (issue #478) — **the window resolves to whole UTC days**
+### `traceql-tag-values-window-is-day-granular` (issue #478) — **RETIRED by #598 part 2: the window is `[start, end)`**
+
+- **Retired 2026-10-17.** The values route's store reads now use `[start, end)` at nanosecond precision, so `Q-AZ` answers `[]`, as the reference does. The text below is kept as the record.
 
 - **Route.** `GET /api/traces/v1/tag/{tag}/values` and
   `GET /api/v2/search/tag/{tag}/values`, for the reads that touch the
@@ -2212,7 +2216,7 @@ when we are asking it to slow down, so we keep `429`; recorded as
   two independent container runs.
 
 - **Ours.** Both values, `200` and `201`: the narrowed read is a `DISTINCT`
-  over the index rows of the matching span set, so it cannot omit a value
+  over the values on the matching spans, so it cannot omit a value
   that set carries.
 
 - **Cases.** `Q-AM`.

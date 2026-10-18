@@ -1741,10 +1741,6 @@
     "values": [
      [
       "string",
-      ""
-     ],
-     [
-      "string",
       "GET /api/v1/users"
      ],
      [
@@ -1761,27 +1757,14 @@
      ],
      [
       "string",
-      "checkout-svc.process"
-     ],
-     [
-      "string",
-      "checkout-svc.retry"
-     ],
-     [
-      "string",
       "pay.charge"
      ],
      [
       "string",
       "pay.charge.retry"
-     ],
-     [
-      "string",
-      "派遣クエリ"
      ]
     ]
-   },
-   "ledger": "traceql-tag-values-q-partial-pushdown"
+   }
   },
   "Q-X": {
    "route": "/api/v2/search/tag/name/values",
@@ -2843,50 +2826,8 @@
    },
    "pulsus": {
     "status": 200,
-    "values": [
-     [
-      "string",
-      ""
-     ],
-     [
-      "string",
-      "GET /api/v1/users"
-     ],
-     [
-      "string",
-      "GET /api/v1/users/{id}"
-     ],
-     [
-      "string",
-      "HTTP POST"
-     ],
-     [
-      "string",
-      "a"
-     ],
-     [
-      "string",
-      "checkout-svc.process"
-     ],
-     [
-      "string",
-      "checkout-svc.retry"
-     ],
-     [
-      "string",
-      "pay.charge"
-     ],
-     [
-      "string",
-      "pay.charge.retry"
-     ],
-     [
-      "string",
-      "派遣クエリ"
-     ]
-    ]
-   },
-   "ledger": "traceql-tag-values-window-is-day-granular"
+    "values": []
+   }
   }
  },
  "range_faults": {

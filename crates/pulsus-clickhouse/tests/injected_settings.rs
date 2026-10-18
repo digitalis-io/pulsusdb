@@ -77,6 +77,7 @@ const INJECTED_SETTINGS: &[&str] = &[
     "max_query_size",
     "max_recursive_cte_evaluation_depth",
     "max_result_bytes",
+    "max_rows_in_distinct",
     "max_rows_in_set",
     "max_rows_to_read",
     "max_threads",

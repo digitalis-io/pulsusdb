@@ -661,7 +661,7 @@ impl Default for ReaderConfig {
             template_timezone: TemplateTimezone::UTC,
             traceql_scan_budget_rows: 50_000_000,
             traceql_max_depth: 64,
-            traceql_tag_lookback: HumanDuration(Duration::from_secs(24 * 3_600)),
+            traceql_tag_lookback: HumanDuration(Duration::from_secs(20 * 60)),
             traceql_max_series: 1_000,
             // Issue #398: 8 GiB on each of the three read surfaces — the
             // value the LogQL sliding range read's own hard-coded

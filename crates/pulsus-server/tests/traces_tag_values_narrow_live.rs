@@ -388,7 +388,7 @@ async fn selects_reading(admin: &ChClient, db: &str, prefix: &str, table: &str) 
         "SELECT toUInt64(count()) AS n FROM system.query_log \
          WHERE type = 'QueryFinish' AND query_kind = 'Select' \
            AND current_database = '{db}' \
-           AND query LIKE '{prefix}%' \
+           AND position(query, '{prefix}') > 0 \
            AND has(arrayMap(x -> toString(x), tables), '{db}.{table}')"
     );
     let mut stream = admin
@@ -540,7 +540,7 @@ async fn our_answers_match_the_committed_fixture() {
     // one, so the occupied day and the empty day are asserted together
     // and the query_log is asked whether the span read actually ran.
     let admin = ChClient::new(ch_config()).await.expect("connect admin");
-    let before = selects_reading(&admin, db, SPAN_NAME_SELECT_PREFIX, "trace_spans").await;
+    let before = selects_reading(&admin, db, SPAN_NAME_SELECT_PREFIX, "spans").await;
     let (empty_start, empty_end) = corpus::empty_day_window_secs(base);
     let res = get(
         port,
@@ -549,12 +549,12 @@ async fn our_answers_match_the_committed_fixture() {
     );
     assert_eq!(res.status, 200, "empty day: body {}", res.text());
     assert_eq!(entries(&res.json("empty day")), Vec::new(), "empty day");
-    let after = selects_reading(&admin, db, SPAN_NAME_SELECT_PREFIX, "trace_spans").await;
+    let after = selects_reading(&admin, db, SPAN_NAME_SELECT_PREFIX, "spans").await;
     assert_eq!(
         after,
         before + 1,
         "the empty answer must be a MEASURED absence: exactly one more span-name read must \
-         have run against {db}.trace_spans"
+         have run against {db}.spans"
     );
 
     // ---- the typing corpus, pushed second ---------------------------

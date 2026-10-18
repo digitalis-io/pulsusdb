@@ -61,9 +61,13 @@ use super::rows::{
     MetricLog2ExemplarRow, MetricQuantileExemplarRow, MetricQuantileInstantRow, MetricQuantileRow,
     SpanNameRow, TagNameRow, TagValueRow,
 };
-use super::tag_narrow::{TagNarrowing, narrowing_from_query};
-use super::tags_sql::DaySpan;
+use super::spans::predicate::PredicateCtx;
+use super::spans::tags::{
+    TAG_STORE_READ_ROWS, TagNarrowing, TagShape, ValueScope, cut_rows, name_values_sql,
+    narrowed_values_sql, narrowing_from_query, table_reads,
+};
 use super::values::{GroupCardinalityCounter, SpanSetGroup, SpanSummary};
+use super::window_sql::WindowSql;
 use crate::logql::error::{ReadError, TooBroadReason};
 use crate::logql::explain::PlanExplain;
 
@@ -401,9 +405,9 @@ fn span_name_value(val: String) -> TagValue {
 ///
 /// `q` is the client's raw query text, percent-decoded — NOT a parsed
 /// AST, and deliberately so: lowering it is total
-/// ([`crate::traces::tag_narrow::narrowing_from_query`]), so an
-/// unparseable `q` widens the read instead of producing an error the
-/// handler would have to turn into a status code.
+/// ([`crate::traces::spans::tags::narrowing_from_query`]), so an
+/// unparseable `q` is answered as an absent one instead of producing an
+/// error the handler would have to turn into a status code.
 #[derive(Debug, Clone, Copy)]
 pub struct TagValuesRequest<'a> {
     /// `q` as the client sent it, percent-decoded. `None` when absent or
@@ -417,19 +421,19 @@ pub struct TagValuesRequest<'a> {
 }
 
 impl TagValuesRequest<'_> {
-    /// The terms this request's `q` contributes — empty for an absent
-    /// `q` and for every `q` the lowering cannot handle.
-    fn narrowing(&self) -> TagNarrowing {
+    /// The narrowing this request's `q` contributes (issue #598 part 2):
+    /// no body for an absent `q` and for every `q` that is not a root
+    /// filter with one.
+    fn narrowing(&self, ctx: &PredicateCtx<'_>) -> TagNarrowing {
         match self.q {
             None => TagNarrowing::default(),
-            Some(q) => narrowing_from_query(q),
+            Some(q) => narrowing_from_query(q, ctx),
         }
     }
 
-    /// The UTC days the window touches — the bound both store-backed
-    /// reads carry.
-    fn days(&self) -> DaySpan {
-        DaySpan::from_window(self.start_ns, self.end_ns)
+    /// The request's window, `[start, end)` at nanosecond precision.
+    fn window(&self) -> WindowSql {
+        WindowSql::start_closed_end_open(self.start_ns, self.end_ns)
     }
 }
 
@@ -652,6 +656,9 @@ pub struct TraceEngine {
     dispatch: super::dispatch::TraceDispatch,
     config: TraceReadConfig,
     indexed: Vec<super::spans::attr_index::IndexedAttr>,
+    /// The ceiling on `R`, the newest spans a span-name or narrowed-values
+    /// read reaches back to (issue #598 part 2a).
+    tag_read_rows: u64,
 }
 
 impl TraceEngine {
@@ -660,7 +667,17 @@ impl TraceEngine {
             dispatch: super::dispatch::TraceDispatch::new(client),
             config,
             indexed: Vec::new(),
+            tag_read_rows: TAG_STORE_READ_ROWS,
         }
+    }
+
+    /// Lowers the ceiling on `R`, the spans a span-name or narrowed-values
+    /// read reaches back to, from [`TAG_STORE_READ_ROWS`] (issue #598
+    /// part 2a); for tests that stop a read on a small corpus. `R` stays
+    /// sized from the scan budget below it.
+    pub fn with_tag_read_rows(mut self, rows: u64) -> Self {
+        self.tag_read_rows = rows;
+        self
     }
 
     /// Stamps every statement this engine issues with
@@ -1798,42 +1815,32 @@ impl TraceEngine {
         scope: Option<&str>,
         req: TagValuesRequest<'_>,
     ) -> Result<TagValues, ReadError> {
-        let key_literal = crate::logql::escape::ch_string(key);
-        let scope_literal = scope.map(crate::logql::escape::ch_string);
-        let narrowing = req.narrowing();
-        let (sql, settings) = if narrowing.is_empty() {
-            (
-                super::spans::tags::tag_values_sql(
-                    &key_literal,
-                    scope_literal.as_deref(),
-                    TAG_VALUES_MAX + 1,
-                ),
-                catalog_settings(&self.config),
-            )
-        } else {
-            // Issue #509: NEITHER branch escapes here, and the comment
-            // this replaced is why. It claimed only the narrowing term
-            // could carry a `?` — "the catalog shape cannot contain one"
-            // — but the unnarrowed shape inlines the requested attribute
-            // KEY, and an OTLP attribute may be named `http.target?raw`.
-            // Measured at `acf44c49`: that key was a `500` on all three
-            // values routes, `a??b` silently read back key `a?b`, and
-            // `a?fields` had the row's column list substituted into the
-            // literal. The doubling now happens once, in
-            // `traces::dispatch`, for every read on this path.
-            (
-                super::tags_sql::attr_values_narrowed_sql(
-                    self.span_filter_ctx(),
-                    &key_literal,
-                    scope_literal.as_deref(),
-                    req.days(),
-                    narrowing.terms(),
-                    TAG_VALUES_MAX + 1,
-                ),
-                metrics_settings(&self.config),
-            )
+        let w = req.window();
+        let ctx = PredicateCtx {
+            window: w,
+            spans_table: &self.config.spans_v2_table,
+            resources_table: &self.config.resources_table,
+            indexed: &[],
         };
-        self.stream_tag_values(&sql, &settings).await
+        let n = req.narrowing(&ctx);
+        if !n.has_body() {
+            let key_literal = crate::logql::escape::ch_string(key);
+            let scope_literal = scope.map(crate::logql::escape::ch_string);
+            let sql = super::spans::tags::tag_values_sql(
+                &key_literal,
+                scope_literal.as_deref(),
+                TAG_VALUES_MAX + 1,
+            );
+            return self
+                .stream_tag_values(&sql, &catalog_settings(&self.config), &n)
+                .await;
+        }
+        // Issue #509: neither branch escapes a `?` here. The doubling
+        // happens once, in `traces::dispatch`, for every read on this
+        // path. The key is escaped into a JSON path by the builder.
+        let sql = tag_values_statement(&self.config, self.tag_read_rows, scope, key, w, &n);
+        self.stream_tag_values(&sql, &tag_store_settings(&self.config), &n)
+            .await
     }
 
     /// Streams the §4.3 SPAN-NAME values read (issue #478 Part 1) —
@@ -1856,24 +1863,26 @@ impl TraceEngine {
         &self,
         req: TagValuesRequest<'_>,
     ) -> Result<TagValues, ReadError> {
-        let narrowing = req.narrowing();
-        let sql = super::tags_sql::span_name_values_sql(
-            self.span_filter_ctx(),
-            req.days(),
-            narrowing.terms(),
-            TAG_VALUES_MAX + 1,
-        );
-        let settings = metrics_settings(&self.config);
+        let w = req.window();
+        let ctx = PredicateCtx {
+            window: w,
+            spans_table: &self.config.spans_v2_table,
+            resources_table: &self.config.resources_table,
+            indexed: &[],
+        };
+        let n = req.narrowing(&ctx);
+        let sql = span_names_statement(&self.config, self.tag_read_rows, w, &n);
+        let settings = tag_store_settings(&self.config);
         let mut values = Vec::new();
         // Scoped stream: same lease/drain contract as list_tag_names.
         let mut stream = self
             .dispatch
             .query_stream::<SpanNameRow, _>(&sql, &settings, |e| {
-                map_trace_read_error(e, &self.config)
+                tag_read_error(e, &n, &self.config)
             })
             .await?;
         while let Some(row) = stream.next().await {
-            let row = row.map_err(|e| map_trace_read_error(e, &self.config))?;
+            let row = row.map_err(|e| tag_read_error(e, &n, &self.config))?;
             values.push(span_name_value(row.val));
         }
         let truncated = values.len() > TAG_VALUES_MAX;
@@ -1888,17 +1897,16 @@ impl TraceEngine {
         &self,
         sql: &str,
         settings: &QuerySettings,
+        n: &TagNarrowing,
     ) -> Result<TagValues, ReadError> {
         let mut values = Vec::new();
         // Scoped stream: same lease/drain contract as list_tag_names.
         let mut stream = self
             .dispatch
-            .query_stream::<TagValueRow, _>(sql, settings, |e| {
-                map_trace_read_error(e, &self.config)
-            })
+            .query_stream::<TagValueRow, _>(sql, settings, |e| tag_read_error(e, n, &self.config))
             .await?;
         while let Some(row) = stream.next().await {
-            let row = row.map_err(|e| map_trace_read_error(e, &self.config))?;
+            let row = row.map_err(|e| tag_read_error(e, n, &self.config))?;
             values.push(TagValue {
                 val: row.val,
                 val_type: row.val_type,
@@ -1907,16 +1915,6 @@ impl TraceEngine {
         let truncated = values.len() > TAG_VALUES_MAX;
         values.truncate(TAG_VALUES_MAX);
         Ok(TagValues { values, truncated })
-    }
-
-    /// The table pair the store-backed tag reads name — the same
-    /// `TraceReadConfig` fields (and therefore the same `_dist` suffixing)
-    /// the whole search path uses.
-    fn span_filter_ctx(&self) -> super::filter::SpanFilterCtx<'_> {
-        super::filter::SpanFilterCtx {
-            spans_table: &self.config.spans_table,
-            attrs_table: &self.config.attrs_table,
-        }
     }
 
     /// Answers `request` with the search statement (issue #602 part 2b),
@@ -2112,6 +2110,89 @@ fn search_settings(config: &TraceReadConfig) -> QuerySettings {
         // (`reader.traceql_read_max_memory_bytes`), throw-not-spill.
         .set("max_memory_usage", config.read_max_memory_bytes)
         .set("max_bytes_before_external_group_by", 0u64)
+}
+
+/// The settings the span-name and narrowed-values reads carry (issue #598
+/// part 2a): [`search_settings`], whose `max_rows_to_read` is the scan
+/// budget with `throw`, a backstop behind the cut; at most 10,000 distinct
+/// values collected, then `break`, so memory is bounded by the answer; and
+/// `max_threads` pinned at 4, so the read-ahead past the cut does not
+/// depend on the host. Not [`metrics_settings`]: its clustered
+/// `distributed_product_mode = 'local'` would read a resource read's
+/// span subquery from one shard only.
+fn tag_store_settings(config: &TraceReadConfig) -> QuerySettings {
+    search_settings(config)
+        .set("max_rows_in_distinct", 10_000u64)
+        .set("distinct_overflow_mode", "break")
+        .set("max_threads", 4u64)
+}
+
+/// The narrowed values statement for one attribute key (issue #598 part
+/// 2a), its cut sized from `ceiling`, the scan budget and the statement's
+/// table reads.
+fn tag_values_statement(
+    config: &TraceReadConfig,
+    ceiling: u64,
+    scope: Option<&str>,
+    key: &str,
+    w: WindowSql,
+    n: &TagNarrowing,
+) -> String {
+    let vs = ValueScope::from_attr_scope(scope);
+    narrowed_values_sql(
+        &config.spans_v2_table,
+        &config.resources_table,
+        &config.traces_table,
+        vs,
+        key,
+        w,
+        n,
+        cut_rows(
+            ceiling,
+            config.scan_budget_rows,
+            table_reads(TagShape::Values(vs), n),
+        ),
+        TAG_VALUES_MAX + 1,
+    )
+}
+
+/// The span-name statement (issue #598 part 2a), its cut sized as
+/// [`tag_values_statement`]'s.
+fn span_names_statement(
+    config: &TraceReadConfig,
+    ceiling: u64,
+    w: WindowSql,
+    n: &TagNarrowing,
+) -> String {
+    name_values_sql(
+        &config.spans_v2_table,
+        &config.traces_table,
+        w,
+        n,
+        cut_rows(
+            ceiling,
+            config.scan_budget_rows,
+            table_reads(TagShape::Names, n),
+        ),
+        TAG_VALUES_MAX + 1,
+    )
+}
+
+/// A tag read's ClickHouse error as the request's: a `!` demand the
+/// predicate raised (`Code: 395` carrying one of its messages) is a `400`
+/// with that message, as on the search route; any other error as the
+/// trace read path maps it.
+fn tag_read_error(e: ChError, n: &TagNarrowing, config: &TraceReadConfig) -> ReadError {
+    if let ChError::Server { code: 395, message } = &e
+        && let Some(d) = n.predicate().and_then(|p| {
+            p.demand_messages()
+                .iter()
+                .find(|d| message.contains(d.as_str()))
+        })
+    {
+        return ReadError::PipelineInvalid { reason: d.clone() };
+    }
+    map_trace_read_error(e, config)
 }
 
 /// The Layer-1 read budget the two §4.3 catalog reads carry (issue #58
@@ -3876,6 +3957,108 @@ mod tests {
         );
     }
 
+    fn tag_narrowing(
+        q: &str,
+        w: super::super::window_sql::WindowSql,
+    ) -> super::super::spans::tags::TagNarrowing {
+        super::super::spans::tags::narrowing_from_query(
+            q,
+            &super::super::spans::predicate::PredicateCtx {
+                window: w,
+                spans_table: "spans",
+                resources_table: "resources",
+                indexed: &[],
+            },
+        )
+    }
+
+    /// U6 (issue #598 part 2a): `R` is sized from the budget and the
+    /// statement's table reads, and the store reads keep the scan budget's
+    /// `throw` as a backstop, bound memory by a distinct cap, and pin
+    /// `max_threads`.
+    #[test]
+    fn tag_store_settings_bound_rows_and_memory() {
+        use crate::traces::spans::tags::{TagShape, ValueScope, cut_rows, table_reads};
+        for (k, want) in [
+            (2, 10_000_000),
+            (3, 8_333_333),
+            (4, 6_250_000),
+            (5, 5_000_000),
+        ] {
+            assert_eq!(cut_rows(10_000_000, 50_000_000, k), want, "k = {k}");
+        }
+        assert_eq!(cut_rows(10_000_000, 1, 2), 1);
+        assert_eq!(cut_rows(10_000, 50_000_000, 2), 10_000);
+        let w = super::super::window_sql::WindowSql::start_closed_end_open(
+            1_700_000_000_000_000_000,
+            1_700_003_600_000_000_000,
+        );
+        let none = tag_narrowing(r#"{span.a="x"}"#, w);
+        let trace = tag_narrowing("{traceDuration > 1s}", w);
+        assert_eq!(table_reads(TagShape::Names, &none), 2);
+        assert_eq!(table_reads(TagShape::Values(ValueScope::Span), &none), 2);
+        assert_eq!(
+            table_reads(TagShape::Values(ValueScope::Resource), &none),
+            2
+        );
+        assert_eq!(
+            table_reads(TagShape::Values(ValueScope::Unscoped), &none),
+            3
+        );
+        assert_eq!(table_reads(TagShape::Values(ValueScope::Span), &trace), 4);
+        assert_eq!(
+            table_reads(TagShape::Values(ValueScope::Unscoped), &trace),
+            5
+        );
+        let config = cfg();
+        let s = tag_store_settings(&config);
+        assert_eq!(
+            s.get("max_rows_to_read"),
+            Some(config.scan_budget_rows.to_string().as_str())
+        );
+        assert_eq!(s.get("read_overflow_mode"), Some("throw"));
+        assert_eq!(s.get("max_rows_in_distinct"), Some("10000"));
+        assert_eq!(s.get("distinct_overflow_mode"), Some("break"));
+        assert_eq!(s.get("max_threads"), Some("4"));
+        assert_eq!(s.get("distributed_product_mode"), None);
+    }
+
+    /// U8 (issue #598 part 2a): the cut size the statement functions
+    /// compute reaches the statement.
+    #[test]
+    fn the_cut_size_reaches_the_statement() {
+        let w = super::super::window_sql::WindowSql::start_closed_end_open(
+            1_700_000_000_000_000_000,
+            1_700_003_600_000_000_000,
+        );
+        let mut config = cfg();
+        config.scan_budget_rows = 1_200_000;
+        let ceiling = crate::traces::spans::tags::TAG_STORE_READ_ROWS;
+        let span_a = tag_narrowing(r#"{span.a="x"}"#, w);
+        let mixed = tag_narrowing(r#"{traceDuration > 1s && span.a="x"}"#, w);
+        let cases = [
+            (
+                span_names_statement(&config, ceiling, w, &span_a),
+                "LIMIT 300000)) AS cut",
+            ),
+            (
+                tag_values_statement(&config, ceiling, None, "http.route", w, &span_a),
+                "LIMIT 200000)) AS cut",
+            ),
+            (
+                tag_values_statement(&config, ceiling, Some("span"), "http.route", w, &mixed),
+                "LIMIT 150000)) AS cut",
+            ),
+        ];
+        let mut wide = cfg();
+        wide.scan_budget_rows = 50_000_000;
+        let last = span_names_statement(&wide, 10_000, w, &span_a);
+        for (sql, want) in cases.iter().chain([(last, "LIMIT 10000)) AS cut")].iter()) {
+            assert!(sql.contains(want), "want {want}: {sql}");
+            assert!(!sql.contains("LIMIT 10000000)"), "a fixed R: {sql}");
+        }
+    }
+
     #[test]
     fn clustered_search_settings_add_the_section_7_reader_settings() {
         let mut config = cfg();
@@ -4111,23 +4294,33 @@ mod tests {
         }
     }
 
-    /// The window a request carries resolves to the UTC days it touches
-    /// — the bound both store-backed reads are given.
+    fn tag_ctx(w: WindowSql) -> PredicateCtx<'static> {
+        PredicateCtx {
+            window: w,
+            spans_table: "spans",
+            resources_table: "resources",
+            indexed: &[],
+        }
+    }
+
+    /// The window a request carries is `[start, end)` at nanosecond
+    /// precision (issue #598 part 2) — the bound both store-backed reads
+    /// are given.
     #[test]
-    fn a_tag_values_request_resolves_its_window_to_utc_days() {
+    fn a_tag_values_request_carries_its_window_half_open() {
         let req = TagValuesRequest {
             q: None,
             start_ns: 1_700_000_000_000_000_000,
             end_ns: 1_700_010_800_000_000_000,
         };
         assert_eq!(
-            req.days(),
-            DaySpan {
-                start_days: 19_675,
-                end_days: 19_676
-            }
+            req.window().span_time_clause(),
+            "start_ns >= 1700000000000000000 AND start_ns < 1700010800000000000"
         );
-        assert!(req.narrowing().is_empty(), "no q means no narrowing");
+        assert!(
+            !req.narrowing(&tag_ctx(req.window())).has_body(),
+            "no q means no narrowing"
+        );
     }
 
     /// An unlowerable `q` narrows NOTHING rather than erroring — the
@@ -4140,14 +4333,20 @@ mod tests {
                 start_ns: 0,
                 end_ns: 0,
             };
-            assert!(req.narrowing().is_empty(), "{q:?} must not narrow");
+            assert!(
+                !req.narrowing(&tag_ctx(req.window())).has_body(),
+                "{q:?} must not narrow"
+            );
         }
         let req = TagValuesRequest {
             q: Some("{resource.service.name=\"cart\"}"),
             start_ns: 0,
             end_ns: 0,
         };
-        assert!(!req.narrowing().is_empty(), "a well-formed q must narrow");
+        assert!(
+            req.narrowing(&tag_ctx(req.window())).predicate().is_some(),
+            "a well-formed q must narrow"
+        );
     }
 }
 

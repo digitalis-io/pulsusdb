@@ -1383,155 +1383,269 @@ async fn unnarrowed_values_for_a_question_mark_key_prune_and_answer() {
 }
 
 // ============================================================================
-// Issue #559: the `IN`-set budget still bites, on the read that still
-// builds an `IN` set.
-//
-// Until this change the metrics FILTER lowered an attribute condition to
-// `(trace_id, span_id) IN (SELECT … FROM trace_attrs_idx …)` under
-// `max_rows_in_set` / `max_bytes_in_set` with `set_overflow_mode =
-// 'throw'`, and that is what `traces_metrics_explain`'s gate 4 exercised.
-// The filter now reads the span row and builds no set, so that gate's
-// subject is gone.
-//
-// The constants and the settings did NOT go with it. The NARROWED
-// tag-values read carries the same `metrics_settings` and keeps its own
-// `(trace_id, span_id) IN (…)` over the span table — deliberately, it is
-// out of issue #559's scope — so the refusal keeps a live test here.
+// Issue #598 part 2a: the span-store reads test the newest whole buckets
+// holding the window's newest `R` spans (R10, R11).
 // ============================================================================
 
-static SET_DB: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_traces_setbudget_it");
+/// Now, in nanoseconds.
+fn now_ns() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos(),
+    )
+    .expect("fits i64")
+}
 
-/// Spans the narrowing term admits, chosen to put the `IN` set past
-/// `TRACE_METRICS_MAX_SET_BYTES` (64 MiB) while staying well under
-/// `TRACE_METRICS_MAX_SET_ROWS` (1,000,000) — so the BYTE ceiling is what
-/// binds, which is what the metrics route's own boundary was measured at:
-/// 524,288 matching spans answered and 524,289 did not.
-const SET_BUDGET_SPANS: u64 = 700_000;
+/// A fresh database for one store-read test, its name timestamped
+/// (`system.query_log` outlives a database).
+async fn store_db(label: &str) -> (ChClient, String, ChClient) {
+    let db = pulsus_testkit::test_db(&format!("pulsus_traces_tags_store_it_{label}_{}", now_ns()));
+    let admin = ChClient::new(test_config()).await.expect("connect");
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {db}")).await;
+    run_init(&admin, &test_ctx(&db)).await.expect("run_init");
+    let client = store_client(&db).await;
+    (admin, db, client)
+}
 
-fn set_budget_config() -> TraceReadConfig {
+/// A client whose default database is `db`.
+async fn store_client(db: &str) -> ChClient {
+    let mut cfg = test_config();
+    cfg.database = db.to_string();
+    ChClient::new(cfg).await.expect("connect data client")
+}
+
+/// `count` spans of service `s1` named `name`, each with `http.route`
+/// taken from `route` (an SQL expression over `number`), starting from
+/// `from_ns` and spread across `spread_ns`.
+#[allow(clippy::too_many_arguments)]
+async fn seed_store_spans(
+    client: &ChClient,
+    db: &str,
+    tag: &str,
+    count: u64,
+    from_ns: i64,
+    spread_ns: i64,
+    name: &str,
+    route: &str,
+) {
+    exec(
+        client,
+        &format!(
+            "INSERT INTO {db}.spans (trace_id, span_id, start_ns, duration_ns, service, name, \
+             kind, attrs, end_ns, service_type) \
+             SELECT sipHash128(number, '{tag}'), reinterpretAsFixedString(cityHash64(number, '{tag}')), \
+             {from_ns} + intDiv(toInt64(number) * {spread_ns}, {count}), 1000, 's1', '{name}', 2, \
+             CAST(concat('{{\"http%2Eroute\":\"', {route}, '\"}}'), 'JSON'), \
+             toUInt64({from_ns} + intDiv(toInt64(number) * {spread_ns}, {count}) + 1000), 'string' \
+             FROM numbers({count})"
+        ),
+    )
+    .await;
+}
+
+fn store_config() -> TraceReadConfig {
     TraceReadConfig {
-        read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
-        spans_table: "trace_spans".to_string(),
-        attrs_table: "trace_attrs_idx".to_string(),
-        edges_table: "trace_edges".to_string(),
-        recent_table: "trace_recent".to_string(),
-        errors_table: "trace_error_spans".to_string(),
-        spans_v2_table: "spans".to_string(),
-        traces_table: "traces".to_string(),
-        resources_table: "resources".to_string(),
         scan_budget_rows: 50_000_000,
-        max_depth: 64,
-        max_series: 1_000,
-        distributed: false,
-        skip_unavailable_shards: false,
+        ..tight_budget_config()
     }
 }
 
-/// **Issue #559 criterion 10: the `IN`-set budget is still enforced, and
-/// still by code 191.**
-///
-/// The narrowed tag-values read builds its set from the span table under
-/// the same `metrics_settings` the metrics route carries. Seeding more
-/// matching spans than the byte ceiling admits must make the read FAIL
-/// rather than silently answer a subset — a truncated set would return
-/// values for some spans and not others with nothing saying so.
-///
-/// **What it asserts, and what it deliberately does not.** It asserts the
-/// server error and its code. It does not assert a
-/// `TooBroadReason::TraceMetricsSetRows`, because this read goes through
-/// `map_trace_read_error`, which does not map 191 — that mapping belongs
-/// to the metrics reads and issue #559 leaves both the mapper and this
-/// read alone. Asserting a reason this path does not produce would pin a
-/// claim the code does not keep.
-///
-/// *RED when:* the set limits stop being carried on this read. Verified
-/// by raising `max_bytes_in_set` past the set's size on the same corpus:
-/// the read then answers and the `expect_err` fails.
+fn store_request(start_ns: i64, end_ns: i64) -> pulsus_read::TagValuesRequest<'static> {
+    pulsus_read::TagValuesRequest {
+        q: Some(r#"{resource.service.name="s1"}"#),
+        start_ns,
+        end_ns,
+    }
+}
+
+/// R10: the read tests the newest whole buckets holding the window's
+/// newest `R` spans, across every part: the newest 100,000 spans hold every
+/// value it lists.
 #[tokio::test]
-async fn the_narrowed_tag_values_read_still_refuses_an_oversized_in_set() {
+async fn a_stopped_read_is_the_newest_one() {
     if !should_run() {
-        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see this file's module docs)");
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
         return;
     }
-    let admin = ChClient::new(test_config()).await.expect("connect");
-    exec(&admin, &format!("DROP DATABASE IF EXISTS {SET_DB}")).await;
-    run_init(&admin, &test_ctx(&SET_DB))
-        .await
-        .expect("run_init");
-
-    let mut cfg = test_config();
-    cfg.database = SET_DB.to_string();
-    let client = ChClient::new(cfg).await.expect("connect data client");
-
-    let base_ns = span_base_ns();
-    // Every span carries the same service, so the narrowing term admits
-    // all of them and the set is the whole corpus.
-    exec(
+    const MIN: i64 = 60_000_000_000;
+    let (admin, db, client) = store_db("newest").await;
+    let now = now_ns();
+    seed_store_spans(
         &client,
-        &format!(
-            "INSERT INTO {db}.trace_spans \
-             (trace_id, span_id, parent_id, name, service, timestamp_ns, duration_ns, \
-              status_code, kind, payload_type, payload, \
-              attr_key, attr_scope, attr_val, attr_type, attr_num) \
-             SELECT reinterpretAsFixedString(cityHash64(number)), \
-                    reinterpretAsFixedString(toUInt64(number)), \
-                    reinterpretAsFixedString(toUInt64(0)), \
-                    'op', 'svc-wide', \
-                    {base_ns} + number * 100, 1500000, 1, 2, 0, '', \
-                    ['wide'], ['span'], [concat('v', toString(number % 1000))], \
-                    ['string'], [NULL] \
-             FROM numbers({SET_BUDGET_SPANS})",
-            db = &*SET_DB
-        ),
+        &db,
+        "old",
+        100_000,
+        now - 120 * MIN,
+        MIN,
+        "op.old",
+        "'/old'",
     )
     .await;
-    exec(
+    seed_store_spans(
         &client,
-        &format!(
-            "INSERT INTO {db}.trace_attrs_idx \
-             (date, key, val, scope, val_type, val_num, timestamp_ns, trace_id, span_id, \
-              duration_ns) \
-             SELECT toDate(fromUnixTimestamp64Nano({base_ns})), \
-                    'wide', concat('v', toString(number % 1000)), 'span', 'string', NULL, \
-                    {base_ns}, \
-                    reinterpretAsFixedString(cityHash64(number)), \
-                    reinterpretAsFixedString(toUInt64(number)), \
-                    1500000 \
-             FROM numbers({SET_BUDGET_SPANS})",
-            db = &*SET_DB
-        ),
+        &db,
+        "new",
+        100_000,
+        now - 2 * MIN,
+        MIN,
+        "op.new",
+        "'/new'",
     )
     .await;
-
-    let engine = TraceEngine::new(
-        {
-            let mut cfg = test_config();
-            cfg.database = SET_DB.to_string();
-            ChClient::new(cfg).await.expect("connect engine client")
-        },
-        set_budget_config(),
-    );
-    let req = pulsus_read::TagValuesRequest {
-        q: Some(r#"{resource.service.name="svc-wide"}"#),
-        start_ns: base_ns,
-        end_ns: base_ns + (SET_BUDGET_SPANS as i64) * 100 + 1,
-    };
-    let err = engine
-        .list_tag_values("wide", Some("span"), req)
-        .await
-        .expect_err(
-            "the narrowed read builds an IN set over every admitted span; past \
-             max_bytes_in_set it must throw rather than answer a silent subset",
+    let req = store_request(now - 180 * MIN, now);
+    for (rows, routes, names) in [
+        (10_000u64, vec!["/new"], vec!["op.new"]),
+        (1_000_000, vec!["/new", "/old"], vec!["op.new", "op.old"]),
+    ] {
+        let engine =
+            TraceEngine::new(store_client(&db).await, store_config()).with_tag_read_rows(rows);
+        let values = engine
+            .list_tag_values("http.route", Some("span"), req)
+            .await
+            .expect("the values read answers");
+        assert_eq!(
+            values
+                .values
+                .iter()
+                .map(|v| v.val.as_str())
+                .collect::<Vec<_>>(),
+            routes,
+            "values at a ceiling of {rows}"
         );
-    let ReadError::Clickhouse(pulsus_clickhouse::ChError::Server { code, .. }) = &err else {
-        panic!("expected a server error carrying the set-limit code, got {err:?}");
-    };
-    assert_eq!(
-        *code, 191,
-        "the refusal must be SET_SIZE_LIMIT_EXCEEDED — that code is what \
-         TRACE_METRICS_MAX_SET_ROWS/BYTES and set_overflow_mode = 'throw' produce, and it is \
-         the one this project's constants exist to raise. Got {err:?}"
-    );
+        assert!(!values.truncated, "a stopped read is not flagged");
+        let names_read = engine
+            .list_span_name_values(req)
+            .await
+            .expect("the names read answers");
+        assert_eq!(
+            names_read
+                .values
+                .iter()
+                .map(|v| v.val.as_str())
+                .collect::<Vec<_>>(),
+            names,
+            "names at a ceiling of {rows}"
+        );
+        assert!(!names_read.truncated, "a stopped read is not flagged");
+    }
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {db}")).await;
 
-    exec(&admin, &format!("DROP DATABASE IF EXISTS {SET_DB}")).await;
+    // The same across twelve parts, merges stopped: eleven parts of old
+    // spans an hour apart, then one part of new ones.
+    let (admin, db, client) = store_db("parts").await;
+    exec(&admin, &format!("SYSTEM STOP MERGES {db}.spans")).await;
+    let now = now_ns();
+    for i in 0..11i64 {
+        seed_store_spans(
+            &client,
+            &db,
+            &format!("old{i}"),
+            10_000,
+            now - (13 - i) * 60 * MIN,
+            MIN,
+            "op.old",
+            "'/old'",
+        )
+        .await;
+    }
+    seed_store_spans(
+        &client,
+        &db,
+        "new",
+        100_000,
+        now - 2 * MIN,
+        MIN,
+        "op.new",
+        "'/new'",
+    )
+    .await;
+    let engine =
+        TraceEngine::new(store_client(&db).await, store_config()).with_tag_read_rows(10_000);
+    let req = store_request(now - 14 * 60 * MIN, now);
+    let values = engine
+        .list_tag_values("http.route", Some("span"), req)
+        .await
+        .expect("the values read answers");
+    assert_eq!(
+        values
+            .values
+            .iter()
+            .map(|v| v.val.as_str())
+            .collect::<Vec<_>>(),
+        ["/new"],
+        "twelve parts"
+    );
+    let names_read = engine
+        .list_span_name_values(req)
+        .await
+        .expect("the names read answers");
+    assert_eq!(
+        names_read
+            .values
+            .iter()
+            .map(|v| v.val.as_str())
+            .collect::<Vec<_>>(),
+        ["op.new"],
+        "twelve parts"
+    );
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {db}")).await;
+}
+
+/// R11: the cut reads the newest buckets only. Three buckets ten minutes
+/// apart hold 50,000 spans each; at a ceiling of 10,000 the read lists
+/// the newest bucket's route and reads well below all three.
+#[tokio::test]
+async fn the_cut_reads_the_newest_buckets() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    const MIN: i64 = 60_000_000_000;
+    const BUCKET: i64 = 300_000_000_000;
+    let (admin, db, client) = store_db("buckets").await;
+    let now = now_ns();
+    let b0 = (now - 6 * MIN).div_euclid(BUCKET) * BUCKET;
+    for (i, route) in ["'/b0'", "'/b1'", "'/b2'"].into_iter().enumerate() {
+        seed_store_spans(
+            &client,
+            &db,
+            &format!("b{i}"),
+            50_000,
+            b0 - i as i64 * 10 * MIN,
+            MIN,
+            "op",
+            route,
+        )
+        .await;
+    }
+    let prefix = pulsus_testkit::test_ident(&format!("t598p2a_cut_{}", now_ns()));
+    let engine = TraceEngine::new(store_client(&db).await, store_config())
+        .with_tag_read_rows(10_000)
+        .with_statement_prefix(&prefix);
+    let values = engine
+        .list_tag_values(
+            "http.route",
+            Some("span"),
+            store_request(now - 3 * 60 * MIN, now),
+        )
+        .await
+        .expect("the values read answers");
+    assert_eq!(
+        values
+            .values
+            .iter()
+            .map(|v| v.val.as_str())
+            .collect::<Vec<_>>(),
+        ["/b0"]
+    );
+    assert!(!values.truncated, "a stopped read is not flagged");
+    exec(&admin, "SYSTEM FLUSH LOGS").await;
+    let read = read_rows_by_id(&admin, &format!("{prefix}-1")).await;
+    assert!(
+        read < 150_000,
+        "the cut read below all three buckets: {read} rows read"
+    );
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {db}")).await;
 }
