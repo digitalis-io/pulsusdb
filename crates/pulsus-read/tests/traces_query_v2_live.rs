@@ -17437,30 +17437,60 @@ async fn compare_reads_the_window_once() {
         .await
         .expect("read the query log");
     let logged = stream.next().await.expect("one row").expect("decode");
-    let spans = window_spans(&client, w).await;
-    let traces = count(
-        &client,
-        &format!(
-            "SELECT count() AS n FROM traces WHERE {}",
-            w.per_trace_day_clause()
-        ),
-    )
-    .await;
-    let resources = count(
-        &client,
-        &format!(
-            "SELECT count() AS n FROM resources WHERE {}",
-            w.resources_day_clause()
-        ),
-    )
-    .await;
+    // The bound (the architect's decision on #597): what one `count()` of
+    // each table over the window reads under `final = 1`, the route's
+    // setting, with the 1.05 margin on the `spans` term only.
+    let read_once = |table: &str, clause: String| {
+        let comment = pulsus_testkit::test_ident(&format!("t597_count_{table}_{}", now_ns()));
+        let sql = format!("SELECT count() AS n FROM {table} WHERE {clause}");
+        let client = &client;
+        async move {
+            let settings = QuerySettings::new()
+                .set("final", 1)
+                .set("log_comment", &comment);
+            let mut stream = client
+                .query_stream::<CountRow>(&sql, &settings)
+                .await
+                .expect("the count");
+            while stream.next().await.is_some() {}
+            comment
+        }
+    };
+    let comments = [
+        read_once(
+            "spans",
+            format!(
+                "{} AND {} AND {}",
+                w.span_time_clause(),
+                w.span_bucket_clause(),
+                w.span_day_clause()
+            ),
+        )
+        .await,
+        read_once("traces", w.per_trace_day_clause()).await,
+        read_once("resources", w.resources_day_clause()).await,
+    ];
+    settled_statements(&client, &db, t0).await;
+    let mut per_table = Vec::new();
+    for comment in &comments {
+        per_table.push(
+            count(
+                &client,
+                &format!(
+                    "SELECT any(read_rows) AS n FROM system.query_log WHERE \
+                     log_comment = '{comment}' AND type = 'QueryFinish'"
+                ),
+            )
+            .await,
+        );
+    }
     drop_db(&db).await;
     assert_eq!(logged.n, 1, "one statement");
-    let bound = 1.05 * spans as f64 + (traces + resources) as f64;
+    let bound = 1.05 * per_table[0] as f64 + (per_table[1] + per_table[2]) as f64;
     assert!(
         logged.rows as f64 <= bound,
-        "{} rows read; the bound is {bound} ({spans} spans, {traces} traces rows, {resources} \
-         resources rows)",
+        "{} rows read; the bound is {bound} (a FINAL count of spans, traces and resources reads \
+         {per_table:?})",
         logged.rows
     );
 }
@@ -17572,4 +17602,91 @@ async fn a_compare_selection_window_partitions() {
     };
     assert_eq!(total("selection_total"), Some(1.0), "selection_total");
     assert_eq!(total("baseline_total"), Some(4.0), "baseline_total");
+}
+
+/// L12 (issue #597): a trace whose spans fall on two UTC days keeps two
+/// `traces` rows, which `final = 1` does not merge across the `day`
+/// partitions; the child's `rootName` is still its root's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_compare_root_crosses_midnight() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db("pulsus_read_it_t597_midnight");
+    let client = fresh_db(&db).await;
+    // `B` is the current UTC midnight, or the previous one while today's
+    // is within the default lookback plus a minute of now (#598's R16).
+    let lookback = i64::try_from(
+        pulsus_config::ReaderConfig::default()
+            .traceql_tag_lookback
+            .0
+            .as_nanos(),
+    )
+    .expect("the default lookback fits in i64 nanoseconds");
+    const DAY_NS: i64 = 86_400 * S_NS;
+    let now = now_ns();
+    let mut b = now.div_euclid(DAY_NS) * DAY_NS;
+    if now - b < lookback + 60 * S_NS {
+        b -= DAY_NS;
+    }
+    let trace = vec![0xe7u8; 16];
+    let root = request(
+        "cmp-e",
+        "pod-e",
+        vec![span_of(
+            trace.clone(),
+            span_id_bytes(1),
+            Vec::new(),
+            "edge.root",
+            2,
+            b - S_NS,
+            S_NS / 10,
+            Vec::new(),
+            0,
+            Vec::new(),
+            Vec::new(),
+        )],
+    );
+    let child = request(
+        "cmp-e",
+        "pod-e",
+        vec![span_of(
+            trace.clone(),
+            span_id_bytes(2),
+            span_id_bytes(1),
+            "edge.child",
+            3,
+            b + S_NS,
+            S_NS / 10,
+            Vec::new(),
+            2,
+            Vec::new(),
+            Vec::new(),
+        )],
+    );
+    land(&client, &root, &format!("l12-root-{}", now_ns())).await;
+    land(&client, &child, &format!("l12-child-{}", now_ns())).await;
+    let days = count(
+        &client,
+        "SELECT uniqExact(day) AS n FROM traces WHERE trace_id = toFixedString(unhex(\
+         'e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7'), 16) SETTINGS final = 0",
+    )
+    .await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let (start_s, end_s) = (b / S_NS - 120, b / S_NS + 120);
+    let out = range_answer(&engine, CMP_Q, start_s, end_s).await;
+    drop_db(&db).await;
+    assert_eq!(
+        days, 2,
+        "the precondition: the trace has a traces row on each day"
+    );
+    let cells = compare_cells(&out.unwrap_or_else(|e| panic!("{CMP_Q}: {e}")));
+    let root_name = |meta: &str| {
+        cells
+            .iter()
+            .filter(|((m, k, v), _)| m == meta && k == "rootName" && v != "s:nil")
+            .map(|((_, _, v), (n, _))| (v.clone(), *n))
+            .collect::<BTreeMap<_, _>>()
+    };
+    let edge: BTreeMap<String, f64> = [("s:edge.root".to_string(), 1.0)].into_iter().collect();
+    assert_eq!(root_name("selection"), edge, "the child's rootName");
+    assert_eq!(root_name("baseline"), edge, "the root's rootName");
 }
