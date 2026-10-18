@@ -62,8 +62,9 @@ use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequ
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
 use opentelemetry_proto::tonic::metrics::v1::{
-    AggregationTemporality, DataPointFlags, ExponentialHistogramDataPoint, HistogramDataPoint,
-    Metric, NumberDataPoint, ScopeMetrics, SummaryDataPoint, metric, number_data_point,
+    AggregationTemporality, DataPointFlags, Exemplar, ExponentialHistogramDataPoint,
+    HistogramDataPoint, Metric, NumberDataPoint, ScopeMetrics, SummaryDataPoint, exemplar, metric,
+    number_data_point,
 };
 use prost::Message;
 use pulsus_config::{ExpHistogramMode, OtlpTranslationStrategy};
@@ -71,7 +72,7 @@ use pulsus_model::{Date, Fingerprint, LabelSet, STALE_NAN_BITS, series_fingerpri
 
 use crate::error::LogsIngestError;
 use crate::ingest::metrics::{
-    HistogramPoint, MetricMetadata, MetricPoint, ParsedMetrics, SeriesRef,
+    ExemplarPoint, HistogramPoint, MetricMetadata, MetricPoint, ParsedMetrics, SeriesRef,
 };
 use crate::protocols::otlp_exp_histogram::to_native_histogram;
 use crate::protocols::prom_metric_name::{
@@ -245,6 +246,12 @@ fn charge_budget(expanded_bytes: &mut usize, amount: usize) -> Result<(), LogsIn
         });
     }
     Ok(())
+}
+
+/// STUB (tests first, issue #501).
+#[allow(dead_code)]
+fn exemplar_charge(_ex: &Exemplar) -> usize {
+    0
 }
 
 /// Everything [`parse`] needs from `Config`, bundled into one value so a
@@ -4067,5 +4074,422 @@ mod tests {
         let err =
             parse(&req, 0).expect_err("over-depth data-point attribute is rejected whole-request");
         assert!(matches!(err, LogsIngestError::OversizeMessage { .. }));
+    }
+    // -- exemplars (issue #501) ------------------------------------------
+
+    const T_NS: u64 = 1_700_000_000_000_000_000;
+
+    fn trace_bytes() -> Vec<u8> {
+        (1..=16u8).collect()
+    }
+
+    fn span_bytes() -> Vec<u8> {
+        (17..=24u8).collect()
+    }
+
+    fn exemplar_at(time_unix_nano: u64, value: Option<exemplar::Value>) -> Exemplar {
+        Exemplar {
+            filtered_attributes: vec![],
+            time_unix_nano,
+            value,
+            span_id: vec![],
+            trace_id: vec![],
+        }
+    }
+
+    fn double_exemplar(value: f64) -> Exemplar {
+        exemplar_at(T_NS, Some(exemplar::Value::AsDouble(value)))
+    }
+
+    fn with_ids(ex: Exemplar) -> Exemplar {
+        Exemplar {
+            trace_id: trace_bytes(),
+            span_id: span_bytes(),
+            ..ex
+        }
+    }
+
+    fn sum_metric(name: &str, dp: NumberDataPoint) -> Metric {
+        Metric {
+            name: name.to_string(),
+            description: String::new(),
+            unit: String::new(),
+            metadata: vec![],
+            data: Some(metric::Data::Sum(Sum {
+                data_points: vec![dp],
+                aggregation_temporality: AggregationTemporality::Cumulative as i32,
+                is_monotonic: true,
+            })),
+        }
+    }
+
+    fn str_value(s: &str) -> Value {
+        Value::StringValue(s.to_string())
+    }
+
+    /// The series ID of the sample named `name` whose `le` is `le`.
+    fn bucket_fp(out: &ParsedMetrics, name: &str, le: &str) -> Fingerprint {
+        out.series
+            .iter()
+            .find(|r| &*r.metric_name == name && r.labels.get("le") == Some(le))
+            .unwrap_or_else(|| panic!("no {name}{{le={le:?}}} series"))
+            .fingerprint
+    }
+
+    /// The `le` of the series an exemplar was attached to, or `None` when
+    /// that series has no `le`.
+    fn le_of(out: &ParsedMetrics, ex: &ExemplarPoint) -> Option<String> {
+        out.series
+            .iter()
+            .find(|r| r.metric_name == ex.metric_name && r.fingerprint == ex.fingerprint)
+            .unwrap_or_else(|| panic!("an exemplar on an unregistered series: {ex:?}"))
+            .labels
+            .get("le")
+            .map(str::to_string)
+    }
+
+    /// **O1: a Sum's and a Gauge's exemplars go to their own sample's
+    /// series**, with their time, value, ids and attributes.
+    #[test]
+    fn sum_and_gauge_points_carry_their_exemplars_to_their_own_series() {
+        let mut sum_dp = number_dp(T_NS, 10.0, vec![]);
+        sum_dp.exemplars = vec![Exemplar {
+            filtered_attributes: vec![kv("user", str_value("alice"))],
+            ..with_ids(exemplar_at(
+                T_NS - 1_000_000_000,
+                Some(exemplar::Value::AsDouble(0.5)),
+            ))
+        }];
+        let mut gauge_dp = number_dp(T_NS, 20.0, vec![]);
+        gauge_dp.exemplars = vec![exemplar_at(T_NS, Some(exemplar::Value::AsInt(3)))];
+        let req = request(vec![ResourceMetrics {
+            resource: None,
+            scope_metrics: vec![scope_metrics(vec![
+                sum_metric("requests", sum_dp),
+                gauge_metric("temperature", gauge_dp),
+            ])],
+            schema_url: String::new(),
+        }]);
+        let out = parse(&req, 0).expect("within the expansion budget");
+        assert_eq!(out.rejected, 0);
+        assert_eq!(out.exemplars.len(), 2, "{:?}", out.exemplars);
+        let sample = |value: f64| {
+            out.samples
+                .iter()
+                .find(|s| s.value == value)
+                .expect("the data point's sample")
+        };
+        let (sum, gauge) = (sample(10.0), sample(20.0));
+
+        let e = &out.exemplars[0];
+        assert_eq!(e.metric_name, sum.metric_name);
+        assert_eq!(e.fingerprint, sum.fingerprint);
+        assert_eq!(e.unix_milli, 1_700_000_000_000 - 1_000);
+        assert_eq!(e.value, 0.5);
+        assert_eq!(e.trace_id.to_vec(), trace_bytes());
+        assert_eq!(e.span_id.to_vec(), span_bytes());
+        assert_eq!(
+            e.labels,
+            LabelSet::from_verbatim([("user".to_string(), "alice".to_string())])
+        );
+        assert!(!e.histogram);
+
+        let e = &out.exemplars[1];
+        assert_eq!(e.metric_name, gauge.metric_name);
+        assert_eq!(e.fingerprint, gauge.fingerprint);
+        assert_eq!(e.unix_milli, 1_700_000_000_000);
+        assert_eq!(e.value, 3.0);
+        assert_eq!(e.trace_id, [0; 16]);
+        assert_eq!(e.span_id, [0; 8]);
+        assert!(e.labels.is_empty());
+        assert!(!e.histogram);
+    }
+
+    /// **O2: a Histogram exemplar goes to the first bucket whose bound its
+    /// value does not exceed**, whatever order the exemplars arrive in, and
+    /// never to `_sum` or `_count`.
+    #[test]
+    fn a_histogram_exemplar_goes_to_the_first_bucket_its_value_does_not_exceed() {
+        let mut dp = histogram_dp(T_NS, 4, Some(11.5), vec![2, 1, 1], vec![1.0, 5.0]);
+        dp.exemplars = [7.0, 0.5, 3.0, 1.0].map(double_exemplar).to_vec();
+        let metric = histogram_metric("latency", AggregationTemporality::Cumulative, dp);
+        let out = parse(&one_metric_request(None, metric), 0).expect("within the expansion budget");
+        assert_eq!(out.exemplars.len(), 4);
+        let on = |le: &str| -> Vec<f64> {
+            let fp = bucket_fp(&out, "latency_bucket", le);
+            out.exemplars
+                .iter()
+                .filter(|e| e.fingerprint == fp && &*e.metric_name == "latency_bucket")
+                .map(|e| e.value)
+                .collect()
+        };
+        assert_eq!(on("1"), vec![0.5, 1.0]);
+        assert_eq!(on("5"), vec![3.0]);
+        assert_eq!(on("+Inf"), vec![7.0]);
+        assert!(
+            out.exemplars
+                .iter()
+                .all(|e| &*e.metric_name == "latency_bucket" && !e.histogram),
+            "none on _sum or _count: {:?}",
+            out.exemplars
+        );
+    }
+
+    /// **O3: an exponential histogram's exemplar follows the form it is
+    /// stored in**: the flattened bucket under `classic`, the native series
+    /// under `native`, both under `dual`.
+    #[test]
+    fn an_exponential_histogram_exemplar_follows_the_stored_form() {
+        let mut req = native_exp_request();
+        let Some(metric::Data::ExponentialHistogram(exp)) =
+            req.resource_metrics[0].scope_metrics[0].metrics[0]
+                .data
+                .as_mut()
+        else {
+            panic!("an exponential histogram");
+        };
+        exp.data_points[0].exemplars = vec![double_exemplar(3.0)];
+
+        // Bounds 0, 2, 4, 8, +Inf: 4 is the first 3.0 does not exceed.
+        let classic = super::parse(&req, 0, hist_settings(ExpHistogramMode::Classic))
+            .expect("within the expansion budget");
+        assert_eq!(classic.exemplars.len(), 1);
+        let e = &classic.exemplars[0];
+        assert_eq!(&*e.metric_name, "request_size_bucket");
+        assert_eq!(
+            e.fingerprint,
+            bucket_fp(&classic, "request_size_bucket", "4")
+        );
+        assert!(!e.histogram);
+
+        let native = super::parse(&req, 0, hist_settings(ExpHistogramMode::Native))
+            .expect("within the expansion budget");
+        assert_eq!(native.exemplars.len(), 1);
+        let e = &native.exemplars[0];
+        assert_eq!(e.metric_name, native.hist_samples[0].metric_name);
+        assert_eq!(e.fingerprint, native.hist_samples[0].fingerprint);
+        assert!(e.histogram);
+        assert_eq!(e.value, 3.0);
+
+        let dual = super::parse(&req, 0, hist_settings(ExpHistogramMode::Dual))
+            .expect("within the expansion budget");
+        assert_eq!(dual.exemplars.len(), 2);
+        let native_one: Vec<_> = dual.exemplars.iter().filter(|e| e.histogram).collect();
+        assert_eq!(native_one.len(), 1);
+        assert_eq!(native_one[0].fingerprint, dual.hist_samples[0].fingerprint);
+        let classic_one: Vec<_> = dual.exemplars.iter().filter(|e| !e.histogram).collect();
+        assert_eq!(classic_one.len(), 1);
+        assert_eq!(
+            classic_one[0].fingerprint,
+            bucket_fp(&dual, "request_size_bucket", "4")
+        );
+    }
+
+    /// **O4: filtered attributes are kept while they and the ids come to at
+    /// most 128 characters**, counted in characters, not bytes; above that
+    /// the attributes are dropped and the ids kept.
+    #[test]
+    fn filtered_attributes_are_kept_to_128_characters_with_the_ids() {
+        let parse_one = |ex: Exemplar| {
+            let mut dp = number_dp(T_NS, 1.0, vec![]);
+            dp.exemplars = vec![ex];
+            let out = parse(&one_metric_request(None, gauge_metric("g", dp)), 0)
+                .expect("within the expansion budget");
+            assert_eq!(out.exemplars.len(), 1, "the exemplar is kept either way");
+            out.exemplars[0].clone()
+        };
+        // trace_id + 32 hex = 40, span_id + 16 hex = 23: 63 characters.
+        let at = |value: String| Exemplar {
+            filtered_attributes: vec![kv("k", Value::StringValue(value))],
+            ..with_ids(double_exemplar(1.0))
+        };
+
+        // 63 + 1 + 64 = 128 characters, though the value alone is 128 bytes.
+        let kept = parse_one(at("é".repeat(64)));
+        assert_eq!(kept.labels.get("k"), Some("é".repeat(64).as_str()));
+        assert_eq!(kept.trace_id.to_vec(), trace_bytes());
+
+        // 129 characters: the attributes go, the ids stay.
+        let dropped = parse_one(at("é".repeat(65)));
+        assert!(dropped.labels.is_empty(), "{:?}", dropped.labels);
+        assert_eq!(dropped.trace_id.to_vec(), trace_bytes());
+        assert_eq!(dropped.span_id.to_vec(), span_bytes());
+
+        // No ids: 1 + 127 = 128 characters, kept.
+        let no_ids = parse_one(Exemplar {
+            filtered_attributes: vec![kv("k", Value::StringValue("a".repeat(127)))],
+            ..double_exemplar(1.0)
+        });
+        assert_eq!(no_ids.labels.get("k"), Some("a".repeat(127).as_str()));
+    }
+
+    /// **O5: an exemplar with no value or a time it cannot store is dropped
+    /// on its own**: its data point is stored and nothing is rejected.
+    #[test]
+    fn an_exemplar_without_a_value_or_with_an_unstorable_time_is_dropped_alone() {
+        // 2107-01-01T00:00:00Z, past the last storable day.
+        let in_2107_ns: u64 = 4_323_283_200 * 1_000_000_000;
+        let mut dp = number_dp(T_NS, 1.0, vec![]);
+        dp.exemplars = vec![
+            exemplar_at(T_NS, None),
+            exemplar_at(0, Some(exemplar::Value::AsDouble(1.0))),
+            exemplar_at(in_2107_ns, Some(exemplar::Value::AsDouble(2.0))),
+            exemplar_at(T_NS, Some(exemplar::Value::AsDouble(3.0))),
+        ];
+        let req = request(vec![ResourceMetrics {
+            resource: None,
+            scope_metrics: vec![scope_metrics(vec![sum_metric("requests", dp)])],
+            schema_url: String::new(),
+        }]);
+        let out = parse(&req, 0).expect("within the expansion budget");
+        assert_eq!(out.samples.len(), 1);
+        assert_eq!(out.rejected, 0);
+        assert_eq!(out.rejected_message, None);
+        assert_eq!(out.exemplars.len(), 1, "{:?}", out.exemplars);
+        assert_eq!(out.exemplars[0].value, 3.0);
+    }
+
+    /// **O6: a rejected data point keeps none of its exemplars**, and a
+    /// `dual` point whose native form is rejected keeps the exemplar of its
+    /// stored classic form only.
+    #[test]
+    fn a_rejected_data_point_keeps_none_of_its_exemplars() {
+        // Counts summing to 4 against a count of 99.
+        let mut dp = histogram_dp(T_NS, 99, Some(1.0), vec![2, 1, 1], vec![1.0, 5.0]);
+        dp.exemplars = vec![double_exemplar(3.0)];
+        let metric = histogram_metric("latency", AggregationTemporality::Cumulative, dp);
+        let out = parse(&one_metric_request(None, metric), 0).expect("within the expansion budget");
+        assert_eq!(out.rejected, 1);
+        assert!(out.samples.is_empty());
+        assert!(out.exemplars.is_empty(), "{:?}", out.exemplars);
+
+        // Scale -5 is below the native minimum: the native form is rejected
+        // and the classic flatten is stored.
+        let mut dp = ExponentialHistogramDataPoint {
+            time_unix_nano: T_NS,
+            count: 4,
+            sum: Some(5.0),
+            scale: -5,
+            positive: Some(Buckets {
+                offset: 0,
+                bucket_counts: vec![1, 2, 1],
+            }),
+            ..exp_histogram_dp()
+        };
+        dp.exemplars = vec![double_exemplar(3.0)];
+        let req = one_metric_request(None, exp_histogram_metric("request_size", dp));
+        let out = super::parse(&req, 0, hist_settings(ExpHistogramMode::Dual))
+            .expect("within the expansion budget");
+        assert_eq!(out.rejected, 1, "the native form is rejected");
+        assert!(out.hist_samples.is_empty());
+        assert!(!out.samples.is_empty(), "the classic form is stored");
+        assert_eq!(out.exemplars.len(), 1, "{:?}", out.exemplars);
+        let e = &out.exemplars[0];
+        assert!(!e.histogram, "no exemplar for the rejected native form");
+        assert_eq!(&*e.metric_name, "request_size_bucket");
+        // The first stored bound 3.0 does not exceed.
+        let first_bound = out
+            .series
+            .iter()
+            .filter(|r| &*r.metric_name == "request_size_bucket")
+            .filter_map(|r| {
+                let le = r.labels.get("le")?;
+                let bound: f64 = le.parse().ok()?;
+                (bound >= 3.0).then_some((bound, r.fingerprint))
+            })
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .expect("a bucket at or above 3.0");
+        assert_eq!(e.fingerprint, first_bound.1);
+        assert_ne!(le_of(&out, e).as_deref(), Some("+Inf"));
+    }
+
+    /// **O7: an attribute named for an id yields to the id**: dropped when
+    /// that id is set, kept as a label when it is not.
+    #[test]
+    fn an_id_named_attribute_yields_to_the_id() {
+        let parse_one = |ex: Exemplar| {
+            let mut dp = number_dp(T_NS, 1.0, vec![]);
+            dp.exemplars = vec![ex];
+            let out = parse(&one_metric_request(None, gauge_metric("g", dp)), 0)
+                .expect("within the expansion budget");
+            assert_eq!(out.exemplars.len(), 1);
+            out.exemplars[0].clone()
+        };
+        let attrs = vec![
+            kv("trace_id", str_value("x")),
+            kv("span_id", str_value("y")),
+        ];
+        let with = parse_one(Exemplar {
+            filtered_attributes: attrs.clone(),
+            ..with_ids(double_exemplar(1.0))
+        });
+        assert!(with.labels.is_empty(), "{:?}", with.labels);
+        let without = parse_one(Exemplar {
+            filtered_attributes: attrs,
+            ..double_exemplar(1.0)
+        });
+        assert_eq!(
+            without.labels,
+            LabelSet::from_verbatim([
+                ("span_id".to_string(), "y".to_string()),
+                ("trace_id".to_string(), "x".to_string()),
+            ])
+        );
+    }
+
+    /// **O8: an exemplar's charge covers the point it builds**: the point
+    /// itself, one label slot per attribute and the attributes' text.
+    #[test]
+    fn the_exemplar_charge_covers_the_point_it_builds() {
+        let ex = Exemplar {
+            filtered_attributes: vec![
+                kv("user", str_value("alice")),
+                kv("region", str_value("eu-west-1")),
+            ],
+            ..with_ids(double_exemplar(1.0))
+        };
+        let text = "user".len() + "alice".len() + "region".len() + "eu-west-1".len();
+        assert!(
+            exemplar_charge(&ex)
+                >= std::mem::size_of::<ExemplarPoint>()
+                    + 2 * std::mem::size_of::<(String, String)>()
+                    + text,
+            "charge {}",
+            exemplar_charge(&ex)
+        );
+    }
+
+    /// **O9: an exemplar's attribute is charged before it is converted.** A
+    /// key-value list rendered at up to six times its wire length, larger
+    /// than the budget allows, fails the request, though the 128-character
+    /// rule would drop it.
+    #[test]
+    fn an_exemplar_attribute_is_charged_before_it_is_converted() {
+        let len = MAX_EXPANDED_BYTES / MAX_JSON_ESCAPE_FACTOR + (1 << 20);
+        let big = Value::KvlistValue(KeyValueList {
+            values: vec![kv("v", Value::StringValue("a".repeat(len)))],
+        });
+        let mut dp = number_dp(T_NS, 1.0, vec![]);
+        dp.exemplars = vec![Exemplar {
+            filtered_attributes: vec![kv("big", big)],
+            ..double_exemplar(1.0)
+        }];
+        let req = request(vec![ResourceMetrics {
+            resource: None,
+            scope_metrics: vec![scope_metrics(vec![sum_metric("requests", dp)])],
+            schema_url: String::new(),
+        }]);
+        let result = parse(&req, 0);
+        assert!(
+            matches!(
+                result,
+                Err(LogsIngestError::OversizeMessage {
+                    limit: MAX_EXPANDED_BYTES,
+                    ..
+                })
+            ),
+            "{:?}",
+            result.as_ref().map(|out| out.exemplars.len())
+        );
     }
 }

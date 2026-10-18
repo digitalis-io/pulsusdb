@@ -21,14 +21,15 @@ use live_db::ScopedDb;
 use pulsus_clickhouse::{ChClient, Idempotency, QuerySettings};
 use pulsus_model::{CounterResetHint, Fingerprint, LabelSet, NativeHistogram, Span};
 use pulsus_write::writer::MetricLandingRow;
-use pulsus_write::{HistogramPoint, MetricPoint, SeriesRef};
+use pulsus_write::{ExemplarPoint, HistogramPoint, MetricPoint, SeriesRef};
 
 const DAY_MS: i64 = 86_400_000;
 const HOUR_MS: i64 = 3_600_000;
 
-/// The targets a replay can store twice: the two sample tables. Activity
-/// and the lookup fold a replayed row into the one already stored.
-const SAMPLE_TARGETS: [&str; 2] = ["metric_samples", "metric_hist_samples"];
+/// The targets a replay can store twice: the two sample tables and the
+/// exemplars (issue #501). Activity and the lookup fold a replayed row into
+/// the one already stored.
+const SAMPLE_TARGETS: [&str; 3] = ["metric_samples", "metric_hist_samples", "metric_exemplars"];
 
 fn should_run() -> bool {
     pulsus_testkit::live_clickhouse_enabled()
@@ -76,8 +77,8 @@ fn histogram() -> NativeHistogram {
 }
 
 /// Landing rows of three series on two whole UTC days, the two before
-/// today: a float sample, a histogram sample and a kind-2 row at hours 2
-/// and 9 of each day. Both days are wholly past, so every row is seeded
+/// today: a float sample, a histogram sample, an exemplar (issue #501) and a
+/// kind-2 row at hours 2 and 9 of each day. Both days are wholly past, so every row is seeded
 /// whatever the time of day the test runs; today would have none before
 /// 02:00 UTC.
 async fn seed_two_days(client: &ChClient, received_ms: i64) {
@@ -103,6 +104,24 @@ async fn seed_two_days_for(client: &ChClient, received_ms: i64, tenant: &str) {
                         fingerprint: fp,
                         unix_milli: at,
                         value: 1.0,
+                    },
+                ));
+                rows.push(MetricLandingRow::exemplar(
+                    &org,
+                    received_ms,
+                    &ExemplarPoint {
+                        metric_name: Arc::from("rb"),
+                        fingerprint: fp,
+                        unix_milli: at,
+                        value: 0.5,
+                        trace_id: [1; 16],
+                        span_id: [2; 8],
+                        labels: LabelSet::from_normalized([(
+                            "user".to_string(),
+                            "alice".to_string(),
+                        )])
+                        .0,
+                        histogram: false,
                     },
                 ));
                 rows.push(MetricLandingRow::hist_sample(

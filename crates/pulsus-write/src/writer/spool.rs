@@ -1454,7 +1454,52 @@ mod tests {
                 "metadata-long-text",
                 MetricLandingRow::metadata(&std::sync::Arc::<str>::from(""), 5, &long_meta),
             ),
+            ("exemplar", exemplar_row()),
         ]
+    }
+
+    /// The kind-4 row `writer::rows`' W2 builds: name `m`, series 3, at
+    /// 1,000 ms, value 0.25, trace `01..10`, span `11..18`, labels `{a: b}`,
+    /// tenant `t`, received at 7.
+    fn exemplar_row() -> MetricLandingRow {
+        let (labels, _) =
+            pulsus_model::LabelSet::from_normalized([("a".to_string(), "b".to_string())]);
+        MetricLandingRow::exemplar(
+            &Arc::from("t"),
+            7,
+            &crate::ingest::metrics::ExemplarPoint {
+                metric_name: Arc::from("m"),
+                fingerprint: Fingerprint::from_raw(3),
+                unix_milli: 1_000,
+                value: 0.25,
+                trace_id: std::array::from_fn(|i| i as u8 + 1),
+                span_id: std::array::from_fn(|i| i as u8 + 17),
+                labels,
+                histogram: false,
+            },
+        )
+    }
+
+    /// **W3 (issue #501): a kind-4 row's audit record carries its ids as
+    /// lowercase hex**, beside the sample columns, and no descriptor column.
+    #[test]
+    fn an_exemplar_row_spools_its_ids_as_hex() {
+        assert_eq!(
+            exemplar_row().to_spool_value(),
+            serde_json::json!({
+                "fingerprint": 3,
+                "kind": 4,
+                "labels": "{\"a\":\"b\"}",
+                "metric_name": "m",
+                "org_id": "t",
+                "received_ms": 7,
+                "span_id": "1112131415161718",
+                "trace_id": "0102030405060708090a0b0c0d0e0f10",
+                "unix_milli": 1000,
+                "value": 0.25,
+                "value_bits": "4598175219545276416",
+            })
+        );
     }
 
     #[tokio::test]

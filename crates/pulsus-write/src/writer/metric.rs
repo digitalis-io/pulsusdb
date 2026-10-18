@@ -934,7 +934,7 @@ mod tests {
     use pulsus_clickhouse::ChError;
 
     use super::*;
-    use crate::ingest::metrics::{HistogramPoint, MetricPoint};
+    use crate::ingest::metrics::{ExemplarPoint, HistogramPoint, MetricPoint};
     use crate::writer::push_dedup::PushDigest;
 
     /// A metric name long enough that a per-series owned copy of it is visible
@@ -1253,6 +1253,7 @@ mod tests {
             hist_samples: Vec<HistogramPoint>,
             series: Vec<SeriesRef>,
             descriptors: Vec<MetricMetadata>,
+            exemplars: Vec<ExemplarPoint>,
         }
 
         let shapes = vec![
@@ -1262,6 +1263,7 @@ mod tests {
                 hist_samples: Vec::new(),
                 series: Vec::new(),
                 descriptors: Vec::new(),
+                exemplars: Vec::new(),
             },
             Shape {
                 name: "one descriptor",
@@ -1269,6 +1271,7 @@ mod tests {
                 hist_samples: Vec::new(),
                 series: Vec::new(),
                 descriptors: vec![descriptor()],
+                exemplars: Vec::new(),
             },
             Shape {
                 name: "sixty new series",
@@ -1276,6 +1279,17 @@ mod tests {
                 hist_samples: vec![hist_sample(61, 1_000)],
                 series: (0..60u128).map(series_ref).collect(),
                 descriptors: vec![descriptor()],
+                exemplars: Vec::new(),
+            },
+            // Issue #501: the exemplar rows' label buffers are held until the
+            // block is encoded, so they are charged.
+            Shape {
+                name: "sixty exemplars",
+                samples: vec![sample(1, 1_000)],
+                hist_samples: Vec::new(),
+                series: Vec::new(),
+                descriptors: Vec::new(),
+                exemplars: (0..60u128).map(|i| exemplar(i, 1_000)).collect(),
             },
         ];
 
@@ -1308,11 +1322,21 @@ mod tests {
                     .map(|m| {
                         MetricLandingRow::est_landing_bytes(MetricMetadataRow::est_source_bytes(m))
                     })
+                    .sum::<u64>()
+                + shape
+                    .exemplars
+                    .iter()
+                    .map(|e| {
+                        MetricLandingRow::est_landing_bytes(
+                            MetricLandingRow::exemplar_source_bytes(e),
+                        )
+                    })
                     .sum::<u64>();
 
             // The rows `admit_batch` materializes for it, in its order.
             let total_rows = shape.samples.len()
                 + shape.hist_samples.len()
+                + shape.exemplars.len()
                 + shape.series.len()
                 + shape.descriptors.len();
             let mut rows: Vec<MetricLandingRow> = Vec::with_capacity(total_rows);
@@ -1326,6 +1350,12 @@ mod tests {
                     .hist_samples
                     .iter()
                     .map(|h| MetricLandingRow::hist_sample(&std::sync::Arc::<str>::from(""), 5, h)),
+            );
+            rows.extend(
+                shape
+                    .exemplars
+                    .iter()
+                    .map(|e| MetricLandingRow::exemplar(&std::sync::Arc::<str>::from(""), 5, e)),
             );
             rows.extend(shape.series.iter().map(|s| {
                 MetricLandingRow::series(
@@ -1450,6 +1480,21 @@ mod tests {
                 negative_buckets: vec![],
                 custom_values: vec![],
             },
+        }
+    }
+
+    /// An exemplar on series `fingerprint` carrying one label whose value is
+    /// 1,000 bytes long.
+    fn exemplar(fingerprint: u128, unix_milli: i64) -> ExemplarPoint {
+        ExemplarPoint {
+            metric_name: Arc::from(LONG_NAME),
+            fingerprint: Fingerprint::from_raw(fingerprint),
+            unix_milli,
+            value: 0.5,
+            trace_id: [1; 16],
+            span_id: [2; 8],
+            labels: LabelSet::from_normalized([("user".to_string(), "u".repeat(1_000))]).0,
+            histogram: false,
         }
     }
 

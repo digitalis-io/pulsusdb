@@ -2181,6 +2181,116 @@ mod tests {
         );
     }
 
+    /// **W8 (issue #501): two pushes differing only in an exemplar are two
+    /// pushes.** Each of the exemplar's eight fields is changed in turn, and
+    /// a second exemplar is added: each variant's identity differs from the
+    /// base's, and the base's twice is equal. A digest omitting any one field
+    /// would suppress a push whose exemplar it never stored.
+    #[test]
+    fn two_pushes_differing_only_in_an_exemplar_have_two_identities() {
+        use crate::ingest::metrics::{ExemplarPoint, MetricPoint};
+        let labels = |v: &str| LabelSet::from_normalized([("a".to_string(), v.to_string())]).0;
+        let base_exemplar = ExemplarPoint {
+            metric_name: "m".into(),
+            fingerprint: Fingerprint::from_raw(1),
+            unix_milli: 1_000,
+            value: 0.25,
+            trace_id: [1; 16],
+            span_id: [2; 8],
+            labels: labels("b"),
+            histogram: false,
+        };
+        let batch = |exemplars: Vec<ExemplarPoint>| ParsedMetrics {
+            samples: vec![MetricPoint {
+                metric_name: "m".into(),
+                fingerprint: Fingerprint::from_raw(1),
+                unix_milli: 1_000,
+                value: 1.0,
+            }],
+            exemplars,
+            ..Default::default()
+        };
+        let tenant = Tenant::from_header(None, false).expect("the empty tenant");
+        let id = |b: &ParsedMetrics| metric_identity(b, &PushHeaders::default(), &tenant).key;
+        let base = batch(vec![base_exemplar.clone()]);
+        assert_eq!(id(&base), id(&batch(vec![base_exemplar.clone()])));
+
+        let mut trace_id = [1; 16];
+        trace_id[15] = 3;
+        let mut span_id = [2; 8];
+        span_id[7] = 3;
+        let variants: Vec<(&str, Vec<ExemplarPoint>)> = vec![
+            ("no exemplar", vec![]),
+            (
+                "a second exemplar",
+                vec![base_exemplar.clone(), base_exemplar.clone()],
+            ),
+            (
+                "metric_name",
+                vec![ExemplarPoint {
+                    metric_name: "n".into(),
+                    ..base_exemplar.clone()
+                }],
+            ),
+            (
+                "fingerprint",
+                vec![ExemplarPoint {
+                    fingerprint: Fingerprint::from_raw(2),
+                    ..base_exemplar.clone()
+                }],
+            ),
+            (
+                "unix_milli",
+                vec![ExemplarPoint {
+                    unix_milli: 1_001,
+                    ..base_exemplar.clone()
+                }],
+            ),
+            (
+                "value",
+                vec![ExemplarPoint {
+                    value: 0.5,
+                    ..base_exemplar.clone()
+                }],
+            ),
+            (
+                "trace_id",
+                vec![ExemplarPoint {
+                    trace_id,
+                    ..base_exemplar.clone()
+                }],
+            ),
+            (
+                "span_id",
+                vec![ExemplarPoint {
+                    span_id,
+                    ..base_exemplar.clone()
+                }],
+            ),
+            (
+                "labels",
+                vec![ExemplarPoint {
+                    labels: labels("c"),
+                    ..base_exemplar.clone()
+                }],
+            ),
+            (
+                "histogram",
+                vec![ExemplarPoint {
+                    histogram: true,
+                    ..base_exemplar.clone()
+                }],
+            ),
+        ];
+        for (field, exemplars) in variants {
+            assert_ne!(
+                id(&base),
+                id(&batch(exemplars)),
+                "a push differing in the exemplar's {field} is another push"
+            );
+        }
+    }
+
     /// **T-W4 (issue #653): a log push's identity includes its tenant.**
     /// One batch, (a) under an `Idempotency-Key` and (b) without one: two
     /// tenants' identities differ on both branches, and one tenant's twice

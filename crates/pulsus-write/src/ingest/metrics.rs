@@ -26,6 +26,28 @@ pub struct MetricPoint {
     pub value: f64,
 }
 
+/// One `metric_exemplars` row's source data (issue #501): one exemplar,
+/// attached to the series it was sent on. The writer lands it as a kind-4
+/// row of `metric_landing`, and a view copies it into `metric_exemplars`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExemplarPoint {
+    pub metric_name: Arc<str>,
+    pub fingerprint: Fingerprint,
+    /// Milliseconds since the Unix epoch, verbatim.
+    pub unix_milli: i64,
+    pub value: f64,
+    /// All zero: none.
+    pub trace_id: [u8; 16],
+    /// All zero: none.
+    pub span_id: [u8; 8],
+    /// Every other exemplar label; never `trace_id` or `span_id` when that
+    /// id is set.
+    pub labels: LabelSet,
+    /// Attached to a native-histogram series, which registers with
+    /// `value_type = 1`.
+    pub histogram: bool,
+}
+
 /// One `metric_hist_samples` row's source data (M7-A4, issue #120): a native
 /// (sparse) histogram sample produced by the OTLP exponential-histogram
 /// ingest path. Parallels [`MetricPoint`] (the float row's source), carrying
@@ -119,6 +141,8 @@ pub struct ParsedMetrics {
     /// Their series are registered from [`Self::series`] just like float
     /// samples, but stamped `value_type = 1`.
     pub hist_samples: Vec<HistogramPoint>,
+    /// One per exemplar per series it is attached to (issue #501).
+    pub exemplars: Vec<ExemplarPoint>,
     /// Sum of every label set's normalized-key collision count across the
     /// whole request — never swallowed, surfaced for the writer's collision
     /// metric.
