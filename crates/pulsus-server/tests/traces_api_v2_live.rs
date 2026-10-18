@@ -5763,8 +5763,18 @@ async fn a_trace_duration_condition_narrows() {
     const S: i64 = 1_000_000_000;
     let now = now_ns();
     let t = now - 120 * S;
+    // The edge trace must sit outside the no-range window, which is the
+    // default lookback: take the previous UTC day while today's start is
+    // within that lookback plus a minute of now.
+    let lookback = i64::try_from(
+        pulsus_config::ReaderConfig::default()
+            .traceql_tag_lookback
+            .0
+            .as_nanos(),
+    )
+    .expect("the default lookback fits in i64 nanoseconds");
     let mut b = now.div_euclid(NS_PER_DAY) * NS_PER_DAY;
-    if now - b < 60 * S {
+    if now - b < lookback + 60 * S {
         b -= NS_PER_DAY;
     }
     let sp = |trace: u8,

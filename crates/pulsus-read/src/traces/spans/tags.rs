@@ -13,6 +13,35 @@
 //! (both tables are ordered by their whole row, so the duplicate is
 //! byte-identical), never `FINAL`. The `LIMIT` is the caller's cap + 1,
 //! the truncation probe.
+//!
+//! **What that does and does not say, because the absolute form of it is
+//! false and a later reader will otherwise read a regression into two
+//! correct rejections.** The property is: *a `q` that is well-formed
+//! input and does not parse as TraceQL never errors.* Two classes are
+//! rejected BELOW this layer, by the HTTP transport, and both are faults
+//! a client can avoid — measured on this tree against the shipped binary,
+//! on all three values routes:
+//!
+//! * **raw invalid UTF-8 in the request target** — a lone `0x80`, a bare
+//!   `0xFF`, a truncated `0xC3` — is `400` before any handler runs. A
+//!   client that percent-encodes the same bytes is served: `q=%80` and
+//!   `q=` + `%80` × 4096 both answer `200`. So this rejects a malformed
+//!   request line, not a `q` value.
+//! * **an enormous `q`**: measured by bisection, 65,493 bytes answers
+//!   `200` and 65,494 is refused — the 64 KiB request-target bound. The
+//!   LENGTH is the stable part; the refusal's status is `414` or `431`
+//!   depending on how the request bytes arrive, and both were observed
+//!   for the SAME 524,194-byte request on two machines (`414` here,
+//!   `431` in CI). Note the bound is TIGHTER than the §4.2 search
+//!   surface's own 128 KiB expression cap
+//!   (`traces_api::querytext::MAX_QUERY_EXPRESSION_BYTES`), so on this
+//!   route the transport bound is what a client meets first.
+//!
+//! Neither is a shape an editor emits: it percent-encodes, and the text
+//! it sends is the query a human is typing. A malformed `start`, a
+//! `start` without an `end` and an inverted range are the other half of
+//! the same rule and are rejected in
+//! `traces_api::params::parse_range_params`.
 
 use pulsus_traceql::{BoolOp, FieldExpr, FieldOp, SpansetExpr, SpansetFilter, parse, validate};
 

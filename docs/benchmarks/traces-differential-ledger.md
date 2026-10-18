@@ -2037,7 +2037,7 @@ when we are asking it to slow down, so we keep `429`; recorded as
   layer, by the HTTP transport, and neither is a shape an editor emits:
   raw invalid UTF-8 in the request target is `400`, and a `q` past the
   64 KiB request-target bound is refused `414`/`431`. Both are bounded and measured in
-  `crates/pulsus-read/src/traces/tag_narrow.rs`'s module doc and pinned
+  `crates/pulsus-read/src/traces/spans/tags.rs`' module doc and pinned
   by `the_q_tolerance_stops_at_input_that_is_not_well_formed`; the
   reference was not probed for either, so no parity claim is made about
   them.) What differs is the ANSWER. We drop the
