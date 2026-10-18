@@ -456,7 +456,7 @@ because the table it reads has no time column.
 
 Open a tag-value dropdown while a service filter is set and the read becomes a
 semi-join between the two tables at **day** grain
-(`crates/pulsus-read/src/traces/tags_sql.rs:283-313`, chosen at `crates/pulsus-read/src/traces/exec.rs:1787-1818` @ d7af710e):
+(`crates/pulsus-read/src/traces/tags_sql.rs:283-313` @ bf2c95bd, chosen at `crates/pulsus-read/src/traces/exec.rs:1787-1818` @ d7af710e):
 
 ```sql
 SELECT DISTINCT val, val_type
@@ -1712,7 +1712,7 @@ Partition blocks.**
 ### Q4 — the tag dropdown
 
 ```sql
--- Q4a values for one key, today   (crates/pulsus-read/src/traces/tags_sql.rs:119-128) - no time bound at all
+-- Q4a values for one key, today   (crates/pulsus-read/src/traces/tags_sql.rs:119-128 @ bf2c95bd) - no time bound at all
 SELECT DISTINCT val, val_type FROM trace_tag_catalog
 WHERE key = 'http.status_code' AND scope = 'span'
 ORDER BY val, val_type LIMIT 1001
@@ -1723,7 +1723,7 @@ WHERE key = 'http.status_code' AND scope = 'span'
   AND date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
 ORDER BY val, val_type LIMIT 1001
 
--- Q4c values narrowed by a service, today (crates/pulsus-read/src/traces/tags_sql.rs:283-313): the semi-join
+-- Q4c values narrowed by a service, today (crates/pulsus-read/src/traces/tags_sql.rs:283-313 @ bf2c95bd): the semi-join
 --    of §2.4 - measured 2,129,920 rows / 260 marks on C1 with service_time present;
 --    4,015,232 / 494 without it.  §2.4 carries both and the instrument
 -- Q4c values narrowed by a service, new: a primary-key seek, no join
@@ -2987,7 +2987,7 @@ a row built from it is 1970-dated and dropped in the same way, silently.
 Every column, type, codec, sort key, partition key, projection column list and
 materialized view in §1 (`crates/pulsus-schema/src/catalog.rs:227-234, 244-256, 266-281, 335-407,
 648-936, 934-1000`); every statement and its `SELECT` list (`crates/pulsus-read/src/traces/search_sql.rs:231,
-230, 286, 325, 397, 428, 468, 492`; `crates/pulsus-read/src/traces/tags_sql.rs:90, 118, 253, 282`;
+230, 286, 325, 397, 428, 468, 492`; `crates/pulsus-read/src/traces/tags_sql.rs:90, 118, 253, 282` @ bf2c95bd;
 `crates/pulsus-read/src/traces/sql.rs:16-26`; and the committed goldens); the batch arithmetic (`crates/pulsus-read/src/traces/exec.rs:126` @ 1cdb3e5e,
 `crates/pulsus-config/src/model.rs:551-553`); which aggregates push down and what they read
 (`crates/pulsus-read/src/traces/compile.rs:439-489, 560-562`); the write path's failure modes

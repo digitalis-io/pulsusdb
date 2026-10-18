@@ -10,7 +10,7 @@
 use thiserror::Error;
 
 use pulsus_read::FetchWindow;
-use pulsus_read::traces::tags_sql::ATTR_SCOPES;
+use pulsus_read::traces::spans::tags::ATTR_SCOPES;
 
 use super::querytext::{QueryTextError, TraceQlText, validate_traceql_query};
 
@@ -1934,7 +1934,7 @@ mod tests {
         for scope in EMPTY_SCOPES {
             assert!(!ATTR_SCOPES.contains(&scope), "{scope} is a catalog scope");
             assert!(
-                !pulsus_read::traces::tags_sql::RESERVED_INTRINSIC_SCOPES.contains(&scope),
+                !pulsus_read::traces::spans::tags::RESERVED_INTRINSIC_SCOPES.contains(&scope),
                 "{scope} is a reserved scope"
             );
             assert!(

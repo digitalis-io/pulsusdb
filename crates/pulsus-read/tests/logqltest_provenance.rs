@@ -2116,18 +2116,11 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
     // stored text matched against the writer's number grammar, its pattern
     // from `anchored_regex_sql`, the leaf `filter.rs` uses.
     ("pulsus-read/src/traces/spans/search.rs", 1),
-    // Issue #478. The one hit here is a TEST EXPECTATION, not a renderer:
-    // `tag_narrow.rs` renders no `match(` itself — it delegates to
-    // `filter::physical_sql`, which is already inventoried above at 12 —
-    // and its unit test asserts the rendered text it gets back. Recorded
-    // rather than excluded, because the scan is lexical and an exclusion
-    // rule is one more thing that can be wrong.
-    ("pulsus-read/src/traces/tag_narrow.rs", 1),
 ];
 
 /// The separately-asserted total, so "a file appeared" reads differently
 /// from "a file grew".
-const MATCH_RENDER_TOTAL: usize = 118;
+const MATCH_RENDER_TOTAL: usize = 117;
 
 /// Every string-literal CONTENT in a Rust source: ordinary `"…"`, raw
 /// `r"…"`/`r#"…"#`, byte `b"…"` and byte-raw. Comments are dropped.

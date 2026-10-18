@@ -88,7 +88,7 @@
 //! | [`super::metrics_sql`] evaluation window | `StartClosedEndOpen` | `metrics_plan`'s snapped `[start, end)` |
 //! | [`super::metrics_sql`] `compare()` selection window | `StartOpenEndClosed` | the reference's `spanStartTime > start && spanStartTime <= end` (Tempo `pkg/traceql/engine_metrics_compare.go:98-110` @ v3.0.2) — a query operand, not a request window |
 //!
-//! [`super::tags_sql::DaySpan`] is deliberately NOT expressed here. The
+//! `DaySpan` (deleted by issue #598) was deliberately NOT expressed here. The
 //! tag-discovery reads carry a day bound and no `timestamp_ns` bound at
 //! all (a sub-day predicate prunes nothing on `trace_spans` and defeats
 //! the `span_name_day` projection — see that type's own doc), so they
