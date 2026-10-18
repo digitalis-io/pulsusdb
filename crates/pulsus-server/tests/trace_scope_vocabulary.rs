@@ -26,7 +26,7 @@
 
 use std::collections::BTreeSet;
 
-use pulsus_read::traces::tags_sql::{ATTR_SCOPES, RESERVED_INTRINSIC_SCOPES};
+use pulsus_read::traces::spans::tags::{ATTR_SCOPES, RESERVED_INTRINSIC_SCOPES};
 
 #[path = "support/source_scan.rs"]
 mod source_scan;

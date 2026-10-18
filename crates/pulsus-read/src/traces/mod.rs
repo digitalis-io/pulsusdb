@@ -13,11 +13,7 @@
 //! value types the decode builds), [`metrics_plan`]/
 //! [`metrics_sql`] (the issue #59 TraceQL metrics planner + byte-frozen
 //! single-query pushdown builders), [`log2_histogram`] (the reference's
-//! pure `histogram_over_time` bucket rule, issue #252), [`tags_sql`]
-//! (the pure §4.3
-//! tag-discovery builders — the two catalog-only ones of issue #58 and
-//! the two store-backed ones of issue #478), [`tag_narrow`] (the issue
-//! #478 `q`-to-terms lowering), [`window_sql`] (the issue #525 shared
+//! pure `histogram_over_time` bucket rule, issue #252), [`window_sql`] (the issue #525 shared
 //! time-window bound conventions — the one place a window's row bound
 //! and its day-partition bound are rendered from, so the two cannot
 //! disagree), [`spans`] (the issue #587 trace fetch on the span,
@@ -51,8 +47,6 @@ pub mod rows;
 // that one is permanent by design.
 
 pub mod spans;
-pub mod tag_narrow;
-pub mod tags_sql;
 pub mod values;
 pub mod window_sql;
 
