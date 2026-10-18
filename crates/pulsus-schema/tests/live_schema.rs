@@ -1211,7 +1211,9 @@ async fn an_existing_landing_table_is_adopted_by_a_rerun() {
              hist_neg_span_lengths    Array(UInt32)  CODEC(ZSTD(1)),
              hist_neg_bucket_deltas   Array(Int64)  CODEC(ZSTD(1)),
              hist_custom_values       Array(Float64)  CODEC(ZSTD(1)),
-             hist_counter_reset_hint  UInt8  CODEC(ZSTD(1))
+             hist_counter_reset_hint  UInt8  CODEC(ZSTD(1)),
+             ex_trace_id              FixedString(16)  CODEC(ZSTD(1)),
+             ex_span_id               FixedString(8)  CODEC(ZSTD(1))
          ) ENGINE = MergeTree
          PARTITION BY toStartOfHour(fromUnixTimestamp64Milli(received_ms))
          ORDER BY (org_id, kind, metric_name, fingerprint, unix_milli)
@@ -1335,6 +1337,8 @@ struct LandingSeriesRow {
     hist_neg_bucket_deltas: Vec<i64>,
     hist_custom_values: Vec<f64>,
     hist_counter_reset_hint: u8,
+    ex_trace_id: [u8; 16],
+    ex_span_id: [u8; 8],
 }
 
 /// **S3 (issue #623): a label row is stored once per series, activity once

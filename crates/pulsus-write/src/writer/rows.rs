@@ -878,7 +878,7 @@ impl SpoolEncode for MetricMetadataRow {
 ///
 /// `kind` says which event the row is; a row sets that kind's columns and
 /// leaves the rest at the type's default. The fields are the landing
-/// table's 26 columns, in the table's own declaration order: the insert's
+/// table's 28 columns, in the table's own declaration order: the insert's
 /// column list is exactly this type's `COLUMN_NAMES`.
 ///
 /// No `PartialEq` derive, for [`MetricSampleRow`]'s reason: `value`,
@@ -913,10 +913,9 @@ pub struct MetricLandingRow {
     pub hist_neg_bucket_deltas: Vec<i64>,
     pub hist_custom_values: Vec<f64>,
     pub hist_counter_reset_hint: u8,
-    // STUB (tests first, issue #501): not yet a column.
-    #[serde(skip)]
+    /// Issue #501: a kind-4 row's exemplar ids, all zero for none.
+    /// `[u8; N]` is `FixedString(N)` on the RowBinary wire.
     pub ex_trace_id: [u8; 16],
-    #[serde(skip)]
     pub ex_span_id: [u8; 8],
 }
 
@@ -927,8 +926,8 @@ pub struct MetricLandingRow {
 ///
 /// A landing row is the union of the four target rows' columns, so it is far
 /// wider than any one of them: three `i64`s, three `f64`s, two `u64`s, a
-/// 16-byte fingerprint, four `String` headers, seven `Vec` headers and four
-/// small integers. What a target row costs prices only the text and array
+/// 16-byte fingerprint, four `String` headers, seven `Vec` headers, four
+/// small integers and the two exemplar ids. What a target row costs prices only the text and array
 /// elements the row owns; the queue also holds all of those slots, every one
 /// of them whether or not its kind uses it.
 pub const LANDING_ROW_SLOT_BYTES: u64 = std::mem::size_of::<MetricLandingRow>() as u64;
@@ -1071,14 +1070,29 @@ impl MetricLandingRow {
         }
     }
 
-    /// STUB (tests first, issue #501).
-    pub fn exemplar(org_id: &Arc<str>, received_ms: i64, _exemplar: &ExemplarPoint) -> Self {
-        Self::of_kind(org_id, received_ms, Self::KIND_EXEMPLAR)
+    /// A kind-4 row: the columns `metric_exemplars_mv` reads, and no others
+    /// (issue #501).
+    pub fn exemplar(org_id: &Arc<str>, received_ms: i64, exemplar: &ExemplarPoint) -> Self {
+        // Spare capacity given back, for [`Self::series`]' reason.
+        let mut labels = exemplar.labels.to_canonical_json();
+        labels.shrink_to_fit();
+        MetricLandingRow {
+            metric_name: exemplar.metric_name.to_string(),
+            fingerprint: exemplar.fingerprint,
+            unix_milli: exemplar.unix_milli,
+            value: exemplar.value,
+            labels,
+            ex_trace_id: exemplar.trace_id,
+            ex_span_id: exemplar.span_id,
+            ..Self::of_kind(org_id, received_ms, Self::KIND_EXEMPLAR)
+        }
     }
 
-    /// STUB (tests first, issue #501).
-    pub fn exemplar_source_bytes(_exemplar: &ExemplarPoint) -> u64 {
-        0
+    /// The buffers a kind-4 row prices: the name, the 16-byte fingerprint,
+    /// `unix_milli`, `value`, the two ids and the canonical labels.
+    pub fn exemplar_source_bytes(exemplar: &ExemplarPoint) -> u64 {
+        (exemplar.metric_name.len() + 16 + 8 + 8 + 16 + 8) as u64
+            + estimate_canonical_json_len(&exemplar.labels) as u64
     }
 }
 
@@ -1137,7 +1151,20 @@ impl SpoolEncode for MetricLandingRow {
                 "labels": self.labels,
                 "value_type": self.value_type,
             }),
-            // Every row is one of the four kinds — nothing else constructs
+            Self::KIND_EXEMPLAR => serde_json::json!({
+                "kind": self.kind,
+                "org_id": &*self.org_id,
+                "received_ms": self.received_ms,
+                "metric_name": self.metric_name,
+                "fingerprint": self.fingerprint,
+                "unix_milli": self.unix_milli,
+                "value": finite_or_null(self.value),
+                "value_bits": self.value.to_bits().to_string(),
+                "trace_id": hex_lower(&self.ex_trace_id),
+                "span_id": hex_lower(&self.ex_span_id),
+                "labels": self.labels,
+            }),
+            // Every row is one of the five kinds — nothing else constructs
             // one — so this arm is the descriptor's. Matching it as the
             // fallback rather than panicking keeps the audit record
             // readable on the one path that reaches this encoder at all,
@@ -1246,6 +1273,21 @@ impl SpoolEncode for MetricLandingRow {
                 o.field("received_ms", &self.received_ms).await?;
                 o.field("unix_milli", &self.unix_milli).await?;
                 o.field("value_type", &self.value_type).await?;
+            }
+            Self::KIND_EXEMPLAR => {
+                o.field("fingerprint", &self.fingerprint).await?;
+                o.field("kind", &self.kind).await?;
+                o.str_field("labels", &self.labels).await?;
+                o.str_field("metric_name", &self.metric_name).await?;
+                o.str_field("org_id", &self.org_id).await?;
+                o.field("received_ms", &self.received_ms).await?;
+                o.str_field("span_id", &hex_lower(&self.ex_span_id)).await?;
+                o.str_field("trace_id", &hex_lower(&self.ex_trace_id))
+                    .await?;
+                o.field("unix_milli", &self.unix_milli).await?;
+                o.field("value", &FiniteOrNull(self.value)).await?;
+                o.str_field("value_bits", &self.value.to_bits().to_string())
+                    .await?;
             }
             // The descriptor's arm, as the fallback, for the reason
             // [`Self::to_spool_value`]'s own fallback gives.

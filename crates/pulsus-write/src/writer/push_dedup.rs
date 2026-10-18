@@ -278,6 +278,18 @@ fn metric_content_digest(batch: &ParsedMetrics) -> PushDigest {
             .fingerprint(series.fingerprint)
             .labels(&series.labels);
     }
+    // Issue #501: a push differing only in an exemplar is another push.
+    d.u64(batch.exemplars.len() as u64);
+    for e in &batch.exemplars {
+        d.str(&e.metric_name)
+            .fingerprint(e.fingerprint)
+            .i64(e.unix_milli)
+            .f64(e.value)
+            .bytes(&e.trace_id)
+            .bytes(&e.span_id)
+            .labels(&e.labels)
+            .u8(e.histogram as u8);
+    }
     d.u64(batch.metadata.len() as u64);
     for meta in &batch.metadata {
         d.str(&meta.metric_name)

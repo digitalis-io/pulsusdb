@@ -3,7 +3,7 @@
 **What this is.** The implementation design of the metrics ingest write path as it stands
 on `main` after issue #603: one landing table, one insert per push, and one materialized
 view per target table. It states the decisions, the guarantees, and for each guarantee
-what holds it up.
+what holds it up. **`metric_exemplars` and landing kind 4 (issue #501) are not described here; `schema/schema.sql` defines them.**
 
 **Who it is for.** Someone about to do the same thing for logs or for traces. §10 is the
 only part that differs per signal; everything above it is the pattern, and nothing in it

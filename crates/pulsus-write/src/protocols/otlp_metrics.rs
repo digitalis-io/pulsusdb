@@ -248,10 +248,18 @@ fn charge_budget(expanded_bytes: &mut usize, amount: usize) -> Result<(), LogsIn
     Ok(())
 }
 
-/// STUB (tests first, issue #501).
-#[allow(dead_code)]
-fn exemplar_charge(_ex: &Exemplar) -> usize {
-    0
+/// What one exemplar costs the expansion budget (issue #501), read from its
+/// wire form so it is charged before anything of it is converted: the point
+/// itself, one label slot per filtered attribute, and the attributes at the
+/// worst-case expansion of their rendering. Allocation-free.
+fn exemplar_charge(ex: &Exemplar) -> usize {
+    std::mem::size_of::<ExemplarPoint>()
+        .saturating_add(
+            ex.filtered_attributes
+                .len()
+                .saturating_mul(std::mem::size_of::<(String, String)>()),
+        )
+        .saturating_add(attrs_budget_charge(&ex.filtered_attributes))
 }
 
 /// Everything [`parse`] needs from `Config`, bundled into one value so a
@@ -1156,7 +1164,18 @@ fn emit_number_point(
     };
     let value = stale_or(dp.flags, raw_value);
     let ctx = DataPointContext::new(out, expanded_bytes, base, &dp.attributes, unix_milli)?;
-    emit_sample(out, expanded_bytes, seen_series, name, &ctx, None, value)
+    let fingerprint = emit_sample(
+        out,
+        expanded_bytes,
+        seen_series,
+        Arc::clone(&name),
+        &ctx,
+        None,
+        value,
+    )?;
+    attach_exemplars(out, expanded_bytes, &dp.exemplars, false, |_| {
+        (Arc::clone(&name), fingerprint)
+    })
 }
 
 /// Histogram mapping (architect plan + amendment): `{name}_bucket{le}` per
@@ -1199,11 +1218,15 @@ fn emit_histogram_point(
     };
     let ctx = DataPointContext::new(out, expanded_bytes, base, &dp.attributes, unix_milli)?;
     let bucket_name: Arc<str> = Arc::from(format!("{name}_bucket").as_str());
+    // Each emitted bucket's bound and series, for the exemplars (issue
+    // #501); kept only when the point carries any, so a point with none
+    // allocates nothing for them.
+    let mut buckets: Vec<(f64, Fingerprint)> = Vec::new();
 
     if dp.bucket_counts.is_empty() {
         // No distribution to cross-check, but `_bucket{le="+Inf"}` must
         // still equal `_count` (review finding 2, AC).
-        emit_sample(
+        let fingerprint = emit_sample(
             out,
             expanded_bytes,
             seen_series,
@@ -1212,6 +1235,9 @@ fn emit_histogram_point(
             Some(("le", "+Inf".to_string())),
             stale_or(dp.flags, dp.count as f64),
         )?;
+        if !dp.exemplars.is_empty() {
+            buckets.push((f64::INFINITY, fingerprint));
+        }
     } else {
         let Some(derived_count) = checked_sum(dp.bucket_counts.iter().copied()) else {
             reject_point(out, || {
@@ -1244,7 +1270,7 @@ fn emit_histogram_point(
                 .expect("prefix sum is bounded by the already-checked total derived_count");
             let le = dp.explicit_bounds.get(i).copied().unwrap_or(f64::INFINITY);
             let value = stale_or(dp.flags, running as f64);
-            emit_sample(
+            let fingerprint = emit_sample(
                 out,
                 expanded_bytes,
                 seen_series,
@@ -1253,8 +1279,14 @@ fn emit_histogram_point(
                 Some(("le", render_bound(le))),
                 value,
             )?;
+            if !dp.exemplars.is_empty() {
+                buckets.push((le, fingerprint));
+            }
         }
     }
+    attach_exemplars(out, expanded_bytes, &dp.exemplars, false, |value| {
+        (Arc::clone(&bucket_name), bucket_for(&buckets, value))
+    })?;
 
     let count_name: Arc<str> = Arc::from(format!("{name}_count").as_str());
     emit_sample(
@@ -1388,7 +1420,10 @@ fn emit_exponential_histogram_point(
     // float rounding can map two distinct bucket bounds to the same
     // displayed label, which would otherwise emit two samples at the same
     // `(metric_name, fingerprint, timestamp)`).
-    let mut merged: Vec<(String, u64)> = Vec::with_capacity(pairs.len());
+    // Each entry keeps the numeric bound of its first pair beside its
+    // label, for the exemplars (issue #501): the pairs it merges render the
+    // same, so any of them would do.
+    let mut merged: Vec<(String, f64, u64)> = Vec::with_capacity(pairs.len());
     for (le, count) in pairs {
         let label = render_bound(le);
         match merged.last_mut() {
@@ -1396,26 +1431,29 @@ fn emit_exponential_histogram_point(
             // sum sequence (`derived_count` above), so this partial total
             // can never itself overflow `u64`.
             Some(last) if last.0 == label => {
-                last.1 = last
-                    .1
+                last.2 = last
+                    .2
                     .checked_add(count)
                     .expect("merged total is bounded by the already-checked derived_count")
             }
-            _ => merged.push((label, count)),
+            _ => merged.push((label, le, count)),
         }
     }
 
     let bucket_name: Arc<str> = Arc::from(format!("{name}_bucket").as_str());
+    // As in [`emit_histogram_point`]: kept only when the point carries
+    // exemplars.
+    let mut buckets: Vec<(f64, Fingerprint)> = Vec::new();
     let mut running: u64 = 0;
     let mut emitted_inf = false;
-    for (label, count) in &merged {
+    for (label, le, count) in &merged {
         // Infallible for the same reason as the merge step above.
         running = running
             .checked_add(*count)
             .expect("prefix sum is bounded by the already-checked total derived_count");
         let value = stale_or(dp.flags, running as f64);
         emitted_inf = label == "+Inf";
-        emit_sample(
+        let fingerprint = emit_sample(
             out,
             expanded_bytes,
             seen_series,
@@ -1424,6 +1462,9 @@ fn emit_exponential_histogram_point(
             Some(("le", label.clone())),
             value,
         )?;
+        if !dp.exemplars.is_empty() {
+            buckets.push((*le, fingerprint));
+        }
     }
     if !emitted_inf {
         // `running` already equals `derived_count` (every positive/
@@ -1431,7 +1472,7 @@ fn emit_exponential_histogram_point(
         // bucket is always present and always equals `_count` by
         // construction (architect plan invariant).
         let value = stale_or(dp.flags, running as f64);
-        emit_sample(
+        let fingerprint = emit_sample(
             out,
             expanded_bytes,
             seen_series,
@@ -1440,7 +1481,13 @@ fn emit_exponential_histogram_point(
             Some(("le", "+Inf".to_string())),
             value,
         )?;
+        if !dp.exemplars.is_empty() {
+            buckets.push((f64::INFINITY, fingerprint));
+        }
     }
+    attach_exemplars(out, expanded_bytes, &dp.exemplars, false, |value| {
+        (Arc::clone(&bucket_name), bucket_for(&buckets, value))
+    })?;
 
     let count_name: Arc<str> = Arc::from(format!("{name}_count").as_str());
     emit_sample(
@@ -1566,7 +1613,9 @@ fn emit_native_exponential_histogram(
         unix_milli,
         histogram,
     });
-    Ok(())
+    attach_exemplars(out, expanded_bytes, &dp.exemplars, true, |_| {
+        (Arc::clone(name), fingerprint)
+    })
 }
 
 /// Builds the raw `(bound, count)` pairs for one exponential-histogram data
@@ -1730,7 +1779,7 @@ fn emit_sample(
     ctx: &DataPointContext,
     extra: Option<(&str, String)>,
     value: f64,
-) -> Result<(), LogsIngestError> {
+) -> Result<Fingerprint, LogsIngestError> {
     // Charge this sample's expanded output BEFORE materializing its
     // `LabelSet` (issue #62): the fixed row floor, the per-scope base
     // pairs it clones (`base_charge`, O(1) read — no re-walk), its own
@@ -1770,7 +1819,102 @@ fn emit_sample(
         unix_milli: ctx.unix_milli,
         value,
     });
+    Ok(fingerprint)
+}
+
+/// The most characters an exemplar's ids and filtered attributes may come
+/// to before the attributes are dropped (the reference's OTLP translator,
+/// `getPromExemplars`).
+const MAX_EXEMPLAR_RUNES: usize = 128;
+
+/// Converts a data point's exemplars and attaches each to the series
+/// `series_for` names for its value (issue #501). Each is charged from its
+/// wire form before anything of it is converted; one with no value or a
+/// time [`resolve_timestamp_ms`] refuses is dropped on its own, and its data
+/// point is unaffected.
+///
+/// Called only once the data point's samples are stored, so a rejected data
+/// point keeps none of its exemplars.
+fn attach_exemplars(
+    out: &mut ParsedMetrics,
+    expanded_bytes: &mut usize,
+    exemplars: &[Exemplar],
+    histogram: bool,
+    series_for: impl Fn(f64) -> (Arc<str>, Fingerprint),
+) -> Result<(), LogsIngestError> {
+    for ex in exemplars {
+        charge_budget(expanded_bytes, exemplar_charge(ex))?;
+        let Ok(unix_milli) = resolve_timestamp_ms(ex.time_unix_nano) else {
+            continue;
+        };
+        let value = match ex.value {
+            Some(exemplar::Value::AsDouble(v)) => v,
+            Some(exemplar::Value::AsInt(i)) => i as f64,
+            None => continue,
+        };
+        // Any length but the id's own is stored as absent.
+        let trace_id = <[u8; 16]>::try_from(ex.trace_id.as_slice()).unwrap_or([0; 16]);
+        let span_id = <[u8; 8]>::try_from(ex.span_id.as_slice()).unwrap_or([0; 8]);
+        let has_trace = trace_id != [0; 16];
+        let has_span = span_id != [0; 8];
+
+        // The ids count as their label name plus their hex text; every
+        // attribute counts its key and rendered value, in characters.
+        let mut runes = 0usize;
+        if has_trace {
+            runes += "trace_id".len() + 32;
+        }
+        if has_span {
+            runes += "span_id".len() + 16;
+        }
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        for kv in &ex.filtered_attributes {
+            runes = runes.saturating_add(kv.key.chars().count());
+            if runes > MAX_EXEMPLAR_RUNES {
+                break;
+            }
+            let rendered = any_value_to_string(kv.value.as_ref());
+            runes = runes.saturating_add(rendered.chars().count());
+            if runes > MAX_EXEMPLAR_RUNES {
+                break;
+            }
+            // An attribute named for an id yields to the id it names.
+            if (has_trace && kv.key == "trace_id") || (has_span && kv.key == "span_id") {
+                continue;
+            }
+            pairs.push((kv.key.clone(), rendered));
+        }
+        if runes > MAX_EXEMPLAR_RUNES {
+            pairs.clear();
+        }
+
+        let (metric_name, fingerprint) = series_for(value);
+        out.exemplars.push(ExemplarPoint {
+            metric_name,
+            fingerprint,
+            unix_milli,
+            value,
+            trace_id,
+            span_id,
+            labels: LabelSet::from_verbatim(pairs),
+            histogram,
+        });
+    }
     Ok(())
+}
+
+/// The series of the first bucket whose bound `value` does not exceed,
+/// tested against every bucket in bucket order; the last bucket, the
+/// `+Inf` one, when none. `buckets` is never empty: every stored histogram
+/// has at least one `_bucket` series.
+fn bucket_for(buckets: &[(f64, Fingerprint)], value: f64) -> Fingerprint {
+    buckets
+        .iter()
+        // `!(value > le)`: a NaN value is not above any bound.
+        .find(|(le, _)| value.partial_cmp(le) != Some(std::cmp::Ordering::Greater))
+        .or(buckets.last())
+        .map(|(_, fingerprint)| *fingerprint)
+        .expect("a stored histogram has at least one bucket series")
 }
 
 /// `addResourceTargetInfo` (`helper.go:498-605 @ v3.13.0`): the resource
