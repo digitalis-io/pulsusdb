@@ -6952,6 +6952,10 @@ async fn a_run_cut_short_counts_once() {
     let _server = spawn_ready(port, &db);
     let client = ch_data(&db).await;
     let l = fixture_anchor();
+    // Merges stopped: a merge would replace the repeated keys before the
+    // read, and a read without `FINAL` would then pass (issue #599 part A
+    // §5.5).
+    ch_exec(&client, "SYSTEM STOP MERGES service_edges").await;
     reset_edges(&client, l - 36 * MINUTE).await;
     push_m1_data(port, l, "M3");
     let select = ch_string(
