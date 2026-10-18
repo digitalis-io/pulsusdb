@@ -2677,7 +2677,9 @@ fn frame_compare_rows(
     // Per side: the population and each key's untrimmed sums, per bucket.
     let mut population: [BTreeMap<i64, u64>; 2] = [BTreeMap::new(), BTreeMap::new()];
     let mut sums: BTreeMap<String, [BTreeMap<i64, u64>; 2]> = BTreeMap::new();
-    let mut exemplars: Vec<(usize, String, Vec<(i64, ([u8; 16], i64))>)> = Vec::new();
+    // (side, key, its per-bucket exemplars `(bucket, (trace id, start ns))`).
+    type KeyExemplars = Vec<(i64, ([u8; 16], i64))>;
+    let mut exemplars: Vec<(usize, String, KeyExemplars)> = Vec::new();
     let mut values: BTreeMap<String, Vec<TraceMetricSeries>> = BTreeMap::new();
     for row in rows {
         let at = side(row.s);
