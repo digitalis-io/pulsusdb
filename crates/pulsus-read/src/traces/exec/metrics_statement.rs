@@ -231,6 +231,14 @@ fn label_of(
     Ok(labels)
 }
 
+/// Tests-first stub (issue #597).
+#[allow(dead_code)]
+pub(super) fn typed_value(text: &str, ty: &str) -> Result<MetricLabelValue, ReadError> {
+    Err(ReadError::Clickhouse(ChError::Decode(format!(
+        "a key value {text:?} of type {ty:?}"
+    ))))
+}
+
 #[cfg(test)]
 mod tests {
     use pulsus_traceql::parse;
@@ -299,5 +307,25 @@ mod tests {
             bucket("{} | histogram_over_time(duration)", 1_073_741_824),
             1.073741824
         );
+    }
+
+    /// U5 (issue #597): a compare value is labelled in the arm of its
+    /// stored type; an unknown type is an error.
+    #[test]
+    fn a_compare_value_is_labelled_by_its_stored_type() {
+        assert_eq!(typed_value("1", "i").ok(), Some(MetricLabelValue::Int(1)));
+        assert_eq!(
+            typed_value("1", "d").ok(),
+            Some(MetricLabelValue::Double(1.0))
+        );
+        assert_eq!(
+            typed_value("true", "b").ok(),
+            Some(MetricLabelValue::Bool(true))
+        );
+        assert_eq!(
+            typed_value("x", "s").ok(),
+            Some(MetricLabelValue::Str("x".to_string()))
+        );
+        assert!(typed_value("1", "q").is_err(), "an unknown type");
     }
 }

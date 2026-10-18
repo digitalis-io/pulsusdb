@@ -104,9 +104,16 @@ pub struct MetricsStatement {
     labels: Vec<String>,
     unit: TargetUnit,
     demands: Vec<String>,
+    compare: bool,
 }
 
 impl MetricsStatement {
+    /// Whether this is a `compare()` statement (issue #597), whose rows are
+    /// [`CompareStatementRow`]s.
+    pub fn is_compare(&self) -> bool {
+        self.compare
+    }
+
     /// The messages the filter's `!` demands raise (issue #602 part 2a): a
     /// `Code: 395` carrying one is the request's `400`.
     pub fn demands(&self) -> &[String] {
@@ -332,6 +339,7 @@ fn statement_for(
         labels: asked.keys.iter().map(label_of_key).collect(),
         unit: asked.target.unit(),
         demands: demands_of(body, range_window, tables),
+        compare: false,
     })
 }
 
@@ -1035,6 +1043,41 @@ fn where_clause(conditions: &[String]) -> String {
     }
 }
 
+// ---------------------------------------------------------------------
+// Issue #597: `compare()` in one statement. Tests-first stubs.
+// ---------------------------------------------------------------------
+
+/// Tests-first stub.
+pub const COMPARE_INTRINSIC_KEYS: [&str; 8] = [""; 8];
+
+/// One row of the `compare()` statement (issue #597): its side `s`, its
+/// grouping `g`, key `k`, value `v`, type `y`, per-bucket counts, per-bucket
+/// exemplars and the cap's flag `c`.
+#[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
+pub struct CompareStatementRow {
+    pub s: u8,
+    pub g: u8,
+    pub k: String,
+    pub v: String,
+    pub y: String,
+    pub pts: Vec<(i64, u64)>,
+    pub ex: Vec<(i64, ([u8; 16], i64))>,
+    pub c: u8,
+}
+
+/// Tests-first stub.
+#[allow(dead_code)]
+fn compare_statement(
+    _plan: &TraceMetricsPlan,
+    _outer: Option<&FieldExpr>,
+    _selection: Option<&FieldExpr>,
+    _window: Option<(i64, i64)>,
+    _max_series: u64,
+    _tables: &StatementTables<'_>,
+) -> Option<MetricsStatement> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use pulsus_traceql::parse;
@@ -1145,13 +1188,11 @@ mod tests {
         );
     }
 
-    /// D1: `compare()` stays on today's planner, and so does an intrinsic
-    /// target other than `duration` and `span:childCount` (part 2's D8).
+    /// D1: an intrinsic target other than `duration` and `span:childCount`
+    /// stays on today's planner (part 2's D8). `compare()` takes the
+    /// statement since issue #597 (U2).
     #[test]
-    fn compare_and_intrinsic_targets_stay_on_todays_planner() {
-        let q = "{} | compare({ status = error })";
-        let r = routed(q, &PARAMS).unwrap_or_else(|e| panic!("{q}: routed refused: {e}"));
-        assert!(r.statement().is_none(), "{q}: a statement");
+    fn intrinsic_targets_stay_on_todays_planner() {
         for q in [
             "{} | sum_over_time(nestedSetLeft)",
             "{} | avg_over_time(trace:duration)",
@@ -1326,6 +1367,243 @@ mod tests {
             ),
         ] {
             assert_eq!(flag(q), want, "{q}");
+        }
+    }
+
+    // ---- issue #597: compare() in one statement ------------------------
+
+    const CMP_PARAMS: MetricsParams = MetricsParams {
+        start_ns: 1_700_000_000_000_000_000,
+        end_ns: 1_700_003_600_000_000_000,
+        step_ms: 60_000,
+        exemplars: Some(100),
+    };
+
+    /// §3 of the plan, typed out: the range form; the instant form differs
+    /// in `{P}` and the window.
+    const COMPARE_TEMPLATE: &str = "{WITH}SELECT s, g, k, v, y, pts, ex, throwIf(countIf(g = 0 AND k != '') OVER () + 4 * uniqExactIf(k, g = 1 AND k != '') OVER () > {CAP}, 'metrics series cap') AS c
+FROM (SELECT s, g, k, v, y, pts, ex, row_number() OVER (PARTITION BY s, g, k ORDER BY tot DESC, v, y) AS rn
+      FROM (SELECT s, g, k, v, y, arraySort(groupArray((p, n))) AS pts, sum(n) AS tot,
+                   if(g = 1 AND {EXB}, arraySort(groupArray((p, (x.1, x.2)))), []) AS ex
+            FROM (SELECT s, e.1 AS k, e.2 AS v, e.3 AS y, p, sum(n) AS n, argMax(x, (x.3, x.4)) AS x, toUInt8(grouping(e.2)) AS g
+                  FROM (SELECT s, k, v, y, p, count() AS n, argMax((trace_id, st, du, sid), (du, sid)) AS x
+                        FROM (SELECT s, p, e.1 AS k, e.2 AS v, e.3 AS y, trace_id, st, du, sid
+                              FROM (SELECT toUInt8({SEL}) AS s, {P} AS p, trace_id, start_ns AS st, duration_ns AS du, span_id AS sid,
+                                           {KVS} AS kvs
+                                    {FROM})
+                              ARRAY JOIN kvs AS e
+                              WHERE e.3 != '')
+                        GROUP BY s, k, v, y, p) AS c
+                  LEFT JOIN {RES} AS rv ON c.y = 'r' AND c.v = rv.rk
+                  ARRAY JOIN if(c.y = 'r', rv.rkv, [(c.k, c.v, c.y)]) AS e
+                  GROUP BY GROUPING SETS ((s, e.1, e.2, e.3, p), (s, e.1, p)))
+            GROUP BY s, g, k, v, y))
+WHERE g = 1 OR (k != '' AND rn <= {TOPN})
+ORDER BY s, g, k, v, y";
+
+    /// `{J(pfx, col)}`, typed out.
+    fn typed_j(pfx: &str, col: &str) -> String {
+        format!(
+            "arrayMap(x -> ('{pfx}' || replaceAll(replaceAll(x.1, '%2E', '.'), '%25', '%'), \
+             if(startsWith(x.2, '\"'), JSONExtractString(x.2), x.2), \
+             transform(JSONAllPathsWithTypes({col})[x.1], ['Int64', 'Float64', 'Bool', 'String'], \
+             ['i', 'd', 'b', 's'], '')), JSONExtractKeysAndValuesRaw(toString({col})))"
+        )
+    }
+
+    /// §3's statement for `{} | compare(<selection>…)` over `w`, typed out.
+    fn typed_compare(sel: &str, p: &str, w: WindowSql, top_n: u64) -> String {
+        let kvs = format!(
+            "arrayConcat({}, {}, if(service_type = 'string', [('resource.service.name', \
+             toString(service), 's')], []), [('name', toString(name), 's'), ('kind', \
+             ['unspecified', 'internal', 'server', 'client', 'producer', 'consumer'][kind + 1], \
+             's'), ('status', ['unset', 'ok', 'error'][status_code + 1], 's'), ('statusMessage', \
+             status_message, 's'), ('instrumentation:name', toString(scope_name), 's'), \
+             ('instrumentation:version', toString(scope_version), 's'), ('rootName', tv.rn, 's'), \
+             ('rootServiceName', tv.rs, 's'), ('', '', 't'), ('', concat(hex(resource_id), \
+             toString(service)), 'r')])",
+            typed_j("span.", "attrs"),
+            typed_j("instrumentation.", "scope_attrs")
+        );
+        let res = format!(
+            "(SELECT concat(hex(resource_id), toString(service)) AS rk, any(kvs) AS rkv FROM \
+             (SELECT service, resource_id, arrayFilter(t -> t.3 != '', {}) AS kvs FROM resources \
+             WHERE {}) GROUP BY rk)",
+            typed_j("resource.", "attrs"),
+            w.resources_day_clause()
+        );
+        let from = format!(
+            "FROM spans\nLEFT JOIN (SELECT trace_id, max(end_ns) - min(start_ns) AS td, min(root) \
+             AS r, if(r.1 = 0, r.5, '') AS rn, if(r.1 = 0, r.4, '') AS rs FROM traces WHERE {} \
+             GROUP BY trace_id) AS tv USING trace_id\nWHERE {}\n  AND {}\n  AND {}\n  AND (true)",
+            w.per_trace_day_clause(),
+            w.span_time_clause(),
+            w.span_bucket_clause(),
+            w.span_day_clause()
+        )
+        .replace('\n', &format!("\n{}", " ".repeat(36)));
+        COMPARE_TEMPLATE
+            .replace("{WITH}", "")
+            .replace("{CAP}", "1000")
+            .replace("{EXB}", "1")
+            .replace("{SEL}", sel)
+            .replace("{P}", p)
+            .replace("{KVS}", &kvs)
+            .replace("{FROM}", &from)
+            .replace("{RES}", &res)
+            .replace("{TOPN}", &top_n.to_string())
+    }
+
+    /// The SQL of `status = error` compiled over `w`.
+    fn status_error_sql(w: WindowSql) -> String {
+        let q = parse("{ status = error } | rate()").expect("parse");
+        let SpansetExpr::Filter(SpansetFilter { body: Some(body) }) = &q.spanset else {
+            panic!("a filter body");
+        };
+        let ctx = PredicateCtx {
+            window: w,
+            spans_table: "spans",
+            resources_table: "resources",
+            indexed: &[],
+        };
+        compile_span_predicate_in(body, &ctx)
+            .expect("compiles")
+            .sql()
+            .to_string()
+    }
+
+    /// U1 (issue #597): the range and instant statements are §3's, byte for
+    /// byte; a selection window wraps the selection and `topN` bounds `rn`.
+    #[test]
+    fn the_compare_statement_is_byte_exact() {
+        let routed =
+            |q: &str| routed(q, &CMP_PARAMS).unwrap_or_else(|e| panic!("{q}: routed refused: {e}"));
+        let r = routed("{} | compare({ status = error })");
+        let st = r.statement().expect("a statement");
+        let (rlo, rhi) = r.plan().range_window_ns();
+        let range_w = WindowSql::start_closed_end_open(rlo, rhi);
+        let p = status_error_sql(range_w);
+        let bucket = "(intDiv(start_ns - 1, 60000000000) + 1) * 60000";
+        assert_eq!(
+            st.range_sql(),
+            typed_compare(&format!("({p})"), bucket, range_w, 10)
+        );
+        let (ilo, ihi) = r.plan().snapped_window_ns();
+        let instant_w = WindowSql::start_closed_end_open(ilo, ihi);
+        let ip = status_error_sql(instant_w);
+        assert_eq!(
+            st.instant_sql(),
+            typed_compare(
+                &format!("({ip})"),
+                &format!("toInt64({})", r.plan().snapped_end_ms()),
+                instant_w,
+                10
+            )
+        );
+        let r =
+            routed("{} | compare({ status = error }, 3, 1700000600000000000, 1700001200000000000)");
+        let st = r.statement().expect("a statement");
+        assert_eq!(
+            st.range_sql(),
+            typed_compare(
+                &format!(
+                    "(({p}) AND start_ns > 1700000600000000000 AND start_ns <= \
+                     1700001200000000000)"
+                ),
+                bucket,
+                range_w,
+                3
+            )
+        );
+    }
+
+    /// U2 (issue #597): a comparison whose spanset is one filter takes the
+    /// statement; a structural spanset keeps today's planner.
+    #[test]
+    fn compare_takes_the_statement_where_its_spanset_is_one_filter() {
+        let q = "{ .a = 1 } | compare({ .b = 2 })";
+        let r = routed(q, &PARAMS).unwrap_or_else(|e| panic!("{q}: routed refused: {e}"));
+        let st = r.statement().unwrap_or_else(|| panic!("{q}: no statement"));
+        assert!(st.is_compare(), "{q}: not a compare statement");
+        let q = "{ .a = 1 } >> { .b = 2 } | compare({ .c = 3 })";
+        let r = routed(q, &PARAMS).unwrap_or_else(|e| panic!("{q}: routed refused: {e}"));
+        assert!(r.statement().is_none(), "{q}: a statement");
+    }
+
+    /// U3 (issue #597): the eight intrinsic keys are D2's, each in the
+    /// statement, and no other intrinsic, event or link key is.
+    #[test]
+    fn the_compare_keys_are_the_references_eight() {
+        assert_eq!(
+            COMPARE_INTRINSIC_KEYS,
+            [
+                "name",
+                "kind",
+                "status",
+                "statusMessage",
+                "instrumentation:name",
+                "instrumentation:version",
+                "rootName",
+                "rootServiceName",
+            ]
+        );
+        let q = "{} | compare({ status = error })";
+        let r = routed(q, &PARAMS).unwrap_or_else(|e| panic!("{q}: routed refused: {e}"));
+        let sql = r
+            .statement()
+            .unwrap_or_else(|| panic!("{q}: no statement"))
+            .range_sql()
+            .to_string();
+        for key in COMPARE_INTRINSIC_KEYS {
+            assert!(sql.contains(&format!("('{key}', ")), "{key} missing");
+        }
+        for absent in [
+            "'span:id'",
+            "'duration'",
+            "'traceDuration'",
+            "'event:",
+            "'link:",
+            "'event.",
+            "'link.",
+            "'trace:id'",
+            "'span:parentID'",
+            "'nestedSetLeft'",
+            "'span:childCount'",
+        ] {
+            assert!(!sql.contains(absent), "{absent} present");
+        }
+        for column in ["events", "links"] {
+            let named = sql
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .any(|w| w == column);
+            assert!(!named, "the column {column} is read");
+        }
+    }
+
+    /// U4 (issue #597): both bodies' trace-level bindings merge into one
+    /// `WITH`, so a leaf both read is bound once.
+    #[test]
+    fn two_bodies_with_one_trace_leaf_bind_it_once() {
+        let q = "{ traceDuration > 1s } | compare({ traceDuration > 1s && status = error })";
+        let r = routed(q, &PARAMS).unwrap_or_else(|e| panic!("{q}: routed refused: {e}"));
+        let st = r.statement().unwrap_or_else(|| panic!("{q}: no statement"));
+        for sql in [st.range_sql(), st.instant_sql()] {
+            assert_eq!(sql.matches("WITH ").count(), 1, "one WITH: {sql}");
+            let aliases: Vec<&str> = sql
+                .match_indices(" AS tl_")
+                .map(|(i, _)| {
+                    let rest = &sql[i + 4..];
+                    let end = rest
+                        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                        .unwrap_or(rest.len());
+                    &rest[..end]
+                })
+                .collect();
+            assert_eq!(
+                aliases.len(),
+                1,
+                "the leaf's alias defined once: {aliases:?}"
+            );
         }
     }
 }
