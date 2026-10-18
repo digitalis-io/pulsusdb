@@ -1293,7 +1293,7 @@ when we are asking it to slow down, so we keep `429`; recorded as
   `sort.Slice` (`pkg/traceql/engine_metrics_compare.go:548-563`, the `sort.Slice` at `:557-559`, @ v3.0.2),
   which is explicitly not a stable sort, so equal-sum entries come out in
   an order that depends on the input permutation and on Go's pivot
-  choices. PulsusDB breaks the tie by **ascending value string**, so our
+  choices. PulsusDB breaks the tie by **ascending value string, then stored type** (issue #597), so our
   answer is the same on every run and on every machine.
 
 - **Measured, twice, on the reference.** Two corpora built for issue #460
