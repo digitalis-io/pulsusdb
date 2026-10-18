@@ -16858,7 +16858,7 @@ async fn the_ledger_search_claims_hold_on_the_route() {
 
 /// Fixture CMP (§5.2 of the plan): four pushes, each one `land` call.
 async fn seed_compare_cmp(test: &str) -> (String, ChClient, i64) {
-    let db = pulsus_testkit::test_db(&format!("pulsus_read_it_t597_{test}"));
+    let db = pulsus_testkit::test_db(&format!("pulsus_read_it_t597_cmp_{test}"));
     let client = fresh_db(&db).await;
     let l = metrics_l();
     let at = |s: i64| (l + s) * S_NS;
@@ -16980,7 +16980,7 @@ async fn seed_compare_cmp(test: &str) -> (String, ChClient, i64) {
 /// trace, one a second from `L+10s`; `idx = "i<j>"` on `11 − j` of them,
 /// `two` `"x"` on two and `"y"` on one.
 async fn seed_compare_topn(test: &str) -> (String, ChClient, i64) {
-    let db = pulsus_testkit::test_db(&format!("pulsus_read_it_t597_{test}"));
+    let db = pulsus_testkit::test_db(&format!("pulsus_read_it_t597_topn_{test}"));
     let client = fresh_db(&db).await;
     let l = metrics_l();
     let mut idx = Vec::new();
