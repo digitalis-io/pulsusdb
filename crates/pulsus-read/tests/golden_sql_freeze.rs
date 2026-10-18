@@ -769,7 +769,7 @@ fn golden_root() -> PathBuf {
 /// The committed goldens that carry a join today, none of which the
 /// compile core plans. The list is asserted as an EQUALITY, not used as
 /// a skip list: a join in any file it does not name fails this test.
-const JOINS_OUTSIDE_THE_COMPILED_SEARCH_CORPUS: [&str; 48] = [
+const JOINS_OUTSIDE_THE_COMPILED_SEARCH_CORPUS: [&str; 50] = [
     "traces_graph/clustered_local_join.sql",
     "traces_graph/single_node.sql",
     // Issue #559 added this comparison golden; a comparison cross-tab
@@ -781,6 +781,12 @@ const JOINS_OUTSIDE_THE_COMPILED_SEARCH_CORPUS: [&str; 48] = [
     "traces_metrics/compare_status_window.sql",
     "traces_metrics_base/compare_status.sql",
     "traces_metrics_base/compare_status_window.sql",
+    // Issue #599: the service graph's statement pairs a raw region's
+    // spans by `ARRAY JOIN` over each key's server halves, an array of the
+    // grouped row itself; built by `spans::graph::spans_graph_sql`, which
+    // the compile core does not plan.
+    "traces_spans_graph/clustered.sql",
+    "traces_spans_graph/single_node.sql",
     // Issue #596 part 1: the metrics statement's `ARRAY JOIN` expands a
     // series' cells, or a bucket's quantiles, into rows — an array of the
     // row itself, not a second table. It is the design's own statement,
@@ -969,7 +975,7 @@ fn every_join_in_the_golden_corpus_is_named() {
          any other file means a builder grew one and nobody said so"
     );
     assert_eq!(
-        scanned, 96,
+        scanned, 98,
         "every committed SQL golden in the tree is scanned, not only the two frozen corpora"
     );
 }

@@ -454,6 +454,9 @@ fn the_script_renders_exactly_what_this_crate_renders() {
                     "event.exception.type".to_string(),
                     "span.http-x.a_b".to_string(),
                 ],
+                // The script renders the production cap and has no input
+                // for it (issue #599), so this case keeps it.
+                graph_job_max_rows: pulsus_schema::GRAPH_JOB_MAX_ROWS,
             },
         ),
         (
@@ -898,34 +901,45 @@ fn the_citing_clustering_passages_name_the_section_holding_the_list() {
     );
 }
 
-/// **No view reads a table another view writes.** Chaining one view onto
-/// another's target would count every row twice, and the server would
-/// accept it without comment.
+/// **No insert-triggered view reads a table another view writes.**
+/// Chaining one such view onto another's target would count every row
+/// twice, and the server would accept it without comment.
 ///
 /// The sources are pinned as a set too: sixteen views read a landing
 /// table, three read `trace_spans` and one reads `trace_attrs_idx` — both
 /// of which the writer fills directly and no view targets.
+///
+/// **V1 (issue #599): the one refreshable view is named, not exempted.**
+/// `service_edges_mv` runs on a schedule rather than on an insert, and it
+/// reads `spans` (another view's target) and its own target, `service_edges`
+/// (its markers). It is pinned by name, target and exact sources, so a
+/// second refreshable view, or this one reading anything else, fails here
+/// instead of passing under a rule for every refreshable view.
 #[test]
-fn no_view_reads_a_table_another_view_writes() {
+fn no_insert_triggered_view_reads_a_table_another_view_writes() {
     let mut targets = Vec::new();
     let mut sources = Vec::new();
+    let mut refreshable = Vec::new();
     for stmt in rendered_statements(&single()) {
         let Some(head) = stmt.strip_prefix("CREATE MATERIALIZED VIEW pulsus.") else {
             continue;
         };
-        let target = head
-            .split_once(" TO pulsus.")
-            .expect("a view names its target")
-            .1
-            .lines()
+        let head_line = head.lines().next().expect("a view has a head line");
+        let name = head_line
+            .split_whitespace()
             .next()
-            .expect("the target is on the head line")
+            .expect("the view's name")
+            .to_string();
+        let target = head_line
+            .split_once(" TO pulsus.")
+            .expect("a view names its target on its head line")
+            .1
             .trim()
             .to_string();
-        targets.push(target);
+        targets.push(target.clone());
         // Every `FROM`, not just the first: a view with a subquery has
         // more than one, and each is a source.
-        let before = sources.len();
+        let mut own: Vec<String> = Vec::new();
         for (at, _) in stmt.match_indices("FROM pulsus.") {
             let table = stmt[at + "FROM pulsus.".len()..]
                 .split_whitespace()
@@ -933,14 +947,27 @@ fn no_view_reads_a_table_another_view_writes() {
                 .expect("a table follows FROM")
                 .trim_end_matches(';')
                 .to_string();
-            sources.push(table);
+            own.push(table);
         }
-        assert!(
-            sources.len() > before,
-            "a view that names no source: {stmt}"
-        );
+        assert!(!own.is_empty(), "a view that names no source: {stmt}");
+        if head_line.contains(" REFRESH EVERY ") {
+            own.sort();
+            own.dedup();
+            refreshable.push((name, target, own));
+        } else {
+            sources.extend(own);
+        }
     }
-    assert_eq!(targets.len(), 21, "twenty-one views");
+    assert_eq!(targets.len(), 22, "twenty-two views");
+    assert_eq!(
+        refreshable,
+        vec![(
+            "service_edges_mv".to_string(),
+            "service_edges".to_string(),
+            vec!["service_edges".to_string(), "spans".to_string()],
+        )],
+        "the one refreshable view, its target and its sources"
+    );
     let mut distinct: Vec<String> = sources.clone();
     distinct.sort();
     distinct.dedup();
@@ -953,7 +980,7 @@ fn no_view_reads_a_table_another_view_writes() {
             "trace_landing",
             "trace_spans",
         ],
-        "a view reads a table outside the pinned source set"
+        "an insert-triggered view reads a table outside the pinned source set"
     );
     for source in &sources {
         assert!(
@@ -1418,4 +1445,127 @@ fn the_rollup_is_kept_as_long_as_the_lines_it_counts() {
     for stmt in [&samples, &rollup] {
         assert!(stmt.contains("ttl_only_drop_parts = 1"), "{stmt}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #599: the service-graph totals and the job that appends them.
+// ---------------------------------------------------------------------------
+
+/// `service_edges` as the design writes it (part A §3.1), rendered with
+/// `db = pulsus`, `retention_days = 7` and no storage policy.
+const SERVICE_EDGES_TABLE: &str = r#"CREATE TABLE IF NOT EXISTS pulsus.service_edges
+(
+    minute DateTime('UTC') CODEC(Delta, ZSTD(1)),
+    client_minute DateTime('UTC') CODEC(Delta, ZSTD(1)),
+    client LowCardinality(String) CODEC(ZSTD(1)),
+    server LowCardinality(String) CODEC(ZSTD(1)),
+    conn_type LowCardinality(String) CODEC(ZSTD(1)),
+    calls UInt64 CODEC(ZSTD(1)),
+    failed UInt64 CODEC(ZSTD(1)),
+    q AggregateFunction(quantilesTDigest(0.5, 0.95, 0.99), Int64) CODEC(ZSTD(1)),
+    ver UInt64 CODEC(ZSTD(1))
+)
+ENGINE = ReplacingMergeTree(ver)
+PARTITION BY toDate(minute)
+ORDER BY (conn_type, minute, client_minute, client, server)
+TTL toDateTime(least(toUInt32(minute) - if(conn_type = '', 240, 0) + (7 * 86400), 4294967295))
+SETTINGS index_granularity = 1024, ttl_only_drop_parts = 1;"#;
+
+/// `service_edges_mv` as the design writes it (part A §3.2), rendered the
+/// same way, with the production row ceiling.
+const SERVICE_EDGES_VIEW: &str = r#"CREATE MATERIALIZED VIEW pulsus.service_edges_mv REFRESH EVERY 1 MINUTE APPEND TO pulsus.service_edges
+AS WITH (SELECT arraySort(groupArray(minute)) FROM pulsus.service_edges FINAL WHERE conn_type = '') AS ms,
+     ms[arrayFirstIndex(i -> i = length(ms) OR ms[i + 1] - ms[i] != 300, arrayEnumerate(ms))] AS wm,
+     toStartOfInterval(now('UTC') - INTERVAL 3 MINUTE, INTERVAL 5 MINUTE) AS ready,
+     (SELECT toDateTime(min(toDate(parseDateTimeBestEffort(partition))), 'UTC') FROM system.parts WHERE database = 'pulsus' AND table = 'spans' AND active) AS oldest,
+     if(wm = 0, if(oldest = 0, ready - INTERVAL 5 MINUTE, oldest), wm + INTERVAL 1 MINUTE) AS lo,
+     least(ready, lo + INTERVAL 5 MINUTE) AS hi,
+     toInt64(toUnixTimestamp(lo)) * 1000000000 AS slo,
+     toInt64(toUnixTimestamp(hi)) * 1000000000 AS shi,
+     toUInt64(toUnixTimestamp64Milli(now64())) AS v
+SELECT * FROM (
+SELECT toDateTime(intDiv(s.6, 60000000000) * 60, 'UTC') AS minute, toDateTime(intDiv(c.4, 60000000000) * 60, 'UTC') AS client_minute,
+       c.1 AS client, s.2 AS server, if(c.3 = 3, 'rpc', 'messaging') AS conn_type,
+       count() AS calls, countIf(s.3 = 2 OR c.2 = 2) AS failed,
+       quantilesTDigestState(0.5, 0.95, 0.99)(s.4) AS q, v AS ver
+FROM (SELECT trace_id,
+        if(kind IN (3, 4) OR attrs.`zipkin%2Eshared`.:String = 'true', span_id, parent_span_id) AS k,
+        anyIf((service, status_code, kind, start_ns), kind IN (3, 4)) AS c,
+        countIf(kind IN (3, 4)) AS nc,
+        groupArrayIf((span_id, service, status_code, duration_ns, kind, start_ns), kind IN (2, 5)) AS ss
+ FROM pulsus.spans
+ WHERE start_ns >= slo - 60000000000 AND start_ns < shi + 60000000000
+   AND intDiv(start_ns, 300000000000) BETWEEN intDiv(slo - 60000000000, 300000000000) AND intDiv(shi + 59999999999, 300000000000)
+   AND ((kind IN (2, 5) AND start_ns >= slo AND start_ns < shi) OR kind IN (3, 4))
+ GROUP BY trace_id, k
+ HAVING nc > 0)
+ARRAY JOIN arrayDistinct(ss) AS s
+WHERE ((c.3 = 3 AND s.5 = 2) OR (c.3 = 4 AND s.5 = 5)) AND shi > slo
+GROUP BY minute, client_minute, client, server, conn_type
+UNION ALL
+SELECT hi - INTERVAL 1 MINUTE, hi - INTERVAL 1 MINUTE, '', '', '', 0, 0, quantilesTDigestState(0.5, 0.95, 0.99)(toInt64(0)), v
+FROM system.one
+WHERE hi > lo)
+ORDER BY conn_type = '', minute, client_minute, client, server, conn_type
+SETTINGS max_threads = 4, max_memory_usage = 4294967296, max_rows_to_read = 60000000, read_overflow_mode = 'throw', max_execution_time = 50,
+         max_insert_threads = 1, max_insert_block_size = 100000000, min_insert_block_size_rows = 100000000, min_insert_block_size_bytes = 10000000000;"#;
+
+/// The rendered statement beginning `head`, exactly one of it.
+fn statement_starting(ctx: &RenderCtx, head: &str) -> String {
+    let found: Vec<String> = rendered_statements(ctx)
+        .into_iter()
+        .filter(|s| s.starts_with(head))
+        .collect();
+    assert_eq!(found.len(), 1, "one statement begins {head:?}: {found:?}");
+    found.into_iter().next().expect("one statement")
+}
+
+/// **U3: the two statements are the design's, byte for byte, in both
+/// variants.** The live cases cannot see most of what is here — a codec, the
+/// partition key, the 3-minute wait, the 60 s margins, the marker's `240`, a
+/// ceiling or an insert setting — so the whole text is the assertion.
+#[test]
+fn the_service_edges_statements_are_the_plan_s() {
+    let table_head = "CREATE TABLE IF NOT EXISTS pulsus.service_edges\n";
+    let view_head = "CREATE MATERIALIZED VIEW pulsus.service_edges_mv ";
+    assert_eq!(
+        statement_starting(&single(), table_head),
+        SERVICE_EDGES_TABLE,
+        "single-node service_edges"
+    );
+    assert_eq!(
+        statement_starting(&single(), view_head),
+        SERVICE_EDGES_VIEW,
+        "single-node service_edges_mv"
+    );
+
+    let clustered_table = SERVICE_EDGES_TABLE
+        .replacen(
+            "pulsus.service_edges\n",
+            "pulsus.service_edges ON CLUSTER 'prod'\n",
+            1,
+        )
+        .replacen(
+            "ENGINE = ReplacingMergeTree(ver)",
+            "ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/pulsus.service_edges', '{replica}', ver)",
+            1,
+        );
+    let clustered_view = SERVICE_EDGES_VIEW.replacen(
+        "pulsus.service_edges_mv REFRESH",
+        "pulsus.service_edges_mv ON CLUSTER 'prod' REFRESH",
+        1,
+    );
+    assert_eq!(
+        statement_starting(
+            &clustered(),
+            "CREATE TABLE IF NOT EXISTS pulsus.service_edges ON CLUSTER 'prod'\n"
+        ),
+        clustered_table,
+        "clustered service_edges"
+    );
+    assert_eq!(
+        statement_starting(&clustered(), view_head),
+        clustered_view,
+        "clustered service_edges_mv"
+    );
 }

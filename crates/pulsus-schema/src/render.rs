@@ -64,7 +64,15 @@ pub struct RenderCtx {
     /// `span.<key>` / `event.<key>` items, each rendered into one index on
     /// `spans` by `{{trace_attr_indexes}}`.
     pub trace_indexed_attributes: Vec<String>,
+    /// `{{graph_job_max_rows}}` (issue #599): the rows one run of the
+    /// service-graph job may read. Not a setting: production renders
+    /// [`GRAPH_JOB_MAX_ROWS`], and a test lowers it to make a run fail.
+    pub graph_job_max_rows: u64,
 }
+
+/// The rows one run of the service-graph job may read (issue #599), the
+/// value `schema/schema.sh` renders. Stub.
+pub const GRAPH_JOB_MAX_ROWS: u64 = 0;
 
 impl RenderCtx {
     /// A context for a test: `db` as given, every other field at the value
@@ -90,6 +98,7 @@ impl RenderCtx {
             trace_landing_retention_hours: 6,
             trace_dedup_window: 10_000,
             trace_indexed_attributes: Vec::new(),
+            graph_job_max_rows: GRAPH_JOB_MAX_ROWS,
         }
     }
 }
@@ -246,6 +255,7 @@ mod tests {
             trace_landing_retention_hours: 6,
             trace_dedup_window: 10_000,
             trace_indexed_attributes: Vec::new(),
+            graph_job_max_rows: GRAPH_JOB_MAX_ROWS,
         }
     }
 

@@ -352,6 +352,31 @@ pub struct ServiceGraph {
     pub truncated: bool,
 }
 
+/// The cluster and database the clustered service graph reads (issue
+/// #599): the first two arguments of the `Distributed(…)` definition of the
+/// reader's `spans` routing table, so the graph reads the target the other
+/// trace routes read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphTarget {
+    pub cluster: String,
+    pub database: String,
+}
+
+/// The [`GraphTarget`] a routing table's `system.tables.engine_full`
+/// names: `Distributed('<cluster>', '<database>', …)`, both arguments
+/// quoted, as the server writes them. `None` for anything else.
+pub fn graph_target_from_engine(_engine_full: &str) -> Option<GraphTarget> {
+    None
+}
+
+/// The process-wide [`GraphTarget`], read once (issue #599).
+///
+/// The server builds a [`TraceEngine`] per request, so the cache lives in
+/// the server's shared state and is handed to each engine; cloning shares
+/// it. A failed read leaves it empty, and the next request reads again.
+#[derive(Debug, Clone, Default)]
+pub struct GraphTargetCache(std::sync::Arc<tokio::sync::OnceCell<GraphTarget>>);
+
 /// [`TraceEngine::list_tag_names`]'s output (issue #58): distinct
 /// `(scope, key)` pairs in the catalog's own `(scope, key)` order, at
 /// most [`TAG_NAMES_MAX`] of them; `truncated` is the non-silent cap
@@ -659,6 +684,8 @@ pub struct TraceEngine {
     /// The ceiling on `R`, the newest spans a span-name or narrowed-values
     /// read reaches back to (issue #598 part 2a).
     tag_read_rows: u64,
+    /// The clustered service graph's target, shared across engines.
+    graph_target: GraphTargetCache,
 }
 
 impl TraceEngine {
@@ -668,7 +695,16 @@ impl TraceEngine {
             config,
             indexed: Vec::new(),
             tag_read_rows: TAG_STORE_READ_ROWS,
+            graph_target: GraphTargetCache::default(),
         }
+    }
+
+    /// Shares `cache` as this engine's [`GraphTarget`] cache (issue #599):
+    /// the server hands every per-request engine the one process-wide
+    /// cache, so the target is read once per process.
+    pub fn with_graph_target_cache(mut self, cache: GraphTargetCache) -> Self {
+        self.graph_target = cache;
+        self
     }
 
     /// Lowers the ceiling on `R`, the spans a span-name or narrowed-values
@@ -3630,6 +3666,47 @@ mod tests {
         assert!(clustered.contains("distributed_product_mode"));
         assert!(clustered.contains("local"));
         assert!(clustered.contains("optimize_skip_unused_shards"));
+    }
+
+    /// U2 (issue #599): the clustered graph's target is the first two
+    /// quoted arguments of the routing table's `Distributed(…)` definition,
+    /// as `system.tables.engine_full` spells it, and nothing else is a
+    /// target.
+    #[test]
+    fn the_graph_target_comes_from_the_distributed_definition() {
+        let target = |c: &str, d: &str| GraphTarget {
+            cluster: c.to_string(),
+            database: d.to_string(),
+        };
+        for (engine_full, want) in [
+            (
+                "Distributed('c1', 'pulsus', 'spans', cityHash64(trace_id))",
+                Some(target("c1", "pulsus")),
+            ),
+            (
+                "Distributed('c1', 'pulsus', 'spans', cityHash64(trace_id)) \
+                 SETTINGS fsync_after_insert = 1, fsync_directories = 1",
+                Some(target("c1", "pulsus")),
+            ),
+            (
+                "Distributed('q', 'store', 'spans')",
+                Some(target("q", "store")),
+            ),
+            (
+                "ReplacingMergeTree PARTITION BY toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') \
+                 ORDER BY (intDiv(start_ns, 300000000000), trace_id)",
+                None,
+            ),
+            ("MergeTree", None),
+            ("Distributed(c1)", None),
+            ("", None),
+        ] {
+            assert_eq!(
+                graph_target_from_engine(engine_full),
+                want,
+                "the target named by {engine_full:?}"
+            );
+        }
     }
 
     /// Issue #133 AC5: `search_settings` and `catalog_settings` carry

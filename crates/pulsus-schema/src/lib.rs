@@ -21,6 +21,6 @@ pub use checks::{
     database_exists, missing_server_names, required_names_sql, server_version,
 };
 pub use error::SchemaError;
-pub use render::{RenderCtx, SchemaParams, render_name, rollup_suffix};
+pub use render::{GRAPH_JOB_MAX_ROWS, RenderCtx, SchemaParams, render_name, rollup_suffix};
 pub use replay::{ReplayReport, replay_trace_window};
 pub use sql::{SCHEMA_SQL, mv_projection, rendered, rendered_statements, table_column_names};

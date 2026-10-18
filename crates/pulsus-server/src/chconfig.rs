@@ -190,6 +190,7 @@ pub(crate) fn schema_params_from(config: &Config) -> SchemaParams {
         trace_landing_retention_hours: config.trace_landing_retention_hours,
         trace_dedup_window: config.trace_dedup_window,
         trace_indexed_attributes: config.traceql_indexed_attributes.clone(),
+        graph_job_max_rows: pulsus_schema::GRAPH_JOB_MAX_ROWS,
     }
 }
 
@@ -640,6 +641,16 @@ mod tests {
         let params = schema_params_from(&config);
         assert_eq!(params.db, "pulsus");
         assert_eq!(params.cluster.as_deref(), Some("prod"));
+    }
+
+    /// U2 (issue #599): production renders the service-graph job's row
+    /// ceiling at the value `schema/schema.sh` renders, 60,000,000.
+    #[test]
+    fn the_schema_params_carry_the_job_row_cap() {
+        assert_eq!(
+            schema_params_from(&Config::default()).graph_job_max_rows,
+            60_000_000
+        );
     }
 
     #[test]

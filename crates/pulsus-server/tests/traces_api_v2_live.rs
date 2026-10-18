@@ -31,6 +31,10 @@
 //! Both cases whose expected answer is empty carry their own non-vacuity
 //! request, so an empty table cannot satisfy them.
 //!
+//! Issue #599 part A's cases — the service graph from per-minute edge
+//! totals — are at the end of the file, with their own note on why no
+//! merge, deduplication or scheduled run can pass them on wrong code.
+//!
 //! Gated behind `PULSUS_TEST_CLICKHOUSE=1`. Run locally:
 //!
 //! ```text
@@ -5914,5 +5918,1971 @@ async fn a_trace_duration_condition_narrows() {
     assert_eq!(
         at("name", "{traceDuration > 1s}", ""),
         strs(&["slow.child", "slow.root"])
+    );
+}
+
+// =====================================================================
+// Issue #599 part A — the service graph from per-minute edge totals
+// =====================================================================
+//
+// A scheduled job in the database (`service_edges_mv`) pairs the spans of
+// each finished 5-minute interval into `service_edges`, ending every run
+// with a marker row; the route sums the minutes the markers cover and
+// pairs the rest of the window from `spans`.
+//
+// **How none of a background merge, insert deduplication or a scheduled
+// run can make wrong code pass** (part A §5.5):
+//
+// * a case that relies on duplicate span copies stops merges on `spans`
+//   before its first push and keeps them stopped, and every push that
+//   repeats a span carries one span no other push has, so neither the
+//   writer's retry suppression nor block deduplication drops it;
+// * "from totals" truncates `spans` — and the old route's `trace_spans`
+//   and `trace_edges` — before the request, so the answer can only come
+//   from `service_edges`;
+// * a case whose assertion reads a state the job could move stops the
+//   view first ([`stop_edges_view`] waits until it is disabled), and a
+//   case that counts runs counts them per marker, not per helper call.
+
+const SEC: i64 = 1_000_000_000;
+const MINUTE: i64 = 60 * SEC;
+const BUCKET: i64 = 5 * MINUTE;
+const MILLI: i64 = 1_000_000;
+
+fn floor_to(ns: i64, unit: i64) -> i64 {
+    ns.div_euclid(unit) * unit
+}
+
+/// `L`: now − 30 min, snapped to 5 minutes (part A §5.2).
+fn fixture_anchor() -> i64 {
+    floor_to(now_ns() - 30 * MINUTE, BUCKET)
+}
+
+/// One edge of the route's answer.
+#[derive(Debug, Clone, PartialEq)]
+struct Edge {
+    client: String,
+    server: String,
+    conn: String,
+    calls: u64,
+    failed: u64,
+    q: [f64; 3],
+}
+
+fn edge(client: &str, server: &str, conn: &str, calls: u64, failed: u64, q: [f64; 3]) -> Edge {
+    Edge {
+        client: client.to_string(),
+        server: server.to_string(),
+        conn: conn.to_string(),
+        calls,
+        failed,
+        q,
+    }
+}
+
+/// The route's answer over `[start, end)`: its edges in order, `truncated`
+/// and the request's statement id.
+fn graph_answer(port: u16, start: i64, end: i64, ctx: &str) -> (Vec<Edge>, bool, String) {
+    let path = format!("/api/traces/v1/service_graph?start={start}&end={end}");
+    let res = get(port, &path, ctx);
+    let json = res.json(ctx);
+    let edges = json["edges"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{ctx}: an edges array, got {json}"))
+        .iter()
+        .map(|e| Edge {
+            client: e["client"].as_str().unwrap_or_default().to_string(),
+            server: e["server"].as_str().unwrap_or_default().to_string(),
+            conn: e["connectionType"].as_str().unwrap_or_default().to_string(),
+            calls: e["calls"].as_u64().unwrap_or(u64::MAX),
+            failed: e["failed"].as_u64().unwrap_or(u64::MAX),
+            q: [
+                e["p50Ns"].as_f64().unwrap_or(f64::NAN),
+                e["p95Ns"].as_f64().unwrap_or(f64::NAN),
+                e["p99Ns"].as_f64().unwrap_or(f64::NAN),
+            ],
+        })
+        .collect();
+    let truncated = json["truncated"]
+        .as_bool()
+        .unwrap_or_else(|| panic!("{ctx}: a truncated flag, got {json}"));
+    let id = res
+        .headers
+        .get("x-pulsus-query-id")
+        .cloned()
+        .unwrap_or_default();
+    (edges, truncated, id)
+}
+
+fn graph_edges_of(port: u16, start: i64, end: i64, ctx: &str) -> Vec<Edge> {
+    graph_answer(port, start, end, ctx).0
+}
+
+/// `got` against `want`, in order. `exact` compares the quantiles exactly;
+/// otherwise within 1 %, the digest's documented movement with the part
+/// layout (part A L4).
+fn assert_edges(got: &[Edge], want: &[Edge], exact: bool, ctx: &str) {
+    let ids = |v: &[Edge]| -> Vec<(String, String, String, u64, u64)> {
+        v.iter()
+            .map(|e| {
+                (
+                    e.client.clone(),
+                    e.server.clone(),
+                    e.conn.clone(),
+                    e.calls,
+                    e.failed,
+                )
+            })
+            .collect()
+    };
+    assert_eq!(ids(got), ids(want), "{ctx}: the edges, in order");
+    for (g, w) in got.iter().zip(want) {
+        for i in 0..3 {
+            let ok = if exact {
+                g.q[i] == w.q[i]
+            } else {
+                (g.q[i] - w.q[i]).abs() <= w.q[i].abs() * 0.01
+            };
+            assert!(
+                ok,
+                "{ctx}: {} -> {} {} quantile {i}: got {}, want {}",
+                w.client, w.server, w.conn, g.q[i], w.q[i]
+            );
+        }
+    }
+}
+
+/// The route's answer over `[start, end)` against `want`.
+fn assert_graph(port: u16, start: i64, end: i64, want: &[Edge], exact: bool, ctx: &str) {
+    assert_edges(&graph_edges_of(port, start, end, ctx), want, exact, ctx);
+}
+
+/// Fixture G's answer (part A §5.2), each call `k` times.
+fn g1_rows(k: u64) -> Vec<Edge> {
+    vec![
+        edge(
+            "svc-a",
+            "svc-d",
+            "rpc",
+            20 * k,
+            0,
+            [10_000_000.0, 19_000_000.0, 20_000_000.0],
+        ),
+        edge("svc-a", "svc-e", "rpc", 2 * k, 2 * k, [40_000_000.0; 3]),
+        edge("svc-a", "svc-b", "messaging", k, 0, [20_000_000.0; 3]),
+        edge("svc-a", "svc-b", "rpc", k, 0, [10_000_000.0; 3]),
+        edge("svc-a", "svc-c", "rpc", k, k, [30_000_000.0; 3]),
+    ]
+}
+
+/// A trace id for copy `copy` of a fixture: `group` and `n` tell its
+/// traces apart.
+fn g_trace(copy: u8, group: u8, n: u8) -> [u8; 16] {
+    let mut id = [0u8; 16];
+    id[0] = 0x59;
+    id[1] = copy;
+    id[2] = group;
+    id[3] = n;
+    id[15] = 1;
+    id
+}
+
+/// A span id for copy `copy` of a fixture.
+fn g_span_id(copy: u8, role: u8, n: u8) -> [u8; 8] {
+    [0x5a, copy, role, n, 0, 0, 0, 1]
+}
+
+/// One span of a service-graph fixture.
+#[allow(clippy::too_many_arguments)]
+fn g_span(
+    trace: [u8; 16],
+    id: [u8; 8],
+    parent: Option<[u8; 8]>,
+    kind: SpanKind,
+    start_ns: i64,
+    duration_ns: i64,
+    error: bool,
+    attrs: Vec<KeyValue>,
+) -> Span {
+    Span {
+        trace_id: trace.to_vec(),
+        span_id: id.to_vec(),
+        parent_span_id: parent.map(|p| p.to_vec()).unwrap_or_default(),
+        name: "op".to_string(),
+        kind: kind as i32,
+        start_time_unix_nano: u64::try_from(start_ns).expect("a post-epoch fixture"),
+        end_time_unix_nano: u64::try_from(start_ns + duration_ns).expect("a post-epoch fixture"),
+        attributes: attrs,
+        status: error.then(|| Status {
+            code: 2,
+            message: String::new(),
+        }),
+        ..Default::default()
+    }
+}
+
+/// Fixture G (part A §5.2) at `l`, copy `copy`: its eight pushes P1–P8,
+/// each one service's spans, every span starting in `[l + 1 s, l + 70 s)`.
+fn fixture_g(l: i64, copy: u8) -> Vec<(&'static str, Vec<Span>)> {
+    let t = |g: u8, n: u8| g_trace(copy, g, n);
+    let s = |r: u8, n: u8| g_span_id(copy, r, n);
+    let c1 = g_span(
+        t(1, 1),
+        s(1, 1),
+        None,
+        SpanKind::Client,
+        l + 58 * SEC,
+        SEC,
+        false,
+        vec![],
+    );
+    let d = |i: u8| {
+        g_span(
+            t(2, i),
+            s(2, i),
+            None,
+            SpanKind::Client,
+            l + 30 * SEC + i64::from(i) * 500 * MILLI,
+            SEC,
+            false,
+            vec![],
+        )
+    };
+    let e = |i: u8| {
+        g_span(
+            t(2, i),
+            s(4, i),
+            Some(s(2, i)),
+            SpanKind::Server,
+            l + 30 * SEC + i64::from(i) * 500 * MILLI - 10 * MILLI,
+            i64::from(i) * MILLI,
+            false,
+            vec![],
+        )
+    };
+    let mut p1 = vec![
+        c1.clone(),
+        g_span(
+            t(1, 2),
+            s(1, 2),
+            None,
+            SpanKind::Client,
+            l + 10 * SEC,
+            SEC,
+            false,
+            vec![],
+        ),
+        g_span(
+            t(1, 3),
+            s(1, 3),
+            None,
+            SpanKind::Producer,
+            l + 20 * SEC,
+            SEC,
+            false,
+            vec![],
+        ),
+    ];
+    p1.extend((1..=20).map(d));
+    let p2 = vec![
+        g_span(
+            t(1, 1),
+            s(3, 1),
+            Some(s(1, 1)),
+            SpanKind::Server,
+            l + 61 * SEC,
+            10 * MILLI,
+            false,
+            vec![],
+        ),
+        g_span(
+            t(1, 3),
+            s(3, 2),
+            Some(s(1, 3)),
+            SpanKind::Consumer,
+            l + 21 * SEC,
+            20 * MILLI,
+            false,
+            vec![],
+        ),
+    ];
+    // The shared server span: the client's own span id, no parent.
+    let p3 = vec![g_span(
+        t(1, 2),
+        s(1, 2),
+        None,
+        SpanKind::Server,
+        l + 11 * SEC,
+        30 * MILLI,
+        true,
+        vec![kv_str("zipkin.shared", "true")],
+    )];
+    let p4: Vec<Span> = (1..=20).map(e).collect();
+    let mut p5 = p4.clone();
+    p5.push(g_span(
+        t(3, 1),
+        s(5, 1),
+        None,
+        SpanKind::Internal,
+        l + 5 * SEC,
+        MILLI,
+        false,
+        vec![],
+    ));
+    let p6 = vec![
+        c1,
+        g_span(
+            t(1, 4),
+            s(1, 4),
+            None,
+            SpanKind::Client,
+            l + 40 * SEC,
+            SEC,
+            true,
+            vec![],
+        ),
+        g_span(
+            t(1, 5),
+            s(1, 5),
+            None,
+            SpanKind::Producer,
+            l + 45 * SEC,
+            SEC,
+            false,
+            vec![],
+        ),
+        g_span(
+            t(1, 6),
+            s(1, 6),
+            None,
+            SpanKind::Client,
+            l + 50 * SEC,
+            SEC,
+            false,
+            vec![],
+        ),
+    ];
+    let p7 = vec![
+        g_span(
+            t(1, 4),
+            s(6, 1),
+            Some(s(1, 4)),
+            SpanKind::Server,
+            l + 41 * SEC,
+            40 * MILLI,
+            false,
+            vec![],
+        ),
+        g_span(
+            t(1, 4),
+            s(6, 2),
+            Some(s(1, 4)),
+            SpanKind::Server,
+            l + 41 * SEC,
+            40 * MILLI,
+            false,
+            vec![],
+        ),
+    ];
+    // Cross-kind halves: a server under a producer, a consumer under a
+    // client. Neither pair is an edge.
+    let p8 = vec![
+        g_span(
+            t(1, 5),
+            s(7, 1),
+            Some(s(1, 5)),
+            SpanKind::Server,
+            l + 46 * SEC,
+            MILLI,
+            false,
+            vec![],
+        ),
+        g_span(
+            t(1, 6),
+            s(7, 2),
+            Some(s(1, 6)),
+            SpanKind::Consumer,
+            l + 51 * SEC,
+            MILLI,
+            false,
+            vec![],
+        ),
+    ];
+    vec![
+        ("svc-a", p1),
+        ("svc-b", p2),
+        ("svc-c", p3),
+        ("svc-d", p4),
+        ("svc-d", p5),
+        ("svc-a", p6),
+        ("svc-e", p7),
+        ("svc-f", p8),
+    ]
+}
+
+/// One push carrying several services' spans, one resource each; waits
+/// until `spans` holds them.
+fn ingest_resources(port: u16, resources: Vec<(&str, Vec<Span>)>, ctx: &str) {
+    let req = ExportTraceServiceRequest {
+        resource_spans: resources
+            .into_iter()
+            .map(|(service, spans)| ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![kv_str("service.name", service)],
+                    dropped_attributes_count: 0,
+                    entity_refs: vec![],
+                }),
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans,
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            })
+            .collect(),
+    };
+    let res = request(
+        port,
+        "POST",
+        "/v1/traces",
+        Some(("application/x-protobuf", &req.encode_to_vec())),
+        &[],
+    )
+    .unwrap_or_else(|| panic!("{ctx}: ingest must be reachable"));
+    assert_eq!(
+        res.status,
+        200,
+        "{ctx}: ingest must succeed, body {:?}",
+        String::from_utf8_lossy(&res.body)
+    );
+    live_db::settle_pushed_spans(port, &pushed_keys(&req), ctx);
+}
+
+/// Fixture G at `l`, copy `copy`, in its eight pushes.
+fn push_g(port: u16, l: i64, copy: u8, ctx: &str) {
+    for (i, (service, spans)) in fixture_g(l, copy).into_iter().enumerate() {
+        ingest(port, service, spans, &format!("{ctx}: P{}", i + 1));
+    }
+}
+
+/// Fixture G at `l`, copy `copy`, in three pushes (P1–P3, P4–P5, P6–P8).
+fn push_g_in_three(port: u16, l: i64, copy: u8, ctx: &str) {
+    let mut pushes = fixture_g(l, copy).into_iter();
+    for (n, take) in [3usize, 2, 3].into_iter().enumerate() {
+        let part: Vec<(&str, Vec<Span>)> = pushes.by_ref().take(take).collect();
+        ingest_resources(port, part, &format!("{ctx}: push {}", n + 1));
+    }
+}
+
+/// Part A M1's data: fixture G copied into the nine buckets from `l − 35
+/// min` to `l + 5 min`, three pushes each, every copy its own ids.
+fn push_m1_data(port: u16, l: i64, ctx: &str) {
+    for j in 0..9u8 {
+        let at = l - 35 * MINUTE + i64::from(j) * BUCKET;
+        push_g_in_three(port, at, 10 + j, &format!("{ctx}: copy {j}"));
+    }
+}
+
+/// A `toDateTime` literal for a whole-second instant.
+fn ch_time(ns: i64) -> String {
+    format!("toDateTime({}, 'UTC')", ns.div_euclid(SEC))
+}
+
+/// One string out of `sql`, whose single column is named `s`.
+async fn ch_string(client: &ChClient, sql: &str) -> String {
+    client
+        .query_strings(sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("query failed: {e}\nSQL:\n{sql}"))
+        .into_iter()
+        .next()
+        .unwrap_or_default()
+}
+
+/// The service-graph totals and their job exist (issue #599): every helper
+/// below starts here, so a tree without them fails at this assertion.
+async fn assert_edge_job(client: &ChClient) {
+    let n = ch_count(
+        client,
+        "SELECT count() AS n FROM system.tables WHERE database = currentDatabase() \
+         AND name IN ('service_edges', 'service_edges_mv')",
+    )
+    .await;
+    assert_eq!(
+        n, 2,
+        "the service-graph totals `service_edges` and their job `service_edges_mv` exist"
+    );
+}
+
+/// The job's state in `system.view_refreshes`.
+async fn view_status(client: &ChClient) -> String {
+    ch_string(
+        client,
+        "SELECT status AS s FROM system.view_refreshes WHERE database = currentDatabase() \
+         AND view = 'service_edges_mv'",
+    )
+    .await
+}
+
+/// `SYSTEM STOP VIEW`, then waits until the view is disabled, so no run is
+/// in flight when the caller goes on.
+async fn stop_edges_view(client: &ChClient) {
+    assert_edge_job(client).await;
+    ch_exec(client, "SYSTEM STOP VIEW service_edges_mv").await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let status = view_status(client).await;
+        if status == "Disabled" {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the edge job did not stop: {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// One marker row at `minute_ns`, as a run of the job writes it.
+async fn insert_marker(client: &ChClient, minute_ns: i64) {
+    ch_exec(
+        client,
+        &format!(
+            "INSERT INTO service_edges SELECT {t}, {t}, '', '', '', 0, 0, \
+             arrayReduce('quantilesTDigestState(0.5, 0.95, 0.99)', [toInt64(0)]), 1",
+            t = ch_time(minute_ns)
+        ),
+    )
+    .await;
+}
+
+/// The job stopped, its totals emptied and one marker at `marker_ns` (a
+/// minute ending a bucket); the job stays stopped.
+async fn reset_edges(client: &ChClient, marker_ns: i64) {
+    assert_eq!(
+        (marker_ns + MINUTE).rem_euclid(BUCKET),
+        0,
+        "a marker sits at the last minute of a bucket"
+    );
+    stop_edges_view(client).await;
+    ch_exec(client, "TRUNCATE TABLE service_edges").await;
+    insert_marker(client, marker_ns).await;
+}
+
+/// Part A §4's `start_edges`: [`reset_edges`], then the job started again.
+async fn start_edges(client: &ChClient, marker_ns: i64) {
+    reset_edges(client, marker_ns).await;
+    ch_exec(client, "SYSTEM START VIEW service_edges_mv").await;
+}
+
+/// Every marker minute, oldest first, in nanoseconds.
+async fn markers(client: &ChClient) -> Vec<i64> {
+    client
+        .query_strings(
+            "SELECT toString(toUnixTimestamp(minute)) AS s FROM service_edges FINAL \
+             WHERE conn_type = '' ORDER BY minute",
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("read the markers")
+        .into_iter()
+        .map(|s| s.parse::<i64>().expect("a timestamp") * SEC)
+        .collect()
+}
+
+/// The end of the complete prefix of markers, §3.3's `last`: the markers in
+/// order from the oldest, up to the first that is not five minutes after
+/// the one before it. `0` with no marker.
+async fn prefix_end(client: &ChClient) -> i64 {
+    let s = ch_string(
+        client,
+        "SELECT toString(toUnixTimestamp(ms[arrayFirstIndex(i -> i = length(ms) \
+         OR ms[i + 1] - ms[i] != 300, arrayEnumerate(ms))])) AS s \
+         FROM (SELECT arraySort(groupArray(minute)) AS ms FROM service_edges FINAL \
+         WHERE conn_type = '')",
+    )
+    .await;
+    s.parse::<i64>().expect("a timestamp") * SEC
+}
+
+/// One `SYSTEM REFRESH VIEW` and its `SYSTEM WAIT VIEW`.
+async fn refresh_once(client: &ChClient) {
+    ch_exec(client, "SYSTEM REFRESH VIEW service_edges_mv").await;
+    ch_exec(client, "SYSTEM WAIT VIEW service_edges_mv").await;
+}
+
+/// Part A §4's `run_edges_until`: the job started, then one refresh at a
+/// time until the complete prefix ends at `until_ns` or later. Returns
+/// the number of refreshes it issued.
+async fn run_edges_until(client: &ChClient, until_ns: i64) -> u32 {
+    assert_edge_job(client).await;
+    ch_exec(client, "SYSTEM START VIEW service_edges_mv").await;
+    let mut runs = 0;
+    while prefix_end(client).await < until_ns {
+        assert!(
+            runs < 400,
+            "the edge job did not reach {until_ns} in {runs} runs"
+        );
+        refresh_once(client).await;
+        runs += 1;
+    }
+    runs
+}
+
+/// [`start_edges`] then [`run_edges_until`].
+async fn process_edges(client: &ChClient, marker_ns: i64, until_ns: i64) -> u32 {
+    start_edges(client, marker_ns).await;
+    run_edges_until(client, until_ns).await
+}
+
+/// The server's clock, in nanoseconds at whole seconds.
+async fn server_now(client: &ChClient) -> i64 {
+    ch_string(client, "SELECT toString(toUnixTimestamp(now())) AS s")
+        .await
+        .parse::<i64>()
+        .expect("the server's clock")
+        * SEC
+}
+
+/// The newest marker minute the job can have written now: the last minute
+/// of the newest bucket at least three minutes old.
+async fn newest_ready_marker(client: &ChClient) -> i64 {
+    floor_to(server_now(client).await - 3 * MINUTE, BUCKET) - MINUTE
+}
+
+/// "From totals" (part A §5.2): with no spans, the answer can only come
+/// from `service_edges`. The old route's tables are emptied too.
+async fn drop_the_spans(client: &ChClient) {
+    for table in ["spans", "trace_spans", "trace_edges"] {
+        ch_exec(client, &format!("TRUNCATE TABLE {table}")).await;
+    }
+}
+
+/// `system.query_log`'s finished statements carrying `id` as
+/// `log_comment`: each one's tables.
+async fn statements_of(client: &ChClient, id: &str) -> Vec<String> {
+    ch_exec(client, "SYSTEM FLUSH LOGS").await;
+    client
+        .query_strings(
+            &format!(
+                "SELECT concat(query, ' :: ', arrayStringConcat(arraySort(tables), ',')) AS s \
+                 FROM system.query_log WHERE type = 'QueryFinish' AND is_initial_query \
+                 AND log_comment = '{id}' ORDER BY event_time_microseconds"
+            ),
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("read query_log")
+}
+
+/// No `(minute, client_minute, client, server, conn_type)` twice under
+/// `FINAL`.
+async fn assert_no_key_twice(client: &ChClient, ctx: &str) {
+    let twice = ch_count(
+        client,
+        "SELECT count() AS n FROM (SELECT count() AS c FROM service_edges FINAL \
+         GROUP BY minute, client_minute, client, server, conn_type HAVING c > 1)",
+    )
+    .await;
+    assert_eq!(twice, 0, "{ctx}: a key twice under FINAL");
+}
+
+/// The markers run every five minutes from `first` with no gap, the last
+/// at or after `last_at_least`.
+fn assert_markers_every_bucket(markers: &[i64], first: i64, last_at_least: i64, ctx: &str) {
+    assert_eq!(
+        markers.first().copied(),
+        Some(first),
+        "{ctx}: the oldest marker"
+    );
+    for pair in markers.windows(2) {
+        assert_eq!(
+            pair[1] - pair[0],
+            BUCKET,
+            "{ctx}: a gap in the markers: {markers:?}"
+        );
+    }
+    assert!(
+        markers.last().copied().unwrap_or(0) >= last_at_least,
+        "{ctx}: the markers end before {last_at_least}: {markers:?}"
+    );
+}
+
+/// G1 (T-C6, T-C7): fixture G's five edges, every field, paired from spans
+/// before the job has seen it and summed from totals after; the whole
+/// minutes of a window decide which totals count.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_service_graph_pairs_both_branches() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_400;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_v2_it_g599_g1")).await;
+    let _server = spawn_ready(port, &db);
+    let client = ch_data(&db).await;
+    ch_exec(&client, "SYSTEM STOP MERGES spans").await;
+    let l = fixture_anchor();
+    push_g(port, l, 0, "G1");
+
+    assert_graph(port, l, l + 300 * SEC, &g1_rows(1), true, "G1 from spans");
+
+    process_edges(&client, l - 6 * MINUTE, l + 4 * MINUTE).await;
+    drop_the_spans(&client).await;
+    assert_graph(port, l, l + 300 * SEC, &g1_rows(1), true, "G1 from totals");
+    let b_rpc = |e: &Edge| e.client == "svc-a" && e.server == "svc-b" && e.conn == "rpc";
+    for (s, e) in [
+        (l, l + 60 * SEC),
+        (l + 60 * SEC, l + 120 * SEC),
+        (l + 59 * SEC, l + 300 * SEC),
+        (l, l + 61 * SEC),
+    ] {
+        let got = graph_edges_of(port, s, e, "G1 minute windows");
+        assert!(
+            !got.iter().any(b_rpc),
+            "G1: [{s}, {e}) cuts c1's or s1's minute, so svc-a -> svc-b rpc is not counted: {got:?}"
+        );
+    }
+    let got = graph_edges_of(port, l, l + 120 * SEC, "G1 two minutes");
+    assert_eq!(
+        got.iter()
+            .filter(|e| b_rpc(e))
+            .map(|e| e.calls)
+            .collect::<Vec<_>>(),
+        vec![1],
+        "G1: [L, L + 120 s) holds both minutes of c1 -> s1: {got:?}"
+    );
+}
+
+/// G2: two calls whose halves sit either side of a UTC midnight, 59.5 s
+/// apart, counted from spans and from totals of four runs across the day.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_service_graph_takes_a_pair_across_midnight() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_401;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_v2_it_g599_g2")).await;
+    let _server = spawn_ready(port, &db);
+    let client = ch_data(&db).await;
+    let b = floor_to(now_ns() - 30 * MINUTE, NS_PER_DAY);
+    let half = |svc: &'static str, trace: u8, id: u8, parent: Option<u8>, at: i64| {
+        let kind = if parent.is_some() {
+            SpanKind::Server
+        } else {
+            SpanKind::Client
+        };
+        (
+            svc,
+            vec![g_span(
+                g_trace(0, 9, trace),
+                g_span_id(0, 9, id),
+                parent.map(|p| g_span_id(0, 9, p)),
+                kind,
+                at,
+                MILLI,
+                false,
+                vec![],
+            )],
+        )
+    };
+    for (svc, spans) in [
+        half("svc-e", 1, 1, None, b - 58_500 * MILLI),
+        half("svc-f", 1, 2, Some(1), b + SEC),
+        half("svc-g", 2, 3, None, b + 58_500 * MILLI),
+        half("svc-h", 2, 4, Some(3), b - SEC),
+    ] {
+        ingest(port, svc, spans, "G2");
+    }
+    let want = vec![
+        edge("svc-e", "svc-f", "rpc", 1, 0, [MILLI as f64; 3]),
+        edge("svc-g", "svc-h", "rpc", 1, 0, [MILLI as f64; 3]),
+    ];
+    for phase in ["from spans", "from totals"] {
+        if phase == "from totals" {
+            let runs = process_edges(&client, b - 11 * MINUTE, b + 9 * MINUTE).await;
+            assert!(runs >= 1, "G2: the job ran");
+            drop_the_spans(&client).await;
+        }
+        assert_graph(
+            port,
+            b - 60 * SEC,
+            b + 60 * SEC,
+            &want,
+            true,
+            &format!("G2 {phase}"),
+        );
+        assert_graph(
+            port,
+            b,
+            b + 60 * SEC,
+            &[],
+            true,
+            &format!("G2 {phase}, after midnight"),
+        );
+    }
+}
+
+/// G3: the cap. 1,001 edges answer the first 1,000 and `truncated`; 1,000
+/// answer all and not `truncated`; from spans and from totals.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_service_graph_cap_sets_truncated() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_402;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_v2_it_g599_g3")).await;
+    let _server = spawn_ready(port, &db);
+    let client = ch_data(&db).await;
+    let l = fixture_anchor();
+    let names: Vec<String> = (0..=1000).map(|i| format!("t{i:04}")).collect();
+    let mut clients = Vec::new();
+    let mut resources: Vec<(&str, Vec<Span>)> = Vec::new();
+    for (i, name) in names.iter().enumerate() {
+        let idx = u16::try_from(i).expect("1,001 traces").to_be_bytes();
+        let mut trace = [0u8; 16];
+        trace[0] = 0x5b;
+        trace[1..3].copy_from_slice(&idx);
+        trace[15] = 1;
+        let cid = [0x5b, 1, idx[0], idx[1], 0, 0, 0, 1];
+        let sid = [0x5b, 2, idx[0], idx[1], 0, 0, 0, 1];
+        // The last edge alone sits after `L + 150 s`, so `[L, L + 150 s)`
+        // holds exactly 1,000 edges.
+        let at = if i == 1000 {
+            l + 200 * SEC
+        } else {
+            l + 10 * SEC + i64::try_from(i).expect("small") * 10 * MILLI
+        };
+        clients.push(g_span(
+            trace,
+            cid,
+            None,
+            SpanKind::Client,
+            at,
+            MILLI,
+            false,
+            vec![],
+        ));
+        resources.push((
+            name.as_str(),
+            vec![g_span(
+                trace,
+                sid,
+                Some(cid),
+                SpanKind::Server,
+                at,
+                MILLI,
+                false,
+                vec![],
+            )],
+        ));
+    }
+    resources.push(("svc-a", clients));
+    ingest_resources(port, resources, "G3");
+    let first: Vec<String> = names[..1000].to_vec();
+    for phase in ["from spans", "from totals"] {
+        if phase == "from totals" {
+            process_edges(&client, l - 6 * MINUTE, l + 4 * MINUTE).await;
+            drop_the_spans(&client).await;
+        }
+        let (edges, truncated, _) = graph_answer(port, l, l + 300 * SEC, &format!("G3 {phase}"));
+        assert_eq!(
+            edges.iter().map(|e| e.server.clone()).collect::<Vec<_>>(),
+            first,
+            "G3 {phase}: the first 1,000 edges in order"
+        );
+        assert!(truncated, "G3 {phase}: 1,001 edges are truncated");
+        let (edges, truncated, _) = graph_answer(port, l, l + 150 * SEC, &format!("G3 {phase}"));
+        assert_eq!(edges.len(), 1000, "G3 {phase}: 1,000 edges");
+        assert!(!truncated, "G3 {phase}: 1,000 edges are not truncated");
+    }
+}
+
+/// G4: the request is one statement, reading `service_edges` and `spans`
+/// and not `trace_edges`.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_service_graph_is_one_statement() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_403;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_v2_it_g599_g4")).await;
+    let _server = spawn_ready(port, &db);
+    let client = ch_data(&db).await;
+    let l = fixture_anchor();
+    push_g(port, l, 0, "G4");
+    process_edges(&client, l - 6 * MINUTE, l + 4 * MINUTE).await;
+    let (edges, _, id) = graph_answer(port, l, l + 300 * SEC, "G4");
+    assert_edges(&edges, &g1_rows(1), true, "G4");
+    let statements = statements_of(&client, &id).await;
+    assert_eq!(statements.len(), 1, "G4: one statement: {statements:?}");
+    let tables = statements[0].rsplit(" :: ").next().unwrap_or_default();
+    for want in ["service_edges", "spans"] {
+        assert!(
+            tables
+                .split(',')
+                .any(|t| t == format!("{}.{want}", db.name())),
+            "G4: the statement reads {want}: {tables}"
+        );
+    }
+    assert!(
+        !tables.contains("trace_edges"),
+        "G4: the statement does not read trace_edges: {tables}"
+    );
+}
+
+/// M1: the job covers every bucket once, in order, one part per run, and
+/// the totals of nine buckets answer nine times fixture G.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_edge_job_covers_every_bucket_once() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_404;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_v2_it_g599_m1")).await;
+    let _server = spawn_ready(port, &db);
+    let client = ch_data(&db).await;
+    let l = fixture_anchor();
+    push_m1_data(port, l, "M1");
+    assert_edge_job(&client).await;
+    let since = ch_string(&client, "SELECT toString(now64(6)) AS s").await;
+    process_edges(&client, l - 36 * MINUTE, l + 9 * MINUTE).await;
+    let newest = newest_ready_marker(&client).await;
+    run_edges_until(&client, newest).await;
+    stop_edges_view(&client).await;
+
+    let markers = markers(&client).await;
+    assert_markers_every_bucket(&markers, l - 36 * MINUTE, newest, "M1");
+    ch_exec(&client, "SYSTEM FLUSH LOGS").await;
+    let parts = ch_count(
+        &client,
+        &format!(
+            "SELECT count() AS n FROM system.part_log WHERE database = currentDatabase() \
+             AND table = 'service_edges' AND event_type = 'NewPart' \
+             AND event_time_microseconds >= toDateTime64('{since}', 6)"
+        ),
+    )
+    .await;
+    assert_eq!(
+        parts,
+        markers.len() as u64,
+        "M1: one new part per marker (the test's own marker and one per run): {markers:?}"
+    );
+    assert_no_key_twice(&client, "M1").await;
+    drop_the_spans(&client).await;
+    assert_graph(
+        port,
+        l - 35 * MINUTE,
+        l + 10 * MINUTE,
+        &g1_rows(9),
+        false,
+        "M1 from totals",
+    );
+}
+
+/// M2: a job stopped for a while resumes at the bucket after its last
+/// marker and skips none.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_edge_job_catches_up_after_a_stop() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_405;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_v2_it_g599_m2")).await;
+    let _server = spawn_ready(port, &db);
+    let client = ch_data(&db).await;
+    let l = fixture_anchor();
+    push_m1_data(port, l, "M2");
+    process_edges(&client, l - 36 * MINUTE, l - 21 * MINUTE).await;
+    stop_edges_view(&client).await;
+    let stopped_at = prefix_end(&client).await;
+    assert!(
+        stopped_at < l + 4 * MINUTE,
+        "M2 precondition: the job stopped before L + 4 min, at {stopped_at}"
+    );
+    push_g_in_three(port, l + 5 * MINUTE, 30, "M2 extra copy");
+    ch_exec(&client, "SYSTEM START VIEW service_edges_mv").await;
+    run_edges_until(&client, l + 9 * MINUTE).await;
+    stop_edges_view(&client).await;
+    let markers = markers(&client).await;
+    assert_markers_every_bucket(&markers, l - 36 * MINUTE, l + 9 * MINUTE, "M2");
+    drop_the_spans(&client).await;
+    assert_graph(
+        port,
+        l - 35 * MINUTE,
+        l + 10 * MINUTE,
+        &g1_rows(10),
+        false,
+        "M2 from totals",
+    );
+}
+
+/// M3: a run whose later rows never arrived counts once: the marker is
+/// sorted last, so half a run carries no marker and the bucket is paired
+/// again; a re-run replaces it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_cut_short_counts_once() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_406;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_v2_it_g599_m3")).await;
+    let _server = spawn_ready(port, &db);
+    let client = ch_data(&db).await;
+    let l = fixture_anchor();
+    reset_edges(&client, l - 36 * MINUTE).await;
+    push_m1_data(port, l, "M3");
+    let select = ch_string(
+        &client,
+        "SELECT as_select AS s FROM system.tables WHERE database = currentDatabase() \
+         AND name = 'service_edges_mv'",
+    )
+    .await;
+    let rows = ch_count(&client, &format!("SELECT count() AS n FROM ({select})")).await;
+    assert!(rows >= 2, "M3: a run's rows and its marker: {rows}");
+    let half = rows / 2;
+    for _ in 0..2 {
+        ch_exec(
+            &client,
+            &format!("INSERT INTO service_edges SELECT * FROM ({select}) LIMIT {half}"),
+        )
+        .await;
+        assert_eq!(
+            markers(&client).await,
+            vec![l - 36 * MINUTE],
+            "M3: half a run carries no marker"
+        );
+    }
+    run_edges_until(&client, l + 9 * MINUTE).await;
+    stop_edges_view(&client).await;
+    assert_no_key_twice(&client, "M3").await;
+    drop_the_spans(&client).await;
+    assert_graph(
+        port,
+        l - 35 * MINUTE,
+        l + 10 * MINUTE,
+        &g1_rows(9),
+        false,
+        "M3 from totals",
+    );
+}
+
+/// The job's statement from a render with `graph_job_max_rows` set.
+fn edge_job_statement(db: &str, max_rows: u64) -> String {
+    let ctx = pulsus_schema::RenderCtx {
+        graph_job_max_rows: max_rows,
+        ..pulsus_schema::RenderCtx::for_tests(db)
+    };
+    let head = format!("CREATE MATERIALIZED VIEW {db}.service_edges_mv ");
+    pulsus_schema::rendered_statements(&ctx)
+        .into_iter()
+        .find(|s| s.starts_with(&head))
+        .unwrap_or_else(|| panic!("the render carries {head}"))
+}
+
+/// M4: a run over its row ceiling fails, writes nothing, and the bucket is
+/// retried; with the ceiling back, the next runs cover it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_over_its_row_cap_retries() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_407;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_v2_it_g599_m4")).await;
+    let _server = spawn_ready(port, &db);
+    let client = ch_data(&db).await;
+    let l = fixture_anchor();
+    reset_edges(&client, l - 36 * MINUTE).await;
+    push_m1_data(port, l, "M4");
+    let capped = edge_job_statement(db.name(), 100);
+    assert!(
+        capped.contains("max_rows_to_read = 100,"),
+        "M4: the render carries the lowered ceiling"
+    );
+    ch_exec(&client, "DROP VIEW service_edges_mv").await;
+    ch_exec(&client, &capped).await;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let exception = loop {
+        let e = ch_string(
+            &client,
+            "SELECT exception AS s FROM system.view_refreshes WHERE database = currentDatabase() \
+             AND view = 'service_edges_mv'",
+        )
+        .await;
+        if !e.is_empty() {
+            break e;
+        }
+        assert!(Instant::now() < deadline, "M4: no run failed");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert!(
+        exception.contains("Code: 158"),
+        "M4: the run fails on its row ceiling: {exception}"
+    );
+    ch_exec(&client, "SYSTEM REFRESH VIEW service_edges_mv").await;
+    let waited = client
+        .execute(
+            "SYSTEM WAIT VIEW service_edges_mv",
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await;
+    assert!(waited.is_err(), "M4: the retried run fails too");
+    assert_eq!(
+        markers(&client).await,
+        vec![l - 36 * MINUTE],
+        "M4: a failed run writes no marker"
+    );
+    ch_exec(&client, "DROP VIEW service_edges_mv").await;
+    ch_exec(
+        &client,
+        &edge_job_statement(db.name(), pulsus_schema::GRAPH_JOB_MAX_ROWS),
+    )
+    .await;
+    run_edges_until(&client, l + 9 * MINUTE).await;
+    stop_edges_view(&client).await;
+    drop_the_spans(&client).await;
+    assert_graph(
+        port,
+        l - 35 * MINUTE,
+        l + 10 * MINUTE,
+        &g1_rows(9),
+        false,
+        "M4 from totals",
+    );
+}
+
+/// R1: a window the job has not reached is paired from spans, under the
+/// route's read ceilings and no refusal of its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_uncovered_window_is_paired_from_spans() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_408;
+    let tight_port = 31_409;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_v2_it_g599_r1")).await;
+    let _server = spawn_ready(port, &db);
+    let client = ch_data(&db).await;
+    stop_edges_view(&client).await;
+    ch_exec(&client, "TRUNCATE TABLE service_edges").await;
+    let l = fixture_anchor();
+    push_g(port, l, 0, "R1");
+    insert_marker(&client, l - 61 * MINUTE).await;
+    assert_graph(
+        port,
+        l - 120 * MINUTE,
+        l + 60 * MINUTE,
+        &g1_rows(1),
+        true,
+        "R1: a 3 h window, the job an hour behind",
+    );
+    let _tight = spawn_ready_with_env(
+        tight_port,
+        &db,
+        &[("PULSUS_TRACEQL_SCAN_BUDGET_ROWS", "50")],
+    );
+    let path = format!(
+        "/api/traces/v1/service_graph?start={}&end={}",
+        l - 120 * MINUTE,
+        l + 60 * MINUTE
+    );
+    let res = request(tight_port, "GET", &path, None, &[]).expect("R1: the route is reachable");
+    assert_eq!(
+        res.status,
+        422,
+        "R1: past the scan budget the request is refused as today: {:?}",
+        String::from_utf8_lossy(&res.body)
+    );
+}
+
+/// F1: a fresh deployment answers at once: its first run writes one
+/// marker at the newest ready bucket, a push is paired from spans at once
+/// and from totals once the job covers it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fresh_deployment_answers_at_once() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_410;
+    let before = now_ns();
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_v2_it_g599_f1")).await;
+    let after = now_ns();
+    let _server = spawn_ready(port, &db);
+    let client = ch_data(&db).await;
+    assert_edge_job(&client).await;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let first = loop {
+        if let Some(m) = markers(&client).await.first().copied() {
+            break m;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "F1: the first run wrote no marker"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let at = |t: i64| floor_to(t - 3 * MINUTE, BUCKET) - MINUTE;
+    assert!(
+        first == at(before) || first == at(after),
+        "F1: the first marker is at the newest ready bucket: {first}, not {} or {}",
+        at(before),
+        at(after)
+    );
+    ch_exec(&client, "SYSTEM STOP MERGES spans").await;
+    let l = floor_to(now_ns(), MINUTE) - 2 * MINUTE;
+    push_g(port, l, 0, "F1");
+    let end = now_ns();
+    let start = end - 10 * MINUTE;
+    assert_graph(
+        port,
+        start,
+        end,
+        &g1_rows(1),
+        true,
+        "F1 at once, from spans",
+    );
+    // The scheduled runs alone: G's last minute is `L + 1 min`.
+    let deadline = Instant::now() + Duration::from_secs(15 * 60);
+    while prefix_end(&client).await < l + MINUTE {
+        assert!(
+            Instant::now() < deadline,
+            "F1: the job did not cover the push in 15 minutes"
+        );
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    }
+    drop_the_spans(&client).await;
+    assert_graph(port, start, end, &g1_rows(1), true, "F1 from totals");
+}
+
+/// F2: with no marker, the first run starts at the oldest stored day of
+/// spans, so spans already stored are totalled.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_first_run_starts_at_the_oldest_stored_day() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_411;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_v2_it_g599_f2")).await;
+    let _server = spawn_ready(port, &db);
+    let client = ch_data(&db).await;
+    stop_edges_view(&client).await;
+    ch_exec(&client, "TRUNCATE TABLE service_edges").await;
+    let l = fixture_anchor();
+    push_g(port, l, 0, "F2");
+    let day = floor_to(l, NS_PER_DAY);
+    ch_exec(&client, "SYSTEM START VIEW service_edges_mv").await;
+    refresh_once(&client).await;
+    assert_eq!(
+        markers(&client).await.first().copied(),
+        Some(day + 4 * MINUTE),
+        "F2: the first run pairs the first bucket of the oldest stored day"
+    );
+    let runs = run_edges_until(&client, l + 4 * MINUTE).await;
+    assert!(runs <= 290, "F2: {runs} runs");
+    drop_the_spans(&client).await;
+    assert_graph(port, l, l + 300 * SEC, &g1_rows(1), true, "F2 from totals");
+}
+
+/// H1: a window before the first marker is paired from spans; one that
+/// runs into the coverage takes its head from spans and its tail from
+/// totals.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_window_before_the_first_marker_is_paired_from_spans() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_412;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_v2_it_g599_h1")).await;
+    let _server = spawn_ready(port, &db);
+    let client = ch_data(&db).await;
+    let l = fixture_anchor();
+    push_g(port, l, 0, "H1");
+    process_edges(&client, l + 9 * MINUTE, l + 14 * MINUTE).await;
+    assert_graph(
+        port,
+        l,
+        l + 300 * SEC,
+        &g1_rows(1),
+        true,
+        "H1 before the first marker",
+    );
+    assert_graph(
+        port,
+        l,
+        l + 20 * MINUTE,
+        &g1_rows(1),
+        true,
+        "H1 into the coverage",
+    );
+}
+
+/// S1: the coverage read touches the markers' granules, not every row.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_coverage_read_touches_only_the_markers() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_413;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_v2_it_g599_s1")).await;
+    let _server = spawn_ready(port, &db);
+    let client = ch_data(&db).await;
+    stop_edges_view(&client).await;
+    ch_exec(&client, "TRUNCATE TABLE service_edges").await;
+    let day = floor_to(now_ns(), NS_PER_DAY) - NS_PER_DAY;
+    ch_exec(
+        &client,
+        &format!(
+            "INSERT INTO service_edges SELECT {d} + intDiv(number, 20) * 60 AS m, m, 'svc-a', \
+             concat('svc-', toString(number % 20)), 'rpc', 1, 0, \
+             arrayReduce('quantilesTDigestState(0.5, 0.95, 0.99)', [toInt64(1000)]), 1 \
+             FROM numbers(28800)",
+            d = ch_time(day)
+        ),
+    )
+    .await;
+    ch_exec(
+        &client,
+        &format!(
+            "INSERT INTO service_edges SELECT {d} + 240 + number * 300 AS m, m, '', '', '', 0, 0, \
+             arrayReduce('quantilesTDigestState(0.5, 0.95, 0.99)', [toInt64(0)]), 1 \
+             FROM numbers(288)",
+            d = ch_time(day)
+        ),
+    )
+    .await;
+    ch_exec(&client, "OPTIMIZE TABLE service_edges FINAL").await;
+    assert_eq!(
+        ch_count(
+            &client,
+            "SELECT count() AS n FROM system.parts WHERE database = currentDatabase() \
+             AND table = 'service_edges' AND active"
+        )
+        .await,
+        1,
+        "S1: one part"
+    );
+    let hour = day + 12 * 60 * MINUTE;
+    let (edges, _, id) = graph_answer(port, hour, hour + 60 * MINUTE, "S1");
+    assert_eq!(edges.len(), 20, "S1: the hour's twenty edges");
+    assert!(
+        edges.iter().all(|e| e.calls == 60),
+        "S1: sixty calls each: {edges:?}"
+    );
+    ch_exec(&client, "SYSTEM FLUSH LOGS").await;
+    let read = ch_count(
+        &client,
+        &format!(
+            "SELECT read_rows AS n FROM system.query_log WHERE type = 'QueryFinish' \
+             AND log_comment = '{id}' AND is_initial_query"
+        ),
+    )
+    .await;
+    assert!(
+        read <= 3_248,
+        "S1: the covered hour reads at most its 1,200 rows and two granules, not every \
+         marker row of the table: {read}"
+    );
+}
+
+/// The part of `service_edges` holding the marker at `minute_ns`.
+async fn part_of_marker(client: &ChClient, minute_ns: i64) -> String {
+    ch_string(
+        client,
+        &format!(
+            "SELECT _part AS s FROM service_edges WHERE conn_type = '' AND minute = {}",
+            ch_time(minute_ns)
+        ),
+    )
+    .await
+}
+
+/// P1 and J1's setup: M1's data processed with merges stopped, the job
+/// stopped, and the part of the run for bucket `L − 20 min` found.
+async fn processed_with_one_run_part(port: u16, client: &ChClient, l: i64, ctx: &str) -> String {
+    assert_edge_job(client).await;
+    ch_exec(client, "SYSTEM STOP MERGES service_edges").await;
+    push_m1_data(port, l, ctx);
+    process_edges(client, l - 36 * MINUTE, l + 9 * MINUTE).await;
+    stop_edges_view(client).await;
+    let part = part_of_marker(client, l - 16 * MINUTE).await;
+    assert!(!part.is_empty(), "{ctx}: the run for L − 20 min has a part");
+    part
+}
+
+/// P1: a run's part missing below newer runs' parts (a follower that
+/// received the later runs first) leaves its interval paired from spans.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_missing_earlier_run_is_paired_from_spans() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_414;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_v2_it_g599_p1")).await;
+    let _server = spawn_ready(port, &db);
+    let client = ch_data(&db).await;
+    let l = fixture_anchor();
+    let part = processed_with_one_run_part(port, &client, l, "P1").await;
+    ch_exec(
+        &client,
+        &format!("ALTER TABLE service_edges DETACH PART '{part}'"),
+    )
+    .await;
+    assert!(
+        prefix_end(&client).await < l - 16 * MINUTE,
+        "P1 precondition: the prefix stops before the detached run"
+    );
+    let window = (l - 35 * MINUTE, l + 10 * MINUTE);
+    assert_graph(port, window.0, window.1, &g1_rows(9), false, "P1 detached");
+    ch_exec(
+        &client,
+        &format!("ALTER TABLE service_edges ATTACH PART '{part}'"),
+    )
+    .await;
+    assert_graph(port, window.0, window.1, &g1_rows(9), false, "P1 attached");
+}
+
+/// J1: the job pairs a bucket missing between markers before any later
+/// one.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_job_pairs_a_missing_bucket_first() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_415;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_v2_it_g599_j1")).await;
+    let _server = spawn_ready(port, &db);
+    let client = ch_data(&db).await;
+    let l = fixture_anchor();
+    let part = processed_with_one_run_part(port, &client, l, "J1").await;
+    ch_exec(
+        &client,
+        &format!("ALTER TABLE service_edges DROP PART '{part}'"),
+    )
+    .await;
+    let since = ch_string(&client, "SELECT toString(now64(6)) AS s").await;
+    ch_exec(&client, "SYSTEM START VIEW service_edges_mv").await;
+    refresh_once(&client).await;
+    stop_edges_view(&client).await;
+    ch_exec(&client, "SYSTEM FLUSH LOGS").await;
+    let first_new = ch_string(
+        &client,
+        &format!(
+            "SELECT part_name AS s FROM system.part_log WHERE database = currentDatabase() \
+             AND table = 'service_edges' AND event_type = 'NewPart' \
+             AND event_time_microseconds >= toDateTime64('{since}', 6) \
+             ORDER BY event_time_microseconds LIMIT 1"
+        ),
+    )
+    .await;
+    assert!(
+        !first_new.is_empty(),
+        "J1: a run after the drop wrote a part"
+    );
+    let shape = ch_string(
+        &client,
+        &format!(
+            "SELECT concat(toString(toUnixTimestamp(minIf(minute, conn_type != ''))), ',', \
+             toString(toUnixTimestamp(maxIf(minute, conn_type != ''))), ',', \
+             arrayStringConcat(arrayMap(m -> toString(toUnixTimestamp(m)), \
+             groupArrayIf(minute, conn_type = '')), ',')) AS s \
+             FROM service_edges WHERE _part = '{first_new}'"
+        ),
+    )
+    .await;
+    let lo = (l - 20 * MINUTE) / SEC;
+    let fields: Vec<i64> = shape
+        .split(',')
+        .map(|f| f.parse::<i64>().expect("a timestamp"))
+        .collect();
+    assert!(
+        fields.len() == 3
+            && fields[0] >= lo
+            && fields[1] < lo + 300
+            && fields[2] == (l - 16 * MINUTE) / SEC,
+        "J1: the first run after the drop pairs [L − 20 min, L − 15 min) and marks L − 16 min: \
+         {shape} (L − 20 min = {lo})"
+    );
+    drop_the_spans(&client).await;
+    assert_graph(
+        port,
+        l - 35 * MINUTE,
+        l + 10 * MINUTE,
+        &g1_rows(9),
+        false,
+        "J1 from totals",
+    );
+}
+
+/// T1: the oldest marked bucket is read from totals, from its start.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_oldest_marked_bucket_is_read_from_totals() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_416;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_v2_it_g599_t1")).await;
+    let _server = spawn_ready(port, &db);
+    let client = ch_data(&db).await;
+    let l = fixture_anchor();
+    push_g(port, l, 0, "T1");
+    process_edges(&client, l - MINUTE, l + 4 * MINUTE).await;
+    stop_edges_view(&client).await;
+    ch_exec(
+        &client,
+        &format!(
+            "ALTER TABLE service_edges DELETE WHERE conn_type = '' AND minute = {} \
+             SETTINGS mutations_sync = 2",
+            ch_time(l - MINUTE)
+        ),
+    )
+    .await;
+    assert_eq!(
+        markers(&client).await.first().copied(),
+        Some(l + 4 * MINUTE),
+        "T1: G's own run is the oldest marker"
+    );
+    drop_the_spans(&client).await;
+    assert_graph(port, l, l + 300 * SEC, &g1_rows(1), true, "T1 from totals");
+}
+
+/// T2: a marker expires with its bucket's start, so it never outlives a
+/// row of its run.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_marker_expires_with_its_bucket_start() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_v2_it_g599_t2")).await;
+    // This case needs the default seven-day retention, not the suite's.
+    live_db::drop_db(db.name()).await;
+    live_db::build_schema_with_retention(db.name(), 7).await;
+    let client = ch_data(&db).await;
+    stop_edges_view(&client).await;
+    ch_exec(&client, "TRUNCATE TABLE service_edges").await;
+    let m = floor_to(now_ns(), MINUTE) - 7 * NS_PER_DAY + 3 * MINUTE;
+    let q = "arrayReduce('quantilesTDigestState(0.5, 0.95, 0.99)', [toInt64(1000)])";
+    ch_exec(
+        &client,
+        &format!(
+            "INSERT INTO service_edges VALUES \
+             ({m0}, {m0}, '', '', '', 0, 0, {q}, 1), \
+             ({x}, {x}, 'svc-a', 'svc-x', 'rpc', 1, 0, {q}, 1), \
+             ({y}, {y}, 'svc-a', 'svc-y', 'rpc', 1, 0, {q}, 1)",
+            m0 = ch_time(m),
+            x = ch_time(m - 4 * MINUTE),
+            y = ch_time(m - MINUTE),
+        ),
+    )
+    .await;
+    ch_exec(&client, "OPTIMIZE TABLE service_edges FINAL").await;
+    let left = client
+        .query_strings(
+            "SELECT concat(conn_type, ':', server) AS s FROM service_edges ORDER BY minute",
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("read service_edges");
+    assert_eq!(
+        left,
+        vec!["rpc:svc-y".to_string()],
+        "T2: the marker expires with the row at its bucket's start"
+    );
+}
+
+/// W1: a bucket becomes ready three minutes after it ends, not before and
+/// not much after.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bucket_waits_three_minutes() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_417;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_v2_it_g599_w1")).await;
+    let _server = spawn_ready(port, &db);
+    let client = ch_data(&db).await;
+    let now = server_now(&client).await;
+    process_edges(
+        &client,
+        floor_to(now, BUCKET) - 11 * MINUTE,
+        newest_ready_marker(&client).await,
+    )
+    .await;
+    for (from, to, behind) in [(160, 175, 5 * MINUTE), (185, 200, 0)] {
+        let deadline = Instant::now() + Duration::from_secs(6 * 60);
+        let at = loop {
+            let now = server_now(&client).await;
+            let into = (now - floor_to(now, BUCKET)) / SEC;
+            if (from..to).contains(&into) {
+                break now;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "W1: never {from} s into a bucket"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        };
+        refresh_once(&client).await;
+        assert_eq!(
+            prefix_end(&client).await + MINUTE,
+            floor_to(at, BUCKET) - behind,
+            "W1: {from}–{to} s into a bucket, the coverage ends {behind} ns before its start"
+        );
+    }
+}
+
+/// X2: a call across either edge of the coverage counts once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_call_across_the_coverage_edges_is_counted_once() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_418;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_v2_it_g599_x2")).await;
+    let _server = spawn_ready(port, &db);
+    let client = ch_data(&db).await;
+    let k = fixture_anchor();
+    let pair = |n: u8, server: &'static str, client_at: i64, server_at: i64| {
+        let trace = g_trace(0, 8, n);
+        let cid = g_span_id(0, 8, n);
+        let sid = g_span_id(0, 9, n);
+        [
+            (
+                "svc-a",
+                vec![g_span(
+                    trace,
+                    cid,
+                    None,
+                    SpanKind::Client,
+                    client_at,
+                    MILLI,
+                    false,
+                    vec![],
+                )],
+            ),
+            (
+                server,
+                vec![g_span(
+                    trace,
+                    sid,
+                    Some(cid),
+                    SpanKind::Server,
+                    server_at,
+                    MILLI,
+                    false,
+                    vec![],
+                )],
+            ),
+        ]
+    };
+    let mut resources = Vec::new();
+    resources.extend(pair(1, "svc-x", k - SEC, k + 58_500 * MILLI));
+    resources.extend(pair(2, "svc-y", k + 10 * SEC, k + 15 * SEC));
+    resources.extend(pair(
+        3,
+        "svc-z",
+        k + 10 * MINUTE - 59 * SEC,
+        k + 10 * MINUTE + 500 * MILLI,
+    ));
+    ingest_resources(port, resources, "X2");
+    process_edges(&client, k - MINUTE, k + 9 * MINUTE).await;
+    stop_edges_view(&client).await;
+    ch_exec(
+        &client,
+        &format!(
+            "ALTER TABLE service_edges DELETE WHERE conn_type = '' \
+             AND (minute = {} OR minute > {}) SETTINGS mutations_sync = 2",
+            ch_time(k - MINUTE),
+            ch_time(k + 9 * MINUTE)
+        ),
+    )
+    .await;
+    assert_eq!(
+        markers(&client).await,
+        vec![k + 4 * MINUTE, k + 9 * MINUTE],
+        "X2: the coverage is [K, K + 10 min)"
+    );
+    let want = vec![
+        edge("svc-a", "svc-x", "rpc", 1, 0, [MILLI as f64; 3]),
+        edge("svc-a", "svc-y", "rpc", 1, 0, [MILLI as f64; 3]),
+        edge("svc-a", "svc-z", "rpc", 1, 0, [MILLI as f64; 3]),
+    ];
+    assert_graph(port, k - 5 * MINUTE, k + 15 * MINUTE, &want, true, "X2");
+}
+
+/// Q1: the job's run carries its nine settings.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_job_runs_under_its_ceilings() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_v2_it_g599_q1")).await;
+    let client = ch_data(&db).await;
+    assert_edge_job(&client).await;
+    refresh_once(&client).await;
+    ch_exec(&client, "SYSTEM FLUSH LOGS").await;
+    let names = [
+        "max_threads",
+        "max_memory_usage",
+        "max_rows_to_read",
+        "read_overflow_mode",
+        "max_execution_time",
+        "max_insert_threads",
+        "max_insert_block_size",
+        "min_insert_block_size_rows",
+        "min_insert_block_size_bytes",
+    ];
+    let got = ch_string(
+        &client,
+        &format!(
+            "SELECT arrayStringConcat([{}], ',') AS s FROM system.query_log \
+             WHERE type = 'QueryFinish' AND log_comment = 'refresh of {}.service_edges_mv' \
+             ORDER BY event_time_microseconds DESC LIMIT 1",
+            names
+                .iter()
+                .map(|n| format!("Settings['{n}']"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            db.name()
+        ),
+    )
+    .await;
+    assert_eq!(
+        got, "4,4294967296,60000000,throw,50,1,100000000,100000000,10000000000",
+        "Q1: the run's settings, in the order {names:?}"
+    );
+}
+
+/// D1: a push after a bucket is finalized changes no answer: neither the
+/// job nor the read pairs a finalized bucket again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_push_after_processing_is_not_counted() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_419;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_v2_it_g599_d1")).await;
+    let _server = spawn_ready(port, &db);
+    let client = ch_data(&db).await;
+    ch_exec(&client, "SYSTEM STOP MERGES spans").await;
+    let l = fixture_anchor();
+    push_g(port, l, 0, "D1");
+    process_edges(&client, l - 6 * MINUTE, l + 4 * MINUTE).await;
+    let g = fixture_g(l, 0);
+    let mut again = g[3].1.clone();
+    again.push(g_span(
+        g_trace(0, 3, 2),
+        g_span_id(0, 5, 2),
+        None,
+        SpanKind::Internal,
+        l + 6 * SEC,
+        MILLI,
+        false,
+        vec![],
+    ));
+    ingest(port, "svc-d", again, "D1: P4 again");
+    let mut e01 = g[3].1[0].clone();
+    e01.end_time_unix_nano = e01.start_time_unix_nano + 99_000_000;
+    ingest(port, "svc-d", vec![e01], "D1: e01 changed");
+    // Past readiness: the runs the job would make now.
+    run_edges_until(&client, newest_ready_marker(&client).await).await;
+    refresh_once(&client).await;
+    assert_graph(
+        port,
+        l,
+        l + 300 * SEC,
+        &g1_rows(1),
+        true,
+        "D1 with spans kept",
+    );
+}
+
+/// A database a test creates beside its [`ScopedDb`], dropped on the way
+/// in by the caller and here on the way out.
+struct SideDb(String);
+
+impl Drop for SideDb {
+    fn drop(&mut self) {
+        let name = self.0.clone();
+        let _ = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build a current-thread runtime")
+                .block_on(live_db::drop_db(&name));
+        })
+        .join();
+    }
+}
+
+/// `pulsusdb` as a reader of another cluster: its own database holds only
+/// the `spans` routing table, named with `suffix`, and its configured
+/// cluster does not exist. No schema is built for it.
+fn spawn_routed_reader(port: u16, reader: &SideDb, suffix: &str) -> ChildGuard {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_pulsusdb"));
+    cmd.env("PULSUS_HOST", "127.0.0.1")
+        .env("PULSUS_PORT", port.to_string())
+        .env("CLICKHOUSE_SERVER", live_db::ch_host())
+        .env("CLICKHOUSE_HTTP_PORT", live_db::ch_http_port().to_string())
+        .env("CLICKHOUSE_DB", &reader.0)
+        .env("PULSUS_MODE", "reader")
+        .env("PULSUS_CLUSTER", "no_such_cluster")
+        .env("PULSUS_DIST_SUFFIX", suffix);
+    let guard = ChildGuard(cmd.spawn().expect("spawn pulsusdb"));
+    // Its metrics label cache has no tables to warm from, so `/ready`
+    // stops at "label cache warming": the pool is up and the trace routes
+    // serve, which is all these cases need.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline {
+        if request(port, "GET", "/ready", None, &[]).is_some_and(|r| {
+            r.status == 200 || String::from_utf8_lossy(&r.body) == "label cache warming"
+        }) {
+            return guard;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("the reader's pool was not up within 60s");
+}
+
+/// The `spans` routing table of the reader database, pointing at `db` on
+/// the server's own `default` cluster.
+async fn route_spans(admin: &ChClient, reader: &SideDb, db: &str) {
+    ch_exec(
+        admin,
+        &format!(
+            "CREATE TABLE {r}.spans_q AS {db}.spans \
+             ENGINE = Distributed('default', '{db}', 'spans', cityHash64(trace_id))",
+            r = reader.0
+        ),
+    )
+    .await;
+}
+
+/// The finished top-level statements of request `id` that read the routing
+/// table's definition.
+async fn target_lookups(client: &ChClient, id: &str) -> usize {
+    statements_of(client, id)
+        .await
+        .iter()
+        .filter(|s| s.contains("engine_full"))
+        .count()
+}
+
+/// N1 (review note 1 on part A): the graph's target is read once per
+/// process, not once per request: the server builds an engine per request,
+/// so two route requests show it. The reader's database holds only the
+/// routing table and its configured cluster does not exist, so an answer
+/// at all shows the target came from the routing table's definition.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_graph_target_is_read_once_per_process() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_420;
+    let reader_port = 31_421;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_v2_it_g599_n1")).await;
+    let _server = spawn_ready(port, &db);
+    let l = fixture_anchor();
+    push_g(port, l, 0, "N1");
+    let admin = ch_admin().await;
+    let reader = SideDb(format!("{}_q", db.name()));
+    live_db::drop_db(&reader.0).await;
+    ch_exec(&admin, &format!("CREATE DATABASE {}", reader.0)).await;
+    route_spans(&admin, &reader, db.name()).await;
+    let _reader = spawn_routed_reader(reader_port, &reader, "_q");
+    let mut lookups = Vec::new();
+    for n in 1..=2 {
+        let (edges, _, id) =
+            graph_answer(reader_port, l, l + 300 * SEC, &format!("N1 request {n}"));
+        assert_edges(&edges, &g1_rows(1), true, &format!("N1 request {n}"));
+        lookups.push(target_lookups(&admin, &id).await);
+    }
+    assert_eq!(
+        lookups,
+        vec![1, 0],
+        "N1: the first request reads the target and the second reuses it"
+    );
+}
+
+/// N2 (review note 2 on part A): a failed target read fails the request
+/// and is read again next time; once it succeeds it is kept.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_target_read_is_retried() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_422;
+    let reader_port = 31_423;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_v2_it_g599_n2")).await;
+    let _server = spawn_ready(port, &db);
+    let l = fixture_anchor();
+    push_g(port, l, 0, "N2");
+    let admin = ch_admin().await;
+    let reader = SideDb(format!("{}_q", db.name()));
+    live_db::drop_db(&reader.0).await;
+    ch_exec(&admin, &format!("CREATE DATABASE {}", reader.0)).await;
+    // A routing table that routes nothing: not a `Distributed` definition.
+    ch_exec(
+        &admin,
+        &format!("CREATE TABLE {}.spans_q AS {}.spans", reader.0, db.name()),
+    )
+    .await;
+    let _reader = spawn_routed_reader(reader_port, &reader, "_q");
+    let path = format!(
+        "/api/traces/v1/service_graph?start={}&end={}",
+        l,
+        l + 300 * SEC
+    );
+    let res = request(reader_port, "GET", &path, None, &[]).expect("N2: reachable");
+    assert_eq!(
+        res.status,
+        500,
+        "N2: a definition that names no target fails the request: {:?}",
+        String::from_utf8_lossy(&res.body)
+    );
+    let failed_id = res
+        .headers
+        .get("x-pulsus-query-id")
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        target_lookups(&admin, &failed_id).await,
+        1,
+        "N2: the failed request read the definition"
+    );
+    ch_exec(&admin, &format!("DROP TABLE {}.spans_q SYNC", reader.0)).await;
+    route_spans(&admin, &reader, db.name()).await;
+    let mut lookups = Vec::new();
+    for n in 1..=2 {
+        let (edges, _, id) = graph_answer(reader_port, l, l + 300 * SEC, &format!("N2 retry {n}"));
+        assert_edges(&edges, &g1_rows(1), true, &format!("N2 retry {n}"));
+        lookups.push(target_lookups(&admin, &id).await);
+    }
+    assert_eq!(
+        lookups,
+        vec![1, 0],
+        "N2: the request after the failure reads the target again, and the next reuses it"
     );
 }

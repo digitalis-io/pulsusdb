@@ -50,6 +50,7 @@ pub mod spans;
 pub mod values;
 pub mod window_sql;
 
+pub use exec::{GraphTarget, GraphTargetCache, graph_target_from_engine};
 pub use exec::{
     HYDRATION_BYTE_BUDGET, RETAINED_ENTRY_OVERHEAD, RootSummary, SPAN_NAME_VALUE_TYPE,
     SearchOutput, ServiceGraph, TAG_NAMES_MAX, TAG_VALUES_MAX, TRACE_METRICS_MAX_SET_BYTES,
@@ -66,6 +67,7 @@ pub use metrics_result::{
     MetricExemplar, MetricLabel, MetricLabelValue, TraceMetricSeries, TraceMetricsResult,
 };
 pub use rows::{GraphEdgeRow, SpanNameRow, TagNameRow, TagValueRow};
+pub use spans::graph::spans_graph_sql;
 pub use spans::metrics::{RoutedMetricsPlan, StatementTables, plan_trace_metrics_routed};
 pub use spans::rows::{
     FallbackFetchRow, FetchRoute, FetchWindow, FetchedEventTuple, FetchedLinkTuple,

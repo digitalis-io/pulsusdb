@@ -89,6 +89,7 @@ fn cluster_ctx(db: &str) -> RenderCtx {
         trace_landing_retention_hours: 6,
         trace_dedup_window: 10_000,
         trace_indexed_attributes: Vec::new(),
+        graph_job_max_rows: pulsus_schema::GRAPH_JOB_MAX_ROWS,
     }
 }
 
@@ -943,4 +944,329 @@ async fn a_compare_top_n_is_ranked_over_every_shard() {
             .collect::<std::collections::BTreeMap<_, _>>(),
         "baseline span.v"
     );
+}
+
+// =====================================================================
+// Issue #599 part A: the service graph over two shards
+// =====================================================================
+//
+// The job runs on each shard's own node into that shard's `service_edges`,
+// and the route reads each shard through `cluster('<c>', view(…))`, so a
+// shard computes its coverage from its own markers. The helpers address one
+// node each, as the cases name them.
+
+const MINUTE: i64 = 60 * S;
+const BUCKET: i64 = 5 * MINUTE;
+
+fn floor_to(ns: i64, unit: i64) -> i64 {
+    ns.div_euclid(unit) * unit
+}
+
+async fn strings(client: &ChClient, sql: &str) -> Vec<String> {
+    client
+        .query_strings(sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"))
+}
+
+/// The node's job stopped, and no run in flight.
+async fn stop_edges_view(client: &ChClient) {
+    exec(client, "SYSTEM STOP VIEW service_edges_mv").await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let status = strings(
+            client,
+            "SELECT status AS s FROM system.view_refreshes WHERE database = currentDatabase() \
+             AND view = 'service_edges_mv'",
+        )
+        .await;
+        if status == ["Disabled"] {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the edge job did not stop: {status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Part A §4's `start_edges` on one node.
+async fn start_edges(client: &ChClient, marker_ns: i64) {
+    stop_edges_view(client).await;
+    exec(client, "TRUNCATE TABLE service_edges").await;
+    exec(
+        client,
+        &format!(
+            "INSERT INTO service_edges SELECT {t}, {t}, '', '', '', 0, 0, \
+             arrayReduce('quantilesTDigestState(0.5, 0.95, 0.99)', [toInt64(0)]), 1",
+            t = format_args!("toDateTime({}, 'UTC')", marker_ns / S)
+        ),
+    )
+    .await;
+    exec(client, "SYSTEM START VIEW service_edges_mv").await;
+}
+
+/// The end of the node's complete prefix of markers, §3.3's `last`.
+async fn prefix_end(client: &ChClient) -> i64 {
+    strings(
+        client,
+        "SELECT toString(toUnixTimestamp(ms[arrayFirstIndex(i -> i = length(ms) \
+         OR ms[i + 1] - ms[i] != 300, arrayEnumerate(ms))])) AS s \
+         FROM (SELECT arraySort(groupArray(minute)) AS ms FROM service_edges FINAL \
+         WHERE conn_type = '')",
+    )
+    .await
+    .first()
+    .map(|s| s.parse::<i64>().expect("a timestamp") * S)
+    .unwrap_or(0)
+}
+
+/// Part A §4's `run_edges_until` on one node.
+async fn run_edges_until(client: &ChClient, until_ns: i64) {
+    exec(client, "SYSTEM START VIEW service_edges_mv").await;
+    let mut runs = 0;
+    while prefix_end(client).await < until_ns {
+        assert!(runs < 400, "the edge job did not reach {until_ns}");
+        exec(client, "SYSTEM REFRESH VIEW service_edges_mv").await;
+        exec(client, "SYSTEM WAIT VIEW service_edges_mv").await;
+        runs += 1;
+    }
+}
+
+/// Part A §4's `process_edges` on one node.
+async fn process_edges(client: &ChClient, marker_ns: i64, until_ns: i64) {
+    start_edges(client, marker_ns).await;
+    run_edges_until(client, until_ns).await;
+}
+
+/// `calls` calls of `svc-a → server`, both halves stored on this node's
+/// own `spans`, from `at` on.
+async fn place_calls(client: &ChClient, tag: &str, server: &str, calls: u64, at: i64) {
+    exec(
+        client,
+        &format!(
+            "INSERT INTO spans (trace_id, span_id, parent_span_id, start_ns, duration_ns, \
+             service, name, kind, attrs, end_ns, service_type) \
+             SELECT sipHash128(number, '{tag}'), \
+                    reinterpretAsFixedString(cityHash64(number, '{tag}', k)), \
+                    if(k = 2, reinterpretAsFixedString(cityHash64(number, '{tag}', toUInt8(3))), \
+                       toFixedString('', 8)), \
+                    {at} + toInt64(number) * 1000000 AS st, 1000000, \
+                    if(k = 3, 'svc-a', '{server}'), 'op', k, CAST('{{}}', 'JSON'), \
+                    toUInt64(st + 1000000), 'string' \
+             FROM numbers({calls}) ARRAY JOIN [toUInt8(3), toUInt8(2)] AS k"
+        ),
+    )
+    .await;
+}
+
+/// C1's placement, #598 part 2a's R14 shape: one shard alone holds
+/// `svc-x`, the other alone `svc-z`, and both hold some `svc-y`.
+async fn place_c1(shard1: &ChClient, shard2: &ChClient, l: i64, only_shard2: bool) {
+    if !only_shard2 {
+        place_calls(shard1, "c1x", "svc-x", 2, l + 10 * S).await;
+        place_calls(shard1, "c1y", "svc-y", 1, l + 20 * S).await;
+    }
+    place_calls(shard2, "c2y", "svc-y", 3, l + 30 * S).await;
+    place_calls(shard2, "c2z", "svc-z", 1, l + 40 * S).await;
+}
+
+/// `(client, server, calls)` of a graph, in order.
+fn calls_of(graph: &pulsus_read::ServiceGraph) -> Vec<(String, String, u64)> {
+    graph
+        .edges
+        .iter()
+        .map(|e| (e.client.clone(), e.server.clone(), e.calls))
+        .collect()
+}
+
+fn c1_edges() -> Vec<(String, String, u64)> {
+    [("svc-y", 4), ("svc-x", 2), ("svc-z", 1)]
+        .into_iter()
+        .map(|(s, n)| ("svc-a".to_string(), s.to_string(), n))
+        .collect()
+}
+
+/// C1, C3 and C2 (issue #599 part A §5.3): the graph over the two shards
+/// from spans and from totals, each shard reading its own coverage; a
+/// reader whose routing table names the storage cluster; and a shard with
+/// no coverage answering from its spans beside one answering from totals.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_service_graph_answers_over_two_shards() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db(&format!("pulsus_read_it_t599_cluster_{}", now_ns()));
+    let reader_db = format!("{db}_q");
+    let bootstrap = ChClient::new(shard1_config("default"))
+        .await
+        .expect("connect shard1");
+    exec(
+        &bootstrap,
+        &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
+    )
+    .await;
+    exec(
+        &bootstrap,
+        &format!("DROP DATABASE IF EXISTS {reader_db} SYNC"),
+    )
+    .await;
+    run_init(&bootstrap, &cluster_ctx(&db))
+        .await
+        .expect("run_init");
+    let shard1 = ChClient::new(shard1_config(&db))
+        .await
+        .expect("connect shard1");
+    let shard2 = ChClient::new(shard2_config(&db))
+        .await
+        .expect("connect shard2");
+    let l = floor_to(now_ns() - 30 * MINUTE, BUCKET);
+    for c in [&shard1, &shard2] {
+        exec(c, "SYSTEM STOP MERGES spans").await;
+    }
+    place_c1(&shard1, &shard2, l, false).await;
+    let window = pulsus_read::GraphWindow {
+        start_ns: l,
+        end_ns: l + 5 * MINUTE,
+    };
+    let engine = |prefix: &str| {
+        let prefix = prefix.to_string();
+        let db = db.clone();
+        async move {
+            pulsus_read::TraceEngine::new(
+                ChClient::new(shard1_config(&db))
+                    .await
+                    .expect("connect the engine"),
+                config(),
+            )
+            .with_statement_prefix(&prefix)
+        }
+    };
+
+    // C1, from spans: a fresh schema's markers are all after L.
+    let graph = engine(&pulsus_testkit::test_ident(&format!(
+        "t599c1s_{}",
+        now_ns()
+    )))
+    .await
+    .service_graph(window)
+    .await
+    .expect("C1 from spans");
+    assert_eq!(calls_of(&graph), c1_edges(), "C1 from spans");
+
+    // C1, shard 2 one bucket behind shard 1: the answer is unchanged.
+    process_edges(&shard1, l - 6 * MINUTE, l + 9 * MINUTE).await;
+    process_edges(&shard2, l - 6 * MINUTE, l + 4 * MINUTE).await;
+    stop_edges_view(&shard2).await;
+    let wide = pulsus_read::GraphWindow {
+        start_ns: l - 5 * MINUTE,
+        end_ns: l + 10 * MINUTE,
+    };
+    let graph = engine(&pulsus_testkit::test_ident(&format!(
+        "t599c1b_{}",
+        now_ns()
+    )))
+    .await
+    .service_graph(wide)
+    .await
+    .expect("C1 one bucket behind");
+    assert_eq!(
+        calls_of(&graph),
+        c1_edges(),
+        "C1, shard 2 one bucket behind"
+    );
+
+    // C3: a reader database holding only a `spans_q` routing table onto the
+    // storage database. Two engines over one target cache, as the server
+    // builds one engine per request: the first reads the target, the
+    // second reuses it, and both answer.
+    exec(&shard1, &format!("CREATE DATABASE {reader_db}")).await;
+    exec(
+        &shard1,
+        &format!(
+            "CREATE TABLE {reader_db}.spans_q AS {db}.spans \
+             ENGINE = Distributed('{CLUSTER_NAME}', '{db}', 'spans', cityHash64(trace_id))"
+        ),
+    )
+    .await;
+    let cache = pulsus_read::GraphTargetCache::default();
+    let mut lookups = Vec::new();
+    for n in 0..2 {
+        let prefix = pulsus_testkit::test_ident(&format!("t599c3_{n}_{}", now_ns()));
+        let reader = pulsus_read::TraceEngine::new(
+            ChClient::new(shard1_config(&reader_db))
+                .await
+                .expect("connect the reader"),
+            pulsus_read::TraceReadConfig {
+                spans_v2_table: "spans_q".to_string(),
+                ..config()
+            },
+        )
+        .with_graph_target_cache(cache.clone())
+        .with_statement_prefix(&prefix);
+        let graph = reader.service_graph(window).await.expect("C3 answers");
+        assert_eq!(calls_of(&graph), c1_edges(), "C3 request {n}");
+        exec(&shard1, "SYSTEM FLUSH LOGS").await;
+        lookups.push(
+            count(
+                &shard1,
+                &format!(
+                    "SELECT count() AS n FROM system.query_log WHERE type = 'QueryFinish' \
+                     AND is_initial_query AND startsWith(query_id, '{prefix}-') \
+                     AND position(query, 'engine_full') > 0"
+                ),
+            )
+            .await,
+        );
+    }
+    assert_eq!(lookups, vec![1, 0], "C3: the target is read once and kept");
+
+    // C1, from totals.
+    run_edges_until(&shard2, l + 9 * MINUTE).await;
+    for c in [&shard1, &shard2] {
+        exec(c, "TRUNCATE TABLE spans").await;
+    }
+    let prefix = pulsus_testkit::test_ident(&format!("t599c1t_{}", now_ns()));
+    let graph = engine(&prefix)
+        .await
+        .service_graph(window)
+        .await
+        .expect("C1 from totals");
+    assert_eq!(calls_of(&graph), c1_edges(), "C1 from totals");
+    exec(&shard2, "SYSTEM FLUSH LOGS").await;
+    let remote = count(
+        &shard2,
+        &format!(
+            "SELECT count() AS n FROM system.query_log WHERE type = 'QueryFinish' \
+             AND is_initial_query = 0 AND startsWith(initial_query_id, '{prefix}-') \
+             AND has(tables, '{db}.service_edges')"
+        ),
+    )
+    .await;
+    assert!(
+        remote > 0,
+        "C1: shard 2 read its own service_edges: {remote}"
+    );
+
+    // C2: shard 2 with no coverage at all pairs from its spans while shard
+    // 1 sums its totals (its spans are gone).
+    place_c1(&shard1, &shard2, l, true).await;
+    stop_edges_view(&shard2).await;
+    exec(&shard2, "TRUNCATE TABLE service_edges").await;
+    let graph = engine(&pulsus_testkit::test_ident(&format!("t599c2_{}", now_ns())))
+        .await
+        .service_graph(window)
+        .await
+        .expect("C2");
+    assert_eq!(calls_of(&graph), c1_edges(), "C2");
+
+    exec(
+        &bootstrap,
+        &format!("DROP DATABASE IF EXISTS {reader_db} SYNC"),
+    )
+    .await;
+    exec(
+        &bootstrap,
+        &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
+    )
+    .await;
 }
