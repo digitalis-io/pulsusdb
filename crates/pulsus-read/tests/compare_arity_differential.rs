@@ -68,11 +68,18 @@ use std::collections::BTreeMap;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+use opentelemetry_proto::tonic::common::v1::{AnyValue, InstrumentationScope, KeyValue, any_value};
+use opentelemetry_proto::tonic::resource::v1::Resource;
+use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, Status};
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings};
-use pulsus_read::traces::metrics_plan::{MetricsParams, plan_trace_metrics};
-use pulsus_read::{MetricLabelValue, TraceEngine, TraceReadConfig};
+use pulsus_read::traces::metrics_plan::MetricsParams;
+use pulsus_read::{
+    MetricLabelValue, StatementTables, TraceEngine, TraceReadConfig, plan_trace_metrics_routed,
+};
 use pulsus_schema::RenderCtx;
 use pulsus_schema_testkit::run_init;
+use pulsus_write::{TraceLandingRow, parse_trace_landing};
 
 const SEC: i64 = 1_000_000_000;
 const MS: i64 = 1_000_000;
@@ -204,6 +211,23 @@ fn corpus_boundary(base: i64, service: &str) -> Vec<SpanDef> {
         .collect()
 }
 
+/// **Corpus P — the partial-key fixture** (issue #597, row B7). Ten spans
+/// `opp`, one per second at `base + i·1s`, `span.part = "p"` on `i` = 0, 1
+/// and 7 only: a key most spans lack, whose totals the reference counts
+/// over the spans carrying it.
+fn corpus_partial(base: i64, service: &str) -> Vec<SpanDef> {
+    (0..10i64)
+        .map(|i| SpanDef {
+            idx: 2000 + i as u32,
+            service: service.to_string(),
+            name: "opp",
+            msg: String::new(),
+            attr: [0, 1, 7].contains(&i).then(|| ("part", "p".to_string())),
+            ts_ns: base + i * SEC,
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Hex helpers
 // ---------------------------------------------------------------------------
@@ -258,82 +282,124 @@ fn counts_from(cells: &[(&str, &str, &str, i64)]) -> Counts {
 // PulsusDB side
 // ---------------------------------------------------------------------------
 
-async fn pulsus_insert(client: &ChClient, db: &str, nonce: &[u8; 16], spans: &[SpanDef]) {
-    let mut rows = Vec::new();
-    for s in spans {
-        // Issue #559: the same attribute goes onto the span row, because
-        // the metrics filter reads it there. A span with no attribute
-        // renders empty arrays, which is what the writer stores for it.
-        let (keys, scopes, vals, types) = match &s.attr {
-            Some((key, val)) => (
-                format!("['{key}']"),
-                "['span']".to_string(),
-                format!("['{val}']"),
-                "['string']".to_string(),
-            ),
-            None => (
-                "CAST([] AS Array(String))".to_string(),
-                "CAST([] AS Array(String))".to_string(),
-                "CAST([] AS Array(String))".to_string(),
-                "CAST([] AS Array(String))".to_string(),
-            ),
-        };
-        let nums = if s.attr.is_some() {
-            "CAST([NULL] AS Array(Nullable(Float64)))"
-        } else {
-            "CAST([] AS Array(Nullable(Float64)))"
-        };
-        rows.push(format!(
-            "(toFixedString(unhex('{tid}'),16), toFixedString(unhex('{sid}'),8), \
-             toFixedString(unhex('0000000000000000'),8), '{name}', '{service}', '{msg}', \
-             '', '', {ts}, 1000, 2, 1, 1, 'x', {keys}, {scopes}, {vals}, {types}, {nums})",
-            tid = hex(&tid_bytes(nonce, s.idx)),
-            sid = hex(&sid_bytes(s.idx)),
-            name = s.name,
-            service = s.service,
-            msg = s.msg,
-            ts = s.ts_ns,
-        ));
+/// The corpus as one request, its spans under one resource and scope,
+/// shaped as [`otlp_push`] sends them to the reference (issue #597: the
+/// product writer fills every table the statement reads).
+fn request_of(nonce: &[u8; 16], spans: &[SpanDef]) -> ExportTraceServiceRequest {
+    let service = spans.first().map(|s| s.service.clone()).unwrap_or_default();
+    assert!(
+        spans.iter().all(|s| s.service == service),
+        "one service a corpus"
+    );
+    ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: Some(Resource {
+                attributes: vec![KeyValue {
+                    key: "service.name".to_string(),
+                    value: Some(AnyValue {
+                        value: Some(any_value::Value::StringValue(service)),
+                    }),
+                    ..KeyValue::default()
+                }],
+                dropped_attributes_count: 0,
+                entity_refs: Vec::new(),
+            }),
+            scope_spans: vec![ScopeSpans {
+                scope: Some(InstrumentationScope {
+                    name: "pulsus-arity-fixture".to_string(),
+                    ..InstrumentationScope::default()
+                }),
+                spans: spans
+                    .iter()
+                    .map(|s| Span {
+                        trace_id: tid_bytes(nonce, s.idx).to_vec(),
+                        span_id: sid_bytes(s.idx).to_vec(),
+                        name: s.name.to_string(),
+                        kind: 1,
+                        start_time_unix_nano: s.ts_ns as u64,
+                        end_time_unix_nano: (s.ts_ns + 1000) as u64,
+                        attributes: s
+                            .attr
+                            .iter()
+                            .map(|(key, val)| KeyValue {
+                                key: key.to_string(),
+                                value: Some(AnyValue {
+                                    value: Some(any_value::Value::StringValue(val.clone())),
+                                }),
+                                ..KeyValue::default()
+                            })
+                            .collect(),
+                        status: Some(Status {
+                            message: s.msg.clone(),
+                            code: 2,
+                        }),
+                        ..Span::default()
+                    })
+                    .collect(),
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
     }
-    exec(
-        client,
-        &format!(
-            "INSERT INTO {db}.trace_spans \
-             (trace_id, span_id, parent_id, name, service, status_message, \
-              scope_name, scope_version, timestamp_ns, \
-              duration_ns, status_code, kind, payload_type, payload, \
-              attr_key, attr_scope, attr_val, attr_type, attr_num) VALUES {}",
-            rows.join(", ")
-        ),
-    )
-    .await;
+}
 
-    let attr_rows: Vec<String> = spans
-        .iter()
-        .filter_map(|s| {
-            let (key, val) = s.attr.as_ref()?;
-            Some(format!(
-                "(toDate(fromUnixTimestamp64Nano({ts})), '{key}', '{val}', 'span', 'string', \
-                 NULL, {ts}, \
-                 toFixedString(unhex('{tid}'),16), toFixedString(unhex('{sid}'),8), 1000)",
-                ts = s.ts_ns,
-                tid = hex(&tid_bytes(nonce, s.idx)),
-                sid = hex(&sid_bytes(s.idx)),
-            ))
-        })
-        .collect();
-    if !attr_rows.is_empty() {
-        exec(
-            client,
-            &format!(
-                "INSERT INTO {db}.trace_attrs_idx \
-                 (date, key, val, scope, val_type, val_num, timestamp_ns, trace_id, span_id, \
-                  duration_ns) VALUES {}",
-                attr_rows.join(", ")
-            ),
+/// Lands `req` through the product writer: the old tables through today's
+/// trace writer, the new ones through `trace_landing`, one insert.
+async fn pulsus_land(client: &ChClient, db: &str, req: &ExportTraceServiceRequest) {
+    use pulsus_write::writer::{ChBlockInserter, TraceWriter, TraceWriterTables};
+    use pulsus_write::{ParsedTraceLanding, PushHeaders, TraceSink};
+    use std::sync::Arc;
+    let writer_client = Arc::new(
+        ChClient::new(ch_config(db))
+            .await
+            .expect("connect the writer"),
+    );
+    let mut cfg = pulsus_config::WriterConfig::default();
+    cfg.batch_bytes.0 = 1;
+    let writer = TraceWriter::with_inserters_with_tables(
+        Arc::new(ChBlockInserter::new(writer_client.clone())),
+        Arc::new(ChBlockInserter::new(writer_client.clone())),
+        Arc::new(ChBlockInserter::new(writer_client.clone())),
+        &cfg,
+        TraceWriterTables::traces_default(),
+    );
+    let parsed = pulsus_write::parse_traces(req, now_ns()).expect("the old path parses");
+    let wait = writer
+        .admit_flush(
+            parsed,
+            ParsedTraceLanding::default(),
+            PushHeaders::default(),
         )
-        .await;
-    }
+        .expect("the queue has room");
+    tokio::time::timeout(Duration::from_secs(30), wait)
+        .await
+        .expect("the old path's flush settles")
+        .expect("the old path commits");
+    let landing = parse_trace_landing(req, now_ns()).expect("the landing decode");
+    let received_ms = now_ns() / 1_000_000;
+    let mut rows: Vec<TraceLandingRow> = Vec::new();
+    rows.extend(
+        landing
+            .spans
+            .iter()
+            .cloned()
+            .map(|s| TraceLandingRow::span(received_ms, s)),
+    );
+    rows.extend(
+        landing
+            .resources
+            .iter()
+            .cloned()
+            .map(|r| TraceLandingRow::resource(received_ms, r)),
+    );
+    client
+        .insert_block_with(
+            "trace_landing",
+            &rows,
+            &QuerySettings::trace_landing_insert(&format!("cmparity-{}", now_ns()), 1_048_576),
+        )
+        .await
+        .expect("the landing insert");
 }
 
 /// Reads `query` back through the REAL metrics executor and projects the
@@ -347,7 +413,8 @@ async fn pulsus_counts(
 ) -> Counts {
     let window_s = (window.1 - window.0) / SEC;
     let parsed = pulsus_traceql::parse(query).unwrap_or_else(|e| panic!("{query}: {e}"));
-    let plan = plan_trace_metrics(
+    // Issue #597: the route's statement, on the tables the writer fills.
+    let routed = plan_trace_metrics_routed(
         &parsed,
         &MetricsParams {
             start_ns: window.0,
@@ -356,10 +423,20 @@ async fn pulsus_counts(
             exemplars: None,
         },
         &engine.metrics_ctx(),
+        &StatementTables {
+            spans: "spans",
+            resources: "resources",
+            traces: "traces",
+            indexed: &[],
+        },
     )
     .unwrap_or_else(|e| panic!("{query}: plan failed: {e}"));
+    assert!(
+        routed.statement().is_some(),
+        "{query}: compare() takes the statement"
+    );
     let res = engine
-        .metrics_range(&plan)
+        .metrics_range_routed(&routed)
         .await
         .unwrap_or_else(|e| panic!("{query}: execute failed: {e}"));
 
@@ -698,14 +775,18 @@ async fn compare_arity_differential() {
     let run = hex(&nonce[..4]);
     let svc_e = format!("svc-e-{run}");
     let svc_b = format!("svc-b5-{run}");
+    let svc_p = format!("svc-p-{run}");
 
     let spans_e = corpus_topn(base, &svc_e);
     let spans_b = corpus_boundary(base, &svc_b);
+    let base_p = base + 20 * SEC;
+    let spans_p = corpus_partial(base_p, &svc_p);
 
     // Reference: push first so it has the whole poll window to become
     // queryable while the PulsusDB side runs.
     otlp_push(&otlp_base, &nonce, &spans_e);
     otlp_push(&otlp_base, &nonce, &spans_b);
+    otlp_push(&otlp_base, &nonce, &spans_p);
 
     let bootstrap = ChClient::new(ch_config("default"))
         .await
@@ -713,8 +794,9 @@ async fn compare_arity_differential() {
     let db = pulsus_testkit::test_db(&format!("pulsus_cmparity_it_{run}"));
     init_db(&bootstrap, &db).await;
     let client = ChClient::new(ch_config(&db)).await.expect("connect db");
-    pulsus_insert(&client, &db, &nonce, &spans_e).await;
-    pulsus_insert(&client, &db, &nonce, &spans_b).await;
+    for spans in [&spans_e, &spans_b, &spans_p] {
+        pulsus_land(&client, &db, &request_of(&nonce, spans)).await;
+    }
     let engine = TraceEngine::new(
         ChClient::new(ch_config(&db)).await.expect("connect engine"),
         engine_config(),
@@ -722,6 +804,10 @@ async fn compare_arity_differential() {
 
     const MSG: &[&str] = &["statusMessage"];
     const IDX: &[&str] = &["span.idx"];
+    const PART: &[&str] = &["span.part"];
+    // Corpus P's window, (base_p + 4.5 s, base_p + 9.5 s]: i = 5…9 are
+    // selection, and `part` sits on i = 0, 1 (baseline) and 7 (selection).
+    let (p_start, p_end) = (base_p + 4 * SEC + 500 * MS, base_p + 9 * SEC + 500 * MS);
     // Corpus E's `(start, end]` window: (base+5.5s, base+8.5s], chosen off
     // every span timestamp so no boundary is exercised by accident here —
     // the boundary is row B5's job.
@@ -860,6 +946,26 @@ async fn compare_arity_differential() {
             ]),
             trimmed: vec![("baseline", "span.idx", 0), ("selection", "span.idx", 0)],
         },
+        // ---- B7: a key most spans lack (issue #597). --------------------
+        // `span.part` is not one of the reference's dedicated columns, so
+        // each side's total counts the spans CARRYING it and there is no
+        // `span.part=nil` series. Derived from the reference's source (the
+        // plan's D9) until the first CI run captures it; the live
+        // comparison below decides.
+        Row {
+            label: "B7 a partial key's totals count the spans carrying it",
+            query: format!(
+                r#"{{resource.service.name="{svc_p}"}} | compare({{status=error}}, 10, {p_start}, {p_end})"#
+            ),
+            keys: PART,
+            want: counts_from(&[
+                ("baseline", "span.part", "p", 2),
+                ("baseline_total", "span.part", "nil", 2),
+                ("selection", "span.part", "p", 1),
+                ("selection_total", "span.part", "nil", 1),
+            ]),
+            trimmed: vec![("baseline", "span.part", 0), ("selection", "span.part", 0)],
+        },
     ];
 
     // ---- READINESS, before any row is evaluated. ----------------------
@@ -870,6 +976,7 @@ async fn compare_arity_differential() {
     // because B5 reads the second one.
     await_complete_corpus(&api_base, &svc_e, "statusMessage", window, 78, 12);
     await_complete_corpus(&api_base, &svc_b, "span.idx", window, 10, 10);
+    await_complete_corpus(&api_base, &svc_p, "span.part", window, 3, 1);
 
     let mut faults: Vec<String> = Vec::new();
     for row in &rows {

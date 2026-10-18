@@ -136,12 +136,12 @@ fn side_of(query: &pulsus_traceql::Query, route: &str) -> &'static str {
 }
 
 /// The side a task's queries take: task 9's are the search statement's,
-/// task 14's the metrics statement's (issue #596 part 1), tasks 10 to 12
-/// and 15's today's engine's.
+/// task 14's and 15's the metrics statement's (issue #596 part 1, issue
+/// #597), tasks 10 to 12 today's engine's.
 fn side_of_task(task: &str) -> &'static str {
     match task {
-        "9" | "14" => "new",
-        "10" | "11" | "12" | "15" => "old",
+        "9" | "14" | "15" => "new",
+        "10" | "11" | "12" => "old",
         "refused" => "refused",
         other => panic!("an unknown task {other:?}"),
     }
@@ -205,7 +205,7 @@ fn the_inventory_is_complete_and_exact() {
             sides.get("old").copied().unwrap_or(0),
             sides.get("refused").copied().unwrap_or(0)
         ),
-        (135, 3, 3),
+        (138, 0, 3),
         "new, old and refused"
     );
 }

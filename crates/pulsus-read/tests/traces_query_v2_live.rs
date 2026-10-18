@@ -94,6 +94,7 @@
 //! podman rm -f pulsus-ch-test
 //! ```
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration as StdDuration;
 
 use futures::StreamExt;
@@ -16849,4 +16850,843 @@ async fn the_ledger_search_claims_hold_on_the_route() {
     }
     drop_db(&db).await;
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+// =====================================================================
+// Issue #597 — `compare()` on the new tables, in one statement
+// =====================================================================
+
+/// Fixture CMP (§5.2 of the plan): four pushes, each one `land` call.
+async fn seed_compare_cmp(test: &str) -> (String, ChClient, i64) {
+    let db = pulsus_testkit::test_db(&format!("pulsus_read_it_t597_cmp_{test}"));
+    let client = fresh_db(&db).await;
+    let l = metrics_l();
+    let at = |s: i64| (l + s) * S_NS;
+    let link_trace = {
+        let mut t = vec![0x99u8; 16];
+        t[0] = 0x00;
+        t[1] = 0x01;
+        t
+    };
+    let p1 = request(
+        "cmp-a",
+        "pod-x",
+        vec![
+            span_of(
+                vec![0xc1; 16],
+                span_id_bytes(1),
+                Vec::new(),
+                "root",
+                2,
+                at(10),
+                S_NS,
+                vec![
+                    kv("http.status_code", int_value(500)),
+                    kv("ratio", double_value(1.0)),
+                    kv("tags", str_array_value(&["a", "b"])),
+                ],
+                2,
+                vec![
+                    event_of(
+                        at(10) + 1_000,
+                        "exception",
+                        vec![kv("exception.type", str_value("IOError"))],
+                    ),
+                    event_of(
+                        at(10) + 2_000,
+                        "exception",
+                        vec![kv("exception.type", str_value("IOError"))],
+                    ),
+                ],
+                vec![link_of(
+                    link_trace,
+                    vec![0, 0, 0, 0, 0, 0, 0, 9],
+                    vec![kv("ref", str_value("follows"))],
+                )],
+            ),
+            span_of(
+                vec![0xc2; 16],
+                span_id_bytes(2),
+                Vec::new(),
+                "root2",
+                2,
+                at(20),
+                5 * S_NS,
+                vec![kv("ratio", int_value(1))],
+                0,
+                Vec::new(),
+                Vec::new(),
+            ),
+        ],
+    );
+    let p2 = request(
+        "cmp-a",
+        "pod-x",
+        vec![span_of(
+            vec![0xc1; 16],
+            span_id_bytes(3),
+            span_id_bytes(1),
+            "child",
+            3,
+            at(15),
+            S_NS,
+            vec![kv("http.status_code", int_value(200))],
+            0,
+            Vec::new(),
+            Vec::new(),
+        )],
+    );
+    let p3 = request(
+        "cmp-b",
+        "pod-y",
+        vec![span_of(
+            vec![0xc3; 16],
+            span_id_bytes(4),
+            Vec::new(),
+            "root3",
+            2,
+            at(130),
+            S_NS,
+            Vec::new(),
+            0,
+            Vec::new(),
+            Vec::new(),
+        )],
+    );
+    let p4 = request(
+        "cmp-b",
+        "pod-y",
+        vec![span_of(
+            vec![0xc3; 16],
+            span_id_bytes(5),
+            span_id_bytes(4),
+            "child",
+            1,
+            at(131),
+            S_NS,
+            Vec::new(),
+            2,
+            Vec::new(),
+            Vec::new(),
+        )],
+    );
+    for (i, req) in [p1, p2, p3, p4].iter().enumerate() {
+        land(&client, req, &format!("{test}-p{i}-{}", now_ns())).await;
+    }
+    (db, client, l)
+}
+
+/// Fixture TOPN (L4): one push, 66 root spans of `cmp-n`, each its own
+/// trace, one a second from `L+10s`; `idx = "i<j>"` on `11 − j` of them,
+/// `two` `"x"` on two and `"y"` on one.
+async fn seed_compare_topn(test: &str) -> (String, ChClient, i64) {
+    let db = pulsus_testkit::test_db(&format!("pulsus_read_it_t597_topn_{test}"));
+    let client = fresh_db(&db).await;
+    let l = metrics_l();
+    let mut idx = Vec::new();
+    for j in 0..=10usize {
+        for _ in 0..(11 - j) {
+            idx.push(format!("i{j}"));
+        }
+    }
+    assert_eq!(idx.len(), 66, "11 + 10 + … + 1");
+    let spans = idx
+        .iter()
+        .enumerate()
+        .map(|(n, v)| {
+            let mut attributes = vec![kv("idx", str_value(v))];
+            match n {
+                0 | 1 => attributes.push(kv("two", str_value("x"))),
+                2 => attributes.push(kv("two", str_value("y"))),
+                _ => {}
+            }
+            let mut trace = vec![0xd0u8; 16];
+            trace[15] = n as u8;
+            span_of(
+                trace,
+                span_id_bytes(n as u8 + 1),
+                Vec::new(),
+                "op",
+                2,
+                (l + 10 + n as i64) * S_NS,
+                S_NS,
+                attributes,
+                0,
+                Vec::new(),
+                Vec::new(),
+            )
+        })
+        .collect();
+    land(
+        &client,
+        &request("cmp-n", "pod-n", spans),
+        &format!("{test}-{}", now_ns()),
+    )
+    .await;
+    (db, client, l)
+}
+
+/// A compare label value as `<arm>:<text>`: `s`, `i`, `d` or `b`.
+fn compare_value(v: &pulsus_read::MetricLabelValue) -> String {
+    match v {
+        pulsus_read::MetricLabelValue::Str(s) => format!("s:{s}"),
+        pulsus_read::MetricLabelValue::Int(i) => format!("i:{i}"),
+        pulsus_read::MetricLabelValue::Double(d) => format!("d:{d}"),
+        pulsus_read::MetricLabelValue::Bool(b) => format!("b:{b}"),
+    }
+}
+
+/// A compare answer as `(meta, key, value) → (Σ samples, samples)`.
+type CompareCells = BTreeMap<(String, String, String), (f64, usize)>;
+
+fn compare_cells(out: &pulsus_read::TraceMetricsResult) -> CompareCells {
+    let mut cells = CompareCells::new();
+    for s in &out.series {
+        let meta = s
+            .labels
+            .iter()
+            .find(|l| l.key == "__meta_type")
+            .map(|l| compare_value(&l.value))
+            .unwrap_or_else(|| panic!("a series without __meta_type: {:?}", s.labels));
+        let meta = meta.trim_start_matches("s:").to_string();
+        let key = s
+            .labels
+            .iter()
+            .find(|l| l.key != "__meta_type")
+            .unwrap_or_else(|| panic!("a series without a key: {:?}", s.labels));
+        let sum: f64 = s.samples.iter().map(|(_, v)| *v).sum();
+        let prior = cells.insert(
+            (meta, key.key.clone(), compare_value(&key.value)),
+            (sum, s.samples.len()),
+        );
+        assert!(prior.is_none(), "a series twice: {:?}", s.labels);
+    }
+    cells
+}
+
+/// CMP's value series (the first table of §5.2), `(key, value, selection,
+/// baseline)`; a zero side has no series.
+const CMP_VALUES: [(&str, &str, u32, u32); 28] = [
+    ("resource.k8s.pod.name", "s:pod-x", 1, 2),
+    ("resource.k8s.pod.name", "s:pod-y", 1, 1),
+    ("resource.service.name", "s:cmp-a", 1, 2),
+    ("resource.service.name", "s:cmp-b", 1, 1),
+    ("resource.deployment.environment.name", "s:prod", 2, 3),
+    ("rootName", "s:root", 1, 1),
+    ("rootName", "s:root2", 0, 1),
+    ("rootName", "s:root3", 1, 1),
+    ("name", "s:root", 1, 0),
+    ("name", "s:root2", 0, 1),
+    ("name", "s:child", 1, 1),
+    ("name", "s:root3", 0, 1),
+    ("span.http.status_code", "i:500", 1, 0),
+    ("span.http.status_code", "i:200", 0, 1),
+    ("instrumentation.otel.scope.build", "s:release", 2, 3),
+    ("kind", "s:server", 1, 2),
+    ("kind", "s:client", 0, 1),
+    ("kind", "s:internal", 1, 0),
+    ("status", "s:error", 2, 0),
+    ("status", "s:unset", 0, 3),
+    ("statusMessage", "s:boom", 2, 0),
+    ("statusMessage", "s:", 0, 3),
+    ("rootServiceName", "s:cmp-a", 1, 2),
+    ("rootServiceName", "s:cmp-b", 1, 1),
+    ("instrumentation:name", "s:io.opentelemetry.http", 2, 3),
+    ("instrumentation:version", "s:2.9.0", 2, 3),
+    ("span.ratio", "d:1", 1, 0),
+    ("span.ratio", "i:1", 0, 1),
+];
+
+/// The 14 keys of the 25-key set CMP does not carry.
+const CMP_NIL_ONLY: [&str; 14] = [
+    "resource.cluster",
+    "resource.container",
+    "resource.namespace",
+    "resource.pod",
+    "resource.k8s.cluster.name",
+    "resource.k8s.container.name",
+    "resource.k8s.namespace.name",
+    "span.http.method",
+    "span.http.request.method",
+    "span.http.route",
+    "span.http.url",
+    "span.server.address",
+    "span.url.path",
+    "span.url.route",
+];
+
+/// CMP's value cells, from [`CMP_VALUES`].
+fn cmp_value_cells() -> BTreeMap<(String, String, String), f64> {
+    let mut want = BTreeMap::new();
+    for (key, value, sel, base) in CMP_VALUES {
+        for (meta, n) in [("selection", sel), ("baseline", base)] {
+            if n > 0 {
+                want.insert(
+                    (meta.to_string(), key.to_string(), value.to_string()),
+                    f64::from(n),
+                );
+            }
+        }
+    }
+    want
+}
+
+/// CMP's denominators (the second paragraph of §5.2): every `*_total` and
+/// every `key=nil` series.
+fn cmp_denominator_cells() -> BTreeMap<(String, String, String), f64> {
+    let mut want = BTreeMap::new();
+    let mut put = |meta: &str, key: &str, n: u32| {
+        if n > 0 {
+            want.insert(
+                (meta.to_string(), key.to_string(), "s:nil".to_string()),
+                f64::from(n),
+            );
+        }
+    };
+    let keys: BTreeSet<&str> = CMP_VALUES.iter().map(|(k, ..)| *k).collect();
+    for key in keys {
+        let (sel, base) = if key == "span.ratio" { (1, 1) } else { (2, 3) };
+        put("selection_total", key, sel);
+        put("baseline_total", key, base);
+    }
+    put("selection", "span.http.status_code", 1);
+    put("baseline", "span.http.status_code", 2);
+    for key in CMP_NIL_ONLY {
+        put("selection", key, 2);
+        put("baseline", key, 3);
+        put("selection_total", key, 2);
+        put("baseline_total", key, 3);
+    }
+    want
+}
+
+/// The cells of `cells` that are value series (not `nil`, not a total).
+fn value_cells(cells: &CompareCells) -> BTreeMap<(String, String, String), f64> {
+    cells
+        .iter()
+        .filter(|((meta, _, value), _)| !meta.ends_with("_total") && value != "s:nil")
+        .map(|(k, (sum, _))| (k.clone(), *sum))
+        .collect()
+}
+
+/// The cells of `cells` that are denominators: a total or a `nil`.
+fn denominator_cells(cells: &CompareCells) -> BTreeMap<(String, String, String), f64> {
+    cells
+        .iter()
+        .filter(|((meta, _, value), _)| meta.ends_with("_total") || value == "s:nil")
+        .map(|(k, (sum, _))| (k.clone(), *sum))
+        .collect()
+}
+
+const CMP_Q: &str = "{} | compare({ status = error })";
+
+/// L1 (issue #597): CMP's every value row exactly; the keys with a value
+/// series are exactly that table's keys, and the keys with only `nil`
+/// exactly the 14.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compare_counts_each_scope_per_span() {
+    skip_unless_live!();
+    let (db, _client, l) = seed_compare_cmp("l1").await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let out = range_answer(&engine, CMP_Q, l, l + 600).await;
+    drop_db(&db).await;
+    let cells = compare_cells(&out.unwrap_or_else(|e| panic!("{CMP_Q}: {e}")));
+    let values = value_cells(&cells);
+    assert_eq!(values, cmp_value_cells(), "the value series");
+    let with_values: BTreeSet<&str> = values.keys().map(|(_, k, _)| k.as_str()).collect();
+    let want_keys: BTreeSet<&str> = CMP_VALUES.iter().map(|(k, ..)| *k).collect();
+    assert_eq!(with_values, want_keys, "the keys with a value series");
+    let nil_only: BTreeSet<&str> = cells
+        .keys()
+        .map(|(_, k, _)| k.as_str())
+        .filter(|k| !with_values.contains(k))
+        .collect();
+    assert_eq!(
+        nil_only,
+        CMP_NIL_ONLY.iter().copied().collect::<BTreeSet<_>>(),
+        "the keys with only nil"
+    );
+}
+
+/// L2 (issue #597): a value is labelled in the arm of its stored type.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_compare_value_carries_its_stored_type() {
+    skip_unless_live!();
+    let (db, _client, l) = seed_compare_cmp("l2").await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let out = range_answer(&engine, CMP_Q, l, l + 600).await;
+    drop_db(&db).await;
+    let cells = compare_cells(&out.unwrap_or_else(|e| panic!("{CMP_Q}: {e}")));
+    let of_key = |key: &str| -> BTreeSet<(String, String)> {
+        cells
+            .keys()
+            .filter(|(meta, k, v)| k == key && !meta.ends_with("_total") && v != "s:nil")
+            .map(|(meta, _, v)| (meta.clone(), v.clone()))
+            .collect()
+    };
+    let pairs = |p: &[(&str, &str)]| -> BTreeSet<(String, String)> {
+        p.iter()
+            .map(|(m, v)| (m.to_string(), v.to_string()))
+            .collect()
+    };
+    assert_eq!(
+        of_key("span.http.status_code"),
+        pairs(&[("selection", "i:500"), ("baseline", "i:200")])
+    );
+    assert_eq!(
+        of_key("span.ratio"),
+        pairs(&[("selection", "d:1"), ("baseline", "i:1")])
+    );
+    assert!(
+        of_key("kind").contains(&("baseline".to_string(), "s:server".to_string())),
+        "kind = server is a string: {:?}",
+        of_key("kind")
+    );
+}
+
+/// L3 (issue #597): an ordinary comparison has no event or link key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ordinary_comparison_has_no_event_or_link_key() {
+    skip_unless_live!();
+    let (db, _client, l) = seed_compare_cmp("l3").await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let out = range_answer(&engine, CMP_Q, l, l + 600).await;
+    drop_db(&db).await;
+    let cells = compare_cells(&out.unwrap_or_else(|e| panic!("{CMP_Q}: {e}")));
+    let evented: Vec<&String> = cells
+        .keys()
+        .map(|(_, k, _)| k)
+        .filter(|k| k.starts_with("event") || k.starts_with("link"))
+        .collect();
+    assert!(evented.is_empty(), "event or link keys: {evented:?}");
+}
+
+/// L11 (issue #597): every denominator is the reference's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_compare_denominator_is_the_reference_one() {
+    skip_unless_live!();
+    let (db, _client, l) = seed_compare_cmp("l11").await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let out = range_answer(&engine, CMP_Q, l, l + 600).await;
+    drop_db(&db).await;
+    let cells = compare_cells(&out.unwrap_or_else(|e| panic!("{CMP_Q}: {e}")));
+    assert_eq!(denominator_cells(&cells), cmp_denominator_cells());
+}
+
+/// L4 (issue #597): `topN` is per key and per side, and a key's total is
+/// its untrimmed sum.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn top_n_is_per_key_and_per_side() {
+    skip_unless_live!();
+    let (db, _client, l) = seed_compare_topn("l4").await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let q = "{} | compare({ status = error }, 10)";
+    let out = range_answer(&engine, q, l, l + 600).await;
+    drop_db(&db).await;
+    let cells = compare_cells(&out.unwrap_or_else(|e| panic!("{q}: {e}")));
+    let of = |key: &str| -> BTreeMap<String, f64> {
+        cells
+            .iter()
+            .filter(|((meta, k, v), _)| meta == "baseline" && k == key && v != "s:nil")
+            .map(|((_, _, v), (n, _))| (v.clone(), *n))
+            .collect()
+    };
+    let want_idx: BTreeMap<String, f64> = (0..10)
+        .map(|j| (format!("s:i{j}"), f64::from(11 - j)))
+        .collect();
+    assert_eq!(of("span.idx"), want_idx, "span.idx");
+    assert_eq!(
+        of("span.two"),
+        [("s:x".to_string(), 2.0), ("s:y".to_string(), 1.0)]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>(),
+        "span.two"
+    );
+    let cell = |meta: &str, key: &str| {
+        cells
+            .get(&(meta.to_string(), key.to_string(), "s:nil".to_string()))
+            .map(|(n, _)| *n)
+    };
+    assert_eq!(cell("baseline_total", "span.idx"), Some(66.0));
+    assert_eq!(cell("baseline_total", "span.two"), Some(3.0));
+    for key in ["span.idx", "span.two"] {
+        assert_eq!(cell("baseline", key), None, "{key}=nil");
+        assert_eq!(cell("selection", key), None, "{key}=nil");
+    }
+}
+
+/// L5 (issue #597): the cap counts the values kept after `topN` on both
+/// sides plus four per key: 80 here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_compare_cap_counts_what_is_kept() {
+    skip_unless_live!();
+    let (db, _client, l) = seed_compare_topn("l5").await;
+    let q = "{} | compare({ status = error }, 10)";
+    let at_80 = range_answer(&metrics_engine(&db, 80).await, q, l, l + 600).await;
+    let at_79 = range_answer(&metrics_engine(&db, 79).await, q, l, l + 600).await;
+    drop_db(&db).await;
+    assert!(at_80.is_ok(), "cap 80: {:?}", at_80.err());
+    assert!(
+        matches!(
+            at_79,
+            Err(pulsus_read::logql::ReadError::QueryTooBroad(
+                pulsus_read::logql::TooBroadReason::TraceMetricsSeriesCap { .. }
+            ))
+        ),
+        "cap 79: {:?}",
+        at_79.map(|o| o.series.len())
+    );
+}
+
+/// L6 (issue #597): an exemplar is the longest span of its side carrying
+/// the key, on that key's total.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_compare_exemplar_is_a_span_of_its_side_carrying_the_key() {
+    skip_unless_live!();
+    let (db, _client, l) = seed_compare_cmp("l6").await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let q = "{} | compare({ status = error }) with(exemplars=100)";
+    let out = range_answer(&engine, q, l, l + 600).await;
+    drop_db(&db).await;
+    let out = out.unwrap_or_else(|e| panic!("{q}: {e}"));
+    let mut on_total = Vec::new();
+    let mut on_values = Vec::new();
+    for s in &out.series {
+        let meta = s
+            .labels
+            .iter()
+            .find(|l| l.key == "__meta_type")
+            .map(|l| compare_value(&l.value))
+            .unwrap_or_default();
+        let key = s
+            .labels
+            .iter()
+            .find(|l| l.key != "__meta_type")
+            .map(|l| l.key.clone())
+            .unwrap_or_default();
+        if meta == "s:baseline_total" && key == "span.http.status_code" {
+            on_total.extend(s.exemplars.iter().map(|e| format!("{:?}", e.labels)));
+        }
+        if !meta.ends_with("_total") && !s.exemplars.is_empty() {
+            on_values.push(format!("{:?}", s.labels));
+        }
+    }
+    assert_eq!(on_total.len(), 1, "one exemplar: {on_total:?}");
+    assert!(
+        on_total[0].contains(&"c1".repeat(16)),
+        "the exemplar is S3's trace: {on_total:?}"
+    );
+    assert!(
+        on_values.is_empty(),
+        "exemplars on value series: {on_values:?}"
+    );
+}
+
+/// L7 (issue #597): the instant answer is the range answer summed, one
+/// sample a series.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_instant_compare_is_the_range_summed() {
+    skip_unless_live!();
+    let (db, _client, l) = seed_compare_cmp("l7").await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let out = instant_answer(&engine, CMP_Q, l, l + 600).await;
+    drop_db(&db).await;
+    let cells = compare_cells(&out.unwrap_or_else(|e| panic!("{CMP_Q}: {e}")));
+    let many: Vec<_> = cells.iter().filter(|(_, (_, n))| *n != 1).collect();
+    assert!(many.is_empty(), "series of more than one sample: {many:?}");
+    assert_eq!(value_cells(&cells), cmp_value_cells(), "the value series");
+    assert_eq!(
+        denominator_cells(&cells),
+        cmp_denominator_cells(),
+        "the denominators"
+    );
+}
+
+/// L8 (issue #597): the comparison is one statement reading the window
+/// about once, plus the `traces` and `resources` rows of its days.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compare_reads_the_window_once() {
+    skip_unless_live!();
+    let (db, client, l) = seed_compare_cmp("l8").await;
+    let prefix = pulsus_testkit::test_ident(&format!("t597_read_once_{}", now_ns()));
+    let engine = metrics_engine(&db, 1_000)
+        .await
+        .with_statement_prefix(&prefix);
+    let routed = routed_plan(&engine, CMP_Q, l, l + 600, 60_000);
+    let (lo, hi) = routed.plan().range_window_ns();
+    let w = WindowSql::start_closed_end_open(lo, hi);
+    let t0 = now_ns();
+    engine
+        .metrics_range_routed(&routed)
+        .await
+        .unwrap_or_else(|e| panic!("{CMP_Q}: {e}"));
+    settled_statements(&client, &db, t0).await;
+    #[derive(Row, serde::Serialize, serde::Deserialize)]
+    struct Logged {
+        n: u64,
+        rows: u64,
+    }
+    let mut stream = client
+        .query_stream::<Logged>(
+            &format!(
+                "SELECT count() AS n, sum(read_rows) AS rows FROM system.query_log \
+                 WHERE type = 'QueryFinish' AND startsWith(query_id, '{prefix}-')"
+            ),
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("read the query log");
+    let logged = stream.next().await.expect("one row").expect("decode");
+    // The bound (the architect's decision on #597): what one `count()` of
+    // each table over the window reads under `final = 1`, the route's
+    // setting, with the 1.05 margin on the `spans` term only.
+    let read_once = |table: &str, clause: String| {
+        let comment = pulsus_testkit::test_ident(&format!("t597_count_{table}_{}", now_ns()));
+        let sql = format!("SELECT count() AS n FROM {table} WHERE {clause}");
+        let client = &client;
+        async move {
+            let settings = QuerySettings::new()
+                .set("final", 1)
+                .set("log_comment", &comment);
+            let mut stream = client
+                .query_stream::<CountRow>(&sql, &settings)
+                .await
+                .expect("the count");
+            while stream.next().await.is_some() {}
+            comment
+        }
+    };
+    let comments = [
+        read_once(
+            "spans",
+            format!(
+                "{} AND {} AND {}",
+                w.span_time_clause(),
+                w.span_bucket_clause(),
+                w.span_day_clause()
+            ),
+        )
+        .await,
+        read_once("traces", w.per_trace_day_clause()).await,
+        read_once("resources", w.resources_day_clause()).await,
+    ];
+    settled_statements(&client, &db, t0).await;
+    let mut per_table = Vec::new();
+    for comment in &comments {
+        per_table.push(
+            count(
+                &client,
+                &format!(
+                    "SELECT any(read_rows) AS n FROM system.query_log WHERE \
+                     log_comment = '{comment}' AND type = 'QueryFinish'"
+                ),
+            )
+            .await,
+        );
+    }
+    drop_db(&db).await;
+    assert_eq!(logged.n, 1, "one statement");
+    let bound = 1.05 * per_table[0] as f64 + (per_table[1] + per_table[2]) as f64;
+    assert!(
+        logged.rows as f64 <= bound,
+        "{} rows read; the bound is {bound} (a FINAL count of spans, traces and resources reads \
+         {per_table:?})",
+        logged.rows
+    );
+}
+
+/// The compare statement's rows.
+async fn compare_statement_rows(
+    client: &ChClient,
+    statement: &str,
+) -> Vec<pulsus_read::traces::spans::metrics::CompareStatementRow> {
+    let mut stream = client
+        .query_stream::<pulsus_read::traces::spans::metrics::CompareStatementRow>(
+            &statement.replace('?', "??"),
+            &read_settings().set("max_block_size", 4096),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the statement failed: {e}\nSQL:\n{statement}"));
+    let mut out = Vec::new();
+    while let Some(row) = stream.next().await {
+        out.push(row.expect("decode a compare statement row"));
+    }
+    out
+}
+
+/// L9 (issue #597): the body is its rows' RowBinary bytes, exactly, and
+/// the row count is bounded by `topN` and the keys.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_q3_compare_body_is_its_rows() {
+    skip_unless_live!();
+    let mut wrong = Vec::new();
+    for (fixture, q) in [
+        ("cmp", CMP_Q.to_string()),
+        ("topn", "{} | compare({ status = error }, 10)".to_string()),
+    ] {
+        let (db, client, l) = if fixture == "cmp" {
+            seed_compare_cmp("l9_cmp").await
+        } else {
+            seed_compare_topn("l9_topn").await
+        };
+        let engine = metrics_engine(&db, 1_000).await;
+        let routed = routed_plan(&engine, &q, l, l + 600, 60_000);
+        let sql = routed.statement().expect("checked").range_sql().to_string();
+        let rows = compare_statement_rows(&client, &sql).await;
+        let body = count(
+            &client,
+            &format!(
+                "SELECT sum(length(formatRow('RowBinary', s, g, k, v, y, pts, ex, c))) AS n \
+                 FROM ({}) SETTINGS final = 1, max_block_size = 4096",
+                sql.replace('?', "??")
+            ),
+        )
+        .await;
+        drop_db(&db).await;
+        let want: usize = rows
+            .iter()
+            .map(|r| {
+                3 + varint_width(r.k.len())
+                    + r.k.len()
+                    + varint_width(r.v.len())
+                    + r.v.len()
+                    + varint_width(r.y.len())
+                    + r.y.len()
+                    + varint_width(r.pts.len())
+                    + 16 * r.pts.len()
+                    + varint_width(r.ex.len())
+                    + 32 * r.ex.len()
+            })
+            .sum();
+        if body != want as u64 {
+            wrong.push(format!("{fixture}: body {body}, the rows' bytes {want}"));
+        }
+        let keys: BTreeSet<&str> = rows
+            .iter()
+            .filter(|r| !r.k.is_empty())
+            .map(|r| r.k.as_str())
+            .collect();
+        let top_n = routed.plan().compare_top_n();
+        let bound = 2 * top_n * keys.len() + keys.len() + 2;
+        if rows.len() > bound {
+            wrong.push(format!("{fixture}: {} rows, the bound {bound}", rows.len()));
+        }
+        eprintln!(
+            "{fixture}: body {body}, {} rows, {} keys",
+            rows.len(),
+            keys.len()
+        );
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// L10 (issue #597): a selection window repartitions the population: S5
+/// is selection, S1 baseline, and `name`'s totals are 1 / 4.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_compare_selection_window_partitions() {
+    skip_unless_live!();
+    let (db, _client, l) = seed_compare_cmp("l10").await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let q = format!(
+        "{{}} | compare({{ status = error }}, 10, {}, {})",
+        (l + 12) * S_NS,
+        (l + 200) * S_NS
+    );
+    let out = range_answer(&engine, &q, l, l + 600).await;
+    drop_db(&db).await;
+    let cells = compare_cells(&out.unwrap_or_else(|e| panic!("{q}: {e}")));
+    let total = |meta: &str| {
+        cells
+            .get(&(meta.to_string(), "name".to_string(), "s:nil".to_string()))
+            .map(|(n, _)| *n)
+    };
+    assert_eq!(total("selection_total"), Some(1.0), "selection_total");
+    assert_eq!(total("baseline_total"), Some(4.0), "baseline_total");
+}
+
+/// L12 (issue #597): a trace whose spans fall on two UTC days keeps two
+/// `traces` rows, which `final = 1` does not merge across the `day`
+/// partitions; the child's `rootName` is still its root's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_compare_root_crosses_midnight() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db("pulsus_read_it_t597_midnight");
+    let client = fresh_db(&db).await;
+    // `B` is the current UTC midnight, or the previous one while today's
+    // is within the default lookback plus a minute of now (#598's R16).
+    let lookback = i64::try_from(
+        pulsus_config::ReaderConfig::default()
+            .traceql_tag_lookback
+            .0
+            .as_nanos(),
+    )
+    .expect("the default lookback fits in i64 nanoseconds");
+    const DAY_NS: i64 = 86_400 * S_NS;
+    let now = now_ns();
+    let mut b = now.div_euclid(DAY_NS) * DAY_NS;
+    if now - b < lookback + 60 * S_NS {
+        b -= DAY_NS;
+    }
+    let trace = vec![0xe7u8; 16];
+    let root = request(
+        "cmp-e",
+        "pod-e",
+        vec![span_of(
+            trace.clone(),
+            span_id_bytes(1),
+            Vec::new(),
+            "edge.root",
+            2,
+            b - S_NS,
+            S_NS / 10,
+            Vec::new(),
+            0,
+            Vec::new(),
+            Vec::new(),
+        )],
+    );
+    let child = request(
+        "cmp-e",
+        "pod-e",
+        vec![span_of(
+            trace.clone(),
+            span_id_bytes(2),
+            span_id_bytes(1),
+            "edge.child",
+            3,
+            b + S_NS,
+            S_NS / 10,
+            Vec::new(),
+            2,
+            Vec::new(),
+            Vec::new(),
+        )],
+    );
+    land(&client, &root, &format!("l12-root-{}", now_ns())).await;
+    land(&client, &child, &format!("l12-child-{}", now_ns())).await;
+    let days = count(
+        &client,
+        "SELECT uniqExact(day) AS n FROM traces WHERE trace_id = toFixedString(unhex(\
+         'e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7'), 16) SETTINGS final = 0",
+    )
+    .await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let (start_s, end_s) = (b / S_NS - 120, b / S_NS + 120);
+    let out = range_answer(&engine, CMP_Q, start_s, end_s).await;
+    drop_db(&db).await;
+    assert_eq!(
+        days, 2,
+        "the precondition: the trace has a traces row on each day"
+    );
+    let cells = compare_cells(&out.unwrap_or_else(|e| panic!("{CMP_Q}: {e}")));
+    let root_name = |meta: &str| {
+        cells
+            .iter()
+            .filter(|((m, k, v), _)| m == meta && k == "rootName" && v != "s:nil")
+            .map(|((_, _, v), (n, _))| (v.clone(), *n))
+            .collect::<BTreeMap<_, _>>()
+    };
+    let edge: BTreeMap<String, f64> = [("s:edge.root".to_string(), 1.0)].into_iter().collect();
+    assert_eq!(root_name("selection"), edge, "the child's rootName");
+    assert_eq!(root_name("baseline"), edge, "the root's rootName");
 }

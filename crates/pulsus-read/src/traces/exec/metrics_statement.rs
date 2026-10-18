@@ -5,9 +5,9 @@
 use std::collections::BTreeMap;
 
 use futures::StreamExt;
-use pulsus_clickhouse::ChError;
+use pulsus_clickhouse::{ChError, ChRow};
 
-use super::{TraceEngine, hex16, map_trace_metrics_error, statement_settings};
+use super::{TraceEngine, frame_compare_rows, hex16, map_trace_metrics_error, statement_settings};
 use crate::logql::error::{ReadError, TooBroadReason};
 use crate::traces::log2_histogram;
 use crate::traces::metrics_plan::{PlanKind, RangeAxis, TraceMetricsPlan};
@@ -15,7 +15,8 @@ use crate::traces::metrics_result::{
     MetricExemplar, MetricLabel, MetricLabelValue, TraceMetricSeries, TraceMetricsResult,
 };
 use crate::traces::spans::metrics::{
-    MetricStatementRow, MetricsStatement, RoutedMetricsPlan, SERIES_CAP_MESSAGE, TargetUnit,
+    CompareStatementRow, MetricStatementRow, MetricsStatement, RoutedMetricsPlan,
+    SERIES_CAP_MESSAGE, TargetUnit,
 };
 use crate::traces::values::go_duration_string;
 
@@ -30,8 +31,18 @@ impl TraceEngine {
         let Some(statement) = routed.statement() else {
             return self.metrics_range(routed.plan()).await;
         };
+        // Issue #597: a comparison's rows are its own.
+        if statement.is_compare() {
+            let rows = self
+                .metric_statement_rows::<CompareStatementRow>(
+                    statement.range_sql(),
+                    statement.demands(),
+                )
+                .await?;
+            return frame_compare_rows(routed.plan(), rows, Some(routed.plan().range_axis()));
+        }
         let rows = self
-            .metric_statement_rows(statement.range_sql(), statement.demands())
+            .metric_statement_rows::<MetricStatementRow>(statement.range_sql(), statement.demands())
             .await?;
         frame(
             routed.plan(),
@@ -51,24 +62,35 @@ impl TraceEngine {
         let Some(statement) = routed.statement() else {
             return self.metrics_instant(routed.plan()).await;
         };
+        if statement.is_compare() {
+            let rows = self
+                .metric_statement_rows::<CompareStatementRow>(
+                    statement.instant_sql(),
+                    statement.demands(),
+                )
+                .await?;
+            return frame_compare_rows(routed.plan(), rows, None);
+        }
         let rows = self
-            .metric_statement_rows(statement.instant_sql(), statement.demands())
+            .metric_statement_rows::<MetricStatementRow>(
+                statement.instant_sql(),
+                statement.demands(),
+            )
             .await?;
         frame(routed.plan(), statement, rows, None)
     }
 
-    /// Issues `sql` under [`statement_settings`].
-    async fn metric_statement_rows(
+    /// Issues `sql` under [`statement_settings`]: a metrics statement's
+    /// rows, or a comparison's (issue #597), under the same error mapping.
+    async fn metric_statement_rows<R: ChRow>(
         &self,
         sql: &str,
         demands: &[String],
-    ) -> Result<Vec<MetricStatementRow>, ReadError> {
+    ) -> Result<Vec<R>, ReadError> {
         let settings = statement_settings(&self.config);
         let mut stream = self
             .dispatch
-            .query_stream::<MetricStatementRow, _>(sql, &settings, |e| {
-                self.map_statement_error(e, demands)
-            })
+            .query_stream::<R, _>(sql, &settings, |e| self.map_statement_error(e, demands))
             .await?;
         let mut rows = Vec::new();
         while let Some(row) = stream.next().await {
@@ -179,16 +201,7 @@ fn label_of(
     let mut labels = Vec::with_capacity(names.len() + 1);
     for ((text, ty), name) in row.g.iter().zip(names) {
         let value = match ty.as_str() {
-            "s" => MetricLabelValue::Str(text.clone()),
-            "i" => MetricLabelValue::Int(
-                text.parse()
-                    .map_err(|e| decode(format!("an integer key value {text:?}: {e}")))?,
-            ),
-            "d" => MetricLabelValue::Double(
-                text.parse()
-                    .map_err(|e| decode(format!("a double key value {text:?}: {e}")))?,
-            ),
-            "b" => MetricLabelValue::Bool(text == "true"),
+            "s" | "i" | "d" | "b" => typed_value(text, ty)?,
             "u" => MetricLabelValue::Str(go_duration_string(
                 text.parse()
                     .map_err(|e| decode(format!("a duration key value {text:?}: {e}")))?,
@@ -229,6 +242,26 @@ fn label_of(
     }
     labels.extend(own);
     Ok(labels)
+}
+
+/// A key value `(text, type)` as its label: `s` a string, `i` an integer,
+/// `d` a double, `b` a boolean, the conversion a `by()` key and a
+/// `compare()` value share (issue #597's D3); any other type is an error.
+pub(super) fn typed_value(text: &str, ty: &str) -> Result<MetricLabelValue, ReadError> {
+    let decode = |m: String| ReadError::Clickhouse(ChError::Decode(m));
+    Ok(match ty {
+        "s" => MetricLabelValue::Str(text.to_string()),
+        "i" => MetricLabelValue::Int(
+            text.parse()
+                .map_err(|e| decode(format!("an integer key value {text:?}: {e}")))?,
+        ),
+        "d" => MetricLabelValue::Double(
+            text.parse()
+                .map_err(|e| decode(format!("a double key value {text:?}: {e}")))?,
+        ),
+        "b" => MetricLabelValue::Bool(text == "true"),
+        other => return Err(decode(format!("a key value of type {other:?}"))),
+    })
 }
 
 #[cfg(test)]
@@ -299,5 +332,25 @@ mod tests {
             bucket("{} | histogram_over_time(duration)", 1_073_741_824),
             1.073741824
         );
+    }
+
+    /// U5 (issue #597): a compare value is labelled in the arm of its
+    /// stored type; an unknown type is an error.
+    #[test]
+    fn a_compare_value_is_labelled_by_its_stored_type() {
+        assert_eq!(typed_value("1", "i").ok(), Some(MetricLabelValue::Int(1)));
+        assert_eq!(
+            typed_value("1", "d").ok(),
+            Some(MetricLabelValue::Double(1.0))
+        );
+        assert_eq!(
+            typed_value("true", "b").ok(),
+            Some(MetricLabelValue::Bool(true))
+        );
+        assert_eq!(
+            typed_value("x", "s").ok(),
+            Some(MetricLabelValue::Str("x".to_string()))
+        );
+        assert!(typed_value("1", "q").is_err(), "an unknown type");
     }
 }

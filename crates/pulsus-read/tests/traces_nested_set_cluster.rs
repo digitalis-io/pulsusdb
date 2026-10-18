@@ -841,3 +841,106 @@ async fn one_cut_holds_for_every_shard() {
     )
     .await;
 }
+
+/// C1 (issue #597): `compare()`'s `topN` is global. Shard a holds `v = "p"`
+/// ×5 and `"q"` ×4, shard b `"q"` ×3 and `"r"` ×6, one root span a trace;
+/// with `topN` 1 the baseline keeps `q`, 7, which neither shard ranks first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_compare_top_n_is_ranked_over_every_shard() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db(&format!("pulsus_read_it_t597_topn_{}", now_ns()));
+    let bootstrap = ChClient::new(shard1_config("default"))
+        .await
+        .expect("connect shard1");
+    exec(
+        &bootstrap,
+        &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
+    )
+    .await;
+    run_init(&bootstrap, &cluster_ctx(&db))
+        .await
+        .expect("run_init");
+    let shard1 = ChClient::new(shard1_config(&db))
+        .await
+        .expect("connect shard1");
+    let shard2 = ChClient::new(shard2_config(&db))
+        .await
+        .expect("connect shard2");
+    let now = now_ns();
+    let at = now - 120 * S;
+    for (client, shard, values) in [
+        (&shard1, "a", [("p", 5u64), ("q", 4)]),
+        (&shard2, "b", [("q", 3), ("r", 6)]),
+    ] {
+        for (v, n) in values {
+            exec(
+                client,
+                &format!(
+                    "INSERT INTO spans (trace_id, span_id, start_ns, duration_ns, service, name, \
+                     kind, attrs, end_ns, service_type) \
+                     SELECT sipHash128(number, '{shard}{v}'), \
+                     reinterpretAsFixedString(cityHash64(number, '{shard}{v}')), \
+                     {at} + toInt64(number), 1000, 'svc-{shard}', 'op', 2, \
+                     CAST('{{\"v\":\"{v}\"}}', 'JSON'), toUInt64({at} + toInt64(number) + 1000), \
+                     'string' FROM numbers({n})"
+                ),
+            )
+            .await;
+        }
+    }
+    let engine = pulsus_read::TraceEngine::new(
+        ChClient::new(shard1_config(&db))
+            .await
+            .expect("connect the engine"),
+        config(),
+    );
+    let read = config();
+    let tables = StatementTables {
+        spans: &read.spans_v2_table,
+        resources: &read.resources_table,
+        traces: &read.traces_table,
+        indexed: &[],
+    };
+    let q = "{} | compare({ status = error }, 1)";
+    let routed = pulsus_read::plan_trace_metrics_routed(
+        &pulsus_traceql::parse(q).expect("parse"),
+        &pulsus_read::MetricsParams {
+            start_ns: (now / S - 600) * S,
+            end_ns: (now / S) * S,
+            step_ms: 60_000,
+            exemplars: None,
+        },
+        &engine.metrics_ctx(),
+        &tables,
+    )
+    .expect("planned");
+    assert!(routed.statement().is_some(), "{q}: no statement");
+    let out = engine
+        .metrics_range_routed(&routed)
+        .await
+        .expect("the comparison answers");
+    let mut baseline = std::collections::BTreeMap::new();
+    for s in &out.series {
+        let meta = s.labels.iter().find(|l| l.key == "__meta_type");
+        let key = s.labels.iter().find(|l| l.key == "span.v");
+        if let (Some(meta), Some(key)) = (meta, key)
+            && meta.value == pulsus_read::MetricLabelValue::Str("baseline".to_string())
+            && key.value != pulsus_read::MetricLabelValue::Str("nil".to_string())
+        {
+            let n: f64 = s.samples.iter().map(|(_, v)| *v).sum();
+            baseline.insert(format!("{:?}", key.value), n);
+        }
+    }
+    exec(
+        &bootstrap,
+        &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
+    )
+    .await;
+    assert_eq!(
+        baseline,
+        [("Str(\"q\")".to_string(), 7.0)]
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>(),
+        "baseline span.v"
+    );
+}

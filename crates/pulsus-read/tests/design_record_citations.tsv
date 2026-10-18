@@ -62,7 +62,7 @@ docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:113	crates/pulsus-r
 docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:1618	crates/pulsus-read/src/traces/exec.rs	1618		line	service_graph_sql	let sql = graph_sql::service_graph_sql(window, &self.config.edges_table, cap);
 docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:2104	crates/pulsus-read/src/traces/exec.rs	2104		line	TRACE_SEARCH_MAX_BLOCK_ROWS	.set("max_block_size", TRACE_SEARCH_MAX_BLOCK_ROWS)
 docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:300	crates/pulsus-read/src/traces/exec.rs	300		line	RootSummary	pub root: RootSummary,
-docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:3935	crates/pulsus-read/src/traces/exec.rs	3935		line	search_settings_pin_the_layer_1_budget_contract	fn search_settings_pin_the_layer_1_budget_contract() {
+docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:4069	crates/pulsus-read/src/traces/exec.rs	4069		line	search_settings_pin_the_layer_1_budget_contract	fn search_settings_pin_the_layer_1_budget_contract() {
 docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:92	crates/pulsus-read/src/traces/exec.rs	92		line	HYDRATION_BYTE_BUDGET	pub const HYDRATION_BYTE_BUDGET: usize = 256 * 1024 * 1024;
 docs/query-lowering.md	crates/pulsus-read/src/traces/filter.rs:907	crates/pulsus-read/src/traces/filter.rs	907		prose	anchored_regex_sql	match
 docs/query-lowering.md	crates/pulsus-read/src/traces/graph_sql.rs:92	crates/pulsus-read/src/traces/graph_sql.rs	92		prose	service_graph_sql	service_graph_sql
@@ -281,7 +281,7 @@ docs/query-to-sql.md	traces/exec.rs:1344	crates/pulsus-read/src/traces/exec.rs	1
 docs/query-to-sql.md	traces/exec.rs:157	crates/pulsus-read/src/traces/exec.rs	157		line	TRACE_METRICS_MAX_SET_ROWS	pub const TRACE_METRICS_MAX_SET_ROWS: u64 = 1_000_000;
 docs/query-to-sql.md	traces/exec.rs:2066	crates/pulsus-read/src/traces/exec.rs	2066		line	dispatch	.dispatch
 docs/query-to-sql.md	traces/exec.rs:2093	crates/pulsus-read/src/traces/exec.rs	2093		line	search_settings	fn search_settings(config: &TraceReadConfig) -> QuerySettings {
-docs/query-to-sql.md	traces/exec.rs:2886	crates/pulsus-read/src/traces/exec.rs	2886		prose	apply_series_reduce	reduce
+docs/query-to-sql.md	traces/exec.rs:3020	crates/pulsus-read/src/traces/exec.rs	3020		prose	apply_series_reduce	reduce
 docs/query-to-sql.md	traces/exec.rs:92	crates/pulsus-read/src/traces/exec.rs	92		line	HYDRATION_BYTE_BUDGET	pub const HYDRATION_BYTE_BUDGET: usize = 256 * 1024 * 1024;
 docs/query-to-sql.md	traces/metrics_sql.rs:89	crates/pulsus-read/src/traces/metrics_sql.rs	89		line	nanosecond	/// the window and the last nanosecond it contains is `end_ns - 1`.
 docs/query-to-sql.md	traces_api/error.rs:270-274	crates/pulsus-server/src/traces_api/error.rs	270	274	line	plain_text_error	fn plain_text_error(status: StatusCode, message: String) -> Response { ( status, [(header::CONTENT_TYPE, "text/plain; ch

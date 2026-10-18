@@ -76,9 +76,9 @@ match_all	search	new	9
 metrics_avg_over_time	metrics	new	14
 metrics_bottomk	metrics	new	14
 metrics_by_service	metrics	new	14
-metrics_compare	metrics	old	15
-metrics_compare_topn	metrics	old	15
-metrics_compare_window	metrics	old	15
+metrics_compare	metrics	new	15
+metrics_compare_topn	metrics	new	15
+metrics_compare_window	metrics	new	15
 metrics_count_over_time	metrics	new	14
 metrics_histogram_over_time	metrics	new	14
 metrics_max_over_time	metrics	new	14

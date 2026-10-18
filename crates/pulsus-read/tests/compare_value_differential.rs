@@ -100,11 +100,19 @@ use std::collections::BTreeMap;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+use opentelemetry_proto::tonic::common::v1::{AnyValue, InstrumentationScope, KeyValue, any_value};
+use opentelemetry_proto::tonic::resource::v1::Resource;
+use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, Status};
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings};
-use pulsus_read::traces::metrics_plan::{MetricsParams, plan_trace_metrics};
-use pulsus_read::{MetricLabelValue, TraceEngine, TraceMetricsResult, TraceReadConfig};
+use pulsus_read::traces::metrics_plan::MetricsParams;
+use pulsus_read::{
+    MetricLabelValue, StatementTables, TraceEngine, TraceMetricsResult, TraceReadConfig,
+    plan_trace_metrics_routed,
+};
 use pulsus_schema::RenderCtx;
 use pulsus_schema_testkit::run_init;
+use pulsus_write::{TraceLandingRow, parse_trace_landing};
 
 /// The keys the value differential is scoped to: the three #189 keys plus
 /// the two #192 instrumentation-scope intrinsics (both data-driven from the
@@ -292,7 +300,8 @@ type Counts = BTreeMap<(String, String, String), i64>;
 async fn pulsus_counts(engine: &TraceEngine, window: (i64, i64)) -> Counts {
     let window_s = (window.1 - window.0) / 1_000_000_000;
     let query = pulsus_traceql::parse(r#"{} | compare({ status = error })"#).expect("parse");
-    let plan = plan_trace_metrics(
+    // Issue #597: the route's statement, on the tables the writer fills.
+    let routed = plan_trace_metrics_routed(
         &query,
         &MetricsParams {
             start_ns: window.0,
@@ -302,9 +311,22 @@ async fn pulsus_counts(engine: &TraceEngine, window: (i64, i64)) -> Counts {
             exemplars: None,
         },
         &engine.metrics_ctx(),
+        &StatementTables {
+            spans: "spans",
+            resources: "resources",
+            traces: "traces",
+            indexed: &[],
+        },
     )
     .expect("plan compare");
-    let res: TraceMetricsResult = engine.metrics_range(&plan).await.expect("compare executes");
+    assert!(
+        routed.statement().is_some(),
+        "compare() takes the statement"
+    );
+    let res: TraceMetricsResult = engine
+        .metrics_range_routed(&routed)
+        .await
+        .expect("compare executes");
 
     let mut out = Counts::new();
     for s in &res.series {
@@ -340,44 +362,132 @@ fn str_label(labels: &[pulsus_read::MetricLabel], key: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// PulsusDB side — ingest via ClickHouse
+// PulsusDB side — ingest through the product writer (issue #597)
 // ---------------------------------------------------------------------------
 
-async fn pulsus_insert(client: &ChClient, db: &str, nonce: &[u8; 16], spans: &[SpanDef]) {
-    let mut rows = Vec::new();
+/// The corpus as one request per service, each span under its own scope,
+/// shaped as [`otlp_push`] sends it to the reference.
+fn requests(nonce: &[u8; 16], spans: &[SpanDef]) -> Vec<ExportTraceServiceRequest> {
+    let mut services: Vec<&str> = Vec::new();
     for s in spans {
-        let pid = if s.parent == 0 {
-            "0000000000000000".to_string()
-        } else {
-            hex(&sid_bytes(s.parent))
-        };
-        rows.push(format!(
-            "(toFixedString(unhex('{tid}'),16), toFixedString(unhex('{sid}'),8), \
-             toFixedString(unhex('{pid}'),8), '{name}', '{service}', '{msg}', \
-             '{scope_name}', '{scope_version}', {ts}, 1000, \
-             {status}, 1, 1, 'x')",
-            tid = hex(&tid_bytes(nonce, s.trace)),
-            sid = hex(&sid_bytes(s.id)),
-            name = s.name,
-            service = s.service,
-            msg = s.msg,
-            scope_name = s.scope_name,
-            scope_version = s.scope_version,
-            ts = s.ts_ns,
-            status = s.status,
-        ));
+        if !services.contains(&s.service) {
+            services.push(s.service);
+        }
     }
-    exec(
-        client,
-        &format!(
-            "INSERT INTO {db}.trace_spans \
-             (trace_id, span_id, parent_id, name, service, status_message, \
-              scope_name, scope_version, timestamp_ns, \
-              duration_ns, status_code, kind, payload_type, payload) VALUES {}",
-            rows.join(", ")
-        ),
-    )
-    .await;
+    services
+        .iter()
+        .map(|service| ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![KeyValue {
+                        key: "service.name".to_string(),
+                        value: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue(service.to_string())),
+                        }),
+                        ..KeyValue::default()
+                    }],
+                    dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
+                }),
+                scope_spans: spans
+                    .iter()
+                    .filter(|s| s.service == *service)
+                    .map(|s| ScopeSpans {
+                        scope: Some(InstrumentationScope {
+                            name: s.scope_name.to_string(),
+                            version: s.scope_version.to_string(),
+                            ..InstrumentationScope::default()
+                        }),
+                        spans: vec![Span {
+                            trace_id: tid_bytes(nonce, s.trace).to_vec(),
+                            span_id: sid_bytes(s.id).to_vec(),
+                            parent_span_id: if s.parent == 0 {
+                                Vec::new()
+                            } else {
+                                sid_bytes(s.parent).to_vec()
+                            },
+                            name: s.name.to_string(),
+                            kind: 1,
+                            start_time_unix_nano: s.ts_ns as u64,
+                            end_time_unix_nano: (s.ts_ns + 1_000_000_000) as u64,
+                            status: Some(Status {
+                                message: s.msg.to_string(),
+                                code: i32::from(s.status),
+                            }),
+                            ..Span::default()
+                        }],
+                        schema_url: String::new(),
+                    })
+                    .collect(),
+                schema_url: String::new(),
+            }],
+        })
+        .collect()
+}
+
+/// Lands each request through the product writer: the old tables through
+/// today's trace writer, the new ones through `trace_landing`, one insert a
+/// request.
+async fn pulsus_land(client: &ChClient, db: &str, reqs: &[ExportTraceServiceRequest]) {
+    use pulsus_write::writer::{ChBlockInserter, TraceWriter, TraceWriterTables};
+    use pulsus_write::{ParsedTraceLanding, PushHeaders, TraceSink};
+    use std::sync::Arc;
+    let writer_client = Arc::new(
+        ChClient::new(ch_config(db))
+            .await
+            .expect("connect the writer"),
+    );
+    let mut cfg = pulsus_config::WriterConfig::default();
+    cfg.batch_bytes.0 = 1;
+    let writer = TraceWriter::with_inserters_with_tables(
+        Arc::new(ChBlockInserter::new(writer_client.clone())),
+        Arc::new(ChBlockInserter::new(writer_client.clone())),
+        Arc::new(ChBlockInserter::new(writer_client.clone())),
+        &cfg,
+        TraceWriterTables::traces_default(),
+    );
+    for (i, req) in reqs.iter().enumerate() {
+        let parsed = pulsus_write::parse_traces(req, now_ns()).expect("the old path parses");
+        let wait = writer
+            .admit_flush(
+                parsed,
+                ParsedTraceLanding::default(),
+                PushHeaders::default(),
+            )
+            .expect("the queue has room");
+        tokio::time::timeout(Duration::from_secs(30), wait)
+            .await
+            .expect("the old path's flush settles")
+            .expect("the old path commits");
+        let landing = parse_trace_landing(req, now_ns()).expect("the landing decode");
+        let received_ms = now_ns() / 1_000_000;
+        let mut rows: Vec<TraceLandingRow> = Vec::new();
+        rows.extend(
+            landing
+                .spans
+                .iter()
+                .cloned()
+                .map(|s| TraceLandingRow::span(received_ms, s)),
+        );
+        rows.extend(
+            landing
+                .resources
+                .iter()
+                .cloned()
+                .map(|r| TraceLandingRow::resource(received_ms, r)),
+        );
+        client
+            .insert_block_with(
+                "trace_landing",
+                &rows,
+                &QuerySettings::trace_landing_insert(
+                    &format!("cmpdiff-{i}-{}", now_ns()),
+                    1_048_576,
+                ),
+            )
+            .await
+            .expect("the landing insert");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -667,7 +777,7 @@ async fn compare_value_differential() {
     let db = pulsus_testkit::test_db(&format!("pulsus_cmpdiff_it_{}", hex(&nonce)));
     init_db(&bootstrap, &db).await;
     let client = ChClient::new(ch_config(&db)).await.expect("connect db");
-    pulsus_insert(&client, &db, &nonce, &spans).await;
+    pulsus_land(&client, &db, &requests(&nonce, &spans)).await;
     let engine = TraceEngine::new(
         ChClient::new(ch_config(&db)).await.expect("connect engine"),
         engine_config(),
