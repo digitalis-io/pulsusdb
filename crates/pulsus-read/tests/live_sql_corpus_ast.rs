@@ -249,8 +249,12 @@ const CONTROL: &str = "with_binding_control.txt";
 /// **Issue #602 part 2c-2b-1 moves them 171 -> 96 and 458 -> 214: the 75
 /// `traces_search` goldens and their 244 statements deleted with the
 /// previous search engine's tests.**
-const SQL_FILES: usize = 96;
-const SQL_STATEMENTS: usize = 214;
+///
+/// **Issue #599 part A moves them 96 -> 98 and 214 -> 216: the two
+/// `traces_spans_graph` goldens, one statement each.** Their `WITH` items
+/// (`ms`, `first`, `last`, `A`, `B`, `h1`, `t0`) are scalars and aliases.
+const SQL_FILES: usize = 98;
+const SQL_STATEMENTS: usize = 216;
 const PROMQL_ENTRIES: usize = 30;
 const PROMQL_STATEMENTS: usize = 55;
 const CONTROL_STATEMENTS: usize = 1;
