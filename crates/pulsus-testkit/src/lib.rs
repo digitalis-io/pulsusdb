@@ -1243,6 +1243,13 @@ pub fn clickhouse_query(sql: &str) -> String {
     payload.to_string()
 }
 
+/// Asks the reference again while it answers 499, up to five calls in all,
+/// and returns the last answer.
+pub fn reask_on_cancel(mut ask: impl FnMut() -> (u32, String)) -> (u32, String) {
+    let _ = &mut ask;
+    (0, String::new())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1768,5 +1775,48 @@ mod tests {
             test_db("pulsus_x_it"),
             compose_db_name(ambient.as_deref(), "pulsus_x_it")
         );
+    }
+
+    /// A closure answering `answers` in order, the last one forever after,
+    /// and counting its calls.
+    fn scripted(
+        answers: &[(u32, &str)],
+    ) -> (
+        impl FnMut() -> (u32, String) + use<>,
+        std::rc::Rc<std::cell::Cell<usize>>,
+    ) {
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let seen = calls.clone();
+        let answers: Vec<(u32, String)> =
+            answers.iter().map(|(c, b)| (*c, b.to_string())).collect();
+        let ask = move || {
+            let i = seen.get();
+            seen.set(i + 1);
+            answers[i.min(answers.len() - 1)].clone()
+        };
+        (ask, calls)
+    }
+
+    #[test]
+    fn a_cancelled_answer_is_asked_again() {
+        let (ask, calls) = scripted(&[(499, "c"), (499, "c"), (400, "unexpected char :")]);
+        assert_eq!(reask_on_cancel(ask), (400, "unexpected char :".to_string()));
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn the_re_ask_is_bounded() {
+        let (ask, calls) = scripted(&[(499, "c")]);
+        assert_eq!(reask_on_cancel(ask), (499, "c".to_string()));
+        assert_eq!(calls.get(), 5);
+    }
+
+    #[test]
+    fn a_settled_answer_is_not_asked_again() {
+        for (code, body) in [(200, ""), (400, "x")] {
+            let (ask, calls) = scripted(&[(code, body), (499, "c")]);
+            assert_eq!(reask_on_cancel(ask), (code, body.to_string()));
+            assert_eq!(calls.get(), 1, "status {code}");
+        }
     }
 }
