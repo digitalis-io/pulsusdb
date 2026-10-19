@@ -4530,4 +4530,39 @@ mod tests {
             "the abort fires at the tipping exemplar: actual={actual}"
         );
     }
+
+    /// **P9: an exemplar's label names and value are kept as sent**: a
+    /// dotted name is not rewritten, and a negative value and a negative
+    /// zero keep their bits.
+    #[test]
+    fn an_exemplar_keeps_its_label_names_and_value_as_sent() {
+        let req = exemplar_request(
+            &[("__name__", "m")],
+            true,
+            vec![
+                exemplar(&[("http.method", "GET")], -2.5, 1_700_000_000_000),
+                exemplar(&[], -0.0, 1_700_000_000_001),
+            ],
+        );
+        let out = parse(&req, 0).expect("within the expansion budget");
+        assert_eq!(
+            out.exemplars
+                .iter()
+                .map(|e| (
+                    e.labels
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect::<Vec<_>>(),
+                    e.value.to_bits()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    vec![("http.method".to_string(), "GET".to_string())],
+                    (-2.5f64).to_bits()
+                ),
+                (vec![], (-0.0f64).to_bits()),
+            ]
+        );
+    }
 }

@@ -3408,3 +3408,66 @@ async fn an_exemplar_only_series_is_answered() {
     drop_db(&db).await;
     assert_eq!(last, want, "/api/v1/query_exemplars' body");
 }
+
+/// S3 (issue #501 part 3): a dotted exemplar label name, a negative value
+/// and a negative zero come back from `/api/v1/query_exemplars` as sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_write_exemplar_names_and_values_are_answered_as_sent() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse to run this test");
+        return;
+    }
+    let db = pulsus_testkit::test_db("pulsus_prom_501_rw_s3");
+    let port: u16 = 31_533;
+    let guard = spawn_prom_server(port, &db, &[]);
+    let t = (now_ms() / 1_000) * 1_000 - 60_000;
+    // Built by hand: a proto3 encoder, ours and the reference's, leaves a
+    // zero `double` off the wire, negative zero included, so the negative
+    // zero is written as its own field.
+    let body = {
+        use prost::Message;
+        use pulsus_write::protocols::remote_write::Exemplar;
+        let field = |tag: u32, payload: &[u8]| {
+            let mut out = Vec::new();
+            prost::encoding::encode_key(tag, prost::encoding::WireType::LengthDelimited, &mut out);
+            prost::encoding::encode_varint(payload.len() as u64, &mut out);
+            out.extend_from_slice(payload);
+            out
+        };
+        let mut ts = series_501(
+            &[("__name__", "v"), ("job", "d")],
+            &[(1.0, t)],
+            &[(&[("http.method", "GET")], -2.5, t - 2_000)],
+        )
+        .encode_to_vec();
+        let mut negative_zero = vec![0x11];
+        negative_zero.extend_from_slice(&(-0.0f64).to_le_bytes());
+        negative_zero.push(0x18);
+        prost::encoding::encode_varint((t - 1_000) as u64, &mut negative_zero);
+        let decoded = Exemplar::decode(negative_zero.as_slice()).expect("an exemplar");
+        assert_eq!(decoded.value.to_bits(), (-0.0f64).to_bits());
+        ts.extend_from_slice(&field(3, &negative_zero));
+        snap::raw::Encoder::new()
+            .compress_vec(&field(1, &ts))
+            .expect("snappy-compress the write")
+    };
+    let status = post_remote_write(port, &body);
+    assert!(
+        (200..300).contains(&status),
+        "the remote write answered {status}"
+    );
+    let path = format!(
+        "/api/v1/query_exemplars?query=v&start={}&end={}",
+        (t - 60_000) / 1_000,
+        (t + 60_000) / 1_000
+    );
+    let want = format!(
+        r#"{{"status":"success","data":[{{"seriesLabels":{{"__name__":"v","job":"d"}},"exemplars":[{{"labels":{{"http.method":"GET"}},"value":"-2.5","timestamp":{}}},{{"labels":{{}},"value":"-0","timestamp":{}}}]}}]}}"#,
+        (t - 2_000) / 1_000,
+        (t - 1_000) / 1_000
+    );
+    let last = poll_until_501(port, &path, &want);
+    drop(guard);
+    drop_db(&db).await;
+    assert_eq!(last, want, "/api/v1/query_exemplars' body");
+}
