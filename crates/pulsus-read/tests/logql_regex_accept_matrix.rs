@@ -3564,22 +3564,29 @@ fn now_s() -> u64 {
 /// One `query_range` probe. **The window ends at `now`, and that is
 /// load-bearing** — see the module docs' trap 3.
 fn reference_verdict(base: &str, query: &str) -> (Verdict, String) {
-    let now = now_s();
-    let probe = curl_probe(
-        REFERENCE_MAX_SECONDS,
-        &[
-            "-G",
-            &format!("{base}/loki/api/v1/query_range"),
-            "--data-urlencode",
-            &format!("query={query}"),
-            "--data-urlencode",
-            &format!("start={}", (now - 300) * 1_000_000_000),
-            "--data-urlencode",
-            &format!("end={}", now * 1_000_000_000),
-            "--data-urlencode",
-            "step=60s",
-        ],
-    );
+    let mut last: Option<Probe> = None;
+    pulsus_testkit::reask_on_cancel(|| {
+        let now = now_s();
+        let probe = curl_probe(
+            REFERENCE_MAX_SECONDS,
+            &[
+                "-G",
+                &format!("{base}/loki/api/v1/query_range"),
+                "--data-urlencode",
+                &format!("query={query}"),
+                "--data-urlencode",
+                &format!("start={}", (now - 300) * 1_000_000_000),
+                "--data-urlencode",
+                &format!("end={}", now * 1_000_000_000),
+                "--data-urlencode",
+                "step=60s",
+            ],
+        );
+        let answer = (probe.http_code.parse().unwrap_or(0), probe.body.clone());
+        last = Some(probe);
+        answer
+    });
+    let probe = last.expect("reask_on_cancel calls the probe at least once");
     let body = probe.body.clone();
     match probe.http_code.as_str() {
         "200" => (Verdict::Accept, body),
