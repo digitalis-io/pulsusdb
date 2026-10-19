@@ -2030,6 +2030,38 @@ mod tests {
             + rows.iter().map(exemplar_row_charge).sum::<usize>()
             + series.iter().map(series_row_charge).sum::<usize>();
         let n = rows.len();
+        // Each row alone, beside the smallest series, and each series alone
+        // with the smallest exemplar: in one answer, the wide rows' slack
+        // would cover a narrow row's shortfall.
+        let small_series = |fp: Fingerprint| ExemplarSeriesRow {
+            fingerprint: fp,
+            series_name: "m".to_string(),
+            series_labels: "{}".to_string(),
+        };
+        let small_row = |fp: Fingerprint| ExemplarRow {
+            fingerprint: fp,
+            unix_milli: 0,
+            value: 0.0,
+            trace_id: [0; 16],
+            span_id: [0; 8],
+            labels: "{}".to_string(),
+        };
+        let pairs_alone = rows
+            .iter()
+            .map(|r| (r.clone(), small_series(r.fingerprint)))
+            .chain(series.iter().map(|s| (small_row(s.fingerprint), s.clone())))
+            .collect::<Vec<_>>();
+        for (row, series_row) in pairs_alone {
+            let charged =
+                ENVELOPE_CHARGE + exemplar_row_charge(&row) + series_row_charge(&series_row);
+            let answer = assemble(vec![keep_exemplar(row)], vec![keep_series(series_row)]);
+            let body = body_string(query_exemplars_response(Some(answer))).await;
+            assert!(
+                body.len() <= charged,
+                "alone, the body is {} bytes against a charge of {charged}: {body}",
+                body.len()
+            );
+        }
         let answer = assemble(
             rows.into_iter().map(keep_exemplar).collect(),
             series.into_iter().map(keep_series).collect(),
