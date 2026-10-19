@@ -38,6 +38,9 @@ use pulsus_clickhouse::{
 /// ```text
 /// git grep -ohE '\.set\("[a-z_0-9]+"' | sed -E 's/.*\.set\("([a-z_0-9]+)".*/\1/' | sort -u
 /// ```
+///
+/// plus `ANSWER_PIN_NAMES`, whose overflow modes `QuerySettings::answer_pins`
+/// sets in a loop the textual scan cannot see.
 const INJECTED_SETTINGS: &[&str] = &[
     "async_insert",
     "deduplicate_blocks_in_dependent_materialized_views",

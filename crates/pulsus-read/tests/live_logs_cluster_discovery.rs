@@ -978,6 +978,11 @@ async fn a_shard_error_is_not_skipped_under_an_exception_skipping_profile() {
 
 /// **LO.** A logs read is not cut short under a profile that stops a
 /// shard's read at a row limit and answers with what it read.
+///
+/// 200,000 lines per shard: at 50,000 a shard's lines are one part read as
+/// one block, so `break` has nothing left to stop and P6 sees the whole
+/// answer (measured on 26.8.21.10: 100,000 of 100,000; at 200,000, 147,456
+/// of 400,000).
 #[tokio::test]
 async fn a_logs_read_is_not_cut_short_under_a_break_profile() {
     skip_unless_live!();
@@ -997,7 +1002,7 @@ async fn a_logs_read_is_not_cut_short_under_a_break_profile() {
                 "INSERT INTO log_landing {LANDING_COLUMNS} \
                  SELECT '', {}, 0, 'split', toUInt128('{SPLIT_FP}'), \
                  {} + number * 1000, 0, concat('line-', toString(number)), '', toDate({}), \
-                 '', 0, '', 0, '' FROM numbers(50000)",
+                 '', 0, '', 0, '' FROM numbers(200000)",
                 f.ts / 1_000_000,
                 f.ts - 60_000_000_000,
                 f.month
@@ -1009,7 +1014,7 @@ async fn a_logs_read_is_not_cut_short_under_a_break_profile() {
     for client in [&f.shard1, &f.shard2] {
         assert_eq!(
             count_on(client, "SELECT toUInt64(count()) AS n FROM log_samples").await,
-            50_000,
+            200_000,
             "each shard's own lines"
         );
     }
@@ -1030,7 +1035,7 @@ async fn a_logs_read_is_not_cut_short_under_a_break_profile() {
     )
     .await;
     assert!(
-        cut < 100_000,
+        cut < 400_000,
         "the profile must cut the read short on this server, got {cut}"
     );
 
@@ -1047,7 +1052,7 @@ async fn a_logs_read_is_not_cut_short_under_a_break_profile() {
         .stats(&expr, bounds)
         .await
         .expect("the control stats read answers");
-    assert_eq!(stats.entries, 100_000, "the control reads every line");
+    assert_eq!(stats.entries, 400_000, "the control reads every line");
 
     // G8: the profile user.
     let got = f
