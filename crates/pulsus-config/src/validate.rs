@@ -191,11 +191,11 @@ pub const INGEST_DEDUP_MAX_BYTES_FLOOR: u64 = 1024 * 1024;
 /// See [`INGEST_DEDUP_MAX_BYTES_FLOOR`].
 pub const INGEST_DEDUP_MAX_BYTES_CEILING: u64 = 1024 * 1024 * 1024;
 
-/// `metrics_landing_retention_hours` — issue #603's replay window: how long
-/// the metrics landing table keeps a landed row. The floor is one hour,
-/// because a shorter window leaves nothing to rebuild a derived table from;
-/// the ceiling is one week, past which the landing table is the deployment's
-/// primary storage rather than its replay window.
+/// `metrics_landing_retention_hours` — how long the metrics landing table
+/// keeps a landed row. The range is one hour to one week, unchanged since
+/// issue #603; nothing in the product reads a landed row after its views
+/// have run, so the rows are kept only so a person can inspect them by
+/// hand.
 pub const METRICS_LANDING_RETENTION_HOURS_FLOOR: u32 = 1;
 /// See [`METRICS_LANDING_RETENTION_HOURS_FLOOR`].
 pub const METRICS_LANDING_RETENTION_HOURS_CEILING: u32 = 168;
@@ -236,11 +236,11 @@ pub const METRICS_LANDING_MAX_ROWS_FLOOR: u64 = 1_000;
 /// See [`METRICS_LANDING_MAX_ROWS_FLOOR`].
 pub const METRICS_LANDING_MAX_ROWS_CEILING: u64 = 10_000_000;
 
-/// `log_landing_retention_hours` — issue #603's logs replay window: how long
-/// the logs landing table keeps a landed row. Both ends are the metrics key's,
-/// and for the same reasons — a shorter window than an hour leaves nothing to
-/// rebuild a derived table from; past a week the landing table is the
-/// deployment's primary storage rather than its replay window.
+/// `log_landing_retention_hours` — how long the logs landing table
+/// keeps a landed row. The range is one hour to one week, unchanged since
+/// issue #603; nothing in the product reads a landed row after its views
+/// have run, so the rows are kept only so a person can inspect them by
+/// hand.
 pub const LOG_LANDING_RETENTION_HOURS_FLOOR: u32 = 1;
 /// See [`LOG_LANDING_RETENTION_HOURS_FLOOR`].
 pub const LOG_LANDING_RETENTION_HOURS_CEILING: u32 = 168;
@@ -283,11 +283,11 @@ pub const LOG_LANDING_MAX_ROWS_FLOOR: u64 = 1_000;
 /// See [`LOG_LANDING_MAX_ROWS_FLOOR`].
 pub const LOG_LANDING_MAX_ROWS_CEILING: u64 = 10_000_000;
 
-/// `trace_landing_retention_hours` — the traces replay window: how long the
-/// traces landing table keeps a landed row. Both ends are the two shipped
-/// signals' keys', and for the same reasons — a shorter window than an hour
-/// leaves nothing to rebuild a derived table from; past a week the landing
-/// table is the deployment's primary storage rather than its replay window.
+/// `trace_landing_retention_hours` — how long the traces landing table
+/// keeps a landed row. The range is one hour to one week, unchanged since
+/// issue #603; nothing in the product reads a landed row after its views
+/// have run, so the rows are kept only so a person can inspect them by
+/// hand.
 pub const TRACE_LANDING_RETENTION_HOURS_FLOOR: u32 = 1;
 /// See [`TRACE_LANDING_RETENTION_HOURS_FLOOR`].
 pub const TRACE_LANDING_RETENTION_HOURS_CEILING: u32 = 168;

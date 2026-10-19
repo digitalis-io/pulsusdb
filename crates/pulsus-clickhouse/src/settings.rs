@@ -340,10 +340,9 @@ impl QuerySettings {
             .set("min_insert_block_size_bytes_for_materialized_views", 0)
     }
 
-    /// The settings every insert of one traces landing block carries, and
-    /// every statement `pulsusdb rebuild-traces` issues (issues #584 to
-    /// #586): [`Self::landing_insert`] whole, plus **fifteen further pins
-    /// of six classes the metrics set did not need**.
+    /// The settings every insert of one traces landing block carries (issues
+    /// #584 to #586): [`Self::landing_insert`] whole, plus **nine further
+    /// pins of six classes the metrics set did not need**.
     ///
     /// The rule behind the set, stated once so it does not grow without
     /// bound: **pin what a profile could use to make an answer wrong or a
@@ -367,20 +366,7 @@ impl QuerySettings {
     /// | `insert_shard_id` | `0` | **a fourth class: where a row is placed.** `DistributedSink::writeSync`: `if (settings[Setting::insert_shard_id]) { start = insert_shard_id - 1; end = insert_shard_id; }` — the whole block goes to that one shard and the sharding expression is not consulted. A hash-pruned read then looks on the shard `cityHash64(trace_id)` selects while the rows are elsewhere: wrong answers on a cluster from a setting nobody pinned |
     /// | `json_type_escape_dots_in_keys` | `0` | **a fifth class: what path a value is stored under.** Its description says it escapes dots "during parsing", and this path sends paths in the binary form rather than parsing text — but nothing read here establishes that the binary form is unaffected, and if it were affected every stored path would differ from what the encoder renders. Pinned because the question is open, not because the effect is known |
     /// | `type_json_skip_duplicated_paths` | `0` | the block-forming class again. At `1` a repeated path in one value "will be ignored and only the first one will be inserted instead of an exception" — the same result the writer's own per-scope deduplication produces, which is why it must stay the **only** mechanism: at `1` a writer that emitted a duplicate would be silently absorbed instead of erroring |
-    /// | the seven overflow modes — `read_overflow_mode`, `read_overflow_mode_leaf`, `timeout_overflow_mode`, `group_by_overflow_mode`, `distinct_overflow_mode`, `sort_overflow_mode`, `result_overflow_mode` | `throw`, each one's own declared default | **a sixth class: whether exceeding a limit is an error or a success that need not be complete.** At `break` — and at `any` for the group-by one — the engine keeps what it had and the statement **succeeds**: `SizeLimits::softCheck` returns `false` and `executeJob` then cancels the source; `ExecutionSpeedLimits::handleOverflowMode` returns `false` for the deadline; and `Aggregator::checkLimits` returns `false` or sets `no_more_keys` instead of raising. A repair run's success would then stop meaning a complete replay, and nothing in the outcome would tell a complete replay from a strict prefix. **The cost, stated because it is not zero**: a deployment that has set both a cap and `break` gets a loud failure here where it had a quiet success. A total landing exactly on the cap is not that deployment — `softCheck` breaks at `>=` while `check` raises only at `>` — so only an overshoot turns loud |
-    ///
-    /// **Four members are inert for an `INSERT … SELECT` and are named here
-    /// so nobody prunes them and reintroduces the drift** the repair's
-    /// statements would then carry: `input_format_binary_read_json_as_string`
-    /// and `format_binary_max_object_size` govern a RowBinary input such a
-    /// statement has none of, and the two view-error settings this set takes
-    /// from [`Self::landing_insert`] govern views, which a repair
-    /// statement's target has none attached. Two are load-bearing
-    /// there — `distributed_foreground_insert` and `insert_shard_id`, because
-    /// the repair writes the routing table for `spans` and `traces` — and two
-    /// are moot by the repair's own shape rather than by a pin, since it
-    /// replays one target partition per statement and so reaches neither
-    /// partition limit.
+    /// | `timeout_overflow_mode` | `throw`, its own declared default | **a sixth class: whether running past the deadline is an error or a success that need not be complete.** Every insert this client makes carries `max_execution_time` (`ChClient::insert_settings_with`). Measured on 26.8.21.10, one source table with two views, one of them slower than a one-second `max_execution_time`: under `break` the insert **succeeded** with the slow view's target empty; under `throw` it failed with `Code: 159`. Pinned so a profile cannot turn a slow view into a silent loss |
     ///
     /// **`async_insert` is deliberately not in the set, because it is already
     /// pinned one layer down.** [`crate::ChClient::insert_settings_of`]
@@ -403,13 +389,7 @@ impl QuerySettings {
             .set("insert_shard_id", 0)
             .set("json_type_escape_dots_in_keys", 0)
             .set("type_json_skip_duplicated_paths", 0)
-            .set("read_overflow_mode", "throw")
-            .set("read_overflow_mode_leaf", "throw")
             .set("timeout_overflow_mode", "throw")
-            .set("group_by_overflow_mode", "throw")
-            .set("distinct_overflow_mode", "throw")
-            .set("sort_overflow_mode", "throw")
-            .set("result_overflow_mode", "throw")
     }
 
     /// docs/schemas.md §7 clustered-reader settings block, emitted exactly:
@@ -736,12 +716,12 @@ mod tests {
     }
 
     /// **The trace landing insert's pin set is exactly the metrics one plus
-    /// the fifteen the trace path needs**, and the two sets are compared as
-    /// **sets**, with the difference taken against those fifteen — so
+    /// the nine the trace path needs**, and the two sets are compared as
+    /// **sets**, with the difference taken against those nine — so
     /// neither an added pin nor a removed one passes.
     ///
     /// It is the only place in this change that writes a setting name as a
-    /// literal. The classes behind the fifteen, and the catalogue
+    /// literal. The classes behind the nine, and the catalogue
     /// quotation behind each value, are
     /// [`QuerySettings::trace_landing_insert`]'s own doc comment.
     ///
@@ -780,7 +760,7 @@ mod tests {
         assert_eq!(
             added, want,
             "the difference against the metrics landing insert is exactly the \
-             fifteen pins this design names"
+             nine pins this design names"
         );
 
         for (key, value) in &base_entries {

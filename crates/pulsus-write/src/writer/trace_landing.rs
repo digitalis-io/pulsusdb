@@ -241,7 +241,7 @@ impl TraceLandingPath {
     }
 
     /// The production constructor's inserter: a plain block inserter, because
-    /// the landing insert's nineteen pins travel on the block itself
+    /// the landing insert's pins travel on the block itself
     /// ([`QuerySettings::trace_landing_insert`]) and are sent with it on
     /// every attempt and every resend.
     pub(crate) fn production_inserter(

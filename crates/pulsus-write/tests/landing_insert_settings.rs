@@ -607,7 +607,7 @@ async fn the_production_inserter_sends_the_trace_landing_settings_on_the_wire() 
     // The writer half: what `TraceWriter` hands its own `BlockInserter` for
     // one push is the trace constructor at the CONFIGURED ceiling, under a
     // token it minted. A writer that handed over `landing_insert` instead —
-    // the metrics constructor — would be short the nineteen trace pins.
+    // the metrics constructor — would be short the nine trace pins.
     let root = spool_root("trace-landing-wire");
     let recorder = Arc::new(SettingsRecorder::default());
     let mut runtime = WriterRuntime::from_config(&cfg);

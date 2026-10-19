@@ -1,11 +1,11 @@
 //! `schema/schema.sql`, rendered.
 //!
 //! The binary does not create schema — `schema/schema.sh` does, and it reads
-//! the same file. What this module exists for is the two questions the
-//! serving process asks the file at run time: a materialized view's own
-//! projection, which `rebuild-traces` and the metrics rebuild replay a
-//! landing window through, and a table's declared column list, which the
-//! trace fetch derives its projection from.
+//! the same file. What this module exists for at run time is the one
+//! question the serving process asks the file: a table's declared column
+//! list, which the trace fetch derives its projection from. A materialized
+//! view's own projection is read out of it too, by the schema cases in
+//! `tests/schema_file.rs`.
 //!
 //! It also renders the whole file, which is how the test toolkit builds a
 //! schema without paying for a subprocess per call site, and how
