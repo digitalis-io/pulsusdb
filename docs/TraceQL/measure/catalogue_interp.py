@@ -585,25 +585,34 @@ class Interp:
     COLUMNS = {'name', 'status', 'kind', 'statusMessage', 'parentID',
                'instrumentation:name', 'instrumentation:version'}
 
-    def wire(self, row, f, leaf=None):
+    def last_attr(self, row, scope, key):
+        """the last element of an event or link scope holding `key`, or None"""
+        items = row['events'] if scope == 'event' else row['links']
+        held = [(t, v) for *_, at in items for k, t, v in at if k == key]
+        return held[-1] if held else None
+
+    def wire(self, row, f, leaf=None, last=False):
         """`(identity, key, type, value)` of field `f` on `row` as the response
         carries it, or None when the span holds no value: the bare key, the
-        stored type, `status` and `kind` as keywords; an event or link
-        intrinsic is the first element satisfying `leaf`."""
+        stored type, `status` and `kind` as keywords. An event or link field
+        is the LAST element satisfying `leaf` (`docs/api.md` §4.2, "Which
+        value a span *has*"); with no `leaf`, the last element holding the key
+        when `last` (the projection) and the first otherwise (a `by()` key)."""
         if f['k'] == 'attr':
             if f['key'] == 'service.name' and f['scope'] == 'resource':
                 return ('resource', 'service.name'), 'service.name', arm('string', row['service'])
             if f['scope'] in ('event', 'link') and leaf is not None:
                 items = row['events'] if f['scope'] == 'event' else row['links']
                 rv = self.value(row, leaf['r'])
-                for *_, at in items:
-                    for k, t, v in at:
-                        if k == f['key'] and self.cmp(leaf['op'], v, rv):
-                            return (f['scope'], k), k, arm(VALUE_TYPE[t], v)
-                return None
+                hits = [(k, t, v) for *_, at in items for k, t, v in at
+                        if k == f['key'] and self.cmp(leaf['op'], v, rv)]
+                if not hits: return None
+                k, t, v = hits[-1]
+                return (f['scope'], k), k, arm(VALUE_TYPE[t], v)
             scopes = UNSCOPED_ORDER if f['scope'] == 'unscoped' else (f['scope'],)
             for sc in scopes:
-                got = self.attr(row, sc, f['key'])
+                got = (self.last_attr(row, sc, f['key']) if last and sc in ('event', 'link')
+                       else self.attr(row, sc, f['key']))
                 if got is not None:
                     return (sc, f['key']), f['key'], arm(VALUE_TYPE[got[0]], got[1])
             return None
@@ -614,7 +623,8 @@ class Interp:
             rv = None if leaf is None else self.value(row, leaf['r'])
             vals = [v for v in vals if leaf is None or self.cmp(leaf['op'], v, rv)]
             if not vals: return None
-            return ('intrinsic', n), n, arm('int' if n == 'event:timeSinceStart' else 'string', vals[0])
+            v = vals[-1] if leaf is not None or last else vals[0]
+            return ('intrinsic', n), n, arm('int' if n == 'event:timeSinceStart' else 'string', v)
         if n in ('duration', 'traceDuration', 'trace:duration'):
             return ('intrinsic', n), n, arm('string', go_duration(self.intrinsic(row, n)))
         v = self.intrinsic(row, n)
@@ -644,7 +654,7 @@ class Interp:
             if f['k'] == 'intrinsic' and f['name'] in self.NOT_PROJECTED: return
             if f['k'] == 'intrinsic' and f['name'] in ('name', 'span:name'):
                 name[0] = True; return
-            w = self.wire(row, f, leaf)
+            w = self.wire(row, f, leaf, last=True)
             if w is None or w[0] in seen: return
             seen.add(w[0]); out.append([w[1], w[2]])
 

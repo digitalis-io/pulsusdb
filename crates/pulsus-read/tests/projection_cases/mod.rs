@@ -41,7 +41,7 @@ const fn keys_only(name: &'static str, q: &'static str) -> ProjectionCase {
 /// The registry — one entry per numbered row of the issue's query table.
 /// The length is asserted at compile time so the count cannot drift from
 /// the table it describes.
-pub const CASES: [ProjectionCase; 35] = [
+pub const CASES: [ProjectionCase; 40] = [
     c("01_name_eq", r#"{ name = "GET /pay" }"#),
     c("02_duration_gt", "{ duration > 1s }"),
     c("03_match_all", "{}"),
@@ -117,6 +117,19 @@ pub const CASES: [ProjectionCase; 35] = [
         "35_instrumentation_version",
         r#"{ instrumentation:version = "1.2.3" }"#,
     ),
+    // 36-40 (issue #600 part 3): `slow-op` holds two events and two links
+    // carrying one key each; which element a span projects.
+    c("36_event_regex_both", r#"{ event.exception.type =~ ".*" }"#),
+    c(
+        "37_event_regex_first_only",
+        r#"{ event.exception.type =~ "Time.*" }"#,
+    ),
+    c("38_link_regex_both", r#"{ link.relation =~ ".*" }"#),
+    c(
+        "39_select_event_of_two",
+        r#"{ name = "slow-op" } | select(event.exception.type)"#,
+    ),
+    c("40_event_name_regex", r#"{ event:name =~ ".*" }"#),
 ];
 
-const _: () = assert!(CASES.len() == 35);
+const _: () = assert!(CASES.len() == 40);
