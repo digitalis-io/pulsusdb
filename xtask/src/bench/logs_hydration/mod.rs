@@ -94,6 +94,13 @@ fn now_unix_ns() -> i64 {
     i64::try_from(elapsed.as_nanos()).unwrap_or(i64::MAX)
 }
 
+/// STUB (tests first).
+#[cfg_attr(not(test), allow(dead_code))]
+fn refuse_dist(args: &BenchArgs) -> anyhow::Result<()> {
+    let _ = args;
+    Ok(())
+}
+
 pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
     if args.rss_probe {
         return run_rss_probe_child_mode(args).await;
@@ -337,6 +344,21 @@ mod tests {
     fn resolve_breadths_full_profile_accepts_an_explicit_override() {
         let args = args_with(Profile::Full, Some("7,8,9"));
         assert_eq!(resolve_breadths(&args).unwrap(), vec![7, 8, 9]);
+    }
+
+    /// H1: the scenario is single-node; `--dist` is refused, not ignored.
+    #[test]
+    fn logs_hydration_refuses_dist() {
+        let mut args = args_with(Profile::Ci, None);
+        args.dist = true;
+        let got = refuse_dist(&args);
+        assert!(
+            got.as_ref()
+                .is_err_and(|e| e.to_string().contains("single-node")),
+            "{got:?}"
+        );
+        args.dist = false;
+        assert!(refuse_dist(&args).is_ok());
     }
 
     #[test]

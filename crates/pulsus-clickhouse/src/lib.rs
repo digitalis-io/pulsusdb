@@ -26,7 +26,10 @@ pub use client::{ChClient, ChRow, ChRowStream, Row};
 pub use config::{ChConnConfig, ChEndpoint, ChProto, ConsistencyConfig, ResolvedEndpoint};
 pub use error::{ChError, Idempotency};
 pub use pool::{ChPool, PooledConn, spawn_reprobe_loop};
-pub use settings::{MAX_JSON_PATHS_PER_VALUE, MAX_PARTITIONS_PER_INSERT_BLOCK, QuerySettings};
+pub use settings::{
+    ANSWER_FAMILIES, ANSWER_PIN_NAMES, AnswerFamily, MAX_JSON_PATHS_PER_VALUE,
+    MAX_PARTITIONS_PER_INSERT_BLOCK, QuerySettings,
+};
 
 #[cfg(test)]
 mod tests {

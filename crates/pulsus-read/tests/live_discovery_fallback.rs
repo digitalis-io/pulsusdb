@@ -128,6 +128,7 @@ fn now_ms() -> i64 {
 
 fn cache_config(db: &str) -> LabelCacheConfig {
     LabelCacheConfig {
+        skip_unavailable_shards: false,
         // Issue #398: the per-query ClickHouse memory ceiling; the
         // production default, so this fixture keeps today's behaviour.
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
@@ -143,6 +144,7 @@ fn cache_config(db: &str) -> LabelCacheConfig {
 
 fn engine_config(db: &str, max_metric_fanout: u64) -> MetricsConfig {
     MetricsConfig {
+        skip_unavailable_shards: false,
         // Issue #398: the per-query ClickHouse memory ceiling; the
         // production default, so this fixture keeps today's behaviour.
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,

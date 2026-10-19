@@ -153,7 +153,13 @@ async fn fetch_rows(cache: &LabelCache, sql: &str) -> Result<Vec<SeriesRow>, ChE
     let mut rows = Vec::new();
     let mut stream = cache
         .client
-        .query_stream::<SeriesRow>(sql, &sweep_settings(cache.config.read_max_memory_bytes))
+        .query_stream::<SeriesRow>(
+            sql,
+            &sweep_settings(
+                cache.config.read_max_memory_bytes,
+                cache.config.skip_unavailable_shards,
+            ),
+        )
         .await?;
     while let Some(row) = stream.next().await {
         rows.push(row?);
@@ -182,7 +188,12 @@ async fn fetch_rows(cache: &LabelCache, sql: &str) -> Result<Vec<SeriesRow>, ChE
 /// here so a sweep that did join would not fall to the server's default
 /// `parallel_hash`, which reserved about 42 MiB before reading a row —
 /// measured on 26.3.29.7, growing with the thread count.
-pub(crate) fn sweep_settings(read_max_memory_bytes: u64) -> QuerySettings {
+pub(crate) fn sweep_settings(
+    read_max_memory_bytes: u64,
+    skip_unavailable_shards: bool,
+) -> QuerySettings {
+    // STUB (tests first): the option is not sent yet.
+    let _ = skip_unavailable_shards;
     QuerySettings::new()
         .set("max_memory_usage", read_max_memory_bytes)
         .set("max_bytes_before_external_group_by", 0u64)

@@ -124,6 +124,7 @@ const GIDS: [u32; 3] = [0, 1, 0];
 /// statement builders produce and the pushed statement is one of them.
 fn freeze_config() -> MetricsConfig {
     MetricsConfig {
+        skip_unavailable_shards: false,
         db: "d".to_string(),
         samples_table: SAMPLES.to_string(),
         hist_samples_table: HIST.to_string(),

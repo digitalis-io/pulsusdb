@@ -583,6 +583,21 @@ mod cluster_topology_tests {
         assert!(err.to_string().contains("duplicate"), "{err}");
     }
 
+    /// X3: two replicas of one shard both map to it.
+    #[test]
+    fn build_shard_maps_accepts_two_replicas_of_one_shard() {
+        let authoritative = shards(&[1, 2]);
+        let macro_rows = rows(&[("a", 1), ("b", 1), ("c", 2)]);
+        let got = build_shard_maps("c", &authoritative, &macro_rows);
+        assert!(got.is_ok(), "{got:?}");
+        let (hostname_to_shard, _) = got.expect("checked above");
+        let want: std::collections::HashMap<String, u32> = [("a", 1), ("b", 1), ("c", 2)]
+            .iter()
+            .map(|(h, s)| (h.to_string(), *s))
+            .collect();
+        assert_eq!(hostname_to_shard, want);
+    }
+
     #[test]
     fn build_shard_maps_rejects_an_out_of_roster_shard_num() {
         let authoritative = shards(&[1, 2, 3, 4]);
@@ -770,6 +785,46 @@ async fn cross_check_logs_shard_key(
              {server}; every shard roster derived from this value would name the wrong shard"
         );
     }
+    Ok(())
+}
+
+/// STUB (tests first): today's participation check, moved here unchanged —
+/// a shard counts only if it did storage work, and exactly one row is the
+/// initiator's.
+#[cfg_attr(not(test), allow(dead_code))]
+fn participation_verdict(
+    stage: &str,
+    query_id: &str,
+    all_shards: &std::collections::BTreeSet<u32>,
+    rows: &[(u32, RawShardRow)],
+) -> anyhow::Result<()> {
+    let mut by_shard: std::collections::BTreeMap<u32, &RawShardRow> =
+        std::collections::BTreeMap::new();
+    for (shard, row) in rows {
+        by_shard.insert(*shard, row);
+    }
+    let observed: std::collections::BTreeSet<u32> = by_shard
+        .iter()
+        .filter(|(_, row)| row.read_rows > 0 || row.selected_marks > 0)
+        .map(|(shard, _)| *shard)
+        .collect();
+    anyhow::ensure!(
+        &observed == all_shards,
+        "stage {stage:?} (query_id={query_id}): observed participating shards {observed:?} != \
+         expected {all_shards:?} — missing {:?} (a lost system.query_log row, indistinguishable \
+         from data loss any other way) or unexpected {:?} (a pruning/sharding-mapping violation)",
+        all_shards.difference(&observed).collect::<Vec<_>>(),
+        observed.difference(all_shards).collect::<Vec<_>>(),
+    );
+    let coordinators = by_shard
+        .values()
+        .filter(|row| row.is_initial_query == 1)
+        .count();
+    anyhow::ensure!(
+        coordinators == 1,
+        "stage {stage:?} (query_id={query_id}) yielded {coordinators} coordinator-local \
+         (is_initial_query = 1) rows, expected exactly 1"
+    );
     Ok(())
 }
 
@@ -1863,4 +1918,96 @@ pub(crate) fn month_literals(start_ns: i64, end_ns: i64) -> Vec<MonthLiteral> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod participation_tests {
+    use super::{ProductMode, RawShardRow, participation_verdict, reader_settings};
+    use std::collections::BTreeSet;
+
+    fn row(shard: u32, initial: u8, read_rows: u64, marks: u64) -> (u32, RawShardRow) {
+        (
+            shard,
+            RawShardRow {
+                hostname: format!("host-{shard}"),
+                is_initial_query: initial,
+                read_rows,
+                read_bytes: read_rows * 10,
+                selected_marks: marks,
+            },
+        )
+    }
+
+    fn shards(nums: &[u32]) -> BTreeSet<u32> {
+        nums.iter().copied().collect()
+    }
+
+    /// The error's text, or nothing when the verdict passed.
+    fn err_text(got: &anyhow::Result<()>) -> String {
+        match got {
+            Ok(()) => String::new(),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// X2a: a shard that was asked and read nothing — no matching block —
+    /// counts as reached. This is the CI failure.
+    #[test]
+    fn a_reached_shard_that_read_nothing_counts_as_reached() {
+        let rows = [row(1, 1, 2000, 1), row(2, 0, 0, 0)];
+        let got = participation_verdict("resolution", "q", &shards(&[1, 2]), &rows);
+        assert!(got.is_ok(), "{got:?}");
+    }
+
+    /// X2b: a shard with no row fails, by name.
+    #[test]
+    fn a_shard_with_no_row_fails_by_name() {
+        let rows = [row(1, 1, 2000, 1), row(2, 0, 100, 1)];
+        let got = participation_verdict("resolution", "q", &shards(&[1, 2, 3]), &rows);
+        assert!(err_text(&got).contains("[3]"), "{got:?}");
+    }
+
+    /// X2c: a shard with two rows fails.
+    #[test]
+    fn a_shard_with_two_rows_fails() {
+        let rows = [row(1, 1, 2000, 1), row(2, 0, 100, 1), row(2, 0, 100, 1)];
+        let got = participation_verdict("resolution", "q", &shards(&[1, 2]), &rows);
+        assert!(err_text(&got).contains("more than one"), "{got:?}");
+    }
+
+    /// X2d: zero or two initiator rows fail.
+    #[test]
+    fn zero_or_two_initiator_rows_fail() {
+        for rows in [
+            [row(1, 0, 2000, 1), row(2, 0, 100, 1)],
+            [row(1, 1, 2000, 1), row(2, 1, 100, 1)],
+        ] {
+            let got = participation_verdict("resolution", "q", &shards(&[1, 2]), &rows);
+            assert!(err_text(&got).contains("initiator rows"), "{got:?}");
+        }
+    }
+
+    /// X1: the bench's reads send what every product logs read sends, at the
+    /// product's defaults, in both modes — entry for entry, apart from the two
+    /// tags.
+    #[test]
+    fn the_bench_reads_send_the_products_settings() {
+        let reader = pulsus_config::Config::default().reader;
+        let want: Vec<(String, String)> = pulsus_read::logql::read_query_settings(
+            reader.logql_scan_budget_bytes.0,
+            reader.logql_read_max_memory_bytes,
+            false,
+        )
+        .entries()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        for dist in [false, true] {
+            let got: Vec<(String, String)> = reader_settings(dist, "q", ProductMode::Flat)
+                .entries()
+                .filter(|(k, _)| *k != "query_id" && *k != "log_comment")
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            assert_eq!(got, want, "dist {dist}");
+        }
+    }
 }

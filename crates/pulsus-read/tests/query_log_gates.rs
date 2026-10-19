@@ -694,6 +694,7 @@ async fn fresh_run_db() -> (ChClient, String, i64) {
 
 fn engine_config(db: &str, scan_budget_bytes: u64) -> EngineConfig {
     EngineConfig {
+        skip_unavailable_shards: false,
         // Issue #398: the per-query ClickHouse memory ceiling; the
         // production default, so this fixture keeps today's behaviour.
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,

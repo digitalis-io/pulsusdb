@@ -46,6 +46,63 @@ pub const MAX_JSON_PATHS_PER_VALUE: u64 = 100_000;
 /// its spans and resources absent from the new tables.
 pub const MAX_PARTITIONS_PER_INSERT_BLOCK: u64 = 100;
 
+/// The settings that can turn a read into a partial or changed answer that
+/// still succeeds (#603 plan, "Answer pins"). Every read of every signal sends them.
+pub const ANSWER_PIN_NAMES: [&str; 17] = [
+    "skip_unavailable_shards",
+    "skip_unavailable_shards_mode",
+    "optimize_skip_unused_shards",
+    "distributed_group_by_no_merge",
+    "enable_parallel_replicas",
+    "max_parallel_replicas",
+    "distinct_overflow_mode",
+    "group_by_overflow_mode",
+    "join_overflow_mode",
+    "read_overflow_mode",
+    "read_overflow_mode_leaf",
+    "result_overflow_mode",
+    "set_overflow_mode",
+    "sort_overflow_mode",
+    "timeout_overflow_mode",
+    "timeout_overflow_mode_leaf",
+    "transfer_overflow_mode",
+];
+
+/// One family: its `LIKE` rules, and the members it does not pin, each with its reason.
+pub struct AnswerFamily {
+    pub name: &'static str,
+    pub like: &'static [&'static str],
+    pub exempt: &'static [(&'static str, &'static str)],
+}
+
+/// STUB (tests first): the four families' rules, no exemptions yet.
+pub const ANSWER_FAMILIES: [AnswerFamily; 4] = [
+    AnswerFamily {
+        name: "PF1 shard routing and availability",
+        like: &["%skip_unavailable_shards%", "%skip_unused_shards%"],
+        exempt: &[],
+    },
+    AnswerFamily {
+        name: "PF2 per-shard result merging",
+        like: &[
+            "distributed_group_by%",
+            "%group_by_sharding_key%",
+            "distributed_aggregation%",
+        ],
+        exempt: &[],
+    },
+    AnswerFamily {
+        name: "PF3 parallel replicas",
+        like: &["%parallel_replica%", "%parallel_reading_from_replicas%"],
+        exempt: &[],
+    },
+    AnswerFamily {
+        name: "PF4 overflow modes",
+        like: &["%overflow_mode%"],
+        exempt: &[],
+    },
+];
+
 /// An ordered list of `(key, value)` ClickHouse settings, applied to exactly
 /// one statement.
 #[derive(Clone, Default, Debug)]
@@ -404,6 +461,12 @@ impl QuerySettings {
             .set("distributed_aggregation_memory_efficient", 1)
             .set("prefer_localhost_replica", 1)
             .set("skip_unavailable_shards", u8::from(skip_unavailable_shards))
+    }
+
+    /// STUB (tests first): sends nothing yet.
+    pub fn answer_pins(self, prune_by_sharding_key: bool, skip_unavailable_shards: bool) -> Self {
+        let _ = (prune_by_sharding_key, skip_unavailable_shards);
+        self
     }
 
     /// Couples the client-side deadline to the server-side
@@ -777,6 +840,50 @@ mod tests {
             "async_insert is pinned one layer down, for every insert this \
              client makes; a second pin here would state one rule twice"
         );
+    }
+
+    /// CK1 (#603 follow-up): the answer pins are exactly the pinned list, in
+    /// order, with each value, for both arguments in both values; and no
+    /// family exempts a name it also pins.
+    #[test]
+    fn answer_pins_set_exactly_the_pinned_list() {
+        for prune in [false, true] {
+            for skip in [false, true] {
+                let s = QuerySettings::new().answer_pins(prune, skip);
+                let got: Vec<(&str, &str)> = s.entries().collect();
+                let mut want: Vec<(&str, String)> = vec![
+                    ("skip_unavailable_shards", u8::from(skip).to_string()),
+                    (
+                        "skip_unavailable_shards_mode",
+                        "unavailable_or_table_missing".to_string(),
+                    ),
+                    ("optimize_skip_unused_shards", u8::from(prune).to_string()),
+                    ("distributed_group_by_no_merge", "0".to_string()),
+                    ("enable_parallel_replicas", "0".to_string()),
+                    ("max_parallel_replicas", "1".to_string()),
+                ];
+                for name in &ANSWER_PIN_NAMES[6..] {
+                    want.push((name, "throw".to_string()));
+                }
+                let want: Vec<(&str, &str)> = want.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                assert_eq!(got, want, "prune {prune}, skip {skip}");
+                let names: Vec<&str> = got.iter().map(|(k, _)| *k).collect();
+                assert_eq!(
+                    names,
+                    ANSWER_PIN_NAMES.to_vec(),
+                    "prune {prune}, skip {skip}"
+                );
+            }
+        }
+        for family in &ANSWER_FAMILIES {
+            for (name, _) in family.exempt {
+                assert!(
+                    !ANSWER_PIN_NAMES.contains(name),
+                    "{} both pins and exempts {name}",
+                    family.name
+                );
+            }
+        }
     }
 
     /// AC2 (issue #114): sequential consistency emits `= 1` only when

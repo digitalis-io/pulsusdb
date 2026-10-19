@@ -27,7 +27,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use futures::StreamExt;
-use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, QuerySettings, Row};
+use pulsus_clickhouse::{
+    ANSWER_FAMILIES, ANSWER_PIN_NAMES, ChClient, ChConnConfig, ChProto, QuerySettings, Row,
+};
 
 /// Every key the workspace passes to `QuerySettings::set`, sorted.
 ///
@@ -43,8 +45,11 @@ const INJECTED_SETTINGS: &[&str] = &[
     "distinct_overflow_mode",
     "distributed_aggregation_memory_efficient",
     "distributed_foreground_insert",
+    // #603 follow-up: the answer pins (`QuerySettings::answer_pins`).
+    "distributed_group_by_no_merge",
     "distributed_product_mode",
     "do_not_merge_across_partitions_select_final",
+    "enable_parallel_replicas",
     // Issue #587: the trace fetch's own settings root carries `final = 1`
     // as a SETTING rather than as SQL text, which is what makes a retried
     // span single on a read taken before the next merge.
@@ -66,6 +71,7 @@ const INJECTED_SETTINGS: &[&str] = &[
     "insert_shard_id",
     // Issue #623: the label join on every series read that returns labels.
     "join_algorithm",
+    "join_overflow_mode",
     "json_type_escape_dots_in_keys",
     // Issue #599 part B: the clustered graph read takes a shard's
     // replicas in order.
@@ -80,6 +86,7 @@ const INJECTED_SETTINGS: &[&str] = &[
     "max_insert_block_size",
     "max_insert_block_size_bytes",
     "max_memory_usage",
+    "max_parallel_replicas",
     "max_query_size",
     "max_recursive_cte_evaluation_depth",
     "max_result_bytes",
@@ -102,6 +109,7 @@ const INJECTED_SETTINGS: &[&str] = &[
     // Issue #624: the `text` body index's direct read is off on every LogQL read.
     "query_plan_direct_read_from_text_index",
     "read_overflow_mode",
+    "read_overflow_mode_leaf",
     // Issue #704: the cluster test's `SYSTEM SYNC REPLICA` caps each call's
     // engine wait below the client's cut.
     "receive_timeout",
@@ -110,8 +118,12 @@ const INJECTED_SETTINGS: &[&str] = &[
     "session_timezone",
     "set_overflow_mode",
     "skip_unavailable_shards",
+    "skip_unavailable_shards_mode",
+    "sort_overflow_mode",
     "throw_on_max_partitions_per_insert_block",
     "timeout_overflow_mode",
+    "timeout_overflow_mode_leaf",
+    "transfer_overflow_mode",
     "type_json_skip_duplicated_paths",
     "use_query_condition_cache",
     "wait_end_of_query",
@@ -234,6 +246,9 @@ fn the_checked_in_setting_list_is_what_the_workspace_actually_injects() {
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         found.extend(set_keys_in(&text));
     }
+    // #603 follow-up: `QuerySettings::answer_pins` sets the overflow modes in
+    // a loop over `ANSWER_PIN_NAMES`, which the textual scan cannot see.
+    found.extend(ANSWER_PIN_NAMES.iter().map(|s| s.to_string()));
     let declared: BTreeSet<String> = INJECTED_SETTINGS.iter().map(|s| s.to_string()).collect();
     let missing: Vec<_> = found.difference(&declared).collect();
     let stale: Vec<_> = declared.difference(&found).collect();
@@ -350,5 +365,72 @@ async fn every_injected_setting_is_live_and_not_obsolete() {
         present.is_empty(),
         "{present:?} ARE server settings on this version — the HTTP-interface-parameter \
          exemption no longer applies to them and they must be checked like the rest"
+    );
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct NameRow {
+    name: String,
+}
+
+/// CK2 (#603 follow-up), live: every setting the server lists under one of
+/// the four answer families' `LIKE` rules is pinned or named exempt in that
+/// family, by exact name; and every pinned or exempt name is one the server
+/// lists under some family. A member a server version adds fails here until
+/// it is pinned or named.
+#[tokio::test]
+async fn every_answer_family_member_is_pinned_or_exempt() {
+    if !should_run() {
+        eprintln!(
+            "skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse to run this test \
+             (see crates/pulsus-clickhouse/tests/injected_settings.rs for setup)"
+        );
+        return;
+    }
+    let client = ChClient::new(test_config()).await.expect("connect");
+
+    let mut listed: BTreeSet<String> = BTreeSet::new();
+    let mut unnamed: Vec<(String, &str)> = Vec::new();
+    for family in &ANSWER_FAMILIES {
+        let rules = family
+            .like
+            .iter()
+            .map(|rule| format!("name LIKE '{rule}'"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let sql = format!("SELECT name FROM system.settings WHERE {rules} ORDER BY name");
+        let mut stream = client
+            .query_stream::<NameRow>(&sql, &QuerySettings::new())
+            .await
+            .expect("query system.settings for a family");
+        while let Some(row) = stream.next().await {
+            let name = row.expect("decode system.settings row").name;
+            let pinned = ANSWER_PIN_NAMES.contains(&name.as_str());
+            let exempt = family.exempt.iter().any(|(e, _)| *e == name);
+            if !pinned && !exempt {
+                unnamed.push((name.clone(), family.name));
+            }
+            listed.insert(name);
+        }
+    }
+    assert!(
+        unnamed.is_empty(),
+        "these family members are neither pinned nor named exempt: {unnamed:?}. Pin each in \
+         QuerySettings::answer_pins or name it in its family's exempt list with the reason."
+    );
+
+    let named: Vec<&str> = ANSWER_PIN_NAMES
+        .iter()
+        .copied()
+        .chain(
+            ANSWER_FAMILIES
+                .iter()
+                .flat_map(|f| f.exempt.iter().map(|(e, _)| *e)),
+        )
+        .filter(|n| !listed.contains(*n))
+        .collect();
+    assert!(
+        named.is_empty(),
+        "these pinned or exempt names are in no family's result on this server: {named:?}"
     );
 }

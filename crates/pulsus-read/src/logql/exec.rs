@@ -130,6 +130,10 @@ pub struct EngineConfig {
     /// `MetricsConfig::distributed` and `TraceReadConfig::distributed`.
     /// See [`LogQlEngine::activity_settings`].
     pub distributed: bool,
+    /// `PULSUS_SKIP_UNAVAILABLE_SHARDS` (#603 follow-up): what a read does
+    /// when a shard cannot be reached or does not have the table. Sent on
+    /// every read as part of the answer pins ([`read_query_settings`]).
+    pub skip_unavailable_shards: bool,
 }
 
 impl EngineConfig {
@@ -1173,6 +1177,7 @@ impl LogQlEngine {
         self.tagged(read_query_settings(
             self.config.scan_budget_bytes,
             self.config.read_max_memory_bytes,
+            self.config.skip_unavailable_shards,
         ))
     }
 
@@ -1294,8 +1299,12 @@ impl LogQlEngine {
     /// `reader.logql_read_max_memory_bytes`.
     pub fn paging_settings(&self, remaining: u64) -> QuerySettings {
         self.tagged(
-            read_query_settings(remaining, self.config.read_max_memory_bytes)
-                .set("wait_end_of_query", 1),
+            read_query_settings(
+                remaining,
+                self.config.read_max_memory_bytes,
+                self.config.skip_unavailable_shards,
+            )
+            .set("wait_end_of_query", 1),
         )
     }
 
@@ -6827,7 +6836,13 @@ fn metric_plan_window(mp: &MetricPlan) -> ClientWindow {
 /// …` condition that makes the next statement with that condition count too
 /// few lines (measured on 26.3.29.7). Turning the direct read off corrects
 /// it and leaves the condition cache and the index analysis on.
-pub fn read_query_settings(scan_budget_bytes: u64, read_max_memory_bytes: u64) -> QuerySettings {
+pub fn read_query_settings(
+    scan_budget_bytes: u64,
+    read_max_memory_bytes: u64,
+    skip_unavailable_shards: bool,
+) -> QuerySettings {
+    // STUB (tests first): the option is not sent yet.
+    let _ = skip_unavailable_shards;
     QuerySettings::new()
         .set("max_bytes_to_read", scan_budget_bytes)
         .set("read_overflow_mode", "throw")
@@ -8239,7 +8254,7 @@ mod tests {
     /// the byte-budget pair plus the raised `max_query_size`.
     #[test]
     fn read_query_settings_sets_the_scan_budget_and_the_raised_query_text_cap() {
-        let s = read_query_settings(1024, TEST_READ_MEM);
+        let s = read_query_settings(1024, TEST_READ_MEM, false);
         assert_eq!(s.get("max_bytes_to_read"), Some("1024"));
         assert_eq!(s.get("read_overflow_mode"), Some("throw"));
         assert_eq!(
@@ -8268,7 +8283,7 @@ mod tests {
         const MEM: u64 = 4096;
         const BUDGET: u64 = 1_000_000;
 
-        let budget = read_query_settings(BUDGET, MEM);
+        let budget = read_query_settings(BUDGET, MEM, false);
         assert_eq!(
             budget.get("distributed_product_mode"),
             None,
@@ -8276,7 +8291,7 @@ mod tests {
              carry no product-mode pin: there is no nested distributed \
              subquery left for it to govern"
         );
-        let paging = read_query_settings(BUDGET, MEM).set("wait_end_of_query", 1);
+        let paging = read_query_settings(BUDGET, MEM, false).set("wait_end_of_query", 1);
         assert_eq!(paging.get("distributed_product_mode"), None);
 
         // What they do carry is unchanged.
@@ -8290,12 +8305,13 @@ mod tests {
         // fixture pins, that pair does not bind the statement this path
         // generates. What bounds the set now is `check_stream_cap` and the
         // rendered-SQL ceiling, both already in the tree.
+        // `transfer_overflow_mode` and `set_overflow_mode` are sent, as
+        // `throw`: they are answer pins (#603 follow-up), and a mode with no
+        // limit beside it bounds nothing.
         for absent in [
             "max_rows_to_transfer",
             "max_bytes_to_transfer",
-            "transfer_overflow_mode",
             "max_rows_in_set",
-            "set_overflow_mode",
         ] {
             assert_eq!(
                 budget.get(absent),
@@ -8319,7 +8335,7 @@ mod tests {
     /// budget every dispatch site already carried.
     #[test]
     fn read_query_settings_carry_the_memory_ceiling_and_throw_not_spill() {
-        let s = read_query_settings(1024, 4096);
+        let s = read_query_settings(1024, 4096, false);
         assert_eq!(s.get("max_memory_usage"), Some("4096"));
         assert_eq!(s.get("max_bytes_before_external_group_by"), Some("0"));
         // The pre-#398 trio, unchanged.
@@ -8337,7 +8353,7 @@ mod tests {
     /// The two engine methods (`budget_settings`, `paging_settings`) are
     /// verbatim delegations to the one free function asserted here —
     /// `budget_settings` is `read_query_settings(scan_budget,
-    /// read_max_memory)` and `paging_settings` is
+    /// read_max_memory, false)` and `paging_settings` is
     /// `read_query_settings(remaining, …)` plus `wait_end_of_query`. They take
     /// `&self` and so need a live `ChClient`; the free function exists
     /// precisely so the settings decision is provable without one. **Every
@@ -8353,7 +8369,7 @@ mod tests {
         const MEM: u64 = 4096;
         const BUDGET: u64 = 1_000_000;
         // `budget_settings`' body, which every discovery dispatch shares.
-        let budget = read_query_settings(BUDGET, MEM);
+        let budget = read_query_settings(BUDGET, MEM, false);
         assert_eq!(
             budget.get("max_memory_usage"),
             Some(MEM.to_string().as_str()),
@@ -8371,7 +8387,7 @@ mod tests {
         // the first — if the decrement ever leaked into it, page N would
         // silently run with a smaller memory bound than page 1.
         const REMAINING: u64 = 777;
-        let paging = read_query_settings(REMAINING, MEM).set("wait_end_of_query", 1);
+        let paging = read_query_settings(REMAINING, MEM, false).set("wait_end_of_query", 1);
         assert_eq!(paging.get("max_bytes_to_read"), Some("777"));
         assert_eq!(
             paging.get("max_memory_usage"),
@@ -8388,17 +8404,38 @@ mod tests {
     #[test]
     fn read_query_settings_carry_the_budget_verbatim_at_the_accepted_min_and_ceiling() {
         assert_eq!(
-            read_query_settings(1, TEST_READ_MEM).get("max_bytes_to_read"),
+            read_query_settings(1, TEST_READ_MEM, false).get("max_bytes_to_read"),
             Some("1")
         );
         let cap = pulsus_config::LOGQL_SCAN_BUDGET_BYTES_CEILING;
-        let s = read_query_settings(cap, TEST_READ_MEM);
+        let s = read_query_settings(cap, TEST_READ_MEM, false);
         assert_eq!(
             s.get("max_bytes_to_read"),
             Some(cap.to_string().as_str()),
             "the ceiling budget must pass through verbatim"
         );
         assert_ne!(s.get("max_bytes_to_read"), Some("0"));
+    }
+
+    /// U1 (#603 follow-up): every LogQL read carries the answer pins, with
+    /// pruning off and the option as configured, in both the budget and the
+    /// paging form.
+    #[test]
+    fn every_logs_read_carries_the_answer_pins() {
+        for skip in [false, true] {
+            let pins = QuerySettings::new().answer_pins(false, skip);
+            let budget = read_query_settings(1024, TEST_READ_MEM, skip);
+            let paging = read_query_settings(1024, TEST_READ_MEM, skip).set("wait_end_of_query", 1);
+            for (form, s) in [("budget", &budget), ("paging", &paging)] {
+                for name in pulsus_clickhouse::ANSWER_PIN_NAMES {
+                    assert_eq!(
+                        s.get(name),
+                        pins.get(name),
+                        "{form} settings, skip {skip}: {name}"
+                    );
+                }
+            }
+        }
     }
 
     /// Issue #133: the paging loop's termination guard still fires at the

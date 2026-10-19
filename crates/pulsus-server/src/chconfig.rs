@@ -212,6 +212,8 @@ pub(crate) fn engine_config_from(config: &Config) -> EngineConfig {
         // distributed `IN`, rejected by ClickHouse's default `deny`
         // (Code 288) on a clustered deployment.
         distributed: config.cluster.is_some(),
+        // STUB (tests first): not mapped yet.
+        skip_unavailable_shards: false,
     }
 }
 
@@ -314,6 +316,8 @@ pub(crate) fn label_cache_config_from(config: &Config) -> LabelCacheConfig {
         // per-query memory ceiling as the request path; its warn-and-serve-
         // the-last-good-snapshot failure behaviour is unchanged.
         read_max_memory_bytes: config.reader.promql_read_max_memory_bytes,
+        // STUB (tests first): not mapped yet.
+        skip_unavailable_shards: false,
     }
 }
 
@@ -386,6 +390,8 @@ pub(crate) fn metrics_config_from(config: &Config) -> MetricsConfig {
         // — `ReaderConfig -> MetricsConfig -> metrics::grouped::node_verdicts`,
         // which is the only reader of it.
         grouped_push: config.reader.promql_grouped_push,
+        // STUB (tests first): not mapped yet.
+        skip_unavailable_shards: false,
     }
 }
 
@@ -441,6 +447,36 @@ pub(crate) fn trace_engine(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// S1 (#603 follow-up): `PULSUS_SKIP_UNAVAILABLE_SHARDS` reaches the
+    /// logs engine, both ways.
+    #[test]
+    fn engine_config_from_maps_skip_unavailable_shards() {
+        for skip in [true, false] {
+            let config = Config {
+                skip_unavailable_shards: skip,
+                ..Config::default()
+            };
+            assert_eq!(engine_config_from(&config).skip_unavailable_shards, skip);
+        }
+    }
+
+    /// S2 (#603 follow-up): the option reaches the metrics engine and the
+    /// label cache's sweep, both ways.
+    #[test]
+    fn metrics_and_label_cache_configs_map_skip_unavailable_shards() {
+        for skip in [true, false] {
+            let config = Config {
+                skip_unavailable_shards: skip,
+                ..Config::default()
+            };
+            assert_eq!(metrics_config_from(&config).skip_unavailable_shards, skip);
+            assert_eq!(
+                label_cache_config_from(&config).skip_unavailable_shards,
+                skip
+            );
+        }
+    }
 
     #[test]
     fn conn_config_from_targets_the_configured_database() {

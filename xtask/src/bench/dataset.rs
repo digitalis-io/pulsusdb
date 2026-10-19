@@ -285,6 +285,20 @@ fn now_ns() -> i64 {
 /// bounded regardless of total corpus size.
 const INSERT_BATCH_ROWS: usize = 100_000;
 
+/// STUB (tests first).
+#[cfg_attr(not(test), allow(dead_code))]
+fn landing_shard_for_batch(batch: u64, shards: u32) -> u32 {
+    let _ = (batch, shards);
+    0
+}
+
+/// STUB (tests first).
+#[cfg_attr(not(test), allow(dead_code))]
+fn expected_lines_per_shard(total: u64, batch: u64, shards: u32) -> Vec<u64> {
+    let _ = (total, batch, shards);
+    Vec::new()
+}
+
 fn gen_body(i: u64, service: &str, carries_needle: bool) -> String {
     let padding = "x".repeat(96);
     if carries_needle {
@@ -876,6 +890,22 @@ mod tests {
             20,
             "every stream must have a distinct fingerprint"
         );
+    }
+
+    /// X4: the CI corpus (720,000 lines in 100,000-line batches) over four
+    /// shards and over the local two-shard fixture.
+    #[test]
+    fn lines_are_spread_by_batch_over_every_shard() {
+        assert_eq!(
+            expected_lines_per_shard(720_000, 100_000, 4),
+            vec![200_000, 200_000, 200_000, 120_000]
+        );
+        assert_eq!(
+            expected_lines_per_shard(720_000, 100_000, 2),
+            vec![400_000, 320_000]
+        );
+        assert_eq!(landing_shard_for_batch(7, 4), 4);
+        assert_eq!(landing_shard_for_batch(4, 4), 1);
     }
 
     #[test]
