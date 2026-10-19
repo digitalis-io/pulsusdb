@@ -536,12 +536,12 @@ fn the_script_renders_exactly_what_this_crate_renders() {
     }
 }
 
-/// The two parts of the file that are read at run time rather than sent:
-/// a view's own projection, which the rebuild commands replay a landing
-/// window through, and a table's declared column list, which the trace
-/// fetch derives its projection from.
+/// Each view's projection reads its landing table under that table's
+/// discriminator — `row_kind` for traces, `kind` for metrics — and a
+/// table's declared column list, which the trace fetch derives its
+/// projection from, is read out of the same file.
 #[test]
-fn the_file_still_answers_the_two_run_time_questions() {
+fn each_view_reads_its_landing_table_under_its_discriminator() {
     let ctx = single();
 
     for mv in [
@@ -557,7 +557,7 @@ fn the_file_still_answers_the_two_run_time_questions() {
         assert!(
             projection.contains("WHERE row_kind = "),
             "{mv} must scan the landing table under a row_kind predicate, \
-             which is where a replay inserts its window: {projection}"
+             which is the one landing-row shape it takes: {projection}"
         );
         assert!(!projection.ends_with(';'));
     }
@@ -575,7 +575,7 @@ fn the_file_still_answers_the_two_run_time_questions() {
             pulsus_schema::mv_projection(mv, &ctx).unwrap_or_else(|| panic!("{mv} is in the file"));
         assert!(
             projection.contains("WHERE kind = "),
-            "a metrics replay appends its window to this predicate: {projection}"
+            "{mv} must read the landing table under a kind predicate: {projection}"
         );
     }
     assert!(pulsus_schema::mv_projection("not_a_view", &ctx).is_none());

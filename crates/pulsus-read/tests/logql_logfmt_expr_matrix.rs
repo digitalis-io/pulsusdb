@@ -1657,7 +1657,9 @@ fn reference_status(
 }
 
 fn reference_verdict(base: &str, query: &str) -> (Verdict, String) {
-    let (code, body) = reference_status(base, "/loki/api/v1/query_range", "query", query, true);
+    let (code, body) = pulsus_testkit::reask_on_cancel(|| {
+        reference_status(base, "/loki/api/v1/query_range", "query", query, true)
+    });
     match code {
         200 => (Verdict::Accept, body),
         400 => (Verdict::Reject, body),

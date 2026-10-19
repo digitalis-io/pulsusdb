@@ -28,9 +28,9 @@ skip_ddl: false
 retention_days: 7
 storage_policy: null
 log_rollup_resolution: 5s
-metrics_landing_retention_hours: 6    # the metrics landing table's replay window, in hours
+metrics_landing_retention_hours: 6    # how long the metrics landing table keeps a landed row, in hours
 metrics_dedup_window: 10000           # blocks each metrics table remembers for deduplication
-log_landing_retention_hours: 6        # the logs landing table's replay window, in hours
+log_landing_retention_hours: 6        # how long the logs landing table keeps a landed row, in hours
 log_dedup_window: 10000               # blocks each logs table remembers for deduplication
 cluster: null                    # ClickHouse cluster name; enables distributed DDL
 dist_suffix: _dist

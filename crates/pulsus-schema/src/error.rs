@@ -1,4 +1,4 @@
-//! `SchemaError` taxonomy for the server checks and the trace replay.
+//! `SchemaError` taxonomy for the server checks.
 
 use thiserror::Error;
 

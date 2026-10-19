@@ -102,13 +102,14 @@ const INJECTED_SETTINGS: &[&str] = &[
     // Issue #624: the `text` body index's direct read is off on every LogQL read.
     "query_plan_direct_read_from_text_index",
     "read_overflow_mode",
-    "read_overflow_mode_leaf",
+    // Issue #704: the cluster test's `SYSTEM SYNC REPLICA` caps each call's
+    // engine wait below the client's cut.
+    "receive_timeout",
     "result_overflow_mode",
     "select_sequential_consistency",
     "session_timezone",
     "set_overflow_mode",
     "skip_unavailable_shards",
-    "sort_overflow_mode",
     "throw_on_max_partitions_per_insert_block",
     "timeout_overflow_mode",
     "type_json_skip_duplicated_paths",

@@ -1536,23 +1536,6 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-schema --test live_hist_schema
 
-      # Issue #623: `pulsusdb rebuild-metrics`, run as the binary, replays a
-      # landing window into each target and leaves every row once.
-      - name: Live metrics rebuild
-        env:
-          PULSUS_TEST_CLICKHOUSE: "1"
-          PULSUS_TEST_CH_HTTP_PORT: "19123"
-        run: cargo test -p pulsus-server --test rebuild_live
-
-      # Issue #653: `pulsusdb rebuild-logs`, run as the binary, replays one
-      # tenant's landing window into each log target and leaves every other
-      # tenant's rows as they were.
-      - name: Live logs rebuild
-        env:
-          PULSUS_TEST_CLICKHOUSE: "1"
-          PULSUS_TEST_CH_HTTP_PORT: "19123"
-        run: cargo test -p pulsus-server --test rebuild_logs_live
-
       # Issue #270: OTLP/JSON metrics ingest must store the CORRECTLY ROUNDED
       # f64 — POST /v1/metrics (application/json) -> decode_json -> parse ->
       # MetricWriter (sync) -> ClickHouse, read back as
@@ -2734,6 +2717,9 @@ jobs:
   # the ~10k `full` tier is `e2e-metrics-full` below.
   e2e-single:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
     steps:
       - uses: actions/checkout@v7
 
@@ -2746,7 +2732,15 @@ jobs:
           shared-key: "workspace"
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - uses: docker/setup-buildx-action@v4
+        with:
+          driver-opts: image=ghcr.io/digitalis-io/buildkit@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
 
       - name: Build pulsusdb:e2e
         uses: docker/build-push-action@v7
@@ -2775,6 +2769,9 @@ jobs:
 
   e2e-cluster:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
     steps:
       - uses: actions/checkout@v7
 
@@ -2787,7 +2784,15 @@ jobs:
           shared-key: "workspace"
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - uses: docker/setup-buildx-action@v4
+        with:
+          driver-opts: image=ghcr.io/digitalis-io/buildkit@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
 
       - name: Build pulsusdb:e2e
         uses: docker/build-push-action@v7
@@ -2822,6 +2827,9 @@ jobs:
       matrix:
         variant: [single, cluster]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
     steps:
       - uses: actions/checkout@v7
 
@@ -2833,7 +2841,15 @@ jobs:
         with:
           shared-key: "workspace"
 
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - uses: docker/setup-buildx-action@v4
+        with:
+          driver-opts: image=ghcr.io/digitalis-io/buildkit@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
 
       - name: Build pulsusdb:e2e
         uses: docker/build-push-action@v7

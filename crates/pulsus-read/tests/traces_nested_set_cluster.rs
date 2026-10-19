@@ -1540,11 +1540,46 @@ async fn wait_state(
     }
 }
 
+/// `db.table` on this replica holds every part announced so far:
+/// `SYSTEM SYNC REPLICA … LIGHTWEIGHT` pulls the log, then waits for the
+/// fetches queued at that moment. A `system.replicas` read cannot be this
+/// barrier, because it takes `inserts_in_queue` and `log_pointer` at two
+/// moments and a pull landing between them reads as synced (#704).
+///
+/// Two minutes for the whole operation, each call inside a timeout of the
+/// time left. Each call's engine wait is at most 30 s, below the client's
+/// 60 s cut, and the call is never retried by the client: a
+/// `TIMEOUT_EXCEEDED` (159) is re-issued here, which pulls the log again.
+async fn sync_replica(client: &ChClient, db: &str, table: &str, what: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let sql = format!("SYSTEM SYNC REPLICA {db}.{table} LIGHTWEIGHT");
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(
+            !left.is_zero(),
+            "{what}: {db}.{table} not synced within 120 s"
+        );
+        let wait = left.min(Duration::from_secs(30)).as_secs().max(1);
+        let settings = QuerySettings::new().set("receive_timeout", wait);
+        match tokio::time::timeout(
+            left,
+            client.execute(&sql, &settings, Idempotency::NonIdempotent),
+        )
+        .await
+        {
+            Err(_elapsed) => panic!("{what}: {db}.{table} not synced within 120 s"),
+            Ok(Ok(())) => return,
+            Ok(Err(ChError::Server { code: 159, .. })) => {}
+            Ok(Err(e)) => panic!("{what}: {sql}: {e}"),
+        }
+    }
+}
+
 /// Both tables of the job synced on every client given.
 async fn wait_synced(clients: &[&ChClient], db: &str, what: &str) {
     for c in clients {
         for table in ["spans", "service_edges"] {
-            wait_state(c, db, table, what, ReplicaState::synced).await;
+            sync_replica(c, db, table, what).await;
         }
     }
 }
@@ -2000,16 +2035,13 @@ impl Replicas {
             exec(c, "SYSTEM STOP MERGES service_edges").await;
         }
         seed_edges(&[&r.s1, &r.s1b, &r.s2], &r.s1, l - MINUTE).await;
-        for c in [&r.s1, &r.s1b] {
-            wait_state(
-                c,
-                &r.db,
-                "service_edges",
-                "the seeded marker",
-                ReplicaState::synced,
-            )
-            .await;
-            assert_eq!(markers(c).await, vec![l - MINUTE], "the seeded marker");
+        for (c, node) in [(&r.s1, "s1"), (&r.s1b, "s1b")] {
+            sync_replica(c, &r.db, "service_edges", "the seeded marker").await;
+            assert_eq!(
+                markers(c).await,
+                vec![l - MINUTE],
+                "the seeded marker on {node}"
+            );
         }
         r
     }
@@ -2234,14 +2266,7 @@ async fn two_replicas_share_one_edge_table() {
     exec(&r.s1b, "SYSTEM STOP FETCHES service_edges").await;
     let stopped = server_now_us(&r.s1b).await;
     refresh_until(&r.s1, &db, newest + BUCKET, 4, "K7: ch-shard1's run").await;
-    wait_state(
-        &r.s1b,
-        &db,
-        "spans",
-        "K7: spans synced on ch-shard1b",
-        ReplicaState::synced,
-    )
-    .await;
+    sync_replica(&r.s1b, &db, "spans", "K7: spans synced on ch-shard1b").await;
     wait_state(
         &r.s1b,
         &db,
@@ -2290,7 +2315,7 @@ async fn a_replica_with_parts_still_to_fetch_writes_nothing() {
         s.inserts_in_queue > 0 && s.log_pointer > s.log_max_index
     })
     .await;
-    wait_state(&r.s1b, &db, "service_edges", "K2", ReplicaState::synced).await;
+    sync_replica(&r.s1b, &db, "service_edges", "K2").await;
     refresh_on(&r.s1b, &db, "K2: ch-shard1b's run").await;
     assert_eq!(
         markers(&r.s1b).await,
@@ -2332,7 +2357,7 @@ async fn pushes_split_across_replicas_wait_for_both() {
             |s| s.inserts_in_queue > 0 && s.log_pointer > s.log_max_index,
         )
         .await;
-        wait_state(c, &db, "service_edges", "K3", ReplicaState::synced).await;
+        sync_replica(c, &db, "service_edges", "K3").await;
     }
     for (c, node) in [(&r.s1, "ch-shard1"), (&r.s1b, "ch-shard1b")] {
         refresh_on(c, &db, &format!("K3: {node}'s run")).await;

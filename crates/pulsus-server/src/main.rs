@@ -19,7 +19,6 @@ mod middleware;
 mod modes;
 mod ops;
 mod prom_api;
-mod rebuild;
 mod request_id;
 mod serve;
 mod subsystems;
@@ -149,27 +148,6 @@ struct Cli {
     /// valid-values list lives in exactly one place.
     #[arg(long)]
     mode: Option<String>,
-
-    /// An operator command instead of serving. Absent, behaviour is exactly
-    /// what it was (issue #603).
-    #[command(subcommand)]
-    command: Option<Command>,
-}
-
-// The variants name the subcommands (`rebuild-metrics`, `rebuild-logs`,
-// `rebuild-traces`), so their shared prefix is the command line's.
-#[allow(clippy::enum_variant_names)]
-#[derive(clap::Subcommand, Debug)]
-enum Command {
-    /// Replay a window of the metrics landing table into one of the four
-    /// tables its materialized views maintain. See `src/rebuild.rs`.
-    RebuildMetrics(rebuild::RebuildMetrics),
-    /// Replay a window of the trace landing table into all five tables its
-    /// materialized views maintain. See `src/rebuild.rs`.
-    RebuildTraces(rebuild::RebuildTraces),
-    /// Replay a window of the log landing table into one of the five
-    /// tables its materialized views maintain. See `src/rebuild.rs`.
-    RebuildLogs(rebuild::RebuildLogs),
 }
 
 #[tokio::main]
@@ -183,16 +161,32 @@ async fn main() -> ExitCode {
             // opted into auto-detection and did not hard-set the zone; the
             // resolved `local_zone` then flows through `conn_config_from`.
             azdetect::resolve_local_zone(&mut config).await;
-            match cli.command {
-                Some(Command::RebuildMetrics(args)) => rebuild::run(&config, args).await,
-                Some(Command::RebuildTraces(args)) => rebuild::run_traces(&config, args).await,
-                Some(Command::RebuildLogs(args)) => rebuild::run_logs(&config, args).await,
-                None => serve::run(config).await,
-            }
+            serve::run(config).await
         }
         Err(err) => {
             eprintln!("pulsusdb: {err}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::{CommandFactory, Parser};
+
+    /// The binary serves and nothing else: no subcommand is declared, the
+    /// three removed rebuild commands do not parse, and the serving flags
+    /// still do (issue #705).
+    #[test]
+    fn the_binary_takes_no_subcommand() {
+        assert_eq!(Cli::command().get_subcommands().count(), 0);
+        for removed in ["rebuild-metrics", "rebuild-logs", "rebuild-traces"] {
+            assert!(
+                Cli::try_parse_from(["pulsusdb", removed]).is_err(),
+                "{removed} must not parse"
+            );
+        }
+        assert!(Cli::try_parse_from(["pulsusdb", "--mode", "all"]).is_ok());
     }
 }
