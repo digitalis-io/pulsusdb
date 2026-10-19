@@ -1182,7 +1182,7 @@ async fn shutdown_files_an_inflight_block_and_a_queued_block_differently() {
 
     let shutdown = {
         let writer = writer.clone();
-        tokio::spawn(async move { writer.shutdown(Duration::from_millis(10)).await })
+        tokio::spawn(async move { writer.shutdown(Duration::ZERO).await })
     };
     let a_answer = a.await;
     let b_answer = b.await;
@@ -2997,4 +2997,37 @@ async fn transition_bucket_registers_both_float_and_histogram_series_rows() {
 #[allow(dead_code)]
 fn no_tenant() -> pulsus_model::Tenant {
     pulsus_model::Tenant::from_header(None, false).expect("no header is the empty tenant")
+}
+
+/// A block still queued when the drain begins is sent while the grace lasts.
+/// On this single-threaded runtime no worker runs between the admissions and
+/// the announcement, so both blocks are provably queued at it.
+#[tokio::test]
+async fn a_metric_block_queued_when_the_drain_begins_is_sent_inside_the_grace() {
+    let root = spool_root("queued-at-drain");
+    let inserter = MockInserter::always(Act::Ok);
+    let writer = writer_with(&WriterConfig::default(), &root, inserter.clone());
+
+    writer
+        .admit(
+            &no_tenant(),
+            batch_for("a", 1, 1_000, true),
+            PushHeaders::default(),
+        )
+        .expect("queue has room");
+    let wait = writer
+        .admit_flush(
+            &no_tenant(),
+            batch_for("b", 2, 1_000, true),
+            PushHeaders::default(),
+        )
+        .expect("queue has room");
+    writer.shutdown(Duration::from_secs(10)).await;
+
+    assert_eq!(inserter.call_count(), 2, "both queued blocks are sent");
+    wait.await.expect("the sync caller is answered success");
+    assert_eq!(spool_records(&root, "poison").len(), 0);
+    assert_eq!(spool_records(&root, "uncertain").len(), 0);
+    assert_eq!(writer.metrics().queue_bytes, 0);
+    std::fs::remove_dir_all(&root).ok();
 }

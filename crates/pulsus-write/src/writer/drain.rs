@@ -118,6 +118,18 @@ impl Deadline {
         *self.0.lock().expect("deadline mutex poisoned") = Some(at);
     }
 
+    /// Announces `at` unless a deadline is already announced, and says
+    /// whether it did. One critical section, so it is ordered against
+    /// [`Self::authorize`] exactly as [`Self::publish`] is.
+    fn publish_if_unset(&self, at: Instant) -> bool {
+        let mut deadline = self.0.lock().expect("deadline mutex poisoned");
+        if deadline.is_some() {
+            return false;
+        }
+        *deadline = Some(at);
+        true
+    }
+
     /// Whether this lock is held right now, by any thread including the
     /// caller's. A case asks it from inside an attempt's constructor, where
     /// the answer says whether a publication could have landed between the
@@ -328,6 +340,23 @@ impl DrainBoundary {
         self.signal.send_replace(());
     }
 
+    /// Announces a deadline that has already passed, unless one is announced:
+    /// from here [`Deadline::authorize`] refuses every attempt, and every
+    /// block still queued is filed without one — through
+    /// [`AttemptEnd::NotStarted`], or by `run_block`'s landing-budget check
+    /// before it when the budget is already spent. What a writer dropped
+    /// without [`Self::shutdown`] gets, called first in the writer's own
+    /// `Drop` so it precedes the teardown of the queue's sender and of this
+    /// boundary's signal; [`Drop`] here calls it again for any other owner.
+    /// An attempt authorized before this call either completes in the poll
+    /// that started it or ends abandoned — the zero-grace case of the second
+    /// residual in the module docs.
+    pub(crate) fn cancel(&self) {
+        if self.deadline.publish_if_unset(Instant::now()) {
+            self.signal.send_replace(());
+        }
+    }
+
     /// Refuses every later admission, then waits for the ones already inside.
     ///
     /// The wait is a yield loop rather than a notification: a pass is held
@@ -357,6 +386,12 @@ impl DrainBoundary {
     #[doc(hidden)]
     pub(crate) fn reopen_for_test(&self) {
         self.closed.store(false, Ordering::SeqCst);
+    }
+}
+
+impl Drop for DrainBoundary {
+    fn drop(&mut self) {
+        self.cancel();
     }
 }
 
@@ -426,7 +461,7 @@ pub(crate) struct DrainWatch {
 impl DrainWatch {
     /// This view with `barrier` attached. See the field.
     #[cfg(test)]
-    fn with_barrier(mut self, barrier: impl FnOnce() + Send + 'static) -> Self {
+    pub(crate) fn with_barrier(mut self, barrier: impl FnOnce() + Send + 'static) -> Self {
         self.barrier = Some(Box::new(barrier));
         self
     }

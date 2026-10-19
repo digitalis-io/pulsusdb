@@ -273,7 +273,7 @@ impl TraceLandingPath {
     ///
     /// A block that reaches here after the queue closed is settled by a task
     /// of this admission's own, through the same ending a worker gives a
-    /// block still queued at shutdown.
+    /// block whose attempt the passed shutdown deadline refuses.
     pub(crate) fn queue(
         &self,
         pass: &AdmissionPass<'_>,

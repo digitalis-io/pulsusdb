@@ -299,8 +299,14 @@ pub(crate) fn mint_landing_token(rng: &mut XorShift64) -> String {
 }
 
 /// Spawns one insert worker on the landing queue. Every worker runs the same
-/// loop: take the next block, run it to an ending, repeat; once the shutdown
-/// signal fires, close the queue and settle what is left.
+/// loop: take the next block, run it to an ending through [`run_block`],
+/// repeat. Once the drain is announced — by `DrainBoundary::shutdown`, or by
+/// `DrainBoundary::cancel` when the writer is dropped — the worker closes the
+/// queue and keeps taking blocks until it is empty, so a block still queued at
+/// the announcement has the endings of any other block: committed; filed when
+/// the landing budget is spent, or when an insert error cannot be resent or
+/// the resends are used up; or filed at the deadline — not started once it
+/// has passed, abandoned if in flight when it passes.
 pub(crate) fn spawn_landing_worker<R>(
     ctx: Arc<LandingContext<R>>,
     rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<LandingBlock<R>>>>,
@@ -317,54 +323,28 @@ where
             None => XorShift64::seeded(),
         };
         loop {
-            if watch.is_announced() {
-                drain_queue(&ctx, &rx).await;
-                return;
-            }
-            let taken = {
+            let block = {
                 let mut queue = rx.lock().await;
-                tokio::select! {
-                    block = queue.recv() => Taken::Block(block),
-                    () = watch.until_announced() => Taken::ShuttingDown,
+                if watch.is_announced() {
+                    queue.close();
+                    queue.recv().await
+                } else {
+                    tokio::select! {
+                        block = queue.recv() => block,
+                        () = watch.until_announced() => {
+                            queue.close();
+                            queue.recv().await
+                        }
+                    }
                 }
             };
-            match taken {
-                Taken::Block(Some(block)) => {
-                    run_block(&ctx, block, &mut watch, &mut rng).await;
-                }
-                // Every sender is gone, so nothing more can arrive.
-                Taken::Block(None) => return,
-                Taken::ShuttingDown => {
-                    drain_queue(&ctx, &rx).await;
-                    return;
-                }
+            match block {
+                Some(block) => run_block(&ctx, block, &mut watch, &mut rng).await,
+                // The queue is closed and empty, or every sender is gone.
+                None => return,
             }
         }
     })
-}
-
-enum Taken<R> {
-    Block(Option<LandingBlock<R>>),
-    ShuttingDown,
-}
-
-/// Closes the queue, then settles every block still in it through the
-/// queued-shutdown ending — no attempt ever ran for one of them, so each
-/// gets a fresh fate and is filed as provably not committed. Closing before
-/// draining is what makes the drain terminate.
-async fn drain_queue<R>(
-    ctx: &Arc<LandingContext<R>>,
-    rx: &Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<LandingBlock<R>>>>,
-) where
-    R: ChRow + SpoolEncode + Send + Sync,
-{
-    let mut queue = rx.lock().await;
-    queue.close();
-    while let Some(block) = queue.recv().await {
-        let mut fate = LandingFate::NeverSent(String::new());
-        fate.saw_pre_send(MSG_SHUTDOWN_QUEUED.to_string());
-        settle_block(ctx, block, fate, TerminalCause::ShuttingDown).await;
-    }
 }
 
 /// Runs one block to an ending. Returns only once that block has settled.
@@ -570,6 +550,91 @@ pub(crate) async fn settle_block<R>(
 mod tests {
     use super::*;
     use crate::writer::rows::MetricLandingRow;
+
+    /// Counts insert calls and answers each at once.
+    struct CountingInserter(std::sync::atomic::AtomicUsize);
+
+    impl BlockInserter<MetricLandingRow> for CountingInserter {
+        fn insert<'a>(
+            &'a self,
+            _table: &'a str,
+            _rows: &'a [MetricLandingRow],
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ChError>> + Send + 'a>>
+        {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// The boundary is dropped on the worker's own thread, after the worker
+    /// has taken a block off the queue and read no deadline, and before its
+    /// attempt is authorized — the window a writer's teardown can open for a
+    /// worker on another thread. A dropped boundary cancels, so that attempt
+    /// is refused: no insert is started and the block is filed never sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_boundary_dropped_after_a_dequeue_starts_no_insert() {
+        let spool_dir = std::env::temp_dir().join(format!(
+            "pulsus-landing-dropped-boundary-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let mut runtime = WriterRuntime::from_config(&pulsus_config::WriterConfig::default());
+        runtime.spool_dir = spool_dir.clone();
+        let metrics = Arc::new(crate::writer::metrics::WriterMetrics::default());
+        let inserter = Arc::new(CountingInserter(std::sync::atomic::AtomicUsize::new(0)));
+        let ctx = Arc::new(LandingContext {
+            table: Arc::from("metric_landing"),
+            inserter: inserter.clone(),
+            runtime: Arc::new(runtime),
+            table_metrics: Arc::new(TableMetrics::default()),
+            queued_bytes: Arc::new(AtomicU64::new(0)),
+            spool: Arc::new(SpoolWriter::new(spool_dir.clone(), metrics)),
+            on_commit: None,
+            retries: 0,
+            max_rows: 1_000,
+        });
+        let (tx, rx) = mpsc::unbounded_channel();
+        let boundary = crate::writer::drain::DrainBoundary::new();
+        let slot = Arc::new(std::sync::Mutex::new(Some(boundary)));
+        let watch = {
+            let guard = slot.lock().expect("slot");
+            let slot = slot.clone();
+            guard
+                .as_ref()
+                .expect("the boundary")
+                .watch()
+                .with_barrier(move || drop(slot.lock().expect("slot").take()))
+        };
+        tx.send(LandingBlock::seal(
+            Vec::<MetricLandingRow>::new(),
+            0,
+            QuerySettings::new(),
+            ClaimTicket::inert(),
+            None,
+            tokio::time::Instant::now(),
+        ))
+        .unwrap_or_else(|_| panic!("the queue is open"));
+        let worker = spawn_landing_worker(ctx, Arc::new(tokio::sync::Mutex::new(rx)), watch);
+        tokio::time::timeout(Duration::from_secs(10), worker)
+            .await
+            .expect("the worker ends once the cancelled queue is empty")
+            .expect("the worker does not panic");
+
+        assert_eq!(
+            inserter.0.load(Ordering::SeqCst),
+            0,
+            "no insert was started"
+        );
+        let poison = std::fs::read_dir(spool_dir.join("poison").join("metric_landing"))
+            .map(|d| d.count())
+            .unwrap_or(0);
+        assert_eq!(poison, 1, "the block is filed never sent");
+        drop(tx);
+        std::fs::remove_dir_all(&spool_dir).ok();
+    }
 
     /// The fate is a value the loop carries: an ending whose own knowledge
     /// is "this did not send" must not reverse an earlier attempt that may
