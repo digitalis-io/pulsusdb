@@ -488,7 +488,10 @@ async fn rows_stored_on_both_shards_are_answered_once() {
     for n in [1, 2] {
         let rows = c
             .shard(n)
-            .query_strings(&format!("SELECT toString(count()) AS s FROM ({h})"), &settings)
+            .query_strings(
+                &format!("SELECT toString(count()) AS s FROM ({h})"),
+                &settings,
+            )
             .await
             .expect("H runs");
         assert_eq!(rows, vec!["1".to_string()], "K4: H through shard {n}");
