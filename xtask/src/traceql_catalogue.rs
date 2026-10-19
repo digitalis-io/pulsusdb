@@ -450,4 +450,21 @@ mod tests {
         assert_eq!(kept, rows(MAX_STATEMENTS));
         assert!(over);
     }
+
+    /// The read that feeds `cap_statements` asks for the sentinel: 101
+    /// rows, one past the ceiling of 100, under the request's own prefix.
+    /// Asking for 100 would never return the row that marks a request over.
+    #[test]
+    fn the_statement_read_asks_for_the_sentinel_row() {
+        let sql = statements_sql("catalogue-1-2-answer");
+        assert!(
+            sql.contains("WHERE log_comment = 'catalogue-1-2-answer' AND"),
+            "{sql}"
+        );
+        assert_eq!(
+            sql.rsplit_once("LIMIT ").map(|(_, n)| n),
+            Some("101"),
+            "{sql}"
+        );
+    }
 }
