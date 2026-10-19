@@ -3,7 +3,7 @@
 **Parts of this document describe the previous trace search engine, which issue #602 part 2c-2b deleted — its test binaries, goldens and benches in part 2c-2b-1, its code and the unit tests inside it in part 2c-2b-2; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** **Since #597 `compare()` is answered by the metrics statement (`crates/pulsus-read/src/traces/spans/metrics.rs`).** Third of three, with `docs/TraceQL/functional-requirements.md` (requirements,
 data, benchmark, test cases) and `docs/TraceQL/sql-schema.md` (tables, SQL,
 measurements). This one says what PulsusDB does, what ClickHouse does, which
-accepted query construct compiles to what, and which files change.
+accepted query construct compiles to what, and which files change. **Stale in §2.5:** `replay_trace_window` and `pulsusdb rebuild-traces` are removed. The landing worker still resends an uncertain insert under the same token; once those resends end, no manual repair remains for a target a failed view left short.
 
 ---
 

@@ -57,10 +57,10 @@ pub struct Config {
     pub traceql_indexed_attributes: Vec<String>,
     pub log_rollup_resolution: HumanDuration,
     /// `PULSUS_METRICS_LANDING_RETENTION_HOURS` (issue #603): the metrics
-    /// landing table's delete-TTL, in hours. It is the replay window — the
-    /// four derived metric tables can only be rebuilt from landed rows that
-    /// are still there — so a deployment that wants a longer window raises
-    /// it. Accepted range `1..=168`.
+    /// landing table's delete-TTL, in hours. Nothing reads a landed row
+    /// after its views have run; the rows are kept only so a person
+    /// can inspect them by hand.
+    /// Accepted range `1..=168`.
     pub metrics_landing_retention_hours: u32,
     /// `PULSUS_METRICS_DEDUP_WINDOW` (issue #603): how many recent blocks
     /// the landing table and each of the four derived metric tables
@@ -75,9 +75,9 @@ pub struct Config {
     /// Accepted range `1..=1000000`.
     pub metrics_dedup_window: u64,
     /// `PULSUS_LOG_LANDING_RETENTION_HOURS` (issue #603): the logs landing
-    /// table's delete-TTL, in hours. It is the replay window — the five
-    /// derived logs tables can only be rebuilt from landed rows that are
-    /// still there — so a deployment that wants a longer window raises it.
+    /// table's delete-TTL, in hours. Nothing reads a landed row
+    /// after its views have run; the rows are kept only so a person
+    /// can inspect them by hand.
     /// Accepted range `1..=168`.
     pub log_landing_retention_hours: u32,
     /// `PULSUS_LOG_DEDUP_WINDOW` (issue #603): how many recent blocks the
@@ -94,10 +94,10 @@ pub struct Config {
     /// still entitled to resend under it. Accepted range `1..=1000000`.
     pub log_dedup_window: u64,
     /// `PULSUS_TRACE_LANDING_RETENTION_HOURS` (issues #584 to #586): the
-    /// traces landing table's delete-TTL, in hours. It is the replay window
-    /// — the five derived trace tables can only be rebuilt from landed rows
-    /// that are still there — so a deployment that wants a longer window
-    /// raises it. Accepted range `1..=168`.
+    /// traces landing table's delete-TTL, in hours. Nothing reads a landed row
+    /// after its views have run; the rows are kept only so a person
+    /// can inspect them by hand.
+    /// Accepted range `1..=168`.
     pub trace_landing_retention_hours: u32,
     /// `PULSUS_TRACE_DEDUP_WINDOW` (issues #584 to #586): how many recent
     /// blocks the traces landing table and each of the five derived trace

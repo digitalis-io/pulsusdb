@@ -79,11 +79,11 @@ impl RenderCtx {
     /// A context for a test: `db` as given, every other field at the value
     /// `pulsus_config`'s own default carries.
     ///
-    /// **Production does not use this.** `chconfig::schema_params_from` keeps
-    /// its exhaustive literal, so a field added here later still cannot be
-    /// silently defaulted where a deployment would notice. This exists because
-    /// every new field otherwise edits one literal per test file — thirty-odd
-    /// of them for the two fields above.
+    /// **Production does not build a `RenderCtx`**: `schema/schema.sh`
+    /// renders the schema from the environment, and nothing in the binary
+    /// renders it since the rebuild commands were removed. This exists
+    /// because every new field otherwise edits one literal per test file —
+    /// thirty-odd of them for the two fields above.
     pub fn for_tests(db: &str) -> Self {
         RenderCtx {
             db: db.to_string(),

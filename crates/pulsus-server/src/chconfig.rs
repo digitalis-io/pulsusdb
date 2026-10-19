@@ -1,10 +1,10 @@
-//! The `Config` → `ChConnConfig` / `SchemaParams` mappings, in exactly one
+//! The `Config` → `ChConnConfig` mappings, in exactly one
 //! place (task-manager resolution on issue #6, carried over from issue #5's
 //! resolution #4): `pulsus-clickhouse` and `pulsus-schema` stay config-free,
 //! and every caller in this binary — the `--mode init` schema controller
 //! (`schema_init.rs`) and the serving startup path (`serve.rs`, which runs
 //! the same schema reconcile before flipping readiness — issue #6 review
-//! fix) — derives its connection settings and schema parameters from these
+//! fix) — derives its connection settings from these
 //! functions.
 
 use std::sync::Arc;
@@ -17,7 +17,7 @@ use pulsus_read::{
     EngineConfig, LabelCache, LabelCacheConfig, LogQlEngine, MetricsConfig, MetricsEngine,
     TraceEngine, TraceReadConfig,
 };
-use pulsus_schema::{NameCatalogue, RenderCtx, SchemaError, SchemaParams};
+use pulsus_schema::{NameCatalogue, SchemaError};
 use pulsus_write::{MetricWriterTables, TraceWriterTables, WriterTables};
 
 /// Maps `Config` to the connection settings any part of this binary dials
@@ -169,29 +169,6 @@ pub(crate) async fn check_schema_present(config: &Config) -> Result<(), NameChec
         return Err(NameCheckError::SchemaAbsent(db.clone()));
     }
     Ok(())
-}
-
-/// Maps `Config` to the rendering parameters `schema/schema.sql`'s tokens
-/// are substituted from — the same values `schema/schema.sh` reads from the
-/// environment. Used by the serving startup's schema-presence check, the
-/// rebuild commands and the trace replay.
-pub(crate) fn schema_params_from(config: &Config) -> SchemaParams {
-    RenderCtx {
-        db: config.clickhouse.database.clone(),
-        cluster: config.cluster.clone(),
-        dist_suffix: config.dist_suffix.clone(),
-        storage_policy: config.storage_policy.clone(),
-        retention_days: config.retention_days,
-        log_rollup: config.log_rollup_resolution.0,
-        metrics_landing_retention_hours: config.metrics_landing_retention_hours,
-        metrics_dedup_window: config.metrics_dedup_window,
-        log_landing_retention_hours: config.log_landing_retention_hours,
-        log_dedup_window: config.log_dedup_window,
-        trace_landing_retention_hours: config.trace_landing_retention_hours,
-        trace_dedup_window: config.trace_dedup_window,
-        trace_indexed_attributes: config.traceql_indexed_attributes.clone(),
-        graph_job_max_rows: pulsus_schema::GRAPH_JOB_MAX_ROWS,
-    }
 }
 
 /// Maps `Config` to [`pulsus_read::LogQlEngine`]'s table-name/budget
@@ -600,26 +577,6 @@ mod tests {
         let ch_cfg = bootstrap_conn_config_from(&config);
         assert_eq!(ch_cfg.proto, ChProto::Https);
         assert_eq!(ch_cfg.server, config.clickhouse.server);
-    }
-
-    #[test]
-    fn schema_params_from_maps_the_target_database_and_cluster() {
-        let mut config = Config::default();
-        config.clickhouse.database = "pulsus".to_string();
-        config.cluster = Some("prod".to_string());
-        let params = schema_params_from(&config);
-        assert_eq!(params.db, "pulsus");
-        assert_eq!(params.cluster.as_deref(), Some("prod"));
-    }
-
-    /// U2 (issue #599): production renders the service-graph job's row
-    /// ceiling at the value `schema/schema.sh` renders, 60,000,000.
-    #[test]
-    fn the_schema_params_carry_the_job_row_cap() {
-        assert_eq!(
-            schema_params_from(&Config::default()).graph_job_max_rows,
-            60_000_000
-        );
     }
 
     #[test]

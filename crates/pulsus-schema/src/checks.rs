@@ -170,11 +170,11 @@ pub const REQUIRED_SERVER_NAMES: &[(&str, NameCatalogue)] = &[
         "replicated_deduplication_window_seconds",
         NameCatalogue::MergeTreeSetting,
     ),
-    // The fifteen further settings one TRACE landing insert pins, of six
+    // The nine further settings one TRACE landing insert pins, of six
     // classes the metrics set does not need: how the block's bytes are read,
     // a limit that refuses a block rather than dividing it, what an
     // acknowledgement means, where a row is placed, what path a value is
-    // stored under, and whether exceeding a limit is an error or a success
+    // stored under, and whether exceeding the deadline is an error or a success
     // that need not be complete.
     // `QuerySettings::trace_landing_insert` names them together and quotes
     // what each one's own catalogue entry says. A pin added there without a
@@ -195,20 +195,9 @@ pub const REQUIRED_SERVER_NAMES: &[(&str, NameCatalogue)] = &[
     ("insert_shard_id", NameCatalogue::Setting),
     ("json_type_escape_dots_in_keys", NameCatalogue::Setting),
     ("type_json_skip_duplicated_paths", NameCatalogue::Setting),
-    // The seven overflow modes the repair's statements reach. Each is one
-    // `DECLARE` line in the engine's own `src/Core/Settings.cpp` at
-    // `v26.3.29.7-lts`, defaulting to `throw`, and each is present in
-    // `system.settings` on that build with that default — so pinning
-    // changes nothing where a deployment keeps them, and makes a
-    // deployment that set `break` fail loudly where it had a success that
-    // need not have been complete.
-    ("read_overflow_mode", NameCatalogue::Setting),
-    ("read_overflow_mode_leaf", NameCatalogue::Setting),
+    // The deadline's overflow mode; `QuerySettings::trace_landing_insert`'s
+    // own doc comment says why it is pinned.
     ("timeout_overflow_mode", NameCatalogue::Setting),
-    ("group_by_overflow_mode", NameCatalogue::Setting),
-    ("distinct_overflow_mode", NameCatalogue::Setting),
-    ("sort_overflow_mode", NameCatalogue::Setting),
-    ("result_overflow_mode", NameCatalogue::Setting),
     ("generateUUIDv7", NameCatalogue::Function),
     ("toStartOfHour", NameCatalogue::Function),
     ("tupleElement", NameCatalogue::Function),
@@ -506,7 +495,7 @@ mod tests {
             "min_insert_block_size_bytes_for_materialized_views",
         ]);
 
-        // The trace landing insert's own fifteen pins are rows too (issues
+        // The trace landing insert's own nine pins are rows too (issues
         // #584 to #586), and they are **derived from that constructor** here
         // rather than written out a second time: this case owns the twelve
         // above as a literal set, and
@@ -586,10 +575,7 @@ mod tests {
                      'throw_on_max_partitions_per_insert_block', \
                      'distributed_foreground_insert', 'insert_shard_id', \
                      'json_type_escape_dots_in_keys', 'type_json_skip_duplicated_paths', \
-                     'read_overflow_mode', 'read_overflow_mode_leaf', \
-                     'timeout_overflow_mode', 'group_by_overflow_mode', \
-                     'distinct_overflow_mode', 'sort_overflow_mode', \
-                     'result_overflow_mode')"
+                     'timeout_overflow_mode')"
                         .to_string()
                 ),
                 (
@@ -629,7 +615,7 @@ mod tests {
     ///
     /// Neither direction names a count or a name, so a pin added without a
     /// row, a row added without a pin, and a row added for one of the
-    /// fifteen while the reverse check only walked some of them all fail.
+    /// nine while the reverse check only walked some of them all fail.
     #[test]
     fn the_settings_read_back_at_startup_are_the_ones_the_trace_insert_sends() {
         use std::collections::BTreeSet;
