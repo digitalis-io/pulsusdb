@@ -750,11 +750,14 @@ async fn distinct_exemplars_stored_on_both_shards_are_answered_whole() {
     c.finish().await;
 }
 
+/// A remote-write exemplar as `(labels, value, ms)`.
+type RwExemplar<'a> = (&'a [(&'a str, &'a str)], f64, i64);
+
 /// One remote-write series `m{job="a"}` with `samples` and `exemplars`,
 /// each exemplar `(labels, value, ms)`.
 fn rw_series(
     samples: &[(f64, i64)],
-    exemplars: &[(&[(&str, &str)], f64, i64)],
+    exemplars: &[RwExemplar<'_>],
 ) -> pulsus_write::protocols::remote_write::TimeSeries {
     use pulsus_write::protocols::remote_write::{Exemplar, Label, Sample, TimeSeries};
     let labels_of = |p: &[(&str, &str)]| {

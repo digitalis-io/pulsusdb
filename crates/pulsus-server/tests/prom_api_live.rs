@@ -3265,12 +3265,15 @@ fn remote_write_body_501(
         .expect("snappy-compress the write")
 }
 
+/// A remote-write exemplar as `(labels, value, ms)`.
+type RwExemplar<'a> = (&'a [(&'a str, &'a str)], f64, i64);
+
 /// A remote-write series of `labels`, its `samples` and `exemplars`, each
 /// exemplar `(labels, value, ms)`.
 fn series_501(
     labels: &[(&str, &str)],
     samples: &[(f64, i64)],
-    exemplars: &[(&[(&str, &str)], f64, i64)],
+    exemplars: &[RwExemplar<'_>],
 ) -> pulsus_write::protocols::remote_write::TimeSeries {
     use pulsus_write::protocols::remote_write::{Exemplar, Label, Sample, TimeSeries};
     let labels_of = |pairs: &[(&str, &str)]| {
