@@ -817,11 +817,42 @@ pub(crate) fn metadata_response(mut items: Vec<MetricMeta>) -> Response {
 // query_exemplars (issue #501 part 2).
 // ---------------------------------------------------------------------
 
-/// `/api/v1/query_exemplars`' answer: `None` for a query with no
-/// selector, else the stored exemplars by series.
+/// `/api/v1/query_exemplars`' answer (issue #501 part 2): `None` — a
+/// query with no selector — is `{"status":"success"}` with no `data`, as
+/// the reference's envelope omits a nil result; otherwise one object per
+/// series, `seriesLabels` then `exemplars`, each exemplar `labels`,
+/// `value` (the samples' formatter, quoted) and `timestamp`
+/// (`web/api/v1/json_codec.go`, `marshalExemplarJSON`).
 pub(crate) fn query_exemplars_response(answer: Option<Vec<ExemplarSeries>>) -> Response {
-    let _ = answer;
-    json_response(Body::from(r#"{"status":"success","data":[]}"#))
+    let Some(series) = answer else {
+        return json_response(Body::from(r#"{"status":"success"}"#));
+    };
+    json_response(stream_array(
+        b"{\"status\":\"success\",\"data\":[".to_vec(),
+        series,
+        render_exemplar_series,
+        b"]}".to_vec(),
+    ))
+}
+
+fn render_exemplar_series(series: &ExemplarSeries) -> Vec<u8> {
+    let mut out = format!(
+        "{{\"seriesLabels\":{},\"exemplars\":[",
+        labels_object_json(&series.series_labels)
+    );
+    for (i, e) in series.exemplars.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "{{\"labels\":{},\"value\":{},\"timestamp\":{}}}",
+            labels_object_json(&e.labels),
+            quoted_value(e.value),
+            prom_timestamp(e.unix_milli)
+        ));
+    }
+    out.push_str("]}");
+    out.into_bytes()
 }
 
 // ---------------------------------------------------------------------
@@ -1965,7 +1996,9 @@ mod tests {
         let name: String = (0..100u32)
             .map(|i| char::from_u32(1 + i % 31).expect("a control character"))
             .collect();
-        let values = [-5e-324, 2.2250738585072009e-308, f64::MAX, f64::NAN];
+        // The largest subnormal, 2.2250738585072009e-308.
+        let largest_subnormal = f64::from_bits(0x000F_FFFF_FFFF_FFFF);
+        let values = [-5e-324, largest_subnormal, f64::MAX, f64::NAN];
         let mut rows = Vec::new();
         for (i, v) in values.iter().enumerate() {
             for (j, ms) in [0i64, 4_294_967_295_999].iter().enumerate() {

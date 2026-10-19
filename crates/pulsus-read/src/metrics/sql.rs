@@ -525,6 +525,37 @@ pub(super) struct ExemplarTables<'a> {
     pub(super) distributed: bool,
 }
 
+impl ExemplarTables<'_> {
+    /// `GLOBAL IN` when clustered: the set is computed once on the
+    /// initiator over every shard and sent to each, because a series'
+    /// registration and its exemplar can sit on different nodes.
+    fn global_in(&self) -> &'static str {
+        if self.distributed { "GLOBAL IN" } else { "IN" }
+    }
+}
+
+/// The exemplar statements' series condition: per filter, `fingerprint
+/// {IN}` the ID statement `/api/v1/series` renders for it, joined by
+/// `OR`.
+fn exemplar_selection(
+    tenant: &Tenant,
+    t: ExemplarTables<'_>,
+    filters: &[DiscoveryFilter],
+    window: DataWindow,
+) -> String {
+    filters
+        .iter()
+        .map(|f| {
+            format!(
+                "fingerprint {} (\nSELECT fingerprint\n{}\n)",
+                t.global_in(),
+                discovery_read(tenant, f, window).ids_from_where(t.ids)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n    OR ")
+}
+
 /// Statement C (issue #501 part 2): the stored exemplars of the selected
 /// series in the request window, counted, and the window they span.
 pub(super) fn exemplar_count_query(
@@ -533,12 +564,24 @@ pub(super) fn exemplar_count_query(
     filters: &[DiscoveryFilter],
     window: DataWindow,
 ) -> String {
-    let _ = (tenant, t, filters, window);
-    String::new()
+    format!(
+        "SELECT count() AS n, min(unix_milli) AS lo, max(unix_milli) AS hi\n\
+         FROM {}\n\
+         WHERE org_id = {}\n\
+         \x20 AND unix_milli >= {} AND unix_milli <= {}\n\
+         \x20 AND ({})",
+        t.exemplars,
+        tenant.sql_literal(),
+        window.start_ms,
+        window.end_ms,
+        exemplar_selection(tenant, t, filters, window)
+    )
 }
 
 /// Statement A (issue #501 part 2): every distinct exemplar of the
-/// selected series in C's `[lo, hi]`, at most 100,000 rows.
+/// selected series in C's `[lo, hi]`, at most 100,000 rows. Dispatched
+/// with `max_rows_to_group_by = 100000` and `group_by_overflow_mode =
+/// 'throw'`, so more distinct exemplars than that fail with code 158.
 pub(super) fn exemplar_rows_query(
     tenant: &Tenant,
     t: ExemplarTables<'_>,
@@ -547,8 +590,20 @@ pub(super) fn exemplar_rows_query(
     lo: i64,
     hi: i64,
 ) -> String {
-    let _ = (tenant, t, filters, window, lo, hi);
-    String::new()
+    format!(
+        "SELECT fingerprint, unix_milli, value, trace_id, span_id, labels\n\
+         FROM {}\n\
+         WHERE org_id = {}\n\
+         \x20 AND unix_milli >= {lo} AND unix_milli <= {hi}\n\
+         \x20 AND ({})\n\
+         GROUP BY fingerprint, unix_milli, value, trace_id, span_id, labels\n\
+         ORDER BY fingerprint, unix_milli, value, trace_id, span_id, labels\n\
+         LIMIT {}",
+        t.exemplars,
+        tenant.sql_literal(),
+        exemplar_selection(tenant, t, filters, window),
+        super::exemplars::EXEMPLAR_ANSWER_CAP
+    )
 }
 
 /// Statement T (issue #501 part 2): per epoch-aligned slice of `w` ms in
@@ -564,15 +619,54 @@ pub(super) fn exemplar_thinned_query(
     hi: i64,
     w: i64,
 ) -> String {
-    let _ = (tenant, t, filters, window, lo, hi, w);
-    String::new()
+    format!(
+        "SELECT e.1 AS fingerprint, e.2 AS unix_milli, e.3 AS value, e.4 AS trace_id, e.5 AS span_id, e.6 AS labels\n\
+         FROM (\n\
+         \x20 SELECT intDiv(unix_milli, {w}) AS slice,\n\
+         \x20        argMin(tuple(fingerprint, unix_milli, value, trace_id, span_id, labels),\n\
+         \x20               tuple(-value, unix_milli, fingerprint, trace_id, span_id, labels)) AS e\n\
+         \x20 FROM {}\n\
+         \x20 WHERE org_id = {}\n\
+         \x20   AND unix_milli >= {lo} AND unix_milli <= {hi}\n\
+         \x20   AND ({})\n\
+         \x20 GROUP BY slice\n\
+         \x20 ORDER BY slice\n\
+         \x20 LIMIT {}\n\
+         )",
+        t.exemplars,
+        tenant.sql_literal(),
+        exemplar_selection(tenant, t, filters, window),
+        super::exemplars::EXEMPLAR_ANSWER_CAP
+    )
 }
 
 /// Statement H (issue #501 part 2): the name and label set of each series
 /// whose ID is in `fps`, the decimal IDs comma-joined, one row per series.
+/// The ID set is a table-less sub-query over one string literal, so every
+/// shard computes the same set; the name set lets the read use the
+/// lookup's whole key.
 pub(super) fn exemplar_series_query(tenant: &Tenant, t: ExemplarTables<'_>, fps: &str) -> String {
-    let _ = (tenant, t, fps);
-    String::new()
+    let ids = format!(
+        "SELECT toUInt128(arrayJoin(splitByChar(',', {})))",
+        ch_string(fps)
+    );
+    let org = tenant.sql_literal();
+    format!(
+        "SELECT fingerprint, any(metric_name) AS series_name, any(labels) AS series_labels\n\
+         FROM {labels}\n\
+         WHERE org_id = {org}\n\
+         \x20 AND metric_name {in_} (\n\
+         \x20   SELECT DISTINCT metric_name\n\
+         \x20   FROM {series}\n\
+         \x20   WHERE org_id = {org}\n\
+         \x20     AND fingerprint IN ({ids})\n\
+         \x20 )\n\
+         \x20 AND fingerprint IN ({ids})\n\
+         GROUP BY fingerprint",
+        labels = t.ids.labels,
+        series = t.ids.series,
+        in_ = t.global_in(),
+    )
 }
 
 #[cfg(test)]

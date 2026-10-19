@@ -485,8 +485,11 @@ impl fmt::Display for TooBroadReason {
                 )
             }
             TooBroadReason::ExemplarAnswerBytes { budget_bytes } => {
-                let _ = budget_bytes;
-                Ok(())
+                write!(
+                    f,
+                    "exemplar answer exceeds the {budget_bytes}-byte budget — narrow the \
+                     selector or the time range"
+                )
             }
             TooBroadReason::TraceReadMemory { budget_bytes } => {
                 write!(

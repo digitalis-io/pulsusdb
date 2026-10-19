@@ -6,8 +6,11 @@
 //! The statements are built in [`super::sql`] and sent by
 //! [`super::exec::MetricsEngine::exemplars`].
 
+use std::collections::HashMap;
+
 use pulsus_model::Fingerprint;
 
+use crate::canonical_labels::parse_canonical_label_set;
 use crate::logql::error::{ReadError, TooBroadReason};
 
 use super::matcher::DataWindow;
@@ -23,6 +26,11 @@ pub const EXEMPLAR_ANSWER_CAP: u64 = 100_000;
 /// retention budget (`crate::traces::exec::HYDRATION_BYTE_BUDGET`), and
 /// each statement's `max_result_bytes`.
 pub const EXEMPLAR_ANSWER_BYTES: usize = 268_435_456;
+
+/// The rows of one block A, T and H return (`max_block_size`): the
+/// driver holds at most one block before its rows are priced, as the
+/// trace search's `TRACE_SEARCH_MAX_BLOCK_ROWS` bounds its.
+pub const EXEMPLAR_MAX_BLOCK_ROWS: u64 = 4_096;
 
 /// The most series IDs one hydration statement names.
 pub const HYDRATION_CHUNK_FINGERPRINTS: usize = 25_000;
@@ -56,39 +64,218 @@ pub struct StoredExemplar {
     pub unix_milli: i64,
 }
 
+/// The client's rounding of an interval (`backend/gtime/gtime.go`,
+/// `RoundInterval`, in the plugin SDK the client's `go.mod` pins): an
+/// interval of at most `.0` ms rounds to `.1` ms — below `.0` for the last
+/// case — and a longer one to [`CLIENT_LONGEST_INTERVAL`].
+const CLIENT_THRESHOLDS: [(i64, i64); 30] = [
+    (10, 1),
+    (15, 10),
+    (35, 20),
+    (75, 50),
+    (150, 100),
+    (350, 200),
+    (750, 500),
+    (1_500, 1_000),
+    (3_500, 2_000),
+    (7_500, 5_000),
+    (12_500, 10_000),
+    (17_500, 15_000),
+    (25_000, 20_000),
+    (45_000, 30_000),
+    (90_000, 60_000),
+    (210_000, 120_000),
+    (450_000, 300_000),
+    (750_000, 600_000),
+    (1_050_000, 900_000),
+    (1_500_000, 1_200_000),
+    (2_700_000, 1_800_000),
+    (5_400_000, 3_600_000),
+    (9_000_000, 7_200_000),
+    (16_200_000, 10_800_000),
+    (32_400_000, 21_600_000),
+    (86_400_000, 43_200_000),
+    (172_800_000, 86_400_000),
+    (604_800_000, 86_400_000),
+    (1_814_400_000, 604_800_000),
+    (63_072_000_000, 2_592_000_000),
+];
+
+/// `RoundInterval`'s value past its last threshold: one year.
+const CLIENT_LONGEST_INTERVAL: i64 = 31_536_000_000;
+
+/// Every value `RoundInterval` returns, ascending, in ms: 1, 10, 20, 50,
+/// 100, 200, 500 ms, 1, 2, 5, 10, 15, 20, 30 s, 1, 2, 5, 10, 15, 20,
+/// 30 min, 1, 2, 3, 6, 12, 24 h, 1 w, 30 d, 1 y.
+const CLIENT_INTERVALS: [i64; 30] = [
+    1,
+    10,
+    20,
+    50,
+    100,
+    200,
+    500,
+    1_000,
+    2_000,
+    5_000,
+    10_000,
+    15_000,
+    20_000,
+    30_000,
+    60_000,
+    120_000,
+    300_000,
+    600_000,
+    900_000,
+    1_200_000,
+    1_800_000,
+    3_600_000,
+    7_200_000,
+    10_800_000,
+    21_600_000,
+    43_200_000,
+    86_400_000,
+    604_800_000,
+    2_592_000_000,
+    CLIENT_LONGEST_INTERVAL,
+];
+
+/// The client's `safeResolution` (`models/query.go:159`): its step is at
+/// least `RoundInterval(range / 11000)`.
+const CLIENT_SAFE_RESOLUTION: i128 = 11_000;
+
+/// `RoundInterval(range / divisor)`, compared exactly as `range ≤
+/// threshold × divisor`.
+fn client_round(range: i128, divisor: i128) -> i64 {
+    let last = CLIENT_THRESHOLDS.len() - 1;
+    CLIENT_THRESHOLDS
+        .iter()
+        .enumerate()
+        .find(|(i, (threshold, _))| {
+            let bound = i128::from(*threshold) * divisor;
+            if *i == last {
+                range < bound
+            } else {
+                range <= bound
+            }
+        })
+        .map(|(_, (_, rounded))| *rounded)
+        .unwrap_or(CLIENT_LONGEST_INTERVAL)
+}
+
+fn gcd(a: i64, b: i64) -> i64 {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
 /// The width in milliseconds of the slices a thinned answer keeps one
-/// exemplar from.
+/// exemplar from, by the client's step rule:
+///
+/// 1. `s0 = RoundInterval(range / 22000)` — half the client's own
+///    resolution, since the request's range can differ from the one the
+///    client computed its step from by up to a step;
+/// 2. the width is the greatest common divisor of the client's rounded
+///    values `≥ s0`, so it divides every one of them;
+/// 3. while `range / width + 2` passes [`EXEMPLAR_ANSWER_CAP`], `s0` is the
+///    next rounded value.
+///
+/// `range` is the request's `end − start`; when the request has no `start`
+/// or no `end` it is `hi − lo`, the window C found the stored exemplars in.
 pub fn slice_width(window: DataWindow, lo: i64, hi: i64) -> i64 {
-    let _ = (window, lo, hi);
-    0
+    let range = if window.start_ms == ALL_TIME_START_MS || window.end_ms == ALL_TIME_END_MS {
+        i128::from(hi) - i128::from(lo)
+    } else {
+        i128::from(window.end_ms) - i128::from(window.start_ms)
+    }
+    .max(0);
+    let s0 = client_round(range, 2 * CLIENT_SAFE_RESOLUTION);
+    let mut from = CLIENT_INTERVALS
+        .iter()
+        .position(|v| *v == s0)
+        .unwrap_or(CLIENT_INTERVALS.len() - 1);
+    loop {
+        let width = CLIENT_INTERVALS[from..].iter().fold(0, |g, v| gcd(*v, g));
+        let slices = range / i128::from(width) + 2;
+        if slices <= i128::from(EXEMPLAR_ANSWER_CAP) || from + 1 == CLIENT_INTERVALS.len() {
+            return width;
+        }
+        from += 1;
+    }
 }
 
-/// The reference's label hash.
+/// The size prefix of one label name or value in the reference's label
+/// encoding (`model/labels/labels_stringlabels.go`, `encodeSize`): one
+/// byte below 255, else `0xFF` and three bytes little-endian.
+fn push_size(buf: &mut Vec<u8>, len: usize) {
+    if len < 255 {
+        buf.push(len as u8);
+    } else {
+        buf.push(0xFF);
+        buf.extend_from_slice(&(len as u32).to_le_bytes()[..3]);
+    }
+}
+
+/// The reference's label hash (`labels_stringlabels.go`, `Hash`): `xxh64`,
+/// seed 0, of the labels sorted by name, each name and value prefixed by
+/// its size. Orders a series' exemplars of one time and one value.
 pub fn reference_label_hash(labels: &[(String, String)]) -> u64 {
-    let _ = labels;
-    0
+    let mut buf = Vec::new();
+    for (name, value) in labels {
+        push_size(&mut buf, name.len());
+        buf.extend_from_slice(name.as_bytes());
+        push_size(&mut buf, value.len());
+        buf.extend_from_slice(value.as_bytes());
+    }
+    xxhash_rust::xxh64::xxh64(&buf, 0)
 }
 
-/// The distinct IDs of `fps`, at most [`HYDRATION_CHUNK_FINGERPRINTS`] a
-/// chunk, each chunk as comma-joined decimals.
+/// The distinct IDs of `fps`, ascending, at most
+/// [`HYDRATION_CHUNK_FINGERPRINTS`] a chunk, each chunk as the decimal IDs
+/// comma-joined — the text statement H reads as one string literal and
+/// converts with `toUInt128`, so a value above `2^64` stays exact.
 pub fn hydration_chunks(fps: &[Fingerprint]) -> Vec<String> {
-    let _ = fps;
-    Vec::new()
+    let mut ids = fps.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    ids.chunks(HYDRATION_CHUNK_FINGERPRINTS)
+        .map(|chunk| {
+            chunk
+                .iter()
+                .map(|fp| serde_json::to_string(fp).unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .collect()
 }
 
-/// What an A or T row is charged.
+/// An A or T row's fixed charge: its JSON's 461 bytes past the stored
+/// labels — the longest quoted value is 329 bytes — with room to spare,
+/// and its decoded form: the struct, the two id pairs and their text.
+const EX_FIXED: usize =
+    464 + std::mem::size_of::<StoredExemplar>() + 3 * std::mem::size_of::<(String, String)>() + 96;
+
+/// An H row's fixed charge: its JSON's 48 bytes past the name and labels,
+/// and its decoded form: the struct and the `__name__` pair.
+const SER_FIXED: usize =
+    64 + std::mem::size_of::<ExemplarSeries>() + 2 * std::mem::size_of::<(String, String)>();
+
+/// What an A or T row is charged: [`EX_FIXED`] and 12 bytes a byte of its
+/// stored labels — the labels once in the JSON, once decoded, and under
+/// 10 bytes of pair headers a byte, each pair being at least 5 bytes.
 pub fn exemplar_row_charge(row: &ExemplarRow) -> usize {
-    let _ = row;
-    0
+    EX_FIXED + 12 * row.labels.len()
 }
 
-/// What an H row is charged.
+/// What an H row is charged: [`SER_FIXED`], 8 bytes a byte of the name —
+/// escaped at most six times over, and kept twice — and 12 a byte of the
+/// stored labels, as for an exemplar.
 pub fn series_row_charge(row: &ExemplarSeriesRow) -> usize {
-    let _ = row;
-    0
+    SER_FIXED + 8 * row.series_name.len() + 12 * row.series_labels.len()
 }
 
-/// The retention counter of one exemplar answer.
+/// The retention counter of one exemplar answer: charged before a row is
+/// kept, the row refused when its charge would pass the cap. A failed
+/// charge does not move the counter. The answer's JSON is never longer
+/// than what was charged, and neither is what the engine keeps.
 #[derive(Debug)]
 pub(crate) struct AnswerBudget {
     used: usize,
@@ -101,40 +288,104 @@ impl AnswerBudget {
     }
 
     pub(crate) fn charge(&mut self, bytes: usize) -> Result<(), ReadError> {
-        let _ = (
-            bytes,
-            self.used,
-            self.cap,
-            TooBroadReason::ExemplarAnswerBytes { budget_bytes: 0 },
-        );
+        let would_be = self.used.saturating_add(bytes);
+        if would_be > self.cap {
+            return Err(ReadError::QueryTooBroad(
+                TooBroadReason::ExemplarAnswerBytes {
+                    budget_bytes: self.cap as u64,
+                },
+            ));
+        }
+        self.used = would_be;
         Ok(())
     }
 }
 
-/// An A or T row as the answer keeps it.
+/// Sorts `pairs` by name, keeping the order of equal names.
+fn by_name(mut pairs: Vec<(String, String)>) -> Vec<(String, String)> {
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    pairs
+}
+
+/// The lowercase hex of `bytes`.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// An A or T row as the answer keeps it: its stored labels, plus
+/// `trace_id` and `span_id` in lowercase hex when they are not all zero,
+/// sorted by name.
 pub fn keep_exemplar(row: ExemplarRow) -> (Fingerprint, StoredExemplar) {
+    let mut labels: Vec<(String, String)> = parse_canonical_label_set(&row.labels)
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    if row.trace_id != [0; 16] {
+        labels.push(("trace_id".to_string(), hex(&row.trace_id)));
+    }
+    if row.span_id != [0; 8] {
+        labels.push(("span_id".to_string(), hex(&row.span_id)));
+    }
     (
         row.fingerprint,
         StoredExemplar {
-            labels: Vec::new(),
+            labels: by_name(labels),
             value: row.value,
             unix_milli: row.unix_milli,
         },
     )
 }
 
-/// An H row as the answer keeps it.
+/// An H row as the answer keeps it: the series' labels plus `__name__`,
+/// sorted by name.
 pub fn keep_series(row: ExemplarSeriesRow) -> (Fingerprint, Vec<(String, String)>) {
-    (row.fingerprint, Vec::new())
+    let mut labels: Vec<(String, String)> = parse_canonical_label_set(&row.series_labels)
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    labels.push(("__name__".to_string(), row.series_name));
+    (row.fingerprint, by_name(labels))
 }
 
-/// Pairs each exemplar with its series' labels, in the reference's order.
+/// One series' labels and its exemplars, each with its label hash.
+type SeriesAndExemplars = (Vec<(String, String)>, Vec<(u64, StoredExemplar)>);
+
+/// Pairs each exemplar with its series' labels, by series ID, in the
+/// reference's order: series by their sorted label pairs, compared pair by
+/// pair, then by length (`labels.Compare`); a series' exemplars by time,
+/// then value, then [`reference_label_hash`]. An exemplar whose series
+/// `series` does not hold is left out.
 pub fn assemble(
     rows: Vec<(Fingerprint, StoredExemplar)>,
     series: Vec<(Fingerprint, Vec<(String, String)>)>,
 ) -> Vec<ExemplarSeries> {
-    let _ = (rows, series);
-    Vec::new()
+    let mut by_id: HashMap<Fingerprint, SeriesAndExemplars> = HashMap::with_capacity(series.len());
+    for (fp, labels) in series {
+        by_id.entry(fp).or_insert((labels, Vec::new()));
+    }
+    for (fp, exemplar) in rows {
+        if let Some((_, exemplars)) = by_id.get_mut(&fp) {
+            exemplars.push((reference_label_hash(&exemplar.labels), exemplar));
+        }
+    }
+    let mut out: Vec<ExemplarSeries> = by_id
+        .into_values()
+        .filter(|(_, exemplars)| !exemplars.is_empty())
+        .map(|(series_labels, mut exemplars)| {
+            exemplars.sort_by(|(ha, a), (hb, b)| {
+                a.unix_milli
+                    .cmp(&b.unix_milli)
+                    .then(a.value.total_cmp(&b.value))
+                    .then(ha.cmp(hb))
+            });
+            ExemplarSeries {
+                series_labels,
+                exemplars: exemplars.into_iter().map(|(_, e)| e).collect(),
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.series_labels.cmp(&b.series_labels));
+    out
 }
 
 #[cfg(test)]
@@ -341,13 +592,13 @@ mod tests {
         );
     }
 
-    /// U2c: 60,001 distinct IDs, some given twice, are three chunks of
+    /// U2c: 50,001 distinct IDs, some given twice, are three chunks of
     /// 25,000, 25,000 and 1, each the comma-joined decimals of its IDs —
     /// exact above `2^64`.
     #[test]
     fn hydration_chunks_hold_25000_fingerprints() {
         let base: u128 = 1 << 64;
-        let mut fps: Vec<Fingerprint> = (0..60_001u128)
+        let mut fps: Vec<Fingerprint> = (0..50_001u128)
             .map(|i| Fingerprint::from_raw(base + i * 7))
             .collect();
         fps.extend((0..100u128).map(|i| Fingerprint::from_raw(base + i * 7)));
@@ -360,7 +611,7 @@ mod tests {
             .map(|d| d.parse::<u128>().expect("a decimal ID"))
             .collect();
         back.sort_unstable();
-        let want: Vec<u128> = (0..60_001u128).map(|i| base + i * 7).collect();
+        let want: Vec<u128> = (0..50_001u128).map(|i| base + i * 7).collect();
         assert_eq!(back, want);
     }
 

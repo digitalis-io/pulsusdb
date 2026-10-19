@@ -37,7 +37,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 
 use futures::future::{join, join_all};
-use pulsus_clickhouse::{ChClient, ChRow, QuerySettings};
+use pulsus_clickhouse::{ChClient, ChError, ChRow, QuerySettings};
 use pulsus_model::{Fingerprint, FpLiteral, LabelSet, NativeHistogram, Tenant};
 use pulsus_promql::parser::Expr;
 use pulsus_promql::{
@@ -2642,14 +2642,107 @@ impl MetricsEngine {
 
     /// `GET|POST /api/v1/query_exemplars` (issue #501 part 2): the stored
     /// exemplars of the series any of `filters` selects in `window`.
+    ///
+    /// Statement C counts them and finds their window; none is an empty
+    /// answer. A then reads every distinct one in that window, or fails
+    /// with code 158 past [`super::exemplars::EXEMPLAR_ANSWER_CAP`], when T
+    /// reads one per slice instead. H hydrates the series labels of the
+    /// rows, one statement per [`super::exemplars::HYDRATION_CHUNK_FINGERPRINTS`]
+    /// IDs, one after another. Every row of A, T and H is charged to one
+    /// [`super::exemplars::EXEMPLAR_ANSWER_BYTES`] budget as it arrives.
     pub async fn exemplars(
         &self,
         tenant: &Tenant,
         filters: &[DiscoveryFilter],
         window: DataWindow,
     ) -> Result<Vec<super::exemplars::ExemplarSeries>, ReadError> {
-        let _ = (tenant, filters, window);
-        Ok(Vec::new())
+        use super::exemplars::{
+            AnswerBudget, ENVELOPE_CHARGE, EXEMPLAR_ANSWER_BYTES, assemble, exemplar_row_charge,
+            hydration_chunks, keep_exemplar, keep_series, series_row_charge, slice_width,
+        };
+        use super::sql::{
+            exemplar_count_query, exemplar_rows_query, exemplar_series_query,
+            exemplar_thinned_query,
+        };
+        let t = self.exemplar_tables();
+        let settings = |statement| {
+            exemplar_settings(
+                statement,
+                self.config.read_max_memory_bytes,
+                self.config.distributed,
+            )
+        };
+        let counts: Vec<super::rows::ExemplarCountRow> = self
+            .fetch_rows_with(
+                exemplar_count_query(tenant, t, filters, window),
+                &settings(ExemplarStatement::Count),
+                None,
+            )
+            .await?;
+        let Some(count) = counts.into_iter().next().filter(|c| c.n > 0) else {
+            return Ok(Vec::new());
+        };
+        let new_budget = || -> Result<AnswerBudget, ReadError> {
+            let mut budget = AnswerBudget::new(EXEMPLAR_ANSWER_BYTES);
+            budget.charge(ENVELOPE_CHARGE)?;
+            Ok(budget)
+        };
+        let mut budget = new_budget()?;
+        let rows = match self
+            .dispatch
+            .fetch_rows_charged_bytes(
+                exemplar_rows_query(tenant, t, filters, window, count.lo, count.hi),
+                &settings(ExemplarStatement::Rows),
+                &mut budget,
+                exemplar_row_charge,
+                keep_exemplar,
+            )
+            .await
+        {
+            Ok(rows) => rows,
+            Err(ReadError::Clickhouse(ChError::Server {
+                code: CODE_TOO_MANY_ROWS,
+                ..
+            })) => {
+                budget = new_budget()?;
+                let w = slice_width(window, count.lo, count.hi);
+                self.dispatch
+                    .fetch_rows_charged_bytes(
+                        exemplar_thinned_query(tenant, t, filters, window, count.lo, count.hi, w),
+                        &settings(ExemplarStatement::Thinned),
+                        &mut budget,
+                        exemplar_row_charge,
+                        keep_exemplar,
+                    )
+                    .await?
+            }
+            Err(e) => return Err(e),
+        };
+        let fps: Vec<Fingerprint> = rows.iter().map(|(fp, _)| *fp).collect();
+        let mut series = Vec::new();
+        for chunk in hydration_chunks(&fps) {
+            series.extend(
+                self.dispatch
+                    .fetch_rows_charged_bytes(
+                        exemplar_series_query(tenant, t, &chunk),
+                        &settings(ExemplarStatement::Series),
+                        &mut budget,
+                        series_row_charge,
+                        keep_series,
+                    )
+                    .await?,
+            );
+        }
+        Ok(assemble(rows, series))
+    }
+
+    /// Issue #501 part 2: the tables the exemplar statements name.
+    fn exemplar_tables(&self) -> super::sql::ExemplarTables<'_> {
+        super::sql::ExemplarTables {
+            exemplars: &self.config.exemplars_table,
+            ids: self.series_tables(),
+            distributed: self.config.distributed,
+        }
     }
 
     /// `GET /api/v1/metadata` (issues #32 and #500): every distinct
@@ -2790,14 +2883,47 @@ enum ExemplarStatement {
     Series,
 }
 
-/// The settings of one exemplar statement (issue #501 part 2).
+/// ClickHouse's `TOO_MANY_ROWS` (issue #501 part 2): statement A's
+/// `max_rows_to_group_by` refusal, the signal to thin.
+const CODE_TOO_MANY_ROWS: i32 = 158;
+
+/// The settings of one exemplar statement (issue #501 part 2): the series
+/// reads' settings ([`series_read_settings`]); when clustered,
+/// `optimize_skip_unused_shards = 0` on all four, and on A and H, which
+/// group by the sharding key's column, `optimize_distributed_group_by_
+/// sharding_key = 0`, so the initiator merges a group stored on two
+/// shards; on A the row cap that decides the branch; on A, T and H the
+/// result byte ceiling and the block size of the byte bound.
 fn exemplar_settings(
     statement: ExemplarStatement,
     read_max_memory_bytes: u64,
     distributed: bool,
 ) -> QuerySettings {
-    let _ = (statement, read_max_memory_bytes, distributed);
-    QuerySettings::new()
+    use super::exemplars::{EXEMPLAR_ANSWER_BYTES, EXEMPLAR_ANSWER_CAP, EXEMPLAR_MAX_BLOCK_ROWS};
+    let mut settings = series_read_settings(read_max_memory_bytes, distributed);
+    if distributed {
+        settings = settings.set("optimize_skip_unused_shards", 0u64);
+    }
+    if statement == ExemplarStatement::Rows {
+        settings = settings
+            .set("max_rows_to_group_by", EXEMPLAR_ANSWER_CAP)
+            .set("group_by_overflow_mode", "throw");
+    }
+    if statement != ExemplarStatement::Count {
+        settings = settings
+            .set("max_result_bytes", EXEMPLAR_ANSWER_BYTES)
+            .set("result_overflow_mode", "throw")
+            .set("max_block_size", EXEMPLAR_MAX_BLOCK_ROWS);
+    }
+    if distributed
+        && matches!(
+            statement,
+            ExemplarStatement::Rows | ExemplarStatement::Series
+        )
+    {
+        settings = settings.set("optimize_distributed_group_by_sharding_key", 0u64);
+    }
+    settings
 }
 
 /// Pure fan-out bound decision for the degraded-cache discovery probe

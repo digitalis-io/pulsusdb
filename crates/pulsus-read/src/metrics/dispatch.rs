@@ -193,7 +193,9 @@ impl std::fmt::Debug for MetricsDispatch {
 }
 
 /// **Leaf module — its entire contents are the ClickHouse handle, its
-/// constructor and its one legitimate accessor. Nothing else may be added
+/// constructor and its two legitimate accessors, `fetch_rows_with` and the
+/// exemplar read's `fetch_rows_charged_bytes` (issue #501 part 2), each
+/// mapping both seams. Nothing else may be added
 /// here** (issue #280 review, finding 1): every item inside this module
 /// can reach `client` and could dispatch around
 /// [`map_metrics_read_error`], and every item outside it provably cannot.
@@ -211,7 +213,10 @@ mod leaf {
     use crate::logql::exec::escape_query_placeholders;
     use crate::metrics::exec::SampleBudget;
 
-    use super::{drain_charged, map_metrics_read_error};
+    use super::{
+        drain_charged, drain_charged_bytes, map_exemplar_read_error, map_metrics_read_error,
+    };
+    use crate::metrics::exemplars::AnswerBudget;
 
     /// The sealed owner of the metrics engine's ClickHouse handle.
     pub(crate) struct MetricsDispatch {
@@ -309,6 +314,40 @@ mod leaf {
                 .map_err(|e| map_metrics_read_error(e, self.read_max_memory_bytes))?;
             drain_charged(stream, budget, self.read_max_memory_bytes).await
         }
+
+        /// [`Self::fetch_rows_with`] for an exemplar statement (issue #501
+        /// part 2): the same text checks and `log_comment`, every error
+        /// through [`super::map_exemplar_read_error`], and each row charged
+        /// to `budget` and converted as it is accepted
+        /// ([`super::drain_charged_bytes`]). The second accessor; like the
+        /// first it hands out the converted rows, never the stream.
+        pub(crate) async fn fetch_rows_charged_bytes<R: ChRow, T>(
+            &self,
+            sql: String,
+            settings: &QuerySettings,
+            budget: &mut AnswerBudget,
+            cost: impl Fn(&R) -> usize,
+            convert: impl FnMut(R) -> T,
+        ) -> Result<Vec<T>, ReadError> {
+            let sql = escape_query_placeholders(&sql);
+            if let Err(reason) = crate::querytext::ensure_query_text_fits(&sql) {
+                return Err(ReadError::QueryTooBroad(reason));
+            }
+            let tagged;
+            let settings = match &self.log_comment {
+                Some(c) => {
+                    tagged = settings.clone().set("log_comment", c.as_str());
+                    &tagged
+                }
+                None => settings,
+            };
+            let stream: ChRowStream<'_, R> = self
+                .client
+                .query_stream::<R>(&sql, settings)
+                .await
+                .map_err(|e| map_exemplar_read_error(e, self.read_max_memory_bytes))?;
+            drain_charged_bytes(stream, budget, cost, convert, self.read_max_memory_bytes).await
+        }
     }
 }
 
@@ -366,13 +405,35 @@ where
     Ok(out)
 }
 
-/// The exemplar read's `ChError` mapper (issue #501 part 2).
+/// ClickHouse's `TOO_MANY_ROWS_OR_BYTES` and `TOO_MANY_BYTES` (issue #501
+/// part 2): a statement's result passed its `max_result_bytes`. Only the
+/// exemplar statements set that ceiling on the metrics path.
+const CODE_TOO_MANY_ROWS_OR_BYTES: i32 = 396;
+const CODE_TOO_MANY_BYTES: i32 = 307;
+
+/// The exemplar read's `ChError` mapper (issue #501 part 2): the two
+/// result-byte codes are the answer's byte refusal, and every other error
+/// is [`map_metrics_read_error`]'s, which is unchanged — so no other
+/// metrics read can produce the refusal.
 pub(crate) fn map_exemplar_read_error(e: ChError, read_max_memory_bytes: u64) -> ReadError {
+    if let ChError::Server {
+        code: CODE_TOO_MANY_ROWS_OR_BYTES | CODE_TOO_MANY_BYTES,
+        ..
+    } = &e
+    {
+        return ReadError::QueryTooBroad(TooBroadReason::ExemplarAnswerBytes {
+            budget_bytes: EXEMPLAR_ANSWER_BYTES as u64,
+        });
+    }
     map_metrics_read_error(e, read_max_memory_bytes)
 }
 
-/// Drains one exemplar statement's row stream against `budget`, keeping
-/// each row as `convert` makes it (issue #501 part 2).
+/// Drains one exemplar statement's row stream against `budget` (issue #501
+/// part 2): each row is priced, charged, then converted into what the
+/// answer keeps, so no row is held twice and a row whose charge would pass
+/// the cap is refused before it is kept. Both `ChError` seams go through
+/// [`map_exemplar_read_error`]. A parent-module function for
+/// [`drain_charged`]'s reason: it cannot create a stream.
 pub(crate) async fn drain_charged_bytes<R, T, S>(
     mut stream: S,
     budget: &mut AnswerBudget,
@@ -383,10 +444,10 @@ pub(crate) async fn drain_charged_bytes<R, T, S>(
 where
     S: futures::Stream<Item = Result<R, ChError>> + Unpin,
 {
-    let _ = (&budget, &cost);
     let mut out = Vec::new();
     while let Some(row) = stream.next().await {
         let row = row.map_err(|e| map_exemplar_read_error(e, read_max_memory_bytes))?;
+        budget.charge(cost(&row))?;
         out.push(convert(row));
     }
     Ok(out)

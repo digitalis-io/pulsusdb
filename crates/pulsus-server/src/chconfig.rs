@@ -368,7 +368,7 @@ pub(crate) fn metrics_config_from(config: &Config) -> MetricsConfig {
         labels_table: format!("metric_labels{dist}"),
         label_index_table: format!("metric_label_index{dist}"),
         label_values_table: "metric_label_values".to_string(),
-        exemplars_table: String::new(),
+        exemplars_table: format!("metric_exemplars{dist}"),
         metadata_table: "metric_metadata".to_string(),
         // M7-A5a: the dual-read's complementary histogram table, `_dist`-
         // aware exactly like `samples_table` (co-sharded Metrics family).

@@ -103,8 +103,8 @@ async fn read_form_pairs(
 /// The reference's `MinTime`/`MaxTime` (api.go:951-967) in milliseconds:
 /// a discovery request's or an exemplar request's absent `start` and `end`
 /// (issue #499).
-pub(crate) const DISCOVERY_MIN_MS: i64 = -9_223_309_901_257_974_000;
-pub(crate) const DISCOVERY_MAX_MS: i64 = 9_223_309_901_257_974_999;
+pub(crate) const DISCOVERY_MIN_MS: i64 = pulsus_read::metrics::exemplars::ALL_TIME_START_MS;
+pub(crate) const DISCOVERY_MAX_MS: i64 = pulsus_read::metrics::exemplars::ALL_TIME_END_MS;
 
 /// Parses `start`/`end` for the discovery endpoints. An absent or empty
 /// bound is the reference's own, [`DISCOVERY_MIN_MS`] or
@@ -630,33 +630,46 @@ async fn metadata_impl(
 }
 
 // ---------------------------------------------------------------------
-// GET|POST /api/v1/query_exemplars (empty-success stub, issue #32 scope)
+// GET|POST /api/v1/query_exemplars (issue #501 part 2)
 // ---------------------------------------------------------------------
 
-/// Reads no data, and still refuses an invalid `X-Scope-OrgID` (issue
-/// #635 part 4), as every metrics route does. Its parameters are
-/// validated as the reference validates them (issue #499); the answer is
-/// empty because exemplars are not stored.
-pub(crate) async fn query_exemplars(headers: HeaderMap, RawQuery(raw): RawQuery) -> Response {
-    if let Err(e) = tenant_of(&headers) {
-        return e.into_response();
-    }
-    match exemplars_impl(&params::parse_pairs(raw.as_deref().unwrap_or(""))) {
+/// Refuses an invalid `X-Scope-OrgID` (issue #635 part 4), as every
+/// metrics route does, validates its parameters as the reference does
+/// (issue #499), and answers from the exemplars `metric_exemplars` holds
+/// for every vector selector of `query`.
+pub(crate) async fn query_exemplars(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let tenant = match tenant_of(&headers) {
+        Ok(t) => t,
+        Err(e) => return e.into_response(),
+    };
+    match exemplars_impl(
+        state,
+        &tenant,
+        &params::parse_pairs(raw.as_deref().unwrap_or("")),
+    )
+    .await
+    {
         Ok(res) => res,
         Err(e) => e.into_response(),
     }
 }
 
 pub(crate) async fn query_exemplars_post(
+    State(state): State<AppState>,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Bytes,
 ) -> Response {
-    if let Err(e) = tenant_of(&headers) {
-        return e.into_response();
-    }
+    let tenant = match tenant_of(&headers) {
+        Ok(t) => t,
+        Err(e) => return e.into_response(),
+    };
     match read_form_pairs(&headers, raw.as_deref(), body).await {
-        Ok(pairs) => match exemplars_impl(&pairs) {
+        Ok(pairs) => match exemplars_impl(state, &tenant, &pairs).await {
             Ok(res) => res,
             Err(e) => e.into_response(),
         },
@@ -664,10 +677,16 @@ pub(crate) async fn query_exemplars_post(
     }
 }
 
-/// `/query_exemplars`' validation (issue #499): `start` and `end`, absent
+/// `/query_exemplars` (issues #499, #501 part 2): `start` and `end`, absent
 /// or empty meaning all time, `end` not before `start`, then the query.
-/// No engine call.
-fn exemplars_impl(pairs: &[(String, String)]) -> Result<Response, ApiError> {
+/// A query with no vector selector reads nothing and answers
+/// `{"status":"success"}`; otherwise every selector is a filter, matched
+/// as `/series` matches `match[]`.
+async fn exemplars_impl(
+    state: AppState,
+    tenant: &Tenant,
+    pairs: &[(String, String)],
+) -> Result<Response, ApiError> {
     let start_ms = match params::nonempty(pairs, "start") {
         Some(v) => params::parse_time(v)?,
         None => DISCOVERY_MIN_MS,
@@ -679,8 +698,24 @@ fn exemplars_impl(pairs: &[(String, String)]) -> Result<Response, ApiError> {
     if end_ms < start_ms {
         return Err(ApiError::Param(ParamError::ExemplarsEndBeforeStart));
     }
-    pulsus_promql::parse(params::get(pairs, "query").unwrap_or(""))?;
-    Ok(encode::query_exemplars_response(Some(Vec::new())))
+    let expr = pulsus_promql::parse(params::get(pairs, "query").unwrap_or(""))?;
+    let selectors = pulsus_promql::exemplar_selectors(&expr)?;
+    if selectors.is_empty() {
+        return Ok(encode::query_exemplars_response(None));
+    }
+    let filters: Vec<DiscoveryFilter> = selectors
+        .into_iter()
+        .map(|(metric_name, name_matchers, matchers)| DiscoveryFilter {
+            metric_name,
+            name_matchers,
+            matchers,
+        })
+        .collect();
+    let engine = engine_for(&state).await?;
+    let answer = engine
+        .exemplars(tenant, &filters, DataWindow { start_ms, end_ms })
+        .await?;
+    Ok(encode::query_exemplars_response(Some(answer)))
 }
 
 // ---------------------------------------------------------------------

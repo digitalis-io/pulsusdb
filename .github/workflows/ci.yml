@@ -1694,6 +1694,15 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-read --test live_metrics_metadata
 
+      # Issue #501 part 2: `/api/v1/query_exemplars`' read — the selected
+      # series' exemplars, a stored repeat once, the bounds, the tenant, the
+      # 100,000 cap counted in distinct exemplars, and the thinned answer.
+      - name: Live metrics exemplars
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-read --test live_metrics_exemplars
+
       # Issue #635 part 4: `X-Scope-OrgID` through the real binary — pushes,
       # the header's rule on every metrics route, push suppression per
       # tenant, and every `/api/v1` route over two tenants' rows.
@@ -2642,6 +2651,16 @@ jobs:
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
         run: cargo test -p pulsus-read --test live_metrics_cluster_fallback
+
+      # Issue #501 part 2: the exemplar read over rows placed on each shard
+      # — a series registered on one shard and its exemplar on the other,
+      # rows stored on both, and an answer thinned over both — answered the
+      # same through either node. The negative control is the count with a
+      # shard-local `IN`, which misses the cross-shard rows.
+      - name: Live metrics exemplars (cluster)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+        run: cargo test -p pulsus-read --test live_metrics_exemplars_cluster
 
       # Issue #603: logs label discovery over SPLIT placement — the placement
       # the landing table produces, now that a push's block is not routed by

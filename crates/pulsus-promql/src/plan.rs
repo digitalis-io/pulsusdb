@@ -1385,9 +1385,44 @@ pub fn series_selector(expr: &Expr) -> Result<ExtractedSelector, PromqlError> {
 /// reference's `parser.ExtractSelectors` does. A matrix selector counts as
 /// its vector selector. An expression with none (`1`, `time()`) gives an
 /// empty list.
+///
+/// The walk recurses once per AST level, and the parser already caps the
+/// depth ([`crate::MAX_EXPR_DEPTH`]).
 pub fn exemplar_selectors(expr: &Expr) -> Result<Vec<ExtractedSelector>, PromqlError> {
-    let _ = expr;
-    Ok(Vec::new())
+    fn walk(expr: &Expr, out: &mut Vec<ExtractedSelector>) -> Result<(), PromqlError> {
+        match expr {
+            Expr::VectorSelector(vs) => push_unique(out, extract_name_and_matchers(vs)?),
+            Expr::MatrixSelector(ms) => push_unique(out, extract_name_and_matchers(&ms.vs)?),
+            Expr::Aggregate(a) => {
+                walk(&a.expr, out)?;
+                if let Some(param) = &a.param {
+                    walk(param, out)?;
+                }
+            }
+            Expr::Unary(u) => walk(&u.expr, out)?,
+            Expr::Paren(p) => walk(&p.expr, out)?,
+            Expr::Subquery(s) => walk(&s.expr, out)?,
+            Expr::Binary(b) => {
+                walk(&b.lhs, out)?;
+                walk(&b.rhs, out)?;
+            }
+            Expr::Call(c) => {
+                for arg in &c.args.args {
+                    walk(arg, out)?;
+                }
+            }
+            Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::Extension(_) => {}
+        }
+        Ok(())
+    }
+    fn push_unique(out: &mut Vec<ExtractedSelector>, selector: ExtractedSelector) {
+        if !out.contains(&selector) {
+            out.push(selector);
+        }
+    }
+    let mut out = Vec::new();
+    walk(expr, &mut out)?;
+    Ok(out)
 }
 
 fn unsupported(construct: impl Into<String>) -> PromqlError {
