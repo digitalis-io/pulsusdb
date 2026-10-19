@@ -141,8 +141,9 @@ struct Fixture {
 }
 
 impl Fixture {
-    async fn new(name: &str) -> Fixture {
-        let db = pulsus_testkit::test_db(name);
+    /// `db` is composed by `pulsus_testkit::test_db` at the call site,
+    /// where the naming guard reads it.
+    async fn new(db: String) -> Fixture {
         let bootstrap = ChClient::new(test_config("default"))
             .await
             .expect("connect (bootstrap)");
@@ -271,7 +272,7 @@ fn ex(labels: Vec<(String, String)>, value: f64, unix_milli: i64) -> StoredExemp
 #[tokio::test(flavor = "multi_thread")]
 async fn the_answer_is_the_selected_series_stored_exemplars() {
     skip_unless_live!();
-    let fx = Fixture::new("pulsus_exemplars_small").await;
+    let fx = Fixture::new(pulsus_testkit::test_db("pulsus_exemplars_small")).await;
     let t0 = fx.t0;
     let (start, end) = (t0 - 5 * MINUTE_MS, t0 + 5 * MINUTE_MS);
     fx.register(&[
@@ -447,7 +448,7 @@ async fn the_answer_is_the_selected_series_stored_exemplars() {
 #[tokio::test(flavor = "multi_thread")]
 async fn distinct_exemplars_under_the_cap_are_answered_whole_whatever_is_stored() {
     skip_unless_live!();
-    let fx = Fixture::new("pulsus_exemplars_l4b").await;
+    let fx = Fixture::new(pulsus_testkit::test_db("pulsus_exemplars_l4b")).await;
     let t0 = fx.t0;
     let start = t0 - 10 * MINUTE_MS;
     let series: Vec<Series<'_>> = (0..3u128)
@@ -548,7 +549,7 @@ fn kept(answer: &[ExemplarSeries]) -> BTreeSet<(usize, i64, u64)> {
 #[tokio::test(flavor = "multi_thread")]
 async fn past_the_cap_each_slice_keeps_its_highest_exemplar() {
     skip_unless_live!();
-    let fx = Fixture::new("pulsus_exemplars_l6").await;
+    let fx = Fixture::new(pulsus_testkit::test_db("pulsus_exemplars_l6")).await;
     let t0 = (fx.t0 / 10) * 10;
     let series: Vec<Series<'_>> = (0..3u128)
         .map(|fp| Series {
@@ -603,7 +604,7 @@ async fn past_the_cap_each_slice_keeps_its_highest_exemplar() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_fifteen_second_panel_keeps_every_buckets_highest() {
     skip_unless_live!();
-    let fx = Fixture::new("pulsus_exemplars_l6b").await;
+    let fx = Fixture::new(pulsus_testkit::test_db("pulsus_exemplars_l6b")).await;
     let end = (fx.t0 / 1_000) * 1_000;
     let start = end - 2 * DAY_MS;
     let hours: Vec<i64> = (0..=48).map(|h| start + h * HOUR_MS).collect();

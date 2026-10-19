@@ -169,8 +169,9 @@ async fn exec(client: &ChClient, sql: &str) {
 }
 
 impl Cluster {
-    async fn new(name: &str) -> Cluster {
-        let db = pulsus_testkit::test_db(name);
+    /// `db` is composed by `pulsus_testkit::test_db` at the call site,
+    /// where the naming guard reads it.
+    async fn new(db: String) -> Cluster {
         let bootstrap = ChClient::new(shard1_config("default"))
             .await
             .expect("connect shard1 (bootstrap)");
@@ -305,7 +306,7 @@ fn ex(value: f64, unix_milli: i64) -> StoredExemplar {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_series_and_its_exemplars_on_different_shards_are_found() {
     skip_unless_live!();
-    let c = Cluster::new("pulsus_exemplars_k1").await;
+    let c = Cluster::new(pulsus_testkit::test_db("pulsus_exemplars_k1")).await;
     let t0 = c.t0;
     c.register(1, 1, r#"{"job":"sel","s":"a"}"#).await;
     c.register(2, 2, r#"{"job":"sel","s":"b"}"#).await;
@@ -381,7 +382,7 @@ async fn a_series_and_its_exemplars_on_different_shards_are_found() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_thinned_answer_is_thinned_over_both_shards() {
     skip_unless_live!();
-    let c = Cluster::new("pulsus_exemplars_k3").await;
+    let c = Cluster::new(pulsus_testkit::test_db("pulsus_exemplars_k3")).await;
     let t0 = (c.t0 / 10) * 10;
     for s in 0..3u128 {
         c.register(1, 100 + s, &format!(r#"{{"job":"sel","s":"{s}"}}"#))
@@ -454,7 +455,7 @@ async fn a_thinned_answer_is_thinned_over_both_shards() {
 #[tokio::test(flavor = "multi_thread")]
 async fn rows_stored_on_both_shards_are_answered_once() {
     skip_unless_live!();
-    let c = Cluster::new("pulsus_exemplars_k4").await;
+    let c = Cluster::new(pulsus_testkit::test_db("pulsus_exemplars_k4")).await;
     let t0 = c.t0;
     c.register(1, 1, r#"{"job":"sel","s":"a"}"#).await;
     c.register(2, 1, r#"{"job":"sel","s":"a"}"#).await;
@@ -500,7 +501,7 @@ async fn rows_stored_on_both_shards_are_answered_once() {
 #[tokio::test(flavor = "multi_thread")]
 async fn distinct_exemplars_stored_on_both_shards_are_answered_whole() {
     skip_unless_live!();
-    let c = Cluster::new("pulsus_exemplars_k5").await;
+    let c = Cluster::new(pulsus_testkit::test_db("pulsus_exemplars_k5")).await;
     let t0 = c.t0;
     for s in 0..3u128 {
         c.register(1, 100 + s, &format!(r#"{{"job":"sel","s":"{s}"}}"#))

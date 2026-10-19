@@ -1662,7 +1662,7 @@ The rule §3.1 states for TraceQL is not a TraceQL rule: **for every payload the
 rejects, the rejection governs and the disposition below is unreachable.** `ReadError::PipelineInvalid`
 maps to **`400`** with `Content-Type: text/plain; charset=utf-8` and `X-Content-Type-Options: nosniff`
 (`crates/pulsus-server/src/logs_api/error.rs:212`, `:147-157`); the body is the bare reason
-(`crates/pulsus-read/src/logql/error.rs:744-745`).
+(`crates/pulsus-read/src/logql/error.rs:758-759`).
 
 **How this table is derived, because the previous one was transcribed and missed two rejections a
 user can reach today.** The enumeration is over a literal scope: **every `ReadError::` construction
