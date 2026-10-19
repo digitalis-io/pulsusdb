@@ -559,6 +559,129 @@ async fn a_numbered_search_answers_over_two_shards() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// Issue #600 part 2: a resource attribute's value over two shards. The
+/// lookup is a scalar the initiator evaluates and sends to each shard as a
+/// literal: one holding `Dynamic` values was refused when empty (code 36)
+/// and re-typed when not, so a stored integer `200` rendered as a string.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resource_value_keeps_its_type_over_two_shards() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db("pulsus_read_it_t600p2_cluster");
+    let bootstrap = ChClient::new(shard1_config("default"))
+        .await
+        .expect("connect shard1");
+    exec(
+        &bootstrap,
+        &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
+    )
+    .await;
+    run_init(&bootstrap, &cluster_ctx(&db))
+        .await
+        .expect("run_init");
+    let shard1 = ChClient::new(shard1_config(&db))
+        .await
+        .expect("connect shard1");
+    let shard2 = ChClient::new(shard2_config(&db))
+        .await
+        .expect("connect shard2");
+
+    let base = (now_ns() / S - 120) * S;
+    for (i, mut req) in bodies(base).into_iter().enumerate() {
+        req.resource_spans[0]
+            .resource
+            .as_mut()
+            .expect("a resource")
+            .attributes
+            .push(KeyValue {
+                key: "http.status_code".to_string(),
+                value: Some(AnyValue {
+                    value: Some(any_value::Value::IntValue(200)),
+                }),
+                ..KeyValue::default()
+            });
+        land(&shard1, &req, &format!("t600p2-cluster-{i}")).await;
+    }
+    for t in ["spans_dist", "traces_dist"] {
+        exec(&shard1, &format!("SYSTEM FLUSH DISTRIBUTED {db}.{t}")).await;
+    }
+    // `resources` is replicated to every node; the `IN` form reads it on the shard.
+    exec(&shard2, &format!("SYSTEM SYNC REPLICA {db}.resources")).await;
+    let local = (
+        count(&shard1, "SELECT count() AS n FROM spans").await,
+        count(&shard2, "SELECT count() AS n FROM spans").await,
+    );
+    assert_eq!(local.0 + local.1, 80, "all spans landed: {local:?}");
+    assert!(
+        local.0 > 0 && local.1 > 0,
+        "the traces split across the shards: {local:?}"
+    );
+
+    let engine = pulsus_read::TraceEngine::new(
+        ChClient::new(shard1_config(&db))
+            .await
+            .expect("connect the engine"),
+        config(),
+    );
+    let plan = |query: &str| {
+        plan_search_request(
+            &pulsus_traceql::parse(query).expect("parses"),
+            &SearchParams {
+                start_ns: base,
+                end_ns: base + 60 * S,
+                limit: 30,
+                spss: 10,
+            },
+            &StatementTables {
+                spans: "spans_dist",
+                resources: "resources",
+                traces: "traces_dist",
+                indexed: &[],
+            },
+            64,
+        )
+        .expect("plans")
+    };
+    let by_status = (0x10..=0x23u8)
+        .rev()
+        .map(|t| format!("{t:02x} {{int:200 [01, 02, 03, 04]}}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let render_numbers: fn(&pulsus_read::traces::SearchOutput) -> String = numbers_of;
+    let render_groups: fn(&pulsus_read::traces::SearchOutput) -> String = groups_of;
+    let mut wrong = Vec::new();
+    for (query, render, want) in [
+        (
+            "{ resource.http.status_code = 200 }",
+            render_numbers,
+            every_trace(&|_| "01 200, 02 200, 03 200, 04 200".to_string()),
+        ),
+        (
+            "{ resource.no.such.key = 1 }",
+            render_numbers,
+            String::new(),
+        ),
+        (
+            "{ } | by(resource.http.status_code)",
+            render_groups,
+            by_status,
+        ),
+    ] {
+        let got = match engine.search_routed(&plan(query)).await {
+            Ok(out) => render(&out),
+            Err(e) => format!("Err({e})"),
+        };
+        if got != want {
+            wrong.push(format!("{query}\n  want: {want}\n  got:  {got}"));
+        }
+    }
+    exec(
+        &bootstrap,
+        &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
+    )
+    .await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// One span of service `svc` carrying `http.route`.
 fn routed_request(
     svc: &str,

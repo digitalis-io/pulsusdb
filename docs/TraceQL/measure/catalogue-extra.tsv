@@ -50,3 +50,5 @@ event_negative_projects_nothing	{ event:name != "none" }	a negative event match 
 field_neq	{ .a != .b }	field against field `!=`, one type
 field_cross_type	{ .foo != .a }	field against field over two types
 siblings_of_roots	{} ~ {}	two parentless spans are not siblings
+select_resource_int	{ } | select(resource.http.status_code)	a resource value stored as an integer, projected: on a cluster the lookup crosses to each shard as a literal, which must keep the stored type (#600 part 2)
+by_resource_int	{ } | by(resource.http.status_code)	the same value as a group key: re-typed, it fails the presence rule and every span falls into the missing-key group (#600 part 2)

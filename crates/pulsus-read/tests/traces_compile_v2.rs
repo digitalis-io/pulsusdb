@@ -2129,22 +2129,44 @@ fn ff_resource_path(key: &str) -> String {
     format!("attrs.`{}`", key.replace('.', "%2E"))
 }
 
-/// `Q(k)` — section 5.1, from [`ctx`]'s window and table.
+/// `Q(k)` — section 5.1, from [`ctx`]'s window and table; each value as its
+/// type's name and its text (issue #600 part 2).
 fn q_of(path: &str) -> String {
     format!(
-        "(SELECT (groupArray(resource_id), groupArray({path}), \
+        "(SELECT (groupArray(resource_id), groupArray((dynamicType({path}), toString({path}))), \
          groupUniqArray(dynamicType({path}))) FROM resources WHERE {} AND \
          dynamicType({path}) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'))",
         t_b1_window().resources_day_clause()
     )
 }
 
-/// `V(k)` — section 5.1.
+/// `V(k)` — section 5.1: `Q(k)` once under its alias, the text read back as
+/// the type it names.
 fn v_of(path: &str) -> String {
     let q = q_of(path);
+    let rq = format!(
+        "rq_{:016x}",
+        q.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    );
+    let arms = [
+        "String",
+        "Int64",
+        "Float64",
+        "Bool",
+        "Array(Nullable(String))",
+        "Array(Nullable(Int64))",
+        "Array(Nullable(Float64))",
+        "Array(Nullable(Bool))",
+    ]
+    .map(|t| {
+        format!("tupleElement(rv, 1) = '{t}', CAST(CAST(tupleElement(rv, 2), '{t}'), 'Dynamic')")
+    })
+    .join(", ");
     format!(
-        "arrayElement(tupleElement({q}, 2), transform(resource_id, tupleElement({q}, 1), \
-         arrayEnumerate(tupleElement({q}, 1)), 0))"
+        "arrayElement(arrayMap(rv -> multiIf({arms}, NULL), [arrayElement(tupleElement({q} AS {rq}, 2), \
+         transform(resource_id, tupleElement({rq}, 1), arrayEnumerate(tupleElement({rq}, 1)), 0))]), 1)"
     )
 }
 
