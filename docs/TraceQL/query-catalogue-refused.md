@@ -1,6 +1,6 @@
 # The TraceQL query catalogue: the 50 refused queries
 
-**Parts of this document describe the previous trace search engine, which issue #602 part 2c-2b deleted — its test binaries, goldens and benches in part 2c-2b-1, its code and the unit tests inside it in part 2c-2b-2; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** The response is `docs/api.md` §4's envelope in every case — **`400`**,
+**Parts of this document describe the previous trace search engine, which issue #602 part 2c-2b deleted — its test binaries, goldens and benches in part 2c-2b-1, its code and the unit tests inside it in part 2c-2b-2; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** **Since #600 `t_c9_every_corpus_refusal_is_a_400_in_the_reference_container` in `crates/pulsus-server/src/traces_api/search.rs` checks these through the search route: 49 answer `400`, and `reject/empty` is no query there, as on the reference.** The response is `docs/api.md` §4's envelope in every case — **`400`**,
 `text/plain`, the message and nothing else — and this design changes neither the
 parser, the validator nor the planner, so it changes no refusal.
 

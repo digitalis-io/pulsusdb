@@ -143,18 +143,16 @@ class P:
         if k == 'duration': return v
         return v
 
-    # spanset_expr := structural chain of filters, with && || and parens
+    # spanset_expr := structural chains joined by && and || at one left-associative
+    # level (`docs/api.md` §4.2 "Operator precedence"; the reference's
+    # `pkg/traceql/expr.y:116`), with parens
     def spanset_expr(self):
         return self.spanset_or()
     def spanset_or(self):
-        l = self.spanset_and()
-        while self.at('||'):
-            self.next(); r = self.spanset_and(); l = {'k': 'sp_or', 'l': l, 'r': r}
-        return l
-    def spanset_and(self):
         l = self.structural()
-        while self.at('&&'):
-            self.next(); r = self.structural(); l = {'k': 'sp_and', 'l': l, 'r': r}
+        while self.at('||') or self.at('&&'):
+            op = self.next()[1]; r = self.structural()
+            l = {'k': 'sp_or' if op == '||' else 'sp_and', 'l': l, 'r': r}
         return l
     STRUCT = {'>': 'child', '>>': 'descendant', '<': 'parent', '<<': 'ancestor', '~': 'sibling'}
     def structural(self):
@@ -228,17 +226,13 @@ class P:
             return {'k': 'compare', 'inner': inner, 'args': args}
         raise ValueError(f'unknown pipeline stage {name!r} in {self.src!r}')
 
-    # field expressions, precedence: || && < cmp < +- < unary < */% < ^
+    # field expressions, precedence: (|| and && as one level) < cmp < +- < unary < */% < ^
+    # `docs/api.md` §4.2 "Operator precedence"; the reference's `pkg/traceql/expr.y:116`
     def expr(self): return self.p_or()
     def p_or(self):
-        l = self.p_and()
-        while self.at('||'):
-            self.next(); l = {'k': 'bin', 'op': '||', 'l': l, 'r': self.p_and()}
-        return l
-    def p_and(self):
         l = self.p_cmp()
-        while self.at('&&'):
-            self.next(); l = {'k': 'bin', 'op': '&&', 'l': l, 'r': self.p_cmp()}
+        while self.at('||') or self.at('&&'):
+            op = self.next()[1]; l = {'k': 'bin', 'op': op, 'l': l, 'r': self.p_cmp()}
         return l
     CMP = ('=', '!=', '=~', '!~', '<', '<=', '>', '>=')
     def p_cmp(self):

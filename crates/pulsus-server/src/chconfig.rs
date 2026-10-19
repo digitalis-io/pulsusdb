@@ -439,44 +439,7 @@ pub(crate) fn metrics_engine(
 /// deployment reads the base tables directly. Search budgets/caps map
 /// from `reader.traceql_scan_budget_rows`.
 pub(crate) fn trace_read_config_from(config: &Config) -> TraceReadConfig {
-    let dist = if config.cluster.is_some() {
-        config.dist_suffix.as_str()
-    } else {
-        ""
-    };
-    TraceReadConfig {
-        spans_table: format!("trace_spans{dist}"),
-        attrs_table: format!("trace_attrs_idx{dist}"),
-        // `trace_edges` (M7-E1, issue #173) co-shards with `trace_spans` on
-        // `cityHash64(trace_id)`, so it is `_dist`-aware exactly like
-        // `spans_table`/`attrs_table` (the dist-suffix rule, not the catalog
-        // carve-out) — the query-time edge join stays shard-local.
-        edges_table: format!("trace_edges{dist}"),
-        // Issue #560: the two derived trace tables co-shard with
-        // `trace_spans` on `cityHash64(trace_id)` — the same rule.
-        recent_table: format!("trace_recent{dist}"),
-        errors_table: format!("trace_error_spans{dist}"),
-        // Issue #587: the fetch's three tables. `spans` and `traces`
-        // co-shard with the landing table on `cityHash64(trace_id)`, so
-        // they take the same `_dist` rule as every other routed trace
-        // table. `resources` does NOT: it is `Replication::Global`, one
-        // cluster-wide replica set read from the local replica, the same
-        // carve-out the tag catalog has — a `_dist` wrapper would fan a
-        // read out to every shard for rows every shard already holds.
-        spans_v2_table: format!("spans{dist}"),
-        traces_table: format!("traces{dist}"),
-        resources_table: "resources".to_string(),
-        scan_budget_rows: config.reader.traceql_scan_budget_rows,
-        max_depth: config.reader.traceql_max_depth,
-        max_series: config.reader.traceql_max_series,
-        // Issue #398: the TraceQL per-query ClickHouse memory ceiling's
-        // production carrier — `ReaderConfig -> TraceReadConfig ->
-        // traces::exec::{search_settings, catalog_settings}` (and, through
-        // `catalog_settings`, the §4.2 point read).
-        read_max_memory_bytes: config.reader.traceql_read_max_memory_bytes,
-        distributed: config.cluster.is_some(),
-        skip_unavailable_shards: config.skip_unavailable_shards,
-    }
+    TraceReadConfig::from_config(config)
 }
 
 /// Builds a [`TraceEngine`] over `pool`, mirroring [`logql_engine`]'s
