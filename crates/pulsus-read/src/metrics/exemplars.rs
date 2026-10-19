@@ -258,6 +258,32 @@ const EX_FIXED: usize =
 const SER_FIXED: usize =
     64 + std::mem::size_of::<ExemplarSeries>() + 2 * std::mem::size_of::<(String, String)>();
 
+/// The `_json` half of an A or T row's charge (issue #501 part 2, r8):
+/// the most bytes its exemplar object and separator add to the body.
+pub fn exemplar_row_json(row: &ExemplarRow) -> usize {
+    let _ = row;
+    0
+}
+
+/// The `_held` half of an A or T row's charge: the most bytes the
+/// structures the answer keeps for it take.
+pub fn exemplar_row_held(row: &ExemplarRow) -> usize {
+    let _ = row;
+    0
+}
+
+/// The `_json` half of an H row's charge.
+pub fn series_row_json(row: &ExemplarSeriesRow) -> usize {
+    let _ = row;
+    0
+}
+
+/// The `_held` half of an H row's charge.
+pub fn series_row_held(row: &ExemplarSeriesRow) -> usize {
+    let _ = row;
+    0
+}
+
 /// What an A or T row is charged: [`EX_FIXED`] and 12 bytes a byte of its
 /// stored labels — the labels once in the JSON, once decoded, and under
 /// 10 bytes of pair headers a byte, each pair being at least 5 bytes.

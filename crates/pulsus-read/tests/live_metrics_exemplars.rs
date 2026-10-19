@@ -23,6 +23,7 @@ use std::time::Duration;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings};
 use pulsus_model::{LabelMatcher, MatchOp, Tenant};
 use pulsus_promql::PromqlError;
+use pulsus_read::logql::TooBroadReason;
 use pulsus_read::{
     DataWindow, DiscoveryFilter, ExemplarSeries, LabelCache, LabelCacheConfig, MetricsConfig,
     MetricsEngine, ReadError, StoredExemplar,
@@ -668,5 +669,103 @@ async fn a_fifteen_second_panel_keeps_every_buckets_highest() {
         buckets.len(),
         missing.first()
     );
+    fx.finish().await;
+}
+
+/// The labels K8 and L4c store on every exemplar: `L` = 200.
+const WIDE_LABELS: &str = concat!(
+    "{\"k\":\"",
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "\"}"
+);
+
+/// L4c: K8 on one node. Every exemplar carries 200 bytes of labels, and
+/// the engine's budget is 60 MiB. 150,000 over 150 s are T's 15,000; 90,000
+/// and 60,000, each at most the cap and each past the budget, are the byte
+/// refusal. On one node the 150,000 reach T through A's own row cap, so
+/// the drain's continuing past an early byte overflow is K8's to check.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wide_answer_past_its_budget_is_thinned_or_refused() {
+    skip_unless_live!();
+    assert_eq!(WIDE_LABELS.len(), 200);
+    let fx = Fixture::new(pulsus_testkit::test_db("pulsus_exemplars_l4c")).await;
+    let t0 = (fx.t0 / 10) * 10;
+    let series: Vec<Series<'_>> = (0..3u128)
+        .map(|fp| Series {
+            org: "",
+            fp: 100 + fp,
+            labels: ["{\"s\":\"0\"}", "{\"s\":\"1\"}", "{\"s\":\"2\"}"][fp as usize],
+            hours: vec![t0, t0 + 10 * MINUTE_MS],
+        })
+        .collect();
+    fx.register(&series).await;
+    // 150,000 from `t0`, 90,000 from `t0 + 200 s`, 60,000 from `t0 + 300 s`.
+    for (from, n) in [
+        (t0, 150_000),
+        (t0 + 200_000, 90_000),
+        (t0 + 300_000, 60_000),
+    ] {
+        fx.exec(&format!(
+            "INSERT INTO metric_exemplars (org_id, fingerprint, unix_milli, value, trace_id, \
+             span_id, labels) \
+             SELECT '', toUInt128(100 + number % 3), {from} + number, \
+                    toFloat64((number * 7919) % 1000), toFixedString('', 16), \
+                    toFixedString('', 8), '{WIDE_LABELS}' \
+             FROM numbers({n})"
+        ))
+        .await;
+    }
+    let budget = 60 * 1024 * 1024;
+    let engine = fx.engine().await.with_exemplar_answer_bytes(budget);
+    let all = DiscoveryFilter {
+        metric_name: Some("m".to_string()),
+        name_matchers: vec![],
+        matchers: vec![],
+    };
+    let got = engine
+        .exemplars(
+            &tenant(""),
+            std::slice::from_ref(&all),
+            DataWindow {
+                start_ms: t0,
+                end_ms: t0 + 149_999,
+            },
+        )
+        .await
+        .expect("L4c: 150,000 are thinned");
+    let rows: Vec<(usize, i64, f64)> = (0..150_000i64)
+        .map(|i| ((i % 3) as usize, t0 + i, ((i * 7919) % 1000) as f64))
+        .collect();
+    assert_eq!(
+        got.iter().map(|s| s.exemplars.len()).sum::<usize>(),
+        15_000,
+        "L4c: one exemplar per slice"
+    );
+    assert!(
+        kept(&got) == thinned(&rows, 10),
+        "L4c: the kept exemplars differ"
+    );
+    for (from, n) in [(t0 + 200_000, 90_000), (t0 + 300_000, 60_000)] {
+        let got = engine
+            .exemplars(
+                &tenant(""),
+                std::slice::from_ref(&all),
+                DataWindow {
+                    start_ms: from,
+                    end_ms: from + n - 1,
+                },
+            )
+            .await;
+        match got {
+            Err(ReadError::QueryTooBroad(TooBroadReason::ExemplarAnswerBytes { budget_bytes })) => {
+                assert_eq!(budget_bytes, budget as u64, "L4c {n}")
+            }
+            other => panic!(
+                "L4c: {n} exemplars past the budget must be refused, got {:?}",
+                other.map(|a| a.iter().map(|s| s.exemplars.len()).sum::<usize>())
+            ),
+        }
+    }
     fx.finish().await;
 }

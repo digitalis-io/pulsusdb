@@ -2736,6 +2736,13 @@ impl MetricsEngine {
         Ok(assemble(rows, series))
     }
 
+    /// TEST SEAM (issue #501 part 2): the byte budget one exemplar answer
+    /// may keep and write.
+    pub fn with_exemplar_answer_bytes(self, bytes: usize) -> Self {
+        let _ = bytes;
+        self
+    }
+
     /// Issue #501 part 2: the tables the exemplar statements name.
     fn exemplar_tables(&self) -> super::sql::ExemplarTables<'_> {
         super::sql::ExemplarTables {

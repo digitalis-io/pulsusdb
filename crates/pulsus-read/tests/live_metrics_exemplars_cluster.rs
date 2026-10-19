@@ -17,10 +17,11 @@ use std::time::Duration;
 
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings};
 use pulsus_model::{LabelMatcher, MatchOp, Tenant};
+use pulsus_read::logql::TooBroadReason;
 use pulsus_read::metrics::sql::discovery_distinct_names_query;
 use pulsus_read::{
     DataWindow, DiscoveryFilter, ExemplarSeries, LabelCache, LabelCacheConfig, MetricsConfig,
-    MetricsEngine, StoredExemplar,
+    MetricsEngine, ReadError, StoredExemplar,
 };
 use pulsus_schema::RenderCtx;
 use pulsus_schema_testkit::run_init;
@@ -80,6 +81,15 @@ fn shard2_config(database: &str) -> ChConnConfig {
         "PULSUS_TEST_CH_SHARD2_HOST",
         "172.28.0.12",
         "PULSUS_TEST_CH_SHARD2_HTTP_PORT",
+        database,
+    )
+}
+
+fn shard1b_config(database: &str) -> ChConnConfig {
+    shard_config(
+        "PULSUS_TEST_CH_SHARD1B_HOST",
+        "172.28.0.13",
+        "PULSUS_TEST_CH_SHARD1B_HTTP_PORT",
         database,
     )
 }
@@ -157,6 +167,9 @@ struct Cluster {
     bootstrap: ChClient,
     shard1: ChClient,
     shard2: ChClient,
+    /// Shard 1's second replica (issue #599 part B), which a distributed
+    /// read may pick for shard 1.
+    replica1b: ChClient,
     /// Thirty minutes ago, minute-aligned.
     t0: i64,
 }
@@ -181,12 +194,16 @@ impl Cluster {
             .expect("run_init (clustered)");
         let shard1 = ChClient::new(shard1_config(&db)).await.expect("shard1");
         let shard2 = ChClient::new(shard2_config(&db)).await.expect("shard2");
+        let replica1b = ChClient::new(shard1b_config(&db))
+            .await
+            .expect("shard 1's second replica");
         let now = chrono::Utc::now().timestamp_millis();
         Cluster {
             db,
             bootstrap,
             shard1,
             shard2,
+            replica1b,
             t0: (now / MINUTE_MS) * MINUTE_MS - 30 * MINUTE_MS,
         }
     }
@@ -236,6 +253,29 @@ impl Cluster {
         .await;
     }
 
+    /// Waits until shard 1's second replica holds every row written on
+    /// shard 1, so a read that picks either replica of shard 1 sees them.
+    async fn sync(&self) {
+        let tables = self
+            .replica1b
+            .query_strings(
+                &format!(
+                    "SELECT table AS s FROM system.replicas WHERE database = '{}'",
+                    self.db
+                ),
+                &QuerySettings::new(),
+            )
+            .await
+            .expect("shard 1's second replica lists its tables");
+        for table in tables {
+            exec(
+                &self.replica1b,
+                &format!("SYSTEM SYNC REPLICA {}.{table}", self.db),
+            )
+            .await;
+        }
+    }
+
     /// An engine whose client is shard `n`, so that node coordinates.
     async fn engine(&self, n: u8) -> MetricsEngine {
         let config = if n == 1 {
@@ -262,6 +302,7 @@ impl Cluster {
     }
 
     async fn answers(&self) -> (Vec<ExemplarSeries>, Vec<ExemplarSeries>) {
+        self.sync().await;
         let mut out = Vec::new();
         for n in [1, 2] {
             out.push(
@@ -384,6 +425,29 @@ async fn a_thinned_answer_is_thinned_over_both_shards() {
     skip_unless_live!();
     let c = Cluster::new(pulsus_testkit::test_db("pulsus_exemplars_k3")).await;
     let t0 = (c.t0 / 10) * 10;
+    split_150k(&c, t0, "{}").await;
+    for n in [1, 2] {
+        let got = c
+            .engine(n)
+            .await
+            .exemplars(&no_tenant(), &[selected()], window_150k(t0))
+            .await
+            .unwrap_or_else(|e| panic!("K3 through shard {n}: {e}"));
+        let kept = kept_by_s(&got);
+        assert_eq!(kept.len(), 15_000, "K3 through shard {n}");
+        assert!(
+            kept == thinned_150k(t0),
+            "K3 through shard {n}: the kept exemplars differ"
+        );
+    }
+    c.finish().await;
+}
+
+/// K3's data: 150,000 exemplars over 150 s from `t0`, row `i` on series
+/// `i mod 3` with value `(7919 i) mod 1000` and labels `labels`, even rows
+/// on shard 1 and odd rows on shard 2 — 75,000 distinct on each, each
+/// under A's per-node row cap.
+async fn split_150k(c: &Cluster, t0: i64, labels: &str) {
     for s in 0..3u128 {
         c.register(1, 100 + s, &format!(r#"{{"job":"sel","s":"{s}"}}"#))
             .await;
@@ -396,12 +460,25 @@ async fn a_thinned_answer_is_thinned_over_both_shards() {
                  trace_id, span_id, labels) \
                  SELECT '', toUInt128(100 + number % 3), {t0} + number, \
                         toFloat64((number * 7919) % 1000), toFixedString('', 16), \
-                        toFixedString('', 8), '{{}}' \
+                        toFixedString('', 8), '{labels}' \
                  FROM numbers(150000) WHERE number % 2 = {parity}"
             ),
         )
         .await;
     }
+    c.sync().await;
+}
+
+fn window_150k(t0: i64) -> DataWindow {
+    DataWindow {
+        start_ms: t0,
+        end_ms: t0 + 149_999,
+    }
+}
+
+/// K3's expectation: per 10 ms slice its highest value, the earliest of
+/// equals, as `(s, time, value bits)`.
+fn thinned_150k(t0: i64) -> BTreeSet<(String, i64, u64)> {
     let mut best: BTreeMap<i64, (i64, i64, f64)> = BTreeMap::new();
     for i in 0..150_000i64 {
         let (s, t, v) = (i % 3, t0 + i, ((i * 7919) % 1000) as f64);
@@ -410,41 +487,168 @@ async fn a_thinned_answer_is_thinned_over_both_shards() {
             *slot = (s, t, v);
         }
     }
-    let want: BTreeSet<(String, i64, u64)> = best
-        .values()
+    best.values()
         .map(|(s, t, v)| (s.to_string(), *t, v.to_bits()))
+        .collect()
+}
+
+/// An answer as `(s, time, value bits)`.
+fn kept_by_s(answer: &[ExemplarSeries]) -> BTreeSet<(String, i64, u64)> {
+    answer
+        .iter()
+        .flat_map(|series| {
+            let s = series
+                .series_labels
+                .iter()
+                .find(|(k, _)| k == "s")
+                .map(|(_, v)| v.clone())
+                .expect("an s label");
+            series
+                .exemplars
+                .iter()
+                .map(move |e| (s.clone(), e.unix_milli, e.value.to_bits()))
+        })
+        .collect()
+}
+
+/// 90,000 distinct exemplars from `t0`, the first 60,000 on shard 1 and
+/// the rest on shard 2, row `i` on series `i mod 3` with value `i`.
+async fn split_90k(c: &Cluster, t0: i64, labels: &str) {
+    for s in 0..3u128 {
+        c.register(1, 100 + s, &format!(r#"{{"job":"sel","s":"{s}"}}"#))
+            .await;
+    }
+    for (n, range) in [(1u8, "number < 60000"), (2u8, "number >= 60000")] {
+        exec(
+            c.shard(n),
+            &format!(
+                "INSERT INTO metric_exemplars (org_id, fingerprint, unix_milli, value, \
+                 trace_id, span_id, labels) \
+                 SELECT '', toUInt128(100 + number % 3), {t0} + number, toFloat64(number), \
+                        toFixedString('', 16), toFixedString('', 8), '{labels}' \
+                 FROM numbers(90000) WHERE {range}"
+            ),
+        )
+        .await;
+    }
+    c.sync().await;
+}
+
+/// K6: 90,000 distinct exemplars, 60,000 on shard 1 and 30,000 on shard
+/// 2, are answered whole through either shard: under the cap, not thinned.
+#[tokio::test(flavor = "multi_thread")]
+async fn under_the_cap_split_unevenly_is_answered_whole() {
+    skip_unless_live!();
+    let c = Cluster::new(pulsus_testkit::test_db("pulsus_exemplars_k6")).await;
+    let t0 = c.t0;
+    split_90k(&c, t0, "{}").await;
+    let want: BTreeSet<(String, i64, u64)> = (0..90_000i64)
+        .map(|i| ((i % 3).to_string(), t0 + i, (i as f64).to_bits()))
         .collect();
-    let window = DataWindow {
-        start_ms: t0,
-        end_ms: t0 + 149_999,
-    };
     for n in [1, 2] {
         let got = c
             .engine(n)
             .await
-            .exemplars(&no_tenant(), &[selected()], window)
+            .exemplars(&no_tenant(), &[selected()], c.window())
             .await
-            .unwrap_or_else(|e| panic!("K3 through shard {n}: {e}"));
-        let kept: BTreeSet<(String, i64, u64)> = got
-            .iter()
-            .flat_map(|series| {
-                let s = series
-                    .series_labels
-                    .iter()
-                    .find(|(k, _)| k == "s")
-                    .map(|(_, v)| v.clone())
-                    .expect("an s label");
-                series
-                    .exemplars
-                    .iter()
-                    .map(move |e| (s.clone(), e.unix_milli, e.value.to_bits()))
-            })
-            .collect();
-        assert_eq!(kept.len(), 15_000, "K3 through shard {n}");
-        assert!(
-            kept == want,
-            "K3 through shard {n}: the kept exemplars differ"
+            .unwrap_or_else(|e| panic!("K6 through shard {n}: {e}"));
+        let kept = kept_by_s(&got);
+        assert_eq!(kept.len(), 90_000, "K6 through shard {n}");
+        assert!(kept == want, "K6 through shard {n}: the answer differs");
+    }
+    c.finish().await;
+}
+
+/// K7: K3's split, 75,000 distinct on each shard and so under each node's
+/// row cap, merges to more than 100,000 — the answer is T's 15,000 through
+/// either shard, never A's first 100,000.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_merge_past_the_cap_is_thinned_not_cut() {
+    skip_unless_live!();
+    let c = Cluster::new(pulsus_testkit::test_db("pulsus_exemplars_k7")).await;
+    let t0 = (c.t0 / 10) * 10;
+    split_150k(&c, t0, "{}").await;
+    for n in [1, 2] {
+        let got = c
+            .engine(n)
+            .await
+            .exemplars(&no_tenant(), &[selected()], window_150k(t0))
+            .await
+            .unwrap_or_else(|e| panic!("K7 through shard {n}: {e}"));
+        let count: usize = got.iter().map(|s| s.exemplars.len()).sum();
+        assert_ne!(
+            count, 100_000,
+            "K7 through shard {n}: A's rows cut at its limit"
         );
+        assert_eq!(
+            count, 15_000,
+            "K7 through shard {n}: one exemplar per slice"
+        );
+        assert!(
+            kept_by_s(&got) == thinned_150k(t0),
+            "K7 through shard {n}: the kept exemplars differ"
+        );
+    }
+    c.finish().await;
+}
+
+/// The labels K8 stores on every exemplar: `L` = 200.
+const WIDE_LABELS: &str = concat!(
+    "{\"k\":\"",
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "\"}"
+);
+
+/// K8: K3's split with 200 bytes of labels on every exemplar, at a 60 MiB
+/// budget. A's provisional rows pass the budget long before its 100,001st
+/// row, so a drain that refused there would refuse; it keeps counting and
+/// the answer is T's 15,000 through either shard. 90,000 such exemplars,
+/// 60,000 + 30,000, end A at or under the cap past the budget: the byte
+/// refusal.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_byte_overflow_before_the_sentinel_still_reaches_the_thinned_answer() {
+    skip_unless_live!();
+    assert_eq!(WIDE_LABELS.len(), 200);
+    let budget = 60 * 1024 * 1024;
+    let c = Cluster::new(pulsus_testkit::test_db("pulsus_exemplars_k8")).await;
+    let t0 = (c.t0 / 10) * 10;
+    split_150k(&c, t0, WIDE_LABELS).await;
+    for n in [1, 2] {
+        let got = c
+            .engine(n)
+            .await
+            .with_exemplar_answer_bytes(budget)
+            .exemplars(&no_tenant(), &[selected()], window_150k(t0))
+            .await
+            .unwrap_or_else(|e| panic!("K8 through shard {n}: {e}"));
+        let kept = kept_by_s(&got);
+        assert_eq!(kept.len(), 15_000, "K8 through shard {n}");
+        assert!(
+            kept == thinned_150k(t0),
+            "K8 through shard {n}: the kept exemplars differ"
+        );
+    }
+    c.finish().await;
+    let c = Cluster::new(pulsus_testkit::test_db("pulsus_exemplars_k8b")).await;
+    let t0 = c.t0;
+    split_90k(&c, t0, WIDE_LABELS).await;
+    for n in [1, 2] {
+        let got = c
+            .engine(n)
+            .await
+            .with_exemplar_answer_bytes(budget)
+            .exemplars(&no_tenant(), &[selected()], c.window())
+            .await;
+        match got {
+            Err(ReadError::QueryTooBroad(TooBroadReason::ExemplarAnswerBytes { budget_bytes })) => {
+                assert_eq!(budget_bytes, budget as u64, "K8 through shard {n}")
+            }
+            other => panic!(
+                "K8 through shard {n}: 90,000 past the budget must be refused, got {:?}",
+                other.map(|a| a.iter().map(|s| s.exemplars.len()).sum::<usize>())
+            ),
+        }
     }
     c.finish().await;
 }
@@ -523,6 +727,7 @@ async fn distinct_exemplars_stored_on_both_shards_are_answered_whole() {
         )
         .await;
     }
+    c.sync().await;
     for n in [1, 2] {
         let got = c
             .engine(n)

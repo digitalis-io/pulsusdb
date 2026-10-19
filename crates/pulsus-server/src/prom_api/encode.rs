@@ -1977,91 +1977,97 @@ mod tests {
         );
     }
 
-    /// U3f: an encoded answer is never longer than what its rows were
-    /// charged, at the longest value form, the widest timestamps, both
-    /// ids, a label value of control characters and a series name of them.
+    /// U3f (issue #501 part 2, r8): per row, the bytes its object and
+    /// separator add to the body are at most its `_json` half — an
+    /// exemplar with labels `{}`, both ids, the longest value and the
+    /// widest timestamp, which needs the fixed 464; the other extreme
+    /// values; labels of 1,000 control characters; a series named with 100
+    /// control characters, which needs the factor 6 — and the whole body is
+    /// at most the sum of the `_json` halves and the envelope's 64.
     #[tokio::test]
-    async fn an_encoded_answer_is_never_longer_than_its_charge() {
+    async fn each_rows_json_is_never_longer_than_its_json_charge() {
         use pulsus_model::Fingerprint;
         use pulsus_read::metrics::exemplars::{
-            ENVELOPE_CHARGE, assemble, exemplar_row_charge, keep_exemplar, keep_series,
-            series_row_charge,
+            ENVELOPE_CHARGE, assemble, exemplar_row_json, keep_exemplar, keep_series,
+            series_row_json,
         };
         use pulsus_read::metrics::rows::{ExemplarRow, ExemplarSeriesRow};
-        let controls: String = (0..1_000u32)
-            .map(|i| char::from_u32(1 + i % 31).expect("a control character"))
-            .collect();
-        let wide_labels =
-            serde_json::to_string(&serde_json::json!({ "k": controls })).expect("canonical labels");
-        let name: String = (0..100u32)
-            .map(|i| char::from_u32(1 + i % 31).expect("a control character"))
-            .collect();
+        let controls = |n: u32| -> String {
+            (0..n)
+                .map(|i| char::from_u32(1 + i % 31).expect("a control character"))
+                .collect()
+        };
+        let wide_labels = serde_json::to_string(&serde_json::json!({ "k": controls(1_000) }))
+            .expect("canonical labels");
         // The largest subnormal, 2.2250738585072009e-308.
         let largest_subnormal = f64::from_bits(0x000F_FFFF_FFFF_FFFF);
-        let values = [-5e-324, largest_subnormal, f64::MAX, f64::NAN];
-        let mut rows = Vec::new();
-        for (i, v) in values.iter().enumerate() {
-            for (j, ms) in [0i64, 4_294_967_295_999].iter().enumerate() {
-                for (k, labels) in ["{}".to_string(), wide_labels.clone()].iter().enumerate() {
-                    rows.push(ExemplarRow {
-                        fingerprint: Fingerprint::from_raw((i % 2) as u128 + 1),
-                        unix_milli: *ms + (i * 4 + j * 2 + k) as i64,
-                        value: *v,
-                        trace_id: [0xab; 16],
-                        span_id: [0xcd; 8],
-                        labels: labels.clone(),
-                    });
-                }
-            }
-        }
+        let row = |value: f64, labels: &str| ExemplarRow {
+            fingerprint: Fingerprint::from_raw(1),
+            unix_milli: 4_294_967_295_999,
+            value,
+            trace_id: [0xab; 16],
+            span_id: [0xcd; 8],
+            labels: labels.to_string(),
+        };
+        let rows = vec![
+            row(-5e-324, "{}"),
+            row(largest_subnormal, "{}"),
+            row(f64::MAX, "{}"),
+            row(f64::NAN, "{}"),
+            row(-5e-324, &wide_labels),
+        ];
         let series = vec![
             ExemplarSeriesRow {
                 fingerprint: Fingerprint::from_raw(1),
-                series_name: name.clone(),
-                series_labels: wide_labels.clone(),
+                series_name: controls(100),
+                series_labels: "{}".to_string(),
             },
             ExemplarSeriesRow {
                 fingerprint: Fingerprint::from_raw(2),
-                series_name: name,
-                series_labels: "{}".to_string(),
+                series_name: "m".to_string(),
+                series_labels: wide_labels.clone(),
             },
         ];
-        let charged: usize = ENVELOPE_CHARGE
-            + rows.iter().map(exemplar_row_charge).sum::<usize>()
-            + series.iter().map(series_row_charge).sum::<usize>();
-        let n = rows.len();
-        // Each row alone, beside the smallest series, and each series alone
-        // with the smallest exemplar: in one answer, the wide rows' slack
-        // would cover a narrow row's shortfall.
-        let small_series = |fp: Fingerprint| ExemplarSeriesRow {
-            fingerprint: fp,
-            series_name: "m".to_string(),
-            series_labels: "{}".to_string(),
+        let body_len = |answer: Vec<ExemplarSeries>| async move {
+            body_string(query_exemplars_response(Some(answer)))
+                .await
+                .len()
         };
-        let small_row = |fp: Fingerprint| ExemplarRow {
-            fingerprint: fp,
-            unix_milli: 0,
-            value: 0.0,
-            trace_id: [0; 16],
-            span_id: [0; 8],
-            labels: "{}".to_string(),
+        let host = || ExemplarSeries {
+            series_labels: vec![("__name__".to_string(), "m".to_string())],
+            exemplars: Vec::new(),
         };
-        let pairs_alone = rows
-            .iter()
-            .map(|r| (r.clone(), small_series(r.fingerprint)))
-            .chain(series.iter().map(|s| (small_row(s.fingerprint), s.clone())))
-            .collect::<Vec<_>>();
-        for (row, series_row) in pairs_alone {
-            let charged =
-                ENVELOPE_CHARGE + exemplar_row_charge(&row) + series_row_charge(&series_row);
-            let answer = assemble(vec![keep_exemplar(row)], vec![keep_series(series_row)]);
-            let body = body_string(query_exemplars_response(Some(answer))).await;
+        let bare = body_len(vec![host()]).await;
+        for r in &rows {
+            let mut one = host();
+            one.exemplars.push(keep_exemplar(r.clone()).1);
+            let bytes = body_len(vec![one]).await - bare + 1;
             assert!(
-                body.len() <= charged,
-                "alone, the body is {} bytes against a charge of {charged}: {body}",
-                body.len()
+                bytes <= exemplar_row_json(r),
+                "an exemplar takes {bytes} bytes against its json charge of {}: {r:?}",
+                exemplar_row_json(r)
             );
         }
+        let empty = body_len(Vec::new()).await;
+        for s in &series {
+            let (_, series_labels) = keep_series(s.clone());
+            let bytes = body_len(vec![ExemplarSeries {
+                series_labels,
+                exemplars: Vec::new(),
+            }])
+            .await
+                - empty
+                + 1;
+            assert!(
+                bytes <= series_row_json(s),
+                "a series takes {bytes} bytes against its json charge of {}",
+                series_row_json(s)
+            );
+        }
+        let charged = ENVELOPE_CHARGE
+            + rows.iter().map(exemplar_row_json).sum::<usize>()
+            + series.iter().map(series_row_json).sum::<usize>();
+        let n = rows.len();
         let answer = assemble(
             rows.into_iter().map(keep_exemplar).collect(),
             series.into_iter().map(keep_series).collect(),
@@ -2077,7 +2083,7 @@ mod tests {
         assert_eq!(kept, n, "every row is in the answer");
         assert!(
             body.len() <= charged,
-            "the body is {} bytes against a charge of {charged}",
+            "the body is {} bytes against a json charge of {charged}",
             body.len()
         );
         assert_eq!(quoted_value(-5e-324).len(), 329);

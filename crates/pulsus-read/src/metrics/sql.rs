@@ -2147,7 +2147,7 @@ WHERE org_id = 'tenant-q'
                      \x20 AND ({sel})\n\
                      GROUP BY fingerprint, unix_milli, value, trace_id, span_id, labels\n\
                      ORDER BY fingerprint, unix_milli, value, trace_id, span_id, labels\n\
-                     LIMIT 100000"
+                     LIMIT 100001"
                 ),
                 "A, distributed {distributed}"
             );
