@@ -141,7 +141,7 @@ pub(crate) fn release_then_wait_for_b(
     }
 }
 
-/// Waits, in real time, until B is filed, then asserts that no insert started
+/// Waits, on the wall clock, until B is filed, then asserts that no insert started
 /// for it and that it was filed never sent.
 pub(crate) async fn assert_b_filed_never_sent(
     inserter: &ParkingInserter,
