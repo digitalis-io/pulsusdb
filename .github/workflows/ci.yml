@@ -3010,3 +3010,39 @@ jobs:
       - name: Tear down the cluster
         if: always()
         run: docker compose -f ci/bench-cluster/compose.yaml down -v
+
+  # Issue #600: every corpus and `catalogue-extra.tsv` query through the
+  # shipped route, each search answer compared with the independent
+  # interpreter. Scheduled or dispatched, not required.
+  traceql-catalogue:
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93.0"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "workspace"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # The digest is `schema-it-traceql`'s, for the reason given there.
+      - name: Start ClickHouse 26.8
+        run: |
+          docker run -d --name pulsus-ch-catalogue -p 19123:8123 \
+            -v "$GITHUB_WORKSPACE"/ci/clickhouse-cluster/users.d/network.xml:/etc/clickhouse-server/users.d/zz-network.xml:ro \
+            clickhouse/clickhouse-server@sha256:d3fd302416d9523d5d64239d5713d1c16c20ecea2045ac70d7e941b376cb266e
+          for _ in $(seq 1 30); do
+            curl -sf http://localhost:19123/ping && break
+            sleep 1
+          done
+
+      - name: Build pulsusdb and xtask
+        run: cargo build -p pulsus-server --bin pulsusdb -p xtask --bin xtask
+
+      - name: The catalogue against the shipped compiler (T-C8, T-Q2)
+        run: sh docs/TraceQL/measure/catalogue.sh localhost 19123 catalogue "$RUNNER_TEMP/catalogue" target/debug

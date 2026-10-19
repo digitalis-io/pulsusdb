@@ -40,5 +40,7 @@ pulsus-re2 = { path = "../crates/pulsus-re2" }
 pulsus-model = { path = "../crates/pulsus-model" }
 pulsus-logql = { path = "../crates/pulsus-logql" }
 pulsus-read = { path = "../crates/pulsus-read" }
+pulsus-traceql = { path = "../crates/pulsus-traceql" }
+pulsus-config = { path = "../crates/pulsus-config" }
 pulsus-schema = { path = "../crates/pulsus-schema" }
 pulsus-schema-testkit = { path = "../crates/pulsus-schema-testkit" }
