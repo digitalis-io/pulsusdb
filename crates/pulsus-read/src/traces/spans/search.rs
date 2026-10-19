@@ -1752,4 +1752,49 @@ mod charge_tests {
             Err(crate::logql::error::ReadError::QueryTooBroad(_))
         ));
     }
+
+    /// Issue #600 part 2, D11: a child-count read nests a read of `spans`
+    /// inside one, as the numbering and a structural operator do, so a
+    /// clustered statement holding one is issued with `'local'`.
+    #[test]
+    fn a_child_count_statement_nests_reads() {
+        let w = WindowSql::start_closed_end_open(1_000_000_000_000, 2_000_000_000_000);
+        let ctx = PredicateCtx {
+            window: w,
+            spans_table: "spans",
+            resources_table: "resources",
+            indexed: &[],
+        };
+        let nests = |query: &str| {
+            let q = pulsus_traceql::parse(query).expect("parses");
+            compile_search(&q, &ctx, "spans", "traces", 20, 3)
+                .expect("compiles")
+                .nests_reads()
+        };
+        let got: Vec<(&str, bool)> = [
+            "{ span:childCount > 2 }",
+            r#"{ span:childCount > 0 || name = "x" }"#,
+            r#"{ trace:rootService = "x" || span:childCount > 0 }"#,
+            "{ nestedSetLeft > 0 }",
+            "{ } > { }",
+            r#"{ name = "x" }"#,
+        ]
+        .into_iter()
+        .map(|q| (q, nests(q)))
+        .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("{ span:childCount > 2 }", true),
+                (r#"{ span:childCount > 0 || name = "x" }"#, true),
+                (
+                    r#"{ trace:rootService = "x" || span:childCount > 0 }"#,
+                    true
+                ),
+                ("{ nestedSetLeft > 0 }", true),
+                ("{ } > { }", true),
+                (r#"{ name = "x" }"#, false),
+            ]
+        );
+    }
 }

@@ -54,10 +54,19 @@ macro_rules! skip_unless_live {
     };
 }
 
+/// A shard's connection: its host from `host_env`, its HTTP port from the
+/// same name with `_HOST` replaced by `_HTTP_PORT`; CI reaches each node on
+/// its fixture address at the server's own port, a local copy on mapped ones.
 fn shard_config(host_env: &str, default_host: &str, database: &str) -> ChConnConfig {
+    let port_env = host_env.replace("_HOST", "_HTTP_PORT");
     ChConnConfig {
         server: std::env::var(host_env).unwrap_or_else(|_| default_host.to_string()),
-        http_port: 8123,
+        http_port: std::env::var(&port_env)
+            .map(|p| {
+                p.parse()
+                    .unwrap_or_else(|_| panic!("{port_env}: a port, got {p:?}"))
+            })
+            .unwrap_or(8123),
         database: database.to_string(),
         proto: ChProto::Http,
         pool_size: 8,
@@ -445,6 +454,9 @@ async fn a_numbered_search_answers_over_two_shards() {
         ),
         ("{ } | by(trace:duration)", "{103ms [01, 02, 03, 04]}"),
         ("{ duration * 2 > trace:duration }", "[01, 02, 03, 04]"),
+        // Issue #600 part 2: a child-count filter reads `spans_dist` inside
+        // `spans_dist`, sent shard-local as the numbering is.
+        ("{ span:childCount > 0 }", "[01, 02]"),
     ] {
         let want = (0x10..=0x23u8)
             .rev()
