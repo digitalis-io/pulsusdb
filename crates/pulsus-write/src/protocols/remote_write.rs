@@ -4148,6 +4148,12 @@ mod tests {
         for _ in 0..MAX_EXEMPLARS_PER_SERIES + 8 {
             ts_payload.extend_from_slice(&field_ld(3, &[]));
         }
+        let direct = TimeSeries::decode(ts_payload.as_slice()).expect("one series");
+        assert_eq!(
+            direct.exemplars.len(),
+            MAX_EXEMPLARS_PER_SERIES + 1,
+            "a direct TimeSeries::decode stops at the cap plus one"
+        );
         let body = field_ld(1, &ts_payload);
         let err = refused(&body);
         assert!(
