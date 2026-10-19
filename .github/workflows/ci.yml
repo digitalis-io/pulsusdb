@@ -2717,6 +2717,9 @@ jobs:
   # the ~10k `full` tier is `e2e-metrics-full` below.
   e2e-single:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
     steps:
       - uses: actions/checkout@v7
 
@@ -2729,7 +2732,15 @@ jobs:
           shared-key: "workspace"
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - uses: docker/setup-buildx-action@v4
+        with:
+          driver-opts: image=ghcr.io/digitalis-io/buildkit@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
 
       - name: Build pulsusdb:e2e
         uses: docker/build-push-action@v7
@@ -2758,6 +2769,9 @@ jobs:
 
   e2e-cluster:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
     steps:
       - uses: actions/checkout@v7
 
@@ -2770,7 +2784,15 @@ jobs:
           shared-key: "workspace"
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - uses: docker/setup-buildx-action@v4
+        with:
+          driver-opts: image=ghcr.io/digitalis-io/buildkit@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
 
       - name: Build pulsusdb:e2e
         uses: docker/build-push-action@v7
@@ -2805,6 +2827,9 @@ jobs:
       matrix:
         variant: [single, cluster]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
     steps:
       - uses: actions/checkout@v7
 
@@ -2816,7 +2841,15 @@ jobs:
         with:
           shared-key: "workspace"
 
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - uses: docker/setup-buildx-action@v4
+        with:
+          driver-opts: image=ghcr.io/digitalis-io/buildkit@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
 
       - name: Build pulsusdb:e2e
         uses: docker/build-push-action@v7
