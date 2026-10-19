@@ -157,24 +157,6 @@ fn metric_writer_with(cfg: WriterConfig, landing: Arc<MockInserter>) -> MetricWr
     MetricWriter::with_landing_inserter(landing, &cfg, pulsus_model::ACTIVITY_BUCKET_MS)
 }
 
-/// Lets a queued landing block reach a worker and settle. An async push
-/// carries no waiter, and a block still queued when the writer shuts down is
-/// never sent, so a case that counts async inserts must wait for the queue to
-/// drain before it shuts the writer down.
-async fn drained(writer: &MetricWriter) {
-    // A sleep, not `yield_now`: on a multi-thread runtime yielding the
-    // calling task does not make another worker's task run, so a yield loop
-    // is a race rather than a wait.
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while std::time::Instant::now() < deadline {
-        if writer.metrics().queue_bytes == 0 {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
-    panic!("the landing queue never drained");
-}
-
 fn metadata_batch(name: &str, metric_type: &str, updated_ns: i64) -> ParsedMetrics {
     ParsedMetrics {
         metadata: vec![MetricMetadata {
@@ -425,10 +407,9 @@ async fn a_push_refused_by_backpressure_leaves_no_claim() {
     };
     assert!(reserved > 0, "a push reserves bytes");
 
-    // A queue that fits one batch and not two, and an age flush that
-    // releases the first batch's bytes shortly afterwards.
+    // A queue that fits one push and not two. The first push's bytes come
+    // back when its insert settles.
     let cfg = WriterConfig {
-        batch_ms: 20,
         batch_bytes: pulsus_config::ByteSize(u64::MAX),
         ingest_queue_bytes: pulsus_config::ByteSize(reserved + reserved / 2),
         ..Default::default()
@@ -457,7 +438,7 @@ async fn a_push_refused_by_backpressure_leaves_no_claim() {
         "the claim taken before the reservation was rolled back"
     );
 
-    // Wait for the age flush to release the first push's bytes.
+    // Wait for the first push's insert to settle and release its bytes.
     for _ in 0..200 {
         if writer.metrics().queue_bytes == 0 {
             break;
@@ -944,7 +925,6 @@ async fn a_descriptor_that_comes_back_within_the_hour_is_already_stored() {
             .expect("queue has room");
         wait.await.expect("the flush settles");
     }
-    drained(&writer).await;
     writer.shutdown(Duration::from_secs(2)).await;
 
     assert_eq!(
@@ -1018,7 +998,6 @@ async fn concurrent_identical_descriptor_bearing_pushes_store_one_copy() {
         "three of the four are suppressed"
     );
 
-    drained(&writer).await;
     writer.shutdown(Duration::from_secs(2)).await;
     assert_eq!(
         landing.rows_of_kind(0),
@@ -1068,7 +1047,6 @@ async fn a_retried_push_carrying_the_same_descriptor_is_still_suppressed() {
             .expect("queue has room");
         wait.await.expect("the flush settles");
     }
-    drained(&writer).await;
     writer.shutdown(Duration::from_secs(2)).await;
 
     assert_eq!(
@@ -1125,7 +1103,6 @@ async fn a_suppressed_push_still_lands_its_descriptor_alone() {
         .expect("queue has room");
     wait.await
         .expect("the suppressed caller gets the original push's outcome, a success");
-    drained(&writer).await;
     writer.shutdown(Duration::from_secs(2)).await;
 
     assert_eq!(

@@ -1182,7 +1182,7 @@ async fn shutdown_files_an_inflight_block_and_a_queued_block_differently() {
 
     let shutdown = {
         let writer = writer.clone();
-        tokio::spawn(async move { writer.shutdown(Duration::from_millis(10)).await })
+        tokio::spawn(async move { writer.shutdown(Duration::ZERO).await })
     };
     let a_answer = a.await;
     let b_answer = b.await;

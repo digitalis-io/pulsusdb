@@ -120,6 +120,16 @@ struct Shared {
     boundary: DrainBoundary,
 }
 
+/// Cancels the drain boundary **before** any field is dropped — the landing
+/// queue's sender and the boundary's own signal among them — so no insert
+/// worker on another thread is authorized an attempt once the writer's
+/// teardown has begun ([`DrainBoundary::cancel`]).
+impl Drop for Shared {
+    fn drop(&mut self) {
+        self.boundary.cancel();
+    }
+}
+
 /// Implements issue #54's `TraceSink` over the generic per-table columnar
 /// writer core. See the module-level docs above.
 pub struct TraceWriter {

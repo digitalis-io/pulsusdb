@@ -299,8 +299,14 @@ pub(crate) fn mint_landing_token(rng: &mut XorShift64) -> String {
 }
 
 /// Spawns one insert worker on the landing queue. Every worker runs the same
-/// loop: take the next block, run it to an ending, repeat; once the shutdown
-/// signal fires, close the queue and settle what is left.
+/// loop: take the next block, run it to an ending through [`run_block`],
+/// repeat. Once the drain is announced — by `DrainBoundary::shutdown`, or by
+/// `DrainBoundary::cancel` when the writer is dropped — the worker closes the
+/// queue and keeps taking blocks until it is empty, so a block still queued at
+/// the announcement has the endings of any other block: committed; filed when
+/// the landing budget is spent, or when an insert error cannot be resent or
+/// the resends are used up; or filed at the deadline — not started once it
+/// has passed, abandoned if in flight when it passes.
 pub(crate) fn spawn_landing_worker<R>(
     ctx: Arc<LandingContext<R>>,
     rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<LandingBlock<R>>>>,
@@ -317,54 +323,28 @@ where
             None => XorShift64::seeded(),
         };
         loop {
-            if watch.is_announced() {
-                drain_queue(&ctx, &rx).await;
-                return;
-            }
-            let taken = {
+            let block = {
                 let mut queue = rx.lock().await;
-                tokio::select! {
-                    block = queue.recv() => Taken::Block(block),
-                    () = watch.until_announced() => Taken::ShuttingDown,
+                if watch.is_announced() {
+                    queue.close();
+                    queue.recv().await
+                } else {
+                    tokio::select! {
+                        block = queue.recv() => block,
+                        () = watch.until_announced() => {
+                            queue.close();
+                            queue.recv().await
+                        }
+                    }
                 }
             };
-            match taken {
-                Taken::Block(Some(block)) => {
-                    run_block(&ctx, block, &mut watch, &mut rng).await;
-                }
-                // Every sender is gone, so nothing more can arrive.
-                Taken::Block(None) => return,
-                Taken::ShuttingDown => {
-                    drain_queue(&ctx, &rx).await;
-                    return;
-                }
+            match block {
+                Some(block) => run_block(&ctx, block, &mut watch, &mut rng).await,
+                // The queue is closed and empty, or every sender is gone.
+                None => return,
             }
         }
     })
-}
-
-enum Taken<R> {
-    Block(Option<LandingBlock<R>>),
-    ShuttingDown,
-}
-
-/// Closes the queue, then settles every block still in it through the
-/// queued-shutdown ending — no attempt ever ran for one of them, so each
-/// gets a fresh fate and is filed as provably not committed. Closing before
-/// draining is what makes the drain terminate.
-async fn drain_queue<R>(
-    ctx: &Arc<LandingContext<R>>,
-    rx: &Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<LandingBlock<R>>>>,
-) where
-    R: ChRow + SpoolEncode + Send + Sync,
-{
-    let mut queue = rx.lock().await;
-    queue.close();
-    while let Some(block) = queue.recv().await {
-        let mut fate = LandingFate::NeverSent(String::new());
-        fate.saw_pre_send(MSG_SHUTDOWN_QUEUED.to_string());
-        settle_block(ctx, block, fate, TerminalCause::ShuttingDown).await;
-    }
 }
 
 /// Runs one block to an ending. Returns only once that block has settled.

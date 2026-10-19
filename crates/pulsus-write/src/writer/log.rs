@@ -137,6 +137,16 @@ struct Shared {
     boundary: DrainBoundary,
 }
 
+/// Cancels the drain boundary **before** any field is dropped — the landing
+/// queue's sender and the boundary's own signal among them — so no insert
+/// worker on another thread is authorized an attempt once the writer's
+/// teardown has begun ([`DrainBoundary::cancel`]).
+impl Drop for Shared {
+    fn drop(&mut self) {
+        self.boundary.cancel();
+    }
+}
+
 /// Implements issue #8's `LogSink` over one landing table. See the
 /// module-level docs above.
 pub struct LogWriter {
@@ -580,8 +590,8 @@ impl LogWriter {
     ///
     /// **A block that reaches here after the queue closed is settled by a task
     /// of this admission's own**, through the same ending a worker gives a
-    /// block still queued at shutdown. Settling needs the spool, which is
-    /// asynchronous, and admission is not.
+    /// block whose attempt the passed shutdown deadline refuses. Settling
+    /// needs the spool, which is asynchronous, and admission is not.
     ///
     /// **Nothing reaches that branch from outside**: the pass this takes is
     /// held for the whole admission, and the drain waits for every pass before
@@ -654,9 +664,10 @@ impl LogWriter {
     /// (`writer::drain`): admission closes and the admissions inside it
     /// finish, the deadline is announced, and every task this writer spawned
     /// is awaited — the insert workers, the suppression ticker and any
-    /// settlement an admission spawned. Each worker closes the queue and
-    /// settles whatever is still in it, which is what makes the drain
-    /// terminate. Idempotent.
+    /// settlement an admission spawned. Each worker closes the queue and runs
+    /// every block still in it to an ending through `run_block` — the endings
+    /// of any block, the shutdown deadline among them — which is what makes
+    /// the drain terminate. Idempotent.
     pub async fn shutdown(&self, deadline: Duration) {
         self.shared.boundary.shutdown(deadline).await;
     }
