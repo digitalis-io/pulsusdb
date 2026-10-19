@@ -1544,14 +1544,16 @@ TTL toDateTime(least(toUInt32(minute) - if(conn_type = '', 240, 0) + (7 * 86400)
 SETTINGS index_granularity = 1024, ttl_only_drop_parts = 1;"#;
 
 /// `service_edges_mv` as the design writes it (part A §3.2), rendered the
-/// same way, with the production row ceiling.
+/// same way, with the production row ceiling. Its `hi` line is the
+/// single-node variant's (`--@single`), which the render strips with the
+/// indentation after the prefix.
 const SERVICE_EDGES_VIEW: &str = r#"CREATE MATERIALIZED VIEW pulsus.service_edges_mv REFRESH EVERY 1 MINUTE APPEND TO pulsus.service_edges
 AS WITH (SELECT arraySort(groupArray(minute)) FROM pulsus.service_edges FINAL WHERE conn_type = '') AS ms,
      ms[arrayFirstIndex(i -> i = length(ms) OR ms[i + 1] - ms[i] != 300, arrayEnumerate(ms))] AS wm,
      toStartOfInterval(now('UTC') - INTERVAL 3 MINUTE, INTERVAL 5 MINUTE) AS ready,
      (SELECT toDateTime(min(toDate(parseDateTimeBestEffort(partition))), 'UTC') FROM system.parts WHERE database = 'pulsus' AND table = 'spans' AND active) AS oldest,
      if(wm = 0, if(oldest = 0, ready - INTERVAL 5 MINUTE, oldest), wm + INTERVAL 1 MINUTE) AS lo,
-     least(ready, lo + INTERVAL 5 MINUTE) AS hi,
+least(ready, lo + INTERVAL 5 MINUTE) AS hi,
      toInt64(toUnixTimestamp(lo)) * 1000000000 AS slo,
      toInt64(toUnixTimestamp(hi)) * 1000000000 AS shi,
      toUInt64(toUnixTimestamp64Milli(now64())) AS v
@@ -1587,7 +1589,7 @@ SETTINGS max_threads = 4, max_memory_usage = 4294967296, max_rows_to_read = 6000
 /// announced for `spans` and `service_edges` pairs an empty range and writes
 /// no marker. Its two lines carry the `--@cluster` prefix, which the render
 /// strips with the indentation after it.
-const SERVICE_EDGES_BARRIER: &str = "(SELECT min(inserts_in_queue = 0 AND (log_pointer > log_max_index OR (log_pointer = 0 AND log_max_index = 0))) FROM system.replicas WHERE database = 'pulsus' AND table IN ('spans', 'service_edges')) AS caught_up,
+const SERVICE_EDGES_BARRIER: &str = "\n(SELECT min(inserts_in_queue = 0 AND (log_pointer > log_max_index OR (log_pointer = 0 AND log_max_index = 0))) FROM system.replicas WHERE database = 'pulsus' AND table IN ('spans', 'service_edges')) AS caught_up,
 if(caught_up, least(ready, lo + INTERVAL 5 MINUTE), lo) AS hi,
 ";
 
@@ -1631,7 +1633,7 @@ fn the_service_edges_statements_are_the_plan_s() {
             "ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/pulsus.service_edges', '{replica}', ver)",
             1,
         );
-    let hi = "     least(ready, lo + INTERVAL 5 MINUTE) AS hi,\n";
+    let hi = "\nleast(ready, lo + INTERVAL 5 MINUTE) AS hi,\n";
     assert!(SERVICE_EDGES_VIEW.contains(hi), "the single-node `hi` line");
     let clustered_view = SERVICE_EDGES_VIEW
         .replacen(

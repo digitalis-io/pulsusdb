@@ -2545,9 +2545,13 @@ fn graph_settings(config: &TraceReadConfig) -> QuerySettings {
     if config.distributed {
         // Issue #599 part A2: with `1` the initiator's own shard runs
         // in-process, `shardNum()` is not folded to a constant there, and
-        // that shard's span read loses its primary-key pruning.
+        // that shard's span read loses its primary-key pruning. Part B:
+        // `in_order` sends a shard's totals and spans read and its marker
+        // fan-out to the same replica unless one is down, so the markers the
+        // read trusts are that replica's own.
         base.set("distributed_product_mode", "local")
             .set("prefer_localhost_replica", 0u64)
+            .set("load_balancing", "in_order")
     } else {
         base
     }

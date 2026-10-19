@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <!--
-  The 2-shard, 1-replica-per-shard cluster the issue #5 CI leg and
-  tests/live_cluster.rs render against. `internal_replication = true`
+  The 2-shard cluster the issue #5 CI leg and tests/live_cluster.rs render
+  against; shard 1 has a second replica, `ch-shard1b` (issue #599 part B). `internal_replication = true`
   because the underlying tables are `Replicated*` (docs/schemas.md §7): the
   Distributed layer must write each block to one replica and let
   replication fan it out, never duplicate via the Distributed layer itself.
@@ -19,6 +19,10 @@
                 <internal_replication>true</internal_replication>
                 <replica>
                     <host>172.28.0.11</host>
+                    <port>9000</port>
+                </replica>
+                <replica>
+                    <host>172.28.0.13</host>
                     <port>9000</port>
                 </replica>
             </shard>

@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<!--
+  Shard 1's second replica (issue #599 part B). See shard1/macros.xml for
+  the full rationale. `<shard>` is shard 1's value, so this node's per-shard
+  replication paths are shard 1's and it joins that shard's replica sets;
+  `<replica>` is its own, cluster-unique. `interserver_http_host` is this
+  node's static `ipv4_address` (compose.yaml, 172.28.0.0/24).
+-->
+<clickhouse>
+    <macros>
+        <shard>1</shard>
+        <replica>ch-shard1b</replica>
+        <cluster>pulsus_test_cluster</cluster>
+    </macros>
+    <interserver_http_host>172.28.0.13</interserver_http_host>
+</clickhouse>
