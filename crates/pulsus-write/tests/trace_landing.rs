@@ -3208,3 +3208,26 @@ async fn w17_the_stored_bucket_set_is_the_traces_own_distinct_span_buckets() {
 
     drop_live_db(&db).await;
 }
+
+/// A landing block still queued when the drain begins is sent while the grace
+/// lasts. On this single-threaded runtime no worker runs between the admission
+/// and the announcement, so the block is provably queued at it.
+#[tokio::test]
+async fn a_trace_block_queued_when_the_drain_begins_is_sent_inside_the_grace() {
+    let root = spool_root("queued-at-drain");
+    let landing: Arc<MockInserter<TraceLandingRow>> = MockInserter::always(Act::Ok);
+    let (writer, _spans, _attrs) = writer_ok_old(&WriterConfig::default(), &root, landing.clone());
+
+    let (parsed, landed) = decode_both(&six_spans());
+    writer
+        .admit(parsed, landed, PushHeaders::default())
+        .expect("queue has room");
+    writer.shutdown(Duration::from_secs(10)).await;
+
+    assert_eq!(landing.call_count(), 1, "the queued landing block is sent");
+    let spooled = std::fs::read_dir(root.join("poison").join(LANDING))
+        .map(|d| d.count())
+        .unwrap_or(0);
+    assert_eq!(spooled, 0, "nothing is filed as never sent");
+    std::fs::remove_dir_all(&root).ok();
+}

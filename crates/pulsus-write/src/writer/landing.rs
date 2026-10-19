@@ -571,6 +571,91 @@ mod tests {
     use super::*;
     use crate::writer::rows::MetricLandingRow;
 
+    /// Counts insert calls and answers each at once.
+    struct CountingInserter(std::sync::atomic::AtomicUsize);
+
+    impl BlockInserter<MetricLandingRow> for CountingInserter {
+        fn insert<'a>(
+            &'a self,
+            _table: &'a str,
+            _rows: &'a [MetricLandingRow],
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ChError>> + Send + 'a>>
+        {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// The boundary is dropped on the worker's own thread, after the worker
+    /// has taken a block off the queue and read no deadline, and before its
+    /// attempt is authorized — the window a writer's teardown can open for a
+    /// worker on another thread. A dropped boundary cancels, so that attempt
+    /// is refused: no insert is started and the block is filed never sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_boundary_dropped_after_a_dequeue_starts_no_insert() {
+        let spool_dir = std::env::temp_dir().join(format!(
+            "pulsus-landing-dropped-boundary-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let mut runtime = WriterRuntime::from_config(&pulsus_config::WriterConfig::default());
+        runtime.spool_dir = spool_dir.clone();
+        let metrics = Arc::new(crate::writer::metrics::WriterMetrics::default());
+        let inserter = Arc::new(CountingInserter(std::sync::atomic::AtomicUsize::new(0)));
+        let ctx = Arc::new(LandingContext {
+            table: Arc::from("metric_landing"),
+            inserter: inserter.clone(),
+            runtime: Arc::new(runtime),
+            table_metrics: Arc::new(TableMetrics::default()),
+            queued_bytes: Arc::new(AtomicU64::new(0)),
+            spool: Arc::new(SpoolWriter::new(spool_dir.clone(), metrics)),
+            on_commit: None,
+            retries: 0,
+            max_rows: 1_000,
+        });
+        let (tx, rx) = mpsc::unbounded_channel();
+        let boundary = crate::writer::drain::DrainBoundary::new();
+        let slot = Arc::new(std::sync::Mutex::new(Some(boundary)));
+        let watch = {
+            let guard = slot.lock().expect("slot");
+            let slot = slot.clone();
+            guard
+                .as_ref()
+                .expect("the boundary")
+                .watch()
+                .with_barrier(move || drop(slot.lock().expect("slot").take()))
+        };
+        tx.send(LandingBlock::seal(
+            Vec::<MetricLandingRow>::new(),
+            0,
+            QuerySettings::new(),
+            ClaimTicket::inert(),
+            None,
+            tokio::time::Instant::now(),
+        ))
+        .unwrap_or_else(|_| panic!("the queue is open"));
+        let worker = spawn_landing_worker(ctx, Arc::new(tokio::sync::Mutex::new(rx)), watch);
+        tokio::time::timeout(Duration::from_secs(10), worker)
+            .await
+            .expect("the worker ends once the cancelled queue is empty")
+            .expect("the worker does not panic");
+
+        assert_eq!(
+            inserter.0.load(Ordering::SeqCst),
+            0,
+            "no insert was started"
+        );
+        let poison = std::fs::read_dir(spool_dir.join("poison").join("metric_landing"))
+            .map(|d| d.count())
+            .unwrap_or(0);
+        assert_eq!(poison, 1, "the block is filed never sent");
+        drop(tx);
+        std::fs::remove_dir_all(&spool_dir).ok();
+    }
+
     /// The fate is a value the loop carries: an ending whose own knowledge
     /// is "this did not send" must not reverse an earlier attempt that may
     /// have sent, or a block that might be stored would be reported as

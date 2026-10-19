@@ -426,7 +426,7 @@ pub(crate) struct DrainWatch {
 impl DrainWatch {
     /// This view with `barrier` attached. See the field.
     #[cfg(test)]
-    fn with_barrier(mut self, barrier: impl FnOnce() + Send + 'static) -> Self {
+    pub(crate) fn with_barrier(mut self, barrier: impl FnOnce() + Send + 'static) -> Self {
         self.barrier = Some(Box::new(barrier));
         self
     }
