@@ -1,6 +1,6 @@
 # The TraceQL query catalogue: the 150 queries the API serves
 
-One row per query the API serves: the 138 of
+**This page is the design renderer's run; since #600 the catalogue compares the shipped compiler instead (`query-catalogue.md`), and the answers here predate the interpreter's corrections.** One row per query the API serves: the 138 of
 `crates/pulsus-traceql/tests/corpus/accept/` and `grafana/`, and the
 12 of `measure/catalogue-extra.tsv`, which are the queries no
 corpus query's rule reaches (`query-catalogue.md` lists them with the rule each

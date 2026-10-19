@@ -1,6 +1,6 @@
 # TraceQL storage and query: functional requirements
 
-**Parts of this document describe the previous trace search engine, which issue #602 part 2c-2b deleted — its test binaries, goldens and benches in part 2c-2b-1, its code and the unit tests inside it in part 2c-2b-2; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** This document says what the trace store must do, in numbers a review can check.
+**Parts of this document describe the previous trace search engine, which issue #602 part 2c-2b deleted — its test binaries, goldens and benches in part 2c-2b-1, its code and the unit tests inside it in part 2c-2b-2; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** **Since #600 `T-C8` and `T-Q2`'s whole-catalogue form are the `traceql-catalogue` CI job, comparing whole answers rather than statement rows, and `T-C9` is a unit test of the search route, where `reject/empty` is no query.** This document says what the trace store must do, in numbers a review can check.
 It is the first of the 7 documents under `docs/TraceQL/`:
 
 | document | subject |
