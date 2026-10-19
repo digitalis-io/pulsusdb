@@ -3250,3 +3250,158 @@ async fn pushed_exemplars_are_answered_on_their_bucket_series() {
     drop_db(&db).await;
     assert_eq!(last, want, "/api/v1/query_exemplars' body");
 }
+
+/// One remote-write body of `series`, snappy-compressed.
+fn remote_write_body_501(
+    series: Vec<pulsus_write::protocols::remote_write::TimeSeries>,
+) -> Vec<u8> {
+    use prost::Message;
+    let req = pulsus_write::protocols::remote_write::WriteRequest {
+        timeseries: series,
+        metadata: vec![],
+    };
+    snap::raw::Encoder::new()
+        .compress_vec(&req.encode_to_vec())
+        .expect("snappy-compress the write")
+}
+
+/// A remote-write series of `labels`, its `samples` and `exemplars`, each
+/// exemplar `(labels, value, ms)`.
+fn series_501(
+    labels: &[(&str, &str)],
+    samples: &[(f64, i64)],
+    exemplars: &[(&[(&str, &str)], f64, i64)],
+) -> pulsus_write::protocols::remote_write::TimeSeries {
+    use pulsus_write::protocols::remote_write::{Exemplar, Label, Sample, TimeSeries};
+    let labels_of = |pairs: &[(&str, &str)]| {
+        pairs
+            .iter()
+            .map(|(name, value)| Label {
+                name: name.to_string(),
+                value: value.to_string(),
+            })
+            .collect::<Vec<_>>()
+    };
+    TimeSeries {
+        labels: labels_of(labels),
+        samples: samples
+            .iter()
+            .map(|(value, timestamp)| Sample {
+                value: *value,
+                timestamp: *timestamp,
+            })
+            .collect(),
+        histograms: vec![],
+        exemplars: exemplars
+            .iter()
+            .map(|(labels, value, timestamp)| Exemplar {
+                labels: labels_of(labels),
+                value: *value,
+                timestamp: *timestamp,
+            })
+            .collect(),
+    }
+}
+
+/// Polls `path` until it answers `want` or 40 s pass; the last body.
+fn poll_until_501(port: u16, path: &str, want: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(40);
+    let mut last = String::new();
+    while Instant::now() < deadline {
+        if let Some((200, body)) = http_get(port, path) {
+            last = body;
+            if last == want {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    last
+}
+
+/// S1 (issue #501 part 3): remote-write exemplars, one on a second
+/// `TimeSeries` of a sampled series with no samples of its own, one whose
+/// upper-case `trace_id` stays a label, come back from
+/// `/api/v1/query_exemplars` on their series.
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_write_exemplars_are_answered_on_their_series() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse to run this test");
+        return;
+    }
+    let db = pulsus_testkit::test_db("pulsus_prom_501_rw_s1");
+    let port: u16 = 31_531;
+    let guard = spawn_prom_server(port, &db, &[]);
+    let t = (now_ms() / 1_000) * 1_000 - 60_000;
+    let lower = "0102030405060708090a0b0c0d0e0f10";
+    let upper = "0102030405060708090A0B0C0D0E0F10";
+    let body = remote_write_body_501(vec![
+        series_501(&[("__name__", "m"), ("job", "a")], &[(1.0, t)], &[]),
+        series_501(
+            &[("__name__", "m"), ("job", "a")],
+            &[],
+            &[(&[("trace_id", lower), ("k", "v")], 0.5, t - 1_000)],
+        ),
+        series_501(
+            &[("__name__", "m"), ("job", "b")],
+            &[(1.0, t)],
+            &[(&[("trace_id", upper)], 2.0, t - 2_000)],
+        ),
+    ]);
+    let status = post_remote_write(port, &body);
+    assert!(
+        (200..300).contains(&status),
+        "the remote write answered {status}"
+    );
+    let path = format!(
+        "/api/v1/query_exemplars?query=m&start={}&end={}",
+        (t - 60_000) / 1_000,
+        (t + 60_000) / 1_000
+    );
+    let want = format!(
+        r#"{{"status":"success","data":[{{"seriesLabels":{{"__name__":"m","job":"a"}},"exemplars":[{{"labels":{{"k":"v","trace_id":"{lower}"}},"value":"0.5","timestamp":{}}}]}},{{"seriesLabels":{{"__name__":"m","job":"b"}},"exemplars":[{{"labels":{{"trace_id":"{upper}"}},"value":"2","timestamp":{}}}]}}]}}"#,
+        (t - 1_000) / 1_000,
+        (t - 2_000) / 1_000
+    );
+    let last = poll_until_501(port, &path, &want);
+    drop(guard);
+    drop_db(&db).await;
+    assert_eq!(last, want, "/api/v1/query_exemplars' body");
+}
+
+/// S2 (issue #501 part 3): a series sent with only an exemplar, never
+/// sampled, is registered by it and answered.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_exemplar_only_series_is_answered() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse to run this test");
+        return;
+    }
+    let db = pulsus_testkit::test_db("pulsus_prom_501_rw_s2");
+    let port: u16 = 31_532;
+    let guard = spawn_prom_server(port, &db, &[]);
+    let t = (now_ms() / 1_000) * 1_000 - 60_000;
+    let body = remote_write_body_501(vec![series_501(
+        &[("__name__", "n"), ("job", "c")],
+        &[],
+        &[(&[("k", "v")], 3.0, t)],
+    )]);
+    let status = post_remote_write(port, &body);
+    assert!(
+        (200..300).contains(&status),
+        "the remote write answered {status}"
+    );
+    let path = format!(
+        "/api/v1/query_exemplars?query=n&start={}&end={}",
+        (t - 60_000) / 1_000,
+        (t + 60_000) / 1_000
+    );
+    let want = format!(
+        r#"{{"status":"success","data":[{{"seriesLabels":{{"__name__":"n","job":"c"}},"exemplars":[{{"labels":{{"k":"v"}},"value":"3","timestamp":{}}}]}}]}}"#,
+        t / 1_000
+    );
+    let last = poll_until_501(port, &path, &want);
+    drop(guard);
+    drop_db(&db).await;
+    assert_eq!(last, want, "/api/v1/query_exemplars' body");
+}
