@@ -517,8 +517,9 @@ struct Split {
     month: u16,
 }
 
-async fn split_fixture(name: &str) -> Split {
-    let db = pulsus_testkit::test_db(name);
+/// `db` is the case's own `pulsus_testkit::test_db(…)`, composed at its call
+/// site so the naming guards can read the literal.
+async fn split_fixture(db: String) -> Split {
     let bootstrap = ChClient::new(shard1_config("default"))
         .await
         .expect("connect shard1 (bootstrap)");
@@ -748,7 +749,7 @@ fn split_selector() -> pulsus_logql::Expr {
 #[tokio::test]
 async fn a_logs_read_answers_completely_over_split_placement_under_a_pruning_profile() {
     skip_unless_live!();
-    let f = split_fixture("pulsus_read_it_logs_cluster_prune").await;
+    let f = split_fixture(pulsus_testkit::test_db("pulsus_read_it_logs_cluster_prune")).await;
     f.land_three_and_five().await;
     let user = f
         .profile_user("prune", "optimize_skip_unused_shards = 1")
@@ -804,7 +805,10 @@ async fn a_logs_read_answers_completely_over_split_placement_under_a_pruning_pro
 #[tokio::test]
 async fn a_logs_aggregate_merges_every_shard_under_a_no_merge_profile() {
     skip_unless_live!();
-    let f = split_fixture("pulsus_read_it_logs_cluster_nomerge").await;
+    let f = split_fixture(pulsus_testkit::test_db(
+        "pulsus_read_it_logs_cluster_nomerge",
+    ))
+    .await;
     f.land_three_and_five().await;
     let user = f
         .profile_user("nomerge", "distributed_group_by_no_merge = 1")
@@ -856,7 +860,7 @@ async fn a_logs_aggregate_merges_every_shard_under_a_no_merge_profile() {
 #[tokio::test]
 async fn a_logs_read_with_a_shard_down_fails_unless_the_option_allows_a_partial_answer() {
     skip_unless_live!();
-    let f = split_fixture("pulsus_read_it_logs_cluster_down").await;
+    let f = split_fixture(pulsus_testkit::test_db("pulsus_read_it_logs_cluster_down")).await;
     f.land_three_and_five().await;
 
     // K1: shard 2 loses `log_samples` alone.
@@ -915,7 +919,10 @@ async fn a_logs_read_with_a_shard_down_fails_unless_the_option_allows_a_partial_
 #[tokio::test]
 async fn a_shard_error_is_not_skipped_under_an_exception_skipping_profile() {
     skip_unless_live!();
-    let f = split_fixture("pulsus_read_it_logs_cluster_shard_error").await;
+    let f = split_fixture(pulsus_testkit::test_db(
+        "pulsus_read_it_logs_cluster_shard_error",
+    ))
+    .await;
     f.land_three_and_five().await;
 
     // K3: shard 2 fails before it sends data.
@@ -986,7 +993,10 @@ async fn a_shard_error_is_not_skipped_under_an_exception_skipping_profile() {
 #[tokio::test]
 async fn a_logs_read_is_not_cut_short_under_a_break_profile() {
     skip_unless_live!();
-    let f = split_fixture("pulsus_read_it_logs_cluster_overflow").await;
+    let f = split_fixture(pulsus_testkit::test_db(
+        "pulsus_read_it_logs_cluster_overflow",
+    ))
+    .await;
     for client in [&f.shard1, &f.shard2] {
         insert_on(
             client,
