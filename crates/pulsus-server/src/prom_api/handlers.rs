@@ -103,8 +103,8 @@ async fn read_form_pairs(
 /// The reference's `MinTime`/`MaxTime` (api.go:951-967) in milliseconds:
 /// a discovery request's or an exemplar request's absent `start` and `end`
 /// (issue #499).
-pub(crate) const DISCOVERY_MIN_MS: i64 = -9_223_309_901_257_974_000;
-pub(crate) const DISCOVERY_MAX_MS: i64 = 9_223_309_901_257_974_999;
+pub(crate) const DISCOVERY_MIN_MS: i64 = pulsus_read::metrics::exemplars::ALL_TIME_START_MS;
+pub(crate) const DISCOVERY_MAX_MS: i64 = pulsus_read::metrics::exemplars::ALL_TIME_END_MS;
 
 /// Parses `start`/`end` for the discovery endpoints. An absent or empty
 /// bound is the reference's own, [`DISCOVERY_MIN_MS`] or
@@ -630,33 +630,46 @@ async fn metadata_impl(
 }
 
 // ---------------------------------------------------------------------
-// GET|POST /api/v1/query_exemplars (empty-success stub, issue #32 scope)
+// GET|POST /api/v1/query_exemplars (issue #501 part 2)
 // ---------------------------------------------------------------------
 
-/// Reads no data, and still refuses an invalid `X-Scope-OrgID` (issue
-/// #635 part 4), as every metrics route does. Its parameters are
-/// validated as the reference validates them (issue #499); the answer is
-/// empty because exemplars are not stored.
-pub(crate) async fn query_exemplars(headers: HeaderMap, RawQuery(raw): RawQuery) -> Response {
-    if let Err(e) = tenant_of(&headers) {
-        return e.into_response();
-    }
-    match exemplars_impl(&params::parse_pairs(raw.as_deref().unwrap_or(""))) {
+/// Refuses an invalid `X-Scope-OrgID` (issue #635 part 4), as every
+/// metrics route does, validates its parameters as the reference does
+/// (issue #499), and answers from the exemplars `metric_exemplars` holds
+/// for every vector selector of `query`.
+pub(crate) async fn query_exemplars(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let tenant = match tenant_of(&headers) {
+        Ok(t) => t,
+        Err(e) => return e.into_response(),
+    };
+    match exemplars_impl(
+        state,
+        &tenant,
+        &params::parse_pairs(raw.as_deref().unwrap_or("")),
+    )
+    .await
+    {
         Ok(res) => res,
         Err(e) => e.into_response(),
     }
 }
 
 pub(crate) async fn query_exemplars_post(
+    State(state): State<AppState>,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Bytes,
 ) -> Response {
-    if let Err(e) = tenant_of(&headers) {
-        return e.into_response();
-    }
+    let tenant = match tenant_of(&headers) {
+        Ok(t) => t,
+        Err(e) => return e.into_response(),
+    };
     match read_form_pairs(&headers, raw.as_deref(), body).await {
-        Ok(pairs) => match exemplars_impl(&pairs) {
+        Ok(pairs) => match exemplars_impl(state, &tenant, &pairs).await {
             Ok(res) => res,
             Err(e) => e.into_response(),
         },
@@ -664,10 +677,16 @@ pub(crate) async fn query_exemplars_post(
     }
 }
 
-/// `/query_exemplars`' validation (issue #499): `start` and `end`, absent
+/// `/query_exemplars` (issues #499, #501 part 2): `start` and `end`, absent
 /// or empty meaning all time, `end` not before `start`, then the query.
-/// No engine call.
-fn exemplars_impl(pairs: &[(String, String)]) -> Result<Response, ApiError> {
+/// A query with no vector selector reads nothing and answers
+/// `{"status":"success"}`; otherwise every selector is a filter, matched
+/// as `/series` matches `match[]`.
+async fn exemplars_impl(
+    state: AppState,
+    tenant: &Tenant,
+    pairs: &[(String, String)],
+) -> Result<Response, ApiError> {
     let start_ms = match params::nonempty(pairs, "start") {
         Some(v) => params::parse_time(v)?,
         None => DISCOVERY_MIN_MS,
@@ -679,8 +698,24 @@ fn exemplars_impl(pairs: &[(String, String)]) -> Result<Response, ApiError> {
     if end_ms < start_ms {
         return Err(ApiError::Param(ParamError::ExemplarsEndBeforeStart));
     }
-    pulsus_promql::parse(params::get(pairs, "query").unwrap_or(""))?;
-    Ok(encode::query_exemplars_response())
+    let expr = pulsus_promql::parse(params::get(pairs, "query").unwrap_or(""))?;
+    let selectors = pulsus_promql::exemplar_selectors(&expr)?;
+    if selectors.is_empty() {
+        return Ok(encode::query_exemplars_response(None));
+    }
+    let filters: Vec<DiscoveryFilter> = selectors
+        .into_iter()
+        .map(|(metric_name, name_matchers, matchers)| DiscoveryFilter {
+            metric_name,
+            name_matchers,
+            matchers,
+        })
+        .collect();
+    let engine = engine_for(&state).await?;
+    let answer = engine
+        .exemplars(tenant, &filters, DataWindow { start_ms, end_ms })
+        .await?;
+    Ok(encode::query_exemplars_response(Some(answer)))
 }
 
 // ---------------------------------------------------------------------
@@ -928,10 +963,13 @@ mod tests {
         assert_eq!(pairs.len(), 17, "extracted (path, method) pairs: {pairs:?}");
         assert_eq!(paths.len(), 12, "extracted paths: {paths:?}");
 
-        // The nine PromQL-reading pairs. Every one parses BEFORE
+        // The eleven PromQL-reading pairs. Every one parses BEFORE
         // `engine_for`, which is why a pool-less state answers 400 here
-        // and 503 on the control leg.
+        // and 503 on the control leg. Issue #501 part 2: `query_exemplars`
+        // reads the store for a query with a selector.
         let reading: BTreeSet<(&str, &str)> = [
+            ("/api/v1/query_exemplars", "GET"),
+            ("/api/v1/query_exemplars", "POST"),
             ("/api/v1/query", "GET"),
             ("/api/v1/query", "POST"),
             ("/api/v1/query_range", "GET"),
@@ -944,7 +982,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        assert_eq!(reading.len(), 9);
+        assert_eq!(reading.len(), 11);
 
         // The eight that never reach the guard. `metadata` and
         // `status/tsdb` call `engine_for` themselves, so hermetically
@@ -960,16 +998,6 @@ mod tests {
         ]
         .into_iter()
         .flat_map(|(path, status)| [(path, "GET"), (path, "POST")].map(|k| (k, status)))
-        .collect();
-
-        // Issue #499: `query_exemplars` parses its `query` and needs no
-        // engine, so an over-deep expression is a 400 and a well-formed
-        // one a 200.
-        let exemplars: BTreeSet<(&str, &str)> = [
-            ("/api/v1/query_exemplars", "GET"),
-            ("/api/v1/query_exemplars", "POST"),
-        ]
-        .into_iter()
         .collect();
 
         let over_deep = every_param(&bin_chain(MAX_EXPR_DEPTH + 1));
@@ -999,14 +1027,6 @@ mod tests {
                     "{path} {method} control leg"
                 );
                 assert_eq!(json["errorType"], "unavailable", "{path} {method}");
-            } else if exemplars.contains(&key) {
-                assert_eq!(status, StatusCode::BAD_REQUEST, "{path} {method}");
-                assert_eq!(
-                    json["error"], "query expression nesting depth 251 exceeds the 250 level limit",
-                    "{path} {method}"
-                );
-                let (status, _, _) = drive(path, method, &well_formed).await;
-                assert_eq!(status, StatusCode::OK, "{path} {method} control leg");
             } else {
                 let want = expected
                     .get(&key)
@@ -1020,9 +1040,7 @@ mod tests {
         let pinned: BTreeMap<(String, &'static str), u16> = pairs
             .iter()
             .map(|(path, method)| {
-                let code = if reading.contains(&(path.as_str(), *method))
-                    || exemplars.contains(&(path.as_str(), *method))
-                {
+                let code = if reading.contains(&(path.as_str(), *method)) {
                     400
                 } else {
                     expected[&(path.as_str(), *method)].as_u16()
@@ -1630,28 +1648,21 @@ mod tests {
         assert_eq!(json["errorType"], "bad_data");
     }
 
+    /// Issue #501 part 2: a query with no selector reads nothing — no
+    /// pool established at all, and the answer is the bare success, with
+    /// no `data`.
     #[tokio::test]
-    async fn query_exemplars_is_an_empty_success_with_no_engine_call() {
-        // No pool established at all — a stub that reached the engine would
-        // 503 instead.
-        let res = query_exemplars(HeaderMap::new(), RawQuery(Some("query=up".to_string()))).await;
-        let (status, json) = status_and_body(res).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["status"], "success");
-        assert_eq!(json["data"], serde_json::json!([]));
+    async fn query_exemplars_without_a_selector_is_a_bare_success_with_no_engine_call() {
+        let (status, json) = get_status("/api/v1/query_exemplars", "query=1").await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json, serde_json::json!({"status": "success"}));
     }
 
     #[tokio::test]
-    async fn query_exemplars_post_is_an_empty_success() {
-        let res = query_exemplars_post(
-            form_headers(),
-            RawQuery(None),
-            Bytes::from_static(b"query=up"),
-        )
-        .await;
-        let (status, json) = status_and_body(res).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["data"], serde_json::json!([]));
+    async fn query_exemplars_post_without_a_selector_is_a_bare_success() {
+        let (status, _, json) = drive("/api/v1/query_exemplars", "POST", "query=1").await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json, serde_json::json!({"status": "success"}));
     }
 
     #[tokio::test]
@@ -2080,8 +2091,8 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{json}");
     }
 
-    /// H7: `/query_exemplars` validates as the reference does, and answers
-    /// empty.
+    /// H7: `/query_exemplars` validates as the reference does, and a query
+    /// with no selector answers the bare success.
     #[tokio::test]
     async fn query_exemplars_validates_its_parameters() {
         let path = "/api/v1/query_exemplars";
@@ -2098,9 +2109,9 @@ mod tests {
             json["error"],
             "end timestamp must not be before start timestamp"
         );
-        let (status, json) = get_status(path, "query=up").await;
+        let (status, json) = get_status(path, "query=1").await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(json, serde_json::json!({"status": "success", "data": []}));
+        assert_eq!(json, serde_json::json!({"status": "success"}));
         let (status, _, json) = drive(path, "POST", "query=up%7B").await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
     }

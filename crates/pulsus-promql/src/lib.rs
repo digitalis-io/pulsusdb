@@ -33,7 +33,7 @@ pub use parser::parse;
 pub use plan::{
     AggOp, BinOp, DEFAULT_LOOKBACK_MS, FillValues, Group, Grouping, Matching, MathFn, OverTimeFn,
     OverTimeParamFn, PlanExpr, PlanParams, QueryPlan, RangeFn, ScalarFn, SelectorId, SelectorSpec,
-    SetOp, plan, series_selector,
+    SetOp, exemplar_selectors, plan, series_selector,
 };
 pub use re2_syntax::re2_pattern_to_rust;
 pub use value::{

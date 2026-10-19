@@ -49,6 +49,7 @@ use pulsus_promql::PromqlError;
 
 use crate::logql::error::{ReadError, TooBroadReason};
 use crate::metrics::exec::SampleBudget;
+use crate::metrics::exemplars::{AnswerBudget, EXEMPLAR_ANSWER_BYTES};
 
 pub(super) use leaf::MetricsDispatch;
 
@@ -192,7 +193,9 @@ impl std::fmt::Debug for MetricsDispatch {
 }
 
 /// **Leaf module — its entire contents are the ClickHouse handle, its
-/// constructor and its one legitimate accessor. Nothing else may be added
+/// constructor and its two legitimate accessors, `fetch_rows_with` and the
+/// exemplar read's `fetch_rows_charged_bytes` (issue #501 part 2), each
+/// mapping both seams. Nothing else may be added
 /// here** (issue #280 review, finding 1): every item inside this module
 /// can reach `client` and could dispatch around
 /// [`map_metrics_read_error`], and every item outside it provably cannot.
@@ -210,7 +213,11 @@ mod leaf {
     use crate::logql::exec::escape_query_placeholders;
     use crate::metrics::exec::SampleBudget;
 
-    use super::{drain_charged, map_metrics_read_error};
+    use super::{
+        Drained, drain_charged, drain_charged_bytes, map_exemplar_read_error,
+        map_metrics_read_error,
+    };
+    use crate::metrics::exemplars::AnswerBudget;
 
     /// The sealed owner of the metrics engine's ClickHouse handle.
     pub(crate) struct MetricsDispatch {
@@ -308,6 +315,50 @@ mod leaf {
                 .map_err(|e| map_metrics_read_error(e, self.read_max_memory_bytes))?;
             drain_charged(stream, budget, self.read_max_memory_bytes).await
         }
+
+        /// [`Self::fetch_rows_with`] for an exemplar statement (issue #501
+        /// part 2): the same text checks and `log_comment`, every error
+        /// through [`super::map_exemplar_read_error`], and each row charged
+        /// to `budget` and converted as it is accepted
+        /// ([`super::drain_charged_bytes`], with A's `sentinel`). The second
+        /// accessor; like the first it hands out the converted rows, never
+        /// the stream.
+        pub(crate) async fn fetch_rows_charged_bytes<R: ChRow, T>(
+            &self,
+            sql: String,
+            settings: &QuerySettings,
+            budget: &mut AnswerBudget,
+            cost: impl Fn(&R) -> usize,
+            convert: impl FnMut(R) -> T,
+            sentinel: Option<usize>,
+        ) -> Result<Drained<T>, ReadError> {
+            let sql = escape_query_placeholders(&sql);
+            if let Err(reason) = crate::querytext::ensure_query_text_fits(&sql) {
+                return Err(ReadError::QueryTooBroad(reason));
+            }
+            let tagged;
+            let settings = match &self.log_comment {
+                Some(c) => {
+                    tagged = settings.clone().set("log_comment", c.as_str());
+                    &tagged
+                }
+                None => settings,
+            };
+            let stream: ChRowStream<'_, R> = self
+                .client
+                .query_stream::<R>(&sql, settings)
+                .await
+                .map_err(|e| map_exemplar_read_error(e, self.read_max_memory_bytes))?;
+            drain_charged_bytes(
+                stream,
+                budget,
+                cost,
+                convert,
+                sentinel,
+                self.read_max_memory_bytes,
+            )
+            .await
+        }
     }
 }
 
@@ -363,6 +414,108 @@ where
         out.push(row);
     }
     Ok(out)
+}
+
+/// ClickHouse's `TOO_MANY_ROWS_OR_BYTES` and `TOO_MANY_BYTES` (issue #501
+/// part 2): a statement's result passed its `max_result_bytes`. Only the
+/// exemplar statements set that ceiling on the metrics path.
+const CODE_TOO_MANY_ROWS_OR_BYTES: i32 = 396;
+const CODE_TOO_MANY_BYTES: i32 = 307;
+
+/// The exemplar read's `ChError` mapper (issue #501 part 2): the two
+/// result-byte codes are the answer's byte refusal, and every other error
+/// is [`map_metrics_read_error`]'s, which is unchanged — so no other
+/// metrics read can produce the refusal.
+pub(crate) fn map_exemplar_read_error(e: ChError, read_max_memory_bytes: u64) -> ReadError {
+    if let ChError::Server {
+        code: CODE_TOO_MANY_ROWS_OR_BYTES | CODE_TOO_MANY_BYTES,
+        ..
+    } = &e
+    {
+        return ReadError::QueryTooBroad(TooBroadReason::ExemplarAnswerBytes {
+            budget_bytes: EXEMPLAR_ANSWER_BYTES as u64,
+        });
+    }
+    map_metrics_read_error(e, read_max_memory_bytes)
+}
+
+/// What one exemplar statement's drain ends with (issue #501 part 2).
+#[derive(Debug)]
+pub(crate) enum Drained<T> {
+    /// Every row, each kept as `convert` made it.
+    Rows(Vec<T>),
+    /// The sentinel row arrived: the statement holds more rows than the
+    /// answer may; nothing is kept and nothing stays charged.
+    Sentinel,
+}
+
+/// Drains one exemplar statement's row stream against `budget` (issue #501
+/// part 2): each row is priced, charged, then converted into what the
+/// answer keeps, so no row is held twice and a row whose charge would pass
+/// the cap is refused before it is kept. Both `ChError` seams go through
+/// [`map_exemplar_read_error`]. A parent-module function for
+/// [`drain_charged`]'s reason: it cannot create a stream.
+///
+/// With a `sentinel` (statement A, r8 §3.3), the drain counts rows: the
+/// `sentinel`th row ends it as [`Drained::Sentinel`]. A charge that does
+/// not fit before then drops every kept row and releases its charge, and
+/// the drain goes on counting without keeping; if the stream then ends
+/// short of the sentinel, the answer does not fit and the budget's refusal
+/// is returned. Without one, the first charge that does not fit is the
+/// refusal. On every way out but [`Drained::Rows`], what the drain charged
+/// is released.
+pub(crate) async fn drain_charged_bytes<R, T, S>(
+    mut stream: S,
+    budget: &mut AnswerBudget,
+    cost: impl Fn(&R) -> usize,
+    mut convert: impl FnMut(R) -> T,
+    sentinel: Option<usize>,
+    read_max_memory_bytes: u64,
+) -> Result<Drained<T>, ReadError>
+where
+    S: futures::Stream<Item = Result<R, ChError>> + Unpin,
+{
+    let mut out = Vec::new();
+    let mut charged = 0usize;
+    let mut seen = 0usize;
+    let mut overflow: Option<ReadError> = None;
+    while let Some(row) = stream.next().await {
+        let row = match row {
+            Ok(row) => row,
+            Err(e) => {
+                budget.release(charged);
+                return Err(map_exemplar_read_error(e, read_max_memory_bytes));
+            }
+        };
+        seen += 1;
+        if sentinel.is_some_and(|s| seen >= s) {
+            budget.release(charged);
+            return Ok(Drained::Sentinel);
+        }
+        if overflow.is_some() {
+            continue;
+        }
+        let bytes = cost(&row);
+        match budget.charge(bytes) {
+            Ok(()) => {
+                charged += bytes;
+                out.push(convert(row));
+            }
+            Err(refusal) => {
+                budget.release(charged);
+                if sentinel.is_none() {
+                    return Err(refusal);
+                }
+                charged = 0;
+                out = Vec::new();
+                overflow = Some(refusal);
+            }
+        }
+    }
+    match overflow {
+        Some(refusal) => Err(refusal),
+        None => Ok(Drained::Rows(out)),
+    }
 }
 
 #[cfg(test)]
@@ -804,5 +957,130 @@ mod tests {
                 other => panic!("expected passthrough, got {other:?}"),
             }
         }
+    }
+
+    /// U3e (issue #501 part 2): the exemplar read maps the two result-byte
+    /// codes to its own refusal and every other code as the metrics mapper
+    /// does; the metrics mapper itself still passes them through.
+    #[test]
+    fn only_the_exemplar_reads_map_the_result_byte_codes() {
+        for code in [396, 307] {
+            let e = || ChError::Server {
+                code,
+                message: "DB::Exception: Limit for result exceeded".to_string(),
+            };
+            match map_exemplar_read_error(e(), TEST_READ_MEM) {
+                ReadError::QueryTooBroad(
+                    reason @ TooBroadReason::ExemplarAnswerBytes { budget_bytes },
+                ) => {
+                    assert_eq!(budget_bytes, EXEMPLAR_ANSWER_BYTES as u64, "{code}");
+                    assert_eq!(
+                        reason.to_string(),
+                        "exemplar answer exceeds the 268435456-byte budget — narrow the \
+                         selector or the time range",
+                        "{code}"
+                    );
+                }
+                other => panic!("{code}: expected the exemplar refusal, got {other:?}"),
+            }
+            match map_metrics_read_error(e(), TEST_READ_MEM) {
+                ReadError::Clickhouse(ChError::Server { code: c, .. }) => assert_eq!(c, code),
+                other => panic!("{code}: the metrics mapper must pass it through, got {other:?}"),
+            }
+        }
+        match map_exemplar_read_error(
+            ChError::Server {
+                code: 241,
+                message: "Memory limit (for query) exceeded".to_string(),
+            },
+            TEST_READ_MEM,
+        ) {
+            ReadError::QueryTooBroad(TooBroadReason::PromqlReadMemory { budget_bytes }) => {
+                assert_eq!(budget_bytes, TEST_READ_MEM);
+            }
+            other => panic!("241 must stay the memory refusal, got {other:?}"),
+        }
+    }
+
+    /// Issue #501 part 2, r8 §3.3: A's drain keeps counting past a byte
+    /// overflow. At a budget of 250 and 100 a row, the third row does not
+    /// fit: with a sentinel of 5, five rows still reach the sentinel and
+    /// nothing stays charged; four rows end short of it and are the byte
+    /// refusal, with nothing charged either. Reaching the sentinel with
+    /// every row kept leaves nothing charged as well.
+    #[tokio::test]
+    async fn the_drain_counts_on_past_a_byte_overflow_to_its_sentinel() {
+        let rows = |n: u32| futures::stream::iter((0..n).map(Ok::<u32, ChError>));
+        let mut budget = AnswerBudget::new(250);
+        match drain_charged_bytes(rows(5), &mut budget, |_| 100, |r| r, Some(5), TEST_READ_MEM)
+            .await
+        {
+            Ok(Drained::Sentinel) => {}
+            other => panic!("expected the sentinel, got {other:?}"),
+        }
+        assert!(
+            budget.charge(250).is_ok(),
+            "the sentinel leaves nothing charged"
+        );
+        let mut budget = AnswerBudget::new(250);
+        match drain_charged_bytes(rows(4), &mut budget, |_| 100, |r| r, Some(5), TEST_READ_MEM)
+            .await
+        {
+            Err(ReadError::QueryTooBroad(TooBroadReason::ExemplarAnswerBytes { budget_bytes })) => {
+                assert_eq!(budget_bytes, 250)
+            }
+            other => panic!("expected the byte refusal, got {other:?}"),
+        }
+        assert!(
+            budget.charge(250).is_ok(),
+            "the refusal leaves nothing charged"
+        );
+        // Reaching the sentinel with every row kept releases them too.
+        let mut budget = AnswerBudget::new(1_000);
+        match drain_charged_bytes(rows(5), &mut budget, |_| 100, |r| r, Some(5), TEST_READ_MEM)
+            .await
+        {
+            Ok(Drained::Sentinel) => {}
+            other => panic!("expected the sentinel, got {other:?}"),
+        }
+        assert!(budget.charge(1_000).is_ok(), "the kept rows were released");
+        let mut budget = AnswerBudget::new(250);
+        match drain_charged_bytes(rows(2), &mut budget, |_| 100, |r| r, Some(5), TEST_READ_MEM)
+            .await
+        {
+            Ok(Drained::Rows(kept)) => assert_eq!(kept, vec![0, 1]),
+            other => panic!("expected both rows, got {other:?}"),
+        }
+    }
+
+    /// Issue #501 part 2 (code review r1): A's rows accepted and then a
+    /// node's code 158 — the error reaches the engine, which runs T next on
+    /// the same budget, so everything the drain charged must be given back
+    /// first.
+    #[tokio::test]
+    async fn a_stream_error_after_accepted_rows_releases_their_charge() {
+        let mut items: Vec<Result<u32, ChError>> = (0..3u32).map(Ok).collect();
+        items.push(Err(ChError::Server {
+            code: 158,
+            message: "DB::Exception: Limit for rows to GROUP BY exceeded".to_string(),
+        }));
+        let mut budget = AnswerBudget::new(1_000);
+        match drain_charged_bytes(
+            futures::stream::iter(items),
+            &mut budget,
+            |_| 300,
+            |r| r,
+            Some(100_001),
+            TEST_READ_MEM,
+        )
+        .await
+        {
+            Err(ReadError::Clickhouse(ChError::Server { code: 158, .. })) => {}
+            other => panic!("expected code 158, got {other:?}"),
+        }
+        assert!(
+            budget.charge(1_000).is_ok(),
+            "the three accepted rows' 900 bytes were not given back before T"
+        );
     }
 }

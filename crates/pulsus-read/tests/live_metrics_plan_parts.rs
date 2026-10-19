@@ -228,6 +228,7 @@ fn engine_config(db: &str) -> MetricsConfig {
         labels_table: "metric_labels".to_string(),
         label_index_table: "metric_label_index".to_string(),
         label_values_table: "metric_label_values".to_string(),
+        exemplars_table: "metric_exemplars".to_string(),
         metadata_table: "metric_metadata".to_string(),
         experimental_functions: false,
         max_metric_fanout: 1_000,

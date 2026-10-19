@@ -37,7 +37,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 
 use futures::future::{join, join_all};
-use pulsus_clickhouse::{ChClient, ChRow, QuerySettings};
+use pulsus_clickhouse::{ChClient, ChError, ChRow, QuerySettings};
 use pulsus_model::{Fingerprint, FpLiteral, LabelSet, NativeHistogram, Tenant};
 use pulsus_promql::parser::Expr;
 use pulsus_promql::{
@@ -100,6 +100,9 @@ pub struct MetricsConfig {
     /// **Never** `_dist`-suffixed: it is named locally inside a statement
     /// dispatched with `distributed_product_mode = 'local'`.
     pub label_values_table: String,
+    /// `metric_exemplars` (issue #501 part 2): every stored exemplar,
+    /// `/api/v1/query_exemplars`' table; `_dist`-aware like `series_table`.
+    pub exemplars_table: String,
     /// `metric_metadata` — issue #32's `/api/v1/metadata`
     /// ([`super::sql::metadata_query`]). **Never** `_dist`-suffixed
     /// (docs/schemas.md §2.1: it is a global, unsharded catalog table) —
@@ -534,6 +537,11 @@ pub struct MetricsEngine {
     /// The staleness lookback, milliseconds (issue #499): the request's
     /// `lookback_delta`, or [`DEFAULT_LOOKBACK_MS`].
     lookback_ms: i64,
+    /// TEST SEAM (issue #501 part 2): the byte budget of one exemplar
+    /// answer — [`super::exemplars::EXEMPLAR_ANSWER_BYTES`] in production,
+    /// lowered by [`MetricsEngine::with_exemplar_answer_bytes`] so a suite
+    /// can pass it at a corpus it can afford.
+    exemplar_answer_bytes: usize,
 }
 
 impl MetricsEngine {
@@ -554,6 +562,7 @@ impl MetricsEngine {
             grouped_chunk_size: sample_sql::CHUNK_THRESHOLD,
             pushed_series_steps_cap: super::grouped::PUSHED_SERIES_STEPS_PER_STATEMENT,
             lookback_ms: DEFAULT_LOOKBACK_MS,
+            exemplar_answer_bytes: super::exemplars::EXEMPLAR_ANSWER_BYTES,
         }
     }
 
@@ -2637,6 +2646,130 @@ impl MetricsEngine {
         Ok(out)
     }
 
+    /// `GET|POST /api/v1/query_exemplars` (issue #501 part 2): the stored
+    /// exemplars of the series any of `filters` selects in `window`.
+    ///
+    /// Statement C counts them and finds their window; none is an empty
+    /// answer. A then reads every distinct one in that window. Its
+    /// 100,001st row — more than [`super::exemplars::EXEMPLAR_ANSWER_CAP`]
+    /// merged from shards each under the cap — or a node's code 158 sends
+    /// the request to T, which reads one per slice instead. H hydrates the series labels of the
+    /// rows, one statement per [`super::exemplars::HYDRATION_CHUNK_FINGERPRINTS`]
+    /// IDs, one after another. Every row of A, T and H is charged to one
+    /// [`super::exemplars::EXEMPLAR_ANSWER_BYTES`] budget as it arrives.
+    pub async fn exemplars(
+        &self,
+        tenant: &Tenant,
+        filters: &[DiscoveryFilter],
+        window: DataWindow,
+    ) -> Result<Vec<super::exemplars::ExemplarSeries>, ReadError> {
+        use super::dispatch::Drained;
+        use super::exemplars::{
+            AnswerBudget, ENVELOPE_CHARGE, EXEMPLAR_SENTINEL_ROW, assemble, exemplar_row_charge,
+            hydration_chunks, keep_exemplar, keep_series, series_row_charge, slice_width,
+        };
+        use super::sql::{
+            exemplar_count_query, exemplar_rows_query, exemplar_series_query,
+            exemplar_thinned_query,
+        };
+        let t = self.exemplar_tables();
+        let settings = |statement| {
+            exemplar_settings(
+                statement,
+                self.config.read_max_memory_bytes,
+                self.config.distributed,
+            )
+        };
+        let counts: Vec<super::rows::ExemplarCountRow> = self
+            .fetch_rows_with(
+                exemplar_count_query(tenant, t, filters, window),
+                &settings(ExemplarStatement::Count),
+                None,
+            )
+            .await?;
+        let Some(count) = counts.into_iter().next().filter(|c| c.n > 0) else {
+            return Ok(Vec::new());
+        };
+        let mut budget = AnswerBudget::new(self.exemplar_answer_bytes);
+        budget.charge(ENVELOPE_CHARGE)?;
+        // A's outcome decides the branch (r8 §3.3): at most the cap is the
+        // answer; its sentinel row, or a node's own code 158, sends the
+        // request to T. The drain has released A's charge either way.
+        let a = self
+            .dispatch
+            .fetch_rows_charged_bytes(
+                exemplar_rows_query(tenant, t, filters, window, count.lo, count.hi),
+                &settings(ExemplarStatement::Rows),
+                &mut budget,
+                exemplar_row_charge,
+                keep_exemplar,
+                Some(EXEMPLAR_SENTINEL_ROW),
+            )
+            .await;
+        let rows = match a {
+            Ok(Drained::Rows(rows)) => rows,
+            Ok(Drained::Sentinel)
+            | Err(ReadError::Clickhouse(ChError::Server {
+                code: CODE_TOO_MANY_ROWS,
+                ..
+            })) => {
+                let w = slice_width(window, count.lo, count.hi);
+                match self
+                    .dispatch
+                    .fetch_rows_charged_bytes(
+                        exemplar_thinned_query(tenant, t, filters, window, count.lo, count.hi, w),
+                        &settings(ExemplarStatement::Thinned),
+                        &mut budget,
+                        exemplar_row_charge,
+                        keep_exemplar,
+                        None,
+                    )
+                    .await?
+                {
+                    Drained::Rows(rows) => rows,
+                    Drained::Sentinel => unreachable!("T is drained with no sentinel"),
+                }
+            }
+            Err(e) => return Err(e),
+        };
+        let fps: Vec<Fingerprint> = rows.iter().map(|(fp, _)| *fp).collect();
+        let mut series = Vec::new();
+        for chunk in hydration_chunks(&fps) {
+            match self
+                .dispatch
+                .fetch_rows_charged_bytes(
+                    exemplar_series_query(tenant, t, &chunk),
+                    &settings(ExemplarStatement::Series),
+                    &mut budget,
+                    series_row_charge,
+                    keep_series,
+                    None,
+                )
+                .await?
+            {
+                Drained::Rows(rows) => series.extend(rows),
+                Drained::Sentinel => unreachable!("H is drained with no sentinel"),
+            }
+        }
+        Ok(assemble(rows, series))
+    }
+
+    /// TEST SEAM (issue #501 part 2): the byte budget one exemplar answer
+    /// may keep and write.
+    pub fn with_exemplar_answer_bytes(mut self, bytes: usize) -> Self {
+        self.exemplar_answer_bytes = bytes;
+        self
+    }
+
+    /// Issue #501 part 2: the tables the exemplar statements name.
+    fn exemplar_tables(&self) -> super::sql::ExemplarTables<'_> {
+        super::sql::ExemplarTables {
+            exemplars: &self.config.exemplars_table,
+            ids: self.series_tables(),
+            distributed: self.config.distributed,
+        }
+    }
+
     /// `GET /api/v1/metadata` (issues #32 and #500): every distinct
     /// descriptor of each name, in name, type, help, unit order; the names
     /// are the base family names the writer stored (docs/schemas.md §2.1's
@@ -2760,6 +2893,64 @@ fn series_read_settings(read_max_memory_bytes: u64, distributed: bool) -> QueryS
     } else {
         base
     }
+}
+
+/// The four exemplar statements (issue #501 part 2), for their settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExemplarStatement {
+    /// C, the count and window.
+    Count,
+    /// A, every distinct exemplar, refused past the cap.
+    Rows,
+    /// T, one exemplar per slice.
+    Thinned,
+    /// H, the series labels.
+    Series,
+}
+
+/// ClickHouse's `TOO_MANY_ROWS` (issue #501 part 2): statement A's
+/// `max_rows_to_group_by` refusal on one node, a signal to thin. The limit
+/// is checked by each node over its own groups and not at the merge, so it
+/// bounds memory; the merged count is A's sentinel row.
+const CODE_TOO_MANY_ROWS: i32 = 158;
+
+/// The settings of one exemplar statement (issue #501 part 2): the series
+/// reads' settings ([`series_read_settings`]); when clustered,
+/// `optimize_skip_unused_shards = 0` on all four, and on A and H, which
+/// group by the sharding key's column, `optimize_distributed_group_by_
+/// sharding_key = 0`, so the initiator merges a group stored on two
+/// shards; on A the row cap that decides the branch; on A, T and H the
+/// result byte ceiling and the block size of the byte bound.
+fn exemplar_settings(
+    statement: ExemplarStatement,
+    read_max_memory_bytes: u64,
+    distributed: bool,
+) -> QuerySettings {
+    use super::exemplars::{EXEMPLAR_ANSWER_BYTES, EXEMPLAR_ANSWER_CAP, EXEMPLAR_MAX_BLOCK_ROWS};
+    let mut settings = series_read_settings(read_max_memory_bytes, distributed);
+    if distributed {
+        settings = settings.set("optimize_skip_unused_shards", 0u64);
+    }
+    if statement == ExemplarStatement::Rows {
+        settings = settings
+            .set("max_rows_to_group_by", EXEMPLAR_ANSWER_CAP)
+            .set("group_by_overflow_mode", "throw");
+    }
+    if statement != ExemplarStatement::Count {
+        settings = settings
+            .set("max_result_bytes", EXEMPLAR_ANSWER_BYTES)
+            .set("result_overflow_mode", "throw")
+            .set("max_block_size", EXEMPLAR_MAX_BLOCK_ROWS);
+    }
+    if distributed
+        && matches!(
+            statement,
+            ExemplarStatement::Rows | ExemplarStatement::Series
+        )
+    {
+        settings = settings.set("optimize_distributed_group_by_sharding_key", 0u64);
+    }
+    settings
 }
 
 /// Pure fan-out bound decision for the degraded-cache discovery probe
@@ -4246,6 +4437,73 @@ mod tests {
         assert!(clustered.contains("max_query_size"));
         assert!(clustered.contains("distributed_product_mode"));
         assert!(clustered.contains("local"));
+    }
+
+    /// U2b (issue #501 part 2): each exemplar statement's own settings
+    /// over the series reads' settings.
+    #[test]
+    fn the_exemplar_statements_carry_their_settings() {
+        use ExemplarStatement::{Count, Rows, Series, Thinned};
+        let get = |st, distributed, key: &str| {
+            exemplar_settings(st, TEST_READ_MEM, distributed)
+                .get(key)
+                .map(str::to_string)
+        };
+        let some = |v: &str| Some(v.to_string());
+        for distributed in [false, true] {
+            for st in [Count, Rows, Thinned, Series] {
+                assert_eq!(
+                    get(st, distributed, "max_memory_usage"),
+                    Some(TEST_READ_MEM.to_string()),
+                    "{st:?} {distributed}: the series read settings"
+                );
+                let byte_bound = st != Count;
+                assert_eq!(
+                    get(st, distributed, "max_result_bytes"),
+                    byte_bound.then(|| "268435456".to_string()),
+                    "{st:?} {distributed}"
+                );
+                assert_eq!(
+                    get(st, distributed, "result_overflow_mode"),
+                    byte_bound.then(|| "throw".to_string()),
+                    "{st:?} {distributed}"
+                );
+                if byte_bound {
+                    assert_eq!(get(st, distributed, "max_block_size"), some("4096"));
+                }
+                let capped = st == Rows;
+                assert_eq!(
+                    get(st, distributed, "max_rows_to_group_by"),
+                    capped.then(|| "100000".to_string()),
+                    "{st:?} {distributed}"
+                );
+                assert_eq!(
+                    get(st, distributed, "group_by_overflow_mode"),
+                    capped.then(|| "throw".to_string()),
+                    "{st:?} {distributed}"
+                );
+                let merged = distributed && matches!(st, Rows | Series);
+                assert_eq!(
+                    get(
+                        st,
+                        distributed,
+                        "optimize_distributed_group_by_sharding_key"
+                    ),
+                    merged.then(|| "0".to_string()),
+                    "{st:?} {distributed}"
+                );
+                assert_eq!(
+                    get(st, distributed, "distributed_product_mode"),
+                    distributed.then(|| "local".to_string()),
+                    "{st:?} {distributed}"
+                );
+                assert_eq!(
+                    get(st, distributed, "optimize_skip_unused_shards"),
+                    distributed.then(|| "0".to_string()),
+                    "{st:?} {distributed}"
+                );
+            }
+        }
     }
 
     // --- build_chunk_sqls / fetch_all_concurrently: cross-chunk merge

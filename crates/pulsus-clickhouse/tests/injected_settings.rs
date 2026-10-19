@@ -85,6 +85,9 @@ const INJECTED_SETTINGS: &[&str] = &[
     "max_result_bytes",
     "max_rows_in_distinct",
     "max_rows_in_set",
+    // Issue #501 part 2: the exemplar read's row cap, which decides whether
+    // the answer is thinned.
+    "max_rows_to_group_by",
     "max_rows_to_read",
     "max_threads",
     "min_insert_block_size_bytes",

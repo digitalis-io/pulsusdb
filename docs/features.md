@@ -106,7 +106,7 @@ and for the one performance cliff it introduces.
 | Labels / values | `GET|POST /api/v1/labels`, `GET /api/v1/label/{name}/values` | M2 |
 | Series | `GET|POST /api/v1/series` | M2 |
 | Metadata | `GET /api/v1/metadata` | M2 |
-| Exemplars | `GET|POST /api/v1/query_exemplars` (empty-success stub) | M2 |
+| Exemplars | `GET|POST /api/v1/query_exemplars` (stored exemplars, at most 100,000 an answer; issue #501) | M2 |
 | Status endpoints | `/api/v1/status/buildinfo`, `/config`, `/flags`, `/runtimeinfo`, `/tsdb` | M2 |
 | Downsampling tiers + query routing | automatic; configurable tiers | M3 |
 

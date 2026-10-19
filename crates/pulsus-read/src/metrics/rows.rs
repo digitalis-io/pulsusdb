@@ -44,6 +44,38 @@ pub struct LabelValueRow {
     pub value: String,
 }
 
+/// Issue #501 part 2, statement C: the stored exemplars of the selected
+/// series in the request window, and the earliest and latest of them.
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct ExemplarCountRow {
+    pub n: u64,
+    pub lo: i64,
+    pub hi: i64,
+}
+
+/// Issue #501 part 2, statements A and T: one exemplar as stored —
+/// `trace_id` and `span_id` all zero when the exemplar carried none, and
+/// `labels` the canonical JSON of its filtered attributes.
+#[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
+pub struct ExemplarRow {
+    pub fingerprint: Fingerprint,
+    pub unix_milli: i64,
+    pub value: f64,
+    pub trace_id: [u8; 16],
+    pub span_id: [u8; 8],
+    pub labels: String,
+}
+
+/// Issue #501 part 2, statement H: one series' name and canonical label
+/// JSON. The columns are not named `metric_name` and `labels`, so the
+/// statement's `WHERE` reads the table's own columns, not its aggregates.
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct ExemplarSeriesRow {
+    pub fingerprint: Fingerprint,
+    pub series_name: String,
+    pub series_labels: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
