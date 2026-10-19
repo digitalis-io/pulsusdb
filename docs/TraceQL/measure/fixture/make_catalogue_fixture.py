@@ -79,11 +79,26 @@ span(T2, 5, 4, 'GET /api/orders', 3, 10 * NS + 5 * 10**6, 1 * NS, 'gw', RES_GW,
      [['a', 'i', 1], ['b', 'i', 2], ['http.method', 's', 'GET'], ['http.url', 's', '/api/v3/list']],
      scope=('otel', '1.0'))
 span(T2, 6, 5, 'child', 5, 10 * NS + 10 * 10**6, 500 * 10**6, 'gw', RES_GW,
-     [['c', 'i', 3], ['success', 'b', False]], scope=('otel', '1.0'))
+     [['c', 'i', 3], ['success', 'b', False]], scope=('otel', '1.0'),
+     # two events and two links, so an event or link condition is decided per
+     # element (docs/api.md section 4.2, "Which value a span has"): the first
+     # event is a `retry` with `exception.type = "Timeout"`, the second an
+     # `exception` with `"IOError"`; only the second link is `child_of`
+     events=[(base * NS + 10 * NS + 20 * 10**6, 'retry', [['exception.type', 's', 'Timeout']]),
+             (base * NS + 10 * NS + 30 * 10**6, 'exception', [['exception.type', 's', 'IOError']])],
+     links=[(LINK_TRACE, '0a1b2c3d4e5f6072', [['relation', 's', 'follows_from']]),
+            (LINK_TRACE, LINK_SPAN, [['relation', 's', 'child_of']])])
+# a late span in trace one, after trace five's last: trace one's newest span
+# comes after trace five's, but its newest span with `a = 1` comes before it,
+# which is what tells a trace order taken before the pipeline from one taken after
+span(T1, 9, 1, 'late', 1, 45 * NS, 1 * NS, 'checkout', RES_CHECKOUT, [])
 # trace 3: a span with no attributes at all, and one with only a numeric double
 span(T3, 7, None, 'bare', 1, 20 * NS, 100 * 10**6, 'plain', RES_PLAIN, [])
 span(T3, 8, 7, 'bare child', 4, 20 * NS + 10 * 10**6, 50 * 10**6, 'plain', RES_PLAIN,
      [['a', 'd', 2.5], ['retries', 'i', 5]], status=1)
+# a second parentless span in trace three: two roots share no parent, so they
+# are not siblings (docs/api.md section 4.2, "Structural operators")
+span(T3, 10, None, 'second root', 1, 20 * NS + 30 * 10**6, 10 * 10**6, 'plain', RES_PLAIN, [])
 # trace 4: P -> A2 -> B1 -> A1 and P -> P2 -> {A3, B2}, plus a span whose parent
 # is not stored. A = `.a = 1`, B = `.b = 2`, and P and P2 carry neither, so
 #   child   -> B1        child union   -> A2, B1
