@@ -26,8 +26,10 @@
 //! decoded since issue #140 — the RW-1.0 wire form IS the stored integer
 //! `NativeHistogram` shape (spans + delta-encoded buckets), copied verbatim,
 //! with the wire `ResetHint` mapped GAUGE→`Gauge`, everything else→`Unknown`.
-//! `exemplars` (`TimeSeries` tag 3) and RW-2.0 stay intentionally
-//! undeclared/out of scope: unknown fields are skipped on decode.
+//! Exemplars (`TimeSeries` tag 3) are decoded since issue #501, under a
+//! per-series cap, a per-exemplar label cap, the label aggregate and the
+//! byte budget, and stored on the series they are sent with. RW-2.0 stays
+//! out of scope: unknown fields are skipped on decode.
 //!
 //! Tag layout is pinned by the architect plan and cross-checked against a
 //! real capture from the OpenTelemetry Collector's `prometheusremotewrite`
@@ -47,7 +49,7 @@ use pulsus_model::{
 
 use crate::error::LogsIngestError;
 use crate::ingest::metrics::{
-    HistogramPoint, MetricMetadata, MetricPoint, ParsedMetrics, SeriesRef,
+    ExemplarPoint, HistogramPoint, MetricMetadata, MetricPoint, ParsedMetrics, SeriesRef,
 };
 use crate::protocols::otlp_prescan::MAX_DECODED_BYTES;
 
@@ -256,7 +258,9 @@ impl prost::Message for WriteRequest {
 ///    [`decode`] then rejects the whole request. This closes the
 ///    second-amplification the per-dimension caps cannot catch: many series each
 ///    under [`MAX_LABELS_PER_SERIES`]/[`MAX_SAMPLES_PER_SERIES`] but collectively
-///    over the aggregate.
+///    over the aggregate. An exemplar's labels (issue #501) count in
+///    `total_labels` too, charged per exemplar during the series' decode, as
+///    guard 3 charges histograms.
 /// 3. Three more transient accumulators for native histograms (issue #140),
 ///    `total_histograms`/`total_hist_spans`/`total_hist_buckets` — charged
 ///    **incrementally per histogram DURING each series' decode** via
@@ -314,11 +318,19 @@ fn decoded_histogram_bytes(h: &Histogram) -> usize {
         )
 }
 
-/// Estimated decoded bytes of one series' NON-histogram structs (issue #127):
-/// the `TimeSeries` struct plus its labels and samples. Histograms are charged
-/// separately — incrementally per histogram DURING the series' decode (see
-/// [`BoundedWriteRequest::merge_one_time_series`]) — so the two never double
-/// count.
+/// Estimated decoded bytes of ONE exemplar (issue #501): the `Exemplar`
+/// struct plus its labels, the per-element estimate the series shell uses.
+fn decoded_exemplar_bytes(ex: &Exemplar) -> usize {
+    std::mem::size_of::<Exemplar>()
+        .saturating_add(ex.labels.len().saturating_mul(std::mem::size_of::<Label>()))
+}
+
+/// Estimated decoded bytes of one series' structs other than its histograms
+/// and exemplars (issue #127): the `TimeSeries` struct plus its labels and
+/// samples. Histograms and exemplars are charged separately — incrementally,
+/// one at a time, DURING the series' decode (see
+/// [`BoundedWriteRequest::merge_one_time_series`]) — so none is counted
+/// twice.
 fn decoded_series_shell_bytes(ts: &TimeSeries) -> usize {
     std::mem::size_of::<TimeSeries>()
         .saturating_add(ts.labels.len().saturating_mul(std::mem::size_of::<Label>()))
@@ -343,6 +355,9 @@ fn decoded_request_bytes(timeseries: &[TimeSeries], metadata: &[MetricMetadataPr
         for h in &ts.histograms {
             total = total.saturating_add(decoded_histogram_bytes(h));
         }
+        for ex in &ts.exemplars {
+            total = total.saturating_add(decoded_exemplar_bytes(ex));
+        }
     }
     total
 }
@@ -360,6 +375,9 @@ impl BoundedWriteRequest {
         };
         for ts in &seed.timeseries {
             seed.total_labels = seed.total_labels.saturating_add(ts.labels.len());
+            for ex in &ts.exemplars {
+                seed.total_labels = seed.total_labels.saturating_add(ex.labels.len());
+            }
             seed.total_samples = seed.total_samples.saturating_add(ts.samples.len());
             seed.total_histograms = seed.total_histograms.saturating_add(ts.histograms.len());
             for h in &ts.histograms {
@@ -386,20 +404,26 @@ impl BoundedWriteRequest {
     /// orders of magnitude, so charging them only at the BETWEEN-series
     /// boundary would let one crafted series fully materialize ~82M spans
     /// (or blow the bucket aggregate from a ~5 MB body) before any check
-    /// ran.
+    /// ran. Exemplars (tag 3, issue #501) are charged the same way, for the
+    /// same reason: one series' [`MAX_EXEMPLARS_PER_SERIES`] ×
+    /// ([`MAX_LABELS_PER_EXEMPLAR`] + 1) labels is five times
+    /// [`MAX_TOTAL_LABELS_PER_REQUEST`] — each exemplar's labels go to
+    /// `total_labels` and its bytes to `decoded_bytes` as it decodes.
     ///
     /// Structurally this replicates `prost::encoding::message::merge` for
     /// the submessage (a [`prost::encoding::merge_loop`] over
-    /// `decode_key` + `merge_field`), but interposes on tag 4: once the
-    /// running `total_histograms`/`total_hist_spans`/`total_hist_buckets`
+    /// `decode_key` + `merge_field`), but interposes on tags 3 and 4: once
+    /// the running `total_histograms`/`total_hist_spans`/`total_hist_buckets`
     /// (or the per-series histogram count) exceeds its cap, further
-    /// histograms in THIS series are drained without materializing —
-    /// bounding the fan-out to `≤ aggregate cap + one histogram's per-field
-    /// caps` — and the deferred [`validate_bounds`] re-sum then rejects the
-    /// whole request. All other tags delegate to `TimeSeries::merge_field`
-    /// (which keeps the per-series label/sample/histogram-count drains).
-    /// The scratch totals commit back to `self` only on `Ok`; on a decode
-    /// error the whole request fails anyway.
+    /// histograms in THIS series are drained without materializing; once
+    /// `total_labels`, `decoded_bytes` or the per-series exemplar count
+    /// does, further exemplars are — bounding the fan-out to `≤ aggregate
+    /// cap + one element's per-field caps` — and the deferred
+    /// [`validate_bounds`] re-sum then rejects the whole request. All other
+    /// tags delegate to `TimeSeries::merge_field` (which keeps the
+    /// per-series label/sample drains). The scratch totals commit back to
+    /// `self` only on `Ok`; on a decode error the whole request fails
+    /// anyway.
     fn merge_one_time_series(
         &mut self,
         wire_type: prost::encoding::WireType,
@@ -407,30 +431,54 @@ impl BoundedWriteRequest {
         ctx: prost::encoding::DecodeContext,
     ) -> Result<(), prost::DecodeError> {
         prost::encoding::check_wire_type(prost::encoding::WireType::LengthDelimited, wire_type)?;
-        // (TimeSeries under construction, total_histograms, total_hist_spans,
-        // total_hist_buckets, decoded_bytes) — one tuple so `merge_loop` can
-        // thread every running total through its single `&mut T`.
-        let mut scratch = (
-            TimeSeries::default(),
-            self.total_histograms,
-            self.total_hist_spans,
-            self.total_hist_buckets,
-            self.decoded_bytes,
-        );
-        prost::encoding::merge_loop(
-            &mut scratch,
-            buf,
-            ctx,
-            |(ts, total_histograms, total_hist_spans, total_hist_buckets, decoded_bytes),
-             buf,
-             ctx| {
-                let (tag, wire_type) = prost::encoding::decode_key(buf)?;
-                if tag == 4u32 {
-                    if ts.histograms.len() > MAX_HISTOGRAMS_PER_SERIES
-                        || *total_histograms > MAX_TOTAL_HISTOGRAMS_PER_REQUEST
-                        || *total_hist_spans > MAX_TOTAL_HIST_SPANS_PER_REQUEST
-                        || *total_hist_buckets > MAX_TOTAL_HIST_BUCKETS_PER_REQUEST
-                        || *decoded_bytes > MAX_DECODED_BYTES
+        // One value so `merge_loop` can thread every running total through
+        // its single `&mut T`.
+        let mut scratch = SeriesDecode {
+            ts: TimeSeries::default(),
+            total_labels: self.total_labels,
+            total_histograms: self.total_histograms,
+            total_hist_spans: self.total_hist_spans,
+            total_hist_buckets: self.total_hist_buckets,
+            decoded_bytes: self.decoded_bytes,
+        };
+        prost::encoding::merge_loop(&mut scratch, buf, ctx, |s, buf, ctx| {
+            let (tag, wire_type) = prost::encoding::decode_key(buf)?;
+            match tag {
+                3u32 => {
+                    if s.ts.exemplars.len() > MAX_EXEMPLARS_PER_SERIES
+                        || s.total_labels > MAX_TOTAL_LABELS_PER_REQUEST
+                        || s.decoded_bytes > MAX_DECODED_BYTES
+                    {
+                        // Cap reached: drain this exemplar unmaterialized,
+                        // wire-type-checked like every other drain arm.
+                        prost::encoding::check_wire_type(
+                            prost::encoding::WireType::LengthDelimited,
+                            wire_type,
+                        )?;
+                        prost::encoding::skip_field(wire_type, tag, buf, ctx)
+                    } else {
+                        prost::encoding::message::merge_repeated(
+                            wire_type,
+                            &mut s.ts.exemplars,
+                            buf,
+                            ctx,
+                        )?;
+                        // Charge the just-merged exemplar at once; its own
+                        // labels are capped by `Exemplar::merge_field`.
+                        if let Some(ex) = s.ts.exemplars.last() {
+                            s.total_labels = s.total_labels.saturating_add(ex.labels.len());
+                            s.decoded_bytes =
+                                s.decoded_bytes.saturating_add(decoded_exemplar_bytes(ex));
+                        }
+                        Ok(())
+                    }
+                }
+                4u32 => {
+                    if s.ts.histograms.len() > MAX_HISTOGRAMS_PER_SERIES
+                        || s.total_histograms > MAX_TOTAL_HISTOGRAMS_PER_REQUEST
+                        || s.total_hist_spans > MAX_TOTAL_HIST_SPANS_PER_REQUEST
+                        || s.total_hist_buckets > MAX_TOTAL_HIST_BUCKETS_PER_REQUEST
+                        || s.decoded_bytes > MAX_DECODED_BYTES
                     {
                         // Cap reached (per-series count OR a request-wide
                         // aggregate): drain this histogram WITHOUT
@@ -446,7 +494,7 @@ impl BoundedWriteRequest {
                     } else {
                         prost::encoding::message::merge_repeated(
                             wire_type,
-                            &mut ts.histograms,
+                            &mut s.ts.histograms,
                             buf,
                             ctx,
                         )?;
@@ -457,29 +505,40 @@ impl BoundedWriteRequest {
                         // per-field caps. The byte estimate (issue #127) is
                         // charged at the same site with the same bounded
                         // over-step.
-                        if let Some(h) = ts.histograms.last() {
-                            *total_histograms = total_histograms.saturating_add(1);
-                            *total_hist_spans = total_hist_spans.saturating_add(h.span_count());
-                            *total_hist_buckets =
-                                total_hist_buckets.saturating_add(h.bucket_element_count());
-                            *decoded_bytes =
-                                decoded_bytes.saturating_add(decoded_histogram_bytes(h));
+                        if let Some(h) = s.ts.histograms.last() {
+                            s.total_histograms = s.total_histograms.saturating_add(1);
+                            s.total_hist_spans = s.total_hist_spans.saturating_add(h.span_count());
+                            s.total_hist_buckets = s
+                                .total_hist_buckets
+                                .saturating_add(h.bucket_element_count());
+                            s.decoded_bytes =
+                                s.decoded_bytes.saturating_add(decoded_histogram_bytes(h));
                         }
                         Ok(())
                     }
-                } else {
-                    ts.merge_field(tag, wire_type, buf, ctx)
                 }
-            },
-        )?;
-        let (ts, total_histograms, total_hist_spans, total_hist_buckets, decoded_bytes) = scratch;
-        self.total_histograms = total_histograms;
-        self.total_hist_spans = total_hist_spans;
-        self.total_hist_buckets = total_hist_buckets;
-        self.decoded_bytes = decoded_bytes;
-        self.timeseries.push(ts);
+                _ => s.ts.merge_field(tag, wire_type, buf, ctx),
+            }
+        })?;
+        self.total_labels = scratch.total_labels;
+        self.total_histograms = scratch.total_histograms;
+        self.total_hist_spans = scratch.total_hist_spans;
+        self.total_hist_buckets = scratch.total_hist_buckets;
+        self.decoded_bytes = scratch.decoded_bytes;
+        self.timeseries.push(scratch.ts);
         Ok(())
     }
+}
+
+/// [`BoundedWriteRequest::merge_one_time_series`]' state while one series
+/// decodes: the series so far and the running totals it charges as it goes.
+struct SeriesDecode {
+    ts: TimeSeries,
+    total_labels: usize,
+    total_histograms: usize,
+    total_hist_spans: usize,
+    total_hist_buckets: usize,
+    decoded_bytes: usize,
 }
 
 impl prost::Message for BoundedWriteRequest {
@@ -531,8 +590,8 @@ impl prost::Message for BoundedWriteRequest {
                     // check runs (codex review of issue #140, high finding).
                     self.merge_one_time_series(wire_type, buf, ctx)?;
                     // Charge the just-merged series' labels/samples into the
-                    // aggregates (histogram totals were already charged
-                    // incrementally above). Its own vecs are capped at
+                    // aggregates (histogram and exemplar totals were already
+                    // charged incrementally above). Its own vecs are capped at
                     // `MAX_*_PER_SERIES + 1` by the per-series drains, and a
                     // single series' label/sample fan-out (256 / 100k) sits
                     // far below the 5M aggregates, so charging THOSE at the
@@ -589,17 +648,17 @@ impl prost::Message for BoundedWriteRequest {
     }
 }
 
-/// `prompb.TimeSeries`: `labels` at tag 1, `samples` at tag 2, `histograms`
-/// at tag 4 (issue #140; `exemplars` at tag 3 stays intentionally
-/// undeclared/skipped — out of scope).
+/// `prompb.TimeSeries`: `labels` at tag 1, `samples` at tag 2, `exemplars`
+/// at tag 3 (issue #501), `histograms` at tag 4 (issue #140).
 ///
 /// Like [`WriteRequest`] it does **not** derive `::prost::Message`; a
 /// hand-written impl (below) caps the repeated `labels` field at
 /// [`MAX_LABELS_PER_SERIES`]` + 1`, `samples` at [`MAX_SAMPLES_PER_SERIES`]`
-/// + 1`, and `histograms` at [`MAX_HISTOGRAMS_PER_SERIES`]` + 1` **inside the
-/// decoder** (issue #115), draining excess records without allocating — so a
-/// single series carrying millions of minimal labels/samples/histograms
-/// cannot unpack past the cap. The caps therefore hold whether a series decodes
+/// + 1`, `exemplars` at [`MAX_EXEMPLARS_PER_SERIES`]` + 1` and `histograms`
+/// at [`MAX_HISTOGRAMS_PER_SERIES`]` + 1` **inside the decoder** (issue
+/// #115), draining excess records without allocating — so a single series
+/// carrying millions of minimal labels/samples/exemplars/histograms cannot
+/// unpack past the cap. The caps therefore hold whether a series decodes
 /// via [`BoundedWriteRequest`] (the ingest path) or via a direct
 /// `TimeSeries::decode`/`merge` (all route through this `merge_field`).
 #[derive(Clone, PartialEq, Default, Debug)]
@@ -607,12 +666,14 @@ pub struct TimeSeries {
     pub labels: Vec<Label>,
     pub samples: Vec<Sample>,
     pub histograms: Vec<Histogram>,
+    pub exemplars: Vec<Exemplar>,
 }
 
 impl prost::Message for TimeSeries {
     fn encode_raw(&self, buf: &mut impl bytes::BufMut) {
         prost::encoding::message::encode_repeated(1u32, &self.labels, buf);
         prost::encoding::message::encode_repeated(2u32, &self.samples, buf);
+        prost::encoding::message::encode_repeated(3u32, &self.exemplars, buf);
         prost::encoding::message::encode_repeated(4u32, &self.histograms, buf);
     }
 
@@ -646,6 +707,22 @@ impl prost::Message for TimeSeries {
                     prost::encoding::message::merge_repeated(wire_type, &mut self.samples, buf, ctx)
                 }
             }
+            3u32 => {
+                if self.exemplars.len() > MAX_EXEMPLARS_PER_SERIES {
+                    prost::encoding::check_wire_type(
+                        prost::encoding::WireType::LengthDelimited,
+                        wire_type,
+                    )?;
+                    prost::encoding::skip_field(wire_type, tag, buf, ctx)
+                } else {
+                    prost::encoding::message::merge_repeated(
+                        wire_type,
+                        &mut self.exemplars,
+                        buf,
+                        ctx,
+                    )
+                }
+            }
             4u32 => {
                 if self.histograms.len() > MAX_HISTOGRAMS_PER_SERIES {
                     prost::encoding::check_wire_type(
@@ -669,12 +746,14 @@ impl prost::Message for TimeSeries {
     fn encoded_len(&self) -> usize {
         prost::encoding::message::encoded_len_repeated(1u32, &self.labels)
             + prost::encoding::message::encoded_len_repeated(2u32, &self.samples)
+            + prost::encoding::message::encoded_len_repeated(3u32, &self.exemplars)
             + prost::encoding::message::encoded_len_repeated(4u32, &self.histograms)
     }
 
     fn clear(&mut self) {
         self.labels.clear();
         self.samples.clear();
+        self.exemplars.clear();
         self.histograms.clear();
     }
 }
@@ -696,6 +775,79 @@ pub struct Sample {
     pub value: f64,
     #[prost(int64, tag = "2")]
     pub timestamp: i64,
+}
+
+/// `prompb.Exemplar` (`TimeSeries` tag 3, issue #501): `labels` at tag 1,
+/// `value` (a `double`) at tag 2, `timestamp` (milliseconds since the Unix
+/// epoch) at tag 3.
+///
+/// A hand-written [`prost::Message`] impl, like [`TimeSeries`]': its
+/// `merge_field` caps `labels` at [`MAX_LABELS_PER_EXEMPLAR`]` + 1` during
+/// decode, draining the rest without allocating, and [`validate_bounds`]
+/// turns the `+ 1` into a whole-request refusal. Encoding is the derived
+/// proto3 form: a zero `value` or `timestamp` is not emitted.
+#[derive(Clone, PartialEq, Default, Debug)]
+pub struct Exemplar {
+    pub labels: Vec<Label>,
+    pub value: f64,
+    pub timestamp: i64,
+}
+
+impl prost::Message for Exemplar {
+    fn encode_raw(&self, buf: &mut impl bytes::BufMut) {
+        prost::encoding::message::encode_repeated(1u32, &self.labels, buf);
+        if self.value != 0f64 {
+            prost::encoding::double::encode(2u32, &self.value, buf);
+        }
+        if self.timestamp != 0 {
+            prost::encoding::int64::encode(3u32, &self.timestamp, buf);
+        }
+    }
+
+    fn merge_field(
+        &mut self,
+        tag: u32,
+        wire_type: prost::encoding::WireType,
+        buf: &mut impl bytes::Buf,
+        ctx: prost::encoding::DecodeContext,
+    ) -> Result<(), prost::DecodeError> {
+        match tag {
+            1u32 => {
+                if self.labels.len() > MAX_LABELS_PER_EXEMPLAR {
+                    prost::encoding::check_wire_type(
+                        prost::encoding::WireType::LengthDelimited,
+                        wire_type,
+                    )?;
+                    prost::encoding::skip_field(wire_type, tag, buf, ctx)
+                } else {
+                    prost::encoding::message::merge_repeated(wire_type, &mut self.labels, buf, ctx)
+                }
+            }
+            2u32 => prost::encoding::double::merge(wire_type, &mut self.value, buf, ctx),
+            3u32 => prost::encoding::int64::merge(wire_type, &mut self.timestamp, buf, ctx),
+            _ => prost::encoding::skip_field(wire_type, tag, buf, ctx),
+        }
+    }
+
+    fn encoded_len(&self) -> usize {
+        prost::encoding::message::encoded_len_repeated(1u32, &self.labels)
+            + if self.value != 0f64 {
+                prost::encoding::double::encoded_len(2u32, &self.value)
+            } else {
+                0
+            }
+            + if self.timestamp != 0 {
+                prost::encoding::int64::encoded_len(3u32, &self.timestamp)
+            } else {
+                0
+            }
+    }
+
+    fn clear(&mut self) {
+        self.labels.clear();
+        self.value = 0f64;
+        self.timestamp = 0;
+    }
 }
 
 /// One alternative of the `prompb.Histogram` `count`/`zero_count` protobuf
@@ -1133,6 +1285,14 @@ pub const MAX_METADATA_PER_REQUEST: usize = 10_000;
 /// `max_samples_per_send` default is 2,000 for the whole request), enforced
 /// during decode by [`TimeSeries::merge_field`]'s drain.
 pub const MAX_HISTOGRAMS_PER_SERIES: usize = 10_000;
+/// Per-series cap on decoded exemplars (`TimeSeries` tag 3, issue #501),
+/// [`MAX_SAMPLES_PER_SERIES`]' value, enforced during decode by
+/// [`TimeSeries::merge_field`]'s drain.
+pub const MAX_EXEMPLARS_PER_SERIES: usize = 100_000;
+/// Per-exemplar cap on decoded labels (issue #501),
+/// [`MAX_LABELS_PER_SERIES`]' value, enforced during decode by
+/// [`Exemplar`]'s `merge_field` drain.
+pub const MAX_LABELS_PER_EXEMPLAR: usize = 256;
 /// Cross-series **aggregate** cap on total decoded histograms (issue #140),
 /// analogous to [`MAX_TOTAL_SAMPLES_PER_REQUEST`]: N series each under
 /// [`MAX_HISTOGRAMS_PER_SERIES`] cannot sum past this ceiling during decode
@@ -1265,6 +1425,47 @@ fn charge_budget(expanded_bytes: &mut usize, amount: usize) -> Result<(), LogsIn
     Ok(())
 }
 
+/// What one exemplar costs the expansion budget (issue #501), read from its
+/// wire form so it is charged before anything of it is built: the point
+/// itself, one label slot per label and the labels' text. Allocation-free.
+fn exemplar_charge(ex: &Exemplar) -> usize {
+    ex.labels.iter().fold(
+        std::mem::size_of::<ExemplarPoint>().saturating_add(
+            ex.labels
+                .len()
+                .saturating_mul(std::mem::size_of::<(String, String)>()),
+        ),
+        |acc, l| {
+            acc.saturating_add(l.name.len())
+                .saturating_add(l.value.len())
+        },
+    )
+}
+
+/// The most characters an exemplar's labels, names and values, may come to
+/// before the exemplar is dropped (the reference's `validateExemplar`).
+const MAX_EXEMPLAR_RUNES: usize = 128;
+
+/// The id `value` spells, when it is exactly `2 × N` characters of
+/// `[0-9a-f]` and not all `0`; `None` otherwise, and the value stays a
+/// label. Lowercase only, so a moved id reads back as it was sent.
+fn lowercase_hex_id<const N: usize>(value: &str) -> Option<[u8; N]> {
+    let digits = value.as_bytes();
+    if digits.len() != 2 * N {
+        return None;
+    }
+    let nibble = |d: u8| match d {
+        b'0'..=b'9' => Some(d - b'0'),
+        b'a'..=b'f' => Some(d - b'a' + 10),
+        _ => None,
+    };
+    let mut id = [0u8; N];
+    for (byte, pair) in id.iter_mut().zip(digits.chunks_exact(2)) {
+        *byte = (nibble(pair[0])? << 4) | nibble(pair[1])?;
+    }
+    (id != [0u8; N]).then_some(id)
+}
+
 /// Decodes a (decompressed) `POST /api/v1/write` request body under the
 /// [`MAX_TIMESERIES_PER_REQUEST`]-family structural bounds. `WriteRequest::
 /// decode` routes through the [`BoundedWriteRequest`] twin, so the repeated
@@ -1358,6 +1559,23 @@ fn validate_bounds(req: &WriteRequest) -> Result<(), LogsIngestError> {
             }
             total_hist_spans = total_hist_spans.saturating_add(h.span_count());
             total_hist_buckets = total_hist_buckets.saturating_add(h.bucket_element_count());
+        }
+        if ts.exemplars.len() > MAX_EXEMPLARS_PER_SERIES {
+            return Err(LogsIngestError::OversizeMessage {
+                field: "exemplars",
+                limit: MAX_EXEMPLARS_PER_SERIES,
+                actual: ts.exemplars.len(),
+            });
+        }
+        for ex in &ts.exemplars {
+            if ex.labels.len() > MAX_LABELS_PER_EXEMPLAR {
+                return Err(LogsIngestError::OversizeMessage {
+                    field: "exemplar labels",
+                    limit: MAX_LABELS_PER_EXEMPLAR,
+                    actual: ex.labels.len(),
+                });
+            }
+            total_labels = total_labels.saturating_add(ex.labels.len());
         }
         total_labels = total_labels.saturating_add(ts.labels.len());
         total_samples = total_samples.saturating_add(ts.samples.len());
@@ -1528,7 +1746,8 @@ pub fn parse(req: &WriteRequest, now_ns: i64) -> Result<ParsedMetrics, LogsInges
 
 /// Parses one `TimeSeries`: extracts `__name__`, keeps the remaining labels
 /// verbatim, as sent (issue #495), fingerprints them, and emits one
-/// [`MetricPoint`] per sample plus (if it has >=1 accepted sample) one
+/// [`MetricPoint`] per sample, one [`ExemplarPoint`] per kept exemplar
+/// (issue #501), plus (if it has a sample, histogram or exemplar) one
 /// [`SeriesRef`] for the series.
 ///
 /// A series is dropped, `rejected += sample_count`, when it has no
@@ -1599,12 +1818,13 @@ fn parse_time_series(
     let labels = LabelSet::from_verbatim(rest);
     let fingerprint = series_fingerprint(&metric_name, &labels);
 
-    // A sampleless series (legal on the wire, e.g. a metadata-only push)
-    // registers no `SeriesRef` — the writer derives `metric_series` rows
-    // from `ParsedMetrics::samples`'/`hist_samples`' timestamps, so a series
-    // with zero accepted samples would yield no row anyway (architect plan;
-    // a histograms-only series must register too, issue #140).
-    if (!ts.samples.is_empty() || !ts.histograms.is_empty())
+    // A series with no samples, histograms or exemplars (legal on the wire,
+    // e.g. a metadata-only push) registers no `SeriesRef` — the writer
+    // derives `metric_series` rows from `ParsedMetrics::samples`'/
+    // `hist_samples`'/`exemplars`' timestamps, so it would yield no row
+    // anyway (architect plan; a histograms-only series registers too, issue
+    // #140, and an exemplar-only one, issue #501).
+    if (!ts.samples.is_empty() || !ts.histograms.is_empty() || !ts.exemplars.is_empty())
         && seen_series.insert((Arc::clone(&metric_name), fingerprint))
     {
         out.series.push(SeriesRef {
@@ -1758,6 +1978,56 @@ fn parse_time_series(
             histogram,
         });
     }
+
+    // Issue #501: the series' exemplars, on the series' own fingerprint. A
+    // dropped exemplar changes nothing else: `rejected` counts samples.
+    let histogram = ts.samples.is_empty() && !ts.histograms.is_empty();
+    for ex in &ts.exemplars {
+        charge_budget(expanded_bytes, exemplar_charge(ex))?;
+        // The tables partition and expire by this time: this store's limit,
+        // the same gate as a sample's.
+        if Date::start_of_day_utc_ms_datetime_safe(ex.timestamp).is_none() {
+            continue;
+        }
+        // Labels with an empty value go first; the rest, ids included, may
+        // come to 128 characters.
+        let kept: Vec<&Label> = ex.labels.iter().filter(|l| !l.value.is_empty()).collect();
+        let runes = kept.iter().fold(0usize, |acc, l| {
+            acc.saturating_add(l.name.chars().count())
+                .saturating_add(l.value.chars().count())
+        });
+        if runes > MAX_EXEMPLAR_RUNES {
+            continue;
+        }
+        // A name given twice resolves to its greatest value, as
+        // `from_verbatim` would resolve it, before an id is read from it.
+        let greatest = |name: &str| {
+            kept.iter()
+                .filter(|l| l.name == name)
+                .map(|l| l.value.as_str())
+                .max()
+        };
+        let trace_id = greatest("trace_id").and_then(lowercase_hex_id::<16>);
+        let span_id = greatest("span_id").and_then(lowercase_hex_id::<8>);
+        let pairs: Vec<(String, String)> = kept
+            .iter()
+            .filter(|l| {
+                !(trace_id.is_some() && l.name == "trace_id"
+                    || span_id.is_some() && l.name == "span_id")
+            })
+            .map(|l| (l.name.clone(), l.value.clone()))
+            .collect();
+        out.exemplars.push(ExemplarPoint {
+            metric_name: Arc::clone(&metric_name),
+            fingerprint,
+            unix_milli: ex.timestamp,
+            value: ex.value,
+            trace_id: trace_id.unwrap_or([0; 16]),
+            span_id: span_id.unwrap_or([0; 8]),
+            labels: LabelSet::from_verbatim(pairs),
+            histogram,
+        });
+    }
     Ok(())
 }
 
@@ -1836,6 +2106,7 @@ mod tests {
                 labels: vec![label("__name__", "up")],
                 samples: vec![sample(1.0, 1)],
                 histograms: vec![],
+                exemplars: vec![],
             }],
             metadata: vec![],
         };
@@ -1853,6 +2124,7 @@ mod tests {
                 labels: vec![label("__name__", "up")],
                 samples: vec![sample(1.0, 1)],
                 histograms: vec![],
+                exemplars: vec![],
             }],
             metadata: vec![],
         };
@@ -1867,6 +2139,7 @@ mod tests {
                     labels: vec![],
                     samples: vec![],
                     histograms: vec![],
+                    exemplars: vec![],
                 };
                 MAX_TIMESERIES_PER_REQUEST + 1
             ],
@@ -1890,6 +2163,7 @@ mod tests {
                 labels: vec![label("k", "v"); MAX_LABELS_PER_SERIES + 1],
                 samples: vec![],
                 histograms: vec![],
+                exemplars: vec![],
             }],
             metadata: vec![],
         };
@@ -1910,6 +2184,7 @@ mod tests {
                 labels: vec![],
                 samples: vec![sample(1.0, 1); MAX_SAMPLES_PER_SERIES + 1],
                 histograms: vec![],
+                exemplars: vec![],
             }],
             metadata: vec![],
         };
@@ -1957,6 +2232,7 @@ mod tests {
                     labels: vec![],
                     samples: vec![],
                     histograms: vec![],
+                    exemplars: vec![],
                 };
                 MAX_TIMESERIES_PER_REQUEST + 1
             ],
@@ -2272,6 +2548,7 @@ mod tests {
                 labels: vec![label("__name__", "up")],
                 samples: vec![sample(1.0, 1)],
                 histograms: vec![],
+                exemplars: vec![],
             }],
             metadata: vec![MetricMetadataProto {
                 r#type: 1,
@@ -2327,11 +2604,13 @@ mod tests {
                     labels: vec![label("__name__", "up"), label("job", "checkout")],
                     samples: vec![sample(1.0, 1), sample(2.0, 2)],
                     histograms: vec![],
+                    exemplars: vec![],
                 },
                 TimeSeries {
                     labels: vec![label("__name__", "latency_bucket"), label("le", "0.5")],
                     samples: vec![sample(3.0, 1)],
                     histograms: vec![],
+                    exemplars: vec![],
                 },
             ],
             metadata: vec![MetricMetadataProto {
@@ -2368,6 +2647,7 @@ mod tests {
                 labels: vec![label("__name__", "up"), label("job", "checkout")],
                 samples: vec![sample(1.0, 1_700_000_000_000)],
                 histograms: vec![],
+                exemplars: vec![],
             }],
             metadata: vec![],
         };
@@ -2387,6 +2667,7 @@ mod tests {
                 ],
                 samples: vec![sample(42.0, 1_700_000_000_000)],
                 histograms: vec![],
+                exemplars: vec![],
             }],
             metadata: vec![],
         };
@@ -2409,6 +2690,7 @@ mod tests {
                 labels: vec![label("__name__", "up")],
                 samples: vec![sample(1.0, 1), sample(2.0, 2), sample(3.0, 3)],
                 histograms: vec![],
+                exemplars: vec![],
             }],
             metadata: vec![],
         };
@@ -2424,6 +2706,7 @@ mod tests {
                 labels: vec![label("__name__", "up")],
                 samples: vec![],
                 histograms: vec![],
+                exemplars: vec![],
             }],
             metadata: vec![],
         };
@@ -2441,6 +2724,7 @@ mod tests {
                 labels: vec![label("job", "checkout")],
                 samples: vec![sample(1.0, 1), sample(2.0, 2)],
                 histograms: vec![],
+                exemplars: vec![],
             }],
             metadata: vec![],
         };
@@ -2458,6 +2742,7 @@ mod tests {
                 labels: vec![label("__name__", "")],
                 samples: vec![sample(1.0, 1)],
                 histograms: vec![],
+                exemplars: vec![],
             }],
             metadata: vec![],
         };
@@ -2474,11 +2759,13 @@ mod tests {
                     labels: vec![label("job", "checkout")],
                     samples: vec![sample(1.0, 1)],
                     histograms: vec![],
+                    exemplars: vec![],
                 },
                 TimeSeries {
                     labels: vec![label("__name__", "up")],
                     samples: vec![sample(1.0, 1)],
                     histograms: vec![],
+                    exemplars: vec![],
                 },
             ],
             metadata: vec![],
@@ -2499,6 +2786,7 @@ mod tests {
                 labels: vec![label("__name__", "up")],
                 samples: vec![sample(1.0, 0)],
                 histograms: vec![],
+                exemplars: vec![],
             }],
             metadata: vec![],
         };
@@ -2518,6 +2806,7 @@ mod tests {
                 labels: vec![label("__name__", "up")],
                 samples: vec![sample(1.0, -1_000)],
                 histograms: vec![],
+                exemplars: vec![],
             }],
             metadata: vec![],
         };
@@ -2542,6 +2831,7 @@ mod tests {
                 labels: vec![label("__name__", "up")],
                 samples: vec![sample(1.0, 4_294_943_999_999)],
                 histograms: vec![],
+                exemplars: vec![],
             }],
             metadata: vec![],
         };
@@ -2561,6 +2851,7 @@ mod tests {
                 labels: vec![label("__name__", "up")],
                 samples: vec![sample(1.0, 4_294_944_000_000)],
                 histograms: vec![],
+                exemplars: vec![],
             }],
             metadata: vec![],
         };
@@ -2587,6 +2878,7 @@ mod tests {
                     sample(2.0, 5_662_310_400_000),
                 ],
                 histograms: vec![],
+                exemplars: vec![],
             }],
             metadata: vec![],
         };
@@ -2610,6 +2902,7 @@ mod tests {
                 labels: vec![label("__name__", "up")],
                 samples: vec![sample(f64::from_bits(STALE_NAN_BITS), 1)],
                 histograms: vec![],
+                exemplars: vec![],
             }],
             metadata: vec![],
         };
@@ -2630,6 +2923,7 @@ mod tests {
                 ],
                 samples: vec![sample(1.0, 1)],
                 histograms: vec![],
+                exemplars: vec![],
             }],
             metadata: vec![],
         };
@@ -2642,6 +2936,7 @@ mod tests {
                 ],
                 samples: vec![sample(1.0, 1)],
                 histograms: vec![],
+                exemplars: vec![],
             }],
             metadata: vec![],
         };
@@ -2663,6 +2958,7 @@ mod tests {
                     labels: labels.iter().map(|(n, v)| label(n, v)).collect(),
                     samples: (0..*samples).map(|k| sample(1.0, 1 + k as i64)).collect(),
                     histograms: vec![],
+                    exemplars: vec![],
                 })
                 .collect(),
             metadata: vec![],
@@ -2783,6 +3079,7 @@ mod tests {
                 labels: vec![label("__name__", "latency_bucket"), label("le", "0.5")],
                 samples: vec![sample(3.0, 1)],
                 histograms: vec![],
+                exemplars: vec![],
             }],
             metadata: vec![],
         };
@@ -2884,6 +3181,7 @@ mod tests {
                 labels: vec![label("__name__", "up")],
                 samples,
                 histograms: vec![],
+                exemplars: vec![],
             }],
             metadata: vec![],
         };
@@ -2932,6 +3230,7 @@ mod tests {
                 labels: vec![label("", ""); MAX_LABELS_PER_SERIES],
                 samples: vec![],
                 histograms: vec![],
+                exemplars: vec![],
             })
             .collect();
         let req = WriteRequest {
@@ -2967,11 +3266,13 @@ mod tests {
                     labels: vec![label("__name__", "up"), label("job", "checkout")],
                     samples: vec![sample(1.0, 1), sample(2.0, 2)],
                     histograms: vec![],
+                    exemplars: vec![],
                 },
                 TimeSeries {
                     labels: vec![label("__name__", "latency_bucket"), label("le", "0.5")],
                     samples: vec![sample(3.0, 1)],
                     histograms: vec![],
+                    exemplars: vec![],
                 },
             ],
             metadata: vec![MetricMetadataProto {
@@ -3021,6 +3322,7 @@ mod tests {
                 labels: vec![label("__name__", "latency"), label("job", "checkout")],
                 samples: vec![],
                 histograms,
+                exemplars: vec![],
             }],
             metadata: vec![],
         }
@@ -3195,6 +3497,7 @@ mod tests {
                 labels: vec![label("__name__", "latency"), label("job", "checkout")],
                 samples: vec![sample(1.0, ms), sample(2.0, ms + 1)],
                 histograms: vec![wire_hist(0, ms)],
+                exemplars: vec![],
             }],
             metadata: vec![],
         };
@@ -3558,6 +3861,7 @@ mod tests {
                     ],
                     ..Default::default()
                 }],
+                exemplars: vec![],
             }],
             metadata: vec![],
         };
@@ -3747,5 +4051,518 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // -- exemplars (issue #501 part 3) --------------------------------------
+
+    /// The 32-character lowercase trace id the exemplar tests send.
+    const TRACE_HEX: &str = "0102030405060708090a0b0c0d0e0f10";
+    /// The 16-character lowercase span id the exemplar tests send.
+    const SPAN_HEX: &str = "1112131415161718";
+
+    fn exemplar(labels: &[(&str, &str)], value: f64, timestamp: i64) -> Exemplar {
+        Exemplar {
+            labels: labels.iter().map(|(n, v)| label(n, v)).collect(),
+            value,
+            timestamp,
+        }
+    }
+
+    /// One request of one series: `labels`, one sample at
+    /// 1,700,000,000,000 when `sampled`, and `exemplars`.
+    fn exemplar_request(
+        labels: &[(&str, &str)],
+        sampled: bool,
+        exemplars: Vec<Exemplar>,
+    ) -> WriteRequest {
+        WriteRequest {
+            timeseries: vec![TimeSeries {
+                labels: labels.iter().map(|(n, v)| label(n, v)).collect(),
+                samples: if sampled {
+                    vec![sample(1.0, 1_700_000_000_000)]
+                } else {
+                    vec![]
+                },
+                histograms: vec![],
+                exemplars,
+            }],
+            metadata: vec![],
+        }
+    }
+
+    /// A wire `Label` message.
+    fn wire_label(name: &str, value: &str) -> Vec<u8> {
+        let mut out = field_ld(1, name.as_bytes());
+        out.extend_from_slice(&field_ld(2, value.as_bytes()));
+        out
+    }
+
+    /// `decode`'s refusal of `body`; a decode that succeeds fails the test
+    /// with the number of series it kept.
+    fn refused(body: &[u8]) -> LogsIngestError {
+        match decode(body) {
+            Err(err) => err,
+            Ok(req) => panic!(
+                "the request must be refused; it decoded {} series",
+                req.timeseries.len()
+            ),
+        }
+    }
+
+    /// **D1: a `TimeSeries` decodes its exemplars.** Hand-encoded at the
+    /// reference's tags (labels 1, value 2 as a double, timestamp 3 as a
+    /// varint), so a wrong tag cannot round-trip through the same structs.
+    #[test]
+    fn a_time_series_decodes_its_exemplars() {
+        let mut ex_payload = field_ld(1, &wire_label("trace_id", TRACE_HEX));
+        ex_payload.extend_from_slice(&field_ld(1, &wire_label("k", "v")));
+        ex_payload.push(0x11); // tag 2, fixed64
+        ex_payload.extend_from_slice(&0.5f64.to_le_bytes());
+        ex_payload.push(0x18); // tag 3, varint
+        prost::encoding::encode_varint(1_700_000_000_000, &mut ex_payload);
+        let mut ts_bytes = field_ld(1, &wire_label("__name__", "m"));
+        ts_bytes.extend_from_slice(&field_ld(3, &ex_payload));
+
+        let want = vec![exemplar(
+            &[("trace_id", TRACE_HEX), ("k", "v")],
+            0.5,
+            1_700_000_000_000,
+        )];
+        let ts = TimeSeries::decode(ts_bytes.as_slice()).expect("one series");
+        assert_eq!(ts.exemplars, want, "TimeSeries::decode");
+        assert_eq!(
+            ts.encode_to_vec(),
+            ts_bytes,
+            "re-encoding gives the same bytes"
+        );
+        assert_eq!(ts.encoded_len(), ts_bytes.len());
+        let req = decode(&field_ld(1, &ts_bytes)).expect("the public decode");
+        assert_eq!(req.timeseries[0].exemplars, want, "the public decode");
+    }
+
+    /// **D2: exemplars past the per-series cap reject the request**, and
+    /// the decoder stops materializing them at the cap plus one.
+    #[test]
+    fn exemplars_past_the_per_series_cap_reject_the_request() {
+        let mut ts_payload = Vec::new();
+        for _ in 0..MAX_EXEMPLARS_PER_SERIES + 8 {
+            ts_payload.extend_from_slice(&field_ld(3, &[]));
+        }
+        let direct = TimeSeries::decode(ts_payload.as_slice()).expect("one series");
+        assert_eq!(
+            direct.exemplars.len(),
+            MAX_EXEMPLARS_PER_SERIES + 1,
+            "a direct TimeSeries::decode stops at the cap plus one"
+        );
+        let body = field_ld(1, &ts_payload);
+        let err = refused(&body);
+        assert!(
+            matches!(
+                err,
+                LogsIngestError::OversizeMessage {
+                    field: "exemplars",
+                    limit: 100_000,
+                    actual: 100_001,
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// **D3: an exemplar past its label cap rejects the request.**
+    #[test]
+    fn an_exemplar_past_its_label_cap_rejects_the_request() {
+        let mut ex_payload = Vec::new();
+        for _ in 0..MAX_LABELS_PER_EXEMPLAR + 8 {
+            ex_payload.extend_from_slice(&field_ld(1, &[]));
+        }
+        let body = field_ld(1, &field_ld(3, &ex_payload));
+        let err = refused(&body);
+        assert!(
+            matches!(
+                err,
+                LogsIngestError::OversizeMessage {
+                    field: "exemplar labels",
+                    limit: 256,
+                    actual: 257,
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// **D4: exemplar labels count toward the label aggregate**: 20,000
+    /// series of one label and one 250-label exemplar each are 5,020,000.
+    #[test]
+    fn exemplar_labels_count_toward_the_label_aggregate() {
+        let mut ex_payload = Vec::new();
+        for _ in 0..250 {
+            ex_payload.extend_from_slice(&field_ld(1, &[]));
+        }
+        let mut ts_payload = field_ld(1, &[]);
+        ts_payload.extend_from_slice(&field_ld(3, &ex_payload));
+        let record = field_ld(1, &ts_payload);
+        let mut body = Vec::with_capacity(record.len() * 20_000);
+        for _ in 0..20_000 {
+            body.extend_from_slice(&record);
+        }
+        let err = refused(&body);
+        assert!(
+            matches!(
+                err,
+                LogsIngestError::OversizeMessage {
+                    field: "total_labels",
+                    limit: MAX_TOTAL_LABELS_PER_REQUEST,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// Three series of one label, each with two exemplars of four labels.
+    fn three_series_of_two_exemplars() -> Vec<TimeSeries> {
+        (0..3)
+            .map(|i| TimeSeries {
+                labels: vec![label("__name__", &format!("m{i}"))],
+                samples: vec![],
+                histograms: vec![],
+                exemplars: (0..2)
+                    .map(|j| {
+                        exemplar(
+                            &[("a", "1"), ("b", "2"), ("c", "3"), ("d", "4")],
+                            f64::from(j),
+                            1 + i64::from(j),
+                        )
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// What [`three_series_of_two_exemplars`] decodes to, by the struct
+    /// sizes: three series shells of one label, six exemplars of four.
+    fn three_series_of_two_exemplars_bytes() -> usize {
+        3 * (std::mem::size_of::<TimeSeries>() + std::mem::size_of::<Label>())
+            + 6 * (std::mem::size_of::<Exemplar>() + 4 * std::mem::size_of::<Label>())
+    }
+
+    /// **D5c: the decode charge equals the re-sum**, and both count every
+    /// exemplar once.
+    #[test]
+    fn the_decode_charge_equals_the_re_sum() {
+        let body = WriteRequest {
+            timeseries: three_series_of_two_exemplars(),
+            metadata: vec![],
+        }
+        .encode_to_vec();
+        let bounded = BoundedWriteRequest::decode(body.as_slice()).expect("small request");
+        assert_eq!(
+            bounded
+                .timeseries
+                .iter()
+                .map(|ts| ts
+                    .exemplars
+                    .iter()
+                    .map(|e| e.labels.len())
+                    .collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            vec![vec![4, 4]; 3],
+            "every exemplar decoded"
+        );
+        assert_eq!(
+            bounded.decoded_bytes,
+            decoded_request_bytes(&bounded.timeseries, &bounded.metadata),
+            "the decode charge and the re-sum agree"
+        );
+        assert_eq!(bounded.decoded_bytes, three_series_of_two_exemplars_bytes());
+        assert_eq!(bounded.total_labels, 3 + 24, "exemplar labels charged once");
+    }
+
+    /// **D6: a merge into a request counts its exemplars.**
+    #[test]
+    fn a_merge_into_a_request_counts_its_exemplars() {
+        let seeded = BoundedWriteRequest::seeded_from(three_series_of_two_exemplars(), vec![]);
+        assert_eq!(
+            seeded.total_labels,
+            3 + 24,
+            "the 24 exemplar labels included"
+        );
+        assert_eq!(
+            seeded.decoded_bytes,
+            decoded_request_bytes(&seeded.timeseries, &seeded.metadata)
+        );
+        assert_eq!(seeded.decoded_bytes, three_series_of_two_exemplars_bytes());
+    }
+
+    /// **P1: an exemplar-only series is registered and carries its
+    /// exemplar.**
+    #[test]
+    fn an_exemplar_only_series_is_registered_and_carries_its_exemplar() {
+        let req = exemplar_request(
+            &[("__name__", "m"), ("job", "a")],
+            false,
+            vec![exemplar(&[], 0.5, 1_700_000_000_000)],
+        );
+        let out = parse(&req, 0).expect("within the expansion budget");
+        let labels = LabelSet::from_verbatim([("job".to_string(), "a".to_string())]);
+        let fingerprint = series_fingerprint("m", &labels);
+        assert_eq!(
+            out.series,
+            vec![SeriesRef {
+                metric_name: Arc::from("m"),
+                fingerprint,
+                labels,
+            }]
+        );
+        assert_eq!(
+            out.exemplars,
+            vec![crate::ingest::metrics::ExemplarPoint {
+                metric_name: Arc::from("m"),
+                fingerprint,
+                unix_milli: 1_700_000_000_000,
+                value: 0.5,
+                trace_id: [0; 16],
+                span_id: [0; 8],
+                labels: LabelSet::default(),
+                histogram: false,
+            }]
+        );
+        assert!(out.samples.is_empty());
+        assert_eq!(out.rejected, 0);
+    }
+
+    /// The one exemplar `labels` parse to, on a sampled `m`.
+    fn one_parsed_exemplar(labels: &[(&str, &str)]) -> crate::ingest::metrics::ExemplarPoint {
+        let req = exemplar_request(
+            &[("__name__", "m")],
+            true,
+            vec![exemplar(labels, 1.0, 1_700_000_000_000)],
+        );
+        let mut out = parse(&req, 0).expect("within the expansion budget");
+        assert_eq!(out.exemplars.len(), 1, "{labels:?}");
+        out.exemplars.remove(0)
+    }
+
+    /// **P2: an id label moves only as lowercase hex of its length and not
+    /// all zeros**, so a moved id reads back as it was sent.
+    #[test]
+    fn an_id_label_moves_only_as_lowercase_hex_of_its_length_and_not_zero() {
+        let moved = one_parsed_exemplar(&[("trace_id", TRACE_HEX), ("k", "v")]);
+        assert_eq!(moved.trace_id, std::array::from_fn(|i| i as u8 + 1));
+        assert_eq!(moved.labels.get("trace_id"), None);
+        assert_eq!(moved.labels.get("k"), Some("v"));
+
+        let zeros = "0".repeat(32);
+        let upper = TRACE_HEX.to_uppercase();
+        let plus = format!("+{}", &TRACE_HEX[1..]);
+        for kept in [
+            upper.as_str(),
+            &TRACE_HEX[..31],
+            zeros.as_str(),
+            plus.as_str(),
+        ] {
+            let ex = one_parsed_exemplar(&[("trace_id", kept)]);
+            assert_eq!(ex.trace_id, [0; 16], "{kept}");
+            assert_eq!(ex.labels.get("trace_id"), Some(kept), "{kept}");
+        }
+
+        let span = one_parsed_exemplar(&[("span_id", SPAN_HEX)]);
+        assert_eq!(span.span_id, std::array::from_fn(|i| i as u8 + 0x11));
+        assert_eq!(span.labels.get("span_id"), None);
+        let long = format!("{SPAN_HEX}1");
+        let span = one_parsed_exemplar(&[("span_id", &long)]);
+        assert_eq!(span.span_id, [0; 8]);
+        assert_eq!(span.labels.get("span_id"), Some(long.as_str()));
+    }
+
+    /// The exemplars `labels` keep on a sampled `m`, with the sample and
+    /// `rejected` checked untouched.
+    fn kept_exemplars(labels: &[(&str, &str)]) -> usize {
+        let req = exemplar_request(
+            &[("__name__", "m")],
+            true,
+            vec![exemplar(labels, 1.0, 1_700_000_000_000)],
+        );
+        let out = parse(&req, 0).expect("within the expansion budget");
+        assert_eq!(out.samples.len(), 1, "the series' sample stays");
+        assert_eq!(
+            out.rejected, 0,
+            "a dropped exemplar is not a rejected sample"
+        );
+        out.exemplars.len()
+    }
+
+    /// **P3: the 128-character rule drops the exemplar**, counting
+    /// characters, not bytes, and the ids as their label text.
+    #[test]
+    fn the_128_character_rule_drops_the_exemplar() {
+        let e = |n: usize| "é".repeat(n);
+        let (e64, e65, e87, e88) = (e(64), e(65), e(87), e(88));
+        assert_eq!(
+            kept_exemplars(&[("trace_id", TRACE_HEX), ("span_id", SPAN_HEX), ("k", &e64)]),
+            1,
+            "128 characters, 192 bytes"
+        );
+        assert_eq!(
+            kept_exemplars(&[("trace_id", TRACE_HEX), ("span_id", SPAN_HEX), ("k", &e65)]),
+            0,
+            "129 characters"
+        );
+        assert_eq!(kept_exemplars(&[("trace_id", TRACE_HEX), ("k", &e87)]), 1);
+        assert_eq!(kept_exemplars(&[("trace_id", TRACE_HEX), ("k", &e88)]), 0);
+    }
+
+    /// **P4: a label with an empty value is dropped before the count.**
+    #[test]
+    fn an_empty_valued_label_is_dropped_before_the_count() {
+        let x = "x".repeat(127);
+        let ex = one_parsed_exemplar(&[("a", ""), ("k", &x)]);
+        assert_eq!(
+            ex.labels.iter().collect::<Vec<_>>(),
+            vec![("k", x.as_str())]
+        );
+    }
+
+    /// **P5: an exemplar outside the storage range is dropped alone.**
+    #[test]
+    fn an_exemplar_outside_the_storage_range_is_dropped_alone() {
+        let req = exemplar_request(
+            &[("__name__", "m")],
+            true,
+            vec![
+                exemplar(&[], 1.0, 0),
+                exemplar(&[], 2.0, 4_323_283_200_000), // 2107-01-01
+            ],
+        );
+        let out = parse(&req, 0).expect("within the expansion budget");
+        assert_eq!(
+            out.exemplars
+                .iter()
+                .map(|e| (e.unix_milli, e.value))
+                .collect::<Vec<_>>(),
+            vec![(0, 1.0)]
+        );
+        assert_eq!(out.rejected, 0);
+        assert_eq!(out.samples.len(), 1);
+    }
+
+    /// **P6: a dropped series keeps none of its exemplars.**
+    #[test]
+    fn a_dropped_series_keeps_none_of_its_exemplars() {
+        let req = exemplar_request(
+            &[("job", "a")],
+            true,
+            vec![exemplar(&[], 1.0, 1_700_000_000_000)],
+        );
+        let out = parse(&req, 0).expect("within the expansion budget");
+        assert!(out.exemplars.is_empty());
+        assert!(out.series.is_empty());
+        assert_eq!(out.rejected, 1, "the series' one sample");
+
+        // The control: the same series with its name keeps the exemplar.
+        let named = exemplar_request(
+            &[("__name__", "m"), ("job", "a")],
+            true,
+            vec![exemplar(&[], 1.0, 1_700_000_000_000)],
+        );
+        let out = parse(&named, 0).expect("within the expansion budget");
+        assert_eq!(
+            out.exemplars.len(),
+            1,
+            "the named series keeps its exemplar"
+        );
+    }
+
+    /// **P7: a histogram-only series marks its exemplars `histogram`**; a
+    /// series with samples as well does not.
+    #[test]
+    fn a_histogram_only_series_marks_its_exemplars_histogram() {
+        for (samples, want) in [
+            (vec![], true),
+            (vec![sample(1.0, 1_700_000_000_001)], false),
+        ] {
+            let mut req = one_hist_series(vec![wire_hist(0, 1_700_000_000_000)]);
+            req.timeseries[0].samples = samples;
+            req.timeseries[0].exemplars = vec![exemplar(&[], 1.0, 1_700_000_000_000)];
+            let out = parse(&req, 0).expect("within the expansion budget");
+            assert_eq!(
+                out.exemplars
+                    .iter()
+                    .map(|e| e.histogram)
+                    .collect::<Vec<_>>(),
+                vec![want]
+            );
+        }
+    }
+
+    /// **P8: an exemplar's charge covers the point it builds.**
+    #[test]
+    fn the_exemplar_charge_covers_the_point_it_builds() {
+        let ex = exemplar(&[("user", "alice"), ("region", "eu-west-1")], 1.0, 1);
+        let text = "user".len() + "alice".len() + "region".len() + "eu-west-1".len();
+        assert!(
+            exemplar_charge(&ex)
+                >= std::mem::size_of::<crate::ingest::metrics::ExemplarPoint>()
+                    + 2 * std::mem::size_of::<(String, String)>()
+                    + text,
+            "charge {}",
+            exemplar_charge(&ex)
+        );
+
+        // `parse` charges each exemplar before anything else is done with
+        // it: exemplars whose time drops every one of them still trip the
+        // budget, at the tipping exemplar.
+        let one = exemplar_charge(&Exemplar::default());
+        let count = MAX_EXPANDED_BYTES / one + 2;
+        let req = exemplar_request(
+            &[("__name__", "m")],
+            false,
+            vec![exemplar(&[], 1.0, 4_323_283_200_000); count],
+        );
+        let err = parse(&req, 0).expect_err("the exemplar charge must trip the expansion budget");
+        let LogsIngestError::OversizeMessage { limit, actual, .. } = err else {
+            panic!("unexpected error: {err}");
+        };
+        assert_eq!(limit, MAX_EXPANDED_BYTES);
+        assert!(
+            actual <= MAX_EXPANDED_BYTES + one,
+            "the abort fires at the tipping exemplar: actual={actual}"
+        );
+    }
+
+    /// **P9: an exemplar's label names and value are kept as sent**: a
+    /// dotted name is not rewritten, and a negative value and a negative
+    /// zero keep their bits.
+    #[test]
+    fn an_exemplar_keeps_its_label_names_and_value_as_sent() {
+        let req = exemplar_request(
+            &[("__name__", "m")],
+            true,
+            vec![
+                exemplar(&[("http.method", "GET")], -2.5, 1_700_000_000_000),
+                exemplar(&[], -0.0, 1_700_000_000_001),
+            ],
+        );
+        let out = parse(&req, 0).expect("within the expansion budget");
+        assert_eq!(
+            out.exemplars
+                .iter()
+                .map(|e| (
+                    e.labels
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect::<Vec<_>>(),
+                    e.value.to_bits()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    vec![("http.method".to_string(), "GET".to_string())],
+                    (-2.5f64).to_bits()
+                ),
+                (vec![], (-0.0f64).to_bits()),
+            ]
+        );
     }
 }

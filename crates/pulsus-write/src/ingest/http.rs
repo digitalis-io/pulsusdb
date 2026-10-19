@@ -2959,6 +2959,7 @@ mod tests {
                     timestamp: 1_700_000_000_000,
                 }],
                 histograms: vec![],
+                exemplars: vec![],
             }],
             metadata: vec![],
         };
@@ -3149,6 +3150,7 @@ mod tests {
                     MAX_SAMPLES_PER_SERIES
                 ],
                 histograms: vec![],
+                exemplars: vec![],
             })
             .collect();
         let req = WriteRequest {
@@ -3186,6 +3188,7 @@ mod tests {
                     timestamp: 1,
                 }],
                 histograms: vec![],
+                exemplars: vec![],
             }],
             metadata: vec![],
         };
@@ -3220,6 +3223,7 @@ mod tests {
                     timestamp: 4_294_944_000_000,
                 }],
                 histograms: vec![],
+                exemplars: vec![],
             }],
             metadata: vec![],
         };
@@ -4386,6 +4390,7 @@ mod tests {
                     labels: vec![empty.clone(); remote_write::MAX_LABELS_PER_SERIES],
                     samples: vec![],
                     histograms: vec![],
+                    exemplars: vec![],
                 })
                 .collect(),
             metadata: vec![],

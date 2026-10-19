@@ -292,6 +292,7 @@ fn synthetic_gauge_hint_body_lands_counter_reset_hint_gauge_through_the_full_pat
                 timestamp: 1_700_000_000_000,
                 ..Default::default()
             }],
+            exemplars: vec![],
         }],
         metadata: vec![],
     };
@@ -325,6 +326,7 @@ fn missing_name_label_drops_the_series_request_still_succeeds_as_partial() {
                     timestamp: 1,
                 }],
                 histograms: vec![],
+                exemplars: vec![],
             },
             TimeSeries {
                 labels: vec![label("__name__", "up")],
@@ -333,6 +335,7 @@ fn missing_name_label_drops_the_series_request_still_succeeds_as_partial() {
                     timestamp: 1,
                 }],
                 histograms: vec![],
+                exemplars: vec![],
             },
         ],
         metadata: vec![],
@@ -361,6 +364,7 @@ fn out_of_order_wire_labels_are_accepted_and_fingerprint_identically_to_sorted()
                 timestamp: 1,
             }],
             histograms: vec![],
+            exemplars: vec![],
         }],
         metadata: vec![],
     };
@@ -376,6 +380,7 @@ fn out_of_order_wire_labels_are_accepted_and_fingerprint_identically_to_sorted()
                 timestamp: 1,
             }],
             histograms: vec![],
+            exemplars: vec![],
         }],
         metadata: vec![],
     };
@@ -573,6 +578,7 @@ async fn a_sample_an_hour_old_is_accepted_and_stored() {
                 timestamp: sample_ms,
             }],
             histograms: vec![],
+            exemplars: vec![],
         }],
         metadata: vec![],
     };
