@@ -25,8 +25,8 @@ use pulsus_write::writer::{
     WriterRuntime, landing_block_overhead_bytes,
 };
 use pulsus_write::{
-    AdmitRefusal, HistogramPoint, MetricMetadata, MetricPoint, MetricSink, ParsedMetrics,
-    PushHeaders, SeriesRef, push_too_large_message,
+    AdmitRefusal, ExemplarPoint, HistogramPoint, MetricMetadata, MetricPoint, MetricSink,
+    ParsedMetrics, PushHeaders, SeriesRef, push_too_large_message,
 };
 use tokio::time::Instant;
 
@@ -1623,6 +1623,134 @@ async fn a_push_at_a_ceiling_is_refused_whole() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// The exemplar W5 adds to the mixed push: on `m`/1 at 1,000 ms, no ids, no
+/// labels. Its kind-4 row owns 59 bytes of buffers: 1 name + 16 fingerprint
+/// + 8 unix_milli + 8 value + 16 trace id + 8 span id + 2 labels (`{}`).
+fn bare_exemplar(unix_milli: i64) -> ExemplarPoint {
+    let (labels, _) = LabelSet::from_normalized(Vec::<(String, String)>::new());
+    ExemplarPoint {
+        metric_name: Arc::from("m"),
+        fingerprint: Fingerprint::from_raw(1),
+        unix_milli,
+        value: 0.5,
+        trace_id: [0; 16],
+        span_id: [0; 8],
+        labels,
+        histogram: false,
+    }
+}
+
+/// **W5 (issue #501): an exemplar is a landing row, so it counts toward both
+/// push ceilings.** The mixed push without its descriptor is 4 rows and 164
+/// bytes of buffers; one exemplar makes it 5 rows and 164 + 59.
+#[tokio::test]
+async fn an_exemplar_counts_toward_both_push_ceilings() {
+    const EX_ROWS: u64 = 5;
+    const EX_BYTES: u64 = 164
+        + 59
+        + EX_ROWS * LANDING_ROW_SLOT_BYTES
+        + landing_block_overhead_bytes::<MetricLandingRow>();
+    let root = spool_root("exemplar-ceiling");
+    let push = || {
+        let mut batch = mixed_push(1_000, 1, false);
+        batch.exemplars.push(bare_exemplar(1_000));
+        batch
+    };
+
+    let cfg = WriterConfig {
+        metrics_landing_max_rows: EX_ROWS,
+        ..Default::default()
+    };
+    let inserter = MockInserter::always(Act::Ok);
+    let writer = writer_with(&cfg, &root, inserter.clone());
+    let err = writer
+        .admit_flush(&no_tenant(), push(), PushHeaders::default())
+        .expect_err("five rows at a five-row ceiling are refused");
+    assert_eq!(
+        err,
+        AdmitRefusal::PushTooLarge {
+            rows: EX_ROWS,
+            row_limit: EX_ROWS,
+            bytes: EX_BYTES,
+            byte_limit: 16 * 1024 * 1024,
+        }
+    );
+    assert_eq!(inserter.call_count(), 0);
+    writer.shutdown(Duration::from_secs(2)).await;
+
+    for (limit, refused) in [(EX_BYTES, false), (EX_BYTES - 1, true)] {
+        let cfg = WriterConfig {
+            batch_bytes: ByteSize(limit),
+            ..Default::default()
+        };
+        let inserter = MockInserter::always(Act::Ok);
+        let writer = writer_with(&cfg, &root, inserter.clone());
+        let result = writer.admit_flush(&no_tenant(), push(), PushHeaders::default());
+        if refused {
+            assert_eq!(
+                result.expect_err("refused one byte under the estimate"),
+                AdmitRefusal::PushTooLarge {
+                    rows: EX_ROWS,
+                    row_limit: 1_048_576,
+                    bytes: EX_BYTES,
+                    byte_limit: limit,
+                }
+            );
+            assert_eq!(inserter.call_count(), 0);
+        } else {
+            let wait = result.expect("byte equality is admitted");
+            tokio::time::timeout(Duration::from_secs(5), wait)
+                .await
+                .expect("settles")
+                .expect("commits");
+            assert_eq!(inserter.call_count(), 1);
+            assert_eq!(kinds(&inserter.rows_of(0)), vec![0, 1, 2, 2, 4]);
+        }
+        writer.shutdown(Duration::from_secs(2)).await;
+    }
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// **W7 (issue #501): an exemplar registers its series in its own activity
+/// bucket.** A sample just after a bucket boundary and an exemplar just
+/// before it: two kind-2 rows, one per bucket. A third exemplar, attached
+/// to a native-histogram series, registers that series as one.
+#[tokio::test]
+async fn an_exemplar_registers_its_series_in_its_own_bucket() {
+    let cfg = WriterConfig::default();
+    let root = spool_root("exemplar-bucket");
+    let inserter = MockInserter::always(Act::Ok);
+    let writer = writer_with(&cfg, &root, inserter.clone());
+    let b = 10 * BUCKET_MS;
+    let mut batch = batch_for("m", 1, b + 1, true);
+    batch.exemplars.push(bare_exemplar(b - 1));
+    batch.exemplars.push(ExemplarPoint {
+        histogram: true,
+        ..bare_exemplar(b + 1)
+    });
+    let wait = writer
+        .admit_flush(&no_tenant(), batch, PushHeaders::default())
+        .expect("queue has room");
+    tokio::time::timeout(Duration::from_secs(5), wait)
+        .await
+        .expect("settles")
+        .expect("commits");
+    let rows = inserter.rows_of(0);
+    let mut registered: Vec<(i64, u64)> = rows_of_kind(&rows, 2)
+        .iter()
+        .map(|r| {
+            (
+                r["unix_milli"].as_i64().expect("a bucket"),
+                r["value_type"].as_u64().expect("a value type"),
+            )
+        })
+        .collect();
+    registered.sort_unstable();
+    assert_eq!(registered, vec![(b - BUCKET_MS, 0), (b, 0), (b, 1)]);
+    writer.shutdown(Duration::from_secs(2)).await;
+    std::fs::remove_dir_all(&root).ok();
+}
+
 /// Issue #603 code review, finding 3: the figure the queue reserves and the
 /// refusal names must cover the rows the **queue** holds. A landing row is
 /// held as a whole `MetricLandingRow` from admission until its block is
@@ -2193,6 +2321,18 @@ async fn every_landing_column_is_the_value_its_kind_was_built_from() {
             unit: "s".to_string(),
             updated_ns: 4_000,
         }],
+        // Issue #501: an exemplar on the float sample's series, in its
+        // bucket, so it adds no registration.
+        exemplars: vec![ExemplarPoint {
+            metric_name: Arc::from("m0"),
+            fingerprint: Fingerprint::from_raw(10),
+            unix_milli: 1_000,
+            value: 0.25,
+            trace_id: std::array::from_fn(|i| i as u8 + 1),
+            span_id: std::array::from_fn(|i| i as u8 + 17),
+            labels: labels.clone(),
+            histogram: false,
+        }],
         ..Default::default()
     };
 
@@ -2204,7 +2344,7 @@ async fn every_landing_column_is_the_value_its_kind_was_built_from() {
         .expect("settles")
         .expect("commits");
     let rows = inserter.rows_of(0);
-    assert_eq!(kinds(&rows), vec![0, 1, 2, 2, 3]);
+    assert_eq!(kinds(&rows), vec![0, 1, 2, 2, 3, 4]);
 
     let float = rows_of_kind(&rows, 0)[0];
     assert_eq!(float["metric_name"].as_str(), Some("m0"));
@@ -2212,6 +2352,35 @@ async fn every_landing_column_is_the_value_its_kind_was_built_from() {
     assert_eq!(float["value"].as_f64(), Some(1.5));
     assert_eq!(float["labels"].as_str(), Some(""), "not a kind-2 column");
     assert_eq!(float["updated_ns"].as_i64(), Some(0));
+    assert_eq!(
+        float["ex_trace_id"],
+        serde_json::json!(vec![0u8; 16]),
+        "not a kind-4 column"
+    );
+    assert_eq!(float["ex_span_id"], serde_json::json!(vec![0u8; 8]));
+
+    let exemplars = rows_of_kind(&rows, 4);
+    assert_eq!(exemplars.len(), 1, "one kind-4 row");
+    let exemplar = exemplars[0];
+    assert_eq!(exemplar["metric_name"].as_str(), Some("m0"));
+    assert_eq!(exemplar["fingerprint"].as_u64(), Some(10));
+    assert_eq!(exemplar["unix_milli"].as_i64(), Some(1_000));
+    assert_eq!(exemplar["value"].as_f64(), Some(0.25));
+    assert_eq!(
+        exemplar["ex_trace_id"],
+        serde_json::json!([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
+    );
+    assert_eq!(
+        exemplar["ex_span_id"],
+        serde_json::json!([17, 18, 19, 20, 21, 22, 23, 24])
+    );
+    assert_eq!(exemplar["labels"].as_str(), Some(r#"{"a":"b"}"#));
+    assert_eq!(exemplar["value_type"].as_u64(), Some(0));
+    assert_eq!(
+        exemplar["hist_count"].as_u64(),
+        Some(0),
+        "not a kind-1 column"
+    );
 
     let hist = rows_of_kind(&rows, 1)[0];
     assert_eq!(hist["metric_name"].as_str(), Some("m1"));

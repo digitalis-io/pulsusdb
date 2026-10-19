@@ -2468,8 +2468,8 @@ jobs:
           schema/schema.sh
           catalogue > /tmp/schema-first.tsv
           objects=$(wc -l < /tmp/schema-first.tsv)
-          if [ "$objects" -ne 49 ]; then
-            echo "::error::expected 49 objects in the single-node schema, got $objects"
+          if [ "$objects" -ne 51 ]; then
+            echo "::error::expected 51 objects in the single-node schema, got $objects"
             cut -f1 /tmp/schema-first.tsv
             exit 1
           fi
@@ -2593,8 +2593,8 @@ jobs:
           catalogue 18123 > /tmp/cluster-shard1.tsv
           catalogue 28123 > /tmp/cluster-shard2.tsv
           objects=$(wc -l < /tmp/cluster-shard1.tsv)
-          if [ "$objects" -ne 66 ]; then
-            echo "::error::expected 66 objects in the clustered schema, got $objects"
+          if [ "$objects" -ne 69 ]; then
+            echo "::error::expected 69 objects in the clustered schema, got $objects"
             cut -f1 /tmp/cluster-shard1.tsv
             exit 1
           fi
@@ -2614,7 +2614,7 @@ jobs:
                              countIf(total_replicas = 1), countIf(total_replicas = 2) \
                       FROM system.replicas WHERE database = 'pulsus' FORMAT TSV"
           }
-          want=$(printf '22\t5\t22\t5')
+          want=$(printf '23\t5\t23\t5')
           for pair in "18123 1" "28123 2"; do
             set -- $pair
             got=$(paths "$1" "$2")

@@ -12,7 +12,8 @@ pub use ingest::http::{
     ingest, ingest_loki_push, ingest_metrics, ingest_remote_write, ingest_traces, ingest_zipkin,
 };
 pub use ingest::metrics::{
-    HistogramPoint, MetricMetadata, MetricPoint, MetricSink, ParsedMetrics, SeriesRef,
+    ExemplarPoint, HistogramPoint, MetricMetadata, MetricPoint, MetricSink, ParsedMetrics,
+    SeriesRef,
 };
 pub use ingest::traces::{
     AttrRecord, AttrValueType, LandingEvent, LandingLink, LandingResource, LandingSpan,

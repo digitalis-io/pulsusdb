@@ -496,6 +496,7 @@ async fn the_configured_retention_reaches_every_retained_tables_ttl() {
         ("metric_samples", "(30 * 86400)", "(7 * 86400)"),
         ("log_samples", "(30 * 86400)", "(7 * 86400)"),
         ("metric_hist_samples", "(30 * 86400)", "(7 * 86400)"),
+        ("metric_exemplars", "(30 * 86400)", "(7 * 86400)"),
         ("log_patterns", "(30 * 86400)", "(7 * 86400)"),
         ("metric_series", "+ 1) + 30) * 86400", "+ 1) + 7) * 86400"),
     ] {
@@ -620,7 +621,7 @@ async fn metric_ttl_expression_is_equivalent_in_range_and_saturates_at_the_bound
     run_init(&client, &ctx)
         .await
         .expect("a build at retention_days = u32::MAX must be accepted");
-    for table in ["metric_samples", "metric_hist_samples"] {
+    for table in ["metric_samples", "metric_hist_samples", "metric_exemplars"] {
         let ddl = create_table_query(&client, db, table).await;
         assert!(
             ddl.contains("(4294967295 * 86400)"),
@@ -822,6 +823,7 @@ async fn a_fresh_database_creates_every_fingerprint_column_as_uint128() {
         "log_samples",
         "log_streams",
         "log_streams_idx",
+        "metric_exemplars",
         "metric_hist_samples",
         "metric_label_index",
         "metric_labels",
@@ -945,7 +947,7 @@ struct LandingColumnRow {
 /// `Gorilla` is reported as `Gorilla(8)`, and a column with no codec clause
 /// reports the empty string. The same normalisation the four shipped TTL
 /// assertions read around a parenthesised product.
-const LANDING_COLUMNS: [(&str, &str, &str); 26] = [
+const LANDING_COLUMNS: [(&str, &str, &str); 28] = [
     ("org_id", "LowCardinality(String)", ""),
     ("received_ms", "Int64", "CODEC(DoubleDelta, ZSTD(1))"),
     ("kind", "UInt8", "CODEC(ZSTD(1))"),
@@ -976,6 +978,8 @@ const LANDING_COLUMNS: [(&str, &str, &str); 26] = [
     ("hist_neg_bucket_deltas", "Array(Int64)", "CODEC(ZSTD(1))"),
     ("hist_custom_values", "Array(Float64)", "CODEC(ZSTD(1))"),
     ("hist_counter_reset_hint", "UInt8", "CODEC(ZSTD(1))"),
+    ("ex_trace_id", "FixedString(16)", "CODEC(ZSTD(1))"),
+    ("ex_span_id", "FixedString(8)", "CODEC(ZSTD(1))"),
 ];
 
 /// A fresh `run_init` creates `metric_landing` with exactly the declared
@@ -1030,6 +1034,7 @@ async fn metric_landing_and_its_views_exist_after_init() {
     for view in [
         "metric_samples_mv",
         "metric_hist_samples_mv",
+        "metric_exemplars_mv",
         "metric_series_mv",
         "metric_metadata_mv",
         "metric_labels_mv",
@@ -1081,6 +1086,7 @@ async fn the_sample_tables_fingerprint_codec_is_zstd() {
     drop(stream);
 
     let want: Vec<(String, String)> = [
+        ("metric_exemplars", "CODEC(ZSTD(1))"),
         ("metric_hist_samples", "CODEC(ZSTD(1))"),
         ("metric_label_index", "CODEC(ZSTD(1))"),
         ("metric_labels", "CODEC(Delta(8), ZSTD(1))"),
@@ -1205,7 +1211,9 @@ async fn an_existing_landing_table_is_adopted_by_a_rerun() {
              hist_neg_span_lengths    Array(UInt32)  CODEC(ZSTD(1)),
              hist_neg_bucket_deltas   Array(Int64)  CODEC(ZSTD(1)),
              hist_custom_values       Array(Float64)  CODEC(ZSTD(1)),
-             hist_counter_reset_hint  UInt8  CODEC(ZSTD(1))
+             hist_counter_reset_hint  UInt8  CODEC(ZSTD(1)),
+             ex_trace_id              FixedString(16)  CODEC(ZSTD(1)),
+             ex_span_id               FixedString(8)  CODEC(ZSTD(1))
          ) ENGINE = MergeTree
          PARTITION BY toStartOfHour(fromUnixTimestamp64Milli(received_ms))
          ORDER BY (org_id, kind, metric_name, fingerprint, unix_milli)
@@ -1284,6 +1292,7 @@ async fn dedup_settings_reach_the_landing_table_and_all_four_targets() {
         "metric_series",
         "metric_metadata",
         "metric_hist_samples",
+        "metric_exemplars",
         "metric_labels",
         "metric_label_index",
         "metric_label_values",
@@ -1328,6 +1337,8 @@ struct LandingSeriesRow {
     hist_neg_bucket_deltas: Vec<i64>,
     hist_custom_values: Vec<f64>,
     hist_counter_reset_hint: u8,
+    ex_trace_id: [u8; 16],
+    ex_span_id: [u8; 8],
 }
 
 /// **S3 (issue #623): a label row is stored once per series, activity once

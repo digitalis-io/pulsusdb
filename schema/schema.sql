@@ -12,7 +12,7 @@
 -- and never add a substitution that matches one.
 --
 -- A REPLICATION PATH NAMES ITS OWN TABLE. The paths are written out rather
--- than derived, so a wrong one is a per-table error. Twenty-two tables take
+-- than derived, so a wrong one is a per-table error. Twenty-three tables take
 -- `/clickhouse/tables/{shard}/` and five take `/clickhouse/tables/all/`
 -- (docs/architecture.md §3). `tests/schema_file.rs` holds the relation.
 --
@@ -137,6 +137,24 @@ ORDER BY (org_id, key, val, fingerprint)
 --@single  SETTINGS index_granularity = 8192, non_replicated_deduplication_window = {{log_dedup_window}}{{storage_policy}};
 --@cluster SETTINGS index_granularity = 8192, replicated_deduplication_window = {{log_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
 
+CREATE TABLE IF NOT EXISTS {{db}}.metric_exemplars{{on_cluster}}
+(
+    org_id LowCardinality(String),
+    fingerprint UInt128 CODEC(ZSTD(1)),
+    unix_milli Int64 CODEC(DoubleDelta, ZSTD(1)),
+    value Float64 CODEC(Gorilla(8), ZSTD(1)),
+    trace_id FixedString(16) CODEC(ZSTD(1)),
+    span_id FixedString(8) CODEC(ZSTD(1)),
+    labels String CODEC(ZSTD(5))
+)
+--@single  ENGINE = MergeTree
+--@cluster ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/{{db}}.metric_exemplars', '{replica}')
+PARTITION BY toDate(fromUnixTimestamp64Milli(unix_milli))
+ORDER BY (org_id, fingerprint, unix_milli)
+TTL toDateTime(least(intDiv(unix_milli, 1000) + ({{retention_days}} * 86400), 4294967295))
+--@single  SETTINGS ttl_only_drop_parts = 1, primary_key_ratio_of_unique_prefix_values_to_skip_suffix_columns = 1, index_granularity = 1024, min_columns_to_activate_adaptive_write_buffer = 1, non_replicated_deduplication_window = {{metrics_dedup_window}}{{storage_policy}};
+--@cluster SETTINGS ttl_only_drop_parts = 1, primary_key_ratio_of_unique_prefix_values_to_skip_suffix_columns = 1, index_granularity = 1024, min_columns_to_activate_adaptive_write_buffer = 1, replicated_deduplication_window = {{metrics_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
+
 CREATE TABLE IF NOT EXISTS {{db}}.metric_hist_samples{{on_cluster}}
 (
     org_id LowCardinality(String),
@@ -234,7 +252,9 @@ CREATE TABLE IF NOT EXISTS {{db}}.metric_landing{{on_cluster}}
     hist_neg_span_lengths Array(UInt32) CODEC(ZSTD(1)),
     hist_neg_bucket_deltas Array(Int64) CODEC(ZSTD(1)),
     hist_custom_values Array(Float64) CODEC(ZSTD(1)),
-    hist_counter_reset_hint UInt8 CODEC(ZSTD(1))
+    hist_counter_reset_hint UInt8 CODEC(ZSTD(1)),
+    ex_trace_id FixedString(16) CODEC(ZSTD(1)),
+    ex_span_id FixedString(8) CODEC(ZSTD(1))
 )
 --@single  ENGINE = MergeTree
 --@cluster ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/{{db}}.metric_landing', '{replica}')
@@ -658,6 +678,9 @@ TTL toDateTime(least(intDiv(last_start_ns, 1000000000) + ({{retention_days}} * 8
 --@cluster CREATE TABLE IF NOT EXISTS {{db}}.log_streams{{dist_suffix}}{{on_cluster}} AS {{db}}.log_streams
 --@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'log_streams', cityHash64(fingerprint));
 
+--@cluster CREATE TABLE IF NOT EXISTS {{db}}.metric_exemplars{{dist_suffix}}{{on_cluster}} AS {{db}}.metric_exemplars
+--@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'metric_exemplars', cityHash64(fingerprint));
+
 --@cluster CREATE TABLE IF NOT EXISTS {{db}}.metric_hist_samples{{dist_suffix}}{{on_cluster}} AS {{db}}.metric_hist_samples
 --@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'metric_hist_samples', cityHash64(fingerprint));
 
@@ -755,6 +778,18 @@ AS SELECT
     updated_ns AS updated_ns
 FROM {{db}}.log_landing
 WHERE kind = 1;
+
+CREATE MATERIALIZED VIEW {{db}}.metric_exemplars_mv{{on_cluster}} TO {{db}}.metric_exemplars
+AS SELECT
+    org_id AS org_id,
+    fingerprint AS fingerprint,
+    unix_milli AS unix_milli,
+    value AS value,
+    ex_trace_id AS trace_id,
+    ex_span_id AS span_id,
+    labels AS labels
+FROM {{db}}.metric_landing
+WHERE kind = 4;
 
 CREATE MATERIALIZED VIEW {{db}}.metric_hist_samples_mv{{on_cluster}} TO {{db}}.metric_hist_samples
 AS SELECT

@@ -28,8 +28,8 @@ use pulsus_model::{ACTIVITY_BUCKET_MS, Fingerprint, LabelSet};
 use pulsus_schema::RenderCtx;
 use pulsus_schema_testkit::run_init;
 use pulsus_write::{
-    MetricMetadata, MetricPoint, MetricSink, MetricWriter, MetricWriterTables, ParsedMetrics,
-    PushHeaders, SeriesRef,
+    ExemplarPoint, MetricMetadata, MetricPoint, MetricSink, MetricWriter, MetricWriterTables,
+    ParsedMetrics, PushHeaders, SeriesRef,
 };
 
 /// `true` when the gated half of this suite should run. Skips cleanly on a
@@ -139,6 +139,15 @@ async fn a_push_lands_one_block_carrying_every_kind() {
 
     let (labels, _) = LabelSet::from_normalized([("job".to_string(), "checkout".to_string())]);
     let metric_name: Arc<str> = Arc::from("http_requests_total");
+    // Issue #501: inside the retention, so the exemplar reaches its table.
+    let exemplar_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("post-epoch clock")
+            .as_millis(),
+    )
+    .expect("present-day ms fits in i64")
+        - 60_000;
     let batch = ParsedMetrics {
         samples: vec![MetricPoint {
             metric_name: metric_name.clone(),
@@ -158,6 +167,16 @@ async fn a_push_lands_one_block_carrying_every_kind() {
             unit: String::new(),
             updated_ns: 1,
         }],
+        exemplars: vec![ExemplarPoint {
+            metric_name: metric_name.clone(),
+            fingerprint: Fingerprint::from_raw(42),
+            unix_milli: exemplar_ms,
+            value: 0.25,
+            trace_id: std::array::from_fn(|i| i as u8 + 1),
+            span_id: std::array::from_fn(|i| i as u8 + 17),
+            labels: LabelSet::from_normalized([("a".to_string(), "b".to_string())]).0,
+            histogram: false,
+        }],
         ..Default::default()
     };
 
@@ -170,7 +189,8 @@ async fn a_push_lands_one_block_carrying_every_kind() {
         .expect("the landing block commits");
     writer.shutdown(Duration::from_secs(5)).await;
 
-    for (kind, want) in [(0u8, 1u64), (1, 0), (2, 1), (3, 1)] {
+    // Two registrations: the sample's bucket and the exemplar's.
+    for (kind, want) in [(0u8, 1u64), (1, 0), (2, 2), (3, 1), (4, 1)] {
         let got = count(
             &client,
             &format!("SELECT count() AS n FROM {db}.metric_landing WHERE kind = {kind}"),
@@ -178,6 +198,24 @@ async fn a_push_lands_one_block_carrying_every_kind() {
         .await;
         assert_eq!(got, want, "kind {kind} rows in the landing block");
     }
+    let stored = client
+        .query_strings(
+            &format!(
+                "SELECT concat(toString(fingerprint), ' ', toString(unix_milli), ' ', \
+                 toString(value), ' ', hex(trace_id), ' ', hex(span_id), ' ', labels) AS s \
+                 FROM {db}.metric_exemplars"
+            ),
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("read metric_exemplars");
+    assert_eq!(
+        stored,
+        vec![format!(
+            "42 {exemplar_ms} 0.25 0102030405060708090A0B0C0D0E0F10 1112131415161718 {{\"a\":\"b\"}}"
+        )],
+        "the view copies the kind-4 row into metric_exemplars, once"
+    );
     let distinct_stamps = count(
         &client,
         &format!("SELECT uniqExact(received_ms) AS n FROM {db}.metric_landing"),

@@ -49,16 +49,16 @@ fn repo_root() -> std::path::PathBuf {
         .expect("the crate directory resolves")
 }
 
-/// The inventory, single-node: one database, 27 tables, 22 views, and
+/// The inventory, single-node: one database, 28 tables, 23 views, and
 /// nothing else. No `Replicated*` engine, no `Distributed` wrapper, no `ON
 /// CLUSTER`.
 #[test]
 fn the_single_node_render_is_the_whole_inventory_with_every_token_resolved() {
     let stmts = rendered_statements(&single());
-    assert_eq!(stmts.len(), 50, "statement count");
+    assert_eq!(stmts.len(), 52, "statement count");
     assert_eq!(starting_with(&stmts, "CREATE DATABASE"), 1);
-    assert_eq!(starting_with(&stmts, "CREATE TABLE"), 27);
-    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 22);
+    assert_eq!(starting_with(&stmts, "CREATE TABLE"), 28);
+    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 23);
 
     let text = rendered(&single());
     assert!(
@@ -87,18 +87,18 @@ fn the_single_node_render_is_the_whole_inventory_with_every_token_resolved() {
     assert!(text.contains("non_replicated_deduplication_window = 10000"));
 }
 
-/// The inventory, clustered: the same statements plus 17 `_dist` wrappers,
+/// The inventory, clustered: the same statements plus 18 `_dist` wrappers,
 /// `ON CLUSTER` on every one, and the macros intact.
 #[test]
 fn the_clustered_render_adds_the_wrappers_and_keeps_the_server_macros() {
     let stmts = rendered_statements(&clustered());
-    assert_eq!(stmts.len(), 67, "statement count");
+    assert_eq!(stmts.len(), 70, "statement count");
     assert_eq!(
         starting_with(&stmts, "CREATE TABLE"),
-        44,
-        "27 tables + 17 wrappers"
+        46,
+        "28 tables + 18 wrappers"
     );
-    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 22);
+    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 23);
 
     let text = rendered(&clustered());
     assert!(
@@ -107,19 +107,19 @@ fn the_clustered_render_adds_the_wrappers_and_keeps_the_server_macros() {
     );
     assert_eq!(
         text.matches("ON CLUSTER 'prod'").count(),
-        67,
+        70,
         "every statement carries ON CLUSTER"
     );
 
     // `{shard}` and `{replica}` are the server's own macros and must arrive
-    // literally. 22 tables take a per-shard replica set and 5 take the
-    // cluster-wide one, so 27 paths name `{replica}` and 22 name `{shard}`.
+    // literally. 23 tables take a per-shard replica set and 5 take the
+    // cluster-wide one, so 28 paths name `{replica}` and 23 name `{shard}`.
     assert_eq!(
         text.matches("{shard}").count(),
-        22,
+        23,
         "per-shard replica sets"
     );
-    assert_eq!(text.matches("{replica}").count(), 27, "replicated tables");
+    assert_eq!(text.matches("{replica}").count(), 28, "replicated tables");
     assert_eq!(
         text.matches("/clickhouse/tables/all/").count(),
         5,
@@ -178,7 +178,7 @@ fn every_replication_path_names_the_table_of_its_own_create() {
             checked += 1;
         }
     }
-    assert_eq!(checked, 27, "every replicated table's path was checked");
+    assert_eq!(checked, 28, "every replicated table's path was checked");
 }
 
 /// The splitter the script relies on: a statement ends at a line whose last
@@ -327,6 +327,7 @@ fn every_wrapper_in_a_family_shards_on_the_same_expression() {
     for table in [
         "metric_samples",
         "metric_hist_samples",
+        "metric_exemplars",
         "metric_series",
         "metric_labels",
     ] {
@@ -357,7 +358,7 @@ fn the_storage_policy_renders_into_every_table_and_no_wrapper_or_view() {
             assert!(!has, "the storage policy reached a wrapper or a view: {s}");
         }
     }
-    assert_eq!(on_tables, 27);
+    assert_eq!(on_tables, 28);
 
     assert!(
         !rendered(&clustered()).contains("storage_policy"),
@@ -565,6 +566,7 @@ fn the_file_still_answers_the_two_run_time_questions() {
         "metric_series_mv",
         "metric_metadata_mv",
         "metric_hist_samples_mv",
+        "metric_exemplars_mv",
         "metric_labels_mv",
         "metric_label_index_mv",
         "metric_label_values_mv",
@@ -912,7 +914,7 @@ fn the_citing_clustering_passages_name_the_section_holding_the_list() {
 /// Chaining one such view onto another's target would count every row
 /// twice, and the server would accept it without comment.
 ///
-/// The sources are pinned as a set too: sixteen views read a landing
+/// The sources are pinned as a set too: seventeen views read a landing
 /// table, three read `trace_spans` and one reads `trace_attrs_idx` — both
 /// of which the writer fills directly and no view targets.
 ///
@@ -965,7 +967,7 @@ fn no_insert_triggered_view_reads_a_table_another_view_writes() {
             sources.extend(own);
         }
     }
-    assert_eq!(targets.len(), 22, "twenty-two views");
+    assert_eq!(targets.len(), 23, "twenty-three views");
     assert_eq!(
         refreshable,
         vec![(
@@ -1059,7 +1061,7 @@ fn metric_landing_carries_no_event_id() {
         !columns.contains(&"event_id"),
         "metric_landing still declares event_id: {columns:?}"
     );
-    assert_eq!(columns.len(), 26, "the 26 columns the writer sends");
+    assert_eq!(columns.len(), 28, "the 28 columns the writer sends");
     // Issue #635 part 4: the tenant leads, as it leads the key.
     assert_eq!(columns.first(), Some(&"org_id"));
     // The log and trace landing tables keep theirs: the trace table's
@@ -1224,7 +1226,7 @@ fn the_sample_tables_are_keyed_by_the_series_id() {
 #[test]
 fn both_sample_tables_keep_the_whole_key_in_memory() {
     for ctx in [single(), clustered()] {
-        for table in ["metric_samples", "metric_hist_samples"] {
+        for table in ["metric_samples", "metric_hist_samples", "metric_exemplars"] {
             let create = create_of(&ctx, table);
             assert!(
                 line_of(&create, "SETTINGS").contains(
@@ -1234,6 +1236,68 @@ fn both_sample_tables_keep_the_whole_key_in_memory() {
             );
         }
     }
+}
+
+/// **Issue #501 part 1: `metric_exemplars` is a sample table with two
+/// ids.** Its key, partition, TTL and windows are `metric_samples`' own;
+/// its granule is 1,024 rows; its view copies kind 4 of the landing table,
+/// and its wrapper shards with the rest of the metrics family.
+#[test]
+fn the_exemplar_table_is_a_sample_table_with_two_ids() {
+    assert_eq!(
+        pulsus_schema::table_column_names("metric_exemplars").expect("in the file"),
+        vec![
+            "org_id",
+            "fingerprint",
+            "unix_milli",
+            "value",
+            "trace_id",
+            "span_id",
+            "labels"
+        ],
+    );
+    for ctx in [single(), clustered()] {
+        let create = create_of(&ctx, "metric_exemplars");
+        let samples = create_of(&ctx, "metric_samples");
+        assert_eq!(
+            line_of(&create, "ORDER BY"),
+            "ORDER BY (org_id, fingerprint, unix_milli)"
+        );
+        for prefix in ["PARTITION BY", "TTL"] {
+            assert_eq!(
+                line_of(&create, prefix),
+                line_of(&samples, prefix),
+                "{prefix}"
+            );
+        }
+        assert!(
+            line_of(&create, "SETTINGS").contains("index_granularity = 1024,"),
+            "{create}"
+        );
+        // Every other setting is `metric_samples`' own.
+        assert_eq!(
+            line_of(&create, "SETTINGS").replace("index_granularity = 1024,", ""),
+            line_of(&samples, "SETTINGS").replace("index_granularity = 8192,", ""),
+        );
+    }
+    let view = pulsus_schema::mv_projection("metric_exemplars_mv", &single())
+        .expect("the view is in the file");
+    for pair in [
+        "org_id AS org_id",
+        "fingerprint AS fingerprint",
+        "unix_milli AS unix_milli",
+        "value AS value",
+        "ex_trace_id AS trace_id",
+        "ex_span_id AS span_id",
+        "labels AS labels",
+    ] {
+        assert!(view.contains(pair), "{pair}: {view}");
+    }
+    assert!(view.trim_end().ends_with("WHERE kind = 4"), "{view}");
+    assert!(
+        rendered(&clustered()).contains("'metric_exemplars', cityHash64(fingerprint))"),
+        "the wrapper shards by the series ID"
+    );
 }
 
 /// Issue #595 part 2: the script refuses, with exit status 2, every item
@@ -1346,6 +1410,7 @@ fn the_write_path_tables_write_with_adaptive_buffers_in_both_modes() {
         "metric_landing",
         "metric_samples",
         "metric_hist_samples",
+        "metric_exemplars",
         "metric_labels",
         "metric_label_index",
     ] {
