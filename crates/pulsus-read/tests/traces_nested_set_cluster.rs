@@ -1062,14 +1062,18 @@ async fn place_calls(client: &ChClient, tag: &str, server: &str, calls: u64, at:
 }
 
 /// C1's placement, #598 part 2a's R14 shape: one shard alone holds
-/// `svc-x`, the other alone `svc-z`, and both hold some `svc-y`.
-async fn place_c1(shard1: &ChClient, shard2: &ChClient, l: i64, only_shard2: bool) {
-    if !only_shard2 {
+/// `svc-x`, the other alone `svc-z`, and both hold some `svc-y`. `again`
+/// places shard 2's calls a second time under new ids: a byte-identical
+/// block would be dropped by the replicated table's block deduplication,
+/// which `TRUNCATE` does not reset.
+async fn place_c1(shard1: &ChClient, shard2: &ChClient, l: i64, again: bool) {
+    let tag = if again { "again" } else { "first" };
+    if !again {
         place_calls(shard1, "c1x", "svc-x", 2, l + 10 * S).await;
         place_calls(shard1, "c1y", "svc-y", 1, l + 20 * S).await;
     }
-    place_calls(shard2, "c2y", "svc-y", 3, l + 30 * S).await;
-    place_calls(shard2, "c2z", "svc-z", 1, l + 40 * S).await;
+    place_calls(shard2, &format!("c2y{tag}"), "svc-y", 3, l + 30 * S).await;
+    place_calls(shard2, &format!("c2z{tag}"), "svc-z", 1, l + 40 * S).await;
 }
 
 /// `(client, server, calls)` of a graph, in order.
