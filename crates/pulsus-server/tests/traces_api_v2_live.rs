@@ -7124,6 +7124,17 @@ async fn an_uncovered_window_is_paired_from_spans() {
     );
 }
 
+/// The non-empty parts `service_edges` has received, from `system.part_log`.
+async fn new_parts(client: &ChClient) -> u64 {
+    ch_exec(client, "SYSTEM FLUSH LOGS").await;
+    ch_count(
+        client,
+        "SELECT count() AS n FROM system.part_log WHERE database = currentDatabase() \
+         AND table = 'service_edges' AND event_type = 'NewPart' AND rows > 0",
+    )
+    .await
+}
+
 /// F1: a fresh deployment answers at once: its first run writes one
 /// marker at the newest ready bucket, a push is paired from spans at once
 /// and from totals once the job covers it.
@@ -7158,6 +7169,26 @@ async fn a_fresh_deployment_answers_at_once() {
         at(before),
         at(after)
     );
+    // Caught up, a refresh writes nothing: no row, so no part. With no
+    // `GROUP BY` the marker branch is an aggregate and returns one row
+    // whatever its `WHERE`; its `HAVING` is what drops it.
+    let mut checked = false;
+    for _ in 0..3 {
+        let ready = newest_ready_marker(&client).await;
+        let before_parts = new_parts(&client).await;
+        refresh_once(&client).await;
+        let after_parts = new_parts(&client).await;
+        if newest_ready_marker(&client).await != ready {
+            continue;
+        }
+        assert_eq!(
+            after_parts, before_parts,
+            "F1: a refresh with no newly eligible bucket adds no part"
+        );
+        checked = true;
+        break;
+    }
+    assert!(checked, "F1: no refresh landed inside one eligibility step");
     ch_exec(&client, "SYSTEM STOP MERGES spans").await;
     let l = floor_to(now_ns(), MINUTE) - 2 * MINUTE;
     push_g(port, l, 0, "F1");
@@ -7301,19 +7332,43 @@ async fn the_coverage_read_touches_only_the_markers() {
         edges.iter().all(|e| e.calls == 60),
         "S1: sixty calls each: {edges:?}"
     );
+    // The route's own statement, measured again with the query condition
+    // cache off, so a cached condition cannot lower the figure.
     ch_exec(&client, "SYSTEM FLUSH LOGS").await;
-    let read = ch_count(
+    let statement = ch_string(
         &client,
         &format!(
-            "SELECT read_rows AS n FROM system.query_log WHERE type = 'QueryFinish' \
+            "SELECT query AS s FROM system.query_log WHERE type = 'QueryFinish' \
              AND log_comment = '{id}' AND is_initial_query"
         ),
     )
     .await;
     assert!(
-        read <= 3_248,
-        "S1: the covered hour reads at most its 1,200 rows and two granules, not every \
-         marker row of the table: {read}"
+        statement.contains("service_edges"),
+        "S1: the route's statement: {statement}"
+    );
+    let measured = pulsus_testkit::test_ident(&format!("s1_{}", now_ns()));
+    client
+        .query_strings(
+            &format!("SELECT toString(count()) AS s FROM ({statement})"),
+            &QuerySettings::new()
+                .set("use_query_condition_cache", 0u64)
+                .set("query_id", measured.as_str()),
+        )
+        .await
+        .expect("S1: the statement again");
+    ch_exec(&client, "SYSTEM FLUSH LOGS").await;
+    let read = ch_count(
+        &client,
+        &format!(
+            "SELECT read_rows AS n FROM system.query_log WHERE type = 'QueryFinish' \
+             AND query_id = '{measured}'"
+        ),
+    )
+    .await;
+    assert!(
+        read <= 8_192,
+        "S1: the covered hour reads a few granules, not every row of the table: {read}"
     );
 }
 
@@ -7523,6 +7578,83 @@ async fn a_marker_expires_with_its_bucket_start() {
         left,
         vec!["rpc:svc-y".to_string()],
         "T2: the marker expires with the row at its bucket's start"
+    );
+}
+
+/// Z1 (L1): a half stored after its bucket is finalized is not added to
+/// the totals. The server half sits in a finalized bucket; its client
+/// arrives later, inside the next bucket's client margin, and that run
+/// pairs only its own bucket's servers.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_half_stored_after_its_bucket_is_finalized_is_not_counted() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_424;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_v2_it_g599_z1")).await;
+    let _server = spawn_ready(port, &db);
+    let client = ch_data(&db).await;
+    let l = fixture_anchor();
+    reset_edges(&client, l - MINUTE).await;
+    ch_exec(&client, "SYSTEM STOP MERGES spans").await;
+    let trace = g_trace(0, 7, 9);
+    let c9 = g_span_id(0, 7, 1);
+    ingest(
+        port,
+        "svc-k",
+        vec![g_span(
+            trace,
+            g_span_id(0, 7, 2),
+            Some(c9),
+            SpanKind::Server,
+            l + 4 * MINUTE + 50 * SEC,
+            MILLI,
+            false,
+            vec![],
+        )],
+        "Z1: s9",
+    );
+    let select = ch_string(
+        &client,
+        "SELECT as_select AS s FROM system.tables WHERE database = currentDatabase() \
+         AND name = 'service_edges_mv'",
+    )
+    .await;
+    let run = format!("INSERT INTO service_edges SELECT * FROM ({select})");
+    ch_exec(&client, &run).await;
+    assert_eq!(
+        markers(&client).await,
+        vec![l - MINUTE, l + 4 * MINUTE],
+        "Z1: the first run finalizes s9's bucket"
+    );
+    ingest(
+        port,
+        "svc-j",
+        vec![g_span(
+            trace,
+            c9,
+            None,
+            SpanKind::Client,
+            l + 4 * MINUTE + 40 * SEC,
+            SEC,
+            false,
+            vec![],
+        )],
+        "Z1: c9, late",
+    );
+    ch_exec(&client, &run).await;
+    assert_eq!(
+        markers(&client).await,
+        vec![l - MINUTE, l + 4 * MINUTE, l + 9 * MINUTE],
+        "Z1: the second run finalizes the next bucket"
+    );
+    drop_the_spans(&client).await;
+    let got = graph_edges_of(port, l, l + 10 * MINUTE, "Z1");
+    assert!(
+        !got.iter()
+            .any(|e| e.client == "svc-j" && e.server == "svc-k"),
+        "Z1: the late client is not added to the totals: {got:?}"
     );
 }
 
