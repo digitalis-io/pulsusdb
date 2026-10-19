@@ -110,6 +110,11 @@ struct Shared {
     /// own byte counter. Additional to the two tables above, which keep
     /// writing until task 20.
     landing: TraceLandingPath,
+    /// Test-only: runs a case's hook from inside this struct's teardown,
+    /// after the landing path and its queue's sender is dropped and before the boundary is
+    /// (`writer::teardown_probe`). Field order is drop order.
+    #[cfg(test)]
+    teardown_probe: crate::writer::teardown_probe::TeardownProbe,
     /// Issue #494's per-signal push-suppression index, extended to the trace
     /// push by issue #586. `None` while `PULSUS_INGEST_DEDUP` is off.
     dedup: Option<Arc<PushDedup>>,
@@ -328,6 +333,8 @@ impl TraceWriter {
             attrs_task: Mutex::new(Some(attrs_task)),
             attrs_backfill_task: Mutex::new(Some(attrs_backfill_task)),
             landing,
+            #[cfg(test)]
+            teardown_probe: Default::default(),
             dedup,
             boundary,
         });
@@ -742,5 +749,91 @@ mod tests {
             }
         }
         assert!(mismatches.is_empty(), "mismatches: {mismatches:?}");
+    }
+
+    /// [`crate::writer::log`]'s case of the same name, for the trace
+    /// writer's landing path: B is refused between the landing sender's
+    /// teardown and the boundary's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_queued_trace_block_is_refused_between_the_senders_and_the_boundarys_teardown() {
+        use crate::writer::teardown_probe::{
+            OkInserter, ParkingInserter, assert_b_filed_never_sent, release_then_wait_for_b,
+            spool_root,
+        };
+        use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+        use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+        use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+
+        const TS: u64 = 1_700_000_000_000_000_000;
+        let push = |span_id: u8| {
+            let req = ExportTraceServiceRequest {
+                resource_spans: vec![ResourceSpans {
+                    resource: Some(Resource {
+                        attributes: vec![KeyValue {
+                            key: "service.name".to_string(),
+                            value: Some(AnyValue {
+                                value: Some(any_value::Value::StringValue("checkout".to_string())),
+                            }),
+                            key_strindex: 0,
+                        }],
+                        ..Default::default()
+                    }),
+                    scope_spans: vec![ScopeSpans {
+                        spans: vec![Span {
+                            trace_id: vec![0xab; 16],
+                            span_id: vec![span_id; 8],
+                            name: "op".to_string(),
+                            start_time_unix_nano: TS,
+                            end_time_unix_nano: TS + 1_000_000,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+            };
+            (
+                crate::parse_traces(&req, TS as i64).expect("the old path's decode"),
+                crate::parse_trace_landing(&req, TS as i64).expect("the landing decode"),
+            )
+        };
+
+        let inserter = ParkingInserter::new();
+        let root = spool_root("trace");
+        let mut runtime = WriterRuntime::from_config(&WriterConfig::default());
+        runtime.spool_dir = root.clone();
+        runtime.trace_landing_inserters = 1;
+        let writer = TraceWriter::with_inserters_and_runtime(
+            Arc::new(OkInserter),
+            Arc::new(OkInserter),
+            inserter.clone(),
+            runtime,
+            TraceWriterTables::traces_default(),
+        );
+        for span_id in [1, 2] {
+            let (parsed, landed) = push(span_id);
+            writer
+                .admit(parsed, landed, PushHeaders::default())
+                .expect("the push is admitted");
+            if span_id == 1 {
+                // A is in flight before B is queued.
+                inserter
+                    .entered
+                    .acquire()
+                    .await
+                    .expect("the entered semaphore is never closed")
+                    .forget();
+            }
+        }
+        writer.shared.teardown_probe.set(release_then_wait_for_b(
+            inserter.clone(),
+            root.clone(),
+            trace_landing::LANDING_TABLE,
+        ));
+        drop(writer);
+
+        assert_b_filed_never_sent(&inserter, &root, trace_landing::LANDING_TABLE).await;
+        std::fs::remove_dir_all(&root).ok();
     }
 }

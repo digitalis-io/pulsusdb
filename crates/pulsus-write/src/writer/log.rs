@@ -120,6 +120,11 @@ struct Shared {
     /// sent and is the only gate, so what the queue holds is bounded by
     /// `PULSUS_INGEST_QUEUE_BYTES`, whatever number of blocks that comes to.
     landing_tx: mpsc::UnboundedSender<LandingBlock<LogLandingRow>>,
+    /// Test-only: runs a case's hook from inside this struct's teardown,
+    /// after the queue's sender is dropped and before the boundary is
+    /// (`writer::teardown_probe`). Field order is drop order.
+    #[cfg(test)]
+    teardown_probe: crate::writer::teardown_probe::TeardownProbe,
     ctx: Arc<LandingContext<LogLandingRow>>,
     /// Issue #494's per-signal push-suppression index. `None` while
     /// `PULSUS_INGEST_DEDUP` is off.
@@ -271,6 +276,8 @@ impl LogWriter {
 
         let shared = Arc::new(Shared {
             landing_tx,
+            #[cfg(test)]
+            teardown_probe: Default::default(),
             ctx,
             dedup,
             queued_bytes,
@@ -1437,5 +1444,61 @@ mod tests {
             charged[1],
             charged[0]
         );
+    }
+
+    /// The window only `Shared`'s own `Drop` closes: the queue's sender is
+    /// gone and the boundary is not. One worker is parked in block A's
+    /// insert with block B queued behind it; the probe, which drops between
+    /// the two, lets A return and waits for the worker to reach B. A writer
+    /// that cancels first has already published a passed deadline there, so
+    /// B is refused and filed never sent; one that cancels only when the
+    /// boundary drops lets A commit and starts B's insert.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_queued_log_block_is_refused_between_the_senders_and_the_boundarys_teardown() {
+        use crate::writer::teardown_probe::{
+            ParkingInserter, assert_b_filed_never_sent, release_then_wait_for_b, spool_root,
+        };
+        const TS: i64 = 1_700_000_000_000_000_000;
+        let inserter = ParkingInserter::new();
+        let root = spool_root("log");
+        let mut runtime = runtime_at(&WriterConfig::default(), &root);
+        runtime.log_landing_inserters = 1;
+        let writer = LogWriter::with_landing_inserter_and_runtime(
+            inserter.clone(),
+            runtime,
+            WriterTables::logs_default(),
+        );
+        let tenant = pulsus_model::Tenant::from_header(None, false).expect("the empty tenant");
+        for (fp, body) in [(7, "a"), (8, "b")] {
+            writer
+                .admit(
+                    &tenant,
+                    ParsedLogs {
+                        rows: vec![log_row(fp, TS, body)],
+                        streams: vec![stream_row(fp, TS)],
+                        ..Default::default()
+                    },
+                    PushHeaders::default(),
+                )
+                .expect("the push is admitted");
+            if fp == 7 {
+                // A is in flight before B is queued.
+                inserter
+                    .entered
+                    .acquire()
+                    .await
+                    .expect("the entered semaphore is never closed")
+                    .forget();
+            }
+        }
+        writer.shared.teardown_probe.set(release_then_wait_for_b(
+            inserter.clone(),
+            root.clone(),
+            LANDING_TABLE,
+        ));
+        drop(writer);
+
+        assert_b_filed_never_sent(&inserter, &root, LANDING_TABLE).await;
+        std::fs::remove_dir_all(&root).ok();
     }
 }

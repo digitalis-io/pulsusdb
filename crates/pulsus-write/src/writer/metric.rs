@@ -142,6 +142,11 @@ struct Shared {
     /// sent and is the only gate, so what the queue holds is bounded by
     /// `PULSUS_INGEST_QUEUE_BYTES`, whatever number of blocks that comes to.
     landing_tx: mpsc::UnboundedSender<LandingBlock<MetricLandingRow>>,
+    /// Test-only: runs a case's hook from inside this struct's teardown,
+    /// after the queue's sender is dropped and before the boundary is
+    /// (`writer::teardown_probe`). Field order is drop order.
+    #[cfg(test)]
+    teardown_probe: crate::writer::teardown_probe::TeardownProbe,
     ctx: Arc<LandingContext<MetricLandingRow>>,
     /// Issue #494's per-signal push-suppression index. `None` while
     /// `PULSUS_INGEST_DEDUP` is off.
@@ -344,6 +349,8 @@ impl MetricWriter {
 
         let shared = Arc::new(Shared {
             landing_tx,
+            #[cfg(test)]
+            teardown_probe: Default::default(),
             ctx,
             dedup,
             queued_bytes,
@@ -1551,5 +1558,58 @@ mod tests {
             unit: "seconds".to_string(),
             updated_ns: 7,
         }
+    }
+
+    /// [`crate::writer::log`]'s case of the same name, for the metric
+    /// writer: B is refused between the sender's teardown and the
+    /// boundary's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_queued_metric_block_is_refused_between_the_senders_and_the_boundarys_teardown() {
+        use crate::writer::teardown_probe::{
+            ParkingInserter, assert_b_filed_never_sent, release_then_wait_for_b, spool_root,
+        };
+        let inserter = ParkingInserter::new();
+        let root = spool_root("metric");
+        let mut runtime = WriterRuntime::from_config(&pulsus_config::WriterConfig::default());
+        runtime.spool_dir = root.clone();
+        runtime.metrics_landing_inserters = 1;
+        let writer = MetricWriter::with_landing_inserter_and_runtime(
+            inserter.clone(),
+            runtime,
+            BUCKET_MS,
+            MetricWriterTables::metrics_default(),
+        );
+        let tenant = pulsus_model::Tenant::from_header(None, false).expect("the empty tenant");
+        for fp in [7, 8] {
+            writer
+                .admit(
+                    &tenant,
+                    ParsedMetrics {
+                        samples: vec![sample(fp, 1_000)],
+                        series: vec![series_ref(fp)],
+                        ..Default::default()
+                    },
+                    PushHeaders::default(),
+                )
+                .expect("the push is admitted");
+            if fp == 7 {
+                // A is in flight before B is queued.
+                inserter
+                    .entered
+                    .acquire()
+                    .await
+                    .expect("the entered semaphore is never closed")
+                    .forget();
+            }
+        }
+        writer.shared.teardown_probe.set(release_then_wait_for_b(
+            inserter.clone(),
+            root.clone(),
+            LANDING_TABLE,
+        ));
+        drop(writer);
+
+        assert_b_filed_never_sent(&inserter, &root, LANDING_TABLE).await;
+        std::fs::remove_dir_all(&root).ok();
     }
 }
