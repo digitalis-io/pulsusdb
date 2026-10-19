@@ -1,6 +1,6 @@
 //! `pulsusdb rebuild-metrics`: replays a window of `metric_landing` into one
-//! of the seven tables the materialized views maintain (issues #603, #623,
-//! #635); `pulsusdb rebuild-logs` does the same over `log_landing` and the
+//! of the eight tables the materialized views maintain (issues #603, #623,
+//! #635, #501); `pulsusdb rebuild-logs` does the same over `log_landing` and the
 //! five log tables (issue #653).
 //!
 //! **Why it exists.** A view never reconciles against its source — it reacts
@@ -29,7 +29,7 @@ use pulsus_read::metrics::TenantSql;
 
 use crate::chconfig::{conn_config_from, schema_params_from};
 
-/// The seven targets, each with the materialized view that maintains it and,
+/// The eight targets, each with the materialized view that maintains it and,
 /// where a replay must drop partitions first, the expression they are keyed
 /// on.
 ///
@@ -37,9 +37,9 @@ use crate::chconfig::{conn_config_from, schema_params_from};
 /// replacing table keyed on `metric_name`, so a replayed row is the same row
 /// or loses to a newer one; `metric_labels` and `metric_series` aggregate,
 /// so a replayed row folds into the one stored — `min` and `max` of the same
-/// instants, an OR of the same hours (issue #623). The two sample tables are
-/// append-only, so a replay that does not drop first stores every row twice
-/// and inflates every counting query.
+/// instants, an OR of the same hours (issue #623). The two sample tables and
+/// the exemplars (issue #501) are append-only, so a replay that does not drop
+/// first stores every row twice and inflates every counting query.
 const TARGETS: &[(&str, &str, Option<&str>)] = &[
     (
         "metric_samples",
@@ -49,6 +49,11 @@ const TARGETS: &[(&str, &str, Option<&str>)] = &[
     (
         "metric_hist_samples",
         "metric_hist_samples_mv",
+        Some("toDate(fromUnixTimestamp64Milli(unix_milli))"),
+    ),
+    (
+        "metric_exemplars",
+        "metric_exemplars_mv",
         Some("toDate(fromUnixTimestamp64Milli(unix_milli))"),
     ),
     // Partitioned by day, but no need to drop (issue #623): a replayed row
@@ -73,7 +78,7 @@ const TARGETS: &[(&str, &str, Option<&str>)] = &[
 pub(crate) struct RebuildMetrics {
     /// Which table to rebuild: `metric_samples`, `metric_series`,
     /// `metric_metadata`, `metric_labels`, `metric_hist_samples`,
-    /// `metric_label_index` or `metric_label_values`.
+    /// `metric_exemplars`, `metric_label_index` or `metric_label_values`.
     #[arg(long)]
     target: String,
 
@@ -88,7 +93,8 @@ pub(crate) struct RebuildMetrics {
     /// Drop the target partitions the replayed rows fall in first. This
     /// deletes **every** row in those partitions, every tenant's, including
     /// data the landing table no longer holds. Without it the two sample
-    /// tables are refused, because a replay would store their rows twice.
+    /// tables and the exemplars are refused, because a replay would store
+    /// their rows twice.
     /// With `--tenant` no partition is dropped: that tenant's rows on those
     /// days are deleted instead, and no other tenant's.
     #[arg(long)]

@@ -10,7 +10,9 @@ use std::sync::Arc;
 use pulsus_model::{Fingerprint, LabelSet};
 use serde::{Deserialize, Serialize};
 
-use crate::ingest::metrics::{HistogramPoint, MetricMetadata, MetricPoint, SeriesRef};
+use crate::ingest::metrics::{
+    ExemplarPoint, HistogramPoint, MetricMetadata, MetricPoint, SeriesRef,
+};
 use crate::ingest::traces::{
     AttrRecord, LandingResource, LandingSpan, LandingTagName, LandingTagValue, SpanRecord,
 };
@@ -876,7 +878,7 @@ impl SpoolEncode for MetricMetadataRow {
 ///
 /// `kind` says which event the row is; a row sets that kind's columns and
 /// leaves the rest at the type's default. The fields are the landing
-/// table's 26 columns, in the table's own declaration order: the insert's
+/// table's 28 columns, in the table's own declaration order: the insert's
 /// column list is exactly this type's `COLUMN_NAMES`.
 ///
 /// No `PartialEq` derive, for [`MetricSampleRow`]'s reason: `value`,
@@ -911,6 +913,10 @@ pub struct MetricLandingRow {
     pub hist_neg_bucket_deltas: Vec<i64>,
     pub hist_custom_values: Vec<f64>,
     pub hist_counter_reset_hint: u8,
+    /// Issue #501: a kind-4 row's exemplar ids, all zero for none.
+    /// `[u8; N]` is `FixedString(N)` on the RowBinary wire.
+    pub ex_trace_id: [u8; 16],
+    pub ex_span_id: [u8; 8],
 }
 
 /// One landing row's own inline footprint, in the shape the WRITER QUEUE
@@ -920,8 +926,8 @@ pub struct MetricLandingRow {
 ///
 /// A landing row is the union of the four target rows' columns, so it is far
 /// wider than any one of them: three `i64`s, three `f64`s, two `u64`s, a
-/// 16-byte fingerprint, four `String` headers, seven `Vec` headers and four
-/// small integers. What a target row costs prices only the text and array
+/// 16-byte fingerprint, four `String` headers, seven `Vec` headers, four
+/// small integers and the two exemplar ids. What a target row costs prices only the text and array
 /// elements the row owns; the queue also holds all of those slots, every one
 /// of them whether or not its kind uses it.
 pub const LANDING_ROW_SLOT_BYTES: u64 = std::mem::size_of::<MetricLandingRow>() as u64;
@@ -946,6 +952,8 @@ impl MetricLandingRow {
     pub const KIND_SERIES: u8 = 2;
     /// A metadata descriptor, whose target is `metric_metadata`.
     pub const KIND_METADATA: u8 = 3;
+    /// An exemplar, whose target is `metric_exemplars` (issue #501).
+    pub const KIND_EXEMPLAR: u8 = 4;
 
     /// A row of `kind` with every kind-specific column at its default.
     fn of_kind(org_id: &Arc<str>, received_ms: i64, kind: u8) -> Self {
@@ -976,6 +984,8 @@ impl MetricLandingRow {
             hist_neg_bucket_deltas: Vec::new(),
             hist_custom_values: Vec::new(),
             hist_counter_reset_hint: 0,
+            ex_trace_id: [0; 16],
+            ex_span_id: [0; 8],
         }
     }
 
@@ -1059,6 +1069,31 @@ impl MetricLandingRow {
             ..Self::of_kind(org_id, received_ms, Self::KIND_METADATA)
         }
     }
+
+    /// A kind-4 row: the columns `metric_exemplars_mv` reads, and no others
+    /// (issue #501).
+    pub fn exemplar(org_id: &Arc<str>, received_ms: i64, exemplar: &ExemplarPoint) -> Self {
+        // Spare capacity given back, for [`Self::series`]' reason.
+        let mut labels = exemplar.labels.to_canonical_json();
+        labels.shrink_to_fit();
+        MetricLandingRow {
+            metric_name: exemplar.metric_name.to_string(),
+            fingerprint: exemplar.fingerprint,
+            unix_milli: exemplar.unix_milli,
+            value: exemplar.value,
+            labels,
+            ex_trace_id: exemplar.trace_id,
+            ex_span_id: exemplar.span_id,
+            ..Self::of_kind(org_id, received_ms, Self::KIND_EXEMPLAR)
+        }
+    }
+
+    /// The buffers a kind-4 row prices: the name, the 16-byte fingerprint,
+    /// `unix_milli`, `value`, the two ids and the canonical labels.
+    pub fn exemplar_source_bytes(exemplar: &ExemplarPoint) -> u64 {
+        (exemplar.metric_name.len() + 16 + 8 + 8 + 16 + 8) as u64
+            + estimate_canonical_json_len(&exemplar.labels) as u64
+    }
 }
 
 impl SpoolEncode for MetricLandingRow {
@@ -1116,7 +1151,20 @@ impl SpoolEncode for MetricLandingRow {
                 "labels": self.labels,
                 "value_type": self.value_type,
             }),
-            // Every row is one of the four kinds — nothing else constructs
+            Self::KIND_EXEMPLAR => serde_json::json!({
+                "kind": self.kind,
+                "org_id": &*self.org_id,
+                "received_ms": self.received_ms,
+                "metric_name": self.metric_name,
+                "fingerprint": self.fingerprint,
+                "unix_milli": self.unix_milli,
+                "value": finite_or_null(self.value),
+                "value_bits": self.value.to_bits().to_string(),
+                "trace_id": hex_lower(&self.ex_trace_id),
+                "span_id": hex_lower(&self.ex_span_id),
+                "labels": self.labels,
+            }),
+            // Every row is one of the five kinds — nothing else constructs
             // one — so this arm is the descriptor's. Matching it as the
             // fallback rather than panicking keeps the audit record
             // readable on the one path that reaches this encoder at all,
@@ -1225,6 +1273,21 @@ impl SpoolEncode for MetricLandingRow {
                 o.field("received_ms", &self.received_ms).await?;
                 o.field("unix_milli", &self.unix_milli).await?;
                 o.field("value_type", &self.value_type).await?;
+            }
+            Self::KIND_EXEMPLAR => {
+                o.field("fingerprint", &self.fingerprint).await?;
+                o.field("kind", &self.kind).await?;
+                o.str_field("labels", &self.labels).await?;
+                o.str_field("metric_name", &self.metric_name).await?;
+                o.str_field("org_id", &self.org_id).await?;
+                o.field("received_ms", &self.received_ms).await?;
+                o.str_field("span_id", &hex_lower(&self.ex_span_id)).await?;
+                o.str_field("trace_id", &hex_lower(&self.ex_trace_id))
+                    .await?;
+                o.field("unix_milli", &self.unix_milli).await?;
+                o.field("value", &FiniteOrNull(self.value)).await?;
+                o.str_field("value_bits", &self.value.to_bits().to_string())
+                    .await?;
             }
             // The descriptor's arm, as the fallback, for the reason
             // [`Self::to_spool_value`]'s own fallback gives.
@@ -2339,10 +2402,10 @@ mod tests {
 
     // -- the landing row (issue #603) ---------------------------------
 
-    /// The 26 columns `metric_landing` declares, in its own declaration
+    /// The 28 columns `metric_landing` declares, in its own declaration
     /// order. Written out here so the row type cannot drift from the schema
     /// silently.
-    const LANDING_COLUMNS: [&str; 26] = [
+    const LANDING_COLUMNS: [&str; 28] = [
         "org_id",
         "received_ms",
         "kind",
@@ -2369,6 +2432,8 @@ mod tests {
         "hist_neg_bucket_deltas",
         "hist_custom_values",
         "hist_counter_reset_hint",
+        "ex_trace_id",
+        "ex_span_id",
     ];
 
     /// The `log_landing` columns, in the table's own declaration order
@@ -2446,6 +2511,83 @@ mod tests {
             names,
             LANDING_COLUMNS.as_slice(),
             "in the table's own order"
+        );
+    }
+
+    /// The exemplar the kind-4 cases below are built from: name `m`, series
+    /// 3, at 1,000 ms, value 0.25, trace `01..10`, span `11..18`, labels
+    /// `{a: b}`.
+    fn test_exemplar() -> ExemplarPoint {
+        let (labels, _) = LabelSet::from_normalized([("a".to_string(), "b".to_string())]);
+        ExemplarPoint {
+            metric_name: Arc::from("m"),
+            fingerprint: Fingerprint::from_raw(3),
+            unix_milli: 1_000,
+            value: 0.25,
+            trace_id: std::array::from_fn(|i| i as u8 + 1),
+            span_id: std::array::from_fn(|i| i as u8 + 17),
+            labels,
+            histogram: false,
+        }
+    }
+
+    /// **W2 (issue #501): a kind-4 row carries the exemplar's columns and
+    /// no other kind's.** A float sample's ids stay zero.
+    #[test]
+    fn an_exemplar_row_carries_its_ids_and_labels_and_nothing_else() {
+        let row = MetricLandingRow::exemplar(&Arc::from("t"), 7, &test_exemplar());
+        assert_eq!(row.kind, MetricLandingRow::KIND_EXEMPLAR);
+        assert_eq!(row.kind, 4);
+        assert_eq!(&*row.org_id, "t");
+        assert_eq!(row.received_ms, 7);
+        assert_eq!(row.metric_name, "m");
+        assert_eq!(row.fingerprint, Fingerprint::from_raw(3));
+        assert_eq!(row.unix_milli, 1_000);
+        assert_eq!(row.value.to_bits(), 0.25f64.to_bits());
+        assert_eq!(
+            row.ex_trace_id,
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        );
+        assert_eq!(row.ex_span_id, [17, 18, 19, 20, 21, 22, 23, 24]);
+        assert_eq!(row.labels, r#"{"a":"b"}"#);
+        assert_eq!(row.value_type, 0);
+        assert_eq!(row.metric_type, "");
+        assert_eq!(row.help, "");
+        assert_eq!(row.unit, "");
+        assert_eq!(row.updated_ns, 0);
+        assert_eq!(row.hist_schema, 0);
+        assert_eq!(row.hist_zero_threshold.to_bits(), 0);
+        assert_eq!(row.hist_zero_count, 0);
+        assert_eq!(row.hist_count, 0);
+        assert_eq!(row.hist_sum.to_bits(), 0);
+        assert!(row.hist_pos_span_offsets.is_empty());
+        assert!(row.hist_pos_span_lengths.is_empty());
+        assert!(row.hist_pos_bucket_deltas.is_empty());
+        assert!(row.hist_neg_span_offsets.is_empty());
+        assert!(row.hist_neg_span_lengths.is_empty());
+        assert!(row.hist_neg_bucket_deltas.is_empty());
+        assert!(row.hist_custom_values.is_empty());
+        assert_eq!(row.hist_counter_reset_hint, 0);
+
+        let float = landing_float(1.0);
+        assert_eq!(float.ex_trace_id, [0; 16]);
+        assert_eq!(float.ex_span_id, [0; 8]);
+    }
+
+    /// **The kind-4 estimator prices the buffers the row owns**: name + 16
+    /// fingerprint + 8 time + 8 value + 16 trace id + 8 span id + the
+    /// canonical labels, 59 bytes for name `m` and labels `{}`.
+    #[test]
+    fn the_exemplar_estimate_is_its_fixed_columns_and_its_labels() {
+        let (empty, _) = LabelSet::from_normalized(Vec::<(String, String)>::new());
+        let bare = ExemplarPoint {
+            labels: empty,
+            ..test_exemplar()
+        };
+        assert_eq!(MetricLandingRow::exemplar_source_bytes(&bare), 59);
+        assert_eq!(
+            MetricLandingRow::exemplar_source_bytes(&test_exemplar()),
+            57 + r#"{"a":"b"}"#.len() as u64
         );
     }
 

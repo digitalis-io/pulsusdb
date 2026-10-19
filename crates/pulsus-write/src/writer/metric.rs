@@ -385,7 +385,8 @@ impl MetricWriter {
         //
         // Suppression applies to the rows where duplication is harmful and
         // not to the one where omission is: a suppressed push stores no
-        // sample, series or histogram row, and still lands its descriptors.
+        // sample, series, histogram or exemplar row, and still lands its
+        // descriptors.
         let mut suppressed: Option<Suppressed> = None;
         let mut guard = match &self.shared.dedup {
             Some(dedup) => {
@@ -459,7 +460,7 @@ impl MetricWriter {
         // Reserve-before-materialize: estimate bytes and decide which
         // series are cache misses BEFORE cloning anything into a row shape.
         // Each landing row is charged the row the QUEUE holds — the union of
-        // the four kinds' columns — plus the buffers that kind's target
+        // every kind's columns — plus the buffers that kind's target
         // estimator prices; [`landing_charge`] adds what the block holds
         // besides its rows.
         let sample_bytes: u64 = batch
@@ -471,6 +472,14 @@ impl MetricWriter {
             .hist_samples
             .iter()
             .map(|h| MetricLandingRow::est_landing_bytes(MetricHistSampleRow::est_source_bytes(h)))
+            .sum();
+        // Issue #501: each exemplar is one kind-4 landing row.
+        let exemplar_bytes: u64 = batch
+            .exemplars
+            .iter()
+            .map(|e| {
+                MetricLandingRow::est_landing_bytes(MetricLandingRow::exemplar_source_bytes(e))
+            })
             .sum();
 
         // Which kind-2 rows the push has to register, and what they cost.
@@ -486,9 +495,11 @@ impl MetricWriter {
             })
             .sum();
 
-        let total_rows =
-            (batch.samples.len() + batch.hist_samples.len() + new_series.len() + descriptors.len())
-                as u64;
+        let total_rows = (batch.samples.len()
+            + batch.hist_samples.len()
+            + batch.exemplars.len()
+            + new_series.len()
+            + descriptors.len()) as u64;
 
         // **A valid push with no rows of any kind is answered here**, before
         // the charge, the two ceilings and the reservation (issue #603 code
@@ -514,10 +525,10 @@ impl MetricWriter {
         // already occupies.
         let tenant_bytes = tenant.as_str().len() as u64;
         let total_bytes = landing_charge::<MetricLandingRow>(
-            sample_bytes + series_bytes + metadata_bytes + hist_sample_bytes,
+            sample_bytes + series_bytes + metadata_bytes + hist_sample_bytes + exemplar_bytes,
         ) + tenant_bytes;
 
-        // The two per-push ceilings, counted over all four kinds, and decided
+        // The two per-push ceilings, counted over every kind, and decided
         // **before** either branch below queues anything (issue #603 code
         // review, finding 5). At or above the row limit the block would not be
         // strictly under the count both pinned row limits carry
@@ -529,7 +540,7 @@ impl MetricWriter {
         // A push the index recognises as a repeat is refused the same way, and
         // for the same reason: it does not fit one block, so storing any part
         // of it — its descriptors included — would leave a `413` that stored
-        // something. Its size is its own, over all four kinds, so one push
+        // something. Its size is its own, over every kind, so one push
         // gets one answer whether or not it raced a copy of itself.
         if total_rows >= self.shared.runtime.metrics_landing_max_rows
             || total_bytes > self.shared.runtime.batch_bytes
@@ -609,6 +620,12 @@ impl MetricWriter {
                 .hist_samples
                 .iter()
                 .map(|h| MetricLandingRow::hist_sample(org_id, received_ms, h)),
+        );
+        rows.extend(
+            batch
+                .exemplars
+                .iter()
+                .map(|e| MetricLandingRow::exemplar(org_id, received_ms, e)),
         );
         for (series, bucket, value_type) in &new_series {
             rows.push(MetricLandingRow::series(
@@ -736,7 +753,23 @@ impl MetricWriter {
                 VALUE_TYPE_HISTOGRAM,
             )
         });
-        for (metric_name, fingerprint, unix_milli, value_type) in float_keys.chain(hist_keys) {
+        // Issue #501: an exemplar registers its series in its own bucket, so
+        // a read resolving series through the activity mask finds it there.
+        let exemplar_keys = batch.exemplars.iter().map(|e| {
+            (
+                &e.metric_name,
+                e.fingerprint,
+                e.unix_milli,
+                if e.histogram {
+                    VALUE_TYPE_HISTOGRAM
+                } else {
+                    VALUE_TYPE_FLOAT
+                },
+            )
+        });
+        for (metric_name, fingerprint, unix_milli, value_type) in
+            float_keys.chain(hist_keys).chain(exemplar_keys)
+        {
             let bucket = floor_to_activity_bucket(unix_milli, self.shared.bucket_ms);
             let key: SeriesKey = (
                 Arc::clone(tenant.as_arc()),
@@ -934,7 +967,7 @@ mod tests {
     use pulsus_clickhouse::ChError;
 
     use super::*;
-    use crate::ingest::metrics::{HistogramPoint, MetricPoint};
+    use crate::ingest::metrics::{ExemplarPoint, HistogramPoint, MetricPoint};
     use crate::writer::push_dedup::PushDigest;
 
     /// A metric name long enough that a per-series owned copy of it is visible
@@ -1253,6 +1286,7 @@ mod tests {
             hist_samples: Vec<HistogramPoint>,
             series: Vec<SeriesRef>,
             descriptors: Vec<MetricMetadata>,
+            exemplars: Vec<ExemplarPoint>,
         }
 
         let shapes = vec![
@@ -1262,6 +1296,7 @@ mod tests {
                 hist_samples: Vec::new(),
                 series: Vec::new(),
                 descriptors: Vec::new(),
+                exemplars: Vec::new(),
             },
             Shape {
                 name: "one descriptor",
@@ -1269,6 +1304,7 @@ mod tests {
                 hist_samples: Vec::new(),
                 series: Vec::new(),
                 descriptors: vec![descriptor()],
+                exemplars: Vec::new(),
             },
             Shape {
                 name: "sixty new series",
@@ -1276,6 +1312,17 @@ mod tests {
                 hist_samples: vec![hist_sample(61, 1_000)],
                 series: (0..60u128).map(series_ref).collect(),
                 descriptors: vec![descriptor()],
+                exemplars: Vec::new(),
+            },
+            // Issue #501: the exemplar rows' label buffers are held until the
+            // block is encoded, so they are charged.
+            Shape {
+                name: "sixty exemplars",
+                samples: vec![sample(1, 1_000)],
+                hist_samples: Vec::new(),
+                series: Vec::new(),
+                descriptors: Vec::new(),
+                exemplars: (0..60u128).map(|i| exemplar(i, 1_000)).collect(),
             },
         ];
 
@@ -1308,11 +1355,21 @@ mod tests {
                     .map(|m| {
                         MetricLandingRow::est_landing_bytes(MetricMetadataRow::est_source_bytes(m))
                     })
+                    .sum::<u64>()
+                + shape
+                    .exemplars
+                    .iter()
+                    .map(|e| {
+                        MetricLandingRow::est_landing_bytes(
+                            MetricLandingRow::exemplar_source_bytes(e),
+                        )
+                    })
                     .sum::<u64>();
 
             // The rows `admit_batch` materializes for it, in its order.
             let total_rows = shape.samples.len()
                 + shape.hist_samples.len()
+                + shape.exemplars.len()
                 + shape.series.len()
                 + shape.descriptors.len();
             let mut rows: Vec<MetricLandingRow> = Vec::with_capacity(total_rows);
@@ -1326,6 +1383,12 @@ mod tests {
                     .hist_samples
                     .iter()
                     .map(|h| MetricLandingRow::hist_sample(&std::sync::Arc::<str>::from(""), 5, h)),
+            );
+            rows.extend(
+                shape
+                    .exemplars
+                    .iter()
+                    .map(|e| MetricLandingRow::exemplar(&std::sync::Arc::<str>::from(""), 5, e)),
             );
             rows.extend(shape.series.iter().map(|s| {
                 MetricLandingRow::series(
@@ -1450,6 +1513,21 @@ mod tests {
                 negative_buckets: vec![],
                 custom_values: vec![],
             },
+        }
+    }
+
+    /// An exemplar on series `fingerprint` carrying one label whose value is
+    /// 1,000 bytes long.
+    fn exemplar(fingerprint: u128, unix_milli: i64) -> ExemplarPoint {
+        ExemplarPoint {
+            metric_name: Arc::from(LONG_NAME),
+            fingerprint: Fingerprint::from_raw(fingerprint),
+            unix_milli,
+            value: 0.5,
+            trace_id: [1; 16],
+            span_id: [2; 8],
+            labels: LabelSet::from_normalized([("user".to_string(), "u".repeat(1_000))]).0,
+            histogram: false,
         }
     }
 
