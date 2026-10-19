@@ -690,6 +690,7 @@ docs/query-lowering.md	exec.rs:2165	ambiguous_basename
 docs/query-lowering.md	exec.rs:2306	ambiguous_basename
 docs/query-lowering.md	exec.rs:2810	ambiguous_basename
 docs/query-lowering.md	exec.rs:3267	pinned_to_another_version
+docs/query-lowering.md	exec.rs:709	ambiguous_basename
 docs/query-lowering.md	exec.rs:912	pinned_to_another_version
 docs/query-lowering.md	labels.rs:318	ambiguous_basename
 docs/query-lowering.md	labels.rs:328	ambiguous_basename

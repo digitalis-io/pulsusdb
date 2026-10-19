@@ -578,12 +578,10 @@ pub(super) fn exemplar_count_query(
     )
 }
 
-/// Statement A (issue #501 part 2): every distinct exemplar of the
-/// selected series in C's `[lo, hi]`, at most 100,001 rows — the last one
-/// the sign that there are more than the 100,000 an answer carries. Its
-/// `max_rows_to_group_by = 100000` bounds each node's own groups, and a
-/// node past it fails with code 158; shards each under it can merge to
-/// more, which only the 100,001st row shows.
+/// Statement A (issue #501 part 2): every distinct exemplar of the selected
+/// series in C's `[lo, hi]`, at most 100,001 rows: a 100,001st row, or a
+/// node's code 158 past its own `max_rows_to_group_by`, shows more than
+/// the 100,000 an answer carries (shards under it can merge to more).
 pub(super) fn exemplar_rows_query(
     tenant: &Tenant,
     t: ExemplarTables<'_>,
