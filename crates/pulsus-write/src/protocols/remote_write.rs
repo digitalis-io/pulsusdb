@@ -4509,5 +4509,25 @@ mod tests {
             "charge {}",
             exemplar_charge(&ex)
         );
+
+        // `parse` charges each exemplar before anything else is done with
+        // it: exemplars whose time drops every one of them still trip the
+        // budget, at the tipping exemplar.
+        let one = exemplar_charge(&Exemplar::default());
+        let count = MAX_EXPANDED_BYTES / one + 2;
+        let req = exemplar_request(
+            &[("__name__", "m")],
+            false,
+            vec![exemplar(&[], 1.0, 4_323_283_200_000); count],
+        );
+        let err = parse(&req, 0).expect_err("the exemplar charge must trip the expansion budget");
+        let LogsIngestError::OversizeMessage { limit, actual, .. } = err else {
+            panic!("unexpected error: {err}");
+        };
+        assert_eq!(limit, MAX_EXPANDED_BYTES);
+        assert!(
+            actual <= MAX_EXPANDED_BYTES + one,
+            "the abort fires at the tipping exemplar: actual={actual}"
+        );
     }
 }
