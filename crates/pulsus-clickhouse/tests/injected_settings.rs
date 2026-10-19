@@ -56,6 +56,9 @@ const INJECTED_SETTINGS: &[&str] = &[
     "input_format_connection_handling",
     "input_format_max_block_size_bytes",
     "input_format_max_block_wait_ms",
+    // Issue #599 part B: a cluster case writes a second run's copy of a
+    // bucket that block deduplication must not discard.
+    "insert_deduplicate",
     "insert_deduplication_token",
     "insert_quorum",
     "insert_quorum_parallel",
@@ -64,6 +67,9 @@ const INJECTED_SETTINGS: &[&str] = &[
     // Issue #623: the label join on every series read that returns labels.
     "join_algorithm",
     "json_type_escape_dots_in_keys",
+    // Issue #599 part B: the clustered graph read takes a shard's
+    // replicas in order.
+    "load_balancing",
     "log_comment",
     "materialized_views_ignore_errors",
     "max_block_size",

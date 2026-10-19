@@ -1495,6 +1495,18 @@ async fn refresh_on(client: &ChClient, db: &str, what: &str) {
     .await;
     assert_eq!(failed, [""], "{what}: the refresh succeeded");
     stop_edges_view(client).await;
+    // Part B §4: each run's duration, the barrier's read included.
+    let durations = strings(
+        client,
+        &format!(
+            "SELECT toString(query_duration_ms) AS s FROM system.query_log \
+             WHERE type = 'QueryFinish' AND log_comment = 'refresh of {db}.service_edges_mv' \
+             AND event_time_microseconds >= fromUnixTimestamp64Micro(toInt64({t0})) \
+             ORDER BY event_time_microseconds"
+        ),
+    )
+    .await;
+    println!("{what}: refresh durations, ms: {durations:?}");
 }
 
 /// Refreshes on `client` until its prefix reaches `until_ns`, at most

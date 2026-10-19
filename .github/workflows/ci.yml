@@ -2682,10 +2682,12 @@ jobs:
       # default `distributed_product_mode` refuses; the search sends
       # `'local'` for it. The negative control pins the refusal (288), the
       # positive cases the answers over traces split across both shards.
+      # The suite also holds the service graph's cluster cases (#599); its
+      # output shows each edge-job run's duration (part B §4).
       - name: Nested-set search over the distributed tables (cluster)
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
-        run: cargo test -p pulsus-read --test traces_nested_set_cluster
+        run: cargo test -p pulsus-read --test traces_nested_set_cluster -- --show-output
 
       # Issue #507, criterion 19: the extracted-field group key read's one
       # read (L) over the `_dist` tables — L answers where today's route
