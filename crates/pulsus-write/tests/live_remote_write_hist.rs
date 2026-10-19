@@ -137,6 +137,7 @@ fn series(name: &str, hint_label: &str, histograms: Vec<Histogram>) -> TimeSerie
         ],
         samples: vec![],
         histograms,
+        exemplars: vec![],
     }
 }
 

@@ -95,6 +95,7 @@ fn rw_request(metric_name: &str, host: &str, service: &str) -> WriteRequest {
                 timestamp: 1_800_000_000_000,
             }],
             histograms: vec![],
+            exemplars: vec![],
         }],
         metadata: vec![],
     }

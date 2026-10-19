@@ -383,6 +383,7 @@ fn remote_write_body(series: &[(&str, f64, i64)]) -> Vec<u8> {
                     timestamp: *ts_ms,
                 }],
                 histograms: vec![],
+                exemplars: vec![],
             })
             .collect(),
         metadata: vec![],

@@ -749,3 +749,159 @@ async fn distinct_exemplars_stored_on_both_shards_are_answered_whole() {
     }
     c.finish().await;
 }
+
+/// A remote-write exemplar as `(labels, value, ms)`.
+type RwExemplar<'a> = (&'a [(&'a str, &'a str)], f64, i64);
+
+/// One remote-write series `m{job="a"}` with `samples` and `exemplars`,
+/// each exemplar `(labels, value, ms)`.
+fn rw_series(
+    samples: &[(f64, i64)],
+    exemplars: &[RwExemplar<'_>],
+) -> pulsus_write::protocols::remote_write::TimeSeries {
+    use pulsus_write::protocols::remote_write::{Exemplar, Label, Sample, TimeSeries};
+    let labels_of = |p: &[(&str, &str)]| {
+        p.iter()
+            .map(|(name, value)| Label {
+                name: name.to_string(),
+                value: value.to_string(),
+            })
+            .collect::<Vec<_>>()
+    };
+    TimeSeries {
+        labels: labels_of(&[("__name__", "m"), ("job", "a")]),
+        samples: samples
+            .iter()
+            .map(|(value, timestamp)| Sample {
+                value: *value,
+                timestamp: *timestamp,
+            })
+            .collect(),
+        histograms: vec![],
+        exemplars: exemplars
+            .iter()
+            .map(|(labels, value, timestamp)| Exemplar {
+                labels: labels_of(labels),
+                value: *value,
+                timestamp: *timestamp,
+            })
+            .collect(),
+    }
+}
+
+impl Cluster {
+    /// Parses `series` as one remote-write body and lands it through a
+    /// `MetricWriter` whose client is shard `n`, as a push that reached
+    /// that node.
+    async fn push_remote_write(
+        &self,
+        n: u8,
+        series: Vec<pulsus_write::protocols::remote_write::TimeSeries>,
+    ) {
+        use pulsus_write::MetricSink;
+        let req = pulsus_write::WriteRequest {
+            timeseries: series,
+            metadata: vec![],
+        };
+        let parsed = pulsus_write::parse_remote_write(&req, 0).expect("the body parses");
+        let config = if n == 1 {
+            shard1_config(&self.db)
+        } else {
+            shard2_config(&self.db)
+        };
+        let writer = pulsus_write::MetricWriter::new(
+            Arc::new(ChClient::new(config).await.expect("connect")),
+            &pulsus_config::WriterConfig::default(),
+            pulsus_model::ACTIVITY_BUCKET_MS,
+        );
+        let wait = writer
+            .admit_flush(&no_tenant(), parsed, pulsus_write::PushHeaders::default())
+            .expect("the queue has room");
+        tokio::time::timeout(Duration::from_secs(30), wait)
+            .await
+            .expect("the flush settles")
+            .expect("the landing block commits");
+        writer.shutdown(Duration::from_secs(5)).await;
+    }
+
+    /// A count of shard `n`'s own rows of `table` matching `filter`.
+    async fn local_count(&self, n: u8, table: &str, filter: &str) -> String {
+        self.shard(n)
+            .query_strings(
+                &format!("SELECT toString(count()) AS s FROM {table} WHERE {filter}"),
+                &QuerySettings::new(),
+            )
+            .await
+            .expect("the count runs")
+            .first()
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+/// K9 (issue #501 part 3): a series' samples pushed to shard 1, and an
+/// exemplar-only push of the same series to shard 2. Shard 2 holds the
+/// registration that push made, beside its exemplar, and either shard
+/// answers the exemplar once, under the series once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_remote_write_exemplar_pushed_to_another_shard_is_answered_once() {
+    skip_unless_live!();
+    let c = Cluster::new(pulsus_testkit::test_db("pulsus_exemplars_k9")).await;
+    let t = c.t0 + MINUTE_MS;
+    let trace = "0102030405060708090a0b0c0d0e0f10";
+    c.push_remote_write(1, vec![rw_series(&[(1.0, t)], &[])])
+        .await;
+    c.push_remote_write(
+        2,
+        vec![rw_series(
+            &[],
+            &[(&[("trace_id", trace), ("k", "v")], 0.5, t - 1_000)],
+        )],
+    )
+    .await;
+
+    assert_eq!(
+        c.local_count(2, "metric_series", "metric_name = 'm'").await,
+        "1",
+        "K9: shard 2 holds the exemplar push's registration"
+    );
+    assert_eq!(
+        c.local_count(
+            2,
+            "metric_exemplars",
+            &format!("unix_milli = {}", t - 1_000)
+        )
+        .await,
+        "1",
+        "K9: shard 2 holds the exemplar"
+    );
+
+    let filter = DiscoveryFilter {
+        metric_name: Some("m".to_string()),
+        name_matchers: vec![],
+        matchers: vec![LabelMatcher {
+            key: "job".to_string(),
+            op: MatchOp::Eq,
+            value: "a".to_string(),
+        }],
+    };
+    let want = vec![ExemplarSeries {
+        series_labels: pairs(&[("__name__", "m"), ("job", "a")]),
+        exemplars: vec![StoredExemplar {
+            labels: pairs(&[("k", "v"), ("trace_id", trace)]),
+            value: 0.5,
+            unix_milli: t - 1_000,
+        }],
+    }];
+    c.sync().await;
+    for n in [1, 2] {
+        let got = c
+            .engine(n)
+            .await
+            .exemplars(&no_tenant(), std::slice::from_ref(&filter), c.window())
+            .await
+            .unwrap_or_else(|e| panic!("K9 through shard {n}: {e}"));
+        assert_eq!(got, want, "K9 through shard {n}");
+    }
+    c.finish().await;
+}
