@@ -573,7 +573,8 @@ impl Harness {
             if rows.len() >= expect && poll >= 2 && previous == rows.len() {
                 let mut by_id: BTreeMap<String, Vec<u64>> = BTreeMap::new();
                 for r in rows {
-                    by_id.entry(r.query_id).or_default().push(r.sent);
+                    let (statement, _run) = r.query_id.rsplit_once('_').expect("a run suffix");
+                    by_id.entry(statement.to_string()).or_default().push(r.sent);
                 }
                 return by_id
                     .into_iter()
@@ -1264,7 +1265,7 @@ async fn pushed_rows_never_exceed_twice_the_raw_rows() {
     // statement text this client sent it. On a single node that is the
     // metered hop; on a cluster the shard hop carries what it carries
     // today, unchanged by this work.
-    let tag = pulsus_testkit::test_ident("pulsus_read_it_grouped_bytes");
+    let tag = pulsus_testkit::test_ident(&format!("pulsus_read_it_grouped_bytes_{}", now_ms()));
     let mut ids: Vec<(String, String, usize)> = Vec::new();
     for (n, case) in cases.iter().enumerate() {
         let fps: Vec<FpLiteral> = case
@@ -1292,22 +1293,22 @@ async fn pushed_rows_never_exceed_twice_the_raw_rows() {
             case.upper_incl_ms,
         );
         let pushed_id = format!("{tag}_{n}_pushed");
-        for _ in 0..3 {
+        for run in 0..3 {
             h.run_tagged::<pulsus_read::metrics::grouped_rows::GroupedRunRow>(
                 &pushed_sql,
-                &pushed_id,
+                &format!("{pushed_id}_{run}"),
             )
             .await;
         }
         ids.push((pushed_id, pushed_sql.len().to_string(), 0));
         let raw_id = format!("{tag}_{n}_raw");
-        for _ in 0..3 {
-            h.run_tagged::<pulsus_read::metrics::SampleRow>(&raw_sql, &raw_id)
+        for run in 0..3 {
+            h.run_tagged::<pulsus_read::metrics::SampleRow>(&raw_sql, &format!("{raw_id}_{run}"))
                 .await;
         }
         ids.push((raw_id, raw_sql.len().to_string(), 0));
     }
-    let sent = h.sent_bytes(&tag, ids.len()).await;
+    let sent = h.sent_bytes(&tag, 3 * ids.len()).await;
     eprintln!(
         "[549] corpus                                          route   NetworkSendBytes + text"
     );
@@ -1319,7 +1320,10 @@ async fn pushed_rows_never_exceed_twice_the_raw_rows() {
                 .find(|(i, _, _)| *i == id)
                 .map(|(_, t, _)| t.parse().expect("len"))
                 .expect("recorded");
-            let bytes = sent.get(&id).copied().unwrap_or_default();
+            let bytes = sent
+                .get(&id)
+                .copied()
+                .unwrap_or_else(|| panic!("{id}: no run of it in the query log"));
             eprintln!("[549] {:<48} {kind:<7} {}", case.name, bytes + text as u64);
         }
     }
