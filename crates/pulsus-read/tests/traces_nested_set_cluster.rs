@@ -58,13 +58,13 @@ macro_rules! skip_unless_live {
 /// same name with `_HOST` replaced by `_HTTP_PORT`; CI reaches each node on
 /// its fixture address at the server's own port, a local copy on mapped ones.
 fn shard_config(host_env: &str, default_host: &str, database: &str) -> ChConnConfig {
-    let port_env = host_env.replace("_HOST", "_HTTP_PORT");
+    let http_var = host_env.replace("_HOST", "_HTTP_PORT");
     ChConnConfig {
         server: std::env::var(host_env).unwrap_or_else(|_| default_host.to_string()),
-        http_port: std::env::var(&port_env)
+        http_port: std::env::var(&http_var)
             .map(|p| {
                 p.parse()
-                    .unwrap_or_else(|_| panic!("{port_env}: a port, got {p:?}"))
+                    .unwrap_or_else(|_| panic!("{http_var}: a port, got {p:?}"))
             })
             .unwrap_or(8123),
         database: database.to_string(),
