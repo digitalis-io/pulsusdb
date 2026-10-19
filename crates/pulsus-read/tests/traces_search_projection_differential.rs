@@ -133,6 +133,7 @@ const S_CHARGE: &str = "a479000000000002";
 const S_CONFIRM: &str = "a479000000000011";
 const S_SLOW: &str = "a479000000000021";
 const LINK_SPAN: &str = "0a1b2c3d4e5f6071";
+const LINK_SPAN_2: &str = "0a1b2c3d4e5f6072";
 
 fn kv(key: &str, value: serde_json::Value) -> serde_json::Value {
     serde_json::json!({"key": key, "value": value})
@@ -207,6 +208,32 @@ fn corpus(base_ns: i64) -> Vec<u8> {
         "startTimeUnixNano": ns(sec / 4),
         "endTimeUnixNano": ns(sec / 4 + 3 * sec),
         "attributes": [kv("http.method", s("DELETE"))],
+        // Issue #600 part 3: two events and two links, each holding the
+        // same key, so the reference's choice between them is compared.
+        "events": [
+            {
+                "name": "retry",
+                "timeUnixNano": ns(sec / 4 + sec / 10),
+                "attributes": [kv("exception.type", s("Timeout"))],
+            },
+            {
+                "name": "exception",
+                "timeUnixNano": ns(sec / 4 + sec / 5),
+                "attributes": [kv("exception.type", s("IOError"))],
+            },
+        ],
+        "links": [
+            {
+                "traceId": TRACE_HEX,
+                "spanId": LINK_SPAN_2,
+                "attributes": [kv("relation", s("follows_from"))],
+            },
+            {
+                "traceId": TRACE_HEX,
+                "spanId": LINK_SPAN,
+                "attributes": [kv("relation", s("child_of"))],
+            },
+        ],
     });
     let scope = serde_json::json!({"name": "proj-scope", "version": "1.2.3"});
     serde_json::to_vec(&serde_json::json!({

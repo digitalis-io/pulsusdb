@@ -52,3 +52,8 @@ field_cross_type	{ .foo != .a }	field against field over two types
 siblings_of_roots	{} ~ {}	two parentless spans are not siblings
 select_resource_int	{ } | select(resource.http.status_code)	a resource value stored as an integer, projected: on a cluster the lookup crosses to each shard as a literal, which must keep the stored type (#600 part 2)
 by_resource_int	{ } | by(resource.http.status_code)	the same value as a group key: re-typed, it fails the presence rule and every span falls into the missing-key group (#600 part 2)
+select_event_last_of_two	{ .c = 3 } | select(event.exception.type)	`select()` of an event attribute on `…06`, whose two events hold it: the last, `IOError`, not the first, `Timeout` (#600 part 3)
+event_regex_both	{ event.exception.type =~ ".*" }	both events of `…06` satisfy the condition: the last, `IOError`, is projected (#600 part 3)
+event_regex_first_only	{ event.exception.type =~ "Time.*" }	only the first event of `…06` satisfies: `Timeout`, not the last stored `IOError` (#600 part 3)
+link_regex_both	{ link.relation =~ ".*" }	both links of `…06` satisfy: the last, `child_of`, not the first, `follows_from` (#600 part 3)
+event_time_first_only	{ event:timeSinceStart < 15ms }	an event intrinsic only the first of `…06`'s two events (10 ms) satisfies, not the last (20 ms) (#600 part 3)

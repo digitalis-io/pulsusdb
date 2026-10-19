@@ -6698,7 +6698,9 @@ async fn search_statement_answers_as_recorded_on_fixture_c() {
             );
             if want != answer_digest(&got) {
                 mismatches.push(format!(
-                    "{query} (limit {limit}, spss {spss})\n  recorded digest {want}\n  statement: {}",
+                    "{query} (limit {limit}, spss {spss})\n  recorded digest {want}, the \
+                     statement's {}\n  statement: {}",
+                    answer_digest(&got),
                     got.chars().take(3000).collect::<String>()
                 ));
             }
@@ -7065,21 +7067,46 @@ async fn search_statement_answers_written_out_on_fixture_p() {
             r#"{ resource.rk_arr != nil }"#,
             "1111(1): 0001[rk_arr=Str [\"x\",\"y\"]]",
         ),
-        // q07: the first element whose own condition holds — not the first
-        // carrying `k` (1), nor the last (9).
+        // q07: the last element whose own condition holds (issue #600
+        // part 3) — not the first that holds (5).
         (
             r#"{ event.k > 3 }"#,
-            "2222(1): 0003[k=Double 4.5] | 1111(1): 0001[k=Int 5]",
+            "2222(1): 0003[k=Double 4.5] | 1111(1): 0001[k=Int 9]",
+        ),
+        // The last element whose own condition holds, not the last carrying
+        // `k` (9) nor the first that holds (1).
+        (
+            r#"{ event.k < 6 }"#,
+            "2222(1): 0003[k=Double 4.5] | 1111(2): 0001[k=Int 5] 0002[k=Int 3]",
+        ),
+        (
+            r#"{ event.k >= 1 }"#,
+            "2222(1): 0003[k=Double 4.5] | 1111(2): 0001[k=Int 9] 0002[k=Int 3]",
+        ),
+        (
+            r#"{ event.k > 3 && .p != nil }"#,
+            "2222(1): 0003[k=Double 4.5,p=Int 42] | 1111(1): 0001[k=Int 9,p=Str res]",
+        ),
+        (
+            r#"{ event.t != nil }"#,
+            "2222(1): 0003[t=Str [\"x\",\"y\"]] | 1111(1): 0001[t=Str b]",
+        ),
+        (r#"{ link.lk != nil }"#, "1111(1): 0001[lk=Int 10]"),
+        (r#"{ link.lk > 5 }"#, "1111(1): 0001[lk=Int 10]"),
+        (
+            r#"{ event:name =~ ".*" }"#,
+            "2222(1): 0003[event:name=Str beta] | 1111(2): 0001[event:name=Str gamma] \
+             0002[event:name=Str delta]",
         ),
         // q10
         (
             r#"{ event.k != nil }"#,
-            "2222(1): 0003[k=Double 4.5] | 1111(2): 0001[k=Int 1] 0002[k=Int 3]",
+            "2222(1): 0003[k=Double 4.5] | 1111(2): 0001[k=Int 9] 0002[k=Int 3]",
         ),
         // q13
         (
             r#"{ event:timeSinceStart > 1500us }"#,
-            "1111(1): 0001[event:timeSinceStart=Int 2000000]",
+            "1111(1): 0001[event:timeSinceStart=Int 3000000]",
         ),
         // q18
         (
@@ -7087,19 +7114,19 @@ async fn search_statement_answers_written_out_on_fixture_p() {
             "2222(1): 0003[p=Int 42] | 1111(2): 0001[p=Str res] 0002[p=Int 42]",
         ),
         // q19
-        (r#"{ .r =~ "ev-r.*" }"#, "1111(1): 0001[r=Str ev-r1]"),
+        (r#"{ .r =~ "ev-r.*" }"#, "1111(1): 0001[r=Str ev-r2]"),
         // q20: the link before the instrumentation scope.
-        (r#"{ .s =~ "link.*" }"#, "1111(1): 0001[s=Str link-s1]"),
+        (r#"{ .s =~ "link.*" }"#, "1111(1): 0001[s=Str link-s2]"),
         // q22: the span's own `k` before the event's on `…03`; `…02`'s
         // string `"span-k"` is not compared with `2`.
         (
             r#"{ .k > 2 }"#,
-            "2222(1): 0003[k=Double 2.5] | 1111(1): 0001[k=Int 5]",
+            "2222(1): 0003[k=Double 2.5] | 1111(1): 0001[k=Int 9]",
         ),
         // q23
         (
             r#"{ .k != nil }"#,
-            "2222(1): 0003[k=Double 2.5] | 1111(2): 0001[k=Int 1] 0002[k=Str span-k]",
+            "2222(1): 0003[k=Double 2.5] | 1111(2): 0001[k=Int 9] 0002[k=Str span-k]",
         ),
         // q27: the literal, lowercased.
         (
@@ -7109,34 +7136,34 @@ async fn search_statement_answers_written_out_on_fixture_p() {
         // q29
         (
             r#"{ .t != nil }"#,
-            "2222(1): 0003[t=Str [\"x\",\"y\"]] | 1111(1): 0001[t=Str a]",
+            "2222(1): 0003[t=Str [\"x\",\"y\"]] | 1111(1): 0001[t=Str b]",
         ),
-        // r01: the first element the comparison holds for.
+        // r01: the last element the comparison holds for.
         (
             r#"{ event.k * 2 > 5 }"#,
-            "2222(1): 0003[k=Double 4.5] | 1111(2): 0001[k=Int 5] 0002[k=Int 3]",
+            "2222(1): 0003[k=Double 4.5] | 1111(2): 0001[k=Int 9] 0002[k=Int 3]",
         ),
         // r02: the span's own `k = 2.5` on `…03` decides, and fails.
-        (r#"{ .k * 2 > 5 }"#, "1111(1): 0001[k=Int 5]"),
-        // r03: the first element carrying the field.
+        (r#"{ .k * 2 > 5 }"#, "1111(1): 0001[k=Int 9]"),
+        // r03: the last element carrying the field.
         (
             r#"{ event.k = event.k }"#,
-            "2222(1): 0003[k=Double 4.5] | 1111(2): 0001[k=Int 1] 0002[k=Int 3]",
+            "2222(1): 0003[k=Double 4.5] | 1111(2): 0001[k=Int 9] 0002[k=Int 3]",
         ),
-        // r04: not `2`, the first link carrying `lk`.
-        (r#"{ link.lk - 1 > 4 }"#, "1111(1): 0001[lk=Int 6]"),
+        // r04: the last link the comparison holds for, not `6`.
+        (r#"{ link.lk - 1 > 4 }"#, "1111(1): 0001[lk=Int 10]"),
         // r05
         (
             r#"{ event:timeSinceStart * 2 > 3ms }"#,
-            "1111(1): 0001[event:timeSinceStart=Int 2000000]",
+            "1111(1): 0001[event:timeSinceStart=Int 3000000]",
         ),
         // r06
         (
             r#"{ .k = .k }"#,
-            "2222(1): 0003[k=Double 2.5] | 1111(2): 0001[k=Int 1] 0002[k=Str span-k]",
+            "2222(1): 0003[k=Double 2.5] | 1111(2): 0001[k=Int 9] 0002[k=Str span-k]",
         ),
-        // r07: the first link carrying `lk`.
-        (r#"{ link.lk = link.lk }"#, "1111(1): 0001[lk=Int 2]"),
+        // r07: the last link carrying `lk`.
+        (r#"{ link.lk = link.lk }"#, "1111(1): 0001[lk=Int 10]"),
         // r08
         (
             r#"{ .p * 2 > 50 }"#,
@@ -7145,7 +7172,7 @@ async fn search_statement_answers_written_out_on_fixture_p() {
         // r09
         (
             r#"{ event:name = event:name }"#,
-            "2222(1): 0003[event:name=Str beta] | 1111(2): 0001[event:name=Str alpha] \
+            "2222(1): 0003[event:name=Str beta] | 1111(2): 0001[event:name=Str gamma] \
              0002[event:name=Str delta]",
         ),
     ];
@@ -7157,6 +7184,17 @@ async fn search_statement_answers_written_out_on_fixture_p() {
             want,
         );
     }
+    // Issue #600 part 3: a search aggregate's argument keeps the FIRST
+    // element carrying it, where the projection takes the last: `…01`'s
+    // first `k` is 1, so trace `11…` averages (1 + 3) / 2 = 2 and fails;
+    // read from the last element it would average (9 + 3) / 2 = 6 and pass.
+    let q = r#"{ } | avg(event.k) > 4"#;
+    let engine = engine_of(&db_p).await;
+    let out = engine
+        .search_routed(&plan_of(&engine, &parse_query(q), window, 100, 100))
+        .await
+        .unwrap_or_else(|e| panic!("{q}: {e}"));
+    check(&mut wrong, q, written(&out, true), "2222(1): 0003");
     // Section 3.6's refusal holds under `!=` too: on fixture P the
     // predicate's any-pair reading drops span `…01`, which today's engine,
     // reading each element against itself, returns. The statement refuses,
@@ -7171,7 +7209,6 @@ async fn search_statement_answers_written_out_on_fixture_p() {
         }
     }
     let five = |key: &str| format!("3333(1): 0004[{key}=Int 5]");
-    let two = |key: &str| format!("3333(1): 0004[{key}=Int 2]");
     let s_rows = [
         (r#"{ event.k / 5 >= 1 }"#, five("k")),
         (r#"{ event.k % 2 = 1 }"#, five("k")),
@@ -7182,14 +7219,15 @@ async fn search_statement_answers_written_out_on_fixture_p() {
         (r#"{ .k / 5 >= 1 }"#, five("k")),
         (r#"{ .k % 2 = 1 }"#, five("k")),
         (r#"{ .k ^ 2 > 10 }"#, five("k")),
-        // A set field compared with itself projects the first element
-        // carrying it; `2 < 5` and `5 > 2` are the pairs that hold.
-        (r#"{ event.k < event.k }"#, two("k")),
-        (r#"{ event.k > event.k }"#, two("k")),
-        (r#"{ link.lk < link.lk }"#, two("lk")),
-        (r#"{ link.lk > link.lk }"#, two("lk")),
-        (r#"{ .k < .k }"#, two("k")),
-        (r#"{ .k > .k }"#, two("k")),
+        // A set field compared with itself projects the last element
+        // carrying it (issue #600 part 3); `2 < 5` and `5 > 2` are the pairs
+        // that hold.
+        (r#"{ event.k < event.k }"#, five("k")),
+        (r#"{ event.k > event.k }"#, five("k")),
+        (r#"{ link.lk < link.lk }"#, five("lk")),
+        (r#"{ link.lk > link.lk }"#, five("lk")),
+        (r#"{ .k < .k }"#, five("k")),
+        (r#"{ .k > .k }"#, five("k")),
     ];
     for (query, want) in s_rows {
         check(
@@ -13087,6 +13125,113 @@ async fn the_statement_keeps_one_hundred_of_one_hundred_and_twenty() {
     assert_eq!(got.len(), 120, "120 series");
     assert_eq!(total, 100, "100 exemplars");
     assert_eq!(without, want);
+}
+
+/// Fixture X (issue #600 part 3): trace `44…`, service `x`, in one bucket
+/// three spans holding `span.a` — `…01` 1 s with `a = 10`, `…02` 3 s with
+/// `a = 4`, `…03` 2 s with the double `a = 1.5` — and three 1 ms children
+/// without it, one under `…01` and two under `…02`. `…02` is the longest
+/// span holding `a`, so it is every query's exemplar; its own duration,
+/// `a` and child count differ from each aggregate but `max(duration)`.
+fn fixture_x(l: i64) -> ExportTraceServiceRequest {
+    let at = |s: i64| (l - 40 + s) * S_NS;
+    let sp = |id: u8, parent: u8, start: i64, duration: i64, attrs: Vec<KeyValue>| {
+        span_of(
+            vec![0x44; 16],
+            span_id_bytes(id),
+            if parent == 0 {
+                Vec::new()
+            } else {
+                span_id_bytes(parent)
+            },
+            "op",
+            2,
+            start,
+            duration,
+            attrs,
+            0,
+            Vec::new(),
+            Vec::new(),
+        )
+    };
+    request(
+        "x",
+        "x-a",
+        vec![
+            sp(1, 0, at(0), S_NS, vec![kv("a", int_value(10))]),
+            sp(2, 0, at(5), 3 * S_NS, vec![kv("a", int_value(4))]),
+            sp(3, 0, at(10), 2 * S_NS, vec![kv("a", double_value(1.5))]),
+            sp(4, 1, at(1), MS_NS, Vec::new()),
+            sp(5, 2, at(6), MS_NS, Vec::new()),
+            sp(6, 2, at(7), MS_NS, Vec::new()),
+        ],
+    )
+}
+
+/// Issue #600 part 3: a `sum`/`min`/`max`/`avg_over_time` exemplar's
+/// `value` is its span's own target value — the duration in seconds, the
+/// attribute's number, the child count — as the reference's
+/// (`exemplarFnFor`); a `rate()`'s is the series' sample. Each row: the
+/// query, the one sample at `L`, and the one exemplar's value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_over_time_exemplar_carries_its_span_s_own_value() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db("pulsus_read_it_t600p3_exemplar");
+    let client = fresh_db(&db).await;
+    let l = metrics_l();
+    land(&client, &fixture_x(l), &format!("t600p3-x-{}", now_ns())).await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let f = "{ span.a != nil }";
+    let rows: [(&str, f64, f64); 11] = [
+        ("sum_over_time(duration)", 6.0, 3.0),
+        ("min_over_time(duration)", 1.0, 3.0),
+        ("max_over_time(duration)", 3.0, 3.0),
+        ("avg_over_time(duration)", 2.0, 3.0),
+        ("sum_over_time(span.a)", 15.5, 4.0),
+        ("min_over_time(span.a)", 1.5, 4.0),
+        ("max_over_time(span.a)", 10.0, 4.0),
+        ("avg_over_time(span.a)", 15.5 / 3.0, 4.0),
+        ("sum_over_time(span:childCount)", 3.0, 2.0),
+        (
+            "max_over_time(span.a) by(resource.service.name) | topk(1)",
+            10.0,
+            4.0,
+        ),
+        ("rate()", 0.05, 0.05),
+    ];
+    let mut wrong = Vec::new();
+    for (stage, sample, value) in rows {
+        let q = format!("{f} | {stage}");
+        let out = range_answer(&engine, &q, l - 60, l).await;
+        let series = out
+            .as_ref()
+            .unwrap_or_else(|e| panic!("{q}: {e}"))
+            .series
+            .iter()
+            .map(|s| {
+                // The bucket at `L`; a rate's leading empty bucket is not
+                // what this test is about.
+                let samples: Vec<(i64, f64)> = s
+                    .samples
+                    .iter()
+                    .map(|(t, v)| (t / 1000 - l, *v))
+                    .filter(|(t, _)| *t == 0)
+                    .collect();
+                let exemplars: Vec<(i64, f64)> = s
+                    .exemplars
+                    .iter()
+                    .map(|e| (e.timestamp_ms - l * 1000, e.value))
+                    .collect();
+                (samples, exemplars)
+            })
+            .collect::<Vec<_>>();
+        let want = vec![(vec![(0, sample)], vec![(-35_000, value)])];
+        if series != want {
+            wrong.push(format!("{q}\n  want: {want:?}\n  got:  {series:?}"));
+        }
+    }
+    drop_db(&db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
 /// An exemplar leaves only beside a sample in the answer.
