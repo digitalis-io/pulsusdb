@@ -57,6 +57,8 @@ mod registration;
 pub(crate) mod rows;
 mod spool;
 mod table;
+#[cfg(test)]
+mod teardown_probe;
 mod trace;
 mod trace_landing;
 

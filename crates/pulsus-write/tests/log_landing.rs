@@ -1483,3 +1483,104 @@ async fn shutdown_files_an_inflight_log_block_and_a_queued_block_differently() {
     assert_eq!(writer.metrics().queue_bytes, 0);
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// A block still queued when the drain begins is sent while the grace lasts.
+/// On this single-threaded runtime no worker runs between the admissions and
+/// the announcement, so both blocks are provably queued at it.
+#[tokio::test]
+async fn a_log_block_queued_when_the_drain_begins_is_sent_inside_the_grace() {
+    let root = spool_root("queued-at-drain");
+    let inserter = MockInserter::always(Act::Ok);
+    let writer = writer_with(&WriterConfig::default(), &root, inserter.clone());
+    let tenant = pulsus_model::Tenant::from_header(None, false).expect("the empty tenant");
+
+    writer
+        .admit(&tenant, two_lines_one_stream(1), PushHeaders::default())
+        .expect("queue has room");
+    let wait = writer
+        .admit_flush(&tenant, two_lines_one_stream(2), PushHeaders::default())
+        .expect("queue has room");
+    writer.shutdown(Duration::from_secs(10)).await;
+
+    assert_eq!(inserter.call_count(), 2, "both queued blocks are sent");
+    wait.await.expect("the sync caller is answered success");
+    assert_eq!(spool_records(&root, "poison").len(), 0);
+    assert_eq!(spool_records(&root, "uncertain").len(), 0);
+    assert_eq!(writer.metrics().queue_bytes, 0);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// One worker, busy with A when the drain begins, with B, C and D queued
+/// behind it: once A commits, the worker takes B, C and D and sends each
+/// inside the grace.
+#[tokio::test]
+async fn a_backlog_behind_a_busy_worker_is_sent_inside_the_grace() {
+    let root = spool_root("backlog-at-drain");
+    let cfg = WriterConfig {
+        log_landing_inserters: 1,
+        ..Default::default()
+    };
+    let inserter = MockInserter::new(vec![
+        Step {
+            delay: Duration::from_millis(50),
+            act: Act::Ok,
+        },
+        Step::now(Act::Ok),
+    ]);
+    let writer = writer_with(&cfg, &root, inserter.clone());
+    let tenant = pulsus_model::Tenant::from_header(None, false).expect("the empty tenant");
+
+    writer
+        .admit(&tenant, two_lines_one_stream(1), PushHeaders::default())
+        .expect("queue has room");
+    inserter
+        .entered
+        .acquire()
+        .await
+        .expect("the entered semaphore is never closed")
+        .forget();
+    for fp in 2..=4 {
+        writer
+            .admit(&tenant, two_lines_one_stream(fp), PushHeaders::default())
+            .expect("queue has room");
+    }
+    writer.shutdown(Duration::from_secs(10)).await;
+
+    assert_eq!(inserter.call_count(), 4, "A and the three queued behind it");
+    assert_eq!(spool_records(&root, "poison").len(), 0);
+    assert_eq!(spool_records(&root, "uncertain").len(), 0);
+    assert_eq!(writer.metrics().queue_bytes, 0);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// A writer dropped without a drain starts no insert for a queued block: it
+/// is filed never sent.
+#[tokio::test]
+async fn a_writer_dropped_without_a_drain_starts_no_queued_insert() {
+    let root = spool_root("dropped-writer");
+    let inserter = MockInserter::always(Act::Ok);
+    let writer = writer_with(&WriterConfig::default(), &root, inserter.clone());
+    let tenant = pulsus_model::Tenant::from_header(None, false).expect("the empty tenant");
+
+    writer
+        .admit(&tenant, two_lines_one_stream(1), PushHeaders::default())
+        .expect("queue has room");
+    drop(writer);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while spool_records(&root, "poison").is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the block was never filed"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(inserter.call_count(), 0, "no insert was started");
+    let poison = spool_records(&root, "poison");
+    assert_eq!(poison.len(), 1);
+    assert_eq!(
+        poison[0]["error"].as_str(),
+        Some("the writer shut down before the block was sent")
+    );
+    std::fs::remove_dir_all(&root).ok();
+}

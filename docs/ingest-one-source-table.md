@@ -464,6 +464,13 @@ settlement tasks. So no block reaches a closed queue from outside, and a settlem
 However many callers ask for it, the drain is one operation under one mutex with one
 deadline, the first announced, and each caller returns only once it has finished.
 
+**A block still queued when the deadline is announced is run like any other block.** Each
+worker closes the queue and keeps taking blocks off it through `run_block`, so the block ends
+by any ending of §4: the shutdown deadline stops an attempt from starting only once it has
+passed, and the landing budget, an insert error that cannot be resent, or the last resend can
+end it before that. A writer dropped without a drain publishes a deadline that has already
+passed before anything of it is torn down, so its queued blocks are filed never sent.
+
 **A block reaching the deadline has one of the two fates of §4 and no third.** It was
 never sent — the queue still held it, or the deadline refused the next attempt — or an
 attempt was in flight and its fate is uncertain. The second is never downgraded to the
