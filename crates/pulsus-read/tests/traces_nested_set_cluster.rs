@@ -1757,7 +1757,10 @@ async fn push_g(client: &ChClient, l: i64, range: std::ops::Range<usize>) {
 
 /// Fixture G's answer (part A §5.2): `(client, server, type, calls,
 /// failed, quantiles)`, in order.
-fn g1_rows() -> Vec<(&'static str, &'static str, &'static str, u64, u64, [f64; 3])> {
+/// One edge of an answer: client, server, type, calls, failed, quantiles.
+type Edge = (&'static str, &'static str, &'static str, u64, u64, [f64; 3]);
+
+fn g1_rows() -> Vec<Edge> {
     vec![
         (
             "svc-a",
@@ -1795,15 +1798,14 @@ fn assert_g1(edges: &[pulsus_read::GraphEdgeRow], what: &str) {
         .collect();
     assert_eq!(got, want, "{what}: fixture G's edges, in order");
     for (e, (_, _, _, _, _, q)) in edges.iter().zip(g1_rows()) {
-        for i in 0..3 {
+        for (i, want) in q.iter().enumerate() {
             assert!(
-                (e.quantiles_ns[i] - q[i]).abs() <= q[i] * 0.01,
-                "{what}: {} -> {} {} quantile {i}: got {:?}, want {}",
+                (e.quantiles_ns[i] - want).abs() <= want * 0.01,
+                "{what}: {} -> {} {} quantile {i}: got {:?}, want {want}",
                 e.client,
                 e.server,
                 e.conn_type,
-                e.quantiles_ns,
-                q[i]
+                e.quantiles_ns
             );
         }
     }
