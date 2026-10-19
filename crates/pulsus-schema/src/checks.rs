@@ -586,10 +586,7 @@ mod tests {
                      'throw_on_max_partitions_per_insert_block', \
                      'distributed_foreground_insert', 'insert_shard_id', \
                      'json_type_escape_dots_in_keys', 'type_json_skip_duplicated_paths', \
-                     'read_overflow_mode', 'read_overflow_mode_leaf', \
-                     'timeout_overflow_mode', 'group_by_overflow_mode', \
-                     'distinct_overflow_mode', 'sort_overflow_mode', \
-                     'result_overflow_mode')"
+                     'timeout_overflow_mode')"
                         .to_string()
                 ),
                 (

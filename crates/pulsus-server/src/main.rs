@@ -196,3 +196,24 @@ async fn main() -> ExitCode {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::{CommandFactory, Parser};
+
+    /// The binary serves and nothing else: no subcommand is declared, the
+    /// three removed rebuild commands do not parse, and the serving flags
+    /// still do (issue #705).
+    #[test]
+    fn the_binary_takes_no_subcommand() {
+        assert_eq!(Cli::command().get_subcommands().count(), 0);
+        for removed in ["rebuild-metrics", "rebuild-logs", "rebuild-traces"] {
+            assert!(
+                Cli::try_parse_from(["pulsusdb", removed]).is_err(),
+                "{removed} must not parse"
+            );
+        }
+        assert!(Cli::try_parse_from(["pulsusdb", "--mode", "all"]).is_ok());
+    }
+}

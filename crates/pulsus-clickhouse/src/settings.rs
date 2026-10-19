@@ -763,13 +763,7 @@ mod tests {
             ("insert_shard_id", "0"),
             ("json_type_escape_dots_in_keys", "0"),
             ("type_json_skip_duplicated_paths", "0"),
-            ("read_overflow_mode", "throw"),
-            ("read_overflow_mode_leaf", "throw"),
             ("timeout_overflow_mode", "throw"),
-            ("group_by_overflow_mode", "throw"),
-            ("distinct_overflow_mode", "throw"),
-            ("sort_overflow_mode", "throw"),
-            ("result_overflow_mode", "throw"),
         ];
 
         let base = QuerySettings::landing_insert("tok-1", 1_048_576);
