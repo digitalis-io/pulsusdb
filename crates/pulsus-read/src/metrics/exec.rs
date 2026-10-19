@@ -100,6 +100,9 @@ pub struct MetricsConfig {
     /// **Never** `_dist`-suffixed: it is named locally inside a statement
     /// dispatched with `distributed_product_mode = 'local'`.
     pub label_values_table: String,
+    /// `metric_exemplars` (issue #501 part 2): every stored exemplar,
+    /// `/api/v1/query_exemplars`' table; `_dist`-aware like `series_table`.
+    pub exemplars_table: String,
     /// `metric_metadata` — issue #32's `/api/v1/metadata`
     /// ([`super::sql::metadata_query`]). **Never** `_dist`-suffixed
     /// (docs/schemas.md §2.1: it is a global, unsharded catalog table) —
@@ -2637,6 +2640,18 @@ impl MetricsEngine {
         Ok(out)
     }
 
+    /// `GET|POST /api/v1/query_exemplars` (issue #501 part 2): the stored
+    /// exemplars of the series any of `filters` selects in `window`.
+    pub async fn exemplars(
+        &self,
+        tenant: &Tenant,
+        filters: &[DiscoveryFilter],
+        window: DataWindow,
+    ) -> Result<Vec<super::exemplars::ExemplarSeries>, ReadError> {
+        let _ = (tenant, filters, window);
+        Ok(Vec::new())
+    }
+
     /// `GET /api/v1/metadata` (issues #32 and #500): every distinct
     /// descriptor of each name, in name, type, help, unit order; the names
     /// are the base family names the writer stored (docs/schemas.md §2.1's
@@ -2760,6 +2775,29 @@ fn series_read_settings(read_max_memory_bytes: u64, distributed: bool) -> QueryS
     } else {
         base
     }
+}
+
+/// The four exemplar statements (issue #501 part 2), for their settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExemplarStatement {
+    /// C, the count and window.
+    Count,
+    /// A, every distinct exemplar, refused past the cap.
+    Rows,
+    /// T, one exemplar per slice.
+    Thinned,
+    /// H, the series labels.
+    Series,
+}
+
+/// The settings of one exemplar statement (issue #501 part 2).
+fn exemplar_settings(
+    statement: ExemplarStatement,
+    read_max_memory_bytes: u64,
+    distributed: bool,
+) -> QuerySettings {
+    let _ = (statement, read_max_memory_bytes, distributed);
+    QuerySettings::new()
 }
 
 /// Pure fan-out bound decision for the degraded-cache discovery probe
@@ -4246,6 +4284,73 @@ mod tests {
         assert!(clustered.contains("max_query_size"));
         assert!(clustered.contains("distributed_product_mode"));
         assert!(clustered.contains("local"));
+    }
+
+    /// U2b (issue #501 part 2): each exemplar statement's own settings
+    /// over the series reads' settings.
+    #[test]
+    fn the_exemplar_statements_carry_their_settings() {
+        use ExemplarStatement::{Count, Rows, Series, Thinned};
+        let get = |st, distributed, key: &str| {
+            exemplar_settings(st, TEST_READ_MEM, distributed)
+                .get(key)
+                .map(str::to_string)
+        };
+        let some = |v: &str| Some(v.to_string());
+        for distributed in [false, true] {
+            for st in [Count, Rows, Thinned, Series] {
+                assert_eq!(
+                    get(st, distributed, "max_memory_usage"),
+                    Some(TEST_READ_MEM.to_string()),
+                    "{st:?} {distributed}: the series read settings"
+                );
+                let byte_bound = st != Count;
+                assert_eq!(
+                    get(st, distributed, "max_result_bytes"),
+                    byte_bound.then(|| "268435456".to_string()),
+                    "{st:?} {distributed}"
+                );
+                assert_eq!(
+                    get(st, distributed, "result_overflow_mode"),
+                    byte_bound.then(|| "throw".to_string()),
+                    "{st:?} {distributed}"
+                );
+                if byte_bound {
+                    assert_eq!(get(st, distributed, "max_block_size"), some("4096"));
+                }
+                let capped = st == Rows;
+                assert_eq!(
+                    get(st, distributed, "max_rows_to_group_by"),
+                    capped.then(|| "100000".to_string()),
+                    "{st:?} {distributed}"
+                );
+                assert_eq!(
+                    get(st, distributed, "group_by_overflow_mode"),
+                    capped.then(|| "throw".to_string()),
+                    "{st:?} {distributed}"
+                );
+                let merged = distributed && matches!(st, Rows | Series);
+                assert_eq!(
+                    get(
+                        st,
+                        distributed,
+                        "optimize_distributed_group_by_sharding_key"
+                    ),
+                    merged.then(|| "0".to_string()),
+                    "{st:?} {distributed}"
+                );
+                assert_eq!(
+                    get(st, distributed, "distributed_product_mode"),
+                    distributed.then(|| "local".to_string()),
+                    "{st:?} {distributed}"
+                );
+                assert_eq!(
+                    get(st, distributed, "optimize_skip_unused_shards"),
+                    distributed.then(|| "0".to_string()),
+                    "{st:?} {distributed}"
+                );
+            }
+        }
     }
 
     // --- build_chunk_sqls / fetch_all_concurrently: cross-chunk merge

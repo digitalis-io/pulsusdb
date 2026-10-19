@@ -83,6 +83,7 @@
 pub mod compile;
 mod dispatch;
 pub mod exec;
+pub mod exemplars;
 pub mod grouped;
 pub mod grouped_rows;
 pub mod grouped_sql;
@@ -111,6 +112,7 @@ pub use exec::{
     FetchProbe, MetricMeta, MetricQueryParams, MetricsConfig, MetricsEngine, StatementProbe,
     TsdbStatus,
 };
+pub use exemplars::{ExemplarSeries, StoredExemplar};
 pub use labels::{
     CacheSnapshot, DEFAULT_STALENESS_MULTIPLIER, FallbackReason, LabelCache, LabelCacheConfig,
     LabelledResolution, MetricSeriesGroup, MultiMetricResolution, MultiMetricScanProbe, Resolution,

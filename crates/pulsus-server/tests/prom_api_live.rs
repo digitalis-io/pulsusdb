@@ -3152,10 +3152,14 @@ async fn prom_api_query_parameters_issue_499() {
         assert_eq!(json["error"], error, "L8 limit={raw}");
     }
 
-    // L9: the exemplar validation.
+    // L9: the exemplar validation. A selector with nothing stored is an
+    // empty list; a query with no selector has no `data` (issue #501 part 2).
     let (status, json) = q("/api/v1/query_exemplars?query=p499");
     assert_eq!(status, 200, "L9: {json}");
     assert_eq!(json, serde_json::json!({"status": "success", "data": []}));
+    let (status, json) = q("/api/v1/query_exemplars?query=1");
+    assert_eq!(status, 200, "L9 query=1: {json}");
+    assert_eq!(json, serde_json::json!({"status": "success"}));
     for params in [
         "",
         "query=p499%7B",
@@ -3183,4 +3187,66 @@ async fn prom_api_query_parameters_issue_499() {
 
     drop(guard);
     drop_db(&db).await;
+}
+
+/// S1 (issue #501 part 2): an OTLP histogram point's three exemplars,
+/// pushed through `/v1/metrics`, come back from `/api/v1/query_exemplars`
+/// on the `_bucket` series each value falls in, as the reference writes
+/// them.
+#[tokio::test(flavor = "multi_thread")]
+async fn pushed_exemplars_are_answered_on_their_bucket_series() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse to run this test");
+        return;
+    }
+    let db = pulsus_testkit::test_db("pulsus_prom_501_s1");
+    let port: u16 = 31_530;
+    let guard = spawn_prom_server(port, &db, &[]);
+    let t = (now_ms() / 1_000) * 1_000 - 60_000;
+    let ns = |ms: i64| (ms * 1_000_000).to_string();
+    let otlp = format!(
+        r#"{{"resourceMetrics":[{{"scopeMetrics":[{{"metrics":[
+             {{"name":"h","histogram":{{"aggregationTemporality":2,"dataPoints":[
+               {{"timeUnixNano":"{}","count":"3","sum":10.5,
+                 "bucketCounts":["1","1","1"],"explicitBounds":[1,5],
+                 "exemplars":[
+                   {{"timeUnixNano":"{}","asDouble":0.5,
+                     "traceId":"0102030405060708090a0b0c0d0e0f10"}},
+                   {{"timeUnixNano":"{}","asDouble":3.0}},
+                   {{"timeUnixNano":"{}","asDouble":7.0}}]}}]}}}}
+           ]}}]}}]}}"#,
+        ns(t),
+        ns(t - 1_500),
+        ns(t - 1_000),
+        ns(t - 500)
+    );
+    let (status, body) = http_post_bytes(port, "/v1/metrics", "application/json", otlp.as_bytes());
+    assert_eq!(status, 200, "the OTLP push: {body}");
+    let query = urlencode_query("histogram_quantile(0.9, rate(h_bucket[5m]))");
+    let path = format!(
+        "/api/v1/query_exemplars?query={query}&start={}&end={}",
+        (t - 60_000) / 1_000,
+        (t + 60_000) / 1_000
+    );
+    let ts = |ms: i64| format!("{}.{}", ms.div_euclid(1_000), ms.rem_euclid(1_000) / 100);
+    let want = format!(
+        r#"{{"status":"success","data":[{{"seriesLabels":{{"__name__":"h_bucket","le":"+Inf"}},"exemplars":[{{"labels":{{}},"value":"7","timestamp":{}}}]}},{{"seriesLabels":{{"__name__":"h_bucket","le":"1"}},"exemplars":[{{"labels":{{"trace_id":"0102030405060708090a0b0c0d0e0f10"}},"value":"0.5","timestamp":{}}}]}},{{"seriesLabels":{{"__name__":"h_bucket","le":"5"}},"exemplars":[{{"labels":{{}},"value":"3","timestamp":{}}}]}}]}}"#,
+        ts(t - 500),
+        ts(t - 1_500),
+        (t - 1_000) / 1_000
+    );
+    let deadline = Instant::now() + Duration::from_secs(40);
+    let mut last = String::new();
+    while Instant::now() < deadline {
+        if let Some((200, body)) = http_get(port, &path) {
+            last = body;
+            if last == want {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    drop(guard);
+    drop_db(&db).await;
+    assert_eq!(last, want, "/api/v1/query_exemplars' body");
 }

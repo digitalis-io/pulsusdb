@@ -137,6 +137,13 @@ pub enum TooBroadReason {
     /// prometheus/prometheus v3.13.0's own memory refusal
     /// (`web/api/v1/api.go:2236-2237 @ v3.13.0`).
     PromqlReadMemory { budget_bytes: u64 },
+    /// Issue #501 part 2: a `/api/v1/query_exemplars` answer exceeded
+    /// its `budget_bytes` budget — the engine's retention counter, or a
+    /// statement's `max_result_bytes` (server codes 396 and 307). Produced
+    /// **ONLY** by the exemplar read: the counter in
+    /// `metrics::exemplars`, and `metrics::dispatch::map_exemplar_read_error`
+    /// for the server codes, which no other metrics read calls.
+    ExemplarAnswerBytes { budget_bytes: u64 },
     /// Issue #398: a **TraceQL** read — search, catalog discovery, or the
     /// trace-by-id point read — exceeded
     /// `reader.traceql_read_max_memory_bytes`. Produced **ONLY** by
@@ -476,6 +483,10 @@ impl fmt::Display for TooBroadReason {
                      (reader.promql_read_max_memory_bytes) — narrow the selector or the \
                      time range"
                 )
+            }
+            TooBroadReason::ExemplarAnswerBytes { budget_bytes } => {
+                let _ = budget_bytes;
+                Ok(())
             }
             TooBroadReason::TraceReadMemory { budget_bytes } => {
                 write!(

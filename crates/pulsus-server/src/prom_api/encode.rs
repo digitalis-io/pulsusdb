@@ -38,8 +38,8 @@ use futures::StreamExt;
 use serde::Serialize;
 
 use pulsus_read::{
-    ExplainStage, HistMatrixSeries, HistOrFloat, HistVectorSample, MatrixSeries, MetricMeta,
-    PlanExplain, QueryResult, TsdbStatus, VectorSample,
+    ExemplarSeries, ExplainStage, HistMatrixSeries, HistOrFloat, HistVectorSample, MatrixSeries,
+    MetricMeta, PlanExplain, QueryResult, TsdbStatus, VectorSample,
 };
 
 use crate::app::BuildInfo;
@@ -814,10 +814,13 @@ pub(crate) fn metadata_response(mut items: Vec<MetricMeta>) -> Response {
 }
 
 // ---------------------------------------------------------------------
-// query_exemplars (issue #32: empty-success stub in M2).
+// query_exemplars (issue #501 part 2).
 // ---------------------------------------------------------------------
 
-pub(crate) fn query_exemplars_response() -> Response {
+/// `/api/v1/query_exemplars`' answer: `None` for a query with no
+/// selector, else the stored exemplars by series.
+pub(crate) fn query_exemplars_response(answer: Option<Vec<ExemplarSeries>>) -> Response {
+    let _ = answer;
     json_response(Body::from(r#"{"status":"success","data":[]}"#))
 }
 
@@ -944,6 +947,7 @@ pub(crate) fn status_tsdb_response(status: TsdbStatus) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pulsus_read::StoredExemplar;
 
     /// No limit, no stats, the presentation sort.
     const NO_SHAPE: ResponseShape = ResponseShape {
@@ -1911,13 +1915,107 @@ mod tests {
         );
     }
 
-    // --- query_exemplars stub ---
+    // --- query_exemplars (issue #501 part 2) ---
 
+    /// U5: no selector is the bare success; an answer is the reference's
+    /// shape byte for byte.
     #[tokio::test]
-    async fn query_exemplars_response_is_an_empty_success() {
-        let res = query_exemplars_response();
-        let body = body_string(res).await;
-        assert_eq!(body, r#"{"status":"success","data":[]}"#);
+    async fn query_exemplars_response_renders_both_shapes() {
+        assert_eq!(
+            body_string(query_exemplars_response(None)).await,
+            r#"{"status":"success"}"#
+        );
+        assert_eq!(
+            body_string(query_exemplars_response(Some(Vec::new()))).await,
+            r#"{"status":"success","data":[]}"#
+        );
+        let answer = vec![ExemplarSeries {
+            series_labels: vec![("__name__".to_string(), "m".to_string())],
+            exemplars: vec![StoredExemplar {
+                labels: vec![(
+                    "trace_id".to_string(),
+                    "0102030405060708090a0b0c0d0e0f10".to_string(),
+                )],
+                value: 0.25,
+                unix_milli: 1_500,
+            }],
+        }];
+        assert_eq!(
+            body_string(query_exemplars_response(Some(answer))).await,
+            r#"{"status":"success","data":[{"seriesLabels":{"__name__":"m"},"exemplars":[{"labels":{"trace_id":"0102030405060708090a0b0c0d0e0f10"},"value":"0.25","timestamp":1.5}]}]}"#
+        );
+    }
+
+    /// U3f: an encoded answer is never longer than what its rows were
+    /// charged, at the longest value form, the widest timestamps, both
+    /// ids, a label value of control characters and a series name of them.
+    #[tokio::test]
+    async fn an_encoded_answer_is_never_longer_than_its_charge() {
+        use pulsus_model::Fingerprint;
+        use pulsus_read::metrics::exemplars::{
+            ENVELOPE_CHARGE, assemble, exemplar_row_charge, keep_exemplar, keep_series,
+            series_row_charge,
+        };
+        use pulsus_read::metrics::rows::{ExemplarRow, ExemplarSeriesRow};
+        let controls: String = (0..1_000u32)
+            .map(|i| char::from_u32(1 + i % 31).expect("a control character"))
+            .collect();
+        let wide_labels =
+            serde_json::to_string(&serde_json::json!({ "k": controls })).expect("canonical labels");
+        let name: String = (0..100u32)
+            .map(|i| char::from_u32(1 + i % 31).expect("a control character"))
+            .collect();
+        let values = [-5e-324, 2.2250738585072009e-308, f64::MAX, f64::NAN];
+        let mut rows = Vec::new();
+        for (i, v) in values.iter().enumerate() {
+            for (j, ms) in [0i64, 4_294_967_295_999].iter().enumerate() {
+                for (k, labels) in ["{}".to_string(), wide_labels.clone()].iter().enumerate() {
+                    rows.push(ExemplarRow {
+                        fingerprint: Fingerprint::from_raw((i % 2) as u128 + 1),
+                        unix_milli: *ms + (i * 4 + j * 2 + k) as i64,
+                        value: *v,
+                        trace_id: [0xab; 16],
+                        span_id: [0xcd; 8],
+                        labels: labels.clone(),
+                    });
+                }
+            }
+        }
+        let series = vec![
+            ExemplarSeriesRow {
+                fingerprint: Fingerprint::from_raw(1),
+                series_name: name.clone(),
+                series_labels: wide_labels.clone(),
+            },
+            ExemplarSeriesRow {
+                fingerprint: Fingerprint::from_raw(2),
+                series_name: name,
+                series_labels: "{}".to_string(),
+            },
+        ];
+        let charged: usize = ENVELOPE_CHARGE
+            + rows.iter().map(exemplar_row_charge).sum::<usize>()
+            + series.iter().map(series_row_charge).sum::<usize>();
+        let n = rows.len();
+        let answer = assemble(
+            rows.into_iter().map(keep_exemplar).collect(),
+            series.into_iter().map(keep_series).collect(),
+        );
+        let body = body_string(query_exemplars_response(Some(answer))).await;
+        let json: serde_json::Value = serde_json::from_str(&body).expect("the answer is JSON");
+        let kept: usize = json["data"]
+            .as_array()
+            .expect("data")
+            .iter()
+            .map(|s| s["exemplars"].as_array().expect("exemplars").len())
+            .sum();
+        assert_eq!(kept, n, "every row is in the answer");
+        assert!(
+            body.len() <= charged,
+            "the body is {} bytes against a charge of {charged}",
+            body.len()
+        );
+        assert_eq!(quoted_value(-5e-324).len(), 329);
     }
 
     // --- status/* ---
@@ -2670,13 +2768,6 @@ mod tests {
                 None,
             );
             assert_eq!(body_string(res).await, fixture);
-        }
-
-        #[tokio::test]
-        async fn query_exemplars_matches_the_captured_prometheus_response() {
-            let fixture =
-                include_str!("../../tests/fixtures/prom_api/query_exemplars.empty_get.json");
-            assert_eq!(body_string(query_exemplars_response()).await, fixture);
         }
 
         /// One test per captured float/special-value golden — the crux of

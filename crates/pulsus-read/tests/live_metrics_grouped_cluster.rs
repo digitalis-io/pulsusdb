@@ -208,6 +208,7 @@ fn engine_config(db: &str, grouped_push: bool) -> MetricsConfig {
         labels_table: "metric_labels_dist".to_string(),
         label_index_table: "metric_label_index_dist".to_string(),
         label_values_table: "metric_label_values".to_string(),
+        exemplars_table: "metric_exemplars_dist".to_string(),
         metadata_table: "metric_metadata".to_string(),
         experimental_functions: false,
         max_metric_fanout: 1_000,

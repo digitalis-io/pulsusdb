@@ -514,6 +514,67 @@ pub fn metadata_query(
     sql
 }
 
+/// Issue #501 part 2: the tables the four exemplar statements name —
+/// `metric_exemplars`, the activity and lookup tables the ID statement
+/// reads, and whether they are the distributed wrappers, which decides
+/// `IN` or `GLOBAL IN` for the sets computed once on the initiator.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ExemplarTables<'a> {
+    pub(super) exemplars: &'a str,
+    pub(super) ids: SeriesTables<'a>,
+    pub(super) distributed: bool,
+}
+
+/// Statement C (issue #501 part 2): the stored exemplars of the selected
+/// series in the request window, counted, and the window they span.
+pub(super) fn exemplar_count_query(
+    tenant: &Tenant,
+    t: ExemplarTables<'_>,
+    filters: &[DiscoveryFilter],
+    window: DataWindow,
+) -> String {
+    let _ = (tenant, t, filters, window);
+    String::new()
+}
+
+/// Statement A (issue #501 part 2): every distinct exemplar of the
+/// selected series in C's `[lo, hi]`, at most 100,000 rows.
+pub(super) fn exemplar_rows_query(
+    tenant: &Tenant,
+    t: ExemplarTables<'_>,
+    filters: &[DiscoveryFilter],
+    window: DataWindow,
+    lo: i64,
+    hi: i64,
+) -> String {
+    let _ = (tenant, t, filters, window, lo, hi);
+    String::new()
+}
+
+/// Statement T (issue #501 part 2): per epoch-aligned slice of `w` ms in
+/// C's `[lo, hi]`, the one exemplar with the highest value, the earliest
+/// of equal values, then the lowest series ID, trace, span and labels.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn exemplar_thinned_query(
+    tenant: &Tenant,
+    t: ExemplarTables<'_>,
+    filters: &[DiscoveryFilter],
+    window: DataWindow,
+    lo: i64,
+    hi: i64,
+    w: i64,
+) -> String {
+    let _ = (tenant, t, filters, window, lo, hi, w);
+    String::new()
+}
+
+/// Statement H (issue #501 part 2): the name and label set of each series
+/// whose ID is in `fps`, the decimal IDs comma-joined, one row per series.
+pub(super) fn exemplar_series_query(tenant: &Tenant, t: ExemplarTables<'_>, fps: &str) -> String {
+    let _ = (tenant, t, fps);
+    String::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1899,5 +1960,156 @@ WHERE org_id = 'tenant-q'
   )",
             "statement 1"
         );
+    }
+
+    /// The exemplar statements' tables, single node or clustered.
+    fn exemplar_tables(distributed: bool) -> ExemplarTables<'static> {
+        if distributed {
+            ExemplarTables {
+                exemplars: "metric_exemplars_dist",
+                ids: SeriesTables {
+                    series: "metric_series_dist",
+                    labels: "metric_labels_dist",
+                    label_index: Some("metric_label_index_dist"),
+                    label_values: Some("metric_label_values"),
+                },
+                distributed: true,
+            }
+        } else {
+            ExemplarTables {
+                exemplars: "metric_exemplars",
+                ids: SeriesTables {
+                    series: "metric_series",
+                    labels: "metric_labels",
+                    label_index: Some("metric_label_index"),
+                    label_values: Some("metric_label_values"),
+                },
+                distributed: false,
+            }
+        }
+    }
+
+    /// U2 (issue #501 part 2): the four exemplar statements render the
+    /// design's text exactly, single node and clustered, `{ids_k}` being
+    /// the ID statement `/api/v1/series` renders for the same filter; two
+    /// filters join with `OR`; no statement joins.
+    #[test]
+    fn the_exemplar_statements_render_exactly() {
+        let tenant = no_tenant();
+        let window = DataWindow {
+            start_ms: 1_792_368_000_000,
+            end_ms: 1_792_371_599_999,
+        };
+        let api = DiscoveryFilter {
+            metric_name: Some("m".to_string()),
+            name_matchers: vec![],
+            matchers: vec![eq("job", "api")],
+        };
+        let (lo, hi) = (1_792_368_000_050, 1_792_371_599_594);
+        for distributed in [false, true] {
+            let t = exemplar_tables(distributed);
+            let (ex, labels, series, in_) = if distributed {
+                (
+                    "metric_exemplars_dist",
+                    "metric_labels_dist",
+                    "metric_series_dist",
+                    "GLOBAL IN",
+                )
+            } else {
+                ("metric_exemplars", "metric_labels", "metric_series", "IN")
+            };
+            let ids = |f: &DiscoveryFilter| {
+                format!(
+                    "SELECT fingerprint\n{}",
+                    discovery_read(&tenant, f, window).ids_from_where(t.ids)
+                )
+            };
+            assert!(
+                ids(&api).contains(&format!("FROM {series}\n")),
+                "{distributed}: {{ids_k}} reads its own tables"
+            );
+            let sel = format!("fingerprint {in_} (\n{}\n)", ids(&api));
+            let filters = std::slice::from_ref(&api);
+            let c = exemplar_count_query(&tenant, t, filters, window);
+            assert_eq!(
+                c,
+                format!(
+                    "SELECT count() AS n, min(unix_milli) AS lo, max(unix_milli) AS hi\n\
+                     FROM {ex}\n\
+                     WHERE org_id = ''\n\
+                     \x20 AND unix_milli >= 1792368000000 AND unix_milli <= 1792371599999\n\
+                     \x20 AND ({sel})"
+                ),
+                "C, distributed {distributed}"
+            );
+            let a = exemplar_rows_query(&tenant, t, filters, window, lo, hi);
+            assert_eq!(
+                a,
+                format!(
+                    "SELECT fingerprint, unix_milli, value, trace_id, span_id, labels\n\
+                     FROM {ex}\n\
+                     WHERE org_id = ''\n\
+                     \x20 AND unix_milli >= 1792368000050 AND unix_milli <= 1792371599594\n\
+                     \x20 AND ({sel})\n\
+                     GROUP BY fingerprint, unix_milli, value, trace_id, span_id, labels\n\
+                     ORDER BY fingerprint, unix_milli, value, trace_id, span_id, labels\n\
+                     LIMIT 100000"
+                ),
+                "A, distributed {distributed}"
+            );
+            let thinned = exemplar_thinned_query(&tenant, t, filters, window, lo, hi, 100);
+            assert_eq!(
+                thinned,
+                format!(
+                    "SELECT e.1 AS fingerprint, e.2 AS unix_milli, e.3 AS value, e.4 AS trace_id, e.5 AS span_id, e.6 AS labels\n\
+                     FROM (\n\
+                     \x20 SELECT intDiv(unix_milli, 100) AS slice,\n\
+                     \x20        argMin(tuple(fingerprint, unix_milli, value, trace_id, span_id, labels),\n\
+                     \x20               tuple(-value, unix_milli, fingerprint, trace_id, span_id, labels)) AS e\n\
+                     \x20 FROM {ex}\n\
+                     \x20 WHERE org_id = ''\n\
+                     \x20   AND unix_milli >= 1792368000050 AND unix_milli <= 1792371599594\n\
+                     \x20   AND ({sel})\n\
+                     \x20 GROUP BY slice\n\
+                     \x20 ORDER BY slice\n\
+                     \x20 LIMIT 100000\n\
+                     )"
+                ),
+                "T, distributed {distributed}"
+            );
+            let h = exemplar_series_query(&tenant, t, "1,2,3");
+            assert_eq!(
+                h,
+                format!(
+                    "SELECT fingerprint, any(metric_name) AS series_name, any(labels) AS series_labels\n\
+                     FROM {labels}\n\
+                     WHERE org_id = ''\n\
+                     \x20 AND metric_name {in_} (\n\
+                     \x20   SELECT DISTINCT metric_name\n\
+                     \x20   FROM {series}\n\
+                     \x20   WHERE org_id = ''\n\
+                     \x20     AND fingerprint IN (SELECT toUInt128(arrayJoin(splitByChar(',', '1,2,3'))))\n\
+                     \x20 )\n\
+                     \x20 AND fingerprint IN (SELECT toUInt128(arrayJoin(splitByChar(',', '1,2,3'))))\n\
+                     GROUP BY fingerprint"
+                ),
+                "H, distributed {distributed}"
+            );
+            // Two filters: one set per filter, joined by `OR`.
+            let web = DiscoveryFilter {
+                metric_name: None,
+                name_matchers: vec![],
+                matchers: vec![eq("job", "web")],
+            };
+            let two = exemplar_count_query(&tenant, t, &[api.clone(), web.clone()], window);
+            let both = format!("{sel}\n    OR fingerprint {in_} (\n{}\n)", ids(&web));
+            assert!(
+                two.ends_with(&format!("  AND ({both})")),
+                "two filters, distributed {distributed}:\n{two}"
+            );
+            for stmt in [&c, &a, &thinned, &h, &two] {
+                assert!(!stmt.contains("JOIN"), "{stmt}");
+            }
+        }
     }
 }

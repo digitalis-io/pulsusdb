@@ -49,6 +49,7 @@ use pulsus_promql::PromqlError;
 
 use crate::logql::error::{ReadError, TooBroadReason};
 use crate::metrics::exec::SampleBudget;
+use crate::metrics::exemplars::{AnswerBudget, EXEMPLAR_ANSWER_BYTES};
 
 pub(super) use leaf::MetricsDispatch;
 
@@ -361,6 +362,32 @@ where
             b.charge_one().map_err(ReadError::QueryTooBroad)?;
         }
         out.push(row);
+    }
+    Ok(out)
+}
+
+/// The exemplar read's `ChError` mapper (issue #501 part 2).
+pub(crate) fn map_exemplar_read_error(e: ChError, read_max_memory_bytes: u64) -> ReadError {
+    map_metrics_read_error(e, read_max_memory_bytes)
+}
+
+/// Drains one exemplar statement's row stream against `budget`, keeping
+/// each row as `convert` makes it (issue #501 part 2).
+pub(crate) async fn drain_charged_bytes<R, T, S>(
+    mut stream: S,
+    budget: &mut AnswerBudget,
+    cost: impl Fn(&R) -> usize,
+    mut convert: impl FnMut(R) -> T,
+    read_max_memory_bytes: u64,
+) -> Result<Vec<T>, ReadError>
+where
+    S: futures::Stream<Item = Result<R, ChError>> + Unpin,
+{
+    let _ = (&budget, &cost);
+    let mut out = Vec::new();
+    while let Some(row) = stream.next().await {
+        let row = row.map_err(|e| map_exemplar_read_error(e, read_max_memory_bytes))?;
+        out.push(convert(row));
     }
     Ok(out)
 }
@@ -803,6 +830,49 @@ mod tests {
                 ReadError::Clickhouse(inner) => assert_eq!(inner.to_string(), expected),
                 other => panic!("expected passthrough, got {other:?}"),
             }
+        }
+    }
+
+    /// U3e (issue #501 part 2): the exemplar read maps the two result-byte
+    /// codes to its own refusal and every other code as the metrics mapper
+    /// does; the metrics mapper itself still passes them through.
+    #[test]
+    fn only_the_exemplar_reads_map_the_result_byte_codes() {
+        for code in [396, 307] {
+            let e = || ChError::Server {
+                code,
+                message: "DB::Exception: Limit for result exceeded".to_string(),
+            };
+            match map_exemplar_read_error(e(), TEST_READ_MEM) {
+                ReadError::QueryTooBroad(
+                    reason @ TooBroadReason::ExemplarAnswerBytes { budget_bytes },
+                ) => {
+                    assert_eq!(budget_bytes, EXEMPLAR_ANSWER_BYTES as u64, "{code}");
+                    assert_eq!(
+                        reason.to_string(),
+                        "exemplar answer exceeds the 268435456-byte budget — narrow the \
+                         selector or the time range",
+                        "{code}"
+                    );
+                }
+                other => panic!("{code}: expected the exemplar refusal, got {other:?}"),
+            }
+            match map_metrics_read_error(e(), TEST_READ_MEM) {
+                ReadError::Clickhouse(ChError::Server { code: c, .. }) => assert_eq!(c, code),
+                other => panic!("{code}: the metrics mapper must pass it through, got {other:?}"),
+            }
+        }
+        match map_exemplar_read_error(
+            ChError::Server {
+                code: 241,
+                message: "Memory limit (for query) exceeded".to_string(),
+            },
+            TEST_READ_MEM,
+        ) {
+            ReadError::QueryTooBroad(TooBroadReason::PromqlReadMemory { budget_bytes }) => {
+                assert_eq!(budget_bytes, TEST_READ_MEM);
+            }
+            other => panic!("241 must stay the memory refusal, got {other:?}"),
         }
     }
 }

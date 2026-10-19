@@ -1253,7 +1253,7 @@ async fn server_now(client: &ChClient) -> String {
 /// **T15 (issue #614): every read route names its statements.** Each read
 /// route of [`every_route`], and the four other status routes, answers with an `X-Pulsus-Query-Id` of 32
 /// lowercase hex characters, a different one per request; every route but
-/// `query_exemplars` and the five status routes (which read nothing) has at least
+/// the five status routes (which read nothing) has at least
 /// one finished statement whose `log_comment` is that id; and no SELECT on
 /// this database between the first request and the last went out without
 /// one. The label cache refreshes hourly here, so its sweep is not in the
@@ -1344,9 +1344,9 @@ async fn every_read_route_names_its_statements_with_the_request_id() {
             ),
         )
         .await;
-        // `query_exemplars` and the status routes read nothing;
-        // `status/tsdb` answers from the label cache.
-        if route.contains("query_exemplars") || route.contains("/api/v1/status/") {
+        // The status routes read nothing; `status/tsdb` answers from the
+        // label cache.
+        if route.contains("/api/v1/status/") {
             assert_eq!(n, 0, "T15: {route} reads nothing");
         } else {
             assert!(n >= 1, "T15: {route}: no statement carries {id}");
