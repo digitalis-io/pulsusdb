@@ -579,9 +579,11 @@ pub(super) fn exemplar_count_query(
 }
 
 /// Statement A (issue #501 part 2): every distinct exemplar of the
-/// selected series in C's `[lo, hi]`, at most 100,000 rows. Dispatched
-/// with `max_rows_to_group_by = 100000` and `group_by_overflow_mode =
-/// 'throw'`, so more distinct exemplars than that fail with code 158.
+/// selected series in C's `[lo, hi]`, at most 100,001 rows — the last one
+/// the sign that there are more than the 100,000 an answer carries. Its
+/// `max_rows_to_group_by = 100000` bounds each node's own groups, and a
+/// node past it fails with code 158; shards each under it can merge to
+/// more, which only the 100,001st row shows.
 pub(super) fn exemplar_rows_query(
     tenant: &Tenant,
     t: ExemplarTables<'_>,
@@ -602,7 +604,7 @@ pub(super) fn exemplar_rows_query(
         t.exemplars,
         tenant.sql_literal(),
         exemplar_selection(tenant, t, filters, window),
-        super::exemplars::EXEMPLAR_ANSWER_CAP
+        super::exemplars::EXEMPLAR_SENTINEL_ROW
     )
 }
 

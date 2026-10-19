@@ -22,6 +22,11 @@ use super::rows::{ExemplarRow, ExemplarSeriesRow};
 /// over it, the answer is thinned to one exemplar per slice.
 pub const EXEMPLAR_ANSWER_CAP: u64 = 100_000;
 
+/// Statement A's `LIMIT` and its drain's sentinel: the row past the cap.
+/// Its arrival means more than [`EXEMPLAR_ANSWER_CAP`] distinct exemplars,
+/// which each node's own row cap cannot see once shards merge (r8 §3.3).
+pub const EXEMPLAR_SENTINEL_ROW: usize = EXEMPLAR_ANSWER_CAP as usize + 1;
+
 /// The bytes one answer may keep and write: 256 MiB, the trace search's
 /// retention budget (`crate::traces::exec::HYDRATION_BYTE_BUDGET`), and
 /// each statement's `max_result_bytes`.
@@ -247,55 +252,54 @@ pub fn hydration_chunks(fps: &[Fingerprint]) -> Vec<String> {
         .collect()
 }
 
-/// An A or T row's fixed charge: its JSON's 461 bytes past the stored
-/// labels — the longest quoted value is 329 bytes — with room to spare,
-/// and its decoded form: the struct, the two id pairs and their text.
-const EX_FIXED: usize =
-    464 + std::mem::size_of::<StoredExemplar>() + 3 * std::mem::size_of::<(String, String)>() + 96;
-
-/// An H row's fixed charge: its JSON's 48 bytes past the name and labels,
-/// and its decoded form: the struct and the `__name__` pair.
-const SER_FIXED: usize =
-    64 + std::mem::size_of::<ExemplarSeries>() + 2 * std::mem::size_of::<(String, String)>();
-
-/// The `_json` half of an A or T row's charge (issue #501 part 2, r8):
-/// the most bytes its exemplar object and separator add to the body.
+/// The `_json` half of an A or T row's charge (r8 §3.7): the most bytes
+/// its exemplar object and separator add to the body. `{"labels":` 10,
+/// `,"value":` 9, the quoted value at most 329 (the longest `prom_float`
+/// form, for −5e−324), `,"timestamp":` 13, the timestamp at most 21, `}`
+/// and a separator 2, the two ids with their names and commas 77: 461,
+/// rounded to 464, past the stored labels, which the encoder writes again
+/// byte for byte.
 pub fn exemplar_row_json(row: &ExemplarRow) -> usize {
-    let _ = row;
-    0
+    464 + row.labels.len()
 }
 
-/// The `_held` half of an A or T row's charge: the most bytes the
-/// structures the answer keeps for it take.
+/// The `_held` half of an A or T row's charge: the struct, the two id
+/// pairs and their 96 bytes of text, and 11 bytes a byte of the stored
+/// labels — each pair at least 5 of them, so under 10 bytes of pair header
+/// a byte, plus the text itself.
 pub fn exemplar_row_held(row: &ExemplarRow) -> usize {
-    let _ = row;
-    0
+    std::mem::size_of::<StoredExemplar>()
+        + 3 * std::mem::size_of::<(String, String)>()
+        + 96
+        + 11 * row.labels.len()
 }
 
-/// The `_json` half of an H row's charge.
+/// The `_json` half of an H row's charge: `{"seriesLabels":` 16,
+/// `"__name__":"…",` 15 and the name escaped, at most 6 bytes a byte,
+/// `,"exemplars":[` 14, `]}` and a separator 3 — 48, rounded to 64 — past
+/// the stored labels.
 pub fn series_row_json(row: &ExemplarSeriesRow) -> usize {
-    let _ = row;
-    0
+    64 + 6 * row.series_name.len() + row.series_labels.len()
 }
 
-/// The `_held` half of an H row's charge.
+/// The `_held` half of an H row's charge: the struct, the `__name__` pair
+/// and one more, the name twice, and 11 bytes a byte of the stored labels.
 pub fn series_row_held(row: &ExemplarSeriesRow) -> usize {
-    let _ = row;
-    0
+    std::mem::size_of::<ExemplarSeries>()
+        + 2 * std::mem::size_of::<(String, String)>()
+        + 2 * row.series_name.len()
+        + 11 * row.series_labels.len()
 }
 
-/// What an A or T row is charged: [`EX_FIXED`] and 12 bytes a byte of its
-/// stored labels — the labels once in the JSON, once decoded, and under
-/// 10 bytes of pair headers a byte, each pair being at least 5 bytes.
+/// What an A or T row is charged: its `_json` and `_held` halves, since
+/// the body and the structures exist at once.
 pub fn exemplar_row_charge(row: &ExemplarRow) -> usize {
-    EX_FIXED + 12 * row.labels.len()
+    exemplar_row_json(row) + exemplar_row_held(row)
 }
 
-/// What an H row is charged: [`SER_FIXED`], 8 bytes a byte of the name —
-/// escaped at most six times over, and kept twice — and 12 a byte of the
-/// stored labels, as for an exemplar.
+/// What an H row is charged: its `_json` and `_held` halves.
 pub fn series_row_charge(row: &ExemplarSeriesRow) -> usize {
-    SER_FIXED + 8 * row.series_name.len() + 12 * row.series_labels.len()
+    series_row_json(row) + series_row_held(row)
 }
 
 /// The retention counter of one exemplar answer: charged before a row is
@@ -324,6 +328,12 @@ impl AnswerBudget {
         }
         self.used = would_be;
         Ok(())
+    }
+
+    /// Gives back `bytes` an earlier charge took, when what it paid for is
+    /// dropped.
+    pub(crate) fn release(&mut self, bytes: usize) {
+        self.used = self.used.saturating_sub(bytes);
     }
 }
 
@@ -681,6 +691,7 @@ mod tests {
             &mut budget,
             |_: &ExemplarRow| 100,
             keep_exemplar,
+            None,
             1 << 30,
         )
         .await;
@@ -696,10 +707,14 @@ mod tests {
             &mut budget,
             |_: &ExemplarRow| 100,
             keep_exemplar,
+            None,
             1 << 30,
         )
         .await
         .expect("three rows at the cap are accepted");
+        let super::super::dispatch::Drained::Rows(kept) = kept else {
+            panic!("no sentinel was set");
+        };
         assert_eq!(kept.len(), 3);
         assert!(
             budget.charge(1).is_err(),

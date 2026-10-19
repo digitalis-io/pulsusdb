@@ -537,6 +537,11 @@ pub struct MetricsEngine {
     /// The staleness lookback, milliseconds (issue #499): the request's
     /// `lookback_delta`, or [`DEFAULT_LOOKBACK_MS`].
     lookback_ms: i64,
+    /// TEST SEAM (issue #501 part 2): the byte budget of one exemplar
+    /// answer — [`super::exemplars::EXEMPLAR_ANSWER_BYTES`] in production,
+    /// lowered by [`MetricsEngine::with_exemplar_answer_bytes`] so a suite
+    /// can pass it at a corpus it can afford.
+    exemplar_answer_bytes: usize,
 }
 
 impl MetricsEngine {
@@ -557,6 +562,7 @@ impl MetricsEngine {
             grouped_chunk_size: sample_sql::CHUNK_THRESHOLD,
             pushed_series_steps_cap: super::grouped::PUSHED_SERIES_STEPS_PER_STATEMENT,
             lookback_ms: DEFAULT_LOOKBACK_MS,
+            exemplar_answer_bytes: super::exemplars::EXEMPLAR_ANSWER_BYTES,
         }
     }
 
@@ -2644,9 +2650,10 @@ impl MetricsEngine {
     /// exemplars of the series any of `filters` selects in `window`.
     ///
     /// Statement C counts them and finds their window; none is an empty
-    /// answer. A then reads every distinct one in that window, or fails
-    /// with code 158 past [`super::exemplars::EXEMPLAR_ANSWER_CAP`], when T
-    /// reads one per slice instead. H hydrates the series labels of the
+    /// answer. A then reads every distinct one in that window. Its
+    /// 100,001st row — more than [`super::exemplars::EXEMPLAR_ANSWER_CAP`]
+    /// merged from shards each under the cap — or a node's code 158 sends
+    /// the request to T, which reads one per slice instead. H hydrates the series labels of the
     /// rows, one statement per [`super::exemplars::HYDRATION_CHUNK_FINGERPRINTS`]
     /// IDs, one after another. Every row of A, T and H is charged to one
     /// [`super::exemplars::EXEMPLAR_ANSWER_BYTES`] budget as it arrives.
@@ -2656,8 +2663,9 @@ impl MetricsEngine {
         filters: &[DiscoveryFilter],
         window: DataWindow,
     ) -> Result<Vec<super::exemplars::ExemplarSeries>, ReadError> {
+        use super::dispatch::Drained;
         use super::exemplars::{
-            AnswerBudget, ENVELOPE_CHARGE, EXEMPLAR_ANSWER_BYTES, assemble, exemplar_row_charge,
+            AnswerBudget, ENVELOPE_CHARGE, EXEMPLAR_SENTINEL_ROW, assemble, exemplar_row_charge,
             hydration_chunks, keep_exemplar, keep_series, series_row_charge, slice_width,
         };
         use super::sql::{
@@ -2682,13 +2690,12 @@ impl MetricsEngine {
         let Some(count) = counts.into_iter().next().filter(|c| c.n > 0) else {
             return Ok(Vec::new());
         };
-        let new_budget = || -> Result<AnswerBudget, ReadError> {
-            let mut budget = AnswerBudget::new(EXEMPLAR_ANSWER_BYTES);
-            budget.charge(ENVELOPE_CHARGE)?;
-            Ok(budget)
-        };
-        let mut budget = new_budget()?;
-        let rows = match self
+        let mut budget = AnswerBudget::new(self.exemplar_answer_bytes);
+        budget.charge(ENVELOPE_CHARGE)?;
+        // A's outcome decides the branch (r8 §3.3): at most the cap is the
+        // answer; its sentinel row, or a node's own code 158, sends the
+        // request to T. The drain has released A's charge either way.
+        let a = self
             .dispatch
             .fetch_rows_charged_bytes(
                 exemplar_rows_query(tenant, t, filters, window, count.lo, count.hi),
@@ -2696,50 +2703,61 @@ impl MetricsEngine {
                 &mut budget,
                 exemplar_row_charge,
                 keep_exemplar,
+                Some(EXEMPLAR_SENTINEL_ROW),
             )
-            .await
-        {
-            Ok(rows) => rows,
-            Err(ReadError::Clickhouse(ChError::Server {
+            .await;
+        let rows = match a {
+            Ok(Drained::Rows(rows)) => rows,
+            Ok(Drained::Sentinel)
+            | Err(ReadError::Clickhouse(ChError::Server {
                 code: CODE_TOO_MANY_ROWS,
                 ..
             })) => {
-                budget = new_budget()?;
                 let w = slice_width(window, count.lo, count.hi);
-                self.dispatch
+                match self
+                    .dispatch
                     .fetch_rows_charged_bytes(
                         exemplar_thinned_query(tenant, t, filters, window, count.lo, count.hi, w),
                         &settings(ExemplarStatement::Thinned),
                         &mut budget,
                         exemplar_row_charge,
                         keep_exemplar,
+                        None,
                     )
                     .await?
+                {
+                    Drained::Rows(rows) => rows,
+                    Drained::Sentinel => unreachable!("T is drained with no sentinel"),
+                }
             }
             Err(e) => return Err(e),
         };
         let fps: Vec<Fingerprint> = rows.iter().map(|(fp, _)| *fp).collect();
         let mut series = Vec::new();
         for chunk in hydration_chunks(&fps) {
-            series.extend(
-                self.dispatch
-                    .fetch_rows_charged_bytes(
-                        exemplar_series_query(tenant, t, &chunk),
-                        &settings(ExemplarStatement::Series),
-                        &mut budget,
-                        series_row_charge,
-                        keep_series,
-                    )
-                    .await?,
-            );
+            match self
+                .dispatch
+                .fetch_rows_charged_bytes(
+                    exemplar_series_query(tenant, t, &chunk),
+                    &settings(ExemplarStatement::Series),
+                    &mut budget,
+                    series_row_charge,
+                    keep_series,
+                    None,
+                )
+                .await?
+            {
+                Drained::Rows(rows) => series.extend(rows),
+                Drained::Sentinel => unreachable!("H is drained with no sentinel"),
+            }
         }
         Ok(assemble(rows, series))
     }
 
     /// TEST SEAM (issue #501 part 2): the byte budget one exemplar answer
     /// may keep and write.
-    pub fn with_exemplar_answer_bytes(self, bytes: usize) -> Self {
-        let _ = bytes;
+    pub fn with_exemplar_answer_bytes(mut self, bytes: usize) -> Self {
+        self.exemplar_answer_bytes = bytes;
         self
     }
 
@@ -2891,7 +2909,9 @@ enum ExemplarStatement {
 }
 
 /// ClickHouse's `TOO_MANY_ROWS` (issue #501 part 2): statement A's
-/// `max_rows_to_group_by` refusal, the signal to thin.
+/// `max_rows_to_group_by` refusal on one node, a signal to thin. The limit
+/// is checked by each node over its own groups and not at the merge, so it
+/// bounds memory; the merged count is A's sentinel row.
 const CODE_TOO_MANY_ROWS: i32 = 158;
 
 /// The settings of one exemplar statement (issue #501 part 2): the series

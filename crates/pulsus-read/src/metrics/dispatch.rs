@@ -214,7 +214,8 @@ mod leaf {
     use crate::metrics::exec::SampleBudget;
 
     use super::{
-        drain_charged, drain_charged_bytes, map_exemplar_read_error, map_metrics_read_error,
+        Drained, drain_charged, drain_charged_bytes, map_exemplar_read_error,
+        map_metrics_read_error,
     };
     use crate::metrics::exemplars::AnswerBudget;
 
@@ -319,8 +320,9 @@ mod leaf {
         /// part 2): the same text checks and `log_comment`, every error
         /// through [`super::map_exemplar_read_error`], and each row charged
         /// to `budget` and converted as it is accepted
-        /// ([`super::drain_charged_bytes`]). The second accessor; like the
-        /// first it hands out the converted rows, never the stream.
+        /// ([`super::drain_charged_bytes`], with A's `sentinel`). The second
+        /// accessor; like the first it hands out the converted rows, never
+        /// the stream.
         pub(crate) async fn fetch_rows_charged_bytes<R: ChRow, T>(
             &self,
             sql: String,
@@ -328,7 +330,8 @@ mod leaf {
             budget: &mut AnswerBudget,
             cost: impl Fn(&R) -> usize,
             convert: impl FnMut(R) -> T,
-        ) -> Result<Vec<T>, ReadError> {
+            sentinel: Option<usize>,
+        ) -> Result<Drained<T>, ReadError> {
             let sql = escape_query_placeholders(&sql);
             if let Err(reason) = crate::querytext::ensure_query_text_fits(&sql) {
                 return Err(ReadError::QueryTooBroad(reason));
@@ -346,7 +349,15 @@ mod leaf {
                 .query_stream::<R>(&sql, settings)
                 .await
                 .map_err(|e| map_exemplar_read_error(e, self.read_max_memory_bytes))?;
-            drain_charged_bytes(stream, budget, cost, convert, self.read_max_memory_bytes).await
+            drain_charged_bytes(
+                stream,
+                budget,
+                cost,
+                convert,
+                sentinel,
+                self.read_max_memory_bytes,
+            )
+            .await
         }
     }
 }
@@ -428,29 +439,83 @@ pub(crate) fn map_exemplar_read_error(e: ChError, read_max_memory_bytes: u64) ->
     map_metrics_read_error(e, read_max_memory_bytes)
 }
 
+/// What one exemplar statement's drain ends with (issue #501 part 2).
+#[derive(Debug)]
+pub(crate) enum Drained<T> {
+    /// Every row, each kept as `convert` made it.
+    Rows(Vec<T>),
+    /// The sentinel row arrived: the statement holds more rows than the
+    /// answer may; nothing is kept and nothing stays charged.
+    Sentinel,
+}
+
 /// Drains one exemplar statement's row stream against `budget` (issue #501
 /// part 2): each row is priced, charged, then converted into what the
 /// answer keeps, so no row is held twice and a row whose charge would pass
 /// the cap is refused before it is kept. Both `ChError` seams go through
 /// [`map_exemplar_read_error`]. A parent-module function for
 /// [`drain_charged`]'s reason: it cannot create a stream.
+///
+/// With a `sentinel` (statement A, r8 §3.3), the drain counts rows: the
+/// `sentinel`th row ends it as [`Drained::Sentinel`]. A charge that does
+/// not fit before then drops every kept row and releases its charge, and
+/// the drain goes on counting without keeping; if the stream then ends
+/// short of the sentinel, the answer does not fit and the budget's refusal
+/// is returned. Without one, the first charge that does not fit is the
+/// refusal. On every way out but [`Drained::Rows`], what the drain charged
+/// is released.
 pub(crate) async fn drain_charged_bytes<R, T, S>(
     mut stream: S,
     budget: &mut AnswerBudget,
     cost: impl Fn(&R) -> usize,
     mut convert: impl FnMut(R) -> T,
+    sentinel: Option<usize>,
     read_max_memory_bytes: u64,
-) -> Result<Vec<T>, ReadError>
+) -> Result<Drained<T>, ReadError>
 where
     S: futures::Stream<Item = Result<R, ChError>> + Unpin,
 {
     let mut out = Vec::new();
+    let mut charged = 0usize;
+    let mut seen = 0usize;
+    let mut overflow: Option<ReadError> = None;
     while let Some(row) = stream.next().await {
-        let row = row.map_err(|e| map_exemplar_read_error(e, read_max_memory_bytes))?;
-        budget.charge(cost(&row))?;
-        out.push(convert(row));
+        let row = match row {
+            Ok(row) => row,
+            Err(e) => {
+                budget.release(charged);
+                return Err(map_exemplar_read_error(e, read_max_memory_bytes));
+            }
+        };
+        seen += 1;
+        if sentinel.is_some_and(|s| seen >= s) {
+            budget.release(charged);
+            return Ok(Drained::Sentinel);
+        }
+        if overflow.is_some() {
+            continue;
+        }
+        let bytes = cost(&row);
+        match budget.charge(bytes) {
+            Ok(()) => {
+                charged += bytes;
+                out.push(convert(row));
+            }
+            Err(refusal) => {
+                budget.release(charged);
+                if sentinel.is_none() {
+                    return Err(refusal);
+                }
+                charged = 0;
+                out = Vec::new();
+                overflow = Some(refusal);
+            }
+        }
     }
-    Ok(out)
+    match overflow {
+        Some(refusal) => Err(refusal),
+        None => Ok(Drained::Rows(out)),
+    }
 }
 
 #[cfg(test)]
@@ -934,6 +999,47 @@ mod tests {
                 assert_eq!(budget_bytes, TEST_READ_MEM);
             }
             other => panic!("241 must stay the memory refusal, got {other:?}"),
+        }
+    }
+
+    /// Issue #501 part 2, r8 §3.3: A's drain keeps counting past a byte
+    /// overflow. At a budget of 250 and 100 a row, the third row does not
+    /// fit: with a sentinel of 5, five rows still reach the sentinel and
+    /// nothing stays charged; four rows end short of it and are the byte
+    /// refusal, with nothing charged either.
+    #[tokio::test]
+    async fn the_drain_counts_on_past_a_byte_overflow_to_its_sentinel() {
+        let rows = |n: u32| futures::stream::iter((0..n).map(Ok::<u32, ChError>));
+        let mut budget = AnswerBudget::new(250);
+        match drain_charged_bytes(rows(5), &mut budget, |_| 100, |r| r, Some(5), TEST_READ_MEM)
+            .await
+        {
+            Ok(Drained::Sentinel) => {}
+            other => panic!("expected the sentinel, got {other:?}"),
+        }
+        assert!(
+            budget.charge(250).is_ok(),
+            "the sentinel leaves nothing charged"
+        );
+        let mut budget = AnswerBudget::new(250);
+        match drain_charged_bytes(rows(4), &mut budget, |_| 100, |r| r, Some(5), TEST_READ_MEM)
+            .await
+        {
+            Err(ReadError::QueryTooBroad(TooBroadReason::ExemplarAnswerBytes { budget_bytes })) => {
+                assert_eq!(budget_bytes, 250)
+            }
+            other => panic!("expected the byte refusal, got {other:?}"),
+        }
+        assert!(
+            budget.charge(250).is_ok(),
+            "the refusal leaves nothing charged"
+        );
+        let mut budget = AnswerBudget::new(250);
+        match drain_charged_bytes(rows(2), &mut budget, |_| 100, |r| r, Some(5), TEST_READ_MEM)
+            .await
+        {
+            Ok(Drained::Rows(kept)) => assert_eq!(kept, vec![0, 1]),
+            other => panic!("expected both rows, got {other:?}"),
         }
     }
 }
