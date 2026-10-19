@@ -716,6 +716,10 @@ pub struct SearchStatement {
     /// Whether the selector holds a structural operator, whose relations
     /// read `spans` inside a read of `spans` (issue #602 part 2b).
     structural: bool,
+    /// Whether a predicate reads a span's child count, whose `(trace_id,
+    /// span_id) IN` subquery reads `spans` inside a read of `spans`
+    /// (issue #600 part 2).
+    child_counts: bool,
 }
 
 /// The response attributes every surviving spanset carries (issue #602
@@ -743,9 +747,10 @@ impl SearchStatement {
     }
 
     /// Whether the statement reads a table inside a read of the same
-    /// table: the numbering or a structural operator's relations.
+    /// table: the numbering, a structural operator's relations or a span's
+    /// child count.
     pub fn nests_reads(&self) -> bool {
-        self.numbered || self.structural
+        self.numbered || self.structural || self.child_counts
     }
 
     pub fn projection(&self) -> &Projection {
@@ -1090,6 +1095,7 @@ pub fn compile_search_sliced(
         climb_depth,
         numbered: numbered > 0,
         structural,
+        child_counts: filter.predicates().iter().any(|p| p.reads_child_counts()),
     })
 }
 

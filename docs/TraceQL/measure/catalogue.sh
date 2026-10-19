@@ -69,7 +69,7 @@ if [ -n "$cluster" ]; then
     shards=$(q "SELECT max(shard_num) FROM system.clusters WHERE cluster = '$cluster'")
     placed="SELECT concat(toString(count()), ',', toString(min(same)), ',', toString(sum(top))) FROM (
         SELECT s, min(n) = max(n) AND min(n) > 0 AS same, max(n) AS top FROM (
-            SELECT shardNum() AS s, hostName() AS h, uniqExact(trace_id, span_id) AS n
+            SELECT getMacro('shard') AS s, hostName() AS h, uniqExact(trace_id, span_id) AS n
             FROM clusterAllReplicas('$cluster', $db.spans) GROUP BY s, h) GROUP BY s)"
     [ "$(q "$placed")" = "$shards,1,$want" ] || {
         echo "catalogue.sh: the fixture is not on every shard and replica: $(q "$placed")" >&2; exit 1; }

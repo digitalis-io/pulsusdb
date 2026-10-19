@@ -210,14 +210,15 @@ impl TraceEngine {
 impl TraceEngine {
     /// A search statement's settings: [`with_final`] over the search
     /// settings, and, clustered, `distributed_product_mode = 'local'` for a
-    /// statement that reads the nested-set numbering (issue #594 part 2)
-    /// or holds a structural operator (issue #602 part 2b). That statement
+    /// statement that reads the nested-set numbering (issue #594 part 2),
+    /// holds a structural operator (issue #602 part 2b) or reads a span's
+    /// child count (issue #600 part 2). That statement
     /// nests a read of `spans` and of `traces` inside reads of the same
     /// tables; clustered, those are `_dist` tables, which ClickHouse's
     /// default `'deny'` refuses. `'local'` reads each nested table on the
     /// shard: both are sharded by `cityHash64(trace_id)`, so a trace's
-    /// rows, and so its numbering and its relations, are whole on one
-    /// shard.
+    /// rows, and so its numbering, its relations and its child counts, are
+    /// whole on one shard.
     pub(super) fn statement_settings(&self, stmt: &SearchStatement) -> QuerySettings {
         product_mode(
             with_final(self.search_settings()),
