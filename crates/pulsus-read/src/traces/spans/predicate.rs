@@ -727,13 +727,20 @@ impl<'a> Compiler<'a> {
     /// set of types those values are stored as. Every occurrence of one
     /// key's text is the same, so the engine evaluates it once per
     /// statement.
+    ///
+    /// The values are text with their type's name, never an
+    /// `Array(Dynamic)` (issue #600 part 2): a clustered read evaluates
+    /// this scalar on the initiator and sends its value to each shard as a
+    /// literal; an empty `Array(Dynamic)` literal is refused (code 36) and
+    /// a non-empty one is re-typed from its text, so a stored `Int64` `200`
+    /// reaches a shard as `Int16`.
     fn resource_read(&mut self, key: &str) -> Result<String, PlanError> {
         let ctx = self.ctx.ok_or_else(|| needs_window(AttrScope::Resource))?;
         self.uses_resources = true;
         let path = attr_path(ATTRS, key);
         Ok(format!(
-            "(SELECT (groupArray(resource_id), groupArray({path}), \
-             groupUniqArray(dynamicType({path}))) FROM {} WHERE {} AND \
+            "(SELECT (groupArray(resource_id), groupArray((dynamicType({path}), \
+             toString({path}))), groupUniqArray(dynamicType({path}))) FROM {} WHERE {} AND \
              dynamicType({path}) {HELD})",
             ctx.resources_table,
             ctx.window.resources_day_clause()
@@ -2512,12 +2519,48 @@ impl Arms {
 
 /// `V(k)`: the value of the lookup `q` (`Q(k)`) at the span's own
 /// `resource_id`, `NULL` when the span's resource row is not among `q`'s.
+///
+/// `q` is written once, under an alias named for its text; the engine
+/// accepts one alias defined again with the same expression, so each
+/// `V(k)` carries its own definition wherever it lands.
 fn resource_value(q: &str) -> String {
+    let arms = HELD_TYPES
+        .iter()
+        .map(|ty| {
+            format!(
+                "tupleElement(rv, 1) = '{ty}', CAST(CAST(tupleElement(rv, 2), '{ty}'), 'Dynamic')"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rq = format!("rq_{:016x}", fnv1a(q));
     format!(
-        "arrayElement(tupleElement({q}, 2), transform(resource_id, tupleElement({q}, 1), \
-         arrayEnumerate(tupleElement({q}, 1)), 0))"
+        "arrayElement(arrayMap(rv -> multiIf({arms}, NULL), [arrayElement(tupleElement({q} AS {rq}, 2), \
+         transform(resource_id, tupleElement({rq}, 1), arrayEnumerate(tupleElement({rq}, 1)), 0))]), 1)"
     )
 }
+
+/// FNV-1a over `text`: the name of a lookup's alias, the same for the same
+/// text in every statement and every process.
+fn fnv1a(text: &str) -> u64 {
+    text.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// The types [`HELD`] lists, in its order: a lookup row carries its value
+/// as text with its type's name, and [`resource_value`] reads it back as
+/// that type.
+const HELD_TYPES: [&str; 8] = [
+    "String",
+    "Int64",
+    "Float64",
+    "Bool",
+    "Array(Nullable(String))",
+    "Array(Nullable(Int64))",
+    "Array(Nullable(Float64))",
+    "Array(Nullable(Bool))",
+];
 
 /// The scalar pairs, in the order their terms are emitted.
 const SCALAR_PAIRS: [(Class, Class); 8] = [

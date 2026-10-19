@@ -1,6 +1,6 @@
 # Reproducing the numbers in docs/TraceQL/
 
-**Parts of this document describe the previous trace search engine, which issue #602 part 2c-2b deleted — its test binaries, goldens and benches in part 2c-2b-1, its code and the unit tests inside it in part 2c-2b-2; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** **Since #600 `catalogue.py` is the shipped-compiler comparison and `catalogue.sh` runs it; `catalogue_render.py` supplies only the disposition rule, and `run_all.sh`, `perturb_check.py`, `reproduce_check.py` and `claims_check.py` describe the design renderer's run and are not re-run.** Every figure in the TraceQL documents comes from one of these scripts.
+**Parts of this document describe the previous trace search engine, which issue #602 part 2c-2b deleted — its test binaries, goldens and benches in part 2c-2b-1, its code and the unit tests inside it in part 2c-2b-2; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** **Since #600 `catalogue.py` is the shipped-compiler comparison and `catalogue.sh` runs it, on one node or on the cluster `PULSUS_CLUSTER` names; `catalogue_render.py` supplies only the disposition rule, and `run_all.sh`, `perturb_check.py`, `reproduce_check.py` and `claims_check.py` describe the design renderer's run and are not re-run.** Every figure in the TraceQL documents comes from one of these scripts.
 They take hosts, ports and directories as arguments; nothing is hard-coded.
 `run_all.sh` goes from a clean checkout to `results/` in one command.
 

@@ -3047,3 +3047,67 @@ jobs:
 
       - name: The catalogue against the shipped compiler (T-C8, T-Q2)
         run: sh docs/TraceQL/measure/catalogue.sh localhost 19123 catalogue "$RUNNER_TEMP/catalogue" target/debug
+
+  # Issue #600 part 2: the catalogue on the two-shard cluster, shard 1 with
+  # two replicas, run through each shard's node. Scheduled or dispatched,
+  # not required.
+  traceql-catalogue-cluster:
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93.0"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "workspace"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Start the 2-shard cluster
+        run: docker compose -f ci/clickhouse-cluster/compose.yaml up -d
+
+      - name: Wait for cluster health
+        run: |
+          for _ in $(seq 1 60); do
+            h1=$(docker inspect -f '{{.State.Health.Status}}' pulsus-ch-shard1-it 2>/dev/null || echo starting)
+            h1b=$(docker inspect -f '{{.State.Health.Status}}' pulsus-ch-shard1b-it 2>/dev/null || echo starting)
+            h2=$(docker inspect -f '{{.State.Health.Status}}' pulsus-ch-shard2-it 2>/dev/null || echo starting)
+            hk=$(docker inspect -f '{{.State.Health.Status}}' pulsus-keeper-it 2>/dev/null || echo starting)
+            if [ "$h1" = healthy ] && [ "$h1b" = healthy ] && [ "$h2" = healthy ] && [ "$hk" = healthy ]; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::cluster did not become healthy in time"
+          docker ps -a
+          exit 1
+
+      - name: Build pulsusdb and xtask
+        run: cargo build -p pulsus-server --bin pulsusdb -p xtask --bin xtask
+
+      - name: One base time
+        run: echo "CATALOGUE_BASE=$(( ( $(date -u +%s) - 7200 ) / 60 * 60 ))" >> "$GITHUB_ENV"
+
+      - name: The catalogue on one node
+        run: sh docs/TraceQL/measure/catalogue.sh localhost 18123 catalogue_single "$RUNNER_TEMP/catalogue-0" target/debug
+
+      - name: The catalogue through shard 1's node
+        env:
+          PULSUS_CLUSTER: pulsus_test_cluster
+        run: sh docs/TraceQL/measure/catalogue.sh localhost 18123 catalogue "$RUNNER_TEMP/catalogue-1" target/debug
+
+      - name: The catalogue through shard 2's node
+        env:
+          PULSUS_CLUSTER: pulsus_test_cluster
+        run: sh docs/TraceQL/measure/catalogue.sh localhost 28123 catalogue "$RUNNER_TEMP/catalogue-2" target/debug
+
+      - name: One answer through every entry point
+        run: python3 docs/TraceQL/measure/catalogue_same.py "$RUNNER_TEMP"/catalogue-0/catalogue-run.jsonl "$RUNNER_TEMP"/catalogue-1/catalogue-run.jsonl "$RUNNER_TEMP"/catalogue-2/catalogue-run.jsonl
+
+      - name: Tear down the cluster
+        if: always()
+        run: docker compose -f ci/clickhouse-cluster/compose.yaml down -v
