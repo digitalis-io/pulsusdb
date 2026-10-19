@@ -1582,6 +1582,15 @@ ORDER BY conn_type = '', minute, client_minute, client, server, conn_type
 SETTINGS max_threads = 4, max_memory_usage = 4294967296, max_rows_to_read = 60000000, read_overflow_mode = 'throw', max_execution_time = 50,
          max_insert_threads = 1, max_insert_block_size = 100000000, min_insert_block_size_rows = 100000000, min_insert_block_size_bytes = 10000000000;"#;
 
+/// The clustered view's replica barrier (part B §2), in place of the
+/// single-node `hi` line: a run that has not received every part its shard
+/// announced for `spans` and `service_edges` pairs an empty range and writes
+/// no marker. Its two lines carry the `--@cluster` prefix, which the render
+/// strips with the indentation after it.
+const SERVICE_EDGES_BARRIER: &str = "(SELECT min(inserts_in_queue = 0 AND (log_pointer > log_max_index OR (log_pointer = 0 AND log_max_index = 0))) FROM system.replicas WHERE database = 'pulsus' AND table IN ('spans', 'service_edges')) AS caught_up,
+if(caught_up, least(ready, lo + INTERVAL 5 MINUTE), lo) AS hi,
+";
+
 /// The rendered statement beginning `head`, exactly one of it.
 fn statement_starting(ctx: &RenderCtx, head: &str) -> String {
     let found: Vec<String> = rendered_statements(ctx)
@@ -1622,11 +1631,15 @@ fn the_service_edges_statements_are_the_plan_s() {
             "ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/pulsus.service_edges', '{replica}', ver)",
             1,
         );
-    let clustered_view = SERVICE_EDGES_VIEW.replacen(
-        "pulsus.service_edges_mv REFRESH",
-        "pulsus.service_edges_mv ON CLUSTER 'prod' REFRESH",
-        1,
-    );
+    let hi = "     least(ready, lo + INTERVAL 5 MINUTE) AS hi,\n";
+    assert!(SERVICE_EDGES_VIEW.contains(hi), "the single-node `hi` line");
+    let clustered_view = SERVICE_EDGES_VIEW
+        .replacen(
+            "pulsus.service_edges_mv REFRESH",
+            "pulsus.service_edges_mv ON CLUSTER 'prod' REFRESH",
+            1,
+        )
+        .replacen(hi, SERVICE_EDGES_BARRIER, 1);
     assert_eq!(
         statement_starting(
             &clustered(),

@@ -3754,6 +3754,22 @@ mod tests {
         );
     }
 
+    /// KU1 (issue #599 part B): the clustered graph read sends a shard's
+    /// totals and spans read and its marker fan-out to the same replica, the
+    /// first listed, unless that one is down; the single-node read is
+    /// untouched.
+    #[test]
+    fn the_clustered_graph_read_takes_the_replicas_in_order() {
+        let local = graph_settings(&cfg());
+        assert_eq!(local.get("load_balancing"), None);
+        let mut clustered = cfg();
+        clustered.distributed = true;
+        assert_eq!(
+            graph_settings(&clustered).get("load_balancing"),
+            Some("in_order")
+        );
+    }
+
     /// U2 (issue #599): the clustered graph's target is the first two
     /// quoted arguments of the routing table's `Distributed(…)` definition,
     /// as `system.tables.engine_full` spells it, and nothing else is a
