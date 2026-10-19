@@ -6836,14 +6836,16 @@ fn metric_plan_window(mp: &MetricPlan) -> ClientWindow {
 /// …` condition that makes the next statement with that condition count too
 /// few lines (measured on 26.3.29.7). Turning the direct read off corrects
 /// it and leaves the condition cache and the index analysis on.
+///
+/// #603: logs rows sit on the shard that took the push, so these reads send
+/// the answer pins with pruning off.
 pub fn read_query_settings(
     scan_budget_bytes: u64,
     read_max_memory_bytes: u64,
     skip_unavailable_shards: bool,
 ) -> QuerySettings {
-    // STUB (tests first): the option is not sent yet.
-    let _ = skip_unavailable_shards;
     QuerySettings::new()
+        .answer_pins(false, skip_unavailable_shards)
         .set("max_bytes_to_read", scan_budget_bytes)
         .set("read_overflow_mode", "throw")
         .set("max_query_size", crate::querytext::MAX_QUERY_TEXT_BYTES)

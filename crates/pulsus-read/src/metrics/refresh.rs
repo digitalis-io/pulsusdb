@@ -192,9 +192,8 @@ pub(crate) fn sweep_settings(
     read_max_memory_bytes: u64,
     skip_unavailable_shards: bool,
 ) -> QuerySettings {
-    // STUB (tests first): the option is not sent yet.
-    let _ = skip_unavailable_shards;
     QuerySettings::new()
+        .answer_pins(false, skip_unavailable_shards)
         .set("max_memory_usage", read_max_memory_bytes)
         .set("max_bytes_before_external_group_by", 0u64)
         .set("distributed_product_mode", "local")

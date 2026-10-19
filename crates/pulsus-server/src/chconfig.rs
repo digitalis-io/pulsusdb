@@ -212,8 +212,8 @@ pub(crate) fn engine_config_from(config: &Config) -> EngineConfig {
         // distributed `IN`, rejected by ClickHouse's default `deny`
         // (Code 288) on a clustered deployment.
         distributed: config.cluster.is_some(),
-        // STUB (tests first): not mapped yet.
-        skip_unavailable_shards: false,
+        // #603 follow-up: sent on every LogQL read as part of the answer pins.
+        skip_unavailable_shards: config.skip_unavailable_shards,
     }
 }
 
@@ -316,8 +316,8 @@ pub(crate) fn label_cache_config_from(config: &Config) -> LabelCacheConfig {
         // per-query memory ceiling as the request path; its warn-and-serve-
         // the-last-good-snapshot failure behaviour is unchanged.
         read_max_memory_bytes: config.reader.promql_read_max_memory_bytes,
-        // STUB (tests first): not mapped yet.
-        skip_unavailable_shards: false,
+        // #603 follow-up: the sweep sends the answer pins too.
+        skip_unavailable_shards: config.skip_unavailable_shards,
     }
 }
 
@@ -390,8 +390,8 @@ pub(crate) fn metrics_config_from(config: &Config) -> MetricsConfig {
         // — `ReaderConfig -> MetricsConfig -> metrics::grouped::node_verdicts`,
         // which is the only reader of it.
         grouped_push: config.reader.promql_grouped_push,
-        // STUB (tests first): not mapped yet.
-        skip_unavailable_shards: false,
+        // #603 follow-up: sent on every metrics read as part of the answer pins.
+        skip_unavailable_shards: config.skip_unavailable_shards,
     }
 }
 

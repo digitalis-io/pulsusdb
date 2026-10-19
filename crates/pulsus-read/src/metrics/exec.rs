@@ -2878,9 +2878,8 @@ fn metrics_read_settings(
     read_max_memory_bytes: u64,
     skip_unavailable_shards: bool,
 ) -> QuerySettings {
-    // STUB (tests first): the option is not sent yet.
-    let _ = skip_unavailable_shards;
     QuerySettings::new()
+        .answer_pins(false, skip_unavailable_shards)
         .set("max_query_size", crate::querytext::MAX_QUERY_TEXT_BYTES)
         .set("max_memory_usage", read_max_memory_bytes)
         .set("max_bytes_before_external_group_by", 0u64)
@@ -2948,8 +2947,8 @@ enum ExemplarStatement {
 const CODE_TOO_MANY_ROWS: i32 = 158;
 
 /// The settings of one exemplar statement (issue #501 part 2): the series
-/// reads' settings ([`series_read_settings`]); when clustered,
-/// `optimize_skip_unused_shards = 0` on all four, and on A and H, which
+/// reads' settings ([`series_read_settings`]), whose answer pins carry
+/// `optimize_skip_unused_shards = 0` on all four; when clustered, on A and H, which
 /// group by the sharding key's column, `optimize_distributed_group_by_
 /// sharding_key = 0`, so the initiator merges a group stored on two
 /// shards; on A the row cap that decides the branch; on A, T and H the
@@ -2963,9 +2962,6 @@ fn exemplar_settings(
     use super::exemplars::{EXEMPLAR_ANSWER_BYTES, EXEMPLAR_ANSWER_CAP, EXEMPLAR_MAX_BLOCK_ROWS};
     let mut settings =
         series_read_settings(read_max_memory_bytes, distributed, skip_unavailable_shards);
-    if distributed {
-        settings = settings.set("optimize_skip_unused_shards", 0u64);
-    }
     if statement == ExemplarStatement::Rows {
         settings = settings
             .set("max_rows_to_group_by", EXEMPLAR_ANSWER_CAP)

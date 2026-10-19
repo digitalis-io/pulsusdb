@@ -2194,13 +2194,18 @@ impl TraceEngine {
 /// [`crate::traces::filter::TRACE_STR_COL_CAP`]-capped string columns
 /// (never a-priori row-unbounded); the Layer-2 retention counter is the
 /// binding bound on accumulated state across the whole request.
+///
+/// #603 follow-up: the answer pins follow the base, before every other
+/// setting, pruning on only when sharded (trace rows are placed by
+/// `cityHash64(trace_id)`).
 fn search_settings(config: &TraceReadConfig) -> QuerySettings {
     let base = if config.distributed {
         QuerySettings::clustered_reader(config.skip_unavailable_shards)
     } else {
         QuerySettings::new()
     };
-    base.set("max_rows_to_read", config.scan_budget_rows)
+    base.answer_pins(config.distributed, config.skip_unavailable_shards)
+        .set("max_rows_to_read", config.scan_budget_rows)
         .set("max_bytes_to_read", TRACE_READ_BYTES_BUDGET)
         .set("read_overflow_mode", "throw")
         .set("max_result_bytes", TRACE_MAX_RESULT_BYTES)
@@ -2316,7 +2321,10 @@ fn tag_read_error(e: ChError, n: &TagNarrowing, config: &TraceReadConfig) -> Rea
 /// unbounded scan; scoped reads that prune to a small partition stay
 /// under budget and return `200` as before.
 fn catalog_settings(config: &TraceReadConfig) -> QuerySettings {
+    // The catalogue tables are copied whole to every node, so no read of
+    // them fans out: the answer pins with pruning off.
     QuerySettings::new()
+        .answer_pins(false, config.skip_unavailable_shards)
         .set("max_rows_to_read", config.scan_budget_rows)
         .set("max_bytes_to_read", TRACE_READ_BYTES_BUDGET)
         .set("read_overflow_mode", "throw")
@@ -2369,7 +2377,8 @@ fn fetch_settings(config: &TraceReadConfig) -> QuerySettings {
         QuerySettings::new()
     };
     with_final(
-        base.set("max_rows_to_read", config.scan_budget_rows)
+        base.answer_pins(config.distributed, config.skip_unavailable_shards)
+            .set("max_rows_to_read", config.scan_budget_rows)
             .set("max_bytes_to_read", TRACE_READ_BYTES_BUDGET)
             .set("read_overflow_mode", "throw")
             .set("max_query_size", crate::querytext::MAX_QUERY_TEXT_BYTES)
