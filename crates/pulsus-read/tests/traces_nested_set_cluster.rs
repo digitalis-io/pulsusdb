@@ -2028,12 +2028,14 @@ async fn two_replicas_share_one_edge_table() {
         let prefix = pulsus_testkit::test_ident(&format!("t599b_k10_{n}_{}", now_ns()));
         assert_g1(&r.graph(&prefix).await, &format!("K10 request {n}"));
         exec(&r.s1, "SYSTEM FLUSH LOGS").await;
+        // The initiator logs the statement's `cluster(…)` table function,
+        // not the tables its parts read.
         let graph_statements = count(
             &r.s1,
             &format!(
                 "SELECT count() AS n FROM system.query_log WHERE type = 'QueryFinish' \
                  AND is_initial_query AND startsWith(query_id, '{prefix}-') \
-                 AND has(tables, '{db}.service_edges') AND has(tables, '{db}.spans') \
+                 AND has(tables, '_table_function.cluster') \
                  AND Settings['load_balancing'] = 'in_order'"
             ),
         )
