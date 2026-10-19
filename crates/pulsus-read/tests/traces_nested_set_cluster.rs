@@ -1335,3 +1335,1175 @@ async fn the_service_graph_answers_over_two_shards() {
     )
     .await;
 }
+
+// Issue #599 part B: shard 1 with two replicas
+// =====================================================================
+//
+// Shard 1 has two replicas, `ch-shard1` (the first listed) and `ch-shard1b`;
+// every replica runs the job into the one shared `service_edges`, and a run
+// pairs a bucket only when its replica holds every part the shard has
+// announced for `spans` and `service_edges`. Each case below names the node
+// it acts on. Every view is stopped while a case builds its state and is
+// started only for the refresh the case names, so no scheduled run acts
+// first; merges are stopped on both tables of both replicas, so neither a
+// merge nor its replication-log entry changes what a run or a check reads.
+
+fn shard1b_config(database: &str) -> ChConnConfig {
+    shard_config("PULSUS_TEST_CH_SHARD1B_HOST", "172.28.0.13", database)
+}
+
+/// A replica's replication state for one table, from `system.replicas`.
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, Copy)]
+struct ReplicaState {
+    inserts_in_queue: u64,
+    log_pointer: u64,
+    log_max_index: u64,
+}
+
+impl ReplicaState {
+    /// No announced part still to fetch, and every log entry copied.
+    fn synced(&self) -> bool {
+        self.inserts_in_queue == 0 && self.log_pointer > self.log_max_index
+    }
+}
+
+async fn replica_state(client: &ChClient, db: &str, table: &str) -> ReplicaState {
+    let sql = format!(
+        "SELECT toUInt64(inserts_in_queue) AS inserts_in_queue, log_pointer, log_max_index \
+         FROM system.replicas WHERE database = '{db}' AND table = '{table}'"
+    );
+    let mut st = client
+        .query_stream::<ReplicaState>(&sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    st.next()
+        .await
+        .unwrap_or_else(|| panic!("{db}.{table} is replicated on this node"))
+        .expect("decode a replica state")
+}
+
+/// Polls `db.table`'s replica state until `want` holds, for up to two
+/// minutes; the test fails, rather than goes on, if it never does.
+async fn wait_state(
+    client: &ChClient,
+    db: &str,
+    table: &str,
+    what: &str,
+    want: impl Fn(&ReplicaState) -> bool,
+) -> ReplicaState {
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let state = replica_state(client, db, table).await;
+        if want(&state) {
+            return state;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what}: {db}.{table} never reached the state: {state:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Both tables of the job synced on every client given.
+async fn wait_synced(clients: &[&ChClient], db: &str, what: &str) {
+    for c in clients {
+        for table in ["spans", "service_edges"] {
+            wait_state(c, db, table, what, ReplicaState::synced).await;
+        }
+    }
+}
+
+/// The node's markers under `FINAL`, oldest first, in ns.
+async fn markers(client: &ChClient) -> Vec<i64> {
+    strings(
+        client,
+        "SELECT toString(toUnixTimestamp(minute)) AS s FROM service_edges FINAL \
+         WHERE conn_type = '' ORDER BY minute",
+    )
+    .await
+    .into_iter()
+    .map(|s| s.parse::<i64>().expect("a timestamp") * S)
+    .collect()
+}
+
+/// The server's clock, in microseconds.
+async fn server_now_us(client: &ChClient) -> i64 {
+    strings(
+        client,
+        "SELECT toString(toUnixTimestamp64Micro(now64(6))) AS s",
+    )
+    .await[0]
+        .parse()
+        .expect("a timestamp")
+}
+
+/// Every view of the database stopped on every node, then `start_edges`'s
+/// state on `client` without its start: no marker but one at `marker_ns`.
+async fn seed_edges(clients: &[&ChClient], client: &ChClient, marker_ns: i64) {
+    for c in clients {
+        stop_edges_view(c).await;
+    }
+    exec(client, "TRUNCATE TABLE service_edges").await;
+    exec(
+        client,
+        &format!(
+            "INSERT INTO service_edges SELECT {t}, {t}, '', '', '', 0, 0, \
+             arrayReduce('quantilesTDigestState(0.5, 0.95, 0.99)', [toInt64(0)]), 1",
+            t = format_args!("toDateTime({}, 'UTC')", marker_ns / S)
+        ),
+    )
+    .await;
+}
+
+/// One refresh of the node's job: the view started for it, a run finished
+/// after the start (its `system.query_log` row), no refresh exception, and
+/// the view stopped again.
+async fn refresh_on(client: &ChClient, db: &str, what: &str) {
+    let t0 = server_now_us(client).await;
+    exec(client, "SYSTEM START VIEW service_edges_mv").await;
+    exec(client, "SYSTEM REFRESH VIEW service_edges_mv").await;
+    exec(client, "SYSTEM WAIT VIEW service_edges_mv").await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        exec(client, "SYSTEM FLUSH LOGS").await;
+        let finished = count(
+            client,
+            &format!(
+                "SELECT count() AS n FROM system.query_log WHERE type = 'QueryFinish' \
+                 AND log_comment = 'refresh of {db}.service_edges_mv' \
+                 AND event_time_microseconds >= fromUnixTimestamp64Micro(toInt64({t0}))"
+            ),
+        )
+        .await;
+        if finished > 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what}: no refresh finished on the node"
+        );
+        exec(client, "SYSTEM WAIT VIEW service_edges_mv").await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    exec(client, "SYSTEM WAIT VIEW service_edges_mv").await;
+    let failed = strings(
+        client,
+        "SELECT exception AS s FROM system.view_refreshes WHERE database = currentDatabase() \
+         AND view = 'service_edges_mv'",
+    )
+    .await;
+    assert_eq!(failed, [""], "{what}: the refresh succeeded");
+    stop_edges_view(client).await;
+    // Part B §4: each run's duration, the barrier's read included.
+    let durations = strings(
+        client,
+        &format!(
+            "SELECT toString(query_duration_ms) AS s FROM system.query_log \
+             WHERE type = 'QueryFinish' AND log_comment = 'refresh of {db}.service_edges_mv' \
+             AND event_time_microseconds >= fromUnixTimestamp64Micro(toInt64({t0})) \
+             ORDER BY event_time_microseconds"
+        ),
+    )
+    .await;
+    println!("{what}: refresh durations, ms: {durations:?}");
+}
+
+/// Refreshes on `client` until its prefix reaches `until_ns`, at most
+/// `tries` times; the view stopped after.
+async fn refresh_until(client: &ChClient, db: &str, until_ns: i64, tries: u32, what: &str) {
+    for _ in 0..tries {
+        if prefix_end(client).await >= until_ns {
+            return;
+        }
+        refresh_on(client, db, what).await;
+    }
+    assert!(
+        prefix_end(client).await >= until_ns,
+        "{what}: the job did not reach {until_ns}: markers {:?}",
+        markers(client).await
+    );
+}
+
+/// `NewPart` events of `service_edges` on the node since `t_us`.
+async fn new_edge_parts_since(client: &ChClient, db: &str, t_us: i64) -> u64 {
+    exec(client, "SYSTEM FLUSH LOGS").await;
+    count(
+        client,
+        &format!(
+            "SELECT count() AS n FROM system.part_log WHERE database = '{db}' \
+             AND table = 'service_edges' AND event_type = 'NewPart' \
+             AND event_time_microseconds >= fromUnixTimestamp64Micro(toInt64({t_us}))"
+        ),
+    )
+    .await
+}
+
+/// One span of fixture G: trace, span id, parent, kind, start, duration,
+/// error, `zipkin.shared = "true"`.
+type GSpan = (
+    [u8; 16],
+    [u8; 8],
+    Option<[u8; 8]>,
+    i32,
+    i64,
+    i64,
+    bool,
+    bool,
+);
+
+const MILLI: i64 = 1_000_000;
+const SERVER: i32 = 2;
+const CLIENT: i32 = 3;
+const PRODUCER: i32 = 4;
+const CONSUMER: i32 = 5;
+const INTERNAL: i32 = 1;
+
+fn g_trace(group: u8, n: u8) -> [u8; 16] {
+    let mut id = [0u8; 16];
+    id[0] = 0x59;
+    id[2] = group;
+    id[3] = n;
+    id[15] = 1;
+    id
+}
+
+fn g_span_id(role: u8, n: u8) -> [u8; 8] {
+    [0x5a, 0, role, n, 0, 0, 0, 1]
+}
+
+/// Part A §5.2's fixture G at `l`: its eight pushes P1–P8, each one
+/// service's spans, every span starting in `[l + 1 s, l + 70 s)`.
+fn fixture_g(l: i64) -> Vec<(&'static str, Vec<GSpan>)> {
+    let (t, s) = (g_trace, g_span_id);
+    let c1: GSpan = (t(1, 1), s(1, 1), None, CLIENT, l + 58 * S, S, false, false);
+    let d = |i: u8| -> GSpan {
+        let at = l + 30 * S + i64::from(i) * 500 * MILLI;
+        (t(2, i), s(2, i), None, CLIENT, at, S, false, false)
+    };
+    let e = |i: u8| -> GSpan {
+        let at = l + 30 * S + i64::from(i) * 500 * MILLI - 10 * MILLI;
+        (
+            t(2, i),
+            s(4, i),
+            Some(s(2, i)),
+            SERVER,
+            at,
+            i64::from(i) * MILLI,
+            false,
+            false,
+        )
+    };
+    let mut p1 = vec![
+        c1,
+        (t(1, 2), s(1, 2), None, CLIENT, l + 10 * S, S, false, false),
+        (
+            t(1, 3),
+            s(1, 3),
+            None,
+            PRODUCER,
+            l + 20 * S,
+            S,
+            false,
+            false,
+        ),
+    ];
+    p1.extend((1..=20).map(d));
+    let p2 = vec![
+        (
+            t(1, 1),
+            s(3, 1),
+            Some(s(1, 1)),
+            SERVER,
+            l + 61 * S,
+            10 * MILLI,
+            false,
+            false,
+        ),
+        (
+            t(1, 3),
+            s(3, 2),
+            Some(s(1, 3)),
+            CONSUMER,
+            l + 21 * S,
+            20 * MILLI,
+            false,
+            false,
+        ),
+    ];
+    // The shared server span: the client's own span id, no parent.
+    let p3 = vec![(
+        t(1, 2),
+        s(1, 2),
+        None,
+        SERVER,
+        l + 11 * S,
+        30 * MILLI,
+        true,
+        true,
+    )];
+    let p4: Vec<GSpan> = (1..=20).map(e).collect();
+    let mut p5 = p4.clone();
+    p5.push((
+        t(3, 1),
+        s(5, 1),
+        None,
+        INTERNAL,
+        l + 5 * S,
+        MILLI,
+        false,
+        false,
+    ));
+    let p6 = vec![
+        c1,
+        (t(1, 4), s(1, 4), None, CLIENT, l + 40 * S, S, true, false),
+        (
+            t(1, 5),
+            s(1, 5),
+            None,
+            PRODUCER,
+            l + 45 * S,
+            S,
+            false,
+            false,
+        ),
+        (t(1, 6), s(1, 6), None, CLIENT, l + 50 * S, S, false, false),
+    ];
+    let p7 = vec![
+        (
+            t(1, 4),
+            s(6, 1),
+            Some(s(1, 4)),
+            SERVER,
+            l + 41 * S,
+            40 * MILLI,
+            false,
+            false,
+        ),
+        (
+            t(1, 4),
+            s(6, 2),
+            Some(s(1, 4)),
+            SERVER,
+            l + 41 * S,
+            40 * MILLI,
+            false,
+            false,
+        ),
+    ];
+    // Cross-kind halves: neither pair is an edge.
+    let p8 = vec![
+        (
+            t(1, 5),
+            s(7, 1),
+            Some(s(1, 5)),
+            SERVER,
+            l + 46 * S,
+            MILLI,
+            false,
+            false,
+        ),
+        (
+            t(1, 6),
+            s(7, 2),
+            Some(s(1, 6)),
+            CONSUMER,
+            l + 51 * S,
+            MILLI,
+            false,
+            false,
+        ),
+    ];
+    vec![
+        ("svc-a", p1),
+        ("svc-b", p2),
+        ("svc-c", p3),
+        ("svc-d", p4),
+        ("svc-d", p5),
+        ("svc-a", p6),
+        ("svc-e", p7),
+        ("svc-f", p8),
+    ]
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Pushes `range` of fixture G (0 is P1) into the node's own `spans`, one
+/// insert, so one part, each.
+async fn push_g(client: &ChClient, l: i64, range: std::ops::Range<usize>) {
+    for (service, spans) in fixture_g(l).into_iter().skip(range.start).take(range.len()) {
+        let rows: Vec<String> = spans
+            .iter()
+            .map(|(t, id, parent, kind, at, dur, error, shared)| {
+                format!(
+                    "('{}', '{}', '{}', {at}, {dur}, {kind}, {}, '{}')",
+                    hex(t),
+                    hex(id),
+                    parent.map(|p| hex(&p)).unwrap_or_default(),
+                    if *error { 2 } else { 0 },
+                    if *shared {
+                        r#"{"zipkin%2Eshared":"true"}"#
+                    } else {
+                        "{}"
+                    }
+                )
+            })
+            .collect();
+        exec(
+            client,
+            &format!(
+                "INSERT INTO spans (trace_id, span_id, parent_span_id, start_ns, duration_ns, \
+                 service, name, kind, status_code, attrs, end_ns, service_type) \
+                 SELECT unhex(t), unhex(sp), unhex(p), st, d, '{service}', 'op', k, sc, \
+                        CAST(a, 'JSON'), toUInt64(st + d), 'string' \
+                 FROM values('t String, sp String, p String, st Int64, d Int64, k Int32, \
+                              sc Int32, a String', {})",
+                rows.join(", ")
+            ),
+        )
+        .await;
+    }
+}
+
+/// Fixture G's answer (part A §5.2): `(client, server, type, calls,
+/// failed, quantiles)`, in order.
+/// One edge of an answer: client, server, type, calls, failed, quantiles.
+type Edge = (&'static str, &'static str, &'static str, u64, u64, [f64; 3]);
+
+fn g1_rows() -> Vec<Edge> {
+    vec![
+        (
+            "svc-a",
+            "svc-d",
+            "rpc",
+            20,
+            0,
+            [10_000_000.0, 19_000_000.0, 20_000_000.0],
+        ),
+        ("svc-a", "svc-e", "rpc", 2, 2, [40_000_000.0; 3]),
+        ("svc-a", "svc-b", "messaging", 1, 0, [20_000_000.0; 3]),
+        ("svc-a", "svc-b", "rpc", 1, 0, [10_000_000.0; 3]),
+        ("svc-a", "svc-c", "rpc", 1, 1, [30_000_000.0; 3]),
+    ]
+}
+
+/// `edges` are fixture G's answer, every field, the quantiles within the
+/// digest's 1 % (part A L4).
+fn assert_g1(edges: &[pulsus_read::GraphEdgeRow], what: &str) {
+    let got: Vec<(String, String, String, u64, u64)> = edges
+        .iter()
+        .map(|e| {
+            (
+                e.client.clone(),
+                e.server.clone(),
+                e.conn_type.clone(),
+                e.calls,
+                e.failed,
+            )
+        })
+        .collect();
+    let want: Vec<(String, String, String, u64, u64)> = g1_rows()
+        .into_iter()
+        .map(|(c, s, t, n, f, _)| (c.to_string(), s.to_string(), t.to_string(), n, f))
+        .collect();
+    assert_eq!(got, want, "{what}: fixture G's edges, in order");
+    for (e, (_, _, _, _, _, q)) in edges.iter().zip(g1_rows()) {
+        for (i, want) in q.iter().enumerate() {
+            assert!(
+                (e.quantiles_ns[i] - want).abs() <= want * 0.01,
+                "{what}: {} -> {} {} quantile {i}: got {:?}, want {want}",
+                e.client,
+                e.server,
+                e.conn_type,
+                e.quantiles_ns
+            );
+        }
+    }
+}
+
+/// Shard 1's two replicas and shard 2's node over a fresh clustered
+/// database, every view stopped, one marker at `L − 1 min`, merges stopped
+/// on both job tables of shard 1, both replicas synced: the state every case
+/// but K6 starts from.
+struct Replicas {
+    db: String,
+    l: i64,
+    s1: ChClient,
+    s1b: ChClient,
+    s2: ChClient,
+}
+
+impl Replicas {
+    async fn new(name: &str) -> Self {
+        let db = pulsus_testkit::test_db(&format!("pulsus_read_it_t599b_{name}_{}", now_ns()));
+        let bootstrap = ChClient::new(shard1_config("default"))
+            .await
+            .expect("connect shard1");
+        exec(
+            &bootstrap,
+            &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
+        )
+        .await;
+        run_init(&bootstrap, &cluster_ctx(&db))
+            .await
+            .expect("run_init");
+        let s1 = ChClient::new(shard1_config(&db))
+            .await
+            .expect("connect shard1");
+        let s1b = ChClient::new(shard1b_config(&db))
+            .await
+            .expect("connect shard1b");
+        let s2 = ChClient::new(shard2_config(&db))
+            .await
+            .expect("connect shard2");
+        let l = floor_to(now_ns() - 30 * MINUTE, BUCKET);
+        let r = Replicas { db, l, s1, s1b, s2 };
+        for c in [&r.s1, &r.s1b] {
+            exec(c, "SYSTEM STOP MERGES spans").await;
+            exec(c, "SYSTEM STOP MERGES service_edges").await;
+        }
+        seed_edges(&[&r.s1, &r.s1b, &r.s2], &r.s1, l - MINUTE).await;
+        for c in [&r.s1, &r.s1b] {
+            wait_state(
+                c,
+                &r.db,
+                "service_edges",
+                "the seeded marker",
+                ReplicaState::synced,
+            )
+            .await;
+            assert_eq!(markers(c).await, vec![l - MINUTE], "the seeded marker");
+        }
+        r
+    }
+
+    /// G's window, `[L, L + 5 min)`.
+    fn window(&self) -> pulsus_read::GraphWindow {
+        pulsus_read::GraphWindow {
+            start_ns: self.l,
+            end_ns: self.l + 5 * MINUTE,
+        }
+    }
+
+    /// The route over G's window, initiated on `ch-shard1`, its statements
+    /// named `prefix`.
+    async fn graph(&self, prefix: &str) -> Vec<pulsus_read::GraphEdgeRow> {
+        pulsus_read::TraceEngine::new(
+            ChClient::new(shard1_config(&self.db))
+                .await
+                .expect("connect the engine"),
+            config(),
+        )
+        .with_statement_prefix(prefix)
+        .service_graph(self.window())
+        .await
+        .expect("the graph answers")
+        .edges
+    }
+
+    /// The route answers fixture G once, after both replicas are synced.
+    async fn assert_route_g1(&self, what: &str) {
+        wait_synced(&[&self.s1, &self.s1b], &self.db, what).await;
+        let prefix = pulsus_testkit::test_ident(&format!("t599b_{}", now_ns()));
+        assert_g1(&self.graph(&prefix).await, what);
+    }
+
+    async fn drop(self) {
+        exec(
+            &self.s1,
+            &format!(
+                "DROP DATABASE IF EXISTS {} ON CLUSTER '{CLUSTER_NAME}' SYNC",
+                self.db
+            ),
+        )
+        .await;
+    }
+}
+
+/// The address and native port shard 1's replica `n` has in the cluster
+/// definition, as the nodes reach each other.
+async fn shard1_replica_address(client: &ChClient, n: u32) -> String {
+    strings(
+        client,
+        &format!(
+            "SELECT concat(host_address, ':', toString(port)) AS s FROM system.clusters \
+             WHERE cluster = '{CLUSTER_NAME}' AND shard_num = 1 AND replica_num = {n}"
+        ),
+    )
+    .await
+    .into_iter()
+    .next()
+    .unwrap_or_else(|| panic!("shard 1 has a replica {n}"))
+}
+
+/// K1, K10 and K7 (issue #599 part B §3): both replicas write one shared
+/// `ReplicatedReplacingMergeTree`, so a bucket both run is kept once; the
+/// read takes a shard's totals and markers on one replica; a replica that
+/// has not received the other's run of a bucket does not pair it again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_replicas_share_one_edge_table() {
+    skip_unless_live!();
+    let r = Replicas::new("k1").await;
+    let (db, l) = (r.db.clone(), r.l);
+
+    // K1: the engine on both replicas.
+    for (c, node) in [(&r.s1, "ch-shard1"), (&r.s1b, "ch-shard1b")] {
+        let engine = strings(
+            c,
+            "SELECT engine AS s FROM system.tables WHERE database = currentDatabase() \
+             AND name = 'service_edges'",
+        )
+        .await;
+        assert_eq!(
+            engine,
+            ["ReplicatedReplacingMergeTree"],
+            "K1: {node}'s target"
+        );
+    }
+    // K1: ch-shard1 runs G's bucket; ch-shard1b's view is stopped.
+    push_g(&r.s1, l, 0..8).await;
+    wait_synced(&[&r.s1, &r.s1b], &db, "K1: G on both replicas").await;
+    refresh_until(&r.s1, &db, l + 4 * MINUTE, 4, "K1: ch-shard1's run").await;
+    wait_synced(&[&r.s1, &r.s1b], &db, "K1: ch-shard1's run on both").await;
+    let written = count(
+        &r.s1,
+        "SELECT count() AS n FROM service_edges WHERE ver > 1",
+    )
+    .await;
+    assert!(
+        written > 5,
+        "K1: ch-shard1's run wrote G's rows and a marker: {written}"
+    );
+    // The same rows, read back from ch-shard1, written on ch-shard1b one
+    // version later, as ch-shard1b running the same bucket later would.
+    let source = shard1_replica_address(&r.s1b, 1).await;
+    r.s1b
+        .execute(
+            &format!(
+                "INSERT INTO service_edges SELECT minute, client_minute, client, server, \
+                 conn_type, calls, failed, q, ver + 1 \
+                 FROM remote('{source}', '{db}', 'service_edges') WHERE ver > 1"
+            ),
+            &QuerySettings::new().set("insert_deduplicate", 0),
+            Idempotency::NonIdempotent,
+        )
+        .await
+        .expect("K1: the second run's rows");
+    wait_synced(&[&r.s1, &r.s1b], &db, "K1: the second run on both").await;
+    let mut finals = Vec::new();
+    for (c, node) in [(&r.s1, "ch-shard1"), (&r.s1b, "ch-shard1b")] {
+        let held = count(c, "SELECT count() AS n FROM service_edges WHERE ver > 1").await;
+        assert_eq!(held, 2 * written, "K1: {node} holds both runs' rows");
+        let repeated = count(
+            c,
+            "SELECT countIf(c > 1) AS n FROM (SELECT count() AS c FROM service_edges FINAL \
+             GROUP BY conn_type, minute, client_minute, client, server)",
+        )
+        .await;
+        assert_eq!(repeated, 0, "K1: every key once under FINAL on {node}");
+        finals.push(
+            strings(
+                c,
+                "SELECT concat(conn_type, ' ', toString(minute), ' ', toString(client_minute), \
+                 ' ', client, ' ', server, ' ', toString(calls), ' ', toString(failed), ' ', \
+                 toString(ver)) AS s FROM service_edges FINAL ORDER BY s",
+            )
+            .await,
+        );
+    }
+    assert_eq!(
+        finals[0], finals[1],
+        "K1: both replicas hold the same totals"
+    );
+    r.assert_route_g1("K1").await;
+
+    // K10: every request reads shard 1 on one replica, the one that served
+    // its marker fan-out, and it does so because the route's statement and
+    // every part of it it sent carry `load_balancing = 'in_order'`: the
+    // logged setting is what fails without it, whatever replicas a random
+    // choice happened to pick.
+    for n in 0..8 {
+        let prefix = pulsus_testkit::test_ident(&format!("t599b_k10_{n}_{}", now_ns()));
+        assert_g1(&r.graph(&prefix).await, &format!("K10 request {n}"));
+        exec(&r.s1, "SYSTEM FLUSH LOGS").await;
+        // The initiator logs the statement's `cluster(…)` table function,
+        // not the tables its parts read.
+        let graph_statements = count(
+            &r.s1,
+            &format!(
+                "SELECT count() AS n FROM system.query_log WHERE type = 'QueryFinish' \
+                 AND is_initial_query AND startsWith(query_id, '{prefix}-') \
+                 AND has(tables, '_table_function.cluster') \
+                 AND Settings['load_balancing'] = 'in_order'"
+            ),
+        )
+        .await;
+        assert_eq!(
+            graph_statements, 1,
+            "K10 request {n}: the route's statement ran with load_balancing = 'in_order'"
+        );
+        let mut hosts = Vec::new();
+        for (c, node) in [(&r.s1, "ch-shard1"), (&r.s1b, "ch-shard1b")] {
+            exec(c, "SYSTEM FLUSH LOGS").await;
+            let rows = count(
+                c,
+                &format!(
+                    "SELECT count() AS n FROM system.query_log WHERE type = 'QueryFinish' \
+                     AND startsWith(initial_query_id, '{prefix}-')"
+                ),
+            )
+            .await;
+            let fan_out = count(
+                c,
+                &format!(
+                    "SELECT count() AS n FROM system.query_log WHERE type = 'QueryFinish' \
+                     AND is_initial_query = 0 AND startsWith(initial_query_id, '{prefix}-') \
+                     AND has(tables, '{db}.service_edges') AND NOT has(tables, '{db}.spans')"
+                ),
+            )
+            .await;
+            let unordered = count(
+                c,
+                &format!(
+                    "SELECT count() AS n FROM system.query_log WHERE type = 'QueryFinish' \
+                     AND is_initial_query = 0 AND startsWith(initial_query_id, '{prefix}-') \
+                     AND has(tables, '{db}.service_edges') \
+                     AND Settings['load_balancing'] != 'in_order'"
+                ),
+            )
+            .await;
+            assert_eq!(
+                unordered, 0,
+                "K10 request {n}: every part {node} ran carried load_balancing = 'in_order'"
+            );
+            if rows > 0 {
+                hosts.push((node, fan_out));
+            }
+        }
+        assert_eq!(
+            hosts.len(),
+            1,
+            "K10 request {n}: shard 1 read on one host: {hosts:?}"
+        );
+        assert!(
+            hosts[0].1 > 0,
+            "K10 request {n}: the host that answered served the marker fan-out: {hosts:?}"
+        );
+    }
+
+    // K7: ch-shard1b has every span but not ch-shard1's run of the next
+    // bucket; its run must not pair that bucket again.
+    let newest = *markers(&r.s1).await.last().expect("a marker");
+    exec(&r.s1b, "SYSTEM STOP FETCHES service_edges").await;
+    let stopped = server_now_us(&r.s1b).await;
+    refresh_until(&r.s1, &db, newest + BUCKET, 4, "K7: ch-shard1's run").await;
+    wait_state(
+        &r.s1b,
+        &db,
+        "spans",
+        "K7: spans synced on ch-shard1b",
+        ReplicaState::synced,
+    )
+    .await;
+    wait_state(
+        &r.s1b,
+        &db,
+        "service_edges",
+        "K7: ch-shard1's run queued on ch-shard1b",
+        |s| s.inserts_in_queue > 0,
+    )
+    .await;
+    refresh_on(&r.s1b, &db, "K7: ch-shard1b's run").await;
+    assert_eq!(
+        new_edge_parts_since(&r.s1b, &db, stopped).await,
+        0,
+        "K7: ch-shard1b's run wrote nothing"
+    );
+    exec(&r.s1b, "SYSTEM START FETCHES service_edges").await;
+    wait_synced(&[&r.s1, &r.s1b], &db, "K7: fetched").await;
+    assert_eq!(
+        markers(&r.s1).await,
+        markers(&r.s1b).await,
+        "K7: both replicas hold the same markers"
+    );
+    for (c, node) in [(&r.s1, "ch-shard1"), (&r.s1b, "ch-shard1b")] {
+        let repeated = count(
+            c,
+            "SELECT countIf(c > 1) AS n FROM (SELECT count() AS c FROM service_edges FINAL \
+             GROUP BY conn_type, minute, client_minute, client, server)",
+        )
+        .await;
+        assert_eq!(repeated, 0, "K7: every key once under FINAL on {node}");
+    }
+    r.drop().await;
+}
+
+/// K2 (issue #599 part B §3): a replica that has copied the log entries of
+/// G's parts but cannot fetch them writes no marker; once it has them, its
+/// run pairs G.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replica_with_parts_still_to_fetch_writes_nothing() {
+    skip_unless_live!();
+    let r = Replicas::new("k2").await;
+    let (db, l) = (r.db.clone(), r.l);
+    exec(&r.s1b, "SYSTEM STOP FETCHES spans").await;
+    push_g(&r.s1, l, 0..8).await;
+    // The entries are copied, so a barrier on the log alone would pass.
+    let state = wait_state(&r.s1b, &db, "spans", "K2: G queued on ch-shard1b", |s| {
+        s.inserts_in_queue > 0 && s.log_pointer > s.log_max_index
+    })
+    .await;
+    wait_state(&r.s1b, &db, "service_edges", "K2", ReplicaState::synced).await;
+    refresh_on(&r.s1b, &db, "K2: ch-shard1b's run").await;
+    assert_eq!(
+        markers(&r.s1b).await,
+        vec![l - MINUTE],
+        "K2: ch-shard1b's run, spans {state:?}, wrote no marker"
+    );
+    exec(&r.s1b, "SYSTEM START FETCHES spans").await;
+    wait_synced(&[&r.s1b], &db, "K2: fetched").await;
+    refresh_until(
+        &r.s1b,
+        &db,
+        l + 4 * MINUTE,
+        4,
+        "K2: ch-shard1b's run after the fetch",
+    )
+    .await;
+    r.assert_route_g1("K2").await;
+    r.drop().await;
+}
+
+/// K3 (issue #599 part B §3): G's pushes split across the two replicas,
+/// neither able to fetch the other's: neither writes a marker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pushes_split_across_replicas_wait_for_both() {
+    skip_unless_live!();
+    let r = Replicas::new("k3").await;
+    let (db, l) = (r.db.clone(), r.l);
+    for c in [&r.s1, &r.s1b] {
+        exec(c, "SYSTEM STOP FETCHES spans").await;
+    }
+    push_g(&r.s1, l, 0..2).await;
+    push_g(&r.s1b, l, 2..8).await;
+    for (c, node) in [(&r.s1, "ch-shard1"), (&r.s1b, "ch-shard1b")] {
+        wait_state(
+            c,
+            &db,
+            "spans",
+            &format!("K3: the other half queued on {node}"),
+            |s| s.inserts_in_queue > 0 && s.log_pointer > s.log_max_index,
+        )
+        .await;
+        wait_state(c, &db, "service_edges", "K3", ReplicaState::synced).await;
+    }
+    for (c, node) in [(&r.s1, "ch-shard1"), (&r.s1b, "ch-shard1b")] {
+        refresh_on(c, &db, &format!("K3: {node}'s run")).await;
+        for (d, other) in [(&r.s1, "ch-shard1"), (&r.s1b, "ch-shard1b")] {
+            assert_eq!(
+                markers(d).await,
+                vec![l - MINUTE],
+                "K3: after {node}'s run, {other} holds no new marker"
+            );
+        }
+    }
+    for c in [&r.s1, &r.s1b] {
+        exec(c, "SYSTEM START FETCHES spans").await;
+    }
+    wait_synced(&[&r.s1, &r.s1b], &db, "K3: fetched").await;
+    refresh_until(&r.s1, &db, l + 4 * MINUTE, 4, "K3: the run after the fetch").await;
+    r.assert_route_g1("K3").await;
+    r.drop().await;
+}
+
+/// K5 (issue #599 part B §3): a rebuilt replica, its tables empty and its
+/// fetches unable to run, writes nothing; once it has fetched the shard it
+/// holds the shard's totals without pairing them again, and answers from
+/// them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rebuilt_replica_waits_for_the_shard() {
+    skip_unless_live!();
+    let r = Replicas::new("k5").await;
+    let (db, l) = (r.db.clone(), r.l);
+    push_g(&r.s1, l, 0..8).await;
+    wait_synced(&[&r.s1, &r.s1b], &db, "K5: G on both replicas").await;
+    refresh_until(&r.s1, &db, l + 4 * MINUTE, 4, "K5: ch-shard1's run").await;
+    wait_synced(&[&r.s1, &r.s1b], &db, "K5: ch-shard1's run on both").await;
+    let totals_sql = "SELECT concat(conn_type, ' ', toString(minute), ' ', \
+                      toString(client_minute), ' ', client, ' ', server, ' ', toString(calls), \
+                      ' ', toString(failed), ' ', toString(ver)) AS s \
+                      FROM service_edges FINAL ORDER BY s";
+    let totals = strings(&r.s1, totals_sql).await;
+
+    // The rebuild: ch-shard1 sends nothing, ch-shard1b's two tables dropped
+    // and created again by the schema's statements.
+    for table in ["spans", "service_edges"] {
+        exec(&r.s1, &format!("SYSTEM STOP REPLICATED SENDS {table}")).await;
+    }
+    let rebuilt = server_now_us(&r.s1b).await;
+    for table in ["spans", "service_edges"] {
+        exec(&r.s1b, &format!("DROP TABLE {table} SYNC")).await;
+    }
+    let on_cluster = format!(" ON CLUSTER '{CLUSTER_NAME}'");
+    for table in ["spans", "service_edges"] {
+        let head = format!("CREATE TABLE IF NOT EXISTS {db}.{table}{on_cluster}\n");
+        let statement = pulsus_schema::rendered_statements(&cluster_ctx(&db))
+            .into_iter()
+            .find(|s| s.starts_with(&head))
+            .unwrap_or_else(|| panic!("the schema creates {table}"));
+        exec(&r.s1b, &statement.replacen(&on_cluster, "", 1)).await;
+        exec(&r.s1b, &format!("SYSTEM STOP MERGES {table}")).await;
+    }
+    for table in ["spans", "service_edges"] {
+        wait_state(
+            &r.s1b,
+            &db,
+            table,
+            "K5: the rebuilt replica has parts to fetch",
+            |s| s.inserts_in_queue > 0,
+        )
+        .await;
+    }
+    refresh_on(&r.s1b, &db, "K5: the rebuilt replica's run").await;
+    assert_eq!(
+        count(&r.s1b, "SELECT count() AS n FROM service_edges").await,
+        0,
+        "K5: the rebuilt replica's run wrote no row and no marker"
+    );
+
+    for table in ["spans", "service_edges"] {
+        exec(&r.s1, &format!("SYSTEM START REPLICATED SENDS {table}")).await;
+    }
+    wait_synced(&[&r.s1b], &db, "K5: the rebuilt replica fetched the shard").await;
+    assert_eq!(
+        strings(&r.s1b, totals_sql).await,
+        totals,
+        "K5: the rebuilt replica holds the shard's totals"
+    );
+    assert_eq!(
+        new_edge_parts_since(&r.s1b, &db, rebuilt).await,
+        0,
+        "K5: the rebuilt replica paired nothing again"
+    );
+
+    // The route's statement with ch-shard1b listed first, in order.
+    let first = shard1_replica_address(&r.s1, 2).await;
+    let second = shard1_replica_address(&r.s1, 1).await;
+    let target = pulsus_read::GraphTarget {
+        cluster: CLUSTER_NAME.to_string(),
+        database: db.clone(),
+    };
+    let sql = pulsus_read::spans_graph_sql(
+        r.window(),
+        Some(&target),
+        pulsus_read::SERVICE_GRAPH_MAX_EDGES,
+    );
+    let from = format!("cluster('{CLUSTER_NAME}', view(");
+    assert_eq!(
+        sql.matches(&from).count(),
+        2,
+        "the read and its fan-out: {sql}"
+    );
+    let sql = sql.replace(&from, &format!("remote('{first}|{second}', view("));
+    let tag = pulsus_testkit::test_ident(&format!("t599b_k5_{}", now_ns()));
+    let settings = QuerySettings::new()
+        .set("load_balancing", "in_order")
+        .set("prefer_localhost_replica", 0)
+        .set("log_comment", &tag);
+    let mut edges = Vec::new();
+    {
+        let mut stream =
+            r.s1.query_stream::<pulsus_read::GraphEdgeRow>(&sql, &settings)
+                .await
+                .expect("K5: the read");
+        while let Some(row) = stream.next().await {
+            edges.push(row.expect("K5: an edge"));
+        }
+    }
+    assert_g1(&edges, "K5: read on the rebuilt replica");
+    for (c, node, want) in [(&r.s1b, "ch-shard1b", true), (&r.s1, "ch-shard1", false)] {
+        exec(c, "SYSTEM FLUSH LOGS").await;
+        let remote = count(
+            c,
+            &format!(
+                "SELECT count() AS n FROM system.query_log WHERE type = 'QueryFinish' \
+                 AND is_initial_query = 0 AND log_comment = '{tag}'"
+            ),
+        )
+        .await;
+        assert_eq!(remote > 0, want, "K5: {node} served the read: {remote}");
+    }
+    r.drop().await;
+}
+
+/// K8 (issue #599 part B §3): a replica that has not copied the log entries
+/// of G's parts has nothing queued, and still writes no marker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replica_behind_on_the_log_writes_nothing() {
+    skip_unless_live!();
+    let r = Replicas::new("k8").await;
+    let (db, l) = (r.db.clone(), r.l);
+    exec(&r.s1b, "SYSTEM STOP PULLING REPLICATION LOG spans").await;
+    push_g(&r.s1, l, 0..8).await;
+    let behind = |s: &ReplicaState| {
+        s.inserts_in_queue == 0 && s.log_max_index > 0 && s.log_pointer <= s.log_max_index
+    };
+    // ch-shard1 has announced all eight parts.
+    wait_state(&r.s1, &db, "spans", "K8: G announced", |s| {
+        s.log_max_index >= 7
+    })
+    .await;
+    for when in ["before", "after"] {
+        let spans = replica_state(&r.s1b, &db, "spans").await;
+        assert!(
+            behind(&spans),
+            "K8: {when} the run, ch-shard1b's spans log: {spans:?}"
+        );
+        let edges = replica_state(&r.s1b, &db, "service_edges").await;
+        assert!(
+            edges.synced(),
+            "K8: {when} the run, service_edges: {edges:?}"
+        );
+        if when == "before" {
+            refresh_on(&r.s1b, &db, "K8: ch-shard1b's run").await;
+        }
+    }
+    assert_eq!(
+        markers(&r.s1b).await,
+        vec![l - MINUTE],
+        "K8: ch-shard1b's run wrote no marker"
+    );
+    exec(&r.s1b, "SYSTEM START PULLING REPLICATION LOG spans").await;
+    wait_synced(&[&r.s1b], &db, "K8: pulled and fetched").await;
+    refresh_until(
+        &r.s1b,
+        &db,
+        l + 4 * MINUTE,
+        4,
+        "K8: ch-shard1b's run after the pull",
+    )
+    .await;
+    r.assert_route_g1("K8").await;
+    r.drop().await;
+}
+
+/// K9 (issue #599 part B §3): another database's replication queue does not
+/// hold this database's job back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn another_database_s_queue_does_not_stop_the_job() {
+    skip_unless_live!();
+    let r = Replicas::new("k9").await;
+    let (db, l) = (r.db.clone(), r.l);
+    push_g(&r.s1, l, 0..8).await;
+    let other = format!("{db}_other");
+    run_init(&r.s1, &cluster_ctx(&other))
+        .await
+        .expect("run_init the other database");
+    exec(&r.s1b, &format!("SYSTEM STOP FETCHES {other}.spans")).await;
+    exec(
+        &r.s1,
+        &format!(
+            "INSERT INTO {other}.spans (trace_id, span_id, parent_span_id, start_ns, \
+             duration_ns, service, name, kind, attrs, end_ns, service_type) \
+             SELECT sipHash128('k9'), reinterpretAsFixedString(cityHash64('k9')), \
+                    toFixedString('', 8), {at}, 1000, 'svc-k9', 'op', 2, CAST('{{}}', 'JSON'), \
+                    toUInt64({at} + 1000), 'string'",
+            at = l + 10 * S
+        ),
+    )
+    .await;
+    wait_state(
+        &r.s1b,
+        &other,
+        "spans",
+        "K9: the other database's part queued",
+        |s| s.inserts_in_queue > 0,
+    )
+    .await;
+    wait_synced(&[&r.s1, &r.s1b], &db, "K9: G on both replicas").await;
+    refresh_until(&r.s1b, &db, l + 4 * MINUTE, 4, "K9: ch-shard1b's run").await;
+    r.assert_route_g1("K9").await;
+    exec(&r.s1b, &format!("SYSTEM START FETCHES {other}.spans")).await;
+    exec(
+        &r.s1,
+        &format!("DROP DATABASE IF EXISTS {other} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
+    )
+    .await;
+    r.drop().await;
+}
+
+/// K6 (issue #599 part B §3): on a fresh cluster no table has a log entry,
+/// and every node's run writes the first marker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fresh_cluster_writes_its_first_markers() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db(&format!("pulsus_read_it_t599b_k6_{}", now_ns()));
+    let bootstrap = ChClient::new(shard1_config("default"))
+        .await
+        .expect("connect shard1");
+    exec(
+        &bootstrap,
+        &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
+    )
+    .await;
+    run_init(&bootstrap, &cluster_ctx(&db))
+        .await
+        .expect("run_init");
+    let nodes = [
+        (
+            "ch-shard1",
+            ChClient::new(shard1_config(&db))
+                .await
+                .expect("connect shard1"),
+        ),
+        (
+            "ch-shard1b",
+            ChClient::new(shard1b_config(&db))
+                .await
+                .expect("connect shard1b"),
+        ),
+        (
+            "ch-shard2",
+            ChClient::new(shard2_config(&db))
+                .await
+                .expect("connect shard2"),
+        ),
+    ];
+    for (node, c) in &nodes {
+        exec(c, "SYSTEM REFRESH VIEW service_edges_mv").await;
+        exec(c, "SYSTEM WAIT VIEW service_edges_mv").await;
+        let state = strings(
+            c,
+            "SELECT concat(exception, '|', toString(isNotNull(last_success_time))) AS s \
+             FROM system.view_refreshes WHERE database = currentDatabase() \
+             AND view = 'service_edges_mv'",
+        )
+        .await;
+        assert_eq!(state, ["|1"], "K6: {node}'s refresh succeeded");
+    }
+    for (node, c) in &nodes {
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            let n = count(
+                c,
+                "SELECT count() AS n FROM service_edges FINAL WHERE conn_type = ''",
+            )
+            .await;
+            if n >= 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "K6: {node} holds no marker"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+    exec(
+        &bootstrap,
+        &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
+    )
+    .await;
+}

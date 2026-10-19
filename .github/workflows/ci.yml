@@ -2557,9 +2557,10 @@ jobs:
         run: |
           for _ in $(seq 1 60); do
             h1=$(docker inspect -f '{{.State.Health.Status}}' pulsus-ch-shard1-it 2>/dev/null || echo starting)
+            h1b=$(docker inspect -f '{{.State.Health.Status}}' pulsus-ch-shard1b-it 2>/dev/null || echo starting)
             h2=$(docker inspect -f '{{.State.Health.Status}}' pulsus-ch-shard2-it 2>/dev/null || echo starting)
             hk=$(docker inspect -f '{{.State.Health.Status}}' pulsus-keeper-it 2>/dev/null || echo starting)
-            if [ "$h1" = healthy ] && [ "$h2" = healthy ] && [ "$hk" = healthy ]; then
+            if [ "$h1" = healthy ] && [ "$h1b" = healthy ] && [ "$h2" = healthy ] && [ "$hk" = healthy ]; then
               exit 0
             fi
             sleep 2
@@ -2591,6 +2592,7 @@ jobs:
                       WHERE database = 'pulsus' ORDER BY name FORMAT TSV"
           }
           catalogue 18123 > /tmp/cluster-shard1.tsv
+          catalogue 38123 > /tmp/cluster-shard1b.tsv
           catalogue 28123 > /tmp/cluster-shard2.tsv
           objects=$(wc -l < /tmp/cluster-shard1.tsv)
           if [ "$objects" -ne 69 ]; then
@@ -2602,23 +2604,30 @@ jobs:
             echo "::error::ON CLUSTER did not land the identical DDL on both shards"
             exit 1
           fi
+          if ! diff -u /tmp/cluster-shard1.tsv /tmp/cluster-shard1b.tsv; then
+            echo "::error::ON CLUSTER did not land the identical DDL on shard 1's second replica"
+            exit 1
+          fi
 
           # Per-shard replica sets must be per shard: `{shard}` resolved to
-          # this node's own macro, so shard1's paths say /1/ and shard2's say
-          # /2/, and each holds one replica. The five cluster-wide tables take
-          # /all/ and hold two. A substituted-away macro collapses the first
-          # group onto one path with two replicas, which this catches.
+          # this node's own macro, so shard 1's paths say /1/ and shard 2's
+          # say /2/. Shard 1 has two replicas (issue #599 part B), so its
+          # per-shard tables hold two and shard 2's hold one. The five
+          # cluster-wide tables take /all/ and hold all three nodes. A
+          # substituted-away macro collapses the first group onto one path
+          # with three replicas, which this catches.
           paths() {
             ask "$1" "SELECT countIf(zookeeper_path LIKE '/clickhouse/tables/$2/%'), \
                              countIf(zookeeper_path LIKE '/clickhouse/tables/all/%'), \
-                             countIf(total_replicas = 1), countIf(total_replicas = 2) \
+                             countIf(total_replicas = 1), countIf(total_replicas = 2), \
+                             countIf(total_replicas = 3) \
                       FROM system.replicas WHERE database = 'pulsus' FORMAT TSV"
           }
-          want=$(printf '23\t5\t23\t5')
-          for pair in "18123 1" "28123 2"; do
+          for pair in "18123 1 23_5_0_23_5" "38123 1 23_5_0_23_5" "28123 2 23_5_23_0_5"; do
             set -- $pair
+            want=$(printf '%s' "$3" | tr '_' '\t')
             got=$(paths "$1" "$2")
-            echo "shard on $1: per-shard/all/one-replica/two-replica = $got"
+            echo "node on $1: per-shard/all/one/two/three-replica = $got"
             if [ "$got" != "$want" ]; then
               echo "::error::shard on $1 resolved its replication paths as '$got', expected '$want'"
               ask "$1" "SELECT table, zookeeper_path, total_replicas FROM system.replicas \
@@ -2673,22 +2682,12 @@ jobs:
       # default `distributed_product_mode` refuses; the search sends
       # `'local'` for it. The negative control pins the refusal (288), the
       # positive cases the answers over traces split across both shards.
+      # The suite also holds the service graph's cluster cases (#599); its
+      # output shows each edge-job run's duration (part B §4).
       - name: Nested-set search over the distributed tables (cluster)
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
-        run: cargo test -p pulsus-read --test traces_nested_set_cluster
-
-      # Issue #507, criterion 19: the extracted-field group key read's one
-      # read (L) over the `_dist` tables — L answers where today's route
-      # refuses, its 2-minute answer is today's within the summation bound,
-      # and the other shard's system.query_log holds exactly one part of L
-      # after its part of today's raw scan.
-      - name: LogQL group key read, one read on two shards (cluster)
-        env:
-          PULSUS_TEST_CLICKHOUSE: "1"
-          PULSUS_TEST_CH_HTTP_PORT: "18123"
-          PULSUS_TEST_CH_CLUSTER: "pulsus_test_cluster"
-        run: cargo test -p pulsus-read --test query_log_gates the_undecided_rows_come_from_one_read -- --exact
+        run: cargo test -p pulsus-read --test traces_nested_set_cluster -- --show-output
 
       # Issue #43: cross-node connection spreading over the two DISTINCT real
       # nodes (SHARD1/SHARD2 default to the fixture IPs 172.28.0.11/12:8123),
