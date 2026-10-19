@@ -156,12 +156,18 @@ async fn run_logs_read(args: BenchArgs) -> anyhow::Result<()> {
         ..ChConnConfig::default()
     };
     let admin = ChClient::new(admin_cfg.clone()).await?;
-    admin
-        .execute(
-            &format!("DROP DATABASE IF EXISTS {}", args.database),
-            &QuerySettings::new(),
-            Idempotency::Idempotent,
+    // `--dist` drops the database on every shard: a rerun must not find an
+    // earlier run's rows on the other shards.
+    let drop_sql = if args.dist {
+        format!(
+            "DROP DATABASE IF EXISTS {} ON CLUSTER {} SYNC",
+            args.database, args.cluster
         )
+    } else {
+        format!("DROP DATABASE IF EXISTS {}", args.database)
+    };
+    admin
+        .execute(&drop_sql, &QuerySettings::new(), Idempotency::Idempotent)
         .await?;
 
     let cluster = args.dist.then(|| args.cluster.clone());
@@ -186,6 +192,11 @@ async fn run_logs_read(args: BenchArgs) -> anyhow::Result<()> {
         args.database, schema_ctx.cluster
     );
     run_init(&admin, &schema_ctx).await?;
+    let landing_shards = if args.dist {
+        create_landing_route(&admin, &args.database, &args.cluster).await?
+    } else {
+        0
+    };
 
     let mut data_cfg = admin_cfg.clone();
     data_cfg.database = args.database.clone();
@@ -199,6 +210,7 @@ async fn run_logs_read(args: BenchArgs) -> anyhow::Result<()> {
         lines_per_sec: args.lines_per_sec,
         duration_secs: args.duration_secs,
         dist: args.dist,
+        landing_shards,
     };
     eprintln!(
         "=== generating dataset (profile={:?}, seed={}, services={}, streams={}, \
@@ -268,6 +280,52 @@ async fn run_logs_read(args: BenchArgs) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// `--dist` (issue #603): reads the cluster's shard count `n`, requires its
+/// shards to be numbered `1..=n` (what `insert_shard_id` addresses), and
+/// creates the bench-only `Distributed` table over `log_landing` with no
+/// sharding key that the loader lands each block through.
+async fn create_landing_route(admin: &ChClient, db: &str, cluster: &str) -> anyhow::Result<u32> {
+    use futures::StreamExt;
+    #[derive(pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+    struct ShardSpan {
+        n: u32,
+        lo: u32,
+        hi: u32,
+    }
+    let sql = format!(
+        "SELECT toUInt32(count(DISTINCT shard_num)) AS n, toUInt32(min(shard_num)) AS lo, \
+         toUInt32(max(shard_num)) AS hi FROM system.clusters WHERE cluster = '{cluster}'"
+    );
+    let mut stream = admin
+        .query_stream::<ShardSpan>(&sql, &QuerySettings::new())
+        .await?;
+    let span = stream
+        .next()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("no row from system.clusters for {cluster:?}"))??;
+    drop(stream);
+    anyhow::ensure!(
+        span.n >= 1 && span.lo == 1 && span.hi == span.n,
+        "cluster {cluster:?} has {} shards numbered {}..={}; the loader addresses shards 1..=n \
+         with insert_shard_id",
+        span.n,
+        span.lo,
+        span.hi
+    );
+    admin
+        .execute(
+            &format!(
+                "CREATE TABLE {db}.{} ON CLUSTER {cluster} AS {db}.log_landing \
+                 ENGINE = Distributed('{cluster}', '{db}', 'log_landing')",
+                dataset::LANDING_ROUTE_TABLE
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await?;
+    Ok(span.n)
 }
 
 /// Splits `--http-url` (e.g. `http://127.0.0.1:19123`) into

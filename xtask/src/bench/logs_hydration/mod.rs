@@ -94,10 +94,13 @@ fn now_unix_ns() -> i64 {
     i64::try_from(elapsed.as_nanos()).unwrap_or(i64::MAX)
 }
 
-/// STUB (tests first).
-#[cfg_attr(not(test), allow(dead_code))]
+/// The scenario is single-node by design (`paths.rs`' `Tables`), so
+/// `--dist` is refused rather than silently ignored.
 fn refuse_dist(args: &BenchArgs) -> anyhow::Result<()> {
-    let _ = args;
+    anyhow::ensure!(
+        !args.dist,
+        "`logs-hydration` is single-node only; `--dist` belongs to `logs-read`"
+    );
     Ok(())
 }
 
@@ -105,6 +108,7 @@ pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
     if args.rss_probe {
         return run_rss_probe_child_mode(args).await;
     }
+    refuse_dist(&args)?;
 
     let breadths = resolve_breadths(&args)?;
     anyhow::ensure!(
@@ -176,7 +180,6 @@ pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
             seed: args.seed,
             breadth,
             ref_ns,
-            dist: false,
         };
         eprintln!("--- generating breadth-{breadth} corpus ---");
         let summary = dataset::load_broad_tier(&client, &spec).await?;

@@ -46,16 +46,17 @@ pub struct DatasetSpec {
     pub streams: u32,
     pub lines_per_sec: u64,
     pub duration_secs: u64,
-    /// Load through the `_dist` Distributed wrappers instead of the bare
-    /// local tables — required for `--dist` mode: a bare-table insert
-    /// always lands on whichever single node `client` is connected to
-    /// (`ReplicatedMergeTree` replicates within a shard, it does not
-    /// re-shard), which would silently defeat the fan-out benchmark by
-    /// putting the entire corpus on one shard. `docs/schemas.md §7`'s
-    /// documented pattern (also `crates/pulsus-schema/tests/
-    /// live_cluster.rs`): insert into `<table>_dist` and let the
-    /// Distributed engine's sharding key place each row.
+    /// `--dist` mode: the corpus is landed through every shard in turn
+    /// (issue #603). A bare `log_landing` insert lands on whichever node
+    /// `client` is bound to, which would put the whole corpus on one shard;
+    /// so each block goes through [`LANDING_ROUTE_TABLE`] with
+    /// `insert_shard_id`, landing whole on one shard and firing the views
+    /// there, as a push landing on that node would. The stream rows go to
+    /// every shard; line batch `b` goes to shard `b % n + 1`.
     pub dist: bool,
+    /// The cluster's shard count `n` when `--dist` (its shards are `1..=n`),
+    /// `0` otherwise.
+    pub landing_shards: u32,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -208,17 +209,27 @@ struct SeedLandingRow {
 /// variant: there is no `log_landing_dist`.
 const LANDING_TABLE: &str = "log_landing";
 
-/// Lands a chunk of sample rows as kind-0 landing rows.
+/// Lands a chunk of sample rows as kind-0 landing rows: into the bare
+/// `log_landing`, or with `Some(k)` through [`LANDING_ROUTE_TABLE`] onto
+/// shard `k`.
 async fn insert_lines(
     client: &ChClient,
     received_ms: i64,
     rows: &[SeedSampleRow],
+    shard: Option<u32>,
 ) -> anyhow::Result<()> {
     let landing: Vec<SeedLandingRow> = rows
         .iter()
         .map(|r| SeedLandingRow::line(received_ms, r))
         .collect();
-    client.insert_block(LANDING_TABLE, &landing).await?;
+    match shard {
+        None => client.insert_block(LANDING_TABLE, &landing).await?,
+        Some(k) => {
+            client
+                .insert_block_with(LANDING_ROUTE_TABLE, &landing, &routed_insert(k))
+                .await?
+        }
+    }
     Ok(())
 }
 
@@ -285,18 +296,38 @@ fn now_ns() -> i64 {
 /// bounded regardless of total corpus size.
 const INSERT_BATCH_ROWS: usize = 100_000;
 
-/// STUB (tests first).
-#[cfg_attr(not(test), allow(dead_code))]
+/// The bench-only `Distributed` table over `log_landing` with no sharding
+/// key, created by the caller under `--dist`: every block sent through it
+/// names its shard with `insert_shard_id`.
+pub const LANDING_ROUTE_TABLE: &str = "bench_landing_route";
+
+/// The shard line batch `batch` lands on: `batch % shards + 1`.
 fn landing_shard_for_batch(batch: u64, shards: u32) -> u32 {
-    let _ = (batch, shards);
-    0
+    (batch % u64::from(shards)) as u32 + 1
 }
 
-/// STUB (tests first).
-#[cfg_attr(not(test), allow(dead_code))]
+/// The lines each shard holds once `total` lines have landed in batches of
+/// `batch` rows (the last one shorter); index `k - 1` is shard `k`.
 fn expected_lines_per_shard(total: u64, batch: u64, shards: u32) -> Vec<u64> {
-    let _ = (total, batch, shards);
-    Vec::new()
+    let mut out = vec![0u64; shards as usize];
+    let mut b = 0u64;
+    let mut left = total;
+    while left > 0 {
+        let rows = left.min(batch);
+        out[(landing_shard_for_batch(b, shards) - 1) as usize] += rows;
+        left -= rows;
+        b += 1;
+    }
+    out
+}
+
+/// The settings of one routed insert: the target shard, and a foreground
+/// insert, so the call returns only after that shard stored the block and
+/// ran its views.
+fn routed_insert(shard: u32) -> QuerySettings {
+    QuerySettings::new()
+        .set("insert_shard_id", shard)
+        .set("distributed_foreground_insert", 1)
 }
 
 fn gen_body(i: u64, service: &str, carries_needle: bool) -> String {
@@ -347,6 +378,64 @@ async fn poll_count_until_visible(
         "{label} did not reach {expected} visible within the poll deadline (60s) — the \
          Distributed corpus failed to settle"
     )
+}
+
+/// The placement gate (issue #603): each shard holds exactly the lines the
+/// loader sent it, and every stream's index rows, read per shard through the
+/// `_dist` tables with pruning off. Fails with both maps; prints one line on
+/// success.
+async fn placement_gate(
+    client: &ChClient,
+    lines_per_shard: Vec<u64>,
+    idx_rows_per_shard: u64,
+) -> anyhow::Result<()> {
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+    struct ShardCount {
+        shard: u32,
+        n: u64,
+    }
+    async fn per_shard(
+        client: &ChClient,
+        table: &str,
+    ) -> anyhow::Result<std::collections::BTreeMap<u32, u64>> {
+        let sql = format!(
+            "SELECT toUInt32(_shard_num) AS shard, count() AS n FROM {table} \
+             GROUP BY shard ORDER BY shard"
+        );
+        let mut stream = client
+            .query_stream::<ShardCount>(
+                &sql,
+                &QuerySettings::new().set("optimize_skip_unused_shards", 0u64),
+            )
+            .await?;
+        let mut out = std::collections::BTreeMap::new();
+        while let Some(row) = stream.next().await {
+            let row = row?;
+            out.insert(row.shard, row.n);
+        }
+        Ok(out)
+    }
+    let want_lines: std::collections::BTreeMap<u32, u64> = lines_per_shard
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (i as u32 + 1, *n))
+        .collect();
+    let want_idx: std::collections::BTreeMap<u32, u64> = want_lines
+        .keys()
+        .map(|k| (*k, idx_rows_per_shard))
+        .collect();
+    let got_lines = per_shard(client, "log_samples_dist").await?;
+    let got_idx = per_shard(client, "log_streams_idx_dist").await?;
+    anyhow::ensure!(
+        got_lines == want_lines && got_idx == want_idx,
+        "placement gate: log_samples per shard {got_lines:?}, expected {want_lines:?}; \
+         log_streams_idx per shard {got_idx:?}, expected {want_idx:?}"
+    );
+    eprintln!(
+        "placement: log_samples per shard {got_lines:?}; log_streams_idx per shard \
+         {idx_rows_per_shard}"
+    );
+    Ok(())
 }
 
 /// Loads `spec`'s corpus into the database `client` is bound to (already
@@ -414,8 +503,27 @@ pub async fn load(client: &ChClient, spec: &DatasetSpec) -> anyhow::Result<Datas
         .iter()
         .map(|r| SeedLandingRow::stream(landing_ms, r))
         .collect();
-    for chunk in landing_stream_rows.chunks(INSERT_BATCH_ROWS) {
-        client.insert_block(LANDING_TABLE, chunk).await?;
+    let total_rows = spec.duration_secs * spec.lines_per_sec;
+    let n = spec.landing_shards;
+    if spec.dist {
+        anyhow::ensure!(n >= 1, "--dist needs the cluster's shard count");
+        let batches = total_rows.div_ceil(INSERT_BATCH_ROWS as u64);
+        anyhow::ensure!(
+            batches >= u64::from(n),
+            "the corpus has {batches} batches, fewer than the {n} shards; some shard would hold \
+             no lines"
+        );
+        for k in 1..=n {
+            for chunk in landing_stream_rows.chunks(INSERT_BATCH_ROWS) {
+                client
+                    .insert_block_with(LANDING_ROUTE_TABLE, chunk, &routed_insert(k))
+                    .await?;
+            }
+        }
+    } else {
+        for chunk in landing_stream_rows.chunks(INSERT_BATCH_ROWS) {
+            client.insert_block(LANDING_TABLE, chunk).await?;
+        }
     }
 
     if spec.dist {
@@ -450,11 +558,12 @@ pub async fn load(client: &ChClient, spec: &DatasetSpec) -> anyhow::Result<Datas
         .await?;
     }
 
-    let total_rows = spec.duration_secs * spec.lines_per_sec;
     let duration_ns = (spec.duration_secs as f64) * 1_000_000_000.0;
     let mut rng = Xorshift64::new(spec.seed);
     let mut needle_rows = 0u64;
     let mut batch: Vec<SeedSampleRow> = Vec::with_capacity(INSERT_BATCH_ROWS);
+    let mut batch_no = 0u64;
+    let route = |b: u64| spec.dist.then(|| landing_shard_for_batch(b, n));
 
     for i in 0..total_rows {
         let stream = &streams[(i % streams.len() as u64) as usize];
@@ -477,12 +586,13 @@ pub async fn load(client: &ChClient, spec: &DatasetSpec) -> anyhow::Result<Datas
             body: gen_body(i, &stream.service, carries_needle),
         });
         if batch.len() == INSERT_BATCH_ROWS {
-            insert_lines(client, landing_ms, &batch).await?;
+            insert_lines(client, landing_ms, &batch, route(batch_no)).await?;
             batch.clear();
+            batch_no += 1;
         }
     }
     if !batch.is_empty() {
-        insert_lines(client, landing_ms, &batch).await?;
+        insert_lines(client, landing_ms, &batch, route(batch_no)).await?;
     }
 
     if spec.dist {
@@ -491,6 +601,12 @@ pub async fn load(client: &ChClient, spec: &DatasetSpec) -> anyhow::Result<Datas
             &format!("SELECT count() AS n FROM {samples_table}"),
             total_rows,
             samples_table,
+        )
+        .await?;
+        placement_gate(
+            client,
+            expected_lines_per_shard(total_rows, INSERT_BATCH_ROWS as u64, n),
+            streams.len() as u64 * LABELS_PER_STREAM,
         )
         .await?;
     }
@@ -557,7 +673,6 @@ pub struct BroadDatasetSpec {
     /// `HYDRATION_RESULT_STREAMS` result set's samples byte-identical
     /// across breadths (same seed, same construction, same anchor).
     pub ref_ns: i64,
-    pub dist: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -704,22 +819,6 @@ pub async fn load_broad_tier(
         spec.breadth
     );
 
-    let streams_table = if spec.dist {
-        "log_streams_dist"
-    } else {
-        "log_streams"
-    };
-    let streams_idx_table = if spec.dist {
-        "log_streams_idx_dist"
-    } else {
-        "log_streams_idx"
-    };
-    let samples_table = if spec.dist {
-        "log_samples_dist"
-    } else {
-        "log_samples"
-    };
-
     let start_instant = Instant::now();
     let streams = build_broad_streams(spec.breadth);
 
@@ -759,23 +858,6 @@ pub async fn load_broad_tier(
         client.insert_block(LANDING_TABLE, chunk).await?;
     }
 
-    if spec.dist {
-        poll_count_until_visible(
-            client,
-            &format!("SELECT count() AS n FROM {streams_table}"),
-            streams.len() as u64,
-            streams_table,
-        )
-        .await?;
-        poll_count_until_visible(
-            client,
-            &format!("SELECT count() AS n FROM {streams_idx_table}"),
-            streams.len() as u64 * LABELS_PER_STREAM,
-            streams_idx_table,
-        )
-        .await?;
-    }
-
     let result_streams = HYDRATION_RESULT_STREAMS.min(spec.breadth);
     let filler_streams = spec.breadth - result_streams;
     let bands = BroadTimestampBands::new(start_ns, t_split_ns, end_ns, filler_streams);
@@ -798,17 +880,7 @@ pub async fn load_broad_tier(
         });
     }
     for chunk in batch.chunks(INSERT_BATCH_ROWS) {
-        insert_lines(client, landing_ms, chunk).await?;
-    }
-
-    if spec.dist {
-        poll_count_until_visible(
-            client,
-            &format!("SELECT count() AS n FROM {samples_table}"),
-            streams.len() as u64,
-            samples_table,
-        )
-        .await?;
+        insert_lines(client, landing_ms, chunk, None).await?;
     }
 
     let result_fingerprints = streams[..result_streams as usize]
@@ -862,6 +934,7 @@ mod tests {
             lines_per_sec: 1,
             duration_secs: 1,
             dist: false,
+            landing_shards: 0,
         };
         let streams = build_streams(&spec);
         assert_eq!(streams[0].service, "svc-000");
@@ -880,6 +953,7 @@ mod tests {
             lines_per_sec: 1,
             duration_secs: 1,
             dist: false,
+            landing_shards: 0,
         };
         let streams = build_streams(&spec);
         let mut fps: Vec<Fingerprint> = streams.iter().map(|s| s.fingerprint).collect();

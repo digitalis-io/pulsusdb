@@ -12,57 +12,25 @@
 //! real request), because that sum is the real cost of answering the
 //! query, not any single stage in isolation.
 //!
-//! `--dist` mode additionally applies the clustered-reader settings block
-//! (docs/schemas.md §7) to every stage (including `EXPLAIN` capture — issue
-//! #16 CODE review round 2 [medium] finding), and reads every shard's own
+//! `--dist` mode reads through the `_dist` tables with the settings every
+//! product logs read sends ([`reader_settings`]), and reads every shard's own
 //! `system.query_log` via `clusterAllReplicas` (a node's `system.query_log`
 //! is local; there is no automatic cluster-wide aggregation) correlated by
 //! `initial_query_id`.
 //!
-//! **Evidence-schema note (issue #16 CODE review round 2 [high] finding).**
-//! Under `prefer_localhost_replica = 1` (part of the clustered-reader
-//! settings block), the initiator does not dispatch a separate sub-query to
-//! its *own* shard — it reads that shard in-process. ClickHouse still logs
-//! that local read, but as part of the initiator's own `is_initial_query =
-//! 1` row, not as an `is_initial_query = 0` remote-shard row. [`ShardEvidence`]
-//! labels that row `role = "coordinator-local"`; every other participating
-//! shard's row is `role = "remote"`. **Totals-overlap caveat:** the
-//! `coordinator-local` row's `read_rows`/`read_bytes`/etc. are the *same*
-//! row [`read_query_log`] reads for a stage's top-level
-//! `QueryEvidence`/`RunOnce` totals — those top-level totals are the
-//! initiator's own local reads, **not** a cluster-wide sum (ClickHouse does
-//! not write a separate "grand total" row anywhere); a cluster-wide total
-//! is `coordinator-local.read_rows + Σ remote.read_rows`, computed by
-//! summing the per-stage table this module emits, never read off a single
-//! row.
+//! **Every logs stage reaches every shard** (issue #603). A logs row sits on
+//! the shard that took the push, not the one the sharding key names, so the
+//! product's reads prune no shard and neither does this harness. A shard
+//! counts as reached when it logged exactly one `QueryFinish` row for the
+//! stage's `initial_query_id`; the work it did is reported, not used to
+//! decide this, because a reached shard with no matching block reads 0
+//! marks.
 //!
-//! **Expected-roster model (issue #16 CODE review round 3 [high] finding).**
-//! `optimize_skip_unused_shards = 1` (part of the clustered-reader block)
-//! legitimately prunes a `fingerprint IN (...)`-predicated stage
-//! (`hydration`/`samples`/`rollup_range`) to only the shards owning one of
-//! those fingerprints — a `system.query_log` row that never existed because
-//! its shard was correctly pruned is otherwise indistinguishable from a row
-//! that *should* exist but was lost (a genuine evidence-capture bug). This
-//! module closes that ambiguity by computing the **expected** participating
-//! shard set client-side, the same way ClickHouse's Distributed engine
-//! would: `cityHash64(fingerprint) % total_weight` against a
-//! cumulative-weight slot→shard map built from `system.clusters`
-//! (docs/schemas.md §7's logs sharding key, issue #498 — the column is
-//! `UInt128`, and a `Distributed` sharding key must evaluate to an
-//! integer type ClickHouse accepts, so the key hashes the column), then
-//! asserts the **observed** participating set (shards that did nonzero
-//! storage work) is *exactly* `expected` — neither a missing owner (FAIL:
-//! a lost row) nor an unexpected participant (FAIL: a pruning/mapping
-//! violation). `resolution` and `discovery` have no `fingerprint` predicate
-//! to prune by, so their expected set is unconditionally the full cluster.
-//! Every shard in the cluster is always represented in a stage's
-//! [`StageEvidence::shards`] — participating shards carry their real
-//! `system.query_log` row; shards correctly excluded by pruning carry a
-//! synthesized `role = "expected-pruned"` entry with `pruned_reason`
-//! spelling out the `cityHash64(fp) % total_weight` derivation. The full
-//! roster is
-//! therefore always **accounted for** (participating + expected-pruned),
-//! even though it is not always **participating**.
+//! **Totals.** The initiator's `read_rows` is the cluster total (measured on
+//! 26.8: 200,002 = 100,001 + 100,001), while its `selected_marks` is its own
+//! (13). So a stage's top-level totals and its `coordinator` row's
+//! `read_rows` count every shard's rows; the `remote` rows are each one
+//! shard's.
 
 use std::time::Instant;
 
@@ -87,22 +55,11 @@ use super::query_log::{
     QueryLogTotals, flush_logs, flush_logs_before_shard_read, read_query_log, tagged_settings,
 };
 
-/// One shard's evidence for a `--dist` run (empty in single-node mode) —
-/// **every** shard in the cluster gets an entry per stage, whether it
-/// participated or was legitimately pruned (the module doc comment's
-/// expected-roster model). `role` is `"coordinator-local"` (the
-/// initiator's own `is_initial_query = 1` row — its in-process local-shard
-/// read under `prefer_localhost_replica = 1`), `"remote"`
-/// (`is_initial_query = 0`, a participating non-initiator shard), or
-/// `"expected-pruned"` (a shard `optimize_skip_unused_shards` correctly
-/// excluded — `read_rows`/`read_bytes`/`selected_marks` are `0` and
-/// `pruned_reason` explains the `cityHash64(fp) % total_weight`
-/// derivation). See the
-/// module doc comment's evidence-schema note for the totals-overlap
-/// caveat: the `coordinator-local` row is the *same* row a stage's
-/// top-level `read_rows`/etc. come from, so summing this vec's
-/// participating rows double-counts it against those top-level fields —
-/// this vec is per-shard attribution, not an additional total.
+/// One shard's evidence for a `--dist` run (empty in single-node mode): one
+/// entry per shard per stage, from that shard's own `system.query_log` row.
+/// `role` is `"coordinator"` (the initiator's `is_initial_query = 1` row,
+/// whose `read_rows` is the cluster total — see the module doc comment) or
+/// `"remote"`.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ShardEvidence {
     pub shard_num: u32,
@@ -111,7 +68,6 @@ pub struct ShardEvidence {
     pub read_rows: u64,
     pub read_bytes: u64,
     pub selected_marks: u64,
-    pub pruned_reason: Option<String>,
 }
 
 /// Per-stage `--dist` evidence: one entry per logical stage a shape's read
@@ -208,7 +164,7 @@ struct LabelNameRow {
 }
 
 /// One shard's raw `system.query_log` row for a stage, before it is
-/// resolved to a `shard_num` and classified against the expected roster.
+/// resolved to a `shard_num`.
 #[derive(Debug, Clone)]
 struct RawShardRow {
     hostname: String,
@@ -221,8 +177,7 @@ struct RawShardRow {
 /// Reads every shard's own correlated `system.query_log` row for
 /// `initial_query_id` — an initial query's own `initial_query_id` equals
 /// its `query_id`, so this matches **both** the initiator's own
-/// `is_initial_query = 1` row (its coordinator-local read; see the module
-/// doc comment's evidence-schema note) and every remote shard's
+/// `is_initial_query = 1` row and every remote shard's
 /// `is_initial_query = 0` sub-query row. A node's `system.query_log` is
 /// local only — no automatic cluster-wide aggregation — so this fans out
 /// via `clusterAllReplicas`.
@@ -262,115 +217,32 @@ async fn read_stage_query_log_rows(
     Ok(out)
 }
 
-/// Cluster shard topology needed to compute a fingerprint-scoped stage's
-/// expected owning shard set (issue #16 CODE review round 3 [high]
-/// finding): `system.clusters`' shard/weight roster and `system.macros`'
-/// per-node `{shard}` value, mapping every replica hostname to its shard
-/// number.
+/// The cluster's shard roster (`system.clusters`) and every replica
+/// hostname's shard (`system.macros`' `{shard}` value).
 #[derive(Debug, Clone)]
 pub(crate) struct ClusterTopology {
-    /// `slots[i]` is the `shard_num` owning cumulative-weight slot `i` of
-    /// `[0, total_weight)` — a general cumulative-weight slot assignment,
-    /// not a bare `%` over shard count, so it stays correct if shard
-    /// weights ever diverge from equal (this fixture's are equal:
-    /// `ci/bench-cluster/*/macros.xml` sets no `<weight>`).
-    slots: Vec<u32>,
-    total_weight: u64,
     /// Authoritative shard_num set, from `system.clusters` alone.
-    /// [`ClusterTopology::all_shards`] returns this field directly, never
-    /// something derived from `shard_to_hostname`'s keys (issue #16 CODE
-    /// review round 4 [medium] finding: `shard_to_hostname` is validated
-    /// to be a bijection onto this set at load time by
-    /// [`build_shard_maps`], but keeping `all_shards()`'s source of truth
-    /// pinned to `system.clusters` — not the macro-derived map — means a
-    /// future change to that validation can't silently make `all_shards()`
-    /// track a wrong or partial roster).
     shards: std::collections::BTreeSet<u32>,
     hostname_to_shard: std::collections::HashMap<String, u32>,
-    shard_to_hostname: std::collections::HashMap<u32, String>,
-}
-
-/// The logs family's sharding key, computed client-side: the 16
-/// little-endian bytes of the `UInt128` fingerprint through ClickHouse's
-/// `cityHash64` (docs/schemas.md §7, issue #498).
-///
-/// **The byte rule was measured, not assumed.** ClickHouse's `cityHash64`
-/// over a numeric argument and over that number's `reinterpretAsFixedString`
-/// are the same value at every vector tried, which is what makes hashing
-/// `to_le_bytes()` the right client-side model:
-///
-/// ```text
-///   SELECT v,
-///          cityHash64(toUInt128(v)),
-///          cityHash64(reinterpretAsFixedString(toUInt128(v)))
-///   FROM (SELECT arrayJoin(['0', '1', '18446744073709551616',
-///                           '18446744073709551617',
-///                           '340282366920938463463374607431768211455',
-///                           '324875417358418231230721791952787510312']) AS v)
-///
-///   0                                         18251889321102256092  (both)
-///   1                                           201160255169616649  (both)
-///   18446744073709551616                      17769502560057329073  (both)
-///   18446744073709551617                       3873931437475153908  (both)
-///   340282366920938463463374607431768211455   11156510505809607899  (both)
-///   324875417358418231230721791952787510312   17369390617107867318  (both)
-/// ```
-///
-/// Measured on ClickHouse 26.3.29.7. The same six vectors are pinned in
-/// this module's unit tests, so a drifting client-side hash fails the
-/// build rather than silently deriving the wrong owner.
-pub(crate) fn logs_shard_key(fingerprint: u128) -> u64 {
-    pulsus_model::raw_cityhash64(&fingerprint.to_le_bytes())
 }
 
 impl ClusterTopology {
-    /// The shard the logs family's `Distributed` engine places a
-    /// fingerprint on: `slots[cityHash64(fingerprint) % total_weight]`.
-    ///
-    /// The hash is not decoration. `fingerprint` is `UInt128` since issue
-    /// #498, and a `Distributed` sharding key must evaluate to an integer
-    /// type ClickHouse accepts — the bare column creates and then refuses
-    /// every insert with `Code: 53 … Sharding key expression does not
-    /// evaluate to an integer type`. A roster derived from the bare value
-    /// would name a different shard from the one the server writes to.
-    pub(crate) fn shard_for_fingerprint(&self, fingerprint: u128) -> u32 {
-        self.shard_for_key_value(logs_shard_key(fingerprint))
-    }
-
-    /// The slot step alone, for a key that has already been hashed — the
-    /// traces family's `cityHash64(trace_id)`, which hashes a
-    /// `FixedString(16)` rather than an integer column.
-    pub(crate) fn shard_for_key_value(&self, value: u64) -> u32 {
-        let slot = (value % self.total_weight) as usize;
-        self.slots[slot]
-    }
-
     pub(crate) fn all_shards(&self) -> std::collections::BTreeSet<u32> {
         self.shards.clone()
     }
 }
 
-/// Validates that `macro_rows` (`(hostname, {shard} macro value)` pairs)
-/// forms an exact bijection onto `authoritative_shards` (the shard_num set
-/// read from `system.clusters`) and, if so, returns the two lookup maps —
-/// issue #16 CODE review round 4 [medium] finding: a bad, duplicate, or
-/// out-of-roster `{shard}` macro value must fail loudly *here*, not
-/// silently produce a wrong `hostname_to_shard`/`shard_to_hostname` map
-/// that a later per-stage `observed == expected` roster check could then
-/// pass against for the wrong reason. Pure (no I/O), so the
-/// missing/duplicate/out-of-roster cases are unit-testable without a live
-/// cluster.
+/// Maps every hostname to its `{shard}` macro value, checked against
+/// `authoritative_shards` (the shard_num set read from `system.clusters`):
+/// a value outside that set fails, and so does a shard no host reports.
+/// Several hosts may report one shard — they are its replicas. Pure (no
+/// I/O), so the cases are unit-testable without a live cluster.
 fn build_shard_maps(
     cluster: &str,
     authoritative_shards: &std::collections::BTreeSet<u32>,
     macro_rows: &[(String, u32)],
-) -> anyhow::Result<(
-    std::collections::HashMap<String, u32>,
-    std::collections::HashMap<u32, String>,
-)> {
+) -> anyhow::Result<std::collections::HashMap<String, u32>> {
     let mut hostname_to_shard = std::collections::HashMap::new();
-    let mut shard_to_hostname: std::collections::HashMap<u32, String> =
-        std::collections::HashMap::new();
     for (hostname, shard_num) in macro_rows {
         anyhow::ensure!(
             authoritative_shards.contains(shard_num),
@@ -378,17 +250,10 @@ fn build_shard_maps(
              not one of system.clusters' shard_nums {authoritative_shards:?} — out-of-roster \
              {{shard}} macro value"
         );
-        if let Some(existing_hostname) = shard_to_hostname.get(shard_num) {
-            anyhow::bail!(
-                "cluster {cluster:?}: shard_num {shard_num} is claimed by both {existing_hostname:?} \
-                 and {hostname:?} — duplicate {{shard}} macro value"
-            );
-        }
         hostname_to_shard.insert(hostname.clone(), *shard_num);
-        shard_to_hostname.insert(*shard_num, hostname.clone());
     }
     let observed_shards: std::collections::BTreeSet<u32> =
-        shard_to_hostname.keys().copied().collect();
+        hostname_to_shard.values().copied().collect();
     anyhow::ensure!(
         &observed_shards == authoritative_shards,
         "cluster {cluster:?}: the {{shard}} macro map covers {observed_shards:?}, missing {:?} \
@@ -398,7 +263,7 @@ fn build_shard_maps(
             .difference(&observed_shards)
             .collect::<Vec<_>>()
     );
-    Ok((hostname_to_shard, shard_to_hostname))
+    Ok(hostname_to_shard)
 }
 
 /// Loads [`ClusterTopology`] for `cluster` — called once per `--dist` run,
@@ -410,39 +275,22 @@ pub(crate) async fn load_cluster_topology(
     #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
     struct ClusterRow {
         shard_num: u32,
-        shard_weight: u64,
     }
     let sql = format!(
-        "SELECT DISTINCT shard_num, toUInt64(shard_weight) AS shard_weight FROM system.clusters \
-         WHERE cluster = '{cluster}' ORDER BY shard_num"
+        "SELECT DISTINCT shard_num FROM system.clusters WHERE cluster = '{cluster}' \
+         ORDER BY shard_num"
     );
     let mut stream = client
         .query_stream::<ClusterRow>(&sql, &QuerySettings::new())
         .await?;
-    let mut rows = Vec::new();
+    let mut authoritative_shards = std::collections::BTreeSet::new();
     while let Some(row) = stream.next().await {
-        rows.push(row?);
+        authoritative_shards.insert(row?.shard_num);
     }
     anyhow::ensure!(
-        !rows.is_empty(),
+        !authoritative_shards.is_empty(),
         "cluster {cluster:?} has no shards in system.clusters — check --cluster"
     );
-
-    let mut slots = Vec::new();
-    for row in &rows {
-        anyhow::ensure!(
-            row.shard_weight > 0,
-            "cluster {cluster:?} shard {} has a zero shard_weight — cannot compute a sharding \
-             slot map",
-            row.shard_num
-        );
-        for _ in 0..row.shard_weight {
-            slots.push(row.shard_num);
-        }
-    }
-    let total_weight = slots.len() as u64;
-    let authoritative_shards: std::collections::BTreeSet<u32> =
-        rows.iter().map(|row| row.shard_num).collect();
 
     #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
     struct MacroRow {
@@ -467,83 +315,17 @@ pub(crate) async fn load_cluster_topology(
          node's macros.xml"
     );
 
-    let (hostname_to_shard, shard_to_hostname) =
-        build_shard_maps(cluster, &authoritative_shards, &macro_rows)?;
-
+    let hostname_to_shard = build_shard_maps(cluster, &authoritative_shards, &macro_rows)?;
     Ok(ClusterTopology {
-        slots,
-        total_weight,
         shards: authoritative_shards,
         hostname_to_shard,
-        shard_to_hostname,
     })
 }
 
 #[cfg(test)]
 mod cluster_topology_tests {
-    use super::{build_shard_maps, logs_shard_key};
+    use super::build_shard_maps;
     use std::collections::BTreeSet;
-
-    /// **The client-side logs sharding key is the server's, at six
-    /// vectors.** A drifting hash here does not fail loudly on its own —
-    /// it derives a different owner from the one ClickHouse writes to, and
-    /// the roster assertion then reports a missing owner or an unexpected
-    /// participant that has nothing to do with evidence capture.
-    ///
-    /// The right-hand values came from the server, not from this code:
-    ///
-    /// ```text
-    ///   SELECT v, cityHash64(toUInt128(v))
-    ///   FROM (SELECT arrayJoin([...the six below...]) AS v)
-    /// ```
-    ///
-    /// run against ClickHouse 26.3.29.7. Boundary values are deliberate:
-    /// zero, one, `2^64` and `2^64 + 1` (where the low word wraps into the
-    /// high one), the 128-bit maximum, and one composed fingerprint from
-    /// the issue's own fixture.
-    #[test]
-    fn the_client_side_logs_shard_key_matches_the_server_at_six_vectors() {
-        let vectors: [(u128, u64); 6] = [
-            (0, 18_251_889_321_102_256_092),
-            (1, 201_160_255_169_616_649),
-            (18_446_744_073_709_551_616, 17_769_502_560_057_329_073),
-            (18_446_744_073_709_551_617, 3_873_931_437_475_153_908),
-            (u128::MAX, 11_156_510_505_809_607_899),
-            (
-                324_875_417_358_418_231_230_721_791_952_787_510_312,
-                17_369_390_617_107_867_318,
-            ),
-        ];
-        for (fp, want) in vectors {
-            assert_eq!(
-                logs_shard_key(fp),
-                want,
-                "cityHash64 drift at {fp}: the client would derive a different owner from the \
-                 shard the server writes to"
-            );
-        }
-    }
-
-    /// **The hash is what separates the two words**, which is the whole
-    /// reason the key is not the column. Two fingerprints differing only
-    /// in the high word are the same value modulo any power of two, so the
-    /// withdrawn bare-column rule placed them on one shard; the hashed key
-    /// separates them.
-    #[test]
-    fn two_fingerprints_differing_only_above_the_low_word_hash_apart() {
-        let low = 7u128;
-        let high = (1u128 << 64) | 7u128;
-        assert_eq!(
-            low % 2,
-            high % 2,
-            "the withdrawn rule cannot tell these two apart"
-        );
-        assert_ne!(
-            logs_shard_key(low),
-            logs_shard_key(high),
-            "the hashed key must read the high word"
-        );
-    }
 
     fn shards(nums: &[u32]) -> BTreeSet<u32> {
         nums.iter().copied().collect()
@@ -557,11 +339,10 @@ mod cluster_topology_tests {
     fn build_shard_maps_accepts_an_exact_bijection() {
         let authoritative = shards(&[1, 2, 3, 4]);
         let macro_rows = rows(&[("a", 1), ("b", 2), ("c", 3), ("d", 4)]);
-        let (hostname_to_shard, shard_to_hostname) =
+        let hostname_to_shard =
             build_shard_maps("c", &authoritative, &macro_rows).expect("bijection is valid");
         assert_eq!(hostname_to_shard.len(), 4);
-        assert_eq!(shard_to_hostname.len(), 4);
-        assert_eq!(shard_to_hostname.get(&3), Some(&"c".to_string()));
+        assert_eq!(hostname_to_shard.get("c"), Some(&3));
     }
 
     #[test]
@@ -573,16 +354,6 @@ mod cluster_topology_tests {
         assert!(err.to_string().contains("missing"), "{err}");
     }
 
-    #[test]
-    fn build_shard_maps_rejects_a_duplicate_shard_num() {
-        let authoritative = shards(&[1, 2, 3, 4]);
-        // Two different hostnames both claim shard 2 — shard 4 never
-        // reports, but the duplicate is detected first (fail fast).
-        let macro_rows = rows(&[("a", 1), ("b", 2), ("c", 2), ("d", 3)]);
-        let err = build_shard_maps("c", &authoritative, &macro_rows).unwrap_err();
-        assert!(err.to_string().contains("duplicate"), "{err}");
-    }
-
     /// X3: two replicas of one shard both map to it.
     #[test]
     fn build_shard_maps_accepts_two_replicas_of_one_shard() {
@@ -590,7 +361,7 @@ mod cluster_topology_tests {
         let macro_rows = rows(&[("a", 1), ("b", 1), ("c", 2)]);
         let got = build_shard_maps("c", &authoritative, &macro_rows);
         assert!(got.is_ok(), "{got:?}");
-        let (hostname_to_shard, _) = got.expect("checked above");
+        let hostname_to_shard = got.expect("checked above");
         let want: std::collections::HashMap<String, u32> = [("a", 1), ("b", 1), ("c", 2)]
             .iter()
             .map(|(h, s)| (h.to_string(), *s))
@@ -609,24 +380,8 @@ mod cluster_topology_tests {
 }
 
 /// Captures `EXPLAIN {kind} {sql}`'s output lines, tagged `query_id` and
-/// run under the clustered-reader settings block when `dist` (issue #16
-/// CODE review round 2 [medium] finding: `EXPLAIN PIPELINE` under plain
-/// settings does not reflect the same `optimize_distributed_group_by_
-/// sharding_key`/`prefer_localhost_replica` settings the actual reads use,
-/// and can show a different pipeline shape — a coordinator re-merge step
-/// vs. shard-local finalization — which is exactly the evidence being
-/// captured). `EXPLAIN indexes = 1` is threaded through for consistency;
-/// **verified live it is not byte-identical to the plain-settings
-/// single-node capture** — under `prefer_localhost_replica = 1` it
-/// reflects the *coordinator's own local shard's* index-pruning view, so
-/// a literal `fingerprint IN (...)` list with (say) 10 elements can show
-/// a narrower "N-element set" in the `PrimaryKey` `Condition` line when
-/// only a subset of those values are relevant to that one shard's local
-/// parts. This is not data loss — the query's actual SQL text and
-/// returned-row counts are unaffected, verified against the single-node
-/// baseline — it is itself further evidence of shard-local index
-/// confinement, so it is recorded as observed rather than asserted
-/// unchanged.
+/// run under the same [`reader_settings`] the stage's read used, so the
+/// pipeline captured is the one that read ran.
 async fn explain_lines(
     client: &ChClient,
     kind: &str,
@@ -652,34 +407,15 @@ async fn explain_lines(
     Ok(out)
 }
 
-/// Which shard set a stage's read is expected to touch — computed
-/// client-side from the sharding key so a lost `system.query_log` row can
-/// be told apart from `optimize_skip_unused_shards` legitimately pruning a
-/// shard (issue #16 CODE review round 3 [high] finding; see the module
-/// doc comment's expected-roster model).
-#[derive(Debug, Clone)]
-enum StageRoster {
-    /// `resolution` (label-index `(key,val)` scan) and `discovery` (full
-    /// `log_streams_idx` scan): no `fingerprint` predicate to prune by, so
-    /// every shard in the cluster is expected to participate.
-    Full,
-    /// `hydration`/`samples`/`rollup_range`: a `fingerprint IN (...)`
-    /// predicate — the expected participants are exactly the shards
-    /// owning one or more of these fingerprints under
-    /// [`ClusterTopology::shard_for_fingerprint`].
-    Fingerprints(Vec<u128>),
-}
-
 /// One executed stage of a shape's read: its logical name
 /// (`resolution`/`hydration`/`samples`/`rollup_range`/`discovery`), the
 /// unique `query_id` its `system.query_log`/`EXPLAIN` rows are tagged
-/// with, its SQL text, and its expected shard [`StageRoster`].
+/// with, and its SQL text.
 #[derive(Debug, Clone)]
 struct StageRef {
     stage: &'static str,
     query_id: String,
     sql: String,
-    roster: StageRoster,
     /// Whether this stage's SQL nests a distributed table inside an `IN
     /// (subquery)` — decides whether its `EXPLAIN PIPELINE` re-issue needs
     /// `distributed_product_mode='local'`. **No stage does since issue
@@ -688,146 +424,53 @@ struct StageRef {
     product: ProductMode,
 }
 
-/// Builds the `expected-pruned` derivation string for `shard_num` — the
-/// exact `cityHash64(fp) % total_weight` reasoning
-/// `optimize_skip_unused_shards` uses
-/// to exclude it, so a reviewer can verify the pruning by hand rather than
-/// take the harness's word for it.
-fn pruned_reason(roster: &StageRoster, topology: &ClusterTopology, shard_num: u32) -> String {
-    match roster {
-        // Never reached: a `Full` roster's `expected` set is every shard,
-        // so no shard is ever pruned from it. Kept for exhaustiveness.
-        StageRoster::Full => {
-            format!("shard {shard_num} unexpectedly excluded from a Full-roster stage")
-        }
-        StageRoster::Fingerprints(fingerprints) => {
-            let hashes: Vec<u64> = fingerprints.iter().map(|fp| logs_shard_key(*fp)).collect();
-            let slots: Vec<u64> = hashes.iter().map(|h| h % topology.total_weight).collect();
-            let owning_shards: std::collections::BTreeSet<u32> = slots
-                .iter()
-                .map(|slot| topology.slots[*slot as usize])
-                .collect();
-            format!(
-                "optimize_skip_unused_shards pruned shard {shard_num}: none of the {} queried \
-                 fingerprints map to it (cityHash64(fingerprint) % total_weight={} over hashes \
-                 {:?} and slots {:?} resolves to owning shards {:?} — shard {shard_num} is not \
-                 among them)",
-                fingerprints.len(),
-                topology.total_weight,
-                hashes,
-                slots,
-                owning_shards
-            )
-        }
-    }
-}
-
-/// Captures one stage's `--dist` evidence against its **computed expected
-/// shard roster** (issue #16 CODE review round 3 [high] finding — see the
-/// module doc comment's expected-roster model):
-/// 1. Reads every shard's own `system.query_log` row
-///    ([`read_stage_query_log_rows`]) and resolves each to a `shard_num`
-///    via `topology.hostname_to_shard`.
-/// 2. Computes `expected` from `stage.roster`.
-/// 3. Computes `observed` as the shards that did nonzero storage work
-///    (`read_rows > 0 || selected_marks > 0` — a row that exists but did
-///    zero work, e.g. a pruned coordinator's own orchestration-only row,
-///    does not count as participating).
-/// 4. Asserts `observed == expected` **exactly**: a shard in `expected`
-///    but missing from `observed` is a lost `system.query_log` row (FAIL —
-///    indistinguishable from data loss any other way); a shard in
-///    `observed` but not `expected` is a pruning/sharding-mapping
-///    violation (FAIL).
-/// 5. Emits one [`ShardEvidence`] **per shard in the cluster**: expected
-///    shards get their real row (`role` = `coordinator-local`/`remote`);
-///    non-expected shards get a synthesized `role = "expected-pruned"`
-///    entry (`read_rows = 0`, `pruned_reason` carrying the derivation) —
-///    so the full roster is always *accounted for*, whether participating
-///    or provably, derivedly pruned.
-///
-/// Also asserts (unconditionally, regardless of pruning): exactly one
-/// `coordinator-local` row, never more distinct shard rows than the
-/// cluster has shards, a nonempty `EXPLAIN PIPELINE`, and the
-/// coordinator/remote balance sanity guard (a coordinator row
-/// disproportionately larger than any remote row would mean a
-/// cluster-wide total row was captured instead of the coordinator's own
-/// local-only read).
-/// Cross-checks the client-side logs sharding key against the live server
-/// for every fingerprint a roster is derived from.
-///
-/// The client model and the server's `Distributed` engine must agree on
-/// one number per fingerprint. If they do not, the roster assertion still
-/// fires — but it reports a missing owner or an unexpected participant,
-/// which is the same message a genuinely lost `system.query_log` row
-/// produces. This separates the two causes before the roster is built.
-async fn cross_check_logs_shard_key(
-    client: &ChClient,
-    fingerprints: &[u128],
-) -> anyhow::Result<()> {
-    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
-    struct HashRow {
-        h: u64,
-    }
-    for fp in fingerprints {
-        let sql = format!("SELECT cityHash64(toUInt128('{fp}')) AS h");
-        let mut stream = client
-            .query_stream::<HashRow>(&sql, &QuerySettings::new())
-            .await?;
-        let server = stream
-            .next()
-            .await
-            .ok_or_else(|| anyhow::anyhow!("no cityHash64 row for fingerprint {fp}"))??
-            .h;
-        let client_side = logs_shard_key(*fp);
-        anyhow::ensure!(
-            server == client_side,
-            "logs sharding-key drift for fingerprint {fp}: client {client_side} != server \
-             {server}; every shard roster derived from this value would name the wrong shard"
-        );
-    }
-    Ok(())
-}
-
-/// STUB (tests first): today's participation check, moved here unchanged —
-/// a shard counts only if it did storage work, and exactly one row is the
-/// initiator's.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Every shard in `all_shards` logged exactly one `QueryFinish` row for the
+/// stage, and exactly one row is the initiator's.
 fn participation_verdict(
     stage: &str,
     query_id: &str,
     all_shards: &std::collections::BTreeSet<u32>,
     rows: &[(u32, RawShardRow)],
 ) -> anyhow::Result<()> {
-    let mut by_shard: std::collections::BTreeMap<u32, &RawShardRow> =
-        std::collections::BTreeMap::new();
-    for (shard, row) in rows {
-        by_shard.insert(*shard, row);
+    let mut per_shard: std::collections::BTreeMap<u32, usize> = std::collections::BTreeMap::new();
+    for (shard, _) in rows {
+        *per_shard.entry(*shard).or_default() += 1;
     }
-    let observed: std::collections::BTreeSet<u32> = by_shard
+    let missing: Vec<u32> = all_shards
         .iter()
-        .filter(|(_, row)| row.read_rows > 0 || row.selected_marks > 0)
+        .filter(|shard| !per_shard.contains_key(shard))
+        .copied()
+        .collect();
+    anyhow::ensure!(
+        missing.is_empty(),
+        "stage {stage:?} (query_id={query_id}): shards {missing:?} logged no QueryFinish row — \
+         the read did not reach them (shard pruning on, or a shard skipped) or the row was lost"
+    );
+    let dup: Vec<u32> = per_shard
+        .iter()
+        .filter(|(_, n)| **n > 1)
         .map(|(shard, _)| *shard)
         .collect();
     anyhow::ensure!(
-        &observed == all_shards,
-        "stage {stage:?} (query_id={query_id}): observed participating shards {observed:?} != \
-         expected {all_shards:?} — missing {:?} (a lost system.query_log row, indistinguishable \
-         from data loss any other way) or unexpected {:?} (a pruning/sharding-mapping violation)",
-        all_shards.difference(&observed).collect::<Vec<_>>(),
-        observed.difference(all_shards).collect::<Vec<_>>(),
+        dup.is_empty(),
+        "stage {stage:?} (query_id={query_id}): shards {dup:?} logged more than one QueryFinish row"
     );
-    let coordinators = by_shard
-        .values()
-        .filter(|row| row.is_initial_query == 1)
+    let n = rows
+        .iter()
+        .filter(|(_, row)| row.is_initial_query == 1)
         .count();
     anyhow::ensure!(
-        coordinators == 1,
-        "stage {stage:?} (query_id={query_id}) yielded {coordinators} coordinator-local \
-         (is_initial_query = 1) rows, expected exactly 1"
+        n == 1,
+        "stage {stage:?} (query_id={query_id}): {n} initiator rows, expected exactly 1"
     );
     Ok(())
 }
 
+/// Captures one stage's `--dist` evidence: every shard's own
+/// `system.query_log` row ([`read_stage_query_log_rows`]), resolved to its
+/// `shard_num` through `topology.hostname_to_shard`, checked by
+/// [`participation_verdict`], plus a nonempty `EXPLAIN PIPELINE`. Emits one
+/// [`ShardEvidence`] per row.
 async fn capture_stage_evidence(
     client: &ChClient,
     cluster: &str,
@@ -852,8 +495,7 @@ async fn capture_stage_evidence(
         stage.sql
     );
 
-    let mut by_shard: std::collections::BTreeMap<u32, RawShardRow> =
-        std::collections::BTreeMap::new();
+    let mut by_shard: Vec<(u32, RawShardRow)> = Vec::with_capacity(raw_rows.len());
     for row in raw_rows {
         let shard_num = *topology
             .hostname_to_shard
@@ -867,130 +509,33 @@ async fn capture_stage_evidence(
                     row.hostname
                 )
             })?;
-        by_shard.insert(shard_num, row);
+        by_shard.push((shard_num, row));
     }
-
-    let expected: std::collections::BTreeSet<u32> = match &stage.roster {
-        StageRoster::Full => topology.all_shards(),
-        StageRoster::Fingerprints(fingerprints) => {
-            // The roster is only as good as the client's copy of the
-            // server's sharding key. Ask the server for the same hash over
-            // the same values before deriving anything from it: a drift
-            // fails here, naming both numbers, rather than surfacing as a
-            // missing owner that reads like a lost `system.query_log` row.
-            cross_check_logs_shard_key(client, fingerprints).await?;
-            fingerprints
-                .iter()
-                .map(|fp| topology.shard_for_fingerprint(*fp))
-                .collect()
-        }
-    };
-    let observed: std::collections::BTreeSet<u32> = by_shard
-        .iter()
-        .filter(|(_, row)| row.read_rows > 0 || row.selected_marks > 0)
-        .map(|(shard, _)| *shard)
-        .collect();
-    anyhow::ensure!(
-        observed == expected,
-        "stage {:?} (query_id={}): observed participating shards {:?} != expected {:?} — \
-         missing {:?} (a lost system.query_log row, indistinguishable from data loss any other \
-         way) or unexpected {:?} (a pruning/sharding-mapping violation); SQL:\n{}",
+    by_shard.sort_by_key(|(shard, _)| *shard);
+    participation_verdict(
         stage.stage,
-        stage.query_id,
-        observed,
-        expected,
-        expected.difference(&observed).collect::<Vec<_>>(),
-        observed.difference(&expected).collect::<Vec<_>>(),
-        stage.sql
-    );
+        &stage.query_id,
+        &topology.all_shards(),
+        &by_shard,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}; SQL:\n{}", stage.sql))?;
 
-    let coordinator_shards: Vec<u32> = by_shard
-        .iter()
-        .filter(|(_, row)| row.is_initial_query == 1)
-        .map(|(shard, _)| *shard)
-        .collect();
-    anyhow::ensure!(
-        coordinator_shards.len() == 1,
-        "stage {:?} (query_id={}) yielded {} coordinator-local (is_initial_query = 1) rows, \
-         expected exactly 1; SQL:\n{}",
-        stage.stage,
-        stage.query_id,
-        coordinator_shards.len(),
-        stage.sql
-    );
-    let cluster_size = topology.all_shards().len();
-    anyhow::ensure!(
-        by_shard.len() <= cluster_size,
-        "stage {:?} (query_id={}) yielded {} distinct shard rows, more than the cluster's \
-         {cluster_size} shards — duplicate/phantom shard-evidence row; SQL:\n{}",
-        stage.stage,
-        stage.query_id,
-        by_shard.len(),
-        stage.sql
-    );
-
-    // Coordinator/remote balance sanity guard: the coordinator-local row
-    // must be the same order of magnitude as an individual remote
-    // shard's read_rows (balanced `fingerprint` co-sharding), never
-    // inflated to roughly `cluster_size` times a remote shard's value —
-    // that shape would mean this query accidentally captured a
-    // cluster-wide total row instead of the coordinator's own
-    // local-only MergeTree read (the exact hazard the module doc
-    // comment's totals-overlap caveat warns about).
-    let coord_shard = coordinator_shards[0];
-    if let Some(coord_row) = by_shard.get(&coord_shard) {
-        let max_remote = by_shard
-            .iter()
-            .filter(|(shard, _)| **shard != coord_shard)
-            .map(|(_, row)| row.read_rows)
-            .max()
-            .unwrap_or(0);
-        anyhow::ensure!(
-            max_remote == 0
-                || coord_row.read_rows <= max_remote.saturating_mul(cluster_size as u64),
-            "stage {:?}: coordinator-local read_rows ({}) is disproportionately larger than the \
-             largest remote shard's ({max_remote}) — looks like a cluster-wide total row was \
-             captured instead of the coordinator's own local read",
-            stage.stage,
-            coord_row.read_rows
-        );
-    }
-
-    // Full-roster assembly: every shard in the cluster gets an entry,
-    // participating (real row) or expected-pruned (synthesized, derived).
-    let mut shards = Vec::with_capacity(cluster_size);
-    for shard_num in topology.all_shards() {
-        if let Some(row) = by_shard.get(&shard_num) {
-            let role = if row.is_initial_query == 1 {
-                "coordinator-local"
+    let shards = by_shard
+        .into_iter()
+        .map(|(shard_num, row)| ShardEvidence {
+            shard_num,
+            role: if row.is_initial_query == 1 {
+                "coordinator"
             } else {
                 "remote"
-            };
-            shards.push(ShardEvidence {
-                shard_num,
-                hostname: row.hostname.clone(),
-                role: role.to_string(),
-                read_rows: row.read_rows,
-                read_bytes: row.read_bytes,
-                selected_marks: row.selected_marks,
-                pruned_reason: None,
-            });
-        } else {
-            shards.push(ShardEvidence {
-                shard_num,
-                hostname: topology
-                    .shard_to_hostname
-                    .get(&shard_num)
-                    .cloned()
-                    .unwrap_or_default(),
-                role: "expected-pruned".to_string(),
-                read_rows: 0,
-                read_bytes: 0,
-                selected_marks: 0,
-                pruned_reason: Some(pruned_reason(&stage.roster, topology, shard_num)),
-            });
-        }
-    }
+            }
+            .to_string(),
+            hostname: row.hostname,
+            read_rows: row.read_rows,
+            read_bytes: row.read_bytes,
+            selected_marks: row.selected_marks,
+        })
+        .collect();
 
     Ok(StageEvidence {
         stage: stage.stage.to_string(),
@@ -1001,8 +546,7 @@ async fn capture_stage_evidence(
 
 /// Captures `--dist` evidence for every stage in `stages`, in order —
 /// shared by every shape runner ([`run_shape`], `run_metric_shape`,
-/// `run_discovery_shape`) so the expected-roster discipline lives in one
-/// place.
+/// `run_discovery_shape`) so the participation check lives in one place.
 async fn capture_all_stage_evidence(
     client: &ChClient,
     cluster: &str,
@@ -1105,17 +649,6 @@ impl Tables {
 /// by `log_comment` alongside `query_id`.
 const LOG_COMMENT: &str = "pulsus-bench:logs-read";
 
-/// Settings applied to every timed query: the clustered-reader block
-/// (docs/schemas.md §7) in `--dist` mode, plain otherwise, plus the
-/// per-query `query_id` tag every stage carries and the scenario-wide
-/// [`LOG_COMMENT`] tag (routed through the shared
-/// [`super::query_log::tagged_settings`] so every scenario's `log_comment`
-/// application lives in one place). `skip_unavailable_shards = false`
-/// (unlike the product's own configurable `PULSUS_SKIP_UNAVAILABLE_SHARDS`
-/// default) — this harness exists to *capture evidence*, and a
-/// verification/benchmark run should fail loudly on genuine shard
-/// unavailability rather than silently tolerate it and record evidence for
-/// a degraded read as if it were normal.
 /// Whether a bench query nests a distributed table inside an `IN
 /// (subquery)`. **Since issue #603 no bench query does.** The `/labels`
 /// discovery shape was the one that did — issue #399's activity semi-join —
@@ -1133,15 +666,29 @@ enum ProductMode {
     Nested,
 }
 
+/// What every product logs read sends, at the product's defaults.
+fn bench_base_settings() -> QuerySettings {
+    let reader = pulsus_config::Config::default().reader;
+    pulsus_read::logql::read_query_settings(
+        reader.logql_scan_budget_bytes.0,
+        reader.logql_read_max_memory_bytes,
+        false,
+    )
+}
+
+/// Settings applied to every timed query, in both modes:
+/// [`bench_base_settings`], so the bench measures the shipped route — shard
+/// pruning off, and a lost shard fails the run rather than being skipped —
+/// plus the per-query `query_id` tag every stage carries and the
+/// scenario-wide [`LOG_COMMENT`] tag (routed through the shared
+/// [`super::query_log::tagged_settings`]). A `Nested` shape adds
+/// `distributed_product_mode = 'local'` under `--dist`.
 fn reader_settings(dist: bool, query_id: &str, product: ProductMode) -> QuerySettings {
-    let base = if dist {
-        let clustered = QuerySettings::clustered_reader(false);
-        match product {
-            ProductMode::Flat => clustered,
-            ProductMode::Nested => clustered.set("distributed_product_mode", "local"),
+    let base = match product {
+        ProductMode::Nested if dist => {
+            bench_base_settings().set("distributed_product_mode", "local")
         }
-    } else {
-        QuerySettings::new()
+        _ => bench_base_settings(),
     };
     tagged_settings(base, query_id, Some(LOG_COMMENT))
 }
@@ -1247,7 +794,6 @@ async fn run_streams_once(
         stage: "resolution",
         query_id: s1_id.clone(),
         sql: sp.stage1_sql.clone(),
-        roster: StageRoster::Full,
         product: ProductMode::Flat,
     }];
     if fingerprints.is_empty() {
@@ -1270,7 +816,6 @@ async fn run_streams_once(
         stage: "hydration",
         query_id: s2_id.clone(),
         sql: stage2_sql,
-        roster: StageRoster::Fingerprints(fingerprints.clone()),
         product: ProductMode::Flat,
     });
 
@@ -1310,7 +855,6 @@ async fn run_streams_once(
         stage: "samples",
         query_id: s3_id.clone(),
         sql: sql3,
-        roster: StageRoster::Fingerprints(fingerprints.clone()),
         product: ProductMode::Flat,
     });
 
@@ -1612,7 +1156,6 @@ async fn run_discovery_shape(
             stage: "discovery",
             query_id: first_id,
             sql: sql.clone(),
-            roster: StageRoster::Full,
             product: ProductMode::Flat,
         };
         vec![
@@ -1648,12 +1191,9 @@ async fn run_discovery_shape(
 }
 
 /// Runs `sql` tagged `query_id` and discards every row (the harness only
-/// needs the returned-row count, not the payload). `dist` applies the
-/// clustered-reader settings block (`reader_settings`) — issue #16 CODE
-/// review [medium] finding: this is the terminal stage for both the
-/// discovery shape and the metric shape, so running it under plain
-/// settings in `--dist` mode would capture evidence for a query the
-/// product's own distributed reader never actually issues.
+/// needs the returned-row count, not the payload), under the same
+/// [`reader_settings`] as every other stage, so the terminal stage of the
+/// discovery and metric shapes is the read the product issues.
 async fn execute_discard<R: ChRow>(
     client: &ChClient,
     sql: &str,
@@ -1716,7 +1256,6 @@ async fn run_metric_shape(
             stage: "resolution",
             query_id: s1_id.clone(),
             sql: mp.stage1_sql.clone(),
-            roster: StageRoster::Full,
             product: ProductMode::Flat,
         }];
         if fingerprints.is_empty() {
@@ -1739,7 +1278,6 @@ async fn run_metric_shape(
             stage: "hydration",
             query_id: s2_id.clone(),
             sql: stage2_sql,
-            roster: StageRoster::Fingerprints(fingerprints.clone()),
             product: ProductMode::Flat,
         });
 
@@ -1783,7 +1321,6 @@ async fn run_metric_shape(
             stage: "rollup_range",
             query_id: s3_id.clone(),
             sql: sql3,
-            roster: StageRoster::Fingerprints(fingerprints.clone()),
             product: ProductMode::Flat,
         });
         let totals = sum_query_log(client, &[s1_id, s2_id, s3_id]).await?;
