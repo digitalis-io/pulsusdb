@@ -1539,7 +1539,7 @@ fn live_matrix_against_the_reference() {
     let points = matrix();
     let mut disagree = Vec::new();
     for p in &points {
-        let (code, body) = reference_status(&base, &p.query, 0);
+        let (code, body) = pulsus_testkit::reask_on_cancel(|| reference_status(&base, &p.query, 0));
         let theirs = match code {
             200 => Verdict::Accept,
             400 => Verdict::Reject,

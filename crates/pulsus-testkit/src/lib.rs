@@ -1245,9 +1245,22 @@ pub fn clickhouse_query(sql: &str) -> String {
 
 /// Asks the reference again while it answers 499, up to five calls in all,
 /// and returns the last answer.
+///
+/// The reference builds the two legs of a binary operator in parallel and
+/// cancels the surviving leg when the other is refused, so a refusal can
+/// read 499 (`the request was cancelled by the client`) instead of 400,
+/// by goroutine order. Re-asking samples that order again. A 200 or 400,
+/// or any status other than 499, is returned after the call that got it.
 pub fn reask_on_cancel(mut ask: impl FnMut() -> (u32, String)) -> (u32, String) {
-    let _ = &mut ask;
-    (0, String::new())
+    const CALLS: usize = 5;
+    let mut answer = ask();
+    for _ in 1..CALLS {
+        if answer.0 != 499 {
+            break;
+        }
+        answer = ask();
+    }
+    answer
 }
 
 #[cfg(test)]
