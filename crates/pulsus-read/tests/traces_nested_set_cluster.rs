@@ -1998,8 +1998,8 @@ async fn two_replicas_share_one_edge_table() {
         assert_eq!(held, 2 * written, "K1: {node} holds both runs' rows");
         let repeated = count(
             c,
-            "SELECT count() - uniqExact(conn_type, minute, client_minute, client, server) AS n \
-             FROM service_edges FINAL",
+            "SELECT countIf(c > 1) AS n FROM (SELECT count() AS c FROM service_edges FINAL \
+             GROUP BY conn_type, minute, client_minute, client, server)",
         )
         .await;
         assert_eq!(repeated, 0, "K1: every key once under FINAL on {node}");
@@ -2098,8 +2098,8 @@ async fn two_replicas_share_one_edge_table() {
     for (c, node) in [(&r.s1, "ch-shard1"), (&r.s1b, "ch-shard1b")] {
         let repeated = count(
             c,
-            "SELECT count() - uniqExact(conn_type, minute, client_minute, client, server) AS n \
-             FROM service_edges FINAL",
+            "SELECT countIf(c > 1) AS n FROM (SELECT count() AS c FROM service_edges FINAL \
+             GROUP BY conn_type, minute, client_minute, client, server)",
         )
         .await;
         assert_eq!(repeated, 0, "K7: every key once under FINAL on {node}");
