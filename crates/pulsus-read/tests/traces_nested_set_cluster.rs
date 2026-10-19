@@ -2020,11 +2020,28 @@ async fn two_replicas_share_one_edge_table() {
     r.assert_route_g1("K1").await;
 
     // K10: every request reads shard 1 on one replica, the one that served
-    // its marker fan-out. Repeated, so a replica picked at random cannot pass
-    // by chance.
+    // its marker fan-out, and it does so because the route's statement and
+    // every part of it it sent carry `load_balancing = 'in_order'`: the
+    // logged setting is what fails without it, whatever replicas a random
+    // choice happened to pick.
     for n in 0..8 {
         let prefix = pulsus_testkit::test_ident(&format!("t599b_k10_{n}_{}", now_ns()));
         assert_g1(&r.graph(&prefix).await, &format!("K10 request {n}"));
+        exec(&r.s1, "SYSTEM FLUSH LOGS").await;
+        let graph_statements = count(
+            &r.s1,
+            &format!(
+                "SELECT count() AS n FROM system.query_log WHERE type = 'QueryFinish' \
+                 AND is_initial_query AND startsWith(query_id, '{prefix}-') \
+                 AND has(tables, '{db}.service_edges') AND has(tables, '{db}.spans') \
+                 AND Settings['load_balancing'] = 'in_order'"
+            ),
+        )
+        .await;
+        assert_eq!(
+            graph_statements, 1,
+            "K10 request {n}: the route's statement ran with load_balancing = 'in_order'"
+        );
         let mut hosts = Vec::new();
         for (c, node) in [(&r.s1, "ch-shard1"), (&r.s1b, "ch-shard1b")] {
             exec(c, "SYSTEM FLUSH LOGS").await;
@@ -2045,6 +2062,20 @@ async fn two_replicas_share_one_edge_table() {
                 ),
             )
             .await;
+            let unordered = count(
+                c,
+                &format!(
+                    "SELECT count() AS n FROM system.query_log WHERE type = 'QueryFinish' \
+                     AND is_initial_query = 0 AND startsWith(initial_query_id, '{prefix}-') \
+                     AND has(tables, '{db}.service_edges') \
+                     AND Settings['load_balancing'] != 'in_order'"
+                ),
+            )
+            .await;
+            assert_eq!(
+                unordered, 0,
+                "K10 request {n}: every part {node} ran carried load_balancing = 'in_order'"
+            );
             if rows > 0 {
                 hosts.push((node, fan_out));
             }
