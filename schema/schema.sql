@@ -974,7 +974,9 @@ AS WITH (SELECT arraySort(groupArray(minute)) FROM {{db}}.service_edges FINAL WH
      toStartOfInterval(now('UTC') - INTERVAL 3 MINUTE, INTERVAL 5 MINUTE) AS ready,
      (SELECT toDateTime(min(toDate(parseDateTimeBestEffort(partition))), 'UTC') FROM system.parts WHERE database = '{{db}}' AND table = 'spans' AND active) AS oldest,
      if(wm = 0, if(oldest = 0, ready - INTERVAL 5 MINUTE, oldest), wm + INTERVAL 1 MINUTE) AS lo,
-     least(ready, lo + INTERVAL 5 MINUTE) AS hi,
+--@single  least(ready, lo + INTERVAL 5 MINUTE) AS hi,
+--@cluster (SELECT min(inserts_in_queue = 0 AND (log_pointer > log_max_index OR (log_pointer = 0 AND log_max_index = 0))) FROM system.replicas WHERE database = '{{db}}' AND table IN ('spans', 'service_edges')) AS caught_up,
+--@cluster if(caught_up, least(ready, lo + INTERVAL 5 MINUTE), lo) AS hi,
      toInt64(toUnixTimestamp(lo)) * 1000000000 AS slo,
      toInt64(toUnixTimestamp(hi)) * 1000000000 AS shi,
      toUInt64(toUnixTimestamp64Milli(now64())) AS v

@@ -1,4 +1,5 @@
-# 2-shard / 1-replica-per-shard ClickHouse cluster + a single-node
+# 2-shard ClickHouse cluster, shard 1 with two replicas (issue #599 part
+# B: `ch-shard1b`), + a single-node
 # clickhouse-keeper, for the issue #5 "2-shard cluster variant" CI leg
 # (docs/schemas.md §7 — `_dist` writes/reads, live sharding-identity
 # assertions). Runtime-neutral: works with either `docker compose` or
@@ -62,6 +63,32 @@ services:
     ports:
       - "18123:8123" # HTTP
       - "19000:9000" # native
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8123/ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+  ch-shard1b:
+    image: docker.io/clickhouse/clickhouse-server@sha256:d3fd302416d9523d5d64239d5713d1c16c20ecea2045ac70d7e941b376cb266e
+    container_name: pulsus-ch-shard1b-it
+    networks:
+      pulsus-schema-it:
+        ipv4_address: 172.28.0.13
+    depends_on:
+      - keeper
+    volumes:
+      - ./config.d/zookeeper.xml:/etc/clickhouse-server/config.d/zookeeper.xml:ro
+      - ./config.d/remote_servers.xml:/etc/clickhouse-server/config.d/remote_servers.xml:ro
+      - ./users.d/network.xml:/etc/clickhouse-server/users.d/network.xml:ro
+      - ./shard1b/macros.xml:/etc/clickhouse-server/config.d/macros.xml:ro
+    ports:
+      - "38123:8123" # HTTP
+      - "39000:9000" # native
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8123/ping"]
       interval: 2s
