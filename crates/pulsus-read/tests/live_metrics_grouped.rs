@@ -541,11 +541,22 @@ impl Harness {
     }
 
     /// `ProfileEvents['NetworkSendBytes']` for every `query_id` beginning
-    /// with `prefix`, read once the count has stopped moving.
+    /// with `prefix`, read once the count has stopped moving, keyed by the
+    /// statement: each id is `<statement>_<run>`, and the runs fold to one
+    /// key.
     ///
     /// The `query_id`s are composed through `pulsus_testkit::test_ident`,
     /// so two checkouts sharing one server cannot read each other's rows.
-    async fn sent_bytes(&self, prefix: &str, expect: usize) -> BTreeMap<String, u64> {
+    ///
+    /// **Exactly `expect` finish rows, one per run id**, or an error naming
+    /// what differs: a second row under one id is a stale one, from an
+    /// earlier run or a reused id, and would be folded into this run's
+    /// figure.
+    async fn sent_bytes(
+        &self,
+        prefix: &str,
+        expect: usize,
+    ) -> Result<BTreeMap<String, u64>, String> {
         let sql = format!(
             "SELECT query_id, toUInt64(ProfileEvents['NetworkSendBytes']) AS sent \
              FROM system.query_log \
@@ -571,18 +582,31 @@ impl Harness {
                 rows.push(r.expect("decode"));
             }
             if rows.len() >= expect && poll >= 2 && previous == rows.len() {
+                let mut per_run: BTreeMap<&str, usize> = BTreeMap::new();
+                for r in &rows {
+                    *per_run.entry(r.query_id.as_str()).or_default() += 1;
+                }
+                let repeated: Vec<(&str, usize)> =
+                    per_run.into_iter().filter(|&(_, n)| n != 1).collect();
+                if !repeated.is_empty() || rows.len() != expect {
+                    return Err(format!(
+                        "{} finish rows for {prefix}, expected {expect}, one per run id; \
+                         ids with more than one: {repeated:?}",
+                        rows.len()
+                    ));
+                }
                 let mut by_id: BTreeMap<String, Vec<u64>> = BTreeMap::new();
                 for r in rows {
                     let (statement, _run) = r.query_id.rsplit_once('_').expect("a run suffix");
                     by_id.entry(statement.to_string()).or_default().push(r.sent);
                 }
-                return by_id
+                return Ok(by_id
                     .into_iter()
                     .map(|(k, mut v)| {
                         v.sort_unstable();
                         (k, v[v.len() / 2])
                     })
-                    .collect();
+                    .collect());
             }
             previous = rows.len();
             tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1308,7 +1332,10 @@ async fn pushed_rows_never_exceed_twice_the_raw_rows() {
         }
         ids.push((raw_id, raw_sql.len().to_string(), 0));
     }
-    let sent = h.sent_bytes(&tag, 3 * ids.len()).await;
+    let sent = h
+        .sent_bytes(&tag, 3 * ids.len())
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
     eprintln!(
         "[549] corpus                                          route   NetworkSendBytes + text"
     );
@@ -1327,6 +1354,27 @@ async fn pushed_rows_never_exceed_twice_the_raw_rows() {
             eprintln!("[549] {:<48} {kind:<7} {}", case.name, bytes + text as u64);
         }
     }
+    // A stale row: a second finish row under a run id already read, as an
+    // earlier run under a fixed tag leaves. The read refuses it rather than
+    // folding it into the figure.
+    let stale = format!("{tag}_0_pushed_0");
+    h.admin
+        .execute(
+            "SELECT 1",
+            &QuerySettings::new().set("query_id", stale.as_str()),
+            // Never resent, so it leaves exactly one more finish row.
+            Idempotency::NonIdempotent,
+        )
+        .await
+        .expect("the stale statement runs");
+    let refused = h
+        .sent_bytes(&tag, 3 * ids.len() + 1)
+        .await
+        .expect_err("a second finish row under one run id is refused");
+    assert!(
+        refused.contains(&format!("(\"{stale}\", 2)")),
+        "the refusal names the repeated id: {refused}"
+    );
     h.finish().await;
 }
 
