@@ -1052,4 +1052,35 @@ mod tests {
             other => panic!("expected both rows, got {other:?}"),
         }
     }
+
+    /// Issue #501 part 2 (code review r1): A's rows accepted and then a
+    /// node's code 158 — the error reaches the engine, which runs T next on
+    /// the same budget, so everything the drain charged must be given back
+    /// first.
+    #[tokio::test]
+    async fn a_stream_error_after_accepted_rows_releases_their_charge() {
+        let mut items: Vec<Result<u32, ChError>> = (0..3u32).map(Ok).collect();
+        items.push(Err(ChError::Server {
+            code: 158,
+            message: "DB::Exception: Limit for rows to GROUP BY exceeded".to_string(),
+        }));
+        let mut budget = AnswerBudget::new(1_000);
+        match drain_charged_bytes(
+            futures::stream::iter(items),
+            &mut budget,
+            |_| 300,
+            |r| r,
+            Some(100_001),
+            TEST_READ_MEM,
+        )
+        .await
+        {
+            Err(ReadError::Clickhouse(ChError::Server { code: 158, .. })) => {}
+            other => panic!("expected code 158, got {other:?}"),
+        }
+        assert!(
+            budget.charge(1_000).is_ok(),
+            "the three accepted rows' 900 bytes were not given back before T"
+        );
+    }
 }

@@ -485,6 +485,48 @@ mod tests {
         }
     }
 
+    /// The width at each transition the user text states (`docs/api.md`,
+    /// `/query_exemplars`): `(longest window in ms, width there, width one
+    /// millisecond longer)`, computed from the step rule by a script over
+    /// every threshold and slice boundary.
+    #[test]
+    fn slice_width_changes_exactly_where_the_user_text_says() {
+        let transitions: [(i64, i64, i64); 18] = [
+            (99_998, 1, 10),
+            (770_000, 10, 50),
+            (1_650_000, 50, 100),
+            (7_700_000, 100, 500),
+            (16_500_000, 500, 1_000),
+            (77_000_000, 1_000, 5_000),
+            (385_000_000, 5_000, 10_000),
+            (550_000_000, 10_000, 30_000),
+            (990_000_000, 30_000, 60_000),
+            (4_620_000_000, 60_000, 300_000),
+            (23_100_000_000, 300_000, 600_000),
+            (33_000_000_000, 600_000, 1_800_000),
+            (59_400_000_000, 1_800_000, 3_600_000),
+            (198_000_000_000, 3_600_000, 10_800_000),
+            (356_400_000_000, 10_800_000, 21_600_000),
+            (712_800_000_000, 21_600_000, 43_200_000),
+            (1_900_800_000_000, 43_200_000, 86_400_000),
+            (8_639_913_599_999, 86_400_000, 432_000_000),
+        ];
+        assert_eq!(slice_width(w(0, 0), 0, 0), 1);
+        for (last, here, next) in transitions {
+            assert_eq!(
+                slice_width(w(0, last), 0, last),
+                here,
+                "a window of {last} ms"
+            );
+            assert_eq!(
+                slice_width(w(0, last + 1), 0, last + 1),
+                next,
+                "a window of {} ms",
+                last + 1
+            );
+        }
+    }
+
     /// The client's `RoundInterval`, for U3b, written from its table
     /// apart from the constants under test.
     fn round(range: i64, divisor: i64) -> i64 {

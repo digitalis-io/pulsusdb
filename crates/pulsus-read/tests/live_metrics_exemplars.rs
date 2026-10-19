@@ -769,3 +769,73 @@ async fn a_wide_answer_past_its_budget_is_thinned_or_refused() {
     }
     fx.finish().await;
 }
+
+/// Code review r1: the envelope's 64 bytes are charged. A budget that holds
+/// the rows' and the series' charges and the envelope's answers; one byte
+/// less is the byte refusal.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_envelope_is_charged_with_the_rows() {
+    use pulsus_model::Fingerprint;
+    use pulsus_read::metrics::exemplars::{
+        ENVELOPE_CHARGE, exemplar_row_charge, series_row_charge,
+    };
+    use pulsus_read::metrics::rows::{ExemplarRow, ExemplarSeriesRow};
+    skip_unless_live!();
+    let fx = Fixture::new(pulsus_testkit::test_db("pulsus_exemplars_envelope")).await;
+    let t0 = fx.t0;
+    let labels = r#"{"job":"env"}"#;
+    fx.register(&[Series {
+        org: "",
+        fp: 1,
+        labels,
+        hours: vec![t0],
+    }])
+    .await;
+    fx.exemplars(&[
+        ("", 1, t0, 1.5, 0x11, 0x21, r#"{"k":"a1"}"#),
+        ("", 1, t0 + 1, 2.5, 0, 0, "{}"),
+    ])
+    .await;
+    let stored = |ms: i64, value: f64, trace: u8, span: u8, labels: &str| ExemplarRow {
+        fingerprint: Fingerprint::from_raw(1),
+        unix_milli: ms,
+        value,
+        trace_id: [trace; 16],
+        span_id: [span; 8],
+        labels: labels.to_string(),
+    };
+    let rows_and_series = exemplar_row_charge(&stored(t0, 1.5, 0x11, 0x21, r#"{"k":"a1"}"#))
+        + exemplar_row_charge(&stored(t0 + 1, 2.5, 0, 0, "{}"))
+        + series_row_charge(&ExemplarSeriesRow {
+            fingerprint: Fingerprint::from_raw(1),
+            series_name: "m".to_string(),
+            series_labels: labels.to_string(),
+        });
+    let window = DataWindow {
+        start_ms: t0 - MINUTE_MS,
+        end_ms: t0 + MINUTE_MS,
+    };
+    let filter = [m_eq("job", "env")];
+    let fits = fx
+        .engine()
+        .await
+        .with_exemplar_answer_bytes(rows_and_series + ENVELOPE_CHARGE)
+        .exemplars(&tenant(""), &filter, window)
+        .await
+        .expect("a budget that holds the envelope too answers");
+    assert_eq!(fits.iter().map(|s| s.exemplars.len()).sum::<usize>(), 2);
+    let short = rows_and_series + ENVELOPE_CHARGE - 1;
+    match fx
+        .engine()
+        .await
+        .with_exemplar_answer_bytes(short)
+        .exemplars(&tenant(""), &filter, window)
+        .await
+    {
+        Err(ReadError::QueryTooBroad(TooBroadReason::ExemplarAnswerBytes { budget_bytes })) => {
+            assert_eq!(budget_bytes, short as u64)
+        }
+        other => panic!("a budget one byte short of the envelope must refuse, got {other:?}"),
+    }
+    fx.finish().await;
+}
