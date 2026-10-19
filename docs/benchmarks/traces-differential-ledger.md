@@ -1,6 +1,6 @@
 # Traces differential divergence ledger
 
-**Parts of this document describe the previous trace search engine, which issue #602 part 2c-2b deleted — its test binaries, goldens and benches in part 2c-2b-1, its code and the unit tests inside it in part 2c-2b-2; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** The M4 traces differential (`e2e/src/traces.rs`, issue #60) gates every
+**Parts of this document describe the previous trace search engine, which issue #602 part 2c-2b deleted — its test binaries, goldens and benches in part 2c-2b-1, its code and the unit tests inside it in part 2c-2b-2; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** **Since #600 part 3 a projected `event`/`link` value is the last element its condition admits (`docs/api.md` §4.2); `traceql-attribute-resolves-to-one-element` below predates that and still governs the condition, the aggregates and `by()`.** The M4 traces differential (`e2e/src/traces.rs`, issue #60) gates every
 corpus-computable TraceQL case in
 `test/fixtures/traces/differential.json` against both the corpus's
 by-construction expectation and the pinned reference Tempo
