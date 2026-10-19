@@ -1006,7 +1006,8 @@ mod tests {
     /// overflow. At a budget of 250 and 100 a row, the third row does not
     /// fit: with a sentinel of 5, five rows still reach the sentinel and
     /// nothing stays charged; four rows end short of it and are the byte
-    /// refusal, with nothing charged either.
+    /// refusal, with nothing charged either. Reaching the sentinel with
+    /// every row kept leaves nothing charged as well.
     #[tokio::test]
     async fn the_drain_counts_on_past_a_byte_overflow_to_its_sentinel() {
         let rows = |n: u32| futures::stream::iter((0..n).map(Ok::<u32, ChError>));
@@ -1034,6 +1035,15 @@ mod tests {
             budget.charge(250).is_ok(),
             "the refusal leaves nothing charged"
         );
+        // Reaching the sentinel with every row kept releases them too.
+        let mut budget = AnswerBudget::new(1_000);
+        match drain_charged_bytes(rows(5), &mut budget, |_| 100, |r| r, Some(5), TEST_READ_MEM)
+            .await
+        {
+            Ok(Drained::Sentinel) => {}
+            other => panic!("expected the sentinel, got {other:?}"),
+        }
+        assert!(budget.charge(1_000).is_ok(), "the kept rows were released");
         let mut budget = AnswerBudget::new(250);
         match drain_charged_bytes(rows(2), &mut budget, |_| 100, |r| r, Some(5), TEST_READ_MEM)
             .await
