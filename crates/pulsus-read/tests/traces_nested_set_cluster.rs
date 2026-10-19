@@ -1092,7 +1092,7 @@ fn c1_edges() -> Vec<(String, String, u64)> {
         .collect()
 }
 
-/// C1, C3 and C2 (issue #599 part A §5.3): the graph over the two shards
+/// C1, C3, C2 and C4 (issue #599 part A §5.3, part A2 §6): the graph over the two shards
 /// from spans and from totals, each shard reading its own coverage; a
 /// reader whose routing table names the storage cluster; and a shard with
 /// no coverage answering from its spans beside one answering from totals.
@@ -1262,6 +1262,67 @@ async fn the_service_graph_answers_over_two_shards() {
         .await
         .expect("C2");
     assert_eq!(calls_of(&graph), c1_edges(), "C2");
+
+    // C4 (part A2): each shard's span read keeps its primary-key pruning.
+    // A million spans per shard in the window's UTC day but outside its
+    // buckets; the request reads its few granules, not the partition, on
+    // every shard including the initiator's.
+    let day = floor_to(l, 24 * 60 * MINUTE);
+    let (from, until) = if l - 5 * MINUTE - day >= 5 * MINUTE {
+        (day, l - 5 * MINUTE)
+    } else {
+        (l + 10 * MINUTE, day + 24 * 60 * MINUTE)
+    };
+    for c in [&shard1, &shard2] {
+        exec(
+            c,
+            &format!(
+                "INSERT INTO spans (trace_id, span_id, parent_span_id, start_ns, duration_ns, \
+                 service, name, kind, attrs, end_ns, service_type) \
+                 SELECT sipHash128(number, 'c4'), reinterpretAsFixedString(cityHash64(number, 'c4')), \
+                        toFixedString('', 8), \
+                        {from} + intDiv(toInt64(number) * ({until} - {from}), 1000000) AS st, \
+                        1000, 'svc-bulk', 'op', 1, CAST('{{}}', 'JSON'), toUInt64(st + 1000), 'string' \
+                 FROM numbers(1000000)"
+            ),
+        )
+        .await;
+    }
+    let prefix = pulsus_testkit::test_ident(&format!("t599c4_{}", now_ns()));
+    let graph = engine(&prefix)
+        .await
+        .service_graph(window)
+        .await
+        .expect("C4");
+    assert_eq!(calls_of(&graph), c1_edges(), "C4");
+    let mut read = 0;
+    for c in [&shard1, &shard2] {
+        exec(c, "SYSTEM FLUSH LOGS").await;
+        read += count(
+            c,
+            &format!(
+                "SELECT sum(read_rows) AS n FROM system.query_log WHERE type = 'QueryFinish' \
+                 AND startsWith(initial_query_id, '{prefix}-')"
+            ),
+        )
+        .await;
+        let statements = count(
+            c,
+            &format!(
+                "SELECT count() AS n FROM system.query_log WHERE type = 'QueryFinish' \
+                 AND startsWith(initial_query_id, '{prefix}-') AND has(tables, '{db}.spans')"
+            ),
+        )
+        .await;
+        assert!(
+            statements > 0,
+            "C4: a statement of the request read spans on every node"
+        );
+    }
+    assert!(
+        read <= 50_000,
+        "C4: the request reads a few granules on each shard, not the day's partition: {read}"
+    );
 
     exec(
         &bootstrap,

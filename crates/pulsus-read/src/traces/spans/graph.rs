@@ -49,10 +49,10 @@ fn bucket(x: i64) -> i64 {
 
 /// The per-shard statement `I`: markers, totals and the raw regions, on
 /// `edges` and `spans` as written.
-fn per_shard(w: GraphWindow, edges: &str, spans: &str) -> String {
+fn per_shard(w: GraphWindow, markers: &str, edges: &str, spans: &str) -> String {
     let (s, e) = (w.start_ns, w.end_ns);
     format!(
-        "WITH (SELECT arraySort(groupArray(minute)) FROM {edges} FINAL WHERE conn_type = '') AS ms,\n\
+        "{markers}\n\
         \x20    ms[1] AS first,\n\
         \x20    ms[arrayFirstIndex(i -> i = length(ms) OR ms[i + 1] - ms[i] != 300, arrayEnumerate(ms))] AS last,\n\
         \x20    greatest({ceil_s}, toInt64(toUnixTimestamp(first)) * 1000000000 - 240000000000) AS A,\n\
@@ -92,6 +92,32 @@ fn per_shard(w: GraphWindow, edges: &str, spans: &str) -> String {
     )
 }
 
+/// `I`'s marker list on a single node: the current database's own.
+fn local_markers(edges: &str) -> String {
+    format!(
+        "WITH (SELECT arraySort(groupArray(minute)) FROM {edges} FINAL WHERE conn_type = '') AS ms,"
+    )
+}
+
+/// `I`'s marker list on a cluster (issue #599 part A2): every shard's list,
+/// keyed by shard number and host, read by a fan-out of the same cluster,
+/// and each shard's own entry picked with `shardNum()` and `hostName()`.
+///
+/// ClickHouse evaluates a scalar subquery inside `cluster(…, view(…))`
+/// once, on the initiator, and sends its value to every shard, so a scalar
+/// over the local table would hand every shard the initiator's markers. A
+/// shard or replica with no entry gets an empty list: it covers nothing and
+/// pairs its whole window from spans.
+fn cluster_markers(cluster: &str, edges: &str) -> String {
+    format!(
+        "WITH (SELECT groupArray((s, h, m)) FROM (SELECT s, h, arraySort(groupArray(minute)) AS m\n\
+        \x20     FROM cluster('{cluster}', view(SELECT shardNum() AS s, hostName() AS h, minute\n\
+        \x20                              FROM {edges} FINAL WHERE conn_type = ''))\n\
+        \x20     GROUP BY s, h)) AS mall,\n\
+        \x20    arrayFirst(x -> x.1 = shardNum() AND x.2 = hostName(), mall).3 AS ms,"
+    )
+}
+
 /// The service-graph statement (issue #599): `I` per shard, summed and
 /// merged by the initiator, ordered and capped at `max_edges + 1` rows (the
 /// truncation probe).
@@ -104,16 +130,23 @@ fn per_shard(w: GraphWindow, edges: &str, spans: &str) -> String {
 /// own coverage from its own markers.
 pub fn spans_graph_sql(w: GraphWindow, target: Option<&GraphTarget>, max_edges: u64) -> String {
     let src = match target {
-        None => format!("(\n{}\n)", per_shard(w, "service_edges", "spans")),
-        Some(t) => format!(
-            "cluster('{}', view(\n{}\n))",
-            escape_quoted(&t.cluster),
-            per_shard(
-                w,
-                &format!("{}.service_edges", t.database),
-                &format!("{}.spans", t.database),
-            )
+        None => format!(
+            "(\n{}\n)",
+            per_shard(w, &local_markers("service_edges"), "service_edges", "spans")
         ),
+        Some(t) => {
+            let cluster = escape_quoted(&t.cluster);
+            let edges = format!("{}.service_edges", t.database);
+            format!(
+                "cluster('{cluster}', view(\n{}\n))",
+                per_shard(
+                    w,
+                    &cluster_markers(&cluster, &edges),
+                    &edges,
+                    &format!("{}.spans", t.database),
+                )
+            )
+        }
     };
     format!(
         "SELECT client, server, conn_type, sum(calls) AS calls, sum(failed) AS failed,\n\

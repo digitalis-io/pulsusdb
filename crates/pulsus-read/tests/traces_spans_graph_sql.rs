@@ -94,11 +94,20 @@ fn every_case_matches_its_committed_golden_byte_for_byte() {
 #[test]
 fn the_clustered_statement_runs_per_shard_on_the_target_tables() {
     let clustered = sql_of(&CASES[1]);
+    // Twice: the per-shard statement and, inside it, the fan-out that reads
+    // every shard's markers (issue #599 part A2), from which each shard
+    // takes its own entry.
     assert_eq!(
         clustered.matches("cluster('c1', view(").count(),
-        1,
-        "one per-shard statement on the target cluster: {clustered}"
+        2,
+        "the per-shard statement and its marker fan-out: {clustered}"
     );
+    for own in ["shardNum()", "hostName()"] {
+        assert!(
+            clustered.contains(own),
+            "each shard picks its own markers by {own}: {clustered}"
+        );
+    }
     assert!(clustered.contains("FROM pulsus.service_edges FINAL"));
     assert!(clustered.contains("FROM pulsus.spans\n"));
     assert!(

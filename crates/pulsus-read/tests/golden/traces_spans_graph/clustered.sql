@@ -4,7 +4,11 @@
 SELECT client, server, conn_type, sum(calls) AS calls, sum(failed) AS failed,
        CAST(quantilesTDigestMerge(0.5, 0.95, 0.99)(q) AS Array(Float64)) AS quantiles_ns
 FROM cluster('c1', view(
-WITH (SELECT arraySort(groupArray(minute)) FROM pulsus.service_edges FINAL WHERE conn_type = '') AS ms,
+WITH (SELECT groupArray((s, h, m)) FROM (SELECT s, h, arraySort(groupArray(minute)) AS m
+      FROM cluster('c1', view(SELECT shardNum() AS s, hostName() AS h, minute
+                               FROM pulsus.service_edges FINAL WHERE conn_type = ''))
+      GROUP BY s, h)) AS mall,
+     arrayFirst(x -> x.1 = shardNum() AND x.2 = hostName(), mall).3 AS ms,
      ms[1] AS first,
      ms[arrayFirstIndex(i -> i = length(ms) OR ms[i + 1] - ms[i] != 300, arrayEnumerate(ms))] AS last,
      greatest(1699999980000000000, toInt64(toUnixTimestamp(first)) * 1000000000 - 240000000000) AS A,

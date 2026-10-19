@@ -2543,7 +2543,11 @@ fn statement_settings(config: &TraceReadConfig) -> QuerySettings {
 fn graph_settings(config: &TraceReadConfig) -> QuerySettings {
     let base = search_settings(config);
     if config.distributed {
+        // Issue #599 part A2: with `1` the initiator's own shard runs
+        // in-process, `shardNum()` is not folded to a constant there, and
+        // that shard's span read loses its primary-key pruning.
         base.set("distributed_product_mode", "local")
+            .set("prefer_localhost_replica", 0u64)
     } else {
         base
     }
@@ -3734,6 +3738,20 @@ mod tests {
         assert!(clustered.contains("distributed_product_mode"));
         assert!(clustered.contains("local"));
         assert!(clustered.contains("optimize_skip_unused_shards"));
+    }
+
+    /// U4 (issue #599 part A2): the clustered graph read never runs the
+    /// initiator's shard in-process, and the single-node read is untouched.
+    #[test]
+    fn the_clustered_graph_read_prefers_no_local_replica() {
+        let local = graph_settings(&cfg());
+        assert_eq!(local.get("prefer_localhost_replica"), None);
+        let mut clustered = cfg();
+        clustered.distributed = true;
+        assert_eq!(
+            graph_settings(&clustered).get("prefer_localhost_replica"),
+            Some("0")
+        );
     }
 
     /// U2 (issue #599): the clustered graph's target is the first two

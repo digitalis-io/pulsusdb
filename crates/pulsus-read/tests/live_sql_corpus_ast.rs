@@ -252,7 +252,8 @@ const CONTROL: &str = "with_binding_control.txt";
 ///
 /// **Issue #599 part A moves them 96 -> 98 and 214 -> 216: the two
 /// `traces_spans_graph` goldens, one statement each.** Their `WITH` items
-/// (`ms`, `first`, `last`, `A`, `B`, `h1`, `t0`) are scalars and aliases.
+/// (`mall` in the clustered one, `ms`, `first`, `last`, `A`, `B`, `h1`,
+/// `t0`) are scalars and aliases.
 const SQL_FILES: usize = 98;
 const SQL_STATEMENTS: usize = 216;
 const PROMQL_ENTRIES: usize = 30;
