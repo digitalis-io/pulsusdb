@@ -61,6 +61,10 @@ trace_dedup=${PULSUS_TRACE_DEDUP_WINDOW:-10000}
 # `pulsus-server` holds it against the landing budget.
 dedup_window_seconds=3600
 
+# `pulsus_schema::GRAPH_JOB_MAX_ROWS`: the rows one run of the service-graph
+# job may read (issue #599). Not a knob.
+graph_job_max_rows=60000000
+
 # Names reach the server inside SQL, so they are identifiers and nothing
 # else. Refusing here is simpler than quoting, and the binary's own
 # configuration check is no wider.
@@ -195,6 +199,7 @@ render() {
             -e "s|{{log_dedup_window}}|$log_dedup|g" \
             -e "s|{{trace_dedup_window}}|$trace_dedup|g" \
             -e "s|{{dedup_window_seconds}}|$dedup_window_seconds|g" \
+            -e "s|{{graph_job_max_rows}}|$graph_job_max_rows|g" \
             -e "s|{{storage_policy}}|$policy_token|g" |
         TRACE_ATTR_INDEXES=$attr_indexes awk '{
             i = index($0, "{{trace_attr_indexes}}")

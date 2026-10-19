@@ -12,7 +12,7 @@
 -- and never add a substitution that matches one.
 --
 -- A REPLICATION PATH NAMES ITS OWN TABLE. The paths are written out rather
--- than derived, so a wrong one is a per-table error. Twenty-two tables take
+-- than derived, so a wrong one is a per-table error. Twenty-three tables take
 -- `/clickhouse/tables/{shard}/` and five take `/clickhouse/tables/all/`
 -- (docs/architecture.md §3). `tests/schema_file.rs` holds the relation.
 --
@@ -948,6 +948,62 @@ AS SELECT
     toUInt8(status_code = 2) AS failed
 FROM {{db}}.trace_spans
 WHERE (kind IN (3, 4)) OR ((kind IN (2, 5)) AND ((shared = 1) OR (parent_id != toFixedString(unhex('0000000000000000'), 8))));
+
+CREATE TABLE IF NOT EXISTS {{db}}.service_edges{{on_cluster}}
+(
+    minute DateTime('UTC') CODEC(Delta, ZSTD(1)),
+    client_minute DateTime('UTC') CODEC(Delta, ZSTD(1)),
+    client LowCardinality(String) CODEC(ZSTD(1)),
+    server LowCardinality(String) CODEC(ZSTD(1)),
+    conn_type LowCardinality(String) CODEC(ZSTD(1)),
+    calls UInt64 CODEC(ZSTD(1)),
+    failed UInt64 CODEC(ZSTD(1)),
+    q AggregateFunction(quantilesTDigest(0.5, 0.95, 0.99), Int64) CODEC(ZSTD(1)),
+    ver UInt64 CODEC(ZSTD(1))
+)
+--@single  ENGINE = ReplacingMergeTree(ver)
+--@cluster ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/{{db}}.service_edges', '{replica}', ver)
+PARTITION BY toDate(minute)
+ORDER BY (conn_type, minute, client_minute, client, server)
+TTL toDateTime(least(toUInt32(minute) - if(conn_type = '', 240, 0) + ({{retention_days}} * 86400), 4294967295))
+SETTINGS index_granularity = 1024, ttl_only_drop_parts = 1{{storage_policy}};
+
+CREATE MATERIALIZED VIEW {{db}}.service_edges_mv{{on_cluster}} REFRESH EVERY 1 MINUTE APPEND TO {{db}}.service_edges
+AS WITH (SELECT arraySort(groupArray(minute)) FROM {{db}}.service_edges FINAL WHERE conn_type = '') AS ms,
+     ms[arrayFirstIndex(i -> i = length(ms) OR ms[i + 1] - ms[i] != 300, arrayEnumerate(ms))] AS wm,
+     toStartOfInterval(now('UTC') - INTERVAL 3 MINUTE, INTERVAL 5 MINUTE) AS ready,
+     (SELECT toDateTime(min(toDate(parseDateTimeBestEffort(partition))), 'UTC') FROM system.parts WHERE database = '{{db}}' AND table = 'spans' AND active) AS oldest,
+     if(wm = 0, if(oldest = 0, ready - INTERVAL 5 MINUTE, oldest), wm + INTERVAL 1 MINUTE) AS lo,
+     least(ready, lo + INTERVAL 5 MINUTE) AS hi,
+     toInt64(toUnixTimestamp(lo)) * 1000000000 AS slo,
+     toInt64(toUnixTimestamp(hi)) * 1000000000 AS shi,
+     toUInt64(toUnixTimestamp64Milli(now64())) AS v
+SELECT * FROM (
+SELECT toDateTime(intDiv(s.6, 60000000000) * 60, 'UTC') AS minute, toDateTime(intDiv(c.4, 60000000000) * 60, 'UTC') AS client_minute,
+       c.1 AS client, s.2 AS server, if(c.3 = 3, 'rpc', 'messaging') AS conn_type,
+       count() AS calls, countIf(s.3 = 2 OR c.2 = 2) AS failed,
+       quantilesTDigestState(0.5, 0.95, 0.99)(s.4) AS q, v AS ver
+FROM (SELECT trace_id,
+        if(kind IN (3, 4) OR attrs.`zipkin%2Eshared`.:String = 'true', span_id, parent_span_id) AS k,
+        anyIf((service, status_code, kind, start_ns), kind IN (3, 4)) AS c,
+        countIf(kind IN (3, 4)) AS nc,
+        groupArrayIf((span_id, service, status_code, duration_ns, kind, start_ns), kind IN (2, 5)) AS ss
+ FROM {{db}}.spans
+ WHERE start_ns >= slo - 60000000000 AND start_ns < shi + 60000000000
+   AND intDiv(start_ns, 300000000000) BETWEEN intDiv(slo - 60000000000, 300000000000) AND intDiv(shi + 59999999999, 300000000000)
+   AND ((kind IN (2, 5) AND start_ns >= slo AND start_ns < shi) OR kind IN (3, 4))
+ GROUP BY trace_id, k
+ HAVING nc > 0)
+ARRAY JOIN arrayDistinct(ss) AS s
+WHERE ((c.3 = 3 AND s.5 = 2) OR (c.3 = 4 AND s.5 = 5)) AND shi > slo
+GROUP BY minute, client_minute, client, server, conn_type
+UNION ALL
+SELECT hi - INTERVAL 1 MINUTE, hi - INTERVAL 1 MINUTE, '', '', '', 0, 0, quantilesTDigestState(0.5, 0.95, 0.99)(toInt64(0)), v
+FROM system.one
+HAVING hi > lo)
+ORDER BY conn_type = '', minute, client_minute, client, server, conn_type
+SETTINGS max_threads = 4, max_memory_usage = 4294967296, max_rows_to_read = {{graph_job_max_rows}}, read_overflow_mode = 'throw', max_execution_time = 50,
+         max_insert_threads = 1, max_insert_block_size = 100000000, min_insert_block_size_rows = 100000000, min_insert_block_size_bytes = 10000000000;
 
 CREATE MATERIALIZED VIEW {{db}}.trace_error_spans_mv{{on_cluster}} TO {{db}}.trace_error_spans
 AS SELECT

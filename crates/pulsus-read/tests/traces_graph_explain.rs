@@ -1,7 +1,9 @@
 //! Issue #173 (M7-E1) AC7/AC-new: live Tier-1 gates for the service-graph
 //! read against ClickHouse 26.3 (scale-invariant ratios only — no
-//! wall-time asserts). Seeds a multi-day `trace_edges` corpus through the
-//! ingest MV (spans → `trace_edges_mv` → `trace_edges`), then proves:
+//! wall-time asserts). Seeds a multi-day corpus through the product's
+//! writers — the old tables (spans → `trace_edges_mv` → `trace_edges`) and
+//! `trace_landing` (→ `spans_mv` → `spans`, which the service graph reads
+//! since issue #599) — then proves:
 //!
 //! - **AC7(a) — daily-partition MinMax prune:** a narrow (1-day) window
 //!   selects strictly fewer parts than the full-range window on the same
@@ -14,8 +16,9 @@
 //!   expression is `Array(Float64)` on the pinned server (loud on drift),
 //!   and the whole `GraphEdgeRow` decodes into `Vec<f64>` through the real
 //!   `TraceEngine::service_graph`.
-//! - **Determinism:** the engine's edges are byte-identical before and
-//!   after `OPTIMIZE TABLE trace_edges FINAL` (merge invariance).
+//! - **Determinism:** the engine's edges, `calls` and `failed` are identical
+//!   before and after `OPTIMIZE TABLE spans FINAL`, the quantiles within
+//!   their band (merge invariance).
 //! - **Scan-budget 422:** a tiny `scan_budget_rows` trips code 158 →
 //!   `TooBroadReason::TraceScanBudgetRows`.
 //!
@@ -91,48 +94,142 @@ async fn exec(client: &ChClient, sql: &str) {
         .unwrap_or_else(|e| panic!("execute failed: {e}\nSQL:\n{sql}"));
 }
 
-/// Seeds `PAIRS` client(kind 3)/server(kind 2) span pairs into
-/// `trace_spans` — the `trace_edges_mv` populates `trace_edges` with the
-/// half-rows. Each pair's timestamp is `(number % DAYS)` whole days before
-/// `anchor`, so the ledger spans `DAYS` daily partitions.
+/// Seeds `PAIRS` client(kind 3)/server(kind 2) span pairs through the
+/// product's writers, as `traces_query_v2_live.rs`'s `land_both` does: the
+/// old tables through `TraceWriter` (so `trace_edges_mv` fills
+/// `trace_edges`, which the AC7 gates read) and `trace_landing` (so
+/// `spans_mv` fills `spans`, which the service graph reads since issue
+/// #599). Each pair's timestamp is `(number % DAYS)` whole days before
+/// `anchor`, so both stores span `DAYS` daily partitions; 1 % of the server
+/// halves carry status error.
 async fn seed_pairs(client: &ChClient, anchor_ns: i64) {
-    // Client halves (kind 3, service 'client-svc'): pair_id = own span_id.
-    // Ids start at `number + 1` so no span_id is the all-zero root sentinel
-    // (which would make its server partner look like a root and drop it).
-    exec(
-        client,
-        &format!(
-            "INSERT INTO {DB}.trace_spans \
-             (trace_id, span_id, parent_id, name, service, timestamp_ns, duration_ns, \
-              status_code, kind, payload_type, payload) \
-             SELECT toFixedString(unhex(leftPad(lower(hex(number + 1)), 32, '0')), 16), \
-                    toFixedString(unhex(leftPad(lower(hex(number + 1)), 16, '0')), 8), \
-                    toFixedString(unhex('0000000000000000'), 8), \
-                    'op', 'client-svc', \
-                    {anchor_ns} - toInt64(number % {DAYS}) * {DAY_NS}, \
-                    toInt64(number % 1000) * 100000, 0, 3, 1, 'p' \
-             FROM numbers({PAIRS})"
-        ),
-    )
-    .await;
-    // Server halves (kind 2, service 'server-svc'): parent_id = the client's
-    // span_id (same `number`), status 500 on 1% (failed edges).
-    exec(
-        client,
-        &format!(
-            "INSERT INTO {DB}.trace_spans \
-             (trace_id, span_id, parent_id, name, service, timestamp_ns, duration_ns, \
-              status_code, kind, payload_type, payload) \
-             SELECT toFixedString(unhex(leftPad(lower(hex(number + 1)), 32, '0')), 16), \
-                    toFixedString(unhex(leftPad(lower(hex(number + 1 + {PAIRS})), 16, '0')), 8), \
-                    toFixedString(unhex(leftPad(lower(hex(number + 1)), 16, '0')), 8), \
-                    'op', 'server-svc', \
-                    {anchor_ns} - toInt64(number % {DAYS}) * {DAY_NS}, \
-                    toInt64(number % 1000) * 100000, if(number % 100 = 0, 2, 0), 2, 1, 'p' \
-             FROM numbers({PAIRS})"
-        ),
-    )
-    .await;
+    use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+    use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
+    use opentelemetry_proto::tonic::resource::v1::Resource;
+    use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, Status};
+    use pulsus_write::writer::{ChBlockInserter, TraceWriter, TraceWriterTables};
+    use pulsus_write::{ParsedTraceLanding, PushHeaders, TraceLandingRow, TraceSink};
+    use std::sync::Arc;
+
+    const CHUNK: u64 = 10_000;
+    let writer_client = Arc::new(
+        ChClient::new(test_config(&DB))
+            .await
+            .expect("connect the writer"),
+    );
+    let mut cfg = pulsus_config::WriterConfig::default();
+    cfg.batch_bytes.0 = 1;
+    let writer = TraceWriter::with_inserters_with_tables(
+        Arc::new(ChBlockInserter::new(writer_client.clone())),
+        Arc::new(ChBlockInserter::new(writer_client.clone())),
+        Arc::new(ChBlockInserter::new(writer_client.clone())),
+        &cfg,
+        TraceWriterTables::traces_default(),
+    );
+    let id = |n: u64, bytes: usize| -> Vec<u8> {
+        let mut v = vec![0u8; bytes];
+        v[bytes - 8..].copy_from_slice(&n.to_be_bytes());
+        v
+    };
+    let resource = |service: &str, spans: Vec<Span>| ResourceSpans {
+        resource: Some(Resource {
+            attributes: vec![KeyValue {
+                key: "service.name".to_string(),
+                value: Some(AnyValue {
+                    value: Some(any_value::Value::StringValue(service.to_string())),
+                }),
+                ..KeyValue::default()
+            }],
+            dropped_attributes_count: 0,
+            entity_refs: Vec::new(),
+        }),
+        scope_spans: vec![ScopeSpans {
+            scope: None,
+            spans,
+            schema_url: String::new(),
+        }],
+        schema_url: String::new(),
+    };
+    let mut from = 0;
+    while from < PAIRS {
+        let to = (from + CHUNK).min(PAIRS);
+        let mut clients = Vec::new();
+        let mut servers = Vec::new();
+        for number in from..to {
+            // Ids start at `number + 1`, so no span id is all zeros.
+            let at = u64::try_from(
+                anchor_ns - i64::try_from(number % DAYS as u64).expect("small") * DAY_NS,
+            )
+            .expect("a post-epoch fixture");
+            let duration = (number % 1000) * 100_000;
+            let span = |span_id: Vec<u8>, parent: Vec<u8>, kind: i32, error: bool| Span {
+                trace_id: id(number + 1, 16),
+                span_id,
+                parent_span_id: parent,
+                name: "op".to_string(),
+                kind,
+                start_time_unix_nano: at,
+                end_time_unix_nano: at + duration,
+                status: error.then(|| Status {
+                    code: 2,
+                    message: String::new(),
+                }),
+                ..Span::default()
+            };
+            clients.push(span(id(number + 1, 8), Vec::new(), 3, false));
+            servers.push(span(
+                id(number + 1 + PAIRS, 8),
+                id(number + 1, 8),
+                2,
+                number % 100 == 0,
+            ));
+        }
+        let req = ExportTraceServiceRequest {
+            resource_spans: vec![
+                resource("client-svc", clients),
+                resource("server-svc", servers),
+            ],
+        };
+        let parsed = pulsus_write::parse_traces(&req, now_ns()).expect("the old path parses");
+        let wait = writer
+            .admit_flush(
+                parsed,
+                ParsedTraceLanding::default(),
+                PushHeaders::default(),
+            )
+            .expect("the queue has room");
+        tokio::time::timeout(Duration::from_secs(120), wait)
+            .await
+            .expect("the old path's flush settles")
+            .expect("the old path commits");
+        let landing =
+            pulsus_write::parse_trace_landing(&req, now_ns()).expect("the landing decode");
+        let received_ms = now_ns() / 1_000_000;
+        let mut rows: Vec<TraceLandingRow> = Vec::new();
+        rows.extend(
+            landing
+                .spans
+                .iter()
+                .cloned()
+                .map(|s| TraceLandingRow::span(received_ms, s)),
+        );
+        rows.extend(
+            landing
+                .resources
+                .iter()
+                .cloned()
+                .map(|r| TraceLandingRow::resource(received_ms, r)),
+        );
+        client
+            .insert_block_with(
+                "trace_landing",
+                &rows,
+                &QuerySettings::trace_landing_insert(&format!("graph-explain-{from}"), 1_048_576),
+            )
+            .await
+            .expect("the landing insert");
+        from = to;
+    }
 }
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -374,7 +471,7 @@ async fn service_graph_tier1_gates() {
     );
     assert!(edge.quantiles_ns.iter().all(|q| q.is_finite()));
 
-    exec(&client, &format!("OPTIMIZE TABLE {DB}.trace_edges FINAL")).await;
+    exec(&client, &format!("OPTIMIZE TABLE {DB}.spans FINAL")).await;
     let after = engine
         .service_graph(full)
         .await

@@ -2232,7 +2232,7 @@ never treat it as zero cost.
 
 **A third trap, and it is the one that decided an architectural question.** Our reader sends
 `max_block_size = 4096` on every search statement — `TRACE_SEARCH_MAX_BLOCK_ROWS: u64 = 4096`
-(`crates/pulsus-read/src/traces/exec.rs:113`), set in `search_settings` (`:2104`) and inherited by
+(`crates/pulsus-read/src/traces/exec.rs:113`), set in `search_settings` (`:2208`) and inherited by
 `generator_settings` (`:3267` @ 1cdb3e5e). ClickHouse 26.3.29.7's own default is **65,409**
 (`SELECT value, default FROM system.settings WHERE name = 'max_block_size'` prints `65409 65409`).
 A measurement taken at the server default is a measurement of a system we do not run, and the
@@ -2279,7 +2279,7 @@ So a re-take at the default **refuses a statement the shipped reader would run**
 metered column by anywhere between 0% and 48% on the same statement. Two competent
 measurements of §9.7's headline figure landed a factor of 4.7 apart for exactly this reason, and
 neither was wrong about what it measured. `search_settings_pin_the_layer_1_budget_contract`
-(`crates/pulsus-read/src/traces/exec.rs:4069`) is what keeps 4,096 shipped: it asserts that the
+(`crates/pulsus-read/src/traces/exec.rs:4232`) is what keeps 4,096 shipped: it asserts that the
 rendered search settings contain the substring `max_block_size` and the substring `4096` — as two
 independent substring checks, not bound to each other, so it would not catch a different value
 arriving beside a stray `4096`.
@@ -2403,7 +2403,7 @@ beside the figures they govern rather than once here, and this list is the index
 | `optimize_aggregation_in_order` | **1**, named on the rows that need it | it is what lets the span-ordered index stream the aggregation instead of holding a hash table over every span-group. On the current index order it buys nothing, because `(trace_id, span_id)` is not a prefix of that sorting key |
 | `max_memory_usage` | **536870912** | the shipped `reader.traceql_generator_max_memory_bytes` (`crates/pulsus-config/src/model.rs:669`), applied by `generator_settings` (`exec.rs:3267` @ 1cdb3e5e) |
 | `max_bytes_before_external_group_by` | **0** | shipped: the generator throws rather than spilling (`exec.rs:3267`) |
-| `max_rows_to_read` | **50000000** shipped, **200000000** in the raised-budget rows | `reader.traceql_scan_budget_rows` (`model.rs:698` @ 1cdb3e5e), carried with `read_overflow_mode = throw` by `search_settings` (`exec.rs:2100-2106`) |
+| `max_rows_to_read` | **50000000** shipped, **200000000** in the raised-budget rows | `reader.traceql_scan_budget_rows` (`model.rs:698` @ 1cdb3e5e), carried with `read_overflow_mode = throw` by `search_settings` (`exec.rs:2204-2210`) |
 | `min_bytes_for_wide_part` | **10485760** | pinned in the corpus recipe so the part format is reproducible; ClickHouse's own 26.3 default happens to be the same value, and neither trace `CREATE TABLE` pins it |
 
 **The rule this section follows: every metered figure carries its instrument beside the number.**
@@ -2437,7 +2437,7 @@ between two takes, is over statements and granules. Rows read and metered bytes 
 rather than checked, and they are outside it because they were measured to be, not because
 excluding them was convenient.**
 
-`search_settings_pin_the_layer_1_budget_contract` (`crates/pulsus-read/src/traces/exec.rs:4069`)
+`search_settings_pin_the_layer_1_budget_contract` (`crates/pulsus-read/src/traces/exec.rs:4232`)
 is what keeps 4,096 shipped, and it is worth knowing exactly how much it keeps: it asserts that the
 rendered search settings contain the substring `max_block_size` and the substring `4096`, as two
 independent checks that are not bound to each other. It would not catch a different block size
@@ -4050,7 +4050,11 @@ at line 11). The committed goldens below carry a join and **none is planned by t
 
 - `traces_graph/clustered_local_join.sql` and `traces_graph/single_node.sql`, one join line each,
   from `service_graph_sql` (`crates/pulsus-read/src/traces/graph_sql.rs:92`, `INNER JOIN` at 109),
-  called from `crates/pulsus-read/src/traces/exec.rs:1618` and nowhere else.
+  which no route calls since issue #599; #602 deletes it.
+- `traces_spans_graph/clustered.sql` and `traces_spans_graph/single_node.sql`, one `ARRAY JOIN`
+  line each, from `spans_graph_sql` (`crates/pulsus-read/src/traces/spans/graph.rs:131`), the
+  service graph's statement since issue #599, called from
+  `crates/pulsus-read/src/traces/exec.rs:1688` and nowhere else.
 - `traces_metrics/compare_outer_attr.sql`, `traces_metrics/compare_status.sql` and
   `traces_metrics/compare_status_window.sql`, seven join lines each. The first was added by issue
   [#559](https://github.com/digitalis-io/pulsusdb/issues/559) — a comparison whose OUTER filter is
@@ -5535,15 +5539,15 @@ The block below, tables and sentences alike, is rendered from the two citation d
 
 | quantity | at this revision |
 |---|---|
-| citation occurrences in the five artefacts | 668 |
+| citation occurrences in the five artefacts | 669 |
 | of those, citing a bare basename | 482 |
 | of those, written as a continuation of a citation earlier in the paragraph | 70 |
 | of those continuations, on a later line than the citation they continue | 30 |
-| `(document, token)` pairs the rule resolves | 287 |
-| occurrences those resolved pairs cover | 394 |
+| `(document, token)` pairs the rule resolves | 288 |
+| occurrences those resolved pairs cover | 395 |
 | `(document, token)` pairs it cannot resolve | 174 |
 | occurrences those frozen pairs cover | 274 |
-| resolved rows anchored on a token the citing prose prints | 155 |
+| resolved rows anchored on a token the citing prose prints | 156 |
 | resolved rows anchored on a snapshot of the cited line | 132 |
 
 | reason it cannot be resolved | pairs | what it means |
@@ -5563,7 +5567,7 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | `prose` | a token the citing prose prints, so the claim and its evidence are reviewable side by side |
 | `line` | a snapshot of the cited line, taken because the citing prose prints no such token: it detects the line moving or changing and cannot show the citation means the right thing |
 
-Of the 668 citation occurrences the five artefacts make, 482 name a bare basename and 70 are written as a continuation of a citation earlier on the same line. The rule resolves 287 `(document, token)` pairs covering 394 occurrences, and cannot resolve 174 covering 274. Of the resolved rows, 155 are anchored on a token the citing prose prints and 132 on a snapshot of the cited line.
+Of the 669 citation occurrences the five artefacts make, 482 name a bare basename and 70 are written as a continuation of a citation earlier on the same line. The rule resolves 288 `(document, token)` pairs covering 395 occurrences, and cannot resolve 174 covering 274. Of the resolved rows, 156 are anchored on a token the citing prose prints and 132 on a snapshot of the cited line.
 
 The language fallback and the anchor rule disagree on 2 citations, all of them read one at a time. 1 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
 
@@ -5571,7 +5575,7 @@ The citations pointing at an empty line are `crates/pulsus-read/src/traces/metri
 
 The citations the rule answers differently for two occurrences of are .
 
-The citations where the fallback answers a file the citing prose does not describe are `exec.rs:2100-2106` in `docs/query-lowering.md`. Each is named with its reasoning in `REVIEWED_FALLBACK_DIVERGENCES`, and the test prints them when it runs.
+The citations where the fallback answers a file the citing prose does not describe are `exec.rs:2204-2210` in `docs/query-lowering.md`. Each is named with its reasoning in `REVIEWED_FALLBACK_DIVERGENCES`, and the test prints them when it runs.
 
 <!-- end generated -->
 

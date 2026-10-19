@@ -136,6 +136,7 @@ pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
         trace_landing_retention_hours: 6,
         trace_dedup_window: 10_000,
         trace_indexed_attributes: Vec::new(),
+        graph_job_max_rows: pulsus_schema::GRAPH_JOB_MAX_ROWS,
     };
 
     // Frozen once, for the whole run — see `now_unix_ns`'s doc comment.

@@ -3709,7 +3709,7 @@ a divergence at a public surface, found while implementing the cap.
     pins alias/native identity on a short query and pins the over-cap
     rejection of that same handler directly in `stats.rs`.
   - *Over a real socket* (`axum::serve` + default hyper h1 — the exact
-    configuration `crates/pulsus-server/src/serve.rs:225,237` runs in
+    configuration `crates/pulsus-server/src/serve.rs:226,238` runs in
     production): a 65,534-byte request-target reaches the handler
     (`200`); at 65,535 bytes hyper answers **`HTTP/1.1 414 URI Too
     Long`** with `content-length: 0` and `connection: close`, before

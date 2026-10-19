@@ -54,6 +54,11 @@ pub(crate) struct AppState {
     /// `MetricsEngine`) because the engine is rebuilt per request via
     /// `engine_for`→`chconfig::metrics_engine`, so an engine-local gate
     /// would reset every query and bound nothing.
+    /// Issue #599: the clustered service graph's target, read once per
+    /// process. Lives here for `eval_gate`'s reason: `engine_for` builds a
+    /// `TraceEngine` per request, so an engine-local cache would read the
+    /// target on every request.
+    pub(crate) graph_target: pulsus_read::GraphTargetCache,
     pub(crate) eval_gate: Arc<pulsus_read::EvalGate>,
     pub(crate) started_at: std::time::SystemTime,
     /// The live-tail runtime bundle (issue #74): the process shutdown
@@ -195,6 +200,7 @@ mod tests {
             metric_writer: Arc::new(MetricWriterSink::new(Arc::new(std::sync::OnceLock::new()))),
             trace_writer: Arc::new(TraceWriterSink::new(Arc::new(std::sync::OnceLock::new()))),
             label_cache: Arc::new(std::sync::OnceLock::new()),
+            graph_target: pulsus_read::GraphTargetCache::default(),
             eval_gate: Arc::new(pulsus_read::EvalGate::new(
                 pulsus_config::Config::default()
                     .reader

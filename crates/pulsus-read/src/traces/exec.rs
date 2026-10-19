@@ -54,7 +54,7 @@ use super::spans::rows::{
 };
 
 use super::rows::{
-    CompareCrossTabRow, CompareTotalsRow, GraphEdgeRow, MetricAggGroupInstantRow,
+    CompareCrossTabRow, CompareTotalsRow, GraphEdgeRow, GraphTargetRow, MetricAggGroupInstantRow,
     MetricAggGroupRow, MetricAggInstantRow, MetricAggRow, MetricBucketRow,
     MetricCompareExemplarRow, MetricCountRow, MetricExemplarRow, MetricGroupCountInstantRow,
     MetricGroupCountRow, MetricGroupExemplarRow, MetricLog2BucketInstantRow, MetricLog2BucketRow,
@@ -351,6 +351,59 @@ pub struct ServiceGraph {
     pub edges: Vec<GraphEdgeRow>,
     pub truncated: bool,
 }
+
+/// The cluster and database the clustered service graph reads (issue
+/// #599): the first two arguments of the `Distributed(…)` definition of the
+/// reader's `spans` routing table, so the graph reads the target the other
+/// trace routes read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphTarget {
+    pub cluster: String,
+    pub database: String,
+}
+
+/// The [`GraphTarget`] a routing table's `system.tables.engine_full`
+/// names: `Distributed('<cluster>', '<database>', …)`, both arguments
+/// quoted, as the server writes them. `None` for anything else.
+pub fn graph_target_from_engine(engine_full: &str) -> Option<GraphTarget> {
+    let rest = engine_full.strip_prefix("Distributed(")?;
+    let (cluster, rest) = quoted_argument(rest)?;
+    let rest = rest.strip_prefix(", ")?;
+    let (database, rest) = quoted_argument(rest)?;
+    if !(rest.starts_with(',') || rest.starts_with(')')) {
+        return None;
+    }
+    Some(GraphTarget { cluster, database })
+}
+
+/// The single-quoted literal `s` starts with, unescaped, and what follows
+/// it; `None` when `s` does not start with one or it is empty.
+fn quoted_argument(s: &str) -> Option<(String, &str)> {
+    let body = s.strip_prefix('\'')?;
+    let mut out = String::new();
+    let mut chars = body.char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\\' => out.push(chars.next()?.1),
+            '\'' => {
+                if out.is_empty() {
+                    return None;
+                }
+                return Some((out, &body[i + 1..]));
+            }
+            other => out.push(other),
+        }
+    }
+    None
+}
+
+/// The process-wide [`GraphTarget`], read once (issue #599).
+///
+/// The server builds a [`TraceEngine`] per request, so the cache lives in
+/// the server's shared state and is handed to each engine; cloning shares
+/// it. A failed read leaves it empty, and the next request reads again.
+#[derive(Debug, Clone, Default)]
+pub struct GraphTargetCache(std::sync::Arc<tokio::sync::OnceCell<GraphTarget>>);
 
 /// [`TraceEngine::list_tag_names`]'s output (issue #58): distinct
 /// `(scope, key)` pairs in the catalog's own `(scope, key)` order, at
@@ -659,6 +712,8 @@ pub struct TraceEngine {
     /// The ceiling on `R`, the newest spans a span-name or narrowed-values
     /// read reaches back to (issue #598 part 2a).
     tag_read_rows: u64,
+    /// The clustered service graph's target, shared across engines.
+    graph_target: GraphTargetCache,
 }
 
 impl TraceEngine {
@@ -668,7 +723,16 @@ impl TraceEngine {
             config,
             indexed: Vec::new(),
             tag_read_rows: TAG_STORE_READ_ROWS,
+            graph_target: GraphTargetCache::default(),
         }
+    }
+
+    /// Shares `cache` as this engine's [`GraphTarget`] cache (issue #599):
+    /// the server hands every per-request engine the one process-wide
+    /// cache, so the target is read once per process.
+    pub fn with_graph_target_cache(mut self, cache: GraphTargetCache) -> Self {
+        self.graph_target = cache;
+        self
     }
 
     /// Lowers the ceiling on `R`, the spans a span-name or narrowed-values
@@ -1615,8 +1679,13 @@ impl TraceEngine {
     /// `OPTIMIZE ... FINAL`.
     pub async fn service_graph(&self, window: GraphWindow) -> Result<ServiceGraph, ReadError> {
         let cap = graph_sql::SERVICE_GRAPH_MAX_EDGES;
-        let sql = graph_sql::service_graph_sql(window, &self.config.edges_table, cap);
         let settings = graph_settings(&self.config);
+        let target = if self.config.distributed {
+            Some(self.graph_target(&settings).await?)
+        } else {
+            None
+        };
+        let sql = super::spans::graph::spans_graph_sql(window, target, cap);
         let mut edges: Vec<GraphEdgeRow> = Vec::new();
         // Scoped stream (module convention): the pooled-connection lease
         // drops at return, after full consumption (≤ cap + 1 rows by the SQL
@@ -1633,6 +1702,41 @@ impl TraceEngine {
         let truncated = edges.len() as u64 > cap;
         edges.truncate(cap as usize);
         Ok(ServiceGraph { edges, truncated })
+    }
+
+    /// The clustered service graph's [`GraphTarget`] (issue #599): read
+    /// from the routing table's definition on the first call in the
+    /// process, under the request's id and settings, and kept in the
+    /// shared [`GraphTargetCache`]. A definition that names no target fails
+    /// the request and keeps nothing, so the next call reads it again.
+    async fn graph_target(&self, settings: &QuerySettings) -> Result<&GraphTarget, ReadError> {
+        self.graph_target
+            .0
+            .get_or_try_init(|| async {
+                let table = &self.config.spans_v2_table;
+                let sql = super::spans::graph::graph_target_sql(table);
+                let mut stream = self
+                    .dispatch
+                    .query_stream::<GraphTargetRow, _>(&sql, settings, |e| {
+                        map_trace_read_error(e, &self.config)
+                    })
+                    .await?;
+                let mut definition = None;
+                while let Some(row) = stream.next().await {
+                    let row = row.map_err(|e| map_trace_read_error(e, &self.config))?;
+                    definition.get_or_insert(row.engine_full);
+                }
+                definition
+                    .as_deref()
+                    .and_then(graph_target_from_engine)
+                    .ok_or_else(|| {
+                        ReadError::Clickhouse(super::spans::graph::no_graph_target(
+                            table,
+                            definition.as_deref(),
+                        ))
+                    })
+            })
+            .await
     }
 
     /// Fetches one trace from the span, per-trace and resource tables
@@ -2439,7 +2543,11 @@ fn statement_settings(config: &TraceReadConfig) -> QuerySettings {
 fn graph_settings(config: &TraceReadConfig) -> QuerySettings {
     let base = search_settings(config);
     if config.distributed {
+        // Issue #599 part A2: with `1` the initiator's own shard runs
+        // in-process, `shardNum()` is not folded to a constant there, and
+        // that shard's span read loses its primary-key pruning.
         base.set("distributed_product_mode", "local")
+            .set("prefer_localhost_replica", 0u64)
     } else {
         base
     }
@@ -3630,6 +3738,61 @@ mod tests {
         assert!(clustered.contains("distributed_product_mode"));
         assert!(clustered.contains("local"));
         assert!(clustered.contains("optimize_skip_unused_shards"));
+    }
+
+    /// U4 (issue #599 part A2): the clustered graph read never runs the
+    /// initiator's shard in-process, and the single-node read is untouched.
+    #[test]
+    fn the_clustered_graph_read_prefers_no_local_replica() {
+        let local = graph_settings(&cfg());
+        assert_eq!(local.get("prefer_localhost_replica"), None);
+        let mut clustered = cfg();
+        clustered.distributed = true;
+        assert_eq!(
+            graph_settings(&clustered).get("prefer_localhost_replica"),
+            Some("0")
+        );
+    }
+
+    /// U2 (issue #599): the clustered graph's target is the first two
+    /// quoted arguments of the routing table's `Distributed(…)` definition,
+    /// as `system.tables.engine_full` spells it, and nothing else is a
+    /// target.
+    #[test]
+    fn the_graph_target_comes_from_the_distributed_definition() {
+        let target = |c: &str, d: &str| GraphTarget {
+            cluster: c.to_string(),
+            database: d.to_string(),
+        };
+        for (engine_full, want) in [
+            (
+                "Distributed('c1', 'pulsus', 'spans', cityHash64(trace_id))",
+                Some(target("c1", "pulsus")),
+            ),
+            (
+                "Distributed('c1', 'pulsus', 'spans', cityHash64(trace_id)) \
+                 SETTINGS fsync_after_insert = 1, fsync_directories = 1",
+                Some(target("c1", "pulsus")),
+            ),
+            (
+                "Distributed('q', 'store', 'spans')",
+                Some(target("q", "store")),
+            ),
+            (
+                "ReplacingMergeTree PARTITION BY toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') \
+                 ORDER BY (intDiv(start_ns, 300000000000), trace_id)",
+                None,
+            ),
+            ("MergeTree", None),
+            ("Distributed(c1)", None),
+            ("", None),
+        ] {
+            assert_eq!(
+                graph_target_from_engine(engine_full),
+                want,
+                "the target named by {engine_full:?}"
+            );
+        }
     }
 
     /// Issue #133 AC5: `search_settings` and `catalog_settings` carry

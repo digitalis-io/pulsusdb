@@ -1,5 +1,5 @@
 //! Token substitution for `schema/schema.sql`: explicit `{{token}}` string
-//! replacement, sixteen names and nothing else.
+//! replacement, eighteen names and nothing else.
 //!
 //! **Double braces, always.** ClickHouse's own `{shard}` and `{replica}`
 //! macros are single-brace and must survive verbatim into `Replicated*`
@@ -64,7 +64,16 @@ pub struct RenderCtx {
     /// `span.<key>` / `event.<key>` items, each rendered into one index on
     /// `spans` by `{{trace_attr_indexes}}`.
     pub trace_indexed_attributes: Vec<String>,
+    /// `{{graph_job_max_rows}}` (issue #599): the rows one run of the
+    /// service-graph job may read. Not a setting: production renders
+    /// [`GRAPH_JOB_MAX_ROWS`], and a test lowers it to make a run fail.
+    pub graph_job_max_rows: u64,
 }
+
+/// The rows one run of the service-graph job may read (issue #599), the
+/// value `schema/schema.sh` renders: three 5-minute buckets of spans at
+/// about 67,000 spans a second on one shard.
+pub const GRAPH_JOB_MAX_ROWS: u64 = 60_000_000;
 
 impl RenderCtx {
     /// A context for a test: `db` as given, every other field at the value
@@ -90,6 +99,7 @@ impl RenderCtx {
             trace_landing_retention_hours: 6,
             trace_dedup_window: 10_000,
             trace_indexed_attributes: Vec::new(),
+            graph_job_max_rows: GRAPH_JOB_MAX_ROWS,
         }
     }
 }
@@ -121,7 +131,8 @@ pub fn rollup_suffix(d: Duration) -> String {
 /// ClickHouse's own single-brace `{shard}`/`{replica}` macros — they are
 /// simply absent from double-brace matching.
 ///
-/// `schema.sh` carries the same list as sixteen `sed` expressions;
+/// `schema.sh` carries the same list as seventeen `sed` expressions and an
+/// `awk` step;
 /// `the_script_renders_exactly_what_this_crate_renders` holds the two
 /// together.
 pub(crate) fn substitute_tokens(tmpl: &str, ctx: &RenderCtx) -> String {
@@ -168,6 +179,10 @@ pub(crate) fn substitute_tokens(tmpl: &str, ctx: &RenderCtx) -> String {
         .replace(
             "{{dedup_window_seconds}}",
             &crate::checks::DEDUP_WINDOW_SECONDS.to_string(),
+        )
+        .replace(
+            "{{graph_job_max_rows}}",
+            &ctx.graph_job_max_rows.to_string(),
         )
         .replace("{{storage_policy}}", &storage_policy)
         .replace("{{trace_attr_indexes}}", &trace_attr_indexes(ctx))
@@ -246,6 +261,7 @@ mod tests {
             trace_landing_retention_hours: 6,
             trace_dedup_window: 10_000,
             trace_indexed_attributes: Vec::new(),
+            graph_job_max_rows: GRAPH_JOB_MAX_ROWS,
         }
     }
 

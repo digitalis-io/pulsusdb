@@ -190,6 +190,7 @@ pub(crate) fn schema_params_from(config: &Config) -> SchemaParams {
         trace_landing_retention_hours: config.trace_landing_retention_hours,
         trace_dedup_window: config.trace_dedup_window,
         trace_indexed_attributes: config.traceql_indexed_attributes.clone(),
+        graph_job_max_rows: pulsus_schema::GRAPH_JOB_MAX_ROWS,
     }
 }
 
@@ -478,17 +479,22 @@ pub(crate) fn trace_read_config_from(config: &Config) -> TraceReadConfig {
 }
 
 /// Builds a [`TraceEngine`] over `pool`, mirroring [`logql_engine`]'s
-/// "shared pool, no second connection" contract.
-pub(crate) fn trace_engine(pool: Arc<ChPool>, config: &Config) -> Result<TraceEngine, ChError> {
+/// "shared pool, no second connection" contract, with the process's one
+/// service-graph target cache (issue #599).
+pub(crate) fn trace_engine(
+    pool: Arc<ChPool>,
+    config: &Config,
+    graph_target: pulsus_read::GraphTargetCache,
+) -> Result<TraceEngine, ChError> {
     let client = ChClient::from_shared_pool(pool, config.query_timeout.0)
         .with_consistency(consistency_from(config))?;
-    Ok(
-        TraceEngine::new(client, trace_read_config_from(config)).with_indexed_attrs(
+    Ok(TraceEngine::new(client, trace_read_config_from(config))
+        .with_indexed_attrs(
             pulsus_read::traces::spans::attr_index::IndexedAttr::from_config(
                 &config.traceql_indexed_attributes,
             ),
-        ),
-    )
+        )
+        .with_graph_target_cache(graph_target))
 }
 
 #[cfg(test)]
@@ -640,6 +646,16 @@ mod tests {
         let params = schema_params_from(&config);
         assert_eq!(params.db, "pulsus");
         assert_eq!(params.cluster.as_deref(), Some("prod"));
+    }
+
+    /// U2 (issue #599): production renders the service-graph job's row
+    /// ceiling at the value `schema/schema.sh` renders, 60,000,000.
+    #[test]
+    fn the_schema_params_carry_the_job_row_cap() {
+        assert_eq!(
+            schema_params_from(&Config::default()).graph_job_max_rows,
+            60_000_000
+        );
     }
 
     #[test]

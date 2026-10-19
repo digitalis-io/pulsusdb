@@ -769,7 +769,7 @@ fn golden_root() -> PathBuf {
 /// The committed goldens that carry a join today, none of which the
 /// compile core plans. The list is asserted as an EQUALITY, not used as
 /// a skip list: a join in any file it does not name fails this test.
-const JOINS_OUTSIDE_THE_COMPILED_SEARCH_CORPUS: [&str; 48] = [
+const JOINS_OUTSIDE_THE_COMPILED_SEARCH_CORPUS: [&str; 50] = [
     "traces_graph/clustered_local_join.sql",
     "traces_graph/single_node.sql",
     // Issue #559 added this comparison golden; a comparison cross-tab
@@ -781,6 +781,12 @@ const JOINS_OUTSIDE_THE_COMPILED_SEARCH_CORPUS: [&str; 48] = [
     "traces_metrics/compare_status_window.sql",
     "traces_metrics_base/compare_status.sql",
     "traces_metrics_base/compare_status_window.sql",
+    // Issue #599: the service graph's statement pairs a raw region's
+    // spans by `ARRAY JOIN` over each key's server halves, an array of the
+    // grouped row itself; built by `spans::graph::spans_graph_sql`, which
+    // the compile core does not plan.
+    "traces_spans_graph/clustered.sql",
+    "traces_spans_graph/single_node.sql",
     // Issue #596 part 1: the metrics statement's `ARRAY JOIN` expands a
     // series' cells, or a bucket's quantiles, into rows — an array of the
     // row itself, not a second table. It is the design's own statement,
@@ -864,9 +870,12 @@ const JOINS_OUTSIDE_THE_COMPILED_SEARCH_CORPUS: [&str; 48] = [
 ///
 /// ```text
 /// file                                           emitted by                        current?
-/// traces_graph/clustered_local_join.sql          service_graph_sql                 current
-/// traces_graph/single_node.sql                   (graph_sql.rs:92, INNER JOIN
+/// traces_graph/clustered_local_join.sql          service_graph_sql                 no route
+/// traces_graph/single_node.sql                   (graph_sql.rs:92, INNER JOIN      since #599
 ///                                                at 109) — one join line each
+/// traces_spans_graph/clustered.sql               spans_graph_sql                   current
+/// traces_spans_graph/single_node.sql             (spans/graph.rs) — one ARRAY
+///                                                JOIN line each
 /// traces_metrics/compare_outer_attr.sql          metrics_compare_sql               current
 /// traces_metrics/compare_status.sql              (metrics_sql.rs:1313, LEFT JOIN
 /// traces_metrics/compare_status_window.sql       at 1385 and INNER JOIN at 1389)
@@ -902,8 +911,9 @@ const JOINS_OUTSIDE_THE_COMPILED_SEARCH_CORPUS: [&str; 48] = [
 /// classifies `Never` — `NotASearchLinkLower::capability`
 /// (in the previous search engine's `traces/compile.rs`, deleted by #602 part 2c-2b-2) — so they are
 /// not lowered pipelines and the decision never reached them.
-/// `service_graph_sql` is called at `traces/exec.rs:1601` and nowhere
-/// else; `metrics_compare_sql` and `metrics_compare_exemplar_range_sql`
+/// `spans_graph_sql` is called from `TraceEngine::service_graph` and
+/// nowhere else, and since issue #599 no route calls `service_graph_sql`;
+/// `metrics_compare_sql` and `metrics_compare_exemplar_range_sql`
 /// only at `traces/metrics_plan.rs:626/638/650/665`. The sentence
 /// reaches further than the decision it records: a drafting fault in the
 /// record, not shipped code breaking a rule. **The wording belongs to
@@ -969,7 +979,7 @@ fn every_join_in_the_golden_corpus_is_named() {
          any other file means a builder grew one and nobody said so"
     );
     assert_eq!(
-        scanned, 96,
+        scanned, 98,
         "every committed SQL golden in the tree is scanned, not only the two frozen corpora"
     );
 }
