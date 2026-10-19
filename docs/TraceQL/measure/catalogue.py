@@ -81,10 +81,18 @@ for line in open(f'{HERE}/parse_vectors.tsv'):
 tally = {g: {'served': 0, 'answer': 0, 'membership': 0} for g in ('corpus', 'design')}
 planner, mismatched, errors, unbounded, unexplained, missing_reason, notes = [], [], [], [], [], [], []
 metrics = later = 0
+# Every row of catalogue-extra.tsv is a query of the run; the added searches
+# expected to agree are those rows less its metrics queries.
+EXTRA_ROWS = sum(1 for l in open(f'{HERE}/catalogue-extra.tsv')
+                 if l.strip() and not l.startswith('#'))
+design_seen = design_other = 0
 pinned_bad, pinned_seen = [], set()
 for line in open(RUN):
     r = json.loads(line)
     q = parse(r['traceql'])
+    if r['group'] == 'design':
+        design_seen += 1
+        design_other += r['disposition'] != 'served' or r['route'] == 'metrics' or r['name'] in LATER
     if (refusal(q) is None) != (r['disposition'] == 'served'):
         mismatched.append(r['name'])
     if r['disposition'] != 'served':
@@ -140,7 +148,9 @@ for n, e in errors: print(f'  statement failed: {n}: {e[:160]}')
 for n in unbounded + unexplained + missing_reason + mismatched + VECTOR_BAD + pinned_bad + sorted(set(PINNED) - pinned_seen):
     print(f'  see: {n}')
 ok = (c == {'served': 118, 'answer': 118, 'membership': 118}
-      and d == {'served': 33, 'answer': 33, 'membership': 33} and metrics == 24 and later == 1
+      and design_seen == EXTRA_ROWS and d['served'] == EXTRA_ROWS - design_other
+      and d == {'served': d['served'], 'answer': d['served'], 'membership': d['served']}
+      and metrics == 24 and later == 1
       and sorted(planner) == ['by_expression_key', 'duration_unitless', 'pipeline_spanset_operation']
       and pinned_seen == set(PINNED)
       and not (mismatched or errors or unbounded or unexplained or missing_reason or VECTOR_BAD

@@ -716,6 +716,10 @@ pub struct SearchStatement {
     /// Whether the selector holds a structural operator, whose relations
     /// read `spans` inside a read of `spans` (issue #602 part 2b).
     structural: bool,
+    /// Whether a predicate reads a span's child count, whose `(trace_id,
+    /// span_id) IN` subquery reads `spans` inside a read of `spans`
+    /// (issue #600 part 2).
+    child_counts: bool,
 }
 
 /// The response attributes every surviving spanset carries (issue #602
@@ -743,9 +747,10 @@ impl SearchStatement {
     }
 
     /// Whether the statement reads a table inside a read of the same
-    /// table: the numbering or a structural operator's relations.
+    /// table: the numbering, a structural operator's relations or a span's
+    /// child count.
     pub fn nests_reads(&self) -> bool {
-        self.numbered || self.structural
+        self.numbered || self.structural || self.child_counts
     }
 
     pub fn projection(&self) -> &Projection {
@@ -1090,6 +1095,7 @@ pub fn compile_search_sliced(
         climb_depth,
         numbered: numbered > 0,
         structural,
+        child_counts: filter.predicates().iter().any(|p| p.reads_child_counts()),
     })
 }
 
@@ -1751,5 +1757,50 @@ mod charge_tests {
             decode(&mut ByteBudget::new(used - 1)),
             Err(crate::logql::error::ReadError::QueryTooBroad(_))
         ));
+    }
+
+    /// Issue #600 part 2, D11: a child-count read nests a read of `spans`
+    /// inside one, as the numbering and a structural operator do, so a
+    /// clustered statement holding one is issued with `'local'`.
+    #[test]
+    fn a_child_count_statement_nests_reads() {
+        let w = WindowSql::start_closed_end_open(1_000_000_000_000, 2_000_000_000_000);
+        let ctx = PredicateCtx {
+            window: w,
+            spans_table: "spans",
+            resources_table: "resources",
+            indexed: &[],
+        };
+        let nests = |query: &str| {
+            let q = pulsus_traceql::parse(query).expect("parses");
+            compile_search(&q, &ctx, "spans", "traces", 20, 3)
+                .expect("compiles")
+                .nests_reads()
+        };
+        let got: Vec<(&str, bool)> = [
+            "{ span:childCount > 2 }",
+            r#"{ span:childCount > 0 || name = "x" }"#,
+            r#"{ trace:rootService = "x" || span:childCount > 0 }"#,
+            "{ nestedSetLeft > 0 }",
+            "{ } > { }",
+            r#"{ name = "x" }"#,
+        ]
+        .into_iter()
+        .map(|q| (q, nests(q)))
+        .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("{ span:childCount > 2 }", true),
+                (r#"{ span:childCount > 0 || name = "x" }"#, true),
+                (
+                    r#"{ trace:rootService = "x" || span:childCount > 0 }"#,
+                    true
+                ),
+                ("{ nestedSetLeft > 0 }", true),
+                ("{ } > { }", true),
+                (r#"{ name = "x" }"#, false),
+            ]
+        );
     }
 }

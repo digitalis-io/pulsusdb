@@ -51,6 +51,10 @@ pub struct Args {
     /// The window's end, exclusive, in Unix nanoseconds.
     #[arg(long)]
     end_ns: i64,
+    /// The cluster the schema was built for (`PULSUS_CLUSTER`): the run reads
+    /// through the `_dist` tables, as the server does. Absent on one node.
+    #[arg(long)]
+    cluster: Option<String>,
 }
 
 /// The most statements one request may issue (`T-Q2`).
@@ -249,7 +253,10 @@ fn refused(line: &mut Value, disposition: &str, message: String) {
 
 pub async fn run(a: Args) -> anyhow::Result<()> {
     // As the search and metrics handlers build them.
-    let config = pulsus_config::Config::default();
+    let config = pulsus_config::Config {
+        cluster: a.cluster.clone(),
+        ..pulsus_config::Config::default()
+    };
     let rc = TraceReadConfig::from_config(&config);
     let indexed = IndexedAttr::from_config(&config.traceql_indexed_attributes);
     let tables = StatementTables {
