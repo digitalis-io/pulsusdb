@@ -46,6 +46,7 @@ pub mod rows;
 // call from here is an `E0603`. The exemption list is PromQL only, and
 // that one is permanent by design.
 
+mod read_config;
 pub mod spans;
 pub mod values;
 pub mod window_sql;

@@ -12,6 +12,7 @@
 mod bench;
 mod ch_bench;
 mod template_audit;
+mod traceql_catalogue;
 
 use clap::{Parser, Subcommand};
 use serde::Serialize;
@@ -40,6 +41,10 @@ enum Command {
     /// audit against two fresh reference containers (offline; the
     /// source of the pinned-address exclusion ledger).
     TemplateAudit(template_audit::TemplateAuditArgs),
+    /// Run every TraceQL catalogue query through the shipped search and
+    /// metrics planners and engine against a database holding the
+    /// catalogue fixture; one JSON line per query (issue #600).
+    TraceqlCatalogue(traceql_catalogue::Args),
 }
 
 #[derive(Parser)]
@@ -113,6 +118,7 @@ async fn main() -> anyhow::Result<()> {
         Command::ChBench(args) => run_ch_bench(args).await,
         Command::Bench(args) => bench::run(args).await,
         Command::TemplateAudit(args) => template_audit::run(args).await,
+        Command::TraceqlCatalogue(args) => traceql_catalogue::run(args).await,
     }
 }
 

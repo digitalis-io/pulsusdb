@@ -18,7 +18,7 @@ and requires the comparison to go red each time. A change made HERE must go red
 just as a change made in the renderer does; that is what says the two sides are
 not the same reasoning written twice.
 """
-import json, re
+import decimal, json, re
 
 # This side's own tables. Same sources as the renderer's, read again rather
 # than imported: an import is what made a shared-encoding defect invisible
@@ -27,6 +27,8 @@ STATUS_CODE = {'unset': 0, 'ok': 1, 'error': 2}
 KIND_CODE = {'unspecified': 0, 'internal': 1, 'server': 2, 'client': 3,
              'producer': 4, 'consumer': 5}
 UNSCOPED_ORDER = ('span', 'resource', 'event', 'link', 'instrumentation')
+# a comparison read the other way round, the field moved to the left
+FLIP = {'<': '>', '<=': '>=', '>': '<', '>=': '<='}
 MAX_DEPTH = 64
 LIMIT = 20
 SPSS = 3
@@ -98,50 +100,35 @@ class Fixture:
                     t['root_service'] = r['service']
         self.nested = self._number()
     def _number(self):
-        """The nested-set numbering, written as the retained implementation
-        describes it (`crates/pulsus-read/src/traces/search_eval.rs:2085-2139`):
-        an Euler tour of the hydrated forest in ascending (start_ns, span_id)
-        order, a span whose parent is not stored counting as a root, and any
-        span a cycle left unvisited promoted to a root in the same order. One
-        counter is incremented on entry and on exit, so n spans occupy 1..2n."""
+        """`docs/api.md` §4.2, "Nested-set intrinsics": the Euler-tour
+        numbering from each span with no parent id, siblings by start time
+        then span id, one counter per trace incremented on entry and on exit;
+        an orphan, a cycle member and every span below them number 0. A root's
+        `nestedSetParent` is -1, any other numbered span's is its parent's
+        `nestedSetLeft`."""
         out = {}
         for tid in {r['trace_id'] for r in self.rows}:
             rows = sorted([r for r in self.rows if r['trace_id'] == tid],
                           key=lambda r: (r['start_ns'], r['span_id']))
-            ids = {r['span_id'] for r in rows}
             kids = {}
             for r in rows:
-                if r['parent_span_id'] and r['parent_span_id'] in ids:
+                if r['parent_span_id']:
                     kids.setdefault(r['parent_span_id'], []).append(r)
-            for v in kids.values():
-                v.sort(key=lambda r: (r['start_ns'], r['span_id']))
-            paths, promoted = {}, set()
+            n = [0]
 
-            def walk(r, p):
-                paths[r['span_id']] = p + [(r['start_ns'], r['span_id'])]
+            def walk(r, parent_left):
+                n[0] += 1
+                left = n[0]
                 for c in kids.get(r['span_id'], []):
-                    if c['span_id'] not in paths:
-                        walk(c, paths[r['span_id']])
+                    walk(c, left)
+                n[0] += 1
+                out[(tid, r['span_id'])] = {'left': left, 'right': n[0], 'parent': parent_left}
 
-            for r in rows:                       # the forest's roots, in order
-                if ((not r['parent_span_id'] or r['parent_span_id'] not in ids)
-                        and r['span_id'] not in paths):
-                    walk(r, [])
-            for r in rows:                       # then what a cycle left behind
-                if r['span_id'] not in paths:
-                    promoted.add(r['span_id'])
-                    walk(r, [])
-            order = list(paths)                  # the tour, in visit order
-            for i, sid in enumerate(order, 1):
-                depth = len(paths[sid]) - 1
-                sub = sum(1 for o in order if paths[o][:len(paths[sid])] == paths[sid])
-                left = 2 * i - 1 - depth
-                out[(tid, sid)] = {'left': left, 'right': left + 2 * sub - 1}
             for r in rows:
-                par = r['parent_span_id']
-                out[(tid, r['span_id'])]['parent'] = (
-                    -1 if r['span_id'] in promoted or not par or par not in paths
-                    else out[(tid, par)]['left'])
+                if not r['parent_span_id']:
+                    walk(r, -1)
+            for r in rows:
+                out.setdefault((tid, r['span_id']), {'left': 0, 'right': 0, 'parent': 0})
         return out
 def f32(x):
     """The value as the metrics quantile returns it.
@@ -174,6 +161,46 @@ def bucket_label_ms(start_ns, step_ns):
     instants are right-closed, so a span at exactly a step edge belongs to the
     bucket that edge ends (`sql-schema.md` §5.6)."""
     return ((start_ns - 1) // step_ns + 1) * step_ns // 10 ** 6
+
+
+def kind(v):
+    """a value's type class for the field-vs-field type gate"""
+    return 'bool' if isinstance(v, bool) else 'number' if isinstance(v, (int, float)) else 'string'
+
+
+def arm(t, v):
+    """`docs/api.md` §4.2: a typed value as the response renders it, its
+    protojson arm and text — a string `stringValue`, an integer `intValue`
+    in decimal, a boolean `boolValue`, a double `doubleValue` in full
+    decimal notation with no exponent and no trailing `.0`"""
+    if t == 'string': return ['stringValue', v]
+    if t == 'int': return ['intValue', str(v)]
+    if t == 'bool': return ['boolValue', 'true' if v else 'false']
+    v = float(v)
+    if v != v: return ['doubleValue', 'NaN']
+    if v in (float('inf'), float('-inf')): return ['doubleValue', 'Infinity' if v > 0 else '-Infinity']
+    if v == int(v): return ['doubleValue', ('-' if str(v).startswith('-') else '') + str(abs(int(v)))]
+    return ['doubleValue', format(decimal.Decimal(repr(v)), 'f')]
+
+
+def go_duration(ns):
+    """Go's `time.Duration.String()`: under a second in the largest of ns, µs,
+    ms with the fraction's trailing zeros dropped; else h, m and seconds"""
+    if ns == 0: return '0s'
+    sign, u = ('-' if ns < 0 else ''), abs(ns)
+    def frac(v, digits):
+        whole, part = divmod(v, 10 ** digits)
+        tail = str(part).rjust(digits, '0').rstrip('0') if digits else ''
+        return str(whole) + ('.' + tail if tail else '')
+    if u < 10 ** 9:
+        unit, digits = ('ns', 0) if u < 10 ** 3 else ('µs', 3) if u < 10 ** 6 else ('ms', 6)
+        return sign + frac(u, digits) + unit
+    secs, rest = divmod(u, 10 ** 9)
+    h, m, sec = secs // 3600, secs // 60 % 60, secs % 60
+    text = frac(sec * 10 ** 9 + rest, 9) + 's'
+    if secs >= 60: text = str(m) + 'm' + text
+    if secs >= 3600: text = str(h) + 'h' + text
+    return sign + text
 
 
 class Interp:
@@ -231,15 +258,7 @@ class Interp:
             'rootServiceName': t['root_service'], 'trace:rootService': t['root_service'],
             'instrumentation:name': row['scope_name'], 'instrumentation:version': row['scope_version'],
             'nestedSetLeft': n['left'], 'nestedSetRight': n['right'],
-            # `nestedSetParent < 0` asks whether the span is a root, and the
-            # API answers it from the stored parent rather than from a
-            # numbering (functional-requirements.md §9, sql-schema.md §5.9):
-            # a span inside a pure cycle HAS a stored parent and is therefore
-            # not a root, which is the one place this differs from the Euler
-            # tour's `promoted` rule.
-            'nestedSetParent': (-1 if not row['parent_span_id']
-                                or (row['trace_id'], row['parent_span_id']) not in self.fx.by_id
-                                else self.fx.nested[(row['trace_id'], row['parent_span_id'])]['left']),
+            'nestedSetParent': n['parent'],
         }.get(name, '__unsupported__')
     def cmp(self, op, lhs, rhs):
         if lhs is None: return op in ('!=', '!~')       # a missing key matches != and !~
@@ -262,6 +281,19 @@ class Interp:
         if e['k'] == 'bin' and e['op'] in ('+', '-', '*', '/', '%', '^'): return self.fold(e)
         if e['k'] == 'unary' and e['op'] == '-': return -self.value(row, e['e'])
         raise ValueError(f'no value for {e}')
+    def elements(self, row, f):
+        """the values of an event or link field, one per element holding it;
+        None for any other field"""
+        if f['k'] == 'intrinsic':
+            return {'event:name': lambda: [e[1] for e in row['events']],
+                    'event:timeSinceStart': lambda: [e[0] - row['start_ns'] for e in row['events']],
+                    'link:spanID': lambda: [k[1] for k in row['links']],
+                    'link:traceID': lambda: [k[0] for k in row['links']]}.get(f['name'], lambda: None)()
+        if f['k'] == 'attr' and f['scope'] in ('event', 'link'):
+            items = row['events'] if f['scope'] == 'event' else row['links']
+            return [v for *_, at in items for k, _, v in at if k == f['key']]
+        return None
+
     def pred(self, row, e):
         if e is None: return True
         k = e['k']
@@ -274,16 +306,16 @@ class Interp:
             return got is not None and got[0] == 'b' and got[1] is True
         if k == 'bin':
             l, r, op = e['l'], e['r'], e['op']
-            # the per-event and per-link intrinsics are existential: they ask
-            # whether the span carries an event or a link that satisfies them
-            if l['k'] == 'intrinsic' and l['name'] in ('event:name', 'event:timeSinceStart',
-                                                       'link:spanID', 'link:traceID'):
+            # `docs/api.md` §4.2, "Which value a span *has*": an event or link
+            # field is decided per element — a condition matches when any
+            # element holding the field satisfies it, `!=` and `!~` when every
+            # one does
+            if self.elements(row, l) is None and self.elements(row, r) is not None:
+                l, r, op = r, l, FLIP.get(op, op)          # the field on the left
+            vals = self.elements(row, l)
+            if vals is not None and not (r['k'] == 'lit' and r['t'] == 'nil'):
                 rv = self.value(row, r)
-                n = l['name']
-                if n == 'event:name': vals = [ev[1] for ev in row['events']]
-                elif n == 'event:timeSinceStart': vals = [ev[0] - row['start_ns'] for ev in row['events']]
-                elif n == 'link:spanID': vals = [lk[1] for lk in row['links']]
-                else: vals = [lk[0] for lk in row['links']]
+                if op in ('!=', '!~'): return all(self.cmp(op, v, rv) for v in vals)
                 return any(self.cmp(op, v, rv) for v in vals)
             if r['k'] == 'lit' and r['t'] == 'nil':
                 present = self.value(row, l) is not None
@@ -297,6 +329,10 @@ class Interp:
             rv = (self.fold(r) if (r['k'] == 'bin' and r['op'] in '+-*/%^')
                   else read(row, r))
             if lv == '__unsupported__' or rv == '__unsupported__': return False
+            # `docs/api.md` §4.2, "Field-vs-field comparison": an absent key
+            # on either side, or operands of two types, is no match for every
+            # operator, `!=` included
+            if both_fields and (lv is None or rv is None or kind(lv) != kind(rv)): return False
             return self.cmp(op, lv, rv)
         raise ValueError(f'no predicate for {e}')
 
@@ -370,7 +406,7 @@ class Interp:
             elif sp['op'] == 'parent':
                 partners = [a for a in A if a['trace_id'] == b['trace_id'] and a['parent_span_id'] == b['span_id']]
             elif sp['op'] == 'sibling':
-                partners = [a for a in A if a['trace_id'] == b['trace_id']
+                partners = [a for a in A if a['trace_id'] == b['trace_id'] and b['parent_span_id']
                             and a['parent_span_id'] == b['parent_span_id'] and a['span_id'] != b['span_id']]
             elif sp['op'] == 'descendant':
                 anc = {(x['trace_id'], x['span_id']) for x in self.ancestors(b)}
@@ -516,60 +552,20 @@ class Interp:
 
     def value_field(self, row, e):
         """A field in VALUE position: `select(...)`, `by(...)`, and either side
-        of a field-against-field comparison.
-
-        The documented rule is narrower here than in predicate position: the
-        span and instrumentation scopes live on the span row, while a resource,
-        event or link value needs a join or an array read, so an unscoped read
-        in value position resolves span, then instrumentation, then nothing
-        (`server-implementation.md` §3.2; `query-catalogue.md` states it as a
-        limitation and names the corpus queries it touches)."""
+        of a field-against-field comparison: the one value the span has
+        (`docs/api.md` §4.2, "Which value a span *has*"), the same as in
+        predicate position."""
         if e['k'] == 'lit': return self.lit(e)
         if e['k'] == 'attr':
-            s_, k = e['scope'], e['key']
-            if s_ == 'resource' and k == 'service.name': return row['service']
-            if s_ == 'span':
-                got = row['attrs_map'].get(k); return None if got is None else got[1]
-            if s_ == 'instrumentation':
-                got = row['scope_map'].get(k); return None if got is None else got[1]
-            if s_ == 'unscoped':
-                for sc in ('span', 'instrumentation'):
-                    got = self.attr(row, sc, k)
-                    if got is not None: return got[1]
-                return None
-            raise ValueError(f'value position for scope {s_} needs a join')
+            if e['scope'] == 'resource' and e['key'] == 'service.name':
+                return row['service']
+            got = self.attr(row, e['scope'], e['key'])
+            return None if got is None else got[1]
         if e['k'] == 'intrinsic':
             v = self.intrinsic(row, e['name'])
             if v == '__unsupported__': raise ValueError(f'no value for {e}')
             return v
         raise ValueError(f'no value for {e}')
-
-    def group_value_type(self, row, key):
-        """The stored type of a `by()` group's value, or None where the type is
-        a property of the QUERY rather than of the data.
-
-        `docs/api.md` §4.2 renders an attribute group key in the arm the sender
-        stored it as, and an integer `1` and a double `1.0` carry the same
-        label — so the label alone is not the group. An intrinsic's type follows
-        from the intrinsic, and `resource.service.name` is always a string."""
-        if key['k'] != 'attr': return None
-        s_, k = key['scope'], key['key']
-        if s_ == 'resource' and k == 'service.name': return None
-        if s_ == 'unscoped':
-            for sc in ('span', 'instrumentation'):
-                got = self.attr(row, sc, k)
-                if got is not None: return VALUE_TYPE[got[0]]
-            return None
-        got = {'span': row['attrs_map'], 'instrumentation': row['scope_map']}[s_].get(k)
-        return None if got is None else VALUE_TYPE[got[0]]
-
-    def group_and_proj(self, q):
-        group, proj = None, []
-        for st in q['pipeline']:
-            if st['k'] == 'by': group = st['key']
-            elif st['k'] == 'coalesce': group = None
-            elif st['k'] == 'select': proj = st['fields']
-        return group, proj
 
     def api_answer(self, q):
         """The rows the request's own statement must return."""
@@ -577,47 +573,208 @@ class Interp:
         if cmpst: return self.compare_rows(q, cmpst)
         metric = next((s for s in q['pipeline'] if s['k'] == 'metric'), None)
         if metric: return self.metric_rows(q, metric)
-        return self.search_rows(q)
+        return self.search_answer(q)
 
-    def span_tuple(self, r, proj):
-        return ([r['span_id'], r['start_ns'], r['dur']]
-                + [self.value_field(r, f) for f in proj])
+    # `docs/api.md` §4.2, "The matched-span projection": the fields the span
+    # summary already carries, and `span:childCount`, are never projected.
+    NOT_PROJECTED = {'duration', 'span:duration', 'traceDuration', 'trace:duration',
+                     'rootServiceName', 'trace:rootService', 'rootName', 'trace:rootName',
+                     'trace:id', 'span:id', 'childCount', 'span:childCount'}
+    # ... and only a field stored as a span-row column projects under `!=` and
+    # `!~`: these, and `resource.service.name`.
+    COLUMNS = {'name', 'status', 'kind', 'statusMessage', 'parentID',
+               'instrumentation:name', 'instrumentation:version'}
 
-    def search_rows(self, q):
-        """`sql-schema.md` §5.2: the newest LIMIT traces, each with its root,
-        its extent from the per-trace table, the matched count and the spanset
-        capped at SPSS spans in (start, id) order."""
-        group, proj = self.group_and_proj(q)
-        rows = self.matched_rows(q)
+    def wire(self, row, f, leaf=None):
+        """`(identity, key, type, value)` of field `f` on `row` as the response
+        carries it, or None when the span holds no value: the bare key, the
+        stored type, `status` and `kind` as keywords; an event or link
+        intrinsic is the first element satisfying `leaf`."""
+        if f['k'] == 'attr':
+            if f['key'] == 'service.name' and f['scope'] == 'resource':
+                return ('resource', 'service.name'), 'service.name', arm('string', row['service'])
+            if f['scope'] in ('event', 'link') and leaf is not None:
+                items = row['events'] if f['scope'] == 'event' else row['links']
+                rv = self.value(row, leaf['r'])
+                for *_, at in items:
+                    for k, t, v in at:
+                        if k == f['key'] and self.cmp(leaf['op'], v, rv):
+                            return (f['scope'], k), k, arm(VALUE_TYPE[t], v)
+                return None
+            scopes = UNSCOPED_ORDER if f['scope'] == 'unscoped' else (f['scope'],)
+            for sc in scopes:
+                got = self.attr(row, sc, f['key'])
+                if got is not None:
+                    return (sc, f['key']), f['key'], arm(VALUE_TYPE[got[0]], got[1])
+            return None
+        n = f['name'].replace('span:', '') if f['name'] in (
+            'span:name', 'span:status', 'span:kind', 'span:statusMessage', 'span:duration') else f['name']
+        vals = self.elements(row, f)
+        if vals is not None:
+            rv = None if leaf is None else self.value(row, leaf['r'])
+            vals = [v for v in vals if leaf is None or self.cmp(leaf['op'], v, rv)]
+            if not vals: return None
+            return ('intrinsic', n), n, arm('int' if n == 'event:timeSinceStart' else 'string', vals[0])
+        if n in ('duration', 'traceDuration', 'trace:duration'):
+            return ('intrinsic', n), n, arm('string', go_duration(self.intrinsic(row, n)))
+        v = self.intrinsic(row, n)
+        if n == 'status': v = STATUS_KEYWORDS[v]
+        if n == 'kind': v = KIND_KEYWORDS[v]
+        if v == '__unsupported__': return None
+        return ('intrinsic', n), n, arm('int' if isinstance(v, int) else 'string', v)
+
+    @staticmethod
+    def fields_of(e):
+        """the distinct fields a comparison's operands name"""
+        if e['k'] in ('attr', 'intrinsic'):
+            return [json.dumps(e, sort_keys=True)]
+        if e['k'] == 'bin' and e['op'] in '+-*/%^': return Interp.fields_of(e['l']) + Interp.fields_of(e['r'])
+        if e['k'] == 'unary' and e['op'] == '-': return Interp.fields_of(e['e'])
+        if e['k'] == 'lit': return []
+        return [None]                                  # a comparison used as an operand
+
+    def projected(self, row, q):
+        """`docs/api.md` §4.2, "The matched-span projection" and "What a
+        negation projects": the response's `name` and `attributes` for `row`.
+        Every single-field condition of the query's filters that matched the
+        span, in the order written, then every `select()` field; a field once."""
+        out, seen, name = [], set(), [False]
+
+        def add(f, leaf=None):
+            if f['k'] == 'intrinsic' and f['name'] in self.NOT_PROJECTED: return
+            if f['k'] == 'intrinsic' and f['name'] in ('name', 'span:name'):
+                name[0] = True; return
+            w = self.wire(row, f, leaf)
+            if w is None or w[0] in seen: return
+            seen.add(w[0]); out.append([w[1], w[2]])
+
+        def walk(e, odd):
+            if e is None or e['k'] == 'lit': return
+            if e['k'] == 'unary' and e['op'] == '!': return walk(e['e'], not odd)
+            if e['k'] == 'attr':                       # truthiness
+                if not odd and self.pred(row, e): add(e)
+                return
+            if e['k'] != 'bin': return
+            if e['op'] in ('&&', '||'):
+                walk(e['l'], odd); walk(e['r'], odd); return
+            l, r, op = e['l'], e['r'], e['op']
+            if l['k'] == 'lit' and l['t'] == 'nil': l, r = r, l
+            if r['k'] == 'lit' and r['t'] == 'nil':  # presence projects, absence does not
+                if (op == '!=') != odd and self.value(row, l) is not None: add(l)
+                return
+            fs = set(self.fields_of(l) + self.fields_of(r))
+            if odd or len(fs) != 1 or None in fs or not self.pred(row, e): return
+            f = json.loads(next(iter(fs)))
+            column = (f['k'] == 'intrinsic' and f['name'].replace('span:', '') in self.COLUMNS) or (
+                f['k'] == 'attr' and f['key'] == 'service.name' and f['scope'] == 'resource')
+            if op in ('!=', '!~') and not column: return
+            if self.elements(row, f) is not None and self.elements(row, l) is None:
+                e = {'k': 'bin', 'op': FLIP.get(op, op), 'l': r, 'r': l}
+            add(f, e if self.elements(row, f) is not None else None)
+
+        def spansets(sp):
+            if sp['k'] == 'filter': walk(sp['body'], False)
+            elif sp['k'] in ('sp_and', 'sp_or', 'struct'): spansets(sp['l']); spansets(sp['r'])
+        spansets(q['spanset'])
+        for st in q['pipeline']:
+            if st['k'] == 'filter_stage': spansets(st['spanset'])
+            if st['k'] == 'select':
+                for f in st['fields']: add(f)
+        return (row['name'] if name[0] and row['name'] else None), out
+
+    def span_answer(self, r, q):
+        name, attrs = self.projected(r, q)
+        return {'id': r['span_id'], 'start': r['start_ns'], 'dur': r['dur'], 'name': name, 'attrs': attrs}
+
+    def group_key(self, r, key):
+        """the `by()` key's response attribute: `by(<key>)`, typed (`docs/api.md` §4.2)"""
+        label = 'by(' + (key['name'] if key['k'] == 'intrinsic' else
+                         ('.' if key['scope'] == 'unscoped' else key['scope'] + '.') + key['key']) + ')'
+        w = self.wire(r, key)
+        return [label, ['stringValue', 'nil'] if w is None else w[2]]
+
+    def field_text(self, f):
+        """a field as the query renders it: `.k`, `span.k`, an intrinsic's name"""
+        if f['k'] == 'intrinsic':
+            return {'span:duration': 'duration', 'span:name': 'name', 'span:status': 'status',
+                    'span:kind': 'kind'}.get(f['name'], f['name'])
+        return ('.' if f['scope'] == 'unscoped' else f['scope'] + '.') + f['key']
+
+    def aggregate(self, st, spans):
+        """`docs/api.md` §4.2: an aggregate stage's value over a spanSet, as
+        `(the number the comparison reads, the typed attribute value)`, or
+        None when no span contributes"""
+        if st['op'] == 'count': return len(spans), arm('int', len(spans))
+        arg = st['arg']
+        if arg['k'] == 'intrinsic' and self.field_text(arg) == 'duration':
+            vals = [r['dur'] for r in spans]
+            v = {'min': min(vals), 'max': max(vals), 'sum': sum(vals),
+                 'avg': sum(vals) // len(vals)}[st['op']]
+            return v, arm('string', go_duration(v))
+        got = [self.attr(r, arg['scope'], arg['key']) for r in spans]
+        got = [g for g in got if g is not None and g[0] in ('i', 'd')]
+        if not got: return None
+        if st['op'] in ('min', 'max'):
+            t, v = (min if st['op'] == 'min' else max)(got, key=lambda g: float(g[1]))
+            return v, arm(VALUE_TYPE[t], v)
+        total = sum(float(g[1]) for g in got)
+        if st['op'] == 'sum':
+            return total, (arm('int', int(total)) if all(g[0] == 'i' for g in got) else arm('double', total))
+        return total / len(got), arm('double', total / len(got))
+
+    def pipeline_fold(self, q, rs):
+        """`docs/api.md` §4.2, "The pipeline is one ordered fold": each stage
+        maps the trace's spanSets, each `[attributes, spans]`, to new ones"""
+        order = lambda r: (r['start_ns'], r['span_id'])
+        sets = [[[], sorted(rs, key=order)]]
+        for st in q['pipeline']:
+            if st['k'] == 'filter_stage':
+                keep = {id(r) for r in self.spanset(st['spanset'])}
+                sets = [[a, [r for r in sp if id(r) in keep]] for a, sp in sets]
+            elif st['k'] == 'aggregate':
+                out = []
+                for a, sp in sets:
+                    v = self.aggregate(st, sp)
+                    if v is not None and self.cmp(st['cmp'], v[0], self.value(sp[0], st['value'])):
+                        key = st['op'] + '(' + (self.field_text(st['arg']) if st['arg'] else '') + ')'
+                        out.append([a + [[key, v[1]]], sp])
+                sets = out
+            elif st['k'] == 'by':
+                out = []
+                for a, sp in sets:
+                    gs = {}
+                    for r in sp: gs.setdefault(json.dumps(self.group_key(r, st['key'])), []).append(r)
+                    out += [[a + [json.loads(k)], v] for k, v in gs.items()]
+                sets = out
+            elif st['k'] == 'coalesce':
+                sets = [[[], sorted({id(r): r for _, sp in sets for r in sp}.values(), key=order)]]
+            sets = [x for x in sets if x[1]]
+        return sets
+
+    def search_answer(self, q):
+        """`docs/api.md` §4.2: the newest LIMIT traces by their newest matching
+        span, before any pipeline stage, each with its root and extent, and its spanSets: one without
+        attributes is the flat `matched` and `spans`, capped at SPSS in
+        (start, id) order; any other is a group with its own count and cap."""
         by_trace = {}
-        for r in rows: by_trace.setdefault(r['trace_id'], []).append(r)
+        for r in self.spanset(q['spanset']): by_trace.setdefault(r['trace_id'], []).append(r)
         out = []
         for tid, rs in by_trace.items():
+            sets = self.pipeline_fold(q, rs)
+            if not sets: continue
             t = self.fx.traces[tid]
-            last = max(r['start_ns'] for r in rs)
-            head = [tid, t['root_service'], t['root_name'], t['start'], t['end'] - t['start'], last]
-            if group is None:
-                spans = sorted(rs, key=lambda r: (r['start_ns'], r['span_id']))[:SPSS]
-                out.append(head + [len(rs), [self.span_tuple(r, proj) for r in spans]])
-                continue
-            groups = {}
-            for r in rs:
-                g = self.value_field(r, group)
-                if g is None: continue                 # no spanset for a span lacking the key
-                t = self.group_value_type(r, group)
-                key = (label_text(g),) if t is None else (label_text(g), t)
-                groups.setdefault(key, []).append(r)
-            if not groups: continue
-            ordered = sorted(groups.items(),
-                             key=lambda kv: min((r['start_ns'], r['span_id']) for r in kv[1]))
-            matched = sum(len(v) for v in groups.values())
-            out.append(head[:5] + [max(max(r['start_ns'] for r in v) for v in groups.values()),
-                                   matched,
-                                   [list(g) + [[self.span_tuple(r, proj)
-                                                for r in sorted(v, key=lambda r: (r['start_ns'], r['span_id']))[:SPSS]]]
-                                    for g, v in ordered]])
-        out.sort(key=lambda row: (-row[5], row[0]))
-        return out[:LIMIT]
+            tr = {'id': tid, 'root_service': t['root_service'], 'root_name': t['root_name'],
+                  'start': t['start'], 'dur': t['end'] - t['start'], 'matched': None,
+                  'spans': None, 'groups': None}
+            if len(sets) == 1 and not sets[0][0]:
+                tr['matched'] = len(sets[0][1])
+                tr['spans'] = [self.span_answer(r, q) for r in sets[0][1][:SPSS]]
+            else:
+                tr['groups'] = [{'attrs': a, 'matched': len(sp),
+                                 'spans': [self.span_answer(r, q) for r in sp[:SPSS]]} for a, sp in sets]
+            out.append((max(r['start_ns'] for r in rs), tr))
+        out.sort(key=lambda x: (-x[0], x[1]['id']))
+        return {'partial': False, 'traces': [tr for _, tr in out[:LIMIT]]}
 
     def exemplar_budget(self, q):
         for k, v in q['hints']:
