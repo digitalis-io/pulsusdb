@@ -3012,8 +3012,9 @@ jobs:
         run: docker compose -f ci/bench-cluster/compose.yaml down -v
 
   # Issue #600: every corpus and `catalogue-extra.tsv` query through the
-  # shipped route, each search answer compared with the independent
-  # interpreter. Scheduled or dispatched, not required.
+  # shipped route, each search answer but `intrinsic_event_time_since_start`
+  # (#600's compiler-fix part) compared with the independent interpreter.
+  # Scheduled or dispatched, not required.
   traceql-catalogue:
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     needs: ci

@@ -90,8 +90,11 @@ span(T2, 6, 5, 'child', 5, 10 * NS + 10 * 10**6, 500 * 10**6, 'gw', RES_GW,
             (LINK_TRACE, LINK_SPAN, [['relation', 's', 'child_of']])])
 # a late span in trace one, after trace five's last: trace one's newest span
 # comes after trace five's, but its newest span with `a = 1` comes before it,
-# which is what tells a trace order taken before the pipeline from one taken after
-span(T1, 9, 1, 'late', 1, 45 * NS, 1 * NS, 'checkout', RES_CHECKOUT, [])
+# which is what tells a trace order taken before the pipeline from one taken after.
+# It lasts 1 s and 3 ns, so trace one's four checkout spans last 7 s and 3 ns in
+# all: their `avg(duration)` is 1.75 s and 0.75 ns, which a truncating average
+# (docs/api.md section 4.2) and a rounding one tell apart
+span(T1, 9, 1, 'late', 1, 45 * NS, 1 * NS + 3, 'checkout', RES_CHECKOUT, [])
 # trace 3: a span with no attributes at all, and one with only a numeric double
 span(T3, 7, None, 'bare', 1, 20 * NS, 100 * 10**6, 'plain', RES_PLAIN, [])
 span(T3, 8, 7, 'bare child', 4, 20 * NS + 10 * 10**6, 50 * 10**6, 'plain', RES_PLAIN,

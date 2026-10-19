@@ -6,8 +6,9 @@ directories of crates/pulsus-traceql/tests/corpus/ and every row of
 `catalogue-extra.tsv` through the route's own planner and engine and writes one
 JSON line per query: its disposition, the answer, and the statements the engine
 issued with the rows each returned (`system.query_log`). This script compares
-each search answer, whole and typed, with `catalogue_interp.py`, which walks the
-parsed query over the fixture rows. The two sides share nothing: the statements
+each search answer but one, whole and typed, with `catalogue_interp.py`, which
+walks the parsed query over the fixture rows; `intrinsic_event_time_since_start`
+waits for #600's compiler-fix part (`LATER` below). The two sides share nothing: the statements
 are the compiler's and the parser here is the interpreter's own.
 
 Usage: catalogue.py RUN_JSONL FIXTURE_JSONL START_NS END_NS
@@ -39,6 +40,11 @@ CAPS = {'answer': LIMIT, 'cut': CUT, 'full': LIMIT}
 # Compared in #600's compiler-fix part: which of several matching events or
 # links the response projects.
 LATER = {'intrinsic_event_time_since_start'}
+# `docs/api.md` §4.2: a duration `avg()` truncates. Trace `11…`'s four checkout
+# spans last 7 s and 3 ns in all, so their average is 1.75 s and 0.75 ns:
+# truncated it is `1.75s`, rounded up or to the nearest `1.750000001s`. Checked
+# on the route's answer itself, so the two sides cannot agree on another rule.
+PINNED = {'pipeline_avg_duration': ['avg(duration)', ['stringValue', '1.75s']]}
 
 
 def interp_answer(q, limit, spss):
@@ -75,6 +81,7 @@ for line in open(f'{HERE}/parse_vectors.tsv'):
 tally = {g: {'served': 0, 'answer': 0, 'membership': 0} for g in ('corpus', 'design')}
 planner, mismatched, errors, unbounded, unexplained, missing_reason, notes = [], [], [], [], [], [], []
 metrics = later = 0
+pinned_bad, pinned_seen = [], set()
 for line in open(RUN):
     r = json.loads(line)
     q = parse(r['traceql'])
@@ -95,6 +102,11 @@ for line in open(RUN):
         errors.append((r['name'], r['error'])); continue
     if not bounded(r): unbounded.append(r['name'])
     res = r['result']
+    if r['name'] in PINNED:
+        pinned_seen.add(r['name'])
+        if not any(PINNED[r['name']] in g['attrs'] for t in res['answer']['traces']
+                   for g in t['groups'] or []):
+            pinned_bad.append(r['name'])
     a = (rendered(res['answer']) == rendered(interp_answer(q, LIMIT, SPSS))
          and rendered(res['cut']) == rendered(interp_answer(q, CUT, SPSS)))
     want_all = rendered(interp_answer(q, LIMIT, ALL))
@@ -119,14 +131,18 @@ print(f"disposition rule against the planner     {len(mismatched)} mismatches")
 print(f"statements that failed                   {len(errors)}")
 print(f"requests over the answer's size (T-Q2)   {len(unbounded)}")
 print(f"parse vectors that differ                {len(VECTOR_BAD)}")
+print(f"pinned values that differ or are absent  {len(pinned_bad) + len(set(PINNED) - pinned_seen)}")
 print(f"empty answers without a reason           {len(unexplained)}")
 print(f"reasons for an answer that is not empty  {len(missing_reason)}")
 for n, src, a, m, got, want in notes:
     print(f'  disagreement: {n} {src!r} answer={a} membership={m}\n    route:       {got}\n    interpreter: {want}')
 for n, e in errors: print(f'  statement failed: {n}: {e[:160]}')
-for n in unbounded + unexplained + missing_reason + mismatched + VECTOR_BAD: print(f'  see: {n}')
+for n in unbounded + unexplained + missing_reason + mismatched + VECTOR_BAD + pinned_bad + sorted(set(PINNED) - pinned_seen):
+    print(f'  see: {n}')
 ok = (c == {'served': 118, 'answer': 118, 'membership': 118}
       and d == {'served': 33, 'answer': 33, 'membership': 33} and metrics == 24 and later == 1
       and sorted(planner) == ['by_expression_key', 'duration_unitless', 'pipeline_spanset_operation']
-      and not (mismatched or errors or unbounded or unexplained or missing_reason or VECTOR_BAD))
+      and pinned_seen == set(PINNED)
+      and not (mismatched or errors or unbounded or unexplained or missing_reason or VECTOR_BAD
+               or pinned_bad))
 sys.exit(0 if ok else 1)
