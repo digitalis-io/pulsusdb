@@ -507,34 +507,59 @@ fn anyvalue_container_after_scalar_wins_matching_vendored_oneof() {
     );
 }
 
+/// The one attribute of the one span `body` decodes to.
+fn only_attribute(body: &str) -> opentelemetry_proto::tonic::common::v1::KeyValue {
+    let req = decode_json(body.as_bytes())
+        .unwrap_or_else(|e| panic!("expected Ok, got {e:?}\nbody: {body}"));
+    let attrs = &req.resource_spans[0].scope_spans[0].spans[0].attributes;
+    assert_eq!(attrs.len(), 1, "{body}");
+    attrs[0].clone()
+}
+
 #[test]
-fn anyvalue_array_missing_values_rejects_matching_vendored() {
-    // `{"arrayValue":{}}` — the vendored ArrayValue derive rejects the missing
-    // required `values`; the bounded seed must too (was wrongly accepted).
+fn anyvalue_array_missing_values_is_empty() {
+    // `{"arrayValue":{}}` is proto3-JSON's empty array (issue #601 part 1).
+    use opentelemetry_proto::tonic::common::v1::{ArrayValue, any_value::Value};
     let attr = r#"{"key":"k","value":{"arrayValue":{}}}"#;
     let body = one_span(&format!(r#"{{"attributes":[{attr}]}}"#));
-    assert_rejects_with(&body, "values");
+    let kv = only_attribute(&body);
+    assert_eq!(
+        kv.value.and_then(|v| v.value),
+        Some(Value::ArrayValue(ArrayValue { values: vec![] }))
+    );
 }
 
 #[test]
-fn anyvalue_kvlist_missing_values_rejects_matching_vendored() {
+fn anyvalue_kvlist_missing_values_is_empty() {
+    use opentelemetry_proto::tonic::common::v1::{KeyValueList, any_value::Value};
     let attr = r#"{"key":"k","value":{"kvlistValue":{}}}"#;
     let body = one_span(&format!(r#"{{"attributes":[{attr}]}}"#));
-    assert_rejects_with(&body, "values");
+    let kv = only_attribute(&body);
+    assert_eq!(
+        kv.value.and_then(|v| v.value),
+        Some(Value::KvlistValue(KeyValueList { values: vec![] }))
+    );
 }
 
 // --------------------------------------------------------------------------
-// Finding 2: KeyValue / EntityRef scalar fields match the non-serde(default)
-// vendored derive — missing-required and duplicate scalar keys are rejected
-// (previously silently defaulted / last-write-win). Audit companions cover the
-// serde(default) Resource / InstrumentationScope duplicate-scalar rejection.
+// Finding 2: KeyValue / EntityRef scalar fields match the vendored derive — a
+// missing one decodes to its default (issue #601 part 1, patch P7) and a
+// duplicate scalar key is rejected (previously last-write-win). Audit
+// companions cover the Resource / InstrumentationScope duplicate-scalar
+// rejection.
 // --------------------------------------------------------------------------
 
 #[test]
-fn key_value_missing_key_rejects_matching_vendored() {
+fn key_value_missing_key_is_empty() {
+    use opentelemetry_proto::tonic::common::v1::any_value::Value;
     let attr = r#"{"value":{"stringValue":"v"}}"#;
     let body = one_span(&format!(r#"{{"attributes":[{attr}]}}"#));
-    assert_rejects_with(&body, "key");
+    let kv = only_attribute(&body);
+    assert_eq!(kv.key, "");
+    assert_eq!(
+        kv.value.and_then(|v| v.value),
+        Some(Value::StringValue("v".to_string()))
+    );
 }
 
 #[test]
@@ -545,9 +570,18 @@ fn key_value_duplicate_key_rejects_matching_vendored() {
 }
 
 #[test]
-fn entity_ref_missing_required_scalar_rejects_matching_vendored() {
+fn entity_ref_missing_scalar_is_empty() {
     let body = r#"{"resourceSpans":[{"resource":{"entityRefs":[{"idKeys":["a"]}]}}]}"#;
-    assert_rejects_with(body, "schemaUrl");
+    let req = decode_json(body.as_bytes()).unwrap_or_else(|e| panic!("expected Ok, got {e:?}"));
+    let refs = &req.resource_spans[0]
+        .resource
+        .as_ref()
+        .expect("the resource")
+        .entity_refs;
+    assert_eq!(refs.len(), 1);
+    assert_eq!(refs[0].schema_url, "");
+    assert_eq!(refs[0].r#type, "");
+    assert_eq!(refs[0].id_keys, vec!["a".to_string()]);
 }
 
 #[test]

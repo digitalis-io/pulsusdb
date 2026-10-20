@@ -397,6 +397,30 @@ const O: &[SpanDef] = &[
     span(2, "u").attrs(&[("v", r#"{"intValue":"2"}"#)]),
 ];
 
+/// Arrays (issue #601 part 1): two, one and no elements, and a span whose
+/// `one` is the string the one-element array holds.
+const S601: &[SpanDef] = &[
+    span(1, "arr").attrs(&[
+        (
+            "tags",
+            r#"{"arrayValue":{"values":[{"stringValue":"x"},{"stringValue":"y"}]}}"#,
+        ),
+        (
+            "nums",
+            r#"{"arrayValue":{"values":[{"intValue":"1"},{"intValue":"2"}]}}"#,
+        ),
+        ("one", r#"{"arrayValue":{"values":[{"stringValue":"z"}]}}"#),
+        ("none", r#"{"arrayValue":{"values":[]}}"#),
+    ]),
+    span(2, "arr").attrs(&[
+        (
+            "tags",
+            r#"{"arrayValue":{"values":[{"stringValue":"x"},{"stringValue":"y"}]}}"#,
+        ),
+        ("one", r#"{"stringValue":"z"}"#),
+    ]),
+];
+
 fn corpora() -> Vec<Corpus> {
     vec![
         Corpus {
@@ -458,6 +482,10 @@ fn corpora() -> Vec<Corpus> {
         Corpus {
             service: "grp492c",
             spans: ORD3,
+        },
+        Corpus {
+            service: "s601a",
+            spans: S601,
         },
     ]
 }
@@ -576,6 +604,12 @@ const fn projected(
 /// `traceql-spanset-aggregate-precedes-grouping` is gone from this list:
 /// the ordered fold landed, the three fixtures it covered now AGREE, and
 /// the ledger row is a withdrawal record.
+const ONE_ELEMENT_ARRAY: &str = "the reference reads a one-element array as its element — ledger row \
+     traceql-search-response-values-against-the-reference, entry 37 of \
+     docs/reference-defects-we-do-not-copy.md";
+const EMPTY_ARRAY: &str = "the reference reads an empty array as no value — ledger row \
+     traceql-search-response-values-against-the-reference, entry 37 of \
+     docs/reference-defects-we-do-not-copy.md";
 const PRECISION_LIMIT: &str = "an attribute aggregate computes on val_num — ledger row \
      traceql-attribute-aggregate-float64-precision";
 const MIXED_TYPE: &str = "the reference's mixed-type sum/avg is order-dependent — ledger row \
@@ -825,6 +859,27 @@ fn fixtures() -> Vec<Fixture> {
              02{f=doubleValue=Infinity,service.name=stringValue=s510k},\
              03{f=doubleValue=-Infinity,service.name=stringValue=s510k}",
         ]),
+        // ---- arrays (issue #601 part 1) -------------------------------
+        projected("projected_string_array", "s601a", "&& span.tags != nil", &[
+            "- | m2 | \
+             01{service.name=stringValue=s601a,tags=arrayValue=[[\"stringValue\",\"x\"],[\"stringValue\",\"y\"]]},\
+             02{service.name=stringValue=s601a,tags=arrayValue=[[\"stringValue\",\"x\"],[\"stringValue\",\"y\"]]}",
+        ]),
+        projected("projected_int_array", "s601a", "&& span.nums != nil", &[
+            "- | m1 | 01{nums=arrayValue=[[\"intValue\",\"1\"],[\"intValue\",\"2\"]],service.name=stringValue=s601a}",
+        ]),
+        parity("by_string_array", "s601a", "| by(span.tags)",
+            &["by(span.tags)=arrayValue=[[\"stringValue\",\"x\"],[\"stringValue\",\"y\"]] | m2 | 01,02"]),
+        diverges("array_one_element_by", "s601a", "| by(span.one)",
+            &["by(span.one)=arrayValue=[[\"stringValue\",\"z\"]] | m1 | 01",
+              "by(span.one)=stringValue=z | m1 | 02"],
+            &["by(span.one)=stringValue=z | m2 | 01,02"],
+            ONE_ELEMENT_ARRAY),
+        diverges("array_empty_by", "s601a", "| by(span.none)",
+            &["by(span.none)=arrayValue=[] | m1 | 01",
+              "by(span.none)=stringValue=nil | m1 | 02"],
+            &["by(span.none)=stringValue=nil | m2 | 01,02"],
+            EMPTY_ARRAY),
     ]
 }
 
@@ -1204,6 +1259,26 @@ fn reference_token(value: Option<&serde_json::Value>) -> String {
     let Some(value) = value else {
         return "<no value>".to_string();
     };
+    // An array (issue #601 part 1): `arrayValue=` and the compact JSON of
+    // its elements as `[arm, text]` pairs, each by the scalar rules below;
+    // `values` absent is the empty array.
+    if let Some(array) = value.get("arrayValue") {
+        let pairs: Vec<(String, String)> = array
+            .get("values")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .map(|e| {
+                let token = reference_token(Some(e));
+                let (arm, text) = token.split_once('=').unwrap_or((token.as_str(), ""));
+                (arm.to_string(), text.to_string())
+            })
+            .collect();
+        return format!(
+            "arrayValue={}",
+            serde_json::to_string(&pairs).expect("pairs of strings serialize")
+        );
+    }
     for arm in ["stringValue", "intValue", "doubleValue"] {
         if let Some(s) = value.get(arm).and_then(|v| v.as_str()) {
             return format!("{arm}={s}");
@@ -1477,7 +1552,7 @@ fn the_group_map_key_carries_every_attribute() {
 /// wire-type difference cannot be normalised away.
 #[test]
 fn the_two_sides_tokenise_a_value_the_same_way() {
-    let cases: [(GroupValue, serde_json::Value); 8] = [
+    let cases: [(GroupValue, serde_json::Value); 11] = [
         (
             GroupValue::Str("apple".to_string()),
             serde_json::json!({"stringValue": "apple"}),
@@ -1506,6 +1581,25 @@ fn the_two_sides_tokenise_a_value_the_same_way() {
         (
             GroupValue::Bool(true),
             serde_json::json!({"boolValue": true}),
+        ),
+        (
+            GroupValue::Array(vec![
+                GroupValue::Str("x".to_string()),
+                GroupValue::Str("y".to_string()),
+            ]),
+            serde_json::json!({"arrayValue": {"values": [
+                {"stringValue": "x"}, {"stringValue": "y"}
+            ]}}),
+        ),
+        (
+            GroupValue::Array(vec![GroupValue::Int(1), GroupValue::Int(2)]),
+            serde_json::json!({"arrayValue": {"values": [
+                {"intValue": "1"}, {"intValue": "2"}
+            ]}}),
+        ),
+        (
+            GroupValue::Array(vec![]),
+            serde_json::json!({"arrayValue": {}}),
         ),
     ];
     for (ours, theirs) in cases {

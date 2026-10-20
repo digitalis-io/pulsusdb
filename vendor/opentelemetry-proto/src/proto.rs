@@ -501,13 +501,9 @@ pub(crate) mod serializers {
                     }
                 }
 
-                if let Some(v) = value {
-                    Ok(Some(v))
-                } else {
-                    Err(de::Error::custom(
-                        "Invalid data for Value, no known keys found",
-                    ))
-                }
+                // PATCH (PulsusDB, P7): no known key is an `AnyValue` with no
+                // value, as proto3-JSON writes it and protobuf decodes it.
+                Ok(value)
             }
         }
 

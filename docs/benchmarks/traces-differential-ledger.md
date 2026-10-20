@@ -4044,6 +4044,18 @@ Applies to `GET /api/traces/v1/search` and its alias.
   recorded observation and not an entry of `docs/reference-defects-we-do-not-copy.md`, which lists it under the
   claims it deliberately does not make.
 
+### `traceql-search-response-values-against-the-reference` (issue #601 part 1) — **the search response's values, read against the reference's source**
+
+| value | the reference | here | disposition |
+|---|---|---|---|
+| projected `event:timeSinceStart` | Go's duration text in `stringValue` (`pkg/traceql/engine.go:399-405`) | the same since #601 part 1; `intValue` nanoseconds before | fixed; projection case `41_event_time_since_start` |
+| an array of two or more elements, projected or a `by()` value | `arrayValue`, each element in its own arm (`engine.go:412-471`) | the same since #601 part 1; its JSON text in `stringValue` before | fixed; `projected_string_array`, `projected_int_array`, `by_string_array` |
+| an array of one element | its element (`encoding/vparquet4/block_traceql.go:3595-3605`) | an `arrayValue` of one | divergence, `array_one_element_by`; reference-defects §37 |
+| an empty array | no value: not projected, grouped `nil` (`block_traceql.go:66-105`) | `{"arrayValue":{}}`, its own group | divergence, `array_empty_by`; reference-defects §37 |
+| `traceID`, `trace:id`, `link:traceID` | leading zeros trimmed (`pkg/util/traceid.go:31-41`); `left_pad_trace_ids` restores them in `traceID` only | 32 characters everywhere | divergence; one spelling across every PulsusDB route |
+| `serviceStats`, the singular `spanSet` | emitted (`engine.go:296-306`, `:351`) | not emitted | divergence; the trace datasource reads `spanSets` and never `serviceStats` |
+| an attribute string over 2048 bytes | cut at ingest (`modules/distributor/distributor.go:677-698`, `:789-817`) | stored whole, cut at 8192 bytes in the search response | divergence; `docs/api.md` §4.2 |
+
 ### `traceql-request-parameters-against-the-reference` (issue #601 part 2) — **request parameters read against the reference's source**
 
 | parameter | the reference | here | disposition |

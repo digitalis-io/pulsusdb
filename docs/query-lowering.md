@@ -78,7 +78,7 @@ receives is all that was wanted (11,340 B, measured on C2 — see §9.1).
 **The same answer lowered is three statements, not one: 3 round trips.** The compiled generator is
 the first; the window-bounded hydration read survives lowering, because `spanSets[].matched` and
 `spanSets[].spans[]` are written unconditionally
-(`crates/pulsus-server/src/traces_api/search_response.rs:428-430`, `:507-512`); the winners' root
+(`crates/pulsus-server/src/traces_api/search_response.rs:437-439`, `:516-521`); the winners' root
 read is the third and stays residual in **every** chain, because the root summary is read
 trace-wide with no time predicate (§3.1's `Emit` row, §5). The attribute condition sends no
 statement of its own: since
@@ -1262,7 +1262,7 @@ Four consequences fall out of the table rather than being written down.
   removes the 1,108 round trips between it and the generator. The window-bounded hydration read
   survives lowering for its own reason — `spanSets[].matched` and `spanSets[].spans[]` are written
   unconditionally
-  (`crates/pulsus-server/src/traces_api/search_response.rs:428-430`, `:507-512`) — so the count is
+  (`crates/pulsus-server/src/traces_api/search_response.rs:437-439`, `:516-521`) — so the count is
   the generator plus that one plus the root read. §1 and §4 count **3** since
   [#557](https://github.com/digitalis-io/pulsusdb/issues/557) made the attribute condition a
   predicate column on the hydration read; §9.2 measured **4**, before that change, and its dated
@@ -1875,7 +1875,7 @@ path". It is not the cap for the `Reduced` kind, and it still applies unchanged 
 already have an incompleteness channel, so the option space is wider than "refuse or lie":
 
 - the traces search route signals truncation with `metrics.completedJobs < metrics.totalJobs`
-  (`search_response.rs:504`, and [api.md §4.2](api.md));
+  (`search_response.rs:513`, and [api.md §4.2](api.md));
 - the LogQL streams route signals byte-budget truncation with `stats.pulsus_partial`
   ([api.md §2.1](api.md)).
 

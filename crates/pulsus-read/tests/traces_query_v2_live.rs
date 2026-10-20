@@ -6093,13 +6093,13 @@ fn fixture_b_bodies(base_ns: i64) -> Vec<ExportTraceServiceRequest> {
             0xf7,
             "b".to_string(),
             "op".to_string(),
-            vec![kv("arr", str_array_value(&[&n(8188)]))],
+            vec![kv("arr", str_array_value(&[&n(8192)]))],
         ),
         (
             0xf8,
             "b".to_string(),
             "op".to_string(),
-            vec![kv("arr", str_array_value(&[&n(8189)]))],
+            vec![kv("arr", str_array_value(&[&n(8193)]))],
         ),
     ];
     rows.into_iter()
@@ -6746,6 +6746,7 @@ fn value_text(v: &pulsus_read::traces::GroupValue) -> String {
         GroupValue::Double(bits) => format!("Double {:?}", f64::from_bits(*bits)),
         GroupValue::Bool(b) => format!("Bool {b}"),
         GroupValue::Nil => "Nil".to_string(),
+        GroupValue::Array(_) => format!("Arr {}", pulsus_read::wire_arm(v).1),
     }
 }
 
@@ -6799,6 +6800,31 @@ async fn ask(
     statement(client, &parse_query(query), window, 100, 100)
         .await
         .unwrap_or_else(|e| panic!("{query}: {e}"))
+}
+
+/// `query`'s written answer at each of [`LIMIT_SPSS`]'s settings, the ones
+/// [`RECORDED_ANSWERS`] holds a digest for, each checked against `want`
+/// (issue #601 part 1). One literal serves all three because every answer
+/// passed here is at most two traces of one span each, which `(2, 1)` does
+/// not cut.
+async fn check_at_every_setting(
+    wrong: &mut Vec<String>,
+    client: &ChClient,
+    query: &str,
+    window: (i64, i64),
+    want: &str,
+) {
+    for (limit, spss) in LIMIT_SPSS {
+        let out = statement(client, &parse_query(query), window, limit, spss)
+            .await
+            .unwrap_or_else(|e| panic!("{query}: {e}"));
+        check(
+            wrong,
+            &format!("{query} (limit {limit}, spss {spss})"),
+            written(&out, false),
+            want,
+        );
+    }
 }
 
 /// Records a written answer that differs.
@@ -6920,15 +6946,40 @@ async fn search_statement_answers_written_out_on_fixture_c() {
         format!("{:?}", (&aa.root.service, &aa.root.name)),
         "(\"svc-a\", \"z-name\")",
     );
-    for (query, want) in [
+    // Issue #601 part 1: the values whose recorded digests moved, written
+    // out at every recorded setting. Span `…b1` stores the four arrays; the
+    // catalogue's span `…04` holds one event 2 ms after its start.
+    let offset_query = corpus_query("intrinsic_event_time_since_start");
+    for (client, query, want) in [
         (
+            &client_z,
             r#"{ span.tags != nil }"#,
-            "bbbb(1): 00b1[tags=Str [\"gold\",\"eu\"]]",
+            "bbbb(1): 00b1[tags=Arr [[\"stringValue\",\"gold\"],[\"stringValue\",\"eu\"]]]",
         ),
         (
+            &client_z,
             r#"{ span.floats != nil }"#,
-            "bbbb(1): 00b1[floats=Str [1.5,2.0]]",
+            "bbbb(1): 00b1[floats=Arr [[\"doubleValue\",\"1.5\"],[\"doubleValue\",\"2\"]]]",
         ),
+        (
+            &client_z,
+            r#"{ span.ints != nil }"#,
+            "bbbb(1): 00b1[ints=Arr [[\"intValue\",\"1\"],[\"intValue\",\"2\"]]]",
+        ),
+        (
+            &client_z,
+            r#"{ span.bools != nil }"#,
+            "bbbb(1): 00b1[bools=Arr [[\"boolValue\",\"true\"],[\"boolValue\",\"false\"]]]",
+        ),
+        (
+            &client_c,
+            offset_query.as_str(),
+            "2222(1): 0004[event:timeSinceStart=Str 2ms]",
+        ),
+    ] {
+        check_at_every_setting(&mut wrong, client, query, window, want).await;
+    }
+    for (query, want) in [
         (
             r#"{ span.a / 2 > 1 }"#,
             "bbbb(2): 00b2[a=Int 8] 00b3[a=Double 2.5]",
@@ -6980,35 +7031,71 @@ async fn search_statement_answers_written_out_on_fixture_c() {
             wrong.push(format!("{label}: the value differs"));
         }
     }
-    let projected_of = |out: &pulsus_read::traces::SearchOutput, trace: u8| -> String {
-        let t = out
-            .traces
-            .iter()
-            .find(|t| t.trace_id == [trace; 16])
-            .unwrap_or_else(|| panic!("trace {trace:02x} is returned"));
-        match t.spans[0].attributes[0].value() {
-            pulsus_read::traces::GroupValue::Str(s) => s.clone(),
-            other => panic!("{other:?}"),
+    let projected_of =
+        |out: &pulsus_read::traces::SearchOutput, trace: u8| -> pulsus_read::traces::GroupValue {
+            let t = out
+                .traces
+                .iter()
+                .find(|t| t.trace_id == [trace; 16])
+                .unwrap_or_else(|| panic!("trace {trace:02x} is returned"));
+            t.spans[0].attributes[0].value().clone()
+        };
+    // A value's string lengths, for the message: a string's, or each
+    // element's of an array.
+    fn lengths(v: &pulsus_read::traces::GroupValue) -> String {
+        use pulsus_read::traces::GroupValue;
+        match v {
+            GroupValue::Str(s) => format!("Str of {} bytes", s.len()),
+            GroupValue::Array(a) => format!(
+                "Array of [{}]",
+                a.iter().map(lengths).collect::<Vec<_>>().join(", ")
+            ),
+            other => format!("{other:?}"),
         }
-    };
+    }
+    use pulsus_read::traces::GroupValue::{Array, Str};
     let s = ask(&client_b, r#"{ span.s =~ ".+" }"#, window).await;
     let arr = ask(&client_b, r#"{ span.arr != nil }"#, window).await;
-    let arr7 = format!("[\"{}\"]", n(8188));
-    let arr8: String = format!("[\"{}\"]", n(8189)).chars().take(2048).collect();
+    // The cut is per element (issue #601 part 1): an element at 8,192
+    // bytes comes back whole, one at 8,193 as its first 2,048 code points.
     for (label, got, want) in [
-        ("f5 span.s", projected_of(&s, 0xf5), n(8192)),
-        ("f6 span.s", projected_of(&s, 0xf6), n(2048)),
-        ("f7 span.arr", projected_of(&arr, 0xf7), arr7),
-        ("f8 span.arr", projected_of(&arr, 0xf8), arr8),
+        ("f5 span.s", projected_of(&s, 0xf5), Str(n(8192))),
+        ("f6 span.s", projected_of(&s, 0xf6), Str(n(2048))),
+        (
+            "f7 span.arr",
+            projected_of(&arr, 0xf7),
+            Array(vec![Str(n(8192))]),
+        ),
+        (
+            "f8 span.arr",
+            projected_of(&arr, 0xf8),
+            Array(vec![Str(n(2048))]),
+        ),
     ] {
         if got != want {
             wrong.push(format!(
-                "{label}: {} bytes back, {} expected",
-                got.len(),
-                want.len()
+                "{label}: {} back, {} expected",
+                lengths(&got),
+                lengths(&want)
             ));
         }
     }
+    // The same two arrays at every recorded setting: span `…f8` holds the
+    // 8,193-byte element, cut, and `…f7` the 8,192-byte one, whole; `…f8`
+    // starts later, so it comes first.
+    check_at_every_setting(
+        &mut wrong,
+        &client_b,
+        r#"{ span.arr != nil }"#,
+        window,
+        &format!(
+            "f8f8(1): 00f8[arr=Arr [[\"stringValue\",\"{}\"]]] | f7f7(1): 00f7[arr=Arr \
+             [[\"stringValue\",\"{}\"]]]",
+            n(2048),
+            n(8192)
+        ),
+    )
+    .await;
     for db in [&db_c, &db_z, &db_b] {
         drop_db(db).await;
     }
@@ -7062,11 +7149,6 @@ async fn search_statement_answers_written_out_on_fixture_p() {
     let p_rows = [
         // q02
         (r#"{ resource.rk_i > 5 }"#, "1111(1): 0001[rk_i=Int 7]"),
-        // q05: the stored array's JSON, not `['x','y']`.
-        (
-            r#"{ resource.rk_arr != nil }"#,
-            "1111(1): 0001[rk_arr=Str [\"x\",\"y\"]]",
-        ),
         // q07: the last element whose own condition holds (issue #600
         // part 3) — not the first that holds (5).
         (
@@ -7087,10 +7169,6 @@ async fn search_statement_answers_written_out_on_fixture_p() {
             r#"{ event.k > 3 && .p != nil }"#,
             "2222(1): 0003[k=Double 4.5,p=Int 42] | 1111(1): 0001[k=Int 9,p=Str res]",
         ),
-        (
-            r#"{ event.t != nil }"#,
-            "2222(1): 0003[t=Str [\"x\",\"y\"]] | 1111(1): 0001[t=Str b]",
-        ),
         (r#"{ link.lk != nil }"#, "1111(1): 0001[lk=Int 10]"),
         (r#"{ link.lk > 5 }"#, "1111(1): 0001[lk=Int 10]"),
         (
@@ -7102,11 +7180,6 @@ async fn search_statement_answers_written_out_on_fixture_p() {
         (
             r#"{ event.k != nil }"#,
             "2222(1): 0003[k=Double 4.5] | 1111(2): 0001[k=Int 9] 0002[k=Int 3]",
-        ),
-        // q13
-        (
-            r#"{ event:timeSinceStart > 1500us }"#,
-            "1111(1): 0001[event:timeSinceStart=Int 3000000]",
         ),
         // q18
         (
@@ -7133,11 +7206,6 @@ async fn search_statement_answers_written_out_on_fixture_p() {
             r#"{ link:spanID = "0B00000000000002" }"#,
             "1111(1): 0001[link:spanID=Str 0b00000000000002]",
         ),
-        // q29
-        (
-            r#"{ .t != nil }"#,
-            "2222(1): 0003[t=Str [\"x\",\"y\"]] | 1111(1): 0001[t=Str b]",
-        ),
         // r01: the last element the comparison holds for.
         (
             r#"{ event.k * 2 > 5 }"#,
@@ -7155,7 +7223,7 @@ async fn search_statement_answers_written_out_on_fixture_p() {
         // r05
         (
             r#"{ event:timeSinceStart * 2 > 3ms }"#,
-            "1111(1): 0001[event:timeSinceStart=Int 3000000]",
+            "1111(1): 0001[event:timeSinceStart=Str 3ms]",
         ),
         // r06
         (
@@ -7183,6 +7251,31 @@ async fn search_statement_answers_written_out_on_fixture_p() {
             written(&ask(&client_p, query, window).await, false),
             want,
         );
+    }
+    // Issue #601 part 1: the values whose recorded digests moved, written
+    // out at every recorded setting.
+    for (query, want) in [
+        // q05: the stored array's elements, each in its own arm.
+        (
+            r#"{ resource.rk_arr != nil }"#,
+            "1111(1): 0001[rk_arr=Arr [[\"stringValue\",\"x\"],[\"stringValue\",\"y\"]]]",
+        ),
+        (
+            r#"{ event.t != nil }"#,
+            "2222(1): 0003[t=Arr [[\"stringValue\",\"x\"],[\"stringValue\",\"y\"]]] | 1111(1): 0001[t=Str b]",
+        ),
+        // q13
+        (
+            r#"{ event:timeSinceStart > 1500us }"#,
+            "1111(1): 0001[event:timeSinceStart=Str 3ms]",
+        ),
+        // q29
+        (
+            r#"{ .t != nil }"#,
+            "2222(1): 0003[t=Arr [[\"stringValue\",\"x\"],[\"stringValue\",\"y\"]]] | 1111(1): 0001[t=Str b]",
+        ),
+    ] {
+        check_at_every_setting(&mut wrong, &client_p, query, window, want).await;
     }
     // Issue #600 part 3: a search aggregate's argument keeps the FIRST
     // element carrying it, where the projection takes the last: `…01`'s
@@ -8206,6 +8299,7 @@ fn grouped_trace_of(t: &pulsus_read::traces::TraceSearchResult) -> String {
                     Some(GroupValue::Double(bits)) => format!("double:{}", f64::from_bits(*bits)),
                     Some(GroupValue::Bool(b)) => format!("bool:{b}"),
                     Some(GroupValue::Nil) => "nil".to_string(),
+                    Some(v @ GroupValue::Array(_)) => format!("arr:{}", pulsus_read::wire_arm(v).1),
                     None => "<no key>".to_string(),
                 };
                 format!("{value} {} [{}]", g.matched, ids(&g.spans))
@@ -8584,11 +8678,11 @@ async fn by_reads_typed_values_only() {
     for (query, literal) in [
         (
             r#"{ name = "all" } | by(span.v)"#,
-            r#"90 7 [91, 92, 93, 94, 95, 96, 97] {["x","y"] 1 [91]; nil 3 [92, 93, 96]; [1,2] 1 [94]; x 1 [95]; [] 1 [97]}"#,
+            r#"90 7 [91, 92, 93, 94, 95, 96, 97] {arr:[["stringValue","x"],["stringValue","y"]] 1 [91]; nil 3 [92, 93, 96]; arr:[["intValue","1"],["intValue","2"]] 1 [94]; x 1 [95]; arr:[] 1 [97]}"#,
         ),
         (
             r#"{ name = "arr" } | by(span.arrx)"#,
-            r#"91 5 [a1, a2, a3, a4, a5] {["x","y"] 1 [a1]; [1,2] 1 [a2]; [] 1 [a3]; x 1 [a4]; nil 1 [a5]}"#,
+            r#"91 5 [a1, a2, a3, a4, a5] {arr:[["stringValue","x"],["stringValue","y"]] 1 [a1]; arr:[["intValue","1"],["intValue","2"]] 1 [a2]; arr:[] 1 [a3]; x 1 [a4]; nil 1 [a5]}"#,
         ),
         (
             r#"{ name = "kv" } | by(span.kvx)"#,
@@ -9020,6 +9114,9 @@ fn selected_answer_of(
                                     }
                                     GroupValue::Bool(b) => format!("bool:{b}"),
                                     GroupValue::Nil => "nil".to_string(),
+                                    GroupValue::Array(_) => {
+                                        format!("arr:{}", pulsus_read::wire_arm(a.value()).1)
+                                    }
                                 };
                                 format!("{}={v}", a.key())
                             })
@@ -15750,13 +15847,13 @@ const UNTYPED_CASES: [(&str, &str, &str, u64); 15] = [
     (
         "U6",
         "{ } | by(span.bd)",
-        "e1 4 [01, 02, 03, 04] {[true,false] 1 [01]; nil 3 [02, 03, 04]}",
+        r#"e1 4 [01, 02, 03, 04] {arr:[["boolValue","true"],["boolValue","false"]] 1 [01]; nil 3 [02, 03, 04]}"#,
         1,
     ),
     (
         "U7",
         "{ } | by(span.dd)",
-        "e1 4 [01, 02, 03, 04] {[1.5,2.5] 1 [01]; nil 3 [02, 03, 04]}",
+        r#"e1 4 [01, 02, 03, 04] {arr:[["doubleValue","1.5"],["doubleValue","2.5"]] 1 [01]; nil 3 [02, 03, 04]}"#,
         1,
     ),
     (

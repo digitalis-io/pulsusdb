@@ -4368,6 +4368,160 @@ async fn a_climb_past_the_configured_depth_answers_422() {
 }
 
 // ---------------------------------------------------------------------
+// Issue #601 part 1: a projected duration and an array, each in its own arm.
+// ---------------------------------------------------------------------
+
+/// An array attribute of the given elements.
+fn kv_array(key: &str, values: Vec<Value>) -> KeyValue {
+    KeyValue {
+        key: key.to_string(),
+        value: Some(AnyValue {
+            value: Some(Value::ArrayValue(
+                opentelemetry_proto::tonic::common::v1::ArrayValue {
+                    values: values
+                        .into_iter()
+                        .map(|v| AnyValue { value: Some(v) })
+                        .collect(),
+                },
+            )),
+        }),
+        key_strindex: 0,
+    }
+}
+
+/// T5: span 1 holds an event 20 ms after its start, `tags = ["x","y"]`,
+/// `nums = [1,2]`, `one = ["z"]` and `none = []`; span 2 holds
+/// `tags = ["x","y"]` and the string `one = "z"`. Each projected value, and
+/// the `by(span.tags)` group value, is the JSON object `docs/api.md` §4.2
+/// states.
+#[tokio::test]
+async fn projected_durations_and_arrays_render_in_their_own_arms() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_601;
+    let db = &pulsus_testkit::test_db("pulsus_traces_search_it_601");
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[]);
+    let base = now_s() - 3_600;
+    let s = |v: &str| Value::StringValue(v.to_string());
+    let start = ts(base, 10);
+    let mut one = span(
+        tid(0x61),
+        sid(1),
+        None,
+        "arr",
+        start,
+        100 * MS,
+        vec![
+            kv_array("tags", vec![s("x"), s("y")]),
+            kv_array("nums", vec![Value::IntValue(1), Value::IntValue(2)]),
+            kv_array("one", vec![s("z")]),
+            kv_array("none", vec![]),
+        ],
+    );
+    one.events = vec![opentelemetry_proto::tonic::trace::v1::span::Event {
+        time_unix_nano: start + 20 * MS,
+        name: "e".to_string(),
+        attributes: vec![],
+        dropped_attributes_count: 0,
+    }];
+    let two = span(
+        tid(0x61),
+        sid(2),
+        Some(sid(1)),
+        "arr",
+        ts(base, 11),
+        100 * MS,
+        vec![kv_array("tags", vec![s("x"), s("y")]), kv_str("one", "z")],
+    );
+    ingest(port, vec![one, two], checkout_resource(), "seed #601 spans");
+
+    /// The value object of `key` on the span `span_hex`, from any span set.
+    fn projected(json: &serde_json::Value, span_hex: &str, key: &str) -> serde_json::Value {
+        json["traces"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|t| t["spanSets"].as_array().into_iter().flatten())
+            .flat_map(|set| set["spans"].as_array().into_iter().flatten())
+            .filter(|sp| sp["spanID"].as_str() == Some(span_hex))
+            .flat_map(|sp| sp["attributes"].as_array().into_iter().flatten())
+            .find(|a| a["key"].as_str() == Some(key))
+            .map_or(serde_json::Value::Null, |a| a["value"].clone())
+    }
+    let (s1, s2) = (hex(&sid(1)), hex(&sid(2)));
+    let xy = serde_json::json!({"arrayValue": {"values": [
+        {"stringValue": "x"}, {"stringValue": "y"}
+    ]}});
+    let cases: Vec<(&str, &str, &str, serde_json::Value)> = vec![
+        (
+            "{ event:timeSinceStart > 10ms }",
+            &s1,
+            "event:timeSinceStart",
+            serde_json::json!({"stringValue": "20ms"}),
+        ),
+        ("{ span.tags != nil }", &s1, "tags", xy.clone()),
+        ("{ span.tags != nil }", &s2, "tags", xy.clone()),
+        (
+            "{ span.nums != nil }",
+            &s1,
+            "nums",
+            serde_json::json!({"arrayValue": {"values": [
+                {"intValue": "1"}, {"intValue": "2"}
+            ]}}),
+        ),
+        (
+            "{ span.one != nil }",
+            &s1,
+            "one",
+            serde_json::json!({"arrayValue": {"values": [{"stringValue": "z"}]}}),
+        ),
+        (
+            "{ span.one != nil }",
+            &s2,
+            "one",
+            serde_json::json!({"stringValue": "z"}),
+        ),
+        (
+            "{ span.none != nil }",
+            &s1,
+            "none",
+            serde_json::json!({"arrayValue": {}}),
+        ),
+    ];
+    let mut wrong: Vec<String> = Vec::new();
+    for (q, span_hex, key, want) in cases {
+        let res = search(port, q, base, base + 600, "", q);
+        let json: serde_json::Value = serde_json::from_slice(&res.body).expect("a JSON body");
+        let got = projected(&json, span_hex, key);
+        if got != want {
+            wrong.push(format!("{q} span {span_hex} {key}: got {got}, want {want}"));
+        }
+    }
+    let q = "{ name = \"arr\" } | by(span.tags)";
+    let res = search(port, q, base, base + 600, "", q);
+    let json: serde_json::Value = serde_json::from_slice(&res.body).expect("a JSON body");
+    let groups: Vec<serde_json::Value> = json["traces"][0]["spanSets"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|set| set["attributes"].clone())
+        .collect();
+    let want = vec![serde_json::json!([{"key": "by(span.tags)", "value": xy}])];
+    if groups != want {
+        wrong.push(format!(
+            "{q}: got {}, want {}",
+            serde_json::Value::from(groups),
+            serde_json::Value::from(want)
+        ));
+    }
+    drop_db(db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+// ---------------------------------------------------------------------
 // Issue #601 part 2: the exact instant window, and the retention floor on
 // every windowed read.
 // ---------------------------------------------------------------------
