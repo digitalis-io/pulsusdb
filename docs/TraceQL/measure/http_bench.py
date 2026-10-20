@@ -215,7 +215,8 @@ def self_test():
         if path == '/search': return 200, one
         return 200, b'{}'
     def theirs(path, n):
-        if path == '/search': return 200, b'{"traces":[]}'
+        # the first answer is the one kept: later ones hold a trace
+        if path == '/search': return 200, b'{"traces":[]}' if n == 1 else one
         return 200, b'{}'
     p, ps = stub(ours)
     r, rs = stub(theirs)

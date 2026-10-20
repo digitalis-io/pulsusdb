@@ -18180,9 +18180,10 @@ fn tid4a(n: u8) -> Vec<u8> {
 }
 
 /// The trace-level fixture of part 4a, over the one-hour window from `w0`:
-/// P (`a1`) wholly inside it, 2 s long; Q (`a2`) with one span inside and
-/// its last span after the end; R (`a3`) with spans before the start and
-/// after the end only; S (`a4`) inside and 0.5 s long; and, `with_m`, M
+/// P (`a1`) wholly inside it, 2 s long; Q (`a2`) with one span inside,
+/// the oldest of any trace's, and its last span after the end; R (`a3`) with spans before the start and
+/// after the end only, its last start the newest of all; S (`a4`) inside
+/// and 0.5 s long; and, `with_m`, M
 /// (`a5`), inside, root `m`, 2 s long. No span lies in the window's newest
 /// five minutes, so the sliced plan's first slice finds nothing.
 fn tl4a_bodies(w0: i64, with_m: bool) -> Vec<ExportTraceServiceRequest> {
@@ -18224,7 +18225,7 @@ fn tl4a_bodies(w0: i64, with_m: bool) -> Vec<ExportTraceServiceRequest> {
             "svc",
             "pod-q",
             vec![
-                one(0xa2, 0x21, root.clone(), "q", w0 + 3_000 * s, s / 10),
+                one(0xa2, 0x21, root.clone(), "q", w0 + 300 * s, s / 10),
                 one(
                     0xa2,
                     0x22,
@@ -18245,7 +18246,7 @@ fn tl4a_bodies(w0: i64, with_m: bool) -> Vec<ExportTraceServiceRequest> {
                     0x32,
                     span_id_bytes(0x31),
                     "r-child",
-                    end + 60 * s,
+                    end + 120 * s,
                     s / 10,
                 ),
             ],
@@ -18366,12 +18367,21 @@ async fn a_trace_level_search_reads_spans_only_for_its_answer() {
     let engine = engine_of(&db).await;
     let (answer, n) =
         routed_with_statements(&engine, &client, &db, "{ traceDuration > 1s }", w).await;
+    // At limit 1 the newest trace by its last span IN the window is P; Q's
+    // last start, after the window, is newer, so a statement that ranked an
+    // edge trace by its last start would choose Q.
+    let plan = plan_of(&engine, &parse_query("{ traceDuration > 1s }"), w, 1, 3);
+    let newest = grouped_answer_of(&engine.search_routed(&plan).await);
     drop_db(&db).await;
     assert_eq!(
-        answer, "a2 1 [21]; a1 2 [11, 12]",
+        answer, "a1 2 [11, 12]; a2 1 [21]",
         "P and Q with today's last and matched; R and S absent"
     );
     assert_eq!(n, 1, "one statement for the request");
+    assert_eq!(
+        newest, "a1 2 [11, 12]",
+        "limit 1: P; Q ranks by its span in the window, the oldest"
+    );
 }
 
 /// T10b (issue #601 part 4a): **a trace with no `traces` row is answered
@@ -18384,8 +18394,8 @@ async fn a_trace_with_no_index_row_is_answered_as_today() {
     skip_unless_live!();
     let (db, client, w) = seed_tl4a("t10b", true).await;
     let engine = engine_of(&db).await;
-    let all = "a2 1 [21]; a5 2 [51, 52]; a4 1 [41]; a1 2 [11, 12]";
-    let long = "a2 1 [21]; a1 2 [11, 12]";
+    let all = "a5 2 [51, 52]; a4 1 [41]; a1 2 [11, 12]; a2 1 [21]";
+    let long = "a1 2 [11, 12]; a2 1 [21]";
     let mut wrong = Vec::new();
     for (q, want, m_present, statements) in [
         ("{ traceDuration > 1s }", long, false, 1),
@@ -18442,8 +18452,8 @@ async fn an_excluded_trace_only_shape_runs_as_today() {
     skip_unless_live!();
     let (db, client, w) = seed_tl4a("t10c", false).await;
     let engine = engine_of(&db).await;
-    let all = "a2 1 [21]; a4 1 [41]; a1 2 [11, 12]";
-    let long = "a2 1 [21]; a1 2 [11, 12]";
+    let all = "a4 1 [41]; a1 2 [11, 12]; a2 1 [21]";
+    let long = "a1 2 [11, 12]; a2 1 [21]";
     let mut wrong = Vec::new();
     for (q, want) in [
         ("{ traceDuration > 1s && rootName != nil }", None),
@@ -18509,7 +18519,7 @@ async fn a_literal_first_comparison_takes_the_shortcut() {
     let engine = engine_of(&db).await;
     let mut wrong = Vec::new();
     for (q, want) in [
-        ("{ 1s < traceDuration }", "a2 1 [21]; a1 2 [11, 12]"),
+        ("{ 1s < traceDuration }", "a1 2 [11, 12]; a2 1 [21]"),
         (r#"{ "m" = rootName }"#, ""),
     ] {
         let (answer, n) = routed_with_statements(&engine, &client, &db, q, w).await;
