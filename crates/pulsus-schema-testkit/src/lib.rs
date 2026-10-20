@@ -30,8 +30,13 @@ pub async fn run_init(client: &ChClient, params: &SchemaParams) -> Result<(), Sc
     let version = pulsus_schema::server_version(client).await?;
     pulsus_schema::check_version(&version)?;
     for stmt in rendered_statements(params) {
+        // The client reads a bare `?` as a query argument; `??` sends one.
         client
-            .execute(&stmt, &QuerySettings::new(), Idempotency::Idempotent)
+            .execute(
+                &stmt.replace('?', "??"),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
             .await?;
     }
     Ok(())
