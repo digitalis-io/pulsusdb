@@ -323,6 +323,7 @@ fn plan_with(
             end_ns: end_s * NS,
             step_ms,
             exemplars,
+            floor_ns: i64::MIN,
         },
         &engine.metrics_ctx(),
     )
@@ -3272,6 +3273,7 @@ async fn the_range_probe_rejects_groups_outside_the_instant_window() {
             end_ns: (aligned + month) * NS,
             step_ms: 1,
             exemplars: None,
+            floor_ns: i64::MIN,
         },
         &capped.metrics_ctx(),
     )

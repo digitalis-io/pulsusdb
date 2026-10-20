@@ -94,6 +94,7 @@ fn golden(stem: &str, query: &str) -> String {
             end_ns: 1_791_410_800_000_000_000,
             step_ms: 60_000,
             exemplars: None,
+            floor_ns: i64::MIN,
         },
         &MetricsCtx {
             filter: SpanFilterCtx {

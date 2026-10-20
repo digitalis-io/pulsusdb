@@ -4366,3 +4366,318 @@ async fn a_climb_past_the_configured_depth_answers_422() {
     );
     drop_db(db).await;
 }
+
+// ---------------------------------------------------------------------
+// Issue #601 part 2: the exact instant window, and the retention floor on
+// every windowed read.
+// ---------------------------------------------------------------------
+
+/// Pushes one request holding one resource per `(resource, spans)` entry,
+/// and waits for every span in the landing-fed tables.
+fn push_resources(port: u16, resources: Vec<(Vec<KeyValue>, Vec<Span>)>, ctx: &str) {
+    let req = ExportTraceServiceRequest {
+        resource_spans: resources
+            .into_iter()
+            .map(|(attributes, spans)| ResourceSpans {
+                resource: Some(Resource {
+                    attributes,
+                    dropped_attributes_count: 0,
+                    entity_refs: vec![],
+                }),
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans,
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            })
+            .collect(),
+    };
+    let res = request(
+        port,
+        "POST",
+        "/v1/traces",
+        Some(("application/x-protobuf", &req.encode_to_vec())),
+    )
+    .unwrap_or_else(|| panic!("{ctx}: ingest must be reachable"));
+    assert_eq!(
+        res.status,
+        200,
+        "{ctx}: sync ingest must succeed, body {:?}",
+        String::from_utf8_lossy(&res.body)
+    );
+    live_db::settle_pushed_spans(port, &pushed_keys(&req), ctx);
+}
+
+/// A 200 JSON answer from `path`.
+fn ok_json(port: u16, path: &str, ctx: &str) -> serde_json::Value {
+    let res = get(port, path, ctx);
+    assert_eq!(
+        res.status,
+        200,
+        "{ctx}: {path} must answer 200, body {:?}",
+        String::from_utf8_lossy(&res.body)
+    );
+    res.json(ctx)
+}
+
+/// The instant route's `series`, each `(labels, value)`, sorted.
+fn instant_series(port: u16, q: &str, window: &str, ctx: &str) -> Vec<String> {
+    let json = ok_json(
+        port,
+        &format!("/api/traces/v1/metrics/query?q={}&{window}", enc(q)),
+        ctx,
+    );
+    let mut out: Vec<String> = json["series"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{ctx}: a series array, body {json}"))
+        .iter()
+        .map(|s| format!("{} = {}", s["labels"], s["value"]))
+        .collect();
+    out.sort();
+    out
+}
+
+/// The range route's `series`, each `(labels, samples)` with exemplars
+/// left out, sorted.
+fn range_series(port: u16, q: &str, window: &str, ctx: &str) -> Vec<String> {
+    let json = ok_json(
+        port,
+        &format!("/api/traces/v1/metrics/query_range?q={}&{window}", enc(q)),
+        ctx,
+    );
+    let mut out: Vec<String> = json["series"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{ctx}: a series array, body {json}"))
+        .iter()
+        .map(|s| format!("{} = {}", s["labels"], s["samples"]))
+        .collect();
+    out.sort();
+    out
+}
+
+/// P8: the instant route evaluates exactly `[start, end)` and reads no
+/// `step`. With `step=3600s` read, `start = t + 1 s` snapped back to `t`
+/// and counted the span there.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_instant_window_is_the_requested_window() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_771;
+    let db = &pulsus_testkit::test_db("pulsus_traces_instant_window_it");
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[]);
+
+    // A whole hour, inside the default retention.
+    let t = (now_s() / 3_600 - 3) * 3_600;
+    let at = |s: i64| (s as u64) * 1_000_000_000;
+    ingest(
+        port,
+        vec![
+            span(tid(1), sid(1), None, "early", at(t), MS, vec![]),
+            span(tid(2), sid(2), None, "late", at(t + 3_600), MS, vec![]),
+        ],
+        checkout_resource(),
+        "instant window",
+    );
+
+    let q = "{} | count_over_time()";
+    let total = |start: i64, end: i64| -> f64 {
+        let ctx = format!("instant [{start}, {end})");
+        let json = ok_json(
+            port,
+            &format!(
+                "/api/traces/v1/metrics/query?q={}&start={start}&end={end}&step=3600s",
+                enc(q)
+            ),
+            &ctx,
+        );
+        json["series"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{ctx}: a series array, body {json}"))
+            .iter()
+            .filter_map(|s| s["value"].as_f64())
+            .sum()
+    };
+    let got = [
+        total(t + 1, t + 3_600),
+        total(t, t + 3_600),
+        total(t + 1, t + 3_601),
+    ];
+    drop_db(db).await;
+    assert_eq!(
+        got,
+        [0.0, 1.0, 1.0],
+        "[t + 1 s, t + 3600 s) holds neither span; [t, t + 3600 s) holds the one at t; \
+         [t + 1 s, t + 3601 s) holds the one at t + 3600 s"
+    );
+}
+
+/// P9: no windowed read returns a span past retention that storage still
+/// holds. A sits 30 s past the one-day cutoff and B 30 s inside it, in one
+/// push and one UTC day, so one part holds both and the table's TTL cannot
+/// have removed A.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_windowed_read_returns_a_span_past_retention() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_772;
+    let db = &pulsus_testkit::test_db("pulsus_traces_retention_floor_it");
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[("PULSUS_RETENTION_DAYS", "1")]);
+
+    // A and B on one UTC day: wait for the next minute and recompute
+    // otherwise, never skip.
+    let (a_s, b_s) = loop {
+        let now = now_s();
+        let (a, b) = (now - 86_400 - 30, now - 86_400 + 30);
+        if a.div_euclid(86_400) == b.div_euclid(86_400) {
+            break (a, b);
+        }
+        std::thread::sleep(Duration::from_secs(61 - (now % 60) as u64));
+    };
+    let pair = |trace: u8, name: &str, at_s: i64, k: &str| -> (Span, Span) {
+        let start = (at_s as u64) * 1_000_000_000;
+        let mut client = span(
+            tid(trace),
+            sid(trace),
+            None,
+            name,
+            start,
+            10 * MS,
+            vec![kv_str("k", k)],
+        );
+        client.kind = 3;
+        let mut server = span(
+            tid(trace),
+            sid(trace + 100),
+            Some(sid(trace)),
+            name,
+            start + MS,
+            5 * MS,
+            vec![kv_str("k", k)],
+        );
+        server.kind = 2;
+        (client, server)
+    };
+    let (a_client, a_server) = pair(1, "A", a_s, "a");
+    let (b_client, b_server) = pair(2, "B", b_s, "b");
+    push_resources(
+        port,
+        vec![
+            (vec![kv_str("service.name", "c")], vec![a_client, b_client]),
+            (vec![kv_str("service.name", "s")], vec![a_server, b_server]),
+        ],
+        "retention seed",
+    );
+
+    let (w0, w1) = (a_s - 600, b_s + 600);
+    let window = format!("start={w0}&end={w1}");
+    let mut wrong: Vec<String> = Vec::new();
+
+    let traces = trace_set(&search(port, "{}", w0, w1, "", "search").json("search"));
+    if traces != ids(&[2]) {
+        wrong.push(format!("search: {traces:?}"));
+    }
+
+    for f in [
+        "count_over_time()",
+        "rate()",
+        "quantile_over_time(duration, .5)",
+        "histogram_over_time(duration)",
+        "count_over_time() by(name)",
+    ] {
+        let all = format!("{{}} | {f}");
+        let b_only = format!("{{ name = \"B\" }} | {f}");
+        for (form, got, want) in [
+            (
+                "range",
+                range_series(port, &all, &format!("{window}&step=60s"), &all),
+                range_series(port, &b_only, &format!("{window}&step=60s"), &b_only),
+            ),
+            (
+                "instant",
+                instant_series(port, &all, &window, &all),
+                instant_series(port, &b_only, &window, &b_only),
+            ),
+        ] {
+            if got != want {
+                wrong.push(format!("{form} {all}: {got:?}, B alone is {want:?}"));
+            }
+        }
+    }
+    let q = "{} | compare({ name = \"B\" })";
+    for (form, series) in [
+        (
+            "range",
+            range_series(port, q, &format!("{window}&step=60s"), q),
+        ),
+        ("instant", instant_series(port, q, &window, q)),
+    ] {
+        if series.is_empty() || series.iter().any(|s| s.contains("\"A\"")) {
+            wrong.push(format!("{form} {q}: {series:?}"));
+        }
+    }
+
+    let values = |path: &str| -> Vec<String> {
+        let json = ok_json(port, path, path);
+        json["tagValues"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{path}: tagValues, body {json}"))
+            .iter()
+            .map(|v| v["value"].as_str().unwrap_or("").to_string())
+            .collect()
+    };
+    let narrowed = values(&format!(
+        "/api/traces/v1/tag/span.k/values?q={}&{window}",
+        enc("{ resource.service.name = \"c\" }")
+    ));
+    if narrowed != ["b"] {
+        wrong.push(format!("q-narrowed span.k values: {narrowed:?}"));
+    }
+    let names = values(&format!("/api/traces/v1/tag/name/values?{window}"));
+    if names != ["B"] {
+        wrong.push(format!("name values: {names:?}"));
+    }
+
+    let graph = ok_json(
+        port,
+        &format!("/api/traces/v1/service_graph?{window}"),
+        "graph",
+    );
+    let calls: Vec<(String, String, u64)> = graph["edges"]
+        .as_array()
+        .unwrap_or_else(|| panic!("graph: edges, body {graph}"))
+        .iter()
+        .map(|e| {
+            (
+                e["client"].as_str().unwrap_or("").to_string(),
+                e["server"].as_str().unwrap_or("").to_string(),
+                e["calls"].as_u64().unwrap_or(0),
+            )
+        })
+        .collect();
+    if calls != [("c".to_string(), "s".to_string(), 1)] {
+        wrong.push(format!("graph: {calls:?}"));
+    }
+
+    let fetch = get(
+        port,
+        &format!("/api/traces/v1/trace/{}", hex(&tid(1))),
+        "fetch A",
+    );
+    if fetch.status != 200 {
+        wrong.push(format!("fetch of A's trace: {}", fetch.status));
+    }
+
+    drop_db(db).await;
+    assert!(
+        wrong.is_empty(),
+        "every windowed read must see B only:\n{}",
+        wrong.join("\n")
+    );
+}

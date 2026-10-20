@@ -150,6 +150,7 @@ fn wire_accepts(q: &str) -> bool {
                 end_ns: 1_700_010_800_000_000_000,
                 step_ms: 60_000,
                 exemplars: None,
+                floor_ns: i64::MIN,
             },
             &MetricsCtx {
                 filter,

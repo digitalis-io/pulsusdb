@@ -54,6 +54,18 @@ pub(crate) enum LegacyError {
          \\\\ are recognized inside quotes"
     )]
     InvalidEscape { escape: char, pos: usize },
+    /// A `tags` key given twice — the reference refuses it.
+    #[error("invalid 'tags': key {key:?} is given more than once")]
+    DuplicateKey { key: String },
+    /// A `minDuration`/`maxDuration` that is not a Go duration.
+    #[error("invalid {name}: {raw:?} is not a duration (e.g. 300ms, 1.5s, 1m30s)")]
+    InvalidDuration { name: &'static str, raw: String },
+    /// A negative `minDuration`/`maxDuration`.
+    #[error("invalid {name}: {raw:?} is negative")]
+    NegativeDuration { name: &'static str, raw: String },
+    /// `minDuration` above `maxDuration`.
+    #[error("invalid maxDuration: {max:?} is below minDuration {min:?}")]
+    MinAboveMax { min: String, max: String },
 }
 
 /// One parsed logfmt pair.
@@ -214,6 +226,7 @@ mod tests {
     /// path.
     #[test]
     fn tags_and_min_duration_compile_to_the_pinned_equivalent_traceql() {
+        // `100ms` compiles to its nanoseconds, the same value.
         let compiled =
             compile_legacy(Some("http.method=GET status=error"), Some("100ms"), None).unwrap();
         let compiled_ast = pulsus_traceql::parse(&compiled).expect("compiled TraceQL parses");
@@ -362,12 +375,17 @@ mod tests {
         }
     }
 
+    /// A key given twice is refused, as the reference refuses it
+    /// (`http.go:197-199`), rather than compiled to an always-false
+    /// conjunction.
     #[test]
-    fn duplicate_keys_become_repeated_conjuncts() {
-        let compiled = compile_legacy(Some("k=a k=b"), None, None).unwrap();
-        let ast = pulsus_traceql::parse(&compiled).expect("parses");
-        let expected = pulsus_traceql::parse(r#"{ .k="a" && .k="b" }"#).expect("parses");
-        assert_eq!(ast, expected);
+    fn a_duplicate_key_is_refused() {
+        assert_eq!(
+            compile_legacy(Some("k=a k=b"), None, None),
+            Err(LegacyError::DuplicateKey {
+                key: "k".to_string()
+            })
+        );
     }
 
     #[test]
@@ -383,10 +401,68 @@ mod tests {
         assert_eq!(ast, expected);
     }
 
+    /// A duration that is not a Go duration is refused here, with its
+    /// own variant, before any TraceQL is built.
     #[test]
-    fn a_malformed_duration_surfaces_as_a_parser_error_single_validation_path() {
-        let compiled = compile_legacy(None, Some("100xs"), None).unwrap();
-        assert!(pulsus_traceql::parse(&compiled).is_err());
+    fn a_malformed_duration_is_refused_before_compilation() {
+        for raw in ["100xs", "1.5", "s", "1m30", "--1s", ""] {
+            assert_eq!(
+                compile_legacy(None, Some(raw), None),
+                Err(LegacyError::InvalidDuration {
+                    name: "minDuration",
+                    raw: raw.to_string()
+                }),
+                "{raw:?}"
+            );
+        }
+        assert_eq!(
+            compile_legacy(None, None, Some("2 s")),
+            Err(LegacyError::InvalidDuration {
+                name: "maxDuration",
+                raw: "2 s".to_string()
+            })
+        );
+    }
+
+    /// P3: `minDuration`/`maxDuration` are Go durations, compiled exact to
+    /// the nanosecond; a negative one, and a minimum above the maximum,
+    /// are refused; and so is a `tags` key given twice.
+    #[test]
+    fn legacy_durations_are_go_durations() {
+        let min = |raw: &str| compile_legacy(None, Some(raw), None);
+        assert_eq!(min("1m30s").unwrap(), "{ duration >= 90000000000ns }");
+        assert_eq!(min("0").unwrap(), "{ duration >= 0ns }");
+        assert_eq!(min("1.5ms").unwrap(), "{ duration >= 1500000ns }");
+        assert_eq!(min("1h2m3.5s").unwrap(), "{ duration >= 3723500000000ns }");
+        assert_eq!(min("+2us").unwrap(), "{ duration >= 2000ns }");
+        assert_eq!(min("3µs").unwrap(), "{ duration >= 3000ns }");
+        for compiled in [min("1m30s").unwrap(), min("0").unwrap()] {
+            assert!(pulsus_traceql::parse(&compiled).is_ok(), "{compiled}");
+        }
+        assert_eq!(
+            min("-1s"),
+            Err(LegacyError::NegativeDuration {
+                name: "minDuration",
+                raw: "-1s".to_string()
+            })
+        );
+        assert_eq!(
+            compile_legacy(None, Some("2s"), Some("1s")),
+            Err(LegacyError::MinAboveMax {
+                min: "2s".to_string(),
+                max: "1s".to_string()
+            })
+        );
+        assert_eq!(
+            compile_legacy(None, Some("1s"), Some("2s")).unwrap(),
+            "{ duration >= 1000000000ns && duration <= 2000000000ns }"
+        );
+        assert_eq!(
+            compile_legacy(Some("a=1 a=2"), None, None),
+            Err(LegacyError::DuplicateKey {
+                key: "a".to_string()
+            })
+        );
     }
 
     #[test]

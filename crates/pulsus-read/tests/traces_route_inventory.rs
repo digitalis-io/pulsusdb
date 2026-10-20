@@ -94,6 +94,7 @@ fn side_of(query: &pulsus_traceql::Query, route: &str) -> &'static str {
             end_ns: START + 3_600_000_000_000,
             step_ms: 60_000,
             exemplars: None,
+            floor_ns: i64::MIN,
         };
         let ctx = MetricsCtx {
             filter: SpanFilterCtx {

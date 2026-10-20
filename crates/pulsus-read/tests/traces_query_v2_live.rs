@@ -12495,6 +12495,7 @@ fn routed_plan(
             end_ns: end_s * S_NS,
             step_ms,
             exemplars: None,
+            floor_ns: i64::MIN,
         },
         &engine.metrics_ctx(),
         &METRICS_TABLES,
@@ -13976,6 +13977,7 @@ fn routed_ok(
             end_ns: end_s * S_NS,
             step_ms: 60_000,
             exemplars: None,
+            floor_ns: i64::MIN,
         },
         &engine.metrics_ctx(),
         &METRICS_TABLES,
@@ -14433,6 +14435,7 @@ async fn child_counts_are_direct_children() {
         end_ns: (b + 60) * S_NS,
         step_ms: 60_000,
         exemplars: None,
+        floor_ns: i64::MIN,
     };
     let routed = pulsus_read::plan_trace_metrics_routed(
         &query,
@@ -14647,6 +14650,7 @@ async fn five_keys() {
             end_ns: (b + 60) * S_NS,
             step_ms: 60_000,
             exemplars: None,
+            floor_ns: i64::MIN,
         },
         &engine.metrics_ctx(),
         &METRICS_TABLES,
@@ -16695,6 +16699,7 @@ async fn a_metrics_negation_is_served_and_a_non_boolean_is_400() {
                 end_ns: end * S_NS,
                 step_ms: 60_000,
                 exemplars: None,
+                floor_ns: i64::MIN,
             },
             &engine.metrics_ctx(),
             &METRICS_TABLES,
@@ -17973,4 +17978,94 @@ async fn a_compare_root_crosses_midnight() {
     let edge: BTreeMap<String, f64> = [("s:edge.root".to_string(), 1.0)].into_iter().collect();
     assert_eq!(root_name("selection"), edge, "the child's rootName");
     assert_eq!(root_name("baseline"), edge, "the root's rootName");
+}
+
+// =====================================================================
+// Issue #601 part 2 — the retention floor on the metrics row windows
+// =====================================================================
+
+/// P12: every metrics statement reads spans from the floor on, while the
+/// grid stays the requested window's. The latest UTC midnight `M` is the
+/// floor; one span sits at `M − 60 s`, in the previous day's partition and
+/// the bucket labelled `M − 60 s`, and one at `M`, in the bucket labelled
+/// `M`. (Buckets are right-closed, so a span between the two labels would
+/// share `M`'s bucket.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_metrics_row_window_starts_at_the_floor_across_a_utc_midnight() {
+    skip_unless_live!();
+    let day_ns = 86_400 * S_NS;
+    let m = now_ns().div_euclid(day_ns) * day_ns;
+    let db = pulsus_testkit::test_db("pulsus_read_it_t601_floor");
+    let client = fresh_db(&db).await;
+    land_metric_spans(
+        &client,
+        0x61,
+        &[
+            ("checkout", 1, m - 60 * S_NS, MS_NS),
+            ("checkout", 2, m, MS_NS),
+        ],
+        "t601-floor",
+    )
+    .await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let query = parse_query("{} | count_over_time()");
+    let plan = |floor_ns: i64| {
+        pulsus_read::plan_trace_metrics_routed(
+            &query,
+            &pulsus_read::MetricsParams {
+                start_ns: m - 180 * S_NS,
+                end_ns: m + 120 * S_NS,
+                step_ms: 60_000,
+                exemplars: None,
+                floor_ns,
+            },
+            &engine.metrics_ctx(),
+            &METRICS_TABLES,
+        )
+        .expect("the routed plan")
+    };
+    let floored = plan(m);
+    let unfloored = plan(i64::MIN);
+    let samples = |answer: &MetricsAnswer| -> Vec<(i64, f64)> {
+        let out = answer
+            .as_ref()
+            .unwrap_or_else(|e| panic!("the metrics read failed: {e}"));
+        assert_eq!(out.series.len(), 1, "one series: {out:?}");
+        out.series[0].samples.clone()
+    };
+    let at = |samples: &[(i64, f64)], label_ms: i64| -> f64 {
+        samples
+            .iter()
+            .find(|(t, _)| *t == label_ms)
+            .map(|(_, v)| *v)
+            .unwrap_or(0.0)
+    };
+    let range_floored = samples(&engine.metrics_range_routed(&floored).await);
+    let range_unfloored = samples(&engine.metrics_range_routed(&unfloored).await);
+    let instant = engine.metrics_instant_routed(&floored).await;
+    drop_db(&db).await;
+
+    let m_ms = m / MS_NS;
+    let before_ms = m_ms - 60_000;
+    assert_eq!(
+        (at(&range_unfloored, before_ms), at(&range_unfloored, m_ms)),
+        (1.0, 1.0),
+        "the fixture: one span in each bucket without the floor"
+    );
+    assert_eq!(
+        (at(&range_floored, before_ms), at(&range_floored, m_ms)),
+        (0.0, 1.0),
+        "the span before the floor is not read: {range_floored:?}"
+    );
+    let grid = |s: &[(i64, f64)]| s.iter().map(|(t, _)| *t).collect::<Vec<_>>();
+    assert_eq!(
+        grid(&range_floored),
+        grid(&range_unfloored),
+        "the grid is the requested window's"
+    );
+    assert_eq!(
+        samples(&instant).iter().map(|(_, v)| *v).sum::<f64>(),
+        1.0,
+        "the instant answer counts the span at M alone"
+    );
 }

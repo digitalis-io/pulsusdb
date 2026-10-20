@@ -56,6 +56,9 @@ pub struct MetricsParams {
     /// The HTTP `exemplars` parameter, normalised by the server:
     /// `None` when absent, empty, unparseable, zero or negative.
     pub exemplars: Option<u32>,
+    /// The retention floor: the first nanosecond any statement may read a
+    /// span from. `i64::MIN` floors nothing.
+    pub floor_ns: i64,
 }
 
 /// The emitted bucket grid (issue #477 (a)/(b)): `points` labels at
@@ -1217,6 +1220,7 @@ mod tests {
         end_ns: 1_700_010_800_000_000_000,
         step_ms: 60_000,
         exemplars: None,
+        floor_ns: i64::MIN,
     };
 
     fn plan(q: &str) -> TraceMetricsPlan {
@@ -1324,6 +1328,7 @@ mod tests {
                 end_ns: end_s * NS_PER_S,
                 step_ms,
                 exemplars: None,
+                floor_ns: i64::MIN,
             };
             let p = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx())
                 .unwrap_or_else(|e| panic!("{start_s}..{end_s} step {step_ms}ms: {e}"));
@@ -1379,6 +1384,7 @@ mod tests {
         let plan_ex = |q: &str, exemplars: Option<u32>| {
             let params = MetricsParams {
                 exemplars,
+                floor_ns: i64::MIN,
                 ..PARAMS
             };
             plan_trace_metrics(&parse(q).expect("parse"), &params, &ctx()).expect("plan")
@@ -1456,6 +1462,7 @@ mod tests {
                 end_ns: width_ms * NS_PER_MS,
                 step_ms,
                 exemplars: None,
+                floor_ns: i64::MIN,
             };
             let got = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx());
             match (want, got) {
@@ -1536,6 +1543,7 @@ mod tests {
             end_ns: 1_700_010_840_000_000_000,
             step_ms: 60_000,
             exemplars: None,
+            floor_ns: i64::MIN,
         };
         let p = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx()).unwrap();
         assert_eq!(
@@ -1675,6 +1683,7 @@ mod tests {
                 end_ns: 10 * NS_PER_S,
                 step_ms: 1_000,
                 exemplars: None,
+                floor_ns: i64::MIN,
             },
             &ctx(),
         )
@@ -1942,6 +1951,7 @@ mod tests {
             end_ns: PARAMS.start_ns,
             step_ms: 60_000,
             exemplars: None,
+            floor_ns: i64::MIN,
         };
         let err = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx())
             .expect_err("inverted window");
@@ -1956,6 +1966,7 @@ mod tests {
             end_ns: 12_000 * 1_000_000_000,
             step_ms: 1_000,
             exemplars: None,
+            floor_ns: i64::MIN,
         };
         let err = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx())
             .expect_err("over the cap");
@@ -1981,6 +1992,7 @@ mod tests {
             end_ns: i64::MAX,
             step_ms: 60_000,
             exemplars: None,
+            floor_ns: i64::MIN,
         };
         let err = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx())
             .expect_err("must reject, not panic");
@@ -1995,6 +2007,7 @@ mod tests {
             end_ns: i64::MIN + 1_000_000_000,
             step_ms: 60_000,
             exemplars: None,
+            floor_ns: i64::MIN,
         };
         let err = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx())
             .expect_err("must reject, not panic");
@@ -2012,6 +2025,7 @@ mod tests {
             end_ns: 9_000_000_000_000_000_000,
             step_ms: 1_000,
             exemplars: None,
+            floor_ns: i64::MIN,
         };
         let err = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx())
             .expect_err("must reject, not panic");
@@ -2031,6 +2045,7 @@ mod tests {
             end_ns: i64::MAX,
             step_ms: 1_000,
             exemplars: None,
+            floor_ns: i64::MIN,
         };
         let err = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx())
             .expect_err("must reject, not panic");
@@ -2060,6 +2075,7 @@ mod tests {
             end_ns: 8_000_000_000_000_000_000,
             step_ms: 2_000_000_000,
             exemplars: None,
+            floor_ns: i64::MIN,
         };
         let p = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx())
             .expect("8000 buckets is under the cap");
@@ -2073,6 +2089,7 @@ mod tests {
             end_ns: MAX_METRICS_POINTS * 1_000_000_000,
             step_ms: 1_000,
             exemplars: None,
+            floor_ns: i64::MIN,
         };
         assert!(plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx()).is_ok());
     }

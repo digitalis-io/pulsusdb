@@ -421,6 +421,7 @@ async fn pulsus_counts(
             end_ns: window.1,
             step_ms: window_s * 1_000,
             exemplars: None,
+            floor_ns: i64::MIN,
         },
         &engine.metrics_ctx(),
         &StatementTables {

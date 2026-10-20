@@ -33,15 +33,8 @@ pub(crate) async fn service_graph(
     }
 }
 
-fn now_unix_seconds() -> i64 {
-    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        Ok(d) => i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
-        Err(_) => 0,
-    }
-}
-
 async fn graph_impl(state: AppState, raw: &str) -> Result<Response, ApiError> {
-    let params = params::parse_graph_params(raw, now_unix_seconds())?;
+    let params = params::parse_graph_params(raw, super::tags::now_unix_nanos())?;
     let window = GraphWindow {
         start_ns: params.start_ns,
         end_ns: params.end_ns,
@@ -127,11 +120,11 @@ mod tests {
     // test state exercises them end to end; a well-formed request stops at
     // 503 (no pool), proving parse precedes execution.
 
+    /// No window is the last hour, the metrics routes' rule (§4.4).
     #[tokio::test]
-    async fn a_missing_window_is_400() {
+    async fn a_missing_window_is_the_last_hour_not_an_error() {
         let (status, body) = run("").await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(!body.contains("byte "), "body {body}");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body {body}");
     }
 
     #[tokio::test]
@@ -140,10 +133,12 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST, "body {body}");
     }
 
+    /// `since` is read only when `start` is absent, so sending it beside
+    /// both bounds is not an error.
     #[tokio::test]
-    async fn since_together_with_absolute_bounds_is_400() {
+    async fn since_beside_absolute_bounds_is_not_an_error() {
         let (status, body) = run("since=1h&start=1700000000&end=1700003600").await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "body {body}");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body {body}");
     }
 
     #[tokio::test]

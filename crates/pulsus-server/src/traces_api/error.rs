@@ -933,7 +933,7 @@ mod tests {
                 "Param",
                 ApiError::Param(TraceIdError::InvalidLength("abc".to_string())),
                 StatusCode::BAD_REQUEST,
-                r#"invalid trace id "abc": expected 16 or 32 hex characters"#,
+                r#"invalid trace id "abc": expected 1 to 32 hex characters"#,
                 None,
             ),
             (

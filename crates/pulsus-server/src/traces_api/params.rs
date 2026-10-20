@@ -122,6 +122,12 @@ pub(crate) enum SearchParamError {
     InvalidRange { start: i64, end: i64 },
     #[error("invalid {name:?} {raw:?}: expected a positive integer")]
     InvalidCount { name: &'static str, raw: String },
+    /// A `limit` above [`MAX_LIMIT`], in the reference's words.
+    #[error("limit {0} exceeds max limit 262144")]
+    LimitTooLarge(u32),
+    /// An `spss` above [`MAX_SPSS`], in the reference's words.
+    #[error("spans per span set exceeds 100. received {0}")]
+    SpssTooLarge(u32),
     #[error(
         "'q' and the legacy search params (tags/minDuration/maxDuration) are mutually \
          exclusive: supply one or the other, never both"
@@ -359,8 +365,10 @@ pub(crate) struct RawMetricsParams {
 /// as a 400.
 pub(crate) fn parse_metrics_params(
     raw: &str,
-    now_s: i64,
+    now_ns: i64,
+    _form: MetricsForm,
 ) -> Result<RawMetricsParams, MetricsParamError> {
+    let now_s = now_ns.div_euclid(1_000_000_000);
     let pairs = parse_pairs(raw);
     let q_key = get(&pairs, "q").filter(|s| !s.is_empty());
     let query_key = get(&pairs, "query").filter(|s| !s.is_empty());
@@ -427,6 +435,15 @@ pub(crate) fn parse_metrics_params(
         step_ms,
         exemplars,
     })
+}
+
+/// Which of the two metrics routes a request arrived on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MetricsForm {
+    /// `query_range`: a grid of buckets.
+    Range,
+    /// `query`: one bucket over the requested window.
+    Instant,
 }
 
 /// The `exemplars` request parameter (issue #477 (c)), normalised rather
@@ -639,7 +656,11 @@ pub(crate) struct RawGraphParams {
 /// RFC3339) XOR a relative `since` (whole-second duration), `now_s` feeding
 /// the `since` window (injected for testability). Any missing/invalid/
 /// conflicting window is an explicit `400`.
-pub(crate) fn parse_graph_params(raw: &str, now_s: i64) -> Result<RawGraphParams, GraphParamError> {
+pub(crate) fn parse_graph_params(
+    raw: &str,
+    now_ns: i64,
+) -> Result<RawGraphParams, GraphParamError> {
+    let now_s = now_ns.div_euclid(1_000_000_000);
     let pairs = parse_pairs(raw);
     let parse_ts = |name: &str| -> Result<Option<i64>, GraphParamError> {
         let Some(raw) = get(&pairs, name).filter(|s| !s.is_empty()) else {
@@ -678,6 +699,16 @@ pub(crate) fn parse_graph_params(raw: &str, now_s: i64) -> Result<RawGraphParams
         });
     }
     Ok(RawGraphParams { start_ns, end_ns })
+}
+
+/// The first nanosecond a windowed trace read may return (stub).
+pub(crate) fn retention_floor_ns(_retention_days: u32, _now_ns: i64) -> i64 {
+    0
+}
+
+/// A window's start raised to the retention floor (stub).
+pub(crate) fn floored_start(start_ns: i64, _end_ns: i64, _floor_ns: i64) -> i64 {
+    start_ns
 }
 
 /// Errors from parsing the `/api/traces/v1/tags` query parameters —
@@ -1058,12 +1089,28 @@ mod tests {
         );
     }
 
+    /// P4: 1 to 32 hex characters, left-padded with zeros to 32, the
+    /// reference's `HexStringToTraceID`.
     #[test]
-    fn an_odd_length_id_is_rejected() {
-        assert!(matches!(
-            parse_trace_id("abc"),
-            Err(TraceIdError::InvalidLength(_))
-        ));
+    fn a_trace_id_of_1_to_32_hex_characters_is_left_padded() {
+        assert_eq!(
+            parse_trace_id("11").unwrap(),
+            format!("{}11", "0".repeat(30))
+        );
+        let thirty_one = "4bf92f3577b34da6a3ce929d0e0e473";
+        assert_eq!(thirty_one.len(), 31);
+        assert_eq!(
+            parse_trace_id(thirty_one).unwrap(),
+            format!("0{thirty_one}")
+        );
+        assert_eq!(parse_trace_id("A").unwrap(), format!("{}a", "0".repeat(31)));
+        for raw in ["4bf92f3577b34da6a3ce929d0e0e47360", "", "zz"] {
+            assert!(parse_trace_id(raw).is_err(), "{raw:?} must be refused");
+        }
+        assert_eq!(
+            TraceIdError::InvalidLength("x".to_string()).to_string(),
+            r#"invalid trace id "x": expected 1 to 32 hex characters"#
+        );
     }
 
     #[test]
@@ -1087,14 +1134,6 @@ mod tests {
         let raw = "4bf92f3577b34da6a3ce929d0e0e47360";
         assert!(matches!(
             parse_trace_id(raw),
-            Err(TraceIdError::InvalidLength(_))
-        ));
-    }
-
-    #[test]
-    fn a_between_lengths_id_is_rejected() {
-        assert!(matches!(
-            parse_trace_id("a3ce929d0e0e47361"), // 17 chars
             Err(TraceIdError::InvalidLength(_))
         ));
     }
@@ -1141,13 +1180,15 @@ mod tests {
 
     #[test]
     fn timestamp_grammar_accepts_seconds_nanoseconds_and_rfc3339() {
-        // Seconds: below the 10^12 magnitude threshold.
+        // Seconds: ten characters or fewer.
         assert_eq!(
             parse_timestamp_ns("1700000000"),
             Some(1_700_000_000_000_000_000)
         );
         assert_eq!(parse_timestamp_ns("-100"), Some(-100_000_000_000));
-        // Nanoseconds: at/above the threshold, passed through verbatim.
+        // Nanoseconds: longer than ten characters, passed through
+        // verbatim — eleven digits included, though under 10^12.
+        assert_eq!(parse_timestamp_ns("99999999999"), Some(99_999_999_999));
         assert_eq!(
             parse_timestamp_ns("1700000000000000000"),
             Some(1_700_000_000_000_000_000)
@@ -1178,6 +1219,31 @@ mod tests {
         }
     }
 
+    /// P1: the reference's `parseTimestamp` — ten characters or fewer is
+    /// seconds, longer nanoseconds, a `.` is fractional seconds rounded to
+    /// the millisecond, anything else RFC3339.
+    #[test]
+    fn trace_timestamps_follow_the_reference_rule() {
+        assert_eq!(
+            parse_timestamp_ns("1700000000"),
+            Some(1_700_000_000_000_000_000)
+        );
+        assert_eq!(parse_timestamp_ns("17000000000"), Some(17_000_000_000));
+        assert_eq!(
+            parse_timestamp_ns("1700000000.25"),
+            Some(1_700_000_000_250_000_000)
+        );
+        assert_eq!(
+            parse_timestamp_ns("1700000000.0004"),
+            Some(1_700_000_000_000_000_000)
+        );
+        assert_eq!(
+            parse_timestamp_ns("2026-10-20T10:00:00.5Z"),
+            Some(1_792_490_400_500_000_000)
+        );
+        assert_eq!(parse_timestamp_ns("abc"), None);
+    }
+
     #[test]
     fn search_accepts_nanosecond_and_rfc3339_bounds() {
         let p = parse_search_params("q=%7B%7D&start=1700000000000000000&end=2023-11-14T23:13:20Z")
@@ -1200,7 +1266,6 @@ mod tests {
             "start=1&end=2&limit=abc",
             "start=1&end=2&limit=0",
             "start=1&end=2&spss=abc",
-            "start=1&end=2&spss=0",
         ] {
             assert!(
                 matches!(
@@ -1210,6 +1275,35 @@ mod tests {
                 "{query} must be rejected"
             );
         }
+    }
+
+    /// P2: `spss=0` is the default 3 (`engine.go:120-123`); `spss` over
+    /// 100 and `limit` over 262,144 are refused, in the reference's words.
+    #[test]
+    fn limit_and_spss_follow_the_reference() {
+        let parse = |extra: &str| parse_search_params(&format!("start=1&end=2&{extra}"));
+        assert_eq!(parse("spss=0").unwrap().spss, 3);
+        assert_eq!(parse("spss=100").unwrap().spss, 100);
+        let err = parse("spss=101").unwrap_err();
+        assert!(
+            matches!(err, SearchParamError::SpssTooLarge(101)),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "spans per span set exceeds 100. received 101"
+        );
+        assert_eq!(parse("limit=262144").unwrap().limit, 262_144);
+        let err = parse("limit=262145").unwrap_err();
+        assert!(
+            matches!(err, SearchParamError::LimitTooLarge(262_145)),
+            "{err:?}"
+        );
+        assert_eq!(err.to_string(), "limit 262145 exceeds max limit 262144");
+        assert!(matches!(
+            parse("limit=0"),
+            Err(SearchParamError::InvalidCount { .. })
+        ));
     }
 
     #[test]
@@ -1248,38 +1342,45 @@ mod tests {
     // -- metrics params (issue #59) ------------------------------------------
 
     const NOW_S: i64 = 1_700_000_000;
+    const NOW_NS: i64 = NOW_S * 1_000_000_000;
+    const S_NS: i64 = 1_000_000_000;
 
     #[test]
     fn a_minimal_metrics_request_parses_with_the_derived_step() {
         let p = parse_metrics_params(
             "q=%7B%7D%20%7C%20rate()&start=1700000000&end=1700003600",
-            NOW_S,
+            NOW_NS,
+            MetricsForm::Range,
         )
         .unwrap();
         assert_eq!(p.q.as_str(), "{} | rate()");
         assert_eq!(p.start_ns, 1_700_000_000_000_000_000);
         assert_eq!(p.end_ns, 1_700_003_600_000_000_000);
-        // Derivation: max(1, 3600 / DEFAULT_METRICS_POINTS(100)) = 36 s,
-        // carried in milliseconds since issue #477 (d).
-        assert_eq!(p.step_ms, 36_000);
+        // Fence D: 3600 s / 240 = 15 s, already a multiple of 5 s.
+        assert_eq!(p.step_ms, 15_000);
     }
 
     #[test]
-    fn a_short_window_derives_the_one_second_step_floor() {
-        // The FLOOR is still one whole second — only an explicit `step`
-        // gained sub-second forms (issue #477 (d)).
-        let p = parse_metrics_params("q=%7B%7D&start=100&end=110", NOW_S).unwrap();
-        assert_eq!(p.step_ms, 1_000);
+    fn a_short_window_derives_the_fifty_millisecond_step_floor() {
+        // Under one minute the derived step is a multiple of 50 ms, at
+        // least 50 ms: 10 s / 240 is under 50 ms.
+        let p =
+            parse_metrics_params("q=%7B%7D&start=100&end=110", NOW_NS, MetricsForm::Range).unwrap();
+        assert_eq!(p.step_ms, 50);
     }
 
     #[test]
-    fn the_query_alias_key_is_accepted_and_the_pair_conflicts() {
-        let p = parse_metrics_params("query=%7B%7D&start=1&end=2", NOW_S).unwrap();
+    fn the_query_alias_key_is_accepted_and_q_wins_over_it() {
+        let p =
+            parse_metrics_params("query=%7B%7D&start=1&end=2", NOW_NS, MetricsForm::Range).unwrap();
         assert_eq!(p.q.as_str(), "{}");
-        assert!(matches!(
-            parse_metrics_params("q=%7B%7D&query=%7B%7D&start=1&end=2", NOW_S),
-            Err(MetricsParamError::ConflictingQueryKeys)
-        ));
+        let p = parse_metrics_params(
+            "q=%7B%7D&query=%7B%20%7D&start=1&end=2",
+            NOW_NS,
+            MetricsForm::Range,
+        )
+        .unwrap();
+        assert_eq!(p.q.as_str(), "{}");
     }
 
     // --- issue #284: the TraceQL expression cap, at the reference's
@@ -1582,14 +1683,16 @@ mod tests {
         for key in ["q", "query"] {
             let ok = parse_metrics_params(
                 &format!("{key}={}&start=1&end=2", q_of_decoded_len(cap)),
-                NOW_S,
+                NOW_NS,
+                MetricsForm::Range,
             )
             .unwrap_or_else(|e| panic!("{key} at the cap must be accepted, got {e:?}"));
             assert_eq!(ok.q.as_str().len(), cap);
 
             let err = parse_metrics_params(
                 &format!("{key}={}&start=1&end=2", q_of_decoded_len(cap + 1)),
-                NOW_S,
+                NOW_NS,
+                MetricsForm::Range,
             )
             .expect_err("one byte over the cap is rejected");
             assert!(
@@ -1636,7 +1739,7 @@ mod tests {
         for raw in ["start=1&end=2", "q=&start=1&end=2"] {
             assert!(
                 matches!(
-                    parse_metrics_params(raw, NOW_S),
+                    parse_metrics_params(raw, NOW_NS, MetricsForm::Range),
                     Err(MetricsParamError::MissingQuery)
                 ),
                 "{raw} must be rejected"
@@ -1671,8 +1774,12 @@ mod tests {
             ("60000ms", 60_000),
             ("5m", 300_000),
         ] {
-            let p = parse_metrics_params(&format!("q=%7B%7D&start=1&end=7201&step={raw}"), NOW_S)
-                .unwrap_or_else(|e| panic!("step={raw} must be accepted, got {e}"));
+            let p = parse_metrics_params(
+                &format!("q=%7B%7D&start=1&end=7201&step={raw}"),
+                NOW_NS,
+                MetricsForm::Range,
+            )
+            .unwrap_or_else(|e| panic!("step={raw} must be accepted, got {e}"));
             assert_eq!(p.step_ms, expected_ms, "step={raw}");
         }
     }
@@ -1690,7 +1797,7 @@ mod tests {
             "",
         ] {
             let query = format!("q=%7B%7D&start=1&end=7201&step={raw}");
-            let result = parse_metrics_params(&query, NOW_S);
+            let result = parse_metrics_params(&query, NOW_NS, MetricsForm::Range);
             if raw.is_empty() {
                 // An empty step falls back to derivation, not an error.
                 assert!(result.is_ok());
@@ -1713,8 +1820,12 @@ mod tests {
     #[test]
     fn the_exemplars_parameter_normalises_by_value() {
         let parse = |suffix: &str| {
-            parse_metrics_params(&format!("q=%7B%7D&start=1&end=7201&step=60{suffix}"), NOW_S)
-                .unwrap_or_else(|e| panic!("exemplars{suffix:?} must not be an error, got {e}"))
+            parse_metrics_params(
+                &format!("q=%7B%7D&start=1&end=7201&step=60{suffix}"),
+                NOW_NS,
+                MetricsForm::Range,
+            )
+            .unwrap_or_else(|e| panic!("exemplars{suffix:?} must not be an error, got {e}"))
         };
         assert_eq!(parse("").exemplars, None, "absent");
         assert_eq!(parse("&exemplars=").exemplars, None, "empty");
@@ -1730,40 +1841,166 @@ mod tests {
     }
 
     #[test]
-    fn since_derives_the_window_from_now_and_conflicts_with_absolute_bounds() {
-        let p = parse_metrics_params("q=%7B%7D&since=1h", NOW_S).unwrap();
-        assert_eq!(p.start_ns, (NOW_S - 3_600) * 1_000_000_000);
-        assert_eq!(p.end_ns, NOW_S * 1_000_000_000);
-        for raw in [
-            "q=%7B%7D&since=1h&start=1",
-            "q=%7B%7D&since=1h&end=2",
-            "q=%7B%7D&since=1h&start=1&end=2",
-        ] {
-            assert!(
-                matches!(
-                    parse_metrics_params(raw, NOW_S),
-                    Err(MetricsParamError::ConflictingRange)
-                ),
-                "{raw} must conflict"
-            );
-        }
+    fn since_sets_the_default_start_and_yields_to_an_absolute_one() {
+        let p = parse_metrics_params("q=%7B%7D&since=1h", NOW_NS, MetricsForm::Range).unwrap();
+        assert_eq!((p.start_ns, p.end_ns), (NOW_NS - 3_600 * S_NS, NOW_NS));
+        let p = parse_metrics_params(
+            "q=%7B%7D&since=1h&start=1699999000",
+            NOW_NS,
+            MetricsForm::Range,
+        )
+        .unwrap();
+        assert_eq!((p.start_ns, p.end_ns), (1_699_999_000 * S_NS, NOW_NS));
+        let p = parse_metrics_params(
+            "q=%7B%7D&since=1h&end=1699990000",
+            NOW_NS,
+            MetricsForm::Range,
+        )
+        .unwrap();
+        assert_eq!(
+            (p.start_ns, p.end_ns),
+            ((1_699_990_000 - 3_600) * S_NS, 1_699_990_000 * S_NS)
+        );
         assert!(matches!(
-            parse_metrics_params("q=%7B%7D&since=soon", NOW_S),
+            parse_metrics_params("q=%7B%7D&since=soon", NOW_NS, MetricsForm::Range),
             Err(MetricsParamError::InvalidSince(_))
         ));
     }
 
     #[test]
-    fn a_missing_or_partial_absolute_range_is_rejected() {
-        for raw in ["q=%7B%7D", "q=%7B%7D&start=1", "q=%7B%7D&end=2"] {
-            assert!(
-                matches!(
-                    parse_metrics_params(raw, NOW_S),
-                    Err(MetricsParamError::MissingRange)
-                ),
-                "{raw} must be rejected"
+    fn a_missing_or_partial_range_takes_the_defaults() {
+        for (raw, want) in [
+            ("q=%7B%7D", (NOW_NS - 3_600 * S_NS, NOW_NS)),
+            ("q=%7B%7D&start=1699999000", (1_699_999_000 * S_NS, NOW_NS)),
+            (
+                "q=%7B%7D&end=1699990000",
+                ((1_699_990_000 - 3_600) * S_NS, 1_699_990_000 * S_NS),
+            ),
+        ] {
+            let p = parse_metrics_params(raw, NOW_NS, MetricsForm::Range)
+                .unwrap_or_else(|e| panic!("{raw}: {e}"));
+            assert_eq!((p.start_ns, p.end_ns), want, "{raw}");
+        }
+    }
+
+    /// P5: the reference's `determineBounds` — `end` defaults to now,
+    /// `start` to `since` before `min(end, now)`, `since` defaults to one
+    /// hour, is a Prometheus duration, and is read only when `start` is
+    /// absent; `q` wins over `query`.
+    #[test]
+    fn metrics_windows_take_the_reference_defaults() {
+        let window = |raw: &str| {
+            let p = parse_metrics_params(&format!("q=%7B%7D{raw}"), NOW_NS, MetricsForm::Range)
+                .unwrap_or_else(|e| panic!("{raw}: {e}"));
+            (p.start_ns, p.end_ns)
+        };
+        assert_eq!(window(""), (NOW_NS - 3_600 * S_NS, NOW_NS));
+        assert_eq!(window("&start=1699999000"), (1_699_999_000 * S_NS, NOW_NS));
+        assert_eq!(
+            window("&end=1699990000"),
+            ((1_699_990_000 - 3_600) * S_NS, 1_699_990_000 * S_NS)
+        );
+        assert_eq!(
+            window("&end=1700000600"),
+            (NOW_NS - 3_600 * S_NS, 1_700_000_600 * S_NS),
+            "an end after now: start is since before now"
+        );
+        for (since, secs) in [
+            ("1h30m", 5_400),
+            ("1d", 86_400),
+            ("2w", 14 * 86_400),
+            ("1y", 365 * 86_400),
+        ] {
+            assert_eq!(
+                window(&format!("&since={since}")),
+                (NOW_NS - secs * S_NS, NOW_NS),
+                "since={since}"
             );
         }
+        assert!(
+            matches!(
+                parse_metrics_params("q=%7B%7D&since=0", NOW_NS, MetricsForm::Range),
+                Err(MetricsParamError::InvalidRange { .. })
+            ),
+            "since=0 parses and leaves an empty window, a 400"
+        );
+        assert_eq!(
+            window("&since=1h&start=1699999000"),
+            (1_699_999_000 * S_NS, NOW_NS)
+        );
+        let p = parse_metrics_params(
+            "q=%7B%7D&query=%7B%20%7D&start=1&end=2",
+            NOW_NS,
+            MetricsForm::Range,
+        )
+        .unwrap();
+        assert_eq!(p.q.as_str(), "{}");
+        for bad in ["1.5h", "1h1h", "30m1h", "-1h", "h"] {
+            assert!(
+                matches!(
+                    parse_metrics_params(
+                        &format!("q=%7B%7D&since={bad}"),
+                        NOW_NS,
+                        MetricsForm::Range
+                    ),
+                    Err(MetricsParamError::InvalidSince(_))
+                ),
+                "since={bad}"
+            );
+        }
+    }
+
+    /// P6: the reference's `DefaultQueryRangeStep` — the window over 240,
+    /// rounded down as fence D states.
+    #[test]
+    fn the_default_step_is_the_reference_s() {
+        let base = 1_700_000_000 * S_NS;
+        for (width_ms, want_ms) in [
+            (3_600_000, 15_000),
+            (86_400_000, 300_000),
+            (7 * 86_400_000, 2_400_000),
+            (50_000, 200),
+            (30_000, 100),
+            (10_000, 50),
+            (61_000, 1_000),
+            (59_999, 200),
+            (60_000, 1_000),
+        ] {
+            let end = base + width_ms * 1_000_000;
+            let p = parse_metrics_params(
+                &format!("q=%7B%7D&start={base}&end={end}"),
+                NOW_NS,
+                MetricsForm::Range,
+            )
+            .unwrap();
+            assert_eq!(p.step_ms, want_ms, "a {width_ms} ms window");
+        }
+    }
+
+    /// P7: the instant request is one bucket; it reads no `step`.
+    #[test]
+    fn the_instant_route_reads_no_step() {
+        for step in ["1.5ms", "junk"] {
+            let raw = format!("q=%7B%7D&start=1700000000&end=1700003600&step={step}");
+            assert!(
+                parse_metrics_params(&raw, NOW_NS, MetricsForm::Instant).is_ok(),
+                "step={step}"
+            );
+        }
+    }
+
+    /// P11: the first kept second under the tables' TTL, and the start a
+    /// windowed read uses.
+    #[test]
+    fn the_retention_floor_is_the_first_kept_second() {
+        assert_eq!(
+            retention_floor_ns(1, 1_000_000 * S_NS + 500_000_000),
+            (1_000_000 - 86_400 + 1) * S_NS
+        );
+        assert_eq!(floored_start(10, 100, 50), 50);
+        assert_eq!(floored_start(70, 100, 50), 70);
+        assert_eq!(floored_start(10, 100, 100), 100);
+        assert_eq!(floored_start(10, 100, 150), 100);
     }
 
     #[test]
@@ -1772,13 +2009,14 @@ mod tests {
         // grammar (one parser — code review round 1 on issue #59).
         let p = parse_metrics_params(
             "q=%7B%7D&start=1700000000000000000&end=2023-11-14T23:13:20Z",
-            NOW_S,
+            NOW_NS,
+            MetricsForm::Range,
         )
         .unwrap();
         assert_eq!(p.start_ns, 1_700_000_000_000_000_000);
         assert_eq!(p.end_ns, 1_700_003_600_000_000_000);
-        // Derived step over the ns-precision window: 3600 / 100 = 36 s.
-        assert_eq!(p.step_ms, 36_000);
+        // Derived step over the ns-precision window: 3600 s / 240 = 15 s.
+        assert_eq!(p.step_ms, 15_000);
     }
 
     #[test]
@@ -1788,25 +2026,32 @@ mod tests {
         // request downstream — never a wrapped/negative step here).
         let p = parse_metrics_params(
             &format!("q=%7B%7D&start={}&end={}", i64::MIN, i64::MAX),
-            NOW_S,
+            NOW_NS,
+            MetricsForm::Range,
         )
         .unwrap();
         assert!(p.step_ms > 0);
-        assert_eq!(p.step_ms, ((u64::MAX / 1_000_000_000) / 100) as i64 * 1_000);
+        // Fence D: the width over 240, rounded down to whole hours.
+        let hour_ns = 3_600 * i128::from(S_NS);
+        let per_point = i128::from(u64::MAX) / 240;
+        assert_eq!(
+            i128::from(p.step_ms),
+            per_point / hour_ns * hour_ns / 1_000_000
+        );
     }
 
     #[test]
     fn metrics_bad_timestamps_and_inverted_ranges_are_rejected() {
         assert!(matches!(
-            parse_metrics_params("q=%7B%7D&start=abc&end=2", NOW_S),
+            parse_metrics_params("q=%7B%7D&start=abc&end=2", NOW_NS, MetricsForm::Range),
             Err(MetricsParamError::InvalidTimestamp(_))
         ));
         assert!(matches!(
-            parse_metrics_params("q=%7B%7D&start=200&end=100", NOW_S),
+            parse_metrics_params("q=%7B%7D&start=200&end=100", NOW_NS, MetricsForm::Range),
             Err(MetricsParamError::InvalidRange { .. })
         ));
         assert!(matches!(
-            parse_metrics_params("q=%7B%7D&start=100&end=100", NOW_S),
+            parse_metrics_params("q=%7B%7D&start=100&end=100", NOW_NS, MetricsForm::Range),
             Err(MetricsParamError::InvalidRange { .. })
         ));
     }
@@ -1815,67 +2060,57 @@ mod tests {
 
     #[test]
     fn a_minimal_graph_request_parses_an_absolute_window() {
-        let p = parse_graph_params("start=1700000000&end=1700003600", NOW_S).unwrap();
+        let p = parse_graph_params("start=1700000000&end=1700003600", NOW_NS).unwrap();
         assert_eq!(p.start_ns, 1_700_000_000_000_000_000);
         assert_eq!(p.end_ns, 1_700_003_600_000_000_000);
     }
 
     #[test]
-    fn graph_since_derives_the_window_and_conflicts_with_absolute_bounds() {
-        let p = parse_graph_params("since=1h", NOW_S).unwrap();
-        assert_eq!(p.start_ns, (NOW_S - 3_600) * 1_000_000_000);
-        assert_eq!(p.end_ns, NOW_S * 1_000_000_000);
-        for raw in [
-            "since=1h&start=1",
-            "since=1h&end=2",
-            "since=1h&start=1&end=2",
-        ] {
-            assert!(
-                matches!(
-                    parse_graph_params(raw, NOW_S),
-                    Err(GraphParamError::ConflictingRange)
-                ),
-                "{raw} must conflict"
-            );
-        }
+    fn graph_since_sets_the_default_start_and_yields_to_an_absolute_one() {
+        let p = parse_graph_params("since=1h", NOW_NS).unwrap();
+        assert_eq!((p.start_ns, p.end_ns), (NOW_NS - 3_600 * S_NS, NOW_NS));
+        let p = parse_graph_params("since=1d&start=1699999000", NOW_NS).unwrap();
+        assert_eq!((p.start_ns, p.end_ns), (1_699_999_000 * S_NS, NOW_NS));
         assert!(matches!(
-            parse_graph_params("since=soon", NOW_S),
+            parse_graph_params("since=soon", NOW_NS),
             Err(GraphParamError::InvalidSince(_))
         ));
     }
 
     #[test]
-    fn graph_missing_or_partial_range_is_rejected() {
-        for raw in ["", "start=1", "end=2"] {
-            assert!(
-                matches!(
-                    parse_graph_params(raw, NOW_S),
-                    Err(GraphParamError::MissingRange)
-                ),
-                "{raw:?} must be rejected"
-            );
+    fn graph_missing_or_partial_range_takes_the_defaults() {
+        for (raw, want) in [
+            ("", (NOW_NS - 3_600 * S_NS, NOW_NS)),
+            ("start=1699999000", (1_699_999_000 * S_NS, NOW_NS)),
+            (
+                "end=1699990000",
+                ((1_699_990_000 - 3_600) * S_NS, 1_699_990_000 * S_NS),
+            ),
+        ] {
+            let p = parse_graph_params(raw, NOW_NS).unwrap_or_else(|e| panic!("{raw:?}: {e}"));
+            assert_eq!((p.start_ns, p.end_ns), want, "{raw:?}");
         }
     }
 
     #[test]
     fn graph_bad_timestamps_and_inverted_ranges_are_rejected() {
         assert!(matches!(
-            parse_graph_params("start=abc&end=2", NOW_S),
+            parse_graph_params("start=abc&end=2", NOW_NS),
             Err(GraphParamError::InvalidTimestamp(_))
         ));
         assert!(matches!(
-            parse_graph_params("start=200&end=100", NOW_S),
+            parse_graph_params("start=200&end=100", NOW_NS),
             Err(GraphParamError::InvalidRange { .. })
         ));
         assert!(matches!(
-            parse_graph_params("start=100&end=100", NOW_S),
+            parse_graph_params("start=100&end=100", NOW_NS),
             Err(GraphParamError::InvalidRange { .. })
         ));
     }
 
     #[test]
     fn graph_accepts_nanosecond_and_rfc3339_bounds() {
-        let p = parse_graph_params("start=1700000000000000000&end=2023-11-14T23:13:20Z", NOW_S)
+        let p = parse_graph_params("start=1700000000000000000&end=2023-11-14T23:13:20Z", NOW_NS)
             .unwrap();
         assert_eq!(p.start_ns, 1_700_000_000_000_000_000);
         assert_eq!(p.end_ns, 1_700_003_600_000_000_000);

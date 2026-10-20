@@ -44,6 +44,7 @@ fn metrics_plan(q: &str) -> TraceMetricsPlan {
             end_ns: END_NS,
             step_ms: 60_000,
             exemplars: None,
+            floor_ns: i64::MIN,
         },
         &MetricsCtx {
             filter: filter_ctx(),
@@ -116,6 +117,7 @@ fn an_arithmetic_comparison_is_refused_by_metrics_and_is_not_claimed_to_render()
             end_ns: END_NS,
             step_ms: 60_000,
             exemplars: None,
+            floor_ns: i64::MIN,
         },
         &MetricsCtx {
             filter: filter_ctx(),

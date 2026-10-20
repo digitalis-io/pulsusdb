@@ -2987,3 +2987,208 @@ async fn six_request_classes_read_exactly_these_tables() {
 
     drop_db(db).await;
 }
+
+// ---------------------------------------------------------------------
+// Issue #601 part 2: the tag `limit`.
+// ---------------------------------------------------------------------
+
+/// P13: each route cuts its own projection after its own deduplication,
+/// static answers included, and a cut native answer sets `truncated`.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_tag_limit_cuts_each_projection_after_its_deduplication() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_773;
+    let db = pulsus_testkit::test_db("pulsus_traces_tag_limit_it");
+    let db = db.as_str();
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db);
+
+    let base_ns: u64 = (now_unix_s() - 600) as u64 * 1_000_000_000;
+    ingest(
+        port,
+        vec![
+            span(
+                1,
+                1,
+                "one",
+                base_ns,
+                vec![
+                    kv_int("a", 1),
+                    kv_str("b", "v"),
+                    kv_str("c", "v"),
+                    kv_str("k", "v"),
+                ],
+            ),
+            span(1, 2, "two", base_ns, vec![kv_str("a", "x"), kv_int("m", 1)]),
+            span(1, 3, "three", base_ns, vec![kv_str("m", "1")]),
+            span(1, 4, "four", base_ns, vec![kv_str("m", "2")]),
+            span(1, 5, "five", base_ns, vec![kv_str("m", "3")]),
+        ],
+        vec![
+            kv_str("service.name", "svc"),
+            kv_str("a", "r"),
+            kv_str("x", "r"),
+            kv_str("y", "r"),
+        ],
+        "tag limit seed",
+    );
+
+    let mut wrong: Vec<String> = Vec::new();
+    let mut check = |what: &str, ok: bool, got: String| {
+        if !ok {
+            wrong.push(format!("{what}: {got}"));
+        }
+    };
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+
+    // (a) names, per scope, the intrinsic scope included.
+    let full = get_ok_json(port, "/api/traces/v1/tags", "names unlimited");
+    let full_scopes = scopes_of(&full, "names unlimited");
+    let intrinsic: Vec<String> = full_scopes
+        .iter()
+        .find(|(n, _)| n == "intrinsic")
+        .map(|(_, t)| t.clone())
+        .unwrap_or_default();
+    assert!(intrinsic.len() > 2, "the intrinsic scope: {full}");
+    let want_cut = vec![
+        ("intrinsic".to_string(), intrinsic[..2].to_vec()),
+        ("resource".to_string(), s(&["a", "service.name"])),
+        ("span".to_string(), s(&["a", "b"])),
+    ];
+    for path in ["/api/traces/v1/tags?limit=2", "/api/v2/search/tags?limit=2"] {
+        let json = get_ok_json(port, path, path);
+        let got = scopes_of(&json, path);
+        check(path, got == want_cut, format!("{got:?}"));
+    }
+    let native = get_ok_json(port, "/api/traces/v1/tags?limit=2", "native names");
+    check(
+        "native names limit=2 truncated",
+        native["truncated"] == true,
+        native.to_string(),
+    );
+    let want_full = vec![
+        ("intrinsic".to_string(), intrinsic.clone()),
+        ("resource".to_string(), s(&["a", "service.name", "x", "y"])),
+        ("span".to_string(), s(&["a", "b", "c", "k", "m"])),
+    ];
+    for path in [
+        "/api/traces/v1/tags?limit=0",
+        "/api/traces/v1/tags?limit=junk",
+    ] {
+        let json = get_ok_json(port, path, path);
+        let got = scopes_of(&json, path);
+        check(
+            path,
+            got == want_full && json["truncated"] == false,
+            json.to_string(),
+        );
+    }
+
+    // (b) the static intrinsic scope alone.
+    let path = "/api/traces/v1/tags?scope=intrinsic&limit=1";
+    let json = get_ok_json(port, path, path);
+    let got = scopes_of(&json, path);
+    check(
+        path,
+        got == vec![("intrinsic".to_string(), intrinsic[..1].to_vec())]
+            && json["truncated"] == true,
+        json.to_string(),
+    );
+
+    // (c) the v1 flat list, cut after its cross-scope deduplication.
+    let path = "/api/search/tags?limit=5";
+    let json = get_ok_json(port, path, path);
+    check(
+        path,
+        json["tagNames"] == serde_json::json!(["a", "service.name", "x", "y", "b"]),
+        json.to_string(),
+    );
+
+    // (d) typed values, cut after the run rule.
+    for (path, want, truncated) in [
+        (
+            "/api/traces/v1/tag/span.a/values?limit=2",
+            vec![
+                ("int".to_string(), "1".to_string()),
+                ("string".to_string(), "x".to_string()),
+            ],
+            Some(false),
+        ),
+        (
+            "/api/traces/v1/tag/span.a/values?limit=1",
+            vec![("int".to_string(), "1".to_string())],
+            Some(true),
+        ),
+        (
+            "/api/v2/search/tag/span.a/values?limit=2",
+            vec![
+                ("int".to_string(), "1".to_string()),
+                ("string".to_string(), "x".to_string()),
+            ],
+            None,
+        ),
+        (
+            "/api/v2/search/tag/span.a/values?limit=1",
+            vec![("int".to_string(), "1".to_string())],
+            None,
+        ),
+    ] {
+        let json = get_ok_json(port, path, path);
+        let got = values_of(&json, path);
+        let flag_ok = match truncated {
+            Some(t) => json["truncated"] == t,
+            None => json.get("truncated").is_none(),
+        };
+        check(path, got == want && flag_ok, json.to_string());
+    }
+
+    // (e) a static value list.
+    let full = get_ok_json(port, "/api/traces/v1/tag/status/values", "status unlimited");
+    let first_status = values_of(&full, "status unlimited")
+        .into_iter()
+        .next()
+        .expect("a status value");
+    assert_eq!(first_status.0, "keyword", "{full}");
+    for (path, truncated) in [
+        ("/api/traces/v1/tag/status/values?limit=1", Some(true)),
+        ("/api/v2/search/tag/status/values?limit=1", None),
+    ] {
+        let json = get_ok_json(port, path, path);
+        let got = values_of(&json, path);
+        let flag_ok = match truncated {
+            Some(t) => json["truncated"] == t,
+            None => json.get("truncated").is_none(),
+        };
+        check(
+            path,
+            got == vec![first_status.clone()] && flag_ok,
+            json.to_string(),
+        );
+    }
+
+    // (f) the v1 flat values, cut after the value-only deduplication.
+    let path = "/api/search/tag/m/values?limit=2";
+    let json = get_ok_json(port, path, path);
+    check(
+        path,
+        json["tagValues"] == serde_json::json!(["1", "2"]),
+        json.to_string(),
+    );
+
+    drop_db(db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Unix seconds now.
+fn now_unix_s() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs(),
+    )
+    .expect("fits i64")
+}
