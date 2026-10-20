@@ -40,7 +40,7 @@ KIND_KEYWORDS = [k for k, _ in sorted(KIND_CODE.items(), key=lambda kv: kv[1])]
 STATUS_KEYWORDS = [k for k, _ in sorted(STATUS_CODE.items(), key=lambda kv: kv[1])]
 # The stored type each fixture value has, in the words the statement's `type`
 # column carries.
-VALUE_TYPE = {'s': 'string', 'i': 'int', 'd': 'double', 'b': 'bool', 'as': 'array'}
+VALUE_TYPE = {'s': 'string', 'i': 'int', 'd': 'double', 'b': 'bool', 'a': 'array'}
 
 
 def duration_ns(e):
@@ -56,6 +56,9 @@ class Fixture:
     def __init__(self, path):
         self.rows = [json.loads(l) for l in open(path)]
         for r in self.rows:
+            # `docs/api.md` §4.2: an array whose elements are of two types has
+            # no TraceQL type and is missing (#600 part 1b-3)
+            r['attrs'] = [a for a in r['attrs'] if a[1] != 'a' or len({e[0] for e in a[2]}) <= 1]
             r['attrs_map'] = {k: (t, v) for k, t, v in r['attrs']}
             r['res_map'] = {k: (t, v) for k, t, v in r['resource']}
             r['scope_map'] = {k: (t, v) for k, t, v in r.get('scope_attrs', [])}
@@ -122,6 +125,29 @@ def f32(x):
     return struct.unpack('f', struct.pack('f', float(x)))[0]
 
 
+def engine_double_text(x):
+    """A double as the engine's `toString` writes it inside an array: the
+    shortest digits that read back as the same double, positional while the
+    decimal point falls within 21 digits of them and 6 zeros after it, else
+    `<digits>e<exponent>` with no `+`; `-0`, `inf`, `-inf`, `nan` as such
+    (measured on the server, #600 part 1b-3)"""
+    x = float(x)
+    if x != x: return 'nan'
+    if x in (float('inf'), float('-inf')): return 'inf' if x > 0 else '-inf'
+    if x == 0: return '-0' if math.copysign(1, x) < 0 else '0'
+    sign = '-' if x < 0 else ''
+    # repr is the shortest round-trip form; the point falls `n` digits after
+    # the first of its significant digits
+    d = decimal.Decimal(repr(abs(x))).as_tuple()
+    n = len(d.digits) + d.exponent
+    digits = ''.join(map(str, d.digits)).rstrip('0')
+    k = len(digits)
+    if k <= n <= 21: return sign + digits + '0' * (n - k)
+    if 0 < n <= 21: return sign + digits[:n] + '.' + digits[n:]
+    if -6 < n <= 0: return sign + '0.' + '0' * -n + digits
+    return sign + digits[0] + ('.' + digits[1:] if k > 1 else '') + 'e' + str(n - 1)
+
+
 def kind(v):
     """a value's type class for the field-vs-field type gate"""
     return 'bool' if isinstance(v, bool) else 'number' if isinstance(v, (int, float)) else 'string'
@@ -133,6 +159,8 @@ def arm(t, v):
     in decimal, a boolean `boolValue`, a double `doubleValue` in full
     decimal notation with no exponent and no trailing `.0`"""
     if t == 'string': return ['stringValue', v]
+    # an array as the JSON text of its elements (#600 part 1b-3)
+    if t == 'array': return ['stringValue', json.dumps([e for _, e in v], separators=(',', ':'))]
     if t == 'int': return ['intValue', str(v)]
     if t == 'bool': return ['boolValue', 'true' if v else 'false']
     v = float(v)
@@ -659,6 +687,13 @@ class Interp:
             code = 'N' if (f['scope'], f['key']) in self.WELL_KNOWN else 'n'
             return ('', code), (name, ('string', 'nil'))
         t, v = got
+        if t == 'a':
+            # each array is its own series labelled `nil` by the engine's text
+            # of it, `['x','y']`, so two arrays of one text share a series
+            # (`docs/api.md` §4.4; #600 part 1b-3)
+            text = '[' + ','.join(f"'{e}'" if et == 's' else engine_double_text(e) if et == 'd'
+                                  else str(e) for et, e in v) + ']'
+            return (text, 'a'), (name, ('string', 'nil'))
         text = ('true' if v else 'false') if t == 'b' else str(v)
         return (text, t), (name, (self.LABEL_TYPE[t], v))
 
