@@ -401,13 +401,22 @@ const O: &[SpanDef] = &[
 /// `one` is the string the one-element array holds.
 const S601: &[SpanDef] = &[
     span(1, "arr").attrs(&[
-        ("tags", r#"{"arrayValue":{"values":[{"stringValue":"x"},{"stringValue":"y"}]}}"#),
-        ("nums", r#"{"arrayValue":{"values":[{"intValue":"1"},{"intValue":"2"}]}}"#),
+        (
+            "tags",
+            r#"{"arrayValue":{"values":[{"stringValue":"x"},{"stringValue":"y"}]}}"#,
+        ),
+        (
+            "nums",
+            r#"{"arrayValue":{"values":[{"intValue":"1"},{"intValue":"2"}]}}"#,
+        ),
         ("one", r#"{"arrayValue":{"values":[{"stringValue":"z"}]}}"#),
         ("none", r#"{"arrayValue":{"values":[]}}"#),
     ]),
     span(2, "arr").attrs(&[
-        ("tags", r#"{"arrayValue":{"values":[{"stringValue":"x"},{"stringValue":"y"}]}}"#),
+        (
+            "tags",
+            r#"{"arrayValue":{"values":[{"stringValue":"x"},{"stringValue":"y"}]}}"#,
+        ),
         ("one", r#"{"stringValue":"z"}"#),
     ]),
 ];

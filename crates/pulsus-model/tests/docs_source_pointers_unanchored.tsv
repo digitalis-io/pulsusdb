@@ -752,7 +752,7 @@ docs/query-lowering.md	search_plan.rs:3139	not_in_this_repository
 docs/query-lowering.md	search_plan.rs:456	not_in_this_repository
 docs/query-lowering.md	search_plan.rs:594	not_in_this_repository
 docs/query-lowering.md	search_plan.rs:958	not_in_this_repository
-docs/query-lowering.md	search_response.rs:504	no_name_the_target_file_holds
+docs/query-lowering.md	search_response.rs:513	no_name_the_target_file_holds
 docs/query-lowering.md	search_sql.rs:345	not_in_this_repository
 docs/query-lowering.md	search_sql.rs:361	not_in_this_repository
 docs/query-lowering.md	search_sql.rs:678	not_in_this_repository

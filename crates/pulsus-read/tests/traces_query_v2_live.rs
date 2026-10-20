@@ -7011,8 +7011,16 @@ async fn search_statement_answers_written_out_on_fixture_c() {
     for (label, got, want) in [
         ("f5 span.s", projected_of(&s, 0xf5), Str(n(8192))),
         ("f6 span.s", projected_of(&s, 0xf6), Str(n(2048))),
-        ("f7 span.arr", projected_of(&arr, 0xf7), Array(vec![Str(n(8192))])),
-        ("f8 span.arr", projected_of(&arr, 0xf8), Array(vec![Str(n(2048))])),
+        (
+            "f7 span.arr",
+            projected_of(&arr, 0xf7),
+            Array(vec![Str(n(8192))]),
+        ),
+        (
+            "f8 span.arr",
+            projected_of(&arr, 0xf8),
+            Array(vec![Str(n(2048))]),
+        ),
     ] {
         if got != want {
             wrong.push(format!(
@@ -7119,7 +7127,7 @@ async fn search_statement_answers_written_out_on_fixture_p() {
         // q13
         (
             r#"{ event:timeSinceStart > 1500us }"#,
-            "1111(1): 0001[event:timeSinceStart=Int 3000000]",
+            "1111(1): 0001[event:timeSinceStart=Str 3ms]",
         ),
         // q18
         (
@@ -7168,7 +7176,7 @@ async fn search_statement_answers_written_out_on_fixture_p() {
         // r05
         (
             r#"{ event:timeSinceStart * 2 > 3ms }"#,
-            "1111(1): 0001[event:timeSinceStart=Int 3000000]",
+            "1111(1): 0001[event:timeSinceStart=Str 3ms]",
         ),
         // r06
         (
@@ -15763,13 +15771,13 @@ const UNTYPED_CASES: [(&str, &str, &str, u64); 15] = [
     (
         "U6",
         "{ } | by(span.bd)",
-        "e1 4 [01, 02, 03, 04] {[true,false] 1 [01]; nil 3 [02, 03, 04]}",
+        r#"e1 4 [01, 02, 03, 04] {arr:[["boolValue","true"],["boolValue","false"]] 1 [01]; nil 3 [02, 03, 04]}"#,
         1,
     ),
     (
         "U7",
         "{ } | by(span.dd)",
-        "e1 4 [01, 02, 03, 04] {[1.5,2.5] 1 [01]; nil 3 [02, 03, 04]}",
+        r#"e1 4 [01, 02, 03, 04] {arr:[["doubleValue","1.5"],["doubleValue","2.5"]] 1 [01]; nil 3 [02, 03, 04]}"#,
         1,
     ),
     (

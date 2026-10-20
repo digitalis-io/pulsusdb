@@ -4434,10 +4434,7 @@ async fn projected_durations_and_arrays_render_in_their_own_arms() {
         "arr",
         ts(base, 11),
         100 * MS,
-        vec![
-            kv_array("tags", vec![s("x"), s("y")]),
-            kv_str("one", "z"),
-        ],
+        vec![kv_array("tags", vec![s("x"), s("y")]), kv_str("one", "z")],
     );
     ingest(port, vec![one, two], checkout_resource(), "seed #601 spans");
 

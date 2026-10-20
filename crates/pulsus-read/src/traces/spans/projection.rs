@@ -28,8 +28,9 @@
 //! refused.
 //!
 //! **Every value's text is cut at today's response ceiling**: more than
-//! 8,192 bytes becomes its first 2,048 code points. An array's JSON is
-//! rendered in the decode, so the decode cuts it by the same rule.
+//! 8,192 bytes becomes its first 2,048 code points. An array's string
+//! elements are decoded one by one, so the decode cuts each by the same
+//! rule (issue #601 part 1).
 
 use pulsus_traceql::{
     AttrScope, ComparisonOp, Field, FieldExpr, FieldOp, Intrinsic, UnaryOp, Value,
@@ -47,7 +48,7 @@ use crate::logql::escape;
 use crate::traces::PlanError;
 use crate::traces::exec::ByteBudget;
 use crate::traces::filter::flip_comparison;
-use crate::traces::values::{GroupValue, ProjectedAttribute, WireKey};
+use crate::traces::values::{GroupValue, ProjectedAttribute, WireKey, go_duration_string};
 use pulsus_clickhouse::ChError;
 
 /// The most groups one search projects: the group index travels as a
@@ -354,12 +355,11 @@ impl Projection {
     }
 
     /// One span's projected values, decoded into `attributes`, returning
-    /// its `name` when a `name` group projected one. Each value is charged
-    /// before it is built, by today's engine's rule (`build_summary`): a
-    /// name its length; an attribute its key's length plus its string
-    /// payload, a number or boolean its key alone; an array its key plus
-    /// the length of its cut render, learned before the render is built.
-    /// A value that does not parse as its kind is a decode error, never a
+    /// its `name` when a `name` group projected one. A name is charged its
+    /// length before it is kept; every other value through [`decode_one`]:
+    /// its key's length plus its payload — a string its bytes, a number or
+    /// boolean nothing, an array its buffer and its elements' payloads. A
+    /// value that does not parse as its kind is a decode error, never a
     /// default.
     pub(crate) fn decode_charged(
         &self,
@@ -384,40 +384,7 @@ impl Projection {
                 name = Some(p.value.clone());
                 continue;
             }
-            let value = match p.kind.as_str() {
-                "Int64" => GroupValue::Int(
-                    p.value
-                        .parse::<i64>()
-                        .map_err(|e| decode(format!("projected Int64 {:?}: {e}", p.value)))?,
-                ),
-                "Float64" => GroupValue::Double(
-                    p.value
-                        .parse::<f64>()
-                        .map_err(|e| decode(format!("projected Float64 {:?}: {e}", p.value)))?
-                        .to_bits(),
-                ),
-                "Bool" => GroupValue::Bool(p.value == "true"),
-                k if k.starts_with("Array(") => {
-                    let values = array_values(&p.value).map_err(decode)?;
-                    budget.charge(group.key_len + rendered_len(&values))?;
-                    let render =
-                        serde_json::to_string(&values).map_err(|e| decode(e.to_string()))?;
-                    attributes.push(ProjectedAttribute::new(
-                        &group.field,
-                        GroupValue::Str(ceiling(render)),
-                    ));
-                    continue;
-                }
-                _ => {
-                    budget.charge(group.key_len + p.value.len())?;
-                    attributes.push(ProjectedAttribute::new(
-                        &group.field,
-                        GroupValue::Str(p.value.clone()),
-                    ));
-                    continue;
-                }
-            };
-            budget.charge(group.key_len + value.payload_bytes())?;
+            let value = decode_one(&p.kind, &p.value, group.key_len, budget)?;
             attributes.push(ProjectedAttribute::new(&group.field, value));
         }
         Ok(name)
@@ -425,15 +392,81 @@ impl Projection {
 }
 
 /// A projected value from the statement's text and stored kind (issue #601).
-/// Stub: the tests are written first.
-#[allow(dead_code)]
-fn typed_value(_kind: &str, text: &str) -> Result<GroupValue, String> {
-    Ok(GroupValue::Str(text.to_string()))
+fn typed_value(kind: &str, text: &str) -> Result<GroupValue, String> {
+    Ok(match kind {
+        "Int64" => GroupValue::Int(
+            text.parse()
+                .map_err(|e| format!("projected Int64 {text:?}: {e}"))?,
+        ),
+        "Float64" => GroupValue::Double(
+            text.parse::<f64>()
+                .map_err(|e| format!("projected Float64 {text:?}: {e}"))?
+                .to_bits(),
+        ),
+        "Bool" => GroupValue::Bool(text == "true"),
+        "Duration" => GroupValue::Str(go_duration_string(
+            text.parse()
+                .map_err(|e| format!("projected Duration {text:?}: {e}"))?,
+        )),
+        k if k.starts_with("Array(") => GroupValue::Array(array_elements(text, true)?),
+        _ => GroupValue::Str(text.to_string()),
+    })
 }
 
-/// One projected value, decoded and charged. Stub: the tests are written
-/// first.
-#[allow(dead_code)]
+/// An array's elements from the statement's `[[type, text], …]`, in stored
+/// order, read one pair at a time: no vector of pairs is ever built, so a
+/// skipped element is dropped as it is read. `cut` applies the 8192-byte rule
+/// to each string element (the projection does; a `by()` value does not). An
+/// element with no value is left out; any type other than the four is an error.
+pub(crate) fn array_elements(text: &str, cut: bool) -> Result<Vec<GroupValue>, String> {
+    struct Elements(bool);
+    impl<'de> serde::de::Visitor<'de> for Elements {
+        type Value = Vec<GroupValue>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("an array of [type, text] pairs")
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Self::Value, A::Error> {
+            use serde::de::Error;
+            let mut out = Vec::new();
+            while let Some((t, v)) = seq.next_element::<(String, String)>()? {
+                out.push(match t.as_str() {
+                    "String" => GroupValue::Str(if self.0 { ceiling(v) } else { v }),
+                    "Int64" => GroupValue::Int(
+                        v.parse()
+                            .map_err(|e| A::Error::custom(format!("array Int64 {v:?}: {e}")))?,
+                    ),
+                    "Float64" => GroupValue::Double(
+                        v.parse::<f64>()
+                            .map_err(|e| A::Error::custom(format!("array Float64 {v:?}: {e}")))?
+                            .to_bits(),
+                    ),
+                    "Bool" => GroupValue::Bool(v == "true"),
+                    "None" => continue,
+                    other => {
+                        return Err(A::Error::custom(format!(
+                            "an array element stored as {other} is not decoded"
+                        )));
+                    }
+                });
+            }
+            out.shrink_to_fit();
+            Ok(out)
+        }
+    }
+    let mut de = serde_json::Deserializer::from_str(text);
+    let out = serde::Deserializer::deserialize_seq(&mut de, Elements(cut))
+        .map_err(|e| format!("array {text:?}: {e}"))?;
+    de.end().map_err(|e| format!("array {text:?}: {e}"))?;
+    Ok(out)
+}
+
+/// One projected value, decoded and charged before `decode_charged` keeps
+/// it: the charge is `key_len` plus [`GroupValue::payload_bytes`], which for
+/// an array is its vector's capacity — whatever the stream reserved — plus
+/// each element's payload.
 pub(crate) fn decode_one(
     kind: &str,
     text: &str,
@@ -443,74 +476,6 @@ pub(crate) fn decode_one(
     let value = typed_value(kind, text).map_err(|m| ReadError::Clickhouse(ChError::Decode(m)))?;
     budget.charge(key_len + value.payload_bytes())?;
     Ok(value)
-}
-
-/// The length of `ceiling(serde_json::to_string(values))`, learned
-/// without building it (issue #591 part 3): the render is serialized into
-/// a counter of its bytes, and of the bytes of its first
-/// `CUT_CODE_POINTS` code points, which is the cut's length.
-fn rendered_len(values: &[serde_json::Value]) -> usize {
-    struct Counter {
-        bytes: usize,
-        code_points: usize,
-        cut_bytes: usize,
-    }
-    impl std::io::Write for Counter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            for &b in buf {
-                // A code point starts at every byte that is not a UTF-8
-                // continuation byte.
-                if b & 0xC0 != 0x80 {
-                    self.code_points += 1;
-                }
-                if self.code_points <= CUT_CODE_POINTS {
-                    self.cut_bytes += 1;
-                }
-            }
-            self.bytes += buf.len();
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut counter = Counter {
-        bytes: 0,
-        code_points: 0,
-        cut_bytes: 0,
-    };
-    serde_json::to_writer(&mut counter, values).expect("a JSON value always serializes");
-    if counter.bytes <= CEILING_BYTES {
-        counter.bytes
-    } else {
-        counter.cut_bytes
-    }
-}
-
-/// Issue #592 part 2: an array value's text as the writer stored it — the
-/// JSON of its elements, each by its own type — from the statement's
-/// `[[type, text], …]`. A `by()` key is not cut, as today's group key is
-/// not.
-pub(crate) fn rendered_array(text: &str) -> Result<String, String> {
-    serde_json::to_string(&array_values(text)?).map_err(|e| e.to_string())
-}
-
-/// The length of [`rendered_array`]'s text, learned without building it,
-/// so the decode charges it first.
-pub(crate) fn rendered_array_len(text: &str) -> Result<usize, String> {
-    struct Counter(usize);
-    impl std::io::Write for Counter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0 += buf.len();
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut counter = Counter(0);
-    serde_json::to_writer(&mut counter, &array_values(text)?).map_err(|e| e.to_string())?;
-    Ok(counter.0)
 }
 
 /// Issue #592 part 2: how the search statement reads one `by()` key.
@@ -626,31 +591,6 @@ pub fn group_key_sql(
             }
         }
     })
-}
-
-/// An array's elements, each by its own type, from the statement's
-/// `[[type, text], …]`.
-fn array_values(value: &str) -> Result<Vec<serde_json::Value>, String> {
-    let elements: Vec<(String, String)> =
-        serde_json::from_str(value).map_err(|e| format!("projected array {value:?}: {e}"))?;
-    let mut rendered: Vec<serde_json::Value> = Vec::with_capacity(elements.len());
-    for (t, text) in elements {
-        rendered.push(match t.as_str() {
-            "String" => serde_json::Value::String(text),
-            "Int64" => serde_json::Value::from(
-                text.parse::<i64>()
-                    .map_err(|e| format!("array element Int64 {text:?}: {e}"))?,
-            ),
-            "Float64" => text
-                .parse::<f64>()
-                .ok()
-                .and_then(serde_json::Number::from_f64)
-                .map_or(serde_json::Value::Null, serde_json::Value::Number),
-            "Bool" => serde_json::Value::Bool(text == "true"),
-            _ => serde_json::Value::Null,
-        });
-    }
-    Ok(rendered)
 }
 
 /// Every `Field` a comparison's operand tree names, in source order.
@@ -787,14 +727,16 @@ fn string_value(e: &str) -> Projects {
 }
 
 /// `I(E)`: an event's offset from its span's start, an `Int128`, clamped
-/// to `Int64` as the writer clamps it, so the value and its kind agree.
-/// The bounds are written as strings, parsed as `Int128`.
+/// to `Int64` as the writer clamps it, so the value parses as its kind. The
+/// kind is a duration, which the decode renders in Go's duration text
+/// (issue #601 part 1). The bounds are written as strings, parsed as
+/// `Int128`.
 fn offset_value(e: &str) -> Projects {
     const MAX: &str = "toInt128('9223372036854775807')";
     const MIN: &str = "toInt128('-9223372036854775808')";
     Projects::Value {
         value: format!("toString(toInt64(if({e} > {MAX}, {MAX}, if({e} < {MIN}, {MIN}, {e}))))"),
-        kind: "'Int64'".to_string(),
+        kind: "'Duration'".to_string(),
     }
 }
 
@@ -1265,34 +1207,6 @@ pub(crate) fn aggregate_argument_sql(
 }
 
 #[cfg(test)]
-mod rendered_len_tests {
-    use super::*;
-
-    /// Section 6.1: `rendered_len` is the length of the cut render, for a
-    /// short four-type array and for one that crosses the ceiling in
-    /// multi-byte code points.
-    #[test]
-    fn rendered_len_is_the_length_of_the_cut_render() {
-        let long = format!("[{}]", vec![r#"["String","é€"]"#; 3000].join(","));
-        for value in [
-            r#"[["String","g"],["Int64","7"],["Float64","1e5"],["Bool","true"]]"#,
-            long.as_str(),
-        ] {
-            let values = array_values(value).expect("a well-formed array");
-            let full = serde_json::to_string(&values).expect("a Value serializes");
-            let render = ceiling(full.clone());
-            eprintln!("uncut {} cut {}", full.len(), render.len());
-            assert_eq!(
-                rendered_len(&values),
-                render.len(),
-                "{}",
-                &full[..full.len().min(80)]
-            );
-        }
-    }
-}
-
-#[cfg(test)]
 mod typed_value_tests {
     use super::*;
     use crate::logql::error::TooBroadReason;
@@ -1390,7 +1304,9 @@ mod typed_value_tests {
         assert!(
             matches!(
                 refused,
-                Err(ReadError::QueryTooBroad(TooBroadReason::ScanBudgetBytes { .. }))
+                Err(ReadError::QueryTooBroad(
+                    TooBroadReason::ScanBudgetBytes { .. }
+                ))
             ),
             "one byte under the charge is refused: {refused:?}"
         );

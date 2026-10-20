@@ -131,8 +131,14 @@ pub const CASES: [ProjectionCase; 42] = [
     ),
     c("40_event_name_regex", r#"{ event:name =~ ".*" }"#),
     // 41-42 (issue #601 part 1): a projected duration, and an array.
-    c("41_event_time_since_start", "{ event:timeSinceStart > 150ms }"),
-    c("42_select_array", r#"{ name = "charge" } | select(span.tags)"#),
+    c(
+        "41_event_time_since_start",
+        "{ event:timeSinceStart > 150ms }",
+    ),
+    c(
+        "42_select_array",
+        r#"{ name = "charge" } | select(span.tags)"#,
+    ),
 ];
 
 const _: () = assert!(CASES.len() == 42);

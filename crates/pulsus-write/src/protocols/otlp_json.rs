@@ -36,7 +36,8 @@
 //! dropping an ignored key is byte-identical to replaying-and-ignoring it. The
 //! `AnyValue` wrapper additionally
 //! reproduces the vendored P2 oneof visitor EXACTLY (last recognized key wins;
-//! `arrayValue`/`kvlistValue` require their `values`) while bounding container
+//! a missing `arrayValue`/`kvlistValue` `values` decodes to the empty list, and
+//! an object with no recognized key to an `AnyValue` with no value) while bounding container
 //! width/depth — the ONLY behavioral divergence from the vendored decode.
 //!
 //! # Scalar-leaf spellings stay camelCase (v6 ruling 1)
@@ -605,7 +606,8 @@ impl<'de> Visitor<'de> for AnyValueVisitor<'_> {
         // (issue #115 finding 1): iterate ALL keys in order, the LAST recognized
         // oneof key wins (no single-member rejection), unknown keys — including
         // the profiling `stringValueStrindex`, which the P2 visitor does not
-        // recognize — are skipped, and a map with no recognized key errors. The
+        // recognize — are skipped, and a map with no recognized key is an
+        // `AnyValue` with no value, as the protobuf encoding decodes it. The
         // ONLY divergence from the vendored decode is the width/depth REJECTION
         // the container seeds add; every scalar arm is finished through the
         // vendored `AnyValue` derive so P1 non-finite doubles, int64-as-string and
@@ -647,13 +649,9 @@ impl<'de> Visitor<'de> for AnyValueVisitor<'_> {
                 }
             }
         }
-        match value {
-            Some(v) => Ok(AnyValue { value: Some(v) }),
-            // Byte-identical to the vendored P2 visitor's terminal error.
-            None => Err(de::Error::custom(
-                "Invalid data for Value, no known keys found",
-            )),
-        }
+        // No recognized key is an `AnyValue` with no value, as the vendored
+        // P2 visitor (patch P7) and the protobuf encoding both decode it.
+        Ok(AnyValue { value })
     }
 }
 
@@ -661,7 +659,8 @@ impl<'de> Visitor<'de> for AnyValueVisitor<'_> {
 /// the assembled [`ArrayValue`]. Its `values` are repeated `AnyValue`s at
 /// `elem_depth`, charged against the shared [`MAX_ANYVALUE_ELEMENTS`] aggregate
 /// (no per-level cap — depth is the complementary bound). Matches the vendored
-/// `ArrayValue` derive: a MISSING `values` and a DUPLICATE `values` are rejected;
+/// `ArrayValue` derive: a MISSING `values` decodes to the empty list, as
+/// proto3-JSON writes it (patch P7); a DUPLICATE `values` is rejected;
 /// unknown fields are ignored.
 struct BoundedArrayValueSeed<'a> {
     agg: &'a JsonAggregates,
@@ -728,9 +727,6 @@ impl<'de> Visitor<'de> for BoundedArrayValueVisitor<'_> {
                 }
             }
         }
-        if !seen {
-            return Err(de::Error::missing_field("values"));
-        }
         Ok(ArrayValue { values })
     }
 }
@@ -739,7 +735,8 @@ impl<'de> Visitor<'de> for BoundedArrayValueVisitor<'_> {
 /// the assembled [`KeyValueList`]. Its `values` are repeated `KeyValue`s whose own
 /// value `AnyValue` sits at `entry_value_depth`, charged against the shared
 /// [`MAX_ANYVALUE_ELEMENTS`] aggregate. Matches the vendored `KeyValueList`
-/// derive: MISSING and DUPLICATE `values` are rejected; unknown fields ignored.
+/// derive: a MISSING `values` decodes to the empty list (patch P7); a DUPLICATE
+/// `values` is rejected; unknown fields ignored.
 struct BoundedKvlistValueSeed<'a> {
     agg: &'a JsonAggregates,
     entry_value_depth: usize,
@@ -802,9 +799,6 @@ impl<'de> Visitor<'de> for BoundedKvlistValueVisitor<'_> {
                 }
             }
         }
-        if !seen {
-            return Err(de::Error::missing_field("values"));
-        }
         Ok(KeyValueList { values })
     }
 }
@@ -846,9 +840,9 @@ impl<'de> Visitor<'de> for KeyValueSeed<'_> {
     {
         // Finding 2: intercept ONLY the `AnyValue`-bearing `value` child for
         // depth bounding; BUFFER every scalar leaf (`key`, `keyStrindex`, unknown)
-        // and finish through the vendored `KeyValue` derive, so the missing
-        // required `key` and duplicate scalar keys are rejected — not silently
-        // defaulted / last-write-win — exactly as the non-`serde(default)` derive.
+        // and finish through the vendored `KeyValue` derive, so a missing `key`
+        // decodes to the empty key (patch P7) and duplicate scalar keys are
+        // rejected — not last-write-win — exactly as the derive.
         let mut value: Option<AnyValue> = None;
         let mut value_seen = false;
         let mut pairs: Vec<(String, serde_json::Value)> = Vec::new();
@@ -997,9 +991,9 @@ impl<'de> Visitor<'de> for EntityRefSeed<'_> {
         // Finding 2: intercept ONLY the repeated `idKeys` / `descriptionKeys`
         // children (both spellings) for bounding; BUFFER the scalar leaves
         // (`schemaUrl`, `type`, unknown) and finish through the vendored
-        // `EntityRef` derive, so the missing required `schemaUrl` / `type` and
-        // duplicate scalar keys are rejected — `EntityRef` is NOT `serde(default)`,
-        // so an empty buffer is a missing-required error there, matching the derive.
+        // `EntityRef` derive, so a missing `schemaUrl` / `type` decodes to the
+        // empty string — `EntityRef` is `serde(default)` (patch P7) — and
+        // duplicate scalar keys are rejected, matching the derive.
         let mut id_keys: Vec<String> = Vec::new();
         let mut description_keys: Vec<String> = Vec::new();
         let mut pairs: Vec<(String, serde_json::Value)> = Vec::new();
@@ -1020,11 +1014,10 @@ impl<'de> Visitor<'de> for EntityRefSeed<'_> {
                 _ => buffer_scalar_or_skip(key, ENTITY_REF_SCALARS, &mut map, &mut pairs)?,
             }
         }
-        // The vendored `EntityRef` derive (no `serde(default)`) requires ALL fields
-        // present, including the repeated `idKeys`/`descriptionKeys` we intercept.
         // Inject empty-array placeholders for the two intercepted repeated fields
-        // so the delegate validates ONLY the SCALAR `schemaUrl`/`type` semantics
-        // (missing-required + duplicate-key reject) — the repeated fields keep
+        // (`idKeys`/`descriptionKeys`) so the delegate decides ONLY the SCALAR
+        // `schemaUrl`/`type` semantics (a missing one is its default, patch P7; a
+        // duplicate is rejected) — the repeated fields keep
         // their bounded, optional, accumulate-duplicates behaviour, matching the
         // protobuf path (JSON and protobuf reject identically). The real bounded
         // values are set below.

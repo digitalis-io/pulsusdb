@@ -399,6 +399,15 @@ fn span_json(span: &SpanSummary, report: &mut DomainReport) -> Value {
 ///   the key vanish from the value object. Our own stored spellings
 ///   (`inf`, `-inf`) normalise here, so they never reach the wire.
 fn group_value_json(value: &GroupValue) -> Value {
+    // An array (issue #601 part 1) is protojson's `arrayValue`, each element
+    // in its own arm; the encoder never builds the array's comparison token.
+    if let GroupValue::Array(v) = value {
+        return if v.is_empty() {
+            json!({ "arrayValue": {} })
+        } else {
+            json!({ "arrayValue": { "values": v.iter().map(group_value_json).collect::<Vec<_>>() } })
+        };
+    }
     // The ARM is decided once, in `pulsus-read`, so the live differential
     // that reads `GroupValue`s straight out of the engine compares the arm
     // this encoder actually writes.

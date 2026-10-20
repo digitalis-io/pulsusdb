@@ -495,19 +495,16 @@ pub(crate) mod serializers {
                             value = Some(any_value::Value::BytesValue(decoded));
                         }
                         _ => {
-                            //skip unknown keys, and handle error later.
-                            continue;
+                            // PATCH (PulsusDB, P7): read and drop an unknown
+                            // key's value, so the next key is read after it.
+                            let _: serde::de::IgnoredAny = map.next_value()?;
                         }
                     }
                 }
 
-                if let Some(v) = value {
-                    Ok(Some(v))
-                } else {
-                    Err(de::Error::custom(
-                        "Invalid data for Value, no known keys found",
-                    ))
-                }
+                // PATCH (PulsusDB, P7): no known key is an `AnyValue` with no
+                // value, as proto3-JSON writes it and protobuf decodes it.
+                Ok(value)
             }
         }
 

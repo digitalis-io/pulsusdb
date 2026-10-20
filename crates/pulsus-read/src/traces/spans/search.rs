@@ -67,9 +67,7 @@ use pulsus_traceql::{
 use super::fold::{Agg, AggArg, Contributor, Fold, Key, Src, Stage};
 use super::numbering::{SCOPE_DETAIL, SCOPE_TOP, after_top_sql, keys_sql, returned_numbers_sql};
 use super::predicate::{PredicateCtx, SpanPredicate, compile_span_predicate_in};
-use super::projection::{
-    Projection, ceiling_sql, group_key_sql, rendered_array, rendered_array_len,
-};
+use super::projection::{Projection, array_elements, ceiling_sql, group_key_sql};
 use super::rows::{SearchGroupTuple, SearchGroupedRow, SearchTraceRow};
 use super::tracelevel::{TraceLeaf, TraceValue, group_values_sql, per_trace_sql, trace_values_sql};
 use crate::logql::error::ReadError;
@@ -1250,8 +1248,8 @@ pub(crate) fn decode_search_charged(
 
 /// A `by()` key's value from the statement's text and stored type (issue
 /// #592 part 2), as today's engine types it: `Int64`, `Float64` (its group
-/// bits), `Bool` and `String` in their own arms, an array as the JSON the
-/// writer rendered it to, a span without the key the `nil` group, and a
+/// bits), `Bool` and `String` in their own arms, an array as its elements
+/// (issue #601 part 1), a span without the key the `nil` group, and a
 /// column key, which has no type, its text.
 pub(crate) fn group_value(text: &str, value_type: &str) -> Result<GroupValue, String> {
     Ok(match value_type {
@@ -1270,7 +1268,7 @@ pub(crate) fn group_value(text: &str, value_type: &str) -> Result<GroupValue, St
             text.parse::<i64>()
                 .map_err(|e| format!("a by() duration {text:?}: {e}"))?,
         )),
-        t if t.starts_with("Array(") => GroupValue::Str(rendered_array(text)?),
+        t if t.starts_with("Array(") => GroupValue::Array(array_elements(text, false)?),
         other => return Err(format!("a by() key stored as {other} is not decoded")),
     })
 }
@@ -1283,7 +1281,7 @@ fn group_value_payload(text: &str, value_type: &str) -> Result<usize, String> {
             GroupValue::Str(s) => s.len(),
             _ => 0,
         },
-        t if t.starts_with("Array(") => rendered_array_len(text)?,
+        t if t.starts_with("Array(") => group_value(text, value_type)?.payload_bytes(),
         _ => 0,
     })
 }

@@ -542,10 +542,11 @@ fn anyvalue_kvlist_missing_values_is_empty() {
 }
 
 // --------------------------------------------------------------------------
-// Finding 2: KeyValue / EntityRef scalar fields match the non-serde(default)
-// vendored derive — missing-required and duplicate scalar keys are rejected
-// (previously silently defaulted / last-write-win). Audit companions cover the
-// serde(default) Resource / InstrumentationScope duplicate-scalar rejection.
+// Finding 2: KeyValue / EntityRef scalar fields match the vendored derive — a
+// missing one decodes to its default (issue #601 part 1, patch P7) and a
+// duplicate scalar key is rejected (previously last-write-win). Audit
+// companions cover the Resource / InstrumentationScope duplicate-scalar
+// rejection.
 // --------------------------------------------------------------------------
 
 #[test]

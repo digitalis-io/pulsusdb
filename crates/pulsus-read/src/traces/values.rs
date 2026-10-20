@@ -209,7 +209,11 @@ pub fn wire_arm(value: &GroupValue) -> (&'static str, String) {
         }
         GroupValue::Bool(b) => ("boolValue", b.to_string()),
         GroupValue::Nil => ("stringValue", "nil".to_string()),
-        GroupValue::Array(_) => ("stringValue", String::new()),
+        GroupValue::Array(v) => (
+            "arrayValue",
+            serde_json::to_string(&v.iter().map(wire_arm).collect::<Vec<_>>())
+                .expect("pairs of strings serialize"),
+        ),
     }
 }
 
@@ -265,7 +269,7 @@ pub(crate) fn group_double_bits(f: f64) -> u64 {
 /// One typed response value — a `by()` group-key value, an aggregate's
 /// own value, or a matched span's projected attribute (issues #193,
 /// #510) — rendering to the reference's
-/// `value:{stringValue|intValue|doubleValue|boolValue}` arms.
+/// `value:{stringValue|intValue|doubleValue|boolValue|arrayValue}` arms.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum GroupValue {
     Str(String),
@@ -284,13 +288,19 @@ pub enum GroupValue {
 }
 
 impl GroupValue {
-    /// The owned heap payload beyond the enum's own `size_of` slot: only a
-    /// `Str` carries bytes (charged/released via `.len()`, the module-wide
-    /// payload convention). Numeric/bool/nil add nothing.
+    /// The owned heap payload beyond the enum's own `size_of` slot: a
+    /// `Str` its bytes (charged/released via `.len()`, the module-wide
+    /// payload convention); an `Array` its buffer at its capacity, which is
+    /// what is retained, plus each element's payload. Numeric/bool/nil add
+    /// nothing.
     pub(crate) fn payload_bytes(&self) -> usize {
         match self {
             GroupValue::Str(s) => s.len(),
-            _ => 0,
+            GroupValue::Array(v) => {
+                v.capacity() * std::mem::size_of::<GroupValue>()
+                    + v.iter().map(GroupValue::payload_bytes).sum::<usize>()
+            }
+            GroupValue::Int(_) | GroupValue::Double(_) | GroupValue::Bool(_) | GroupValue::Nil => 0,
         }
     }
 }

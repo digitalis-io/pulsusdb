@@ -612,7 +612,9 @@ fn an_omitted_default_field_decodes_on_every_signal() {
             r#"{"key":"k","value":{"arrayValue":{}}}"#,
             kv(
                 "k",
-                any(Some(any_value::Value::ArrayValue(ArrayValue { values: vec![] }))),
+                any(Some(any_value::Value::ArrayValue(ArrayValue {
+                    values: vec![],
+                }))),
             ),
         ),
         (
@@ -628,7 +630,10 @@ fn an_omitted_default_field_decodes_on_every_signal() {
         (r#"{"key":"k","value":{"fooValue":1}}"#, kv("k", any(None))),
         (
             r#"{"value":{"stringValue":"v"}}"#,
-            kv("", any(Some(any_value::Value::StringValue("v".to_string())))),
+            kv(
+                "",
+                any(Some(any_value::Value::StringValue("v".to_string()))),
+            ),
         ),
     ];
     let entity = |schema_url: &str, ty: &str, id: &str| EntityRef {
@@ -692,7 +697,9 @@ fn an_omitted_default_field_decodes_on_every_signal() {
         ] {
             match decode_on(signal, attr, "{}") {
                 Err(e) if e.contains(field) => {}
-                other => wrong.push(format!("{signal} {attr}: {other:?}, want an error naming {field}")),
+                other => wrong.push(format!(
+                    "{signal} {attr}: {other:?}, want an error naming {field}"
+                )),
             }
         }
     }
@@ -716,10 +723,7 @@ fn the_generated_decoder_reads_an_omitted_field_as_its_default() {
     ) {
         match serde_json::from_str::<T>(json) {
             Ok(v) if ok(&v) => {}
-            other => wrong.push(format!(
-                "{} {json}: {other:?}",
-                std::any::type_name::<T>()
-            )),
+            other => wrong.push(format!("{} {json}: {other:?}", std::any::type_name::<T>())),
         }
     }
     let mut w: Vec<String> = Vec::new();
@@ -730,7 +734,9 @@ fn the_generated_decoder_reads_an_omitted_field_as_its_default() {
     check::<AnyValue>(&mut w, r#"{"fooValue":1,"stringValue":"s"}"#, |v| {
         v.value == Some(any_value::Value::StringValue("s".to_string()))
     });
-    check::<KeyValue>(&mut w, r#"{"value":{"stringValue":"v"}}"#, |v| v.key.is_empty());
+    check::<KeyValue>(&mut w, r#"{"value":{"stringValue":"v"}}"#, |v| {
+        v.key.is_empty()
+    });
     check::<EntityRef>(&mut w, r#"{"idKeys":["a"]}"#, |v| {
         v.schema_url.is_empty() && v.r#type.is_empty()
     });
