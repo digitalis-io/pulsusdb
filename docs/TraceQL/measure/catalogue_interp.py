@@ -795,6 +795,9 @@ class Interp:
                 except ValueError: return 0
         return DEFAULT_EXEMPLARS
 
+    def range_answer(self, q, start, end, step=60 * 10**9):
+        raise NotImplementedError('range_answer (#600 part 1b-1)')
+
     def metric_rows(self, q, metric):
         """`sql-schema.md` §5.6: one row per series, its points in bucket order,
         and — when `with(exemplars=…)` asks for them — one exemplar per bucket
