@@ -3,11 +3,9 @@
 
 `docs/TraceQL/query-catalogue.md` claims three things this script is the check on:
 
-1. **The two sides are independent.** `catalogue_render.py` and
-   `catalogue_interp.py` share the parser and nothing else, so a rule changed on
-   EITHER side must produce a disagreement. Review round 4 found the opposite:
-   one table served both sides, the reviewer changed `STATUS['error']` from 2 to
-   1, and the catalogue still reported every answer as agreeing.
+1. **The interpreter's rules are checked.** The other side is the shipped
+   route, whose answers the saved run holds, so a rule changed in
+   `catalogue_interp.py` must produce a disagreement.
 2. **The shared parser is checked too.** A rule changed THERE moves both answers
    together, so no comparison can see it; `measure/parse_vectors.tsv` holds the
    tree each rule must produce, written out by hand, and the rows below whose
@@ -25,19 +23,25 @@
 
 Each row of `perturbations.tsv` names a file, a string to replace and what is
 expected. The replacement is made in a scratch copy — the committed files are
-never written — and the whole catalogue is run against it.
+never written — and `catalogue.py` is run in that copy over a saved run of
+`catalogue.sh`: the route's answers stay as the run recorded them, and the
+changed rule moves only this side's. The unchanged copy must pass first.
 
-Usage: perturb_check.py CH_URL DB CORPUS_DIR FIXTURE_JSONL WORK_DIR START_NS END_NS
+Usage: perturb_check.py RUN_JSONL FIXTURE_JSONL START_NS END_NS WORK_DIR
+
+RUN_JSONL and FIXTURE_JSONL are `catalogue.sh`'s `catalogue-run.jsonl` and
+`cat/spans.jsonl`; START_NS and END_NS the window it ran over. Writes
+`results/perturbations.tsv`; exits 0 only when every row ends as it expects.
 """
-import json, os, shutil, subprocess, sys
+import json, os, re, shutil, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CH, DB, CORPUS, FIXTURE, WORK, S, E = sys.argv[1:8]
+RUN, FIXTURE, S, E, WORK = sys.argv[1:6]
+RUN, FIXTURE, WORK = os.path.abspath(RUN), os.path.abspath(FIXTURE), os.path.abspath(WORK)
 os.makedirs(WORK, exist_ok=True)
 
 COPY = ['catalogue_parse.py', 'catalogue_render.py', 'catalogue_interp.py', 'catalogue.py',
-        'validate_messages.tsv', 'planner_dispositions.tsv', 'catalogue-extra.tsv',
-        'parse_vectors.tsv']
+        'catalogue-extra.tsv', 'parse_vectors.tsv']
 
 rows = []
 for line in open(f'{HERE}/perturbations.tsv'):
@@ -47,8 +51,7 @@ for line in open(f'{HERE}/perturbations.tsv'):
 
 # Every anchor is checked BEFORE the first run, and all of them are reported at
 # once: an anchor that has gone stale because the file it points into was edited
-# is a defect in this file, not a property of the design, and finding them one
-# nine-second run at a time hides how many there are.
+# is a defect in this file, not a property of the design.
 stale = [(pid, f, open(f'{HERE}/{f}').read().count(find))
          for pid, side, f, expect, rule, find, repl in rows]
 stale = [x for x in stale if x[2] != 1]
@@ -59,46 +62,52 @@ if stale:
     sys.exit(1)
 
 
-def run_one(pid, f, find, repl):
-    d = f'{WORK}/{pid}/measure'
-    if os.path.exists(f'{WORK}/{pid}'): shutil.rmtree(f'{WORK}/{pid}')
-    os.makedirs(f'{d}/results'); os.makedirs(f'{d}/catalogue-sql')
-    for n in COPY: shutil.copy(f'{HERE}/{n}', f'{d}/{n}')
-    src = open(f'{d}/{f}').read()
-    if src.count(find) != 1:
-        return 'anchor-not-unique', {}
-    open(f'{d}/{f}', 'w').write(src.replace(find, repl))
-    p = subprocess.run([sys.executable, f'{d}/catalogue.py', CH, DB, CORPUS, FIXTURE, d, S, E],
-                       capture_output=True, text=True, timeout=1800)
-    try:
-        counts = json.load(open(f'{d}/results/catalogue.json'))['counts']
-    except Exception:
-        shutil.rmtree(f'{WORK}/{pid}')
-        return 'crashed', {'stderr': p.stderr.strip().split('\n')[-1][:120]}
-    shutil.rmtree(f'{WORK}/{pid}')
-    return None, counts
+def count(out, label):
+    m = re.search(rf'^{re.escape(label)}\s+(\d+)', out, re.M)
+    return int(m.group(1)) if m else 0
 
-out = [('id', 'side', 'expect', 'api_disagree', 'membership_disagree', 'statement_errors',
+
+def run_one(name, f=None, find=None, repl=None):
+    """`catalogue.py` in a scratch copy with one rule changed: None when it
+    crashed, else (exit status, counts)"""
+    d = f'{WORK}/{name}'
+    shutil.rmtree(d, ignore_errors=True); os.makedirs(d)
+    for n in COPY: shutil.copy(f'{HERE}/{n}', f'{d}/{n}')
+    if f is not None:
+        src = open(f'{d}/{f}').read()
+        open(f'{d}/{f}', 'w').write(src.replace(find, repl))
+    p = subprocess.run([sys.executable, '-I', f'{d}/catalogue.py', RUN, FIXTURE, S, E],
+                       capture_output=True, text=True, timeout=600)
+    shutil.rmtree(d)
+    if 'Traceback' in p.stderr or p.returncode not in (0, 1):
+        return None, p.stderr.strip().split('\n')[-1][:160]
+    notes = [l.split()[1:3] for l in p.stdout.splitlines() if l.startswith('  disagreement: ')]
+    metric = sum(1 for n in notes if n[1] in ('(range)', '(instant)'))
+    return p.returncode, {'search': len(notes) - metric, 'metrics': metric,
+                          'errors': count(p.stdout, 'statements that failed'),
+                          'mismatch': count(p.stdout, 'disposition rule against the planner'),
+                          'vectors': count(p.stdout, 'parse vectors that differ')}
+
+
+base, why = run_one('unchanged')
+if base != 0:
+    print(f'the unchanged catalogue does not pass over this run: {why or "exit 1"}')
+    sys.exit(1)
+
+out = [('id', 'side', 'expect', 'search_disagree', 'metrics_disagree', 'statement_errors',
         'disposition_mismatch', 'parse_vector_mismatch', 'outcome', 'verdict', 'rule')]
 fails = 0
 for pid, side, f, expect, rule, find, repl in rows:
-    bad, counts = run_one(pid, f, find, repl)
-    if bad:
-        api = mem = err = mis = vec = '-'
-        outcome = bad
+    status, c = run_one(pid, f, find, repl)
+    if status is None:
+        cols, outcome = ['-'] * 5, 'crashed'
     else:
-        served = counts['served_total']
-        api = served - counts['api_agree_total']
-        mem = served - counts['membership_agree_total']
-        err = served - counts['ran_total']
-        mis = counts['disposition_mismatches']
-        vec = counts['parse_vector_mismatches']
-        outcome = 'noticed' if (api or mem or err or mis or vec) else 'clean'
+        cols = [str(c[k]) for k in ('search', 'metrics', 'errors', 'mismatch', 'vectors')]
+        outcome = 'noticed' if status else 'clean'
     want = 'noticed' if expect == 'red' else 'clean'
     verdict = 'PASS' if outcome == want else 'FAIL'
-    if verdict == 'FAIL': fails += 1
-    out.append((pid, side, expect, str(api), str(mem), str(err), str(mis), str(vec),
-                outcome, verdict, rule))
+    fails += verdict == 'FAIL'
+    out.append((pid, side, expect, *cols, outcome, verdict, rule))
     print('\t'.join(out[-1]), flush=True)
 
 with open(f'{HERE}/results/perturbations.tsv', 'w') as fh:

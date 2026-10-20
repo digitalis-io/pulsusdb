@@ -1,26 +1,30 @@
 #!/usr/bin/env python3
-"""The fixture docs/TraceQL/query-catalogue.md answers on: spans in six traces,
+"""The fixture docs/TraceQL/query-catalogue.md answers on: spans in seven traces,
 carrying every attribute key, scope, intrinsic and value type the TraceQL corpus
 at crates/pulsus-traceql/tests/corpus/ mentions, so that a catalogue entry's
 answer is a list of spans rather than a uniform empty set.
 
-Three things the layout is built for, each because a fixture without it lets a
+Four things the layout is built for, each because a fixture without it lets a
 wrong rule pass:
 
 1. **The structural topology** (traces four and five): a chain that alternates
-   the two sides, so the child union, the parent union and the descendant union
-   each return a different pair; a sibling pair under a parent of neither side;
-   a span whose parent is not stored; a two-span cycle.
-2. **A descendant two links past the nearest edge** (trace four,
+   the two sides, so in trace four the child union returns A2 and B1, the
+   parent union A1 and B1, and the descendant union A2, B1, A4 and B4; a
+   sibling pair under a parent of neither side; a span whose parent is not
+   stored; a two-span cycle.
+2. **A descendant three links below its nearest matching ancestor** (trace four,
    `A4 -> N1 -> N2 -> B4`): a direct-child rule and a recursive climb answer
    `{A} >> {B}` differently, and a climb bounded at one link loses B4.
 3. **A positive answer for every rule the corpus exercises** (trace six and the
    additions to trace four): arithmetic values, the escaped names, a bool the
-   truthiness rule must read, a span with four children, a trace with four error
+   truthiness rule must read, a span with eight children, a trace with four error
    spans, a sibling pair that survives a `| count() > 1` stage, and one resource
    carrying a key its span also carries with a different value, so the unscoped
    lookup ORDER decides the answer. `docs/TraceQL/query-catalogue.md` lists the
    four corpus queries that stay empty on both sides, with the reason.
+4. **An orphan earlier than its trace's root** (trace seven): a root rule that
+   admitted a span whose parent id names a span not stored would answer the
+   orphan's service and name as the trace's root.
 
 Writes OTLP/JSON bodies under <out>/otlp/ and the staging rows at
 <out>/spans.jsonl. Usage: make_catalogue_fixture.py OUT_DIR BASE_UNIX_SECONDS"""
@@ -33,6 +37,7 @@ T3 = '33' * 16                      # trace three: a span carrying nothing
 T4 = '44' * 16                      # trace four: the structural topology
 T5 = '55' * 16                      # trace five: a two-span cycle
 T6 = '66' * 16                      # trace six: the values every rule needs
+T7 = '77' * 16                      # trace seven: an orphan before the root
 LINK_TRACE = '000102030405060708090a0b0c0d0e0f'
 LINK_SPAN = '0a1b2c3d4e5f6071'
 def sid(n): return f'{n:016x}'
@@ -106,7 +111,7 @@ span(T3, 10, None, 'second root', 1, 20 * NS + 30 * 10**6, 10 * 10**6, 'plain', 
 # is not stored. A = `.a = 1`, B = `.b = 2`, and P and P2 carry neither, so
 #   child   -> B1        child union   -> A2, B1
 #   parent  -> B1        parent union  -> A1, B1
-#   sibling -> B2        sibling union -> A3, B2
+#   sibling -> B2, B3    sibling union -> A3, B2, B3 (B3 is added below)
 RES_EDGE = [['service.name', 's', 'edge'], ['deployment.environment', 's', 'prod'],
             ['k8s.pod.name', 's', 'edge-a']]
 span(T4, 20, None, 'P', 2, 30 * NS, 5 * NS, 'edge', RES_EDGE, [])
@@ -173,6 +178,12 @@ RES_REGEX = [['service.name', 's', 'regex'], ['deployment.environment', 's', 'de
              ['k8s.pod.name', 's', 'regex-a']]
 span(T6, 48, 40, 'xGETy', 1, 50 * NS + 10 * 10**6, 1 * NS, 'regex', RES_REGEX,
      [['http.url', 's', 'x/api/z'], ['http.route', 's', 'z/api/v2/x']])
+
+# trace 7: an orphan, its parent id naming no stored span, starts before the
+# trace's one parentless span and has another service and name; the root is
+# the parentless span (`docs/api.md` section 4.2, "Nested-set intrinsics")
+span(T7, 60, 998, 'early orphan', 1, 54 * NS, 1 * NS, 'regex', RES_REGEX, [])
+span(T7, 61, None, 'true root', 2, 55 * NS, 1 * NS, 'gw', RES_GW, [])
 
 os.makedirs(f'{out}/otlp', exist_ok=True)
 def av(t, v):

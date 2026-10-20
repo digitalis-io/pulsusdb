@@ -64,7 +64,7 @@ const MAX_STATEMENTS: usize = 100;
 const TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The search requests, each `(name, limit, spss)`: the answer, a top-K cut
-/// that decides something on six traces, and every matching span.
+/// that decides something on seven traces, and every matching span.
 const SEARCH_REQUESTS: [(&str, u32, u32); 3] =
     [("answer", 20, 3), ("cut", 2, 3), ("full", 20, 1000)];
 
@@ -343,13 +343,22 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
             } else {
                 "previous"
             });
-            let (engine, prefix) = engine(index, "answer");
+            let (range_engine, prefix) = engine(index, "answer");
             prefixes.push(("answer", prefix));
-            engine
+            let range = range_engine
                 .metrics_range_routed(&plan)
                 .await
                 .map(|r| metrics_json(&r))
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string());
+            // Issue #600 part 1b-2: the instant route's answer to the same
+            // plan, as the instant handler issues it.
+            let (instant_engine, prefix) = engine(index, "instant");
+            prefixes.push(("instant", prefix));
+            match instant_engine.metrics_instant_routed(&plan).await {
+                Ok(r) => line["instant"] = metrics_json(&r),
+                Err(e) => line["instant_error"] = json!(e.to_string()),
+            }
+            range
         } else {
             let mut requests = Vec::new();
             let mut refusal = None;

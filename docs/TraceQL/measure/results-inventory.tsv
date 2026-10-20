@@ -45,8 +45,7 @@ edge_checks.sh	text	the script’s own header	# WORKDIR. Writes results/edge-che
 edge_checks.sh	write	the directory itself, created for this script’s own output	R=$HERE/results; mkdir -p "$R"
 edge_checks.sh	write	written here	printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$v" >> "$R/edge-checks.tsv"
 edge_checks.sh	write	written here	printf 'check\texpected\tgot\tverdict\n' > "$R/edge-checks.tsv"
-perturb_check.py	write	the directory inside each perturbed copy, for that copy’s output	os.makedirs(f'{d}/results'); os.makedirs(f'{d}/catalogue-sql')
-perturb_check.py	read	each perturbed copy's own result, under that copy's scratch directory	counts = json.load(open(f'{d}/results/catalogue.json'))['counts']
+perturb_check.py	text	the docstring's account of what it writes	`results/perturbations.tsv`; exits 0 only when every row ends as it expects.
 perturb_check.py	write	written here	with open(f'{HERE}/results/perturbations.tsv', 'w') as fh:
 reproduce_check.py	text	this checker’s docstring	* **the file list is the run's own**, `results/catalogue-outputs.txt`, which
 reproduce_check.py	text	the same docstring	`results/catalogue.json`'s `statement_ms` member, and the last cell of each
@@ -83,10 +82,7 @@ run_all.sh	read	the two stores' counts, written at 124	for l in open(f'{R}/g1-ag
 run_all.sh	write	written here	python3 "$HERE/fixture/fixture_answers.py" "$CH" tqd_fx "$REF" "$((FB-1))" "$((FB+10))" > "$R/fixture-answers.tsv"
 run_all.sh	write	written here	> "$R/fixture-structural.tsv"
 run_all.sh	write	written here	"$HERE/edge_checks.sh" "$CH" tqd_edge "$WORK" | tee "$R/edge-checks-summary.txt"
-run_all.sh	write	written here	python3 "$HERE/fixture/make_catalogue_fixture.py" "$WORK/cat" "$CATB" > "$R/catalogue-fixture.json"
-run_all.sh	text	the comment on the step order	# results/perturbations.tsv and the catalogue document quotes it: the other
-run_all.sh	text	the same comment	# seven files under results/ that a later step of the same run reads;
-run_all.sh	write	written here	"${CATB}000000000" "$((CATB + 60))000000000" | tee "$R/catalogue-summary.txt"
+run_all.sh	write	the catalogue run's summary	"${PULSUS_BIN:-$(cd "$HERE/../../.." && pwd)/target/debug}" | tee "$R/catalogue-summary.txt"
 run_all.sh	write	the storage totals	GROUP BY table ORDER BY table FORMAT TSVWithNames" > "$R/storage.tsv"
 run_all.sh	write	the same file, the per-span figures	FORMAT TSVWithNames" >> "$R/storage.tsv"
 run_all.sh	write	the same file, the per-column bytes	FROM system.columns WHERE database='tqd_g1' AND table='spans' ORDER BY bytes DESC FORMAT TSVWithNames" >> "$R/storage.tsv"

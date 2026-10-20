@@ -1,6 +1,6 @@
 # Reproducing the numbers in docs/TraceQL/
 
-**Parts of this document describe the previous trace search engine, which issue #602 part 2c-2b deleted — its test binaries, goldens and benches in part 2c-2b-1, its code and the unit tests inside it in part 2c-2b-2; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** **Since #600 `catalogue.py` is the shipped-compiler comparison and `catalogue.sh` runs it, on one node or on the cluster `PULSUS_CLUSTER` names; `catalogue_render.py` supplies only the disposition rule, and `run_all.sh`, `perturb_check.py`, `reproduce_check.py` and `claims_check.py` describe the design renderer's run and are not re-run.** Every figure in the TraceQL documents comes from one of these scripts.
+**Parts of this document describe the previous trace search engine, which issue #602 part 2c-2b deleted — its test binaries, goldens and benches in part 2c-2b-1, its code and the unit tests inside it in part 2c-2b-2; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** **Since #600 `catalogue.py` is the shipped-compiler comparison and `catalogue.sh` runs it, on one node or on the cluster `PULSUS_CLUSTER` names; `catalogue_render.py` supplies only the disposition rule, `perturb_check.py RUN_JSONL FIXTURE_JSONL START_NS END_NS WORK_DIR` changes one rule at a time over a saved `catalogue.sh` run and writes `results/perturbations.tsv`; `run_all.sh`'s catalogue step runs `catalogue.sh` and then `perturb_check.py`. Its design-schema steps, `reproduce_check.py` and `claims_check.py` are the design-era record behind the design documents' figures, kept until those documents are rewritten, and are not re-run.** Every figure in the TraceQL documents comes from one of these scripts.
 They take hosts, ports and directories as arguments; nothing is hard-coded.
 `run_all.sh` goes from a clean checkout to `results/` in one command.
 
@@ -30,11 +30,11 @@ They take hosts, ports and directories as arguments; nothing is hard-coded.
 | `offload.sh` | the object-storage measurement kept in `functional-requirements.md` §3 after the requirement was withdrawn |
 | `fixture/make_fixture.py`, `fixture/fixture_answers.py` | the worked fixture and both stores' answers |
 | `fixture/structural_answers.py` | the fifteen structural forms' answers on that fixture |
-| `fixture/make_catalogue_fixture.py` | the catalogue fixture: 34 spans in six traces, carrying every key and type the corpus names and the shapes that tell a wrong rule from a right one |
+| `fixture/make_catalogue_fixture.py` | the catalogue fixture: 38 spans in seven traces, carrying every key and type the corpus names and the shapes that tell a wrong rule from a right one |
 | `catalogue_parse.py` | the TraceQL parser the catalogue's two sides share, and the only thing they share |
 | `parse_vectors.tsv` | one line per rule that parser decides, with the tree it must produce, written out by hand — the check on the one module a comparison cannot check |
 | `catalogue-extra.tsv` | the queries the corpus does not contain, one per rule of §3.2 no corpus query reaches, each with the rule it decides |
-| `catalogue_render.py` | the hand-written TraceQL-to-SQL rules: the statement each route issues, and the membership query |
+| `catalogue_render.py` | the disposition rule (`refusal`): which accepted queries the API answers with a `400` |
 | `catalogue_interp.py` | the independent side: the fixture rows and an interpreter that walks the same parsed query over them |
 | `catalogue.py` | runs both statements for every corpus query and writes `docs/TraceQL/query-catalogue*.md` and `catalogue-sql/` |
 | `perturb_check.py`, `perturbations.tsv` | changes one rule at a time, on one side at a time, and requires the catalogue to notice; `results/perturbations.tsv` is the run |
