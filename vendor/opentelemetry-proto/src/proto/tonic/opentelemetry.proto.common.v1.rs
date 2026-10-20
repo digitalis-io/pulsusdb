@@ -66,6 +66,7 @@ pub mod any_value {
 pub struct ArrayValue {
     /// Array of values. The array may be empty (contain 0 elements).
     #[prost(message, repeated, tag = "1")]
+    #[cfg_attr(feature = "with-serde", serde(default))]
     pub values: ::prost::alloc::vec::Vec<AnyValue>,
 }
 /// KeyValueList is a list of KeyValue messages. We need KeyValueList as a message
@@ -85,6 +86,7 @@ pub struct KeyValueList {
     /// value with the same key).
     /// The behavior of software that receives duplicated keys can be unpredictable.
     #[prost(message, repeated, tag = "1")]
+    #[cfg_attr(feature = "with-serde", serde(default))]
     pub values: ::prost::alloc::vec::Vec<KeyValue>,
 }
 /// Represents a key-value pair that is used to store Span attributes, Link
@@ -97,6 +99,7 @@ pub struct KeyValue {
     /// The key name of the pair.
     /// key_ref MUST NOT be set if key is used.
     #[prost(string, tag = "1")]
+    #[cfg_attr(feature = "with-serde", serde(default))]
     pub key: ::prost::alloc::string::String,
     /// The value of the pair.
     #[prost(message, optional, tag = "2")]
@@ -154,6 +157,7 @@ pub struct InstrumentationScope {
 #[cfg_attr(feature = "with-schemars", derive(schemars::JsonSchema))]
 #[cfg_attr(feature = "with-serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "with-serde", serde(rename_all = "camelCase"))]
+#[cfg_attr(feature = "with-serde", serde(default))]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct EntityRef {
     /// The Schema URL, if known. This is the identifier of the Schema that the entity data

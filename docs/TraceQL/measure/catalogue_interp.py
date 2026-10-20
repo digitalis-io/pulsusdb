@@ -159,8 +159,8 @@ def arm(t, v):
     in decimal, a boolean `boolValue`, a double `doubleValue` in full
     decimal notation with no exponent and no trailing `.0`"""
     if t == 'string': return ['stringValue', v]
-    # an array as the JSON text of its elements (#600 part 1b-3)
-    if t == 'array': return ['stringValue', json.dumps([e for _, e in v], separators=(',', ':'))]
+    # an array in the arrayValue arm, each element in its own (#601 part 1)
+    if t == 'array': return ['arrayValue', json.dumps([arm(VALUE_TYPE[et], e) for et, e in v], separators=(',', ':'), ensure_ascii=False)]
     if t == 'int': return ['intValue', str(v)]
     if t == 'bool': return ['boolValue', 'true' if v else 'false']
     v = float(v)
@@ -493,7 +493,7 @@ class Interp:
             vals = [v for v in vals if leaf is None or self.cmp(leaf['op'], v, rv)]
             if not vals: return None
             v = vals[-1] if leaf is not None or last else vals[0]
-            return ('intrinsic', n), n, arm('int' if n == 'event:timeSinceStart' else 'string', v)
+            return ('intrinsic', n), n, arm('string', go_duration(v)) if n == 'event:timeSinceStart' else arm('string', v)
         if n in ('duration', 'traceDuration', 'trace:duration'):
             return ('intrinsic', n), n, arm('string', go_duration(self.intrinsic(row, n)))
         v = self.intrinsic(row, n)

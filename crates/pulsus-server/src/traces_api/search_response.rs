@@ -399,6 +399,15 @@ fn span_json(span: &SpanSummary, report: &mut DomainReport) -> Value {
 ///   the key vanish from the value object. Our own stored spellings
 ///   (`inf`, `-inf`) normalise here, so they never reach the wire.
 fn group_value_json(value: &GroupValue) -> Value {
+    // An array (issue #601 part 1) is protojson's `arrayValue`, each element
+    // in its own arm; the encoder never builds the array's comparison token.
+    if let GroupValue::Array(v) = value {
+        return if v.is_empty() {
+            json!({ "arrayValue": {} })
+        } else {
+            json!({ "arrayValue": { "values": v.iter().map(group_value_json).collect::<Vec<_>>() } })
+        };
+    }
     // The ARM is decided once, in `pulsus-read`, so the live differential
     // that reads `GroupValue`s straight out of the engine compares the arm
     // this encoder actually writes.
@@ -2340,6 +2349,28 @@ mod tests {
             attrs[3]["value"],
             serde_json::json!({"stringValue": "nil"}),
             "an absent by-key value is the reference's nil MARKER, not JSON null"
+        );
+    }
+
+    /// T3 (issue #601 part 1): an array renders protojson's `arrayValue`,
+    /// each element in its own arm, and an empty one as `{"arrayValue":{}}`.
+    #[test]
+    fn an_array_value_renders_protojson_array_value() {
+        assert_eq!(
+            group_value_json(&GroupValue::Array(vec![
+                GroupValue::Str("x".to_string()),
+                GroupValue::Int(2),
+                GroupValue::Double(f64::NAN.to_bits()),
+            ])),
+            serde_json::json!({"arrayValue": {"values": [
+                {"stringValue": "x"},
+                {"intValue": "2"},
+                {"doubleValue": "NaN"},
+            ]}})
+        );
+        assert_eq!(
+            group_value_json(&GroupValue::Array(vec![])),
+            serde_json::json!({"arrayValue": {}})
         );
     }
 

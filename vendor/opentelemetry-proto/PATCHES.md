@@ -206,6 +206,21 @@ to 202 instead of 400-ing on a missing required field once the swallow is
 removed. `serde(default)` affects only ABSENT fields, so it re-introduces no
 swallow. Guarded by `otlp_json_vendor_patch.rs`.
 
+### P7. A field omitted at its proto3 default decodes to it — `src/proto/tonic/*.rs`, `src/proto.rs` (#601)
+
+proto3-JSON omits a field at its default: an empty array is `{"arrayValue":{}}`, an empty list
+`{"kvlistValue":{}}`, an empty key is no `key`, an empty `EntityRef.schemaUrl` or `type` is no such field, an
+empty request is `{}`, and an `AnyValue` with no value is `{}`. The derives required each of them.
+`ArrayValue.values`, `KeyValueList.values` and `KeyValue.key` gain `#[cfg_attr(feature = "with-serde",
+serde(default))]`; so do the structs `EntityRef`, `ExportTraceServiceRequest`, `ExportLogsServiceRequest`,
+`ExportMetricsServiceRequest`, `TracesData`, `LogsData` and `MetricsData`. The P2 `AnyValue` visitor answers no
+recognised key with no value rather than an error. Serialization is unchanged; serde's derive still refuses a field given twice.
+The ingest decoder is the bounded one in `crates/pulsus-write/src/protocols/otlp_json.rs`; it finishes `KeyValue`
+and `EntityRef` through these derives and drops its own two `values` refusals and its no-key refusal in the same
+change. Gated by `the_generated_decoder_reads_an_omitted_field_as_its_default` (these derives directly) and
+`an_omitted_default_field_decodes_on_every_signal` (the three signals' decoders), both in
+`crates/pulsus-write/tests/otlp_json_vendor_patch.rs`.
+
 ## Out of scope (pre-existing upstream behavior, NOT introduced here)
 
 - `asDouble`'s **integer** representation and other non-`asInt` int64 fields are

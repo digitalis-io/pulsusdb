@@ -25,6 +25,7 @@ crates/pulsus-schema/src/catalog.rs
 crates/pulsus-schema/src/controller.rs
 distributor.go
 docs/sources/query/log_queries/_index.md
+encoding/vparquet4/block_traceql.go
 engine.go
 engine_metrics.go
 evaluator.go
@@ -44,6 +45,7 @@ limits.go
 marshal.go
 metrics_to_prw.go
 model/labels/labels_common.go
+modules/distributor/distributor.go
 modules/frontend/combiner/response_metrics.go
 modules/frontend/combiner/search.go
 modules/frontend/combiner/trace_by_id.go
@@ -133,6 +135,7 @@ pkg/util/errors.go
 pkg/util/httpreq/tags.go
 pkg/util/marshal/marshal.go
 pkg/util/marshal/query.go
+pkg/util/traceid.go
 pkg/util/validation/validate.go
 pkg/validation/limits.go
 pkg/validation/validate.go

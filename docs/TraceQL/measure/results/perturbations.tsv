@@ -45,8 +45,8 @@ root_columns_interp	interpreter	red	157	0	0	0	0	noticed	PASS	the trace row carri
 presence_interp	interpreter	red	5	4	0	0	0	noticed	PASS	`!= nil` is presence: the key is stored
 select_projection_interp	interpreter	red	6	0	0	0	0	noticed	PASS	`select()` adds a projected slot to each span tuple
 spanset_and_interp	interpreter	red	3	0	0	0	0	noticed	PASS	`{A} && {B}` keeps only traces carrying both sides
-group_type_interp	interpreter	red	2	0	0	0	0	noticed	PASS	an attribute `by()` group carries its stored type, so two values with the same label stay two groups
+group_type_interp	interpreter	red	3	0	0	0	0	noticed	PASS	an attribute `by()` group carries its stored type, so two values with the same label stay two groups
 array_mixed_interp	interpreter	red	4	6	0	0	0	noticed	PASS	an array of two element types is missing
-array_render_interp	interpreter	red	3	0	0	0	0	noticed	PASS	an array is the compact JSON text of its elements
+array_render_interp	interpreter	red	3	0	0	0	0	noticed	PASS	an array is the arrayValue of its elements' arms
 array_compare_interp	interpreter	red	0	8	0	0	0	noticed	PASS	an array value is not counted in `compare()`
 array_series_interp	interpreter	red	0	2	0	0	0	noticed	PASS	each array is its own `nil` series by its rendered text on the metrics routes

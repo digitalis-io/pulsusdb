@@ -187,7 +187,10 @@ fn corpus(base_ns: i64) -> Vec<u8> {
         "kind": 3,
         "startTimeUnixNano": ns(sec / 10),
         "endTimeUnixNano": ns(sec / 10 + sec / 2),
-        "attributes": [kv("http.method", s("POST"))],
+        "attributes": [
+            kv("http.method", s("POST")),
+            kv("tags", serde_json::json!({"arrayValue": {"values": [s("a"), s("b")]}})),
+        ],
     });
     let confirm = serde_json::json!({
         "traceId": TRACE_HEX,
@@ -501,6 +504,7 @@ fn our_untyped_value(v: &pulsus_read::GroupValue) -> String {
         pulsus_read::GroupValue::Double(bits) => f64::from_bits(*bits).to_string(),
         pulsus_read::GroupValue::Bool(b) => b.to_string(),
         pulsus_read::GroupValue::Nil => String::new(),
+        pulsus_read::GroupValue::Array(_) => pulsus_read::wire_arm(v).1,
     }
 }
 
@@ -517,6 +521,25 @@ fn our_untyped_value(v: &pulsus_read::GroupValue) -> String {
 /// untyped on purpose — its own comparison is a multiset over five value
 /// SOURCES, and flattening keeps that comparison independent of the arm.
 fn untyped_value(v: &serde_json::Value) -> String {
+    // An array (issue #601 part 1): the compact JSON of its elements'
+    // `[arm, text]` pairs, each read by the scalar rules below — the text
+    // `wire_arm` gives our array.
+    if let Some(array) = v.get("arrayValue") {
+        let pairs: Vec<(String, String)> = array
+            .get("values")
+            .and_then(|x| x.as_array())
+            .into_iter()
+            .flatten()
+            .map(|e| {
+                let arm = ["stringValue", "intValue", "doubleValue", "boolValue"]
+                    .into_iter()
+                    .find(|a| e.get(*a).is_some())
+                    .unwrap_or("<no arm>");
+                (arm.to_string(), untyped_value(e))
+            })
+            .collect();
+        return serde_json::to_string(&pairs).expect("pairs of strings serialize");
+    }
     for field in ["stringValue", "intValue"] {
         if let Some(s) = v.get(field).and_then(|x| x.as_str()) {
             return s.to_string();
