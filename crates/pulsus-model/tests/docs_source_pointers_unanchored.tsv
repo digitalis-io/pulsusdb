@@ -978,8 +978,8 @@ docs/query-to-sql.md	traces/exec.rs:126	pinned_to_another_version
 docs/query-to-sql.md	traces/exec.rs:131	pinned_to_another_version
 docs/query-to-sql.md	traces/exec.rs:1408	no_name_the_target_file_holds
 docs/query-to-sql.md	traces/exec.rs:157	no_name_the_target_file_holds
-docs/query-to-sql.md	traces/exec.rs:2170	no_name_the_target_file_holds
-docs/query-to-sql.md	traces/exec.rs:2211	no_name_the_target_file_holds
+docs/query-to-sql.md	traces/exec.rs:2167	no_name_the_target_file_holds
+docs/query-to-sql.md	traces/exec.rs:2208	no_name_the_target_file_holds
 docs/query-to-sql.md	traces/exec.rs:92	no_name_the_target_file_holds
 docs/query-to-sql.md	traces/metrics_sql.rs:89	no_name_the_target_file_holds
 docs/query-to-sql.md	traces/search_plan.rs:1121	not_in_this_repository
