@@ -2157,11 +2157,7 @@ impl Replicas {
             self.db
         );
         client
-            .execute(
-                &sql,
-                &QuerySettings::new().set("distributed_ddl_task_timeout", 600),
-                Idempotency::NonIdempotent,
-            )
+            .execute(&sql, &QuerySettings::new(), Idempotency::NonIdempotent)
             .await
             .unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
