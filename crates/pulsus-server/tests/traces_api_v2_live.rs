@@ -1584,6 +1584,46 @@ fn fetched_span_ids(data: &TracesData) -> BTreeSet<String> {
         .collect()
 }
 
+/// T6 (issue #601 part 4a): a fetch returns one `ScopeSpans` per distinct
+/// (resource, scope) pair its fixture writes, under one `ResourceSpans` per
+/// resource, with every span once. `ctx` names the case.
+fn assert_grouped(data: &TracesData, pairs: usize, spans: usize, ctx: &str) {
+    let got: usize = data
+        .resource_spans
+        .iter()
+        .map(|rs| rs.scope_spans.len())
+        .sum();
+    assert_eq!(
+        got, pairs,
+        "{ctx}: one ScopeSpans per distinct (resource, scope) pair the fixture writes"
+    );
+    let resources: BTreeSet<Vec<u8>> = data
+        .resource_spans
+        .iter()
+        .map(|rs| {
+            rs.resource
+                .as_ref()
+                .map(Message::encode_to_vec)
+                .unwrap_or_default()
+        })
+        .collect();
+    assert_eq!(
+        resources.len(),
+        data.resource_spans.len(),
+        "{ctx}: one ResourceSpans per distinct resource"
+    );
+    let ids: Vec<String> = fetched_spans(data)
+        .iter()
+        .map(|s| hex(&s.span_id))
+        .collect();
+    let distinct: BTreeSet<&String> = ids.iter().collect();
+    assert_eq!(
+        (ids.len(), distinct.len()),
+        (spans, spans),
+        "{ctx}: every span present once"
+    );
+}
+
 /// Every span of a fetched trace, in the order the response carries them.
 fn fetched_spans(data: &TracesData) -> Vec<&Span> {
     data.resource_spans
@@ -1915,22 +1955,9 @@ async fn t_w7_a_span_with_every_field_round_trips_as_an_otlp_value() {
     let (fetched, prefix) = fetch_trace(port, &hex32, "", "T-W7");
     the_new_statements_ran(&admin, db.name(), &prefix).await;
 
-    // The response topology: one group per span, each carrying the SAME
-    // resource and the SAME scope.
-    assert_eq!(
-        fetched.resource_spans.len(),
-        2,
-        "one ResourceSpans per span, which is what every golden pins"
-    );
-    assert_eq!(
-        fetched.resource_spans[0].resource, fetched.resource_spans[1].resource,
-        "byte-identical resources between the groups"
-    );
-    assert_eq!(
-        fetched.resource_spans[0].scope_spans[0].scope,
-        fetched.resource_spans[1].scope_spans[0].scope,
-        "and byte-identical scopes"
-    );
+    // The response topology: the fixture writes one resource and one
+    // scope, so both spans come back in one group.
+    assert_grouped(&fetched, 1, 2, "T-W7");
 
     let spans = fetched_spans(&fetched);
     // The zero-start span sorts FIRST, because the canonical order leads
@@ -2035,7 +2062,7 @@ async fn t_w7_a_span_with_every_field_round_trips_as_an_otlp_value() {
     );
 
     // --- the resource, the scope, the event and the link ------------
-    let group = &fetched.resource_spans[1];
+    let group = &fetched.resource_spans[0];
     assert_eq!(group.schema_url, "https://example.invalid/res");
     let resource_back = group.resource.as_ref().expect("a present resource");
     assert_eq!(resource_back.dropped_attributes_count, 7);
@@ -3272,11 +3299,7 @@ async fn two_resources_differing_only_in_semantics_fetch_as_themselves() {
 
     let (fetched, prefix) = fetch_trace(port, &hex32, "", "T-W10");
     the_new_statements_ran(&admin, db.name(), &prefix).await;
-    assert_eq!(
-        fetched.resource_spans.len(),
-        5,
-        "one ResourceSpans per span"
-    );
+    assert_grouped(&fetched, 5, 5, "T-W10: five distinct resources, one scope");
 
     /// The resource of the group holding the span whose id byte is `n`.
     fn resource_of(data: &TracesData, n: u8) -> &Resource {
@@ -3884,10 +3907,11 @@ async fn t_q3_the_truncated_set_route_suppresses_the_discarded_array() {
     );
 
     // (b3) three different numbers over one answer, asserted separately.
-    assert_eq!(
-        fetched.resource_spans.len(),
+    assert_grouped(
+        &fetched,
+        4,
         40,
-        "(b3)(i) one ResourceSpans per span, whatever the resources are"
+        "(b3)(i) four resources, one scope, forty spans",
     );
     let distinct_resources: BTreeSet<Vec<u8>> = fetched
         .resource_spans
@@ -3902,7 +3926,7 @@ async fn t_q3_the_truncated_set_route_suppresses_the_discarded_array() {
     assert_eq!(
         distinct_resources.len(),
         4,
-        "(b3)(ii) four DISTINCT resource values across those forty groups"
+        "(b3)(ii) four DISTINCT resource values across the groups"
     );
     assert_eq!(
         statement_lengths(&data, &second).await,

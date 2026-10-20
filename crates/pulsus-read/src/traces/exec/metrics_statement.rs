@@ -87,7 +87,7 @@ impl TraceEngine {
         sql: &str,
         demands: &[String],
     ) -> Result<Vec<R>, ReadError> {
-        let settings = statement_settings(&self.config);
+        let settings = statement_settings(&self.config, true);
         let mut stream = self
             .dispatch
             .query_stream::<R, _>(sql, &settings, |e| self.map_statement_error(e, demands))

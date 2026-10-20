@@ -220,12 +220,17 @@ impl TraceEngine {
     /// rows, and so its numbering, its relations and its child counts, are
     /// whole on one shard.
     pub(super) fn statement_settings(&self, stmt: &SearchStatement) -> QuerySettings {
-        product_mode(
-            with_final(self.search_settings()),
-            self.config.distributed,
-            stmt.nests_reads(),
-        )
+        search_statement_settings(&self.config, stmt)
     }
+}
+
+/// [`TraceEngine::statement_settings`], on the engine's configuration.
+fn search_statement_settings(config: &TraceReadConfig, stmt: &SearchStatement) -> QuerySettings {
+    product_mode(
+        with_final(super::search_settings(config)),
+        config.distributed,
+        stmt.nests_reads(),
+    )
 }
 
 /// [`TraceEngine::statement_settings`]'s rule, on its own.
@@ -255,6 +260,58 @@ mod tests {
                 s.get("distributed_product_mode"),
                 want,
                 "distributed {distributed}, numbered {numbered}"
+            );
+        }
+    }
+
+    /// T13 (issue #601 part 4a): a search statement runs under `final`
+    /// only when it reads the nested-set numbering — a predicate, the
+    /// projection or a `by()` key.
+    #[test]
+    fn a_statement_keeps_final_only_when_it_numbers() {
+        let cfg = TraceReadConfig {
+            spans_table: "trace_spans".to_string(),
+            attrs_table: "trace_attrs_idx".to_string(),
+            edges_table: "trace_edges".to_string(),
+            recent_table: "trace_recent".to_string(),
+            errors_table: "trace_error_spans".to_string(),
+            spans_v2_table: "spans".to_string(),
+            traces_table: "traces".to_string(),
+            resources_table: "resources".to_string(),
+            scan_budget_rows: 1_000,
+            max_depth: 64,
+            max_series: 1_000,
+            read_max_memory_bytes: 1 << 30,
+            distributed: false,
+            skip_unavailable_shards: false,
+        };
+        for (q, want) in [
+            ("{ status = error }", None),
+            ("{ status = error } | count() > 1", None),
+            ("{ nestedSetParent > 0 }", Some("1")),
+            ("{ } | select(nestedSetLeft)", Some("1")),
+        ] {
+            let request = SearchRequest {
+                start_ns: 1_700_000_000_000_000_000,
+                end_ns: 1_700_003_600_000_000_000,
+                limit: 20,
+                spss: 3,
+                query: pulsus_traceql::parse(q).expect("parses"),
+            };
+            let stmt = crate::traces::spans::search::plan_statement_sliced(
+                &request,
+                "spans",
+                "traces",
+                "resources",
+                64,
+                &[],
+                None,
+            )
+            .unwrap_or_else(|e| panic!("{q}: {e}"));
+            assert_eq!(
+                search_statement_settings(&cfg, &stmt).get("final"),
+                want,
+                "{q}"
             );
         }
     }

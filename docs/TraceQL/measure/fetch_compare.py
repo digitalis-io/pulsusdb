@@ -62,15 +62,29 @@ def stub(answer):
     return f'http://127.0.0.1:{srv.server_address[1]}', srv
 
 
+def traces_data(spans):
+    """a `TracesData` holding `spans` empty spans in one resource and scope,
+    on the protobuf wire: field 1 `ResourceSpans`, its field 2 `ScopeSpans`,
+    its field 2 `Span`"""
+    def ld(field, payload):
+        assert len(payload) < 128
+        return bytes([(field << 3) | 2, len(payload)]) + payload
+    return ld(1, ld(2, b''.join(ld(2, b'') for _ in range(spans))))
+
+
 def self_test():
     import subprocess
-    good = lambda n: (200, b'trace')
+    one = traces_data(1)
+    good = lambda n: (200, one)
     cases = [
-        ('PulsusDB 500 on its third call', lambda n: (500, b'') if n == 3 else (200, b'trace'), good,
+        ('PulsusDB 500 on its third call', lambda n: (500, b'') if n == 3 else (200, one), good,
          1, ['PulsusDB', '500']),
-        ('the reference 200 with an empty body on its first call', good, lambda n: (200, b'') if n == 1 else (200, b'trace'),
+        ('the reference 200 with an empty body on its first call', good, lambda n: (200, b'') if n == 1 else (200, one),
          1, ['the reference', 'empty body']),
         ('a good pair', good, good, 0, []),
+        ('two spans against one', lambda n: (200, traces_data(2)), good, 1, ['not like for like']),
+        ('no span on either side', lambda n: (200, traces_data(0)), lambda n: (200, traces_data(0)),
+         1, ['not like for like']),
     ]
     fails = 0
     for name, pa, ra, want, words in cases:
@@ -84,7 +98,7 @@ def self_test():
             ok = ok and len(lines) == 2 and lines[0].startswith('PulsusDB\t') and lines[1].startswith('the reference\t')
         print(f'{"ok  " if ok else "FAIL"} {name}: exit {run.returncode}, expected {want}; {run.stderr.strip()[-200:]}')
         fails += not ok
-    print(f'fetch_compare.py self-test: {3 - fails} of 3 cases as expected')
+    print(f'fetch_compare.py self-test: {len(cases) - fails} of {len(cases)} cases as expected')
     return 1 if fails else 0
 
 

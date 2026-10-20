@@ -744,6 +744,12 @@ impl SearchStatement {
         self.numbered
     }
 
+    /// Whether the statement runs under `final` (issue #601 part 4a). Not
+    /// yet built.
+    pub fn keeps_final(&self) -> bool {
+        true
+    }
+
     /// Whether the statement reads a table inside a read of the same
     /// table: the numbering, a structural operator's relations or a span's
     /// child count.
@@ -1095,6 +1101,12 @@ pub fn compile_search_sliced(
         structural,
         child_counts: filter.predicates().iter().any(|p| p.reads_child_counts()),
     })
+}
+
+/// Whether `expr` is a filter the trace-level statement answers alone
+/// (issue #601 part 4a). Not yet built.
+pub(crate) fn admits_trace_shortcut(_expr: &FieldExpr) -> bool {
+    true
 }
 
 /// The caller-validated request window and response caps.
@@ -1830,5 +1842,43 @@ mod by_array_tests {
             group_value(&format!(r#"[["String","{long}"]]"#), kind),
             Ok(GroupValue::Array(vec![GroupValue::Str(long)]))
         );
+    }
+}
+
+#[cfg(test)]
+mod trace_shortcut_tests {
+    use super::*;
+    use pulsus_traceql::{ArithOp, FieldOp, UnaryOp};
+
+    /// T10e (issue #601 part 4a): the three gate arms validation refuses
+    /// before planning — a bare trace field, a top-level arithmetic node and
+    /// a top-level negation — are refused by the gate as well, built
+    /// directly because no query reaches the planner with them.
+    #[test]
+    fn the_gate_refuses_the_arms_validation_also_refuses() {
+        let field = || FieldExpr::Field(Field::Intrinsic(Intrinsic::TraceDuration));
+        for (name, expr) in [
+            (
+                "traceDuration * 2",
+                FieldExpr::Binary {
+                    op: FieldOp::Arith(ArithOp::Mul),
+                    lhs: Box::new(field()),
+                    rhs: Box::new(FieldExpr::Literal(Value::Number("2".to_string()))),
+                },
+            ),
+            (
+                "-traceDuration",
+                FieldExpr::Unary {
+                    op: UnaryOp::Neg,
+                    expr: Box::new(field()),
+                },
+            ),
+            ("traceDuration", field()),
+        ] {
+            assert!(
+                !admits_trace_shortcut(&expr),
+                "{name} must not take the shortcut"
+            );
+        }
     }
 }

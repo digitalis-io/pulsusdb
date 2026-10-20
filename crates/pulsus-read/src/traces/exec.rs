@@ -2533,7 +2533,7 @@ fn metrics_settings(config: &TraceReadConfig) -> QuerySettings {
 /// [`metrics_settings`] with `final = 1` and no set limit. The statement
 /// builds the sets of the seven trace-level and nested-set fields, bounded
 /// by the read memory ceiling and the scan budget, not by a set limit.
-fn statement_settings(config: &TraceReadConfig) -> QuerySettings {
+fn statement_settings(config: &TraceReadConfig, _keeps_final: bool) -> QuerySettings {
     with_final(metrics_settings(config))
         .set("max_rows_in_set", 0u64)
         .set("max_bytes_in_set", 0u64)
@@ -3392,7 +3392,7 @@ mod tests {
     /// on one host, which is not one position, so it closes none of the
     /// visibility states it was proposed for.
     #[test]
-    fn fetch_settings_carries_exactly_the_clustered_budget_set_and_final() {
+    fn fetch_settings_carries_exactly_the_clustered_budget_set_and_no_final() {
         let clustered = TraceReadConfig {
             distributed: true,
             skip_unavailable_shards: true,
@@ -3437,8 +3437,6 @@ mod tests {
             // would pass against a config that carried something else.
             ("max_memory_usage", mem.as_str()),
             ("max_bytes_before_external_group_by", "0"),
-            ("final", "1"),
-            ("do_not_merge_across_partitions_select_final", "1"),
         ]
         .iter()
         .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
@@ -3728,10 +3726,9 @@ mod tests {
     /// clustered, it keeps the local product mode the sets need.
     #[test]
     fn the_statement_builds_sets_under_the_memory_ceiling() {
-        let s = statement_settings(&cfg());
+        let s = statement_settings(&cfg(), false);
         assert_eq!(s.get("max_rows_in_set"), Some("0"));
         assert_eq!(s.get("max_bytes_in_set"), Some("0"));
-        assert_eq!(s.get("final"), Some("1"));
         assert_eq!(
             s.get("max_memory_usage"),
             Some(TEST_READ_MEM.to_string().as_str())
@@ -3740,9 +3737,65 @@ mod tests {
         let mut clustered = cfg();
         clustered.distributed = true;
         assert_eq!(
-            statement_settings(&clustered).get("distributed_product_mode"),
+            statement_settings(&clustered, false).get("distributed_product_mode"),
             Some("local")
         );
+    }
+
+    /// T14 (issue #601 part 4a): a metrics statement runs under `final`
+    /// only when it reads the nested-set numbering; every other statement
+    /// removes a stored span's copies itself.
+    #[test]
+    fn a_metrics_statement_keeps_final_only_when_it_numbers() {
+        use crate::traces::filter::SpanFilterCtx;
+        use crate::traces::metrics_plan::MetricsParams;
+        use crate::traces::spans::metrics::{StatementTables, plan_trace_metrics_routed};
+        let ctx = crate::traces::metrics_plan::MetricsCtx {
+            filter: SpanFilterCtx {
+                spans_table: "trace_spans",
+                attrs_table: "trace_attrs_idx",
+            },
+            scan_budget_rows: 50_000_000,
+            max_series: 1_000,
+            distributed: false,
+            skip_unavailable_shards: false,
+        };
+        let params = MetricsParams {
+            start_ns: 1_700_000_000_000_000_000,
+            end_ns: 1_700_000_600_000_000_000,
+            step_ms: 60_000,
+            exemplars: None,
+            floor_ns: i64::MIN,
+        };
+        let tables = StatementTables {
+            spans: "spans",
+            resources: "resources",
+            traces: "traces",
+            indexed: &[],
+        };
+        for (q, want) in [
+            ("{ status = error } | count_over_time()", None),
+            (
+                "{ status = error } | count_over_time() by(nestedSetParent)",
+                Some("1"),
+            ),
+        ] {
+            let routed = plan_trace_metrics_routed(
+                &pulsus_traceql::parse(q).expect("parses"),
+                &params,
+                &ctx,
+                &tables,
+            )
+            .unwrap_or_else(|e| panic!("{q}: {e}"));
+            let stmt = routed
+                .statement()
+                .unwrap_or_else(|| panic!("{q}: no statement"));
+            assert_eq!(
+                statement_settings(&cfg(), stmt.keeps_final()).get("final"),
+                want,
+                "{q}"
+            );
+        }
     }
 
     /// Issue #173: `graph_settings` carries the search row/byte budget and
@@ -4483,7 +4536,7 @@ mod tests {
                     ("tag_store_settings", tag_store_settings(&config)),
                     ("fetch_settings", fetch_settings(&config)),
                     ("metrics_settings", metrics_settings(&config)),
-                    ("statement_settings", statement_settings(&config)),
+                    ("statement_settings", statement_settings(&config, false)),
                     ("graph_settings", graph_settings(&config)),
                 ];
                 for (builder, s) in &builders {
@@ -4616,7 +4669,7 @@ mod tests {
                 // `fetch_by_id`'s settings object, by construction.
                 ("fetch_by_id (point read)", catalog_settings(&c)),
                 ("metrics_settings", metrics_settings(&c)),
-                ("statement_settings", statement_settings(&c)),
+                ("statement_settings", statement_settings(&c, false)),
                 ("graph_settings", graph_settings(&c)),
             ] {
                 assert_eq!(

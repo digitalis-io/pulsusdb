@@ -168,18 +168,46 @@ def stub(answer):
 
 
 def self_test():
-    p, ps = stub(lambda path, n: (400, b'no') if path == '/flaky' and n == 1 else (200, b'{}'))
-    r, rs = stub(lambda path, n: (200, b'{}'))
+    import tempfile
+    one = b'{"traces":[{"traceID":"aa"}]}'
+    def ours(path, n):
+        if path == '/flaky' and n == 1: return 400, b'no'
+        if path == '/search': return 200, one
+        return 200, b'{}'
+    def theirs(path, n):
+        if path == '/search': return 200, b'{"traces":[]}'
+        return 200, b'{}'
+    p, ps = stub(ours)
+    r, rs = stub(theirs)
+    bodies = tempfile.mkdtemp(prefix='http_bench_bodies.')
+    os.environ['BENCH_BODIES'] = bodies
     rows = {row[0]: row for row in paired(p, r, [('flaky', '/flaky', {}, '/flaky', {}),
-                                                   ('steady', '/steady', {}, '/steady', {})], 3)}
+                                                   ('steady', '/steady', {}, '/steady', {}),
+                                                   ('s99_empty_reference', '/search', {}, '/search', {})], 3)}
+    del os.environ['BENCH_BODIES']
     fails = 0
     for name, want in (('flaky', '400'), ('steady', '200')):
         got = rows[name][1] if name in rows else None
         ok = got == want
         print(f'{"ok  " if ok else "FAIL"} {name}: p_status {got}, expected {want}')
         fails += not ok
+    # a search the reference answers with no trace: its row counts 1 trace
+    # for PulsusDB and 0 for the reference, and both first bodies are kept
+    row = rows.get('s99_empty_reference', [])
+    got = (row[11] if len(row) > 11 else None, row[12] if len(row) > 12 else None)
+    ok = got == ('1', '0')
+    print(f'{"ok  " if ok else "FAIL"} s99_empty_reference: (p_items, r_items) {got}, expected (\'1\', \'0\')')
+    fails += not ok
+    kept = {}
+    for side in ('pulsus', 'reference'):
+        path = os.path.join(bodies, f's99_empty_reference.{side}')
+        kept[side] = open(path, 'rb').read() if os.path.exists(path) else None
+    ok = kept == {'pulsus': one, 'reference': b'{"traces":[]}'}
+    print(f'{"ok  " if ok else "FAIL"} s99_empty_reference: bodies written under BENCH_BODIES {kept}')
+    fails += not ok
+    import shutil; shutil.rmtree(bodies)
     ps.shutdown(); rs.shutdown()
-    print(f'http_bench.py self-test: {2 - fails} of 2 cases as expected')
+    print(f'http_bench.py self-test: {4 - fails} of 4 cases as expected')
     return 1 if fails else 0
 
 

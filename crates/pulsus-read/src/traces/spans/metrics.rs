@@ -120,6 +120,12 @@ impl MetricsStatement {
         self.compare
     }
 
+    /// Whether the statement runs under `final` (issue #601 part 4a). Not
+    /// yet built.
+    pub fn keeps_final(&self) -> bool {
+        true
+    }
+
     /// The messages the filter's `!` demands raise (issue #602 part 2a): a
     /// `Code: 395` carrying one is the request's `400`.
     pub fn demands(&self) -> &[String] {

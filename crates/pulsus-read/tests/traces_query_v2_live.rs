@@ -18166,3 +18166,719 @@ async fn the_metrics_row_window_starts_at_the_floor_across_a_utc_midnight() {
         "the instant answer counts the span at M alone"
     );
 }
+
+// =====================================================================
+// Issue #601 part 4a — the trace-level search, and a retried push read
+// once by every statement
+// =====================================================================
+
+/// A 16-byte trace id whose last byte is `n`.
+fn tid4a(n: u8) -> Vec<u8> {
+    let mut v = vec![0u8; 16];
+    v[15] = n;
+    v
+}
+
+/// The trace-level fixture of part 4a, over the one-hour window from `w0`:
+/// P (`a1`) wholly inside it, 2 s long; Q (`a2`) with one span inside and
+/// its last span after the end; R (`a3`) with spans before the start and
+/// after the end only; S (`a4`) inside and 0.5 s long; and, `with_m`, M
+/// (`a5`), inside, root `m`, 2 s long. No span lies in the window's newest
+/// five minutes, so the sliced plan's first slice finds nothing.
+fn tl4a_bodies(w0: i64, with_m: bool) -> Vec<ExportTraceServiceRequest> {
+    let s = 1_000_000_000i64;
+    let end = w0 + 3_600 * s;
+    let root = Vec::new();
+    let one = |t: u8, sid: u8, parent: Vec<u8>, name: &str, at: i64, dur: i64| {
+        span_of(
+            tid4a(t),
+            span_id_bytes(sid),
+            parent,
+            name,
+            2,
+            at,
+            dur,
+            Vec::new(),
+            0,
+            Vec::new(),
+            Vec::new(),
+        )
+    };
+    let mut out = vec![
+        request(
+            "svc",
+            "pod-p",
+            vec![
+                one(0xa1, 0x11, root.clone(), "p", w0 + 600 * s, 2 * s),
+                one(
+                    0xa1,
+                    0x12,
+                    span_id_bytes(0x11),
+                    "p-child",
+                    w0 + 600 * s + s / 2,
+                    s,
+                ),
+            ],
+        ),
+        request(
+            "svc",
+            "pod-q",
+            vec![
+                one(0xa2, 0x21, root.clone(), "q", w0 + 3_000 * s, s / 10),
+                one(
+                    0xa2,
+                    0x22,
+                    span_id_bytes(0x21),
+                    "q-child",
+                    end + 60 * s,
+                    s / 10,
+                ),
+            ],
+        ),
+        request(
+            "svc",
+            "pod-r",
+            vec![
+                one(0xa3, 0x31, root.clone(), "r", w0 - 60 * s, s / 10),
+                one(
+                    0xa3,
+                    0x32,
+                    span_id_bytes(0x31),
+                    "r-child",
+                    end + 60 * s,
+                    s / 10,
+                ),
+            ],
+        ),
+        request(
+            "svc",
+            "pod-s",
+            vec![one(0xa4, 0x41, root.clone(), "s", w0 + 1_200 * s, s / 2)],
+        ),
+    ];
+    if with_m {
+        out.push(request(
+            "svc",
+            "pod-m",
+            vec![
+                one(0xa5, 0x51, root, "m", w0 + 1_800 * s, 2 * s),
+                one(
+                    0xa5,
+                    0x52,
+                    span_id_bytes(0x51),
+                    "m-child",
+                    w0 + 1_800 * s + s / 5,
+                    s / 2,
+                ),
+            ],
+        ));
+    }
+    out
+}
+
+/// A fresh database holding [`tl4a_bodies`], its client and the window;
+/// with `with_m`, M's `traces` row is then removed.
+async fn seed_tl4a(test: &str, with_m: bool) -> (String, ChClient, (i64, i64)) {
+    let db = pulsus_testkit::test_db(&format!("pulsus_read_it_t601p4a_{test}"));
+    let client = fresh_db(&db).await;
+    let w0 = (now_ns() / 1_000_000_000 - 7_200) * 1_000_000_000;
+    for (i, req) in tl4a_bodies(w0, with_m).iter().enumerate() {
+        land(&client, req, &format!("t601p4a-{test}-{i}")).await;
+    }
+    if with_m {
+        client
+            .execute(
+                &format!(
+                    "ALTER TABLE traces DELETE WHERE trace_id = unhex('{}') \
+                     SETTINGS mutations_sync = 2",
+                    "00".repeat(15) + "a5"
+                ),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("remove M's traces row");
+        assert_eq!(
+            count_of(
+                &client,
+                &format!(
+                    "SELECT count() AS n FROM traces WHERE trace_id = unhex('{}')",
+                    "00".repeat(15) + "a5"
+                )
+            )
+            .await,
+            0,
+            "M has no traces row"
+        );
+        assert_eq!(
+            count_of(
+                &client,
+                &format!(
+                    "SELECT count() AS n FROM spans WHERE trace_id = unhex('{}')",
+                    "00".repeat(15) + "a5"
+                )
+            )
+            .await,
+            2,
+            "M's spans are stored"
+        );
+    }
+    (db, client, (w0, w0 + 3_600_000_000_000))
+}
+
+/// `count() AS n` of `sql`.
+async fn count_of(client: &ChClient, sql: &str) -> u64 {
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug)]
+    struct N {
+        n: u64,
+    }
+    let mut st = client
+        .query_stream::<N>(sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    st.next().await.expect("one row").expect("decode").n
+}
+
+/// `q` through the route over `w`, limit 20 and spss 3: its answer, as
+/// [`grouped_answer_of`] renders it, and the statements it ran.
+async fn routed_with_statements(
+    engine: &pulsus_read::TraceEngine,
+    client: &ChClient,
+    db: &str,
+    q: &str,
+    w: (i64, i64),
+) -> (String, u64) {
+    let plan = plan_of(engine, &parse_query(q), w, 20, 3);
+    let t0 = now_ns();
+    let out = engine.search_routed(&plan).await;
+    let (n, _) = settled_statements(client, db, t0).await;
+    (grouped_answer_of(&out), n)
+}
+
+/// T10 (issue #601 part 4a): **a trace-level search is one statement, and
+/// reads the window's edge.** `{ traceDuration > 1s }` answers P and Q as
+/// the sliced statement does — Q from its one span inside the window — and
+/// neither R, whose spans all lie outside it, nor S, too short.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_trace_level_search_reads_spans_only_for_its_answer() {
+    skip_unless_live!();
+    let (db, client, w) = seed_tl4a("t10", false).await;
+    let engine = engine_of(&db).await;
+    let (answer, n) =
+        routed_with_statements(&engine, &client, &db, "{ traceDuration > 1s }", w).await;
+    drop_db(&db).await;
+    assert_eq!(
+        answer, "a2 1 [21]; a1 2 [11, 12]",
+        "P and Q with today's last and matched; R and S absent"
+    );
+    assert_eq!(n, 1, "one statement for the request");
+}
+
+/// T10b (issue #601 part 4a): **a trace with no `traces` row is answered
+/// as today.** M's spans lie inside the window and its `traces` row is
+/// removed: a shape that is false when every trace-level condition is
+/// false never returned M and takes the one statement; a shape that is
+/// then true returned M and stays on the sliced plan, which still does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_trace_with_no_index_row_is_answered_as_today() {
+    skip_unless_live!();
+    let (db, client, w) = seed_tl4a("t10b", true).await;
+    let engine = engine_of(&db).await;
+    let all = "a2 1 [21]; a5 2 [51, 52]; a4 1 [41]; a1 2 [11, 12]";
+    let long = "a2 1 [21]; a1 2 [11, 12]";
+    let mut wrong = Vec::new();
+    for (q, want, m_present, statements) in [
+        ("{ traceDuration > 1s }", long, false, 1),
+        (r#"{ traceDuration > 1s && rootName = "m" }"#, "", false, 1),
+        (
+            r#"{ traceDuration > 1s || rootName = "m" }"#,
+            long,
+            false,
+            1,
+        ),
+        (r#"{ !(rootName = "x") }"#, all, true, 2),
+        (
+            r#"{ !(rootName = "x") && traceDuration > 1s }"#,
+            long,
+            false,
+            1,
+        ),
+        (
+            r#"{ !(rootName = "x") || traceDuration > 1s }"#,
+            all,
+            true,
+            2,
+        ),
+        (
+            r#"{ !(traceDuration > 1s && rootName = "m") }"#,
+            all,
+            true,
+            2,
+        ),
+        ("{ !!(traceDuration > 1s) }", long, false, 1),
+    ] {
+        let (answer, n) = routed_with_statements(&engine, &client, &db, q, w).await;
+        eprintln!("{q}: {answer} in {n} statements");
+        if answer != want || answer.contains("a5 ") != m_present || n != statements {
+            wrong.push(format!(
+                "{q}: {answer:?} in {n} statements, expected {want:?} (M present: {m_present}) \
+                 in {statements}"
+            ));
+        }
+    }
+    drop_db(&db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// T10c (issue #601 part 4a): **every trace-only shape the gate refuses
+/// runs as it did before**, in more than one statement on the one-hour
+/// window and with the same answer: a refused child under `&&` and `||`, a
+/// negated presence check, a comparison of a comparison, a field against a
+/// field, a negated or multiplied field, a literal predicate and presence.
+/// The planner refuses a presence check on a trace-level intrinsic, so the
+/// three shapes holding one are pinned as refused (`None`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_excluded_trace_only_shape_runs_as_today() {
+    skip_unless_live!();
+    let (db, client, w) = seed_tl4a("t10c", false).await;
+    let engine = engine_of(&db).await;
+    let all = "a2 1 [21]; a4 1 [41]; a1 2 [11, 12]";
+    let long = "a2 1 [21]; a1 2 [11, 12]";
+    let mut wrong = Vec::new();
+    for (q, want) in [
+        ("{ traceDuration > 1s && rootName != nil }", None),
+        (
+            "{ traceDuration > 1s || traceDuration = traceDuration }",
+            Some(all),
+        ),
+        ("{ !(rootName != nil) }", None),
+        ("{ (traceDuration > 1s) = true }", Some(long)),
+        ("{ traceDuration = traceDuration }", Some(all)),
+        ("{ rootName = rootServiceName }", Some("")),
+        ("{ -traceDuration < 0s }", Some(all)),
+        ("{ traceDuration * 2 > 1s }", Some(long)),
+        ("{ true }", Some(all)),
+        ("{ 1 = 1 }", Some(all)),
+        ("{ rootName != nil }", None),
+        ("{ rootName = nil }", None),
+    ] {
+        let planned = pulsus_read::plan_search_request(
+            &parse_query(q),
+            &pulsus_read::SearchParams {
+                start_ns: w.0,
+                end_ns: w.1,
+                limit: 20,
+                spss: 3,
+            },
+            &pulsus_read::StatementTables {
+                spans: "spans",
+                resources: "resources",
+                traces: "traces",
+                indexed: &[],
+            },
+            64,
+        );
+        let Some(want) = want else {
+            if planned.is_ok() {
+                wrong.push(format!("{q}: planned, expected the planner's refusal"));
+            }
+            continue;
+        };
+        if let Err(e) = planned {
+            wrong.push(format!("{q}: refused ({e}), expected an answer"));
+            continue;
+        }
+        let (answer, n) = routed_with_statements(&engine, &client, &db, q, w).await;
+        eprintln!("{q}: {answer} in {n} statements");
+        if answer != want || n != 2 {
+            wrong.push(format!(
+                "{q}: {answer:?} in {n} statements, expected {want:?} in 2"
+            ));
+        }
+    }
+    drop_db(&db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// T10d (issue #601 part 4a): **a comparison written literal first takes
+/// the one statement**, with the answer of its field-first form.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_literal_first_comparison_takes_the_shortcut() {
+    skip_unless_live!();
+    let (db, client, w) = seed_tl4a("t10d", false).await;
+    let engine = engine_of(&db).await;
+    let mut wrong = Vec::new();
+    for (q, want) in [
+        ("{ 1s < traceDuration }", "a2 1 [21]; a1 2 [11, 12]"),
+        (r#"{ "m" = rootName }"#, ""),
+    ] {
+        let (answer, n) = routed_with_statements(&engine, &client, &db, q, w).await;
+        eprintln!("{q}: {answer} in {n} statements");
+        if answer != want || n != 1 {
+            wrong.push(format!(
+                "{q}: {answer:?} in {n} statements, expected {want:?} in 1"
+            ));
+        }
+    }
+    drop_db(&db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Fixture Q of part 4a: trace A (`b1`) — `r` the frontend root, `p1` and
+/// `s` payment children of `r`, `p2` a payment child of `p1`, `c` a payment
+/// child of `p2`; `p1`, `s`, `p2` and `c` in error; 100, 10, 20, 30 and 40
+/// ms long — and trace B (`b2`), `b1` a payment root, ok, 50 ms. Spans
+/// `01` to `06` in that order, all inside the ten seconds from `base`.
+fn retried_bodies(base: i64) -> (ExportTraceServiceRequest, ExportTraceServiceRequest) {
+    let ms = 1_000_000i64;
+    let at = base + 1_000 * ms;
+    let one =
+        |t: u8, sid: u8, parent: Option<u8>, name: &str, start: i64, dur: i64, error: bool| {
+            span_of(
+                tid4a(t),
+                span_id_bytes(sid),
+                parent.map(span_id_bytes).unwrap_or_default(),
+                name,
+                2,
+                start,
+                dur,
+                Vec::new(),
+                if error { 2 } else { 0 },
+                Vec::new(),
+                Vec::new(),
+            )
+        };
+    let mut a = request(
+        "frontend",
+        "pod-f",
+        vec![one(0xb1, 1, None, "r", at, 100 * ms, false)],
+    );
+    a.resource_spans.extend(
+        request(
+            "payment",
+            "pod-p",
+            vec![
+                one(0xb1, 2, Some(1), "p1", at + 10 * ms, 10 * ms, true),
+                one(0xb1, 3, Some(1), "s", at + 20 * ms, 20 * ms, true),
+                one(0xb1, 4, Some(2), "p2", at + 30 * ms, 30 * ms, true),
+                one(0xb1, 5, Some(4), "c", at + 40 * ms, 40 * ms, true),
+            ],
+        )
+        .resource_spans,
+    );
+    let b = request(
+        "payment",
+        "pod-p",
+        vec![one(0xb2, 6, None, "b1", at + 1_000 * ms, 50 * ms, false)],
+    );
+    (a, b)
+}
+
+/// Lands fixture Q with merges stopped on `spans`: A, B with token `q1`,
+/// then A again with token `q2`, so `spans` holds A twice. Asserts the
+/// eleven rows and six span identities, so no merge makes a case pass.
+async fn land_retried(client: &ChClient, db: &str, base: i64) {
+    client
+        .execute(
+            &format!("SYSTEM STOP MERGES {db}.spans"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("stop merges on spans");
+    let (a, b) = retried_bodies(base);
+    land(client, &a, "q0").await;
+    land(client, &b, "q1").await;
+    land(client, &a, "q2").await;
+    assert_eq!(
+        count_of(client, "SELECT count() AS n FROM spans").await,
+        11,
+        "A twice and B once"
+    );
+    assert_eq!(
+        count_of(
+            client,
+            "SELECT uniqExact(trace_id, start_ns, span_id, kind) AS n FROM spans"
+        )
+        .await,
+        6,
+        "six span identities"
+    );
+}
+
+/// The `SELECT`s of `db` finished since `t0_ns` and how many ran with
+/// `final = 1`, read until two reads a second apart agree on at least one.
+async fn final_statements(client: &ChClient, db: &str, t0_ns: i64) -> (u64, u64) {
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, PartialEq, Clone, Copy)]
+    struct Logged {
+        n: u64,
+        f: u64,
+    }
+    let read = || async {
+        client
+            .execute(
+                "SYSTEM FLUSH LOGS",
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("flush the logs");
+        let sql = format!(
+            "SELECT count() AS n, countIf(Settings['final'] = '1') AS f FROM system.query_log \
+             WHERE type = 'QueryFinish' AND query_kind = 'Select' AND has(databases, '{db}') \
+             AND event_time_microseconds >= toDateTime64({}, 6)",
+            t0_ns as f64 / 1e9
+        );
+        let mut stream = client
+            .query_stream::<Logged>(&sql, &QuerySettings::new())
+            .await
+            .expect("read the query log");
+        stream
+            .next()
+            .await
+            .expect("one row")
+            .expect("decode the query log row")
+    };
+    let deadline = std::time::Instant::now() + StdDuration::from_secs(30);
+    loop {
+        let a = read().await;
+        tokio::time::sleep(StdDuration::from_secs(1)).await;
+        let b = read().await;
+        if a == b && a.n >= 1 {
+            return (a.n, a.f);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the query log did not settle within 30 s: {a:?} then {b:?}"
+        );
+    }
+}
+
+/// Every series' samples summed, per series name.
+fn sums_of(out: &MetricsAnswer) -> BTreeMap<String, f64> {
+    let out = out
+        .as_ref()
+        .unwrap_or_else(|e| panic!("the metrics read failed: {e}"));
+    let mut sums = BTreeMap::new();
+    for s in &out.series {
+        *sums.entry(series_name(s)).or_insert(0.0) +=
+            s.samples.iter().map(|(_, v)| *v).sum::<f64>();
+    }
+    sums
+}
+
+/// One case of [`a_retried_push_is_read_once`]: its answer `got` against
+/// `want`, and `finals`, its statements and those that ran with `final`,
+/// against `keeps`.
+fn check_retried(
+    wrong: &mut Vec<String>,
+    case: &str,
+    got: String,
+    want: &str,
+    finals: (u64, u64),
+    keeps: bool,
+) {
+    let (n, f) = finals;
+    let want_f = if keeps { n } else { 0 };
+    eprintln!("{case}: {got}; {f} of {n} statements with final");
+    if got != want {
+        wrong.push(format!("{case} (a): {got:?}, expected {want:?}"));
+    }
+    if f != want_f {
+        wrong.push(format!(
+            "{case} (b): {f} of {n} statements ran with final, expected {want_f}"
+        ));
+    }
+}
+
+/// T16–T28 (issue #601 part 4a): **a retried push stored twice is read
+/// once by every search, metrics and fetch read**, and none of those
+/// statements runs under `final` but the one that numbers (T27, a guard:
+/// it keeps `final`). Each case asserts its answer — which doubles or
+/// flips if `final` is removed without its read's change — and which of
+/// its statements ran with `final = 1`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retried_push_is_read_once() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db("pulsus_read_it_t601p4a_retried");
+    let client = fresh_db(&db).await;
+    let base = (now_ns() / 1_000_000_000 - 600) * 1_000_000_000;
+    land_retried(&client, &db, base).await;
+    let engine = engine_of(&db).await;
+    let window = (base, base + 10_000_000_000);
+    let base_s = base / 1_000_000_000;
+    let mut wrong = Vec::new();
+
+    for (case, q, want, keeps) in [
+        (
+            "T16",
+            r#"{ resource.service.name = "payment" && status = error }"#,
+            "b1 4 [02, 03, 04, 05]",
+            false,
+        ),
+        (
+            "T17a",
+            r#"{ resource.service.name = "payment" } | count() > 3"#,
+            "b1 4 [02, 03, 04, 05] {int:4 4 [02, 03, 04, 05]}",
+            false,
+        ),
+        (
+            "T17b",
+            r#"{ resource.service.name = "payment" } | count() > 4"#,
+            "",
+            false,
+        ),
+        ("T18", "{ span:childCount > 1 }", "b1 1 [01]", false),
+        (
+            "T19",
+            "{ status = error } ~ { status = error }",
+            "b1 2 [02, 03]",
+            false,
+        ),
+        (
+            "T20",
+            r#"{ resource.service.name = "frontend" } >> { status = error }"#,
+            "b1 4 [02, 03, 04, 05]",
+            false,
+        ),
+        (
+            "T21",
+            r#"{ resource.service.name = "frontend" } | by(span:childCount)"#,
+            "b1 1 [01] {int:2 1 [01]}",
+            false,
+        ),
+        (
+            "T27",
+            "{ status = error && nestedSetParent > 0 }",
+            "b1 4 [02, 03, 04, 05]",
+            true,
+        ),
+        (
+            "T28",
+            r#"{ trace:rootService = "frontend" }"#,
+            "b1 5 [01, 02, 03, 04, 05]",
+            false,
+        ),
+    ] {
+        let plan = plan_of(&engine, &parse_query(q), window, 20, 10);
+        let t0 = now_ns();
+        let got = if case == "T20" {
+            let (out, explain) = engine
+                .search_routed_explained(&plan)
+                .await
+                .unwrap_or_else(|e| panic!("{q}: {e}"));
+            let stmt = explain
+                .stages
+                .iter()
+                .find(|s| s.name == "search_statement")
+                .map(|s| s.sql.clone())
+                .unwrap_or_default();
+            for needle in [
+                "SELECT DISTINCT trace_id, span_id AS start",
+                "SELECT DISTINCT trace_id, span_id, parent_span_id FROM",
+            ] {
+                if !stmt.contains(needle) {
+                    wrong.push(format!("T20: the climb lacks {needle:?}"));
+                }
+            }
+            grouped_answer_of(&Ok(out))
+        } else {
+            grouped_answer_of(&engine.search_routed(&plan).await)
+        };
+        check_retried(
+            &mut wrong,
+            case,
+            got,
+            want,
+            final_statements(&client, &db, t0).await,
+            keeps,
+        );
+    }
+
+    for (case, q, want) in [
+        (
+            "T22",
+            "{ status = error } | count_over_time()",
+            "__name__=count_over_time=4",
+        ),
+        (
+            "T23",
+            r#"{ resource.service.name = "payment" } | sum_over_time(duration)"#,
+            "__name__=sum_over_time=0.15",
+        ),
+        (
+            "T24",
+            "{ span:childCount > 1 } | count_over_time()",
+            "__name__=count_over_time=1",
+        ),
+    ] {
+        let routed = routed_plan(&engine, q, base_s, base_s + 10, 10_000);
+        let t0 = now_ns();
+        let sums = sums_of(&engine.metrics_range_routed(&routed).await);
+        let got = sums
+            .iter()
+            .map(|(k, v)| format!("{k}={}", (v * 1e6).round() / 1e6))
+            .collect::<Vec<_>>()
+            .join(" ");
+        check_retried(
+            &mut wrong,
+            case,
+            got,
+            want,
+            final_statements(&client, &db, t0).await,
+            false,
+        );
+    }
+
+    let routed = routed_plan(
+        &engine,
+        "{ } | compare({ status = error })",
+        base_s,
+        base_s + 10,
+        10_000,
+    );
+    let t0 = now_ns();
+    let sums = sums_of(&engine.metrics_range_routed(&routed).await);
+    let got = [
+        "__meta_type=selection,resource.service.name=payment",
+        "__meta_type=selection,rootServiceName=frontend",
+    ]
+    .iter()
+    .map(|k| format!("{k} {}", sums.get(*k).copied().unwrap_or(-1.0)))
+    .collect::<Vec<_>>()
+    .join("; ");
+    eprintln!("T25 series: {sums:?}");
+    check_retried(
+        &mut wrong,
+        "T25",
+        got,
+        "__meta_type=selection,resource.service.name=payment 4; \
+         __meta_type=selection,rootServiceName=frontend 4",
+        final_statements(&client, &db, t0).await,
+        false,
+    );
+
+    let t0 = now_ns();
+    let fetched = engine
+        .fetch_by_id(&("00".repeat(15) + "b1"), None)
+        .await
+        .expect("the fetch answers");
+    // The statement's span array may carry a stored span's copies; the
+    // server's rebuild keeps one per `(span_id, kind)`.
+    let ids: BTreeSet<String> = fetched
+        .spans
+        .iter()
+        .map(|s| format!("{:02x}/{}", s.span_id[7], s.kind))
+        .collect();
+    check_retried(
+        &mut wrong,
+        "T26",
+        ids.into_iter().collect::<Vec<_>>().join(" "),
+        "01/2 02/2 03/2 04/2 05/2",
+        final_statements(&client, &db, t0).await,
+        false,
+    );
+
+    drop_db(&db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
