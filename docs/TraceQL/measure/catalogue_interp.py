@@ -858,6 +858,9 @@ class Interp:
             raise NotImplementedError('the exemplar stride is not modelled (#600 part 1b-1)')
         return {'series': out}
 
+    def instant_answer(self, q, start, end, step=60 * 10**9):
+        raise NotImplementedError('instant_answer (#600 part 1b-2)')
+
     def compare_rows(self, q, stage):
         """`compare()`'s own statement: one row per (scope, key, value, type,
         side) with that side's count, ordered as §5.6 states."""

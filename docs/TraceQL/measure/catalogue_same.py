@@ -28,19 +28,20 @@ def main(paths):
             differ.append(f"{name}: missing from a run")
             continue
         for path, r in zip(paths, rs):
-            if r.get("error"):
-                failed.append(f"{name} in {path}: {r['error'][:200]}")
-        key = [(r.get("disposition"), r.get("route"), r.get("result")) for r in rs]
+            if r.get("error") or r.get("instant_error"):
+                failed.append(f"{name} in {path}: {(r.get('error') or r['instant_error'])[:200]}")
+        key = [(r.get("disposition"), r.get("route"), r.get("result"), r.get("instant")) for r in rs]
         if any(k != key[0] for k in key[1:]):
             differ.append(f"{name}: the runs' answers differ")
         if rs[0].get("route") != "metrics" or rs[0].get("error"):
             continue
         metrics += 1
         for path, r in zip(paths, rs):
-            if r.get("error"):
+            if r.get("error") or r.get("instant_error"):
                 continue
-            series = len(r["result"]["series"])
             for request, statements in r["statements"].items():
+                # each request against its own answer (#600 part 1b-2)
+                series = len(r["instant" if request == "instant" else "result"]["series"])
                 over = r["overflow"].get(request)
                 rows = [s[1] for s in statements]
                 if over or not 1 <= len(rows) <= 100 or max(rows) > max(series, 1):
