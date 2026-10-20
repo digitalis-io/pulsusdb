@@ -64,7 +64,6 @@ intrinsic_set_parse	parser	red	0	0	0	7	6	noticed	PASS	`duration` is an intrinsic
 duration_unit_render	renderer	red	2	2	0	0	0	noticed	PASS	a millisecond is 10^6 nanoseconds
 duration_unit_interp	interpreter	red	2	2	0	0	0	noticed	PASS	a millisecond is 10^6 nanoseconds
 group_label_render	renderer	red	6	0	0	0	0	noticed	PASS	a group label is the value’s text
-group_label_interp	interpreter	red	6	0	0	0	0	noticed	PASS	a group label is the value’s text
 group_order_render	renderer	red	2	0	0	0	0	noticed	PASS	the groups come back in first-appearance order
 group_order_interp	interpreter	red	2	0	0	0	0	noticed	PASS	the groups come back in first-appearance order
 compare_service_render	renderer	red	5	5	0	0	0	noticed	PASS	`resource.service.name` is counted from the span’s own column
