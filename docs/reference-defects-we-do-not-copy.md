@@ -89,6 +89,7 @@ replaces one.
 | [34](#34-spanchildcount-is-accepted-and-answers-nothing) | trace reference | queries | A, D | A query on a span's child count answers "nothing matched", in every position. |
 | [35](#35-past-the-series-limit-a-drilldown-answer-gains-series-with-no-labels) | log reference | queries | C | A partial answer past the series limit can carry extra series with no labels, holding points of series it was dropping. |
 | [36](#36-one-pattern-series-can-carry-two-samples-at-one-timestamp) | log reference | queries | A | A `/patterns` series can answer `[[t,1],[t,1]]` where it means `[[t,2]]`. |
+| [37](#37-a-one-element-array-is-read-as-its-element-and-an-empty-one-as-no-value) | trace reference | queries | C | A span sent `["z"]` answers `"z"`, and one sent `[]` answers as if it held nothing. |
 
 ---
 
@@ -2200,6 +2201,33 @@ One sample per timestamp in each series, the sum over streams.
 
 Ledger row `logql-patterns-step-fill`. Pinned by
 `patterns_fill_empty_steps_within_a_stream_as_the_reference_does` in `crates/pulsus-server/tests/loki_push_live.rs`.
+
+---
+
+## 37. A one-element array is read as its element, and an empty one as no value
+
+**The trace reference · queries · test C**
+
+### What the reference does
+
+Its attribute reader decides what a stored value is from how many elements each typed buffer holds and does not
+read the array flag stored beside them, as its own comment says (`encoding/vparquet4/block_traceql.go:3595`).
+One element comes back as a scalar (`:3598-3605`), two or more as an array (`:3606-3613`), and none as an empty
+value, which the projection skips (`:66-105`) and `by()` groups under `nil`.
+
+### Why that is wrong rather than different
+
+The sender's value was an array; the read returns another type, or nothing, and says nothing (**C**). Read from
+the source; the two `by()` answers are measured in CI by the fixtures below.
+
+### What PulsusDB does
+
+An array stays an array of its elements, one and none included, in the `arrayValue` arm.
+
+### Evidence
+
+Ledger row `traceql-search-response-values-against-the-reference`. Pinned by `array_one_element_by` and
+`array_empty_by` in `crates/pulsus-read/tests/traces_search_grouping_differential.rs`.
 
 ---
 
