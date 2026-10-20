@@ -90,7 +90,7 @@ Deployment topologies:
 
 1. **Single node** — one `pulsusdb` (mode `all`), one ClickHouse. No cluster vars.
 2. **Split tiers** — N × `PULSUS_MODE=writer` behind an ingest LB, M × `PULSUS_MODE=reader` behind a query LB, same ClickHouse.
-3. **Sharded ClickHouse** — set `PULSUS_CLUSTER`; run `PULSUS_CLUSTER=<name> schema/schema.sh` once (or the chart's init Job) to create the replicated + distributed tables; writers/readers as in (2).
+3. **Sharded ClickHouse** — set `PULSUS_CLUSTER`; run `PULSUS_CLUSTER=<name> schema/schema.sh` once (or the chart's init Job) to create the replicated + distributed tables; writers/readers as in (2). Every replica of a shard must run with the same ClickHouse server time zone (the server `timezone` setting), and that zone must not change while the cluster is serving; UTC is recommended. The service-graph job reads a time another replica of its shard wrote in that replica's zone.
 4. **Cross-cluster reads** — a reader pointed at a query-only ClickHouse cluster whose `_dist`-suffixed tables front the storage cluster; set `PULSUS_DIST_SUFFIX` accordingly.
 
 ## 5. Writer
