@@ -4,7 +4,7 @@ carrying every attribute key, scope, intrinsic and value type the TraceQL corpus
 at crates/pulsus-traceql/tests/corpus/ mentions, so that a catalogue entry's
 answer is a list of spans rather than a uniform empty set.
 
-Three things the layout is built for, each because a fixture without it lets a
+Four things the layout is built for, each because a fixture without it lets a
 wrong rule pass:
 
 1. **The structural topology** (traces four and five): a chain that alternates
