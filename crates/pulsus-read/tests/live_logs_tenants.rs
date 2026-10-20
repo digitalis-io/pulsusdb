@@ -65,6 +65,7 @@ async fn execute(client: &ChClient, sql: &str) {
 
 fn engine_config(db: &str) -> EngineConfig {
     EngineConfig {
+        skip_unavailable_shards: false,
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
         db: db.to_string(),
         streams_idx: "log_streams_idx".to_string(),

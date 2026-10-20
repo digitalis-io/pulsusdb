@@ -64,6 +64,7 @@ macro_rules! skip_unless_live {
 
 fn engine_config(db: &str, grouped_push: bool) -> MetricsConfig {
     MetricsConfig {
+        skip_unavailable_shards: false,
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
         db: db.to_string(),
         samples_table: "metric_samples".to_string(),
@@ -89,6 +90,7 @@ fn engine_config(db: &str, grouped_push: bool) -> MetricsConfig {
 /// series active only the day before are not resident.
 fn cache_config(db: &str) -> LabelCacheConfig {
     LabelCacheConfig {
+        skip_unavailable_shards: false,
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
         db: db.to_string(),
         series_table: "metric_series".to_string(),

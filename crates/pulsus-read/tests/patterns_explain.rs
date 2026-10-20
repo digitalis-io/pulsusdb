@@ -381,6 +381,7 @@ async fn patterns_read_prunes_daily_partitions() {
 
 fn engine_config(db: &str) -> EngineConfig {
     EngineConfig {
+        skip_unavailable_shards: false,
         // Issue #398: the per-query ClickHouse memory ceiling; the
         // production default, so this fixture keeps today's behaviour.
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,

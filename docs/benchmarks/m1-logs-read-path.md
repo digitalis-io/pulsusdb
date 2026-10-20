@@ -4,6 +4,8 @@
 > claims.** The §9 latency targets remain **unvalidated** pending the Tier-2
 > 1 TB/7d reference run ([#25](https://github.com/digitalis-io/pulsusdb/issues/25)).
 
+> **Method changed under #603.** The harness now lands the corpus through every shard in turn and reads with the product's settings, shard pruning off. Every stage is expected to reach every shard, and a shard counts as reached when it logged the stage's row. The expected-roster model, `expected-pruned` rows and per-shard figures below describe the earlier method.
+
 Issue: [#16](https://github.com/digitalis-io/pulsusdb/issues/16). Evidence
 model: `docs/schemas.md` §9's two-tier evidence model (added by this issue).
 
@@ -454,11 +456,11 @@ stage before any query runs, in `xtask/src/bench/queries.rs`:
 ```text
   stage          roster                        where
   ------------   ---------------------------   ---------------------------
-  resolution     StageRoster::Full             queries.rs:1214, :1660
-  discovery      StageRoster::Full             queries.rs:1556
-  hydration      StageRoster::Fingerprints     queries.rs:1233, :1679
-  samples        StageRoster::Fingerprints     queries.rs:1272
-  rollup_range   StageRoster::Fingerprints     queries.rs:1722
+  resolution     StageRoster::Full             queries.rs:1214, :1660 @ 59468f6a
+  discovery      StageRoster::Full             queries.rs:1556 @ 59468f6a
+  hydration      StageRoster::Fingerprints     queries.rs:1233, :1679 @ 59468f6a
+  samples        StageRoster::Fingerprints     queries.rs:1272 @ 59468f6a
+  rollup_range   StageRoster::Fingerprints     queries.rs:1722 @ 59468f6a
 ```
 
 A `Full` roster is the whole cluster and is derived from no fingerprint,
