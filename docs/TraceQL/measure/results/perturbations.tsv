@@ -49,4 +49,4 @@ group_type_interp	interpreter	red	2	0	0	0	0	noticed	PASS	an attribute `by()` gro
 array_mixed_interp	interpreter	red	4	6	0	0	0	noticed	PASS	an array of two element types is missing
 array_render_interp	interpreter	red	3	0	0	0	0	noticed	PASS	an array is the compact JSON text of its elements
 array_compare_interp	interpreter	red	0	8	0	0	0	noticed	PASS	an array value is not counted in `compare()`
-array_series_interp	interpreter	red	0	2	0	0	0	noticed	PASS	each distinct array is its own `nil` series on the metrics routes
+array_series_interp	interpreter	red	0	2	0	0	0	noticed	PASS	each array is its own `nil` series by its rendered text on the metrics routes

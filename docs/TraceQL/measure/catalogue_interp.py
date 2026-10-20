@@ -665,10 +665,12 @@ class Interp:
             return ('', code), (name, ('string', 'nil'))
         t, v = got
         if t == 'a':
-            # each distinct array is its own series labelled `nil`, ordered by
-            # the engine's text of it, `['x','y']` (`docs/api.md` §4.4;
-            # #600 part 1b-3)
-            text = '[' + ','.join(f"'{e}'" if et == 's' else str(e) for et, e in v) + ']'
+            # each array is its own series labelled `nil` by the engine's text
+            # of it, `['x','y']`, a whole double written as an integer, so two
+            # arrays of one text share a series (`docs/api.md` §4.4; #600 part
+            # 1b-3)
+            text = '[' + ','.join(f"'{e}'" if et == 's' else str(int(e)) if et == 'd' and float(e).is_integer()
+                                  else str(e) for et, e in v) + ']'
             return (text, 'a'), (name, ('string', 'nil'))
         text = ('true' if v else 'false') if t == 'b' else str(v)
         return (text, t), (name, (self.LABEL_TYPE[t], v))
