@@ -923,7 +923,10 @@ fn the_citing_clustering_passages_name_the_section_holding_the_list() {
 /// reads `spans` (another view's target) and its own target, `service_edges`
 /// (its markers). It is pinned by name, target and exact sources, so a
 /// second refreshable view, or this one reading anything else, fails here
-/// instead of passing under a rule for every refreshable view.
+/// instead of passing under a rule for every refreshable view. Its sources
+/// are read through `merge('pulsus', '^<table>$')` and through nothing else
+/// (part C D6): a direct `FROM pulsus.` read takes its part snapshot before
+/// the barrier runs.
 #[test]
 fn no_insert_triggered_view_reads_a_table_another_view_writes() {
     let mut targets = Vec::new();
@@ -958,12 +961,32 @@ fn no_insert_triggered_view_reads_a_table_another_view_writes() {
                 .to_string();
             own.push(table);
         }
-        assert!(!own.is_empty(), "a view that names no source: {stmt}");
+        // `merge('pulsus', '^<table>$')`: one table, read when the query
+        // reaches it.
+        let mut merged: Vec<String> = Vec::new();
+        for (at, _) in stmt.match_indices("merge('pulsus', '^") {
+            let table = stmt[at + "merge('pulsus', '^".len()..]
+                .split_once("$')")
+                .expect("a merge() source ends with $')")
+                .0
+                .to_string();
+            merged.push(table);
+        }
+        assert!(
+            !own.is_empty() || !merged.is_empty(),
+            "a view that names no source: {stmt}"
+        );
         if head_line.contains(" REFRESH EVERY ") {
             own.sort();
             own.dedup();
-            refreshable.push((name, target, own));
+            merged.sort();
+            merged.dedup();
+            refreshable.push((name, target, own, merged));
         } else {
+            assert!(
+                merged.is_empty(),
+                "an insert-triggered view reads through merge(): {stmt}"
+            );
             sources.extend(own);
         }
     }
@@ -973,9 +996,11 @@ fn no_insert_triggered_view_reads_a_table_another_view_writes() {
         vec![(
             "service_edges_mv".to_string(),
             "service_edges".to_string(),
+            Vec::<String>::new(),
             vec!["service_edges".to_string(), "spans".to_string()],
         )],
-        "the one refreshable view, its target and its sources"
+        "the one refreshable view, its target, its direct sources (none) and \
+         its sources read through merge()"
     );
     let mut distinct: Vec<String> = sources.clone();
     distinct.sort();
@@ -1543,12 +1568,14 @@ ORDER BY (conn_type, minute, client_minute, client, server)
 TTL toDateTime(least(toUInt32(minute) - if(conn_type = '', 240, 0) + (7 * 86400), 4294967295))
 SETTINGS index_granularity = 1024, ttl_only_drop_parts = 1;"#;
 
-/// `service_edges_mv` as the design writes it (part A §3.2), rendered the
-/// same way, with the production row ceiling. Its `hi` line is the
-/// single-node variant's (`--@single`), which the render strips with the
-/// indentation after the prefix.
+/// `service_edges_mv` as the design writes it (part A §3.2, part C §3),
+/// rendered the same way, with the production row ceiling. Its first line
+/// and its `hi` line are the single-node variant's (`--@single`), which the
+/// render strips with the indentation after the prefix. Both tables are
+/// read through `merge()`, so each is read when the scalars before it have
+/// run (part C D6).
 const SERVICE_EDGES_VIEW: &str = r#"CREATE MATERIALIZED VIEW pulsus.service_edges_mv REFRESH EVERY 1 MINUTE APPEND TO pulsus.service_edges
-AS WITH (SELECT arraySort(groupArray(minute)) FROM pulsus.service_edges FINAL WHERE conn_type = '') AS ms,
+AS WITH (SELECT arraySort(groupArray(minute)) FROM merge('pulsus', '^service_edges$') FINAL WHERE conn_type = '') AS ms,
      ms[arrayFirstIndex(i -> i = length(ms) OR ms[i + 1] - ms[i] != 300, arrayEnumerate(ms))] AS wm,
      toStartOfInterval(now('UTC') - INTERVAL 3 MINUTE, INTERVAL 5 MINUTE) AS ready,
      (SELECT toDateTime(min(toDate(parseDateTimeBestEffort(partition))), 'UTC') FROM system.parts WHERE database = 'pulsus' AND table = 'spans' AND active) AS oldest,
@@ -1567,7 +1594,7 @@ FROM (SELECT trace_id,
         anyIf((service, status_code, kind, start_ns), kind IN (3, 4)) AS c,
         countIf(kind IN (3, 4)) AS nc,
         groupArrayIf((span_id, service, status_code, duration_ns, kind, start_ns), kind IN (2, 5)) AS ss
- FROM pulsus.spans
+ FROM merge('pulsus', '^spans$')
  WHERE start_ns >= slo - 60000000000 AND start_ns < shi + 60000000000
    AND intDiv(start_ns, 300000000000) BETWEEN intDiv(slo - 60000000000, 300000000000) AND intDiv(shi + 59999999999, 300000000000)
    AND ((kind IN (2, 5) AND start_ns >= slo AND start_ns < shi) OR kind IN (3, 4))
@@ -1584,14 +1611,33 @@ ORDER BY conn_type = '', minute, client_minute, client, server, conn_type
 SETTINGS max_threads = 4, max_memory_usage = 4294967296, max_rows_to_read = 60000000, read_overflow_mode = 'throw', max_execution_time = 50,
          max_insert_threads = 1, max_insert_block_size = 100000000, min_insert_block_size_rows = 100000000, min_insert_block_size_bytes = 10000000000;"#;
 
-/// The clustered view's replica barrier (part B §2), in place of the
-/// single-node `hi` line: a run that has not received every part its shard
-/// announced for `spans` and `service_edges` pairs an empty range and writes
-/// no marker. Its two lines carry the `--@cluster` prefix, which the render
-/// strips with the indentation after it.
-const SERVICE_EDGES_BARRIER: &str = "\n(SELECT min(inserts_in_queue = 0 AND (log_pointer > log_max_index OR (log_pointer = 0 AND log_max_index = 0))) FROM system.replicas WHERE database = 'pulsus' AND table IN ('spans', 'service_edges')) AS caught_up,
-if(caught_up, least(ready, lo + INTERVAL 5 MINUTE), lo) AS hi,
-";
+/// The clustered view's first line (part C §3), in place of the
+/// single-node one: the replication log copied and the replica not under
+/// repair for both tables, then each table's queue read entry by entry from
+/// Keeper, and the watermark read only when `service_edges`' queue holds
+/// nothing but merges. Its lines carry the `--@cluster` prefix, which the
+/// render strips with the indentation after it.
+const SERVICE_EDGES_HEAD: &str = r#"AS WITH (SELECT groupArray((replica_path, log_pointer > log_max_index OR (log_pointer = 0 AND log_max_index = 0))) FROM system.replicas WHERE database = 'pulsus' AND table IN ('spans', 'service_edges')) AS logs,
+(SELECT groupArray((name, numChildren, value)) FROM system.zookeeper WHERE path IN (SELECT arrayJoin(arrayMap(x -> x.1, logs))) AND name IN ('queue', 'is_lost')) AS nodes,
+length(logs) = 2 AND arrayAll(x -> x.2, logs) AND arrayCount(n -> n.1 = 'is_lost' AND n.3 = '0', nodes) = 2 AND arrayCount(n -> n.1 = 'queue' AND n.2 <= 1000, nodes) = 2 AS listable,
+(SELECT groupArray((position(path, '.service_edges/') > 0, extract(value, '^format version: \\d+\ncreate_time: [^\n]*\nsource replica: [^\n]*\nblock_id: [^\n]*\n(?:log_entry_id: [^\n]*\n)?([A-Za-z_]+)\n'), parseDateTimeBestEffortOrZero(extract(value, '\ncreate_time: ([^\n]*)\n'), serverTimezone()), extract(value, '\n(?:get|attach)\n([^\n]+)'), extract(value, '\nsource replica: ([^\n]*)\n'))) FROM system.zookeeper WHERE path IN (SELECT arrayJoin(arrayMap(x -> x.1 || if(listable, '/queue', '/log_pointer'), logs))) SETTINGS max_execution_time = 10) AS entries,
+listable AND arrayCount(e -> e.1, entries) <= 1000 AND arrayCount(e -> NOT e.1, entries) <= 1000 AND arrayAll(e -> NOT e.1 OR e.2 = 'merge', entries) AS edges_ok,
+(SELECT arraySort(groupArray(minute)) FROM merge('pulsus', '^service_edges$') FINAL WHERE conn_type = '' AND edges_ok) AS ms,
+"#;
+
+/// The clustered view's replica barrier (part C §3), in place of the
+/// single-node `hi` line: a run pairs an empty range and writes no marker
+/// unless every `spans` entry queued on this replica is a merge, a fetch
+/// or an attach of a part it already holds, or a fetch an insert queued at
+/// least 10 s after the interval became eligible. Its lines carry the
+/// `--@cluster` prefix, which the render strips with the indentation after
+/// it.
+const SERVICE_EDGES_BARRIER: &str = r#"
+least(ready, lo + INTERVAL 5 MINUTE) AS hi0,
+(SELECT groupArray(name) FROM system.parts WHERE database = 'pulsus' AND table = 'spans' AND active AND has(arrayMap(e -> e.4, entries), name)) AS local_named,
+edges_ok AND arrayAll(e -> e.1 OR e.2 = 'merge' OR (e.2 IN ('get', 'attach') AND e.5 != '' AND e.4 != '' AND toUnixTimestamp(e.3) > 0 AND (has(local_named, e.4) OR (e.2 = 'get' AND e.3 >= hi0 + INTERVAL 3 MINUTE + INTERVAL 10 SECOND))), entries) AS caught_up,
+if(caught_up, hi0, lo) AS hi,
+"#;
 
 /// The rendered statement beginning `head`, exactly one of it.
 fn statement_starting(ctx: &RenderCtx, head: &str) -> String {
@@ -1635,13 +1681,20 @@ fn the_service_edges_statements_are_the_plan_s() {
         );
     let hi = "\nleast(ready, lo + INTERVAL 5 MINUTE) AS hi,\n";
     assert!(SERVICE_EDGES_VIEW.contains(hi), "the single-node `hi` line");
+    let head = "AS WITH (SELECT arraySort(groupArray(minute)) FROM merge('pulsus', \
+                '^service_edges$') FINAL WHERE conn_type = '') AS ms,\n";
+    assert!(
+        SERVICE_EDGES_VIEW.contains(head),
+        "the single-node first line"
+    );
     let clustered_view = SERVICE_EDGES_VIEW
         .replacen(
             "pulsus.service_edges_mv REFRESH",
             "pulsus.service_edges_mv ON CLUSTER 'prod' REFRESH",
             1,
         )
-        .replacen(hi, SERVICE_EDGES_BARRIER, 1);
+        .replacen(hi, SERVICE_EDGES_BARRIER, 1)
+        .replacen(head, SERVICE_EDGES_HEAD, 1);
     assert_eq!(
         statement_starting(
             &clustered(),

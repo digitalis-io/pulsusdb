@@ -7658,6 +7658,120 @@ async fn a_half_stored_after_its_bucket_is_finalized_is_not_counted() {
     );
 }
 
+/// KS2 (part C D6): the job reads `spans` after its scalars. Every part
+/// snapshot of the run is delayed 4 s; fixture G's server halves are pushed
+/// 6 s after the run starts, after the snapshot a direct `FROM spans` read
+/// takes and before the one a `merge()` read takes after the watermark's
+/// waits. The run's totals hold fixture G whole.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_job_reads_spans_after_its_scalars() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_425;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_v2_it_g599_ks2")).await;
+    let _server = spawn_ready(port, &db);
+    let client = ch_data(&db).await;
+    let l = fixture_anchor();
+    start_edges(&client, l - MINUTE).await;
+    stop_edges_view(&client).await;
+    let mut g = fixture_g(l, 0);
+    let servers: Vec<(&str, Vec<Span>)> = [1usize, 2, 3, 4, 6, 7]
+        .into_iter()
+        .map(|i| (g[i].0, std::mem::take(&mut g[i].1)))
+        .collect();
+    for i in [0usize, 5] {
+        let (service, spans) = (g[i].0, std::mem::take(&mut g[i].1));
+        ingest(
+            port,
+            service,
+            spans,
+            &format!("KS2: client half P{}", i + 1),
+        );
+    }
+    let select = ch_string(
+        &client,
+        "SELECT as_select AS s FROM system.tables WHERE database = currentDatabase() \
+         AND name = 'service_edges_mv'",
+    )
+    .await;
+    let tag = pulsus_testkit::test_ident(&format!("ks2_{}", now_ns()));
+    let run = format!(
+        "INSERT INTO service_edges SELECT * FROM ({select}) \
+         SETTINGS merge_tree_storage_snapshot_sleep_ms = 4000"
+    );
+    let runner = ch_data(db.name()).await;
+    let settings = QuerySettings::new().set("log_comment", &tag);
+    let started = Instant::now();
+    let task = tokio::spawn(async move {
+        runner
+            .execute(&run, &settings, Idempotency::NonIdempotent)
+            .await
+    });
+    tokio::time::sleep(Duration::from_secs(6).saturating_sub(started.elapsed())).await;
+    let push_ctx = "KS2: the server halves";
+    tokio::task::block_in_place(|| ingest_resources(port, servers, push_ctx));
+    task.await
+        .expect("KS2: the run's task")
+        .expect("KS2: the run succeeds");
+    // The run's `QueryFinish` row can reach the log after its response.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let offsets = loop {
+        ch_exec(&client, "SYSTEM FLUSH LOGS").await;
+        let offsets = ch_string(
+            &client,
+            &format!(
+                "SELECT concat(toString(dateDiff('millisecond', r.s, p.f)), ' ', \
+                    toString(r.n), ' ', toString(p.n)) AS s \
+             FROM (SELECT min(query_start_time_microseconds) AS s, count() AS n \
+                   FROM system.query_log WHERE type = 'QueryFinish' \
+                   AND log_comment = '{tag}') AS r, \
+                  (SELECT max(event_time_microseconds) AS f, count() AS n \
+                   FROM system.query_log WHERE type = 'QueryFinish' \
+                   AND query_kind = 'Insert' AND has(tables, '{db}.trace_landing') \
+                   AND event_time_microseconds >= (SELECT min(query_start_time_microseconds) \
+                       FROM system.query_log WHERE type = 'QueryFinish' \
+                       AND log_comment = '{tag}')) AS p",
+                db = db.name()
+            ),
+        )
+        .await;
+        if !offsets.ends_with(" 0") && offsets.split(' ').nth(1) != Some("0") {
+            break offsets;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "KS2: the run's and the push's log rows: {offsets}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    println!("KS2: the push's finish after the run's start, ms; runs; pushes: {offsets}");
+    let parts: Vec<i64> = offsets
+        .split(' ')
+        .map(|x| x.parse().expect("a number"))
+        .collect();
+    assert!(
+        parts[1] == 1 && parts[2] >= 1 && (5_000..=11_000).contains(&parts[0]),
+        "KS2 precondition: the push finished between 5 s and 11 s after the run started \
+         (ms, runs, pushes): {offsets}"
+    );
+    assert_eq!(
+        markers(&client).await,
+        vec![l - MINUTE, l + 4 * MINUTE],
+        "KS2: the run finalized G's interval"
+    );
+    drop_the_spans(&client).await;
+    assert_graph(
+        port,
+        l,
+        l + 300 * SEC,
+        &g1_rows(1),
+        true,
+        "KS2: G from the run's totals",
+    );
+}
+
 /// W1: a bucket becomes ready three minutes after it ends, not before and
 /// not much after.
 #[tokio::test(flavor = "multi_thread")]

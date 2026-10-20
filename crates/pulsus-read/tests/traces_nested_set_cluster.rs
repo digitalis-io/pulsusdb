@@ -1480,8 +1480,9 @@ async fn the_service_graph_answers_over_two_shards() {
 // announced for `spans` and `service_edges`. Each case below names the node
 // it acts on. Every view is stopped while a case builds its state and is
 // started only for the refresh the case names, so no scheduled run acts
-// first; merges are stopped on both tables of both replicas, so neither a
-// merge nor its replication-log entry changes what a run or a check reads.
+// first; merges are stopped on both tables of every node and no replica
+// assigns one (`max_replicated_merges_in_queue = 0`), so no merge runs and no
+// merge entry is queued unless a case's `OPTIMIZE` assigns it.
 
 fn shard1b_config(database: &str) -> ChConnConfig {
     shard_config("PULSUS_TEST_CH_SHARD1B_HOST", "172.28.0.13", database)
@@ -1903,6 +1904,11 @@ fn hex(bytes: &[u8]) -> String {
 /// Pushes `range` of fixture G (0 is P1) into the node's own `spans`, one
 /// insert, so one part, each.
 async fn push_g(client: &ChClient, l: i64, range: std::ops::Range<usize>) {
+    push_g_into(client, "spans", l, range).await;
+}
+
+/// [`push_g`] into `table`, a table with `spans`' columns.
+async fn push_g_into(client: &ChClient, table: &str, l: i64, range: std::ops::Range<usize>) {
     for (service, spans) in fixture_g(l).into_iter().skip(range.start).take(range.len()) {
         let rows: Vec<String> = spans
             .iter()
@@ -1924,7 +1930,7 @@ async fn push_g(client: &ChClient, l: i64, range: std::ops::Range<usize>) {
         exec(
             client,
             &format!(
-                "INSERT INTO spans (trace_id, span_id, parent_span_id, start_ns, duration_ns, \
+                "INSERT INTO {table} (trace_id, span_id, parent_span_id, start_ns, duration_ns, \
                  service, name, kind, status_code, attrs, end_ns, service_type) \
                  SELECT unhex(t), unhex(sp), unhex(p), st, d, '{service}', 'op', k, sc, \
                         CAST(a, 'JSON'), toUInt64(st + d), 'string' \
@@ -2006,7 +2012,19 @@ struct Replicas {
 }
 
 impl Replicas {
+    /// `L` 30 minutes back, its interval eligible long ago.
     async fn new(name: &str) -> Self {
+        Self::build(name, false).await
+    }
+
+    /// Part C: `L` the start of the interval in progress, so an insert now
+    /// queues its fetches before the interval becomes eligible; the marker
+    /// at `L − 1 min` seeded on shard 1 and on `ch-shard2`.
+    async fn new_current(name: &str) -> Self {
+        Self::build(name, true).await
+    }
+
+    async fn build(name: &str, current: bool) -> Self {
         let db = pulsus_testkit::test_db(&format!("pulsus_read_it_t599b_{name}_{}", now_ns()));
         let bootstrap = ChClient::new(shard1_config("default"))
             .await
@@ -2028,11 +2046,27 @@ impl Replicas {
         let s2 = ChClient::new(shard2_config(&db))
             .await
             .expect("connect shard2");
-        let l = floor_to(now_ns() - 30 * MINUTE, BUCKET);
+        let l = if current {
+            floor_to(server_now_us(&s1).await * 1000, BUCKET)
+        } else {
+            floor_to(now_ns() - 30 * MINUTE, BUCKET)
+        };
         let r = Replicas { db, l, s1, s1b, s2 };
-        for c in [&r.s1, &r.s1b] {
-            exec(c, "SYSTEM STOP MERGES spans").await;
-            exec(c, "SYSTEM STOP MERGES service_edges").await;
+        // `STOP MERGES` stops only the running of merges: a replica still
+        // assigns merge entries unless its queue limit for them is 0. The
+        // setting is per replica and queues nothing; an `OPTIMIZE` still
+        // assigns one.
+        for c in [&r.s1, &r.s1b, &r.s2] {
+            for table in ["spans", "service_edges"] {
+                exec(c, &format!("SYSTEM STOP MERGES {table}")).await;
+                exec(
+                    c,
+                    &format!(
+                        "ALTER TABLE {table} MODIFY SETTING max_replicated_merges_in_queue = 0"
+                    ),
+                )
+                .await;
+            }
         }
         seed_edges(&[&r.s1, &r.s1b, &r.s2], &r.s1, l - MINUTE).await;
         for (c, node) in [(&r.s1, "s1"), (&r.s1b, "s1b")] {
@@ -2043,7 +2077,37 @@ impl Replicas {
                 "the seeded marker on {node}"
             );
         }
+        if current {
+            seed_edges(&[&r.s2], &r.s2, l - MINUTE).await;
+            sync_replica(&r.s2, &r.db, "service_edges", "the seeded marker").await;
+            assert_eq!(
+                markers(&r.s2).await,
+                vec![l - MINUTE],
+                "the seeded marker on ch-shard2"
+            );
+        }
         r
+    }
+
+    /// Part C: waits until `[L, L + 5 min)` has been eligible for 11 s by
+    /// the server's clock, `L + 8 min + 11 s`: at most 8 min 11 s after
+    /// [`Self::new_current`].
+    async fn wait_eligible(&self) {
+        let at_us = (self.l + 8 * MINUTE + 11 * S) / 1000;
+        let deadline = std::time::Instant::now() + Duration::from_secs(8 * 60 + 41);
+        loop {
+            let now = server_now_us(&self.s1).await;
+            if now >= at_us {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the interval at {} never became eligible: the server's clock at {now} us",
+                self.l
+            );
+            let left = u64::try_from(at_us - now).expect("a positive wait");
+            tokio::time::sleep(Duration::from_micros(left.min(5_000_000))).await;
+        }
     }
 
     /// G's window, `[L, L + 5 min)`.
@@ -2306,7 +2370,7 @@ async fn two_replicas_share_one_edge_table() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_replica_with_parts_still_to_fetch_writes_nothing() {
     skip_unless_live!();
-    let r = Replicas::new("k2").await;
+    let r = Replicas::new_current("k2").await;
     let (db, l) = (r.db.clone(), r.l);
     exec(&r.s1b, "SYSTEM STOP FETCHES spans").await;
     push_g(&r.s1, l, 0..8).await;
@@ -2316,6 +2380,7 @@ async fn a_replica_with_parts_still_to_fetch_writes_nothing() {
     })
     .await;
     sync_replica(&r.s1b, &db, "service_edges", "K2").await;
+    r.wait_eligible().await;
     refresh_on(&r.s1b, &db, "K2: ch-shard1b's run").await;
     assert_eq!(
         markers(&r.s1b).await,
@@ -2341,7 +2406,7 @@ async fn a_replica_with_parts_still_to_fetch_writes_nothing() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pushes_split_across_replicas_wait_for_both() {
     skip_unless_live!();
-    let r = Replicas::new("k3").await;
+    let r = Replicas::new_current("k3").await;
     let (db, l) = (r.db.clone(), r.l);
     for c in [&r.s1, &r.s1b] {
         exec(c, "SYSTEM STOP FETCHES spans").await;
@@ -2359,6 +2424,7 @@ async fn pushes_split_across_replicas_wait_for_both() {
         .await;
         sync_replica(c, &db, "service_edges", "K3").await;
     }
+    r.wait_eligible().await;
     for (c, node) in [(&r.s1, "ch-shard1"), (&r.s1b, "ch-shard1b")] {
         refresh_on(c, &db, &format!("K3: {node}'s run")).await;
         for (d, other) in [(&r.s1, "ch-shard1"), (&r.s1b, "ch-shard1b")] {
@@ -2666,4 +2732,1060 @@ async fn a_fresh_cluster_writes_its_first_markers() {
         &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
     )
     .await;
+}
+
+// Issue #599 part C: a barrier read from Keeper
+// =====================================================================
+//
+// The job's barrier reads each replica's queue from Keeper, entry by
+// entry, after the replication log is copied and the replica is not under
+// repair. The cases below build a queue state, check it in Keeper, and
+// refresh. The cases that write a node through `INSERT INTO
+// system.zookeeper` need `allow_zookeeper_write`, which the fixture's
+// `config.d/keeper_write.xml` sets.
+
+/// `db.table`'s replica path in Keeper on this node.
+async fn replica_path(client: &ChClient, db: &str, table: &str) -> String {
+    strings(
+        client,
+        &format!(
+            "SELECT replica_path AS s FROM system.replicas WHERE database = '{db}' \
+             AND table = '{table}'"
+        ),
+    )
+    .await
+    .into_iter()
+    .next()
+    .unwrap_or_else(|| panic!("{db}.{table} is replicated on this node"))
+}
+
+/// This node's replica name, the `source replica` its inserts write.
+async fn replica_name(client: &ChClient) -> String {
+    strings(client, "SELECT getMacro('replica') AS s").await[0].clone()
+}
+
+/// The values of `db.table`'s queue nodes in Keeper on this node, by name.
+async fn queue_values(client: &ChClient, db: &str, table: &str) -> Vec<String> {
+    let path = replica_path(client, db, table).await;
+    strings(
+        client,
+        &format!(
+            "SELECT value AS s FROM system.zookeeper WHERE path = '{path}/queue' \
+             ORDER BY name"
+        ),
+    )
+    .await
+}
+
+/// The number of `db.table`'s queue nodes in Keeper on this node.
+async fn queue_size(client: &ChClient, db: &str, table: &str) -> u64 {
+    let path = replica_path(client, db, table).await;
+    count(
+        client,
+        &format!(
+            "SELECT toUInt64(numChildren) AS n FROM system.zookeeper WHERE path = '{path}' \
+             AND name = 'queue'"
+        ),
+    )
+    .await
+}
+
+/// Polls until `db.table`'s queue in Keeper satisfies `want`, for up to
+/// two minutes; the test fails, rather than goes on, if it never does.
+async fn wait_queue(
+    client: &ChClient,
+    db: &str,
+    table: &str,
+    what: &str,
+    want: impl Fn(&[Entry]) -> bool,
+) -> Vec<Entry> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let entries: Vec<Entry> = queue_values(client, db, table)
+            .await
+            .iter()
+            .map(|v| Entry::parse(v))
+            .collect();
+        if want(&entries) {
+            return entries;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what}: {db}.{table}'s queue never reached the state: {entries:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// The fields of a queued entry the barrier reads, as the engine writes
+/// them: `format version`, `create_time`, `source replica`, `block_id`, an
+/// optional `log_entry_id`, the type, then (for a `get` or an `attach`) the
+/// part.
+#[derive(Debug, Clone, PartialEq)]
+struct Entry {
+    create_time: String,
+    source: String,
+    kind: String,
+    part: String,
+}
+
+impl Entry {
+    fn parse(value: &str) -> Entry {
+        let field = |key: &str| {
+            value
+                .lines()
+                .find_map(|l| l.strip_prefix(key))
+                .unwrap_or_default()
+                .to_string()
+        };
+        let mut lines = value.lines().skip_while(|l| !l.starts_with("block_id: "));
+        lines.next();
+        let mut kind = lines.next().unwrap_or_default();
+        if kind.starts_with("log_entry_id: ") {
+            kind = lines.next().unwrap_or_default();
+        }
+        let part = if kind == "get" || kind == "attach" {
+            lines.next().unwrap_or_default()
+        } else {
+            ""
+        };
+        Entry {
+            create_time: field("create_time: "),
+            source: field("source replica: "),
+            kind: kind.to_string(),
+            part: part.to_string(),
+        }
+    }
+}
+
+/// The active parts of `db.spans` on this node.
+async fn active_spans_parts(client: &ChClient, db: &str) -> Vec<String> {
+    strings(
+        client,
+        &format!(
+            "SELECT name AS s FROM system.parts WHERE database = '{db}' AND table = 'spans' \
+             AND active ORDER BY name"
+        ),
+    )
+    .await
+}
+
+/// `secs` as the engine writes an entry's `create_time`: the server's
+/// zone, `YYYY-MM-DD hh:mm:ss`.
+async fn log_time(client: &ChClient, secs: i64) -> String {
+    strings(
+        client,
+        &format!("SELECT toString(toDateTime({secs}, serverTimezone())) AS s"),
+    )
+    .await[0]
+        .clone()
+}
+
+/// `value` as a quoted ClickHouse string literal.
+fn quoted(value: &str) -> String {
+    let mut out = String::from("'");
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Writes, or rewrites, `<replica path>/queue/queue-9000000000` of
+/// `db.table` on this node: an existing node is set.
+async fn queue_node(client: &ChClient, db: &str, table: &str, value: &str) {
+    let path = replica_path(client, db, table).await;
+    exec(
+        client,
+        &format!(
+            "INSERT INTO system.zookeeper (name, path, value) \
+             VALUES ('queue-9000000000', '{path}/queue', {})",
+            quoted(value)
+        ),
+    )
+    .await;
+}
+
+/// A queued entry's text: `format version: 4`, its `create_time`, its
+/// `source replica`, an empty `block_id`, then `rest` (the type and part).
+fn entry_text(create_time: &str, source: &str, rest: &str) -> String {
+    format!(
+        "format version: 4\ncreate_time: {create_time}\nsource replica: {source}\nblock_id: \n{rest}"
+    )
+}
+
+/// `G`'s partition id in `table` on this node: one, since G's spans lie in
+/// `[L + 1 s, L + 70 s)`.
+async fn g_partition(client: &ChClient, db: &str, table: &str) -> String {
+    let ids = strings(
+        client,
+        &format!(
+            "SELECT DISTINCT partition_id AS s FROM system.parts WHERE database = '{db}' \
+             AND table = '{table}' AND active"
+        ),
+    )
+    .await;
+    assert_eq!(ids.len(), 1, "G lies in one partition of {table}: {ids:?}");
+    ids[0].clone()
+}
+
+/// The node's markers include `L + 4 min`: its run covered `[L, L + 5 min)`.
+async fn assert_covers_g(client: &ChClient, l: i64, what: &str) {
+    let m = markers(client).await;
+    assert!(
+        m.contains(&(l + 4 * MINUTE)),
+        "{what}: the marker covers [L, L + 5 min): {m:?}"
+    );
+}
+
+/// The node holds no marker after `L − 1 min`.
+async fn assert_no_new_marker(client: &ChClient, l: i64, what: &str) {
+    assert_eq!(
+        markers(client).await,
+        vec![l - MINUTE],
+        "{what}: no marker after L - 1 min"
+    );
+}
+
+/// KC1: a replica whose queue nodes and `log_pointer` are in Keeper, its
+/// memory not yet holding them, writes nothing. The pull's own `multi` is
+/// written by hand, its memory step never run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pulled_entry_not_yet_in_memory_holds_the_run() {
+    skip_unless_live!();
+    let r = Replicas::new("kc1").await;
+    let (db, l) = (r.db.clone(), r.l);
+    exec(&r.s1b, "SYSTEM STOP PULLING REPLICATION LOG spans").await;
+    push_g(&r.s1, l, 0..8).await;
+    wait_state(&r.s1, &db, "spans", "KC1: G announced", |s| {
+        s.log_max_index >= 7
+    })
+    .await;
+    let path = replica_path(&r.s1b, &db, "spans").await;
+    let zk_path = strings(
+        &r.s1b,
+        &format!(
+            "SELECT zookeeper_path AS s FROM system.replicas WHERE database = '{db}' \
+             AND table = 'spans'"
+        ),
+    )
+    .await[0]
+        .clone();
+    let pointer = replica_state(&r.s1b, &db, "spans").await.log_pointer;
+    let log = strings(
+        &r.s1b,
+        &format!(
+            "SELECT concat(name, '\\t', value) AS s FROM system.zookeeper \
+             WHERE path = '{zk_path}/log' ORDER BY name"
+        ),
+    )
+    .await;
+    let early = log_time(&r.s1b, (l + MINUTE) / S).await;
+    let mut rows = Vec::new();
+    let mut next = pointer;
+    for entry in &log {
+        let (name, value) = entry.split_once('\t').expect("a name and a value");
+        let index: u64 = name
+            .strip_prefix("log-")
+            .expect("a log node")
+            .parse()
+            .expect("a log index");
+        if index < pointer {
+            continue;
+        }
+        let value: String = value
+            .lines()
+            .map(|line| {
+                if line.starts_with("create_time: ") {
+                    format!("create_time: {early}\n")
+                } else {
+                    format!("{line}\n")
+                }
+            })
+            .collect();
+        rows.push(format!(
+            "('queue-{:010}', '{path}/queue', {})",
+            9_000_000_000u64 + index,
+            quoted(&value)
+        ));
+        next = next.max(index + 1);
+    }
+    rows.push(format!("('log_pointer', '{path}', '{next}')"));
+    exec(
+        &r.s1b,
+        &format!(
+            "INSERT INTO system.zookeeper (name, path, value) VALUES {}",
+            rows.join(", ")
+        ),
+    )
+    .await;
+    let state = replica_state(&r.s1b, &db, "spans").await;
+    assert!(
+        state.inserts_in_queue == 0 && state.log_pointer > state.log_max_index,
+        "KC1: the memory holds no entry and the log reads copied: {state:?}"
+    );
+    let queued = queue_size(&r.s1b, &db, "spans").await;
+    assert!(queued >= 8, "KC1: G's entries in Keeper's queue: {queued}");
+    sync_replica(&r.s1b, &db, "service_edges", "KC1").await;
+    refresh_on(&r.s1b, &db, "KC1: ch-shard1b's run").await;
+    assert_no_new_marker(&r.s1b, l, "KC1: ch-shard1b's run").await;
+    exec(&r.s1b, "SYSTEM RESTART REPLICA spans").await;
+    exec(&r.s1b, "SYSTEM START PULLING REPLICATION LOG spans").await;
+    wait_synced(&[&r.s1, &r.s1b], &db, "KC1: fetched").await;
+    refresh_until(
+        &r.s1b,
+        &db,
+        l + 4 * MINUTE,
+        4,
+        "KC1: the run after the fetch",
+    )
+    .await;
+    r.assert_route_g1("KC1").await;
+    r.drop().await;
+}
+
+/// KC4: a queued `REPLACE_RANGE` holds the run, though `system.replicas`
+/// counts no insert and reads the log copied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pending_replace_range_holds_the_run() {
+    skip_unless_live!();
+    let r = Replicas::new("kc4").await;
+    let (db, l) = (r.db.clone(), r.l);
+    exec(&r.s1b, "SYSTEM STOP FETCHES spans").await;
+    exec(
+        &r.s1,
+        "CREATE TABLE spans_g AS spans ENGINE = MergeTree \
+         PARTITION BY toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') \
+         ORDER BY (intDiv(start_ns, 300000000000), trace_id, start_ns, span_id, kind)",
+    )
+    .await;
+    push_g_into(&r.s1, "spans_g", l, 0..8).await;
+    let id = g_partition(&r.s1, &db, "spans_g").await;
+    exec(
+        &r.s1,
+        &format!("ALTER TABLE spans REPLACE PARTITION ID '{id}' FROM spans_g"),
+    )
+    .await;
+    wait_queue(&r.s1b, &db, "spans", "KC4: the replace queued", |q| {
+        q.iter().any(|e| e.kind == "REPLACE_RANGE")
+    })
+    .await;
+    let state = wait_state(&r.s1b, &db, "spans", "KC4: the log copied", |s| {
+        s.log_pointer > s.log_max_index
+    })
+    .await;
+    assert_eq!(
+        state.inserts_in_queue, 0,
+        "KC4: system.replicas counts no insert: {state:?}"
+    );
+    sync_replica(&r.s1b, &db, "service_edges", "KC4").await;
+    refresh_on(&r.s1b, &db, "KC4: ch-shard1b's run").await;
+    assert_no_new_marker(&r.s1b, l, "KC4: ch-shard1b's run").await;
+    exec(&r.s1b, "SYSTEM START FETCHES spans").await;
+    wait_synced(&[&r.s1, &r.s1b], &db, "KC4: fetched").await;
+    refresh_until(
+        &r.s1b,
+        &db,
+        l + 4 * MINUTE,
+        4,
+        "KC4: the run after the fetch",
+    )
+    .await;
+    r.assert_route_g1("KC4").await;
+    r.drop().await;
+}
+
+/// KC3: the queue cap. A queue of 1,000 fetches an insert queued after
+/// eligibility lets the run through; 1,001 holds it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_queue_cap_holds_the_run() {
+    skip_unless_live!();
+    let r = Replicas::new("kc3").await;
+    let (db, l) = (r.db.clone(), r.l);
+    for c in [&r.s1, &r.s1b] {
+        exec(c, "SYSTEM STOP MERGES spans").await;
+    }
+    exec(&r.s1b, "SYSTEM STOP FETCHES spans").await;
+    let blocks = |tag: &str, n: u64| {
+        format!(
+            "INSERT INTO spans (trace_id, span_id, parent_span_id, start_ns, duration_ns, \
+             service, name, kind, attrs, end_ns, service_type) \
+             SELECT sipHash128(number, '{tag}'), reinterpretAsFixedString(cityHash64(number, '{tag}')), \
+                    toFixedString('', 8), {at} + toInt64(number) * 1000000 AS st, 1000, 'svc-kc3', \
+                    'op', 1, CAST('{{}}', 'JSON'), toUInt64(st + 1000), 'string' \
+             FROM numbers({n}) \
+             SETTINGS max_block_size = 1, max_insert_block_size = 1, min_insert_block_size_rows = 0, \
+                      min_insert_block_size_bytes = 0, max_threads = 1, max_insert_threads = 1",
+            at = l + 100 * S
+        )
+    };
+    exec(&r.s1, &blocks("kc3a", 1000)).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let n = queue_size(&r.s1b, &db, "spans").await;
+        if n == 1000 {
+            break;
+        }
+        if n > 1000 {
+            let mut kinds: Vec<(String, String)> = queue_values(&r.s1b, &db, "spans")
+                .await
+                .iter()
+                .map(|v| {
+                    let e = Entry::parse(v);
+                    (e.kind, e.source)
+                })
+                .collect();
+            kinds.sort();
+            kinds.dedup();
+            panic!("KC3: ch-shard1b's queue holds 1,000 entries: {n}, kinds {kinds:?}");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "KC3: ch-shard1b's queue holds 1,000 entries: {n}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    sync_replica(&r.s1b, &db, "service_edges", "KC3").await;
+    refresh_on(&r.s1b, &db, "KC3: the run over 1,000 entries").await;
+    assert_covers_g(&r.s1b, l, "KC3: the run over 1,000 entries").await;
+    let before = markers(&r.s1b).await;
+    exec(&r.s1, &blocks("kc3b", 1)).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let n = queue_size(&r.s1b, &db, "spans").await;
+        if n == 1001 {
+            break;
+        }
+        assert!(
+            n < 1001 && std::time::Instant::now() < deadline,
+            "KC3: ch-shard1b's queue holds 1,001 entries: {n}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    sync_replica(&r.s1b, &db, "service_edges", "KC3: the first run's part").await;
+    assert_eq!(
+        queue_size(&r.s1b, &db, "service_edges").await,
+        0,
+        "KC3: ch-shard1b's service_edges queue is empty"
+    );
+    refresh_on(&r.s1b, &db, "KC3: the run over 1,001 entries").await;
+    assert_eq!(
+        markers(&r.s1b).await,
+        before,
+        "KC3: the run over 1,001 entries wrote no marker"
+    );
+    exec(&r.s1b, "SYSTEM START FETCHES spans").await;
+    r.drop().await;
+}
+
+/// KC5: a replica whose `spans` queue holds only a merge writes its marker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_queued_merge_alone_does_not_hold_the_run() {
+    skip_unless_live!();
+    let r = Replicas::new("kc5").await;
+    let (db, l) = (r.db.clone(), r.l);
+    push_g(&r.s1, l, 0..8).await;
+    wait_synced(&[&r.s1, &r.s1b], &db, "KC5: G on both replicas").await;
+    exec(&r.s1b, "SYSTEM STOP MERGES spans").await;
+    exec(&r.s1, "SYSTEM START MERGES spans").await;
+    let id = g_partition(&r.s1, &db, "spans").await;
+    exec(
+        &r.s1,
+        &format!("OPTIMIZE TABLE spans PARTITION ID '{id}' FINAL"),
+    )
+    .await;
+    let q = wait_queue(&r.s1b, &db, "spans", "KC5: the merge queued", |q| {
+        !q.is_empty() && q.iter().all(|e| e.kind == "merge")
+    })
+    .await;
+    sync_replica(&r.s1b, &db, "service_edges", "KC5").await;
+    refresh_on(&r.s1b, &db, "KC5: ch-shard1b's run").await;
+    assert_covers_g(&r.s1b, l, &format!("KC5: ch-shard1b's run over {q:?}")).await;
+    r.assert_route_g1("KC5").await;
+    r.drop().await;
+}
+
+/// KC8: a replica whose `service_edges` queue holds only a merge writes the
+/// next interval's marker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_queued_totals_merge_alone_does_not_hold_the_run() {
+    skip_unless_live!();
+    let r = Replicas::new("kc8").await;
+    let (db, l) = (r.db.clone(), r.l);
+    push_g(&r.s1, l, 0..8).await;
+    wait_synced(&[&r.s1, &r.s1b], &db, "KC8: G on both replicas").await;
+    refresh_until(&r.s1, &db, l + 4 * MINUTE, 4, "KC8: ch-shard1's run").await;
+    wait_synced(&[&r.s1, &r.s1b], &db, "KC8: ch-shard1's run on both").await;
+    exec(&r.s1, "SYSTEM START MERGES service_edges").await;
+    exec(&r.s1, "OPTIMIZE TABLE service_edges FINAL").await;
+    let q = wait_queue(&r.s1b, &db, "service_edges", "KC8: the merge queued", |q| {
+        !q.is_empty() && q.iter().all(|e| e.kind == "merge")
+    })
+    .await;
+    let spans_queue = queue_values(&r.s1b, &db, "spans").await;
+    assert!(
+        spans_queue.is_empty(),
+        "KC8: ch-shard1b's spans queue is empty: {spans_queue:?}"
+    );
+    refresh_on(&r.s1b, &db, "KC8: ch-shard1b's run").await;
+    let m = markers(&r.s1b).await;
+    assert!(
+        m.contains(&(l + 9 * MINUTE)),
+        "KC8: ch-shard1b's run over {q:?} wrote the next interval's marker: {m:?}"
+    );
+    r.drop().await;
+}
+
+/// KC6: a replica's own inserts, queued as fetches of parts it holds, do
+/// not hold its run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_replica_s_own_parts_do_not_hold_the_run() {
+    skip_unless_live!();
+    let r = Replicas::new_current("kc6").await;
+    let (db, l) = (r.db.clone(), r.l);
+    exec(&r.s2, "SYSTEM STOP REPLICATION QUEUES spans").await;
+    push_g(&r.s2, l, 0..8).await;
+    let me = replica_name(&r.s2).await;
+    let eligible = log_time(&r.s2, (l + 8 * MINUTE) / S).await;
+    let active = active_spans_parts(&r.s2, &db).await;
+    let q = wait_queue(&r.s2, &db, "spans", "KC6: G's entries queued", |q| {
+        q.len() == 8
+    })
+    .await;
+    for e in &q {
+        assert!(
+            e.kind == "get"
+                && e.source == me
+                && active.contains(&e.part)
+                && e.create_time < eligible,
+            "KC6: every entry is a get from {me} of a part active here, created before \
+             {eligible}: {e:?}, active {active:?}"
+        );
+    }
+    r.wait_eligible().await;
+    sync_replica(&r.s2, &db, "service_edges", "KC6").await;
+    refresh_on(&r.s2, &db, "KC6: ch-shard2's run").await;
+    assert_covers_g(&r.s2, l, "KC6: ch-shard2's run").await;
+    exec(&r.s2, "SYSTEM START REPLICATION QUEUES spans").await;
+    wait_synced(&[&r.s2], &db, "KC6: the queue run").await;
+    // From the totals: no span is left to pair.
+    exec(&r.s2, "TRUNCATE TABLE spans").await;
+    r.assert_route_g1("KC6").await;
+    r.drop().await;
+}
+
+/// The state KC9 and KC11 share: G on both replicas, its partition detached
+/// and attached again on `ch-shard1` with the queues of `stopped` stopped.
+async fn attach_g(r: &Replicas, stopped: &ChClient, what: &str) {
+    push_g(&r.s1, r.l, 0..8).await;
+    wait_synced(&[&r.s1, &r.s1b], &r.db, what).await;
+    let id = g_partition(&r.s1, &r.db, "spans").await;
+    exec(
+        &r.s1,
+        &format!("ALTER TABLE spans DETACH PARTITION ID '{id}'"),
+    )
+    .await;
+    wait_synced(&[&r.s1, &r.s1b], &r.db, what).await;
+    exec(stopped, "SYSTEM STOP REPLICATION QUEUES spans").await;
+    exec(
+        &r.s1,
+        &format!("ALTER TABLE spans ATTACH PARTITION ID '{id}'"),
+    )
+    .await;
+}
+
+/// KC9: an `attach` of parts the replica holds does not hold its run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_local_attach_does_not_hold_the_run() {
+    skip_unless_live!();
+    let r = Replicas::new("kc9").await;
+    let (db, l) = (r.db.clone(), r.l);
+    attach_g(&r, &r.s1, "KC9").await;
+    let me = replica_name(&r.s1).await;
+    let active = active_spans_parts(&r.s1, &db).await;
+    let q = wait_queue(&r.s1, &db, "spans", "KC9: the attach queued", |q| {
+        !q.is_empty()
+    })
+    .await;
+    for e in &q {
+        assert!(
+            e.kind == "attach" && e.source == me && active.contains(&e.part),
+            "KC9: every entry is an attach from {me} of a part active here: {e:?}, \
+             active {active:?}"
+        );
+    }
+    sync_replica(&r.s1, &db, "service_edges", "KC9").await;
+    refresh_on(&r.s1, &db, "KC9: ch-shard1's run").await;
+    assert_covers_g(&r.s1, l, "KC9: ch-shard1's run").await;
+    exec(&r.s1, "SYSTEM START REPLICATION QUEUES spans").await;
+    r.assert_route_g1("KC9").await;
+    r.drop().await;
+}
+
+/// KC11: an `attach` queued after eligibility, of parts the replica does
+/// not hold, holds its run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_late_attach_holds_the_run() {
+    skip_unless_live!();
+    let r = Replicas::new("kc11").await;
+    let (db, l) = (r.db.clone(), r.l);
+    attach_g(&r, &r.s1b, "KC11").await;
+    let source = replica_name(&r.s1).await;
+    let late = log_time(&r.s1b, (l + 8 * MINUTE + 10 * S) / S).await;
+    let q = wait_queue(&r.s1b, &db, "spans", "KC11: the attach queued", |q| {
+        !q.is_empty()
+    })
+    .await;
+    let active = active_spans_parts(&r.s1b, &db).await;
+    for e in &q {
+        assert!(
+            e.kind == "attach"
+                && e.source == source
+                && e.create_time > late
+                && !active.contains(&e.part),
+            "KC11: every entry is an attach from {source}, created after {late}, of a part \
+             not active here: {e:?}, active {active:?}"
+        );
+    }
+    sync_replica(&r.s1b, &db, "service_edges", "KC11").await;
+    refresh_on(&r.s1b, &db, "KC11: ch-shard1b's run").await;
+    assert_no_new_marker(&r.s1b, l, "KC11: ch-shard1b's run").await;
+    exec(&r.s1b, "SYSTEM START REPLICATION QUEUES spans").await;
+    wait_synced(&[&r.s1, &r.s1b], &db, "KC11: attached").await;
+    refresh_until(
+        &r.s1b,
+        &db,
+        l + 4 * MINUTE,
+        4,
+        "KC11: the run after the attach",
+    )
+    .await;
+    r.assert_route_g1("KC11").await;
+    r.drop().await;
+}
+
+/// `node`'s two queues in Keeper hold only `value`, in `spans`.
+async fn assert_only_entry(r: &Replicas, value: &str, what: &str) {
+    assert_eq!(
+        queue_values(&r.s1b, &r.db, "spans").await,
+        vec![value.to_string()],
+        "{what}: the crafted node is ch-shard1b's only spans entry"
+    );
+    assert_eq!(
+        queue_size(&r.s1b, &r.db, "service_edges").await,
+        0,
+        "{what}: ch-shard1b's service_edges queue is empty"
+    );
+}
+
+/// KC10: a fetch queued 9 s after eligibility holds the run; one queued
+/// 10 s after does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_late_cut_off_is_ten_seconds_after_eligibility() {
+    skip_unless_live!();
+    let r = Replicas::new("kc10").await;
+    let (db, l) = (r.db.clone(), r.l);
+    push_g(&r.s1, l, 0..8).await;
+    wait_synced(&[&r.s1, &r.s1b], &db, "KC10: G on both replicas").await;
+    let source = replica_name(&r.s1).await;
+    for (secs, passes) in [(9, false), (10, true)] {
+        let t = log_time(&r.s1b, (l + 8 * MINUTE) / S + secs).await;
+        let value = entry_text(&t, &source, "get\ncrafted_9_9_0\n");
+        queue_node(&r.s1b, &db, "spans", &value).await;
+        let what = format!("KC10: a fetch created at eligibility + {secs} s");
+        assert_only_entry(&r, &value, &what).await;
+        refresh_on(&r.s1b, &db, &what).await;
+        if passes {
+            assert_covers_g(&r.s1b, l, &what).await;
+        } else {
+            assert_no_new_marker(&r.s1b, l, &what).await;
+        }
+    }
+    r.assert_route_g1("KC10").await;
+    r.drop().await;
+}
+
+/// KC7: an entry whose type, time or part is not read holds the run, and
+/// so does a fetch with no source replica (a repair's); a merge, the
+/// control, does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreadable_or_repair_entry_holds_the_run() {
+    skip_unless_live!();
+    let r = Replicas::new("kc7").await;
+    let (db, l) = (r.db.clone(), r.l);
+    push_g(&r.s1, l, 0..8).await;
+    wait_synced(&[&r.s1, &r.s1b], &db, "KC7: G on both replicas").await;
+    let source = replica_name(&r.s1).await;
+    let p = active_spans_parts(&r.s1b, &db)
+        .await
+        .into_iter()
+        .next()
+        .expect("KC7: a part active on ch-shard1b");
+    let t = log_time(&r.s1b, server_now_us(&r.s1b).await / 1_000_000).await;
+    let rows = [
+        ("1, garbage", "garbage".to_string()),
+        (
+            "2, time not read",
+            entry_text("x", &source, &format!("get\n{p}\n")),
+        ),
+        ("3, part not read", entry_text(&t, &source, "get\n")),
+        (
+            "4, no source, a part not held",
+            entry_text(&t, "", "get\ncrafted_9_9_0\n"),
+        ),
+        (
+            "5, no source, a part held",
+            entry_text(&t, "", &format!("get\n{p}\n")),
+        ),
+        (
+            "6, a merge",
+            entry_text(&t, &source, &format!("merge\n{p}\ninto\ncrafted_9_9_1\n")),
+        ),
+    ];
+    for (row, value) in &rows {
+        queue_node(&r.s1b, &db, "spans", value).await;
+        let what = format!("KC7 row {row}");
+        assert_only_entry(&r, value, &what).await;
+        refresh_on(&r.s1b, &db, &what).await;
+        if row.starts_with('6') {
+            assert_covers_g(&r.s1b, l, &what).await;
+        } else {
+            assert_no_new_marker(&r.s1b, l, &what).await;
+        }
+    }
+    r.assert_route_g1("KC7").await;
+    r.drop().await;
+}
+
+/// KC12: a replica marked lost, being rebuilt, writes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replica_under_repair_holds_the_run() {
+    skip_unless_live!();
+    let r = Replicas::new("kc12").await;
+    let (db, l) = (r.db.clone(), r.l);
+    push_g(&r.s1, l, 0..8).await;
+    wait_synced(&[&r.s1, &r.s1b], &db, "KC12: G on both replicas").await;
+    let path = replica_path(&r.s1b, &db, "spans").await;
+    for (lost, passes) in [("1", false), ("0", true)] {
+        exec(
+            &r.s1b,
+            &format!(
+                "INSERT INTO system.zookeeper (name, path, value) \
+                 VALUES ('is_lost', '{path}', '{lost}')"
+            ),
+        )
+        .await;
+        let what = format!("KC12: is_lost '{lost}'");
+        for table in ["spans", "service_edges"] {
+            assert_eq!(
+                queue_size(&r.s1b, &db, table).await,
+                0,
+                "{what}: ch-shard1b's {table} queue is empty"
+            );
+            let state = replica_state(&r.s1b, &db, table).await;
+            assert!(
+                state.log_pointer > state.log_max_index,
+                "{what}: ch-shard1b's {table} log is copied: {state:?}"
+            );
+        }
+        refresh_on(&r.s1b, &db, &what).await;
+        if passes {
+            assert_covers_g(&r.s1b, l, &what).await;
+        } else {
+            assert_no_new_marker(&r.s1b, l, &what).await;
+        }
+    }
+    r.assert_route_g1("KC12").await;
+    r.drop().await;
+}
+
+/// One push of LV1's load: `pairs` client and server pairs starting now,
+/// their ids from `seq`.
+fn load_push(seq: u64, pairs: u64) -> ExportTraceServiceRequest {
+    let at = u64::try_from(now_ns()).expect("a post-epoch clock");
+    let id = |n: u64, bytes: usize| -> Vec<u8> {
+        let mut v = vec![0u8; bytes];
+        v[0] = 0x6c;
+        v[bytes - 8..].copy_from_slice(&n.to_be_bytes());
+        v
+    };
+    let mut clients = Vec::new();
+    let mut servers = Vec::new();
+    for i in 0..pairs {
+        let n = seq * pairs + i + 1;
+        let span = |span_id: Vec<u8>, parent: Vec<u8>, kind: i32| Span {
+            trace_id: id(n, 16),
+            span_id,
+            parent_span_id: parent,
+            name: "op".to_string(),
+            kind,
+            start_time_unix_nano: at,
+            end_time_unix_nano: at + 1_000_000,
+            ..Span::default()
+        };
+        clients.push(span(id(2 * n, 8), Vec::new(), CLIENT));
+        servers.push(span(id(2 * n + 1, 8), id(2 * n, 8), SERVER));
+    }
+    let resource = |service: &str, spans: Vec<Span>| ResourceSpans {
+        resource: Some(Resource {
+            attributes: vec![KeyValue {
+                key: "service.name".to_string(),
+                value: Some(AnyValue {
+                    value: Some(any_value::Value::StringValue(service.to_string())),
+                }),
+                ..KeyValue::default()
+            }],
+            dropped_attributes_count: 0,
+            entity_refs: Vec::new(),
+        }),
+        scope_spans: vec![ScopeSpans {
+            scope: None,
+            spans,
+            schema_url: String::new(),
+        }],
+        schema_url: String::new(),
+    };
+    ExportTraceServiceRequest {
+        resource_spans: vec![
+            resource("lv-client", clients),
+            resource("lv-server", servers),
+        ],
+    }
+}
+
+/// The product's trace writer over one node, with the product's settings.
+async fn node_writer(config: ChConnConfig) -> pulsus_write::writer::TraceWriter {
+    use pulsus_write::writer::{ChBlockInserter, TraceWriter, TraceWriterTables};
+    use std::sync::Arc;
+    let client = Arc::new(ChClient::new(config).await.expect("connect the writer"));
+    // The product's defaults: a push of 1,000 spans is larger than a
+    // one-byte batch, which the writer refuses.
+    let cfg = pulsus_config::WriterConfig::default();
+    TraceWriter::with_inserters_with_tables(
+        Arc::new(ChBlockInserter::new(client.clone())),
+        Arc::new(ChBlockInserter::new(client.clone())),
+        Arc::new(ChBlockInserter::new(client.clone())),
+        &cfg,
+        TraceWriterTables::traces_default(),
+    )
+}
+
+/// The node's job's last successful run, as text; empty before the first.
+async fn last_success(client: &ChClient) -> String {
+    strings(
+        client,
+        "SELECT ifNull(toString(last_success_time), '') AS s FROM system.view_refreshes \
+         WHERE database = currentDatabase() AND view = 'service_edges_mv'",
+    )
+    .await
+    .into_iter()
+    .next()
+    .unwrap_or_default()
+}
+
+/// LV1: under steady ingest on every node, with merges and fetches running
+/// and every node's job on its schedule, each shard finalizes every interval
+/// within three minutes of its eligibility.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_job_keeps_up_under_steady_ingest() {
+    use pulsus_write::{PushHeaders, TraceSink};
+    skip_unless_live!();
+    let r = Replicas::new("lv1").await;
+    let db = r.db.clone();
+    for c in [&r.s1, &r.s1b, &r.s2] {
+        for table in ["spans", "service_edges"] {
+            exec(c, &format!("SYSTEM START MERGES {table}")).await;
+            exec(
+                c,
+                &format!("ALTER TABLE {table} RESET SETTING max_replicated_merges_in_queue"),
+            )
+            .await;
+        }
+    }
+    let newest_eligible = |now_us: i64| floor_to(now_us * 1000 - 3 * MINUTE, BUCKET) - MINUTE;
+    let newest = newest_eligible(server_now_us(&r.s1).await);
+    run_edges_until(&r.s1, newest).await;
+    run_edges_until(&r.s2, newest).await;
+    exec(&r.s1b, "SYSTEM START VIEW service_edges_mv").await;
+
+    // Start just after an interval became eligible.
+    let deadline = std::time::Instant::now() + Duration::from_secs(330);
+    loop {
+        let into = (server_now_us(&r.s1).await / 1_000_000).rem_euclid(300);
+        if (180..200).contains(&into) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "LV1: no start in [180 s, 200 s) of an interval"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let start_us = server_now_us(&r.s1).await;
+    let load_end_us = start_us + 16 * 60 * 1_000_000;
+    // The intervals that become eligible during the load, by eligibility.
+    let mut watched: Vec<(i64, i64)> = Vec::new();
+    let mut b = floor_to(start_us * 1000 - 8 * MINUTE, BUCKET) + BUCKET;
+    while (b + 8 * MINUTE) / 1000 <= load_end_us {
+        watched.push((b, (b + 8 * MINUTE) / 1000));
+        b += BUCKET;
+    }
+    assert!(watched.len() >= 3, "LV1: three intervals: {watched:?}");
+
+    // The load: one writer per node, 10 pushes a second together.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let failures = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let first_failure = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let mut tasks = Vec::new();
+    for (k, config) in [shard1_config(&db), shard1b_config(&db), shard2_config(&db)]
+        .into_iter()
+        .enumerate()
+    {
+        let writer = std::sync::Arc::new(node_writer(config).await);
+        let stop = stop.clone();
+        let failures = failures.clone();
+        let first_failure = first_failure.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(300));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut seq = k as u64;
+            let mut waits = Vec::new();
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                tick.tick().await;
+                let req = load_push(seq, 500);
+                seq += 3;
+                let parsed =
+                    pulsus_write::parse_traces(&req, now_ns()).expect("the old path parses");
+                let landing =
+                    pulsus_write::parse_trace_landing(&req, now_ns()).expect("the landing decode");
+                match writer.admit_flush(parsed, landing, PushHeaders::default()) {
+                    Ok(wait) => {
+                        let failures = failures.clone();
+                        let first_failure = first_failure.clone();
+                        waits.push(tokio::spawn(async move {
+                            let failed =
+                                match tokio::time::timeout(Duration::from_secs(60), wait).await {
+                                    Ok(Ok(())) => None,
+                                    Ok(Err(e)) => Some(e.to_string()),
+                                    Err(_) => Some("no answer within 60 s".to_string()),
+                                };
+                            if let Some(e) = failed {
+                                failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                first_failure.lock().expect("the lock").get_or_insert(e);
+                            }
+                        }));
+                    }
+                    Err(e) => {
+                        failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        first_failure
+                            .lock()
+                            .expect("the lock")
+                            .get_or_insert(format!("refused: {e:?}"));
+                    }
+                }
+            }
+            for w in waits {
+                w.await.expect("a push's wait");
+            }
+            writer.shutdown(Duration::from_secs(30)).await;
+        }));
+    }
+
+    // The samples: each node's two queues every second, each shard's
+    // prefix end after every completed run on its nodes.
+    let nodes = [
+        ("ch-shard1", &r.s1),
+        ("ch-shard1b", &r.s1b),
+        ("ch-shard2", &r.s2),
+    ];
+    let mut last: Vec<String> = Vec::new();
+    for (_, c) in &nodes {
+        last.push(last_success(c).await);
+    }
+    let mut covered: Vec<[Option<i64>; 2]> = vec![[None, None]; watched.len()];
+    let mut lags: Vec<String> = Vec::new();
+    let mut worst_lag = 0;
+    let mut queue_samples: Vec<String> = Vec::new();
+    let end_us = watched.last().expect("an interval").1 + 3 * 60 * 1_000_000 + 1_000_000;
+    loop {
+        let now_us = server_now_us(&r.s1).await;
+        if now_us >= load_end_us {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        if now_us >= end_us && now_us >= load_end_us {
+            break;
+        }
+        let mut sample = format!("{}", (now_us - start_us) / 1_000_000);
+        for (node, c) in &nodes {
+            sample.push_str(&format!(
+                " {node} {}/{}",
+                queue_size(c, &db, "spans").await,
+                queue_size(c, &db, "service_edges").await
+            ));
+        }
+        queue_samples.push(sample);
+        let ends = [prefix_end(&r.s1).await, prefix_end(&r.s2).await];
+        for (i, (_, at_us)) in watched.iter().enumerate() {
+            for shard in 0..2 {
+                if covered[i][shard].is_none() && ends[shard] >= watched[i].0 + 4 * MINUTE {
+                    covered[i][shard] = Some(now_us - at_us);
+                }
+            }
+        }
+        for (i, (node, c)) in nodes.iter().enumerate() {
+            let now_last = last_success(c).await;
+            if now_last != last[i] {
+                last[i] = now_last;
+                let end = if *node == "ch-shard2" {
+                    ends[1]
+                } else {
+                    ends[0]
+                };
+                let lag = newest_eligible(server_now_us(c).await) - end;
+                worst_lag = worst_lag.max(lag);
+                lags.push(format!(
+                    "{node} at {}: {} s",
+                    (now_us - start_us) / 1_000_000,
+                    lag / S
+                ));
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for t in tasks {
+        t.await.expect("a writer task");
+    }
+    println!("LV1 queue samples (s since start, spans/service_edges per node):");
+    for s in &queue_samples {
+        println!("  {s}");
+    }
+    println!("LV1 lag after each completed run: {lags:?}");
+    println!("LV1 intervals {watched:?}, covered after eligibility (us): {covered:?}");
+    assert_eq!(
+        failures.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "LV1: every push was stored; the first failure: {:?}",
+        first_failure.lock().expect("the lock")
+    );
+    for ((b, _), shards) in watched.iter().zip(&covered) {
+        for (shard, after) in shards.iter().enumerate() {
+            assert!(
+                after.is_some_and(|us| us <= 3 * 60 * 1_000_000),
+                "LV1: the interval at {b} covered on shard {} within 3 min of eligibility: \
+                 {after:?} us",
+                shard + 1
+            );
+        }
+    }
+    assert!(
+        worst_lag <= 5 * MINUTE,
+        "LV1: the lag after every completed run is at most 5 min: {lags:?}"
+    );
+    r.drop().await;
 }

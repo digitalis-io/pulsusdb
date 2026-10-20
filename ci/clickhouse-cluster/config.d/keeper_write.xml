@@ -1,0 +1,7 @@
+<?xml version="1.0"?>
+<!--
+  Lets a test write a Keeper node through `INSERT INTO system.zookeeper`
+  (issue #599 part C): the service-graph barrier cases build replication
+  queue states the engine only passes through.
+-->
+<clickhouse><allow_zookeeper_write>1</allow_zookeeper_write></clickhouse>

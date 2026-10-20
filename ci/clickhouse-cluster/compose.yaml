@@ -60,6 +60,7 @@ services:
       - ./config.d/remote_servers.xml:/etc/clickhouse-server/config.d/remote_servers.xml:ro
       - ./users.d/network.xml:/etc/clickhouse-server/users.d/network.xml:ro
       - ./shard1/macros.xml:/etc/clickhouse-server/config.d/macros.xml:ro
+      - ./config.d/keeper_write.xml:/etc/clickhouse-server/config.d/keeper_write.xml:ro
     ports:
       - "18123:8123" # HTTP
       - "19000:9000" # native
@@ -86,6 +87,7 @@ services:
       - ./config.d/remote_servers.xml:/etc/clickhouse-server/config.d/remote_servers.xml:ro
       - ./users.d/network.xml:/etc/clickhouse-server/users.d/network.xml:ro
       - ./shard1b/macros.xml:/etc/clickhouse-server/config.d/macros.xml:ro
+      - ./config.d/keeper_write.xml:/etc/clickhouse-server/config.d/keeper_write.xml:ro
     ports:
       - "38123:8123" # HTTP
       - "39000:9000" # native
@@ -112,6 +114,7 @@ services:
       - ./config.d/remote_servers.xml:/etc/clickhouse-server/config.d/remote_servers.xml:ro
       - ./users.d/network.xml:/etc/clickhouse-server/users.d/network.xml:ro
       - ./shard2/macros.xml:/etc/clickhouse-server/config.d/macros.xml:ro
+      - ./config.d/keeper_write.xml:/etc/clickhouse-server/config.d/keeper_write.xml:ro
     ports:
       - "28123:8123" # HTTP
       - "29000:9000" # native
