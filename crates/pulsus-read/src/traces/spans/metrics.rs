@@ -459,7 +459,7 @@ impl Read {
         let g = if texts.is_empty() {
             NO_KEYS.to_string()
         } else {
-            format!("[{}]", texts.join(", "))
+            folded_keys(&texts.join(", "))
         };
         let (x, i) = match &asked.target {
             Target::Duration => (None, None),
@@ -521,6 +521,17 @@ impl Read {
             None => "duration_ns".to_string(),
         }
     }
+}
+
+/// The key array `[{texts}]` with the text of every value the labels read
+/// as missing — an absent value, or one with no TraceQL type — blanked,
+/// `'n'` for an ordinary key and `'N'` for a well-known one each kept, so a
+/// mixed array and a span without the key are one series, as the reference
+/// answers (issue #600 part 1b-3). An array keeps its own text and type, so
+/// each distinct array is its own `nil` series, as the reference's is
+/// (`docs/api.md` §4.4).
+fn folded_keys(texts: &str) -> String {
+    format!("arrayMap(x -> if(x.2 IN ('n', 'N'), ('', x.2), x), [{texts}])")
 }
 
 /// `D(x)`: a `Dynamic` read as `(text, type)`, `missing` the type of an
@@ -1524,13 +1535,20 @@ mod tests {
                 .range_sql()
                 .to_string()
         };
+        // The key's own missing arm (`dynamic_key`, or the service column's),
+        // not `folded_keys`, which names both codes in every keyed statement
+        // (#600 part 1b-3).
+        let missing = |sql: &str, code: char| {
+            sql.contains(&format!("{HELD}), '{code}', 'a')"))
+                || (code == 'N' && sql.contains("(toString(service), 's'), ('', 'N'))"))
+        };
         for key in well_known {
-            assert!(statement(key).contains("'N'"), "{key}: no 'N'");
+            assert!(missing(&statement(key), 'N'), "{key}: no 'N'");
         }
         for key in ["resource.foo", "span.foo"] {
             let sql = statement(key);
-            assert!(sql.contains("'n'"), "{key}: no 'n'");
-            assert!(!sql.contains("'N'"), "{key}: an 'N'");
+            assert!(missing(&sql, 'n'), "{key}: no 'n'");
+            assert!(!missing(&sql, 'N'), "{key}: an 'N'");
         }
     }
 

@@ -10,7 +10,7 @@ FROM (SELECT g, o, arraySort(groupArrayIf(((29856666 + p) * 60000, v), NOT none)
        countIf(has) OVER () AS T
 FROM (SELECT g, o, empty(cells) AS none, c.1 AS p, c.2 AS v, if(isNaN(v), CAST((toFixedString('', 16), 0, 0), 'Tuple(FixedString(16), Int64, Int64)'), c.3) AS ex
 FROM (SELECT g, o, groupArray((p, v, ex)) AS cells, throwIf(count() OVER () > 1000, 'metrics series cap') AS over
-FROM (SELECT [(toString(nb.np), 'i')] AS g, toUInt64(0) AS o, intDiv(start_ns - 1, 60000000000) + 1 - 29856666 AS p, toFloat64(count()) / 60 AS v, argMax((trace_id, start_ns, duration_ns), (duration_ns, span_id)) AS ex
+FROM (SELECT arrayMap(x -> if(x.2 IN ('n', 'N'), ('', x.2), x), [(toString(nb.np), 'i')]) AS g, toUInt64(0) AS o, intDiv(start_ns - 1, 60000000000) + 1 - 29856666 AS p, toFloat64(count()) / 60 AS v, argMax((trace_id, start_ns, duration_ns), (duration_ns, span_id)) AS ex
 FROM spans
 LEFT JOIN (WITH (SELECT groupArray((k, trace_id)) FROM (SELECT trace_id, arrayJoin(bk) AS k FROM (SELECT trace_id, groupUniqArrayArray(buckets) AS bk FROM traces WHERE day >= toDate(fromUnixTimestamp64Nano(1791313500000000001), 'UTC') AND day <= toDate(fromUnixTimestamp64Nano(1791497220000000000), 'UTC') GROUP BY trace_id HAVING max(last_start_ns) >= 1791399900000000001 AND min(start_ns) <= 1791410820000000000))) AS nested_keys SELECT trace_id, sp.1 AS span_id, nl, nr, np FROM (SELECT trace_id, s, n, lft, rgt,
        arrayMap((l, p) -> if(l = 0, 0, p), lft,
@@ -78,7 +78,7 @@ ORDER BY g, o
 
 == instant ==
 SELECT g, o, [(toInt64(1791410820000), v)] AS points, CAST([], 'Array(Tuple(FixedString(16), Int64, Float64))') AS exemplars, 0 AS f
-FROM (SELECT g, o, v FROM (SELECT g, o, v, throwIf(count() OVER () > 1000, 'metrics series cap') AS over FROM (SELECT [(toString(nb.np), 'i')] AS g, toUInt64(0) AS o, toFloat64(count()) / 10860 AS v
+FROM (SELECT g, o, v FROM (SELECT g, o, v, throwIf(count() OVER () > 1000, 'metrics series cap') AS over FROM (SELECT arrayMap(x -> if(x.2 IN ('n', 'N'), ('', x.2), x), [(toString(nb.np), 'i')]) AS g, toUInt64(0) AS o, toFloat64(count()) / 10860 AS v
 FROM spans
 LEFT JOIN (WITH (SELECT groupArray((k, trace_id)) FROM (SELECT trace_id, arrayJoin(bk) AS k FROM (SELECT trace_id, groupUniqArrayArray(buckets) AS bk FROM traces WHERE day >= toDate(fromUnixTimestamp64Nano(1791313560000000000), 'UTC') AND day <= toDate(fromUnixTimestamp64Nano(1791497219999999999), 'UTC') GROUP BY trace_id HAVING max(last_start_ns) >= 1791399960000000000 AND min(start_ns) <= 1791410819999999999))) AS nested_keys SELECT trace_id, sp.1 AS span_id, nl, nr, np FROM (SELECT trace_id, s, n, lft, rgt,
        arrayMap((l, p) -> if(l = 0, 0, p), lft,
