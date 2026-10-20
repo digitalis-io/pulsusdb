@@ -194,6 +194,7 @@ fn engine(client: ChClient, db: &str, rollup_res_ns: u64) -> LogQlEngine {
     LogQlEngine::new(
         client,
         EngineConfig {
+            skip_unavailable_shards: false,
             read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
             db: db.to_string(),
             streams_idx: "log_streams_idx".to_string(),

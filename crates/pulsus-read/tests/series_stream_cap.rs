@@ -145,6 +145,7 @@ async fn seed_activity(client: &ChClient, db: &str, ts_ns: i64, fingerprints: &[
 
 fn engine_config(db: &str, max_streams: usize) -> EngineConfig {
     EngineConfig {
+        skip_unavailable_shards: false,
         // Issue #398: the per-query ClickHouse memory ceiling; the
         // production default, so this fixture keeps today's behaviour.
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,

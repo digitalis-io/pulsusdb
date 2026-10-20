@@ -84,6 +84,9 @@ pub struct LabelCacheConfig {
     /// Its failure BEHAVIOUR is deliberately unchanged — warn and keep
     /// serving the last good snapshot.
     pub read_max_memory_bytes: u64,
+    /// `PULSUS_SKIP_UNAVAILABLE_SHARDS` (#603 follow-up): the sweep sends
+    /// the answer pins with it, as every request-path metrics read does.
+    pub skip_unavailable_shards: bool,
 }
 
 /// Resident snapshot: `fingerprint -> LabelSet` plus `metric_name ->
@@ -1335,6 +1338,7 @@ impl MultiMetricScanProbe {
             regex_cache: RegexCache::new(REGEX_CACHE_CAPACITY),
             metrics: CacheMetrics::default(),
             config: LabelCacheConfig {
+                skip_unavailable_shards: false,
                 db: "pulsus".to_string(),
                 series_table: "metric_series".to_string(),
                 labels_table: "metric_labels".to_string(),
@@ -1422,6 +1426,7 @@ mod tests {
 
     fn config() -> LabelCacheConfig {
         LabelCacheConfig {
+            skip_unavailable_shards: false,
             db: "pulsus".to_string(),
             series_table: "metric_series".to_string(),
             labels_table: "metric_labels".to_string(),

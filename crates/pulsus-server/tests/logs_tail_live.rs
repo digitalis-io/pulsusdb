@@ -529,6 +529,7 @@ fn engine_for_db(client: ChClient) -> LogQlEngine {
     LogQlEngine::new(
         client,
         EngineConfig {
+            skip_unavailable_shards: false,
             // Issue #398: the per-query ClickHouse memory ceiling; the
             // production default, so this fixture keeps today's behaviour.
             read_max_memory_bytes: 8 * 1024 * 1024 * 1024,

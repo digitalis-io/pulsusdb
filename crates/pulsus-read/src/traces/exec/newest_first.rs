@@ -258,4 +258,46 @@ mod tests {
             );
         }
     }
+
+    /// TP1b (#603 follow-up): the newest-first statements' settings — the
+    /// composition `TraceEngine::statement_settings` returns — carry the
+    /// answer pins, pruning as the deployment is sharded.
+    #[test]
+    fn the_newest_first_statements_carry_the_answer_pins() {
+        for distributed in [false, true] {
+            for nested in [false, true] {
+                for skip in [false, true] {
+                    let cfg = TraceReadConfig {
+                        spans_table: "trace_spans".to_string(),
+                        attrs_table: "trace_attrs_idx".to_string(),
+                        edges_table: "trace_edges".to_string(),
+                        recent_table: "trace_recent".to_string(),
+                        errors_table: "trace_error_spans".to_string(),
+                        spans_v2_table: "spans".to_string(),
+                        traces_table: "traces".to_string(),
+                        resources_table: "resources".to_string(),
+                        scan_budget_rows: 1_000,
+                        max_depth: 64,
+                        max_series: 1_000,
+                        read_max_memory_bytes: 1 << 30,
+                        distributed,
+                        skip_unavailable_shards: skip,
+                    };
+                    let s = product_mode(
+                        with_final(super::super::search_settings(&cfg)),
+                        distributed,
+                        nested,
+                    );
+                    let pins = QuerySettings::new().answer_pins(distributed, skip);
+                    for name in pulsus_clickhouse::ANSWER_PIN_NAMES {
+                        assert_eq!(
+                            s.get(name),
+                            pins.get(name),
+                            "distributed {distributed}, nested {nested}, skip {skip}: {name}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

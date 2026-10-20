@@ -181,6 +181,9 @@ pub struct MetricsConfig {
     /// [`crate::logql::error::TooBroadReason::PromqlReadMemory`] → `422
     /// execution`.
     pub read_max_memory_bytes: u64,
+    /// `PULSUS_SKIP_UNAVAILABLE_SHARDS` (#603 follow-up): sent on every
+    /// metrics read as part of the answer pins ([`metrics_read_settings`]).
+    pub skip_unavailable_shards: bool,
     /// Issue #549: `reader.promql_grouped_push` — compile `min`/`max`/
     /// `count`/`group` over a plain instant selector into ONE statement
     /// per fingerprint chunk ([`super::grouped`]), returning the answer
@@ -1883,6 +1886,7 @@ impl MetricsEngine {
                 let settings = series_read_settings(
                     self.config.read_max_memory_bytes,
                     self.config.distributed,
+                    self.config.skip_unavailable_shards,
                 );
                 let (rows, hist_rows): (Vec<SampleRow>, Vec<HistSampleRow>) =
                     fetch_dual_concurrently(
@@ -1925,9 +1929,16 @@ impl MetricsEngine {
                 // Issue #635 part 3: a read over statement 1 nests the
                 // series tables, so it carries `series_read_settings`.
                 let settings = if nested {
-                    series_read_settings(self.config.read_max_memory_bytes, self.config.distributed)
+                    series_read_settings(
+                        self.config.read_max_memory_bytes,
+                        self.config.distributed,
+                        self.config.skip_unavailable_shards,
+                    )
                 } else {
-                    metrics_read_settings(self.config.read_max_memory_bytes)
+                    metrics_read_settings(
+                        self.config.read_max_memory_bytes,
+                        self.config.skip_unavailable_shards,
+                    )
                 };
                 let (rows, hist_rows): (Vec<MultiSampleRow>, Vec<MultiHistSampleRow>) =
                     fetch_dual_concurrently(
@@ -1980,6 +1991,7 @@ impl MetricsEngine {
                 let settings = series_read_settings(
                     self.config.read_max_memory_bytes,
                     self.config.distributed,
+                    self.config.skip_unavailable_shards,
                 );
                 let mut chunks = Vec::with_capacity(sqls.len());
                 for (g0, sql) in sqls {
@@ -2056,7 +2068,10 @@ impl MetricsEngine {
     async fn fetch_rows<R: ChRow>(&self, sql: String) -> Result<Vec<R>, ReadError> {
         self.fetch_rows_with(
             sql,
-            &metrics_read_settings(self.config.read_max_memory_bytes),
+            &metrics_read_settings(
+                self.config.read_max_memory_bytes,
+                self.config.skip_unavailable_shards,
+            ),
             None,
         )
         .await
@@ -2068,7 +2083,11 @@ impl MetricsEngine {
     async fn fetch_series_rows<R: ChRow>(&self, sql: String) -> Result<Vec<R>, ReadError> {
         self.fetch_rows_with(
             sql,
-            &series_read_settings(self.config.read_max_memory_bytes, self.config.distributed),
+            &series_read_settings(
+                self.config.read_max_memory_bytes,
+                self.config.distributed,
+                self.config.skip_unavailable_shards,
+            ),
             None,
         )
         .await
@@ -2086,7 +2105,10 @@ impl MetricsEngine {
     ) -> Result<Vec<R>, ReadError> {
         self.fetch_rows_with(
             sql,
-            &metrics_read_settings(self.config.read_max_memory_bytes),
+            &metrics_read_settings(
+                self.config.read_max_memory_bytes,
+                self.config.skip_unavailable_shards,
+            ),
             Some(budget),
         )
         .await
@@ -2678,6 +2700,7 @@ impl MetricsEngine {
                 statement,
                 self.config.read_max_memory_bytes,
                 self.config.distributed,
+                self.config.skip_unavailable_shards,
             )
         };
         let counts: Vec<super::rows::ExemplarCountRow> = self
@@ -2851,8 +2874,12 @@ impl MetricsEngine {
 /// transforms coalesce blocks beyond the input setting, and at the
 /// smallest setting the grouped statement was measured returning two-row
 /// blocks where a simple probe gives one-row blocks.
-fn metrics_read_settings(read_max_memory_bytes: u64) -> QuerySettings {
+fn metrics_read_settings(
+    read_max_memory_bytes: u64,
+    skip_unavailable_shards: bool,
+) -> QuerySettings {
     QuerySettings::new()
+        .answer_pins(false, skip_unavailable_shards)
         .set("max_query_size", crate::querytext::MAX_QUERY_TEXT_BYTES)
         .set("max_memory_usage", read_max_memory_bytes)
         .set("max_bytes_before_external_group_by", 0u64)
@@ -2883,11 +2910,16 @@ const CH_DEFAULT_MAX_BLOCK_SIZE: u64 = 65_409;
 /// fetches, which nest nothing — a blanket client-wide default would let a
 /// future non-co-located subquery silently return wrong shard-local results
 /// instead of failing loud.
-fn series_read_settings(read_max_memory_bytes: u64, distributed: bool) -> QuerySettings {
+fn series_read_settings(
+    read_max_memory_bytes: u64,
+    distributed: bool,
+    skip_unavailable_shards: bool,
+) -> QuerySettings {
     // The label joins' build side is the scoped metrics' label rows; the
     // plain hash join, for `refresh::sweep_settings`' reason. The unnamed
     // names join sets its own algorithm in its text.
-    let base = metrics_read_settings(read_max_memory_bytes).set("join_algorithm", "hash");
+    let base = metrics_read_settings(read_max_memory_bytes, skip_unavailable_shards)
+        .set("join_algorithm", "hash");
     if distributed {
         base.set("distributed_product_mode", "local")
     } else {
@@ -2915,8 +2947,8 @@ enum ExemplarStatement {
 const CODE_TOO_MANY_ROWS: i32 = 158;
 
 /// The settings of one exemplar statement (issue #501 part 2): the series
-/// reads' settings ([`series_read_settings`]); when clustered,
-/// `optimize_skip_unused_shards = 0` on all four, and on A and H, which
+/// reads' settings ([`series_read_settings`]), whose answer pins carry
+/// `optimize_skip_unused_shards = 0` on all four; when clustered, on A and H, which
 /// group by the sharding key's column, `optimize_distributed_group_by_
 /// sharding_key = 0`, so the initiator merges a group stored on two
 /// shards; on A the row cap that decides the branch; on A, T and H the
@@ -2925,12 +2957,11 @@ fn exemplar_settings(
     statement: ExemplarStatement,
     read_max_memory_bytes: u64,
     distributed: bool,
+    skip_unavailable_shards: bool,
 ) -> QuerySettings {
     use super::exemplars::{EXEMPLAR_ANSWER_BYTES, EXEMPLAR_ANSWER_CAP, EXEMPLAR_MAX_BLOCK_ROWS};
-    let mut settings = series_read_settings(read_max_memory_bytes, distributed);
-    if distributed {
-        settings = settings.set("optimize_skip_unused_shards", 0u64);
-    }
+    let mut settings =
+        series_read_settings(read_max_memory_bytes, distributed, skip_unavailable_shards);
     if statement == ExemplarStatement::Rows {
         settings = settings
             .set("max_rows_to_group_by", EXEMPLAR_ANSWER_CAP)
@@ -4325,7 +4356,7 @@ mod tests {
     /// comes in — so the byte-budget keys must still be absent.
     #[test]
     fn metrics_read_settings_carry_the_memory_ceiling() {
-        let s = metrics_read_settings(TEST_READ_MEM);
+        let s = metrics_read_settings(TEST_READ_MEM, false);
         assert_eq!(
             s.get("max_memory_usage"),
             Some(TEST_READ_MEM.to_string().as_str())
@@ -4339,7 +4370,7 @@ mod tests {
         );
         // The `SqlFallback` variant layers on top and must keep both.
         for distributed in [false, true] {
-            let f = series_read_settings(TEST_READ_MEM, distributed);
+            let f = series_read_settings(TEST_READ_MEM, distributed, false);
             assert_eq!(
                 f.get("max_memory_usage"),
                 Some(TEST_READ_MEM.to_string().as_str()),
@@ -4357,7 +4388,7 @@ mod tests {
     /// exists to remove.
     #[test]
     fn label_cache_sweep_carries_the_memory_ceiling() {
-        let s = crate::metrics::refresh::sweep_settings(TEST_READ_MEM);
+        let s = crate::metrics::refresh::sweep_settings(TEST_READ_MEM, false);
         assert_eq!(
             s.get("max_memory_usage"),
             Some(TEST_READ_MEM.to_string().as_str())
@@ -4371,7 +4402,7 @@ mod tests {
 
     #[test]
     fn metrics_read_settings_sets_the_raised_query_text_cap() {
-        let s = metrics_read_settings(TEST_READ_MEM);
+        let s = metrics_read_settings(TEST_READ_MEM, false);
         assert_eq!(
             s.get("max_query_size"),
             Some(crate::querytext::MAX_QUERY_TEXT_BYTES.to_string().as_str())
@@ -4420,7 +4451,7 @@ mod tests {
 
     #[test]
     fn series_read_settings_carries_the_read_settings_and_omits_local_product_mode_unclustered() {
-        let unclustered = format!("{:?}", series_read_settings(TEST_READ_MEM, false));
+        let unclustered = format!("{:?}", series_read_settings(TEST_READ_MEM, false, false));
         assert!(
             unclustered.contains("max_query_size"),
             "missing max_query_size in {unclustered}"
@@ -4433,7 +4464,7 @@ mod tests {
 
     #[test]
     fn series_read_settings_adds_the_local_product_mode_when_clustered() {
-        let clustered = format!("{:?}", series_read_settings(TEST_READ_MEM, true));
+        let clustered = format!("{:?}", series_read_settings(TEST_READ_MEM, true, false));
         assert!(clustered.contains("max_query_size"));
         assert!(clustered.contains("distributed_product_mode"));
         assert!(clustered.contains("local"));
@@ -4445,7 +4476,7 @@ mod tests {
     fn the_exemplar_statements_carry_their_settings() {
         use ExemplarStatement::{Count, Rows, Series, Thinned};
         let get = |st, distributed, key: &str| {
-            exemplar_settings(st, TEST_READ_MEM, distributed)
+            exemplar_settings(st, TEST_READ_MEM, distributed, false)
                 .get(key)
                 .map(str::to_string)
         };
@@ -4463,9 +4494,10 @@ mod tests {
                     byte_bound.then(|| "268435456".to_string()),
                     "{st:?} {distributed}"
                 );
+                // An answer pin on every statement (#603 follow-up).
                 assert_eq!(
                     get(st, distributed, "result_overflow_mode"),
-                    byte_bound.then(|| "throw".to_string()),
+                    some("throw"),
                     "{st:?} {distributed}"
                 );
                 if byte_bound {
@@ -4477,9 +4509,10 @@ mod tests {
                     capped.then(|| "100000".to_string()),
                     "{st:?} {distributed}"
                 );
+                // An answer pin on every statement (#603 follow-up).
                 assert_eq!(
                     get(st, distributed, "group_by_overflow_mode"),
-                    capped.then(|| "throw".to_string()),
+                    some("throw"),
                     "{st:?} {distributed}"
                 );
                 let merged = distributed && matches!(st, Rows | Series);
@@ -4499,9 +4532,51 @@ mod tests {
                 );
                 assert_eq!(
                     get(st, distributed, "optimize_skip_unused_shards"),
-                    distributed.then(|| "0".to_string()),
+                    some("0"),
                     "{st:?} {distributed}"
                 );
+            }
+        }
+    }
+
+    /// MU (#603 follow-up): every metrics settings root, and every builder
+    /// over it, carries the answer pins with pruning off and the option as
+    /// configured, clustered or not.
+    #[test]
+    fn every_metrics_read_carries_the_answer_pins() {
+        use ExemplarStatement::{Count, Rows, Series, Thinned};
+        for skip in [false, true] {
+            let pins = QuerySettings::new().answer_pins(false, skip);
+            for distributed in [false, true] {
+                let mut builders: Vec<(String, QuerySettings)> = vec![
+                    (
+                        "metrics_read_settings".to_string(),
+                        metrics_read_settings(TEST_READ_MEM, skip),
+                    ),
+                    (
+                        "series_read_settings".to_string(),
+                        series_read_settings(TEST_READ_MEM, distributed, skip),
+                    ),
+                    (
+                        "sweep_settings".to_string(),
+                        crate::metrics::refresh::sweep_settings(TEST_READ_MEM, skip),
+                    ),
+                ];
+                for st in [Count, Rows, Thinned, Series] {
+                    builders.push((
+                        format!("exemplar_settings({st:?})"),
+                        exemplar_settings(st, TEST_READ_MEM, distributed, skip),
+                    ));
+                }
+                for (builder, s) in &builders {
+                    for name in pulsus_clickhouse::ANSWER_PIN_NAMES {
+                        assert_eq!(
+                            s.get(name),
+                            pins.get(name),
+                            "{builder}, distributed {distributed}, skip {skip}: {name}"
+                        );
+                    }
+                }
             }
         }
     }

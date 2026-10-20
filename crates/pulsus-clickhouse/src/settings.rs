@@ -46,6 +46,156 @@ pub const MAX_JSON_PATHS_PER_VALUE: u64 = 100_000;
 /// its spans and resources absent from the new tables.
 pub const MAX_PARTITIONS_PER_INSERT_BLOCK: u64 = 100;
 
+/// The settings that can turn a read into a partial or changed answer that
+/// still succeeds (#603 plan, "Answer pins"). Every read of every signal sends them.
+pub const ANSWER_PIN_NAMES: [&str; 17] = [
+    "skip_unavailable_shards",
+    "skip_unavailable_shards_mode",
+    "optimize_skip_unused_shards",
+    "distributed_group_by_no_merge",
+    "enable_parallel_replicas",
+    "max_parallel_replicas",
+    "distinct_overflow_mode",
+    "group_by_overflow_mode",
+    "join_overflow_mode",
+    "read_overflow_mode",
+    "read_overflow_mode_leaf",
+    "result_overflow_mode",
+    "set_overflow_mode",
+    "sort_overflow_mode",
+    "timeout_overflow_mode",
+    "timeout_overflow_mode_leaf",
+    "transfer_overflow_mode",
+];
+
+/// One family: its `LIKE` rules, and the members it does not pin, each with its reason.
+pub struct AnswerFamily {
+    pub name: &'static str,
+    pub like: &'static [&'static str],
+    pub exempt: &'static [(&'static str, &'static str)],
+}
+
+/// The four families of settings a pin decision covers (#603 plan, "Answer
+/// pins"): each family's `LIKE` rules over `system.settings.name`, and every
+/// member it does not pin, by exact name, with the reason. A live test
+/// (`every_answer_family_member_is_pinned_or_exempt`) fails when the server
+/// lists a member that is neither in [`ANSWER_PIN_NAMES`] nor named here.
+pub const ANSWER_FAMILIES: [AnswerFamily; 4] = [
+    AnswerFamily {
+        name: "PF1 shard routing and availability",
+        like: &["%skip_unavailable_shards%", "%skip_unused_shards%"],
+        exempt: &[
+            ("max_skip_unavailable_shards_num", SKIP_TO_ERROR),
+            ("max_skip_unavailable_shards_ratio", SKIP_TO_ERROR),
+            ("optimize_skip_unused_shards_limit", ONLY_WHILE_PRUNING),
+            ("optimize_skip_unused_shards_nesting", ONLY_WHILE_PRUNING),
+            ("optimize_skip_unused_shards_rewrite_in", ONLY_WHILE_PRUNING),
+            (
+                "force_optimize_skip_unused_shards",
+                ONLY_WHILE_PRUNING_ERROR,
+            ),
+            (
+                "force_optimize_skip_unused_shards_nesting",
+                ONLY_WHILE_PRUNING_ERROR,
+            ),
+            (
+                "allow_nondeterministic_optimize_skip_unused_shards",
+                ONLY_WHILE_PRUNING,
+            ),
+        ],
+    },
+    AnswerFamily {
+        name: "PF2 per-shard result merging",
+        like: &[
+            "distributed_group_by%",
+            "%group_by_sharding_key%",
+            "distributed_aggregation%",
+        ],
+        exempt: &[
+            (
+                "optimize_distributed_group_by_sharding_key",
+                "it acts only while pruning is on (alone it gave 8 of 8, measured)",
+            ),
+            (
+                "distributed_aggregation_memory_efficient",
+                "it changes memory use, not rows",
+            ),
+        ],
+    },
+    AnswerFamily {
+        name: "PF3 parallel replicas",
+        like: &["%parallel_replica%", "%parallel_reading_from_replicas%"],
+        exempt: &[
+            (
+                "allow_experimental_parallel_reading_from_replicas",
+                "the same setting: system.settings.alias_for of enable_parallel_replicas names it",
+            ),
+            ("parallel_replicas_count", PR_INTERNAL),
+            ("parallel_replica_offset", PR_INTERNAL),
+            ("parallel_replicas_custom_key", PR_SPLIT),
+            ("parallel_replicas_custom_key_range_lower", PR_SPLIT),
+            ("parallel_replicas_custom_key_range_upper", PR_SPLIT),
+            ("parallel_replicas_mode", PR_SPLIT),
+            ("automatic_parallel_replicas_mode", PR_AUTOMATIC),
+            (
+                "automatic_parallel_replicas_min_bytes_per_replica",
+                PR_AUTOMATIC,
+            ),
+            (
+                "cluster_for_parallel_replicas",
+                "names the cluster a parallel-replica read uses; read only while the mode is on",
+            ),
+            ("parallel_replicas_allow_in_with_subquery", PR_TUNE),
+            ("parallel_replicas_allow_materialized_views", PR_TUNE),
+            ("parallel_replicas_allow_view_over_mergetree", PR_TUNE),
+            ("parallel_replicas_connect_timeout_ms", PR_TUNE),
+            ("parallel_replicas_filter_pushdown", PR_TUNE),
+            ("parallel_replicas_for_cluster_engines", PR_TUNE),
+            ("parallel_replicas_for_non_replicated_merge_tree", PR_TUNE),
+            (
+                "parallel_replicas_index_analysis_only_on_coordinator",
+                PR_TUNE,
+            ),
+            ("parallel_replicas_insert_select_local_pipeline", PR_TUNE),
+            ("parallel_replicas_local_plan", PR_TUNE),
+            ("parallel_replicas_mark_segment_size", PR_TUNE),
+            ("parallel_replicas_min_number_of_rows_per_replica", PR_TUNE),
+            ("parallel_replicas_only_with_analyzer", PR_TUNE),
+            ("parallel_replicas_plan_based", PR_TUNE),
+            ("parallel_replicas_prefer_local_join", PR_TUNE),
+            ("parallel_replicas_prefer_local_replica", PR_TUNE),
+            ("parallel_replicas_support_projection", PR_TUNE),
+            ("parallel_replicas_custom_key_filter_type", PR_OBSOLETE),
+            (
+                "parallel_replicas_min_number_of_granules_to_enable",
+                PR_OBSOLETE,
+            ),
+            (
+                "parallel_replicas_single_task_marks_count_multiplier",
+                PR_OBSOLETE,
+            ),
+        ],
+    },
+    AnswerFamily {
+        name: "PF4 overflow modes",
+        like: &["%overflow_mode%"],
+        exempt: &[],
+    },
+];
+
+const SKIP_TO_ERROR: &str = "it can only turn a skip into an error";
+const ONLY_WHILE_PRUNING: &str = "it acts only while pruning is on, which happens only on sharded \
+     trace reads, whose placement follows the key";
+const ONLY_WHILE_PRUNING_ERROR: &str =
+    "it acts only while pruning is on, and can only raise an error";
+const PR_INTERNAL: &str = "an internal setting the initiator sets up; no measured combination \
+     without enable_parallel_replicas = 1 changed an answer";
+const PR_SPLIT: &str = "it chooses how replicas split a read; measured, no split happens while \
+     the pins hold";
+const PR_AUTOMATIC: &str = "automatic mode requires enable_parallel_replicas != 0";
+const PR_TUNE: &str = "it tunes a parallel-replica read and takes effect only while the mode is on";
+const PR_OBSOLETE: &str = "obsolete (tier = 'Obsolete'); the server ignores it";
+
 /// An ordered list of `(key, value)` ClickHouse settings, applied to exactly
 /// one statement.
 #[derive(Clone, Default, Debug)]
@@ -404,6 +554,39 @@ impl QuerySettings {
             .set("distributed_aggregation_memory_efficient", 1)
             .set("prefer_localhost_replica", 1)
             .set("skip_unavailable_shards", u8::from(skip_unavailable_shards))
+    }
+
+    /// The answer pins (#603 plan, "Answer pins"): every setting in
+    /// [`ANSWER_PIN_NAMES`], so a server profile cannot turn a read into a
+    /// partial or changed answer that still succeeds.
+    ///
+    /// `prune_by_sharding_key` is `optimize_skip_unused_shards`: true only
+    /// where rows are placed by the sharding key (sharded trace reads). Logs
+    /// and metrics rows sit on the shard that took the push, so their reads
+    /// pass `false`. `skip_unavailable_shards` is
+    /// `PULSUS_SKIP_UNAVAILABLE_SHARDS`; its mode is pinned so "unavailable"
+    /// means unreachable or missing the table, never a shard's error. Every
+    /// overflow mode is `throw`: a read that hits a limit fails rather than
+    /// answering with what it had read. A caller that means to cut an answer
+    /// short sets its own mode after this.
+    pub fn answer_pins(self, prune_by_sharding_key: bool, skip_unavailable_shards: bool) -> Self {
+        let mut s = self
+            .set("skip_unavailable_shards", u8::from(skip_unavailable_shards))
+            .set(
+                "skip_unavailable_shards_mode",
+                "unavailable_or_table_missing",
+            )
+            .set(
+                "optimize_skip_unused_shards",
+                u8::from(prune_by_sharding_key),
+            )
+            .set("distributed_group_by_no_merge", 0u64)
+            .set("enable_parallel_replicas", 0u64)
+            .set("max_parallel_replicas", 1u64);
+        for name in &ANSWER_PIN_NAMES[6..] {
+            s = s.set(name, "throw");
+        }
+        s
     }
 
     /// Couples the client-side deadline to the server-side
@@ -777,6 +960,50 @@ mod tests {
             "async_insert is pinned one layer down, for every insert this \
              client makes; a second pin here would state one rule twice"
         );
+    }
+
+    /// CK1 (#603 follow-up): the answer pins are exactly the pinned list, in
+    /// order, with each value, for both arguments in both values; and no
+    /// family exempts a name it also pins.
+    #[test]
+    fn answer_pins_set_exactly_the_pinned_list() {
+        for prune in [false, true] {
+            for skip in [false, true] {
+                let s = QuerySettings::new().answer_pins(prune, skip);
+                let got: Vec<(&str, &str)> = s.entries().collect();
+                let mut want: Vec<(&str, String)> = vec![
+                    ("skip_unavailable_shards", u8::from(skip).to_string()),
+                    (
+                        "skip_unavailable_shards_mode",
+                        "unavailable_or_table_missing".to_string(),
+                    ),
+                    ("optimize_skip_unused_shards", u8::from(prune).to_string()),
+                    ("distributed_group_by_no_merge", "0".to_string()),
+                    ("enable_parallel_replicas", "0".to_string()),
+                    ("max_parallel_replicas", "1".to_string()),
+                ];
+                for name in &ANSWER_PIN_NAMES[6..] {
+                    want.push((name, "throw".to_string()));
+                }
+                let want: Vec<(&str, &str)> = want.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                assert_eq!(got, want, "prune {prune}, skip {skip}");
+                let names: Vec<&str> = got.iter().map(|(k, _)| *k).collect();
+                assert_eq!(
+                    names,
+                    ANSWER_PIN_NAMES.to_vec(),
+                    "prune {prune}, skip {skip}"
+                );
+            }
+        }
+        for family in &ANSWER_FAMILIES {
+            for (name, _) in family.exempt {
+                assert!(
+                    !ANSWER_PIN_NAMES.contains(name),
+                    "{} both pins and exempts {name}",
+                    family.name
+                );
+            }
+        }
     }
 
     /// AC2 (issue #114): sequential consistency emits `= 1` only when

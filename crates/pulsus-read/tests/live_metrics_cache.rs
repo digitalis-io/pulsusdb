@@ -132,6 +132,7 @@ async fn execute_fingerprint_sql(client: &ChClient, sql: &str) -> Vec<Fingerprin
 
 fn cache_config(db: &str, series_table: &str, window_ms: i64, ttl: Duration) -> LabelCacheConfig {
     LabelCacheConfig {
+        skip_unavailable_shards: false,
         // Issue #398: the per-query ClickHouse memory ceiling; the
         // production default, so this fixture keeps today's behaviour.
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
