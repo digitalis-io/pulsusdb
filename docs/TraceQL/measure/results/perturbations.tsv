@@ -14,7 +14,7 @@ union_interp	interpreter	red	2	0	0	0	0	noticed	PASS	a union form returns both pa
 descendant_interp	interpreter	red	1	0	0	0	0	noticed	PASS	`>>` climbs past the first parent
 limit_interp	interpreter	red	72	0	0	0	0	noticed	PASS	a search returns at most LIMIT traces
 spss_interp	interpreter	red	54	0	0	0	0	noticed	PASS	a spanset carries at most SPSS spans
-trace_order_interp	interpreter	red	91	0	0	0	0	noticed	PASS	the traces come back newest first
+trace_order_interp	interpreter	red	93	0	0	0	0	noticed	PASS	the traces come back newest first
 group_missing_interp	interpreter	red	4	0	0	0	0	noticed	PASS	a span lacking the `by()` key is grouped under `nil`
 coalesce_interp	interpreter	red	1	0	0	0	0	noticed	PASS	`| coalesce()` drops the key `by()` added
 step_label_interp	interpreter	red	0	29	0	0	0	noticed	PASS	a bucket is labelled by the instant that closes it
@@ -22,7 +22,7 @@ histogram_interp	interpreter	red	0	1	0	0	0	noticed	PASS	the log2 bucket is the s
 topk_interp	interpreter	red	0	4	0	0	0	noticed	PASS	`topk` keeps the largest series, `bottomk` the smallest
 exemplar_interp	interpreter	red	0	21	0	0	0	noticed	PASS	the exemplar is the bucket’s longest span
 compare_type_interp	interpreter	red	0	14	0	0	0	noticed	PASS	`compare()` keeps a value distinct per stored type
-root_rule_interp	interpreter	red	154	14	0	0	0	noticed	PASS	a root is a span whose parent is not stored
+root_rule_interp	interpreter	red	43	6	0	0	0	noticed	PASS	a root is a span with no parent id, never an orphan whose parent id names a span not stored
 childcount_interp	interpreter	red	1	2	0	0	0	noticed	PASS	`childCount` counts the spans whose parent is this span
 trace_duration_interp	interpreter	red	3	0	0	0	0	noticed	PASS	`trace:duration` is the whole trace’s extent
 event_existential_interp	interpreter	red	18	2	0	0	0	noticed	PASS	an event intrinsic asks whether ANY event satisfies it

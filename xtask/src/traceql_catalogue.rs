@@ -64,7 +64,7 @@ const MAX_STATEMENTS: usize = 100;
 const TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The search requests, each `(name, limit, spss)`: the answer, a top-K cut
-/// that decides something on six traces, and every matching span.
+/// that decides something on seven traces, and every matching span.
 const SEARCH_REQUESTS: [(&str, u32, u32); 3] =
     [("answer", 20, 3), ("cut", 2, 3), ("full", 20, 1000)];
 

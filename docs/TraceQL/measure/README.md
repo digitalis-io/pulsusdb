@@ -30,7 +30,7 @@ They take hosts, ports and directories as arguments; nothing is hard-coded.
 | `offload.sh` | the object-storage measurement kept in `functional-requirements.md` §3 after the requirement was withdrawn |
 | `fixture/make_fixture.py`, `fixture/fixture_answers.py` | the worked fixture and both stores' answers |
 | `fixture/structural_answers.py` | the fifteen structural forms' answers on that fixture |
-| `fixture/make_catalogue_fixture.py` | the catalogue fixture: 34 spans in six traces, carrying every key and type the corpus names and the shapes that tell a wrong rule from a right one |
+| `fixture/make_catalogue_fixture.py` | the catalogue fixture: 38 spans in seven traces, carrying every key and type the corpus names and the shapes that tell a wrong rule from a right one |
 | `catalogue_parse.py` | the TraceQL parser the catalogue's two sides share, and the only thing they share |
 | `parse_vectors.tsv` | one line per rule that parser decides, with the tree it must produce, written out by hand — the check on the one module a comparison cannot check |
 | `catalogue-extra.tsv` | the queries the corpus does not contain, one per rule of §3.2 no corpus query reaches, each with the rule it decides |
