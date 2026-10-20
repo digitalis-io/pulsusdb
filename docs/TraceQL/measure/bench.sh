@@ -70,7 +70,7 @@ PY
   echo "trace_largest	$TBIG	$NBIG spans"
   echo "nproc	$(nproc)"
   # the two images the workflow starts, read from the files it reads them from
-  echo "clickhouse_image	$(grep -o -m1 'clickhouse/clickhouse-server@sha256:[0-9a-f]*' "$HERE/../../../.github/workflows/traceql-reference-bench.yml")"
+  echo "clickhouse_image	$(grep -o -m1 '[a-z]*/clickhouse-server@sha256:[0-9a-f]*' "$HERE/../../../.github/workflows/traceql-reference-bench.yml")"
   echo "reference_image	deploy/e2e/compose.single.yaml's pinned image, $(sed -n 's/^ *image: [^ ]*:3\.0\.2@\(sha256:[0-9a-f]*\)$/\1/p' "$HERE/../../../deploy/e2e/compose.single.yaml")"
 } > "$OUT/run.txt"
 cat "$OUT/run.txt"
