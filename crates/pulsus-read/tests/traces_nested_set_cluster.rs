@@ -3127,7 +3127,21 @@ async fn the_queue_cap_holds_the_run() {
             at = l + 100 * S
         )
     };
-    exec(&r.s1, &blocks("kc3a", 1000)).await;
+    // One insert of 1,000 parts can take longer than the shared client's
+    // 60 s cut on a busy runner: a client of its own, with 10 minutes.
+    let slow = ChClient::new(ChConnConfig {
+        query_timeout: Duration::from_secs(600),
+        ..shard1_config(&db)
+    })
+    .await
+    .expect("connect shard1");
+    slow.execute(
+        &blocks("kc3a", 1000),
+        &QuerySettings::new().set("max_execution_time", 600),
+        Idempotency::NonIdempotent,
+    )
+    .await
+    .expect("KC3: 1,000 one-row blocks");
     let deadline = std::time::Instant::now() + Duration::from_secs(120);
     loop {
         let n = queue_size(&r.s1b, &db, "spans").await;
