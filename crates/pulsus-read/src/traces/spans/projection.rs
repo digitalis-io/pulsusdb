@@ -17,12 +17,15 @@
 //! (`attrs.`, `scope_attrs.`). Off the span row (issue #591 part 2): a
 //! resource attribute other than `service.name` through the predicate's
 //! own resource lookup at the span's `resource_id`; an event or link
-//! attribute, or an event or link intrinsic, as the first element whose own
-//! condition holds, or — once inside arithmetic — the first element the
-//! comparison holds for; the unscoped `.k` at the first scope of the
-//! predicate's chain that holds it. A set field compared with itself is
-//! its first element carrying the field. One set field twice in a
-//! comparison holding arithmetic has no single element and is refused.
+//! attribute, or an event or link intrinsic, as the LAST element whose own
+//! condition holds, or — once inside arithmetic — the last element the
+//! comparison holds for (issue #600 part 3, the reference's response); the
+//! unscoped `.k` at the first scope of the predicate's chain that holds
+//! it. A set field compared with itself, `select()`ed or tested for
+//! presence is its last element carrying the field. A search aggregate's
+//! argument reads the FIRST element carrying it ([`Pick`]). One set field
+//! twice in a comparison holding arithmetic has no single element and is
+//! refused.
 //!
 //! **Every value's text is cut at today's response ceiling**: more than
 //! 8,192 bytes becomes its first 2,048 code points. An array's JSON is
@@ -35,7 +38,8 @@ use pulsus_traceql::{
 use super::numbering::projected_sql;
 use super::predicate::{
     CHAIN, HELD, PredicateCtx, SERVICE_IS_STRING, SERVICE_VALUE, attr_path, chain_presence_in,
-    compile_span_predicate_in, element_index_in, element_select_in, resource_value_in, scope_value,
+    compile_span_predicate_in, element_index_in, element_select_in, last_element_index_in,
+    resource_value_in, scope_value,
 };
 use super::rows::SearchProjected;
 use crate::logql::error::ReadError;
@@ -102,6 +106,16 @@ fn ceiling(text: String) -> String {
     } else {
         text.chars().take(CUT_CODE_POINTS).collect()
     }
+}
+
+/// Which element of an event or link set a value read takes (issue #600
+/// part 3): the projection the last, as the reference's response renders
+/// a span's attributes; a search aggregate's argument the first, as the
+/// reference's value reader does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pick {
+    First,
+    Last,
 }
 
 /// What a condition projects for its one field.
@@ -203,7 +217,7 @@ impl Projection {
                         field: field.clone(),
                         negated: false,
                     };
-                    self.add(field, stored_value(field, ctx)?, &presence, ctx)?;
+                    self.add(field, stored_value(field, ctx, Pick::Last)?, &presence, ctx)?;
                 }
                 Ok(())
             }
@@ -769,13 +783,14 @@ fn resource_stored(key: &str, ctx: &PredicateCtx<'_>) -> Result<Projects, PlanEr
 }
 
 /// A field's stored value, as presence projects it: an attribute's own, a
-/// column's, the resource row's, or a set's first element carrying it.
-fn stored_value(field: &Field, ctx: &PredicateCtx<'_>) -> Result<Projects, PlanError> {
+/// column's, the resource row's, or a set's element carrying it, the one
+/// `pick` names.
+fn stored_value(field: &Field, ctx: &PredicateCtx<'_>, pick: Pick) -> Result<Projects, PlanError> {
     Ok(match (place_of(field), field) {
         (Place::Attribute(root), Field::Attribute { key, .. }) => stored_attribute(root, key),
         (Place::Column(sql), _) => column(sql),
         (Place::Resource, Field::Attribute { key, .. }) => resource_stored(key, ctx)?,
-        (Place::Set, _) => first_carrying(field, ctx)?,
+        (Place::Set, _) => carrying(field, ctx, pick)?,
         (Place::Envelope | Place::Numbered(_), _)
         | (Place::Attribute(_) | Place::Resource, Field::Intrinsic(_)) => Projects::Nothing,
     })
@@ -982,12 +997,12 @@ fn arithmetic_only(expr: &FieldExpr) -> bool {
 }
 
 /// A set field's value under a comparison naming it alone (sections 3.2,
-/// 3.5 and 3.6): opposite a literal-only side, the first element whose own
-/// condition holds; once inside arithmetic, the first element the
-/// comparison holds for; compared with itself, the first element carrying
-/// it. Twice in a comparison holding arithmetic was refused before this
-/// ([`refuse_two_occurrences`]); any other shape projects nothing, as the
-/// previous engine projects nothing for it (issue #602 part 1, D6).
+/// 3.5 and 3.6; issue #600 part 3): opposite a literal-only side, the last
+/// element whose own condition holds; once inside arithmetic, the last
+/// element the comparison holds for; compared with itself, the last element
+/// carrying it. Twice in a comparison holding arithmetic was refused before
+/// this ([`refuse_two_occurrences`]); any other shape projects nothing, as
+/// the previous engine projects nothing for it (issue #602 part 1, D6).
 fn set_value(
     field: &Field,
     lhs: &FieldExpr,
@@ -1000,7 +1015,7 @@ fn set_value(
     operand_fields(rhs, &mut fields);
     if fields.len() >= 2 {
         if matches!((lhs, rhs), (FieldExpr::Field(_), FieldExpr::Field(_))) {
-            return first_carrying(field, ctx);
+            return carrying(field, ctx, Pick::Last);
         }
         return Ok(Projects::Nothing);
     }
@@ -1012,7 +1027,7 @@ fn set_value(
         (lhs, rhs)
     };
     match side {
-        FieldExpr::Field(_) if literal_only(other) => first_holding(field, comparison, ctx),
+        FieldExpr::Field(_) if literal_only(other) => last_holding(field, comparison, ctx),
         _ if arithmetic_only(side) && literal_only(other) => {
             let e = element_select_in(comparison, ctx)?;
             if e == "false" {
@@ -1044,11 +1059,11 @@ fn refuse_two_occurrences(
     Ok(())
 }
 
-/// Section 3.2: the first element whose own condition holds, for a
-/// comparison of `field` against a literal-only side; the unscoped `.k`
-/// through the chain, its event and link values the same comparison's on
-/// `event.k` and `link.k`.
-fn first_holding(
+/// Section 3.2: the last element whose own condition holds (issue #600
+/// part 3), for a comparison of `field` against a literal-only side; the
+/// unscoped `.k` through the chain, its event and link values the same
+/// comparison's on `event.k` and `link.k`.
+fn last_holding(
     field: &Field,
     comparison: &FieldExpr,
     ctx: &PredicateCtx<'_>,
@@ -1059,34 +1074,43 @@ fn first_holding(
     } = field
     {
         return chain_value(key, ctx, |scoped| {
-            first_holding(scoped, &with_field(comparison, field, scoped), ctx)
+            last_holding(scoped, &with_field(comparison, field, scoped), ctx)
         });
     }
-    let index = element_index_in(comparison, ctx)?;
+    let index = last_element_index_in(comparison, ctx)?;
     if index == "false" {
         return Ok(Projects::Nothing);
     }
     Ok(element_value(field, &index))
 }
 
-/// Section 3.6: the first element carrying `field` — an attribute's first
-/// element holding the key, an intrinsic's first element; the unscoped
-/// `.k` through the chain.
-fn first_carrying(field: &Field, ctx: &PredicateCtx<'_>) -> Result<Projects, PlanError> {
+/// Section 3.6: the element carrying `field` that `pick` names — an
+/// attribute's first or last element holding the key, an intrinsic's
+/// first or last element; the unscoped `.k` through the chain.
+fn carrying(field: &Field, ctx: &PredicateCtx<'_>, pick: Pick) -> Result<Projects, PlanError> {
     match field {
         Field::Attribute {
             scope: AttrScope::Unscoped,
             key,
-        } => chain_value(key, ctx, |scoped| first_carrying(scoped, ctx)),
+        } => chain_value(key, ctx, |scoped| carrying(scoped, ctx, pick)),
         Field::Attribute { .. } => {
             let presence = FieldExpr::Exists {
                 field: field.clone(),
                 negated: false,
             };
-            let index = element_index_in(&presence, ctx)?;
+            let index = match pick {
+                Pick::First => element_index_in(&presence, ctx)?,
+                Pick::Last => last_element_index_in(&presence, ctx)?,
+            };
             Ok(element_value(field, &index))
         }
-        Field::Intrinsic(_) => Ok(element_value(field, "1")),
+        Field::Intrinsic(_) => Ok(element_value(
+            field,
+            match pick {
+                Pick::First => "1",
+                Pick::Last => "-1",
+            },
+        )),
     }
 }
 
@@ -1156,9 +1180,9 @@ fn with_field(expr: &FieldExpr, from: &Field, to: &Field) -> FieldExpr {
     }
 }
 
-/// A set field's element at the 1-based `index`: an attribute's stored
-/// value; `event:name` and the link ids as text, the ids as lowercase hex;
-/// `event:timeSinceStart` through [`offset_value`].
+/// A set field's element at the 1-based `index`, `-1` the last: an
+/// attribute's stored value; `event:name` and the link ids as text, the ids
+/// as lowercase hex; `event:timeSinceStart` through [`offset_value`].
 fn element_value(field: &Field, index: &str) -> Projects {
     match field {
         Field::Attribute { scope, key } => {
@@ -1211,7 +1235,7 @@ pub(crate) fn aggregate_argument_sql(
             scope: AttrScope::Resource,
             key,
         } if key == "service.name" => Ok(Some(stored_parts(SERVICE_VALUE))),
-        Field::Attribute { .. } => match stored_value(field, ctx)? {
+        Field::Attribute { .. } => match stored_value(field, ctx, Pick::First)? {
             Projects::Value { value, kind } => Ok(Some((value, kind))),
             Projects::Nothing => Ok(None),
         },

@@ -6,9 +6,8 @@ directories of crates/pulsus-traceql/tests/corpus/ and every row of
 `catalogue-extra.tsv` through the route's own planner and engine and writes one
 JSON line per query: its disposition, the answer, and the statements the engine
 issued with the rows each returned (`system.query_log`). This script compares
-each search answer but one, whole and typed, with `catalogue_interp.py`, which
-walks the parsed query over the fixture rows; `intrinsic_event_time_since_start`
-waits for #600's compiler-fix part (`LATER` below). The two sides share nothing: the statements
+each search answer, whole and typed, with `catalogue_interp.py`, which walks
+the parsed query over the fixture rows. The two sides share nothing: the statements
 are the compiler's and the parser here is the interpreter's own.
 
 Usage: catalogue.py RUN_JSONL FIXTURE_JSONL START_NS END_NS
@@ -37,9 +36,6 @@ EMPTY_REASONS = {
                         '`!=` that matched would return spans `…01` and `…2d`',
 }
 CAPS = {'answer': LIMIT, 'cut': CUT, 'full': LIMIT}
-# Compared in #600's compiler-fix part: which of several matching events or
-# links the response projects.
-LATER = {'intrinsic_event_time_since_start'}
 # `docs/api.md` §4.2: a duration `avg()` truncates. Trace `11…`'s four checkout
 # spans last 7 s and 3 ns in all, so their average is 1.75 s and 0.75 ns:
 # truncated it is `1.75s`, rounded up or to the nearest `1.750000001s`. Checked
@@ -80,7 +76,7 @@ for line in open(f'{HERE}/parse_vectors.tsv'):
 
 tally = {g: {'served': 0, 'answer': 0, 'membership': 0} for g in ('corpus', 'design')}
 planner, mismatched, errors, unbounded, unexplained, missing_reason, notes = [], [], [], [], [], [], []
-metrics = later = 0
+metrics = 0
 # Every row of catalogue-extra.tsv is a query of the run; the added searches
 # expected to agree are those rows less its metrics queries.
 EXTRA_ROWS = sum(1 for l in open(f'{HERE}/catalogue-extra.tsv')
@@ -92,7 +88,7 @@ for line in open(RUN):
     q = parse(r['traceql'])
     if r['group'] == 'design':
         design_seen += 1
-        design_other += r['disposition'] != 'served' or r['route'] == 'metrics' or r['name'] in LATER
+        design_other += r['disposition'] != 'served' or r['route'] == 'metrics'
     if (refusal(q) is None) != (r['disposition'] == 'served'):
         mismatched.append(r['name'])
     if r['disposition'] != 'served':
@@ -100,9 +96,6 @@ for line in open(RUN):
         continue
     if r['route'] == 'metrics':              # compared in part 1b
         metrics += 1
-        continue
-    if r['name'] in LATER:
-        later += 1
         continue
     t = tally['design' if r['group'] == 'design' else 'corpus']
     t['served'] += 1
@@ -133,7 +126,6 @@ print(f"  answers / memberships that agree        {c['answer']} / {c['membership
 print(f"catalogue-extra.tsv searches served      {d['served']}")
 print(f"  answers / memberships that agree        {d['answer']} / {d['membership']}")
 print(f"metrics queries served, compared in 1b   {metrics}")
-print(f"searches for the compiler-fix part       {later}")
 print(f"refused by the planner                   {len(planner)}: {', '.join(sorted(planner))}")
 print(f"disposition rule against the planner     {len(mismatched)} mismatches")
 print(f"statements that failed                   {len(errors)}")
@@ -147,10 +139,10 @@ for n, src, a, m, got, want in notes:
 for n, e in errors: print(f'  statement failed: {n}: {e[:160]}')
 for n in unbounded + unexplained + missing_reason + mismatched + VECTOR_BAD + pinned_bad + sorted(set(PINNED) - pinned_seen):
     print(f'  see: {n}')
-ok = (c == {'served': 118, 'answer': 118, 'membership': 118}
+ok = (c == {'served': 119, 'answer': 119, 'membership': 119}
       and design_seen == EXTRA_ROWS and d['served'] == EXTRA_ROWS - design_other
       and d == {'served': d['served'], 'answer': d['served'], 'membership': d['served']}
-      and metrics == 24 and later == 1
+      and metrics == 24
       and sorted(planner) == ['by_expression_key', 'duration_unitless', 'pipeline_spanset_operation']
       and pinned_seen == set(PINNED)
       and not (mismatched or errors or unbounded or unexplained or missing_reason or VECTOR_BAD

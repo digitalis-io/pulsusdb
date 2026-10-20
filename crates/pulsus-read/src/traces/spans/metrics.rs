@@ -52,6 +52,12 @@ pub const SERIES_CAP_MESSAGE: &str = "metrics series cap";
 /// The exemplar of a cell that has none: start `0`.
 const EX0: &str = "CAST((toFixedString('', 16), 0, 0), 'Tuple(FixedString(16), Int64, Int64)')";
 
+/// The exemplar of a cell that has none, for a `sum`/`min`/`max`/
+/// `avg_over_time`, whose exemplar carries its span's own target value as
+/// a double (issue #600 part 3): start `0`.
+const EX0_OWN: &str =
+    "CAST((toFixedString('', 16), 0, 0), 'Tuple(FixedString(16), Int64, Float64)')";
+
 /// An empty exemplar column.
 const NO_EXEMPLARS: &str = "CAST([], 'Array(Tuple(FixedString(16), Int64, Float64))')";
 
@@ -846,6 +852,12 @@ fn range_sql(plan: &TraceMetricsPlan, shape: &Shape, read: &Read, max_series: u6
     let first = axis.first_ms / step_ms;
     let step_ns = i128::from(step_ms) * 1_000_000;
     let budget = plan.exemplar_budget();
+    // Issue #600 part 3: a `sum`/`min`/`max`/`avg_over_time` exemplar's
+    // value is its span's own target value, as the reference's
+    // (`exemplarFnFor`, `pkg/traceql/ast_metrics.go:111-124`,
+    // `engine_metrics_average.go:50`), not the series' sample.
+    let own = matches!(shape.kind, PlanKind::Agg(_));
+    let ex0 = if own { EX0_OWN } else { EX0 };
     let bucket = format!("intDiv(start_ns - 1, {step_ns}) + 1 - {first}");
     let g = &read.g;
     let from = &read.from;
@@ -878,7 +890,18 @@ fn range_sql(plan: &TraceMetricsPlan, shape: &Shape, read: &Read, max_series: u6
             levels = shape.levels(plan, read)
         )
     } else {
-        let ex = if budget > 0 { LONGEST } else { EX0 };
+        let ex = match (budget > 0, own) {
+            (false, _) => ex0.to_string(),
+            (true, false) => LONGEST.to_string(),
+            (true, true) => {
+                let value = if read.x.is_none() {
+                    "toFloat64(duration_ns) / 1000000000".to_string()
+                } else {
+                    read.x()
+                };
+                format!("argMax((trace_id, start_ns, {value}), (duration_ns, span_id))")
+            }
+        };
         format!(
             "{with}SELECT {g} AS g, {o} AS o, {bucket} AS p, {v} AS v, {ex} AS ex\n{from}\nGROUP BY {by}",
             with = read.with,
@@ -917,7 +940,7 @@ fn range_sql(plan: &TraceMetricsPlan, shape: &Shape, read: &Read, max_series: u6
                 None => "c.2".to_string(),
             };
             format!(
-                "SELECT g, o, empty(cells) AS none, c.1 AS p, {v} AS v, if(isNaN(v), {EX0}, c.3) AS ex\n\
+                "SELECT g, o, empty(cells) AS none, c.1 AS p, {v} AS v, if(isNaN(v), {ex0}, c.3) AS ex\n\
                  FROM ({ser})\nLEFT ARRAY JOIN cells AS c{}",
                 where_clause(&wheres)
             )
@@ -948,6 +971,7 @@ fn range_sql(plan: &TraceMetricsPlan, shape: &Shape, read: &Read, max_series: u6
         let value = match (shape.kind, read.x.is_none()) {
             (PlanKind::Quantile, true) => "ex.3 / 1000000000",
             (PlanKind::Quantile, false) => "toFloat64(ex.3)",
+            (PlanKind::Agg(_), _) => "ex.3",
             _ => "v",
         };
         let keep = format!(

@@ -1960,7 +1960,7 @@ jobs:
       # (non-skipped). Pushes ONE OTLP/JSON body to its own instance's OTLP
       # receiver and decodes those same bytes through our own ingest
       # parser, then compares, per matched span, the multiset of projected
-      # attribute keys and the `name`-present flag over a 35-case registry.
+      # attribute keys and the `name`-present flag over a 40-case registry.
       #
       # ITS OWN INSTANCE, not the shared `pulsus-tempo-diff` above (code
       # review wave 1): this corpus's statusMessage / service / root names
@@ -3028,8 +3028,8 @@ jobs:
         run: docker compose -f ci/bench-cluster/compose.yaml down -v
 
   # Issue #600: every corpus and `catalogue-extra.tsv` query through the
-  # shipped route, each search answer but `intrinsic_event_time_since_start`
-  # (#600's compiler-fix part) compared with the independent interpreter.
+  # shipped route, each search answer compared with the independent
+  # interpreter; metrics answers are compared from #600 part 1b.
   # Scheduled or dispatched, not required.
   traceql-catalogue:
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
