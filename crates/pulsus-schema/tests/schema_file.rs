@@ -1612,14 +1612,17 @@ SETTINGS max_threads = 4, max_memory_usage = 4294967296, max_rows_to_read = 6000
          max_insert_threads = 1, max_insert_block_size = 100000000, min_insert_block_size_rows = 100000000, min_insert_block_size_bytes = 10000000000;"#;
 
 /// The clustered view's first line (part C §3), in place of the
-/// single-node one: the replication log copied and the replica not under
-/// repair for both tables, then each table's queue read entry by entry from
+/// single-node one: the replication log copied (for `spans`, or its
+/// uncopied entries counted and listed, at most 10,000) and the replica not
+/// under repair for both tables, then each table's queue read entry by entry from
 /// Keeper, and the watermark read only when `service_edges`' queue holds
 /// nothing but merges. Its lines carry the `--@cluster` prefix, which the
 /// render strips with the indentation after it.
-const SERVICE_EDGES_HEAD: &str = r#"AS WITH (SELECT groupArray((replica_path, log_pointer > log_max_index OR (log_pointer = 0 AND log_max_index = 0))) FROM system.replicas WHERE database = 'pulsus' AND table IN ('spans', 'service_edges')) AS logs,
+const SERVICE_EDGES_HEAD: &str = r#"AS WITH (SELECT groupArray((replica_path, log_pointer > log_max_index OR (log_pointer = 0 AND log_max_index = 0), zookeeper_path, log_pointer)) FROM system.replicas WHERE database = 'pulsus' AND table IN ('spans', 'service_edges')) AS logs,
 (SELECT groupArray((name, numChildren, value)) FROM system.zookeeper WHERE path IN (SELECT arrayJoin(arrayMap(x -> x.1, logs))) AND name IN ('queue', 'is_lost')) AS nodes,
-length(logs) = 2 AND arrayAll(x -> x.2, logs) AND arrayCount(n -> n.1 = 'is_lost' AND n.3 = '0', nodes) = 2 AND arrayCount(n -> n.1 = 'queue' AND n.2 <= 1000, nodes) = 2 AS listable,
+(SELECT groupArray((path, numChildren)) FROM system.zookeeper WHERE path IN (SELECT arrayJoin(arrayMap(x -> x.3, arrayFilter(x -> position(x.1, '.spans/') > 0 AND NOT x.2, logs)))) AND name = 'log') AS loglen,
+(SELECT groupArray((toUInt64OrZero(substring(name, 5)), ctime, extract(value, '^format version: \\d+\ncreate_time: [^\n]*\nsource replica: [^\n]*\nblock_id: [^\n]*\n(?:log_entry_id: [^\n]*\n)?([A-Za-z_]+)\n'), extract(value, '\nsource replica: ([^\n]*)\n'))) FROM (SELECT name, ctime, value FROM system.zookeeper WHERE path IN (SELECT arrayJoin(arrayMap(x -> x.3 || '/log', arrayFilter(x -> position(x.1, '.spans/') > 0 AND NOT x.2 AND length(loglen) = 1 AND loglen[1].2 <= 10000, logs)))) LIMIT 10001) SETTINGS max_execution_time = 10) AS logents,
+length(logs) = 2 AND arrayAll(x -> x.2 OR (position(x.1, '.spans/') > 0 AND length(loglen) = 1 AND loglen[1].2 <= 10000 AND length(logents) <= 10000), logs) AND arrayCount(n -> n.1 = 'is_lost' AND n.3 = '0', nodes) = 2 AND arrayCount(n -> n.1 = 'queue' AND n.2 <= 1000, nodes) = 2 AS listable,
 (SELECT groupArray((position(path, '.service_edges/') > 0, extract(value, '^format version: \\d+\ncreate_time: [^\n]*\nsource replica: [^\n]*\nblock_id: [^\n]*\n(?:log_entry_id: [^\n]*\n)?([A-Za-z_]+)\n'), parseDateTimeBestEffortOrZero(extract(value, '\ncreate_time: ([^\n]*)\n'), serverTimezone()), extract(value, '\n(?:get|attach)\n([^\n]+)'), extract(value, '\nsource replica: ([^\n]*)\n'))) FROM system.zookeeper WHERE path IN (SELECT arrayJoin(arrayMap(x -> x.1 || if(listable, '/queue', '/log_pointer'), logs))) SETTINGS max_execution_time = 10) AS entries,
 listable AND arrayCount(e -> e.1, entries) <= 1000 AND arrayCount(e -> NOT e.1, entries) <= 1000 AND arrayAll(e -> NOT e.1 OR e.2 = 'merge', entries) AS edges_ok,
 (SELECT arraySort(groupArray(minute)) FROM merge('pulsus', '^service_edges$') FINAL WHERE conn_type = '' AND edges_ok) AS ms,
@@ -1629,13 +1632,15 @@ listable AND arrayCount(e -> e.1, entries) <= 1000 AND arrayCount(e -> NOT e.1, 
 /// single-node `hi` line: a run pairs an empty range and writes no marker
 /// unless every `spans` entry queued on this replica is a merge, a fetch
 /// or an attach of a part it already holds, or a fetch an insert queued at
-/// least 10 s after the interval became eligible. Its lines carry the
+/// least 10 s after the interval became eligible, and every uncopied
+/// `spans` log entry is a merge or an insert's fetch committed to the log
+/// at least 10 s after that eligibility. Its lines carry the
 /// `--@cluster` prefix, which the render strips with the indentation after
 /// it.
 const SERVICE_EDGES_BARRIER: &str = r#"
 least(ready, lo + INTERVAL 5 MINUTE) AS hi0,
 (SELECT groupArray(name) FROM system.parts WHERE database = 'pulsus' AND table = 'spans' AND active AND has(arrayMap(e -> e.4, entries), name)) AS local_named,
-edges_ok AND arrayAll(e -> e.1 OR e.2 = 'merge' OR (e.2 IN ('get', 'attach') AND e.5 != '' AND e.4 != '' AND toUnixTimestamp(e.3) > 0 AND (has(local_named, e.4) OR (e.2 = 'get' AND e.3 >= hi0 + INTERVAL 3 MINUTE + INTERVAL 10 SECOND))), entries) AS caught_up,
+edges_ok AND arrayAll(x -> x.2 OR arrayAll(e -> e.1 < x.4 OR e.3 = 'merge' OR (e.3 = 'get' AND e.4 != '' AND e.2 >= hi0 + INTERVAL 3 MINUTE + INTERVAL 10 SECOND), logents), logs) AND arrayAll(e -> e.1 OR e.2 = 'merge' OR (e.2 IN ('get', 'attach') AND e.5 != '' AND e.4 != '' AND toUnixTimestamp(e.3) > 0 AND (has(local_named, e.4) OR (e.2 = 'get' AND e.3 >= hi0 + INTERVAL 3 MINUTE + INTERVAL 10 SECOND))), entries) AS caught_up,
 if(caught_up, hi0, lo) AS hi,
 "#;
 

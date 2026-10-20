@@ -2569,7 +2569,7 @@ async fn a_rebuilt_replica_waits_for_the_shard() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_replica_behind_on_the_log_writes_nothing() {
     skip_unless_live!();
-    let r = Replicas::new("k8").await;
+    let r = Replicas::new_current("k8").await;
     let (db, l) = (r.db.clone(), r.l);
     exec(&r.s1b, "SYSTEM STOP PULLING REPLICATION LOG spans").await;
     push_g(&r.s1, l, 0..8).await;
@@ -2581,6 +2581,9 @@ async fn a_replica_behind_on_the_log_writes_nothing() {
         s.log_max_index >= 7
     })
     .await;
+    // Part C: G's entries, committed before its interval became eligible,
+    // hold the run though they are not copied.
+    r.wait_eligible().await;
     for when in ["before", "after"] {
         let spans = replica_state(&r.s1b, &db, "spans").await;
         assert!(
@@ -3787,5 +3790,288 @@ async fn the_job_keeps_up_under_steady_ingest() {
         worst_lag <= 5 * MINUTE,
         "LV1: the lag after every completed run is at most 5 min: {lags:?}"
     );
+    r.drop().await;
+}
+
+/// One entry of `db.spans`' replication log at or past this node's
+/// pointer: its index, its Keeper commit time (Unix seconds) and its fields.
+async fn uncopied_entries(client: &ChClient, db: &str) -> Vec<(u64, i64, Entry)> {
+    let zk_path = strings(
+        client,
+        &format!(
+            "SELECT zookeeper_path AS s FROM system.replicas WHERE database = '{db}' \
+             AND table = 'spans'"
+        ),
+    )
+    .await[0]
+        .clone();
+    let pointer = replica_state(client, db, "spans").await.log_pointer;
+    strings(
+        client,
+        &format!(
+            "SELECT concat(substring(name, 5), '|', toString(toUnixTimestamp(ctime)), '|', \
+             value) AS s FROM system.zookeeper WHERE path = '{zk_path}/log' ORDER BY name"
+        ),
+    )
+    .await
+    .iter()
+    .filter_map(|row| {
+        let mut parts = row.splitn(3, '|');
+        let index: u64 = parts.next()?.parse().expect("a log index");
+        let ctime: i64 = parts.next()?.parse().expect("a commit time");
+        let value = parts.next().unwrap_or_default();
+        (index >= pointer).then(|| (index, ctime, Entry::parse(value)))
+    })
+    .collect()
+}
+
+/// Polls until `db.spans`' uncopied entries on this node satisfy `want`,
+/// for up to `secs`; the test fails, rather than goes on, if they never do.
+async fn wait_uncopied(
+    client: &ChClient,
+    db: &str,
+    what: &str,
+    secs: u64,
+    want: impl Fn(&[(u64, i64, Entry)]) -> bool,
+) -> Vec<(u64, i64, Entry)> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+    loop {
+        let entries = uncopied_entries(client, db).await;
+        if want(&entries) {
+            return entries;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what}: the uncopied log never reached the state: {} entries, the first {:?}",
+            entries.len(),
+            entries.first()
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// `n` one-row inserts into the node's `spans`, each starting now.
+async fn one_row_inserts(client: &ChClient, tag: &str, n: u32) {
+    for i in 0..n {
+        exec(
+            client,
+            &format!(
+                "INSERT INTO spans (trace_id, span_id, parent_span_id, start_ns, duration_ns, \
+                 service, name, kind, attrs, end_ns, service_type) \
+                 SELECT sipHash128('{tag}', {i}), reinterpretAsFixedString(cityHash64('{tag}', {i})), \
+                        toFixedString('', 8), toInt64(toUnixTimestamp64Nano(now64(9))) AS st, 1000, \
+                        'svc-{tag}', 'op', 1, CAST('{{}}', 'JSON'), toUInt64(st + 1000), 'string'"
+            ),
+        )
+        .await;
+    }
+}
+
+/// The node's totals over `[L, L + 5 min)` are fixture G's answer, read
+/// from `service_edges` on that node alone.
+async fn assert_totals_g1(client: &ChClient, l: i64, what: &str) {
+    let got = strings(
+        client,
+        &format!(
+            "SELECT concat(client, ' ', server, ' ', conn_type, ' ', toString(sum(calls)), ' ', \
+                    toString(sum(failed))) AS s \
+             FROM service_edges FINAL WHERE conn_type != '' \
+             AND minute >= toDateTime({lo}, 'UTC') AND minute < toDateTime({hi}, 'UTC') \
+             GROUP BY client, server, conn_type ORDER BY s",
+            lo = l / S,
+            hi = (l + 5 * MINUTE) / S
+        ),
+    )
+    .await;
+    let mut want: Vec<String> = g1_rows()
+        .into_iter()
+        .map(|(c, s, t, n, f, _)| format!("{c} {s} {t} {n} {f}"))
+        .collect();
+    want.sort();
+    assert_eq!(got, want, "{what}: fixture G's edges in the node's totals");
+}
+
+/// KC13: a replica whose copier is behind, with only late insert fetches
+/// uncopied, still finalizes the interval.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replica_copying_its_log_late_still_finalizes() {
+    skip_unless_live!();
+    let r = Replicas::new("kc13").await;
+    let (db, l) = (r.db.clone(), r.l);
+    push_g(&r.s1, l, 0..8).await;
+    wait_synced(&[&r.s1, &r.s1b], &db, "KC13: G on both replicas").await;
+    exec(&r.s1b, "SYSTEM STOP PULLING REPLICATION LOG spans").await;
+    one_row_inserts(&r.s1, "kc13", 5).await;
+    let late = wait_uncopied(&r.s1b, &db, "KC13: five entries uncopied", 120, |e| {
+        e.len() >= 5
+    })
+    .await;
+    let state = replica_state(&r.s1b, &db, "spans").await;
+    assert!(
+        state.log_pointer <= state.log_max_index,
+        "KC13: ch-shard1b's log reads not copied: {state:?}"
+    );
+    refresh_on(&r.s1b, &db, "KC13: ch-shard1b's run").await;
+    assert_covers_g(&r.s1b, l, &format!("KC13: the run over {late:?}")).await;
+    assert_totals_g1(&r.s1b, l, "KC13").await;
+    exec(&r.s1b, "SYSTEM START PULLING REPLICATION LOG spans").await;
+    r.drop().await;
+}
+
+/// KC14: an uncopied merge does not hold the run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_uncopied_merge_does_not_hold_the_run() {
+    skip_unless_live!();
+    let r = Replicas::new("kc14").await;
+    let (db, l) = (r.db.clone(), r.l);
+    push_g(&r.s1, l, 0..8).await;
+    wait_synced(&[&r.s1, &r.s1b], &db, "KC14: G on both replicas").await;
+    exec(&r.s1b, "SYSTEM STOP PULLING REPLICATION LOG spans").await;
+    exec(&r.s1, "SYSTEM START MERGES spans").await;
+    let id = g_partition(&r.s1, &db, "spans").await;
+    exec(
+        &r.s1,
+        &format!("OPTIMIZE TABLE spans PARTITION ID '{id}' FINAL"),
+    )
+    .await;
+    let uncopied = wait_uncopied(&r.s1b, &db, "KC14: the merge uncopied", 120, |e| {
+        !e.is_empty() && e.iter().all(|(_, _, x)| x.kind == "merge")
+    })
+    .await;
+    refresh_on(&r.s1b, &db, "KC14: ch-shard1b's run").await;
+    assert_covers_g(&r.s1b, l, &format!("KC14: the run over {uncopied:?}")).await;
+    assert_totals_g1(&r.s1b, l, "KC14").await;
+    exec(&r.s1b, "SYSTEM START PULLING REPLICATION LOG spans").await;
+    r.drop().await;
+}
+
+/// KC15: an uncopied attach, committed after eligibility, holds the run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_uncopied_late_attach_holds_the_run() {
+    skip_unless_live!();
+    let r = Replicas::new("kc15").await;
+    let (db, l) = (r.db.clone(), r.l);
+    push_g(&r.s1, l, 0..8).await;
+    wait_synced(&[&r.s1, &r.s1b], &db, "KC15: G on both replicas").await;
+    let id = g_partition(&r.s1, &db, "spans").await;
+    exec(
+        &r.s1,
+        &format!("ALTER TABLE spans DETACH PARTITION ID '{id}'"),
+    )
+    .await;
+    wait_synced(&[&r.s1, &r.s1b], &db, "KC15: detached").await;
+    exec(&r.s1b, "SYSTEM STOP PULLING REPLICATION LOG spans").await;
+    exec(
+        &r.s1,
+        &format!("ALTER TABLE spans ATTACH PARTITION ID '{id}'"),
+    )
+    .await;
+    let uncopied = wait_uncopied(&r.s1b, &db, "KC15: the attach uncopied", 120, |e| {
+        !e.is_empty() && e.iter().all(|(_, _, x)| x.kind == "attach")
+    })
+    .await;
+    refresh_on(&r.s1b, &db, "KC15: ch-shard1b's run").await;
+    assert_no_new_marker(&r.s1b, l, &format!("KC15: the run over {uncopied:?}")).await;
+    exec(&r.s1b, "SYSTEM START PULLING REPLICATION LOG spans").await;
+    wait_synced(&[&r.s1, &r.s1b], &db, "KC15: attached").await;
+    refresh_until(
+        &r.s1b,
+        &db,
+        l + 4 * MINUTE,
+        4,
+        "KC15: the run after the copy",
+    )
+    .await;
+    r.assert_route_g1("KC15").await;
+    r.drop().await;
+}
+
+/// KC16: uncopied entries committed within 10 s of a later interval's
+/// eligibility are judged against the eligibility of the interval being
+/// finalized, long past, and pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn uncopied_entries_are_judged_against_the_interval_being_finalized() {
+    skip_unless_live!();
+    let r = Replicas::new("kc16").await;
+    let (db, l) = (r.db.clone(), r.l);
+    push_g(&r.s1, l, 0..8).await;
+    wait_synced(&[&r.s1, &r.s1b], &db, "KC16: G on both replicas").await;
+    exec(&r.s1b, "SYSTEM STOP PULLING REPLICATION LOG spans").await;
+    // An eligibility: 180 s into an interval, at most 5 min away.
+    let deadline = std::time::Instant::now() + Duration::from_secs(330);
+    let eligibility = loop {
+        let now = server_now_us(&r.s1).await / 1_000_000;
+        if now.rem_euclid(300) == 180 {
+            break now;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "KC16: no eligibility reached"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    one_row_inserts(&r.s1, "kc16", 5).await;
+    let uncopied = wait_uncopied(&r.s1b, &db, "KC16: five entries uncopied", 60, |e| {
+        e.len() >= 5
+    })
+    .await;
+    for (index, ctime, e) in &uncopied {
+        assert!(
+            *ctime < eligibility + 10,
+            "KC16: entry {index} ({e:?}) committed at {ctime}, before the eligibility at \
+             {eligibility} + 10 s"
+        );
+    }
+    refresh_on(&r.s1b, &db, "KC16: ch-shard1b's run").await;
+    let after = server_now_us(&r.s1b).await / 1_000_000;
+    assert!(
+        after < eligibility + 300,
+        "KC16: the run came before the next eligibility: {after}"
+    );
+    assert_covers_g(&r.s1b, l, "KC16: ch-shard1b's run").await;
+    assert_totals_g1(&r.s1b, l, "KC16").await;
+    exec(&r.s1b, "SYSTEM START PULLING REPLICATION LOG spans").await;
+    r.drop().await;
+}
+
+/// KC17: a log with more than 10,000 uncopied entries holds the run; once
+/// copied, the interval is finalized.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_log_over_the_cap_holds_the_run() {
+    skip_unless_live!();
+    let r = Replicas::new("kc17").await;
+    let (db, l) = (r.db.clone(), r.l);
+    push_g(&r.s1, l, 0..8).await;
+    wait_synced(&[&r.s1, &r.s1b], &db, "KC17: G on both replicas").await;
+    exec(&r.s1b, "SYSTEM STOP PULLING REPLICATION LOG spans").await;
+    // 101 inserts of 100 rows, each row in its own day of the next 100:
+    // one part per day per insert.
+    for i in 0..101 {
+        exec(
+            &r.s1,
+            &format!(
+                "INSERT INTO spans (trace_id, span_id, parent_span_id, start_ns, duration_ns, \
+                 service, name, kind, attrs, end_ns, service_type) \
+                 SELECT sipHash128('kc17', {i}, number), \
+                        reinterpretAsFixedString(cityHash64('kc17', {i}, number)), \
+                        toFixedString('', 8), \
+                        toInt64(toUnixTimestamp64Nano(now64(9))) + toInt64(number + 1) * 86400000000000 AS st, \
+                        1000, 'svc-kc17', 'op', 1, CAST('{{}}', 'JSON'), toUInt64(st + 1000), 'string' \
+                 FROM numbers(100)"
+            ),
+        )
+        .await;
+    }
+    let n = wait_uncopied(&r.s1b, &db, "KC17: over 10,000 uncopied", 120, |e| {
+        e.len() > 10_000
+    })
+    .await
+    .len();
+    refresh_on(&r.s1b, &db, "KC17: ch-shard1b's run over the cap").await;
+    assert_no_new_marker(&r.s1b, l, &format!("KC17: the run over {n} uncopied")).await;
+    exec(&r.s1b, "SYSTEM START PULLING REPLICATION LOG spans").await;
+    wait_synced(&[&r.s1b], &db, "KC17: copied").await;
+    refresh_on(&r.s1b, &db, "KC17: ch-shard1b's run after the copy").await;
+    assert_covers_g(&r.s1b, l, "KC17: the run after the copy").await;
     r.drop().await;
 }
