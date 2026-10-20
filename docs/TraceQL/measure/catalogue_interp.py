@@ -40,7 +40,7 @@ KIND_KEYWORDS = [k for k, _ in sorted(KIND_CODE.items(), key=lambda kv: kv[1])]
 STATUS_KEYWORDS = [k for k, _ in sorted(STATUS_CODE.items(), key=lambda kv: kv[1])]
 # The stored type each fixture value has, in the words the statement's `type`
 # column carries.
-VALUE_TYPE = {'s': 'string', 'i': 'int', 'd': 'double', 'b': 'bool', 'as': 'array'}
+VALUE_TYPE = {'s': 'string', 'i': 'int', 'd': 'double', 'b': 'bool', 'a': 'array'}
 
 
 def duration_ns(e):
@@ -56,6 +56,9 @@ class Fixture:
     def __init__(self, path):
         self.rows = [json.loads(l) for l in open(path)]
         for r in self.rows:
+            # `docs/api.md` §4.2: an array whose elements are of two types has
+            # no TraceQL type and is missing (#600 part 1b-3)
+            r['attrs'] = [a for a in r['attrs'] if a[1] != 'a' or len({e[0] for e in a[2]}) <= 1]
             r['attrs_map'] = {k: (t, v) for k, t, v in r['attrs']}
             r['res_map'] = {k: (t, v) for k, t, v in r['resource']}
             r['scope_map'] = {k: (t, v) for k, t, v in r.get('scope_attrs', [])}
@@ -133,6 +136,8 @@ def arm(t, v):
     in decimal, a boolean `boolValue`, a double `doubleValue` in full
     decimal notation with no exponent and no trailing `.0`"""
     if t == 'string': return ['stringValue', v]
+    # an array as the JSON text of its elements (#600 part 1b-3)
+    if t == 'array': return ['stringValue', json.dumps([e for _, e in v], separators=(',', ':'))]
     if t == 'int': return ['intValue', str(v)]
     if t == 'bool': return ['boolValue', 'true' if v else 'false']
     v = float(v)
@@ -659,6 +664,12 @@ class Interp:
             code = 'N' if (f['scope'], f['key']) in self.WELL_KNOWN else 'n'
             return ('', code), (name, ('string', 'nil'))
         t, v = got
+        if t == 'a':
+            # each distinct array is its own series labelled `nil`, ordered by
+            # the engine's text of it, `['x','y']` (`docs/api.md` §4.4;
+            # #600 part 1b-3)
+            text = '[' + ','.join(f"'{e}'" if et == 's' else str(e) for et, e in v) + ']'
+            return (text, 'a'), (name, ('string', 'nil'))
         text = ('true' if v else 'false') if t == 'b' else str(v)
         return (text, t), (name, (self.LABEL_TYPE[t], v))
 

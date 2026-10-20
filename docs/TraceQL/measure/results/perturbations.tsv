@@ -12,17 +12,17 @@ child_interp	interpreter	red	5	0	0	0	0	noticed	PASS	`{A} > {B}`: B is a child of
 sibling_interp	interpreter	red	4	0	0	0	0	noticed	PASS	a sibling is not the span itself
 union_interp	interpreter	red	2	0	0	0	0	noticed	PASS	a union form returns both participating sides
 descendant_interp	interpreter	red	1	0	0	0	0	noticed	PASS	`>>` climbs past the first parent
-limit_interp	interpreter	red	72	0	0	0	0	noticed	PASS	a search returns at most LIMIT traces
-spss_interp	interpreter	red	54	0	0	0	0	noticed	PASS	a spanset carries at most SPSS spans
-trace_order_interp	interpreter	red	93	0	0	0	0	noticed	PASS	the traces come back newest first
-group_missing_interp	interpreter	red	4	0	0	0	0	noticed	PASS	a span lacking the `by()` key is grouped under `nil`
+limit_interp	interpreter	red	74	0	0	0	0	noticed	PASS	a search returns at most LIMIT traces
+spss_interp	interpreter	red	56	0	0	0	0	noticed	PASS	a spanset carries at most SPSS spans
+trace_order_interp	interpreter	red	95	0	0	0	0	noticed	PASS	the traces come back newest first
+group_missing_interp	interpreter	red	5	0	0	0	0	noticed	PASS	a span lacking the `by()` key is grouped under `nil`
 coalesce_interp	interpreter	red	1	0	0	0	0	noticed	PASS	`| coalesce()` drops the key `by()` added
-step_label_interp	interpreter	red	0	29	0	0	0	noticed	PASS	a bucket is labelled by the instant that closes it
+step_label_interp	interpreter	red	0	31	0	0	0	noticed	PASS	a bucket is labelled by the instant that closes it
 histogram_interp	interpreter	red	0	1	0	0	0	noticed	PASS	the log2 bucket is the smallest power of two at or above the duration
 topk_interp	interpreter	red	0	4	0	0	0	noticed	PASS	`topk` keeps the largest series, `bottomk` the smallest
-exemplar_interp	interpreter	red	0	21	0	0	0	noticed	PASS	the exemplar is the bucket’s longest span
-compare_type_interp	interpreter	red	0	14	0	0	0	noticed	PASS	`compare()` keeps a value distinct per stored type
-root_rule_interp	interpreter	red	43	6	0	0	0	noticed	PASS	a root is a span with no parent id, never an orphan whose parent id names a span not stored
+exemplar_interp	interpreter	red	0	23	0	0	0	noticed	PASS	the exemplar is the bucket’s longest span
+compare_type_interp	interpreter	red	0	16	0	0	0	noticed	PASS	`compare()` keeps a value distinct per stored type
+root_rule_interp	interpreter	red	45	8	0	0	0	noticed	PASS	a root is a span with no parent id, never an orphan whose parent id names a span not stored
 childcount_interp	interpreter	red	1	2	0	0	0	noticed	PASS	`childCount` counts the spans whose parent is this span
 trace_duration_interp	interpreter	red	3	0	0	0	0	noticed	PASS	`trace:duration` is the whole trace’s extent
 event_existential_interp	interpreter	red	18	2	0	0	0	noticed	PASS	an event intrinsic asks whether ANY event satisfies it
@@ -34,15 +34,19 @@ struct_op_parse	parser	red	1	0	0	0	1	noticed	PASS	`>>` is the descendant operato
 status_names_parse	parser	red	5	0	0	0	1	noticed	PASS	`error` is a status keyword, not an attribute name
 intrinsic_set_parse	parser	red	14	19	0	1	6	noticed	PASS	`duration` is an intrinsic, not an attribute name
 duration_unit_interp	interpreter	red	3	0	0	0	0	noticed	PASS	a millisecond is 10^6 nanoseconds
-group_order_interp	interpreter	red	5	0	0	0	0	noticed	PASS	the groups come back in first-appearance order
-compare_service_interp	interpreter	red	0	14	0	0	0	noticed	PASS	`resource.service.name` is counted from the span’s own column
-compare_resource_interp	interpreter	red	0	14	0	0	0	noticed	PASS	the resource scope is in `compare()`’s key universe
-compare_keyword_interp	interpreter	red	0	14	0	0	0	noticed	PASS	`kind` and `status` are counted as the keywords the API returns
-compare_topn_interp	interpreter	red	0	14	0	0	0	noticed	PASS	`topN` is applied per key and per side, not as one cap
+group_order_interp	interpreter	red	6	0	0	0	0	noticed	PASS	the groups come back in first-appearance order
+compare_service_interp	interpreter	red	0	16	0	0	0	noticed	PASS	`resource.service.name` is counted from the span’s own column
+compare_resource_interp	interpreter	red	0	16	0	0	0	noticed	PASS	the resource scope is in `compare()`’s key universe
+compare_keyword_interp	interpreter	red	0	16	0	0	0	noticed	PASS	`kind` and `status` are counted as the keywords the API returns
+compare_topn_interp	interpreter	red	0	16	0	0	0	noticed	PASS	`topN` is applied per key and per side, not as one cap
 exemplar_off_interp	interpreter	red	0	1	0	0	0	noticed	PASS	`with(exemplars=false)` turns the exemplar column off
-matched_count_interp	interpreter	red	134	0	0	0	0	noticed	PASS	`matched` is how many spans of the trace the query kept
-root_columns_interp	interpreter	red	154	0	0	0	0	noticed	PASS	the trace row carries the root service and the root name, in that order
-presence_interp	interpreter	red	3	2	0	0	0	noticed	PASS	`!= nil` is presence: the key is stored
-select_projection_interp	interpreter	red	5	0	0	0	0	noticed	PASS	`select()` adds a projected slot to each span tuple
+matched_count_interp	interpreter	red	136	0	0	0	0	noticed	PASS	`matched` is how many spans of the trace the query kept
+root_columns_interp	interpreter	red	157	0	0	0	0	noticed	PASS	the trace row carries the root service and the root name, in that order
+presence_interp	interpreter	red	5	4	0	0	0	noticed	PASS	`!= nil` is presence: the key is stored
+select_projection_interp	interpreter	red	6	0	0	0	0	noticed	PASS	`select()` adds a projected slot to each span tuple
 spanset_and_interp	interpreter	red	3	0	0	0	0	noticed	PASS	`{A} && {B}` keeps only traces carrying both sides
 group_type_interp	interpreter	red	2	0	0	0	0	noticed	PASS	an attribute `by()` group carries its stored type, so two values with the same label stay two groups
+array_mixed_interp	interpreter	red	4	6	0	0	0	noticed	PASS	an array of two element types is missing
+array_render_interp	interpreter	red	3	0	0	0	0	noticed	PASS	an array is the compact JSON text of its elements
+array_compare_interp	interpreter	red	0	8	0	0	0	noticed	PASS	an array value is not counted in `compare()`
+array_series_interp	interpreter	red	0	2	0	0	0	noticed	PASS	each distinct array is its own `nil` series on the metrics routes
