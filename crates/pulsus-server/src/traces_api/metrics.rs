@@ -44,9 +44,10 @@ pub(crate) async fn metrics_query(
 }
 
 async fn metrics_impl(state: AppState, raw: &str, form: MetricsForm) -> Result<Response, ApiError> {
-    let params = params::parse_metrics_params(raw, super::tags::now_unix_nanos(), form)?;
+    let now_ns = super::tags::now_unix_nanos();
+    let params = params::parse_metrics_params(raw, now_ns, form)?;
     // Issue #596 part 1: the reference's step limit, on the range route
-    // only; the instant route keeps its step.
+    // only; the instant route reads no step.
     if form == MetricsForm::Range {
         params::check_range_intervals(&params)?;
     }
@@ -76,7 +77,9 @@ async fn metrics_impl(state: AppState, raw: &str, form: MetricsForm) -> Result<R
         end_ns: params.end_ns,
         step_ms: params.step_ms,
         exemplars: params.exemplars,
-        floor_ns: i64::MIN,
+        // docs/api.md §4, "Retention": no statement reads a span older
+        // than the retention cutoff, whether or not storage still holds it.
+        floor_ns: params::retention_floor_ns(state.config.retention_days, now_ns),
     };
     // Issue #596 part 1: the statement on `spans` where it serves the
     // query, today's planner on the query itself where it does not.
@@ -262,7 +265,7 @@ mod tests {
 
     /// D13: a range of more than 10,000 steps answers `400` in the
     /// reference's words; exactly 10,000 is served, and the instant route
-    /// keeps its step.
+    /// reads no step.
     #[tokio::test]
     async fn a_range_over_ten_thousand_intervals_is_the_reference_400() {
         let window = "start=1700000000&end=1700010800";

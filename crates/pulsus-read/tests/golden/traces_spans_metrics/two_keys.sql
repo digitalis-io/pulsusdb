@@ -25,10 +25,10 @@ ORDER BY g, o
 
 == instant ==
 SELECT g, o, [(toInt64(1791410820000), v)] AS points, CAST([], 'Array(Tuple(FixedString(16), Int64, Float64))') AS exemplars, 0 AS f
-FROM (SELECT g, o, v FROM (SELECT g, o, v, throwIf(count() OVER () > 1000, 'metrics series cap') AS over FROM (SELECT arrayMap(x -> if(x.2 IN ('n', 'N'), ('', x.2), x), [if(service_type = 'string', (toString(service), 's'), ('', 'N')), (toString(attrs.`http%2Eroute`), multiIf(dynamicType(attrs.`http%2Eroute`) = 'Int64', 'i', dynamicType(attrs.`http%2Eroute`) = 'Float64', 'd', dynamicType(attrs.`http%2Eroute`) = 'Bool', 'b', dynamicType(attrs.`http%2Eroute`) = 'String', 's', NOT (dynamicType(attrs.`http%2Eroute`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))')), 'n', 'a'))]) AS g, toUInt64(0) AS o, toFloat64(count()) / 10860 AS v
+FROM (SELECT g, o, v FROM (SELECT g, o, v, throwIf(count() OVER () > 1000, 'metrics series cap') AS over FROM (SELECT arrayMap(x -> if(x.2 IN ('n', 'N'), ('', x.2), x), [if(service_type = 'string', (toString(service), 's'), ('', 'N')), (toString(attrs.`http%2Eroute`), multiIf(dynamicType(attrs.`http%2Eroute`) = 'Int64', 'i', dynamicType(attrs.`http%2Eroute`) = 'Float64', 'd', dynamicType(attrs.`http%2Eroute`) = 'Bool', 'b', dynamicType(attrs.`http%2Eroute`) = 'String', 's', NOT (dynamicType(attrs.`http%2Eroute`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))')), 'n', 'a'))]) AS g, toUInt64(0) AS o, toFloat64(count()) / 10800 AS v
 FROM spans
-WHERE start_ns >= 1791399960000000000 AND start_ns < 1791410820000000000
-  AND intDiv(start_ns, 300000000000) BETWEEN intDiv(1791399960000000000, 300000000000) AND intDiv(1791410819999999999, 300000000000)
+WHERE start_ns >= 1791400000000000000 AND start_ns < 1791410800000000000
+  AND intDiv(start_ns, 300000000000) BETWEEN intDiv(1791400000000000000, 300000000000) AND intDiv(1791410799999999999, 300000000000)
   AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') >= toDate('2026-10-07') AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') <= toDate('2026-10-07')
   AND (true)
 GROUP BY g, o)) WHERE over = 0)

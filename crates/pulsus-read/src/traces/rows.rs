@@ -28,7 +28,7 @@ pub struct MetricBucketRow {
 }
 
 /// One metrics instant-query row (`metrics_sql::metrics_instant_sql`):
-/// the whole snapped window's deduped count — always exactly one row
+/// the whole instant window's deduped count — always exactly one row
 /// (aggregate with no `GROUP BY`). Also the shape of the by()-series
 /// distinct-by-key probe (`metrics_series_probe_sql`, issue #182): the
 /// probe's `count()` of distinct label-sets, capped at `cap+1`.
@@ -129,7 +129,7 @@ pub struct MetricLog2BucketRow {
 }
 
 /// One `histogram_over_time` instant-form tally row — the same
-/// `(bucket, count)` over the whole snapped window, no time bucket.
+/// `(bucket, count)` over the whole instant window, no time bucket.
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct MetricLog2BucketInstantRow {
     #[serde(rename = "bucket")]

@@ -976,9 +976,12 @@ mod tests {
             ),
             (
                 "GraphParam",
-                ApiError::GraphParam(GraphParamError::MissingRange),
+                ApiError::GraphParam(GraphParamError::InvalidRange {
+                    start: 200,
+                    end: 100,
+                }),
                 StatusCode::BAD_REQUEST,
-                r#"missing required parameters: supply start and end (unix seconds), or since"#,
+                r#"invalid range: end (100) must be greater than start (200)"#,
                 None,
             ),
             (

@@ -15,7 +15,7 @@ ORDER BY t ASC
 WITH arrayFirstIndex((k, s) -> k = 'foo' AND s = 'span', attr_key, attr_scope) AS pi0
 SELECT uniqExact(trace_id, span_id) AS n
 FROM trace_spans
-WHERE timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000
+WHERE timestamp_ns >= 1700000000000000000 AND timestamp_ns < 1700010800000000000
   AND ((((pi0 != 0) AND attr_val[pi0] = 'x') OR duration_ns > 2000000000) AND status_code = 2)
 
 == exemplars ==

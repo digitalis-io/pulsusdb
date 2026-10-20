@@ -448,7 +448,7 @@ that costs 75% of the storage.**
 
 And the request that reads it already computes a window and throws it away. The
 values route parses `start`/`end`, defaulting to `traceql_tag_lookback` = 24 h
-(`crates/pulsus-config/src/model.rs:553`, `crates/pulsus-server/src/traces_api/tags.rs:161-164`), then calls
+(`crates/pulsus-config/src/model.rs:553`, `crates/pulsus-server/src/traces_api/tags.rs:165-168`), then calls
 `tag_values_sql` (`crates/pulsus-read/src/traces/spans/tags.rs:89-99`), which emits no time predicate at all —
 because the table it reads has no time column.
 
@@ -4394,13 +4394,13 @@ The image line (`:571`) is shown at today's floor; the source quoted here pinned
 
 ### `crates/pulsus-server/src/traces_api/tags.rs`
 
-**`:161-164`**
+**`:165-168`**
 
 ```rust
-  161  /// The window the values routes read over when the client supplies none.
-  162  pub(super) fn tag_lookback_ns(state: &AppState) -> i64 {
-  163      i64::try_from(state.config.reader.traceql_tag_lookback.0.as_nanos()).unwrap_or(i64::MAX)
-  164  }
+  165  /// The window the values routes read over when the client supplies none.
+  166  pub(super) fn tag_lookback_ns(state: &AppState) -> i64 {
+  167      i64::try_from(state.config.reader.traceql_tag_lookback.0.as_nanos()).unwrap_or(i64::MAX)
+  168  }
 ```
 
 ### `crates/pulsus-read/src/traces/tags_sql.rs`

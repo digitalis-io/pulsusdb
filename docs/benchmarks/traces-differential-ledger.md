@@ -4043,3 +4043,13 @@ Applies to `GET /api/traces/v1/search` and its alias.
 - **Not established:** the reference's mechanism. The comparison was not located in its source, so this is a
   recorded observation and not an entry of `docs/reference-defects-we-do-not-copy.md`, which lists it under the
   claims it deliberately does not make.
+
+### `traceql-request-parameters-against-the-reference` (issue #601 part 2) — **request parameters read against the reference's source**
+
+| parameter | the reference | here | disposition |
+|---|---|---|---|
+| a search with no `start` and `end` | searches its in-memory stores | `400` | divergence: no stored-window counterpart; the trace datasource sends both |
+| a search or tag window over 168 h; a metrics window over 24 h | `400` at its defaults | answered within the read budgets | divergence |
+| `minDuration`/`maxDuration` | cut to whole milliseconds; a negative value wraps | exact nanoseconds; a negative value is `400` | divergence |
+| tag `maxStaleValues` | an early stop after N values already seen | ignored | divergence: the early stop can under-report |
+| a span past retention that storage still holds | shown until its block is deleted | not returned by a windowed read | divergence |

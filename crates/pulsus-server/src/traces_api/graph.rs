@@ -34,9 +34,15 @@ pub(crate) async fn service_graph(
 }
 
 async fn graph_impl(state: AppState, raw: &str) -> Result<Response, ApiError> {
-    let params = params::parse_graph_params(raw, super::tags::now_unix_nanos())?;
+    let now_ns = super::tags::now_unix_nanos();
+    let params = params::parse_graph_params(raw, now_ns)?;
+    // docs/api.md §4, "Retention": the window starts at the cutoff.
     let window = GraphWindow {
-        start_ns: params.start_ns,
+        start_ns: params::floored_start(
+            params.start_ns,
+            params.end_ns,
+            params::retention_floor_ns(state.config.retention_days, now_ns),
+        ),
         end_ns: params.end_ns,
     };
 

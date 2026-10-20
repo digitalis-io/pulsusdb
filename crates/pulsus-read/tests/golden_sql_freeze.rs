@@ -497,7 +497,15 @@ const CORPORA: [(&str, usize); 3] = [
 /// engine's, deleted with its tests; the digest now covers `traces_metrics`
 /// alone, and no `traces_metrics` file moved. The suites the entries above
 /// name as gates over that corpus went with it.
-const PINNED_SQL_CORPUS: u64 = 0xc6f0_52ca_842d_d404;
+///
+/// **Moved on issue #601 part 2: 27 `traces_metrics` files MODIFIED, 0
+/// added, 0 removed, 38 lines, every one in an instant section or an
+/// instant series probe.** The instant form reads exactly the requested
+/// window instead of the window snapped to the step, and these cases ask
+/// for an unaligned one (`1700000000` is not a multiple of 60 s), so the
+/// instant bounds, their day literals and the instant `rate` divisor
+/// (10,860 s → 10,800 s) move. No range section moves.
+const PINNED_SQL_CORPUS: u64 = 0x4c64_a9dc_2a57_af5c;
 
 fn golden_dir(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -659,11 +667,13 @@ const PINNED_SPANS_SEARCH_CORPUS: u64 = 0x7c29_1eb9_f6f7_5179;
 /// tests read only the types the reference holds; three by issue #600
 /// part 3, whose `*_over_time` exemplar carries its span's own value;
 /// thirteen by issue #600 part 1b-3, whose series key folds a value with no
-/// TraceQL type into the missing series), each the
+/// TraceQL type into the missing series; all twenty-three by issue #601
+/// part 2, whose instant form reads the requested window unsnapped — only
+/// the instant statements' bounds and `rate` divisor move), each the
 /// range and instant forms of one request of
 /// `crates/pulsus-read/src/traces/spans/metrics.rs`'s `metrics_statement`,
 /// under [`corpus_digest`]'s encoding.
-const PINNED_SPANS_METRICS_CORPUS: u64 = 0xed8b_a278_8160_cb9b;
+const PINNED_SPANS_METRICS_CORPUS: u64 = 0x8ba2_514b_7a3d_776f;
 
 #[test]
 fn the_sql_golden_corpus_matches_its_committed_digest() {

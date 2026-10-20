@@ -15,9 +15,12 @@
 //!   key with no `=`, an empty key, or an unterminated quote is a `400`
 //!   — every grammar error names a byte offset into the decoded `tags`
 //!   value, inside its message.
-//! - `minDuration`/`maxDuration` compile to `duration >= <lit>` /
-//!   `duration <= <lit>` conjuncts; a malformed duration surfaces as the
-//!   parser's positioned error → `400`.
+//! - a `tags` key given twice is a `400`, as the reference refuses it.
+//! - `minDuration`/`maxDuration` are Go durations (the reference's
+//!   `time.ParseDuration`) and compile to `duration >= <n>ns` /
+//!   `duration <= <n>ns` conjuncts, exact to the nanosecond where the
+//!   reference cuts to whole milliseconds; a malformed or negative one, or
+//!   a `minDuration` above the `maxDuration`, is a `400`.
 //! - All conjuncts join with `&&` inside one `{ … }`; empty legacy input
 //!   compiles to `{}` (match-all, time-bounded).
 
@@ -200,21 +203,118 @@ pub(crate) fn compile_legacy(
 ) -> Result<String, LegacyError> {
     let mut conjuncts: Vec<String> = Vec::new();
     if let Some(tags) = tags {
+        let mut seen: Vec<String> = Vec::new();
         for pair in parse_logfmt(tags)? {
+            if seen.contains(&pair.key) {
+                return Err(LegacyError::DuplicateKey { key: pair.key });
+            }
             conjuncts.push(format!(".{}={}", pair.key, quote(&pair.value)));
+            seen.push(pair.key);
         }
     }
-    if let Some(min) = min_duration {
-        conjuncts.push(format!("duration >= {min}"));
+    let min_ns = min_duration
+        .map(|raw| legacy_duration_ns("minDuration", raw))
+        .transpose()?;
+    let max_ns = max_duration
+        .map(|raw| legacy_duration_ns("maxDuration", raw))
+        .transpose()?;
+    if let (Some(min), Some(max), Some(min_raw), Some(max_raw)) =
+        (min_ns, max_ns, min_duration, max_duration)
+        && min > 0
+        && min > max
+    {
+        return Err(LegacyError::MinAboveMax {
+            min: min_raw.to_string(),
+            max: max_raw.to_string(),
+        });
     }
-    if let Some(max) = max_duration {
-        conjuncts.push(format!("duration <= {max}"));
+    if let Some(min) = min_ns {
+        conjuncts.push(format!("duration >= {min}ns"));
+    }
+    if let Some(max) = max_ns {
+        conjuncts.push(format!("duration <= {max}ns"));
     }
     if conjuncts.is_empty() {
         Ok("{}".to_string())
     } else {
         Ok(format!("{{ {} }}", conjuncts.join(" && ")))
     }
+}
+
+/// One legacy duration parameter in nanoseconds: refused when it is not
+/// a Go duration or is negative.
+fn legacy_duration_ns(name: &'static str, raw: &str) -> Result<i64, LegacyError> {
+    let ns = go_duration_ns(raw).ok_or_else(|| LegacyError::InvalidDuration {
+        name,
+        raw: raw.to_string(),
+    })?;
+    if ns < 0 {
+        return Err(LegacyError::NegativeDuration {
+            name,
+            raw: raw.to_string(),
+        });
+    }
+    Ok(ns)
+}
+
+/// A Go duration (`time.ParseDuration`) in nanoseconds: an optional sign,
+/// then `0` alone or one or more `<number><unit>`, `<number>` digits with
+/// an optional fraction and `<unit>` one of `ns us µs μs ms s m h`. A
+/// fraction past the nanosecond is dropped; `None` on anything else or a
+/// value past `i64`.
+fn go_duration_ns(raw: &str) -> Option<i64> {
+    const UNITS: [(&str, i128); 8] = [
+        ("ns", 1),
+        ("us", 1_000),
+        ("µs", 1_000),
+        ("μs", 1_000),
+        ("ms", 1_000_000),
+        ("s", 1_000_000_000),
+        ("m", 60_000_000_000),
+        ("h", 3_600_000_000_000),
+    ];
+    let (negative, body) = match raw.as_bytes().first() {
+        Some(b'-') => (true, &raw[1..]),
+        Some(b'+') => (false, &raw[1..]),
+        _ => (false, raw),
+    };
+    if body == "0" {
+        return Some(0);
+    }
+    if body.is_empty() {
+        return None;
+    }
+    let mut rest = body;
+    let mut total: i128 = 0;
+    while !rest.is_empty() {
+        let int_len = rest.bytes().take_while(u8::is_ascii_digit).count();
+        let (int_part, after_int) = rest.split_at(int_len);
+        let (frac_part, after_number) = match after_int.strip_prefix('.') {
+            Some(f) => {
+                let frac_len = f.bytes().take_while(u8::is_ascii_digit).count();
+                f.split_at(frac_len)
+            }
+            None => ("", after_int),
+        };
+        if int_part.is_empty() && frac_part.is_empty() {
+            return None;
+        }
+        // The longest unit, so `ms` is never `m` then `s`.
+        let (unit, per_unit) = UNITS
+            .iter()
+            .filter(|(u, _)| after_number.starts_with(u))
+            .max_by_key(|(u, _)| u.len())?;
+        // Exact in `i128`: `digits · per_unit / 10^fraction_digits`,
+        // truncated, so what falls below 1 ns is dropped. Fraction digits
+        // past the eighteenth are below 1 ns for every unit.
+        let frac_kept = &frac_part[..frac_part.len().min(18)];
+        let digits: i128 = format!("0{int_part}{frac_kept}").parse().ok()?;
+        let denominator = 10_i128.pow(frac_kept.len() as u32);
+        let value = digits.checked_mul(*per_unit)? / denominator;
+        total = total.checked_add(value)?;
+        rest = &after_number[unit.len()..];
+    }
+    i64::try_from(if negative { -total } else { total }).ok()
 }
 
 #[cfg(test)]

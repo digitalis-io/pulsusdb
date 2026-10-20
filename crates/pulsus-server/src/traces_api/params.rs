@@ -1,5 +1,5 @@
 //! `/api/traces/v1` parameter parsing: the trace-fetch hex id
-//! (docs/api.md §4.1: "16 or 32 chars, left-padded" — the injection
+//! (docs/api.md §4.1: 1 to 32 hex characters, left-padded — the injection
 //! boundary for the fetch statements' `unhex('...')` literals: only
 //! `[0-9a-f]{32}` output ever leaves [`parse_trace_id`]) and the issue
 //! #57 search params (docs/api.md §4.2: `q`/legacy params, `start`/`end`
@@ -18,29 +18,24 @@ use super::querytext::{QueryTextError, TraceQlText, validate_traceql_query};
 /// by `error::ApiError`.
 #[derive(Debug, Error)]
 pub(crate) enum TraceIdError {
-    #[error("invalid trace id {0:?}: expected 16 or 32 hex characters")]
+    #[error("invalid trace id {0:?}: expected 1 to 32 hex characters")]
     InvalidLength(String),
     #[error("invalid trace id {0:?}: expected hex characters only")]
     NotHex(String),
 }
 
-/// Parses `raw` into the canonical 32-char lowercase hex trace id:
-/// 32 hex chars pass through (lowercased); 16 hex chars are left-padded
-/// with 16 `'0'`s (a 64-bit id in a 128-bit field, docs/api.md §4.1);
-/// anything else — empty, odd, wrong length, non-hex — is rejected.
+/// Parses `raw` into the canonical 32-char lowercase hex trace id: 1 to
+/// 32 hex characters, lowercased and left-padded with `'0'` to 32 (the
+/// reference's `HexStringToTraceID`, odd lengths included); empty, longer
+/// than 32, or not hex is rejected.
 pub(crate) fn parse_trace_id(raw: &str) -> Result<String, TraceIdError> {
-    if raw.len() != 16 && raw.len() != 32 {
+    if raw.is_empty() || raw.len() > 32 {
         return Err(TraceIdError::InvalidLength(raw.to_string()));
     }
     if !raw.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(TraceIdError::NotHex(raw.to_string()));
     }
-    let lowered = raw.to_ascii_lowercase();
-    if lowered.len() == 16 {
-        Ok(format!("0000000000000000{lowered}"))
-    } else {
-        Ok(lowered)
-    }
+    Ok(format!("{:0>32}", raw.to_ascii_lowercase()))
 }
 
 /// The fetch routes' optional request window (issue #587).
@@ -107,8 +102,12 @@ fn parse_supplied_bound(
 
 /// Default `limit` when the param is absent (docs/api.md §4.2).
 pub(crate) const DEFAULT_LIMIT: u32 = 20;
-/// Default `spss` (spans-per-spanset cap) when the param is absent.
+/// Default `spss` (spans-per-spanset cap) when the param is absent or `0`.
 pub(crate) const DEFAULT_SPSS: u32 = 3;
+/// The largest `limit`: the reference's default `max_limit`.
+const MAX_LIMIT: u32 = 262_144;
+/// The largest `spss`: the reference's default `max_spans_per_span_set`.
+const MAX_SPSS: u32 = 100;
 
 /// Errors from parsing `/api/traces/v1/search` request parameters —
 /// mapped to `400` by `error::ApiError`.
@@ -122,10 +121,10 @@ pub(crate) enum SearchParamError {
     InvalidRange { start: i64, end: i64 },
     #[error("invalid {name:?} {raw:?}: expected a positive integer")]
     InvalidCount { name: &'static str, raw: String },
-    /// A `limit` above [`MAX_LIMIT`], in the reference's words.
+    /// A `limit` above `MAX_LIMIT`, in the reference's words.
     #[error("limit {0} exceeds max limit 262144")]
     LimitTooLarge(u32),
-    /// An `spss` above [`MAX_SPSS`], in the reference's words.
+    /// An `spss` above `MAX_SPSS`, in the reference's words.
     #[error("spans per span set exceeds 100. received {0}")]
     SpssTooLarge(u32),
     #[error(
@@ -202,8 +201,8 @@ pub(crate) fn parse_search_params(raw: &str) -> Result<RawSearchParams, SearchPa
             end: end_ns / 1_000_000_000,
         });
     }
-    let limit = parse_count(&pairs, "limit", DEFAULT_LIMIT)?;
-    let spss = parse_count(&pairs, "spss", DEFAULT_SPSS)?;
+    let limit = parse_limit(&pairs)?;
+    let spss = parse_spss(&pairs)?;
     Ok(RawSearchParams {
         q,
         tags,
@@ -216,27 +215,36 @@ pub(crate) fn parse_search_params(raw: &str) -> Result<RawSearchParams, SearchPa
     })
 }
 
-/// The one trace-surface timestamp grammar (docs/api.md §1: "trace APIs
-/// accept unix seconds/nanoseconds/RFC3339"), shared by the search and
-/// metrics parsers so the two endpoints can never drift:
+/// The one trace-surface timestamp rule (docs/api.md §1), the reference's
+/// `parseTimestamp` (`pkg/api/http.go:626-650`), shared by every trace
+/// route so they cannot drift:
 ///
-/// - an integer literal with magnitude `>= 10^12` is unix **nanoseconds**
-///   (10^12 s is the year 33658 — no realistic seconds value; 10^12 ns is
-///   16 minutes past the 1970 epoch — no realistic trace timestamp loses
-///   the disambiguation);
-/// - any other integer literal is unix **seconds**;
-/// - anything else parses as **RFC3339** (`chrono`, the `logs_api`
-///   precedent — scoped to parsing only).
+/// - a value containing `.` that parses as a float is unix **seconds**
+///   with a fraction rounded to the millisecond;
+/// - an integer of ten characters or fewer is unix **seconds**, a longer
+///   one unix **nanoseconds** — the length of the text, not the
+///   magnitude, as the log APIs read it;
+/// - anything else parses as **RFC3339**.
 fn parse_timestamp_ns(raw: &str) -> Option<i64> {
+    if raw.contains('.')
+        && let Ok(f) = raw.parse::<f64>()
+    {
+        let secs = f.trunc();
+        let frac_ms = ((f - secs) * 1000.0).round();
+        return (secs as i64)
+            .checked_mul(1_000_000_000)?
+            .checked_add(frac_ms as i64 * 1_000_000);
+    }
     if let Ok(v) = raw.parse::<i64>() {
-        return if v.unsigned_abs() >= 1_000_000_000_000 {
-            Some(v)
-        } else {
+        return if raw.len() <= 10 {
             v.checked_mul(1_000_000_000)
+        } else {
+            Some(v)
         };
     }
-    let dt = chrono::DateTime::parse_from_rfc3339(raw).ok()?;
-    dt.timestamp_nanos_opt()
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .ok()?
+        .timestamp_nanos_opt()
 }
 
 fn parse_unix_seconds_ns(
@@ -247,14 +255,38 @@ fn parse_unix_seconds_ns(
     parse_timestamp_ns(raw).ok_or_else(|| SearchParamError::InvalidTimestamp(raw.to_string()))
 }
 
-fn parse_count(
-    pairs: &[(String, String)],
-    name: &'static str,
-    default: u32,
-) -> Result<u32, SearchParamError> {
-    let Some(raw) = get(pairs, name) else {
-        return Ok(default);
+/// The search `limit`: default [`DEFAULT_LIMIT`], `1..=MAX_LIMIT`; zero,
+/// negative or not an integer is `InvalidCount`, above the maximum
+/// `LimitTooLarge` (`search_handlers.go:165-175`).
+fn parse_limit(pairs: &[(String, String)]) -> Result<u32, SearchParamError> {
+    let Some(raw) = get(pairs, "limit") else {
+        return Ok(DEFAULT_LIMIT);
     };
+    let n = parse_positive(raw, "limit")?;
+    if n > MAX_LIMIT {
+        return Err(SearchParamError::LimitTooLarge(n));
+    }
+    Ok(n)
+}
+
+/// The search `spss`: absent or `0` is [`DEFAULT_SPSS`] (`engine.go:120-123`),
+/// otherwise `1..=MAX_SPSS`; above the maximum `SpssTooLarge`
+/// (`search_sharder.go:108-113`), negative or not an integer
+/// `InvalidCount`.
+fn parse_spss(pairs: &[(String, String)]) -> Result<u32, SearchParamError> {
+    match get(pairs, "spss") {
+        None | Some("0") => Ok(DEFAULT_SPSS),
+        Some(raw) => {
+            let n = parse_positive(raw, "spss")?;
+            if n > MAX_SPSS {
+                return Err(SearchParamError::SpssTooLarge(n));
+            }
+            Ok(n)
+        }
+    }
+}
+
+fn parse_positive(raw: &str, name: &'static str) -> Result<u32, SearchParamError> {
     raw.parse::<u32>()
         .ok()
         .filter(|n| *n >= 1)
@@ -271,20 +303,11 @@ fn parse_count(
 pub(crate) enum MetricsParamError {
     #[error("missing required parameter: 'q' (or 'query') must carry a TraceQL metrics expression")]
     MissingQuery,
-    #[error("'q' and 'query' are aliases: supply one or the other, never both")]
-    ConflictingQueryKeys,
-    #[error(
-        "'since' and 'start'/'end' are mutually exclusive: supply a relative window or an \
-         absolute one, never both"
-    )]
-    ConflictingRange,
-    #[error("missing required parameters: supply start and end (unix seconds), or since")]
-    MissingRange,
     #[error("invalid timestamp {0:?}: expected unix seconds, unix nanoseconds, or RFC3339")]
     InvalidTimestamp(String),
     #[error("invalid range: end ({end}) must be greater than start ({start})")]
     InvalidRange { start: i64, end: i64 },
-    #[error("invalid 'since' {0:?}: expected a whole-second duration (e.g. 1h, 30m, 90s)")]
+    #[error("invalid 'since' {0:?}: expected a duration such as 90s, 1h30m, 1d or 2w")]
     InvalidSince(String),
     #[error(
         "invalid 'step' {0:?}: expected a positive whole number of milliseconds \
@@ -328,8 +351,8 @@ pub(crate) fn check_range_intervals(params: &RawMetricsParams) -> Result<(), Met
 
 /// The parsed metrics request: the TraceQL expression, the validated
 /// window and step, and the normalised exemplar budget. `step_ms` is
-/// already defaulted via the committed derivation formula (docs/api.md
-/// §4.4) when the request omitted `step`.
+/// already derived (docs/api.md §4.4) when the request omitted `step` or
+/// arrived on the instant route.
 ///
 /// `q` is a [`TraceQlText`] for the same reason the search params' is
 /// (issue #284): the cap runs or the struct cannot be built.
@@ -347,18 +370,15 @@ pub(crate) struct RawMetricsParams {
     pub exemplars: Option<u32>,
 }
 
-/// Parses the metrics query string (docs/api.md §4.4). `now_s` feeds the
-/// `since` relative window (injected for testability). `q`/`query` are
-/// strict aliases (both present → 400); `since` conflicts with
-/// `start`/`end` (never silent precedence — the search surface's
-/// ratified rule); `step` accepts any positive whole number of
-/// MILLISECONDS through [`parse_step_ms`] — `500ms`, `1.5s`, `1m30s` and
-/// a bare seconds count all work (issue #477 (d)) — and anything that is
-/// not a whole millisecond is an explicit 400. When `step` is omitted the
-/// derivation is unchanged and still whole seconds:
-/// `step_ms = 1000 · max(1, ⌊(end_s − start_s) / DEFAULT_METRICS_POINTS⌋)`
-/// (the committed contract; the point cap is enforced downstream by
-/// `plan_trace_metrics`).
+/// Parses the metrics query string (docs/api.md §4.4), the reference's
+/// `ParseQueryRangeRequest`/`ParseQueryInstantRequest`.
+///
+/// `q` wins over `query` when both are sent. The window is
+/// [`parse_window`]'s, with `now_ns` injected for testability. On the
+/// range route `step` accepts any positive whole number of MILLISECONDS
+/// through [`parse_step_ms`] (issue #477 (d)) and, when absent, is
+/// [`default_step_ms`]'s; the instant route reads no `step` and carries
+/// the derived one, which only sizes the plan's unused range grid.
 ///
 /// `exemplars` is read here (issue #477 (c)) and normalised to
 /// `Option<u32>`; every unusable spelling behaves as absent rather than
@@ -366,64 +386,30 @@ pub(crate) struct RawMetricsParams {
 pub(crate) fn parse_metrics_params(
     raw: &str,
     now_ns: i64,
-    _form: MetricsForm,
+    form: MetricsForm,
 ) -> Result<RawMetricsParams, MetricsParamError> {
-    let now_s = now_ns.div_euclid(1_000_000_000);
     let pairs = parse_pairs(raw);
     let q_key = get(&pairs, "q").filter(|s| !s.is_empty());
     let query_key = get(&pairs, "query").filter(|s| !s.is_empty());
-    let q = match (q_key, query_key) {
-        (Some(_), Some(_)) => return Err(MetricsParamError::ConflictingQueryKeys),
-        (Some(q), None) | (None, Some(q)) => TraceQlText::new(q)?,
-        (None, None) => return Err(MetricsParamError::MissingQuery),
+    let q = match q_key.or(query_key) {
+        Some(q) => TraceQlText::new(q)?,
+        None => return Err(MetricsParamError::MissingQuery),
     };
 
-    let start = parse_opt_unix_seconds_ns(&pairs, "start")?;
-    let end = parse_opt_unix_seconds_ns(&pairs, "end")?;
-    let since = get(&pairs, "since").filter(|s| !s.is_empty());
-    let (start_ns, end_ns) = match (since, start, end) {
-        (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
-            return Err(MetricsParamError::ConflictingRange);
-        }
-        (Some(raw_since), None, None) => {
-            let since_s = parse_whole_seconds(raw_since)
-                .ok_or_else(|| MetricsParamError::InvalidSince(raw_since.to_string()))?;
-            let end_ns = now_s
-                .checked_mul(1_000_000_000)
-                .ok_or_else(|| MetricsParamError::InvalidSince(raw_since.to_string()))?;
-            let start_ns = now_s
-                .checked_sub(since_s)
-                .and_then(|s| s.checked_mul(1_000_000_000))
-                .ok_or_else(|| MetricsParamError::InvalidSince(raw_since.to_string()))?;
-            (start_ns, end_ns)
-        }
-        (None, Some(start_ns), Some(end_ns)) => (start_ns, end_ns),
-        (None, _, _) => return Err(MetricsParamError::MissingRange),
-    };
-    if end_ns <= start_ns {
-        return Err(MetricsParamError::InvalidRange {
-            start: start_ns / 1_000_000_000,
-            end: end_ns / 1_000_000_000,
-        });
-    }
+    let (start_ns, end_ns) = parse_window(&pairs, now_ns).map_err(|fault| match fault {
+        WindowFault::Timestamp(raw) => MetricsParamError::InvalidTimestamp(raw),
+        WindowFault::Since(raw) => MetricsParamError::InvalidSince(raw),
+        WindowFault::Range { start, end } => MetricsParamError::InvalidRange { start, end },
+    })?;
 
-    let step_ms = match get(&pairs, "step").filter(|s| !s.is_empty()) {
+    let explicit = match form {
+        MetricsForm::Range => get(&pairs, "step").filter(|s| !s.is_empty()),
+        MetricsForm::Instant => None,
+    };
+    let step_ms = match explicit {
         Some(raw_step) => parse_step_ms(raw_step)
             .ok_or_else(|| MetricsParamError::InvalidStep(raw_step.to_string()))?,
-        // The committed derivation formula (docs/api.md §4.4) — still in
-        // whole seconds, scaled to the new unit. Only the explicit `step`
-        // grammar gained sub-second forms; the derived floor stays one
-        // second, so an omitted `step` produces exactly the grid it did
-        // before.
-        None => {
-            // i128: with ns-precision endpoints the i64 width can wrap
-            // (code review round 1) — the derived step must stay exact so
-            // the planner's static point cap sees the true bucket count.
-            let span_s =
-                (i128::from(end_ns) - i128::from(start_ns)) / i128::from(1_000_000_000_i64);
-            let step_seconds = (span_s / i128::from(pulsus_read::DEFAULT_METRICS_POINTS)).max(1);
-            i64::try_from(step_seconds * 1_000).unwrap_or(i64::MAX)
-        }
+        None => default_step_ms(start_ns, end_ns),
     };
 
     let exemplars = parse_exemplars(&pairs);
@@ -435,6 +421,136 @@ pub(crate) fn parse_metrics_params(
         step_ms,
         exemplars,
     })
+}
+
+/// What can be wrong with a metrics or service-graph window.
+enum WindowFault {
+    Timestamp(String),
+    Since(String),
+    Range { start: i64, end: i64 },
+}
+
+/// The default lookback when neither `start` nor `since` is sent.
+const DEFAULT_SINCE_NS: i64 = 3_600 * 1_000_000_000;
+
+/// The metrics and service-graph window, the reference's
+/// `determineBounds` (`pkg/api/http.go:516-556`): `end` is the parsed
+/// `end`, else now; `start` is the parsed `start`, else `since` (default
+/// one hour) before `min(end, now)`, and `since` is read only then. A
+/// window whose `end` is not after its `start` is refused — the
+/// reference accepts `start = end`, an empty window, and answers nothing
+/// over it either way (docs/api.md §4.4).
+fn parse_window(pairs: &[(String, String)], now_ns: i64) -> Result<(i64, i64), WindowFault> {
+    let bound = |name: &str| -> Result<Option<i64>, WindowFault> {
+        let Some(raw) = get(pairs, name).filter(|s| !s.is_empty()) else {
+            return Ok(None);
+        };
+        parse_timestamp_ns(raw)
+            .map(Some)
+            .ok_or_else(|| WindowFault::Timestamp(raw.to_string()))
+    };
+    let start = bound("start")?;
+    let end_ns = bound("end")?.unwrap_or(now_ns);
+    let start_ns = match start {
+        Some(start_ns) => start_ns,
+        None => {
+            let since = get(pairs, "since").filter(|s| !s.is_empty());
+            let since_ns = match since {
+                Some(raw) => parse_prom_duration_ns(raw)
+                    .ok_or_else(|| WindowFault::Since(raw.to_string()))?,
+                None => DEFAULT_SINCE_NS,
+            };
+            end_ns
+                .min(now_ns)
+                .checked_sub(since_ns)
+                .ok_or_else(|| WindowFault::Since(since.unwrap_or_default().to_string()))?
+        }
+    };
+    if end_ns <= start_ns {
+        return Err(WindowFault::Range {
+            start: start_ns / 1_000_000_000,
+            end: end_ns / 1_000_000_000,
+        });
+    }
+    Ok((start_ns, end_ns))
+}
+
+/// The derived range step, the reference's `DefaultQueryRangeStep`
+/// (`pkg/traceql/engine_metrics.go:35-79`), in whole milliseconds: the
+/// window over 240, rounded down to a multiple of the first of 1 h,
+/// 5 min, 1 min, 15 s, 5 s and 1 s it exceeds, at least 1 s; under a
+/// one-minute window, rounded down to a multiple of 50 ms, at least 50 ms.
+fn default_step_ms(start_ns: i64, end_ns: i64) -> i64 {
+    const MS: i128 = NS_PER_MS;
+    const S: i128 = 1_000 * MS;
+    // i128: the width of two extreme `i64` instants does not fit `i64`.
+    let width = i128::from(end_ns) - i128::from(start_ns);
+    let per_point = width / 240;
+    let step_ns = if width < 60 * S {
+        if per_point > 50 * MS {
+            per_point / (50 * MS) * (50 * MS)
+        } else {
+            50 * MS
+        }
+    } else {
+        [3_600 * S, 300 * S, 60 * S, 15 * S, 5 * S, S]
+            .into_iter()
+            .find(|g| per_point > *g)
+            .map_or(S, |g| per_point / g * g)
+    };
+    i64::try_from(step_ns / MS).unwrap_or(i64::MAX)
+}
+
+/// A Prometheus duration (`model.ParseDuration`), in nanoseconds: one or
+/// more `<digits><unit>` with units `y w d h m s ms`, each at most once and
+/// in that order, or `0` alone. `1d` is 86,400 s, `1w` seven days, `1y`
+/// 365 days.
+fn parse_prom_duration_ns(raw: &str) -> Option<i64> {
+    const S: i128 = 1_000_000_000;
+    const UNITS: [(&str, i128); 7] = [
+        ("y", 365 * 86_400 * S),
+        ("w", 7 * 86_400 * S),
+        ("d", 86_400 * S),
+        ("h", 3_600 * S),
+        ("m", 60 * S),
+        ("s", S),
+        ("ms", 1_000_000),
+    ];
+    if raw == "0" {
+        return Some(0);
+    }
+    if raw.is_empty() {
+        return None;
+    }
+    let bytes = raw.as_bytes();
+    let mut idx = 0usize;
+    // Units appear in `UNITS` order, once each: the next allowed index.
+    let mut next_unit = 0usize;
+    let mut total: i128 = 0;
+    while idx < bytes.len() {
+        let digits_start = idx;
+        while bytes.get(idx).is_some_and(u8::is_ascii_digit) {
+            idx += 1;
+        }
+        if idx == digits_start {
+            return None;
+        }
+        let n: i128 = raw[digits_start..idx].parse().ok()?;
+        let rest = &raw[idx..];
+        // The longest match, so `5ms` is never `5m` then `s`.
+        let (pos, (unit, per_unit)) = UNITS
+            .iter()
+            .enumerate()
+            .filter(|(_, (u, _))| rest.starts_with(u))
+            .max_by_key(|(_, (u, _))| u.len())?;
+        if pos < next_unit {
+            return None;
+        }
+        next_unit = pos + 1;
+        idx += unit.len();
+        total = total.checked_add(n.checked_mul(*per_unit)?)?;
+    }
+    i64::try_from(total).ok()
 }
 
 /// Which of the two metrics routes a request arrived on.
@@ -460,20 +576,6 @@ fn parse_exemplars(pairs: &[(String, String)]) -> Option<u32> {
         .and_then(|raw| raw.parse::<i64>().ok())
         .filter(|n| *n > 0)
         .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
-}
-
-fn parse_opt_unix_seconds_ns(
-    pairs: &[(String, String)],
-    name: &str,
-) -> Result<Option<i64>, MetricsParamError> {
-    let Some(raw) = get(pairs, name).filter(|s| !s.is_empty()) else {
-        return Ok(None);
-    };
-    // The shared trace-surface grammar (s / ns / RFC3339) — one parser
-    // for search and metrics alike.
-    parse_timestamp_ns(raw)
-        .map(Some)
-        .ok_or_else(|| MetricsParamError::InvalidTimestamp(raw.to_string()))
 }
 
 /// Nanoseconds in one millisecond — the resolution boundary the metrics
@@ -593,52 +695,20 @@ fn whole_ms(total_ns: i128) -> Option<i64> {
     i64::try_from(total_ns / NS_PER_MS).ok()
 }
 
-/// Parses a positive whole-second count: bare digits (seconds) or a
-/// whole-second duration suffix form (`s`/`m`/`h`, or `ms` divisible by
-/// 1000). Anything else — zero, negative, fractional seconds (`1.5`,
-/// `500ms`), unknown units — is `None`.
-fn parse_whole_seconds(raw: &str) -> Option<i64> {
-    let (digits, unit_multiplier_ms) = if let Some(n) = raw.strip_suffix("ms") {
-        (n, 1)
-    } else if let Some(n) = raw.strip_suffix('s') {
-        (n, 1_000)
-    } else if let Some(n) = raw.strip_suffix('m') {
-        (n, 60_000)
-    } else if let Some(n) = raw.strip_suffix('h') {
-        (n, 3_600_000)
-    } else {
-        (raw, 1_000)
-    };
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let value: i64 = digits.parse().ok()?;
-    let ms = value.checked_mul(unit_multiplier_ms)?;
-    if ms <= 0 || ms % 1_000 != 0 {
-        return None;
-    }
-    Some(ms / 1_000)
-}
-
 /// Errors from parsing `/api/traces/v1/service_graph` request parameters
 /// (issue #173, docs/api.md §4.5) — mapped to `400` by
 /// `error::ApiError`. Same window grammar as the metrics surface (`start`/
 /// `end`/`since`), minus `q`/`step` — the service graph is a fixed
 /// aggregation over a window, with no expression and no bucketing.
+// The variants keep the names their `MetricsParamError` twins carry.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Error)]
 pub(crate) enum GraphParamError {
-    #[error(
-        "'since' and 'start'/'end' are mutually exclusive: supply a relative window or an \
-         absolute one, never both"
-    )]
-    ConflictingRange,
-    #[error("missing required parameters: supply start and end (unix seconds), or since")]
-    MissingRange,
     #[error("invalid timestamp {0:?}: expected unix seconds, unix nanoseconds, or RFC3339")]
     InvalidTimestamp(String),
     #[error("invalid range: end ({end}) must be greater than start ({start})")]
     InvalidRange { start: i64, end: i64 },
-    #[error("invalid 'since' {0:?}: expected a whole-second duration (e.g. 1h, 30m, 90s)")]
+    #[error("invalid 'since' {0:?}: expected a duration such as 90s, 1h30m, 1d or 2w")]
     InvalidSince(String),
 }
 
@@ -651,64 +721,49 @@ pub(crate) struct RawGraphParams {
     pub end_ns: i64,
 }
 
-/// Parses the service-graph query string (docs/api.md §4.5). Reuses the
-/// metrics surface's window grammar exactly: `start`/`end` (unix s/ns/
-/// RFC3339) XOR a relative `since` (whole-second duration), `now_s` feeding
-/// the `since` window (injected for testability). Any missing/invalid/
-/// conflicting window is an explicit `400`.
+/// Parses the service-graph query string (docs/api.md §4.5): the metrics
+/// routes' window, [`parse_window`], with `now_ns` injected for
+/// testability. An invalid or inverted window is an explicit `400`.
 pub(crate) fn parse_graph_params(
     raw: &str,
     now_ns: i64,
 ) -> Result<RawGraphParams, GraphParamError> {
-    let now_s = now_ns.div_euclid(1_000_000_000);
     let pairs = parse_pairs(raw);
-    let parse_ts = |name: &str| -> Result<Option<i64>, GraphParamError> {
-        let Some(raw) = get(&pairs, name).filter(|s| !s.is_empty()) else {
-            return Ok(None);
-        };
-        parse_timestamp_ns(raw)
-            .map(Some)
-            .ok_or_else(|| GraphParamError::InvalidTimestamp(raw.to_string()))
-    };
-    let start = parse_ts("start")?;
-    let end = parse_ts("end")?;
-    let since = get(&pairs, "since").filter(|s| !s.is_empty());
-    let (start_ns, end_ns) = match (since, start, end) {
-        (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
-            return Err(GraphParamError::ConflictingRange);
-        }
-        (Some(raw_since), None, None) => {
-            let since_s = parse_whole_seconds(raw_since)
-                .ok_or_else(|| GraphParamError::InvalidSince(raw_since.to_string()))?;
-            let end_ns = now_s
-                .checked_mul(1_000_000_000)
-                .ok_or_else(|| GraphParamError::InvalidSince(raw_since.to_string()))?;
-            let start_ns = now_s
-                .checked_sub(since_s)
-                .and_then(|s| s.checked_mul(1_000_000_000))
-                .ok_or_else(|| GraphParamError::InvalidSince(raw_since.to_string()))?;
-            (start_ns, end_ns)
-        }
-        (None, Some(start_ns), Some(end_ns)) => (start_ns, end_ns),
-        (None, _, _) => return Err(GraphParamError::MissingRange),
-    };
-    if end_ns <= start_ns {
-        return Err(GraphParamError::InvalidRange {
-            start: start_ns / 1_000_000_000,
-            end: end_ns / 1_000_000_000,
-        });
-    }
+    let (start_ns, end_ns) = parse_window(&pairs, now_ns).map_err(|fault| match fault {
+        WindowFault::Timestamp(raw) => GraphParamError::InvalidTimestamp(raw),
+        WindowFault::Since(raw) => GraphParamError::InvalidSince(raw),
+        WindowFault::Range { start, end } => GraphParamError::InvalidRange { start, end },
+    })?;
     Ok(RawGraphParams { start_ns, end_ns })
 }
 
-/// The first nanosecond a windowed trace read may return (stub).
-pub(crate) fn retention_floor_ns(_retention_days: u32, _now_ns: i64) -> i64 {
-    0
+/// The first nanosecond a windowed trace read returns (docs/api.md §4,
+/// "Retention"): a span is expired once
+/// `intDiv(start_ns, 1e9) + retention_days * 86400 <= now`, the tables'
+/// own TTL, so the first kept nanosecond is
+/// `(now_s - retention_days * 86400 + 1) * 1e9`.
+pub(crate) fn retention_floor_ns(retention_days: u32, now_ns: i64) -> i64 {
+    now_ns
+        .div_euclid(1_000_000_000)
+        .saturating_sub(i64::from(retention_days).saturating_mul(86_400))
+        .saturating_add(1)
+        .saturating_mul(1_000_000_000)
 }
 
-/// A window's start raised to the retention floor (stub).
-pub(crate) fn floored_start(start_ns: i64, _end_ns: i64, _floor_ns: i64) -> i64 {
-    start_ns
+/// A window's start raised to the retention floor, and never past its
+/// end: a window wholly before the floor becomes the empty `[end, end)`.
+/// Parameter faults are answered before this, on the window as sent.
+pub(crate) fn floored_start(start_ns: i64, end_ns: i64, floor_ns: i64) -> i64 {
+    start_ns.max(floor_ns).min(end_ns)
+}
+
+/// The tag routes' `limit` (`tag_handlers.go:600-619`): at most this many
+/// names per scope, or values. Absent, `0`, or not an integer is no limit.
+pub(crate) fn parse_tag_limit(pairs: &[(String, String)]) -> Option<usize> {
+    get(pairs, "limit")
+        .and_then(|raw| raw.parse::<u32>().ok())
+        .filter(|n| *n > 0)
+        .map(|n| n as usize)
 }
 
 /// Errors from parsing the `/api/traces/v1/tags` query parameters —
@@ -877,7 +932,8 @@ pub(crate) enum TagScope {
 /// `start`/`end` are accepted for client compatibility and IGNORED —
 /// `trace_tag_catalog` has no timestamp column, so tag discovery is
 /// time-less by contract (docs/api.md §4.3, issue #58 frozen-schema
-/// resolution); any other parameter is likewise ignored.
+/// resolution). `limit` is read by [`parse_tag_limit`] and cuts the
+/// rendered lists; any other parameter is ignored.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct TagsParams {
     pub scope: TagScope,
@@ -2387,7 +2443,7 @@ mod tests {
                 Some("start=1699999999&end=1700000002"),
                 ns(1_699_999_999_000_000_000, 1_700_000_002_000_000_000),
             ),
-            // nanoseconds, by magnitude
+            // nanoseconds, longer than ten characters
             (
                 Some("start=1699999999000000000&end=1700000002000000000"),
                 ns(1_699_999_999_000_000_000, 1_700_000_002_000_000_000),

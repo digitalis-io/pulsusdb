@@ -1482,10 +1482,10 @@ impl TraceEngine {
     }
 
     /// Executes a metrics instant plan (issue #59): the same pushed-down
-    /// body over the whole snapped window `[S, E)` with no bucketing —
+    /// body over the requested window `[start, end)` with no bucketing —
     /// exactly one row (`uniqExact` with no `GROUP BY`), returned as a
     /// one-sample label-less vector; the instant `rate` denominator is
-    /// the snapped window width (plan v2 delta 2). The caller stamps the
+    /// `end − start`. The caller stamps the
     /// sample at [`TraceMetricsPlan::snapped_end_ms`].
     pub async fn metrics_instant(
         &self,
@@ -2995,11 +2995,11 @@ fn thin_collected_exemplars(collected: &mut Vec<(usize, MetricExemplar)>, budget
 
 /// The count-path (`rate`/`count_over_time`) encode-boundary value:
 /// `rate` divides by its denominator (one bucket's width per range
-/// sample, the snapped window's width for an instant) in `f64` here —
+/// sample, the requested window's width for an instant) in `f64` here —
 /// never in SQL; `count_over_time` is the deduped count itself.
 ///
 /// The denominator is **fractional seconds** (issue #477 (d)): a
-/// sub-second step, or a snapped window narrower than a second, truncated
+/// sub-second step, or an instant window narrower than a second, truncated
 /// to `0` under the old whole-second form and made every rate `inf`.
 fn count_value(is_rate: bool, n: u64, rate_denominator_seconds: f64) -> f64 {
     if is_rate {
