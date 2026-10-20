@@ -34,7 +34,7 @@ They take hosts, ports and directories as arguments; nothing is hard-coded.
 | `catalogue_parse.py` | the TraceQL parser the catalogue's two sides share, and the only thing they share |
 | `parse_vectors.tsv` | one line per rule that parser decides, with the tree it must produce, written out by hand — the check on the one module a comparison cannot check |
 | `catalogue-extra.tsv` | the queries the corpus does not contain, one per rule of §3.2 no corpus query reaches, each with the rule it decides |
-| `catalogue_render.py` | the hand-written TraceQL-to-SQL rules: the statement each route issues, and the membership query |
+| `catalogue_render.py` | the disposition rule (`refusal`): which accepted queries the API answers with a `400` |
 | `catalogue_interp.py` | the independent side: the fixture rows and an interpreter that walks the same parsed query over them |
 | `catalogue.py` | runs both statements for every corpus query and writes `docs/TraceQL/query-catalogue*.md` and `catalogue-sql/` |
 | `perturb_check.py`, `perturbations.tsv` | changes one rule at a time, on one side at a time, and requires the catalogue to notice; `results/perturbations.tsv` is the run |

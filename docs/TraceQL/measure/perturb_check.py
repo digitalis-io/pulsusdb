@@ -3,12 +3,9 @@
 
 `docs/TraceQL/query-catalogue.md` claims three things this script is the check on:
 
-1. **The interpreter's rules are checked.** Since #600 the other side is the
-   shipped route, whose answers the saved run holds, so a rule changed in
-   `catalogue_interp.py` must produce a disagreement. A row on
-   `catalogue_render.py` changes the design renderer's statements, which the
-   catalogue no longer runs (only its disposition rule is read), so it ends
-   `clean`.
+1. **The interpreter's rules are checked.** The other side is the shipped
+   route, whose answers the saved run holds, so a rule changed in
+   `catalogue_interp.py` must produce a disagreement.
 2. **The shared parser is checked too.** A rule changed THERE moves both answers
    together, so no comparison can see it; `measure/parse_vectors.tsv` holds the
    tree each rule must produce, written out by hand, and the rows below whose

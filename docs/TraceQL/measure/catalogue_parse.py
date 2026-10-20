@@ -20,10 +20,9 @@ answer:
 
 A status keyword parses to `{'t': 'status', 'v': 'error'}` — the NAME. A
 duration parses to `{'t': 'duration', 'v': '1.5', 'unit': 'ms'}` — the digits
-and the unit's SPELLING. The renderer (`catalogue_render.py`) and the
-interpreter (`catalogue_interp.py`) each map those to a number from their own
-table, and `measure/perturb_check.py` perturbs one table at a time and requires
-the comparison to go red for each.
+and the unit's SPELLING. The interpreter (`catalogue_interp.py`) maps those
+to a number from its own table, and `measure/perturb_check.py` perturbs that
+table and requires the comparison to go red.
 
 A rule that stayed here would move both sides together and the comparison would
 stay green, so this module is checked a second way: `measure/parse_vectors.tsv`
@@ -60,8 +59,8 @@ def lex(src):
 
 # The unit spellings a duration literal may be written with. The SPELLINGS are
 # lexical and belong here; what each one is worth in nanoseconds decides an
-# answer, so it is written once on each side (`catalogue_render.DURATION_NS`,
-# `catalogue_interp.DURATION_NS`). Review round 5 found the multipliers here:
+# answer, so it is written in the interpreter (`catalogue_interp.DURATION_NS`).
+# Review round 5 found the multipliers here:
 # changing `ms` from 10**6 to 10**3 moved both sides together and the whole
 # catalogue still reported complete agreement.
 DUR_UNITS = frozenset({'ns', 'us', 'µs', 'ms', 's', 'm', 'h'})

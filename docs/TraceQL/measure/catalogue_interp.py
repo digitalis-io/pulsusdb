@@ -2,9 +2,9 @@
 """The independent side of the catalogue's check: the fixture rows, and an
 interpreter that walks a parsed TraceQL query over them.
 
-It shares `catalogue_parse` with `catalogue_render.py` and nothing else. Every
-rule that decides an answer is written here again, from the sources named
-beside it, so that a mistake on one side shows up as a disagreement:
+The other side is the shipped route, whose answers `catalogue.sh` records.
+Every rule that decides an answer is written here from the sources named
+beside it, so that a mistake on either side shows up as a disagreement:
 
 - the status and kind codes, from OTLP's own `trace.proto`;
 - the order an unscoped `.k` tries the scopes in, from `docs/api.md` §4.2;
@@ -13,15 +13,13 @@ beside it, so that a mistake on one side shows up as a disagreement:
   `docs/TraceQL/sql-schema.md` §5.2 — and what a metric, a grouping stage and
   `compare()` return.
 
-`measure/perturb_check.py` changes one rule at a time, on one side at a time,
-and requires the comparison to go red each time. A change made HERE must go red
-just as a change made in the renderer does; that is what says the two sides are
-not the same reasoning written twice.
+`measure/perturb_check.py` changes one rule here at a time and requires the
+comparison to go red each time.
 """
 import decimal, json, math, re
 
-# This side's own tables. Same sources as the renderer's, read again rather
-# than imported: an import is what made a shared-encoding defect invisible
+# This side's own tables, read from their sources rather than imported from
+# the product: an import is what made a shared-encoding defect invisible
 # (review round 4, finding 4).
 STATUS_CODE = {'unset': 0, 'ok': 1, 'error': 2}
 KIND_CODE = {'unspecified': 0, 'internal': 1, 'server': 2, 'client': 3,
@@ -391,7 +389,7 @@ class Interp:
     # spans match" but "what does the request answer". Each shape below is
     # written from the document that defines it — the trace envelope of
     # `sql-schema.md` §5.2, the series envelope of §5.6, `compare()`'s two
-    # distributions — and never from the SQL that `catalogue_render.py` emits.
+    # distributions — and never from the shipped compiler's SQL.
 
     def value_field(self, row, e):
         """A field in VALUE position: `select(...)`, `by(...)`, and either side
