@@ -27,7 +27,7 @@ CLICKHOUSE_SERVER=$ch CLICKHOUSE_HTTP_PORT=$port CLICKHOUSE_DB=$db sh "$root/sch
 # Two hours ago, on a minute: inside the default seven-day retention, and the
 # step's grid starts at the fixture's first span.
 base=${CATALOGUE_BASE:-$(( ( $(date -u +%s) - 7200 ) / 60 * 60 ))}
-start=${base}000000000 end=$(( base + 60 ))000000000
+start=${base}000000000 end=$(( base + 120 ))000000000
 python3 "$here/fixture/make_catalogue_fixture.py" "$work/cat" "$base" > "$work/fixture.json"
 want=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["spans"])' "$work/fixture.json")
 
