@@ -2194,13 +2194,18 @@ impl TraceEngine {
 /// [`crate::traces::filter::TRACE_STR_COL_CAP`]-capped string columns
 /// (never a-priori row-unbounded); the Layer-2 retention counter is the
 /// binding bound on accumulated state across the whole request.
+///
+/// #603 follow-up: the answer pins follow the base, before every other
+/// setting, pruning on only when sharded (trace rows are placed by
+/// `cityHash64(trace_id)`).
 fn search_settings(config: &TraceReadConfig) -> QuerySettings {
     let base = if config.distributed {
         QuerySettings::clustered_reader(config.skip_unavailable_shards)
     } else {
         QuerySettings::new()
     };
-    base.set("max_rows_to_read", config.scan_budget_rows)
+    base.answer_pins(config.distributed, config.skip_unavailable_shards)
+        .set("max_rows_to_read", config.scan_budget_rows)
         .set("max_bytes_to_read", TRACE_READ_BYTES_BUDGET)
         .set("read_overflow_mode", "throw")
         .set("max_result_bytes", TRACE_MAX_RESULT_BYTES)
@@ -2316,7 +2321,10 @@ fn tag_read_error(e: ChError, n: &TagNarrowing, config: &TraceReadConfig) -> Rea
 /// unbounded scan; scoped reads that prune to a small partition stay
 /// under budget and return `200` as before.
 fn catalog_settings(config: &TraceReadConfig) -> QuerySettings {
+    // The catalogue tables are copied whole to every node, so no read of
+    // them fans out: the answer pins with pruning off.
     QuerySettings::new()
+        .answer_pins(false, config.skip_unavailable_shards)
         .set("max_rows_to_read", config.scan_budget_rows)
         .set("max_bytes_to_read", TRACE_READ_BYTES_BUDGET)
         .set("read_overflow_mode", "throw")
@@ -2369,7 +2377,8 @@ fn fetch_settings(config: &TraceReadConfig) -> QuerySettings {
         QuerySettings::new()
     };
     with_final(
-        base.set("max_rows_to_read", config.scan_budget_rows)
+        base.answer_pins(config.distributed, config.skip_unavailable_shards)
+            .set("max_rows_to_read", config.scan_budget_rows)
             .set("max_bytes_to_read", TRACE_READ_BYTES_BUDGET)
             .set("read_overflow_mode", "throw")
             .set("max_query_size", crate::querytext::MAX_QUERY_TEXT_BYTES)
@@ -3394,15 +3403,35 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         let mem = TEST_READ_MEM.to_string();
+        // `QuerySettings::set` keeps an existing key's position and appends
+        // a new one, so the answer pins (#603 follow-up) the clustered base
+        // does not already carry follow it, in `ANSWER_PIN_NAMES` order.
         let want: Vec<(String, String)> = [
             ("optimize_skip_unused_shards", "1"),
             ("optimize_distributed_group_by_sharding_key", "1"),
             ("distributed_aggregation_memory_efficient", "1"),
             ("prefer_localhost_replica", "1"),
             ("skip_unavailable_shards", "1"),
+            (
+                "skip_unavailable_shards_mode",
+                "unavailable_or_table_missing",
+            ),
+            ("distributed_group_by_no_merge", "0"),
+            ("enable_parallel_replicas", "0"),
+            ("max_parallel_replicas", "1"),
+            ("distinct_overflow_mode", "throw"),
+            ("group_by_overflow_mode", "throw"),
+            ("join_overflow_mode", "throw"),
+            ("read_overflow_mode", "throw"),
+            ("read_overflow_mode_leaf", "throw"),
+            ("result_overflow_mode", "throw"),
+            ("set_overflow_mode", "throw"),
+            ("sort_overflow_mode", "throw"),
+            ("timeout_overflow_mode", "throw"),
+            ("timeout_overflow_mode_leaf", "throw"),
+            ("transfer_overflow_mode", "throw"),
             ("max_rows_to_read", "1000"),
             ("max_bytes_to_read", "53687091200"),
-            ("read_overflow_mode", "throw"),
             ("max_query_size", "8388608"),
             // From the fixture's own ceiling, not restated: a literal here
             // would pass against a config that carried something else.
@@ -3426,25 +3455,23 @@ mod tests {
             "a replica preference closes none of the visibility states"
         );
 
-        // Unclustered: the same budgets and `final`, with no
-        // clustered-reader block at all.
+        // Unclustered: the 17 answer pins, then the same budgets and
+        // `final`, with no clustered-reader block at all.
         let local: Vec<String> = fetch_settings(&cfg())
             .entries()
             .map(|(k, _)| k.to_string())
             .collect();
-        assert_eq!(
-            local,
-            vec![
-                "max_rows_to_read",
-                "max_bytes_to_read",
-                "read_overflow_mode",
-                "max_query_size",
-                "max_memory_usage",
-                "max_bytes_before_external_group_by",
-                "final",
-                "do_not_merge_across_partitions_select_final",
-            ]
-        );
+        let mut want_local: Vec<&str> = pulsus_clickhouse::ANSWER_PIN_NAMES.to_vec();
+        want_local.extend([
+            "max_rows_to_read",
+            "max_bytes_to_read",
+            "max_query_size",
+            "max_memory_usage",
+            "max_bytes_before_external_group_by",
+            "final",
+            "do_not_merge_across_partitions_select_final",
+        ]);
+        assert_eq!(local, want_local);
     }
 
     /// `F-19`: **the route flag, one sub-case per arm, with the second
@@ -4268,8 +4295,10 @@ mod tests {
                 "missing {expected} in {rendered}"
             );
         }
+        // `optimize_skip_unused_shards` is an answer pin, sent as `0`
+        // (#603 follow-up); the rest of the §7 block stays clustered-only.
         assert!(
-            !rendered.contains("optimize_skip_unused_shards"),
+            !rendered.contains("prefer_localhost_replica"),
             "unclustered engines must not carry the §7 settings"
         );
     }
@@ -4413,12 +4442,12 @@ mod tests {
                 "missing {expected} in {rendered}"
             );
         }
-        for absent in ["optimize_skip_unused_shards", "prefer_localhost_replica"] {
-            assert!(
-                !rendered.contains(absent),
-                "unexpected {absent} in {rendered} — catalog reads are never clustered"
-            );
-        }
+        // `optimize_skip_unused_shards` is an answer pin, sent as `0`
+        // (#603 follow-up).
+        assert!(
+            !rendered.contains("prefer_localhost_replica"),
+            "unexpected prefer_localhost_replica in {rendered} — catalog reads are never clustered"
+        );
     }
 
     /// Distributed config must not leak the clustered-reader settings into
@@ -4430,8 +4459,60 @@ mod tests {
         let mut config = cfg();
         config.distributed = true;
         let rendered = format!("{:?}", catalog_settings(&config));
-        assert!(!rendered.contains("optimize_skip_unused_shards"));
+        // `optimize_skip_unused_shards` is an answer pin, sent as `0`
+        // (#603 follow-up).
         assert!(!rendered.contains("prefer_localhost_replica"));
+    }
+
+    /// TP1 (#603 follow-up): every trace settings builder carries the
+    /// answer pins, pruning as the deployment is sharded and the option as
+    /// configured, except the tag reads' `distinct_overflow_mode = 'break'`
+    /// (their 10,000-value cut); the catalogue reads never prune.
+    #[test]
+    fn every_trace_read_carries_the_answer_pins() {
+        for distributed in [false, true] {
+            for skip in [false, true] {
+                let config = TraceReadConfig {
+                    distributed,
+                    skip_unavailable_shards: skip,
+                    ..cfg()
+                };
+                let pins = QuerySettings::new().answer_pins(distributed, skip);
+                let builders = [
+                    ("search_settings", search_settings(&config)),
+                    ("tag_store_settings", tag_store_settings(&config)),
+                    ("fetch_settings", fetch_settings(&config)),
+                    ("metrics_settings", metrics_settings(&config)),
+                    ("statement_settings", statement_settings(&config)),
+                    ("graph_settings", graph_settings(&config)),
+                ];
+                for (builder, s) in &builders {
+                    for name in pulsus_clickhouse::ANSWER_PIN_NAMES {
+                        let want = if *builder == "tag_store_settings"
+                            && name == "distinct_overflow_mode"
+                        {
+                            Some("break")
+                        } else {
+                            pins.get(name)
+                        };
+                        assert_eq!(
+                            s.get(name),
+                            want,
+                            "{builder}, distributed {distributed}, skip {skip}: {name}"
+                        );
+                    }
+                }
+                let catalog_pins = QuerySettings::new().answer_pins(false, skip);
+                let catalog = catalog_settings(&config);
+                for name in pulsus_clickhouse::ANSWER_PIN_NAMES {
+                    assert_eq!(
+                        catalog.get(name),
+                        catalog_pins.get(name),
+                        "catalog_settings, distributed {distributed}, skip {skip}: {name}"
+                    );
+                }
+            }
+        }
     }
 
     // --- Issue #35: full-shape parse bound (traces) ---

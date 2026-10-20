@@ -1989,10 +1989,15 @@ enum ReviewedVerdict {
 // shorter body moved `exec.rs:3324` to `:3267`, `exec.rs:3284-3290` to
 // `:3227-3233`, and the grouped row charge moved `exec.rs:910` to `:912`.
 // The verdicts are unchanged.
+//
+// #603 follow-up: coordinates and nothing else. The answer pins in
+// `search_settings` moved the block, and the pointer now names exactly its
+// `max_rows_to_read` / `read_overflow_mode` lines: `exec.rs:2204-2210` is
+// `:2208-2210`. The verdict is unchanged.
 const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 2] = [
     (
         "docs/query-lowering.md",
-        "exec.rs:2204-2210",
+        "exec.rs:2208-2210",
         0,
         ReviewedVerdict::FallbackWrong,
         "the search settings block the same section quotes; it is in traces/exec.rs \

@@ -207,6 +207,7 @@ fn now_ms() -> i64 {
 
 fn cache_config(db: &str) -> LabelCacheConfig {
     LabelCacheConfig {
+        skip_unavailable_shards: false,
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
         db: db.to_string(),
         series_table: "metric_series".to_string(),
@@ -220,6 +221,7 @@ fn cache_config(db: &str) -> LabelCacheConfig {
 
 fn engine_config(db: &str) -> MetricsConfig {
     MetricsConfig {
+        skip_unavailable_shards: false,
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
         db: db.to_string(),
         samples_table: "metric_samples".to_string(),

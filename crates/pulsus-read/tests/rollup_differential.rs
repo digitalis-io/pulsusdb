@@ -591,6 +591,7 @@ async fn engine_query_on_the_rollup_path_matches_independently_computed_raw_coun
     let engine = LogQlEngine::new(
         engine_client,
         EngineConfig {
+            skip_unavailable_shards: false,
             // Issue #398: the per-query ClickHouse memory ceiling; the
             // production default, so this fixture keeps today's behaviour.
             read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
@@ -677,6 +678,7 @@ async fn engine_query_on_the_client_agg_path_matches_the_sql_aggregated_count() 
     let engine = LogQlEngine::new(
         engine_client,
         EngineConfig {
+            skip_unavailable_shards: false,
             // Issue #398: the per-query ClickHouse memory ceiling; the
             // production default, so this fixture keeps today's behaviour.
             read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
@@ -791,6 +793,7 @@ async fn engine_client_agg_scan_past_the_byte_budget_is_a_named_query_too_broad(
     let engine = LogQlEngine::new(
         engine_client,
         EngineConfig {
+            skip_unavailable_shards: false,
             // Issue #398: the per-query ClickHouse memory ceiling; the
             // production default, so this fixture keeps today's behaviour.
             read_max_memory_bytes: 8 * 1024 * 1024 * 1024,

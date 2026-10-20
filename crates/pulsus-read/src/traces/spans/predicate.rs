@@ -272,10 +272,23 @@ pub(super) fn element_index_in(
     c.render_expr(leaf)
 }
 
+/// [`element_index_in`] with `arrayLastIndex`: the 1-based index of the
+/// LAST element whose own condition holds, the element the search
+/// response projects (issue #600 part 3). `false` when the condition holds
+/// on no span.
+pub(super) fn last_element_index_in(
+    leaf: &FieldExpr,
+    ctx: &PredicateCtx<'_>,
+) -> Result<String, PlanError> {
+    let mut c = Compiler::new(Some(*ctx));
+    c.head = Head::LastIndex;
+    c.render_expr(leaf)
+}
+
 /// Issue #591 part 2's section 3.5: `comparison`, holding one set field
-/// once inside arithmetic, in select mode — the first element of the
-/// field's set the comparison holds for, read through every binder outside
-/// the loop. `false` when the comparison holds on no span.
+/// once inside arithmetic, in select mode — the last element of the
+/// field's set the comparison holds for (issue #600 part 3), read through
+/// every binder outside the loop. `false` when the comparison holds on no span.
 pub(super) fn element_select_in(
     comparison: &FieldExpr,
     ctx: &PredicateCtx<'_>,
@@ -565,14 +578,16 @@ struct Compiler<'a> {
     span_values: SpanValues,
 }
 
-/// The head of an element loop: `arrayExists` for the predicate; for the
-/// search projection (issue #591 part 2), `arrayFirstIndex`, the first
-/// element whose own condition holds, or select mode, the first element
-/// itself.
+/// The head of an element loop: `arrayExists` for the predicate;
+/// `arrayFirstIndex`, the first element whose own condition holds, for a
+/// search aggregate's argument; for the search projection (issue #591 part
+/// 2, issue #600 part 3), `arrayLastIndex`, the last such element, or
+/// select mode, the last element itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Head {
     Exists,
     FirstIndex,
+    LastIndex,
     Select,
 }
 
@@ -582,6 +597,7 @@ impl Head {
         match self {
             Head::Exists | Head::Select => "arrayExists",
             Head::FirstIndex => "arrayFirstIndex",
+            Head::LastIndex => "arrayLastIndex",
         }
     }
 }
@@ -1312,8 +1328,9 @@ impl<'a> Compiler<'a> {
     /// over a body of `false`, so it holds when a set is empty (decision 9).
     ///
     /// In select mode (issue #591 part 2's section 3.5) the loop is
-    /// `arrayFirst`, the first element the comparison holds for, and each
-    /// binder outside it reads that element: `arrayElement(arrayMap(…), 1)`.
+    /// `arrayLast`, the last element the comparison holds for (issue #600
+    /// part 3), and each binder outside it reads that element:
+    /// `arrayElement(arrayMap(…), 1)`.
     /// The arithmetic sides' binders inside the loop stay `arrayExists`:
     /// they are the loop's condition.
     fn occurrence_build(&self, op: ComparisonOp, l: &Arms, r: &Arms, body: String) -> String {
@@ -1331,7 +1348,7 @@ impl<'a> Compiler<'a> {
         let mut text = bind_values(&arith, &[], body);
         for occ in self.occurrences.iter().rev() {
             let each = if select {
-                "arrayFirst"
+                "arrayLast"
             } else if neq {
                 "arrayAll"
             } else {
@@ -2277,8 +2294,9 @@ pub(super) fn attr_path(root: &str, key: &str) -> String {
 }
 
 /// Any element holds the key. Absence is `NOT` outside, so a span carrying
-/// no elements lacks it. `head` is the loop's function: `arrayExists`, or
-/// `arrayFirstIndex` for the search projection's first element holding it.
+/// no elements lacks it. `head` is the loop's function: `arrayExists`;
+/// `arrayFirstIndex` for a search aggregate's first element holding it, or
+/// `arrayLastIndex` for the search projection's last.
 fn element_exists(root: &str, key: &str, negated: bool, head: &str) -> String {
     let present = format!(
         "{head}(d -> dynamicType(d) {HELD}, {})",

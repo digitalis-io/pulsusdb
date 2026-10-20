@@ -18,7 +18,7 @@ and requires the comparison to go red each time. A change made HERE must go red
 just as a change made in the renderer does; that is what says the two sides are
 not the same reasoning written twice.
 """
-import decimal, json, re
+import decimal, json, math, re
 
 # This side's own tables. Same sources as the renderer's, read again rather
 # than imported: an import is what made a shared-encoding defect invisible
@@ -59,14 +59,6 @@ def value_text(t, v):
     if t == 'd': return f'{v:g}'
     return str(v)
 
-
-def label_text(v):
-    """The text a group or series label carries, from a value this interpreter
-    already holds as a Python object rather than as a stored (type, value)
-    pair."""
-    if isinstance(v, bool): return 'true' if v else 'false'
-    if isinstance(v, float): return f'{v:g}'
-    return str(v)
 
 # ------------------------------------------------------------- interpreter --
 class Fixture:
@@ -140,27 +132,6 @@ def f32(x):
     stated at that precision here."""
     import struct
     return struct.unpack('f', struct.pack('f', float(x)))[0]
-
-
-def log2_bucket_ns(dur):
-    """The `histogram_over_time` bucket: the smallest power of two nanoseconds
-    at or above the duration, and nothing at all below 2 ns.
-
-    The reference's `Log2Bucketize` (`pkg/traceql/engine_metrics.go:2038-2046 @
-    v3.0.2`) bit-scans `v - 1`; written here over Python integers, which is the
-    same arithmetic without the word width. The label is the bucket in
-    nanoseconds; the response layer renders it as float seconds
-    (`log2_histogram::bucket_seconds`)."""
-    if dur < 2: return None
-    return 1 << (dur - 1).bit_length()
-
-
-def bucket_label_ms(start_ns, step_ns):
-    """The instant that CLOSES the bucket a span falls in, in milliseconds:
-    the metrics window is left-closed and right-open and a range selector's
-    instants are right-closed, so a span at exactly a step edge belongs to the
-    bucket that edge ends (`sql-schema.md` §5.6)."""
-    return ((start_ns - 1) // step_ns + 1) * step_ns // 10 ** 6
 
 
 def kind(v):
@@ -342,7 +313,7 @@ class Interp:
         cmpst = next((s for s in pipe if s['k'] == 'compare'), None)
         if cmpst: return self.compare_answer(q, cmpst)
         metric = next((s for s in pipe if s['k'] == 'metric'), None)
-        if metric: return self.metric_answer(q, metric)
+        if metric: raise NotImplementedError('metrics: range_answer (#600 part 1b-1)')
         return sorted(r['span_id'] for r in self.matched_rows(q))
 
     def matched_rows(self, q):
@@ -501,47 +472,6 @@ class Interp:
         return [(f'{sc}/{k}={v}:{ty}', side, str(n))
                 for (sc, k, v, ty), side, n in self.compare_tuples(q, stage)]
 
-    def metric_answer(self, q, metric):
-        sp = q['spanset']
-        rows = self.spanset(sp)
-        step = 60 * 10**9
-        out = {}
-        for r in rows:
-            if metric['fn'] == 'histogram_over_time':
-                g = log2_bucket_ns(r['dur'])
-                if g is None: continue        # a span shorter than 2 ns has no bucket
-                g = str(g)
-            elif metric.get('by') is not None:
-                v = self.value_field(r, metric['by'])
-                g = '' if v is None else label_text(v)
-            else:
-                g = ''
-            t = bucket_label_ms(r['start_ns'], step)
-            out.setdefault((g, t), []).append(r)
-        fn = metric['fn']
-        qarg = float(metric['args'][1]['v']) if fn == 'quantile_over_time' and len(metric['args']) > 1 else 0.9
-        res = []
-        for (g, t), rs in sorted(out.items()):
-            durs = sorted(x['dur'] for x in rs)
-            v = {'rate': len(rs), 'count_over_time': len(rs), 'histogram_over_time': len(rs),
-                 'sum_over_time': sum(durs), 'min_over_time': min(durs), 'max_over_time': max(durs),
-                 'avg_over_time': sum(durs) / len(durs),
-                 'quantile_over_time': f32(durs[min(len(durs) - 1, int(qarg * len(durs)))])}[fn]
-            res.append((g, t, v))
-        if 'cmp' in metric:
-            op, val = metric['cmp']
-            th = self.lit(val)
-            res = [x for x in res if self.cmp(op, x[2], th)]
-        second = next((x for x in q['pipeline'] if x['k'] == 'second'), None)
-        if second:
-            totals = {}
-            for g, t, v in res: totals[g] = totals.get(g, 0) + v
-            order = sorted(totals, key=lambda g: (-totals[g], g)) if second['fn'] == 'topk' \
-                    else sorted(totals, key=lambda g: (totals[g], g))
-            keep = set(order[:second['n']])
-            res = [x for x in res if x[0] in keep]
-        return res
-
     # ------------------------------------------ what the route itself returns --
     #
     # The independent side of the check review round 4 asked for: not "which
@@ -572,7 +502,7 @@ class Interp:
         cmpst = next((s for s in q['pipeline'] if s['k'] == 'compare'), None)
         if cmpst: return self.compare_rows(q, cmpst)
         metric = next((s for s in q['pipeline'] if s['k'] == 'metric'), None)
-        if metric: return self.metric_rows(q, metric)
+        if metric: raise NotImplementedError('metrics: range_answer (#600 part 1b-1)')
         return self.search_answer(q)
 
     # `docs/api.md` §4.2, "The matched-span projection": the fields the span
@@ -585,25 +515,34 @@ class Interp:
     COLUMNS = {'name', 'status', 'kind', 'statusMessage', 'parentID',
                'instrumentation:name', 'instrumentation:version'}
 
-    def wire(self, row, f, leaf=None):
+    def last_attr(self, row, scope, key):
+        """the last element of an event or link scope holding `key`, or None"""
+        items = row['events'] if scope == 'event' else row['links']
+        held = [(t, v) for *_, at in items for k, t, v in at if k == key]
+        return held[-1] if held else None
+
+    def wire(self, row, f, leaf=None, last=False):
         """`(identity, key, type, value)` of field `f` on `row` as the response
         carries it, or None when the span holds no value: the bare key, the
-        stored type, `status` and `kind` as keywords; an event or link
-        intrinsic is the first element satisfying `leaf`."""
+        stored type, `status` and `kind` as keywords. An event or link field
+        is the LAST element satisfying `leaf` (`docs/api.md` §4.2, "Which
+        value a span *has*"); with no `leaf`, the last element holding the key
+        when `last` (the projection) and the first otherwise (a `by()` key)."""
         if f['k'] == 'attr':
             if f['key'] == 'service.name' and f['scope'] == 'resource':
                 return ('resource', 'service.name'), 'service.name', arm('string', row['service'])
             if f['scope'] in ('event', 'link') and leaf is not None:
                 items = row['events'] if f['scope'] == 'event' else row['links']
                 rv = self.value(row, leaf['r'])
-                for *_, at in items:
-                    for k, t, v in at:
-                        if k == f['key'] and self.cmp(leaf['op'], v, rv):
-                            return (f['scope'], k), k, arm(VALUE_TYPE[t], v)
-                return None
+                hits = [(k, t, v) for *_, at in items for k, t, v in at
+                        if k == f['key'] and self.cmp(leaf['op'], v, rv)]
+                if not hits: return None
+                k, t, v = hits[-1]
+                return (f['scope'], k), k, arm(VALUE_TYPE[t], v)
             scopes = UNSCOPED_ORDER if f['scope'] == 'unscoped' else (f['scope'],)
             for sc in scopes:
-                got = self.attr(row, sc, f['key'])
+                got = (self.last_attr(row, sc, f['key']) if last and sc in ('event', 'link')
+                       else self.attr(row, sc, f['key']))
                 if got is not None:
                     return (sc, f['key']), f['key'], arm(VALUE_TYPE[got[0]], got[1])
             return None
@@ -614,7 +553,8 @@ class Interp:
             rv = None if leaf is None else self.value(row, leaf['r'])
             vals = [v for v in vals if leaf is None or self.cmp(leaf['op'], v, rv)]
             if not vals: return None
-            return ('intrinsic', n), n, arm('int' if n == 'event:timeSinceStart' else 'string', vals[0])
+            v = vals[-1] if leaf is not None or last else vals[0]
+            return ('intrinsic', n), n, arm('int' if n == 'event:timeSinceStart' else 'string', v)
         if n in ('duration', 'traceDuration', 'trace:duration'):
             return ('intrinsic', n), n, arm('string', go_duration(self.intrinsic(row, n)))
         v = self.intrinsic(row, n)
@@ -644,7 +584,7 @@ class Interp:
             if f['k'] == 'intrinsic' and f['name'] in self.NOT_PROJECTED: return
             if f['k'] == 'intrinsic' and f['name'] in ('name', 'span:name'):
                 name[0] = True; return
-            w = self.wire(row, f, leaf)
+            w = self.wire(row, f, leaf, last=True)
             if w is None or w[0] in seen: return
             seen.add(w[0]); out.append([w[1], w[2]])
 
@@ -785,42 +725,138 @@ class Interp:
                 except ValueError: return 0
         return DEFAULT_EXEMPLARS
 
-    def metric_rows(self, q, metric):
-        """`sql-schema.md` §5.6: one row per series, its points in bucket order,
-        and — when `with(exemplars=…)` asks for them — one exemplar per bucket
-        per series, the span with the largest duration in that bucket."""
-        flat = self.metric_answer(q, metric)
-        want_ex = self.exemplar_budget(q) > 0
-        ex_by = {}
-        if want_ex:
-            step = 60 * 10**9
-            for r in self.matched_rows(q):
-                t = bucket_label_ms(r['start_ns'], step)
-                g = self.metric_series_key(r, metric)
-                cur = ex_by.get((g, t))
-                if cur is None or (r['dur'], r['span_id']) > (cur['dur'], cur['span_id']):
-                    ex_by[(g, t)] = r
-        out = {}
-        for g, t, v in flat: out.setdefault(g, []).append((t, v))
-        rows = []
-        for g in sorted(out):
-            points = [[t, v] for t, v in out[g]]
-            if want_ex:
-                ex = [[t, ex_by[(g, t)]['trace_id'], ex_by[(g, t)]['span_id'], ex_by[(g, t)]['dur']]
-                      for t, _ in out[g]]
-                rows.append([g, points, ex])
-            else:
-                rows.append([g, points])
-        return rows
+    # `docs/api.md` §4.4, "Grouping": a missing value of these keys is a `nil`
+    # label, of any other key no label; one key missing alone is `nil` either way
+    WELL_KNOWN = {('resource', k) for k in ('service.name', 'cluster', 'namespace', 'pod',
+                  'container', 'k8s.cluster.name', 'k8s.namespace.name', 'k8s.pod.name',
+                  'k8s.container.name')} | {('span', k) for k in ('http.status_code',
+                  'http.method', 'http.url')}
+    LABEL_TYPE = {'s': 'string', 'i': 'int', 'd': 'double', 'b': 'bool'}
 
-    def metric_series_key(self, r, metric):
-        if metric['fn'] == 'histogram_over_time':
-            b = log2_bucket_ns(r['dur'])
-            return None if b is None else str(b)
-        by = metric.get('by')
-        if by is None: return ''
-        v = self.value_field(r, by)
-        return '' if v is None else label_text(v)
+    def series_key(self, r, f):
+        """`(sort key, label)` of `by(f)` on span `r`: the label `<scope>.<key>`
+        (`.<key>` unscoped) with the value in its stored type; a missing value
+        `nil`, sorted as the empty text (`docs/api.md` §4.4)"""
+        if f['k'] == 'intrinsic':                      # a string intrinsic: `name`
+            v = self.intrinsic(r, f['name'])
+            return (v, 's'), (f['name'], ('string', v))
+        name = ('.' if f['scope'] == 'unscoped' else f['scope'] + '.') + f['key']
+        if f['scope'] == 'resource' and f['key'] == 'service.name':
+            return (r['service'], 's'), (name, ('string', r['service']))
+        got = self.attr(r, f['scope'], f['key'])
+        if got is None:
+            code = 'N' if (f['scope'], f['key']) in self.WELL_KNOWN else 'n'
+            return ('', code), (name, ('string', 'nil'))
+        t, v = got
+        text = ('true' if v else 'false') if t == 'b' else str(v)
+        return (text, t), (name, (self.LABEL_TYPE[t], v))
+
+    def range_answer(self, q, start, end, step=60 * 10**9):
+        """`docs/api.md` §4.4: the `query_range` answer of a metrics query that
+        is not `compare()`, as the command writes it."""
+        metric = next(s for s in q['pipeline'] if s['k'] == 'metric')
+        second = next((s for s in q['pipeline'] if s['k'] == 'second'), None)
+        fn = metric['fn']
+        dense = fn in ('rate', 'count_over_time', 'histogram_over_time', 'quantile_over_time')
+        # a quantile's levels, in the query's order, each its own series
+        levels = [float(a['v']) for a in metric['args'][1:]] if fn == 'quantile_over_time' else [None]
+        # "Bucketing": snapped outward; labels S … E; label L holds (L − step, L]
+        S, E = start // step * step, -(-end // step) * step
+        grid = [(S + i * step) // 10**6 for i in range((E - S) // step + 1)]
+        arg = metric['args'][0] if metric['args'] and fn not in ('rate', 'count_over_time') else None
+
+        def target(r):
+            """the target in its unit: `duration` in seconds, an attribute's
+            Int64 or Float64 as a double, `span:childCount`; None: not counted"""
+            if arg is None or arg['k'] == 'intrinsic' and arg['name'] in ('duration', 'span:duration'):
+                return r['dur'] / 1e9
+            if arg['k'] == 'intrinsic':                    # span:childCount
+                return float(self.child_count(r))
+            got = self.attr(r, arg['scope'], arg['key'])
+            return float(got[1]) if got and got[0] in ('i', 'd') else None
+        cells = {}
+        for r in self.spanset(q['spanset']):
+            if not S - step < r['start_ns'] <= E: continue
+            if fn.endswith('_over_time') and fn != 'count_over_time' and target(r) is None: continue
+            if fn == 'histogram_over_time':
+                if r['dur'] < 2: continue
+                b = 1 << (r['dur'] - 1).bit_length()       # the log2 bucket, ns
+                key = ((b,), (('__bucket', ('double', b / 1e9)),))
+            elif 'by' in metric:
+                sk, label = self.series_key(r, metric['by'])
+                key = (sk, (label,))
+            elif fn == 'quantile_over_time':
+                key = ((), ())                          # its `p` label is its only one
+            else:
+                key = ((), (('__name__', ('string', fn)),))
+            t = ((r['start_ns'] - 1) // step + 1) * step // 10**6
+            cells.setdefault(key, {}).setdefault(t, []).append(r)
+
+        def value(rs, level=None):
+            # a duration aggregates in nanoseconds and converts once
+            # (`float64(ns)/1e9`); any other target aggregates its own number
+            dur = arg is None or arg['k'] == 'intrinsic' and arg['name'] in ('duration', 'span:duration')
+            d = [x['dur'] for x in rs] if dur else [target(x) for x in rs]
+            k = 1e9 if dur else 1
+            if fn == 'quantile_over_time':
+                # the exact quantile: the ceil(p * n)-th smallest duration (at
+                # least the first), as the 32-bit float the t-digest returns
+                d = sorted(d)
+                return f32(d[max(1, math.ceil(level * len(d))) - 1]) / k
+            return {'rate': lambda: len(rs) / (step / 1e9), 'count_over_time': lambda: float(len(rs)),
+                    'histogram_over_time': lambda: float(len(rs)),
+                    'sum_over_time': lambda: float(sum(d)) / k,
+                    'min_over_time': lambda: float(min(d)) / k,
+                    'max_over_time': lambda: float(max(d)) / k,
+                    'avg_over_time': lambda: (sum(d) / len(d)) / k}[fn]()
+        # dense: every label, 0 where empty; the value aggregations: occupied only
+        pts = [((key[0] + (i,), key[1] + ((('p', ('double', lv)),) if lv is not None else ())),
+                t, value(by_t[t], lv) if t in by_t else 0.0, by_t.get(t, []))
+               for key, by_t in cells.items() for i, lv in enumerate(levels)
+               for t in grid if dense or t in by_t]
+        if fn == 'quantile_over_time':
+            # an exemplar sits on the `p` series whose value at its own bucket
+            # is nearest its duration, ties to the first (`docs/api.md` §4.4)
+            at = {(p[0][0][:-1], p[1]): [] for p in pts}
+            for p in pts: at[(p[0][0][:-1], p[1])].append(p)
+            def placed(p):
+                if not p[3]: return []
+                top = max(p[3], key=lambda x: (x['dur'], x['span_id']))
+                own = top['dur'] / 1e9
+                best = min(at[(p[0][0][:-1], p[1])], key=lambda o: (abs(o[2] - own), o[0][0][-1]))
+                return p[3] if best[0] == p[0] else []
+            pts = [(k, t, v, placed((k, t, v, rs))) for k, t, v, rs in pts]
+        if 'cmp' in metric:
+            op, lit = metric['cmp']
+            th = self.lit(lit) / 1e9 if lit.get('t') == 'duration' else self.lit(lit)
+            pts = [p for p in pts if self.cmp(op, p[2], th)]
+        if second:                     # per timestamp, after the comparison, ties by labels
+            keep = []
+            for t in grid:
+                at = sorted((p for p in pts if p[1] == t),
+                            key=lambda p: (-p[2] if second['fn'] == 'topk' else p[2], p[0][0]))
+                keep += at[:second['n']]
+            pts = keep
+        budget = self.exemplar_budget(q)
+        series = {}
+        for key, t, v, rs in pts:
+            s = series.setdefault(key, {'labels': [[k, list(x)] for k, x in key[1]],
+                                        'samples': [], 'exemplars': []})
+            s['samples'].append([t, v])
+            if rs and budget:          # the longest span, the larger id on a tie
+                top = max(rs, key=lambda x: (x['dur'], x['span_id']))
+                s['exemplars'].append({'labels': [['trace:id', ['string', top['trace_id']]]],
+                                       'value': v if dense and fn != 'quantile_over_time' else target(top),
+                                       'ts': top['start_ns'] // 10**6})
+        out = []
+        for key in sorted(series, key=lambda k: k[0]):
+            s = series[key]
+            s['samples'].sort()
+            s['exemplars'].sort(key=lambda e: e['ts'])
+            out.append(s)
+        if sum(len(s['exemplars']) for s in out) > budget > 0:
+            raise NotImplementedError('the exemplar stride is not modelled (#600 part 1b-1)')
+        return {'series': out}
 
     def compare_rows(self, q, stage):
         """`compare()`'s own statement: one row per (scope, key, value, type,

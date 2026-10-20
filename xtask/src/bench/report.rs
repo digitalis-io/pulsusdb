@@ -58,38 +58,22 @@ pub fn render_markdown(report: &BenchReport) -> String {
     }
     if report.dist {
         out.push_str(
-            "\nPer-stage, per-shard evidence (`--dist`) — issue #16 CODE review: every stage a \
-             shape's read actually executes (`resolution`/`hydration`/`samples`/`rollup_range`/\
-             `discovery`) is captured separately, not just the terminal stage, and **every shard \
-             in the cluster is accounted for every stage** — either participating or provably, \
-             derivedly pruned. **Schema note (expected-roster model).** `role` is \
-             `coordinator-local` (the initiator's own `is_initial_query = 1` row — its \
-             in-process local-shard read under `prefer_localhost_replica = 1`), `remote` \
-             (`is_initial_query = 0`, a participating non-initiator shard), or `expected-pruned` \
-             (a shard `optimize_skip_unused_shards` correctly excluded — `read_rows`/\
-             `read_bytes`/`selected_marks` are `0`, and `pruned_reason` spells out the \
-             `cityHash64(fingerprint) % total_weight` derivation). **Unpruned stages** \
-             (`resolution`, \
-             `discovery` — no `fingerprint` predicate to prune by) show every shard \
-             **participating**. **Fingerprint-scoped stages** (`hydration`, `samples`, \
-             `rollup_range`) show exactly the *computed owning subset* participating, with every \
-             other shard `expected-pruned` — full roster **accounted for**, not full roster \
-             **participating**. **Totals-overlap caveat:** the `coordinator-local` row is the \
-             *same* row this table's per-query `read_rows`/etc. columns above come from — those \
-             are the initiator's own local reads, not a cluster-wide sum; a cluster-wide total is \
-             `coordinator-local.read_rows + Σ remote.read_rows` (excluding `expected-pruned` \
-             rows, which contribute `0`).\n\n",
+            "\nPer-stage, per-shard evidence (`--dist`): every logs stage reaches every shard, \
+             and a shard counts as reached when it logged exactly one `QueryFinish` row for the \
+             stage, whatever work it did. `role` is `coordinator` (the initiator, whose \
+             `read_rows` is the cluster total and whose `selected_marks` are its own) or \
+             `remote` (one shard's own figures).\n\n",
         );
         out.push_str(
             "| Query | stage | shard_num | role | hostname | read_rows | read_bytes | \
-             selected_marks | pruned_reason |\n",
+             selected_marks |\n",
         );
-        out.push_str("|---|---|---|---|---|---|---|---|---|\n");
+        out.push_str("|---|---|---|---|---|---|---|---|\n");
         for q in &report.queries {
             for stage in &q.stage_evidence {
                 for shard in &stage.shards {
                     out.push_str(&format!(
-                        "| {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                        "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
                         q.name,
                         stage.stage,
                         shard.shard_num,
@@ -98,7 +82,6 @@ pub fn render_markdown(report: &BenchReport) -> String {
                         shard.read_rows,
                         shard.read_bytes,
                         shard.selected_marks,
-                        shard.pruned_reason.as_deref().unwrap_or("-"),
                     ));
                 }
             }

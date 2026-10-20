@@ -323,6 +323,7 @@ async fn wait_for_cross_shard_split(
 
 fn cache_config_dist(db: &str) -> LabelCacheConfig {
     LabelCacheConfig {
+        skip_unavailable_shards: false,
         // Issue #398: the per-query ClickHouse memory ceiling; the
         // production default, so this fixture keeps today's behaviour.
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
@@ -338,6 +339,7 @@ fn cache_config_dist(db: &str) -> LabelCacheConfig {
 
 fn engine_config_dist(db: &str) -> MetricsConfig {
     MetricsConfig {
+        skip_unavailable_shards: false,
         // Issue #398: the per-query ClickHouse memory ceiling; the
         // production default, so this fixture keeps today's behaviour.
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
@@ -902,4 +904,320 @@ async fn seed_labels_on_every_shard(db: &str, rows: &[SeedSeriesRow]) {
 #[allow(dead_code)]
 fn no_tenant() -> pulsus_model::Tenant {
     pulsus_model::Tenant::from_header(None, false).expect("no header is the empty tenant")
+}
+
+// ---------------------------------------------------------------------------
+// #603 follow-up: the answer pins on metrics reads, under a profile that
+// would change the answer. The engine connects as a user whose own settings
+// carry the profile value, so the engine's pins are what overrides it.
+// ---------------------------------------------------------------------------
+
+/// A user on shard 1 whose own settings carry `settings`.
+async fn profile_user(admin: &ChClient, db: &str, suffix: &str, settings: &str) -> String {
+    let user = format!("{db}_{suffix}");
+    for stmt in [
+        format!("DROP USER IF EXISTS {user}"),
+        format!("CREATE USER {user} IDENTIFIED WITH no_password SETTINGS {settings}"),
+        format!("GRANT SELECT ON {db}.* TO {user}"),
+    ] {
+        admin
+            .execute(&stmt, &QuerySettings::new(), Idempotency::Idempotent)
+            .await
+            .unwrap_or_else(|e| panic!("{e}\n{stmt}"));
+    }
+    user
+}
+
+async fn drop_user(admin: &ChClient, user: &str) {
+    admin
+        .execute(
+            &format!("DROP USER IF EXISTS {user}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the profile user");
+}
+
+/// A client on shard 1, bound to `db`, as `user`.
+async fn client_as(db: &str, user: &str) -> ChClient {
+    ChClient::new(ChConnConfig {
+        user: user.to_string(),
+        ..shard1_config(db)
+    })
+    .await
+    .expect("connect as the profile user")
+}
+
+/// The one `n` a statement answers.
+async fn single_count(client: &ChClient, sql: &str) -> u64 {
+    let mut stream = client
+        .query_stream::<CountRow>(sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    let n = stream
+        .next()
+        .await
+        .expect("one row")
+        .unwrap_or_else(|e| panic!("{e}\n{sql}"))
+        .n;
+    assert!(stream.next().await.is_none(), "one row from {sql}");
+    n
+}
+
+/// The answer as `(labels, value)` pairs, for a vector.
+fn vector_of(result: &QueryResult) -> Vec<(Vec<(String, String)>, f64)> {
+    match result {
+        QueryResult::Vector(v) => v.iter().map(|s| (s.labels.clone(), s.value)).collect(),
+        other => panic!("expected Vector, got {other:?}"),
+    }
+}
+
+/// **LMP.** A metrics read answers completely over split placement under a
+/// profile that prunes shards by the sharding key.
+#[tokio::test]
+async fn a_metrics_read_answers_completely_over_split_placement_under_a_pruning_profile() {
+    skip_unless_live!();
+
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_cluster_prune");
+    let shard1_bootstrap = init_clustered_db(db).await;
+    let shard1 = ChClient::new(shard1_config(db))
+        .await
+        .expect("connect shard1");
+    let shard2 = ChClient::new(shard2_config(db))
+        .await
+        .expect("connect shard2");
+    let t = now_ms();
+    let series = |at: i64| {
+        format!(
+            "({}, 2, 'lmp_metric', 88, {at}, '{{\"job\":\"api\"}}', 0, 0)",
+            now_ms()
+        )
+    };
+    let sample = |at: i64| format!("({}, 0, 'lmp_metric', 88, {at}, '', 0, 1)", now_ms());
+    for (shard, rows) in [
+        (
+            &shard1,
+            vec![series(t - 120_000), sample(t - 120_000), sample(t - 60_000)],
+        ),
+        (&shard2, vec![series(t - 120_000), sample(t - 90_000)]),
+    ] {
+        shard
+            .execute(
+                &format!(
+                    "INSERT INTO metric_landing \
+                     (received_ms, kind, metric_name, fingerprint, unix_milli, labels, value_type, value) \
+                     VALUES {}",
+                    rows.join(", ")
+                ),
+                &QuerySettings::new(),
+                Idempotency::NonIdempotent,
+            )
+            .await
+            .expect("seed a shard's own metric_landing");
+    }
+    // F7: the placement.
+    let local = "SELECT toUInt64(count()) AS n FROM metric_samples";
+    assert_eq!(
+        single_count(&shard1, local).await,
+        2,
+        "shard 1's own samples"
+    );
+    assert_eq!(
+        single_count(&shard2, local).await,
+        1,
+        "shard 2's own samples"
+    );
+
+    let user = profile_user(
+        &shard1_bootstrap,
+        db,
+        "prune",
+        "optimize_skip_unused_shards = 1",
+    )
+    .await;
+    // P5: the profile prunes on this server.
+    let pruned = single_count(
+        &client_as(db, &user).await,
+        &format!(
+            "SELECT toUInt64(count()) AS n FROM {db}.metric_samples_dist WHERE fingerprint IN (88)"
+        ),
+    )
+    .await;
+    assert!(
+        pruned == 2 || pruned == 1,
+        "the profile must prune to the hash owner on this server, got {pruned}"
+    );
+
+    let cache = Arc::new(LabelCache::new(
+        ChClient::new(shard1_config(db))
+            .await
+            .expect("connect cache client"),
+        cache_config_dist(db),
+    ));
+    cache.refresh().await.expect("refresh");
+    assert!(cache.is_warm());
+
+    let expr = parse("sum(count_over_time(lmp_metric[10m]))").expect("parse");
+    let params = MetricQueryParams {
+        start_ms: t,
+        end_ms: t,
+        step_ms: 0,
+    };
+    // C6: the default user.
+    let engine = MetricsEngine::new(
+        ChClient::new(shard1_config(db))
+            .await
+            .expect("connect engine client"),
+        Arc::clone(&cache),
+        engine_config_dist(db),
+    );
+    let (result, _) = engine
+        .query(&no_tenant(), &expr, &params)
+        .await
+        .expect("the control read answers");
+    assert_eq!(
+        vector_of(&result),
+        vec![(Vec::new(), 3.0)],
+        "the control reads both shards"
+    );
+
+    // G7: the profile user.
+    let engine = MetricsEngine::new(
+        client_as(db, &user).await,
+        Arc::clone(&cache),
+        engine_config_dist(db),
+    );
+    let (result, _) = engine
+        .query(&no_tenant(), &expr, &params)
+        .await
+        .expect("the read answers under the pruning profile");
+    assert_eq!(
+        vector_of(&result),
+        vec![(Vec::new(), 3.0)],
+        "G7: a metrics read must reach every shard whatever the profile says"
+    );
+
+    drop_user(&shard1_bootstrap, &user).await;
+    drop_database(&shard1_bootstrap, db).await;
+}
+
+/// **LM.** With shard 2's `metric_samples` gone, a metrics read fails unless
+/// the option allows a partial answer — and a profile alone does not.
+#[tokio::test]
+async fn a_metrics_read_with_a_shard_down_fails_unless_the_option_allows_a_partial_answer() {
+    skip_unless_live!();
+
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_cluster_down");
+    let shard1_bootstrap = init_clustered_db(db).await;
+    let shard2 = ChClient::new(shard2_config("default"))
+        .await
+        .expect("connect shard2");
+    let metric_name = "cluster_down_metric";
+    let fps: Vec<u64> = (1..=40).collect();
+    let bucket = historical_bucket();
+    seed_dist(db, metric_name, &fps, bucket).await;
+    let shard1_local = ChClient::new(shard1_config("default"))
+        .await
+        .expect("connect shard1 (local reads)");
+    wait_for_cross_shard_split(&shard1_local, &shard2, db, metric_name, &fps).await;
+
+    let cache = Arc::new(LabelCache::new(
+        ChClient::new(shard1_config(db))
+            .await
+            .expect("connect cache client"),
+        cache_config_dist(db),
+    ));
+    cache.refresh().await.expect("refresh");
+    assert!(cache.is_warm());
+
+    let n1 = single_count(
+        &shard1_local,
+        &format!("SELECT toUInt64(uniqExact(fingerprint)) AS n FROM {db}.metric_samples"),
+    )
+    .await;
+    assert!(
+        0 < n1 && n1 < 40,
+        "the fixture is split: shard 1 holds {n1} of 40"
+    );
+
+    // K2: shard 2 loses `metric_samples` alone.
+    shard2
+        .execute(
+            &format!("DROP TABLE {db}.metric_samples SYNC"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop shard 2's metric_samples");
+    let user = profile_user(
+        &shard1_bootstrap,
+        db,
+        "skipdown",
+        "skip_unavailable_shards = 1",
+    )
+    .await;
+
+    // P2: the profile gives a silent partial answer on this server.
+    let partial = single_count(
+        &client_as(db, &user).await,
+        &format!("SELECT toUInt64(uniqExact(fingerprint)) AS n FROM {db}.metric_samples_dist"),
+    )
+    .await;
+    assert_eq!(
+        partial, n1,
+        "the profile must skip the missing table on this server"
+    );
+
+    let expr = parse(&format!("count by (job) ({metric_name})")).expect("parse");
+    let params = MetricQueryParams {
+        start_ms: bucket,
+        end_ms: bucket,
+        step_ms: 0,
+    };
+    let engine_as = |client: ChClient, skip: bool| {
+        MetricsEngine::new(
+            client,
+            Arc::clone(&cache),
+            MetricsConfig {
+                skip_unavailable_shards: skip,
+                ..engine_config_dist(db)
+            },
+        )
+    };
+
+    // C3: the default user, option off.
+    let control = engine_as(
+        ChClient::new(shard1_config(db)).await.expect("connect"),
+        false,
+    )
+    .query(&no_tenant(), &expr, &params)
+    .await;
+    assert!(control.is_err(), "the control must fail: {control:?}");
+
+    // G3: the profile user, option off.
+    let got = engine_as(client_as(db, &user).await, false)
+        .query(&no_tenant(), &expr, &params)
+        .await;
+    assert!(
+        got.is_err(),
+        "G3: with the option off the read must fail whatever the profile says, got {got:?}"
+    );
+
+    // G4: the default user, option on.
+    let (result, _) = engine_as(
+        ChClient::new(shard1_config(db)).await.expect("connect"),
+        true,
+    )
+    .query(&no_tenant(), &expr, &params)
+    .await
+    .expect("G4: with the option on the read answers from the other shard");
+    assert_eq!(
+        vector_of(&result),
+        vec![(vec![("job".to_string(), "api".to_string())], n1 as f64)],
+        "G4: the series whose samples are on shard 1"
+    );
+
+    drop_user(&shard1_bootstrap, &user).await;
+    drop_database(&shard1_bootstrap, db).await;
 }

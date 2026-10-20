@@ -68,7 +68,7 @@ The hard requirements are columnar bulk-insert/fetch performance and reliable DD
 |----------|---------|-------------|
 | `PULSUS_CLUSTER` | unset | ClickHouse cluster name; enables `ON CLUSTER` DDL, `Replicated*` engines, and `_dist` tables |
 | `PULSUS_DIST_SUFFIX` | `_dist` | suffix of Distributed tables targeted by readers (set differently for cross-cluster read topologies); the service graph reads the cluster and database that `spans` plus this suffix names |
-| `PULSUS_SKIP_UNAVAILABLE_SHARDS` | `false` | serve degraded reads when a shard is down |
+| `PULSUS_SKIP_UNAVAILABLE_SHARDS` | `false` | on a cluster, what a logs, metrics or trace read does when a shard cannot be reached or does not have the table. `false`: the read fails. `true`: it answers from the other shards, leaving that shard's data out, with no error. |
 | `PULSUS_AVAILABILITY_ZONE` | unset | this node's own availability zone; when set, the connection pool prefers `CLICKHOUSE_SERVERS` endpoints whose zone matches (see below). An explicit value always wins over `PULSUS_AZ_DETECT` |
 | `PULSUS_AZ_DETECT` | `off` | when `PULSUS_AVAILABILITY_ZONE` is unset, auto-detect this node's zone from cloud instance metadata at startup: `off` \| `aws` \| `gcp` \| `azure` \| `auto` (tries each). Detection is fail-soft (any failure/timeout ⇒ unzoned) |
 
