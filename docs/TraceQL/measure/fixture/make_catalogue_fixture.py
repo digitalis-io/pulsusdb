@@ -8,15 +8,16 @@ Four things the layout is built for, each because a fixture without it lets a
 wrong rule pass:
 
 1. **The structural topology** (traces four and five): a chain that alternates
-   the two sides, so the child union, the parent union and the descendant union
-   each return a different pair; a sibling pair under a parent of neither side;
-   a span whose parent is not stored; a two-span cycle.
-2. **A descendant two links past the nearest edge** (trace four,
+   the two sides, so in trace four the child union returns A2 and B1, the
+   parent union A1 and B1, and the descendant union A2, B1, A4 and B4; a
+   sibling pair under a parent of neither side; a span whose parent is not
+   stored; a two-span cycle.
+2. **A descendant three links below its nearest matching ancestor** (trace four,
    `A4 -> N1 -> N2 -> B4`): a direct-child rule and a recursive climb answer
    `{A} >> {B}` differently, and a climb bounded at one link loses B4.
 3. **A positive answer for every rule the corpus exercises** (trace six and the
    additions to trace four): arithmetic values, the escaped names, a bool the
-   truthiness rule must read, a span with four children, a trace with four error
+   truthiness rule must read, a span with eight children, a trace with four error
    spans, a sibling pair that survives a `| count() > 1` stage, and one resource
    carrying a key its span also carries with a different value, so the unscoped
    lookup ORDER decides the answer. `docs/TraceQL/query-catalogue.md` lists the
@@ -110,7 +111,7 @@ span(T3, 10, None, 'second root', 1, 20 * NS + 30 * 10**6, 10 * 10**6, 'plain', 
 # is not stored. A = `.a = 1`, B = `.b = 2`, and P and P2 carry neither, so
 #   child   -> B1        child union   -> A2, B1
 #   parent  -> B1        parent union  -> A1, B1
-#   sibling -> B2        sibling union -> A3, B2
+#   sibling -> B2, B3    sibling union -> A3, B2, B3 (B3 is added below)
 RES_EDGE = [['service.name', 's', 'edge'], ['deployment.environment', 's', 'prod'],
             ['k8s.pod.name', 's', 'edge-a']]
 span(T4, 20, None, 'P', 2, 30 * NS, 5 * NS, 'edge', RES_EDGE, [])
