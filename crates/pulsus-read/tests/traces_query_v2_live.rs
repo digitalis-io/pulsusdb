@@ -13304,7 +13304,8 @@ async fn an_untyped_value_shares_the_missing_series() {
     let nil = "span.tags=nil";
     let mut wrong = Vec::new();
     // (query, each series' name, count and exemplar in ms from L)
-    let cases: [(&str, Vec<(&str, f64, i64)>); 3] = [
+    type Series<'a> = Vec<(&'a str, f64, i64)>;
+    let cases: [(&str, Series); 3] = [
         (
             "{} | count_over_time() by(span.tags)",
             vec![
