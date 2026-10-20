@@ -2268,9 +2268,31 @@ async fn two_replicas_share_one_edge_table() {
     for n in 0..8 {
         let prefix = pulsus_testkit::test_ident(&format!("t599b_k10_{n}_{}", now_ns()));
         assert_g1(&r.graph(&prefix).await, &format!("K10 request {n}"));
-        exec(&r.s1, "SYSTEM FLUSH LOGS").await;
         // The initiator logs the statement's `cluster(…)` table function,
-        // not the tables its parts read.
+        // not the tables its parts read. Its row can reach the log after the
+        // answer does, so the log is read once the row is there, whatever
+        // its settings; the settings are then checked.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            exec(&r.s1, "SYSTEM FLUSH LOGS").await;
+            let logged = count(
+                &r.s1,
+                &format!(
+                    "SELECT count() AS n FROM system.query_log WHERE type = 'QueryFinish' \
+                     AND is_initial_query AND startsWith(query_id, '{prefix}-') \
+                     AND has(tables, '_table_function.cluster')"
+                ),
+            )
+            .await;
+            if logged > 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "K10 request {n}: the route's statement never reached the query log"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
         let graph_statements = count(
             &r.s1,
             &format!(
