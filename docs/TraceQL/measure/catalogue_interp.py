@@ -125,6 +125,29 @@ def f32(x):
     return struct.unpack('f', struct.pack('f', float(x)))[0]
 
 
+def engine_double_text(x):
+    """A double as the engine's `toString` writes it inside an array: the
+    shortest digits that read back as the same double, positional while the
+    decimal point falls within 21 digits of them and 6 zeros after it, else
+    `<digits>e<exponent>` with no `+`; `-0`, `inf`, `-inf`, `nan` as such
+    (measured on the server, #600 part 1b-3)"""
+    x = float(x)
+    if x != x: return 'nan'
+    if x in (float('inf'), float('-inf')): return 'inf' if x > 0 else '-inf'
+    if x == 0: return '-0' if math.copysign(1, x) < 0 else '0'
+    sign = '-' if x < 0 else ''
+    # repr is the shortest round-trip form; the point falls `n` digits after
+    # the first of its significant digits
+    d = decimal.Decimal(repr(abs(x))).as_tuple()
+    n = len(d.digits) + d.exponent
+    digits = ''.join(map(str, d.digits)).rstrip('0')
+    k = len(digits)
+    if k <= n <= 21: return sign + digits + '0' * (n - k)
+    if 0 < n <= 21: return sign + digits[:n] + '.' + digits[n:]
+    if -6 < n <= 0: return sign + '0.' + '0' * -n + digits
+    return sign + digits[0] + ('.' + digits[1:] if k > 1 else '') + 'e' + str(n - 1)
+
+
 def kind(v):
     """a value's type class for the field-vs-field type gate"""
     return 'bool' if isinstance(v, bool) else 'number' if isinstance(v, (int, float)) else 'string'
@@ -666,10 +689,9 @@ class Interp:
         t, v = got
         if t == 'a':
             # each array is its own series labelled `nil` by the engine's text
-            # of it, `['x','y']`, a whole double written as an integer, so two
-            # arrays of one text share a series (`docs/api.md` §4.4; #600 part
-            # 1b-3)
-            text = '[' + ','.join(f"'{e}'" if et == 's' else str(int(e)) if et == 'd' and float(e).is_integer()
+            # of it, `['x','y']`, so two arrays of one text share a series
+            # (`docs/api.md` §4.4; #600 part 1b-3)
+            text = '[' + ','.join(f"'{e}'" if et == 's' else engine_double_text(e) if et == 'd'
                                   else str(e) for et, e in v) + ']'
             return (text, 'a'), (name, ('string', 'nil'))
         text = ('true' if v else 'false') if t == 'b' else str(v)
