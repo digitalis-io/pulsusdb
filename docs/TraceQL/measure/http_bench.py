@@ -5,6 +5,47 @@ statements each request issued and how many bytes ClickHouse sent back.
 Usage: http_bench.py reference|pulsus BASE_URL START_S END_S REPS [CH_URL]
 Prints TSV: name status bytes ms_min ms_median ms_max [statements rows_read ch_bytes_sent]"""
 import sys, time, json, urllib.request, urllib.parse, statistics
+def paired(p_base, r_base, shapes, reps, ch=None):
+    """One row per shape, both stores alternating which goes first."""
+    return []
+
+
+def stub(answer):
+    """A server on 127.0.0.1, on a port the OS picks; answer(path, n) gives the
+    status and body of the n-th call (from 1) to that path."""
+    import http.server, threading
+    seen = {}
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            path = self.path.split('?')[0]
+            seen[path] = seen.get(path, 0) + 1
+            status, body = answer(path, seen[path])
+            self.send_response(status); self.send_header('Content-Length', str(len(body))); self.end_headers()
+            self.wfile.write(body)
+        def log_message(self, *a): pass
+    srv = http.server.ThreadingHTTPServer(('127.0.0.1', 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return f'http://127.0.0.1:{srv.server_address[1]}', srv
+
+
+def self_test():
+    p, ps = stub(lambda path, n: (400, b'no') if path == '/flaky' and n == 1 else (200, b'{}'))
+    r, rs = stub(lambda path, n: (200, b'{}'))
+    rows = {row[0]: row for row in paired(p, r, [('flaky', '/flaky', {}, '/flaky', {}),
+                                                   ('steady', '/steady', {}, '/steady', {})], 3)}
+    fails = 0
+    for name, want in (('flaky', '400'), ('steady', '200')):
+        got = rows[name][1] if name in rows else None
+        ok = got == want
+        print(f'{"ok  " if ok else "FAIL"} {name}: p_status {got}, expected {want}')
+        fails += not ok
+    ps.shutdown(); rs.shutdown()
+    print(f'http_bench.py self-test: {2 - fails} of 2 cases as expected')
+    return 1 if fails else 0
+
+
+if sys.argv[1:] == ['--self-test']:
+    sys.exit(self_test())
 flavor, base, S, E, reps = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5])
 ch = sys.argv[6] if len(sys.argv) > 6 else None
 native = flavor == 'pulsus'
