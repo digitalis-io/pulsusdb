@@ -4,6 +4,8 @@ name: traceql-reference-bench
 
 on:
   workflow_dispatch:
+  push:
+    branches: [issue-601-part3]
 
 permissions:
   contents: read
