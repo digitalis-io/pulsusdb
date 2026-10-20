@@ -34,13 +34,13 @@ FROM (WITH (SELECT tuple(groupArrayIf(trace_id, duration > 1000000000))
  FROM (SELECT trace_id, max(end_ns) - min(start_ns) AS duration, min(root) AS r,
               if(r.1 = 0, if(length(r.4) <= 8192, r.4, substringUTF8(r.4, 1, 2048)), '') AS root_service, if(r.1 = 0, if(length(r.5) <= 8192, r.5, substringUTF8(r.5, 1, 2048)), '') AS root_name
        FROM traces
-       WHERE day >= toDate(fromUnixTimestamp64Nano(1791313560000000000), 'UTC') AND day <= toDate(fromUnixTimestamp64Nano(1791497219999999999), 'UTC')
+       WHERE day >= toDate(fromUnixTimestamp64Nano(1791313600000000000), 'UTC') AND day <= toDate(fromUnixTimestamp64Nano(1791497199999999999), 'UTC')
        GROUP BY trace_id
-       HAVING max(last_start_ns) >= 1791399960000000000 AND min(start_ns) <= 1791410819999999999)) AS per_trace,
-     per_trace.1 AS tl_e0f58a826d69378d2fdfe982d4d9de0c SELECT CAST([], 'Array(Tuple(String, String))') AS g, toUInt64(0) AS o, toFloat64(count()) / 10860 AS v
+       HAVING max(last_start_ns) >= 1791400000000000000 AND min(start_ns) <= 1791410799999999999)) AS per_trace,
+     per_trace.1 AS tl_e0f58a826d69378d2fdfe982d4d9de0c SELECT CAST([], 'Array(Tuple(String, String))') AS g, toUInt64(0) AS o, toFloat64(count()) / 10800 AS v
 FROM spans
-WHERE start_ns >= 1791399960000000000 AND start_ns < 1791410820000000000
-  AND intDiv(start_ns, 300000000000) BETWEEN intDiv(1791399960000000000, 300000000000) AND intDiv(1791410819999999999, 300000000000)
+WHERE start_ns >= 1791400000000000000 AND start_ns < 1791410800000000000
+  AND intDiv(start_ns, 300000000000) BETWEEN intDiv(1791400000000000000, 300000000000) AND intDiv(1791410799999999999, 300000000000)
   AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') >= toDate('2026-10-07') AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') <= toDate('2026-10-07')
   AND (trace_id IN (SELECT arrayJoin(tl_e0f58a826d69378d2fdfe982d4d9de0c))))
 ORDER BY g, o

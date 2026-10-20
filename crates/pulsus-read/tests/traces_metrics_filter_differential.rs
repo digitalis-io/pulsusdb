@@ -266,6 +266,7 @@ async fn pulsus_total(engine: &TraceEngine, q: &str, window: (i64, i64)) -> f64 
             end_ns: window.1,
             step_ms: STEP_MS,
             exemplars: None,
+            floor_ns: i64::MIN,
         },
         &engine.metrics_ctx(),
     )

@@ -31,7 +31,7 @@ docs/TraceQL/functional-requirements.md	crates/pulsus-read/src/traces/tags_sql.r
 docs/TraceQL/functional-requirements.md	crates/pulsus-schema/src/catalog.rs:394-404	not_in_this_repository
 docs/TraceQL/functional-requirements.md	crates/pulsus-schema/src/catalog.rs:862-870	not_in_this_repository
 docs/TraceQL/functional-requirements.md	crates/pulsus-server/src/traces_api/intrinsics.rs:61-63	no_name_the_target_file_holds
-docs/TraceQL/functional-requirements.md	crates/pulsus-server/src/traces_api/params.rs:224-234	no_name_the_target_file_holds
+docs/TraceQL/functional-requirements.md	crates/pulsus-server/src/traces_api/params.rs:228-248	no_name_the_target_file_holds
 docs/TraceQL/functional-requirements.md	crates/pulsus-write/src/protocols/otlp_traces.rs:484-495	no_name_the_target_file_holds
 docs/TraceQL/functional-requirements.md	crates/pulsus-write/src/protocols/otlp_traces.rs:948	no_name_the_target_file_holds
 docs/TraceQL/functional-requirements.md	deploy/e2e/compose.single.yaml:158	no_name_the_target_file_holds
@@ -865,7 +865,7 @@ docs/query-to-sql.md	logql/predicate.rs:501	no_name_the_target_file_holds
 docs/query-to-sql.md	logql/predicate.rs:501-520	no_name_the_target_file_holds
 docs/query-to-sql.md	logql/predicate.rs:522	no_name_the_target_file_holds
 docs/query-to-sql.md	logql/window.rs:148	no_name_the_target_file_holds
-docs/query-to-sql.md	metrics_plan.rs:397	no_name_the_target_file_holds
+docs/query-to-sql.md	metrics_plan.rs:403	no_name_the_target_file_holds
 docs/query-to-sql.md	metrics_sql.rs:1036	no_name_the_target_file_holds
 docs/query-to-sql.md	metrics_sql.rs:111	no_name_the_target_file_holds
 docs/query-to-sql.md	metrics_sql.rs:116	no_name_the_target_file_holds

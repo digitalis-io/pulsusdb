@@ -1411,8 +1411,11 @@ fn traces_metrics_malformed_q(req: &mut Req) {
     req.query = "q=%7B&start=1700000000&end=1700003600".to_string();
 }
 
-fn traces_metrics_missing_range(req: &mut Req) {
-    req.query = "q=%7B%7D%20%7C%20rate()".to_string();
+fn traces_metrics_inverted_range(req: &mut Req) {
+    // No window is no longer a fault — it is the last hour (issue #601
+    // part 2) — so the window case is an inverted one, a 400 on both
+    // routes.
+    req.query = "q=%7B%7D%20%7C%20rate()&start=1700003600&end=1700000000".to_string();
 }
 
 fn traces_metrics_bad_step(req: &mut Req) {
@@ -1424,7 +1427,8 @@ fn traces_metrics_bad_step(req: &mut Req) {
     // `1.5ms` is the smallest spelling of that, and it is a deliberate
     // divergence — the reference answers 200 to it above its own
     // `range/10000` floor, ledgered as
-    // `traceql-metrics-fractional-ms-step-rejected`.
+    // `traceql-metrics-fractional-ms-step-rejected`. Range route only: the
+    // instant route reads no `step` (issue #601 part 2).
     req.query = "q=%7B%7D%20%7C%20rate()&start=1700000000&end=1700003600&step=1.5ms".to_string();
 }
 
@@ -1435,17 +1439,16 @@ fn traces_metrics_missing_stage(req: &mut Req) {
 }
 
 fn traces_metrics_point_cap(req: &mut Req) {
-    // 1,000,000 one-second buckets >> MAX_METRICS_POINTS (11,000). On the
-    // instant route: the static pre-execution 422, never a truncation. On
-    // the range route the reference's step limit answers first (issue
-    // #596 part 1): more than 10,000 steps is its 400, `step of 1s is too
-    // small, minimum step for given range is 1m40s`.
+    // 1,000,000 one-second buckets: the reference's step limit (issue
+    // #596 part 1), more than 10,000 steps is its 400, `step of 1s is too
+    // small, minimum step for given range is 1m40s`. Range route only: the
+    // instant route reads no `step`, so its point cap cannot be reached.
     req.query = "q=%7B%7D%20%7C%20rate()&start=1700000000&end=1701000000&step=1".to_string();
 }
 
-/// The four cases both metrics routes share, then `$last`, the route's own.
+/// The three cases both metrics routes share, then the route's own.
 macro_rules! traces_metrics_cases {
-    ($last:expr) => {
+    ($($own:expr),*) => {
         &[
             CaseClass {
                 name: "malformed_q",
@@ -1454,14 +1457,8 @@ macro_rules! traces_metrics_cases {
                 expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
             },
             CaseClass {
-                name: "missing_range",
-                build: traces_metrics_missing_range,
-                expect_status: 400,
-                expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
-            },
-            CaseClass {
-                name: "bad_step",
-                build: traces_metrics_bad_step,
+                name: "inverted_range",
+                build: traces_metrics_inverted_range,
                 expect_status: 400,
                 expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
             },
@@ -1471,27 +1468,30 @@ macro_rules! traces_metrics_cases {
                 expect_status: 400,
                 expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
             },
-            $last,
+            $($own,)*
         ]
     };
 }
 
-/// `query_range`: 1,000,000 steps is refused by the reference's step limit,
-/// `400`.
-const TRACES_METRICS_RANGE_CASES: &[CaseClass] = traces_metrics_cases!(CaseClass {
-    name: "step_too_small_400",
-    build: traces_metrics_point_cap,
-    expect_status: 400,
-    expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
-});
+/// `query_range`: a step that is not a whole millisecond, and 1,000,000
+/// steps, refused by the reference's step limit — each a `400`.
+const TRACES_METRICS_RANGE_CASES: &[CaseClass] = traces_metrics_cases!(
+    CaseClass {
+        name: "bad_step",
+        build: traces_metrics_bad_step,
+        expect_status: 400,
+        expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
+    },
+    CaseClass {
+        name: "step_too_small_400",
+        build: traces_metrics_point_cap,
+        expect_status: 400,
+        expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
+    }
+);
 
-/// `query`: the same request is refused by the static point cap, `422`.
-const TRACES_METRICS_INSTANT_CASES: &[CaseClass] = traces_metrics_cases!(CaseClass {
-    name: "point_cap_static_422",
-    build: traces_metrics_point_cap,
-    expect_status: 422,
-    expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
-});
+/// `query`: the shared cases alone — the instant route reads no `step`.
+const TRACES_METRICS_INSTANT_CASES: &[CaseClass] = traces_metrics_cases!();
 
 // -- traces service graph (issue #173, docs/api.md §4.5) ----------------
 
@@ -1499,28 +1499,19 @@ const TRACES_METRICS_INSTANT_CASES: &[CaseClass] = traces_metrics_cases!(CaseCla
 /// absolute 1h window (both required bounds present, no `q`, no `step`).
 pub const TRACES_GRAPH_BASE_QUERY: &str = "start=1700000000&end=1700003600";
 
-fn traces_graph_missing_window(req: &mut Req) {
-    req.query.clear();
-}
-
 fn traces_graph_inverted_range(req: &mut Req) {
     // `end <= start` — explicit 400, never a silently empty window.
     req.query = "start=1700003600&end=1700000000".to_string();
 }
 
-fn traces_graph_since_plus_absolute(req: &mut Req) {
-    // `since` conflicts with `start`/`end` (the §4.4 mutual-exclusion rule,
-    // shared window grammar) — explicit 400, never silent precedence.
-    req.query = format!("{TRACES_GRAPH_BASE_QUERY}&since=1h");
+fn traces_graph_bad_since(req: &mut Req) {
+    // `since` is read when `start` is absent (the §4.4 window rule) and is
+    // a duration; anything else is an explicit 400. No window, and `since`
+    // beside `start`/`end`, are no longer faults (issue #601 part 2).
+    req.query = "since=soon".to_string();
 }
 
 const TRACES_GRAPH_CASES: &[CaseClass] = &[
-    CaseClass {
-        name: "missing_window",
-        build: traces_graph_missing_window,
-        expect_status: 400,
-        expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
-    },
     CaseClass {
         name: "inverted_range",
         build: traces_graph_inverted_range,
@@ -1528,8 +1519,8 @@ const TRACES_GRAPH_CASES: &[CaseClass] = &[
         expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
     },
     CaseClass {
-        name: "since_plus_absolute_conflict",
-        build: traces_graph_since_plus_absolute,
+        name: "bad_since",
+        build: traces_graph_bad_since,
         expect_status: 400,
         expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
     },

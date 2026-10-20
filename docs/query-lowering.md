@@ -4062,9 +4062,9 @@ at line 11). The committed goldens below carry a join and **none is planned by t
   attribute locators into a single statement. Six of the seven come from `metrics_compare_sql`
   (`crates/pulsus-read/src/traces/metrics_sql.rs:1313`, `LEFT JOIN` at 1385 and `INNER JOIN` at
   1389), which builds one string holding both joins and feeds it to the cross-tab and the probe,
-  and which `metrics_plan.rs` calls three times (`:626`, `:638`, `:650`). The seventh comes from
+  and which `metrics_plan.rs` calls three times (`:646`, `:658`, `:670`). The seventh comes from
   `metrics_compare_exemplar_range_sql` (`metrics_sql.rs:1512`, `INNER JOIN` at 1562, called at
-  `metrics_plan.rs:665`).
+  `metrics_plan.rs:685`).
 - `traces_metrics_base/compare_status.sql` and `traces_metrics_base/compare_status_window.sql`,
   four join lines each. These are **historic**: each is byte-identical to
   `git show 2f78c53:crates/pulsus-read/tests/golden/traces_metrics/` at the same file name, they carry no
@@ -4980,7 +4980,7 @@ the two tables are a cross-check on each other rather than one table quoted twic
 
 Issue #492 part 1 emits no SQL, so the first two must stay green **unchanged** — measured green today,
 `Starting 1 test` each, exit 0 (§11.0). When the fold is wired, the
-goldens and `PINNED_SQL_CORPUS` (`crates/pulsus-read/tests/golden_sql_freeze.rs:500`) move in the
+goldens and `PINNED_SQL_CORPUS` (`crates/pulsus-read/tests/golden_sql_freeze.rs:508`) move in the
 same commit.
 
 ### 11.2 The gates that reproduce each hand-written walk — all **#492 part 1** at base, none of them there then; all six exist today
@@ -5543,16 +5543,16 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | of those, citing a bare basename | 482 |
 | of those, written as a continuation of a citation earlier in the paragraph | 70 |
 | of those continuations, on a later line than the citation they continue | 30 |
-| `(document, token)` pairs the rule resolves | 288 |
-| occurrences those resolved pairs cover | 395 |
-| `(document, token)` pairs it cannot resolve | 174 |
-| occurrences those frozen pairs cover | 274 |
+| `(document, token)` pairs the rule resolves | 289 |
+| occurrences those resolved pairs cover | 396 |
+| `(document, token)` pairs it cannot resolve | 173 |
+| occurrences those frozen pairs cover | 273 |
 | resolved rows anchored on a token the citing prose prints | 156 |
-| resolved rows anchored on a snapshot of the cited line | 132 |
+| resolved rows anchored on a snapshot of the cited line | 133 |
 
 | reason it cannot be resolved | pairs | what it means |
 |---|---|---|
-| `ambiguous_basename` | 87 | the basename matches several tracked files and the citing line prints no identifier that separates them |
+| `ambiguous_basename` | 86 | the basename matches several tracked files and the citing line prints no identifier that separates them |
 | `blank_target_line` | 3 | the cited line exists and is **empty**, so there is nothing to anchor on |
 | `not_a_tracked_file` | 84 | the citation names a file the tree does not hold: a throwaway probe that was never committed, which §10 records deliberately, or a file of the previous search engine that #602 part 2c-2b deleted |
 
@@ -5567,7 +5567,7 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | `prose` | a token the citing prose prints, so the claim and its evidence are reviewable side by side |
 | `line` | a snapshot of the cited line, taken because the citing prose prints no such token: it detects the line moving or changing and cannot show the citation means the right thing |
 
-Of the 669 citation occurrences the five artefacts make, 482 name a bare basename and 70 are written as a continuation of a citation earlier on the same line. The rule resolves 288 `(document, token)` pairs covering 395 occurrences, and cannot resolve 174 covering 274. Of the resolved rows, 156 are anchored on a token the citing prose prints and 132 on a snapshot of the cited line.
+Of the 669 citation occurrences the five artefacts make, 482 name a bare basename and 70 are written as a continuation of a citation earlier on the same line. The rule resolves 289 `(document, token)` pairs covering 396 occurrences, and cannot resolve 173 covering 273. Of the resolved rows, 156 are anchored on a token the citing prose prints and 133 on a snapshot of the cited line.
 
 The language fallback and the anchor rule disagree on 2 citations, all of them read one at a time. 1 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
 

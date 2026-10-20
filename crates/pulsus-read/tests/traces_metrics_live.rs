@@ -323,6 +323,7 @@ fn plan_with(
             end_ns: end_s * NS,
             step_ms,
             exemplars,
+            floor_ns: i64::MIN,
         },
         &engine.metrics_ctx(),
     )
@@ -1617,9 +1618,14 @@ async fn metrics_internal_consistency_identities() {
         60_000,
     );
     assert_eq!(
+        (plan.range_axis().first_ms, plan.snapped_end_ms()),
+        (base_s() * 1_000, (base_s() + 120) * 1_000),
+        "the grid snaps outward"
+    );
+    assert_eq!(
         plan.snapped_window_ns(),
-        (base_s() * NS, (base_s() + 120) * NS),
-        "outward snap"
+        ((base_s() + 30) * NS, (base_s() + 90) * NS),
+        "the instant form reads the requested window, unsnapped (issue #601 part 2)"
     );
     let points = matrix_points(&engine.metrics_range(&plan).await.expect("unaligned"));
     assert_eq!(
@@ -3272,6 +3278,7 @@ async fn the_range_probe_rejects_groups_outside_the_instant_window() {
             end_ns: (aligned + month) * NS,
             step_ms: 1,
             exemplars: None,
+            floor_ns: i64::MIN,
         },
         &capped.metrics_ctx(),
     )

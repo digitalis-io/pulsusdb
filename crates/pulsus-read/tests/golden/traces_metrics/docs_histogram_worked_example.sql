@@ -21,7 +21,7 @@ FROM (
   SELECT trace_id, span_id, any(duration_ns) AS val
   FROM trace_spans
   PREWHERE service = 'checkout'
-  WHERE timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000
+  WHERE timestamp_ns >= 1700000000000000000 AND timestamp_ns < 1700010800000000000
   GROUP BY trace_id, span_id
 )
 WHERE val >= 2

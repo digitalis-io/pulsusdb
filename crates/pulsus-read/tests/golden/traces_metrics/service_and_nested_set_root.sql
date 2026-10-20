@@ -15,7 +15,7 @@ ORDER BY t ASC
 SELECT uniqExact(trace_id, span_id) AS n
 FROM trace_spans
 PREWHERE service = 'checkout'
-WHERE timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000
+WHERE timestamp_ns >= 1700000000000000000 AND timestamp_ns < 1700010800000000000
   AND parent_id = toFixedString(unhex('0000000000000000'), 8)
 
 == exemplars ==

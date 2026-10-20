@@ -67,10 +67,11 @@ docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:92	crates/pulsus-re
 docs/query-lowering.md	crates/pulsus-read/src/traces/filter.rs:907	crates/pulsus-read/src/traces/filter.rs	907		prose	anchored_regex_sql	match
 docs/query-lowering.md	crates/pulsus-read/src/traces/graph_sql.rs:92	crates/pulsus-read/src/traces/graph_sql.rs	92		prose	service_graph_sql	service_graph_sql
 docs/query-lowering.md	crates/pulsus-read/src/traces/metrics_sql.rs:1313	crates/pulsus-read/src/traces/metrics_sql.rs	1313		line	metrics_compare_sql	pub fn metrics_compare_sql(input: &CompareSqlInput<'_>) -> CompareSql {
-docs/query-lowering.md	crates/pulsus-read/src/traces/metrics_sql.rs:638	crates/pulsus-read/src/traces/metrics_sql.rs	638		line	ComparisonOp	op: ComparisonOp,
-docs/query-lowering.md	crates/pulsus-read/src/traces/metrics_sql.rs:650	crates/pulsus-read/src/traces/metrics_sql.rs	650		line	metrics	metrics filters"
+docs/query-lowering.md	crates/pulsus-read/src/traces/metrics_sql.rs:646	crates/pulsus-read/src/traces/metrics_sql.rs	646		line	root_true	let root_true = super::values::cmp_f64(op, -1.0, value);
+docs/query-lowering.md	crates/pulsus-read/src/traces/metrics_sql.rs:658	crates/pulsus-read/src/traces/metrics_sql.rs	658		line	is_root_sql	(false, true) => format!("NOT ({})", is_root_sql()),
+docs/query-lowering.md	crates/pulsus-read/src/traces/metrics_sql.rs:670	crates/pulsus-read/src/traces/metrics_sql.rs	670		line	timestamp_ns	/// while `timestamp_ns == L·10^6 + 1` floors to `L` and comes back to
 docs/query-lowering.md	crates/pulsus-read/src/traces/spans/graph.rs:131	crates/pulsus-read/src/traces/spans/graph.rs	131		prose	spans_graph_sql	spans_graph_sql
-docs/query-lowering.md	crates/pulsus-read/tests/golden_sql_freeze.rs:500	crates/pulsus-read/tests/golden_sql_freeze.rs	500		prose	0xc6f0_52ca_842d_d404	PINNED_SQL_CORPUS
+docs/query-lowering.md	crates/pulsus-read/tests/golden_sql_freeze.rs:508	crates/pulsus-read/tests/golden_sql_freeze.rs	508		prose	0x4c64_a9dc_2a57_af5c	PINNED_SQL_CORPUS
 docs/query-lowering.md	crates/pulsus-server/src/logs_api/error.rs:147-157	crates/pulsus-server/src/logs_api/error.rs	147	157	line	X_CONTENT_TYPE_OPTIONS	pub(crate) fn plain_text_error(status: StatusCode, message: String) -> Response { ( status, [ (header::CONTENT_TYPE, "te
 docs/query-lowering.md	crates/pulsus-server/src/logs_api/error.rs:147-212	crates/pulsus-server/src/logs_api/error.rs	147	212	line	ClientHTTPStatusAndError	pub(crate) fn plain_text_error(status: StatusCode, message: String) -> Response { ( status, [ (header::CONTENT_TYPE, "te
 docs/query-lowering.md	crates/pulsus-server/src/logs_api/error.rs:212	crates/pulsus-server/src/logs_api/error.rs	212		line	PipelineInvalid	| ReadError::PipelineInvalid { .. }
@@ -89,7 +90,7 @@ docs/query-lowering.md	filter.rs:95	crates/pulsus-read/src/traces/filter.rs	95		
 docs/query-lowering.md	logql/compile.rs:315-318	crates/pulsus-read/src/logql/compile.rs	315	318	line	residual_effect	/// The seed is always applied, so there is no residual case. fn residual_effect(&self, _s: &LqlLink, rel: Relation<Lql>
 docs/query-lowering.md	logql/predicate.rs:87-91	crates/pulsus-read/src/logql/predicate.rs	87	91	line	documentation	//! //! **It does not check its error code** (measured on this toolchain, issue //! #286): rustdoc requires the snippet
 docs/query-lowering.md	logql/predicate.rs:93	crates/pulsus-read/src/logql/predicate.rs	93		line	REMOVAL	//! **So a fence is only worth what its REMOVAL TEST is worth**, and the
-docs/query-lowering.md	metrics_plan.rs:665	crates/pulsus-read/src/traces/metrics_plan.rs	665		line	metrics_compare_exemplar_range_sql	metrics_sql::metrics_compare_exemplar_range_sql(&metrics_sql::CompareExemplarSqlInput {
+docs/query-lowering.md	metrics_plan.rs:685	crates/pulsus-read/src/traces/metrics_plan.rs	685		line	metrics_compare_exemplar_range_sql	metrics_sql::metrics_compare_exemplar_range_sql(&metrics_sql::CompareExemplarSqlInput {
 docs/query-lowering.md	metrics_sql.rs:111	crates/pulsus-read/src/traces/metrics_sql.rs	111		line	mistaken	/// be mistaken for the other.
 docs/query-lowering.md	metrics_sql.rs:1512	crates/pulsus-read/src/traces/metrics_sql.rs	1512		prose	metrics_compare_exemplar_range_sql	metrics_compare_exemplar_range_sql
 docs/query-lowering.md	metrics_sql.rs:546	crates/pulsus-read/src/traces/metrics_sql.rs	546		line	everything	// exact per-span SQL form; everything else in the family keeps a
@@ -207,8 +208,8 @@ docs/query-to-sql.md	logql/predicate.rs:955	crates/pulsus-read/src/logql/predica
 docs/query-to-sql.md	logql/sql.rs:424	crates/pulsus-read/src/logql/sql.rs	424		prose	json_count_columns	json_count_columns
 docs/query-to-sql.md	logql/window.rs:148	crates/pulsus-read/src/logql/window.rs	148		line	MAX_CLIENT_AGG_BUCKETS	pub const MAX_CLIENT_AGG_BUCKETS: u64 = 11_000;
 docs/query-to-sql.md	logs_api/error.rs:148-153	crates/pulsus-server/src/logs_api/error.rs	148	153	line	X_CONTENT_TYPE_OPTIONS	( status, [ (header::CONTENT_TYPE, "text/plain; charset=utf-8"), (header::X_CONTENT_TYPE_OPTIONS, "nosniff"), ],
-docs/query-to-sql.md	metrics_plan.rs:397	crates/pulsus-read/src/traces/metrics_plan.rs	397		line	plan_trace_metrics	pub fn plan_trace_metrics(
-docs/query-to-sql.md	metrics_plan.rs:963	crates/pulsus-read/src/traces/metrics_plan.rs	963		prose	pipeline	reduce
+docs/query-to-sql.md	metrics_plan.rs:403	crates/pulsus-read/src/traces/metrics_plan.rs	403		line	plan_trace_metrics	pub fn plan_trace_metrics(
+docs/query-to-sql.md	metrics_plan.rs:985	crates/pulsus-read/src/traces/metrics_plan.rs	985		prose	pipeline	reduce
 docs/query-to-sql.md	metrics_sql.rs:111	crates/pulsus-read/src/traces/metrics_sql.rs	111		line	mistaken	/// be mistaken for the other.
 docs/query-to-sql.md	metrics_sql.rs:116	crates/pulsus-read/src/traces/metrics_sql.rs	116		line	trace_attrs_idx	/// The `trace_attrs_idx` daily-partition pruning clause for the
 docs/query-to-sql.md	metrics_sql.rs:357	crates/pulsus-read/src/traces/metrics_sql.rs	357		line	attribute	/// Renders one attribute leaf's span-row test and records its

@@ -23,10 +23,10 @@ ORDER BY g, o
 
 == instant ==
 SELECT g, o, [(toInt64(1791410820000), v)] AS points, CAST([], 'Array(Tuple(FixedString(16), Int64, Float64))') AS exemplars, 0 AS f
-FROM (SELECT CAST([], 'Array(Tuple(String, String))') AS g, toUInt64(0) AS o, toFloat64(count()) / 10860 AS v
+FROM (SELECT CAST([], 'Array(Tuple(String, String))') AS g, toUInt64(0) AS o, toFloat64(count()) / 10800 AS v
 FROM spans
-WHERE start_ns >= 1791399960000000000 AND start_ns < 1791410820000000000
-  AND intDiv(start_ns, 300000000000) BETWEEN intDiv(1791399960000000000, 300000000000) AND intDiv(1791410819999999999, 300000000000)
+WHERE start_ns >= 1791400000000000000 AND start_ns < 1791410800000000000
+  AND intDiv(start_ns, 300000000000) BETWEEN intDiv(1791400000000000000, 300000000000) AND intDiv(1791410799999999999, 300000000000)
   AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') >= toDate('2026-10-07') AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') <= toDate('2026-10-07')
   AND (arrayExists(a2 -> (coalesce(duration_ns > tupleElement(a2, 1), false) OR coalesce(duration_ns > tupleElement(a2, 2), false)), [arrayElement(arrayMap((pl, pr) -> tuple(if(abs(toFloat64(tupleElement(pl, 1) * tupleElement(pr, 1)) - toFloat64(tupleElement(pl, 1)) * toFloat64(tupleElement(pr, 1))) <= 1e-6 * abs(toFloat64(tupleElement(pl, 1)) * toFloat64(tupleElement(pr, 1))), tupleElement(pl, 1) * tupleElement(pr, 1), NULL), if(tupleElement(pl, 2) IS NULL AND tupleElement(pr, 2) IS NULL, NULL, coalesce(tupleElement(pl, 2), toFloat64(tupleElement(pl, 1))) * coalesce(tupleElement(pr, 2), toFloat64(tupleElement(pr, 1))))), [tuple(toInt256(attrs.`http%2Erequest%2Ebody%2Esize`.:Int64), attrs.`http%2Erequest%2Ebody%2Esize`.:Float64)], [tuple(toInt256(1000), CAST(NULL, 'Nullable(Float64)'))]), 1)])))
 ORDER BY g, o
