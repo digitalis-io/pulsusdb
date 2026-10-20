@@ -772,18 +772,15 @@ def refusal(q):
             return ('cross-spanset and structural expressions are not supported by '
                     'metrics queries')
     if metric is not None:
-        by = metric.get('by')
-        # metrics_plan.rs:1102-1121
-        if by is not None and not (by.get('k') == 'attr' and by.get('scope') == 'resource'
-                                   and by.get('key') == 'service.name'):
-            return 'a metrics grouping key other than resource.service.name'
-        if by is not None and metric['fn'] in ('quantile_over_time', 'histogram_over_time'):
-            return 'a grouped quantile or histogram'
+        # `docs/api.md` §4.4, "Function set": `by()` takes any key, and the
+        # target is `duration`, an attribute or `span:childCount`; any other
+        # intrinsic target is a `400` (#600 part 1b-1)
         args = metric['args']
         if metric['fn'] not in ('rate', 'count_over_time') and args:
             a = args[0]
-            if not (a.get('k') == 'intrinsic' and a['name'] in DURATION_INTRINSICS):
-                return 'an aggregation target other than duration'
+            if a.get('k') == 'intrinsic' and a['name'] not in DURATION_INTRINSICS + (
+                    'span:childCount', 'childCount'):
+                return 'an intrinsic target other than duration and span:childCount'
     return None
 
 
