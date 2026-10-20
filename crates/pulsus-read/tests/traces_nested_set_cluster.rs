@@ -4049,9 +4049,12 @@ async fn uncopied_entries_are_judged_against_the_interval_being_finalized() {
     // An eligibility: 180 s into an interval, at most 5 min away.
     let deadline = std::time::Instant::now() + Duration::from_secs(330);
     let eligibility = loop {
+        // A window of 3 s, not the one second: under load one poll can take
+        // longer than a second and step over it.
         let now = server_now_us(&r.s1).await / 1_000_000;
-        if now.rem_euclid(300) == 180 {
-            break now;
+        let into = now.rem_euclid(300);
+        if (180..183).contains(&into) {
+            break now - (into - 180);
         }
         assert!(
             std::time::Instant::now() < deadline,
