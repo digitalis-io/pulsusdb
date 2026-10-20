@@ -13234,6 +13234,144 @@ async fn an_over_time_exemplar_carries_its_span_s_own_value() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// Issue #600 part 1b-3: a value with no TraceQL type is one series with
+/// the spans that lack the key, as the reference answers, under an ordinary
+/// key (`span.tags`) and a well-known one (`span.http.method`); each array,
+/// and the string `"nil"`, stays its own series under the same `nil` label.
+/// Seven 1 s spans, `…01` to `…07`, start at `L − 40 s`, one second apart.
+/// `span.tags`: `["x"]`, `["y","z"]`, `[1,2]`, the mixed `["m",1]`, the
+/// string `"nil"`, nothing, `"q"`; `…04` also holds a mixed
+/// `span.http.method`, `…07` `span.http.method = "GET"` and
+/// `span.other = "o"`. The series are in key-text order; each range
+/// series' exemplar is its longest span, the larger id on a tie, so it
+/// names the series' spans: the missing-and-mixed series `…06` (−35 s),
+/// `['x']` `…01` (−40 s), `['y','z']` `…02` (−39 s), `[1,2]` `…03`
+/// (−38 s), `nil` `…05` (−36 s), `q` and `GET` `…07` (−34 s).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_untyped_value_shares_the_missing_series() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db("pulsus_read_it_t600p1b3_untyped");
+    let client = fresh_db(&db).await;
+    let l = metrics_l();
+    let mixed = || AnyValue {
+        value: Some(any_value::Value::ArrayValue(ArrayValue {
+            values: vec![str_value("m"), int_value(1)],
+        })),
+    };
+    let tags = [
+        Some(str_array_value(&["x"])),
+        Some(str_array_value(&["y", "z"])),
+        Some(int_array_value(&[1, 2])),
+        Some(mixed()),
+        Some(str_value("nil")),
+        None,
+        Some(str_value("q")),
+    ];
+    let spans = tags
+        .into_iter()
+        .enumerate()
+        .map(|(i, tag)| {
+            let mut attrs: Vec<KeyValue> = tag.into_iter().map(|v| kv("tags", v)).collect();
+            if i == 3 {
+                attrs.push(kv("http.method", mixed()));
+            }
+            if i == 6 {
+                attrs.push(kv("other", str_value("o")));
+                attrs.push(kv("http.method", str_value("GET")));
+            }
+            span_of(
+                vec![0x55; 16],
+                span_id_bytes(i as u8 + 1),
+                Vec::new(),
+                "op",
+                2,
+                (l - 40 + i as i64) * S_NS,
+                S_NS,
+                attrs,
+                0,
+                Vec::new(),
+                Vec::new(),
+            )
+        })
+        .collect();
+    land(
+        &client,
+        &request("x", "x-a", spans),
+        &format!("t600p1b3-{}", now_ns()),
+    )
+    .await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let nil = "span.tags=nil";
+    let mut wrong = Vec::new();
+    // (query, each series' name, count and exemplar in ms from L)
+    let cases: [(&str, Vec<(&str, f64, i64)>); 3] = [
+        (
+            "{} | count_over_time() by(span.tags)",
+            vec![
+                (nil, 2.0, -35_000),
+                (nil, 1.0, -40_000),
+                (nil, 1.0, -39_000),
+                (nil, 1.0, -38_000),
+                (nil, 1.0, -36_000),
+                ("span.tags=q", 1.0, -34_000),
+            ],
+        ),
+        (
+            "{} | count_over_time() by(span.tags, span.other)",
+            vec![
+                (nil, 2.0, -35_000),
+                (nil, 1.0, -40_000),
+                (nil, 1.0, -39_000),
+                (nil, 1.0, -38_000),
+                (nil, 1.0, -36_000),
+                ("span.tags=q,span.other=o", 1.0, -34_000),
+            ],
+        ),
+        (
+            "{} | count_over_time() by(span.http.method)",
+            vec![
+                ("span.http.method=nil", 6.0, -35_000),
+                ("span.http.method=GET", 1.0, -34_000),
+            ],
+        ),
+    ];
+    for (q, want) in cases {
+        let range_out = range_answer(&engine, q, l - 60, l).await;
+        let range = samples_of(&range_out, l);
+        let exemplars = exemplars_of(&range_out, l);
+        let instant = samples_of(&instant_answer(&engine, q, l - 60, l).await, l);
+        let want_range: Vec<(String, Vec<(i64, f64)>)> = want
+            .iter()
+            .map(|(n, v, _)| (n.to_string(), vec![(-60, 0.0), (0, *v)]))
+            .collect();
+        let want_exemplars: Vec<(String, Vec<(String, i64)>)> = want
+            .iter()
+            .map(|(n, _, t)| (n.to_string(), vec![(trace_label(0x55), *t)]))
+            .collect();
+        let want_instant: Vec<(String, Vec<(i64, f64)>)> = want
+            .iter()
+            .map(|(n, v, _)| (n.to_string(), vec![(0, *v)]))
+            .collect();
+        if range != want_range {
+            wrong.push(format!(
+                "{q} range\n  want: {want_range:?}\n  got:  {range:?}"
+            ));
+        }
+        if exemplars != want_exemplars {
+            wrong.push(format!(
+                "{q} exemplars\n  want: {want_exemplars:?}\n  got:  {exemplars:?}"
+            ));
+        }
+        if instant != want_instant {
+            wrong.push(format!(
+                "{q} instant\n  want: {want_instant:?}\n  got:  {instant:?}"
+            ));
+        }
+    }
+    drop_db(&db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// An exemplar leaves only beside a sample in the answer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_exemplar_needs_its_sample() {

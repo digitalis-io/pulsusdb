@@ -114,11 +114,11 @@ span(T3, 10, None, 'second root', 1, 20 * NS + 30 * 10**6, 10 * 10**6, 'plain', 
 #   sibling -> B2, B3    sibling union -> A3, B2, B3 (B3 is added below)
 RES_EDGE = [['service.name', 's', 'edge'], ['deployment.environment', 's', 'prod'],
             ['k8s.pod.name', 's', 'edge-a']]
-span(T4, 20, None, 'P', 2, 30 * NS, 5 * NS, 'edge', RES_EDGE, [])
+span(T4, 20, None, 'P', 2, 30 * NS, 5 * NS, 'edge', RES_EDGE, [['tags', 'a', [['s', 'x'], ['s', 'y']]]])
 span(T4, 21, 20, 'A2', 1, 30 * NS + 10**6, 1 * NS, 'edge', RES_EDGE, [['a', 'i', 1]])
 span(T4, 22, 21, 'B1', 1, 30 * NS + 2 * 10**6, 1 * NS, 'edge', RES_EDGE, [['b', 'i', 2]])
 span(T4, 23, 22, 'A1', 1, 30 * NS + 3 * 10**6, 1 * NS, 'edge', RES_EDGE, [['a', 'i', 1]])
-span(T4, 24, 20, 'P2', 1, 30 * NS + 4 * 10**6, 1 * NS, 'edge', RES_EDGE, [])
+span(T4, 24, 20, 'P2', 1, 30 * NS + 4 * 10**6, 1 * NS, 'edge', RES_EDGE, [['tags', 'a', []]])
 span(T4, 25, 24, 'A3', 1, 30 * NS + 5 * 10**6, 1 * NS, 'edge', RES_EDGE, [['a', 'i', 1]])
 span(T4, 26, 24, 'B2', 1, 30 * NS + 6 * 10**6, 1 * NS, 'edge', RES_EDGE, [['b', 'i', 2]])
 span(T4, 27, 999, 'orphan', 1, 30 * NS + 7 * 10**6, 1 * NS, 'edge', RES_EDGE, [['b', 'i', 2]])
@@ -130,8 +130,8 @@ span(T4, 36, 24, 'B3', 1, 30 * NS + 8 * 10**6, 1 * NS, 'edge', RES_EDGE, [['b', 
 # child of neither side, so `>` and `>>` differ, and a climb bounded at one
 # link loses it
 span(T4, 32, 20, 'A4', 1, 30 * NS + 9 * 10**6, 1 * NS, 'edge', RES_EDGE, [['a', 'i', 1]])
-span(T4, 37, 32, 'N1', 1, 30 * NS + 10 * 10**6, 1 * NS, 'edge', RES_EDGE, [])
-span(T4, 38, 37, 'N2', 1, 30 * NS + 11 * 10**6, 1 * NS, 'edge', RES_EDGE, [])
+span(T4, 37, 32, 'N1', 1, 30 * NS + 10 * 10**6, 1 * NS, 'edge', RES_EDGE, [['tags', 'a', [['s', 'z']]]])
+span(T4, 38, 37, 'N2', 1, 30 * NS + 11 * 10**6, 1 * NS, 'edge', RES_EDGE, [['tags', 'a', [['i', 1], ['i', 2]]]])
 span(T4, 33, 38, 'B4', 1, 30 * NS + 12 * 10**6, 1 * NS, 'edge', RES_EDGE, [['b', 'i', 2]])
 # trace 5: a two-span cycle, one span on each side
 span(T5, 30, 31, 'cyc-a', 1, 40 * NS, 1 * NS, 'edge', RES_EDGE, [['a', 'i', 1]])
@@ -163,7 +163,8 @@ span(T6, 44, 40, NAME_SHORT, 1, 50 * NS + 4 * 10**6, 1 * NS, 'plain', RES_PLAIN,
 # differ somewhere
 span(T6, 45, 40, 'b', 1, 50 * NS + 5 * 10**6, 1073741824, 'plain', RES_PLAIN,
      [['a', 'i', 1], ['foo', 'b', True]])
-span(T6, 49, 45, 'b-child-1', 1, 50 * NS + 8 * 10**6, 1 * NS, 'plain', RES_PLAIN, [])
+span(T6, 49, 45, 'b-child-1', 1, 50 * NS + 8 * 10**6, 1 * NS, 'plain', RES_PLAIN,
+     [['tags', 'a', [['s', 'm'], ['i', 1]]], ['http.method', 'a', [['s', 'm'], ['i', 1]]]])
 span(T6, 50, 45, 'b-child-2', 1, 50 * NS + 9 * 10**6, 1 * NS, 'plain', RES_PLAIN, [])
 span(T6, 46, 40, 'min', 1, 50 * NS + 6 * 10**6, 1 * NS, 'plain', RES_PLAIN,
      [['a', 'i', -9223372036854775808]])
@@ -188,7 +189,8 @@ span(T7, 61, None, 'true root', 2, 55 * NS, 1 * NS, 'gw', RES_GW, [])
 os.makedirs(f'{out}/otlp', exist_ok=True)
 def av(t, v):
     return ({'stringValue': v} if t == 's' else {'intValue': str(v)} if t == 'i'
-            else {'doubleValue': v} if t == 'd' else {'boolValue': v})
+            else {'doubleValue': v} if t == 'd'
+            else {'arrayValue': {'values': [av(et, ev) for et, ev in v]}} if t == 'a' else {'boolValue': v})
 def kv(l): return [{'key': k, 'value': av(t, v)} for k, t, v in l]
 bodies, by_res = [], {}
 for r in rows:

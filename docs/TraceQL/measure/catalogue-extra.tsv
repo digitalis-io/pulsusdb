@@ -72,3 +72,9 @@ compare_event_filter	{ event.exception.type = "IOError" } | compare({ .a = 1 })	
 metrics_rate_nothing	{ .no.such.key = 1 } | rate()	an ungrouped rate no span matches: one series of zeros on both routes (#600 part 1b-2)
 metrics_avg_nothing	{ .no.such.key = 1 } | avg_over_time(duration)	an aggregation no span matches: no series on either route (#600 part 1b-2)
 metrics_duration_threshold_max	{ .a = 1 } | max_over_time(duration) > 2s	the threshold on the instant route: the window's longest span (3 s) passes 2 s, and fails it left in nanoseconds (#600 part 1b-2)
+array_select	{} | select(span.tags)	arrays projected: two strings, empty, one string, two integers; a mixed array projects nothing
+array_by	{ span.tags != nil || .a = nil } | by(span.tags)	arrays as `by()` keys
+array_presence	{ span.tags != nil }	presence: every array but the mixed one
+array_compare	{} | compare({ span.tags != nil })	arrays are not counted in `compare()`
+array_metrics_by	{} | rate() by(span.tags)	an array `by()` key on the metrics routes: each array its own `nil` series, the mixed one with the spans that lack the key
+array_metrics_well_known	{} | rate() by(span.http.method)	a mixed array on a well-known key: one `nil` series with the spans that lack the key
