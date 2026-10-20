@@ -15,9 +15,12 @@
 //!   key with no `=`, an empty key, or an unterminated quote is a `400`
 //!   — every grammar error names a byte offset into the decoded `tags`
 //!   value, inside its message.
-//! - `minDuration`/`maxDuration` compile to `duration >= <lit>` /
-//!   `duration <= <lit>` conjuncts; a malformed duration surfaces as the
-//!   parser's positioned error → `400`.
+//! - a `tags` key given twice is a `400`, as the reference refuses it.
+//! - `minDuration`/`maxDuration` are Go durations (the reference's
+//!   `time.ParseDuration`) and compile to `duration >= <n>ns` /
+//!   `duration <= <n>ns` conjuncts, exact to the nanosecond where the
+//!   reference cuts to whole milliseconds; a malformed or negative one, or
+//!   a `minDuration` above the `maxDuration`, is a `400`.
 //! - All conjuncts join with `&&` inside one `{ … }`; empty legacy input
 //!   compiles to `{}` (match-all, time-bounded).
 
@@ -54,6 +57,18 @@ pub(crate) enum LegacyError {
          \\\\ are recognized inside quotes"
     )]
     InvalidEscape { escape: char, pos: usize },
+    /// A `tags` key given twice — the reference refuses it.
+    #[error("invalid 'tags': key {key:?} is given more than once")]
+    DuplicateKey { key: String },
+    /// A `minDuration`/`maxDuration` that is not a Go duration.
+    #[error("invalid {name}: {raw:?} is not a duration (e.g. 300ms, 1.5s, 1m30s)")]
+    InvalidDuration { name: &'static str, raw: String },
+    /// A negative `minDuration`/`maxDuration`.
+    #[error("invalid {name}: {raw:?} is negative")]
+    NegativeDuration { name: &'static str, raw: String },
+    /// `minDuration` above `maxDuration`.
+    #[error("invalid maxDuration: {max:?} is below minDuration {min:?}")]
+    MinAboveMax { min: String, max: String },
 }
 
 /// One parsed logfmt pair.
@@ -188,21 +203,118 @@ pub(crate) fn compile_legacy(
 ) -> Result<String, LegacyError> {
     let mut conjuncts: Vec<String> = Vec::new();
     if let Some(tags) = tags {
+        let mut seen: Vec<String> = Vec::new();
         for pair in parse_logfmt(tags)? {
+            if seen.contains(&pair.key) {
+                return Err(LegacyError::DuplicateKey { key: pair.key });
+            }
             conjuncts.push(format!(".{}={}", pair.key, quote(&pair.value)));
+            seen.push(pair.key);
         }
     }
-    if let Some(min) = min_duration {
-        conjuncts.push(format!("duration >= {min}"));
+    let min_ns = min_duration
+        .map(|raw| legacy_duration_ns("minDuration", raw))
+        .transpose()?;
+    let max_ns = max_duration
+        .map(|raw| legacy_duration_ns("maxDuration", raw))
+        .transpose()?;
+    if let (Some(min), Some(max), Some(min_raw), Some(max_raw)) =
+        (min_ns, max_ns, min_duration, max_duration)
+        && min > 0
+        && min > max
+    {
+        return Err(LegacyError::MinAboveMax {
+            min: min_raw.to_string(),
+            max: max_raw.to_string(),
+        });
     }
-    if let Some(max) = max_duration {
-        conjuncts.push(format!("duration <= {max}"));
+    if let Some(min) = min_ns {
+        conjuncts.push(format!("duration >= {min}ns"));
+    }
+    if let Some(max) = max_ns {
+        conjuncts.push(format!("duration <= {max}ns"));
     }
     if conjuncts.is_empty() {
         Ok("{}".to_string())
     } else {
         Ok(format!("{{ {} }}", conjuncts.join(" && ")))
     }
+}
+
+/// One legacy duration parameter in nanoseconds: refused when it is not
+/// a Go duration or is negative.
+fn legacy_duration_ns(name: &'static str, raw: &str) -> Result<i64, LegacyError> {
+    let ns = go_duration_ns(raw).ok_or_else(|| LegacyError::InvalidDuration {
+        name,
+        raw: raw.to_string(),
+    })?;
+    if ns < 0 {
+        return Err(LegacyError::NegativeDuration {
+            name,
+            raw: raw.to_string(),
+        });
+    }
+    Ok(ns)
+}
+
+/// A Go duration (`time.ParseDuration`) in nanoseconds: an optional sign,
+/// then `0` alone or one or more `<number><unit>`, `<number>` digits with
+/// an optional fraction and `<unit>` one of `ns us µs μs ms s m h`. A
+/// fraction past the nanosecond is dropped; `None` on anything else or a
+/// value past `i64`.
+fn go_duration_ns(raw: &str) -> Option<i64> {
+    const UNITS: [(&str, i128); 8] = [
+        ("ns", 1),
+        ("us", 1_000),
+        ("µs", 1_000),
+        ("μs", 1_000),
+        ("ms", 1_000_000),
+        ("s", 1_000_000_000),
+        ("m", 60_000_000_000),
+        ("h", 3_600_000_000_000),
+    ];
+    let (negative, body) = match raw.as_bytes().first() {
+        Some(b'-') => (true, &raw[1..]),
+        Some(b'+') => (false, &raw[1..]),
+        _ => (false, raw),
+    };
+    if body == "0" {
+        return Some(0);
+    }
+    if body.is_empty() {
+        return None;
+    }
+    let mut rest = body;
+    let mut total: i128 = 0;
+    while !rest.is_empty() {
+        let int_len = rest.bytes().take_while(u8::is_ascii_digit).count();
+        let (int_part, after_int) = rest.split_at(int_len);
+        let (frac_part, after_number) = match after_int.strip_prefix('.') {
+            Some(f) => {
+                let frac_len = f.bytes().take_while(u8::is_ascii_digit).count();
+                f.split_at(frac_len)
+            }
+            None => ("", after_int),
+        };
+        if int_part.is_empty() && frac_part.is_empty() {
+            return None;
+        }
+        // The longest unit, so `ms` is never `m` then `s`.
+        let (unit, per_unit) = UNITS
+            .iter()
+            .filter(|(u, _)| after_number.starts_with(u))
+            .max_by_key(|(u, _)| u.len())?;
+        // Exact in `i128`: `digits · per_unit / 10^fraction_digits`,
+        // truncated, so what falls below 1 ns is dropped. Fraction digits
+        // past the eighteenth are below 1 ns for every unit.
+        let frac_kept = &frac_part[..frac_part.len().min(18)];
+        let digits: i128 = format!("0{int_part}{frac_kept}").parse().ok()?;
+        let denominator = 10_i128.pow(frac_kept.len() as u32);
+        let value = digits.checked_mul(*per_unit)? / denominator;
+        total = total.checked_add(value)?;
+        rest = &after_number[unit.len()..];
+    }
+    i64::try_from(if negative { -total } else { total }).ok()
 }
 
 #[cfg(test)]
@@ -214,6 +326,7 @@ mod tests {
     /// path.
     #[test]
     fn tags_and_min_duration_compile_to_the_pinned_equivalent_traceql() {
+        // `100ms` compiles to its nanoseconds, the same value.
         let compiled =
             compile_legacy(Some("http.method=GET status=error"), Some("100ms"), None).unwrap();
         let compiled_ast = pulsus_traceql::parse(&compiled).expect("compiled TraceQL parses");
@@ -362,12 +475,17 @@ mod tests {
         }
     }
 
+    /// A key given twice is refused, as the reference refuses it
+    /// (`http.go:197-199`), rather than compiled to an always-false
+    /// conjunction.
     #[test]
-    fn duplicate_keys_become_repeated_conjuncts() {
-        let compiled = compile_legacy(Some("k=a k=b"), None, None).unwrap();
-        let ast = pulsus_traceql::parse(&compiled).expect("parses");
-        let expected = pulsus_traceql::parse(r#"{ .k="a" && .k="b" }"#).expect("parses");
-        assert_eq!(ast, expected);
+    fn a_duplicate_key_is_refused() {
+        assert_eq!(
+            compile_legacy(Some("k=a k=b"), None, None),
+            Err(LegacyError::DuplicateKey {
+                key: "k".to_string()
+            })
+        );
     }
 
     #[test]
@@ -383,10 +501,68 @@ mod tests {
         assert_eq!(ast, expected);
     }
 
+    /// A duration that is not a Go duration is refused here, with its
+    /// own variant, before any TraceQL is built.
     #[test]
-    fn a_malformed_duration_surfaces_as_a_parser_error_single_validation_path() {
-        let compiled = compile_legacy(None, Some("100xs"), None).unwrap();
-        assert!(pulsus_traceql::parse(&compiled).is_err());
+    fn a_malformed_duration_is_refused_before_compilation() {
+        for raw in ["100xs", "1.5", "s", "1m30", "--1s", ""] {
+            assert_eq!(
+                compile_legacy(None, Some(raw), None),
+                Err(LegacyError::InvalidDuration {
+                    name: "minDuration",
+                    raw: raw.to_string()
+                }),
+                "{raw:?}"
+            );
+        }
+        assert_eq!(
+            compile_legacy(None, None, Some("2 s")),
+            Err(LegacyError::InvalidDuration {
+                name: "maxDuration",
+                raw: "2 s".to_string()
+            })
+        );
+    }
+
+    /// P3: `minDuration`/`maxDuration` are Go durations, compiled exact to
+    /// the nanosecond; a negative one, and a minimum above the maximum,
+    /// are refused; and so is a `tags` key given twice.
+    #[test]
+    fn legacy_durations_are_go_durations() {
+        let min = |raw: &str| compile_legacy(None, Some(raw), None);
+        assert_eq!(min("1m30s").unwrap(), "{ duration >= 90000000000ns }");
+        assert_eq!(min("0").unwrap(), "{ duration >= 0ns }");
+        assert_eq!(min("1.5ms").unwrap(), "{ duration >= 1500000ns }");
+        assert_eq!(min("1h2m3.5s").unwrap(), "{ duration >= 3723500000000ns }");
+        assert_eq!(min("+2us").unwrap(), "{ duration >= 2000ns }");
+        assert_eq!(min("3µs").unwrap(), "{ duration >= 3000ns }");
+        for compiled in [min("1m30s").unwrap(), min("0").unwrap()] {
+            assert!(pulsus_traceql::parse(&compiled).is_ok(), "{compiled}");
+        }
+        assert_eq!(
+            min("-1s"),
+            Err(LegacyError::NegativeDuration {
+                name: "minDuration",
+                raw: "-1s".to_string()
+            })
+        );
+        assert_eq!(
+            compile_legacy(None, Some("2s"), Some("1s")),
+            Err(LegacyError::MinAboveMax {
+                min: "2s".to_string(),
+                max: "1s".to_string()
+            })
+        );
+        assert_eq!(
+            compile_legacy(None, Some("1s"), Some("2s")).unwrap(),
+            "{ duration >= 1000000000ns && duration <= 2000000000ns }"
+        );
+        assert_eq!(
+            compile_legacy(Some("a=1 a=2"), None, None),
+            Err(LegacyError::DuplicateKey {
+                key: "a".to_string()
+            })
+        );
     }
 
     #[test]

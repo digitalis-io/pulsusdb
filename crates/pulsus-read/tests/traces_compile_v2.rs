@@ -100,6 +100,7 @@ fn metrics_statement() -> String {
             end_ns: END_NS,
             step_ms: STEP_MS,
             exemplars: None,
+            floor_ns: i64::MIN,
         },
         &MetricsCtx {
             filter: filter_ctx(),

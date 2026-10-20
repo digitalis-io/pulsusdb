@@ -19,16 +19,7 @@ use crate::app::AppState;
 
 use super::error::ApiError;
 use super::handlers::engine_for;
-use super::params;
-
-/// Which of the two response forms a request evaluates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MetricsForm {
-    /// `query_range` → Prometheus matrix.
-    Range,
-    /// `query` → Prometheus vector (one bucket over the snapped window).
-    Instant,
-}
+use super::params::{self, MetricsForm};
 
 /// `GET /api/traces/v1/metrics/query_range`.
 pub(crate) async fn metrics_query_range(
@@ -52,19 +43,11 @@ pub(crate) async fn metrics_query(
     }
 }
 
-fn now_unix_seconds() -> i64 {
-    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        Ok(d) => i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
-        // A pre-epoch clock is pathological; `since` windows anchored at
-        // 0 simply fail range validation downstream.
-        Err(_) => 0,
-    }
-}
-
 async fn metrics_impl(state: AppState, raw: &str, form: MetricsForm) -> Result<Response, ApiError> {
-    let params = params::parse_metrics_params(raw, now_unix_seconds())?;
+    let now_ns = super::tags::now_unix_nanos();
+    let params = params::parse_metrics_params(raw, now_ns, form)?;
     // Issue #596 part 1: the reference's step limit, on the range route
-    // only; the instant route keeps its step.
+    // only; the instant route reads no step.
     if form == MetricsForm::Range {
         params::check_range_intervals(&params)?;
     }
@@ -94,6 +77,9 @@ async fn metrics_impl(state: AppState, raw: &str, form: MetricsForm) -> Result<R
         end_ns: params.end_ns,
         step_ms: params.step_ms,
         exemplars: params.exemplars,
+        // docs/api.md §4, "Retention": no statement reads a span older
+        // than the retention cutoff, whether or not storage still holds it.
+        floor_ns: params::retention_floor_ns(state.config.retention_days, now_ns),
     };
     // Issue #596 part 1: the statement on `spans` where it serves the
     // query, today's planner on the query itself where it does not.
@@ -190,18 +176,22 @@ mod tests {
         assert!(body.contains("byte 1"), "body {body}");
     }
 
+    /// No window is the last hour (the reference's `determineBounds`):
+    /// the request is well formed and stops at the pool, on both forms.
     #[tokio::test]
-    async fn a_missing_range_is_400() {
+    async fn a_missing_window_is_the_last_hour_not_an_error() {
         let (status, body) = run_range(RATE_Q).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(!body.contains("byte "), "body {body}");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body {body}");
+        let (status, body) = run_instant(RATE_Q).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body {body}");
     }
 
     /// Issue #477 (d): `500ms` moved from this list to the accepted
     /// grammar. `1.5ms` is the whole-millisecond bound that replaces it,
-    /// and `30S` is the case-sensitivity one.
+    /// and `30S` is the case-sensitivity one. The instant route reads no
+    /// `step` at all, so the same request stops at the pool there.
     #[tokio::test]
-    async fn a_bad_step_is_400_on_both_forms() {
+    async fn a_bad_step_is_400_on_the_range_route_and_ignored_on_the_instant_route() {
         for step in ["1.5ms", "30S", "5e2ms", "0s", "500us"] {
             let query = format!("{RATE_Q}&start=1700000000&end=1700003600&step={step}");
             let (status, body) = run_range(&query).await;
@@ -209,7 +199,7 @@ mod tests {
             let (status, body) = run_instant(&query).await;
             assert_eq!(
                 status,
-                StatusCode::BAD_REQUEST,
+                StatusCode::SERVICE_UNAVAILABLE,
                 "instant {step}: body {body}"
             );
         }
@@ -258,11 +248,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exceeding_the_point_cap_is_a_static_422() {
+    async fn exceeding_the_point_cap_is_refused_before_execution() {
         // 1,000,000 seconds at step=1 → 1M buckets: on the range route the
         // reference's step limit refuses it first (issue #596 part 1), at
         // plan time — no pool needed, so this no-pool state proves the
-        // rejection is pre-execution.
+        // rejection is pre-execution. The instant route reads no `step`,
+        // so its point cap cannot be reached and it has no case here.
         let (status, body) =
             run_range(&format!("{RATE_Q}&start=1700000000&end=1701000000&step=1")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "body {body}");
@@ -270,16 +261,11 @@ mod tests {
             body,
             "step of 1s is too small, minimum step for given range is 1m40s"
         );
-        // The instant route keeps the static 422 point cap.
-        let (status, body) =
-            run_instant(&format!("{RATE_Q}&start=1700000000&end=1701000000&step=1")).await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body {body}");
-        assert!(!body.contains("byte "), "body {body}");
     }
 
     /// D13: a range of more than 10,000 steps answers `400` in the
     /// reference's words; exactly 10,000 is served, and the instant route
-    /// keeps its step.
+    /// reads no step.
     #[tokio::test]
     async fn a_range_over_ten_thousand_intervals_is_the_reference_400() {
         let window = "start=1700000000&end=1700010800";
@@ -331,13 +317,13 @@ mod tests {
         // Full-i64-range endpoints: the i128 arithmetic resolves this
         // before any pool/SQL work (code review round 1's overflow class,
         // proven end to end through the handler) — on the range route the
-        // step limit's 400 (issue #596 part 1), on the instant route the
-        // static point-cap 422.
+        // step limit's 400 (issue #596 part 1); on the instant route,
+        // which reads no step, the planner's out-of-range 400.
         let query = format!("{RATE_Q}&start={}&end={}&step=1", i64::MIN, i64::MAX);
         let (status, body) = run_range(&query).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "body {body}");
         let (status, body) = run_instant(&query).await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body {body}");
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body {body}");
     }
 
     #[tokio::test]

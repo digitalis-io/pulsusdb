@@ -293,6 +293,7 @@ mod tests {
             end_ns: 1_700_000_060_000_000_000,
             step_ms: 60_000,
             exemplars: None,
+            floor_ns: i64::MIN,
         };
         let tables = StatementTables {
             spans: "spans",

@@ -82,16 +82,17 @@ pub(crate) enum TagNamesAnswer<'a> {
 
 /// What answers a tag-VALUES request, before rendering (issue #475).
 pub(crate) enum TagValuesAnswer<'a> {
-    /// The static vocabulary: every value typed `keyword`, never
-    /// truncated, never read from the store.
+    /// The static vocabulary: every value typed `keyword`, never read from
+    /// the store, and truncated only by the request's `limit`.
     Static(&'a [&'static str]),
     /// A catalog read: the stored type per value, `truncated` carried.
     Catalog(&'a TagValues),
 }
 
 impl TagNamesAnswer<'_> {
-    /// `truncated` continues to mean "the catalog read hit its cap" and
-    /// nothing else, so a static answer is never truncated.
+    /// Whether the catalog read hit its cap; a static answer never does.
+    /// The request's `limit` can also cut an answer, which
+    /// [`render_tag_names`] adds.
     fn truncated(&self) -> bool {
         match self {
             Self::IntrinsicOnly | Self::NoTags => false,
@@ -109,41 +110,57 @@ impl TagValuesAnswer<'_> {
     }
 }
 
-/// The static intrinsic scope object, identical on every route that
-/// carries it.
-fn intrinsic_scope_json() -> Value {
-    json!({"name": INTRINSIC_SCOPE, "tags": intrinsic_scope_tags()})
+/// Cuts `list` to the request's `limit`, saying whether anything was cut.
+fn cut<T>(list: &mut Vec<T>, limit: Option<usize>) -> bool {
+    match limit {
+        Some(n) if list.len() > n => {
+            list.truncate(n);
+            true
+        }
+        _ => false,
+    }
 }
 
 /// The shared `scopes` array both scoped renderers emit — rows arrive in
 /// the catalog's `(scope, key)` order, so grouping preserves both the
-/// scope order and each scope's ascending key order.
-fn scopes_json(answer: &TagNamesAnswer<'_>) -> Vec<Value> {
+/// scope order and each scope's ascending key order — and whether the
+/// request's `limit` cut any scope's list, the `intrinsic` scope's
+/// included. The limit applies per scope, after grouping.
+fn scopes_json(answer: &TagNamesAnswer<'_>, limit: Option<usize>) -> (Vec<Value>, bool) {
     let (names, with_intrinsic) = match answer {
-        TagNamesAnswer::IntrinsicOnly => return vec![intrinsic_scope_json()],
-        TagNamesAnswer::NoTags => return Vec::new(),
+        TagNamesAnswer::IntrinsicOnly => (None, true),
+        TagNamesAnswer::NoTags => return (Vec::new(), false),
         TagNamesAnswer::Catalog {
             names,
             with_intrinsic,
-        } => (*names, *with_intrinsic),
+        } => (Some(*names), *with_intrinsic),
     };
-    let mut out: Vec<Value> = Vec::new();
-    if with_intrinsic {
-        out.push(intrinsic_scope_json());
-    }
     let mut scopes: Vec<(String, Vec<String>)> = Vec::new();
-    for (scope, key) in &names.names {
-        match scopes.last_mut() {
+    if with_intrinsic {
+        scopes.push((
+            INTRINSIC_SCOPE.to_string(),
+            intrinsic_scope_tags()
+                .iter()
+                .map(|t| t.to_string())
+                .collect(),
+        ));
+    }
+    let catalog_from = scopes.len();
+    for (scope, key) in names.map(|n| n.names.as_slice()).unwrap_or_default() {
+        match scopes[catalog_from..].last_mut() {
             Some((current, keys)) if current == scope => keys.push(key.clone()),
             _ => scopes.push((scope.clone(), vec![key.clone()])),
         }
     }
-    out.extend(
-        scopes
-            .into_iter()
-            .map(|(name, tags)| json!({"name": name, "tags": tags})),
-    );
-    out
+    let mut was_cut = false;
+    let out = scopes
+        .into_iter()
+        .map(|(name, mut tags)| {
+            was_cut |= cut(&mut tags, limit);
+            json!({"name": name, "tags": tags})
+        })
+        .collect();
+    (out, was_cut)
 }
 
 /// The wire `type` for one catalog row (issue #476): the stored type, or
@@ -188,8 +205,15 @@ const STRING_TYPE: &str = "string";
 /// missing and `truncated` is already `true`; that is not chased further.
 ///
 /// One pass over at most `TAG_VALUES_MAX` entries, no extra query, and no
-/// character of `val` is read.
-fn typed_values_json(answer: &TagValuesAnswer<'_>) -> Vec<Value> {
+/// character of `val` is read. The request's `limit` cuts the entries
+/// after the run rule, a static list too; the flag says whether it did.
+fn typed_values_json(answer: &TagValuesAnswer<'_>, limit: Option<usize>) -> (Vec<Value>, bool) {
+    let mut out = typed_values(answer);
+    let was_cut = cut(&mut out, limit);
+    (out, was_cut)
+}
+
+fn typed_values(answer: &TagValuesAnswer<'_>) -> Vec<Value> {
     fn entry(ty: &str, val: &str) -> Value {
         let mut obj = serde_json::Map::new();
         obj.insert("type".to_string(), json!(ty));
@@ -232,32 +256,43 @@ fn typed_values_json(answer: &TagValuesAnswer<'_>) -> Vec<Value> {
 }
 
 /// Native: `{"scopes":[{"name":…,"tags":[…]}],"truncated":…}`.
-pub(crate) fn render_tag_names(answer: &TagNamesAnswer<'_>) -> Value {
+/// `truncated` is the read's cap or the request's `limit` cutting a scope.
+pub(crate) fn render_tag_names(answer: &TagNamesAnswer<'_>, limit: Option<usize>) -> Value {
+    let (scopes, was_cut) = scopes_json(answer, limit);
     json!({
-        "scopes": scopes_json(answer),
-        "truncated": answer.truncated(),
+        "scopes": scopes,
+        "truncated": answer.truncated() || was_cut,
     })
 }
 
 /// Native: `{"tagValues":[{"type":…,"value":…}],"truncated":…}`.
-pub(crate) fn render_tag_values(answer: &TagValuesAnswer<'_>) -> Value {
+/// `truncated` is the read's cap or the request's `limit` cutting the
+/// list, a static one included.
+pub(crate) fn render_tag_values(answer: &TagValuesAnswer<'_>, limit: Option<usize>) -> Value {
+    let (values, was_cut) = typed_values_json(answer, limit);
     json!({
-        "tagValues": typed_values_json(answer),
-        "truncated": answer.truncated(),
+        "tagValues": values,
+        "truncated": answer.truncated() || was_cut,
     })
 }
 
 /// Tempo v2 alias (`/api/v2/search/tags`): the native scoped shape MINUS
 /// the PulsusDB-only `truncated` field (issue #61 plan v2 Δ1 — alias
 /// consumers lose the truncation signal; documented §8.1 delta).
-pub(crate) fn render_tag_names_scoped_v2(answer: &TagNamesAnswer<'_>) -> Value {
-    json!({"scopes": scopes_json(answer)})
+pub(crate) fn render_tag_names_scoped_v2(
+    answer: &TagNamesAnswer<'_>,
+    limit: Option<usize>,
+) -> Value {
+    json!({"scopes": scopes_json(answer, limit).0})
 }
 
 /// Tempo v2 alias (`/api/v2/search/tag/{tag}/values`): the native typed
 /// shape MINUS `truncated`.
-pub(crate) fn render_tag_values_typed_v2(answer: &TagValuesAnswer<'_>) -> Value {
-    json!({"tagValues": typed_values_json(answer)})
+pub(crate) fn render_tag_values_typed_v2(
+    answer: &TagValuesAnswer<'_>,
+    limit: Option<usize>,
+) -> Value {
+    json!({"tagValues": typed_values_json(answer, limit).0})
 }
 
 /// Tempo v1 alias (`/api/search/tags`): flat `{"tagNames":[…]}` — the
@@ -267,10 +302,15 @@ pub(crate) fn render_tag_values_typed_v2(answer: &TagValuesAnswer<'_>) -> Value 
 ///
 /// The intrinsic vocabulary reaches this route only when it is asked for
 /// by name (`scope=intrinsic`): an unscoped v1 flat listing carries the
-/// catalog keys alone, matching the reference (issue #475).
-pub(crate) fn render_tag_names_flat(answer: &TagNamesAnswer<'_>) -> Value {
+/// catalog keys alone, matching the reference (issue #475). The request's
+/// `limit` cuts the one flat list, after the deduplication.
+pub(crate) fn render_tag_names_flat(answer: &TagNamesAnswer<'_>, limit: Option<usize>) -> Value {
     let (names, with_intrinsic) = match answer {
-        TagNamesAnswer::IntrinsicOnly => return json!({"tagNames": intrinsic_scope_tags()}),
+        TagNamesAnswer::IntrinsicOnly => {
+            let mut keys = intrinsic_scope_tags().to_vec();
+            cut(&mut keys, limit);
+            return json!({"tagNames": keys});
+        }
         TagNamesAnswer::NoTags => return json!({"tagNames": Vec::<&str>::new()}),
         TagNamesAnswer::Catalog {
             names,
@@ -297,6 +337,7 @@ pub(crate) fn render_tag_names_flat(answer: &TagNamesAnswer<'_>) -> Value {
             keys.push(key.as_str());
         }
     }
+    cut(&mut keys, limit);
     json!({"tagNames": keys})
 }
 
@@ -309,13 +350,15 @@ pub(crate) fn render_tag_names_flat(answer: &TagNamesAnswer<'_>) -> Value {
 /// `"8080"` and an int `8080` yields two rows whose flat projection would
 /// otherwise be `["8080","8080"]`. Rows sharing a `val` are contiguous by
 /// the read's `ORDER BY`, so this is a first-occurrence pass, not a set.
-pub(crate) fn render_tag_values_flat(values: &TagValues) -> Value {
+/// The request's `limit` cuts the list after that pass.
+pub(crate) fn render_tag_values_flat(values: &TagValues, limit: Option<usize>) -> Value {
     let mut flat: Vec<&str> = Vec::with_capacity(values.values.len());
     for v in &values.values {
         if flat.last() != Some(&v.val.as_str()) {
             flat.push(v.val.as_str());
         }
     }
+    cut(&mut flat, limit);
     json!({"tagValues": flat})
 }
 
@@ -361,7 +404,7 @@ mod tests {
             truncated: false,
         };
         assert_eq!(
-            render_tag_names(&catalog(&names)),
+            render_tag_names(&catalog(&names), None),
             json!({
                 "scopes": [
                     {"name": "resource", "tags": ["env", "service.name"]},
@@ -379,7 +422,7 @@ mod tests {
             truncated: false,
         };
         assert_eq!(
-            render_tag_names(&catalog(&names)),
+            render_tag_names(&catalog(&names), None),
             json!({"scopes": [], "truncated": false})
         );
     }
@@ -390,14 +433,17 @@ mod tests {
             names: vec![("span".to_string(), "k".to_string())],
             truncated: true,
         };
-        assert_eq!(render_tag_names(&catalog(&names))["truncated"], json!(true));
+        assert_eq!(
+            render_tag_names(&catalog(&names), None)["truncated"],
+            json!(true)
+        );
     }
 
     #[test]
     fn render_tag_values_emits_typed_values_and_the_flag() {
         let values = tag_values(&[("checkout", "string"), ("500", "int")], false);
         assert_eq!(
-            render_tag_values(&TagValuesAnswer::Catalog(&values)),
+            render_tag_values(&TagValuesAnswer::Catalog(&values), None),
             json!({
                 "tagValues": [
                     {"type": "string", "value": "checkout"},
@@ -408,7 +454,7 @@ mod tests {
         );
         let empty = tag_values(&[], false);
         assert_eq!(
-            render_tag_values(&TagValuesAnswer::Catalog(&empty)),
+            render_tag_values(&TagValuesAnswer::Catalog(&empty), None),
             json!({"tagValues": [], "truncated": false})
         );
     }
@@ -427,7 +473,7 @@ mod tests {
             names: &names,
             with_intrinsic: true,
         };
-        let rendered = render_tag_names_scoped_v2(&answer);
+        let rendered = render_tag_names_scoped_v2(&answer, None);
         let scopes = rendered["scopes"].as_array().expect("scopes");
         assert_eq!(scopes.len(), 2);
         assert_eq!(scopes[0]["name"], json!("intrinsic"));
@@ -449,10 +495,13 @@ mod tests {
             truncated: false,
         };
         assert_eq!(
-            render_tag_names_flat(&TagNamesAnswer::Catalog {
-                names: &names,
-                with_intrinsic: false,
-            }),
+            render_tag_names_flat(
+                &TagNamesAnswer::Catalog {
+                    names: &names,
+                    with_intrinsic: false,
+                },
+                None
+            ),
             json!({"tagNames": ["status"]})
         );
         // The flag is the single control: the renderer HONOURS it rather
@@ -461,10 +510,13 @@ mod tests {
         // BOTH a catalog key here and one of the 25 static names, so the
         // deduplicated list is 25 long, not 26 — the count is measured,
         // not assumed.
-        let injected = render_tag_names_flat(&TagNamesAnswer::Catalog {
-            names: &names,
-            with_intrinsic: true,
-        });
+        let injected = render_tag_names_flat(
+            &TagNamesAnswer::Catalog {
+                names: &names,
+                with_intrinsic: true,
+            },
+            None,
+        );
         let injected = injected["tagNames"].as_array().expect("tagNames").clone();
         assert_eq!(injected.len(), 25, "{injected:?}");
         assert_eq!(injected[0], json!("duration"), "the static names lead");
@@ -478,15 +530,15 @@ mod tests {
     fn the_intrinsic_only_answer_is_the_static_scope_on_every_shape() {
         let tags = json!(intrinsic_scope_tags());
         assert_eq!(
-            render_tag_names(&TagNamesAnswer::IntrinsicOnly),
+            render_tag_names(&TagNamesAnswer::IntrinsicOnly, None),
             json!({"scopes": [{"name": "intrinsic", "tags": tags}], "truncated": false})
         );
         assert_eq!(
-            render_tag_names_scoped_v2(&TagNamesAnswer::IntrinsicOnly),
+            render_tag_names_scoped_v2(&TagNamesAnswer::IntrinsicOnly, None),
             json!({"scopes": [{"name": "intrinsic", "tags": tags}]})
         );
         assert_eq!(
-            render_tag_names_flat(&TagNamesAnswer::IntrinsicOnly),
+            render_tag_names_flat(&TagNamesAnswer::IntrinsicOnly, None),
             json!({"tagNames": tags})
         );
     }
@@ -494,15 +546,15 @@ mod tests {
     #[test]
     fn the_no_tags_answer_is_an_empty_list_on_every_shape() {
         assert_eq!(
-            render_tag_names(&TagNamesAnswer::NoTags),
+            render_tag_names(&TagNamesAnswer::NoTags, None),
             json!({"scopes": [], "truncated": false})
         );
         assert_eq!(
-            render_tag_names_scoped_v2(&TagNamesAnswer::NoTags),
+            render_tag_names_scoped_v2(&TagNamesAnswer::NoTags, None),
             json!({"scopes": []})
         );
         assert_eq!(
-            render_tag_names_flat(&TagNamesAnswer::NoTags),
+            render_tag_names_flat(&TagNamesAnswer::NoTags, None),
             json!({"tagNames": []})
         );
     }
@@ -511,7 +563,7 @@ mod tests {
     fn a_static_value_answer_is_typed_keyword_and_never_truncated() {
         let answer = TagValuesAnswer::Static(&["ok", "error", "unset"]);
         assert_eq!(
-            render_tag_values_typed_v2(&answer),
+            render_tag_values_typed_v2(&answer, None),
             json!({"tagValues": [
                 {"type": "keyword", "value": "ok"},
                 {"type": "keyword", "value": "error"},
@@ -519,7 +571,7 @@ mod tests {
             ]})
         );
         assert_eq!(
-            render_tag_values(&answer)["truncated"],
+            render_tag_values(&answer, None)["truncated"],
             json!(false),
             "a static answer never hit a cap"
         );
@@ -531,10 +583,10 @@ mod tests {
     fn an_empty_tag_value_omits_the_value_key() {
         let values = tag_values(&[("", "string"), ("x", "string")], false);
         assert_eq!(
-            render_tag_values_typed_v2(&TagValuesAnswer::Catalog(&values)),
+            render_tag_values_typed_v2(&TagValuesAnswer::Catalog(&values), None),
             json!({"tagValues": [{"type": "string"}, {"type": "string", "value": "x"}]})
         );
-        let typed = render_tag_values_typed_v2(&TagValuesAnswer::Catalog(&values));
+        let typed = render_tag_values_typed_v2(&TagValuesAnswer::Catalog(&values), None);
         assert!(
             typed["tagValues"][0].get("value").is_none(),
             "the empty value must carry no `value` key: {typed}"
@@ -542,7 +594,7 @@ mod tests {
         // The v1 flat projection is untouched: it still emits the empty
         // string as an element (ledger `traceql-v1-flat-empty-value-dropped`).
         assert_eq!(
-            render_tag_values_flat(&values),
+            render_tag_values_flat(&values, None),
             json!({"tagValues": ["", "x"]})
         );
     }
@@ -564,8 +616,11 @@ mod tests {
     #[test]
     fn render_tag_names_scoped_v2_is_the_native_scopes_without_a_truncated_key() {
         let names = truncated_names();
-        let v2 = render_tag_names_scoped_v2(&catalog(&names));
-        assert_eq!(v2["scopes"], render_tag_names(&catalog(&names))["scopes"]);
+        let v2 = render_tag_names_scoped_v2(&catalog(&names), None);
+        assert_eq!(
+            v2["scopes"],
+            render_tag_names(&catalog(&names), None)["scopes"]
+        );
         assert!(
             v2.get("truncated").is_none(),
             "the v2 alias must drop `truncated` even when the native flag is true: {v2}"
@@ -575,7 +630,7 @@ mod tests {
             truncated: false,
         };
         assert_eq!(
-            render_tag_names_scoped_v2(&catalog(&empty)),
+            render_tag_names_scoped_v2(&catalog(&empty), None),
             json!({"scopes": []})
         );
     }
@@ -583,7 +638,7 @@ mod tests {
     #[test]
     fn render_tag_values_typed_v2_is_the_native_typed_values_without_a_truncated_key() {
         let values = tag_values(&[("checkout", "string"), ("500", "int")], true);
-        let v2 = render_tag_values_typed_v2(&TagValuesAnswer::Catalog(&values));
+        let v2 = render_tag_values_typed_v2(&TagValuesAnswer::Catalog(&values), None);
         assert_eq!(
             v2,
             json!({
@@ -599,7 +654,7 @@ mod tests {
         );
         let empty = tag_values(&[], false);
         assert_eq!(
-            render_tag_values_typed_v2(&TagValuesAnswer::Catalog(&empty)),
+            render_tag_values_typed_v2(&TagValuesAnswer::Catalog(&empty), None),
             json!({"tagValues": []})
         );
     }
@@ -609,7 +664,7 @@ mod tests {
         // `env` exists in BOTH scopes — the flat projection keeps its
         // first (resource-side) occurrence only.
         let names = truncated_names();
-        let flat = render_tag_names_flat(&catalog(&names));
+        let flat = render_tag_names_flat(&catalog(&names), None);
         assert_eq!(
             flat,
             json!({"tagNames": ["env", "service.name", "http.status_code"]})
@@ -625,7 +680,7 @@ mod tests {
             truncated: false,
         };
         assert_eq!(
-            render_tag_names_flat(&catalog(&empty)),
+            render_tag_names_flat(&catalog(&empty), None),
             json!({"tagNames": []})
         );
     }
@@ -634,11 +689,14 @@ mod tests {
     fn render_tag_values_flat_emits_bare_strings_without_type_or_truncated() {
         let values = tag_values(&[("checkout", "string"), ("500", "int")], true);
         assert_eq!(
-            render_tag_values_flat(&values),
+            render_tag_values_flat(&values, None),
             json!({"tagValues": ["checkout", "500"]})
         );
         let empty = tag_values(&[], false);
-        assert_eq!(render_tag_values_flat(&empty), json!({"tagValues": []}));
+        assert_eq!(
+            render_tag_values_flat(&empty, None),
+            json!({"tagValues": []})
+        );
     }
 
     // -- issue #476: the stored type, the legacy window, the run rule ----
@@ -653,7 +711,7 @@ mod tests {
     fn a_legacy_row_reports_string_however_its_text_reads() {
         for text in ["1.5", "12345", "-7", "true", "2s", "alpha", ""] {
             let values = tag_values(&[(text, "")], false);
-            let rendered = render_tag_values_typed_v2(&TagValuesAnswer::Catalog(&values));
+            let rendered = render_tag_values_typed_v2(&TagValuesAnswer::Catalog(&values), None);
             let expected = if text.is_empty() {
                 json!({"tagValues": [{"type": "string"}]})
             } else {
@@ -679,7 +737,7 @@ mod tests {
             false,
         );
         assert_eq!(
-            render_tag_values_typed_v2(&TagValuesAnswer::Catalog(&values)),
+            render_tag_values_typed_v2(&TagValuesAnswer::Catalog(&values), None),
             json!({"tagValues": [
                 {"type": "float", "value": "1.5"},
                 {"type": "string", "value": "12345"},
@@ -697,7 +755,7 @@ mod tests {
     fn one_value_at_two_types_renders_two_entries() {
         let values = tag_values(&[("8080", "int"), ("8080", "string")], false);
         assert_eq!(
-            render_tag_values_typed_v2(&TagValuesAnswer::Catalog(&values)),
+            render_tag_values_typed_v2(&TagValuesAnswer::Catalog(&values), None),
             json!({"tagValues": [
                 {"type": "int", "value": "8080"},
                 {"type": "string", "value": "8080"},
@@ -710,7 +768,7 @@ mod tests {
     fn the_flat_route_deduplicates_a_value_stored_at_two_types() {
         let values = tag_values(&[("8080", "int"), ("8080", "string")], false);
         assert_eq!(
-            render_tag_values_flat(&values),
+            render_tag_values_flat(&values, None),
             json!({"tagValues": ["8080"]})
         );
     }
@@ -730,11 +788,11 @@ mod tests {
     fn a_rolling_upgrade_duplicate_collapses_to_the_typed_row() {
         let values = tag_values(&[("500", ""), ("500", "int")], false);
         assert_eq!(
-            render_tag_values_typed_v2(&TagValuesAnswer::Catalog(&values)),
+            render_tag_values_typed_v2(&TagValuesAnswer::Catalog(&values), None),
             json!({"tagValues": [{"type": "int", "value": "500"}]})
         );
         // ...and the untyped row is dropped, not merely reordered.
-        let rendered = render_tag_values_typed_v2(&TagValuesAnswer::Catalog(&values));
+        let rendered = render_tag_values_typed_v2(&TagValuesAnswer::Catalog(&values), None);
         assert_eq!(rendered["tagValues"].as_array().expect("array").len(), 1);
     }
 
@@ -744,7 +802,7 @@ mod tests {
     fn the_run_rule_does_not_leak_across_values() {
         let values = tag_values(&[("a", ""), ("b", ""), ("b", "int"), ("c", "")], false);
         assert_eq!(
-            render_tag_values_typed_v2(&TagValuesAnswer::Catalog(&values)),
+            render_tag_values_typed_v2(&TagValuesAnswer::Catalog(&values), None),
             json!({"tagValues": [
                 {"type": "string", "value": "a"},
                 {"type": "int", "value": "b"},
@@ -757,9 +815,10 @@ mod tests {
     #[test]
     fn no_rendered_entry_carries_an_empty_type() {
         let values = tag_values(&[("x", ""), ("y", "int"), ("y", "")], false);
-        for entry in render_tag_values_typed_v2(&TagValuesAnswer::Catalog(&values))["tagValues"]
-            .as_array()
-            .expect("array")
+        for entry in
+            render_tag_values_typed_v2(&TagValuesAnswer::Catalog(&values), None)["tagValues"]
+                .as_array()
+                .expect("array")
         {
             assert_ne!(entry["type"], json!(""), "{entry}");
         }
@@ -796,7 +855,7 @@ mod tests {
             false,
         );
         assert_eq!(
-            render_tag_values(&TagValuesAnswer::Catalog(&values)),
+            render_tag_values(&TagValuesAnswer::Catalog(&values), None),
             json!({
                 "tagValues": [
                     {"type": "string"},
@@ -822,12 +881,12 @@ mod tests {
     fn a_vocabulary_value_is_keyword_and_a_span_name_is_string() {
         let statics: [&'static str; 1] = ["error"];
         assert_eq!(
-            render_tag_values(&TagValuesAnswer::Static(&statics))["tagValues"],
+            render_tag_values(&TagValuesAnswer::Static(&statics), None)["tagValues"],
             json!([{"type": "keyword", "value": "error"}])
         );
         let names = tag_values(&[("error", "string")], false);
         assert_eq!(
-            render_tag_values(&TagValuesAnswer::Catalog(&names))["tagValues"],
+            render_tag_values(&TagValuesAnswer::Catalog(&names), None)["tagValues"],
             json!([{"type": "string", "value": "error"}])
         );
     }

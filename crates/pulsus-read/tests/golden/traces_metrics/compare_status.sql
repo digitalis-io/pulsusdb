@@ -83,7 +83,7 @@ SELECT toUInt64(pairs * 2 + keys * 4 + 100) AS n FROM (
     SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), INTERVAL 60000 MILLISECOND)) AS t, trace_id, span_id, name AS i_name, kind AS i_kind, status_code AS i_status, service AS i_service, status_message AS i_status_message, scope_name AS i_scope_name, scope_version AS i_scope_version, (((cpi0 != 0) AND attr_val[cpi0] = '500')) AS is_sel
     FROM trace_spans
     PREWHERE service = 'checkout'
-  WHERE timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000
+  WHERE timestamp_ns >= 1700000000000000000 AND timestamp_ns < 1700010800000000000
   )
   GROUP BY t, trace_id, span_id
     ) b
@@ -97,7 +97,7 @@ SELECT toUInt64(pairs * 2 + keys * 4 + 100) AS n FROM (
     SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), INTERVAL 60000 MILLISECOND)) AS t, trace_id, span_id, name AS i_name, kind AS i_kind, status_code AS i_status, service AS i_service, status_message AS i_status_message, scope_name AS i_scope_name, scope_version AS i_scope_version, (((cpi0 != 0) AND attr_val[cpi0] = '500')) AS is_sel
     FROM trace_spans
     PREWHERE service = 'checkout'
-  WHERE timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000
+  WHERE timestamp_ns >= 1700000000000000000 AND timestamp_ns < 1700010800000000000
   )
   GROUP BY t, trace_id, span_id
   ))
@@ -113,12 +113,12 @@ SELECT toUInt64(pairs * 2 + keys * 4 + 100) AS n FROM (
     SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), INTERVAL 60000 MILLISECOND)) AS t, trace_id, span_id, name AS i_name, kind AS i_kind, status_code AS i_status, service AS i_service, status_message AS i_status_message, scope_name AS i_scope_name, scope_version AS i_scope_version, (((cpi0 != 0) AND attr_val[cpi0] = '500')) AS is_sel
     FROM trace_spans
     PREWHERE service = 'checkout'
-  WHERE timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000
+  WHERE timestamp_ns >= 1700000000000000000 AND timestamp_ns < 1700010800000000000
   )
   GROUP BY t, trace_id, span_id
   ) b
   INNER JOIN (
-    SELECT DISTINCT trace_id, span_id, scope, key, val FROM trace_attrs_idx WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15') AND timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000
+    SELECT DISTINCT trace_id, span_id, scope, key, val FROM trace_attrs_idx WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15') AND timestamp_ns >= 1700000000000000000 AND timestamp_ns < 1700010800000000000
   ) a ON b.trace_id = a.trace_id AND b.span_id = a.span_id
 ) GROUP BY akey, aval LIMIT 1001
 )

@@ -960,7 +960,7 @@ async fn trace_fetch_serves_negotiated_representations_against_real_clickhouse()
     let res = get(PORT, &fetch_path("zzzz"), &[], ctx);
     let body = assert_error_body(&res, 400, ctx);
     assert!(
-        body.contains("expected 16 or 32 hex characters"),
+        body.contains("expected hex characters only"),
         "{ctx}: {body:?}"
     );
     assert!(has_vary_accept(&res), "{ctx}: 400 must Vary: accept");

@@ -66,6 +66,7 @@ async fn tags_impl(state: AppState, raw: &str) -> Result<Response, ApiError> {
     // Parse before the pool: `scope=bogus` resolves 400 without
     // ClickHouse — the search surface's parse-before-engine ordering.
     let params = params::parse_tags_params(raw)?;
+    let limit = params::parse_tag_limit(&params::parse_pairs(raw));
     // The two static scopes short-circuit before `engine_for`: they issue
     // NO ClickHouse query at all (issue #475), which is what the
     // zero-delta gate in `traces_tags_live.rs` measures.
@@ -73,11 +74,13 @@ async fn tags_impl(state: AppState, raw: &str) -> Result<Response, ApiError> {
         TagScope::Intrinsic => {
             return Ok(ok_json(tags_response::render_tag_names(
                 &TagNamesAnswer::IntrinsicOnly,
+                limit,
             )));
         }
         TagScope::NoTags => {
             return Ok(ok_json(tags_response::render_tag_names(
                 &TagNamesAnswer::NoTags,
+                limit,
             )));
         }
         scope => {
@@ -90,6 +93,7 @@ async fn tags_impl(state: AppState, raw: &str) -> Result<Response, ApiError> {
             names: &names,
             with_intrinsic: matches!(params.scope, TagScope::All),
         },
+        limit,
     )))
 }
 
@@ -200,11 +204,16 @@ pub(super) async fn values_for(
     raw_query: &str,
 ) -> Result<ValuesSource, ApiError> {
     let lookup = params::parse_tag_lookup(raw_tag)?;
-    let params =
-        params::parse_tag_values_params(raw_query, now_unix_nanos(), tag_lookback_ns(state))?;
+    let now_ns = now_unix_nanos();
+    let params = params::parse_tag_values_params(raw_query, now_ns, tag_lookback_ns(state))?;
+    // docs/api.md §4, "Retention": a store read starts at the cutoff.
     let req = pulsus_read::TagValuesRequest {
         q: params.q.as_deref(),
-        start_ns: params.start_ns,
+        start_ns: params::floored_start(
+            params.start_ns,
+            params.end_ns,
+            params::retention_floor_ns(state.config.retention_days, now_ns),
+        ),
         end_ns: params.end_ns,
     };
     match lookup {
@@ -248,7 +257,11 @@ async fn tag_values_impl(
     raw_query: &str,
 ) -> Result<Response, ApiError> {
     let source = values_for(&state, raw_tag, raw_query).await?;
-    Ok(ok_json(tags_response::render_tag_values(&source.answer())))
+    let limit = params::parse_tag_limit(&params::parse_pairs(raw_query));
+    Ok(ok_json(tags_response::render_tag_values(
+        &source.answer(),
+        limit,
+    )))
 }
 
 #[cfg(test)]

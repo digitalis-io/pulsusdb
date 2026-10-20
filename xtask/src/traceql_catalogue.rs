@@ -328,6 +328,7 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
                 end_ns: a.end_ns,
                 step_ms: STEP_MS,
                 exemplars: None,
+                floor_ns: i64::MIN,
             };
             let plan = match plan_trace_metrics_routed(&query, &params, &ctx, &tables) {
                 Ok(plan) => plan,

@@ -9,7 +9,6 @@ docs/query-lowering.md	ast.rs:248	ambiguous_basename
 docs/query-lowering.md	ast.rs:251	ambiguous_basename
 docs/query-lowering.md	ast.rs:939	ambiguous_basename
 docs/query-lowering.md	crates/pulsus-read/src/traces/compile.rs:1396-1404	not_a_tracked_file
-docs/query-lowering.md	crates/pulsus-read/src/traces/metrics_sql.rs:626	ambiguous_basename
 docs/query-lowering.md	crates/pulsus-read/src/traces/metrics_sql.rs:627	blank_target_line
 docs/query-lowering.md	crates/pulsus-read/src/traces/search_eval.rs:183	not_a_tracked_file
 docs/query-lowering.md	crates/pulsus-read/src/traces/search_eval.rs:2440	not_a_tracked_file

@@ -247,6 +247,7 @@ async fn total_over_buckets(engine: &TraceEngine, q: &str, start_ns: i64, end_ns
             end_ns,
             step_ms: 300_000,
             exemplars: None,
+            floor_ns: i64::MIN,
         },
         &engine.metrics_ctx(),
     )

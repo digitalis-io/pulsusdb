@@ -26,8 +26,8 @@ ORDER BY g, o
 SELECT g, o, [(toInt64(1791410820000), v)] AS points, CAST([], 'Array(Tuple(FixedString(16), Int64, Float64))') AS exemplars, 0 AS f
 FROM (SELECT CAST([], 'Array(Tuple(String, String))') AS g, toUInt64(roundToExp2(duration_ns - 1)) * 2 AS o, toFloat64(count()) AS v
 FROM spans
-WHERE start_ns >= 1791399960000000000 AND start_ns < 1791410820000000000
-  AND intDiv(start_ns, 300000000000) BETWEEN intDiv(1791399960000000000, 300000000000) AND intDiv(1791410819999999999, 300000000000)
+WHERE start_ns >= 1791400000000000000 AND start_ns < 1791410800000000000
+  AND intDiv(start_ns, 300000000000) BETWEEN intDiv(1791400000000000000, 300000000000) AND intDiv(1791410799999999999, 300000000000)
   AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') >= toDate('2026-10-07') AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') <= toDate('2026-10-07')
   AND (true) AND duration_ns >= 2
 GROUP BY g, o)

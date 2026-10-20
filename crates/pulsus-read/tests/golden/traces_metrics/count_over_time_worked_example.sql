@@ -17,7 +17,7 @@ WITH arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, 
 SELECT uniqExact(trace_id, span_id) AS n
 FROM trace_spans
 PREWHERE service = 'checkout'
-WHERE timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000
+WHERE timestamp_ns >= 1700000000000000000 AND timestamp_ns < 1700010800000000000
   AND (((pi0 != 0) AND ifNull(attr_num[pi0] >= 500, 0)) AND duration_ns > 2000000000)
 
 == exemplars ==

@@ -27,7 +27,7 @@ WITH arrayFirstIndex((k, s) -> k = 'flag' AND s = 'span', attr_key, attr_scope) 
      arrayFirstIndex((k, s, v) -> k = 'flag' AND s = 'link' AND v = 'true', attr_key, attr_scope, attr_val) AS pm0l
 SELECT uniqExact(trace_id, span_id) AS n
 FROM trace_spans
-WHERE timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000
+WHERE timestamp_ns >= 1700000000000000000 AND timestamp_ns < 1700010800000000000
   AND (if(pi0s != 0, attr_val[pi0s] = 'true', if(pi0r != 0, attr_val[pi0r] = 'true', if(pi0e != 0, pm0e != 0, if(pi0l != 0, pm0l != 0, if(pi0i != 0, attr_val[pi0i] = 'true', 0))))))
 
 == exemplars ==

@@ -1380,6 +1380,7 @@ mod tests {
         end_ns: 1_700_010_800_000_000_000,
         step_ms: 60_000,
         exemplars: None,
+        floor_ns: i64::MIN,
     };
 
     const TABLES: StatementTables<'static> = StatementTables {
@@ -1661,6 +1662,7 @@ mod tests {
         end_ns: 1_700_003_600_000_000_000,
         step_ms: 60_000,
         exemplars: Some(100),
+        floor_ns: i64::MIN,
     };
 
     /// §3 of the plan, typed out: the range form; the instant form differs
