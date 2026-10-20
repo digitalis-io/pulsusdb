@@ -60,14 +60,6 @@ def value_text(t, v):
     return str(v)
 
 
-def label_text(v):
-    """The text a group or series label carries, from a value this interpreter
-    already holds as a Python object rather than as a stored (type, value)
-    pair."""
-    if isinstance(v, bool): return 'true' if v else 'false'
-    if isinstance(v, float): return f'{v:g}'
-    return str(v)
-
 # ------------------------------------------------------------- interpreter --
 class Fixture:
     """The fixture rows, read from the generator's own output, with the derived
@@ -140,27 +132,6 @@ def f32(x):
     stated at that precision here."""
     import struct
     return struct.unpack('f', struct.pack('f', float(x)))[0]
-
-
-def log2_bucket_ns(dur):
-    """The `histogram_over_time` bucket: the smallest power of two nanoseconds
-    at or above the duration, and nothing at all below 2 ns.
-
-    The reference's `Log2Bucketize` (`pkg/traceql/engine_metrics.go:2038-2046 @
-    v3.0.2`) bit-scans `v - 1`; written here over Python integers, which is the
-    same arithmetic without the word width. The label is the bucket in
-    nanoseconds; the response layer renders it as float seconds
-    (`log2_histogram::bucket_seconds`)."""
-    if dur < 2: return None
-    return 1 << (dur - 1).bit_length()
-
-
-def bucket_label_ms(start_ns, step_ns):
-    """The instant that CLOSES the bucket a span falls in, in milliseconds:
-    the metrics window is left-closed and right-open and a range selector's
-    instants are right-closed, so a span at exactly a step edge belongs to the
-    bucket that edge ends (`sql-schema.md` §5.6)."""
-    return ((start_ns - 1) // step_ns + 1) * step_ns // 10 ** 6
 
 
 def kind(v):
