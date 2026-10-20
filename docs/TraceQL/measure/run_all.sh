@@ -161,26 +161,18 @@ echo "== the awkward topologies: same-time siblings, an orphan, a cycle, the dep
 "$HERE/edge_checks.sh" "$CH" tqd_edge "$WORK" | tee "$R/edge-checks-summary.txt"
 
 echo "== the query catalogue: every query in the TraceQL corpus"
-CORPUS_TQL=${CORPUS_TQL:-$(cd "$HERE/../../.." && pwd)/crates/pulsus-traceql/tests/corpus}
-# A fixed base, not one derived from the corpus window: the catalogue lives in
-# its own database, and the command printed in docs/TraceQL/query-catalogue.md
-# has to reproduce the committed answers whenever it is run.
-CATB=${CATALOGUE_BASE_S:-1790000000}
-python3 "$HERE/fixture/make_catalogue_fixture.py" "$WORK/cat" "$CATB" > "$R/catalogue-fixture.json"
-"$HERE/load_staging.sh" "$CH" tqd_cat cat
-python3 "$HERE/apply_schema.py" "$CH" tqd_cat
-# The perturbation suite runs FIRST, because it writes
-# results/perturbations.tsv and the catalogue document quotes it: the other
-# order would describe the previous run's rules (review round 5). It is one of
-# seven files under results/ that a later step of the same run reads;
-# measure/README.md lists all seven with the line that writes each and the line
-# that reads it.
+# The shipped route against the interpreter (#600): `catalogue.sh` builds the
+# shipped schema in its own database, lands the fixture through `pulsusdb`, runs
+# `xtask traceql-catalogue` and `catalogue.py`, and exits non-zero unless every
+# answer agrees. PULSUS_BIN holds `pulsusdb` and `xtask`, built from this tree.
+CHHP=${CH#*://}
+sh "$HERE/catalogue.sh" "${CHHP%%:*}" "${CHHP##*:}" tqd_cat "$WORK/catalogue" \
+        "${PULSUS_BIN:-$(cd "$HERE/../../.." && pwd)/target/debug}" | tee "$R/catalogue-summary.txt"
+# One rule changed at a time over that run: the comparison must notice each one.
+CATS=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['window_start_s'])" "$WORK/catalogue/fixture.json")
 echo "== one rule changed at a time: the run must notice each one"
-python3 "$HERE/perturb_check.py" "$CH" tqd_cat "$CORPUS_TQL" "$WORK/cat/spans.jsonl" \
-        "$WORK/perturb" "${CATB}000000000" "$((CATB + 60))000000000" | tail -3
-
-python3 "$HERE/catalogue.py" "$CH" tqd_cat "$CORPUS_TQL" "$WORK/cat/spans.jsonl" "$HERE" \
-        "${CATB}000000000" "$((CATB + 60))000000000" | tee "$R/catalogue-summary.txt"
+python3 "$HERE/perturb_check.py" "$WORK/catalogue/catalogue-run.jsonl" "$WORK/catalogue/cat/spans.jsonl" \
+        "${CATS}000000000" "$((CATS + 120))000000000" "$WORK/perturb" | tail -1
 
 # Every number and set the documents state, against the thing it counts.
 # It runs after the catalogue because one of its rules reads that run's result.
