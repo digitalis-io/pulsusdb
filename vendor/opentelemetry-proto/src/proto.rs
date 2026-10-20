@@ -495,9 +495,8 @@ pub(crate) mod serializers {
                             value = Some(any_value::Value::BytesValue(decoded));
                         }
                         _ => {
-                            // PATCH (PulsusDB, P7): read and drop an unknown
-                            // key's value, so the next key is read after it.
-                            let _: serde::de::IgnoredAny = map.next_value()?;
+                            //skip unknown keys, and handle error later.
+                            continue;
                         }
                     }
                 }

@@ -213,9 +213,8 @@ proto3-JSON omits a field at its default: an empty array is `{"arrayValue":{}}`,
 empty request is `{}`, and an `AnyValue` with no value is `{}`. The derives required each of them.
 `ArrayValue.values`, `KeyValueList.values` and `KeyValue.key` gain `#[cfg_attr(feature = "with-serde",
 serde(default))]`; so do the structs `EntityRef`, `ExportTraceServiceRequest`, `ExportLogsServiceRequest`,
-`ExportMetricsServiceRequest`, `TracesData`, `LogsData` and `MetricsData`. The P2 `AnyValue` visitor reads and
-drops an unknown key's value — it used to leave it unread, so the next key failed — and answers no recognised key
-with no value rather than an error. Serialization is unchanged; serde's derive still refuses a field given twice.
+`ExportMetricsServiceRequest`, `TracesData`, `LogsData` and `MetricsData`. The P2 `AnyValue` visitor answers no
+recognised key with no value rather than an error. Serialization is unchanged; serde's derive still refuses a field given twice.
 The ingest decoder is the bounded one in `crates/pulsus-write/src/protocols/otlp_json.rs`; it finishes `KeyValue`
 and `EntityRef` through these derives and drops its own two `values` refusals and its no-key refusal in the same
 change. Gated by `the_generated_decoder_reads_an_omitted_field_as_its_default` (these derives directly) and
