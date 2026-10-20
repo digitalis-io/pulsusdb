@@ -41,7 +41,7 @@ const fn keys_only(name: &'static str, q: &'static str) -> ProjectionCase {
 /// The registry — one entry per numbered row of the issue's query table.
 /// The length is asserted at compile time so the count cannot drift from
 /// the table it describes.
-pub const CASES: [ProjectionCase; 40] = [
+pub const CASES: [ProjectionCase; 42] = [
     c("01_name_eq", r#"{ name = "GET /pay" }"#),
     c("02_duration_gt", "{ duration > 1s }"),
     c("03_match_all", "{}"),
@@ -130,6 +130,9 @@ pub const CASES: [ProjectionCase; 40] = [
         r#"{ name = "slow-op" } | select(event.exception.type)"#,
     ),
     c("40_event_name_regex", r#"{ event:name =~ ".*" }"#),
+    // 41-42 (issue #601 part 1): a projected duration, and an array.
+    c("41_event_time_since_start", "{ event:timeSinceStart > 150ms }"),
+    c("42_select_array", r#"{ name = "charge" } | select(span.tags)"#),
 ];
 
-const _: () = assert!(CASES.len() == 40);
+const _: () = assert!(CASES.len() == 42);

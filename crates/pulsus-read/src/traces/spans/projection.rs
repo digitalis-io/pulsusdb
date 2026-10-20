@@ -424,6 +424,27 @@ impl Projection {
     }
 }
 
+/// A projected value from the statement's text and stored kind (issue #601).
+/// Stub: the tests are written first.
+#[allow(dead_code)]
+fn typed_value(_kind: &str, text: &str) -> Result<GroupValue, String> {
+    Ok(GroupValue::Str(text.to_string()))
+}
+
+/// One projected value, decoded and charged. Stub: the tests are written
+/// first.
+#[allow(dead_code)]
+pub(crate) fn decode_one(
+    kind: &str,
+    text: &str,
+    key_len: usize,
+    budget: &mut ByteBudget,
+) -> Result<GroupValue, ReadError> {
+    let value = typed_value(kind, text).map_err(|m| ReadError::Clickhouse(ChError::Decode(m)))?;
+    budget.charge(key_len + value.payload_bytes())?;
+    Ok(value)
+}
+
 /// The length of `ceiling(serde_json::to_string(values))`, learned
 /// without building it (issue #591 part 3): the render is serialized into
 /// a counter of its bytes, and of the bytes of its first
@@ -1268,5 +1289,110 @@ mod rendered_len_tests {
                 &full[..full.len().min(80)]
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod typed_value_tests {
+    use super::*;
+    use crate::logql::error::TooBroadReason;
+
+    /// T2 (issue #601 part 1): a projected duration takes Go's duration
+    /// text, an array its elements in their own arms, a `None` element is
+    /// left out, a long string element is cut, and an element of any other
+    /// type is an error.
+    #[test]
+    fn a_projected_duration_and_array_take_their_own_arms() {
+        assert_eq!(
+            typed_value("Duration", "20000000"),
+            Ok(GroupValue::Str("20ms".to_string()))
+        );
+        assert_eq!(
+            typed_value("Duration", "-1500000000"),
+            Ok(GroupValue::Str("-1.5s".to_string()))
+        );
+        assert_eq!(
+            typed_value(
+                "Array(Nullable(String))",
+                r#"[["String","x"],["None",""],["String","y"]]"#
+            ),
+            Ok(GroupValue::Array(vec![
+                GroupValue::Str("x".to_string()),
+                GroupValue::Str("y".to_string()),
+            ]))
+        );
+        let one = typed_value(
+            "Array(Nullable(String))",
+            r#"[["None",""],["String","x"],["None",""]]"#,
+        )
+        .expect("decodes");
+        assert_eq!(
+            one,
+            GroupValue::Array(vec![GroupValue::Str("x".to_string())])
+        );
+        let GroupValue::Array(v) = &one else {
+            unreachable!("asserted above")
+        };
+        assert_eq!(
+            one.payload_bytes(),
+            v.capacity() * std::mem::size_of::<GroupValue>() + 1
+        );
+        assert_eq!(
+            typed_value(
+                "Array(Nullable(Float64))",
+                r#"[["Float64","nan"],["Float64","1.5"]]"#
+            ),
+            Ok(GroupValue::Array(vec![
+                GroupValue::Double(f64::NAN.to_bits()),
+                GroupValue::Double(1.5f64.to_bits()),
+            ]))
+        );
+        let long = "é".repeat(5_000);
+        assert_eq!(long.len(), 10_000);
+        assert_eq!(
+            typed_value(
+                "Array(Nullable(String))",
+                &format!(r#"[["String","{long}"]]"#)
+            ),
+            Ok(GroupValue::Array(vec![GroupValue::Str("é".repeat(2_048))]))
+        );
+        assert!(
+            typed_value("Array(Nullable(String))", r#"[["Map",""]]"#).is_err(),
+            "an element stored as Map is not decoded"
+        );
+    }
+
+    /// T2b (issue #601 part 1): ten thousand skipped `None` elements cost
+    /// nothing — the charge is the key, the kept vector's capacity and the
+    /// one kept string — and one byte under that charge is refused.
+    #[test]
+    fn skipped_array_elements_cost_nothing_at_the_budget_edge() {
+        let mut pairs = vec![r#"["None",""]"#; 10_000];
+        pairs.push(r#"["String","x"]"#);
+        let text = format!("[{}]", pairs.join(","));
+        let kind = "Array(Nullable(String))";
+        let first = decode_one(kind, &text, 3, &mut ByteBudget::new(usize::MAX))
+            .expect("decodes unbounded");
+        assert!(
+            matches!(&first, GroupValue::Array(_)),
+            "an array decodes to an array: {}",
+            format!("{first:?}").chars().take(80).collect::<String>()
+        );
+        let GroupValue::Array(v) = &first else {
+            unreachable!("asserted above")
+        };
+        let want = 3 + v.capacity() * std::mem::size_of::<GroupValue>() + 1;
+        assert_eq!(
+            decode_one(kind, &text, 3, &mut ByteBudget::new(want)).ok(),
+            Some(GroupValue::Array(vec![GroupValue::Str("x".to_string())]))
+        );
+        let refused = decode_one(kind, &text, 3, &mut ByteBudget::new(want - 1));
+        assert!(
+            matches!(
+                refused,
+                Err(ReadError::QueryTooBroad(TooBroadReason::ScanBudgetBytes { .. }))
+            ),
+            "one byte under the charge is refused: {refused:?}"
+        );
     }
 }

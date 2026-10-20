@@ -2343,6 +2343,28 @@ mod tests {
         );
     }
 
+    /// T3 (issue #601 part 1): an array renders protojson's `arrayValue`,
+    /// each element in its own arm, and an empty one as `{"arrayValue":{}}`.
+    #[test]
+    fn an_array_value_renders_protojson_array_value() {
+        assert_eq!(
+            group_value_json(&GroupValue::Array(vec![
+                GroupValue::Str("x".to_string()),
+                GroupValue::Int(2),
+                GroupValue::Double(f64::NAN.to_bits()),
+            ])),
+            serde_json::json!({"arrayValue": {"values": [
+                {"stringValue": "x"},
+                {"intValue": "2"},
+                {"doubleValue": "NaN"},
+            ]}})
+        );
+        assert_eq!(
+            group_value_json(&GroupValue::Array(vec![])),
+            serde_json::json!({"arrayValue": {}})
+        );
+    }
+
     /// Issue #510: a non-finite double renders inside the `doubleValue`
     /// arm as one of the reference's three literal STRINGS.
     ///

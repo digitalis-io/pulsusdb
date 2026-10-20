@@ -209,6 +209,7 @@ pub fn wire_arm(value: &GroupValue) -> (&'static str, String) {
         }
         GroupValue::Bool(b) => ("boolValue", b.to_string()),
         GroupValue::Nil => ("stringValue", "nil".to_string()),
+        GroupValue::Array(_) => ("stringValue", String::new()),
     }
 }
 
@@ -277,6 +278,9 @@ pub enum GroupValue {
     Bool(bool),
     /// The span carried no value for this key (grouped into the nil bucket).
     Nil,
+    /// An array (issue #601): its elements in stored order, each `Str`,
+    /// `Int`, `Double` or `Bool` — never `Nil`, never `Array`.
+    Array(Vec<GroupValue>),
 }
 
 impl GroupValue {
@@ -533,6 +537,38 @@ pub fn go_duration_string(nanos: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T1 (issue #601 part 1): an array takes the `arrayValue` arm, its
+    /// token the compact JSON of each element's own `[arm, text]` pair, and
+    /// its payload is its buffer's capacity plus its elements' payloads.
+    #[test]
+    fn an_array_takes_the_array_arm_with_each_element_in_its_own() {
+        let four = GroupValue::Array(vec![
+            GroupValue::Str("x".to_string()),
+            GroupValue::Int(1),
+            GroupValue::Double(1.5f64.to_bits()),
+            GroupValue::Bool(true),
+        ]);
+        assert_eq!(
+            wire_arm(&four),
+            (
+                "arrayValue",
+                r#"[["stringValue","x"],["intValue","1"],["doubleValue","1.5"],["boolValue","true"]]"#
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            wire_arm(&GroupValue::Array(vec![])),
+            ("arrayValue", "[]".to_string())
+        );
+        let mut v = Vec::with_capacity(4);
+        v.push(GroupValue::Str("ab".to_string()));
+        assert_eq!(v.capacity(), 4);
+        assert_eq!(
+            GroupValue::Array(v).payload_bytes(),
+            4 * std::mem::size_of::<GroupValue>() + 2
+        );
+    }
 
     /// Moved here with `go_duration_string` from the deleted
     /// `search_eval.rs` (#602 part 2c-2b-2): the Go runtime's

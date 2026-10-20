@@ -85,6 +85,8 @@ const ALLOWLIST: &[(&str, &str, &str, usize, &str)] = &[
      "the fractional-digit scratch buffer (<= 9 ASCII bytes) for a by(duration) group value's Go-duration render - a bounded scalar render whose result .len() is charged by charged_str at the group-value site before retention (the same residual class as build_summary's duration/status/kind scalar renders)"),
     ("values.rs", "go_duration_string", "format!", 5,
      "bounded duration-string assembly (<= ~32 bytes, e.g. '2540400h10m10.000000000s') for a by(duration)/by(traceDuration) group value; charged_str charges its .len() before it is cloned into the retained tuple/attributes - a scalar-render residual"),
+    ("values.rs", "wire_arm", ".collect", 1,
+     "an array's comparison token: built only by the live differentials, the catalogue xtask and tests; the search encoder matches an array before it calls wire_arm (fence C), so no response path builds it"),
 ];
 
 fn source(file: &str) -> String {

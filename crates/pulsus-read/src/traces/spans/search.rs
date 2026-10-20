@@ -1804,3 +1804,33 @@ mod charge_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod by_array_tests {
+    use super::*;
+
+    /// T4 (issue #601 part 1): a `by()` key holding an array is an array
+    /// of its elements, its payload learned before it is built is the
+    /// built value's, and a long string element is not cut.
+    #[test]
+    fn a_by_array_key_is_an_array_value() {
+        let text = r#"[["String","x"],["String","y"]]"#;
+        let kind = "Array(Nullable(String))";
+        assert_eq!(
+            group_value(text, kind),
+            Ok(GroupValue::Array(vec![
+                GroupValue::Str("x".to_string()),
+                GroupValue::Str("y".to_string()),
+            ]))
+        );
+        assert_eq!(
+            group_value_payload(text, kind),
+            Ok(2 * std::mem::size_of::<GroupValue>() + 2)
+        );
+        let long = "n".repeat(9_000);
+        assert_eq!(
+            group_value(&format!(r#"[["String","{long}"]]"#), kind),
+            Ok(GroupValue::Array(vec![GroupValue::Str(long)]))
+        );
+    }
+}

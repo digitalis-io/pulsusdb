@@ -527,3 +527,218 @@ fn valid_number_and_metric_data_still_decode() {
         other => panic!("expected Gauge, got {other:?}"),
     }
 }
+
+// ---- Issue #601 part 1: a field omitted at its proto3 default ---------------
+
+use opentelemetry_proto::tonic::common::v1::{ArrayValue, EntityRef, KeyValue, KeyValueList};
+use opentelemetry_proto::tonic::resource::v1::Resource;
+
+/// One body per signal carrying `attr` as the one attribute of its one
+/// record and `resource` as its one resource, and the decoded record's
+/// attributes and resource.
+type Decoded = (Vec<KeyValue>, Option<Resource>);
+
+fn decode_on(signal: &str, attr: &str, resource: &str) -> Result<Decoded, String> {
+    let attrs = if attr.is_empty() {
+        String::new()
+    } else {
+        format!(r#""attributes":[{attr}]"#)
+    };
+    match signal {
+        "traces" => {
+            let body = format!(
+                r#"{{"resourceSpans":[{{"resource":{resource},"scopeSpans":[{{"spans":[{{{attrs}}}]}}]}}]}}"#
+            );
+            pulsus_write::protocols::otlp_traces::decode_json(body.as_bytes())
+                .map(|r| {
+                    let rs = &r.resource_spans[0];
+                    (
+                        rs.scope_spans[0].spans[0].attributes.clone(),
+                        rs.resource.clone(),
+                    )
+                })
+                .map_err(|e| format!("{e:?}"))
+        }
+        "logs" => {
+            let body = format!(
+                r#"{{"resourceLogs":[{{"resource":{resource},"scopeLogs":[{{"logRecords":[{{{attrs}}}]}}]}}]}}"#
+            );
+            pulsus_write::protocols::otlp_logs::decode_json(body.as_bytes())
+                .map(|r| {
+                    let rl = &r.resource_logs[0];
+                    (
+                        rl.scope_logs[0].log_records[0].attributes.clone(),
+                        rl.resource.clone(),
+                    )
+                })
+                .map_err(|e| format!("{e:?}"))
+        }
+        "metrics" => {
+            let sep = if attrs.is_empty() { "" } else { "," };
+            let body = format!(
+                r#"{{"resourceMetrics":[{{"resource":{resource},"scopeMetrics":[{{"metrics":[{{"name":"g","gauge":{{"dataPoints":[{{"asDouble":1{sep}{attrs}}}]}}}}]}}]}}]}}"#
+            );
+            pulsus_write::protocols::otlp_metrics::decode_json(body.as_bytes())
+                .map(|r| {
+                    let rm = &r.resource_metrics[0];
+                    let attrs = match &rm.scope_metrics[0].metrics[0].data {
+                        Some(metric::Data::Gauge(g)) => g.data_points[0].attributes.clone(),
+                        other => panic!("a gauge: {other:?}"),
+                    };
+                    (attrs, rm.resource.clone())
+                })
+                .map_err(|e| format!("{e:?}"))
+        }
+        other => unreachable!("{other}"),
+    }
+}
+
+fn any(value: Option<any_value::Value>) -> Option<AnyValue> {
+    Some(AnyValue { value })
+}
+
+/// T8: the seven forms proto3-JSON writes for a field at its default each
+/// decode, on traces, logs and metrics, to the default; `{}` is a request
+/// with no resources; a field given twice is still refused, naming it.
+#[test]
+fn an_omitted_default_field_decodes_on_every_signal() {
+    let kv = |key: &str, value: Option<AnyValue>| KeyValue {
+        key: key.to_string(),
+        value,
+        key_strindex: 0,
+    };
+    let attr_forms: [(&str, KeyValue); 5] = [
+        (
+            r#"{"key":"k","value":{"arrayValue":{}}}"#,
+            kv(
+                "k",
+                any(Some(any_value::Value::ArrayValue(ArrayValue { values: vec![] }))),
+            ),
+        ),
+        (
+            r#"{"key":"k","value":{"kvlistValue":{}}}"#,
+            kv(
+                "k",
+                any(Some(any_value::Value::KvlistValue(KeyValueList {
+                    values: vec![],
+                }))),
+            ),
+        ),
+        (r#"{"key":"k","value":{}}"#, kv("k", any(None))),
+        (r#"{"key":"k","value":{"fooValue":1}}"#, kv("k", any(None))),
+        (
+            r#"{"value":{"stringValue":"v"}}"#,
+            kv("", any(Some(any_value::Value::StringValue("v".to_string())))),
+        ),
+    ];
+    let entity = |schema_url: &str, ty: &str, id: &str| EntityRef {
+        schema_url: schema_url.to_string(),
+        r#type: ty.to_string(),
+        id_keys: vec![id.to_string()],
+        description_keys: vec![],
+    };
+    let ref_forms: [(&str, EntityRef); 2] = [
+        (
+            r#"{"entityRefs":[{"type":"service","idKeys":["service.name"]}]}"#,
+            entity("", "service", "service.name"),
+        ),
+        (
+            r#"{"entityRefs":[{"schemaUrl":"u","idKeys":["a"]}]}"#,
+            entity("u", "", "a"),
+        ),
+    ];
+    let mut wrong: Vec<String> = Vec::new();
+    for signal in ["traces", "logs", "metrics"] {
+        for (attr, want) in &attr_forms {
+            match decode_on(signal, attr, "{}") {
+                Ok((attrs, _)) if attrs == vec![want.clone()] => {}
+                other => wrong.push(format!("{signal} {attr}: {other:?}")),
+            }
+        }
+        for (resource, want) in &ref_forms {
+            match decode_on(signal, "", resource) {
+                Ok((_, Some(r))) if r.entity_refs == vec![want.clone()] => {}
+                other => wrong.push(format!("{signal} {resource}: {other:?}")),
+            }
+        }
+    }
+    let empty = [
+        pulsus_write::protocols::otlp_traces::decode_json(b"{}")
+            .map(|r| r.resource_spans.len())
+            .map_err(|e| format!("{e:?}")),
+        pulsus_write::protocols::otlp_logs::decode_json(b"{}")
+            .map(|r| r.resource_logs.len())
+            .map_err(|e| format!("{e:?}")),
+        pulsus_write::protocols::otlp_metrics::decode_json(b"{}")
+            .map(|r| r.resource_metrics.len())
+            .map_err(|e| format!("{e:?}")),
+    ];
+    for (signal, got) in ["traces", "logs", "metrics"].iter().zip(empty) {
+        if got != Ok(0) {
+            wrong.push(format!("{signal} {{}}: {got:?}"));
+        }
+    }
+    for signal in ["traces", "logs", "metrics"] {
+        for (attr, field) in [
+            (
+                r#"{"key":"k","value":{"arrayValue":{"values":[],"values":[]}}}"#,
+                "`values`",
+            ),
+            (r#"{"key":"a","key":"b"}"#, "`key`"),
+            (
+                r#"{"key":"k","value":{"stringValue":"a"},"value":{"stringValue":"b"}}"#,
+                "`value`",
+            ),
+        ] {
+            match decode_on(signal, attr, "{}") {
+                Err(e) if e.contains(field) => {}
+                other => wrong.push(format!("{signal} {attr}: {other:?}, want an error naming {field}")),
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// T8c: the generated decoder itself, not the bounded one, reads each
+/// omitted field as its default — the derives directly.
+#[test]
+fn the_generated_decoder_reads_an_omitted_field_as_its_default() {
+    use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+    use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+    use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+    use opentelemetry_proto::tonic::logs::v1::LogsData;
+    use opentelemetry_proto::tonic::metrics::v1::MetricsData;
+    use opentelemetry_proto::tonic::trace::v1::TracesData;
+    fn check<T: serde::de::DeserializeOwned + std::fmt::Debug>(
+        wrong: &mut Vec<String>,
+        json: &str,
+        ok: impl Fn(&T) -> bool,
+    ) {
+        match serde_json::from_str::<T>(json) {
+            Ok(v) if ok(&v) => {}
+            other => wrong.push(format!(
+                "{} {json}: {other:?}",
+                std::any::type_name::<T>()
+            )),
+        }
+    }
+    let mut w: Vec<String> = Vec::new();
+    check::<ArrayValue>(&mut w, "{}", |v| v.values.is_empty());
+    check::<KeyValueList>(&mut w, "{}", |v| v.values.is_empty());
+    check::<AnyValue>(&mut w, "{}", |v| v.value.is_none());
+    check::<AnyValue>(&mut w, r#"{"fooValue":1}"#, |v| v.value.is_none());
+    check::<AnyValue>(&mut w, r#"{"fooValue":1,"stringValue":"s"}"#, |v| {
+        v.value == Some(any_value::Value::StringValue("s".to_string()))
+    });
+    check::<KeyValue>(&mut w, r#"{"value":{"stringValue":"v"}}"#, |v| v.key.is_empty());
+    check::<EntityRef>(&mut w, r#"{"idKeys":["a"]}"#, |v| {
+        v.schema_url.is_empty() && v.r#type.is_empty()
+    });
+    check::<ExportTraceServiceRequest>(&mut w, "{}", |v| v.resource_spans.is_empty());
+    check::<ExportLogsServiceRequest>(&mut w, "{}", |v| v.resource_logs.is_empty());
+    check::<ExportMetricsServiceRequest>(&mut w, "{}", |v| v.resource_metrics.is_empty());
+    check::<TracesData>(&mut w, "{}", |v| v.resource_spans.is_empty());
+    check::<LogsData>(&mut w, "{}", |v| v.resource_logs.is_empty());
+    check::<MetricsData>(&mut w, "{}", |v| v.resource_metrics.is_empty());
+    assert!(w.is_empty(), "{} of 13 refused:\n{}", w.len(), w.join("\n"));
+}
