@@ -54,8 +54,8 @@ docs/query-lowering.md	crates/pulsus-read/src/logql/post_agg.rs:3307-3350	crates
 docs/query-lowering.md	crates/pulsus-read/src/logql/sql.rs:1132	crates/pulsus-read/src/logql/sql.rs	1132		prose	stage3_keyset	stage3_keyset
 docs/query-lowering.md	crates/pulsus-read/src/logql/sql.rs:709	crates/pulsus-read/src/logql/sql.rs	709		line	stage1	pub fn stage1(
 docs/query-lowering.md	crates/pulsus-read/src/logql/sql.rs:748	crates/pulsus-read/src/logql/sql.rs	748		line	probe	pub fn probe(
-docs/query-lowering.md	crates/pulsus-read/src/metrics/labels.rs:280	crates/pulsus-read/src/metrics/labels.rs	280		line	is_match	let is_match = re.is_match(name);
-docs/query-lowering.md	crates/pulsus-read/src/metrics/labels.rs:627	crates/pulsus-read/src/metrics/labels.rs	627		line	to_string	pattern.to_string(),
+docs/query-lowering.md	crates/pulsus-read/src/metrics/labels.rs:278	crates/pulsus-read/src/metrics/labels.rs	278		line	compile_user_regex_anchored	let re = pulsus_re2::compile_user_regex_anchored(&re2_pattern_to_rust(&m.value))
+docs/query-lowering.md	crates/pulsus-read/src/metrics/labels.rs:625	crates/pulsus-read/src/metrics/labels.rs	625		line	compile_user_regex_anchored	Arc::new(pulsus_re2::compile_user_regex_anchored(&re2_pattern_to_rust(pattern)).ok()?);
 docs/query-lowering.md	crates/pulsus-read/src/metrics/re2_authority.rs:89	crates/pulsus-read/src/metrics/re2_authority.rs	89		line	re2_pattern_to_rust	let rewritten = re2_pattern_to_rust(&m.value);
 docs/query-lowering.md	crates/pulsus-read/src/querytext.rs:52	crates/pulsus-read/src/querytext.rs	52		prose	MAX_QUERY_TEXT_BYTES	MAX_QUERY_TEXT_BYTES
 docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:113	crates/pulsus-read/src/traces/exec.rs	113		line	TRACE_SEARCH_MAX_BLOCK_ROWS	pub const TRACE_SEARCH_MAX_BLOCK_ROWS: u64 = 4096;
@@ -81,7 +81,7 @@ docs/query-lowering.md	crates/pulsus-server/src/traces_api/error.rs:366	crates/p
 docs/query-lowering.md	crates/pulsus-server/src/traces_api/search_response.rs:428-430	crates/pulsus-server/src/traces_api/search_response.rs	428	430	line	matched	let mut set = json!({ "matched": group.matched, "spans": spans,
 docs/query-lowering.md	crates/pulsus-server/src/traces_api/search_response.rs:507-512	crates/pulsus-server/src/traces_api/search_response.rs	507	512	line	span_json	"matched": trace.matched, "spans": trace .spans .iter() .map(|span| span_json(span, report)) .collect::<Vec<_>>(),
 docs/query-lowering.md	crates/pulsus-write/src/protocols/otlp_traces.rs:760	crates/pulsus-write/src/protocols/otlp_traces.rs	760		prose	numeric_val_num	numeric_val_num
-docs/query-lowering.md	exec.rs:2209-2215	crates/pulsus-read/src/traces/exec.rs	2209	2215	prose	TRACE_SEARCH_MAX_BLOCK_ROWS	read_overflow_mode
+docs/query-lowering.md	exec.rs:2208-2210	crates/pulsus-read/src/traces/exec.rs	2208	2210	prose	TRACE_READ_BYTES_BUDGET	read_overflow_mode
 docs/query-lowering.md	filter.rs:102	crates/pulsus-read/src/traces/filter.rs	102		prose	TimeRange	TimeRange
 docs/query-lowering.md	filter.rs:2690	crates/pulsus-read/src/traces/filter.rs	2690		prose	spans_generator_for	spans_generator_for
 docs/query-lowering.md	filter.rs:524	crates/pulsus-read/src/traces/filter.rs	524		prose	BoolTruth	BoolTruth
@@ -281,7 +281,7 @@ docs/query-to-sql.md	traces/exec.rs:104	crates/pulsus-read/src/traces/exec.rs	10
 docs/query-to-sql.md	traces/exec.rs:1408	crates/pulsus-read/src/traces/exec.rs	1408		line	MetricQuantileExemplarRow	.query_stream::<MetricQuantileExemplarRow, _>(sql, &settings, |e| {
 docs/query-to-sql.md	traces/exec.rs:157	crates/pulsus-read/src/traces/exec.rs	157		line	TRACE_METRICS_MAX_SET_ROWS	pub const TRACE_METRICS_MAX_SET_ROWS: u64 = 1_000_000;
 docs/query-to-sql.md	traces/exec.rs:2170	crates/pulsus-read/src/traces/exec.rs	2170		line	dispatch	.dispatch
-docs/query-to-sql.md	traces/exec.rs:2201	crates/pulsus-read/src/traces/exec.rs	2201		line	search_settings	fn search_settings(config: &TraceReadConfig) -> QuerySettings {
+docs/query-to-sql.md	traces/exec.rs:2211	crates/pulsus-read/src/traces/exec.rs	2211		line	TRACE_MAX_RESULT_BYTES	.set("max_result_bytes", TRACE_MAX_RESULT_BYTES)
 docs/query-to-sql.md	traces/exec.rs:3141	crates/pulsus-read/src/traces/exec.rs	3141		prose	apply_series_reduce	reduce
 docs/query-to-sql.md	traces/exec.rs:92	crates/pulsus-read/src/traces/exec.rs	92		line	HYDRATION_BYTE_BUDGET	pub const HYDRATION_BYTE_BUDGET: usize = 256 * 1024 * 1024;
 docs/query-to-sql.md	traces/metrics_sql.rs:89	crates/pulsus-read/src/traces/metrics_sql.rs	89		line	nanosecond	/// the window and the last nanosecond it contains is `end_ns - 1`.

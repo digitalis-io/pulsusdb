@@ -5274,7 +5274,7 @@ engine will read, and what it will return:
 | TraceQL batch size | 32 traces | `traces/exec.rs:126` @ 1cdb3e5e |
 | spans per trace | 10,000 | `traces/exec.rs:131` @ 1cdb3e5e; a trace over it is reported incomplete |
 | TraceQL span-read bytes | 256 MiB | `traces/exec.rs:92` |
-| ClickHouse result bytes, traces | 64 MiB, refusing rather than truncating | `traces/exec.rs:104`, applied at `:2201` |
+| ClickHouse result bytes, traces | 64 MiB, refusing rather than truncating | `traces/exec.rs:104`, applied at `:2211` |
 | rendered SQL text | 8 MiB; at or past it is `422 query_too_broad` | `pulsus-read/src/querytext.rs:52` |
 | syntax tree, reduced statement after `\| logfmt` | `max_ast_elements` 1,000,000 and `max_expanded_ast_elements` 10,000,000 on that statement only; at the server's default of 50,000 it fails with `TOO_BIG_AST` | `logql/sql.rs` `metric_range_reduced` |
 | handover size | at most one set of values written into the text of the next statement. 32,768 literal ids is `Code: 168. DB::Exception: AST is too big. Maximum: 50000.` | ADR 0008 D3 |

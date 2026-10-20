@@ -1059,7 +1059,7 @@ rather than suspected.
 
 Our other two languages rewrite a user pattern into the Rust `regex` crate's dialect before
 compiling it, so that the crate reads it the way RE2 does — `pulsus_re2::re2_pattern_to_rust`,
-applied at `crates/pulsus-read/src/metrics/labels.rs:280` and `:627`,
+applied at `crates/pulsus-read/src/metrics/labels.rs:278` and `:625`,
 `crates/pulsus-read/src/metrics/re2_authority.rs:89` and `crates/pulsus-read/src/logql/plan.rs:174`.
 **The TraceQL path applies it nowhere.** `git grep -n re2_pattern_to_rust -- crates/pulsus-read/src/traces/ crates/pulsus-traceql/src/`
 returns no line; `search_plan.rs:958` compiles the **raw** pattern with
@@ -2403,7 +2403,7 @@ beside the figures they govern rather than once here, and this list is the index
 | `optimize_aggregation_in_order` | **1**, named on the rows that need it | it is what lets the span-ordered index stream the aggregation instead of holding a hash table over every span-group. On the current index order it buys nothing, because `(trace_id, span_id)` is not a prefix of that sorting key |
 | `max_memory_usage` | **536870912** | the shipped `reader.traceql_generator_max_memory_bytes` (`crates/pulsus-config/src/model.rs:669`), applied by `generator_settings` (`exec.rs:3267` @ 1cdb3e5e) |
 | `max_bytes_before_external_group_by` | **0** | shipped: the generator throws rather than spilling (`exec.rs:3267`) |
-| `max_rows_to_read` | **50000000** shipped, **200000000** in the raised-budget rows | `reader.traceql_scan_budget_rows` (`model.rs:698` @ 1cdb3e5e), carried with `read_overflow_mode = throw` by `search_settings` (`exec.rs:2209-2215`) |
+| `max_rows_to_read` | **50000000** shipped, **200000000** in the raised-budget rows | `reader.traceql_scan_budget_rows` (`model.rs:698` @ 1cdb3e5e), carried with `read_overflow_mode = throw` by `search_settings` (`exec.rs:2208-2210`) |
 | `min_bytes_for_wide_part` | **10485760** | pinned in the corpus recipe so the part format is reproducible; ClickHouse's own 26.3 default happens to be the same value, and neither trace `CREATE TABLE` pins it |
 
 **The rule this section follows: every metered figure carries its instrument beside the number.**
@@ -5575,7 +5575,7 @@ The citations pointing at an empty line are `crates/pulsus-read/src/traces/metri
 
 The citations the rule answers differently for two occurrences of are .
 
-The citations where the fallback answers a file the citing prose does not describe are `exec.rs:2209-2215` in `docs/query-lowering.md`. Each is named with its reasoning in `REVIEWED_FALLBACK_DIVERGENCES`, and the test prints them when it runs.
+The citations where the fallback answers a file the citing prose does not describe are `exec.rs:2208-2210` in `docs/query-lowering.md`. Each is named with its reasoning in `REVIEWED_FALLBACK_DIVERGENCES`, and the test prints them when it runs.
 
 <!-- end generated -->
 

@@ -659,8 +659,6 @@ docs/query-lowering.md	crates/pulsus-read/src/logql/sql.rs:527	no_name_the_targe
 docs/query-lowering.md	crates/pulsus-read/src/logql/sql.rs:671	no_name_the_target_file_holds
 docs/query-lowering.md	crates/pulsus-read/src/logql/sql.rs:709	no_name_the_target_file_holds
 docs/query-lowering.md	crates/pulsus-read/src/logql/sql.rs:748	no_name_the_target_file_holds
-docs/query-lowering.md	crates/pulsus-read/src/metrics/labels.rs:280	no_name_the_target_file_holds
-docs/query-lowering.md	crates/pulsus-read/src/metrics/labels.rs:627	no_name_the_target_file_holds
 docs/query-lowering.md	crates/pulsus-read/src/traces/compile.rs:1396-1404	not_in_this_repository
 docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:126	pinned_to_another_version
 docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:163-173	pinned_to_another_version
@@ -973,7 +971,7 @@ docs/query-to-sql.md	traces/exec.rs:131	pinned_to_another_version
 docs/query-to-sql.md	traces/exec.rs:1408	no_name_the_target_file_holds
 docs/query-to-sql.md	traces/exec.rs:157	no_name_the_target_file_holds
 docs/query-to-sql.md	traces/exec.rs:2170	no_name_the_target_file_holds
-docs/query-to-sql.md	traces/exec.rs:2201	no_name_the_target_file_holds
+docs/query-to-sql.md	traces/exec.rs:2211	no_name_the_target_file_holds
 docs/query-to-sql.md	traces/exec.rs:92	no_name_the_target_file_holds
 docs/query-to-sql.md	traces/metrics_sql.rs:89	no_name_the_target_file_holds
 docs/query-to-sql.md	traces/search_plan.rs:1121	not_in_this_repository
