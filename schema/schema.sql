@@ -969,14 +969,24 @@ TTL toDateTime(least(toUInt32(minute) - if(conn_type = '', 240, 0) + ({{retentio
 SETTINGS index_granularity = 1024, ttl_only_drop_parts = 1{{storage_policy}};
 
 CREATE MATERIALIZED VIEW {{db}}.service_edges_mv{{on_cluster}} REFRESH EVERY 1 MINUTE APPEND TO {{db}}.service_edges
-AS WITH (SELECT arraySort(groupArray(minute)) FROM {{db}}.service_edges FINAL WHERE conn_type = '') AS ms,
+--@single AS WITH (SELECT arraySort(groupArray(minute)) FROM merge('{{db}}', '^service_edges$') FINAL WHERE conn_type = '') AS ms,
+--@cluster AS WITH (SELECT groupArray((replica_path, log_pointer > log_max_index OR (log_pointer = 0 AND log_max_index = 0), zookeeper_path, log_pointer)) FROM system.replicas WHERE database = '{{db}}' AND table IN ('spans', 'service_edges')) AS logs,
+--@cluster (SELECT groupArray((name, numChildren, value)) FROM system.zookeeper WHERE path IN (SELECT arrayJoin(arrayMap(x -> x.1, logs))) AND name IN ('queue', 'is_lost')) AS nodes,
+--@cluster (SELECT groupArray((path, numChildren)) FROM system.zookeeper WHERE path IN (SELECT arrayJoin(arrayMap(x -> x.3, arrayFilter(x -> position(x.1, '.spans/') > 0 AND NOT x.2, logs)))) AND name = 'log') AS loglen,
+--@cluster (SELECT groupArray((toUInt64OrZero(substring(name, 5)), ctime, extract(value, '^format version: \\d+\ncreate_time: [^\n]*\nsource replica: [^\n]*\nblock_id: [^\n]*\n(?:log_entry_id: [^\n]*\n)?([A-Za-z_]+)\n'), extract(value, '\nsource replica: ([^\n]*)\n'))) FROM (SELECT name, ctime, value FROM system.zookeeper WHERE path IN (SELECT arrayJoin(arrayMap(x -> x.3 || '/log', arrayFilter(x -> position(x.1, '.spans/') > 0 AND NOT x.2 AND length(loglen) = 1 AND loglen[1].2 <= 10000, logs)))) LIMIT 10001) SETTINGS max_execution_time = 10) AS logents,
+--@cluster length(logs) = 2 AND arrayAll(x -> x.2 OR (position(x.1, '.spans/') > 0 AND length(loglen) = 1 AND loglen[1].2 <= 10000 AND length(logents) <= 10000), logs) AND arrayCount(n -> n.1 = 'is_lost' AND n.3 = '0', nodes) = 2 AND arrayCount(n -> n.1 = 'queue' AND n.2 <= 1000, nodes) = 2 AS listable,
+--@cluster (SELECT groupArray((position(path, '.service_edges/') > 0, extract(value, '^format version: \\d+\ncreate_time: [^\n]*\nsource replica: [^\n]*\nblock_id: [^\n]*\n(?:log_entry_id: [^\n]*\n)?([A-Za-z_]+)\n'), parseDateTimeBestEffortOrZero(extract(value, '\ncreate_time: ([^\n]*)\n'), serverTimezone()), extract(value, '\n(?:get|attach)\n([^\n]+)'), extract(value, '\nsource replica: ([^\n]*)\n'))) FROM system.zookeeper WHERE path IN (SELECT arrayJoin(arrayMap(x -> x.1 || if(listable, '/queue', '/log_pointer'), logs))) SETTINGS max_execution_time = 10) AS entries,
+--@cluster listable AND arrayCount(e -> e.1, entries) <= 1000 AND arrayCount(e -> NOT e.1, entries) <= 1000 AND arrayAll(e -> NOT e.1 OR e.2 = 'merge', entries) AS edges_ok,
+--@cluster (SELECT arraySort(groupArray(minute)) FROM merge('{{db}}', '^service_edges$') FINAL WHERE conn_type = '' AND edges_ok) AS ms,
      ms[arrayFirstIndex(i -> i = length(ms) OR ms[i + 1] - ms[i] != 300, arrayEnumerate(ms))] AS wm,
      toStartOfInterval(now('UTC') - INTERVAL 3 MINUTE, INTERVAL 5 MINUTE) AS ready,
      (SELECT toDateTime(min(toDate(parseDateTimeBestEffort(partition))), 'UTC') FROM system.parts WHERE database = '{{db}}' AND table = 'spans' AND active) AS oldest,
      if(wm = 0, if(oldest = 0, ready - INTERVAL 5 MINUTE, oldest), wm + INTERVAL 1 MINUTE) AS lo,
 --@single  least(ready, lo + INTERVAL 5 MINUTE) AS hi,
---@cluster (SELECT min(inserts_in_queue = 0 AND (log_pointer > log_max_index OR (log_pointer = 0 AND log_max_index = 0))) FROM system.replicas WHERE database = '{{db}}' AND table IN ('spans', 'service_edges')) AS caught_up,
---@cluster if(caught_up, least(ready, lo + INTERVAL 5 MINUTE), lo) AS hi,
+--@cluster least(ready, lo + INTERVAL 5 MINUTE) AS hi0,
+--@cluster (SELECT groupArray(name) FROM system.parts WHERE database = '{{db}}' AND table = 'spans' AND active AND has(arrayMap(e -> e.4, entries), name)) AS local_named,
+--@cluster edges_ok AND arrayAll(x -> x.2 OR arrayAll(e -> e.1 < x.4 OR e.3 = 'merge' OR (e.3 = 'get' AND e.4 != '' AND e.2 >= hi0 + INTERVAL 3 MINUTE + INTERVAL 10 SECOND), logents), logs) AND arrayAll(e -> e.1 OR e.2 = 'merge' OR (e.2 IN ('get', 'attach') AND e.5 != '' AND e.4 != '' AND toUnixTimestamp(e.3) > 0 AND (has(local_named, e.4) OR (e.2 = 'get' AND e.3 >= hi0 + INTERVAL 3 MINUTE + INTERVAL 10 SECOND))), entries) AS caught_up,
+--@cluster if(caught_up, hi0, lo) AS hi,
      toInt64(toUnixTimestamp(lo)) * 1000000000 AS slo,
      toInt64(toUnixTimestamp(hi)) * 1000000000 AS shi,
      toUInt64(toUnixTimestamp64Milli(now64())) AS v
@@ -990,7 +1000,7 @@ FROM (SELECT trace_id,
         anyIf((service, status_code, kind, start_ns), kind IN (3, 4)) AS c,
         countIf(kind IN (3, 4)) AS nc,
         groupArrayIf((span_id, service, status_code, duration_ns, kind, start_ns), kind IN (2, 5)) AS ss
- FROM {{db}}.spans
+ FROM merge('{{db}}', '^spans$')
  WHERE start_ns >= slo - 60000000000 AND start_ns < shi + 60000000000
    AND intDiv(start_ns, 300000000000) BETWEEN intDiv(slo - 60000000000, 300000000000) AND intDiv(shi + 59999999999, 300000000000)
    AND ((kind IN (2, 5) AND start_ns >= slo AND start_ns < shi) OR kind IN (3, 4))
