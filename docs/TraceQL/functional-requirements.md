@@ -422,11 +422,12 @@ Two things fall out of it, and neither is visible from an agreement count:
   `docs/TraceQL/query-catalogue.md` with the reason, rather than counted as
   passing.
 
-Three of the fixture's six traces exist for the same purpose: a chain
+Four of the fixture's seven traces exist for the same purpose: a chain
 alternating the two sides of a structural operator, a sibling pair under a
 parent of neither side, a descendant three links below its nearest matching
-ancestor, a span whose parent is not stored, a two-span cycle, and a resource
-carrying a key its own span carries with a different value. Adding the first set
+ancestor, a span whose parent is not stored, a two-span cycle, a resource
+carrying a key its own span carries with a different value, and an orphan that
+starts before its trace's root. Adding the first set
 moved three catalogue answers — a pipeline stage after a structural operator
 was dropped and a sibling union re-added its own hit, both defects, and the root
 test missed the orphan and the cycle, which is the reference's rule (#594 part 2).

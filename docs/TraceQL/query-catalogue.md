@@ -1,6 +1,6 @@
 # The TraceQL query catalogue
 
-**Parts of this document describe the previous trace search engine, which issue #602 part 2c-2b deleted — its test binaries, goldens and benches in part 2c-2b-1, its code and the unit tests inside it in part 2c-2b-2; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** **Since #600 `measure/catalogue.py` compares the shipped compiler's search answers — whole and typed, from the route's planner and engine, run by `xtask traceql-catalogue` through `measure/catalogue.sh` — with `measure/catalogue_interp.py`, whose rules and parser were corrected to `docs/api.md`; the run on `1a927f3a` agreed on 119 of 119 corpus searches and 40 of 40 added ones, and on 16 of 16 corpus and 12 of 12 added metrics range answers, on one node and, through each shard's node, on two shards with a replicated shard. `compare()` and instant answers are compared from #600 part 1b-2. The statements, answers and counts below are the design renderer's earlier run.** Every query in the repository's TraceQL corpus, with the SQL it compiles to
+**Parts of this document describe the previous trace search engine, which issue #602 part 2c-2b deleted — its test binaries, goldens and benches in part 2c-2b-1, its code and the unit tests inside it in part 2c-2b-2; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** **Since #600 `measure/catalogue.py` compares the shipped compiler's search answers — whole and typed, from the route's planner and engine, run by `xtask traceql-catalogue` through `measure/catalogue.sh` — with `measure/catalogue_interp.py`, whose rules and parser were corrected to `docs/api.md`; the run on `22a42618` agreed on 119 of 119 corpus searches and 40 of 40 added ones, and on 19 of 19 corpus and 20 of 20 added metrics queries, range and instant, `compare()` included, on one node and, through each shard's node, on two shards with a replicated shard. Arrays are compared from #600 part 1b-3. The statements, answers and counts below are the design renderer's earlier run, and so is the perturbation account below, "The rules no query can tell apart" included: the current record is `measure/results/perturbations.tsv`, which `measure/perturb_check.py` writes over a `measure/catalogue.sh` run, one interpreter or parser rule changed at a time.** Every query in the repository's TraceQL corpus, with the SQL it compiles to
 against the schema of `docs/TraceQL/sql-schema.md` and the literal answer it
 gives, or — where the query is refused — the status and the reason.
 
@@ -85,17 +85,19 @@ answer is the fixture data itself, read by the interpreter. Where the two stores
 `docs/TraceQL/functional-requirements.md` §6.1 and §6.2.
 
 The fixture is `docs/TraceQL/measure/fixture/make_catalogue_fixture.py`:
-34 spans in 6 traces carrying every key, scope, intrinsic and value
+38 spans in 7 traces carrying every key, scope, intrinsic and value
 type the corpus mentions, so an answer is a list of spans rather than a uniform
 empty set. Answers name spans by the last four hex digits of their id.
 
-Three of its six traces exist so that a wrong rule and a right one differ: a
+Four of its seven traces exist so that a wrong rule and a right one differ: a
 chain that alternates the two sides of an operator (`P -> A2 -> B1 -> A1`)
 beside a sibling pair under a parent of neither side; a descendant three links
 below its nearest matching ancestor, so a direct-child rule and a bounded climb
 answer `>>` differently; a span whose parent is not stored; a two-span cycle;
-and one resource carrying a key its own span also carries with a different
-value, so the unscoped lookup **order** decides the answer.
+one resource carrying a key its own span also carries with a different
+value, so the unscoped lookup **order** decides the answer; and an orphan that
+starts before its trace's root with another service, so a root rule that
+admitted the orphan would answer the wrong root.
 
 Reproduce with:
 

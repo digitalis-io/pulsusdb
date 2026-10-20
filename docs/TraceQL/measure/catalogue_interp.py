@@ -2,9 +2,9 @@
 """The independent side of the catalogue's check: the fixture rows, and an
 interpreter that walks a parsed TraceQL query over them.
 
-It shares `catalogue_parse` with `catalogue_render.py` and nothing else. Every
-rule that decides an answer is written here again, from the sources named
-beside it, so that a mistake on one side shows up as a disagreement:
+The other side is the shipped route, whose answers `catalogue.sh` records.
+Every rule that decides an answer is written here from the sources named
+beside it, so that a mistake on either side shows up as a disagreement:
 
 - the status and kind codes, from OTLP's own `trace.proto`;
 - the order an unscoped `.k` tries the scopes in, from `docs/api.md` §4.2;
@@ -13,15 +13,13 @@ beside it, so that a mistake on one side shows up as a disagreement:
   `docs/TraceQL/sql-schema.md` §5.2 — and what a metric, a grouping stage and
   `compare()` return.
 
-`measure/perturb_check.py` changes one rule at a time, on one side at a time,
-and requires the comparison to go red each time. A change made HERE must go red
-just as a change made in the renderer does; that is what says the two sides are
-not the same reasoning written twice.
+`measure/perturb_check.py` changes one rule here at a time and requires the
+comparison to go red each time.
 """
 import decimal, json, math, re
 
-# This side's own tables. Same sources as the renderer's, read again rather
-# than imported: an import is what made a shared-encoding defect invisible
+# This side's own tables, read from their sources rather than imported from
+# the product: an import is what made a shared-encoding defect invisible
 # (review round 4, finding 4).
 STATUS_CODE = {'unset': 0, 'ok': 1, 'error': 2}
 KIND_CODE = {'unspecified': 0, 'internal': 1, 'server': 2, 'client': 3,
@@ -48,16 +46,6 @@ VALUE_TYPE = {'s': 'string', 'i': 'int', 'd': 'double', 'b': 'bool', 'as': 'arra
 def duration_ns(e):
     """a parsed duration literal in nanoseconds"""
     return int(round(float(e['v']) * DURATION_NS[e['unit']]))
-
-
-def value_text(t, v):
-    """The text a stored value renders as — the JSON token ClickHouse writes
-    back for it, which is what `compare()` counts and what a group label
-    carries. A whole double is its digits with no fractional part (`1.0` is
-    written back as `1`), a boolean is `true`/`false`, and a string is itself."""
-    if t == 'b': return 'true' if v else 'false'
-    if t == 'd': return f'{v:g}'
-    return str(v)
 
 
 # ------------------------------------------------------------- interpreter --
@@ -311,7 +299,7 @@ class Interp:
     def answer(self, q):
         sp, pipe = q['spanset'], q['pipeline']
         cmpst = next((s for s in pipe if s['k'] == 'compare'), None)
-        if cmpst: return self.compare_answer(q, cmpst)
+        if cmpst: raise NotImplementedError('compare(): compare_answer (#600 part 1b-2)')
         metric = next((s for s in pipe if s['k'] == 'metric'), None)
         if metric: raise NotImplementedError('metrics: range_answer (#600 part 1b-1)')
         return sorted(r['span_id'] for r in self.matched_rows(q))
@@ -395,90 +383,13 @@ class Interp:
             hit = [r for r in self.fx.rows if r['span_id'] in ids]
         return hit
 
-    # --- compare() ----------------------------------------------------------
-    #
-    # Written from `server-implementation.md` §3.2 and `sql-schema.md` §5.6, not
-    # from the statement: every attribute of all five scopes, plus eleven
-    # intrinsics (`span:id` is deliberately not one of them), counted per SPAN,
-    # with `topN` applied per key and per side. A shared reduction on both sides
-    # is what review round 5 found here.
-    def compare_keys(self, r):
-        """every (scope, key, value, type) this span contributes"""
-        out = []
-        for k, t, v in r['attrs']:
-            out.append(('span', k, value_text(t, v), VALUE_TYPE[t]))
-        for k, t, v in r.get('scope_attrs', []):
-            out.append(('instrumentation', k, value_text(t, v), VALUE_TYPE[t]))
-        for k, t, v in r['resource']:
-            # the service name is the span row's own column and is not repeated
-            # inside the stored resource JSON, so it is counted once, below
-            if k == 'service.name': continue
-            out.append(('resource', k, value_text(t, v), VALUE_TYPE[t]))
-        out.append(('resource', 'service.name', r['service'], 'string'))
-        for _, _, at in r['events']:
-            for k, t, v in at:
-                out.append(('event', k, value_text(t, v), VALUE_TYPE[t]))
-        for _, _, at in r['links']:
-            for k, t, v in at:
-                out.append(('link', k, value_text(t, v), VALUE_TYPE[t]))
-        tr = self.fx.traces[r['trace_id']]
-        for k, v in (('name', r['name']),
-                     ('kind', KIND_KEYWORDS[r['kind']]),
-                     ('status', STATUS_KEYWORDS[r['status_code']]),
-                     ('statusMessage', r['status_message']),
-                     ('instrumentation:name', r['scope_name']),
-                     ('instrumentation:version', r['scope_version']),
-                     ('trace:rootService', tr['root_service']),
-                     ('trace:rootName', tr['root_name'])):
-            out.append(('intrinsic', k, str(v), 'string'))
-        for _, name, _ in r['events']:
-            out.append(('event', 'name', str(name), 'string'))
-        for tid, sid, _ in r['links']:
-            out.append(('link', 'traceId', tid, 'string'))
-            out.append(('link', 'spanId', sid, 'string'))
-        return out
-
-    def compare_tuples(self, q, stage):
-        outer = self.spanset(q['spanset'])
-        sel_rows = set(id(r) for r in self.spanset(stage['inner']))
-        topn = int(stage['args'][0]) if stage['args'] else 10
-        if len(stage['args']) >= 3:
-            s0, e0 = int(stage['args'][1]), int(stage['args'][2])
-            # `(start, end]`, the reference's definition — see the same
-            # window in catalogue_render.py.
-            in_win = lambda r: s0 < r['start_ns'] <= e0
-        else:
-            in_win = lambda r: True
-        counts = {}
-        for r in outer:
-            side = 'selection' if (id(r) in sel_rows and in_win(r)) else 'baseline'
-            for scope, k, text, ty in self.compare_keys(r):
-                key = (scope, k, text, ty, side)
-                counts[key] = counts.get(key, 0) + 1
-        rows = [(sc, k, v, ty, side, n) for (sc, k, v, ty, side), n in counts.items()]
-        order = lambda x: (x[0], x[1], x[4], -x[5], x[2], x[3])
-        # topN is per key and per side, inside the statement, before any cap
-        rank, keep = {}, []
-        for row in sorted(rows, key=order):
-            sc, k, v, ty, side, n = row
-            part = (sc, k, side)          # topN is per key and per side
-            i = rank.get(part, 0) + 1
-            rank[part] = i
-            if i <= topn: keep.append(row)
-        return [((sc, k, v, ty), side, n) for sc, k, v, ty, side, n in keep]
-
-    def compare_answer(self, q, stage):
-        """the same rows, as the catalogue's answer column shows them"""
-        return [(f'{sc}/{k}={v}:{ty}', side, str(n))
-                for (sc, k, v, ty), side, n in self.compare_tuples(q, stage)]
-
     # ------------------------------------------ what the route itself returns --
     #
     # The independent side of the check review round 4 asked for: not "which
     # spans match" but "what does the request answer". Each shape below is
     # written from the document that defines it — the trace envelope of
     # `sql-schema.md` §5.2, the series envelope of §5.6, `compare()`'s two
-    # distributions — and never from the SQL that `catalogue_render.py` emits.
+    # distributions — and never from the shipped compiler's SQL.
 
     def value_field(self, row, e):
         """A field in VALUE position: `select(...)`, `by(...)`, and either side
@@ -500,7 +411,7 @@ class Interp:
     def api_answer(self, q):
         """The rows the request's own statement must return."""
         cmpst = next((s for s in q['pipeline'] if s['k'] == 'compare'), None)
-        if cmpst: return self.compare_rows(q, cmpst)
+        if cmpst: raise NotImplementedError('compare(): compare_answer (#600 part 1b-2)')
         metric = next((s for s in q['pipeline'] if s['k'] == 'metric'), None)
         if metric: raise NotImplementedError('metrics: range_answer (#600 part 1b-1)')
         return self.search_answer(q)
@@ -791,6 +702,10 @@ class Interp:
                 key = ((), (('__name__', ('string', fn)),))
             t = ((r['start_ns'] - 1) // step + 1) * step // 10**6
             cells.setdefault(key, {}).setdefault(t, []).append(r)
+        # an ungrouped count or rate no span reaches, not ranked, is one series
+        # of zeros (a trailing comparison may then remove them) (r2)
+        if not cells and 'by' not in metric and fn in ('rate', 'count_over_time') and not second:
+            cells[((), (('__name__', ('string', fn)),))] = {}
 
         def value(rs, level=None):
             # a duration aggregates in nanoseconds and converts once
@@ -838,27 +753,188 @@ class Interp:
                 keep += at[:second['n']]
             pts = keep
         budget = self.exemplar_budget(q)
-        series = {}
+        series, cand = {}, []
         for key, t, v, rs in pts:
             s = series.setdefault(key, {'labels': [[k, list(x)] for k, x in key[1]],
                                         'samples': [], 'exemplars': []})
             s['samples'].append([t, v])
             if rs and budget:          # the longest span, the larger id on a tie
                 top = max(rs, key=lambda x: (x['dur'], x['span_id']))
-                s['exemplars'].append({'labels': [['trace:id', ['string', top['trace_id']]]],
-                                       'value': v if dense and fn != 'quantile_over_time' else target(top),
-                                       'ts': top['start_ns'] // 10**6})
+                cand.append(((t, key[0]), s, {'labels': [['trace:id', ['string', top['trace_id']]]],
+                             'value': v if dense and fn != 'quantile_over_time' else target(top),
+                             'ts': top['start_ns'] // 10**6}))
+        # over the budget, an even stride in bucket order, then series order
+        # (`docs/api.md` §4.4): candidate `x` of `T` is kept when
+        # `c = ⌈x·b/T⌉ < b` and `⌊c·T/b⌋ = x` (#600 part 1b-2)
+        cand.sort(key=lambda c: c[0])
+        T = len(cand)
+        for x, (_, s, e) in enumerate(cand):
+            c = -(-x * budget // T)
+            if T <= budget or (c < budget and c * T // budget == x):
+                s['exemplars'].append(e)
         out = []
         for key in sorted(series, key=lambda k: k[0]):
             s = series[key]
             s['samples'].sort()
             s['exemplars'].sort(key=lambda e: e['ts'])
             out.append(s)
-        if sum(len(s['exemplars']) for s in out) > budget > 0:
-            raise NotImplementedError('the exemplar stride is not modelled (#600 part 1b-1)')
         return {'series': out}
 
-    def compare_rows(self, q, stage):
-        """`compare()`'s own statement: one row per (scope, key, value, type,
-        side) with that side's count, ordered as §5.6 states."""
-        return [[sc, k, v, ty, side, n] for (sc, k, v, ty), side, n in self.compare_tuples(q, stage)]
+    def instant_answer(self, q, start, end, step=60 * 10**9):
+        """`docs/api.md` §4.4, "The instant `query` form": one bucket over the
+        snapped `[S, E)`, reported at `E`; `rate` divides by `E − S` seconds;
+        no exemplars. An ungrouped count or rate is always one series; any
+        other shape only the series some span reaches."""
+        metric = next(s for s in q['pipeline'] if s['k'] == 'metric')
+        second = next((s for s in q['pipeline'] if s['k'] == 'second'), None)
+        fn = metric['fn']
+        S, E = start // step * step, -(-end // step) * step
+        levels = [float(a['v']) for a in metric['args'][1:]] if fn == 'quantile_over_time' else [None]
+        arg = metric['args'][0] if metric['args'] and fn not in ('rate', 'count_over_time') else None
+        dur = arg is None or arg['k'] == 'intrinsic' and arg['name'] in ('duration', 'span:duration')
+
+        def target(r):
+            if dur: return r['dur'] / 1e9
+            if arg['k'] == 'intrinsic': return float(self.child_count(r))
+            got = self.attr(r, arg['scope'], arg['key'])
+            return float(got[1]) if got and got[0] in ('i', 'd') else None
+        groups = {}
+        for r in self.spanset(q['spanset']):
+            if not S <= r['start_ns'] < E: continue
+            if fn.endswith('_over_time') and fn != 'count_over_time' and target(r) is None: continue
+            if fn == 'histogram_over_time':
+                if r['dur'] < 2: continue
+                b = 1 << (r['dur'] - 1).bit_length()
+                key = ((b,), (('__bucket', ('double', b / 1e9)),))
+            elif 'by' in metric:
+                sk, label = self.series_key(r, metric['by'])
+                key = (sk, (label,))
+            elif fn == 'quantile_over_time':
+                key = ((), ())
+            else:
+                key = ((), (('__name__', ('string', fn)),))
+            groups.setdefault(key, []).append(r)
+        if not groups and 'by' not in metric and fn in ('rate', 'count_over_time'):
+            groups[((), (('__name__', ('string', fn)),))] = []
+
+        def value(rs, level):
+            d = [x['dur'] for x in rs] if dur else [target(x) for x in rs]
+            k = 1e9 if dur else 1
+            if fn == 'quantile_over_time':
+                d = sorted(d)
+                return f32(d[max(1, math.ceil(level * len(d))) - 1]) / k
+            return {'rate': lambda: len(rs) / ((E - S) / 1e9), 'count_over_time': lambda: float(len(rs)),
+                    'histogram_over_time': lambda: float(len(rs)),
+                    'sum_over_time': lambda: float(sum(d)) / k, 'min_over_time': lambda: float(min(d)) / k,
+                    'max_over_time': lambda: float(max(d)) / k,
+                    'avg_over_time': lambda: (sum(d) / len(d)) / k}[fn]()
+        pts = [((key[0] + (i,), key[1] + ((('p', ('double', lv)),) if lv is not None else ())), value(rs, lv))
+               for key, rs in groups.items() for i, lv in enumerate(levels)]
+        if 'cmp' in metric:
+            op, lit = metric['cmp']
+            th = self.lit(lit) / 1e9 if lit.get('t') == 'duration' else self.lit(lit)
+            pts = [p for p in pts if self.cmp(op, p[1], th)]
+        if second:
+            pts = sorted(pts, key=lambda p: (-p[1] if second['fn'] == 'topk' else p[1], p[0][0]))[:second['n']]
+        return {'series': [{'labels': [[k, list(x)] for k, x in key[1]], 'samples': [[E // 10**6, v]],
+                            'exemplars': []} for key, v in sorted(pts, key=lambda p: p[0][0])]}
+
+    # `docs/api.md` §4.4, "`compare()`'s keys": the 25 keys always answered
+    COMPARE_KNOWN = ('name', 'kind', 'status', 'statusMessage', 'rootName', 'rootServiceName',
+                     'instrumentation:name', 'instrumentation:version', 'resource.service.name',
+                     'resource.cluster', 'resource.container', 'resource.namespace', 'resource.pod',
+                     'resource.k8s.cluster.name', 'resource.k8s.container.name',
+                     'resource.k8s.namespace.name', 'resource.k8s.pod.name', 'span.http.method',
+                     'span.http.request.method', 'span.http.route', 'span.http.status_code',
+                     'span.http.url', 'span.server.address', 'span.url.path', 'span.url.route')
+
+    def compare_pairs(self, r):
+        """every `(key, value, stored type)` a span counts once in `compare()`:
+        its span, instrumentation and resource attributes of a TraceQL type
+        and eight intrinsics; no event or link key (C9, `docs/api.md` §4.4)"""
+        ty = {'s': 'string', 'i': 'int', 'd': 'double', 'b': 'bool'}
+        out = [('span.' + k, v, ty[t]) for k, t, v in r['attrs'] if t in ty]
+        out += [('instrumentation.' + k, v, ty[t]) for k, t, v in r.get('scope_attrs', []) if t in ty]
+        out += [('resource.' + k, v, ty[t]) for k, t, v in r['resource'] if t in ty and k != 'service.name']
+        out.append(('resource.service.name', r['service'], 'string'))
+        tr = self.fx.traces[r['trace_id']]
+        for k, v in (('name', r['name']), ('kind', KIND_KEYWORDS[r['kind']]),
+                     ('status', STATUS_KEYWORDS[r['status_code']]), ('statusMessage', r['status_message']),
+                     ('instrumentation:name', r['scope_name']), ('instrumentation:version', r['scope_version']),
+                     ('rootName', tr['root_name']), ('rootServiceName', tr['root_service'])):
+            out.append((k, v, 'string'))
+        return out
+
+    def compare_answer(self, q, start, end, instant, step=60 * 10**9):
+        """`docs/api.md` §4.4, `compare()`: per key, its kept values per side,
+        then for a well-known key `key=nil` per side, then `<side>_total`."""
+        st = next(s for s in q['pipeline'] if s['k'] == 'compare')
+        topn = int(st['args'][0]) if st['args'] else 10
+        win = (int(st['args'][1]), int(st['args'][2])) if len(st['args']) >= 3 else (0, 0)
+        S, E = start // step * step, -(-end // step) * step
+        grid = [E // 10**6] if instant else [(S + i * step) // 10**6 for i in range((E - S) // step + 1)]
+        sel_ids = {id(r) for r in self.spanset(st['inner'])}
+        pop = [{}, {}]; sums = {}; vals = {}; best = {}
+        for r in self.spanset(q['spanset']):
+            if instant and not S <= r['start_ns'] < E: continue
+            if not instant and not S - step < r['start_ns'] <= E: continue
+            side = int(id(r) in sel_ids and (win == (0, 0) or win[0] < r['start_ns'] <= win[1]))
+            t = E // 10**6 if instant else ((r['start_ns'] - 1) // step + 1) * step // 10**6
+            pop[side][t] = pop[side].get(t, 0) + 1
+            for k, v, ty in self.compare_pairs(r):
+                sums.setdefault(k, [{}, {}])[side][t] = sums.setdefault(k, [{}, {}])[side].get(t, 0) + 1
+                cell = vals.setdefault((side, k, v, ty), {})
+                cell[t] = cell.get(t, 0) + 1
+                cur = best.get((side, k, t))
+                if cur is None or (r['dur'], r['span_id']) > (cur['dur'], cur['span_id']):
+                    best[(side, k, t)] = r
+
+        def text(v, ty):
+            return ('true' if v else 'false') if ty == 'bool' else (format(v, 'g') if ty == 'double' else str(v))
+        kept = {}
+        for (side, k, v, ty), cell in vals.items():
+            kept.setdefault((side, k), []).append((-sum(cell.values()), text(v, ty), ty, v, cell))
+        series = []
+        meta = ('baseline', 'selection')
+        for k in sorted(set(sums) | set(self.COMPARE_KNOWN)):
+            for side in (0, 1):
+                # `topN` by count, ties by value text then type; listed by value text then type
+                top = sorted(kept.get((side, k), []), key=lambda x: x[:3])[:topn]
+                for _, _, ty, v, cell in sorted(top, key=lambda x: x[1:3]):
+                    series.append(([['__meta_type', ['string', meta[side]]], [k, [ty, v]]], cell, None))
+            of_key = sums.get(k, [{}, {}])
+            known = k in self.COMPARE_KNOWN
+            if known:
+                for side in (0, 1):
+                    series.append(([['__meta_type', ['string', meta[side]]], [k, ['string', 'nil']]],
+                                   {t: n - of_key[side].get(t, 0) for t, n in pop[side].items()}, None))
+            for side in (0, 1):
+                series.append(([['__meta_type', ['string', meta[side] + '_total']], [k, ['string', 'nil']]],
+                               pop[side] if known else of_key[side], (side, k)))
+        out = []
+        for labels, cell, ex_key in series:
+            if not any(cell.values()): continue
+            samples = [[t, float(cell.get(t, 0))] for t in grid] if not instant else \
+                      [[t, float(n)] for t, n in sorted(cell.items())]
+            out.append({'labels': labels, 'samples': samples, 'exemplars': [], '_ex': ex_key})
+        budget = self.exemplar_budget(q)
+        if not instant and budget:
+            # each key's candidates — per side, key and bucket the longest span
+            # carrying it — go onto its side's total; then an even stride over
+            # the whole answer, keys in order, sides baseline first
+            index = {s['_ex']: s for s in out if s['_ex']}
+            cand = []
+            for side in (0, 1):
+                for k in sorted(sums):
+                    s = index.get((side, k))
+                    for t in sorted(sums[k][side]):
+                        top = best[(side, k, t)]
+                        if s is None: continue
+                        v = dict((a, b) for a, b in s['samples']).get(t)
+                        cand.append((s, {'labels': [['trace:id', ['string', top['trace_id']]]], 'value': v,
+                                         'ts': top['start_ns'] // 10**6}))
+            if len(cand) > budget:
+                cand = [cand[i * len(cand) // budget] for i in range(budget)]
+            for s, e in cand: s['exemplars'].append(e)
+        for s in out: del s['_ex']
+        return {'series': out}
