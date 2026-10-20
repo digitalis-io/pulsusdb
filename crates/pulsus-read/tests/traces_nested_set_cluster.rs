@@ -2141,15 +2141,29 @@ impl Replicas {
         assert_g1(&self.graph(&prefix).await, what);
     }
 
+    /// The database dropped on every node, sent once on a client with a
+    /// 10-minute cut: a large database can take longer than the shared
+    /// client's 60 s, and a second `DROP … ON CLUSTER` racing the first can
+    /// fail with "does not exist" despite `IF EXISTS`.
     async fn drop(self) {
-        exec(
-            &self.s1,
-            &format!(
-                "DROP DATABASE IF EXISTS {} ON CLUSTER '{CLUSTER_NAME}' SYNC",
-                self.db
-            ),
-        )
-        .await;
+        let client = ChClient::new(ChConnConfig {
+            query_timeout: Duration::from_secs(600),
+            ..shard1_config("default")
+        })
+        .await
+        .expect("connect shard1");
+        let sql = format!(
+            "DROP DATABASE IF EXISTS {} ON CLUSTER '{CLUSTER_NAME}' SYNC",
+            self.db
+        );
+        client
+            .execute(
+                &sql,
+                &QuerySettings::new().set("distributed_ddl_task_timeout", 600),
+                Idempotency::NonIdempotent,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
 }
 
@@ -3804,6 +3818,9 @@ async fn the_job_keeps_up_under_steady_ingest() {
         worst_lag <= 5 * MINUTE,
         "LV1: the lag after every completed run is at most 5 min: {lags:?}"
     );
+    for c in [&r.s1, &r.s1b, &r.s2] {
+        stop_edges_view(c).await;
+    }
     r.drop().await;
 }
 
