@@ -6,7 +6,8 @@ directories of crates/pulsus-traceql/tests/corpus/ and every row of
 `catalogue-extra.tsv` through the route's own planner and engine and writes one
 JSON line per query: its disposition, the answer, and the statements the engine
 issued with the rows each returned (`system.query_log`). This script compares
-each search answer, whole and typed, with `catalogue_interp.py`, which walks
+each search answer and each metrics range answer but `compare()`'s, whole and
+typed, with `catalogue_interp.py`, which walks
 the parsed query over the fixture rows. The two sides share nothing: the statements
 are the compiler's and the parser here is the interpreter's own.
 
@@ -34,6 +35,8 @@ EMPTY_REASONS = {
     'intrinsic_trace_id': 'a stored trace id is thirty-two hex characters',
     'field_cross_type': 'every span holding both keys holds them at two types; a cross-type '
                         '`!=` that matched would return spans `…01` and `…2d`',
+    'metrics_result_comparison': 'no bucket of `{ .a = 1 }` holds more than 9 spans a minute, '
+                                 '0.15 per second, so no sample passes `> 5`',
 }
 CAPS = {'answer': LIMIT, 'cut': CUT, 'full': LIMIT}
 # `docs/api.md` §4.2: a duration `avg()` truncates. Trace `11…`'s four checkout
@@ -60,6 +63,14 @@ def rendered(answer):
     return answer
 
 
+def metrics_bounded(r):
+    """`T-Q2`, metrics: 1 to 100 statements, no sentinel row, and none returning
+    more rows than the answer has series (one when it has none)"""
+    st = r['statements'].get('answer') or []
+    n = max(len(r['result']['series']), 1)
+    return 1 <= len(st) and not r['overflow'].get('answer') and all(s[1] <= n for s in st)
+
+
 def bounded(r):
     """`T-Q2`: each request's statements stayed under the ceiling, and each
     returned at most the request's `limit` rows"""
@@ -67,6 +78,17 @@ def bounded(r):
     return all(st.get(k) and not r['overflow'].get(k) and all(s[1] <= cap for s in st[k])
                for k, cap in CAPS.items())
 
+
+# The interpreter's two older entry points no longer answer a metrics query:
+# `range_answer` is the one rule, and an entry point that still answered one
+# would be a second, unchecked copy of it (#600 part 1b-1).
+LEGACY_ANSWERING = []
+for entry in (I.answer, I.api_answer):
+    try:
+        entry(parse('{} | rate()'))
+        LEGACY_ANSWERING.append(entry.__name__)
+    except NotImplementedError:
+        pass
 
 VECTOR_BAD = []
 for line in open(f'{HERE}/parse_vectors.tsv'):
@@ -76,11 +98,18 @@ for line in open(f'{HERE}/parse_vectors.tsv'):
 
 tally = {g: {'served': 0, 'answer': 0, 'membership': 0} for g in ('corpus', 'design')}
 planner, mismatched, errors, unbounded, unexplained, missing_reason, notes = [], [], [], [], [], [], []
-metrics = 0
+metrics = {g: {'served': 0, 'answer': 0} for g in ('corpus', 'design')}
+compare_later, metric_notes = [], []
 # Every row of catalogue-extra.tsv is a query of the run; the added searches
 # expected to agree are those rows less its metrics queries.
 EXTRA_ROWS = sum(1 for l in open(f'{HERE}/catalogue-extra.tsv')
                  if l.strip() and not l.startswith('#'))
+# ... and the added metrics answers compared here are its rows with a metrics
+# stage and no `compare()`
+EXTRA_METRICS = sum(1 for l in open(f'{HERE}/catalogue-extra.tsv')
+                    if l.strip() and not l.startswith('#')
+                    for p in [parse(l.split('\t')[1])['pipeline']]
+                    if any(st['k'] == 'metric' for st in p) and not any(st['k'] == 'compare' for st in p))
 design_seen = design_other = 0
 pinned_bad, pinned_seen = [], set()
 for line in open(RUN):
@@ -88,14 +117,26 @@ for line in open(RUN):
     q = parse(r['traceql'])
     if r['group'] == 'design':
         design_seen += 1
-        design_other += r['disposition'] != 'served' or r['route'] == 'metrics'
+        design_other += r['disposition'] != 'served' or r.get('route') == 'metrics'
     if (refusal(q) is None) != (r['disposition'] == 'served'):
         mismatched.append(r['name'])
     if r['disposition'] != 'served':
         if r['disposition'] == 'plan_error': planner.append(r['name'])
         continue
-    if r['route'] == 'metrics':              # compared in part 1b
-        metrics += 1
+    if r['route'] == 'metrics':
+        if any(st['k'] == 'compare' for st in q['pipeline']):
+            compare_later.append(r['name']); continue       # #600 part 1b-2
+        mt = metrics['design' if r['group'] == 'design' else 'corpus']
+        mt['served'] += 1
+        if 'error' in r:
+            errors.append((r['name'], r['error'])); continue
+        if not metrics_bounded(r): unbounded.append(r['name'])
+        want = I.range_answer(q, S, E)
+        mt['answer'] += r['result'] == want
+        if r['result'] != want:
+            metric_notes.append((r['name'], r['traceql'], json.dumps(r['result'])[:600], json.dumps(want)[:600]))
+        if not want['series'] and r['name'] not in EMPTY_REASONS: unexplained.append(r['name'])
+        if want['series'] and r['name'] in EMPTY_REASONS: missing_reason.append(r['name'])
         continue
     t = tally['design' if r['group'] == 'design' else 'corpus']
     t['served'] += 1
@@ -125,26 +166,34 @@ print(f"corpus searches served                   {c['served']}")
 print(f"  answers / memberships that agree        {c['answer']} / {c['membership']}")
 print(f"catalogue-extra.tsv searches served      {d['served']}")
 print(f"  answers / memberships that agree        {d['answer']} / {d['membership']}")
-print(f"metrics queries served, compared in 1b   {metrics}")
+cm, dm = metrics['corpus'], metrics['design']
+print(f"corpus metrics range answers that agree   {cm['answer']} / {cm['served']}")
+print(f"catalogue-extra.tsv metrics that agree    {dm['answer']} / {dm['served']}")
+print(f"compare() queries, compared in 1b-2       {len(compare_later)}")
 print(f"refused by the planner                   {len(planner)}: {', '.join(sorted(planner))}")
 print(f"disposition rule against the planner     {len(mismatched)} mismatches")
 print(f"statements that failed                   {len(errors)}")
 print(f"requests over the answer's size (T-Q2)   {len(unbounded)}")
 print(f"parse vectors that differ                {len(VECTOR_BAD)}")
+print(f"older entry points answering metrics     {len(LEGACY_ANSWERING)}")
 print(f"pinned values that differ or are absent  {len(pinned_bad) + len(set(PINNED) - pinned_seen)}")
 print(f"empty answers without a reason           {len(unexplained)}")
 print(f"reasons for an answer that is not empty  {len(missing_reason)}")
 for n, src, a, m, got, want in notes:
     print(f'  disagreement: {n} {src!r} answer={a} membership={m}\n    route:       {got}\n    interpreter: {want}')
+for n, src, got, want in metric_notes:
+    print(f'  disagreement: {n} {src!r}\n    route:       {got}\n    interpreter: {want}')
 for n, e in errors: print(f'  statement failed: {n}: {e[:160]}')
-for n in unbounded + unexplained + missing_reason + mismatched + VECTOR_BAD + pinned_bad + sorted(set(PINNED) - pinned_seen):
+for n in unbounded + unexplained + missing_reason + mismatched + VECTOR_BAD + LEGACY_ANSWERING + pinned_bad + sorted(set(PINNED) - pinned_seen):
     print(f'  see: {n}')
 ok = (c == {'served': 119, 'answer': 119, 'membership': 119}
       and design_seen == EXTRA_ROWS and d['served'] == EXTRA_ROWS - design_other
       and d == {'served': d['served'], 'answer': d['served'], 'membership': d['served']}
-      and metrics == 24
+      and cm == {'served': 16, 'answer': 16} and dm == {'served': EXTRA_METRICS, 'answer': EXTRA_METRICS}
+      and len(compare_later) == 5
       and sorted(planner) == ['by_expression_key', 'duration_unitless', 'pipeline_spanset_operation']
       and pinned_seen == set(PINNED)
       and not (mismatched or errors or unbounded or unexplained or missing_reason or VECTOR_BAD
+               or LEGACY_ANSWERING
                or pinned_bad))
 sys.exit(0 if ok else 1)

@@ -3029,7 +3029,7 @@ jobs:
 
   # Issue #600: every corpus and `catalogue-extra.tsv` query through the
   # shipped route, each search answer compared with the independent
-  # interpreter; metrics answers are compared from #600 part 1b.
+  # interpreter, as is each metrics range answer but compare()'s.
   # Scheduled or dispatched, not required.
   traceql-catalogue:
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'

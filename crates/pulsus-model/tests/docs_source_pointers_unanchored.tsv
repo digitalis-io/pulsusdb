@@ -55,7 +55,7 @@ docs/api.md	cmd/tempo/app/modules.go:500-512	pinned_to_another_version
 docs/api.md	cmd/tempo/app/modules.go:846-850	pinned_to_another_version
 docs/api.md	crates/pulsus-logql/src/error.rs:16-23	no_name_the_target_file_holds
 docs/api.md	crates/pulsus-write/src/protocols/otlp_logs.rs:37-55	no_name_the_target_file_holds
-docs/api.md	engine_metrics.go:2058	not_in_this_repository
+docs/api.md	engine_metrics.go:2058-2122	not_in_this_repository
 docs/api.md	exp/api/remote/remote_api.go:611	pinned_to_another_version
 docs/api.md	expr.y:324-326	pinned_to_another_version
 docs/api.md	field_detection.go:96-124	pinned_to_another_version
