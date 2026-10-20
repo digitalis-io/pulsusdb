@@ -71,7 +71,7 @@ run_all.sh	write	written here	"${P[@]}" s08_user_point "attrs.\`app%2Euser%2Eid\
 run_all.sh	write	written here	"${P[@]}" s12_select "status_code = 2" resource_id 5 >> "$R/g1-new-design-sliced.tsv"
 run_all.sh	write	written here	echo "== the reference, same queries"; python3 "$HERE/http_bench.py" reference "$REF" "$START" "$END" 5 > "$R/g1-reference-warm.tsv"
 run_all.sh	write	written here	echo "== trace fetch, interleaved"; : > "$R/g1-fetch-compare.tsv"
-run_all.sh	write	written here	python3 "$HERE/fetch_compare.py" "$CH" tqd_g1 "$REF" "$tid" 21 >> "$R/g1-fetch-compare.tsv"; done
+run_all.sh	write	written here	python3 "$HERE/fetch_compare_design.py" "$CH" tqd_g1 "$REF" "$tid" 21 >> "$R/g1-fetch-compare.tsv"; done
 run_all.sh	write	written here	echo "== the reference's broad search, three calls"; : > "$R/g1-broad-search-check.tsv"
 run_all.sh	write	written here	for i in 1 2 3; do python3 "$HERE/broad_search_check.py" "$CH" tqd_g1 "$REF" "$START" "$END" | tr '\n' ' ' >> "$R/g1-broad-search-check.tsv"; echo >> "$R/g1-broad-search-check.tsv"; done
 run_all.sh	write	written here	echo "== correctness"; python3 "$HERE/ground_truth.py" "$WORK/g1/spans.jsonl" > "$R/g1-ground-truth.tsv"

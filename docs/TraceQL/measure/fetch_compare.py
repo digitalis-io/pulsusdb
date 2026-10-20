@@ -1,8 +1,50 @@
 #!/usr/bin/env python3
-"""Trace-by-id, both stores, many repetitions, reported as a distribution: the
-reference's cost depends on how many blocks it must check, so a single median
-is not enough. Usage: fetch_compare.py CH_URL DB TEMPO_URL TRACE_ID_HEX REPS"""
-import sys, time, statistics, urllib.request
+"""Trace by id over the shipped routes, PulsusDB against the reference, many
+repetitions, reported as a distribution: the reference's fetch time varies
+between sessions, so a single median is not enough. The two stores are
+interleaved, alternating which goes first, so neither gets the warm side of a
+session effect. Every call, the unmeasured first included, must answer 200 with
+a body, or the script exits 1 naming the side and the cause.
+Usage: fetch_compare.py PULSUS_URL REFERENCE_URL TRACE_ID_HEX REPS  |  fetch_compare.py --self-test"""
+import sys, time, statistics, urllib.request, urllib.error
+
+# what the trace datasource requests
+ACCEPT = {'Accept': 'application/protobuf'}
+
+
+def timed(side, url, size):
+    """wall time of one GET in ms; records the body length in size[side]"""
+    t0 = time.perf_counter()
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=ACCEPT), timeout=120) as r:
+            body = r.read(); status = r.status
+    except urllib.error.HTTPError as e:
+        body = e.read(); status = e.code
+    ms = (time.perf_counter() - t0) * 1000
+    if status != 200:
+        sys.exit(f'{side}: status {status} from {url}: {body[:200]!r}')
+    if not body:
+        sys.exit(f'{side}: empty body with status 200 from {url}')
+    size[side] = len(body)
+    return ms
+
+
+def main(pulsus, ref, tid, reps):
+    p_url = f'{pulsus.rstrip("/")}/api/traces/v1/trace/{tid.lower()}'
+    r_url = f'{ref.rstrip("/")}/api/traces/{tid.lower()}'
+    size = {}
+    tp = lambda: timed('PulsusDB', p_url, size)
+    tr = lambda: timed('the reference', r_url, size)
+    tp(); tr()                                   # unmeasured
+    a, b = [], []
+    for i in range(reps):
+        if i % 2 == 0: a.append(tp()); b.append(tr())
+        else: b.append(tr()); a.append(tp())
+    for name, xs in (('PulsusDB', sorted(a)), ('the reference', sorted(b))):
+        print(f'{name}\ttrace={tid[:8]}\treps={reps}\tmin={xs[0]:.0f}\tp50={statistics.median(xs):.0f}'
+              f'\tp90={xs[int(len(xs)*0.9)-1]:.0f}\tmax={xs[-1]:.0f}\tbytes={size[name]}', flush=True)
+
+
 def stub(answer):
     """A server on 127.0.0.1, on a port the OS picks; answer(n) gives the status
     and body of its n-th call (from 1)."""
@@ -46,25 +88,7 @@ def self_test():
     return 1 if fails else 0
 
 
-if sys.argv[1:] == ['--self-test']:
-    sys.exit(self_test())
-ch, DB, tempo, tid, reps = sys.argv[1].rstrip('/'), sys.argv[2], sys.argv[3].rstrip('/'), sys.argv[4], int(sys.argv[5])
-sql = open(f'{sys.path[0]}/sql/b01_trace_by_id_20.sql').read()
-sql = sql.replace('50FB0CD99260AC2A15D0A6F208126742', tid.upper()).replace('tqd_g1', DB)
-def t_ch():
-    t0 = time.perf_counter()
-    urllib.request.urlopen(urllib.request.Request(f'{ch}/?default_format=RowBinary&final=1', data=sql.encode()), timeout=120).read()
-    return (time.perf_counter() - t0) * 1000
-def t_ref():
-    t0 = time.perf_counter()
-    urllib.request.urlopen(f'{tempo}/api/traces/{tid.lower()}', timeout=120).read()
-    return (time.perf_counter() - t0) * 1000
-# interleaved, alternating which store goes first, so neither gets the warm
-# side of a session effect
-t_ch(); t_ref()
-a, b = [], []
-for i in range(reps):
-    if i % 2 == 0: a.append(t_ch()); b.append(t_ref())
-    else: b.append(t_ref()); a.append(t_ch())
-for name, xs in (('this design', sorted(a)), ('the reference', sorted(b))):
-    print(f'{name}\ttrace={tid[:8]}\treps={reps}\tmin={xs[0]:.0f}\tp50={statistics.median(xs):.0f}\tp90={xs[int(len(xs)*0.9)-1]:.0f}\tmax={xs[-1]:.0f}')
+if __name__ == '__main__':
+    if sys.argv[1:] == ['--self-test']:
+        sys.exit(self_test())
+    main(sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]))

@@ -35,16 +35,67 @@ PASS = {'below': 13, 'exempt': 1, 'no counterpart': 1}
 
 def verdict(paired_text, fetch_text):
     """(rows, counts): rows are (shape, pulsus_ms, reference_ms, pulsus_bytes,
-    reference_bytes, state)."""
-    return [], {}
+    reference_bytes, state). A shape missing from an input is refused on that
+    side's account."""
+    halves = {}            # shape -> {side: (status, ms, bytes)}, side 'p' or 'r'
+    for line in paired_text.splitlines():
+        c = line.split('\t')
+        if len(c) < 6 or not c[0]: continue
+        h = halves.setdefault(c[0], {})
+        h['p'] = (c[1], c[4], c[2])
+        if len(c) >= 11 and c[6] != '-':
+            h['r'] = (c[6], c[9], c[7])
+    fetch = [dict(kv.split('=', 1) for kv in line.split('\t')[1:] if '=' in kv) | {'side': line.split('\t')[0]}
+             for line in fetch_text.splitlines() if line.strip()]
+    for shape, at in (('fetch_trace_20', 0), ('fetch_trace_largest', 2)):
+        h = halves.setdefault(shape, {})
+        for side, i, who in (('p', at, 'PulsusDB'), ('r', at + 1, 'the reference')):
+            if i < len(fetch) and fetch[i]['side'] == who and 'p50' in fetch[i]:
+                h[side] = ('200', fetch[i]['p50'], fetch[i].get('bytes', ''))
+    rows, counts = [], {s: 0 for s in STATES}
+    for shape, kind in SHAPES:
+        h = halves.get(shape, {})
+        p, r = h.get('p'), h.get('r')
+        if p is None or p[0] != '200':
+            state = 'refused'
+        elif kind == 'no counterpart':
+            state = 'no counterpart'
+        elif r is None or r[0] != '200':
+            state = 'reference failed'
+        elif kind == 'exempt':
+            state = 'exempt'
+        else:
+            state = 'below' if float(p[1]) < float(r[1]) else 'not below'
+        counts[state] += 1
+        rows.append((shape, p[1] if p else '-', r[1] if r else '-', p[2] if p else '-', r[2] if r else '-', state))
+    return rows, counts
 
 
 def passes(counts):
     return {k: v for k, v in counts.items() if v} == PASS
 
 
+COUNT_LINES = [('compared below', 'below'), ('exempt', 'exempt'), ('no counterpart', 'no counterpart'),
+               ('refused', 'refused'), ('not below', 'not below'), ('reference failed', 'reference failed')]
+
+
 def write(out, rows, counts):
-    pass
+    """the TSV on stdout, the same as Markdown in OUT/summary.md"""
+    head = ('shape', 'pulsus_ms', 'reference_ms', 'pulsus_bytes', 'reference_bytes', 'state')
+    for r in (head, *rows):
+        print('\t'.join(r))
+    print()
+    for label, state in COUNT_LINES:
+        print(f'{label}\t{counts[state]}')
+    print(f'verdict\t{"pass" if passes(counts) else "fail"}')
+    with open(f'{out}/summary.md', 'w') as f:
+        f.write('## TraceQL against the reference: the shipped routes, warm medians\n\n')
+        f.write('| ' + ' | '.join(head) + ' |\n|---|---:|---:|---:|---:|---|\n')
+        for r in rows:
+            f.write('| ' + ' | '.join(r) + ' |\n')
+        f.write('\n' + '; '.join(f'{label} {counts[state]}' for label, state in COUNT_LINES) + '\n\n')
+        f.write(f'**{"pass" if passes(counts) else "fail"}**: the rule needs 13 compared below, 1 exempt, '
+                '1 with no counterpart and nothing else.\n')
 
 
 def self_test():
