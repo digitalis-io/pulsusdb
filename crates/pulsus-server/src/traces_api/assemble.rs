@@ -6,18 +6,22 @@
 //!
 //! **Nothing is decoded from a stored payload any more** (issue #587). The
 //! fetch projects the span, per-trace and resource tables' own columns, and
-//! this module is what turns them back into the protocol's messages. The
-//! response's SHAPE does not move: one `ResourceSpans` per span, each with
-//! one `ScopeSpans` holding one `Span`, in the canonical
-//! `(start_time_unix_nano, span_id, kind)` order — which is what every
-//! golden that pins it, and the byte-frozen reference capture, depend on.
+//! this module is what turns them back into the protocol's messages.
+//!
+//! **Spans are grouped by resource and scope** (issue #601 part 4a): one
+//! `ResourceSpans` per distinct rendered `Resource` and its schema url, one
+//! `ScopeSpans` per distinct rendered `InstrumentationScope` and its schema
+//! url inside it, each listing its spans in the canonical
+//! `(start_time_unix_nano, span_id, kind)` order; the groups are ordered by
+//! their first span. The key is the message as rendered, not as stored:
+//! attributes come back sorted whatever order either carrier holds, so two
+//! stored orders of one resource or scope are one group.
 //!
 //! **Dedup is evaluated per `(span_id, kind)`** and the winner is the row
 //! with the greatest `start_ns`. That totalises it: two rows sharing
-//! `(span_id, kind)` AND `start_ns` share the whole span sort key, and the
-//! fetch's `final = 1` collapses them — so two survivors with one
-//! `(span_id, kind)` differ in `start_ns`, and with `final` off the two
-//! rows are byte-identical and either choice gives the same answer. `kind`
+//! `(span_id, kind)` AND `start_ns` share the whole span identity — one
+//! span stored twice, which the fetch reads without `final` (issue #601
+//! part 4a) — and either is the answer (`docs/api.md` §1.0). `kind`
 //! is `i32` because the stored column is, so the map key and the
 //! canonical-order tiebreak are `(span_id, i32)`.
 //!
@@ -467,14 +471,36 @@ fn rebuild(trace_id: &[u8; 16], fetched: FetchedTrace) -> Result<(TracesData, u6
     spans.sort_by_key(|s| (s.start_ns as u64, s.span_id, s.kind));
 
     let mut missing_resources = 0u64;
-    let mut groups = Vec::with_capacity(spans.len());
+    // A span's resource is rendered from its `(resource_id, service)`, so
+    // each pair renders once and resolves to the group its rendering keys.
+    let mut groups: Vec<ResourceSpans> = Vec::new();
+    let mut group_of: HashMap<(Vec<u8>, String), usize> = HashMap::new();
+    let mut rendered: HashMap<(u128, String), usize> = HashMap::new();
+    let mut scope_of: Vec<HashMap<(Vec<u8>, String), usize>> = Vec::new();
     for span in spans {
         let span_subject = format!("span {}", hex(&span.span_id));
         let entry = resources.get(&span.resource_id);
         if entry.is_none() {
             missing_resources += 1;
         }
-        let (resource, resource_schema_url) = render_resource(&span.service, entry)?;
+        let g = match rendered.get(&(span.resource_id, span.service.clone())) {
+            Some(&g) => g,
+            None => {
+                let (resource, schema_url) = render_resource(&span.service, entry)?;
+                let key = (resource.encode_to_vec(), schema_url.clone());
+                let g = *group_of.entry(key).or_insert_with(|| {
+                    groups.push(ResourceSpans {
+                        resource: Some(resource),
+                        scope_spans: Vec::new(),
+                        schema_url,
+                    });
+                    scope_of.push(HashMap::new());
+                    groups.len() - 1
+                });
+                rendered.insert((span.resource_id, span.service.clone()), g);
+                g
+            }
+        };
         let scope = InstrumentationScope {
             name: span.scope_name,
             version: span.scope_version,
@@ -525,39 +551,43 @@ fn rebuild(trace_id: &[u8; 16], fetched: FetchedTrace) -> Result<(TracesData, u6
                 dropped_attributes_count: link.dropped_attrs,
             });
         }
-        groups.push(ResourceSpans {
-            resource: Some(resource),
-            scope_spans: vec![ScopeSpans {
-                scope: Some(scope),
-                spans: vec![Span {
-                    // The REQUEST's own sixteen bytes: the span table
-                    // carries the trace id as a key and the statements do
-                    // not project it.
-                    trace_id: trace_id.to_vec(),
-                    span_id: span.span_id.to_vec(),
-                    trace_state: span.trace_state,
-                    parent_span_id: otlp_parent_span_id(&span.parent_span_id),
-                    flags: span.flags,
-                    name: span.name,
-                    // The protocol's own signed values, verbatim.
-                    kind: span.kind,
-                    start_time_unix_nano: span.start_ns as u64,
-                    end_time_unix_nano: span.end_ns,
-                    attributes,
-                    dropped_attributes_count: span.dropped_attrs,
-                    events,
-                    dropped_events_count: span.dropped_events,
-                    links,
-                    dropped_links_count: span.dropped_links,
-                    status: Some(Status {
-                        code: span.status_code,
-                        message: span.status_message,
-                    }),
-                }],
-                schema_url: span.scope_schema_url,
-            }],
-            schema_url: resource_schema_url,
-        });
+        let out = Span {
+            // The REQUEST's own sixteen bytes: the span table
+            // carries the trace id as a key and the statements do
+            // not project it.
+            trace_id: trace_id.to_vec(),
+            span_id: span.span_id.to_vec(),
+            trace_state: span.trace_state,
+            parent_span_id: otlp_parent_span_id(&span.parent_span_id),
+            flags: span.flags,
+            name: span.name,
+            // The protocol's own signed values, verbatim.
+            kind: span.kind,
+            start_time_unix_nano: span.start_ns as u64,
+            end_time_unix_nano: span.end_ns,
+            attributes,
+            dropped_attributes_count: span.dropped_attrs,
+            events,
+            dropped_events_count: span.dropped_events,
+            links,
+            dropped_links_count: span.dropped_links,
+            status: Some(Status {
+                code: span.status_code,
+                message: span.status_message,
+            }),
+        };
+        let scope_spans = &mut groups[g].scope_spans;
+        let k = *scope_of[g]
+            .entry((scope.encode_to_vec(), span.scope_schema_url.clone()))
+            .or_insert_with(|| {
+                scope_spans.push(ScopeSpans {
+                    scope: Some(scope),
+                    spans: Vec::new(),
+                    schema_url: span.scope_schema_url,
+                });
+                scope_spans.len() - 1
+            });
+        scope_spans[k].spans.push(out);
     }
     Ok((
         TracesData {
@@ -1102,7 +1132,9 @@ mod tests {
         let resources = vec![a, b];
 
         let data = assembled(fetched(rows.clone(), resources.clone()));
-        let shape: Vec<(Vec<String>, Vec<(String, Vec<u8>)>)> = data
+        /// A group's resource keys, and each scope's name and span ids.
+        type Shape = Vec<(Vec<String>, Vec<(String, Vec<u8>)>)>;
+        let shape: Shape = data
             .as_traces_data()
             .resource_spans
             .iter()

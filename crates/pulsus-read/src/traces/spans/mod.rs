@@ -43,9 +43,15 @@ pub mod tracelevel;
 
 /// `(SELECT *{cols} FROM {from_where}\nLIMIT 1 BY trace_id, start_ns, span_id, kind)`:
 /// `from_where` is `<table>[ joins]\nWHERE …`, the read's own text unchanged.
-/// Not yet built (issue #601 part 4a).
-pub(crate) fn distinct_spans(_from_where: &str, _cols: &str) -> String {
-    String::new()
+///
+/// A span read without `final` (issue #601 part 4a): a push stored twice is
+/// two rows with one span identity, `(trace_id, start_ns, span_id, kind)` —
+/// the `spans` sorting key less its bucket, a function of `start_ns` — and
+/// this keeps one of them. `cols` aliases each joined column the outer
+/// read names, such as `tv.td`, to that name, so it resolves through the
+/// wrap.
+pub(crate) fn distinct_spans(from_where: &str, cols: &str) -> String {
+    format!("(SELECT *{cols} FROM {from_where}\nLIMIT 1 BY trace_id, start_ns, span_id, kind)")
 }
 
 #[cfg(test)]

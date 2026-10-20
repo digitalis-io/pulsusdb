@@ -8,7 +8,8 @@
 #
 # Both stores must start empty. BENCH_END_S fixes the corpus's end (default:
 # now). OUT receives corpus-summary.json, run.txt, paired.tsv, fetch.tsv,
-# verdict.tsv and summary.md; the exit status is the verdict's.
+# verdict.tsv, summary.md and bodies/, each side's first body per shape; the
+# exit status is the verdict's.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 PULSUS=${1%/} CH=${2%/} REF=${3%/} REFOTLP=$4 WORK=$5 OUT=$6
@@ -60,6 +61,32 @@ tbig = min(n, key=lambda t: (-n[t], t))
 print(t20, n[t20], tbig, n[tbig])
 PY
 )
+# t02's key: the first candidate some span of the corpus carries and the
+# reference answers with at least one value over the window. None is a failed
+# run, naming every candidate tried.
+CANDIDATES="rpc.method http.request.method db.operation.name db.system.name messaging.system http.route"
+CARRIED=$(python3 - "$WORK/g1/spans.jsonl" $CANDIDATES <<'PY'
+import json, sys
+want, seen = sys.argv[2:], set()
+for line in open(sys.argv[1]):
+    seen.update(a[0] for a in json.loads(line)['attrs'] if a[0] in want)
+    if len(seen) == len(want): break
+print(' '.join(k for k in want if k in seen))
+PY
+)
+T02_KEY= TRIED=
+for key in $CANDIDATES; do
+  case " $CARRIED " in *" $key "*) ;; *) TRIED="$TRIED $key(no span carries it)"; continue ;; esac
+  n=$(curl --fail-with-body -sS -G "$REF/api/v2/search/tag/span.$key/values" \
+        --data-urlencode "start=$START" --data-urlencode "end=$END" |
+      python3 -c "import json,sys;print(len(json.load(sys.stdin).get('tagValues') or []))")
+  TRIED="$TRIED $key($n values)"
+  if [ "$n" -gt 0 ]; then T02_KEY=$key; break; fi
+done
+if [ -z "$T02_KEY" ]; then
+  echo "   STOP: no t02 key: the reference answers none of the candidates:$TRIED" >&2
+  exit 1
+fi
 {
   echo "date	$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "end_s	$END"
@@ -68,6 +95,8 @@ PY
   echo "dup_spans	$DUP"
   echo "trace_20	$T20	$N20 spans"
   echo "trace_largest	$TBIG	$NBIG spans"
+  echo "t02_key	$T02_KEY"
+  echo "t02_candidates_tried	${TRIED# }"
   echo "nproc	$(nproc)"
   # the two images the workflow starts, read from the files it reads them from
   echo "clickhouse_image	$(grep -o -m1 'clickhouse/clickhouse-server@sha256:[0-9a-f]*' "$HERE/../../../.github/workflows/traceql-reference-bench.yml")"
@@ -76,7 +105,7 @@ PY
 cat "$OUT/run.txt"
 
 echo "== every shape, paired"
-BENCH_T20=$T20 BENCH_TBIG=$TBIG python3 "$HERE/http_bench.py" paired "$PULSUS" "$REF" "$START" "$END" 5 "$CH" > "$OUT/paired.tsv"
+BENCH_T20=$T20 BENCH_TBIG=$TBIG BENCH_T02_KEY=$T02_KEY BENCH_BODIES="$OUT/bodies" python3 "$HERE/http_bench.py" paired "$PULSUS" "$REF" "$START" "$END" 5 "$CH" > "$OUT/paired.tsv"
 echo "== trace fetch, interleaved"
 # a refused fetch exits 1 naming the side; its two lines then carry no timing,
 # which the verdict counts as refused, so the run goes on to the verdict

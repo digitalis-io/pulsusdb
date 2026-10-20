@@ -30,7 +30,8 @@ impl TraceEngine {
     /// 2 * limit`, `k` the slices of the current width the window holds.
     /// `Some` is a slice's answer; `None` means the whole-window statement
     /// answers, and its `search_statement` stage is pushed. A slice's
-    /// demand is the request's `400`.
+    /// demand is the request's `400`. The trace-level statement (issue #601
+    /// part 4a) reads the window in one statement, so no slice runs for it.
     pub(super) async fn newest_first(
         &self,
         request: &SearchRequest,
@@ -42,7 +43,7 @@ impl TraceEngine {
         let mut budget = ByteBudget::new(HYDRATION_BYTE_BUDGET);
         let mut charged = 0usize;
         let mut len = SLICE_NS;
-        while len < window_ns {
+        while len < window_ns && !stmt.is_trace_level() {
             let sliced = self
                 .search_statement(request, Some(len))
                 .expect("a statement that compiled whole compiles sliced");
@@ -168,9 +169,9 @@ impl StatementRows {
 }
 
 impl TraceEngine {
-    /// Issues `stmt` once with the search settings plus `final = 1` (and a
-    /// climb's depth bound), collecting its rows against `budget`. A
-    /// ClickHouse error comes back as it came, for [`statement_error`].
+    /// Issues `stmt` once with [`Self::statement_settings`] (and a climb's
+    /// depth bound), collecting its rows against `budget`. A ClickHouse
+    /// error comes back as it came, for [`statement_error`].
     pub(super) async fn statement_rows(
         &self,
         stmt: &SearchStatement,
@@ -208,8 +209,11 @@ impl TraceEngine {
 }
 
 impl TraceEngine {
-    /// A search statement's settings: [`with_final`] over the search
-    /// settings, and, clustered, `distributed_product_mode = 'local'` for a
+    /// A search statement's settings: the search settings, with
+    /// [`with_final`] when the statement keeps `final` (issue #601 part 4a:
+    /// it reads the nested-set numbering; every other statement keeps one
+    /// row per span identity itself), and, clustered,
+    /// `distributed_product_mode = 'local'` for a
     /// statement that reads the nested-set numbering (issue #594 part 2),
     /// holds a structural operator (issue #602 part 2b) or reads a span's
     /// child count (issue #600 part 2). That statement
@@ -226,11 +230,13 @@ impl TraceEngine {
 
 /// [`TraceEngine::statement_settings`], on the engine's configuration.
 fn search_statement_settings(config: &TraceReadConfig, stmt: &SearchStatement) -> QuerySettings {
-    product_mode(
-        with_final(super::search_settings(config)),
-        config.distributed,
-        stmt.nests_reads(),
-    )
+    let settings = super::search_settings(config);
+    let settings = if stmt.keeps_final() {
+        with_final(settings)
+    } else {
+        settings
+    };
+    product_mode(settings, config.distributed, stmt.nests_reads())
 }
 
 /// [`TraceEngine::statement_settings`]'s rule, on its own.

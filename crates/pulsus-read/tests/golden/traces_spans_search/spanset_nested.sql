@@ -5,11 +5,12 @@ WITH (SELECT (groupArray(trace_id), groupArray(keys))
 FROM (SELECT *, ((f1 AND ((c1 OR c2) AND c3)) OR (f2 AND ((c1 OR c2) AND c3)) OR (f3 AND ((c1 OR c2) AND c3))) AS s0
 FROM (SELECT *, max(f1) OVER (PARTITION BY trace_id) AS c1, max(f2) OVER (PARTITION BY trace_id) AS c2, max(f3) OVER (PARTITION BY trace_id) AS c3
 FROM (SELECT trace_id, span_id, start_ns, duration_ns, ((coalesce(attrs.`a`.:Int64 = 1, false) OR coalesce(attrs.`a`.:Float64 = 1, false))) AS f1, ((coalesce(attrs.`b`.:Int64 = 2, false) OR coalesce(attrs.`b`.:Float64 = 2, false))) AS f2, ((coalesce(attrs.`c`.:Int64 = 3, false) OR coalesce(attrs.`c`.:Float64 = 3, false))) AS f3
-FROM spans
+FROM (SELECT * FROM spans
 WHERE start_ns >= 1790084801000000000 AND start_ns < 1790095601000000000
   AND intDiv(start_ns, 300000000000) BETWEEN intDiv(1790084801000000000, 300000000000) AND intDiv(1790095600999999999, 300000000000)
   AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') >= toDate('2026-09-22') AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') <= toDate('2026-09-22')
-  AND (((coalesce(attrs.`a`.:Int64 = 1, false) OR coalesce(attrs.`a`.:Float64 = 1, false))) OR ((coalesce(attrs.`b`.:Int64 = 2, false) OR coalesce(attrs.`b`.:Float64 = 2, false))) OR ((coalesce(attrs.`c`.:Int64 = 3, false) OR coalesce(attrs.`c`.:Float64 = 3, false)))))))
+  AND (((coalesce(attrs.`a`.:Int64 = 1, false) OR coalesce(attrs.`a`.:Float64 = 1, false))) OR ((coalesce(attrs.`b`.:Int64 = 2, false) OR coalesce(attrs.`b`.:Float64 = 2, false))) OR ((coalesce(attrs.`c`.:Int64 = 3, false) OR coalesce(attrs.`c`.:Float64 = 3, false))))
+LIMIT 1 BY trace_id, start_ns, span_id, kind))))
 GROUP BY trace_id
 HAVING countIf(s0) > 0
 ORDER BY last DESC, trace_id ASC
@@ -22,13 +23,14 @@ arraySlice(arraySort(x -> (x.2, x.1), groupArrayIf((span_id, start_ns, duration_
 FROM (SELECT *, ((f1 AND ((c1 OR c2) AND c3)) OR (f2 AND ((c1 OR c2) AND c3)) OR (f3 AND ((c1 OR c2) AND c3))) AS s0
 FROM (SELECT *, max(f1) OVER (PARTITION BY trace_id) AS c1, max(f2) OVER (PARTITION BY trace_id) AS c2, max(f3) OVER (PARTITION BY trace_id) AS c3
 FROM (SELECT trace_id, span_id, start_ns, duration_ns, service, ((coalesce(attrs.`a`.:Int64 = 1, false) OR coalesce(attrs.`a`.:Float64 = 1, false))) AS f1, ((coalesce(attrs.`b`.:Int64 = 2, false) OR coalesce(attrs.`b`.:Float64 = 2, false))) AS f2, ((coalesce(attrs.`c`.:Int64 = 3, false) OR coalesce(attrs.`c`.:Float64 = 3, false))) AS f3, (arrayFilter(x -> x.1 != 0, [multiIf((coalesce(attrs.`a`.:Int64 = 1, false) OR coalesce(attrs.`a`.:Float64 = 1, false)), (1, if(NOT (dynamicType(attrs.`a`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))')), '', if(startsWith(dynamicType(attrs.`a`), 'Array'), toJSONString(arrayMap(x -> (toString(dynamicType(x)), toString(x)), CAST(attrs.`a`, 'Array(Dynamic)'))), if(length(toString(attrs.`a`)) <= 8192, toString(attrs.`a`), substringUTF8(toString(attrs.`a`), 1, 2048)))), if(dynamicType(attrs.`a`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'), toString(dynamicType(attrs.`a`)), 'None')), (0, '', '')), multiIf((coalesce(attrs.`b`.:Int64 = 2, false) OR coalesce(attrs.`b`.:Float64 = 2, false)), (2, if(NOT (dynamicType(attrs.`b`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))')), '', if(startsWith(dynamicType(attrs.`b`), 'Array'), toJSONString(arrayMap(x -> (toString(dynamicType(x)), toString(x)), CAST(attrs.`b`, 'Array(Dynamic)'))), if(length(toString(attrs.`b`)) <= 8192, toString(attrs.`b`), substringUTF8(toString(attrs.`b`), 1, 2048)))), if(dynamicType(attrs.`b`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'), toString(dynamicType(attrs.`b`)), 'None')), (0, '', '')), multiIf((coalesce(attrs.`c`.:Int64 = 3, false) OR coalesce(attrs.`c`.:Float64 = 3, false)), (3, if(NOT (dynamicType(attrs.`c`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))')), '', if(startsWith(dynamicType(attrs.`c`), 'Array'), toJSONString(arrayMap(x -> (toString(dynamicType(x)), toString(x)), CAST(attrs.`c`, 'Array(Dynamic)'))), if(length(toString(attrs.`c`)) <= 8192, toString(attrs.`c`), substringUTF8(toString(attrs.`c`), 1, 2048)))), if(dynamicType(attrs.`c`) IN ('String', 'Int64', 'Float64', 'Bool', 'Array(Nullable(String))', 'Array(Nullable(Int64))', 'Array(Nullable(Float64))', 'Array(Nullable(Bool))'), toString(dynamicType(attrs.`c`)), 'None')), (0, '', ''))])) AS proj
-FROM spans
+FROM (SELECT * FROM spans
 WHERE (intDiv(start_ns, 300000000000), trace_id) IN
 (SELECT arrayJoin(arrayFlatten(arrayMap((t, ks) -> arrayMap(k -> (k, t), ks), top.1, top.2))))
   AND start_ns >= 1790084801000000000 AND start_ns < 1790095601000000000
   AND intDiv(start_ns, 300000000000) BETWEEN intDiv(1790084801000000000, 300000000000) AND intDiv(1790095600999999999, 300000000000)
   AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') >= toDate('2026-09-22') AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') <= toDate('2026-09-22')
-  AND (((coalesce(attrs.`a`.:Int64 = 1, false) OR coalesce(attrs.`a`.:Float64 = 1, false))) OR ((coalesce(attrs.`b`.:Int64 = 2, false) OR coalesce(attrs.`b`.:Float64 = 2, false))) OR ((coalesce(attrs.`c`.:Int64 = 3, false) OR coalesce(attrs.`c`.:Float64 = 3, false)))))))
+  AND (((coalesce(attrs.`a`.:Int64 = 1, false) OR coalesce(attrs.`a`.:Float64 = 1, false))) OR ((coalesce(attrs.`b`.:Int64 = 2, false) OR coalesce(attrs.`b`.:Float64 = 2, false))) OR ((coalesce(attrs.`c`.:Int64 = 3, false) OR coalesce(attrs.`c`.:Float64 = 3, false))))
+LIMIT 1 BY trace_id, start_ns, span_id, kind))))
 GROUP BY trace_id) AS m
 LEFT JOIN (SELECT trace_id, min(start_ns) AS start_ns, max(end_ns) AS end_ns,
                   min(root) AS r, if(r.1 = 0, if(length(r.4) <= 8192, r.4, substringUTF8(r.4, 1, 2048)), '') AS root_service, if(r.1 = 0, if(length(r.5) <= 8192, r.5, substringUTF8(r.5, 1, 2048)), '') AS root_name

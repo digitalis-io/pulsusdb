@@ -1746,9 +1746,9 @@ impl TraceEngine {
     /// (the server's `parse_trace_id` is the one validation point) —
     /// injection-safe because only `[0-9a-f]` can then reach the
     /// `unhex('...')` literal. An empty `spans` means no statement found
-    /// the trace; duplicate `(span_id, kind)` pairs that survive
-    /// `final = 1` are returned as stored, because dedup across replicas
-    /// is the assembler's read-time concern.
+    /// the trace; duplicate `(span_id, kind)` pairs — a span stored twice,
+    /// read without `final` — are returned as stored, because the dedup is
+    /// the assembler's read-time concern.
     ///
     /// `window` is the request's own `start`/`end` when it supplied them.
     /// **The indexed statement never reads it** — its bounds come from the
@@ -2045,8 +2045,9 @@ impl TraceEngine {
         Ok((output, explain))
     }
 
-    /// The shared body: each statement with the search settings plus
-    /// `final = 1`, its rows and decode charged to one 256 MiB budget. A
+    /// The shared body: each statement with its own settings
+    /// (`newest_first.rs`'s `statement_settings`), its rows and decode
+    /// charged to one 256 MiB budget. A
     /// request the statement's compiler refuses is a `400` with its text.
     async fn search_routed_inner(
         &self,
@@ -2085,10 +2086,6 @@ impl TraceEngine {
             &self.indexed,
             slice_ns,
         )
-    }
-
-    fn search_settings(&self) -> QuerySettings {
-        search_settings(&self.config)
     }
 
     /// Runs one search query to completion inside its own scope (the
@@ -2344,19 +2341,16 @@ fn catalog_settings(config: &TraceReadConfig) -> QuerySettings {
 /// beside [`search_settings`] and [`catalog_settings`], not a change to
 /// either.
 ///
-/// [`catalog_settings`]'s budget set, **plus `final = 1`**, **plus**
+/// [`catalog_settings`]'s budget set, **plus**
 /// `QuerySettings::clustered_reader` as the base when clustered.
 /// `catalog_settings` deliberately carries no clustered-reader block
 /// because the catalogs are `Replication::Global`; the fetch reads two
 /// `PerShard` tables, so it needs one.
 ///
-/// **`final = 1` is a setting, not SQL text**, and it is what makes a
-/// retried span single on a read taken before the next merge. It applies
-/// to the span table (collapsing a repeat of the
-/// `(bucket, trace_id, start_ns, span_id, kind)` key), to the resource
-/// table (collapsing a repeat of `(service, resource_id)` inside a day)
-/// and to the per-trace table. On the per-trace table it changes nothing
-/// the statements act on: `index_rows` is read only as `!= 0`, and
+/// **No `final`** (issue #601 part 4a). A retried span stored twice comes
+/// back twice in the span array and the server's rebuild keeps one per
+/// `(span_id, kind)`; the resource read groups by `resource_id` with `any`;
+/// and on the per-trace table `index_rows` is read only as `!= 0` and
 /// `min`/`max` are idempotent under aggregation, so they return the same
 /// value whether the trace's day rows have been collapsed or not.
 ///
@@ -2376,15 +2370,13 @@ fn fetch_settings(config: &TraceReadConfig) -> QuerySettings {
     } else {
         QuerySettings::new()
     };
-    with_final(
-        base.answer_pins(config.distributed, config.skip_unavailable_shards)
-            .set("max_rows_to_read", config.scan_budget_rows)
-            .set("max_bytes_to_read", TRACE_READ_BYTES_BUDGET)
-            .set("read_overflow_mode", "throw")
-            .set("max_query_size", crate::querytext::MAX_QUERY_TEXT_BYTES)
-            .set("max_memory_usage", config.read_max_memory_bytes)
-            .set("max_bytes_before_external_group_by", 0u64),
-    )
+    base.answer_pins(config.distributed, config.skip_unavailable_shards)
+        .set("max_rows_to_read", config.scan_budget_rows)
+        .set("max_bytes_to_read", TRACE_READ_BYTES_BUDGET)
+        .set("read_overflow_mode", "throw")
+        .set("max_query_size", crate::querytext::MAX_QUERY_TEXT_BYTES)
+        .set("max_memory_usage", config.read_max_memory_bytes)
+        .set("max_bytes_before_external_group_by", 0u64)
 }
 
 /// `final = 1`, with each partition merged on its own (issue #594 part 1):
@@ -2530,11 +2522,20 @@ fn metrics_settings(config: &TraceReadConfig) -> QuerySettings {
 }
 
 /// The settings the metrics statement runs under (issue #594 part 5):
-/// [`metrics_settings`] with `final = 1` and no set limit. The statement
-/// builds the sets of the seven trace-level and nested-set fields, bounded
-/// by the read memory ceiling and the scan budget, not by a set limit.
-fn statement_settings(config: &TraceReadConfig, _keeps_final: bool) -> QuerySettings {
-    with_final(metrics_settings(config))
+/// [`metrics_settings`] with no set limit, and with `final = 1` when the
+/// statement keeps it (issue #601 part 4a: it reads the nested-set
+/// numbering; every other statement keeps one row per span identity
+/// itself). The statement builds the sets of the seven trace-level and
+/// nested-set fields, bounded by the read memory ceiling and the scan
+/// budget, not by a set limit.
+fn statement_settings(config: &TraceReadConfig, keeps_final: bool) -> QuerySettings {
+    let settings = metrics_settings(config);
+    let settings = if keeps_final {
+        with_final(settings)
+    } else {
+        settings
+    };
+    settings
         .set("max_rows_in_set", 0u64)
         .set("max_bytes_in_set", 0u64)
 }
@@ -3453,8 +3454,8 @@ mod tests {
             "a replica preference closes none of the visibility states"
         );
 
-        // Unclustered: the 17 answer pins, then the same budgets and
-        // `final`, with no clustered-reader block at all.
+        // Unclustered: the 17 answer pins, then the same budgets, with no
+        // clustered-reader block at all and no `final`.
         let local: Vec<String> = fetch_settings(&cfg())
             .entries()
             .map(|(k, _)| k.to_string())
@@ -3466,8 +3467,6 @@ mod tests {
             "max_query_size",
             "max_memory_usage",
             "max_bytes_before_external_group_by",
-            "final",
-            "do_not_merge_across_partitions_select_final",
         ]);
         assert_eq!(local, want_local);
     }

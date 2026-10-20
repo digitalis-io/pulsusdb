@@ -5,7 +5,8 @@ Reads OUT/paired.tsv (http_bench.py paired) and OUT/fetch.tsv
 (fetch_compare.py, the 20-span trace's two lines and then the largest trace's),
 prints one row per §6.3 shape and then each state's count, and writes the same
 as Markdown to OUT/summary.md. Exits 0 only for 13 `below`, 1 `exempt`,
-1 `no counterpart` and nothing else.
+1 `no counterpart` and nothing else. A compared or exempt shape either side
+answers with nothing (`items` 0), or g01 with no edge, is `not like for like`.
 
 Usage: bench_verdict.py OUT  |  bench_verdict.py --self-test
 """
@@ -29,7 +30,8 @@ SHAPES = [
     ('c08_compare', 'compared'),
     ('g01_service_graph', 'no counterpart'),
 ]
-STATES = ['below', 'not below', 'exempt', 'no counterpart', 'refused', 'reference failed']
+STATES = ['below', 'not below', 'exempt', 'no counterpart', 'refused', 'reference failed',
+          'not like for like']
 PASS = {'below': 13, 'exempt': 1, 'no counterpart': 1}
 
 
@@ -38,6 +40,7 @@ def verdict(paired_text, fetch_text):
     reference_bytes, state). A shape missing from an input is refused on that
     side's account."""
     halves = {}            # shape -> {side: (status, ms, bytes)}, side 'p' or 'r'
+    answered = {}          # shape -> {side: items}, from paired's p_items and r_items
     for line in paired_text.splitlines():
         c = line.split('\t')
         if len(c) < 6 or not c[0]: continue
@@ -45,6 +48,9 @@ def verdict(paired_text, fetch_text):
         h['p'] = (c[1], c[4], c[2])
         if len(c) >= 11 and c[6] != '-':
             h['r'] = (c[6], c[9], c[7])
+        for side, i in (('p', 11), ('r', 12)):
+            if len(c) > i and c[i].isdigit():
+                answered.setdefault(c[0], {})[side] = int(c[i])
     fetch = [dict(kv.split('=', 1) for kv in line.split('\t')[1:] if '=' in kv) | {'side': line.split('\t')[0]}
              for line in fetch_text.splitlines() if line.strip()]
     for shape, at in (('fetch_trace_20', 0), ('fetch_trace_largest', 2)):
@@ -56,12 +62,15 @@ def verdict(paired_text, fetch_text):
     for shape, kind in SHAPES:
         h = halves.get(shape, {})
         p, r = h.get('p'), h.get('r')
+        n = answered.get(shape, {})
         if p is None or p[0] != '200':
             state = 'refused'
         elif kind == 'no counterpart':
-            state = 'no counterpart'
+            state = 'not like for like' if n.get('p') == 0 else 'no counterpart'
         elif r is None or r[0] != '200':
             state = 'reference failed'
+        elif 0 in (n.get('p'), n.get('r')):
+            state = 'not like for like'
         elif kind == 'exempt':
             state = 'exempt'
         else:
@@ -76,7 +85,8 @@ def passes(counts):
 
 
 COUNT_LINES = [('compared below', 'below'), ('exempt', 'exempt'), ('no counterpart', 'no counterpart'),
-               ('refused', 'refused'), ('not below', 'not below'), ('reference failed', 'reference failed')]
+               ('refused', 'refused'), ('not below', 'not below'), ('reference failed', 'reference failed'),
+               ('not like for like', 'not like for like')]
 
 
 def write(out, rows, counts):

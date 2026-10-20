@@ -8,15 +8,19 @@ Usage: http_bench.py reference|pulsus BASE_URL START_S END_S REPS [CH_URL]
        http_bench.py paired PULSUS_URL REFERENCE_URL START_S END_S REPS [CH_URL]
        http_bench.py --self-test
 Prints TSV: name status bytes ms_min ms_median ms_max [statements rows_read ch_bytes_sent];
-paired: name p_status p_bytes p_min p_med p_max r_status r_bytes r_min r_med r_max [p_statements p_rows_read p_ch_bytes_sent]
+paired: name p_status p_bytes p_min p_med p_max r_status r_bytes r_min r_med r_max p_items r_items [p_statements p_rows_read p_ch_bytes_sent]
 Each shape runs once unmeasured, then REPS times; paired runs one unmeasured call
 per store, then REPS on each, the two stores alternating which goes first. A
 status is the first non-200 of any call to the shape, the unmeasured one
-included, else 200. b01/b02 fetch the traces BENCH_T20 and BENCH_TBIG when set."""
+included, else 200. b01/b02 fetch the traces BENCH_T20 and BENCH_TBIG when set;
+t02 reads the span key BENCH_T02_KEY (default http.route). paired counts the
+answer in each side's first body (`items`), and with BENCH_BODIES=DIR set
+writes that body to DIR/<shape>.pulsus and DIR/<shape>.reference."""
 import os, sys, time, json, urllib.request, urllib.parse, urllib.error, statistics
 
 T20 = os.environ.get('BENCH_T20') or '50fb0cd99260ac2a15d0a6f208126742'
 TBIG = os.environ.get('BENCH_TBIG') or '9e0ae95131b5bedbeea2c9eb5234f1ec'
+T02_KEY = os.environ.get('BENCH_T02_KEY') or 'http.route'
 
 
 def queries(native, S, E):
@@ -46,7 +50,7 @@ def queries(native, S, E):
      ('s14_trace_level', *s('{ rootServiceName = "loadgen" && traceDuration > 2s }')),
      ('s15_unscoped_and_resource', *s('{ .app.cache.hit = true && resource.k8s.pod.name = "cart-7d9f8b-00002" }')),
      ('t01_tag_names_span', TAGS, dict(w, scope='span')),
-     ('t02_tag_values_route', TAGV('span.http.route'), dict(w)),
+     ('t02_tag_values_route', TAGV(f'span.{T02_KEY}'), dict(w)),
      ('t03_tag_values_filtered', TAGV('resource.k8s.pod.name'), dict(w, q='{ resource.service.name = "cart" }')),
      ('m01_rate_by_service', QR, dict(w, q='{ } | rate() by (resource.service.name)', step='60s')),
      ('m02_quantiles_by_route', QR, dict(w, q='{ resource.service.name = "frontend" && kind = server } | quantile_over_time(duration, .5, .95, .99) by (span.http.route)', step='60s')),
@@ -75,15 +79,43 @@ def call(base, path, params):
     return (time.perf_counter() - t0) * 1000, status, body
 
 
+def items(name, body):
+    """the answer's own unit in `body`, by shape: traces for a search, tag
+    names across the scopes, tag values, series, edges, and the spans of a
+    JSON fetch; a body that is not JSON counts 0"""
+    try:
+        d = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return 0
+    if not isinstance(d, dict):
+        return 0
+    if name.startswith('s'):
+        return len(d.get('traces') or [])
+    if name.startswith('t01'):
+        return sum(len(sc.get('tags') or []) for sc in d.get('scopes') or [])
+    if name.startswith(('t02', 't03')):
+        return len(d.get('tagValues') or [])
+    if name.startswith(('m', 'c08')):
+        return len(d.get('series') or [])
+    if name.startswith('g01'):
+        return len(d.get('edges') or [])
+    if name.startswith(('b01', 'b02')):
+        return sum(len(ss.get('spans') or []) for rs in d.get('resourceSpans') or []
+                   for ss in rs.get('scopeSpans') or [])
+    return 0
+
+
 class Side:
-    """one store's calls to one shape: the measured times, the last body's
-    size, and the first non-200 status with its body"""
+    """one store's calls to one shape: the measured times, the first body,
+    the last body's size, and the first non-200 status with its body"""
     def __init__(self, base, path, params):
         self.base, self.path, self.params = base, path, params
         self.times, self.status, self.size, self.bad_body = [], 200, None, None
+        self.first = None
     def run(self, measured):
         ms, status, body = call(self.base, self.path, self.params)
         if measured: self.times.append(ms)
+        if self.first is None: self.first = body
         self.size = len(body)
         if status != 200 and self.status == 200:
             self.status, self.bad_body = status, body
@@ -141,6 +173,14 @@ def paired(p_base, r_base, shapes, reps, ch=None):
             for x in (first, second):
                 if x: x.run(True)
         line = [name] + p.cells() + (r.cells() if r else ['-'] * 5)
+        line += [str(items(name, p.first)), str(items(name, r.first)) if r else '-']
+        bodies = os.environ.get('BENCH_BODIES')
+        if bodies:
+            os.makedirs(bodies, exist_ok=True)
+            for who, x in (('pulsus', p), ('reference', r)):
+                if x:
+                    with open(os.path.join(bodies, f'{name}.{who}'), 'wb') as f:
+                        f.write(x.first)
         if ch: line += ch_cells(ch, t_start, reps + 1)
         bad = '; '.join(f'{who}: {why(x)}' for who, x in (('PulsusDB', p), ('the reference', r)) if x and x.status != 200)
         if bad: line.append(bad)
