@@ -109,19 +109,28 @@ def main(pulsus, ref, tid, reps):
 
 def stub(answer):
     """A server on 127.0.0.1, on a port the OS picks; answer(n) gives the status
-    and body of its n-th call (from 1)."""
+    and body of its n-th call (from 1), and optionally a third item: the
+    Content-Length to declare, so a longer one ends the read short."""
     import http.server, threading
     seen = [0]
     class H(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
             seen[0] += 1
-            status, body = answer(seen[0])
-            self.send_response(status); self.send_header('Content-Length', str(len(body))); self.end_headers()
+            status, body, *declared = answer(seen[0])
+            self.send_response(status)
+            self.send_header('Content-Length', str(declared[0] if declared else len(body))); self.end_headers()
             self.wfile.write(body)
         def log_message(self, *a): pass
     srv = http.server.ThreadingHTTPServer(('127.0.0.1', 0), H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return f'http://127.0.0.1:{srv.server_address[1]}', srv
+
+
+def closed_port():
+    """a URL on 127.0.0.1 where nothing listens: a port the OS gave out, closed again"""
+    import socket
+    s = socket.socket(); s.bind(('127.0.0.1', 0)); port = s.getsockname()[1]; s.close()
+    return f'http://127.0.0.1:{port}', None
 
 
 def traces_data(spans):
@@ -161,6 +170,21 @@ def self_test():
         ('PulsusDB 500 on its third call', lambda n: (500, b'') if n == 3 else (200, one), good,
          'failed side: PulsusDB',
          ['PulsusDB\ttrace=aaaaaaaa\tfailed', 'the reference\ttrace=aaaaaaaa\tanswered']),
+        # a call that ends without a status, and a body that does not decode,
+        # are that side's failure as a status is (r9fix2)
+        ('nothing listening on the reference port', good, 'closed',
+         'failed side: the reference',
+         ['PulsusDB\ttrace=aaaaaaaa\tanswered', 'the reference\ttrace=aaaaaaaa\tfailed']),
+        ('nothing listening on the PulsusDB port', 'closed', good,
+         'failed side: PulsusDB',
+         ['PulsusDB\ttrace=aaaaaaaa\tfailed', 'the reference\ttrace=aaaaaaaa\tnot called']),
+        ('the reference body cut short of its Content-Length on its third call', good,
+         lambda n: (200, one, len(one) + 100) if n == 3 else (200, one),
+         'failed side: the reference',
+         ['PulsusDB\ttrace=aaaaaaaa\tanswered', 'the reference\ttrace=aaaaaaaa\tfailed']),
+        ('a PulsusDB body that does not decode', lambda n: (200, b'\xff'), good,
+         'failed side: PulsusDB',
+         ['PulsusDB\ttrace=aaaaaaaa\tfailed', 'the reference\ttrace=aaaaaaaa\tnot called']),
     ]
     fails = 0
     for name, pa, ra, want, words in cases:
@@ -175,10 +199,11 @@ def self_test():
         print(f'{"ok  " if ok else "FAIL"} {name}: exit {run.returncode}, expected {want}; {run.stderr.strip()[-200:]}')
         fails += not ok
     for name, pa, ra, marker, want_lines in slots:
-        (p, ps), (r, rs) = stub(pa), stub(ra)
+        (p, ps), (r, rs) = (closed_port() if a == 'closed' else stub(a) for a in (pa, ra))
         run = subprocess.run([sys.executable, __file__, p, r, 'aaaaaaaabbbbbbbbccccccccdddddddd', '3'],
                              capture_output=True, text=True, timeout=60)
-        ps.shutdown(); rs.shutdown()
+        for srv in (ps, rs):
+            if srv: srv.shutdown()
         ok = (run.returncode == 1 and marker in run.stderr.splitlines()
               and run.stdout.splitlines() == want_lines)
         print(f'{"ok  " if ok else "FAIL"} {name}: exit {run.returncode}; stdout {run.stdout.splitlines()}; '
