@@ -255,8 +255,12 @@ const CONTROL: &str = "with_binding_control.txt";
 /// `traces_spans_graph` goldens, one statement each.** Their `WITH` items
 /// (`mall` in the clustered one, `ms`, `first`, `last`, `A`, `B`, `h1`,
 /// `t0`) are scalars and aliases.
-const SQL_FILES: usize = 98;
-const SQL_STATEMENTS: usize = 216;
+///
+/// **Issue #602 part 3a moves them 98 -> 43 and 216 -> 66: the 55
+/// `traces_metrics`, `traces_metrics_base` and `traces_graph` goldens and
+/// their 150 statements deleted with the previous metrics and graph SQL.**
+const SQL_FILES: usize = 43;
+const SQL_STATEMENTS: usize = 66;
 const PROMQL_ENTRIES: usize = 30;
 const PROMQL_STATEMENTS: usize = 55;
 const CONTROL_STATEMENTS: usize = 1;
