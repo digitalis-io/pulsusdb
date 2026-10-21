@@ -1580,6 +1580,90 @@ mod tests {
         }
     }
 
+    /// The refused text of `q`, which must be a `TypeMismatch`.
+    fn refusal(q: &str) -> String {
+        match routed(q, &PARAMS) {
+            Err(PlanError::TypeMismatch(text)) => text,
+            other => panic!("{q}: not a TypeMismatch refusal: {other:?}"),
+        }
+    }
+
+    /// Issue #602 part 3a (D2): a filter or key the statement compiler
+    /// refuses is refused in its words; the previous planner's filter
+    /// compiler answers nothing.
+    #[test]
+    fn a_refusal_is_the_statement_compilers() {
+        for (q, want) in [
+            (
+                r#"{ resource.service.name > "x" } | avg_over_time(.n) by (name)"#,
+                "resource.service.name supports only = != =~ !~",
+            ),
+            (
+                "{ name != nil } | histogram_over_time(span:childCount)",
+                "existence checks are only supported on attributes",
+            ),
+            (
+                "{ resource.service.name > -1 } | rate()",
+                "resource.service.name supports only = != =~ !~",
+            ),
+            (
+                "{ !instrumentation:name } | rate()",
+                "expression (!instrumentation:name) expected a boolean",
+            ),
+        ] {
+            assert_eq!(refusal(q), want, "{q}");
+        }
+    }
+
+    /// Issue #602 part 3a (§2.1): an intrinsic target other than `duration`
+    /// and `span:childCount` is refused by name.
+    #[test]
+    fn an_intrinsic_target_is_refused_by_name() {
+        for (q, want) in [
+            (
+                "{} | sum_over_time(nestedSetLeft)",
+                "sum_over_time() over nestedSetLeft is not supported: its target must be \
+                 duration, span:childCount or an attribute",
+            ),
+            (
+                "{} | avg_over_time(trace:duration)",
+                "avg_over_time() over traceDuration is not supported: its target must be \
+                 duration, span:childCount or an attribute",
+            ),
+        ] {
+            assert_eq!(refusal(q), want, "{q}");
+        }
+    }
+
+    /// Issue #602 part 3a: `compare()` beside another stage is the
+    /// validator's refusal.
+    #[test]
+    fn compare_with_another_stage_is_the_validators_refusal() {
+        let q = "{ } | by(name) | compare({ status = error })";
+        assert_eq!(
+            refusal(q),
+            "compare() cannot be combined with any other pipeline stage",
+            "{q}"
+        );
+    }
+
+    /// An invalid regular expression on either side is refused when the
+    /// request is planned, not when it runs.
+    #[test]
+    fn an_invalid_regex_is_refused_at_plan_time() {
+        for q in [
+            r#"{ name =~ "(" } | rate()"#,
+            r#"{ .a =~ "(" } | compare({ .b = 1 })"#,
+            r#"{ } | compare({ .b =~ "(" })"#,
+        ] {
+            assert_eq!(
+                refusal(q),
+                r#"invalid regex "(": not a valid RE2 regular expression"#,
+                "{q}"
+            );
+        }
+    }
+
     /// Part 2: any key, two keys, a keyed quantile, an attribute target
     /// and `span:childCount` as a key or a target are served by the
     /// statement; the child counts read the `ch` join.

@@ -12951,6 +12951,113 @@ async fn an_empty_window() {
     assert_eq!(got, want);
 }
 
+/// The fifteen services of [`a_duration_in_seconds_is_rounded_once`].
+const ROUNDING_SERVICES: [&str; 15] = [
+    "u0", "u1", "u2", "u3", "u4", "u5", "u6", "u7", "u8", "u9", "u10", "u11", "u12", "u13", "u14",
+];
+
+/// `(duration ns, the reference's seconds value)`: six widths where one
+/// rounding and two differ, six past 2^53 ns, where the cast to a double
+/// is itself lossy, and three exact controls.
+const ROUNDING_WIDTHS: [(i64, f64); 15] = [
+    (1_118_000_000, 1.118),
+    (1_122_000_000, 1.122),
+    (1_128_000_000, 1.128),
+    (1_235_000_000, 1.235),
+    (31_952_000_000, 31.952),
+    (1_000_064_438, 1.000064438),
+    (18_014_398_509_482_025, 18_014_398.509_482_022),
+    (18_014_398_509_482_035, 18_014_398.509_482_037),
+    (18_014_398_509_482_017, 18_014_398.509_482_015),
+    (1_088_608_058_291_172_412, 1_088_608_058.291_172_3),
+    (10_000_000_000_000_005, 10_000_000.000_000_004),
+    (10_000_000_000_000_015, 10_000_000.000_000_017),
+    (500_000_000, 0.5),
+    (1_500_000_000, 1.5),
+    (2_000_000_000, 2.0),
+];
+
+/// Issue #602 part 3a: a duration read as seconds is converted once, from
+/// the integer nanoseconds, so each width's `max_over_time(duration)` is
+/// bit-identical to the reference's value. **guard**.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_duration_in_seconds_is_rounded_once() {
+    skip_unless_live!();
+    let spans = |l: i64| -> Vec<MetricSpan> {
+        ROUNDING_WIDTHS
+            .iter()
+            .zip(ROUNDING_SERVICES)
+            .enumerate()
+            .map(|(i, ((ns, _), service))| (service, i as u8 + 1, (l - 30 + i as i64) * S_NS, *ns))
+            .collect()
+    };
+    let (db, _client, l) = seed_metrics("rounding", 0x11, spans).await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let mut got = Vec::new();
+    for (service, (ns, _)) in ROUNDING_SERVICES.iter().zip(ROUNDING_WIDTHS) {
+        let q = format!(r#"{{ resource.service.name = "{service}" }} | max_over_time(duration)"#);
+        let out = instant_answer(&engine, &q, l - 60, l).await;
+        let values: Vec<f64> = out
+            .as_ref()
+            .unwrap_or_else(|e| panic!("{q}: the metrics read failed: {e}"))
+            .series
+            .iter()
+            .flat_map(|s| s.samples.iter().map(|(_, v)| *v))
+            .collect();
+        got.push((ns, values));
+    }
+    drop_db(&db).await;
+    for ((ns, values), (_, want)) in got.into_iter().zip(ROUNDING_WIDTHS) {
+        let [value] = values.as_slice() else {
+            panic!("{ns} ns: one sample, got {values:?}");
+        };
+        assert_eq!(
+            value.to_bits(),
+            want.to_bits(),
+            "{ns} ns: got {value}, want {want}"
+        );
+    }
+}
+
+/// Issue #602 part 3a: a span starting exactly on a grid point belongs to
+/// that point, a span a millisecond later to the next. **guard**.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_span_on_a_grid_point_belongs_to_that_point() {
+    skip_unless_live!();
+    let spans = |l: i64| -> Vec<MetricSpan> {
+        let at = (l - 10) * S_NS;
+        vec![
+            ("grid", 1, at, S_NS),
+            ("grid", 2, at, S_NS),
+            ("grid", 3, at + MS_NS, S_NS),
+            ("grid", 4, at + MS_NS, S_NS),
+            ("grid", 5, at + MS_NS, S_NS),
+        ]
+    };
+    let (db, _client, l) = seed_metrics("grid_point", 0x11, spans).await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let q = "{} | count_over_time()";
+    let routed = routed_plan(&engine, q, l - 20, l, 500);
+    let out = engine.metrics_range_routed(&routed).await;
+    drop_db(&db).await;
+    let out = out.unwrap_or_else(|e| panic!("{q}: the metrics read failed: {e}"));
+    assert_eq!(out.series.len(), 1, "{q}: one series");
+    let points: Vec<(i64, f64)> = out.series[0]
+        .samples
+        .iter()
+        .map(|(t, v)| (t - l * 1000, *v))
+        .collect();
+    assert_eq!(points.len(), 41, "{q}: 41 points: {points:?}");
+    let at = |ms: i64| points.iter().find(|(t, _)| *t == ms).map(|(_, v)| *v);
+    assert_eq!(at(-10_000), Some(2.0), "{q}: the grid point: {points:?}");
+    assert_eq!(at(-9_500), Some(3.0), "{q}: the next point: {points:?}");
+    assert_eq!(
+        points.iter().map(|(_, v)| v).sum::<f64>(),
+        5.0,
+        "{q}: the total: {points:?}"
+    );
+}
+
 /// The trailing comparison runs in the statement, and an empty bucket's
 /// `0` passes or fails it as any other value.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -14554,7 +14661,6 @@ async fn child_counts_are_direct_children() {
         &METRICS_TABLES,
     )
     .map(|_| ());
-    let today = pulsus_read::plan_trace_metrics(&query, &params, &engine.metrics_ctx()).map(|_| ());
     drop_db(&db).await;
     assert_eq!(
         by,
@@ -14577,13 +14683,14 @@ async fn child_counts_are_direct_children() {
             (&[("name", s("child2"))], 1.0),
         ])
     );
-    assert!(
-        today.is_err(),
-        "today's planner refuses a nested-set target"
-    );
     assert_eq!(
-        routed, today,
-        "a nested-set target keeps today's answer (D8)"
+        routed,
+        Err(pulsus_read::TracePlanError::TypeMismatch(
+            "sum_over_time() over nestedSetLeft is not supported: its target must be duration, \
+             span:childCount or an attribute"
+                .to_string()
+        )),
+        "a nested-set target is refused by name (D8)"
     );
 }
 

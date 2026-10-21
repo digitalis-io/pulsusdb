@@ -5,43 +5,35 @@
 //! ways: a search, a trace fetch, a tag-value read, a metrics range query
 //! and a service-graph request. What the case asserts:
 //!
-//! * every `timestamp_ns` bound anywhere in the five reads uses the
-//!   half-open operators, `>=` on the low side and `<` on the high side —
-//!   against the **shipped** column name at this point; task 8 re-asserts
-//!   it against `start_ns`;
-//! * the two reads whose bound IS the request's window — the search's
-//!   phase-2 hydration and both halves of the service graph — carry the
-//!   request's own literals, `timestamp_ns >= <s> AND timestamp_ns < <e>`;
-//! * the recency candidate bound is `ts_max >= <s> AND ts_min <= <e - 1>`,
-//!   derived from the same convention rather than written out;
-//! * the trace fetch and the winners' root hydration carry **no**
-//!   `timestamp_ns` bound at all — both are `trace_id` point reads
-//!   (`traces/sql.rs`, and the per-trace read of `spans/search.rs`);
-//! * the tag-value read carries **no** `timestamp_ns` bound either, and
-//!   its day clause is the day span the request touches. That is deferred
-//!   work owned by issue #598, not an oversight: the read is day-granular
-//!   today and #598 gives it a row bound against the statement its cost is
-//!   measured on;
-//! * the graph and metrics halves hold **before** the change and must hold
-//!   after — the regression half. Both already use these operators
-//!   (`graph_sql.rs`, `metrics_sql.rs`), so the case fails if either is
-//!   "tidied" into the other convention.
+//! * every `_ns` column bound anywhere in the search, metrics and graph
+//!   reads uses the half-open operators, `>=` on the low side and `<` on
+//!   the high side;
+//! * the reads whose bound IS the request's window — the search statement,
+//!   the tag-value read and the service graph's span read — carry the
+//!   request's own literals on `start_ns`;
+//! * the trace fetch carries **no** time bound at all: it is a `trace_id`
+//!   point read (`traces/spans/fetch.rs`);
+//! * the tag-value read names no `timestamp_ns`.
+//!
+//! The metrics read is the routed range statement of `{} | rate()`, and
+//! the graph read the statement of `spans/graph.rs` on a single node
+//! (issue #602 part 3a: the previous metrics and graph SQL went).
 //!
 //! **Two windows are deliberately outside this case.** The per-step range
 //! selector inside a metrics query keeps the right-closed instants the
-//! query language defines for it, rendered `[aS − step + 1, aE + 1)`
-//! (`metrics_plan.rs`) — so the metrics statement's bound is checked for
-//! its operators and NOT for the request's literals, which are not what it
-//! selects. And `compare()`'s `start`/`end` arguments keep the reference's
-//! `(start, end]`. Neither is a request window. The metrics query compiled
-//! here is a plain `rate()`, so no selection window is rendered at all and
-//! the second exclusion is structural rather than a carve-out.
+//! query language defines for it (`metrics_plan.rs`) — so the metrics
+//! statement's bound is checked for its operators and NOT for the
+//! request's literals, which are not what it selects. And `compare()`'s
+//! `start`/`end` arguments keep the reference's `(start, end]`. Neither is
+//! a request window. The metrics query compiled here is a plain `rate()`,
+//! so no selection window is rendered at all and the second exclusion is
+//! structural rather than a carve-out.
 
-use pulsus_read::traces::metrics_plan::{MetricsCtx, MetricsParams, plan_trace_metrics};
+use pulsus_read::traces::metrics_plan::{MetricsCtx, MetricsParams};
 use pulsus_read::traces::spans::search::plan_statement_sliced;
 use pulsus_read::traces::spans::tags::{TagNarrowing, name_values_sql, narrowing_from_query};
-use pulsus_read::traces::{GraphWindow, SERVICE_GRAPH_MAX_EDGES, service_graph_sql};
-use pulsus_read::{SearchParams, StatementTables, plan_search_request};
+use pulsus_read::traces::{GraphWindow, SERVICE_GRAPH_MAX_EDGES, spans_graph_sql};
+use pulsus_read::{SearchParams, StatementTables, plan_search_request, plan_trace_metrics_routed};
 use pulsus_read::{SpanFilterCtx, TAG_VALUES_MAX};
 
 /// The one request window every read below is compiled over:
@@ -56,13 +48,18 @@ const END_NS: i64 = 1_700_010_800_000_000_000;
 /// request's own.
 const STEP_MS: i64 = 400_000;
 
-const SPANS_TABLE: &str = "trace_spans";
-const ATTRS_TABLE: &str = "trace_attrs_idx";
+const TABLES: StatementTables<'static> = StatementTables {
+    spans: "spans",
+    error_spans: "error_spans",
+    resources: "resources",
+    traces: "traces",
+    indexed: &[],
+};
 
 fn filter_ctx() -> SpanFilterCtx<'static> {
     SpanFilterCtx {
-        spans_table: SPANS_TABLE,
-        attrs_table: ATTRS_TABLE,
+        spans_table: "trace_spans",
+        attrs_table: "trace_attrs_idx",
     }
 }
 
@@ -77,13 +74,7 @@ fn search_statements() -> Vec<(&'static str, String)> {
             limit: 20,
             spss: 3,
         },
-        &StatementTables {
-            spans: "spans",
-            error_spans: "error_spans",
-            resources: "resources",
-            traces: "traces",
-            indexed: &[],
-        },
+        &TABLES,
         64,
     )
     .expect("the empty selector plans");
@@ -92,9 +83,10 @@ fn search_statements() -> Vec<(&'static str, String)> {
     vec![("search statement", statement.sql().to_string())]
 }
 
+/// The routed range statement of `{} | rate()`.
 fn metrics_statement() -> String {
     let query = pulsus_traceql::parse("{} | rate()").expect("the metrics query parses");
-    let plan = plan_trace_metrics(
+    let routed = plan_trace_metrics_routed(
         &query,
         &MetricsParams {
             start_ns: START_NS,
@@ -110,18 +102,24 @@ fn metrics_statement() -> String {
             distributed: false,
             skip_unavailable_shards: false,
         },
+        &TABLES,
     )
     .expect("the metrics query plans");
-    plan.range_sql().to_string()
+    routed
+        .statement()
+        .expect("a statement")
+        .range_sql()
+        .to_string()
 }
 
+/// The service-graph statement on a single node.
 fn graph_statement() -> String {
-    service_graph_sql(
+    spans_graph_sql(
         GraphWindow {
             start_ns: START_NS,
             end_ns: END_NS,
         },
-        "trace_edges",
+        None,
         SERVICE_GRAPH_MAX_EDGES,
     )
 }
@@ -156,12 +154,12 @@ fn tag_values_statement() -> String {
     )
 }
 
-/// Every `timestamp_ns` comparison in `sql`, as the operator that follows
-/// the column name — so a bound written with an unexpected operator is
-/// reported rather than merely missing from a `contains` check.
-fn timestamp_operators(sql: &str) -> Vec<String> {
+/// Every comparison of an `_ns` column in `sql`, as the operator that
+/// follows the column name — so a bound written with an unexpected
+/// operator is reported rather than merely missing from a `contains` check.
+fn bound_operators(sql: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let needle = "timestamp_ns ";
+    let needle = "_ns ";
     let mut rest = sql;
     while let Some(at) = rest.find(needle) {
         let after = &rest[at + needle.len()..];
@@ -180,32 +178,36 @@ fn timestamp_operators(sql: &str) -> Vec<String> {
 /// `T-B5`: the five reads, one window, one rule.
 #[test]
 fn every_request_window_renders_the_one_half_open_bound() {
-    let row_bound = format!("timestamp_ns >= {START_NS} AND timestamp_ns < {END_NS}");
     let mut wrong: Vec<String> = Vec::new();
 
     let search = search_statements();
     let metrics = ("metrics range query", metrics_statement());
     let graph = ("service graph", graph_statement());
 
-    // -- every read: the operators, wherever a `timestamp_ns` bound
-    //    appears. The metrics statement is here and not below because its
-    //    literals are the range selector's instants, which the query
-    //    language owns (module doc).
+    // -- every read: the operators, wherever an `_ns` bound appears. The
+    //    metrics statement is here and not below because its literals are
+    //    the range selector's instants, which the query language owns
+    //    (module doc).
     for (label, sql) in search.iter().chain([&metrics, &graph]) {
-        let unexpected: Vec<String> = timestamp_operators(sql)
+        let unexpected: Vec<String> = bound_operators(sql)
             .into_iter()
             .filter(|op| op != ">=" && op != "<")
             .collect();
         if !unexpected.is_empty() {
             wrong.push(format!(
-                "{label}: every timestamp_ns bound must be >= or <, found {unexpected:?}:\n{sql}"
+                "{label}: every _ns bound must be >= or <, found {unexpected:?}:\n{sql}"
             ));
         }
     }
 
-    // -- the two reads whose bound IS the request's window: its literals.
-    if !graph.1.contains(&row_bound) {
-        wrong.push(format!("{}: expected `{row_bound}`:\n{}", graph.0, graph.1));
+    // -- the service graph's span read: the request's own literals.
+    for bound in [
+        format!("start_ns >= {START_NS} "),
+        format!("start_ns < {END_NS}"),
+    ] {
+        if !graph.1.contains(&bound) {
+            wrong.push(format!("{}: expected `{bound}`:\n{}", graph.0, graph.1));
+        }
     }
     // The search statement bounds `spans.start_ns`, by the same rule.
     let span_bound = format!("start_ns >= {START_NS} AND start_ns < {END_NS}");
@@ -496,6 +498,25 @@ fn t_c2_the_attribute_path_carries_both_escapes() {
 /// the day clause carries the explicit `'UTC'` that makes it
 /// byte-identical to `spans`' own `PARTITION BY` — without it the
 /// expression is a different one and the partition prune is lost.
+/// A quote in an attribute value is escaped in every literal the
+/// predicate renders, so the value cannot end the string (moved from the
+/// previous filter compiler's tests, issue #602 part 3a).
+#[test]
+fn injection_attempt_in_an_attr_value_is_neutralized() {
+    let sql = rendered(r#"{ span.k = "x'; DROP TABLE spans; --" }"#);
+    let escaped = r"'x\'; DROP TABLE spans; --'";
+    assert_eq!(
+        sql.matches(escaped).count(),
+        2,
+        "two escaped literals: {sql}"
+    );
+    assert_eq!(
+        sql.matches("DROP TABLE").count(),
+        2,
+        "no literal other than the two escaped ones: {sql}"
+    );
+}
+
 #[test]
 fn t_c3_the_span_tables_three_window_clauses() {
     let w = t_b1_window();
