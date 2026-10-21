@@ -107,12 +107,17 @@ cat "$OUT/run.txt"
 echo "== every shape, paired"
 BENCH_T20=$T20 BENCH_TBIG=$TBIG BENCH_T02_KEY=$T02_KEY BENCH_BODIES="$OUT/bodies" python3 "$HERE/http_bench.py" paired "$PULSUS" "$REF" "$START" "$END" 5 "$CH" > "$OUT/paired.tsv"
 echo "== trace fetch, interleaved"
-# a refused fetch exits 1 naming the side; its two lines then carry no timing,
-# which the verdict counts as refused, so the run goes on to the verdict
+# a fetch that fails on one side exits 1 and still writes the trace's two
+# lines, the failed side's ending `failed`, so the verdict charges that side
+# alone and the run goes on to the verdict; one that exits writing no line
+# (not like for like, or a crash) charges both sides
 : > "$OUT/fetch.tsv"
 for tid in "$T20" "$TBIG"; do
-  python3 "$HERE/fetch_compare.py" "$PULSUS" "$REF" "$tid" 21 >> "$OUT/fetch.tsv" ||
-    printf 'PulsusDB\ttrace=%s\tfailed\nthe reference\ttrace=%s\tfailed\n' "${tid:0:8}" "${tid:0:8}" >> "$OUT/fetch.tsv"
+  python3 "$HERE/fetch_compare.py" "$PULSUS" "$REF" "$tid" 21 > "$WORK/fetch-one.tsv" || true
+  if [ "$(grep -c . "$WORK/fetch-one.tsv")" != 2 ]; then
+    printf 'PulsusDB\ttrace=%s\tfailed\nthe reference\ttrace=%s\tfailed\n' "${tid:0:8}" "${tid:0:8}" > "$WORK/fetch-one.tsv"
+  fi
+  cat "$WORK/fetch-one.tsv" >> "$OUT/fetch.tsv"
 done
 
 echo "== verdict"

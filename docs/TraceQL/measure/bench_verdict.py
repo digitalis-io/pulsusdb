@@ -53,13 +53,16 @@ def verdict(paired_text, fetch_text):
         for side, i in (('p', 11), ('r', 12)):
             if len(c) > i and c[i].isdigit():
                 answered.setdefault(c[0], {})[side] = int(c[i])
-    fetch = [dict(kv.split('=', 1) for kv in line.split('\t')[1:] if '=' in kv) | {'side': line.split('\t')[0]}
+    fetch = [dict(kv.split('=', 1) for kv in line.split('\t')[1:] if '=' in kv)
+             | {'side': line.split('\t')[0], 'state': line.split('\t')[-1]}
              for line in fetch_text.splitlines() if line.strip()]
     for shape, at in (('fetch_trace_20', 0), ('fetch_trace_largest', 2)):
         h = halves.setdefault(shape, {})
         for side, i, who in (('p', at, 'PulsusDB'), ('r', at + 1, 'the reference')):
             if i < len(fetch) and fetch[i]['side'] == who and 'p50' in fetch[i]:
                 h[side] = ('200', fetch[i]['p50'], fetch[i].get('bytes', ''))
+            elif i < len(fetch) and fetch[i]['side'] == who and fetch[i]['state'] == 'answered':
+                h[side] = ('200', '-', '-')      # every call answered 200; the other side failed
     rows, counts = [], {s: 0 for s in STATES}
     for shape, kind in SHAPES:
         h = halves.get(shape, {})

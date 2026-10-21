@@ -4,9 +4,13 @@ repetitions, reported as a distribution: the reference's fetch time varies
 between sessions, so a single median is not enough. The two stores are
 interleaved, alternating which goes first, so neither gets the warm side of a
 session effect. Every call, the unmeasured first included, must answer 200 with
-a body, or the script exits 1 naming the side and the cause; and the first body
-of each side, read on the protobuf wire, must hold the same number of spans,
-more than 0, or it exits 1 naming `not like for like`.
+a body, or the script exits 1 naming the side and the cause. The side is also
+named on a fixed stderr line, `failed side: PulsusDB` or `failed side: the
+reference`, and stdout then carries the trace's two lines in their usual order:
+the failed side's ends `failed`, the other side's `answered` (every call it was
+given answered 200, untimed) or `not called`. The first body of each side, read
+on the protobuf wire, must hold the same number of spans, more than 0, or it
+exits 1 naming `not like for like`, with nothing on stdout.
 Usage: fetch_compare.py PULSUS_URL REFERENCE_URL TRACE_ID_HEX REPS  |  fetch_compare.py --self-test"""
 import sys, time, statistics, urllib.request, urllib.error
 
@@ -49,6 +53,12 @@ def span_count(body):
         return None
 
 
+class Failed(Exception):
+    """one call of `side` did not answer 200 with a body"""
+    def __init__(self, side, message):
+        super().__init__(message); self.side = side
+
+
 def timed(side, url, size, first=None):
     """wall time of one GET in ms; records the body length in size[side],
     and the body in first[side] when `first` is given"""
@@ -60,9 +70,9 @@ def timed(side, url, size, first=None):
         body = e.read(); status = e.code
     ms = (time.perf_counter() - t0) * 1000
     if status != 200:
-        sys.exit(f'{side}: status {status} from {url}: {body[:200]!r}')
+        raise Failed(side, f'{side}: status {status} from {url}: {body[:200]!r}')
     if not body:
-        sys.exit(f'{side}: empty body with status 200 from {url}')
+        raise Failed(side, f'{side}: empty body with status 200 from {url}')
     size[side] = len(body)
     if first is not None:
         first[side] = body
@@ -75,11 +85,19 @@ def main(pulsus, ref, tid, reps):
     size, first = {}, {}
     tp = lambda: timed('PulsusDB', p_url, size)
     tr = lambda: timed('the reference', r_url, size)
-    timed('PulsusDB', p_url, size, first); timed('the reference', r_url, size, first)   # unmeasured
     a, b = [], []
-    for i in range(reps):
-        if i % 2 == 0: a.append(tp()); b.append(tr())
-        else: b.append(tr()); a.append(tp())
+    try:
+        timed('PulsusDB', p_url, size, first); timed('the reference', r_url, size, first)   # unmeasured
+        for i in range(reps):
+            if i % 2 == 0: a.append(tp()); b.append(tr())
+            else: b.append(tr()); a.append(tp())
+    except Failed as e:
+        # a side that answered a call has a body length in `size`
+        for name in ('PulsusDB', 'the reference'):
+            state = 'failed' if name == e.side else 'answered' if name in size else 'not called'
+            print(f'{name}\ttrace={tid[:8]}\t{state}', flush=True)
+        print(f'failed side: {e.side}', file=sys.stderr)
+        sys.exit(str(e))
     n = {side: span_count(body) for side, body in first.items()}
     if n['PulsusDB'] != n['the reference'] or not n['PulsusDB']:
         sys.exit(f'not like for like: trace {tid}: PulsusDB answers {n["PulsusDB"]} spans, '
