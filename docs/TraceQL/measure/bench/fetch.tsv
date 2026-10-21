@@ -1,0 +1,4 @@
+PulsusDB	trace=0f888729	reps=21	min=36	p50=38	p90=39	max=40	bytes=13106
+the reference	trace=0f888729	reps=21	min=22	p50=23	p90=24	max=30	bytes=13106
+PulsusDB	trace=248398a4	reps=21	min=78	p50=80	p90=82	max=86	bytes=307719
+the reference	trace=248398a4	reps=21	min=34	p50=35	p90=38	max=46	bytes=307719

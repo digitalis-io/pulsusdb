@@ -591,7 +591,7 @@ read-row counts are an **upper bound** on this statement's and nothing more: it
 reads the span table once where the previous shape read it twice, so it reads no
 more and probably fewer — argued from the shape, not measured. The returned-byte
 and latency figures transfer in neither direction. The reference comparison
-(`measure/fetch_compare.py`, `results/g1-fetch-compare.tsv`) reads the
+(`measure/fetch_compare_design.py`, `results/g1-fetch-compare.tsv`) reads the
 regenerated statement file, so it re-measures with no code change of its own;
 what it recorded about the reference's own variance between sessions — 53 and
 102 ms in one run, 61 and 112 in the one before, 66 and 121 before that — is a

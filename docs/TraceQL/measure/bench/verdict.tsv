@@ -1,0 +1,26 @@
+shape	pulsus_ms	reference_ms	pulsus_bytes	reference_bytes	state
+fetch_trace_20	38	23	13106	13106	recorded
+fetch_trace_largest	80	35	307719	307719	recorded
+m01_rate_by_service	332.7	359.6	178846	181000	below
+m02_quantiles_by_route	141.6	279.4	237013	286813	below
+m03_errors_by_service	28.9	90.9	142598	143329	below
+m04_histogram	178.5	227.7	169557	169040	below
+m05_instant_avg_by_name	127.0	289.0	7275	7371	below
+m06_rate_by_resource_attr	372.9	593.9	670268	675076	below
+t01_tag_names_span	4.7	5.6	577	535	below
+t02_tag_values_route	6.1	773.7	306	328	below
+t03_tag_values_filtered	18.2	47.1	217	236	below
+s08_user_point	59.3	184.7	2088	4122	below
+s14_trace_level	97.6	35.3	10298	19594	exempt
+c08_compare	1232.5	1746.0	158096	310847	below
+g01_service_graph	468.1	-	3001	-	no counterpart
+
+compared below	11
+recorded	2
+exempt	1
+no counterpart	1
+refused	0
+not below	0
+reference failed	0
+not like for like	0
+verdict	pass
