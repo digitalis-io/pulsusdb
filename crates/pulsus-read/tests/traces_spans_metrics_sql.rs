@@ -108,6 +108,7 @@ fn golden(stem: &str, query: &str) -> String {
         },
         &StatementTables {
             spans: "spans",
+            error_spans: "error_spans",
             resources: "resources",
             traces: "traces",
             indexed: &[],

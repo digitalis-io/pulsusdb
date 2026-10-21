@@ -125,6 +125,7 @@ fn engine_config() -> TraceReadConfig {
         recent_table: "trace_recent".to_string(),
         errors_table: "trace_error_spans".to_string(),
         spans_v2_table: "spans".to_string(),
+        error_spans_table: "error_spans".to_string(),
         traces_table: "traces".to_string(),
         resources_table: "resources".to_string(),
         scan_budget_rows: 50_000_000,
@@ -426,6 +427,7 @@ async fn pulsus_counts(
         &engine.metrics_ctx(),
         &StatementTables {
             spans: "spans",
+            error_spans: "error_spans",
             resources: "resources",
             traces: "traces",
             indexed: &[],

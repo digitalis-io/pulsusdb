@@ -22,12 +22,15 @@
 //!   #594 part 2);
 //! * [`metrics`] — the metrics statement (issue #596 part 1): every
 //!   metrics shape but `compare()`, in one statement per request;
+//! * [`error_spans`] — which queries the error-span table answers
+//!   (issue #601 part 4b);
 //! * [`graph`] — the service-graph statement (issue #599): per-minute
 //!   edge totals plus the calls they do not cover, paired from spans;
 //! * [`tags`] — the two catalog reads of tag discovery (issue #598 part
 //!   1): tag names from `tag_names`, unnarrowed values from `tag_values`.
 
 pub mod attr_index;
+pub mod error_spans;
 pub mod fetch;
 pub mod fold;
 pub mod graph;

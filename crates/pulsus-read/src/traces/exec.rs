@@ -239,6 +239,11 @@ pub struct TraceReadConfig {
     /// metrics, tag and graph reads, which this part does not move. Same
     /// `_dist` rule: the table co-shards on `cityHash64(trace_id)`.
     pub spans_v2_table: String,
+    /// `error_spans{_dist}` — the error-span table (issue #601 part 4b):
+    /// the search statement of a query
+    /// [`super::spans::error_spans::admits`] reads it in place of
+    /// [`Self::spans_v2_table`]. Same `_dist` rule.
+    pub error_spans_table: String,
     /// `traces{_dist}` — the per-trace table the indexed fetch reads its
     /// bucket set and its extent from (issue #587). Same `_dist` rule.
     pub traces_table: String,
@@ -3348,6 +3353,7 @@ mod tests {
             recent_table: "trace_recent".to_string(),
             errors_table: "trace_error_spans".to_string(),
             spans_v2_table: "spans".to_string(),
+            error_spans_table: "error_spans".to_string(),
             traces_table: "traces".to_string(),
             resources_table: "resources".to_string(),
             scan_budget_rows: 50_000_000,
@@ -3371,6 +3377,7 @@ mod tests {
             recent_table: "trace_recent".to_string(),
             errors_table: "trace_error_spans".to_string(),
             spans_v2_table: "spans".to_string(),
+            error_spans_table: "error_spans".to_string(),
             traces_table: "traces".to_string(),
             resources_table: "resources".to_string(),
             scan_budget_rows: 1_000,
@@ -3768,6 +3775,7 @@ mod tests {
         };
         let tables = StatementTables {
             spans: "spans",
+            error_spans: "error_spans",
             resources: "resources",
             traces: "traces",
             indexed: &[],

@@ -88,6 +88,9 @@ const WELL_KNOWN_SPAN: [&str; 3] = ["http.status_code", "http.method", "http.url
 #[derive(Debug, Clone, Copy)]
 pub struct StatementTables<'a> {
     pub spans: &'a str,
+    /// The error-span table (issue #601 part 4b): the statement's span
+    /// table when [`super::error_spans::admits`] the query.
+    pub error_spans: &'a str,
     pub resources: &'a str,
     pub traces: &'a str,
     pub indexed: &'a [IndexedAttr],
@@ -1436,6 +1439,7 @@ mod tests {
 
     const TABLES: StatementTables<'static> = StatementTables {
         spans: "spans",
+        error_spans: "error_spans",
         resources: "resources",
         traces: "traces",
         indexed: &[],
@@ -1610,6 +1614,7 @@ mod tests {
     fn the_tables_come_from_the_caller() {
         let tables = StatementTables {
             spans: "sp_t",
+            error_spans: "es_t",
             resources: "rs_t",
             traces: "tr_t",
             indexed: &[],

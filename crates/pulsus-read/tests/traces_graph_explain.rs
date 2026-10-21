@@ -327,6 +327,7 @@ fn engine_config(scan_budget_rows: u64) -> TraceReadConfig {
         recent_table: "trace_recent".to_string(),
         errors_table: "trace_error_spans".to_string(),
         spans_v2_table: "spans".to_string(),
+        error_spans_table: "error_spans".to_string(),
         traces_table: "traces".to_string(),
         resources_table: "resources".to_string(),
         scan_budget_rows,

@@ -49,16 +49,16 @@ fn repo_root() -> std::path::PathBuf {
         .expect("the crate directory resolves")
 }
 
-/// The inventory, single-node: one database, 28 tables, 23 views, and
+/// The inventory, single-node: one database, 30 tables, 25 views, and
 /// nothing else. No `Replicated*` engine, no `Distributed` wrapper, no `ON
 /// CLUSTER`.
 #[test]
 fn the_single_node_render_is_the_whole_inventory_with_every_token_resolved() {
     let stmts = rendered_statements(&single());
-    assert_eq!(stmts.len(), 52, "statement count");
+    assert_eq!(stmts.len(), 56, "statement count");
     assert_eq!(starting_with(&stmts, "CREATE DATABASE"), 1);
-    assert_eq!(starting_with(&stmts, "CREATE TABLE"), 28);
-    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 23);
+    assert_eq!(starting_with(&stmts, "CREATE TABLE"), 30);
+    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 25);
 
     let text = rendered(&single());
     assert!(
@@ -87,18 +87,18 @@ fn the_single_node_render_is_the_whole_inventory_with_every_token_resolved() {
     assert!(text.contains("non_replicated_deduplication_window = 10000"));
 }
 
-/// The inventory, clustered: the same statements plus 18 `_dist` wrappers,
+/// The inventory, clustered: the same statements plus 19 `_dist` wrappers,
 /// `ON CLUSTER` on every one, and the macros intact.
 #[test]
 fn the_clustered_render_adds_the_wrappers_and_keeps_the_server_macros() {
     let stmts = rendered_statements(&clustered());
-    assert_eq!(stmts.len(), 70, "statement count");
+    assert_eq!(stmts.len(), 75, "statement count");
     assert_eq!(
         starting_with(&stmts, "CREATE TABLE"),
-        46,
-        "28 tables + 18 wrappers"
+        49,
+        "30 tables + 19 wrappers"
     );
-    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 23);
+    assert_eq!(starting_with(&stmts, "CREATE MATERIALIZED VIEW"), 25);
 
     let text = rendered(&clustered());
     assert!(
@@ -107,22 +107,22 @@ fn the_clustered_render_adds_the_wrappers_and_keeps_the_server_macros() {
     );
     assert_eq!(
         text.matches("ON CLUSTER 'prod'").count(),
-        70,
+        75,
         "every statement carries ON CLUSTER"
     );
 
     // `{shard}` and `{replica}` are the server's own macros and must arrive
-    // literally. 23 tables take a per-shard replica set and 5 take the
-    // cluster-wide one, so 28 paths name `{replica}` and 23 name `{shard}`.
+    // literally. 24 tables take a per-shard replica set and 6 take the
+    // cluster-wide one, so 30 paths name `{replica}` and 24 name `{shard}`.
     assert_eq!(
         text.matches("{shard}").count(),
-        23,
+        24,
         "per-shard replica sets"
     );
-    assert_eq!(text.matches("{replica}").count(), 28, "replicated tables");
+    assert_eq!(text.matches("{replica}").count(), 30, "replicated tables");
     assert_eq!(
         text.matches("/clickhouse/tables/all/").count(),
-        5,
+        6,
         "cluster-wide replica sets"
     );
     assert!(
@@ -178,7 +178,7 @@ fn every_replication_path_names_the_table_of_its_own_create() {
             checked += 1;
         }
     }
-    assert_eq!(checked, 28, "every replicated table's path was checked");
+    assert_eq!(checked, 30, "every replicated table's path was checked");
 }
 
 /// The splitter the script relies on: a statement ends at a line whose last
@@ -358,7 +358,7 @@ fn the_storage_policy_renders_into_every_table_and_no_wrapper_or_view() {
             assert!(!has, "the storage policy reached a wrapper or a view: {s}");
         }
     }
-    assert_eq!(on_tables, 28);
+    assert_eq!(on_tables, 30);
 
     assert!(
         !rendered(&clustered()).contains("storage_policy"),
@@ -550,6 +550,8 @@ fn each_view_reads_its_landing_table_under_its_discriminator() {
         "resources_mv",
         "tag_names_mv",
         "tag_values_mv",
+        "error_spans_mv",
+        "tag_bucket_values_mv",
     ] {
         let projection =
             pulsus_schema::mv_projection(mv, &ctx).unwrap_or_else(|| panic!("{mv} is in the file"));
@@ -560,6 +562,16 @@ fn each_view_reads_its_landing_table_under_its_discriminator() {
              which is the one landing-row shape it takes: {projection}"
         );
         assert!(!projection.ends_with(';'));
+    }
+    // Issue #601 part 4b: the two derived tables read the span rows alone.
+    for mv in ["error_spans_mv", "tag_bucket_values_mv"] {
+        let projection =
+            pulsus_schema::mv_projection(mv, &ctx).unwrap_or_else(|| panic!("{mv} is in the file"));
+        assert!(
+            projection.contains("FROM pulsus.trace_landing")
+                && projection.contains("WHERE row_kind = 0"),
+            "{mv} must read the landing table's span rows: {projection}"
+        );
     }
     for mv in [
         "metric_samples_mv",
@@ -739,8 +751,8 @@ fn the_wrapper_sentences_name_every_table_without_a_routing_sibling() {
     let no_wrapper = tables_without_a_wrapper();
     assert_eq!(
         no_wrapper.len(),
-        10,
-        "three landing tables, the label values, `service_edges` and five cluster-wide ones: \
+        11,
+        "three landing tables, the label values, `service_edges` and six cluster-wide ones: \
          {no_wrapper:?}"
     );
     let all = tables();
@@ -786,7 +798,7 @@ fn the_trace_sharding_key_passage_names_every_routed_trace_table() {
         .collect();
     assert_eq!(
         routed.len(),
-        7,
+        8,
         "every trace base table but the landing one is routed: {routed:?}"
     );
     for (name, anchor) in [
@@ -890,6 +902,7 @@ fn the_citing_clustering_passages_name_the_section_holding_the_list() {
         8 => "eight",
         9 => "nine",
         10 => "ten",
+        11 => "eleven",
         n => panic!("spell {n} out here before the count can be cited"),
     };
     assert!(
@@ -914,7 +927,7 @@ fn the_citing_clustering_passages_name_the_section_holding_the_list() {
 /// Chaining one such view onto another's target would count every row
 /// twice, and the server would accept it without comment.
 ///
-/// The sources are pinned as a set too: seventeen views read a landing
+/// The sources are pinned as a set too: nineteen views read a landing
 /// table, three read `trace_spans` and one reads `trace_attrs_idx` — both
 /// of which the writer fills directly and no view targets.
 ///
@@ -990,7 +1003,7 @@ fn no_insert_triggered_view_reads_a_table_another_view_writes() {
             sources.extend(own);
         }
     }
-    assert_eq!(targets.len(), 23, "twenty-three views");
+    assert_eq!(targets.len(), 25, "twenty-five views");
     assert_eq!(
         refreshable,
         vec![(
@@ -1025,7 +1038,7 @@ fn no_insert_triggered_view_reads_a_table_another_view_writes() {
     }
 }
 
-/// **The cluster-wide replica set is exactly these five tables.** A data
+/// **The cluster-wide replica set is exactly these six tables.** A data
 /// table given an `/all/` path would make every shard a replica of one
 /// table and silently collapse the cluster to one shard's worth of data.
 #[test]
@@ -1041,6 +1054,7 @@ fn the_cluster_wide_replica_set_is_exactly_the_catalog_tables() {
         vec![
             "metric_metadata",
             "resources",
+            "tag_bucket_values",
             "tag_names",
             "tag_values",
             "trace_tag_catalog",
