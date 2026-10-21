@@ -13050,6 +13050,103 @@ async fn a_span_on_a_grid_point_belongs_to_that_point() {
     );
 }
 
+/// The range answer to `q` over `[start_s, end_s)` at `step_ms` on a fresh
+/// database holding `spans`, as `(label ms, value)` of its one series.
+/// With `hold`, the span table's merges are stopped before the push, so a
+/// span past the retention TTL stays readable for the read that follows.
+async fn extreme_points(
+    test: &str,
+    spans: &[MetricSpan],
+    hold: bool,
+    (start_s, end_s, step_ms): (i64, i64, i64),
+) -> Result<Vec<(i64, f64)>, String> {
+    let db = pulsus_testkit::test_db(&format!("pulsus_read_it_t602_{test}"));
+    let client = fresh_db(&db).await;
+    if hold {
+        client
+            .execute(
+                "SYSTEM STOP MERGES spans",
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("stop the span table's merges");
+    }
+    land_metric_spans(&client, 0x11, spans, test).await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let routed = routed_plan(&engine, "{} | count_over_time()", start_s, end_s, step_ms);
+    let out = engine.metrics_range_routed(&routed).await;
+    drop_db(&db).await;
+    let out = out.map_err(|e| e.to_string())?;
+    match out.series.as_slice() {
+        [one] => Ok(one.samples.clone()),
+        other => Err(format!("{} series", other.len())),
+    }
+}
+
+/// Issue #602 part 3a: bucket labels past 32-bit epoch seconds come
+/// through the statement and its decode exact. The write path stores no
+/// span after 2106-02-06 (`otlp_traces.rs`, issue #131), so the occupied
+/// bucket is that day's last hour — past signed 32-bit seconds — and the
+/// window runs on past 2^32 s (2106-02-07 06:28:16), where every bucket is
+/// empty. Hourly buckets from 2106-02-06 23:00 to 2106-02-07 07:00.
+/// **guard**.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bucket_labels_past_32_bit_seconds_are_exact() {
+    skip_unless_live!();
+    // 2106-02-06 23:00:00 UTC and 2106-02-07 07:00:00 UTC.
+    const START: i64 = 4_294_940_400;
+    const END: i64 = 4_294_969_200;
+    let spans: Vec<MetricSpan> = vec![
+        // 23:30:00 and 23:59:59 on 2106-02-06: both in the bucket labelled
+        // 2106-02-07 00:00:00.
+        ("future", 1, 4_294_942_200 * S_NS, S_NS),
+        ("future", 2, 4_294_943_999 * S_NS, S_NS),
+    ];
+    let got = extreme_points("past_32_bit", &spans, false, (START, END, 3_600_000)).await;
+    assert_eq!(
+        got,
+        Ok(vec![
+            (4_294_940_400_000, 0.0),
+            (4_294_944_000_000, 2.0),
+            (4_294_947_600_000, 0.0),
+            (4_294_951_200_000, 0.0),
+            (4_294_954_800_000, 0.0),
+            (4_294_958_400_000, 0.0),
+            (4_294_962_000_000, 0.0),
+            (4_294_965_600_000, 0.0),
+            (4_294_969_200_000, 0.0),
+        ])
+    );
+}
+
+/// Issue #602 part 3a: a request window that starts before 1970, over
+/// spans stored just after it. The write path stores no span before 1970,
+/// so the statement's grid starts at a negative bucket over positive
+/// starts: its labels are the exact negative and positive millisecond
+/// values and its count is exact. The spans are past the retention TTL,
+/// so the span table's merges are held for the read. **guard**.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_window_from_before_1970_is_labelled_exactly() {
+    skip_unless_live!();
+    let spans: Vec<MetricSpan> = vec![
+        ("epoch", 1, S_NS, S_NS),
+        ("epoch", 2, 30 * S_NS, S_NS),
+        ("epoch", 3, 90 * S_NS, S_NS),
+    ];
+    let got = extreme_points("before_1970", &spans, true, (-120, 120, 60_000)).await;
+    assert_eq!(
+        got,
+        Ok(vec![
+            (-120_000, 0.0),
+            (-60_000, 0.0),
+            (0, 0.0),
+            (60_000, 2.0),
+            (120_000, 1.0),
+        ])
+    );
+}
+
 /// The trailing comparison runs in the statement, and an empty bucket's
 /// `0` passes or fails it as any other value.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
