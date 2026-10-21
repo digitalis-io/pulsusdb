@@ -19949,3 +19949,106 @@ async fn a_retried_push_is_counted_once_in_the_error_table() {
     drop_db(&db).await;
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+/// T5c (issue #601 part 4b, r10): **whole buckets are capped one by one.**
+/// Two whole buckets of 100 values each, 150 distinct between them, and one
+/// value in the window's first, partial bucket: each bucket is under the
+/// cap, so the answer is all 151 pairs, in one statement that reads the
+/// catalogue — not the 101 a cap applied to the buckets' union would keep.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn whole_buckets_are_capped_one_by_one() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db("pulsus_read_it_t601p4b_c5c");
+    let client = fresh_db(&db).await;
+    stop_span_merges_4b(&client, &db).await;
+    let b0 = buckets_4b();
+    let bucket = |b: i64, from: u16| -> Vec<Span> {
+        (0..100u16)
+            .map(|i| {
+                route_span_4b(
+                    0xc6,
+                    (b as u16) * 1000 + i,
+                    (b0 + b) * BUCKET_4B + S_NS + i64::from(i) * S_NS,
+                    &format!("/v{:03}", from + i),
+                )
+            })
+            .collect()
+    };
+    land(
+        &client,
+        &request("checkout", "pod-c", bucket(1, 0)),
+        "t601p4b-t5c-1",
+    )
+    .await;
+    land(
+        &client,
+        &request("checkout", "pod-c", bucket(2, 50)),
+        "t601p4b-t5c-2",
+    )
+    .await;
+    land(
+        &client,
+        &request(
+            "checkout",
+            "pod-c",
+            vec![route_span_4b(0xc6, 9, b0 * BUCKET_4B + 200 * S_NS, "/e")],
+        ),
+        "t601p4b-t5c-0",
+    )
+    .await;
+    let (s, e) = (b0 * BUCKET_4B + BUCKET_4B / 2, (b0 + 3) * BUCKET_4B);
+    let q = r#"{ resource.service.name = "checkout" }"#;
+    let (got, stmts) =
+        values_request_4b(&db, &client, "t5c", "http.route", Some("span"), q, s, e).await;
+    drop_db(&db).await;
+    let mut want = vec![("/e".to_string(), "string".to_string())];
+    want.extend((0..150).map(|i| (format!("/v{i:03}"), "string".to_string())));
+    eprintln!(
+        "T5c: {} pairs in {stmts:?}",
+        got.as_ref().map(Vec::len).unwrap_or(0)
+    );
+    assert_eq!(got, Ok(want), "the 151 pairs, /e then /v000 to /v149");
+    assert_eq!(stmts.len(), 1, "one statement: {stmts:?}");
+    assert!(
+        read_table(&stmts, &db, "tag_bucket_values"),
+        "the statement reads the catalogue: {stmts:?}"
+    );
+}
+
+/// T7b (issue #601 part 4b, r10): **the error sum answers as written by
+/// hand.** Over fixture E, `{ status = error } | sum_over_time(duration)` is
+/// one series totalling the five error spans' 20 + 5 + 50 + 30 + 30 ms =
+/// 0.135 s, read from `error_spans` and not from `spans`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_error_sum_answers_as_written_by_hand() {
+    skip_unless_live!();
+    let (db, client, base) = seed_e("t7b").await;
+    let prefix = prefix_4b("t7b");
+    let engine = engine_4b(&db, &prefix).await;
+    let base_s = base / S_NS;
+    let routed = routed_plan(
+        &engine,
+        "{ status = error } | sum_over_time(duration)",
+        base_s,
+        base_s + 10,
+        1_000,
+    );
+    let sums = sums_of(&engine.metrics_range_routed(&routed).await);
+    let stmts = statements_4b(&client, &prefix).await;
+    drop_db(&db).await;
+    eprintln!("T7b: {sums:?} in {stmts:?}");
+    assert_eq!(
+        sums.keys().cloned().collect::<Vec<_>>(),
+        vec!["__name__=sum_over_time".to_string()],
+        "one series"
+    );
+    let total = sums["__name__=sum_over_time"];
+    assert!(
+        (total - 0.135).abs() < 1e-9,
+        "the error spans' durations sum to 0.135 s, got {total}"
+    );
+    assert!(
+        read_table(&stmts, &db, "error_spans") && !read_table(&stmts, &db, "spans"),
+        "error_spans read and spans not: {stmts:?}"
+    );
+}
