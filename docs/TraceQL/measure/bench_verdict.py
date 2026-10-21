@@ -190,6 +190,18 @@ def self_test():
     check("no reference line for fetch_trace_20: reference failed, fails",
           states_are(rows, fetch_trace_20='reference failed', fetch_trace_largest='refused') and not passes(counts))
 
+    # a fetch that failed on one side: fetch_compare.py writes the failed side
+    # `failed` and the other `answered` (every call it was given answered 200,
+    # untimed); the row is that side's failure, not the other's
+    rows, counts = run(good_p, 'PulsusDB\ttrace=aaaaaaaa\tanswered\n'
+                               'the reference\ttrace=aaaaaaaa\tfailed\n' + fbigp + fbigr)
+    check("the reference's fetch failed on fetch_trace_20: reference failed, fails",
+          states_are(rows, fetch_trace_20='reference failed') and not passes(counts))
+    rows, counts = run(good_p, f20p + f20r + 'PulsusDB\ttrace=bbbbbbbb\tfailed\n'
+                               'the reference\ttrace=bbbbbbbb\tanswered\n')
+    check("PulsusDB's fetch failed on fetch_trace_largest: refused, fails",
+          states_are(rows, fetch_trace_largest='refused') and not passes(counts))
+
     # an answer with nothing in it is not a like-for-like comparison,
     # whichever side gave it and however fast
     for name, row in (
@@ -203,7 +215,7 @@ def self_test():
               states_are(rows, **{name: 'not like for like'}) and counts.get('not like for like') == 1
               and not passes(counts))
 
-    print(f'bench_verdict.py self-test: {12 - len(fails)} of 12 cases as expected')
+    print(f'bench_verdict.py self-test: {14 - len(fails)} of 14 cases as expected')
     return 1 if fails else 0
 
 

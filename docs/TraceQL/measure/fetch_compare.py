@@ -130,6 +130,20 @@ def self_test():
         ('no span on either side', lambda n: (200, traces_data(0)), lambda n: (200, traces_data(0)),
          1, ['not like for like']),
     ]
+    # a failure names its side on a fixed stderr line, and stdout carries the
+    # trace's two slot lines: the failed side `failed`, the other `answered`
+    # (every call it was given answered 200) or `not called`
+    slots = [
+        ('the reference 404 on its first call', good, lambda n: (404, b'') if n == 1 else (200, one),
+         'failed side: the reference',
+         ['PulsusDB\ttrace=aaaaaaaa\tanswered', 'the reference\ttrace=aaaaaaaa\tfailed']),
+        ('PulsusDB 500 on its first call', lambda n: (500, b'') if n == 1 else (200, one), good,
+         'failed side: PulsusDB',
+         ['PulsusDB\ttrace=aaaaaaaa\tfailed', 'the reference\ttrace=aaaaaaaa\tnot called']),
+        ('PulsusDB 500 on its third call', lambda n: (500, b'') if n == 3 else (200, one), good,
+         'failed side: PulsusDB',
+         ['PulsusDB\ttrace=aaaaaaaa\tfailed', 'the reference\ttrace=aaaaaaaa\tanswered']),
+    ]
     fails = 0
     for name, pa, ra, want, words in cases:
         (p, ps), (r, rs) = stub(pa), stub(ra)
@@ -142,7 +156,18 @@ def self_test():
             ok = ok and len(lines) == 2 and lines[0].startswith('PulsusDB\t') and lines[1].startswith('the reference\t')
         print(f'{"ok  " if ok else "FAIL"} {name}: exit {run.returncode}, expected {want}; {run.stderr.strip()[-200:]}')
         fails += not ok
-    print(f'fetch_compare.py self-test: {len(cases) - fails} of {len(cases)} cases as expected')
+    for name, pa, ra, marker, want_lines in slots:
+        (p, ps), (r, rs) = stub(pa), stub(ra)
+        run = subprocess.run([sys.executable, __file__, p, r, 'aaaaaaaabbbbbbbbccccccccdddddddd', '3'],
+                             capture_output=True, text=True, timeout=60)
+        ps.shutdown(); rs.shutdown()
+        ok = (run.returncode == 1 and marker in run.stderr.splitlines()
+              and run.stdout.splitlines() == want_lines)
+        print(f'{"ok  " if ok else "FAIL"} {name}: exit {run.returncode}; stdout {run.stdout.splitlines()}; '
+              f'{run.stderr.strip()[-200:]}')
+        fails += not ok
+    total = len(cases) + len(slots)
+    print(f'fetch_compare.py self-test: {total - fails} of {total} cases as expected')
     return 1 if fails else 0
 
 
