@@ -112,16 +112,29 @@ def self_test():
     good_p = {name: (f'{name}\t200\t1000\t1.0\t5.0\t9.0\t200\t2000\t2.0\t10.0\t20.0\t3\t3\t1.0\t100\t1000')
               for name, _ in SHAPES if not name.startswith('fetch_')}
     good_p['g01_service_graph'] = 'g01_service_graph\t200\t1000\t1.0\t5.0\t9.0\t-\t-\t-\t-\t-\t3\t-\t1.0\t100\t1000'
-    good_f = ('PulsusDB\ttrace=aaaaaaaa\treps=21\tmin=1\tp50=4\tp90=6\tmax=9\tbytes=15000\n'
-              'the reference\ttrace=aaaaaaaa\treps=21\tmin=2\tp50=8\tp90=12\tmax=20\tbytes=16000\n'
-              'PulsusDB\ttrace=bbbbbbbb\treps=21\tmin=1\tp50=14\tp90=16\tmax=19\tbytes=800000\n'
-              'the reference\ttrace=bbbbbbbb\treps=21\tmin=2\tp50=28\tp90=32\tmax=40\tbytes=900000\n')
+    f20p = 'PulsusDB\ttrace=aaaaaaaa\treps=21\tmin=1\tp50=4\tp90=6\tmax=9\tbytes=15000\n'
+    f20r = 'the reference\ttrace=aaaaaaaa\treps=21\tmin=2\tp50=8\tp90=12\tmax=20\tbytes=16000\n'
+    fbigp = 'PulsusDB\ttrace=bbbbbbbb\treps=21\tmin=1\tp50=14\tp90=16\tmax=19\tbytes=800000\n'
+    fbigr = 'the reference\ttrace=bbbbbbbb\treps=21\tmin=2\tp50=28\tp90=32\tmax=40\tbytes=900000\n'
+    good_f = f20p + f20r + fbigp + fbigr
+    # every row's state on the good inputs, written out here rather than read
+    # from SHAPES, so a kind changed there is a failed case
+    good_states = {
+        'fetch_trace_20': 'recorded', 'fetch_trace_largest': 'recorded',
+        'm01_rate_by_service': 'below', 'm02_quantiles_by_route': 'below', 'm03_errors_by_service': 'below',
+        'm04_histogram': 'below', 'm05_instant_avg_by_name': 'below', 'm06_rate_by_resource_attr': 'below',
+        't01_tag_names_span': 'below', 't02_tag_values_route': 'below', 't03_tag_values_filtered': 'below',
+        's08_user_point': 'below', 's14_trace_level': 'exempt', 'c08_compare': 'below',
+        'g01_service_graph': 'no counterpart',
+    }
 
-    def run(p):
-        return verdict('\n'.join(p.values()) + '\n', good_f)
+    def run(p, f=good_f):
+        return verdict('\n'.join(p.values()) + '\n', f)
 
-    def state(rows, name):
-        return next((r[5] for r in rows if r[0] == name), None)
+    def states_are(rows, **changed):
+        """every row's state is the good one, except those named"""
+        want = good_states | {k: v for k, v in changed.items()}
+        return len(rows) == 15 and {r[0]: r[5] for r in rows} == want
 
     fails = []
 
@@ -130,30 +143,50 @@ def self_test():
         if not ok: fails.append(case)
 
     rows, counts = run(good_p)
-    check('all fifteen good: pass', passes(counts) and len(rows) == 15)
+    check('all fifteen good: counts 11/2/1/1/0, pass',
+          states_are(rows) and passes(counts)
+          and (counts.get('below'), counts.get('recorded'), counts.get('exempt'), counts.get('no counterpart'),
+               counts.get('refused')) == (11, 2, 1, 1, 0))
 
     p = dict(good_p); p['m01_rate_by_service'] = 'm01_rate_by_service\t200\t1000\t1.0\t10.0\t19.0\t200\t2000\t2.0\t10.0\t20.0'
     rows, counts = run(p)
-    check('equal medians: not below, fails', state(rows, 'm01_rate_by_service') == 'not below' and not passes(counts))
+    check('equal medians: not below, fails', states_are(rows, m01_rate_by_service='not below') and not passes(counts))
 
     p = dict(good_p); p['m02_quantiles_by_route'] = 'm02_quantiles_by_route\t400\t60\t1.0\t5.0\t9.0\t200\t2000\t2.0\t10.0\t20.0'
     rows, counts = run(p)
     check('PulsusDB 400 on m02: refused, count 1, fails',
-          state(rows, 'm02_quantiles_by_route') == 'refused' and counts.get('refused') == 1 and not passes(counts))
+          states_are(rows, m02_quantiles_by_route='refused') and counts.get('refused') == 1 and not passes(counts))
 
     p = dict(good_p); p['t03_tag_values_filtered'] = 't03_tag_values_filtered\t200\t1000\t1.0\t5.0\t9.0'
     rows, counts = run(p)
     check("t03's reference half missing: reference failed, fails",
-          state(rows, 't03_tag_values_filtered') == 'reference failed' and not passes(counts))
+          states_are(rows, t03_tag_values_filtered='reference failed') and not passes(counts))
 
     p = dict(good_p); p['s14_trace_level'] = 's14_trace_level\t200\t1000\t1.0\t5.0\t9.0\t500\t80\t2.0\t10.0\t20.0'
     rows, counts = run(p)
     check('the reference 500 on s14: reference failed, fails',
-          state(rows, 's14_trace_level') == 'reference failed' and not passes(counts))
+          states_are(rows, s14_trace_level='reference failed') and not passes(counts))
 
     p = dict(good_p); del p['g01_service_graph']
     rows, counts = run(p)
-    check('g01 absent: refused, fails', state(rows, 'g01_service_graph') == 'refused' and not passes(counts))
+    check('g01 absent: refused, fails', states_are(rows, g01_service_graph='refused') and not passes(counts))
+
+    # the two trace-by-id rows are recorded: their order passes and fails nothing
+    rows, counts = run(good_p, f20p.replace('p50=4', 'p50=80') + f20r + fbigp + fbigr)
+    check("PulsusDB's p50 above the reference's on fetch_trace_20: recorded, pass",
+          states_are(rows) and next(r[1] for r in rows if r[0] == 'fetch_trace_20') == '80' and passes(counts))
+
+    # fetch.tsv is read by position: PulsusDB's line and then the reference's,
+    # the 20-span trace's two and then the largest trace's
+    rows, counts = run(good_p, f20p + f20r + fbigr)
+    check("no PulsusDB line for fetch_trace_largest: refused, fails",
+          states_are(rows, fetch_trace_largest='refused') and not passes(counts))
+
+    # without the reference's first line every later line moves up one, so the
+    # largest trace's PulsusDB line is not where it is read and that row is refused too
+    rows, counts = run(good_p, f20p + fbigp + fbigr)
+    check("no reference line for fetch_trace_20: reference failed, fails",
+          states_are(rows, fetch_trace_20='reference failed', fetch_trace_largest='refused') and not passes(counts))
 
     # an answer with nothing in it is not a like-for-like comparison,
     # whichever side gave it and however fast
@@ -165,10 +198,10 @@ def self_test():
         p = dict(good_p); p[name] = row
         rows, counts = run(p)
         check(f'{name} with an empty side: not like for like, count 1, fails',
-              state(rows, name) == 'not like for like' and counts.get('not like for like') == 1
+              states_are(rows, **{name: 'not like for like'}) and counts.get('not like for like') == 1
               and not passes(counts))
 
-    print(f'bench_verdict.py self-test: {9 - len(fails)} of 9 cases as expected')
+    print(f'bench_verdict.py self-test: {12 - len(fails)} of 12 cases as expected')
     return 1 if fails else 0
 
 
