@@ -4743,9 +4743,12 @@ async fn the_catalogue_and_the_error_table_answer_over_two_shards() {
     let mut local = Vec::new();
     for node in [&shard1, &shard2] {
         local.push(
-            node.query_strings("SELECT count() FROM error_spans", &QuerySettings::new())
-                .await
-                .map_err(|e| e.to_string()),
+            node.query_strings(
+                "SELECT toString(count()) AS s FROM error_spans",
+                &QuerySettings::new(),
+            )
+            .await
+            .map_err(|e| e.to_string()),
         );
     }
     let ok = |r: &Result<Vec<String>, String>| -> u64 {
@@ -4923,7 +4926,7 @@ async fn the_catalogue_and_the_error_table_answer_over_two_shards() {
     // The catalogue is one replica set: every node holds the same groups.
     let groups = "SELECT concat(service, ' ', key, ' ', toString(bucket), ' ', \
                   arrayStringConcat(arrayMap(x -> x.1, arraySort(groupUniqArrayMerge(101)(vals))), ',')) \
-                  FROM tag_bucket_values GROUP BY service, key, bucket ORDER BY service, key, bucket";
+                  AS s FROM tag_bucket_values GROUP BY service, key, bucket ORDER BY service, key, bucket";
     let mut held = Vec::new();
     for node in [&shard1, &shard1b, &shard2] {
         let synced = node
