@@ -232,6 +232,9 @@ def self_test():
         ('a fixed32 cut short, trailing in ScopeSpans', ld(1, ld(2, ld(2, b'') + b'\x0d\x00'))),
         ('a key cut short, trailing in ResourceSpans', ld(1, ld(2, ld(2, b'')) + b'\x80')),
         ('a length past the end, in TracesData, with no byte after it', b'\x0a\x01'),
+        ('field number 0, in TracesData', one + b'\x00\x00'),
+        ('field number 0, in ResourceSpans', ld(1, ld(2, ld(2, b'')) + b'\x02\x00')),
+        ('field number 0, in ScopeSpans', ld(1, ld(2, ld(2, b'') + b'\x05' + bytes(4)))),
     ]
     for i, (form, body) in enumerate(malformed):
         bad = lambda n, body=body: (200, body)
