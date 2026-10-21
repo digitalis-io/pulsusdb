@@ -677,14 +677,14 @@ const PINNED_SPANS_SEARCH_CORPUS: u64 = 0x12e3_5061_8645_68f2;
 /// issue #601 part 4a, whose span reads keep one row per span identity, a
 /// count and a rate counting each identity once — the two that read the
 /// numbering keep `final` and do not move; one, `sum_errors`, by issue #601
-/// part 4b, whose `{ status = error }` filter reads `error_spans`; seven by
-/// part 4c, whose key array and target are computed inside the read that
-/// keeps one row per span identity — a count and a rate have no such read
-/// and do not move), each the
+/// part 4b, whose `{ status = error }` filter reads `error_spans`; three by
+/// part 4c, whose key array or attribute target is computed inside the read
+/// that keeps one row per span identity — a count and a rate have no such
+/// read, and a statement with neither reads no value through it), each the
 /// range and instant forms of one request of
 /// `crates/pulsus-read/src/traces/spans/metrics.rs`'s `metrics_statement`,
 /// under [`corpus_digest`]'s encoding.
-const PINNED_SPANS_METRICS_CORPUS: u64 = 0xaf66_6a8a_4959_7a07;
+const PINNED_SPANS_METRICS_CORPUS: u64 = 0x3032_bb57_79ec_d2c5;
 
 #[test]
 fn the_sql_golden_corpus_matches_its_committed_digest() {

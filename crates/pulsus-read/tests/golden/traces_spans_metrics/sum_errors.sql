@@ -10,8 +10,8 @@ FROM (SELECT g, o, arraySort(groupArrayIf(((29856666 + p) * 60000, v), NOT none)
        countIf(has) OVER () AS T
 FROM (SELECT g, o, empty(cells) AS none, c.1 AS p, c.2 AS v, if(isNaN(v), CAST((toFixedString('', 16), 0, 0), 'Tuple(FixedString(16), Int64, Float64)'), c.3) AS ex
 FROM (SELECT CAST([], 'Array(Tuple(String, String))') AS g, toUInt64(0) AS o, groupArray((p, v, ex)) AS cells
-FROM (SELECT w_g AS g, toUInt64(0) AS o, intDiv(start_ns - 1, 60000000000) + 1 - 29856666 AS p, toFloat64(sum(duration_ns)) / 1000000000 AS v, argMax((trace_id, start_ns, toFloat64(duration_ns) / 1000000000), (duration_ns, span_id)) AS ex
-FROM (SELECT *, CAST([], 'Array(Tuple(String, String))') AS w_g FROM error_spans
+FROM (SELECT CAST([], 'Array(Tuple(String, String))') AS g, toUInt64(0) AS o, intDiv(start_ns - 1, 60000000000) + 1 - 29856666 AS p, toFloat64(sum(duration_ns)) / 1000000000 AS v, argMax((trace_id, start_ns, toFloat64(duration_ns) / 1000000000), (duration_ns, span_id)) AS ex
+FROM (SELECT * FROM error_spans
 WHERE start_ns >= 1791399900000000001 AND start_ns < 1791410820000000001
   AND intDiv(start_ns, 300000000000) BETWEEN intDiv(1791399900000000001, 300000000000) AND intDiv(1791410820000000000, 300000000000)
   AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') >= toDate('2026-10-07') AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') <= toDate('2026-10-07')
@@ -25,8 +25,8 @@ ORDER BY g, o
 
 == instant ==
 SELECT g, o, [(toInt64(1791410820000), v)] AS points, CAST([], 'Array(Tuple(FixedString(16), Int64, Float64))') AS exemplars, 0 AS f
-FROM (SELECT w_g AS g, toUInt64(0) AS o, toFloat64(sum(duration_ns)) / 1000000000 AS v
-FROM (SELECT *, CAST([], 'Array(Tuple(String, String))') AS w_g FROM error_spans
+FROM (SELECT CAST([], 'Array(Tuple(String, String))') AS g, toUInt64(0) AS o, toFloat64(sum(duration_ns)) / 1000000000 AS v
+FROM (SELECT * FROM error_spans
 WHERE start_ns >= 1791400000000000000 AND start_ns < 1791410800000000000
   AND intDiv(start_ns, 300000000000) BETWEEN intDiv(1791400000000000000, 300000000000) AND intDiv(1791410799999999999, 300000000000)
   AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') >= toDate('2026-10-07') AND toDate(fromUnixTimestamp64Nano(start_ns), 'UTC') <= toDate('2026-10-07')

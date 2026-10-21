@@ -532,9 +532,15 @@ impl Read {
         // Issue #601 part 4c (D1): a read through the dedup wrap computes
         // the key array and the target inside it and reads them by alias,
         // so the wrap reads each subcolumn they name and not its whole
-        // column.
+        // column. An ungrouped statement's key array is a constant, which
+        // reads no column and stays outside, where it is not grouped by.
         let (inner, g, x, i) = if dedup {
-            let mut inner = format!(", {g} AS w_g");
+            let keyed = !texts.is_empty();
+            let mut inner = if keyed {
+                format!(", {g} AS w_g")
+            } else {
+                String::new()
+            };
             if let Some(x) = &x {
                 inner.push_str(&format!(", {x} AS w_x"));
             }
@@ -543,7 +549,7 @@ impl Read {
             }
             (
                 inner,
-                "w_g".to_string(),
+                if keyed { "w_g".to_string() } else { g },
                 x.map(|_| "w_x".to_string()),
                 i.map(|_| "w_i".to_string()),
             )
