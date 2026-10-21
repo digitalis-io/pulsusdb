@@ -193,7 +193,52 @@ def self_test():
          'failed side: PulsusDB',
          ['PulsusDB\ttrace=aaaaaaaa\tfailed', 'the reference\ttrace=aaaaaaaa\tnot called']),
     ]
+    # every malformed form, at each level the count walks (TracesData,
+    # ResourceSpans, ScopeSpans), is a body that does not decode, charged to
+    # the side that sent it
+    def ld(field, payload):
+        n, size = len(payload), b''
+        while True:
+            size += bytes([(n & 0x7f) | (0x80 if n > 0x7f else 0)]); n >>= 7
+            if not n: break
+        return bytes([(field << 3) | 2]) + size + payload
+    malformed = [
+        ('a length past the end, in TracesData', b'\x0a\x05\x12'),
+        ('a length past the end, in ResourceSpans', ld(1, b'\x12\x05\x12')),
+        ('a length past the end, in ScopeSpans', ld(1, ld(2, b'\x12\x05'))),
+        ('a varint off the end, in TracesData', b'\x0a\x80'),
+        ('a varint off the end, in ScopeSpans', ld(1, ld(2, b'\x08\x80'))),
+        ('an 11-byte varint, in TracesData', one + b'\x08' + b'\x80' * 10 + b'\x00'),
+        ('an 11-byte varint, in ResourceSpans', ld(1, b'\x08' + b'\x80' * 10 + b'\x00')),
+        ('wire type 3, a group start, in TracesData', one + b'\x0b'),
+        ('wire type 4, a group end, in ResourceSpans', ld(1, b'\x0c')),
+        ('wire type 6, in ScopeSpans', ld(1, ld(2, b'\x0e'))),
+        ('wire type 7, in TracesData', one + b'\x0f'),
+        ('a fixed64 cut short, trailing in TracesData', one + b'\x09\x00'),
+        ('a fixed32 cut short, trailing in ScopeSpans', ld(1, ld(2, ld(2, b'') + b'\x0d\x00'))),
+        ('a key cut short, trailing in ResourceSpans', ld(1, ld(2, ld(2, b'')) + b'\x80')),
+        ('a length past the end, in TracesData, with no byte after it', b'\x0a\x01'),
+    ]
+    for i, (form, body) in enumerate(malformed):
+        bad = lambda n, body=body: (200, body)
+        if i % 2 == 0:
+            slots.append((f'{form}, from PulsusDB', bad, good, 'failed side: PulsusDB',
+                          ['PulsusDB\ttrace=aaaaaaaa\tfailed', 'the reference\ttrace=aaaaaaaa\tnot called']))
+        else:
+            slots.append((f'{form}, from the reference', good, bad, 'failed side: the reference',
+                          ['PulsusDB\ttrace=aaaaaaaa\tanswered', 'the reference\ttrace=aaaaaaaa\tfailed']))
     fails = 0
+    # a well-formed body still counts every span: two resources, three scopes,
+    # seven spans with content, and a field of every other wire type at each level
+    other = b'\x18\x96\x01' + b'\x21' + bytes(8) + b'\x2d' + bytes(4)
+    span = ld(1, bytes(16)) + ld(5, b'GET /cart')
+    scope = lambda n: ld(1, ld(1, b'lib')) + other + b''.join(ld(2, span) for _ in range(n)) + ld(3, b'url')
+    body = (ld(1, ld(1, b'res-a') + ld(2, scope(2)) + other + ld(2, scope(3)))
+            + other + ld(1, ld(2, scope(2)) + ld(3, b'url')))
+    ok = span_count(body) == 7 and span_count(traces_data(20)) == 20
+    print(f'{"ok  " if ok else "FAIL"} a well-formed nested body: {span_count(body)} spans of 7, '
+          f'{span_count(traces_data(20))} of 20')
+    fails += not ok
     for name, pa, ra, want, words in cases:
         (p, ps), (r, rs) = stub(pa), stub(ra)
         run = subprocess.run([sys.executable, __file__, p, r, 'aaaaaaaabbbbbbbbccccccccdddddddd', '3'],
@@ -216,7 +261,7 @@ def self_test():
         print(f'{"ok  " if ok else "FAIL"} {name}: exit {run.returncode}; stdout {run.stdout.splitlines()}; '
               f'{run.stderr.strip()[-200:]}')
         fails += not ok
-    total = len(cases) + len(slots)
+    total = len(cases) + len(slots) + 1
     print(f'fetch_compare.py self-test: {total - fails} of {total} cases as expected')
     return 1 if fails else 0
 
