@@ -673,7 +673,7 @@ per bucket per series in the same pass —
 exemplar is the bucket's longest span and the span id breaks a tie, which makes
 the answer the same on every run. `with(sample=…)` and every other hint change
 no read at all: the shipped planner accepts them and returns the exact superset
-(`crates/pulsus-read/src/traces/metrics_plan.rs:1092`).
+(`crates/pulsus-read/src/traces/metrics_plan.rs:1114`).
 
 Grouping by a **resource** attribute
 aggregates by `resource_id` first and joins the small resource table afterwards,

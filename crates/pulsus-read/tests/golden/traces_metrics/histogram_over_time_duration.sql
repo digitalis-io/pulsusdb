@@ -22,7 +22,7 @@ FROM (
   WITH arrayFirstIndex((k, s) -> k = 'http.status_code' AND s = 'span', attr_key, attr_scope) AS pi0
   SELECT trace_id, span_id, any(duration_ns) AS val
   FROM trace_spans
-  WHERE timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000
+  WHERE timestamp_ns >= 1700000000000000000 AND timestamp_ns < 1700010800000000000
     AND ((pi0 != 0) AND ifNull(attr_num[pi0] >= 500, 0))
   GROUP BY trace_id, span_id
 )

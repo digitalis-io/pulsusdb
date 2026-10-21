@@ -13,14 +13,6 @@ use pulsus_traceql::{AttrScope, Field, Intrinsic, MetricFn, PipelineStage, Query
 use super::filter::{PlanError, SpanFilterCtx};
 use super::metrics_sql::{self, AggFn, GroupKeySql, SnappedWindow};
 
-/// The auto-derivation target when `step` is omitted (docs/api.md §4.4,
-/// task-manager adjudication 3): the derived step is
-/// `max(1, ⌊(end_s − start_s) / DEFAULT_METRICS_POINTS⌋)` whole SECONDS,
-/// scaled to the plan's millisecond unit. The derivation itself runs
-/// server-side in `parse_metrics_params`; the constant lives here as the
-/// committed contract's single source.
-pub const DEFAULT_METRICS_POINTS: i64 = 100;
-
 /// The hard bucket-count cap (docs/api.md §4.4): a snapped range
 /// resolving more buckets is rejected statically with `422
 /// query_too_broad` — bounded response, no silent truncation (the
@@ -44,9 +36,9 @@ const NS_PER_MS: i64 = 1_000_000;
 /// the request fails.
 const COMPARE_SELECTION_ALIAS_PREFIX: &str = "c";
 
-/// The caller-validated request window, step and exemplar budget.
-/// `step_ms` is whole milliseconds (issue #477 (d)), already defaulted by
-/// the server's derivation formula when the request omitted `step`.
+/// The caller-validated request window, step, exemplar budget and
+/// retention floor. `step_ms` is whole milliseconds (issue #477 (d)),
+/// already derived by the server when the request omitted `step`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MetricsParams {
     pub start_ns: i64,
@@ -56,6 +48,9 @@ pub struct MetricsParams {
     /// The HTTP `exemplars` parameter, normalised by the server:
     /// `None` when absent, empty, unparseable, zero or negative.
     pub exemplars: Option<u32>,
+    /// The retention floor: the first nanosecond any statement may read a
+    /// span from. `i64::MIN` floors nothing.
+    pub floor_ns: i64,
 }
 
 /// The emitted bucket grid (issue #477 (a)/(b)): `points` labels at
@@ -225,13 +220,22 @@ pub struct TraceMetricsPlan {
     /// which trims nothing and is exactly what an enormous `topN` means.
     compare_top_n: usize,
     step_ms: i64,
-    /// The INSTANT evaluation window `[aS, aE)` — unchanged by issue #477.
+    /// The snapped grid window `[aS, aE)`: its right edge labels the
+    /// instant answer and the range axis starts at its left edge.
     window: SnappedWindow,
     /// The emitted bucket grid for the range form.
     range_axis: RangeAxis,
-    /// The RANGE evaluation window `[aS - step + 1, aE + 1)`, i.e. the
-    /// instants `(aS - step, aE]`.
-    range_window: SnappedWindow,
+    /// The INSTANT window, exactly as requested: `[start, end)`, one
+    /// bucket, not snapped (issue #601 part 2).
+    instant_window: SnappedWindow,
+    /// The rows the instant statements read: [`Self::instant_window`]
+    /// from the retention floor on.
+    instant_rows: SnappedWindow,
+    /// The rows the range statements read: the grid's
+    /// `[aS - step + 1, aE + 1)`, i.e. the instants `(aS - step, aE]`, from
+    /// the retention floor on. The grid keeps its buckets; those before the
+    /// floor read no span.
+    range_rows: SnappedWindow,
     distributed: bool,
     range_sql: String,
     instant_sql: String,
@@ -351,18 +355,20 @@ impl TraceMetricsPlan {
         self.distributed
     }
 
-    /// The snapped, left-closed INSTANT window `[S, E)` in nanoseconds.
-    /// Unchanged by issue #477 — the range form reads
+    /// The rows every INSTANT statement reads, in nanoseconds: the
+    /// requested `[start, end)` exactly, from the retention floor on
+    /// (issue #601 part 2). The range form reads
     /// [`Self::range_window_ns`].
     pub fn snapped_window_ns(&self) -> (i64, i64) {
-        (self.window.start_ns, self.window.end_ns)
+        (self.instant_rows.start_ns, self.instant_rows.end_ns)
     }
 
-    /// The RANGE window `[aS - step + 1, aE + 1)` in nanoseconds — the
-    /// integer-nanosecond spelling of the right-closed instant range
-    /// `(aS - step, aE]`.
+    /// The rows every RANGE statement reads, in nanoseconds: the grid's
+    /// `[aS - step + 1, aE + 1)` — the integer-nanosecond spelling of the
+    /// right-closed instant range `(aS - step, aE]` — from the retention
+    /// floor on.
     pub fn range_window_ns(&self) -> (i64, i64) {
-        (self.range_window.start_ns, self.range_window.end_ns)
+        (self.range_rows.start_ns, self.range_rows.end_ns)
     }
 
     /// The instant evaluation timestamp (`E`, the snapped right edge) in
@@ -372,16 +378,16 @@ impl TraceMetricsPlan {
         self.window.end_ns / 1_000_000
     }
 
-    /// The snapped INSTANT window width in **fractional seconds** — the
-    /// instant `rate` denominator.
+    /// The requested INSTANT window's width, `end − start`, in
+    /// **fractional seconds** — the instant `rate` denominator.
     ///
-    /// `f64`, not whole seconds: once the step can be sub-second (issue
-    /// #477 (d)) a snapped window can be narrower than one second, and the
-    /// old truncating `i64` form made the denominator `0`, so `n / 0.0`
-    /// encoded as `inf`. Widened through `i128` first: both snapped bounds
-    /// fit `i64`, but their difference need not.
+    /// `f64`, not whole seconds: a window can be narrower than one second,
+    /// and a truncating `i64` form makes the denominator `0`, so `n / 0.0`
+    /// encodes as `inf`. Widened through `i128` first: both bounds fit
+    /// `i64`, but their difference need not.
     pub(crate) fn window_seconds(&self) -> f64 {
-        let width_ns = i128::from(self.window.end_ns) - i128::from(self.window.start_ns);
+        let width_ns =
+            i128::from(self.instant_window.end_ns) - i128::from(self.instant_window.start_ns);
         width_ns as f64 / NS_PER_S as f64
     }
 
@@ -487,18 +493,32 @@ pub fn plan_trace_metrics(
         step_ms: params.step_ms,
         points: (buckets as usize) + 1,
     };
+    // Issue #601 part 2: the instant form is one bucket over exactly the
+    // requested window, and every statement reads spans from the
+    // retention floor on — the grid above is unchanged, and a floor at or
+    // past a window's end leaves it empty.
+    let instant_window = SnappedWindow {
+        start_ns: params.start_ns,
+        end_ns: params.end_ns,
+    };
+    let floored = |w: SnappedWindow| SnappedWindow {
+        start_ns: w.start_ns.max(params.floor_ns).min(w.end_ns),
+        end_ns: w.end_ns,
+    };
+    let instant_rows = floored(instant_window);
+    let range_rows = floored(range_window);
 
     let filter_sql = metrics_sql::compile_filter_predicate(
         spanset_filter.body.as_ref(),
         ctx.filter.attrs_table,
-        window,
+        instant_rows,
     )?;
     // The attribute semi-joins embed the window's own date/time pruning,
     // so the range form needs its own compilation over the range window.
     let range_filter_sql = metrics_sql::compile_filter_predicate(
         spanset_filter.body.as_ref(),
         ctx.filter.attrs_table,
-        range_window,
+        range_rows,
     )?;
     let spans = ctx.filter.spans_table;
     let keys = analysis.keys;
@@ -507,35 +527,35 @@ pub fn plan_trace_metrics(
             metrics_sql::metrics_count_range_sql(
                 spans,
                 &range_filter_sql,
-                range_window,
+                range_rows,
                 params.step_ms,
                 &keys,
             ),
-            metrics_sql::metrics_count_instant_sql(spans, &filter_sql, window, &keys),
+            metrics_sql::metrics_count_instant_sql(spans, &filter_sql, instant_rows, &keys),
         ),
         PlanKind::Agg(agg) => (
             metrics_sql::metrics_agg_range_sql(
                 spans,
                 &range_filter_sql,
-                range_window,
+                range_rows,
                 params.step_ms,
                 agg,
                 &keys,
             ),
-            metrics_sql::metrics_agg_instant_sql(spans, &filter_sql, window, agg, &keys),
+            metrics_sql::metrics_agg_instant_sql(spans, &filter_sql, instant_rows, agg, &keys),
         ),
         PlanKind::Quantile => (
             metrics_sql::metrics_quantile_range_sql(
                 spans,
                 &range_filter_sql,
-                range_window,
+                range_rows,
                 params.step_ms,
                 &analysis.quantiles,
             ),
             metrics_sql::metrics_quantile_instant_sql(
                 spans,
                 &filter_sql,
-                window,
+                instant_rows,
                 &analysis.quantiles,
             ),
         ),
@@ -543,10 +563,10 @@ pub fn plan_trace_metrics(
             metrics_sql::metrics_log2_bucket_range_sql(
                 spans,
                 &range_filter_sql,
-                range_window,
+                range_rows,
                 params.step_ms,
             ),
-            metrics_sql::metrics_log2_bucket_instant_sql(spans, &filter_sql, window),
+            metrics_sql::metrics_log2_bucket_instant_sql(spans, &filter_sql, instant_rows),
         ),
         // compare() serves from its own cross-tab/totals SQL below.
         PlanKind::Compare => (String::new(), String::new()),
@@ -582,7 +602,7 @@ pub fn plan_trace_metrics(
                 .as_ref()
                 .and_then(|f| f.body.as_ref()),
             ctx.filter.attrs_table,
-            window,
+            instant_rows,
             COMPARE_SELECTION_ALIAS_PREFIX,
         )?;
         // Compiled twice, once per window, because the two forms used to
@@ -598,7 +618,7 @@ pub fn plan_trace_metrics(
                 .as_ref()
                 .and_then(|f| f.body.as_ref()),
             ctx.filter.attrs_table,
-            range_window,
+            range_rows,
             COMPARE_SELECTION_ALIAS_PREFIX,
         )?;
         // The fixed well-known-absent-attribute set contributes 4 series
@@ -628,7 +648,7 @@ pub fn plan_trace_metrics(
             attrs_table: ctx.filter.attrs_table,
             outer: &range_filter_sql,
             inner_bool: &range_inner_bool,
-            window: range_window,
+            window: range_rows,
             bucket_expr: &range_bucket,
             cap: ctx.max_series,
             fixed_series,
@@ -640,7 +660,7 @@ pub fn plan_trace_metrics(
             attrs_table: ctx.filter.attrs_table,
             outer: &filter_sql,
             inner_bool: &inner_bool,
-            window,
+            window: instant_rows,
             bucket_expr: &instant_bucket,
             cap: ctx.max_series,
             fixed_series,
@@ -652,7 +672,7 @@ pub fn plan_trace_metrics(
             attrs_table: ctx.filter.attrs_table,
             outer: &filter_sql,
             inner_bool: &inner_bool,
-            window,
+            window: instant_rows,
             bucket_expr: &instant_probe_bucket,
             cap: ctx.max_series,
             fixed_series,
@@ -667,7 +687,7 @@ pub fn plan_trace_metrics(
                 attrs_table: ctx.filter.attrs_table,
                 outer: &range_filter_sql,
                 inner_bool: &range_inner_bool,
-                window: range_window,
+                window: range_rows,
                 bucket_expr: &range_bucket,
                 sel_window: analysis.compare_window,
                 k: per_bucket_k,
@@ -689,14 +709,14 @@ pub fn plan_trace_metrics(
             Some(metrics_sql::metrics_series_probe_sql(
                 spans,
                 &range_filter_sql,
-                range_window,
+                range_rows,
                 &keys,
                 ctx.max_series,
             )),
             Some(metrics_sql::metrics_series_probe_sql(
                 spans,
                 &filter_sql,
-                window,
+                instant_rows,
                 &keys,
                 ctx.max_series,
             )),
@@ -721,7 +741,7 @@ pub fn plan_trace_metrics(
                 Some(metrics_sql::metrics_exemplar_range_sql(
                     spans,
                     &range_filter_sql,
-                    range_window,
+                    range_rows,
                     params.step_ms,
                     per_bucket_k,
                     &keys,
@@ -737,7 +757,7 @@ pub fn plan_trace_metrics(
                 Some(metrics_sql::metrics_quantile_exemplar_range_sql(
                     spans,
                     &range_filter_sql,
-                    range_window,
+                    range_rows,
                     params.step_ms,
                     per_bucket_k,
                 )),
@@ -747,7 +767,7 @@ pub fn plan_trace_metrics(
                 Some(metrics_sql::metrics_log2_bucket_exemplar_range_sql(
                     spans,
                     &range_filter_sql,
-                    range_window,
+                    range_rows,
                     params.step_ms,
                     per_bucket_k,
                 )),
@@ -775,7 +795,9 @@ pub fn plan_trace_metrics(
         step_ms: params.step_ms,
         window,
         range_axis,
-        range_window,
+        instant_window,
+        instant_rows,
+        range_rows,
         distributed: ctx.distributed,
         range_sql,
         instant_sql,
@@ -1217,6 +1239,7 @@ mod tests {
         end_ns: 1_700_010_800_000_000_000,
         step_ms: 60_000,
         exemplars: None,
+        floor_ns: i64::MIN,
     };
 
     fn plan(q: &str) -> TraceMetricsPlan {
@@ -1324,6 +1347,7 @@ mod tests {
                 end_ns: end_s * NS_PER_S,
                 step_ms,
                 exemplars: None,
+                floor_ns: i64::MIN,
             };
             let p = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx())
                 .unwrap_or_else(|e| panic!("{start_s}..{end_s} step {step_ms}ms: {e}"));
@@ -1379,6 +1403,7 @@ mod tests {
         let plan_ex = |q: &str, exemplars: Option<u32>| {
             let params = MetricsParams {
                 exemplars,
+                floor_ns: i64::MIN,
                 ..PARAMS
             };
             plan_trace_metrics(&parse(q).expect("parse"), &params, &ctx()).expect("plan")
@@ -1456,6 +1481,7 @@ mod tests {
                 end_ns: width_ms * NS_PER_MS,
                 step_ms,
                 exemplars: None,
+                floor_ns: i64::MIN,
             };
             let got = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx());
             match (want, got) {
@@ -1481,8 +1507,8 @@ mod tests {
         }
     }
 
-    /// Issue #477: the two probes are built over DIFFERENT windows, and
-    /// the instant one is the byte-identical pre-change probe.
+    /// Issue #477: the two probes are built over DIFFERENT windows; the
+    /// instant one is over the requested window (issue #601 part 2).
     #[test]
     fn the_two_series_cap_probes_are_over_different_windows() {
         for q in [
@@ -1501,7 +1527,7 @@ mod tests {
             );
             assert!(
                 instant.contains(
-                    "timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000"
+                    "timestamp_ns >= 1700000000000000000 AND timestamp_ns < 1700010800000000000"
                 ),
                 "{q}: the instant probe is over the instant window: {instant}"
             );
@@ -1516,17 +1542,70 @@ mod tests {
         assert!(p.instant_probe_sql().is_none());
     }
 
+    /// The grid snaps outward to step boundaries; the instant window does
+    /// not (issue #601 part 2).
     #[test]
-    fn the_window_snaps_outward_to_epoch_aligned_step_boundaries() {
+    fn the_grid_snaps_outward_to_epoch_aligned_step_boundaries() {
         let p = plan("{} | rate()");
         // 1_700_000_000 is not a multiple of 60 → S floors to
         // 1_699_999_980; 1_700_010_800 → E ceils to 1_700_010_840.
+        assert_eq!(p.range_axis().first_ms, 1_699_999_980_000);
+        assert_eq!(p.snapped_end_ms(), 1_700_010_840_000);
         assert_eq!(
             p.snapped_window_ns(),
-            (1_699_999_980_000_000_000, 1_700_010_840_000_000_000)
+            (1_700_000_000_000_000_000, 1_700_010_800_000_000_000),
+            "the instant rows are the requested window"
         );
-        assert_eq!(p.window_seconds(), 10_860.0);
-        assert_eq!(p.snapped_end_ms(), 1_700_010_840_000);
+        assert_eq!(p.window_seconds(), 10_800.0);
+    }
+
+    /// Issue #601 part 2: every statement reads from the retention floor
+    /// on, the grid unchanged; a floor at or past a window's end leaves it
+    /// empty.
+    #[test]
+    fn the_row_windows_start_at_the_floor() {
+        let floor = 1_700_005_000_000_000_000;
+        let p = plan_trace_metrics(
+            &parse("{} | rate()").unwrap(),
+            &MetricsParams {
+                floor_ns: floor,
+                ..PARAMS
+            },
+            &ctx(),
+        )
+        .unwrap();
+        assert_eq!(p.range_window_ns(), (floor, 1_700_010_840_000_000_001));
+        assert_eq!(p.snapped_window_ns(), (floor, 1_700_010_800_000_000_000));
+        assert!(
+            p.range_sql()
+                .contains(&format!("timestamp_ns >= {floor} AND timestamp_ns <")),
+            "{}",
+            p.range_sql()
+        );
+        assert!(
+            p.instant_sql()
+                .contains(&format!("timestamp_ns >= {floor} AND timestamp_ns <")),
+            "{}",
+            p.instant_sql()
+        );
+        assert_eq!(p.range_axis(), plan("{} | rate()").range_axis());
+        let past = plan_trace_metrics(
+            &parse("{} | rate()").unwrap(),
+            &MetricsParams {
+                floor_ns: i64::MAX,
+                ..PARAMS
+            },
+            &ctx(),
+        )
+        .unwrap();
+        assert_eq!(
+            past.snapped_window_ns(),
+            (1_700_010_800_000_000_000, 1_700_010_800_000_000_000)
+        );
+        assert_eq!(
+            past.range_window_ns(),
+            (1_700_010_840_000_000_001, 1_700_010_840_000_000_001)
+        );
     }
 
     #[test]
@@ -1536,6 +1615,7 @@ mod tests {
             end_ns: 1_700_010_840_000_000_000,
             step_ms: 60_000,
             exemplars: None,
+            floor_ns: i64::MIN,
         };
         let p = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx()).unwrap();
         assert_eq!(
@@ -1675,6 +1755,7 @@ mod tests {
                 end_ns: 10 * NS_PER_S,
                 step_ms: 1_000,
                 exemplars: None,
+                floor_ns: i64::MIN,
             },
             &ctx(),
         )
@@ -1844,9 +1925,9 @@ mod tests {
     }
 
     /// Issue #477: the two forms carry DIFFERENT window bounds. The
-    /// instant form keeps `[aS, aE)` byte for byte; the range form reads
-    /// `(aS - step, aE]`, spelled over integer nanoseconds as
-    /// `[aS - step + 1, aE + 1)`.
+    /// instant form reads the requested `[start, end)` (issue #601 part 2);
+    /// the range form reads `(aS - step, aE]`, spelled over integer
+    /// nanoseconds as `[aS - step + 1, aE + 1)`.
     #[test]
     fn the_generated_sql_carries_each_forms_own_window_bounds() {
         let p = plan("{} | rate()");
@@ -1859,7 +1940,7 @@ mod tests {
         );
         assert!(
             p.instant_sql().contains(
-                "WHERE timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000"
+                "WHERE timestamp_ns >= 1700000000000000000 AND timestamp_ns < 1700010800000000000"
             ),
             "{}",
             p.instant_sql()
@@ -1870,7 +1951,7 @@ mod tests {
         );
         assert_eq!(
             p.snapped_window_ns(),
-            (1_699_999_980_000_000_000, 1_700_010_840_000_000_000)
+            (1_700_000_000_000_000_000, 1_700_010_800_000_000_000)
         );
     }
 
@@ -1942,6 +2023,7 @@ mod tests {
             end_ns: PARAMS.start_ns,
             step_ms: 60_000,
             exemplars: None,
+            floor_ns: i64::MIN,
         };
         let err = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx())
             .expect_err("inverted window");
@@ -1956,6 +2038,7 @@ mod tests {
             end_ns: 12_000 * 1_000_000_000,
             step_ms: 1_000,
             exemplars: None,
+            floor_ns: i64::MIN,
         };
         let err = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx())
             .expect_err("over the cap");
@@ -1981,6 +2064,7 @@ mod tests {
             end_ns: i64::MAX,
             step_ms: 60_000,
             exemplars: None,
+            floor_ns: i64::MIN,
         };
         let err = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx())
             .expect_err("must reject, not panic");
@@ -1995,6 +2079,7 @@ mod tests {
             end_ns: i64::MIN + 1_000_000_000,
             step_ms: 60_000,
             exemplars: None,
+            floor_ns: i64::MIN,
         };
         let err = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx())
             .expect_err("must reject, not panic");
@@ -2012,6 +2097,7 @@ mod tests {
             end_ns: 9_000_000_000_000_000_000,
             step_ms: 1_000,
             exemplars: None,
+            floor_ns: i64::MIN,
         };
         let err = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx())
             .expect_err("must reject, not panic");
@@ -2031,6 +2117,7 @@ mod tests {
             end_ns: i64::MAX,
             step_ms: 1_000,
             exemplars: None,
+            floor_ns: i64::MIN,
         };
         let err = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx())
             .expect_err("must reject, not panic");
@@ -2060,6 +2147,7 @@ mod tests {
             end_ns: 8_000_000_000_000_000_000,
             step_ms: 2_000_000_000,
             exemplars: None,
+            floor_ns: i64::MIN,
         };
         let p = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx())
             .expect("8000 buckets is under the cap");
@@ -2073,6 +2161,7 @@ mod tests {
             end_ns: MAX_METRICS_POINTS * 1_000_000_000,
             step_ms: 1_000,
             exemplars: None,
+            floor_ns: i64::MIN,
         };
         assert!(plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx()).is_ok());
     }

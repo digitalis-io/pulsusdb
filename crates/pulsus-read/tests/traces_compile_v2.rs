@@ -100,6 +100,7 @@ fn metrics_statement() -> String {
             end_ns: END_NS,
             step_ms: STEP_MS,
             exemplars: None,
+            floor_ns: i64::MIN,
         },
         &MetricsCtx {
             filter: filter_ctx(),
@@ -5404,7 +5405,7 @@ fn a_count_or_number_operand_joins_the_read_spans() {
     );
     let f = text("{ span:childCount > 1 + 1 }");
     assert!(
-        f.contains("HAVING count() > 2") && !f.contains("pv_"),
+        f.contains("HAVING uniqExact(span_id, start_ns, kind) > 2") && !f.contains("pv_"),
         "{f}"
     );
     let s = compile_search_of("{ } | select(nestedSetLeft)").expect("served");

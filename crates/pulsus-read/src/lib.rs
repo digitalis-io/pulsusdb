@@ -29,18 +29,18 @@ pub use metrics::{
 };
 pub use querytext::{MAX_QUERY_TEXT_BYTES, ensure_query_text_fits};
 pub use traces::{
-    DEFAULT_METRICS_POINTS, FetchRoute, FetchWindow, FetchedResource, FetchedSpan, FetchedTrace,
-    GraphEdgeRow, GraphTarget, GraphTargetCache, GraphWindow, GroupValue, HYDRATION_BYTE_BUDGET,
-    MAX_METRICS_POINTS, MetricExemplar, MetricFunc, MetricLabel, MetricLabelValue, MetricsCtx,
-    MetricsParams, PlanError as TracePlanError, ProjectedAttribute, RETAINED_ENTRY_OVERHEAD,
-    RootSummary, RoutedMetricsPlan, SERVICE_GRAPH_MAX_EDGES, SPAN_NAME_VALUE_TYPE, SearchOutput,
-    SearchParams, SearchRequest, ServiceGraph, SpanFilterCtx, SpanSetGroup, SpanSummary,
-    StatementTables, TAG_NAMES_MAX, TAG_VALUES_MAX, TRACE_METRICS_MAX_SET_BYTES,
-    TRACE_METRICS_MAX_SET_ROWS, TRACE_SEARCH_MAX_BLOCK_ROWS, TagNames, TagValue, TagValues,
-    TagValuesRequest, TraceEngine, TraceMetricSeries, TraceMetricsPlan, TraceMetricsResult,
-    TraceReadConfig, TraceSearchResult, WireKey, compile_span_filter, go_duration_string,
-    graph_target_from_engine, non_finite_double_spelling, plan_search_request, plan_trace_metrics,
-    plan_trace_metrics_routed, service_graph_sql, spans_graph_sql, wire_arm,
+    FetchRoute, FetchWindow, FetchedResource, FetchedSpan, FetchedTrace, GraphEdgeRow, GraphTarget,
+    GraphTargetCache, GraphWindow, GroupValue, HYDRATION_BYTE_BUDGET, MAX_METRICS_POINTS,
+    MetricExemplar, MetricFunc, MetricLabel, MetricLabelValue, MetricsCtx, MetricsParams,
+    PlanError as TracePlanError, ProjectedAttribute, RETAINED_ENTRY_OVERHEAD, RootSummary,
+    RoutedMetricsPlan, SERVICE_GRAPH_MAX_EDGES, SPAN_NAME_VALUE_TYPE, SearchOutput, SearchParams,
+    SearchRequest, ServiceGraph, SpanFilterCtx, SpanSetGroup, SpanSummary, StatementTables,
+    TAG_NAMES_MAX, TAG_VALUES_MAX, TRACE_METRICS_MAX_SET_BYTES, TRACE_METRICS_MAX_SET_ROWS,
+    TRACE_SEARCH_MAX_BLOCK_ROWS, TagNames, TagValue, TagValues, TagValuesRequest, TraceEngine,
+    TraceMetricSeries, TraceMetricsPlan, TraceMetricsResult, TraceReadConfig, TraceSearchResult,
+    WireKey, compile_span_filter, go_duration_string, graph_target_from_engine,
+    non_finite_double_spelling, plan_search_request, plan_trace_metrics, plan_trace_metrics_routed,
+    service_graph_sql, spans_graph_sql, wire_arm,
 };
 
 #[cfg(test)]

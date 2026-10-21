@@ -533,6 +533,7 @@ async fn a_numbered_search_answers_over_two_shards() {
                 end_ns: window.1,
                 step_ms: 60_000,
                 exemplars: None,
+                floor_ns: i64::MIN,
             },
             &engine.metrics_ctx(),
             &tables,
@@ -1045,6 +1046,7 @@ async fn a_compare_top_n_is_ranked_over_every_shard() {
             end_ns: (now / S) * S,
             step_ms: 60_000,
             exemplars: None,
+            floor_ns: i64::MIN,
         },
         &engine.metrics_ctx(),
         &tables,
@@ -4126,4 +4128,360 @@ async fn a_log_over_the_cap_holds_the_run() {
     refresh_on(&r.s1b, &db, "KC17: ch-shard1b's run after the copy").await;
     assert_covers_g(&r.s1b, l, "KC17: the run after the copy").await;
     r.drop().await;
+}
+
+// =====================================================================
+// Issue #601 part 4a: a retried push read once over two shards (T29)
+// =====================================================================
+
+/// A 16-byte trace id whose last byte is `n`: `b1` and `b2` hash to
+/// different shards.
+fn tid4a(n: u8) -> Vec<u8> {
+    let mut v = vec![0u8; 16];
+    v[15] = n;
+    v
+}
+
+/// One request under `service`'s resource.
+fn service_request(service: &str, spans: Vec<Span>) -> ExportTraceServiceRequest {
+    let mut req = request(spans);
+    req.resource_spans[0].resource = Some(Resource {
+        attributes: vec![KeyValue {
+            key: "service.name".to_string(),
+            value: Some(AnyValue {
+                value: Some(any_value::Value::StringValue(service.to_string())),
+            }),
+            ..KeyValue::default()
+        }],
+        dropped_attributes_count: 0,
+        entity_refs: Vec::new(),
+    });
+    req
+}
+
+/// `traces_query_v2_live.rs`'s fixture Q of part 4a: trace A (`b1`) — `r`
+/// the frontend root, `p1` and `s` payment children of `r`, `p2` a payment
+/// child of `p1`, `c` a payment child of `p2`, all four in error, 100, 10,
+/// 20, 30 and 40 ms — and trace B (`b2`), `b1` a payment root, ok, 50 ms.
+fn retried_bodies(base: i64) -> (ExportTraceServiceRequest, ExportTraceServiceRequest) {
+    use opentelemetry_proto::tonic::trace::v1::Status;
+    let ms = 1_000_000i64;
+    let at = base + 1_000 * ms;
+    let one =
+        |t: u8, sid: u8, parent: Option<u8>, name: &str, start: i64, dur: i64, error: bool| Span {
+            trace_id: tid4a(t),
+            span_id: id(sid),
+            parent_span_id: parent.map(id).unwrap_or_default(),
+            name: name.to_string(),
+            kind: 2,
+            start_time_unix_nano: start as u64,
+            end_time_unix_nano: (start + dur) as u64,
+            status: error.then(|| Status {
+                message: "boom".to_string(),
+                code: 2,
+            }),
+            ..Span::default()
+        };
+    let mut a = service_request(
+        "frontend",
+        vec![one(0xb1, 1, None, "r", at, 100 * ms, false)],
+    );
+    a.resource_spans.extend(
+        service_request(
+            "payment",
+            vec![
+                one(0xb1, 2, Some(1), "p1", at + 10 * ms, 10 * ms, true),
+                one(0xb1, 3, Some(1), "s", at + 20 * ms, 20 * ms, true),
+                one(0xb1, 4, Some(2), "p2", at + 30 * ms, 30 * ms, true),
+                one(0xb1, 5, Some(4), "c", at + 40 * ms, 40 * ms, true),
+            ],
+        )
+        .resource_spans,
+    );
+    let b = service_request(
+        "payment",
+        vec![one(0xb2, 6, None, "b1", at + 1_000 * ms, 50 * ms, false)],
+    );
+    (a, b)
+}
+
+/// The cluster's `SELECT`s of `db` finished since `t0_ns` and how many ran
+/// with `final = 1`, over every replica, read until two reads a second
+/// apart agree on at least one.
+async fn cluster_final_statements(nodes: &[&ChClient], db: &str, t0_ns: i64) -> (u64, u64) {
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, PartialEq, Clone, Copy)]
+    struct Logged {
+        n: u64,
+        f: u64,
+    }
+    let read = || async {
+        for node in nodes {
+            exec(node, "SYSTEM FLUSH LOGS").await;
+        }
+        let sql = format!(
+            "SELECT count() AS n, countIf(Settings['final'] = '1') AS f \
+             FROM clusterAllReplicas('{CLUSTER_NAME}', system.query_log) \
+             WHERE type = 'QueryFinish' AND query_kind = 'Select' AND has(databases, '{db}') \
+             AND event_time_microseconds >= toDateTime64({}, 6)",
+            t0_ns as f64 / 1e9
+        );
+        let mut st = nodes[0]
+            .query_stream::<Logged>(&sql, &QuerySettings::new())
+            .await
+            .expect("read the query log");
+        st.next().await.expect("one row").expect("decode")
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let a = read().await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let b = read().await;
+        if a == b && a.n >= 1 {
+            return (a.n, a.f);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the query log did not settle within 60 s: {a:?} then {b:?}"
+        );
+    }
+}
+
+/// T29 (issue #601 part 4a): **a retried push stored twice is read once
+/// over two shards**, with merges stopped on all three replicas: the
+/// search's detail read and fold (T16, T17), a count and a comparison
+/// (T22, T25) and the fetch (T26), none of them under `final`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retried_push_is_counted_once_over_two_shards() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db("pulsus_read_it_t601p4a_cluster");
+    let bootstrap = ChClient::new(shard1_config("default"))
+        .await
+        .expect("connect shard1");
+    exec(
+        &bootstrap,
+        &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
+    )
+    .await;
+    run_init(&bootstrap, &cluster_ctx(&db))
+        .await
+        .expect("run_init");
+    let shard1 = ChClient::new(shard1_config(&db))
+        .await
+        .expect("connect shard1");
+    let shard1b = ChClient::new(shard1b_config(&db))
+        .await
+        .expect("connect shard1b");
+    let shard2 = ChClient::new(shard2_config(&db))
+        .await
+        .expect("connect shard2");
+    for node in [&shard1, &shard1b, &shard2] {
+        exec(node, &format!("SYSTEM STOP MERGES {db}.spans")).await;
+    }
+    let base = (now_ns() / S - 600) * S;
+    let (a, b) = retried_bodies(base);
+    land(&shard1, &a, "q0").await;
+    land(&shard1, &b, "q1").await;
+    land(&shard1, &a, "q2").await;
+    for t in ["spans_dist", "traces_dist"] {
+        exec(&shard1, &format!("SYSTEM FLUSH DISTRIBUTED {db}.{t}")).await;
+    }
+    let local = (
+        count(&shard1, "SELECT count() AS n FROM spans").await,
+        count(&shard2, "SELECT count() AS n FROM spans").await,
+    );
+    assert!(
+        local.0 > 0 && local.1 > 0 && local.0 + local.1 == 11,
+        "A twice and B once, split across the shards: {local:?}"
+    );
+    assert_eq!(
+        count(
+            &shard1,
+            "SELECT uniqExact(trace_id, start_ns, span_id, kind) AS n FROM spans_dist"
+        )
+        .await,
+        6,
+        "six span identities"
+    );
+
+    let engine = pulsus_read::TraceEngine::new(
+        ChClient::new(shard1_config(&db))
+            .await
+            .expect("connect the engine"),
+        config(),
+    );
+    let tables = StatementTables {
+        spans: "spans_dist",
+        resources: "resources",
+        traces: "traces_dist",
+        indexed: &[],
+    };
+    let nodes = [&shard1, &shard1b, &shard2];
+    let mut wrong = Vec::new();
+    let mut judge = |case: &str, got: String, want: &str, finals: (u64, u64)| {
+        eprintln!(
+            "{case}: {got}; {} of {} statements with final",
+            finals.1, finals.0
+        );
+        if got != want {
+            wrong.push(format!("{case} (a): {got:?}, expected {want:?}"));
+        }
+        if finals.1 != 0 {
+            wrong.push(format!(
+                "{case} (b): {} of {} statements ran with final, expected 0",
+                finals.1, finals.0
+            ));
+        }
+    };
+
+    for (case, q, want) in [
+        (
+            "T16",
+            r#"{ resource.service.name = "payment" && status = error }"#,
+            "b1 4 [02, 03, 04, 05]",
+        ),
+        (
+            "T17a",
+            r#"{ resource.service.name = "payment" } | count() > 3"#,
+            "b1 4 [02, 03, 04, 05]",
+        ),
+        (
+            "T17b",
+            r#"{ resource.service.name = "payment" } | count() > 4"#,
+            "",
+        ),
+    ] {
+        let request = plan_search_request(
+            &pulsus_traceql::parse(q).expect("parses"),
+            &SearchParams {
+                start_ns: base,
+                end_ns: base + 10 * S,
+                limit: 20,
+                spss: 10,
+            },
+            &tables,
+            64,
+        )
+        .expect("plans");
+        let t0 = now_ns();
+        let out = engine
+            .search_routed(&request)
+            .await
+            .expect("the search answers");
+        let got = out
+            .traces
+            .iter()
+            .map(|t| {
+                let ids: Vec<String> = t
+                    .spans
+                    .iter()
+                    .map(|s| format!("{:02x}", s.span_id[7]))
+                    .collect();
+                format!("{:02x} {} [{}]", t.trace_id[15], t.matched, ids.join(", "))
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        judge(
+            case,
+            got,
+            want,
+            cluster_final_statements(&nodes, &db, t0).await,
+        );
+    }
+
+    let metrics = |q: &str| {
+        pulsus_read::plan_trace_metrics_routed(
+            &pulsus_traceql::parse(q).expect("parses"),
+            &pulsus_read::MetricsParams {
+                start_ns: base,
+                end_ns: base + 10 * S,
+                step_ms: 10_000,
+                exemplars: None,
+                floor_ns: i64::MIN,
+            },
+            &engine.metrics_ctx(),
+            &tables,
+        )
+        .expect("planned")
+    };
+    let sums = |out: &pulsus_read::TraceMetricsResult| {
+        let mut m = std::collections::BTreeMap::new();
+        for s in &out.series {
+            let name = s
+                .labels
+                .iter()
+                .map(|l| match &l.value {
+                    pulsus_read::MetricLabelValue::Str(v) => format!("{}={v}", l.key),
+                    other => format!("{}={other:?}", l.key),
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            *m.entry(name).or_insert(0.0) += s.samples.iter().map(|(_, v)| *v).sum::<f64>();
+        }
+        m
+    };
+
+    let routed = metrics("{ status = error } | count_over_time()");
+    let t0 = now_ns();
+    let out = engine
+        .metrics_range_routed(&routed)
+        .await
+        .expect("the count answers");
+    let got = sums(&out)
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    judge(
+        "T22",
+        got,
+        "__name__=count_over_time=4",
+        cluster_final_statements(&nodes, &db, t0).await,
+    );
+
+    let routed = metrics("{ } | compare({ status = error })");
+    let t0 = now_ns();
+    let out = engine
+        .metrics_range_routed(&routed)
+        .await
+        .expect("the comparison answers");
+    let s = sums(&out);
+    let got = [
+        "__meta_type=selection,resource.service.name=payment",
+        "__meta_type=selection,rootServiceName=frontend",
+    ]
+    .iter()
+    .map(|k| format!("{k} {}", s.get(*k).copied().unwrap_or(-1.0)))
+    .collect::<Vec<_>>()
+    .join("; ");
+    judge(
+        "T25",
+        got,
+        "__meta_type=selection,resource.service.name=payment 4; \
+         __meta_type=selection,rootServiceName=frontend 4",
+        cluster_final_statements(&nodes, &db, t0).await,
+    );
+
+    let t0 = now_ns();
+    let fetched = engine
+        .fetch_by_id(&("00".repeat(15) + "b1"), None)
+        .await
+        .expect("the fetch answers");
+    let ids: std::collections::BTreeSet<String> = fetched
+        .spans
+        .iter()
+        .map(|s| format!("{:02x}/{}", s.span_id[7], s.kind))
+        .collect();
+    judge(
+        "T26",
+        ids.into_iter().collect::<Vec<_>>().join(" "),
+        "01/2 02/2 03/2 04/2 05/2",
+        cluster_final_statements(&nodes, &db, t0).await,
+    );
+
+    exec(
+        &bootstrap,
+        &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
+    )
+    .await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }

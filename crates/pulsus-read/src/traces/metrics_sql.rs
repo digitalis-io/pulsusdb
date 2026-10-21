@@ -17,10 +17,10 @@
 //! instant landing exactly on a grid point belongs to THAT point — via
 //! [`range_bucket_expr`]. `metrics_plan` hands them the widened range
 //! window `[aS - step + 1, aE + 1)`, i.e. the instants `(aS - step, aE]`,
-//! which is one whole step wider on the left than the instant window and
-//! includes `aE` itself. The INSTANT builders keep the snapped window
-//! `[S, E)` unchanged, and their `WHERE` bound stays left-closed /
-//! right-open (`>= S`, `< E`) — deliberately different from search's
+//! which includes `aE` itself. The INSTANT builders take the requested
+//! window `[start, end)` exactly, unsnapped (issue #601 part 2), and
+//! their `WHERE` bound is left-closed / right-open (`>= start`,
+//! `< end`) — deliberately different from search's
 //! `> start`, `<= end`. Every emitted bucket is full-width, so the
 //! client-side rate division always uses the full step.
 //!
@@ -751,8 +751,8 @@ pub fn metrics_range_sql(
     sql
 }
 
-/// The instant query — the same body over the whole snapped window
-/// `[S, E)` with no `GROUP BY`: exactly one row (`uniqExact` over an
+/// The instant query — the same body over the whole instant window
+/// `[start, end)` with no `GROUP BY`: exactly one row (`uniqExact` over an
 /// empty set is a single `n = 0` row, the documented empty-DB vector
 /// oracle). The rate division by the window width happens client-side at
 /// the encode boundary, like the range path's division by the step.
@@ -848,7 +848,7 @@ pub fn metrics_count_range_sql(
     sql
 }
 
-/// The grouped/ungrouped **count** instant query (whole snapped window,
+/// The grouped/ungrouped **count** instant query (whole instant window,
 /// no time bucket). With by-keys this yields one row per label-set.
 pub fn metrics_count_instant_sql(
     spans_table: &str,
@@ -902,7 +902,7 @@ pub fn metrics_agg_range_sql(
 }
 
 /// The grouped/ungrouped value-aggregation instant query — the same
-/// dedup-then-aggregate over the whole snapped window, no time bucket.
+/// dedup-then-aggregate over the whole instant window, no time bucket.
 pub fn metrics_agg_instant_sql(
     spans_table: &str,
     filter: &FilterSql,
@@ -977,7 +977,7 @@ pub fn metrics_quantile_range_sql(
 }
 
 /// The ungrouped `quantile_over_time` instant query — the same
-/// dedup-then-TDigest over the whole snapped window, no time bucket.
+/// dedup-then-TDigest over the whole instant window, no time bucket.
 pub fn metrics_quantile_instant_sql(
     spans_table: &str,
     filter: &FilterSql,
@@ -1061,7 +1061,7 @@ pub fn metrics_log2_bucket_range_sql(
 }
 
 /// The ungrouped `histogram_over_time` instant form — the same tally
-/// over the whole snapped window, no time bucket.
+/// over the whole instant window, no time bucket.
 pub fn metrics_log2_bucket_instant_sql(
     spans_table: &str,
     filter: &FilterSql,

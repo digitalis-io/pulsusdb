@@ -37,12 +37,17 @@ impl TraceEngine {
                 .metric_statement_rows::<CompareStatementRow>(
                     statement.range_sql(),
                     statement.demands(),
+                    statement.keeps_final(),
                 )
                 .await?;
             return frame_compare_rows(routed.plan(), rows, Some(routed.plan().range_axis()));
         }
         let rows = self
-            .metric_statement_rows::<MetricStatementRow>(statement.range_sql(), statement.demands())
+            .metric_statement_rows::<MetricStatementRow>(
+                statement.range_sql(),
+                statement.demands(),
+                statement.keeps_final(),
+            )
             .await?;
         frame(
             routed.plan(),
@@ -67,6 +72,7 @@ impl TraceEngine {
                 .metric_statement_rows::<CompareStatementRow>(
                     statement.instant_sql(),
                     statement.demands(),
+                    statement.keeps_final(),
                 )
                 .await?;
             return frame_compare_rows(routed.plan(), rows, None);
@@ -75,19 +81,22 @@ impl TraceEngine {
             .metric_statement_rows::<MetricStatementRow>(
                 statement.instant_sql(),
                 statement.demands(),
+                statement.keeps_final(),
             )
             .await?;
         frame(routed.plan(), statement, rows, None)
     }
 
-    /// Issues `sql` under [`statement_settings`]: a metrics statement's
-    /// rows, or a comparison's (issue #597), under the same error mapping.
+    /// Issues `sql` under [`statement_settings`], with `final` when the
+    /// statement keeps it: a metrics statement's rows, or a comparison's
+    /// (issue #597), under the same error mapping.
     async fn metric_statement_rows<R: ChRow>(
         &self,
         sql: &str,
         demands: &[String],
+        keeps_final: bool,
     ) -> Result<Vec<R>, ReadError> {
-        let settings = statement_settings(&self.config);
+        let settings = statement_settings(&self.config, keeps_final);
         let mut stream = self
             .dispatch
             .query_stream::<R, _>(sql, &settings, |e| self.map_statement_error(e, demands))
@@ -293,6 +302,7 @@ mod tests {
             end_ns: 1_700_000_060_000_000_000,
             step_ms: 60_000,
             exemplars: None,
+            floor_ns: i64::MIN,
         };
         let tables = StatementTables {
             spans: "spans",

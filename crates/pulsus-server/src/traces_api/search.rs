@@ -86,15 +86,13 @@ async fn search_impl(
         traces: &read_config.traces_table,
         indexed: &indexed,
     };
-    // Issue #591 part 3's amendment: the window starts no earlier than the
-    // retention cutoff, for both engines, so a span past its retention is
-    // never returned whether or not storage has deleted it yet. Parameter
-    // faults were answered above, on the window as sent; a window wholly
-    // before the cutoff becomes empty and answers no traces.
-    let start_ns = params
-        .start_ns
-        .max(retention_floor_ns(state.config.retention_days, now_ns()))
-        .min(params.end_ns);
+    // docs/api.md §4, "Retention": the window starts no earlier than the
+    // retention cutoff, for both engines.
+    let start_ns = params::floored_start(
+        params.start_ns,
+        params.end_ns,
+        params::retention_floor_ns(state.config.retention_days, super::tags::now_unix_nanos()),
+    );
     let search_params = pulsus_read::SearchParams {
         start_ns,
         end_ns: params.end_ns,
@@ -121,26 +119,6 @@ async fn search_impl(
         );
     }
     Ok((StatusCode::OK, Json(body)).into_response())
-}
-
-/// The first nanosecond a search reads: a span is expired once
-/// `intDiv(start_ns, 1e9) + retention_days * 86400 <= now`, the tables'
-/// own TTL, so the first kept nanosecond is
-/// `(now_s - retention_days * 86400 + 1) * 1e9`.
-fn retention_floor_ns(retention_days: u32, now_ns: i64) -> i64 {
-    now_ns
-        .div_euclid(1_000_000_000)
-        .saturating_sub(i64::from(retention_days).saturating_mul(86_400))
-        .saturating_add(1)
-        .saturating_mul(1_000_000_000)
-}
-
-/// The wall clock in nanoseconds, as `logs_api/params.rs`'s `now_ns`.
-fn now_ns() -> i64 {
-    let dur = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    i64::try_from(dur.as_nanos()).unwrap_or(i64::MAX)
 }
 
 #[cfg(test)]

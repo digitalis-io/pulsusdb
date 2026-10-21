@@ -4055,3 +4055,13 @@ Applies to `GET /api/traces/v1/search` and its alias.
 | `traceID`, `trace:id`, `link:traceID` | leading zeros trimmed (`pkg/util/traceid.go:31-41`); `left_pad_trace_ids` restores them in `traceID` only | 32 characters everywhere | divergence; one spelling across every PulsusDB route |
 | `serviceStats`, the singular `spanSet` | emitted (`engine.go:296-306`, `:351`) | not emitted | divergence; the trace datasource reads `spanSets` and never `serviceStats` |
 | an attribute string over 2048 bytes | cut at ingest (`modules/distributor/distributor.go:677-698`, `:789-817`) | stored whole, cut at 8192 bytes in the search response | divergence; `docs/api.md` §4.2 |
+
+### `traceql-request-parameters-against-the-reference` (issue #601 part 2) — **request parameters read against the reference's source**
+
+| parameter | the reference | here | disposition |
+|---|---|---|---|
+| a search with no `start` and `end` | searches its in-memory stores | `400` | divergence: no stored-window counterpart; the trace datasource sends both |
+| a search or tag window over 168 h; a metrics window over 24 h | `400` at its defaults | answered within the read budgets | divergence |
+| `minDuration`/`maxDuration` | cut to whole milliseconds; a negative value wraps | exact nanoseconds; a negative value is `400` | divergence |
+| tag `maxStaleValues` | an early stop after N values already seen | ignored | divergence: the early stop can under-report |
+| a span past retention that storage still holds | shown until its block is deleted | not returned by a windowed read | divergence |

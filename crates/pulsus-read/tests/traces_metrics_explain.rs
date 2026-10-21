@@ -346,6 +346,7 @@ fn plan_for(engine: &TraceEngine, q: &str, start_ns: i64, end_ns: i64) -> TraceM
             end_ns,
             step_ms: 3_600_000,
             exemplars: None,
+            floor_ns: i64::MIN,
         },
         &engine.metrics_ctx(),
     )

@@ -21,7 +21,7 @@ FROM (
   WITH arrayFirstIndex((k, s) -> k = 'env' AND s = 'span', attr_key, attr_scope) AS pi0
   SELECT service AS g0, trace_id, span_id, any(duration_ns) AS val
   FROM trace_spans
-  WHERE timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000
+  WHERE timestamp_ns >= 1700000000000000000 AND timestamp_ns < 1700010800000000000
     AND ((pi0 != 0) AND attr_val[pi0] = 'prod')
   GROUP BY g0, trace_id, span_id
 )
@@ -33,7 +33,7 @@ SELECT count() AS n FROM (
   WITH arrayFirstIndex((k, s) -> k = 'env' AND s = 'span', attr_key, attr_scope) AS pi0
   SELECT service AS g0
   FROM trace_spans
-  WHERE timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000
+  WHERE timestamp_ns >= 1700000000000000000 AND timestamp_ns < 1700010800000000000
     AND ((pi0 != 0) AND attr_val[pi0] = 'prod')
   GROUP BY g0
   LIMIT 1001

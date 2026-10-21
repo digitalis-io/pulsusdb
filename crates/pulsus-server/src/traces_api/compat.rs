@@ -107,10 +107,19 @@ async fn tag_values_v1_for(
 
 /// `GET /api/search/tags` — Tempo v1 flat `{"tagNames":[…]}`.
 pub(crate) async fn tags_v1(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
-    match tag_names_for(state, raw.as_deref().unwrap_or("")).await {
-        Ok(source) => ok_json(tags_response::render_tag_names_flat(&source.answer(false))),
+    let raw = raw.as_deref().unwrap_or("");
+    match tag_names_for(state, raw).await {
+        Ok(source) => ok_json(tags_response::render_tag_names_flat(
+            &source.answer(false),
+            limit_of(raw),
+        )),
         Err(e) => e.into_response(),
     }
+}
+
+/// The request's tag `limit` (`params::parse_tag_limit`).
+fn limit_of(raw_query: &str) -> Option<usize> {
+    params::parse_tag_limit(&params::parse_pairs(raw_query))
 }
 
 /// `GET /api/search/tag/{tag}/values` — Tempo v1 flat
@@ -120,8 +129,12 @@ pub(crate) async fn tag_values_v1(
     Path(tag): Path<String>,
     RawQuery(raw): RawQuery,
 ) -> Response {
-    match tag_values_v1_for(state, &tag, raw.as_deref().unwrap_or("")).await {
-        Ok(values) => ok_json(tags_response::render_tag_values_flat(&values)),
+    let raw = raw.as_deref().unwrap_or("");
+    match tag_values_v1_for(state, &tag, raw).await {
+        Ok(values) => ok_json(tags_response::render_tag_values_flat(
+            &values,
+            limit_of(raw),
+        )),
         Err(e) => e.into_response(),
     }
 }
@@ -129,9 +142,11 @@ pub(crate) async fn tag_values_v1(
 /// `GET /api/v2/search/tags` — the native scoped shape minus
 /// `truncated`.
 pub(crate) async fn tags_v2(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
-    match tag_names_for(state, raw.as_deref().unwrap_or("")).await {
+    let raw = raw.as_deref().unwrap_or("");
+    match tag_names_for(state, raw).await {
         Ok(source) => ok_json(tags_response::render_tag_names_scoped_v2(
             &source.answer(true),
+            limit_of(raw),
         )),
         Err(e) => e.into_response(),
     }
@@ -145,8 +160,12 @@ pub(crate) async fn tag_values_v2(
     Path(tag): Path<String>,
     RawQuery(raw): RawQuery,
 ) -> Response {
-    match tags::values_for(&state, &tag, raw.as_deref().unwrap_or("")).await {
-        Ok(source) => ok_json(tags_response::render_tag_values_typed_v2(&source.answer())),
+    let raw = raw.as_deref().unwrap_or("");
+    match tags::values_for(&state, &tag, raw).await {
+        Ok(source) => ok_json(tags_response::render_tag_values_typed_v2(
+            &source.answer(),
+            limit_of(raw),
+        )),
         Err(e) => e.into_response(),
     }
 }

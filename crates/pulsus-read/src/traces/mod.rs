@@ -61,8 +61,7 @@ pub use exec::{
 pub use filter::{CompiledLeaf, CompiledSpanFilter, PlanError, SpanFilterCtx, compile_span_filter};
 pub use graph_sql::{GraphWindow, SERVICE_GRAPH_MAX_EDGES, service_graph_sql};
 pub use metrics_plan::{
-    DEFAULT_METRICS_POINTS, MAX_METRICS_POINTS, MetricFunc, MetricsCtx, MetricsParams,
-    TraceMetricsPlan, plan_trace_metrics,
+    MAX_METRICS_POINTS, MetricFunc, MetricsCtx, MetricsParams, TraceMetricsPlan, plan_trace_metrics,
 };
 pub use metrics_result::{
     MetricExemplar, MetricLabel, MetricLabelValue, TraceMetricSeries, TraceMetricsResult,

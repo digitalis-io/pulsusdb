@@ -2992,7 +2992,9 @@ async fn the_metrics_aliases_are_byte_identical_to_the_native_routes() {
             "q=%7B%7D%20%7C%20count_over_time()&start=1700000100&end=1700003700",
         ),
         // `traceql-metrics-fractional-ms-step-rejected`: a 400 the alias
-        // must reproduce byte for byte, body included.
+        // must reproduce byte for byte, body included — on `query_range`;
+        // the instant route reads no `step` and answers it (issue #601
+        // part 2).
         (
             "fractional-step-400",
             "q=%7B%7D%20%7C%20rate()&start=1700000100&end=1700003700&step=1.5ms",
@@ -3034,7 +3036,7 @@ async fn the_metrics_aliases_are_byte_identical_to_the_native_routes() {
                 );
             }
 
-            if *case == "fractional-step-400" {
+            if *case == "fractional-step-400" && leaf == "query_range" {
                 assert_eq!(
                     canonical_res.status,
                     400,

@@ -5,7 +5,8 @@ Reads OUT/paired.tsv (http_bench.py paired) and OUT/fetch.tsv
 (fetch_compare.py, the 20-span trace's two lines and then the largest trace's),
 prints one row per §6.3 shape and then each state's count, and writes the same
 as Markdown to OUT/summary.md. Exits 0 only for 13 `below`, 1 `exempt`,
-1 `no counterpart` and nothing else.
+1 `no counterpart` and nothing else. A compared or exempt shape either side
+answers with nothing (`items` 0), or g01 with no edge, is `not like for like`.
 
 Usage: bench_verdict.py OUT  |  bench_verdict.py --self-test
 """
@@ -29,7 +30,8 @@ SHAPES = [
     ('c08_compare', 'compared'),
     ('g01_service_graph', 'no counterpart'),
 ]
-STATES = ['below', 'not below', 'exempt', 'no counterpart', 'refused', 'reference failed']
+STATES = ['below', 'not below', 'exempt', 'no counterpart', 'refused', 'reference failed',
+          'not like for like']
 PASS = {'below': 13, 'exempt': 1, 'no counterpart': 1}
 
 
@@ -38,6 +40,7 @@ def verdict(paired_text, fetch_text):
     reference_bytes, state). A shape missing from an input is refused on that
     side's account."""
     halves = {}            # shape -> {side: (status, ms, bytes)}, side 'p' or 'r'
+    answered = {}          # shape -> {side: items}, from paired's p_items and r_items
     for line in paired_text.splitlines():
         c = line.split('\t')
         if len(c) < 6 or not c[0]: continue
@@ -45,6 +48,9 @@ def verdict(paired_text, fetch_text):
         h['p'] = (c[1], c[4], c[2])
         if len(c) >= 11 and c[6] != '-':
             h['r'] = (c[6], c[9], c[7])
+        for side, i in (('p', 11), ('r', 12)):
+            if len(c) > i and c[i].isdigit():
+                answered.setdefault(c[0], {})[side] = int(c[i])
     fetch = [dict(kv.split('=', 1) for kv in line.split('\t')[1:] if '=' in kv) | {'side': line.split('\t')[0]}
              for line in fetch_text.splitlines() if line.strip()]
     for shape, at in (('fetch_trace_20', 0), ('fetch_trace_largest', 2)):
@@ -56,12 +62,15 @@ def verdict(paired_text, fetch_text):
     for shape, kind in SHAPES:
         h = halves.get(shape, {})
         p, r = h.get('p'), h.get('r')
+        n = answered.get(shape, {})
         if p is None or p[0] != '200':
             state = 'refused'
         elif kind == 'no counterpart':
-            state = 'no counterpart'
+            state = 'not like for like' if n.get('p') == 0 else 'no counterpart'
         elif r is None or r[0] != '200':
             state = 'reference failed'
+        elif 0 in (n.get('p'), n.get('r')):
+            state = 'not like for like'
         elif kind == 'exempt':
             state = 'exempt'
         else:
@@ -76,7 +85,8 @@ def passes(counts):
 
 
 COUNT_LINES = [('compared below', 'below'), ('exempt', 'exempt'), ('no counterpart', 'no counterpart'),
-               ('refused', 'refused'), ('not below', 'not below'), ('reference failed', 'reference failed')]
+               ('refused', 'refused'), ('not below', 'not below'), ('reference failed', 'reference failed'),
+               ('not like for like', 'not like for like')]
 
 
 def write(out, rows, counts):
@@ -99,9 +109,9 @@ def write(out, rows, counts):
 
 
 def self_test():
-    good_p = {name: (f'{name}\t200\t1000\t1.0\t5.0\t9.0\t200\t2000\t2.0\t10.0\t20.0\t1.0\t100\t1000')
+    good_p = {name: (f'{name}\t200\t1000\t1.0\t5.0\t9.0\t200\t2000\t2.0\t10.0\t20.0\t3\t3\t1.0\t100\t1000')
               for name, _ in SHAPES if not name.startswith('fetch_')}
-    good_p['g01_service_graph'] = 'g01_service_graph\t200\t1000\t1.0\t5.0\t9.0\t-\t-\t-\t-\t-\t1.0\t100\t1000'
+    good_p['g01_service_graph'] = 'g01_service_graph\t200\t1000\t1.0\t5.0\t9.0\t-\t-\t-\t-\t-\t3\t-\t1.0\t100\t1000'
     good_f = ('PulsusDB\ttrace=aaaaaaaa\treps=21\tmin=1\tp50=4\tp90=6\tmax=9\tbytes=15000\n'
               'the reference\ttrace=aaaaaaaa\treps=21\tmin=2\tp50=8\tp90=12\tmax=20\tbytes=16000\n'
               'PulsusDB\ttrace=bbbbbbbb\treps=21\tmin=1\tp50=14\tp90=16\tmax=19\tbytes=800000\n'
@@ -145,7 +155,20 @@ def self_test():
     rows, counts = run(p)
     check('g01 absent: refused, fails', state(rows, 'g01_service_graph') == 'refused' and not passes(counts))
 
-    print(f'bench_verdict.py self-test: {6 - len(fails)} of 6 cases as expected')
+    # an answer with nothing in it is not a like-for-like comparison,
+    # whichever side gave it and however fast
+    for name, row in (
+        ('t02_tag_values_route', 't02_tag_values_route\t200\t1000\t1.0\t5.0\t9.0\t200\t55\t2.0\t10.0\t20.0\t58\t0\t1.0\t100\t1000'),
+        ('s14_trace_level', 's14_trace_level\t200\t1000\t1.0\t5.0\t9.0\t200\t2000\t2.0\t10.0\t20.0\t0\t20\t1.0\t100\t1000'),
+        ('g01_service_graph', 'g01_service_graph\t200\t1000\t1.0\t5.0\t9.0\t-\t-\t-\t-\t-\t0\t-\t1.0\t100\t1000'),
+    ):
+        p = dict(good_p); p[name] = row
+        rows, counts = run(p)
+        check(f'{name} with an empty side: not like for like, count 1, fails',
+              state(rows, name) == 'not like for like' and counts.get('not like for like') == 1
+              and not passes(counts))
+
+    print(f'bench_verdict.py self-test: {9 - len(fails)} of 9 cases as expected')
     return 1 if fails else 0
 
 

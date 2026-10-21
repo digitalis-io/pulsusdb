@@ -8,15 +8,19 @@ Usage: http_bench.py reference|pulsus BASE_URL START_S END_S REPS [CH_URL]
        http_bench.py paired PULSUS_URL REFERENCE_URL START_S END_S REPS [CH_URL]
        http_bench.py --self-test
 Prints TSV: name status bytes ms_min ms_median ms_max [statements rows_read ch_bytes_sent];
-paired: name p_status p_bytes p_min p_med p_max r_status r_bytes r_min r_med r_max [p_statements p_rows_read p_ch_bytes_sent]
+paired: name p_status p_bytes p_min p_med p_max r_status r_bytes r_min r_med r_max p_items r_items [p_statements p_rows_read p_ch_bytes_sent]
 Each shape runs once unmeasured, then REPS times; paired runs one unmeasured call
 per store, then REPS on each, the two stores alternating which goes first. A
 status is the first non-200 of any call to the shape, the unmeasured one
-included, else 200. b01/b02 fetch the traces BENCH_T20 and BENCH_TBIG when set."""
+included, else 200. b01/b02 fetch the traces BENCH_T20 and BENCH_TBIG when set;
+t02 reads the span key BENCH_T02_KEY (default http.route). paired counts the
+answer in each side's first body (`items`), and with BENCH_BODIES=DIR set
+writes that body to DIR/<shape>.pulsus and DIR/<shape>.reference."""
 import os, sys, time, json, urllib.request, urllib.parse, urllib.error, statistics
 
 T20 = os.environ.get('BENCH_T20') or '50fb0cd99260ac2a15d0a6f208126742'
 TBIG = os.environ.get('BENCH_TBIG') or '9e0ae95131b5bedbeea2c9eb5234f1ec'
+T02_KEY = os.environ.get('BENCH_T02_KEY') or 'http.route'
 
 
 def queries(native, S, E):
@@ -46,7 +50,7 @@ def queries(native, S, E):
      ('s14_trace_level', *s('{ rootServiceName = "loadgen" && traceDuration > 2s }')),
      ('s15_unscoped_and_resource', *s('{ .app.cache.hit = true && resource.k8s.pod.name = "cart-7d9f8b-00002" }')),
      ('t01_tag_names_span', TAGS, dict(w, scope='span')),
-     ('t02_tag_values_route', TAGV('span.http.route'), dict(w)),
+     ('t02_tag_values_route', TAGV(f'span.{T02_KEY}'), dict(w)),
      ('t03_tag_values_filtered', TAGV('resource.k8s.pod.name'), dict(w, q='{ resource.service.name = "cart" }')),
      ('m01_rate_by_service', QR, dict(w, q='{ } | rate() by (resource.service.name)', step='60s')),
      ('m02_quantiles_by_route', QR, dict(w, q='{ resource.service.name = "frontend" && kind = server } | quantile_over_time(duration, .5, .95, .99) by (span.http.route)', step='60s')),
@@ -75,15 +79,43 @@ def call(base, path, params):
     return (time.perf_counter() - t0) * 1000, status, body
 
 
+def items(name, body):
+    """the answer's own unit in `body`, by shape: traces for a search, tag
+    names across the scopes, tag values, series, edges, and the spans of a
+    JSON fetch; a body that is not JSON counts 0"""
+    try:
+        d = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return 0
+    if not isinstance(d, dict):
+        return 0
+    if name.startswith('s'):
+        return len(d.get('traces') or [])
+    if name.startswith('t01'):
+        return sum(len(sc.get('tags') or []) for sc in d.get('scopes') or [])
+    if name.startswith(('t02', 't03')):
+        return len(d.get('tagValues') or [])
+    if name.startswith(('m', 'c08')):
+        return len(d.get('series') or [])
+    if name.startswith('g01'):
+        return len(d.get('edges') or [])
+    if name.startswith(('b01', 'b02')):
+        return sum(len(ss.get('spans') or []) for rs in d.get('resourceSpans') or []
+                   for ss in rs.get('scopeSpans') or [])
+    return 0
+
+
 class Side:
-    """one store's calls to one shape: the measured times, the last body's
-    size, and the first non-200 status with its body"""
+    """one store's calls to one shape: the measured times, the first body,
+    the last body's size, and the first non-200 status with its body"""
     def __init__(self, base, path, params):
         self.base, self.path, self.params = base, path, params
         self.times, self.status, self.size, self.bad_body = [], 200, None, None
+        self.first = None
     def run(self, measured):
         ms, status, body = call(self.base, self.path, self.params)
         if measured: self.times.append(ms)
+        if self.first is None: self.first = body
         self.size = len(body)
         if status != 200 and self.status == 200:
             self.status, self.bad_body = status, body
@@ -141,6 +173,14 @@ def paired(p_base, r_base, shapes, reps, ch=None):
             for x in (first, second):
                 if x: x.run(True)
         line = [name] + p.cells() + (r.cells() if r else ['-'] * 5)
+        line += [str(items(name, p.first)), str(items(name, r.first)) if r else '-']
+        bodies = os.environ.get('BENCH_BODIES')
+        if bodies:
+            os.makedirs(bodies, exist_ok=True)
+            for who, x in (('pulsus', p), ('reference', r)):
+                if x:
+                    with open(os.path.join(bodies, f'{name}.{who}'), 'wb') as f:
+                        f.write(x.first)
         if ch: line += ch_cells(ch, t_start, reps + 1)
         bad = '; '.join(f'{who}: {why(x)}' for who, x in (('PulsusDB', p), ('the reference', r)) if x and x.status != 200)
         if bad: line.append(bad)
@@ -168,18 +208,47 @@ def stub(answer):
 
 
 def self_test():
-    p, ps = stub(lambda path, n: (400, b'no') if path == '/flaky' and n == 1 else (200, b'{}'))
-    r, rs = stub(lambda path, n: (200, b'{}'))
+    import tempfile
+    one = b'{"traces":[{"traceID":"aa"}]}'
+    def ours(path, n):
+        if path == '/flaky' and n == 1: return 400, b'no'
+        if path == '/search': return 200, one
+        return 200, b'{}'
+    def theirs(path, n):
+        # the first answer is the one kept: later ones hold a trace
+        if path == '/search': return 200, b'{"traces":[]}' if n == 1 else one
+        return 200, b'{}'
+    p, ps = stub(ours)
+    r, rs = stub(theirs)
+    bodies = tempfile.mkdtemp(prefix='http_bench_bodies.')
+    os.environ['BENCH_BODIES'] = bodies
     rows = {row[0]: row for row in paired(p, r, [('flaky', '/flaky', {}, '/flaky', {}),
-                                                   ('steady', '/steady', {}, '/steady', {})], 3)}
+                                                   ('steady', '/steady', {}, '/steady', {}),
+                                                   ('s99_empty_reference', '/search', {}, '/search', {})], 3)}
+    del os.environ['BENCH_BODIES']
     fails = 0
     for name, want in (('flaky', '400'), ('steady', '200')):
         got = rows[name][1] if name in rows else None
         ok = got == want
         print(f'{"ok  " if ok else "FAIL"} {name}: p_status {got}, expected {want}')
         fails += not ok
+    # a search the reference answers with no trace: its row counts 1 trace
+    # for PulsusDB and 0 for the reference, and both first bodies are kept
+    row = rows.get('s99_empty_reference', [])
+    got = (row[11] if len(row) > 11 else None, row[12] if len(row) > 12 else None)
+    ok = got == ('1', '0')
+    print(f'{"ok  " if ok else "FAIL"} s99_empty_reference: (p_items, r_items) {got}, expected (\'1\', \'0\')')
+    fails += not ok
+    kept = {}
+    for side in ('pulsus', 'reference'):
+        path = os.path.join(bodies, f's99_empty_reference.{side}')
+        kept[side] = open(path, 'rb').read() if os.path.exists(path) else None
+    ok = kept == {'pulsus': one, 'reference': b'{"traces":[]}'}
+    print(f'{"ok  " if ok else "FAIL"} s99_empty_reference: bodies written under BENCH_BODIES {kept}')
+    fails += not ok
+    import shutil; shutil.rmtree(bodies)
     ps.shutdown(); rs.shutdown()
-    print(f'http_bench.py self-test: {2 - fails} of 2 cases as expected')
+    print(f'http_bench.py self-test: {4 - fails} of 4 cases as expected')
     return 1 if fails else 0
 
 

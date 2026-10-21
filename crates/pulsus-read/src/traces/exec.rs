@@ -1482,10 +1482,10 @@ impl TraceEngine {
     }
 
     /// Executes a metrics instant plan (issue #59): the same pushed-down
-    /// body over the whole snapped window `[S, E)` with no bucketing —
+    /// body over the requested window `[start, end)` with no bucketing —
     /// exactly one row (`uniqExact` with no `GROUP BY`), returned as a
     /// one-sample label-less vector; the instant `rate` denominator is
-    /// the snapped window width (plan v2 delta 2). The caller stamps the
+    /// `end − start`. The caller stamps the
     /// sample at [`TraceMetricsPlan::snapped_end_ms`].
     pub async fn metrics_instant(
         &self,
@@ -1746,9 +1746,9 @@ impl TraceEngine {
     /// (the server's `parse_trace_id` is the one validation point) —
     /// injection-safe because only `[0-9a-f]` can then reach the
     /// `unhex('...')` literal. An empty `spans` means no statement found
-    /// the trace; duplicate `(span_id, kind)` pairs that survive
-    /// `final = 1` are returned as stored, because dedup across replicas
-    /// is the assembler's read-time concern.
+    /// the trace; duplicate `(span_id, kind)` pairs — a span stored twice,
+    /// read without `final` — are returned as stored, because the dedup is
+    /// the assembler's read-time concern.
     ///
     /// `window` is the request's own `start`/`end` when it supplied them.
     /// **The indexed statement never reads it** — its bounds come from the
@@ -2045,8 +2045,9 @@ impl TraceEngine {
         Ok((output, explain))
     }
 
-    /// The shared body: each statement with the search settings plus
-    /// `final = 1`, its rows and decode charged to one 256 MiB budget. A
+    /// The shared body: each statement with its own settings
+    /// (`newest_first.rs`'s `statement_settings`), its rows and decode
+    /// charged to one 256 MiB budget. A
     /// request the statement's compiler refuses is a `400` with its text.
     async fn search_routed_inner(
         &self,
@@ -2085,10 +2086,6 @@ impl TraceEngine {
             &self.indexed,
             slice_ns,
         )
-    }
-
-    fn search_settings(&self) -> QuerySettings {
-        search_settings(&self.config)
     }
 
     /// Runs one search query to completion inside its own scope (the
@@ -2344,19 +2341,16 @@ fn catalog_settings(config: &TraceReadConfig) -> QuerySettings {
 /// beside [`search_settings`] and [`catalog_settings`], not a change to
 /// either.
 ///
-/// [`catalog_settings`]'s budget set, **plus `final = 1`**, **plus**
+/// [`catalog_settings`]'s budget set, **plus**
 /// `QuerySettings::clustered_reader` as the base when clustered.
 /// `catalog_settings` deliberately carries no clustered-reader block
 /// because the catalogs are `Replication::Global`; the fetch reads two
 /// `PerShard` tables, so it needs one.
 ///
-/// **`final = 1` is a setting, not SQL text**, and it is what makes a
-/// retried span single on a read taken before the next merge. It applies
-/// to the span table (collapsing a repeat of the
-/// `(bucket, trace_id, start_ns, span_id, kind)` key), to the resource
-/// table (collapsing a repeat of `(service, resource_id)` inside a day)
-/// and to the per-trace table. On the per-trace table it changes nothing
-/// the statements act on: `index_rows` is read only as `!= 0`, and
+/// **No `final`** (issue #601 part 4a). A retried span stored twice comes
+/// back twice in the span array and the server's rebuild keeps one per
+/// `(span_id, kind)`; the resource read groups by `resource_id` with `any`;
+/// and on the per-trace table `index_rows` is read only as `!= 0` and
 /// `min`/`max` are idempotent under aggregation, so they return the same
 /// value whether the trace's day rows have been collapsed or not.
 ///
@@ -2376,15 +2370,13 @@ fn fetch_settings(config: &TraceReadConfig) -> QuerySettings {
     } else {
         QuerySettings::new()
     };
-    with_final(
-        base.answer_pins(config.distributed, config.skip_unavailable_shards)
-            .set("max_rows_to_read", config.scan_budget_rows)
-            .set("max_bytes_to_read", TRACE_READ_BYTES_BUDGET)
-            .set("read_overflow_mode", "throw")
-            .set("max_query_size", crate::querytext::MAX_QUERY_TEXT_BYTES)
-            .set("max_memory_usage", config.read_max_memory_bytes)
-            .set("max_bytes_before_external_group_by", 0u64),
-    )
+    base.answer_pins(config.distributed, config.skip_unavailable_shards)
+        .set("max_rows_to_read", config.scan_budget_rows)
+        .set("max_bytes_to_read", TRACE_READ_BYTES_BUDGET)
+        .set("read_overflow_mode", "throw")
+        .set("max_query_size", crate::querytext::MAX_QUERY_TEXT_BYTES)
+        .set("max_memory_usage", config.read_max_memory_bytes)
+        .set("max_bytes_before_external_group_by", 0u64)
 }
 
 /// `final = 1`, with each partition merged on its own (issue #594 part 1):
@@ -2530,11 +2522,20 @@ fn metrics_settings(config: &TraceReadConfig) -> QuerySettings {
 }
 
 /// The settings the metrics statement runs under (issue #594 part 5):
-/// [`metrics_settings`] with `final = 1` and no set limit. The statement
-/// builds the sets of the seven trace-level and nested-set fields, bounded
-/// by the read memory ceiling and the scan budget, not by a set limit.
-fn statement_settings(config: &TraceReadConfig) -> QuerySettings {
-    with_final(metrics_settings(config))
+/// [`metrics_settings`] with no set limit, and with `final = 1` when the
+/// statement keeps it (issue #601 part 4a: it reads the nested-set
+/// numbering; every other statement keeps one row per span identity
+/// itself). The statement builds the sets of the seven trace-level and
+/// nested-set fields, bounded by the read memory ceiling and the scan
+/// budget, not by a set limit.
+fn statement_settings(config: &TraceReadConfig, keeps_final: bool) -> QuerySettings {
+    let settings = metrics_settings(config);
+    let settings = if keeps_final {
+        with_final(settings)
+    } else {
+        settings
+    };
+    settings
         .set("max_rows_in_set", 0u64)
         .set("max_bytes_in_set", 0u64)
 }
@@ -2995,11 +2996,11 @@ fn thin_collected_exemplars(collected: &mut Vec<(usize, MetricExemplar)>, budget
 
 /// The count-path (`rate`/`count_over_time`) encode-boundary value:
 /// `rate` divides by its denominator (one bucket's width per range
-/// sample, the snapped window's width for an instant) in `f64` here —
+/// sample, the requested window's width for an instant) in `f64` here —
 /// never in SQL; `count_over_time` is the deduped count itself.
 ///
 /// The denominator is **fractional seconds** (issue #477 (d)): a
-/// sub-second step, or a snapped window narrower than a second, truncated
+/// sub-second step, or an instant window narrower than a second, truncated
 /// to `0` under the old whole-second form and made every rate `inf`.
 fn count_value(is_rate: bool, n: u64, rate_denominator_seconds: f64) -> f64 {
     if is_rate {
@@ -3392,7 +3393,7 @@ mod tests {
     /// on one host, which is not one position, so it closes none of the
     /// visibility states it was proposed for.
     #[test]
-    fn fetch_settings_carries_exactly_the_clustered_budget_set_and_final() {
+    fn fetch_settings_carries_exactly_the_clustered_budget_set_and_no_final() {
         let clustered = TraceReadConfig {
             distributed: true,
             skip_unavailable_shards: true,
@@ -3437,8 +3438,6 @@ mod tests {
             // would pass against a config that carried something else.
             ("max_memory_usage", mem.as_str()),
             ("max_bytes_before_external_group_by", "0"),
-            ("final", "1"),
-            ("do_not_merge_across_partitions_select_final", "1"),
         ]
         .iter()
         .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
@@ -3455,8 +3454,8 @@ mod tests {
             "a replica preference closes none of the visibility states"
         );
 
-        // Unclustered: the 17 answer pins, then the same budgets and
-        // `final`, with no clustered-reader block at all.
+        // Unclustered: the 17 answer pins, then the same budgets, with no
+        // clustered-reader block at all and no `final`.
         let local: Vec<String> = fetch_settings(&cfg())
             .entries()
             .map(|(k, _)| k.to_string())
@@ -3468,8 +3467,6 @@ mod tests {
             "max_query_size",
             "max_memory_usage",
             "max_bytes_before_external_group_by",
-            "final",
-            "do_not_merge_across_partitions_select_final",
         ]);
         assert_eq!(local, want_local);
     }
@@ -3728,10 +3725,9 @@ mod tests {
     /// clustered, it keeps the local product mode the sets need.
     #[test]
     fn the_statement_builds_sets_under_the_memory_ceiling() {
-        let s = statement_settings(&cfg());
+        let s = statement_settings(&cfg(), false);
         assert_eq!(s.get("max_rows_in_set"), Some("0"));
         assert_eq!(s.get("max_bytes_in_set"), Some("0"));
-        assert_eq!(s.get("final"), Some("1"));
         assert_eq!(
             s.get("max_memory_usage"),
             Some(TEST_READ_MEM.to_string().as_str())
@@ -3740,9 +3736,65 @@ mod tests {
         let mut clustered = cfg();
         clustered.distributed = true;
         assert_eq!(
-            statement_settings(&clustered).get("distributed_product_mode"),
+            statement_settings(&clustered, false).get("distributed_product_mode"),
             Some("local")
         );
+    }
+
+    /// T14 (issue #601 part 4a): a metrics statement runs under `final`
+    /// only when it reads the nested-set numbering; every other statement
+    /// removes a stored span's copies itself.
+    #[test]
+    fn a_metrics_statement_keeps_final_only_when_it_numbers() {
+        use crate::traces::filter::SpanFilterCtx;
+        use crate::traces::metrics_plan::MetricsParams;
+        use crate::traces::spans::metrics::{StatementTables, plan_trace_metrics_routed};
+        let ctx = crate::traces::metrics_plan::MetricsCtx {
+            filter: SpanFilterCtx {
+                spans_table: "trace_spans",
+                attrs_table: "trace_attrs_idx",
+            },
+            scan_budget_rows: 50_000_000,
+            max_series: 1_000,
+            distributed: false,
+            skip_unavailable_shards: false,
+        };
+        let params = MetricsParams {
+            start_ns: 1_700_000_000_000_000_000,
+            end_ns: 1_700_000_600_000_000_000,
+            step_ms: 60_000,
+            exemplars: None,
+            floor_ns: i64::MIN,
+        };
+        let tables = StatementTables {
+            spans: "spans",
+            resources: "resources",
+            traces: "traces",
+            indexed: &[],
+        };
+        for (q, want) in [
+            ("{ status = error } | count_over_time()", None),
+            (
+                "{ status = error } | count_over_time() by(nestedSetParent)",
+                Some("1"),
+            ),
+        ] {
+            let routed = plan_trace_metrics_routed(
+                &pulsus_traceql::parse(q).expect("parses"),
+                &params,
+                &ctx,
+                &tables,
+            )
+            .unwrap_or_else(|e| panic!("{q}: {e}"));
+            let stmt = routed
+                .statement()
+                .unwrap_or_else(|| panic!("{q}: no statement"));
+            assert_eq!(
+                statement_settings(&cfg(), stmt.keeps_final()).get("final"),
+                want,
+                "{q}"
+            );
+        }
     }
 
     /// Issue #173: `graph_settings` carries the search row/byte budget and
@@ -4483,7 +4535,7 @@ mod tests {
                     ("tag_store_settings", tag_store_settings(&config)),
                     ("fetch_settings", fetch_settings(&config)),
                     ("metrics_settings", metrics_settings(&config)),
-                    ("statement_settings", statement_settings(&config)),
+                    ("statement_settings", statement_settings(&config, false)),
                     ("graph_settings", graph_settings(&config)),
                 ];
                 for (builder, s) in &builders {
@@ -4616,7 +4668,7 @@ mod tests {
                 // `fetch_by_id`'s settings object, by construction.
                 ("fetch_by_id (point read)", catalog_settings(&c)),
                 ("metrics_settings", metrics_settings(&c)),
-                ("statement_settings", statement_settings(&c)),
+                ("statement_settings", statement_settings(&c, false)),
                 ("graph_settings", graph_settings(&c)),
             ] {
                 assert_eq!(

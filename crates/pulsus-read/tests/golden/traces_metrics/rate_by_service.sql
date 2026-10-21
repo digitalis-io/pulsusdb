@@ -13,7 +13,7 @@ ORDER BY t ASC, g0
 == instant (query) ==
 SELECT service AS g0, uniqExact(trace_id, span_id) AS n
 FROM trace_spans
-WHERE timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000
+WHERE timestamp_ns >= 1700000000000000000 AND timestamp_ns < 1700010800000000000
   AND duration_ns > 1000000000
 GROUP BY g0
 ORDER BY g0
@@ -22,7 +22,7 @@ ORDER BY g0
 SELECT count() AS n FROM (
   SELECT service AS g0
   FROM trace_spans
-  WHERE timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000
+  WHERE timestamp_ns >= 1700000000000000000 AND timestamp_ns < 1700010800000000000
     AND duration_ns > 1000000000
   GROUP BY g0
   LIMIT 1001

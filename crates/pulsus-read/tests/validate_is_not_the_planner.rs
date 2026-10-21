@@ -137,6 +137,7 @@ fn every_plan_error_variant_is_witnessed_by_an_accepted_vector() {
         end_ns: 4_000_000_000_000_000_000,
         step_ms: 1_000,
         exemplars: None,
+        floor_ns: i64::MIN,
     };
 
     for v in &accepted {

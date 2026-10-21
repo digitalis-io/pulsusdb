@@ -71,7 +71,9 @@ pub fn trace_leaf(
 
 /// The predicate text of `span:childCount op n`, `rendered` being `n`'s
 /// literal. A span with no child counts 0, which no group carries, so when
-/// `0 op n` holds the leaf is `NOT IN` the groups where the count fails.
+/// `0 op n` holds the leaf is `NOT IN` the groups where the count fails. A
+/// child is counted once per span identity, so a child stored twice is one
+/// child (issue #601 part 4a).
 ///
 /// # Errors
 ///
@@ -88,9 +90,9 @@ pub fn child_leaf(
     };
     let zero_holds = crate::traces::values::cmp_f64(op, 0.0, parse_num(raw)?);
     let (not, cond) = if zero_holds {
-        ("NOT ", format!("NOT (count() {sym} {rendered})"))
+        ("NOT ", format!("NOT ({CHILDREN} {sym} {rendered})"))
     } else {
-        ("", format!("count() {sym} {rendered}"))
+        ("", format!("{CHILDREN} {sym} {rendered}"))
     };
     Ok(format!(
         "(trace_id, span_id) {not}IN (SELECT trace_id, parent_span_id FROM {spans_table} \
@@ -100,6 +102,10 @@ pub fn child_leaf(
         w.span_bucket_clause()
     ))
 }
+
+/// A parent's children, each span identity once: a child stored twice is
+/// one child (issue #601 part 4a).
+pub(crate) const CHILDREN: &str = "uniqExact(span_id, start_ns, kind)";
 
 /// The statement's per-trace scalar and its aliases, ending in `,\n     `
 /// so it sits before the statement's `top`; empty when no predicate holds
@@ -320,7 +326,7 @@ pub fn group_values_sql(
         ),
         KeyValues::ChildCount => format!(
             "{keys},\n     (SELECT (groupArray(concat(trace_id, parent_span_id)), groupArray(c)) \
-             FROM (SELECT trace_id, parent_span_id, count() AS c FROM {spans_table} \
+             FROM (SELECT trace_id, parent_span_id, {CHILDREN} AS c FROM {spans_table} \
              WHERE (intDiv(start_ns, {RECENT_BUCKET_NS}), trace_id) IN (SELECT arrayJoin(group_keys)) \
              AND parent_span_id != toFixedString('', 8) GROUP BY trace_id, parent_span_id)) AS group_values"
         ),

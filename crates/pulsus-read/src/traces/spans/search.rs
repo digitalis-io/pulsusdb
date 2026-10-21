@@ -61,7 +61,8 @@
 use std::collections::HashMap;
 
 use pulsus_traceql::{
-    BoolOp, Field, FieldExpr, Intrinsic, PipelineStage, Query, SpansetExpr, SpansetFilter, Value,
+    BoolOp, ComparisonOp, Field, FieldExpr, FieldOp, Intrinsic, PipelineStage, Query, SpansetExpr,
+    SpansetFilter, UnaryOp, Value,
 };
 
 use super::fold::{Agg, AggArg, Contributor, Fold, Key, Src, Stage};
@@ -69,7 +70,9 @@ use super::numbering::{SCOPE_DETAIL, SCOPE_TOP, after_top_sql, keys_sql, returne
 use super::predicate::{PredicateCtx, SpanPredicate, compile_span_predicate_in};
 use super::projection::{Projection, array_elements, ceiling_sql, group_key_sql};
 use super::rows::{SearchGroupTuple, SearchGroupedRow, SearchTraceRow};
-use super::tracelevel::{TraceLeaf, TraceValue, group_values_sql, per_trace_sql, trace_values_sql};
+use super::tracelevel::{
+    KeyValues, TraceLeaf, TraceValue, group_values_sql, per_trace_sql, trace_leaf, trace_values_sql,
+};
 use crate::logql::error::ReadError;
 use crate::traces::PlanError;
 use crate::traces::exec::{
@@ -112,13 +115,64 @@ SELECT m.trace_id AS trace_id, t.root_service AS root_service, t.root_name AS ro
 FROM ({scope_detail}SELECT trace_id, max(start_ns) AS last, count() AS matched,
              arraySlice(arraySort(x -> (x.2, x.1),
                         groupArray((span_id, start_ns, duration_ns, service, {projection}))), 1, {spss}) AS spans
-      FROM {spans}
+      FROM {detail_from}
+      GROUP BY trace_id) AS m
+{trace_read}";
+
+/// The detail read's span rows: the chosen traces' spans by the sort key's
+/// prefix, the window's three bounds and the predicate. Read once per span
+/// identity unless the statement keeps `final` (issue #601 part 4a).
+const DETAIL_FROM: &str = r"{spans}
       WHERE (intDiv(start_ns, 300000000000), trace_id) IN
             {keys}
         AND {time}
         AND {bucket}
         AND {day}
-        AND ({predicate})
+        AND ({predicate})";
+
+/// A filter whose every condition is a trace-level intrinsic against a
+/// literal (issue #601 part 4a, [`admits_trace_shortcut`]): one statement.
+/// `cand` is every trace overlapping the window whose `traces` rows, over
+/// the window's days and the day either side, satisfy `{having}`, as
+/// `(trace_id, last start, first start, buckets)`. A trace with every span
+/// inside the window is `last` its last start; any other is read by
+/// `(bucket, trace_id)` within the window's buckets for its newest span in
+/// the window (`edge`), and dropped when it has none. `top` is the newest
+/// `limit` of them with their window buckets, which the detail read keys
+/// on as the whole-window statement's does. The predicate holds for every
+/// span of a chosen trace, so the detail read carries none.
+const SEARCH_TRACE_LEVEL: &str = r"WITH (SELECT groupArray((trace_id, lst, fst, bk))
+      FROM (SELECT trace_id, max(last_start_ns) AS lst, min(start_ns) AS fst, groupUniqArrayArray(buckets) AS bk,
+                   max(end_ns) - min(start_ns) AS duration, min(root) AS r,
+                   if(r.1 = 0, {root_service}, '') AS root_service, if(r.1 = 0, {root_name}, '') AS root_name
+            FROM {traces}
+            WHERE {days}
+            GROUP BY trace_id
+            HAVING lst >= {first} AND fst <= {last} AND ({having}))) AS cand,
+     (SELECT (groupArray(trace_id), groupArray(last))
+      FROM (SELECT trace_id, max(start_ns) AS last
+            FROM {spans}
+            WHERE (intDiv(start_ns, 300000000000), trace_id) IN
+                  (SELECT arrayJoin(arrayFlatten(arrayMap(x -> arrayMap(k -> (k, x.1), arrayFilter(k -> {within}, x.4)),
+                                                          arrayFilter(x -> NOT (x.3 >= {first} AND x.2 <= {last}), cand)))))
+              AND {time}
+              AND {bucket}
+              AND {day}
+            GROUP BY trace_id)) AS edge,
+     (SELECT (groupArray(t), groupArray(ks))
+      FROM (SELECT x.1 AS t, if(x.3 >= {first} AND x.2 <= {last}, x.2, edge.2[indexOf(edge.1, x.1)]) AS l,
+                   arrayFilter(k -> {within}, x.4) AS ks
+            FROM (SELECT arrayJoin(cand) AS x)
+            WHERE (x.3 >= {first} AND x.2 <= {last}) OR has(edge.1, x.1)
+            ORDER BY l DESC, t ASC
+            LIMIT {limit})) AS top
+SELECT m.trace_id AS trace_id, t.root_service AS root_service, t.root_name AS root_name,
+       t.start_ns AS start_ns, t.end_ns - t.start_ns AS duration_ns,
+       m.last AS last, m.matched AS matched, m.spans AS spans
+FROM (SELECT trace_id, max(start_ns) AS last, count() AS matched,
+             arraySlice(arraySort(x -> (x.2, x.1),
+                        groupArray((span_id, start_ns, duration_ns, service, {projection}))), 1, {spss}) AS spans
+      FROM {detail_from}
       GROUP BY trace_id) AS m
 {trace_read}";
 
@@ -366,9 +420,10 @@ pub fn compile_search_filter(
 /// traces with a span `f` keeps, their matched spans capped at `spss`,
 /// each carrying `proj`'s values, and their roots. `limit` and `spss` are
 /// the request's, already validated positive by the caller. Issue it with
-/// `final = 1`, as every read of these tables is; clustered, pass the
-/// distributed table names — spans are sharded by trace, so each trace's
-/// rows are on one shard.
+/// `final = 1` when [`keeps_final`] says so, and without it otherwise: its
+/// span reads then keep one row per span identity themselves (issue #601
+/// part 4a). Clustered, pass the distributed table names — spans are
+/// sharded by trace, so each trace's rows are on one shard.
 ///
 /// # Panics
 ///
@@ -400,6 +455,49 @@ pub fn search_sql_at(
     proj: &Projection,
     limit: u32,
     spss: u32,
+) -> String {
+    let keeps = keeps_final(f, proj);
+    search_sql_kept(
+        spans_table,
+        traces_table,
+        w,
+        slice,
+        f,
+        proj,
+        limit,
+        spss,
+        keeps,
+    )
+}
+
+/// Whether a search statement runs under `final` (issue #601 part 4a): it
+/// reads the nested-set numbering — a predicate does, the projection does
+/// or a `by()` key is a numbered intrinsic. Every other statement keeps one
+/// row per span identity itself, [`super::distinct_spans`].
+pub fn keeps_final(f: &SearchFilter, proj: &Projection) -> bool {
+    let keyed = match f {
+        SearchFilter::Pipeline { fold, .. } => fold
+            .keys
+            .iter()
+            .any(|k| matches!(k.sql.values, Some(KeyValues::Numbered(_)))),
+        _ => false,
+    };
+    f.predicates().iter().any(|p| p.reads_numbering()) || proj.reads_numbers() || keyed
+}
+
+/// [`search_sql_at`], `keeps` deciding whether the span reads are left to
+/// `final` or keep one row per span identity.
+#[allow(clippy::too_many_arguments)]
+fn search_sql_kept(
+    spans_table: &str,
+    traces_table: &str,
+    w: WindowSql,
+    slice: Option<WindowSql>,
+    f: &SearchFilter,
+    proj: &Projection,
+    limit: u32,
+    spss: u32,
+    keeps: bool,
 ) -> String {
     for p in f.predicates() {
         assert!(
@@ -485,13 +583,29 @@ pub fn search_sql_at(
                     KEYS_SLICED,
                 ),
             };
+            let detail = fill(
+                DETAIL_FROM,
+                &[
+                    ("spans", spans_table),
+                    ("keys", keys),
+                    ("time", &time),
+                    ("bucket", &bucket),
+                    ("day", &day),
+                    ("predicate", p.sql()),
+                ],
+            );
+            let detail_from = if keeps {
+                detail
+            } else {
+                super::distinct_spans(&detail, "")
+            };
             let mut values: Vec<(&str, &str)> = common.to_vec();
             values.push(("predicate", p.sql()));
             values.push(("top_time", &top_time));
             values.push(("top_bucket", &top_bucket));
             values.push(("top_day", &top_day));
             values.push(("window_keys", &window_keys));
-            values.push(("keys", keys));
+            values.push(("detail_from", &detail_from));
             fill(SEARCH, &values)
         }
         SearchFilter::Tree { .. } | SearchFilter::Structural { .. } => {
@@ -550,9 +664,14 @@ pub fn search_sql_at(
             // and membership as a relation.
             let base = |is_top: bool, keys_cond: &str| -> Src {
                 let scope = if is_top { scope_top } else { scope_detail };
-                let from = format!(
+                let read = format!(
                     "{spans_table}\nWHERE {keys_cond}{time}\n  AND {bucket}\n  AND {day}\n  AND ({sel})"
                 );
+                let from = if keeps {
+                    read
+                } else {
+                    super::distinct_spans(&read, "")
+                };
                 let mut named = fold.columns(is_top);
                 if !is_top {
                     named.push(("proj".to_string(), projection.clone()));
@@ -718,6 +837,12 @@ pub struct SearchStatement {
     /// span_id) IN` subquery reads `spans` inside a read of `spans`
     /// (issue #600 part 2).
     child_counts: bool,
+    /// Whether the statement runs under `final` ([`keeps_final`], issue
+    /// #601 part 4a).
+    keeps_final: bool,
+    /// Whether the statement is the trace-level one ([`admits_trace_shortcut`],
+    /// issue #601 part 4a): the newest-slice loop does not run for it.
+    trace_level: bool,
 }
 
 /// The response attributes every surviving spanset carries (issue #602
@@ -742,6 +867,18 @@ impl SearchStatement {
     /// 2): the newest-slice loop keeps doubling for it.
     pub fn reads_numbering(&self) -> bool {
         self.numbered
+    }
+
+    /// Whether the statement runs under `final` (issue #601 part 4a): it
+    /// reads the nested-set numbering.
+    pub fn keeps_final(&self) -> bool {
+        self.keeps_final
+    }
+
+    /// Whether the statement is the trace-level one (issue #601 part 4a),
+    /// which answers the window in one statement.
+    pub fn is_trace_level(&self) -> bool {
+        self.trace_level
     }
 
     /// Whether the statement reads a table inside a read of the same
@@ -1075,16 +1212,40 @@ pub fn compile_search_sliced(
         .iter()
         .map(|p| p.numbered_leaves())
         .sum();
-    let sql = search_sql_at(
-        spans_table,
-        traces_table,
-        ctx.window,
-        slice,
-        &filter,
-        &projection,
-        limit,
-        spss,
-    );
+    let keeps = keeps_final(&filter, &projection);
+    // Issue #601 part 4a: one filter, no stage, every condition trace-level
+    // against a literal and false for a trace with no `traces` row — the
+    // trace-level statement, over the whole window whatever `slice` is.
+    let trace_level = match (&query.spanset, &filter) {
+        (SpansetExpr::Filter(SpansetFilter { body: Some(body) }), SearchFilter::One(_))
+            if query.pipeline.is_empty() && admits_trace_shortcut(body) =>
+        {
+            Some(body)
+        }
+        _ => None,
+    };
+    let sql = match trace_level {
+        Some(body) => trace_level_sql(
+            spans_table,
+            traces_table,
+            ctx.window,
+            body,
+            &projection,
+            limit,
+            spss,
+        )?,
+        None => search_sql_kept(
+            spans_table,
+            traces_table,
+            ctx.window,
+            slice,
+            &filter,
+            &projection,
+            limit,
+            spss,
+            keeps,
+        ),
+    };
     Ok(SearchStatement {
         sql,
         projection,
@@ -1094,7 +1255,172 @@ pub fn compile_search_sliced(
         numbered: numbered > 0,
         structural,
         child_counts: filter.predicates().iter().any(|p| p.reads_child_counts()),
+        keeps_final: keeps && trace_level.is_none(),
+        trace_level: trace_level.is_some(),
     })
+}
+
+/// Whether `expr` is a filter the trace-level statement answers alone
+/// (issue #601 part 4a): every node is `&&`, `||`, `!` or a comparison of
+/// `traceDuration`, `rootName` or `rootServiceName` with a literal, in
+/// either order, and the predicate is false when every comparison is.
+///
+/// A comparison on `traces` is false for a trace that has spans and no
+/// `traces` row; such a trace's spans match exactly when the predicate is
+/// true with every comparison false, and the statement, which reads its
+/// traces from `traces`, could not return it.
+pub(crate) fn admits_trace_shortcut(expr: &FieldExpr) -> bool {
+    every_leaf_false(expr) == Some(false)
+}
+
+/// The value of `expr` with every trace-level comparison false, or `None`
+/// when a node is anything but `&&`, `||`, `!` and such a comparison.
+fn every_leaf_false(expr: &FieldExpr) -> Option<bool> {
+    match expr {
+        FieldExpr::Binary {
+            op: FieldOp::Bool(op),
+            lhs,
+            rhs,
+        } => {
+            let (l, r) = (every_leaf_false(lhs)?, every_leaf_false(rhs)?);
+            Some(match op {
+                BoolOp::And => l && r,
+                BoolOp::Or => l || r,
+            })
+        }
+        FieldExpr::Unary {
+            op: UnaryOp::Not,
+            expr,
+        } => every_leaf_false(expr).map(|v| !v),
+        FieldExpr::Binary {
+            op: FieldOp::Cmp(_),
+            ..
+        } => trace_comparison(expr).map(|_| false),
+        _ => None,
+    }
+}
+
+/// `(intrinsic, op, literal)` of a comparison of a trace-level intrinsic
+/// with a literal, the operator mirrored when the literal is on the left.
+fn trace_comparison(expr: &FieldExpr) -> Option<(Intrinsic, ComparisonOp, &Value)> {
+    let FieldExpr::Binary {
+        op: FieldOp::Cmp(op),
+        lhs,
+        rhs,
+    } = expr
+    else {
+        return None;
+    };
+    let trace_level = |f: &FieldExpr| match f {
+        FieldExpr::Field(Field::Intrinsic(
+            i @ (Intrinsic::TraceDuration | Intrinsic::RootName | Intrinsic::RootServiceName),
+        )) => Some(*i),
+        _ => None,
+    };
+    match (lhs.as_ref(), rhs.as_ref()) {
+        (field, FieldExpr::Literal(v)) => trace_level(field).map(|i| (i, *op, v)),
+        (FieldExpr::Literal(v), field) => {
+            trace_level(field).map(|i| (i, crate::traces::filter::flip_comparison(*op), v))
+        }
+        _ => None,
+    }
+}
+
+/// `expr`, admitted by [`admits_trace_shortcut`], over one trace's
+/// `duration`, `root_name` and `root_service`: each comparison its
+/// [`trace_leaf`] condition, composed as the predicate compiler composes
+/// `&&`, `||` and `!`.
+fn trace_having(expr: &FieldExpr) -> Result<String, PlanError> {
+    match expr {
+        FieldExpr::Binary {
+            op: FieldOp::Bool(op),
+            lhs,
+            rhs,
+        } => {
+            let (l, r) = (trace_having(lhs)?, trace_having(rhs)?);
+            Ok(match op {
+                BoolOp::And => format!("({l}) AND ({r})"),
+                BoolOp::Or => format!("({l}) OR ({r})"),
+            })
+        }
+        FieldExpr::Unary {
+            op: UnaryOp::Not,
+            expr,
+        } => Ok(format!("NOT ({})", trace_having(expr)?)),
+        _ => {
+            let (i, op, v) = trace_comparison(expr).ok_or_else(|| {
+                PlanError::TypeMismatch(format!("{expr} is not a trace-level comparison"))
+            })?;
+            Ok(trace_leaf(i, op, v)?.1.cond)
+        }
+    }
+}
+
+/// The trace-level statement ([`SEARCH_TRACE_LEVEL`]) over `w` for the
+/// admitted filter `expr`, its detail read keeping one row per span
+/// identity.
+#[allow(clippy::too_many_arguments)]
+fn trace_level_sql(
+    spans_table: &str,
+    traces_table: &str,
+    w: WindowSql,
+    expr: &FieldExpr,
+    proj: &Projection,
+    limit: u32,
+    spss: u32,
+) -> Result<String, PlanError> {
+    let having = trace_having(expr)?;
+    let (time, bucket, day) = (
+        w.span_time_clause(),
+        w.span_bucket_clause(),
+        w.span_day_clause(),
+    );
+    let detail = fill(
+        DETAIL_FROM,
+        &[
+            ("spans", spans_table),
+            ("keys", KEYS_WHOLE),
+            ("time", &time),
+            ("bucket", &bucket),
+            ("day", &day),
+            ("predicate", "true"),
+        ],
+    );
+    let trace_read = fill(
+        TRACE_READ,
+        &[
+            ("traces", traces_table),
+            ("root_service", &ceiling_sql("r.4")),
+            ("root_name", &ceiling_sql("r.5")),
+        ],
+    );
+    let (first, last) = (
+        w.first_included_ns().to_string(),
+        w.last_included_ns().to_string(),
+    );
+    let (limit, spss, projection) = (limit.to_string(), spss.to_string(), proj.sql());
+    Ok(fill(
+        SEARCH_TRACE_LEVEL,
+        &[
+            ("root_service", &ceiling_sql("r.4")),
+            ("root_name", &ceiling_sql("r.5")),
+            ("traces", traces_table),
+            ("days", &w.per_trace_day_clause()),
+            ("first", &first),
+            ("last", &last),
+            ("having", &having),
+            ("spans", spans_table),
+            ("within", &w.bucket_within("k")),
+            ("time", &time),
+            ("bucket", &bucket),
+            ("day", &day),
+            ("limit", &limit),
+            ("projection", &projection),
+            ("spss", &spss),
+            ("detail_from", &super::distinct_spans(&detail, "")),
+            ("trace_read", &trace_read),
+        ],
+    ))
 }
 
 /// The caller-validated request window and response caps.
@@ -1830,5 +2156,43 @@ mod by_array_tests {
             group_value(&format!(r#"[["String","{long}"]]"#), kind),
             Ok(GroupValue::Array(vec![GroupValue::Str(long)]))
         );
+    }
+}
+
+#[cfg(test)]
+mod trace_shortcut_tests {
+    use super::*;
+    use pulsus_traceql::{ArithOp, FieldOp, UnaryOp};
+
+    /// T10e (issue #601 part 4a): the three gate arms validation refuses
+    /// before planning — a bare trace field, a top-level arithmetic node and
+    /// a top-level negation — are refused by the gate as well, built
+    /// directly because no query reaches the planner with them.
+    #[test]
+    fn the_gate_refuses_the_arms_validation_also_refuses() {
+        let field = || FieldExpr::Field(Field::Intrinsic(Intrinsic::TraceDuration));
+        for (name, expr) in [
+            (
+                "traceDuration * 2",
+                FieldExpr::Binary {
+                    op: FieldOp::Arith(ArithOp::Mul),
+                    lhs: Box::new(field()),
+                    rhs: Box::new(FieldExpr::Literal(Value::Number("2".to_string()))),
+                },
+            ),
+            (
+                "-traceDuration",
+                FieldExpr::Unary {
+                    op: UnaryOp::Neg,
+                    expr: Box::new(field()),
+                },
+            ),
+            ("traceDuration", field()),
+        ] {
+            assert!(
+                !admits_trace_shortcut(&expr),
+                "{name} must not take the shortcut"
+            );
+        }
     }
 }

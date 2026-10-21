@@ -20,6 +20,7 @@ const PARAMS: MetricsParams = MetricsParams {
     end_ns: 1_700_010_800_000_000_000,
     step_ms: 60_000,
     exemplars: None,
+    floor_ns: i64::MIN,
 };
 
 struct Case {
@@ -399,9 +400,10 @@ fn worked_example_pins_the_documented_fragments() {
     assert!(range.contains(
         "WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001"
     ));
-    // The instant window is unchanged.
+    // The instant window is the requested one, unsnapped (issue #601
+    // part 2).
     assert!(plan.instant_sql().contains(
-        "WHERE timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000"
+        "WHERE timestamp_ns >= 1700000000000000000 AND timestamp_ns < 1700010800000000000"
     ));
     // The attribute condition is answered on the span row: the located
     // element is tested, and nothing reads `trace_attrs_idx` (issue
@@ -621,15 +623,11 @@ fn shipped_metrics_shapes_and_limits_are_documented() {
     for needle in [
         "rate()",
         "count_over_time()",
-        "DEFAULT_METRICS_POINTS",
-        "MAX_METRICS_POINTS",
-        "11000",
-        // The §4.4 point-cap taxonomy. Issue #384 removed the `errorType`
-        // vocabulary from §4 with the JSON envelope, so the old
-        // `query_too_broad` needle would now pass only if the doc still
-        // named a field the wire no longer carries. The sentence is the pin.
-        "is rejected **statically before execution** with `422`",
-        "left-closed",
+        // Issue #601 part 2: the derived range step, and the instant route
+        // as one bucket over exactly the requested window, reading no step.
+        "the step is the window over 240",
+        "The **instant** route reads no `step`: it is one bucket over exactly `[start, end)`.",
+        "over exactly the requested window `[start, end)`",
         // Issue #477 (a): the emitted grid, its extra leading bucket, and
         // the per-function density rule an alert author needs.
         "`intervals + 1` samples",
@@ -1121,10 +1119,12 @@ fn the_declared_inverse_restores_every_moved_section_to_its_base_bytes() {
     );
 }
 
-/// AC7(d): every instant-side section is byte-identical to `2f78c53`.
-/// Asserted separately from the inverse so a failure names which half
-/// moved. The instant route belongs to #503 and this change moves none of
-/// its bytes.
+/// AC7(d): every instant-side section is `2f78c53`'s with one change, the
+/// window. Asserted separately from the inverse so a failure names which
+/// half moved. Issue #601 part 2 made the instant form read the requested
+/// window `[1700000000 s, 1700010800 s)` instead of the step-snapped
+/// `[1699999980 s, 1700010840 s)`, so the base's two bounds are replaced
+/// by the requested ones before comparing, and nothing else may differ.
 ///
 /// **Count the instant predicates by SECTION, not by a line offset**
 /// (issue #477 wave 4 review). A hand check of `compare_status.sql` that
@@ -1159,7 +1159,13 @@ fn every_instant_side_section_is_byte_identical_to_base() {
             };
             let n =
                 section_body(&new, name).unwrap_or_else(|| panic!("{stem}: {name} disappeared"));
-            assert_eq!(n, b, "{stem}: {name} moved and must not have");
+            let b = b
+                .replace("1699999980000000000", "1700000000000000000")
+                .replace("1700010840000000000", "1700010800000000000");
+            assert_eq!(
+                n, b,
+                "{stem}: {name} moved beyond the requested window and must not have"
+            );
             checked += 1;
         }
     }
