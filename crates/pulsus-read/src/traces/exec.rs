@@ -1944,6 +1944,15 @@ impl TraceEngine {
                 .stream_tag_values(&sql, &catalog_settings(&self.config), &n)
                 .await;
         }
+        // Issue #601 part 4b: a span-scoped key narrowed by one service
+        // equality answers from the bucket catalogue, unless an interior
+        // bucket is overflowed.
+        if scope == Some("span")
+            && let Some(service) = n.service_equality()
+            && let Some(values) = self.catalogue_tag_values(service, key, req).await?
+        {
+            return Ok(values);
+        }
         // Issue #509: neither branch escapes a `?` here. The doubling
         // happens once, in `traces::dispatch`, for every read on this
         // path. The key is escaped into a JSON path by the builder.
@@ -2076,15 +2085,21 @@ impl TraceEngine {
     }
 
     /// The statement for `request`, its top-K reading the newest
-    /// `slice_ns` when given.
+    /// `slice_ns` when given; on the error-span table when
+    /// [`super::spans::error_spans::admits`] the query (issue #601 part 4b).
     pub(super) fn search_statement(
         &self,
         request: &super::spans::search::SearchRequest,
         slice_ns: Option<i64>,
     ) -> Result<super::spans::search::SearchStatement, super::PlanError> {
+        let spans = if super::spans::error_spans::admits(&request.query) {
+            &self.config.error_spans_table
+        } else {
+            &self.config.spans_v2_table
+        };
         super::spans::search::plan_statement_sliced(
             request,
-            &self.config.spans_v2_table,
+            spans,
             &self.config.traces_table,
             &self.config.resources_table,
             self.config.max_depth,
@@ -4808,5 +4823,6 @@ mod tests {
     }
 }
 
+mod catalogue_values;
 mod metrics_statement;
 mod newest_first;

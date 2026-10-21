@@ -19130,7 +19130,7 @@ fn c4_bodies(b0: i64) -> Vec<ExportTraceServiceRequest> {
 
 /// A fresh database holding fixture C4, merges stopped on `spans`.
 async fn seed_c4(test: &str) -> (String, ChClient, i64) {
-    let db = pulsus_testkit::test_db(&format!("pulsus_read_it_t601p4b_{test}"));
+    let db = pulsus_testkit::test_db(&format!("pulsus_read_it_t601p4b_c4_{test}"));
     let client = fresh_db(&db).await;
     stop_span_merges_4b(&client, &db).await;
     let b0 = buckets_4b();
@@ -19151,6 +19151,7 @@ fn listed_4b(values: &pulsus_read::TagValues) -> Vec<(String, String)> {
 
 /// `key`'s values for `q` over `[s, e)` through a fresh engine, and the
 /// statements that request ran.
+#[allow(clippy::too_many_arguments)]
 async fn values_request_4b(
     db: &str,
     client: &ChClient,
@@ -19342,7 +19343,7 @@ async fn a_service_narrowed_values_read_answers_from_the_catalogue() {
 /// The fixture of T5 and T5b: `checkout` holding `/v000` to `/v099` in
 /// bucket `b0 + 1`, merges stopped on `spans`.
 async fn seed_c5(test: &str) -> (String, ChClient, i64) {
-    let db = pulsus_testkit::test_db(&format!("pulsus_read_it_t601p4b_{test}"));
+    let db = pulsus_testkit::test_db(&format!("pulsus_read_it_t601p4b_c5_{test}"));
     let client = fresh_db(&db).await;
     stop_span_merges_4b(&client, &db).await;
     let b0 = buckets_4b();
@@ -19577,7 +19578,7 @@ fn e_bodies(base: i64) -> Vec<ExportTraceServiceRequest> {
 
 /// A fresh database holding fixture E, and `base`.
 async fn seed_e(test: &str) -> (String, ChClient, i64) {
-    let db = pulsus_testkit::test_db(&format!("pulsus_read_it_t601p4b_{test}"));
+    let db = pulsus_testkit::test_db(&format!("pulsus_read_it_t601p4b_e_{test}"));
     let client = fresh_db(&db).await;
     let base = (now_ns() / S_NS - 600) * S_NS;
     for (i, req) in e_bodies(base).iter().enumerate() {
@@ -19875,15 +19876,20 @@ async fn a_retried_push_is_counted_once_in_the_error_table() {
         .await;
     let base = (now_ns() / 1_000_000_000 - 600) * 1_000_000_000;
     land_retried(&client, &db, base).await;
-    let stored = try_vals_4b(
-        &client,
-        "SELECT toString(count()) AS val, toString(uniqExact(trace_id, start_ns, span_id, kind)) \
-         AS val_type FROM error_spans",
-    )
-    .await;
+    let stored = match client
+        .query_strings(
+            "SELECT concat(toString(count()), ' ', \
+             toString(uniqExact(trace_id, start_ns, span_id, kind))) FROM error_spans",
+            &QuerySettings::new(),
+        )
+        .await
+    {
+        Ok(rows) => Ok(rows.join(" ")),
+        Err(e) => Err(e.to_string()),
+    };
     let base_s = base / 1_000_000_000;
     let mut wrong = Vec::new();
-    if stopped.is_err() || stored != Ok(vec![("8".to_string(), "4".to_string())]) {
+    if stopped.is_err() || stored != Ok("8 4".to_string()) {
         wrong.push(format!(
             "error_spans must hold A's four error spans twice: {stopped:?}, {stored:?}"
         ));

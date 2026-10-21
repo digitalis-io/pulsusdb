@@ -264,7 +264,17 @@ pub fn plan_trace_metrics_routed(
     let Ok(plan) = plan_trace_metrics(&shell, params, ctx) else {
         return today();
     };
-    match statement_for(&plan, &asked, filter.body.as_ref(), ctx.max_series, tables) {
+    // Issue #601 part 4b: an admitted query's statement reads the error-span
+    // table as its span table.
+    let tables = if super::error_spans::admits(query) {
+        StatementTables {
+            spans: tables.error_spans,
+            ..*tables
+        }
+    } else {
+        *tables
+    };
+    match statement_for(&plan, &asked, filter.body.as_ref(), ctx.max_series, &tables) {
         Some(statement) => Ok(RoutedMetricsPlan {
             plan,
             statement: Some(statement),

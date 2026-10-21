@@ -1,6 +1,6 @@
 # Changing the trace tables
 
-**Parts of this document describe the previous trace search engine, which issue #602 part 2c-2b deleted — its test binaries, goldens and benches in part 2c-2b-1, its code and the unit tests inside it in part 2c-2b-2; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** **What this is.** The design for the ClickHouse tables that hold traces: what we
+**Parts of this document describe the previous trace search engine, which issue #602 part 2c-2b deleted — its test binaries, goldens and benches in part 2c-2b-1, its code and the unit tests inside it in part 2c-2b-2; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** **What this is.** The design for the ClickHouse tables that hold traces: what we **Since #601 part 4b the trace store holds seven tables, not five, and the counts, targets, storage figures and statement contracts below predate it, except the clustering and sharding-key passages, which name the new tables.** `tag_bucket_values` holds each 5-minute bucket's span-attribute values per service and key, storing at most 101 distinct `(value, type)` pairs: up to 100 answer exactly, and a 101st marks the bucket overflowed. It answers a values read for a `span.<key>` whose `q` is a single filter of exactly one `resource.service.name` equality; when a whole bucket of the window is overflowed, the request is answered by the span read in a second statement — the one exception this part adds to one statement per request. `error_spans` holds the error spans' non-attribute columns; it answers a single-filter, non-structural search or non-`compare()` metrics query with a top-level `status = error` that reads only `status`, `statusMessage`, `kind`, `name`, `duration`, `span:id`, `trace:id`, `resource.service.name`, `traceDuration`, `rootName` or `rootServiceName`. Measured on g1: the store is 44.32 B/span over the seven tables, with `spans`' attribute columns holding 16 dynamic paths and the rest in 8 shared-data buckets (`tag_bucket_values` 0.734, `error_spans` 0.245), and between replicas an error span's columns cross once more in `error_spans`, 0.253 B/span (0.63% of the span stream), while `tag_bucket_values` replicates to every node. The current statements are `docs/api.md` §4.2 and §4.3 and `schema/schema.sql`.
 store today, what is wrong with it in numbers, what we would store instead, and
 what each query costs before and after.
 
@@ -449,7 +449,7 @@ that costs 75% of the storage.**
 And the request that reads it already computes a window and throws it away. The
 values route parses `start`/`end`, defaulting to `traceql_tag_lookback` = 24 h
 (`crates/pulsus-config/src/model.rs:553`, `crates/pulsus-server/src/traces_api/tags.rs:165-168`), then calls
-`tag_values_sql` (`crates/pulsus-read/src/traces/spans/tags.rs:89-99`), which emits no time predicate at all —
+`tag_values_sql` (`crates/pulsus-read/src/traces/spans/tags.rs:93-103`), which emits no time predicate at all —
 because the table it reads has no time column.
 
 ### 2.4 The narrowed dropdown is a join over the window
@@ -2319,7 +2319,7 @@ Three aggregate conditions are pushed into the candidate generator today
 Losing a pushdown does not change an answer. The condition is re-evaluated over
 the hydrated spans either way; the pushed form only narrows the candidate list,
 and the plan already keeps a byte-for-byte fallback statement with nothing pushed
-(`crates/pulsus-read/src/traces/search_plan.rs:3084-3104`, used at `crates/pulsus-read/src/traces/exec.rs:2153-2181`). The effect is more
+(`crates/pulsus-read/src/traces/search_plan.rs:3084-3104`, used at `crates/pulsus-read/src/traces/exec.rs:2173-2201`). The effect is more
 candidates, not a different result.
 
 `by()` grouping already refuses to push whenever the generator is not
@@ -4505,7 +4505,7 @@ The image line (`:571`) is shown at today's floor; the source quoted here pinned
   135  pub const TAG_VALUES_MAX: usize = 1_000;
 ```
 
-**`:1795-1836` @ d7af710e**  (42 lines in the range; comments and blanks elided, 30 shown)
+**`:1800-1841` @ d7af710e**  (42 lines in the range; comments and blanks elided, 30 shown)
 
 ```rust
  1825      pub async fn list_tag_values(

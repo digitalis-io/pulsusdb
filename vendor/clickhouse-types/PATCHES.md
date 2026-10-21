@@ -7,10 +7,10 @@ import path is unchanged. See
 [`docs/decisions/0009-clickhouse-types-vendor-patch.md`](../../docs/decisions/0009-clickhouse-types-vendor-patch.md)
 for the decision this copy implements, and issue #585 for the measurements.
 
-**Five patches, in one file**, `src/data_types.rs`: §1 `split_type_arguments`,
+**Six patches, in one file**, `src/data_types.rs`: §1 `split_type_arguments`,
 §2 `split_element_name` with `parse_named_tuple` and the `NamedTuple`
 representation, §3 the `parse_tuple` call site, §4 the nineteen checked byte
-indices, and §5 `Display`'s new arm. Nothing else is modified. `src/` is
+indices, §5 `Display`'s new arm, and §6 the `JSON` type with settings. Nothing else is modified. `src/` is
 otherwise upstream's byte for byte; `Cargo.toml` is the registry-normalized
 manifest with **an empty `[workspace]` table added**, which is what makes
 `cargo test --manifest-path vendor/clickhouse-types/Cargo.toml` resolve at all
@@ -75,7 +75,7 @@ arm and the `Display` arm are each byte-identical, and `lib.rs`, `decoders.rs`
 and `error.rs` are identical whole. So the defect is in the latest published
 release too, and only the tuple code is common ground between the two.
 
-## The property all five patches preserve
+## The property all six patches preserve
 
 For every input string, the patched `DataTypeNode::new` returns one of exactly
 three things:
@@ -83,7 +83,9 @@ three things:
 1. **upstream's exact result** — the same value, or the same error with the same
    message;
 2. `Ok(NamedTuple(..))`, of which the next section holds;
-3. an **error**, on an input where upstream panics.
+3. an **error**, on an input where upstream panics;
+4. `Ok(JsonWithParams(..))`, on the one form §6 reads, where upstream returns
+   `JSON`.
 
 Nothing returns a different value and nothing panics. (1) and (2) hold because
 `parse_named_tuple` returns `Option` and **every** failure in it returns
@@ -122,7 +124,7 @@ whitespace and then either fails to parse or re-renders without it.
 - **An element whose type text the crate re-renders differently.** Measured
   members: `Enum8('b' = 2, 'a' = 1)` → `Enum8('a' = 1, 'b' = 2)` (`Display`
   sorts by index), `JSON(max_dynamic_paths=8)` → `JSON` (`parse_json` drops
-  parameters), `Time64(3, 'UTC')` → `Time64(3)` (`parse_time64` keeps only the
+  parameters; read since §6), `Time64(3, 'UTC')` → `Time64(3)` (`parse_time64` keeps only the
   precision). This costs nothing that worked before: an insert whose header
   carried `Display`'s string for such a type would be refused by the server, so
   the patch turns a server refusal into a client-side parse error, and on the
@@ -472,6 +474,42 @@ fallthrough or is a `==`/`matches!` test that is simply false for a new variant,
 and `#[non_exhaustive]` plus a fallthrough means no error and no warning. The
 one that needed a change and said nothing is the insert-side validator, in the
 other vendored crate.
+
+## 6. A `JSON` type carrying settings
+
+`src/data_types.rs`: a variant `JsonWithParams(String)` after `JsonWithHint`,
+a check at the start of `parse_json`, and its `Display` arm. Issue #601 part 4b.
+
+### Why
+
+`spans`' attribute columns are `JSON(max_dynamic_paths = 16)`, which the server
+names `JSON(max_dynamic_paths=16)`, inside the `events` and `links` tuples too.
+Upstream's `parse_json` returns plain `JSON` for it, which renders `JSON`, so the
+named reading (§2) refuses the tuple element and the whole `events` type fails
+to parse: every fetch answered `500`, `Unknown data type: time_ns UInt64`.
+
+### The change
+
+When the text inside `JSON(` … `)` is non-empty and every comma-separated piece
+is `name = integer` — `name` an unquoted identifier (an ASCII letter or `_`,
+then letters, digits or `_`), `integer` ASCII digits, whitespace allowed around
+each — `parse_json` returns `JsonWithParams` holding that text verbatim, and
+`Display` writes `JSON(<text>)`, the server's name byte for byte. Otherwise it
+runs upstream's code, unchanged: no new error and no new rejection. The two
+insert-side validator arms that accept `JSON` accept it too
+(`vendor/clickhouse/PATCHES.md` §3). Upstream's own test of `parse_json` is
+unchanged: both its inputs carry `SKIP`, so they take upstream's code.
+
+### Its limit
+
+Only `JSON(name = integer, …)`, the form `schema/schema.sql` creates, changes;
+every other argument form — settings beside a path hint, `SKIP`, quoted text —
+is read by upstream's code as before, which drops settings and `SKIP` clauses
+from the node and splits on every comma, so such a type renders differently
+from its text and a named tuple holding it is not read as named.
+
+Pinned by `crates/pulsus-clickhouse/tests/named_tuple_types.rs`,
+`a_json_element_with_settings_is_a_named_element`.
 
 ## What to say upstream
 

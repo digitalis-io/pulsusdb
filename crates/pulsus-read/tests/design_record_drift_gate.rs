@@ -1998,10 +1998,14 @@ enum ReviewedVerdict {
 // #601 part 4a: coordinates and nothing else. Removing the engine's unused
 // `search_settings` method moved the block up three lines: `:2208-2210` is
 // `:2205-2207`. The verdict is unchanged.
+//
+// #601 part 4b: coordinates and nothing else. The error-span table's name in
+// the read configuration moved the block down twenty lines: `:2205-2207` is
+// `:2225-2227`. The verdict is unchanged.
 const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 2] = [
     (
         "docs/query-lowering.md",
-        "exec.rs:2205-2207",
+        "exec.rs:2225-2227",
         0,
         ReviewedVerdict::FallbackWrong,
         "the search settings block the same section quotes; it is in traces/exec.rs \

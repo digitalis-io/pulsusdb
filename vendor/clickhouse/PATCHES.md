@@ -384,8 +384,13 @@ the three JSON-ish columns in the shipped schema (`log_streams.labels`,
 One match arm:
 
 ```rust
-DataTypeNode::JSON => Ok(None),
+DataTypeNode::JSON | DataTypeNode::JsonWithParams(_) => Ok(None),
 ```
+
+`DataTypeNode::JsonWithParams` is a `JSON` type carrying settings,
+`JSON(max_dynamic_paths = 16)`, which `vendor/clickhouse-types/PATCHES.md` §6
+reads; its wire form is `JSON`'s, so it takes the same arm here and joins
+`DataTypeNode::JSON` in the `Str`/`String` arm.
 
 `Option<InnerDataTypeValidator>::validate` returns `Ok(None)` the moment the
 validator is `None`, so nothing inside the sequence is validated and the

@@ -268,6 +268,15 @@ pub struct SpanNameRow {
     pub val: String,
 }
 
+/// The one row of the service-narrowed values read on the bucket catalogue
+/// (`tags::catalogue_values_sql`, issue #601 part 4b): whether an interior
+/// group the request reads is overflowed, and the pairs in today's order.
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct CatalogValuesRow {
+    pub overflowed: u8,
+    pub vals: Vec<(String, String)>,
+}
+
 /// One `trace_tag_catalog` row of the §4.3 tag-values read
 /// (`tags_sql::tag_values_sql` — `SELECT DISTINCT val, val_type`, issues
 /// #58 and #476). Field order matches the SELECT list exactly (RowBinary
