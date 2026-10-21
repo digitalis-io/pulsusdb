@@ -21,26 +21,40 @@ ACCEPT = {'Accept': 'application/protobuf'}
 
 
 def varint(b, i):
-    r = s = 0
-    while True:
-        c = b[i]; i += 1; r |= (c & 0x7f) << s; s += 7
-        if c < 0x80: return r, i
+    """the varint at b[i]: (value, next index); ValueError when it runs off
+    the end or is longer than 10 bytes"""
+    r = 0
+    for k in range(10):
+        if i + k >= len(b):
+            raise ValueError('a varint runs off the end')
+        c = b[i + k]; r |= (c & 0x7f) << (7 * k)
+        if c < 0x80:
+            return r, i + k + 1
+    raise ValueError('a varint longer than 10 bytes')
 
 
 def fields(b):
-    """(field, payload) of every length-delimited field of a message;
-    other wire types are skipped"""
+    """(field, payload) of every length-delimited field of a message; the
+    other wire types (0, 1, 5) are skipped. ValueError on anything that is
+    not a whole field: a length or fixed width past the end, a bad varint, or
+    a wire type other than 0, 1, 2 and 5 (3 and 4 are groups)"""
     i, out = 0, []
     while i < len(b):
         key, i = varint(b, i)
         f, wt = key >> 3, key & 7
         if wt == 2:
-            n, i = varint(b, i); out.append((f, b[i:i + n])); i += n
+            n, i = varint(b, i)
+            if i + n > len(b):
+                raise ValueError(f'field {f}: a length of {n} past the end')
+            out.append((f, b[i:i + n])); i += n
         elif wt == 0:
             _, i = varint(b, i)
-        elif wt == 1: i += 8
-        elif wt == 5: i += 4
-        else: raise ValueError(f'wire type {wt}')
+        elif wt in (1, 5):
+            i += 8 if wt == 1 else 4
+            if i > len(b):
+                raise ValueError(f'field {f}: a fixed width past the end')
+        else:
+            raise ValueError(f'wire type {wt}')
     return out
 
 
