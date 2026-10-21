@@ -1143,3 +1143,23 @@ ARRAY JOIN multiIf(
     CAST([], 'Array(Tuple(String, String))')) AS e
 WHERE row_kind = 0 AND service_type = 'string'
 GROUP BY bucket, service, scope, key;
+
+CREATE TABLE IF NOT EXISTS {{db}}.service_bucket_resources{{on_cluster}}
+(
+    bucket Int64 CODEC(ZSTD(1)),
+    service LowCardinality(String) CODEC(ZSTD(1)),
+    resource_id UInt128 CODEC(ZSTD(1))
+)
+--@single  ENGINE = ReplacingMergeTree
+--@cluster ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/all/{{db}}.service_bucket_resources', '{replica}')
+PARTITION BY toDate(fromUnixTimestamp64Nano(bucket * 300000000000), 'UTC')
+ORDER BY (service, bucket, resource_id)
+TTL toDateTime(least(intDiv(bucket * 300000000000, 1000000000) + ({{retention_days}} * 86400), 4294967295))
+--@single  SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{trace_dedup_window}}{{storage_policy}};
+--@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, replicated_deduplication_window = {{trace_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
+
+CREATE MATERIALIZED VIEW {{db}}.service_bucket_resources_mv{{on_cluster}} TO {{db}}.service_bucket_resources
+AS SELECT intDiv(start_ns, 300000000000) AS bucket, service, resource_id
+FROM {{db}}.trace_landing
+WHERE row_kind = 0 AND service_type = 'string'
+GROUP BY bucket, service, resource_id;

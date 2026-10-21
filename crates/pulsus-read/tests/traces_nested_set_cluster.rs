@@ -4951,3 +4951,373 @@ async fn the_catalogue_and_the_error_table_answer_over_two_shards() {
     .await;
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+// =====================================================================
+// Issue #601 part 4c: a resource label and the resource catalogue over
+// two shards (T5, T11)
+// =====================================================================
+
+fn kv_4c(key: &str, value: any_value::Value) -> KeyValue {
+    KeyValue {
+        key: key.to_string(),
+        value: Some(AnyValue { value: Some(value) }),
+        ..KeyValue::default()
+    }
+}
+
+/// One request under a resource holding `attributes`, its spans each
+/// carrying `span_attrs`.
+fn resource_request_4c(
+    attributes: Vec<KeyValue>,
+    spans: Vec<Span>,
+    span_attrs: &[KeyValue],
+) -> ExportTraceServiceRequest {
+    let mut req = request(
+        spans
+            .into_iter()
+            .map(|mut s| {
+                s.attributes = span_attrs.to_vec();
+                s
+            })
+            .collect(),
+    );
+    req.resource_spans[0].resource = Some(Resource {
+        attributes,
+        dropped_attributes_count: 0,
+        entity_refs: Vec::new(),
+    });
+    req
+}
+
+/// A fresh clustered database, merges stopped on `spans`, and its three
+/// nodes.
+async fn cluster_db_4c(test: &str) -> (String, ChClient, [ChClient; 3]) {
+    let db = pulsus_testkit::test_db(&format!("pulsus_read_it_t601p4c_{test}"));
+    let bootstrap = ChClient::new(shard1_config("default"))
+        .await
+        .expect("connect shard1");
+    exec(
+        &bootstrap,
+        &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
+    )
+    .await;
+    run_init(&bootstrap, &cluster_ctx(&db))
+        .await
+        .expect("run_init");
+    let shard1 = ChClient::new(shard1_config(&db)).await.expect("shard1");
+    let shard1b = ChClient::new(shard1b_config(&db)).await.expect("shard1b");
+    let shard2 = ChClient::new(shard2_config(&db)).await.expect("shard2");
+    exec(
+        &shard1,
+        &format!("SYSTEM STOP MERGES ON CLUSTER '{CLUSTER_NAME}' {db}.spans"),
+    )
+    .await;
+    (db, bootstrap, [shard1, shard1b, shard2])
+}
+
+/// T5 (issue #601 part 4c), a guard: **a resource key labels alike over two
+/// shards.** `traces_query_v2_live.rs`'s fixture R through one node, its
+/// eight traces split across the shards: the scoped and the unscoped pod
+/// name label as that file's T4 writes by hand.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resource_key_labels_alike_over_two_shards() {
+    skip_unless_live!();
+    use any_value::Value as V;
+    use opentelemetry_proto::tonic::common::v1::{ArrayValue, KeyValueList};
+    let (db, bootstrap, [shard1, _, shard2]) = cluster_db_4c("t5").await;
+    let b = (now_ns() / S / 60 - 5) * 60;
+    let str_v = |s: &str| V::StringValue(s.to_string());
+    let pods: Vec<(Option<V>, Vec<KeyValue>)> = vec![
+        (Some(str_v("p1")), Vec::new()),
+        (Some(V::IntValue(7)), Vec::new()),
+        (Some(V::DoubleValue(1e21)), Vec::new()),
+        (Some(V::BoolValue(true)), Vec::new()),
+        (
+            Some(V::ArrayValue(ArrayValue {
+                values: ["a", "b"]
+                    .iter()
+                    .map(|v| AnyValue {
+                        value: Some(str_v(v)),
+                    })
+                    .collect(),
+            })),
+            Vec::new(),
+        ),
+        (
+            Some(V::KvlistValue(KeyValueList {
+                values: vec![kv_4c("x", str_v("y"))],
+            })),
+            Vec::new(),
+        ),
+        (None, Vec::new()),
+        (None, vec![kv_4c("k8s.pod.name", str_v("s9"))]),
+    ];
+    let mut push = ExportTraceServiceRequest {
+        resource_spans: Vec::new(),
+    };
+    for (i, (pod, span_attrs)) in pods.into_iter().enumerate() {
+        let i = u8::try_from(i).expect("eight resources");
+        let mut attributes = vec![
+            kv_4c("service.name", str_v("r")),
+            kv_4c("fixture.i", V::IntValue(i64::from(i))),
+        ];
+        if let Some(pod) = pod {
+            attributes.push(kv_4c("k8s.pod.name", pod));
+        }
+        let at = (b + 10) * S + i64::from(i) * 2 * S;
+        let spans = (0..2u8)
+            .map(|j| {
+                let mut sp = span(0xe0 + i, 2 * i + j + 1, 0, at + i64::from(j) * S);
+                sp.trace_id = tid4a(0xe0 + i);
+                sp
+            })
+            .collect();
+        push.resource_spans
+            .extend(resource_request_4c(attributes, spans, &span_attrs).resource_spans);
+    }
+    land(&shard1, &push, "t601p4c-t5").await;
+    exec(
+        &shard1,
+        &format!("SYSTEM FLUSH DISTRIBUTED {db}.spans_dist"),
+    )
+    .await;
+    let local = (
+        count(&shard1, "SELECT count() AS n FROM spans").await,
+        count(&shard2, "SELECT count() AS n FROM spans").await,
+    );
+    assert!(
+        local.0 > 0 && local.1 > 0 && local.0 + local.1 == 16,
+        "sixteen spans split across the shards: {local:?}"
+    );
+
+    let engine = pulsus_read::TraceEngine::new(
+        ChClient::new(shard1_config(&db))
+            .await
+            .expect("connect the engine"),
+        config(),
+    );
+    let tables = StatementTables {
+        spans: "spans_dist",
+        error_spans: "error_spans_dist",
+        resources: "resources",
+        traces: "traces_dist",
+        indexed: &[],
+    };
+    let mut answers = Vec::new();
+    for key in ["resource.k8s.pod.name", ".k8s.pod.name"] {
+        let q = format!("{{ }} | count_over_time() by ({key})");
+        let routed = pulsus_read::plan_trace_metrics_routed(
+            &pulsus_traceql::parse(&q).expect("parses"),
+            &pulsus_read::MetricsParams {
+                start_ns: b * S,
+                end_ns: (b + 60) * S,
+                step_ms: 60_000,
+                exemplars: None,
+                floor_ns: i64::MIN,
+            },
+            &engine.metrics_ctx(),
+            &tables,
+        )
+        .expect("plans");
+        let text = match engine.metrics_instant_routed(&routed).await {
+            Err(e) => vec![format!("Err({e})")],
+            Ok(out) => {
+                let mut v: Vec<String> = out
+                    .series
+                    .iter()
+                    .map(|s| {
+                        let labels: Vec<String> = s
+                            .labels
+                            .iter()
+                            .map(|l| format!("{}={:?}", l.key, l.value))
+                            .collect();
+                        let total: f64 = s.samples.iter().map(|(_, v)| v).sum();
+                        format!("{} {total}", labels.join(","))
+                    })
+                    .collect();
+                v.sort();
+                v
+            }
+        };
+        answers.push(text);
+    }
+    exec(
+        &bootstrap,
+        &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
+    )
+    .await;
+    let want = |k: &str, own: &[(&str, f64)]| -> Vec<String> {
+        let mut v: Vec<String> = [
+            ("Str(\"p1\")", 2.0),
+            ("Int(7)", 2.0),
+            ("Double(1e21)", 2.0),
+            ("Bool(true)", 2.0),
+            ("Str(\"nil\")", 2.0),
+        ]
+        .iter()
+        .chain(own)
+        .map(|(v, n)| format!("{k}={v} {n}"))
+        .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(
+        answers[0],
+        want("resource.k8s.pod.name", &[("Str(\"nil\")", 6.0)]),
+        "scoped"
+    );
+    assert_eq!(
+        answers[1],
+        want(
+            ".k8s.pod.name",
+            &[("Str(\"s9\")", 2.0), ("Str(\"nil\")", 4.0)]
+        ),
+        "unscoped"
+    );
+}
+
+/// T11 (issue #601 part 4c): **the resource catalogue answers over two
+/// shards.** `traces_query_v2_live.rs`'s fixture B through one node: the
+/// service-narrowed resource values read lists `ra1` and `ra2` in one
+/// statement reading `service_bucket_resources`, and the table holds the
+/// same five rows on all three replicas.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_resource_catalogue_answers_over_two_shards() {
+    skip_unless_live!();
+    use any_value::Value as V;
+    let (db, bootstrap, nodes) = cluster_db_4c("t11").await;
+    let k0 = now_ns() / BUCKET - 8;
+    let at = |s: i64| k0 * BUCKET + s * S;
+    let resource = |service: &str, pod: &str| {
+        vec![
+            kv_4c("service.name", V::StringValue(service.to_string())),
+            kv_4c("k8s.pod.name", V::StringValue(pod.to_string())),
+        ]
+    };
+    let one = |service: &str, pod: &str, sid: u16, s: i64| {
+        resource_request_4c(
+            resource(service, pod),
+            vec![span_4b(
+                0xb0 + (sid as u8),
+                sid,
+                None,
+                "op",
+                2,
+                at(s),
+                1,
+                false,
+                None,
+            )],
+            &[],
+        )
+    };
+    let mut first = one("a", "ra2", 1, 150);
+    first
+        .resource_spans
+        .extend(one("a", "ra3", 2, 50).resource_spans);
+    let mut second = resource_request_4c(
+        resource("a", "ra1"),
+        (0..3_000u16)
+            .map(|i| {
+                span_4b(
+                    0xd0 + (i % 40) as u8,
+                    1_000 + i,
+                    None,
+                    "op",
+                    2,
+                    at(400),
+                    1,
+                    false,
+                    None,
+                )
+            })
+            .collect(),
+        &[],
+    );
+    second
+        .resource_spans
+        .extend(one("b", "rb1", 3, 450).resource_spans);
+    for (i, req) in [first, second, one("a", "ra4", 4, 1_050)]
+        .iter()
+        .enumerate()
+    {
+        land(&nodes[0], req, &format!("t601p4c-t11-{i}")).await;
+    }
+    exec(
+        &nodes[0],
+        &format!("SYSTEM FLUSH DISTRIBUTED {db}.spans_dist"),
+    )
+    .await;
+
+    let mut wrong = Vec::new();
+    let (s, e) = (at(100), at(1_000));
+    let prefix = pulsus_testkit::test_ident(&format!("t601p4c_t11_{}", now_ns()));
+    let values = engine_4b(&db, Some(prefix.clone()), "error_spans_dist")
+        .await
+        .list_tag_values(
+            "k8s.pod.name",
+            Some("resource"),
+            pulsus_read::TagValuesRequest {
+                q: Some(r#"{ resource.service.name = "a" }"#),
+                start_ns: s,
+                end_ns: e,
+            },
+        )
+        .await
+        .map(|v| {
+            v.values
+                .iter()
+                .map(|v| format!("{}/{}", v.val, v.val_type))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .map_err(|e| e.to_string());
+    let stmts = statements_4b(&nodes[0], &prefix).await;
+    eprintln!("T11: {values:?} in {stmts:?}");
+    if values != Ok("ra1/string ra2/string".to_string()) {
+        wrong.push(format!("T8 over the cluster: {values:?}"));
+    }
+    if stmts.len() != 1 || !read_table_4b(&stmts, &db, "service_bucket_resources") {
+        wrong.push(format!(
+            "expected one statement reading the catalogue: {stmts:?}"
+        ));
+    }
+
+    let rows = format!(
+        "SELECT concat(toString(bucket - {k0}), ' ', service, ' ', hex(resource_id)) AS s \
+         FROM service_bucket_resources ORDER BY s"
+    );
+    let mut held = Vec::new();
+    for node in &nodes {
+        let synced = node
+            .execute(
+                &format!("SYSTEM SYNC REPLICA {db}.service_bucket_resources"),
+                &QuerySettings::new(),
+                Idempotency::NonIdempotent,
+            )
+            .await
+            .map_err(|e| e.to_string());
+        held.push((
+            synced,
+            node.query_strings(&rows, &QuerySettings::new())
+                .await
+                .map_err(|e| e.to_string()),
+        ));
+    }
+    eprintln!("service_bucket_resources per node: {held:?}");
+    let five = |h: &(Result<(), String>, Result<Vec<String>, String>)| {
+        h.0.is_ok() && h.1.as_ref().is_ok_and(|r| r.len() == 5)
+    };
+    if !held.iter().all(five) || held[0] != held[1] || held[0] != held[2] {
+        wrong.push(format!(
+            "the three replicas do not hold the same five rows: {held:?}"
+        ));
+    }
+
+    exec(
+        &bootstrap,
+        &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
+    )
+    .await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

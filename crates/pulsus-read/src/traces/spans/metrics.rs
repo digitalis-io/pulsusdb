@@ -41,7 +41,7 @@ use super::attr_index::{IndexedAttr, index_hints};
 use super::numbering::numbering_sql;
 use super::predicate::{
     HELD, PredicateCtx, SpanPredicate, any_element_held, attr_path, compile_span_predicate_in,
-    first_element, resource_value_in, scope_value,
+    first_element, resource_label_in, scope_value,
 };
 use super::tracelevel::{CHILDREN, TraceLeaf, TraceValue, per_trace_sql, trace_values_sql};
 
@@ -529,9 +529,36 @@ impl Read {
         // span identity; a read of the numbering keeps `final` for both.
         let keeps_final = joins.numbering || numbered;
         let dedup = !keeps_final && !matches!(plan.kind(), PlanKind::Count { .. });
+        // Issue #601 part 4c (D1): a read through the dedup wrap computes
+        // the key array and the target inside it and reads them by alias,
+        // so the wrap reads each subcolumn they name and not its whole
+        // column. An ungrouped statement's key array is a constant, which
+        // reads no column and stays outside, where it is not grouped by.
+        let (inner, g, x, i) = if dedup {
+            let keyed = !texts.is_empty();
+            let mut inner = if keyed {
+                format!(", {g} AS w_g")
+            } else {
+                String::new()
+            };
+            if let Some(x) = &x {
+                inner.push_str(&format!(", {x} AS w_x"));
+            }
+            if let Some(i) = &i {
+                inner.push_str(&format!(", {i} AS w_i"));
+            }
+            (
+                inner,
+                if keyed { "w_g".to_string() } else { g },
+                x.map(|_| "w_x".to_string()),
+                i.map(|_| "w_i".to_string()),
+            )
+        } else {
+            (String::new(), g, x, i)
+        };
         Some(Read {
             with,
-            from: from_clause(tables, joins, window, &predicate, &condition, dedup),
+            from: from_clause(tables, joins, window, &predicate, &condition, dedup, &inner),
             g,
             x,
             i,
@@ -601,7 +628,12 @@ fn key_text(field: &Field, ctx: &PredicateCtx<'_>, joins: &mut Joins) -> Result<
                     "if(service_type = 'string', (toString(service), 's'), ('', 'N'))".to_string()
                 }
                 AttrScope::Span => dynamic_key(&attr_path("attrs", key), missing),
-                AttrScope::Resource => dynamic_key(&resource_value_in(key, ctx)?, missing),
+                // Issue #601 part 4c (D2): the label the lookup computes
+                // once per resource row.
+                AttrScope::Resource => {
+                    let (present, label) = resource_label_in(key, ctx)?;
+                    format!("if({present}, {label}, ('', '{missing}'))")
+                }
                 AttrScope::Instrumentation => dynamic_key(&attr_path("scope_attrs", key), missing),
                 AttrScope::Event => dynamic_key(&first_element("events.attrs", key), missing),
                 AttrScope::Link => dynamic_key(&first_element("links.attrs", key), missing),
@@ -610,11 +642,8 @@ fn key_text(field: &Field, ctx: &PredicateCtx<'_>, joins: &mut Joins) -> Result<
                     let resource_arm = if key == "service.name" {
                         "service_type = 'string', (toString(service), 's')".to_string()
                     } else {
-                        let resource = resource_value_in(key, ctx)?;
-                        format!(
-                            "dynamicType({resource}) {HELD}, {}",
-                            dynamic_key(&resource, missing)
-                        )
+                        let (present, label) = resource_label_in(key, ctx)?;
+                        format!("{present}, {label}")
                     };
                     format!(
                         "multiIf(dynamicType({span}) {HELD}, {}, {resource_arm}, {}, {}, {}, \
@@ -700,7 +729,8 @@ fn trace_keys(traces: &str, window: WindowSql) -> String {
 /// the target read: the window's three bounds, the predicate, and the
 /// target's condition. With `dedup` (issue #601 part 4a), one row per span
 /// identity, the joins inside and each joined column the statement reads
-/// named as it reads it.
+/// named as it reads it, then `inner`, the columns the wrap computes for
+/// the statement (part 4c); `inner` is ignored without `dedup`.
 fn from_clause(
     tables: &StatementTables<'_>,
     joins: Joins,
@@ -708,6 +738,7 @@ fn from_clause(
     predicate: &str,
     condition: &str,
     dedup: bool,
+    inner: &str,
 ) -> String {
     let mut join = String::new();
     if joins.trace {
@@ -755,6 +786,7 @@ fn from_clause(
     if joins.children {
         cols.push_str(", ch.cc AS `ch.cc`");
     }
+    cols.push_str(inner);
     format!("FROM {}", super::distinct_spans(&read, &cols))
 }
 
@@ -1390,6 +1422,9 @@ fn compare_sql(
         &outer_sql,
         "",
         !keeps_final,
+        // The outer read takes `kvs`, the whole `attrs`, which the wrap
+        // supplies whole.
+        "",
     )
     .replace('\n', &format!("\n{}", " ".repeat(36)));
     let exb = u8::from(plan.exemplar_budget() > 0);
@@ -1601,12 +1636,16 @@ mod tests {
                 .range_sql()
                 .to_string()
         };
-        // The key's own missing arm (`dynamic_key`, or the service column's),
-        // not `folded_keys`, which names both codes in every keyed statement
-        // (#600 part 1b-3).
+        // The key's own missing arm (`dynamic_key`, the service column's, or
+        // a resource label's, issue #601 part 4c), not `folded_keys`, which
+        // names both codes in every keyed statement (#600 part 1b-3).
         let missing = |sql: &str, code: char| {
+            let label = format!("), ('', '{code}'))");
             sql.contains(&format!("{HELD}), '{code}', 'a')"))
                 || (code == 'N' && sql.contains("(toString(service), 's'), ('', 'N'))"))
+                || sql
+                    .match_indices("ri_")
+                    .any(|(at, _)| sql.get(at + 19..).is_some_and(|r| r.starts_with(&label)))
         };
         for key in well_known {
             assert!(missing(&statement(key), 'N'), "{key}: no 'N'");

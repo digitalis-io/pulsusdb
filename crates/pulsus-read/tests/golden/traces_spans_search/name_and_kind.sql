@@ -16,8 +16,8 @@ SELECT m.trace_id AS trace_id, t.root_service AS root_service, t.root_name AS ro
        m.last AS last, m.matched AS matched, m.spans AS spans
 FROM (SELECT trace_id, max(start_ns) AS last, count() AS matched,
              arraySlice(arraySort(x -> (x.2, x.1),
-                        groupArray((span_id, start_ns, duration_ns, service, arrayFilter(x -> x.1 != 0, [multiIf(match(name, '^(?:GET.*)$'), (1, if(length(toString(name)) <= 8192, toString(name), substringUTF8(toString(name), 1, 2048)), 'String'), (0, '', '')), multiIf(kind = 3, (2, if(length(multiIf(kind = 1, 'internal', kind = 2, 'server', kind = 3, 'client', kind = 4, 'producer', kind = 5, 'consumer', 'unspecified')) <= 8192, multiIf(kind = 1, 'internal', kind = 2, 'server', kind = 3, 'client', kind = 4, 'producer', kind = 5, 'consumer', 'unspecified'), substringUTF8(multiIf(kind = 1, 'internal', kind = 2, 'server', kind = 3, 'client', kind = 4, 'producer', kind = 5, 'consumer', 'unspecified'), 1, 2048)), 'String'), (0, '', ''))])))), 1, 3) AS spans
-      FROM (SELECT * FROM spans
+                        groupArray((span_id, start_ns, duration_ns, service, w_proj))), 1, 3) AS spans
+      FROM (SELECT *, arrayFilter(x -> x.1 != 0, [multiIf(match(name, '^(?:GET.*)$'), (1, if(length(toString(name)) <= 8192, toString(name), substringUTF8(toString(name), 1, 2048)), 'String'), (0, '', '')), multiIf(kind = 3, (2, if(length(multiIf(kind = 1, 'internal', kind = 2, 'server', kind = 3, 'client', kind = 4, 'producer', kind = 5, 'consumer', 'unspecified')) <= 8192, multiIf(kind = 1, 'internal', kind = 2, 'server', kind = 3, 'client', kind = 4, 'producer', kind = 5, 'consumer', 'unspecified'), substringUTF8(multiIf(kind = 1, 'internal', kind = 2, 'server', kind = 3, 'client', kind = 4, 'producer', kind = 5, 'consumer', 'unspecified'), 1, 2048)), 'String'), (0, '', ''))]) AS w_proj FROM spans
       WHERE (intDiv(start_ns, 300000000000), trace_id) IN
             (SELECT arrayJoin(arrayFlatten(arrayMap((t, ks) -> arrayMap(k -> (k, t), ks), top.1, top.2))))
         AND start_ns >= 1790084801000000000 AND start_ns < 1790095601000000000
