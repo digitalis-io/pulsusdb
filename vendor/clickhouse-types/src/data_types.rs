@@ -143,10 +143,6 @@ pub enum DataTypeNode {
 
     // TODO: Rename for better representation
     JsonWithHint(Vec<(String, Box<DataTypeNode>)>),
-    /// PATCH (PATCHES.md s6). `JSON(name = integer, ...)`, the settings form
-    /// the schema creates, its argument text kept verbatim so the type
-    /// renders as the server names it.
-    JsonWithParams(String),
     Point,
     Ring,
     LineString,
@@ -368,8 +364,6 @@ impl Display for DataTypeNode {
             Polygon => write!(f, "Polygon"),
             MultiPolygon => write!(f, "MultiPolygon"),
             JsonWithHint(json) => format_json_with_hint(json, f),
-            // PATCH (PATCHES.md s6): the server's name, byte for byte.
-            JsonWithParams(params) => write!(f, "JSON({params})"),
         }
     }
 }
@@ -858,11 +852,6 @@ fn parse_map(input: &str) -> Result<DataTypeNode, TypesError> {
 }
 
 fn parse_json(input: &str) -> Result<DataTypeNode, TypesError> {
-    // PATCH (PATCHES.md s6): the exact settings form first. On `None` the
-    // code below is upstream's, byte for byte.
-    if let Some(params) = json_params(input) {
-        return Ok(DataTypeNode::JsonWithParams(params.to_string()));
-    }
     let columns = remove_json_header(input)?.split(',').collect::<Vec<_>>();
 
     let inner_types = columns
@@ -890,34 +879,6 @@ fn parse_json(input: &str) -> Result<DataTypeNode, TypesError> {
     }
 
     Ok(DataTypeNode::JsonWithHint(inner_types))
-}
-
-/// PATCH (PATCHES.md s6). `Some` with the argument text of `JSON(...)` only
-/// when it is non-empty and every comma-separated piece is `name = integer`:
-/// `name` an unquoted identifier (an ASCII letter or `_`, then letters,
-/// digits or `_`), `integer` ASCII digits, whitespace allowed around each.
-/// Every other input returns `None`.
-fn json_params(input: &str) -> Option<&str> {
-    let inner = input.strip_prefix("JSON(")?.strip_suffix(')')?;
-    if inner.is_empty() {
-        return None;
-    }
-    let space = |c: char| c.is_ascii_whitespace();
-    for piece in inner.split(',') {
-        let (name, value) = piece.split_once('=')?;
-        let name = name.trim_matches(space);
-        let value = value.trim_matches(space);
-        let mut chars = name.chars();
-        let first = chars.next()?;
-        if !(first.is_ascii_alphabetic() || first == '_')
-            || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-            || value.is_empty()
-            || !value.bytes().all(|b| b.is_ascii_digit())
-        {
-            return None;
-        }
-    }
-    Some(inner)
 }
 
 fn remove_json_header(input: &str) -> Result<&str, TypesError> {

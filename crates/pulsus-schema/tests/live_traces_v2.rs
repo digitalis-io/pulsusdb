@@ -1267,10 +1267,8 @@ async fn shape(client: &ChClient, db: &str, name: &str) -> ShapeRow {
     row.expect("one row").expect("decode ShapeRow")
 }
 
-/// **T2 and T2b (issue #601 part 4b).** The two derived tables, their
-/// wrapper and their views as the design writes them, read back off the
-/// server; and `spans`' four attribute columns holding 16 dynamic paths with
-/// the rest in 8 shared-data buckets.
+/// **T2 (issue #601 part 4b).** The two derived tables, their wrapper and
+/// their views as the design writes them, read back off the server.
 ///
 /// Single-node always. With `PULSUS_TEST_CH_CLUSTER` set — this suite's
 /// connection then points at a node of that cluster — the clustered schema
@@ -1373,35 +1371,6 @@ async fn the_two_4b_tables_have_the_planned_shape() {
             tbv_mv.as_select
         );
 
-        // T2b: `spans`' attribute storage.
-        let types: Vec<(String, String)> = columns(&client, db, "spans").await;
-        let type_of = |name: &str| -> String {
-            types
-                .iter()
-                .find(|(n, _)| n == name)
-                .map(|(_, t)| t.clone())
-                .unwrap_or_else(|| panic!("spans has no column {name}"))
-        };
-        for col in ["attrs", "scope_attrs"] {
-            assert_eq!(type_of(col), "JSON(max_dynamic_paths=16)", "spans.{col}");
-        }
-        for col in ["events", "links"] {
-            let t = type_of(col);
-            assert!(
-                t.contains("attrs JSON(max_dynamic_paths=16)") && !t.contains("attrs JSON,"),
-                "spans.{col}: {t}"
-            );
-        }
-        let spans = shape(&client, db, "spans").await;
-        assert!(
-            spans.engine_full.contains(
-                "object_shared_data_serialization_version = 'map_with_buckets', \
-                 object_shared_data_buckets_for_wide_part = 8"
-            ),
-            "spans' settings: {}",
-            spans.engine_full
-        );
-
         if let Some(cluster) = &cluster {
             assert!(
                 es.engine_full.starts_with(&format!(
@@ -1425,13 +1394,6 @@ async fn the_two_4b_tables_have_the_planned_shape() {
                      SETTINGS fsync_after_insert = 1, fsync_directories = 1"
                 )
             );
-            let dist = columns(&client, db, "spans_dist").await;
-            let dist_attrs = dist
-                .iter()
-                .find(|(n, _)| n == "attrs")
-                .map(|(_, t)| t.clone())
-                .unwrap_or_default();
-            assert_eq!(dist_attrs, "JSON(max_dynamic_paths=16)", "spans_dist.attrs");
             let mv = scalar(
                 &client,
                 &format!(

@@ -350,14 +350,14 @@ CREATE TABLE IF NOT EXISTS {{db}}.spans{{on_cluster}}
     flags UInt32 CODEC(ZSTD(1)),
     scope_name LowCardinality(String) CODEC(ZSTD(1)),
     scope_version LowCardinality(String) CODEC(ZSTD(1)),
-    scope_attrs JSON(max_dynamic_paths = 16) CODEC(ZSTD(1)),
-    attrs JSON(max_dynamic_paths = 16) CODEC(ZSTD(1)),
+    scope_attrs JSON CODEC(ZSTD(1)),
+    attrs JSON CODEC(ZSTD(1)),
     attrs_other String CODEC(ZSTD(1)),
     dropped_attrs UInt32 CODEC(ZSTD(1)),
     events Array(Tuple(
         time_ns UInt64,
         name LowCardinality(String),
-        attrs JSON(max_dynamic_paths = 16),
+        attrs JSON,
         attrs_other String,
         dropped_attrs UInt32)) CODEC(ZSTD(1)),
     dropped_events UInt32 CODEC(ZSTD(1)),
@@ -366,7 +366,7 @@ CREATE TABLE IF NOT EXISTS {{db}}.spans{{on_cluster}}
         span_id String,
         trace_state String,
         flags UInt32,
-        attrs JSON(max_dynamic_paths = 16),
+        attrs JSON,
         attrs_other String,
         dropped_attrs UInt32)) CODEC(ZSTD(1)),
     dropped_links UInt32 CODEC(ZSTD(1)),
@@ -384,8 +384,8 @@ CREATE TABLE IF NOT EXISTS {{db}}.spans{{on_cluster}}
 PARTITION BY toDate(fromUnixTimestamp64Nano(start_ns), 'UTC')
 ORDER BY (intDiv(start_ns, 300000000000), trace_id, start_ns, span_id, kind)
 TTL toDateTime(least(intDiv(start_ns, 1000000000) + ({{retention_days}} * 86400), 4294967295))
---@single  SETTINGS ttl_only_drop_parts = 1, index_granularity = 2048, min_columns_to_activate_adaptive_write_buffer = 1, non_replicated_deduplication_window = {{trace_dedup_window}}, object_shared_data_serialization_version = 'map_with_buckets', object_shared_data_buckets_for_wide_part = 8{{storage_policy}};
---@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 2048, min_columns_to_activate_adaptive_write_buffer = 1, replicated_deduplication_window = {{trace_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}, object_shared_data_serialization_version = 'map_with_buckets', object_shared_data_buckets_for_wide_part = 8{{storage_policy}};
+--@single  SETTINGS ttl_only_drop_parts = 1, index_granularity = 2048, min_columns_to_activate_adaptive_write_buffer = 1, non_replicated_deduplication_window = {{trace_dedup_window}}{{storage_policy}};
+--@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 2048, min_columns_to_activate_adaptive_write_buffer = 1, replicated_deduplication_window = {{trace_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
 
 CREATE TABLE IF NOT EXISTS {{db}}.tag_names{{on_cluster}}
 (

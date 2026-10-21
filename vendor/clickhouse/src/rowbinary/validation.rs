@@ -626,11 +626,7 @@ fn validate_impl<'serde, 'caller, R: Row>(
                 root,
                 kind: InnerDataTypeValidatorKind::JsonWithHint(kv),
             })),
-            // PATCHES.md s3, and clickhouse-types' PATCHES.md s6: a JSON
-            // type carrying settings is the same wire form.
-            DataTypeNode::String | DataTypeNode::JSON | DataTypeNode::JsonWithParams(_) => {
-                Ok(None)
-            }
+            DataTypeNode::String | DataTypeNode::JSON => Ok(None),
             _ => root.err_on_schema_mismatch(data_type, serde_type, is_inner),
         },
         // allows to work with BLOB strings as well
@@ -697,7 +693,7 @@ fn validate_impl<'serde, 'caller, R: Row>(
             // returns `Ok(None)` the moment the validator is `None` — which
             // is the patch's stated limit: a wrong type tag reaches the
             // server rather than the driver.
-            DataTypeNode::JSON | DataTypeNode::JsonWithParams(_) => Ok(None),
+            DataTypeNode::JSON => Ok(None),
             _ => root.err_on_schema_mismatch(data_type, serde_type, is_inner),
         },
         SerdeType::Tuple(len) => match data_type {
