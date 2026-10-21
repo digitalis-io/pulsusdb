@@ -261,6 +261,7 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
     let indexed = IndexedAttr::from_config(&config.traceql_indexed_attributes);
     let tables = StatementTables {
         spans: &rc.spans_v2_table,
+        error_spans: &rc.error_spans_table,
         resources: &rc.resources_table,
         traces: &rc.traces_table,
         indexed: &indexed,

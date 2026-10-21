@@ -108,6 +108,7 @@ fn side_of(query: &pulsus_traceql::Query, route: &str) -> &'static str {
         };
         let tables = StatementTables {
             spans: "spans",
+            error_spans: "error_spans",
             resources: "resources",
             traces: "traces",
             indexed: &[],
@@ -126,6 +127,7 @@ fn side_of(query: &pulsus_traceql::Query, route: &str) -> &'static str {
     };
     let tables = StatementTables {
         spans: "spans",
+        error_spans: "error_spans",
         resources: "resources",
         traces: "traces",
         indexed: &[],

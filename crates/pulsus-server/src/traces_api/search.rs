@@ -82,6 +82,7 @@ async fn search_impl(
     );
     let tables = pulsus_read::StatementTables {
         spans: &read_config.spans_v2_table,
+        error_spans: &read_config.error_spans_table,
         resources: &read_config.resources_table,
         traces: &read_config.traces_table,
         indexed: &indexed,

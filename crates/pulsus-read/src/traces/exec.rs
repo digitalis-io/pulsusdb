@@ -239,6 +239,11 @@ pub struct TraceReadConfig {
     /// metrics, tag and graph reads, which this part does not move. Same
     /// `_dist` rule: the table co-shards on `cityHash64(trace_id)`.
     pub spans_v2_table: String,
+    /// `error_spans{_dist}` — the error-span table (issue #601 part 4b):
+    /// the search statement of a query
+    /// [`super::spans::error_spans::admits`] reads it in place of
+    /// [`Self::spans_v2_table`]. Same `_dist` rule.
+    pub error_spans_table: String,
     /// `traces{_dist}` — the per-trace table the indexed fetch reads its
     /// bucket set and its extent from (issue #587). Same `_dist` rule.
     pub traces_table: String,
@@ -1939,6 +1944,15 @@ impl TraceEngine {
                 .stream_tag_values(&sql, &catalog_settings(&self.config), &n)
                 .await;
         }
+        // Issue #601 part 4b: a span-scoped key narrowed by one service
+        // equality answers from the bucket catalogue, unless an interior
+        // bucket is overflowed.
+        if scope == Some("span")
+            && let Some(service) = n.service_equality()
+            && let Some(values) = self.catalogue_tag_values(service, key, req).await?
+        {
+            return Ok(values);
+        }
         // Issue #509: neither branch escapes a `?` here. The doubling
         // happens once, in `traces::dispatch`, for every read on this
         // path. The key is escaped into a JSON path by the builder.
@@ -2071,15 +2085,21 @@ impl TraceEngine {
     }
 
     /// The statement for `request`, its top-K reading the newest
-    /// `slice_ns` when given.
+    /// `slice_ns` when given; on the error-span table when
+    /// [`super::spans::error_spans::admits`] the query (issue #601 part 4b).
     pub(super) fn search_statement(
         &self,
         request: &super::spans::search::SearchRequest,
         slice_ns: Option<i64>,
     ) -> Result<super::spans::search::SearchStatement, super::PlanError> {
+        let spans = if super::spans::error_spans::admits(&request.query) {
+            &self.config.error_spans_table
+        } else {
+            &self.config.spans_v2_table
+        };
         super::spans::search::plan_statement_sliced(
             request,
-            &self.config.spans_v2_table,
+            spans,
             &self.config.traces_table,
             &self.config.resources_table,
             self.config.max_depth,
@@ -3348,6 +3368,7 @@ mod tests {
             recent_table: "trace_recent".to_string(),
             errors_table: "trace_error_spans".to_string(),
             spans_v2_table: "spans".to_string(),
+            error_spans_table: "error_spans".to_string(),
             traces_table: "traces".to_string(),
             resources_table: "resources".to_string(),
             scan_budget_rows: 50_000_000,
@@ -3371,6 +3392,7 @@ mod tests {
             recent_table: "trace_recent".to_string(),
             errors_table: "trace_error_spans".to_string(),
             spans_v2_table: "spans".to_string(),
+            error_spans_table: "error_spans".to_string(),
             traces_table: "traces".to_string(),
             resources_table: "resources".to_string(),
             scan_budget_rows: 1_000,
@@ -3768,6 +3790,7 @@ mod tests {
         };
         let tables = StatementTables {
             spans: "spans",
+            error_spans: "error_spans",
             resources: "resources",
             traces: "traces",
             indexed: &[],
@@ -4800,5 +4823,6 @@ mod tests {
     }
 }
 
+mod catalogue_values;
 mod metrics_statement;
 mod newest_first;

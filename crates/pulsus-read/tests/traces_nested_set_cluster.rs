@@ -230,6 +230,7 @@ fn config() -> pulsus_read::TraceReadConfig {
         recent_table: "trace_recent_dist".to_string(),
         errors_table: "trace_error_spans_dist".to_string(),
         spans_v2_table: "spans_dist".to_string(),
+        error_spans_table: "error_spans_dist".to_string(),
         traces_table: "traces_dist".to_string(),
         resources_table: "resources".to_string(),
         scan_budget_rows: 50_000_000,
@@ -368,6 +369,7 @@ async fn a_numbered_search_answers_over_two_shards() {
             },
             &StatementTables {
                 spans: "spans_dist",
+                error_spans: "error_spans_dist",
                 resources: "resources",
                 traces: "traces_dist",
                 indexed: &[],
@@ -516,6 +518,7 @@ async fn a_numbered_search_answers_over_two_shards() {
     // the distributed tables, instant over the minute holding the traces.
     let tables = pulsus_read::StatementTables {
         spans: "spans_dist",
+        error_spans: "error_spans_dist",
         resources: "resources",
         traces: "traces_dist",
         indexed: &[],
@@ -646,6 +649,7 @@ async fn a_resource_value_keeps_its_type_over_two_shards() {
             },
             &StatementTables {
                 spans: "spans_dist",
+                error_spans: "error_spans_dist",
                 resources: "resources",
                 traces: "traces_dist",
                 indexed: &[],
@@ -1034,6 +1038,7 @@ async fn a_compare_top_n_is_ranked_over_every_shard() {
     let read = config();
     let tables = StatementTables {
         spans: &read.spans_v2_table,
+        error_spans: &read.error_spans_table,
         resources: &read.resources_table,
         traces: &read.traces_table,
         indexed: &[],
@@ -1339,6 +1344,7 @@ async fn the_service_graph_answers_over_two_shards() {
                 .expect("connect the reader"),
             pulsus_read::TraceReadConfig {
                 spans_v2_table: "spans_q".to_string(),
+                error_spans_table: "error_spans_q".to_string(),
                 ..config()
             },
         )
@@ -4311,6 +4317,7 @@ async fn a_retried_push_is_counted_once_over_two_shards() {
     );
     let tables = StatementTables {
         spans: "spans_dist",
+        error_spans: "error_spans_dist",
         resources: "resources",
         traces: "traces_dist",
         indexed: &[],
@@ -4477,6 +4484,465 @@ async fn a_retried_push_is_counted_once_over_two_shards() {
         "01/2 02/2 03/2 04/2 05/2",
         cluster_final_statements(&nodes, &db, t0).await,
     );
+
+    exec(
+        &bootstrap,
+        &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
+    )
+    .await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+// =====================================================================
+// Issue #601 part 4b: the bucket catalogue and the error table over two
+// shards (T11)
+// =====================================================================
+
+/// One span of trace `t` for part 4b: kind, duration in ms, error or not,
+/// and an `http.route` when given.
+#[allow(clippy::too_many_arguments)]
+fn span_4b(
+    t: u8,
+    sid: u16,
+    parent: Option<u16>,
+    name: &str,
+    kind: i32,
+    at: i64,
+    dur_ms: i64,
+    error: bool,
+    route: Option<&str>,
+) -> Span {
+    use opentelemetry_proto::tonic::trace::v1::Status;
+    let sid_bytes = |s: u16| {
+        let mut v = vec![0u8; 8];
+        v[0] = 0x4b;
+        v[6..8].copy_from_slice(&s.to_be_bytes());
+        v
+    };
+    Span {
+        trace_id: tid4a(t),
+        span_id: sid_bytes(sid),
+        parent_span_id: parent.map(sid_bytes).unwrap_or_default(),
+        name: name.to_string(),
+        kind,
+        start_time_unix_nano: at as u64,
+        end_time_unix_nano: (at + dur_ms * 1_000_000) as u64,
+        attributes: route
+            .map(|r| {
+                vec![KeyValue {
+                    key: "http.route".to_string(),
+                    value: Some(AnyValue {
+                        value: Some(any_value::Value::StringValue(r.to_string())),
+                    }),
+                    ..KeyValue::default()
+                }]
+            })
+            .unwrap_or_default(),
+        status: error.then(|| Status {
+            message: "boom".to_string(),
+            code: 2,
+        }),
+        ..Span::default()
+    }
+}
+
+/// One finished statement of the engine, on the node that ran it.
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+struct Stmt4b {
+    tables: Vec<String>,
+    read_rows: u64,
+}
+
+/// The statements whose `query_id` starts with `prefix`, as the initiating
+/// node logged them, read until two reads a second apart agree on one.
+async fn statements_4b(client: &ChClient, prefix: &str) -> Vec<Stmt4b> {
+    let read = || async {
+        exec(client, "SYSTEM FLUSH LOGS").await;
+        let sql = format!(
+            "SELECT tables, read_rows FROM system.query_log \
+             WHERE type = 'QueryFinish' AND is_initial_query AND startsWith(query_id, '{prefix}-') \
+             ORDER BY event_time_microseconds"
+        );
+        let mut st = client
+            .query_stream::<Stmt4b>(&sql, &QuerySettings::new())
+            .await
+            .expect("read the query log");
+        let mut out = Vec::new();
+        while let Some(row) = st.next().await {
+            out.push(row.expect("decode"));
+        }
+        out
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let a = read().await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let b = read().await;
+        if a == b && !a.is_empty() {
+            return a;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the query log did not settle: {a:?} then {b:?}"
+        );
+    }
+}
+
+/// The engine on shard 1 whose error table is `errors`, stamping its
+/// statements with `prefix` when given.
+async fn engine_4b(db: &str, prefix: Option<String>, errors: &str) -> pulsus_read::TraceEngine {
+    let engine = pulsus_read::TraceEngine::new(
+        ChClient::new(shard1_config(db))
+            .await
+            .expect("connect the engine"),
+        pulsus_read::TraceReadConfig {
+            error_spans_table: errors.to_string(),
+            ..config()
+        },
+    );
+    match prefix {
+        Some(p) => engine.with_statement_prefix(&p),
+        None => engine,
+    }
+}
+
+fn read_table_4b(stmts: &[Stmt4b], db: &str, table: &str) -> bool {
+    let name = format!("{db}.{table}");
+    stmts.iter().any(|s| s.tables.contains(&name))
+}
+
+/// T11 (issue #601 part 4b): **the catalogue and the error table answer
+/// over two shards.** Part 4b's fixtures C4 and E land through one node and
+/// split across the shards: the service-narrowed values read answers in one
+/// statement from `tag_bucket_values` and `spans_dist`, reading fewer rows
+/// than the window holds; the admitted metrics and search reads answer as
+/// the same reads forced to `spans_dist`, from `error_spans_dist` and not
+/// `spans_dist`; and `tag_bucket_values` holds the same groups on all three
+/// replicas.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_catalogue_and_the_error_table_answer_over_two_shards() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db("pulsus_read_it_t601p4b_cluster");
+    let bootstrap = ChClient::new(shard1_config("default"))
+        .await
+        .expect("connect shard1");
+    exec(
+        &bootstrap,
+        &format!("DROP DATABASE IF EXISTS {db} ON CLUSTER '{CLUSTER_NAME}' SYNC"),
+    )
+    .await;
+    run_init(&bootstrap, &cluster_ctx(&db))
+        .await
+        .expect("run_init");
+    let shard1 = ChClient::new(shard1_config(&db)).await.expect("shard1");
+    let shard1b = ChClient::new(shard1b_config(&db)).await.expect("shard1b");
+    let shard2 = ChClient::new(shard2_config(&db)).await.expect("shard2");
+    exec(
+        &shard1,
+        &format!("SYSTEM STOP MERGES ON CLUSTER '{CLUSTER_NAME}' {db}.spans"),
+    )
+    .await;
+
+    // Fixture C4: `checkout` and `other` across three buckets, each bucket
+    // and service its own push, the inner bucket's 400 spans over 40 traces.
+    let b0 = now_ns() / BUCKET - 8;
+    let at = |b: i64, s: i64| (b0 + b) * BUCKET + s * S;
+    let route = |t: u8, sid: u16, when: i64, r: &str| {
+        span_4b(t, sid, None, "op", 2, when, 1, false, Some(r))
+    };
+    let mut pushes = vec![
+        service_request(
+            "checkout",
+            vec![
+                route(0xc1, 1, at(0, 10), "/early"),
+                route(0xc1, 2, at(0, 200), "/a"),
+            ],
+        ),
+        service_request("other", vec![route(0xc2, 3, at(0, 200), "/other")]),
+        service_request(
+            "checkout",
+            (0..400u16)
+                .map(|i| {
+                    route(
+                        0xd0 + (i % 40) as u8,
+                        100 + i,
+                        at(1, 10) + i64::from(i) * 100_000_000,
+                        &format!("/r{}", i % 5),
+                    )
+                })
+                .chain([route(0xc1, 99, at(1, 200), "/b")])
+                .collect(),
+        ),
+        service_request(
+            "other",
+            (0..10u16)
+                .map(|i| route(0xc2, 600 + i, at(1, 20 + i64::from(i)), "/x"))
+                .collect(),
+        ),
+        service_request(
+            "checkout",
+            vec![
+                route(0xc1, 4, at(2, 100), "/c"),
+                route(0xc1, 5, at(2, 200), "/late"),
+            ],
+        ),
+    ];
+    // Fixture E, in the ten seconds from `base`.
+    let base = (now_ns() / S - 600) * S;
+    let ms = 1_000_000i64;
+    let e = |t: u8,
+             sid: u16,
+             parent: Option<u16>,
+             name: &str,
+             kind: i32,
+             off: i64,
+             dur: i64,
+             err: bool| {
+        span_4b(t, sid, parent, name, kind, base + off * ms, dur, err, None)
+    };
+    pushes.extend([
+        service_request(
+            "frontend",
+            vec![e(0xe1, 1, None, "GET /", 2, 1_000, 100, false)],
+        ),
+        service_request(
+            "payment",
+            vec![
+                e(0xe1, 2, Some(1), "charge", 3, 1_010, 20, true),
+                e(0xe1, 3, Some(1), "db", 1, 1_020, 5, true),
+                e(0xe2, 4, None, "pay", 2, 3_000, 50, true),
+                e(0xe2, 5, Some(4), "pay2", 2, 3_010, 30, true),
+            ],
+        ),
+        service_request(
+            "checkout",
+            vec![
+                e(0xe2, 6, Some(4), "cart", 3, 3_020, 10, false),
+                e(0xe3, 8, Some(7), "x", 2, 5_010, 30, true),
+            ],
+        ),
+        service_request(
+            "frontend",
+            vec![e(0xe3, 7, None, "home", 2, 5_000, 80, false)],
+        ),
+    ]);
+    for (i, req) in pushes.iter().enumerate() {
+        land(&shard1, req, &format!("t601p4b-cluster-{i}")).await;
+    }
+    for t in ["spans_dist", "traces_dist"] {
+        exec(&shard1, &format!("SYSTEM FLUSH DISTRIBUTED {db}.{t}")).await;
+    }
+    let flushed = shard1
+        .execute(
+            &format!("SYSTEM FLUSH DISTRIBUTED {db}.error_spans_dist"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .map_err(|e| e.to_string());
+    let mut local = Vec::new();
+    for node in [&shard1, &shard2] {
+        local.push(
+            node.query_strings(
+                "SELECT toString(count()) AS s FROM error_spans",
+                &QuerySettings::new(),
+            )
+            .await
+            .map_err(|e| e.to_string()),
+        );
+    }
+    let ok = |r: &Result<Vec<String>, String>| -> u64 {
+        r.as_ref()
+            .ok()
+            .and_then(|v| v.first())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0)
+    };
+    assert!(
+        flushed.is_ok()
+            && ok(&local[0]) > 0
+            && ok(&local[1]) > 0
+            && ok(&local[0]) + ok(&local[1]) == 5,
+        "the five error spans split across the shards: {flushed:?} {local:?}"
+    );
+
+    let mut wrong = Vec::new();
+
+    // T4 through the cluster.
+    let (s, e_ns) = (b0 * BUCKET + BUCKET / 2, (b0 + 2) * BUCKET + BUCKET / 2);
+    let prefix = pulsus_testkit::test_ident(&format!("t601p4b_c4_{}", now_ns()));
+    let values = engine_4b(&db, Some(prefix.clone()), "error_spans_dist")
+        .await
+        .list_tag_values(
+            "http.route",
+            Some("span"),
+            pulsus_read::TagValuesRequest {
+                q: Some(r#"{ resource.service.name = "checkout" }"#),
+                start_ns: s,
+                end_ns: e_ns,
+            },
+        )
+        .await
+        .map(|v| {
+            v.values
+                .iter()
+                .map(|v| v.val.clone())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .map_err(|e| e.to_string());
+    let stmts = statements_4b(&shard1, &prefix).await;
+    let in_window = count(
+        &shard1,
+        &format!("SELECT count() AS n FROM spans_dist WHERE start_ns >= {s} AND start_ns < {e_ns}"),
+    )
+    .await;
+    eprintln!("T4: {values:?} in {stmts:?}; {in_window} spans in the window");
+    if values != Ok("/a /b /c /r0 /r1 /r2 /r3 /r4".to_string()) {
+        wrong.push(format!("T4: {values:?}"));
+    }
+    if stmts.len() != 1
+        || !read_table_4b(&stmts, &db, "tag_bucket_values")
+        || stmts[0].read_rows >= in_window
+    {
+        wrong.push(format!(
+            "T4: expected one statement reading the catalogue and fewer than {in_window} rows: {stmts:?}"
+        ));
+    }
+
+    // T7 through the cluster.
+    let tables = |errors: &'static str| StatementTables {
+        spans: "spans_dist",
+        error_spans: errors,
+        resources: "resources",
+        traces: "traces_dist",
+        indexed: &[],
+    };
+    let base_s = base / S;
+    for (q, metrics) in [
+        (
+            "{ status = error } | count_over_time() by(resource.service.name)",
+            true,
+        ),
+        ("{ status = error } | rate()", true),
+        (
+            "{ status = error } | quantile_over_time(duration, .5) by(name)",
+            true,
+        ),
+        (
+            r#"{ resource.service.name = "payment" && status = error }"#,
+            false,
+        ),
+        ("{ status = error && kind = server } | count() > 1", false),
+    ] {
+        let query = pulsus_traceql::parse(q).expect("parses");
+        let prefix = pulsus_testkit::test_ident(&format!("t601p4b_c7_{}", now_ns()));
+        let mut answers = Vec::new();
+        for (p, errors) in [
+            (Some(prefix.clone()), "error_spans_dist"),
+            (None, "spans_dist"),
+        ] {
+            let engine = engine_4b(&db, p, errors).await;
+            let text = if metrics {
+                let routed = pulsus_read::plan_trace_metrics_routed(
+                    &query,
+                    &pulsus_read::MetricsParams {
+                        start_ns: base_s * S,
+                        end_ns: (base_s + 10) * S,
+                        step_ms: 1_000,
+                        exemplars: None,
+                        floor_ns: i64::MIN,
+                    },
+                    &engine.metrics_ctx(),
+                    &tables(if errors == "spans_dist" {
+                        "spans_dist"
+                    } else {
+                        "error_spans_dist"
+                    }),
+                )
+                .expect("plans");
+                match engine.metrics_range_routed(&routed).await {
+                    Err(e) => format!("Err({e})"),
+                    Ok(out) => {
+                        let mut series: Vec<String> = out
+                            .series
+                            .iter()
+                            .map(|s| format!("{:?} {:?}", s.labels, s.samples))
+                            .collect();
+                        series.sort();
+                        series.join("; ")
+                    }
+                }
+            } else {
+                let plan = plan_search_request(
+                    &query,
+                    &SearchParams {
+                        start_ns: base,
+                        end_ns: base + 10 * S,
+                        limit: 20,
+                        spss: 10,
+                    },
+                    &tables("error_spans_dist"),
+                    64,
+                )
+                .expect("plans");
+                match engine.search_routed(&plan).await {
+                    Err(e) => format!("Err({e})"),
+                    Ok(out) => out
+                        .traces
+                        .iter()
+                        .map(|t| {
+                            format!(
+                                "{:02x} {} [{}]",
+                                t.trace_id[15],
+                                t.matched,
+                                t.spans
+                                    .iter()
+                                    .map(|s| format!("{:02x}", s.span_id[7]))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                }
+            };
+            answers.push(text);
+        }
+        let stmts = statements_4b(&shard1, &prefix).await;
+        eprintln!("T7 {q}: {} | forced {} | {stmts:?}", answers[0], answers[1]);
+        if answers[0] != answers[1] || answers[0].is_empty() || answers[0].starts_with("Err") {
+            wrong.push(format!("T7 {q}: {} against {}", answers[0], answers[1]));
+        }
+        if !read_table_4b(&stmts, &db, "error_spans_dist")
+            || read_table_4b(&stmts, &db, "spans_dist")
+        {
+            wrong.push(format!(
+                "T7 {q}: expected error_spans_dist and not spans_dist: {stmts:?}"
+            ));
+        }
+    }
+
+    // The catalogue is one replica set: every node holds the same groups.
+    let groups = "SELECT concat(service, ' ', key, ' ', toString(bucket), ' ', \
+                  arrayStringConcat(arrayMap(x -> x.1, arraySort(groupUniqArrayMerge(101)(vals))), ',')) \
+                  AS s FROM tag_bucket_values GROUP BY service, key, bucket ORDER BY service, key, bucket";
+    let mut held = Vec::new();
+    for node in [&shard1, &shard1b, &shard2] {
+        let synced = node
+            .execute(
+                &format!("SYSTEM SYNC REPLICA {db}.tag_bucket_values"),
+                &QuerySettings::new(),
+                Idempotency::NonIdempotent,
+            )
+            .await;
+        let rows = node.query_strings(groups, &QuerySettings::new()).await;
+        held.push(format!("{synced:?} {rows:?}"));
+    }
+    eprintln!("tag_bucket_values per node: {held:?}");
+    if held[0] != held[1] || held[0] != held[2] || !held[0].contains("checkout") {
+        wrong.push(format!("the three replicas differ: {held:?}"));
+    }
 
     exec(
         &bootstrap,

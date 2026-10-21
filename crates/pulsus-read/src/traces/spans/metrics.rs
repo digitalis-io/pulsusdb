@@ -88,6 +88,9 @@ const WELL_KNOWN_SPAN: [&str; 3] = ["http.status_code", "http.method", "http.url
 #[derive(Debug, Clone, Copy)]
 pub struct StatementTables<'a> {
     pub spans: &'a str,
+    /// The error-span table (issue #601 part 4b): the statement's span
+    /// table when [`super::error_spans::admits`] the query.
+    pub error_spans: &'a str,
     pub resources: &'a str,
     pub traces: &'a str,
     pub indexed: &'a [IndexedAttr],
@@ -261,7 +264,17 @@ pub fn plan_trace_metrics_routed(
     let Ok(plan) = plan_trace_metrics(&shell, params, ctx) else {
         return today();
     };
-    match statement_for(&plan, &asked, filter.body.as_ref(), ctx.max_series, tables) {
+    // Issue #601 part 4b: an admitted query's statement reads the error-span
+    // table as its span table.
+    let tables = if super::error_spans::admits(query) {
+        StatementTables {
+            spans: tables.error_spans,
+            ..*tables
+        }
+    } else {
+        *tables
+    };
+    match statement_for(&plan, &asked, filter.body.as_ref(), ctx.max_series, &tables) {
         Some(statement) => Ok(RoutedMetricsPlan {
             plan,
             statement: Some(statement),
@@ -1436,6 +1449,7 @@ mod tests {
 
     const TABLES: StatementTables<'static> = StatementTables {
         spans: "spans",
+        error_spans: "error_spans",
         resources: "resources",
         traces: "traces",
         indexed: &[],
@@ -1610,6 +1624,7 @@ mod tests {
     fn the_tables_come_from_the_caller() {
         let tables = StatementTables {
             spans: "sp_t",
+            error_spans: "es_t",
             resources: "rs_t",
             traces: "tr_t",
             indexed: &[],

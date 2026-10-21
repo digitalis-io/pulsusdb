@@ -124,6 +124,7 @@ fn derive_ours(q: &str) -> Side {
         },
         &StatementTables {
             spans: "spans",
+            error_spans: "error_spans",
             resources: "resources",
             traces: "traces",
             indexed: &[],

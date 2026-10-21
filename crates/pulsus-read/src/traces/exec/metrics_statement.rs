@@ -306,6 +306,7 @@ mod tests {
         };
         let tables = StatementTables {
             spans: "spans",
+            error_spans: "error_spans",
             resources: "resources",
             traces: "traces",
             indexed: &[],

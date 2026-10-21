@@ -205,7 +205,7 @@ echo "== storage totals, compression, rows per span"
 q "SELECT table, sum(rows) AS rows, sum(bytes_on_disk) AS bytes, round(sum(bytes_on_disk)/$SPANS, 3) AS b_per_span
    FROM system.parts WHERE database='tqd_g1' AND active AND table IN ('spans','resources','traces','tag_names','tag_values')
    GROUP BY table ORDER BY table FORMAT TSVWithNames" > "$R/storage.tsv"
-q "WITH (SELECT sum(bytes_on_disk) FROM system.parts WHERE database='tqd_g1' AND active AND table IN ('spans','resources','traces','tag_names','tag_values')) AS total,
+q "WITH (SELECT sum(bytes_on_disk) FROM system.parts WHERE database='tqd_g1' AND active AND table IN ('spans','resources','traces','tag_names','tag_values','tag_bucket_values','error_spans')) AS total,
         (SELECT sum(bytes_on_disk) FROM system.parts WHERE database='tqd_g1' AND active AND table='spans') AS span,
         (SELECT sum(data_compressed_bytes) FROM system.parts WHERE database='tqd_g1' AND active AND table='spans') AS comp,
         (SELECT sum(data_uncompressed_bytes) FROM system.parts WHERE database='tqd_g1' AND active AND table='spans') AS uncomp,

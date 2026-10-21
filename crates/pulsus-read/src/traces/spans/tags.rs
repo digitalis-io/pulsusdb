@@ -43,7 +43,11 @@
 //! the same rule and are rejected in
 //! `traces_api::params::parse_range_params`.
 
-use pulsus_traceql::{BoolOp, FieldExpr, FieldOp, SpansetExpr, SpansetFilter, parse, validate};
+use pulsus_clickhouse::json_column::escape_json_path;
+use pulsus_traceql::{
+    AttrScope, BoolOp, ComparisonOp, Field, FieldExpr, FieldOp, SpansetExpr, SpansetFilter, Value,
+    parse, validate,
+};
 
 use super::predicate::{PredicateCtx, SpanPredicate, attr_path, compile_span_predicate_in};
 use super::projection::ceiling_sql;
@@ -175,6 +179,7 @@ pub struct TagNarrowing {
     pred: Option<SpanPredicate>,
     span_pred: Option<SpanPredicate>,
     terms: usize,
+    service: Option<String>,
 }
 
 impl TagNarrowing {
@@ -199,6 +204,13 @@ impl TagNarrowing {
     /// How many conjuncts were kept.
     pub fn terms(&self) -> usize {
         self.terms
+    }
+
+    /// The service when `q`'s `&&` spine is exactly one conjunct,
+    /// `resource.service.name = "<literal>"` (issue #601 part 4b): the one
+    /// narrowing [`catalogue_values_sql`] answers.
+    pub fn service_equality(&self) -> Option<&str> {
+        self.service.as_deref()
     }
 }
 
@@ -225,6 +237,10 @@ pub fn narrowing_from_query(raw_q: &str, ctx: &PredicateCtx<'_>) -> TagNarrowing
     };
     let mut conjuncts: Vec<&FieldExpr> = Vec::new();
     spine(body, &mut conjuncts);
+    let service = match conjuncts.as_slice() {
+        [service_equality] => service_literal(service_equality),
+        _ => None,
+    };
     let mut kept: Vec<(&FieldExpr, bool)> = Vec::new();
     for c in conjuncts {
         if kept.len() >= TAG_NARROW_MAX_TERMS {
@@ -259,6 +275,29 @@ pub fn narrowing_from_query(raw_q: &str, ctx: &PredicateCtx<'_>) -> TagNarrowing
         terms: if pred.is_some() { kept.len() } else { 0 },
         pred,
         span_pred,
+        service,
+    }
+}
+
+/// The literal of `resource.service.name = "<literal>"`, or `None`.
+fn service_literal(expr: &FieldExpr) -> Option<String> {
+    let FieldExpr::Binary {
+        op: FieldOp::Cmp(ComparisonOp::Eq),
+        lhs,
+        rhs,
+    } = expr
+    else {
+        return None;
+    };
+    match (&**lhs, &**rhs) {
+        (
+            FieldExpr::Field(Field::Attribute {
+                scope: AttrScope::Resource,
+                key,
+            }),
+            FieldExpr::Literal(Value::String(service)),
+        ) if key == "service.name" => Some(service.clone()),
+        _ => None,
     }
 }
 
@@ -489,6 +528,65 @@ pub fn narrowed_values_sql(
             )
         }
     }
+}
+
+// ---------------------------------------------------------------------
+// Issue #601 part 4b: service-narrowed values from the bucket catalogue
+// ---------------------------------------------------------------------
+
+/// The per-bucket value catalogue: one cluster-wide replica set, read
+/// locally, as `tag_values` is.
+const TAG_BUCKET_VALUES_TABLE: &str = "tag_bucket_values";
+
+/// A catalogue group holding this many distinct `(value, type)` pairs is
+/// overflowed: it stores at most this many, so below it a group is exact.
+pub const CATALOGUE_CAP: usize = 101;
+
+/// The service-narrowed values read for one span-scoped key (issue #601
+/// part 4b): the whole buckets `lo..=hi` from the catalogue, plus `edges`,
+/// today's [`narrowed_values_sql`] over each partial bucket of the window.
+/// Both catalogue reads merge per bucket, so the cap applies to each
+/// bucket's group; the outer `groupUniqArray` takes the union. One row:
+/// `overflowed`, 1 when an interior group the request reads is
+/// overflowed, in which case the interior contributes nothing and the
+/// caller answers with today's statement; and `vals`, the first `limit`
+/// pairs in today's order. The outer aggregate has no `GROUP BY`, so it returns its row
+/// whatever its input, so the flag arrives when every branch is empty.
+/// `service` and `key` are raw; both are escaped here, the key into the
+/// JSON path the catalogue stores.
+pub fn catalogue_values_sql(
+    service: &str,
+    key: &str,
+    lo: i64,
+    hi: i64,
+    edges: &[String],
+    limit: usize,
+) -> String {
+    let svc = crate::logql::escape::ch_string(service);
+    let path = crate::logql::escape::ch_string(&escape_json_path(key));
+    let groups = format!(
+        "service = {svc} AND scope = 'span' AND key = {path} AND bucket BETWEEN {lo} AND {hi}"
+    );
+    let over = CATALOGUE_CAP - 1;
+    let mut sql = format!(
+        "WITH (SELECT max(length(v)) > {over} FROM (SELECT groupUniqArrayMerge({CATALOGUE_CAP})(vals) AS v FROM {TAG_BUCKET_VALUES_TABLE}
+      WHERE {groups} GROUP BY bucket)) AS over
+SELECT toUInt8(ifNull(over, 0)) AS overflowed,
+       arraySlice(arraySort(groupUniqArray((val, val_type))), 1, {limit}) AS vals
+FROM (
+    SELECT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type
+    FROM (SELECT arrayJoin(groupUniqArrayMerge({CATALOGUE_CAP})(vals)) AS e FROM {TAG_BUCKET_VALUES_TABLE}
+          WHERE NOT over AND {groups}\n          GROUP BY bucket)"
+    );
+    for edge in edges {
+        sql.push_str(&format!(
+            "
+    UNION ALL
+    SELECT val, val_type FROM ({edge})"
+        ));
+    }
+    sql.push(')');
+    sql
 }
 
 #[cfg(test)]

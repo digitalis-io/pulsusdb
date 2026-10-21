@@ -674,11 +674,12 @@ const PINNED_SPANS_SEARCH_CORPUS: u64 = 0x03fc_7c26_00c8_7312;
 /// the instant statements' bounds and `rate` divisor move; twenty-one by
 /// issue #601 part 4a, whose span reads keep one row per span identity, a
 /// count and a rate counting each identity once — the two that read the
-/// numbering keep `final` and do not move), each the
+/// numbering keep `final` and do not move; one, `sum_errors`, by issue #601
+/// part 4b, whose `{ status = error }` filter reads `error_spans`), each the
 /// range and instant forms of one request of
 /// `crates/pulsus-read/src/traces/spans/metrics.rs`'s `metrics_statement`,
 /// under [`corpus_digest`]'s encoding.
-const PINNED_SPANS_METRICS_CORPUS: u64 = 0x35b1_c902_a5f2_5cfe;
+const PINNED_SPANS_METRICS_CORPUS: u64 = 0xe70b_0c4d_841c_7662;
 
 #[test]
 fn the_sql_golden_corpus_matches_its_committed_digest() {

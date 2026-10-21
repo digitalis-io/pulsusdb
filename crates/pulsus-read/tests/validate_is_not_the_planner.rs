@@ -119,6 +119,7 @@ fn every_plan_error_variant_is_witnessed_by_an_accepted_vector() {
     let (filter, params) = search_ctx("pulsus.trace_spans", "pulsus.trace_attrs_idx");
     let tables = StatementTables {
         spans: "pulsus.spans",
+        error_spans: "pulsus.error_spans",
         resources: "pulsus.resources",
         traces: "pulsus.traces",
         indexed: &[],
