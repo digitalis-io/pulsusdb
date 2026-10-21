@@ -83,10 +83,9 @@
 //!
 //! | caller | convention | why |
 //! |---|---|---|
-//! | [`super::spans`] statements | `StartClosedEndOpen` | R9, docs/api.md §4.2 `[start, end)` |
-//! | [`super::graph_sql`] | `StartClosedEndOpen` | docs/api.md §4.5 `[start, end)` |
-//! | [`super::metrics_sql`] evaluation window | `StartClosedEndOpen` | `metrics_plan`'s snapped `[start, end)` |
-//! | [`super::metrics_sql`] `compare()` selection window | `StartOpenEndClosed` | the reference's `spanStartTime > start && spanStartTime <= end` (Tempo `pkg/traceql/engine_metrics_compare.go:98-110` @ v3.0.2) — a query operand, not a request window |
+//! | [`super::spans`] statements, the service graph's included | `StartClosedEndOpen` | R9, docs/api.md §4.2 and §4.5 `[start, end)` |
+//! | [`super::spans::metrics`] evaluation windows | `StartClosedEndOpen` | `metrics_plan`'s `[start, end)` |
+//! | [`super::spans::metrics`] `compare()` selection window | `StartOpenEndClosed` | the reference's `spanStartTime > start && spanStartTime <= end` (`pkg/traceql/engine_metrics_compare.go:98-110` @ v3.0.2) — a query operand, not a request window |
 //!
 //! `DaySpan` (deleted by issue #598) was deliberately NOT expressed here. The
 //! tag-discovery reads carry a day bound and no `timestamp_ns` bound at
@@ -117,8 +116,8 @@ const NS_PER_DAY: i64 = 86_400_000_000_000;
 
 /// The recency table's bucket width in nanoseconds (issue #560). THE
 /// definition — the reader owns the value, `trace_recent_mv`'s
-/// `intDiv(timestamp_ns, …)` carries the same number as TEXT, and
-/// `tests/traces_recency_table_literals.rs` binds the two. A whole number
+/// `intDiv(timestamp_ns, …)` carries the same number as TEXT; the test that
+/// bound the two went with the previous metrics SQL (#602 part 3a). A whole number
 /// of these makes a UTC day (288 of them), so a bucket never straddles
 /// midnight and `trace_recent.date` is a function of `bucket`.
 pub const RECENT_BUCKET_NS: i64 = 300_000_000_000;
@@ -362,8 +361,8 @@ impl WindowSql {
 
 /// Renders `days`-since-epoch as a `toDate('YYYY-MM-DD')` literal —
 /// civil-date conversion (proleptic Gregorian), pure integer math.
-/// `pub(crate)`: [`super::metrics_sql`] reuses it for the metrics
-/// semi-joins' daily-partition pruning.
+/// `pub(crate)`: the previous metrics SQL reused it, and went (#602 part
+/// 3a).
 pub(crate) fn date_literal(days: i64) -> String {
     // Howard Hinnant's days-to-civil algorithm.
     let z = days + 719_468;

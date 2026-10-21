@@ -1524,29 +1524,25 @@
       "query": "{ true } | rate() by(.a)",
       "reference": "accept",
       "pulsus": "accept",
-      "verdict": "agree",
-      "owning_issue": 182
+      "verdict": "agree"
     },
     {
       "query": "{ true } | rate() by(span.a)",
       "reference": "accept",
       "pulsus": "accept",
-      "verdict": "agree",
-      "owning_issue": 182
+      "verdict": "agree"
     },
     {
       "query": "{ true } | rate() by(name)",
       "reference": "accept",
       "pulsus": "accept",
-      "verdict": "agree",
-      "owning_issue": 182
+      "verdict": "agree"
     },
     {
       "query": "{ true } | rate() by(span:id)",
       "reference": "accept",
       "pulsus": "accept",
-      "verdict": "agree",
-      "owning_issue": 182
+      "verdict": "agree"
     },
     {
       "query": "{ true } | rate() by(resource.service.name)",
@@ -1558,8 +1554,7 @@
       "query": "{ true } | rate() by(.a, .b)",
       "reference": "accept",
       "pulsus": "accept",
-      "verdict": "agree",
-      "owning_issue": 182
+      "verdict": "agree"
     },
     {
       "query": "{ true } | rate() by(.a + 1)",
@@ -1619,15 +1614,13 @@
       "query": "{ true } | quantile_over_time(.a, .5) > 1",
       "reference": "accept",
       "pulsus": "accept",
-      "verdict": "agree",
-      "owning_issue": 182
+      "verdict": "agree"
     },
     {
       "query": "{ true } | max_over_time(.a) > 1",
       "reference": "accept",
       "pulsus": "accept",
-      "verdict": "agree",
-      "owning_issue": 182
+      "verdict": "agree"
     },
     {
       "query": "{ true } | max_over_time(span:duration) > 1",

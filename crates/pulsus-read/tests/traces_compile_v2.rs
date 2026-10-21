@@ -29,12 +29,12 @@
 //! so no selection window is rendered at all and the second exclusion is
 //! structural rather than a carve-out.
 
+use pulsus_read::TAG_VALUES_MAX;
 use pulsus_read::traces::metrics_plan::{MetricsCtx, MetricsParams};
 use pulsus_read::traces::spans::search::plan_statement_sliced;
 use pulsus_read::traces::spans::tags::{TagNarrowing, name_values_sql, narrowing_from_query};
 use pulsus_read::traces::{GraphWindow, SERVICE_GRAPH_MAX_EDGES, spans_graph_sql};
 use pulsus_read::{SearchParams, StatementTables, plan_search_request, plan_trace_metrics_routed};
-use pulsus_read::{SpanFilterCtx, TAG_VALUES_MAX};
 
 /// The one request window every read below is compiled over:
 /// 2023-11-14T22:13:20Z to +3h, the shape the search and metrics golden
@@ -55,13 +55,6 @@ const TABLES: StatementTables<'static> = StatementTables {
     traces: "traces",
     indexed: &[],
 };
-
-fn filter_ctx() -> SpanFilterCtx<'static> {
-    SpanFilterCtx {
-        spans_table: "trace_spans",
-        attrs_table: "trace_attrs_idx",
-    }
-}
 
 /// The search statement the empty selector compiles to over the window.
 fn search_statements() -> Vec<(&'static str, String)> {
@@ -96,7 +89,6 @@ fn metrics_statement() -> String {
             floor_ns: i64::MIN,
         },
         &MetricsCtx {
-            filter: filter_ctx(),
             scan_budget_rows: 1_000_000_000,
             max_series: 1_000,
             distributed: false,
@@ -105,11 +97,7 @@ fn metrics_statement() -> String {
         &TABLES,
     )
     .expect("the metrics query plans");
-    routed
-        .statement()
-        .expect("a statement")
-        .range_sql()
-        .to_string()
+    routed.statement().range_sql().to_string()
 }
 
 /// The service-graph statement on a single node.
@@ -257,9 +245,8 @@ fn every_request_window_renders_the_one_half_open_bound() {
 // issues.
 //
 // `T-C7` is not a case here: it is the existing `golden_sql_freeze` suite,
-// run unchanged. `PINNED_SQL_CORPUS` must not move — this change adds a
-// `WindowSql` method and edits no existing method body, so `search_sql`
-// and `metrics_sql` cannot render different text.
+// run unchanged. (The digest it named, over the previous metrics SQL's
+// goldens, went with that SQL, #602 part 3a.)
 
 use pulsus_read::traces::PlanError;
 use pulsus_read::traces::spans::predicate::{
@@ -742,12 +729,12 @@ fn t_c5_every_out_of_scope_field_refuses_and_names_itself() {
 // ---------------------------------------------------------------------
 
 /// `T-C6`: the fixed refusals, each message compared byte for byte against
-/// `filter.rs`'s own text — so `{ span.k = error }` is the same `400` on
-/// both compilers.
+/// the previous filter compiler's text, which went with the previous
+/// metrics SQL (#602 part 3a).
 ///
 /// `{ duration =~ "x" }` takes the OPERAND message, not the operator one:
-/// `filter.rs` checks the value before the operator and this compiler
-/// keeps that order, which is what makes the two byte-identical. The
+/// the previous filter compiler checked the value before the operator and
+/// this compiler keeps that order. The
 /// operator message is reachable only with a duration operand, asserted
 /// below through the leaf.
 #[test]

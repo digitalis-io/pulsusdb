@@ -193,7 +193,8 @@ const CONTROL: &str = "with_binding_control.txt";
 /// **Issue #559 moves `SQL_FILES` 126 -> 127 and `SQL_STATEMENTS`
 /// 380 -> 385: ONE golden added, no section of any existing file gained
 /// or lost.** The addition is
-/// `crates/pulsus-read/tests/golden/traces_metrics/compare_outer_attr.sql`,
+/// `compare_outer_attr.sql` in the previous metrics SQL's corpus (which went
+/// with that SQL, #602 part 3a),
 /// a comparison whose OUTER filter is an attribute condition — the one
 /// shape whose outer filter and selection predicate both declare locator
 /// aliases into a single statement. A comparison golden carries five

@@ -14,7 +14,7 @@ use pulsus_traceql::{ComparisonOp, Intrinsic, Value};
 use xxhash_rust::xxh3::xxh3_128;
 
 use super::projection::ceiling_sql;
-use crate::traces::filter::{PlanError, parse_num, sql_op};
+use crate::traces::sql_text::{PlanError, parse_num, sql_op};
 use crate::traces::window_sql::{RECENT_BUCKET_NS, WindowSql};
 
 /// One trace leaf's element of the per-trace scalar: the alias the leaf
@@ -159,9 +159,10 @@ pub fn per_trace_sql(
     )
 }
 
-/// Today's planner's refusal of a literal of another type or an operator
-/// the intrinsic does not take (`filter.rs`'s `compile_trace_num_leaf` and
-/// `string_op_leaf`), in its text.
+/// The refusal of a literal of another type or an operator the intrinsic
+/// does not take, in the previous filter compiler's text (its
+/// `compile_trace_num_leaf` and `string_op_leaf`, which went with the
+/// previous metrics SQL, #602 part 3a).
 pub fn type_refusal(intrinsic: Intrinsic, op: ComparisonOp, value: &Value) -> PlanError {
     PlanError::TypeMismatch(match intrinsic {
         Intrinsic::TraceDuration | Intrinsic::ChildCount => {

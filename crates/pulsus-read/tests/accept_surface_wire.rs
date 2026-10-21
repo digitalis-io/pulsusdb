@@ -49,14 +49,13 @@
 //! the fixtures are read across crates from
 //! `pulsus-traceql/tests/accept_surface/`. The planner inputs are the
 //! fixed deterministic shapes the golden suites pin
-//! (`traces_metrics_sql.rs`; `traces_search_sql.rs` until #602 part 2c-2b-1), so the derivation
+//! (`traces_spans_metrics_sql.rs`; `traces_search_sql.rs` until #602 part 2c-2b-1), so the derivation
 //! is hermetic and reproducible; only the query varies per probe.
 
 use std::path::PathBuf;
 
-use pulsus_read::SpanFilterCtx;
-use pulsus_read::traces::metrics_plan::{MetricsCtx, MetricsParams, plan_trace_metrics};
-use pulsus_read::{SearchParams, StatementTables, plan_search_request};
+use pulsus_read::traces::metrics_plan::{MetricsCtx, MetricsParams};
+use pulsus_read::{SearchParams, StatementTables, plan_search_request, plan_trace_metrics_routed};
 use serde::Deserialize;
 
 /// The frozen baseline: the two constants and the per-probe dispositions,
@@ -138,12 +137,15 @@ fn wire_accepts(q: &str) -> bool {
     if pulsus_traceql::validate(&query).is_err() {
         return false;
     }
-    let filter = SpanFilterCtx {
-        spans_table: "trace_spans",
-        attrs_table: "trace_attrs_idx",
+    let tables = StatementTables {
+        spans: "spans",
+        error_spans: "error_spans",
+        resources: "resources",
+        traces: "traces",
+        indexed: &[],
     };
     if is_metrics(q) {
-        plan_trace_metrics(
+        plan_trace_metrics_routed(
             &query,
             &MetricsParams {
                 start_ns: 1_700_000_000_000_000_000,
@@ -153,12 +155,12 @@ fn wire_accepts(q: &str) -> bool {
                 floor_ns: i64::MIN,
             },
             &MetricsCtx {
-                filter,
                 scan_budget_rows: 50_000_000,
                 max_series: 1_000,
                 distributed: false,
                 skip_unavailable_shards: false,
             },
+            &tables,
         )
         .is_ok()
     } else {
@@ -170,13 +172,7 @@ fn wire_accepts(q: &str) -> bool {
                 limit: 20,
                 spss: 3,
             },
-            &StatementTables {
-                spans: "spans",
-                error_spans: "error_spans",
-                resources: "resources",
-                traces: "traces",
-                indexed: &[],
-            },
+            &tables,
             64,
         )
         .is_ok()

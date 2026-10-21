@@ -61,7 +61,7 @@
 //!   roots arrive in two pushes across a UTC midnight; and eight values at
 //!   the 8,192-byte response ceiling. RZ, B and the catalogue fixture are
 //!   landed in both stores, so the search statement is compared with
-//!   today's engine over the same pushes.
+//!   the previous search engine over the same pushes.
 //! * Fixtures TL, CC and RD (issue #594 part 1) — six traces whose
 //!   extent, root and root's day differ from their window's spans'; two
 //!   traces sharing span ids, with children inside and outside the window;
@@ -5869,19 +5869,14 @@ async fn the_detail_read_does_not_re_scan_the_window() {
 }
 
 // =====================================================================
-// Issue #591 part 1 — the search statement against today's engine
+// Issue #591 part 1 — the search statement against the previous search engine
 // =====================================================================
 
-/// Today's engine's configuration: the old tables, as
+/// The engine's configuration: the span design's tables, as
 /// `traces_search_projection_differential.rs` configures it.
 fn engine_config() -> pulsus_read::TraceReadConfig {
     pulsus_read::TraceReadConfig {
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
-        spans_table: "trace_spans".to_string(),
-        attrs_table: "trace_attrs_idx".to_string(),
-        edges_table: "trace_edges".to_string(),
-        recent_table: "trace_recent".to_string(),
-        errors_table: "trace_error_spans".to_string(),
         spans_v2_table: "spans".to_string(),
         error_spans_table: "error_spans".to_string(),
         traces_table: "traces".to_string(),
@@ -6274,7 +6269,7 @@ fn fixture_p_body(base_ns: i64) -> ExportTraceServiceRequest {
 /// whose links hold `lk` = 2 then 5, and nothing else holds `k` or `lk`.
 /// The two-element sets on which the elementwise rule of
 /// `docs/benchmarks/traces-differential-ledger.md`,
-/// `traceql-event-link-set-operands`, answers where today's engine,
+/// `traceql-event-link-set-operands`, answers where the previous search engine,
 /// reading the first element, does not.
 fn fixture_s_body(base_ns: i64) -> ExportTraceServiceRequest {
     const MS: i64 = 1_000_000;
@@ -6466,7 +6461,7 @@ const RZ_QUERIES: [&str; 7] = [
 ];
 
 /// An array mixing element types is missing (issue #602 part 1, D5), so
-/// this matches no span on fixture RZ; today's engine holds it.
+/// this matches no span on fixture RZ; the previous search engine holds it.
 const RZ_MIXED: &str = r#"{ span.mixed != nil }"#;
 
 /// Fixture B's three queries.
@@ -7124,7 +7119,7 @@ async fn search_statement_answers_written_out_on_fixture_c() {
 /// `docs/benchmarks/traces-differential-ledger.md`,
 /// `traceql-event-link-set-operands`, records ("arithmetic over event, link
 /// and unscoped operands ranges over their elements"; "two sets are
-/// compared pair by pair"). Today's engine reads the first element, `2`,
+/// compared pair by pair"). The previous search engine reads the first element, `2`,
 /// and answers none of these: they are a documented difference, not
 /// parity, so neither engine wrote these rows either.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7297,9 +7292,9 @@ async fn search_statement_answers_written_out_on_fixture_p() {
         .unwrap_or_else(|e| panic!("{q}: {e}"));
     check(&mut wrong, q, written(&out, true), "2222(1): 0003");
     // Section 3.6's refusal holds under `!=` too: on fixture P the
-    // predicate's any-pair reading drops span `…01`, which today's engine,
+    // predicate's any-pair reading drops span `…01`, which the previous search engine,
     // reading each element against itself, returns. The statement refuses,
-    // so the query is today's engine's.
+    // so the query is the previous search engine's.
     for query in [r#"{ event.k * event.k != 5 }"#, r#"{ .k + 1 != .k }"#] {
         match statement(&client_p, &parse_query(query), window, 100, 100).await {
             Err(e) if e.contains("two occurrences") => {}
@@ -7480,7 +7475,7 @@ async fn search_statement_reads_one_root_across_pushes_and_merges() {
 // Issue #591 part 3 — the route fork
 // =====================================================================
 
-/// The engine over `db`, configured as [`today`] configures it.
+/// The engine over `db`, configured as [`engine_config`] configures it.
 async fn engine_of(db: &str) -> pulsus_read::TraceEngine {
     pulsus_read::TraceEngine::new(
         ChClient::new(client_config(db))
@@ -7608,7 +7603,7 @@ async fn search_routed_answers_as_recorded_on_fixture_c() {
             let plan = plan_of(&engine, &parse_query(query), window, limit, spss);
             let routed = engine.search_routed(&plan).await;
             // Issue #602 part 1 (D2): `d1` has no `service.name`, which the
-            // statement projects nothing for and today's engine projects as
+            // statement projects nothing for and the previous search engine projects as
             // an empty string, so its answer is not compared.
             if label == "noservice" {
                 let projected = selected_answer_of(&routed);
@@ -7641,7 +7636,7 @@ async fn search_routed_answers_as_recorded_on_fixture_c() {
 }
 
 /// Issue #594 part 2 (decision D1): the three nested-set rows answer by
-/// the reference's numbering and today's engine by its own, so on fixture
+/// the reference's numbering and the previous search engine by its own, so on fixture
 /// C, which holds an orphan (`44…1b`) and a pure cycle (trace `55…`), each
 /// is checked against its answer at limit 100 and spss 100 as
 /// [`numbers_of`] writes it, cut to `limit` traces of `spss` spans.
@@ -7720,7 +7715,7 @@ type PipelineFixture = (
 /// `service.name = "svc"` unless said otherwise; starts are seconds after
 /// `base_ns`.
 ///
-/// - `rank`: today's engine ranks a trace by the newest span the
+/// - `rank`: the previous search engine ranks a trace by the newest span the
 ///   selector matched, before any stage runs. `a1`'s newest span (+10 s)
 ///   is removed by the later filter, and `a1` still comes first.
 /// - `cap`: `c1` and `c2` tie at +20 s, and the lower trace id comes
@@ -7728,7 +7723,7 @@ type PipelineFixture = (
 ///   start together and come in span-id order.
 /// - `noservice`: `d1`'s span is in a resource with no attributes, and
 ///   `select(resource.service.name)` returns its service as `""`, as
-///   today's engine does.
+///   the previous search engine does.
 fn pipeline_fixtures(base_ns: i64) -> Vec<PipelineFixture> {
     const S: i64 = 1_000_000_000;
     let sp = |trace: u8, span: u8, name: &str, at_s: i64| {
@@ -8074,7 +8069,7 @@ async fn search_routed_keeps_the_search_bounds() {
 }
 
 /// Section 6.9, issue #602 part 2b: a run-time demand the statement raises
-/// is the request's error, the same error today's engine gives — and the
+/// is the request's error, the same error the previous search engine gives — and the
 /// query log shows no read of today's tables after the statement's 395.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn search_routed_answers_a_run_time_demand_itself() {
@@ -9611,7 +9606,7 @@ async fn a_structural_operator_answers_as_today() {
 
 /// A condition the database cannot answer (`!span.x` over a string) under
 /// each relation: the statement raises its demand, the fork hands the
-/// request to today's engine, and both answer the same `PipelineInvalid`,
+/// request to the previous search engine, and both answer the same `PipelineInvalid`,
 /// which the route renders `400` (`traces_api/error.rs`). Only today's
 /// engine raises that variant; the statement's own error is a `Code: 395`
 /// server error, a `500`.
@@ -10077,7 +10072,7 @@ async fn a_configured_bound_counts_parent_links() {
 }
 
 /// A condition the database cannot answer under `>>` and `<<`: the same
-/// `PipelineInvalid` from the route and today's engine.
+/// `PipelineInvalid` from the route and the previous search engine.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refused_condition_under_a_climb_answers_as_today() {
     skip_unless_live!();
@@ -10113,9 +10108,9 @@ async fn a_refused_condition_under_a_climb_answers_as_today() {
 }
 
 /// A climb whose candidate traces cover most of a window of more than 64
-/// granules is one statement and answers as today's engine does, as a
+/// granules is one statement and answers as the previous search engine does, as a
 /// selective one in the same window is (issue #602 part 2b; it handed the
-/// request to today's engine before). 1,000 traces of 140 spans in one
+/// request to the previous search engine before). 1,000 traces of 140 spans in one
 /// five-minute bucket: a root, 138 children of it, and an error span under
 /// the last child; trace `000…07` alone has a root named `pick`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -12589,8 +12584,7 @@ const METRICS_TABLES: pulsus_read::StatementTables<'static> = pulsus_read::State
     indexed: &[],
 };
 
-/// The routed plan for `q` over `[start_s, end_s)` at `step_ms`, which must
-/// carry a statement.
+/// The routed plan for `q` over `[start_s, end_s)` at `step_ms`.
 fn routed_plan(
     engine: &pulsus_read::TraceEngine,
     q: &str,
@@ -12598,7 +12592,7 @@ fn routed_plan(
     end_s: i64,
     step_ms: i64,
 ) -> pulsus_read::RoutedMetricsPlan {
-    let routed = pulsus_read::plan_trace_metrics_routed(
+    pulsus_read::plan_trace_metrics_routed(
         &parse_query(q),
         &pulsus_read::MetricsParams {
             start_ns: start_s * S_NS,
@@ -12610,9 +12604,7 @@ fn routed_plan(
         &engine.metrics_ctx(),
         &METRICS_TABLES,
     )
-    .unwrap_or_else(|e| panic!("{q}: the routed planner refused: {e}"));
-    assert!(routed.statement().is_some(), "{q}: no statement");
-    routed
+    .unwrap_or_else(|e| panic!("{q}: the routed planner refused: {e}"))
 }
 
 type MetricsAnswer = Result<pulsus_read::TraceMetricsResult, pulsus_read::logql::ReadError>;
@@ -13818,7 +13810,7 @@ async fn t_q3_metrics_bodies_are_within_the_bound() {
     for (q, instant) in T_Q3_SHAPES {
         for (q, exemplars) in [(q.to_string(), true), (without_exemplars(q), false)] {
             let routed = routed_plan(&engine, &q, start_s, end_s, 60_000);
-            let statement = routed.statement().expect("checked");
+            let statement = routed.statement();
             let (sql, out) = if instant {
                 (
                     statement.instant_sql().to_string(),
@@ -13931,11 +13923,7 @@ async fn a_one_sample_answer_with_service_labels() {
     let engine = metrics_engine(&db, 1_000).await;
     let q = "{} | count_over_time() by(resource.service.name)";
     let routed = routed_plan(&engine, q, l - 60, l, 60_000);
-    let sql = routed
-        .statement()
-        .expect("checked")
-        .instant_sql()
-        .to_string();
+    let sql = routed.statement().instant_sql().to_string();
     let body = body_bytes(&client, &sql).await;
     let rows = statement_rows(&client, &sql).await;
     #[derive(Row, serde::Serialize, serde::Deserialize)]
@@ -14180,7 +14168,7 @@ async fn seed_rf(
 }
 
 /// The routed plan for `q` over `[start_s, end_s)`, step 60 s, asserted
-/// `Ok` and carrying a statement.
+/// `Ok`.
 fn routed_ok(
     engine: &pulsus_read::TraceEngine,
     q: &str,
@@ -14203,9 +14191,7 @@ fn routed_ok(
         routed.is_ok(),
         "{q}: the routed planner refused: {routed:?}"
     );
-    let routed = routed.expect("checked");
-    assert!(routed.statement().is_some(), "{q}: no statement");
-    routed
+    routed.expect("checked")
 }
 
 /// The instant answer to `q` over `[b, b + 60)`.
@@ -16666,7 +16652,7 @@ fn p2_written(out: &pulsus_read::traces::SearchOutput) -> String {
 
 /// Plan §5.1: each case of fixture P2, at `spss = 10` over the four hours
 /// before `end`, is answered by the statement alone (the first slice alone
-/// where marked), as `docs/api.md` §4.2 writes it, and as today's engine
+/// where marked), as `docs/api.md` §4.2 writes it, and as the previous search engine
 /// answers it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_pipeline_shape_is_one_statement_and_answers_as_written() {
@@ -18037,7 +18023,7 @@ async fn t_q3_compare_body_is_its_rows() {
         };
         let engine = metrics_engine(&db, 1_000).await;
         let routed = routed_plan(&engine, &q, l, l + 600, 60_000);
-        let sql = routed.statement().expect("checked").range_sql().to_string();
+        let sql = routed.statement().range_sql().to_string();
         let rows = compare_statement_rows(&client, &sql).await;
         let body = count(
             &client,

@@ -1193,7 +1193,7 @@ The instant `query` form evaluates one bucket over exactly the requested window 
 Read this if a Tempo dashboard and a PulsusDB dashboard disagree and you
 need to know which number to believe. Every figure below is captured from
 the pinned reference (`grafana/tempo:3.0.2@sha256:cda87c21…`, committed at
-`crates/pulsus-read/tests/golden/traces_metrics/log2_reference_capture.json`)
+`crates/pulsus-read/tests/fixtures/log2_reference_capture.json`)
 and is pinned by a test.
 
 **1. The histogram matches exactly.** `histogram_over_time(duration)`

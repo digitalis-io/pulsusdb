@@ -27,7 +27,23 @@
 //! text.
 
 use crate::traces::exec::GraphTarget;
-use crate::traces::graph_sql::GraphWindow;
+
+/// Response cap on distinct `(client, server, conn_type)` edges the
+/// service-graph read returns (docs/api.md §4.5; promoted to config only on
+/// evidence). The SQL carries `LIMIT SERVICE_GRAPH_MAX_EDGES + 1`: the extra
+/// row is the truncation probe (the search path's `cap + 1` convention) —
+/// the engine returns at most `SERVICE_GRAPH_MAX_EDGES` edges plus a
+/// non-silent `truncated` flag.
+pub const SERVICE_GRAPH_MAX_EDGES: u64 = 1_000;
+
+/// The snapped, left-closed/right-open service-graph window `[start_ns,
+/// end_ns)` — an edge is reported iff BOTH its halves' own timestamps fall
+/// in this window (the normative boundary rule, docs/api.md §4.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphWindow {
+    pub start_ns: i64,
+    pub end_ns: i64,
+}
 
 const NS_PER_MINUTE: i64 = 60_000_000_000;
 const NS_PER_BUCKET: i64 = 300_000_000_000;

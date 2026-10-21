@@ -1,6 +1,5 @@
 //! The metrics statement's engine side (issue #596 part 1): issue the one
-//! statement a [`RoutedMetricsPlan`] carries and frame its rows, or hand a
-//! plan without one to today's engine.
+//! statement a [`RoutedMetricsPlan`] carries and frame its rows.
 
 use std::collections::BTreeMap;
 
@@ -22,15 +21,12 @@ use crate::traces::values::go_duration_string;
 
 impl TraceEngine {
     /// The range answer to `routed`: its statement's rows, each series'
-    /// empty buckets filled with `0` where its flag says so; today's
-    /// [`TraceEngine::metrics_range`] when it carries no statement.
+    /// empty buckets filled with `0` where its flag says so.
     pub async fn metrics_range_routed(
         &self,
         routed: &RoutedMetricsPlan,
     ) -> Result<TraceMetricsResult, ReadError> {
-        let Some(statement) = routed.statement() else {
-            return self.metrics_range(routed.plan()).await;
-        };
+        let statement = routed.statement();
         // Issue #597: a comparison's rows are its own.
         if statement.is_compare() {
             let rows = self
@@ -57,16 +53,12 @@ impl TraceEngine {
         )
     }
 
-    /// The instant answer to `routed`: its statement's rows as returned;
-    /// today's [`TraceEngine::metrics_instant`] when it carries no
-    /// statement.
+    /// The instant answer to `routed`: its statement's rows as returned.
     pub async fn metrics_instant_routed(
         &self,
         routed: &RoutedMetricsPlan,
     ) -> Result<TraceMetricsResult, ReadError> {
-        let Some(statement) = routed.statement() else {
-            return self.metrics_instant(routed.plan()).await;
-        };
+        let statement = routed.statement();
         if statement.is_compare() {
             let rows = self
                 .metric_statement_rows::<CompareStatementRow>(
@@ -109,7 +101,7 @@ impl TraceEngine {
     }
 
     /// The series cap's `throwIf` is the series cap's `422`, its count
-    /// the cap plus one as today's probe reported it; any other error is
+    /// the cap plus one; any other error is
     /// the metrics path's.
     fn map_statement_error(&self, e: ChError, demands: &[String]) -> ReadError {
         // Issue #602 part 2a: a `!` demand the filter raised is the
@@ -278,7 +270,6 @@ mod tests {
     use pulsus_traceql::parse;
 
     use super::*;
-    use crate::traces::filter::SpanFilterCtx;
     use crate::traces::metrics_plan::{MetricsCtx, MetricsParams};
     use crate::traces::metrics_result::MetricLabelValue;
     use crate::traces::spans::metrics::{StatementTables, plan_trace_metrics_routed};
@@ -288,10 +279,6 @@ mod tests {
     #[test]
     fn a_bucket_label_takes_its_targets_unit() {
         let ctx = MetricsCtx {
-            filter: SpanFilterCtx {
-                spans_table: "trace_spans",
-                attrs_table: "trace_attrs_idx",
-            },
             scan_budget_rows: 50_000_000,
             max_series: 1_000,
             distributed: false,
@@ -316,9 +303,7 @@ mod tests {
                 plan_trace_metrics_routed(&parse(q).expect("parse"), &params, &ctx, &tables);
             assert!(routed.is_ok(), "{q}: routed refused: {routed:?}");
             let routed = routed.expect("checked");
-            let Some(statement) = routed.statement() else {
-                panic!("{q}: no statement");
-            };
+            let statement = routed.statement();
             let row = MetricStatementRow {
                 g: Vec::new(),
                 o,

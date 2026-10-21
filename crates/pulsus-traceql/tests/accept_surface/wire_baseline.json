@@ -1,7 +1,7 @@
 {
-  "WIRE_AGREE_BASELINE": 254,
-  "WIRE_DIVERGE_BASELINE": 52,
-  "note": "Stage D0 (issue #335, 2026-08-12) appended 85 probes and raised WIRE_DIVERGE_BASELINE from 10 to 63, and Stages D1 and D2 lowered it to 52. NOTHING REGRESSED. The first enumeration covered the precedence table and the field-expression operand positions - 24 of the reference grammar's 33 productions. Stage D0 enumerated all 33; the nine that had never been probed carry two classes on their own. The rise is the enumeration widening from a subset of the grammar to the whole of it, not decay. See accept_surface/grammar_slots.json, accept_surface/PROVENANCE.md section 'Stage D0' and the doc block above TOTAL/AGREE/DIVERGE in pulsus-traceql/tests/accept_surface.rs. Issue #460 closed D17 (compare()'s two extra arities), moving its two probes reject->accept on both axes: WIRE_AGREE_BASELINE 254 -> 256 and WIRE_DIVERGE_BASELINE 52 -> 50. The baseline is directional and this move is toward FEWER divergences. Issue #602 part 2b moved the search route onto the search statement, which answers `{ !-.a }` and `{ -!.a }` with 400 (ledger traceql-search-statement-refusals); part 2c-1 points this suite at that route, moving the two probes accept->reject: WIRE_AGREE_BASELINE 256 -> 254 and WIRE_DIVERGE_BASELINE 50 -> 52. This move is toward MORE divergences.",
+  "WIRE_AGREE_BASELINE": 261,
+  "WIRE_DIVERGE_BASELINE": 45,
+  "note": "Stage D0 (issue #335, 2026-08-12) appended 85 probes and raised WIRE_DIVERGE_BASELINE from 10 to 63, and Stages D1 and D2 lowered it to 52. NOTHING REGRESSED. The first enumeration covered the precedence table and the field-expression operand positions - 24 of the reference grammar's 33 productions. Stage D0 enumerated all 33; the nine that had never been probed carry two classes on their own. The rise is the enumeration widening from a subset of the grammar to the whole of it, not decay. See accept_surface/grammar_slots.json, accept_surface/PROVENANCE.md section 'Stage D0' and the doc block above TOTAL/AGREE/DIVERGE in pulsus-traceql/tests/accept_surface.rs. Issue #460 closed D17 (compare()'s two extra arities), moving its two probes reject->accept on both axes: WIRE_AGREE_BASELINE 254 -> 256 and WIRE_DIVERGE_BASELINE 52 -> 50. The baseline is directional and this move is toward FEWER divergences. Issue #602 part 2b moved the search route onto the search statement, which answers `{ !-.a }` and `{ -!.a }` with 400 (ledger traceql-search-statement-refusals); part 2c-1 points this suite at that route, moving the two probes accept->reject: WIRE_AGREE_BASELINE 256 -> 254 and WIRE_DIVERGE_BASELINE 50 -> 52. This move is toward MORE divergences. Issue #602 part 3a deleted the previous metrics SQL, so every metrics query is planned by the shell planner and answered by the metrics statement, which accepts seven by() and attribute-target probes the reference accepts too: WIRE_AGREE_BASELINE 254 -> 261 and WIRE_DIVERGE_BASELINE 52 -> 45. This move is toward FEWER divergences.",
   "wire_baseline": [
     {
       "pulsus_wire": "reject",
@@ -752,19 +752,19 @@
       "query": "{ true } | select(.a = 1)"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ true } | rate() by(.a)"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ true } | rate() by(span.a)"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ true } | rate() by(name)"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ true } | rate() by(span:id)"
     },
     {
@@ -772,7 +772,7 @@
       "query": "{ true } | rate() by(resource.service.name)"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ true } | rate() by(.a, .b)"
     },
     {
@@ -812,11 +812,11 @@
       "query": "{ true } | quantile_over_time(span:duration, .5) > 1"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ true } | quantile_over_time(.a, .5) > 1"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ true } | max_over_time(.a) > 1"
     },
     {

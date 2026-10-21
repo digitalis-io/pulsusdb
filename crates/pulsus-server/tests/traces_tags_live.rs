@@ -2527,9 +2527,8 @@ async fn the_stored_attribute_type_reaches_the_wire_and_its_query_returns_the_tr
     // =================================================================
     // AC9 — the five typed sites still REJECT at the wire. This half
     // proves the validator (the `400` comes from `validate`, not from
-    // the planner); the gate on the changed planner code is the unit
-    // test `typed_string_sites_still_reject_a_non_string_operand` in
-    // `crates/pulsus-read/src/traces/filter.rs`.
+    // the planner); the unit test on the planner code went with the
+    // previous metrics SQL's filter compiler (#602 part 3a).
     // =================================================================
     for (q, want) in [
         (

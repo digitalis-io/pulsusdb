@@ -1,9 +1,9 @@
 //! TraceQL metrics on `spans`, one statement per request (issue #596,
 //! `docs/TraceQL/server-implementation.md` §3.2).
 //!
-//! [`plan_trace_metrics_routed`] decides which engine answers a metrics
-//! query, and [`metrics_statement`] renders the one statement that answers
-//! it from the span table, in five levels:
+//! [`plan_trace_metrics_routed`] plans a metrics query's shell with the
+//! shell planner and renders the one statement that answers it from the
+//! span table, in five levels:
 //!
 //! ```text
 //!   S       the occupied buckets: per series and bucket, the value and
@@ -26,15 +26,15 @@
 use pulsus_clickhouse::Row;
 use pulsus_traceql::{
     AttrScope, ComparisonOp, Field, FieldExpr, Intrinsic, MetricFn, PipelineStage, Query,
-    SpansetExpr, SpansetFilter,
+    SpansetExpr,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::traces::PlanError;
 use crate::traces::metrics_plan::{
-    MetricsCtx, MetricsParams, PlanKind, SeriesReduce, TraceMetricsPlan, plan_trace_metrics,
+    AggFn, MetricsCtx, MetricsParams, PlanKind, STRUCTURAL_METRICS, SeriesReduce, TraceMetricsPlan,
+    plan_trace_metrics,
 };
-use crate::traces::metrics_sql::AggFn;
 use crate::traces::window_sql::WindowSql;
 
 use super::attr_index::{IndexedAttr, index_hints};
@@ -157,26 +157,25 @@ impl MetricsStatement {
     }
 }
 
-/// Today's plan, and the statement that answers it from `spans` when the
-/// query is one this route serves.
+/// The shell planner's plan of a metrics query, and the statement that
+/// answers it from `spans`.
 #[derive(Debug, Clone)]
 pub struct RoutedMetricsPlan {
     plan: TraceMetricsPlan,
-    statement: Option<MetricsStatement>,
+    statement: MetricsStatement,
 }
 
 impl RoutedMetricsPlan {
-    /// With a statement, today's plan of the query with its filter body
-    /// removed, its `by()` emptied and its target `duration`: the window,
-    /// step, axis, kind, quantiles, ranking, comparison and exemplar
-    /// budget, its own SQL never issued. Without, today's plan of the
-    /// query itself.
+    /// The shell planner's plan of the query with its `by()` emptied and
+    /// its target `duration`: the window, step, axis, kind, quantiles,
+    /// ranking, comparison and exemplar budget.
     pub fn plan(&self) -> &TraceMetricsPlan {
         &self.plan
     }
 
-    pub fn statement(&self) -> Option<&MetricsStatement> {
-        self.statement.as_ref()
+    /// The statement that answers the query.
+    pub fn statement(&self) -> &MetricsStatement {
+        &self.statement
     }
 }
 
@@ -192,11 +191,13 @@ pub struct MetricStatementRow {
     pub f: u8,
 }
 
-/// What a query asks the statement for beyond today's plan: its `by()`
-/// keys and its target.
+/// What a query asks the statement for beyond the shell plan: its `by()`
+/// keys and its target, and the refusal of a target the statement does
+/// not aggregate.
 struct Asked {
     keys: Vec<Field>,
     target: Target,
+    refused_target: Option<String>,
 }
 
 /// What the function aggregates.
@@ -219,51 +220,56 @@ impl Target {
     }
 }
 
-/// Plans one metrics request: the statement on `spans` when the query is
-/// not `compare()`, its spanset is one `{ … }`, its target is `duration`,
-/// an attribute or `span:childCount`, today's planner accepts it with the
-/// filter's body removed, its `by()` emptied and its target `duration`,
-/// and [`metrics_statement`] serves the body; otherwise today's planner on
-/// the query itself, its answer and its refusals unchanged. A query the
-/// validator refuses is refused with its text.
+/// Plans one metrics request: the validator's refusal, else the shell
+/// planner's plan of the query with its `by()` emptied and its target
+/// `duration` and the statement that answers it, else the first refusal
+/// of the shell planner (window, pipeline shape, spanset shape), an
+/// intrinsic target, or the statement compiler.
 pub fn plan_trace_metrics_routed(
     query: &Query,
     params: &MetricsParams,
-    ctx: &MetricsCtx<'_>,
+    ctx: &MetricsCtx,
     tables: &StatementTables<'_>,
 ) -> Result<RoutedMetricsPlan, PlanError> {
-    let today = || {
-        plan_trace_metrics(query, params, ctx).map(|plan| RoutedMetricsPlan {
-            plan,
-            statement: None,
-        })
-    };
-    let SpansetExpr::Filter(filter) = &query.spanset else {
-        return today();
-    };
-    if query
-        .pipeline
-        .iter()
-        .any(|stage| matches!(stage, PipelineStage::Compare { .. }))
-    {
-        return compare_routed(query, filter, params, ctx, tables).unwrap_or_else(today);
-    }
     // The shell empties `by()`, so the validator's arity rule is checked
     // here, before the shell can accept what the query may not ask.
-    if let Err(e) = pulsus_traceql::validate(query) {
-        return Err(PlanError::TypeMismatch(e.to_string()));
+    pulsus_traceql::validate(query).map_err(|e| PlanError::TypeMismatch(e.to_string()))?;
+    let (pipeline, asked) = shell_pipeline(&query.pipeline);
+    let plan = plan_trace_metrics(
+        &Query {
+            spanset: query.spanset.clone(),
+            pipeline,
+            hints: query.hints.clone(),
+        },
+        params,
+        ctx,
+    )?;
+    let SpansetExpr::Filter(filter) = &query.spanset else {
+        return Err(PlanError::TypeMismatch(STRUCTURAL_METRICS.to_string()));
+    };
+    if let [
+        PipelineStage::Compare {
+            selection,
+            start_ns,
+            end_ns,
+            ..
+        },
+    ] = query.pipeline.as_slice()
+    {
+        let window = (*start_ns != 0 || *end_ns != 0).then_some((*start_ns, *end_ns));
+        let statement = compare_statement(
+            &plan,
+            filter.body.as_ref(),
+            selection.body.as_ref(),
+            window,
+            ctx.max_series,
+            tables,
+        )?;
+        return Ok(RoutedMetricsPlan { plan, statement });
     }
-    let Some((shell_pipeline, asked)) = shell_pipeline(&query.pipeline) else {
-        return today();
-    };
-    let shell = Query {
-        spanset: SpansetExpr::Filter(SpansetFilter { body: None }),
-        pipeline: shell_pipeline,
-        hints: query.hints.clone(),
-    };
-    let Ok(plan) = plan_trace_metrics(&shell, params, ctx) else {
-        return today();
-    };
+    if let Some(refusal) = &asked.refused_target {
+        return Err(PlanError::TypeMismatch(refusal.clone()));
+    }
     // Issue #601 part 4b: an admitted query's statement reads the error-span
     // table as its span table.
     let tables = if super::error_spans::admits(query) {
@@ -274,22 +280,20 @@ pub fn plan_trace_metrics_routed(
     } else {
         *tables
     };
-    match statement_for(&plan, &asked, filter.body.as_ref(), ctx.max_series, &tables) {
-        Some(statement) => Ok(RoutedMetricsPlan {
-            plan,
-            statement: Some(statement),
-        }),
-        None => today(),
-    }
+    let statement = statement_for(&plan, &asked, filter.body.as_ref(), ctx.max_series, &tables)?;
+    Ok(RoutedMetricsPlan { plan, statement })
 }
 
 /// The pipeline with its metric stage's `by()` emptied and its target
-/// `duration`, and what the stage asked; `None` when the target is an
-/// intrinsic other than `duration` and `span:childCount` (part 2's D8).
-fn shell_pipeline(pipeline: &[PipelineStage]) -> Option<(Vec<PipelineStage>, Asked)> {
+/// `duration`, and what the stage asked. An intrinsic target other than
+/// `duration` and `span:childCount` is kept as its refusal (part 2's D8),
+/// the shell's target `duration`, so the shell planner's refusals come
+/// first.
+fn shell_pipeline(pipeline: &[PipelineStage]) -> (Vec<PipelineStage>, Asked) {
     let mut asked = Asked {
         keys: Vec::new(),
         target: Target::Duration,
+        refused_target: None,
     };
     let mut out = Vec::with_capacity(pipeline.len());
     for stage in pipeline {
@@ -299,6 +303,7 @@ fn shell_pipeline(pipeline: &[PipelineStage]) -> Option<(Vec<PipelineStage>, Ask
         };
         let mut metric = metric.clone();
         asked.keys = std::mem::take(&mut metric.by);
+        let name = metric.func.name();
         let field = match &mut metric.func {
             MetricFn::Rate | MetricFn::CountOverTime => None,
             MetricFn::SumOverTime(f)
@@ -312,56 +317,41 @@ fn shell_pipeline(pipeline: &[PipelineStage]) -> Option<(Vec<PipelineStage>, Ask
             asked.target = match &*f {
                 Field::Intrinsic(Intrinsic::Duration) => Target::Duration,
                 Field::Intrinsic(Intrinsic::ChildCount) => Target::Children,
-                Field::Intrinsic(_) => return None,
+                Field::Intrinsic(i) => {
+                    asked.refused_target = Some(format!(
+                        "{name}() over {i} is not supported: its target must be duration, \
+                         span:childCount or an attribute"
+                    ));
+                    Target::Duration
+                }
                 Field::Attribute { .. } => Target::Attribute(f.clone()),
             };
             *f = Field::Intrinsic(Intrinsic::Duration);
         }
         out.push(PipelineStage::Metric(metric));
     }
-    Some((out, asked))
+    (out, asked)
 }
 
-/// The statement for `plan`, whose filter body is `body` and which groups
-/// by nothing and aggregates `duration`: part 1's entry point.
-pub fn metrics_statement(
-    plan: &TraceMetricsPlan,
-    body: Option<&FieldExpr>,
-    max_series: u64,
-    tables: &StatementTables<'_>,
-) -> Option<MetricsStatement> {
-    let asked = Asked {
-        keys: plan
-            .group_label()
-            .map(|_| {
-                vec![Field::Attribute {
-                    scope: AttrScope::Resource,
-                    key: "service.name".to_string(),
-                }]
-            })
-            .unwrap_or_default(),
-        target: Target::Duration,
-    };
-    statement_for(plan, &asked, body, max_series, tables)
-}
-
-/// The statement for the shell `plan` and what the query asked; `None`
-/// when the plan is `compare()`.
+/// The statement for the shell `plan` and what the query asked, or the
+/// statement compiler's refusal.
 fn statement_for(
     plan: &TraceMetricsPlan,
     asked: &Asked,
     body: Option<&FieldExpr>,
     max_series: u64,
     tables: &StatementTables<'_>,
-) -> Option<MetricsStatement> {
-    let shape = Shape::of(plan, !asked.keys.is_empty())?;
+) -> Result<MetricsStatement, PlanError> {
+    let shape = Shape::of(plan, !asked.keys.is_empty()).ok_or_else(|| {
+        PlanError::TypeMismatch("a metrics comparison takes = != < <= > >=".to_string())
+    })?;
     let (rlo, rhi) = plan.range_window_ns();
     let (ilo, ihi) = plan.snapped_window_ns();
     let range_window = WindowSql::start_closed_end_open(rlo, rhi);
     let instant_window = WindowSql::start_closed_end_open(ilo, ihi);
     let range = Read::of(plan, asked, body, range_window, tables)?;
     let instant = Read::of(plan, asked, body, instant_window, tables)?;
-    Some(MetricsStatement {
+    Ok(MetricsStatement {
         range_sql: range_sql(plan, &shape, &range, max_series),
         instant_sql: instant_sql(plan, &shape, &instant, max_series),
         labels: asked.keys.iter().map(label_of_key).collect(),
@@ -374,26 +364,26 @@ fn statement_for(
 
 /// Whether the engine fills a series' empty buckets with `0` (D14).
 #[cfg(test)]
-fn fills(plan: &TraceMetricsPlan) -> bool {
-    Shape::of(plan, plan.group_label().is_some()).is_some_and(|s| s.fill)
+fn fills(plan: &TraceMetricsPlan, grouped: bool) -> bool {
+    Shape::of(plan, grouped).is_some_and(|s| s.fill)
 }
 
 /// The filter body compiled for `ctx`'s window, behind its index hints,
 /// and the `WITH` binding what it reads beside the span row (#594 part 5):
 /// the search statement's per-trace scalar, operand pairs and numbered
-/// traces over that window, or nothing. `("true", "")` for `{}`; `None`
-/// when the body does not compile. A `!` demand is kept in the predicate
+/// traces over that window, or nothing. `("true", "")` for `{}`; the
+/// compiler's refusal when the body does not compile. A `!` demand is kept in the predicate
 /// and carried as the statement's demands (issue #602 part 2a). The flag
 /// is whether the predicate reads the nested-set numbering.
 fn predicate(
     body: Option<&FieldExpr>,
     ctx: &PredicateCtx<'_>,
     traces: &str,
-) -> Option<(String, String, bool)> {
+) -> Result<(String, String, bool), PlanError> {
     let Some(body) = body else {
-        return Some(("true".to_string(), String::new(), false));
+        return Ok(("true".to_string(), String::new(), false));
     };
-    let p = compile_span_predicate_in(body, ctx).ok()?;
+    let p = compile_span_predicate_in(body, ctx)?;
     let w = ctx.window;
     let leaves: Vec<&TraceLeaf> = p.trace_leaves().iter().collect();
     let mut bound = per_trace_sql(&leaves, p.reads_child_counts(), w, traces);
@@ -407,7 +397,7 @@ fn predicate(
     } else {
         format!("WITH {bound} ")
     };
-    Some((
+    Ok((
         p.with_hints(&index_hints(body, ctx.indexed))
             .sql()
             .to_string(),
@@ -470,7 +460,7 @@ impl Read {
         body: Option<&FieldExpr>,
         window: WindowSql,
         tables: &StatementTables<'_>,
-    ) -> Option<Read> {
+    ) -> Result<Read, PlanError> {
         let ctx = PredicateCtx {
             window,
             spans_table: tables.spans,
@@ -481,7 +471,7 @@ impl Read {
         let mut joins = Joins::default();
         let mut texts = Vec::with_capacity(asked.keys.len());
         for key in &asked.keys {
-            texts.push(key_text(key, &ctx, &mut joins).ok()?);
+            texts.push(key_text(key, &ctx, &mut joins)?);
         }
         let g = if texts.is_empty() {
             NO_KEYS.to_string()
@@ -498,7 +488,7 @@ impl Read {
                 )
             }
             Target::Attribute(Field::Attribute { scope, key }) => {
-                let a = scope_value(*scope, key, &ctx).ok()?;
+                let a = scope_value(*scope, key, &ctx)?;
                 (
                     Some(format!(
                         "if(dynamicType({a}) = 'Int64', toFloat64(dynamicElement({a}, 'Int64')), \
@@ -507,7 +497,13 @@ impl Read {
                     Some(format!("dynamicElement({a}, 'Int64')")),
                 )
             }
-            Target::Attribute(Field::Intrinsic(_)) => return None,
+            // Unreachable: `shell_pipeline` builds an attribute target from
+            // an attribute only.
+            Target::Attribute(Field::Intrinsic(i)) => {
+                return Err(PlanError::TypeMismatch(format!(
+                    "{i} is not an attribute target"
+                )));
+            }
         };
         let condition = match (plan.kind(), &asked.target) {
             (PlanKind::Histogram, Target::Duration) => " AND duration_ns >= 2".to_string(),
@@ -556,7 +552,7 @@ impl Read {
         } else {
             (String::new(), g, x, i)
         };
-        Some(Read {
+        Ok(Read {
             with,
             from: from_clause(tables, joins, window, &predicate, &condition, dedup, &inner),
             g,
@@ -826,7 +822,7 @@ impl Shape {
                     ComparisonOp::Lt => ("<", 0.0 < threshold),
                     ComparisonOp::Lte => ("<=", 0.0 <= threshold),
                     // The parser refuses a regular expression after a
-                    // metrics stage; today's engine keeps no sample.
+                    // metrics stage, so none reaches here.
                     ComparisonOp::Re | ComparisonOp::Nre => return None,
                 };
                 (Some((text, f64_text(threshold))), passes)
@@ -1202,62 +1198,10 @@ pub struct CompareStatementRow {
     pub c: u8,
 }
 
-/// D1: a `compare()` whose pipeline is that one stage takes the statement,
-/// planned as the shell `{ } | compare({ }, topN, start, end)`; `None`
-/// sends the query to today's planner.
-fn compare_routed(
-    query: &Query,
-    filter: &SpansetFilter,
-    params: &MetricsParams,
-    ctx: &MetricsCtx<'_>,
-    tables: &StatementTables<'_>,
-) -> Option<Result<RoutedMetricsPlan, PlanError>> {
-    let [
-        PipelineStage::Compare {
-            selection,
-            top_n,
-            start_ns,
-            end_ns,
-            hints,
-        },
-    ] = query.pipeline.as_slice()
-    else {
-        return None;
-    };
-    if let Err(e) = pulsus_traceql::validate(query) {
-        return Some(Err(PlanError::TypeMismatch(e.to_string())));
-    }
-    let shell = Query {
-        spanset: SpansetExpr::Filter(SpansetFilter { body: None }),
-        pipeline: vec![PipelineStage::Compare {
-            selection: Box::new(SpansetFilter { body: None }),
-            top_n: *top_n,
-            start_ns: *start_ns,
-            end_ns: *end_ns,
-            hints: hints.clone(),
-        }],
-        hints: query.hints.clone(),
-    };
-    let plan = plan_trace_metrics(&shell, params, ctx).ok()?;
-    let window = (*start_ns != 0 || *end_ns != 0).then_some((*start_ns, *end_ns));
-    let statement = compare_statement(
-        &plan,
-        filter.body.as_ref(),
-        selection.body.as_ref(),
-        window,
-        ctx.max_series,
-        tables,
-    )?;
-    Some(Ok(RoutedMetricsPlan {
-        plan,
-        statement: Some(statement),
-    }))
-}
-
 /// The `compare()` statement (section 3 of the plan) for the shell `plan`:
 /// `outer` the spanset's body, `selection` the comparison's, `window` its
-/// `(start, end]` selection window. `None` when either body does not
-/// compile.
+/// `(start, end]` selection window. The compiler's refusal when either
+/// body does not compile.
 fn compare_statement(
     plan: &TraceMetricsPlan,
     outer: Option<&FieldExpr>,
@@ -1265,10 +1209,7 @@ fn compare_statement(
     window: Option<(i64, i64)>,
     max_series: u64,
     tables: &StatementTables<'_>,
-) -> Option<MetricsStatement> {
-    if plan.kind() != PlanKind::Compare {
-        return None;
-    }
+) -> Result<MetricsStatement, PlanError> {
     let (rlo, rhi) = plan.range_window_ns();
     let (ilo, ihi) = plan.snapped_window_ns();
     let range_window = WindowSql::start_closed_end_open(rlo, rhi);
@@ -1288,7 +1229,7 @@ fn compare_statement(
             demands.push(d);
         }
     }
-    Some(MetricsStatement {
+    Ok(MetricsStatement {
         range_sql,
         instant_sql,
         labels: Vec::new(),
@@ -1339,7 +1280,7 @@ fn compare_sql(
     tables: &StatementTables<'_>,
     w: WindowSql,
     p: &str,
-) -> Option<(String, bool)> {
+) -> Result<(String, bool), PlanError> {
     let ctx = PredicateCtx {
         window: w,
         spans_table: tables.spans,
@@ -1348,12 +1289,10 @@ fn compare_sql(
     };
     let outer_p = outer
         .map(|b| compile_span_predicate_in(b, &ctx))
-        .transpose()
-        .ok()?;
+        .transpose()?;
     let selection_p = selection
         .map(|b| compile_span_predicate_in(b, &ctx))
-        .transpose()
-        .ok()?;
+        .transpose()?;
     // D12: both bodies' trace-level bindings in one `WITH`.
     let both: Vec<&SpanPredicate> = outer_p.iter().chain(selection_p.iter()).collect();
     let leaves: Vec<&TraceLeaf> = both.iter().flat_map(|p| p.trace_leaves()).collect();
@@ -1429,7 +1368,7 @@ fn compare_sql(
     .replace('\n', &format!("\n{}", " ".repeat(36)));
     let exb = u8::from(plan.exemplar_budget() > 0);
     let top_n = plan.compare_top_n();
-    Some((format!(
+    Ok((format!(
         "{with}SELECT s, g, k, v, y, pts, ex, throwIf(countIf(g = 0 AND k != '') OVER () + 4 * uniqExactIf(k, g = 1 AND k != '') OVER () > {max_series}, '{SERIES_CAP_MESSAGE}') AS c
 FROM (SELECT s, g, k, v, y, pts, ex, row_number() OVER (PARTITION BY s, g, k ORDER BY tot DESC, v, y) AS rn
       FROM (SELECT s, g, k, v, y, arraySort(groupArray((p, n))) AS pts, sum(n) AS tot,
@@ -1456,17 +1395,12 @@ ORDER BY s, g, k, v, y"
 
 #[cfg(test)]
 mod tests {
-    use pulsus_traceql::parse;
+    use pulsus_traceql::{SpansetFilter, parse};
 
     use super::*;
-    use crate::traces::filter::SpanFilterCtx;
 
-    fn ctx<'a>() -> MetricsCtx<'a> {
+    fn ctx() -> MetricsCtx {
         MetricsCtx {
-            filter: SpanFilterCtx {
-                spans_table: "trace_spans",
-                attrs_table: "trace_attrs_idx",
-            },
             scan_budget_rows: 50_000_000,
             max_series: 1_000,
             distributed: false,
@@ -1499,7 +1433,7 @@ mod tests {
         )
     }
 
-    fn today(q: &str, params: &MetricsParams) -> Result<TraceMetricsPlan, PlanError> {
+    fn shell(q: &str, params: &MetricsParams) -> Result<TraceMetricsPlan, PlanError> {
         plan_trace_metrics(
             &parse(q).unwrap_or_else(|e| panic!("{q} must parse: {e:?}")),
             params,
@@ -1508,7 +1442,7 @@ mod tests {
     }
 
     /// D1: a field against a field, arithmetic and an absence check are
-    /// served from the statement, where today's planner refuses them.
+    /// served from the statement.
     #[test]
     fn a_field_against_a_field_is_served() {
         for q in [
@@ -1516,9 +1450,7 @@ mod tests {
             "{ duration * 2 > 700ms } | rate()",
             "{ .a = nil } | rate()",
         ] {
-            let r = routed(q, &PARAMS).unwrap_or_else(|e| panic!("{q}: routed refused: {e}"));
-            assert!(r.statement().is_some(), "{q}: no statement");
-            assert!(today(q, &PARAMS).is_err(), "{q}: today's planner serves it");
+            routed(q, &PARAMS).unwrap_or_else(|e| panic!("{q}: routed refused: {e}"));
         }
     }
 
@@ -1547,7 +1479,7 @@ mod tests {
             ),
         ] {
             let r = routed(q, &PARAMS).unwrap_or_else(|e| panic!("{q}: routed refused: {e}"));
-            let s = r.statement().unwrap_or_else(|| panic!("{q}: no statement"));
+            let s = r.statement();
             for (form, sql) in [("range", s.range_sql()), ("instant", s.instant_sql())] {
                 assert!(
                     sql.contains(binding),
@@ -1559,25 +1491,11 @@ mod tests {
         // carries the demand for its `400`.
         let q = "{ !span.a } | rate()";
         let r = routed(q, &PARAMS).unwrap_or_else(|e| panic!("{q}: routed refused: {e}"));
-        let s = r.statement().unwrap_or_else(|| panic!("{q}: no statement"));
+        let s = r.statement();
         assert!(
             !s.demands().is_empty(),
             "{q}: the statement carries no demand"
         );
-    }
-
-    /// D1: an intrinsic target other than `duration` and `span:childCount`
-    /// stays on today's planner (part 2's D8). `compare()` takes the
-    /// statement since issue #597 (U2).
-    #[test]
-    fn intrinsic_targets_stay_on_todays_planner() {
-        for q in [
-            "{} | sum_over_time(nestedSetLeft)",
-            "{} | avg_over_time(trace:duration)",
-        ] {
-            let want = today(q, &PARAMS).expect_err("today's planner refuses it");
-            assert_eq!(routed(q, &PARAMS).err(), Some(want), "{q}");
-        }
     }
 
     /// The refused text of `q`, which must be a `TypeMismatch`.
@@ -1682,9 +1600,7 @@ mod tests {
             let r = routed(q, &PARAMS);
             assert!(r.is_ok(), "{q}: routed refused: {r:?}");
             let r = r.expect("checked");
-            let Some(st) = r.statement() else {
-                panic!("{q}: no statement");
-            };
+            let st = r.statement();
             let children = q.contains("span:childCount");
             for sql in [st.range_sql(), st.instant_sql()] {
                 assert_eq!(sql.contains(") AS ch USING"), children, "{q}: the ch join");
@@ -1714,11 +1630,7 @@ mod tests {
             let q = format!("{{}} | count_over_time() by({key})");
             let r = routed(&q, &PARAMS);
             assert!(r.is_ok(), "{q}: routed refused: {r:?}");
-            r.expect("checked")
-                .statement()
-                .unwrap_or_else(|| panic!("{q}: no statement"))
-                .range_sql()
-                .to_string()
+            r.expect("checked").statement().range_sql().to_string()
         };
         // The key's own missing arm (`dynamic_key`, the service column's, or
         // a resource label's, issue #601 part 4c), not `folded_keys`, which
@@ -1761,7 +1673,7 @@ mod tests {
             );
             assert!(r.is_ok(), "{q}: routed refused: {r:?}");
             let r = r.expect("checked");
-            let st = r.statement().unwrap_or_else(|| panic!("{q}: no statement"));
+            let st = r.statement();
             [st.range_sql().to_string(), st.instant_sql().to_string()]
         };
         for q in [
@@ -1785,7 +1697,7 @@ mod tests {
         }
     }
 
-    /// D2: a window error is today's, word for word.
+    /// D2: a window error is the shell planner's, word for word.
     #[test]
     fn a_window_error_is_todays() {
         let q = "{ span.a = span.b } | rate()";
@@ -1803,7 +1715,7 @@ mod tests {
                 ..PARAMS
             },
         ] {
-            let want = today("{} | rate()", &params).expect_err("today's planner refuses it");
+            let want = shell("{} | rate()", &params).expect_err("the shell planner refuses it");
             assert_eq!(routed(q, &params).err(), Some(want), "{params:?}");
         }
     }
@@ -1812,7 +1724,10 @@ mod tests {
     /// ranking.
     #[test]
     fn zero_passing_is_decided_once() {
-        let flag = |q: &str| fills(&today(q, &PARAMS).unwrap_or_else(|e| panic!("{q}: {e}")));
+        let flag = |q: &str| {
+            let plan = shell(q, &PARAMS).unwrap_or_else(|e| panic!("{q}: {e}"));
+            fills(&plan, q.contains("by("))
+        };
         for (q, want) in [
             ("{} | count_over_time() > 0", false),
             ("{} | count_over_time() >= 0", true),
@@ -1958,7 +1873,7 @@ ORDER BY s, g, k, v, y";
         let routed =
             |q: &str| routed(q, &CMP_PARAMS).unwrap_or_else(|e| panic!("{q}: routed refused: {e}"));
         let r = routed("{} | compare({ status = error })");
-        let st = r.statement().expect("a statement");
+        let st = r.statement();
         let (rlo, rhi) = r.plan().range_window_ns();
         let range_w = WindowSql::start_closed_end_open(rlo, rhi);
         let p = status_error_sql(range_w);
@@ -1981,7 +1896,7 @@ ORDER BY s, g, k, v, y";
         );
         let r =
             routed("{} | compare({ status = error }, 3, 1700000600000000000, 1700001200000000000)");
-        let st = r.statement().expect("a statement");
+        let st = r.statement();
         assert_eq!(
             st.range_sql(),
             typed_compare(
@@ -1997,25 +1912,21 @@ ORDER BY s, g, k, v, y";
     }
 
     /// U2 (issue #597): a comparison whose spanset is one filter takes the
-    /// statement; a structural spanset keeps today's planner.
+    /// statement; a structural spanset is the shell planner's refusal.
     #[test]
     fn compare_takes_the_statement_where_its_spanset_is_one_filter() {
         let q = "{ .a = 1 } | compare({ .b = 2 })";
         let r = routed(q, &PARAMS).unwrap_or_else(|e| panic!("{q}: routed refused: {e}"));
-        let st = r.statement().unwrap_or_else(|| panic!("{q}: no statement"));
+        let st = r.statement();
         assert!(st.is_compare(), "{q}: not a compare statement");
-        // Today's planner answers it, here with its refusal of a structural
-        // metrics query; either way no statement.
+        // A structural spanset is the shell planner's refusal.
         let q = "{ .a = 1 } >> { .b = 2 } | compare({ .c = 3 })";
         let r = routed(q, &PARAMS);
+        assert!(r.is_err(), "{q}: a statement");
         assert_eq!(
             r.as_ref().err(),
-            today(q, &PARAMS).err().as_ref(),
-            "{q}: today's answer"
-        );
-        assert!(
-            !matches!(r, Ok(ref r) if r.statement().is_some()),
-            "{q}: a statement"
+            shell(q, &PARAMS).err().as_ref(),
+            "{q}: the shell planner's answer"
         );
     }
 
@@ -2038,11 +1949,7 @@ ORDER BY s, g, k, v, y";
         );
         let q = "{} | compare({ status = error })";
         let r = routed(q, &PARAMS).unwrap_or_else(|e| panic!("{q}: routed refused: {e}"));
-        let sql = r
-            .statement()
-            .unwrap_or_else(|| panic!("{q}: no statement"))
-            .range_sql()
-            .to_string();
+        let sql = r.statement().range_sql().to_string();
         for key in COMPARE_INTRINSIC_KEYS {
             assert!(sql.contains(&format!("('{key}', ")), "{key} missing");
         }
@@ -2075,7 +1982,7 @@ ORDER BY s, g, k, v, y";
     fn two_bodies_with_one_trace_leaf_bind_it_once() {
         let q = "{ traceDuration > 1s } | compare({ traceDuration > 1s && status = error })";
         let r = routed(q, &PARAMS).unwrap_or_else(|e| panic!("{q}: routed refused: {e}"));
-        let st = r.statement().unwrap_or_else(|| panic!("{q}: no statement"));
+        let st = r.statement();
         for sql in [st.range_sql(), st.instant_sql()] {
             assert_eq!(sql.matches("WITH ").count(), 1, "one WITH: {sql}");
             let aliases: Vec<&str> = sql

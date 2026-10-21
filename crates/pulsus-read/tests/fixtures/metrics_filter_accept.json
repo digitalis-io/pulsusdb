@@ -8,7 +8,7 @@
     "note": "Every `reference` verdict below was captured live from that image on that route and window. An accepting reference response carries no pinned body: the 200 envelope is `{\"series\":[],\"metrics\":{\"completedJobs\":N,\"totalJobs\":N}}` and the job counts are not a property of the query. Every rejecting body IS pinned, on both sides."
   },
   "limits": {
-    "what_this_cannot_see": "A refusal turned into MATCH-ALL keeps its `accept` disposition and passes this suite unchanged. That is exactly the break that motivated issue #458 and nothing here can catch it \u2014 `traces_metrics_nested_set_live.rs` (AC 3b) and the golden SQL in `traces_metrics_sql.rs` (AC 5) are the criteria that can."
+    "what_this_cannot_see": "A refusal turned into MATCH-ALL keeps its `accept` disposition and passes this suite unchanged. That is exactly the break that motivated issue #458 and nothing here can catch it \u2014 `traces_query_v2_live.rs`'s `the_seven_filter_metrics` and the golden SQL in `traces_spans_metrics_sql.rs` are the criteria that can (the two suites issue #458 named went with the previous metrics SQL, #602 part 3a)."
   },
   "probes": [
     {

@@ -1,4 +1,0 @@
-//! Not valid Rust. Under a line scan an unparseable file scanned clean;
-//! the parse panics instead.
-
-fn base_s( -> i64 {

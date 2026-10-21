@@ -30,8 +30,8 @@ use std::path::PathBuf;
 use serde::Deserialize;
 
 use pulsus_read::{
-    MetricsCtx, MetricsParams, SearchParams, SpanFilterCtx, StatementTables, TracePlanError,
-    plan_search_request, plan_trace_metrics,
+    MetricsCtx, MetricsParams, SearchParams, StatementTables, TracePlanError, plan_search_request,
+    plan_trace_metrics,
 };
 use pulsus_traceql::{parse, validate};
 
@@ -61,19 +61,13 @@ fn load_vectors() -> Vec<Vector> {
         .vectors
 }
 
-fn search_ctx<'a>(spans: &'a str, attrs: &'a str) -> (SpanFilterCtx<'a>, SearchParams) {
-    (
-        SpanFilterCtx {
-            spans_table: spans,
-            attrs_table: attrs,
-        },
-        SearchParams {
-            start_ns: 1_000_000_000,
-            end_ns: 2_000_000_000,
-            limit: 20,
-            spss: 3,
-        },
-    )
+fn search_params() -> SearchParams {
+    SearchParams {
+        start_ns: 1_000_000_000,
+        end_ns: 2_000_000_000,
+        limit: 20,
+        spss: 3,
+    }
 }
 
 /// Every expression the reference's validator accepts must validate
@@ -116,7 +110,7 @@ fn every_plan_error_variant_is_witnessed_by_an_accepted_vector() {
     let mut type_mismatch = 0usize;
     let mut point_cap = 0usize;
 
-    let (filter, params) = search_ctx("pulsus.trace_spans", "pulsus.trace_attrs_idx");
+    let params = search_params();
     let tables = StatementTables {
         spans: "pulsus.spans",
         error_spans: "pulsus.error_spans",
@@ -125,7 +119,6 @@ fn every_plan_error_variant_is_witnessed_by_an_accepted_vector() {
         indexed: &[],
     };
     let mctx = MetricsCtx {
-        filter,
         scan_budget_rows: 1_000_000,
         max_series: 500,
         distributed: false,

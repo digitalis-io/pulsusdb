@@ -17,7 +17,7 @@
 //!
 //!   * **PulsusDB side** — written to a throwaway ClickHouse DB and read
 //!     back through this crate's REAL metrics executor
-//!     ([`TraceEngine::metrics_range`]);
+//!     ([`TraceEngine::metrics_range_routed`]);
 //!   * **reference side** — the same spans pushed to
 //!     `grafana/tempo:3.0.2` over OTLP and read back from its
 //!     `/api/metrics/query_range`.
@@ -119,11 +119,6 @@ fn ch_config(database: &str) -> ChConnConfig {
 fn engine_config() -> TraceReadConfig {
     TraceReadConfig {
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
-        spans_table: "trace_spans".to_string(),
-        attrs_table: "trace_attrs_idx".to_string(),
-        edges_table: "trace_edges".to_string(),
-        recent_table: "trace_recent".to_string(),
-        errors_table: "trace_error_spans".to_string(),
         spans_v2_table: "spans".to_string(),
         error_spans_table: "error_spans".to_string(),
         traces_table: "traces".to_string(),
@@ -434,10 +429,6 @@ async fn pulsus_counts(
         },
     )
     .unwrap_or_else(|e| panic!("{query}: plan failed: {e}"));
-    assert!(
-        routed.statement().is_some(),
-        "{query}: compare() takes the statement"
-    );
     let res = engine
         .metrics_range_routed(&routed)
         .await

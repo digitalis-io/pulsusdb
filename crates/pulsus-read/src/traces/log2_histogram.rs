@@ -30,8 +30,8 @@
 //!
 //! This module owns only the label rendering and the pure bucket rule;
 //! the bucketing itself is pushed down to ClickHouse as
-//! `toUInt64(roundToExp2(val - 1)) * 2` under an outer `WHERE val >= 2`
-//! ([`super::metrics_sql::metrics_log2_bucket_range_sql`]), so
+//! `toUInt64(roundToExp2(<target> - 1)) * 2` over the spans whose target
+//! is `>= 2` (the metrics statement, [`super::spans::metrics`]), so
 //! `GROUP BY` returns at most 64 tallies per step and no aggregation
 //! moves client-side.
 
@@ -48,17 +48,16 @@
 /// past the word width) is unreachable for the same reason and gets this
 /// sentence rather than a dead branch.
 ///
-/// The SQL twin is `toUInt64(roundToExp2(val - 1)) * 2` guarded by
-/// `WHERE val >= 2` on the OUTER query (after the replay dedup). **The
-/// guard is what excludes `v <= 1`, not the expression**, and the
+/// The SQL twin is `toUInt64(roundToExp2(<target> - 1)) * 2` guarded by
+/// the statement's `>= 2` condition on the target. **The guard is what
+/// excludes `v <= 1`, not the expression**, and the
 /// expression fails silently rather than loudly without it: measured on
 /// ClickHouse 24.8.14.39, `roundToExp2` over `Int64` returns `0` for
 /// every argument `<= 0`, so `-1`, `0` and `1` ns all land in a spurious
 /// `__bucket = 0` series that the reference never emits — no error, no
-/// NULL. That is why the guard is tested live against real rows
-/// (`traces_metrics_live.rs::log2_histogram_membership_and_the_sub_two_ns_guard`,
-/// whose mutant produces exactly that `(0.0, 3.0)` series) rather than
-/// reasoned about.
+/// NULL. That is why the guard is tested live against stored rows
+/// (`traces_query_v2_live.rs::the_histogram_buckets`, whose 1 ns span is
+/// dropped) rather than reasoned about.
 pub fn log2_bucketize_ns(v: i64) -> Option<u64> {
     if v < 2 {
         return None;
@@ -146,7 +145,8 @@ mod tests {
 
     /// The two-rounding form, transcribed ONLY so this test can assert
     /// the production conversion is form-independent here (issues
-    /// #237 / #232 — `exec.rs`'s `agg_value` carries the same guard).
+    /// #237 / #232 — the metrics statement's one rounding is pinned live by
+    /// `traces_query_v2_live.rs`'s `a_duration_in_seconds_is_rounded_once`).
     fn two_rounding_seconds(ns: u64) -> f64 {
         (ns / 1_000_000_000) as f64 + (ns % 1_000_000_000) as f64 / 1e9
     }
@@ -166,7 +166,7 @@ mod tests {
     #[test]
     fn bucket_seconds_reproduces_the_captured_reference_bucket_labels() {
         // Captured from grafana/tempo:3.0.2 (see
-        // `tests/golden/traces_metrics/log2_reference_capture.json`).
+        // `tests/fixtures/log2_reference_capture.json`).
         for (ns, want) in [
             (1u64 << 1, 2e-9f64),
             (1 << 2, 4e-9),

@@ -56,7 +56,7 @@ performance regression nobody could see in the emitted SQL.
 Measured against corpus **C1**, described in [query-lowering.md §9](../query-lowering.md), on
 ClickHouse `26.3.17.110` in a container started for this work. Every figure is one
 `system.query_log` row per `query_id`, with the trace read path's own settings
-([`search_settings`](../../crates/pulsus-read/src/traces/exec.rs), line 2095) plus
+([`search_settings`](../../crates/pulsus-read/src/traces/exec.rs), line 1295) plus
 `use_query_condition_cache = 0` — see [query-lowering.md §9](../query-lowering.md) for why that
 setting is mandatory for any granule measurement on ClickHouse 26.3.
 

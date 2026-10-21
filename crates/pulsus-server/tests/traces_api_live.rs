@@ -2505,22 +2505,25 @@ async fn absent_submessages_are_materialized_present_and_empty_on_the_wire() {
 /// AC8(iv-c) (issue #477): the range route rejects with `422` a group the
 /// instant route serves with `200`.
 ///
-/// **Both routes agree at `2f78c53`.** Measured there over four window
+/// **Both routes agreed at `2f78c53`**, on the previous metrics SQL, which
+/// went with its probes in #602 part 3a. Measured there over four window
 /// configurations: `enforce_series_cap` read ONE accessor off the plan, so
 /// the two routes executed the same probe string and no request pair,
 /// identical but for the route, could return different statuses for a cap
 /// reason. What could be told apart at base was the two WINDOWS — the same
 /// query at the same cap, one step wider, returned `422` where the narrow
-/// one returned `200` — and after this change the window is the only thing
-/// separating `range_probe_sql` from `instant_probe_sql`. So the pair
-/// below is exactly that difference, moved from the request into the code.
+/// one returned `200` — and after that change the window was the only thing
+/// separating `range_probe_sql` from `instant_probe_sql` (both went, #602
+/// part 3a); the metrics statement caps each form over its own window. So
+/// the pair below is exactly that difference, moved from the request into
+/// the code.
 ///
 /// Two time-disjoint fixed windows, one spawn, one database. Fixed FUTURE
 /// timestamps rather than clock-derived ones — the idiom already in this
 /// file — so the corpus is deterministic and sits past the delete TTL by
-/// construction rather than by luck. `past_window`'s clock margin is
-/// `crates/pulsus-read/tests/traces_metrics_live.rs`'s rule and exists
-/// against the reference's end clamp; this test never contacts the
+/// construction rather than by luck. `past_window`'s clock margin was the
+/// rule of a suite that went with the previous metrics SQL (#602 part 3a)
+/// and existed against the reference's end clamp; this test never contacts the
 /// reference and takes no bound from the clock.
 ///
 /// **Run procedure, because it is not obvious and it costs an hour when it

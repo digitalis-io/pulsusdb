@@ -247,7 +247,7 @@ design rather than of a query:
    and `<name>.sql` shows that shape. The catalogue's answer column is
    membership, so those queries share their answer with the filter they wrap.
    `with(sample=true)` changes no read at all — the shipped planner accepts it
-   and returns the exact superset (`metrics_plan.rs:1114`).
+   and returns the exact superset (`metrics_plan.rs:656`).
 4. **The transitive structural operators run bounded.** Every `>>`/`<<` statement
    carries `depth < PULSUS_TRACEQL_MAX_DEPTH` and reports what it could not
    resolve, as `sql-schema.md` §5.8 describes.

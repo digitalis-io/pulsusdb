@@ -15,17 +15,6 @@ impl TraceReadConfig {
             ""
         };
         TraceReadConfig {
-            spans_table: format!("trace_spans{dist}"),
-            attrs_table: format!("trace_attrs_idx{dist}"),
-            // `trace_edges` (M7-E1, issue #173) co-shards with `trace_spans` on
-            // `cityHash64(trace_id)`, so it is `_dist`-aware exactly like
-            // `spans_table`/`attrs_table` (the dist-suffix rule, not the catalog
-            // carve-out) — the query-time edge join stays shard-local.
-            edges_table: format!("trace_edges{dist}"),
-            // Issue #560: the two derived trace tables co-shard with
-            // `trace_spans` on `cityHash64(trace_id)` — the same rule.
-            recent_table: format!("trace_recent{dist}"),
-            errors_table: format!("trace_error_spans{dist}"),
             // Issue #587: the fetch's three tables. `spans` and `traces`
             // co-shard with the landing table on `cityHash64(trace_id)`, so
             // they take the same `_dist` rule as every other routed trace
@@ -77,11 +66,6 @@ mod tests {
             config.reader.traceql_max_series = 11;
             config.reader.traceql_read_max_memory_bytes = 13;
             let c = TraceReadConfig::from_config(&config);
-            assert_eq!(c.spans_table, format!("trace_spans{dist}"));
-            assert_eq!(c.attrs_table, format!("trace_attrs_idx{dist}"));
-            assert_eq!(c.edges_table, format!("trace_edges{dist}"));
-            assert_eq!(c.recent_table, format!("trace_recent{dist}"));
-            assert_eq!(c.errors_table, format!("trace_error_spans{dist}"));
             assert_eq!(c.spans_v2_table, format!("spans{dist}"));
             assert_eq!(c.error_spans_table, format!("error_spans{dist}"));
             assert_eq!(c.traces_table, format!("traces{dist}"));

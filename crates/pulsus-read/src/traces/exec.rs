@@ -36,31 +36,23 @@
 //! what bounds it is [`fetch_settings`]' `max_memory_usage`, applied
 //! server-side.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChError, ChRow, QuerySettings};
 
-use super::graph_sql::{self, GraphWindow};
-use super::log2_histogram;
-use super::metrics_plan::{ExemplarSeriesKey, MetricsCtx, PlanKind, TraceMetricsPlan};
+use super::metrics_plan::{MetricsCtx, TraceMetricsPlan};
 use super::metrics_result::{
     MetricExemplar, MetricLabel, MetricLabelValue, TraceMetricSeries, TraceMetricsResult,
 };
 use super::spans::fetch as span_fetch;
+use super::spans::graph::{GraphWindow, SERVICE_GRAPH_MAX_EDGES};
 use super::spans::rows::{
     FallbackFetchRow, FetchRoute, FetchWindow, FetchedTrace, IndexedFetchRow, SearchGroupTuple,
     SearchGroupedRow, SearchProjected, SearchSpanTuple, SearchTraceRow, WideFetchRow,
 };
 
-use super::rows::{
-    CompareCrossTabRow, CompareTotalsRow, GraphEdgeRow, GraphTargetRow, MetricAggGroupInstantRow,
-    MetricAggGroupRow, MetricAggInstantRow, MetricAggRow, MetricBucketRow,
-    MetricCompareExemplarRow, MetricCountRow, MetricExemplarRow, MetricGroupCountInstantRow,
-    MetricGroupCountRow, MetricGroupExemplarRow, MetricLog2BucketInstantRow, MetricLog2BucketRow,
-    MetricLog2ExemplarRow, MetricQuantileExemplarRow, MetricQuantileInstantRow, MetricQuantileRow,
-    SpanNameRow, TagNameRow, TagValueRow,
-};
+use super::rows::{GraphEdgeRow, GraphTargetRow, SpanNameRow, TagNameRow, TagValueRow};
 use super::spans::predicate::PredicateCtx;
 use super::spans::tags::{
     TAG_STORE_READ_ROWS, TagNarrowing, TagShape, ValueScope, cut_rows, name_values_sql,
@@ -107,7 +99,7 @@ pub const TRACE_MAX_RESULT_BYTES: u64 = 64 * 1024 * 1024;
 /// query (issue #57 re-audit, sub-problem A): bounds the row width of
 /// any single transiently-buffered result block, so the driver's
 /// documented one-block residual is a hard product with
-/// [`crate::traces::filter::TRACE_STR_COL_CAP`] rather than
+/// [`crate::traces::sql_text::TRACE_STR_COL_CAP`] rather than
 /// a-priori row-unbounded — see the module doc's memory-contract
 /// paragraph.
 pub const TRACE_SEARCH_MAX_BLOCK_ROWS: u64 = 4096;
@@ -124,8 +116,7 @@ const CODE_MEMORY_LIMIT_EXCEEDED: i32 = 241;
 /// `SET_SIZE_LIMIT_EXCEEDED` — raised by an `IN (SELECT …)` set built
 /// under [`TRACE_METRICS_MAX_SET_ROWS`]/[`TRACE_METRICS_MAX_SET_BYTES`]
 /// with `set_overflow_mode='throw'`. No other trace or LogQL query sets a
-/// set limit, so this code maps exclusively on the reads that carry
-/// [`metrics_settings`].
+/// set limit, so this code maps exclusively on the metrics path.
 ///
 /// **Issue #559 removed the surface this used to name.** Until then the
 /// metrics FILTER lowered an attribute condition to
@@ -136,11 +127,11 @@ const CODE_MEMORY_LIMIT_EXCEEDED: i32 = 241;
 /// cannot raise this any more — its binding limit is
 /// `max_rows_to_read = reader.traceql_scan_budget_rows`, code 158.
 ///
-/// The metrics statement builds sets only for the seven fields (#594 part
-/// 5) without set limits ([`statement_settings`]); the set limits bind the
-/// previous planner's reads and the NARROWED tag-values read
-/// (`tags_sql::attr_values_narrowed_sql`, any-element rule deliberately,
-/// `traces_tags_live`'s budget test). Constant, mapping, 422 unchanged.
+/// The set limits are inert for the metrics statement: it builds sets only
+/// for the seven fields (#594 part 5) and sends `max_rows_in_set = 0` and
+/// `max_bytes_in_set = 0` ([`statement_settings`]). The previous planner's
+/// reads they bound went with the previous metrics SQL (#602 part 3a).
+/// Constant, mapping, 422 unchanged.
 const CODE_SET_SIZE_LIMIT_EXCEEDED: i32 = 191;
 
 /// The IN-set row budget (`max_rows_in_set`, throw) carried by every read
@@ -150,10 +141,10 @@ const CODE_SET_SIZE_LIMIT_EXCEEDED: i32 = 191;
 /// than an unbounded in-memory set. Documented constant
 /// (docs/schemas.md §4.2; promoted to config only on evidence).
 ///
-/// **The metrics statement builds sets only for the seven fields (#594
-/// part 5), without set limits** ([`statement_settings`]); this bounds the
-/// previous planner's reads and the narrowed tag-values read's `IN` set.
-/// The value does not move; the sentence naming the semi-join did.
+/// **Inert for the metrics statement**, which builds sets only for the
+/// seven fields (#594 part 5) and lifts the limit ([`statement_settings`]);
+/// the previous planner's reads it bound went with the previous metrics SQL
+/// (#602 part 3a). The value does not move.
 pub const TRACE_METRICS_MAX_SET_ROWS: u64 = 1_000_000;
 
 /// The metrics IN-set byte budget (`max_bytes_in_set`, throw) — the byte
@@ -210,34 +201,14 @@ impl<R, C: FnMut(&R) -> usize, A: FnMut(R)> ChargedRowSink<R> for FnRowSink<C, A
 
 /// Owned table/budget configuration a [`TraceEngine`] reads against —
 /// mirrors [`crate::logql::EngineConfig`]'s "owned `String`, no borrowed
-/// lifetime on the engine itself" shape. The point read uses only
-/// `spans_table`; the search path (issue #57) uses everything.
+/// lifetime on the engine itself" shape. Every trace read is on the span
+/// design's tables: `spans`, `error_spans`, `traces` and `resources`.
 #[derive(Debug, Clone)]
 pub struct TraceReadConfig {
-    /// `trace_spans` (or `trace_spans_dist` when clustered — the caller
-    /// applies the same `_dist` rule as every other read engine's config).
-    pub spans_table: String,
-    /// `trace_attrs_idx{_dist}` — the attribute index the metrics and tag
-    /// reads still use; no search reads it.
-    pub attrs_table: String,
-    /// `trace_edges{_dist}` — the service-graph half-row ledger the
-    /// `service_graph` read targets (issue #173). `_dist`-suffixed when
-    /// clustered exactly like `spans_table`/`attrs_table` (halves co-shard
-    /// on `cityHash64(trace_id)`, so the query-time join is shard-local).
-    pub edges_table: String,
-    /// `trace_recent{_dist}` — the previous search engine's time-range
-    /// source (issue #560); no read uses it since #602 part 2c-2b-2, and
-    /// the table and this field go with #602 part 3.
-    pub recent_table: String,
-    /// `trace_error_spans{_dist}` — the previous search engine's
-    /// `{ status = error }` source (issue #560); unread the same way.
-    pub errors_table: String,
-    /// `spans{_dist}` — the trace fetch's span table (issue #587).
-    ///
-    /// **A third name beside [`Self::spans_table`], not a repurposing of
-    /// it.** `spans_table` still means `trace_spans` to the search,
-    /// metrics, tag and graph reads, which this part does not move. Same
-    /// `_dist` rule: the table co-shards on `cityHash64(trace_id)`.
+    /// `spans{_dist}` — the span table every search, fetch, metrics, tag
+    /// and service-graph read uses (issue #587). The table co-shards on
+    /// `cityHash64(trace_id)`; `_dist` when clustered, as every other read
+    /// engine's config.
     pub spans_v2_table: String,
     /// `error_spans{_dist}` — the error-span table (issue #601 part 4b):
     /// the search statement of a query
@@ -263,8 +234,8 @@ pub struct TraceReadConfig {
     /// A span with a parent left to follow past it answers `422`
     /// ([`TooBroadReason::TraceStructuralDepth`]).
     pub max_depth: u32,
-    /// `reader.traceql_max_series` (issue #182) — the metrics `by(...)`
-    /// distinct-series cap; the `LIMIT cap+1` probe breach → 422
+    /// `reader.traceql_max_series` (issue #182) — the metrics series cap;
+    /// the statement throws past it → 422
     /// ([`TooBroadReason::TraceMetricsSeriesCap`]).
     pub max_series: u64,
     /// Issue #398: `reader.traceql_read_max_memory_bytes` — the
@@ -348,7 +319,7 @@ pub struct SearchOutput {
 
 /// [`TraceEngine::service_graph`]'s output (issue #173): the aggregated
 /// service-graph edges, ordered `calls DESC, client ASC, server ASC`, at
-/// most [`graph_sql::SERVICE_GRAPH_MAX_EDGES`] of them; `truncated` is the
+/// most [`SERVICE_GRAPH_MAX_EDGES`] of them; `truncated` is the
 /// non-silent cap indicator — `true` iff the `LIMIT cap + 1` probe row
 /// appeared (the search path's convention).
 #[derive(Debug, Clone, PartialEq)]
@@ -506,7 +477,8 @@ pub struct TagValues {
 
 /// Charged before a search response's trace buffer is reserved at `n`
 /// entries: the buffer's slots and one entry's overhead (issue #591 part 3
-/// shares it between today's engine and the search statement's decode).
+/// shared it between the previous search engine and the search statement's
+/// decode).
 pub(crate) fn output_reserve_bytes(n: usize) -> usize {
     n * std::mem::size_of::<TraceSearchResult>() + RETAINED_ENTRY_OVERHEAD
 }
@@ -764,12 +736,8 @@ impl TraceEngine {
     /// The metrics planning context this engine's configuration implies —
     /// callers feed it to [`super::metrics_plan::plan_trace_metrics`]
     /// (issue #59).
-    pub fn metrics_ctx(&self) -> MetricsCtx<'_> {
+    pub fn metrics_ctx(&self) -> MetricsCtx {
         MetricsCtx {
-            filter: super::filter::SpanFilterCtx {
-                spans_table: &self.config.spans_table,
-                attrs_table: &self.config.attrs_table,
-            },
             scan_budget_rows: self.config.scan_budget_rows,
             max_series: self.config.max_series,
             distributed: self.config.distributed,
@@ -777,902 +745,11 @@ impl TraceEngine {
         }
     }
 
-    /// Executes a metrics range plan (issue #59): one fully-pushed-down
-    /// time-bucketed query — bucketing, replay-deduped counting, and time
-    /// pruning all happen in ClickHouse; the engine frames exactly
-    /// `range_axis().points` `(t_ms, value)` samples per densified series
-    /// (at most `MAX_METRICS_POINTS + 1`; the plan enforced the cap
-    /// statically) and applies the explicit encode-boundary conversions
-    /// (`n as f64`, rate ÷ the step in fractional seconds; the row's
-    /// `t_ms` is already the millisecond point unit the encoder consumes —
-    /// issue #59 re-audit, `Int64` epoch-milliseconds).
-    ///
-    /// Membership follows the function (issue #477 (a)): an ungrouped
-    /// `rate`/`count_over_time` always returns its one series, zero-filled
-    /// where nothing matched; the value aggregations, the grouped shapes,
-    /// `quantile_over_time`, `histogram_over_time` and `compare()` return
-    /// an empty series list when nothing matched.
-    pub async fn metrics_range(
-        &self,
-        plan: &TraceMetricsPlan,
-    ) -> Result<TraceMetricsResult, ReadError> {
-        let mut result = self.frame_range(plan).await?;
-        // P5: attach exemplars and apply the topk/bottomk second-stage
-        // reduction (issue #182).
-        //
-        // Issue #477 (c) turns exemplars on by DEFAULT, so this is now a
-        // second ClickHouse statement on every range panel rather than
-        // only under a `with()` hint. The skip below is what bounds that:
-        // a frame whose samples are all zero has no bucket an exemplar
-        // could belong to, and after densification an empty answer is a
-        // full grid of zeros — exactly the shape a sparse panel produces
-        // most often. Checked against the FRAMED result, so it costs no
-        // extra query to decide.
-        if plan.exemplar_sql().is_some() && has_a_non_zero_sample(&result) {
-            self.attach_range_exemplars(plan, &mut result).await?;
-        }
-        // P6b: the metrics-result comparison post-filter (`… > 5`).
-        if let Some(rf) = plan.result_filter() {
-            apply_result_filter(rf, &mut result);
-        }
-        if let Some(reduce) = plan.reduce() {
-            apply_series_reduce(reduce, &mut result);
-        }
-        Ok(result)
-    }
-
-    /// Frames the first-stage range result (before P5 exemplars/reduce),
-    /// then DENSIFIES it onto the plan's bucket axis (issue #477 (a)).
-    ///
-    /// The fill happens here, at the framing boundary, and never in SQL:
-    /// the query still groups only over rows that exist, and the missing
-    /// buckets are materialised from the window and the step, which are
-    /// already known. A ClickHouse-side gap fill, a second query, or a
-    /// wider scan would all be the wrong shape — emitting every bucket is
-    /// a rendering property, not a scan property.
-    async fn frame_range(&self, plan: &TraceMetricsPlan) -> Result<TraceMetricsResult, ReadError> {
-        self.enforce_series_cap(plan.range_probe_sql()).await?;
-        let mut result = self.frame_range_series(plan).await?;
-        if densifies(plan.kind()) {
-            let axis = plan.range_axis();
-            for series in &mut result.series {
-                densify(series, axis);
-            }
-        }
-        Ok(result)
-    }
-
-    /// The per-shape range framing, before densification.
-    async fn frame_range_series(
-        &self,
-        plan: &TraceMetricsPlan,
-    ) -> Result<TraceMetricsResult, ReadError> {
-        if plan.kind() == PlanKind::Compare {
-            let (cross_tab, totals) = plan
-                .compare_range()
-                .expect("compare plan carries range SQL");
-            return self
-                .frame_compare(cross_tab, totals, plan.compare_top_n())
-                .await;
-        }
-        let settings = metrics_settings(&self.config);
-        let sql = plan.range_sql();
-        match (plan.kind(), plan.group_label()) {
-            (PlanKind::Quantile, _) => {
-                // One series per requested quantile (`p=<q>`); the TDigest
-                // result array is ordered as requested. ns→seconds scale.
-                let quantiles = plan.quantiles();
-                let mut series: Vec<TraceMetricSeries> = quantiles
-                    .iter()
-                    .map(|q| TraceMetricSeries {
-                        labels: vec![MetricLabel::double("p", *q)],
-                        samples: Vec::new(),
-                        exemplars: Vec::new(),
-                    })
-                    .collect();
-                let mut stream = self
-                    .dispatch
-                    .query_stream::<MetricQuantileRow, _>(sql, &settings, |e| {
-                        map_trace_metrics_error(e, &self.config)
-                    })
-                    .await?;
-                while let Some(row) = stream.next().await {
-                    let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
-                    for (i, s) in series.iter_mut().enumerate() {
-                        let v = row.qs.get(i).copied().unwrap_or(0.0);
-                        s.samples.push((row.t_ms, agg_value(finite_or_zero(v))));
-                    }
-                }
-                if series.iter().all(|s| s.samples.is_empty()) {
-                    return Ok(TraceMetricsResult { series: vec![] });
-                }
-                Ok(TraceMetricsResult { series })
-            }
-            (PlanKind::Histogram, _) => {
-                // Issue #252: one PLAIN-TALLY series per power-of-two
-                // bucket that actually occurred (`__bucket=<seconds>`).
-                // No ladder, nothing cumulative, and a bucket with no
-                // spans anywhere in the window emits NO series at all —
-                // the reference creates a series on first observation of
-                // the key (`engine_metrics.go:788-793 @ v3.0.2`).
-                //
-                // The SQL orders by `(t, bucket)`, so collecting into a
-                // `BTreeMap` keyed by bucket keeps each series' samples
-                // in timestamp order without a second sort.
-                let mut by_bucket: BTreeMap<u64, Vec<(i64, f64)>> = BTreeMap::new();
-                let mut stream = self
-                    .dispatch
-                    .query_stream::<MetricLog2BucketRow, _>(sql, &settings, |e| {
-                        map_trace_metrics_error(e, &self.config)
-                    })
-                    .await?;
-                while let Some(row) = stream.next().await {
-                    let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
-                    by_bucket
-                        .entry(row.bucket_ns)
-                        .or_default()
-                        .push((row.t_ms, row.n as f64));
-                }
-                if by_bucket.is_empty() {
-                    return Ok(TraceMetricsResult { series: vec![] });
-                }
-                let mut series: Vec<TraceMetricSeries> = by_bucket
-                    .into_iter()
-                    .map(|(bucket_ns, samples)| TraceMetricSeries {
-                        labels: vec![MetricLabel::double(
-                            "__bucket",
-                            log2_histogram::bucket_seconds(bucket_ns),
-                        )],
-                        samples,
-                        exemplars: Vec::new(),
-                    })
-                    .collect();
-                sort_histogram_series_by_bucket_ascending(&mut series);
-                Ok(TraceMetricsResult { series })
-            }
-            (kind, None) => {
-                let mut samples: Vec<(i64, f64)> = Vec::new();
-                match kind {
-                    PlanKind::Count { is_rate } => {
-                        let denom = plan.step_seconds();
-                        let mut stream = self
-                            .dispatch
-                            .query_stream::<MetricBucketRow, _>(sql, &settings, |e| {
-                                map_trace_metrics_error(e, &self.config)
-                            })
-                            .await?;
-                        while let Some(row) = stream.next().await {
-                            let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
-                            samples.push((row.t_ms, count_value(is_rate, row.n, denom)));
-                        }
-                    }
-                    PlanKind::Agg(_) => {
-                        let mut stream = self
-                            .dispatch
-                            .query_stream::<MetricAggRow, _>(sql, &settings, |e| {
-                                map_trace_metrics_error(e, &self.config)
-                            })
-                            .await?;
-                        while let Some(row) = stream.next().await {
-                            let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
-                            samples.push((row.t_ms, agg_value(row.v)));
-                        }
-                    }
-                    PlanKind::Quantile | PlanKind::Histogram | PlanKind::Compare => {
-                        unreachable!("quantile/histogram are framed above")
-                    }
-                }
-                // Issue #477 (a): membership is per function. An ungrouped
-                // `rate`/`count_over_time` ALWAYS emits its one `__name__`
-                // series, even with no matching row anywhere in the window
-                // — densification then fills every bucket with a zero the
-                // encoder omits, and the datasource reads an absent value
-                // back as zero, which is the right answer. The value
-                // aggregations stay sparse and keep returning nothing:
-                // measured, the reference answers `{"series":[]}` for a
-                // no-match `avg_over_time` and a zero-filled series for a
-                // no-match `rate`.
-                if samples.is_empty() && !matches!(kind, PlanKind::Count { .. }) {
-                    return Ok(TraceMetricsResult { series: vec![] });
-                }
-                Ok(TraceMetricsResult {
-                    series: vec![TraceMetricSeries {
-                        labels: vec![MetricLabel::str("__name__", plan.metric_name())],
-                        samples,
-                        exemplars: vec![],
-                    }],
-                })
-            }
-            (kind, Some(label)) => {
-                // Grouped: collect samples per group value into a
-                // deterministic (BTreeMap-ordered) set of labelled series.
-                let mut by_group: BTreeMap<String, Vec<(i64, f64)>> = BTreeMap::new();
-                match kind {
-                    PlanKind::Count { is_rate } => {
-                        let denom = plan.step_seconds();
-                        let mut stream = self
-                            .dispatch
-                            .query_stream::<MetricGroupCountRow, _>(sql, &settings, |e| {
-                                map_trace_metrics_error(e, &self.config)
-                            })
-                            .await?;
-                        while let Some(row) = stream.next().await {
-                            let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
-                            by_group
-                                .entry(row.g0)
-                                .or_default()
-                                .push((row.t_ms, count_value(is_rate, row.n, denom)));
-                        }
-                    }
-                    PlanKind::Agg(_) => {
-                        let mut stream = self
-                            .dispatch
-                            .query_stream::<MetricAggGroupRow, _>(sql, &settings, |e| {
-                                map_trace_metrics_error(e, &self.config)
-                            })
-                            .await?;
-                        while let Some(row) = stream.next().await {
-                            let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
-                            by_group
-                                .entry(row.g0)
-                                .or_default()
-                                .push((row.t_ms, agg_value(row.v)));
-                        }
-                    }
-                    PlanKind::Quantile | PlanKind::Histogram | PlanKind::Compare => {
-                        unreachable!("quantile/histogram are framed above")
-                    }
-                }
-                Ok(TraceMetricsResult {
-                    series: by_group
-                        .into_iter()
-                        .map(|(g, samples)| TraceMetricSeries {
-                            labels: vec![MetricLabel::str(label, g)],
-                            samples,
-                            exemplars: vec![],
-                        })
-                        .collect(),
-                })
-            }
-        }
-    }
-
-    /// Runs the grouped-query distinct-by-key series probe (issue #182):
-    /// a `cap+1` result is a static `422 query_too_broad`
-    /// ([`TooBroadReason::TraceMetricsSeriesCap`]). Ungrouped plans have
-    /// no probe and return immediately.
-    ///
-    /// The probe is PASSED IN rather than read off the plan (issue #477):
-    /// the two routes count over different windows, so the range path
-    /// hands it [`TraceMetricsPlan::range_probe_sql`] and the instant path
-    /// [`TraceMetricsPlan::instant_probe_sql`]. Reading one accessor here
-    /// is what made the range answer's cap countable only over the
-    /// instant window.
-    async fn enforce_series_cap(&self, probe: Option<&str>) -> Result<(), ReadError> {
-        let Some(probe) = probe else {
-            return Ok(());
-        };
-        let cap = self.config.max_series;
-        let settings = metrics_settings(&self.config);
-        let mut count: u64 = 0;
-        // Scoped stream: the probe returns exactly one `count()` row.
-        let mut stream = self
-            .dispatch
-            .query_stream::<MetricCountRow, _>(probe, &settings, |e| {
-                map_trace_metrics_error(e, &self.config)
-            })
-            .await?;
-        while let Some(row) = stream.next().await {
-            count = row.map_err(|e| map_trace_metrics_error(e, &self.config))?.n;
-        }
-        if count > cap {
-            return Err(ReadError::QueryTooBroad(
-                TooBroadReason::TraceMetricsSeriesCap { count, cap },
-            ));
-        }
-        Ok(())
-    }
-
-    /// Frames a `compare()` result (issue #182 P6b) from its cross-tab and
-    /// totals queries into the captured Tempo meta-series shape: per
-    /// attribute `(key, value)` a `baseline` (all outer spans) and a
-    /// `selection` (`is_sel`) series; per key a `key=nil` complement
-    /// (`total − Σ present`) and the `baseline_total`/`selection_total`
-    /// denominators (`__meta_type` label + one attribute label).
-    ///
-    /// Fully data-driven: this loop enumerates whatever `(key, value)` the
-    /// cross-tab emits and the well-known loop below only fills in keys with
-    /// zero present rows. Issue #189 wires the cross-tab to emit real values
-    /// for `statusMessage`/`rootName`/`rootServiceName` (see
-    /// [`super::metrics_sql::metrics_compare_sql`]) — those keys are now
-    /// data-driven-when-present here with no per-key branch, and only remain
-    /// well-known-`nil` when fully absent (`instrumentation:name`/
-    /// `instrumentation:version` still always `nil` pending #179).
-    ///
-    /// # `top_n` (issue #460)
-    ///
-    /// `compare()`'s second argument, defaulting to **10** in the
-    /// reference's own grammar (`expr.y:324`), so it bites on the
-    /// one-argument form too. Per attribute AND per side independently,
-    /// that side's distinct values are ranked by the sum of their counts
-    /// over the whole window and only the top `top_n` are emitted
-    /// (`engine_metrics_compare.go:234-256` — `addValues` builds a
-    /// per-side `topN` and calls `top.get(m.topN, …)`, whose key is
-    /// `Σ values`). Trimmed values are **dropped, not folded**: they stay
-    /// in `key_bucket_sum`, so the `key=nil` complement and the `*_total`
-    /// denominators are unchanged.
-    ///
-    /// Ties are broken here by ascending value string. The reference's
-    /// order under a tie is `sort.Slice`, which is not stable, so its own
-    /// survivors are arbitrary (measured twice, two different arbitrary
-    /// sets); ours is deterministic, which is a deliberate refinement —
-    /// ledger `traceql-compare-topn-tie-order`.
-    ///
-    /// # The error series we deliberately do NOT emit
-    ///
-    /// When a key exceeds `topN` the reference's raw job also emits a
-    /// series labelled with its `internalLabelErrorTooManyValues`
-    /// (`engine_metrics_compare.go:28,252-267` @ v3.0.2), carrying
-    /// `Values: nil`. It is **unreachable on the wire**:
-    /// `SeriesSet.ToProto` drops zero-sample series
-    /// (`engine_metrics.go:380-383`), and it is measured absent from the
-    /// container's response body at `topN` 1 and 3. Emitting one here
-    /// would therefore be a divergence from what a user actually sees, so
-    /// this function emits none.
-    ///
-    /// **That is checkable, and the check's own scope is the point.** The
-    /// label name appears in no production source in this workspace; the
-    /// exact command, its domain and its one carve-out are recorded beside
-    /// the assertion that consumes them, in
-    /// `crates/pulsus-read/tests/compare_arity_differential.rs` — which is
-    /// the one file that must name the label, in order to assert its
-    /// absence from a rendered body.
-    ///
-    /// Cost: the ranking runs over rows [`Self::enforce_series_cap`] has
-    /// already bounded to `reader.traceql_max_series` distinct
-    /// `(key, value)` pairs, with no extra query and no extra round trip.
-    async fn frame_compare(
-        &self,
-        cross_tab_sql: &str,
-        totals_sql: &str,
-        top_n: usize,
-    ) -> Result<TraceMetricsResult, ReadError> {
-        let settings = metrics_settings(&self.config);
-        // (key, value) -> [(t, base_n, sel_n)]; (key, t) -> Σ present.
-        let mut per_kv: BTreeMap<(String, String), CompareValueBuckets> = BTreeMap::new();
-        let mut key_bucket_sum: BTreeMap<(String, i64), (u64, u64)> = BTreeMap::new();
-        let mut keys: BTreeSet<String> = BTreeSet::new();
-        {
-            let mut stream = self
-                .dispatch
-                .query_stream::<CompareCrossTabRow, _>(cross_tab_sql, &settings, |e| {
-                    map_trace_metrics_error(e, &self.config)
-                })
-                .await?;
-            while let Some(row) = stream.next().await {
-                let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
-                keys.insert(row.akey.clone());
-                per_kv
-                    .entry((row.akey.clone(), row.aval))
-                    .or_default()
-                    .push((row.t_ms, row.base_n, row.sel_n));
-                let e = key_bucket_sum.entry((row.akey, row.t_ms)).or_default();
-                e.0 += row.base_n;
-                e.1 += row.sel_n;
-            }
-        }
-        // Per-bucket baseline/selection totals (the denominators).
-        let mut totals: BTreeMap<i64, (u64, u64)> = BTreeMap::new();
-        {
-            let mut stream = self
-                .dispatch
-                .query_stream::<CompareTotalsRow, _>(totals_sql, &settings, |e| {
-                    map_trace_metrics_error(e, &self.config)
-                })
-                .await?;
-            while let Some(row) = stream.next().await {
-                let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
-                totals.insert(row.t_ms, (row.base_total, row.sel_total));
-            }
-        }
-
-        let mut series: Vec<TraceMetricSeries> = Vec::new();
-        let meta = |kind: &str, key: &str, val: &str| -> Vec<MetricLabel> {
-            vec![
-                MetricLabel::str("__meta_type", kind),
-                MetricLabel::str(key, val),
-            ]
-        };
-        // The per-key-per-side rank-and-keep buffers, reused across keys so
-        // the ranking allocates once rather than once per attribute. Both
-        // are bounded by the probe-capped distinct-pair count.
-        let mut rank_base: Vec<(u64, &str)> = Vec::new();
-        let mut rank_sel: Vec<(u64, &str)> = Vec::new();
-        for key in &keys {
-            // topN (issue #460): rank this key's present values on EACH
-            // side by that side's window sum, keep the top `top_n`.
-            rank_base.clear();
-            rank_sel.clear();
-            for ((k, val), rows) in per_kv.range((key.clone(), String::new())..) {
-                if k != key {
-                    break;
-                }
-                let (bsum, ssum) = rows
-                    .iter()
-                    .fold((0u64, 0u64), |(b, s), (_, rb, rs)| (b + rb, s + rs));
-                rank_base.push((bsum, val.as_str()));
-                rank_sel.push((ssum, val.as_str()));
-            }
-            let keep_base = keep_top_n(&mut rank_base, top_n);
-            let keep_sel = keep_top_n(&mut rank_sel, top_n);
-
-            // Present values: one baseline + one selection series each,
-            // emitted only for that side's kept set.
-            for ((k, val), rows) in per_kv.range((key.clone(), String::new())..) {
-                if k != key {
-                    break;
-                }
-                if keep_base.contains(val) {
-                    let base: Vec<(i64, f64)> =
-                        rows.iter().map(|(t, b, _)| (*t, *b as f64)).collect();
-                    series.push(TraceMetricSeries {
-                        labels: meta("baseline", key, val),
-                        samples: base,
-                        exemplars: vec![],
-                    });
-                }
-                if keep_sel.contains(val) {
-                    let sel: Vec<(i64, f64)> =
-                        rows.iter().map(|(t, _, s)| (*t, *s as f64)).collect();
-                    series.push(TraceMetricSeries {
-                        labels: meta("selection", key, val),
-                        samples: sel,
-                        exemplars: vec![],
-                    });
-                }
-            }
-            // `key=nil` complement + the `*_total` denominators, per
-            // bucket. Built from the UNTRIMMED `key_bucket_sum`: a value
-            // topN dropped is gone, never folded into the complement or
-            // the denominator (`selection_total` stays the whole
-            // population, which is what the reference returns).
-            let mut base_nil = Vec::new();
-            let mut sel_nil = Vec::new();
-            let mut base_total = Vec::new();
-            let mut sel_total = Vec::new();
-            for (&t, &(bt, st)) in &totals {
-                let (bp, sp) = key_bucket_sum
-                    .get(&(key.clone(), t))
-                    .copied()
-                    .unwrap_or((0, 0));
-                base_nil.push((t, bt.saturating_sub(bp) as f64));
-                sel_nil.push((t, st.saturating_sub(sp) as f64));
-                base_total.push((t, bt as f64));
-                sel_total.push((t, st as f64));
-            }
-            series.push(TraceMetricSeries {
-                labels: meta("baseline", key, "nil"),
-                samples: base_nil,
-                exemplars: vec![],
-            });
-            series.push(TraceMetricSeries {
-                labels: meta("selection", key, "nil"),
-                samples: sel_nil,
-                exemplars: vec![],
-            });
-            series.push(TraceMetricSeries {
-                labels: meta("baseline_total", key, "nil"),
-                samples: base_total,
-                exemplars: vec![],
-            });
-            series.push(TraceMetricSeries {
-                labels: meta("selection_total", key, "nil"),
-                samples: sel_total,
-                exemplars: vec![],
-            });
-        }
-        // The well-known-absent-attribute universe (issue #182 review Fix
-        // 3): Tempo enumerates a fixed set of intrinsic/resource/OTLP-
-        // semconv keys even when no span carries them, as `key=nil`. For a
-        // fully-absent key every span lacks it, so `baseline`/`selection`
-        // `key=nil` equal the totals. Captured black-box + OTLP semconv
-        // (see [`WELL_KNOWN_COMPARE_KEYS`]). The `continue` below is what
-        // lets a now-data-driven well-known key (issue #189:
-        // `statusMessage`/`rootName`/`rootServiceName`) render its real
-        // present values instead — it is enumerated as `key=nil` here only
-        // when NO span carried it.
-        for &wk in super::metrics_plan::WELL_KNOWN_COMPARE_KEYS {
-            if keys.contains(wk) {
-                continue; // already enumerated from present data
-            }
-            let base_total: Vec<(i64, f64)> =
-                totals.iter().map(|(&t, &(b, _))| (t, b as f64)).collect();
-            let sel_total: Vec<(i64, f64)> =
-                totals.iter().map(|(&t, &(_, s))| (t, s as f64)).collect();
-            for kind in ["baseline", "baseline_total"] {
-                series.push(TraceMetricSeries {
-                    labels: meta(kind, wk, "nil"),
-                    samples: base_total.clone(),
-                    exemplars: vec![],
-                });
-            }
-            for kind in ["selection", "selection_total"] {
-                series.push(TraceMetricSeries {
-                    labels: meta(kind, wk, "nil"),
-                    samples: sel_total.clone(),
-                    exemplars: vec![],
-                });
-            }
-        }
-        // Drop all-zero meta-series (e.g. a selection value never appears
-        // under `baseline`) — matches Tempo's omission of empty series.
-        series.retain(|s| s.samples.iter().any(|(_, v)| *v != 0.0));
-        Ok(TraceMetricsResult { series })
-    }
-
-    /// Runs the exemplar-collection query (issue #182 P5) and attaches a
-    /// bounded `trace:id` exemplar per sampled span to the series it
-    /// belongs to. Each exemplar carries that series' value at its own
-    /// bucket and the span's own timestamp (only the trace reference is
-    /// emitted; the sampled `span_id` is not a wire field).
-    ///
-    /// The bucket lookup keys on the row's `t`, which after issue #477 (b)
-    /// is the RIGHT-CLOSED label — the same label the series' samples are
-    /// stamped with. A left-edge lookup returned the previous bucket's
-    /// value, which is the wrong number whenever the two buckets differ.
-    ///
-    /// **Which series** is decided by the row, not by position (issue
-    /// #477 wave 2). A grouped range answer is one series per group
-    /// value; attaching every row to `series.first_mut()` put the second
-    /// group's traces on the first group's line, and read the value out
-    /// of that first series — which for a densified shape is the `0.0`
-    /// of a bucket where that group had nothing, and for a sparse
-    /// aggregation is a bucket the series does not carry at all. Both
-    /// render as a measured zero. The SQL now returns `g0` for the
-    /// grouped shapes ([`TraceMetricsPlan::exemplar_group_label`]) and
-    /// the row is matched to the series carrying that label value.
-    ///
-    /// A row whose group has no series, or whose bucket the matched
-    /// series does not carry, is DROPPED rather than attached at `0.0`:
-    /// neither can arise from a consistent pair of statements over the
-    /// same rows and the same window, and a fabricated zero is worse than
-    /// a missing exemplar because it reads as a measurement.
-    ///
-    /// The SQL's `groupArraySample(k, …)` is a PER-BUCKET bound; the
-    /// resolved budget is a TOTAL (ruling 1 on issue #477), so the
-    /// collected list is thinned to it here — across every series, since
-    /// the budget is for the whole response.
-    async fn attach_range_exemplars(
-        &self,
-        plan: &TraceMetricsPlan,
-        result: &mut TraceMetricsResult,
-    ) -> Result<(), ReadError> {
-        let Some(exemplar_sql) = plan.exemplar_sql() else {
-            return Ok(());
-        };
-        if result.series.is_empty() {
-            return Ok(());
-        }
-        // Bucket label (ms) → the value of series `i` at that bucket.
-        let value_at: Vec<BTreeMap<i64, f64>> = result
-            .series
-            .iter()
-            .map(|s| s.samples.iter().copied().collect())
-            .collect();
-        let settings = metrics_settings(&self.config);
-        let sql = exemplar_sql;
-        // `(series index, exemplar)`, in bucket order, so the thinning
-        // stride below is taken over the whole response exactly as it was
-        // when every exemplar lived on one series.
-        let mut collected: Vec<(usize, MetricExemplar)> = Vec::new();
-        match plan.exemplar_key() {
-            ExemplarSeriesKey::Single => {
-                let mut stream = self
-                    .dispatch
-                    .query_stream::<MetricExemplarRow, _>(sql, &settings, |e| {
-                        map_trace_metrics_error(e, &self.config)
-                    })
-                    .await?;
-                while let Some(row) = stream.next().await {
-                    let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
-                    push_bucket_exemplars(&mut collected, 0, &value_at[0], row.t_ms, row.ex);
-                    decimate_if_full(&mut collected);
-                }
-            }
-            ExemplarSeriesKey::Group { label } => {
-                // Group value → the index of the series carrying it. Built
-                // from the framed answer, so a group the answer does not
-                // contain has nowhere to land and its rows are dropped.
-                let index: HashMap<&str, usize> = result
-                    .series
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, s)| series_label_value(s, label).map(|v| (v, i)))
-                    .collect();
-                let mut stream = self
-                    .dispatch
-                    .query_stream::<MetricGroupExemplarRow, _>(sql, &settings, |e| {
-                        map_trace_metrics_error(e, &self.config)
-                    })
-                    .await?;
-                while let Some(row) = stream.next().await {
-                    let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
-                    let Some(&i) = index.get(row.g0.as_str()) else {
-                        continue;
-                    };
-                    push_bucket_exemplars(&mut collected, i, &value_at[i], row.t_ms, row.ex);
-                    decimate_if_full(&mut collected);
-                }
-            }
-            ExemplarSeriesKey::Quantile => {
-                // No index: the join is numeric. Each sampled span goes to
-                // the `p=` series whose value at the span's OWN bucket is
-                // nearest the span's own duration.
-                let mut stream = self
-                    .dispatch
-                    .query_stream::<MetricQuantileExemplarRow, _>(sql, &settings, |e| {
-                        map_trace_metrics_error(e, &self.config)
-                    })
-                    .await?;
-                while let Some(row) = stream.next().await {
-                    let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
-                    push_quantile_exemplars(&mut collected, &value_at, row.t_ms, row.ex);
-                    decimate_if_full(&mut collected);
-                }
-            }
-            ExemplarSeriesKey::HistogramBucket => {
-                // Bucket bound → the index of the `__bucket` series
-                // carrying it. Keyed on the RENDERED label (the seconds
-                // double the framing put on the wire) so the join is the
-                // exact inverse of the construction, not a re-derivation.
-                let index: HashMap<u64, usize> = result
-                    .series
-                    .iter()
-                    .enumerate()
-                    .map(|(i, s)| (bucket_label(s).to_bits(), i))
-                    .collect();
-                let mut stream = self
-                    .dispatch
-                    .query_stream::<MetricLog2ExemplarRow, _>(sql, &settings, |e| {
-                        map_trace_metrics_error(e, &self.config)
-                    })
-                    .await?;
-                while let Some(row) = stream.next().await {
-                    let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
-                    let key = log2_histogram::bucket_seconds(row.bucket_ns).to_bits();
-                    let Some(&i) = index.get(&key) else {
-                        continue;
-                    };
-                    push_bucket_exemplars(&mut collected, i, &value_at[i], row.t_ms, row.ex);
-                    decimate_if_full(&mut collected);
-                }
-            }
-            ExemplarSeriesKey::CompareSide => {
-                // `(__meta_type, attribute key)` → series index, over the
-                // two TOTAL meta-types only: those are the series the
-                // reference attaches a comparison exemplar to. A key whose
-                // totals series the answer dropped (all-zero) has nowhere
-                // to land and its rows are dropped.
-                let index: HashMap<(&str, &str), usize> = result
-                    .series
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, s)| compare_total_series_key(s).map(|k| (k, i)))
-                    .collect();
-                let mut stream = self
-                    .dispatch
-                    .query_stream::<MetricCompareExemplarRow, _>(sql, &settings, |e| {
-                        map_trace_metrics_error(e, &self.config)
-                    })
-                    .await?;
-                while let Some(row) = stream.next().await {
-                    let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
-                    let kind = compare_total_meta_type(row.is_sel);
-                    let Some(&i) = index.get(&(kind, row.akey.as_str())) else {
-                        continue;
-                    };
-                    push_bucket_exemplars(&mut collected, i, &value_at[i], row.t_ms, row.ex);
-                    decimate_if_full(&mut collected);
-                }
-            }
-        }
-        thin_collected_exemplars(&mut collected, plan.exemplar_budget());
-        for series in result.series.iter_mut() {
-            series.exemplars.clear();
-        }
-        for (i, ex) in collected {
-            result.series[i].exemplars.push(ex);
-        }
-        Ok(())
-    }
-
-    /// Executes a metrics instant plan (issue #59): the same pushed-down
-    /// body over the requested window `[start, end)` with no bucketing —
-    /// exactly one row (`uniqExact` with no `GROUP BY`), returned as a
-    /// one-sample label-less vector; the instant `rate` denominator is
-    /// `end − start`. The caller stamps the
-    /// sample at [`TraceMetricsPlan::snapped_end_ms`].
-    pub async fn metrics_instant(
-        &self,
-        plan: &TraceMetricsPlan,
-    ) -> Result<TraceMetricsResult, ReadError> {
-        let mut result = self.frame_instant(plan).await?;
-        if let Some(rf) = plan.result_filter() {
-            apply_result_filter(rf, &mut result);
-        }
-        if let Some(reduce) = plan.reduce() {
-            apply_series_reduce(reduce, &mut result);
-        }
-        Ok(result)
-    }
-
-    /// Frames the first-stage instant result (before the P5 reduction).
-    async fn frame_instant(
-        &self,
-        plan: &TraceMetricsPlan,
-    ) -> Result<TraceMetricsResult, ReadError> {
-        self.enforce_series_cap(plan.instant_probe_sql()).await?;
-        if plan.kind() == PlanKind::Compare {
-            let (cross_tab, totals) = plan
-                .compare_instant()
-                .expect("compare plan carries instant SQL");
-            return self
-                .frame_compare(cross_tab, totals, plan.compare_top_n())
-                .await;
-        }
-        let settings = metrics_settings(&self.config);
-        let sql = plan.instant_sql();
-        let at_ms = plan.snapped_end_ms();
-        match (plan.kind(), plan.group_label()) {
-            (PlanKind::Quantile, _) => {
-                let quantiles = plan.quantiles();
-                let mut qs: Vec<f64> = Vec::new();
-                let mut stream = self
-                    .dispatch
-                    .query_stream::<MetricQuantileInstantRow, _>(sql, &settings, |e| {
-                        map_trace_metrics_error(e, &self.config)
-                    })
-                    .await?;
-                while let Some(row) = stream.next().await {
-                    qs = row
-                        .map_err(|e| map_trace_metrics_error(e, &self.config))?
-                        .qs;
-                }
-                Ok(TraceMetricsResult {
-                    series: quantiles
-                        .iter()
-                        .enumerate()
-                        .map(|(i, q)| {
-                            let v = agg_value(finite_or_zero(qs.get(i).copied().unwrap_or(0.0)));
-                            TraceMetricSeries {
-                                labels: vec![MetricLabel::double("p", *q)],
-                                samples: vec![(at_ms, v)],
-                                exemplars: vec![],
-                            }
-                        })
-                        .collect(),
-                })
-            }
-            (PlanKind::Histogram, _) => {
-                // The instant twin of the range arm: one plain tally per
-                // OCCUPIED power-of-two bucket over the whole snapped
-                // window (issue #252).
-                let mut series: Vec<TraceMetricSeries> = Vec::new();
-                let mut stream = self
-                    .dispatch
-                    .query_stream::<MetricLog2BucketInstantRow, _>(sql, &settings, |e| {
-                        map_trace_metrics_error(e, &self.config)
-                    })
-                    .await?;
-                while let Some(row) = stream.next().await {
-                    let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
-                    series.push(TraceMetricSeries {
-                        labels: vec![MetricLabel::double(
-                            "__bucket",
-                            log2_histogram::bucket_seconds(row.bucket_ns),
-                        )],
-                        samples: vec![(at_ms, row.n as f64)],
-                        exemplars: vec![],
-                    });
-                }
-                sort_histogram_series_by_bucket_ascending(&mut series);
-                Ok(TraceMetricsResult { series })
-            }
-            (kind, None) => {
-                // Ungrouped: exactly one row (aggregate with no GROUP BY).
-                let value = match kind {
-                    PlanKind::Count { is_rate } => {
-                        let denom = plan.window_seconds();
-                        let mut n: u64 = 0;
-                        let mut stream = self
-                            .dispatch
-                            .query_stream::<MetricCountRow, _>(sql, &settings, |e| {
-                                map_trace_metrics_error(e, &self.config)
-                            })
-                            .await?;
-                        while let Some(row) = stream.next().await {
-                            n = row.map_err(|e| map_trace_metrics_error(e, &self.config))?.n;
-                        }
-                        count_value(is_rate, n, denom)
-                    }
-                    PlanKind::Agg(_) => {
-                        // `any(...)` over an empty set yields no row; an
-                        // empty aggregate window is a 0-valued sample.
-                        let mut v: Option<f64> = None;
-                        let mut stream = self
-                            .dispatch
-                            .query_stream::<MetricAggInstantRow, _>(sql, &settings, |e| {
-                                map_trace_metrics_error(e, &self.config)
-                            })
-                            .await?;
-                        while let Some(row) = stream.next().await {
-                            v = Some(row.map_err(|e| map_trace_metrics_error(e, &self.config))?.v);
-                        }
-                        v.map(agg_value).unwrap_or(0.0)
-                    }
-                    PlanKind::Quantile | PlanKind::Histogram | PlanKind::Compare => {
-                        unreachable!("quantile/histogram are framed above")
-                    }
-                };
-                Ok(TraceMetricsResult {
-                    series: vec![TraceMetricSeries {
-                        labels: vec![MetricLabel::str("__name__", plan.metric_name())],
-                        samples: vec![(at_ms, value)],
-                        exemplars: vec![],
-                    }],
-                })
-            }
-            (kind, Some(label)) => {
-                let mut by_group: BTreeMap<String, f64> = BTreeMap::new();
-                match kind {
-                    PlanKind::Count { is_rate } => {
-                        let denom = plan.window_seconds();
-                        let mut stream = self
-                            .dispatch
-                            .query_stream::<MetricGroupCountInstantRow, _>(sql, &settings, |e| {
-                                map_trace_metrics_error(e, &self.config)
-                            })
-                            .await?;
-                        while let Some(row) = stream.next().await {
-                            let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
-                            by_group.insert(row.g0, count_value(is_rate, row.n, denom));
-                        }
-                    }
-                    PlanKind::Agg(_) => {
-                        let mut stream = self
-                            .dispatch
-                            .query_stream::<MetricAggGroupInstantRow, _>(sql, &settings, |e| {
-                                map_trace_metrics_error(e, &self.config)
-                            })
-                            .await?;
-                        while let Some(row) = stream.next().await {
-                            let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
-                            by_group.insert(row.g0, agg_value(row.v));
-                        }
-                    }
-                    PlanKind::Quantile | PlanKind::Histogram | PlanKind::Compare => {
-                        unreachable!("quantile/histogram are framed above")
-                    }
-                }
-                Ok(TraceMetricsResult {
-                    series: by_group
-                        .into_iter()
-                        .map(|(g, value)| TraceMetricSeries {
-                            labels: vec![MetricLabel::str(label, g)],
-                            samples: vec![(at_ms, value)],
-                            exemplars: vec![],
-                        })
-                        .collect(),
-                })
-            }
-        }
-    }
-
     /// Executes the §4.5 service-graph read (issue #173): one fully-pushed-
     /// down two-level aggregation over the `trace_edges` half-row ledger —
     /// per-side dedup, the within-`conn_type` `pair_id` equi-join, and the
     /// per-`(client, server, conn_type)` rollup all happen in ClickHouse; the
-    /// engine only frames at most [`graph_sql::SERVICE_GRAPH_MAX_EDGES`]
+    /// engine only frames at most [`SERVICE_GRAPH_MAX_EDGES`]
     /// edges. The `LIMIT cap + 1` probe row (never returned) flips
     /// `truncated` rather than shipping a silent subset. `max_rows_to_read =
     /// scan_budget_rows` (throw) bounds the join's scan/hash-table cost — a
@@ -1683,7 +760,7 @@ impl TraceEngine {
     /// dedup), so the result is byte-identical before and after
     /// `OPTIMIZE ... FINAL`.
     pub async fn service_graph(&self, window: GraphWindow) -> Result<ServiceGraph, ReadError> {
-        let cap = graph_sql::SERVICE_GRAPH_MAX_EDGES;
+        let cap = SERVICE_GRAPH_MAX_EDGES;
         let settings = graph_settings(&self.config);
         let target = if self.config.distributed {
             Some(self.graph_target(&settings).await?)
@@ -2208,7 +1285,7 @@ impl TraceEngine {
 /// clustered-reader settings first. The accepted, documented residual is
 /// block-granular enforcement — the driver may transiently hold at most
 /// one block, now hard-bounded by `max_block_size` rows ×
-/// [`crate::traces::filter::TRACE_STR_COL_CAP`]-capped string columns
+/// [`crate::traces::sql_text::TRACE_STR_COL_CAP`]-capped string columns
 /// (never a-priori row-unbounded); the Layer-2 retention counter is the
 /// binding bound on accumulated state across the whole request.
 ///
@@ -2476,54 +1553,6 @@ fn fetch_route_and_second(
     }
 }
 
-/// The Layer-1 settings every metrics query carries (issue #59 plan v2
-/// delta 3): the full search budget set ([`search_settings`]) plus the
-/// IN-set limits (`max_rows_in_set`/`max_bytes_in_set`, throw → code 191
-/// → 422 via the dedicated [`TooBroadReason::TraceMetricsSetRows`]).
-///
-/// **Which reads those set limits still bind.** The metrics statement
-/// builds sets only for the seven trace-level and nested-set fields (issue
-/// #594 part 5) and runs without set limits ([`statement_settings`]); the
-/// set limits bind the previous planner's reads and the narrowed
-/// tag-values read, which carries these same settings and keeps its own
-/// `(trace_id, span_id) IN (…)`.
-///
-/// Clustered mode additionally injects `distributed_product_mode='local'`,
-/// which rewrites an `IN (SELECT … FROM <table>_dist …)` to the **local**
-/// shard table — co-sharding on `cityHash64(trace_id)` makes each shard's
-/// answer exact and kills the `_dist`-inside-`_dist` double-distributed
-/// path. Its readers are `compare()`'s attribute enumeration, the narrowed
-/// tag-values read and the metrics statement's sets (#594 part 5, through
-/// [`statement_settings`]). (Honesty note: the time-bucket `GROUP BY`
-/// itself is *not* shard-local — buckets exist on every shard; the
-/// coordinator merges per-bucket partial states, bounded by the point
-/// cap × shards. Scale evidence routes to #25.)
-/// `compare()`'s per-attribute-per-side rank-and-keep (issue #460).
-///
-/// `ranked` holds one `(window sum, value)` entry per distinct value on
-/// ONE side of ONE attribute. It is ranked descending by sum and the top
-/// `top_n` values are returned. The ranking key is the reference's:
-/// `topN.add` sums a value's per-bucket counts and `topN.get` sorts
-/// descending (`engine_metrics_compare.go:535-563` @ v3.0.2).
-///
-/// **Ties are broken by ascending value string, and that tie order is
-/// OURS.** The reference sorts with `sort.Slice`, which is not stable, so
-/// among equal sums its survivors are arbitrary — measured twice on issue
-/// #460, two different arbitrary sets from the same input shape.
-/// Determinism is a deliberate refinement, ledgered as
-/// `traceql-compare-topn-tie-order`; no test may assert WHICH member of a
-/// tie survives, only how many do.
-///
-/// Sorts in place so the caller can reuse one buffer across attributes.
-fn keep_top_n(ranked: &mut [(u64, &str)], top_n: usize) -> BTreeSet<String> {
-    ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
-    ranked
-        .iter()
-        .take(top_n)
-        .map(|(_, v)| (*v).to_string())
-        .collect()
-}
-
 fn metrics_settings(config: &TraceReadConfig) -> QuerySettings {
     // `max_query_size` is already present, inherited from `search_settings`
     // — set again here (idempotent, `QuerySettings::set` overrides rather
@@ -2587,27 +1616,6 @@ fn graph_settings(config: &TraceReadConfig) -> QuerySettings {
     }
 }
 
-/// The explicit encode-boundary value conversion (issue #59 plan v2
-/// delta 5): the SQL side always ships the deduped `UInt64` count;
-/// Whether a range shape emits EVERY bucket in the window or only the
-/// occupied ones (issue #477 (a)).
-///
-/// Density follows the FUNCTION, not the query — measured against the
-/// reference over one window with interior and edge gaps:
-/// `count_over_time`, `rate`, `quantile_over_time`, `histogram_over_time`,
-/// `count_over_time by(name)` and every series of a `compare()` come back
-/// dense, while `sum`/`min`/`max`/`avg_over_time` come back sparse,
-/// grouped or not. A blanket fill would create four fresh divergences;
-/// the value aggregations are already correct and must be left alone.
-fn densifies(kind: PlanKind) -> bool {
-    match kind {
-        PlanKind::Count { .. } | PlanKind::Quantile | PlanKind::Histogram | PlanKind::Compare => {
-            true
-        }
-        PlanKind::Agg(_) => false,
-    }
-}
-
 /// Rewrites `series.samples` as exactly one sample per axis label, in
 /// ascending label order, taking the framed value where the query
 /// produced one and `0.0` where it did not.
@@ -2628,21 +1636,10 @@ fn densify(series: &mut TraceMetricSeries, axis: super::metrics_plan::RangeAxis)
     series.samples = dense;
 }
 
-/// Whether any framed sample carries a non-zero value — the precondition
-/// for issuing the exemplar query at all (issue #477 (c)).
-fn has_a_non_zero_sample(result: &TraceMetricsResult) -> bool {
-    result
-        .series
-        .iter()
-        .any(|s| s.samples.iter().any(|(_, v)| *v != 0.0))
-}
-
 /// The string value of `series`' label `key`, if it carries one.
 ///
-/// Grouped range series are labelled `MetricLabel::str(<by-key>, <group
-/// value>)` by `frame_range_series`, so this is the inverse of that
-/// construction and the join column between an exemplar row's `g0` and
-/// the series it belongs to (issue #477 wave 2).
+/// A comparison's series are labelled `MetricLabel::str(<key>, <value>)`,
+/// so this is the inverse of that construction.
 fn series_label_value<'a>(series: &'a TraceMetricSeries, key: &str) -> Option<&'a str> {
     series.labels.iter().find(|l| l.key == key).and_then(|l| {
         match &l.value {
@@ -2685,109 +1682,10 @@ fn push_bucket_exemplars(
     }
 }
 
-/// Places each sampled span of a `quantile_over_time` bucket row on the
-/// `p=` series nearest its own duration, and stamps it with that duration
-/// (issue #477 wave 2).
-///
-/// Two rules from the reference, both different from every other shape:
-///
-/// * **Placement** is nearest-value, not nearest-anything-else: the
-///   exemplar goes to the quantile whose value is closest to the span's
-///   duration, ties to the lowest index (`assignExemplarToQuantile`,
-///   `pkg/traceql/engine_metrics.go:2013-2031 @ v3.0.2` — a strict `<`
-///   keeps the first of equals).
-/// * **The value is the span's own duration**, not the series' sample.
-///   `quantile_over_time(duration)` records a real observed value
-///   (`exemplarDuration`, `pkg/traceql/ast_metrics.go:235-239 @ v3.0.2`)
-///   and only the NaN placeholders the counting shapes record are
-///   rewritten to the series sample at the end
-///   (`modules/frontend/combiner/metrics_query_range.go:278-305 @ v3.0.2`).
-///   The ns→seconds conversion is [`agg_value`], the same one the series
-///   values go through, so the comparison is between like units.
-///
-/// **The comparison is against the `p` values at the exemplar's OWN
-/// bucket — the numbers the panel draws beside it — and that is a
-/// deliberate divergence.** The reference compares against a distribution
-/// it never draws: it pools every interval's bucket counts into one map
-/// and takes the requested quantiles of THAT once per response
-/// (`aggregatedBuckets` / `quantileValues`,
-/// `pkg/traceql/engine_metrics.go:1933-1962 @ v3.0.2`), while the value
-/// each `p=` series carries is computed per interval from that interval's
-/// own buckets (`:1993`); placement then compares the exemplar against
-/// the pooled array (`:1996-2001`). So the series an exemplar is put on
-/// is chosen from numbers that series never carries, and where load
-/// varies across the window the two disagree. Its placement function is
-/// also unfinished rather than designed: the doc comment promises a `-1`
-/// "doesn't fit any quantile reasonably well" return and "reasonable
-/// bucket validation" (`:2010-2012`), and the body implements neither —
-/// `buckets` is dead past an emptiness check and the nearest index is
-/// always returned (`:2013-2031`). Ledgered as
-/// `traceql-metrics-quantile-exemplar-placement-domain` in
-/// docs/benchmarks/traces-differential-ledger.md, which cross-references
-/// `2026-08-05-traceql-quantile-over-time-tdigest` (issue #252): our `p=`
-/// values are already computed differently, so placing against our own
-/// values is what keeps an exemplar coherent with the series it sits on.
-///
-/// With one span in a bucket every quantile of that bucket is that span's
-/// duration, so every candidate ties and the lowest `p` wins. That is a
-/// property of degenerate input — one observation has no spread — not a
-/// defect in the rule.
-///
-/// A bucket no series carries drops the sample, exactly as
-/// [`push_bucket_exemplars`] does.
-fn push_quantile_exemplars(
-    collected: &mut Vec<(usize, MetricExemplar)>,
-    value_at: &[BTreeMap<i64, f64>],
-    t_ms: i64,
-    sampled: Vec<([u8; 16], i64, i64)>,
-) {
-    for (trace_id, ts_ns, duration_ns) in sampled {
-        let value = agg_value(duration_ns as f64);
-        let mut best: Option<(usize, f64)> = None;
-        for (i, series) in value_at.iter().enumerate() {
-            let Some(&q) = series.get(&t_ms) else {
-                continue;
-            };
-            let diff = (value - q).abs();
-            let better = match best {
-                Some((_, b)) => diff < b,
-                None => true,
-            };
-            if better {
-                best = Some((i, diff));
-            }
-        }
-        let Some((i, _)) = best else {
-            continue;
-        };
-        collected.push((
-            i,
-            MetricExemplar {
-                labels: vec![MetricLabel::str("trace:id", hex16(&trace_id))],
-                value,
-                timestamp_ms: ts_ns / 1_000_000,
-            },
-        ));
-    }
-}
-
-/// The `__meta_type` a `compare()` exemplar row's side names (issue #477
-/// wave 2): the reference attaches baseline samples to `baseline_total`
-/// and selection samples to `selection_total`, never to the per-value
-/// `baseline`/`selection` series
-/// (`pkg/traceql/engine_metrics_compare.go:296-301 @ v3.0.2`).
-fn compare_total_meta_type(is_sel: u8) -> &'static str {
-    if is_sel == 0 {
-        "baseline_total"
-    } else {
-        "selection_total"
-    }
-}
-
 /// The `(__meta_type, attribute key)` pair identifying a `compare()`
 /// TOTALS series, or `None` for any other series — the inverse of
-/// `frame_compare`'s `meta("baseline_total", key, "nil")` construction
-/// and the join column for a comparison exemplar row.
+/// [`frame_compare_rows`]' total-series labels and the join column for a
+/// comparison exemplar.
 fn compare_total_series_key(series: &TraceMetricSeries) -> Option<(&str, &str)> {
     let kind = series_label_value(series, "__meta_type")?;
     if kind != "baseline_total" && kind != "selection_total" {
@@ -3014,109 +1912,6 @@ fn thin_collected_exemplars(collected: &mut Vec<(usize, MetricExemplar)>, budget
     *collected = kept;
 }
 
-/// The count-path (`rate`/`count_over_time`) encode-boundary value:
-/// `rate` divides by its denominator (one bucket's width per range
-/// sample, the requested window's width for an instant) in `f64` here —
-/// never in SQL; `count_over_time` is the deduped count itself.
-///
-/// The denominator is **fractional seconds** (issue #477 (d)): a
-/// sub-second step, or an instant window narrower than a second, truncated
-/// to `0` under the old whole-second form and made every rate `inf`.
-fn count_value(is_rate: bool, n: u64, rate_denominator_seconds: f64) -> f64 {
-    if is_rate {
-        n as f64 / rate_denominator_seconds
-    } else {
-        n as f64
-    }
-}
-
-/// The value-aggregation (`*_over_time`) encode-boundary value: the
-/// `toFloat64`-cast aggregate over the physical `duration_ns` scaled
-/// nanoseconds→seconds (Tempo's duration-metric unit). Attribute value
-/// targets — when wired — will carry a unit scale of 1.
-///
-/// Issue #237 (settled — do NOT "fix" this like #232): the reference's
-/// ns→seconds conversion is the SINGLE-rounding `float64(ns) / 1e9`,
-/// not the two-rounding `float64(sec) + float64(nsec)/1e9` form that
-/// #232 established for the LogQL rate divisor (a different reference).
-/// Evidence of record: 17-significant-digit raw-wire captures from the
-/// pinned reference container (`grafana/tempo:3.0.2@sha256:cda87c21…`,
-/// the digest in `deploy/e2e/compose.single.yaml`, probed 2026-07-26)
-/// for six widths where the two forms differ by 1 ULP —
-/// 18_014_398_509_482_025 / _035 / _017, 1_088_608_058_291_172_412,
-/// 10_000_000_000_000_005 / _015 ns. Each emitted value is the shortest
-/// rendering of the single-rounding f64 at 17 significant digits, which
-/// no ≤16-digit formatter can produce and which determines the f64
-/// uniquely; every witness exceeds 2^53, so the int64→f64 cast is lossy
-/// and the (more accurate) two-rounding value would have been visibly
-/// different. Corroboration only (not proof — a response's exemplar
-/// label does not establish the numeric field's source path): the same
-/// bodies render the raw duration losslessly in an exemplar label while
-/// the numeric field carries the cast-first value, and the reference's
-/// own comparison operator brackets stored values at the single-rounding
-/// f64 (`>= L` matches, `> L` does not, for the 1_118_000_000 ns width).
-/// The claim is observed-behaviour only, at emitted-value granularity;
-/// no reference source was read. Applying #232's two-rounding fix here
-/// would INTRODUCE a 1-ULP divergence — the bit-exact pins in this
-/// file's tests carry paired `assert_ne!`s against that form and will
-/// fail loudly on such a change.
-fn agg_value(v: f64) -> f64 {
-    v / 1_000_000_000.0
-}
-
-/// Orders `histogram_over_time` series **ascending by bucket** — a
-/// deliberate divergence from the reference, ledgered as
-/// `2026-08-05-traceql-histogram-series-order` (docs/api.md §4.4.1).
-///
-/// The reference's `sortResponse`
-/// (`modules/frontend/combiner/metrics_query_range.go:245-266 @ v3.0.2`)
-/// compares `Label.Value.String()`, and that `Value` is a protobuf
-/// `AnyValue` whose `String()` is `proto.CompactTextString`
-/// (`pkg/tempopb/common/v1/common.pb.go:46 @ v3.0.2`), ending at gogo's
-/// `writeAny` `default:` arm — `fmt.Fprint`, i.e. Go's `%v`/`%g` for a
-/// `float64`. So its order is lexicographic on a RENDERING of the
-/// bucket, which is neither numeric nor the order of its own JSON body.
-/// Measured on the pinned container: spans at 1 µs, 16 µs, 1 ms and 1 s
-/// come back `1 ms, 1 µs, 1 s, 16 µs` (capture corpus `mixladder`).
-///
-/// That is a determinism device, not a semantic one, and a histogram is
-/// drawn smallest-bucket-first everywhere a user has seen one — so we
-/// emit ascending. **Series ORDER only**: labels, tallies, membership
-/// and non-cumulativity all match the reference exactly, and any client
-/// that reads the `__bucket` label rather than the array position sees
-/// no difference at all.
-///
-/// The range arm's `BTreeMap` and the instant arm's `ORDER BY bucket ASC`
-/// already yield this order; sorting here makes the guarantee local to
-/// the framing rather than an inherited property of two other places.
-pub fn sort_histogram_series_by_bucket_ascending(series: &mut [TraceMetricSeries]) {
-    series.sort_by(|a, b| bucket_label(a).total_cmp(&bucket_label(b)));
-}
-
-/// The `__bucket` label's value, or `-inf` for a series without one (a
-/// shape this framing never produces — it keeps the comparator total).
-fn bucket_label(series: &TraceMetricSeries) -> f64 {
-    series
-        .labels
-        .iter()
-        .find(|l| l.key == "__bucket")
-        .and_then(|l| match l.value {
-            MetricLabelValue::Double(d) => Some(d),
-            MetricLabelValue::Str(_) | MetricLabelValue::Int(_) | MetricLabelValue::Bool(_) => None,
-        })
-        .unwrap_or(f64::NEG_INFINITY)
-}
-
-/// Sanitizes a non-finite aggregate (e.g. `quantilesTDigest` over an empty
-/// bucket yields NaN) to `0.0` so the JSON encoder never emits `NaN`.
-fn finite_or_zero(v: f64) -> f64 {
-    if v.is_finite() { v } else { 0.0 }
-}
-
-/// Per-bucket `(t_ms, baseline_n, selection_n)` counts for one compare()
-/// attribute `(key, value)` (issue #182 P6b).
-type CompareValueBuckets = Vec<(i64, u64, u64)>;
-
 /// Lowercase hex of a 16-byte trace id (the `trace:id` exemplar label).
 fn hex16(bytes: &[u8; 16]) -> String {
     let mut s = String::with_capacity(32);
@@ -3124,137 +1919,6 @@ fn hex16(bytes: &[u8; 16]) -> String {
         s.push_str(&format!("{b:02x}"));
     }
     s
-}
-
-/// Applies a metrics-result comparison post-filter (`… > 5`, issue #182
-/// P6b): keeps only samples whose value satisfies `value <op> threshold`;
-/// series left empty are dropped.
-fn apply_result_filter(
-    filter: (pulsus_traceql::ComparisonOp, f64),
-    result: &mut TraceMetricsResult,
-) {
-    use pulsus_traceql::ComparisonOp;
-    let (op, threshold) = filter;
-    let keep = |v: f64| -> bool {
-        match op {
-            ComparisonOp::Eq => v == threshold,
-            ComparisonOp::Neq => v != threshold,
-            ComparisonOp::Gt => v > threshold,
-            ComparisonOp::Gte => v >= threshold,
-            ComparisonOp::Lt => v < threshold,
-            ComparisonOp::Lte => v <= threshold,
-            // Regex operators are rejected at parse time for result
-            // comparisons; treat defensively as no-match.
-            ComparisonOp::Re | ComparisonOp::Nre => false,
-        }
-    };
-    for s in &mut result.series {
-        s.samples.retain(|(_, v)| keep(*v));
-    }
-    result.series.retain(|s| !s.samples.is_empty());
-}
-
-/// Applies a `topk(n)`/`bottomk(n)` second-stage reduction (issue #182 P5)
-/// per timestamp over the series set: at each timestamp the `n` series
-/// with the largest (topk) / smallest (bottomk) value keep their sample;
-/// the rest drop it. Series left with no samples are removed. Ties break
-/// deterministically by series index.
-fn apply_series_reduce(reduce: super::metrics_plan::SeriesReduce, result: &mut TraceMetricsResult) {
-    use super::metrics_plan::SeriesReduce;
-    let (k, top) = match reduce {
-        SeriesReduce::TopK(n) => (n as usize, true),
-        SeriesReduce::BottomK(n) => (n as usize, false),
-    };
-    if k == 0 {
-        result.series.clear();
-        return;
-    }
-    // Every distinct timestamp across all series.
-    let mut timestamps: BTreeSet<i64> = BTreeSet::new();
-    for s in &result.series {
-        for (t, _) in &s.samples {
-            timestamps.insert(*t);
-        }
-    }
-    for t in timestamps {
-        // (series_idx, value) for series present at this timestamp.
-        let mut present: Vec<(usize, f64)> = result
-            .series
-            .iter()
-            .enumerate()
-            .filter_map(|(i, s)| {
-                s.samples
-                    .iter()
-                    .find(|(ts, _)| *ts == t)
-                    .map(|(_, v)| (i, *v))
-            })
-            .collect();
-        if present.len() <= k {
-            continue;
-        }
-        // Rank: topk keeps largest values; bottomk keeps smallest. Ties
-        // break by series index (ascending) deterministically.
-        present.sort_by(|a, b| {
-            let ord = a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal);
-            if top { ord.reverse() } else { ord }.then(a.0.cmp(&b.0))
-        });
-        let keep: HashSet<usize> = present.iter().take(k).map(|(i, _)| *i).collect();
-        for (i, s) in result.series.iter_mut().enumerate() {
-            if !keep.contains(&i) {
-                s.samples.retain(|(ts, _)| *ts != t);
-            }
-        }
-    }
-    result.series.retain(|s| !s.samples.is_empty());
-}
-
-#[cfg(test)]
-mod wire_literal {
-    /// A reference-captured wire rendering (issue #237). Nothing textual
-    /// or numeric leaves this module: every exit is a predicate. There is
-    /// no `value()`, no `tokens()`, and no raw-text accessor, conversion,
-    /// deref or formatting impl of any spelling — and this copy
-    /// deliberately has no text-accepting method at all, so a body assertion is not even
-    /// expressible here (no serialized body exists in this file's scope).
-    /// The whole block, including the attribute above it, is byte-frozen
-    /// by `the_wire_literal_module_is_byte_frozen`; it invokes no macro,
-    /// so no macro can be shadowed into it.
-    pub(crate) struct WireLiteral(&'static str);
-
-    impl WireLiteral {
-        pub(crate) const fn new(text: &'static str) -> Self {
-            Self(text)
-        }
-
-        /// True iff the captured text is EXACTLY what the locked encoder
-        /// emits for `want`: it parses bit-identically to `want` AND
-        /// `serde_json::to_string(&want)` reproduces it. This is the
-        /// per-row transcription pin for the captured table.
-        pub(crate) fn denotes(&self, want: f64) -> bool {
-            let parses = match self.0.parse::<f64>() {
-                Ok(v) => v.to_bits() == want.to_bits(),
-                Err(_) => false,
-            };
-            let renders = match serde_json::to_string(&want) {
-                Ok(s) => s == self.0,
-                Err(_) => false,
-            };
-            parses && renders
-        }
-
-        /// Significant digits of the captured rendering (leading and
-        /// trailing zeros stripped). A width only discriminates the two
-        /// rounding forms formatter-independently if this is 17.
-        pub(crate) fn significant_digits(&self) -> usize {
-            let mut digits = String::new();
-            for c in self.0.chars() {
-                if c.is_ascii_digit() {
-                    digits.push(c);
-                }
-            }
-            digits.trim_start_matches('0').trim_end_matches('0').len()
-        }
-    }
 }
 
 #[cfg(test)]
@@ -3312,61 +1976,9 @@ mod tests {
         assert_eq!(collected.len(), 100);
     }
 
-    /// Issue #460 AC 9 — under a TIE, only the CARDINALITY is a
-    /// specification.
-    ///
-    /// The reference's own survivors among equal counts are arbitrary
-    /// (`sort.Slice` is not stable; measured twice, two different sets),
-    /// so nothing here asserts which value lives. What is asserted is
-    /// `n_kept == min(top_n, distinct)` — and, separately, that OUR
-    /// choice is deterministic across runs, which is the refinement the
-    /// ledger records rather than a parity claim.
-    #[test]
-    fn the_topn_keep_is_cardinality_only_under_a_tie() {
-        let vals: Vec<String> = (0..12).map(|i| format!("v{i:02}")).collect();
-        let ranked: Vec<(u64, &str)> = vals.iter().map(|v| (7u64, v.as_str())).collect();
-        for top_n in [1usize, 3, 10, 11, 12, 13, 100] {
-            let mut buf = ranked.clone();
-            let kept = keep_top_n(&mut buf, top_n);
-            assert_eq!(
-                kept.len(),
-                top_n.min(vals.len()),
-                "top_n {top_n} over 12 equal-count values must keep min(top_n, 12)"
-            );
-            // Deterministic, not merely stable-looking: the same input
-            // gives the same set, from an INDEPENDENTLY shuffled buffer.
-            let mut shuffled: Vec<(u64, &str)> = ranked.iter().rev().copied().collect();
-            assert_eq!(
-                keep_top_n(&mut shuffled, top_n),
-                kept,
-                "top_n {top_n}: the kept set must not depend on input order"
-            );
-        }
-
-        // With DISTINCT sums the set itself is specified, and that is what
-        // the live differential's tie-free fixture relies on.
-        let mut distinct: Vec<(u64, &str)> = vals
-            .iter()
-            .enumerate()
-            .map(|(i, v)| (i as u64 + 1, v.as_str()))
-            .collect();
-        assert_eq!(
-            keep_top_n(&mut distinct, 3),
-            ["v09", "v10", "v11"]
-                .into_iter()
-                .map(str::to_string)
-                .collect::<BTreeSet<String>>()
-        );
-    }
-
     #[test]
     fn trace_read_config_is_cloneable_and_debuggable() {
         let config = TraceReadConfig {
-            spans_table: "trace_spans".to_string(),
-            attrs_table: "trace_attrs_idx".to_string(),
-            edges_table: "trace_edges".to_string(),
-            recent_table: "trace_recent".to_string(),
-            errors_table: "trace_error_spans".to_string(),
             spans_v2_table: "spans".to_string(),
             error_spans_table: "error_spans".to_string(),
             traces_table: "traces".to_string(),
@@ -3379,18 +1991,12 @@ mod tests {
             skip_unavailable_shards: false,
         };
         let clone = config.clone();
-        assert_eq!(clone.spans_table, "trace_spans");
-        assert_eq!(clone.attrs_table, "trace_attrs_idx");
-        assert!(format!("{config:?}").contains("trace_spans"));
+        assert_eq!(clone.spans_v2_table, "spans");
+        assert!(format!("{config:?}").contains("spans_v2_table: \"spans\""));
     }
 
     fn cfg() -> TraceReadConfig {
         TraceReadConfig {
-            spans_table: "trace_spans".to_string(),
-            attrs_table: "trace_attrs_idx".to_string(),
-            edges_table: "trace_edges".to_string(),
-            recent_table: "trace_recent".to_string(),
-            errors_table: "trace_error_spans".to_string(),
             spans_v2_table: "spans".to_string(),
             error_spans_table: "error_spans".to_string(),
             traces_table: "traces".to_string(),
@@ -3768,14 +2374,9 @@ mod tests {
     /// removes a stored span's copies itself.
     #[test]
     fn a_metrics_statement_keeps_final_only_when_it_numbers() {
-        use crate::traces::filter::SpanFilterCtx;
         use crate::traces::metrics_plan::MetricsParams;
         use crate::traces::spans::metrics::{StatementTables, plan_trace_metrics_routed};
         let ctx = crate::traces::metrics_plan::MetricsCtx {
-            filter: SpanFilterCtx {
-                spans_table: "trace_spans",
-                attrs_table: "trace_attrs_idx",
-            },
             scan_budget_rows: 50_000_000,
             max_series: 1_000,
             distributed: false,
@@ -3809,9 +2410,7 @@ mod tests {
                 &tables,
             )
             .unwrap_or_else(|e| panic!("{q}: {e}"));
-            let stmt = routed
-                .statement()
-                .unwrap_or_else(|| panic!("{q}: no statement"));
+            let stmt = routed.statement();
             assert_eq!(
                 statement_settings(&cfg(), stmt.keeps_final()).get("final"),
                 want,
@@ -3939,360 +2538,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn metric_values_convert_at_the_encode_boundary() {
-        assert_eq!(count_value(true, 120, 60.0), 2.0);
-        assert_eq!(count_value(false, 120, 60.0), 120.0);
-        assert_eq!(count_value(true, 0, 3_600.0), 0.0);
-        // Value aggregations scale duration ns → seconds.
-        assert_eq!(agg_value(2_000_000_000.0), 2.0);
-        assert_eq!(agg_value(0.0), 0.0);
-    }
-
-    use super::wire_literal::WireLiteral;
-
-    /// Reference-captured ns→seconds renderings (issue #237).
-    /// `grafana/tempo:3.0.2@sha256:cda87c21…`, probed 2026-07-26.
-    /// `(ns, seconds value, captured rendering, two-rounding rendering)`.
-    /// One copy per site by design — do NOT lift into a shared crate.
-    const REFERENCE_DURATION_SECONDS: &[(i64, f64, WireLiteral, WireLiteral)] = &[
-        // ≤16-digit group: 1 ULP apart; pinned by the reference's own
-        // comparison operator (`>= L` matches, `> L` does not).
-        (
-            1_118_000_000,
-            1.118,
-            WireLiteral::new("1.118"),
-            WireLiteral::new("1.1179999999999999"),
-        ),
-        (
-            1_122_000_000,
-            1.122,
-            WireLiteral::new("1.122"),
-            WireLiteral::new("1.1219999999999999"),
-        ),
-        (
-            1_128_000_000,
-            1.128,
-            WireLiteral::new("1.128"),
-            WireLiteral::new("1.1280000000000001"),
-        ),
-        (
-            1_235_000_000,
-            1.235,
-            WireLiteral::new("1.235"),
-            WireLiteral::new("1.2349999999999999"),
-        ),
-        (
-            31_952_000_000,
-            31.952,
-            WireLiteral::new("31.952"),
-            WireLiteral::new("31.951999999999998"),
-        ),
-        (
-            1_000_064_438,
-            1.000064438,
-            WireLiteral::new("1.000064438"),
-            WireLiteral::new("1.0000644379999999"),
-        ),
-        // 17-significant-digit group: the formatter-independent RAW-WIRE
-        // discriminators (#237 round 3). `ns > 2^53`, so the `int64->f64`
-        // cast is lossy and the two-rounding value is the correctly
-        // rounded one — the reference emitting the single-rounding value
-        // positively identifies a cast-first form.
-        (
-            18_014_398_509_482_025,
-            18_014_398.509_482_022,
-            WireLiteral::new("18014398.509482022"),
-            WireLiteral::new("18014398.509482026"),
-        ),
-        (
-            18_014_398_509_482_035,
-            18_014_398.509_482_037,
-            WireLiteral::new("18014398.509482037"),
-            WireLiteral::new("18014398.509482034"),
-        ),
-        (
-            18_014_398_509_482_017,
-            18_014_398.509_482_015,
-            WireLiteral::new("18014398.509482015"),
-            WireLiteral::new("18014398.50948202"),
-        ),
-        (
-            1_088_608_058_291_172_412,
-            1_088_608_058.291_172_3,
-            WireLiteral::new("1088608058.2911723"),
-            WireLiteral::new("1088608058.2911725"),
-        ),
-        (
-            10_000_000_000_000_005,
-            10_000_000.000_000_004,
-            WireLiteral::new("10000000.000000004"),
-            WireLiteral::new("10000000.000000006"),
-        ),
-        (
-            10_000_000_000_000_015,
-            10_000_000.000_000_017,
-            WireLiteral::new("10000000.000000017"),
-            WireLiteral::new("10000000.000000015"),
-        ),
-    ];
-
-    /// Exactly representable under both rounding forms — these prove
-    /// nothing on their own and exist only to catch a gross scaling
-    /// error. Bit-level only: integral-double JSON rendering is a
-    /// protojson number-format question (#263), not the ns→seconds
-    /// conversion #237 settles, so controls carry NO wire literal and are
-    /// never asserted as text.
-    const REFERENCE_DURATION_CONTROLS: &[(i64, f64)] = &[
-        (500_000_000, 0.5),
-        (1_500_000_000, 1.5),
-        (2_000_000_000, 2.0),
-    ];
-
-    /// The 17-significant-digit subset of `REFERENCE_DURATION_SECONDS`.
-    const SEVENTEEN_DIGIT_WIDTHS: &[i64] = &[
-        18_014_398_509_482_025,
-        18_014_398_509_482_035,
-        18_014_398_509_482_017,
-        1_088_608_058_291_172_412,
-        10_000_000_000_000_005,
-        10_000_000_000_000_015,
-    ];
-
-    /// Of those, the ones whose `int64->f64` cast is NOT an exact tie
-    /// (ulp = 4 in `[2^54, 2^55)`; `ns % 4 in {1, 3}`). These need no
-    /// round-half-to-even assumption anywhere in the chain.
-    const TIE_FREE_WIDTHS: &[i64] = &[
-        18_014_398_509_482_025,
-        18_014_398_509_482_035,
-        18_014_398_509_482_017,
-        1_088_608_058_291_172_412,
-    ];
-
-    /// The two-rounding form, transcribed ONLY so the tests can assert
-    /// the production code is NOT it (issues #237 / #232).
-    fn two_rounding_seconds(ns: i64) -> f64 {
-        (ns / 1_000_000_000) as f64 + (ns % 1_000_000_000) as f64 / 1e9
-    }
-
     // The `__bucket` rendering pins moved to
     // `traces::log2_histogram`'s own tests with the function itself
     // (issue #252) — `bucket_seconds` is no longer an `exec.rs` local.
-
-    /// Issue #252 (owner ruling, 2026-08-05): histogram series come out
-    /// ASCENDING BY BUCKET, whatever order the rows arrived in. The
-    /// reference's own order is lexicographic on a `%g` rendering of the
-    /// label and is neither numeric nor stable in any way a client could
-    /// use — a determinism device, ledgered as
-    /// `2026-08-05-traceql-histogram-series-order`. The captured
-    /// reference orders are pinned in `tests/traces_log2_reference.rs`
-    /// beside ours, so both sides are visible.
-    #[test]
-    fn histogram_series_are_emitted_ascending_by_bucket() {
-        let bucket = |ns: u64| TraceMetricSeries {
-            labels: vec![MetricLabel::double(
-                "__bucket",
-                log2_histogram::bucket_seconds(ns),
-            )],
-            samples: vec![(0, 1.0)],
-            exemplars: vec![],
-        };
-        // Deliberately shuffled, and spanning the renderings that make
-        // the reference's own comparator disagree with numeric order
-        // (2^10 and 2^14 render in exponent form under `%g`).
-        let mut series = vec![
-            bucket(1 << 20),
-            bucket(1 << 63),
-            bucket(2),
-            bucket(1 << 14),
-            bucket(1 << 10),
-        ];
-        sort_histogram_series_by_bucket_ascending(&mut series);
-        let ordered: Vec<f64> = series
-            .iter()
-            .map(|s| match s.labels[0].value {
-                MetricLabelValue::Double(d) => d,
-                _ => panic!("__bucket is a double"),
-            })
-            .collect();
-        let want: Vec<f64> = [2u64, 1 << 10, 1 << 14, 1 << 20, 1 << 63]
-            .into_iter()
-            .map(log2_histogram::bucket_seconds)
-            .collect();
-        assert_eq!(ordered, want);
-        // Ascending in the values themselves, not merely equal to a list.
-        assert!(ordered.windows(2).all(|w| w[0] < w[1]));
-    }
-
-    #[test]
-    fn agg_value_uses_the_references_single_rounding_conversion() {
-        for (ns, want, wire, t_wire) in REFERENCE_DURATION_SECONDS {
-            // Transcription guards: the two rendering columns must denote
-            // the two f64s, or every negative below is vacuous.
-            assert!(wire.denotes(*want), "{ns}: captured rendering");
-            assert!(
-                t_wire.denotes(two_rounding_seconds(*ns)),
-                "{ns}: two-rounding rendering"
-            );
-            // The two forms MUST disagree here, or the case proves nothing.
-            assert_ne!(
-                (*ns as f64 / 1e9).to_bits(),
-                two_rounding_seconds(*ns).to_bits(),
-                "{ns} ns must be a width where the two forms disagree"
-            );
-            assert_eq!(agg_value(*ns as f64).to_bits(), want.to_bits(), "{ns}");
-            assert_ne!(
-                agg_value(*ns as f64).to_bits(),
-                two_rounding_seconds(*ns).to_bits(),
-                "{ns}"
-            );
-        }
-        for (ns, want) in REFERENCE_DURATION_CONTROLS {
-            assert_eq!(agg_value(*ns as f64).to_bits(), want.to_bits(), "{ns}");
-            assert_eq!(
-                agg_value(*ns as f64).to_bits(),
-                two_rounding_seconds(*ns).to_bits(),
-                "{ns}"
-            );
-        }
-    }
-
-    /// Issue #237 round 3: pins the PROPERTY that makes the raw-wire
-    /// capture formatter-independent. A width only discriminates if its
-    /// reference rendering carries 17 significant digits (no <=16-digit
-    /// formatter can emit it) — and 17 digits forces `ns > 2^53`, hence a
-    /// lossy cast.
-    #[test]
-    fn the_seventeen_digit_witnesses_are_formatter_independent_discriminators() {
-        for ns in SEVENTEEN_DIGIT_WIDTHS {
-            let (_, want, wire, t_wire) = REFERENCE_DURATION_SECONDS
-                .iter()
-                .find(|(n, ..)| n == ns)
-                .expect("witness is in the captured table");
-            assert_eq!(wire.significant_digits(), 17, "{ns}");
-            // The two renderings denote distinct f64s (bit level, never a
-            // string comparison — #237 plan v4 §3).
-            assert!(wire.denotes(*ns as f64 / 1e9), "{ns}");
-            assert!(!t_wire.denotes(*ns as f64 / 1e9), "{ns}");
-            assert!(
-                *ns > (1i64 << 53),
-                "{ns}: a 17-digit witness must exceed 2^53"
-            );
-            assert_ne!(
-                (*ns as f64) as i64,
-                *ns,
-                "{ns}: the int64->f64 cast is lossy"
-            );
-            assert_eq!(agg_value(*ns as f64).to_bits(), want.to_bits(), "{ns}");
-            assert_ne!(
-                agg_value(*ns as f64).to_bits(),
-                two_rounding_seconds(*ns).to_bits(),
-                "{ns}"
-            );
-        }
-        for ns in TIE_FREE_WIDTHS {
-            assert_ne!(ns.rem_euclid(4), 2, "{ns}: cast must not be an exact tie");
-        }
-    }
-
-    /// The byte-frozen text of this file's `mod wire_literal` block,
-    /// including the `#[cfg(test)]` line above it (issue #237 Rule C,
-    /// upward-extended span). Regenerated only as a deliberate, reviewed
-    /// edit alongside the module itself.
-    const FROZEN_WIRE_LITERAL_EXEC: &[&str] = &[
-        "#[cfg(test)]",
-        "mod wire_literal {",
-        "    /// A reference-captured wire rendering (issue #237). Nothing textual",
-        "    /// or numeric leaves this module: every exit is a predicate. There is",
-        "    /// no `value()`, no `tokens()`, and no raw-text accessor, conversion,",
-        "    /// deref or formatting impl of any spelling — and this copy",
-        "    /// deliberately has no text-accepting method at all, so a body assertion is not even",
-        "    /// expressible here (no serialized body exists in this file's scope).",
-        "    /// The whole block, including the attribute above it, is byte-frozen",
-        "    /// by `the_wire_literal_module_is_byte_frozen`; it invokes no macro,",
-        "    /// so no macro can be shadowed into it.",
-        "    pub(crate) struct WireLiteral(&'static str);",
-        "",
-        "    impl WireLiteral {",
-        "        pub(crate) const fn new(text: &'static str) -> Self {",
-        "            Self(text)",
-        "        }",
-        "",
-        "        /// True iff the captured text is EXACTLY what the locked encoder",
-        "        /// emits for `want`: it parses bit-identically to `want` AND",
-        "        /// `serde_json::to_string(&want)` reproduces it. This is the",
-        "        /// per-row transcription pin for the captured table.",
-        "        pub(crate) fn denotes(&self, want: f64) -> bool {",
-        "            let parses = match self.0.parse::<f64>() {",
-        "                Ok(v) => v.to_bits() == want.to_bits(),",
-        "                Err(_) => false,",
-        "            };",
-        "            let renders = match serde_json::to_string(&want) {",
-        "                Ok(s) => s == self.0,",
-        "                Err(_) => false,",
-        "            };",
-        "            parses && renders",
-        "        }",
-        "",
-        "        /// Significant digits of the captured rendering (leading and",
-        "        /// trailing zeros stripped). A width only discriminates the two",
-        "        /// rounding forms formatter-independently if this is 17.",
-        "        pub(crate) fn significant_digits(&self) -> usize {",
-        "            let mut digits = String::new();",
-        "            for c in self.0.chars() {",
-        "                if c.is_ascii_digit() {",
-        "                    digits.push(c);",
-        "                }",
-        "            }",
-        "            digits.trim_start_matches('0').trim_end_matches('0').len()",
-        "        }",
-        "    }",
-        "}",
-    ];
-
-    /// Issue #237 residual R4, closed mechanically: `mod wire_literal`
-    /// (including the `#[cfg(test)]` attribute attached to it) is
-    /// byte-frozen against this file's own source. Any attribute above
-    /// it, added method, changed signature or changed body fails here —
-    /// the span extends upward to the previous column-0 `}` so an outer
-    /// attribute cannot sit outside the frozen text.
-    #[test]
-    fn the_wire_literal_module_is_byte_frozen() {
-        let src = include_str!("exec.rs");
-        let lines: Vec<&str> = src.lines().collect();
-        let mut mod_lines: Vec<usize> = Vec::new();
-        for (i, line) in lines.iter().enumerate() {
-            if line.trim() == "mod wire_literal {" {
-                mod_lines.push(i);
-            }
-        }
-        assert_eq!(mod_lines.len(), 1, "exactly one wire_literal module");
-        let m = mod_lines[0];
-        let mut e = None;
-        for (i, line) in lines.iter().enumerate().skip(m + 1) {
-            if *line == "}" {
-                e = Some(i);
-                break;
-            }
-        }
-        let e = e.expect("module closes at column 0");
-        let mut s = 0;
-        for i in (0..m).rev() {
-            if lines[i] == "}" {
-                s = i + 1;
-                break;
-            }
-        }
-        while s < m && lines[s].trim().is_empty() {
-            s += 1;
-        }
-        assert_eq!(
-            lines[s..=e].to_vec(),
-            FROZEN_WIRE_LITERAL_EXEC,
-            "mod wire_literal must stay byte-identical to the frozen text \
-             (issue #237; update both sides in the same commit, loudly)"
-        );
-    }
 
     #[test]
     fn a_timeout_is_never_reinterpreted_as_a_budget_error() {

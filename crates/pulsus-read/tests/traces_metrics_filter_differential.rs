@@ -47,11 +47,16 @@
 use std::process::Command;
 use std::time::Duration;
 
+use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+use opentelemetry_proto::tonic::common::v1::{AnyValue, InstrumentationScope, KeyValue, any_value};
+use opentelemetry_proto::tonic::resource::v1::Resource;
+use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings};
-use pulsus_read::traces::metrics_plan::{MetricsParams, plan_trace_metrics};
-use pulsus_read::{TraceEngine, TraceReadConfig};
+use pulsus_read::traces::metrics_plan::MetricsParams;
+use pulsus_read::{StatementTables, TraceEngine, TraceReadConfig, plan_trace_metrics_routed};
 use pulsus_schema::RenderCtx;
 use pulsus_schema_testkit::run_init;
+use pulsus_write::{TraceLandingRow, parse_trace_landing};
 
 /// Traces in the corpus — one parentless span each.
 const TRACES: u8 = 6;
@@ -86,11 +91,6 @@ fn ch_config(db: &str) -> ChConnConfig {
 fn engine_config() -> TraceReadConfig {
     TraceReadConfig {
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
-        spans_table: "trace_spans".to_string(),
-        attrs_table: "trace_attrs_idx".to_string(),
-        edges_table: "trace_edges".to_string(),
-        recent_table: "trace_recent".to_string(),
-        errors_table: "trace_error_spans".to_string(),
         spans_v2_table: "spans".to_string(),
         error_spans_table: "error_spans".to_string(),
         traces_table: "traces".to_string(),
@@ -164,40 +164,76 @@ fn corpus(base: i64) -> Vec<SpanDef> {
     out
 }
 
-async fn pulsus_insert(
-    client: &ChClient,
-    db: &str,
-    service: &str,
-    nonce: &[u8; 16],
-    spans: &[SpanDef],
-) {
-    let rows: Vec<String> = spans
-        .iter()
-        .map(|s| {
-            let parent = if s.index == 0 {
-                "0000000000000000".to_string()
-            } else {
-                hex(&sid(s.trace, 0))
-            };
-            format!(
-                "(toFixedString(unhex('{tid}'),16), toFixedString(unhex('{sid}'),8), \
-                 toFixedString(unhex('{parent}'),8), 'op', '{service}', {ts}, 1000000, 0, 1, 1, 'x')",
-                tid = hex(&tid(nonce, s.trace)),
-                sid = hex(&sid(s.trace, s.index)),
-                ts = s.ts_ns,
-            )
-        })
-        .collect();
-    exec(
-        client,
-        &format!(
-            "INSERT INTO {db}.trace_spans \
-             (trace_id, span_id, parent_id, name, service, timestamp_ns, duration_ns, \
-              status_code, kind, payload_type, payload) VALUES {}",
-            rows.join(", ")
-        ),
-    )
-    .await;
+/// Lands `spans` the way the product does: decoded by
+/// `parse_trace_landing` and written in one insert into `trace_landing`,
+/// whose views fill the span, per-trace and resource tables.
+async fn pulsus_insert(client: &ChClient, service: &str, nonce: &[u8; 16], spans: &[SpanDef]) {
+    let req = ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: Some(Resource {
+                attributes: vec![KeyValue {
+                    key: "service.name".to_string(),
+                    value: Some(AnyValue {
+                        value: Some(any_value::Value::StringValue(service.to_string())),
+                    }),
+                    ..KeyValue::default()
+                }],
+                dropped_attributes_count: 0,
+                entity_refs: Vec::new(),
+            }),
+            scope_spans: vec![ScopeSpans {
+                scope: Some(InstrumentationScope {
+                    name: "diff-scope".to_string(),
+                    version: "1.0.0".to_string(),
+                    ..InstrumentationScope::default()
+                }),
+                spans: spans
+                    .iter()
+                    .map(|s| Span {
+                        trace_id: tid(nonce, s.trace).to_vec(),
+                        span_id: sid(s.trace, s.index).to_vec(),
+                        parent_span_id: if s.index == 0 {
+                            Vec::new()
+                        } else {
+                            sid(s.trace, 0).to_vec()
+                        },
+                        name: "op".to_string(),
+                        kind: 1,
+                        start_time_unix_nano: s.ts_ns as u64,
+                        end_time_unix_nano: (s.ts_ns + 1_000_000) as u64,
+                        ..Span::default()
+                    })
+                    .collect(),
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    };
+    let landing = parse_trace_landing(&req, now_ns()).expect("the landing decode");
+    let received_ms = now_ns() / 1_000_000;
+    let mut rows: Vec<TraceLandingRow> = Vec::new();
+    rows.extend(
+        landing
+            .spans
+            .iter()
+            .cloned()
+            .map(|s| TraceLandingRow::span(received_ms, s)),
+    );
+    rows.extend(
+        landing
+            .resources
+            .iter()
+            .cloned()
+            .map(|r| TraceLandingRow::resource(received_ms, r)),
+    );
+    client
+        .insert_block_with(
+            "trace_landing",
+            &rows,
+            &QuerySettings::trace_landing_insert(&format!("nsdiff-{}", now_ns()), 1_048_576),
+        )
+        .await
+        .expect("the landing insert");
 }
 
 fn otlp_push(otlp_base: &str, service: &str, nonce: &[u8; 16], spans: &[SpanDef]) {
@@ -256,11 +292,11 @@ fn otlp_push(otlp_base: &str, service: &str, nonce: &[u8; 16], spans: &[SpanDef]
 }
 
 /// The sum of every non-null sample across every series our own engine
-/// returns for `q`. Built with `plan_trace_metrics` and executed through
-/// `TraceEngine` — never over hand-assembled SQL.
+/// returns for `q`. Built with `plan_trace_metrics_routed` and executed
+/// through `TraceEngine` — never over hand-assembled SQL.
 async fn pulsus_total(engine: &TraceEngine, q: &str, window: (i64, i64)) -> f64 {
     let query = pulsus_traceql::parse(q).unwrap_or_else(|e| panic!("{q} parses: {e:?}"));
-    let plan = plan_trace_metrics(
+    let plan = plan_trace_metrics_routed(
         &query,
         &MetricsParams {
             start_ns: window.0,
@@ -270,10 +306,17 @@ async fn pulsus_total(engine: &TraceEngine, q: &str, window: (i64, i64)) -> f64 
             floor_ns: i64::MIN,
         },
         &engine.metrics_ctx(),
+        &StatementTables {
+            spans: "spans",
+            error_spans: "error_spans",
+            resources: "resources",
+            traces: "traces",
+            indexed: &[],
+        },
     )
     .unwrap_or_else(|e| panic!("{q} plans: {e:?}"));
     engine
-        .metrics_range(&plan)
+        .metrics_range_routed(&plan)
         .await
         .unwrap_or_else(|e| panic!("{q} executes: {e}"))
         .series
@@ -421,7 +464,7 @@ async fn nested_set_root_counts_match_the_reference_on_a_shared_corpus() {
     let db = pulsus_testkit::test_db(&format!("pulsus_nsfilterdiff_it_{}", hex(&nonce)));
     init_db(&bootstrap, &db).await;
     let client = ChClient::new(ch_config(&db)).await.expect("connect db");
-    pulsus_insert(&client, &db, &service, &nonce, &spans).await;
+    pulsus_insert(&client, &service, &nonce, &spans).await;
     let engine = TraceEngine::new(
         ChClient::new(ch_config(&db)).await.expect("connect engine"),
         engine_config(),

@@ -8,7 +8,8 @@
 
 use pulsus_read::{GraphTarget, GraphWindow, SERVICE_GRAPH_MAX_EDGES, spans_graph_sql};
 
-/// `traces_graph_sql.rs`'s window: 2023-11-14 23:33 .. +3h, crossing a UTC
+/// The previous graph SQL's suite's window (it went, #602 part 3a):
+/// 2023-11-14 23:33 .. +3h, crossing a UTC
 /// day, so the bucket bounds and the minute rounding are pinned on both
 /// sides of midnight.
 const W: GraphWindow = GraphWindow {

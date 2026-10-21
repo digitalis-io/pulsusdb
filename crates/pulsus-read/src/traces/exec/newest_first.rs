@@ -276,11 +276,6 @@ mod tests {
     #[test]
     fn a_statement_keeps_final_only_when_it_numbers() {
         let cfg = TraceReadConfig {
-            spans_table: "trace_spans".to_string(),
-            attrs_table: "trace_attrs_idx".to_string(),
-            edges_table: "trace_edges".to_string(),
-            recent_table: "trace_recent".to_string(),
-            errors_table: "trace_error_spans".to_string(),
             spans_v2_table: "spans".to_string(),
             error_spans_table: "error_spans".to_string(),
             traces_table: "traces".to_string(),
@@ -332,11 +327,6 @@ mod tests {
             for nested in [false, true] {
                 for skip in [false, true] {
                     let cfg = TraceReadConfig {
-                        spans_table: "trace_spans".to_string(),
-                        attrs_table: "trace_attrs_idx".to_string(),
-                        edges_table: "trace_edges".to_string(),
-                        recent_table: "trace_recent".to_string(),
-                        errors_table: "trace_error_spans".to_string(),
                         spans_v2_table: "spans".to_string(),
                         error_spans_table: "error_spans".to_string(),
                         traces_table: "traces".to_string(),

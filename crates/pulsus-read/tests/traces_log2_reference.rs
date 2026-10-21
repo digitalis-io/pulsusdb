@@ -1,5 +1,5 @@
 //! Issue #252 AC3a/AC3b/AC8: the hermetic replay of the committed
-//! reference capture (`tests/golden/traces_metrics/log2_reference_capture.json`,
+//! reference capture (`tests/fixtures/log2_reference_capture.json`,
 //! `grafana/tempo:3.0.2@sha256:cda87c21…`, 2026-08-05).
 //!
 //! Three separate claims are pinned here, and they are different in kind:
@@ -42,9 +42,7 @@
 
 use std::collections::BTreeMap;
 
-use pulsus_read::traces::exec::sort_histogram_series_by_bucket_ascending;
 use pulsus_read::traces::log2_histogram::{bucket_seconds, log2_bucketize_ns};
-use pulsus_read::{MetricLabel, MetricLabelValue, TraceMetricSeries};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -81,7 +79,7 @@ struct CapturedQuantile {
 
 fn capture() -> Capture {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/golden/traces_metrics/log2_reference_capture.json");
+        .join("tests/fixtures/log2_reference_capture.json");
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
     serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {path:?}: {e}"))
 }
@@ -218,10 +216,12 @@ fn expected(table: &[(&str, &[u64])], name: &str) -> Vec<u64> {
         .to_vec()
 }
 
-/// AC8 under the owner's 2026-08-05 ruling: **our** order is ascending by
-/// bucket, and the reference's is pinned beside it as the ledgered
-/// divergence. Nothing is exempted and neither side is derived from the
-/// other, so a change on either fails here.
+/// AC8 under the owner's 2026-08-05 decision: **our** order is ascending by
+/// bucket — pinned live by `traces_query_v2_live.rs`'s
+/// `the_histogram_buckets` since the previous metrics SQL went (#602 part
+/// 3a) — and the reference's is pinned here as the ledgered
+/// divergence. Neither side is derived from the other: a change to ours
+/// fails there, a change to the reference's here.
 ///
 /// `mix16k` is the witness the ledger row rests on: a 16 µs span beside a
 /// 1 ms span — an ordinary corpus, not an exotic one — for which the
@@ -271,39 +271,6 @@ fn we_emit_ascending_by_bucket_and_the_reference_order_is_pinned_beside_it() {
             by_their_wire,
             expected(IF_SORTED_ON_THE_REFERENCE_WIRE_TEXT, &corpus.name),
             "{}: the order the reference's OWN wire text would give",
-            corpus.name
-        );
-
-        // OURS: ascending, always — framed the way the engine frames,
-        // through the production sort.
-        let mut series: Vec<TraceMetricSeries> = our_tallies(&corpus.durations_ns)
-            .into_iter()
-            .map(|(bucket_ns, n)| TraceMetricSeries {
-                labels: vec![MetricLabel::double("__bucket", bucket_seconds(bucket_ns))],
-                samples: vec![(0, n as f64)],
-                exemplars: vec![],
-            })
-            .collect();
-        sort_histogram_series_by_bucket_ascending(&mut series);
-        let ours: Vec<u64> = series
-            .iter()
-            .map(|s| {
-                let MetricLabelValue::Double(seconds) = s.labels[0].value else {
-                    panic!("__bucket is a double");
-                };
-                (seconds * 1e9).round() as u64
-            })
-            .collect();
-        let mut ascending = theirs.clone();
-        ascending.sort_unstable();
-        assert_eq!(
-            ours, ascending,
-            "{}: PulsusDB emits histogram series ascending by bucket",
-            corpus.name
-        );
-        assert!(
-            ours.windows(2).all(|w| w[0] < w[1]),
-            "{}: strictly ascending, {ours:?}",
             corpus.name
         );
     }
@@ -567,7 +534,8 @@ fn the_references_quantile_is_a_function_of_the_bucket_not_of_the_durations() {
     assert!(!u280.is_empty());
     // And the true p99 of the 300 ms corpus is 0.3 s, which the
     // reference reports as 0.536870912 s — 79% high. Our own value is
-    // pinned live (`traces_metrics_live.rs`), against real tDigest.
+    // pinned live (`traces_query_v2_live.rs`'s `the_quantile`), against
+    // tDigest.
     let p99 = u280
         .iter()
         .find(|(p, _)| *p == 0.99)

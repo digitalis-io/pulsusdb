@@ -2010,11 +2010,6 @@ async fn every_trace_engine_query_carries_the_memory_ceiling() {
     pulsus_testkit::assert_stores_agree(&run_db);
 
     let config = pulsus_read::TraceReadConfig {
-        spans_table: "trace_spans".to_string(),
-        attrs_table: "trace_attrs_idx".to_string(),
-        edges_table: "trace_edges".to_string(),
-        recent_table: "trace_recent".to_string(),
-        errors_table: "trace_error_spans".to_string(),
         spans_v2_table: "spans".to_string(),
         error_spans_table: "error_spans".to_string(),
         traces_table: "traces".to_string(),
@@ -2091,10 +2086,10 @@ async fn every_trace_engine_query_carries_the_memory_ceiling() {
         .await
         .expect("tag values");
 
-    // 5. A trace-metrics query — `metrics_settings`.
+    // 5. A trace-metrics query — `statement_settings`.
     let metric_query = pulsus_traceql::parse(r#"{ span.http.status_code = "500" } | rate()"#)
         .expect("metric query parses");
-    let metric_plan = pulsus_read::traces::metrics_plan::plan_trace_metrics(
+    let metric_plan = pulsus_read::plan_trace_metrics_routed(
         &metric_query,
         &pulsus_read::traces::metrics_plan::MetricsParams {
             start_ns: (ts_ns / 1_000_000_000 - 300) * 1_000_000_000,
@@ -2104,16 +2099,23 @@ async fn every_trace_engine_query_carries_the_memory_ceiling() {
             floor_ns: i64::MIN,
         },
         &engine.metrics_ctx(),
+        &pulsus_read::StatementTables {
+            spans: "spans",
+            error_spans: "error_spans",
+            resources: "resources",
+            traces: "traces",
+            indexed: &[],
+        },
     )
     .expect("metric query plans");
     engine
-        .metrics_range(&metric_plan)
+        .metrics_range_routed(&metric_plan)
         .await
         .expect("metrics range");
 
     // 6. The service graph — `graph_settings`.
     engine
-        .service_graph(pulsus_read::traces::graph_sql::GraphWindow {
+        .service_graph(pulsus_read::GraphWindow {
             start_ns: ts_ns - 3_600_000_000_000,
             end_ns: ts_ns + 3_600_000_000_000,
         })

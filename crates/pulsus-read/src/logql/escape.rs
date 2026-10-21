@@ -20,8 +20,9 @@
 //! non-LogQL consumer holds a named capability token carrying its
 //! justification (PromQL's SQL path deliberately defers to ClickHouse's
 //! RE2 as the regex authority). Issue #282 retired TraceQL's placeholder
-//! token by migrating `traces/filter.rs` to `_checked`, so the exemption
-//! list shrank rather than ossified.
+//! token by migrating `traces/filter.rs` to `_checked` (that renderer is
+//! `traces/sql_text.rs`'s since #602 part 3a), so the exemption list shrank
+//! rather than ossified.
 //!
 //! CONSTRAINED MODULE (issue #240). `tests/logqltest_provenance.rs` check D
 //! enforces BOTH halves of this, fail-closed:

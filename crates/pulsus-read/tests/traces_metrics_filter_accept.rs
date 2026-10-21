@@ -26,9 +26,10 @@
 //! disposition and passes here unchanged.** That is the break that
 //! motivated issue #458 — `LeafEval::NestedSet { .. } => Ok("1")` — and
 //! no accept-surface fixture can catch it, because the accept surface
-//! does not move. `traces_metrics_nested_set_live.rs` (AC 3b, the answer
-//! identity) and `traces_metrics_sql.rs` (AC 5, the golden SQL bytes) are
-//! the criteria that can. A gate that pretended otherwise would be worse
+//! does not move. `traces_query_v2_live.rs`'s `the_seven_filter_metrics`
+//! (the answer identity) and `traces_spans_metrics_sql.rs` (the golden SQL
+//! bytes) are the criteria that can; the two suites issue #458 named went
+//! with the previous metrics SQL (#602 part 3a). A gate that pretended otherwise would be worse
 //! than an honest limit.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -37,7 +38,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use pulsus_read::traces::metrics_plan::{MetricsCtx, MetricsParams};
-use pulsus_read::{SpanFilterCtx, StatementTables, plan_trace_metrics_routed};
+use pulsus_read::{StatementTables, plan_trace_metrics_routed};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -113,10 +114,6 @@ fn derive_ours(q: &str) -> Side {
             floor_ns: i64::MIN,
         },
         &MetricsCtx {
-            filter: SpanFilterCtx {
-                spans_table: "trace_spans",
-                attrs_table: "trace_attrs_idx",
-            },
             scan_budget_rows: 50_000_000,
             max_series: 1_000,
             distributed: false,
