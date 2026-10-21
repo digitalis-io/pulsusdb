@@ -1011,9 +1011,12 @@ fn store_config() -> TraceReadConfig {
     }
 }
 
+/// Two conditions, so the values read is the span read whose cut these cases
+/// pin and not the bucket catalogue a lone service equality answers from
+/// (issue #601 part 4b); every seeded span is a server span.
 fn store_request(start_ns: i64, end_ns: i64) -> pulsus_read::TagValuesRequest<'static> {
     pulsus_read::TagValuesRequest {
-        q: Some(r#"{resource.service.name="s1"}"#),
+        q: Some(r#"{resource.service.name="s1" && kind=server}"#),
         start_ns,
         end_ns,
     }

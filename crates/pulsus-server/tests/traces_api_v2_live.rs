@@ -4448,6 +4448,12 @@ fn long_key_spans_sql(base_ns: i64) -> String {
     )
 }
 
+/// The error-span table, from the spans, by `error_spans_mv`'s own `SELECT`
+/// (issue #601 part 4b).
+const ERROR_SPANS_FROM_SPANS: &str = "INSERT INTO error_spans SELECT trace_id, span_id, start_ns, \
+     duration_ns, end_ns, service, service_type, resource_id, name, kind, status_code, \
+     status_message FROM spans WHERE status_code = 2";
+
 /// The per-trace table from the spans, by `traces_mv`'s own `SELECT`.
 const TRACES_FROM_SPANS: &str = "INSERT INTO traces SELECT \
      toDate(fromUnixTimestamp64Nano(s), 'UTC') AS day, trace_id, \
@@ -4557,14 +4563,22 @@ async fn t_q3_a_search_returns_at_most_r6s_bound() {
     let _server = spawn_ready(port, &db);
     seed_by_sql(
         db.name(),
-        &[corpus_s_spans_sql(base), TRACES_FROM_SPANS.to_string()],
+        &[
+            corpus_s_spans_sql(base),
+            TRACES_FROM_SPANS.to_string(),
+            ERROR_SPANS_FROM_SPANS.to_string(),
+        ],
     )
     .await;
     let long_port = 31_593;
     let _long_server = spawn_ready(long_port, &long);
     seed_by_sql(
         long.name(),
-        &[long_key_spans_sql(base), TRACES_FROM_SPANS.to_string()],
+        &[
+            long_key_spans_sql(base),
+            TRACES_FROM_SPANS.to_string(),
+            ERROR_SPANS_FROM_SPANS.to_string(),
+        ],
     )
     .await;
     let key = "k".repeat(4000);

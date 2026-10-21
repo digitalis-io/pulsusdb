@@ -5679,6 +5679,12 @@ async fn fr_t_c4_a_tie_orders_by_trace_id() {
 /// Corpus S's three hours, ending at the test's own whole second.
 const CORPUS_S_NS: i64 = 10_800_000_000_000;
 
+/// The error-span table, from the spans, by `error_spans_mv`'s own `SELECT`
+/// (issue #601 part 4b).
+const ERROR_SPANS_FROM_SPANS: &str = "INSERT INTO error_spans SELECT trace_id, span_id, start_ns, \
+     duration_ns, end_ns, service, service_type, resource_id, name, kind, status_code, \
+     status_message FROM spans WHERE status_code = 2";
+
 /// The per-trace table, from the spans, by `traces_mv`'s own `SELECT`.
 const TRACES_FROM_SPANS: &str = "INSERT INTO traces SELECT toDate(fromUnixTimestamp64Nano(s), 'UTC') AS day, trace_id, \
      s AS start_ns, e AS end_ns, r AS root, sv AS services, \
@@ -5727,6 +5733,7 @@ async fn seed_corpus_s(db: String) -> (String, ChClient, WindowSql) {
     )
     .await;
     run_bounded(&client, TRACES_FROM_SPANS.to_string()).await;
+    run_bounded(&client, ERROR_SPANS_FROM_SPANS.to_string()).await;
     run_bounded(&client, format!("OPTIMIZE TABLE {SPANS_TABLE} FINAL")).await;
     let seeded = count(&client, &format!("SELECT count() AS n FROM {SPANS_TABLE}")).await;
     assert_eq!(seeded, 1_960_000, "corpus S seeds 1,960,000 spans");
@@ -8248,6 +8255,7 @@ async fn seed_long_keys(db: String) -> (String, ChClient, WindowSql) {
     )
     .await;
     run_bounded(&client, TRACES_FROM_SPANS.to_string()).await;
+    run_bounded(&client, ERROR_SPANS_FROM_SPANS.to_string()).await;
     let seeded = count(&client, &format!("SELECT count() AS n FROM {SPANS_TABLE}")).await;
     assert_eq!(seeded, 70_000, "70,000 spans");
     let w = WindowSql::start_closed_end_open(base_ns, base_ns + CORPUS_S_NS);
@@ -10992,6 +11000,7 @@ async fn seed_rare(db: String) -> (String, ChClient, (i64, i64)) {
     )
     .await;
     run_bounded(&client, TRACES_FROM_SPANS.to_string()).await;
+    run_bounded(&client, ERROR_SPANS_FROM_SPANS.to_string()).await;
     run_bounded(&client, format!("OPTIMIZE TABLE {SPANS_TABLE} FINAL")).await;
     (db, client, (base_ns, base_ns + 60_000_000_000))
 }
@@ -11782,6 +11791,7 @@ async fn seed_fixture_a(db: &str, attrs: &[&str]) -> (ChClient, (i64, i64)) {
     )
     .await;
     run_bounded(&client, TRACES_FROM_SPANS.to_string()).await;
+    run_bounded(&client, ERROR_SPANS_FROM_SPANS.to_string()).await;
     run_bounded(&client, format!("OPTIMIZE TABLE {SPANS_TABLE} FINAL")).await;
     (client, (base_ns, base_ns + 60_000_000_000))
 }
@@ -19879,7 +19889,7 @@ async fn a_retried_push_is_counted_once_in_the_error_table() {
     let stored = match client
         .query_strings(
             "SELECT concat(toString(count()), ' ', \
-             toString(uniqExact(trace_id, start_ns, span_id, kind))) FROM error_spans",
+             toString(uniqExact(trace_id, start_ns, span_id, kind))) AS s FROM error_spans",
             &QuerySettings::new(),
         )
         .await
