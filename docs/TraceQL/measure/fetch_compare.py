@@ -36,12 +36,15 @@ def varint(b, i):
 def fields(b):
     """(field, payload) of every length-delimited field of a message; the
     other wire types (0, 1, 5) are skipped. ValueError on anything that is
-    not a whole field: a length or fixed width past the end, a bad varint, or
-    a wire type other than 0, 1, 2 and 5 (3 and 4 are groups)"""
+    not a whole field: a length or fixed width past the end, a bad varint,
+    field number 0, or a wire type other than 0, 1, 2 and 5 (3 and 4 are
+    groups)"""
     i, out = 0, []
     while i < len(b):
         key, i = varint(b, i)
         f, wt = key >> 3, key & 7
+        if f == 0:
+            raise ValueError('field number 0')
         if wt == 2:
             n, i = varint(b, i)
             if i + n > len(b):
