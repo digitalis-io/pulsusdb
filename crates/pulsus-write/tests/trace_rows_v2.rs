@@ -1989,6 +1989,7 @@ async fn t_w6_a_throwing_view_fails_the_insert_and_its_target_holds_nothing() {
         "tag_values",
         "error_spans",
         "tag_bucket_values",
+        "service_bucket_resources",
     ] {
         let n = count(&client, &format!("SELECT count() AS n FROM {table}")).await;
         eprintln!("T-W6: {table} held {n} rows (recorded, asserted against nothing)");

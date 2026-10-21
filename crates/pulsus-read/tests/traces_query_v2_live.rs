@@ -18942,6 +18942,7 @@ async fn try_vals_4b(client: &ChClient, sql: &str) -> Result<Vec<(String, String
 struct Stmt4b {
     tables: Vec<String>,
     read_rows: u64,
+    read_bytes: u64,
 }
 
 /// The finished statements whose `query_id` starts with `prefix`, in issue
@@ -18957,7 +18958,7 @@ async fn statements_4b(client: &ChClient, prefix: &str) -> Vec<Stmt4b> {
             .await
             .expect("flush the logs");
         let sql = format!(
-            "SELECT tables, read_rows FROM system.query_log \
+            "SELECT tables, read_rows, read_bytes FROM system.query_log \
              WHERE type = 'QueryFinish' AND is_initial_query AND startsWith(query_id, '{prefix}-') \
              ORDER BY event_time_microseconds"
         );
@@ -19466,8 +19467,10 @@ async fn an_overflow_with_empty_edges_still_falls_back() {
 }
 
 /// T6 (issue #601 part 4b), a guard: **only a single service equality is
-/// admitted.** A second condition, a regex, a span condition, a resource
-/// key and a window inside one bucket each run today's statement alone.
+/// admitted.** A second condition, a regex, a span condition and a resource
+/// key each run one statement that does not read `tag_bucket_values`. (A
+/// window inside one bucket reads the catalogue since part 4c, whose T10c
+/// pins it.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn only_a_single_service_equality_is_admitted() {
     skip_unless_live!();
@@ -19501,22 +19504,12 @@ async fn only_a_single_service_equality_is_admitted() {
             (s, e),
         ),
         ("resource", "k8s.pod.name", Some("resource"), eq, (s, e)),
-        (
-            "inside",
-            "http.route",
-            Some("span"),
-            eq,
-            (
-                (b0 + 1) * BUCKET_4B + 5 * S_NS,
-                (b0 + 1) * BUCKET_4B + 250 * S_NS,
-            ),
-        ),
     ] {
         let (got, stmts) = values_request_4b(&db, &client, case, key, scope, q, w.0, w.1).await;
         eprintln!("T6 {case}: {got:?} in {stmts:?}");
         if got.is_err() || stmts.len() != 1 || read_table(&stmts, &db, "tag_bucket_values") {
             wrong.push(format!(
-                "{case}: {got:?} in {stmts:?}, expected today's one statement"
+                "{case}: {got:?} in {stmts:?}, expected one statement off the catalogue"
             ));
         }
     }
@@ -20050,5 +20043,778 @@ async fn the_error_sum_answers_as_written_by_hand() {
     assert!(
         read_table(&stmts, &db, "error_spans") && !read_table(&stmts, &db, "spans"),
         "error_spans read and spans not: {stmts:?}"
+    );
+}
+
+// =====================================================================
+// Issue #601 part 4c — the dedup wrap reads only what it names, a resource
+// label once per resource, resource values from a bucket catalogue
+// =====================================================================
+
+/// One span of fixture W: forty 256-byte attributes `pad.00` to `pad.39`,
+/// `http.route` and an int `size`.
+fn w_span(t: u8, sid: u8, at: i64, route: &str, size: i64, dur_ms: i64) -> Span {
+    let mut attrs: Vec<KeyValue> = (0..40)
+        .map(|i| {
+            kv(
+                &format!("pad.{i:02}"),
+                str_value(&format!("{i:02}{}", "x".repeat(254))),
+            )
+        })
+        .collect();
+    attrs.push(kv("http.route", str_value(route)));
+    attrs.push(kv("size", int_value(size)));
+    span_of(
+        tid4a(t),
+        span_id_bytes(sid),
+        Vec::new(),
+        "op",
+        2,
+        at,
+        dur_ms * 1_000_000,
+        attrs,
+        0,
+        Vec::new(),
+        Vec::new(),
+    )
+}
+
+/// The trace ids and span ids of a search answer: `tt n [ss, …]` per trace,
+/// sorted, each span followed by its projected values.
+fn traces_4c(
+    out: &Result<pulsus_read::traces::SearchOutput, pulsus_read::logql::ReadError>,
+) -> Vec<String> {
+    use pulsus_read::traces::GroupValue;
+    let out = match out {
+        Ok(o) => o,
+        Err(e) => return vec![format!("Err({e})")],
+    };
+    let mut v: Vec<String> = out
+        .traces
+        .iter()
+        .map(|t| {
+            let spans: Vec<String> = t
+                .spans
+                .iter()
+                .map(|s| {
+                    let mut text = format!("{:02x}", s.span_id[7]);
+                    for a in &s.attributes {
+                        match a.value() {
+                            GroupValue::Int(i) => text.push_str(&format!(" {}={i}", a.key())),
+                            other => text.push_str(&format!(" {}={other:?}", a.key())),
+                        }
+                    }
+                    text
+                })
+                .collect();
+            format!(
+                "{:02x} {} [{}]",
+                t.trace_id[15],
+                t.matched,
+                spans.join(", ")
+            )
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+/// T1 (issue #601 part 4c): **a deduplicated read reads only the
+/// attributes it names.** Fixture W: service `w`, every span carrying forty
+/// 256-byte attributes beside `http.route` and an int `size`; trace `a1`
+/// holds `01` (`/a`, size 10, 10 ms) and `02` (`/a`, 20, 20 ms) in push A
+/// and `03` (`/a`, 60, 60 ms) in push B, trace `a2` holds `04` (`/b`, 40,
+/// 40 ms) in push B; A lands twice, merges stopped on `spans`. Each request
+/// answers as written by hand — which needs one row per span identity —
+/// and its statements read fewer bytes together than one read of the
+/// whole `attrs` column of the six rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deduplicated_read_reads_only_the_attributes_it_names() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db("pulsus_read_it_t601p4c_t1");
+    let client = fresh_db(&db).await;
+    stop_span_merges_4b(&client, &db).await;
+    let b0 = (now_ns() / (10 * S_NS) - 60) * 10 * S_NS;
+    let ms = 1_000_000i64;
+    let push_a = request(
+        "w",
+        "pod-w",
+        vec![
+            w_span(0xa1, 1, b0 + 1_000 * ms, "/a", 10, 10),
+            w_span(0xa1, 2, b0 + 1_010 * ms, "/a", 20, 20),
+        ],
+    );
+    let push_b = request(
+        "w",
+        "pod-w",
+        vec![
+            w_span(0xa1, 3, b0 + 1_100 * ms, "/a", 60, 60),
+            w_span(0xa2, 4, b0 + 1_200 * ms, "/b", 40, 40),
+        ],
+    );
+    land(&client, &push_a, "t601p4c-w-a").await;
+    land(&client, &push_b, "t601p4c-w-b").await;
+    land(&client, &push_a, "t601p4c-w-a2").await;
+    assert_eq!(
+        count_of(&client, "SELECT count() AS n FROM spans").await,
+        6,
+        "A twice and B once"
+    );
+    assert_eq!(
+        count_of(
+            &client,
+            "SELECT uniqExact(trace_id, start_ns, span_id, kind) AS n FROM spans"
+        )
+        .await,
+        4,
+        "four span identities"
+    );
+
+    // Control: one read of the whole attribute column of the six rows.
+    let control_prefix = prefix_4b("t1control");
+    let mut stream = client
+        .query_stream::<CountRow>(
+            "SELECT count() AS n FROM spans WHERE NOT ignore(attrs)",
+            &QuerySettings::new().set("query_id", format!("{control_prefix}-1")),
+        )
+        .await
+        .expect("the control read");
+    while let Some(row) = stream.next().await {
+        row.expect("decode the control row");
+    }
+    let control = statements_4b(&client, &control_prefix).await[0].read_bytes;
+
+    let mut wrong = Vec::new();
+    let check_bytes = |wrong: &mut Vec<String>, case: &str, stmts: &[Stmt4b]| {
+        let bytes: u64 = stmts.iter().map(|s| s.read_bytes).sum();
+        eprintln!("T1 {case}: {bytes} bytes in {stmts:?}; control {control}");
+        if stmts.is_empty() || bytes >= control {
+            wrong.push(format!(
+                "{case}: {bytes} bytes read, not below the control's {control}: {stmts:?}"
+            ));
+        }
+    };
+    let base_s = b0 / S_NS;
+    for (case, q, want) in [
+        (
+            "sum",
+            "{ } | sum_over_time(duration) by (span.http.route)",
+            [("span.http.route=/a", 0.090), ("span.http.route=/b", 0.040)],
+        ),
+        (
+            "avg",
+            "{ } | avg_over_time(span.size) by (span.http.route)",
+            [("span.http.route=/a", 30.0), ("span.http.route=/b", 40.0)],
+        ),
+    ] {
+        let prefix = prefix_4b(&format!("t1{case}"));
+        let engine = engine_4b(&db, &prefix).await;
+        let routed = routed_plan(&engine, q, base_s, base_s + 10, 10_000);
+        let sums = sums_of(&engine.metrics_range_routed(&routed).await);
+        eprintln!("T1 {case}: {sums:?}");
+        let close = sums.len() == want.len()
+            && want
+                .iter()
+                .all(|(k, v)| sums.get(*k).is_some_and(|got| (got - v).abs() < 1e-9));
+        if !close {
+            wrong.push(format!("{case}: {sums:?}, expected {want:?}"));
+        }
+        check_bytes(&mut wrong, case, &statements_4b(&client, &prefix).await);
+    }
+    for (case, q, want) in [
+        (
+            "avg > 25",
+            "{ } | avg(span.size) > 25",
+            vec!["a1 3 [01, 02, 03]", "a2 1 [04]"],
+        ),
+        (
+            "select",
+            "{ } | select(span.size)",
+            vec![
+                "a1 3 [01 size=10, 02 size=20, 03 size=60]",
+                "a2 1 [04 size=40]",
+            ],
+        ),
+        (
+            "tree",
+            r#"{ span.size > 15 } || { span.http.route = "/b" }"#,
+            vec![
+                "a1 2 [02 size=20, 03 size=60]",
+                r#"a2 1 [04 size=40 http.route=Str("/b")]"#,
+            ],
+        ),
+    ] {
+        let prefix = prefix_4b(&format!("t1{}", case.replace([' ', '>'], "")));
+        let engine = engine_4b(&db, &prefix).await;
+        let plan = plan_of(&engine, &parse_query(q), (b0, b0 + 10 * S_NS), 20, 10);
+        let got = traces_4c(&engine.search_routed(&plan).await);
+        eprintln!("T1 {case}: {got:?}");
+        if got != want {
+            wrong.push(format!("{case}: {got:?}, expected {want:?}"));
+        }
+        check_bytes(&mut wrong, case, &statements_4b(&client, &prefix).await);
+    }
+    drop_db(&db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// One request of fixture R: service `r`, a resource numbered `i` whose
+/// `k8s.pod.name` is `pod` (absent when `None`), two spans of trace `ri`
+/// one second apart from `at`, each carrying `span_attrs`.
+fn r_request(
+    i: u8,
+    pod: Option<AnyValue>,
+    at: i64,
+    span_attrs: Vec<KeyValue>,
+) -> ExportTraceServiceRequest {
+    let mut req = request("r", "unused", Vec::new());
+    let resource = req.resource_spans[0].resource.as_mut().expect("a resource");
+    resource.attributes = vec![
+        kv("service.name", str_value("r")),
+        kv("fixture.i", int_value(i64::from(i))),
+    ];
+    if let Some(pod) = pod {
+        resource.attributes.push(kv("k8s.pod.name", pod));
+    }
+    req.resource_spans[0].scope_spans[0].spans = (0..2u8)
+        .map(|j| {
+            span_of(
+                tid4a(0xe0 + i),
+                span_id_bytes(2 * i + j + 1),
+                Vec::new(),
+                "op",
+                2,
+                at + i64::from(j) * S_NS,
+                1_000_000,
+                span_attrs.clone(),
+                0,
+                Vec::new(),
+                Vec::new(),
+            )
+        })
+        .collect();
+    req
+}
+
+/// Fixture R (T4, issue #601 part 4c): one push, eight resources of
+/// service `r`, two spans each inside the minute from `b`. `k8s.pod.name`
+/// is `"p1"`, `7`, `1e21`, `true`, `["a", "b"]`, a key-value list, absent,
+/// and absent on a resource whose spans carry `k8s.pod.name = "s9"`.
+fn r_bodies(b: i64) -> ExportTraceServiceRequest {
+    let at = (b + 10) * S_NS;
+    let pods: Vec<(Option<AnyValue>, Vec<KeyValue>)> = vec![
+        (Some(str_value("p1")), Vec::new()),
+        (Some(int_value(7)), Vec::new()),
+        (Some(double_value(1e21)), Vec::new()),
+        (Some(bool_value(true)), Vec::new()),
+        (Some(str_array_value(&["a", "b"])), Vec::new()),
+        (
+            Some(AnyValue {
+                value: Some(any_value::Value::KvlistValue(KeyValueList {
+                    values: vec![kv("x", str_value("y"))],
+                })),
+            }),
+            Vec::new(),
+        ),
+        (None, Vec::new()),
+        (None, vec![kv("k8s.pod.name", str_value("s9"))]),
+    ];
+    let mut req = ExportTraceServiceRequest {
+        resource_spans: Vec::new(),
+    };
+    for (i, (pod, span_attrs)) in pods.into_iter().enumerate() {
+        let i = u8::try_from(i).expect("eight resources");
+        req.resource_spans
+            .extend(r_request(i, pod, at + i64::from(i) * 2 * S_NS, span_attrs).resource_spans);
+    }
+    req
+}
+
+/// T4 (issue #601 part 4c), a guard: **a resource key labels as written by
+/// hand.** Over fixture R, `count_over_time()` by the scoped and the
+/// unscoped pod name: a string, an int, a double and a bool each label
+/// their own series; the array is its own `nil` series; the key-value list
+/// and the absent key are the missing `nil`; unscoped, the span's own value
+/// comes first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resource_key_labels_as_written_by_hand() {
+    skip_unless_live!();
+    let db = pulsus_testkit::test_db("pulsus_read_it_t601p4c_t4");
+    let client = fresh_db(&db).await;
+    let b = metrics_l();
+    land(&client, &r_bodies(b), "t601p4c-r").await;
+    let engine = metrics_engine(&db, 1_000).await;
+    let scoped = series_texts(
+        &rf_instant(
+            &engine,
+            "{ } | count_over_time() by (resource.k8s.pod.name)",
+            b,
+        )
+        .await,
+        b,
+    );
+    let unscoped = series_texts(
+        &rf_instant(&engine, "{ } | count_over_time() by (.k8s.pod.name)", b).await,
+        b,
+    );
+    drop_db(&db).await;
+    let r = "resource.k8s.pod.name";
+    let u = ".k8s.pod.name";
+    assert_eq!(
+        scoped,
+        instant_want(&[
+            (&[(r, s("p1"))], 2.0),
+            (&[(r, LV::Int(7))], 2.0),
+            (&[(r, LV::Double(1e21))], 2.0),
+            (&[(r, LV::Bool(true))], 2.0),
+            (&[(r, s("nil"))], 2.0),
+            (&[(r, s("nil"))], 6.0),
+        ]),
+        "scoped"
+    );
+    assert_eq!(
+        unscoped,
+        instant_want(&[
+            (&[(u, s("p1"))], 2.0),
+            (&[(u, LV::Int(7))], 2.0),
+            (&[(u, LV::Double(1e21))], 2.0),
+            (&[(u, LV::Bool(true))], 2.0),
+            (&[(u, s("nil"))], 2.0),
+            (&[(u, s("s9"))], 2.0),
+            (&[(u, s("nil"))], 4.0),
+        ]),
+        "unscoped"
+    );
+}
+
+/// Fixture B (T7 to T12, issue #601 part 4c), at bucket `k0`: service `a`'s
+/// `ra2` one span at `+150 s` and `ra3` one at `+50 s` (bucket `k0`), `ra1`
+/// 3,000 spans at `+400 s` and service `b`'s `rb1` one at `+450 s` (bucket
+/// `k0 + 1`), and `ra4` one at `+1,050 s` (bucket `k0 + 3`). One push per
+/// bucket; each resource's `k8s.pod.name` is its own name.
+fn b_bodies(k0: i64) -> Vec<ExportTraceServiceRequest> {
+    let at = |s: i64| k0 * BUCKET_4B + s * S_NS;
+    let one = |service: &str, pod: &str, sid: u16, s: i64| {
+        request(service, pod, vec![route_span_4b(0xb0, sid, at(s), "/x")])
+    };
+    let mut first = one("a", "ra2", 1, 150);
+    first
+        .resource_spans
+        .extend(one("a", "ra3", 2, 50).resource_spans);
+    let mut second = request(
+        "a",
+        "ra1",
+        (0..3_000u16)
+            .map(|i| route_span_4b(0xb1, 1_000 + i, at(400), "/x"))
+            .collect(),
+    );
+    second
+        .resource_spans
+        .extend(one("b", "rb1", 3, 450).resource_spans);
+    vec![first, second, one("a", "ra4", 4, 1_050)]
+}
+
+/// A fresh database holding fixture B, merges stopped on `spans`, each push
+/// landed `times` times under its own token; with `int_service`, one more
+/// span at `+420 s` whose `service.name` is the int `7`.
+async fn seed_b(test: &str, times: usize, int_service: bool) -> (String, ChClient, i64) {
+    let db = pulsus_testkit::test_db(&format!("pulsus_read_it_t601p4c_b_{test}"));
+    let client = fresh_db(&db).await;
+    stop_span_merges_4b(&client, &db).await;
+    let k0 = buckets_4b();
+    let mut pushes = b_bodies(k0);
+    if int_service {
+        let mut c = request(
+            "c",
+            "rc1",
+            vec![route_span_4b(0xbc, 5, k0 * BUCKET_4B + 420 * S_NS, "/x")],
+        );
+        c.resource_spans[0]
+            .resource
+            .as_mut()
+            .expect("a resource")
+            .attributes[0] = kv("service.name", int_value(7));
+        pushes.push(c);
+    }
+    for round in 0..times {
+        for (i, req) in pushes.iter().enumerate() {
+            land(&client, req, &format!("t601p4c-{test}-{i}-{round}")).await;
+        }
+    }
+    (db, client, k0)
+}
+
+/// `key`'s values for `q` over `[s, e)` through a fresh engine, its cut at
+/// `rows` spans when given, and the statements that request ran.
+#[allow(clippy::too_many_arguments)]
+async fn values_request_4c(
+    db: &str,
+    client: &ChClient,
+    case: &str,
+    key: &str,
+    scope: Option<&str>,
+    q: &str,
+    s: i64,
+    e: i64,
+    rows: Option<u64>,
+) -> (Result<pulsus_read::TagValues, String>, Vec<Stmt4b>) {
+    let prefix = prefix_4b(case);
+    let engine = engine_4b(db, &prefix).await;
+    let engine = match rows {
+        Some(r) => engine.with_tag_read_rows(r),
+        None => engine,
+    };
+    let got = engine
+        .list_tag_values(
+            key,
+            scope,
+            pulsus_read::TagValuesRequest {
+                q: Some(q),
+                start_ns: s,
+                end_ns: e,
+            },
+        )
+        .await
+        .map_err(|e| e.to_string());
+    (got, statements_4b(client, &prefix).await)
+}
+
+/// The pod names of `values`, each `string`.
+fn pods_4c(
+    values: &Result<pulsus_read::TagValues, String>,
+) -> Result<Vec<(String, String)>, String> {
+    values.as_ref().map(listed_4b).map_err(Clone::clone)
+}
+
+const A_EQ: &str = r#"{ resource.service.name = "a" }"#;
+
+/// T7 (issue #601 part 4c): **the resource catalogue holds each bucket's
+/// resources.** Fixture B, plus a span whose `service.name` is an int: the
+/// table holds exactly each `(bucket, service, resource)` the fixture
+/// writes, and nothing for the int service.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_resource_catalogue_holds_each_buckets_resources() {
+    skip_unless_live!();
+    let (db, client, k0) = seed_b("t7", 1, true).await;
+    let pod = attr_path_4c("k8s.pod.name");
+    let held = client
+        .query_strings(
+            &format!(
+                "SELECT concat(toString(bucket - {k0}), ' ', service, ' ', pod) AS s \
+                 FROM service_bucket_resources AS c \
+                 LEFT JOIN (SELECT resource_id, any(toString({pod})) AS pod FROM resources \
+                            GROUP BY resource_id) AS r USING resource_id \
+                 ORDER BY s"
+            ),
+            &QuerySettings::new(),
+        )
+        .await
+        .map_err(|e| e.to_string());
+    drop_db(&db).await;
+    let want: Vec<String> = [
+        (0, "a", "ra2"),
+        (0, "a", "ra3"),
+        (1, "a", "ra1"),
+        (1, "b", "rb1"),
+        (3, "a", "ra4"),
+    ]
+    .iter()
+    .map(|(b, svc, pod)| format!("{b} {svc} {pod}"))
+    .collect();
+    assert_eq!(held, Ok(want));
+}
+
+/// `attrs.<key>` as a `resources` read names it.
+fn attr_path_4c(key: &str) -> String {
+    format!(
+        "attrs.`{}`",
+        pulsus_clickhouse::json_column::escape_json_path(key)
+    )
+}
+
+/// T8 (issue #601 part 4c): **a service-narrowed resource values read
+/// answers from the catalogue.** Over `[b0 + 100 s, b0 + 1,000 s)` service
+/// `a` lists `ra1` (bucket `k0 + 1`, whole) and `ra2` (the first edge), not
+/// `ra3` or `ra4` (the edges' buckets, outside the window), in one statement
+/// that reads `service_bucket_resources` and fewer rows than `ra1`'s 3,000
+/// spans.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_service_narrowed_resource_values_read_answers_from_the_catalogue() {
+    skip_unless_live!();
+    let (db, client, k0) = seed_b("t8", 1, false).await;
+    let (s, e) = (k0 * BUCKET_4B + 100 * S_NS, k0 * BUCKET_4B + 1_000 * S_NS);
+    let (got, stmts) = values_request_4c(
+        &db,
+        &client,
+        "t8",
+        "k8s.pod.name",
+        Some("resource"),
+        A_EQ,
+        s,
+        e,
+        None,
+    )
+    .await;
+    drop_db(&db).await;
+    eprintln!("T8: {got:?} in {stmts:?}");
+    assert_eq!(
+        pods_4c(&got),
+        Ok(strings_4b(&[("ra1", "string"), ("ra2", "string")]))
+    );
+    assert_eq!(stmts.len(), 1, "one statement: {stmts:?}");
+    assert!(
+        read_table(&stmts, &db, "service_bucket_resources"),
+        "the statement reads the catalogue: {stmts:?}"
+    );
+    assert!(
+        stmts[0].read_rows < 3_000,
+        "the statement read {} rows, not below ra1's 3,000 spans",
+        stmts[0].read_rows
+    );
+}
+
+/// T8b (issue #601 part 4c), a guard: **both edges empty reads no spans.**
+/// The window is exactly buckets `k0 + 1` and `k0 + 2`: `ra1`, in one
+/// statement reading the catalogue and not `spans`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn both_edges_empty_reads_no_spans() {
+    skip_unless_live!();
+    let (db, client, k0) = seed_b("t8b", 1, false).await;
+    let (s, e) = ((k0 + 1) * BUCKET_4B, (k0 + 3) * BUCKET_4B);
+    let (got, stmts) = values_request_4c(
+        &db,
+        &client,
+        "t8b",
+        "k8s.pod.name",
+        Some("resource"),
+        A_EQ,
+        s,
+        e,
+        None,
+    )
+    .await;
+    drop_db(&db).await;
+    eprintln!("T8b: {got:?} in {stmts:?}");
+    assert_eq!(pods_4c(&got), Ok(strings_4b(&[("ra1", "string")])));
+    assert_eq!(stmts.len(), 1, "one statement: {stmts:?}");
+    assert!(
+        read_table(&stmts, &db, "service_bucket_resources") && !read_table(&stmts, &db, "spans"),
+        "the catalogue read and spans not: {stmts:?}"
+    );
+}
+
+/// T8c (issue #601 part 4c), a guard: **an admitted request matching
+/// nothing answers empty**, not truncated, in one statement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_admitted_request_matching_nothing_answers_empty() {
+    skip_unless_live!();
+    let (db, client, k0) = seed_b("t8c", 1, false).await;
+    let (s, e) = (k0 * BUCKET_4B + 100 * S_NS, k0 * BUCKET_4B + 1_000 * S_NS);
+    let (got, stmts) = values_request_4c(
+        &db,
+        &client,
+        "t8c",
+        "k8s.pod.name",
+        Some("resource"),
+        r#"{ resource.service.name = "zz" }"#,
+        s,
+        e,
+        None,
+    )
+    .await;
+    drop_db(&db).await;
+    eprintln!("T8c: {got:?} in {stmts:?}");
+    assert_eq!(
+        got,
+        Ok(pulsus_read::TagValues {
+            values: Vec::new(),
+            truncated: false
+        })
+    );
+    assert_eq!(stmts.len(), 1, "one statement: {stmts:?}");
+}
+
+/// T9 (issue #601 part 4c), a guard: **only a service equality narrows a
+/// resource key from the catalogue.** A second condition, a regex,
+/// `resource.service.name` itself, the bare key and the span scope each
+/// answer without reading `service_bucket_resources`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn only_a_service_equality_narrows_a_resource_key_from_the_catalogue() {
+    skip_unless_live!();
+    let (db, client, k0) = seed_b("t9", 1, false).await;
+    let (s, e) = (k0 * BUCKET_4B + 100 * S_NS, k0 * BUCKET_4B + 1_000 * S_NS);
+    let mut wrong = Vec::new();
+    for (case, key, scope, q) in [
+        (
+            "and",
+            "k8s.pod.name",
+            Some("resource"),
+            r#"{ resource.service.name = "a" && name = "x" }"#,
+        ),
+        (
+            "regex",
+            "k8s.pod.name",
+            Some("resource"),
+            r#"{ resource.service.name =~ "a" }"#,
+        ),
+        ("service", "service.name", Some("resource"), A_EQ),
+        ("bare", "k8s.pod.name", None, A_EQ),
+        ("span", "k8s.pod.name", Some("span"), A_EQ),
+    ] {
+        let (got, stmts) = values_request_4c(
+            &db,
+            &client,
+            &format!("t9{case}"),
+            key,
+            scope,
+            q,
+            s,
+            e,
+            None,
+        )
+        .await;
+        eprintln!("T9 {case}: {got:?} in {stmts:?}");
+        if got.is_err() || read_table(&stmts, &db, "service_bucket_resources") {
+            wrong.push(format!("{case}: {got:?} in {stmts:?}"));
+        }
+    }
+    drop_db(&db).await;
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// T10 (issue #601 part 4c): **the resource catalogue answers the whole
+/// window** (D4): with the cut at one span, today's statement reads only
+/// bucket `k0 + 1` and lists `ra1` alone; the catalogue lists `ra1` and
+/// `ra2`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_resource_catalogue_answers_the_whole_window() {
+    skip_unless_live!();
+    let (db, client, k0) = seed_b("t10", 1, false).await;
+    let (s, e) = (k0 * BUCKET_4B + 100 * S_NS, k0 * BUCKET_4B + 1_000 * S_NS);
+    let (got, stmts) = values_request_4c(
+        &db,
+        &client,
+        "t10",
+        "k8s.pod.name",
+        Some("resource"),
+        A_EQ,
+        s,
+        e,
+        Some(1),
+    )
+    .await;
+    drop_db(&db).await;
+    eprintln!("T10: {got:?} in {stmts:?}");
+    assert_eq!(
+        pods_4c(&got),
+        Ok(strings_4b(&[("ra1", "string"), ("ra2", "string")]))
+    );
+}
+
+/// T12 (issue #601 part 4c), a guard: **a retried push lists its resources
+/// once.** Every push of fixture B lands twice under two tokens: T8's
+/// answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retried_push_lists_its_resources_once() {
+    skip_unless_live!();
+    let (db, client, k0) = seed_b("t12", 2, false).await;
+    let stored = count_of(&client, "SELECT count() AS n FROM spans").await;
+    let (s, e) = (k0 * BUCKET_4B + 100 * S_NS, k0 * BUCKET_4B + 1_000 * S_NS);
+    let (got, stmts) = values_request_4c(
+        &db,
+        &client,
+        "t12",
+        "k8s.pod.name",
+        Some("resource"),
+        A_EQ,
+        s,
+        e,
+        None,
+    )
+    .await;
+    drop_db(&db).await;
+    eprintln!("T12: {got:?} in {stmts:?}");
+    assert_eq!(stored, 2 * 3_004, "every span stored twice");
+    assert_eq!(
+        pods_4c(&got),
+        Ok(strings_4b(&[("ra1", "string"), ("ra2", "string")]))
+    );
+}
+
+/// Fixture S (T10b, T10c, issue #601 part 4c): service `a`'s resource `sa`
+/// with one span at `k0 + 250 s` carrying `http.route = /early` (bucket
+/// `k0`), and `sb` with one at `k0 + 350 s` carrying `/late` (bucket
+/// `k0 + 1`), one push each.
+async fn seed_s(test: &str) -> (String, ChClient, i64) {
+    let db = pulsus_testkit::test_db(&format!("pulsus_read_it_t601p4c_s_{test}"));
+    let client = fresh_db(&db).await;
+    stop_span_merges_4b(&client, &db).await;
+    let k0 = buckets_4b();
+    let at = |s: i64| k0 * BUCKET_4B + s * S_NS;
+    for (i, (pod, sid, s, route)) in [("sa", 1u16, 250, "/early"), ("sb", 2, 350, "/late")]
+        .into_iter()
+        .enumerate()
+    {
+        let req = request("a", pod, vec![route_span_4b(0x5a, sid, at(s), route)]);
+        land(&client, &req, &format!("t601p4c-{test}-{i}")).await;
+    }
+    (db, client, k0)
+}
+
+/// T10b (issue #601 part 4c): **a resource window with no whole bucket is
+/// read whole.** `[k0 + 200 s, k0 + 400 s)` crosses one bucket boundary;
+/// with the cut at one span today's statement reads bucket `k0 + 1` alone
+/// and lists `sb`; the edge rule lists `sa` and `sb`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resource_window_with_no_whole_bucket_is_read_whole() {
+    skip_unless_live!();
+    let (db, client, k0) = seed_s("t10b").await;
+    let (s, e) = (k0 * BUCKET_4B + 200 * S_NS, k0 * BUCKET_4B + 400 * S_NS);
+    let (got, stmts) = values_request_4c(
+        &db,
+        &client,
+        "t10b",
+        "k8s.pod.name",
+        Some("resource"),
+        A_EQ,
+        s,
+        e,
+        Some(1),
+    )
+    .await;
+    drop_db(&db).await;
+    eprintln!("T10b: {got:?} in {stmts:?}");
+    assert_eq!(
+        pods_4c(&got),
+        Ok(strings_4b(&[("sa", "string"), ("sb", "string")]))
+    );
+}
+
+/// T10c (issue #601 part 4c): **a span window with no whole bucket is read
+/// whole.** The same window and cut for `span.http.route`: part 4b ran
+/// today's statement there, which lists `/late` alone; the edge rule lists
+/// `/early` and `/late`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_span_window_with_no_whole_bucket_is_read_whole() {
+    skip_unless_live!();
+    let (db, client, k0) = seed_s("t10c").await;
+    let (s, e) = (k0 * BUCKET_4B + 200 * S_NS, k0 * BUCKET_4B + 400 * S_NS);
+    let (got, stmts) = values_request_4c(
+        &db,
+        &client,
+        "t10c",
+        "http.route",
+        Some("span"),
+        A_EQ,
+        s,
+        e,
+        Some(1),
+    )
+    .await;
+    drop_db(&db).await;
+    eprintln!("T10c: {got:?} in {stmts:?}");
+    assert_eq!(
+        pods_4c(&got),
+        Ok(strings_4b(&[("/early", "string"), ("/late", "string")]))
     );
 }

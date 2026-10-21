@@ -25,9 +25,9 @@ use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySetti
 use pulsus_schema::{RenderCtx, SchemaParams};
 use pulsus_schema_testkit::run_init;
 
-/// The eight tables on the trace write path: the landing table and the
-/// seven the views maintain.
-const WRITE_PATH_TABLES: [&str; 8] = [
+/// The nine tables on the trace write path: the landing table and the
+/// eight the views maintain.
+const WRITE_PATH_TABLES: [&str; 9] = [
     "trace_landing",
     "spans",
     "resources",
@@ -36,15 +36,16 @@ const WRITE_PATH_TABLES: [&str; 8] = [
     "tag_values",
     "error_spans",
     "tag_bucket_values",
+    "service_bucket_resources",
 ];
 
-/// The seven tables the views maintain, as a `table IN (…)` list. The
+/// The eight tables the views maintain, as a `table IN (…)` list. The
 /// landing table is not one of them.
 const TARGET_TABLE_LIST: &str = "'spans', 'traces', 'resources', 'tag_names', 'tag_values', \
-                                 'error_spans', 'tag_bucket_values'";
+                                 'error_spans', 'tag_bucket_values', 'service_bucket_resources'";
 
-/// The seven views, one per target.
-const TRACE_MVS: [&str; 7] = [
+/// The eight views, one per target.
+const TRACE_MVS: [&str; 8] = [
     "spans_mv",
     "resources_mv",
     "traces_mv",
@@ -52,6 +53,7 @@ const TRACE_MVS: [&str; 7] = [
     "tag_values_mv",
     "error_spans_mv",
     "tag_bucket_values_mv",
+    "service_bucket_resources_mv",
 ];
 
 /// `true` when the gated half of this suite should run. Skips cleanly on a
@@ -306,8 +308,8 @@ fn landing_span_sql(
     )
 }
 
-/// The eight tables and the seven views exist after one `run_init`, and the
-/// seven views' sources are recorded against the landing table.
+/// The nine tables and the eight views exist after one `run_init`, and the
+/// eight views' sources are recorded against the landing table.
 #[tokio::test]
 async fn trace_landing_and_its_views_exist_after_init() {
     skip_unless_live!();
@@ -330,8 +332,8 @@ async fn trace_landing_and_its_views_exist_after_init() {
             )
         )
         .await,
-        8,
-        "the landing table and its seven targets"
+        9,
+        "the landing table and its eight targets"
     );
 
     let quoted = TRACE_MVS
@@ -348,8 +350,8 @@ async fn trace_landing_and_its_views_exist_after_init() {
             )
         )
         .await,
-        7,
-        "seven views, seven targets"
+        8,
+        "eight views, eight targets"
     );
 
     // The server's own record of what feeds what.
@@ -524,7 +526,7 @@ async fn the_per_trace_aggregate_columns_carry_the_functions_this_design_names()
     drop_database(&client, db).await;
 }
 
-/// **T-S5.** Every column of the seven target tables carries a compression
+/// **T-S5.** Every column of the eight target tables carries a compression
 /// codec — none empty in `system.columns`.
 ///
 /// `trace_landing` is deliberately outside the domain: its `event_id`
@@ -549,13 +551,14 @@ async fn every_target_table_column_carries_a_codec() {
             ),
         )
         .await,
-        67,
-        "the seven target tables' own column count (28 + 8 + 8 + 2 + 4 + 12 \
-         + 5), so the codec check below has a non-empty domain. Issue #587 \
+        70,
+        "the eight target tables' own column count (28 + 8 + 8 + 2 + 4 + 12 \
+         + 5 + 3), so the codec check below has a non-empty domain. Issue #587 \
          added four columns to `spans`, two to `traces` and one to \
          `resources`; issue #589 added one to `spans`; issue #591 part 1 made \
          `traces`' two root columns one; issue #601 part 4b added \
-         `error_spans` and `tag_bucket_values`"
+         `error_spans` and `tag_bucket_values`; part 4c added \
+         `service_bucket_resources`"
     );
     let bare = names(
         &client,
@@ -572,7 +575,7 @@ async fn every_target_table_column_carries_a_codec() {
     drop_database(&client, db).await;
 }
 
-/// **T-S5b.** The exact codec spelling of every column of the seven target
+/// **T-S5b.** The exact codec spelling of every column of the eight target
 /// tables, in declaration order within each table. A presence test cannot
 /// tell `ZSTD(1)` from `ZSTD(22)`.
 ///
@@ -584,7 +587,7 @@ async fn every_target_table_column_carries_a_codec() {
 ///
 /// The column **type** is not pinned here — the per-table `(name, type)`
 /// cases above own that.
-const TARGET_TABLE_CODECS: [(&str, &str, &str); 67] = [
+const TARGET_TABLE_CODECS: [(&str, &str, &str); 70] = [
     ("error_spans", "trace_id", "CODEC(ZSTD(1))"),
     ("error_spans", "span_id", "CODEC(ZSTD(1))"),
     ("error_spans", "start_ns", "CODEC(Delta(8), ZSTD(1))"),
@@ -605,6 +608,9 @@ const TARGET_TABLE_CODECS: [(&str, &str, &str); 67] = [
     ("resources", "dropped_attrs", "CODEC(ZSTD(1))"),
     ("resources", "schema_url", "CODEC(ZSTD(1))"),
     ("resources", "entity_refs", "CODEC(ZSTD(1))"),
+    ("service_bucket_resources", "bucket", "CODEC(ZSTD(1))"),
+    ("service_bucket_resources", "service", "CODEC(ZSTD(1))"),
+    ("service_bucket_resources", "resource_id", "CODEC(ZSTD(1))"),
     ("spans", "trace_id", "CODEC(ZSTD(1))"),
     ("spans", "span_id", "CODEC(ZSTD(1))"),
     ("spans", "parent_span_id", "CODEC(ZSTD(1))"),
@@ -680,7 +686,7 @@ async fn the_target_tables_carry_the_codecs_this_design_names() {
     assert_eq!(
         seen.len(),
         TARGET_TABLE_CODECS.len(),
-        "the seven target tables' column count"
+        "the eight target tables' column count"
     );
     for (got, (table, name, codec)) in seen.iter().zip(TARGET_TABLE_CODECS) {
         assert_eq!(got.table, table, "table order");
@@ -764,11 +770,11 @@ async fn the_catalogs_carry_no_ttl_and_the_other_four_do() {
     drop_database(&client, db).await;
 }
 
-/// The configured window reaches **all eight** write-path tables, read off
+/// The configured window reaches **all nine** write-path tables, read off
 /// each table's own stored definition rather than off the statements that
 /// set it.
 #[tokio::test]
-async fn dedup_settings_reach_all_eight_trace_tables() {
+async fn dedup_settings_reach_all_nine_trace_tables() {
     skip_unless_live!();
     let db = &pulsus_testkit::test_db("pulsus_trace_landing_it_dedupwin");
     let client = ChClient::new(test_config()).await.expect("connect");
@@ -1076,7 +1082,7 @@ async fn the_attribute_columns_are_exactly_these() {
     drop_database(&client, db).await;
     run_init(&client, &test_ctx(db)).await.expect("run_init");
 
-    // Every column of the eight write-path tables whose declared type carries
+    // Every column of the nine write-path tables whose declared type carries
     // a JSON value, plus the two text columns that carry attribute values —
     // `attrs_other` (a protobuf `KeyValueList`) and the catalogs' own value
     // column.
@@ -1085,7 +1091,8 @@ async fn the_attribute_columns_are_exactly_these() {
            SELECT table, name, type FROM system.columns \
            WHERE database = '{db}' \
              AND table IN ('trace_landing', 'spans', 'resources', 'tag_names', 'tag_values', \
-                           'traces', 'error_spans', 'tag_bucket_values') \
+                           'traces', 'error_spans', 'tag_bucket_values', \
+                           'service_bucket_resources') \
              AND (position(type, 'JSON') > 0 \
                   OR name IN ('attrs_other', 'scope_attrs_other', 'value', 'tag_value', \
                               'vals'))\
@@ -1412,6 +1419,97 @@ async fn the_two_4b_tables_have_the_planned_shape() {
                 "single-node has no wrapper"
             );
         }
+        exec(&client, &format!("DROP DATABASE IF EXISTS {db}{on}")).await;
+    }
+}
+
+/// **T6 (issue #601 part 4c).** `service_bucket_resources` and its view
+/// as the design writes them, read back off the server: a
+/// `ReplacingMergeTree` ordered for the service-narrowed read, partitioned
+/// and expired by its bucket, filled from the landing table's span rows
+/// whose `service.name` is a string.
+///
+/// Single-node always. With `PULSUS_TEST_CH_CLUSTER` set the clustered
+/// schema is checked too: one cluster-wide replica set, and no wrapper.
+#[tokio::test]
+async fn the_4c_table_has_the_planned_shape() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let mut modes = vec![None];
+    if let Ok(cluster) = std::env::var("PULSUS_TEST_CH_CLUSTER") {
+        modes.push(Some(cluster));
+    }
+    for cluster in modes {
+        let tag = if cluster.is_some() { "c" } else { "s" };
+        let db = &pulsus_testkit::test_db(&format!("pulsus_trace_landing_it_4c_{tag}"));
+        let on = cluster
+            .as_ref()
+            .map(|c| format!(" ON CLUSTER {c} SYNC"))
+            .unwrap_or_default();
+        exec(&client, &format!("DROP DATABASE IF EXISTS {db}{on}")).await;
+        let ctx = SchemaParams {
+            cluster: cluster.clone(),
+            ..test_ctx(db)
+        };
+        run_init(&client, &ctx).await.expect("run_init");
+        let (dedup, replicated) = if cluster.is_some() {
+            (
+                format!(
+                    "replicated_deduplication_window = 10000, \
+                     replicated_deduplication_window_seconds = {}",
+                    pulsus_schema::DEDUP_WINDOW_SECONDS
+                ),
+                "Replicated",
+            )
+        } else {
+            (
+                "non_replicated_deduplication_window = 10000".to_string(),
+                "",
+            )
+        };
+
+        let sbr = shape(&client, db, "service_bucket_resources").await;
+        assert_eq!(sbr.engine, format!("{replicated}ReplacingMergeTree"));
+        assert_eq!(sbr.sorting_key, "service, bucket, resource_id");
+        assert_eq!(
+            sbr.partition_key,
+            "toDate(fromUnixTimestamp64Nano(bucket * 300000000000), 'UTC')"
+        );
+        assert_eq!(
+            ttl_expr(&sbr.engine_full, "service_bucket_resources"),
+            "toDateTime(least(intDiv(bucket * 300000000000, 1000000000) + (7 * 86400), 4294967295))"
+        );
+        assert!(
+            sbr.engine_full.ends_with(&format!(
+                "SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, {dedup}"
+            )),
+            "service_bucket_resources' settings: {}",
+            sbr.engine_full
+        );
+        let mv = shape(&client, db, "service_bucket_resources_mv").await;
+        assert!(
+            mv.as_select.contains(&format!("FROM {db}.trace_landing "))
+                && mv.as_select.ends_with(
+                    "WHERE (row_kind = 0) AND (service_type = 'string') \
+                     GROUP BY bucket, service, resource_id"
+                ),
+            "service_bucket_resources_mv: {}",
+            mv.as_select
+        );
+
+        if cluster.is_some() {
+            assert!(
+                sbr.engine_full.starts_with(&format!(
+                    "ReplicatedReplacingMergeTree('/clickhouse/tables/all/{db}.service_bucket_resources', '{{replica}}')"
+                )),
+                "service_bucket_resources' replica path: {}",
+                sbr.engine_full
+            );
+        }
+        assert!(
+            shape_absent(&client, db, "service_bucket_resources_dist").await,
+            "no wrapper: one replica set, read locally"
+        );
         exec(&client, &format!("DROP DATABASE IF EXISTS {db}{on}")).await;
     }
 }

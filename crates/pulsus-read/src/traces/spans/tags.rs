@@ -589,6 +589,20 @@ FROM (
     sql
 }
 
+/// `(lo, hi, edges)` for window `[start_ns, end_ns)` (issue #601 part 4c):
+/// the whole buckets `lo..=hi` and the non-empty partial edges, at every
+/// `i64` endpoint.
+pub fn catalogue_buckets(start_ns: i64, end_ns: i64) -> (i64, i64, Vec<(i64, i64)>) {
+    const B: i64 = 300_000_000_000;
+    let lo = start_ns.div_euclid(B) + i64::from(start_ns.rem_euclid(B) != 0);
+    let hi = end_ns.div_euclid(B) - 1;
+    let edges = [(start_ns, lo * B), ((hi + 1) * B, end_ns)]
+        .into_iter()
+        .filter(|(s, e)| s < e)
+        .collect();
+    (lo, hi, edges)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -987,6 +1001,55 @@ mod tests {
         assert_eq!(
             trace_prefix("traces", "spans", window(), &narrow(r#"{span.a="x"}"#), R),
             ""
+        );
+    }
+
+    /// T14 (issue #601 part 4c): **the bucket rule holds at every endpoint
+    /// the values route accepts**: no overflow at `i64::MAX` or `i64::MIN`,
+    /// the part of a window before zero reads no bucket, and an ordinary
+    /// window splits into its whole buckets and its partial edges.
+    #[test]
+    fn catalogue_buckets_holds_at_every_endpoint() {
+        const B: i64 = 300_000_000_000;
+        const SEC: i64 = 1_000_000_000;
+        for (s, e, want) in [
+            (i64::MAX, i64::MAX, vec![]),
+            (i64::MAX - 1, i64::MAX, vec![(i64::MAX - 1, i64::MAX)]),
+        ] {
+            let (lo, hi, edges) = catalogue_buckets(s, e);
+            assert!(lo > hi, "[{s}, {e}): lo {lo}, hi {hi}");
+            assert_eq!(edges, want, "[{s}, {e})");
+        }
+        for (s, e) in [(i64::MIN, i64::MIN), (i64::MIN, i64::MIN + 1), (-2 * B, -B)] {
+            assert_eq!(catalogue_buckets(s, e), (0, -1, vec![]), "[{s}, {e})");
+        }
+        assert_eq!(
+            catalogue_buckets(-B / 2, 3 * B / 2),
+            (0, 0, vec![(B, 3 * B / 2)]),
+            "a window straddling zero"
+        );
+        let k: i64 = 5_975_180;
+        assert_eq!(
+            catalogue_buckets(k * B + 200 * SEC, (k + 1) * B + 100 * SEC),
+            (
+                k + 1,
+                k,
+                vec![
+                    (k * B + 200 * SEC, (k + 1) * B),
+                    ((k + 1) * B, (k + 1) * B + 100 * SEC)
+                ]
+            ),
+            "a window across one boundary"
+        );
+        assert_eq!(
+            catalogue_buckets(k * B + 100 * SEC, k * B + 200 * SEC),
+            (k + 1, k - 1, vec![(k * B + 100 * SEC, k * B + 200 * SEC)]),
+            "a window inside one bucket"
+        );
+        assert_eq!(
+            catalogue_buckets(k * B, (k + 2) * B),
+            (k, k + 1, vec![]),
+            "whole buckets only"
         );
     }
 }
