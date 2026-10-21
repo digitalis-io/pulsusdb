@@ -545,10 +545,12 @@ pub const CATALOGUE_CAP: usize = 101;
 /// The service-narrowed values read for one span-scoped key (issue #601
 /// part 4b): the whole buckets `lo..=hi` from the catalogue, plus `edges`,
 /// today's [`narrowed_values_sql`] over each partial bucket of the window.
-/// One row: `overflowed`, 1 when an interior group the request reads is
+/// Both catalogue reads merge per bucket, so the cap applies to each
+/// bucket's group; the outer `groupUniqArray` takes the union. One row:
+/// `overflowed`, 1 when an interior group the request reads is
 /// overflowed, in which case the interior contributes nothing and the
 /// caller answers with today's statement; and `vals`, the first `limit`
-/// pairs in today's order. An aggregate with no `GROUP BY` returns its row
+/// pairs in today's order. The outer aggregate has no `GROUP BY`, so it returns its row
 /// whatever its input, so the flag arrives when every branch is empty.
 /// `service` and `key` are raw; both are escaped here, the key into the
 /// JSON path the catalogue stores.
@@ -574,7 +576,7 @@ SELECT toUInt8(ifNull(over, 0)) AS overflowed,
 FROM (
     SELECT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type
     FROM (SELECT arrayJoin(groupUniqArrayMerge({CATALOGUE_CAP})(vals)) AS e FROM {TAG_BUCKET_VALUES_TABLE}
-          WHERE NOT over AND {groups})"
+          WHERE NOT over AND {groups}\n          GROUP BY bucket)"
     );
     for edge in edges {
         sql.push_str(&format!(
