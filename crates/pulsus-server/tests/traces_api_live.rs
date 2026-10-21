@@ -113,6 +113,8 @@ const CEILING_ONE_PORT: u16 = 31_226;
 const CEILING_TWO_PORT: u16 = 31_227;
 /// Issue #614: T10, every trace read names its statements.
 const REQUEST_ID_PORT: u16 = 31_265;
+/// `a_fetch_groups_spans_by_resource` (issue #601 part 4a).
+const GROUPED_PORT: u16 = 31_602;
 
 /// Retention for the issue #474 spawn only. The fixture's timestamps are
 /// FROZEN at 2023-11-14 so its captured bytes can be committed, and the
@@ -1396,6 +1398,112 @@ async fn zipkin_shared_span_trace_by_id_returns_both_the_server_and_client_sides
             .is_some_and(|t| t.iter().any(|tr| tr["traceID"] == trace_hex)),
         "{ctx}: the shared-span trace must appear in search results, body {json}"
     );
+}
+
+/// T7 (issue #601 part 4a): **a fetch groups its spans by resource.**
+/// Three spans pushed in two `ResourceSpans` — two under `checkout`, one
+/// under `payment`, all three in one scope — come back as two
+/// `ResourceSpans`, in protobuf and in JSON alike.
+#[tokio::test]
+async fn a_fetch_groups_spans_by_resource() {
+    if !should_run() {
+        eprintln!(
+            "skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse to run this test \
+             (see crates/pulsus-server/tests/traces_api_live.rs for setup)"
+        );
+        return;
+    }
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_traces_api_it_grouped")).await;
+    let _guard = spawn_ready(GROUPED_PORT, &db);
+
+    let now_ns = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos(),
+    )
+    .expect("fits u64");
+    let trace = [0x6a; 16];
+    let trace_hex = hex(&trace);
+    let group = |service: &str, spans: Vec<Span>| ResourceSpans {
+        resource: Some(Resource {
+            attributes: vec![kv("service.name", service)],
+            dropped_attributes_count: 0,
+            entity_refs: vec![],
+        }),
+        scope_spans: vec![ScopeSpans {
+            scope: Some(InstrumentationScope {
+                name: "live-scope".to_string(),
+                ..Default::default()
+            }),
+            spans,
+            schema_url: String::new(),
+        }],
+        schema_url: String::new(),
+    };
+    let req = ExportTraceServiceRequest {
+        resource_spans: vec![
+            group(
+                "checkout",
+                vec![
+                    span(trace, [1; 8], "one", now_ns),
+                    span(trace, [3; 8], "three", now_ns + 2_000_000),
+                ],
+            ),
+            group(
+                "payment",
+                vec![span(trace, [2; 8], "two", now_ns + 1_000_000)],
+            ),
+        ],
+    };
+    let ctx = "push the grouped trace";
+    let res = request(
+        GROUPED_PORT,
+        "POST",
+        "/v1/traces",
+        &[],
+        Some(("application/x-protobuf", &req.encode_to_vec())),
+    )
+    .unwrap_or_else(|| panic!("{ctx}: ingest must be reachable"));
+    assert_eq!(res.status, 200, "{ctx}");
+    live_db::settle_pushed_spans(GROUPED_PORT, &pushed_keys(&req), ctx);
+
+    let shape = |data: &TracesData| -> Vec<Vec<Vec<u8>>> {
+        data.resource_spans
+            .iter()
+            .map(|rs| {
+                rs.scope_spans
+                    .iter()
+                    .flat_map(|ss| &ss.spans)
+                    .map(|s| s.span_id.clone())
+                    .collect()
+            })
+            .collect()
+    };
+    let want = vec![vec![vec![1u8; 8], vec![3u8; 8]], vec![vec![2u8; 8]]];
+
+    let ctx = "GET the grouped trace (protobuf)";
+    let res = get(
+        GROUPED_PORT,
+        &fetch_path(&trace_hex),
+        &[("accept", "application/protobuf")],
+        ctx,
+    );
+    assert_eq!(res.status, 200, "{ctx}");
+    let protobuf = TracesData::decode(res.body.as_slice())
+        .unwrap_or_else(|e| panic!("{ctx}: body must prost-decode as TracesData: {e}"));
+    assert_eq!(
+        shape(&protobuf),
+        want,
+        "{ctx}: two ResourceSpans, checkout's two spans then payment's one"
+    );
+
+    let ctx = "GET the grouped trace (JSON)";
+    let res = get(GROUPED_PORT, &fetch_path(&trace_hex), &[], ctx);
+    assert_eq!(res.status, 200, "{ctx}");
+    let json: TracesData = serde_json::from_slice(&res.body)
+        .unwrap_or_else(|e| panic!("{ctx}: protojson must deserialize as TracesData: {e}"));
+    assert_eq!(shape(&json), want, "{ctx}: the same two ResourceSpans");
 }
 
 /// Extracts the instant series' scalar numeric token

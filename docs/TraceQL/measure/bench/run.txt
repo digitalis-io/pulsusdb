@@ -1,0 +1,12 @@
+date	2026-10-21T12:01:25Z
+end_s	1792582100
+commit	9c42c43e45c4c04d9571b9ed530a6177fc3e0b13
+spans	2000064
+dup_spans	19669
+trace_20	0f888729f8f806b3a091f8946cd56e05	20 spans
+trace_largest	248398a4d2b3efd5ee750d3bb575bd52	1000 spans
+t02_key	rpc.method
+t02_candidates_tried	rpc.method(8 values)
+nproc	4
+clickhouse_image	clickhouse/clickhouse-server@sha256:d3fd302416d9523d5d64239d5713d1c16c20ecea2045ac70d7e941b376cb266e
+reference_image	deploy/e2e/compose.single.yaml's pinned image, sha256:cda87c212d8c584dc0b89e337e7ed648a5100feb657e5d528480ee4fa03dbbe3

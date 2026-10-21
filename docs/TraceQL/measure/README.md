@@ -20,8 +20,12 @@ They take hosts, ports and directories as arguments; nothing is hard-coded.
 | `make_sql.py` | writes `sql/*.sql`: the statement each query shape compiles to |
 | `run_query.sh` | runs one statement warm or cold; rows, bytes, memory, time |
 | `search_sliced.py` | the disjoint-slice loop the 2026-09-23 run measured, and its statement count |
-| `http_bench.py` | the same queries over HTTP against the reference or PulsusDB |
-| `fetch_compare.py` | trace by id, interleaved between the two stores, as a distribution |
+| `http_bench.py` | the same queries over HTTP against the reference or PulsusDB, or `paired`: both, alternating which goes first; `paired` keeps each side's first body and counts its answer |
+| `fetch_compare.py` | trace by id over the shipped routes, interleaved between PulsusDB and the reference, as a distribution |
+| `fetch_compare_design.py` | trace by id, the design's statement file against the reference, interleaved: `run_all.sh`'s |
+| `check_run_all.sh` | walks `run_all.sh`'s steps without running them: it parses, every script it calls exists, the inventory follows it |
+| `bench.sh`, `bench_verdict.py` | the R10 benchmark: one corpus into PulsusDB and the reference, every §6.3 shape over HTTP, and the verdict on §6.3's rule; the `traceql-reference-bench` workflow runs it |
+| `bench/` | that workflow's committed run |
 | `agreement.py`, `ground_truth.py` | per-filter counts from both stores, and from the corpus file |
 | `boundary.sh` | the window rule at both edges and across a day bound |
 | `retention.sh` | dropping a day: time, parts, mutations, merges |

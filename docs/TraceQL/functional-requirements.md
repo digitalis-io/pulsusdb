@@ -1,6 +1,6 @@
 # TraceQL storage and query: functional requirements
 
-**Parts of this document describe the previous trace search engine, which issue #602 part 2c-2b deleted — its test binaries, goldens and benches in part 2c-2b-1, its code and the unit tests inside it in part 2c-2b-2; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** **Since #600 `T-C8` and `T-Q2`'s whole-catalogue form are the `traceql-catalogue` CI job and, on the two-shard cluster, `traceql-catalogue-cluster`, comparing whole answers rather than statement rows, and `T-C9` is a unit test of the search route, where `reject/empty` is no query.** This document says what the trace store must do, in numbers a review can check.
+**Parts of this document describe the previous trace search engine, which issue #602 part 2c-2b deleted — its test binaries, goldens and benches in part 2c-2b-1, its code and the unit tests inside it in part 2c-2b-2; the search route's design is `docs/TraceQL/sql-schema.md` §5.2–§5.3.** **Since #600 `T-C8` and `T-Q2`'s whole-catalogue form are the `traceql-catalogue` CI job and, on the two-shard cluster, `traceql-catalogue-cluster`, comparing whole answers rather than statement rows, and `T-C9` is a unit test of the search route, where `reject/empty` is no query.** This document says what the trace store must do, in numbers a review can check. **Since #601 part 4b the trace store holds seven tables, not five, and the counts, targets, storage figures and statement contracts below predate it, except the clustering and sharding-key passages, which name the new tables.** `tag_bucket_values` holds each 5-minute bucket's span-attribute values per service and key, storing at most 101 distinct `(value, type)` pairs: up to 100 answer exactly, and a 101st marks the bucket overflowed. It answers a values read for a `span.<key>` whose `q` is a single filter of exactly one `resource.service.name` equality; when a whole bucket of the window is overflowed, the request is answered by the span read in a second statement — the one exception this part adds to one statement per request. `error_spans` holds the error spans' non-attribute columns; it answers a single-filter, non-structural search or non-`compare()` metrics query with a top-level `status = error` that reads only `status`, `statusMessage`, `kind`, `name`, `duration`, `span:id`, `trace:id`, `resource.service.name`, `traceDuration`, `rootName` or `rootServiceName`. Measured on g1: the store is 43.89 B/span over the seven tables (`tag_bucket_values` 0.734, `error_spans` 0.245), and between replicas an error span's columns cross once more in `error_spans`, 0.253 B/span (0.63% of the span stream), while `tag_bucket_values` replicates to every node. The current statements are `docs/api.md` §4.2 and §4.3 and `schema/schema.sql`. **Since #601 part 4c the trace store holds eight tables: `service_bucket_resources` records which resources each service's spans used in each 5-minute bucket, and answers a values read for a `resource.<key>` whose `q` is exactly one `resource.service.name` equality over the whole window (0.0019 B/span on g1, replicated to every node). A statement that keeps one row per span identity computes every value it reads from those rows inside that step, and a metrics `by()` on a resource attribute reads a label computed once per resource.**
 It is the first of the 7 documents under `docs/TraceQL/`:
 
 | document | subject |
@@ -26,7 +26,9 @@ Revisions made after that run re-derive the counted claims against the tree with
 `measure/claims_check.py` and re-run the catalogue over its fixture; they do
 **not** re-measure the corpus. `measure/README.md`, under "What this revision
 re-derived, and what it carries forward", says which is which. A figure whose
-producer is `run_all.sh` is as old as the last `run_all.sh`.
+producer is `run_all.sh` is as old as the last `run_all.sh`. §6.3's table and its
+bytes come from the `traceql-reference-bench` run that wrote `measure/bench/`,
+dated there.
 
 ---
 
@@ -306,57 +308,61 @@ cause was not established and is recorded as unexplained.
 
 ### 6.3 The benchmark
 
-**The definition.** The same corpus into both stores from the same 4,073 bodies.
-Both containers `--cpus 4 --memory 6g` on one machine. Each query runs once
-unmeasured, then five times; the median is reported. The trace-fetch comparison
-**interleaves** the two stores within one run and reports a distribution, because
-the reference's fetch time varies between sessions (`measure/fetch_compare.py`).
-**Cold** for ClickHouse drops the mark, uncompressed, query-condition and
-primary-index caches and reads with direct I/O; the reference's caches cannot be
-dropped equivalently, so cold numbers are reported for this design only and the
-requirement is stated warm-to-warm.
+**The definition.** One corpus g1, generated at the run's own time
+(`measure/gen_corpus.py`, 2,000,000 spans asked), into both stores from the same
+bodies, on one CI runner (the `traceql-reference-bench` workflow): ClickHouse and
+the reference each in a container limited to `--cpus 4 --memory 6g`, PulsusDB a
+release build beside them, both read over their shipped HTTP routes. Each query
+runs once unmeasured on each store, then five times on each, the two stores
+**alternating** which goes first; the median per store is reported
+(`measure/http_bench.py`, `paired`). The trace fetch does the same 21 times each
+(`measure/fetch_compare.py`), because the reference's fetch time varies between
+sessions. A shape any of whose calls is not a `200` fails the run. The
+requirement is warm to warm; no cold figure is measured. **The two trace-by-id
+rows are recorded, not compared**: the reference ran here on local disk, which
+is not its production storage, and the owner has accepted PulsusDB's fetch
+latency, so neither median passes or fails the run.
 
-**The rule.** Warm median below the reference's for every shape except searches
+**The rule.** Warm median below the reference's for every shape except the two
+trace-by-id rows, which are recorded and not compared (above), and except searches
 whose filter matches a large share of the window, where the reference returns
 the first twenty traces it finds and stops while this design returns the twenty
 **newest** — a stricter answer, and the one `docs/api.md` §4.2 requires.
 
-**The two trace-by-id rows are superseded** (issue #587). They came from
-`measure/fetch_compare.py`, which reads `sql/b01_trace_by_id_20.sql` — a file
-`measure/make_sql.py` now regenerates in a different shape, so both figures
-measured a statement that no longer exists. `measure/run_all.sh` re-measures
-them with no further code change: the comparison script reads the regenerated
-file. The REFERENCE columns are unaffected, being a property of the other
-implementation.
+The run of 2026-10-21 (12:01 UTC) on 9c42c43e, `measure/bench/` (`verdict.tsv`,
+and `run.txt` for the corpus, the two traces and the runner):
 
-| shape | this design, warm | cold | the reference | today |
-|---|---:|---:|---:|---:|
-| trace by id, 20 spans (interleaved, 21 reps, p50) | **superseded** | — | 53 ms | 6 ms |
-| trace by id, 1,000 spans (interleaved, 21 reps, p50) | **superseded** | — | 102 ms | 17 ms |
-| `{ } \| rate() by (resource.service.name)` | **38 ms** | 44 | 249 ms | 181 ms |
-| `quantile_over_time(duration, …) by (span.http.route)` | **40 ms** | 56 | 190 ms | `400` |
-| `{ status = error } \| count_over_time() by (…service.name)` | **17 ms** | 27 | 62 ms | 52 ms |
-| `histogram_over_time(duration)` | **26 ms** | 37 | 163 ms | 125 ms |
-| instant `avg_over_time(duration) by (name)` | **27 ms** | 45 | 210 ms | `400` |
-| `{ } \| rate() by (resource.k8s.pod.name)` | **44 ms** | 46 | 445 ms | `400` |
-| tag names, span scope (the catalog read, `c11`) | **2 ms** | 2 | 5 ms | 4 ms |
-| tag values for one key (the catalog read, `c12`) | **2 ms** | 5 | 3 ms | 4 ms |
-| tag values narrowed by a query (`t03`) | **27 ms** | 36 | 30 ms | 108 ms |
-| `{ span.app.user.id = "u-10013" }` | **44 ms** | 67 | 139 ms | 26 ms |
-| `{ rootServiceName = … && traceDuration > 2s }` | **78 ms** | 168 | 26 ms¹ | 75,369 ms |
-| `\| compare({ status = error })` | **1,191 ms** | 1,428 | 1,229 ms | — |
-| the service graph | **209 ms** | 261 | no endpoint | 323 ms |
+| shape | PulsusDB, warm median | the reference, warm median | state |
+|---|---:|---:|---|
+| trace by id, 20 spans (interleaved, 21 reps) | 38 ms | 23 ms | recorded² |
+| trace by id, 1,000 spans, the corpus's largest (interleaved, 21 reps) | 80 ms | 35 ms | recorded² |
+| `{ } \| rate() by (resource.service.name)` | 332.7 ms | 359.6 ms | below |
+| `quantile_over_time(duration, …) by (span.http.route)` | 141.6 ms | 279.4 ms | below |
+| `{ status = error } \| count_over_time() by (…service.name)` | 28.9 ms | 90.9 ms | below |
+| `histogram_over_time(duration)` | 178.5 ms | 227.7 ms | below |
+| instant `avg_over_time(duration) by (name)` | 127.0 ms | 289.0 ms | below |
+| `{ } \| rate() by (resource.k8s.pod.name)` | 372.9 ms | 593.9 ms | below |
+| tag names, span scope | 4.7 ms | 5.6 ms | below |
+| tag values for one key | 6.1 ms | 773.7 ms | below |
+| tag values narrowed by a query | 18.2 ms | 47.1 ms | below |
+| `{ span.app.user.id = "u-10013" }` | 59.3 ms | 184.7 ms | below |
+| `{ rootServiceName = … && traceDuration > 2s }` | 97.6 ms | 35.3 ms | exempt¹ |
+| `\| compare({ status = error })` | 1,232.5 ms | 1,746.0 ms | below |
+| the service graph | 468.1 ms | no endpoint | no counterpart |
 
-¹ A search, so it falls in the exempt class: the reference stops at the first
-twenty traces.
+11 compared, every one below; 2 recorded; 1 exempt; 1 with no counterpart; 0 refused.
 
-**Why the tag catalogs exist**, in the same units: answering the same two
-questions by scanning the span table costs **392 ms** for the span-scope names
+¹ A search, so it falls in the exempt class: the reference stops at the first twenty traces.
+² Recorded, not compared: the reference ran on local disk, not its production
+storage, and the owner accepted the fetch's latency.
+
+In the design run of 2026-09-23, carried forward: **Why the tag catalogs
+exist**, in the same units: answering the same two questions by scanning the span table costs **392 ms** for the span-scope names
 (`t01`) and **44 ms** for one key's values (`t02`), against 2 ms from the
 catalogs. Those two statements are in the suite for that comparison, not as the
 design's tag path.
 
-**The exempt class, measured** (`results/comparison.tsv`,
+In the design run of 2026-09-23, carried forward: **The exempt class, measured** (`results/comparison.tsv`,
 `results/g1-new-design-sliced.tsv`, by `measure/search_sliced.py`, a loop that
 continues past an empty slice): `{}` 62 ms whole-window, **34 ms** sliced in 2
 statements, against the reference's 9 ms; a service search 36/31 against 10;
@@ -368,7 +374,7 @@ five minutes (`measure/gen_corpus.py:249` places no trace start in the last
 600 s), so under that rule every sliceable g1 search reads one empty slice, then
 the window.
 
-The reference's own answer to `{}` is not the newest twenty, and is not the same
+In the design run of 2026-09-23, carried forward: The reference's own answer to `{}` is not the newest twenty, and is not the same
 answer twice: in three consecutive calls it returned **none** of the corpus's
 newest twenty traces, and the twenty it did return ranked 52,635th to 68,876th
 by recency in the first call, 16,583rd to 51,614th in the second, and
@@ -376,8 +382,8 @@ by recency in the first call, 16,583rd to 51,614th in the second, and
 `results/g1-broad-search-check.tsv`). That is what the exception buys: this
 design returns the twenty newest, every time.
 
-**Bytes returned**: a search 546–4,926 bytes here against 4,122–33,970 from the
-reference; a 180-step metrics query 2,346–185,352 against 7,380–680,516.
+**Bytes returned**, in this run: a search 2,088–15,757 bytes here against
+4,122–34,770 from the reference; a 180-step metrics query 142,598–670,268 against 143,329–675,076.
 
 ### 6.4 The whole corpus, not a selection
 
@@ -618,7 +624,7 @@ answer; `measure/sql/<file>.sql` is the statement it must compile to.
 | `T-T5` | `k` as int 8080 in one span and string `"8080"` in another | the two entries | two entries, `int` and `string`, same text | **guard**: passes today — the shipped catalog already carries `val_type` per value (`crates/pulsus-schema/src/catalog.rs:862-870`, migration 41) |
 | `T-T6` | names in and outside the window for `/tag/name/values` | the value list | only the in-window names, on the `[start, end)` rule of §4.1 | today the read is day-widened |
 | `T-T7` | `/tag/status/values` | the response and the statement count | the three keywords typed `keyword`, zero statements | **guard**: passes today — the static vocabulary reads nothing, and must keep doing so. `crates/pulsus-server/src/traces_api/tags.rs:138-161` sends every intrinsic but `name` to `TagValueSource::Vocabulary`; `:220-223` answers those from `ValuesSource::Static` without asking the engine at all, which is why the statement count is zero; `crates/pulsus-server/src/traces_api/intrinsics.rs:61-63` produces the list. **The three values are `"ok"`, `"error"` and `"unset"` at `crates/pulsus-traceql/src/ast.rs:858-864`** (`StatusValue::as_str`), gathered into `INTRINSIC_STATUS_VALUES` by the `const` block at `:952-960`, which computes the list from the enum rather than transcribing it. **`keyword` is applied at `crates/pulsus-server/src/traces_api/tags_response.rs:226`**, where a `Static` answer renders every value with `KEYWORD_TYPE` (`intrinsics.rs:34`) |
-| `T-T8` | 10,001 names and 1,001 values | the responses | capped at 10,000 and 1,000, `truncated: true` | **guard**: passes today — the caps are the API's and must not move with the catalogs. `crates/pulsus-read/src/traces/exec.rs:80` is `TAG_NAMES_MAX = 10_000`, read at `:1869` as `LIMIT cap + 1` and truncated with its flag at `:1885-1887`. `:85` is `TAG_VALUES_MAX = 1_000`, read the same way at `:1936`, `:2264` and `:2286`, and truncated in **both** value paths: `:1992-1993` for the span-name values and **`:2019-2020` for the attribute values**, each setting `truncated` from the pre-truncation length |
+| `T-T8` | 10,001 names and 1,001 values | the responses | capped at 10,000 and 1,000, `truncated: true` | **guard**: passes today — the caps are the API's and must not move with the catalogs. `crates/pulsus-read/src/traces/exec.rs:80` is `TAG_NAMES_MAX = 10_000`, read at `:1874` as `LIMIT cap + 1` and truncated with its flag at `:1890-1892`. `:85` is `TAG_VALUES_MAX = 1_000`, read the same way at `:1941`, `:2281` and `:2303`, and truncated in **both** value paths: `:2006-2007` for the span-name values and **`:2033-2034` for the attribute values**, each setting `truncated` from the pre-truncation length |
 | `T-T9` | a scope attribute `otel.scope.build = "release"` | `/tags?scope=instrumentation` and `/tag/instrumentation.otel.scope.build/values` | the name and the value are listed | the catalog write must cover the fifth scope, as `measure/schema.sql` now does |
 
 ### 8.5 The write path
@@ -641,8 +647,8 @@ Each names the literal breach and the configured bound it breaches.
 |---|---|---|---|---|
 | `T-X1` | `POST /v1/traces` carrying `N` spans, each with one string attribute whose value is 1,048,576 ASCII bytes, for `N` = 248, 249, … 264. The ceiling is `MAX_EXPANDED_BYTES` = 4 × `MAX_DECOMPRESSED_BYTES` = 268,435,456 bytes and the test is `>` (`crates/pulsus-write/src/protocols/otlp_traces.rs:135` and `:948`), and the charge is the attribute's **wire** length plus the per-span row overhead — so the flip is near 256 spans but not at a number this document can compute, which is why the case sweeps | for each `N`: the status, and the row count in `spans` afterwards | there is exactly one `N*` in the sweep with `200` at `N* - 1` and `400` at `N*`; every `N` above `N*` also gives `400`, with `google.rpc.Status` code 3 and no rows stored; every `N` below gives `200`. The test records `N*` | **guard**: passes today — the ceiling and the sweep's monotone flip are today's behaviour (`crates/pulsus-write/src/protocols/otlp_traces.rs:135`, `MAX_EXPANDED_BYTES`, and the `>` test in `charge_budget` at `:946-950`). It is here because the charge has to keep covering a row shape that changes, and `N*` is recorded on both runs; `N*` itself may move |
 | `T-X2` | one attribute whose `AnyValue` nests 33 levels, against `MAX_ANYVALUE_DEPTH = 32` (`crates/pulsus-write/src/protocols/otlp_depth.rs:47`) | status | `400`, as today | **guard**: passes today — the depth limit is the decoder's: `crates/pulsus-write/src/protocols/otlp_depth.rs:47` is `MAX_ANYVALUE_DEPTH = 32` and `:132-139` is the check that returns the oversize error the moment a child would pass it. The new JSON path writer must not reach past it |
-| `T-X3` | `PULSUS_TRACEQL_SCAN_BUDGET_ROWS = 1000`, then `{}` over the 2,000,064-span corpus | status and body | `422 query_too_broad` | **guard**: passes today — the budget is `max_rows_to_read` with `read_overflow_mode = throw` (`crates/pulsus-read/src/traces/exec.rs:252-255` and `:3311-3313` @ 1cdb3e5e), and code 158 maps to `422` (`:673-677`); it must stay attached when the statements are replaced |
-| `T-X4` | `PULSUS_TRACEQL_READ_MAX_MEMORY_BYTES = 1048576`, then the **served** metrics query `{ } \| rate() by (resource.service.name)` over the fixture of §6.1; then the same query at the shipped default | the status and body of each | `422 query_too_broad` naming `reader.traceql_read_max_memory_bytes` at the low ceiling, and `200` at the default. Measured: at a 1 MiB ceiling a single-part scan of a 34-row table already asks ClickHouse for 1.17 MiB and raises code 241, so the breach does not depend on how large the corpus is | **guard**: passes today — `metrics_settings` is built on `search_settings`, which carries `max_memory_usage` (`crates/pulsus-read/src/traces/exec.rs:2201-2220` and `:2515-2520`), and `map_trace_metrics_error` hands code 241 to `map_trace_read_error` (`crates/pulsus-read/src/traces/exec.rs:575-586` and `:675-706`), which is `TraceReadMemory` → `422`. **The query has to be one the planner serves**: this case used to name `by (resource.k8s.pod.name)`, which was a plan-time `400` (`metrics_plan.rs:1123-1142`) until #596 part 2, so no ceiling could be reached then and the case could not pass |
+| `T-X3` | `PULSUS_TRACEQL_SCAN_BUDGET_ROWS = 1000`, then `{}` over the 2,000,064-span corpus | status and body | `422 query_too_broad` | **guard**: passes today — the budget is `max_rows_to_read` with `read_overflow_mode = throw` (`crates/pulsus-read/src/traces/exec.rs:257-260` and `:3311-3313` @ 1cdb3e5e), and code 158 maps to `422` (`:678-682`); it must stay attached when the statements are replaced |
+| `T-X4` | `PULSUS_TRACEQL_READ_MAX_MEMORY_BYTES = 1048576`, then the **served** metrics query `{ } \| rate() by (resource.service.name)` over the fixture of §6.1; then the same query at the shipped default | the status and body of each | `422 query_too_broad` naming `reader.traceql_read_max_memory_bytes` at the low ceiling, and `200` at the default. Measured: at a 1 MiB ceiling a single-part scan of a 34-row table already asks ClickHouse for 1.17 MiB and raises code 241, so the breach does not depend on how large the corpus is | **guard**: passes today — `metrics_settings` is built on `search_settings`, which carries `max_memory_usage` (`crates/pulsus-read/src/traces/exec.rs:2221-2240` and `:2535-2540`), and `map_trace_metrics_error` hands code 241 to `map_trace_read_error` (`crates/pulsus-read/src/traces/exec.rs:580-591` and `:680-711`), which is `TraceReadMemory` → `422`. **The query has to be one the planner serves**: this case used to name `by (resource.k8s.pod.name)`, which was a plan-time `400` (`metrics_plan.rs:1123-1142`) until #596 part 2, so no ceiling could be reached then and the case could not pass |
 | `T-X5` | one span at `2106-02-07T00:00:00Z` and one at `2106-02-06T23:59:59Z` | ingest result for each | the first rejected, the second stored | **guard**: passes today — the admitted domain is the writer's (`crates/pulsus-write/src/protocols/otlp_traces.rs:484-495`, the last UTC day fully inside the storage range), and the new partition and TTL depend on it |
 
 ### 8.7 Correctness at corpus scale
@@ -656,7 +662,7 @@ Each names the literal breach and the configured bound it breaches.
 | `T-C5` | one trace `c5000000000000000000000000000001`: a root span in service `loadgen`, name `GET /cart`, at `1790035200000000000` lasting 1 s, and a child in service `cart` at `1790038800000000000` lasting 2 s — 1 h 0 m 2 s of trace extent. The request window is `start=1790038800&end=1790042400` (seconds), which contains the child and not the root | `trace:duration` and `trace:rootService` on the returned trace, and the query `{ trace:rootService = "loadgen" && trace:duration > 1h }` | `3602000000000` ns and `loadgen`; the query returns the trace | both values come from the per-trace table, which aggregates the whole trace rather than the part inside the window; a window-only computation gives 2 s and `cart` |
 | `T-C6` | one ordinary pair (client `c1` svc-a → server `s1` svc-b, parent `c1`) and one **shared** pair (client `c2` svc-a and a server span with the **same id** `c2`, svc-c, carrying `zipkin.shared`) | the service-graph edges | two rpc edges, `svc-a → svc-b` and `svc-a → svc-c`, one call each | the single-branch join misses the shared pair; measured by `measure/shared_span_edges.sh` |
 | `T-C7` | one rpc pair and one messaging pair between the same two services | the edges | two edges differing only in `connectionType` | today's statement grouped them together |
-| `T-P1` | both stores, same corpus, interleaved | warm medians per shape | below the reference for every shape outside §6.3's exempt class | this design does not exist yet |
+| `T-P1` | both stores, same corpus, interleaved | warm medians per shape | below the reference for every shape outside §6.3's exempt class | the `traceql-reference-bench` workflow, dispatched; `measure/bench/verdict.tsv` |
 | `T-C8` | every query in `crates/pulsus-traceql/tests/corpus/accept/` and `grafana/` that the API serves (138 of 141; the other three are `T-C9`'s), **and the 12 of `measure/catalogue-extra.tsv`** — the queries no corpus query's rule reaches, among them the attribute group key whose statement the database rejected | for each: the statement the route issues runs and its rows equal the independent interpreter's, and the membership statement does too | **138 of 138 and 12 of 12** on both comparisons, as `docs/TraceQL/query-catalogue.md` records, which counts the rows of that file rather than repeating a number | the compiler is new; `measure/catalogue.py` is the runner |
 | `T-C9` | every query the API refuses: the 47 of `reject/`, `unsupported/` and `validate_reject/`, and the three of `accept/` the planner refuses — `{ .a = 1 } \| by(.b + .c)`, `{ duration > 100 }` and `{ .a = 1 } \| { .b = 2 } && { .c = 3 }` | the status and body | `400` and `docs/api.md` §4's envelope for all 50, with the message the corpus's golden pins for the 47 | **guard**: passes today — the parser, the validator and the planner do not change, and all 50 refusals must survive. The three plan-time sites are `crates/pulsus-read/src/traces/search_plan.rs:1949-1960` (a stage that is not one filter), `:2015-2021` (a group key that is not a field) and `crates/pulsus-read/src/traces/filter.rs:1705-1710` (`duration` against a bare number); `measure/planner_dispositions.tsv` is the shipped planner's own answer for every one of them |
 

@@ -1,0 +1,76 @@
+# Issue #601 part 3 (R10, T-P1): the shipped routes against the reference,
+# one corpus into both, on one runner. Run by hand only; not a required check.
+name: traceql-reference-bench
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93.0"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "traceql-reference-bench"
+      - name: Build pulsusdb (release)
+        run: cargo build --release -p pulsus-server --bin pulsusdb
+      - name: Start ClickHouse and the reference, 4 CPUs and 6 GB each
+        run: |
+          docker run -d --name pulsus-ch-bench --cpus 4 --memory 6g -p 19123:8123 \
+            -v "$GITHUB_WORKSPACE"/ci/clickhouse-cluster/users.d/network.xml:/etc/clickhouse-server/users.d/zz-network.xml:ro \
+            clickhouse/clickhouse-server@sha256:d3fd302416d9523d5d64239d5713d1c16c20ecea2045ac70d7e941b376cb266e
+          ref=$(sed -n 's/^ *image: \([^ ]*:3\.0\.2@sha256:[0-9a-f]*\)$/\1/p' deploy/e2e/compose.single.yaml)
+          test -n "$ref"
+          docker run -d --name pulsus-ref-bench --cpus 4 --memory 6g -p 13300:3200 -p 14318:4318 \
+            -v "$GITHUB_WORKSPACE"/docs/TraceQL/measure/reference.yaml:/etc/reference.yaml:ro \
+            "$ref" -config.file=/etc/reference.yaml
+          for _ in $(seq 1 120); do
+            curl -sf http://localhost:19123/ping >/dev/null && curl -sf http://localhost:13300/ready >/dev/null && break
+            sleep 1
+          done
+          curl -sf http://localhost:19123/ping && curl -sf http://localhost:13300/ready
+      - name: Schema and PulsusDB
+        run: |
+          CLICKHOUSE_SERVER=127.0.0.1 CLICKHOUSE_HTTP_PORT=19123 sh schema/schema.sh
+          # (r4) the containers' limits for the third process: four CPUs, 6 GiB of address space
+          ( ulimit -v 6291456
+            CLICKHOUSE_SERVER=127.0.0.1 CLICKHOUSE_HTTP_PORT=19123 PULSUS_PORT=3100 \
+              nohup taskset -c 0-3 target/release/pulsusdb > "$RUNNER_TEMP/pulsusdb.log" 2>&1 & )
+          for _ in $(seq 1 60); do curl -sf http://localhost:3100/ready >/dev/null && break; sleep 1; done
+          curl -sf http://localhost:3100/ready
+      - name: The benchmark
+        run: |
+          bash docs/TraceQL/measure/check_run_all.sh --self-test
+          bash docs/TraceQL/measure/check_run_all.sh
+          python3 docs/TraceQL/measure/bench_verdict.py --self-test
+          python3 docs/TraceQL/measure/http_bench.py --self-test
+          python3 docs/TraceQL/measure/fetch_compare.py --self-test
+          set +e
+          bash docs/TraceQL/measure/bench.sh http://localhost:3100 http://localhost:19123 \
+            http://localhost:13300 http://localhost:14318 "$RUNNER_TEMP/bench-work" "$RUNNER_TEMP/bench-out"
+          status=$?
+          cat "$RUNNER_TEMP/bench-out/summary.md" >> "$GITHUB_STEP_SUMMARY" || true
+          exit $status
+      - name: Container logs
+        if: always()
+        run: docker logs pulsus-ref-bench > "$RUNNER_TEMP/reference.log" 2>&1 || true
+      - name: Upload the run
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: traceql-reference-bench
+          path: |
+            ${{ runner.temp }}/bench-out/
+            ${{ runner.temp }}/pulsusdb.log
+            ${{ runner.temp }}/reference.log
+      - name: Tear down
+        if: always()
+        run: docker rm -f -v pulsus-ch-bench pulsus-ref-bench || true

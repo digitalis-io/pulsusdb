@@ -43,7 +43,11 @@
 //! the same rule and are rejected in
 //! `traces_api::params::parse_range_params`.
 
-use pulsus_traceql::{BoolOp, FieldExpr, FieldOp, SpansetExpr, SpansetFilter, parse, validate};
+use pulsus_clickhouse::json_column::escape_json_path;
+use pulsus_traceql::{
+    AttrScope, BoolOp, ComparisonOp, Field, FieldExpr, FieldOp, SpansetExpr, SpansetFilter, Value,
+    parse, validate,
+};
 
 use super::predicate::{PredicateCtx, SpanPredicate, attr_path, compile_span_predicate_in};
 use super::projection::ceiling_sql;
@@ -175,6 +179,7 @@ pub struct TagNarrowing {
     pred: Option<SpanPredicate>,
     span_pred: Option<SpanPredicate>,
     terms: usize,
+    service: Option<String>,
 }
 
 impl TagNarrowing {
@@ -199,6 +204,13 @@ impl TagNarrowing {
     /// How many conjuncts were kept.
     pub fn terms(&self) -> usize {
         self.terms
+    }
+
+    /// The service when `q`'s `&&` spine is exactly one conjunct,
+    /// `resource.service.name = "<literal>"` (issue #601 part 4b): the one
+    /// narrowing [`catalogue_values_sql`] answers.
+    pub fn service_equality(&self) -> Option<&str> {
+        self.service.as_deref()
     }
 }
 
@@ -225,6 +237,10 @@ pub fn narrowing_from_query(raw_q: &str, ctx: &PredicateCtx<'_>) -> TagNarrowing
     };
     let mut conjuncts: Vec<&FieldExpr> = Vec::new();
     spine(body, &mut conjuncts);
+    let service = match conjuncts.as_slice() {
+        [service_equality] => service_literal(service_equality),
+        _ => None,
+    };
     let mut kept: Vec<(&FieldExpr, bool)> = Vec::new();
     for c in conjuncts {
         if kept.len() >= TAG_NARROW_MAX_TERMS {
@@ -259,6 +275,29 @@ pub fn narrowing_from_query(raw_q: &str, ctx: &PredicateCtx<'_>) -> TagNarrowing
         terms: if pred.is_some() { kept.len() } else { 0 },
         pred,
         span_pred,
+        service,
+    }
+}
+
+/// The literal of `resource.service.name = "<literal>"`, or `None`.
+fn service_literal(expr: &FieldExpr) -> Option<String> {
+    let FieldExpr::Binary {
+        op: FieldOp::Cmp(ComparisonOp::Eq),
+        lhs,
+        rhs,
+    } = expr
+    else {
+        return None;
+    };
+    match (&**lhs, &**rhs) {
+        (
+            FieldExpr::Field(Field::Attribute {
+                scope: AttrScope::Resource,
+                key,
+            }),
+            FieldExpr::Literal(Value::String(service)),
+        ) if key == "service.name" => Some(service.clone()),
+        _ => None,
     }
 }
 
@@ -489,6 +528,138 @@ pub fn narrowed_values_sql(
             )
         }
     }
+}
+
+// ---------------------------------------------------------------------
+// Issue #601 part 4b: service-narrowed values from the bucket catalogue
+// ---------------------------------------------------------------------
+
+/// The per-bucket value catalogue: one cluster-wide replica set, read
+/// locally, as `tag_values` is.
+const TAG_BUCKET_VALUES_TABLE: &str = "tag_bucket_values";
+
+/// A catalogue group holding this many distinct `(value, type)` pairs is
+/// overflowed: it stores at most this many, so below it a group is exact.
+pub const CATALOGUE_CAP: usize = 101;
+
+/// The service-narrowed values read for one span-scoped key (issue #601
+/// part 4b): the whole buckets `lo..=hi` from the catalogue, plus `edges`,
+/// today's [`narrowed_values_sql`] over each partial bucket of the window.
+/// Both catalogue reads merge per bucket, so the cap applies to each
+/// bucket's group; the outer `groupUniqArray` takes the union. One row:
+/// `overflowed`, 1 when an interior group the request reads is
+/// overflowed, in which case the interior contributes nothing and the
+/// caller answers with today's statement; and `vals`, the first `limit`
+/// pairs in today's order. The outer aggregate has no `GROUP BY`, so it returns its row
+/// whatever its input, so the flag arrives when every branch is empty.
+/// `service` and `key` are raw; both are escaped here, the key into the
+/// JSON path the catalogue stores.
+pub fn catalogue_values_sql(
+    service: &str,
+    key: &str,
+    lo: i64,
+    hi: i64,
+    edges: &[String],
+    limit: usize,
+) -> String {
+    let svc = crate::logql::escape::ch_string(service);
+    let path = crate::logql::escape::ch_string(&escape_json_path(key));
+    let groups = format!(
+        "service = {svc} AND scope = 'span' AND key = {path} AND bucket BETWEEN {lo} AND {hi}"
+    );
+    let over = CATALOGUE_CAP - 1;
+    let mut sql = format!(
+        "WITH (SELECT max(length(v)) > {over} FROM (SELECT groupUniqArrayMerge({CATALOGUE_CAP})(vals) AS v FROM {TAG_BUCKET_VALUES_TABLE}
+      WHERE {groups} GROUP BY bucket)) AS over
+SELECT toUInt8(ifNull(over, 0)) AS overflowed,
+       arraySlice(arraySort(groupUniqArray((val, val_type))), 1, {limit}) AS vals
+FROM (
+    SELECT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type
+    FROM (SELECT arrayJoin(groupUniqArrayMerge({CATALOGUE_CAP})(vals)) AS e FROM {TAG_BUCKET_VALUES_TABLE}
+          WHERE NOT over AND {groups}\n          GROUP BY bucket)"
+    );
+    for edge in edges {
+        sql.push_str(&format!(
+            "
+    UNION ALL
+    SELECT val, val_type FROM ({edge})"
+        ));
+    }
+    sql.push(')');
+    sql
+}
+
+/// `(lo, hi, edges)` for window `[start_ns, end_ns)` (issue #601 part 4c):
+/// the whole buckets `lo..=hi` and the non-empty partial edges, at every
+/// `i64` endpoint.
+///
+/// No span starts before zero, and on `>= 0` the views' truncating
+/// `intDiv` and this flooring quotient agree, so both bounds are first
+/// raised to zero. The edges are `[start, m)` and `[max((hi + 1)·B, m),
+/// end)` with `m = min(lo·B, end)`, computed in `i128`: a window inside one
+/// bucket is the one edge `[start, end)`, and a window across one boundary
+/// with no whole bucket is its two partial buckets.
+pub fn catalogue_buckets(start_ns: i64, end_ns: i64) -> (i64, i64, Vec<(i64, i64)>) {
+    const B: i64 = 300_000_000_000;
+    let (start_ns, end_ns) = (start_ns.max(0), end_ns.max(0));
+    let lo = start_ns.div_euclid(B) + i64::from(start_ns.rem_euclid(B) != 0);
+    let hi = end_ns.div_euclid(B) - 1;
+    let to_i64 = |v: i128| i64::try_from(v).expect("a bound between the window's ends");
+    let m = to_i64((i128::from(lo) * i128::from(B)).min(i128::from(end_ns)));
+    let second = to_i64((i128::from(hi + 1) * i128::from(B)).max(i128::from(m)));
+    let edges = [(start_ns, m), (second, end_ns)]
+        .into_iter()
+        .filter(|(s, e)| s < e)
+        .collect();
+    (lo, hi, edges)
+}
+
+/// The resource catalogue: which resources each service's spans used in
+/// each 5-minute bucket, one cluster-wide replica set read locally.
+const SERVICE_BUCKET_RESOURCES_TABLE: &str = "service_bucket_resources";
+
+/// One partial edge of a service-narrowed resource values read (issue
+/// #601 part 4c): the `(service, resource_id)` of the spans in `w` that
+/// `pred` keeps, with no cut.
+pub fn resource_edge_sql(spans: &str, w: WindowSql, pred: Option<&SpanPredicate>) -> String {
+    format!(
+        "SELECT service, resource_id FROM {spans} WHERE {} AND {} AND {}{}",
+        w.span_time_clause(),
+        w.span_bucket_clause(),
+        w.span_day_clause(),
+        pred.map(|p| format!(" AND ({})", p.sql()))
+            .unwrap_or_default()
+    )
+}
+
+/// The service-narrowed values read for one resource-scoped key (issue
+/// #601 part 4c): the values of the resources `service`'s spans used in the
+/// whole buckets `lo..=hi`, from the catalogue, and in `edges`, each a
+/// [`resource_edge_sql`]. `rday` is the whole window's resource-day clause;
+/// a value's text and type are [`narrowed_values_sql`]'s. `service` and
+/// `key` are raw; both are escaped here.
+#[allow(clippy::too_many_arguments)]
+pub fn catalogue_resource_values_sql(
+    service: &str,
+    key: &str,
+    lo: i64,
+    hi: i64,
+    edges: &[String],
+    limit: usize,
+    resources: &str,
+    rday: &str,
+) -> String {
+    let svc = crate::logql::escape::ch_string(service);
+    let mut set = format!(
+        "SELECT service, resource_id FROM {SERVICE_BUCKET_RESOURCES_TABLE}\n      WHERE service = {svc} AND bucket BETWEEN {lo} AND {hi}"
+    );
+    for edge in edges {
+        set.push_str(&format!("\n      UNION ALL {edge}"));
+    }
+    format!(
+        "SELECT DISTINCT tupleElement(e, 1) AS val, tupleElement(e, 2) AS val_type\nFROM {resources}\nARRAY JOIN {arr} AS e\nWHERE {rday}\n  AND (service, resource_id) IN (\n      {set})\nORDER BY val, val_type\nLIMIT {limit}",
+        arr = elems(&attr_path("attrs", key)),
+    )
 }
 
 #[cfg(test)]
@@ -889,6 +1060,55 @@ mod tests {
         assert_eq!(
             trace_prefix("traces", "spans", window(), &narrow(r#"{span.a="x"}"#), R),
             ""
+        );
+    }
+
+    /// T14 (issue #601 part 4c): **the bucket rule holds at every endpoint
+    /// the values route accepts**: no overflow at `i64::MAX` or `i64::MIN`,
+    /// the part of a window before zero reads no bucket, and an ordinary
+    /// window splits into its whole buckets and its partial edges.
+    #[test]
+    fn catalogue_buckets_holds_at_every_endpoint() {
+        const B: i64 = 300_000_000_000;
+        const SEC: i64 = 1_000_000_000;
+        for (s, e, want) in [
+            (i64::MAX, i64::MAX, vec![]),
+            (i64::MAX - 1, i64::MAX, vec![(i64::MAX - 1, i64::MAX)]),
+        ] {
+            let (lo, hi, edges) = catalogue_buckets(s, e);
+            assert!(lo > hi, "[{s}, {e}): lo {lo}, hi {hi}");
+            assert_eq!(edges, want, "[{s}, {e})");
+        }
+        for (s, e) in [(i64::MIN, i64::MIN), (i64::MIN, i64::MIN + 1), (-2 * B, -B)] {
+            assert_eq!(catalogue_buckets(s, e), (0, -1, vec![]), "[{s}, {e})");
+        }
+        assert_eq!(
+            catalogue_buckets(-B / 2, 3 * B / 2),
+            (0, 0, vec![(B, 3 * B / 2)]),
+            "a window straddling zero"
+        );
+        let k: i64 = 5_975_180;
+        assert_eq!(
+            catalogue_buckets(k * B + 200 * SEC, (k + 1) * B + 100 * SEC),
+            (
+                k + 1,
+                k,
+                vec![
+                    (k * B + 200 * SEC, (k + 1) * B),
+                    ((k + 1) * B, (k + 1) * B + 100 * SEC)
+                ]
+            ),
+            "a window across one boundary"
+        );
+        assert_eq!(
+            catalogue_buckets(k * B + 100 * SEC, k * B + 200 * SEC),
+            (k + 1, k - 1, vec![(k * B + 100 * SEC, k * B + 200 * SEC)]),
+            "a window inside one bucket"
+        );
+        assert_eq!(
+            catalogue_buckets(k * B, (k + 2) * B),
+            (k, k + 1, vec![]),
+            "whole buckets only"
         );
     }
 }

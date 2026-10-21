@@ -79,6 +79,7 @@ fn search_statements() -> Vec<(&'static str, String)> {
         },
         &StatementTables {
             spans: "spans",
+            error_spans: "error_spans",
             resources: "resources",
             traces: "traces",
             indexed: &[],
@@ -4873,6 +4874,7 @@ fn route_accepts(query: &str) -> bool {
         },
         &StatementTables {
             spans: "spans",
+            error_spans: "error_spans",
             resources: "resources",
             traces: "traces",
             indexed: &[],
@@ -5405,7 +5407,7 @@ fn a_count_or_number_operand_joins_the_read_spans() {
     );
     let f = text("{ span:childCount > 1 + 1 }");
     assert!(
-        f.contains("HAVING count() > 2") && !f.contains("pv_"),
+        f.contains("HAVING uniqExact(span_id, start_ns, kind) > 2") && !f.contains("pv_"),
         "{f}"
     );
     let s = compile_search_of("{ } | select(nestedSetLeft)").expect("served");

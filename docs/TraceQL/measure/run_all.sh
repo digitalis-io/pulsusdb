@@ -116,7 +116,7 @@ P=(python3 "$HERE/search_sliced.py" "$CH" tqd_g1 "$S_NS" "$E_NS")
 echo "== the reference, same queries"; python3 "$HERE/http_bench.py" reference "$REF" "$START" "$END" 5 > "$R/g1-reference-warm.tsv"
 echo "== trace fetch, interleaved"; : > "$R/g1-fetch-compare.tsv"
 for tid in 50fb0cd99260ac2a15d0a6f208126742 9e0ae95131b5bedbeea2c9eb5234f1ec; do
-  python3 "$HERE/fetch_compare.py" "$CH" tqd_g1 "$REF" "$tid" 21 >> "$R/g1-fetch-compare.tsv"; done
+  python3 "$HERE/fetch_compare_design.py" "$CH" tqd_g1 "$REF" "$tid" 21 >> "$R/g1-fetch-compare.tsv"; done
 echo "== the reference's broad search, three calls"; : > "$R/g1-broad-search-check.tsv"
 for i in 1 2 3; do python3 "$HERE/broad_search_check.py" "$CH" tqd_g1 "$REF" "$START" "$END" | tr '\n' ' ' >> "$R/g1-broad-search-check.tsv"; echo >> "$R/g1-broad-search-check.tsv"; done
 
@@ -205,7 +205,7 @@ echo "== storage totals, compression, rows per span"
 q "SELECT table, sum(rows) AS rows, sum(bytes_on_disk) AS bytes, round(sum(bytes_on_disk)/$SPANS, 3) AS b_per_span
    FROM system.parts WHERE database='tqd_g1' AND active AND table IN ('spans','resources','traces','tag_names','tag_values')
    GROUP BY table ORDER BY table FORMAT TSVWithNames" > "$R/storage.tsv"
-q "WITH (SELECT sum(bytes_on_disk) FROM system.parts WHERE database='tqd_g1' AND active AND table IN ('spans','resources','traces','tag_names','tag_values')) AS total,
+q "WITH (SELECT sum(bytes_on_disk) FROM system.parts WHERE database='tqd_g1' AND active AND table IN ('spans','resources','traces','tag_names','tag_values','tag_bucket_values','error_spans','service_bucket_resources')) AS total,
         (SELECT sum(bytes_on_disk) FROM system.parts WHERE database='tqd_g1' AND active AND table='spans') AS span,
         (SELECT sum(data_compressed_bytes) FROM system.parts WHERE database='tqd_g1' AND active AND table='spans') AS comp,
         (SELECT sum(data_uncompressed_bytes) FROM system.parts WHERE database='tqd_g1' AND active AND table='spans') AS uncomp,

@@ -30,7 +30,8 @@ impl TraceEngine {
     /// 2 * limit`, `k` the slices of the current width the window holds.
     /// `Some` is a slice's answer; `None` means the whole-window statement
     /// answers, and its `search_statement` stage is pushed. A slice's
-    /// demand is the request's `400`.
+    /// demand is the request's `400`. The trace-level statement (issue #601
+    /// part 4a) reads the window in one statement, so no slice runs for it.
     pub(super) async fn newest_first(
         &self,
         request: &SearchRequest,
@@ -42,7 +43,7 @@ impl TraceEngine {
         let mut budget = ByteBudget::new(HYDRATION_BYTE_BUDGET);
         let mut charged = 0usize;
         let mut len = SLICE_NS;
-        while len < window_ns {
+        while len < window_ns && !stmt.is_trace_level() {
             let sliced = self
                 .search_statement(request, Some(len))
                 .expect("a statement that compiled whole compiles sliced");
@@ -168,9 +169,9 @@ impl StatementRows {
 }
 
 impl TraceEngine {
-    /// Issues `stmt` once with the search settings plus `final = 1` (and a
-    /// climb's depth bound), collecting its rows against `budget`. A
-    /// ClickHouse error comes back as it came, for [`statement_error`].
+    /// Issues `stmt` once with [`Self::statement_settings`] (and a climb's
+    /// depth bound), collecting its rows against `budget`. A ClickHouse
+    /// error comes back as it came, for [`statement_error`].
     pub(super) async fn statement_rows(
         &self,
         stmt: &SearchStatement,
@@ -208,8 +209,11 @@ impl TraceEngine {
 }
 
 impl TraceEngine {
-    /// A search statement's settings: [`with_final`] over the search
-    /// settings, and, clustered, `distributed_product_mode = 'local'` for a
+    /// A search statement's settings: the search settings, with
+    /// [`with_final`] when the statement keeps `final` (issue #601 part 4a:
+    /// it reads the nested-set numbering; every other statement keeps one
+    /// row per span identity itself), and, clustered,
+    /// `distributed_product_mode = 'local'` for a
     /// statement that reads the nested-set numbering (issue #594 part 2),
     /// holds a structural operator (issue #602 part 2b) or reads a span's
     /// child count (issue #600 part 2). That statement
@@ -220,12 +224,19 @@ impl TraceEngine {
     /// rows, and so its numbering, its relations and its child counts, are
     /// whole on one shard.
     pub(super) fn statement_settings(&self, stmt: &SearchStatement) -> QuerySettings {
-        product_mode(
-            with_final(self.search_settings()),
-            self.config.distributed,
-            stmt.nests_reads(),
-        )
+        search_statement_settings(&self.config, stmt)
     }
+}
+
+/// [`TraceEngine::statement_settings`], on the engine's configuration.
+fn search_statement_settings(config: &TraceReadConfig, stmt: &SearchStatement) -> QuerySettings {
+    let settings = super::search_settings(config);
+    let settings = if stmt.keeps_final() {
+        with_final(settings)
+    } else {
+        settings
+    };
+    product_mode(settings, config.distributed, stmt.nests_reads())
 }
 
 /// [`TraceEngine::statement_settings`]'s rule, on its own.
@@ -259,6 +270,59 @@ mod tests {
         }
     }
 
+    /// T13 (issue #601 part 4a): a search statement runs under `final`
+    /// only when it reads the nested-set numbering — a predicate, the
+    /// projection or a `by()` key.
+    #[test]
+    fn a_statement_keeps_final_only_when_it_numbers() {
+        let cfg = TraceReadConfig {
+            spans_table: "trace_spans".to_string(),
+            attrs_table: "trace_attrs_idx".to_string(),
+            edges_table: "trace_edges".to_string(),
+            recent_table: "trace_recent".to_string(),
+            errors_table: "trace_error_spans".to_string(),
+            spans_v2_table: "spans".to_string(),
+            error_spans_table: "error_spans".to_string(),
+            traces_table: "traces".to_string(),
+            resources_table: "resources".to_string(),
+            scan_budget_rows: 1_000,
+            max_depth: 64,
+            max_series: 1_000,
+            read_max_memory_bytes: 1 << 30,
+            distributed: false,
+            skip_unavailable_shards: false,
+        };
+        for (q, want) in [
+            ("{ status = error }", None),
+            ("{ status = error } | count() > 1", None),
+            ("{ nestedSetParent > 0 }", Some("1")),
+            ("{ } | select(nestedSetLeft)", Some("1")),
+        ] {
+            let request = SearchRequest {
+                start_ns: 1_700_000_000_000_000_000,
+                end_ns: 1_700_003_600_000_000_000,
+                limit: 20,
+                spss: 3,
+                query: pulsus_traceql::parse(q).expect("parses"),
+            };
+            let stmt = crate::traces::spans::search::plan_statement_sliced(
+                &request,
+                "spans",
+                "traces",
+                "resources",
+                64,
+                &[],
+                None,
+            )
+            .unwrap_or_else(|e| panic!("{q}: {e}"));
+            assert_eq!(
+                search_statement_settings(&cfg, &stmt).get("final"),
+                want,
+                "{q}"
+            );
+        }
+    }
+
     /// TP1b (#603 follow-up): the newest-first statements' settings — the
     /// composition `TraceEngine::statement_settings` returns — carry the
     /// answer pins, pruning as the deployment is sharded.
@@ -274,6 +338,7 @@ mod tests {
                         recent_table: "trace_recent".to_string(),
                         errors_table: "trace_error_spans".to_string(),
                         spans_v2_table: "spans".to_string(),
+                        error_spans_table: "error_spans".to_string(),
                         traces_table: "traces".to_string(),
                         resources_table: "resources".to_string(),
                         scan_budget_rows: 1_000,

@@ -34,6 +34,7 @@ impl TraceReadConfig {
             // carve-out the tag catalog has — a `_dist` wrapper would fan a
             // read out to every shard for rows every shard already holds.
             spans_v2_table: format!("spans{dist}"),
+            error_spans_table: format!("error_spans{dist}"),
             traces_table: format!("traces{dist}"),
             resources_table: "resources".to_string(),
             scan_budget_rows: config.reader.traceql_scan_budget_rows,
@@ -82,6 +83,7 @@ mod tests {
             assert_eq!(c.recent_table, format!("trace_recent{dist}"));
             assert_eq!(c.errors_table, format!("trace_error_spans{dist}"));
             assert_eq!(c.spans_v2_table, format!("spans{dist}"));
+            assert_eq!(c.error_spans_table, format!("error_spans{dist}"));
             assert_eq!(c.traces_table, format!("traces{dist}"));
             assert_eq!(c.resources_table, "resources");
             assert_eq!(c.scan_budget_rows, 7);

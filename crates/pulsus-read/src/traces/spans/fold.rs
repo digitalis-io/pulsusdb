@@ -86,8 +86,10 @@ pub struct Src {
 }
 
 impl Src {
-    /// The span table: `from` is `<table>\nWHERE …`, `scope` the numbering's
-    /// `WITH` prefix, `inline` each named column's expression.
+    /// The span table: `from` is `<table>\nWHERE …`, or that read keeping one
+    /// row per span identity (`super::distinct_spans`, issue #601 part 4a),
+    /// `scope` the numbering's `WITH` prefix, `inline` each named column's
+    /// expression.
     pub fn table(scope: &str, from: String, inline: Vec<(String, String)>) -> Self {
         Src {
             scope: scope.to_string(),

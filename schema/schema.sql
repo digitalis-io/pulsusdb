@@ -1075,3 +1075,91 @@ FROM
     WHERE row_kind = 0
     GROUP BY trace_id
 );
+
+CREATE TABLE IF NOT EXISTS {{db}}.tag_bucket_values{{on_cluster}}
+(
+    bucket Int64 CODEC(ZSTD(1)),
+    service LowCardinality(String) CODEC(ZSTD(1)),
+    scope LowCardinality(String) CODEC(ZSTD(1)),
+    key String CODEC(ZSTD(1)),
+    vals AggregateFunction(groupUniqArray(101), Tuple(String, LowCardinality(String))) CODEC(ZSTD(1))
+)
+--@single  ENGINE = AggregatingMergeTree
+--@cluster ENGINE = ReplicatedAggregatingMergeTree('/clickhouse/tables/all/{{db}}.tag_bucket_values', '{replica}')
+PARTITION BY toDate(fromUnixTimestamp64Nano(bucket * 300000000000), 'UTC')
+ORDER BY (service, scope, key, bucket)
+TTL toDateTime(least(intDiv(bucket * 300000000000, 1000000000) + ({{retention_days}} * 86400), 4294967295))
+--@single  SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{trace_dedup_window}}{{storage_policy}};
+--@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, replicated_deduplication_window = {{trace_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
+
+CREATE TABLE IF NOT EXISTS {{db}}.error_spans{{on_cluster}}
+(
+    trace_id FixedString(16) CODEC(ZSTD(1)),
+    span_id FixedString(8) CODEC(ZSTD(1)),
+    start_ns Int64 CODEC(Delta(8), ZSTD(1)),
+    duration_ns Int64 CODEC(T64, ZSTD(1)),
+    end_ns UInt64 CODEC(Delta(8), ZSTD(1)),
+    service LowCardinality(String) CODEC(ZSTD(1)),
+    service_type LowCardinality(String) CODEC(ZSTD(1)),
+    resource_id UInt128 CODEC(ZSTD(1)),
+    name LowCardinality(String) CODEC(ZSTD(1)),
+    kind Int32 CODEC(ZSTD(1)),
+    status_code Int32 CODEC(ZSTD(1)),
+    status_message String CODEC(ZSTD(1))
+)
+--@single  ENGINE = ReplacingMergeTree
+--@cluster ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/{{db}}.error_spans', '{replica}')
+PARTITION BY toDate(fromUnixTimestamp64Nano(start_ns), 'UTC')
+ORDER BY (intDiv(start_ns, 300000000000), trace_id, start_ns, span_id, kind)
+TTL toDateTime(least(intDiv(start_ns, 1000000000) + ({{retention_days}} * 86400), 4294967295))
+--@single  SETTINGS ttl_only_drop_parts = 1, index_granularity = 2048, min_columns_to_activate_adaptive_write_buffer = 1, non_replicated_deduplication_window = {{trace_dedup_window}}{{storage_policy}};
+--@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 2048, min_columns_to_activate_adaptive_write_buffer = 1, replicated_deduplication_window = {{trace_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
+
+--@cluster CREATE TABLE IF NOT EXISTS {{db}}.error_spans{{dist_suffix}}{{on_cluster}} AS {{db}}.error_spans
+--@cluster ENGINE = Distributed('{{cluster}}', '{{db}}', 'error_spans', cityHash64(trace_id))
+--@cluster SETTINGS fsync_after_insert = 1, fsync_directories = 1;
+
+CREATE MATERIALIZED VIEW {{db}}.error_spans_mv{{on_cluster}} TO {{db}}.error_spans{{route_suffix}}
+AS SELECT trace_id, span_id, start_ns, duration_ns, end_ns, service, service_type, resource_id, name, kind,
+          status_code, status_message
+FROM {{db}}.trace_landing
+WHERE row_kind = 0 AND status_code = 2;
+
+CREATE MATERIALIZED VIEW {{db}}.tag_bucket_values_mv{{on_cluster}} TO {{db}}.tag_bucket_values
+AS SELECT intDiv(start_ns, 300000000000) AS bucket, service, 'span' AS scope, pv.1 AS key,
+          groupUniqArrayState(101)(e) AS vals
+FROM {{db}}.trace_landing
+ARRAY JOIN arrayZip(mapKeys(JSONAllPathsWithTypes(attrs)), mapValues(JSONAllPathsWithTypes(attrs)),
+                    JSONAllValues(attrs)) AS pv
+ARRAY JOIN multiIf(
+    pv.2 = 'String',  [(pv.3, 'string')],
+    pv.2 = 'Int64',   [(pv.3, 'int')],
+    pv.2 = 'Float64', [(pv.3, 'float')],
+    pv.2 = 'Bool',    [(pv.3, 'bool')],
+    pv.2 = 'Array(Nullable(String))',  arrayMap(x -> (assumeNotNull(x), 'string'), CAST(pv.3, 'Array(Nullable(String))')),
+    pv.2 = 'Array(Nullable(Int64))',   arrayMap(x -> (toString(assumeNotNull(x)), 'int'), CAST(pv.3, 'Array(Nullable(Int64))')),
+    pv.2 = 'Array(Nullable(Float64))', arrayMap(x -> (toString(assumeNotNull(x)), 'float'), CAST(pv.3, 'Array(Nullable(Float64))')),
+    pv.2 = 'Array(Nullable(Bool))',    arrayMap(x -> (toString(assumeNotNull(x)), 'bool'), CAST(pv.3, 'Array(Nullable(Bool))')),
+    CAST([], 'Array(Tuple(String, String))')) AS e
+WHERE row_kind = 0 AND service_type = 'string'
+GROUP BY bucket, service, scope, key;
+
+CREATE TABLE IF NOT EXISTS {{db}}.service_bucket_resources{{on_cluster}}
+(
+    bucket Int64 CODEC(ZSTD(1)),
+    service LowCardinality(String) CODEC(ZSTD(1)),
+    resource_id UInt128 CODEC(ZSTD(1))
+)
+--@single  ENGINE = ReplacingMergeTree
+--@cluster ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/all/{{db}}.service_bucket_resources', '{replica}')
+PARTITION BY toDate(fromUnixTimestamp64Nano(bucket * 300000000000), 'UTC')
+ORDER BY (service, bucket, resource_id)
+TTL toDateTime(least(intDiv(bucket * 300000000000, 1000000000) + ({{retention_days}} * 86400), 4294967295))
+--@single  SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, non_replicated_deduplication_window = {{trace_dedup_window}}{{storage_policy}};
+--@cluster SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192, replicated_deduplication_window = {{trace_dedup_window}}, replicated_deduplication_window_seconds = {{dedup_window_seconds}}{{storage_policy}};
+
+CREATE MATERIALIZED VIEW {{db}}.service_bucket_resources_mv{{on_cluster}} TO {{db}}.service_bucket_resources
+AS SELECT intDiv(start_ns, 300000000000) AS bucket, service, resource_id
+FROM {{db}}.trace_landing
+WHERE row_kind = 0 AND service_type = 'string'
+GROUP BY bucket, service, resource_id;

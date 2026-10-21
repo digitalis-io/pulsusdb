@@ -19,7 +19,7 @@
 use pulsus_traceql::{BoolOp, FieldExpr, SpansetExpr, StructuralModifier, StructuralOp, Value};
 
 use super::predicate::{PredicateCtx, SpanPredicate, compile_span_predicate_in};
-use super::tracelevel::TraceLeaf;
+use super::tracelevel::{CHILDREN, TraceLeaf};
 use crate::traces::PlanError;
 
 /// The all-zero parent: a root.
@@ -230,7 +230,9 @@ impl Membership<'_, '_> {
                     self.over(
                         "trace_id, parent_span_id",
                         seed,
-                        &format!("{under} GROUP BY trace_id, parent_span_id HAVING count() >= 2")
+                        &format!(
+                            "{under} GROUP BY trace_id, parent_span_id HAVING {CHILDREN} >= 2"
+                        )
                     ),
                     self.over("trace_id, parent_span_id", seed, &under)
                 )
@@ -310,11 +312,11 @@ impl Membership<'_, '_> {
              countIf({start}) > 0 AND countIf({other}) > 0 AS both \
              FROM {spans} WHERE {scope}{window} GROUP BY trace_id)) AS climb_cand, \
              climb AS (\
-             SELECT trace_id, span_id AS start, parent_span_id AS cur, toUInt32(1) AS depth, {found_base} AS found, CAST([], 'Array(FixedString(8))') AS path FROM {spans} \
+             SELECT DISTINCT trace_id, span_id AS start, parent_span_id AS cur, toUInt32(1) AS depth, {found_base} AS found, CAST([], 'Array(FixedString(8))') AS path FROM {spans} \
              WHERE {CAND_KEYS} AND {window} AND ({start}) AND parent_span_id != {ZERO} AND parent_span_id != span_id \
              UNION ALL \
              SELECT c.trace_id, c.start, x.parent_span_id, c.depth + 1, {found_step}, arrayPushBack(c.path, c.cur) \
-             FROM (SELECT trace_id, span_id, parent_span_id FROM {spans} WHERE {CAND_KEYS} AND {window}) AS x \
+             FROM (SELECT DISTINCT trace_id, span_id, parent_span_id FROM {spans} WHERE {CAND_KEYS} AND {window}) AS x \
              INNER JOIN climb AS c ON x.trace_id = c.trace_id AND x.span_id = c.cur \
              WHERE c.found = 0 AND c.depth <= {d} AND x.parent_span_id != {ZERO} AND x.parent_span_id != x.span_id \
              AND NOT has(c.path, x.parent_span_id))",

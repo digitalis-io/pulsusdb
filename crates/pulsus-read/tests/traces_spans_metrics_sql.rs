@@ -108,6 +108,7 @@ fn golden(stem: &str, query: &str) -> String {
         },
         &StatementTables {
             spans: "spans",
+            error_spans: "error_spans",
             resources: "resources",
             traces: "traces",
             indexed: &[],
@@ -162,6 +163,35 @@ fn every_case_has_a_statement() {
             !golden(stem, query).contains("-- no statement"),
             "{stem}: {query} has no statement"
         );
+    }
+}
+
+/// T3 (issue #601 part 4c): **a resource key reads its label once per
+/// resource.** A `by()` on a resource attribute, scoped or unscoped, takes
+/// its `(text, type)` label from the lookup, computed there per resource
+/// row: neither the range nor the instant statement casts the looked-up
+/// text back to a typed value per span.
+#[test]
+fn a_resource_key_reads_its_label_once_per_resource() {
+    for query in [
+        "{} | rate() by(resource.k8s.pod.name)",
+        "{} | rate() by(.k8s.pod.name)",
+    ] {
+        let text = golden("t3", query);
+        assert!(
+            !text.contains("CAST(CAST(tupleElement(rv, 2)"),
+            "{query}: the label is rebuilt per span: {text}"
+        );
+        let parts: Vec<&str> = text.split("\n== ").skip(1).collect();
+        assert_eq!(parts.len(), 2, "{query}: a range and an instant statement");
+        for (name, part) in parts.iter().map(|p| (&p[..7], p)) {
+            for alias in ["AS rk_", "AS ri_"] {
+                assert!(
+                    part.contains(alias),
+                    "{query}: the {name} statement lacks {alias:?}: {part}"
+                );
+            }
+        }
     }
 }
 

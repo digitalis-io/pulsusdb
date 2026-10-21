@@ -41,9 +41,9 @@ use super::attr_index::{IndexedAttr, index_hints};
 use super::numbering::numbering_sql;
 use super::predicate::{
     HELD, PredicateCtx, SpanPredicate, any_element_held, attr_path, compile_span_predicate_in,
-    first_element, resource_value_in, scope_value,
+    first_element, resource_label_in, scope_value,
 };
-use super::tracelevel::{TraceLeaf, TraceValue, per_trace_sql, trace_values_sql};
+use super::tracelevel::{CHILDREN, TraceLeaf, TraceValue, per_trace_sql, trace_values_sql};
 
 /// The `throwIf` message of the series cap. The engine turns a `Code: 395`
 /// carrying it into the series cap's `422`.
@@ -88,6 +88,9 @@ const WELL_KNOWN_SPAN: [&str; 3] = ["http.status_code", "http.method", "http.url
 #[derive(Debug, Clone, Copy)]
 pub struct StatementTables<'a> {
     pub spans: &'a str,
+    /// The error-span table (issue #601 part 4b): the statement's span
+    /// table when [`super::error_spans::admits`] the query.
+    pub error_spans: &'a str,
     pub resources: &'a str,
     pub traces: &'a str,
     pub indexed: &'a [IndexedAttr],
@@ -111,6 +114,8 @@ pub struct MetricsStatement {
     unit: TargetUnit,
     demands: Vec<String>,
     compare: bool,
+    /// Whether the statement runs under `final` (issue #601 part 4a).
+    keeps_final: bool,
 }
 
 impl MetricsStatement {
@@ -118,6 +123,13 @@ impl MetricsStatement {
     /// [`CompareStatementRow`]s.
     pub fn is_compare(&self) -> bool {
         self.compare
+    }
+
+    /// Whether the statement runs under `final` (issue #601 part 4a): it
+    /// reads the nested-set numbering, through a key, the target or the
+    /// filter. Every other statement keeps one row per span identity itself.
+    pub fn keeps_final(&self) -> bool {
+        self.keeps_final
     }
 
     /// The messages the filter's `!` demands raise (issue #602 part 2a): a
@@ -252,7 +264,17 @@ pub fn plan_trace_metrics_routed(
     let Ok(plan) = plan_trace_metrics(&shell, params, ctx) else {
         return today();
     };
-    match statement_for(&plan, &asked, filter.body.as_ref(), ctx.max_series, tables) {
+    // Issue #601 part 4b: an admitted query's statement reads the error-span
+    // table as its span table.
+    let tables = if super::error_spans::admits(query) {
+        StatementTables {
+            spans: tables.error_spans,
+            ..*tables
+        }
+    } else {
+        *tables
+    };
+    match statement_for(&plan, &asked, filter.body.as_ref(), ctx.max_series, &tables) {
         Some(statement) => Ok(RoutedMetricsPlan {
             plan,
             statement: Some(statement),
@@ -346,6 +368,7 @@ fn statement_for(
         unit: asked.target.unit(),
         demands: demands_of(body, range_window, tables),
         compare: false,
+        keeps_final: range.keeps_final,
     })
 }
 
@@ -360,14 +383,15 @@ fn fills(plan: &TraceMetricsPlan) -> bool {
 /// the search statement's per-trace scalar, operand pairs and numbered
 /// traces over that window, or nothing. `("true", "")` for `{}`; `None`
 /// when the body does not compile. A `!` demand is kept in the predicate
-/// and carried as the statement's demands (issue #602 part 2a).
+/// and carried as the statement's demands (issue #602 part 2a). The flag
+/// is whether the predicate reads the nested-set numbering.
 fn predicate(
     body: Option<&FieldExpr>,
     ctx: &PredicateCtx<'_>,
     traces: &str,
-) -> Option<(String, String)> {
+) -> Option<(String, String, bool)> {
     let Some(body) = body else {
-        return Some(("true".to_string(), String::new()));
+        return Some(("true".to_string(), String::new(), false));
     };
     let p = compile_span_predicate_in(body, ctx).ok()?;
     let w = ctx.window;
@@ -388,6 +412,7 @@ fn predicate(
             .sql()
             .to_string(),
         with,
+        p.reads_numbering(),
     ))
 }
 
@@ -434,6 +459,8 @@ struct Read {
     g: String,
     x: Option<String>,
     i: Option<String>,
+    /// Whether the read keeps `final`: it reads the numbering.
+    keeps_final: bool,
 }
 
 impl Read {
@@ -450,7 +477,7 @@ impl Read {
             resources_table: tables.resources,
             indexed: tables.indexed,
         };
-        let (predicate, with) = predicate(body, &ctx, tables.traces)?;
+        let (predicate, with, numbered) = predicate(body, &ctx, tables.traces)?;
         let mut joins = Joins::default();
         let mut texts = Vec::with_capacity(asked.keys.len());
         for key in &asked.keys {
@@ -497,12 +524,45 @@ impl Read {
             }
             _ => String::new(),
         };
+        // Issue #601 part 4a: a count and a rate count each span identity
+        // once in the statement itself; any other kind reads one row per
+        // span identity; a read of the numbering keeps `final` for both.
+        let keeps_final = joins.numbering || numbered;
+        let dedup = !keeps_final && !matches!(plan.kind(), PlanKind::Count { .. });
+        // Issue #601 part 4c (D1): a read through the dedup wrap computes
+        // the key array and the target inside it and reads them by alias,
+        // so the wrap reads each subcolumn they name and not its whole
+        // column. An ungrouped statement's key array is a constant, which
+        // reads no column and stays outside, where it is not grouped by.
+        let (inner, g, x, i) = if dedup {
+            let keyed = !texts.is_empty();
+            let mut inner = if keyed {
+                format!(", {g} AS w_g")
+            } else {
+                String::new()
+            };
+            if let Some(x) = &x {
+                inner.push_str(&format!(", {x} AS w_x"));
+            }
+            if let Some(i) = &i {
+                inner.push_str(&format!(", {i} AS w_i"));
+            }
+            (
+                inner,
+                if keyed { "w_g".to_string() } else { g },
+                x.map(|_| "w_x".to_string()),
+                i.map(|_| "w_i".to_string()),
+            )
+        } else {
+            (String::new(), g, x, i)
+        };
         Some(Read {
             with,
-            from: from_clause(tables, joins, window, &predicate, &condition),
+            from: from_clause(tables, joins, window, &predicate, &condition, dedup, &inner),
             g,
             x,
             i,
+            keeps_final,
         })
     }
 
@@ -568,7 +628,12 @@ fn key_text(field: &Field, ctx: &PredicateCtx<'_>, joins: &mut Joins) -> Result<
                     "if(service_type = 'string', (toString(service), 's'), ('', 'N'))".to_string()
                 }
                 AttrScope::Span => dynamic_key(&attr_path("attrs", key), missing),
-                AttrScope::Resource => dynamic_key(&resource_value_in(key, ctx)?, missing),
+                // Issue #601 part 4c (D2): the label the lookup computes
+                // once per resource row.
+                AttrScope::Resource => {
+                    let (present, label) = resource_label_in(key, ctx)?;
+                    format!("if({present}, {label}, ('', '{missing}'))")
+                }
                 AttrScope::Instrumentation => dynamic_key(&attr_path("scope_attrs", key), missing),
                 AttrScope::Event => dynamic_key(&first_element("events.attrs", key), missing),
                 AttrScope::Link => dynamic_key(&first_element("links.attrs", key), missing),
@@ -577,11 +642,8 @@ fn key_text(field: &Field, ctx: &PredicateCtx<'_>, joins: &mut Joins) -> Result<
                     let resource_arm = if key == "service.name" {
                         "service_type = 'string', (toString(service), 's')".to_string()
                     } else {
-                        let resource = resource_value_in(key, ctx)?;
-                        format!(
-                            "dynamicType({resource}) {HELD}, {}",
-                            dynamic_key(&resource, missing)
-                        )
+                        let (present, label) = resource_label_in(key, ctx)?;
+                        format!("{present}, {label}")
                     };
                     format!(
                         "multiIf(dynamicType({span}) {HELD}, {}, {resource_arm}, {}, {}, {}, \
@@ -665,13 +727,18 @@ fn trace_keys(traces: &str, window: WindowSql) -> String {
 
 /// The span rows of `window` the filter keeps, with the joins the keys and
 /// the target read: the window's three bounds, the predicate, and the
-/// target's condition.
+/// target's condition. With `dedup` (issue #601 part 4a), one row per span
+/// identity, the joins inside and each joined column the statement reads
+/// named as it reads it, then `inner`, the columns the wrap computes for
+/// the statement (part 4c); `inner` is ignored without `dedup`.
 fn from_clause(
     tables: &StatementTables<'_>,
     joins: Joins,
     window: WindowSql,
     predicate: &str,
     condition: &str,
+    dedup: bool,
+    inner: &str,
 ) -> String {
     let mut join = String::new();
     if joins.trace {
@@ -695,20 +762,32 @@ fn from_clause(
     if joins.children {
         join.push_str(&format!(
             "\nLEFT JOIN (WITH {} AS child_keys SELECT trace_id, parent_span_id AS span_id, \
-             count() AS cc FROM {} WHERE (intDiv(start_ns, 300000000000), trace_id) IN \
+             {CHILDREN} AS cc FROM {} WHERE (intDiv(start_ns, 300000000000), trace_id) IN \
              (SELECT arrayJoin(child_keys)) AND parent_span_id != toFixedString('', 8) \
              GROUP BY trace_id, parent_span_id) AS ch USING (trace_id, span_id)",
             trace_keys(tables.traces, window),
             tables.spans
         ));
     }
-    format!(
-        "FROM {}{join}\nWHERE {}\n  AND {}\n  AND {}\n  AND ({predicate}){condition}",
+    let read = format!(
+        "{}{join}\nWHERE {}\n  AND {}\n  AND {}\n  AND ({predicate}){condition}",
         tables.spans,
         window.span_time_clause(),
         window.span_bucket_clause(),
         window.span_day_clause()
-    )
+    );
+    if !dedup {
+        return format!("FROM {read}");
+    }
+    let mut cols = String::new();
+    if joins.trace {
+        cols.push_str(", tv.td AS `tv.td`, tv.rn AS `tv.rn`, tv.rs AS `tv.rs`");
+    }
+    if joins.children {
+        cols.push_str(", ch.cc AS `ch.cc`");
+    }
+    cols.push_str(inner);
+    format!("FROM {}", super::distinct_spans(&read, &cols))
 }
 
 /// What a plan's statement is made of.
@@ -792,12 +871,13 @@ impl Shape {
             }
         };
         match self.kind {
+            // Issue #601 part 4a: a count and a rate count each span
+            // identity once, unless the statement keeps `final`.
             PlanKind::Count { is_rate: true } => {
-                format!("toFloat64(count()) / {}", f64_text(seconds))
+                format!("toFloat64({}) / {}", count_of(read), f64_text(seconds))
             }
-            PlanKind::Count { is_rate: false } | PlanKind::Histogram => {
-                "toFloat64(count())".to_string()
-            }
+            PlanKind::Count { is_rate: false } => format!("toFloat64({})", count_of(read)),
+            PlanKind::Histogram => "toFloat64(count())".to_string(),
             PlanKind::Agg(AggFn::Sum) => agg("sum"),
             PlanKind::Agg(AggFn::Min) => agg("min"),
             PlanKind::Agg(AggFn::Max) => agg("max"),
@@ -830,6 +910,16 @@ impl Shape {
             SeriesReduce::TopK(n) => ("DESC", n),
             SeriesReduce::BottomK(n) => ("ASC", n),
         })
+    }
+}
+
+/// A count and a rate's count (issue #601 part 4a): each span identity once,
+/// or every row under `final`.
+fn count_of(read: &Read) -> &'static str {
+    if read.keeps_final {
+        "count()"
+    } else {
+        "uniqExact(trace_id, start_ns, span_id, kind)"
     }
 }
 
@@ -1190,8 +1280,8 @@ fn compare_statement(
     let read = |w: WindowSql, p: &str| {
         compare_sql(plan, outer, selection, window, max_series, tables, w, p)
     };
-    let range_sql = read(range_window, &range_p)?;
-    let instant_sql = read(instant_window, &instant_p)?;
+    let (range_sql, keeps_final) = read(range_window, &range_p)?;
+    let (instant_sql, _) = read(instant_window, &instant_p)?;
     let mut demands = demands_of(outer, range_window, tables);
     for d in demands_of(selection, range_window, tables) {
         if !demands.contains(&d) {
@@ -1205,6 +1295,7 @@ fn compare_statement(
         unit: TargetUnit::Raw,
         demands,
         compare: true,
+        keeps_final,
     })
 }
 
@@ -1236,7 +1327,8 @@ fn compare_intrinsic(key: &str) -> &'static str {
     }
 }
 
-/// The section 3 statement over `w`, its bucket `p`.
+/// The section 3 statement over `w`, its bucket `p`, and whether it keeps
+/// `final` (issue #601 part 4a): a body reads the nested-set numbering.
 #[allow(clippy::too_many_arguments)]
 fn compare_sql(
     plan: &TraceMetricsPlan,
@@ -1247,7 +1339,7 @@ fn compare_sql(
     tables: &StatementTables<'_>,
     w: WindowSql,
     p: &str,
-) -> Option<String> {
+) -> Option<(String, bool)> {
     let ctx = PredicateCtx {
         window: w,
         spans_table: tables.spans,
@@ -1274,7 +1366,8 @@ fn compare_sql(
     }
     let mut bound = per_trace_sql(&leaves, children, w, tables.traces);
     bound.push_str(&trace_values_sql(&values, w, w, tables.traces));
-    if both.iter().any(|p| p.reads_numbering()) {
+    let keeps_final = both.iter().any(|p| p.reads_numbering());
+    if keeps_final {
         bound.push_str(&format!("{} AS nested_keys", trace_keys(tables.traces, w)));
     }
     let bound = bound.trim_end().trim_end_matches(',');
@@ -1328,11 +1421,15 @@ fn compare_sql(
         w,
         &outer_sql,
         "",
+        !keeps_final,
+        // The outer read takes `kvs`, the whole `attrs`, which the wrap
+        // supplies whole.
+        "",
     )
     .replace('\n', &format!("\n{}", " ".repeat(36)));
     let exb = u8::from(plan.exemplar_budget() > 0);
     let top_n = plan.compare_top_n();
-    Some(format!(
+    Some((format!(
         "{with}SELECT s, g, k, v, y, pts, ex, throwIf(countIf(g = 0 AND k != '') OVER () + 4 * uniqExactIf(k, g = 1 AND k != '') OVER () > {max_series}, '{SERIES_CAP_MESSAGE}') AS c
 FROM (SELECT s, g, k, v, y, pts, ex, row_number() OVER (PARTITION BY s, g, k ORDER BY tot DESC, v, y) AS rn
       FROM (SELECT s, g, k, v, y, arraySort(groupArray((p, n))) AS pts, sum(n) AS tot,
@@ -1352,6 +1449,8 @@ FROM (SELECT s, g, k, v, y, pts, ex, row_number() OVER (PARTITION BY s, g, k ORD
             GROUP BY s, g, k, v, y))
 WHERE g = 1 OR (k != '' AND rn <= {top_n})
 ORDER BY s, g, k, v, y"
+        ),
+        keeps_final,
     ))
 }
 
@@ -1385,6 +1484,7 @@ mod tests {
 
     const TABLES: StatementTables<'static> = StatementTables {
         spans: "spans",
+        error_spans: "error_spans",
         resources: "resources",
         traces: "traces",
         indexed: &[],
@@ -1536,12 +1636,16 @@ mod tests {
                 .range_sql()
                 .to_string()
         };
-        // The key's own missing arm (`dynamic_key`, or the service column's),
-        // not `folded_keys`, which names both codes in every keyed statement
-        // (#600 part 1b-3).
+        // The key's own missing arm (`dynamic_key`, the service column's, or
+        // a resource label's, issue #601 part 4c), not `folded_keys`, which
+        // names both codes in every keyed statement (#600 part 1b-3).
         let missing = |sql: &str, code: char| {
+            let label = format!("), ('', '{code}'))");
             sql.contains(&format!("{HELD}), '{code}', 'a')"))
                 || (code == 'N' && sql.contains("(toString(service), 's'), ('', 'N'))"))
+                || sql
+                    .match_indices("ri_")
+                    .any(|(at, _)| sql.get(at + 19..).is_some_and(|r| r.starts_with(&label)))
         };
         for key in well_known {
             assert!(missing(&statement(key), 'N'), "{key}: no 'N'");
@@ -1559,6 +1663,7 @@ mod tests {
     fn the_tables_come_from_the_caller() {
         let tables = StatementTables {
             spans: "sp_t",
+            error_spans: "es_t",
             resources: "rs_t",
             traces: "tr_t",
             indexed: &[],
@@ -1718,10 +1823,14 @@ ORDER BY s, g, k, v, y";
             typed_j("resource.", "attrs"),
             w.resources_day_clause()
         );
+        // Issue #601 part 4a: one row per span identity, the join inside
+        // and its three columns named as the statement reads them.
         let from = format!(
-            "FROM spans\nLEFT JOIN (SELECT trace_id, max(end_ns) - min(start_ns) AS td, min(root) \
+            "FROM (SELECT *, tv.td AS `tv.td`, tv.rn AS `tv.rn`, tv.rs AS `tv.rs` FROM spans\n\
+             LEFT JOIN (SELECT trace_id, max(end_ns) - min(start_ns) AS td, min(root) \
              AS r, if(r.1 = 0, r.5, '') AS rn, if(r.1 = 0, r.4, '') AS rs FROM traces WHERE {} \
-             GROUP BY trace_id) AS tv USING trace_id\nWHERE {}\n  AND {}\n  AND {}\n  AND (true)",
+             GROUP BY trace_id) AS tv USING trace_id\nWHERE {}\n  AND {}\n  AND {}\n  AND (true)\n\
+             LIMIT 1 BY trace_id, start_ns, span_id, kind)",
             w.per_trace_day_clause(),
             w.span_time_clause(),
             w.span_bucket_clause(),

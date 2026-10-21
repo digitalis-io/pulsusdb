@@ -209,6 +209,7 @@ fn fetch_config() -> TraceReadConfig {
         recent_table: "trace_recent".to_string(),
         errors_table: "trace_error_spans".to_string(),
         spans_v2_table: "spans".to_string(),
+        error_spans_table: "error_spans".to_string(),
         traces_table: "traces".to_string(),
         resources_table: "resources".to_string(),
         scan_budget_rows: 50_000_000,
@@ -717,23 +718,23 @@ async fn the_outer_bucket_union_is_capped_across_the_traces_day_rows() {
 }
 
 // =====================================================================
-// The `final = 1` collapse.
+// A retried span, read without `final`.
 // =====================================================================
 
-/// **A retried span is not doubled before assembly.**
+/// **A retried span reaches the assembler as stored** (issue #601 part 4a).
 ///
-/// The quantity that moves when `final = 1` goes missing is the number of
-/// rows the ENGINE returns, which is observable only below the assembler:
-/// asserting "4 rows stored, 2 spans in the response" through HTTP passes
-/// either way, because the assembler's `(span_id, kind)` map collapses the
-/// duplicates in Rust.
+/// The fetch runs without `final`, so the ENGINE returns every stored row
+/// of a span stored twice, and the assembler's `(span_id, kind)` map keeps
+/// one (`crates/pulsus-server/src/traces_api/assemble.rs`, and the HTTP
+/// cases of `a_retried_push_is_read_once` in `traces_query_v2_live.rs`).
+/// Before part 4a this case pinned the opposite: `final = 1` collapsed the
+/// rows below the assembler.
 ///
 /// **Merges are stopped around the inserts, and that is not optional.**
 /// The two inserts write four rows with IDENTICAL sort keys into ONE
 /// partition, so a background merge between the second insert and
-/// assertion (1) collapses them to two and (1) goes red while the case's
-/// subject is unaffected — assertion (3) reads through `final = 1` and
-/// returns 2 either way. A flaky red on correct code. Weakening (1) to
+/// assertions (1) and (3) collapses them to two and both go red on correct
+/// code. Weakening (1) to
 /// `>= 2` instead would be worse: it would pass against a single insert,
 /// which is the state this case exists to rule out.
 ///
@@ -748,7 +749,7 @@ async fn the_outer_bucket_union_is_capped_across_the_traces_day_rows() {
 /// it, and a later assertion on a resource field would fail here for a
 /// reason that is not this case's subject.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_duplicate_stored_span_is_collapsed_by_final_before_the_reader_sees_it() {
+async fn a_duplicate_stored_span_reaches_the_reader_as_stored() {
     if !should_run() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
@@ -792,7 +793,7 @@ async fn a_duplicate_stored_span_is_collapsed_by_final_before_the_reader_sees_it
     // case would be red for a reason that is not its subject. Two
     // distinct tokens is what a genuine at-least-once duplicate from two
     // different pushes looks like: the same span, two blocks, and the
-    // read's own `final = 1` is the only thing that collapses them.
+    // assembler is the only thing that collapses them.
     for token in ["fetch-final-fixture-a", "fetch-final-fixture-b"] {
         // `SETTINGS` goes BEFORE `VALUES` in an insert; after it the
         // value parser reads the clause as another row.
@@ -840,16 +841,19 @@ async fn a_duplicate_stored_span_is_collapsed_by_final_before_the_reader_sees_it
     assert_eq!(state.start_ns, first_ns);
     assert_eq!(state.last_start_ns, second_ns);
 
-    // (3) the subject: the ENGINE returns two rows, not four.
+    // (3) the subject: the ENGINE returns the four stored rows, two span
+    // identities, for the assembler to collapse.
     let fetched = engine_on(&db, &prefix())
         .await
         .fetch_by_id(&hex(&trace_id), None)
         .await
         .expect("the fetch executes");
+    let identities: std::collections::BTreeSet<([u8; 8], i32)> =
+        fetched.spans.iter().map(|s| (s.span_id, s.kind)).collect();
     assert_eq!(
-        fetched.spans.len(),
-        2,
-        "`final = 1` is what collapses the duplicates before the reader sees them"
+        (fetched.spans.len(), identities.len()),
+        (4, 2),
+        "the fetch reads without `final`: both copies of each span reach the assembler"
     );
 
     drop_db(&db).await;
