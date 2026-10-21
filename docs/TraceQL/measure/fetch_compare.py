@@ -8,9 +8,11 @@ a body, or the script exits 1 naming the side and the cause. The side is also
 named on a fixed stderr line, `failed side: PulsusDB` or `failed side: the
 reference`, and stdout then carries the trace's two lines in their usual order:
 the failed side's ends `failed`, the other side's `answered` (every call it was
-given answered 200, untimed) or `not called`. The first body of each side, read
-on the protobuf wire, must hold the same number of spans, more than 0, or it
-exits 1 naming `not like for like`, with nothing on stdout.
+given answered 200, untimed) or `not called`. A call that ends without a
+status (nothing listening, a timeout, a body cut short) is its side's failure
+in the same way, and so is a first body that does not decode on the protobuf
+wire. The two first bodies must hold the same number of spans, more than 0, or
+it exits 1 naming `not like for like`, with nothing on stdout.
 Usage: fetch_compare.py PULSUS_URL REFERENCE_URL TRACE_ID_HEX REPS  |  fetch_compare.py --self-test"""
 import sys, time, statistics, urllib.request, urllib.error
 
@@ -64,10 +66,13 @@ def timed(side, url, size, first=None):
     and the body in first[side] when `first` is given"""
     t0 = time.perf_counter()
     try:
-        with urllib.request.urlopen(urllib.request.Request(url, headers=ACCEPT), timeout=120) as r:
-            body = r.read(); status = r.status
-    except urllib.error.HTTPError as e:
-        body = e.read(); status = e.code
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=ACCEPT), timeout=120) as r:
+                body = r.read(); status = r.status
+        except urllib.error.HTTPError as e:
+            body = e.read(); status = e.code
+    except Exception as e:     # no status: refused, closed, timed out, cut short
+        raise Failed(side, f'{side}: {type(e).__name__} from {url}: {e}')
     ms = (time.perf_counter() - t0) * 1000
     if status != 200:
         raise Failed(side, f'{side}: status {status} from {url}: {body[:200]!r}')
@@ -75,6 +80,8 @@ def timed(side, url, size, first=None):
         raise Failed(side, f'{side}: empty body with status 200 from {url}')
     size[side] = len(body)
     if first is not None:
+        if span_count(body) is None:
+            raise Failed(side, f'{side}: a body that is not a trace from {url}: {body[:200]!r}')
         first[side] = body
     return ms
 
@@ -171,7 +178,7 @@ def self_test():
          'failed side: PulsusDB',
          ['PulsusDB\ttrace=aaaaaaaa\tfailed', 'the reference\ttrace=aaaaaaaa\tanswered']),
         # a call that ends without a status, and a body that does not decode,
-        # are that side's failure as a status is (r9fix2)
+        # are that side's failure as a status is
         ('nothing listening on the reference port', good, 'closed',
          'failed side: the reference',
          ['PulsusDB\ttrace=aaaaaaaa\tanswered', 'the reference\ttrace=aaaaaaaa\tfailed']),
