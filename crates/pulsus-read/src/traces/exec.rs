@@ -1944,12 +1944,12 @@ impl TraceEngine {
                 .stream_tag_values(&sql, &catalog_settings(&self.config), &n)
                 .await;
         }
-        // Issue #601 part 4b: a span-scoped key narrowed by one service
-        // equality answers from the bucket catalogue, unless an interior
-        // bucket is overflowed.
-        if scope == Some("span")
-            && let Some(service) = n.service_equality()
-            && let Some(values) = self.catalogue_tag_values(service, key, req).await?
+        // Issue #601 parts 4b and 4c: a span- or resource-scoped key narrowed
+        // by one service equality answers from its bucket catalogue over the
+        // whole window, unless an interior bucket of a span key is
+        // overflowed, when today's statement answers.
+        if let Some(service) = n.service_equality()
+            && let Some(values) = self.catalogue_values(scope, service, key, req).await?
         {
             return Ok(values);
         }

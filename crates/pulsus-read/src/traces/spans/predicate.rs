@@ -307,6 +307,18 @@ pub(super) fn resource_value_in(key: &str, ctx: &PredicateCtx<'_>) -> Result<Str
     Ok(resource_value(&q))
 }
 
+/// `(present, label)` for a metrics `by()` key on resource attribute `key`
+/// (issue #601 part 4c): whether the span's resource row holds `key` as a
+/// held type, and its `(text, type)` label, computed once per resource row
+/// by the lookup.
+pub(super) fn resource_label_in(
+    key: &str,
+    ctx: &PredicateCtx<'_>,
+) -> Result<(String, String), PlanError> {
+    let mut c = Compiler::new(Some(*ctx));
+    c.resource_label(key)
+}
+
 /// Issue #591 part 2's section 3.3: `P_scope`, whether `scope` holds `key`
 /// as the unscoped chain tests it ([`Compiler::chain_presence`]).
 pub(super) fn chain_presence_in(
@@ -760,6 +772,32 @@ impl<'a> Compiler<'a> {
              dynamicType({path}) {HELD})",
             ctx.resources_table,
             ctx.window.resources_day_clause()
+        ))
+    }
+
+    /// `L(k)` (issue #601 part 4c): the resource rows in the window's days
+    /// holding `key` as a held type, their ids and their `(text, type)`
+    /// labels, the letters [`super::metrics`]' key labels use; and from it
+    /// `(present, label)` at the span's own `resource_id`.
+    fn resource_label(&mut self, key: &str) -> Result<(String, String), PlanError> {
+        let ctx = self.ctx.ok_or_else(|| needs_window(AttrScope::Resource))?;
+        self.uses_resources = true;
+        let p = attr_path(ATTRS, key);
+        let l = format!(
+            "(SELECT (groupArray(resource_id), groupArray((toString({p}), \
+             multiIf(dynamicType({p}) = 'Int64', 'i', dynamicType({p}) = 'Float64', 'd', \
+             dynamicType({p}) = 'Bool', 'b', dynamicType({p}) = 'String', 's', 'a')))) \
+             FROM {} WHERE {} AND dynamicType({p}) {HELD})",
+            ctx.resources_table,
+            ctx.window.resources_day_clause()
+        );
+        let h = fnv1a(&l);
+        Ok((
+            format!(
+                "((transform(resource_id, tupleElement({l} AS rk_{h:016x}, 1), \
+                 arrayEnumerate(tupleElement(rk_{h:016x}, 1)), 0) AS ri_{h:016x}) != 0)"
+            ),
+            format!("arrayElement(tupleElement(rk_{h:016x}, 2), ri_{h:016x})"),
         ))
     }
 

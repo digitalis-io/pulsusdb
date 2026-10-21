@@ -1,6 +1,9 @@
-//! The service-narrowed values read on the bucket catalogue (issue #601
-//! part 4b): the window's whole 5-minute buckets from `tag_bucket_values`,
-//! its partial first and last bucket from today's narrowed read.
+//! The service-narrowed values reads on the bucket catalogues: a span key's
+//! (issue #601 part 4b), the window's whole 5-minute buckets from
+//! `tag_bucket_values` and its partial first and last bucket from today's
+//! narrowed read; and a resource key's (part 4c), the window's whole
+//! buckets from `service_bucket_resources` and its partial ones from
+//! `spans`.
 
 use futures::StreamExt;
 use pulsus_clickhouse::ChError;
@@ -11,48 +14,64 @@ use super::{
 };
 use crate::logql::error::ReadError;
 use crate::traces::rows::CatalogValuesRow;
-use crate::traces::spans::tags::catalogue_values_sql;
+use crate::traces::spans::tags::{
+    catalogue_buckets, catalogue_resource_values_sql, catalogue_values_sql, resource_edge_sql,
+};
 
 impl TraceEngine {
+    /// The service-narrowed values read of `scope.key` on its bucket
+    /// catalogue (issue #601 parts 4b and 4c): a span key's, `None` when a
+    /// whole bucket is overflowed; a resource key's other than
+    /// `service.name`; `None` for any other key, which the caller reads as
+    /// today.
+    pub(super) async fn catalogue_values(
+        &self,
+        scope: Option<&str>,
+        service: &str,
+        key: &str,
+        req: TagValuesRequest<'_>,
+    ) -> Result<Option<TagValues>, ReadError> {
+        match scope {
+            Some("span") => self.catalogue_tag_values(service, key, req).await,
+            Some("resource") if key != "service.name" => self
+                .catalogue_resource_values(service, key, req)
+                .await
+                .map(Some),
+            _ => Ok(None),
+        }
+    }
+
     /// The service-narrowed values of span-scoped `key` over `req`'s
     /// window (issue #601 part 4b): its whole 5-minute buckets from
     /// `tag_bucket_values`, its partial first and last bucket from today's
     /// narrowed read with that edge as its window, in one statement.
-    /// `None` when the window holds no whole bucket, or when a whole bucket
-    /// is overflowed: the caller then runs today's statement.
+    /// `None` when a whole bucket is overflowed: the caller then runs
+    /// today's statement.
     pub(super) async fn catalogue_tag_values(
         &self,
         service: &str,
         key: &str,
         req: TagValuesRequest<'_>,
     ) -> Result<Option<TagValues>, ReadError> {
-        const BUCKET_NS: i64 = 300_000_000_000;
-        let (start_ns, end_ns) = (req.start_ns, req.end_ns);
-        let lo = start_ns.div_euclid(BUCKET_NS) + i64::from(start_ns.rem_euclid(BUCKET_NS) != 0);
-        let hi = end_ns.div_euclid(BUCKET_NS) - 1;
-        if lo > hi {
-            return Ok(None);
-        }
+        let (lo, hi, buckets) = catalogue_buckets(req.start_ns, req.end_ns);
         let mut edges = Vec::new();
-        for (s, e) in [(start_ns, lo * BUCKET_NS), ((hi + 1) * BUCKET_NS, end_ns)] {
-            if s < e {
-                let w = WindowSql::start_closed_end_open(s, e);
-                let ctx = PredicateCtx {
-                    window: w,
-                    spans_table: &self.config.spans_v2_table,
-                    resources_table: &self.config.resources_table,
-                    indexed: &[],
-                };
-                let edge_n = req.narrowing(&ctx);
-                edges.push(tag_values_statement(
-                    &self.config,
-                    self.tag_read_rows,
-                    Some("span"),
-                    key,
-                    w,
-                    &edge_n,
-                ));
-            }
+        for (s, e) in buckets {
+            let w = WindowSql::start_closed_end_open(s, e);
+            let ctx = PredicateCtx {
+                window: w,
+                spans_table: &self.config.spans_v2_table,
+                resources_table: &self.config.resources_table,
+                indexed: &[],
+            };
+            let edge_n = req.narrowing(&ctx);
+            edges.push(tag_values_statement(
+                &self.config,
+                self.tag_read_rows,
+                Some("span"),
+                key,
+                w,
+                &edge_n,
+            ));
         }
         let sql = catalogue_values_sql(service, key, lo, hi, &edges, TAG_VALUES_MAX + 1);
         let n = TagNarrowing::default();
@@ -83,5 +102,51 @@ impl TraceEngine {
         let truncated = values.len() > TAG_VALUES_MAX;
         values.truncate(TAG_VALUES_MAX);
         Ok(Some(TagValues { values, truncated }))
+    }
+
+    /// The service-narrowed values of resource-scoped `key` over `req`'s
+    /// whole window (issue #601 part 4c): the resources `service`'s spans
+    /// used in its whole 5-minute buckets from `service_bucket_resources`,
+    /// and in its partial first and last bucket from `spans`, in one
+    /// statement with no cut.
+    pub(super) async fn catalogue_resource_values(
+        &self,
+        service: &str,
+        key: &str,
+        req: TagValuesRequest<'_>,
+    ) -> Result<TagValues, ReadError> {
+        let (lo, hi, buckets) = catalogue_buckets(req.start_ns, req.end_ns);
+        let mut edges = Vec::new();
+        for (s, e) in buckets {
+            let w = WindowSql::start_closed_end_open(s, e);
+            let ctx = PredicateCtx {
+                window: w,
+                spans_table: &self.config.spans_v2_table,
+                resources_table: &self.config.resources_table,
+                indexed: &[],
+            };
+            let edge_n = req.narrowing(&ctx);
+            edges.push(resource_edge_sql(
+                &self.config.spans_v2_table,
+                w,
+                edge_n.predicate(),
+            ));
+        }
+        let sql = catalogue_resource_values_sql(
+            service,
+            key,
+            lo,
+            hi,
+            &edges,
+            TAG_VALUES_MAX + 1,
+            &self.config.resources_table,
+            &req.window().resources_day_clause(),
+        );
+        self.stream_tag_values(
+            &sql,
+            &tag_store_settings(&self.config),
+            &TagNarrowing::default(),
+        )
+        .await
     }
 }

@@ -546,7 +546,7 @@ fn search_sql_kept(
     } else {
         ("", "", String::new())
     };
-    let common: [(&str, &str); 13] = [
+    let common: [(&str, &str); 12] = [
         ("scalars", &scalars),
         ("scope_top", scope_top),
         ("scope_detail", scope_detail),
@@ -557,7 +557,6 @@ fn search_sql_kept(
         ("day", &day),
         ("limit", &limit_text),
         ("spss", &spss_text),
-        ("projection", &projection),
         ("trace_read", &trace_read),
         ("traces", traces_table),
     ];
@@ -594,12 +593,18 @@ fn search_sql_kept(
                     ("predicate", p.sql()),
                 ],
             );
-            let detail_from = if keeps {
-                detail
+            // Issue #601 part 4c (D1): a wrapped detail read computes the
+            // projection inside the wrap and the statement reads its alias.
+            let (detail_from, detail_projection) = if keeps {
+                (detail, projection.as_str())
             } else {
-                super::distinct_spans(&detail, "")
+                (
+                    super::distinct_spans(&detail, &format!(", {projection} AS w_proj")),
+                    "w_proj",
+                )
             };
             let mut values: Vec<(&str, &str)> = common.to_vec();
+            values.push(("projection", detail_projection));
             values.push(("predicate", p.sql()));
             values.push(("top_time", &top_time));
             values.push(("top_bucket", &top_bucket));
@@ -621,8 +626,8 @@ fn search_sql_kept(
                 top.span_bucket_clause(),
                 top.span_day_clause(),
             );
-            let (sel, flags, member) = match &**selector {
-                SearchFilter::One(p) => (p.sql().to_string(), String::new(), None),
+            let (sel, flags, flag_names, member) = match &**selector {
+                SearchFilter::One(p) => (p.sql().to_string(), String::new(), String::new(), None),
                 SearchFilter::Tree {
                     filters, guards, ..
                 } => {
@@ -641,14 +646,16 @@ fn search_sql_kept(
                             Some(g) => format!("(f{i} AND {g})"),
                         })
                         .collect();
+                    let names: String = (1..=n).map(|i| format!(", f{i}")).collect();
                     (
                         any_sql.join(" OR "),
                         format!(", {}", flags.join(", ")),
+                        names,
                         Some((counts.join(", "), member.join(" OR "))),
                     )
                 }
                 SearchFilter::Structural { member, .. } => {
-                    (member.sql().to_string(), String::new(), None)
+                    (member.sql().to_string(), String::new(), String::new(), None)
                 }
                 SearchFilter::Pipeline { .. } => unreachable!("a selector is not a pipeline"),
             };
@@ -661,34 +668,52 @@ fn search_sql_kept(
             };
             // The fold's span rows: the span table itself for one filter,
             // so a clustered statement groups on each shard; a tree's flags
-            // and membership as a relation.
+            // and membership as a relation. Issue #601 part 4c (D1): a read
+            // keeping one row per span identity computes every named column,
+            // and a tree's flags, inside the wrap, and the fold reads them
+            // by name.
             let base = |is_top: bool, keys_cond: &str| -> Src {
                 let scope = if is_top { scope_top } else { scope_detail };
                 let read = format!(
                     "{spans_table}\nWHERE {keys_cond}{time}\n  AND {bucket}\n  AND {day}\n  AND ({sel})"
                 );
-                let from = if keeps {
-                    read
-                } else {
-                    super::distinct_spans(&read, "")
-                };
                 let mut named = fold.columns(is_top);
                 if !is_top {
                     named.push(("proj".to_string(), projection.clone()));
                 }
-                match &member {
-                    None => {
-                        named.push(("s0".to_string(), "true".to_string()));
-                        Src::table(scope, from, named)
+                if member.is_none() {
+                    named.push(("s0".to_string(), "true".to_string()));
+                }
+                let from = if keeps {
+                    read
+                } else {
+                    let mut inner = if member.is_some() {
+                        flags.clone()
+                    } else {
+                        String::new()
+                    };
+                    for (n, e) in &named {
+                        inner.push_str(&format!(", ({e}) AS {n}"));
                     }
+                    super::distinct_spans(&read, &inner)
+                };
+                match &member {
+                    None => Src::table(scope, from, if keeps { named } else { Vec::new() }),
                     Some((counts, member)) => {
                         let mut cols = String::from("trace_id, span_id, start_ns, duration_ns");
                         if !is_top {
                             cols.push_str(", service");
                         }
-                        cols.push_str(&flags);
-                        for (n, e) in &named {
-                            cols.push_str(&format!(", ({e}) AS {n}"));
+                        if keeps {
+                            cols.push_str(&flags);
+                            for (n, e) in &named {
+                                cols.push_str(&format!(", ({e}) AS {n}"));
+                            }
+                        } else {
+                            cols.push_str(&flag_names);
+                            for (n, _) in &named {
+                                cols.push_str(&format!(", {n}"));
+                            }
                         }
                         Src::rel(&format!(
                             "SELECT *, ({member}) AS s0\nFROM (SELECT *, {counts}\nFROM ({scope}SELECT {cols}\nFROM {from}))"
@@ -1415,9 +1440,14 @@ fn trace_level_sql(
             ("bucket", &bucket),
             ("day", &day),
             ("limit", &limit),
-            ("projection", &projection),
+            // Issue #601 part 4c (D1): the projection computed inside the
+            // wrap, read by its alias.
+            ("projection", "w_proj"),
             ("spss", &spss),
-            ("detail_from", &super::distinct_spans(&detail, "")),
+            (
+                "detail_from",
+                &super::distinct_spans(&detail, &format!(", {projection} AS w_proj")),
+            ),
             ("trace_read", &trace_read),
         ],
     ))
