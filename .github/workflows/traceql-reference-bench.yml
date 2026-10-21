@@ -61,6 +61,9 @@ jobs:
           status=$?
           cat "$RUNNER_TEMP/bench-out/summary.md" >> "$GITHUB_STEP_SUMMARY" || true
           exit $status
+      - name: Container logs
+        if: always()
+        run: docker logs pulsus-ref-bench > "$RUNNER_TEMP/reference.log" 2>&1 || true
       - name: Upload the run
         if: always()
         uses: actions/upload-artifact@v4
@@ -69,6 +72,7 @@ jobs:
           path: |
             ${{ runner.temp }}/bench-out/
             ${{ runner.temp }}/pulsusdb.log
+            ${{ runner.temp }}/reference.log
       - name: Tear down
         if: always()
         run: docker rm -f -v pulsus-ch-bench pulsus-ref-bench || true

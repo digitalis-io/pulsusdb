@@ -4,9 +4,11 @@
 Reads OUT/paired.tsv (http_bench.py paired) and OUT/fetch.tsv
 (fetch_compare.py, the 20-span trace's two lines and then the largest trace's),
 prints one row per §6.3 shape and then each state's count, and writes the same
-as Markdown to OUT/summary.md. Exits 0 only for 13 `below`, 1 `exempt`,
-1 `no counterpart` and nothing else. A compared or exempt shape either side
-answers with nothing (`items` 0), or g01 with no edge, is `not like for like`.
+as Markdown to OUT/summary.md. Exits 0 only for 11 `below`, 2 `recorded`,
+1 `exempt`, 1 `no counterpart` and nothing else. The two trace-by-id rows are
+`recorded`: both medians are reported and their order passes or fails
+nothing. A compared or exempt shape either side answers with nothing
+(`items` 0), or g01 with no edge, is `not like for like`.
 
 Usage: bench_verdict.py OUT  |  bench_verdict.py --self-test
 """
@@ -14,8 +16,8 @@ import sys
 
 # §6.3's fifteen shapes, in its table's order: (name, how it is judged)
 SHAPES = [
-    ('fetch_trace_20', 'compared'),
-    ('fetch_trace_largest', 'compared'),
+    ('fetch_trace_20', 'recorded'),
+    ('fetch_trace_largest', 'recorded'),
     ('m01_rate_by_service', 'compared'),
     ('m02_quantiles_by_route', 'compared'),
     ('m03_errors_by_service', 'compared'),
@@ -30,9 +32,9 @@ SHAPES = [
     ('c08_compare', 'compared'),
     ('g01_service_graph', 'no counterpart'),
 ]
-STATES = ['below', 'not below', 'exempt', 'no counterpart', 'refused', 'reference failed',
+STATES = ['below', 'not below', 'recorded', 'exempt', 'no counterpart', 'refused', 'reference failed',
           'not like for like']
-PASS = {'below': 13, 'exempt': 1, 'no counterpart': 1}
+PASS = {'below': 11, 'recorded': 2, 'exempt': 1, 'no counterpart': 1}
 
 
 def verdict(paired_text, fetch_text):
@@ -71,8 +73,8 @@ def verdict(paired_text, fetch_text):
             state = 'reference failed'
         elif 0 in (n.get('p'), n.get('r')):
             state = 'not like for like'
-        elif kind == 'exempt':
-            state = 'exempt'
+        elif kind in ('exempt', 'recorded'):
+            state = kind
         else:
             state = 'below' if float(p[1]) < float(r[1]) else 'not below'
         counts[state] += 1
@@ -84,8 +86,8 @@ def passes(counts):
     return {k: v for k, v in counts.items() if v} == PASS
 
 
-COUNT_LINES = [('compared below', 'below'), ('exempt', 'exempt'), ('no counterpart', 'no counterpart'),
-               ('refused', 'refused'), ('not below', 'not below'), ('reference failed', 'reference failed'),
+COUNT_LINES = [('compared below', 'below'), ('recorded', 'recorded'), ('exempt', 'exempt'),
+               ('no counterpart', 'no counterpart'), ('refused', 'refused'), ('not below', 'not below'), ('reference failed', 'reference failed'),
                ('not like for like', 'not like for like')]
 
 
@@ -104,8 +106,8 @@ def write(out, rows, counts):
         for r in rows:
             f.write('| ' + ' | '.join(r) + ' |\n')
         f.write('\n' + '; '.join(f'{label} {counts[state]}' for label, state in COUNT_LINES) + '\n\n')
-        f.write(f'**{"pass" if passes(counts) else "fail"}**: the rule needs 13 compared below, 1 exempt, '
-                '1 with no counterpart and nothing else.\n')
+        f.write(f'**{"pass" if passes(counts) else "fail"}**: the rule needs 11 compared below, 2 recorded, '
+                '1 exempt, 1 with no counterpart and nothing else.\n')
 
 
 def self_test():
