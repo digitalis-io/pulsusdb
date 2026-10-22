@@ -29,6 +29,7 @@ crates/pulsus-read/tests/golden/traces_search/val_num_range.sql
 crates/pulsus-read/tests/golden/traces_search/worked_example.sql
 crates/pulsus-schema/src/catalog.rs
 crates/pulsus-schema/src/controller.rs
+crates/pulsus-write/src/writer/backfill.rs
 distributor.go
 docs/sources/query/log_queries/_index.md
 encoding/vparquet4/block_traceql.go

@@ -105,25 +105,25 @@ Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b25_pattern_expr_reject.t
 Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b28_reserved_names.test:181	-	-	<__error__> <latency>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b2_formatters.test:198	-	-	<method> <path> <status>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/tests/logqltest/corpus/differential_parsers_filters.test:65	-	-	<method> <path> <status> <took>	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:11038	-	-	<_> <proc>[<pid>]: <msg>	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:11056	-	-	{pattern}	reject	reject	-	-	-
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:11136	-	-	<a> <b>	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:11187	-	-	<a> <b>	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:11189	-	-	<a> <b>	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:11219	-	-	<a> <b>	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:11248	-	-	<a> <b>	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:11277	-	-	<a> <b>	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:11324	-	-	<_> <proc>[<pid>]: <msg>	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:11365	-	-	<a> <_>	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:11415	-	-	<__error__>	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:11420	-	-	<a> <_>	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:11425	-	-	<__error__>	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:11564	-	-	<a> <_>	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:11751	-	-	<p> <_>	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:11808	-	-	<a> <_>	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:11808	-	-	<a> <_>	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:13636	-	-	, 	reject	reject	-	-	-
-Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:14416	-	-	<_> route=<route> latency=<latency>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:11030	-	-	<_> <proc>[<pid>]: <msg>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:11048	-	-	{pattern}	reject	reject	-	-	-
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:11128	-	-	<a> <b>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:11179	-	-	<a> <b>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:11181	-	-	<a> <b>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:11211	-	-	<a> <b>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:11240	-	-	<a> <b>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:11269	-	-	<a> <b>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:11316	-	-	<_> <proc>[<pid>]: <msg>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:11357	-	-	<a> <_>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:11407	-	-	<__error__>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:11412	-	-	<a> <_>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:11417	-	-	<__error__>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:11556	-	-	<a> <_>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:11743	-	-	<p> <_>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:11800	-	-	<a> <_>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:11800	-	-	<a> <_>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:13628	-	-	, 	reject	reject	-	-	-
+Site	Literal	crates/pulsus-read/tests/query_log_gates.rs:14408	-	-	<_> route=<route> latency=<latency>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-server/tests/categorize_labels_differential.rs:201	-	-	PT <app> <trace_id> end	accept	accept	-	-	-
 Site	Literal	crates/pulsus-server/tests/fixtures/categorize_labels/capture.json:145	-	-	PT <app> <trace_id> end	accept	accept	-	-	-
 Site	Literal	docs/benchmarks/logs-differential-ledger.md:4189	-	-	<a> <a>	accept	reject	-	-	b25_pattern_expr_reject.test's eval_fail rows and the ledger's window-independence table -- THE ISSUE. Added by this change to pin the move, not moved by it

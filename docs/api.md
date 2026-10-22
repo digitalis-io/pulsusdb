@@ -52,20 +52,34 @@ twice by that writer.** The window is `PULSUS_INGEST_DEDUP_WINDOW` (`5m`);
 
 | what arrives | what happens |
 |---|---|
-| a content-identical push, **same writer process**, inside the window | nothing is stored; the response is the one the original push received |
+| a content-identical push, **same writer process**, inside the window | decided by the original push's claim when it arrives — the retry table below |
 | the same push after the window has elapsed | stored — it is a new push |
 | the same push at a **different** writer process | stored. The index is per process; this is a declared limit, not an oversight |
 | two identical lines inside **one** push | both stored |
 | concurrent identical requests at one writer | exactly one is stored |
-| the same `Idempotency-Key` with different content | `400`, nothing stored |
-| the index is at its byte bound with nothing evictable | `429`, nothing stored, and the client's retry is answered normally once it drains |
+
+**The retry table.** A content-identical push that reaches the same writer process inside the window is decided by the original push's claim when it arrives. The claim is **pending** until the original's insert settles. It then becomes **committed** if any of its inserts committed — for logs and metrics, also if an insert's fate is unknown — or **released** if none did; for traces, any failed insert releases it, and a push with no rows is released at once. A claim still pending at its deadline, two minutes after `PULSUS_BATCH_MS`, becomes **expired**; a claim the window has passed is **absent**. A settled claim carries the answer the original's sync caller got: **success** or **failure** (a push with no rows: success). An admitted repeat is handled as a new push: its rows, if any, are stored, and it is answered with its own outcome.
+
+| # | the claim is | its answer | the repeat | admitted | response |
+|---|---|---|---|---|---|
+| 1 | absent | — | sync | yes | its own outcome |
+| 2 | absent | — | async | yes | `202` |
+| 3 | absent, and the index is full of claims it may not evict | — | either | no | `429`; a retry is answered normally once it drains |
+| 4 | pending | settles to success | sync | no | success, once it settles |
+| 5 | pending | settles to failure, or expires | sync | no | `500`, once it does |
+| 6 | pending | leaves the index first: the original was refused, or the window passed | sync | no | `500` |
+| 7 | pending, and the waiters' budget is full | any | sync | no | `429` |
+| 8 | pending | any | async | no | `202` at once |
+| 9 | committed | success | sync | no | success |
+| 10 | committed | failure | sync | no | `500` |
+| 11 | committed | either | async | no | `202` |
+| 12 | released | either | sync | yes | its own outcome |
+| 13 | released | either | async | yes | `202` |
+| 14 | expired | failure | sync | no | `500` |
+| 15 | expired | failure | async | no | `202` |
+| 16 | pending, committed, released or expired, under the same `Idempotency-Key` with different content (an absent key is rows 1-3) | — | either | no | `400` |
 
 **Trace reads count a stored span once.** A span stored twice — a retry after the window, or at another writer — is read once by every search, metrics and fetch request; two stored copies of one span `(trace id, start time, span id, kind)` whose contents differ are read as either one of them, and a grouped count may count each in its own series.
-
-**What a suppressed caller is told.** In sync mode the response is the
-original push's outcome, which means a suppressed caller can receive the
-original's failure. In async mode the answer is `202` without waiting, as
-it is for any async push.
 
 **What it costs.** `PULSUS_INGEST_DEDUP_MAX_BYTES` (`16MiB` per signal)
 bounds the whole index. It is a hard bound rather than a target: the index
@@ -98,7 +112,7 @@ Content-Type: application/x-protobuf   (default; OTLP/JSON via application/json 
 - **Which faults are whole-request, and which are per-point.** A fault in the request's **shape or naming** is whole-request: `400` with `google.rpc.Status.code = 3`, and nothing from the request is stored. A fault in **one data point's data** is per-point: the response is `200` carrying `partial_success.rejected_data_points` and `error_message`, and every other data point in the request is stored.
 
   The two are not the same kind of thing. A naming fault changes **series identity** — there is nothing to partially accept, because the series the request describes is not a series we can name. A bad data point is genuinely per-point: the rest of the request is well-formed and independently valid. Collapsing them into one model would mean either discarding good data because one point was bad, or accepting a request whose series identity is wrong. Prometheus v3.13.0 has one model rather than two — it rolls the whole request back on any error — so both halves are ledgered, as `otlp-request-atomic-faults` and `otlp-delta-partial-success`.
-- **`POST /v1/traces` bounds the bytes one request may expand into, at a fixed 256 MiB.** It is not configurable and it is not `PULSUS_INGEST_QUEUE_BYTES`, which is the separate queue bound that still applies after admission. The estimate is taken before a single row is materialized, so an over-budget request is refused without ever paying for the expansion it describes. From issue #556 on, a span's **attribute arrays** are charged against it too — each attribute now costs one array element and a second copy of its rendered key and value — so a request whose expansion is dominated by attributes and which sat just inside the bound before is now refused. A breach is the whole-request `400` with `google.rpc.Status.code = 3` described above; the alternate ingest receiver shares the same bound but not the same envelope (§8.2).
+- **`POST /v1/traces` bounds the bytes one request may expand into, at a fixed 256 MiB.** It is not configurable and it is not `PULSUS_INGEST_QUEUE_BYTES`, which is the separate queue bound that still applies after admission. What it counts, and when, is [configuration.md §5](configuration.md): every attribute once where it is stored, and every span with what it copies, each charged before it is built. A breach is the whole-request `400` with `google.rpc.Status.code = 3` described above; the alternate ingest receiver shares the same bound but not the same envelope (§8.2).
 
   **A second whole-request `400` on this route is the stored JSON path count** (issue #586). A span attribute's value is stored as a `JSON` column, whose binary wire form admits at most `100000` paths in one value — the server's own `format_binary_max_object_size` default, which this build pins. A span whose span attributes, scope attributes, or any event's or link's attributes would carry more than that many stored paths is refused at **decode**, with `google.rpc.Status.code = 3`, naming the count and the limit. It is refused there rather than at admission because the insert would otherwise fail after the block had been sent, leaving the caller an uncertain ending for a push that could never have succeeded. The Zipkin receiver cannot reach it: that receiver refuses above `65536` tags per span and a Zipkin tag's value is a string, so its path count cannot exceed its tag count.
 - **`POST /v1/metrics`, `POST /v1/logs` and `POST /v1/traces` refuse a push that does not fit one block, whole (issues #603 and #586).** Each is stored as one `INSERT` of one block into one table, and it is never split: two blocks can commit a prefix, and a prefix is not all-or-nothing. A push is refused when its landing rows **reach** the signal's row ceiling — `PULSUS_METRICS_LANDING_MAX_ROWS`, `PULSUS_LOG_LANDING_MAX_ROWS` or `PULSUS_TRACE_LANDING_MAX_ROWS`, all `1048576` — or its estimated landing bytes **exceed** `PULSUS_BATCH_BYTES` (`16MiB`), shared by all three signals. Both are counted over every row one push produces: for metrics, one per sample, one per native-histogram sample, one per exemplar per series it is attached to, one per series registration the push is first to make in an activity bucket, and one per metric descriptor; for logs, one per log line, one per stream the push is first to register in that month, and one per distinct stream, 10s bucket, extracted pattern and level; for traces, one per span, one per distinct resource and UTC day in the push, one per distinct attribute key in any of the five scopes, and one per distinct attribute value ([configuration.md §5](configuration.md) defines the keys). The answer is **`413`** with `google.rpc.Status.code = 8` and the message
@@ -1459,7 +1473,7 @@ when we are asking it to slow down, so we keep `429`; recorded as
 `zipkin-backpressure-429-not-500` in docs/benchmarks/traces-differential-ledger.md.
 <!-- copied-rule:zipkin-backpressure:end -->
 
-**This receiver shares the trace expansion bound, and not the error envelope.** Like `POST /v1/traces` (§1.1), a Zipkin request is charged against the same fixed 256 MiB ceiling on the bytes it may expand into, block by block as it is adapted, so an over-budget request aborts mid-adaptation rather than exhausting memory first. It is not configurable and it is not `PULSUS_INGEST_QUEUE_BYTES`. From issue #556 on, a span's **attribute arrays** are charged against it too — each attribute now costs one array element and a second copy of its rendered key and value — so a request whose expansion is dominated by attributes and which sat just inside the bound before is now refused. The refusal is a whole-request plain-text **400** in this receiver's own envelope described above (`text/plain; charset=utf-8`, `X-Content-Type-Options: nosniff`, one trailing newline), **not** the structured `google.rpc.Status` §1.1 returns for the same condition: Zipkin has no partial-success channel, and this receiver's pre-admission rejections all take the plain-text form.
+**This receiver shares the trace expansion bound, and not the error envelope.** Like `POST /v1/traces` (§1.1), a Zipkin request is charged against the same fixed 256 MiB ceiling on the bytes it may expand into, block by block as it is adapted, so an over-budget request aborts mid-adaptation rather than exhausting memory first. It is not configurable and it is not `PULSUS_INGEST_QUEUE_BYTES`; what it counts is [configuration.md §5](configuration.md). The refusal is a whole-request plain-text **400** in this receiver's own envelope described above (`text/plain; charset=utf-8`, `X-Content-Type-Options: nosniff`, one trailing newline), **not** the structured `google.rpc.Status` §1.1 returns for the same condition: Zipkin has no partial-success channel, and this receiver's pre-admission rejections all take the plain-text form.
 
 **This endpoint is split by stage, not by status, and the two halves write different containers** (issue #586). Everything up to and including the decode takes the pre-admission envelope above: `text/plain; charset=utf-8`, `X-Content-Type-Options: nosniff`, one trailing newline. **Every refusal the sink raises takes the post-admission container instead** — `text/plain; charset=utf-8`, **no** `X-Content-Type-Options` and **no** terminator, which is what the reference's own bare write produces past admission and what this receiver's `429` already wrote. So the `413`s and the reused-key `400` above carry the bare container, while a decode refusal of the same status carries `nosniff` and a newline: the status alone does not say which half answered.
 
