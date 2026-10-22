@@ -3693,6 +3693,9 @@ async fn the_job_keeps_up_under_steady_ingest() {
         let failures = failures.clone();
         let first_failure = first_failure.clone();
         tasks.push(tokio::spawn(async move {
+            // Each answered push's admit-to-answer time, in ms; a push not
+            // answered within 60 s is recorded as 60,000.
+            let answer_ms = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
             let mut tick = tokio::time::interval(Duration::from_millis(300));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut seq = k as u64;
@@ -3702,17 +3705,24 @@ async fn the_job_keeps_up_under_steady_ingest() {
                 let req = load_push(seq, 500);
                 seq += 3;
                 let landing = pulsus_write::parse_trace_landing(&req).expect("the landing decode");
+                let admitted_at = std::time::Instant::now();
                 match writer.admit_flush(landing, PushHeaders::default()) {
                     Ok(wait) => {
                         let failures = failures.clone();
                         let first_failure = first_failure.clone();
+                        let answer_ms = answer_ms.clone();
                         waits.push(tokio::spawn(async move {
-                            let failed =
-                                match tokio::time::timeout(Duration::from_secs(60), wait).await {
-                                    Ok(Ok(())) => None,
-                                    Ok(Err(e)) => Some(e.to_string()),
-                                    Err(_) => Some("no answer within 60 s".to_string()),
-                                };
+                            let answered =
+                                tokio::time::timeout(Duration::from_secs(60), wait).await;
+                            answer_ms
+                                .lock()
+                                .expect("the lock")
+                                .push(admitted_at.elapsed().as_millis().min(60_000) as u64);
+                            let failed = match answered {
+                                Ok(Ok(())) => None,
+                                Ok(Err(e)) => Some(e.to_string()),
+                                Err(_) => Some("no answer within 60 s".to_string()),
+                            };
                             if let Some(e) = failed {
                                 failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 first_failure.lock().expect("the lock").get_or_insert(e);
@@ -3732,6 +3742,16 @@ async fn the_job_keeps_up_under_steady_ingest() {
                 w.await.expect("a push's wait");
             }
             writer.shutdown(Duration::from_secs(30)).await;
+            let mut ms = answer_ms.lock().expect("the lock").clone();
+            ms.sort_unstable();
+            let at = |q: f64| ms.get(((ms.len().max(1) - 1) as f64 * q) as usize).copied();
+            format!(
+                "writer {k}: {} answers, p50 {:?} ms, p99 {:?} ms, max {:?} ms",
+                ms.len(),
+                at(0.5),
+                at(0.99),
+                ms.last()
+            )
         }));
     }
 
@@ -3798,7 +3818,8 @@ async fn the_job_keeps_up_under_steady_ingest() {
     }
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     for t in tasks {
-        t.await.expect("a writer task");
+        let latency = t.await.expect("a writer task");
+        println!("LV1 answer latency, {latency}");
     }
     println!("LV1 queue samples (s since start, spans/service_edges per node):");
     for s in &queue_samples {

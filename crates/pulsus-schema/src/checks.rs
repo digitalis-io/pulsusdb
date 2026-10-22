@@ -170,12 +170,12 @@ pub const REQUIRED_SERVER_NAMES: &[(&str, NameCatalogue)] = &[
         "replicated_deduplication_window_seconds",
         NameCatalogue::MergeTreeSetting,
     ),
-    // The nine further settings one TRACE landing insert pins, of six
+    // The ten further settings one TRACE landing insert pins, of seven
     // classes the metrics set does not need: how the block's bytes are read,
     // a limit that refuses a block rather than dividing it, what an
     // acknowledgement means, where a row is placed, what path a value is
-    // stored under, and whether exceeding the deadline is an error or a success
-    // that need not be complete.
+    // stored under, whether exceeding the deadline is an error or a success
+    // that need not be complete, and how the views run.
     // `QuerySettings::trace_landing_insert` names them together and quotes
     // what each one's own catalogue entry says. A pin added there without a
     // row here is caught by
@@ -192,6 +192,7 @@ pub const REQUIRED_SERVER_NAMES: &[(&str, NameCatalogue)] = &[
         NameCatalogue::Setting,
     ),
     ("distributed_foreground_insert", NameCatalogue::Setting),
+    ("parallel_view_processing", NameCatalogue::Setting),
     ("insert_shard_id", NameCatalogue::Setting),
     ("json_type_escape_dots_in_keys", NameCatalogue::Setting),
     ("type_json_skip_duplicated_paths", NameCatalogue::Setting),
@@ -495,7 +496,7 @@ mod tests {
             "min_insert_block_size_bytes_for_materialized_views",
         ]);
 
-        // The trace landing insert's own nine pins are rows too (issues
+        // The trace landing insert's own ten pins are rows too (issues
         // #584 to #586), and they are **derived from that constructor** here
         // rather than written out a second time: this case owns the twelve
         // above as a literal set, and
@@ -573,7 +574,8 @@ mod tests {
                      'input_format_binary_read_json_as_string', \
                      'format_binary_max_object_size', 'max_partitions_per_insert_block', \
                      'throw_on_max_partitions_per_insert_block', \
-                     'distributed_foreground_insert', 'insert_shard_id', \
+                     'distributed_foreground_insert', 'parallel_view_processing', \
+                     'insert_shard_id', \
                      'json_type_escape_dots_in_keys', 'type_json_skip_duplicated_paths', \
                      'timeout_overflow_mode')"
                         .to_string()
