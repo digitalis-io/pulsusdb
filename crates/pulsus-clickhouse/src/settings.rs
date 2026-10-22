@@ -923,6 +923,7 @@ mod tests {
             ("max_partitions_per_insert_block", "100"),
             ("throw_on_max_partitions_per_insert_block", "1"),
             ("distributed_foreground_insert", "1"),
+            ("parallel_view_processing", "1"),
             ("insert_shard_id", "0"),
             ("json_type_escape_dots_in_keys", "0"),
             ("type_json_skip_duplicated_paths", "0"),

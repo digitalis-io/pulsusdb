@@ -107,6 +107,9 @@ const INJECTED_SETTINGS: &[&str] = &[
     "optimize_distributed_group_by_sharding_key",
     "optimize_read_in_order",
     "optimize_skip_unused_shards",
+    // Issue #602 part 3b-1: the trace landing insert runs its views
+    // concurrently.
+    "parallel_view_processing",
     "prefer_localhost_replica",
     "query_id",
     // Issue #624: the `text` body index's direct read is off on every LogQL read.
