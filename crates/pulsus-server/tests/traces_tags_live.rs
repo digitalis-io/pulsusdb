@@ -2302,6 +2302,44 @@ async fn the_stored_attribute_type_reaches_the_wire_and_its_query_returns_the_tr
     );
 
     // =================================================================
+    // B1 (issue #602 part 3c) — no catalog row is untyped. The writer
+    // types every value it stores from the OTLP kind, and the renderer
+    // reports the stored type verbatim, so an empty `val_type` here would
+    // reach the wire as `"type":""`. The corpus carries string, int,
+    // double and bool attributes, and the row count keeps the check off
+    // an empty table.
+    // =================================================================
+    {
+        #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+        struct UntypedRow {
+            untyped: u64,
+            rows: u64,
+        }
+        let mut cfg = ch_config();
+        cfg.database = db.to_string();
+        let b1 = ChClient::new(cfg).await.expect("connect data client");
+        let mut stream = b1
+            .query_stream::<UntypedRow>(
+                "SELECT toUInt64(countIf(val_type = '')) AS untyped, toUInt64(count()) AS rows \
+                 FROM tag_values",
+                &QuerySettings::default(),
+            )
+            .await
+            .expect("count untyped catalog rows");
+        let row = stream
+            .next()
+            .await
+            .expect("one row")
+            .expect("decode the untyped count");
+        assert!(row.rows > 0, "B1: the corpus put no row in tag_values");
+        assert_eq!(
+            row.untyped, 0,
+            "B1: {} of {} catalog rows carry no type",
+            row.untyped, row.rows
+        );
+    }
+
+    // =================================================================
     // AC2 — the stored type replaces the guess, against reference bytes.
     // =================================================================
     let capture = reference_capture();

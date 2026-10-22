@@ -648,20 +648,6 @@ mod tests {
         "inspectedSpans",
     ];
 
-    /// The values of `SearchOutput::partial` — the ONLY field
-    /// [`render`] branches on when it builds the `metrics` block, and so
-    /// the exact enumeration the documented metrics shape is derived over
-    /// (issue #464).
-    ///
-    /// **This is not "every branch of `render`".** `render` reaches at
-    /// least five other branch points, all of them inside the `traces`
-    /// array and none of them able to move a `metrics` key:
-    /// [`trace_json`]'s `groups` split and its zero-`durationMs`
-    /// omission, [`span_json`]'s zero-`durationNanos` omission and its
-    /// empty-`attributes` omission, and [`group_value_json`]'s type
-    /// match. The constant covers the metrics projection only.
-    const METRICS_PARTIALITY_BRANCHES: [bool; 2] = [false, true];
-
     fn sample_output() -> SearchOutput {
         SearchOutput {
             traces: vec![TraceSearchResult {
@@ -1027,8 +1013,8 @@ mod tests {
         // per-key assertion cannot see a fourth key reappearing.
         assert_eq!(
             v["metrics"],
-            serde_json::json!({"totalJobs": 1}),
-            "the sample output is truncated: completedJobs is zero and protojson omits a zero"
+            serde_json::json!({"completedJobs": 1, "totalJobs": 1}),
+            "one completed job of one"
         );
     }
 
@@ -1528,94 +1514,52 @@ mod tests {
     }
 
     /// Issue #464 AC 1: the `metrics` block is the reference's own
-    /// `completedJobs`/`totalJobs` pair, asserted as a WHOLE OBJECT on
-    /// each completeness branch — a per-key assertion is what let three
-    /// invented keys ship.
-    ///
-    /// `completedJobs` is omitted on the truncated branch because
-    /// protojson omits a default-valued scalar, and an omitted key is a
-    /// zero rather than a missing value: `completedJobs (absent => 0) <
-    /// totalJobs (1)` is the incompleteness signal the search route
-    /// carries (`modules/frontend/combiner/response_metrics.go:19-38`,
-    /// `combiner/search.go:126-135` @ v3.0.2).
+    /// `completedJobs`/`totalJobs` pair, asserted as a WHOLE OBJECT — a
+    /// per-key assertion is what let three invented keys ship.
     #[test]
-    fn the_metrics_block_is_the_reference_jobs_pair_on_both_partiality_branches() {
-        let mut complete = sample_output();
-        complete.partial = false;
+    fn the_metrics_block_is_one_completed_job() {
         assert_eq!(
-            render(&complete)["metrics"],
+            render(&sample_output())["metrics"],
             serde_json::json!({"completedJobs": 1, "totalJobs": 1}),
-            "a complete search: one job, one completed"
-        );
-
-        let mut truncated = sample_output();
-        truncated.partial = true;
-        assert_eq!(
-            render(&truncated)["metrics"],
-            serde_json::json!({"totalJobs": 1}),
-            "a truncated search: completedJobs is zero, and protojson omits a zero"
+            "a search: one job, one completed"
         );
     }
 
-    /// Issue #464 AC 2: no key outside `tempopb.SearchMetrics` survives on
-    /// either branch. Grafana's Tempo datasource decodes the search
-    /// response with unknown fields REJECTED (`pkg/tempo/search.go:95` @
-    /// `v13.1.5-11-g3c7375b`), so one invented key costs the whole
-    /// response, not one field of it.
+    /// Issue #464 AC 2: no key outside `tempopb.SearchMetrics` survives.
+    /// Grafana's Tempo datasource decodes the search response with unknown
+    /// fields REJECTED (`pkg/tempo/search.go:95` @ `v13.1.5-11-g3c7375b`),
+    /// so one invented key costs the whole response, not one field of it.
     ///
     /// **Scope, stated exactly.** This detects an *invented key* and
-    /// nothing else. It does not detect a wrong value, a wrong branch or
-    /// a missing key — those belong to
-    /// [`the_metrics_block_is_the_reference_jobs_pair_on_both_partiality_branches`],
-    /// and every value/branch break leaves this test green.
+    /// nothing else. It does not detect a wrong value or a missing key —
+    /// those belong to [`the_metrics_block_is_one_completed_job`], and
+    /// every value break leaves this test green.
     #[test]
     fn every_metrics_key_is_a_tempopb_search_metrics_field() {
-        for partial in METRICS_PARTIALITY_BRANCHES {
-            let mut output = sample_output();
-            output.partial = partial;
-            let rendered = render(&output);
-            let metrics = rendered["metrics"].as_object().expect("metrics object");
-            for key in metrics.keys() {
-                assert!(
-                    SEARCH_METRICS_FIELDS.contains(&key.as_str()),
-                    "partial={partial}: {key:?} is not a tempopb.SearchMetrics field"
-                );
-            }
+        let rendered = render(&sample_output());
+        let metrics = rendered["metrics"].as_object().expect("metrics object");
+        for key in metrics.keys() {
+            assert!(
+                SEARCH_METRICS_FIELDS.contains(&key.as_str()),
+                "{key:?} is not a tempopb.SearchMetrics field"
+            );
         }
     }
 
     /// Issue #464 AC 6b: the metrics shape in docs/api.md §4.2 is
-    /// DERIVED from [`render`] over both partiality branches, never
-    /// restated. That sentence is the public contract for
-    /// `/api/traces/v1/search` and its `/api/search` alias, and the
-    /// hermetic docs pin [`the_search_contracts_are_documented`] (moved from
-    /// `traces_search_sql.rs`) compares the document against a *constant*; this is the half that
-    /// compares it against the code.
-    ///
-    /// **What it couples:** the union of the `metrics` key sets across
-    /// [`METRICS_PARTIALITY_BRANCHES`], against the documentation. Both
-    /// branches, because a key emitted only when `output.partial` slips
-    /// past a single-call version of this test.
-    ///
-    /// **What it is not.** It is not "every branch of `render`" (see
-    /// [`METRICS_PARTIALITY_BRANCHES`] for the five it does not reach),
-    /// it does not reach the VALUES, and it does not reach the omission
-    /// rule: a key present on one branch and absent on the other is
-    /// indistinguishable here from a key present on both. Those are the
-    /// subjects of the two tests above and of the empty-envelope test.
+    /// DERIVED from [`render`], never restated. That sentence is the public
+    /// contract for `/api/traces/v1/search` and its `/api/search` alias; the
+    /// hermetic docs pin [`the_search_contracts_are_documented`] compares
+    /// the document against a *constant*, and this is the half that compares
+    /// it against the code. It reaches the keys, not the values.
     #[test]
-    fn the_documented_metrics_shape_is_derived_from_both_partiality_branches() {
-        let mut keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        for partial in METRICS_PARTIALITY_BRANCHES {
-            let mut output = sample_output();
-            output.partial = partial;
-            let rendered = render(&output);
-            let metrics = rendered["metrics"].as_object().expect("metrics object");
-            keys.extend(metrics.keys().cloned());
-        }
+    fn the_documented_metrics_shape_is_derived_from_render() {
+        let rendered = render(&sample_output());
+        let metrics = rendered["metrics"].as_object().expect("metrics object");
         let shape = format!(
             "{{{}}}",
-            keys.iter()
+            metrics
+                .keys()
                 .map(|key| format!("\"{key}\":<n>"))
                 .collect::<Vec<_>>()
                 .join(",")
@@ -1626,89 +1570,37 @@ mod tests {
         .expect("read docs/api.md");
         assert!(
             api.contains(&shape),
-            "docs/api.md §4.2 must document the metrics-key union over both partiality \
-             branches, {shape:?} — derived from render(), never restated"
+            "docs/api.md §4.2 must document the metrics keys render() emits, {shape:?}"
         );
     }
 
-    /// Issue #502. `docs/schemas.md` described a `partial` response field
-    /// that issue #464 removed, and the check whose own doc comment
-    /// claimed to gate that document's "partiality sources"
-    /// (`crates/pulsus-read/tests/traces_search_sql.rs::shipped_shapes_and_limits_are_documented`)
-    /// carried no partiality needle on its `schemas.md` half at all — one
-    /// half of a check was repaired at #464 and the other half kept
-    /// passing.
-    ///
-    /// **Neither side of this assertion can produce the other.**
-    /// [`render`]'s truncated output is produced here, from the renderer
-    /// under test; the sentence describing it is read from another
-    /// directory. So a code change that stops omitting `completedJobs`
-    /// reddens it, and so does a document edit that renames the signal.
-    ///
-    /// **What it does not do:** it does not reach the HTTP boundary. That
-    /// the shipped route serves this block on a truncated search is
-    /// `crates/pulsus-server/tests/traces_api_live.rs::the_incomplete_signal_follows_the_candidate_ceiling_and_not_the_request_limit`.
+    /// Issue #502, then #602 part 3c. `docs/schemas.md` §4.2 states the
+    /// block every search answers; it is read here from [`render`]'s own
+    /// output, so a code change and a document edit cannot drift apart.
+    /// The retired wire field, and the omission rule a search no longer
+    /// takes, must not be described.
     #[test]
-    fn schemas_md_describes_the_partiality_signal_render_actually_emits() {
-        let metrics_keys = |partial: bool| -> std::collections::BTreeSet<String> {
-            let mut output = sample_output();
-            output.partial = partial;
-            render(&output)["metrics"]
-                .as_object()
-                .expect("metrics object")
-                .keys()
-                .cloned()
-                .collect()
-        };
-        let truncated = metrics_keys(true);
-        let complete = metrics_keys(false);
-
-        assert_eq!(
-            truncated,
-            std::collections::BTreeSet::from(["totalJobs".to_string()]),
-            "a truncated search's metrics block is the jobs total alone"
-        );
-        let omitted: Vec<&String> = complete.difference(&truncated).collect();
-        assert_eq!(
-            omitted,
-            vec!["completedJobs"],
-            "truncation is signalled by omitting exactly one key"
-        );
-
-        // The rendered block, built from `render`'s own output rather than
-        // typed beside the assertion.
-        let mut output = sample_output();
-        output.partial = true;
-        let rendered = serde_json::to_string(&render(&output)["metrics"]).expect("render metrics");
-
+    fn schemas_md_states_the_metrics_block_render_emits() {
+        let rendered =
+            serde_json::to_string(&render(&sample_output())["metrics"]).expect("render metrics");
         let schemas = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/schemas.md"),
         )
         .expect("read docs/schemas.md");
         assert!(
             schemas.contains(&rendered),
-            "docs/schemas.md's partiality paragraph must carry the block render() emits, \
-             {rendered:?} — derived from render(), never restated"
+            "docs/schemas.md must carry the block render() emits, {rendered:?}"
         );
-        for key in &omitted {
-            assert!(
-                schemas.contains(&format!("`metrics.{key}`")),
-                "docs/schemas.md must name the omitted key `metrics.{key}`"
-            );
-        }
-        // The retired wire field, in both spellings the document carried
-        // before issue #502. `partial` survives as the engine's own flag
-        // name, so a bare occurrence is not the thing being excluded.
         for retired in [
             "`partial` flag",
             "response marked `partial`",
             "`partial = true`",
+            "OMITS `metrics.completedJobs`",
         ] {
             assert_eq!(
                 schemas.matches(retired).count(),
                 0,
-                "docs/schemas.md must not describe a {retired:?} wire field; \
-                 issue #464 replaced it with the omitted `metrics.completedJobs`"
+                "docs/schemas.md must not describe {retired:?}"
             );
         }
     }

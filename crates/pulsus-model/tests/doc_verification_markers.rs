@@ -341,7 +341,7 @@ const WITNESSES: &[Witness] = &[
     },
     Witness {
         file: "docs/schemas.md",
-        key: "the response OMITS `metrics.completedJobs`",
+        key: "**Ordering and partiality contracts**",
     },
 ];
 

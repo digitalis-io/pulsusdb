@@ -8162,3 +8162,221 @@ async fn a_failed_target_read_is_retried() {
         "N2: the request after the failure reads the target again, and the next reuses it"
     );
 }
+
+// ---------------------------------------------------------------------
+// T-Q1 whole (issue #602 part 3c): every request of
+// `docs/TraceQL/measure/api_requests.tsv` issues the statements its
+// `statements` column gives, and answers the status its `route today`
+// column gives.
+// ---------------------------------------------------------------------
+
+/// One routed row of `api_requests.tsv`.
+struct RequestRow {
+    statement: String,
+    method: String,
+    path: String,
+    query: String,
+    statements: u64,
+    status: u16,
+}
+
+/// The routed rows of `api_requests.tsv`: every line that is not a `#`
+/// comment and not the header, whose `method` is not `-`. A `-` row has no
+/// route, so it must carry `-` in both count columns.
+fn api_request_rows() -> Vec<RequestRow> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/TraceQL/measure/api_requests.tsv");
+    let text = std::fs::read_to_string(&path).expect("read api_requests.tsv");
+    let mut rows = Vec::new();
+    let mut header_seen = false;
+    for line in text.lines() {
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        if !header_seen {
+            assert!(line.starts_with("statement\t"), "the header, got {line:?}");
+            header_seen = true;
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        assert_eq!(cols.len(), 6, "six columns: {line:?}");
+        if cols[1] == "-" {
+            assert_eq!(
+                (cols[4], cols[5]),
+                ("-", "-"),
+                "{}: a row with no route has no count and no status",
+                cols[0]
+            );
+            continue;
+        }
+        rows.push(RequestRow {
+            statement: cols[0].to_string(),
+            method: cols[1].to_string(),
+            path: cols[2].to_string(),
+            query: cols[3].to_string(),
+            statements: cols[4]
+                .parse()
+                .unwrap_or_else(|_| panic!("{}: statements {:?}", cols[0], cols[4])),
+            status: cols[5]
+                .parse()
+                .unwrap_or_else(|_| panic!("{}: route today {:?}", cols[0], cols[5])),
+        });
+    }
+    rows
+}
+
+/// The parameter names a row's query string carries. A `q` value can hold
+/// `&&`, `&>`, `&~` and `&<`, so the string is split on `&` only where
+/// one of these follows it.
+const T_Q1_PARAMS: [&str; 7] = [
+    "q=",
+    "start=",
+    "end=",
+    "limit=",
+    "step=",
+    "exemplars=",
+    "scope=",
+];
+
+/// A row's query string with every value percent-encoded.
+fn encoded_query(query: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for (i, c) in query.char_indices() {
+        if c == '&' && T_Q1_PARAMS.iter().any(|p| query[i + 1..].starts_with(p)) {
+            parts.push(std::mem::take(&mut current));
+        } else {
+            current.push(c);
+        }
+    }
+    parts.push(current);
+    parts
+        .iter()
+        .map(|part| {
+            let (key, value) = part
+                .split_once('=')
+                .unwrap_or_else(|| panic!("a parameter, got {part:?} in {query:?}"));
+            format!("{key}={}", enc(value))
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// The statements `system.query_log` holds for `id` on `db`: finished or
+/// failed, issued by the server and not by another statement.
+async fn statements_for(admin: &ChClient, db: &str, id: &str) -> u64 {
+    ch_exec(admin, "SYSTEM FLUSH LOGS").await;
+    ch_count(
+        admin,
+        &format!(
+            "SELECT uniqExact(query_id) AS n FROM system.query_log \
+             WHERE log_comment = '{id}' AND type != 'QueryStart' AND is_initial_query \
+             AND current_database = '{db}'"
+        ),
+    )
+    .await
+}
+
+/// `T-Q1` (issue #602 part 3c): **every routed request in
+/// `docs/TraceQL/measure/api_requests.tsv` issues exactly the statements
+/// its row gives, and answers the status its row gives.**
+///
+/// The fixture is the file's own premise: two traces of service
+/// `checkout`, one of 20 spans and one of 1,000, ten minutes before the
+/// window's end, so the newest five minutes of the window hold no span.
+/// A search then reads that slice and the window, which is why most
+/// searches are two statements; with spans in the newest slice the same
+/// request could be one.
+///
+/// A statement is counted by the request's own `X-Pulsus-Query-Id`, which
+/// the server stamps on every statement as `log_comment`. The count waits
+/// for the row's figure, then reads once more, so a late statement past
+/// the figure is seen.
+#[tokio::test(flavor = "multi_thread")]
+async fn t_q1_every_request_issues_the_statements_its_row_states() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_791;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_v2_it_t_q1_rows")).await;
+    let _server = spawn_ready(port, &db);
+    let admin = ch_admin().await;
+
+    let now_s = now_ns() / SEC;
+    let e = (now_s - 3_600).div_euclid(300) * 300;
+    let s = e - 600;
+    let first_ns = (s + 60) * SEC;
+    let t20: [u8; 16] = [
+        0x50, 0xfb, 0x0c, 0xd9, 0x92, 0x60, 0xac, 0x2a, 0x15, 0xd0, 0xa6, 0xf2, 0x08, 0x12, 0x67,
+        0x42,
+    ];
+    let t1000: [u8; 16] = [
+        0x9e, 0x0a, 0xe9, 0x51, 0x31, 0xb5, 0xbe, 0xdb, 0xee, 0xa2, 0xc9, 0xeb, 0x52, 0x34, 0xf1,
+        0xec,
+    ];
+    for (tid, n) in [(t20, 20_u64), (t1000, 1_000)] {
+        let spans = (1..=n)
+            .map(|i| plain_span(tid, i.to_be_bytes(), first_ns + (i as i64 - 1) * MILLI))
+            .collect();
+        one_resource_push(port, "checkout", spans, "T-Q1 fixture");
+        stored_in_spans(&admin, db.name(), &hex(&tid), n).await;
+    }
+    let t20_hex = hex(&t20);
+    let t1000_hex = hex(&t1000);
+    let substitute = |text: &str| {
+        text.replace("$T1000", &t1000_hex)
+            .replace("$T20", &t20_hex)
+            .replace("$S", &s.to_string())
+            .replace("$E", &e.to_string())
+    };
+
+    let rows = api_request_rows();
+    let mut failures: Vec<String> = Vec::new();
+    for row in &rows {
+        let path = substitute(&row.path);
+        let target = if row.query.is_empty() {
+            path
+        } else {
+            format!("{path}?{}", encoded_query(&substitute(&row.query)))
+        };
+        let res = request(port, &row.method, &target, None, &[])
+            .unwrap_or_else(|| panic!("{}: reachable", row.statement));
+        let Some(id) = res.headers.get("x-pulsus-query-id").cloned() else {
+            failures.push(format!(
+                "{}: no X-Pulsus-Query-Id (status {})",
+                row.statement, res.status
+            ));
+            continue;
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut n = statements_for(&admin, db.name(), &id).await;
+        while n < row.statements && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            n = statements_for(&admin, db.name(), &id).await;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        n = statements_for(&admin, db.name(), &id).await;
+        if res.status != row.status || n != row.statements {
+            failures.push(format!(
+                "{}: status {} and {n} statements; the row says {} and {}",
+                row.statement, res.status, row.status, row.statements
+            ));
+        }
+    }
+    let at = |k: u64| rows.iter().filter(|r| r.statements == k).count();
+    let distribution = (at(1), at(2));
+    let routed = rows.len();
+    assert!(
+        failures.is_empty(),
+        "{} of {routed} rows differ:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+    assert_eq!(routed, 61, "the routed rows of api_requests.tsv");
+    assert_eq!(
+        distribution,
+        (20, 41),
+        "the routed rows at one statement and at two"
+    );
+}

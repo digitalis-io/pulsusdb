@@ -407,16 +407,16 @@ mod tests {
     #[test]
     fn the_closed_end_convention_renders_its_operators() {
         assert_eq!(
-            WindowSql::start_open_end_closed(10, 20).time_clause(),
-            "timestamp_ns > 10 AND timestamp_ns <= 20"
+            WindowSql::start_open_end_closed(10, 20).span_time_clause(),
+            "start_ns > 10 AND start_ns <= 20"
         );
     }
 
     #[test]
     fn the_open_end_convention_renders_its_operators() {
         assert_eq!(
-            WindowSql::start_closed_end_open(10, 20).time_clause(),
-            "timestamp_ns >= 10 AND timestamp_ns < 20"
+            WindowSql::start_closed_end_open(10, 20).span_time_clause(),
+            "start_ns >= 10 AND start_ns < 20"
         );
     }
 
@@ -425,7 +425,7 @@ mod tests {
     #[test]
     fn a_closed_end_at_midnight_keeps_the_day_the_boundary_starts() {
         assert_eq!(
-            WindowSql::start_open_end_closed(PREV_MIDNIGHT_NS, MIDNIGHT_NS).date_clause(),
+            WindowSql::start_open_end_closed(PREV_MIDNIGHT_NS, MIDNIGHT_NS).date_clause_on("date"),
             "date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')"
         );
     }
@@ -435,7 +435,7 @@ mod tests {
     #[test]
     fn an_open_end_at_midnight_drops_the_day_the_boundary_starts() {
         assert_eq!(
-            WindowSql::start_closed_end_open(PREV_MIDNIGHT_NS, MIDNIGHT_NS).date_clause(),
+            WindowSql::start_closed_end_open(PREV_MIDNIGHT_NS, MIDNIGHT_NS).date_clause_on("date"),
             "date >= toDate('2023-11-14') AND date <= toDate('2023-11-14')"
         );
     }
@@ -450,8 +450,8 @@ mod tests {
         let closed = WindowSql::start_open_end_closed(PREV_MIDNIGHT_NS, MIDNIGHT_NS);
         let open = WindowSql::start_closed_end_open(PREV_MIDNIGHT_NS, MIDNIGHT_NS);
         assert_ne!(
-            closed.date_clause(),
-            open.date_clause(),
+            closed.date_clause_on("date"),
+            open.date_clause_on("date"),
             "a window ending exactly at midnight touches one more day when its end is \
              INCLUDED than when it is EXCLUDED; if these render alike, one convention has \
              been given the other's day rule — and the two directions differ: widening the \
@@ -468,8 +468,8 @@ mod tests {
     fn the_two_conventions_agree_about_a_window_ending_mid_day() {
         let mid = MIDNIGHT_NS + 4_400_000_000_000;
         assert_eq!(
-            WindowSql::start_open_end_closed(PREV_MIDNIGHT_NS, mid).date_clause(),
-            WindowSql::start_closed_end_open(PREV_MIDNIGHT_NS, mid).date_clause()
+            WindowSql::start_open_end_closed(PREV_MIDNIGHT_NS, mid).date_clause_on("date"),
+            WindowSql::start_closed_end_open(PREV_MIDNIGHT_NS, mid).date_clause_on("date")
         );
     }
 
@@ -479,11 +479,11 @@ mod tests {
     #[test]
     fn a_pre_epoch_open_end_at_midnight_drops_the_day_the_boundary_starts() {
         assert_eq!(
-            WindowSql::start_closed_end_open(-2 * NS_PER_DAY, -NS_PER_DAY).date_clause(),
+            WindowSql::start_closed_end_open(-2 * NS_PER_DAY, -NS_PER_DAY).date_clause_on("date"),
             "date >= toDate('1969-12-30') AND date <= toDate('1969-12-30')"
         );
         assert_eq!(
-            WindowSql::start_open_end_closed(-2 * NS_PER_DAY, -NS_PER_DAY).date_clause(),
+            WindowSql::start_open_end_closed(-2 * NS_PER_DAY, -NS_PER_DAY).date_clause_on("date"),
             "date >= toDate('1969-12-30') AND date <= toDate('1969-12-31')"
         );
     }
