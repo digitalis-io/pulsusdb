@@ -3679,7 +3679,12 @@ async fn the_job_keeps_up_under_steady_ingest() {
     }
     assert!(watched.len() >= 3, "LV1: three intervals: {watched:?}");
 
-    // The load: one writer per node, 10 pushes a second together.
+    // The load: one writer per node, 5 pushes a second together, each of
+    // 1,000 spans. Twice that rate was more than a four-core CI runner's
+    // three-node cluster could replicate: its replication queues passed the
+    // job's 1,000-entry hold and the sync answers queued past 60 s (issue
+    // #602 part 3b-1). At this rate the run still keeps the queues busy
+    // enough to hold the job if its catch-up rule is removed.
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let failures = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let first_failure = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
@@ -3696,7 +3701,7 @@ async fn the_job_keeps_up_under_steady_ingest() {
             // Each answered push's admit-to-answer time, in ms; a push not
             // answered within 60 s is recorded as 60,000.
             let answer_ms = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
-            let mut tick = tokio::time::interval(Duration::from_millis(300));
+            let mut tick = tokio::time::interval(Duration::from_millis(600));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut seq = k as u64;
             let mut waits = Vec::new();
@@ -3745,13 +3750,14 @@ async fn the_job_keeps_up_under_steady_ingest() {
             let mut ms = answer_ms.lock().expect("the lock").clone();
             ms.sort_unstable();
             let at = |q: f64| ms.get(((ms.len().max(1) - 1) as f64 * q) as usize).copied();
-            format!(
+            let line = format!(
                 "writer {k}: {} answers, p50 {:?} ms, p99 {:?} ms, max {:?} ms",
                 ms.len(),
                 at(0.5),
                 at(0.99),
                 ms.last()
-            )
+            );
+            (k, line, at(0.99))
         }));
     }
 
@@ -3817,9 +3823,11 @@ async fn the_job_keeps_up_under_steady_ingest() {
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut p99s = Vec::new();
     for t in tasks {
-        let latency = t.await.expect("a writer task");
+        let (k, latency, p99) = t.await.expect("a writer task");
         println!("LV1 answer latency, {latency}");
+        p99s.push((k, p99));
     }
     println!("LV1 queue samples (s since start, spans/service_edges per node):");
     for s in &queue_samples {
@@ -3833,6 +3841,14 @@ async fn the_job_keeps_up_under_steady_ingest() {
         "LV1: every push was stored; the first failure: {:?}",
         first_failure.lock().expect("the lock")
     );
+    // The OTLP exporter's own default timeout is 10 s: a sync answer slower
+    // than that is a client retry, whatever the 60 s check above allows.
+    for (k, p99) in &p99s {
+        assert!(
+            p99.is_some_and(|ms| ms <= 10_000),
+            "LV1: writer {k}'s answer p99 is within 10 s: {p99:?} ms"
+        );
+    }
     for ((b, _), shards) in watched.iter().zip(&covered) {
         for (shard, after) in shards.iter().enumerate() {
             assert!(

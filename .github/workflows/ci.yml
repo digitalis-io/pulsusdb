@@ -2457,6 +2457,13 @@ jobs:
   schema-it-cluster:
     runs-on: ubuntu-latest
     steps:
+      # Issue #602 part 3b-1: the runner's size, so a load-bound case such as
+      # `the_job_keeps_up_under_steady_ingest` can be read against it.
+      - name: Runner size
+        run: |
+          nproc
+          free -g
+
       - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
@@ -2612,10 +2619,20 @@ jobs:
       # positive cases the answers over traces split across both shards.
       # The suite also holds the service graph's cluster cases (#599); its
       # output shows each edge-job run's duration (part B §4).
+      # `the_job_keeps_up_under_steady_ingest` runs in the next step, alone
+      # (issue #602 part 3b-1).
       - name: Nested-set search over the distributed tables (cluster)
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
-        run: cargo test -p pulsus-read --test traces_nested_set_cluster -- --show-output
+        run: cargo test -p pulsus-read --test traces_nested_set_cluster -- --show-output --skip the_job_keeps_up_under_steady_ingest
+
+      # Issue #602 part 3b-1: the edge job under steady ingest, alone. It
+      # loads the whole cluster for sixteen minutes, and a case beside it
+      # would share the runner with that load.
+      - name: The edge job keeps up under steady ingest (cluster)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+        run: cargo test -p pulsus-read --test traces_nested_set_cluster -- --show-output --exact the_job_keeps_up_under_steady_ingest
 
       # Issue #43: cross-node connection spreading over the two DISTINCT real
       # nodes (SHARD1/SHARD2 default to the fixture IPs 172.28.0.11/12:8123),
