@@ -713,6 +713,72 @@ mod tests {
         );
     }
 
+    /// **The block charge covers every signal's settings as they are built**
+    /// (issue #602 part 3b-1). For each signal's own constructor, at a token
+    /// `mint_landing_token` writes and at the floor, the default and the
+    /// largest accepted row ceiling, the settings' measured allocation plus
+    /// the block's fixed terms must fit in the charge. A setting added to any
+    /// signal's insert without the charge following fails here.
+    #[test]
+    fn the_block_charge_covers_every_signals_settings_as_built() {
+        use crate::writer::rows::{LogLandingRow, TraceLandingRow};
+        use pulsus_config as cfg;
+        fn fixed<R>() -> u64 {
+            2 * std::mem::size_of::<LandingBlock<R>>() as u64
+                + 4 * std::mem::size_of::<push_dedup::PushDigest>() as u64
+                + 256
+        }
+        let token = mint_landing_token(&mut XorShift64::seeded());
+        assert_eq!(token.len(), 36);
+        let defaults = pulsus_config::WriterConfig::default();
+        let mut short = Vec::new();
+        let mut check = |signal: &str, settings: QuerySettings, fixed: u64, charged: u64| {
+            let needed = settings.allocated_bytes() + fixed;
+            if needed > charged {
+                short.push(format!(
+                    "{signal}: the block holds {needed} bytes and is charged {charged}"
+                ));
+            }
+        };
+        for rows in [
+            cfg::METRICS_LANDING_MAX_ROWS_FLOOR,
+            defaults.metrics_landing_max_rows,
+            cfg::METRICS_LANDING_MAX_ROWS_CEILING,
+        ] {
+            check(
+                "metrics",
+                QuerySettings::landing_insert(&token, rows),
+                fixed::<MetricLandingRow>(),
+                landing_block_overhead_bytes::<MetricLandingRow>(),
+            );
+        }
+        for rows in [
+            cfg::LOG_LANDING_MAX_ROWS_FLOOR,
+            defaults.log_landing_max_rows,
+            cfg::LOG_LANDING_MAX_ROWS_CEILING,
+        ] {
+            check(
+                "logs",
+                QuerySettings::landing_insert(&token, rows),
+                fixed::<LogLandingRow>(),
+                landing_block_overhead_bytes::<LogLandingRow>(),
+            );
+        }
+        for rows in [
+            cfg::TRACE_LANDING_MAX_ROWS_FLOOR,
+            defaults.trace_landing_max_rows,
+            cfg::TRACE_LANDING_MAX_ROWS_CEILING,
+        ] {
+            check(
+                "traces",
+                QuerySettings::trace_landing_insert(&token, rows),
+                fixed::<TraceLandingRow>(),
+                landing_block_overhead_bytes::<TraceLandingRow>(),
+            );
+        }
+        assert!(short.is_empty(), "{}", short.join("\n"));
+    }
+
     /// **W3 (issue #623): the block charge prices every landing setting.**
     /// The settings of the widest block — a 36-byte token and the largest
     /// accepted row ceiling — read from the settings themselves: their count

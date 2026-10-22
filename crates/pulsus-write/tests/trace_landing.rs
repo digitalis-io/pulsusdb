@@ -1063,6 +1063,86 @@ async fn a_retry_after_an_uncertain_landing_insert_is_stored() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// An inserter whose one call is held until the case releases it, and then
+/// fails with a non-retryable error: provably not committed.
+struct GatedPoisonInserter {
+    entered: tokio::sync::Semaphore,
+    gate: tokio::sync::Semaphore,
+    calls: AtomicUsize,
+}
+
+impl BlockInserter<TraceLandingRow> for GatedPoisonInserter {
+    fn insert<'a>(
+        &'a self,
+        _table: &'a str,
+        _rows: &'a [TraceLandingRow],
+    ) -> Pin<Box<dyn Future<Output = Result<(), ChError>> + Send + 'a>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.entered.add_permits(1);
+        Box::pin(async move {
+            self.gate
+                .acquire()
+                .await
+                .expect("the gate is never closed")
+                .forget();
+            Err(ChError::Decode("gated poison".to_string()))
+        })
+    }
+}
+
+/// **A sync repeat waiting on a pending trace claim is answered the failure
+/// the claim settles to** (issue #602; the retry contract's row 5, at the
+/// writer). The original's landing insert is held in flight, the identical
+/// push arrives and waits, then the insert fails: both callers are answered
+/// the failure, and the repeat stores nothing.
+#[tokio::test]
+async fn a_sync_repeat_waiting_on_a_pending_trace_claim_is_answered_its_failure() {
+    let root = spool_root("repeat-on-pending-failure");
+    let landing = Arc::new(GatedPoisonInserter {
+        entered: tokio::sync::Semaphore::new(0),
+        gate: tokio::sync::Semaphore::new(0),
+        calls: AtomicUsize::new(0),
+    });
+    let writer = writer_with(&WriterConfig::default(), &root, landing.clone());
+    let landed = decode(&six_spans());
+
+    let original = writer
+        .admit_flush(landed.clone(), PushHeaders::default())
+        .expect("queue has room");
+    // The original's insert is in flight, so its claim is pending.
+    landing
+        .entered
+        .acquire()
+        .await
+        .expect("the entered semaphore is never closed")
+        .forget();
+    let repeat = writer
+        .admit_flush(landed, PushHeaders::default())
+        .expect("the repeat waits on the pending claim");
+    assert_eq!(writer.metrics().dedup.duplicate_pushes_total, 1);
+
+    landing.gate.add_permits(1);
+    let original = original.await;
+    let repeat = tokio::time::timeout(Duration::from_secs(10), repeat)
+        .await
+        .expect("the repeat is answered once the claim settles");
+    assert!(
+        original.is_err(),
+        "the failed insert is the original's answer"
+    );
+    assert!(
+        repeat.is_err(),
+        "the repeat is answered the failure its claim settled to: {repeat:?}"
+    );
+    assert_eq!(
+        landing.calls.load(Ordering::SeqCst),
+        1,
+        "the repeat stored nothing"
+    );
+    writer.shutdown(Duration::from_secs(5)).await;
+    std::fs::remove_dir_all(&root).ok();
+}
+
 /// **The hermetic half of the push-identity set**: two identical bodies
 /// under two distinct `Idempotency-Key`s are two identities, so both store.
 #[tokio::test]
