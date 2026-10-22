@@ -1653,7 +1653,7 @@ fn tempo_instant_values(body: &serde_json::Value) -> Result<f64> {
 /// Cluster-only shard-local sanity (mirrors
 /// `scenarios::assert_shard_local_row_counts`, table `spans`): polls
 /// until the per-shard local counts sum to the ingested span total —
-/// proves real fan-out through `spans_dist` without requiring any
+/// proves fan-out through `spans_dist` without requiring any
 /// particular per-shard split.
 ///
 /// **Run-scoped and replay-immune (issue #60 code review, medium):**

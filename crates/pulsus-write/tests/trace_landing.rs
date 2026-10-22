@@ -2,7 +2,7 @@
 //! `trace_landing`** (issues #586 and #602), the three per-push ceilings, the
 //! admission over the landing queue, the push-suppression index, the sync
 //! acknowledgement, and the two refusal containers the trace transports
-//! render. All against mock `BlockInserter`s — no real ClickHouse,
+//! render. All against mock `BlockInserter`s — no ClickHouse server,
 //! except the one case whose whole observable is a `system` table and which
 //! gates itself on `PULSUS_TEST_CLICKHOUSE=1`.
 //!
